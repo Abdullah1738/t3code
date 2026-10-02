@@ -450,6 +450,16 @@ const rule = (action: string, effect: Rule["effect"]): Rule => ({ action, resour
 const t3McpServerName = (threadId: string) =>
   `t3-code-${threadId.replaceAll(/[^a-zA-Z0-9_-]/g, "_")}`;
 
+/** Whether an OpenCode server URL points at this machine. */
+const isLoopbackUrl = (url: string): boolean => {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "::1" || /^127\./.test(host);
+  } catch {
+    return false;
+  }
+};
+
 /**
  * The rules that keep T3's MCP servers to their own thread, after the mode's:
  * the last matching rule wins, so every thread's T3 server is denied and then
@@ -3191,9 +3201,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const mcpSession = McpProviderSession.readMcpProviderSession(turnInput.threadId);
       const directory = turnInput.runtimePolicy.cwd ?? serverConfig.cwd;
       const name = t3McpServerName(turnInput.threadId);
-      // An external server may not reach T3's MCP endpoint, as with 1.x.
+      // An external server may not reach T3's MCP endpoint, as with 1.x. A
+      // loopback one shares this host, so it can.
       const wanted =
-        mcpSession === undefined || connection.external
+        mcpSession === undefined || (connection.external && !isLoopbackUrl(connection.url))
           ? undefined
           : { name, directory, credential: mcpSession.authorizationHeader };
       if (
