@@ -1,0 +1,251 @@
+#!/usr/bin/env node
+// t3ctl: shell access to the ardud control API. Prints JSON unless --text.
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeUtil from "node:util";
+
+import { ControlClient, DEFAULT_TOKEN_FILE } from "./client.mjs";
+
+const HELP = `t3ctl <command> [options]
+
+  login --url URL --token TOKEN        save to ~/.t3/ardud-control.json (chmod 600)
+  health                               check the connection and token
+  requests [--origin O]                pending approvals and questions everywhere
+  projects                             list projects
+  models                               default model and available models
+  threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--all-kinds]
+  create [--prompt P] [--title T] [--dir D | --project ID] [--model provider/model]
+         [--variant V] [--mode full-access|approval-required|...] [--origin O] [--plan]
+         [--wait] [--timeout SECONDS]
+  status THREAD                        state, run, pending requests
+  native SES_ID                        thread for an OpenCode session id
+  messages THREAD [--limit N] [--last] [--role user|assistant]
+  send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--variant V] [--wait]
+  wait THREAD [--timeout SECONDS] [--drain]
+  interrupt THREAD
+  respond THREAD REQUEST (--approve | --deny | --always | --answer KEY=VALUE ... | --dismiss)
+  origin THREAD ORIGIN|none
+  set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive]
+  events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
+
+Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, or ${DEFAULT_TOKEN_FILE}.`;
+
+const { values: flags, positionals } = NodeUtil.parseArgs({
+  allowPositionals: true,
+  options: {
+    url: { type: "string" },
+    token: { type: "string" },
+    prompt: { type: "string" },
+    title: { type: "string" },
+    dir: { type: "string" },
+    project: { type: "string" },
+    model: { type: "string" },
+    variant: { type: "string" },
+    mode: { type: "string" },
+    origin: { type: "string" },
+    plan: { type: "boolean" },
+    wait: { type: "boolean" },
+    drain: { type: "boolean" },
+    timeout: { type: "string" },
+    active: { type: "boolean" },
+    state: { type: "string" },
+    since: { type: "string" },
+    limit: { type: "string" },
+    "all-kinds": { type: "boolean" },
+    last: { type: "boolean" },
+    role: { type: "string" },
+    approve: { type: "boolean" },
+    deny: { type: "boolean" },
+    always: { type: "boolean" },
+    dismiss: { type: "boolean" },
+    answer: { type: "string", multiple: true },
+    archive: { type: "boolean" },
+    unarchive: { type: "boolean" },
+    thread: { type: "string" },
+    types: { type: "string" },
+    after: { type: "string" },
+    text: { type: "boolean" },
+    help: { type: "boolean", short: "h" },
+  },
+});
+
+const [command, ...args] = positionals;
+const print = (value) => console.log(JSON.stringify(value, null, 2));
+const need = (value, name) => {
+  if (!value) {
+    console.error(`missing ${name}\n\n${HELP}`);
+    process.exit(2);
+  }
+  return value;
+};
+const timeoutMs = () => (flags.timeout ? Number(flags.timeout) * 1000 : 10 * 60_000);
+
+async function main() {
+  if (!command || flags.help) {
+    console.log(HELP);
+    return;
+  }
+  if (command === "login") {
+    const url = need(flags.url, "--url");
+    const token = need(flags.token ?? process.env.T3_CONTROL_TOKEN, "--token");
+    NodeFS.mkdirSync(NodePath.dirname(DEFAULT_TOKEN_FILE), { recursive: true, mode: 0o700 });
+    NodeFS.writeFileSync(DEFAULT_TOKEN_FILE, `${JSON.stringify({ url, token }, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    NodeFS.chmodSync(DEFAULT_TOKEN_FILE, 0o600);
+    console.log(`saved ${DEFAULT_TOKEN_FILE}`);
+    return;
+  }
+  const client = new ControlClient({ url: flags.url, token: flags.token });
+  switch (command) {
+    case "health":
+      return print(await client.health());
+    case "requests":
+      return print(await client.pendingRequests({ origin: flags.origin }));
+    case "projects":
+      return print(await client.projects());
+    case "models":
+      return print(await client.models());
+    case "threads": {
+      const result = await client.listThreads({
+        origin: flags.origin,
+        active: flags.active,
+        state: flags.state,
+        updatedSince: flags.since,
+        limit: flags.limit,
+        includeSubagents: flags["all-kinds"],
+      });
+      if (flags.text) {
+        for (const thread of result.threads) {
+          console.log(
+            `${thread.threadId}\t${thread.state}\t${thread.origin ?? "-"}\t${thread.title}`,
+          );
+        }
+        return;
+      }
+      return print(result);
+    }
+    case "create": {
+      const created = await client.createThread({
+        prompt: flags.prompt,
+        title: flags.title,
+        ...(flags.dir ? { directory: flags.dir } : {}),
+        ...(flags.project ? { projectId: flags.project } : {}),
+        model: flags.model,
+        variant: flags.variant,
+        runtimeMode: flags.mode,
+        origin: flags.origin,
+        ...(flags.plan ? { interactionMode: "plan" } : {}),
+      });
+      if (!flags.wait) return print(created);
+      const waited = await client.wait(created.threadId, { timeoutMs: timeoutMs() });
+      if (flags.text) return console.log(waited.lastAssistant?.text ?? "");
+      return print({ ...created, ...waited });
+    }
+    case "status":
+      return print(await client.thread(need(args[0], "THREAD")));
+    case "native":
+      return print(await client.threadByNativeSession(need(args[0], "SES_ID")));
+    case "messages": {
+      const threadId = need(args[0], "THREAD");
+      const result = await client.messages(threadId, {
+        limit: flags.limit,
+        role: flags.role,
+      });
+      if (flags.last) {
+        return flags.text
+          ? console.log(result.lastAssistant?.text ?? "")
+          : print(result.lastAssistant);
+      }
+      return print(result);
+    }
+    case "send": {
+      const threadId = need(args[0], "THREAD");
+      const sent = await client.send(threadId, need(args.slice(1).join(" "), "TEXT"), {
+        mode: flags.mode,
+        model: flags.model,
+        variant: flags.variant,
+      });
+      if (!flags.wait) return print(sent);
+      const waited = await client.wait(threadId, { timeoutMs: timeoutMs(), runId: sent.runId });
+      if (flags.text) return console.log(waited.lastAssistant?.text ?? "");
+      return print({ ...sent, ...waited });
+    }
+    case "wait": {
+      const waited = await client.wait(need(args[0], "THREAD"), {
+        timeoutMs: timeoutMs(),
+        drain: flags.drain,
+      });
+      if (flags.text) return console.log(waited.lastAssistant?.text ?? "");
+      return print(waited);
+    }
+    case "interrupt":
+      return print(await client.interrupt(need(args[0], "THREAD")));
+    case "respond": {
+      const threadId = need(args[0], "THREAD");
+      const requestId = need(args[1], "REQUEST");
+      const answers = flags.answer?.length
+        ? Object.fromEntries(
+            flags.answer.map((entry) => {
+              const index = entry.indexOf("=");
+              return index < 0 ? [entry, ""] : [entry.slice(0, index), entry.slice(index + 1)];
+            }),
+          )
+        : undefined;
+      const decision = flags.approve
+        ? "approve"
+        : flags.deny
+          ? "deny"
+          : flags.always
+            ? "always"
+            : undefined;
+      return print(
+        await client.respond(threadId, requestId, {
+          ...(decision ? { decision } : {}),
+          ...(answers ? { answers } : {}),
+          ...(flags.dismiss ? { dismiss: true } : {}),
+        }),
+      );
+    }
+    case "origin": {
+      const origin = need(args[1], "ORIGIN");
+      return print(
+        await client.setOrigin(need(args[0], "THREAD"), origin === "none" ? null : origin),
+      );
+    }
+    case "set":
+      return print(
+        await client.updateThread(need(args[0], "THREAD"), {
+          runtimeMode: flags.mode,
+          model: flags.model,
+          variant: flags.variant,
+          title: flags.title,
+          ...(flags.archive ? { archived: true } : flags.unarchive ? { archived: false } : {}),
+        }),
+      );
+    case "events": {
+      const controller = new AbortController();
+      process.once("SIGINT", () => controller.abort());
+      process.once("SIGTERM", () => controller.abort());
+      for await (const event of client.events({
+        signal: controller.signal,
+        threadId: flags.thread,
+        origin: flags.origin,
+        types: flags.types?.split(","),
+        after: flags.after === undefined ? undefined : Number(flags.after),
+        onError: (error) => console.error(`events: ${error.message ?? error}`),
+      })) {
+        console.log(JSON.stringify(event));
+      }
+      return;
+    }
+    default:
+      console.error(`unknown command ${command}\n\n${HELP}`);
+      process.exit(2);
+  }
+}
+
+main().catch((error) => {
+  console.error(error.code ? `${error.code}: ${error.message}` : (error.message ?? String(error)));
+  process.exit(1);
+});
