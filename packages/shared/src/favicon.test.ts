@@ -27,10 +27,10 @@ describe("faviconUrlForOrigin", () => {
     expect(faviconUrlForOrigin(origin)).toBeNull();
   });
 
-  it("keeps the public origin, port and requested size", () => {
-    expect(faviconUrlForOrigin("https://github.com:8443/pingdotgg/t3code?private=query", 64)).toBe(
-      "https://www.google.com/s2/favicons?domain=github.com%3A8443&sz=64",
-    );
+  it("never sends public hosts to a third-party favicon service", () => {
+    expect(
+      faviconUrlForOrigin("https://github.com:8443/pingdotgg/t3code?private=query", 64),
+    ).toBeNull();
   });
 
   it.each([null, undefined, "", "invalid URL", "file:///tmp/private", "data:text/plain,private"])(

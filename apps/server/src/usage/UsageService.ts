@@ -211,6 +211,9 @@ export const make = Effect.gen(function* () {
       }
     }
 
+    // Fork: no third-party price-table fetch unless explicitly opted in.
+    if (hostEnvironment.T3CODE_FETCH_LITELLM_RATES !== "1") return;
+
     const fetched = yield* httpClient.get(LITELLM_RATES_URL).pipe(
       Effect.flatMap(HttpClientResponse.filterStatusOk),
       Effect.flatMap((response) => response.json),

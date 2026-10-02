@@ -90,7 +90,9 @@ export function faviconUrlForOrigin(rawUrl: string | null | undefined, size = 32
     if (!url.host) return null;
     if (url.protocol !== "http:" && url.protocol !== "https:") return null;
     if (!isPublicFaviconHost(url.hostname)) return null;
-    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(url.host)}&sz=${size}`;
+    // Fork: never send link hosts to a third-party favicon service.
+    void size;
+    return null;
   } catch {
     return null;
   }

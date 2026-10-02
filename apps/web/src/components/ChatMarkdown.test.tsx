@@ -150,9 +150,7 @@ describe("ChatMarkdown favicon privacy", () => {
       await act(async () => {
         renderer = create(markdown("https://example.com"));
       });
-      expect(renderer!.root.findAllByType("img").map((image) => image.props.src)).toEqual([
-        "https://www.google.com/s2/favicons?domain=example.com&sz=32",
-      ]);
+      expect(renderer!.root.findAllByType("img")).toHaveLength(0);
       for (const url of ["http://192.168.1.10:8080", "http://localhost:3000", "http://home.arpa"]) {
         await act(async () => {
           renderer!.update(markdown(url));
@@ -162,7 +160,7 @@ describe("ChatMarkdown favicon privacy", () => {
       await act(async () => {
         renderer!.update(markdown("https://example.com"));
       });
-      expect(renderer!.root.findAllByType("img")).toHaveLength(1);
+      expect(renderer!.root.findAllByType("img")).toHaveLength(0);
       // GitHub links draw the brand mark in currentColor instead of fetching a favicon.
       await act(async () => {
         renderer!.update(markdown("https://github.com/pingdotgg/t3code/pull/1"));
