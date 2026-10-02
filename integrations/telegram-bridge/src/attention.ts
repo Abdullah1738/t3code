@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { IMESSAGE_ORIGIN, sessionOrigin, type BoardEntry, type BoardSnapshot, type JsonValue, type OpenChamber, type PermissionRequest, type QuestionRequest, type SessionRecord } from "./openchamber.ts";
-import { parseNotificationEvent } from "./notification-events.ts";
+import { IMESSAGE_ORIGIN, sessionOrigin, type AlertBackend, type BoardEntry, type BoardSnapshot, type JsonValue, type PermissionRequest, type QuestionRequest, type SessionRecord } from "./openchamber.ts";
+import { parseNotificationEvent, type NotificationEvent } from "./notification-events.ts";
 import { spectrumRouterStatus, type RouterStatus } from "./spectrum-status.ts";
 import { callbackToken, sessionNoticeId, type KeyboardSpec, type SessionNotice, type Store } from "./store.ts";
 import type { Telegram, TelegramUpdate } from "./telegram.ts";
@@ -48,7 +48,7 @@ export class Attention {
 
   constructor(
     private readonly store: Store,
-    private readonly backend: OpenChamber,
+    private readonly backend: AlertBackend,
     private readonly transport: Pick<Telegram, "editMessageText" | "answerCallback">,
     private readonly options: AttentionOptions,
   ) {}
@@ -98,7 +98,12 @@ export class Attention {
   processEvent(input: JsonValue): void {
     if (this.stopped) return;
     const event = parseNotificationEvent(input, this.sessionDirectories);
-    if (!event) return;
+    if (event) this.processNotification(event);
+  }
+
+  /** Same as processEvent, for backends that decode their own stream (Robob's control events). */
+  processNotification(event: NotificationEvent): void {
+    if (this.stopped) return;
     if (event.type === "invalidate") {
       this.invalidate(); this.wake(); return;
     }

@@ -64,6 +64,29 @@ under `~/.config/telegram-bridge/`.
   conversation endpoint.
 - A bridge restart never restarts OpenChamber.
 
+## Robob backend
+
+`src/robob.ts` implements the same `AlertBackend` interface on Robob's control
+API. Switch and token lookup match the iMessage bridge: `BRIDGE_BACKEND=robob`
+or `"backend": "robob"` in config.json (default `openchamber`), then
+`T3_CONTROL_URL`/`T3_CONTROL_TOKEN` or `~/.robob/ardud-control.json` (chmod 600).
+
+- Events: one `GET /events` stream, resumed with `Last-Event-ID` across
+  reconnects, decoded into the same notification events as before
+  (`request.opened`/`resolved` to asked/resolved, `thread.status` to busy/idle,
+  user `message.completed` to changed, runtime-mode changes to invalidate).
+- Requests: `GET /requests`, scoped to a directory by each thread's folder.
+  Replies use the respond route.
+- Reviews: until Robob's session board (`/api/ardud/board/*`) is ready,
+  `ThreadReviewBoard` builds a board snapshot from `GET /threads`: root threads
+  only, iMessage threads left out, other origins (automation, crw, watcher) as
+  `scheduled` (never announced), settled threads as `backlog`, and the newest
+  run's ordinal as the work revision. A root thread whose turn finishes gets
+  one review notice. The real board plugs in through the `ReviewBoard`
+  interface (`board` option).
+- iMessage family: every thread reports its root's origin, so subagents of an
+  iMessage chat stay quiet without a parent walk.
+
 ## OpenCode 2 API
 
 OpenChamber v2 forwards `/api/*` to OpenCode 2 unchanged, so the bridge calls

@@ -3,10 +3,11 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import { createApi } from "./api.ts";
 import { Attention } from "./attention.ts";
-import { backendConnection, loadConfig, spectrumBridgeSocket, stateRoot } from "./config.ts";
+import { backendConnection, backendKind, loadConfig, spectrumBridgeSocket, stateRoot } from "./config.ts";
 import { Delivery } from "./delivery.ts";
 import { acquireLock } from "./lock.ts";
-import { OpenChamber } from "./openchamber.ts";
+import { OpenChamber, type AlertBackend } from "./openchamber.ts";
+import { RobobAlertBackend } from "./robob.ts";
 import { Store } from "./store.ts";
 import { Telegram } from "./telegram.ts";
 
@@ -49,8 +50,9 @@ async function main(): Promise<void> {
   if (!["serve", "check", "pair"].includes(mode)) throw new Error("Unknown bridge command");
   const token = process.env.TELEGRAM_BOT_TOKEN ?? "";
   const telegram = new Telegram(token, config.owner);
-  const connection = await backendConnection();
-  const backend = new OpenChamber(connection.baseUrl, connection.headers);
+  const kind = backendKind(process.env, config);
+  const backend: AlertBackend = kind === "robob" ? new RobobAlertBackend()
+    : await backendConnection().then(connection => new OpenChamber(connection.baseUrl, connection.headers));
   if (mode === "check" || mode === "pair") {
     try {
       const me = await telegram.check();
@@ -66,7 +68,7 @@ async function main(): Promise<void> {
             : "Send /start to the bot from the owner Telegram account to bind the chat. No other account is accepted.",
         }));
       } else {
-        console.log(JSON.stringify({ backendVersion: health?.openchamberVersion, enabled: config.enabled, ownerConfigured: config.owner !== "" }));
+        console.log(JSON.stringify({ backend: kind, backendVersion: health?.openchamberVersion, enabled: config.enabled, ownerConfigured: config.owner !== "" }));
       }
     } finally { await telegram.stop(); }
     return;
@@ -143,12 +145,31 @@ async function main(): Promise<void> {
     }
   }
   async function events(path: "/api/event" | "/api/openchamber/events"): Promise<void> {
+    if (!(backend instanceof OpenChamber)) return;
     while (!stopping) {
       try {
         for await (const event of backend.events(path, shutdown.signal)) {
           if (stopping) break;
           health.backendLastOk = Date.now();
           attention.processEvent(event);
+        }
+      } catch { if (!stopping) log("backend-events-unavailable"); }
+      if (!stopping) await sleep(5_000);
+    }
+  }
+  async function controlEvents(): Promise<void> {
+    if (!(backend instanceof RobobAlertBackend)) return;
+    // The control stream's keepalives are SSE comments, so a quiet stream proves nothing; check health directly.
+    const healthTimer = setInterval(() => {
+      void backend.health().then(() => { health.backendLastOk = Date.now(); }, () => {});
+    }, 30_000);
+    shutdown.signal.addEventListener("abort", () => clearInterval(healthTimer), { once: true });
+    while (!stopping) {
+      try {
+        for await (const event of backend.notifications(shutdown.signal, () => { health.backendLastOk = Date.now(); })) {
+          if (stopping) break;
+          health.backendLastOk = Date.now();
+          attention.processNotification(event);
         }
       } catch { if (!stopping) log("backend-events-unavailable"); }
       if (!stopping) await sleep(5_000);
@@ -175,10 +196,11 @@ async function main(): Promise<void> {
   };
   process.once("SIGTERM", () => { void stop(); });
   process.once("SIGINT", () => { void stop(); });
+  log("backend-selected", kind);
   log(config.enabled ? "bridge-awaiting-owner" : "bridge-disabled");
   // `/api/event` is OpenChamber's pass-through of OpenCode 2's single wire
   // stream; OpenChamber-owned events travel on `/api/openchamber/events`.
-  await Promise.all([updates(), ping(), events("/api/event"), events("/api/openchamber/events")]);
+  await Promise.all([updates(), ping(), events("/api/event"), events("/api/openchamber/events"), controlEvents()]);
 }
 
 if (import.meta.main) main().catch(error => { log("bridge-start-failed", errorCode(error)); process.exit(1); });
