@@ -142,6 +142,38 @@ under `~/.config/spectrum-bridge/`.
   text travelled inside the leader's prompt. The batch outcome is on the
   leader row; the aggregate is kept in kv `batch:<leaderId>`.
 
+## Robob backend
+
+The bridge can run on Robob's control API (`/api/ardud/control/*`) instead of
+OpenChamber. `src/robob.ts` implements the same `ChatBackend` interface the
+router uses, so the router is unchanged.
+
+- Switch: `BRIDGE_BACKEND=robob` in the environment, or `"backend": "robob"`
+  in `~/.config/spectrum-bridge/config.json`. The default is `openchamber`; any
+  other value stops the bridge at startup.
+- Server and token: `T3_CONTROL_URL` + `T3_CONTROL_TOKEN`, else the JSON file
+  `T3_CONTROL_TOKEN_FILE` or `~/.robob/ardud-control.json`
+  (`{"url":"http://127.0.0.1:<port>","token":"..."}`, chmod 600, loopback URL only).
+  Issue the token with `t3 auth session issue --base-dir <t3 home> --label bridges --ttl 365d --json`.
+- Chat root: `ROBOB_IMESSAGE_CHAT_ROOT`, else `robobChatRoot` in config.json,
+  else `~/.config/openchamber/imessage`. It must be a registered Robob project
+  (`t3 project add <root> --title iMessage`); `check` fails otherwise. Each new
+  chat is a thread in `<root>/<YYYY-MM-DD>/session-<uuid>`, which Robob
+  creates, with origin `imessage` and runtime mode `full-access`.
+- Model: the `imessage` preference from the OpenCode config, sent as
+  `provider/model` plus `variant` on create and on every send.
+- Channel guidance: the control API has no system record, so the guidance is
+  prepended to the message between two marker lines and stripped again when
+  the bridge reads messages back.
+- Ids: new routes store Robob thread ids. Stored `ses_` ids resolve through
+  `GET /threads/by-native/:ses`. A stored route the mapping does not know (404)
+  is dropped while idle, so the next text starts a fresh chat.
+- Auto-accept: a thread counts as auto-accepting when its `runtimeMode` is
+  `full-access`. Approvals and questions are read from the thread detail and
+  answered with `POST /threads/:id/requests/:rid/respond`.
+- Origin backfill marks owned threads with `PUT /threads/:id/origin`, under
+  its own `robob-origin-marked:` keys.
+
 ## OpenCode 2 API
 
 OpenChamber v2 forwards `/api/*` to OpenCode 2 unchanged (OpenCode 2 serves

@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { createApi } from "./api.ts";
 import { startAppsServer } from "./apps.ts";
 import { Delivery } from "./delivery.ts";
-import { alertSkillPath, backendConnection, imessageChatRoot, loadConfig, skillPath, stateRoot, telegramBridgeSocket } from "./config.ts";
+import { alertSkillPath, loadConfig, skillPath, stateRoot, telegramBridgeSocket } from "./config.ts";
 import { ingest } from "./ingress.ts";
 import { acquireLock } from "./lock.ts";
-import { OpenChamber } from "./openchamber.ts";
+import { backendKind, createBackend } from "./backend.ts";
+import { RobobBackend, retireUnresolvedRoute } from "./robob.ts";
 import { backfillOrigins, OriginBackfill } from "./origin-backfill.ts";
 import { canonicalOwnerChat, Photon } from "./photon.ts";
 import { publish } from "./publish.ts";
@@ -72,8 +73,8 @@ async function main(): Promise<void> {
   const mode = process.argv[2] ?? "serve";
   if (!["serve", "check", "pair"].includes(mode)) throw new Error("Unknown bridge command");
   const photon = new Photon(process.env.SPECTRUM_PROJECT_ID ?? "", process.env.SPECTRUM_PROJECT_SECRET ?? "");
-  const connection = await backendConnection();
-  const backend = new OpenChamber(connection.baseUrl, connection.headers, { chatRoot: imessageChatRoot });
+  const kind = backendKind(process.env, config);
+  const backend = await createBackend(kind, config);
   if (mode === "check" || mode === "pair") {
     try {
       await photon.check();
@@ -81,6 +82,7 @@ async function main(): Promise<void> {
       const health = await backend.health();
       if (billing.tier !== "pro" || billing.status !== "active") throw new Error("Active Pro plan required");
       if (health?.status !== "ok" || typeof health.openchamberVersion !== "string") throw new Error("Backend not healthy");
+      if (backend instanceof RobobBackend && !await backend.chatRootRegistered()) throw new Error("iMessage chat root is not a Robob project");
       log("checks-passed");
       if (mode === "pair") {
         const user = await cloudRequest("/users/", { type: "shared", phoneNumber: config.owner });
@@ -90,7 +92,7 @@ async function main(): Promise<void> {
         // This is the public contact the owner needs to message, not an authentication secret.
         console.log(JSON.stringify({ assignedPhoneNumber: user.assignedPhoneNumber, sentMessages: 0 }));
       } else {
-        console.log(JSON.stringify({ plan: "pro", backendVersion: health?.openchamberVersion, enabled: config.enabled }));
+        console.log(JSON.stringify({ plan: "pro", backend: kind, backendVersion: health?.openchamberVersion, enabled: config.enabled }));
       }
     } finally { await photon.close(); }
     return;
@@ -119,6 +121,7 @@ async function main(): Promise<void> {
   }
   store.set("identity", identity);
   if (store.get<number>("bootstrapCutoff") === undefined) store.set("bootstrapCutoff", Date.now());
+  log("backend-selected", kind);
   let stopping = false;
   let synchronized = false;
   let controlsPending = true;
@@ -216,10 +219,13 @@ async function main(): Promise<void> {
   }
   // Sessions created before OpenChamber learned the iMessage origin are marked
   // in small background passes; inbound handling never waits on them.
-  const originBackfill = new OriginBackfill(() => backfillOrigins(store, backend), log);
+  const originBackfill = new OriginBackfill(() => backfillOrigins(store, backend, undefined,
+    // Robob keeps origins in its own table, so sessions marked in OpenChamber are marked again there.
+    kind === "robob" ? "robob-origin-marked:" : undefined), log);
   async function tick(): Promise<void> {
     let backendCheckedAt = 0;
     let secretsSweptAt = 0;
+    let routeCheckedAt = 0;
     while (!stopping) {
       // Runs even when messaging is not ready: submitted values must still expire on time.
       if (Date.now() - secretsSweptAt >= 30_000) {
@@ -227,6 +233,11 @@ async function main(): Promise<void> {
         await sweepSecrets(secretDeps).catch(() => log("secret-sweep-failed"));
       }
       if (!originBackfill.done) void originBackfill.kick();
+      if (backend instanceof RobobBackend && ready() && !router?.status().activeTurn && Date.now() - routeCheckedAt >= 30_000) {
+        routeCheckedAt = Date.now();
+        // A stored ses_ route the OpenCode import never mapped starts a fresh chat instead of stalling.
+        if (await retireUnresolvedRoute(store, backend).catch(() => false)) log("route-unresolved-retired");
+      }
       if (ready()) {
         const revision = ingressRevision;
         try {

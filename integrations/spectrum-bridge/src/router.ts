@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { stripInternalText } from "./formatting.ts";
-import { assistantText, type FilePart, type MessageRecord, type OpenChamber, type PermissionRequest, type QuestionRequest } from "./openchamber.ts";
+import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type PermissionRequest, type QuestionRequest } from "./openchamber.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
 import { imessagePreferences } from "./preferred-model.ts";
@@ -245,7 +245,7 @@ export class Router {
 
   constructor(
     private readonly store: Store,
-    private readonly backend: OpenChamber,
+    private readonly backend: ChatBackend,
     private readonly transport: Pick<Photon, "typing" | "read" | "downloadAttachment">,
     private readonly options: Options,
   ) {

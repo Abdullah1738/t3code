@@ -1,8 +1,8 @@
-import type { OpenChamber } from "./openchamber.ts";
+import type { ChatBackend } from "./openchamber.ts";
 import type { Store } from "./store.ts";
 
 const ID = /^[^\p{Cc}]{1,4096}$/u;
-const doneKey = (id: string) => `origin-marked:${id}`;
+const ORIGIN_MARKED = "origin-marked:";
 
 /**
  * Every OpenCode session this bridge owns: the current route, sessions the
@@ -43,10 +43,12 @@ export const BACKFILL_BATCH = 10;
  */
 export async function backfillOrigins(
   store: Store,
-  backend: Pick<OpenChamber, "markImessageOrigin">,
+  backend: Pick<ChatBackend, "markImessageOrigin">,
   limit = BACKFILL_BATCH,
+  prefix = ORIGIN_MARKED,
 ): Promise<{ marked: number; already: number; missing: number; pending: number }> {
   const result = { marked: 0, already: 0, missing: 0, pending: 0 };
+  const doneKey = (id: string) => `${prefix}${id}`;
   const waiting = ownedSessions(store).filter(session => store.get<boolean>(doneKey(session.id)) !== true);
   const todo = waiting.slice(0, limit);
   result.pending = waiting.length - todo.length;
