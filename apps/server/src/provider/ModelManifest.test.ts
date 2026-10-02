@@ -346,7 +346,9 @@ const serviceLayers = (input: {
 }) =>
   ServerConfig.layerTest(process.cwd(), { prefix: input.prefix }).pipe(
     Layer.provideMerge(NodeServices.layer),
-    Layer.provideMerge(ServerSettings.layerTest(input.settings ?? {})),
+    Layer.provideMerge(
+      ServerSettings.layerTest({ enableProviderUpdateChecks: true, ...input.settings }),
+    ),
     Layer.provideMerge(httpClientLayer(input.response)),
   );
 
