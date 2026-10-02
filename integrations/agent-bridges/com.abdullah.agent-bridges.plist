@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.abdullah.agent-bridges</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string><string>-f</string>
+    <string>/Users/ardud/.local/share/agent-bridges/start.zsh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/ardud/.local/share/agent-bridges</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>15</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/ardud/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/ardud/.config/agent-bridges/service.log</string>
+  <key>StandardErrorPath</key><string>/Users/ardud/.config/agent-bridges/service-error.log</string>
+</dict>
+</plist>

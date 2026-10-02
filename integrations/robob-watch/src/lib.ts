@@ -1,0 +1,301 @@
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+export const HOME = homedir();
+export const ROOT = process.env.ROBOB_WATCH_ROOT ?? join(HOME, ".local/share/robob-watch");
+export const WATCHERS = join(ROOT, "watchers");
+export const ARCHIVE = join(ROOT, "archive");
+export const HELPERS = join(ROOT, "helpers");
+export const WA_LOCK = join(ROOT, "wa.lock");
+/** wacli's store (kept live by `wacli sync --follow`); its WAL grows/changes whenever a message is stored. */
+export const WACLI_STORE = process.env.WACLI_STORE_DIR ?? join(homedir(), ".wacli");
+export const WA_TRIGGERS = [join(WACLI_STORE, "wacli.db-wal"), join(WACLI_STORE, "wacli.db")];
+export const BUN = join(HOME, ".bun/bin/bun");
+export const SPECTRUM_CLI = process.env.ROBOB_WATCH_SPECTRUM_CLI ?? join(HOME, ".local/share/spectrum-bridge/src/cli.ts");
+export const TELEGRAM_CLI = process.env.ROBOB_WATCH_TELEGRAM_CLI ?? join(HOME, ".local/share/telegram-bridge/src/cli.ts");
+export const BRIDGE_DB = process.env.ROBOB_WATCH_BRIDGE_DB ?? join(HOME, ".config/spectrum-bridge/state.sqlite");
+export const PATH = [HELPERS, join(HOME, ".local/bin"), join(HOME, ".bun/bin"), "/opt/homebrew/bin", "/usr/local/bin",
+  "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
+
+export const MIN_INTERVAL = 5;
+export const DEFAULT_INTERVAL = 15;
+export const CHECK_TIMEOUT_MS = 60_000;
+export const FAILURE_ALERT_AFTER = 5;
+/** Holds the WATCH_RUN id of the last run whose output the runner recorded (see whatsapp-new-message's outbox). */
+export const RUN_OK_FILE = ".run-ok";
+const MAX_EVENT = 6_000;
+const MAX_WAKE = 12_000;
+const MAX_LOG = 512 * 1024;
+
+export type Mode = "wake" | "notify";
+export type Watcher = {
+  id: string;
+  title: string;
+  check: string;
+  interval_s: number;
+  mode: Mode;
+  context: string;
+  expires_at: string | null;
+  /** 0 means unlimited. */
+  max_fires: number;
+  /** Serialize with every other serial check and all wa usage (the WhatsApp TUI cannot be driven concurrently). */
+  serial: boolean;
+  paused: boolean;
+  /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
+  headsup?: boolean;
+  /**
+   * Files whose change (mtime/size) runs the check on the next 1s tick instead of waiting for interval_s,
+   * e.g. ~/Library/Messages/chat.db-wal. interval_s stays as the fallback cadence.
+   */
+  triggers?: string[];
+  /** Minimum seconds between trigger-driven runs (default 2); raise it for expensive checks on busy files. */
+  trigger_gap_s?: number;
+  created_at: string;
+  created_by_session: string | null;
+};
+export type State = {
+  status: "active" | "done" | "expired";
+  fires: number;
+  last_run_at?: string;
+  last_fire_at?: string;
+  next_at?: number;
+  consecutive_failures: number;
+  failure_alerted: boolean;
+  last_error?: string;
+  /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
+  pending?: { key: string; event: string; at: string };
+  last_delivery?: string;
+  /** Delivered wakes whose bridge inbound row may still be queued behind a busy agent turn. */
+  wakes?: TrackedWake[];
+  /** Trigger-file signature seen at the start of the last run. */
+  trigger_sig?: string;
+};
+export type TrackedWake = { inbound: string; key: string; event: string; delivered_at: number; attempts?: number };
+
+export const HEADSUP_MS = Number(process.env.ROBOB_WATCH_HEADSUP_MS ?? 120_000);
+/** Tracking is dropped after this long even if the row state could never be read. */
+export const HEADSUP_GIVE_UP_MS = 6 * 3_600_000;
+
+export const validId = (id: unknown): id is string => typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,47}$/.test(id);
+export const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+export const now = () => Date.now();
+export const iso = (ms = now()) => new Date(ms).toISOString();
+
+export const watcherDir = (id: string) => join(WATCHERS, id);
+
+/** Cheap change signature of a watcher's trigger files (a stat per file). */
+export function triggerSig(watcher: Watcher): string | undefined {
+  if (!watcher.triggers?.length) return undefined;
+  return watcher.triggers.map(path => {
+    try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; } catch { return "missing"; }
+  }).join("|");
+}
+
+export function readJson<T>(path: string): T | undefined {
+  try { return JSON.parse(readFileSync(path, "utf8")) as T; } catch { return undefined; }
+}
+
+export function writeJson(path: string, value: unknown): void {
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
+}
+
+export function normalize(input: Partial<Watcher> & Record<string, unknown>): Watcher {
+  const errors: string[] = [];
+  if (!validId(input.id)) errors.push("id must be 1-48 chars of a-z, 0-9, - (starting alphanumeric)");
+  if (typeof input.title !== "string" || !input.title.trim() || input.title.length > 200 || /[\x00-\x1f]/.test(input.title)) errors.push("title must be one line, 1-200 chars");
+  if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
+  const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
+  if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
+  const mode = input.mode ?? "wake";
+  if (mode !== "wake" && mode !== "notify") errors.push("mode must be wake or notify");
+  let triggers = input.triggers === undefined ? [] : input.triggers;
+  // whatsapp-new-message reads wacli's store; its WAL changes on every stored message, so trigger on it.
+  // The old whatscli session.db trigger is replaced (it no longer means anything to these checks).
+  if (Array.isArray(triggers) && typeof input.check === "string" && /\bwhatsapp-new-message\b/.test(input.check)) {
+    triggers = [...triggers.filter(t => typeof t !== "string" || !t.includes("whatscli/session.db")), ...WA_TRIGGERS]
+      .filter((t, i, all) => all.indexOf(t) === i);
+  }
+  if (!Array.isArray(triggers) || triggers.some(t => typeof t !== "string" || !t.trim()) || triggers.length > 8) errors.push("triggers must be up to 8 file paths");
+  if (typeof (input.context ?? "") !== "string" || String(input.context ?? "").length > 6_000) errors.push("context must be text up to 6000 chars");
+  if (mode === "wake" && !String(input.context ?? "").trim()) errors.push("wake watchers need context (owner intent, background, what to do on fire)");
+  const expires = input.expires_at ?? null;
+  if (expires !== null && (typeof expires !== "string" || Number.isNaN(Date.parse(expires)))) errors.push("expires_at must be an ISO date");
+  const maxFires = input.max_fires === undefined ? 1 : Number(input.max_fires);
+  if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
+  if (errors.length) throw new Error(errors.join("; "));
+  return {
+    id: input.id!, title: input.title!.trim(), check: input.check!, interval_s: interval, mode: mode as Mode,
+    context: String(input.context ?? "").trim(), expires_at: expires === null ? null : new Date(expires).toISOString(),
+    // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
+    max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
+    paused: input.paused === true,
+    ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
+    ...(input.headsup === true ? { headsup: true } : {}),
+    ...(Number.isFinite(Number(input.trigger_gap_s)) && Number(input.trigger_gap_s) > 0 ? { trigger_gap_s: Number(input.trigger_gap_s) } : {}),
+    created_at: typeof input.created_at === "string" ? input.created_at : iso(),
+    created_by_session: typeof input.created_by_session === "string" && input.created_by_session ? input.created_by_session : null,
+  };
+}
+
+export function loadWatcher(id: string): Watcher | undefined {
+  return readJson<Watcher>(join(watcherDir(id), "watcher.json"));
+}
+
+export function loadState(id: string): State {
+  return readJson<State>(join(watcherDir(id), "state.json")) ?? { status: "active", fires: 0, consecutive_failures: 0, failure_alerted: false };
+}
+
+export function saveState(id: string, state: State): void {
+  writeJson(join(watcherDir(id), "state.json"), state);
+}
+
+export function listIds(): string[] {
+  if (!existsSync(WATCHERS)) return [];
+  return readdirSync(WATCHERS).filter(name => validId(name) && existsSync(join(WATCHERS, name, "watcher.json"))).sort();
+}
+
+export function log(id: string | null, message: string): void {
+  const line = `${iso()} ${message.replace(/\n/g, "\\n")}\n`;
+  if (!id) { process.stdout.write(line); return; }
+  const path = join(watcherDir(id), "log");
+  try {
+    if (existsSync(path) && statSync(path).size > MAX_LOG) {
+      const text = readFileSync(path, "utf8");
+      writeFileSync(path, text.slice(text.length / 2));
+    }
+    appendFileSync(path, line);
+  } catch { /* A missing dir (removed mid-run) is fine. */ }
+}
+
+export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
+
+export type CheckResult = { code: number | null; stdout: string; stderr: string; timedOut: boolean };
+
+/** Runs a check in its own process group so a timeout kills everything it started. */
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = CHECK_TIMEOUT_MS): Promise<CheckResult> {
+  const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
+  return new Promise(resolve => {
+    const child = spawn(shell[0]!, shell.slice(1), {
+      cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
+      env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
+    child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ }
+    }, timeoutMs);
+    child.on("close", code => { clearTimeout(timer); resolve({ code, stdout, stderr, timedOut }); });
+    child.on("error", error => { clearTimeout(timer); resolve({ code: 127, stdout, stderr: String(error), timedOut }); });
+  });
+}
+
+async function run(args: string[], timeoutMs = 20_000): Promise<{ ok: boolean; out: string }> {
+  const child = Bun.spawn(args, { env: { HOME, PATH }, stdout: "pipe", stderr: "pipe", timeout: timeoutMs, killSignal: "SIGKILL" });
+  const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, 500) };
+}
+
+export function liveSession(): string | undefined {
+  const result = spawnSync("/usr/bin/sqlite3", ["-readonly", BRIDGE_DB, "select json_extract(value,'$.id') from kv where key='route'"],
+    { encoding: "utf8", timeout: 10_000 });
+  const id = result.stdout?.trim();
+  return result.status === 0 && id && /^ses[A-Za-z0-9_]+$/.test(id) ? id : undefined;
+}
+
+/** The bridge names a wake's inbound row after the sha256 of its dedupe key (api.ts /wake). */
+export const wakeInboundId = (key: string) => `wake:${hash(key)}`;
+
+/**
+ * State of a bridge inbound row: "pending" means still queued (the agent has not started on it);
+ * processing/batched/done/cancelled/failed/unknown all mean the router has taken it. "missing" if absent,
+ * undefined if the database could not be read.
+ */
+export function inboundState(id: string): string | undefined {
+  if (!/^wake:[a-f0-9]{64}$/.test(id)) return undefined;
+  const result = spawnSync("/usr/bin/sqlite3", ["-readonly", BRIDGE_DB, `select state from inbound where id='${id}'`],
+    { encoding: "utf8", timeout: 10_000 });
+  if (result.status !== 0) return undefined;
+  return result.stdout.trim() || "missing";
+}
+
+export function headsUpText(watcher: Watcher, event: string): string {
+  const line = event.trim().replace(/\s+/g, " ");
+  const short = line.length <= 160 ? `${line.replace(/[.!?]+$/, "")}.` : `${line.slice(0, 157).trimEnd()}...`;
+  return `Heads-up from watcher ${watcher.title}: ${short} I'll follow up properly when I'm free.`;
+}
+
+/** Telegram accepts only a short plain source label. */
+const telegramSource = (text: string) => (text.replace(/[^A-Za-z0-9 ._-]/g, " ").replace(/\s+/g, " ").trim() || "Watcher").slice(0, 40);
+
+export function wake(source: string, text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  return run([BUN, SPECTRUM_CLI, "wake", "--source", source.slice(0, 100), "--text", clip(text, MAX_WAKE), "--key", key]);
+}
+
+export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
+  const session = liveSession();
+  if (!session) return { ok: false, out: "no live route session" };
+  return run([BUN, SPECTRUM_CLI, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
+}
+
+export function telegram(source: string, text: string, key: string, severity = "info"): Promise<{ ok: boolean; out: string }> {
+  return run([BUN, TELEGRAM_CLI, "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
+}
+
+export function wakeText(watcher: Watcher, event: string, state: State, test = false): string {
+  const fires = watcher.max_fires === 0 ? `fire ${state.fires + 1}, unlimited` : `fire ${state.fires + 1} of ${watcher.max_fires}`;
+  const after = watcher.max_fires !== 0 && state.fires + 1 >= watcher.max_fires
+    ? "This watcher is now finished and disabled. If the owner still wants it watched, add a fresh one."
+    : "The watcher keeps running; manage it with robob-watch show/pause/remove " + watcher.id + ".";
+  return [
+    `${test ? "[TEST FIRE, not a real event: acknowledge briefly and do nothing else] " : ""}${watcher.title}`,
+    "",
+    "Event:",
+    clip(event.trim(), MAX_EVENT),
+    "",
+    "Context saved when this watcher was set up (written by the agent that set it up; the owner's instructions for this event):",
+    watcher.context || "(none)",
+    "",
+    `Watcher ${watcher.id} (${fires}). ${after}`,
+  ].join("\n");
+}
+
+export type Delivery = { ok: boolean; via: string; detail: string };
+
+/** Delivers one event; each channel is idempotent under the same key. */
+export async function deliver(watcher: Watcher, event: string, key: string, state: State, test = false): Promise<Delivery> {
+  const tried: string[] = [];
+  const plain = `${test ? "[Watcher test] " : ""}${watcher.title}\n${clip(event.trim(), MAX_EVENT)}`;
+  if (watcher.mode === "wake") {
+    const result = await wake(`robob-watch ${watcher.id}`, wakeText(watcher, event, state, test), key);
+    if (result.ok) return { ok: true, via: "wake", detail: result.out };
+    tried.push(`wake: ${result.out}`);
+  }
+  const sent = await imessage(plain, key);
+  if (sent.ok) return { ok: true, via: "imessage-send", detail: [...tried, sent.out].join(" | ") };
+  tried.push(`send: ${sent.out}`);
+  const notified = await telegram(`Watcher ${watcher.id}`, plain, key);
+  if (notified.ok) return { ok: true, via: "telegram", detail: [...tried, notified.out].join(" | ") };
+  tried.push(`telegram: ${notified.out}`);
+  return { ok: false, via: "none", detail: tried.join(" | ") };
+}
+
+/** Housekeeping notices (failures, expiry) go to the alert channel first, iMessage second. */
+export async function alert(watcher: Watcher, text: string, key: string, severity = "attention"): Promise<Delivery> {
+  const notified = await telegram(`Watcher ${watcher.id}`, text, key, severity);
+  if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
+  const sent = await imessage(`${watcher.title}: ${text}`, key);
+  return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
+}
+
+export function ensureDirs(): void {
+  for (const dir of [ROOT, WATCHERS, ARCHIVE]) mkdirSync(dir, { recursive: true, mode: 0o700 });
+}

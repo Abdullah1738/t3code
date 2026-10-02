@@ -1,0 +1,52 @@
+#!/bin/zsh
+# whatsapp-new-message JID [--from NAME]
+# Prints new incoming WhatsApp messages (not "Me:") in that chat since the last run, one
+# "(dd-mm-yy HH:MM:SS) Name: text" line each. First run records a baseline and prints nothing.
+#
+# Since 1 Oct 2026 this reads wacli's durable store (~/.wacli/wacli.db, written live by the
+# com.ardud.wacli-sync LaunchAgent), not the whatscli TUI:
+# - The cursor is the store's insert rowid, kept per chat in $WATCH_DIR/wadb-<id>.json, so nothing is skipped:
+#   same-second messages, late or offline deliveries, both the phone JID and LID chat (resolved automatically).
+# - The cheap gate is the DB itself (~10ms). No TUI, no lock, no 600s forced re-read.
+# - Edits of recent messages fire once more ("(edited)"). Reactions are ignored unless WA_REACTIONS=1.
+# - Outbox: if the runner didn't record a run (timeout or crash), its events are printed again on the next run.
+# - Exits 1 if the sync daemon is down, so the watcher backs off and alerts instead of silently seeing nothing.
+#   Messages that arrive while it's down are caught up when it reconnects (offline sync), and the cursor then
+#   delivers them.
+# Migration: a watcher with legacy TUI state (wa-<id>.seen) gets the replies since that file was created, then
+# switches to the cursor.
+set -u
+jid=${1:?usage: whatsapp-new-message JID [--from NAME]}; shift
+from=""
+[[ ${1:-} == --from ]] && from=${2:?--from needs a name}
+dir=${WATCH_DIR:-.}
+[[ $jid == *@* ]] || jid="$jid@s.whatsapp.net"
+H=${0:A:h}
+canon=$("$H/wa-db" resolve "$jid" 2>/dev/null | grep -m1 '@s.whatsapp.net$') || canon=$jid
+[[ -n $canon ]] || canon=$jid
+key="${jid%%@*}${from:+-${from//[^A-Za-z0-9]/_}}"
+if [[ ! -f $dir/wadb-${canon%%@*}${from:+-${from//[^A-Za-z0-9]/_}}.json ]]; then
+  # Legacy TUI state: replies newer than its last successful read (recorded in .seen.sig, else the .seen mtime)
+  # were never reported, so they fire once now.
+  legacy="$dir/wa-$key.seen"
+  if [[ -f $legacy ]]; then
+    since=0
+    [[ -f $legacy.sig ]] && read -r _ since _ < $legacy.sig 2>/dev/null
+    [[ ${since:-0} == <-> && ${since:-0} -gt 0 ]] || since=$(/usr/bin/stat -f %m "$legacy" 2>/dev/null || echo 0)
+    export WA_BASELINE_SINCE=$since
+  fi
+fi
+# Daemon liveness in pure zsh (no python spawn): the sync process holds ~/.wacli/LOCK with its pid.
+store=${WACLI_STORE_DIR:-$HOME/.wacli}
+lpid=$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$store/LOCK" 2>/dev/null)
+[[ -n $lpid ]] && kill -0 $lpid 2>/dev/null || { echo "wacli sync daemon is not running (LOCK pid '${lpid:-none}')" >&2; exit 1; }
+# Python launches are occasionally killed by macOS (syspolicyd stalls on this Mac); retry those, never lose state:
+# wa-db only advances its cursor after it has printed.
+for try in 1 2 3; do
+  out=$(WA_RETRY=$(( try > 1 )) "$H/wa-db" new "$jid" ${from:+--from "$from"}); rc=$?
+  (( rc == 0 )) && { [[ -n $out ]] && print -r -- "$out"; exit 0; }
+  (( rc > 0 && rc < 128 )) && break   # a real error (not a kill): do not retry
+  sleep 1
+done
+echo "wa-db new failed (rc=$rc)" >&2
+exit 1

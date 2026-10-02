@@ -1,0 +1,7 @@
+{
+  "compilerOptions": {
+    "target": "ESNext", "module": "ESNext", "moduleResolution": "bundler", "strict": true, "noEmit": true,
+    "allowImportingTsExtensions": true, "skipLibCheck": true, "types": ["bun"], "typeRoots": ["../spectrum-bridge/node_modules/@types"]
+  },
+  "include": ["src"]
+}

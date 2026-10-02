@@ -1,0 +1,6 @@
+{
+  "name": "robob-watch",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "bun src/runner.ts", "check": "bunx tsc --noEmit -p ." }
+}

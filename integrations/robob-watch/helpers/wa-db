@@ -1,0 +1,391 @@
+#!/usr/bin/python3
+"""wa-db: read-only access to wacli's message store (~/.wacli/wacli.db, kept live by `wacli sync --follow`).
+
+  wa-db resolve JID|NUMBER        all JIDs of that chat (phone JID, LID; or the group JID), one per line
+  wa-db read JID [--limit N]      last N messages (default 40), "(dd-mm-yy HH:MM:SS) Me|Name: text", oldest first
+  wa-db new JID [--from NAME]     whatsapp-new-message backend (message-id cursor in $WATCH_DIR), see that helper
+  wa-db find QUERY                "<jid> | name | push name" contact search
+  wa-db chats [N]                 recent chats
+  wa-db health                    exit 0 if the sync daemon is live (lock held + heartbeat/DB fresh), else 1 + reason
+
+Times print in the Mac's local zone (Asia/Dubai). Never writes wacli.db.
+"""
+import json, os, re, sqlite3, sys, time
+
+HOME = os.path.expanduser("~")
+STORE = os.environ.get("WACLI_STORE_DIR", os.path.join(HOME, ".wacli"))
+DB = os.path.join(STORE, "wacli.db")
+SESSION_DB = os.path.join(STORE, "session.db")
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def connect(path=DB):
+    if not os.path.exists(path):
+        die(f"wa-db: {path} missing (is wacli paired?)")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    con.execute("pragma busy_timeout=5000")
+    return con
+
+
+def norm(jid):
+    jid = jid.strip()
+    if "@" not in jid:
+        jid = re.sub(r"[^0-9]", "", jid) + "@s.whatsapp.net"
+    return jid
+
+
+def resolve(con, jid):
+    """Every JID the person/group can appear under. wacli stores DMs under the phone JID once it knows the
+    mapping, but older rows or unmapped contacts can still sit under the LID, so both are always queried."""
+    jid = norm(jid)
+    user, server = jid.split("@", 1)
+    out = [jid]
+    if server in ("s.whatsapp.net", "lid"):
+        pairs = []
+        try:
+            s = connect(SESSION_DB)
+            if server == "lid":
+                pairs = [r[0] + "@s.whatsapp.net" for r in s.execute("select pn from whatsmeow_lid_map where lid=?", (user,))]
+            else:
+                pairs = [r[0] + "@lid" for r in s.execute("select lid from whatsmeow_lid_map where pn=?", (user,))]
+            s.close()
+        except Exception:
+            pass
+        for p in pairs:
+            if p not in out:
+                out.append(p)
+    return out
+
+
+_names = {}
+
+
+def name_of(con, jid):
+    """Best display name for a person JID, across both identities (phone JID and LID) and both stores."""
+    if jid in _names:
+        return _names[jid]
+    ids = resolve(con, jid)
+    q = ",".join("?" * len(ids))
+    name = ""
+    for r in con.execute(f"select coalesce(nullif(a.alias,''), nullif(c.full_name,''), nullif(c.business_name,''), nullif(c.system_name,''), nullif(c.push_name,'')) "
+                         f"from contacts c left join contact_aliases a on a.jid=c.jid where c.jid in ({q})", ids):
+        if r[0]:
+            name = r[0]
+            break
+    if not name:
+        try:
+            s = connect(SESSION_DB)
+            for r in s.execute(f"select coalesce(nullif(full_name,''), nullif(business_name,''), nullif(push_name,'')) from whatsmeow_contacts where their_jid in ({q})", ids):
+                if r[0]:
+                    name = r[0]
+                    break
+            s.close()
+        except Exception:
+            pass
+    _names[jid] = name
+    return name
+
+
+def label(con, row):
+    """Display name for an incoming message: contact name/push name (either identity), else the sender id."""
+    sender, sname, chat = row["sender_jid"] or "", row["sender_name"] or "", row["chat_jid"]
+    jid = sender if chat.endswith("@g.us") else chat
+    name = name_of(con, jid) or sname
+    return name or (sender or chat).split("@")[0]
+
+
+def body(row):
+    text = row["text"] or ""
+    mt = row["media_type"] or ""
+    if mt:
+        tag = {"image": "IMAGE", "video": "VIDEO", "audio": "AUDIO", "document": "DOCUMENT", "sticker": "STICKER",
+               "gif": "GIF", "location": "LOCATION", "live_location": "LOCATION"}.get(mt, mt.upper())
+        extra = row["filename"] or ""
+        cap = row["media_caption"] or (text if text and not text.startswith("[") else "")
+        text = f"[{tag}{': ' + extra if extra else ''}]" + (f" {cap}" if cap else "")
+    if row["reaction_emoji"]:
+        text = f"[reacted {row['reaction_emoji']}]"
+    if not text:
+        text = row["display_text"] or "[unsupported message]"
+    if row["edited"]:
+        text += " (edited)"
+    if row["revoked"]:
+        text = "[deleted] " + text
+    return " / ".join(l for l in text.splitlines() if l.strip()) or text
+
+
+def fmt(con, row):
+    t = time.strftime("%d-%m-%y %H:%M:%S", time.localtime(row["ts"]))
+    who = "Me" if row["from_me"] else label(con, row)
+    return f"({t}) {who}: {body(row)}"
+
+
+COLS = "rowid, chat_jid, msg_id, sender_jid, sender_name, ts, from_me, text, display_text, media_type, media_caption, filename, reaction_emoji, edited, edited_ts, revoked"
+
+
+def rows(con, jids, where="", args=(), order="ts, rowid", limit=None):
+    con.row_factory = sqlite3.Row
+    q = f"select {COLS} from messages where chat_jid in ({','.join('?' * len(jids))}) and deleted_at is null {where} order by {order}"
+    if limit:
+        q = f"select * from ({q.replace('order by ' + order, 'order by ts desc, rowid desc')} limit {int(limit)}) order by ts, rowid"
+    return con.execute(q, (*jids, *args)).fetchall()
+
+
+def cmd_read(args):
+    if not args:
+        die("usage: wa-db read JID [--limit N]", 2)
+    limit = 40
+    if "--limit" in args:
+        limit = int(args[args.index("--limit") + 1])
+    con = connect()
+    jids = resolve(con, args[0])
+    rs = rows(con, jids, limit=limit)
+    if not rs:
+        die(f"wa read: no messages stored for {args[0]}", 4)
+    for r in rs:
+        print(fmt(con, r))
+
+
+def cmd_resolve(args):
+    con = connect()
+    print("\n".join(resolve(con, args[0])))
+
+
+def cmd_find(args):
+    q = " ".join(args)
+    con = connect()
+    like = f"%{q}%"
+    seen = set()
+    sql = ("select c.jid, coalesce(nullif(a.alias,''), nullif(c.full_name,''), nullif(c.business_name,''), nullif(c.system_name,''), ''), coalesce(c.push_name,'') "
+           "from contacts c left join contact_aliases a on a.jid=c.jid where c.full_name like ? or c.push_name like ? or c.business_name like ? "
+           "or c.system_name like ? or a.alias like ? or c.jid like ? or c.phone like ? limit 25")
+    out = []
+    for jid, name, push in con.execute(sql, (like,) * 7).fetchall():
+        out.append((jid, name or name_of(con, jid), push))
+    try:
+        s = connect(SESSION_DB)
+        for jid, name, push in s.execute("select their_jid, coalesce(nullif(full_name,''), business_name, ''), coalesce(push_name,'') from whatsmeow_contacts "
+                                         "where full_name like ? or push_name like ? or business_name like ? or their_jid like ? limit 25", (like,) * 4):
+            if not any(o[0] == jid for o in out):
+                out.append((jid, name, push))
+        s.close()
+    except Exception:
+        pass
+    for jid, name in con.execute("select jid, name from chats where name like ? or jid like ? limit 25", (like, like)):
+        if not any(o[0] == jid for o in out):
+            out.append((jid, name if name and "@" not in name else "", ""))
+    for jid, name, push in out:
+        if jid in seen:
+            continue
+        seen.add(jid)
+        print(f"{jid} | {name} | {push}")
+        # Show the other identity (LID <-> phone) so callers know both exist.
+        for alt in resolve(con, jid)[1:]:
+            if alt not in seen:
+                seen.add(alt)
+                print(f"{alt} | {name} | {push}")
+
+
+def cmd_chats(args):
+    n = int(args[0]) if args else 40
+    con = connect()
+    for jid, name, unread in con.execute("select jid, coalesce(name,''), unread_count from chats where kind in ('dm','group') "
+                                         "order by coalesce(last_message_ts,0) desc limit ?", (n,)).fetchall():
+        nm = name if name and "@" not in name else ("" if jid.endswith("@g.us") else name_of(con, jid))
+        print(f"{nm or jid.split('@')[0]}{f' ({unread})' if unread else ''} | {jid}")
+
+
+def daemon_status():
+    """(ok, reason). Live = the sync process holds the store lock and the DB or heartbeat moved recently,
+    or the process is up (quiet chats legitimately leave both untouched)."""
+    lock = os.path.join(STORE, "LOCK")
+    try:
+        m = re.search(r"pid[=\":\s]+(\d+)", open(lock).read())
+        pid = int(m.group(1)) if m else None
+    except Exception:
+        pid = None
+    if not pid:
+        return False, "wacli sync not running (no lock owner)"
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False, f"wacli sync pid {pid} is gone"
+    return True, f"pid {pid}"
+
+
+def cmd_health(args):
+    ok, why = daemon_status()
+    print(("online " if ok else "offline ") + why)
+    sys.exit(0 if ok else 1)
+
+
+# --- whatsapp-new-message backend -------------------------------------------------------------------------
+# State: $WATCH_DIR/wadb-<chat>[-<from>].json = {"rowid": last processed messages.rowid, "edits": {msg_id: edited_ts}}
+# Cursor is the store's insert rowid (monotonic, never reused), so late/out-of-order timestamps, same-second
+# messages and history-sync inserts are all caught exactly once. Edits re-fire once (edited_ts moves).
+# Outbox: events from a run the runner did not ack ($WATCH_RUN vs $WATCH_DIR/.run-ok) are printed again.
+HISTORY_GRACE = 6 * 3600  # an insert whose timestamp is older than this is history backfill, not a new reply
+OUTBOX_TTL = 3600  # an unacked event is replayed for at most an hour
+OUTBOX_MAX_REPLAYS = 3
+MIGRATE_LOOKBACK = 24 * 3600  # on migration from TUI state, never report anything older than this
+
+
+def legacy_seen_keys(wdir):
+    """'(dd-mm-yy HH:MM:SS) ' prefixes of every line any legacy TUI .seen file in this watcher recorded (already
+    reported or baselined), plus the newest such time. Used so a migration never re-reports them."""
+    keys, newest = set(), 0
+    for f in os.listdir(wdir):
+        if f.startswith("wa-") and f.endswith(".seen"):
+            for line in open(os.path.join(wdir, f), errors="replace"):
+                for m in re.finditer(r"\(?(\d\d-\d\d-\d\d \d\d:\d\d:\d\d)\)", line):
+                    keys.add(m.group(1))
+                    try:
+                        newest = max(newest, int(time.mktime(time.strptime(m.group(1), "%d-%m-%y %H:%M:%S"))))
+                    except ValueError:
+                        pass
+    return keys, newest
+
+
+def cmd_new(args):
+    if not args:
+        die("usage: wa-db new JID [--from NAME]", 2)
+    jid = args[0]
+    who = args[args.index("--from") + 1] if "--from" in args else ""
+    wdir = os.environ.get("WATCH_DIR", ".")
+    con = connect()
+    jids = resolve(con, jid)
+    # One cursor per person/chat: the phone JID and the LID share it (keyed by the phone JID when known), so a check
+    # that lists both JIDs reports each message once.
+    canon = next((j for j in jids if j.endswith("@s.whatsapp.net")), jids[0])
+    key = canon.split("@")[0] + (("-" + re.sub(r"[^A-Za-z0-9]", "_", who)) if who else "")
+    statef = os.path.join(wdir, f"wadb-{key}.json")
+    outbox = statef + ".outbox"
+    run = os.environ.get("WATCH_RUN", "")
+    carry = []
+    replays = 0
+    outbox_same_run = False
+    if os.path.exists(outbox):
+        # The outbox holds lines printed by ONE earlier run. If the runner acked that run they were recorded, so
+        # drop them. Otherwise replay them, but at most OUTBOX_MAX_REPLAYS times and only within OUTBOX_TTL, and
+        # always re-stamped with the current run id, so an acked replay clears them. (Bug 1 Oct 2026: replays kept
+        # the old run id, which could never be acked again, so the same lines re-fired on every run.)
+        try:
+            ob = json.load(open(outbox))
+        except Exception:
+            ob = {}
+        okid = open(os.path.join(wdir, ".run-ok")).read().strip() if os.path.exists(os.path.join(wdir, ".run-ok")) else ""
+        fresh_ob = time.time() - float(ob.get("at", 0)) < OUTBOX_TTL and int(ob.get("replays", 0)) < OUTBOX_MAX_REPLAYS
+        if run and ob.get("run") == run:
+            # Same run already printed these (phone JID and LID share this cursor): don't print them twice.
+            outbox_same_run = True
+        elif run and ob.get("run") != okid and fresh_ob:
+            carry = ob.get("lines", [])
+            replays = int(ob.get("replays", 0)) + 1
+        else:
+            os.remove(outbox)
+
+    con.row_factory = sqlite3.Row
+    top = con.execute("select coalesce(max(rowid),0) from messages").fetchone()[0]
+    if not os.path.exists(statef):
+        # Baseline: everything stored now counts as seen. A legacy TUI .seen file's birth time (watcher created
+        # earlier) lets replies since then fire, so migrating a live watcher can't swallow a pending reply.
+        since = int(os.environ.get("WA_BASELINE_SINCE", "0") or 0)
+        new = []
+        if since > 0:
+            # Only replies after the legacy state's newest recorded line AND not already in any legacy .seen file
+            # (they were reported, or baselined, by the TUI helper), and never older than MIGRATE_LOOKBACK.
+            keys, newest = legacy_seen_keys(wdir)
+            floor = max(since, newest, int(time.time()) - MIGRATE_LOOKBACK)
+            new = [r for r in rows(con, jids, "and from_me=0 and ts>? and coalesce(reaction_emoji,'')=''", (floor,))
+                   if (not who or label(con, r) == who) and time.strftime("%d-%m-%y %H:%M:%S", time.localtime(r["ts"])) not in keys]
+        lines = [fmt(con, r) for r in new]
+        emit(lines, run, outbox)
+        json.dump({"rowid": top, "edits": {}, "at": int(time.time())}, open(statef + ".tmp", "w"))
+        os.replace(statef + ".tmp", statef)
+        return
+    st = json.load(open(statef))
+    cur = int(st.get("rowid", 0))
+    edits = st.get("edits", {})
+    now = time.time()
+    # WA_INCLUDE_ME=1 (tests only): also report our own messages, e.g. a self-chat end-to-end test.
+    mine = "" if os.environ.get("WA_INCLUDE_ME") == "1" else "and from_me=0"
+    fresh = rows(con, jids, f"and rowid>? {mine}", (cur,), order="rowid")
+    lines = []
+    for r in fresh:
+        if who and label(con, r) != who:
+            continue
+        if r["reaction_emoji"] and not os.environ.get("WA_REACTIONS"):
+            continue
+        if now - r["ts"] > HISTORY_GRACE:
+            continue
+        lines.append(fmt(con, r))
+    # Edits of recent incoming messages re-fire once.
+    for r in rows(con, jids, "and from_me=0 and edited=1 and edited_ts>?", (int(now) - 7 * 86400,)):
+        if who and label(con, r) != who:
+            continue
+        prev = edits.get(r["msg_id"])
+        if prev == r["edited_ts"]:
+            continue
+        # Already-seen message (rowid <= cursor) edited since we last looked: report it once more.
+        if r["rowid"] <= cur and (prev is not None or r["edited_ts"] > st.get("at", 0)):
+            lines.append(fmt(con, r))
+        edits[r["msg_id"]] = r["edited_ts"]
+    st = {"rowid": top, "edits": dict(list(edits.items())[-200:]), "at": int(now)}
+    if outbox_same_run and os.environ.get("WA_RETRY") != "1":
+        # The other identity of this chat already printed the outbox lines in this run; add only new ones.
+        ob = json.load(open(outbox))
+        prev = ob.get("lines", [])
+        add = [l for l in lines if l not in prev]
+        if add:
+            ob["lines"] = prev + add
+            json.dump(ob, open(outbox + ".tmp", "w"))
+            os.replace(outbox + ".tmp", outbox)
+            print("\n".join(add))
+            sys.stdout.flush()
+    else:
+        if outbox_same_run:  # retry after this run's earlier attempt was killed: its output never reached the runner
+            carry = json.load(open(outbox)).get("lines", [])
+        seen = set()
+        allx = [l for l in carry + lines if not (l in seen or seen.add(l))]
+        emit(allx, run, outbox, replays=replays if carry and not outbox_same_run else 0)
+    # Cursor moves only after the events are in the outbox and on stdout.
+    json.dump(st, open(statef + ".tmp", "w"))
+    os.replace(statef + ".tmp", statef)
+
+
+def emit(lines, run, outbox, replays=0):
+    """Print lines; with a runner run id, keep them in the outbox (stamped with THIS run) until that run is acked."""
+    if run and lines:
+        prev_at = time.time()
+        if replays and os.path.exists(outbox):
+            try:
+                prev_at = float(json.load(open(outbox)).get("at", prev_at))
+            except Exception:
+                pass
+        json.dump({"run": run, "lines": lines, "at": prev_at, "replays": replays}, open(outbox + ".tmp", "w"))
+        os.replace(outbox + ".tmp", outbox)
+    elif os.path.exists(outbox):
+        os.remove(outbox)
+    if lines:
+        print("\n".join(lines))
+
+
+def main():
+    if len(sys.argv) < 2:
+        die(__doc__, 2)
+    cmd, args = sys.argv[1], sys.argv[2:]
+    fn = {"read": cmd_read, "resolve": cmd_resolve, "find": cmd_find, "chats": cmd_chats, "health": cmd_health, "new": cmd_new}.get(cmd)
+    if not fn:
+        die(__doc__, 2)
+    try:
+        fn(args)
+    except sqlite3.Error as e:
+        die(f"wa-db: sqlite error: {e}")
+
+
+if __name__ == "__main__":
+    main()

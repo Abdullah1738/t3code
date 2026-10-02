@@ -1,0 +1,7 @@
+#!/bin/zsh
+# wa-lock CMD...  Historical: serialised access to the whatscli TUI. `wa` is backed by wacli now (no TUI, safe to run
+# concurrently), so this just runs CMD. Legacy TUI calls (`wa tui ...`) still take the lock.
+if [[ ${1:-} == wa && ${2:-} == (tui|screen) && -z ${WA_LOCKED:-} ]]; then
+  exec /usr/bin/lockf -k -t 120 "$HOME/.local/share/robob-watch/wa.lock" env WA_LOCKED=1 "$@"
+fi
+exec "$@"

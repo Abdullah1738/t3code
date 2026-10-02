@@ -1,0 +1,40 @@
+#!/bin/zsh
+# output-changed [--show] [--label TEXT] -- CMD...   (or: output-changed --url URL [--show])
+# Fires when CMD's output (or the URL body) differs from last run. First run records a baseline silently.
+# --show prints the new output (clipped to 3000 chars) instead of a one-line summary. A failing CMD is a check failure.
+set -u
+show=0; label=""; url=""
+while (( $# )); do
+  case $1 in
+    --show) show=1; shift ;;
+    --label) label=$2; shift 2 ;;
+    --url) url=$2; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+dir=${WATCH_DIR:-.}
+if [[ -n $url ]]; then
+  out=$(curl -fsSL --max-time 30 "$url") || { echo "fetch failed: $url" >&2; exit 1; }
+  [[ -n $label ]] || label=$url
+else
+  (( $# )) || { echo "usage: output-changed [--show] [--label TEXT] -- CMD... | --url URL" >&2; exit 2; }
+  out=$("$@") || { echo "command failed: $*" >&2; exit 1; }
+  [[ -n $label ]] || label="$*"
+fi
+key=$(print -rn -- "${url:-$*}" | shasum -a 256 | cut -c1-16)
+state="$dir/out-$key"
+new=$(print -rn -- "$out" | shasum -a 256 | cut -c1-64)
+if [[ ! -f $state.sha ]]; then print -r -- "$new" > $state.sha; print -r -- "$out" > $state.last; exit 0; fi
+old=$(<$state.sha)
+[[ $new == "$old" ]] && exit 0
+print -r -- "$new" > $state.sha
+if (( show )); then
+  echo "Changed: $label"
+  print -r -- "$out" | head -c 3000
+else
+  echo "Changed: $label"
+  diff <(print -r -- "$(<$state.last)") <(print -r -- "$out") | head -40
+fi
+print -r -- "$out" > $state.last
+exit 0

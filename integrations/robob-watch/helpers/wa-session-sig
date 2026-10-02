@@ -1,0 +1,18 @@
+#!/bin/zsh
+# wa-session-sig JID   prints a hash of the Signal session rows for that contact (phone JID and its LID), or for a
+# group (...@g.us) of its sender-key rows. An incoming message advances the ratchet, so the hash changes; a local
+# sqlite read, no TUI. Prints nothing (exit 1) if the store can't be read.
+set -u
+jid=${1:?usage: wa-session-sig JID}; id=${jid%%@*}
+DB="$HOME/Library/Application Support/whatscli/session.db"
+if [[ $jid == *@g.us ]]; then
+  [[ $id == [0-9-]## ]] || exit 1
+  out=$(/usr/bin/sqlite3 -readonly -cmd '.timeout 2000' "file:$DB?mode=ro" "select sender_id||hex(sender_key) from whatsmeow_sender_keys where chat_id='$jid' order by sender_id" 2>/dev/null) || exit 1
+  print -rn -- "g$out" | shasum -a 256 | cut -c1-16
+  exit 0
+fi
+[[ $id == <-> ]] || exit 1
+ids=$(/usr/bin/sqlite3 -readonly -cmd '.timeout 2000' "file:$DB?mode=ro" "select '$id' union select lid from whatsmeow_lid_map where pn='$id' union select pn from whatsmeow_lid_map where lid='$id'" 2>/dev/null) || exit 1
+where=$(print -r -- "$ids" | grep . | sed "s/.*/their_id like '&\\\\_%' escape '\\\\'/" | paste -sd'|' - | sed 's/|/ or /g')
+out=$(/usr/bin/sqlite3 -readonly -cmd '.timeout 2000' "file:$DB?mode=ro" "select their_id||hex(session) from whatsmeow_sessions where $where order by their_id" 2>/dev/null) || exit 1
+print -rn -- "$out" | shasum -a 256 | cut -c1-16

@@ -1,0 +1,190 @@
+# Spectrum Photon Bridge
+
+This directory documents the companion private Photon Cloud Pro bridge used with
+OpenChamber. The bridge is intentionally kept as a separate package: it talks to
+OpenChamber through the authenticated loopback HTTP/SSE API and does not start a
+second OpenChamber or OpenCode backend.
+
+The bridge source and tests are vendored here for reproducible maintenance. Do
+not add credentials, SQLite state, sockets, generated dependencies, or local
+verification artifacts to this repository. Runtime credentials and state remain
+under `~/.config/spectrum-bridge/`.
+
+## Relationship to OpenChamber
+
+- OpenChamber owns session state, including the Sessions review board.
+- The bridge creates or reuses a Chats session and sends prompts through the
+  authenticated loopback API.
+- The bridge is conversations only. Notifications, reminders, review notices,
+  and interactive alerts live on the telegram bridge; the CLI here is
+  `health`, the session-bound sends, `react`, and `wake`. Reminder and alert commands
+  are rejected with a pointer to the telegram bridge.
+- The conversation model is a private `imessage` key in the OpenCode config
+  (`~/.config/opencode/opencode.jsonc`), deliberately separate from
+  OpenChamber's desktop default and OpenCode's global `model` default:
+  `"imessage": { "model": "provider/model", "variant": "...", "prompt": "..." }`.
+  Every prompt carries the model to OpenCode explicitly; a missing or malformed
+  key falls back to OpenCode's own default resolution. Every conversational
+  turn also opens with built-in iMessage guidance so the agent knows it is
+  texting over iMessage: it may use the Photon message features (send-file,
+  react) when they serve the conversation, and it must format replies as plain,
+  text-like messages without Markdown tables, headers, or code fences. An
+  optional `prompt` string (trimmed, at most 2000 characters, no control
+  characters beyond newlines) replaces that built-in guidance at prompt time;
+  any malformed value falls back to the built-in text.
+- Every outbound text (relayed replies, CLI `send`, send-file captions,
+  question/approval prompts and notices) and every app-card caption passes
+  through one sanitizer in `formatting.ts` at delivery time. It removes leaked
+  model-internal blocks (`<think>` and similar) and DCP context-management
+  metadata: `<dcp-...>` tags and blocks such as `<dcp-system-reminder>`, lines
+  that are exactly `[Compressed conversation section]`, and bare boundary ids
+  (`@162@`, `@b7@`, `@blocked@`) that stand alone as a token. Emails,
+  `@mentions`, URLs and code spans are left untouched. A message or card left
+  empty is cancelled and logged as `outbound-skipped`/`emptyAfterSanitize`
+  instead of sending an empty bubble.
+- Questions (OpenCode forms) and approvals raised in the active chat, or by
+  any running subagent below it at any depth, are sent into the conversation.
+  This is the only place they are asked: OpenChamber and the telegram bridge
+  stay silent for the whole family. The router rechecks the live request before every
+  send and before answering, so resolved or changed requests are never
+  answered. Forms with fields a text reply cannot answer (numbers, booleans,
+  external links, conditional fields) are announced but must be answered in
+  OpenChamber. Review notices and alerts for every other session live on the
+  telegram bridge.
+- The router answers `GET /router` on its unix socket so the telegram bridge
+  can defer alerting for requests this conversation owns.
+- Every chat session is created with `metadata.openchamber.origin: "imessage"`;
+  subagents inherit it. OpenChamber keeps these sessions off the Sessions board
+  and out of its review, question and approval notifications, and the telegram
+  bridge never prompts for them. Sessions from before the marker existed are
+  backfilled in the background, beside the router and never inside its tick:
+  the current route, rotated routes (their continuity seed) and every session
+  named by a conversation or control outbox row, at most 10 per pass. Each is
+  read; one without the origin gets a merge patch through OpenChamber's
+  metadata route, the same serialized queue OpenChamber's own goal, assist and
+  context writers use, so every other key is kept. A write is read back on the
+  next pass (a minute later); once a read shows the marker, or OpenCode answers
+  `SessionNotFoundError` for that exact session, it is recorded as
+  `origin-marked:<id>` in the kv table and never asked again. A failed pass is
+  logged and retried with backoff (30 seconds doubling to 30 minutes); it never
+  stops the bridge.
+- Incoming batches wait 15 seconds after the latest message. Photon 2.1 exposes
+  outgoing typing only, so text still being composed cannot extend the quiet window.
+- Incoming attachments are limited to 10 files and 100 MiB total per batch. Every
+  file is saved under the chat's `attachments/` folder and passed to the agent by
+  absolute path. Only images (PNG, JPEG, GIF, WebP, plus a JPEG preview of HEIC)
+  are also attached natively, since a part the model provider rejects leaves the
+  whole chat stuck. PDFs, archives and everything else are path-only. An image
+  over 3.5 MiB or 2000 px per side gets a JPEG preview from `/usr/bin/sips`, at
+  most 2000 px; if that fails or is still too big, it is path-only. Anthropic
+  allows 5 MB per image, and 8000 px per side, but only 2000 px once a request
+  carries more than 20 images, and earlier turns count. Headers claiming over
+  100 megapixels are never decoded. Native previews share a 10 MiB budget per
+  batch.
+- 100 MiB is about iMessage's own ceiling. Files are buffered whole in memory,
+  and the download deadline grows with size: 30 seconds plus one per MiB. Only
+  files up to 20 MiB are checkpointed as SQLite blobs, which are never pruned;
+  a larger file is downloaded again if its batch is retried, so such a batch
+  waits for a busy conversation before downloading. Transient failures
+  retry twice before producing a clear failure response. A Live Photo's unused
+  companion video does not count against the still image's budget.
+- A bridge restart never restarts OpenChamber.
+- Mini apps are served on loopback (`appsPort`, default 18791) from `appsRoot`.
+  They reach the tailnet on demand: `publish --app SLUG` or `publish --port N`
+  runs `tailscale serve` for a free HTTPS port in 18400-18499 (or reuses an
+  existing mapping) and prints the URL; `unpublish --port N` removes one. Only
+  ports in that range are ever created or removed.
+- Secure forms: `secret-request --session S --key K --purpose P --field name:Label[:type]`
+  sends a one-time app card (15 minutes) for credentials. Submitted values are
+  stored in `~/.config/spectrum-bridge/secrets/` (0600, never in the chat,
+  the database, or the apps root) and the agent is told which fields were
+  filled. `secret --token T --field NAME` prints one raw value;
+  `secret --token T --forget` deletes them, and they expire 30 minutes after
+  submission.
+- Watcher wakes: `wake --text T --source S --key K` (`POST /wake`) queues
+  `T` as a synthetic inbound row `wake:<sha256(K)>`, framed as
+  `[Watcher event from S, not typed by the owner. ...]`, so the agent handles
+  it as a new turn in whichever session is live. It is not session-bound, so it
+  follows rotation and `/new` (a pending wake carries over into the fresh chat).
+  The same key with different content is rejected. Like secure-form notices,
+  wakes are never taken as answers to pending questions or approvals, never
+  batched with owner texts, never used as quoted-reply or reaction targets, and
+  a turn that ends without text (or with `NO_REPLY`) simply closes. The
+  robob-watch runner (`~/.local/share/robob-watch`) is the intended caller.
+- Synthetic rows (wakes and secure-form notices) never get an owner-facing
+  "mind sending it again?" notice: nobody typed them. A turn for one that is
+  never accepted, or is interrupted before it starts, goes back to `pending`
+  with a backoff (30 s, then 60 s; the state is in kv `synthetic-retry:<id>`).
+  A turn that was accepted and then failed while running is not retried, since
+  its work may be partly done. The owner gets one notice naming the watcher. Owner texts queued behind it are not held up. Before
+  any retry POSTs, every earlier prompt for the row is checked with
+  `promptAccepted`. If one landed late, it is adopted instead of being sent
+  again. If the check itself fails, the retry waits. After 3 attempts the row
+  is marked `failed`, the owner gets one notice naming the watcher or form
+  (`synthetic-dropped:<hash>`), and the text rides along as quoted data in the
+  next submitted turn's system context (kv `missedSynthetic`) until a prompt
+  carrying it is accepted. A row going back to `pending` does not re-arm
+  robob-watch's heads-up: the runner stops tracking a wake once it sees any
+  state other than `pending`.
+- Owner texts whose prompt OpenCode never confirms (for example while it is
+  briefly unresponsive) are sent again before the owner is asked to resend:
+  3 attempts, re-sent after 1 and then 2 more minutes, with the "didn't catch
+  that" notice 2 minutes after the third (`OWNER_RESEND_MS`). Each attempt has
+  its own record id, and before every POST all earlier attempts are checked
+  with `promptAccepted`; one that landed late becomes the turn's prompt instead
+  of being duplicated. A failed read is never treated as absence: nothing is
+  re-sent until a read confirms none landed. A text still unconfirmed 10
+  minutes after it was first sent is given up on instead of being delivered
+  late (`OWNER_GIVE_UP_MS`). The exact prompt (text, guidance, files, model)
+  is kept in kv `resendBody` only while delivery is uncertain. Logged as
+  `owner-text-resent`, `owner-text-adopted` and `owner-text-undelivered`.
+- `batched` is a terminal inbound state: a non-leader member of a batch whose
+  text travelled inside the leader's prompt. The batch outcome is on the
+  leader row; the aggregate is kept in kv `batch:<leaderId>`.
+
+## OpenCode 2 API
+
+OpenChamber v2 forwards `/api/*` to OpenCode 2 unchanged (OpenCode 2 serves
+its own routes under `/api`), so the bridge calls OpenCode routes on the
+OpenChamber origin with the desktop client token. The chat directory travels
+in the `x-opencode-directory` header, percent-encoded; answers come wrapped in
+`{ data }` envelopes. What the router relies on:
+
+- New chats: `POST /api/session` with `location.directory` and
+  `metadata: { openchamber: { origin: "imessage" } }` in the body.
+- Origin backfill: `GET /api/session/:id`, then OpenChamber's own
+  `POST /api/openchamber/sessions/:id/metadata` with
+  `{ patch: { openchamber: { origin: "imessage" } }, directory }`. It answers
+  `{ metadata }`, the full merged object, which must name the origin.
+- A turn: `POST /api/session/:id/model` when a preferred model is configured
+  (the model is a session property now), `POST /api/session/:id/synthetic`
+  with `resume: false` for the iMessage guidance, then
+  `POST /api/session/:id/prompt` with the bridge's own message id, the text,
+  and image attachments as data URI files. The prompt is admitted to the session
+  inbox and returns at once.
+- Acceptance after a lost response: `GET /api/session/:id/message/:messageID`
+  (promoted) or `GET /api/session/:id/inbox` (still queued). Neither ever
+  resends the prompt; only a confirmed absence of every attempt does (owner
+  text only, see above).
+- Completion: session records are flat and have no parent link, so a turn is
+  every record after its prompt up to the `idle` record OpenCode appends when
+  execution settles. Only a succeeded turn whose last assistant step finished
+  with visible text is forwarded. A final text that is exactly `NO_REPLY`, or
+  has it alone on its last line, is a deliberate silent turn: nothing is sent,
+  and the inbound row and watermark advance as for an empty turn. A failed or
+  interrupted turn is reported as a response error. `GET /api/session/active` must also no longer list the
+  session.
+- Requests: `GET /api/session/:id/permission` and `/form`; replies go to
+  `POST /api/session/:id/permission/:requestID/reply` with `{ decision }` and
+  `POST /api/session/:id/form/:formID/reply` with an answer keyed by field.
+- Stopping a turn: `POST /api/session/:id/interrupt`.
+
+The operational setup and private credential handling remain in the local
+`imessage-notifications` skill. Use `bun run check` and `bun test` from this
+directory when changing the bridge.
+
+## Upstream
+
+The main OpenChamber repository remains the `upstream` Git remote. This fork is
+owned by `Abdullah1738` so cumulative OpenChamber changes and the companion
+bridge can be synchronized without losing local work.

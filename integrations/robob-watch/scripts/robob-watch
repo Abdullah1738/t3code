@@ -1,0 +1,2 @@
+#!/bin/zsh
+exec "$HOME/.bun/bin/bun" "$HOME/.local/share/robob-watch/src/cli.ts" "$@"

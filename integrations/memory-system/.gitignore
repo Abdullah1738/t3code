@@ -1,0 +1,12 @@
+# Never commit runtime data or environments from this system.
+data/
+logs/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.bak
+HANDOFF.md
