@@ -17,10 +17,11 @@ Checks (per Abdullah's scope, 2026-09-26):
                                     confidence below threshold. QUESTION.
 
 Policy (Abdullah): autofix what is clearly safe, ask on genuine conflict or
-ambiguity. Daily cadence. Questions open an OpenChamber review session
-(Sessions board): an agent researches each item, drafts decisions for
-src/apply_decisions.py and waits for Abdullah to approve or amend. Only one
-review is open at a time. Telegram digest is the fallback if OpenChamber is down.
+ambiguity. Daily cadence. Questions open a review session (OpenChamber, or a
+Robob thread when MEMORY_BACKEND=robob, see backend.py): an agent researches each
+item, drafts decisions for src/apply_decisions.py and waits for Abdullah to
+approve or amend. Only one review is open at a time. Telegram digest is the
+fallback if the review can't be opened.
 
 Run:
   .venv/bin/python -u src/janitor.py            # scan + autofix + print report
@@ -44,12 +45,16 @@ MAX_Q = 25                    # cap questions in one digest
 TG_CLI = "/Users/ardud/.local/share/telegram-bridge/src/cli.ts"
 BUN = "/Users/ardud/.bun/bin/bun"
 
-# Questions go to an OpenChamber review session (Sessions board) instead of a
-# Telegram digest. Telegram is only the fallback when OpenChamber is down.
+sys.path.insert(0, os.path.join(BASE, "src"))
+import backend  # noqa: E402
+
+# Questions go to a review session (OpenChamber session or Robob thread)
+# instead of a Telegram digest. Telegram is only the fallback when that fails.
 OC_URL = os.environ.get("OPENCHAMBER_URL", "http://127.0.0.1:57123")
 OC_PROJECT = "path_L1VzZXJzL2FyZHVk"          # /Users/ardud
 REVIEW_TASK_NAME = "Memory janitor review"
 REVIEW_MODEL = ("opus", "claude-opus-5-5", "xhigh")
+REVIEW_PROJECT_DIR = os.path.expanduser("~")       # same project as the OpenChamber task
 REVIEW_PROMPT = os.path.join(BASE, "src", "janitor_review_prompt.md")
 REVIEW_DIR = os.path.join(BASE, "logs", "janitor-review")
 REVIEW_STATE = os.path.join(REVIEW_DIR, "state.json")
@@ -316,7 +321,7 @@ def send_digest(questions, fixes, stats):
     return ok
 
 
-# ---------- OpenChamber review session ----------
+# ---------- review session ----------
 
 def fact_row(mem, fid):
     r = mem.execute(
@@ -379,8 +384,28 @@ def ensure_review_task():
     return res["task"]["id"]
 
 
+def open_robob_review():
+    """Start the review as a Robob thread. Returns (thread id, native session id)."""
+    prompt = open(REVIEW_PROMPT).read().strip()
+    body = {"title": REVIEW_TASK_NAME, "prompt": prompt, "directory": REVIEW_PROJECT_DIR,
+            "model": f"{REVIEW_MODEL[0]}/{REVIEW_MODEL[1]}", "variant": REVIEW_MODEL[2],
+            "runtimeMode": "full-access", "origin": "automation",
+            "clientRequestId": "memory-janitor-review:" + time.strftime("%Y-%m-%d")}
+    code, res = backend.control("POST", "/threads", body, timeout=120)
+    if code not in (200, 201) or not isinstance(res, dict) or not res.get("threadId"):
+        raise RuntimeError(f"create thread: HTTP {code} {backend._err(res)}")
+    native = None
+    try:
+        c2, detail = backend.control("GET", "/threads/" + backend.q(res["threadId"]))
+        if c2 == 200:
+            native = (detail.get("thread") or {}).get("nativeSessionId")
+    except Exception:
+        pass
+    return res["threadId"], native
+
+
 def open_review(report, items):
-    """Write the review snapshot and start an OpenChamber review session.
+    """Write the review snapshot and start the review session.
     Returns (ok, message). ok=False means the caller should fall back."""
     os.makedirs(REVIEW_DIR, exist_ok=True)
     now = int(time.time())
@@ -402,10 +427,15 @@ def open_review(report, items):
                  "status": "pending", "session_id": None,
                  "previous": {k: st.get(k) for k in ("review", "status", "session_id")} if st else None}
     try:
-        tid = ensure_review_task()
-        new_state["task_id"] = tid
-        res = oc_request("POST", f"/api/projects/{OC_PROJECT}/scheduled-tasks/{tid}/run", {}, timeout=120)
-        new_state["session_id"] = res.get("sessionId")
+        if backend.is_robob():
+            # session_id keeps meaning "where the review runs": the Robob thread id here
+            new_state["backend"] = "robob"
+            new_state["session_id"], new_state["native_session_id"] = open_robob_review()
+        else:
+            tid = ensure_review_task()
+            new_state["task_id"] = tid
+            res = oc_request("POST", f"/api/projects/{OC_PROJECT}/scheduled-tasks/{tid}/run", {}, timeout=120)
+            new_state["session_id"] = res.get("sessionId")
     except Exception as e:
         new_state["status"] = "failed"
         new_state["error"] = str(e)[:300]
@@ -544,7 +574,7 @@ def main():
     if args.notify and report["questions"]:
         items = build_review_items(mem, true_orphans, contras[:CONTRADICT_MAX], lowc)
         ok, msg = open_review(report, items)
-        print(f"  openchamber review: {msg}")
+        print(f"  {'robob' if backend.is_robob() else 'openchamber'} review: {msg}")
         if not ok:
             ok = send_digest(report["questions"], report["fixes"], report["stats"])
             print(f"  telegram digest (fallback): {'sent' if ok else 'FAILED'}")
