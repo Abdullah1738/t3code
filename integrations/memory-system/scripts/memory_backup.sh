@@ -74,9 +74,34 @@ free_gb=$(df -g "$REPO_ROOT" | awk 'NR==2{print $4}')
 [ "$free_gb" -ge "$MIN_FREE_GB" ] || fail disk "SSD free ${free_gb}G < ${MIN_FREE_GB}G"
 
 # 1. replicas
+# sqlite3_rsync can exit 0 without bringing the replica up to date (seen
+# 2026-09-30..10-02: memory.db replica frozen for two days while every run
+# "succeeded"). So record the live high-water mark of the append-only tables
+# *before* syncing and require the replica to reach it afterwards; retry once,
+# then fail loudly.
+hwm_sql() { # db -> query returning the append-only high-water mark ("" = none)
+  case "$1" in
+    memory.db) echo "SELECT coalesce(max(id),0) FROM episodic_events" ;;
+    opencode_raw.db) echo "SELECT coalesce(max(rowid),0) FROM raw_messages" ;;
+    *) echo "" ;;
+  esac
+}
 for db in memory.db opencode_raw.db consolidation.db fact_vectors.db; do
   [ -f "$DATA/$db" ] || continue
-  out=$("$SQRSYNC" "$DATA/$db" "$STAGE/$db" 2>&1) || fail replica "$db: $out"
+  sql=$(hwm_sql "$db"); want=""
+  if [ -n "$sql" ]; then
+    want=$("$SQLITE" -readonly "$DATA/$db" "$sql" 2>&1)
+    [[ "$want" =~ ^[0-9]+$ ]] || fail replica "$db: cannot read live high-water mark: $want"
+  fi
+  for attempt in 1 2; do
+    out=$("$SQRSYNC" -v "$DATA/$db" "$STAGE/$db" 2>&1) || fail replica "$db: $out"
+    log "replica $db try$attempt: $(printf '%s' "$out" | tail -1)"
+    [ -z "$want" ] && break
+    got=$("$SQLITE" -readonly "$STAGE/$db" "$sql" 2>&1)
+    [[ "$got" =~ ^[0-9]+$ ]] && [ "$got" -ge "$want" ] && break
+    [ "$attempt" = 2 ] && fail replica "$db replica not updated by sqlite3_rsync: replica=$got live>=$want"
+    log "replica $db behind after sync (replica=$got live>=$want), retrying"
+  done
 done
 "$SQLITE" "$DATA/agent_notes.db" ".backup '$STAGE/agent_notes.db'" 2>>"$LOG" || fail replica "agent_notes.db backup failed"
 # sqlite3_rsync verifies page hashes itself; here we only confirm each replica
