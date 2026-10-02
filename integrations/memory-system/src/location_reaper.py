@@ -16,7 +16,8 @@ So this job disconnects only the cua-driver MCP client in idle locations:
   POST /api/experimental/mcp/cua-driver/connect?location[directory]=DIR
       -> reconnects in <1 s.
 
-Per loaded location (GET /api/debug/location via OpenChamber):
+Per loaded location (GET /api/debug/location; MEMORY_BACKEND picks OpenChamber's
+proxy or the OpenCode service directly, see backend.py):
   keep/reconnect - a running session lives there (GET /api/session/active),
                    or any session there was created/updated/viewed within
                    ACTIVE_MIN, or the directory is in the keep file
@@ -37,10 +38,12 @@ Status: logs/location_reaper_last.json. --dry-run prints the plan only.
 import argparse, json, os, sqlite3, subprocess, sys, time, urllib.parse, urllib.request
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import backend  # noqa: E402
+
 ROOT = Path.home() / ".local/share/memory-system"
 LOGS = ROOT / "logs"
-OC_DB = Path.home() / ".local/share/opencode/opencode.db"
-OC_URL = os.environ.get("OPENCHAMBER_URL", "http://127.0.0.1:57123")
+OC_DB = Path(backend.opencode_db())
 KEEP_FILE = Path.home() / ".config/opencode/location-reaper-keep.txt"
 STATUS = LOGS / "location_reaper_last.json"
 SERVER = os.environ.get("LOCATION_REAPER_MCP", "cua-driver")
@@ -51,7 +54,7 @@ CUA_BIN = str(Path.home() / ".local/bin/cua-driver")
 
 
 def api(method, path, timeout=30):
-    req = urllib.request.Request(OC_URL + path, method=method)
+    req = backend.opencode_request(method, path)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = r.read()
         return r.status, (json.loads(body) if body else None)
@@ -115,6 +118,15 @@ def cua_procs():
     return procs, servers
 
 
+def serving_pids():
+    """PIDs listening on the OpenCode service port (robob backend), so the orphan
+    sweep only judges that server's children by its own loaded locations."""
+    port = urllib.parse.urlsplit(backend.opencode_url()).port or 80
+    out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                         capture_output=True, text=True).stdout
+    return {int(x) for x in out.split() if x.strip().isdigit()}
+
+
 def etime_s(e):
     days = 0
     if "-" in e:
@@ -137,7 +149,7 @@ def main():
     a = ap.parse_args()
     t0 = time.time()
     now_ms = int(t0 * 1000)
-    st = {"ts": int(t0), "dry_run": a.dry_run, "state": "done", "server": SERVER,
+    st = {"ts": int(t0), "dry_run": a.dry_run, "state": "done", "server": SERVER, "backend": backend.name(),
           "disconnected": [], "reconnected": [], "kept": {}, "killed_orphans": [], "errors": []}
     try:
         _, locs = api("GET", "/api/debug/location")
@@ -197,6 +209,8 @@ def main():
         _, locs = api("GET", "/api/debug/location")
         loaded_now = {l["directory"] for l in (locs or []) if l.get("directory")}
         procs, servers = cua_procs()
+        if backend.is_robob():
+            servers &= serving_pids()
         for p in procs:
             orphan = p["ppid"] == 1 or (p["ppid"] in servers and p["cwd"] not in loaded_now)
             if orphan and p["age_s"] >= ORPHAN_MIN * 60:
