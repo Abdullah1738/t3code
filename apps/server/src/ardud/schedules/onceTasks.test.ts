@@ -120,7 +120,7 @@ const seedOnceRow = (dueIso: string) =>
       title: "t3 test: once while down",
       prompt: "reply OK",
       enabled: 1,
-      schedule_json: JSON.stringify({ type: "once", at: dueIso }),
+      schedule_json: `{"type":"once","at":"${dueIso}"}`,
       project_id: "project-once",
       thread_id: null,
       workspace_strategy_json: '{"type":"root"}',

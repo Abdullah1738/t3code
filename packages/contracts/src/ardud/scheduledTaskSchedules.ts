@@ -37,8 +37,10 @@ export function onceScheduleProblem(at: string, timeZone: string | undefined): s
   const year = Number(at.slice(0, 4));
   const month = Number(at.slice(5, 7));
   const day = Number(at.slice(8, 10));
-  // Date rolls 2026-02-31 over into March; reject it instead.
-  if (day > new Date(Date.UTC(year, month, 0)).getUTCDate()) {
+  // Date parsing rolls 2026-02-31 over into March; reject it instead.
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day > (daysInMonth[month - 1] ?? 31)) {
     return "The timestamp has an impossible calendar date.";
   }
   if (timeZone !== undefined && !isValidTimeZone(timeZone)) {
