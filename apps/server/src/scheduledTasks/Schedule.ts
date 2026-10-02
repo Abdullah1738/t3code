@@ -1,6 +1,15 @@
 import { MIN_SCHEDULED_TASK_INTERVAL_MS, type ScheduledTaskSchedule } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
+import {
+  describeForkSchedule,
+  inScheduleZone,
+  isSameForkSchedule,
+  MISSED_ONCE_GRACE_MS,
+  nextCronRunAt,
+  nextOnceRunAt,
+} from "../ardud/schedules/scheduleMath.ts";
+
 const MINUTE_MS = 60_000;
 
 export function parseTimeOfDay(value: string): { hour: number; minute: number } | null {
@@ -20,13 +29,16 @@ export function nextScheduledRunAt(
       milliseconds: Math.max(schedule.everyMs, MIN_SCHEDULED_TASK_INTERVAL_MS),
     });
   }
+  if (schedule.type === "cron") return nextCronRunAt(schedule, from);
+  if (schedule.type === "once") return nextOnceRunAt(schedule, from);
 
   const time = parseTimeOfDay(schedule.timeOfDay);
   if (time === null) return null;
+  const zoned = inScheduleZone(from, schedule.timeZone);
   const weekdays =
     schedule.weekdays && schedule.weekdays.length > 0 ? new Set(schedule.weekdays) : null;
   for (let offset = 0; offset <= 7; offset += 1) {
-    const candidate = DateTime.setParts(DateTime.add(from, { days: offset }), {
+    const candidate = DateTime.setParts(DateTime.add(zoned, { days: offset }), {
       hour: time.hour,
       minute: time.minute,
       second: 0,
@@ -52,6 +64,7 @@ function weekdayKey(weekdays: ReadonlyArray<number> | undefined): string {
 
 /** Semantic equality for schedules: true iff both fire at the same times. */
 export function isSameSchedule(a: ScheduledTaskSchedule, b: ScheduledTaskSchedule): boolean {
+  if (a.type === "cron" || a.type === "once") return isSameForkSchedule(a, b) === true;
   if (a.type === "interval") {
     return b.type === "interval" && a.everyMs === b.everyMs;
   }
@@ -66,7 +79,8 @@ export function isSameSchedule(a: ScheduledTaskSchedule, b: ScheduledTaskSchedul
     bTime !== null &&
     aTime.hour === bTime.hour &&
     aTime.minute === bTime.minute &&
-    weekdayKey(a.weekdays) === weekdayKey(b.weekdays)
+    weekdayKey(a.weekdays) === weekdayKey(b.weekdays) &&
+    a.timeZone === b.timeZone
   );
 }
 
@@ -88,11 +102,28 @@ export function isMissedFixedTimeRun(
   dueAt: DateTime.DateTime,
   now: DateTime.DateTime,
 ): boolean {
-  if (schedule.type !== "fixed_time") return false;
+  // Cron runs are wall-clock slots too, so they follow the fixed-time rule.
+  if (schedule.type !== "fixed_time" && schedule.type !== "cron") return false;
   return DateTime.toEpochMillis(now) - DateTime.toEpochMillis(dueAt) > MISSED_FIXED_TIME_GRACE_MS;
 }
 
+/**
+ * True when a one-time run is overdue by more than an hour (the server was
+ * down). The task is then marked missed and disabled instead of firing late.
+ */
+export function isExpiredOnceRun(
+  schedule: ScheduledTaskSchedule,
+  dueAt: DateTime.DateTime,
+  now: DateTime.DateTime,
+): boolean {
+  if (schedule.type !== "once") return false;
+  return DateTime.toEpochMillis(now) - DateTime.toEpochMillis(dueAt) > MISSED_ONCE_GRACE_MS;
+}
+
 function describeSchedule(schedule: ScheduledTaskSchedule): string {
+  if (schedule.type === "cron" || schedule.type === "once") {
+    return describeForkSchedule(schedule) ?? schedule.type;
+  }
   if (schedule.type === "interval") {
     const minutes = schedule.everyMs / MINUTE_MS;
     if (Number.isInteger(minutes)) {

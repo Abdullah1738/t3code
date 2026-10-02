@@ -5,6 +5,7 @@ import type {
   ScheduledTaskUpsertInput,
 } from "@t3tools/contracts";
 import { resolveEnvironmentMachineKind } from "@t3tools/contracts";
+import { forkScheduleLabel } from "@t3tools/client-runtime/ardud/schedule-draft";
 import type { MenuAction } from "@react-native-menu/menu";
 import { DateTimePicker } from "@expo/ui/community/datetime-picker";
 import {
@@ -86,6 +87,9 @@ const DAYS = [
 ] as const;
 
 function describeSchedule(task: ScheduledTask): string {
+  if (task.schedule.type === "cron" || task.schedule.type === "once") {
+    return forkScheduleLabel(task.schedule) ?? task.schedule.type;
+  }
   if (task.schedule.type === "interval") return formatScheduledTaskInterval(task.schedule.everyMs);
   const days = task.schedule.weekdays?.length ? repeatLabel(task.schedule.weekdays) : "Every day";
   return `${days} at ${formatTime(task.schedule.timeOfDay)}`;
@@ -794,7 +798,9 @@ function TaskForm({
           <SegmentedControl
             options={[
               { value: "fixed_time", label: "At a time" },
-              { value: "interval", label: "Every interval" },
+              { value: "interval", label: "Interval" },
+              { value: "cron", label: "Cron" },
+              { value: "once", label: "Once" },
             ]}
             selected={draft.schedule.mode}
             onSelect={(mode) => {
@@ -803,7 +809,55 @@ function TaskForm({
             }}
           />
         </View>
-        {draft.schedule.mode === "fixed_time" ? (
+        {draft.schedule.mode === "cron" || draft.schedule.mode === "once" ? (
+          <>
+            {draft.schedule.mode === "cron" ? (
+              <FormField
+                label="Cron (minute hour day month weekday)"
+                value={draft.schedule.fork.cronExpression}
+                placeholder="0 9 * * 1-5"
+                disabled={saving}
+                borderTop
+                onChange={(cronExpression) =>
+                  setDraft({
+                    ...draft,
+                    schedule: {
+                      ...draft.schedule,
+                      fork: { ...draft.schedule.fork, cronExpression },
+                    },
+                  })
+                }
+              />
+            ) : (
+              <FormField
+                label="Run once at (YYYY-MM-DDTHH:MM)"
+                value={draft.schedule.fork.onceLocal}
+                placeholder="2026-10-05T12:55"
+                disabled={saving}
+                borderTop
+                onChange={(onceLocal) =>
+                  setDraft({
+                    ...draft,
+                    schedule: { ...draft.schedule, fork: { ...draft.schedule.fork, onceLocal } },
+                  })
+                }
+              />
+            )}
+            <FormField
+              label="Time zone"
+              value={draft.schedule.fork.timeZone}
+              placeholder="Asia/Dubai"
+              disabled={saving}
+              borderTop
+              onChange={(timeZone) =>
+                setDraft({
+                  ...draft,
+                  schedule: { ...draft.schedule, fork: { ...draft.schedule.fork, timeZone } },
+                })
+              }
+            />
+          </>
+        ) : draft.schedule.mode === "fixed_time" ? (
           <>
             <Pressable
               accessibilityRole="button"
@@ -908,7 +962,13 @@ function TaskForm({
       </SettingsSection>
       {draft.schedule.mode === "fixed_time" ? (
         <Text className="px-2 text-sm text-foreground-muted">
-          Time uses the environment's time zone, which may differ from your phone's.
+          {draft.schedule.fixedTimeZone
+            ? `Time uses ${draft.schedule.fixedTimeZone}.`
+            : "Time uses the environment's time zone, which may differ from your phone's."}
+        </Text>
+      ) : draft.schedule.mode === "once" ? (
+        <Text className="px-2 text-sm text-foreground-muted">
+          A one-time task turns itself off after it runs.
         </Text>
       ) : null}
       <Pressable

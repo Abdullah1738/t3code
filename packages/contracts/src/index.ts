@@ -56,6 +56,8 @@ export * from "./previewAutomation.ts";
 export * from "./resourceTelemetry.ts";
 export * from "./usage.ts";
 export * from "./scheduledTask.ts";
+export * from "./ardud/scheduledTaskSchedules.ts";
+export * from "./ardud/scheduleImport.ts";
 export * from "./worktreeMcp.ts";
 export * from "./resourceTelemetry.ts";
 export * from "./rpc.ts";

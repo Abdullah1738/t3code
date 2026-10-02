@@ -45,6 +45,12 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { WorktreeBaseBranchPicker } from "../WorktreeBaseBranchPicker";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { ForkScheduleFields, TimeZoneInput } from "../../ardud/schedules/ForkScheduleFields";
+import {
+  defaultForkScheduleDraft,
+  forkScheduleFromDraft,
+  forkScheduleLabel,
+} from "@t3tools/client-runtime/ardud/schedule-draft";
 import {
   matchesScheduledTaskScope,
   scheduledTaskDefaultModel,
@@ -102,6 +108,8 @@ const EMPTY_DRAFT: DraftState = {
   intervalMinutes: "15",
   timeOfDay: "09:00",
   weekdays: new Set([1, 2, 3, 4, 5]),
+  fork: defaultForkScheduleDraft(),
+  fixedTimeZoned: false,
   projectId: "",
   threadId: "",
   workspaceMode: "worktree",
@@ -148,20 +156,31 @@ function splitModelKey(value: string): ModelSelection | null {
   };
 }
 
-function scheduleFromDraft(draft: DraftState): ScheduledTaskSchedule {
+function scheduleFromDraft(
+  draft: DraftState,
+): { readonly schedule: ScheduledTaskSchedule } | { readonly problem: string } {
+  if (draft.scheduleMode === "cron" || draft.scheduleMode === "once") {
+    return forkScheduleFromDraft(draft.scheduleMode, draft.fork);
+  }
   if (draft.scheduleMode === "interval") {
     const everyMs = Math.round(Number(draft.intervalMinutes) * 60_000);
-    return { type: "interval", everyMs };
+    return { schedule: { type: "interval", everyMs } };
   }
   const selectedEveryDay = draft.weekdays.size === 0 || draft.weekdays.size === 7;
   return {
-    type: "fixed_time",
-    timeOfDay: draft.timeOfDay || "09:00",
-    ...(selectedEveryDay ? {} : { weekdays: [...draft.weekdays].toSorted() }),
+    schedule: {
+      type: "fixed_time",
+      timeOfDay: draft.timeOfDay || "09:00",
+      ...(selectedEveryDay ? {} : { weekdays: [...draft.weekdays].toSorted() }),
+      ...(draft.fixedTimeZoned ? { timeZone: draft.fork.timeZone.trim() } : {}),
+    },
   };
 }
 
 export function scheduleLabel(schedule: ScheduledTaskSchedule): string {
+  if (schedule.type === "cron" || schedule.type === "once") {
+    return forkScheduleLabel(schedule) ?? schedule.type;
+  }
   if (schedule.type === "interval") {
     const minutes = schedule.everyMs / 60_000;
     return Number.isInteger(minutes)
@@ -175,7 +194,7 @@ export function scheduleLabel(schedule: ScheduledTaskSchedule): string {
       : weekdays.length === 5 && weekdays.every((day) => day >= 1 && day <= 5)
         ? "Weekdays"
         : weekdays.map((day) => WEEKDAY_LABELS[day]).join(", ");
-  return `${days} at ${schedule.timeOfDay}`;
+  return `${days} at ${schedule.timeOfDay}${schedule.timeZone ? ` · ${schedule.timeZone}` : ""}`;
 }
 
 /**
@@ -565,7 +584,12 @@ function ScheduledTaskEditorDialog({
       reportFailure("Scheduled task is incomplete", "Add a title, prompt, project, and model.");
       return;
     }
-    const schedule = scheduleFromDraft(draft);
+    const built = scheduleFromDraft(draft);
+    if ("problem" in built) {
+      reportFailure("Invalid schedule", built.problem);
+      return;
+    }
+    const schedule = built.schedule;
     if (
       schedule.type === "interval" &&
       (!Number.isSafeInteger(schedule.everyMs) || schedule.everyMs < MIN_SCHEDULED_TASK_INTERVAL_MS)
@@ -635,7 +659,7 @@ function ScheduledTaskEditorDialog({
         <DialogHeader>
           <DialogTitle>{draft.editingId ? "Edit task" : "New task"}</DialogTitle>
           <DialogDescription>
-            Run a prompt automatically — on an interval or at a fixed time.
+            Run a prompt automatically — on an interval, at a fixed time, on a cron, or once.
           </DialogDescription>
         </DialogHeader>
 
@@ -826,51 +850,87 @@ function ScheduledTaskEditorDialog({
                   value={[draft.scheduleMode]}
                   onValueChange={(values) => {
                     const mode = values[0];
-                    if (mode === "fixed" || mode === "interval")
+                    if (
+                      mode === "fixed" ||
+                      mode === "interval" ||
+                      mode === "cron" ||
+                      mode === "once"
+                    )
                       setDraft((current) => ({ ...current, scheduleMode: mode }));
                   }}
                 >
                   <Toggle value="fixed">At a time</Toggle>
                   <Toggle value="interval">Every interval</Toggle>
+                  <Toggle value="cron">Cron</Toggle>
+                  <Toggle value="once">Once</Toggle>
                 </ToggleGroup>
               </div>
 
-              {draft.scheduleMode === "fixed" ? (
-                <div className="flex flex-wrap items-center gap-3">
-                  <div className="flex items-center gap-2">
-                    <Label htmlFor="scheduled-task-time">Run at</Label>
-                    <Input
-                      type="time"
-                      id="scheduled-task-time"
-                      nativeInput
-                      className="w-32"
-                      value={draft.timeOfDay}
-                      onChange={(event) =>
-                        setDraft((current) => ({ ...current, timeOfDay: event.target.value }))
+              {draft.scheduleMode === "cron" || draft.scheduleMode === "once" ? (
+                <ForkScheduleFields
+                  mode={draft.scheduleMode}
+                  draft={draft.fork}
+                  onChange={(fork) => setDraft((current) => ({ ...current, fork }))}
+                />
+              ) : draft.scheduleMode === "fixed" ? (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Switch
+                      id="scheduled-task-fixed-zone"
+                      checked={draft.fixedTimeZoned}
+                      onCheckedChange={(fixedTimeZoned) =>
+                        setDraft((current) => ({ ...current, fixedTimeZoned }))
                       }
                     />
-                    <span className="text-xs text-muted-foreground">on</span>
+                    <Label htmlFor="scheduled-task-fixed-zone">Use a specific time zone</Label>
+                    {draft.fixedTimeZoned ? (
+                      <TimeZoneInput
+                        value={draft.fork.timeZone}
+                        onChange={(timeZone) =>
+                          setDraft((current) => ({
+                            ...current,
+                            fork: { ...current.fork, timeZone },
+                          }))
+                        }
+                      />
+                    ) : null}
                   </div>
-                  <ToggleGroup
-                    multiple
-                    variant="outline"
-                    size="sm"
-                    aria-label="Days to run"
-                    value={[...draft.weekdays].map(String)}
-                    onValueChange={(values) => {
-                      if (values.length === 0) return;
-                      setDraft((current) => ({
-                        ...current,
-                        weekdays: new Set(values.map(Number)),
-                      }));
-                    }}
-                  >
-                    {WEEKDAY_ORDER.map((day) => (
-                      <Toggle key={day} value={String(day)} aria-label={WEEKDAY_LABELS[day]}>
-                        {WEEKDAY_SHORT[day]}
-                      </Toggle>
-                    ))}
-                  </ToggleGroup>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="scheduled-task-time">Run at</Label>
+                      <Input
+                        type="time"
+                        id="scheduled-task-time"
+                        nativeInput
+                        className="w-32"
+                        value={draft.timeOfDay}
+                        onChange={(event) =>
+                          setDraft((current) => ({ ...current, timeOfDay: event.target.value }))
+                        }
+                      />
+                      <span className="text-xs text-muted-foreground">on</span>
+                    </div>
+                    <ToggleGroup
+                      multiple
+                      variant="outline"
+                      size="sm"
+                      aria-label="Days to run"
+                      value={[...draft.weekdays].map(String)}
+                      onValueChange={(values) => {
+                        if (values.length === 0) return;
+                        setDraft((current) => ({
+                          ...current,
+                          weekdays: new Set(values.map(Number)),
+                        }));
+                      }}
+                    >
+                      {WEEKDAY_ORDER.map((day) => (
+                        <Toggle key={day} value={String(day)} aria-label={WEEKDAY_LABELS[day]}>
+                          {WEEKDAY_SHORT[day]}
+                        </Toggle>
+                      ))}
+                    </ToggleGroup>
+                  </div>
                 </div>
               ) : (
                 <div className="flex items-center gap-2">
