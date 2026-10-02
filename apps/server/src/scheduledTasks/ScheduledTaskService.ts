@@ -31,7 +31,13 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
-import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
+import {
+  isExpiredOnceRun,
+  isMissedFixedTimeRun,
+  isSameSchedule,
+  nextScheduledRunAt,
+} from "./Schedule.ts";
+import { ONCE_IN_PAST_MESSAGE, onceRunInPast } from "../ardud/schedules/onceTasks.ts";
 
 const decodeTask = Schema.decodeUnknownEffect(ScheduledTask);
 const decodeTaskId = Schema.decodeUnknownOption(ScheduledTaskId);
@@ -422,6 +428,17 @@ export const layer = Layer.effect(
         ),
       );
 
+    const disableTask = (id: ScheduledTaskId, atIso: string) =>
+      sql`
+        UPDATE scheduled_tasks
+        SET enabled = 0, next_run_at = NULL, updated_at = ${atIso}
+        WHERE task_id = ${id}
+      `.pipe(
+        Effect.mapError((cause) =>
+          taskError("Could not disable schedule task.", { taskId: id, cause }),
+        ),
+      );
+
     // Best-effort escape hatch: if anything fails between markRunning and
     // markCompleted, write a full terminal record so runDueTasks neither skips
     // the task forever (it filters out 'running' rows) nor re-fires it
@@ -568,6 +585,12 @@ export const layer = Layer.effect(
           lastRunError,
           runCount: scheduleSource.runCount + 1,
         };
+        // A one-time task is spent once its scheduled run fires: keep the
+        // record, but switch it off.
+        const onceSpent =
+          trigger === "scheduled" &&
+          scheduleSource.schedule.type === "once" &&
+          completed.nextRunAt === null;
         if (current !== null) {
           // startedAtIso in the guard ensures this writes only to the row this
           // run marked as running — a task deleted mid-run and recreated with
@@ -580,9 +603,10 @@ export const layer = Layer.effect(
             error: lastRunError,
             startedAtIso,
           });
+          if (onceSpent) yield* disableTask(task.id, completed.updatedAt);
           yield* notifyChanged;
         }
-        return completed;
+        return onceSpent ? { ...completed, enabled: false } : completed;
       }).pipe(
         Effect.onError((cause) => releaseStuckRun(task, errorMessage(cause))),
         Effect.ensuring(
@@ -620,6 +644,35 @@ export const layer = Layer.effect(
       yield* notifyChanged;
     });
 
+    // A one-time run that passed while the server was down for more than the
+    // grace window is not fired late: record it as missed and switch it off.
+    const markOnceMissed = Effect.fn("ScheduledTaskService.markOnceMissed")(function* (
+      task: ScheduledTask,
+      now: DateTime.DateTime,
+    ) {
+      yield* Effect.logInfo("Marking missed one-time schedule task", {
+        taskId: task.id,
+        missedRunAt: task.nextRunAt,
+      });
+      yield* sql`
+        UPDATE scheduled_tasks
+        SET enabled = 0,
+            next_run_at = NULL,
+            last_run_status = 'failed',
+            last_run_error = ${`Missed: the server was not running at ${task.nextRunAt}.`},
+            updated_at = ${iso(now)}
+        WHERE task_id = ${task.id} AND last_run_status <> 'running'
+      `.pipe(
+        Effect.mapError((cause) =>
+          taskError("Could not mark one-time schedule task as missed.", {
+            taskId: task.id,
+            cause,
+          }),
+        ),
+      );
+      yield* notifyChanged;
+    });
+
     const runDueTasks = Effect.fn("ScheduledTaskService.runDueTasks")(function* () {
       const now = yield* localNow;
       const tasks = yield* listDueTasks(now).pipe(
@@ -631,9 +684,11 @@ export const layer = Layer.effect(
       yield* Effect.forEach(
         due,
         ({ task, dueAt }) =>
-          (isMissedFixedTimeRun(task.schedule, dueAt, now)
-            ? rescheduleMissedRun(task, now)
-            : runTask(task, "scheduled")
+          (isExpiredOnceRun(task.schedule, dueAt, now)
+            ? markOnceMissed(task, now)
+            : isMissedFixedTimeRun(task.schedule, dueAt, now)
+              ? rescheduleMissedRun(task, now)
+              : runTask(task, "scheduled")
           ).pipe(
             Effect.catch((cause) =>
               Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
@@ -745,6 +800,9 @@ export const layer = Layer.effect(
           existingTask !== null &&
           existingTask.enabled === input.enabled &&
           isSameSchedule(existingTask.schedule, input.schedule);
+        if (input.enabled && !scheduleUnchanged && onceRunInPast(input.schedule, now)) {
+          return yield* taskError(ONCE_IN_PAST_MESSAGE, { taskId: id });
+        }
         const task: ScheduledTask = {
           id,
           title: input.title,
@@ -779,6 +837,9 @@ export const layer = Layer.effect(
         const existing = yield* loadTask(input.id);
         if (existing.enabled === input.enabled) return { task: existing };
         const now = yield* localNow;
+        if (input.enabled && onceRunInPast(existing.schedule, now)) {
+          return yield* taskError(ONCE_IN_PAST_MESSAGE, { taskId: input.id });
+        }
         const next = nextRunAt({ enabled: input.enabled, schedule: existing.schedule }, now);
         // RETURNING so a task deleted between the load and this UPDATE is a
         // visible not-found error, not a false success.

@@ -15,6 +15,14 @@ import {
   OrchestrationV2ThreadLaunchWorkspaceStrategy,
 } from "./orchestrationV2.ts";
 import { ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
+import {
+  fixedTimeZoneProblem,
+  ScheduledTaskCronSchedule,
+  ScheduledTaskFixedTimeZone,
+  ScheduledTaskOnceSchedule,
+  ScheduledTaskUpsertCronSchedule,
+  ScheduledTaskUpsertOnceSchedule,
+} from "./ardud/scheduledTaskSchedules.ts";
 
 /** 24-hour "HH:MM" wall-clock time. Mirrors `parseTimeOfDay` on the server. */
 const TimeOfDay = TrimmedNonEmptyString.check(
@@ -50,6 +58,7 @@ const ScheduledTaskFixedTimeSchedule = Schema.Struct({
       description: "Optional weekdays; omit to run every day.",
     }),
   ),
+  timeZone: ScheduledTaskFixedTimeZone,
 }).annotate({
   description: "Run at a fixed local wall-clock time on selected weekdays.",
 });
@@ -61,9 +70,11 @@ const ScheduledTaskFixedTimeSchedule = Schema.Struct({
 export const ScheduledTaskSchedule = Schema.Union([
   ScheduledTaskIntervalSchedule,
   ScheduledTaskFixedTimeSchedule,
+  ScheduledTaskCronSchedule,
+  ScheduledTaskOnceSchedule,
 ]).annotate({
   description:
-    "Structured recurring schedule. Pass an object with type 'interval' or 'fixed_time'.",
+    "Structured schedule. Pass an object with type 'interval', 'fixed_time', 'cron', or 'once'.",
 });
 export type ScheduledTaskSchedule = typeof ScheduledTaskSchedule.Type;
 
@@ -81,9 +92,14 @@ export const ScheduledTaskUpsertSchedule = Schema.Union([
   }).annotate({
     description: "Run repeatedly after a fixed number of milliseconds.",
   }),
-  ScheduledTaskFixedTimeSchedule,
+  ScheduledTaskFixedTimeSchedule.check(
+    Schema.makeFilter((schedule) => fixedTimeZoneProblem(schedule.timeZone)),
+  ),
+  ScheduledTaskUpsertCronSchedule,
+  ScheduledTaskUpsertOnceSchedule,
 ]).annotate({
-  description: "Writable recurring schedule. Pass an object with type 'interval' or 'fixed_time'.",
+  description:
+    "Writable schedule. Pass an object with type 'interval', 'fixed_time', 'cron', or 'once'.",
 });
 export type ScheduledTaskUpsertSchedule = typeof ScheduledTaskUpsertSchedule.Type;
 
