@@ -46,6 +46,7 @@ import * as ProviderRegistry from "../../provider/Services/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
+import { BoardService } from "../board/BoardService.ts";
 import {
   formatModel,
   lastAssistantText,
@@ -377,6 +378,10 @@ const makeRoutes = Effect.gen(function* () {
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
   const store = yield* ControlStore.ControlStore;
+  // Optional so the control API still works without the board layer.
+  const board = yield* Effect.serviceOption(BoardService);
+  const refreshBoard = (threadId: string) =>
+    board._tag === "Some" ? board.value.refreshThread(threadId).pipe(Effect.ignore) : Effect.void;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -687,6 +692,7 @@ const makeRoutes = Effect.gen(function* () {
       yield* store
         .setOrigin(launched.threadId, body.origin.trim())
         .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+      yield* refreshBoard(launched.threadId);
     }
     const initialMessageId = MessageId.make(commandId);
     const run = launched.projection.runs.find(
@@ -969,6 +975,7 @@ const makeRoutes = Effect.gen(function* () {
     yield* store
       .setOrigin(threadId, origin)
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    yield* refreshBoard(threadId);
     return json({ ok: true, threadId, origin });
   });
 

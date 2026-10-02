@@ -170,6 +170,9 @@ import {
 } from "./serverRuntimeState.ts";
 import { orchestrationHttpApiLayer } from "./orchestration-v2/http.ts";
 import { controlRouteLayer } from "./ardud/control/http.ts";
+// ardud fork: session board
+import { ArdudBoardLive } from "./ardud/board/layer.ts";
+import { ardudBoardRouteLayer } from "./ardud/board/http.ts";
 import { projectHttpApiLayer } from "./project/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -528,6 +531,7 @@ const RuntimeCoreDependenciesBaseLive = Layer.mergeAll(
   ProviderUsageLimitsIngestionLive,
   ProviderInstallationRefreshLive,
   ReplayMarkers.layer,
+  ArdudBoardLive,
 ).pipe(
   // Core Services
   Layer.provideMerge(OrchestrationApplicationLayerLive),
@@ -642,6 +646,7 @@ const makeRoutesLayer = Layer.mergeAll(
     scheduleImportRouteLayer,
     // ardud fork: local control API for bridges, crw and CLIs.
     controlRouteLayer,
+    ardudBoardRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
   ),
