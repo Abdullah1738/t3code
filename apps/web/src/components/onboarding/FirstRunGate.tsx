@@ -34,8 +34,7 @@ import { Button } from "../ui/button";
 /**
  * Holds back authenticated and hosted app trees until the first-run decision
  * is known, so a fresh install never flashes the main screen before the wizard.
- * Nothing renders while pending — no shell, no EventRouter (whose welcome
- * payload would otherwise navigate into a thread), no dialogs.
+ * Nothing renders while pending — no shell, no EventRouter, no dialogs.
  *
  * Decision order: a set `onboardingCompletedAt` resolves to the app as soon as
  * settings hydrate (the common case, no server round-trip). A `null` flag also

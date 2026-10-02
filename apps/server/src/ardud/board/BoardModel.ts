@@ -274,7 +274,8 @@ export class BoardModel {
     }
     if (active && row.deleted) row = { ...row, deleted: false };
     if ((observation.scheduledHint === true || automated) && !row.scheduled) {
-      row = { ...row, scheduled: true };
+      // Baselined automated threads have no prompt-driven stamp; date the card.
+      row = { ...row, scheduled: true, updatedAt: row.updatedAt || (row.promptAt ?? now) };
     }
 
     // The activation cutoff baselines old history: an untouched thread is never written.

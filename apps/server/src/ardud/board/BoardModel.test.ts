@@ -300,6 +300,15 @@ describe("session board model", () => {
     expect(f.lanes()).toEqual([["t_crw", "scheduled"]]);
   });
 
+  it("dates an automated card whose only prompt predates activation", () => {
+    const f = fixture();
+    f.model.origins.set("t_crw", "crw");
+    f.add("t_crw");
+    f.prompt("t_crw", 50);
+    expect(f.lanes()).toEqual([["t_crw", "scheduled"]]);
+    expect(f.model.rows.get("t_crw")?.updatedAt).toBe(50);
+  });
+
   it("tracks a pending question as needs-input on a running card and rolls subagent requests up", () => {
     const f = fixture();
     f.add("t_root");

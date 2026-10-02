@@ -1,8 +1,8 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
-// ardud fork: session board
-import { BoardPage } from "../ardud/board/BoardPage";
-
+// ardud fork: the board is the home page now; keep old /board links working.
 export const Route = createFileRoute("/board")({
-  component: BoardPage,
+  beforeLoad: () => {
+    throw redirect({ to: "/", replace: true });
+  },
 });

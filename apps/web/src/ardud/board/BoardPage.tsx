@@ -6,28 +6,32 @@ import {
   CircleHelpIcon,
   FolderIcon,
   GitBranchIcon,
+  PlusIcon,
   ShieldCheckIcon,
   Undo2Icon,
 } from "lucide-react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 import { isElectron } from "../../env";
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { sortScopedProjectsForSidebar } from "../../components/Sidebar.logic";
+import { useNewThreadHandler } from "../../hooks/useHandleNewThread";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { useProjects } from "../../state/entities";
+import { useProjects, useThreadShells } from "../../state/entities";
 import { cn } from "../../lib/utils";
-import { useEscapeToGoBack } from "../../hooks/useNavigateBack";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { ScrollArea } from "../../components/ui/scroll-area";
 import { SidebarInset } from "../../components/ui/sidebar";
 import { Spinner } from "../../components/ui/spinner";
-import { stackedThreadToast, toastManager } from "../../components/ui/toast";
+import { toastManager } from "../../components/ui/toast";
 import { Toggle, ToggleGroup } from "../../components/ui/toggle-group";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../../components/WorkspaceBreadcrumb";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { boardActions, subscribeBoard, useBoardStore, type BoardEntry } from "./boardClient";
 import { formatBoardAge, statusLabel } from "./boardFormat";
+import { errorMessage, undoToast } from "./boardToasts";
 
 type Lane = BoardEntry["state"];
 
@@ -46,9 +50,6 @@ const LANES: ReadonlyArray<{ lane: Lane; title: string; short: string; empty: st
 const PAGE_SIZE = 50;
 const UNDO_CONCURRENCY = 4;
 
-const errorMessage = (error: unknown) =>
-  error instanceof Error ? error.message : "Something went wrong.";
-
 async function settleAll<T>(items: ReadonlyArray<T>, task: (item: T) => Promise<unknown>) {
   let next = 0;
   let failed = false;
@@ -66,32 +67,40 @@ async function settleAll<T>(items: ReadonlyArray<T>, task: (item: T) => Promise<
   return !failed;
 }
 
-function undoToast(title: string, description: string, undo: () => Promise<unknown>) {
-  toastManager.add(
-    stackedThreadToast({
-      type: "success",
-      title,
-      description,
-      actionProps: {
-        children: "Undo",
-        onClick: () => {
-          void undo().catch((error) =>
+/** Starts a draft thread in the most recently active project. */
+function BoardNewThreadButton() {
+  const projects = useProjects();
+  const threads = useThreadShells();
+  const handleNewThread = useNewThreadHandler();
+  const project = useMemo(
+    () => sortScopedProjectsForSidebar(projects, threads, "updated_at")[0] ?? null,
+    [projects, threads],
+  );
+  if (project === null) return null;
+  return (
+    <Button
+      size="xs"
+      variant="outline"
+      onClick={() => {
+        void handleNewThread(scopeProjectRef(project.environmentId, project.id)).catch(
+          (error: unknown) =>
             toastManager.add({
               type: "error",
-              title: "Could not undo",
+              title: "Could not start a thread",
               description: errorMessage(error),
             }),
-          );
-        },
-      },
-      actionVariant: "outline",
-    }),
+        );
+      }}
+    >
+      <PlusIcon />
+      New thread
+      <span className="sr-only"> in {project.title}</span>
+    </Button>
   );
 }
 
 /** The fork's session board: every project's threads in four lanes. */
 export function BoardPage() {
-  useEscapeToGoBack();
   useEffect(() => subscribeBoard(), []);
   const entries = useBoardStore((state) => state.entries);
   const connection = useBoardStore((state) => state.connection);
@@ -214,6 +223,7 @@ export function BoardPage() {
               {connection === "offline" ? "Offline" : "Reconnecting"}
             </Badge>
           ) : null}
+          <BoardNewThreadButton />
         </WorkspacePageHeader>
 
         <div className="px-4 pb-2 @[60rem]/board:hidden">
@@ -453,9 +463,11 @@ const BoardCard = memo(function BoardCard(props: {
         ) : null}
         <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
           <span>{statusLabel(entry)}</span>
-          <time dateTime={new Date(entry.updatedAt).toISOString()}>
-            {formatBoardAge(entry.updatedAt)}
-          </time>
+          {entry.updatedAt > 0 ? (
+            <time dateTime={new Date(entry.updatedAt).toISOString()}>
+              {formatBoardAge(entry.updatedAt)}
+            </time>
+          ) : null}
         </span>
         {attention ? (
           <Badge variant="warning" size="sm" className="w-fit">
