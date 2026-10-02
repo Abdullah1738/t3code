@@ -13,6 +13,12 @@ import {
   type LegacyProjectSettingsFields,
 } from "@t3tools/shared/projectSettings";
 import {
+  defaultForkScheduleDraft,
+  forkScheduleDraftFor,
+  forkScheduleFromDraft,
+  type ForkScheduleDraft,
+} from "@t3tools/client-runtime/ardud/schedule-draft";
+import {
   buildModelOptions,
   resolveDefaultableModelSelection,
   resolveNewTaskModelSelection,
@@ -37,10 +43,14 @@ export function scheduledTaskDefaultModel(
 }
 
 export type ScheduleDraft = {
-  readonly mode: "fixed_time" | "interval";
+  readonly mode: "fixed_time" | "interval" | "cron" | "once";
   readonly timeOfDay: string;
   readonly weekdays: ReadonlyArray<number>;
   readonly intervalMinutes: string;
+  /** Cron, one-time, and time zone fields (fork). */
+  readonly fork: ForkScheduleDraft;
+  /** Zone kept from an existing fixed-time schedule so edits do not drop it. */
+  readonly fixedTimeZone?: string;
 };
 
 export const DEFAULT_SCHEDULE: ScheduleDraft = {
@@ -48,9 +58,14 @@ export const DEFAULT_SCHEDULE: ScheduleDraft = {
   timeOfDay: "09:00",
   weekdays: [1, 2, 3, 4, 5],
   intervalMinutes: "15",
+  fork: defaultForkScheduleDraft(),
 };
 
 export function scheduleDraftForTask(task: Pick<ScheduledTask, "schedule">): ScheduleDraft {
+  const fork = forkScheduleDraftFor(task.schedule);
+  if (task.schedule.type === "cron" || task.schedule.type === "once") {
+    return { ...DEFAULT_SCHEDULE, mode: task.schedule.type, fork };
+  }
   return task.schedule.type === "fixed_time"
     ? {
         ...DEFAULT_SCHEDULE,
@@ -58,6 +73,8 @@ export function scheduleDraftForTask(task: Pick<ScheduledTask, "schedule">): Sch
         weekdays: task.schedule.weekdays?.length
           ? [...new Set(task.schedule.weekdays)].sort((a, b) => a - b)
           : [0, 1, 2, 3, 4, 5, 6],
+        fork,
+        ...(task.schedule.timeZone ? { fixedTimeZone: task.schedule.timeZone } : {}),
       }
     : {
         ...DEFAULT_SCHEDULE,
@@ -67,6 +84,10 @@ export function scheduleDraftForTask(task: Pick<ScheduledTask, "schedule">): Sch
 }
 
 export function scheduleFromDraft(draft: ScheduleDraft): ScheduledTaskUpsertSchedule | null {
+  if (draft.mode === "cron" || draft.mode === "once") {
+    const built = forkScheduleFromDraft(draft.mode, draft.fork);
+    return "schedule" in built ? built.schedule : null;
+  }
   if (draft.mode === "interval") {
     const minutes = Number(draft.intervalMinutes);
     // Undo floating-point noise from displaying existing millisecond intervals as minutes.
@@ -85,6 +106,7 @@ export function scheduleFromDraft(draft: ScheduleDraft): ScheduledTaskUpsertSche
     type: "fixed_time",
     timeOfDay: draft.timeOfDay,
     ...(weekdays.length === 7 ? {} : { weekdays }),
+    ...(draft.fixedTimeZone ? { timeZone: draft.fixedTimeZone } : {}),
   };
 }
 
@@ -119,6 +141,13 @@ function draftSignature(draft: ScheduledTaskDraft): string {
     draft.schedule.timeOfDay,
     [...draft.schedule.weekdays].sort((a, b) => a - b),
     draft.schedule.intervalMinutes,
+    draft.schedule.mode === "cron" || draft.schedule.mode === "once"
+      ? [
+          draft.schedule.fork.cronExpression,
+          draft.schedule.fork.onceLocal,
+          draft.schedule.fork.timeZone,
+        ]
+      : null,
     draft.workspace,
     draft.baseRef,
     draft.checkoutPath,
