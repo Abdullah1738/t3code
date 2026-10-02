@@ -47,6 +47,26 @@ runtime, never committed.
   default soft limit of 256 is too low for many concurrent client sessions.
   Reference copy: `scripts/com.abdullah.memory-mcp.plist`.
 - `com.abdullah.memory-janitor` - daily 09:00 triage sweep, Telegram digest
+- `com.abdullah.session-reaper` (30 min) and `com.abdullah.location-reaper` (5 min)
+
+## Backend (OpenChamber or Robob)
+
+`session_reaper.py`, `location_reaper.py` and the janitor's review session pick
+their backend in `src/backend.py` from `MEMORY_BACKEND`:
+
+- `openchamber` (default): OpenCode endpoints through OpenChamber
+  (`OPENCHAMBER_URL`), OpenChamber scheduled tasks and session board.
+- `robob`: OpenCode endpoints on the OpenCode service directly
+  (`OPENCODE_SERVICE_URL`, default `http://127.0.0.1:49374`, basic auth `opencode`
+  with `OPENCODE_SERVER_PASSWORD` or `~/.config/opencode-service/password`), the
+  Robob control API (`T3_CONTROL_URL`/`T3_CONTROL_TOKEN` or
+  `~/.robob/ardud-control.json`), and Robob's state DB read-only
+  (`ROBOB_STATE_DB`, default `~/.robob/userdata/statev2.sqlite`) for scheduled
+  task sessions and the board backlog. The reaper deletes nothing while the
+  Robob board can't be read, and archives the Robob thread of each deleted root
+  session. The janitor opens its review as a Robob thread.
+
+Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` and `bash tests/test_stages.sh`.
 
 ## Working agreement
 

@@ -16,7 +16,7 @@ Backup gate (once per run, run refuses to delete anything if it fails)
 Per session (every node of the tree, because delete cascades to children)
   - no activity (session row or any message) for STALE_DAYS
   - not running, not suspended, no inbox/pending rows, not the last session of
-    an OpenChamber scheduled task, not on the review board backlog, not in
+    a scheduled task, not on the session board backlog, not in
     ~/.config/opencode/session-reaper-keep.txt
   - native: live + replica memory ledger stamped with the session's
     time_updated (all messages projected), replica raw_sessions row current,
@@ -26,8 +26,12 @@ Per session (every node of the tree, because delete cascades to children)
     ledger row present, and replica memory.db has the original session's
     events (skipped when the copy has no messages)
 
-Deletes go through the OpenCode API (DELETE /api/session/{id} via OpenChamber),
-never raw SQL. Throttled per run. Audit trail: logs/session_reaper-YYYYMM.jsonl.
+Deletes go through the OpenCode API (DELETE /api/session/{id}), never raw SQL.
+MEMORY_BACKEND (see backend.py) picks the route: openchamber proxies through
+OpenChamber and reads its scheduled tasks and board; robob talks to the OpenCode
+service directly, reads Robob's scheduled tasks and board from its state DB, and
+archives the Robob thread bound to each deleted root session.
+Throttled per run. Audit trail: logs/session_reaper-YYYYMM.jsonl.
 Status: logs/session_reaper_last.json (checked by health_check.py).
 
   session_reaper.py --dry-run [--limit N]   verify and report, delete nothing
@@ -44,16 +48,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import backend  # noqa: E402
+
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".local/share/memory-system")
 DATA = os.path.join(ROOT, "data")
 LOGS = os.path.join(ROOT, "logs")
-OC_DB = os.path.join(HOME, ".local/share/opencode/opencode.db")
+OC_DB = backend.opencode_db()
 MEM_DB = os.path.join(DATA, "memory.db")
 REPLICA = "/Volumes/ExternalSSD/memory-system-backup/replica"
 LIVE_REPO = "/Volumes/ExternalSSD/memory-system-backup/restic/live"
 DROPBOX_LIVE = "/Backups/memory-system/live"
-OC_URL = os.environ.get("OPENCHAMBER_URL", "http://127.0.0.1:57123")
 KEEP_FILE = os.path.join(HOME, ".config/opencode/session-reaper-keep.txt")
 OC_CONF = os.path.join(HOME, ".config/openchamber")
 STATUS = os.path.join(LOGS, "session_reaper_last.json")
@@ -81,7 +87,7 @@ def ro(path):
 
 
 def http(method, path, timeout=120):
-    req = urllib.request.Request(OC_URL + path, method=method)
+    req = backend.opencode_request(method, path)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
@@ -94,9 +100,9 @@ def running_ids():
     try:
         code, body = http("GET", "/api/session/active", timeout=30)
     except (TimeoutError, OSError) as e:
-        raise Gate(f"OpenChamber slow/unreachable reading running sessions ({e!r}); stopping")
+        raise Gate(f"{backend.label()} slow/unreachable reading running sessions ({e!r}); stopping")
     if code != 200 or not isinstance(body, dict) or "data" not in body:
-        raise Gate(f"cannot read running sessions from OpenChamber ({code})")
+        raise Gate(f"cannot read running sessions from {backend.label()} ({code})")
     return set(body["data"])
 
 
@@ -141,12 +147,28 @@ def backup_gate(check_dropbox=True):
 
 
 # ------------------------------------------------------------------ protection
-def protected_ids():
-    keep = set()
+def keep_file_ids():
     try:
-        keep |= {l.split()[0] for l in open(KEEP_FILE) if l.strip() and not l.startswith("#")}
+        with open(KEEP_FILE) as fh:
+            return {l.split()[0] for l in fh if l.strip() and not l.startswith("#")}
     except FileNotFoundError:
-        pass
+        return set()
+
+
+def protected_ids():
+    return keep_file_ids() | scheduled_ids() | backlog_ids()
+
+
+def scheduled_ids():
+    # The old OpenChamber tasks' last sessions stay protected after the cutover
+    # for as long as their config is around.
+    if backend.is_robob():
+        return robob_scheduled_ids() | openchamber_scheduled_ids()
+    return openchamber_scheduled_ids()
+
+
+def openchamber_scheduled_ids():
+    keep = set()
     pdir = os.path.join(OC_CONF, "projects")
     for n in os.listdir(pdir) if os.path.isdir(pdir) else []:
         try:
@@ -156,11 +178,26 @@ def protected_ids():
                     keep.add(sid)
         except Exception:
             continue
-    keep |= backlog_ids()
     return keep
 
 
+def robob_scheduled_ids():
+    # Fail closed: without Robob's task list a task's last session could be deleted.
+    try:
+        con = backend.robob_ro()
+        try:
+            return backend.scheduled_task_session_ids(con)
+        finally:
+            con.close()
+    except Exception as e:
+        raise Gate(f"cannot read Robob scheduled tasks ({e!r})")
+
+
 def backlog_ids():
+    return robob_backlog_ids() if backend.is_robob() else openchamber_backlog_ids()
+
+
+def openchamber_backlog_ids():
     # Sessions on the OpenChamber board Backlog lane are never deleted. Fail closed:
     # if the board can't be read, no run.
     p = os.path.join(OC_CONF, "session-board.json")
@@ -171,6 +208,45 @@ def backlog_ids():
         return set()
     except Exception as e:
         raise Gate(f"cannot read session board backlog ({e!r})")
+
+
+def robob_backlog_ids():
+    # Same rule for the Robob session board, and no board at all also means no run.
+    # TODO: switch to GET /api/ardud/board once the session board API lands.
+    try:
+        con = backend.robob_ro()
+        try:
+            ids = backend.board_backlog_session_ids(con)
+        finally:
+            con.close()
+    except Exception as e:
+        raise Gate(f"cannot read Robob session board backlog ({e!r})")
+    if ids is None:
+        raise Gate("Robob session board not found (no ardud_board_rows table); "
+                   "not deleting anything until its backlog can be read")
+    return ids
+
+
+def control_gate():
+    # Deleted root sessions get their Robob thread archived, so the control API
+    # has to answer before anything is deleted.
+    try:
+        code, body = backend.control("GET", "/health", timeout=30)
+    except Exception as e:
+        raise Gate(f"Robob control API unreachable ({e!r})")
+    if code != 200:
+        raise Gate(f"Robob control API not healthy (HTTP {code} {backend._err(body)})")
+
+
+def archive_robob_thread(ses_id):
+    """Archive the Robob thread bound to a deleted root session. Returns the
+    thread id, None when no thread is bound, or raises."""
+    thread = backend.thread_for_session(ses_id)
+    if not thread:
+        return None
+    if not thread.get("archived"):
+        backend.archive_thread(thread["threadId"])
+    return thread["threadId"]
 
 
 # ------------------------------------------------------------------ candidates
@@ -323,6 +399,9 @@ def main():
         st["evidence"] = ev
         oc = ro(OC_DB)
         running = running_ids()
+        if backend.is_robob():
+            st["backend"] = "robob"
+            control_gate()
         sessions, busy = load_sessions(oc)
         work, reason, blocked = plan(sessions, busy, running, protected_ids(), int(t0 * 1000))
         st["sessions_total"] = len(sessions)
@@ -399,6 +478,12 @@ def main():
                     break
                 continue
             rec["delete_secs"] = round(dt, 2)
+            if backend.is_robob():
+                try:
+                    rec["robob_thread"] = archive_robob_thread(root["id"])
+                except Exception as e:
+                    rec["robob_thread_error"] = str(e)[:200]
+                    st["errors"].append(f"{root['id']}: deleted, but archiving its Robob thread failed: {str(e)[:120]}")
             audit.write(json.dumps(rec, ensure_ascii=False) + "\n")
             audit.flush()
             st["deleted_roots"] += 1
