@@ -168,6 +168,7 @@ import {
   persistServerRuntimeState,
 } from "./serverRuntimeState.ts";
 import { orchestrationHttpApiLayer } from "./orchestration-v2/http.ts";
+import { controlRouteLayer } from "./ardud/control/http.ts";
 import { projectHttpApiLayer } from "./project/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -636,6 +637,8 @@ const makeRoutesLayer = Layer.mergeAll(
     assetRouteLayer,
     attachmentUploadRouteLayer,
     deviceHubProxyRouteLayer,
+    // ardud fork: local control API for bridges, crw and CLIs.
+    controlRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
   ),
