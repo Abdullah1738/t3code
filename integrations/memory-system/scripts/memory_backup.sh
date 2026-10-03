@@ -104,9 +104,16 @@ for db in memory.db opencode_raw.db consolidation.db fact_vectors.db; do
   done
 done
 "$SQLITE" "$DATA/agent_notes.db" ".backup '$STAGE/agent_notes.db'" 2>>"$LOG" || fail replica "agent_notes.db backup failed"
+# Robob's state DB holds the session board, schedules and the OpenCode import
+# map, which nothing else backs up. Optional: skipped until Robob is installed.
+ROBOB_DB="${ROBOB_STATE_DB:-$HOME/.robob/userdata/statev2.sqlite}"
+if [ -f "$ROBOB_DB" ]; then
+  "$SQLITE" -readonly "$ROBOB_DB" ".backup '$STAGE/robob-state.sqlite'" 2>>"$LOG" ||
+    fail replica "robob state backup failed: $ROBOB_DB"
+fi
 # sqlite3_rsync verifies page hashes itself; here we only confirm each replica
 # opens and has a schema (quick_check on the 70 GB memory.db takes too long).
-for db in memory.db opencode_raw.db consolidation.db fact_vectors.db agent_notes.db; do
+for db in memory.db opencode_raw.db consolidation.db fact_vectors.db agent_notes.db robob-state.sqlite; do
   [ -f "$STAGE/$db" ] || continue
   q=$("$SQLITE" -readonly "$STAGE/$db" "SELECT count(*) > 0 FROM sqlite_master;" 2>&1 | head -1)
   [ "$q" = "1" ] || fail verify "$db replica unreadable: $q"
