@@ -2195,9 +2195,9 @@ describe("OpenCode2 adapter", () => {
     Effect.gen(function* () {
       // The server goes away with no turn running, and never comes back.
       const { runtime, thread } = yield* resumed([{ type: "runtime_exit", status: "success" }]);
-      // Reconnecting retries a few times, seconds apart, then ends the runtime's events.
+      // Reconnecting backs off for a few minutes, then ends the runtime's events.
       const drained = yield* runtime.events.pipe(Stream.runDrain, Effect.forkScoped);
-      yield* TestClock.adjust("1 minute");
+      yield* TestClock.adjust("6 minutes");
       yield* Fiber.join(drained);
       const refused = yield* runtime.startTurn(turnInput(thread)).pipe(Effect.flip);
       assert.equal(refused._tag, "ProviderAdapterEventStreamError");
@@ -2216,7 +2216,7 @@ describe("OpenCode2 adapter", () => {
     return Effect.gen(function* () {
       const { runtime } = yield* resumed([{ type: "runtime_exit", status: "success" }]);
       const drained = yield* runtime.events.pipe(Stream.runDrain, Effect.forkScoped);
-      yield* TestClock.adjust("1 minute");
+      yield* TestClock.adjust("6 minutes");
       yield* Fiber.join(drained);
       const gaveUp = logs.find((entry) =>
         JSON.stringify(entry.message).includes("Could not reconnect to the OpenCode event stream"),
@@ -2243,7 +2243,7 @@ describe("OpenCode2 adapter", () => {
       // The runtime's event stream has one consumer.
       const events = yield* runtime.events.pipe(Stream.runCollect, Effect.forkScoped);
       yield* runtime.startTurn(turnInput(thread));
-      yield* TestClock.adjust("1 minute");
+      yield* TestClock.adjust("6 minutes");
       const collected = yield* Fiber.join(events);
       const terminal = collected.find((event) => event.type === "turn.terminal");
       assert.deepInclude(terminal, { status: "failed", threadDisposition: "broken" });

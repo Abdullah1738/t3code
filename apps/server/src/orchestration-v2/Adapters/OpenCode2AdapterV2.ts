@@ -59,6 +59,7 @@ import {
 import type * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
@@ -662,12 +663,26 @@ const isWakeTurn = (turn: OrchestrationV2ProviderTurn) =>
 const INTERRUPT_TIMEOUT = "10 seconds";
 /** The session instructions entry T3 writes its per-turn system prompt to. */
 const INSTRUCTIONS_KEY = "t3-code";
-/** A lost event stream is resubscribed this many times, this far apart, before the session breaks. */
-const RECONNECT_ATTEMPTS = 5;
-const RECONNECT_DELAY = "2 seconds";
-const RECONCILE_TIMEOUT = "15 seconds";
-/** How long a new turn waits for a reconnect in progress. */
-const RECONNECT_WAIT = "30 seconds";
+/**
+ * A lost event stream is resubscribed with backoff for this long before the
+ * session breaks. A busy server can stall for a couple of minutes (a big
+ * database, many sessions), so a short window turns one stall into a failure
+ * of every running turn.
+ */
+const RECONNECT_WINDOW = "5 minutes";
+const RECONNECT_SCHEDULE = Schedule.exponential("2 seconds").pipe(
+  Schedule.modifyDelay(({ duration }) =>
+    Effect.succeed(Duration.min(duration, Duration.seconds(30))),
+  ),
+  Schedule.upTo({ duration: RECONNECT_WINDOW }),
+);
+/**
+ * Reading back what a gap missed pages through every running session's history.
+ * It holds the event lock, so interrupts wait on it; a slow pass just retries.
+ */
+const RECONCILE_TIMEOUT = "45 seconds";
+/** How long a new turn waits for a reconnect in progress before it's refused. */
+const RECONNECT_WAIT = "2 minutes";
 /** A background subagent's result when its end was lost with the event stream. */
 const LOST_BACKGROUND =
   "T3 Code lost its connection to OpenCode while this subagent ran, so its result is not shown.";
@@ -2810,9 +2825,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       for (const state of threads.values()) state.mcp = undefined;
       yield* lock.withPermit(reconcile).pipe(Effect.timeout(RECONCILE_TIMEOUT));
       return stream;
-    }).pipe(
-      Effect.retry({ times: RECONNECT_ATTEMPTS - 1, schedule: Schedule.spaced(RECONNECT_DELAY) }),
-    );
+    }).pipe(Effect.retry(RECONNECT_SCHEDULE));
 
     let currentScope = initial.scope;
     // The borrow in use when the session closes is returned with it, so a
