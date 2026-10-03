@@ -1,26 +1,20 @@
 import { createHash } from 'node:crypto';
-import { tx, get, all, run } from './db.mjs';
+import { tx, get, all, run, CoordError } from './db.mjs';
 import * as evidence from './evidence.mjs';
 
-export { evidence };
+export { evidence, CoordError };
 
 export { open, close } from './db.mjs';
 
 export const clock = { now: () => Math.floor(Date.now() / 1000) };
 const now = () => clock.now();
 
-export class CoordError extends Error {
-  constructor(code, message, extra = {}) {
-    super(message);
-    this.code = code;
-    this.extra = extra;
-  }
-}
 const refuse = (code, message, extra) => new CoordError(code, message, extra);
 
 const EVENT_KINDS = ['request', 'decision', 'status', 'evidence', 'blocker', 'control'];
 const RELEASE_KINDS = ['service_release', 'frontend_release', 'redispatch', 'tf_apply', 'ddl', 'migration', 'qa_window'];
 const MANUAL_KINDS = ['tf_apply', 'ddl', 'migration'];
+const DEPLOY_KINDS = ['service_release', 'frontend_release', 'redispatch'];
 const ARCH_KINDS = ['drift_audit', 'contract_change', 'doc_fix', 'suspected_bug'];
 const DEP_NEEDS = ['pr_merged', 'pr_deployed', 'ticket_done', 'release_done', 'event_acked', 'claim_free', 'manual'];
 const list = (v, dflt) => (v ? String(v).split(',').map(s => s.trim()).filter(Boolean) : dflt);
@@ -59,13 +53,20 @@ export function setMode(mode, { scope, as, reason } = {}) {
   return { key: k, mode };
 }
 
+export const FLAG_DEFAULTS = { tf_full_root_blocked: true };
+export const FLAG_CLEARERS = { tf_full_root_blocked: ['master'] };
+
 export function setFlag(k, on, { as, reason } = {}) {
   need(as, 'as');
+  if (!on && FLAG_CLEARERS[k] && !FLAG_CLEARERS[k].includes(as)) throw refuse('forbidden', `only ${FLAG_CLEARERS[k].join('|')} may clear ${k}`);
   run('INSERT INTO control (k,v,set_by,set_at,reason) VALUES (?,?,?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, set_by=excluded.set_by, set_at=excluded.set_at, reason=excluded.reason',
     k, on ? '1' : '0', as, now(), reason ?? null);
   return { key: k, on: !!on };
 }
-const flag = k => get('SELECT v FROM control WHERE k=?', k)?.v === '1';
+export function flag(k) {
+  const v = get('SELECT v FROM control WHERE k=?', k)?.v;
+  return v === undefined ? !!FLAG_DEFAULTS[k] : v === '1';
+}
 
 // Effective mode of a scope: the strictest of the global mode and the scope's own mode.
 export function gate(scope) {
@@ -96,12 +97,23 @@ export function actorSet(id, { thread, kind } = {}) {
       id, k, k === 'thread' ? thread : null, now());
     // Pending and failed deliveries follow the actor to its new thread.
     const r = k === 'thread'
-      ? run("UPDATE deliveries SET thread_id=?, status='pending', next_attempt_at=NULL, attempts=0, last_error=NULL WHERE recipient=? AND status IN ('pending','failed')", thread, id)
-      : run("UPDATE deliveries SET thread_id=NULL, status='skipped' WHERE recipient=? AND status IN ('pending','failed')", id);
+      ? run("UPDATE deliveries SET thread_id=?, status='pending', next_attempt_at=NULL, attempts=0, last_error=NULL, gen=gen+1 WHERE recipient=? AND status IN ('pending','failed')", thread, id)
+      : run("UPDATE deliveries SET thread_id=NULL, status='skipped', gen=gen+1 WHERE recipient=? AND status IN ('pending','failed')", id);
     return { actor: get('SELECT * FROM actors WHERE id=?', id), retargeted: Number(r.changes) };
   });
 }
 const actor = id => get('SELECT * FROM actors WHERE id=?', id);
+
+// Creates the actor if missing; an existing actor (and its thread binding) is left alone.
+export function ensureActor(id, { thread, kind } = {}) {
+  const a = actor(need(id, 'actor id'));
+  return a ? { actor: a, existing: true } : actorSet(id, { thread, kind });
+}
+
+// Idempotent first-run seed: the pull-only crw process actor.
+export function init() {
+  return { actors: [ensureActor('crw', { kind: 'process' })] };
+}
 
 export function channelCreate(id, { owner, purpose } = {}) {
   need(id, 'channel id'); need(owner, 'owner');
@@ -137,6 +149,9 @@ export function memberRm(channel, actorId) {
 
 // ---------- events, deliveries, ack ----------
 
+// Unambiguous per (event, recipient): colons in either part cannot collide.
+export const deliveryId = (eventKey, recipient) => `coord:${createHash('sha256').update(JSON.stringify([eventKey, recipient])).digest('hex')}`;
+
 export function post(channel, o = {}) {
   const { as, kind, key, summary } = o;
   need(as, 'as'); need(key, 'key'); need(summary, 'summary');
@@ -164,7 +179,7 @@ export function post(channel, o = {}) {
       const a = actor(r);
       const push = a.kind === 'thread' && a.thread_id && (to || members.find(m => m.actor_id === r)?.wake);
       run('INSERT INTO deliveries (event_seq,recipient,status,client_request_id,thread_id) VALUES (?,?,?,?,?)',
-        seq, r, push ? 'pending' : 'skipped', `coord:${key}:${r}`, push ? a.thread_id : null);
+        seq, r, push ? 'pending' : 'skipped', deliveryId(key, r), push ? a.thread_id : null);
     }
     return { seq, recipients: recips };
   });
@@ -188,7 +203,7 @@ export function ack(as, refs = []) {
       const d = get('SELECT * FROM deliveries WHERE event_seq=? AND recipient=?', e.seq, as);
       if (!d) throw refuse('not_addressed', `event ${ref} was not addressed to ${as}`);
       if (d.status === 'acked') return { seq: e.seq, already: true };
-      run("UPDATE deliveries SET status='acked', acked_at=? WHERE event_seq=? AND recipient=?", now(), e.seq, as);
+      run("UPDATE deliveries SET status='acked', acked_at=?, gen=gen+1 WHERE event_seq=? AND recipient=?", now(), e.seq, as);
       return { seq: e.seq };
     }),
   }));
@@ -214,6 +229,8 @@ export function claim(resource, { as, ttl, purpose, op } = {}) {
     const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
     if (c?.state === 'reconcile_required') return reconcileErr(c);
     if (c?.state === 'active') throw refuse('held', `${resource} is held by ${c.owner}`, { owner: c.owner, fence: c.fence, lease_until: c.lease_until });
+    if (c) run(`INSERT OR IGNORE INTO claim_history (resource,fence,owner,state,op_ref,reconcile_by,reconcile_outcome,reconcile_evidence,ended_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`, c.resource, c.fence, c.owner, c.state, c.op_ref, c.reconcile_by, c.reconcile_outcome, c.reconcile_evidence, c.released_at ?? now());
     run('INSERT INTO fences (resource,fence) VALUES (?,1) ON CONFLICT(resource) DO UPDATE SET fence=fence+1', resource);
     const fence = get('SELECT fence FROM fences WHERE resource=?', resource).fence;
     const t = now();
@@ -250,11 +267,11 @@ export function renew(resource, { as, fence, ttl, op } = {}) {
   });
 }
 
+// An expired lease cannot be released: its operation may still be running, so it needs reconcile.
 export function release(resource, { as, fence, note } = {}) {
   return tx(() => {
-    const c = get('SELECT * FROM claims WHERE resource=?', resource);
-    if (!c || c.state !== 'active' || c.owner !== as || c.fence !== Number(fence))
-      throw refuse('stale_fence', `${as} fence ${fence} does not hold ${resource}`, { owner: c?.owner, fence: c?.fence, state: c?.state });
+    const c = holder(resource, as, fence);
+    if (c instanceof Error) return c;
     run("UPDATE claims SET state='released', released_at=?, note=? WHERE resource=?", now(), note ?? null, resource);
     return { resource, fence: c.fence, state: 'released' };
   });
@@ -269,7 +286,7 @@ export function reconcile(resource, { as, outcome, evidence } = {}) {
     const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
     if (c?.state !== 'reconcile_required') throw refuse('not_reconcilable', `${resource} is ${c?.state ?? 'unclaimed'}`);
     const state = outcome === 'still_running' ? 'reconcile_required' : 'reconciled';
-    run('UPDATE claims SET state=?, reconcile_by=?, reconcile_outcome=?, reconcile_evidence=? WHERE resource=?', state, as, outcome, evidence, resource);
+    run('UPDATE claims SET state=?, reconcile_by=?, reconcile_outcome=?, reconcile_evidence=?, released_at=? WHERE resource=?', state, as, outcome, evidence, now(), resource);
     return { resource, state, outcome };
   });
 }
@@ -292,7 +309,7 @@ export function depSet(id, { state, evidence } = {}) {
   const d = get('SELECT * FROM deps WHERE id=?', Number(id));
   if (!d) throw refuse('not_found', `no dep ${id}`);
   if (state === 'ready' && !evidence) throw refuse('invalid', 'evidence is required');
-  run('UPDATE deps SET state=?, evidence=?, why=?, checked_at=? WHERE id=?', state, evidence ?? null, 'set by hand', now(), d.id);
+  run('UPDATE deps SET state=?, evidence=?, why=?, checked_at=?, version=version+1 WHERE id=?', state, evidence ?? null, 'set by hand', now(), d.id);
   return { dep: get('SELECT * FROM deps WHERE id=?', d.id) };
 }
 
@@ -317,7 +334,13 @@ export async function ready(work, { external = evidence.external } = {}) {
       } else if (d.state !== 'ready') {
         r = { state: 'waiting', why: d.need === 'manual' || d.need === 'ticket_done' ? 'set by hand with dep set' : 'no evaluator' };
       }
-      run('UPDATE deps SET state=?, why=?, evidence=?, checked_at=? WHERE id=?', r.state, r.why ?? null, r.evidence ?? null, now(), d.id);
+      // Compare-and-set: a decision made while the check was pending (dep set dead/ready) wins.
+      const u = run('UPDATE deps SET state=?, why=?, evidence=?, checked_at=?, version=version+1 WHERE id=? AND version=?',
+        r.state, r.why ?? null, r.evidence ?? null, now(), d.id, d.version);
+      if (!Number(u.changes)) {
+        const cur = get('SELECT * FROM deps WHERE id=?', d.id);
+        r = { state: cur.state, why: cur.why, evidence: cur.evidence, changed: true };
+      }
     }
     out.push({ id: d.id, need: d.need, ref: d.ref, ...r });
   }
@@ -330,92 +353,157 @@ const SHA = /^[0-9a-f]{40}$/;
 const relRow = id => {
   const r = get('SELECT * FROM releases WHERE id=?', Number(id));
   if (!r) throw refuse('not_found', `no release ${id}`);
-  return { ...r, footprint: parse(r.footprint), content_prs: parse(r.content_prs), readback: parse(r.readback) };
+  return { ...r, footprint: parse(r.footprint), content_prs: parse(r.content_prs), readback: parse(r.readback), tf_scope: parse(r.tf_scope) };
 };
 const touch = (id, set) => {
   const keys = Object.keys(set);
-  run(`UPDATE releases SET ${keys.map(k => `${k}=?`).join(', ')}, updated_at=? WHERE id=?`, ...keys.map(k => set[k]), now(), id);
+  run(`UPDATE releases SET ${keys.map(k => `${k}=?`).join(', ')}, version=version+1, updated_at=? WHERE id=?`, ...keys.map(k => set[k]), now(), id);
 };
 const overlap = (a, b) => a.some(x => b.includes(x));
-const tfFull = fp => fp.some(f => /^tf:[^:]+$/.test(f));
+const fingerprint = o => hash(o);
+
+// Hooks supplied by the embedding process (crw). gateCheck(release) must resolve
+// { prs: [{ pr, ok, evidence }] } with a positive, evidence-backed entry for every PR in content_prs.
+export const hooks = { gateCheck: null };
+export function configure(o = {}) {
+  if ('gateCheck' in o) hooks.gateCheck = o.gateCheck;
+  return { gateCheck: !!hooks.gateCheck };
+}
+
+async function runGates(r, gateCheck = hooks.gateCheck) {
+  if (!DEPLOY_KINDS.includes(r.kind)) return { ok: true };
+  if (!r.content_prs.length) return { ok: true, evidence: { empty_range: r.range_evidence } };
+  if (typeof gateCheck !== 'function') return { ok: false, code: 'gate_unavailable', reason: 'no gateCheck hook configured' };
+  let res;
+  try { res = await gateCheck(r); } catch (e) { return { ok: false, code: 'gate_unavailable', reason: e.message }; }
+  const got = new Map((res?.prs ?? []).map(p => [p.pr, p]));
+  const missing = r.content_prs.filter(pr => !(got.get(pr)?.ok === true && got.get(pr)?.evidence));
+  return missing.length
+    ? { ok: false, code: 'gates_not_clear', reason: `no positive gate evidence for ${missing.join(', ')}`, missing }
+    : { ok: true, evidence: r.content_prs.map(pr => ({ pr, evidence: got.get(pr).evidence })) };
+}
+
+export function tfRootGen(root) {
+  return { root: need(root, 'root'), gen: get('SELECT gen FROM tf_roots WHERE root=?', root)?.gen ?? 0 };
+}
 
 export function releaseRequest(o = {}) {
   const { as, key, kind } = o;
   need(as, 'as'); need(key, 'key');
   if (!RELEASE_KINDS.includes(kind) || kind === 'qa_window') throw refuse('invalid', `kind must be one of ${RELEASE_KINDS.filter(k => k !== 'qa_window').join('|')}`);
   const env = need(o.env, 'env');
-  const footprint = Array.isArray(o.footprint) ? o.footprint : list(o.footprint, []);
+  evidence.requireEnv(env); // nothing could ever observe it to a terminal state
+  const footprint = [...new Set(Array.isArray(o.footprint) ? o.footprint : list(o.footprint, []))];
   if (!footprint.length) throw refuse('invalid', 'footprint is required');
-  if (['service_release', 'frontend_release', 'redispatch'].includes(kind)) {
-    need(o.repo, 'repo');
+  let contentPrs = null, tfScope = null;
+  if (DEPLOY_KINDS.includes(kind)) {
+    need(o.repo, 'repo'); need(o.binary, 'binary');
     if (!SHA.test(o.sha ?? '')) throw refuse('invalid', 'sha must be a full 40-char revision');
+    if (!SHA.test(o.runtimeSha ?? '')) throw refuse('invalid', 'runtimeSha (what is live now) must be a full 40-char revision');
+    contentPrs = Array.isArray(o.contentPrs) ? o.contentPrs : list(o.contentPrs, null);
+    if (!contentPrs) throw refuse('invalid', 'contentPrs (every PR in runtimeSha..sha) is required');
+    if (!contentPrs.length && !o.rangeEvidence) throw refuse('invalid', 'an empty content range needs rangeEvidence');
+    contentPrs = [...new Set(contentPrs)].sort();
   }
   if (kind === 'redispatch' && !(o.tag && o.digest)) throw refuse('invalid', 'redispatch binds the existing tag and digest');
-  if (MANUAL_KINDS.includes(kind)) need(o.plan, 'plan');
+  if (MANUAL_KINDS.includes(kind) && !evidence.EXEC_RULES[kind].identity(need(o.plan, 'plan')))
+    throw refuse('invalid', kind === 'tf_apply' ? 'plan must be saved:<plan run id> or scope:<infra-only scope>' : 'plan must be <file>.sql[@checksum]');
+  if (kind === 'tf_apply') {
+    need(o.tfRoot, 'tfRoot');
+    if (o.fullRoot) tfScope = { full_root: true };
+    else {
+      const targets = Array.isArray(o.targets) ? o.targets : list(o.targets, []);
+      if (!targets.length) throw refuse('invalid', 'tf_apply needs targets or fullRoot');
+      tfScope = { targets: [...new Set(targets)].sort() };
+    }
+    if (!Number.isInteger(o.rootGen) || o.rootGen < 0) throw refuse('invalid', 'rootGen (tf root gen at plan time) is required');
+    if (!footprint.includes(`tf:${o.tfRoot}`)) footprint.push(`tf:${o.tfRoot}`);
+  }
   const row = {
     requester: as, kind, environment: env, repo: o.repo ?? null, binary: o.binary ?? null, git_sha: o.sha ?? null,
-    runtime_sha: o.runtimeSha ?? null, content_prs: json(o.contentPrs), tag: o.tag ?? null, image_digest: o.digest ?? null,
-    plan_id: o.plan ?? null, footprint: json(footprint), risk: o.risk ?? 'ordinary', batch_id: o.batch ?? null,
+    runtime_sha: o.runtimeSha ?? null, content_prs: json(contentPrs), range_evidence: o.rangeEvidence ?? null, tag: o.tag ?? null,
+    image_digest: o.digest ?? null, plan_id: o.plan ?? null, footprint: json(footprint.sort()), risk: o.risk ?? 'ordinary',
+    batch_id: o.batch ?? null, tf_root: o.tfRoot ?? null, tf_scope: json(tfScope), root_gen: kind === 'tf_apply' ? o.rootGen : null,
   };
   if (!['ordinary', 'stateful', 'high'].includes(row.risk)) throw refuse('invalid', 'risk must be ordinary|stateful|high');
+  const fp = fingerprint(row);
   return tx(() => {
-    const prev = get('SELECT * FROM releases WHERE request_key=?', key);
+    const prev = get('SELECT id, fingerprint FROM releases WHERE request_key=?', key);
     if (prev) {
-      const same = Object.keys(row).every(k => prev[k] === row[k]);
-      if (!same) throw refuse('conflict', `release request ${key} exists with a different binding`, { status: 409, id: prev.id });
+      if (prev.fingerprint !== fp) throw refuse('conflict', `release request ${key} exists with a different binding`, { status: 409, id: prev.id });
       return { release: relRow(prev.id), duplicate: true };
     }
     const t = now();
     const cols = Object.keys(row);
-    const id = Number(run(`INSERT INTO releases (request_key,${cols.join(',')},state,created_at,updated_at) VALUES (?,${cols.map(() => '?').join(',')},'requested',?,?)`,
-      key, ...cols.map(k => row[k]), t, t).lastInsertRowid);
+    const id = Number(run(`INSERT INTO releases (request_key,fingerprint,${cols.join(',')},state,created_at,updated_at) VALUES (?,?,${cols.map(() => '?').join(',')},'requested',?,?)`,
+      key, fp, ...cols.map(k => row[k]), t, t).lastInsertRowid);
     return { release: relRow(id) };
   });
 }
 
-// `verify(release)` revalidates the pinned head (default: evidence.verifyHead). It must resolve {ok, reason?}.
-export async function releaseAdmit(id, { as, manual = false, verify = evidence.verifyHead } = {}) {
+// Claims that block a mutation: expired leases on the footprint or env are first moved to reconcile_required.
+function blockingClaim(env, footprint, owners) {
+  const res = [...new Set([...footprint, `env:${env}`])];
+  for (const resource of res) {
+    const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
+    if (c?.state === 'reconcile_required') return refuse('reconcile_required', `${resource} needs reconcile (${c.owner}, op ${c.op_ref ?? '-'})`, { owner: c.owner, op_ref: c.op_ref });
+    if (c?.state === 'active' && !owners.includes(c.owner)) return refuse('claimed', `${resource} is held by ${c.owner}`, { owner: c.owner, fence: c.fence });
+  }
+  return null;
+}
+// Any open QA window holds its whole environment, expired or not, until master/release closes it.
+const openQa = (env, exceptId = -1) => get("SELECT id, requester FROM releases WHERE kind='qa_window' AND state='running' AND environment=? AND id!=?", env, exceptId);
+
+function tfChecks(r, at) {
+  if (r.kind !== 'tf_apply') return null;
+  if (r.tf_scope?.full_root && flag('tf_full_root_blocked')) return refuse('tf_full_root_blocked', 'full-root Terraform apply is blocked until master clears tf_full_root_blocked');
+  const cur = tfRootGen(r.tf_root).gen;
+  if (r.root_gen !== cur) {
+    touch(r.id, { state: 'superseded', failure: `plan from root gen ${r.root_gen}, root is at ${cur} (${at})` });
+    return refuse('stale_plan', `plan ${r.plan_id} was made at ${r.tf_root} gen ${r.root_gen}; root is now at gen ${cur}`);
+  }
+  return null;
+}
+
+function builtBlockers(r) {
+  if (!r.repo) return [];
+  return all("SELECT * FROM releases WHERE state='built_not_deployed' AND repo=? AND environment=? AND id!=?", r.repo, r.environment, r.id);
+}
+
+// `verify(release)` revalidates the pinned head (default: evidence.verifyHead). It must resolve {ok, reason?, transient?}.
+export async function releaseAdmit(id, { as, manual = false, verify = evidence.verifyHead, gateCheck } = {}) {
   need(as, 'as');
-  let r = relRow(id);
-  if (r.state === 'admitted' && r.admitted_by === as) return { release: r, duplicate: true };
-  const v = r.git_sha && verify ? await verify(r) : { ok: true };
+  const r0 = relRow(id);
+  if (r0.state === 'admitted' && r0.admitted_by === as) return { release: r0, duplicate: true };
+  if (r0.state !== 'requested') throw refuse('bad_state', `release ${id} is ${r0.state}`);
+  const v = r0.git_sha ? await verify(r0) : { ok: true };
+  const g = await runGates(r0, gateCheck);
   return tx(() => {
-    r = relRow(id);
-    if (r.state !== 'requested') throw refuse('bad_state', `release ${id} is ${r.state}`);
+    const r = relRow(id);
+    if (r.version !== r0.version) throw refuse('changed', `release ${id} changed during admission; retry`);
     requireMode(`env:${r.environment}`);
     if (v.transient) throw refuse('verify_failed', `could not revalidate ${r.git_sha}: ${v.reason}`);
     if (!v.ok) {
       touch(r.id, { state: 'superseded', failure: `stale revision: ${v.reason ?? 'head check failed'}` });
       return refuse('stale_revision', `release ${id} ${r.git_sha} no longer valid: ${v.reason ?? ''}`.trim());
     }
-    if (r.kind === 'tf_apply' && tfFull(r.footprint) && flag('tf_full_root_blocked'))
-      throw refuse('tf_full_root_blocked', 'full-root Terraform apply is blocked');
-    if (r.kind === 'tf_apply') {
-      // A plan made before another mutation of the same root was admitted no longer describes reality.
-      const roots = r.footprint.filter(f => f.startsWith('tf:')).map(f => f.split(':').slice(0, 2).join(':'));
-      const later = all(`SELECT id, footprint FROM releases WHERE id!=? AND kind='tf_apply' AND admitted_at>=?
-        AND state NOT IN ('requested','cancelled','superseded')`, r.id, r.created_at)
-        .find(x => parse(x.footprint).some(f => roots.includes(f.split(':').slice(0, 2).join(':'))));
-      if (later) {
-        touch(r.id, { state: 'superseded', failure: `plan predates admitted mutation #${later.id}` });
-        return refuse('stale_plan', `plan ${r.plan_id} predates admitted mutation #${later.id} of the same root`);
-      }
-    }
-    const busy = all("SELECT id, kind, footprint FROM releases WHERE id!=? AND state IN ('admitted','running')", r.id)
+    if (!g.ok) throw refuse(g.code, g.reason, { missing: g.missing });
+    const tf = tfChecks(r, 'admit');
+    if (tf) return tf;
+    const qa = openQa(r.environment);
+    if (qa) throw refuse('qa_window_open', `QA window #${qa.id} (${qa.requester}) holds ${r.environment}`, { blocking: qa.id });
+    const busy = all("SELECT id, kind, footprint FROM releases WHERE id!=? AND state IN ('admitted','running') AND kind!='qa_window'", r.id)
       .find(x => overlap(parse(x.footprint), r.footprint));
     if (busy) throw refuse('footprint_busy', `overlaps ${busy.kind} #${busy.id}`, { blocking: busy.id });
-    // An env lease held by an admitter is the admission authority itself, not a competing mutation.
-    const held = all("SELECT resource, owner, state FROM claims WHERE state IN ('active','reconcile_required')")
-      .find(c => r.footprint.includes(c.resource) && (c.state !== 'active' ||
-        (![as, r.requester].includes(c.owner) && !(c.resource.startsWith('env:') && DEFAULTS.admitters.includes(c.owner)))));
-    if (held) throw refuse('claimed', `${held.resource} is ${held.state} by ${held.owner}`);
-    const built = r.repo && all("SELECT * FROM releases WHERE state='built_not_deployed' AND repo=? AND COALESCE(binary,'')=COALESCE(?,'') AND environment=?",
-      r.repo, r.binary, r.environment);
+    const held = blockingClaim(r.environment, r.footprint, [as, r.requester]);
+    if (held) return held;
+    const built = builtBlockers(r);
+    let src = null;
     if (r.kind === 'redispatch') {
-      const src = built?.find(b => b.tag === r.tag && b.image_digest === r.image_digest && b.git_sha === r.git_sha);
-      if (!src) throw refuse('no_built_release', `no built_not_deployed release with tag ${r.tag} and digest ${r.image_digest}`);
-    } else if (built?.length) {
-      throw refuse('built_not_deployed', `release #${built[0].id} (${built[0].tag}) is built but not deployed; redispatch it first`, { blocking: built[0].id });
+      src = built.find(b => b.binary === r.binary && b.tag === r.tag && b.image_digest === r.image_digest && b.git_sha === r.git_sha);
+      if (!src) throw refuse('no_built_release', `no built_not_deployed ${r.binary} release in ${r.environment} with tag ${r.tag} and digest ${r.image_digest}`);
+    } else if (built.length) {
+      throw refuse('built_not_deployed', `release #${built[0].id} (${built[0].binary} ${built[0].tag}) is built but not deployed; redispatch it first`, { blocking: built[0].id });
     }
     const needsManual = r.risk !== 'ordinary' || MANUAL_KINDS.includes(r.kind) || r.kind === 'redispatch' || r.footprint.filter(f => f.startsWith('svc:')).length > 1;
     if (needsManual && !(manual && DEFAULTS.admitters.includes(as)))
@@ -429,7 +517,8 @@ export async function releaseAdmit(id, { as, manual = false, verify = evidence.v
       run('INSERT INTO fences (resource,fence) VALUES (?,1) ON CONFLICT(resource) DO UPDATE SET fence=fence+1', fenceRes);
       fence = get('SELECT fence FROM fences WHERE resource=?', fenceRes).fence;
     }
-    touch(r.id, { state: 'admitted', admitted_by: as, admitted_at: now(), fence, fence_resource: fenceRes });
+    touch(r.id, { state: 'admitted', admitted_by: as, admitted_at: now(), fence, fence_resource: fenceRes, fence_owner: as,
+      redispatch_of: src?.id ?? null, gate_evidence: json(g.evidence) });
     return { release: relRow(r.id) };
   });
 }
@@ -438,15 +527,17 @@ export async function releaseAdmit(id, { as, manual = false, verify = evidence.v
 export async function releaseStart(id, o = {}) {
   const { as, fence } = o;
   need(as, 'as'); need(fence, 'fence');
-  let r = relRow(id);
-  const v = r.git_sha ? await (o.verify ?? evidence.verifyHead)(r) : { ok: true };
+  const r0 = relRow(id);
+  if (r0.state !== 'admitted') throw refuse('bad_state', `release ${id} is ${r0.state}`);
+  const v = r0.git_sha ? await (o.verify ?? evidence.verifyHead)(r0) : { ok: true };
+  const g = await runGates(r0, o.gateCheck);
   return tx(() => {
-    r = relRow(id);
+    const r = relRow(id);
+    if (r.version !== r0.version) throw refuse('changed', `release ${id} changed during start checks; retry`);
     requireMode(`env:${r.environment}`, true);
-    if (r.state !== 'admitted') throw refuse('bad_state', `release ${id} is ${r.state}`);
     if (r.fence !== Number(fence)) throw refuse('stale_fence', `fence ${fence} is not the admission fence`);
     if (r.fence_resource?.startsWith('env:')) {
-      const c = holder(r.fence_resource, r.admitted_by, r.fence);
+      const c = holder(r.fence_resource, r.fence_owner, r.fence);
       if (c instanceof Error) return c;
     }
     if (as !== r.requester && as !== r.admitted_by) throw refuse('forbidden', `${as} did not request or admit release ${id}`);
@@ -459,42 +550,73 @@ export async function releaseStart(id, o = {}) {
       touch(r.id, { state: 'superseded', failure: `head moved after admission: ${v.reason ?? ''}` });
       return refuse('head_moved', `release ${id} head moved after admission: ${v.reason ?? ''}`.trim());
     }
-    const set = { state: 'running' };
+    if (!g.ok) throw refuse(g.code, g.reason, { missing: g.missing });
+    const tf = tfChecks(r, 'start');
+    if (tf) return tf;
+    const qa = openQa(r.environment);
+    if (qa) throw refuse('qa_window_open', `QA window #${qa.id} holds ${r.environment}`, { blocking: qa.id });
+    const held = blockingClaim(r.environment, r.footprint, [r.admitted_by, r.requester]);
+    if (held) return held;
+    if (r.kind === 'redispatch') {
+      const src = get("SELECT id FROM releases WHERE id=? AND state='built_not_deployed'", r.redispatch_of);
+      if (!src) throw refuse('no_built_release', `source release #${r.redispatch_of} is no longer built_not_deployed`);
+    }
+    const set = { state: 'running', gate_evidence: json(g.evidence) };
     for (const [k, col] of [['tag', 'tag'], ['digest', 'image_digest'], ['releaseRun', 'release_run'], ['deployRun', 'deploy_run'], ['tfRun', 'tf_run']])
       if (o[k] !== undefined) set[col] = o[k];
     touch(r.id, set);
-    if (r.kind === 'redispatch')
-      run(`UPDATE releases SET state='superseded', outcome=?, updated_at=? WHERE state='built_not_deployed' AND repo=? AND tag=? AND image_digest=?`,
-        `redispatched as #${r.id}`, now(), r.repo, r.tag, r.image_digest);
+    // Any started mutation that declares a Terraform root invalidates plans made against that root.
+    for (const root of r.footprint.filter(f => f.startsWith('tf:')).map(f => f.slice(3)))
+      run('INSERT INTO tf_roots (root,gen) VALUES (?,1) ON CONFLICT(root) DO UPDATE SET gen=gen+1', root);
+    if (r.kind === 'redispatch') touch(r.redispatch_of, { state: 'superseded', outcome: `redispatched as #${r.id}` });
     return { release: relRow(r.id) };
   });
 }
 
-// Records run ids or a digest on a running release (they are often known only after dispatch).
+// Records run ids or a digest found after dispatch. On a built_not_deployed row an admitter may bind the
+// digest or downstream run from evidence (so it can be redispatched); the row stays built_not_deployed.
 export function releaseRecord(id, o = {}) {
-  const r = relRow(id);
-  if (!['running', 'admitted'].includes(r.state)) throw refuse('bad_state', `release ${id} is ${r.state}`);
-  if (r.fence !== Number(o.fence)) throw refuse('stale_fence', `fence ${o.fence} is not the admission fence`);
-  const set = {};
-  for (const [k, col] of [['releaseRun', 'release_run'], ['deployRun', 'deploy_run'], ['tfRun', 'tf_run'], ['digest', 'image_digest']]) {
-    if (o[k] === undefined) continue;
-    if (r[col] && r[col] !== o[k]) throw refuse('binding_mismatch', `${col} already ${r[col]}`);
-    set[col] = o[k];
-  }
-  if (Object.keys(set).length) touch(r.id, set);
-  return { release: relRow(r.id) };
+  return tx(() => {
+    const r = relRow(id);
+    const built = r.state === 'built_not_deployed';
+    if (built) {
+      if (!DEFAULTS.admitters.includes(o.as)) throw refuse('forbidden', `only ${DEFAULTS.admitters.join('|')} may record on a built release`);
+      need(o.evidence, 'evidence');
+    } else {
+      if (!['running', 'admitted'].includes(r.state)) throw refuse('bad_state', `release ${id} is ${r.state}`);
+      if (r.fence !== Number(o.fence)) throw refuse('stale_fence', `fence ${o.fence} is not the admission fence`);
+    }
+    const set = {};
+    for (const [k, col] of [['releaseRun', 'release_run'], ['deployRun', 'deploy_run'], ['tfRun', 'tf_run'], ['digest', 'image_digest']]) {
+      if (o[k] === undefined) continue;
+      if (r[col] && r[col] !== o[k]) throw refuse('binding_mismatch', `${col} already ${r[col]}`);
+      if (built && !['digest', 'deployRun'].includes(k)) throw refuse('invalid', `${k} cannot be recorded on a built release`);
+      set[col] = o[k];
+    }
+    if (built && Object.keys(set).length) set.outcome = `recorded by ${o.as}: ${o.evidence}`;
+    if (Object.keys(set).length) touch(r.id, set);
+    return { release: relRow(r.id) };
+  });
 }
 
-// `observe(release)` resolves {state, readback?, failure?, outcome?}; see evidence.observeRelease.
+// `observe(release)` resolves {state, readback?, failure?, outcome?, digest?}; see evidence.observeRelease.
+// The result is applied only if the row did not change while the observer ran.
 export async function releaseObserve(id, { observe = evidence.observeRelease } = {}) {
   const r = relRow(id);
   if (r.state !== 'running') return { release: r, unchanged: true };
   const o = await observe(r);
-  if (!o || o.state === 'running') return { release: r, pending: o?.why ?? 'still running' };
-  if (!['done', 'failed', 'built_not_deployed'].includes(o.state)) throw refuse('invalid', `observer returned ${o.state}`);
+  if (!o || !['done', 'failed', 'built_not_deployed'].includes(o.state)) {
+    const note = `${o?.state ?? 'unknown'}: ${o?.why ?? 'no result'}`;
+    run('UPDATE releases SET observed_at=?, observe_note=? WHERE id=?', now(), note, r.id);
+    return { release: relRow(id), pending: note };
+  }
   return tx(() => {
-    if (relRow(id).state !== 'running') return { release: relRow(id), unchanged: true };
-    touch(r.id, { state: o.state, readback: json(o.readback), failure: o.failure ?? null, outcome: o.outcome ?? o.state, ...(o.digest && !r.image_digest ? { image_digest: o.digest } : {}) });
+    const cur = relRow(id);
+    if (cur.version !== r.version) return { release: cur, pending: 'release changed while observing; observe again' };
+    if (o.digest && cur.image_digest && o.digest !== cur.image_digest)
+      throw refuse('binding_mismatch', `observed digest ${o.digest} differs from bound ${cur.image_digest}`);
+    touch(r.id, { state: o.state, readback: json(o.readback), failure: o.failure ?? null, outcome: o.outcome ?? o.state, observed_at: now(),
+      ...(o.digest && !cur.image_digest ? { image_digest: o.digest } : {}) });
     return { release: relRow(r.id) };
   });
 }
@@ -515,22 +637,29 @@ export function releaseList({ state, env } = {}) {
   return { releases: all('SELECT id FROM releases WHERE (? IS NULL OR state=?) AND (? IS NULL OR environment=?) ORDER BY id', state ?? null, state ?? null, env ?? null, env ?? null).map(x => relRow(x.id)) };
 }
 
-// A QA window is a release row of kind qa_window that goes straight to running and blocks overlapping
-// admissions until closed. Expiry only raises attention; it never frees the footprint on its own.
+// A QA window is a release row of kind qa_window that goes straight to running. It holds its whole
+// environment against every mutation (and every mutation holds it off), whatever the footprint strings.
+// Expiry only raises attention; it never frees the environment on its own.
 export function qaOpen({ as, env, footprint, ttl, key } = {}) {
   need(as, 'as'); need(env, 'env');
-  const fp = Array.isArray(footprint) ? footprint : list(footprint, []);
-  if (!fp.length) throw refuse('invalid', 'footprint is required');
+  const fp = [...new Set([...(Array.isArray(footprint) ? footprint : list(footprint, [])), `env:${env}`])].sort();
   const secs = parseTtl(ttl, 4 * 3600);
+  const f = fingerprint({ kind: 'qa_window', requester: as, environment: env, footprint: fp, ttl: secs });
   return tx(() => {
-    const prev = key && get('SELECT id FROM releases WHERE request_key=?', key);
-    if (prev) return { release: relRow(prev.id), duplicate: true };
+    const prev = key && get('SELECT id, fingerprint FROM releases WHERE request_key=?', key);
+    if (prev) {
+      if (prev.fingerprint !== f) throw refuse('conflict', `request ${key} exists with a different binding`, { status: 409, id: prev.id });
+      return { release: relRow(prev.id), duplicate: true };
+    }
     requireMode(`env:${env}`);
-    const busy = all("SELECT id, kind, footprint FROM releases WHERE state IN ('admitted','running')").find(x => overlap(parse(x.footprint), fp));
-    if (busy) throw refuse('footprint_busy', `overlaps ${busy.kind} #${busy.id}`, { blocking: busy.id });
+    const busy = all("SELECT id, kind, footprint FROM releases WHERE state IN ('admitted','running') AND (environment=? OR kind='qa_window')", env)
+      .find(x => x.kind !== 'qa_window' || overlap(parse(x.footprint), fp));
+    if (busy) throw refuse(busy.kind === 'qa_window' ? 'footprint_busy' : 'env_busy', `${env} has ${busy.kind} #${busy.id} in flight`, { blocking: busy.id });
+    const held = blockingClaim(env, fp, [as]);
+    if (held) return held;
     const t = now();
-    const id = Number(run(`INSERT INTO releases (request_key,requester,kind,environment,footprint,state,admitted_by,admitted_at,readback,created_at,updated_at)
-      VALUES (?,?,'qa_window',?,?,'running',?,?,?,?,?)`, key ?? `qa:${as}:${env}:${t}:${hash(fp).slice(0, 8)}`, as, env, json(fp), as, t, json({ until: t + secs }), t, t).lastInsertRowid);
+    const id = Number(run(`INSERT INTO releases (request_key,fingerprint,requester,kind,environment,footprint,state,admitted_by,admitted_at,readback,created_at,updated_at)
+      VALUES (?,?,?,'qa_window',?,?,'running',?,?,?,?,?)`, key ?? `qa:${as}:${env}:${t}:${f.slice(0, 8)}`, f, as, env, json(fp), as, t, json({ until: t + secs }), t, t).lastInsertRowid);
     return { release: relRow(id) };
   });
 }
@@ -579,7 +708,8 @@ function archStep(id, as, fence, from, set) {
     if (!a) throw refuse('not_found', `no arch request ${id}`);
     if (from === 'queued' && a.state === 'taken' && a.taken_by === as) return { request: a, duplicate: true };
     if (a.state !== from) throw refuse('bad_state', `arch request ${id} is ${a.state}`);
-    if (from === 'taken' && a.taken_by !== as) throw refuse('forbidden', `arch request ${id} is taken by ${a.taken_by}`);
+    if (from === 'taken' && (a.taken_by !== as || a.fence !== Number(fence)))
+      throw refuse('forbidden', `arch request ${id} is bound to ${a.taken_by} fence ${a.fence}; use arch transfer after reconcile`);
     const keys = Object.keys(set);
     run(`UPDATE arch_requests SET ${keys.map(k => `${k}=?`).join(', ')}, updated_at=? WHERE id=?`, ...keys.map(k => set[k]), now(), a.id);
     return { request: get('SELECT * FROM arch_requests WHERE id=?', a.id) };
@@ -590,6 +720,26 @@ export const archDone = (id, { as, fence, commits, note } = {}) =>
   archStep(id, as, fence, 'taken', { state: 'done', result_commits: json(Array.isArray(commits) ? commits : list(commits, [])), result_note: note ?? null });
 export const archReject = (id, { as, fence, note, superseded } = {}) =>
   archStep(id, as, fence, 'taken', { state: superseded ? 'superseded' : 'rejected', result_note: need(note, 'note') });
+// Hands a taken request to the current arch:broker holder once the fence it was taken under has ended
+// cleanly: released by its owner, or reconciled as not_started / rolled_back.
+export function archTransfer(id, { as, fence } = {}) {
+  return tx(() => {
+    const c = holder(ARCH_RESOURCE, as, fence);
+    if (c instanceof Error) return c;
+    const a = get('SELECT * FROM arch_requests WHERE id=?', Number(id));
+    if (!a) throw refuse('not_found', `no arch request ${id}`);
+    if (a.state !== 'taken') throw refuse('bad_state', `arch request ${id} is ${a.state}`);
+    if (a.taken_by === as && a.fence === Number(fence)) return { request: a, duplicate: true };
+    const prev = get('SELECT * FROM claim_history WHERE resource=? AND fence=?', ARCH_RESOURCE, a.fence);
+    const ok = prev && (prev.state === 'released' || (prev.state === 'reconciled' && ['not_started', 'rolled_back'].includes(prev.reconcile_outcome)));
+    if (!ok)
+      throw refuse('not_reconciled', `fence ${a.fence} of ${a.taken_by} was neither released nor reconciled as not_started/rolled_back`,
+        { previous: prev ? { state: prev.state, outcome: prev.reconcile_outcome } : null });
+    run('UPDATE arch_requests SET taken_by=?, fence=?, result_note=?, updated_at=? WHERE id=?', as, Number(fence),
+      `transferred from ${a.taken_by} fence ${a.fence} (${prev.state}${prev.reconcile_outcome ? ` ${prev.reconcile_outcome} by ${prev.reconcile_by}: ${prev.reconcile_evidence}` : ''})`, now(), a.id);
+    return { request: get('SELECT * FROM arch_requests WHERE id=?', a.id) };
+  });
+}
 export const archList = ({ state } = {}) => ({ requests: all('SELECT * FROM arch_requests WHERE (? IS NULL OR state=?) ORDER BY id', state ?? null, state ?? null) });
 
 // ---------- approval provenance ----------
@@ -619,11 +769,10 @@ export async function drainReport({ threadState, scope } = {}) {
     deliveries: get("SELECT COUNT(*) n FROM deliveries WHERE status='pending'").n,
     threads: [],
   };
-  if (threadState) {
-    for (const a of all("SELECT * FROM actors WHERE kind='thread' AND thread_id IS NOT NULL")) {
-      const state = await threadState(a.thread_id).catch(e => `unknown: ${e.message}`);
-      if (!threadDrained(state)) inflight.threads.push({ actor: a.id, thread: a.thread_id, state });
-    }
+  // Thread actors that cannot be checked count as not drained.
+  for (const a of all("SELECT * FROM actors WHERE kind='thread' AND thread_id IS NOT NULL")) {
+    const state = threadState ? await threadState(a.thread_id).catch(e => `unknown: ${e.message}`) : 'unknown: no control API';
+    if (!threadDrained(state)) inflight.threads.push({ actor: a.id, thread: a.thread_id, state });
   }
   const drained = !inflight.releases.length && !inflight.claims.length && !inflight.deliveries && !inflight.threads.length;
   return { mode: g.mode, drained, inflight };
@@ -639,6 +788,7 @@ export function attention({ unackedAfter = DEFAULTS.unackedAfter } = {}) {
     releases: all(`SELECT id, kind, environment, repo, binary, tag, state, failure FROM releases
       WHERE state IN ('built_not_deployed','failed') OR (state='superseded' AND outcome IS NULL AND updated_at>?)
         OR (state='requested' AND created_at<=?) OR (state='admitted' AND admitted_at<=?)`, t - 7 * 86400, t - 3600, t - 3600),
+    unobserved: all("SELECT id, kind, environment, observed_at, observe_note FROM releases WHERE state='running' AND kind!='qa_window' AND observe_note LIKE 'unknown:%'"),
     expired_qa_windows: all("SELECT id, requester, environment, readback FROM releases WHERE kind='qa_window' AND state='running'")
       .filter(q => (parse(q.readback)?.until ?? Infinity) <= t),
     arch_queued: all("SELECT id, kind, requester, summary FROM arch_requests WHERE state='queued'"),

@@ -50,6 +50,32 @@ export async function stubControl({ states = {} } = {}) {
   return { cfg, sends, messages, states, failNext: n => { failNext = n; }, close: () => new Promise(r => server.close(r)) };
 }
 
+export const SHA0 = '0'.repeat(40);
 export const SHA1 = 'a'.repeat(40);
 export const SHA2 = 'b'.repeat(40);
 export const DIGEST = `sha256:${'c'.repeat(64)}`;
+
+// Rollout-gate hook that clears every PR in the range with evidence.
+export const gatesOk = async r => ({ prs: r.content_prs.map(pr => ({ pr, ok: true, evidence: `approved head of ${pr}` })) });
+
+// Fake `gh` keyed by the joined argument string. Values may be strings, objects (JSON) or functions.
+export function fakeGh(routes) {
+  const calls = [];
+  const gh = async args => {
+    const k = args.join(' ');
+    calls.push(k);
+    for (const [re, v] of routes) {
+      const m = k.match(re);
+      if (!m) continue;
+      const out = typeof v === 'function' ? await v(m) : v;
+      return typeof out === 'string' ? out : JSON.stringify(out);
+    }
+    throw new Error(`fake gh: no route for ${k}`);
+  };
+  gh.calls = calls;
+  return gh;
+}
+
+export const deployLog = (binary, tag, sha, { env = 'dev', digest = DIGEST } = {}) =>
+  `npm run validate:release-tag -- --env ${env} --binary "${binary}" --tag "${tag}"\n` +
+  `npm run validate:ecr-image-provenance -- --env ${env} --binary "${binary}" --image-digest "${digest}" --git-sha "${sha}" --aws-account-id "1"`;

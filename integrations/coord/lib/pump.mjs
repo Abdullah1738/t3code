@@ -5,7 +5,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { tx, get, all, run } from './db.mjs';
-import { clock, gate, DEFAULTS } from './coord.mjs';
+import { clock, gate, DEFAULTS, releaseObserve } from './coord.mjs';
 
 const PREFIX = '/api/ardud/control';
 const MAX_ATTEMPTS = 8;
@@ -58,44 +58,59 @@ export function render(e, recipient) {
     `When read, ack it: coord ack --as ${recipient} ${e.seq}`;
 }
 
-// Takes due rows under a short lease so overlapping pumps do not race on the same row.
-// While paused, only control events go out; the rest stay pending and are counted as held.
-function take(limit, seq) {
+const paused = d => d.kind !== 'control' && gate(d.environment ? `env:${d.environment}` : undefined).mode === 'pause';
+const DUE = `SELECT d.*, e.kind, e.environment FROM deliveries d JOIN events e ON e.seq=d.event_seq
+  WHERE d.status='pending' AND d.thread_id IS NOT NULL AND COALESCE(d.next_attempt_at,0)<=?`;
+
+// Reserves one row right before its send: re-reads it, its actor's current thread and the effective pause,
+// then bumps gen. The result write must match that gen, so an ack, retarget or newer reservation wins.
+function reserve(seq, recipient) {
   return tx(() => {
-    const t = clock.now();
-    const rows = all(`SELECT d.*, e.kind, e.environment FROM deliveries d JOIN events e ON e.seq=d.event_seq
-      WHERE d.status='pending' AND d.thread_id IS NOT NULL AND COALESCE(d.next_attempt_at,0)<=? AND (? IS NULL OR d.event_seq=?)
-      ORDER BY d.event_seq LIMIT ?`, t, seq ?? null, seq ?? null, limit);
-    const out = [];
-    let held = 0;
-    for (const d of rows) {
-      if (paused(d)) { held++; continue; }
-      run('UPDATE deliveries SET attempts=attempts+1, next_attempt_at=? WHERE event_seq=? AND recipient=?', t + LEASE, d.event_seq, d.recipient);
-      out.push({ ...d, attempts: d.attempts + 1 });
-    }
-    return { rows: out, held };
+    const d = get(`${DUE} AND d.event_seq=? AND d.recipient=?`, clock.now(), seq, recipient);
+    if (!d || paused(d)) return null;
+    const a = get('SELECT * FROM actors WHERE id=?', d.recipient);
+    if (a?.kind !== 'thread' || a.thread_id !== d.thread_id) return null;
+    run('UPDATE deliveries SET attempts=attempts+1, next_attempt_at=?, gen=gen+1 WHERE event_seq=? AND recipient=?', clock.now() + LEASE, seq, recipient);
+    return get(`SELECT d.*, e.kind, e.environment FROM deliveries d JOIN events e ON e.seq=d.event_seq WHERE d.event_seq=? AND d.recipient=?`, seq, recipient);
   });
 }
-const paused = d => d.kind !== 'control' && gate(d.environment ? `env:${d.environment}` : undefined).mode === 'pause';
+
+// Due rows in order, skipping held (paused) rows so they cannot starve deliverable ones.
+function candidates(limit, seq) {
+  const out = [];
+  let held = 0, cur = [0, ''];
+  for (;;) {
+    const page = all(`${DUE} AND (d.event_seq>? OR (d.event_seq=? AND d.recipient>?)) AND (? IS NULL OR d.event_seq=?)
+      ORDER BY d.event_seq, d.recipient LIMIT 200`, clock.now(), cur[0], cur[0], cur[1], seq, seq);
+    for (const d of page) {
+      if (paused(d)) held++;
+      else if (out.length < limit) out.push(d);
+    }
+    if (page.length < 200) break;
+    cur = [page.at(-1).event_seq, page.at(-1).recipient];
+  }
+  return { rows: out, held };
+}
 
 export async function deliver({ cfg, limit = 50, seq, send = sendToThread, unackedAfter = DEFAULTS.unackedAfter } = {}) {
-  const res = { sent: [], failed: [], retry: [], reminded: [], held: 0 };
+  const res = { sent: [], failed: [], retry: [], reminded: [], held: 0, skipped: 0 };
   cfg ??= controlConfig();
-  const { rows, held } = take(limit, seq == null ? null : Number(seq));
+  const { rows, held } = candidates(limit, seq == null ? null : Number(seq));
   res.held = held;
-  for (const d of rows) {
+  for (const c of rows) {
+    const d = reserve(c.event_seq, c.recipient);
+    if (!d) { res.skipped++; continue; }
     const e = get('SELECT * FROM events WHERE seq=?', d.event_seq);
     try {
       const r = await send(cfg, d.thread_id, render(e, d.recipient), d.client_request_id);
-      // Only mark it sent if the row still targets the thread we sent to (an actor rebind resets it).
       const u = run(`UPDATE deliveries SET status='sent', sent_at=?, message_id=?, run_id=?, last_error=NULL, next_attempt_at=NULL
-        WHERE event_seq=? AND recipient=? AND status='pending' AND thread_id=?`, clock.now(), r?.messageId ?? null, r?.runId ?? null, d.event_seq, d.recipient, d.thread_id);
+        WHERE event_seq=? AND recipient=? AND status='pending' AND gen=?`, clock.now(), r?.messageId ?? null, r?.runId ?? null, d.event_seq, d.recipient, d.gen);
       if (Number(u.changes)) res.sent.push({ seq: d.event_seq, recipient: d.recipient, messageId: r?.messageId ?? null, delivery: r?.delivery ?? null });
     } catch (err) {
       const fatal = err.status === 404 || err.status === 400 || d.attempts >= MAX_ATTEMPTS;
       const back = Math.min(3600, 30 * 2 ** (d.attempts - 1));
-      run(`UPDATE deliveries SET status=?, last_error=?, next_attempt_at=? WHERE event_seq=? AND recipient=? AND status='pending' AND thread_id=?`,
-        fatal ? 'failed' : 'pending', `${err.code ?? 'error'}: ${err.message}`.slice(0, 500), fatal ? null : clock.now() + back, d.event_seq, d.recipient, d.thread_id);
+      run(`UPDATE deliveries SET status=?, last_error=?, next_attempt_at=? WHERE event_seq=? AND recipient=? AND status='pending' AND gen=?`,
+        fatal ? 'failed' : 'pending', `${err.code ?? 'error'}: ${err.message}`.slice(0, 500), fatal ? null : clock.now() + back, d.event_seq, d.recipient, d.gen);
       (fatal ? res.failed : res.retry).push({ seq: d.event_seq, recipient: d.recipient, error: err.message });
     }
   }
@@ -109,7 +124,7 @@ export async function deliver({ cfg, limit = 50, seq, send = sendToThread, unack
       try {
         await send(cfg, thread, `[coord reminder #${d.event_seq}] still unacked. Read it with coord inbox --as ${d.recipient} --unacked, then: coord ack --as ${d.recipient} ${d.event_seq}`,
           `${d.client_request_id}:remind`);
-        run('UPDATE deliveries SET reminded=1 WHERE event_seq=? AND recipient=?', d.event_seq, d.recipient);
+        run("UPDATE deliveries SET reminded=1 WHERE event_seq=? AND recipient=? AND status='sent'", d.event_seq, d.recipient);
         res.reminded.push({ seq: d.event_seq, recipient: d.recipient });
       } catch (err) {
         res.retry.push({ seq: d.event_seq, recipient: d.recipient, reminder: true, error: err.message });
@@ -117,4 +132,20 @@ export async function deliver({ cfg, limit = 50, seq, send = sendToThread, unack
     }
   }
   return res;
+}
+
+// One pump tick: deliveries, then observe a bounded number of running releases (oldest observation first).
+export async function pump({ cfg, observe, observeLimit = 5, ...o } = {}) {
+  const out = { deliver: await deliver({ cfg, ...o }).catch(e => ({ error: e.message })), observed: [] };
+  const rows = all("SELECT id FROM releases WHERE state='running' AND kind!='qa_window' ORDER BY COALESCE(observed_at,0), id LIMIT ?", observeLimit);
+  for (const { id } of rows) {
+    try {
+      const r = await releaseObserve(id, observe ? { observe } : {});
+      out.observed.push({ id, state: r.release.state, ...(r.pending ? { pending: r.pending } : {}) });
+    } catch (e) {
+      run('UPDATE releases SET observed_at=?, observe_note=? WHERE id=?', clock.now(), `unknown: ${e.code ?? 'error'}: ${e.message}`.slice(0, 500), id);
+      out.observed.push({ id, error: e.code ?? 'error', message: e.message });
+    }
+  }
+  return out;
 }
