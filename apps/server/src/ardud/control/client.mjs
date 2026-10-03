@@ -231,7 +231,7 @@ export class ControlClient {
   /**
    * @param {string} threadId
    * @param {{ runtimeMode?: string, interactionMode?: string, model?: string,
-   *   variant?: string | null, title?: string, archived?: boolean }} settings
+   *   variant?: string | null, title?: string, archived?: boolean, settled?: boolean }} settings
    */
   updateThread(threadId, settings) {
     return this.request("PATCH", `/threads/${encodeURIComponent(threadId)}`, settings);

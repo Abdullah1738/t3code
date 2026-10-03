@@ -25,7 +25,7 @@ const HELP = `t3ctl <command> [options]
   interrupt THREAD
   respond THREAD REQUEST (--approve | --deny | --always | --answer KEY=VALUE ... | --dismiss)
   origin THREAD ORIGIN|none
-  set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive]
+  set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive] [--settle|--unsettle]
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, or ${DEFAULT_TOKEN_FILE}.`;
@@ -61,6 +61,8 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     answer: { type: "string", multiple: true },
     archive: { type: "boolean" },
     unarchive: { type: "boolean" },
+    settle: { type: "boolean" },
+    unsettle: { type: "boolean" },
     thread: { type: "string" },
     types: { type: "string" },
     after: { type: "string" },
@@ -214,6 +216,10 @@ async function main() {
       );
     }
     case "set":
+      if (flags.settle && flags.unsettle) {
+        console.error("pick one of --settle or --unsettle");
+        process.exit(2);
+      }
       return print(
         await client.updateThread(need(args[0], "THREAD"), {
           runtimeMode: flags.mode,
@@ -221,6 +227,7 @@ async function main() {
           variant: flags.variant,
           title: flags.title,
           ...(flags.archive ? { archived: true } : flags.unarchive ? { archived: false } : {}),
+          ...(flags.settle ? { settled: true } : flags.unsettle ? { settled: false } : {}),
         }),
       );
     case "events": {

@@ -67,25 +67,25 @@ or the client refuses it. `t3ctl login --url URL --token TOKEN` writes it.
 
 All paths are under `/api/ardud/control`.
 
-| Method | Path                                       | What it does                                                                     |
-| ------ | ------------------------------------------ | -------------------------------------------------------------------------------- |
-| GET    | `/health`                                  | Token check plus the latest event sequence.                                      |
-| GET    | `/projects`                                | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).          |
-| GET    | `/models`                                  | Default model and runtime mode, plus each provider's models and variants.        |
-| GET    | `/threads`                                 | List threads (see filters below).                                                |
-| POST   | `/threads`                                 | Create a thread, optionally with a first prompt.                                 |
-| GET    | `/threads/by-native/:sesId`                | Thread for an OpenCode session id (`ses_...`).                                   |
-| GET    | `/threads/:id`                             | Detail: state, current run, recent runs, pending requests.                       |
-| PATCH  | `/threads/:id`                             | Change `runtimeMode`, `interactionMode`, `model`/`variant`, `title`, `archived`. |
-| GET    | `/threads/:id/messages`                    | Messages plus `lastAssistant`.                                                   |
-| GET    | `/threads/:id/wait`                        | Long-poll until not running (or needs input).                                    |
-| POST   | `/threads/:id/send`                        | Send a message.                                                                  |
-| POST   | `/threads/:id/interrupt`                   | Stop the active turn.                                                            |
-| POST   | `/threads/:id/requests/:requestId/respond` | Answer an approval or a question.                                                |
-| PUT    | `/threads/:id/origin`                      | Set or clear the origin.                                                         |
-| GET    | `/requests`                                | Every pending approval and question across active threads.                       |
-| POST   | `/attachments`                             | Get a signed upload URL for a file to attach.                                    |
-| GET    | `/events`                                  | Server-sent events (SSE).                                                        |
+| Method | Path                                       | What it does                                                                                |
+| ------ | ------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| GET    | `/health`                                  | Token check plus the latest event sequence.                                                 |
+| GET    | `/projects`                                | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                     |
+| GET    | `/models`                                  | Default model and runtime mode, plus each provider's models and variants.                   |
+| GET    | `/threads`                                 | List threads (see filters below).                                                           |
+| POST   | `/threads`                                 | Create a thread, optionally with a first prompt.                                            |
+| GET    | `/threads/by-native/:sesId`                | Thread for an OpenCode session id (`ses_...`).                                              |
+| GET    | `/threads/:id`                             | Detail: state, current run, recent runs, pending requests.                                  |
+| PATCH  | `/threads/:id`                             | Change `runtimeMode`, `interactionMode`, `model`/`variant`, `title`, `archived`, `settled`. |
+| GET    | `/threads/:id/messages`                    | Messages plus `lastAssistant`.                                                              |
+| GET    | `/threads/:id/wait`                        | Long-poll until not running (or needs input).                                               |
+| POST   | `/threads/:id/send`                        | Send a message.                                                                             |
+| POST   | `/threads/:id/interrupt`                   | Stop the active turn.                                                                       |
+| POST   | `/threads/:id/requests/:requestId/respond` | Answer an approval or a question.                                                           |
+| PUT    | `/threads/:id/origin`                      | Set or clear the origin.                                                                    |
+| GET    | `/requests`                                | Every pending approval and question across active threads.                                  |
+| POST   | `/attachments`                             | Get a signed upload URL for a file to attach.                                               |
+| GET    | `/events`                                  | Server-sent events (SSE).                                                                   |
 
 ### GET /threads
 

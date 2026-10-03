@@ -228,6 +228,7 @@ const SettingsBody = Schema.Struct({
   variant: Schema.optional(Schema.NullOr(Schema.String)),
   title: OptionalString,
   archived: Schema.optional(Schema.Boolean),
+  settled: Schema.optional(Schema.Boolean),
 });
 
 const UploadBody = Schema.Struct({
@@ -1032,6 +1033,18 @@ const makeRoutes = Effect.gen(function* () {
         commandId: yield* next("archive"),
         threadId: id,
       });
+    }
+    if (body.settled !== undefined && body.settled !== (shell.settledOverride === "settled")) {
+      yield* dispatch(
+        body.settled
+          ? { type: "thread.settle", commandId: yield* next("settle"), threadId: id }
+          : {
+              type: "thread.unsettle",
+              commandId: yield* next("unsettle"),
+              threadId: id,
+              reason: "user",
+            },
+      );
     }
     return json({ ok: true, thread: yield* threadDetail(threadId) });
   });
