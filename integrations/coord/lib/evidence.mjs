@@ -13,6 +13,10 @@ export const SERVICE_DEPLOY_WORKFLOW = 'deploy-dev-service.yml';
 // Service repos publish images from release.yml; this step is the image push.
 export const RELEASE_WORKFLOW = 'release.yml';
 export const PUBLISH_STEP = 'Build and push image';
+export const DISPATCH_STEP = 'Trigger environment deployment workflow';
+// Steps of terraform-dev.yml (main-dev 34264683c2, lines 1466-1519) that produce a saved full-root plan.
+export const SAVED_PLAN_STEPS = ['Package saved full-root plan', 'Configure AWS credentials for saved plan storage',
+  'Store saved plan in the state bucket', 'Upload saved plan metadata'];
 // Frontend repo -> its dev deploy workflow file.
 export const FRONTEND_DEPLOY = {
   'equicom-crypto/crypko-frontend': 'deploy-dev.yml',
@@ -196,34 +200,53 @@ export async function verifyHead(release, { gh = ghText, branch = BRANCH } = {})
   }
 }
 
-// A saved Terraform plan run attempt: where and when it ran (admission rejects plans older than the root's last mutation).
+// A saved Terraform plan run attempt. terraform-dev.yml's saved-plan apply takes only a run id and uses
+// that run's latest attempt, so the pinned attempt must still be the latest, and that attempt must have
+// produced and stored the saved full-root plan. Used at admission and again at start.
 export async function planRun(planId, { gh = ghText } = {}) {
   const m = /^saved:(\d+)@(\d+)$/.exec(planId ?? '');
   if (!m) throw new CoordError('invalid', `plan ${planId} is not saved:<run>@<attempt>`);
-  const a = await ghJson(gh, ['api', `repos/${DEVOPS}/actions/runs/${m[1]}/attempts/${m[2]}`]);
-  if (!isWorkflow(a, 'terraform-dev.yml')) throw new CoordError('plan_unverified', `run ${m[1]} is ${a?.path}, not terraform-dev.yml`);
-  if (a.status !== 'completed' || a.conclusion !== 'success') throw new CoordError('plan_unverified', `plan run ${m[1]} attempt ${m[2]} is ${a.status}/${a.conclusion}`);
-  if (a.head_branch !== BRANCH) throw new CoordError('plan_unverified', `plan run ${m[1]} ran on ${a.head_branch}`);
-  return { run: m[1], attempt: Number(m[2]), startedAt: attemptTime(a), headSha: a.head_sha };
+  const [run_, attempt] = [m[1], Number(m[2])];
+  const cur = await runInfo(DEVOPS, run_, { gh });
+  if ((cur?.run_attempt ?? 1) !== attempt)
+    throw new CoordError('plan_attempt_moved', `run ${run_} is at attempt ${cur?.run_attempt}, plan pins attempt ${attempt}; the apply would use the latest`);
+  const a = await ghJson(gh, ['api', `repos/${DEVOPS}/actions/runs/${run_}/attempts/${attempt}`]);
+  if (!isWorkflow(a, 'terraform-dev.yml')) throw new CoordError('plan_unverified', `run ${run_} is ${a?.path}, not terraform-dev.yml`);
+  if (a.status !== 'completed' || a.conclusion !== 'success') throw new CoordError('plan_unverified', `plan run ${run_} attempt ${attempt} is ${a.status}/${a.conclusion}`);
+  if (a.head_branch !== BRANCH) throw new CoordError('plan_unverified', `plan run ${run_} ran on ${a.head_branch}`);
+  const { jobs, done } = await attemptJobs(gh, DEVOPS, run_, attempt, { logs: false });
+  const missing = SAVED_PLAN_STEPS.filter(n => step(jobs, n)?.conclusion !== 'success');
+  if (!done || missing.length) throw new CoordError('plan_unverified', `plan run ${run_} attempt ${attempt} did not save a full-root plan (${missing.join(', ') || 'jobs unfinished'})`);
+  return { run: run_, attempt, startedAt: attemptTime(a), headSha: a.head_sha };
 }
 
+// Latest attempt number of a run (manual Terraform closeout checks the plan's attempt did not move).
+export const currentAttempt = async (runId, { gh = ghText } = {}) => (await runInfo(DEVOPS, runId, { gh }))?.run_attempt ?? 1;
+
 // Pure classification of a service release from its Release run and the downstream deploy run.
-export function classify({ release, published, downstream, downstreamJobs, inputs, expect, releaseAgeSec, waitSec = 1800 }) {
+// A known downstream decides; a parent failure alone never ends the operation.
+// `dispatched`: 'yes' (link found), 'no' (the dispatch step provably did not run), or 'unknown'.
+export function classify({ release, published, dispatched = 'yes', downstream, downstreamJobs, inputs, expect, releaseAgeSec, waitSec = 1800 }) {
+  if (downstream) {
+    if (!isWorkflow(downstream, SERVICE_DEPLOY_WORKFLOW)) return unknown(`run ${downstream.id} is not ${SERVICE_DEPLOY_WORKFLOW}`);
+    if (downstream.status !== 'completed') return { state: 'running', why: 'downstream running' };
+    if (!release || release.status !== 'completed') return { state: 'running', why: 'release run not finished' };
+    if (downstream.conclusion === 'cancelled' && !downstreamJobs)
+      return published ? { state: 'built_not_deployed', failure: `image published, downstream ${downstream.id} cancelled before any job` }
+        : unknown(`downstream ${downstream.id} cancelled before any job; image publication not shown`);
+    if (downstream.conclusion !== 'success') return { state: 'failed', failure: `downstream ${downstream.id} ${downstream.conclusion}` };
+    if (!inputs) return unknown(`downstream ${downstream.id} inputs unreadable`);
+    for (const k of ['env', 'binary', 'git_sha']) if (!expect[k]) return unknown(`release has no ${k} bound`);
+    for (const k of ['env', 'binary', 'tag', 'digest', 'git_sha'])
+      if (expect[k] && inputs[k] !== expect[k]) return { state: 'failed', failure: `downstream deployed ${k}=${inputs[k]}, expected ${expect[k]}` };
+    return { state: 'done', digest: inputs.digest };
+  }
   if (!release || release.status !== 'completed') return { state: 'running', why: 'release run not finished' };
-  if (release.conclusion !== 'success') return { state: 'failed', failure: `release run ${release.conclusion}` };
-  if (!published) return unknown('release run shows no successful image publication');
-  if (!downstream) return releaseAgeSec > waitSec
-    ? { state: 'built_not_deployed', failure: 'release ok, no downstream deploy run' } : { state: 'running', why: 'downstream not found yet' };
-  if (!isWorkflow(downstream, SERVICE_DEPLOY_WORKFLOW)) return unknown(`run ${downstream.id} is not ${SERVICE_DEPLOY_WORKFLOW}`);
-  if (downstream.status !== 'completed') return { state: 'running', why: 'downstream running' };
-  if (downstream.conclusion === 'cancelled' && !downstreamJobs)
-    return { state: 'built_not_deployed', failure: `release ok, downstream ${downstream.id} cancelled before any job` };
-  if (downstream.conclusion !== 'success') return { state: 'failed', failure: `downstream ${downstream.id} ${downstream.conclusion}` };
-  if (!inputs) return unknown(`downstream ${downstream.id} inputs unreadable`);
-  for (const k of ['env', 'binary', 'git_sha']) if (!expect[k]) return unknown(`release has no ${k} bound`);
-  for (const k of ['env', 'binary', 'tag', 'digest', 'git_sha'])
-    if (expect[k] && inputs[k] !== expect[k]) return { state: 'failed', failure: `downstream deployed ${k}=${inputs[k]}, expected ${expect[k]}` };
-  return { state: 'done', digest: inputs.digest };
+  if (dispatched === 'no') return published ? { state: 'built_not_deployed', failure: `image published, no downstream dispatched (release ${release.conclusion})` }
+    : { state: 'failed', failure: `release run ${release.conclusion}; nothing published or dispatched` };
+  if (dispatched === 'unknown') return unknown(`release run ${release.conclusion}: cannot tell whether a downstream deploy was dispatched; reconcile manually`);
+  return releaseAgeSec > waitSec ? unknown('dispatch step ran but no downstream run was found; reconcile manually')
+    : { state: 'running', why: 'downstream not found yet' };
 }
 
 async function observeFrontend(r, gh) {
@@ -233,7 +256,8 @@ async function observeFrontend(r, gh) {
   const d = await runInfo(r.repo, r.deploy_run, { gh });
   if (!isWorkflow(d, wf)) return unknown(`run ${r.deploy_run} is ${d?.path}, not ${wf}`);
   if (d.status !== 'completed') return { state: 'running', why: 'deploy run not finished' };
-  if (d.conclusion !== 'success') return { state: 'failed', failure: `deploy run ${d.conclusion}` };
+  if (d.conclusion !== 'success')
+    return (await recheck(gh, r.repo, d).catch(() => false)) ? { state: 'failed', failure: `deploy run ${d.conclusion}` } : unknown(`run ${d.id} changed while reading`);
   let executed;
   try { executed = await frontendExecuted(gh, r.repo, d); } catch (e) { return unknown(`deploy run jobs unreadable: ${e.message}`); }
   if (!executed) return unknown(`deploy run ${d.id} executed no deploy job`);
@@ -252,19 +276,29 @@ export async function observeRelease(r, { gh = ghText, now = Math.floor(Date.now
   if (!['service_release', 'redispatch', 'frontend_release'].includes(r.kind)) return { state: 'running', why: `${r.kind} is closed with release reconcile` };
   if (r.kind === 'frontend_release') return observeFrontend(r, gh);
   const expect = { env: r.environment, binary: r.binary, tag: r.tag, digest: r.image_digest, git_sha: r.git_sha };
-  let release = null, published = false, downstreamId = r.deploy_run;
+  let release = null, published = false, dispatched = 'yes', downstreamId = r.deploy_run;
   if (r.kind === 'redispatch') release = { status: 'completed', conclusion: 'success' }, published = true;
   else if (r.release_run) {
     release = await runInfo(r.repo, r.release_run, { gh });
     if (!isWorkflow(release, RELEASE_WORKFLOW)) return unknown(`run ${r.release_run} is ${release?.path}, not ${RELEASE_WORKFLOW}`);
+    if (release.event === 'workflow_dispatch') return unknown('workflow_dispatch provenance unsupported; reconcile manually');
     if (release.head_sha !== r.git_sha || (r.tag && release.head_branch !== r.tag))
       return unknown(`release run ${release.id} is ${release.head_branch}@${release.head_sha}, not ${r.tag}@${r.git_sha}`);
-    if (release.status === 'completed' && release.conclusion === 'success') {
+    if (release.status === 'completed') {
       let jobs;
       try { jobs = await attemptJobs(gh, r.repo, release.id, release.run_attempt ?? 1, { logs: !downstreamId }); }
-      catch (e) { return unknown(`release run jobs unreadable: ${e.message}`); }
-      published = step(jobs.jobs, PUBLISH_STEP)?.conclusion === 'success';
-      if (!downstreamId) downstreamId = /crpko-devops\/actions\/runs\/(\d+)/i.exec(jobs.log)?.[1];
+      catch (e) { if (!downstreamId) return unknown(`release run jobs unreadable: ${e.message}`); }
+      if (jobs) {
+        published = step(jobs.jobs, PUBLISH_STEP)?.conclusion === 'success';
+        if (!downstreamId) {
+          downstreamId = /crpko-devops\/actions\/runs\/(\d+)/i.exec(jobs.log)?.[1];
+          // Without a link in the logs: 'no' only when the dispatch step is shown not to have run.
+          const d = step(jobs.jobs, DISPATCH_STEP);
+          dispatched = downstreamId ? 'yes'
+            : jobs.done && d?.conclusion === 'skipped' ? 'no'
+            : jobs.done && d?.conclusion === 'success' ? 'yes' : 'unknown';
+        }
+      }
     }
   }
   const downstream = downstreamId ? await runInfo(DEVOPS, downstreamId, { gh }) : null;
@@ -280,8 +314,13 @@ export async function observeRelease(r, { gh = ghText, now = Math.floor(Date.now
     } catch (e) { return unknown(`downstream ${downstreamId} unreadable: ${e.message}`); }
   }
   const age = release?.updated_at ? now - sec(release.updated_at) : now - (r.updated_at ?? now);
-  const c = classify({ release, published, downstream, downstreamJobs: jobs, inputs, expect, releaseAgeSec: age });
-  return { ...c, readback: { release_run: r.release_run, deploy_run: downstreamId ?? null, attempt: downstream?.run_attempt ?? null, inputs } };
+  const c = classify({ release, published, dispatched, downstream, downstreamJobs: jobs, inputs, expect, releaseAgeSec: age });
+  // Before any terminal result, both runs must still be at the attempts that were read and finished.
+  if (['done', 'failed', 'built_not_deployed'].includes(c.state)) {
+    for (const [repo, run_] of [[r.repo, r.kind === 'redispatch' ? null : release], [DEVOPS, downstream]])
+      if (run_ && !(await recheck(gh, repo, run_).catch(() => false))) return unknown(`run ${run_.id} moved to a new attempt or is running again`);
+  }
+  return { ...c, readback: { release_run: r.release_run, release_attempt: release?.run_attempt ?? null, deploy_run: downstreamId ?? null, attempt: downstream?.run_attempt ?? null, inputs } };
 }
 
 // Evaluator for coord.ready: pr_merged / pr_deployed refs look like `owner/repo#123` or `owner/repo#123@binary`.

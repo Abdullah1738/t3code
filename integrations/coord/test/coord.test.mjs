@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import * as C from '../lib/coord.mjs';
 import { deliver, threadState } from '../lib/pump.mjs';
 import { classify, parseRunInputs } from '../lib/evidence.mjs';
-import { fresh, advance, stubControl, SHA0, SHA1, SHA2, DIGEST, deployGh, deployLog, resetHooks } from './helpers.mjs';
+import { fresh, advance, stubControl, SHA0, SHA1, SHA2, DIGEST, deployGh, deployLog, resetHooks, tagFor } from './helpers.mjs';
 
 const CLI = fileURLToPath(new URL('../cli.mjs', import.meta.url));
 const ok = async () => ({ ok: true });
@@ -111,12 +111,12 @@ test('claims: fencing is monotonic; expiry gives reconcile_required, never a sil
 // ---------- release admission ----------
 
 const svc = (key, o = {}) => C.releaseRequest({ as: 'crw', key, kind: 'service_release', env: 'dev', repo: 'Equicom-Crypto/trading-core',
-  binary: 'trading-core', sha: SHA1, tag: 'dev.33', runtimeSha: SHA0, contentPrs: ['equicom-crypto/trading-core#141'], ...o }).release;
+  binary: 'trading-core', sha: SHA1, runtimeSha: SHA0, contentPrs: ['equicom-crypto/trading-core#141'], ...o, n: undefined, tag: o.tag ?? tagFor(o.binary, o.n ?? 33, o.env) }).release;
 
 test('release admission binds repo+sha+digest+plan+env; stale sha is refused and superseded', async () => {
   const r = svc('crw:deploy:1');
   assert.equal(C.releaseRequest({ as: 'crw', key: 'crw:deploy:1', kind: 'service_release', env: 'dev', repo: 'Equicom-Crypto/trading-core',
-    binary: 'trading-core', sha: SHA1, tag: 'dev.33', runtimeSha: SHA0, contentPrs: ['equicom-crypto/trading-core#141'] }).duplicate, true);
+    binary: 'trading-core', sha: SHA1, tag: 'trading-core-docs1-dev.33', runtimeSha: SHA0, contentPrs: ['equicom-crypto/trading-core#141'] }).duplicate, true);
   assert.throws(() => svc('crw:deploy:1', { sha: SHA2 }), e => e.code === 'conflict');
   const s = svc('crw:deploy:2', { repo: 'Equicom-Crypto/risk', binary: 'risk' });
   await refused(() => C.releaseAdmit(s.id, { as: 'release', verify: stale }), 'stale_revision');
@@ -128,10 +128,10 @@ test('release admission binds repo+sha+digest+plan+env; stale sha is refused and
   await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence, sha: SHA2, verify: ok }), 'binding_mismatch');
   await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence, env: 'prod', verify: ok }), 'binding_mismatch');
   await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence + 1, verify: ok }), 'stale_fence');
-  await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence, tag: 'dev.34', verify: ok }), 'binding_mismatch');
-  const st = (await C.releaseStart(r.id, { as: 'crw', fence: a.fence, sha: SHA1, tag: 'dev.33', releaseRun: '1', verify: ok })).release;
+  await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence, tag: 'trading-core-docs1-dev.34', verify: ok }), 'binding_mismatch');
+  const st = (await C.releaseStart(r.id, { as: 'crw', fence: a.fence, sha: SHA1, tag: 'trading-core-docs1-dev.33', releaseRun: '1', verify: ok })).release;
   assert.equal(st.state, 'running');
-  assert.equal(st.tag, 'dev.33');
+  assert.equal(st.tag, 'trading-core-docs1-dev.33');
 });
 
 test('a head that moves after admission blocks release start', async () => {
@@ -153,7 +153,7 @@ test('a saved plan started before the last mutation of its root is superseded; f
   C.setFlag('tf_full_root_blocked', false, { as: 'master' });
   await refused(() => C.releaseAdmit(p1.id, { as: 'release', planRun }), 'manual_admit_required');
   const a1 = (await C.releaseAdmit(p1.id, { as: 'release', manual: true, planRun })).release;
-  await C.releaseStart(p1.id, { as: 'release', fence: a1.fence, tfRun: '5' });
+  await C.releaseStart(p1.id, { as: 'release', fence: a1.fence, tfRun: '5', planRun });
   assert.equal(C.tfRootGen('dev').gen, 1);
   await refused(() => C.releaseAdmit(p2.id, { as: 'release', manual: true, planRun }), 'stale_plan');
   assert.equal(C.releaseList({ state: 'superseded' }).releases[0].id, p2.id);
@@ -168,32 +168,33 @@ test('overlapping footprints and open QA windows block admission; built_not_depl
   await C.releaseStart(r.id, { as: 'crw', fence: a.fence, digest: DIGEST, releaseRun: '10', verify: ok });
   const obs = await C.releaseObserve(r.id, { observe: async () => ({ state: 'built_not_deployed', failure: 'downstream cancelled before any job' }) });
   assert.equal(obs.release.state, 'built_not_deployed');
-  const next = svc('crw:deploy:5', { sha: SHA2, tag: 'dev.34' });
+  const next = svc('crw:deploy:5', { sha: SHA2, n: 34 });
   await refused(() => C.releaseAdmit(next.id, { as: 'release', verify: ok }), 'built_not_deployed');
   const redis = (key, tag) => C.releaseRequest({ as: 'release', key, kind: 'redispatch', env: 'dev', repo: 'Equicom-Crypto/trading-core', binary: 'trading-core',
     sha: SHA1, runtimeSha: SHA0, contentPrs: ['equicom-crypto/trading-core#141'], tag, digest: DIGEST }).release;
-  const bad = redis('redis:x', 'dev.34');
+  const bad = redis('redis:x', 'trading-core-docs1-dev.34');
   await refused(() => C.releaseAdmit(bad.id, { as: 'release', manual: true, verify: ok }), 'no_built_release');
-  const re = redis('redis:1', 'dev.33');
+  const re = redis('redis:1', 'trading-core-docs1-dev.33');
   await refused(() => C.releaseAdmit(re.id, { as: 'crw', verify: ok }), 'manual_admit_required');
   const ra = (await C.releaseAdmit(re.id, { as: 'release', manual: true, verify: ok })).release;
-  await refused(() => C.releaseStart(re.id, { as: 'release', fence: ra.fence, tag: 'dev.34', verify: ok }), 'binding_mismatch');
+  await refused(() => C.releaseStart(re.id, { as: 'release', fence: ra.fence, tag: 'trading-core-docs1-dev.34', verify: ok }), 'binding_mismatch');
   await C.releaseStart(re.id, { as: 'release', fence: ra.fence, deployRun: '99', verify: ok });
   assert.equal(C.releaseList({ state: 'built_not_deployed' }).releases.length, 0);
 });
 
 test('evidence classification: zero-job cancelled downstream is built_not_deployed, not failed or done', () => {
   const rel = { status: 'completed', conclusion: 'success' };
-  const expect = { env: 'dev', binary: 'trading-core', tag: 'dev.33', digest: DIGEST, git_sha: SHA1 };
+  const expect = { env: 'dev', binary: 'trading-core', tag: 'trading-core-docs1-dev.33', digest: DIGEST, git_sha: SHA1 };
   const ds = (conclusion) => ({ id: 1, path: '.github/workflows/deploy-dev-service.yml', status: 'completed', conclusion });
   const c = o => classify({ release: rel, published: true, expect, ...o }).state;
   assert.equal(c({ downstream: ds('cancelled'), downstreamJobs: 0 }), 'built_not_deployed');
-  assert.equal(c({ downstream: null, releaseAgeSec: 4000 }), 'built_not_deployed');
-  assert.equal(c({ downstream: null, releaseAgeSec: 4000, published: false }), 'unknown');
+  assert.equal(c({ downstream: null, dispatched: 'no' }), 'built_not_deployed');
+  assert.equal(c({ downstream: null, dispatched: 'no', published: false }), 'failed');
+  assert.equal(c({ downstream: null, releaseAgeSec: 4000 }), 'unknown', 'dispatch ran but no downstream found: reconcile by hand');
   assert.equal(c({ downstream: null, releaseAgeSec: 60 }), 'running');
-  assert.equal(c({ downstream: ds('success'), inputs: { ...expect, tag: 'dev.32' } }), 'failed');
+  assert.equal(c({ downstream: ds('success'), inputs: { ...expect, tag: 'trading-core-docs1-dev.32' } }), 'failed');
   assert.equal(c({ downstream: ds('success'), inputs: expect }), 'done');
-  const log = `npm run validate:release-tag -- --env dev --binary "trading-core" --tag "dev.33"\n` +
+  const log = `npm run validate:release-tag -- --env dev --binary "trading-core" --tag "trading-core-docs1-dev.33"\n` +
     `npm run validate:ecr-image-provenance -- --env dev --binary "trading-core" --image-digest "${DIGEST}" --git-sha "${SHA1}" --aws-account-id "1"`;
   assert.deepEqual(parseRunInputs(log), expect);
 });
@@ -372,7 +373,7 @@ test('CLI: JSON output, refusal exits 1 with error.code', () => {
   assert.equal(tf.status, 0, JSON.stringify(tf.out));
   assert.deepEqual(tf.out.release.footprint, ['env:dev', 'tf:dev']);
   const empty = cli('release', 'request', '--as', 'crw', '--key', 'svc0', '--kind', 'service_release', '--env', 'dev', '--repo', 'O/R', '--binary', 'r',
-    '--sha', SHA1, '--tag', 'dev.1', '--runtime-sha', SHA1, '--content-prs', '');
+    '--sha', SHA1, '--tag', 'r-docs1-dev.1', '--runtime-sha', SHA1, '--content-prs', '');
   assert.equal(empty.status, 0, JSON.stringify(empty.out));
   assert.deepEqual([empty.out.release.content_prs, empty.out.release.repo], [[], 'o/r']);
   assert.equal(cli('flag', 'tf_full_root_blocked', 'off', '--as', 'release').out.error.code, 'forbidden');
@@ -397,10 +398,10 @@ test('evidence: verifyHead and serviceRuntime read gh output (fake gh)', async (
   assert.equal(C.releaseList({ state: 'requested' }).releases.length, 1, 'a transient failure does not supersede');
 
   const gh = deployGh({ 'deploy-dev-service.yml': [
-    { id: 10, started: '2026-10-01T00:00:00Z', log: deployLog('trading-core', 'dev.32', SHA1) },
+    { id: 10, started: '2026-10-01T00:00:00Z', log: deployLog('trading-core', 'trading-core-docs1-dev.32', SHA1) },
     { id: 11, started: '2026-10-02T00:00:00Z', log: deployLog('risk-liquidation', 'dev.34', SHA2) }] });
   const rt = await serviceRuntime({ binary: 'trading-core', gh });
-  assert.deepEqual(rt, { state: 'known', sha: SHA1, tag: 'dev.32', digest: DIGEST, run: '10', attempt: 1, reason: null });
+  assert.deepEqual(rt, { state: 'known', sha: SHA1, tag: 'trading-core-docs1-dev.32', digest: DIGEST, run: '10', attempt: 1, reason: null });
   const logs = gh.calls.filter(c => c.includes('/logs')).length;
   await serviceRuntime({ binary: 'trading-core', gh });
   assert.equal(gh.calls.filter(c => c.includes('/logs')).length, logs, 'run inputs are cached per run attempt');

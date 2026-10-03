@@ -228,6 +228,8 @@ export function claim(resource, { as, ttl, purpose, op } = {}) {
     requireMode(resourceScope(resource));
     const qa = qaOn(resource);
     if (qa) throw refuse('qa_window_open', `QA window #${qa.id} holds ${resource.slice(4)}; env claims wait for it to close`, { blocking: qa.id });
+    const rel = releaseOn(resource);
+    if (rel) throw refuse('release_in_flight', `${rel.kind} #${rel.id} (${rel.state}) holds ${resource}`, { blocking: rel.id });
     const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
     if (c?.state === 'reconcile_required') return reconcileErr(c);
     if (c?.state === 'active') throw refuse('held', `${resource} is held by ${c.owner}`, { owner: c.owner, fence: c.fence, lease_until: c.lease_until });
@@ -253,10 +255,24 @@ function holder(resource, as, fence) {
 
 const qaOn = resource => (resource.startsWith('env:') ? openQa(resource.slice(4)) : null);
 
+// Admitted/running mutations holding `resource`, other than ones whose admission relied on exactly this
+// claim fence (the same operation). An env: resource is held by every mutation in that environment.
+function releaseOn(resource, fence = null, owner = null) {
+  const env = resource.startsWith('env:') ? resource.slice(4) : null;
+  return all("SELECT id, kind, state, environment, footprint, claim_fences FROM releases WHERE state IN ('admitted','running') AND kind!='qa_window'")
+    .find(r => {
+      if (env ? r.environment !== env : !parse(r.footprint).includes(resource)) return false;
+      const relied = parse(r.claim_fences)?.[resource];
+      return !(fence !== null && relied && relied.fence === Number(fence) && relied.owner === owner);
+    }) ?? null;
+}
+
 export function check(resource, { as, fence } = {}) {
   return tx(() => {
     const qa = qaOn(resource);
     if (qa) throw refuse('qa_window_open', `QA window #${qa.id} holds ${resource.slice(4)}`, { blocking: qa.id });
+    const rel = releaseOn(resource, fence, as);
+    if (rel) throw refuse('release_in_flight', `${rel.kind} #${rel.id} (${rel.state}) holds ${resource}`, { blocking: rel.id });
     const c = holder(resource, as, fence);
     return c instanceof Error ? c : { resource, owner: c.owner, fence: c.fence, lease_until: c.lease_until };
   });
@@ -319,6 +335,22 @@ export function depSet(id, { state, evidence } = {}) {
   return { dep: get('SELECT * FROM deps WHERE id=?', d.id) };
 }
 
+const LOCAL_NEEDS = ['event_acked', 'claim_free', 'release_done'];
+// Dependencies backed by coord's own tables; re-evaluated inside the final ready() transaction.
+function localDep(d) {
+  if (d.need === 'event_acked') {
+    const e = get('SELECT seq FROM events WHERE event_key=?', d.ref);
+    const open = e && get("SELECT COUNT(*) n FROM deliveries WHERE event_seq=? AND status!='acked'", e.seq).n;
+    return !e ? { state: 'waiting', why: 'event not posted' } : open ? { state: 'waiting', why: `${open} recipients unacked` } : { state: 'ready', why: 'all acked', evidence: `seq ${e.seq}` };
+  }
+  if (d.need === 'claim_free') {
+    const c = get("SELECT * FROM claims WHERE resource=? AND state IN ('active','reconcile_required')", d.ref);
+    return c ? { state: 'waiting', why: `${c.state} by ${c.owner}` } : { state: 'ready', why: 'no claim' };
+  }
+  const x = get('SELECT * FROM releases WHERE request_key=? OR CAST(id AS TEXT)=?', d.ref, d.ref);
+  return x?.state === 'done' ? { state: 'ready', why: 'release done', evidence: x.readback } : { state: 'waiting', why: `release ${x?.state ?? 'not requested'}` };
+}
+
 // External needs (pr_merged, pr_deployed) are evaluated by `external(dep)` when supplied (see evidence.mjs).
 export async function ready(work, { external = evidence.external } = {}) {
   const out = [];
@@ -327,16 +359,8 @@ export async function ready(work, { external = evidence.external } = {}) {
     versions.set(d.id, d.version);
     let r = { state: d.state, why: d.why, evidence: d.evidence };
     if (d.state !== 'dead' && !(d.state === 'ready' && ['manual', 'ticket_done'].includes(d.need))) {
-      if (d.need === 'event_acked') {
-        const e = get('SELECT seq FROM events WHERE event_key=?', d.ref);
-        const open = e && get("SELECT COUNT(*) n FROM deliveries WHERE event_seq=? AND status!='acked'", e.seq).n;
-        r = !e ? { state: 'waiting', why: 'event not posted' } : open ? { state: 'waiting', why: `${open} recipients unacked` } : { state: 'ready', why: 'all acked', evidence: `seq ${e.seq}` };
-      } else if (d.need === 'claim_free') {
-        const c = get("SELECT * FROM claims WHERE resource=? AND state IN ('active','reconcile_required')", d.ref);
-        r = c ? { state: 'waiting', why: `${c.state} by ${c.owner}` } : { state: 'ready', why: 'no claim' };
-      } else if (d.need === 'release_done') {
-        const x = get('SELECT * FROM releases WHERE request_key=? OR CAST(id AS TEXT)=?', d.ref, d.ref);
-        r = x?.state === 'done' ? { state: 'ready', why: 'release done', evidence: x.readback } : { state: 'waiting', why: `release ${x?.state ?? 'not requested'}` };
+      if (LOCAL_NEEDS.includes(d.need)) {
+        r = localDep(d);
       } else if (['pr_merged', 'pr_deployed'].includes(d.need) && external) {
         r = await external(d).catch(e => ({ state: 'waiting', why: `check failed: ${e.message}` }));
       } else if (d.state !== 'ready') {
@@ -359,6 +383,8 @@ export async function ready(work, { external = evidence.external } = {}) {
     const final = all('SELECT id, need, ref, state, why, evidence, version FROM deps WHERE work_id=? ORDER BY id', work);
     const changed = final.length !== versions.size || final.some(f => versions.get(f.id) !== f.version);
     if (changed) return { work, ready: false, changed: true, why: 'dependencies changed during the check; run ready again', deps: final };
+    const moved = final.filter(d => d.state !== 'dead' && LOCAL_NEEDS.includes(d.need)).find(d => localDep(d).state !== d.state);
+    if (moved) return { work, ready: false, changed: true, why: `${moved.need} ${moved.ref} changed during the check; run ready again`, deps: final };
     return { work, ready: final.length > 0 && final.every(d => d.state === 'ready'), deps: out };
   });
 }
@@ -381,15 +407,27 @@ const overlap = (a, b) => a.some(x => b.includes(x));
 const conflicts = (a, b) => overlap(a.footprint.filter(f => !f.startsWith('env:')), b.footprint.filter(f => !f.startsWith('env:')))
   || ((a.env_exclusive || b.env_exclusive) && a.environment === b.environment);
 const fingerprint = o => hash(o);
+// Release tags, as in crpko-devops scripts/validate-release-tag.mjs: <binary>-docs<N>-<env>.<M>.
+export function parseTag(tag) {
+  const m = /^([a-z0-9][a-z0-9-]*)-docs([1-9][0-9]*)-(dev|staging|prod)\.([1-9][0-9]*)$/.exec(String(tag ?? ''));
+  return m && { binary: m[1], docs: Number(m[2]), env: m[3], version: Number(m[4]) };
+}
+function tagError(tag, binary, env) {
+  const t = parseTag(tag);
+  if (!t) return refuse('invalid_tag', `${tag} is not <binary>-docs<N>-<env>.<M>`);
+  if (t.binary !== binary || t.env !== env) return refuse('invalid_tag', `${tag} is ${t.binary}/${t.env}, request is ${binary}/${env}`);
+  return null;
+}
 export const canonRepo = r => String(r ?? '').trim().toLowerCase();
 export const canonBinary = b => String(b ?? '').trim().toLowerCase();
 
 // Terraform roots a service deploy applies, from deploy-dev-service.yml (crpko-devops main-dev 34264683c2):
 // registry plans and applies terraform/roots/dev ("Deploy registry publisher"); risk-liquidation hands state
-// over to and may bootstrap-apply dev-risk-liquidation, and reconciles dev-core-capacity.
+// from dev to (and may bootstrap-apply) dev-risk-liquidation, and reconciles dev-core-capacity.
 export const SERVICE_TF_ROOTS = {
   registry: ['dev'],
-  'risk-liquidation': ['dev-risk-liquidation', 'dev-core-capacity'],
+  // The state handoff moves resources out of terraform/roots/dev and pushes that source state back.
+  'risk-liquidation': ['dev', 'dev-risk-liquidation', 'dev-core-capacity'],
 };
 // Saved plans are always the full `dev` root (terraform-dev.yml terraform-saved-plan-apply job).
 export const SAVED_PLAN_ROOT = 'dev';
@@ -405,7 +443,7 @@ function intrinsic(row) {
 const tfRoots = r => r.footprint.filter(f => f.startsWith('tf:')).map(f => f.slice(3));
 
 // Hooks supplied by the embedding process (crw); see README "Contracts".
-export const hooks = { gateCheck: null, rangeResolver: null, runtime: null };
+export const hooks = { gateCheck: null, rangeResolver: null, runtime: null, planRun: null };
 export function configure(o = {}) {
   for (const k of Object.keys(hooks)) if (k in o) hooks[k] = o[k];
   return Object.fromEntries(Object.keys(hooks).map(k => [k, !!hooks[k]]));
@@ -468,6 +506,7 @@ export function releaseRequest(o = {}) {
     contentPrs = [...new Set(contentPrs)].sort();
   }
   if (kind === 'service_release' && !o.tag) throw refuse('invalid', 'tag (the release tag that will be cut) is required');
+  if (['service_release', 'redispatch'].includes(kind) && o.tag) { const e = tagError(o.tag, binary, env); if (e) throw e; }
   if (kind === 'redispatch' && !(o.tag && o.digest)) throw refuse('invalid', 'redispatch binds the existing tag and digest');
   if (kind === 'tf_apply') {
     if (!/^saved:\d+@\d+$/.test(o.plan ?? '')) throw refuse('invalid', 'tf_apply plan must be saved:<plan run id>@<attempt>');
@@ -575,7 +614,7 @@ export async function releaseAdmit(id, o = {}) {
   const g = await rangeChecks(r0, o);
   let plan = null;
   if (r0.kind === 'tf_apply') {
-    try { plan = await (o.planRun ?? evidence.planRun)(r0.plan_id); } catch (e) { throw refuse(e.code ?? 'plan_unverified', e.message); }
+    try { plan = await (o.planRun ?? hooks.planRun ?? evidence.planRun)(r0.plan_id); } catch (e) { throw refuse(e.code ?? 'plan_unverified', e.message); }
   }
   return tx(() => {
     let r = relRow(id);
@@ -587,6 +626,7 @@ export async function releaseAdmit(id, o = {}) {
       return refuse('stale_revision', `release ${id} ${r.git_sha} no longer valid: ${v.reason ?? ''}`.trim());
     }
     if (!g.ok) throw refuse(g.code, g.reason, { missing: g.missing });
+    if (r.tag) { const e = tagError(r.tag, r.binary, r.environment); if (e) throw e; }
     if (plan) { touch(r.id, { planned_at: plan.startedAt }); r = relRow(id); }
     const tf = tfCheck(r, { at: 'admit' });
     if (tf) return tf;
@@ -618,9 +658,15 @@ export async function releaseStart(id, o = {}) {
   if (r0.state !== 'admitted') throw refuse('bad_state', `release ${id} is ${r0.state}`);
   const v = r0.git_sha ? await (o.verify ?? evidence.verifyHead)(r0) : { ok: true };
   const g = await rangeChecks(r0, o);
+  let plan = null;
+  if (r0.kind === 'tf_apply') {
+    try { plan = await (o.planRun ?? hooks.planRun ?? evidence.planRun)(r0.plan_id); } catch (e) { throw refuse(e.code ?? 'plan_unverified', e.message); }
+  }
   return tx(() => {
     const r = relRow(id);
     if (r.version !== r0.version) throw refuse('changed', `release ${id} changed during start checks; retry`);
+    if (plan && plan.startedAt !== r.planned_at) throw refuse('plan_unverified', `plan ${r.plan_id} attempt start moved since admission`);
+    if (r.tag) { const e = tagError(r.tag, r.binary, r.environment); if (e) throw e; }
     requireMode(`env:${r.environment}`, true);
     if (r.fence !== Number(fence)) throw refuse('stale_fence', `fence ${fence} is not the admission fence`);
     if (as !== r.requester && as !== r.admitted_by) throw refuse('forbidden', `${as} did not request or admit release ${id}`);
@@ -643,9 +689,7 @@ export async function releaseStart(id, o = {}) {
     if (moved) return moved;
     const src = builtCheck(r);
     if (src instanceof Error) throw src;
-    const set = { state: 'running', gate_evidence: json(g.evidence) };
-    for (const [k, col] of [['digest', 'image_digest'], ['releaseRun', 'release_run'], ['deployRun', 'deploy_run'], ['tfRun', 'tf_run']])
-      if (o[k] !== undefined) set[col] = o[k];
+    const set = { state: 'running', gate_evidence: json(g.evidence), ...bindOnce(r, o, ['digest', 'releaseRun', 'deployRun', 'tfRun']) };
     touch(r.id, set);
     // Any started mutation that touches a Terraform root invalidates plans made against that root.
     bumpRoots(tfRoots(r));
@@ -654,6 +698,20 @@ export async function releaseStart(id, o = {}) {
   });
 }
 
+const RUN_FIELDS = { tag: 'tag', digest: 'image_digest', releaseRun: 'release_run', deployRun: 'deploy_run', tfRun: 'tf_run' };
+// Bind-once: a field may be set when unbound or to the value it already has; returns the columns to write.
+function bindOnce(r, o, keys) {
+  const set = {};
+  for (const k of keys) {
+    if (o[k] === undefined || o[k] === null) continue;
+    const col = RUN_FIELDS[k];
+    if (r[col] !== null && r[col] !== undefined && String(r[col]) !== String(o[k])) throw refuse('binding_mismatch', `${col} already ${r[col]}, not ${o[k]}`);
+    if (k === 'digest' && !/^sha256:[0-9a-f]{64}$/.test(o[k])) throw refuse('invalid', 'digest must be sha256:<64 hex>');
+    if (k === 'tag') { const e = tagError(o[k], r.binary, r.environment); if (e) throw e; }
+    if (r[col] === null || r[col] === undefined) set[col] = String(o[k]);
+  }
+  return set;
+}
 const BUILT_FIELDS = { tag: 'tag', digest: 'image_digest', deployRun: 'deploy_run' };
 // Records run ids or a digest found after dispatch. On a built_not_deployed row an admitter may bind the
 // tag, digest or downstream run from evidence (so it can be redispatched); the row stays built_not_deployed.
@@ -668,15 +726,9 @@ export function releaseRecord(id, o = {}) {
       if (!['running', 'admitted'].includes(r.state)) throw refuse('bad_state', `release ${id} is ${r.state}`);
       if (r.fence !== Number(o.fence)) throw refuse('stale_fence', `fence ${o.fence} is not the admission fence`);
     }
-    const fields = { tag: 'tag', releaseRun: 'release_run', deployRun: 'deploy_run', tfRun: 'tf_run', digest: 'image_digest' };
-    const set = {};
-    for (const [k, col] of Object.entries(fields)) {
-      if (o[k] === undefined) continue;
-      if (built ? !(k in BUILT_FIELDS) : k === 'tag') throw refuse('invalid', `${k} cannot be recorded on a ${r.state} release`);
-      if (r[col] && r[col] !== o[k]) throw refuse('binding_mismatch', `${col} already ${r[col]}`);
-      if (k === 'digest' && !/^sha256:[0-9a-f]{64}$/.test(o[k])) throw refuse('invalid', 'digest must be sha256:<64 hex>');
-      set[col] = o[k];
-    }
+    for (const k of Object.keys(RUN_FIELDS))
+      if (o[k] !== undefined && (built ? !(k in BUILT_FIELDS) : k === 'tag')) throw refuse('invalid', `${k} cannot be recorded on a ${r.state} release`);
+    const set = bindOnce(r, o, Object.keys(RUN_FIELDS));
     if (built && Object.keys(set).length) set.outcome = `recorded by ${o.as}: ${o.evidence}`;
     if (Object.keys(set).length) touch(r.id, set);
     return { release: relRow(r.id) };
@@ -694,19 +746,36 @@ const RECONCILE = {
 };
 // Closes a release whose outcome automation cannot establish: Terraform/DDL/migration always, and
 // deploys that crashed before dispatch or whose evidence stays unknown. Exclusion holds until called.
-export function releaseReconcile(id, { as, outcome, evidence: ev } = {}) {
+// A Terraform `done` is checked against the saved plan's run: if a newer attempt exists, the apply may have
+// consumed it instead, so `done` needs evidence that names the plan attempt the apply used (`plan attempt <n>`).
+export async function releaseReconcile(id, { as, outcome, evidence: ev, currentAttempt = evidence.currentAttempt } = {}) {
   need(as, 'as'); need(ev, 'evidence');
   if (!DEFAULTS.reconcilers.includes(as)) throw refuse('forbidden', `${as} may not reconcile releases (allowed: ${DEFAULTS.reconcilers.join(',')})`);
   const rule = RECONCILE[outcome];
   if (!rule) throw refuse('invalid', `outcome must be ${Object.keys(RECONCILE).join('|')}`);
+  const r0 = relRow(id);
+  if (r0.kind === 'tf_apply' && outcome === 'done') {
+    const [, run_, pinned] = /^saved:(\d+)@(\d+)$/.exec(r0.plan_id);
+    let latest;
+    try { latest = await currentAttempt(run_); } catch (e) { throw refuse('plan_unverified', `cannot read plan run ${run_}: ${e.message}`); }
+    const named = Number(/\bplan attempt\s+(\d+)\b/i.exec(ev)?.[1]);
+    if (latest !== Number(pinned) && !(named >= Number(pinned) && named <= latest))
+      throw refuse('plan_attempt_moved', `plan run ${run_} is at attempt ${latest}, admitted ${pinned}; name the plan attempt the apply used ("plan attempt <n>") in the evidence`);
+  }
   return tx(() => {
     const r = relRow(id);
+    if (r.version !== r0.version) throw refuse('changed', `release ${id} changed during reconcile; retry`);
     if (r.kind === 'qa_window') throw refuse('invalid', 'close QA windows with qa close');
     if (!rule[0].includes(r.state)) throw refuse('bad_state', `release ${id} is ${r.state}; ${outcome} applies to ${rule[0].join('|')}`);
     if (outcome === 'built' && !['service_release'].includes(r.kind)) throw refuse('invalid', 'only service releases can be built_not_deployed');
     const note = `${outcome} by ${as}: ${ev}`;
     if (!rule[1]) { touch(r.id, { observe_note: `reconciled ${note}` }); return { release: relRow(r.id) }; }
     touch(r.id, { state: rule[1], outcome: note, observed_at: now(), ...(outcome === 'rolled_back' || outcome === 'failed' ? { failure: note } : {}) });
+    // A redispatch that provably never ran leaves its built source exactly as it was.
+    if (r.kind === 'redispatch' && outcome === 'not_started' && r.state === 'running' && r.redispatch_of) {
+      const src = relRow(r.redispatch_of);
+      if (src.state === 'superseded' && src.outcome === `redispatched as #${r.id}`) touch(src.id, { state: 'built_not_deployed', outcome: `restored: redispatch #${r.id} not started (${note})` });
+    }
     // A Terraform mutation that ended (either way) moved its roots; plans made before now are stale.
     if (r.state === 'running') bumpRoots(tfRoots(r));
     return { release: relRow(r.id) };

@@ -7,7 +7,7 @@ import * as C from '../lib/coord.mjs';
 import * as E from '../lib/evidence.mjs';
 import { run } from '../lib/db.mjs';
 import * as P from '../lib/pump.mjs';
-import { fresh, advance, stubControl, SHA0, SHA1, SHA2, DIGEST, fakeGh, deployGh, deployLog, resetHooks, live, ranges } from './helpers.mjs';
+import { fresh, advance, stubControl, SHA0, SHA1, SHA2, DIGEST, fakeGh, deployGh, deployLog, resetHooks, live, ranges, tagFor } from './helpers.mjs';
 
 const deliver = (...a) => P.deliver(...a);
 const SHA3 = 'c'.repeat(40);
@@ -16,10 +16,12 @@ const ok = async () => ({ ok: true });
 const refused = (fn, code) => assert.rejects(async () => fn(), e => { assert.equal(e.code, code, `${e.code}: ${e.message}`); return true; });
 // `footprint` and `rangeEvidence` only matter to the previous contract; they let old-head runs reach the behaviour under test.
 const svc = (key, o = {}) => C.releaseRequest({ as: 'crw', key, kind: 'service_release', env: 'dev', repo: TC, binary: 'trading-core',
-  sha: SHA1, tag: 'dev.33', runtimeSha: SHA0, contentPrs: [`${TC}#141`], footprint: [`svc:${(o.binary ?? 'trading-core').toLowerCase()}`], rangeEvidence: 'x', ...o }).release;
+  sha: SHA1, runtimeSha: SHA0, contentPrs: [`${TC}#141`], footprint: [`svc:${(o.binary ?? 'trading-core').toLowerCase()}`], rangeEvidence: 'x', ...o, n: undefined, tag: o.tag ?? tagFor(o.binary, o.n ?? 33, o.env) }).release;
 const admit = async (r, o = {}) => (await C.releaseAdmit(r.id, { as: 'release', manual: true, verify: ok, ...o })).release;
 const start = async (r, o = {}) => (await C.releaseStart(r.id, { as: 'release', fence: r.fence, verify: ok, ...o })).release;
-const planAt = ago => async () => ({ startedAt: C.clock.now() - ago });
+const plans = new Map();
+// A fake saved-plan run that started `ago` seconds before the first lookup; later lookups see the same run.
+const planAt = ago => async id => { if (!plans.has(id)) plans.set(id, C.clock.now() - ago); return { startedAt: plans.get(id) }; };
 const tf = (key, o = {}) => C.releaseRequest({ as: 'release', key, kind: 'tf_apply', env: 'dev', plan: 'saved:900@1', footprint: ['env:dev'], ...o }).release;
 const D = 'deploy-dev-service.yml';
 const R = 'rollback-dev-service.yml';
@@ -28,6 +30,8 @@ let stub, dbPath;
 beforeEach(async () => {
   dbPath = fresh();
   resetHooks();
+  plans.clear();
+  C.configure({ planRun: planAt(10) });
   stub = await stubControl({ states: { 'T-master': 'idle' } });
   C.actorSet('master', { thread: 'T-master' });
   C.channelCreate('ops', { owner: 'master' });
@@ -63,12 +67,12 @@ test('#2 admission and start validate the complete runtime..target range against
 
 test('#3 the same binary cannot run twice whatever the footprints; repo identity is case-insensitive', async () => {
   const a = await admit(svc('s1', { footprint: ['svc:trading-core'] }));
-  await refused(() => admit(svc('s2', { footprint: ['env:dev'], sha: SHA2, tag: 'dev.34' })), 'footprint_busy');
+  await refused(() => admit(svc('s2', { footprint: ['env:dev'], sha: SHA2, n: 34 })), 'footprint_busy');
   assert.deepEqual(a.footprint, ['env:dev', `repo:${TC}`, 'svc:trading-core']);
-  assert.equal(svc('s1b', { footprint: ['env:dev'], sha: SHA3, tag: 'dev.36' }).footprint.includes('svc:trading-core'), true);
+  assert.equal(svc('s1b', { footprint: ['env:dev'], sha: SHA3, n: 36 }).footprint.includes('svc:trading-core'), true);
   await start(a);
   await C.releaseObserve(a.id, { observe: async () => ({ state: 'built_not_deployed', failure: 'no downstream' }) });
-  const upper = svc('s3', { repo: 'Equicom-Crypto/Trading-Core', binary: 'Trading-Core', sha: SHA2, tag: 'dev.35' });
+  const upper = svc('s3', { repo: 'Equicom-Crypto/Trading-Core', binary: 'Trading-Core', sha: SHA2, n: 35 });
   assert.deepEqual([upper.repo, upper.binary], [TC, 'trading-core']);
   await refused(() => admit(upper), 'built_not_deployed');
 });
@@ -79,7 +83,9 @@ test('#4 start requires the exact claim fences admission relied on, including th
   assert.deepEqual(a.claim_fences, { 'env:dev': { owner: 'crw', fence: 1 } });
   advance(20);
   C.reconcile('env:dev', { as: 'master', outcome: 'not_started', evidence: 'nothing ran' });
-  C.claim('env:dev', { as: 'crw', op: 'op-2' });
+  // A new claim is refused while the release is admitted (r3 F1); a raced row stands in for one.
+  assert.throws(() => C.claim('env:dev', { as: 'crw', op: 'op-2' }), e => e.code === 'release_in_flight');
+  run("INSERT OR REPLACE INTO claims (resource,owner,fence,state,lease_until) VALUES ('env:dev','crw',2,'active',?)", C.clock.now() + 600);
   await refused(() => start(a), 'stale_fence');
 });
 
@@ -98,7 +104,7 @@ test('#6 a plan cannot be resubmitted to dodge staleness; its age comes from the
   const old = tf('t0', { plan: 'saved:900@1' });
   const p1 = await admit(tf('t1', { plan: 'saved:901@1' }), { planRun: planAt(5) });
   await start(p1);
-  C.releaseReconcile(p1.id, { as: 'release', outcome: 'done', evidence: 'run 901 attempt 1 apply ok' });
+  await C.releaseReconcile(p1.id, { as: 'release', outcome: 'done', evidence: 'run 901 attempt 1 apply ok', currentAttempt: async () => 1 });
   await refused(() => admit(old, { planRun: planAt(50) }), 'stale_plan');
   assert.throws(() => tf('t0-again', { plan: 'saved:900@1' }), e => e.code === 'conflict');
   advance(1000);
@@ -126,9 +132,9 @@ test('#7 service releases that apply Terraform conflict with and invalidate plan
 test('#8 start rechecks the repo-wide built blocker', async () => {
   const a = await start(await admit(svc('b1')));
   // Same repo, other binary: the intrinsic repo lock already refuses it while the first is running.
-  await refused(() => admit(svc('b2', { binary: 'trading-core-executor', sha: SHA2, tag: 'dev.34' })), 'footprint_busy');
+  await refused(() => admit(svc('b2', { binary: 'trading-core-executor', sha: SHA2, n: 34 })), 'footprint_busy');
   await C.releaseObserve(a.id, { observe: async () => ({ state: 'done' }) });
-  const other = await admit(svc('b3', { binary: 'trading-core-executor', sha: SHA2, tag: 'dev.34' }));
+  const other = await admit(svc('b3', { binary: 'trading-core-executor', sha: SHA2, n: 34 }));
   // A built row of the repo appears after admission (e.g. a reconcile of an earlier run); start must see it.
   run("UPDATE releases SET state='built_not_deployed' WHERE id=?", a.id);
   await refused(() => start(other), 'built_not_deployed');
@@ -143,7 +149,7 @@ test('#9 Terraform/migration plan identities are exact; no log substring matchin
   assert.equal(E.EXEC_RULES, undefined);
   const r = { kind: 'tf_apply', environment: 'dev', plan_id: 'saved:9@1', tf_run: '900' };
   assert.equal((await E.observeRelease(r, { gh: fakeGh([]) })).state, 'running');
-  await refused(() => E.planRun('saved:9@1', { gh: fakeGh([[/runs\/9\/attempts\/1$/, { path: '.github/workflows/lint.yml', status: 'completed', conclusion: 'success' }]]) }), 'plan_unverified');
+  await refused(() => E.planRun('saved:9@1', { gh: fakeGh([[/runs\/9$/, { id: 9, run_attempt: 1 }], [/runs\/9\/attempts\/1$/, { path: '.github/workflows/lint.yml', status: 'completed', conclusion: 'success' }]]) }), 'plan_unverified');
 });
 
 const FE = 'equicom-crypto/crypko-frontend';
@@ -160,10 +166,11 @@ test('#10 frontend deployment proof only comes from the configured deploy workfl
 });
 
 const relGh = o => fakeGh([
-  [/actions\/runs\/(\d+)\/attempts\/1\/jobs/, { jobs: [{ id: 1, status: 'completed', conclusion: 'success', run_attempt: 1, steps: [{ name: 'Build and push image', conclusion: o.publish ?? 'success' }] }] }],
+  [/actions\/runs\/(\d+)\/attempts\/1\/jobs/, { jobs: [{ id: 1, status: 'completed', conclusion: 'success', run_attempt: 1,
+    steps: [{ name: 'Build and push image', conclusion: o.publish ?? 'success' }, { name: 'Trigger environment deployment workflow', conclusion: 'skipped' }] }] }],
   [/actions\/jobs\/1\/logs/, 'no downstream link'],
   [/actions\/runs\/10$/, { id: 10, path: `.github/workflows/${o.wf ?? 'release.yml'}`, status: 'completed', conclusion: 'success',
-    head_sha: o.head ?? SHA1, head_branch: 'dev.33', run_attempt: 1, updated_at: '2026-01-01T00:00:00Z' }],
+    head_sha: o.head ?? SHA1, head_branch: 'trading-core-docs1-dev.33', run_attempt: 1, updated_at: '2026-01-01T00:00:00Z' }],
 ]);
 
 test('#11 built classification needs the repo release workflow at the right head with a successful image push', async () => {
@@ -172,7 +179,7 @@ test('#11 built classification needs the repo release workflow at the right head
   assert.equal((await obs({})).state, 'built_not_deployed');
   assert.equal((await obs({ wf: 'lint.yml' })).state, 'unknown');
   assert.equal((await obs({ head: SHA2 })).state, 'unknown');
-  assert.equal((await obs({ publish: 'skipped' })).state, 'unknown');
+  assert.equal((await obs({ publish: 'skipped' })).state, 'failed', 'nothing published and dispatch skipped: no build to block on');
 });
 
 test('#12 runtime discovery includes rollback-dev-service runs', async () => {
@@ -219,25 +226,25 @@ test('#15 jobs come from the observed attempt, and a rerun started meanwhile mak
 
 test('#16 a running release that never dispatched is reconciled by release/master, keeping exclusion until then', async () => {
   const a = await start(await admit(svc('c1')));
-  await refused(() => admit(svc('c2', { sha: SHA2, tag: 'dev.34' })), 'footprint_busy');
-  assert.throws(() => C.releaseReconcile(a.id, { as: 'crw', outcome: 'not_started', evidence: 'x' }), e => e.code === 'forbidden');
-  assert.throws(() => C.releaseReconcile(a.id, { as: 'release', outcome: 'not_started' }), e => e.code === 'invalid');
-  C.releaseReconcile(a.id, { as: 'release', outcome: 'still_running', evidence: 'tag push in flight' });
-  await refused(() => admit(svc('c3', { sha: SHA2, tag: 'dev.34' })), 'footprint_busy');
-  const r = C.releaseReconcile(a.id, { as: 'master', outcome: 'not_started', evidence: 'no tag dev.33 on origin; no release run' }).release;
+  await refused(() => admit(svc('c2', { sha: SHA2, n: 34 })), 'footprint_busy');
+  await assert.rejects(() => C.releaseReconcile(a.id, { as: 'crw', outcome: 'not_started', evidence: 'x' }), e => e.code === 'forbidden');
+  await assert.rejects(() => C.releaseReconcile(a.id, { as: 'release', outcome: 'not_started' }), e => e.code === 'invalid');
+  await C.releaseReconcile(a.id, { as: 'release', outcome: 'still_running', evidence: 'tag push in flight' });
+  await refused(() => admit(svc('c3', { sha: SHA2, n: 34 })), 'footprint_busy');
+  const r = (await C.releaseReconcile(a.id, { as: 'master', outcome: 'not_started', evidence: 'no tag dev.33 on origin; no release run' })).release;
   assert.equal(r.state, 'cancelled');
-  assert.equal((await admit(svc('c4', { sha: SHA2, tag: 'dev.34' }))).state, 'admitted');
+  assert.equal((await admit(svc('c4', { sha: SHA2, n: 34 }))).state, 'admitted');
 });
 
 test('#17 service releases need a tag up front, and a built release can get its tag and digest bound from evidence', async () => {
-  assert.throws(() => svc('t0', { tag: undefined }), e => e.code === 'invalid');
+  assert.throws(() => C.releaseRequest({ as: 'crw', key: 't0', kind: 'service_release', env: 'dev', repo: TC, binary: 'trading-core', sha: SHA1, runtimeSha: SHA0, contentPrs: [] }), e => e.code === 'invalid');
   const a = await start(await admit(svc('t1')));
-  C.releaseReconcile(a.id, { as: 'release', outcome: 'built', evidence: 'release run 10 pushed image; downstream never ran' });
+  await C.releaseReconcile(a.id, { as: 'release', outcome: 'built', evidence: 'release run 10 pushed image; downstream never ran' });
   run('UPDATE releases SET tag=NULL WHERE id=?', a.id); // a legacy row without a bound tag
-  const rec = C.releaseRecord(a.id, { as: 'release', evidence: 'ecr describe-images imageTag=dev.33', tag: 'dev.33', digest: DIGEST }).release;
-  assert.deepEqual([rec.state, rec.tag, rec.image_digest], ['built_not_deployed', 'dev.33', DIGEST]);
-  assert.throws(() => C.releaseRecord(a.id, { as: 'release', evidence: 'x', tag: 'dev.34' }), e => e.code === 'binding_mismatch');
-  const re = C.releaseRequest({ as: 'release', key: 'rd', kind: 'redispatch', env: 'dev', repo: TC, binary: 'trading-core', sha: SHA1, runtimeSha: SHA0, contentPrs: [`${TC}#141`], tag: 'dev.33', digest: DIGEST }).release;
+  const rec = C.releaseRecord(a.id, { as: 'release', evidence: 'ecr describe-images imageTag=dev.33', tag: 'trading-core-docs1-dev.33', digest: DIGEST }).release;
+  assert.deepEqual([rec.state, rec.tag, rec.image_digest], ['built_not_deployed', 'trading-core-docs1-dev.33', DIGEST]);
+  assert.throws(() => C.releaseRecord(a.id, { as: 'release', evidence: 'x', tag: 'trading-core-docs1-dev.34' }), e => e.code === 'binding_mismatch');
+  const re = C.releaseRequest({ as: 'release', key: 'rd', kind: 'redispatch', env: 'dev', repo: TC, binary: 'trading-core', sha: SHA1, runtimeSha: SHA0, contentPrs: [`${TC}#141`], tag: 'trading-core-docs1-dev.33', digest: DIGEST }).release;
   assert.equal((await start(await admit(re))).state, 'running');
 });
 

@@ -123,3 +123,6 @@ export function deployGh(byWorkflow, { repo = 'equicom-crypto/crpko-devops', per
     [/actions\/runs\/(\d+)$/, m => shapeRun(runs.find(x => x.id === Number(m[1])))],
   ]);
 }
+
+// A valid release tag for a binary/env: <binary>-docs1-<env>.<n>.
+export const tagFor = (binary = 'trading-core', n = 33, env = 'dev') => `${String(binary).toLowerCase()}-docs1-${env}.${n}`;

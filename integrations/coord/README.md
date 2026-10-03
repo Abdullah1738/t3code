@@ -61,28 +61,45 @@ The CLI loads both hooks from `COORD_HOOKS` (a module exporting `rangeResolver` 
 
 | kind | required |
 | --- | --- |
-| `service_release` | `as, key, env, repo, binary, sha, tag, runtimeSha, contentPrs` (array, may be `[]`) |
+| `service_release` | `as, key, env, repo, binary, sha, tag, runtimeSha, contentPrs` (array, may be `[]`); `tag` is `<binary>-docs<N>-dev.<M>` |
 | `frontend_release` | `as, key, env, repo, binary, sha, runtimeSha, contentPrs` |
 | `redispatch` | the service fields plus `tag, digest` of the built release (manual admit) |
 | `tf_apply` | `as, key, env, plan: 'saved:<plan run id>@<attempt>'`; always the full `dev` root; manual admit |
 | `ddl` / `migration` | `as, key, env, plan: '<file>.sql@<sha256 of the SQL>'`; manual admit |
 
+Tags follow crpko-devops `scripts/validate-release-tag.mjs`: `^<binary>-docs<N>-<env>\.<M>$` with
+`N, M >= 1` and no leading zeros. Its binary and env must equal the request's (dev only, since only dev
+has evidence); this is checked at request, admission, start and when binding a tag on a built row
+(`invalid_tag`). The service workflow takes its environment from the tag, so a prod tag on a dev
+request would release to prod. `coord.parseTag(tag)` returns `{ binary, docs, env, version }` or null.
+
 `footprint` is optional and only adds resources. Every request also takes `env:<env>`, `repo:<repo>`,
 `svc:<binary>` and the Terraform roots it touches (`tf:dev` for saved plans and for `registry`,
-`tf:dev-risk-liquidation` and `tf:dev-core-capacity` for `risk-liquidation`). Naming `env:<env>` in
+`tf:dev`, `tf:dev-risk-liquidation` and `tf:dev-core-capacity` for `risk-liquidation`, whose state
+handoff writes the source `dev` state too). Naming `env:<env>` in
 `footprint` (and every Terraform/DDL/migration) makes the operation exclusive for its environment.
 
 **`releaseAdmit(id, { as, manual?, verify?, planRun?, rangeResolver?, gateCheck?, runtime? })`**,
 **`releaseStart(id, { as, fence, sha?, tag?, digest?, plan?, releaseRun?, deployRun?, tfRun?, ... })`**.
 Start requires the admission fence, the same claim fences admission relied on, the same head, range,
-gates and runtime, no open QA window and no other built release of the repo.
+gates and runtime, a valid tag, no open QA window and no other built release of the repo. Run ids
+(`releaseRun`, `deployRun`, `tfRun`), digest and tag bind once, whether given to `releaseRecord` or
+`releaseStart`: a different value for a bound field is `binding_mismatch`.
+
+**Claims and releases** exclude each other both ways. While a release is admitted or running:
+- `claim('env:<env>')` is refused (`release_in_flight`) for every mutation in that environment;
+- `claim('svc:…' | 'repo:…' | 'tf:…')` is refused when that resource is in the release's footprint;
+- `check` of such a fence is refused too, except for a claim the release's admission relied on
+  (listed in its `claim_fences`): its owner keeps `check`/`renew` of exactly that fence.
+So take the claims an operation needs before its admission, not after. Admission and start refuse
+foreign or expired claims on the footprint (`claimed`, `reconcile_required`).
 
 **`releaseRecord(id, o)`**
 - admitted/running: `{ fence, releaseRun?, deployRun?, tfRun?, digest? }` (each field binds once).
 - built_not_deployed: `{ as: 'release'|'master', evidence: string, tag?, digest?, deployRun? }`. The
   row stays built; it then admits a `redispatch` with that exact tag and digest.
 
-**`releaseReconcile(id, { as: 'release'|'master', outcome, evidence: string })`**
+**`releaseReconcile(id, { as: 'release'|'master', outcome, evidence: string })`** (async)
 | outcome | from | to |
 | --- | --- | --- |
 | `not_started` | admitted, running | cancelled |
@@ -91,10 +108,23 @@ gates and runtime, no open QA window and no other built release of the repo.
 | `rolled_back`, `failed` | running | failed |
 | `built` (service only) | running | built_not_deployed |
 
+A redispatch reconciled `not_started` puts its built source back to `built_not_deployed`; only
+`releaseCancel` by an admitter abandons a built release.
+
 Terraform, DDL and migrations are never auto-classified: after the run, the release owner or master
 records `done`/`failed` with evidence text (run id, attempt, readback). The release keeps its locks
 until then (`attention.awaiting_reconcile`). Ending a running operation that touches a Terraform root
 advances that root, so saved plans whose run started earlier are refused (`stale_plan`).
+
+Saved plans: `terraform-dev.yml`'s saved-plan apply takes only `saved_plan_run_id` and uses that
+run's **latest** attempt; it has no attempt input. Admission and start therefore require the pinned
+attempt to still be the run's latest (`plan_attempt_moved`) and that attempt's `Package saved full-root
+plan`, `Configure AWS credentials for saved plan storage`, `Store saved plan in the state bucket` and
+`Upload saved plan metadata` steps to have succeeded (`plan_unverified`). A rerun of the plan run
+between start and the apply dispatch is not visible to coord: the master owns that race (dispatch
+right after start and do not rerun plan runs). Reconciling a `tf_apply` as `done` re-reads the plan
+run; if it moved past the pinned attempt the evidence must name the plan attempt the apply used
+(`plan attempt <n>`, between the pinned and the latest), otherwise `plan_attempt_moved`.
 
 **Runtime evidence** (`coord.evidence.serviceRuntime({ binary, env = 'dev' })`,
 `coord.evidence.frontendRuntime({ repo, env = 'dev' })`) resolve
@@ -122,7 +152,8 @@ for frontends; everything but `state` and `reason` is `null` when unknown). They
 - The pump re-reads each delivery or reminder, its actor's thread and the pause state just before each
   send; held rows never starve deliverable ones.
 - A Robob thread in `waiting` is not drained, and a thread that could not be checked is not drained.
-- `ready()` is true only if no dependency changed or was added while it was evaluated.
+- `ready()` is true only if no dependency changed or was added while it was evaluated, and the local
+  ones (`claim_free`, `event_acked`, `release_done`) still hold inside its final transaction.
 - A taken arch request moves to a new `arch:broker` holder via `arch transfer` after the old fence was
   released or reconciled `not_started`/`rolled_back`, or is closed with `arch closeout` (commits plus
   evidence) after it was reconciled `done`.
@@ -139,8 +170,18 @@ Evidence fails closed: anything not positively identified is `unknown`, and the 
   newer attempt (created within GitHub's 30-day rerun window); otherwise `unknown`. A newer unreadable,
   unfinished or failed run for the binary makes it `unknown`. Jobs are read per attempt; skipped jobs
   are not log-fetched.
+- Service observation trusts push-tag `release.yml` runs only: the run's `head_branch` must be the
+  tag and `head_sha` the release sha. A `workflow_dispatch` release run (`--field release_tag=...`) is
+  `unknown` with reason `workflow_dispatch provenance unsupported; reconcile manually`; CRW cuts
+  release tags by push, so this is an accepted limit.
+- A known downstream deploy run decides the outcome, whatever the parent's conclusion: while it runs,
+  the release stays running. Without a downstream link, a parent run is `failed` only when its
+  `Trigger environment deployment workflow` step was skipped and nothing was published (published:
+  `built_not_deployed`); otherwise the result is `unknown` and the locks stay until reconciled.
 - `built_not_deployed` needs the repo's `release.yml` run at the release's tag and sha with a
   successful `Build and push image` step.
+- Before any terminal result, the release and deploy runs are re-read: a new attempt or a run running
+  again makes the result `unknown`.
 - Frontend `done` needs a successful run of the repo's configured deploy workflow
   (`deploy-dev.yml`) that executed a deploy job and whose head contains the requested sha.
 - Terraform, DDL and migration outcomes are recorded by hand (`release reconcile`), not read from logs.

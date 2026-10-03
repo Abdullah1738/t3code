@@ -8,14 +8,14 @@ import * as P from '../lib/pump.mjs';
 
 const deliver = (...a) => P.deliver(...a);
 const pump = (...a) => P.pump(...a);
-import { fresh, advance, stubControl, SHA0, SHA1, SHA2, DIGEST, fakeGh, deployGh, deployLog, resetHooks, testHooks, ranges } from './helpers.mjs';
+import { fresh, advance, stubControl, SHA0, SHA1, SHA2, DIGEST, fakeGh, deployGh, deployLog, resetHooks, testHooks, ranges, tagFor } from './helpers.mjs';
 
 const DIGEST2 = `sha256:${'d'.repeat(64)}`;
 const TC = 'equicom-crypto/trading-core';
 const ok = async () => ({ ok: true });
 const refused = (fn, code) => assert.rejects(async () => fn(), e => { assert.equal(e.code, code, `${e.code}: ${e.message}`); return true; });
 const svc = (key, o = {}) => C.releaseRequest({ as: 'crw', key, kind: 'service_release', env: 'dev', repo: TC, binary: 'trading-core',
-  sha: SHA1, tag: 'dev.33', runtimeSha: SHA0, contentPrs: [`${TC}#141`], ...o }).release;
+  sha: SHA1, runtimeSha: SHA0, contentPrs: [`${TC}#141`], ...o, n: undefined, tag: o.tag ?? tagFor(o.binary, o.n ?? 33, o.env) }).release;
 const admitStart = async (r, o = {}) => {
   const a = (await C.releaseAdmit(r.id, { as: 'release', manual: true, verify: ok, ...o })).release;
   return (await C.releaseStart(r.id, { as: 'release', fence: a.fence, verify: ok, ...o })).release;
@@ -25,12 +25,16 @@ const built = async (key, o = {}) => {
   return (await C.releaseObserve(r.id, { observe: async () => ({ state: 'built_not_deployed', failure: 'downstream never ran' }) })).release;
 };
 const tf = (key, o = {}) => C.releaseRequest({ as: 'release', key, kind: 'tf_apply', env: 'dev', plan: 'saved:900@1', ...o }).release;
-const planAt = ago => async () => ({ startedAt: C.clock.now() - ago });
+const plans = new Map();
+// A fake saved-plan run that started `ago` seconds before the first lookup; later lookups see the same run.
+const planAt = ago => async id => { if (!plans.has(id)) plans.set(id, C.clock.now() - ago); return { startedAt: plans.get(id) }; };
 
 let stub;
 beforeEach(async () => {
   fresh();
   resetHooks();
+  plans.clear();
+  C.configure({ planRun: planAt(10) });
   stub = await stubControl({ states: { 'T-master': 'idle', 'T-shared': 'idle' } });
   C.actorSet('master', { thread: 'T-master' });
   C.channelCreate('ops', { owner: 'master' });
@@ -54,7 +58,7 @@ test('#2 an expired env claim held by an admitter blocks admission by anyone', a
   await refused(() => C.releaseAdmit(r.id, { as: 'release', verify: ok }), 'reconcile_required');
   C.reconcile('env:dev', { as: 'master', outcome: 'done', evidence: 'tf-run-5 finished' });
   const a = (await C.releaseAdmit(r.id, { as: 'release', verify: ok })).release;
-  C.claim('env:dev', { as: 'master', ttl: '1s', op: 'manual-fix' });
+  run("INSERT OR REPLACE INTO claims (resource,owner,fence,state,lease_until) VALUES ('env:dev','master',9,'active',?)", C.clock.now() + 1);
   advance(2);
   await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence, verify: ok }), 'reconcile_required');
 });
@@ -76,7 +80,7 @@ test('#3 content range is required and every PR needs positive gate evidence at 
   C.configure({ gateCheck: null });
   assert.equal((await C.releaseAdmit(empty.id, { as: 'release', verify: ok })).release.state, 'admitted', 'a resolver-verified empty range needs no gate hook');
   ranges[SHA2] = [`${TC}#141`, `${TC}#150`];
-  const r = svc('g4', { sha: SHA2, tag: 'dev.34', contentPrs: [`${TC}#141`, `${TC}#150`] });
+  const r = svc('g4', { sha: SHA2, n: 34, contentPrs: [`${TC}#141`, `${TC}#150`] });
   await refused(() => C.releaseAdmit(r.id, { as: 'release', verify: ok }), 'gate_unavailable');
   const only141 = async () => ({ prs: [{ pr: `${TC}#141`, ok: true, evidence: 'approved' }, { pr: `${TC}#150`, ok: false }] });
   await refused(() => C.releaseAdmit(r.id, { as: 'release', verify: ok, gateCheck: only141 }), 'gates_not_clear');
@@ -134,7 +138,7 @@ test('#7 a saved plan older than the root\'s last mutation is refused at admit a
   const p1 = tf('p1', { plan: 'saved:901@1' });
   const a1 = (await C.releaseAdmit(p1.id, { as: 'release', manual: true, planRun: planAt(5) })).release;
   await C.releaseStart(p1.id, { as: 'release', fence: a1.fence, tfRun: '1' });
-  C.releaseReconcile(p1.id, { as: 'release', outcome: 'done', evidence: 'run 1 attempt 1 apply ok' });
+  await C.releaseReconcile(p1.id, { as: 'release', outcome: 'done', evidence: 'run 1 attempt 1 apply ok', currentAttempt: async () => 1 });
   assert.equal(C.tfRootGen('dev').gen, 2);
   await refused(() => C.releaseAdmit(old.id, { as: 'release', manual: true, planRun: planAt(50) }), 'stale_plan');
   advance(100);
@@ -153,8 +157,8 @@ test('#8 Terraform/DDL/migration are never auto-classified; only release reconci
   const o = await C.releaseObserve(rel.id, { observe: async () => ({ state: 'done' }) });
   assert.equal(o.release.state, 'running');
   assert.equal((await E.observeRelease({ ...rel, environment: 'dev' }, { gh: fakeGh([]) })).state, 'running');
-  assert.throws(() => C.releaseReconcile(rel.id, { as: 'crw', outcome: 'done', evidence: 'x' }), e => e.code === 'forbidden');
-  assert.equal(C.releaseReconcile(rel.id, { as: 'release', outcome: 'done', evidence: 'run 77 attempt 1: Apply saved plan success' }).release.state, 'done');
+  await assert.rejects(() => C.releaseReconcile(rel.id, { as: 'crw', outcome: 'done', evidence: 'x' }), e => e.code === 'forbidden');
+  assert.equal((await C.releaseReconcile(rel.id, { as: 'release', outcome: 'done', evidence: 'run 77 attempt 1: Apply saved plan success', currentAttempt: async () => 1 })).release.state, 'done');
 });
 
 test('#9 dev evidence never satisfies other environments', async () => {
@@ -226,7 +230,7 @@ test('#14 a built release without a digest can be bound from evidence by an admi
   const rec = C.releaseRecord(b.id, { as: 'release', evidence: 'ecr describe-images dev.33', digest: DIGEST }).release;
   assert.deepEqual([rec.state, rec.image_digest], ['built_not_deployed', DIGEST]);
   const re = C.releaseRequest({ as: 'release', key: 'r14', kind: 'redispatch', env: 'dev', repo: TC, binary: 'trading-core', sha: SHA1, runtimeSha: SHA0,
-    contentPrs: [`${TC}#141`], tag: 'dev.33', digest: DIGEST, footprint: ['svc:trading-core'] }).release;
+    contentPrs: [`${TC}#141`], tag: 'trading-core-docs1-dev.33', digest: DIGEST, footprint: ['svc:trading-core'] }).release;
   assert.equal((await admitStart(re)).state, 'running');
 });
 
@@ -237,25 +241,24 @@ test('#15 binary is required and the built blocker is repo-wide', async () => {
   await refused(() => C.releaseAdmit(other.id, { as: 'release', verify: ok }), 'built_not_deployed');
 });
 
-test('#16 a redispatch supersedes only its own source release, not built rows in other environments', async t => {
-  E.SUPPORTED_ENVS.push('ephemeral:x');
-  t.after(() => E.SUPPORTED_ENVS.pop());
-  const devBuilt = await built('b16dev');
-  await built('b16eph', { env: 'ephemeral:x' });
-  const re = C.releaseRequest({ as: 'release', key: 'r16', kind: 'redispatch', env: 'ephemeral:x', repo: TC, binary: 'trading-core', sha: SHA1, runtimeSha: SHA0,
-    contentPrs: [`${TC}#141`], tag: 'dev.33', digest: DIGEST, footprint: ['svc:trading-core'] }).release;
+test('#16 a redispatch supersedes only its own source release, not other built rows', async () => {
+  const tc = await built('b16tc');
+  const other = await built('b16x', { repo: 'Equicom-Crypto/x', binary: 'x', contentPrs: [`${TC}#141`] });
+  const re = C.releaseRequest({ as: 'release', key: 'r16', kind: 'redispatch', env: 'dev', repo: 'Equicom-Crypto/x', binary: 'x', sha: SHA1, runtimeSha: SHA0,
+    contentPrs: [`${TC}#141`], tag: tagFor('x'), digest: DIGEST }).release;
   await admitStart(re);
   const states = Object.fromEntries(C.releaseList({}).releases.map(r => [r.request_key, r.state]));
-  assert.equal(states.b16dev, 'built_not_deployed');
-  assert.equal(states.b16eph, 'superseded');
-  assert.equal(C.releaseList({ state: 'built_not_deployed' }).releases[0].id, devBuilt.id);
+  assert.equal(states.b16tc, 'built_not_deployed');
+  assert.equal(states.b16x, 'superseded');
+  assert.equal(C.releaseList({ state: 'built_not_deployed' }).releases[0].id, tc.id);
+  assert.ok(other);
 });
 
 test('#17 replaying the original release request stays idempotent after start and observation', async () => {
   const r = await admitStart(svc('i17'));
   await C.releaseObserve(r.id, { observe: async () => ({ state: 'done', digest: DIGEST }) });
   const again = C.releaseRequest({ as: 'crw', key: 'i17', kind: 'service_release', env: 'dev', repo: 'Equicom-Crypto/Trading-Core', binary: 'trading-core', sha: SHA1,
-    tag: 'dev.33', runtimeSha: SHA0, contentPrs: [`${TC}#141`] });
+    tag: 'trading-core-docs1-dev.33', runtimeSha: SHA0, contentPrs: [`${TC}#141`] });
   assert.deepEqual([again.duplicate, again.release.id, again.release.state], [true, r.id, 'done']);
   assert.throws(() => svc('i17', { sha: SHA2 }), e => e.code === 'conflict');
 });
