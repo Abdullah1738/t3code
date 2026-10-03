@@ -1,0 +1,2 @@
+#!/bin/zsh
+exec node "$HOME/.local/share/coord/cli.mjs" "$@"
