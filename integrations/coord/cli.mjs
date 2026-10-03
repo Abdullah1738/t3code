@@ -21,17 +21,19 @@ const USAGE = `coord <command> [args] (JSON output; see README.md)
   claims [--owner A] [--state S]
   dep add WORK NEED REF | dep set ID --state S --evidence E | ready WORK
   release request --as A --key K --kind K --env E --footprint a,b [--risk R] [--batch B]
-      deploys:  --repo R --binary B --sha S --runtime-sha S (--content-prs a,b | --content-prs '' --range-evidence X) [--tag T --digest D]
-      tf_apply: --plan saved:<run>|scope:<name> --tf-root ROOT (--targets a,b | --full-root) --root-gen N     ddl/migration: --plan FILE.sql[@sum]
-  tf gen ROOT                                      (root generation to record at plan time)
+      service:  --repo R --binary B --sha S --tag T --runtime-sha S --content-prs a,b ('' for an empty range)
+      frontend: --repo R --binary B --sha S --runtime-sha S --content-prs a,b      redispatch: --repo --binary --sha --tag --digest
+      tf_apply: --plan saved:<plan run>@<attempt> (always the full dev root)     ddl/migration: --plan FILE.sql@<sha256>
+  tf gen ROOT                                      (mutation count and time of a Terraform root)
   release admit ID --as A [--force-manual] | release start ID --as A --fence N [--tag T --sha S --digest D --plan P --release-run X --deploy-run Y --tf-run Z]
-  release record ID (--fence N | --as ADMITTER --evidence E) [--release-run X --deploy-run Y --tf-run Z --digest D]
+  release record ID (--fence N | --as ADMITTER --evidence E) [--release-run X --deploy-run Y --tf-run Z --digest D --tag T]
+  release reconcile ID --as release|master --outcome not_started|still_running|done|rolled_back|failed|built --evidence E
   release observe ID | release cancel ID --as A [--note]
   release list [--state S] [--env E]
   qa open --as A --env E --footprint a,b [--ttl 4h] | qa close ID --as A [--note]
   arch request --as A --kind K [--key K] [--repos a,b] [--pins-file F] [--packet P] [--summary S]
   arch take ID --as A --fence N | arch done ID --as A --fence N --commits a,b [--note] | arch reject ID --as A --fence N --note N [--superseded]
-  arch transfer ID --as A --fence N | arch list [--state S]
+  arch transfer ID --as A --fence N | arch closeout ID --as A --fence N --commits a,b --evidence E | arch list [--state S]
   pause|drain|resume [--scope S] --as A --reason R
   flag KEY on|off --as A [--reason R]              gate [SCOPE]
   attention | status`;
@@ -46,8 +48,7 @@ const OPTS = {
   'content-prs': { type: 'string' }, tag: { type: 'string' }, digest: { type: 'string' }, plan: { type: 'string' }, footprint: { type: 'string' },
   risk: { type: 'string' }, batch: { type: 'string' }, 'force-manual': { type: 'boolean' }, 'release-run': { type: 'string' },
   'deploy-run': { type: 'string' }, 'tf-run': { type: 'string' }, repos: { type: 'string' }, 'pins-file': { type: 'string' }, packet: { type: 'string' },
-  commits: { type: 'string' }, 'tf-root': { type: 'string' }, targets: { type: 'string' }, 'full-root': { type: 'boolean' },
-  'root-gen': { type: 'string' }, 'range-evidence': { type: 'string' }, superseded: { type: 'boolean' }, scope: { type: 'string' }, reason: { type: 'string' }, help: { type: 'boolean', short: 'h' },
+  commits: { type: 'string' }, superseded: { type: 'boolean' }, scope: { type: 'string' }, reason: { type: 'string' }, help: { type: 'boolean', short: 'h' },
 };
 
 const { values: o, positionals: p } = parseArgs({ args: process.argv.slice(2), options: OPTS, allowPositionals: true, strict: true });
@@ -55,9 +56,12 @@ const read = f => (f === '-' ? readFileSync(0, 'utf8') : readFileSync(f, 'utf8')
 const readJson = f => { const s = read(f); try { return JSON.parse(s); } catch { return s; } };
 const csv = s => (s === undefined ? undefined : s.split(',').map(x => x.trim()).filter(Boolean));
 
-// The rollout-gate hook comes from the embedding process; the CLI can load one from COORD_GATE_HOOK
-// (a module exporting gateCheck). Without it, admission of a non-empty content range refuses gate_unavailable.
-if (process.env.COORD_GATE_HOOK) C.configure({ gateCheck: (await import(process.env.COORD_GATE_HOOK)).gateCheck });
+// Release hooks come from the embedding process; the CLI can load them from COORD_HOOKS (a module exporting
+// rangeResolver and gateCheck). Without them, service/frontend admission refuses range_unavailable.
+if (process.env.COORD_HOOKS) {
+  const m = await import(process.env.COORD_HOOKS);
+  C.configure({ ...(m.rangeResolver ? { rangeResolver: m.rangeResolver } : {}), ...(m.gateCheck ? { gateCheck: m.gateCheck } : {}) });
+}
 
 async function tryDeliver(seq) {
   try { return await deliver({ seq }); } catch (e) { return { deferred: e.message }; }
@@ -89,7 +93,7 @@ async function main() {
     case 'claim': return C.claim(sub, { as: o.as, ttl: o.ttl, purpose: o.purpose, op: o.op });
     case 'renew': return C.renew(sub, { as: o.as, fence: o.fence, ttl: o.ttl, op: o.op });
     case 'release':
-      if (!/^(request|admit|start|record|observe|cancel|list)$/.test(sub ?? '')) return C.release(sub, { as: o.as, fence: o.fence, note: o.note });
+      if (!/^(request|admit|start|record|reconcile|observe|cancel|list)$/.test(sub ?? '')) return C.release(sub, { as: o.as, fence: o.fence, note: o.note });
       return releaseCmd(sub, a1);
     case 'check': return C.check(sub, { as: o.as, fence: o.fence });
     case 'reconcile': return C.reconcile(sub, { as: o.as, outcome: o.outcome, evidence: o.evidence });
@@ -109,6 +113,7 @@ async function main() {
       if (sub === 'done') return C.archDone(a1, { as: o.as, fence: o.fence, commits: o.commits, note: o.note });
       if (sub === 'reject') return C.archReject(a1, { as: o.as, fence: o.fence, note: o.note, superseded: o.superseded });
       if (sub === 'transfer') return C.archTransfer(a1, { as: o.as, fence: o.fence });
+      if (sub === 'closeout') return C.archCloseout(a1, { as: o.as, fence: o.fence, commits: o.commits, evidence: o.evidence });
       if (sub === 'list') return C.archList({ state: o.state });
       break;
     case 'pause': case 'drain': case 'resume': {
@@ -118,7 +123,9 @@ async function main() {
       try { const cfg = controlConfig(); ts = id => threadState(cfg, id); } catch { /* no control API: threads report unknown */ }
       return { ...r, ...(await C.drainReport({ threadState: ts, scope: o.scope })) };
     }
-    case 'flag': return C.setFlag(sub, a1 === 'on', { as: o.as, reason: o.reason });
+    case 'flag':
+      if (!['on', 'off'].includes(a1)) throw new C.CoordError('invalid', 'flag value must be exactly on or off');
+      return C.setFlag(sub, a1 === 'on', { as: o.as, reason: o.reason });
     case 'gate': {
       const g = C.gate(sub);
       if (!g.ok) throw new C.CoordError(g.mode === 'pause' ? 'paused' : 'draining', `${g.key} is ${g.mode}${g.reason ? `: ${g.reason}` : ''}`, { gate: g });
@@ -133,13 +140,13 @@ async function main() {
 function releaseCmd(sub, id) {
   switch (sub) {
     case 'request': return C.releaseRequest({ as: o.as, key: o.key, kind: o.kind, env: o.env, repo: o.repo, binary: o.binary, sha: o.sha,
-      runtimeSha: o['runtime-sha'], contentPrs: csv(o['content-prs']), rangeEvidence: o['range-evidence'], tag: o.tag, digest: o.digest, plan: o.plan,
-      footprint: o.footprint, risk: o.risk, batch: o.batch, tfRoot: o['tf-root'], targets: o.targets, fullRoot: o['full-root'],
-      rootGen: o['root-gen'] === undefined ? undefined : Number(o['root-gen']) });
+      runtimeSha: o['runtime-sha'], contentPrs: csv(o['content-prs']), tag: o.tag, digest: o.digest, plan: o.plan,
+      footprint: o.footprint, risk: o.risk, batch: o.batch });
     case 'admit': return C.releaseAdmit(id, { as: o.as, manual: o['force-manual'], verify: r => E.verifyHead(r) });
     case 'start': return C.releaseStart(id, { as: o.as, fence: o.fence, tag: o.tag, sha: o.sha, digest: o.digest, plan: o.plan,
       releaseRun: o['release-run'], deployRun: o['deploy-run'], tfRun: o['tf-run'], verify: r => E.verifyHead(r) });
-    case 'record': return C.releaseRecord(id, { as: o.as, evidence: o.evidence, fence: o.fence, releaseRun: o['release-run'], deployRun: o['deploy-run'], tfRun: o['tf-run'], digest: o.digest });
+    case 'reconcile': return C.releaseReconcile(id, { as: o.as, outcome: o.outcome, evidence: o.evidence });
+    case 'record': return C.releaseRecord(id, { as: o.as, evidence: o.evidence, tag: o.tag, fence: o.fence, releaseRun: o['release-run'], deployRun: o['deploy-run'], tfRun: o['tf-run'], digest: o.digest });
     case 'observe': return C.releaseObserve(id, { observe: r => E.observeRelease(r) });
     case 'cancel': return C.releaseCancel(id, { as: o.as, note: o.note });
     case 'list': return C.releaseList({ state: o.state, env: o.env });

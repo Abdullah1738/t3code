@@ -79,3 +79,47 @@ export function fakeGh(routes) {
 export const deployLog = (binary, tag, sha, { env = 'dev', digest = DIGEST } = {}) =>
   `npm run validate:release-tag -- --env ${env} --binary "${binary}" --tag "${tag}"\n` +
   `npm run validate:ecr-image-provenance -- --env ${env} --binary "${binary}" --image-digest "${digest}" --git-sha "${sha}" --aws-account-id "1"`;
+
+// Release hooks for tests: runtime is whatever `live` says (default SHA0 for every binary), the range of
+// base..head is `ranges[head]` (default the request's own list), and every PR clears its gates.
+export const live = {};
+export const ranges = {};
+export const testHooks = {
+  runtime: async r => ({ state: 'known', sha: live[r.binary] ?? SHA0, run: '1', attempt: 1 }),
+  rangeResolver: async ({ base, head }) => ({ complete: true, prs: ranges[`${base}..${head}`] ?? ranges[head] ?? ['equicom-crypto/trading-core#141'], evidence: `compare ${base}...${head}` }),
+  gateCheck: async r => ({ prs: r.content_prs.map(pr => ({ pr, ok: true, evidence: `approved head of ${pr}` })) }),
+};
+export function resetHooks() {
+  for (const k of Object.keys(live)) delete live[k];
+  for (const k of Object.keys(ranges)) delete ranges[k];
+  C.configure?.(testHooks);
+}
+
+// Fake GitHub for runtime discovery. `runs` per workflow file: [{ id, attempt?, started, created?, conclusion?,
+// status?, log?, jobs? }]; `log` is the deploy log of that attempt (an Error to make it unreadable).
+export function deployGh(byWorkflow, { repo = 'equicom-crypto/crpko-devops', perPage = 100, extra = [] } = {}) {
+  const runs = Object.values(byWorkflow).flat();
+  const shapeRun = r => ({ id: r.id, status: r.status ?? 'completed', conclusion: r.conclusion ?? 'success', run_attempt: r.attempt ?? 1,
+    created_at: r.created ?? r.started, run_started_at: r.started, head_sha: r.head, head_branch: r.branch ?? 'main-dev', path: r.path });
+  return fakeGh([
+    ...extra,
+    [new RegExp(`repos/${repo}/actions/workflows/([\\w.-]+)/runs\\?per_page=100&page=(\\d+)`), m => {
+      const list = (byWorkflow[m[1]] ?? []).toSorted((a, b) => Date.parse(b.created ?? b.started) - Date.parse(a.created ?? a.started) || b.id - a.id);
+      return { workflow_runs: list.slice((m[2] - 1) * perPage, m[2] * perPage).map(shapeRun) };
+    }],
+    [/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs/, m => {
+      const r = runs.find(x => x.id === Number(m[1]));
+      return { total_count: (r.jobs ?? [{}]).length, jobs: (r.jobs ?? [{ name: 'deploy' }]).map((j, i) => ({ id: r.id * 100 + i, status: 'completed', conclusion: 'success',
+        run_attempt: Number(m[2]), steps: [{ name: 'Validate release tag', conclusion: 'success' }], ...j })) };
+    }],
+    [/actions\/jobs\/(\d+)\/logs/, m => {
+      const r = runs.find(x => x.id === Math.floor(Number(m[1]) / 100));
+      const j = (r.jobs ?? [{}])[Number(m[1]) % 100];
+      if (j.log instanceof Error) throw j.log;
+      if (j.log !== undefined) return j.log;
+      if (r.log instanceof Error) throw r.log;
+      return r.log ?? '';
+    }],
+    [/actions\/runs\/(\d+)$/, m => shapeRun(runs.find(x => x.id === Number(m[1])))],
+  ]);
+}

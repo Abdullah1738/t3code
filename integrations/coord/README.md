@@ -8,10 +8,12 @@ Linear and GitHub stay the external truth; crw keeps its own approval and execut
 Plain Node (v22.5+, `node:sqlite`), no dependencies.
 
 - `lib/coord.mjs`: the library (`post`, `inbox`, `ack`, `claim`, `check`, `renew`, `release`,
-  `reconcile`, `releaseRequest`, `releaseAdmit`, `releaseStart`, `releaseObserve`, `archRequest`,
-  `archTake`, `archDone`, `archTransfer`, `gate`, `approvalProvenance`, `ensureActor`, `configure`,
-  `attention`, ...). crw imports it in-process.
-- `lib/evidence.mjs`: read-only `gh` evidence (`serviceRuntime`, `verifyHead`, `observeRelease`).
+  `reconcile`, `releaseRequest`, `releaseAdmit`, `releaseStart`, `releaseRecord`, `releaseReconcile`,
+  `releaseObserve`, `archRequest`, `archTake`, `archDone`, `archTransfer`, `archCloseout`, `gate`,
+  `approvalProvenance`, `ensureActor`, `configure`, `attention`, ...). crw imports it in-process;
+  `coord.evidence` re-exports `lib/evidence.mjs`.
+- `lib/evidence.mjs`: read-only `gh` evidence (`serviceRuntime`, `frontendRuntime`, `verifyHead`,
+  `observeRelease`, `planRun`).
 - `lib/pump.mjs`: delivery to Robob threads via `POST /api/ardud/control/threads/:id/send`
   (`mode: queue`, `clientRequestId = coord:<sha256 of JSON [event_key, recipient]>`, so a resend
   after a crash replays instead of posting twice), then `release observe` for a bounded number of
@@ -32,47 +34,98 @@ lease TTL 30 min, one reminder after 30 min unacked.
 `coord init` seeds the pull-only `crw` process actor (idempotent). The crw adapter also calls
 `ensureActor('crw', { kind: 'process' })`, which never rebinds an existing actor.
 
-crw supplies the rollout-gate hook in-process:
+## Contracts for the crw adapter
 
 ```js
 import * as coord from '<live>/lib/coord.mjs';
-coord.configure({ gateCheck: async release => ({ prs: release.content_prs.map(pr => ({ pr, ok, evidence })) }) });
+coord.configure({ rangeResolver, gateCheck });   // once per process; both are required for deploy releases
 ```
 
-Every PR in `content_prs` needs `ok: true` with non-empty `evidence`, at admission and again at
-start. Without a hook, a non-empty range is refused with `gate_unavailable`. The CLI loads one from
-`COORD_GATE_HOOK` (a module exporting `gateCheck`).
+**`rangeResolver({ repo, binary, environment, base, head }) -> Promise<{ complete: true, prs: string[], evidence?: string }>`**
+`repo` is lowercase `owner/name`, `base` is the request's `runtimeSha`, `head` its `sha` (both 40-char).
+`prs` is every PR whose merge commit is in `base..head`, as lowercase `owner/repo#N`. Return
+`complete: true` only when the whole range was read; throw or return anything else and admission
+refuses `range_unavailable`. An empty range is accepted only as `{ complete: true, prs: [] }`.
+
+**`gateCheck(release) -> Promise<{ prs: Array<{ pr: string, ok: boolean, evidence: string }> }>`**
+Called with the release row (`content_prs`, `repo`, `binary`, `git_sha`, `runtime_sha`, ...) only when
+the range is non-empty. Every PR in `content_prs` needs `ok: true` and non-empty `evidence`, otherwise
+`gates_not_clear` (or `gate_unavailable` when the hook is missing or throws).
+
+Both run at `releaseAdmit` and again at `releaseStart`, after coord checks that the live runtime
+(`serviceRuntime` / `frontendRuntime`) is known and equals the request's `runtimeSha`
+(`runtime_unknown` / `runtime_moved`), and that `prs` equals `contentPrs` as a set (`range_mismatch`).
+The CLI loads both hooks from `COORD_HOOKS` (a module exporting `rangeResolver` and `gateCheck`).
+
+**Requests** (`releaseRequest(o)`; repo and binary are canonicalized to lowercase):
+
+| kind | required |
+| --- | --- |
+| `service_release` | `as, key, env, repo, binary, sha, tag, runtimeSha, contentPrs` (array, may be `[]`) |
+| `frontend_release` | `as, key, env, repo, binary, sha, runtimeSha, contentPrs` |
+| `redispatch` | the service fields plus `tag, digest` of the built release (manual admit) |
+| `tf_apply` | `as, key, env, plan: 'saved:<plan run id>@<attempt>'`; always the full `dev` root; manual admit |
+| `ddl` / `migration` | `as, key, env, plan: '<file>.sql@<sha256 of the SQL>'`; manual admit |
+
+`footprint` is optional and only adds resources. Every request also takes `env:<env>`, `repo:<repo>`,
+`svc:<binary>` and the Terraform roots it touches (`tf:dev` for saved plans and for `registry`,
+`tf:dev-risk-liquidation` and `tf:dev-core-capacity` for `risk-liquidation`). Naming `env:<env>` in
+`footprint` (and every Terraform/DDL/migration) makes the operation exclusive for its environment.
+
+**`releaseAdmit(id, { as, manual?, verify?, planRun?, rangeResolver?, gateCheck?, runtime? })`**,
+**`releaseStart(id, { as, fence, sha?, tag?, digest?, plan?, releaseRun?, deployRun?, tfRun?, ... })`**.
+Start requires the admission fence, the same claim fences admission relied on, the same head, range,
+gates and runtime, no open QA window and no other built release of the repo.
+
+**`releaseRecord(id, o)`**
+- admitted/running: `{ fence, releaseRun?, deployRun?, tfRun?, digest? }` (each field binds once).
+- built_not_deployed: `{ as: 'release'|'master', evidence: string, tag?, digest?, deployRun? }`. The
+  row stays built; it then admits a `redispatch` with that exact tag and digest.
+
+**`releaseReconcile(id, { as: 'release'|'master', outcome, evidence: string })`**
+| outcome | from | to |
+| --- | --- | --- |
+| `not_started` | admitted, running | cancelled |
+| `still_running` | admitted, running | unchanged (note recorded) |
+| `done` | running | done |
+| `rolled_back`, `failed` | running | failed |
+| `built` (service only) | running | built_not_deployed |
+
+Terraform, DDL and migrations are never auto-classified: after the run, the release owner or master
+records `done`/`failed` with evidence text (run id, attempt, readback). The release keeps its locks
+until then (`attention.awaiting_reconcile`). Ending a running operation that touches a Terraform root
+advances that root, so saved plans whose run started earlier are refused (`stale_plan`).
+
+**Runtime evidence** (`coord.evidence.serviceRuntime({ binary, env = 'dev' })`,
+`coord.evidence.frontendRuntime({ repo, env = 'dev' })`) resolve
+`{ state: 'known'|'unknown', sha, tag, digest, run, attempt, reason }` (`tag`/`digest` are `null`
+for frontends; everything but `state` and `reason` is `null` when unknown). They throw
+`env_unsupported` for environments other than `dev`.
 
 ## Rules worth knowing
 
 - Same `event_key` + same body is a no-op; a different body is refused (`conflict`, 409).
-- An expired lease becomes `reconcile_required`, never a handover. Fences only grow.
+- An expired lease becomes `reconcile_required`, never a handover. Fences only grow. An expired lease
+  is never released; it needs `reconcile`, and blocks admission, start and QA by anyone meanwhile.
 - Request keys are idempotent against an immutable fingerprint of the request; a different binding is
-  `conflict`, even after the release progressed.
-- Service and frontend releases need `binary`, `runtimeSha` and `contentPrs` (every PR in
-  runtimeSha..sha), or an empty list with `rangeEvidence`.
-- Release admission binds repo, sha, digest, plan and environment; `release start` revalidates the
-  head and the gates, and refuses if either moved. A `built_not_deployed` release blocks new releases
-  of that repo in that environment until a manually admitted `redispatch` with the same tag and digest
-  starts (it supersedes exactly that row), or an admitter cancels it. An admitter can bind a missing
-  digest to a built row with `release record --as release --evidence ...`.
-- Terraform: `tf_apply` names its root and scope (`targets` or `fullRoot`) and the root generation at
-  plan time (`coord tf gen ROOT`). Starting any mutation whose footprint names `tf:<root>` bumps that
-  generation; older plans are refused (`stale_plan`) at admission and at start. `tf_full_root_blocked`
-  is on until master clears it, and is rechecked at start. `plan` is `saved:<plan run id>` or
-  `scope:<infra-only scope>`; for ddl/migration `<file>.sql[@checksum]`.
-- An open QA window holds its whole environment against every mutation, in both directions, whatever
-  the footprint strings; an expired window keeps holding until master/release closes it (attention
-  lists it). QA cannot open over an unresolved or foreign env claim.
-- An expired lease is never released or handed over; it needs `reconcile`. Expired claims on a
-  footprint or its env block admission, start and QA by anyone.
+  `conflict`, even after the release progressed. A saved plan or migration can be registered once.
+- A `built_not_deployed` release blocks every new release of its repo in that environment, at
+  admission and at start, until the redispatch admitted for exactly that row starts, or an admitter
+  cancels or reconciles it.
+- `tf_full_root_blocked` is on until master clears it, and is rechecked at start.
+- An open QA window holds its environment in both directions: no admission or start of a mutation, no
+  new `env:` claim, and `check` of an `env:` fence fails. QA cannot open over any env claim or any
+  admitted/running mutation of that environment. An expired window keeps holding until master/release
+  closes it (attention lists it).
 - `pause` refuses claims, admissions, starts and non-control deliveries; acks still work.
   `drain` refuses new claims and admissions; in-flight work can renew and observe.
-- The pump re-reads each delivery, its actor's thread and the pause state just before each send;
-  held rows never starve deliverable ones.
+- The pump re-reads each delivery or reminder, its actor's thread and the pause state just before each
+  send; held rows never starve deliverable ones.
 - A Robob thread in `waiting` is not drained, and a thread that could not be checked is not drained.
-- A taken arch request moves to a new `arch:broker` holder only via `arch transfer`, after the old
-  fence was released or reconciled as `not_started`/`rolled_back`.
+- `ready()` is true only if no dependency changed or was added while it was evaluated.
+- A taken arch request moves to a new `arch:broker` holder via `arch transfer` after the old fence was
+  released or reconciled `not_started`/`rolled_back`, or is closed with `arch closeout` (commits plus
+  evidence) after it was reconciled `done`.
 - `approvalProvenance(msg)` verifies only `createdBy=user` with `creationSource` in the configured set.
 
 ## Evidence and known limits
@@ -81,11 +134,16 @@ Evidence fails closed: anything not positively identified is `unknown`, and the 
 `running` (attention lists it under `unobserved`).
 
 - Only `dev` has an evidence source. Requests for other environments are refused `env_unsupported`.
-- Service runtime is the newest deploy-dev-service attempt (by `run_started_at`) that names the binary;
-  a newer unreadable, unfinished or failed run for it makes runtime unknown.
-- Terraform/migration `done` needs the right workflow file, `CRPKO_ENV`, plan identity in the logs and
-  a successful apply step (`Apply saved plan`, `Terraform apply`, `Apply gated migration`).
-- Frontend `done` needs the deploy run's head to contain the requested sha (observed-head semantics).
+- Service runtime is the newest executed attempt (by `run_started_at`) of `deploy-dev-service.yml` or
+  `rollback-dev-service.yml` that names the binary. Run lists are paged until no unseen run could hold a
+  newer attempt (created within GitHub's 30-day rerun window); otherwise `unknown`. A newer unreadable,
+  unfinished or failed run for the binary makes it `unknown`. Jobs are read per attempt; skipped jobs
+  are not log-fetched.
+- `built_not_deployed` needs the repo's `release.yml` run at the release's tag and sha with a
+  successful `Build and push image` step.
+- Frontend `done` needs a successful run of the repo's configured deploy workflow
+  (`deploy-dev.yml`) that executed a deploy job and whose head contains the requested sha.
+- Terraform, DDL and migration outcomes are recorded by hand (`release reconcile`), not read from logs.
 - No ECS readback yet: deployed means the deploy workflow succeeded with matching inputs, not that
   every ECS service runs the digest with `rolloutState=COMPLETED`.
 

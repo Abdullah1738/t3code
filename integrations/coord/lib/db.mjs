@@ -42,10 +42,12 @@ CREATE TABLE IF NOT EXISTS releases (
   id INTEGER PRIMARY KEY, request_key TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, requester TEXT NOT NULL, kind TEXT NOT NULL,
   environment TEXT NOT NULL, repo TEXT, binary TEXT, git_sha TEXT, runtime_sha TEXT, content_prs TEXT,
   tag TEXT, image_digest TEXT, plan_id TEXT, footprint TEXT NOT NULL, risk TEXT NOT NULL DEFAULT 'ordinary',
-  batch_id TEXT, state TEXT NOT NULL, admitted_by TEXT, admitted_at INTEGER, fence INTEGER, fence_resource TEXT, fence_owner TEXT,
+  batch_id TEXT, state TEXT NOT NULL, admitted_by TEXT, admitted_at INTEGER, fence INTEGER,
+  claim_fences TEXT,                                 -- JSON {resource: {owner, fence}} of claims relied on at admission
   release_run TEXT, deploy_run TEXT, tf_run TEXT, readback TEXT, outcome TEXT, failure TEXT,
-  range_evidence TEXT, gate_evidence TEXT, redispatch_of INTEGER,
-  tf_root TEXT, tf_scope TEXT, root_gen INTEGER,     -- tf_apply: root, {full_root|targets}, root generation at plan time
+  gate_evidence TEXT, redispatch_of INTEGER,
+  env_exclusive INTEGER NOT NULL DEFAULT 0,          -- 1: conflicts with every other mutation in its environment
+  tf_root TEXT, planned_at INTEGER,                  -- tf_apply: root, start time of the saved plan's run attempt
   version INTEGER NOT NULL DEFAULT 0,                -- bumped on every write; async checks compare-and-set against it
   observed_at INTEGER, observe_note TEXT,
   created_at INTEGER, updated_at INTEGER);
@@ -54,7 +56,8 @@ CREATE TABLE IF NOT EXISTS arch_requests (
   id INTEGER PRIMARY KEY, request_key TEXT NOT NULL UNIQUE, requester TEXT NOT NULL, kind TEXT NOT NULL,
   repos TEXT, pins TEXT, packet_path TEXT, summary TEXT, state TEXT NOT NULL, taken_by TEXT, fence INTEGER,
   result_commits TEXT, result_note TEXT, created_at INTEGER, updated_at INTEGER);
-CREATE TABLE IF NOT EXISTS tf_roots (root TEXT PRIMARY KEY, gen INTEGER NOT NULL);
+-- Per Terraform root: count and time of the last mutation start or end; older saved plans are stale.
+CREATE TABLE IF NOT EXISTS tf_roots (root TEXT PRIMARY KEY, gen INTEGER NOT NULL, bumped_at INTEGER);
 CREATE TABLE IF NOT EXISTS control (k TEXT PRIMARY KEY, v TEXT, set_by TEXT, set_at INTEGER, reason TEXT);
 CREATE TABLE IF NOT EXISTS run_inputs (run_id TEXT PRIMARY KEY, inputs TEXT, at INTEGER);
 `;

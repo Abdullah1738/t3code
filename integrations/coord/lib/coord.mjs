@@ -226,6 +226,8 @@ export function claim(resource, { as, ttl, purpose, op } = {}) {
   const secs = parseTtl(ttl);
   return tx(() => {
     requireMode(resourceScope(resource));
+    const qa = qaOn(resource);
+    if (qa) throw refuse('qa_window_open', `QA window #${qa.id} holds ${resource.slice(4)}; env claims wait for it to close`, { blocking: qa.id });
     const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
     if (c?.state === 'reconcile_required') return reconcileErr(c);
     if (c?.state === 'active') throw refuse('held', `${resource} is held by ${c.owner}`, { owner: c.owner, fence: c.fence, lease_until: c.lease_until });
@@ -249,8 +251,12 @@ function holder(resource, as, fence) {
   return c;
 }
 
+const qaOn = resource => (resource.startsWith('env:') ? openQa(resource.slice(4)) : null);
+
 export function check(resource, { as, fence } = {}) {
   return tx(() => {
+    const qa = qaOn(resource);
+    if (qa) throw refuse('qa_window_open', `QA window #${qa.id} holds ${resource.slice(4)}`, { blocking: qa.id });
     const c = holder(resource, as, fence);
     return c instanceof Error ? c : { resource, owner: c.owner, fence: c.fence, lease_until: c.lease_until };
   });
@@ -316,7 +322,9 @@ export function depSet(id, { state, evidence } = {}) {
 // External needs (pr_merged, pr_deployed) are evaluated by `external(dep)` when supplied (see evidence.mjs).
 export async function ready(work, { external = evidence.external } = {}) {
   const out = [];
+  const versions = new Map();
   for (const d of all('SELECT * FROM deps WHERE work_id=? ORDER BY id', work)) {
+    versions.set(d.id, d.version);
     let r = { state: d.state, why: d.why, evidence: d.evidence };
     if (d.state !== 'dead' && !(d.state === 'ready' && ['manual', 'ticket_done'].includes(d.need))) {
       if (d.need === 'event_acked') {
@@ -337,14 +345,22 @@ export async function ready(work, { external = evidence.external } = {}) {
       // Compare-and-set: a decision made while the check was pending (dep set dead/ready) wins.
       const u = run('UPDATE deps SET state=?, why=?, evidence=?, checked_at=?, version=version+1 WHERE id=? AND version=?',
         r.state, r.why ?? null, r.evidence ?? null, now(), d.id, d.version);
-      if (!Number(u.changes)) {
+      if (Number(u.changes)) versions.set(d.id, d.version + 1);
+      else {
         const cur = get('SELECT * FROM deps WHERE id=?', d.id);
         r = { state: cur.state, why: cur.why, evidence: cur.evidence, changed: true };
+        versions.set(d.id, cur.version);
       }
     }
     out.push({ id: d.id, need: d.need, ref: d.ref, ...r });
   }
-  return { work, ready: out.length > 0 && out.every(d => d.state === 'ready'), deps: out };
+  // Readiness holds only if the dependency set and every row are exactly what this pass saw and wrote.
+  return tx(() => {
+    const final = all('SELECT id, need, ref, state, why, evidence, version FROM deps WHERE work_id=? ORDER BY id', work);
+    const changed = final.length !== versions.size || final.some(f => versions.get(f.id) !== f.version);
+    if (changed) return { work, ready: false, changed: true, why: 'dependencies changed during the check; run ready again', deps: final };
+    return { work, ready: final.length > 0 && final.every(d => d.state === 'ready'), deps: out };
+  });
 }
 
 // ---------- release / TF / DDL / QA admission ----------
@@ -353,39 +369,87 @@ const SHA = /^[0-9a-f]{40}$/;
 const relRow = id => {
   const r = get('SELECT * FROM releases WHERE id=?', Number(id));
   if (!r) throw refuse('not_found', `no release ${id}`);
-  return { ...r, footprint: parse(r.footprint), content_prs: parse(r.content_prs), readback: parse(r.readback), tf_scope: parse(r.tf_scope) };
+  return { ...r, footprint: parse(r.footprint), content_prs: parse(r.content_prs), readback: parse(r.readback), claim_fences: parse(r.claim_fences) };
 };
 const touch = (id, set) => {
   const keys = Object.keys(set);
   run(`UPDATE releases SET ${keys.map(k => `${k}=?`).join(', ')}, version=version+1, updated_at=? WHERE id=?`, ...keys.map(k => set[k]), now(), id);
 };
 const overlap = (a, b) => a.some(x => b.includes(x));
+// Two mutations conflict on any shared non-env resource, or on the environment when either is env-exclusive.
+// Plain deploys share env:<env> only for claim and QA checks; GitHub's crpko-dev-mutation group serializes their runs.
+const conflicts = (a, b) => overlap(a.footprint.filter(f => !f.startsWith('env:')), b.footprint.filter(f => !f.startsWith('env:')))
+  || ((a.env_exclusive || b.env_exclusive) && a.environment === b.environment);
 const fingerprint = o => hash(o);
+export const canonRepo = r => String(r ?? '').trim().toLowerCase();
+export const canonBinary = b => String(b ?? '').trim().toLowerCase();
 
-// Hooks supplied by the embedding process (crw). gateCheck(release) must resolve
-// { prs: [{ pr, ok, evidence }] } with a positive, evidence-backed entry for every PR in content_prs.
-export const hooks = { gateCheck: null };
+// Terraform roots a service deploy applies, from deploy-dev-service.yml (crpko-devops main-dev 34264683c2):
+// registry plans and applies terraform/roots/dev ("Deploy registry publisher"); risk-liquidation hands state
+// over to and may bootstrap-apply dev-risk-liquidation, and reconciles dev-core-capacity.
+export const SERVICE_TF_ROOTS = {
+  registry: ['dev'],
+  'risk-liquidation': ['dev-risk-liquidation', 'dev-core-capacity'],
+};
+// Saved plans are always the full `dev` root (terraform-dev.yml terraform-saved-plan-apply job).
+export const SAVED_PLAN_ROOT = 'dev';
+
+// Locks every operation takes whatever footprint the caller sends; the caller's footprint only adds to them.
+function intrinsic(row) {
+  const out = [`env:${row.environment}`];
+  if (row.repo) out.push(`repo:${row.repo}`);
+  if (row.binary) out.push(`svc:${row.binary}`);
+  for (const root of row.kind === 'tf_apply' ? [row.tf_root] : SERVICE_TF_ROOTS[row.binary] ?? []) out.push(`tf:${root}`);
+  return out;
+}
+const tfRoots = r => r.footprint.filter(f => f.startsWith('tf:')).map(f => f.slice(3));
+
+// Hooks supplied by the embedding process (crw); see README "Contracts".
+export const hooks = { gateCheck: null, rangeResolver: null, runtime: null };
 export function configure(o = {}) {
-  if ('gateCheck' in o) hooks.gateCheck = o.gateCheck;
-  return { gateCheck: !!hooks.gateCheck };
+  for (const k of Object.keys(hooks)) if (k in o) hooks[k] = o[k];
+  return Object.fromEntries(Object.keys(hooks).map(k => [k, !!hooks[k]]));
 }
 
-async function runGates(r, gateCheck = hooks.gateCheck) {
+const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i]);
+
+// Content-range check, run at admission and at start: the runtime the request was based on is still what
+// is live, the resolver's PR list for runtimeSha..sha equals the request's, and every PR clears its gates.
+async function rangeChecks(r, o = {}) {
   if (!DEPLOY_KINDS.includes(r.kind)) return { ok: true };
-  if (!r.content_prs.length) return { ok: true, evidence: { empty_range: r.range_evidence } };
+  const runtime = o.runtime ?? hooks.runtime ?? defaultRuntime;
+  const resolver = o.rangeResolver ?? hooks.rangeResolver;
+  const gateCheck = o.gateCheck ?? hooks.gateCheck;
+  if (typeof resolver !== 'function') return { ok: false, code: 'range_unavailable', reason: 'no rangeResolver hook configured' };
+  let rt, range;
+  try { rt = await runtime(r); } catch (e) { return { ok: false, code: 'runtime_unknown', reason: e.message }; }
+  if (rt?.state !== 'known') return { ok: false, code: 'runtime_unknown', reason: rt?.reason ?? 'runtime not known' };
+  if (rt.sha !== r.runtime_sha) return { ok: false, code: 'runtime_moved', reason: `live is ${rt.sha} (run ${rt.run}), request was based on ${r.runtime_sha}` };
+  try { range = await resolver({ repo: r.repo, binary: r.binary, environment: r.environment, base: r.runtime_sha, head: r.git_sha }); }
+  catch (e) { return { ok: false, code: 'range_unavailable', reason: e.message }; }
+  if (!range || range.complete !== true || !Array.isArray(range.prs)) return { ok: false, code: 'range_unavailable', reason: 'resolver did not return a complete range' };
+  if (!sameSet(range.prs, r.content_prs)) return { ok: false, code: 'range_mismatch', reason: `range ${r.runtime_sha.slice(0, 12)}..${r.git_sha.slice(0, 12)} is [${range.prs.join(', ')}], request lists [${r.content_prs.join(', ')}]` };
+  const evidenceOut = { runtime: { run: rt.run, attempt: rt.attempt, sha: rt.sha }, range: range.evidence ?? null, prs: [] };
+  if (!range.prs.length) return { ok: true, evidence: evidenceOut };
   if (typeof gateCheck !== 'function') return { ok: false, code: 'gate_unavailable', reason: 'no gateCheck hook configured' };
   let res;
   try { res = await gateCheck(r); } catch (e) { return { ok: false, code: 'gate_unavailable', reason: e.message }; }
   const got = new Map((res?.prs ?? []).map(p => [p.pr, p]));
   const missing = r.content_prs.filter(pr => !(got.get(pr)?.ok === true && got.get(pr)?.evidence));
-  return missing.length
-    ? { ok: false, code: 'gates_not_clear', reason: `no positive gate evidence for ${missing.join(', ')}`, missing }
-    : { ok: true, evidence: r.content_prs.map(pr => ({ pr, evidence: got.get(pr).evidence })) };
+  if (missing.length) return { ok: false, code: 'gates_not_clear', reason: `no positive gate evidence for ${missing.join(', ')}`, missing };
+  evidenceOut.prs = r.content_prs.map(pr => ({ pr, evidence: got.get(pr).evidence }));
+  return { ok: true, evidence: evidenceOut };
 }
+const defaultRuntime = r => r.kind === 'frontend_release'
+  ? evidence.frontendRuntime({ repo: r.repo, env: r.environment }) : evidence.serviceRuntime({ binary: r.binary, env: r.environment });
 
 export function tfRootGen(root) {
-  return { root: need(root, 'root'), gen: get('SELECT gen FROM tf_roots WHERE root=?', root)?.gen ?? 0 };
+  const t = get('SELECT gen, bumped_at FROM tf_roots WHERE root=?', need(root, 'root'));
+  return { root, gen: t?.gen ?? 0, bumped_at: t?.bumped_at ?? null };
 }
+const bumpRoots = roots => {
+  for (const root of roots) run('INSERT INTO tf_roots (root,gen,bumped_at) VALUES (?,1,?) ON CONFLICT(root) DO UPDATE SET gen=gen+1, bumped_at=excluded.bumped_at', root, now());
+};
 
 export function releaseRequest(o = {}) {
   const { as, key, kind } = o;
@@ -393,38 +457,34 @@ export function releaseRequest(o = {}) {
   if (!RELEASE_KINDS.includes(kind) || kind === 'qa_window') throw refuse('invalid', `kind must be one of ${RELEASE_KINDS.filter(k => k !== 'qa_window').join('|')}`);
   const env = need(o.env, 'env');
   evidence.requireEnv(env); // nothing could ever observe it to a terminal state
-  const footprint = [...new Set(Array.isArray(o.footprint) ? o.footprint : list(o.footprint, []))];
-  if (!footprint.length) throw refuse('invalid', 'footprint is required');
-  let contentPrs = null, tfScope = null;
+  const repo = o.repo ? canonRepo(o.repo) : null, binary = o.binary ? canonBinary(o.binary) : null;
+  let contentPrs = null, tfRoot = null;
   if (DEPLOY_KINDS.includes(kind)) {
-    need(o.repo, 'repo'); need(o.binary, 'binary');
+    need(repo, 'repo'); need(binary, 'binary');
     if (!SHA.test(o.sha ?? '')) throw refuse('invalid', 'sha must be a full 40-char revision');
     if (!SHA.test(o.runtimeSha ?? '')) throw refuse('invalid', 'runtimeSha (what is live now) must be a full 40-char revision');
     contentPrs = Array.isArray(o.contentPrs) ? o.contentPrs : list(o.contentPrs, null);
-    if (!contentPrs) throw refuse('invalid', 'contentPrs (every PR in runtimeSha..sha) is required');
-    if (!contentPrs.length && !o.rangeEvidence) throw refuse('invalid', 'an empty content range needs rangeEvidence');
+    if (!contentPrs) throw refuse('invalid', 'contentPrs (every PR in runtimeSha..sha, possibly empty) is required');
     contentPrs = [...new Set(contentPrs)].sort();
   }
+  if (kind === 'service_release' && !o.tag) throw refuse('invalid', 'tag (the release tag that will be cut) is required');
   if (kind === 'redispatch' && !(o.tag && o.digest)) throw refuse('invalid', 'redispatch binds the existing tag and digest');
-  if (MANUAL_KINDS.includes(kind) && !evidence.EXEC_RULES[kind].identity(need(o.plan, 'plan')))
-    throw refuse('invalid', kind === 'tf_apply' ? 'plan must be saved:<plan run id> or scope:<infra-only scope>' : 'plan must be <file>.sql[@checksum]');
   if (kind === 'tf_apply') {
-    need(o.tfRoot, 'tfRoot');
-    if (o.fullRoot) tfScope = { full_root: true };
-    else {
-      const targets = Array.isArray(o.targets) ? o.targets : list(o.targets, []);
-      if (!targets.length) throw refuse('invalid', 'tf_apply needs targets or fullRoot');
-      tfScope = { targets: [...new Set(targets)].sort() };
-    }
-    if (!Number.isInteger(o.rootGen) || o.rootGen < 0) throw refuse('invalid', 'rootGen (tf root gen at plan time) is required');
-    if (!footprint.includes(`tf:${o.tfRoot}`)) footprint.push(`tf:${o.tfRoot}`);
+    if (!/^saved:\d+@\d+$/.test(o.plan ?? '')) throw refuse('invalid', 'tf_apply plan must be saved:<plan run id>@<attempt>');
+    if ((o.tfRoot && o.tfRoot !== SAVED_PLAN_ROOT) || (o.targets && list(o.targets, []).length) || o.fullRoot === false)
+      throw refuse('invalid', `a saved plan is always the full ${SAVED_PLAN_ROOT} root; tfRoot/targets contradict it`);
+    tfRoot = SAVED_PLAN_ROOT;
   }
+  if (['ddl', 'migration'].includes(kind) && !/^[\w.-]+\.sql@[0-9a-f]{64}$/.test(o.plan ?? ''))
+    throw refuse('invalid', `${kind} plan must be <file>.sql@<sha256 of the SQL>`);
   const row = {
-    requester: as, kind, environment: env, repo: o.repo ?? null, binary: o.binary ?? null, git_sha: o.sha ?? null,
-    runtime_sha: o.runtimeSha ?? null, content_prs: json(contentPrs), range_evidence: o.rangeEvidence ?? null, tag: o.tag ?? null,
-    image_digest: o.digest ?? null, plan_id: o.plan ?? null, footprint: json(footprint.sort()), risk: o.risk ?? 'ordinary',
-    batch_id: o.batch ?? null, tf_root: o.tfRoot ?? null, tf_scope: json(tfScope), root_gen: kind === 'tf_apply' ? o.rootGen : null,
+    requester: as, kind, environment: env, repo, binary, git_sha: o.sha ?? null,
+    runtime_sha: o.runtimeSha ?? null, content_prs: json(contentPrs), tag: o.tag ?? null,
+    image_digest: o.digest ?? null, plan_id: o.plan ?? null, risk: o.risk ?? 'ordinary', batch_id: o.batch ?? null, tf_root: tfRoot,
   };
+  const extra = Array.isArray(o.footprint) ? o.footprint : list(o.footprint, []);
+  row.footprint = json([...new Set([...intrinsic(row), ...extra])].sort());
+  row.env_exclusive = MANUAL_KINDS.includes(kind) || extra.includes(`env:${env}`) ? 1 : 0;
   if (!['ordinary', 'stateful', 'high'].includes(row.risk)) throw refuse('invalid', 'risk must be ordinary|stateful|high');
   const fp = fingerprint(row);
   return tx(() => {
@@ -433,6 +493,8 @@ export function releaseRequest(o = {}) {
       if (prev.fingerprint !== fp) throw refuse('conflict', `release request ${key} exists with a different binding`, { status: 409, id: prev.id });
       return { release: relRow(prev.id), duplicate: true };
     }
+    if (row.plan_id && get("SELECT id FROM releases WHERE plan_id=? AND kind=?", row.plan_id, kind))
+      throw refuse('conflict', `plan ${row.plan_id} was already registered`);
     const t = now();
     const cols = Object.keys(row);
     const id = Number(run(`INSERT INTO releases (request_key,fingerprint,${cols.join(',')},state,created_at,updated_at) VALUES (?,?,${cols.map(() => '?').join(',')},'requested',?,?)`,
@@ -441,45 +503,82 @@ export function releaseRequest(o = {}) {
   });
 }
 
-// Claims that block a mutation: expired leases on the footprint or env are first moved to reconcile_required.
-function blockingClaim(env, footprint, owners) {
-  const res = [...new Set([...footprint, `env:${env}`])];
-  for (const resource of res) {
+// Claims on the operation's resources. Expired leases become reconcile_required and block everyone;
+// claims of `owners` are allowed and their exact fences returned, so start can require the same ones.
+function claimsFor(footprint, owners) {
+  const relied = {};
+  for (const resource of footprint) {
     const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
     if (c?.state === 'reconcile_required') return refuse('reconcile_required', `${resource} needs reconcile (${c.owner}, op ${c.op_ref ?? '-'})`, { owner: c.owner, op_ref: c.op_ref });
-    if (c?.state === 'active' && !owners.includes(c.owner)) return refuse('claimed', `${resource} is held by ${c.owner}`, { owner: c.owner, fence: c.fence });
+    if (c?.state !== 'active') continue;
+    if (!owners.includes(c.owner)) return refuse('claimed', `${resource} is held by ${c.owner}`, { owner: c.owner, fence: c.fence });
+    relied[resource] = { owner: c.owner, fence: c.fence };
+  }
+  return relied;
+}
+// The claims relied on at admission must still be the same active fences at start; no new foreign claim.
+function sameClaims(r) {
+  const now_ = claimsFor(r.footprint, [r.admitted_by, r.requester]);
+  if (now_ instanceof Error) return now_;
+  const before = r.claim_fences ?? {};
+  for (const res of new Set([...Object.keys(before), ...Object.keys(now_)])) {
+    const a = before[res], b = now_[res];
+    if (!a || !b || a.owner !== b.owner || a.fence !== b.fence)
+      return refuse('stale_fence', `claim on ${res} changed since admission (${a ? `${a.owner}#${a.fence}` : 'none'} -> ${b ? `${b.owner}#${b.fence}` : 'none'})`);
   }
   return null;
 }
 // Any open QA window holds its whole environment, expired or not, until master/release closes it.
-const openQa = (env, exceptId = -1) => get("SELECT id, requester FROM releases WHERE kind='qa_window' AND state='running' AND environment=? AND id!=?", env, exceptId);
-
-function tfChecks(r, at) {
-  if (r.kind !== 'tf_apply') return null;
-  if (r.tf_scope?.full_root && flag('tf_full_root_blocked')) return refuse('tf_full_root_blocked', 'full-root Terraform apply is blocked until master clears tf_full_root_blocked');
-  const cur = tfRootGen(r.tf_root).gen;
-  if (r.root_gen !== cur) {
-    touch(r.id, { state: 'superseded', failure: `plan from root gen ${r.root_gen}, root is at ${cur} (${at})` });
-    return refuse('stale_plan', `plan ${r.plan_id} was made at ${r.tf_root} gen ${r.root_gen}; root is now at gen ${cur}`);
-  }
-  return null;
-}
+const openQa = env => get("SELECT id, requester FROM releases WHERE kind='qa_window' AND state='running' AND environment=?", env);
 
 function builtBlockers(r) {
   if (!r.repo) return [];
   return all("SELECT * FROM releases WHERE state='built_not_deployed' AND repo=? AND environment=? AND id!=?", r.repo, r.environment, r.id);
 }
+// Built releases of the repo block everything but the one redispatch admitted for its exact source row.
+function builtCheck(r) {
+  const built = builtBlockers(r);
+  if (r.kind === 'redispatch') {
+    const src = r.redispatch_of ? built.find(b => b.id === r.redispatch_of)
+      : built.find(b => b.binary === r.binary && b.tag === r.tag && b.image_digest === r.image_digest && b.git_sha === r.git_sha);
+    if (!src) return refuse('no_built_release', `no built_not_deployed ${r.binary} release in ${r.environment} with tag ${r.tag} and digest ${r.image_digest}`);
+    const other = built.find(b => b.id !== src.id);
+    if (other) return refuse('built_not_deployed', `release #${other.id} (${other.binary} ${other.tag}) is also built but not deployed`, { blocking: other.id });
+    return src;
+  }
+  if (built.length) return refuse('built_not_deployed', `release #${built[0].id} (${built[0].binary} ${built[0].tag}) is built but not deployed; redispatch or reconcile it first`, { blocking: built[0].id });
+  return null;
+}
 
-// `verify(release)` revalidates the pinned head (default: evidence.verifyHead). It must resolve {ok, reason?, transient?}.
-export async function releaseAdmit(id, { as, manual = false, verify = evidence.verifyHead, gateCheck } = {}) {
+// Saved plans are stale once any mutation of their root started or ended after the plan run attempt began.
+function tfCheck(r, { at }) {
+  if (r.kind !== 'tf_apply') return null;
+  if (flag('tf_full_root_blocked')) return refuse('tf_full_root_blocked', 'a saved plan is a full-root apply; blocked until master clears tf_full_root_blocked');
+  const last = tfRootGen(r.tf_root);
+  if (last.bumped_at !== null && r.planned_at !== null && r.planned_at <= last.bumped_at) {
+    touch(r.id, { state: 'superseded', failure: `plan run started before the last ${r.tf_root} mutation (${at})` });
+    return refuse('stale_plan', `plan ${r.plan_id} started before the last mutation of ${r.tf_root} (gen ${last.gen})`);
+  }
+  return null;
+}
+
+// verify(release) revalidates the pinned head; planRun(planId) resolves the saved plan's run attempt.
+export async function releaseAdmit(id, o = {}) {
+  const { as, manual = false } = o;
   need(as, 'as');
   const r0 = relRow(id);
   if (r0.state === 'admitted' && r0.admitted_by === as) return { release: r0, duplicate: true };
   if (r0.state !== 'requested') throw refuse('bad_state', `release ${id} is ${r0.state}`);
-  const v = r0.git_sha ? await verify(r0) : { ok: true };
-  const g = await runGates(r0, gateCheck);
+  if (MANUAL_KINDS.includes(r0.kind) && !(manual && DEFAULTS.admitters.includes(as)))
+    throw refuse('manual_admit_required', `${r0.kind} needs a manual admit by ${DEFAULTS.admitters.join('|')}`);
+  const v = r0.git_sha ? await (o.verify ?? evidence.verifyHead)(r0) : { ok: true };
+  const g = await rangeChecks(r0, o);
+  let plan = null;
+  if (r0.kind === 'tf_apply') {
+    try { plan = await (o.planRun ?? evidence.planRun)(r0.plan_id); } catch (e) { throw refuse(e.code ?? 'plan_unverified', e.message); }
+  }
   return tx(() => {
-    const r = relRow(id);
+    let r = relRow(id);
     if (r.version !== r0.version) throw refuse('changed', `release ${id} changed during admission; retry`);
     requireMode(`env:${r.environment}`);
     if (v.transient) throw refuse('verify_failed', `could not revalidate ${r.git_sha}: ${v.reason}`);
@@ -488,36 +587,24 @@ export async function releaseAdmit(id, { as, manual = false, verify = evidence.v
       return refuse('stale_revision', `release ${id} ${r.git_sha} no longer valid: ${v.reason ?? ''}`.trim());
     }
     if (!g.ok) throw refuse(g.code, g.reason, { missing: g.missing });
-    const tf = tfChecks(r, 'admit');
+    if (plan) { touch(r.id, { planned_at: plan.startedAt }); r = relRow(id); }
+    const tf = tfCheck(r, { at: 'admit' });
     if (tf) return tf;
     const qa = openQa(r.environment);
     if (qa) throw refuse('qa_window_open', `QA window #${qa.id} (${qa.requester}) holds ${r.environment}`, { blocking: qa.id });
-    const busy = all("SELECT id, kind, footprint FROM releases WHERE id!=? AND state IN ('admitted','running') AND kind!='qa_window'", r.id)
-      .find(x => overlap(parse(x.footprint), r.footprint));
+    const busy = all("SELECT id, kind, environment, env_exclusive, footprint FROM releases WHERE id!=? AND state IN ('admitted','running') AND kind!='qa_window'", r.id)
+      .find(x => conflicts({ ...x, footprint: parse(x.footprint) }, r));
     if (busy) throw refuse('footprint_busy', `overlaps ${busy.kind} #${busy.id}`, { blocking: busy.id });
-    const held = blockingClaim(r.environment, r.footprint, [as, r.requester]);
-    if (held) return held;
-    const built = builtBlockers(r);
-    let src = null;
-    if (r.kind === 'redispatch') {
-      src = built.find(b => b.binary === r.binary && b.tag === r.tag && b.image_digest === r.image_digest && b.git_sha === r.git_sha);
-      if (!src) throw refuse('no_built_release', `no built_not_deployed ${r.binary} release in ${r.environment} with tag ${r.tag} and digest ${r.image_digest}`);
-    } else if (built.length) {
-      throw refuse('built_not_deployed', `release #${built[0].id} (${built[0].binary} ${built[0].tag}) is built but not deployed; redispatch it first`, { blocking: built[0].id });
-    }
+    const relied = claimsFor(r.footprint, [as, r.requester]);
+    if (relied instanceof Error) return relied;
+    const src = builtCheck(r);
+    if (src instanceof Error) throw src;
     const needsManual = r.risk !== 'ordinary' || MANUAL_KINDS.includes(r.kind) || r.kind === 'redispatch' || r.footprint.filter(f => f.startsWith('svc:')).length > 1;
     if (needsManual && !(manual && DEFAULTS.admitters.includes(as)))
       throw refuse('manual_admit_required', `${r.kind}/${r.risk} needs a manual admit by ${DEFAULTS.admitters.join('|')}`);
-    // The fence is the admitter's env lease when it holds one, else a fresh admission fence for the env.
-    const lease = get("SELECT * FROM claims WHERE resource=? AND state='active' AND owner=?", `env:${r.environment}`, as);
-    let fence, fenceRes;
-    if (lease) [fence, fenceRes] = [lease.fence, lease.resource];
-    else {
-      fenceRes = `release:${r.environment}`;
-      run('INSERT INTO fences (resource,fence) VALUES (?,1) ON CONFLICT(resource) DO UPDATE SET fence=fence+1', fenceRes);
-      fence = get('SELECT fence FROM fences WHERE resource=?', fenceRes).fence;
-    }
-    touch(r.id, { state: 'admitted', admitted_by: as, admitted_at: now(), fence, fence_resource: fenceRes, fence_owner: as,
+    run('INSERT INTO fences (resource,fence) VALUES (?,1) ON CONFLICT(resource) DO UPDATE SET fence=fence+1', `release:${r.environment}`);
+    const fence = get('SELECT fence FROM fences WHERE resource=?', `release:${r.environment}`).fence;
+    touch(r.id, { state: 'admitted', admitted_by: as, admitted_at: now(), fence, claim_fences: json(relied),
       redispatch_of: src?.id ?? null, gate_evidence: json(g.evidence) });
     return { release: relRow(r.id) };
   });
@@ -530,51 +617,46 @@ export async function releaseStart(id, o = {}) {
   const r0 = relRow(id);
   if (r0.state !== 'admitted') throw refuse('bad_state', `release ${id} is ${r0.state}`);
   const v = r0.git_sha ? await (o.verify ?? evidence.verifyHead)(r0) : { ok: true };
-  const g = await runGates(r0, o.gateCheck);
+  const g = await rangeChecks(r0, o);
   return tx(() => {
     const r = relRow(id);
     if (r.version !== r0.version) throw refuse('changed', `release ${id} changed during start checks; retry`);
     requireMode(`env:${r.environment}`, true);
     if (r.fence !== Number(fence)) throw refuse('stale_fence', `fence ${fence} is not the admission fence`);
-    if (r.fence_resource?.startsWith('env:')) {
-      const c = holder(r.fence_resource, r.fence_owner, r.fence);
-      if (c instanceof Error) return c;
-    }
     if (as !== r.requester && as !== r.admitted_by) throw refuse('forbidden', `${as} did not request or admit release ${id}`);
-    // Fields fixed at request time must match; tag and digest may be bound now if still unset.
-    for (const [k, col] of [['sha', 'git_sha'], ['repo', 'repo'], ['env', 'environment'], ['plan', 'plan_id'], ['tag', 'tag'], ['digest', 'image_digest']])
-      if (o[k] !== undefined && (r[col] !== null || ['sha', 'repo', 'env', 'plan'].includes(k)) && o[k] !== r[col])
+    for (const [k, col] of [['sha', 'git_sha'], ['repo', 'repo'], ['env', 'environment'], ['plan', 'plan_id'], ['tag', 'tag'], ['digest', 'image_digest']]) {
+      const want = k === 'repo' ? canonRepo(o[k]) : o[k];
+      if (o[k] !== undefined && (r[col] !== null || ['sha', 'repo', 'env', 'plan', 'tag'].includes(k)) && want !== r[col])
         throw refuse('binding_mismatch', `${k} ${o[k]} differs from admitted ${r[col]}`);
+    }
     if (v.transient) throw refuse('verify_failed', `could not revalidate ${r.git_sha}: ${v.reason}`);
     if (!v.ok) {
       touch(r.id, { state: 'superseded', failure: `head moved after admission: ${v.reason ?? ''}` });
       return refuse('head_moved', `release ${id} head moved after admission: ${v.reason ?? ''}`.trim());
     }
     if (!g.ok) throw refuse(g.code, g.reason, { missing: g.missing });
-    const tf = tfChecks(r, 'start');
+    const tf = tfCheck(r, { at: 'start' });
     if (tf) return tf;
     const qa = openQa(r.environment);
     if (qa) throw refuse('qa_window_open', `QA window #${qa.id} holds ${r.environment}`, { blocking: qa.id });
-    const held = blockingClaim(r.environment, r.footprint, [r.admitted_by, r.requester]);
-    if (held) return held;
-    if (r.kind === 'redispatch') {
-      const src = get("SELECT id FROM releases WHERE id=? AND state='built_not_deployed'", r.redispatch_of);
-      if (!src) throw refuse('no_built_release', `source release #${r.redispatch_of} is no longer built_not_deployed`);
-    }
+    const moved = sameClaims(r);
+    if (moved) return moved;
+    const src = builtCheck(r);
+    if (src instanceof Error) throw src;
     const set = { state: 'running', gate_evidence: json(g.evidence) };
-    for (const [k, col] of [['tag', 'tag'], ['digest', 'image_digest'], ['releaseRun', 'release_run'], ['deployRun', 'deploy_run'], ['tfRun', 'tf_run']])
+    for (const [k, col] of [['digest', 'image_digest'], ['releaseRun', 'release_run'], ['deployRun', 'deploy_run'], ['tfRun', 'tf_run']])
       if (o[k] !== undefined) set[col] = o[k];
     touch(r.id, set);
-    // Any started mutation that declares a Terraform root invalidates plans made against that root.
-    for (const root of r.footprint.filter(f => f.startsWith('tf:')).map(f => f.slice(3)))
-      run('INSERT INTO tf_roots (root,gen) VALUES (?,1) ON CONFLICT(root) DO UPDATE SET gen=gen+1', root);
-    if (r.kind === 'redispatch') touch(r.redispatch_of, { state: 'superseded', outcome: `redispatched as #${r.id}` });
+    // Any started mutation that touches a Terraform root invalidates plans made against that root.
+    bumpRoots(tfRoots(r));
+    if (r.kind === 'redispatch') touch(src.id, { state: 'superseded', outcome: `redispatched as #${r.id}` });
     return { release: relRow(r.id) };
   });
 }
 
+const BUILT_FIELDS = { tag: 'tag', digest: 'image_digest', deployRun: 'deploy_run' };
 // Records run ids or a digest found after dispatch. On a built_not_deployed row an admitter may bind the
-// digest or downstream run from evidence (so it can be redispatched); the row stays built_not_deployed.
+// tag, digest or downstream run from evidence (so it can be redispatched); the row stays built_not_deployed.
 export function releaseRecord(id, o = {}) {
   return tx(() => {
     const r = relRow(id);
@@ -586,15 +668,47 @@ export function releaseRecord(id, o = {}) {
       if (!['running', 'admitted'].includes(r.state)) throw refuse('bad_state', `release ${id} is ${r.state}`);
       if (r.fence !== Number(o.fence)) throw refuse('stale_fence', `fence ${o.fence} is not the admission fence`);
     }
+    const fields = { tag: 'tag', releaseRun: 'release_run', deployRun: 'deploy_run', tfRun: 'tf_run', digest: 'image_digest' };
     const set = {};
-    for (const [k, col] of [['releaseRun', 'release_run'], ['deployRun', 'deploy_run'], ['tfRun', 'tf_run'], ['digest', 'image_digest']]) {
+    for (const [k, col] of Object.entries(fields)) {
       if (o[k] === undefined) continue;
+      if (built ? !(k in BUILT_FIELDS) : k === 'tag') throw refuse('invalid', `${k} cannot be recorded on a ${r.state} release`);
       if (r[col] && r[col] !== o[k]) throw refuse('binding_mismatch', `${col} already ${r[col]}`);
-      if (built && !['digest', 'deployRun'].includes(k)) throw refuse('invalid', `${k} cannot be recorded on a built release`);
+      if (k === 'digest' && !/^sha256:[0-9a-f]{64}$/.test(o[k])) throw refuse('invalid', 'digest must be sha256:<64 hex>');
       set[col] = o[k];
     }
     if (built && Object.keys(set).length) set.outcome = `recorded by ${o.as}: ${o.evidence}`;
     if (Object.keys(set).length) touch(r.id, set);
+    return { release: relRow(r.id) };
+  });
+}
+
+const RECONCILE = {
+  // outcome -> [states it applies to, resulting state]
+  not_started: [['admitted', 'running'], 'cancelled'],
+  still_running: [['admitted', 'running'], null],
+  done: [['running'], 'done'],
+  rolled_back: [['running'], 'failed'],
+  failed: [['running'], 'failed'],
+  built: [['running'], 'built_not_deployed'],
+};
+// Closes a release whose outcome automation cannot establish: Terraform/DDL/migration always, and
+// deploys that crashed before dispatch or whose evidence stays unknown. Exclusion holds until called.
+export function releaseReconcile(id, { as, outcome, evidence: ev } = {}) {
+  need(as, 'as'); need(ev, 'evidence');
+  if (!DEFAULTS.reconcilers.includes(as)) throw refuse('forbidden', `${as} may not reconcile releases (allowed: ${DEFAULTS.reconcilers.join(',')})`);
+  const rule = RECONCILE[outcome];
+  if (!rule) throw refuse('invalid', `outcome must be ${Object.keys(RECONCILE).join('|')}`);
+  return tx(() => {
+    const r = relRow(id);
+    if (r.kind === 'qa_window') throw refuse('invalid', 'close QA windows with qa close');
+    if (!rule[0].includes(r.state)) throw refuse('bad_state', `release ${id} is ${r.state}; ${outcome} applies to ${rule[0].join('|')}`);
+    if (outcome === 'built' && !['service_release'].includes(r.kind)) throw refuse('invalid', 'only service releases can be built_not_deployed');
+    const note = `${outcome} by ${as}: ${ev}`;
+    if (!rule[1]) { touch(r.id, { observe_note: `reconciled ${note}` }); return { release: relRow(r.id) }; }
+    touch(r.id, { state: rule[1], outcome: note, observed_at: now(), ...(outcome === 'rolled_back' || outcome === 'failed' ? { failure: note } : {}) });
+    // A Terraform mutation that ended (either way) moved its roots; plans made before now are stale.
+    if (r.state === 'running') bumpRoots(tfRoots(r));
     return { release: relRow(r.id) };
   });
 }
@@ -604,6 +718,7 @@ export function releaseRecord(id, o = {}) {
 export async function releaseObserve(id, { observe = evidence.observeRelease } = {}) {
   const r = relRow(id);
   if (r.state !== 'running') return { release: r, unchanged: true };
+  if (MANUAL_KINDS.includes(r.kind)) return { release: r, pending: `${r.kind} is closed with release reconcile` };
   const o = await observe(r);
   if (!o || !['done', 'failed', 'built_not_deployed'].includes(o.state)) {
     const note = `${o?.state ?? 'unknown'}: ${o?.why ?? 'no result'}`;
@@ -617,6 +732,7 @@ export async function releaseObserve(id, { observe = evidence.observeRelease } =
       throw refuse('binding_mismatch', `observed digest ${o.digest} differs from bound ${cur.image_digest}`);
     touch(r.id, { state: o.state, readback: json(o.readback), failure: o.failure ?? null, outcome: o.outcome ?? o.state, observed_at: now(),
       ...(o.digest && !cur.image_digest ? { image_digest: o.digest } : {}) });
+    bumpRoots(tfRoots(r));
     return { release: relRow(r.id) };
   });
 }
@@ -655,8 +771,11 @@ export function qaOpen({ as, env, footprint, ttl, key } = {}) {
     const busy = all("SELECT id, kind, footprint FROM releases WHERE state IN ('admitted','running') AND (environment=? OR kind='qa_window')", env)
       .find(x => x.kind !== 'qa_window' || overlap(parse(x.footprint), fp));
     if (busy) throw refuse(busy.kind === 'qa_window' ? 'footprint_busy' : 'env_busy', `${env} has ${busy.kind} #${busy.id} in flight`, { blocking: busy.id });
-    const held = blockingClaim(env, fp, [as]);
-    if (held) return held;
+    // No env mutation claim may coexist with a QA window, whoever holds it.
+    const envClaim = claimsFor([`env:${env}`], []);
+    if (envClaim instanceof Error) return envClaim;
+    const held = claimsFor(fp.filter(f => f !== `env:${env}`), [as]);
+    if (held instanceof Error) return held;
     const t = now();
     const id = Number(run(`INSERT INTO releases (request_key,fingerprint,requester,kind,environment,footprint,state,admitted_by,admitted_at,readback,created_at,updated_at)
       VALUES (?,?,?,'qa_window',?,?,'running',?,?,?,?,?)`, key ?? `qa:${as}:${env}:${t}:${f.slice(0, 8)}`, f, as, env, json(fp), as, t, json({ until: t + secs }), t, t).lastInsertRowid);
@@ -740,6 +859,26 @@ export function archTransfer(id, { as, fence } = {}) {
     return { request: get('SELECT * FROM arch_requests WHERE id=?', a.id) };
   });
 }
+// Closes a request whose previous writer finished the work but lost its claim before archDone: the fence it
+// was taken under must have been reconciled `done`, and the current arch:broker holder records the commits.
+export function archCloseout(id, { as, fence, commits, evidence: ev } = {}) {
+  need(ev, 'evidence');
+  const list_ = Array.isArray(commits) ? commits : list(commits, []);
+  if (!list_.length) throw refuse('invalid', 'commits are required');
+  return tx(() => {
+    const c = holder(ARCH_RESOURCE, as, fence);
+    if (c instanceof Error) return c;
+    const a = get('SELECT * FROM arch_requests WHERE id=?', Number(id));
+    if (!a) throw refuse('not_found', `no arch request ${id}`);
+    if (a.state !== 'taken') throw refuse('bad_state', `arch request ${id} is ${a.state}`);
+    const prev = get('SELECT * FROM claim_history WHERE resource=? AND fence=?', ARCH_RESOURCE, a.fence);
+    if (!(prev?.state === 'reconciled' && prev.reconcile_outcome === 'done'))
+      throw refuse('not_reconciled', `fence ${a.fence} of ${a.taken_by} was not reconciled as done`);
+    run("UPDATE arch_requests SET state='done', result_commits=?, result_note=?, updated_at=? WHERE id=?", json(list_),
+      `closed by ${as} after ${a.taken_by} fence ${a.fence} reconciled done by ${prev.reconcile_by} (${prev.reconcile_evidence}): ${ev}`, now(), a.id);
+    return { request: get('SELECT * FROM arch_requests WHERE id=?', a.id) };
+  });
+}
 export const archList = ({ state } = {}) => ({ requests: all('SELECT * FROM arch_requests WHERE (? IS NULL OR state=?) ORDER BY id', state ?? null, state ?? null) });
 
 // ---------- approval provenance ----------
@@ -788,6 +927,7 @@ export function attention({ unackedAfter = DEFAULTS.unackedAfter } = {}) {
     releases: all(`SELECT id, kind, environment, repo, binary, tag, state, failure FROM releases
       WHERE state IN ('built_not_deployed','failed') OR (state='superseded' AND outcome IS NULL AND updated_at>?)
         OR (state='requested' AND created_at<=?) OR (state='admitted' AND admitted_at<=?)`, t - 7 * 86400, t - 3600, t - 3600),
+    awaiting_reconcile: all("SELECT id, kind, environment, plan_id, tf_run, admitted_by FROM releases WHERE state='running' AND kind IN ('tf_apply','ddl','migration')"),
     unobserved: all("SELECT id, kind, environment, observed_at, observe_note FROM releases WHERE state='running' AND kind!='qa_window' AND observe_note LIKE 'unknown:%'"),
     expired_qa_windows: all("SELECT id, requester, environment, readback FROM releases WHERE kind='qa_window' AND state='running'")
       .filter(q => (parse(q.readback)?.until ?? Infinity) <= t),

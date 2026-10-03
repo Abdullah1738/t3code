@@ -8,29 +8,29 @@ import * as P from '../lib/pump.mjs';
 
 const deliver = (...a) => P.deliver(...a);
 const pump = (...a) => P.pump(...a);
-import { fresh, advance, stubControl, SHA0, SHA1, SHA2, DIGEST, gatesOk, fakeGh, deployLog } from './helpers.mjs';
+import { fresh, advance, stubControl, SHA0, SHA1, SHA2, DIGEST, fakeGh, deployGh, deployLog, resetHooks, testHooks, ranges } from './helpers.mjs';
 
 const DIGEST2 = `sha256:${'d'.repeat(64)}`;
-const TC = 'Equicom-Crypto/trading-core';
+const TC = 'equicom-crypto/trading-core';
 const ok = async () => ({ ok: true });
 const refused = (fn, code) => assert.rejects(async () => fn(), e => { assert.equal(e.code, code, `${e.code}: ${e.message}`); return true; });
 const svc = (key, o = {}) => C.releaseRequest({ as: 'crw', key, kind: 'service_release', env: 'dev', repo: TC, binary: 'trading-core',
-  sha: SHA1, runtimeSha: SHA0, contentPrs: [`${TC}#141`], footprint: ['svc:trading-core'], ...o }).release;
+  sha: SHA1, tag: 'dev.33', runtimeSha: SHA0, contentPrs: [`${TC}#141`], ...o }).release;
 const admitStart = async (r, o = {}) => {
   const a = (await C.releaseAdmit(r.id, { as: 'release', manual: true, verify: ok, ...o })).release;
   return (await C.releaseStart(r.id, { as: 'release', fence: a.fence, verify: ok, ...o })).release;
 };
 const built = async (key, o = {}) => {
-  const r = await admitStart(svc(key, o), { tag: o.tag ?? 'dev.33', ...(o.noDigest ? {} : { digest: DIGEST }) });
+  const r = await admitStart(svc(key, o), { ...(o.noDigest ? {} : { digest: DIGEST }) });
   return (await C.releaseObserve(r.id, { observe: async () => ({ state: 'built_not_deployed', failure: 'downstream never ran' }) })).release;
 };
-const tf = (key, o = {}) => C.releaseRequest({ as: 'release', key, kind: 'tf_apply', env: 'dev', plan: 'saved:900', tfRoot: 'dev-risk',
-  targets: ['module.ecs'], rootGen: C.tfRootGen(o.tfRoot ?? 'dev-risk').gen, footprint: ['env:dev'], ...o }).release;
+const tf = (key, o = {}) => C.releaseRequest({ as: 'release', key, kind: 'tf_apply', env: 'dev', plan: 'saved:900@1', ...o }).release;
+const planAt = ago => async () => ({ startedAt: C.clock.now() - ago });
 
 let stub;
 beforeEach(async () => {
   fresh();
-  C.configure?.({ gateCheck: gatesOk });
+  resetHooks();
   stub = await stubControl({ states: { 'T-master': 'idle', 'T-shared': 'idle' } });
   C.actorSet('master', { thread: 'T-master' });
   C.channelCreate('ops', { owner: 'master' });
@@ -64,26 +64,27 @@ test('guard for #2: the requester may hold its own footprint claim; a third part
   const r = svc('a2b');
   assert.equal((await C.releaseAdmit(r.id, { as: 'release', verify: ok })).release.state, 'admitted');
   C.claim('svc:x', { as: 'cell:z' });
-  const r2 = svc('a2c', { repo: 'Equicom-Crypto/x', binary: 'x', footprint: ['svc:x'] });
+  const r2 = svc('a2c', { repo: 'Equicom-Crypto/x', binary: 'x' });
   await refused(() => C.releaseAdmit(r2.id, { as: 'release', verify: ok }), 'claimed');
 });
 
 test('#3 content range is required and every PR needs positive gate evidence at admit and at start', async () => {
   assert.throws(() => svc('g0', { contentPrs: undefined }), e => e.code === 'invalid');
   assert.throws(() => svc('g1', { runtimeSha: undefined }), e => e.code === 'invalid');
-  assert.throws(() => svc('g2', { contentPrs: [] }), e => e.code === 'invalid');
-  const empty = svc('g3', { contentPrs: [], rangeEvidence: `compare ${SHA0}...${SHA1}: identical`, repo: 'Equicom-Crypto/x', binary: 'x', footprint: ['svc:x'] });
+  ranges[SHA1] = [];
+  const empty = svc('g3', { contentPrs: [], repo: 'Equicom-Crypto/x', binary: 'x' });
   C.configure({ gateCheck: null });
-  assert.equal((await C.releaseAdmit(empty.id, { as: 'release', verify: ok })).release.state, 'admitted', 'empty evidenced range needs no hook');
-  const r = svc('g4', { contentPrs: [`${TC}#141`, `${TC}#150`] });
+  assert.equal((await C.releaseAdmit(empty.id, { as: 'release', verify: ok })).release.state, 'admitted', 'a resolver-verified empty range needs no gate hook');
+  ranges[SHA2] = [`${TC}#141`, `${TC}#150`];
+  const r = svc('g4', { sha: SHA2, tag: 'dev.34', contentPrs: [`${TC}#141`, `${TC}#150`] });
   await refused(() => C.releaseAdmit(r.id, { as: 'release', verify: ok }), 'gate_unavailable');
   const only141 = async () => ({ prs: [{ pr: `${TC}#141`, ok: true, evidence: 'approved' }, { pr: `${TC}#150`, ok: false }] });
   await refused(() => C.releaseAdmit(r.id, { as: 'release', verify: ok, gateCheck: only141 }), 'gates_not_clear');
-  const a = (await C.releaseAdmit(r.id, { as: 'release', verify: ok, gateCheck: gatesOk })).release;
-  assert.equal(JSON.parse(a.gate_evidence).length, 2);
+  const a = (await C.releaseAdmit(r.id, { as: 'release', verify: ok, gateCheck: testHooks.gateCheck })).release;
+  assert.equal(JSON.parse(a.gate_evidence).prs.length, 2);
   await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence, verify: ok }), 'gate_unavailable');
   await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence, verify: ok, gateCheck: only141 }), 'gates_not_clear');
-  assert.equal((await C.releaseStart(r.id, { as: 'crw', fence: a.fence, verify: ok, gateCheck: gatesOk })).release.state, 'running');
+  assert.equal((await C.releaseStart(r.id, { as: 'crw', fence: a.fence, verify: ok, gateCheck: testHooks.gateCheck })).release.state, 'running');
 });
 
 test('#4 an open shared-dev QA window excludes every dev mutation regardless of footprint, both directions', async () => {
@@ -115,66 +116,45 @@ test('#5 QA cannot open over a reconcile_required or foreign active env claim', 
   assert.throws(() => C.qaOpen({ as: 'harness', env: 'dev' }), e => e.code === 'claimed');
 });
 
-test('#6 tf_apply must name root and scope; full-root is blocked by default, clearable only by master, and rechecked at start', async () => {
-  assert.throws(() => tf('t0', { tfRoot: undefined }), e => e.code === 'invalid');
-  assert.throws(() => tf('t1', { targets: undefined }), e => e.code === 'invalid');
-  assert.throws(() => tf('t2', { rootGen: undefined }), e => e.code === 'invalid');
+test('#6 full-root saved plans are blocked by default, clearable only by master, and rechecked at start', async () => {
   assert.throws(() => tf('t2b', { plan: 'tfplan-xyz' }), e => e.code === 'invalid');
-  const full = tf('t3', { targets: undefined, fullRoot: true, tfRoot: 'dev' });
+  const full = tf('t3');
   assert.deepEqual(full.footprint, ['env:dev', 'tf:dev']);
-  await refused(() => C.releaseAdmit(full.id, { as: 'release', manual: true }), 'tf_full_root_blocked');
+  await refused(() => C.releaseAdmit(full.id, { as: 'release', manual: true, planRun: planAt(10) }), 'tf_full_root_blocked');
   assert.throws(() => C.setFlag('tf_full_root_blocked', false, { as: 'release' }), e => e.code === 'forbidden');
   C.setFlag('tf_full_root_blocked', false, { as: 'master', reason: 'FDB coordinator gate resolved' });
-  const a = (await C.releaseAdmit(full.id, { as: 'release', manual: true })).release;
+  const a = (await C.releaseAdmit(full.id, { as: 'release', manual: true, planRun: planAt(10) })).release;
   C.setFlag('tf_full_root_blocked', true, { as: 'release', reason: 're-blocked' });
   await refused(() => C.releaseStart(full.id, { as: 'release', fence: a.fence }), 'tf_full_root_blocked');
 });
 
-test('#7 plans bind to the root generation at plan time, checked at admit and at start', async () => {
-  const old = tf('p0'); // planned at gen 0
-  const p1 = tf('p1', { plan: 'saved:901' });
-  const a1 = (await C.releaseAdmit(p1.id, { as: 'release', manual: true })).release;
+test('#7 a saved plan older than the root\'s last mutation is refused at admit and at start', async () => {
+  C.setFlag('tf_full_root_blocked', false, { as: 'master' });
+  const old = tf('p0', { plan: 'saved:900@1' });
+  const p1 = tf('p1', { plan: 'saved:901@1' });
+  const a1 = (await C.releaseAdmit(p1.id, { as: 'release', manual: true, planRun: planAt(5) })).release;
   await C.releaseStart(p1.id, { as: 'release', fence: a1.fence, tfRun: '1' });
-  await C.releaseObserve(p1.id, { observe: async () => ({ state: 'done' }) });
-  assert.equal(C.tfRootGen('dev-risk').gen, 1);
-  await refused(() => C.releaseAdmit(old.id, { as: 'release', manual: true }), 'stale_plan');
-  const p2 = tf('p2', { plan: 'saved:902' });
-  const a2 = (await C.releaseAdmit(p2.id, { as: 'release', manual: true })).release;
-  run("UPDATE tf_roots SET gen=gen+1 WHERE root='dev-risk'"); // another apply of the root started in between
+  C.releaseReconcile(p1.id, { as: 'release', outcome: 'done', evidence: 'run 1 attempt 1 apply ok' });
+  assert.equal(C.tfRootGen('dev').gen, 2);
+  await refused(() => C.releaseAdmit(old.id, { as: 'release', manual: true, planRun: planAt(50) }), 'stale_plan');
+  advance(100);
+  const p2 = tf('p2', { plan: 'saved:902@1' });
+  const a2 = (await C.releaseAdmit(p2.id, { as: 'release', manual: true, planRun: planAt(10) })).release;
+  run("UPDATE tf_roots SET gen=gen+1, bumped_at=? WHERE root='dev'", C.clock.now()); // another mutation of the root in between
   await refused(() => C.releaseStart(p2.id, { as: 'release', fence: a2.fence }), 'stale_plan');
   assert.equal(C.releaseList({ state: 'superseded' }).releases.length, 2);
 });
 
-const tfRun = ({ path = '.github/workflows/terraform-dev.yml', env = 'dev', saved = '900', step = 'success', conclusion = 'success' } = {}) => fakeGh([
-  [/actions\/runs\/77$/, { id: 77, path, status: 'completed', conclusion, html_url: 'u', run_attempt: 1 }],
-  [/runs\/77\/jobs/, { total_count: 1, jobs: [{ id: 7700, steps: [{ name: 'Apply saved plan', conclusion: step }] }] }],
-  [/jobs\/7700\/logs/, `  CRPKO_ENV: ${env}\n  SAVED_PLAN_RUN_ID: ${saved}\n`],
-]);
-
-test('#8 TF/migration observation requires the right workflow, env, plan identity and an executed apply step', async () => {
-  const r = { kind: 'tf_apply', environment: 'dev', plan_id: 'saved:900', tf_run: '77' };
-  assert.equal((await E.observeRelease(r, { gh: tfRun() })).state, 'done');
-  assert.equal((await E.observeRelease(r, { gh: tfRun({ path: '.github/workflows/other.yml' }) })).state, 'unknown');
-  assert.equal((await E.observeRelease(r, { gh: tfRun({ env: 'staging' }) })).state, 'unknown');
-  assert.equal((await E.observeRelease(r, { gh: tfRun({ saved: '901' }) })).state, 'unknown');
-  assert.notEqual((await E.observeRelease(r, { gh: tfRun({ step: 'skipped' }) })).state, 'done');
-  assert.equal((await E.observeRelease({ ...r, plan_id: 'tfplan-xyz' }, { gh: tfRun() })).state, 'unknown');
-  const mig = { kind: 'migration', environment: 'dev', plan_id: '2026-10-01-markets.sql', tf_run: '78' };
-  const migGh = apply => fakeGh([
-    [/actions\/runs\/78$/, { id: 78, path: '.github/workflows/apply-clickhouse-migration.yml', status: 'completed', conclusion: 'success' }],
-    [/runs\/78\/jobs/, { jobs: [{ id: 7800, steps: [{ name: 'Apply gated migration', conclusion: 'success' }] }] }],
-    [/jobs\/7800\/logs/, `CRPKO_ENV: dev\nMIGRATION_FILE: 2026-10-01-markets.sql\nAPPLY: ${apply}\nVERIFY_ONLY: false\n`],
-  ]);
-  assert.equal((await E.observeRelease(mig, { gh: migGh('true') })).state, 'done');
-  assert.equal((await E.observeRelease(mig, { gh: migGh('false') })).state, 'unknown', 'a dry run is not an apply');
-  // unknown keeps the release running; a run whose apply step did not succeed fails it
+test('#8 Terraform/DDL/migration are never auto-classified; only release reconcile closes them', async () => {
+  C.setFlag('tf_full_root_blocked', false, { as: 'master' });
   const rel = tf('o1');
-  const a = (await C.releaseAdmit(rel.id, { as: 'release', manual: true })).release;
+  const a = (await C.releaseAdmit(rel.id, { as: 'release', manual: true, planRun: planAt(5) })).release;
   await C.releaseStart(rel.id, { as: 'release', fence: a.fence, tfRun: '77' });
-  const u = await C.releaseObserve(rel.id, { observe: rr => E.observeRelease(rr, { gh: tfRun({ saved: '901' }) }) });
-  assert.equal(u.release.state, 'running');
-  const o = await C.releaseObserve(rel.id, { observe: rr => E.observeRelease(rr, { gh: tfRun({ step: 'skipped' }) }) });
-  assert.equal(o.release.state, 'failed');
+  const o = await C.releaseObserve(rel.id, { observe: async () => ({ state: 'done' }) });
+  assert.equal(o.release.state, 'running');
+  assert.equal((await E.observeRelease({ ...rel, environment: 'dev' }, { gh: fakeGh([]) })).state, 'running');
+  assert.throws(() => C.releaseReconcile(rel.id, { as: 'crw', outcome: 'done', evidence: 'x' }), e => e.code === 'forbidden');
+  assert.equal(C.releaseReconcile(rel.id, { as: 'release', outcome: 'done', evidence: 'run 77 attempt 1: Apply saved plan success' }).release.state, 'done');
 });
 
 test('#9 dev evidence never satisfies other environments', async () => {
@@ -183,67 +163,40 @@ test('#9 dev evidence never satisfies other environments', async () => {
   await assert.rejects(E.serviceRuntime({ binary: 'trading-core', env: 'staging', gh: fakeGh([]) }), e => e.code === 'env_unsupported');
   const expect = { env: 'dev', binary: 'trading-core', git_sha: SHA1 };
   const ds = { id: 1, path: '.github/workflows/deploy-dev-service.yml', status: 'completed', conclusion: 'success' };
-  const c = E.classify({ release: { status: 'completed', conclusion: 'success' }, downstream: ds, inputs: { ...expect, env: 'staging' }, expect });
+  const c = E.classify({ release: { status: 'completed', conclusion: 'success' }, published: true, downstream: ds, inputs: { ...expect, env: 'staging' }, expect });
   assert.equal(c.state, 'failed');
   assert.equal(E.parseRunInputs(deployLog('trading-core', 'dev.1', SHA1, { env: 'staging' })).env, 'staging');
 });
 
-const runtimeGh = (runs, logs) => fakeGh([
-  [/workflows\/deploy-dev-service.yml\/runs/, { workflow_runs: runs }],
-  [/runs\/(\d+)\/jobs/, m => ({ total_count: 1, jobs: [{ id: Number(m[1]) * 100 }] })],
-  [/jobs\/(\d+)00\/logs/, m => { const l = logs[m[1]]; if (l instanceof Error) throw l; return l; }],
-]);
-
+const D = 'deploy-dev-service.yml';
 test('#10 runtime follows the latest attempt, so a rollback rerun of an older run wins', async () => {
-  const gh = runtimeGh([
-    { id: 10, status: 'completed', conclusion: 'success', created_at: '2026-10-01T00:00:00Z', run_started_at: '2026-10-03T00:00:00Z', run_attempt: 2 },
-    { id: 11, status: 'completed', conclusion: 'success', created_at: '2026-10-02T00:00:00Z', run_started_at: '2026-10-02T00:00:00Z', run_attempt: 1 },
-  ], { 10: deployLog('trading-core', 'dev.1', SHA1), 11: deployLog('trading-core', 'dev.2', SHA2) });
+  const gh = deployGh({ [D]: [
+    { id: 10, attempt: 2, created: '2026-10-01T00:00:00Z', started: '2026-10-03T00:00:00Z', log: deployLog('trading-core', 'dev.1', SHA1) },
+    { id: 11, created: '2026-10-02T00:00:00Z', started: '2026-10-02T00:00:00Z', log: deployLog('trading-core', 'dev.2', SHA2) },
+  ] });
   const rt = await E.serviceRuntime({ binary: 'trading-core', gh });
   assert.deepEqual([rt.state, rt.tag, rt.attempt], ['known', 'dev.1', 2]);
 });
 
 test('#11 an unreadable newer run makes runtime unknown instead of falling back', async () => {
-  const runs = [
-    { id: 12, status: 'completed', conclusion: 'success', run_started_at: '2026-10-03T00:00:00Z' },
-    { id: 11, status: 'completed', conclusion: 'success', run_started_at: '2026-10-02T00:00:00Z' },
-  ];
-  let rt = await E.serviceRuntime({ binary: 'trading-core', gh: runtimeGh(runs, { 12: new Error('HTTP 502'), 11: deployLog('trading-core', 'dev.2', SHA2) }) });
-  assert.equal(rt.state, 'unknown');
-  rt = await E.serviceRuntime({ binary: 'trading-core', gh: runtimeGh(runs, { 12: 'no inputs here', 11: deployLog('trading-core', 'dev.2', SHA2) }) });
-  assert.equal(rt.state, 'unknown');
-  const ghSteps = fakeGh([
-    [/workflows\/deploy-dev-service.yml\/runs/, { workflow_runs: runs }],
-    [/runs\/12\/jobs/, { total_count: 1, jobs: [{ id: 1200, status: 'completed', steps: [{ name: 'Validate release tag', conclusion: 'success' }] }] }],
-    [/runs\/(\d+)\/jobs/, m => ({ total_count: 1, jobs: [{ id: Number(m[1]) * 100 }] })],
-    [/jobs\/1200\/logs/, 'log truncated'],
-    [/jobs\/1100\/logs/, deployLog('trading-core', 'dev.2', SHA2)],
-  ]);
-  rt = await E.serviceRuntime({ binary: 'trading-core', gh: ghSteps });
-  assert.equal(rt.state, 'unknown', 'validation ran but its inputs cannot be read');
-  const ghNone = fakeGh([
-    [/workflows\/deploy-dev-service.yml\/runs/, { workflow_runs: [{ ...runs[0], id: 14, conclusion: 'failure' }, runs[1]] }],
-    [/runs\/14\/jobs/, { total_count: 1, jobs: [{ id: 1400, status: 'completed', steps: [{ name: 'Authorize', conclusion: 'failure' }, { name: 'Validate release tag', conclusion: 'skipped' }] }] }],
-    [/runs\/(\d+)\/jobs/, m => ({ total_count: 1, jobs: [{ id: Number(m[1]) * 100 }] })],
-    [/jobs\/1400\/logs/, 'rejected before validation'],
-    [/jobs\/1100\/logs/, deployLog('trading-core', 'dev.2', SHA2)],
-  ]);
-  rt = await E.serviceRuntime({ binary: 'trading-core', gh: ghNone });
-  assert.deepEqual([rt.state, rt.tag], ['known', 'dev.2'], 'a run that provably never reached validation changed nothing');
-  rt = await E.serviceRuntime({ binary: 'trading-core', gh: runtimeGh(runs, { 12: deployLog('registry', 'dev.9', SHA1), 11: deployLog('trading-core', 'dev.2', SHA2) }) });
-  assert.deepEqual([rt.state, rt.tag], ['known', 'dev.2'], 'a positively identified other binary is skipped');
-  rt = await E.serviceRuntime({ binary: 'trading-core', gh: runtimeGh([{ ...runs[0], id: 13, conclusion: 'failure' }, runs[1]], { 13: deployLog('trading-core', 'dev.3', SHA1), 11: deployLog('trading-core', 'dev.2', SHA2) }) });
-  assert.equal(rt.state, 'unknown', 'a newer failed deploy of the binary leaves runtime unknown');
+  const older = { id: 11, started: '2026-10-02T00:00:00Z', log: deployLog('trading-core', 'dev.2', SHA2) };
+  let next = 20;
+  const newer = o => deployGh({ [D]: [{ id: next++, started: '2026-10-03T00:00:00Z', ...o }, older] });
+  const rt = async o => E.serviceRuntime({ binary: 'trading-core', gh: newer(o) });
+  assert.equal((await rt({ log: new Error('HTTP 502') })).state, 'unknown');
+  assert.equal((await rt({ log: 'no inputs here' })).state, 'unknown', 'validation ran but its inputs cannot be read');
+  assert.deepEqual(Object.values(await rt({ conclusion: 'failure', log: 'rejected', jobs: [{ steps: [{ name: 'Authorize', conclusion: 'failure' }, { name: 'Validate release tag', conclusion: 'skipped' }] }] }))
+    .slice(0, 3), ['known', SHA2, 'dev.2'], 'a run that provably never reached validation changed nothing');
+  assert.equal((await rt({ log: deployLog('registry', 'dev.9', SHA1) })).tag, 'dev.2', 'a positively identified other binary is skipped');
+  assert.equal((await rt({ conclusion: 'failure', log: deployLog('trading-core', 'dev.3', SHA1) })).state, 'unknown', 'a newer failed deploy of the binary leaves runtime unknown');
 });
 
 test('#12 a frontend release is done only when the observed head contains the requested sha', async () => {
   const fe = C.releaseRequest({ as: 'crw', key: 'fe1', kind: 'frontend_release', env: 'dev', repo: 'Equicom-Crypto/crypko-frontend', binary: 'crypko-frontend',
-    sha: SHA1, runtimeSha: SHA0, contentPrs: ['Equicom-Crypto/crypko-frontend#9'], footprint: ['svc:crypko-frontend'] }).release;
+    sha: SHA1, runtimeSha: SHA0, contentPrs: ['equicom-crypto/crypko-frontend#9'] }).release;
   const r = { ...fe, deploy_run: '55' };
-  const gh = status => fakeGh([
-    [/actions\/runs\/55$/, { id: 55, status: 'completed', conclusion: 'success', head_branch: 'main-dev', head_sha: SHA2, html_url: 'u' }],
-    [new RegExp(`compare/${SHA2}\\.\\.\\.${SHA1}`), { status }],
-  ]);
+  const gh = status => deployGh({ 'deploy-dev.yml': [{ id: 55, started: '2026-10-03T00:00:00Z', head: SHA2, path: '.github/workflows/deploy-dev.yml' }] },
+    { repo: 'equicom-crypto/crypko-frontend', extra: [[new RegExp(`compare/${SHA2}\\.\\.\\.${SHA1}`), { status }]] });
   assert.equal((await E.observeRelease(r, { gh: gh('ahead') })).state, 'failed');
   assert.equal((await E.observeRelease(r, { gh: gh('diverged') })).state, 'failed');
   const d = await E.observeRelease(r, { gh: gh('behind') });
@@ -299,10 +252,10 @@ test('#16 a redispatch supersedes only its own source release, not built rows in
 });
 
 test('#17 replaying the original release request stays idempotent after start and observation', async () => {
-  const r = await admitStart(svc('i17'), { tag: 'dev.40' });
+  const r = await admitStart(svc('i17'));
   await C.releaseObserve(r.id, { observe: async () => ({ state: 'done', digest: DIGEST }) });
-  const again = C.releaseRequest({ as: 'crw', key: 'i17', kind: 'service_release', env: 'dev', repo: TC, binary: 'trading-core', sha: SHA1,
-    runtimeSha: SHA0, contentPrs: [`${TC}#141`], footprint: ['svc:trading-core'] });
+  const again = C.releaseRequest({ as: 'crw', key: 'i17', kind: 'service_release', env: 'dev', repo: 'Equicom-Crypto/Trading-Core', binary: 'trading-core', sha: SHA1,
+    tag: 'dev.33', runtimeSha: SHA0, contentPrs: [`${TC}#141`] });
   assert.deepEqual([again.duplicate, again.release.id, again.release.state], [true, r.id, 'done']);
   assert.throws(() => svc('i17', { sha: SHA2 }), e => e.code === 'conflict');
 });
@@ -411,7 +364,7 @@ test('#24 transfer is refused while the previous writer is unreconciled or recon
 
 test('pump observes running releases, bounded per tick', async () => {
   const ids = [];
-  for (let i = 0; i < 3; i++) ids.push((await admitStart(svc(`pm${i}`, { repo: `Equicom-Crypto/r${i}`, binary: `r${i}`, footprint: [`svc:r${i}`] }))).id);
+  for (let i = 0; i < 3; i++) ids.push((await admitStart(svc(`pm${i}`, { repo: `Equicom-Crypto/r${i}`, binary: `r${i}` }))).id);
   const seen = [];
   const out = await pump({ cfg: stub.cfg, observeLimit: 2, observe: async r => { seen.push(r.id); return { state: 'done' }; } });
   assert.deepEqual(seen, ids.slice(0, 2));
