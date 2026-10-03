@@ -87,7 +87,8 @@ handoff writes the source `dev` state too). Naming `env:<env>` in
 **`releaseAdmit(id, { as, manual?, verify?, planRun?, rangeResolver?, gateCheck?, runtime? })`**,
 **`releaseStart(id, { as, fence, sha?, tag?, digest?, plan?, releaseRun?, deployRun?, tfRun?, ... })`**.
 Start requires the admission fence, the same claim fences admission relied on, the same head, range,
-gates and runtime, a valid tag, no open QA window and no other built release of the repo. Run ids
+gates and runtime, a valid tag, no open QA window and no other built release of the repo. Restated
+`env`, `repo` and `sha` are compared in canonical form (`DEV` matches `dev`). Run ids
 (`releaseRun`, `deployRun`, `tfRun`), digest and tag bind once, whether given to `releaseRecord` or
 `releaseStart`: a different value for a bound field is `binding_mismatch`.
 
@@ -229,7 +230,11 @@ Evidence fails closed: anything not positively identified is `unknown`, and the 
 - Only `dev` has an evidence source. Requests for other environments are refused `env_unsupported`.
 - Service runtime is the newest executed attempt (by `run_started_at`) of `deploy-dev-service.yml` or
   `rollback-dev-service.yml` that names the binary. Run lists are paged until no unseen run could hold a
-  newer attempt (created within GitHub's 30-day rerun window); otherwise `unknown`. A newer unreadable,
+  newer attempt (created within GitHub's 30-day rerun window); otherwise `unknown`.
+  A run's latest attempt that provably changed nothing (it never reached `Validate release tag`;
+  for frontends, ran no deploy job) does not erase that run's history: its earlier attempts are read
+  back, and the latest one that did something decides that run, at that attempt's own time. An attempt
+  whose effect cannot be told makes the runtime `unknown`; an older run is never reported instead. A newer unreadable,
   unfinished or failed run for the binary makes it `unknown`. Jobs are read per attempt; skipped jobs
   are not log-fetched.
 - Service observation trusts push-tag `release.yml` runs only: the run's `head_branch` must be the

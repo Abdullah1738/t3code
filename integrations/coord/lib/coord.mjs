@@ -684,7 +684,7 @@ export function releaseRequest(o = {}) {
   if (kind === 'redispatch' && !(o.tag && o.digest)) throw refuse('invalid', 'redispatch binds the existing tag and digest');
   if (kind === 'tf_apply') {
     if (!/^saved:\d+@\d+$/.test(o.plan ?? '')) throw refuse('invalid', 'tf_apply plan must be saved:<plan run id>@<attempt>');
-    if ((o.tfRoot && o.tfRoot !== SAVED_PLAN_ROOT) || (o.targets && list(o.targets, []).length) || o.fullRoot === false)
+    if ((o.tfRoot && canonicalResource(`tf:${o.tfRoot}`).slice(3) !== SAVED_PLAN_ROOT) || (o.targets && list(o.targets, []).length) || o.fullRoot === false)
       throw refuse('invalid', `a saved plan is always the full ${SAVED_PLAN_ROOT} root; tfRoot/targets contradict it`);
     tfRoot = SAVED_PLAN_ROOT;
   }
@@ -867,8 +867,11 @@ export async function releaseStart(id, o = {}) {
     requireMode(`env:${r.environment}`, true);
     if (r.fence !== Number(fence)) throw refuse('stale_fence', `fence ${fence} is not the admission fence`);
     if (as !== r.requester && as !== r.admitted_by) throw refuse('forbidden', `${as} did not request or admit release ${id}`);
+    // Restated bindings are compared in canonical form, the same form the request stored.
+    const lower = v => String(v).toLowerCase();
+    const canonOf = { repo: canonRepo, env: e => canonicalEnv(e, { supported: false }), sha: lower };
     for (const [k, col] of [['sha', 'git_sha'], ['repo', 'repo'], ['env', 'environment'], ['plan', 'plan_id'], ['tag', 'tag'], ['digest', 'image_digest']]) {
-      const want = k === 'repo' ? canonRepo(o[k]) : o[k];
+      const want = o[k] !== undefined && canonOf[k] ? canonOf[k](o[k]) : o[k];
       if (o[k] !== undefined && (r[col] !== null || ['sha', 'repo', 'env', 'plan', 'tag'].includes(k)) && want !== r[col])
         throw refuse('binding_mismatch', `${k} ${o[k]} differs from admitted ${r[col]}`);
     }

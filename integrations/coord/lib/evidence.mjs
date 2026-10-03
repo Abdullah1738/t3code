@@ -87,24 +87,57 @@ export async function deployRunInputs(id, { gh = ghText, attempt = 1 } = {}) {
   return inputs;
 }
 
+// A run's latest attempt that provably changed nothing does not erase what an earlier attempt of the
+// same run did. `probe(attempt)` classifies one attempt: { skip } (provably changed nothing), { match, data },
+// { unknown }, or {} (another target). Walks back from the latest attempt; the first attempt that is not
+// a skip decides the run, and its start time (`at`) is the run's place in the execution order.
+async function throughAttempts(gh, repo, r, probe) {
+  const latest = r.run_attempt ?? 1;
+  for (let k = latest; k >= 1; k--) {
+    let a = r;
+    if (k !== latest) {
+      a = await ghJson(gh, ['api', `repos/${repo}/actions/runs/${r.id}/attempts/${k}`]);
+      if (a?.status !== 'completed') return { unknown: `run ${r.id} attempt ${k} is ${a?.status}` };
+      a = { ...r, ...a, id: r.id, run_attempt: k };
+    }
+    const m = await probe(a);
+    if (m?.skip) continue;
+    return { ...m, attempt: k, at: attemptTime(a) };
+  }
+  return {};
+}
+
 // Finds the newest executed attempt that `identify` matches across workflow files. Lists are ordered by
 // run creation, but a rerun of an older run executes later. So the walk is decided by the newest attempt
 // that matches, is unknown, or is unfinished, and only once every workflow has been paged back past that
 // attempt's time minus the rerun window (no unseen run can have a newer attempt). Otherwise: unknown.
+// `identify` may place a run earlier than its latest attempt (`at`), when only an earlier attempt of it
+// did anything; the order is then recomputed with that time.
 async function latestAttempt({ gh, repo, workflows, identify, maxPages = MAX_PAGES }) {
   maxPages ??= MAX_PAGES;
   const seen = new Map();
+  const memo = new Map();
+  const eff = new Map();
+  const when = r => eff.get(r._key) ?? attemptTime(r);
   const lists = Object.fromEntries(workflows.map(w => [w, { page: 0, done: false, oldest: Infinity }]));
   for (;;) {
     let decided = null;
-    for (const r of [...seen.values()].sort((a, b) => attemptTime(b) - attemptTime(a) || b.id - a.id)) {
-      if (r.status !== 'completed') { decided = { r, out: unknown(`run ${r.id} is ${r.status}`) }; break; }
-      let m;
-      try { m = await identify(r); } catch (e) { decided = { r, out: unknown(`run ${r.id} attempt ${r.run_attempt ?? 1} unreadable: ${e.message}`) }; break; }
-      if (m?.unknown) { decided = { r, out: unknown(m.unknown) }; break; }
-      if (m?.match) { decided = { r, out: { state: 'known', r, data: m.data } }; break; }
+    for (let again = true; again;) {
+      again = false;
+      decided = null;
+      for (const r of [...seen.values()].sort((a, b) => when(b) - when(a) || b.id - a.id)) {
+        if (r.status !== 'completed') { decided = { r, out: unknown(`run ${r.id} is ${r.status}`) }; break; }
+        let m = memo.get(r._key);
+        if (!m) {
+          try { m = await identify(r); } catch (e) { m = { unknown: `run ${r.id} attempt ${r.run_attempt ?? 1} unreadable: ${e.message}` }; }
+          memo.set(r._key, m);
+        }
+        if (m.at !== undefined && m.at < attemptTime(r) && !eff.has(r._key)) { eff.set(r._key, m.at); again = true; break; }
+        if (m.unknown) { decided = { r, out: unknown(m.unknown) }; break; }
+        if (m.match) { decided = { r, out: { state: 'known', r, attempt: m.attempt ?? r.run_attempt ?? 1, data: m.data } }; break; }
+      }
     }
-    const horizon = decided ? attemptTime(decided.r) - RERUN_WINDOW : -Infinity;
+    const horizon = decided ? when(decided.r) - RERUN_WINDOW : -Infinity;
     const more = workflows.filter(w => !lists[w].done && lists[w].oldest >= horizon);
     if (!more.length) return decided?.out ?? unknown(`no matching run in ${workflows.join(', ')}`);
     for (const w of more) {
@@ -112,7 +145,7 @@ async function latestAttempt({ gh, repo, workflows, identify, maxPages = MAX_PAG
       if (l.page >= maxPages) return unknown(`run list of ${w} not covered after ${maxPages} pages`);
       const res = await ghJson(gh, ['api', `repos/${repo}/actions/workflows/${w}/runs?per_page=100&page=${++l.page}`]);
       const runs = res?.workflow_runs ?? [];
-      for (const r of runs) { seen.set(`${w}:${r.id}`, r); l.oldest = Math.min(l.oldest, sec(r.created_at)); }
+      for (const r of runs) { seen.set(`${w}:${r.id}`, { ...r, _key: `${w}:${r.id}` }); l.oldest = Math.min(l.oldest, sec(r.created_at)); }
       if (runs.length < 100) l.done = true;
     }
   }
@@ -134,18 +167,19 @@ export async function serviceRuntime({ binary, env = 'dev', gh = ghText, maxPage
   binary = String(binary ?? '').toLowerCase();
   const found = await latestAttempt({
     gh, repo: DEVOPS, workflows: SERVICE_DEPLOY_WORKFLOWS, maxPages,
-    identify: async r => {
-      const inputs = await deployRunInputs(r.id, { gh, attempt: r.run_attempt ?? 1 });
-      if (inputs.none || inputs.binary !== binary) return { match: false };
-      if (inputs.env !== env) return { unknown: `run ${r.id} deployed ${binary} to ${inputs.env}` };
-      if (r.conclusion !== 'success' || inputs.partial) return { unknown: `latest ${binary} run ${r.id} ended ${r.conclusion}` };
+    identify: r => throughAttempts(gh, DEVOPS, r, async a => {
+      const inputs = await deployRunInputs(a.id, { gh, attempt: a.run_attempt });
+      if (inputs.none) return { skip: true }; // never reached release validation: changed nothing
+      if (inputs.binary !== binary) return {};
+      if (inputs.env !== env) return { unknown: `run ${a.id} attempt ${a.run_attempt} deployed ${binary} to ${inputs.env}` };
+      if (a.conclusion !== 'success' || inputs.partial) return { unknown: `latest ${binary} run ${a.id} attempt ${a.run_attempt} ended ${a.conclusion}` };
       return { match: true, data: inputs };
-    },
+    }),
   }).catch(e => unknown(e.message));
   if (found.state !== 'known') return shape('unknown', { reason: found.reason });
-  const { r, data } = found;
+  const { r, data, attempt } = found;
   if (!(await recheck(gh, DEVOPS, r).catch(() => false))) return shape('unknown', { reason: `run ${r.id} changed while reading` });
-  return shape('known', { sha: data.git_sha, tag: data.tag, digest: data.digest, run: String(r.id), attempt: r.run_attempt ?? 1 });
+  return shape('known', { sha: data.git_sha, tag: data.tag, digest: data.digest, run: String(r.id), attempt });
 }
 
 // Frontend jobs that ran beyond the manual-actor authorization job.
@@ -169,15 +203,15 @@ export async function frontendRuntime({ repo, env = 'dev', gh = ghText } = {}) {
   if (!wf) return shape('unknown', { reason: `no deploy workflow configured for ${repo}` });
   const found = await latestAttempt({
     gh, repo, workflows: [wf],
-    identify: async r => {
-      if (!(await frontendExecuted(gh, repo, r))) return { match: false };
-      if (r.conclusion !== 'success') return { unknown: `latest deploy run ${r.id} ended ${r.conclusion}` };
-      return { match: true, data: { sha: r.head_sha } };
-    },
+    identify: r => throughAttempts(gh, repo, r, async a => {
+      if (!(await frontendExecuted(gh, repo, a))) return { skip: true };
+      if (a.conclusion !== 'success') return { unknown: `latest deploy run ${a.id} attempt ${a.run_attempt} ended ${a.conclusion}` };
+      return { match: true, data: { sha: a.head_sha } };
+    }),
   }).catch(e => unknown(e.message));
   if (found.state !== 'known') return shape('unknown', { reason: found.reason });
   if (!(await recheck(gh, repo, found.r).catch(() => false))) return shape('unknown', { reason: `run ${found.r.id} changed while reading` });
-  return shape('known', { sha: found.data.sha, run: String(found.r.id), attempt: found.r.run_attempt ?? 1 });
+  return shape('known', { sha: found.data.sha, run: String(found.r.id), attempt: found.attempt });
 }
 
 // compare base...head through gh.
