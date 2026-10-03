@@ -1210,7 +1210,7 @@ export const archList = ({ state } = {}) => ({ requests: all('SELECT * FROM arch
 
 // ---------- approval provenance ----------
 
-const RELAY = /^\s*(\[crw\]|\[coord |CRPKO_PIPELINE_AUTOMATION:)/;
+const RELAY = /^\s*(\[crw\]|\[coord[ \]]|CRPKO_PIPELINE_AUTOMATION:)/;
 // A Robob message may carry human authority only when the owner typed it in the web or mobile app.
 export function approvalProvenance(m, { sources = DEFAULTS.approvalSources } = {}) {
   const role = m?.role ?? null, createdBy = m?.createdBy ?? null, creationSource = m?.creationSource ?? null;

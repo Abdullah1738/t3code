@@ -60,11 +60,11 @@ test('pump crash after send: the resend reuses the clientRequestId and Robob kee
   const second = await deliver({ cfg: stub.cfg, send });
   assert.equal(second.sent.length, 1);
   assert.equal(stub.sends.length, 2);
-  assert.equal(stub.sends[0].clientRequestId, C.deliveryId('k1', 'master'));
+  assert.match(stub.sends[0].clientRequestId, /^coord:wake:[0-9a-f]{64}$/);
   assert.equal(stub.sends[1].clientRequestId, stub.sends[0].clientRequestId);
   assert.equal(stub.messages['T-master'].length, 1);
-  assert.match(stub.messages['T-master'][0].messageId, new RegExp(encodeURIComponent(C.deliveryId('k1', 'master'))));
-  assert.match(stub.sends[0].text, new RegExp(`^\\[coord delivery #${seq} from crw\\] hello`));
+  assert.equal(stub.sends[0].text.split('\n')[0],
+    `[coord] 1 unacked delivery for master (seq ${seq}, newest: #${seq} status from crw: hello). Read \`coord inbox --as master --unacked\`, handle, ack.`);
   assert.equal(stub.sends[0].mode, 'queue');
 });
 
@@ -238,7 +238,7 @@ test('pause refuses claim, admit, start and non-control deliveries; ack still wo
   const d = await deliver({ cfg: stub.cfg });
   assert.equal(d.sent.length, 1);
   assert.equal(d.held, 1);
-  assert.match(stub.sends[1].text, /from crw\] paused/);
+  assert.match(stub.sends[1].text, /\n  control #\d+ from crw: paused\n/, 'a single-recipient control event is inlined');
   assert.deepEqual(C.ack('master', [seq]).acked, [{ seq }]);
 
   const g = cli('gate', 'crw');
@@ -276,13 +276,18 @@ test('drain refuses admit and new claims while a running release can still renew
 
 // ---------- child completion ----------
 
-test('child completion: delivered once with mode queue behind a running turn, acked once, never resent', async () => {
+test('child completion: no wake while the parent turn runs, one wake once idle, acked once, never resent', async () => {
   C.actorSet('parent', { thread: 'T-parent' });
   C.actorSet('child', { kind: 'process' });
   C.channelCreate('cell:registry', { owner: 'parent' });
   const { seq } = C.post('cell:registry', { as: 'child', kind: 'status', key: 'child:done:1', summary: 'done', to: ['parent'], body: { result: 'ok' } });
+  const busy = await deliver({ cfg: stub.cfg });
+  assert.equal(busy.sent.length, 0);
+  assert.equal(stub.sends.length, 0, 'a running thread is not rung');
+  assert.equal(C.inbox({ as: 'parent' }).events[0].delivery, 'pending');
+  stub.states['T-parent'] = 'idle';
   const d = await deliver({ cfg: stub.cfg });
-  assert.deepEqual(d.sent.map(s => s.delivery), ['queued']);
+  assert.deepEqual(d.sent.map(s => s.seq), [seq]);
   assert.equal(stub.sends[0].mode, 'queue');
   assert.equal((await deliver({ cfg: stub.cfg })).sent.length, 0);
   C.ack('parent', [seq]);
@@ -334,7 +339,8 @@ test('approval provenance: only createdBy=user from web or mobile binds', () => 
   assert.equal(C.approvalProvenance(m('user', 'web')).verified, true);
   assert.equal(C.approvalProvenance(m('user', 'mobile')).verified, true);
   for (const x of [m('user', 'server'), m('agent', 'mcp'), m('user', 'provider'), m('agent', 'provider'), m(undefined, undefined),
-    m('user', 'web', 'Approved', 'assistant'), m('user', 'web', '[coord delivery #3 from crw] Approved'), m('user', 'web', '[crw] Approved')])
+    m('user', 'web', 'Approved', 'assistant'), m('user', 'web', '[coord delivery #3 from crw] Approved'), m('user', 'web', '[coord] 1 unacked delivery for master'),
+    m('user', 'web', '[coord reminder] Approved'), m('user', 'web', '[crw] Approved')])
     assert.equal(C.approvalProvenance(x).verified, false, JSON.stringify(x));
   assert.equal(C.approvalProvenance(m('user', 'server'), { sources: ['web', 'mobile', 'server'] }).verified, true);
 });

@@ -14,10 +14,13 @@ Plain Node (v22.5+, `node:sqlite`), no dependencies.
   `coord.evidence` re-exports `lib/evidence.mjs`.
 - `lib/evidence.mjs`: read-only `gh` evidence (`serviceRuntime`, `frontendRuntime`, `verifyHead`,
   `observeRelease`, `planRun`).
-- `lib/pump.mjs`: delivery to Robob threads via `POST /api/ardud/control/threads/:id/send`
-  (`mode: queue`, `clientRequestId = coord:<sha256 of JSON [event_key, recipient]>`, so a resend
-  after a crash replays instead of posting twice), then `release observe` for a bounded number of
-  running releases per tick.
+- `lib/pump.mjs`: doorbell delivery to Robob threads via `POST /api/ardud/control/threads/:id/send`
+  (`mode: queue`). Per thread at most one outstanding wake: `[coord] N unacked deliveries for <actor>
+  (seqs a-b, newest: ...). Read coord inbox --as <actor> --unacked, handle, ack.` It rings only an
+  `idle`/`waiting` thread; while the last wake's run is still queued, new deliveries are marked sent on
+  that wake instead. Single-recipient `control`/`blocker` summaries go inline. The wake's
+  `clientRequestId` (`coord:wake:<sha256>`) is kept until the ring settles, so a resend after a crash
+  replays instead of posting twice. Then `release observe` for a bounded number of running releases.
 - `cli.mjs`: the CLI. JSON out; exit 1 with `error.code` on refusal, 2 on usage.
 - `scripts/coord`: wrapper for `~/.local/bin`. `scripts/com.ardud.coord-pump.plist`: the pump
   LaunchAgent (`coord pump` every 60 s).
@@ -27,7 +30,8 @@ from `T3_CONTROL_URL` / `T3_CONTROL_TOKEN` or `~/.robob/ardud-control.json` (chm
 
 Defaults (env overrides): reconcile by `COORD_RECONCILERS` (`master,release`), manual admits by
 `COORD_ADMITTERS` (`master,release`), approval sources `COORD_APPROVAL_SOURCES` (`web,mobile`),
-lease TTL 30 min, one reminder after 30 min unacked.
+lease TTL 30 min; each delivery is reminded once after 30 min unacked, at most one coalesced reminder
+per thread per 30 min, only while the thread is idle.
 
 ## Setup
 
@@ -209,8 +213,8 @@ for frontends; everything but `state` and `reason` is `null` when unknown). They
   closes it (attention lists it).
 - `pause` refuses claims, admissions, starts and non-control deliveries; acks still work.
   `drain` refuses new claims and admissions; in-flight work can renew and observe.
-- The pump re-reads each delivery or reminder, its actor's thread and the pause state just before each
-  send; held rows never starve deliverable ones.
+- The pump re-reads each delivery, its actor's thread and the pause state just before each ring, under a
+  per-thread lease; held rows never starve deliverable ones. Last ring per thread is in the `wakes` table.
 - A Robob thread in `waiting` is not drained, and a thread that could not be checked is not drained.
 - `reconcile(resource, { as, fence, outcome, evidence })` (CLI `--fence`, required) closes exactly the
   expired claim with that fence. Retrying a fence that was already reconciled returns its historical

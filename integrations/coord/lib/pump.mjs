@@ -1,6 +1,10 @@
-// Delivery pump: pushes pending deliveries to Robob threads through the control API.
-// At-least-once: the clientRequestId is deterministic per (event, recipient), so a resend after a
+// Delivery pump, doorbell model: per Robob thread at most one outstanding wake that points the agent at
+// `coord inbox --unacked`, instead of one queued turn per delivery. A thread is rung only while it is idle
+// (or waiting), and not while an earlier wake is still queued unread; deliveries that arrive meanwhile ride
+// on that wake. Unacked deliveries get at most one coalesced reminder per thread per `unackedAfter`.
+// At-least-once: the clientRequestId is deterministic per (thread, covered deliveries), so a resend after a
 // crash between send and mark replays the first result in Robob instead of posting twice.
+import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -10,6 +14,11 @@ import { clock, gate, DEFAULTS, releaseObserve } from './coord.mjs';
 const PREFIX = '/api/ardud/control';
 const MAX_ATTEMPTS = 8;
 const LEASE = 120;
+const MAX_ROWS = 5000;
+// Thread states that may be rung, and run statuses that mean an earlier wake has not been read yet.
+const RINGABLE = new Set(['idle', 'waiting']);
+const UNREAD = new Set(['queued', 'preparing']);
+const INLINE = new Set(['control', 'blocker']);
 
 export function controlConfig(o = {}) {
   let url = o.url ?? process.env.T3_CONTROL_URL;
@@ -48,49 +57,50 @@ async function call(cfg, method, path, body) {
 
 export const sendToThread = (cfg, threadId, text, clientRequestId) =>
   call(cfg, 'POST', `/threads/${encodeURIComponent(threadId)}/send`, { text, mode: 'queue', clientRequestId });
-export const threadState = async (cfg, threadId) => (await call(cfg, 'GET', `/threads/${encodeURIComponent(threadId)}`)).thread?.state;
+export const threadDetail = async (cfg, threadId) => (await call(cfg, 'GET', `/threads/${encodeURIComponent(threadId)}`)).thread;
+export const threadState = async (cfg, threadId) => (await threadDetail(cfg, threadId))?.state;
 
-export function render(e, recipient) {
-  const meta = [['kind', e.kind], ['work', e.work_id], ['env', e.environment], ['rev', e.expected_revision], ['authority', e.authority_ref], ['reply-to', e.reply_to]]
-    .filter(([, v]) => v !== null && v !== undefined).map(([k, v]) => `${k}: ${v}`).join(' | ');
-  const body = e.body_json ? `\n\n${e.body_json.length > 6000 ? `${e.body_json.slice(0, 6000)}… (coord inbox --as ${recipient} --after ${e.seq - 1})` : e.body_json}` : '';
-  return `[coord ${e.channel_id} #${e.seq} from ${e.sender}] ${e.summary}\n${meta}${body}\n\nThis is a coordination message, not owner approval. ` +
-    `When read, ack it: coord ack --as ${recipient} ${e.seq}`;
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
+const plural = n => `${n} unacked ${n === 1 ? 'delivery' : 'deliveries'}`;
+
+// One wake (or reminder) for every actor bound to the thread. Single-recipient control/blocker events are
+// summarized inline; everything else is read through the inbox.
+export function wakeText(rows, { remind = false } = {}) {
+  const by = new Map();
+  for (const d of rows) (by.get(d.recipient) ?? by.set(d.recipient, []).get(d.recipient)).push(d);
+  const lines = [];
+  for (const [actor, rs] of by) {
+    const open = get("SELECT COUNT(*) n, MIN(event_seq) lo, MAX(event_seq) hi FROM deliveries WHERE recipient=? AND status!='acked'", actor);
+    const n = Math.max(open.n, rs.length);
+    const last = rs.at(-1);
+    const seqs = open.n > 1 ? `seqs ${open.lo}-${open.hi}` : `seq ${last.event_seq}`;
+    lines.push(`[coord${remind ? ' reminder' : ''}] ${plural(n)} for ${actor} (${seqs}, newest: #${last.event_seq} ${last.kind} from ${last.sender}: ${clip(last.summary, 200)}). ` +
+      `Read \`coord inbox --as ${actor} --unacked\`, handle, ack.`);
+    for (const d of rs) if (!remind && INLINE.has(d.kind) && d.fanout === 1) lines.push(`  ${d.kind} #${d.event_seq} from ${d.sender}: ${clip(d.summary, 300)}`);
+  }
+  return `${lines.join('\n')}\n\nThis is a coordination message, not owner approval.`;
 }
+
+const wakeId = (thread, rows, remind) =>
+  `coord:${remind ? 'remind' : 'wake'}:${createHash('sha256').update(JSON.stringify([thread, rows.map(d => d.client_request_id).sort()])).digest('hex')}`;
 
 const paused = d => d.kind !== 'control' && gate(d.environment ? `env:${d.environment}` : undefined).mode === 'pause';
-const DUE = `SELECT d.*, e.kind, e.environment FROM deliveries d JOIN events e ON e.seq=d.event_seq
-  WHERE d.status='pending' AND d.thread_id IS NOT NULL AND COALESCE(d.next_attempt_at,0)<=?`;
+const ROW = `SELECT d.*, e.kind, e.environment, e.sender, e.summary,
+  (SELECT COUNT(*) FROM deliveries x WHERE x.event_seq=d.event_seq) fanout FROM deliveries d JOIN events e ON e.seq=d.event_seq`;
+const DUE = `${ROW} WHERE d.status='pending' AND d.thread_id IS NOT NULL AND COALESCE(d.next_attempt_at,0)<=?`;
 // Sent, unacked, not yet reminded, past the threshold (`?` = now - unackedAfter), and not leased by another pump.
-const REMIND = `SELECT d.*, e.kind, e.environment FROM deliveries d JOIN events e ON e.seq=d.event_seq
-  WHERE d.status='sent' AND d.reminded=0 AND d.sent_at<=? AND COALESCE(d.next_attempt_at,0)<=?`;
-
-// Reserves one row right before its send: re-reads it, its actor's current thread and the effective pause,
-// then bumps gen. The result write must match that gen, so an ack, retarget or newer reservation wins.
-// Initial sends must still target the row's thread; reminders go to the actor's current thread.
-function reserve(seq, recipient, { remind = false, unackedAfter } = {}) {
-  return tx(() => {
-    const t = clock.now();
-    const d = remind ? get(`${REMIND} AND d.event_seq=? AND d.recipient=?`, t - unackedAfter, t, seq, recipient)
-      : get(`${DUE} AND d.event_seq=? AND d.recipient=?`, t, seq, recipient);
-    if (!d || paused(d)) return null;
-    const a = get('SELECT * FROM actors WHERE id=?', d.recipient);
-    if (a?.kind !== 'thread' || !a.thread_id || (!remind && a.thread_id !== d.thread_id)) return null;
-    run(`UPDATE deliveries SET ${remind ? '' : 'attempts=attempts+1, '}next_attempt_at=?, gen=gen+1 WHERE event_seq=? AND recipient=?`, t + LEASE, seq, recipient);
-    return { ...get(`SELECT d.*, e.kind, e.environment FROM deliveries d JOIN events e ON e.seq=d.event_seq WHERE d.event_seq=? AND d.recipient=?`, seq, recipient), target: a.thread_id };
-  });
-}
+const REMIND = `${ROW} WHERE d.status='sent' AND d.reminded=0 AND d.sent_at<=? AND COALESCE(d.next_attempt_at,0)<=?`;
 
 // Due rows in order, skipping held (paused) rows so they cannot starve deliverable ones.
-function candidates(limit, seq, { base = DUE, args = () => [clock.now()] } = {}) {
+function candidates(base, args) {
   const out = [];
   let held = 0, cur = [0, ''];
   for (;;) {
-    const page = all(`${base} AND (d.event_seq>? OR (d.event_seq=? AND d.recipient>?)) AND (? IS NULL OR d.event_seq=?)
-      ORDER BY d.event_seq, d.recipient LIMIT 200`, ...args(), cur[0], cur[0], cur[1], seq, seq);
+    const page = all(`${base} AND (d.event_seq>? OR (d.event_seq=? AND d.recipient>?)) ORDER BY d.event_seq, d.recipient LIMIT 200`,
+      ...args(), cur[0], cur[0], cur[1]);
     for (const d of page) {
       if (paused(d)) held++;
-      else if (out.length < limit) out.push(d);
+      else if (out.length < MAX_ROWS) out.push(d);
     }
     if (page.length < 200) break;
     cur = [page.at(-1).event_seq, page.at(-1).recipient];
@@ -98,45 +108,132 @@ function candidates(limit, seq, { base = DUE, args = () => [clock.now()] } = {})
   return { rows: out, held };
 }
 
-export async function deliver({ cfg, limit = 50, seq, send = sendToThread, unackedAfter = DEFAULTS.unackedAfter } = {}) {
-  const res = { sent: [], failed: [], retry: [], reminded: [], held: 0, skipped: 0 };
-  cfg ??= controlConfig();
-  const { rows, held } = candidates(limit, seq == null ? null : Number(seq));
-  res.held = held;
-  for (const c of rows) {
-    const d = reserve(c.event_seq, c.recipient);
-    if (!d) { res.skipped++; continue; }
-    const e = get('SELECT * FROM events WHERE seq=?', d.event_seq);
-    try {
-      const r = await send(cfg, d.thread_id, render(e, d.recipient), d.client_request_id);
-      const u = run(`UPDATE deliveries SET status='sent', sent_at=?, message_id=?, run_id=?, last_error=NULL, next_attempt_at=NULL
-        WHERE event_seq=? AND recipient=? AND status='pending' AND gen=?`, clock.now(), r?.messageId ?? null, r?.runId ?? null, d.event_seq, d.recipient, d.gen);
-      if (Number(u.changes)) res.sent.push({ seq: d.event_seq, recipient: d.recipient, messageId: r?.messageId ?? null, delivery: r?.delivery ?? null });
-    } catch (err) {
+// Rows grouped by the recipient actor's current thread. Initial sends must still target the row's thread.
+function byThread(rows, remind) {
+  const m = new Map();
+  for (const d of rows) {
+    const a = get('SELECT * FROM actors WHERE id=?', d.recipient);
+    if (a?.kind !== 'thread' || !a.thread_id || (!remind && a.thread_id !== d.thread_id)) continue;
+    (m.get(a.thread_id) ?? m.set(a.thread_id, []).get(a.thread_id)).push(d);
+  }
+  return m;
+}
+
+// Reserves a thread's rows right before a ring: takes the thread lease (one ring in flight per thread),
+// re-reads each row, its actor's thread and the pause, then bumps gen. Result writes must match that gen,
+// so an ack, retarget or newer reservation wins. A ring of the same kind that never settled keeps its
+// clientRequestId, so a retry after a crash replays it in Robob.
+function reserve(thread, rows, { remind = false, unackedAfter, coalesce = false } = {}) {
+  return tx(() => {
+    const t = clock.now();
+    const w = get('SELECT * FROM wakes WHERE thread_id=?', thread);
+    if (w?.lease_until > t) return null;
+    if (remind && w?.rung_at > t - unackedAfter) return null;
+    const out = [];
+    for (const c of rows) {
+      const d = remind ? get(`${REMIND} AND d.event_seq=? AND d.recipient=?`, t - unackedAfter, t, c.event_seq, c.recipient)
+        : get(`${DUE} AND d.event_seq=? AND d.recipient=?`, t, c.event_seq, c.recipient);
+      if (!d || paused(d)) continue;
+      const a = get('SELECT * FROM actors WHERE id=?', d.recipient);
+      if (a?.kind !== 'thread' || a.thread_id !== thread || (!remind && d.thread_id !== thread)) continue;
+      run(`UPDATE deliveries SET ${remind ? '' : 'attempts=attempts+1, '}next_attempt_at=?, gen=gen+1 WHERE event_seq=? AND recipient=?`, t + LEASE, d.event_seq, d.recipient);
+      out.push({ ...d, gen: d.gen + 1, attempts: d.attempts + (remind ? 0 : 1) });
+    }
+    if (!out.length) return null;
+    // An unsettled ring that already covered every reserved row is replayed under its id; anything new
+    // gets a fresh ring.
+    const prev = w?.inflight ? JSON.parse(w.inflight) : null;
+    const keys = out.map(d => d.client_request_id);
+    const reuse = prev && prev.id.startsWith(`coord:${remind ? 'remind' : 'wake'}:`) && keys.every(k => prev.rows.includes(k));
+    const inflight = coalesce ? w?.inflight ?? null : JSON.stringify(reuse ? prev : { id: wakeId(thread, out, remind), rows: keys });
+    run(`INSERT INTO wakes (thread_id, lease_until, inflight) VALUES (?,?,?)
+      ON CONFLICT(thread_id) DO UPDATE SET lease_until=excluded.lease_until, inflight=excluded.inflight`, thread, t + LEASE, inflight);
+    out.id = inflight && JSON.parse(inflight).id;
+    return out;
+  });
+}
+
+// Marks reserved rows sent (or reminded) by the ring `r`; `ring` also records it as the thread's last ring.
+function settle(thread, rows, r, { remind = false, ring } = {}, res) {
+  tx(() => {
+    const t = clock.now();
+    for (const d of rows) {
+      const u = remind
+        ? run("UPDATE deliveries SET reminded=1, next_attempt_at=NULL WHERE event_seq=? AND recipient=? AND status='sent' AND gen=?", d.event_seq, d.recipient, d.gen)
+        : run(`UPDATE deliveries SET status='sent', sent_at=?, message_id=?, run_id=?, last_error=NULL, next_attempt_at=NULL
+            WHERE event_seq=? AND recipient=? AND status='pending' AND gen=?`, t, r?.messageId ?? null, r?.runId ?? null, d.event_seq, d.recipient, d.gen);
+      if (Number(u.changes)) (remind ? res.reminded : res.sent).push({ seq: d.event_seq, recipient: d.recipient, ...(remind ? {} : { messageId: r?.messageId ?? null, delivery: r?.delivery ?? null }) });
+    }
+    if (ring) run(`UPDATE wakes SET kind=?, client_request_id=?, covered=?, message_id=?, run_id=?, delivery=?, rung_at=?, lease_until=NULL, inflight=NULL WHERE thread_id=?`,
+      ring.kind, ring.id, JSON.stringify(rows.map(d => [d.event_seq, d.recipient])), r?.messageId ?? null, r?.runId ?? null, r?.delivery ?? null, t, thread);
+    else run('UPDATE wakes SET lease_until=NULL WHERE thread_id=?', thread);
+  });
+}
+
+function fail(thread, rows, err, { remind = false } = {}, res) {
+  tx(() => {
+    let fatalAll = !remind;
+    for (const d of rows) {
+      if (remind) {
+        run('UPDATE deliveries SET next_attempt_at=? WHERE event_seq=? AND recipient=? AND gen=?', clock.now() + 300, d.event_seq, d.recipient, d.gen);
+        res.retry.push({ seq: d.event_seq, recipient: d.recipient, reminder: true, error: err.message });
+        continue;
+      }
       const fatal = err.status === 404 || err.status === 400 || d.attempts >= MAX_ATTEMPTS;
+      fatalAll &&= fatal;
       const back = Math.min(3600, 30 * 2 ** (d.attempts - 1));
       run(`UPDATE deliveries SET status=?, last_error=?, next_attempt_at=? WHERE event_seq=? AND recipient=? AND status='pending' AND gen=?`,
         fatal ? 'failed' : 'pending', `${err.code ?? 'error'}: ${err.message}`.slice(0, 500), fatal ? null : clock.now() + back, d.event_seq, d.recipient, d.gen);
       (fatal ? res.failed : res.retry).push({ seq: d.event_seq, recipient: d.recipient, error: err.message });
     }
+    run(`UPDATE wakes SET lease_until=NULL${fatalAll ? ', inflight=NULL' : ''} WHERE thread_id=?`, thread);
+  });
+}
+
+async function ring(cfg, send, thread, rows, opts, res) {
+  const kind = opts.remind ? 'reminder' : 'wake';
+  const id = rows.id;
+  try {
+    const r = await send(cfg, thread, wakeText(rows, opts), id);
+    settle(thread, rows, r, { ...opts, ring: { kind, id } }, res);
+    res.wakes.push({ thread, kind, deliveries: rows.length, delivery: r?.delivery ?? null });
+  } catch (err) {
+    fail(thread, rows, err, opts, res);
   }
-  if (!seq) {
-    // One reminder for a delivery left unacked; after that it only shows in `coord attention`.
-    // Same discipline as initial sends: eligible rows before the limit, fresh re-read and gen per send.
-    const { rows: due } = candidates(limit, null, { base: REMIND, args: () => [clock.now() - unackedAfter, clock.now()] });
-    for (const c of due) {
-      const d = reserve(c.event_seq, c.recipient, { remind: true, unackedAfter });
-      if (!d) { res.skipped++; continue; }
-      try {
-        await send(cfg, d.target, `[coord reminder #${d.event_seq}] still unacked. Read it with coord inbox --as ${d.recipient} --unacked, then: coord ack --as ${d.recipient} ${d.event_seq}`,
-          `${d.client_request_id}:remind`);
-        const u = run("UPDATE deliveries SET reminded=1, next_attempt_at=NULL WHERE event_seq=? AND recipient=? AND status='sent' AND gen=?", d.event_seq, d.recipient, d.gen);
-        if (Number(u.changes)) res.reminded.push({ seq: d.event_seq, recipient: d.recipient });
-      } catch (err) {
-        run("UPDATE deliveries SET next_attempt_at=? WHERE event_seq=? AND recipient=? AND gen=?", clock.now() + 300, d.event_seq, d.recipient, d.gen);
-        res.retry.push({ seq: d.event_seq, recipient: d.recipient, reminder: true, error: err.message });
-      }
+}
+
+// `seq` limits the run to threads with that delivery pending (the post-time nudge); it sends no reminders.
+export async function deliver({ cfg, limit = 50, seq, send = sendToThread, look = threadDetail, unackedAfter = DEFAULTS.unackedAfter } = {}) {
+  const res = { sent: [], failed: [], retry: [], reminded: [], wakes: [], held: 0, skipped: 0 };
+  cfg ??= controlConfig();
+  const one = seq == null ? null : Number(seq);
+  const { rows, held } = candidates(DUE, () => [clock.now()]);
+  res.held = held;
+  const due = byThread(rows, false);
+  if (one != null) for (const [t, rs] of due) if (!rs.some(d => d.event_seq === one)) due.delete(t);
+  const stale = one == null ? byThread(candidates(REMIND, () => [clock.now() - unackedAfter, clock.now()]).rows, true) : new Map();
+  for (const thread of [...new Set([...due.keys(), ...stale.keys()])].slice(0, limit)) {
+    const pend = due.get(thread) ?? [];
+    let info;
+    try {
+      info = await look(cfg, thread);
+    } catch (err) {
+      const r = pend.length ? reserve(thread, pend) : null;
+      if (r) fail(thread, r, err, {}, res); else res.skipped++;
+      continue;
     }
+    const w = get('SELECT * FROM wakes WHERE thread_id=?', thread);
+    if (w?.run_id && (info?.recentRuns ?? []).some(x => x.runId === w.run_id && UNREAD.has(x.status))) {
+      // The last wake is still queued unread; it will show these too.
+      const r = pend.length ? reserve(thread, pend, { coalesce: true }) : null;
+      if (r) settle(thread, r, { messageId: w.message_id, runId: w.run_id, delivery: 'coalesced' }, {}, res); else res.skipped++;
+      continue;
+    }
+    if (!RINGABLE.has(info?.state)) { res.skipped++; continue; }
+    const r = pend.length ? reserve(thread, pend) : null;
+    if (r) { await ring(cfg, send, thread, r, {}, res); continue; }
+    const s = stale.has(thread) ? reserve(thread, stale.get(thread), { remind: true, unackedAfter }) : null;
+    if (s) await ring(cfg, send, thread, s, { remind: true }, res); else res.skipped++;
   }
   return res;
 }

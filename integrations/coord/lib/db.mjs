@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS deliveries (
   gen INTEGER NOT NULL DEFAULT 0,             -- bumped by every reservation and retarget; result writes must match it
   PRIMARY KEY (event_seq, recipient));
 CREATE INDEX IF NOT EXISTS deliveries_status ON deliveries (status, next_attempt_at);
+-- Doorbell: the last wake or reminder rung per Robob thread (one outstanding ring per thread).
+CREATE TABLE IF NOT EXISTS wakes (
+  thread_id TEXT PRIMARY KEY, kind TEXT, client_request_id TEXT, covered TEXT, message_id TEXT, run_id TEXT,
+  delivery TEXT, rung_at INTEGER, lease_until INTEGER,
+  inflight TEXT);                              -- JSON {id, rows} of a ring not yet settled; replayed on retry
 CREATE TABLE IF NOT EXISTS fences (resource TEXT PRIMARY KEY, fence INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS claims (
   resource TEXT PRIMARY KEY, owner TEXT NOT NULL, fence INTEGER NOT NULL, state TEXT NOT NULL,

@@ -17,10 +17,13 @@ export function fresh() {
 export const advance = s => { t0 += s; };
 
 // Stand-in for the Robob control API. Like Robob, a repeated clientRequestId replays the first result.
+// `runs` maps runId -> status; thread detail reports the thread's runs as `recentRuns`, newest first.
 export async function stubControl({ states = {} } = {}) {
   const sends = [];
   const byRequest = new Map();
   const messages = {};
+  const runs = {};
+  const runThread = {};
   let failNext = 0;
   const server = createServer((req, res) => {
     let raw = '';
@@ -32,14 +35,20 @@ export async function stubControl({ states = {} } = {}) {
       if (!m) return reply(404, { ok: false, error: { code: 'not_found', message: req.url } });
       const thread = decodeURIComponent(m[1]);
       if (!(thread in states)) return reply(404, { ok: false, error: { code: 'not_found', message: `no thread ${thread}` } });
-      if (!m[2]) return reply(200, { ok: true, thread: { threadId: thread, state: states[thread] } });
+      if (!m[2]) {
+        const recentRuns = Object.keys(runs).filter(r => runThread[r] === thread).reverse().slice(0, 5).map(runId => ({ runId, status: runs[runId] }));
+        return reply(200, { ok: true, thread: { threadId: thread, state: states[thread], recentRuns } });
+      }
       const body = JSON.parse(raw);
       sends.push({ thread, ...body });
       if (failNext > 0) { failNext--; return reply(503, { ok: false, error: { code: 'unavailable', message: 'down' } }); }
       const id = `ardud-control:send:${thread}:${encodeURIComponent(body.clientRequestId)}`;
       if (!byRequest.has(id)) {
         const delivery = states[thread] === 'running' && body.mode === 'queue' ? 'queued' : 'started';
-        byRequest.set(id, { messageId: id, runId: `run-${byRequest.size + 1}`, delivery });
+        const runId = `run-${byRequest.size + 1}`;
+        byRequest.set(id, { messageId: id, runId, delivery });
+        runs[runId] = delivery === 'queued' ? 'queued' : 'completed';
+        runThread[runId] = thread;
         (messages[thread] ??= []).push({ messageId: id, text: body.text });
       }
       reply(200, { ok: true, threadId: thread, ...byRequest.get(id) });
@@ -47,7 +56,7 @@ export async function stubControl({ states = {} } = {}) {
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const cfg = { url: `http://127.0.0.1:${server.address().port}`, token: 'test-token' };
-  return { cfg, sends, messages, states, failNext: n => { failNext = n; }, close: () => new Promise(r => server.close(r)) };
+  return { cfg, sends, messages, states, runs, failNext: n => { failNext = n; }, close: () => new Promise(r => server.close(r)) };
 }
 
 export const SHA0 = '0'.repeat(40);

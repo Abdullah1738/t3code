@@ -263,31 +263,35 @@ test('#17 replaying the original release request stays idempotent after start an
   assert.throws(() => svc('i17', { sha: SHA2 }), e => e.code === 'conflict');
 });
 
-test('#18 the pump re-reads each row before sending: pause, ack and retarget during a batch are honoured', async () => {
+test('#18 the pump re-reads each row before ringing: ack and retarget during a ring are honoured', async () => {
   const s1 = C.post('ops', { as: 'crw', kind: 'status', key: 'p1', summary: 'one', to: ['master'] }).seq;
   const s2 = C.post('ops', { as: 'crw', kind: 'status', key: 'p2', summary: 'two', to: ['master'] }).seq;
   const s3 = C.post('ops', { as: 'crw', kind: 'status', key: 'p3', summary: 'three', to: ['master'] }).seq;
   const sent = [];
   let n = 0;
   const send = async (cfg, thread, text) => {
-    sent.push([thread, text.slice(0, 20)]);
+    sent.push([thread, text]);
     if (++n === 1) { C.ack('master', [s2]); C.actorSet('master', { thread: 'T-shared' }); }
     return { messageId: `m${n}` };
   };
   const d = await deliver({ cfg: stub.cfg, send });
-  assert.equal(sent.length, 2, 'the acked second event was not sent');
-  assert.equal(sent[1][0], 'T-shared', 'third went to the rebound thread');
-  assert.deepEqual(d.sent.map(x => x.seq), [s3], 'the first was rebound mid-send, so it is not marked sent');
+  assert.equal(sent.length, 1, 'one wake for all three');
+  assert.match(sent[0][1], new RegExp(`3 unacked deliveries for master \\(seqs ${s1}-${s3}`));
+  assert.deepEqual(d.sent, [], 'acked or rebound mid-ring, so nothing is marked sent');
   const again = await deliver({ cfg: stub.cfg, send });
-  assert.deepEqual(again.sent.map(x => x.seq), [s1]);
-  assert.equal(sent.at(-1)[0], 'T-shared', 'the rebound first event is resent to the new thread');
+  assert.deepEqual(again.sent.map(x => x.seq), [s1, s3]);
+  assert.equal(sent.at(-1)[0], 'T-shared', 'the rebound deliveries ring the new thread');
+  assert.match(sent.at(-1)[1], new RegExp(`2 unacked deliveries for master \\(seqs ${s1}-${s3}`));
   const t1 = C.post('ops', { as: 'crw', kind: 'status', key: 'p4', summary: 'four', to: ['master'] }).seq;
-  C.post('ops', { as: 'crw', kind: 'status', key: 'p5', summary: 'five', to: ['master'] });
+  const t2 = C.post('ops', { as: 'crw', kind: 'status', key: 'p5', summary: 'five', to: ['master'] }).seq;
   n = 0;
   const pausing = async () => { if (++n === 1) C.setMode('pause', { as: 'master', reason: 'r' }); return {}; };
   const d2 = await deliver({ cfg: stub.cfg, send: pausing });
   assert.equal(n, 1);
-  assert.deepEqual(d2.sent.map(x => x.seq), [t1]);
+  assert.deepEqual(d2.sent.map(x => x.seq), [t1, t2], 'both rode the one wake reserved before the pause');
+  C.post('ops', { as: 'crw', kind: 'status', key: 'p6', summary: 'six', to: ['master'] });
+  assert.equal((await deliver({ cfg: stub.cfg, send: pausing })).held, 1);
+  assert.equal(n, 1, 'nothing rings while paused');
 });
 
 test('#19 held rows under pause do not starve deliverable control events or other environments', async () => {
@@ -308,7 +312,9 @@ test('#20 delivery ids are unambiguous for colon-bearing event keys and actor id
   assert.notEqual(C.deliveryId('operation:cell', 'a'), C.deliveryId('operation', 'cell:a'));
   assert.match(C.deliveryId('x', 'y'), /^coord:[0-9a-f]{64}$/);
   await deliver({ cfg: stub.cfg });
-  assert.equal(stub.messages['T-shared'].length, 2);
+  assert.equal(stub.messages['T-shared'].length, 1, 'one wake per thread');
+  assert.match(stub.messages['T-shared'][0].text, /for a \(seq/);
+  assert.match(stub.messages['T-shared'][0].text, /for cell:a \(seq/);
 });
 
 test('#21 QA key reuse with a different binding is a conflict', () => {
