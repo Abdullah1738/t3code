@@ -487,6 +487,8 @@ if (isRobobMobileBuild && !isIosPersonalTeamBuild) {
   );
 }
 
+const robobSplashIcon = "./assets/robob-splash-icon.png";
+
 function withRobobBranding(base: ExpoConfig): ExpoConfig {
   const rebrand = (value: unknown) =>
     typeof value === "string" ? value.replaceAll("T3 Code", "Robob") : value;
@@ -518,16 +520,31 @@ function withRobobBranding(base: ExpoConfig): ExpoConfig {
     // aps-environment, which the wildcard dev profile can't sign.
     plugins: [
       "./plugins/withoutIosPersonalTeamCapabilities.cjs",
-      ...(base.plugins ?? []).map((plugin): NonNullable<ExpoConfig["plugins"]>[number] =>
-        Array.isArray(plugin) && (plugin[0] === "expo-audio" || plugin[0] === "expo-camera")
-          ? [
-              plugin[0],
-              Object.fromEntries(
-                Object.entries(plugin[1] ?? {}).map(([key, value]) => [key, rebrand(value)]),
-              ),
-            ]
-          : plugin,
-      ),
+      ...(base.plugins ?? []).map((plugin): NonNullable<ExpoConfig["plugins"]>[number] => {
+        if (!Array.isArray(plugin)) return plugin;
+        if (plugin[0] === "expo-audio" || plugin[0] === "expo-camera") {
+          return [
+            plugin[0],
+            Object.fromEntries(
+              Object.entries(plugin[1] ?? {}).map(([key, value]) => [key, rebrand(value)]),
+            ),
+          ];
+        }
+        if (plugin[0] === "expo-splash-screen") {
+          // The raw 1024 icon has square corners; the splash uses a pre-rounded copy.
+          const splash = plugin[1] ?? {};
+          return [
+            plugin[0],
+            {
+              ...splash,
+              image: robobSplashIcon,
+              imageWidth: 180,
+              dark: { ...splash.dark, image: robobSplashIcon },
+            },
+          ];
+        }
+        return plugin;
+      }),
     ],
   };
 }
