@@ -234,7 +234,11 @@ Evidence fails closed: anything not positively identified is `unknown`, and the 
   A run's latest attempt that provably changed nothing (it never reached `Validate release tag`;
   for frontends, ran no deploy job) does not erase that run's history: its earlier attempts are read
   back, and the latest one that did something decides that run, at that attempt's own time. An attempt
-  whose effect cannot be told makes the runtime `unknown`; an older run is never reported instead. A newer unreadable,
+  whose effect cannot be told makes the runtime `unknown`; an older run is never reported instead.
+  Before a runtime is reported `known`, every run discovery classified (the winner, runs skipped as
+  no-ops, runs placed at an earlier attempt) is re-read by id; if any moved to a new attempt, is running
+  again, or cannot be read, the result is `unknown` and the reason names the run. Nothing is cached
+  across calls. A newer unreadable,
   unfinished or failed run for the binary makes it `unknown`. Jobs are read per attempt; skipped jobs
   are not log-fetched.
 - Service observation trusts push-tag `release.yml` runs only: the run's `head_branch` must be the

@@ -127,14 +127,14 @@ async function latestAttempt({ gh, repo, workflows, identify, maxPages = MAX_PAG
       decided = null;
       for (const r of [...seen.values()].sort((a, b) => when(b) - when(a) || b.id - a.id)) {
         if (r.status !== 'completed') { decided = { r, out: unknown(`run ${r.id} is ${r.status}`) }; break; }
-        let m = memo.get(r._key);
+        let m = memo.get(r._key)?.m;
         if (!m) {
           try { m = await identify(r); } catch (e) { m = { unknown: `run ${r.id} attempt ${r.run_attempt ?? 1} unreadable: ${e.message}` }; }
-          memo.set(r._key, m);
+          memo.set(r._key, { r, m });
         }
         if (m.at !== undefined && m.at < attemptTime(r) && !eff.has(r._key)) { eff.set(r._key, m.at); again = true; break; }
         if (m.unknown) { decided = { r, out: unknown(m.unknown) }; break; }
-        if (m.match) { decided = { r, out: { state: 'known', r, attempt: m.attempt ?? r.run_attempt ?? 1, data: m.data } }; break; }
+        if (m.match) { decided = { r, out: { state: 'known', r, attempt: m.attempt ?? r.run_attempt ?? 1, data: m.data, considered: () => [...memo.values()].map(x => x.r) } }; break; }
       }
     }
     const horizon = decided ? when(decided.r) - RERUN_WINDOW : -Infinity;
@@ -155,6 +155,19 @@ async function latestAttempt({ gh, repo, workflows, identify, maxPages = MAX_PAG
 async function recheck(gh, repo, r) {
   const cur = await runInfo(repo, r.id, { gh });
   return cur?.status === 'completed' && (cur.run_attempt ?? 1) === (r.run_attempt ?? 1);
+}
+
+// Before a runtime is reported known, every run discovery classified (the winner, runs skipped as no-ops,
+// runs placed earlier than their latest attempt) is re-read by id: each must still be completed at the
+// attempt discovery saw. Returns null, or the reason the result must be unknown. Nothing is cached.
+async function recheckConsidered(gh, repo, found) {
+  const runs = new Map([[found.r.id, found.r], ...found.considered().map(r => [r.id, r])]);
+  for (const r of runs.values()) {
+    let ok;
+    try { ok = await recheck(gh, repo, r); } catch (e) { return `run ${r.id} could not be re-read: ${e.message}`; }
+    if (!ok) return `run ${r.id} moved past attempt ${r.run_attempt ?? 1} or is running again while discovery read it`;
+  }
+  return null;
 }
 
 const shape = (state, o = {}) => ({ state, sha: o.sha ?? null, tag: o.tag ?? null, digest: o.digest ?? null,
@@ -178,7 +191,8 @@ export async function serviceRuntime({ binary, env = 'dev', gh = ghText, maxPage
   }).catch(e => unknown(e.message));
   if (found.state !== 'known') return shape('unknown', { reason: found.reason });
   const { r, data, attempt } = found;
-  if (!(await recheck(gh, DEVOPS, r).catch(() => false))) return shape('unknown', { reason: `run ${r.id} changed while reading` });
+  const moved = await recheckConsidered(gh, DEVOPS, found);
+  if (moved) return shape('unknown', { reason: moved });
   return shape('known', { sha: data.git_sha, tag: data.tag, digest: data.digest, run: String(r.id), attempt });
 }
 
@@ -210,7 +224,8 @@ export async function frontendRuntime({ repo, env = 'dev', gh = ghText } = {}) {
     }),
   }).catch(e => unknown(e.message));
   if (found.state !== 'known') return shape('unknown', { reason: found.reason });
-  if (!(await recheck(gh, repo, found.r).catch(() => false))) return shape('unknown', { reason: `run ${found.r.id} changed while reading` });
+  const moved = await recheckConsidered(gh, repo, found);
+  if (moved) return shape('unknown', { reason: moved });
   return shape('known', { sha: found.data.sha, run: String(found.r.id), attempt: found.attempt });
 }
 
