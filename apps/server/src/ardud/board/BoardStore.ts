@@ -135,10 +135,10 @@ export class BoardStore extends Context.Service<
     readonly existingThreads: (
       threadIds: ReadonlyArray<string>,
     ) => Effect.Effect<ReadonlySet<string>, BoardStoreError>;
-    /** Threads whose latest prompt came from a scheduled task. */
+    /** Threads whose latest prompt came from a scheduled task, with that task's id. */
     readonly scheduledThreads: (
       threadIds: ReadonlyArray<string>,
-    ) => Effect.Effect<ReadonlySet<string>, BoardStoreError>;
+    ) => Effect.Effect<ReadonlyMap<string, string>, BoardStoreError>;
   }
 >()("t3/ardud/board/BoardStore") {}
 
@@ -286,17 +286,17 @@ const make = Effect.gen(function* () {
   const scheduledThreads = (threadIds: ReadonlyArray<string>) =>
     chunked(
       threadIds,
-      (chunk) => sql<{ readonly thread_id: string }>`
-        SELECT thread_id FROM (
-          SELECT thread_id, payload_json,
+      (chunk) => sql<{ readonly thread_id: string; readonly task_id: string }>`
+        SELECT thread_id, task_id FROM (
+          SELECT thread_id, json_extract(payload_json, '$.scheduledTaskId') AS task_id,
             ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY updated_at DESC, message_id DESC) AS rank
           FROM orchestration_v2_projection_messages
           WHERE thread_id IN ${sql.in(chunk)} AND role = 'user'
         )
-        WHERE rank = 1 AND json_extract(payload_json, '$.scheduledTaskId') IS NOT NULL
+        WHERE rank = 1 AND task_id IS NOT NULL
       `,
     ).pipe(
-      Effect.map((rows) => new Set(rows.map((row) => row.thread_id))),
+      Effect.map((rows) => new Map(rows.map((row) => [row.thread_id, String(row.task_id)]))),
       Effect.mapError(fail("read scheduled prompts")),
     );
 

@@ -50,6 +50,35 @@ it.layer(TestLayer)("session board store", (it) => {
     }),
   );
 
+  it.effect("reads the scheduled task behind each thread's latest prompt", () =>
+    Effect.gen(function* () {
+      const store = yield* BoardStore.BoardStore;
+      const sql = yield* SqlClient.SqlClient;
+      const columns = yield* sql<{ readonly name: string; readonly notnull: number }>`
+        PRAGMA table_info(orchestration_v2_projection_messages)
+      `;
+      const message = (threadId: string, id: string, at: string, payload: object) => {
+        const values: Record<string, unknown> = {
+          message_id: id,
+          thread_id: threadId,
+          role: "user",
+          updated_at: at,
+          created_at: at,
+          payload_json: JSON.stringify(payload),
+        };
+        for (const column of columns) {
+          if (column.notnull === 1 && !(column.name in values)) values[column.name] = "x";
+        }
+        return sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert(values)}`;
+      };
+      yield* message("t-run", "m1", "2026-10-03T00:00:00.000Z", { scheduledTaskId: "task-a" });
+      yield* message("t-later", "m2", "2026-10-03T00:00:00.000Z", { scheduledTaskId: "task-a" });
+      yield* message("t-later", "m3", "2026-10-03T00:01:00.000Z", {});
+      const scheduled = yield* store.scheduledThreads(["t-run", "t-later", "t-none"]);
+      assert.deepStrictEqual([...scheduled], [["t-run", "task-a"]]);
+    }),
+  );
+
   it.effect("reads the OpenCode import mapping", () =>
     Effect.gen(function* () {
       const store = yield* BoardStore.BoardStore;

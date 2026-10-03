@@ -412,6 +412,84 @@ describe("session board model", () => {
     expect(f.entries()).toMatchObject([{ status: "deleted" }]);
   });
 
+  describe("scheduled runs", () => {
+    const run = (f: ReturnType<typeof fixture>, threadId: string, at: number, task = "task-a") => {
+      f.add(threadId);
+      f.prompt(threadId, at, { scheduledHint: true });
+      f.model.schedules.set(threadId, task);
+    };
+    const supersede = (f: ReturnType<typeof fixture>) => {
+      const rows = f.model.supersededRuns();
+      for (const row of rows) f.model.rows.set(row.threadId, row);
+      return rows.map((row) => row.threadId);
+    };
+
+    it("keeps one card per schedule and completes the older runs like a review", () => {
+      const f = fixture();
+      run(f, "t_1", 120);
+      run(f, "t_2", 140);
+      run(f, "t_other", 130, "task-b");
+      const token = f.token("t_1");
+      expect(supersede(f)).toEqual(["t_1"]);
+      expect(Object.fromEntries(f.lanes())).toEqual({ t_2: "scheduled", t_other: "scheduled" });
+      expect(f.model.rows.get("t_1")).toMatchObject({
+        reviewed: true,
+        pending: false,
+        completedFrom: "scheduled",
+        workRevision: token,
+      });
+      // Undo still works with the token the card last showed.
+      expect(f.act("restore", "t_1", token)._tag).toBe("commit");
+      expect(supersede(f)).toEqual([]);
+      expect(f.lanes().map(([id]) => id)).toContain("t_1");
+      // The schedule's next run replaces the restored card too.
+      f.tick(1_000);
+      run(f, "t_3", 3_000);
+      expect(supersede(f).sort()).toEqual(["t_1", "t_2"]);
+      expect(Object.fromEntries(f.lanes())).toEqual({ t_3: "scheduled", t_other: "scheduled" });
+    });
+
+    it("leaves an older run that is still running or waiting on a question", () => {
+      const f = fixture();
+      run(f, "t_busy", 110);
+      run(f, "t_asks", 120);
+      run(f, "t_new", 140);
+      f.status("t_busy", "working");
+      f.attention("t_asks", "question");
+      expect(supersede(f)).toEqual([]);
+      expect(Object.fromEntries(f.lanes())).toEqual({
+        t_busy: "running",
+        t_asks: "scheduled",
+        t_new: "scheduled",
+      });
+      f.status("t_busy", "idle");
+      f.attention("t_asks", null);
+      expect(supersede(f).sort()).toEqual(["t_asks", "t_busy"]);
+      expect(f.lanes()).toEqual([["t_new", "scheduled"]]);
+    });
+
+    it("keeps an older run that shows as running after a restart until it is read", () => {
+      const f = fixture();
+      run(f, "t_1", 120);
+      run(f, "t_2", 140);
+      f.model.live.delete("t_1");
+      expect(supersede(f)).toEqual([]);
+    });
+
+    it("never touches backlog cards, ungrouped cards or the newest run", () => {
+      const f = fixture();
+      run(f, "t_1", 120);
+      f.act("backlog", "t_1");
+      f.add("t_plain");
+      f.prompt("t_plain", 125);
+      f.model.schedules.set("t_plain", null);
+      run(f, "t_2", 140);
+      expect(supersede(f)).toEqual([]);
+      expect(f.model.rows.get("t_1")).toMatchObject({ backlog: true, completedFrom: null });
+      expect(f.lanes().map(([id]) => id)).toEqual(expect.arrayContaining(["t_plain", "t_2"]));
+    });
+  });
+
   describe("iMessage threads", () => {
     it("never makes an iMessage root or its subagents pending or visible", () => {
       const f = fixture();

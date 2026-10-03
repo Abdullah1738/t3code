@@ -172,37 +172,58 @@ const make = Effect.gen(function* () {
       Effect.mapError((cause) => new BoardUnavailableError({ cause })),
     );
 
-  /** Applies observations; call under the lock. */
+  /**
+   * Applies observations, then completes runs a newer run of their schedule
+   * replaced. Call under the lock; returns the completed thread ids so the
+   * caller can settle them in t3 once the lock is released.
+   */
   const applyObservations = (observations: ReadonlyArray<Observation>) =>
     Effect.gen(function* () {
       const patches = observations.map((observation) => ({
         observation,
         patch: model.observe(observation),
       }));
-      // New work whose prompt may have come from a scheduled task.
-      const creating = patches
-        .filter(({ patch }) => {
-          const row = patch.rows[0];
-          return (
-            row !== undefined &&
-            !row.scheduled &&
-            (patch.creates || row.promptAt !== model.rows.get(row.threadId)?.promptAt)
-          );
+      // New prompts may come from a scheduled task, and a scheduled card still
+      // on the board when first seen needs its task id to group by.
+      const lookup = patches
+        .filter(({ observation, patch }) => {
+          if (observation.deleted === true) return false;
+          const previous = model.rows.get(observation.threadId);
+          const row = patch.rows[0] ?? previous;
+          if (row === undefined) return false;
+          const prompted =
+            patch.rows[0] !== undefined && (patch.creates || row.promptAt !== previous?.promptAt);
+          return prompted || (row.scheduled && !row.reviewed && !model.schedules.has(row.threadId));
         })
         .map(({ observation }) => observation.threadId);
       const scheduled =
-        creating.length === 0
-          ? new Set<string>()
+        lookup.length === 0
+          ? new Map<string, string>()
           : yield* store
-              .scheduledThreads(creating)
+              .scheduledThreads(lookup)
               .pipe(Effect.mapError((cause) => new BoardUnavailableError({ cause })));
-      const final = patches.map(({ observation, patch }) =>
-        scheduled.has(observation.threadId) && observation.deleted !== true
+      const final = patches.map(({ observation, patch }) => {
+        const row = patch.rows[0];
+        return scheduled.has(observation.threadId) &&
+          observation.deleted !== true &&
+          row !== undefined &&
+          !row.scheduled
           ? model.observe({ ...observation, scheduledHint: true })
-          : patch,
-      );
+          : patch;
+      });
       yield* persist(final.flatMap((patch) => patch.rows));
       for (const patch of final) model.commit(patch);
+      for (const threadId of lookup) model.schedules.set(threadId, scheduled.get(threadId) ?? null);
+
+      const superseded = model.supersededRuns();
+      yield* persist(superseded);
+      for (const row of superseded) model.rows.set(row.threadId, row);
+      return superseded
+        .filter((row) => {
+          const info = model.live.get(row.threadId);
+          return info !== undefined && !info.archived && !info.settled && !row.deleted;
+        })
+        .map((row) => row.threadId);
     });
 
   const observeThreads = (
@@ -231,17 +252,19 @@ const make = Effect.gen(function* () {
       const origins = yield* store
         .origins([...lineage])
         .pipe(Effect.mapError((cause) => new BoardUnavailableError({ cause })));
-      yield* serialized(
+      const superseded = yield* serialized(
         Effect.gen(function* () {
           for (const threadId of lineage) {
             const origin = origins.get(threadId);
             if (origin === undefined) model.origins.delete(threadId);
             else model.origins.set(threadId, origin);
           }
-          yield* applyObservations(observations);
+          const superseded = yield* applyObservations(observations);
           yield* publish;
+          return superseded;
         }),
       );
+      yield* syncSettled("thread.settle", superseded);
     });
 
   const refreshThread = (threadId: string) => observeThreads([threadId]);
@@ -303,7 +326,7 @@ const make = Effect.gen(function* () {
       .map((row) => row.threadId);
     // Archived or older tracked cards are not in the active shell list; read them by id.
     const extra = yield* Effect.forEach(tracked, readShell, { concurrency: 8 });
-    yield* serialized(
+    const superseded = yield* serialized(
       Effect.gen(function* () {
         model.origins.clear();
         for (const [threadId, origin] of origins) model.origins.set(threadId, origin);
@@ -311,7 +334,7 @@ const make = Effect.gen(function* () {
           ...shells.threads.map((shell) => observationFromShell(shell, shell.id)),
           ...extra,
         ];
-        yield* applyObservations(observations);
+        const superseded = yield* applyObservations(observations);
         // Live state for threads this pass did not see is stale.
         const seen = new Set(observations.map((observation) => observation.threadId));
         for (const threadId of model.live.keys()) {
@@ -320,8 +343,10 @@ const make = Effect.gen(function* () {
         syncError = null;
         yield* publish;
         yield* PubSub.publish(events, { kind: "snapshot", snapshot: snapshotNow() });
+        return superseded;
       }),
     );
+    yield* syncSettled("thread.settle", superseded);
     return yield* serialized(Effect.sync(snapshotNow));
   });
 
@@ -334,7 +359,7 @@ const make = Effect.gen(function* () {
         observation.deleted !== true && !observation.archived && observation.attention === null;
       const result = yield* serialized(
         Effect.gen(function* () {
-          yield* applyObservations([observation]);
+          const superseded = yield* applyObservations([observation]);
           const now = yield* Clock.currentTimeMillis;
           const decision = decideAction({
             action,
@@ -345,19 +370,25 @@ const make = Effect.gen(function* () {
           });
           if (decision._tag === "conflict") {
             yield* publish;
-            return yield* new BoardConflictError({
-              threadId: token.threadId,
-              reason: decision.reason,
-            });
+            return { conflict: decision.reason, superseded } as const;
           }
           if (decision._tag === "commit") {
             yield* persist([decision.row]);
             model.rows.set(decision.row.threadId, decision.row);
           }
           yield* publish;
-          return { snapshot: snapshotNow(), committed: decision._tag === "commit" };
+          return {
+            conflict: null,
+            snapshot: snapshotNow(),
+            committed: decision._tag === "commit",
+            superseded,
+          } as const;
         }),
       );
+      yield* syncSettled("thread.settle", result.superseded);
+      if (result.conflict !== null) {
+        return yield* new BoardConflictError({ threadId: token.threadId, reason: result.conflict });
+      }
       if (result.committed && syncable) {
         if (action === "review" && observation.settled !== true) {
           yield* syncSettled("thread.settle", [token.threadId]);
@@ -374,12 +405,12 @@ const make = Effect.gen(function* () {
       const observations = yield* Effect.forEach(unique, (entry) => readShell(entry.threadId), {
         concurrency: 8,
       });
-      const result = yield* serialized(
+      const { result, superseded } = yield* serialized(
         Effect.gen(function* () {
           const before = new Map(
             unique.map((entry) => [entry.threadId, model.rows.get(entry.threadId)?.workRevision]),
           );
-          yield* applyObservations(observations);
+          const superseded = yield* applyObservations(observations);
           const working = model.workingAncestors();
           const totals = model.attentionTotals();
           const now = yield* Clock.currentTimeMillis;
@@ -434,9 +465,10 @@ const make = Effect.gen(function* () {
           yield* persist(rows);
           for (const row of rows) model.rows.set(row.threadId, row);
           yield* publish;
-          return { ...snapshotNow(), cleared, skipped };
+          return { result: { ...snapshotNow(), cleared, skipped }, superseded };
         }),
       );
+      yield* syncSettled("thread.settle", superseded);
       const settleable = new Set(
         observations
           .filter(
