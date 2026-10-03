@@ -1,0 +1,8 @@
+{
+  "name": "coord",
+  "private": true,
+  "type": "module",
+  "main": "lib/coord.mjs",
+  "bin": { "coord": "cli.mjs" },
+  "scripts": { "test": "node --test test/*.test.mjs" }
+}

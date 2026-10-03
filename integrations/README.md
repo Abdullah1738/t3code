@@ -11,6 +11,7 @@ code here, test here, then sync it over.
 | `telegram-bridge` | `~/.local/share/telegram-bridge` | via agent-bridges |
 | `robob-watch` | `~/.local/share/robob-watch` | `com.ardud.robob-watch` |
 | `memory-system` | `~/.local/share/memory-system` | `com.abdullah.memory-*` |
+| `coord` | `~/.local/share/coord` | `com.ardud.coord-pump` (delivery pump) |
 
 Never add credentials, SQLite state, logs, `data/`, virtualenvs, watcher
 state (`robob-watch/watchers`, `archive`) or `.bak` files here. Runtime state
