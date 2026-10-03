@@ -46,6 +46,18 @@ describe("T3 orchestration provider instructions", () => {
     assert.equal(t3OrchestrationSystemPrompt(true), T3_CODE_ORCHESTRATION_INSTRUCTIONS);
   });
 
+  it("adds browser and device guidance only for granted tools", () => {
+    const none = t3OrchestrationSystemPrompt(true, { browser: false, device: false });
+    assert.equal(none, T3_CODE_ORCHESTRATION_INSTRUCTIONS);
+    const device = t3OrchestrationSystemPrompt(true, { browser: false, device: true });
+    assert.include(device, "`device_list`");
+    assert.notInclude(device, "preview_status");
+    const both = t3OrchestrationSystemPrompt(true, { browser: true, device: true });
+    assert.include(both, "preview_status");
+    assert.include(both, "`device_open`");
+    assert.equal(t3OrchestrationSystemPrompt(false, { browser: true, device: true }), undefined);
+  });
+
   it("gives ACP sessions provider-neutral mode, browser, and orchestration guidance", () => {
     const injected = t3AcpPromptWithInstructions({
       prompt: "Inspect the repository.",
