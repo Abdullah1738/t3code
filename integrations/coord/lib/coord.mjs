@@ -40,6 +40,33 @@ export function parseTtl(v, dflt = DEFAULTS.ttl) {
 }
 const need = (v, name) => { if (v === undefined || v === null || v === '') throw refuse('invalid', `${name} is required`); return v; };
 
+// ---------- environment identities ----------
+
+// One spelling per environment, wherever an environment enters (claim env, release env, QA env,
+// pause/drain scopes, event env, filters, CLI flags): lowercase dev | staging | prod | ephemeral:<name>.
+// env_required (missing/blank), env_invalid (malformed), env_unsupported (not supported: '*', or any
+// environment without an evidence source unless `supported: false`, which only checks the spelling).
+const ENV_FORM = /^[a-z0-9][a-z0-9-]*(?::[a-z0-9][a-z0-9-]*)?$/;
+export function canonicalEnv(env, { supported = true } = {}) {
+  if (env === undefined || env === null || (typeof env === 'string' && !env.trim())) throw refuse('env_required', 'environment is missing or blank');
+  if (typeof env !== 'string') throw refuse('env_invalid', `environment ${JSON.stringify(env)} must be a string`);
+  if (env === '*') throw refuse('env_unsupported', "'*' is not an environment; name one");
+  const e = env.toLowerCase();
+  if (!ENV_FORM.test(e)) throw refuse('env_invalid', `environment ${JSON.stringify(env)} is malformed`);
+  if (supported && !evidence.SUPPORTED_ENVS.includes(e)) throw refuse('env_unsupported', `environment ${e} is not supported (${evidence.SUPPORTED_ENVS.join(', ')})`);
+  return e;
+}
+// Pause/drain scopes: env:<e> (canonical environment) or a lowercase name such as `crw`; anything else is
+// scope_invalid. Empty means the global scope.
+export function canonicalScope(scope, { supported = true } = {}) {
+  if (scope === undefined || scope === null || scope === '') return null;
+  if (typeof scope !== 'string') throw refuse('scope_invalid', `scope ${JSON.stringify(scope)} must be a string`);
+  if (/^env:/i.test(scope)) return `env:${canonicalEnv(scope.slice(4), { supported })}`;
+  const k = scope.toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(k)) throw refuse('scope_invalid', `scope ${JSON.stringify(scope)} must be env:<e> or a name`);
+  return k;
+}
+
 // ---------- control: pause / drain / flags ----------
 
 const RANK = { run: 0, drain: 1, pause: 2 };
@@ -47,7 +74,8 @@ const RANK = { run: 0, drain: 1, pause: 2 };
 export function setMode(mode, { scope, as, reason } = {}) {
   if (!(mode in RANK)) throw refuse('invalid', `mode must be run|drain|pause`);
   need(as, 'as');
-  const k = scope ? `mode:${scope}` : 'mode';
+  const sc = canonicalScope(scope);
+  const k = sc ? `mode:${sc}` : 'mode';
   run('INSERT INTO control (k,v,set_by,set_at,reason) VALUES (?,?,?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, set_by=excluded.set_by, set_at=excluded.set_at, reason=excluded.reason',
     k, mode, as, now(), reason ?? null);
   return { key: k, mode };
@@ -70,6 +98,7 @@ export function flag(k) {
 
 // Effective mode of a scope: the strictest of the global mode and the scope's own mode.
 export function gate(scope) {
+  scope = canonicalScope(scope, { supported: false }) ?? undefined;
   let best = { mode: 'run', key: 'mode' };
   for (const k of scope ? ['mode', `mode:${scope}`] : ['mode']) {
     const r = get('SELECT * FROM control WHERE k=?', k);
@@ -164,7 +193,8 @@ export function post(channel, o = {}) {
   need(as, 'as'); need(key, 'key'); need(summary, 'summary');
   if (!EVENT_KINDS.includes(kind)) throw refuse('invalid', `kind must be one of ${EVENT_KINDS.join('|')}`);
   const to = Array.isArray(o.to) ? o.to : list(o.to, null);
-  const fields = { channel, kind, sender: as, work: o.work, env: o.env, rev: o.rev, authority: o.authority, summary, body: o.body, reply_to: o.replyTo, to };
+  const ev = o.env === undefined || o.env === null ? null : canonicalEnv(o.env, { supported: false });
+  const fields = { channel, kind, sender: as, work: o.work, env: ev ?? undefined, rev: o.rev, authority: o.authority, summary, body: o.body, reply_to: o.replyTo, to };
   const h = hash(fields);
   return tx(() => {
     const prev = get('SELECT seq, body_hash FROM events WHERE event_key=?', key);
@@ -180,7 +210,7 @@ export function post(channel, o = {}) {
     for (const r of recips) if (!actor(r)) throw refuse('unknown_actor', `no actor ${r}`);
     const t = now();
     const seq = Number(run(`INSERT INTO events (event_key,body_hash,channel_id,kind,sender,work_id,environment,expected_revision,authority_ref,summary,body_json,reply_to,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, key, h, channel, kind, as, o.work ?? null, o.env ?? null, o.rev ?? null, o.authority ?? null, summary,
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, key, h, channel, kind, as, o.work ?? null, ev, o.rev ?? null, o.authority ?? null, summary,
       json(o.body), o.replyTo ?? null, t).lastInsertRowid);
     for (const r of [...new Set(recips)]) {
       const a = actor(r);
@@ -285,10 +315,7 @@ export function claimEnv(resource, env) {
   const own = intrinsicEnv(resource);
   if (own !== null && !own.trim()) throw refuse('env_required', `${resource} names no environment`);
   let given = null;
-  if (env !== undefined && env !== null) {
-    if (typeof env !== 'string' || !env.trim()) throw refuse('env_required', `env for ${resource} is blank`);
-    given = env;
-  }
+  if (env !== undefined && env !== null) given = canonicalEnv(env, { supported: false });
   if (own && given && given !== own) throw refuse('env_mismatch', `${resource} is a ${own} resource, not ${given}`);
   const scope = own ?? given;
   if (!scope) throw refuse('env_required', `${resource} is a mutation claim: pass the environment it acts on (env)`);
@@ -621,7 +648,8 @@ const defaultRuntime = r => r.kind === 'frontend_release'
   ? evidence.frontendRuntime({ repo: r.repo, env: r.environment }) : evidence.serviceRuntime({ binary: r.binary, env: r.environment });
 
 export function tfRootGen(root) {
-  const t = get('SELECT gen, bumped_at FROM tf_roots WHERE root=?', need(root, 'root'));
+  root = canonicalResource(`tf:${need(root, 'root')}`).slice(3);
+  const t = get('SELECT gen, bumped_at FROM tf_roots WHERE root=?', root);
   return { root, gen: t?.gen ?? 0, bumped_at: t?.bumped_at ?? null };
 }
 // Terraform roots a mutation claim may touch: tf:<root> itself; env:<e> every known root of <e>.
@@ -640,8 +668,7 @@ export function releaseRequest(o = {}) {
   const { as, key, kind } = o;
   need(as, 'as'); need(key, 'key');
   if (!RELEASE_KINDS.includes(kind) || kind === 'qa_window') throw refuse('invalid', `kind must be one of ${RELEASE_KINDS.filter(k => k !== 'qa_window').join('|')}`);
-  const env = need(o.env, 'env');
-  evidence.requireEnv(env); // nothing could ever observe it to a terminal state
+  const env = canonicalEnv(o.env); // dev only: nothing could ever observe another env to a terminal state
   const repo = o.repo ? canonRepo(o.repo) : null, binary = o.binary ? canonBinary(o.binary) : null;
   let contentPrs = null, tfRoot = null;
   if (DEPLOY_KINDS.includes(kind)) {
@@ -1004,6 +1031,7 @@ export function releaseCancel(id, { as, note } = {}) {
 }
 
 export function releaseList({ state, env } = {}) {
+  if (env !== undefined && env !== null) env = canonicalEnv(env, { supported: false });
   return { releases: all('SELECT id FROM releases WHERE (? IS NULL OR state=?) AND (? IS NULL OR environment=?) ORDER BY id', state ?? null, state ?? null, env ?? null, env ?? null).map(x => relRow(x.id)) };
 }
 
@@ -1011,7 +1039,8 @@ export function releaseList({ state, env } = {}) {
 // environment against every mutation (and every mutation holds it off), whatever the footprint strings.
 // Expiry only raises attention; it never frees the environment on its own.
 export function qaOpen({ as, env, footprint, ttl, key } = {}) {
-  need(as, 'as'); need(env, 'env');
+  need(as, 'as');
+  env = canonicalEnv(env);
   const fp = canonList([...(Array.isArray(footprint) ? footprint : list(footprint, [])), `env:${env}`]).sort();
   const secs = parseTtl(ttl, 4 * 3600);
   const f = fingerprint({ kind: 'qa_window', requester: as, environment: env, footprint: fp, ttl: secs });
@@ -1051,49 +1080,44 @@ export function qaClose(id, { as, note } = {}) {
 
 // ---------- architecture writer queue ----------
 
-// Existing rows from before canonical keys: rewrite non-canonical resource keys in place, once per open,
-// in one transaction. Refuses to open (resource_alias_conflict / resource_invalid) when a rewrite would
-// merge two live keys or a key cannot be parsed, so no unresolved claim is silently dropped.
-function normalizeStoredKeys() {
-  const fix = [];
-  const canon = k => { try { return canonicalResource(k); } catch (e) { throw refuse(e.code, `stored ${e.message}; fix the row by hand`); } };
-  tx(() => {
-    for (const c of all('SELECT resource FROM claims')) {
-      const k = canon(c.resource);
-      if (k === c.resource) continue;
-      if (get('SELECT 1 FROM claims WHERE resource=?', k)) throw refuse('resource_alias_conflict', `claims ${c.resource} and ${k} are the same resource; resolve one by hand`);
-      run('UPDATE claims SET resource=? WHERE resource=?', k, c.resource);
-      fix.push(c.resource);
-    }
-    for (const f of all('SELECT resource, fence FROM fences')) {
-      const k = canon(f.resource);
-      if (k === f.resource) continue;
-      run('INSERT INTO fences (resource,fence) VALUES (?,?) ON CONFLICT(resource) DO UPDATE SET fence=MAX(fence, excluded.fence)', k, f.fence);
-      run('DELETE FROM fences WHERE resource=?', f.resource);
-    }
-    for (const h of all('SELECT resource, fence FROM claim_history')) {
-      const k = canon(h.resource);
-      if (k === h.resource) continue;
-      if (get('SELECT 1 FROM claim_history WHERE resource=? AND fence=?', k, h.fence)) throw refuse('resource_alias_conflict', `claim history ${h.resource}#${h.fence} collides with ${k}`);
-      run('UPDATE claim_history SET resource=? WHERE resource=? AND fence=?', k, h.resource, h.fence);
-    }
-    for (const d of all("SELECT id, work_id, ref FROM deps WHERE need='claim_free'")) {
-      const k = canon(d.ref);
-      if (k === d.ref) continue;
-      if (get("SELECT 1 FROM deps WHERE work_id=? AND need='claim_free' AND ref=?", d.work_id, k)) throw refuse('resource_alias_conflict', `dep ${d.id} ${d.ref} duplicates ${k}`);
-      run('UPDATE deps SET ref=? WHERE id=?', k, d.id);
-    }
-    for (const r of all('SELECT id, footprint, claim_fences FROM releases')) {
-      const fp = parse(r.footprint), cf = parse(r.claim_fences);
-      const nfp = canonList(fp.map(canon)).sort();
-      const ncf = cf && Object.fromEntries(Object.entries(cf).map(([k, v]) => [canon(k), v]));
-      if (JSON.stringify(nfp) !== JSON.stringify(fp) || (cf && JSON.stringify(ncf) !== JSON.stringify(cf)))
-        run('UPDATE releases SET footprint=?, claim_fences=? WHERE id=?', json(nfp), json(ncf), r.id);
-    }
-  });
-  return fix;
+// Read-only check on open: every stored resource key, environment, scope and Terraform root must already
+// be canonical. coord never rewrites stored state; a non-canonical row (written by an older version or by
+// hand) refuses the open with noncanonical_state, naming the rows, for an operator to reconcile by hand.
+// Request fingerprints are derived from these fields, so a canonical row also has a canonical fingerprint.
+function checkStoredState() {
+  const bad = [];
+  const want = (table, id, col, value, canon) => {
+    let c;
+    try { c = canon(value); } catch (e) { c = `invalid (${e.code})`; }
+    if (c !== value) bad.push({ table, id, col, value, canonical: c });
+  };
+  const res = k => canonicalResource(k);
+  const envForm = e => canonicalEnv(e, { supported: false });
+  const root = r => canonicalResource(`tf:${r}`).slice(3);
+  for (const c of all('SELECT resource, env FROM claims')) {
+    want('claims', c.resource, 'resource', c.resource, res);
+    if (c.env !== null) want('claims', c.resource, 'env', c.env, envForm);
+  }
+  for (const f of all('SELECT resource FROM fences')) want('fences', f.resource, 'resource', f.resource, res);
+  for (const h of all('SELECT resource, fence FROM claim_history')) want('claim_history', `${h.resource}#${h.fence}`, 'resource', h.resource, res);
+  for (const d of all("SELECT id, ref FROM deps WHERE need='claim_free'")) want('deps', d.id, 'ref', d.ref, res);
+  for (const r of all('SELECT id, environment, footprint, claim_fences, tf_root, repo, binary FROM releases')) {
+    want('releases', r.id, 'environment', r.environment, envForm);
+    for (const k of parse(r.footprint) ?? []) want('releases', r.id, 'footprint', k, res);
+    for (const k of Object.keys(parse(r.claim_fences) ?? {})) want('releases', r.id, 'claim_fences', k, res);
+    if (r.tf_root !== null) want('releases', r.id, 'tf_root', r.tf_root, root);
+    if (r.repo !== null) want('releases', r.id, 'repo', r.repo, canonRepo);
+    if (r.binary !== null) want('releases', r.id, 'binary', r.binary, canonBinary);
+  }
+  for (const t of all('SELECT root FROM tf_roots')) want('tf_roots', t.root, 'root', t.root, root);
+  for (const c of all("SELECT k FROM control WHERE k LIKE 'mode:%'")) want('control', c.k, 'k', c.k, k => `mode:${canonicalScope(k.slice(5), { supported: false })}`);
+  for (const e of all('SELECT seq, environment FROM events WHERE environment IS NOT NULL')) want('events', e.seq, 'environment', e.environment, envForm);
+  if (bad.length) {
+    const list_ = bad.slice(0, 10).map(b => `${b.table} ${b.id} ${b.col}=${JSON.stringify(b.value)} (canonical: ${b.canonical})`).join('; ');
+    throw refuse('noncanonical_state', `stored state is not canonical; reconcile by hand: ${list_}${bad.length > 10 ? `; and ${bad.length - 10} more` : ''}`, { rows: bad });
+  }
 }
-setOnOpen(normalizeStoredKeys);
+setOnOpen(checkStoredState);
 
 export const archKey = (repos, pins, prefix = 'crw-drift') => `${prefix}:${[...repos].sort().join(',')}:${hash(pins).slice(0, 16)}`;
 

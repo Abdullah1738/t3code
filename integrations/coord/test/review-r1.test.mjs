@@ -315,10 +315,11 @@ test('#21 QA key reuse with a different binding is a conflict', () => {
   const fp = ['harness:baseline'];
   const q = C.qaOpen({ as: 'harness', env: 'dev', footprint: fp, key: 'qa-1' }).release;
   assert.equal(C.qaOpen({ as: 'harness', env: 'dev', footprint: fp, key: 'qa-1' }).release.id, q.id);
-  assert.throws(() => C.qaOpen({ as: 'harness', env: 'ephemeral:x', footprint: fp, key: 'qa-1' }), e => e.code === 'conflict');
+  assert.throws(() => C.qaOpen({ as: 'harness', env: 'dev', footprint: ['harness:other'], key: 'qa-1' }), e => e.code === 'conflict');
+  assert.throws(() => C.qaOpen({ as: 'harness', env: 'ephemeral:x', footprint: fp, key: 'qa-1' }), e => e.code === 'env_unsupported');
   assert.throws(() => C.qaOpen({ as: 'other', env: 'dev', footprint: fp, key: 'qa-1' }), e => e.code === 'conflict');
   svc('rel-key');
-  assert.throws(() => C.qaOpen({ as: 'harness', env: 'ephemeral:y', footprint: fp, key: 'rel-key' }), e => e.code === 'conflict');
+  assert.throws(() => C.qaOpen({ as: 'harness', env: 'dev', footprint: fp, key: 'rel-key' }), e => e.code === 'conflict');
 });
 
 test('#22 a late readiness result does not resurrect a dependency set dead meanwhile', async () => {

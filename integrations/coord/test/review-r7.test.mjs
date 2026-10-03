@@ -79,27 +79,18 @@ test('R7-1 the CLI canonicalizes resource keys', () => {
   C.open(dbPath);
 });
 
-test('R7-1 stored non-canonical keys are normalized on open; aliases that would merge refuse to open', () => {
+test('R7-1 stored non-canonical keys refuse to open (no automatic rewrite)', () => {
   C.close();
   const raw = new DatabaseSync(dbPath);
-  raw.exec(`INSERT INTO claims (resource,owner,fence,state,lease_until,env) VALUES ('repo:Equicom-Crypto/Trading-Core','cell:a',1,'active',${2e9},'dev');
-    INSERT INTO fences (resource,fence) VALUES ('repo:Equicom-Crypto/Trading-Core',1);
-    INSERT INTO claim_history (resource,fence,owner,state) VALUES ('svc:Trading-Core',3,'cell:z','reconciled');`);
+  raw.exec(`INSERT INTO claims (resource,owner,fence,state,lease_until,env) VALUES ('repo:Equicom-Crypto/Trading-Core','cell:a',1,'active',${2e9},'dev');`);
   raw.close();
-  C.open(dbPath);
-  assert.deepEqual(C.claims({}).claims.map(x => x.resource), ['repo:equicom-crypto/trading-core']);
-  throwsCode(() => C.claim('repo:equicom-crypto/trading-core', { as: 'cell:b', env: 'dev' }), 'held');
-  assert.equal(C.check(`repo:${TC}`, { as: 'cell:a', fence: 1 }).fence, 1);
-  C.close();
+  throwsCode(() => C.open(dbPath), 'noncanonical_state');
   const raw2 = new DatabaseSync(dbPath);
-  raw2.exec(`INSERT INTO claims (resource,owner,fence,state,lease_until,env) VALUES ('repo:EQUICOM-CRYPTO/trading-core','cell:c',1,'active',${2e9},'dev');`);
+  assert.equal(raw2.prepare('SELECT resource FROM claims').get().resource, 'repo:Equicom-Crypto/Trading-Core', 'left as stored');
+  raw2.exec(`UPDATE claims SET resource='repo:equicom-crypto/trading-core'`);
   raw2.close();
-  throwsCode(() => C.open(dbPath), 'resource_alias_conflict');
-  const raw3 = new DatabaseSync(dbPath);
-  raw3.exec(`DELETE FROM claims WHERE resource='repo:EQUICOM-CRYPTO/trading-core'`);
-  raw3.close();
   C.open(dbPath);
-  assert.equal(C.claims({}).claims.length, 1);
+  assert.equal(C.check(`repo:${TC}`, { as: 'cell:a', fence: 1 }).fence, 1);
 });
 
 // ---------- R7-2 ----------

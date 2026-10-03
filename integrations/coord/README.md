@@ -98,8 +98,20 @@ owner and name; `svc:`, `tf:` and `env:` values are lowercased names. Malformed 
 (`resource_invalid`): a missing kind or value, whitespace or control characters, `repo:` without exactly
 `<owner>/<name>`, `pr:` without `#<number>`, `svc:`/`tf:`/`env:` values that are not names. Other
 kinds (`ticket:`, `ch:`, ...) keep their value as given. Results report the canonical `resource`.
-On open, stored non-canonical keys are rewritten in place once; if two stored claims are spellings of
-the same resource the database refuses to open (`resource_alias_conflict`) until one is resolved by hand.
+
+**Environments** have one spelling too, wherever they enter: claim `env`, release `env`, QA `env`,
+pause/drain `scope` (`env:<e>` or a lowercase name such as `crw`), event `env`, list filters and the
+CLI flags. `coord.canonicalEnv(env)` lowercases and checks it: `env_required` (missing/blank),
+`env_invalid` (malformed), `env_unsupported` (`*`, or anything but dev where an operation acts).
+`setMode` stores `mode:env:dev` for `ENV:DEV`; `gate` reads the same key; a malformed scope is
+`scope_invalid`.
+
+**Stored state is never rewritten.** On open, coord checks (read-only) that every stored resource key,
+environment, pause/drain scope, Terraform root, release repo and binary is canonical. If any is not
+(written by an older version or by hand) the open is refused with `noncanonical_state`, naming the
+table, row and canonical form; an operator must reconcile those rows by hand (decide which spelling is
+the real claim or release, resolve conflicts, then rewrite or delete) before coord will open the database.
+Request fingerprints come from canonical fields, so retries of the same request stay idempotent.
 
 **Mutation claims** are claims on anything but `pr:`, `ticket:`, `files:`, `arch:`, `channel:` and
 `work:`. Each resolves to exactly one concrete supported environment (only `dev` today), checked in
