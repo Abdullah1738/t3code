@@ -50,6 +50,8 @@ import { layer as threadLifecycleServiceLayer } from "./ThreadLifecycleService.t
 import { layer as threadForkServiceLayer } from "./ThreadForkService.ts";
 import { layer as turnItemPositionStoreLayer } from "./TurnItemPositionStore.ts";
 import { layer as scheduledTaskServiceLayer } from "../scheduledTasks/ScheduledTaskService.ts";
+import * as ArdudOpenCodeImporter from "../ardud/opencode-import/OpenCodeImporter.ts";
+import { withOpenCodeTranscripts } from "../ardud/opencode-import/layer.ts";
 
 /** The shared application event log and its command receipts. */
 export const OrchestrationEventInfrastructureLayerLive = Layer.mergeAll(
@@ -224,8 +226,19 @@ const agentSessionImporterProvided = agentSessionImporterLayer.pipe(
   ),
 );
 
+// ardud fork: imported OpenCode sessions load their transcript on first read.
+const ardudOpenCodeImporterProvided = ArdudOpenCodeImporter.layer.pipe(
+  Layer.provide(Layer.mergeAll(eventSinkProvided, idAllocatorLayer, projectionStoreLayer)),
+);
 const threadManagementProvided = threadManagementServiceLayer.pipe(
-  Layer.provide(Layer.merge(orchestratorProvided, legacyV1ThreadImporterProvided)),
+  Layer.provide(
+    Layer.merge(
+      orchestratorProvided,
+      withOpenCodeTranscripts.pipe(
+        Layer.provide(Layer.merge(legacyV1ThreadImporterProvided, ardudOpenCodeImporterProvided)),
+      ),
+    ),
+  ),
 );
 export const ProjectSetupScriptRunnerLayerLive = projectSetupScriptRunnerLayer.pipe(
   Layer.provide(ProjectServiceLayerLive),
@@ -297,6 +310,7 @@ export const OrchestrationV2LayerLive = Layer.mergeAll(
   providerRuntimeRecoveryProvided,
   projectionMaintenanceProvided,
   legacyV1ThreadImporterProvided,
+  ardudOpenCodeImporterProvided,
 );
 
 export const OrchestrationV2ProductionLayerLive = Layer.mergeAll(
