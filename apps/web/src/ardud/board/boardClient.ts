@@ -54,15 +54,24 @@ export function applyBoardDelta(state: BoardState, delta: ArdudBoardDelta): Boar
   };
 }
 
+// Same-origin web relies on the session cookie. Desktop (custom-scheme origin)
+// authenticates with a bearer token; the server answers CORS with "*", which
+// browsers reject for credentialed requests, so cookies must be omitted there.
+function boardCredentials(url: string): RequestCredentials {
+  if (typeof window === "undefined" || window.desktopBridge !== undefined) return "omit";
+  return new URL(url, window.location.href).origin === window.location.origin ? "include" : "omit";
+}
+
 async function authHeaders(): Promise<Record<string, string>> {
   const token = await readDesktopPrimaryBearerToken().catch(() => null);
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 
 async function request<A>(path: string, init?: { body?: unknown }): Promise<A> {
-  const response = await fetch(resolvePrimaryEnvironmentHttpUrl(`/api/ardud/board${path}`), {
+  const url = resolvePrimaryEnvironmentHttpUrl(`/api/ardud/board${path}`);
+  const response = await fetch(url, {
     method: init ? "POST" : "GET",
-    credentials: "include",
+    credentials: boardCredentials(url),
     cache: "no-store",
     headers: {
       ...(await authHeaders()),
@@ -133,8 +142,9 @@ async function runStream(signal: AbortSignal) {
   while (!signal.aborted) {
     try {
       useBoardStore.setState({ connection: "connecting" });
-      const response = await fetch(resolvePrimaryEnvironmentHttpUrl("/api/ardud/board/events"), {
-        credentials: "include",
+      const url = resolvePrimaryEnvironmentHttpUrl("/api/ardud/board/events");
+      const response = await fetch(url, {
+        credentials: boardCredentials(url),
         cache: "no-store",
         headers: { ...(await authHeaders()), accept: "text/event-stream" },
         signal,
