@@ -77,13 +77,11 @@ or `"backend": "robob"` in config.json (default `openchamber`), then
   user `message.completed` to changed, runtime-mode changes to invalidate).
 - Requests: `GET /requests`, scoped to a directory by each thread's folder.
   Replies use the respond route.
-- Reviews: until Robob's session board (`/api/ardud/board/*`) is ready,
-  `ThreadReviewBoard` builds a board snapshot from `GET /threads`: root threads
-  only, iMessage threads left out, other origins (automation, crw, watcher) as
-  `scheduled` (never announced), settled threads as `backlog`, and the newest
-  run's ordinal as the work revision. A root thread whose turn finishes gets
-  one review notice. The real board plugs in through the `ReviewBoard`
-  interface (`board` option).
+- Reviews: read from Robob's session board (`GET /api/ardud/board`, same
+  bearer token). The server already leaves iMessage threads off the board,
+  files automated origins (automation, crw, watcher) under `scheduled` and
+  rolls subagents into their parent, so a root card that turns idle in
+  `waiting` gets one review notice. Notices say `[Robob]` and point at the Board.
 - iMessage family: every thread reports its root's origin, so subagents of an
   iMessage chat stay quiet without a parent walk.
 

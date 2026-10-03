@@ -58,6 +58,8 @@ export class Attention {
     return this.ticking ??= this.run().finally(() => { this.ticking = undefined; });
   }
 
+  private get app(): string { return this.backend.brand?.app ?? "OpenChamber"; }
+
   invalidate(): void { this.epoch++; }
 
   stop(): void {
@@ -369,7 +371,7 @@ export class Attention {
       if (statuses[notice.sessionId]) return "wait";
       if (entry.attention) return "wait";
       if ([...questions, ...permissions].some(request => request.sessionID === notice.sessionId)) return "wait";
-      return { text: `[OpenChamber] ${label(session.title)} is ready for review. Please attend to it in Sessions.`, signature: "" };
+      return { text: `[${this.app}] ${label(session.title)} is ready for review. Please attend to it in ${this.backend.brand?.board ?? "Sessions"}.`, signature: "" };
     }
     if (age < ATTENTION_DELAY) return "wait";
     if (!notice.requestId) return "cancel";
@@ -395,7 +397,7 @@ export class Attention {
     const signature = this.signature(request);
     const token = callbackToken(notice.id);
     if (notice.kind === "approval" && "action" in request) {
-      const text = `[OpenChamber] ${context} needs your approval.\nPermission ${request.id}: ${request.action.slice(0, 200)}\n${request.resources.join("\n").slice(0, 2_000)}\n\nTap Approve once or Reject.`;
+      const text = `[${this.app}] ${context} needs your approval.\nPermission ${request.id}: ${request.action.slice(0, 200)}\n${request.resources.join("\n").slice(0, 2_000)}\n\nTap Approve once or Reject.`;
       const keyboard: KeyboardSpec = { rows: [
         [{ text: "Approve once", data: `a:${token}:once` }, { text: "Reject", data: `a:${token}:reject` }],
       ] };
@@ -404,11 +406,11 @@ export class Attention {
     if (notice.kind !== "question" || !("questions" in request)) return "cancel";
     if (request.unsupported) {
       // Still surfaced so a blocked session is never silent, but without buttons.
-      return { text: `[OpenChamber] ${context} has a form for you.\nForm ${request.id}: ${label(request.title)}\n\nIt has fields a chat reply cannot answer. Please answer it in OpenChamber.`, signature };
+      return { text: `[${this.app}] ${context} has a form for you.\nForm ${request.id}: ${label(request.title)}\n\nIt has fields a chat reply cannot answer. Please answer it in ${this.app}.`, signature };
     }
     if (request.questions.length > 1) {
       // Multiple questions are asked one at a time by editing this message.
-      const header = `[OpenChamber] ${context} has ${request.questions.length} questions for you.`;
+      const header = `[${this.app}] ${context} has ${request.questions.length} questions for you.`;
       const keyboard = this.stepKeyboard(request, token, 0, []);
       return { text: this.stepText(header, request, 0), ...("rows" in keyboard ? { keyboard } : {}), signature };
     }
@@ -418,7 +420,7 @@ export class Attention {
     const single = request.questions.length === 1 && request.questions[0]!.multiple !== true;
     const hint = request.questions.length === 1 && request.questions[0]!.custom !== false
       ? "\nReply to this message with your own text." : "";
-    const text = `[OpenChamber] ${context} has a question for you.\nQuestion ${request.id}:\n${body}${single ? "" : "\n\nTap each option that applies, then Submit."}${hint}`;
+    const text = `[${this.app}] ${context} has a question for you.\nQuestion ${request.id}:\n${body}${single ? "" : "\n\nTap each option that applies, then Submit."}${hint}`;
     return { text, keyboard: this.questionKeyboard(request, token), signature };
   }
 
@@ -586,7 +588,7 @@ export class Attention {
 
   /** The prompt's first line; every step of a multi-question prompt repeats it. */
   private sequenceHeader(noticeId: string): string {
-    return (this.store.getOperation(noticeId)?.text ?? "[OpenChamber] Questions for you.").split("\n", 1)[0]!;
+    return (this.store.getOperation(noticeId)?.text ?? `[${this.app}] Questions for you.`).split("\n", 1)[0]!;
   }
 
   private async showStep(messageId: number, notice: SessionNotice, request: QuestionRequest, sequence: Sequence): Promise<boolean> {
@@ -729,7 +731,7 @@ export class Attention {
     optionIndex: number,
   ): Promise<void> {
     const answer = (text: string) => this.transport.answerCallback(update.callbackId, text).catch(() => {});
-    if (request.unsupported) return answer("Answer this form in OpenChamber.");
+    if (request.unsupported) return answer(`Answer this form in ${this.app}.`);
     const question = request.questions[questionIndex];
     if (!question || !question.options[optionIndex]) return answer("That option is no longer current.");
     if (request.questions.length === 1 && question.multiple !== true) {

@@ -203,6 +203,8 @@ export function formAnswer(request: QuestionRequest, answers: string[][]): Recor
  * implements it here; Robob's control API implements it in robob.ts.
  */
 export interface AlertBackend {
+  /** How notices name the app and its review board. Defaults to OpenChamber and Sessions. */
+  readonly brand?: { app: string; board: string };
   health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
   sessionBoard(): Promise<BoardSnapshot>;
   getSession(id: string, directory: string): Promise<SessionRecord | undefined>;

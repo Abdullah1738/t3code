@@ -2,7 +2,9 @@ import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { Attention } from "../src/attention.ts";
 import { backendKind } from "../src/config.ts";
 import type { PendingRequest } from "../src/control.ts";
-import { boardEntry, RobobAlertBackend, ROBOB_BOARD_ACTIVATED, runOrdinal } from "../src/robob.ts";
+import { boardEntry, RobobAlertBackend, runOrdinal } from "../src/robob.ts";
+
+const BOARD_ACTIVATED = 1_000;
 import { Store } from "../src/store.ts";
 
 type Thread = {
@@ -35,6 +37,17 @@ function fakeControl(events: string[] = []) {
     const body = request.method === "GET" ? undefined : await request.json().catch(() => undefined);
     calls.push({ method: request.method, path: path + (searchParams.size ? `?${searchParams}` : ""), body });
     if (request.headers.get("authorization") !== "Bearer test-token") return Response.json({ ok: false }, { status: 401 });
+    if (pathname === "/api/ardud/board") {
+      // A small stand-in for the server board: roots only, iMessage quiet, automated origins scheduled.
+      const entries = [...threads.values()].filter(thread => !thread.parentThreadId && thread.origin !== "imessage").map(thread => ({
+        threadId: thread.threadId, projectId: thread.projectId, title: thread.title,
+        state: thread.origin ? "scheduled" : thread.settled ? "backlog" : thread.state === "waiting" || thread.state === "idle" ? "waiting" : "running",
+        status: thread.state === "needs-input" ? "needs-input" : thread.state === "running" ? "working" : "idle",
+        workRevision: runOrdinal(thread.latestRunId), updatedAt: now, worktreePath: thread.worktreePath,
+        ...(thread.pending[0] ? { attention: { kind: thread.pending[0].kind, count: thread.pending.length } } : {}),
+      }));
+      return Response.json({ version: 1, revision: 1, activatedAt: BOARD_ACTIVATED, entries, syncError: null });
+    }
     const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
     if (path === "/health") return ok({ status: "healthy" });
     if (path === "/projects") return ok({ projects: [{ projectId: "p1", title: "repo", workspaceRoot: "/repo" }] });
@@ -81,17 +94,14 @@ test("backend switch defaults to OpenChamber", () => {
   expect(() => backendKind({}, { backend: "other" })).toThrow();
 });
 
-test("board entries: imessage is quiet, automated origins never get reviews, settled goes to backlog", () => {
-  const base = { threadId: "t", projectId: "p", title: "T", state: "waiting" as const, status: "waiting", origin: null, nativeSessionId: null,
-    runtimeMode: "full-access", parentThreadId: null, rootThreadId: "t", worktreePath: null, pendingRequest: null,
-    latestRunId: "run:thread:t:ordinal:4", createdAt: null, updatedAt: null };
-  expect(boardEntry(base, "/repo")).toMatchObject({ state: "waiting", status: "idle", workRevision: 4, directory: "/repo" });
-  expect(boardEntry({ ...base, state: "running" }, "/repo")).toMatchObject({ state: "running", status: "busy" });
-  expect(boardEntry({ ...base, state: "needs-input", pendingRequest: { requestId: "r", kind: "approval", requestKind: "command" } }, "/repo"))
+test("server board cards map onto attention's board entries", () => {
+  const base = { threadId: "t", projectId: "p", title: "T", state: "waiting" as const, status: "idle", workRevision: 4, updatedAt: 5 };
+  expect(boardEntry(base, "/repo")).toMatchObject({ sessionId: "t", state: "waiting", status: "idle", workRevision: 4, directory: "/repo" });
+  expect(boardEntry({ ...base, state: "running", status: "working" }, "/repo")).toMatchObject({ state: "running", status: "busy" });
+  expect(boardEntry({ ...base, state: "waiting", status: "background" }, "/repo")).toMatchObject({ status: "busy" });
+  expect(boardEntry({ ...base, state: "running", status: "needs-input", attention: { kind: "approval", count: 1 } }, "/repo"))
     .toMatchObject({ state: "running", attention: { kind: "approval", count: 1 } });
-  expect(boardEntry({ ...base, origin: "imessage" }, "/repo")).toBeUndefined();
-  expect(boardEntry({ ...base, origin: "crw" }, "/repo")).toMatchObject({ state: "scheduled" });
-  expect(boardEntry({ ...base, settled: true }, "/repo")).toMatchObject({ state: "backlog" });
+  expect(boardEntry({ ...base, projectId: null }, "/repo")).not.toHaveProperty("projectId");
   expect(runOrdinal("run:thread:a%3Ab:ordinal:12")).toBe(12);
   expect(runOrdinal(null)).toBe(0);
 });
@@ -155,7 +165,7 @@ test("a finished root thread gets one review notice; imessage threads never do",
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();
   expect(store.pendingSessionNotices()).toEqual([]);
-  expect(store.get(`session-notification-baseline:${ROBOB_BOARD_ACTIVATED}`)).toBeDefined();
+  expect(store.get(`session-notification-baseline:${BOARD_ACTIVATED}`)).toBeDefined();
   control.threads.get("work")!.state = "waiting";
   control.threads.get("chat")!.state = "waiting";
   await alerts.tick();
@@ -164,7 +174,7 @@ test("a finished root thread gets one review notice; imessage threads never do",
   expect(notice).toMatchObject({ kind: "review", sessionId: "work", directory: "/repo", workRevision: 1 });
   setSystemTime(now + 61_000);
   await alerts.tick();
-  expect(store.pendingOutbox().map(item => item.text)).toEqual(["[OpenChamber] Fix the build is ready for review. Please attend to it in Sessions."]);
+  expect(store.pendingOutbox().map(item => item.text)).toEqual(["[Robob] Fix the build is ready for review. Please attend to it in the Board."]);
   await alerts.tick();
   expect(store.pendingOutbox()).toHaveLength(1);
 });

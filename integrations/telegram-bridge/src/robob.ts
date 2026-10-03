@@ -1,6 +1,6 @@
 import type { NotificationEvent } from "./notification-events.ts";
 import {
-  IMESSAGE_ORIGIN, type AlertBackend, type BoardEntry, type BoardSnapshot, type PermissionRequest,
+  type AlertBackend, type BoardEntry, type BoardSnapshot, type PermissionRequest,
   type QuestionRequest, type SessionRecord, type SessionStatus,
 } from "./openchamber.ts";
 import {
@@ -10,14 +10,7 @@ import {
 
 /** States that mean a thread is still working. `waiting` is not: its reply is out, only background work drains. */
 const BUSY = new Set<ThreadState>(["running", "needs-input", "queued"]);
-/** Fixed activation stamp of the derived board, so its review baseline never mixes with OpenChamber's. */
-export const ROBOB_BOARD_ACTIVATED = 1_000;
-
-/**
- * Where review notices come from. Until Robob's session board
- * (/api/ardud/board/*) is ready, ThreadReviewBoard derives one from the
- * control API's thread list; the real board plugs in here later.
- */
+/** Where review notices come from: Robob's session board, or a stand-in in tests. */
 export interface ReviewBoard {
   snapshot(): Promise<BoardSnapshot>;
 }
@@ -28,41 +21,59 @@ export function runOrdinal(runId: string | null | undefined): number {
   return match ? Number(match[1]) : 0;
 }
 
+/** One card of Robob's session board (/api/ardud/board), as the server sends it. */
+export interface RobobBoardEntry {
+  threadId: string;
+  projectId: string | null;
+  title: string;
+  state: BoardEntry["state"];
+  /** `working`, `queued`, `background`, `needs-input`, `idle`, `deleted` or `unknown`. */
+  status: string;
+  workRevision: number;
+  updatedAt: number;
+  attention?: { kind: "question" | "approval"; count: number };
+  worktreePath?: string | null;
+}
+
+export interface RobobBoardSnapshot {
+  version: 1;
+  revision: number;
+  activatedAt: number;
+  entries: RobobBoardEntry[];
+  syncError: string | null;
+}
+
 /**
- * Board state for one root thread, or undefined when it never belongs on the
- * board. iMessage threads are quiet. Other origins (automation, crw, watcher)
- * are someone else's to review, so they count as scheduled, which attention.ts
- * never announces. A thread the owner marked settled counts as backlog.
+ * Maps a server card onto attention.ts's board vocabulary. The server already
+ * leaves iMessage threads off the board, files automated origins under
+ * scheduled and rolls subagents up into their parent, so only the live status
+ * needs translating: a card is idle only when nothing under it still works.
  */
-export function boardEntry(thread: ThreadSummary, directory: string): BoardEntry | undefined {
-  if (thread.origin === IMESSAGE_ORIGIN || thread.archived) return;
-  const busy = BUSY.has(thread.state);
-  const state: BoardEntry["state"] = thread.origin !== null ? "scheduled" : thread.settled ? "backlog" : busy ? "running" : "waiting";
+export function boardEntry(entry: RobobBoardEntry, directory: string): BoardEntry {
   return {
-    sessionId: thread.threadId,
+    sessionId: entry.threadId,
     directory,
-    title: thread.title,
-    ...(thread.parentThreadId ? { parentId: thread.parentThreadId } : {}),
-    projectId: thread.projectId,
-    state,
-    status: busy ? "busy" : "idle",
-    workRevision: runOrdinal(thread.latestRunId),
-    updatedAt: epoch(thread.updatedAt),
-    ...(thread.pendingRequest ? { attention: { kind: thread.pendingRequest.kind, count: 1 } } : {}),
+    title: entry.title,
+    ...(entry.projectId ? { projectId: entry.projectId } : {}),
+    state: entry.state,
+    status: entry.status === "idle" ? "idle" : entry.status === "deleted" || entry.status === "unknown" ? entry.status : "busy",
+    workRevision: entry.workRevision,
+    updatedAt: entry.updatedAt,
+    ...(entry.attention ? { attention: entry.attention } : {}),
   };
 }
 
-export class ThreadReviewBoard implements ReviewBoard {
-  constructor(private readonly client: Pick<ControlClient, "listThreads">, private readonly directories: ThreadDirectories, private readonly limit = 200) {}
+export class ServerReviewBoard implements ReviewBoard {
+  constructor(private readonly client: Pick<ControlClient, "board">, private readonly directories: ThreadDirectories) {}
 
   async snapshot(): Promise<BoardSnapshot> {
-    const { threads } = await this.client.listThreads({ limit: this.limit });
+    const board = await this.client.board<RobobBoardSnapshot>();
     const entries: BoardEntry[] = [];
-    for (const thread of threads) {
-      const entry = boardEntry(thread, await this.directories.of(thread));
-      if (entry) entries.push(entry);
+    for (const entry of board.entries) {
+      const directory = entry.worktreePath ?? (entry.projectId ? await this.directories.rootOf(entry.projectId) : undefined) ?? "/";
+      entries.push(boardEntry(entry, directory));
     }
-    return { version: 1, revision: 0, activatedAt: ROBOB_BOARD_ACTIVATED, migrationComplete: true, entries };
+    return { version: 1, revision: board.revision, activatedAt: board.activatedAt, migrationComplete: true, entries, syncError: board.syncError };
   }
 }
 
@@ -73,6 +84,7 @@ export interface RobobAlertOptions extends ControlConfigOptions {
 
 /** The Telegram alert backend on Robob's control API. Session ids are thread ids; `ses_` ids resolve through the import mapping. */
 export class RobobAlertBackend implements AlertBackend {
+  readonly brand = { app: "Robob", board: "the Board" };
   readonly client: ControlClient;
   readonly directories: ThreadDirectories;
   private readonly board: ReviewBoard;
@@ -83,7 +95,7 @@ export class RobobAlertBackend implements AlertBackend {
   constructor(options: RobobAlertOptions = {}) {
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
-    this.board = options.board ?? new ThreadReviewBoard(this.client, this.directories);
+    this.board = options.board ?? new ServerReviewBoard(this.client, this.directories);
   }
 
   private async resolve(id: string): Promise<string> {
