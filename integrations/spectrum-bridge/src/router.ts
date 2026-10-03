@@ -608,6 +608,29 @@ export class Router {
       .filter(Boolean).join(" ");
   }
 
+  private retiring = false;
+  private retireAgain = false;
+
+  /**
+   * Settles earlier chats in the background once the route moves on, so only the live one stays open.
+   * One pass at a time, always keeping the route stored when it starts; a route change mid-pass queues another.
+   */
+  private retireOthers(): void {
+    const backend = this.backend;
+    if (!backend.retireOthers) return;
+    if (this.retiring) { this.retireAgain = true; return; }
+    const keep = this.store.get<Route | null>("route")?.id;
+    if (!keep) return;
+    this.retiring = true;
+    void backend.retireOthers(keep)
+      .then(count => { if (count) this.options.log?.("chats-settled", String(count)); })
+      .catch(() => {})
+      .finally(() => {
+        this.retiring = false;
+        if (this.retireAgain) { this.retireAgain = false; this.retireOthers(); }
+      });
+  }
+
   private async newChat(inboundId: string, preceding: Set<string>): Promise<void> {
     const old = this.store.get<Route | null>("route");
     const turn = this.store.get<Turn | null>("activeTurn");
@@ -636,6 +659,7 @@ export class Router {
         this.store.set("route", { ...created, generation, createdAt: Date.now() });
         this.acknowledge(inboundId, "Fresh start. What's up?");
       }).immediate();
+      this.retireOthers();
     } catch {
       this.acknowledge(inboundId, "Couldn't start fresh just now. Try /new again in a moment.", "unknown");
     }
@@ -1094,6 +1118,7 @@ export class Router {
           this.store.set("route", activeRoute);
           this.store.set(`batch-phase:${row.id}`, "preparing");
         }).immediate();
+        this.retireOthers();
       } catch {
         this.acknowledge(row.id, "I couldn't get started on that just now. Mind sending it again in a moment?", "unknown");
         return;
@@ -1278,6 +1303,7 @@ export class Router {
       if (refused) this.store.set("refusedRoute", null);
     }).immediate();
     this.options.log?.("route-rotated", refused ? "providerRefusal" : large ? "contextSize" : "age");
+    this.retireOthers();
     return next;
   }
 

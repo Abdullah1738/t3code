@@ -253,6 +253,8 @@ export interface ChatBackend {
   health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
   createChat(title?: string): Promise<{ id: string; directory: string }>;
   markImessageOrigin(id: string, directory?: string): Promise<"marked" | "already" | "missing">;
+  /** Settles every other idle iMessage chat once the route moves to `keepId`. Best effort; returns how many it settled. */
+  retireOthers?(keepId: string): Promise<number>;
   getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
   children(id: string, directory: string): Promise<SessionRecord[]>;
   messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;

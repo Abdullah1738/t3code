@@ -13,7 +13,7 @@ type Thread = {
   threadId: string; projectId: string; title: string; origin: string | null; runtimeMode: string;
   worktreePath: string | null; parentThreadId: string | null; nativeSessionId: string | null;
   runs: Array<{ runId: string; ordinal: number; status: string }>;
-  messages: ControlMessage[]; pending: PendingRequest[]; lastError: string | null;
+  messages: ControlMessage[]; pending: PendingRequest[]; lastError: string | null; settled?: boolean;
 };
 type Call = { method: string; path: string; body?: any; auth: string | null };
 
@@ -31,6 +31,8 @@ function fakeControl() {
   const threads = new Map<string, Thread>();
   const natives = new Map<string, string>();
   const calls: Call[] = [];
+  /** `ignoreSettled` mimics a server from before PATCH learned `settled`. */
+  const flags = { ignoreSettled: false };
   const projects = [{ projectId: "chats", title: "iMessage", workspaceRoot: "/chats" }];
   let counter = 0;
   const now = () => new Date(Date.now() + counter++).toISOString();
@@ -41,7 +43,7 @@ function fakeControl() {
     origin: thread.origin, nativeSessionId: thread.nativeSessionId, runtimeMode: thread.runtimeMode, parentThreadId: thread.parentThreadId,
     rootThreadId: thread.parentThreadId ?? thread.threadId, worktreePath: thread.worktreePath, latestRunId: thread.runs.at(-1)?.runId ?? null,
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
-    lastError: thread.lastError, createdAt: now(), updatedAt: now(),
+    lastError: thread.lastError, settled: thread.settled ?? false, createdAt: now(), updatedAt: now(),
   });
   const detail = (thread: Thread) => ({ ...summary(thread), run: thread.runs.at(-1) ?? null, recentRuns: [...thread.runs].reverse(), pendingRequests: thread.pending });
   const ok = (body: object, status = 200) => Response.json({ ok: true, ...body }, { status });
@@ -66,6 +68,7 @@ function fakeControl() {
         let list = [...threads.values()];
         if (searchParams.get("parentThreadId")) list = list.filter(thread => thread.parentThreadId === searchParams.get("parentThreadId"));
         if (searchParams.get("active") === "true") list = list.filter(thread => state(thread) !== "idle");
+        if (searchParams.get("origin")) list = list.filter(thread => thread.origin === searchParams.get("origin"));
         return ok({ total: list.length, threads: list.map(summary) });
       }
       if (parts[0] === "threads" && parts[1] === "by-native") {
@@ -74,6 +77,13 @@ function fakeControl() {
       }
       const thread = parts[0] === "threads" ? threads.get(parts[1]!) : undefined;
       if (parts[0] === "threads" && !thread) return notFound();
+      if (thread && parts.length === 2 && request.method === "PATCH") {
+        if (body.settled !== undefined) {
+          if (body.settled && state(thread) !== "idle") return Response.json({ ok: false, error: { code: "conflict", message: "busy" } }, { status: 409 });
+          if (!flags.ignoreSettled) thread.settled = body.settled;
+        }
+        return ok({ thread: detail(thread) });
+      }
       if (thread && parts.length === 2) return ok({ thread: detail(thread) });
       if (thread && parts[2] === "messages") return ok({ threadId: thread.threadId, state: state(thread), messages: thread.messages });
       if (thread && parts[2] === "origin") { thread.origin = body.origin; return ok({ threadId: thread.threadId, origin: body.origin }); }
@@ -104,7 +114,7 @@ function fakeControl() {
     run.status = status;
   };
   const backend = (chatRoot = "/chats") => new RobobBackend({ chatRoot, url, token: "test-token", model: async () => ({ providerID: "opus", modelID: "claude-opus-5-5", variant: "high" }) });
-  return { url, threads, natives, calls, projects, reply, backend };
+  return { url, threads, natives, calls, projects, flags, reply, backend };
 }
 
 test("backend switch defaults to OpenChamber and rejects unknown values", () => {
@@ -237,6 +247,34 @@ test("statuses list busy threads; waiting (background drain) does not block the 
   expect(await backend.statuses()).toEqual({});
 });
 
+test("retireOthers settles idle iMessage chats except the kept one", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const old = await backend.createChat();
+  const busy = await backend.createChat();
+  const keep = await backend.createChat();
+  await backend.prompt(busy.id, busy.directory, "msg_1", "still going");
+  control.threads.set("other", { ...control.threads.get(old.id)!, threadId: "other", origin: null });
+  control.threads.set("child", { ...control.threads.get(old.id)!, threadId: "child", parentThreadId: old.id });
+  expect(await backend.retireOthers(keep.id)).toBe(1);
+  expect(control.threads.get(old.id)!.settled).toBe(true);
+  expect(control.threads.get(busy.id)!.settled).toBeUndefined();
+  expect(control.threads.get(keep.id)!.settled).toBeUndefined();
+  expect(control.threads.get("other")!.settled).toBeUndefined();
+  expect(control.threads.get("child")!.settled).toBeUndefined();
+  expect(await backend.retireOthers(keep.id)).toBe(0);
+});
+
+test("retireOthers counts nothing when the server ignores settled", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const old = await backend.createChat();
+  const keep = await backend.createChat();
+  control.flags.ignoreSettled = true;
+  expect(await backend.retireOthers(keep.id)).toBe(0);
+  expect(control.threads.get(old.id)!.settled).toBeUndefined();
+});
+
 test("an unmapped ses_ route is retired so the next text starts a fresh chat", async () => {
   const control = fakeControl();
   const backend = control.backend();
@@ -262,6 +300,7 @@ test("SSE parser yields id, event and JSON data, skipping comments", async () =>
 test("the router runs a full iMessage turn on the Robob backend", async () => {
   const control = fakeControl();
   const backend = control.backend();
+  const earlier = await backend.createChat();
   const store = new Store(":memory:");
   stores.push(store);
   const transport: Pick<Photon, "typing" | "read" | "downloadAttachment"> = {
@@ -274,16 +313,20 @@ test("the router runs a full iMessage turn on the Robob backend", async () => {
   store.acceptInbound("in-1", { id: "in-1", text: "what's up?", attachments: [], isAudioMessage: false, receivedAt: Date.now() } satisfies NormalizedInbound);
   await router.tick();
   const route = store.get<{ id: string; directory: string }>("route")!;
-  expect(route.id).toBe("thread-1");
+  expect(route.id).toBe("thread-2");
+  // The earlier chat is settled in the background once the new route is stored.
+  for (let i = 0; i < 100 && !control.threads.get(earlier.id)!.settled; i++) await Bun.sleep(5);
+  expect(control.threads.get(earlier.id)!.settled).toBe(true);
+  expect(control.threads.get(route.id)!.settled).toBeUndefined();
   expect(control.threads.get(route.id)!.origin).toBe("imessage");
   const sent = control.calls.find(call => call.path.endsWith("/send"))!;
   expect(sent.body.text).toStartWith(GUIDANCE_START);
-  expect(sent.body.text).toContain("CURRENT_SESSION_ID for bridge commands: thread-1");
+  expect(sent.body.text).toContain("CURRENT_SESSION_ID for bridge commands: thread-2");
   expect(sent.body.text).toEndWith("what's up?");
   expect(store.get<{ phase: string }>("activeTurn")!.phase).toBe("running");
   control.reply(route.id, "All good here.");
   await router.tick();
   const replies = store.pendingOutbox().filter(item => item.kind === "conversation");
-  expect(replies.map(item => [item.text, item.sessionId])).toEqual([["All good here.", "thread-1"]]);
+  expect(replies.map(item => [item.text, item.sessionId])).toEqual([["All good here.", "thread-2"]]);
   expect(store.get("activeTurn")).toBeNull();
 });

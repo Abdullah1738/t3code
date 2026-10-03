@@ -177,6 +177,23 @@ export class RobobBackend implements ChatBackend {
     return "marked";
   }
 
+  async retireOthers(keepId: string): Promise<number> {
+    const keep = await this.resolve(keepId);
+    const { threads } = await this.client.listThreads({ origin: IMESSAGE_ORIGIN, limit: 500 });
+    let settled = 0;
+    for (const thread of threads) {
+      if (thread.threadId === keep || thread.parentThreadId || thread.settled || thread.archived || BUSY.has(thread.state) || thread.pendingRequest) continue;
+      try {
+        const result = await this.client.request<{ thread?: { settled?: boolean } } | undefined>("PATCH", `/threads/${encodeURIComponent(thread.threadId)}`, { settled: true });
+        // An older server ignores the field and answers 200, so only count what it reports as settled.
+        if (result?.thread?.settled === true) settled += 1;
+      } catch {
+        // A thread that started a run in the meantime refuses to settle; leave it.
+      }
+    }
+    return settled;
+  }
+
   private async record(id: string, thread: ThreadSummary, parentID?: string): Promise<SessionRecord> {
     return {
       id, directory: await this.directories.of(thread), title: thread.title,
