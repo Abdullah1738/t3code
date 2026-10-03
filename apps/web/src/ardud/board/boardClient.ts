@@ -1,3 +1,10 @@
+import {
+  acceptBoardSnapshot,
+  applyBoardDelta,
+  applyBoardSnapshot,
+  boardReconnectDelay,
+  createSseParser,
+} from "@t3tools/client-runtime/ardud/board";
 import type {
   ArdudBoardClearResult,
   ArdudBoardDelta,
@@ -32,27 +39,6 @@ export const useBoardStore = create<BoardState>(() => ({
   connection: "connecting",
   error: null,
 }));
-
-export function applyBoardSnapshot(state: BoardState, snapshot: ArdudBoardSnapshot): BoardState {
-  return {
-    ...state,
-    entries: new Map(snapshot.entries.map((entry) => [entry.threadId, entry])),
-    revision: snapshot.revision,
-    syncError: snapshot.syncError,
-  };
-}
-
-export function applyBoardDelta(state: BoardState, delta: ArdudBoardDelta): BoardState {
-  const entries = new Map(state.entries);
-  for (const id of delta.removed) entries.delete(id);
-  for (const entry of delta.upserts) entries.set(entry.threadId, entry);
-  return {
-    ...state,
-    entries,
-    revision: Math.max(state.revision, delta.revision),
-    syncError: delta.syncError,
-  };
-}
 
 // Same-origin web relies on the session cookie. Desktop (custom-scheme origin)
 // authenticates with a bearer token; the server answers CORS with "*", which
@@ -92,9 +78,7 @@ const token = (entry: BoardEntry) => ({
 });
 
 const acceptSnapshot = (snapshot: ArdudBoardSnapshot) =>
-  useBoardStore.setState((state) =>
-    snapshot.revision >= state.revision ? applyBoardSnapshot(state, snapshot) : state,
-  );
+  useBoardStore.setState((state) => acceptBoardSnapshot(state, snapshot));
 
 export const boardActions = {
   review: (entry: BoardEntry) =>
@@ -112,27 +96,6 @@ export const boardActions = {
   },
   reconcile: () => request<ArdudBoardSnapshot>("/reconcile", { body: {} }).then(acceptSnapshot),
 };
-
-/** Parses a text/event-stream body into (event, data) pairs. */
-export function createSseParser(onEvent: (event: string, data: string) => void) {
-  let buffer = "";
-  return (chunk: string) => {
-    buffer += chunk;
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      let event = "message";
-      const data: string[] = [];
-      for (const line of block.split("\n")) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
-      }
-      if (data.length > 0) onEvent(event, data.join("\n"));
-      boundary = buffer.indexOf("\n\n");
-    }
-  };
-}
 
 let subscribers = 0;
 let controller: AbortController | null = null;
@@ -183,8 +146,7 @@ async function runStream(signal: AbortSignal) {
     }
     if (signal.aborted) return;
     attempt += 1;
-    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    await new Promise((resolve) => setTimeout(resolve, boardReconnectDelay(attempt)));
   }
 }
 

@@ -14,6 +14,12 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 import { isElectron } from "../../env";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import {
+  formatBoardAge,
+  groupBoardLanes,
+  settleBoardTasks,
+  statusLabel,
+} from "@t3tools/client-runtime/ardud/board";
 import { sortScopedProjectsForSidebar } from "../../components/Sidebar.logic";
 import { useNewThreadHandler } from "../../hooks/useHandleNewThread";
 import { usePrimaryEnvironmentId } from "../../state/environments";
@@ -30,7 +36,6 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/toolt
 import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../../components/WorkspaceBreadcrumb";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { boardActions, subscribeBoard, useBoardStore, type BoardEntry } from "./boardClient";
-import { formatBoardAge, statusLabel } from "./boardFormat";
 import { errorMessage, undoToast } from "./boardToasts";
 
 type Lane = BoardEntry["state"];
@@ -48,25 +53,6 @@ const LANES: ReadonlyArray<{ lane: Lane; title: string; short: string; empty: st
 ];
 
 const PAGE_SIZE = 50;
-const UNDO_CONCURRENCY = 4;
-
-async function settleAll<T>(items: ReadonlyArray<T>, task: (item: T) => Promise<unknown>) {
-  let next = 0;
-  let failed = false;
-  const worker = async () => {
-    while (next < items.length) {
-      const item = items[next++]!;
-      try {
-        await task(item);
-      } catch {
-        failed = true;
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(UNDO_CONCURRENCY, items.length) }, worker));
-  return !failed;
-}
-
 /** Starts a draft thread in the most recently active project. */
 function BoardNewThreadButton() {
   const projects = useProjects();
@@ -111,19 +97,7 @@ export function BoardPage() {
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
   const [clearing, setClearing] = useState<Lane | null>(null);
 
-  const byLane = useMemo(() => {
-    const lanes: Record<Lane, BoardEntry[]> = {
-      running: [],
-      waiting: [],
-      backlog: [],
-      scheduled: [],
-    };
-    for (const entry of entries.values()) lanes[entry.state].push(entry);
-    for (const lane of Object.values(lanes)) {
-      lane.sort((a, b) => b.updatedAt - a.updatedAt || a.threadId.localeCompare(b.threadId));
-    }
-    return lanes;
-  }, [entries]);
+  const byLane = useMemo(() => groupBoardLanes(entries.values()), [entries]);
 
   const withBusy = async (key: string, task: () => Promise<unknown>) => {
     if (busy.has(key)) return;
@@ -191,7 +165,7 @@ export function BoardPage() {
         return;
       }
       undoToast(`Cleared ${restorable.length}`, description, async () => {
-        const ok = await settleAll(restorable, (entry) => boardActions.restore(entry));
+        const ok = await settleBoardTasks(restorable, (entry) => boardActions.restore(entry));
         if (!ok) throw new Error("Some cards could not be restored.");
       });
     } catch (error) {

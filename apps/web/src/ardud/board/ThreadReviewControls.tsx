@@ -1,6 +1,7 @@
 // ardud fork: in-thread review controls. Complete the open thread when it is
 // waiting for review, and walk the review queue without going back to the board.
 import { useNavigate } from "@tanstack/react-router";
+import { formatBoardAge } from "@t3tools/client-runtime/ardud/board";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
   CheckIcon,
@@ -21,7 +22,6 @@ import { cn } from "../../lib/utils";
 import { useProjects } from "../../state/entities";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { boardActions, subscribeBoard, useBoardStore, type BoardEntry } from "./boardClient";
-import { formatBoardAge } from "./boardFormat";
 import { errorMessage, undoToast } from "./boardToasts";
 
 // One in-flight guard per (thread, work revision) so the header button and the

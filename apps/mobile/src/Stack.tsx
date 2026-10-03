@@ -28,6 +28,7 @@ import {
   RenderFailureView,
   type RenderFailureProps,
 } from "./components/RenderErrorBoundary";
+import { BoardRouteScreen } from "./ardud/board/BoardRouteScreen";
 import { ArchivedThreadsRouteScreen } from "./features/archive/ArchivedThreadsRouteScreen";
 import { useAgentNotificationNavigation } from "./features/agent-awareness/notificationNavigation";
 import { ConnectOnboardingRouteScreen } from "./features/cloud/ConnectOnboardingRouteScreen";
@@ -689,6 +690,12 @@ const RootStackConfig = createNativeStackNavigator({
       screen: ThreadRouteScreen,
       linking: THREAD_LINKING_PREFIX,
       options: GLASS_HEADER_OPTIONS,
+    }),
+    // ardud fork: session board.
+    Board: createNativeStackScreen({
+      screen: BoardRouteScreen,
+      linking: "board",
+      options: { ...GLASS_HEADER_OPTIONS, title: "Board" },
     }),
     ThreadTerminal: createNativeStackScreen({
       screen: ThreadTerminalRouteScreen,

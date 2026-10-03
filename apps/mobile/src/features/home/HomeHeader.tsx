@@ -38,6 +38,14 @@ export function HomeHeader(props: HomeHeaderProps) {
           headerTintColor: iconColor,
           unstable_headerRightItems: () => [
             withNativeGlassHeaderItem({
+              accessibilityLabel: "Open board",
+              icon: { name: "rectangle.3.group", type: "sfSymbol" } as const,
+              identifier: "home-board",
+              label: "",
+              onPress: props.onOpenBoard,
+              type: "button",
+            }),
+            withNativeGlassHeaderItem({
               accessibilityLabel: "Open settings",
               icon: { name: "ellipsis", type: "sfSymbol" } as const,
               identifier: "home-settings",
