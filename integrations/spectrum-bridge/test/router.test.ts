@@ -3138,6 +3138,16 @@ test("forms a text reply cannot answer are announced and never answered from iMe
   expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["yes"]]]]);
 });
 
+test("the form notice names the backend's app", async () => {
+  const h = setup();
+  Object.assign(h.backend, { brand: { app: "Robob" } });
+  h.input("first", "Ask me");
+  await h.router.tick();
+  h.backend.questionRequests = [{ id: "frm_9", sessionID: "ses_1", title: "Deploy settings", questions: [], unsupported: true }];
+  await h.router.tick();
+  expect(asked(h.store).map(c => c.text)).toEqual(["There's a form waiting for you in Robob that I can't fill in over text: Deploy settings"]);
+});
+
 test("voice messages are transcribed into the prompt text, and the transcript is cached across retries", async () => {
   const calls: SttInput[] = [];
   let h!: ReturnType<typeof filesSetup>;

@@ -99,7 +99,7 @@ describe("publish and unpublish commands", () => {
       await expect(runLocalCommand({ command: "publish", app: "missing" }, { exec, apps })).rejects.toThrow("No app at");
       expect(await runLocalCommand({ command: "publish", localPort: 18791 }, { exec, apps }))
         .toEqual({ url: "https://mac.ts.net:18400", port: 18400, created: false });
-      await expect(runLocalCommand({ command: "publish", localPort: 57123 }, { exec, apps })).rejects.toThrow("OpenChamber");
+      await expect(runLocalCommand({ command: "publish", localPort: 57123 }, { exec, apps })).rejects.toThrow("tailnet root");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
