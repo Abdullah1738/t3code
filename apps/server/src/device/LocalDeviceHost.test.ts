@@ -149,6 +149,33 @@ describe("Android SDK availability", () => {
     }),
   );
 
+  it.effect("ignores an ANDROID_SDK_ROOT that points at a missing SDK", () =>
+    Effect.gen(function* () {
+      const root = "/opt/homebrew/share/android-commandlinetools";
+      const reason = yield* diagnose(
+        [
+          `${root}/platform-tools/adb`,
+          `${root}/emulator/emulator`,
+          `${root}/cmdline-tools/latest/bin/avdmanager`,
+        ],
+        { HOME: "/home", ANDROID_SDK_ROOT: "/home/Library/Android/sdk" },
+      );
+      expect(reason).toBeNull();
+    }),
+  );
+
+  it.effect("uses ANDROID_SDK_ROOT when ANDROID_HOME is stale", () =>
+    Effect.gen(function* () {
+      const root = "/sdks/android";
+      const reason = yield* diagnose([`${root}/platform-tools/adb`], {
+        HOME: "/home",
+        ANDROID_HOME: "/home/Library/Android/sdk",
+        ANDROID_SDK_ROOT: root,
+      });
+      expect(reason).toContain(`Android Emulator is missing from ${root}.`);
+    }),
+  );
+
   it.effect("finds an SDK through an avdmanager symlink on PATH", () =>
     Effect.gen(function* () {
       const root = "/sdks/android";
@@ -189,13 +216,14 @@ it.effect("puts detected Android tools on the helper PATH without losing existin
   Effect.gen(function* () {
     const path = yield* Path.Path;
     const environment = LocalDeviceHost.__testing.deviceHostEnvironment(
-      { PATH: "/usr/bin", HOME: "/test/home" },
+      { PATH: "/usr/bin", HOME: "/test/home", ANDROID_SDK_ROOT: "/stale/sdk" },
       "/sdk",
       "darwin",
       path,
     );
     expect(environment.PATH).toBe("/sdk/platform-tools:/sdk/emulator:/usr/bin");
     expect(environment.ANDROID_HOME).toBe("/sdk");
+    expect(environment.ANDROID_SDK_ROOT).toBe("/sdk");
     expect(environment.HOME).toBe("/test/home");
   }).pipe(Effect.provide(NodePath.layer)),
 );

@@ -130,7 +130,25 @@ const androidSdk = Effect.gen(function* () {
   const environment = yield* HostProcessEnvironment;
   const platform = yield* HostProcessPlatform;
   const home = environment.HOME ?? environment.USERPROFILE ?? "";
-  const explicit = environment.ANDROID_HOME?.trim() || environment.ANDROID_SDK_ROOT?.trim();
+  const exists = (file: string) => fs.exists(file).pipe(Effect.orElseSucceed(() => false));
+  const hasTools = (root: string) =>
+    Effect.gen(function* () {
+      const suffix = platform === "win32" ? ".exe" : "";
+      return (
+        (yield* exists(path.join(root, "platform-tools", `adb${suffix}`))) ||
+        (yield* exists(path.join(root, "emulator", `emulator${suffix}`)))
+      );
+    });
+  // A stale ANDROID_HOME/ANDROID_SDK_ROOT (left in a shell profile after the SDK moved)
+  // must not hide an SDK we can discover, so only trust one that has any SDK tool.
+  let explicit: string | undefined;
+  for (const configured of [environment.ANDROID_HOME, environment.ANDROID_SDK_ROOT]) {
+    const root = configured?.trim();
+    if (root && (yield* hasTools(root))) {
+      explicit = root;
+      break;
+    }
+  }
   const candidates = explicit
     ? [explicit]
     : [
@@ -167,7 +185,6 @@ const androidSdk = Effect.gen(function* () {
       }
     }
   }
-  const exists = (file: string) => fs.exists(file).pipe(Effect.orElseSucceed(() => false));
   const inspect = Effect.fn(function* (root: string) {
     const adb = yield* exists(
       path.join(root, "platform-tools", platform === "win32" ? "adb.exe" : "adb"),
@@ -219,6 +236,8 @@ const deviceHostEnvironment = (
     ? {
         ...environment,
         ANDROID_HOME: sdkRoot,
+        // Tools prefer ANDROID_SDK_ROOT when set, so don't let a stale one win.
+        ANDROID_SDK_ROOT: sdkRoot,
         PATH: [
           path.join(sdkRoot, "platform-tools"),
           path.join(sdkRoot, "emulator"),
