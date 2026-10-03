@@ -770,7 +770,9 @@ test("owner commands: help, status, reminders, cancel, and snooze with durable a
   h.store.createReminder({ id: "R1", text: "stretch", dueAt: now + 60_000, timezone: "UTC" });
   await h.attention.handleUpdate(h.message(1, "/start"));
   expect(h.store.getOperation("ack:1")?.text).toContain("OpenChamber alert bridge.");
+  Object.assign(h.backend, { brand: { app: "Robob", board: "the Board" } });
   await h.attention.handleUpdate(h.message(2, "/help"));
+  expect(h.store.getOperation("ack:2")?.text).toStartWith("Robob alert bridge.");
   expect(h.store.getOperation("ack:2")?.text).toContain("/reminders");
   await h.attention.handleUpdate(h.message(3, "/status"));
   expect(JSON.parse(h.store.getOperation("ack:3")!.text)).toEqual({

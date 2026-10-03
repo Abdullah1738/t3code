@@ -875,7 +875,7 @@ export class Router {
       const resources = request.resources.slice(0, 5).join("\n").slice(0, 1_000);
       text = `Quick check before I go on: ${request.action.slice(0, 200)}${resources ? `\n${resources}` : ""}\nOK to go ahead?`;
     } else if (request.unsupported) {
-      text = `There's a form waiting for you in OpenChamber that I can't fill in over text: ${request.title.slice(0, 200)}`;
+      text = `There's a form waiting for you in ${this.backend.brand?.app ?? "OpenChamber"} that I can't fill in over text: ${request.title.slice(0, 200)}`;
       entry.unsupported = true;
     } else {
       const question = request.questions[step]!;

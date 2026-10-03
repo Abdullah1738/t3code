@@ -248,6 +248,8 @@ function validRoot(root: unknown): root is string {
  * implements it here; Robob's control API implements it in robob.ts.
  */
 export interface ChatBackend {
+  /** How owner-facing text names the app. Defaults to OpenChamber. */
+  readonly brand?: { app: string };
   health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
   createChat(title?: string): Promise<{ id: string; directory: string }>;
   markImessageOrigin(id: string, directory?: string): Promise<"marked" | "already" | "missing">;

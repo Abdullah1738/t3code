@@ -70,9 +70,9 @@ describe("publish", () => {
     expect(ts.web).toMatchObject(LIVE);
   });
 
-  test("refuses the OpenChamber port, invalid local ports, and a full range", async () => {
+  test("refuses the tailnet root port, invalid local ports, and a full range", async () => {
     const ts = fakeTailscale(LIVE);
-    await expect(publish(57123, { exec: ts.exec })).rejects.toThrow("OpenChamber");
+    await expect(publish(57123, { exec: ts.exec })).rejects.toThrow("tailnet root");
     for (const port of [0, -1, 65536, 1.5, NaN]) await expect(publish(port, { exec: ts.exec })).rejects.toThrow("1-65535");
     const full = fakeTailscale(Object.fromEntries(Array.from({ length: 100 }, (_, i) => [String(18400 + i), `http://127.0.0.1:${2000 + i}`])));
     await expect(publish(18791, { exec: full.exec })).rejects.toThrow("No free tailnet port");

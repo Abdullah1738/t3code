@@ -20,7 +20,7 @@ type Selection = Record<string, number[]>;
 type Sequence = { answers: string[][]; selected: number[]; text?: string };
 const sequenceKey = (noticeId: string) => `sequence:${noticeId}`;
 
-const HELP_TEXT = "OpenChamber alert bridge. This bot delivers alerts, reminders, and approval/question prompts with tap buttons. Conversations stay on iMessage. Commands: /status, /reminders, /cancel ID, /snooze ID 5m|1h|2d.";
+const helpText = (app: string) => `${app} alert bridge. This bot delivers alerts, reminders, and approval/question prompts with tap buttons. Conversations stay on iMessage. Commands: /status, /reminders, /cancel ID, /snooze ID 5m|1h|2d.`;
 const INVALID_ANSWERS = "Choose one answer per question, or one or more distinct answers where multiple choices are allowed. Use exact option labels; other text is accepted only when custom answers are allowed.";
 const ALERTS_ONLY = "This bridge is alerts-only. Conversations happen over iMessage. Use /help for commands.";
 
@@ -489,7 +489,7 @@ export class Attention {
     const text = update.text.trim();
     const command = text.split(/\s/, 1)[0];
     if (command === "/start" || command === "/help") {
-      this.ack(update.messageId, HELP_TEXT);
+      this.ack(update.messageId, helpText(this.app));
       return;
     }
     if (text === "/status") {

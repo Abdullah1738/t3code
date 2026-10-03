@@ -111,6 +111,7 @@ export interface RobobBackendOptions extends ControlConfigOptions {
 
 /** The iMessage router's backend on Robob's control API. Accepts thread ids and OpenCode `ses_` ids alike. */
 export class RobobBackend implements ChatBackend {
+  readonly brand = { app: "Robob" };
   readonly client: ControlClient;
   private readonly chatRoot: string;
   private readonly directories: ThreadDirectories;

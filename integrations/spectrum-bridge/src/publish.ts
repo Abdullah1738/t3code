@@ -124,7 +124,7 @@ export function publish(localPort: number, { exec = tailscaleExec() }: { exec?: 
     if (!validPort(localPort)) throw new PublishError("Local port must be 1-65535");
     const state = await readServe(exec);
     const root = state.handlers.find(handler => handler.port === 443 && handler.path === "/");
-    if (root && localTarget(root.proxy) === localPort) throw new PublishError("Refusing to publish the OpenChamber port");
+    if (root && localTarget(root.proxy) === localPort) throw new PublishError("Refusing to publish the port served at the tailnet root");
     const existing = state.handlers.find(handler => handler.path === "/" && localTarget(handler.proxy) === localPort && validHost(handler.host));
     if (existing) return { url: httpsUrl(existing.host.toLowerCase(), existing.port), port: existing.port, created: false };
     const host = await selfDnsName(exec);
