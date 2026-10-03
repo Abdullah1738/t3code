@@ -1374,6 +1374,8 @@ export const layer: Layer.Layer<
               ))
             : input.session.startTurn(turnInput);
           yield* startTurn.pipe(
+            // The event fiber is detached; an interrupted start must not leak it.
+            Effect.onInterrupt(() => Fiber.interrupt(providerEventFiber)),
             Effect.catchCause((cause) =>
               Effect.logError("orchestration V2 provider turn start failed", {
                 runId: input.run.id,

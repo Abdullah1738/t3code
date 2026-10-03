@@ -1374,11 +1374,15 @@ export const layerWithOptions = (
               }),
             ).pipe(
               Effect.andThen(observeActivity(providerSessionId, markBusy(providerSessionId))),
-              Effect.andThen(runtime.startTurn(input)),
-              Effect.catch((error) =>
-                observeActivity(providerSessionId, markIdle(providerSessionId)).pipe(
-                  Effect.andThen(Effect.fail(error)),
-                ),
+              // Interrupted or failed, the turn never started, so the session is idle again.
+              Effect.andThen(
+                runtime
+                  .startTurn(input)
+                  .pipe(
+                    Effect.onError(() =>
+                      observeActivity(providerSessionId, markIdle(providerSessionId)),
+                    ),
+                  ),
               ),
             ),
           steerTurn: (input) =>

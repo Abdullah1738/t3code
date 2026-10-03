@@ -313,11 +313,20 @@ const colorForm = {
  */
 const resumed = (
   entries: ReadonlyArray<ProviderReplayEntry>,
-  options?: { readonly external?: boolean; readonly supervised?: boolean },
+  options?: {
+    readonly external?: boolean;
+    readonly supervised?: boolean;
+    /**
+     * Receives the whole transcript and is replayed as is, so a test can add
+     * what a server that came back answers only after something happened.
+     */
+    readonly transcript?: Array<ProviderReplayEntry>;
+  },
 ) =>
   Effect.gen(function* () {
-    const runtime = yield* openCode2ReplayRuntime(
-      withInstructions([
+    const sink = options?.transcript ?? [];
+    sink.push(
+      ...withInstructions([
         ...opening,
         out("session.get", { sessionID: SESSION }),
         replyData("session.get", sessionInfo()),
@@ -332,6 +341,9 @@ const resumed = (
           : []),
         ...entries,
       ]),
+    );
+    const runtime = yield* openCode2ReplayRuntime(
+      sink,
       options?.external === undefined ? undefined : { external: options.external },
     );
     const thread = yield* runtime.resumeThread({
@@ -2195,13 +2207,87 @@ describe("OpenCode2 adapter", () => {
     Effect.gen(function* () {
       // The server goes away with no turn running, and never comes back.
       const { runtime, thread } = yield* resumed([{ type: "runtime_exit", status: "success" }]);
-      // Reconnecting backs off for a few minutes, then ends the runtime's events.
+      // Reconnecting backs off for a while, then ends the runtime's events.
       const drained = yield* runtime.events.pipe(Stream.runDrain, Effect.forkScoped);
-      yield* TestClock.adjust("6 minutes");
+      yield* TestClock.adjust("20 minutes");
       yield* Fiber.join(drained);
       const refused = yield* runtime.startTurn(turnInput(thread)).pipe(Effect.flip);
       assert.equal(refused._tag, "ProviderAdapterEventStreamError");
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("sends a turn started while reconnecting once the stream is back", () =>
+    Effect.gen(function* () {
+      // A stalled server can take minutes to come back. The turn starts at
+      // once without holding its caller, and is sent when the stream returns.
+      const transcript: Array<ProviderReplayEntry> = [];
+      const { runtime, thread } = yield* resumed([{ type: "runtime_exit", status: "success" }], {
+        transcript,
+      });
+      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* TestClock.adjust("1 second");
+      yield* runtime.startTurn(turnInput(thread));
+      yield* TestClock.adjust("5 minutes");
+      assert.isUndefined(terminal.pollUnsafe());
+      // The server comes back. The held turn sent nothing, so there is no
+      // history to read back for it.
+      transcript.push(
+        out("event.subscribe"),
+        out("session.instructions.entry.put", {
+          sessionID: SESSION,
+          key: "t3-code",
+          value: "<any>",
+        }),
+        reply("session.instructions.entry.put", null),
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      );
+      yield* TestClock.adjust("1 minute");
+      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("fails a turn started while reconnecting once reconnecting gives up", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([{ type: "runtime_exit", status: "success" }]);
+      const events = yield* runtime.events.pipe(Stream.runCollect, Effect.forkScoped);
+      yield* TestClock.adjust("1 second");
+      yield* runtime.startTurn(turnInput(thread));
+      yield* TestClock.adjust("20 minutes");
+      const collected = yield* Fiber.join(events);
+      const terminal = collected.find((event) => event.type === "turn.terminal");
+      assert.deepInclude(terminal, { status: "failed", threadDisposition: "broken" });
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("stops a turn held for a reconnect without asking the server", () =>
+    Effect.gen(function* () {
+      // The replay fails on any request: the server is still down.
+      const { runtime, thread } = yield* resumed([{ type: "runtime_exit", status: "success" }]);
+      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* TestClock.adjust("1 second");
+      yield* runtime.startTurn(turnInput(thread));
+      yield* runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId: yield* providerTurnId,
+        requestRuntimeRestart: false,
+      });
+      assert.equal((yield* Fiber.join(terminal))?.status, "interrupted");
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("refuses a turn once its session closed while reconnecting", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const { runtime, thread } = yield* resumed([
+        { type: "runtime_exit", status: "success" },
+      ]).pipe(Scope.provide(scope));
+      yield* TestClock.adjust("1 second");
+      yield* Scope.close(scope, Exit.void);
+      const refused = yield* runtime.startTurn(turnInput(thread)).pipe(Effect.flip);
+      assert.equal(refused._tag, "ProviderAdapterEventStreamError");
+    }).pipe(Effect.provide(TestClock.layer())),
   );
 
   it.effect("logs why reconnecting to a lost event stream gave up", () => {
@@ -2216,7 +2302,7 @@ describe("OpenCode2 adapter", () => {
     return Effect.gen(function* () {
       const { runtime } = yield* resumed([{ type: "runtime_exit", status: "success" }]);
       const drained = yield* runtime.events.pipe(Stream.runDrain, Effect.forkScoped);
-      yield* TestClock.adjust("6 minutes");
+      yield* TestClock.adjust("20 minutes");
       yield* Fiber.join(drained);
       const gaveUp = logs.find((entry) =>
         JSON.stringify(entry.message).includes("Could not reconnect to the OpenCode event stream"),
@@ -2243,7 +2329,7 @@ describe("OpenCode2 adapter", () => {
       // The runtime's event stream has one consumer.
       const events = yield* runtime.events.pipe(Stream.runCollect, Effect.forkScoped);
       yield* runtime.startTurn(turnInput(thread));
-      yield* TestClock.adjust("6 minutes");
+      yield* TestClock.adjust("20 minutes");
       const collected = yield* Fiber.join(events);
       const terminal = collected.find((event) => event.type === "turn.terminal");
       assert.deepInclude(terminal, { status: "failed", threadDisposition: "broken" });

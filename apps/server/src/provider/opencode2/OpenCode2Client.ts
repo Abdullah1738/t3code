@@ -94,9 +94,11 @@ export class OpenCode2Client extends Context.Service<
 
 /**
  * OpenCode writes a `: heartbeat` comment every 10 to 15 seconds, so this long
- * without a single byte means the server is stuck, not idle.
+ * without a single byte means the server is stuck, not idle. A busy server can
+ * go quiet for a minute or two and then carry on, which is cheaper to wait out
+ * than to reconnect from; a server that exits closes the stream on its own.
  */
-const SILENT_STREAM_TIMEOUT = "45 seconds";
+const SILENT_STREAM_TIMEOUT = "2 minutes";
 
 const decodeEvent = Schema.decodeUnknownResult(Schema.fromJsonString(OpenCodeEvent));
 // Just enough of an event to route it, for frames the full schema rejects.

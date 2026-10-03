@@ -110,7 +110,7 @@ describe("OpenCode2Client events", () => {
       const drained = yield* (yield* events).pipe(Stream.runDrain, Effect.flip, Effect.forkChild);
       // Let the first frame arrive and the timer start before the clock moves.
       for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
-      yield* TestClock.adjust("46 seconds");
+      yield* TestClock.adjust("121 seconds");
       const failure = yield* Fiber.join(drained);
       assert.strictEqual(failure._tag, "OpenCode2SilentStreamError");
     }).pipe(Effect.provide(TestClock.layer())),
