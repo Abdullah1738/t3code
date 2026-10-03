@@ -251,6 +251,15 @@ interface ActiveTurn {
    */
   unsent: boolean;
   /**
+   * Installed while the event stream reconnects, and not set up yet. The
+   * session's executions are not this turn's until then: one OpenCode runs on
+   * its own meanwhile is held as a wake, which the turn joins once it is set
+   * up. It takes no steers, and a Stop ends it here.
+   */
+  parked: boolean;
+  /** Set while its request is on the way: the server may not have its prompt yet. */
+  submitting: boolean;
+  /**
    * Steers sent into this turn that OpenCode has not delivered yet, by inbox
    * id. Each one wakes the session, so an execution that ends before reading
    * one is followed by another that does, and the turn spans both.
@@ -401,6 +410,10 @@ interface ThreadState {
     | undefined;
   instructions: string | undefined;
 }
+
+/** The thread's turn that owns its session's executions; a parked one does not yet. */
+const runningTurn = (state: ThreadState | undefined) =>
+  state?.active?.parked === true ? undefined : state?.active;
 
 type TurnTerminal =
   | { readonly status: "completed" | "interrupted" }
@@ -1016,7 +1029,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           ? { state, turn: background.turn }
           : undefined;
       }
-      return state.active === undefined ? undefined : { state, turn: state.active };
+      const turn = runningTurn(state);
+      return turn === undefined ? undefined : { state, turn };
     };
 
     /**
@@ -1281,6 +1295,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       compactions: 0,
       interrupted: false,
       unsent: false,
+      parked: false,
+      submitting: false,
       steers: new Set(),
       settledInbox: new Set(),
       heldEnd: undefined,
@@ -2406,7 +2422,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       // A subagent a held execution started is named only when that execution replays.
       const parent = announced.get(sessionId)?.parentID;
       const holder = parent === undefined ? undefined : threads.get(parent);
-      return holder !== undefined && holder.active === undefined && holder.wakes.length > 0
+      return holder !== undefined && runningTurn(holder) === undefined && holder.wakes.length > 0
         ? holder
         : undefined;
     };
@@ -2504,7 +2520,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       // Marks where a running turn's own execution begins; it never ends one.
       // With no turn running it is a subagent's or a follow-up's start, below.
       if (event.type === "unreadable.execution.started") {
-        const turn = threads.get(event.sessionID)?.active;
+        const turn = runningTurn(threads.get(event.sessionID));
         if (turn !== undefined) {
           turn.awaitingStart = false;
           turn.heldEnd = undefined;
@@ -2513,7 +2529,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       }
       if (event.type === "unreadable.execution.ended") {
         const state = threads.get(event.sessionID);
-        const turn = state?.active;
+        const turn = runningTurn(state);
         if (state === undefined || turn === undefined || turn.awaitingStart) return;
         return yield* endExecution(
           state,
@@ -2599,7 +2615,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         }
         return yield* startChildTurn(state);
       }
-      const turn = state.active;
+      const turn = runningTurn(state);
       if (turn === undefined) {
         // OpenCode started the thread's session on its own.
         if (started && state.subagent === undefined) return yield* onWake(state);
@@ -2741,10 +2757,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const reconcile = Effect.gen(function* () {
       // A subagent's turn ends before the turn that waits on it, so the
       // deepest sessions are read back first.
-      // A turn that has not sent its request has no history to read back yet
-      // (one held for this reconnect sends once it is done).
+      // A turn whose request the server may not have yet has no history to
+      // read back (one held for this reconnect sends once it is done).
       const running = [...threads]
-        .filter(([, state]) => state.active !== undefined && !state.active.unsent)
+        .filter(
+          ([, state]) =>
+            state.active !== undefined && !state.active.unsent && !state.active.submitting,
+        )
         .toSorted(([left], [right]) => callsAbove(right).length - callsAbove(left).length);
       const background = [...threads.values()].filter(
         (state) => state.subagent === undefined && hasBackground(state),
@@ -3307,14 +3326,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
 
     /**
      * Installs a turn T3 started; every path after it ends the turn with a
-     * terminal. A turn held for a reconnect (`holdTurn`) is installed while
-     * the stream is down; reconnecting giving up ends it with the rest.
+     * terminal. A turn held for a reconnect is installed while the stream is
+     * down (see `parked`); reconnecting giving up ends it with the rest.
      */
     const beginTurn = (
       state: ThreadState,
       turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
       awaitingStart: boolean,
-      reconnecting = false,
     ) =>
       Effect.gen(function* () {
         const startedAt = yield* DateTime.now;
@@ -3339,8 +3357,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           completedAt: null,
         };
         const turn = makeTurn(turnInput, providerTurn, { scope: "", awaitingStart });
-        // No stream is left to end this turn, so it must not start.
-        if (streamFailure !== undefined && !reconnecting) {
+        // No stream is left to end this turn, so it must not start. One that
+        // starts while the stream reconnects is read back once it is back.
+        if (streamEnded) {
           return yield* new ProviderAdapter.ProviderAdapterEventStreamError({
             driver,
             providerSessionId: input.providerSessionId,
@@ -3599,7 +3618,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             if (state === undefined || (held !== undefined && state.active !== held)) return;
             // OpenCode already ran this turn on its own; it prompts nothing.
             if (isContinuation(turnInput)) {
-              if (held !== undefined) held.unsent = false;
+              if (held !== undefined) {
+                held.unsent = false;
+                held.parked = false;
+              }
               return yield* runWake(state, turnInput, held);
             }
             // After a timed-out Stop the server says whether that run is gone. A
@@ -3687,6 +3709,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             // A held turn a Stop ended during its setup sends nothing.
             if (state.active !== turn) return;
             turn.unsent = true;
+            turn.parked = false;
             // An execution OpenCode is running on its own takes this prompt at
             // its next step, so this turn is that execution from here on.
             yield* lock.withPermit(takeRunningWake(state));
@@ -3695,7 +3718,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         );
         if (started === undefined) return;
         const { state, sessionId, turn } = started;
+        turn.submitting = true;
         yield* submit(sessionId, turnInput, state, turn).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              turn.submitting = false;
+            }),
+          ),
           // Deleted outside T3: the thread is broken, and forgetting it makes
           // the next turn resume, fail, and recreate it with a handoff.
           Effect.catchTags({
@@ -3893,8 +3922,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                   cause: streamFailure ?? "The OpenCode event stream ended.",
                 });
               }
-              const held = yield* beginTurn(state, turnInput, false, true);
+              const held = yield* beginTurn(state, turnInput, false);
               held.unsent = true;
+              held.parked = true;
               return { state, held };
             }),
           );
@@ -3941,7 +3971,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             turn.providerTurn.id !== steerInput.providerTurnId ||
             turn.interrupted ||
             // A turn held for a reconnect has no execution to steer yet.
-            (streamFailure !== undefined && turn.unsent)
+            turn.parked
           ) {
             return yield* new ProviderAdapter.ProviderAdapterProtocolError({
               driver: OPENCODE_PROVIDER,
@@ -4004,7 +4034,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           }
           // A turn held for a reconnect sent nothing, and the server may not
           // answer yet: it ends here, and never sends its request.
-          if (streamFailure !== undefined && turn.unsent) {
+          if (turn.parked) {
             turn.interrupted = true;
             return yield* lock.withPermit(finishTurn(state, { status: "interrupted" }));
           }
