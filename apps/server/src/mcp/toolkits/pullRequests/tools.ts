@@ -288,6 +288,6 @@ export const PullRequestsToolkit = Toolkit.make(
   LinkPullRequestTool,
   UnlinkPullRequestTool,
   ListThreadPullRequestsTool,
-  WatchPullRequestTool,
-  UnwatchPullRequestTool,
+  // ardud: PR watch is off in Robob (crw owns PR babysitting). Re-add
+  // WatchPullRequestTool and UnwatchPullRequestTool to turn it back on.
 );

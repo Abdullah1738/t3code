@@ -240,7 +240,8 @@ export const make = Effect.gen(function* () {
       threadTitleRegeneration: true,
       threadVisitedTracking: true,
       threadPullRequests: true,
-      threadPullRequestWatch: true,
+      // ardud: PR watch is off in Robob.
+      threadPullRequestWatch: false,
       pullRequestStackActions: true,
       threadPullRequestLinking: true,
       serverResolvedCommandContext: true,

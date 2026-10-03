@@ -318,8 +318,6 @@ const make = Effect.gen(function* () {
       }),
     list_thread_pull_requests: () =>
       requireThread(PullRequestListFailedError).pipe(Effect.map(listThreadPullRequests)),
-    watch_pull_request: (input) => setWatching(input, true),
-    unwatch_pull_request: (input) => setWatching(input, false),
   });
 });
 
