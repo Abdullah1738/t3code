@@ -2697,6 +2697,74 @@ describe("OpenCode2 adapter", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("tracks a background subagent launched while the stream was down", () =>
+    Effect.gen(function* () {
+      const CHILD = "ses_f1485c529ffea4URrYruwEg0Ja";
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", { [CHILD]: { type: "running" } }),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_idle_gap", time: { created: 3 }, type: "idle", outcome: "succeeded" },
+            {
+              id: "msg_assistant_gap",
+              time: { created: 2 },
+              type: "assistant",
+              agent: "build",
+              model: { id: "big-pickle", providerID: "opencode", variant: "default" },
+              content: [
+                {
+                  type: "tool",
+                  id: "call_gap_subagent",
+                  name: "subagent",
+                  executed: true,
+                  state: {
+                    status: "completed",
+                    input: { description: "Sleep", prompt: "sleep", background: true },
+                    content: [{ type: "text", text: "The subagent is working in the background." }],
+                    metadata: { sessionID: CHILD, status: "running" },
+                  },
+                  time: { created: 2, ran: 2, completed: 2 },
+                },
+              ],
+              finish: "stop",
+            },
+            { id: PROMPT_ID, time: { created: 1 }, text: "hi", type: "user" },
+          ],
+          cursor: {},
+        }),
+        // The child was announced in the gap, so it gets the thread's rules.
+        out("session.update", { sessionID: CHILD, permissions: "<any>" }),
+        reply("session.update", null),
+        // The still-running child is read back for requests asked in the gap.
+        out("permission.list", { sessionID: CHILD }),
+        replyData("permission.list", []),
+        out("session.form.list", { sessionID: CHILD }),
+        replyData("session.form.list", []),
+      ]);
+      const events = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      const collected = yield* Fiber.join(events);
+      assert.notInclude(turnItems(collected), "dynamic_tool:completed");
+      const subagent = collected.findLast((event) => event.type === "subagent.updated");
+      assert.equal(
+        subagent?.type === "subagent.updated" ? subagent.subagent.status : undefined,
+        "running",
+      );
+      assert.deepInclude(collected.at(-1), { type: "turn.terminal", status: "completed" });
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("shows a permission asked while the stream was down, and answers it", () =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed(

@@ -2200,6 +2200,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       turn.usedSubagents = true;
       state.calls.set(toolId, call);
       yield* emitSubagent(call);
+      return call;
     });
 
     /**
@@ -2728,6 +2729,35 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             continue;
           }
           if (part.type !== "tool") continue;
+          // A `subagent` call is its item and child thread, as live: a
+          // background one launched in the gap must hold its thread's
+          // completion. One already settled live (its item exists but its
+          // call is gone) is not started again.
+          if (part.name === "subagent") {
+            const known = state.calls.get(part.id);
+            if (known === undefined && turn.ordinals.has(`${turn.scope}${part.id}`)) continue;
+            const call = known ?? (yield* startCall(state, turn, part.id));
+            const input = part.state.input;
+            if (typeof input === "object" && input !== null) {
+              const fields = input as Record<string, unknown>;
+              call.prompt = stringField(fields, "prompt") ?? call.prompt;
+              call.title = stringField(fields, "description") ?? call.title;
+              call.agent = stringField(fields, "agent") ?? call.agent;
+              call.model = stringField(fields, "model") ?? call.model;
+              call.background = fields["background"] === true;
+            }
+            const metadata = "metadata" in part.state ? part.state.metadata : undefined;
+            const childId = stringField(metadata, "sessionID");
+            if (childId !== undefined) yield* attachChild(call, childId);
+            if (part.state.status === "completed" && metadata?.["status"] !== "running") {
+              yield* settleCall(call, "completed", subagentOutput(textOf(part.state.content)));
+            } else if (part.state.status === "error") {
+              yield* settleCall(call, "failed", part.state.error.message);
+            } else {
+              yield* emitSubagent(call);
+            }
+            continue;
+          }
           if (!turn.tools.has(part.id)) {
             turn.tools.set(part.id, { name: part.name, input: {} });
             turn.startedAt.set(part.id, yield* DateTime.now);
@@ -2784,10 +2814,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const running = [...threads]
         .filter(([, state]) => state.active !== undefined && !state.active.unsent)
         .toSorted(([left], [right]) => callsAbove(right).length - callsAbove(left).length);
-      const background = [...threads.values()].filter(
-        (state) => state.subagent === undefined && hasBackground(state),
-      );
-      if (running.length === 0 && background.length === 0 && busy.size === 0) return;
+      const withBackground = () =>
+        [...threads.values()].filter(
+          (state) => state.subagent === undefined && hasBackground(state),
+        );
+      if (running.length === 0 && withBackground().length === 0 && busy.size === 0) return;
       const active = yield* client.session.active();
       // An execution that ended while the stream was down never said so.
       for (const sessionId of busy) if (!(sessionId in active)) busy.delete(sessionId);
@@ -2812,7 +2843,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               : { status: "interrupted" },
         );
       }
-      for (const state of background) {
+      // Read after the backfill, which can start background calls made in the gap.
+      for (const state of withBackground()) {
         // A subagent still running keeps its call; its end arrives on the new stream.
         for (const call of runningCalls(state)) {
           const child = call.child?.sessionId;
