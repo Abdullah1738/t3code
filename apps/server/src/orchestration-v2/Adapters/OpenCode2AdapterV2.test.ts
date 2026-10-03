@@ -2253,6 +2253,64 @@ describe("OpenCode2 adapter", () => {
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
+  it.effect("refuses a steer into a turn held for a reconnect", () =>
+    Effect.gen(function* () {
+      const transcript: Array<ProviderReplayEntry> = [];
+      const { runtime, thread } = yield* resumed([{ type: "runtime_exit", status: "success" }], {
+        transcript,
+      });
+      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* TestClock.adjust("1 second");
+      yield* runtime.startTurn(turnInput(thread));
+      // A refused steer: the held turn has nothing running to take it.
+      const steered = yield* runtime
+        .steerTurn({
+          threadId,
+          runId: RunId.make("run:opencode2-adapter"),
+          providerThread: thread,
+          providerTurnId: yield* providerTurnId,
+          message: {
+            ...turnInput(thread).message,
+            messageId: MessageId.make("message:opencode2-adapter:steer"),
+            text: "Also say STEERED.",
+          },
+        })
+        .pipe(Effect.flip);
+      assert.equal(steered._tag, "ProviderAdapterProtocolError");
+      yield* TestClock.adjust("1 minute");
+      // The server comes back and the turn is sent.
+      transcript.push(
+        out("event.subscribe"),
+        out("session.instructions.entry.put", {
+          sessionID: SESSION,
+          key: "t3-code",
+          value: "<any>",
+        }),
+        reply("session.instructions.entry.put", null),
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.started", { sessionID: SESSION }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      );
+      yield* TestClock.adjust("1 minute");
+      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("closes a session while a turn waits for its reconnect", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const { runtime, thread } = yield* resumed([
+        { type: "runtime_exit", status: "success" },
+      ]).pipe(Scope.provide(scope));
+      yield* TestClock.adjust("1 second");
+      yield* runtime.startTurn(turnInput(thread));
+      yield* Scope.close(scope, Exit.void);
+      const refused = yield* runtime.startTurn(turnInput(thread)).pipe(Effect.flip);
+      assert.equal(refused._tag, "ProviderAdapterEventStreamError");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("fails a turn started while reconnecting once reconnecting gives up", () =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed([{ type: "runtime_exit", status: "success" }]);
