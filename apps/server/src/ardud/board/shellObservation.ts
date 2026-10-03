@@ -50,5 +50,6 @@ export function observationFromShell(
     branch: shell.branch,
     worktreePath: shell.worktreePath,
     archived: shell.archivedAt !== null,
+    settled: shell.settledOverride === "settled",
   };
 }

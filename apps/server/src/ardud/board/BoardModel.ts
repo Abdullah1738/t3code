@@ -60,6 +60,13 @@ export interface ThreadObservation {
   readonly branch: string | null;
   readonly worktreePath: string | null;
   readonly archived: boolean;
+  /**
+   * The user just settled the thread in t3 (from the event stream, never the
+   * automatic sweep); the board treats that as Done.
+   */
+  readonly settledByUser?: boolean;
+  /** Whether t3 currently shows the thread as settled. */
+  readonly settled?: boolean;
   /** The thread was started by a scheduled task. */
   readonly scheduledHint?: boolean;
 }
@@ -276,6 +283,25 @@ export class BoardModel {
     if ((observation.scheduledHint === true || automated) && !row.scheduled) {
       // Baselined automated threads have no prompt-driven stamp; date the card.
       row = { ...row, scheduled: true, updatedAt: row.updatedAt || (row.promptAt ?? now) };
+    }
+    // The user settled the thread in t3: mark its card Done. t3 only lets a
+    // thread settle once its turn ended, so background work draining under it
+    // doesn't block this. Un-settling in t3 does not restore the card; any new
+    // message to the thread brings it back anyway.
+    if (
+      observation.settledByUser === true &&
+      observation.live !== "working" &&
+      observation.live !== "queued" &&
+      (row.pending || row.backlog || (row.scheduled && !row.reviewed))
+    ) {
+      row = {
+        ...row,
+        pending: false,
+        reviewed: true,
+        backlog: false,
+        completedFrom: row.backlog ? "backlog" : row.scheduled ? "scheduled" : "waiting",
+        workRevision: row.workRevision + 1,
+      };
     }
 
     // The activation cutoff baselines old history: an untouched thread is never written.

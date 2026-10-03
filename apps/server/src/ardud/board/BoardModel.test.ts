@@ -309,6 +309,52 @@ describe("session board model", () => {
     expect(f.model.rows.get("t_crw")?.updatedAt).toBe(50);
   });
 
+  it("completes a card when the user settles its thread, and keeps a later restore", () => {
+    const f = fixture();
+    f.prompt("t1");
+    expect(f.lanes()).toEqual([["t1", "waiting"]]);
+    f.observe("t1", { settled: true, settledByUser: true });
+    expect(f.lanes()).toEqual([]);
+    expect(f.model.rows.get("t1")?.completedFrom).toBe("waiting");
+    // Later reads of the still-settled thread don't undo a restore.
+    expect(f.act("restore", "t1")._tag).toBe("commit");
+    f.observe("t1", { settled: true });
+    expect(f.lanes()).toEqual([["t1", "waiting"]]);
+  });
+
+  it("completes a Later card on a user settle", () => {
+    const f = fixture();
+    f.prompt("t1");
+    f.act("backlog", "t1");
+    f.observe("t1", { settled: true, settledByUser: true });
+    expect(f.lanes()).toEqual([]);
+    expect(f.model.rows.get("t1")?.completedFrom).toBe("backlog");
+  });
+
+  it("completes on a settle while background work drains, and clears once it ends", () => {
+    const f = fixture();
+    f.prompt("t1");
+    f.status("t1", "background", { settled: true, settledByUser: true });
+    expect(f.model.rows.get("t1")?.reviewed).toBe(true);
+    f.status("t1", "idle", { settled: true });
+    expect(f.lanes()).toEqual([]);
+  });
+
+  it("ignores a settled shell without a user settle (startup, auto-settle)", () => {
+    const f = fixture();
+    f.prompt("t1");
+    f.act("backlog", "t1");
+    f.observe("t1", { settled: true });
+    expect(f.lanes()).toEqual([["t1", "backlog"]]);
+  });
+
+  it("does not complete a running card on settle", () => {
+    const f = fixture();
+    f.prompt("t1");
+    f.status("t1", "working", { settled: true, settledByUser: true });
+    expect(f.lanes()).toEqual([["t1", "running"]]);
+  });
+
   it("tracks a pending question as needs-input on a running card and rolls subagent requests up", () => {
     const f = fixture();
     f.add("t_root");

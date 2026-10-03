@@ -1,5 +1,8 @@
+import * as NodeCrypto from "node:crypto";
+
 import {
   ArdudBoardEntry,
+  CommandId,
   ThreadId,
   type ArdudBoardClearInput,
   type ArdudBoardClearResult,
@@ -90,6 +93,16 @@ export class BoardService extends Context.Service<
     readonly start: Effect.Effect<void, never, Scope.Scope>;
   }
 >()("t3/ardud/board/BoardService") {}
+
+/**
+ * A settle the user made (sidebar, keybinding, MCP, control API). The
+ * automatic sweep (`server:auto-settle:`) and the board's own sync
+ * (`ardud-board:`) don't count: auto-settle would empty Later after a few
+ * idle days, and the board already applied its own.
+ */
+const isUserSettle = (commandId: string | null) =>
+  commandId === null ||
+  !(commandId.startsWith("server:auto-settle:") || commandId.startsWith("ardud-board:"));
 
 // Entries are compared by their encoded form to find what changed.
 const encodeEntry = Schema.encodeSync(Schema.fromJsonString(ArdudBoardEntry));
@@ -192,9 +205,19 @@ const make = Effect.gen(function* () {
       for (const patch of final) model.commit(patch);
     });
 
-  const observeThreads = (threadIds: ReadonlyArray<string>) =>
+  const observeThreads = (
+    threadIds: ReadonlyArray<string>,
+    userSettled: ReadonlySet<string> = new Set(),
+  ) =>
     Effect.gen(function* () {
-      const observations = yield* Effect.forEach(threadIds, readShell, { concurrency: 8 });
+      const observations = (yield* Effect.forEach(threadIds, readShell, { concurrency: 8 })).map(
+        (observation): Observation =>
+          observation.deleted !== true &&
+          observation.settled === true &&
+          userSettled.has(observation.threadId)
+            ? { ...observation, settledByUser: true }
+            : observation,
+      );
       // Origins are written by other services (bridges, crw) around thread
       // creation, so re-read them for every thread in the batch and its lineage.
       const lineage = new Set<string>();
@@ -222,6 +245,49 @@ const make = Effect.gen(function* () {
     });
 
   const refreshThread = (threadId: string) => observeThreads([threadId]);
+
+  /**
+   * Done on the board settles the thread in t3, and Restore un-settles it, so
+   * the sidebar and the board agree. Best effort: the card state is already
+   * saved, and t3 refuses to settle a thread that still has work.
+   */
+  const syncSettled = (
+    type: "thread.settle" | "thread.unsettle",
+    threadIds: ReadonlyArray<string>,
+  ) =>
+    Effect.forEach(
+      threadIds,
+      (threadId) =>
+        threads
+          .dispatch(
+            type === "thread.settle"
+              ? {
+                  type,
+                  commandId: CommandId.make(
+                    `ardud-board:settle:${threadId}:${NodeCrypto.randomUUID()}`,
+                  ),
+                  threadId: ThreadId.make(threadId),
+                }
+              : {
+                  type,
+                  commandId: CommandId.make(
+                    `ardud-board:unsettle:${threadId}:${NodeCrypto.randomUUID()}`,
+                  ),
+                  threadId: ThreadId.make(threadId),
+                  reason: "user",
+                },
+          )
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Session board could not sync the thread's settled state", {
+                threadId,
+                type,
+                error,
+              }),
+            ),
+          ),
+      { concurrency: 4, discard: true },
+    );
 
   const reconcile = Effect.gen(function* () {
     const shells = yield* threads
@@ -263,7 +329,10 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       // A fresh read first, so a just-finished or just-restarted run is judged on truth.
       const observation = yield* readShell(token.threadId);
-      return yield* serialized(
+      // Settling cancels open questions, so a card with one only changes on the board.
+      const syncable =
+        observation.deleted !== true && !observation.archived && observation.attention === null;
+      const result = yield* serialized(
         Effect.gen(function* () {
           yield* applyObservations([observation]);
           const now = yield* Clock.currentTimeMillis;
@@ -286,9 +355,17 @@ const make = Effect.gen(function* () {
             model.rows.set(decision.row.threadId, decision.row);
           }
           yield* publish;
-          return snapshotNow();
+          return { snapshot: snapshotNow(), committed: decision._tag === "commit" };
         }),
       );
+      if (result.committed && syncable) {
+        if (action === "review" && observation.settled !== true) {
+          yield* syncSettled("thread.settle", [token.threadId]);
+        } else if (action === "restore" && observation.settled === true) {
+          yield* syncSettled("thread.unsettle", [token.threadId]);
+        }
+      }
+      return result.snapshot;
     });
 
   const clearLane = (input: ArdudBoardClearInput) =>
@@ -297,7 +374,7 @@ const make = Effect.gen(function* () {
       const observations = yield* Effect.forEach(unique, (entry) => readShell(entry.threadId), {
         concurrency: 8,
       });
-      return yield* serialized(
+      const result = yield* serialized(
         Effect.gen(function* () {
           const before = new Map(
             unique.map((entry) => [entry.threadId, model.rows.get(entry.threadId)?.workRevision]),
@@ -360,6 +437,18 @@ const make = Effect.gen(function* () {
           return { ...snapshotNow(), cleared, skipped };
         }),
       );
+      const settleable = new Set(
+        observations
+          .filter(
+            (o) => o.deleted !== true && !o.archived && o.settled !== true && o.attention === null,
+          )
+          .map((o) => o.threadId),
+      );
+      yield* syncSettled(
+        "thread.settle",
+        result.cleared.filter((threadId) => settleable.has(threadId)),
+      );
+      return result;
     });
 
   const importRows = (rows: ReadonlyArray<BoardRow>) =>
@@ -407,19 +496,28 @@ const make = Effect.gen(function* () {
         afterSequence: latest,
         project: (stored) =>
           "aggregateKind" in stored
-            ? { sequence: stored.sequence, threadId: null as string | null }
+            ? { sequence: stored.sequence, threadId: null as string | null, userSettle: false }
             : {
                 sequence: stored.sequence,
                 threadId: ignoredEvents.has(stored.event.type)
                   ? null
                   : (stored.event.threadId as string),
+                userSettle:
+                  stored.event.type === "thread.settled" && isUserSettle(stored.commandId),
               },
       })
       .pipe(
         Stream.filter((item) => item.threadId !== null),
         Stream.groupedWithin(512, Duration.millis(150)),
         Stream.runForEach((batch) =>
-          observeThreads([...new Set(Array.from(batch, (item) => item.threadId as string))]).pipe(
+          observeThreads(
+            [...new Set(Array.from(batch, (item) => item.threadId as string))],
+            new Set(
+              Array.from(batch)
+                .filter((item) => item.userSettle)
+                .map((item) => item.threadId as string),
+            ),
+          ).pipe(
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) =>
