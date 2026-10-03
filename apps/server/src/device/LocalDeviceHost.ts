@@ -141,43 +141,72 @@ const androidSdk = Effect.gen(function* () {
           "Android",
           "Sdk",
         ),
+        // Homebrew's android-commandlinetools cask.
+        ...(platform === "darwin"
+          ? [
+              "/opt/homebrew/share/android-commandlinetools",
+              "/usr/local/share/android-commandlinetools",
+            ]
+          : []),
       ];
   if (!explicit) {
+    // Tools on PATH may be symlinks into an SDK; walk back up to its root.
+    const tools: ReadonlyArray<readonly [string, number]> = [
+      [platform === "win32" ? "adb.exe" : "adb", 2],
+      [platform === "win32" ? "emulator.exe" : "emulator", 2],
+      [platform === "win32" ? "avdmanager.bat" : "avdmanager", 4],
+    ];
     for (const directory of (environment.PATH ?? "").split(platform === "win32" ? ";" : ":")) {
       if (!directory) continue;
-      const resolved = yield* fs
-        .realPath(path.join(directory, platform === "win32" ? "adb.exe" : "adb"))
-        .pipe(Effect.option);
-      if (resolved._tag === "Some") candidates.push(path.dirname(path.dirname(resolved.value)));
+      for (const [tool, depth] of tools) {
+        const resolved = yield* fs.realPath(path.join(directory, tool)).pipe(Effect.option);
+        if (resolved._tag === "None") continue;
+        let root = resolved.value;
+        for (let level = 0; level < depth; level++) root = path.dirname(root);
+        candidates.push(root);
+      }
     }
   }
   const exists = (file: string) => fs.exists(file).pipe(Effect.orElseSucceed(() => false));
-  for (const root of candidates) {
+  const inspect = Effect.fn(function* (root: string) {
     const adb = yield* exists(
       path.join(root, "platform-tools", platform === "win32" ? "adb.exe" : "adb"),
     );
     const emulator = yield* exists(
       path.join(root, "emulator", platform === "win32" ? "emulator.exe" : "emulator"),
     );
-    if (explicit || adb || emulator) {
-      const avdmanager = yield* exists(
-        path.join(
-          root,
-          "cmdline-tools",
-          "latest",
-          "bin",
-          platform === "win32" ? "avdmanager.bat" : "avdmanager",
-        ),
-      );
-      const legacyAvdmanager =
-        !avdmanager &&
-        (yield* exists(
-          path.join(root, "tools", "bin", platform === "win32" ? "avdmanager.bat" : "avdmanager"),
-        ));
-      return { root, adb, emulator, avdmanager, legacyAvdmanager };
-    }
+    const avdmanager = yield* exists(
+      path.join(
+        root,
+        "cmdline-tools",
+        "latest",
+        "bin",
+        platform === "win32" ? "avdmanager.bat" : "avdmanager",
+      ),
+    );
+    const legacyAvdmanager =
+      !avdmanager &&
+      (yield* exists(
+        path.join(root, "tools", "bin", platform === "win32" ? "avdmanager.bat" : "avdmanager"),
+      ));
+    return { root, adb, emulator, avdmanager, legacyAvdmanager };
+  });
+  // A standalone platform-tools install (adb only) must not shadow a full SDK found later.
+  let partial: Effect.Success<ReturnType<typeof inspect>> | null = null;
+  for (const root of new Set(candidates)) {
+    const sdk = yield* inspect(root);
+    if (explicit || (sdk.adb && sdk.emulator)) return sdk;
+    if (!partial && (sdk.adb || sdk.emulator)) partial = sdk;
   }
-  return { root: null, adb: false, emulator: false, avdmanager: false, legacyAvdmanager: false };
+  return (
+    partial ?? {
+      root: null,
+      adb: false,
+      emulator: false,
+      avdmanager: false,
+      legacyAvdmanager: false,
+    }
+  );
 });
 
 const deviceHostEnvironment = (

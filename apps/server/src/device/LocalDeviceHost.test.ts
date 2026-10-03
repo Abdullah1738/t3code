@@ -22,6 +22,7 @@ const diagnose = (
   files: ReadonlyArray<string>,
   environment: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = "darwin",
+  links: Readonly<Record<string, string>> = {},
 ) =>
   LocalDeviceHost.__testing.platformReason("android").pipe(
     Effect.provideService(HostProcessEnvironment, environment),
@@ -30,6 +31,8 @@ const diagnose = (
       FileSystem.FileSystem,
       FileSystem.makeNoop({
         exists: (file) => Effect.succeed(files.includes(file)),
+        realPath: (file) =>
+          links[file] ? Effect.succeed(links[file]) : FileSystem.makeNoop({}).realPath(file),
       }),
     ),
     Effect.provide(platform === "win32" ? NodePath.layerWin32 : NodePath.layerPosix),
@@ -109,6 +112,69 @@ describe("Android SDK availability", () => {
         { HOME: "/test/home" },
       );
       expect(reason).toBeNull();
+    }),
+  );
+
+  it.effect("prefers the Homebrew SDK over a standalone adb found on PATH", () =>
+    Effect.gen(function* () {
+      const root = "/opt/homebrew/share/android-commandlinetools";
+      const reason = yield* diagnose(
+        [
+          "/home/.local/android/platform-tools/adb",
+          `${root}/platform-tools/adb`,
+          `${root}/emulator/emulator`,
+          `${root}/cmdline-tools/latest/bin/avdmanager`,
+        ],
+        { HOME: "/home", PATH: "/opt/homebrew/bin:/usr/bin" },
+        "darwin",
+        { "/opt/homebrew/bin/adb": "/home/.local/android/platform-tools/adb" },
+      );
+      expect(reason).toBeNull();
+    }),
+  );
+
+  it.effect("skips an earlier adb-only SDK in favor of a full one", () =>
+    Effect.gen(function* () {
+      const root = "/opt/homebrew/share/android-commandlinetools";
+      const reason = yield* diagnose(
+        [
+          "/home/Library/Android/sdk/platform-tools/adb",
+          `${root}/platform-tools/adb`,
+          `${root}/emulator/emulator`,
+          `${root}/cmdline-tools/latest/bin/avdmanager`,
+        ],
+        { HOME: "/home" },
+      );
+      expect(reason).toBeNull();
+    }),
+  );
+
+  it.effect("finds an SDK through an avdmanager symlink on PATH", () =>
+    Effect.gen(function* () {
+      const root = "/sdks/android";
+      const reason = yield* diagnose(
+        [
+          `${root}/platform-tools/adb`,
+          `${root}/emulator/emulator`,
+          `${root}/cmdline-tools/latest/bin/avdmanager`,
+        ],
+        { HOME: "/home", PATH: "/usr/local/bin" },
+        "linux",
+        { "/usr/local/bin/avdmanager": `${root}/cmdline-tools/latest/bin/avdmanager` },
+      );
+      expect(reason).toBeNull();
+    }),
+  );
+
+  it.effect("still reports a standalone adb when no full SDK exists", () =>
+    Effect.gen(function* () {
+      const reason = yield* diagnose(
+        ["/home/.local/android/platform-tools/adb"],
+        { HOME: "/home", PATH: "/opt/homebrew/bin" },
+        "linux",
+        { "/opt/homebrew/bin/adb": "/home/.local/android/platform-tools/adb" },
+      );
+      expect(reason).toContain("Android Emulator is missing from /home/.local/android");
     }),
   );
 
