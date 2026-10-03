@@ -15,7 +15,7 @@ const USAGE = `coord <command> [args] (JSON output; see README.md)
   inbox --as A [--unacked] [--after SEQ]          ack --as A SEQ|KEY ...
   deliver [--once]                                 (deliveries only)
   pump                                             (deliveries + observe running releases; for launchd)
-  claim RES --as A [--ttl 30m] [--purpose P] [--op REF]
+  claim RES --as A [--env E] [--ttl 30m] [--purpose P] [--op REF]   (--env: environment a mutation claim acts on; default its own or *)
   renew RES --as A --fence N [--ttl] [--op REF]    release RES --as A --fence N [--note]
   check RES --as A --fence N                       reconcile RES --as A --outcome O --evidence TEXT
   claims [--owner A] [--state S]
@@ -90,7 +90,7 @@ async function main() {
     case 'ack': return C.ack(o.as, p.slice(1));
     case 'deliver': return deliver();
     case 'pump': return pump();
-    case 'claim': return C.claim(sub, { as: o.as, ttl: o.ttl, purpose: o.purpose, op: o.op });
+    case 'claim': return C.claim(sub, { as: o.as, env: o.env, ttl: o.ttl, purpose: o.purpose, op: o.op });
     case 'renew': return C.renew(sub, { as: o.as, fence: o.fence, ttl: o.ttl, op: o.op });
     case 'release':
       if (!/^(request|admit|start|record|reconcile|observe|cancel|list)$/.test(sub ?? '')) return C.release(sub, { as: o.as, fence: o.fence, note: o.note });

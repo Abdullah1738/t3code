@@ -83,7 +83,6 @@ function requireMode(scope, allowDrain) {
   if (g.mode === 'pause' || (g.mode === 'drain' && !allowDrain))
     throw refuse(g.mode === 'pause' ? 'paused' : 'draining', `${g.key} is ${g.mode}${g.reason ? `: ${g.reason}` : ''}`, { gate: g });
 }
-const resourceScope = r => (/^env:/.test(r) ? r : undefined);
 
 // ---------- actors, channels, members ----------
 
@@ -224,12 +223,19 @@ const reconcileErr = c => refuse('reconcile_required', `${c.resource} lease of $
 // Claims on these resource kinds coordinate work, not environment mutations; every other kind
 // (env:, svc:, repo:, tf:, ch:, ...) is a mutation claim scoped to one environment, or to all ('*').
 const NON_MUTATION = ['pr', 'ticket', 'files', 'arch', 'channel', 'work'];
+// The environment a resource names by itself: env:<e>, and Terraform roots tf:<e> / tf:<e>-<suffix>
+// (dev, dev-risk-liquidation and dev-core-capacity are dev). Null when the resource does not say.
+function intrinsicEnv(resource) {
+  if (resource.startsWith('env:')) return resource.slice(4);
+  return /^tf:(dev|staging|prod)(?:-[a-z0-9-]+)?$/.exec(resource)?.[1] ?? null;
+}
+// Mutation scope of a claim: the resource's own environment, else the caller's `env`, else '*'.
+// An explicit `env` that contradicts the resource's own environment is refused.
 export function claimEnv(resource, env) {
   if (NON_MUTATION.includes(resource.split(':')[0])) return null;
-  if (resource.startsWith('env:')) return resource.slice(4);
-  if (env) return env;
-  const root = /^tf:([a-z]+)/.exec(resource)?.[1];
-  return ['dev', 'staging', 'prod'].includes(root) ? root : '*';
+  const own = intrinsicEnv(resource);
+  if (own && env && env !== own) throw refuse('env_mismatch', `${resource} is a ${own} resource, not ${env}`);
+  return own ?? env ?? '*';
 }
 const envMatch = (a, b) => a === '*' || b === '*' || a === b;
 
@@ -242,15 +248,42 @@ function envHolder(resource, env, fence = null, owner = null) {
   return rel && refuse('release_in_flight', `${rel.kind} #${rel.id} (${rel.state}) holds ${resource}`, { blocking: rel.id });
 }
 
+// Pause/drain gates a claim must pass: global, plus its environment's; a '*' claim passes every
+// environment gate that is set, since it may act in any of them.
+function requireClaimMode(scope) {
+  if (scope === null) return requireMode(undefined);
+  if (scope !== '*') return requireMode(`env:${scope}`);
+  requireMode(undefined);
+  for (const { k } of all("SELECT k FROM control WHERE k LIKE 'mode:env:%'")) requireMode(k.slice(5));
+}
+
+// Claim-vs-claim overlap beyond the same resource: env:<e> covers every mutation claim scoped to <e>
+// or '*', and every such claim is covered by env:<e>. Expired leases still count (reconcile first).
+// There is no same-operation association between claims, so the owner does not matter.
+function overlappingClaim(resource, scope) {
+  if (scope === null) return null;
+  const isEnv = resource.startsWith('env:');
+  for (const row of all("SELECT * FROM claims WHERE resource!=? AND env IS NOT NULL AND state IN ('active','reconcile_required')", resource)) {
+    const c = expire(row);
+    const covers = isEnv ? envMatch(c.env, scope) : c.resource.startsWith('env:') && envMatch(c.env, scope);
+    if (!covers) continue;
+    if (c.state === 'reconcile_required') return refuse('reconcile_required', `${c.resource} (${c.owner}) overlaps ${resource} and needs reconcile`, { owner: c.owner, resource: c.resource, op_ref: c.op_ref });
+    return refuse('claimed', `${c.resource} held by ${c.owner} overlaps ${resource}`, { owner: c.owner, resource: c.resource, fence: c.fence });
+  }
+  return null;
+}
+
 export function claim(resource, { as, ttl, purpose, op, env } = {}) {
   need(resource, 'resource'); need(as, 'as');
   const secs = parseTtl(ttl);
   const scope = claimEnv(resource, env);
   return tx(() => {
-    requireMode(resourceScope(resource) ?? (scope && scope !== '*' ? `env:${scope}` : undefined));
+    requireClaimMode(scope);
     const held = envHolder(resource, scope);
     if (held instanceof Error) throw held;
     if (held) throw refuse('release_in_flight', `${held.kind} #${held.id} (${held.state}) holds ${resource}`, { blocking: held.id });
+    const overlap_ = overlappingClaim(resource, scope);
+    if (overlap_) return overlap_;
     const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
     if (c?.state === 'reconcile_required') return reconcileErr(c);
     if (c?.state === 'active') throw refuse('held', `${resource} is held by ${c.owner}`, { owner: c.owner, fence: c.fence, lease_until: c.lease_until });
@@ -291,9 +324,12 @@ function releaseOn(resource, fence = null, owner = null, claimScope = null) {
 export function check(resource, { as, fence } = {}) {
   return tx(() => {
     const cur = get('SELECT env FROM claims WHERE resource=?', resource);
-    const held = envHolder(resource, cur ? cur.env : claimEnv(resource), fence, as);
+    const scope = cur ? cur.env : claimEnv(resource);
+    const held = envHolder(resource, scope, fence, as);
     if (held instanceof Error) throw held;
     if (held) throw refuse('release_in_flight', `${held.kind} #${held.id} (${held.state}) holds ${resource}`, { blocking: held.id });
+    const overlap_ = overlappingClaim(resource, scope);
+    if (overlap_) return overlap_;
     const c = holder(resource, as, fence);
     return c instanceof Error ? c : { resource, owner: c.owner, fence: c.fence, lease_until: c.lease_until };
   });
@@ -845,8 +881,10 @@ export async function releaseObserve(id, { observe = evidence.observeRelease } =
     const terminal = o && ['done', 'failed', 'built_not_deployed'].includes(o.state) && !conflict;
     if (!terminal) {
       const note = conflict ? `unknown: ${conflict}; reconcile manually` : `${o?.state ?? 'unknown'}: ${o?.why ?? 'no result'}`;
-      if (Object.keys(set).length) touch(r.id, set);
-      run('UPDATE releases SET observed_at=?, observe_note=? WHERE id=?', now(), note, r.id);
+      // Bumps the version even without new bindings, so an older observation still in flight is dropped.
+      // updated_at stays: it ages a dispatch whose downstream run has not been found.
+      const cols = { ...set, observed_at: now(), observe_note: note };
+      run(`UPDATE releases SET ${Object.keys(cols).map(k => `${k}=?`).join(', ')}, version=version+1 WHERE id=?`, ...Object.values(cols), r.id);
       return { release: relRow(id), pending: note };
     }
     if (o.digest && cur.image_digest && o.digest !== cur.image_digest)

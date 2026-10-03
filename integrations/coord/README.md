@@ -90,9 +90,18 @@ gates and runtime, a valid tag, no open QA window and no other built release of 
 `releaseStart`: a different value for a bound field is `binding_mismatch`.
 
 **Mutation claims** are claims on anything but `pr:`, `ticket:`, `files:`, `arch:`, `channel:` and
-`work:`. Each is scoped to one environment: `env:<e>` is `<e>`, `tf:dev*` roots are `dev`, otherwise
-pass `claim(resource, { as, env })`; without `env` the claim is scoped to every environment (`*`).
-`claim` returns its `env`.
+`work:`. Each is scoped to one environment. `env:<e>` and Terraform roots `tf:<e>` / `tf:<e>-<suffix>`
+(`tf:dev`, `tf:dev-risk-liquidation`, `tf:dev-core-capacity` are dev) carry their own environment;
+an explicit `env` that contradicts it is refused (`env_mismatch`). Other resources take
+`claim(resource, { as, env })` (CLI `--env`); without `env` the claim is scoped to every environment
+(`*`). `claim` returns its `env`. A `*` claim must pass the global gate and every environment's
+pause/drain gate; a scoped claim the global gate and its environment's.
+
+**Claims exclude claims** beyond the same resource: an `env:<e>` claim overlaps every other mutation
+claim scoped to `<e>` or `*`, in both directions and whoever holds it (`claimed`; an expired one gives
+`reconcile_required` until reconciled). `check` applies the same rule. Disjoint narrow claims (two
+services) stay independent, and coordination claims are unaffected. There is no same-owner exception:
+an operation that holds `env:<e>` does not also claim narrower resources in `<e>`.
 
 **Claims, QA windows and releases** exclude each other both ways:
 - An open QA window refuses every mutation claim in its environment (`qa_window_open`), and cannot
@@ -187,6 +196,8 @@ Evidence fails closed: anything not positively identified is `unknown`, and the 
   tag and `head_sha` the release sha. A `workflow_dispatch` release run (`--field release_tag=...`) is
   `unknown` with reason `workflow_dispatch provenance unsupported; reconcile manually`; CRW cuts
   release tags by push, so this is an accepted limit.
+- Every applied observation, pending or terminal, advances the release version, so an older
+  observation still in flight is discarded once a newer one was recorded.
 - The observer binds the release run's attempt, the downstream deploy run and its attempt the first time
   it sees them, and persists them even while the result is pending. Afterwards, a different attempt of
   either run, a release run first seen past attempt 1, or a dispatch link in the logs that is not the
