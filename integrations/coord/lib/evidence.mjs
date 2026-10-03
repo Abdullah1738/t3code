@@ -217,6 +217,10 @@ export async function planRun(planId, { gh = ghText } = {}) {
   const { jobs, done } = await attemptJobs(gh, DEVOPS, run_, attempt, { logs: false });
   const missing = SAVED_PLAN_STEPS.filter(n => step(jobs, n)?.conclusion !== 'success');
   if (!done || missing.length) throw new CoordError('plan_unverified', `plan run ${run_} attempt ${attempt} did not save a full-root plan (${missing.join(', ') || 'jobs unfinished'})`);
+  // A rerun that started while the evidence above was read would be the attempt the apply uses.
+  const after = await runInfo(DEVOPS, run_, { gh });
+  if ((after?.run_attempt ?? 1) !== attempt || after?.status !== 'completed')
+    throw new CoordError('plan_attempt_moved', `run ${run_} moved to attempt ${after?.run_attempt} (${after?.status}) while plan attempt ${attempt} was verified`);
   return { run: run_, attempt, startedAt: attemptTime(a), headSha: a.head_sha };
 }
 
@@ -226,13 +230,16 @@ export const currentAttempt = async (runId, { gh = ghText } = {}) => (await runI
 // Pure classification of a service release from its Release run and the downstream deploy run.
 // A known downstream decides; a parent failure alone never ends the operation.
 // `dispatched`: 'yes' (link found), 'no' (the dispatch step provably did not run), or 'unknown'.
-export function classify({ release, published, dispatched = 'yes', downstream, downstreamJobs, inputs, expect, releaseAgeSec, waitSec = 1800 }) {
+// `published`: 'yes' (push step succeeded), 'no' (it provably never ran), or 'unknown' (it started and
+// did not succeed: the push may have happened before a later check in the same step failed).
+export function classify({ release, published: pub, dispatched = 'yes', downstream, downstreamJobs, inputs, expect, releaseAgeSec, waitSec = 1800 }) {
+  const published = pub === true ? 'yes' : pub === false ? 'no' : pub ?? 'unknown';
   if (downstream) {
     if (!isWorkflow(downstream, SERVICE_DEPLOY_WORKFLOW)) return unknown(`run ${downstream.id} is not ${SERVICE_DEPLOY_WORKFLOW}`);
     if (downstream.status !== 'completed') return { state: 'running', why: 'downstream running' };
     if (!release || release.status !== 'completed') return { state: 'running', why: 'release run not finished' };
     if (downstream.conclusion === 'cancelled' && !downstreamJobs)
-      return published ? { state: 'built_not_deployed', failure: `image published, downstream ${downstream.id} cancelled before any job` }
+      return published === 'yes' ? { state: 'built_not_deployed', failure: `image published, downstream ${downstream.id} cancelled before any job` }
         : unknown(`downstream ${downstream.id} cancelled before any job; image publication not shown`);
     if (downstream.conclusion !== 'success') return { state: 'failed', failure: `downstream ${downstream.id} ${downstream.conclusion}` };
     if (!inputs) return unknown(`downstream ${downstream.id} inputs unreadable`);
@@ -242,8 +249,9 @@ export function classify({ release, published, dispatched = 'yes', downstream, d
     return { state: 'done', digest: inputs.digest };
   }
   if (!release || release.status !== 'completed') return { state: 'running', why: 'release run not finished' };
-  if (dispatched === 'no') return published ? { state: 'built_not_deployed', failure: `image published, no downstream dispatched (release ${release.conclusion})` }
-    : { state: 'failed', failure: `release run ${release.conclusion}; nothing published or dispatched` };
+  if (dispatched === 'no') return published === 'yes' ? { state: 'built_not_deployed', failure: `image published, no downstream dispatched (release ${release.conclusion})` }
+    : published === 'no' ? { state: 'failed', failure: `release run ${release.conclusion}; push step never ran and nothing was dispatched` }
+    : unknown(`release run ${release.conclusion}: the push step started but did not succeed, so an image may exist; reconcile built or failed with evidence`);
   if (dispatched === 'unknown') return unknown(`release run ${release.conclusion}: cannot tell whether a downstream deploy was dispatched; reconcile manually`);
   return releaseAgeSec > waitSec ? unknown('dispatch step ran but no downstream run was found; reconcile manually')
     : { state: 'running', why: 'downstream not found yet' };
@@ -276,32 +284,52 @@ export async function observeRelease(r, { gh = ghText, now = Math.floor(Date.now
   if (!['service_release', 'redispatch', 'frontend_release'].includes(r.kind)) return { state: 'running', why: `${r.kind} is closed with release reconcile` };
   if (r.kind === 'frontend_release') return observeFrontend(r, gh);
   const expect = { env: r.environment, binary: r.binary, tag: r.tag, digest: r.image_digest, git_sha: r.git_sha };
-  let release = null, published = false, dispatched = 'yes', downstreamId = r.deploy_run;
-  if (r.kind === 'redispatch') release = { status: 'completed', conclusion: 'success' }, published = true;
+  // Run attempts and the downstream run are bound at first sight and persisted (`bind`). Any later attempt
+  // change, a parent first seen past attempt 1, or a downstream link that is not the bound run means an
+  // unaccounted dispatch may exist: unknown, so the release keeps its locks until reconciled by hand.
+  const bind = {};
+  let release = null, published = 'no', dispatched = 'yes', downstreamId = r.deploy_run;
+  if (r.kind === 'redispatch') release = { status: 'completed', conclusion: 'success' }, published = 'yes';
   else if (r.release_run) {
     release = await runInfo(r.repo, r.release_run, { gh });
     if (!isWorkflow(release, RELEASE_WORKFLOW)) return unknown(`run ${r.release_run} is ${release?.path}, not ${RELEASE_WORKFLOW}`);
     if (release.event === 'workflow_dispatch') return unknown('workflow_dispatch provenance unsupported; reconcile manually');
     if (release.head_sha !== r.git_sha || (r.tag && release.head_branch !== r.tag))
       return unknown(`release run ${release.id} is ${release.head_branch}@${release.head_sha}, not ${r.tag}@${r.git_sha}`);
+    const att = release.run_attempt ?? 1;
+    if (r.release_attempt != null && att !== r.release_attempt)
+      return unknown(`release run ${release.id} moved from attempt ${r.release_attempt} to ${att}; an earlier attempt may have dispatched a deploy; reconcile manually`);
+    if (r.release_attempt == null && att !== 1)
+      return unknown(`release run ${release.id} first observed at attempt ${att}; earlier attempts may have dispatched a deploy; reconcile manually`);
+    bind.release_attempt = att;
     if (release.status === 'completed') {
       let jobs;
-      try { jobs = await attemptJobs(gh, r.repo, release.id, release.run_attempt ?? 1, { logs: !downstreamId }); }
-      catch (e) { if (!downstreamId) return unknown(`release run jobs unreadable: ${e.message}`); }
-      if (jobs) {
-        published = step(jobs.jobs, PUBLISH_STEP)?.conclusion === 'success';
-        if (!downstreamId) {
-          downstreamId = /crpko-devops\/actions\/runs\/(\d+)/i.exec(jobs.log)?.[1];
-          // Without a link in the logs: 'no' only when the dispatch step is shown not to have run.
-          const d = step(jobs.jobs, DISPATCH_STEP);
-          dispatched = downstreamId ? 'yes'
-            : jobs.done && d?.conclusion === 'skipped' ? 'no'
-            : jobs.done && d?.conclusion === 'success' ? 'yes' : 'unknown';
-        }
+      try { jobs = await attemptJobs(gh, r.repo, release.id, att); } catch (e) { return unknown(`release run jobs unreadable: ${e.message}`); }
+      const links = [...new Set([...jobs.log.matchAll(/crpko-devops\/actions\/runs\/(\d+)/gi)].map(m => m[1]))];
+      if (links.length > 1 || (downstreamId && links.length && links[0] !== String(downstreamId)))
+        return unknown(`release run ${release.id} dispatched ${links.join(', ')}, bound downstream is ${downstreamId ?? 'none'}; reconcile manually`);
+      // A step that is absent counts as not run only when every job of the attempt was skipped.
+      const ps = step(jobs.jobs, PUBLISH_STEP);
+      const allSkipped = jobs.done && jobs.jobs.length > 0 && jobs.jobs.every(j => j.conclusion === 'skipped');
+      published = ps?.conclusion === 'success' ? 'yes' : ps?.conclusion === 'skipped' || (!ps && allSkipped) ? 'no' : 'unknown';
+      if (!downstreamId) {
+        downstreamId = links[0];
+        // Without a link in the logs: 'no' only when the dispatch step is shown not to have run.
+        const d = step(jobs.jobs, DISPATCH_STEP);
+        dispatched = downstreamId ? 'yes'
+          : jobs.done && (d?.conclusion === 'skipped' || (!d && allSkipped)) ? 'no'
+          : jobs.done && d?.conclusion === 'success' ? 'yes' : 'unknown';
       }
     }
   }
+  if (downstreamId) bind.deploy_run = String(downstreamId);
   const downstream = downstreamId ? await runInfo(DEVOPS, downstreamId, { gh }) : null;
+  if (downstream) {
+    const datt = downstream.run_attempt ?? 1;
+    if (r.deploy_attempt != null && datt !== r.deploy_attempt)
+      return unknown(`deploy run ${downstream.id} moved from attempt ${r.deploy_attempt} to ${datt}; reconcile manually`);
+    bind.deploy_attempt = datt;
+  }
   const finished = downstream?.status === 'completed';
   let jobs = 0, inputs = null;
   if (finished) {
@@ -311,16 +339,16 @@ export async function observeRelease(r, { gh = ghText, now = Math.floor(Date.now
         inputs = await deployRunInputs(downstreamId, { gh, attempt: downstream.run_attempt ?? 1 });
         if (inputs.none || inputs.partial) inputs = null;
       }
-    } catch (e) { return unknown(`downstream ${downstreamId} unreadable: ${e.message}`); }
+    } catch (e) { return { ...unknown(`downstream ${downstreamId} unreadable: ${e.message}`), bind }; }
   }
   const age = release?.updated_at ? now - sec(release.updated_at) : now - (r.updated_at ?? now);
   const c = classify({ release, published, dispatched, downstream, downstreamJobs: jobs, inputs, expect, releaseAgeSec: age });
   // Before any terminal result, both runs must still be at the attempts that were read and finished.
   if (['done', 'failed', 'built_not_deployed'].includes(c.state)) {
     for (const [repo, run_] of [[r.repo, r.kind === 'redispatch' ? null : release], [DEVOPS, downstream]])
-      if (run_ && !(await recheck(gh, repo, run_).catch(() => false))) return unknown(`run ${run_.id} moved to a new attempt or is running again`);
+      if (run_ && !(await recheck(gh, repo, run_).catch(() => false))) return { ...unknown(`run ${run_.id} moved to a new attempt or is running again`), bind };
   }
-  return { ...c, readback: { release_run: r.release_run, release_attempt: release?.run_attempt ?? null, deploy_run: downstreamId ?? null, attempt: downstream?.run_attempt ?? null, inputs } };
+  return { ...c, bind, readback: { release_run: r.release_run, release_attempt: release?.run_attempt ?? null, deploy_run: downstreamId ?? null, attempt: downstream?.run_attempt ?? null, inputs } };
 }
 
 // Evaluator for coord.ready: pr_merged / pr_deployed refs look like `owner/repo#123` or `owner/repo#123@binary`.

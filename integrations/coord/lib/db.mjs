@@ -28,6 +28,7 @@ CREATE INDEX IF NOT EXISTS deliveries_status ON deliveries (status, next_attempt
 CREATE TABLE IF NOT EXISTS fences (resource TEXT PRIMARY KEY, fence INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS claims (
   resource TEXT PRIMARY KEY, owner TEXT NOT NULL, fence INTEGER NOT NULL, state TEXT NOT NULL,
+  env TEXT,                                    -- environment a mutation claim acts on (NULL for non-mutation claims)
   lease_until INTEGER NOT NULL, purpose TEXT, op_ref TEXT, claimed_at INTEGER, renewed_at INTEGER,
   released_at INTEGER, note TEXT, reconcile_by TEXT, reconcile_outcome TEXT, reconcile_evidence TEXT);
 -- Ended claims (released or reconciled) kept when the resource is claimed again.
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS releases (
   tf_root TEXT, planned_at INTEGER,                  -- tf_apply: root, start time of the saved plan's run attempt
   version INTEGER NOT NULL DEFAULT 0,                -- bumped on every write; async checks compare-and-set against it
   observed_at INTEGER, observe_note TEXT,
+  release_attempt INTEGER, deploy_attempt INTEGER,  -- run attempts bound at first observation; any change is unknown
   created_at INTEGER, updated_at INTEGER);
 CREATE INDEX IF NOT EXISTS releases_state ON releases (state, environment);
 CREATE TABLE IF NOT EXISTS arch_requests (

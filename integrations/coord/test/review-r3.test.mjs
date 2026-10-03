@@ -42,7 +42,7 @@ test('F1 claims and releases exclude each other in both directions', async () =>
   run("DELETE FROM claims WHERE resource='env:dev'");
   await C.releaseReconcile(a.id, { as: 'release', outcome: 'done', evidence: 'run 1 attempt 1 ok' });
   const c = C.claim('env:dev', { as: 'crw', op: 'deploy x' });
-  const b = await admit(svc('b', { repo: 'Equicom-Crypto/x', binary: 'x', contentPrs: [`${TC}#141`] }));
+  const b = await admit(svc('b', { repo: 'Equicom-Crypto/edge-api', binary: 'edge-api', contentPrs: [`${TC}#141`] }));
   assert.deepEqual(b.claim_fences, { 'env:dev': { owner: 'crw', fence: c.fence } });
   assert.equal(C.check('env:dev', { as: 'crw', fence: c.fence }).fence, c.fence);
   C.renew('env:dev', { as: 'crw', fence: c.fence });
@@ -104,7 +104,7 @@ test('F3 a parent failure never frees the locks while the downstream runs or dis
   assert.equal((await E.observeRelease(row, { gh: obsGh({ rel: failedParent, ds: { status: 'in_progress' } }) })).state, 'running');
   assert.equal((await E.observeRelease(row, { gh: obsGh({ rel: failedParent }) })).state, 'done');
   // Failed parent that provably never reached publication or dispatch: failed.
-  const none = obsGh({ rel: failedParent, link: false, relSteps: [{ name: 'Build and push image', conclusion: 'failure' }, { name: 'Trigger environment deployment workflow', conclusion: 'skipped' }] });
+  const none = obsGh({ rel: failedParent, link: false, relSteps: [{ name: 'Build and push image', conclusion: 'skipped' }, { name: 'Trigger environment deployment workflow', conclusion: 'skipped' }] });
   assert.equal((await E.observeRelease(row, { gh: none })).state, 'failed');
 });
 
@@ -120,7 +120,7 @@ test('F4 risk-liquidation releases lock and advance the source dev root of the s
 // terraform-dev.yml (main-dev 34264683c2) lines 1466-1519.
 const SAVED = ['Package saved full-root plan', 'Configure AWS credentials for saved plan storage', 'Store saved plan in the state bucket', 'Upload saved plan metadata'];
 const planGh = ({ latest = 1, steps = SAVED.map(name => ({ name, conclusion: 'success' })) } = {}) => fakeGh([
-  [/crpko-devops\/actions\/runs\/900$/, { id: 900, run_attempt: latest }],
+  [/crpko-devops\/actions\/runs\/900$/, { id: 900, run_attempt: latest, status: 'completed' }],
   [/crpko-devops\/actions\/runs\/900\/attempts\/1$/, { path: '.github/workflows/terraform-dev.yml', status: 'completed', conclusion: 'success', head_branch: 'main-dev', run_started_at: '2026-01-01T00:00:00Z' }],
   [/crpko-devops\/actions\/runs\/900\/attempts\/1\/jobs/, { jobs: [{ id: 9, status: 'completed', conclusion: 'success', run_attempt: 1, steps }] }],
 ]);

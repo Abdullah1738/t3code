@@ -118,7 +118,7 @@ test('release admission binds repo+sha+digest+plan+env; stale sha is refused and
   assert.equal(C.releaseRequest({ as: 'crw', key: 'crw:deploy:1', kind: 'service_release', env: 'dev', repo: 'Equicom-Crypto/trading-core',
     binary: 'trading-core', sha: SHA1, tag: 'trading-core-docs1-dev.33', runtimeSha: SHA0, contentPrs: ['equicom-crypto/trading-core#141'] }).duplicate, true);
   assert.throws(() => svc('crw:deploy:1', { sha: SHA2 }), e => e.code === 'conflict');
-  const s = svc('crw:deploy:2', { repo: 'Equicom-Crypto/risk', binary: 'risk' });
+  const s = svc('crw:deploy:2', { repo: 'Equicom-Crypto/reporting', binary: 'reporting' });
   await refused(() => C.releaseAdmit(s.id, { as: 'release', verify: stale }), 'stale_revision');
   assert.equal(C.releaseList({ state: 'superseded' }).releases[0].id, s.id);
   await refused(() => C.releaseAdmit(s.id, { as: 'release', verify: ok }), 'bad_state');
@@ -230,7 +230,7 @@ test('pause refuses claim, admit, start and non-control deliveries; ack still wo
   C.post('delivery', { as: 'crw', kind: 'status', key: 'during', summary: 'held' });
   assert.throws(() => C.claim('ticket:CRP-1', { as: 'cell:a' }), e => e.code === 'paused');
   await refused(() => C.releaseStart(r.id, { as: 'crw', fence: a.fence, verify: ok }), 'paused');
-  const r2 = svc('crw:deploy:7', { repo: 'Equicom-Crypto/x', binary: 'x' });
+  const r2 = svc('crw:deploy:7', { repo: 'Equicom-Crypto/edge-api', binary: 'edge-api' });
   await refused(() => C.releaseAdmit(r2.id, { as: 'release', verify: ok }), 'paused');
 
 
@@ -262,7 +262,7 @@ test('drain refuses admit and new claims while a running release can still renew
   await C.releaseStart(r.id, { as: 'crw', fence: a.fence, verify: ok });
   const c = C.claim('pr:y#2', { as: 'cell:a' });
   C.setMode('drain', { scope: 'env:dev', as: 'master', reason: 'baseline' });
-  const r2 = svc('crw:deploy:9', { repo: 'Equicom-Crypto/x', binary: 'x' });
+  const r2 = svc('crw:deploy:9', { repo: 'Equicom-Crypto/edge-api', binary: 'edge-api' });
   await refused(() => C.releaseAdmit(r2.id, { as: 'release', verify: ok }), 'draining');
   assert.throws(() => C.claim('env:dev', { as: 'release' }), e => e.code === 'draining');
   C.renew('pr:y#2', { as: 'cell:a', fence: c.fence });
@@ -372,10 +372,10 @@ test('CLI: JSON output, refusal exits 1 with error.code', () => {
   const tf = cli('release', 'request', '--as', 'release', '--key', 'tfc', '--kind', 'tf_apply', '--env', 'dev', '--plan', 'saved:1@1');
   assert.equal(tf.status, 0, JSON.stringify(tf.out));
   assert.deepEqual(tf.out.release.footprint, ['env:dev', 'tf:dev']);
-  const empty = cli('release', 'request', '--as', 'crw', '--key', 'svc0', '--kind', 'service_release', '--env', 'dev', '--repo', 'O/R', '--binary', 'r',
-    '--sha', SHA1, '--tag', 'r-docs1-dev.1', '--runtime-sha', SHA1, '--content-prs', '');
+  const empty = cli('release', 'request', '--as', 'crw', '--key', 'svc0', '--kind', 'service_release', '--env', 'dev', '--repo', 'Equicom-Crypto/Reporting', '--binary', 'reporting',
+    '--sha', SHA1, '--tag', 'reporting-docs1-dev.1', '--runtime-sha', SHA1, '--content-prs', '');
   assert.equal(empty.status, 0, JSON.stringify(empty.out));
-  assert.deepEqual([empty.out.release.content_prs, empty.out.release.repo], [[], 'o/r']);
+  assert.deepEqual([empty.out.release.content_prs, empty.out.release.repo], [[], 'equicom-crypto/reporting']);
   assert.equal(cli('flag', 'tf_full_root_blocked', 'off', '--as', 'release').out.error.code, 'forbidden');
 });
 

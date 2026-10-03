@@ -132,9 +132,9 @@ test('#7 service releases that apply Terraform conflict with and invalidate plan
 test('#8 start rechecks the repo-wide built blocker', async () => {
   const a = await start(await admit(svc('b1')));
   // Same repo, other binary: the intrinsic repo lock already refuses it while the first is running.
-  await refused(() => admit(svc('b2', { binary: 'trading-core-executor', sha: SHA2, n: 34 })), 'footprint_busy');
+  await refused(() => admit(svc('b2', { binary: 'ws-gateway', sha: SHA2, n: 34 })), 'footprint_busy');
   await C.releaseObserve(a.id, { observe: async () => ({ state: 'done' }) });
-  const other = await admit(svc('b3', { binary: 'trading-core-executor', sha: SHA2, n: 34 }));
+  const other = await admit(svc('b3', { binary: 'ws-gateway', sha: SHA2, n: 34 }));
   // A built row of the repo appears after admission (e.g. a reconcile of an earlier run); start must see it.
   run("UPDATE releases SET state='built_not_deployed' WHERE id=?", a.id);
   await refused(() => start(other), 'built_not_deployed');

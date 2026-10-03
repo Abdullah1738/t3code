@@ -67,8 +67,8 @@ test('guard for #2: the requester may hold its own footprint claim; a third part
   C.claim('svc:trading-core', { as: 'crw' });
   const r = svc('a2b');
   assert.equal((await C.releaseAdmit(r.id, { as: 'release', verify: ok })).release.state, 'admitted');
-  C.claim('svc:x', { as: 'cell:z' });
-  const r2 = svc('a2c', { repo: 'Equicom-Crypto/x', binary: 'x' });
+  C.claim('svc:edge-api', { as: 'cell:z' });
+  const r2 = svc('a2c', { repo: 'Equicom-Crypto/edge-api', binary: 'edge-api' });
   await refused(() => C.releaseAdmit(r2.id, { as: 'release', verify: ok }), 'claimed');
 });
 
@@ -76,7 +76,7 @@ test('#3 content range is required and every PR needs positive gate evidence at 
   assert.throws(() => svc('g0', { contentPrs: undefined }), e => e.code === 'invalid');
   assert.throws(() => svc('g1', { runtimeSha: undefined }), e => e.code === 'invalid');
   ranges[SHA1] = [];
-  const empty = svc('g3', { contentPrs: [], repo: 'Equicom-Crypto/x', binary: 'x' });
+  const empty = svc('g3', { contentPrs: [], repo: 'Equicom-Crypto/edge-api', binary: 'edge-api' });
   C.configure({ gateCheck: null });
   assert.equal((await C.releaseAdmit(empty.id, { as: 'release', verify: ok })).release.state, 'admitted', 'a resolver-verified empty range needs no gate hook');
   ranges[SHA2] = [`${TC}#141`, `${TC}#150`];
@@ -237,15 +237,15 @@ test('#14 a built release without a digest can be bound from evidence by an admi
 test('#15 binary is required and the built blocker is repo-wide', async () => {
   assert.throws(() => svc('n0', { binary: undefined }), e => e.code === 'invalid');
   await built('b15');
-  const other = svc('n1', { binary: 'trading-core-executor', sha: SHA2, footprint: ['svc:trading-core-executor'] });
+  const other = svc('n1', { binary: 'ws-gateway', sha: SHA2, footprint: ['svc:ws-gateway'] });
   await refused(() => C.releaseAdmit(other.id, { as: 'release', verify: ok }), 'built_not_deployed');
 });
 
 test('#16 a redispatch supersedes only its own source release, not other built rows', async () => {
   const tc = await built('b16tc');
-  const other = await built('b16x', { repo: 'Equicom-Crypto/x', binary: 'x', contentPrs: [`${TC}#141`] });
-  const re = C.releaseRequest({ as: 'release', key: 'r16', kind: 'redispatch', env: 'dev', repo: 'Equicom-Crypto/x', binary: 'x', sha: SHA1, runtimeSha: SHA0,
-    contentPrs: [`${TC}#141`], tag: tagFor('x'), digest: DIGEST }).release;
+  const other = await built('b16x', { repo: 'Equicom-Crypto/edge-api', binary: 'edge-api', contentPrs: [`${TC}#141`] });
+  const re = C.releaseRequest({ as: 'release', key: 'r16', kind: 'redispatch', env: 'dev', repo: 'Equicom-Crypto/edge-api', binary: 'edge-api', sha: SHA1, runtimeSha: SHA0,
+    contentPrs: [`${TC}#141`], tag: tagFor('edge-api'), digest: DIGEST }).release;
   await admitStart(re);
   const states = Object.fromEntries(C.releaseList({}).releases.map(r => [r.request_key, r.state]));
   assert.equal(states.b16tc, 'built_not_deployed');
@@ -367,7 +367,7 @@ test('#24 transfer is refused while the previous writer is unreconciled or recon
 
 test('pump observes running releases, bounded per tick', async () => {
   const ids = [];
-  for (let i = 0; i < 3; i++) ids.push((await admitStart(svc(`pm${i}`, { repo: `Equicom-Crypto/r${i}`, binary: `r${i}` }))).id);
+  for (let i = 0; i < 3; i++) ids.push((await admitStart(svc(`pm${i}`, { repo: `Equicom-Crypto/${['edge-api', 'reporting', 'rewards'][i]}`, binary: ['edge-api', 'reporting', 'rewards'][i] }))).id);
   const seen = [];
   const out = await pump({ cfg: stub.cfg, observeLimit: 2, observe: async r => { seen.push(r.id); return { state: 'done' }; } });
   assert.deepEqual(seen, ids.slice(0, 2));

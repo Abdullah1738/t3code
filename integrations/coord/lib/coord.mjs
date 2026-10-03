@@ -221,15 +221,36 @@ function expire(c) {
 const reconcileErr = c => refuse('reconcile_required', `${c.resource} lease of ${c.owner} expired; reconcile before reuse`,
   { owner: c.owner, fence: c.fence, op_ref: c.op_ref, reconcile_outcome: c.reconcile_outcome });
 
-export function claim(resource, { as, ttl, purpose, op } = {}) {
+// Claims on these resource kinds coordinate work, not environment mutations; every other kind
+// (env:, svc:, repo:, tf:, ch:, ...) is a mutation claim scoped to one environment, or to all ('*').
+const NON_MUTATION = ['pr', 'ticket', 'files', 'arch', 'channel', 'work'];
+export function claimEnv(resource, env) {
+  if (NON_MUTATION.includes(resource.split(':')[0])) return null;
+  if (resource.startsWith('env:')) return resource.slice(4);
+  if (env) return env;
+  const root = /^tf:([a-z]+)/.exec(resource)?.[1];
+  return ['dev', 'staging', 'prod'].includes(root) ? root : '*';
+}
+const envMatch = (a, b) => a === '*' || b === '*' || a === b;
+
+// Every holder of a mutation claim in `env`: the open QA window or the first conflicting release.
+function envHolder(resource, env, fence = null, owner = null) {
+  if (env === null) return releaseOn(resource, fence, owner);
+  const qa = all("SELECT id, environment FROM releases WHERE kind='qa_window' AND state='running'").find(q => envMatch(q.environment, env));
+  if (qa) return refuse('qa_window_open', `QA window #${qa.id} holds ${qa.environment}; mutation claims wait for it to close`, { blocking: qa.id });
+  const rel = releaseOn(resource, fence, owner, env);
+  return rel && refuse('release_in_flight', `${rel.kind} #${rel.id} (${rel.state}) holds ${resource}`, { blocking: rel.id });
+}
+
+export function claim(resource, { as, ttl, purpose, op, env } = {}) {
   need(resource, 'resource'); need(as, 'as');
   const secs = parseTtl(ttl);
+  const scope = claimEnv(resource, env);
   return tx(() => {
-    requireMode(resourceScope(resource));
-    const qa = qaOn(resource);
-    if (qa) throw refuse('qa_window_open', `QA window #${qa.id} holds ${resource.slice(4)}; env claims wait for it to close`, { blocking: qa.id });
-    const rel = releaseOn(resource);
-    if (rel) throw refuse('release_in_flight', `${rel.kind} #${rel.id} (${rel.state}) holds ${resource}`, { blocking: rel.id });
+    requireMode(resourceScope(resource) ?? (scope && scope !== '*' ? `env:${scope}` : undefined));
+    const held = envHolder(resource, scope);
+    if (held instanceof Error) throw held;
+    if (held) throw refuse('release_in_flight', `${held.kind} #${held.id} (${held.state}) holds ${resource}`, { blocking: held.id });
     const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
     if (c?.state === 'reconcile_required') return reconcileErr(c);
     if (c?.state === 'active') throw refuse('held', `${resource} is held by ${c.owner}`, { owner: c.owner, fence: c.fence, lease_until: c.lease_until });
@@ -238,9 +259,9 @@ export function claim(resource, { as, ttl, purpose, op } = {}) {
     run('INSERT INTO fences (resource,fence) VALUES (?,1) ON CONFLICT(resource) DO UPDATE SET fence=fence+1', resource);
     const fence = get('SELECT fence FROM fences WHERE resource=?', resource).fence;
     const t = now();
-    run(`INSERT OR REPLACE INTO claims (resource,owner,fence,state,lease_until,purpose,op_ref,claimed_at,renewed_at)
-      VALUES (?,?,?,'active',?,?,?,?,?)`, resource, as, fence, t + secs, purpose ?? null, op ?? null, t, t);
-    return { resource, fence, lease_until: t + secs };
+    run(`INSERT OR REPLACE INTO claims (resource,owner,fence,state,lease_until,purpose,op_ref,claimed_at,renewed_at,env)
+      VALUES (?,?,?,'active',?,?,?,?,?,?)`, resource, as, fence, t + secs, purpose ?? null, op ?? null, t, t, scope);
+    return { resource, fence, lease_until: t + secs, env: scope };
   });
 }
 
@@ -253,15 +274,15 @@ function holder(resource, as, fence) {
   return c;
 }
 
-const qaOn = resource => (resource.startsWith('env:') ? openQa(resource.slice(4)) : null);
-
 // Admitted/running mutations holding `resource`, other than ones whose admission relied on exactly this
-// claim fence (the same operation). An env: resource is held by every mutation in that environment.
-function releaseOn(resource, fence = null, owner = null) {
+// claim fence (the same operation). An env: resource is held by every mutation in that environment, and
+// an env-exclusive mutation holds every mutation claim (`claimScope`) in its environment.
+function releaseOn(resource, fence = null, owner = null, claimScope = null) {
   const env = resource.startsWith('env:') ? resource.slice(4) : null;
-  return all("SELECT id, kind, state, environment, footprint, claim_fences FROM releases WHERE state IN ('admitted','running') AND kind!='qa_window'")
+  return all("SELECT id, kind, state, environment, env_exclusive, footprint, claim_fences FROM releases WHERE state IN ('admitted','running') AND kind!='qa_window'")
     .find(r => {
-      if (env ? r.environment !== env : !parse(r.footprint).includes(resource)) return false;
+      const holds = env ? r.environment === env : parse(r.footprint).includes(resource);
+      if (!holds && !(r.env_exclusive && claimScope !== null && envMatch(r.environment, claimScope))) return false;
       const relied = parse(r.claim_fences)?.[resource];
       return !(fence !== null && relied && relied.fence === Number(fence) && relied.owner === owner);
     }) ?? null;
@@ -269,10 +290,10 @@ function releaseOn(resource, fence = null, owner = null) {
 
 export function check(resource, { as, fence } = {}) {
   return tx(() => {
-    const qa = qaOn(resource);
-    if (qa) throw refuse('qa_window_open', `QA window #${qa.id} holds ${resource.slice(4)}`, { blocking: qa.id });
-    const rel = releaseOn(resource, fence, as);
-    if (rel) throw refuse('release_in_flight', `${rel.kind} #${rel.id} (${rel.state}) holds ${resource}`, { blocking: rel.id });
+    const cur = get('SELECT env FROM claims WHERE resource=?', resource);
+    const held = envHolder(resource, cur ? cur.env : claimEnv(resource), fence, as);
+    if (held instanceof Error) throw held;
+    if (held) throw refuse('release_in_flight', `${held.kind} #${held.id} (${held.state}) holds ${resource}`, { blocking: held.id });
     const c = holder(resource, as, fence);
     return c instanceof Error ? c : { resource, owner: c.owner, fence: c.fence, lease_until: c.lease_until };
   });
@@ -407,14 +428,26 @@ const overlap = (a, b) => a.some(x => b.includes(x));
 const conflicts = (a, b) => overlap(a.footprint.filter(f => !f.startsWith('env:')), b.footprint.filter(f => !f.startsWith('env:')))
   || ((a.env_exclusive || b.env_exclusive) && a.environment === b.environment);
 const fingerprint = o => hash(o);
-// Release tags, as in crpko-devops scripts/validate-release-tag.mjs: <binary>-docs<N>-<env>.<M>.
+// Release binaries and environments: crpko-devops plan/schemas/cicd/release-tag.schema.json
+// (properties.binary.enum / env.enum) at main-dev 34264683c2, as read by scripts/validate-release-tag.mjs.
+// Repository names are not binaries: custody-transfer releases `custody-transfers`, market-data-mock
+// `market-data`, venue-router-adapters-mock `venue-router-adapters`, risk-liquidation-latest `risk-liquidation`.
+export const RELEASE_BINARIES = ['backoffice-core', 'backoffice-frontend', 'clickhouse-ingestor', 'compliance-kyc', 'crypko-frontend',
+  'custody-transfers', 'edge-api', 'market-data', 'registry', 'reporting', 'rewards', 'risk-liquidation', 'trading-core',
+  'venue-router-adapters', 'ws-gateway'];
+const RELEASE_ENVS = ['dev', 'staging', 'prod'];
+// Release tags as scripts/validate-release-tag.mjs parses them: exactly one allowed binary must match
+// ^<binary>-docs<N>-<env>.<M>$ with N, M >= 1 and no leading zeros.
 export function parseTag(tag) {
-  const m = /^([a-z0-9][a-z0-9-]*)-docs([1-9][0-9]*)-(dev|staging|prod)\.([1-9][0-9]*)$/.exec(String(tag ?? ''));
-  return m && { binary: m[1], docs: Number(m[2]), env: m[3], version: Number(m[4]) };
+  const hits = RELEASE_BINARIES.flatMap(binary => {
+    const m = new RegExp(`^${binary}-docs([1-9][0-9]*)-(${RELEASE_ENVS.join('|')})\\.([1-9][0-9]*)$`).exec(String(tag ?? ''));
+    return m ? [{ binary, docs: Number(m[1]), env: m[2], version: Number(m[3]) }] : [];
+  });
+  return hits.length === 1 ? hits[0] : null;
 }
 function tagError(tag, binary, env) {
   const t = parseTag(tag);
-  if (!t) return refuse('invalid_tag', `${tag} is not <binary>-docs<N>-<env>.<M>`);
+  if (!t) return refuse('invalid_tag', `${tag} is not <binary>-docs<N>-<env>.<M> for a release binary (${RELEASE_BINARIES.join(', ')})`);
   if (t.binary !== binary || t.env !== env) return refuse('invalid_tag', `${tag} is ${t.binary}/${t.env}, request is ${binary}/${env}`);
   return null;
 }
@@ -555,9 +588,17 @@ function claimsFor(footprint, owners) {
   }
   return relied;
 }
+// Resources whose claims a release must respect: its footprint, plus, when env-exclusive, every
+// mutation claim in its environment (whatever the resource).
+function claimResources(r) {
+  if (!r.env_exclusive) return r.footprint;
+  const scoped = all("SELECT resource, env FROM claims WHERE state IN ('active','reconcile_required') AND env IS NOT NULL")
+    .filter(c => envMatch(c.env, r.environment)).map(c => c.resource);
+  return [...new Set([...r.footprint, ...scoped])];
+}
 // The claims relied on at admission must still be the same active fences at start; no new foreign claim.
 function sameClaims(r) {
-  const now_ = claimsFor(r.footprint, [r.admitted_by, r.requester]);
+  const now_ = claimsFor(claimResources(r), [r.admitted_by, r.requester]);
   if (now_ instanceof Error) return now_;
   const before = r.claim_fences ?? {};
   for (const res of new Set([...Object.keys(before), ...Object.keys(now_)])) {
@@ -635,7 +676,7 @@ export async function releaseAdmit(id, o = {}) {
     const busy = all("SELECT id, kind, environment, env_exclusive, footprint FROM releases WHERE id!=? AND state IN ('admitted','running') AND kind!='qa_window'", r.id)
       .find(x => conflicts({ ...x, footprint: parse(x.footprint) }, r));
     if (busy) throw refuse('footprint_busy', `overlaps ${busy.kind} #${busy.id}`, { blocking: busy.id });
-    const relied = claimsFor(r.footprint, [as, r.requester]);
+    const relied = claimsFor(claimResources(r), [as, r.requester]);
     if (relied instanceof Error) return relied;
     const src = builtCheck(r);
     if (src instanceof Error) throw src;
@@ -789,17 +830,28 @@ export async function releaseObserve(id, { observe = evidence.observeRelease } =
   if (r.state !== 'running') return { release: r, unchanged: true };
   if (MANUAL_KINDS.includes(r.kind)) return { release: r, pending: `${r.kind} is closed with release reconcile` };
   const o = await observe(r);
-  if (!o || !['done', 'failed', 'built_not_deployed'].includes(o.state)) {
-    const note = `${o?.state ?? 'unknown'}: ${o?.why ?? 'no result'}`;
-    run('UPDATE releases SET observed_at=?, observe_note=? WHERE id=?', now(), note, r.id);
-    return { release: relRow(id), pending: note };
-  }
   return tx(() => {
     const cur = relRow(id);
     if (cur.version !== r.version) return { release: cur, pending: 'release changed while observing; observe again' };
+    // Persist the run attempts and downstream run the observer saw, pending or terminal. A value that
+    // differs from one already bound is an unaccounted run: the result becomes unknown.
+    const set = {};
+    let conflict = null;
+    for (const [col, v] of Object.entries(o?.bind ?? {})) {
+      if (v === undefined || v === null) continue;
+      if (cur[col] !== null && cur[col] !== undefined && String(cur[col]) !== String(v)) conflict = `${col} is ${cur[col]}, observed ${v}`;
+      else if (cur[col] === null || cur[col] === undefined) set[col] = col === 'deploy_run' ? String(v) : Number(v);
+    }
+    const terminal = o && ['done', 'failed', 'built_not_deployed'].includes(o.state) && !conflict;
+    if (!terminal) {
+      const note = conflict ? `unknown: ${conflict}; reconcile manually` : `${o?.state ?? 'unknown'}: ${o?.why ?? 'no result'}`;
+      if (Object.keys(set).length) touch(r.id, set);
+      run('UPDATE releases SET observed_at=?, observe_note=? WHERE id=?', now(), note, r.id);
+      return { release: relRow(id), pending: note };
+    }
     if (o.digest && cur.image_digest && o.digest !== cur.image_digest)
       throw refuse('binding_mismatch', `observed digest ${o.digest} differs from bound ${cur.image_digest}`);
-    touch(r.id, { state: o.state, readback: json(o.readback), failure: o.failure ?? null, outcome: o.outcome ?? o.state, observed_at: now(),
+    touch(r.id, { ...set, state: o.state, readback: json(o.readback), failure: o.failure ?? null, outcome: o.outcome ?? o.state, observed_at: now(),
       ...(o.digest && !cur.image_digest ? { image_digest: o.digest } : {}) });
     bumpRoots(tfRoots(r));
     return { release: relRow(r.id) };
@@ -840,10 +892,12 @@ export function qaOpen({ as, env, footprint, ttl, key } = {}) {
     const busy = all("SELECT id, kind, footprint FROM releases WHERE state IN ('admitted','running') AND (environment=? OR kind='qa_window')", env)
       .find(x => x.kind !== 'qa_window' || overlap(parse(x.footprint), fp));
     if (busy) throw refuse(busy.kind === 'qa_window' ? 'footprint_busy' : 'env_busy', `${env} has ${busy.kind} #${busy.id} in flight`, { blocking: busy.id });
-    // No env mutation claim may coexist with a QA window, whoever holds it.
-    const envClaim = claimsFor([`env:${env}`], []);
+    // No mutation claim in the environment may coexist with a QA window, whoever holds it.
+    const scoped = all("SELECT resource, env FROM claims WHERE state IN ('active','reconcile_required') AND env IS NOT NULL")
+      .filter(c => envMatch(c.env, env)).map(c => c.resource);
+    const envClaim = claimsFor([...new Set([`env:${env}`, ...scoped])], []);
     if (envClaim instanceof Error) return envClaim;
-    const held = claimsFor(fp.filter(f => f !== `env:${env}`), [as]);
+    const held = claimsFor(fp.filter(f => f !== `env:${env}` && !scoped.includes(f)), [as]);
     if (held instanceof Error) return held;
     const t = now();
     const id = Number(run(`INSERT INTO releases (request_key,fingerprint,requester,kind,environment,footprint,state,admitted_by,admitted_at,readback,created_at,updated_at)
