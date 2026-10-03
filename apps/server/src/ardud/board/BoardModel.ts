@@ -89,6 +89,7 @@ export interface LiveInfo {
   readonly branch: string | null;
   readonly worktreePath: string | null;
   readonly archived: boolean;
+  readonly settled: boolean;
   readonly title: string;
   readonly projectId: string | null;
 }
@@ -138,6 +139,11 @@ export class BoardModel {
   readonly rows = new Map<string, BoardRow>();
   readonly live = new Map<string, LiveInfo>();
   readonly origins = new Map<string, string>();
+  /**
+   * The scheduled task behind each card's latest prompt, or null when it was
+   * checked and is not a scheduled run.
+   */
+  readonly schedules = new Map<string, string | null>();
   activatedAt: number;
   private readonly now: () => number;
 
@@ -222,6 +228,7 @@ export class BoardModel {
       branch: observation.branch,
       worktreePath: observation.worktreePath,
       archived: observation.archived,
+      settled: observation.settled === true,
       title: observation.title,
       projectId: observation.projectId,
     };
@@ -318,6 +325,48 @@ export class BoardModel {
       if (info === null) this.live.delete(threadId);
       else this.live.set(threadId, info);
     }
+  }
+
+  /**
+   * A schedule shows as one card: its latest run. Older runs resting in the
+   * Scheduled lane are completed the way a review completes them. Runs still
+   * running or waiting on a request stay until they settle, and a card the
+   * user restored stays until the schedule runs again. Returns the rows to
+   * write; the caller commits them.
+   */
+  supersededRuns(): BoardRow[] {
+    const order = (row: BoardRow) => row.promptAt ?? row.updatedAt;
+    const runs: Array<{ readonly row: BoardRow; readonly scheduleId: string }> = [];
+    const latest = new Map<string, BoardRow>();
+    for (const [threadId, scheduleId] of this.schedules) {
+      if (scheduleId === null) continue;
+      const row = this.rows.get(threadId);
+      if (row === undefined) continue;
+      runs.push({ row, scheduleId });
+      const current = latest.get(scheduleId);
+      if (
+        current === undefined ||
+        order(row) > order(current) ||
+        (order(row) === order(current) && row.threadId > current.threadId)
+      ) {
+        latest.set(scheduleId, row);
+      }
+    }
+    let working: ReadonlySet<string> | undefined;
+    let totals: ReadonlyMap<string, ArdudBoardAttention> | undefined;
+    const superseded: BoardRow[] = [];
+    for (const { row, scheduleId } of runs) {
+      const newest = latest.get(scheduleId)!;
+      if (newest.threadId === row.threadId || row.reviewed || !row.scheduled || row.backlog) {
+        continue;
+      }
+      if (!row.pending && row.updatedAt >= order(newest)) continue;
+      working ??= this.workingAncestors();
+      totals ??= this.attentionTotals();
+      if (totals.has(row.threadId) || this.laneOf(row, working, totals) !== "scheduled") continue;
+      superseded.push({ ...row, pending: false, reviewed: true, completedFrom: "scheduled" });
+    }
+    return superseded;
   }
 
   /** Requests on each thread plus every subagent below it. */
