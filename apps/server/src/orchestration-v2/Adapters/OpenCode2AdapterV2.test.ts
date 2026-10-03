@@ -46,7 +46,7 @@ import * as IdAllocator from "../IdAllocator.ts";
 import type { ProviderContinuationRequest } from "../ProviderContinuationRequests.ts";
 import * as ProviderContinuationRequests from "../ProviderContinuationRequests.ts";
 import { OPENCODE_PROVIDER } from "./OpenCodeAdapterV2.ts";
-import { OPENCODE_2_STILL_STOPPING } from "./OpenCode2AdapterV2.ts";
+import { OPENCODE_2_STILL_STOPPING, t3McpServerName } from "./OpenCode2AdapterV2.ts";
 import { openCode2ReplayRuntime } from "./OpenCode2AdapterV2.testkit.ts";
 
 const SESSION = "ses_f148ca2deffeJcwCnRQtb0YFNX";
@@ -398,6 +398,17 @@ const history = {
 };
 
 describe("OpenCode2 adapter", () => {
+  it("keeps T3's MCP server name within OpenCode's 64-character namespace limit", () => {
+    assert.strictEqual(t3McpServerName("thread-1"), "t3-code-thread-1");
+    const long = "ardud-opencode-import:thread:ses_f011863f3ffeZDdPM70y6Y9Ncr";
+    const other = "ardud-opencode-import:thread:ses_f011863f3ffeZDdPM70y6Y9Ncs";
+    const name = t3McpServerName(long);
+    assert.isAtMost(name.length, 64);
+    assert.match(name, /^t3-code-ardud-opencode-import_thread_[A-Za-z0-9_-]+$/);
+    assert.notStrictEqual(name, t3McpServerName(other));
+    assert.strictEqual(name, t3McpServerName(long));
+  });
+
   it.effect("switches the session's model and variant before a turn that changed them", () =>
     Effect.gen(function* () {
       const { runtime, thread } = yield* resumed([
