@@ -90,15 +90,18 @@ gates and runtime, a valid tag, no open QA window and no other built release of 
 `releaseStart`: a different value for a bound field is `binding_mismatch`.
 
 **Mutation claims** are claims on anything but `pr:`, `ticket:`, `files:`, `arch:`, `channel:` and
-`work:`. Each is scoped to one environment. `env:<e>` and Terraform roots `tf:<e>` / `tf:<e>-<suffix>`
-(`tf:dev`, `tf:dev-risk-liquidation`, `tf:dev-core-capacity` are dev) carry their own environment;
-an explicit `env` that contradicts it is refused (`env_mismatch`). Other resources take
-`claim(resource, { as, env })` (CLI `--env`); without `env` the claim is scoped to every environment
-(`*`). `claim` returns its `env`. A `*` claim must pass the global gate and every environment's
-pause/drain gate; a scoped claim the global gate and its environment's.
+`work:`. Each resolves to exactly one concrete supported environment (only `dev` today), checked in
+the library so the CLI and embedders agree:
+- `env:<e>` and Terraform roots `tf:<e>` / `tf:<e>-<suffix>` (`tf:dev`, `tf:dev-risk-liquidation`,
+  `tf:dev-core-capacity` are dev) carry their own environment;
+- every other mutation resource needs `claim(resource, { as, env })` (CLI `--env`).
+Refusals: `env_required` (missing or blank `env`, or `env:` with nothing after it), `env_unsupported`
+(any environment other than dev, including `*` and `env:*`), `env_mismatch` (an `env` that contradicts
+the resource's own). Coordination claims ignore `env`. `claim` returns its `env`. A mutation claim
+passes the global pause/drain gate and its environment's.
 
 **Claims exclude claims** beyond the same resource: an `env:<e>` claim overlaps every other mutation
-claim scoped to `<e>` or `*`, in both directions and whoever holds it (`claimed`; an expired one gives
+claim scoped to `<e>`, in both directions and whoever holds it (`claimed`; an expired one gives
 `reconcile_required` until reconciled). `check` applies the same rule. Disjoint narrow claims (two
 services) stay independent, and coordination claims are unaffected. There is no same-owner exception:
 an operation that holds `env:<e>` does not also claim narrower resources in `<e>`.
@@ -137,6 +140,16 @@ records `done`/`failed` with evidence text (run id, attempt, readback). The rele
 until then (`attention.awaiting_reconcile`). Ending a running operation that touches a Terraform root
 advances that root, so saved plans whose run started earlier are refused (`stale_plan`).
 
+Claim-only mutations advance roots too: acquiring `tf:<root>` advances `<root>`, and so does releasing
+it or reconciling it after expiry; acquiring or ending an `env:<e>` claim advances every known root of
+`<e>` (the saved-plan root and the service release roots). A saved plan whose run started before any
+of those is refused (`stale_plan`).
+
+**Plan verification** (`configure({ planRun })` or the default GitHub check) must return
+`{ startedAt, run?, attempt? }` with a finite positive `startedAt` (seconds) and, when given, the
+pinned run and attempt. `null`, a malformed result, or a throw is `plan_unverified`, at admission and
+at start; start also requires the same `startedAt` as admission.
+
 Saved plans: `terraform-dev.yml`'s saved-plan apply takes only `saved_plan_run_id` and uses that
 run's **latest** attempt; it has no attempt input. Admission and start therefore require the pinned
 attempt to still be the run's latest, both before and after reading its evidence
@@ -174,6 +187,9 @@ for frontends; everything but `state` and `reason` is `null` when unknown). They
 - The pump re-reads each delivery or reminder, its actor's thread and the pause state just before each
   send; held rows never starve deliverable ones.
 - A Robob thread in `waiting` is not drained, and a thread that could not be checked is not drained.
+- `reconcile(resource, { as, fence, outcome, evidence })` (CLI `--fence`, required) closes exactly the
+  expired claim with that fence. Retrying a fence that was already reconciled returns its historical
+  result (`historical: true`); any other fence is `stale_fence`, and the current claim is untouched.
 - `ready()` is true only if no dependency changed or was added while it was evaluated, and the local
   ones (`claim_free`, `event_acked`, `release_done`) still hold inside its final transaction.
 - A taken arch request moves to a new `arch:broker` holder via `arch transfer` after the old fence was
@@ -197,7 +213,8 @@ Evidence fails closed: anything not positively identified is `unknown`, and the 
   `unknown` with reason `workflow_dispatch provenance unsupported; reconcile manually`; CRW cuts
   release tags by push, so this is an accepted limit.
 - Every applied observation, pending or terminal, advances the release version, so an older
-  observation still in flight is discarded once a newer one was recorded.
+  observation still in flight is discarded once a newer one was recorded. An observer that throws is
+  recorded the same way, as an unknown result (`observation failed: ...`).
 - The observer binds the release run's attempt, the downstream deploy run and its attempt the first time
   it sees them, and persists them even while the result is pending. Afterwards, a different attempt of
   either run, a release run first seen past attempt 1, or a dispatch link in the logs that is not the

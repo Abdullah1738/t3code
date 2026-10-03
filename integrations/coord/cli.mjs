@@ -15,9 +15,9 @@ const USAGE = `coord <command> [args] (JSON output; see README.md)
   inbox --as A [--unacked] [--after SEQ]          ack --as A SEQ|KEY ...
   deliver [--once]                                 (deliveries only)
   pump                                             (deliveries + observe running releases; for launchd)
-  claim RES --as A [--env E] [--ttl 30m] [--purpose P] [--op REF]   (--env: environment a mutation claim acts on; default its own or *)
+  claim RES --as A [--env E] [--ttl 30m] [--purpose P] [--op REF]   (--env: required for mutation claims other than env:/tf:; dev only)
   renew RES --as A --fence N [--ttl] [--op REF]    release RES --as A --fence N [--note]
-  check RES --as A --fence N                       reconcile RES --as A --outcome O --evidence TEXT
+  check RES --as A --fence N                       reconcile RES --as A --fence N --outcome O --evidence TEXT
   claims [--owner A] [--state S]
   dep add WORK NEED REF | dep set ID --state S --evidence E | ready WORK
   release request --as A --key K --kind K --env E --footprint a,b [--risk R] [--batch B]
@@ -96,7 +96,7 @@ async function main() {
       if (!/^(request|admit|start|record|reconcile|observe|cancel|list)$/.test(sub ?? '')) return C.release(sub, { as: o.as, fence: o.fence, note: o.note });
       return releaseCmd(sub, a1);
     case 'check': return C.check(sub, { as: o.as, fence: o.fence });
-    case 'reconcile': return C.reconcile(sub, { as: o.as, outcome: o.outcome, evidence: o.evidence });
+    case 'reconcile': return C.reconcile(sub, { as: o.as, fence: o.fence, outcome: o.outcome, evidence: o.evidence });
     case 'claims': return C.claims({ owner: o.owner, state: o.state });
     case 'dep':
       if (sub === 'add') return C.depAdd(a1, a2, p[4]);

@@ -56,7 +56,7 @@ test('#2 an expired env claim held by an admitter blocks admission by anyone', a
   await refused(() => C.releaseAdmit(r.id, { as: 'crw', verify: ok }), 'reconcile_required');
   assert.equal(C.claims({ state: 'reconcile_required' }).claims[0].resource, 'env:dev');
   await refused(() => C.releaseAdmit(r.id, { as: 'release', verify: ok }), 'reconcile_required');
-  C.reconcile('env:dev', { as: 'master', outcome: 'done', evidence: 'tf-run-5 finished' });
+  C.reconcile('env:dev', { as: 'master', fence: 1, outcome: 'done', evidence: 'tf-run-5 finished' });
   const a = (await C.releaseAdmit(r.id, { as: 'release', verify: ok })).release;
   run("INSERT OR REPLACE INTO claims (resource,owner,fence,state,lease_until) VALUES ('env:dev','master',9,'active',?)", C.clock.now() + 1);
   advance(2);
@@ -64,10 +64,10 @@ test('#2 an expired env claim held by an admitter blocks admission by anyone', a
 });
 
 test('guard for #2: the requester may hold its own footprint claim; a third party may not', async () => {
-  C.claim('svc:trading-core', { as: 'crw' });
+  C.claim('svc:trading-core', { as: 'crw', env: 'dev' });
   const r = svc('a2b');
   assert.equal((await C.releaseAdmit(r.id, { as: 'release', verify: ok })).release.state, 'admitted');
-  C.claim('svc:edge-api', { as: 'cell:z' });
+  C.claim('svc:edge-api', { as: 'cell:z', env: 'dev' });
   const r2 = svc('a2c', { repo: 'Equicom-Crypto/edge-api', binary: 'edge-api' });
   await refused(() => C.releaseAdmit(r2.id, { as: 'release', verify: ok }), 'claimed');
 });
@@ -115,7 +115,7 @@ test('#5 QA cannot open over a reconcile_required or foreign active env claim', 
   C.claim('env:dev', { as: 'release', ttl: '1s', op: 'tf-run-9' });
   advance(2);
   assert.throws(() => C.qaOpen({ as: 'harness', env: 'dev' }), e => e.code === 'reconcile_required');
-  C.reconcile('env:dev', { as: 'master', outcome: 'done', evidence: 'run 9 ok' });
+  C.reconcile('env:dev', { as: 'master', fence: 1, outcome: 'done', evidence: 'run 9 ok' });
   C.claim('env:dev', { as: 'cell:a' });
   assert.throws(() => C.qaOpen({ as: 'harness', env: 'dev' }), e => e.code === 'claimed');
 });
@@ -345,7 +345,7 @@ test('#24 a reconciled writer can be replaced: the new arch:broker holder takes 
   C.archTake(req.id, { as: 'arch-author', fence: f1 });
   advance(2);
   assert.throws(() => C.claim(C.ARCH_RESOURCE, { as: 'arch-author-2' }), e => e.code === 'reconcile_required');
-  C.reconcile(C.ARCH_RESOURCE, { as: 'master', outcome: 'not_started', evidence: 'no broker commits since take' });
+  C.reconcile(C.ARCH_RESOURCE, { as: 'master', fence: f1, outcome: 'not_started', evidence: 'no broker commits since take' });
   const f2 = C.claim(C.ARCH_RESOURCE, { as: 'arch-author-2' }).fence;
   assert.throws(() => C.archDone(req.id, { as: 'arch-author-2', fence: f2, commits: 'x' }), e => e.code === 'forbidden');
   const t = C.archTransfer(req.id, { as: 'arch-author-2', fence: f2 }).request;
@@ -358,7 +358,7 @@ test('#24 transfer is refused while the previous writer is unreconciled or recon
   const f1 = C.claim(C.ARCH_RESOURCE, { as: 'w1', ttl: '1s' }).fence;
   C.archTake(req.id, { as: 'w1', fence: f1 });
   advance(2);
-  C.reconcile(C.ARCH_RESOURCE, { as: 'master', outcome: 'done', evidence: 'commit abc pushed' });
+  C.reconcile(C.ARCH_RESOURCE, { as: 'master', fence: f1, outcome: 'done', evidence: 'commit abc pushed' });
   const f2 = C.claim(C.ARCH_RESOURCE, { as: 'w2' }).fence;
   assert.throws(() => C.archTransfer(req.id, { as: 'w2', fence: f2 }), e => e.code === 'not_reconciled');
 });

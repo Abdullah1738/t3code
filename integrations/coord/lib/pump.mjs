@@ -151,7 +151,7 @@ export async function pump({ cfg, observe, observeLimit = 5, ...o } = {}) {
       const r = await releaseObserve(id, observe ? { observe } : {});
       out.observed.push({ id, state: r.release.state, ...(r.pending ? { pending: r.pending } : {}) });
     } catch (e) {
-      run('UPDATE releases SET observed_at=?, observe_note=? WHERE id=?', clock.now(), `unknown: ${e.code ?? 'error'}: ${e.message}`.slice(0, 500), id);
+      // releaseObserve records observation failures itself; what reaches here is a refusal, not evidence.
       out.observed.push({ id, error: e.code ?? 'error', message: e.message });
     }
   }

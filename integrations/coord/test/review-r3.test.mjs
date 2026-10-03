@@ -32,8 +32,8 @@ afterEach(async () => { await stub.close(); C.close(); });
 test('F1 claims and releases exclude each other in both directions', async () => {
   const a = await start(await admit(svc('a')));
   throwsCode(() => C.claim('env:dev', { as: 'cell:manual', op: 'terraform apply' }), 'release_in_flight');
-  throwsCode(() => C.claim('svc:trading-core', { as: 'cell:manual' }), 'release_in_flight');
-  throwsCode(() => C.claim(`repo:${TC}`, { as: 'release' }), 'release_in_flight');
+  throwsCode(() => C.claim('svc:trading-core', { as: 'cell:manual', env: 'dev' }), 'release_in_flight');
+  throwsCode(() => C.claim(`repo:${TC}`, { as: 'release', env: 'dev' }), 'release_in_flight');
   C.claim('pr:x#1', { as: 'cell:manual' }); // unrelated resources stay claimable
   // A fence that races in (here written directly) does not pass check while the release holds the env.
   run("INSERT INTO claims (resource,owner,fence,state,lease_until) VALUES ('env:dev','cell:manual',7,'active',?)", C.clock.now() + 600);

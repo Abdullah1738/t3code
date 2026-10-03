@@ -89,7 +89,7 @@ test('R5-2 tf roots and env: claims keep their own environment; a contradictory 
     C.release(res, { as: 'cell:m', fence: c.fence });
   }
   assert.equal(C.claimEnv('svc:trading-core', 'dev'), 'dev');
-  assert.equal(C.claimEnv('svc:trading-core'), '*');
+  throwsCode(() => C.claimEnv('svc:trading-core'), 'env_required');
 });
 
 test('R5-2 each dev root versus a dev QA window, both orders', () => {
@@ -123,10 +123,9 @@ test('R5-2 each dev root versus an env-exclusive non-Terraform release, both ord
 
 test('R5-3 an env: claim and a foreign narrower mutation claim in that env exclude each other, both orders', () => {
   const apply = C.claim('env:dev', { as: 'cell:apply', op: 'full-root apply' });
-  for (const [res, env] of [['svc:trading-core', 'dev'], ['tf:dev', undefined], ['ch:ddl', undefined], ['repo:x', 'dev']])
+  for (const [res, env] of [['svc:trading-core', 'dev'], ['tf:dev', undefined], ['ch:ddl', 'dev'], ['repo:x', 'dev']])
     throwsCode(() => C.claim(res, { as: 'cell:deploy', env }), 'claimed');
   C.claim('pr:x#1', { as: 'cell:deploy' }); // coordination claims are unaffected
-  C.claim('svc:edge-api', { as: 'cell:other', env: 'staging' }); // other environments are unaffected
   C.release('env:dev', { as: 'cell:apply', fence: apply.fence });
   const deploy = C.claim('svc:trading-core', { as: 'cell:deploy', env: 'dev' });
   throwsCode(() => C.claim('env:dev', { as: 'cell:apply' }), 'claimed');
@@ -137,31 +136,29 @@ test('R5-3 an env: claim and a foreign narrower mutation claim in that env exclu
   throwsCode(() => C.check('env:dev', { as: 'cell:apply', fence: 9 }), 'claimed');
 });
 
-test('R5-3 a wildcard mutation claim overlaps env:<e>, and the same owner gets no exception', () => {
-  const w = C.claim('svc:trading-core', { as: 'cell:a' });
-  assert.equal(w.env, '*');
+test('R5-3 a narrow dev claim overlaps env:dev, and the same owner gets no exception', () => {
+  const w = C.claim('svc:trading-core', { as: 'cell:a', env: 'dev' });
   throwsCode(() => C.claim('env:dev', { as: 'cell:a' }), 'claimed');
   C.release('svc:trading-core', { as: 'cell:a', fence: w.fence });
   C.claim('env:dev', { as: 'cell:a' });
-  throwsCode(() => C.claim('svc:trading-core', { as: 'cell:a' }), 'claimed');
+  throwsCode(() => C.claim('svc:trading-core', { as: 'cell:a', env: 'dev' }), 'claimed');
 });
 
 test('R5-3 an expired env: claim blocks narrower claims until reconciled', () => {
   C.claim('env:dev', { as: 'cell:apply', ttl: '1s', op: 'apply' });
   advance(2);
   throwsCode(() => C.claim('svc:trading-core', { as: 'cell:deploy', env: 'dev' }), 'reconcile_required');
-  C.reconcile('env:dev', { as: 'master', outcome: 'done', evidence: 'apply finished' });
+  C.reconcile('env:dev', { as: 'master', fence: 1, outcome: 'done', evidence: 'apply finished' });
   assert.equal(C.claim('svc:trading-core', { as: 'cell:deploy', env: 'dev' }).env, 'dev');
 });
 
 // ---------- R5-4 ----------
 
-test('R5-4 a wildcard mutation claim passes every environment gate', () => {
+test('R5-4 a mutation claim passes its environment gate; unscoped ones are refused', () => {
   for (const mode of ['pause', 'drain']) {
     C.setMode(mode, { scope: 'env:dev', as: 'master', reason: 'r' });
     throwsCode(() => C.claim('svc:trading-core', { as: 'cell:direct', env: 'dev' }), mode === 'pause' ? 'paused' : 'draining');
-    throwsCode(() => C.claim('svc:trading-core', { as: 'cell:direct' }), mode === 'pause' ? 'paused' : 'draining');
-    assert.equal(C.claim('svc:edge-api', { as: 'cell:direct', env: 'staging' }).env, 'staging');
+    throwsCode(() => C.claim('svc:trading-core', { as: 'cell:direct' }), 'env_required');
     C.claim('pr:z#1', { as: 'cell:direct' }); // coordination claims follow the global gate only
     run('DELETE FROM claims');
     C.setMode('run', { scope: 'env:dev', as: 'master' });
@@ -175,11 +172,9 @@ test('R5-4 the CLI forwards --env to claim', () => {
     const r = spawnSync(process.execPath, [fileURLToPath(new URL('../cli.mjs', import.meta.url)), ...args], { env: { ...process.env, COORD_DB: dbPath }, encoding: 'utf8' });
     return { status: r.status, out: JSON.parse(r.stdout || 'null') };
   };
-  for (const extra of [['--env', 'dev'], []]) {
-    const r = cli('claim', 'svc:trading-core', '--as', 'cell:direct', ...extra, '--op', 'direct deploy');
-    assert.deepEqual([r.status, r.out.error?.code], [1, 'paused'], extra.join(' '));
-  }
-  const s = cli('claim', 'svc:edge-api', '--as', 'cell:direct', '--env', 'staging');
-  assert.deepEqual([s.status, s.out.env], [0, 'staging']);
+  const r = cli('claim', 'svc:trading-core', '--as', 'cell:direct', '--env', 'dev', '--op', 'direct deploy');
+  assert.deepEqual([r.status, r.out.error?.code], [1, 'paused']);
+  const u = cli('claim', 'svc:trading-core', '--as', 'cell:direct', '--op', 'direct deploy');
+  assert.deepEqual([u.status, u.out.error?.code], [1, 'env_required']);
   C.open(dbPath);
 });

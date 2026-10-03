@@ -82,7 +82,7 @@ test('#4 start requires the exact claim fences admission relied on, including th
   const a = await admit(svc('f1'));
   assert.deepEqual(a.claim_fences, { 'env:dev': { owner: 'crw', fence: 1 } });
   advance(20);
-  C.reconcile('env:dev', { as: 'master', outcome: 'not_started', evidence: 'nothing ran' });
+  C.reconcile('env:dev', { as: 'master', fence: 1, outcome: 'not_started', evidence: 'nothing ran' });
   // A new claim is refused while the release is admitted (r3 F1); a raced row stands in for one.
   assert.throws(() => C.claim('env:dev', { as: 'crw', op: 'op-2' }), e => e.code === 'release_in_flight');
   run("INSERT OR REPLACE INTO claims (resource,owner,fence,state,lease_until) VALUES ('env:dev','crw',2,'active',?)", C.clock.now() + 600);
@@ -92,7 +92,9 @@ test('#4 start requires the exact claim fences admission relied on, including th
 test('#5 an open QA window refuses env claims and env checks; QA cannot open over an env claim', () => {
   const q = C.qaOpen({ as: 'harness', env: 'dev' }).release;
   assert.throws(() => C.claim('env:dev', { as: 'cell:a', op: 'mutate' }), e => e.code === 'qa_window_open');
+  run("INSERT INTO claims (resource,owner,fence,state,lease_until,env) VALUES ('env:dev','cell:a',1,'active',?,'dev')", C.clock.now() + 600); // a raced row
   assert.throws(() => C.check('env:dev', { as: 'cell:a', fence: 1 }), e => e.code === 'qa_window_open');
+  run("DELETE FROM claims WHERE resource='env:dev'");
   C.claim('pr:x#1', { as: 'cell:a' });
   C.qaClose(q.id, { as: 'harness' });
   C.claim('env:dev', { as: 'cell:a' });
@@ -305,7 +307,7 @@ test('#22 architecture work reconciled done is closed out by the new holder with
   const f1 = C.claim(C.ARCH_RESOURCE, { as: 'w1', ttl: '1s' }).fence;
   C.archTake(req.id, { as: 'w1', fence: f1 });
   advance(2);
-  C.reconcile(C.ARCH_RESOURCE, { as: 'master', outcome: 'done', evidence: 'broker commit abc pushed' });
+  C.reconcile(C.ARCH_RESOURCE, { as: 'master', fence: f1, outcome: 'done', evidence: 'broker commit abc pushed' });
   const f2 = C.claim(C.ARCH_RESOURCE, { as: 'w2' }).fence;
   assert.throws(() => C.archCloseout(req.id, { as: 'w2', fence: f2, commits: 'abc' }), e => e.code === 'invalid');
   const done = C.archCloseout(req.id, { as: 'w2', fence: f2, commits: 'abc', evidence: 'git log origin/main shows abc' }).request;

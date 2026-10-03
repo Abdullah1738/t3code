@@ -221,7 +221,7 @@ const reconcileErr = c => refuse('reconcile_required', `${c.resource} lease of $
   { owner: c.owner, fence: c.fence, op_ref: c.op_ref, reconcile_outcome: c.reconcile_outcome });
 
 // Claims on these resource kinds coordinate work, not environment mutations; every other kind
-// (env:, svc:, repo:, tf:, ch:, ...) is a mutation claim scoped to one environment, or to all ('*').
+// (env:, svc:, repo:, tf:, ch:, ...) is a mutation claim scoped to exactly one supported environment.
 const NON_MUTATION = ['pr', 'ticket', 'files', 'arch', 'channel', 'work'];
 // The environment a resource names by itself: env:<e>, and Terraform roots tf:<e> / tf:<e>-<suffix>
 // (dev, dev-risk-liquidation and dev-core-capacity are dev). Null when the resource does not say.
@@ -229,15 +229,25 @@ function intrinsicEnv(resource) {
   if (resource.startsWith('env:')) return resource.slice(4);
   return /^tf:(dev|staging|prod)(?:-[a-z0-9-]+)?$/.exec(resource)?.[1] ?? null;
 }
-// Mutation scope of a claim: the resource's own environment, else the caller's `env`, else '*'.
-// An explicit `env` that contradicts the resource's own environment is refused.
+// Mutation scope of a claim: the resource's own environment, else the caller's explicit `env`. It must
+// be one concrete supported environment: env_required (missing/blank), env_unsupported (unsupported or
+// '*'), env_mismatch (contradicts the resource's own environment). Coordination claims have no scope.
 export function claimEnv(resource, env) {
   if (NON_MUTATION.includes(resource.split(':')[0])) return null;
   const own = intrinsicEnv(resource);
-  if (own && env && env !== own) throw refuse('env_mismatch', `${resource} is a ${own} resource, not ${env}`);
-  return own ?? env ?? '*';
+  if (own !== null && !own.trim()) throw refuse('env_required', `${resource} names no environment`);
+  let given = null;
+  if (env !== undefined && env !== null) {
+    if (typeof env !== 'string' || !env.trim()) throw refuse('env_required', `env for ${resource} is blank`);
+    given = env;
+  }
+  if (own && given && given !== own) throw refuse('env_mismatch', `${resource} is a ${own} resource, not ${given}`);
+  const scope = own ?? given;
+  if (!scope) throw refuse('env_required', `${resource} is a mutation claim: pass the environment it acts on (env)`);
+  if (!evidence.SUPPORTED_ENVS.includes(scope)) throw refuse('env_unsupported', `${resource}: environment ${scope} is not supported (${evidence.SUPPORTED_ENVS.join(', ')})`);
+  return scope;
 }
-const envMatch = (a, b) => a === '*' || b === '*' || a === b;
+const envMatch = (a, b) => a === b;
 
 // Every holder of a mutation claim in `env`: the open QA window or the first conflicting release.
 function envHolder(resource, env, fence = null, owner = null) {
@@ -248,17 +258,11 @@ function envHolder(resource, env, fence = null, owner = null) {
   return rel && refuse('release_in_flight', `${rel.kind} #${rel.id} (${rel.state}) holds ${resource}`, { blocking: rel.id });
 }
 
-// Pause/drain gates a claim must pass: global, plus its environment's; a '*' claim passes every
-// environment gate that is set, since it may act in any of them.
-function requireClaimMode(scope) {
-  if (scope === null) return requireMode(undefined);
-  if (scope !== '*') return requireMode(`env:${scope}`);
-  requireMode(undefined);
-  for (const { k } of all("SELECT k FROM control WHERE k LIKE 'mode:env:%'")) requireMode(k.slice(5));
-}
+// Pause/drain gates a claim must pass: global, plus its environment's.
+const requireClaimMode = scope => requireMode(scope === null ? undefined : `env:${scope}`);
 
-// Claim-vs-claim overlap beyond the same resource: env:<e> covers every mutation claim scoped to <e>
-// or '*', and every such claim is covered by env:<e>. Expired leases still count (reconcile first).
+// Claim-vs-claim overlap beyond the same resource: env:<e> covers every mutation claim scoped to <e>,
+// and every such claim is covered by env:<e>. Expired leases still count (reconcile first).
 // There is no same-operation association between claims, so the owner does not matter.
 function overlappingClaim(resource, scope) {
   if (scope === null) return null;
@@ -294,6 +298,7 @@ export function claim(resource, { as, ttl, purpose, op, env } = {}) {
     const t = now();
     run(`INSERT OR REPLACE INTO claims (resource,owner,fence,state,lease_until,purpose,op_ref,claimed_at,renewed_at,env)
       VALUES (?,?,?,'active',?,?,?,?,?,?)`, resource, as, fence, t + secs, purpose ?? null, op ?? null, t, t, scope);
+    bumpRoots(claimRoots(resource, scope));
     return { resource, fence, lease_until: t + secs, env: scope };
   });
 }
@@ -324,7 +329,8 @@ function releaseOn(resource, fence = null, owner = null, claimScope = null) {
 export function check(resource, { as, fence } = {}) {
   return tx(() => {
     const cur = get('SELECT env FROM claims WHERE resource=?', resource);
-    const scope = cur ? cur.env : claimEnv(resource);
+    if (!cur) return refuse('not_held', `${resource} is not claimed`);
+    const scope = cur.env;
     const held = envHolder(resource, scope, fence, as);
     if (held instanceof Error) throw held;
     if (held) throw refuse('release_in_flight', `${held.kind} #${held.id} (${held.state}) holds ${resource}`, { blocking: held.id });
@@ -352,21 +358,31 @@ export function release(resource, { as, fence, note } = {}) {
     const c = holder(resource, as, fence);
     if (c instanceof Error) return c;
     run("UPDATE claims SET state='released', released_at=?, note=? WHERE resource=?", now(), note ?? null, resource);
+    bumpRoots(claimRoots(resource, c.env));
     return { resource, fence: c.fence, state: 'released' };
   });
 }
 
-export function reconcile(resource, { as, outcome, evidence } = {}) {
-  need(as, 'as'); need(evidence, 'evidence');
+// Reconciles exactly the expired claim with `fence`. A retry for a fence that was already reconciled
+// returns that historical result; any other fence mismatch is stale_fence and the current claim is untouched.
+export function reconcile(resource, { as, fence, outcome, evidence } = {}) {
+  need(as, 'as'); need(evidence, 'evidence'); need(fence, 'fence');
+  const f = Number(fence);
+  if (!Number.isInteger(f) || f < 1) throw refuse('invalid', 'fence must be a positive integer');
   if (!['done', 'not_started', 'rolled_back', 'still_running'].includes(outcome))
     throw refuse('invalid', 'outcome must be done|not_started|rolled_back|still_running');
   if (!DEFAULTS.reconcilers.includes(as)) throw refuse('forbidden', `${as} may not reconcile (allowed: ${DEFAULTS.reconcilers.join(',')})`);
   return tx(() => {
     const c = expire(get('SELECT * FROM claims WHERE resource=?', resource));
-    if (c?.state !== 'reconcile_required') throw refuse('not_reconcilable', `${resource} is ${c?.state ?? 'unclaimed'}`);
+    const done = c?.fence === f && c.state === 'reconciled' ? c
+      : get("SELECT * FROM claim_history WHERE resource=? AND fence=? AND state='reconciled'", resource, f);
+    if (done) return { resource, fence: f, state: 'reconciled', outcome: done.reconcile_outcome, historical: true };
+    if (c?.fence !== f) throw refuse('stale_fence', `${resource} fence ${f} is not the current claim (current ${c?.fence ?? 'none'}) and was not reconciled`, { fence: c?.fence ?? null });
+    if (c.state !== 'reconcile_required') throw refuse('not_reconcilable', `${resource} fence ${f} is ${c.state}`);
     const state = outcome === 'still_running' ? 'reconcile_required' : 'reconciled';
-    run('UPDATE claims SET state=?, reconcile_by=?, reconcile_outcome=?, reconcile_evidence=?, released_at=? WHERE resource=?', state, as, outcome, evidence, now(), resource);
-    return { resource, state, outcome };
+    run('UPDATE claims SET state=?, reconcile_by=?, reconcile_outcome=?, reconcile_evidence=?, released_at=? WHERE resource=? AND fence=?', state, as, outcome, evidence, now(), resource, f);
+    bumpRoots(claimRoots(resource, c.env));
+    return { resource, fence: f, state, outcome };
   });
 }
 
@@ -554,6 +570,14 @@ export function tfRootGen(root) {
   const t = get('SELECT gen, bumped_at FROM tf_roots WHERE root=?', need(root, 'root'));
   return { root, gen: t?.gen ?? 0, bumped_at: t?.bumped_at ?? null };
 }
+// Terraform roots a mutation claim may touch: tf:<root> itself; env:<e> every known root of <e>.
+// Known roots are the saved-plan root, the service release roots and any root already recorded.
+function claimRoots(resource, scope) {
+  if (resource.startsWith('tf:')) return [resource.slice(3)];
+  if (!resource.startsWith('env:') || !scope) return [];
+  const known = [SAVED_PLAN_ROOT, ...Object.values(SERVICE_TF_ROOTS).flat(), ...all('SELECT root FROM tf_roots').map(x => x.root)];
+  return [...new Set(known)].filter(root => intrinsicEnv(`tf:${root}`) === scope);
+}
 const bumpRoots = roots => {
   for (const root of roots) run('INSERT INTO tf_roots (root,gen,bumped_at) VALUES (?,1,?) ON CONFLICT(root) DO UPDATE SET gen=gen+1, bumped_at=excluded.bumped_at', root, now());
 };
@@ -678,6 +702,19 @@ function tfCheck(r, { at }) {
   return null;
 }
 
+// The planRun hook must positively verify the saved plan: a finite positive startedAt, and when it
+// reports run/attempt they must be the pinned ones. Anything else (null, malformed, a throw) is plan_unverified.
+async function verifiedPlan(planId, o) {
+  let p;
+  try { p = await (o.planRun ?? hooks.planRun ?? evidence.planRun)(planId); } catch (e) { throw refuse(e.code ?? 'plan_unverified', e.message); }
+  const [, run_, attempt] = /^saved:(\d+)@(\d+)$/.exec(planId);
+  if (!p || typeof p !== 'object' || !Number.isFinite(p.startedAt) || p.startedAt <= 0)
+    throw refuse('plan_unverified', `plan ${planId}: verification returned no positive start time`);
+  if ((p.run !== undefined && String(p.run) !== run_) || (p.attempt !== undefined && Number(p.attempt) !== Number(attempt)))
+    throw refuse('plan_unverified', `plan ${planId}: verification is for run ${p.run} attempt ${p.attempt}`);
+  return p;
+}
+
 // verify(release) revalidates the pinned head; planRun(planId) resolves the saved plan's run attempt.
 export async function releaseAdmit(id, o = {}) {
   const { as, manual = false } = o;
@@ -691,7 +728,7 @@ export async function releaseAdmit(id, o = {}) {
   const g = await rangeChecks(r0, o);
   let plan = null;
   if (r0.kind === 'tf_apply') {
-    try { plan = await (o.planRun ?? hooks.planRun ?? evidence.planRun)(r0.plan_id); } catch (e) { throw refuse(e.code ?? 'plan_unverified', e.message); }
+    plan = await verifiedPlan(r0.plan_id, o);
   }
   return tx(() => {
     let r = relRow(id);
@@ -705,6 +742,7 @@ export async function releaseAdmit(id, o = {}) {
     if (!g.ok) throw refuse(g.code, g.reason, { missing: g.missing });
     if (r.tag) { const e = tagError(r.tag, r.binary, r.environment); if (e) throw e; }
     if (plan) { touch(r.id, { planned_at: plan.startedAt }); r = relRow(id); }
+    if (r.kind === 'tf_apply' && !(r.planned_at > 0)) throw refuse('plan_unverified', `plan ${r.plan_id} has no verified start time`);
     const tf = tfCheck(r, { at: 'admit' });
     if (tf) return tf;
     const qa = openQa(r.environment);
@@ -737,12 +775,13 @@ export async function releaseStart(id, o = {}) {
   const g = await rangeChecks(r0, o);
   let plan = null;
   if (r0.kind === 'tf_apply') {
-    try { plan = await (o.planRun ?? hooks.planRun ?? evidence.planRun)(r0.plan_id); } catch (e) { throw refuse(e.code ?? 'plan_unverified', e.message); }
+    plan = await verifiedPlan(r0.plan_id, o);
   }
   return tx(() => {
     const r = relRow(id);
     if (r.version !== r0.version) throw refuse('changed', `release ${id} changed during start checks; retry`);
-    if (plan && plan.startedAt !== r.planned_at) throw refuse('plan_unverified', `plan ${r.plan_id} attempt start moved since admission`);
+    if (r.kind === 'tf_apply' && !(r.planned_at > 0 && plan.startedAt === r.planned_at))
+      throw refuse('plan_unverified', `plan ${r.plan_id} start ${plan.startedAt} does not match the admitted ${r.planned_at}`);
     if (r.tag) { const e = tagError(r.tag, r.binary, r.environment); if (e) throw e; }
     requireMode(`env:${r.environment}`, true);
     if (r.fence !== Number(fence)) throw refuse('stale_fence', `fence ${fence} is not the admission fence`);
@@ -865,7 +904,9 @@ export async function releaseObserve(id, { observe = evidence.observeRelease } =
   const r = relRow(id);
   if (r.state !== 'running') return { release: r, unchanged: true };
   if (MANUAL_KINDS.includes(r.kind)) return { release: r, pending: `${r.kind} is closed with release reconcile` };
-  const o = await observe(r);
+  // A failed observation is an unknown result, applied through the same snapshot check and version bump.
+  let o;
+  try { o = await observe(r); } catch (e) { o = { state: 'unknown', why: `observation failed: ${e.code ?? 'error'}: ${e.message}`.slice(0, 500) }; }
   return tx(() => {
     const cur = relRow(id);
     if (cur.version !== r.version) return { release: cur, pending: 'release changed while observing; observe again' };

@@ -94,10 +94,10 @@ test('claims: fencing is monotonic; expiry gives reconcile_required, never a sil
   assert.equal(C.claims({ state: 'reconcile_required' }).claims.length, 1, 'expiry persisted despite the refusal');
   assert.throws(() => C.check('pr:x#1', { as: 'cell:a', fence: 1 }), e => e.code === 'reconcile_required');
   assert.throws(() => C.renew('pr:x#1', { as: 'cell:a', fence: 1 }), e => e.code === 'reconcile_required');
-  assert.throws(() => C.reconcile('pr:x#1', { as: 'cell:b', outcome: 'done', evidence: 'x' }), e => e.code === 'forbidden');
-  C.reconcile('pr:x#1', { as: 'master', outcome: 'still_running', evidence: 'run 7 in progress' });
+  assert.throws(() => C.reconcile('pr:x#1', { as: 'cell:b', fence: 1, outcome: 'done', evidence: 'x' }), e => e.code === 'forbidden');
+  C.reconcile('pr:x#1', { as: 'master', fence: 1, outcome: 'still_running', evidence: 'run 7 in progress' });
   assert.throws(() => C.claim('pr:x#1', { as: 'cell:b' }), e => e.code === 'reconcile_required');
-  C.reconcile('pr:x#1', { as: 'master', outcome: 'done', evidence: 'run 7 merged abc' });
+  C.reconcile('pr:x#1', { as: 'master', fence: 1, outcome: 'done', evidence: 'run 7 merged abc' });
   const b = C.claim('pr:x#1', { as: 'cell:b' });
   assert.equal(b.fence, 2);
   assert.throws(() => C.check('pr:x#1', { as: 'cell:a', fence: 1 }), e => e.code === 'stale_fence');

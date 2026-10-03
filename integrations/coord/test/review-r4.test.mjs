@@ -95,14 +95,14 @@ test('R4-1 a log link that is not the bound downstream run is unknown', async ()
 test('R4-2 an open QA window excludes every mutation claim in its environment, both orders', () => {
   const q = C.qaOpen({ as: 'harness', env: 'dev' }).release;
   for (const res of ['tf:dev', 'svc:trading-core', 'repo:equicom-crypto/edge-api', 'ch:ddl'])
-    throwsCode(() => C.claim(res, { as: 'cell:manual', op: 'mutate' }), 'qa_window_open');
+    throwsCode(() => C.claim(res, { as: 'cell:manual', op: 'mutate', env: 'dev' }), 'qa_window_open');
   C.claim('pr:x#1', { as: 'cell:manual' }); // coordination claims stay free
   C.qaClose(q.id, { as: 'harness' });
   const c = C.claim('tf:dev', { as: 'cell:manual', op: 'terraform apply' });
   assert.equal(c.env, 'dev');
   throwsCode(() => C.qaOpen({ as: 'harness', env: 'dev' }), 'claimed');
   C.release('tf:dev', { as: 'cell:manual', fence: c.fence });
-  C.claim('svc:trading-core', { as: 'cell:manual' });
+  C.claim('svc:trading-core', { as: 'cell:manual', env: 'dev' });
   throwsCode(() => C.qaOpen({ as: 'harness', env: 'dev' }), 'claimed');
 });
 
@@ -111,13 +111,13 @@ test('R4-2 an env-exclusive release excludes every mutation claim in its environ
   const tf = key => C.releaseRequest({ as: 'release', key, kind: 'tf_apply', env: 'dev', plan: `saved:${key.length + 900}@1`, footprint: ['env:dev'] }).release;
   // Release first: a direct deploy's service claim, and a ch: claim, are refused while it is in flight.
   const s = await start(await admit(tf('p')));
-  throwsCode(() => C.claim('svc:trading-core', { as: 'cell:direct', op: 'deploy' }), 'release_in_flight');
-  throwsCode(() => C.claim('ch:ddl', { as: 'cell:direct' }), 'release_in_flight');
+  throwsCode(() => C.claim('svc:trading-core', { as: 'cell:direct', op: 'deploy', env: 'dev' }), 'release_in_flight');
+  throwsCode(() => C.claim('ch:ddl', { as: 'cell:direct', env: 'dev' }), 'release_in_flight');
   C.claim('pr:y#1', { as: 'cell:direct' }); // coordination claims stay free
   await C.releaseReconcile(s.id, { as: 'release', outcome: 'done', evidence: 'run 1 plan attempt 1 ok', currentAttempt: async () => 1 });
   // Claim first: an env-exclusive release cannot be admitted over a foreign service claim in its environment.
   const later = async () => ({ startedAt: C.clock.now() + 1 });
-  const c = C.claim('svc:trading-core', { as: 'cell:direct', op: 'deploy' });
+  const c = C.claim('svc:trading-core', { as: 'cell:direct', op: 'deploy', env: 'dev' });
   await refused(() => admit(tf('pp'), { planRun: later }), 'claimed');
   C.release('svc:trading-core', { as: 'cell:direct', fence: c.fence });
   assert.equal((await admit(tf('pp'), { planRun: later })).state, 'admitted');
