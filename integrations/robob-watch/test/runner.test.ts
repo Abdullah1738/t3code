@@ -186,3 +186,51 @@ test("a trigger file runs the check within a couple of seconds, long before its 
   expect(state("trig").fires).toBe(1);
   expect(readCalls().some(call => call.args.includes("robob-watch trig"))).toBe(true);
 }, 20_000);
+
+test("timeouts are transient: no alert before 10 min of failing, fast retry; a real error still alerts after 5", async () => {
+  writeFileSync(calls, "");
+  for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
+  const slowEnv = { ...env, ROBOB_WATCH_CHECK_TIMEOUT_MS: "300" };
+  const runSlow = async (ms: number) => {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/runner.ts")], { env: slowEnv, stdout: "ignore", stderr: "ignore" });
+    await Bun.sleep(ms);
+    child.kill();
+    await child.exited;
+  };
+  expect(cli("add", "--id", "slow", "--title", "Slow", "--check", "sleep 5", "--mode", "notify", "--interval", "30", "--no-prime").exitCode).toBe(0);
+  const file = join(sandbox, "root/watchers/slow/state.json");
+  // Failing x4 for 2 minutes: the 5th timeout must not alert yet, and must retry within 2 min, not 30s x 8 = 4 min.
+  writeFileSync(file, JSON.stringify({ status: "active", fires: 0, consecutive_failures: 4, failure_alerted: false,
+    failing_since: new Date(Date.now() - 120_000).toISOString() }));
+  await runSlow(2_000);
+  expect(state("slow")).toMatchObject({ consecutive_failures: 5, failure_alerted: false });
+  expect(state("slow").next_at - Date.now()).toBeLessThanOrEqual(120_000);
+  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(0);
+  // The same run of timeouts, 11 minutes long: now it alerts once.
+  writeFileSync(file, JSON.stringify({ ...state("slow"), next_at: 0, failing_since: new Date(Date.now() - 11 * 60_000).toISOString() }));
+  await runSlow(2_000);
+  expect(state("slow")).toMatchObject({ consecutive_failures: 6, failure_alerted: true });
+  expect(readCalls().filter(call => call.cli === "telegram")).toHaveLength(1);
+}, 20_000);
+
+test("checks run with bounded concurrency; queue time does not count against the timeout; runs are timed", async () => {
+  const capEnv = { ...env, ROBOB_WATCH_MAX_CONCURRENT: "2", ROBOB_WATCH_CHECK_TIMEOUT_MS: "1500" };
+  const marks = join(sandbox, "conc");
+  writeFileSync(marks, "");
+  for (const i of [1, 2, 3, 4]) {
+    expect(cli("add", "--id", `conc${i}`, "--title", `C${i}`, "--mode", "notify", "--interval", "600", "--no-prime",
+      "--check", `print start >> ${marks}; sleep 1; print end >> ${marks}`).exitCode).toBe(0);
+  }
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/runner.ts")], { env: capEnv, stdout: "ignore", stderr: "ignore" });
+  await Bun.sleep(4_500);
+  child.kill();
+  await child.exited;
+  // Never more than 2 overlapping, and the queued ones (waiting ~1s) still finish without timing out.
+  let live = 0, peak = 0;
+  for (const line of readFileSync(marks, "utf8").trim().split("\n")) { live += line === "start" ? 1 : -1; peak = Math.max(peak, live); }
+  expect(peak).toBe(2);
+  for (const i of [1, 2, 3, 4]) {
+    expect(state(`conc${i}`).consecutive_failures).toBe(0);
+    expect(state(`conc${i}`).last_run_ms).toBeGreaterThanOrEqual(900);
+  }
+}, 20_000);

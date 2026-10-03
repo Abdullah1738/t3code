@@ -1,22 +1,38 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  alert, CHECK_TIMEOUT_MS, deliver, ensureDirs, FAILURE_ALERT_AFTER, hash, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
+  alert, CHECK_TIMEOUT_MS, deliver, ensureDirs, hash, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
-  triggerSig, type Watcher, wakeInboundId, watcherDir,
+  triggerSig, type Watcher, wakeInboundId, watcherDir, shouldAlert, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
 // A 1s tick costs a few stats and JSON reads per watcher; it lets trigger files and short intervals act fast.
 const TICK_MS = 1_000;
 /** By default a trigger-file change never runs the same check more often than this (watcher.trigger_gap_s overrides). */
 const TRIGGER_MIN_GAP_MS = 2_000;
+/** At most this many checks run at once; a burst (runner restart, many intervals lining up) queues instead. */
+const MAX_CONCURRENT_CHECKS = Number(process.env.ROBOB_WATCH_MAX_CONCURRENT ?? 6);
 const running = new Set<string>();
+let activeChecks = 0;
+const slotWaiters: (() => void)[] = [];
 
-function backoff(state: State, interval: number): number {
-  // 1x, 2x, 4x ... the interval, capped at 30 minutes.
-  const factor = 2 ** Math.min(Math.max(state.consecutive_failures - 1, 0), 8);
-  return Math.min(interval * factor, 1_800) * 1_000;
+/** Queue time never counts against a check's timeout: the timer starts only once a slot is free. */
+async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeChecks >= MAX_CONCURRENT_CHECKS) await new Promise<void>(resolve => slotWaiters.push(resolve));
+  else activeChecks += 1;
+  try { return await fn(); } finally {
+    const next = slotWaiters.shift();
+    if (next) next(); else activeChecks -= 1;
+  }
 }
+
+function backoff(state: State, interval: number, timedOut: boolean): number {
+  // 1x, 2x, 4x ... the interval, capped at 30 minutes. A timeout is usually a load spike, so it retries
+  // at least every TIMEOUT_BACKOFF_CAP_S and the watcher catches up soon after the spike passes.
+  const factor = 2 ** Math.min(Math.max(state.consecutive_failures - 1, 0), 8);
+  return Math.min(interval * factor, timedOut ? Math.max(interval, TIMEOUT_BACKOFF_CAP_S) : 1_800) * 1_000;
+}
+
 
 function finish(watcher: Watcher, state: State, status: State["status"]): void {
   state.status = status;
@@ -54,7 +70,7 @@ async function headsUps(watcher: Watcher, state: State): Promise<void> {
   const keep: TrackedWake[] = [];
   for (const wake of state.wakes) {
     const age = now() - wake.delivered_at;
-    const row = inboundState(wake.inbound);
+    const row = await inboundState(wake.inbound);
     // A just-delivered wake's row can briefly read as missing; only trust "missing" after a short grace.
     if (row === "missing" && age < 15_000) { keep.push(wake); continue; }
     if (row !== undefined && row !== "pending") {
@@ -128,18 +144,23 @@ async function tickOne(id: string): Promise<void> {
   // WATCH_RUN lets helpers that commit their own cursor (whatsapp-new-message) keep an outbox: anything they
   // printed in a run that never reached RUN_OK_FILE (timeout, crash) is printed again on the next run.
   const runId = `${t.toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-  const result = await runCheck(watcher, watcherDir(id), { WATCH_RUN: runId });
+  const result = await withSlot(() => runCheck(watcher, watcherDir(id), { WATCH_RUN: runId }));
   const fresh = loadState(id);
   if (!loadWatcher(id) || fresh.status !== "active") return;
+  fresh.last_run_ms = result.ms;
+  const queued = now() - t - result.ms;
+  if (result.ms >= SLOW_RUN_MS || queued >= 5_000) log(id, `slow run: check ${(result.ms / 1000).toFixed(1)}s, queued ${(queued / 1000).toFixed(1)}s`);
   const ackRun = () => { try { writeFileSync(join(watcherDir(id), RUN_OK_FILE), `${runId}\n`); } catch { /* removed mid-run */ } };
   if (result.timedOut || result.code !== 0) {
     fresh.consecutive_failures += 1;
+    if (fresh.consecutive_failures === 1 || !fresh.failing_since) fresh.failing_since = iso(t);
     fresh.last_error = result.timedOut ? `timed out after ${CHECK_TIMEOUT_MS / 1000}s` : `exit ${result.code}: ${result.stderr.trim().slice(-500)}`;
-    fresh.next_at = now() + backoff(fresh, watcher.interval_s);
-    log(id, `check failed (${fresh.consecutive_failures}) ${fresh.last_error}`);
-    if (fresh.consecutive_failures >= FAILURE_ALERT_AFTER && !fresh.failure_alerted) {
-      const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} times in a row and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
-        `robob-watch:${id}:failing:${hash(fresh.last_run_at ?? "")}`, "error");
+    fresh.next_at = now() + backoff(fresh, watcher.interval_s, result.timedOut);
+    log(id, `check failed (${fresh.consecutive_failures}) ${fresh.last_error}${result.timedOut && result.stderr.trim() ? ` | stderr: ${result.stderr.trim().slice(-300)}` : ""}`);
+    if (shouldAlert(fresh, result.timedOut)) {
+      const mins = Math.round((now() - Date.parse(fresh.failing_since!)) / 60_000);
+      const sent = await alert(watcher, `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} times in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`,
+        `robob-watch:${id}:failing:${hash(fresh.failing_since ?? "")}`, "error");
       fresh.failure_alerted = sent.ok;
       log(id, `failure alert ok=${sent.ok} via=${sent.via}`);
     }
@@ -150,6 +171,7 @@ async function tickOne(id: string): Promise<void> {
   fresh.consecutive_failures = 0;
   fresh.failure_alerted = false;
   delete fresh.last_error;
+  delete fresh.failing_since;
   const event = result.stdout.trim();
   if (!event) { saveState(id, fresh); ackRun(); return; }
   fresh.pending = { key: `robob-watch:${id}:${fresh.fires + 1}:${hash(event).slice(0, 16)}`, event, at: iso() };

@@ -142,7 +142,7 @@ async function main(argv: string[]): Promise<void> {
         const w = loadWatcher(id)!;
         const s = loadState(id);
         const status = w.paused ? "paused" : s.status;
-        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${w.triggers?.length ? "+trigger" : ""}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.pending ? "  UNDELIVERED EVENT" : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}\n    ${w.title}`);
+        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${w.triggers?.length ? "+trigger" : ""}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}\n    ${w.title}`);
       }
       return;
     }
@@ -160,7 +160,7 @@ async function main(argv: string[]): Promise<void> {
     case "test": {
       const w = need(positionals[0]);
       const result = await scratchRun(w);
-      console.log(JSON.stringify({ id: w.id, exit: result.code, timedOut: result.timedOut, fires: !!result.stdout.trim() && result.code === 0,
+      console.log(JSON.stringify({ id: w.id, exit: result.code, timedOut: result.timedOut, seconds: Math.round(result.ms / 100) / 10, fires: !!result.stdout.trim() && result.code === 0,
         stdout: result.stdout.trim(), stderr: result.stderr.trim().slice(-1000) }, null, 2));
       if (result.code !== 0 || result.timedOut) process.exitCode = 1;
       return;

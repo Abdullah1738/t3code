@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -22,8 +22,16 @@ export const PATH = [HELPERS, join(HOME, ".local/bin"), join(HOME, ".bun/bin"), 
 
 export const MIN_INTERVAL = 5;
 export const DEFAULT_INTERVAL = 15;
-export const CHECK_TIMEOUT_MS = 60_000;
+export const CHECK_TIMEOUT_MS = Number(process.env.ROBOB_WATCH_CHECK_TIMEOUT_MS ?? 60_000);
+/** After SIGKILL, stop waiting for the process to report exit (a throttled process can take minutes to be reaped). */
+export const KILL_GRACE_MS = 5_000;
 export const FAILURE_ALERT_AFTER = 5;
+/** Timeouts are transient (load spikes): no alert until the watcher has been failing at least this long. */
+export const TIMEOUT_ALERT_AFTER_MS = 10 * 60_000;
+/** Timeouts retry at most this far apart, so a watcher catches up soon after a load spike. */
+export const TIMEOUT_BACKOFF_CAP_S = 120;
+/** Runs slower than this are logged with their duration. */
+export const SLOW_RUN_MS = 15_000;
 /** Holds the WATCH_RUN id of the last run whose output the runner recorded (see whatsapp-new-message's outbox). */
 export const RUN_OK_FILE = ".run-ok";
 const MAX_EVENT = 6_000;
@@ -65,6 +73,10 @@ export type State = {
   consecutive_failures: number;
   failure_alerted: boolean;
   last_error?: string;
+  /** When the current run of consecutive failures started. */
+  failing_since?: string;
+  /** Wall time of the last check run, in ms. */
+  last_run_ms?: number;
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
   pending?: { key: string; event: string; at: string };
   last_delivery?: string;
@@ -174,27 +186,45 @@ export function log(id: string | null, message: string): void {
 
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
-export type CheckResult = { code: number | null; stdout: string; stderr: string; timedOut: boolean };
+export type CheckResult = { code: number | null; stdout: string; stderr: string; timedOut: boolean; ms: number };
 
-/** Runs a check in its own process group so a timeout kills everything it started. */
+/**
+ * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
+ * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
+ * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
+ */
 export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = CHECK_TIMEOUT_MS): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
+  const started = now();
   return new Promise(resolve => {
+    let done = false;
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let grace: ReturnType<typeof setTimeout> | undefined;
+    const finish = (code: number | null, extra = "") => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      resolve({ code, stdout, stderr: stderr + extra, timedOut, ms: now() - started });
+    };
     const child = spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
       env: { HOME, PATH, LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv },
     });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.on("data", chunk => { if (stderr.length < 20_000) stderr += chunk; });
     const timer = setTimeout(() => {
       timedOut = true;
       try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ }
+      grace = setTimeout(() => {
+        try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { /* ignore */ }
+        finish(null, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
+      }, KILL_GRACE_MS);
     }, timeoutMs);
-    child.on("close", code => { clearTimeout(timer); resolve({ code, stdout, stderr, timedOut }); });
-    child.on("error", error => { clearTimeout(timer); resolve({ code: 127, stdout, stderr: String(error), timedOut }); });
+    child.on("close", code => finish(code));
+    child.on("error", error => finish(127, String(error)));
   });
 }
 
@@ -204,11 +234,11 @@ async function run(args: string[], timeoutMs = 20_000): Promise<{ ok: boolean; o
   return { ok: code === 0, out: `${stdout}${stderr}`.trim().slice(0, 500) };
 }
 
-export function liveSession(): string | undefined {
-  const result = spawnSync("/usr/bin/sqlite3", ["-readonly", BRIDGE_DB, "select json_extract(value,'$.id') from kv where key='route'"],
-    { encoding: "utf8", timeout: 10_000 });
-  const id = result.stdout?.trim();
-  return result.status === 0 && id && /^ses[A-Za-z0-9_]+$/.test(id) ? id : undefined;
+/** Async on purpose: a blocking spawnSync here would freeze every watcher's timers for up to 10s. */
+export async function liveSession(): Promise<string | undefined> {
+  const result = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, "select json_extract(value,'$.id') from kv where key='route'"], 10_000);
+  const id = result.out.trim();
+  return result.ok && id && /^ses[A-Za-z0-9_]+$/.test(id) ? id : undefined;
 }
 
 /** The bridge names a wake's inbound row after the sha256 of its dedupe key (api.ts /wake). */
@@ -219,12 +249,11 @@ export const wakeInboundId = (key: string) => `wake:${hash(key)}`;
  * processing/batched/done/cancelled/failed/unknown all mean the router has taken it. "missing" if absent,
  * undefined if the database could not be read.
  */
-export function inboundState(id: string): string | undefined {
+export async function inboundState(id: string): Promise<string | undefined> {
   if (!/^wake:[a-f0-9]{64}$/.test(id)) return undefined;
-  const result = spawnSync("/usr/bin/sqlite3", ["-readonly", BRIDGE_DB, `select state from inbound where id='${id}'`],
-    { encoding: "utf8", timeout: 10_000 });
-  if (result.status !== 0) return undefined;
-  return result.stdout.trim() || "missing";
+  const result = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, `select state from inbound where id='${id}'`], 10_000);
+  if (!result.ok) return undefined;
+  return result.out.trim() || "missing";
 }
 
 export function headsUpText(watcher: Watcher, event: string): string {
@@ -241,7 +270,7 @@ export function wake(source: string, text: string, key: string): Promise<{ ok: b
 }
 
 export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
-  const session = liveSession();
+  const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
   return run([BUN, SPECTRUM_CLI, "send", "--text", clip(text, MAX_WAKE), "--session", session, "--key", key]);
 }
@@ -294,6 +323,16 @@ export async function alert(watcher: Watcher, text: string, key: string, severit
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
   const sent = await imessage(`${watcher.title}: ${text}`, key);
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
+}
+
+/**
+ * A real error alerts after FAILURE_ALERT_AFTER failures in a row. Timeouts are transient (a stalled CLI or a
+ * load spike), so a run of them alerts only once it has also lasted TIMEOUT_ALERT_AFTER_MS.
+ */
+export function shouldAlert(state: State, timedOut: boolean, t = now()): boolean {
+  if (state.failure_alerted || state.consecutive_failures < FAILURE_ALERT_AFTER) return false;
+  if (!timedOut) return true;
+  return t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS;
 }
 
 export function ensureDirs(): void {
