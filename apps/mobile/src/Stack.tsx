@@ -122,6 +122,7 @@ import {
 } from "./features/sharing/incoming-share-presentation";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "./native/native-glass";
 import { deriveLayout } from "./lib/layout";
+import { MOBILE_APP_NAME } from "./lib/mobileBranding";
 import { nativeHeaderScrollEdgeEffects } from "./native/StackHeader";
 import { FORM_SHEET_PRESENTATION_OPTIONS } from "./native/sheet-surface";
 import { useThreadOutboxDrain } from "./state/use-thread-outbox-drain";
@@ -252,7 +253,7 @@ const SettingsContentStack = createNativeStackNavigator({
     SettingsAbout: createNativeStackScreen({
       screen: SettingsAboutRouteScreen,
       linking: "about",
-      options: { title: "About T3 Code" },
+      options: { title: `About ${MOBILE_APP_NAME}` },
     }),
     SettingsEnvironmentNew: createNativeStackScreen({
       screen: ConnectionsNewRouteScreen,

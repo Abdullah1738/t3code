@@ -477,4 +477,59 @@ const config: ExpoConfig = {
   owner: "pingdotgg",
 };
 
-export default config;
+// Robob fork: ROBOB_MOBILE=1 rebrands the build as the Robob app, signed by the Robob team with
+// the personal-team capability set (no widgets, share extension, push or App Groups).
+const isRobobMobileBuild = repoEnv.ROBOB_MOBILE === "1";
+
+if (isRobobMobileBuild && !isIosPersonalTeamBuild) {
+  throw new Error(
+    "ROBOB_MOBILE=1 needs T3CODE_IOS_PERSONAL_TEAM=1 and T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID=com.ardud.robob.mobile.",
+  );
+}
+
+function withRobobBranding(base: ExpoConfig): ExpoConfig {
+  const rebrand = (value: unknown) =>
+    typeof value === "string" ? value.replaceAll("T3 Code", "Robob") : value;
+  const { associatedDomains: _clerkDomains, ...ios } = base.ios ?? {};
+
+  return {
+    ...base,
+    name: "Robob",
+    scheme: "robob",
+    updates: { ...base.updates, enabled: false },
+    ios: {
+      ...ios,
+      icon: fromRepoRoot(BRAND_ASSET_PATHS.productionIosIconPng),
+      bundleIdentifier: iosBundleIdentifier,
+      appleTeamId: "HVG39427R3",
+      entitlements: {
+        ...ios.entitlements,
+        "keychain-access-groups": [`$(AppIdentifierPrefix)${iosBundleIdentifier}`],
+      },
+      infoPlist: {
+        ...ios.infoPlist,
+        NSLocalNetworkUsageDescription:
+          "Allow Robob to connect to Robob servers on your local network or tailnet.",
+        NSPhotoLibraryAddUsageDescription: "Allow Robob to save images to your photo library.",
+      },
+    },
+    android: { ...base.android, package: iosBundleIdentifier },
+    // Registered first so its entitlement mod runs last, after expo-notifications has added
+    // aps-environment, which the wildcard dev profile can't sign.
+    plugins: [
+      "./plugins/withoutIosPersonalTeamCapabilities.cjs",
+      ...(base.plugins ?? []).map((plugin): NonNullable<ExpoConfig["plugins"]>[number] =>
+        Array.isArray(plugin) && (plugin[0] === "expo-audio" || plugin[0] === "expo-camera")
+          ? [
+              plugin[0],
+              Object.fromEntries(
+                Object.entries(plugin[1] ?? {}).map(([key, value]) => [key, rebrand(value)]),
+              ),
+            ]
+          : plugin,
+      ),
+    ],
+  };
+}
+
+export default isRobobMobileBuild ? withRobobBranding(config) : config;

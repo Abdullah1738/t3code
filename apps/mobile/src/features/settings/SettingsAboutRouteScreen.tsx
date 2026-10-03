@@ -15,12 +15,13 @@ import {
 import { SettingsRow } from "./components/SettingsRow";
 import { SettingsSection } from "./components/SettingsSection";
 import { SettingsScreen } from "./components/SettingsScreen";
+import { MOBILE_APP_NAME } from "../../lib/mobileBranding";
 
 export function SettingsAboutRouteScreen() {
   const insets = useSafeAreaInsets();
 
   return (
-    <SettingsScreen title="About T3 Code">
+    <SettingsScreen title={`About ${MOBILE_APP_NAME}`}>
       <ScrollView
         contentInsetAdjustmentBehavior="automatic"
         showsVerticalScrollIndicator={false}

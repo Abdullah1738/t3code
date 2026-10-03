@@ -42,6 +42,14 @@ describe("extractPairingUrlFromQrPayload", () => {
     ).toBe("https://remote.example.com/pair#token=pairing-token");
   });
 
+  it("unwraps Robob deep links that carry an encoded pairing url", () => {
+    expect(
+      extractPairingUrlFromQrPayload(
+        "robob://pair?pairingUrl=https%3A%2F%2Fremote.example.com%2Fpair%23token%3Dpairing-token",
+      ),
+    ).toBe("https://remote.example.com/pair#token=pairing-token");
+  });
+
   it("rejects empty qr payloads", () => {
     expect(() => extractPairingUrlFromQrPayload("   ")).toThrowError(PairingQrPayloadEmptyError);
     expect(() => extractPairingUrlFromQrPayload("   ")).toThrowError(

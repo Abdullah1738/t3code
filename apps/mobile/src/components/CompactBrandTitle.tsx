@@ -5,7 +5,7 @@ import { Platform, View } from "react-native";
 import { AppText as Text } from "./AppText";
 import { T3Wordmark } from "./T3Wordmark";
 import { IPAD_HOME_TITLE_OFFSET } from "../lib/layoutMetrics";
-import { resolveMobileStageLabel } from "../lib/mobileBranding";
+import { MOBILE_APP_NAME, resolveMobileStageLabel } from "../lib/mobileBranding";
 import { useAndroidControlSizing } from "./useAndroidControlSizing";
 
 /**
@@ -32,7 +32,7 @@ export function CompactBrandTitle(
   return (
     <View
       aria-level={1}
-      accessibilityLabel="T3 Code, Threads"
+      accessibilityLabel={`${MOBILE_APP_NAME}, Threads`}
       accessible
       role="heading"
       className="flex-row items-center gap-1.5"

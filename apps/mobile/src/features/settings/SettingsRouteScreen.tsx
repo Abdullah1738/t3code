@@ -17,6 +17,7 @@ import {
   SettingsEnvironmentFilterHeader,
 } from "./components/SettingsEnvironmentFilterHeader";
 import { useSettingsEnvironmentFilter } from "./settings-environment-filter";
+import { MOBILE_APP_NAME } from "../../lib/mobileBranding";
 
 export function SettingsRouteScreen() {
   const navigation = useNavigation();
@@ -207,7 +208,7 @@ function SettingsIndexSections() {
 
       <SettingsSection title="App">
         <SettingsRow icon="chart.bar.xaxis" label="Usage" target="SettingsUsage" />
-        <SettingsRow icon="info.circle" label="About T3 Code" target="SettingsAbout" />
+        <SettingsRow icon="info.circle" label={`About ${MOBILE_APP_NAME}`} target="SettingsAbout" />
       </SettingsSection>
     </>
   );
