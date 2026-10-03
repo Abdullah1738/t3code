@@ -20,6 +20,10 @@ export interface Config {
   enabled: boolean;
   appsRoot: string;
   appsPort: number;
+  /** "openchamber" (default) or "robob"; BRIDGE_BACKEND overrides it. */
+  backend?: string;
+  /** Registered Robob project root for iMessage chat folders. */
+  robobChatRoot?: string;
 }
 
 /** Fills and validates the optional mini-app server fields. */

@@ -198,7 +198,25 @@ export function formAnswer(request: QuestionRequest, answers: string[][]): Recor
   }));
 }
 
-export class OpenChamber {
+/**
+ * What the alert logic in attention.ts needs from a backend. OpenChamber
+ * implements it here; Robob's control API implements it in robob.ts.
+ */
+export interface AlertBackend {
+  /** How notices name the app and its review board. Defaults to OpenChamber and Sessions. */
+  readonly brand?: { app: string; board: string };
+  health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
+  sessionBoard(): Promise<BoardSnapshot>;
+  getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
+  statuses(): Promise<Record<string, SessionStatus>>;
+  permissions(directory: string): Promise<PermissionRequest[]>;
+  questions(directory: string): Promise<QuestionRequest[]>;
+  permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject"): Promise<boolean>;
+  questionReply(request: QuestionRequest, directory: string, answers: string[][]): Promise<boolean>;
+  isSessionAutoAccepting(sessionId: string, directory: string): Promise<boolean | undefined>;
+}
+
+export class OpenChamber implements AlertBackend {
   private readonly baseUrl: string;
   private readonly headers: Headers;
 

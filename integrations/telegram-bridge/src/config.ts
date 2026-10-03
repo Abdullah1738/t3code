@@ -10,6 +10,8 @@ export interface Config {
   owner: string;
   timezone: string;
   enabled: boolean;
+  /** "openchamber" (default) or "robob"; BRIDGE_BACKEND overrides it. */
+  backend?: string;
 }
 
 export async function loadConfig(): Promise<Config> {
@@ -25,6 +27,15 @@ export async function loadConfig(): Promise<Config> {
     || typeof config.timezone !== "string") throw new Error("Invalid bridge configuration");
   new Intl.DateTimeFormat("en-US", { timeZone: config.timezone });
   return config;
+}
+
+export type BackendKind = "openchamber" | "robob";
+
+/** BRIDGE_BACKEND, then `backend` in config.json; OpenChamber stays the default until cutover. */
+export function backendKind(env: Record<string, string | undefined> = process.env, config: { backend?: unknown } = {}): BackendKind {
+  const value = env.BRIDGE_BACKEND?.trim() || (typeof config.backend === "string" ? config.backend : "") || "openchamber";
+  if (value !== "openchamber" && value !== "robob") throw new Error("Invalid bridge backend");
+  return value;
 }
 
 export async function backendConnection(): Promise<{ baseUrl: string; headers: Record<string, string> }> {

@@ -243,7 +243,31 @@ function validRoot(root: unknown): root is string {
   return typeof root === "string" && root.startsWith("/") && !root.includes("\0");
 }
 
-export class OpenChamber {
+/**
+ * What the router and the origin backfill need from a backend. OpenChamber
+ * implements it here; Robob's control API implements it in robob.ts.
+ */
+export interface ChatBackend {
+  health(): Promise<{ status: string; openchamberVersion?: string; [key: string]: unknown } | undefined>;
+  createChat(title?: string): Promise<{ id: string; directory: string }>;
+  markImessageOrigin(id: string, directory?: string): Promise<"marked" | "already" | "missing">;
+  getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
+  children(id: string, directory: string): Promise<SessionRecord[]>;
+  messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;
+  promptAccepted(id: string, directory: string, messageId: string): Promise<boolean>;
+  prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
+    model?: { providerID: string; modelID: string; variant?: string }): Promise<void>;
+  abort(id: string, directory: string): Promise<boolean>;
+  statuses(): Promise<Record<string, SessionStatus>>;
+  permissions(sessionId: string, directory: string): Promise<PermissionRequest[]>;
+  questions(sessionId: string, directory: string): Promise<QuestionRequest[]>;
+  permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject"): Promise<boolean>;
+  questionReply(request: QuestionRequest, directory: string, answers: string[][]): Promise<boolean>;
+  cancelQuestion(sessionId: string, formId: string, directory: string): Promise<boolean>;
+  isSessionAutoAccepting(sessionId: string, directory: string): Promise<boolean | undefined>;
+}
+
+export class OpenChamber implements ChatBackend {
   private readonly baseUrl: string;
   private readonly headers: Headers;
   private readonly chatRoot: string | undefined;
