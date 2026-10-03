@@ -156,7 +156,7 @@ router uses, so the router is unchanged.
   (`{"url":"http://127.0.0.1:<port>","token":"..."}`, chmod 600, loopback URL only).
   Issue the token with `t3 auth session issue --base-dir <t3 home> --label bridges --ttl 365d --json`.
 - Chat root: `ROBOB_IMESSAGE_CHAT_ROOT`, else `robobChatRoot` in config.json,
-  else `~/.config/openchamber/imessage`. It must be a registered Robob project
+  else `~/.robob/imessage`. It must be a registered Robob project
   (`t3 project add <root> --title iMessage`); `check` fails otherwise. Each new
   chat is a thread in `<root>/<YYYY-MM-DD>/session-<uuid>`, which Robob
   creates, with origin `imessage` and runtime mode `full-access`.

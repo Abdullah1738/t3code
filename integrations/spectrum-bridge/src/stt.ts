@@ -129,7 +129,7 @@ export function splitWav(wav: Uint8Array<ArrayBuffer>, maxBytes: number): Uint8A
 export async function transcribe(input: SttInput, deps: SttDeps = {}): Promise<string> {
   if (!(input.data instanceof Uint8Array) || input.data.byteLength === 0) throw new SttError("emptyAudio");
   if (input.data.byteLength > MAX_AUDIO_BYTES) throw new SttError("audioTooLarge");
-  const { server, model } = await settings(deps.settingsPath ?? join(homedir(), ".config/openchamber/settings.json"));
+  const { server, model } = await settings(deps.settingsPath ?? join(homedir(), ".config/spectrum-bridge/config.json"));
   const keyFile = deps.keyFile ?? process.env.SPECTRUM_STT_KEY_FILE ?? join(homedir(), ".config/opencode/openrouter-key");
   let key: string;
   try { key = (await readFile(keyFile, "utf8")).trim(); } catch { throw new SttError("keyUnavailable"); }

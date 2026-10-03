@@ -5,8 +5,8 @@ import { isAbsolute, join } from "node:path";
 export const stateRoot = join(homedir(), ".config/spectrum-bridge");
 export const skillPath = join(homedir(), ".config/opencode/skills/imessage-notifications/SKILL.md");
 export const alertSkillPath = join(homedir(), ".config/opencode/skills/telegram-notifications/SKILL.md");
-// iMessage chats live in their own OpenChamber project, outside the shared Chats root.
-export const imessageChatRoot = join(homedir(), ".config/openchamber/imessage");
+// iMessage chats live in their own Robob project, outside the shared Chats root.
+export const imessageChatRoot = join(homedir(), ".robob/imessage");
 // Read-only lookup of telegram-delivered notifications for /notification references.
 export const telegramBridgeSocket = join(homedir(), ".config/telegram-bridge/bridge.sock");
 // Public tailnet URLs are assigned at runtime by publish.ts; only the local side is configured.
