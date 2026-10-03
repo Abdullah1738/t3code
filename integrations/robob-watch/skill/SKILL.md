@@ -5,7 +5,7 @@ description: Use whenever you'd watch/monitor/wait for something for the owner (
 
 # Robob watchers
 
-`robob-watch` runs small check commands on a schedule (default every 30s) and, when one prints something, **wakes the agent**: the event arrives as a new turn in whichever iMessage session is live (it follows session rotation and `/new`), together with the context you saved when you set it up. The agent handles it and its reply goes to the owner as usual.
+`robob-watch` runs small check commands on a schedule (default every 15s, or within ~1s of a trigger file changing) and, when one prints something, **wakes the agent**: the event arrives as a new turn in whichever iMessage session is live (it follows session rotation and `/new`), together with the context you saved when you set it up. The agent handles it and its reply goes to the owner as usual.
 
 ## When to use
 
@@ -18,21 +18,28 @@ Always actually create the watcher in the same turn. Never promise "I'll keep an
 ```bash
 robob-watch add --id nik-macbook --title "Nik replied on WhatsApp (MacBook order)" \
   --check 'whatsapp-new-message 971506575224@s.whatsapp.net' \
-  --interval 30 --mode wake --expires 14d --max-fires 1 \
+  --interval 30 \
+  --mode wake --expires 14d --max-fires 1 \
   --session CURRENT_SESSION_ID \
   --context-file /path/to/context.txt     # or --context "..."
 ```
 
-Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode, context, expires_at ("14d" or ISO), max_fires, serial, created_by_session}`. Add `--replace` to redefine an existing id (its state is kept).
+Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode, context, expires_at ("14d" or ISO), max_fires, serial, triggers, trigger_gap_s, created_by_session}`. Add `--replace` to redefine an existing id (its state is kept, and since 1 Oct 2026 the prime run is skipped: a replace-prime once swallowed a real Dynamic reply that landed mid-prime).
 
 `add` runs the check once to **prime** it: baseline helpers record what's already there, so old items never fire. Read the `prime` line in the output. If it says "printed (NOT delivered)", your check fires on existing data and needs fixing.
 
 - **id**: short kebab-case, unique (`apple-order-email`, `crpko-deploy-1234`).
 - **mode**: `wake` (default) wakes the agent to act. `notify` just texts the event to the owner with no agent involved; use it only for plain FYIs that need no thinking.
-- **interval**: 30s for messages and replies, 60-300s for web pages, prices and CI. The minimum is 10s. Be kind to rate limits.
+- **interval**: default 15s, minimum 5s. Use 10-15s for chat, WhatsApp and email replies (with a trigger, the interval is only a fallback), and 60-300s for web pages, prices and CI. Be kind to rate limits.
+- **trigger** (push, preferred for anything local): `--trigger FILE` (repeatable, up to 8) runs the check on the next 1s tick after FILE's mtime or size changes, instead of waiting for the interval. It is rate-limited to one run per 2s, or `trigger_gap_s` in watcher.json for expensive checks. It never overrides a failing watcher's backoff. Busy files change often, so put a cheap gate at the top of the check:
+  - iMessage: `~/Library/Messages/chat.db-wal` and `~/Library/Messages/chat.db`. Gate on `select max(message_id) from chat_message_join where chat_id=N` (~5ms) before calling `imsg history`.
+  - WhatsApp: nothing to add. A check using `whatsapp-new-message` gets `~/.wacli/wacli.db-wal` + `wacli.db` as triggers automatically (and an old `whatscli/session.db` trigger is swapped out).
+  - Your own scripts: touch a file in `$WATCH_DIR` and trigger on it.
+  - Remote things (email, web, CI) have no local file. Poll them, or push via a daemon, the way otp-idle does IMAP IDLE for OTPs (agent-mail skill).
 - **expires**: always set one that fits (hours for a deploy, 1-2 weeks for a human reply). The default is 14d. On expiry the owner gets a short "expired without firing" note.
 - **max-fires**: default 1 (fire once, then done). Use `0` (unlimited) or N for ongoing feeds.
-- **serial**: set automatically when the check uses `wa`/`whatsapp-new-message`. Serial checks share one lock.
+- **serial**: set automatically only for checks that drive the legacy whatscli TUI (`wa read/send/...`, `wa tui`). `whatsapp-new-message` and `wa-db` read a database and need no lock.
+- **Where latency goes** (measured 30 Sep 2026): runner tick (1s) + trigger or interval wait + check time + bridge pickup. The bridge now starts a wake turn immediately, because watcher wakes skip the 15s owner-typing grace. If the agent is already mid-turn, the wake still waits for that turn to finish, and nothing at the watcher level can change that.
 
 ## Writing the context (the important part)
 
@@ -49,16 +56,16 @@ Keep it under ~1500 characters. Never put secrets in it (it's stored in plain te
 
 - A zsh command run in the watcher's dir with `WATCH_DIR` (and `WATCH_ID`) set, PATH including the helpers, a 60s timeout, and no TTY.
 - **Nothing new**: print nothing, exit 0. **Event**: print the event text on stdout, exit 0. Print only what's new and keep it short.
-- **Non-zero exit** counts as a failure: exponential backoff, and after 5 in a row the owner gets one alert (via Telegram).
+- **Non-zero exit** counts as a failure: exponential backoff, and after 5 in a row the owner gets one alert (via Telegram). A **timeout** is treated as transient: it retries at least every 120s (or the interval, if longer) and alerts only once the watcher has been failing 10+ minutes.
 - Keep your own state (baselines, last-seen) in `$WATCH_DIR`. The first run should record a baseline and print nothing.
 - An event that can't be delivered is kept and retried with the same key before the check runs again, so nothing is lost or doubled.
 
 ## Helpers (on PATH inside checks)
 
-- `whatsapp-new-message JID [--from NAME]`: new incoming (non-"Me:") messages in one chat since the last run. Resolve the JID with `wa find`. Multi-line messages are joined with " / " (fixed 29 Sep 2026; before that only the first line was reported). On a fire, still `wa read` the chat in full before summarising to the owner. It takes the WhatsApp lock itself. **Gotcha:** one contact can have two chats, a phone JID (`...@s.whatsapp.net`) and a LID (`...@lid`), and replies often land in the LID chat even when we sent to the phone JID. `wa find NAME` lists both; watch every JID for that person (a small check.sh that runs the helper once per JID).
+- `whatsapp-new-message JID [--from NAME]`: new incoming (non-"Me:") messages for that person/group since the last run, as `(dd-mm-yy HH:MM:SS) Name: text` lines. Since 1 Oct 2026 it reads **wacli's durable store** (`~/.wacli/wacli.db`, written live by the `com.ardud.wacli-sync` daemon; see the whatsapp skill), not the TUI. It's a ~10ms SQLite query, with no lock and no forced re-reads. **Cursor = store insert rowid** (`$WATCH_DIR/wadb-<phone>.json`), shared by the phone JID and the LID (both are always covered, so one call per person is enough; listing both is harmless). Same-second, late and offline-delivered messages fire exactly once. History-backfill inserts older than 6h never fire. Edits re-fire once with "(edited)". Reactions are ignored unless `WA_REACTIONS=1`. Media shows as `[IMAGE] caption`, `[AUDIO]`, `[DOCUMENT: name]` (use `wa download` / `wa-voice`). **Outbox:** if the runner never recorded a run (timeout or crash), that run's lines are replayed at most 3 times within 1h, re-stamped with the new run id, and cleared once a run is acked, so they never loop. It exits 1 if the sync daemon is down, so the watcher alerts instead of going silently blind, and messages that arrive meanwhile are caught up on reconnect. Migrating a watcher with legacy TUI state (`wa-*.seen`) reports only replies newer than everything those files recorded (max 24h back). On a fire, `wa read` the chat in full before summarising to the owner. In a multi-JID check.sh, gate on the daemon in pure zsh (`kill -0` the pid in `~/.wacli/LOCK`) and `exit 1` if a helper call fails. Don't swallow errors with `|| true`.
 - `output-changed [--show] [--label TEXT] -- CMD...` or `output-changed --url URL`: fires with a diff (or the full new output with `--show`) when output changes. Good for `gh pr view 123 --json state,reviewDecision`, `gh run list -L1 --json status,conclusion`, a price scraped with curl|jq, and so on. Normalise away noise (timestamps) in CMD, or it'll fire every time.
 - `email-new-message ACCOUNT 'QUERY' [MAILBOX]`: new mail matching a himalaya query (`from apple.com`, `subject invoice`, `from x and subject y`) in the last 3 days. Accounts: icloud, gmail, fund, outlook. Never marks mail read.
-- `wa-lock CMD...` (also in ~/.local/bin): run any `wa` command under the shared WhatsApp lock. Use it for your own interactive `wa` calls while watchers are live, since the TUI can't be driven concurrently.
+- `wa-lock CMD...`: legacy. `wa` is wacli-backed and safe to run concurrently, so wa-lock just runs CMD (it still locks `wa tui ...`).
 
 Custom checks: write a small script to `~/.local/share/robob-watch/watchers/<id>/check.sh` (after `add`, or create the dir first), `chmod +x`, and use `--check ./check.sh`. Test it with `robob-watch test <id>`.
 
@@ -106,7 +113,7 @@ The `activity-digest` watcher (custom check, every 10 min) wakes the agent with 
 
 **While the agent is busy:** a wake never interrupts the current turn. It queues and runs as its own separate turn right after the current one finishes. It is never batched with the owner's texts and never treated as the answer to a pending question or approval.
 
-**2-minute heads-up:** the runner tracks each delivered wake (`wakes` in `state.json`). It watches the bridge inbound row `wake:<sha256 of key>`: `pending` means still queued, and anything else means the router has taken it. If the row is still `pending` 120s after delivery (the agent is stuck on a long turn), the owner gets ONE short plain text in the live session: "Heads-up from watcher <title>: <event, truncated>. I'll follow up properly when I'm free." It falls back to Telegram if that send fails, and uses an idempotent key, so it's never sent twice. If the row is consumed before 120s, nothing extra is sent. The log shows `heads-up ... via=...` or `wake ... consumed (...)`. When you pick up a woken turn after a heads-up, the owner already has the gist, so give the proper follow-up without repeating the whole event.
+**2-minute heads-up (opt-in, off by default since 2026-09-30):** only watchers with `"headsup": true` in watcher.json get this; the owner found raw heads-ups confusing, so leave it off unless he asks. When enabled, the runner tracks each delivered wake (`wakes` in `state.json`). It watches the bridge inbound row `wake:<sha256 of key>`: `pending` means still queued, and anything else means the router has taken it. If the row is still `pending` 120s after delivery (the agent is stuck on a long turn), the owner gets ONE short plain text in the live session: "Heads-up from watcher <title>: <event, truncated>. I'll follow up properly when I'm free." It falls back to Telegram if that send fails, and uses an idempotent key, so it's never sent twice. If the row is consumed before 120s, nothing extra is sent. The log shows `heads-up ... via=...` or `wake ... consumed (...)`. When you pick up a woken turn after a heads-up, the owner already has the gist, so give the proper follow-up without repeating the whole event.
 
 ## Manage and clean up
 
@@ -122,8 +129,16 @@ Remove watchers once the thing is resolved, or when the owner says to stop. Done
 
 ## Troubleshooting
 
-- Runner: one LaunchAgent `com.ardud.robob-watch` (KeepAlive, ticks every 10s). `robob-watch runner` or `launchctl print gui/$(id -u)/com.ardud.robob-watch`. Log: `~/.local/share/robob-watch/runner.log`. You may restart it: `launchctl kickstart -k gui/$(id -u)/com.ardud.robob-watch`.
+- Runner: one LaunchAgent `com.ardud.robob-watch` (KeepAlive, ticks every 1s; each tick is a stat per trigger file plus a JSON read per watcher, about 0% CPU). `robob-watch runner` or `launchctl print gui/$(id -u)/com.ardud.robob-watch`. Log: `~/.local/share/robob-watch/runner.log`. You may restart it: `launchctl kickstart -k gui/$(id -u)/com.ardud.robob-watch`.
+- **Mass "timed out after 60s" (root cause, 3-4 Oct 2026):** the plist had `ProcessType=Background`, which clamps the runner and every check to background QoS. Under a load spike (Docker tests, emulators, simulators; load 50-110) macOS starves background work for minutes while the UI stays smooth: `taskpolicy -c background` on the trivial `time-reached` check did not finish in 100s (0.1s normally), and a killed check sat runnable with 0s CPU for 9+ min. Now `ProcessType=Standard`. If it comes back, check `ps -o pri -p $(cat ~/.local/share/robob-watch/runner.pid)`: it must be 20+, not 4. Never set Background/Adaptive on this runner.
+- Runner behaviour since 4 Oct 2026: at most 6 checks run at once (`ROBOB_WATCH_MAX_CONCURRENT`), and queue time does not count against the 60s timeout. A timeout SIGKILLs the check's whole process group and returns within 5s even if the kernel hasn't reaped it. The bridge sqlite reads are async, so they never freeze other watchers' timers. Each run's duration is stored (`last_run_ms`, shown in `list`), and runs over 15s or queued over 5s are logged as `slow run: check Xs, queued Ys`.
+- Email checks: each `email-new-message` call is a fresh himalaya IMAP login (~2.5-3.5s for iCloud). Put several senders into **one** OR query per mailbox (`'from a.com or from b.com or subject X'`) instead of one call per sender. Results match: verified on 4 Oct for insurer-quotes-monika (8 logins down to 1), dynamic-ticket (5 to 2) and monika-insurer-replies (3 to 1). Changing the query changes the seen-file key (`mail-<sha>.seen`), so merge the old seen files into the new one first, or old mail fires again.
 - Per-watcher files: `~/.local/share/robob-watch/watchers/<id>/{watcher.json,state.json,log}` plus the check's own state files.
-- "wa read returned no messages": WhatsApp is disconnected or re-linking. See the whatsapp skill (`wa status`).
+- "wacli sync daemon is not running": `wa status`; restart with `wa start` (= kickstart `com.ardud.wacli-sync`); check `~/.local/share/wacli/sync.events.log` for `logged_out` (re-pair, see the whatsapp skill). Nothing is lost: the daemon catches up on reconnect and the cursor then delivers.
+- A WhatsApp watcher re-firing the same old messages (1 Oct 2026 bug, fixed): check for a stale `wadb-*.json.outbox` in the watcher dir. Pause the watcher, delete `wadb-*` files, run the check once with `WATCH_DIR` set to baseline it, then resume.
 - A watcher firing repeatedly on noise: fix the check (normalise its output), then `--replace`.
-- Source: `~/.local/share/robob-watch/src/{lib,runner,cli}.ts`. Tests: `cd ~/.local/share/robob-watch && bun test`. The bridge side (`wake`) lives in the OpenChamber fork under `integrations/spectrum-bridge` (see openchamber-modifications).
+- Flaky local CLIs (`imsg history` stalls for 25s+ now and then; since 3 Oct 2026 imsg 0.15.3 takes 1.5-3s even when healthy against the 360MB chat.db, so never set a per-call cap under ~9s — a 2.5s cap made the Moni watcher time out most calls and wake 3-4 min late; a stalled call rarely recovers, but a fresh one usually works): in custom checks, gate on a cheap local read first, then use a per-call timeout well above the healthy time (9s) with a few retries, keep the whole check under 60s, and treat a transient stall as "nothing new" (exit 0, cursor unchanged, so nothing is lost). Exit non-zero only if the stall lasts about 10 min or more. For LLM classifier calls (jev), fail open. Example: `watchers/moni-robob-requests/classify.py`.
+- **iMessage history: read chat.db, not `imsg history`** (3 Oct 2026: `imsg history` stalled 20+ min and the Moni watcher went blind, missing her requests). Query `message` + `chat_message_join` + `attachment` read-only (~10ms), decoding `attributedBody` when `text` is NULL. Keep imsg only as a fallback. Reference: `sqlite_history()` in `watchers/moni-robob-requests/classify.py`.
+- A check that can be killed at 60s never advances its cursor, so it loops failing and nothing is delivered (moni-robob-requests, 3 Oct: Moni's order was lost for 20+ min). Give classifier checks an internal SIGALRM budget (~35s) that forwards everything fail-open, and log slow stages. See `watchers/moni-robob-requests/classify.py` (`CLASSIFY_BUDGET_S`, `stage()`).
+- iMessage "who sent this?" (robob vs Abdullah, same account): `reply_to_guid` is NOT a signal (Abdullah's iPhone sets it too since late Sep 2026; that mislabel made the Moni classifier wake on her replies to him). Use the helper `imsg_robob_sent.py` (`attribute(msgs, cache)` in Python, or `imsg-history-json | imsg_robob_sent.py`), which matches outgoing messages against the assistant's real send tool calls in the OpenCode DB. Verdicts: robob / abdullah / unknown (DB unreadable).
+- Source: Robob fork `/Volumes/ExternalSSD/t3code-fork/integrations/robob-watch/src/{lib,runner,cli}.ts` (tests: `bun test` there; deploy with `integrations/deploy.zsh robob-watch`, live copy `~/.local/share/robob-watch`). The bridge side (`wake`) lives in the same fork under `integrations/spectrum-bridge`.
