@@ -99,7 +99,7 @@ test('#4 an open shared-dev QA window excludes every dev mutation regardless of 
   const a = (await C.releaseAdmit(r.id, { as: 'release', verify: ok })).release;
   assert.throws(() => C.qaOpen({ as: 'harness', env: 'dev', footprint: ['harness:baseline'] }), e => e.code === 'env_busy');
   await C.releaseStart(r.id, { as: 'crw', fence: a.fence, verify: ok });
-  assert.throws(() => C.qaOpen({ as: 'harness', env: 'dev', footprint: ['other'] }), e => e.code === 'env_busy');
+  assert.throws(() => C.qaOpen({ as: 'harness', env: 'dev', footprint: ['harness:other'] }), e => e.code === 'env_busy');
 });
 
 test('#4 a QA window opened after admission blocks release start', async () => {

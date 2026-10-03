@@ -77,6 +77,9 @@ export class CoordError extends Error {
 
 let cur = null;
 let depth = 0;
+let onOpen = null;
+// Runs once per opened database, after the schema exists (coord.mjs registers its key normalization).
+export const setOnOpen = fn => { onOpen = fn; };
 
 export function open(path = process.env.COORD_DB || DEFAULT_DB) {
   if (cur?.path === path) return cur.db;
@@ -88,6 +91,9 @@ export function open(path = process.env.COORD_DB || DEFAULT_DB) {
   for (const [t, c, type] of ADDED)
     if (!db.prepare(`PRAGMA table_info(${t})`).all().some(x => x.name === c)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${type}`);
   cur = { path, db };
+  if (onOpen) {
+    try { onOpen(); } catch (e) { close(); throw e; }
+  }
   return db;
 }
 

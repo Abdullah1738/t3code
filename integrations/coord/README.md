@@ -32,7 +32,9 @@ lease TTL 30 min, one reminder after 30 min unacked.
 ## Setup
 
 `coord init` seeds the pull-only `crw` process actor (idempotent). The crw adapter also calls
-`ensureActor('crw', { kind: 'process' })`, which never rebinds an existing actor.
+`ensureActor('crw', { kind: 'process' })`, which never rebinds an existing actor: it is a single
+insert-if-absent, so a registration that wins concurrently stays as it is. It returns
+`{ actor, created: true }` or `{ actor, existing: true }`.
 
 ## Contracts for the crw adapter
 
@@ -88,6 +90,16 @@ Start requires the admission fence, the same claim fences admission relied on, t
 gates and runtime, a valid tag, no open QA window and no other built release of the repo. Run ids
 (`releaseRun`, `deployRun`, `tfRun`), digest and tag bind once, whether given to `releaseRecord` or
 `releaseStart`: a different value for a bound field is `binding_mismatch`.
+
+**Resource keys** are canonicalized by every entry point that takes one (`claim`, `check`, `renew`,
+`release`, `reconcile`, `claim_free` deps, release and QA footprints, the CLI), so spellings of the same
+resource are one key: the kind is lowercased; `repo:<owner>/<name>` and `pr:<owner>/<name>#<n>` lowercase
+owner and name; `svc:`, `tf:` and `env:` values are lowercased names. Malformed keys are refused
+(`resource_invalid`): a missing kind or value, whitespace or control characters, `repo:` without exactly
+`<owner>/<name>`, `pr:` without `#<number>`, `svc:`/`tf:`/`env:` values that are not names. Other
+kinds (`ticket:`, `ch:`, ...) keep their value as given. Results report the canonical `resource`.
+On open, stored non-canonical keys are rewritten in place once; if two stored claims are spellings of
+the same resource the database refuses to open (`resource_alias_conflict`) until one is resolved by hand.
 
 **Mutation claims** are claims on anything but `pr:`, `ticket:`, `files:`, `arch:`, `channel:` and
 `work:`. Each resolves to exactly one concrete supported environment (only `dev` today), checked in

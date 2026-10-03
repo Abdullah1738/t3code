@@ -123,7 +123,7 @@ test('R5-2 each dev root versus an env-exclusive non-Terraform release, both ord
 
 test('R5-3 an env: claim and a foreign narrower mutation claim in that env exclude each other, both orders', () => {
   const apply = C.claim('env:dev', { as: 'cell:apply', op: 'full-root apply' });
-  for (const [res, env] of [['svc:trading-core', 'dev'], ['tf:dev', undefined], ['ch:ddl', 'dev'], ['repo:x', 'dev']])
+  for (const [res, env] of [['svc:trading-core', 'dev'], ['tf:dev', undefined], ['ch:ddl', 'dev'], ['repo:equicom-crypto/x', 'dev']])
     throwsCode(() => C.claim(res, { as: 'cell:deploy', env }), 'claimed');
   C.claim('pr:x#1', { as: 'cell:deploy' }); // coordination claims are unaffected
   C.release('env:dev', { as: 'cell:apply', fence: apply.fence });

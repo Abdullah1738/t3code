@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { tx, get, all, run, CoordError } from './db.mjs';
+import { tx, get, all, run, CoordError, setOnOpen } from './db.mjs';
 import * as evidence from './evidence.mjs';
 
 export { evidence, CoordError };
@@ -103,10 +103,18 @@ export function actorSet(id, { thread, kind } = {}) {
 }
 const actor = id => get('SELECT * FROM actors WHERE id=?', id);
 
-// Creates the actor if missing; an existing actor (and its thread binding) is left alone.
+// Creates the actor if missing; an existing actor (and its thread binding) is left alone. One insert-if-
+// absent, so a registration that wins concurrently is never overwritten. A new actor has no deliveries
+// (posting requires the actor), so nothing is retargeted.
 export function ensureActor(id, { thread, kind } = {}) {
-  const a = actor(need(id, 'actor id'));
-  return a ? { actor: a, existing: true } : actorSet(id, { thread, kind });
+  need(id, 'actor id');
+  const k = kind ?? (thread ? 'thread' : 'process');
+  if (!['thread', 'process'].includes(k)) throw refuse('invalid', 'kind must be thread|process');
+  if (k === 'thread' && !thread) throw refuse('invalid', 'thread actors need --thread');
+  return tx(() => {
+    const ins = run('INSERT INTO actors (id,kind,thread_id,updated_at) VALUES (?,?,?,?) ON CONFLICT(id) DO NOTHING', id, k, k === 'thread' ? thread : null, now());
+    return { actor: actor(id), ...(Number(ins.changes) ? { created: true } : { existing: true }) };
+  });
 }
 
 // Idempotent first-run seed: the pull-only crw process actor.
@@ -220,6 +228,46 @@ function expire(c) {
 const reconcileErr = c => refuse('reconcile_required', `${c.resource} lease of ${c.owner} expired; reconcile before reuse`,
   { owner: c.owner, fence: c.fence, op_ref: c.op_ref, reconcile_outcome: c.reconcile_outcome });
 
+// Resource keys: one canonical spelling per resource, used by every entry point that takes a key
+// (claim, check, renew, release, reconcile, claim_free deps, release and QA footprints, CLI).
+// repo:<owner>/<name> and pr:<owner>/<name>#<n> lowercase owner/name (GitHub is case-insensitive);
+// svc:<binary>, tf:<root> and env:<e> are lowercase identifiers; other kinds keep their value as given.
+// Anything else is refused (resource_invalid) rather than guessed.
+const ID = /^[a-z0-9][a-z0-9-]*$/;
+const REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9_.-]+$/;
+export function canonicalResource(key) {
+  const bad = why => refuse('resource_invalid', `resource ${JSON.stringify(key)}: ${why}`);
+  if (typeof key !== 'string' || !key) throw bad('must be a non-empty string');
+  if (/[\s\u0000-\u001f\u007f]/.test(key)) throw bad('no whitespace or control characters');
+  const i = key.indexOf(':');
+  if (i < 1) throw bad('must be <kind>:<value>');
+  const kind = key.slice(0, i).toLowerCase(), value = key.slice(i + 1);
+  if (!/^[a-z][a-z0-9_-]*$/.test(kind)) throw bad('kind must be letters, digits, _ or -');
+  if (kind === 'env') {
+    // env: and env:* reach claimEnv, which refuses them as env_required / env_unsupported.
+    if (value === '' || value === '*') return `env:${value}`;
+    // dev | staging | prod | ephemeral:<name> (the release environment grammar).
+    if (!/^[a-z0-9][a-z0-9-]*(?::[a-z0-9][a-z0-9-]*)?$/.test(value.toLowerCase())) throw bad('env must be an environment name');
+    return `env:${value.toLowerCase()}`;
+  }
+  if (kind === 'svc' || kind === 'tf') {
+    if (!ID.test(value.toLowerCase())) throw bad(`${kind} must be a lowercase name`);
+    return `${kind}:${value.toLowerCase()}`;
+  }
+  if (kind === 'repo') {
+    if (!REPO.test(value)) throw bad('repo must be <owner>/<name>');
+    return `repo:${value.toLowerCase()}`;
+  }
+  if (kind === 'pr') {
+    const m = /^([A-Za-z0-9][A-Za-z0-9_.\/-]*)#([1-9][0-9]*)$/.exec(value);
+    if (!m) throw bad('pr must be <repo>#<number>');
+    return `pr:${m[1].toLowerCase()}#${m[2]}`;
+  }
+  if (!value) throw bad('value is empty');
+  return `${kind}:${value}`;
+}
+const canonList = keys => [...new Set(keys.map(canonicalResource))];
+
 // Claims on these resource kinds coordinate work, not environment mutations; every other kind
 // (env:, svc:, repo:, tf:, ch:, ...) is a mutation claim scoped to exactly one supported environment.
 const NON_MUTATION = ['pr', 'ticket', 'files', 'arch', 'channel', 'work'];
@@ -279,6 +327,7 @@ function overlappingClaim(resource, scope) {
 
 export function claim(resource, { as, ttl, purpose, op, env } = {}) {
   need(resource, 'resource'); need(as, 'as');
+  resource = canonicalResource(resource);
   const secs = parseTtl(ttl);
   const scope = claimEnv(resource, env);
   return tx(() => {
@@ -327,6 +376,7 @@ function releaseOn(resource, fence = null, owner = null, claimScope = null) {
 }
 
 export function check(resource, { as, fence } = {}) {
+  resource = canonicalResource(resource);
   return tx(() => {
     const cur = get('SELECT env FROM claims WHERE resource=?', resource);
     if (!cur) return refuse('not_held', `${resource} is not claimed`);
@@ -342,6 +392,7 @@ export function check(resource, { as, fence } = {}) {
 }
 
 export function renew(resource, { as, fence, ttl, op } = {}) {
+  resource = canonicalResource(resource);
   const secs = parseTtl(ttl);
   return tx(() => {
     const c = holder(resource, as, fence);
@@ -354,6 +405,7 @@ export function renew(resource, { as, fence, ttl, op } = {}) {
 
 // An expired lease cannot be released: its operation may still be running, so it needs reconcile.
 export function release(resource, { as, fence, note } = {}) {
+  resource = canonicalResource(resource);
   return tx(() => {
     const c = holder(resource, as, fence);
     if (c instanceof Error) return c;
@@ -366,6 +418,7 @@ export function release(resource, { as, fence, note } = {}) {
 // Reconciles exactly the expired claim with `fence`. A retry for a fence that was already reconciled
 // returns that historical result; any other fence mismatch is stale_fence and the current claim is untouched.
 export function reconcile(resource, { as, fence, outcome, evidence } = {}) {
+  resource = canonicalResource(resource);
   need(as, 'as'); need(evidence, 'evidence'); need(fence, 'fence');
   const f = Number(fence);
   if (!Number.isInteger(f) || f < 1) throw refuse('invalid', 'fence must be a positive integer');
@@ -395,6 +448,7 @@ export function claims({ owner, state } = {}) {
 export function depAdd(work, needKind, ref) {
   if (!DEP_NEEDS.includes(needKind)) throw refuse('invalid', `need must be one of ${DEP_NEEDS.join('|')}`);
   need(work, 'work'); need(ref, 'ref');
+  if (needKind === 'claim_free') ref = canonicalResource(ref);
   run('INSERT INTO deps (work_id,need,ref) VALUES (?,?,?) ON CONFLICT DO NOTHING', work, needKind, ref);
   return { dep: get('SELECT * FROM deps WHERE work_id=? AND need=? AND ref=?', work, needKind, ref) };
 }
@@ -614,8 +668,8 @@ export function releaseRequest(o = {}) {
     runtime_sha: o.runtimeSha ?? null, content_prs: json(contentPrs), tag: o.tag ?? null,
     image_digest: o.digest ?? null, plan_id: o.plan ?? null, risk: o.risk ?? 'ordinary', batch_id: o.batch ?? null, tf_root: tfRoot,
   };
-  const extra = Array.isArray(o.footprint) ? o.footprint : list(o.footprint, []);
-  row.footprint = json([...new Set([...intrinsic(row), ...extra])].sort());
+  const extra = canonList(Array.isArray(o.footprint) ? o.footprint : list(o.footprint, []));
+  row.footprint = json(canonList([...intrinsic(row), ...extra]).sort());
   row.env_exclusive = MANUAL_KINDS.includes(kind) || extra.includes(`env:${env}`) ? 1 : 0;
   if (!['ordinary', 'stateful', 'high'].includes(row.risk)) throw refuse('invalid', 'risk must be ordinary|stateful|high');
   const fp = fingerprint(row);
@@ -958,7 +1012,7 @@ export function releaseList({ state, env } = {}) {
 // Expiry only raises attention; it never frees the environment on its own.
 export function qaOpen({ as, env, footprint, ttl, key } = {}) {
   need(as, 'as'); need(env, 'env');
-  const fp = [...new Set([...(Array.isArray(footprint) ? footprint : list(footprint, [])), `env:${env}`])].sort();
+  const fp = canonList([...(Array.isArray(footprint) ? footprint : list(footprint, [])), `env:${env}`]).sort();
   const secs = parseTtl(ttl, 4 * 3600);
   const f = fingerprint({ kind: 'qa_window', requester: as, environment: env, footprint: fp, ttl: secs });
   return tx(() => {
@@ -996,6 +1050,50 @@ export function qaClose(id, { as, note } = {}) {
 }
 
 // ---------- architecture writer queue ----------
+
+// Existing rows from before canonical keys: rewrite non-canonical resource keys in place, once per open,
+// in one transaction. Refuses to open (resource_alias_conflict / resource_invalid) when a rewrite would
+// merge two live keys or a key cannot be parsed, so no unresolved claim is silently dropped.
+function normalizeStoredKeys() {
+  const fix = [];
+  const canon = k => { try { return canonicalResource(k); } catch (e) { throw refuse(e.code, `stored ${e.message}; fix the row by hand`); } };
+  tx(() => {
+    for (const c of all('SELECT resource FROM claims')) {
+      const k = canon(c.resource);
+      if (k === c.resource) continue;
+      if (get('SELECT 1 FROM claims WHERE resource=?', k)) throw refuse('resource_alias_conflict', `claims ${c.resource} and ${k} are the same resource; resolve one by hand`);
+      run('UPDATE claims SET resource=? WHERE resource=?', k, c.resource);
+      fix.push(c.resource);
+    }
+    for (const f of all('SELECT resource, fence FROM fences')) {
+      const k = canon(f.resource);
+      if (k === f.resource) continue;
+      run('INSERT INTO fences (resource,fence) VALUES (?,?) ON CONFLICT(resource) DO UPDATE SET fence=MAX(fence, excluded.fence)', k, f.fence);
+      run('DELETE FROM fences WHERE resource=?', f.resource);
+    }
+    for (const h of all('SELECT resource, fence FROM claim_history')) {
+      const k = canon(h.resource);
+      if (k === h.resource) continue;
+      if (get('SELECT 1 FROM claim_history WHERE resource=? AND fence=?', k, h.fence)) throw refuse('resource_alias_conflict', `claim history ${h.resource}#${h.fence} collides with ${k}`);
+      run('UPDATE claim_history SET resource=? WHERE resource=? AND fence=?', k, h.resource, h.fence);
+    }
+    for (const d of all("SELECT id, work_id, ref FROM deps WHERE need='claim_free'")) {
+      const k = canon(d.ref);
+      if (k === d.ref) continue;
+      if (get("SELECT 1 FROM deps WHERE work_id=? AND need='claim_free' AND ref=?", d.work_id, k)) throw refuse('resource_alias_conflict', `dep ${d.id} ${d.ref} duplicates ${k}`);
+      run('UPDATE deps SET ref=? WHERE id=?', k, d.id);
+    }
+    for (const r of all('SELECT id, footprint, claim_fences FROM releases')) {
+      const fp = parse(r.footprint), cf = parse(r.claim_fences);
+      const nfp = canonList(fp.map(canon)).sort();
+      const ncf = cf && Object.fromEntries(Object.entries(cf).map(([k, v]) => [canon(k), v]));
+      if (JSON.stringify(nfp) !== JSON.stringify(fp) || (cf && JSON.stringify(ncf) !== JSON.stringify(cf)))
+        run('UPDATE releases SET footprint=?, claim_fences=? WHERE id=?', json(nfp), json(ncf), r.id);
+    }
+  });
+  return fix;
+}
+setOnOpen(normalizeStoredKeys);
 
 export const archKey = (repos, pins, prefix = 'crw-drift') => `${prefix}:${[...repos].sort().join(',')}:${hash(pins).slice(0, 16)}`;
 
