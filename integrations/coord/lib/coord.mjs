@@ -1259,6 +1259,10 @@ export function attention({ unackedAfter = DEFAULTS.unackedAfter } = {}) {
     expired_qa_windows: all("SELECT id, requester, environment, readback FROM releases WHERE kind='qa_window' AND state='running'")
       .filter(q => (parse(q.readback)?.until ?? Infinity) <= t),
     arch_queued: all("SELECT id, kind, requester, summary FROM arch_requests WHERE state='queued'"),
+    // Never rung: the pump kept skipping the thread (busy, held queue) or is down.
+    pending_overdue: all(`SELECT d.recipient, d.thread_id, COUNT(*) n, MIN(d.event_seq) lo, MAX(d.event_seq) hi, MIN(e.created_at) oldest
+      FROM deliveries d JOIN events e ON e.seq=d.event_seq WHERE d.status='pending' AND e.created_at<=? GROUP BY d.recipient, d.thread_id`, t - unackedAfter),
+    pump: (r => ({ last_tick: r?.set_at ?? null, stale: !r || r.set_at <= t - 300 }))(get("SELECT set_at FROM control WHERE k='pump:heartbeat'")),
   };
 }
 

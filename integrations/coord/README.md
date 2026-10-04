@@ -21,6 +21,13 @@ Plain Node (v22.5+, `node:sqlite`), no dependencies.
   that wake instead. Single-recipient `control`/`blocker` summaries go inline. The wake's
   `clientRequestId` (`coord:wake:<sha256>`) is kept until the ring settles, so a resend after a crash
   replays instead of posting twice. Then `release observe` for a bounded number of running releases.
+  Self-healing (`HEAL` in `lib/pump.mjs`, counted in `deliver.healed`/`heals`): a thread reported
+  `queued` with no run activity for 3 min has a held queue (Robob holds it after provider failures and
+  restarts) and is rung like an idle one; a wake whose turn failed or was cancelled after starting (or
+  that sits behind a held queue) goes back to pending and is re-rung under a new `clientRequestId`, at
+  most once per 5 min; a turn running 30+ min with deliveries older than `unackedAfter` gets a queued
+  wake. Overdue deliveries on a busy thread are listed in `deliver.stuck` and `attention.pending_overdue`.
+  Each tick stamps `pump:heartbeat` in `control`; `attention.pump.stale` flags a pump silent for 5 min.
 - `cli.mjs`: the CLI. JSON out; exit 1 with `error.code` on refusal, 2 on usage.
 - `scripts/coord`: wrapper for `~/.local/bin`. `scripts/com.ardud.coord-pump.plist`: the pump
   LaunchAgent (`coord pump` every 60 s).

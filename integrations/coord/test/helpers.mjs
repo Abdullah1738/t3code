@@ -24,6 +24,10 @@ export async function stubControl({ states = {} } = {}) {
   const messages = {};
   const runs = {};
   const runThread = {};
+  // runId -> {requestedAt, startedAt, completedAt}; thread -> active run summary ({startedAt}) for `run`.
+  const runTimes = {};
+  const active = {};
+  const clockNow = () => C.clock.now();
   let failNext = 0;
   const server = createServer((req, res) => {
     let raw = '';
@@ -36,8 +40,9 @@ export async function stubControl({ states = {} } = {}) {
       const thread = decodeURIComponent(m[1]);
       if (!(thread in states)) return reply(404, { ok: false, error: { code: 'not_found', message: `no thread ${thread}` } });
       if (!m[2]) {
-        const recentRuns = Object.keys(runs).filter(r => runThread[r] === thread).reverse().slice(0, 5).map(runId => ({ runId, status: runs[runId] }));
-        return reply(200, { ok: true, thread: { threadId: thread, state: states[thread], recentRuns } });
+        const recentRuns = Object.keys(runs).filter(r => runThread[r] === thread).reverse().slice(0, 5)
+          .map(runId => ({ runId, status: runs[runId], ...runTimes[runId] }));
+        return reply(200, { ok: true, thread: { threadId: thread, state: states[thread], recentRuns, run: active[thread] ?? null } });
       }
       const body = JSON.parse(raw);
       sends.push({ thread, ...body });
@@ -49,6 +54,8 @@ export async function stubControl({ states = {} } = {}) {
         byRequest.set(id, { messageId: id, runId, delivery });
         runs[runId] = delivery === 'queued' ? 'queued' : 'completed';
         runThread[runId] = thread;
+        const at = new Date(clockNow() * 1000).toISOString();
+        runTimes[runId] = { requestedAt: at, startedAt: delivery === 'queued' ? null : at, completedAt: null };
         (messages[thread] ??= []).push({ messageId: id, text: body.text });
       }
       reply(200, { ok: true, threadId: thread, ...byRequest.get(id) });
@@ -56,7 +63,7 @@ export async function stubControl({ states = {} } = {}) {
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const cfg = { url: `http://127.0.0.1:${server.address().port}`, token: 'test-token' };
-  return { cfg, sends, messages, states, runs, failNext: n => { failNext = n; }, close: () => new Promise(r => server.close(r)) };
+  return { cfg, sends, messages, states, runs, runThread, runTimes, active, failNext: n => { failNext = n; }, close: () => new Promise(r => server.close(r)) };
 }
 
 export const SHA0 = '0'.repeat(40);

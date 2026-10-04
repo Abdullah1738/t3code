@@ -19,6 +19,15 @@ const MAX_ROWS = 5000;
 const RINGABLE = new Set(['idle', 'waiting']);
 const UNREAD = new Set(['queued', 'preparing']);
 const INLINE = new Set(['control', 'blocker']);
+// Self-healing. A queue with nothing running drains within seconds, so a thread still `queued` this long
+// after its last run activity has a held queue (Robob holds it after provider failures and restarts) and
+// would never be rung. A turn running this long gets a queued wake for deliveries older than unackedAfter.
+// A wake whose turn failed is re-rung at most once per relostAfter.
+export const HEAL = { heldQueueAfter: 180, longRunAfter: 1800, relostAfter: 300 };
+const sec = iso => (iso ? Math.floor(Date.parse(iso) / 1000) : 0);
+const heldQueue = (info, t) => info?.state === 'queued' &&
+  t - Math.max(0, ...(info.recentRuns ?? []).flatMap(r => [sec(r.requestedAt), sec(r.startedAt), sec(r.completedAt)])) >= HEAL.heldQueueAfter;
+const longRun = (info, t) => info?.state === 'running' && !!info.run?.startedAt && t - sec(info.run.startedAt) >= HEAL.longRunAfter;
 
 export function controlConfig(o = {}) {
   let url = o.url ?? process.env.T3_CONTROL_URL;
@@ -81,11 +90,14 @@ export function wakeText(rows, { remind = false } = {}) {
   return `${lines.join('\n')}\n\nThis is a coordination message, not owner approval.`;
 }
 
+// Attempts are part of the id so a re-ring of the same rows after a lost wake posts a new message instead of
+// replaying the old one; a crash replay reuses the inflight id instead.
 const wakeId = (thread, rows, remind) =>
-  `coord:${remind ? 'remind' : 'wake'}:${createHash('sha256').update(JSON.stringify([thread, rows.map(d => d.client_request_id).sort()])).digest('hex')}`;
+  `coord:${remind ? 'remind' : 'wake'}:${createHash('sha256').update(JSON.stringify([thread, rows.map(d => d.client_request_id).sort(),
+    ...(remind ? [] : [rows.reduce((n, d) => n + d.attempts, 0)])])).digest('hex')}`;
 
 const paused = d => d.kind !== 'control' && gate(d.environment ? `env:${d.environment}` : undefined).mode === 'pause';
-const ROW = `SELECT d.*, e.kind, e.environment, e.sender, e.summary,
+const ROW = `SELECT d.*, e.kind, e.environment, e.sender, e.summary, e.created_at,
   (SELECT COUNT(*) FROM deliveries x WHERE x.event_seq=d.event_seq) fanout FROM deliveries d JOIN events e ON e.seq=d.event_seq`;
 const DUE = `${ROW} WHERE d.status='pending' AND d.thread_id IS NOT NULL AND COALESCE(d.next_attempt_at,0)<=?`;
 // Sent, unacked, not yet reminded, past the threshold (`?` = now - unackedAfter), and not leased by another pump.
@@ -203,17 +215,38 @@ async function ring(cfg, send, thread, rows, opts, res) {
 }
 
 // `seq` limits the run to threads with that delivery pending (the post-time nudge); it sends no reminders.
+// A wake whose turn failed, or was cancelled after it started (server restart), before its deliveries were
+// acked was lost; its unacked rows go back to pending so the next ring covers them again instead of waiting
+// for a reminder. A wake still queued behind a held queue is lost too: Robob will not start it on its own.
+// Interrupts are the owner's call and a cancel before start is a promote-to-steer, so neither is re-rung.
+// Rate-limited by HEAL.relostAfter since the last ring and MAX_ATTEMPTS per row, so a thread whose turns
+// keep failing is not rung every tick.
+function requeueLost(thread, info, held) {
+  const w = get('SELECT * FROM wakes WHERE thread_id=?', thread);
+  if (!w?.run_id || w.rung_at > clock.now() - HEAL.relostAfter) return 0;
+  const r = (info?.recentRuns ?? []).find(x => x.runId === w.run_id);
+  if (!r || !(r.status === 'failed' || (r.status === 'cancelled' && r.startedAt) || (held && UNREAD.has(r.status)))) return 0;
+  return tx(() => Number(run(`UPDATE deliveries SET status='pending', next_attempt_at=NULL, thread_id=?, gen=gen+1
+    WHERE run_id=? AND status='sent' AND attempts<? AND recipient IN (SELECT id FROM actors WHERE kind='thread' AND thread_id=?)`,
+    thread, w.run_id, MAX_ATTEMPTS, thread).changes));
+}
+
+// `seq` limits the run to threads with that delivery pending (the post-time nudge); it sends no reminders.
 export async function deliver({ cfg, limit = 50, seq, send = sendToThread, look = threadDetail, unackedAfter = DEFAULTS.unackedAfter } = {}) {
-  const res = { sent: [], failed: [], retry: [], reminded: [], wakes: [], held: 0, skipped: 0 };
+  const res = { sent: [], failed: [], retry: [], reminded: [], wakes: [], held: 0, skipped: 0, healed: 0, heals: [], stuck: [] };
   cfg ??= controlConfig();
   const one = seq == null ? null : Number(seq);
+  const pending = () => byThread(candidates(DUE, () => [clock.now()]).rows, false);
   const { rows, held } = candidates(DUE, () => [clock.now()]);
   res.held = held;
   const due = byThread(rows, false);
   if (one != null) for (const [t, rs] of due) if (!rs.some(d => d.event_seq === one)) due.delete(t);
   const stale = one == null ? byThread(candidates(REMIND, () => [clock.now() - unackedAfter, clock.now()]).rows, true) : new Map();
-  for (const thread of [...new Set([...due.keys(), ...stale.keys()])].slice(0, limit)) {
-    const pend = due.get(thread) ?? [];
+  // Threads whose last wake was lost, even with nothing new due.
+  const lost = one == null ? all(`SELECT DISTINCT w.thread_id FROM wakes w JOIN deliveries d ON d.run_id=w.run_id AND d.status='sent'
+    WHERE w.rung_at<=?`, clock.now() - HEAL.relostAfter).map(x => x.thread_id) : [];
+  for (const thread of [...new Set([...due.keys(), ...stale.keys(), ...lost])].slice(0, limit)) {
+    let pend = due.get(thread) ?? [];
     let info;
     try {
       info = await look(cfg, thread);
@@ -222,25 +255,60 @@ export async function deliver({ cfg, limit = 50, seq, send = sendToThread, look 
       if (r) fail(thread, r, err, {}, res); else res.skipped++;
       continue;
     }
+    const t = clock.now();
+    const why = [];
+    const held = heldQueue(info, t);
+    if (one == null && requeueLost(thread, info, held)) {
+      why.push('lost_wake');
+      pend = pending().get(thread) ?? [];
+    }
     const w = get('SELECT * FROM wakes WHERE thread_id=?', thread);
-    if (w?.run_id && (info?.recentRuns ?? []).some(x => x.runId === w.run_id && UNREAD.has(x.status))) {
+    if (!held && w?.run_id && (info?.recentRuns ?? []).some(x => x.runId === w.run_id && UNREAD.has(x.status))) {
       // The last wake is still queued unread; it will show these too.
       const r = pend.length ? reserve(thread, pend, { coalesce: true }) : null;
       if (r) settle(thread, r, { messageId: w.message_id, runId: w.run_id, delivery: 'coalesced' }, {}, res); else res.skipped++;
       continue;
     }
-    if (!RINGABLE.has(info?.state)) { res.skipped++; continue; }
+    const overdue = pend.some(d => d.created_at <= t - unackedAfter) || stale.has(thread);
+    // A held queue rings like an idle thread (a queue-mode send to a thread with nothing running starts at
+    // once); a long turn gets a queued wake so it is read when the turn ends.
+    if (held) why.push('held_queue');
+    else if (!RINGABLE.has(info?.state) && overdue && longRun(info, t)) why.push('long_run');
+    if (!RINGABLE.has(info?.state) && !held && !why.includes('long_run')) {
+      if (overdue) {
+        const oldest = Math.min(...pend.map(d => d.created_at), ...(stale.get(thread) ?? []).map(d => d.sent_at));
+        res.stuck.push({ thread, state: info?.state ?? null, oldest_min: Math.floor((t - oldest) / 60) });
+      }
+      res.skipped++;
+      continue;
+    }
+    const before = res.wakes.length;
     const r = pend.length ? reserve(thread, pend) : null;
-    if (r) { await ring(cfg, send, thread, r, {}, res); continue; }
-    const s = stale.has(thread) ? reserve(thread, stale.get(thread), { remind: true, unackedAfter }) : null;
-    if (s) await ring(cfg, send, thread, s, { remind: true }, res); else res.skipped++;
+    if (r) await ring(cfg, send, thread, r, {}, res);
+    else {
+      const s = stale.has(thread) ? reserve(thread, stale.get(thread), { remind: true, unackedAfter }) : null;
+      if (s) await ring(cfg, send, thread, s, { remind: true }, res); else res.skipped++;
+    }
+    if (why.length && res.wakes.length > before) { res.healed++; res.heals.push({ thread, reason: why.join('+') }); }
   }
   return res;
+}
+
+// Heartbeat: every tick stamps `pump:heartbeat` in control, so `coord status`/`attention` show a dead pump.
+export const HEARTBEAT = 'pump:heartbeat';
+function heartbeat(res) {
+  const t = clock.now();
+  const prev = get('SELECT set_at FROM control WHERE k=?', HEARTBEAT)?.set_at ?? null;
+  const v = JSON.stringify({ sent: res?.sent?.length ?? 0, healed: res?.healed ?? 0, stuck: res?.stuck?.length ?? 0, error: res?.error ?? null });
+  run(`INSERT INTO control (k,v,set_by,set_at,reason) VALUES (?,?,'pump',?,NULL)
+    ON CONFLICT(k) DO UPDATE SET v=excluded.v, set_by=excluded.set_by, set_at=excluded.set_at`, HEARTBEAT, v, t);
+  return { at: new Date(t * 1000).toISOString(), gap_s: prev == null ? null : t - prev };
 }
 
 // One pump tick: deliveries, then observe a bounded number of running releases (oldest observation first).
 export async function pump({ cfg, observe, observeLimit = 5, ...o } = {}) {
   const out = { deliver: await deliver({ cfg, ...o }).catch(e => ({ error: e.message })), observed: [] };
+  out.heartbeat = heartbeat(out.deliver);
   const rows = all(`SELECT id FROM releases WHERE state='running' AND kind IN ('service_release','frontend_release','redispatch')
     ORDER BY COALESCE(observed_at,0), id LIMIT ?`, observeLimit);
   for (const { id } of rows) {
