@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  alert, CHECK_TIMEOUT_MS, deliver, ensureDirs, hash, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
+  alert, CHECK_TIMEOUT_MS, deliver, ensureDirs, escalate, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
   inboundState, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   triggerSig, type Watcher, wakeInboundId, watcherDir, shouldAlert, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
@@ -164,12 +164,21 @@ async function tickOne(id: string): Promise<void> {
       fresh.failure_alerted = sent.ok;
       log(id, `failure alert ok=${sent.ok} via=${sent.via}`);
     }
+    if (shouldEscalate(watcher, fresh)) {
+      const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(fresh.failing_since ?? "").slice(0, 32)}`);
+      fresh.failure_escalated = sent.ok;
+      log(id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
+    }
+    // Keep the retry cadence at most 5 min apart for wake watchers so escalation and recovery are not delayed
+    // by a 30 min backoff.
+    if (watcher.mode === "wake") fresh.next_at = Math.min(fresh.next_at!, now() + Math.max(watcher.interval_s, 300) * 1_000);
     saveState(id, fresh);
     return;
   }
   if (fresh.consecutive_failures) log(id, `check recovered after ${fresh.consecutive_failures} failures`);
   fresh.consecutive_failures = 0;
   fresh.failure_alerted = false;
+  delete fresh.failure_escalated;
   delete fresh.last_error;
   delete fresh.failing_since;
   const event = result.stdout.trim();

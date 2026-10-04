@@ -75,6 +75,8 @@ export type State = {
   last_error?: string;
   /** When the current run of consecutive failures started. */
   failing_since?: string;
+  /** The agent was woken about the current run of failures (see shouldEscalate). */
+  failure_escalated?: boolean;
   /** Wall time of the last check run, in ms. */
   last_run_ms?: number;
   /** An event whose delivery has not succeeded yet; retried verbatim with the same key. */
@@ -238,7 +240,8 @@ async function run(args: string[], timeoutMs = 20_000): Promise<{ ok: boolean; o
 export async function liveSession(): Promise<string | undefined> {
   const result = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, "select json_extract(value,'$.id') from kv where key='route'"], 10_000);
   const id = result.out.trim();
-  return result.ok && id && /^ses[A-Za-z0-9_]+$/.test(id) ? id : undefined;
+  // Robob routes are thread ids ("ardud-control:thread:<uuid>"); older OpenCode routes were "ses_...".
+  return result.ok && id && /^[A-Za-z0-9_][A-Za-z0-9_:.-]{0,199}$/.test(id) ? id : undefined;
 }
 
 /** The bridge names a wake's inbound row after the sha256 of its dedupe key (api.ts /wake). */
@@ -333,6 +336,40 @@ export function shouldAlert(state: State, timedOut: boolean, t = now()): boolean
   if (state.failure_alerted || state.consecutive_failures < FAILURE_ALERT_AFTER) return false;
   if (!timedOut) return true;
   return t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS;
+}
+
+/**
+ * A wake watcher that keeps failing is blind, and a Telegram alert alone went unanswered for 2.5h (4 Oct 2026,
+ * wacli daemon booted out). After ESCALATE_AFTER_MS of failing, wake the agent (iMessage text as fallback) once
+ * per failure run so it can repair the cause.
+ */
+export const ESCALATE_AFTER_MS = Number(process.env.ROBOB_WATCH_ESCALATE_AFTER_MS ?? 15 * 60_000);
+
+export function shouldEscalate(watcher: Watcher, state: State, t = now()): boolean {
+  if (watcher.mode !== "wake" || state.failure_escalated || !state.failing_since) return false;
+  return t - Date.parse(state.failing_since) >= ESCALATE_AFTER_MS;
+}
+
+export function escalationText(watcher: Watcher, state: State, mins: number): string {
+  return [
+    `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs) and is blind until fixed.`,
+    `Last error: ${(state.last_error ?? "").slice(0, 500)}`,
+    "",
+    "Diagnose and repair the cause now (e.g. \"wacli sync daemon is not running\" -> `wa start`, then `wa status`; see the robob-watchers skill's Troubleshooting).",
+    `Then \`robob-watch resume ${watcher.id}\` to re-run it at once and \`robob-watch show ${watcher.id}\` to confirm. Only text the owner if you cannot fix it or something was missed; otherwise log it and end with NO_REPLY.`,
+    "",
+    "The watcher's own context (do not act on it now; it is for when it fires):",
+    clip(watcher.context || "(none)", 1_500),
+  ].join("\n");
+}
+
+export async function escalate(watcher: Watcher, state: State, key: string): Promise<Delivery> {
+  const mins = Math.round((now() - Date.parse(state.failing_since!)) / 60_000);
+  const text = escalationText(watcher, state, mins);
+  const woke = await wake(`robob-watch ${watcher.id} failing`, text, key);
+  if (woke.ok) return { ok: true, via: "wake", detail: woke.out };
+  const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min: ${(state.last_error ?? "").slice(0, 300)}`, key);
+  return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
 }
 
 export function ensureDirs(): void {

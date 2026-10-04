@@ -98,6 +98,47 @@ test("failing checks back off and alert once; expired watchers switch off with a
   expect(readCalls().some(call => call.cli === "telegram" && call.args.join(" ").includes("expired"))).toBe(true);
 }, 20_000);
 
+test("a wake watcher failing 15+ min wakes the agent once per failure run, caps its backoff at 5 min, and resets on recovery", async () => {
+  writeFileSync(calls, "");
+  for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
+  const flag = join(sandbox, "esc-ok");
+  expect(cli("add", "--id", "esc", "--title", "Esc", "--check", `[[ -f ${flag} ]] || { echo "wacli sync daemon is not running" >&2; exit 1; }`,
+    "--interval", "30", "--context", "Owner waits for a reply.", "--no-prime").exitCode).toBe(0);
+  const file = join(sandbox, "root/watchers/esc/state.json");
+  // Failing 5 min: no escalation yet.
+  writeFileSync(file, JSON.stringify({ status: "active", fires: 0, consecutive_failures: 7, failure_alerted: true,
+    failing_since: new Date(Date.now() - 5 * 60_000).toISOString() }));
+  await runnerFor(2_000);
+  expect(readCalls().filter(call => call.args[0] === "wake")).toHaveLength(0);
+  expect(state("esc").next_at - Date.now()).toBeLessThanOrEqual(300_000);
+  // Failing 16 min: one wake with the error and repair instructions.
+  writeFileSync(file, JSON.stringify({ ...state("esc"), next_at: 0, failing_since: new Date(Date.now() - 16 * 60_000).toISOString() }));
+  await runnerFor(2_000);
+  const wakes = readCalls().filter(call => call.args[0] === "wake");
+  expect(wakes).toHaveLength(1);
+  const text = wakes[0]!.args[wakes[0]!.args.indexOf("--text") + 1]!;
+  expect(text).toContain("FAILING for 16 min");
+  expect(text).toContain("wacli sync daemon is not running");
+  expect(text).toContain("robob-watch resume esc");
+  expect(state("esc").failure_escalated).toBe(true);
+  // Still failing: not woken again.
+  writeFileSync(file, JSON.stringify({ ...state("esc"), next_at: 0 }));
+  await runnerFor(2_000);
+  expect(readCalls().filter(call => call.args[0] === "wake")).toHaveLength(1);
+  // Recovery clears the flag.
+  writeFileSync(flag, "");
+  writeFileSync(file, JSON.stringify({ ...state("esc"), next_at: 0 }));
+  await runnerFor(2_000);
+  expect(state("esc").failure_escalated).toBeUndefined();
+  expect(state("esc").consecutive_failures).toBe(0);
+  // Notify watchers never escalate.
+  expect(cli("add", "--id", "escn", "--title", "EscN", "--check", "exit 1", "--mode", "notify", "--no-prime").exitCode).toBe(0);
+  writeFileSync(join(sandbox, "root/watchers/escn/state.json"), JSON.stringify({ status: "active", fires: 0, consecutive_failures: 9,
+    failure_alerted: true, failing_since: new Date(Date.now() - 60 * 60_000).toISOString() }));
+  await runnerFor(2_000);
+  expect(readCalls().filter(call => call.args[0] === "wake")).toHaveLength(1);
+}, 30_000);
+
 test("validation: wake watchers need context, interval has a floor, ids are strict", () => {
   expect(cli("add", "--id", "x", "--title", "t", "--check", "true").stderr.toString()).toContain("wake watchers need context");
   expect(cli("add", "--id", "x", "--title", "t", "--check", "true", "--mode", "notify", "--interval", "4").stderr.toString()).toContain("interval_s");
