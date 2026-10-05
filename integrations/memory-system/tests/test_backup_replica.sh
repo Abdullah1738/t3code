@@ -95,4 +95,23 @@ if [ -x "$REAL_RSYNC" ]; then
     && pass "robob state used sqlite3_rsync" || fail "robob state not via sqlite3_rsync"
   rm -rf "$T"
 fi
+
+# 5. a lock left by a dead run is removed (and logged); a live run's lock is kept
+setup fake
+mkdir "$R/logs/backup.lock"
+true & dead=$!; wait $dead
+echo $dead > "$R/logs/backup.lock/pid"
+run
+grep -q "removing stale backup.lock (holder $dead is gone)" "$R"/logs/backup-*.log \
+  && pass "dead holder's lock removed" || fail "dead holder lock: $(cat "$R"/logs/backup-*.log)"
+[ "$(st)" = "restic False" ] && pass "run proceeds after stale lock" || fail "after stale lock: $(st)"
+bash -c 'sleep 30; :' memory_backup.sh & live=$!
+mkdir "$R/logs/backup.lock"; echo $live > "$R/logs/backup.lock/pid"
+run
+grep -q "skip: backup $live still running" "$R"/logs/backup-*.log \
+  && pass "live holder skipped" || fail "live holder not skipped"
+kill -0 $live 2>/dev/null && [ -d "$R/logs/backup.lock" ] \
+  && pass "live holder not killed, lock kept" || fail "live holder disturbed"
+kill $live; wait $live 2>/dev/null
+rm -rf "$T"
 exit $FAIL

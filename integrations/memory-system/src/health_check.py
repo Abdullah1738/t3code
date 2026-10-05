@@ -8,6 +8,7 @@ Checks that the whole pipeline is flowing, not just that processes exist:
   mcp       memory MCP answers on :18765
   janitor   daily janitor ran and exited 0
   backup    last memory backup succeeded recently
+  backup_lock  no backup run is hung (>2 h) or died holding logs/backup.lock
   dropbox   Dropbox copy of the live backup repo is complete (name + size)
   disk      internal disk has room
   session_reaper   hourly deletion of 30-day-idle OpenCode sessions runs and is not stuck gated
@@ -49,6 +50,7 @@ LAG_MAX = 3
 EXTRACT_MAX_AGE = 6 * 3600
 BUDGET = float(os.environ.get("MEMORY_EXTRACT_MONTHLY_BUDGET", "1000"))
 BACKUP_MAX_AGE = 9 * 3600       # backup every 4 h
+BACKUP_LOCK_MAX_AGE = 2 * 3600  # runs take up to ~1.7 h
 DISK_MIN_GB = 30
 
 
@@ -197,6 +199,41 @@ def check_backup():
     return True, f"snapshot {st.get('last_snapshot')} {int((time.time()-last_ok)/60)} min ago"
 
 
+def pid_is_backup(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
+    return "memory_backup.sh" in cmd
+
+
+def check_backup_lock():
+    # launchd never starts the backup job while a previous run is alive, so a
+    # hung run blocks every later one silently; the backup script can't see it.
+    lock = os.path.join(LOGS, "backup.lock")
+    try:
+        age = time.time() - os.stat(lock).st_mtime
+    except FileNotFoundError:
+        return True, "no backup running"
+    try:
+        with open(os.path.join(lock, "pid")) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        pid = None
+    if pid is None and age < 60:
+        return True, "backup starting"
+    if pid is None or not pid_is_backup(pid):
+        # the next backup run removes it (and logs that)
+        return False, f"backup run {pid or '?'} died without releasing logs/backup.lock ({int(age/60)} min old)"
+    if age > BACKUP_LOCK_MAX_AGE:
+        return False, (f"backup run PID {pid} still running after {age/3600:.1f} h; later runs are blocked "
+                       f"until it exits (not killed automatically)")
+    return True, f"backup PID {pid} running for {int(age/60)} min"
+
+
 def check_dropbox():
     # independent of the backup job: Dropbox copy of the live repo matches the
     # local repo by name + size (full content_hash check runs in every backup)
@@ -292,6 +329,7 @@ def check_worktree_reaper():
 
 CHECKS = [("sync", check_sync), ("lag", check_lag), ("extract", check_extract),
           ("mcp", check_mcp), ("janitor", check_janitor), ("backup", check_backup),
+          ("backup_lock", check_backup_lock),
           ("dropbox", check_dropbox), ("disk", check_disk), ("cold_finalize", check_cold_finalize),
           ("session_reaper", check_session_reaper), ("location_reaper", check_location_reaper),
           ("worktree_reaper", check_worktree_reaper)]
@@ -343,7 +381,7 @@ def main():
         lines = [f"- {n}: {results[n]['msg']}" for n in new_fail]
         text = "Memory system problem:\n" + "\n".join(lines)
         key = "memory-health:" + today + ":" + ",".join(f"{n}@{failing[n]['since']}" for n in sorted(new_fail))
-        if notify("error" if any(n in ("sync", "backup", "mcp") for n in new_fail) else "attention", text, key):
+        if notify("error" if any(n in ("sync", "backup", "backup_lock", "mcp") for n in new_fail) else "attention", text, key):
             for n in new_fail:
                 failing[n]["notified_day"] = today
     if recovered:

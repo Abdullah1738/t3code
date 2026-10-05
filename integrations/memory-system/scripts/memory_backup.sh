@@ -34,9 +34,12 @@ log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
 if ! mkdir "$LOCK" 2>/dev/null; then
   holder=$(cat "$LOCK/pid" 2>/dev/null)
-  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+  # launchd never overlaps runs, so this only sees manual runs or a lock left
+  # by a killed run. A hung run is reported by health_check.py (backup_lock).
+  if [ -n "$holder" ] && ps -p "$holder" -o command= 2>/dev/null | grep -q memory_backup.sh; then
     log "skip: backup $holder still running"; exit 0
   fi
+  log "removing stale backup.lock (holder ${holder:-?} is gone)"
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
