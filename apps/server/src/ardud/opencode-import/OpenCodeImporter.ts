@@ -33,10 +33,10 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "../../orchestration-v2/IdAllocator.ts";
-import { makeKeyedSerialExecutor } from "../../orchestration-v2/KeyedSerialExecutor.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { makeSubagentChildThread } from "../../orchestration-v2/SubagentProjection.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
@@ -169,7 +169,7 @@ export const make = Effect.gen(function* () {
   const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
   const settings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
   const runLock = yield* Semaphore.make(1);
-  const transcriptLocks = yield* makeKeyedSerialExecutor<ThreadId>();
+  const transcriptLocks = yield* KeyedLock.make<ThreadId>();
   // Threads whose transcript this process already brought up to date.
   const freshTranscripts = new Set<ThreadId>();
   // Thread id -> native session id, or null for threads this importer does not own.
