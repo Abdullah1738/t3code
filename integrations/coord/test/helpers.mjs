@@ -57,13 +57,35 @@ export async function stubControl({ states = {} } = {}) {
         const at = new Date(clockNow() * 1000).toISOString();
         runTimes[runId] = { requestedAt: at, startedAt: delivery === 'queued' ? null : at, completedAt: null };
         (messages[thread] ??= []).push({ messageId: id, text: body.text });
+        runMessage[runId] = { messageId: id, text: body.text };
       }
       reply(200, { ok: true, threadId: thread, ...byRequest.get(id) });
     });
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const cfg = { url: `http://127.0.0.1:${server.address().port}`, token: 'test-token' };
-  return { cfg, sends, messages, states, runs, runThread, runTimes, active, failNext: n => { failNext = n; }, close: () => new Promise(r => server.close(r)) };
+  // Queue API stand-in (deliver's `queue` option): lists the thread's queued runs, cancels by run id.
+  const runMessage = {};
+  const cancels = [];
+  const queue = {
+    list: async (_cfg, thread) => Object.keys(runs).filter(r => runThread[r] === thread && runs[r] === 'queued')
+      .map(runId => ({ runId, ...runMessage[runId], held: true })),
+    cancel: async (_cfg, thread, runId) => {
+      if (runs[runId] !== 'queued' || runThread[runId] !== thread) throw new Error(`Run ${runId} is not queued.`);
+      runs[runId] = 'cancelled';
+      cancels.push(runId);
+      return { sequence: cancels.length };
+    },
+  };
+  // A queued run not sent by the pump (owner message, agent notice).
+  const enqueue = (thread, runId, text, messageId = `msg:${runId}`) => {
+    runs[runId] = 'queued';
+    runThread[runId] = thread;
+    runTimes[runId] = { requestedAt: new Date(clockNow() * 1000).toISOString(), startedAt: null, completedAt: null };
+    runMessage[runId] = { messageId, text };
+  };
+  return { cfg, sends, messages, states, runs, runThread, runTimes, active, queue, cancels, enqueue,
+    failNext: n => { failNext = n; }, close: () => new Promise(r => server.close(r)) };
 }
 
 export const SHA0 = '0'.repeat(40);

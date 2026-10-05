@@ -1263,6 +1263,8 @@ export function attention({ unackedAfter = DEFAULTS.unackedAfter } = {}) {
     pending_overdue: all(`SELECT d.recipient, d.thread_id, COUNT(*) n, MIN(d.event_seq) lo, MAX(d.event_seq) hi, MIN(e.created_at) oldest
       FROM deliveries d JOIN events e ON e.seq=d.event_seq WHERE d.status='pending' AND e.created_at<=? GROUP BY d.recipient, d.thread_id`, t - unackedAfter),
     pump: (r => ({ last_tick: r?.set_at ?? null, stale: !r || r.set_at <= t - 300 }))(get("SELECT set_at FROM control WHERE k='pump:heartbeat'")),
+    // Actor threads held 10+ min with queued items the pump must not cancel (owner or agent messages, notices).
+    held_queues: parse(get("SELECT v FROM control WHERE k='pump:held_queues'")?.v) ?? [],
   };
 }
 

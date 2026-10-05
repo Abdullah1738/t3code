@@ -23,10 +23,12 @@ const INLINE = new Set(['control', 'blocker']);
 // after its last run activity has a held queue (Robob holds it after provider failures and restarts) and
 // would never be rung. A turn running this long gets a queued wake for deliveries older than unackedAfter.
 // A wake whose turn failed is re-rung at most once per relostAfter.
-export const HEAL = { heldQueueAfter: 180, longRunAfter: 1800, relostAfter: 300 };
+// Every sweepEvery the pump also checks each actor thread: one held staleHeldAfter with only coord wakes queued
+// has them cancelled (their unacked deliveries get a fresh wake); one holding other items is listed in attention.
+export const HEAL = { heldQueueAfter: 180, longRunAfter: 1800, relostAfter: 300, staleHeldAfter: 600, sweepEvery: 300 };
 const sec = iso => (iso ? Math.floor(Date.parse(iso) / 1000) : 0);
-const heldQueue = (info, t) => info?.state === 'queued' &&
-  t - Math.max(0, ...(info.recentRuns ?? []).flatMap(r => [sec(r.requestedAt), sec(r.startedAt), sec(r.completedAt)])) >= HEAL.heldQueueAfter;
+const heldQueue = (info, t, after = HEAL.heldQueueAfter) => info?.state === 'queued' &&
+  t - Math.max(0, ...(info.recentRuns ?? []).flatMap(r => [sec(r.requestedAt), sec(r.startedAt), sec(r.completedAt)])) >= after;
 const longRun = (info, t) => info?.state === 'running' && !!info.run?.startedAt && t - sec(info.run.startedAt) >= HEAL.longRunAfter;
 
 export function controlConfig(o = {}) {
@@ -70,6 +72,82 @@ export const threadDetail = async (cfg, threadId) => (await call(cfg, 'GET', `/t
 export const threadState = async (cfg, threadId) => (await threadDetail(cfg, threadId))?.state;
 
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+// The control API has no queue routes (t3_queue_list/t3_queue_cancel are MCP-only), so queued runs are read
+// and cancelled over the app's WebSocket RPC with the same token. One request per connection.
+async function rpc(cfg, tag, payload) {
+  const t = await fetch(`${cfg.url}/api/auth/websocket-ticket`, {
+    method: 'POST', headers: { authorization: `Bearer ${cfg.token}` }, signal: AbortSignal.timeout(30000),
+  });
+  const ticket = (await t.json().catch(() => null))?.ticket;
+  if (!t.ok || !ticket) throw Object.assign(new Error(`websocket ticket: HTTP ${t.status}`), { status: t.status });
+  const ws = new WebSocket(`${cfg.url.replace(/^http/, 'ws')}/ws?orchestrationProtocol=2&wsTicket=${encodeURIComponent(ticket)}`);
+  let timer;
+  try {
+    return await new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${tag}: timeout`)), 30000);
+      ws.onopen = () => ws.send(JSON.stringify({ _tag: 'Request', id: '1', tag, payload, headers: [] }));
+      ws.onerror = () => reject(new Error(`${tag}: websocket error`));
+      ws.onclose = e => reject(new Error(`${tag}: websocket closed (${e.code})`));
+      ws.onmessage = e => {
+        for (const m of [JSON.parse(e.data)].flat()) {
+          if (m._tag === 'Exit' && String(m.requestId) === '1') {
+            if (m.exit?._tag === 'Success') resolve(m.exit.value);
+            else reject(new Error(`${tag}: ${clip(JSON.stringify(m.exit?.cause ?? m.exit), 300)}`));
+          } else if (m._tag === 'Defect' || m._tag === 'ClientProtocolError') reject(new Error(`${tag}: ${clip(JSON.stringify(m), 300)}`));
+        }
+      };
+    });
+  } finally {
+    clearTimeout(timer);
+    ws.close();
+  }
+}
+
+export const queueApi = {
+  async list(cfg, threadId) {
+    const p = await rpc(cfg, 'orchestration.getThreadProjection', { threadId });
+    const text = new Map((p?.messages ?? []).map(m => [m.id, m.text]));
+    return (p?.runs ?? []).filter(r => r.status === 'queued')
+      .map(r => ({ runId: r.id, messageId: r.userMessageId, text: text.get(r.userMessageId) ?? null, held: !!r.queueHeld }));
+  },
+  cancel: (cfg, threadId, runId) =>
+    // A rejected command id stays rejected, so each attempt gets its own.
+    rpc(cfg, 'orchestration.dispatchCommand', { type: 'queued-run.cancel', commandId: `coord:supersede:${runId}:${clock.now()}`, threadId, runId }),
+};
+
+// A queued run the pump created: its message id is the send commandId built from a `coord:` clientRequestId,
+// and its text is a coord wake or reminder. Anything else (owner, agents, task notices) is never touched.
+const ours = (thread, q) => !!q.messageId?.startsWith(`ardud-control:send:${thread}:coord%3A`) && /^\[coord[\] ]/.test(q.text ?? '');
+
+// Cancels the pump's own queued runs in `items`; their unacked deliveries go back to pending so the next ring
+// covers them. Returns the cancelled run ids.
+async function supersede(cfg, queue, thread, items, reason, res) {
+  const done = [];
+  for (const q of items.filter(q => ours(thread, q))) {
+    try {
+      await queue.cancel(cfg, thread, q.runId);
+      done.push(q.runId);
+    } catch (err) {
+      res.queueErrors.push({ thread, runId: q.runId, error: err.message });
+    }
+  }
+  if (!done.length) return done;
+  const requeued = tx(() => {
+    let n = 0;
+    const back = (where, ...a) => { n += Number(run(`UPDATE deliveries SET status='pending', next_attempt_at=NULL, thread_id=?, gen=gen+1
+      WHERE status='sent' AND attempts<? AND recipient IN (SELECT id FROM actors WHERE kind='thread' AND thread_id=?) AND ${where}`,
+    thread, MAX_ATTEMPTS, thread, ...a).changes); };
+    for (const id of done) back('run_id=?', id);
+    // A cancelled reminder (the thread's last ring) never got read either; its rows get a fresh wake.
+    const w = get('SELECT * FROM wakes WHERE thread_id=?', thread);
+    if (w?.kind === 'reminder' && done.includes(w.run_id)) for (const [seq, r] of JSON.parse(w.covered ?? '[]')) back('event_seq=? AND recipient=?', seq, r);
+    return n;
+  });
+  res.superseded += done.length;
+  res.supersedes.push({ thread, reason, runs: done.length, requeued });
+  return done;
+}
 const plural = n => `${n} unacked ${n === 1 ? 'delivery' : 'deliveries'}`;
 
 // One wake (or reminder) for every actor bound to the thread. Single-recipient control/blocker events are
@@ -231,11 +309,47 @@ function requeueLost(thread, info, held) {
     thread, w.run_id, MAX_ATTEMPTS, thread).changes));
 }
 
+// Stale held queues, at most once per HEAL.sweepEvery: an actor thread held staleHeldAfter whose queue holds only
+// coord wakes has them all cancelled, so the fresh wake rung this tick is the one that runs. A held queue with
+// anything else is left alone and listed under `pump:held_queues` for `coord attention`.
+export const SWEEP = 'pump:sweep';
+export const HELD_QUEUES = 'pump:held_queues';
+const stamp = (k, v) => run(`INSERT INTO control (k,v,set_by,set_at,reason) VALUES (?,?,'pump',?,NULL)
+  ON CONFLICT(k) DO UPDATE SET v=excluded.v, set_by=excluded.set_by, set_at=excluded.set_at`, k, v, clock.now());
+async function sweep(cfg, look, queue, res) {
+  if (clock.now() - Number(get('SELECT v FROM control WHERE k=?', SWEEP)?.v ?? 0) < HEAL.sweepEvery) return;
+  stamp(SWEEP, String(clock.now()));
+  const heldQueues = [];
+  const actors = all("SELECT id, thread_id FROM actors WHERE kind='thread' AND thread_id IS NOT NULL ORDER BY id");
+  for (const thread of new Set(actors.map(a => a.thread_id))) {
+    let info, items;
+    try {
+      info = await look(cfg, thread);
+      if (!heldQueue(info, clock.now(), HEAL.staleHeldAfter)) continue;
+      items = await queue.list(cfg, thread);
+    } catch (err) {
+      res.queueErrors.push({ thread, error: err.message });
+      continue;
+    }
+    const other = items.filter(q => !ours(thread, q));
+    if (!other.length) {
+      await supersede(cfg, queue, thread, items, 'stale_held', res);
+      continue;
+    }
+    const last = Math.max(0, ...(info.recentRuns ?? []).flatMap(r => [sec(r.requestedAt), sec(r.startedAt), sec(r.completedAt)]));
+    heldQueues.push({ thread, actors: actors.filter(a => a.thread_id === thread).map(a => a.id), held_min: Math.floor((clock.now() - last) / 60),
+      coord: items.length - other.length, other: other.map(q => ({ runId: q.runId, text: clip(q.text ?? '', 120) })) });
+  }
+  stamp(HELD_QUEUES, JSON.stringify(heldQueues));
+}
+
 // `seq` limits the run to threads with that delivery pending (the post-time nudge); it sends no reminders.
-export async function deliver({ cfg, limit = 50, seq, send = sendToThread, look = threadDetail, unackedAfter = DEFAULTS.unackedAfter } = {}) {
-  const res = { sent: [], failed: [], retry: [], reminded: [], wakes: [], held: 0, skipped: 0, healed: 0, heals: [], stuck: [] };
+export async function deliver({ cfg, limit = 50, seq, send = sendToThread, look = threadDetail, queue = queueApi, unackedAfter = DEFAULTS.unackedAfter } = {}) {
+  const res = { sent: [], failed: [], retry: [], reminded: [], wakes: [], held: 0, skipped: 0, healed: 0, heals: [], stuck: [],
+    superseded: 0, supersedes: [], queueErrors: [] };
   cfg ??= controlConfig();
   const one = seq == null ? null : Number(seq);
+  if (one == null) await sweep(cfg, look, queue, res);
   const pending = () => byThread(candidates(DUE, () => [clock.now()]).rows, false);
   const { rows, held } = candidates(DUE, () => [clock.now()]);
   res.held = held;
@@ -282,6 +396,13 @@ export async function deliver({ cfg, limit = 50, seq, send = sendToThread, look 
       res.skipped++;
       continue;
     }
+    // About to queue a wake on a thread that may hold queued runs (an idle thread holds none): the pump's own
+    // earlier wakes are cancelled first, so only the newest one is left to run.
+    if (info?.state !== 'idle' && (pend.length || stale.has(thread))) {
+      let items = [];
+      try { items = await queue.list(cfg, thread); } catch (err) { res.queueErrors.push({ thread, error: err.message }); }
+      if ((await supersede(cfg, queue, thread, items, 'ring', res)).length) pend = pending().get(thread) ?? [];
+    }
     const before = res.wakes.length;
     const r = pend.length ? reserve(thread, pend) : null;
     if (r) await ring(cfg, send, thread, r, {}, res);
@@ -299,10 +420,10 @@ export const HEARTBEAT = 'pump:heartbeat';
 function heartbeat(res) {
   const t = clock.now();
   const prev = get('SELECT set_at FROM control WHERE k=?', HEARTBEAT)?.set_at ?? null;
-  const v = JSON.stringify({ sent: res?.sent?.length ?? 0, healed: res?.healed ?? 0, stuck: res?.stuck?.length ?? 0, error: res?.error ?? null });
-  run(`INSERT INTO control (k,v,set_by,set_at,reason) VALUES (?,?,'pump',?,NULL)
-    ON CONFLICT(k) DO UPDATE SET v=excluded.v, set_by=excluded.set_by, set_at=excluded.set_at`, HEARTBEAT, v, t);
-  return { at: new Date(t * 1000).toISOString(), gap_s: prev == null ? null : t - prev };
+  const v = JSON.stringify({ sent: res?.sent?.length ?? 0, healed: res?.healed ?? 0, stuck: res?.stuck?.length ?? 0,
+    superseded: res?.superseded ?? 0, error: res?.error ?? null });
+  stamp(HEARTBEAT, v);
+  return { at: new Date(t * 1000).toISOString(), gap_s: prev == null ? null : t - prev, superseded: res?.superseded ?? 0 };
 }
 
 // One pump tick: deliveries, then observe a bounded number of running releases (oldest observation first).

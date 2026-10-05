@@ -27,7 +27,15 @@ Plain Node (v22.5+, `node:sqlite`), no dependencies.
   that sits behind a held queue) goes back to pending and is re-rung under a new `clientRequestId`, at
   most once per 5 min; a turn running 30+ min with deliveries older than `unackedAfter` gets a queued
   wake. Overdue deliveries on a busy thread are listed in `deliver.stuck` and `attention.pending_overdue`.
-  Each tick stamps `pump:heartbeat` in `control`; `attention.pump.stale` flags a pump silent for 5 min.
+  Supersede: before ringing a non-idle thread the pump lists its queued runs and cancels its own earlier
+  wakes/reminders (message id from a `coord:` clientRequestId and `[coord]`/`[coord reminder]` text), so
+  only the newest wake is queued; their unacked deliveries ride on the new wake. Every 5 min it also checks
+  each actor thread: one held 10+ min with only coord wakes queued has them cancelled and gets one fresh
+  wake; one holding anything else (owner or agent messages, task notices) is never touched and is listed in
+  `attention.held_queues`. Queue list/cancel go over the app's `/ws` RPC (`getThreadProjection`,
+  `queued-run.cancel`) with the control token. Counted in `deliver.superseded`/`supersedes`.
+  Each tick stamps `pump:heartbeat` in `control` (with `superseded`); `attention.pump.stale` flags a pump
+  silent for 5 min.
 - `cli.mjs`: the CLI. JSON out; exit 1 with `error.code` on refusal, 2 on usage.
 - `scripts/coord`: wrapper for `~/.local/bin`. `scripts/com.ardud.coord-pump.plist`: the pump
   LaunchAgent (`coord pump` every 60 s).
