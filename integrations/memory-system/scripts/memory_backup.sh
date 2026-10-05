@@ -79,22 +79,22 @@ free_gb=$(df -g "$REPO_ROOT" | awk 'NR==2{print $4}')
 # "succeeded"). So record the live high-water mark of the append-only tables
 # *before* syncing and require the replica to reach it afterwards; retry once,
 # then fail loudly.
-hwm_sql() { # db -> query returning the append-only high-water mark ("" = none)
+hwm_sql() { # replica name -> query returning the append-only high-water mark ("" = none)
   case "$1" in
     memory.db) echo "SELECT coalesce(max(id),0) FROM episodic_events" ;;
     opencode_raw.db) echo "SELECT coalesce(max(rowid),0) FROM raw_messages" ;;
     *) echo "" ;;
   esac
 }
-for db in memory.db opencode_raw.db consolidation.db fact_vectors.db; do
-  [ -f "$DATA/$db" ] || continue
-  sql=$(hwm_sql "$db"); want=""
+replicate() { # live-path replica-name
+  local src="$1" db="$2" sql want="" out got attempt
+  sql=$(hwm_sql "$db")
   if [ -n "$sql" ]; then
-    want=$("$SQLITE" -readonly "$DATA/$db" "$sql" 2>&1)
+    want=$("$SQLITE" -readonly "$src" "$sql" 2>&1)
     [[ "$want" =~ ^[0-9]+$ ]] || fail replica "$db: cannot read live high-water mark: $want"
   fi
   for attempt in 1 2; do
-    out=$("$SQRSYNC" -v "$DATA/$db" "$STAGE/$db" 2>&1) || fail replica "$db: $out"
+    out=$("$SQRSYNC" -v "$src" "$STAGE/$db" 2>&1) || fail replica "$db: $out"
     log "replica $db try$attempt: $(printf '%s' "$out" | tail -1)"
     [ -z "$want" ] && break
     got=$("$SQLITE" -readonly "$STAGE/$db" "$sql" 2>&1)
@@ -102,25 +102,27 @@ for db in memory.db opencode_raw.db consolidation.db fact_vectors.db; do
     [ "$attempt" = 2 ] && fail replica "$db replica not updated by sqlite3_rsync: replica=$got live>=$want"
     log "replica $db behind after sync (replica=$got live>=$want), retrying"
   done
+}
+for db in memory.db opencode_raw.db consolidation.db fact_vectors.db; do
+  [ -f "$DATA/$db" ] && replicate "$DATA/$db" "$db"
 done
 "$SQLITE" "$DATA/agent_notes.db" ".backup '$STAGE/agent_notes.db'" 2>>"$LOG" || fail replica "agent_notes.db backup failed"
 # Robob's state DB holds the session board, schedules and the OpenCode import
 # map, which nothing else backs up. Optional: skipped until Robob is installed.
+# sqlite3_rsync, not .backup: the CLI's .backup restarts whenever Robob writes
+# between its 100-page steps, so on the busy multi-GB DB it ran for hours.
 ROBOB_DB="${ROBOB_STATE_DB:-$HOME/.robob/userdata/statev2.sqlite}"
-if [ -f "$ROBOB_DB" ]; then
-  "$SQLITE" -readonly "$ROBOB_DB" ".backup '$STAGE/robob-state.sqlite'" 2>>"$LOG" ||
-    fail replica "robob state backup failed: $ROBOB_DB"
-fi
-# sqlite3_rsync verifies page hashes itself; here we only confirm each replica
-# opens and has a schema (quick_check on the 70 GB memory.db takes too long).
+[ -f "$ROBOB_DB" ] && replicate "$ROBOB_DB" robob-state.sqlite
+# sqlite3_rsync verifies page hashes itself and replicate() already checked
+# each replica against the live high-water mark taken before its sync; here we
+# only confirm each replica opens and has a schema (quick_check on the 70 GB
+# memory.db takes too long). Don't compare against live again: rows inserted
+# after the sync can carry old timestamps (reprojection), so that races.
 for db in memory.db opencode_raw.db consolidation.db fact_vectors.db agent_notes.db robob-state.sqlite; do
   [ -f "$STAGE/$db" ] || continue
   q=$("$SQLITE" -readonly "$STAGE/$db" "SELECT count(*) > 0 FROM sqlite_master;" 2>&1 | head -1)
   [ "$q" = "1" ] || fail verify "$db replica unreadable: $q"
 done
-q=$("$SQLITE" -readonly "$STAGE/memory.db" "SELECT (SELECT max(id) FROM episodic_events) >= $(
-  "$SQLITE" -readonly "$DATA/memory.db" "SELECT max(id) FROM episodic_events WHERE timestamp < strftime('%s','now','-1 day')")" 2>&1)
-[ "$q" = "1" ] || fail verify "memory.db replica behind live: $q"
 mkdir -p "$STAGE/files"
 /opt/homebrew/bin/rsync -a --delete \
   --include='profile*' --include='*.md' --include='*.json' --include='*.txt' --exclude='*' \

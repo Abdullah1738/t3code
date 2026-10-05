@@ -60,4 +60,39 @@ if [ -x "$REAL_RSYNC" ]; then
     && pass "replica caught up" || fail "replica not caught up"
   rm -rf "$T"
 fi
+
+# 3. 2026-10-04 incident: a row inserted *after* the sync with an old timestamp
+# (sync_opencode_v2 reprojection keeps the message's original time) made the
+# post-sync "replica >= live max(id) older than a day" check fail with
+# "memory.db replica behind live: 0" on every run. A fresh-enough replica must pass.
+if [ -x "$REAL_RSYNC" ]; then
+  setup real
+  rm "$R/bin/sqlite3_rsync"
+  cat > "$R/bin/sqlite3_rsync" <<EOF
+#!/bin/bash
+"$REAL_RSYNC" "\$@" || exit \$?
+case "\${@: -1}" in */memory.db)
+  "$SQLITE" "$R/data/memory.db" "INSERT INTO episodic_events(timestamp) VALUES (\$(( \$(date +%s) - 2 * 86400 )))" ;;
+esac
+EOF
+  chmod +x "$R/bin/sqlite3_rsync"
+  run
+  [ "$(st)" = "restic False" ] && pass "late old-timestamp insert doesn't fail verify" \
+    || fail "late insert gave: $(st) $(cat "$R/logs/backup_last.json")"
+  rm -rf "$T"
+fi
+
+# 4. Robob state DB goes through sqlite3_rsync (the CLI .backup restarted on
+# every write and ran for hours on the live DB).
+if [ -x "$REAL_RSYNC" ]; then
+  setup real
+  "$SQLITE" "$T/robob.sqlite" "PRAGMA journal_mode=wal; CREATE TABLE t(x); INSERT INTO t VALUES (7);" >/dev/null
+  ROBOB_STATE_DB="$T/robob.sqlite" run
+  [ "$(st)" = "restic False" ] && pass "robob state replica passes verify" || fail "robob gave: $(st)"
+  [ "$("$SQLITE" -readonly "$T/stage/robob-state.sqlite" 'SELECT x FROM t')" = 7 ] \
+    && pass "robob state replicated" || fail "robob state replica missing"
+  grep -q "replica robob-state.sqlite try1" "$R"/logs/backup-*.log \
+    && pass "robob state used sqlite3_rsync" || fail "robob state not via sqlite3_rsync"
+  rm -rf "$T"
+fi
 exit $FAIL
