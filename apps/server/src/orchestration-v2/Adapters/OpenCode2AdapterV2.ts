@@ -301,9 +301,22 @@ interface SubagentCall {
   /** The tool returned while the subagent runs on; the report OpenCode gives its parent settles it. */
   background: boolean;
   child: ThreadState | undefined;
+  /** The child's inbox item carrying this call's prompt. */
+  inbox: string | undefined;
+  /** The child execution that took that prompt in, counted by `executions`. */
+  execution: number | undefined;
+  /** When OpenCode made the call, in its clock's milliseconds: its prompt reached the child later. */
+  launched: number | undefined;
   status: OrchestrationV2Subagent["status"];
   result: string | null;
   completedAt: DateTime.Utc | null;
+}
+
+/** A foreground `subagent` call a reconnect found ended, and how. */
+interface FinishedCall {
+  readonly call: SubagentCall;
+  readonly status: OrchestrationV2Subagent["status"];
+  readonly output: string;
 }
 
 /**
@@ -405,6 +418,13 @@ interface ThreadState {
    * inbox, where the next prompt would deliver them first, so it cancels them.
    */
   readonly strandedSteers: Set<string>;
+  /** How many executions this session started, which tells one apart from the next. */
+  executions: number;
+  /**
+   * The number of the execution the stream is in, or was in last. A reconnect
+   * can place the stream back in one it numbered earlier.
+   */
+  execution: number;
   /** T3's MCP server as registered for this thread, and the instructions entry sent with it. */
   mcp:
     | { readonly name: string; readonly directory: string; readonly credential: string }
@@ -665,6 +685,40 @@ const reportOutcome = (state: string | undefined) =>
 /** A subagent's answer, without the `<subagent …>` wrapper OpenCode gives the model. */
 const subagentOutput = (text: string) =>
   /^<subagent\b[^>]*>\n?([\s\S]*?)\n?<\/subagent>$/.exec(text.trim())?.[1] ?? text;
+
+const XML_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+};
+
+/**
+ * The description of the call a subagent report answers. OpenCode puts it on
+ * the report's `<subagent …>` wrapper; the payload may carry it too.
+ */
+const reportDescription = (payload: {
+  readonly text: string;
+  readonly description?: unknown;
+  readonly metadata?: Readonly<Record<string, unknown>> | undefined;
+}) => {
+  const direct =
+    stringField(payload.metadata, "description") ??
+    (typeof payload.description === "string" && payload.description.trim().length > 0
+      ? payload.description
+      : undefined);
+  if (direct !== undefined) return direct;
+  const quoted = /^<subagent\b[^>]*\bdescription="([^"]*)"/.exec(payload.text.trim())?.[1];
+  return quoted?.replace(/&(amp|lt|gt|quot|apos);/g, (_, name: string) => XML_ENTITIES[name] ?? _);
+};
+
+/** What OpenCode puts before a call's prompt when the call creates its subagent. */
+const SUBAGENT_PREAMBLE = "You are a subagent spawned by another session.\n";
+
+/** Whether a child prompt is the one a call sent, as a new subagent or a resumed one. */
+const isPromptOf = (call: SubagentCall, text: string) =>
+  call.prompt.length > 0 && (text === call.prompt || text === SUBAGENT_PREAMBLE + call.prompt);
 
 const isContinuation = (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) =>
   turnInput.message.createdBy === "agent" && turnInput.message.creationSource === "provider";
@@ -971,6 +1025,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       reports: new Map(),
       stoppedChildren: new Set(),
       strandedSteers: new Set(),
+      executions: 0,
+      execution: 0,
       mcp: undefined,
       instructions: undefined,
     });
@@ -1801,6 +1857,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         const call = state.subagent.call;
         if (!call.background && terminal.status !== "completed") {
           yield* settleCall(call, terminal.status);
+          yield* settleShared(call, terminal.status);
         }
         return;
       }
@@ -2205,6 +2262,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         model: null,
         background: false,
         child: undefined,
+        inbox: undefined,
+        execution: undefined,
+        launched: undefined,
         status: "running",
         result: null,
         completedAt: null,
@@ -2253,6 +2313,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             call.agent = stringField(input, "agent");
             call.model = stringField(input, "model") ?? call.model;
             call.background = input["background"] === true;
+            call.launched = event.created;
             return yield* emitSubagent(call);
           }
           const tool = turn.tools.get(event.data.id);
@@ -2272,7 +2333,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             if (childId !== undefined) yield* attachChild(call, childId);
             // A background call returns at launch; its report settles it.
             if (event.data.metadata?.["status"] === "running") return;
-            return yield* settleCall(call, "completed", subagentOutput(textOf(event.data.content)));
+            const output = subagentOutput(textOf(event.data.content));
+            yield* settleCall(call, "completed", output);
+            return yield* settleShared(call, "completed", output);
           }
           const output = textOf(event.data.content);
           yield* emitTool(state, turn, event.data.id, "completed", {
@@ -2287,11 +2350,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const call = state.calls.get(event.data.id);
           // A refused call (unknown agent, the nesting limit) is a failed subagent.
           if (call !== undefined) {
-            return yield* settleCall(
-              call,
-              aborted ? "interrupted" : "failed",
-              event.data.error.message,
-            );
+            const status = aborted ? "interrupted" : "failed";
+            yield* settleCall(call, status, event.data.error.message);
+            return yield* settleShared(call, status, event.data.error.message);
           }
           yield* emitTool(state, turn, event.data.id, aborted ? "interrupted" : "failed", {
             output: event.data.error.message,
@@ -2395,20 +2456,50 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       yield* offerWake(state, wake);
     });
 
+    /**
+     * A prompt sent to a subagent while it still runs is answered by that same
+     * execution, and OpenCode reports the execution once, or not at all when
+     * a foreground call took it. The end of one call's execution ends the
+     * background calls whose prompts that execution took in too.
+     */
+    const settleShared = Effect.fnUntraced(function* (
+      call: SubagentCall,
+      status: OrchestrationV2Subagent["status"],
+      output?: string,
+    ) {
+      if (call.child === undefined || call.execution === undefined) return;
+      const shared = [...call.state.calls.values()].filter(
+        (candidate) =>
+          candidate !== call &&
+          candidate.background &&
+          candidate.child === call.child &&
+          candidate.execution === call.execution,
+      );
+      for (const candidate of shared) yield* settleCall(candidate, status, output);
+    });
+
     /** A background subagent's end, as OpenCode queues it for its parent. */
     const onReport = Effect.fnUntraced(function* (
       state: ThreadState,
       inboxId: string,
       payload: {
         readonly text: string;
+        readonly description?: unknown;
         readonly metadata?: Readonly<Record<string, unknown>> | undefined;
       },
     ) {
       const childId = stringField(payload.metadata, "childID");
       if (stringField(payload.metadata, "source") !== "subagent" || childId === undefined) return;
-      const call = [...state.calls.values()].find(
-        (candidate) => candidate.child?.sessionId === childId,
+      const description = reportDescription(payload);
+      // A subagent called again runs in the same session, so several calls can
+      // name this child. Only a background call gets a report: the one whose
+      // description it carries, else the oldest still running.
+      const onChild = [...state.calls.values()].filter(
+        (candidate) => candidate.background && candidate.child?.sessionId === childId,
       );
+      const call =
+        onChild.find((candidate) => description !== undefined && candidate.title === description) ??
+        onChild[0];
       const outcome = reportOutcome(stringField(payload.metadata, "state"));
       state.reports.set(inboxId, {
         inboxId,
@@ -2416,23 +2507,22 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         text: payload.text,
         report: {
           kind: "subagent",
-          label: call?.title ?? stringField(payload.metadata, "description"),
+          label: call?.title ?? description,
           childThreadId: call?.child?.subagent?.appThread.id,
           outcome,
         },
       });
       if (call === undefined) return;
-      yield* settleCall(
-        call,
-        state.stoppedChildren.has(childId)
-          ? "interrupted"
-          : outcome === "failed"
-            ? "failed"
-            : outcome === "cancelled"
-              ? "cancelled"
-              : "completed",
-        subagentOutput(payload.text),
-      );
+      const status = state.stoppedChildren.has(childId)
+        ? ("interrupted" as const)
+        : outcome === "failed"
+          ? ("failed" as const)
+          : outcome === "cancelled"
+            ? ("cancelled" as const)
+            : ("completed" as const);
+      const output = subagentOutput(payload.text);
+      yield* settleCall(call, status, output);
+      yield* settleShared(call, status, output);
     });
 
     /**
@@ -2540,6 +2630,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         ended.unsettled = false;
         return;
       }
+      if (
+        event.type === "session.execution.started" ||
+        event.type === "unreadable.execution.started"
+      ) {
+        const state = threads.get(sessionId ?? "");
+        if (state !== undefined) state.execution = ++state.executions;
+      }
       // Marks where a running turn's own execution begins; it never ends one.
       // With no turn running it is a subagent's or a follow-up's start, below.
       if (event.type === "unreadable.execution.started") {
@@ -2613,6 +2710,23 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       ) {
         state.subagent.queued ??= event.data.inboxID;
       }
+      // A subagent's prompt, matched to the call that sent it.
+      const parent = state.subagent?.call.state;
+      if (
+        event.type === "session.inbox.enqueued" &&
+        event.data.item.type === "user" &&
+        parent !== undefined
+      ) {
+        const text = event.data.item.payload.text;
+        const matches = [...parent.calls.values()].filter(
+          (candidate) =>
+            candidate.child === state &&
+            candidate.inbox === undefined &&
+            isPromptOf(candidate, text),
+        );
+        // Two calls sending the same prompt cannot be told apart.
+        if (matches.length === 1) matches[0]!.inbox = event.data.inboxID;
+      }
       if (event.type === "session.inbox.enqueued" && event.data.item.type === "synthetic") {
         return yield* onReport(state, event.data.inboxID, event.data.item.payload);
       }
@@ -2620,6 +2734,18 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       // A steer of the running turn's is settled the same way.
       if (event.type === "session.inbox.cancelled" || event.type === "session.inbox.delivered") {
         state.reports.delete(event.data.inboxID);
+        // The execution that took this call's prompt in answers it. A prompt
+        // that starts an execution is delivered after that start. A reconnect
+        // may already have read the delivery back from the child's history,
+        // which places the stream in that execution, so the prompts it takes
+        // in next count into it too, whatever starts the stream repeated.
+        if (event.type === "session.inbox.delivered") {
+          for (const call of parent?.calls.values() ?? []) {
+            if (call.child !== state || call.inbox !== event.data.inboxID) continue;
+            if (call.execution === undefined) call.execution = state.execution;
+            else state.execution = call.execution;
+          }
+        }
         const turn = state.active;
         if (turn !== undefined && turn.steers.delete(event.data.inboxID)) {
           turn.settledInbox.add(event.data.inboxID);
@@ -2708,9 +2834,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
      * continuation.
      * Returns how that history says the turn's execution ended: the `idle` item
      * OpenCode appends after each one, or undefined when there is none after
-     * the turn's start.
+     * the turn's start. A foreground `subagent` call that ended in the gap
+     * goes into `finished`, for the background calls whose prompts its run
+     * also answered.
      */
-    const backfill = Effect.fnUntraced(function* (sessionId: string, state: ThreadState) {
+    const backfill = Effect.fnUntraced(function* (
+      sessionId: string,
+      state: ThreadState,
+      finished: Array<FinishedCall>,
+    ) {
       const turn = state.active;
       if (turn === undefined) return undefined;
       const promptId = promptOf(turn.providerTurn);
@@ -2758,13 +2890,19 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               call.model = stringField(fields, "model") ?? call.model;
               call.background = fields["background"] === true;
             }
+            call.launched ??= DateTime.toEpochMillis(part.time.created);
             const metadata = "metadata" in part.state ? part.state.metadata : undefined;
             const childId = stringField(metadata, "sessionID");
             if (childId !== undefined) yield* attachChild(call, childId);
             if (part.state.status === "completed" && metadata?.["status"] !== "running") {
-              yield* settleCall(call, "completed", subagentOutput(textOf(part.state.content)));
+              const output = subagentOutput(textOf(part.state.content));
+              yield* settleCall(call, "completed", output);
+              if (!call.background) finished.push({ call, status: "completed", output });
             } else if (part.state.status === "error") {
               yield* settleCall(call, "failed", part.state.error.message);
+              if (!call.background) {
+                finished.push({ call, status: "failed", output: part.state.error.message });
+              }
             } else {
               yield* emitSubagent(call);
             }
@@ -2796,6 +2934,97 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         }
       }
       return idle === undefined ? undefined : { outcome: idle.outcome };
+    });
+
+    /**
+     * Ties the calls sharing a child to the executions that took their prompts
+     * in, read back from the child's history, so one report (or a foreground
+     * call's end) settles a background call as it would have live, even when
+     * its prompt went in while the stream was down or before a backfill
+     * started the call. OpenCode appends an `idle` item after each execution,
+     * so the prompts between two of them are one execution's, and those after
+     * the last one are the running execution's. A prompt counts for a call
+     * only once the call was made, or by its inbox id when that is known.
+     * Then each foreground call in `finished` settles the background calls its
+     * run answered.
+     */
+    const recoverShared = Effect.fnUntraced(function* (
+      state: ThreadState,
+      finished: ReadonlyArray<FinishedCall>,
+      active: Readonly<Record<string, unknown>>,
+    ) {
+      const sessions = new Set(sessionsOf(state));
+      const ended = finished.filter(({ call }) => sessions.has(call.state));
+      const byChild = new Map<ThreadState, Array<SubagentCall>>();
+      for (const call of [...runningCalls(state), ...ended.map(({ call }) => call)]) {
+        if (call.child === undefined || call.prompt.length === 0) continue;
+        if (call.inbox === undefined && call.launched === undefined) continue;
+        byChild.set(call.child, [...(byChild.get(call.child) ?? []), call]);
+      }
+      for (const [child, all] of byChild) {
+        // Two calls sending the same prompt cannot be told apart by it, only
+        // by the inbox items they are known to have.
+        const calls = all.filter(
+          (call) =>
+            call.inbox !== undefined ||
+            all.every(
+              (other) =>
+                other === call || other.inbox !== undefined || other.prompt !== call.prompt,
+            ),
+        );
+        // Read back even for a single call that has its execution: the stream
+        // comes back in the child's latest one, which only its history tells,
+        // and a call made from now on may join it.
+        if (!calls.some((call) => !ended.some((end) => end.call === call))) continue;
+        // A stopped child's background calls end as interrupted, unless a
+        // foreground call's run answered them.
+        if (!(child.sessionId in active) && !ended.some(({ call }) => call.child === child)) {
+          continue;
+        }
+        // Executions back from the newest, each with the calls whose prompt it took in.
+        const runs: Array<Array<{ call: SubagentCall; id: string }>> = [[]];
+        const left = new Set(calls);
+        const since = () =>
+          Math.min(...[...left].map((call) => call.launched ?? Number.NEGATIVE_INFINITY));
+        yield* paginate(
+          { sessionID: Session.ID.make(child.sessionId), order: "desc" as const, limit: 50 },
+          client.message.list,
+        ).pipe(
+          Stream.takeWhile(
+            (message) => left.size > 0 && DateTime.toEpochMillis(message.time.created) >= since(),
+          ),
+          Stream.runForEach((message) =>
+            Effect.sync(() => {
+              if (message.type === "idle") runs.push([]);
+              if (message.type !== "user") return;
+              const id = String(message.id);
+              const created = DateTime.toEpochMillis(message.time.created);
+              const call =
+                [...left].find((candidate) => candidate.inbox === id) ??
+                [...left].find(
+                  (candidate) =>
+                    candidate.inbox === undefined &&
+                    candidate.launched! <= created &&
+                    isPromptOf(candidate, message.text),
+                );
+              if (call === undefined) return;
+              left.delete(call);
+              runs.at(-1)!.push({ call, id });
+            }),
+          ),
+        );
+        // Each execution gets a count of its own, oldest first, so the running
+        // one has the latest: prompts delivered into it from now on share it,
+        // and none that an earlier one took in.
+        for (const run of runs.toReversed()) {
+          child.execution = ++child.executions;
+          for (const { call, id } of run) {
+            call.inbox ??= id;
+            call.execution = child.execution;
+          }
+        }
+      }
+      for (const { call, status, output } of ended) yield* settleShared(call, status, output);
     });
 
     /**
@@ -2835,12 +3064,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         );
       if (running.length === 0 && withBackground().length === 0 && busy.size === 0) return;
       const active = yield* client.session.active();
+      const finished: Array<FinishedCall> = [];
       // An execution that ended while the stream was down never said so.
       for (const sessionId of busy) if (!(sessionId in active)) busy.delete(sessionId);
       for (const [sessionId, state] of running) {
         const turn = state.active;
         if (turn === undefined) continue;
-        const ended = yield* backfill(sessionId, state);
+        const ended = yield* backfill(sessionId, state, finished);
         if (sessionId in active || state.active !== turn) continue;
         yield* finishTurn(
           state,
@@ -2860,6 +3090,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       }
       // Read after the backfill, which can start background calls made in the gap.
       for (const state of withBackground()) {
+        // A run a foreground call shared already answered its background calls.
+        yield* recoverShared(state, finished, active);
         // A subagent still running keeps its call; its end arrives on the new stream.
         for (const call of runningCalls(state)) {
           const child = call.child?.sessionId;
@@ -2922,8 +3154,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       client = next.client;
       currentScope = scope;
       yield* Scope.close(previous, Exit.void);
-      // A restarted server forgot T3's MCP servers; the next turn adds them again.
-      for (const state of threads.values()) state.mcp = undefined;
+      // A restarted server forgot T3's MCP servers; the next turn adds them
+      // again. Executions may have ended and started unseen, so a prompt
+      // delivered from now on is never counted into one from before.
+      for (const state of threads.values()) {
+        state.mcp = undefined;
+        state.execution = ++state.executions;
+      }
       yield* lock.withPermit(reconcile).pipe(Effect.timeout(RECONCILE_TIMEOUT));
       return stream;
     }).pipe(Effect.retry(RECONNECT_SCHEDULE));

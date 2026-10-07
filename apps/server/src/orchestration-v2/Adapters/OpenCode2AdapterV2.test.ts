@@ -881,6 +881,668 @@ describe("OpenCode2 adapter", () => {
     }).pipe(Effect.scoped),
   );
 
+  /** Another call in the same turn that resumes `child`, by default a background one. */
+  const backgroundResume = (
+    child: string,
+    { id = "call-again", description = "Again", prompt = "again", background = true } = {},
+  ): ReadonlyArray<ProviderReplayEntry> => {
+    const tool = { sessionID: SESSION, assistantMessageID: "msg_assistant", id };
+    return [
+      event("session.tool.input.started", { ...tool, name: "subagent" }),
+      event("session.tool.called", {
+        ...tool,
+        name: "subagent",
+        input: { description, prompt, background, sessionID: child },
+        executed: false,
+      }),
+      event("session.tool.progress", {
+        ...tool,
+        metadata: background ? { sessionID: child, status: "running" } : { sessionID: child },
+      }),
+      // The child was announced for the first call, so its rules are written again.
+      out("session.update", { sessionID: child, permissions: "<any>" }),
+      reply("session.update", null),
+    ];
+  };
+  /** A subagent's report queued for the parent, and named only in its text. */
+  const childReport = (inboxID: string, child: string, description: string) =>
+    event("session.inbox.enqueued", {
+      inboxID,
+      sessionID: SESSION,
+      item: {
+        type: "synthetic",
+        payload: {
+          text: `<subagent sessionID="${child}" state="completed" description="${description}">\nOK\n</subagent>`,
+          metadata: { source: "subagent", childID: child, agent: "General", state: "completed" },
+        },
+        delivery: "steer",
+      },
+    });
+  /** A child prompt OpenCode queues for one call. */
+  const childPrompt = (inboxID: string, child: string, text: string) =>
+    event("session.inbox.enqueued", {
+      inboxID,
+      sessionID: child,
+      item: { type: "user", payload: { text }, delivery: "steer" },
+    });
+  /**
+   * Reported after every event the test cares about: the session moves to
+   * another model, which the adapter announces.
+   */
+  const lastEvent = event("session.model.selected", {
+    sessionID: SESSION,
+    model: { id: "gpt-5", providerID: "openai", variant: "default" },
+  });
+  /** Records each subagent's latest status by its title, and the last event's arrival. */
+  const watchSubagents = (runtime: ProviderAdapterV2SessionRuntime) =>
+    Effect.gen(function* () {
+      const status = new Map<string, string>();
+      const done = { current: false };
+      let wake = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.tap((event) =>
+          Effect.gen(function* () {
+            if (event.type === "subagent.updated") {
+              status.set(event.subagent.title ?? "", event.subagent.status);
+            }
+            if (
+              event.type === "provider_thread.updated" &&
+              event.providerThread.nativeThreadRef?.nativeId === SESSION &&
+              event.providerThread.nativeMetadata?.modelSelection?.model === "openai/gpt-5"
+            ) {
+              done.current = true;
+            }
+            yield* Deferred.succeed(wake, undefined);
+          }),
+        ),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      const until = (check: () => boolean): Effect.Effect<void> =>
+        Effect.suspend(() => {
+          if (check()) return Effect.void;
+          return Effect.gen(function* () {
+            wake = yield* Deferred.make<void>();
+            if (check()) return;
+            yield* Deferred.await(wake);
+            yield* until(check);
+          });
+        });
+      return { status, until, done: () => done.current };
+    });
+
+  it.effect("settles the background subagent a report names when calls share a child", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        ...backgroundResume(CHILD),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        // The resumed call's report comes first and names only that call.
+        childReport("msg_report_again", CHILD, "Again"),
+        event("session.usage.updated", { sessionID: SESSION }),
+        event("session.inbox.delivered", { sessionID: SESSION, inboxID: "msg_report_again" }),
+        childReport("msg_report_sleep", CHILD, "Sleep"),
+        event("session.inbox.delivered", { sessionID: SESSION, inboxID: "msg_report_sleep" }),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(() => watch.status.get("Again") === "completed");
+      assert.equal(watch.status.get("Sleep"), "running");
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("settles every background call answered by one run of their shared child", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        // The second call's prompt is steered into the child's running execution.
+        ...backgroundResume(CHILD),
+        childPrompt("msg_child_again", CHILD, "again"),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        // One execution answered both prompts, so only one report comes.
+        childReport("msg_report", CHILD, "Sleep"),
+        event("session.inbox.delivered", { sessionID: SESSION, inboxID: "msg_report" }),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "completed");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a background call whose prompt the shared child has not taken yet", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        // The second call names the child before the first prompt is delivered.
+        ...backgroundResume(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        // The second prompt is only queued once the first execution is over.
+        childPrompt("msg_child_again", CHILD, "again"),
+        childReport("msg_report", CHILD, "Sleep"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "running");
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("matches a shared child's prompt to the call that sent exactly that prompt", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        // Both calls name the child before either prompt is queued; one prompt ends the other.
+        ...backgroundResume(CHILD, { prompt: "go on" }),
+        // The rules written for the first resume already match, so none follow.
+        ...backgroundResume(CHILD, {
+          id: "call-third",
+          description: "Third",
+          prompt: "check, go on",
+        }).slice(0, -2),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        childPrompt("msg_child_third", CHILD, "check, go on"),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_third" }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        childReport("msg_report", CHILD, "Sleep"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Third"), "completed");
+      assert.equal(watch.status.get("Again"), "running");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a shared child's runs apart across a lost stream", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        ...backgroundResume(CHILD),
+        childPrompt("msg_child_again", CHILD, "again"),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        // The child's run ends and the next one starts while the stream is down.
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", { [CHILD]: { type: "running" } }),
+        // The child's running turn reads back what it missed.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", { data: [], cursor: {} }),
+        // Read again for the calls sharing the child, whose runs it tells apart.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_child_again", time: { created: 3 }, text: "again", type: "user" },
+            { id: "msg_child_idle", time: { created: 2 }, type: "idle", outcome: "succeeded" },
+            {
+              id: "msg_child_sleep",
+              time: { created: 1 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        out("permission.list", { sessionID: CHILD }),
+        replyData("permission.list", []),
+        out("session.form.list", { sessionID: CHILD }),
+        replyData("session.form.list", []),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        childReport("msg_report", CHILD, "Again"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Again"), "completed");
+      assert.equal(watch.status.get("Sleep"), "running");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a later prompt out of a run a reconnect read back", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        ...backgroundResume(CHILD),
+        childPrompt("msg_child_again", CHILD, "again"),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        // The child's run ends and another one starts while the stream is down.
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", { [CHILD]: { type: "running" } }),
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", { data: [], cursor: {} }),
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_child_other", time: { created: 3 }, text: "other", type: "user" },
+            { id: "msg_child_idle", time: { created: 2 }, type: "idle", outcome: "succeeded" },
+            {
+              id: "msg_child_sleep",
+              time: { created: 1 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        out("permission.list", { sessionID: CHILD }),
+        replyData("permission.list", []),
+        out("session.form.list", { sessionID: CHILD }),
+        replyData("session.form.list", []),
+        // The running execution takes the queued prompt in; the first run's report comes late.
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        childReport("msg_report", CHILD, "Sleep"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "running");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps the run a reconnect read back for a delivery the new stream repeats", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        ...backgroundResume(CHILD),
+        childPrompt("msg_child_again", CHILD, "again"),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", { [CHILD]: { type: "running" } }),
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", { data: [], cursor: {} }),
+        // The run took both prompts in and ended before the reconnect read it.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_child_idle", time: { created: 4 }, type: "idle", outcome: "succeeded" },
+            { id: "msg_child_again", time: { created: 3 }, text: "again", type: "user" },
+            {
+              id: "msg_child_sleep",
+              time: { created: 1 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        out("permission.list", { sessionID: CHILD }),
+        replyData("permission.list", []),
+        out("session.form.list", { sessionID: CHILD }),
+        replyData("session.form.list", []),
+        // The new stream still carries that run's end.
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        childReport("msg_report", CHILD, "Sleep"),
+        event("session.inbox.delivered", { sessionID: SESSION, inboxID: "msg_report" }),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "completed");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a run a reconnect read back whole when the new stream repeats its start", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        ...backgroundResume(CHILD),
+        childPrompt("msg_child_again", CHILD, "again"),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", { [CHILD]: { type: "running" } }),
+        // The child's run started and took the first prompt in before the reconnect read it.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            {
+              id: "msg_child_sleep",
+              time: { created: 1 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        out("permission.list", { sessionID: CHILD }),
+        replyData("permission.list", []),
+        out("session.form.list", { sessionID: CHILD }),
+        replyData("session.form.list", []),
+        // The new stream still carries that run's start, then the same run takes the second prompt.
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        childReport("msg_report", CHILD, "Sleep"),
+        event("session.inbox.delivered", { sessionID: SESSION, inboxID: "msg_report" }),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "completed");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a shared child's latest run apart across two lost streams", () => {
+    // The child ran the three prompts one execution each; the last still runs.
+    const childHistory = reply("message.list", {
+      data: [
+        { id: "msg_child_third", time: { created: 6 }, text: "third", type: "user" },
+        { id: "msg_child_end_again", time: { created: 5 }, type: "idle", outcome: "succeeded" },
+        { id: "msg_child_again", time: { created: 4 }, text: "again", type: "user" },
+        { id: "msg_child_end_sleep", time: { created: 3 }, type: "idle", outcome: "succeeded" },
+        {
+          id: "msg_child_sleep",
+          time: { created: 1 },
+          text: "You are a subagent spawned by another session.\nsleep",
+          type: "user",
+        },
+      ],
+      cursor: {},
+    });
+    const reconnect = [
+      { type: "runtime_exit", status: "success" } as const,
+      out("event.subscribe"),
+      out("session.active"),
+      replyData("session.active", { [SESSION]: { type: "running" }, [CHILD]: { type: "running" } }),
+      out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+      reply("message.list", { data: [], cursor: {} }),
+      out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+      childHistory,
+      ...noRequests(SESSION),
+      ...noRequests(CHILD),
+    ];
+    return Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        ...backgroundResume(CHILD),
+        childPrompt("msg_child_again", CHILD, "again"),
+        ...backgroundResume(CHILD, {
+          id: "call-third",
+          description: "Third",
+          prompt: "third",
+        }).slice(0, -2),
+        childPrompt("msg_child_third", CHILD, "third"),
+        ...reconnect,
+        // The new stream repeats the first run's delivery, then drops again.
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        ...reconnect,
+        // A call made now sends its prompt into the child's running execution.
+        ...backgroundResume(CHILD, {
+          id: "call-fourth",
+          description: "Fourth",
+          prompt: "fourth",
+        }).slice(0, -2),
+        childPrompt("msg_child_fourth", CHILD, "fourth"),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_fourth" }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        childReport("msg_report", CHILD, "Third"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Third"), "completed");
+      assert.equal(watch.status.get("Fourth"), "completed");
+    }).pipe(Effect.scoped);
+  });
+
+  it.effect("lets a call made after a reconnect join its child's run that kept going", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", {
+          [SESSION]: { type: "running" },
+          [CHILD]: { type: "running" },
+        }),
+        // The running turns are read back, then the child's run that kept going through the gap.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", { data: [], cursor: {} }),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        reply("message.list", { data: [], cursor: {} }),
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            {
+              id: "msg_child_sleep",
+              time: { created: 1 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        ...noRequests(SESSION),
+        ...noRequests(CHILD),
+        // A call made now sends its prompt into that run.
+        ...backgroundResume(CHILD),
+        childPrompt("msg_child_again", CHILD, "again"),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        childReport("msg_report", CHILD, "Sleep"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "completed");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps calls sending the same prompt in their run across a reconnect", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        // A second call sends the same prompt, a third another, into the same run.
+        ...backgroundResume(CHILD, { prompt: "sleep" }),
+        childPrompt("msg_child_again", CHILD, "sleep"),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        ...backgroundResume(CHILD, {
+          id: "call-third",
+          description: "Third",
+          prompt: "third",
+        }).slice(0, -2),
+        childPrompt("msg_child_third", CHILD, "third"),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_third" }),
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", {
+          [SESSION]: { type: "running" },
+          [CHILD]: { type: "running" },
+        }),
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", { data: [], cursor: {} }),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        reply("message.list", { data: [], cursor: {} }),
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_child_third", time: { created: 4 }, text: "third", type: "user" },
+            { id: "msg_child_again", time: { created: 3 }, text: "sleep", type: "user" },
+            {
+              id: "msg_child_sleep",
+              time: { created: 1 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        ...noRequests(SESSION),
+        ...noRequests(CHILD),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        childReport("msg_report", CHILD, "Sleep"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "completed");
+      assert.equal(watch.status.get("Third"), "completed");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("fails a background call when the foreground call sharing its run fails", () =>
+    Effect.gen(function* () {
+      const tool = { sessionID: SESSION, assistantMessageID: "msg_assistant", id: "call-again" };
+      const { runtime, thread } = yield* resumed([
+        ...backgroundLaunch(CHILD),
+        childPrompt(
+          "msg_child_sleep",
+          CHILD,
+          "You are a subagent spawned by another session.\nsleep",
+        ),
+        event("session.execution.started", { sessionID: CHILD }),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_sleep" }),
+        // A foreground call resumes the child while it still runs.
+        event("session.tool.input.started", { ...tool, name: "subagent" }),
+        event("session.tool.called", {
+          ...tool,
+          name: "subagent",
+          input: { description: "Again", prompt: "again", sessionID: CHILD },
+          executed: false,
+        }),
+        event("session.tool.progress", { ...tool, metadata: { sessionID: CHILD } }),
+        out("session.update", { sessionID: CHILD, permissions: "<any>" }),
+        reply("session.update", null),
+        childPrompt("msg_child_again", CHILD, "again"),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        // The run fails; the foreground call reports it and no report follows.
+        event("session.execution.failed", {
+          sessionID: CHILD,
+          error: { type: "unknown", message: "boom" },
+        }),
+        // `session.tool.failed` is at version 2 of its durable schema.
+        {
+          type: "emit_inbound",
+          frame: {
+            type: "sdk.event",
+            event: {
+              id: "evt_sessiontoolfailed0001",
+              created: 1,
+              type: "session.tool.failed",
+              data: { ...tool, error: { type: "unknown", message: "boom" }, executed: true },
+              durable: { aggregateID: SESSION, seq: 1, version: 2 },
+            },
+          },
+        },
+        event("session.execution.succeeded", { sessionID: SESSION }),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Again"), "failed");
+      assert.equal(watch.status.get("Sleep"), "failed");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("leaves no background work pending once a reconnect finds its subagent gone", () =>
     Effect.gen(function* () {
       // The subagent ends while the stream is down: its end, its report and
@@ -2799,6 +3461,9 @@ describe("OpenCode2 adapter", () => {
         // The child was announced in the gap, so it gets the thread's rules.
         out("session.update", { sessionID: CHILD, permissions: "<any>" }),
         reply("session.update", null),
+        // The still-running child's history tells which run its call is in.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", { data: [], cursor: {} }),
         // The still-running child is read back for requests asked in the gap.
         out("permission.list", { sessionID: CHILD }),
         replyData("permission.list", []),
@@ -2820,6 +3485,363 @@ describe("OpenCode2 adapter", () => {
       );
       assert.deepInclude(collected.at(-1), { type: "turn.terminal", status: "completed" });
       assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "settles background calls launched while the stream was down with their shared run",
+    () =>
+      Effect.gen(function* () {
+        const CHILD = "ses_f1485c529ffea4URrYruwEg0Ja";
+        const call = (id: string, description: string, prompt: string) => ({
+          type: "tool",
+          id,
+          name: "subagent",
+          executed: true,
+          state: {
+            status: "completed",
+            input: { description, prompt, background: true },
+            content: [{ type: "text", text: "The subagent is working in the background." }],
+            metadata: { sessionID: CHILD, status: "running" },
+          },
+          time: { created: 2, ran: 2, completed: 2 },
+        });
+        const { runtime, thread } = yield* resumed([
+          out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+          promptAccepted,
+          { type: "runtime_exit", status: "success" } as const,
+          out("event.subscribe"),
+          out("session.active"),
+          replyData("session.active", { [CHILD]: { type: "running" } }),
+          out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+          reply("message.list", {
+            data: [
+              { id: "msg_idle_gap", time: { created: 3 }, type: "idle", outcome: "succeeded" },
+              {
+                id: "msg_assistant_gap",
+                time: { created: 2 },
+                type: "assistant",
+                agent: "build",
+                model: { id: "big-pickle", providerID: "opencode", variant: "default" },
+                content: [
+                  call("call_gap_sleep", "Sleep", "sleep"),
+                  call("call_gap_again", "Again", "again"),
+                ],
+                finish: "stop",
+              },
+              { id: PROMPT_ID, time: { created: 1 }, text: "hi", type: "user" },
+            ],
+            cursor: {},
+          }),
+          out("session.update", { sessionID: CHILD, permissions: "<any>" }),
+          reply("session.update", null),
+          // The child's running execution took both prompts in.
+          out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+          reply("message.list", {
+            data: [
+              { id: "msg_child_again", time: { created: 3 }, text: "again", type: "user" },
+              {
+                id: "msg_child_sleep",
+                time: { created: 2 },
+                text: "You are a subagent spawned by another session.\nsleep",
+                type: "user",
+              },
+              { id: "msg_child_idle", time: { created: 1 }, type: "idle", outcome: "succeeded" },
+            ],
+            cursor: {},
+          }),
+          out("permission.list", { sessionID: CHILD }),
+          replyData("permission.list", []),
+          out("session.form.list", { sessionID: CHILD }),
+          replyData("session.form.list", []),
+          event("session.execution.succeeded", { sessionID: CHILD }),
+          // One execution answered both prompts, so only one report comes.
+          childReport("msg_report", CHILD, "Sleep"),
+          event("session.inbox.delivered", { sessionID: SESSION, inboxID: "msg_report" }),
+          lastEvent,
+        ]);
+        const watch = yield* watchSubagents(runtime);
+        yield* runtime.startTurn(withLineage(thread));
+        yield* watch.until(watch.done);
+        assert.equal(watch.status.get("Sleep"), "completed");
+        assert.equal(watch.status.get("Again"), "completed");
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+      }).pipe(Effect.scoped),
+  );
+
+  /** A `subagent` call on `CHILD` made while the stream was down, as the parent's history holds it. */
+  const gapCall = (
+    id: string,
+    description: string,
+    prompt: string,
+    background: boolean,
+    created = 2,
+  ) => ({
+    type: "tool",
+    id,
+    name: "subagent",
+    executed: true,
+    state: background
+      ? {
+          status: "completed",
+          input: { description, prompt, background },
+          content: [{ type: "text", text: "The subagent is working in the background." }],
+          metadata: { sessionID: CHILD, status: "running" },
+        }
+      : { status: "running", input: { description, prompt }, metadata: { sessionID: CHILD } },
+    time: { created, ran: created },
+  });
+  /** The parent's history after the gap: its prompt, then the calls it made. */
+  const gapHistory = (calls: ReadonlyArray<unknown>, ended: boolean) =>
+    reply("message.list", {
+      data: [
+        ...(ended
+          ? [{ id: "msg_idle_gap", time: { created: 3 }, type: "idle", outcome: "succeeded" }]
+          : []),
+        {
+          id: "msg_assistant_gap",
+          time: { created: 2 },
+          type: "assistant",
+          agent: "build",
+          model: { id: "big-pickle", providerID: "opencode", variant: "default" },
+          content: calls,
+          ...(ended ? { finish: "stop" } : {}),
+        },
+        { id: PROMPT_ID, time: { created: 1 }, text: "hi", type: "user" },
+      ],
+      cursor: {},
+    });
+  const noRequests = (sessionID: string) => [
+    out("permission.list", { sessionID }),
+    replyData("permission.list", []),
+    out("session.form.list", { sessionID }),
+    replyData("session.form.list", []),
+  ];
+
+  it.effect("settles background calls whose shared run ended while a reconnect read it", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", { [CHILD]: { type: "running" } }),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        gapHistory(
+          [
+            gapCall("call_gap_sleep", "Sleep", "sleep", true),
+            gapCall("call_gap_again", "Again", "again", true),
+          ],
+          true,
+        ),
+        out("session.update", { sessionID: CHILD, permissions: "<any>" }),
+        reply("session.update", null),
+        // The child's run ended after `session.active` listed it running.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_child_end", time: { created: 4 }, type: "idle", outcome: "succeeded" },
+            { id: "msg_child_again", time: { created: 3 }, text: "again", type: "user" },
+            {
+              id: "msg_child_sleep",
+              time: { created: 2 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        ...noRequests(CHILD),
+        childReport("msg_report", CHILD, "Sleep"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "completed");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("settles a background call with the foreground call sharing its run after a gap", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", {
+          [SESSION]: { type: "running" },
+          [CHILD]: { type: "running" },
+        }),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        gapHistory(
+          [
+            gapCall("call_gap_sleep", "Sleep", "sleep", true),
+            gapCall("call_gap_ask", "Ask", "ask", false),
+          ],
+          false,
+        ),
+        out("session.update", { sessionID: CHILD, permissions: "<any>" }),
+        reply("session.update", null),
+        // The child's running execution took both prompts in.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_child_ask", time: { created: 3 }, text: "ask", type: "user" },
+            {
+              id: "msg_child_sleep",
+              time: { created: 2 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        ...noRequests(SESSION),
+        ...noRequests(CHILD),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        // The foreground call returns the run's answer; no report follows.
+        {
+          type: "emit_inbound",
+          frame: {
+            type: "sdk.event",
+            event: {
+              id: "evt_sessiontoolsuccess0001",
+              created: 1,
+              type: "session.tool.success",
+              data: {
+                sessionID: SESSION,
+                assistantMessageID: "msg_assistant_gap",
+                id: "call_gap_ask",
+                content: [
+                  { type: "text", text: `<subagent sessionID="${CHILD}">\nOK\n</subagent>` },
+                ],
+                metadata: { sessionID: CHILD, status: "completed" },
+                executed: true,
+              },
+              durable: { aggregateID: SESSION, seq: 1, version: 2 },
+            },
+          },
+        },
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Ask"), "completed");
+      assert.equal(watch.status.get("Sleep"), "completed");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("settles a background call with a foreground call that ended in a gap", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", {}),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        gapHistory(
+          [
+            gapCall("call_gap_sleep", "Sleep", "sleep", true),
+            {
+              type: "tool",
+              id: "call_gap_ask",
+              name: "subagent",
+              executed: true,
+              state: {
+                status: "completed",
+                input: { description: "Ask", prompt: "ask" },
+                content: [
+                  { type: "text", text: `<subagent sessionID="${CHILD}">\nOK\n</subagent>` },
+                ],
+                metadata: { sessionID: CHILD, status: "completed" },
+              },
+              time: { created: 2, ran: 2, completed: 5 },
+            },
+          ],
+          true,
+        ),
+        out("session.update", { sessionID: CHILD, permissions: "<any>" }),
+        reply("session.update", null),
+        // One run of the child answered both, and ended; no report follows.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_child_end", time: { created: 4 }, type: "idle", outcome: "succeeded" },
+            { id: "msg_child_ask", time: { created: 3 }, text: "ask", type: "user" },
+            {
+              id: "msg_child_sleep",
+              time: { created: 2 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+          ],
+          cursor: {},
+        }),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Ask"), "completed");
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("ties a call recovered after a gap only to a prompt sent after it", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", { [CHILD]: { type: "running" } }),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        gapHistory(
+          [
+            gapCall("call_gap_sleep", "Sleep", "sleep", true),
+            gapCall("call_gap_again", "Again", "again", true, 4),
+          ],
+          true,
+        ),
+        out("session.update", { sessionID: CHILD, permissions: "<any>" }),
+        reply("session.update", null),
+        // An earlier call sent the same prompt before Again was made; Again's is still queued.
+        out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            { id: "msg_child_earlier", time: { created: 3 }, text: "again", type: "user" },
+            {
+              id: "msg_child_sleep",
+              time: { created: 2 },
+              text: "You are a subagent spawned by another session.\nsleep",
+              type: "user",
+            },
+            { id: "msg_child_idle", time: { created: 1 }, type: "idle", outcome: "succeeded" },
+          ],
+          cursor: {},
+        }),
+        ...noRequests(CHILD),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        event("session.execution.started", { sessionID: CHILD }),
+        childPrompt("msg_child_again", CHILD, "again"),
+        event("session.inbox.delivered", { sessionID: CHILD, inboxID: "msg_child_again" }),
+        childReport("msg_report", CHILD, "Sleep"),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "completed");
+      assert.equal(watch.status.get("Again"), "running");
     }).pipe(Effect.scoped),
   );
 
