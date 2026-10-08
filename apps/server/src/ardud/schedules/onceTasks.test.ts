@@ -6,13 +6,14 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
-import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ScheduledTaskService from "../../scheduledTasks/ScheduledTaskService.ts";
 import * as Scheduler from "../../scheduling/Scheduler.ts";
+import * as SecretRequests from "../../secrets/SecretRequests.ts";
 
 const decodeUpsertInput = Schema.decodeUnknownEffect(ScheduledTaskUpsertInput);
 
@@ -49,6 +50,7 @@ const withService = <A, E>(
             Layer.mock(ThreadManagementService.ThreadManagementService)({}),
             NodeCrypto.layer,
             Scheduler.layer,
+            Layer.mock(SecretRequests.SecretRequests)({}),
           ),
         ),
       );
@@ -90,7 +92,7 @@ it.effect("fires a once task when due, then disables it and keeps the record", (
         assert.include(refused.message, "in the past");
       }),
     );
-  }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
 );
 
 it.effect("rejects creating an enabled once task in the past, but allows a disabled one", () =>
@@ -109,7 +111,7 @@ it.effect("rejects creating an enabled once task in the past, but allows a disab
         assert.equal((yield* service.upsert(disabled)).task.enabled, false);
       }),
     );
-  }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
 );
 
 const seedOnceRow = (dueIso: string) =>
@@ -155,7 +157,7 @@ it.effect("fires a once task missed by less than an hour when the server comes b
         assert.equal(task?.lastRunStatus, "succeeded");
       }),
     );
-  }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
 );
 
 it.effect("marks a once task missed by more than an hour instead of firing it", () =>
@@ -176,5 +178,5 @@ it.effect("marks a once task missed by more than an hour instead of firing it", 
         assert.include(task?.lastRunError ?? "", "Missed");
       }),
     );
-  }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
 );

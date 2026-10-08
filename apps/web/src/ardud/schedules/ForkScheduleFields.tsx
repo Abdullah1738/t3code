@@ -54,7 +54,8 @@ export function ForkScheduleFields(props: {
           <Label htmlFor="scheduled-task-cron">Cron</Label>
           <Input
             id="scheduled-task-cron"
-            className="w-48 font-mono"
+            className="w-48"
+            font="mono"
             value={draft.cronExpression}
             placeholder="0 9 * * 1-5"
             spellCheck={false}

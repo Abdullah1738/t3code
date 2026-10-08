@@ -32,17 +32,17 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { issueAttachmentUploadUrl } from "../../assets/AttachmentUpload.ts";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
-import * as OrchestrationEventStore from "../../persistence/Services/OrchestrationEventStore.ts";
+import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
 import { userFacingDispatchErrorMessage } from "../../orchestration-v2/UserFacingErrors.ts";
 import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
-import * as ProviderRegistry from "../../provider/Services/ProviderRegistry.ts";
+import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
@@ -1243,7 +1243,7 @@ const makeRoutes = Effect.gen(function* () {
     effect: Effect.Effect<HttpServerResponse.HttpServerResponse, ControlError, R>,
   ) =>
     effect.pipe(
-      Effect.catchTag("ControlError", (error) => Effect.succeed(errorResponse(error))),
+      Effect.catchTags({ ControlError: (error) => Effect.succeed(errorResponse(error)) }),
       Effect.catchCause((cause) =>
         Effect.logWarning("ardud control request failed", { cause }).pipe(
           Effect.as(errorResponse(fail("internal", "Internal error."))),

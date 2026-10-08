@@ -15,8 +15,8 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as References from "effect/References";
 import * as Schema from "effect/Schema";
-import { Command, Flag, GlobalFlag } from "effect/unstable/cli";
-import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
+import { Command, Flag, GlobalFlag } from "effect/cli";
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "../../cli/config.ts";
@@ -145,7 +145,7 @@ export const importOpenChamberSchedulesCommand = Command.make("import-openchambe
         );
       }).pipe(
         Effect.provide(
-          EnvironmentAuth.runtimeLayer.pipe(
+          EnvironmentAuth.layerRuntime.pipe(
             Layer.provideMerge(FetchHttpClient.layer),
             Layer.provide(ServerConfig.layer(config)),
             Layer.provide(Layer.succeed(References.MinimumLogLevel, config.logLevel)),
