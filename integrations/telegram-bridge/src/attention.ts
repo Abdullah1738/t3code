@@ -9,12 +9,7 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 // OpenCode 2 session titles are optional until generated.
 const label = (title: string | undefined) => (title ?? "").replace(/\p{Cc}/gu, " ").replace(/\s+/g, " ").trim().slice(0, 180) || "Session";
 const ATTENTION_DELAY = 5_000;
-// Review notices debounce much longer: a goal-mode continuation bumps the
-// session's workRevision, which cancels the pending notice and restarts the
-// clock on the next settle, so only work that stays settled is announced.
-const REVIEW_DEBOUNCE = 60_000;
 const AUTO_ACCEPT_GRACE = 15_000;
-type Baseline = Record<string, { state: BoardEntry["state"] | "unknown"; workRevision: number }>;
 type Selection = Record<string, number[]>;
 /** Durable progress of a multi-question prompt asked one question at a time. */
 type Sequence = { answers: string[][]; selected: number[]; text?: string };
@@ -32,7 +27,7 @@ export type AttentionOptions = {
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-/** Observes the server-owned board and owns every alert delivery. Never owns review state. */
+/** Observes the server-owned board and owns every alert delivery. Never announces settled sessions. */
 export class Attention {
   private ticking?: Promise<void>;
   private epoch = 0;
@@ -40,7 +35,6 @@ export class Attention {
   private readonly sessionEpochs = new Map<string, number>();
   private wakeTimer?: ReturnType<typeof setTimeout>;
   private readonly activeSessions = new Set<string>();
-  private readonly settledSessions = new Set<string>();
   /** Session to directory, learned from located events; execution events carry none. */
   private readonly sessionDirectories = new Map<string, string>();
   private stopped = false;
@@ -67,7 +61,6 @@ export class Attention {
     if (this.wakeTimer) clearTimeout(this.wakeTimer);
     this.wakeTimer = undefined;
     this.activeSessions.clear();
-    this.settledSessions.clear();
     this.sessionEpochs.clear();
     this.boardEntries.clear();
     this.sessionDirectories.clear();
@@ -133,12 +126,8 @@ export class Attention {
     }
     if (event.type === "status") {
       const status = event.status;
-      if (status === "busy") {
-        this.activeSessions.add(sessionKey);
-        this.settledSessions.delete(sessionKey);
-      } else {
-        if (this.activeSessions.delete(sessionKey)) this.settledSessions.add(sessionKey);
-      }
+      if (status === "busy") this.activeSessions.add(sessionKey);
+      else this.activeSessions.delete(sessionKey);
       this.wake();
       return;
     }
@@ -231,6 +220,7 @@ export class Attention {
     const board = await this.backend.sessionBoard().catch(() => undefined);
     if (epoch !== this.epoch || this.stopped) return;
     if (board?.migrationComplete) this.observeBoard(board, boardVersions);
+    // Settled sessions are not announced: agents use `notify` when they need the owner.
     const directories = new Set((board?.entries ?? [])
       .filter(entry => entry.attention || entry.state === "running")
       .map(entry => entry.directory));
@@ -257,10 +247,8 @@ export class Attention {
       try {
         const op = this.store.getOperation(notice.id);
         if (op?.state === "sent") { this.store.saveSessionNotice({ ...notice, state: "sent" }); continue; }
-        const identity = `${notice.directory}\0${notice.sessionId}`;
-        const sessionEpoch = this.sessionEpochs.get(identity);
-        if (notice.kind === "review" && boardVersions.get(identity) !== sessionEpoch) continue;
-        const result = await this.check(notice, board, parents);
+        const sessionEpoch = this.sessionEpochs.get(`${notice.directory}\0${notice.sessionId}`);
+        const result = await this.check(notice, parents);
         if (epoch !== this.epoch || this.stopped) return;
         if (sessionEpoch !== this.sessionEpochs.get(`${notice.directory}\0${notice.sessionId}`)) continue;
         if (result === "cancel") { this.cancel(notice); continue; }
@@ -279,37 +267,14 @@ export class Attention {
     }).immediate();
   }
 
+  /** Stops polling sessions the board shows as settled; a snapshot older than a newer event never wins. */
   private observeBoard(board: BoardSnapshot, versions: ReadonlyMap<string, number>): void {
-    const baselineKey = `session-notification-baseline:${board.activatedAt}`;
-    const previous = this.store.get<Baseline>(baselineKey);
-    const baselineEstablished = previous !== undefined;
-    const revisions = previous ?? {};
-    // First activation baselines the old waiting backlog. Pending interactions
-    // are current work and are discovered even in that initial snapshot.
     for (const entry of board.entries) {
-      const identity = JSON.stringify([entry.directory, entry.sessionId]);
-      const before = previous?.[identity];
       const key = `${entry.directory}\0${entry.sessionId}`;
-      const live = (entry.state === "running" && (entry.status === "busy" || entry.status === "retry"))
-        || (entry.state === "waiting" && entry.status === "idle");
-      if (!live || versions.get(key) !== this.sessionEpochs.get(key)) {
-        // Disconnect snapshots cannot erase an observed running edge. The
-        // initial unknown backlog still needs a baseline so reconnecting alone
-        // does not announce historical work as a new completion.
-        if (!baselineEstablished) revisions[identity] = { state: "unknown", workRevision: entry.workRevision };
-        continue;
+      if (entry.state === "waiting" && entry.status === "idle" && versions.get(key) === this.sessionEpochs.get(key)) {
+        this.activeSessions.delete(key);
       }
-      if (entry.state === "waiting") this.activeSessions.delete(key);
-      if (entry.parentId) this.settledSessions.delete(key);
-      if (entry.state === "waiting" && !entry.parentId
-        && ((baselineEstablished && (before?.state === "running" || entry.workRevision > (before?.workRevision ?? -1)))
-          || this.settledSessions.has(`${entry.directory}\0${entry.sessionId}`))) {
-        this.remember(entry, "review");
-        this.settledSessions.delete(`${entry.directory}\0${entry.sessionId}`);
-      }
-      revisions[identity] = { state: entry.state, workRevision: entry.workRevision };
     }
-    this.store.set(baselineKey, revisions);
   }
 
   private async session(notice: SessionNotice): Promise<SessionRecord> {
@@ -351,28 +316,10 @@ export class Attention {
       : session.parentID ? `Subsession ${label(session.title)}` : label(session.title);
   }
 
-  private async check(notice: SessionNotice, board?: BoardSnapshot, parents?: Map<string, Promise<SessionRecord | undefined>>): Promise<"cancel" | "wait" | { text: string; keyboard?: KeyboardSpec; signature: string }> {
+  private async check(notice: SessionNotice, parents?: Map<string, Promise<SessionRecord | undefined>>): Promise<"cancel" | "wait" | { text: string; keyboard?: KeyboardSpec; signature: string }> {
     const age = Date.now() - notice.firstSeen;
-    const entry = board?.entries.find(row => row.sessionId === notice.sessionId && row.directory === notice.directory);
-    if (notice.kind === "review") {
-      if (!board?.migrationComplete) return "wait";
-      if (!entry || entry.workRevision !== notice.workRevision || entry.parentId) return "cancel";
-      if (entry.state === "backlog" || entry.state === "scheduled") return "cancel";
-      if (age < REVIEW_DEBOUNCE) return "wait";
-      if (entry.state !== "waiting" || entry.status !== "idle") return "wait";
-      const session = await this.session(notice);
-      if (session.parentID) return "cancel";
-      if (await this.imessageFamily(session, parents)) return "cancel";
-      const [statuses, questions, permissions] = await Promise.all([
-        this.backend.statuses(), this.backend.questions(notice.directory), this.backend.permissions(notice.directory),
-      ]);
-      if (!statuses || !questions || !permissions) return "wait";
-      // `/api/session/active` lists running sessions only; absent is idle.
-      if (statuses[notice.sessionId]) return "wait";
-      if (entry.attention) return "wait";
-      if ([...questions, ...permissions].some(request => request.sessionID === notice.sessionId)) return "wait";
-      return { text: `[${this.app}] ${label(session.title)} is ready for review. Please attend to it in ${this.backend.brand?.board ?? "Sessions"}.`, signature: "" };
-    }
+    // Ready-for-review notices were retired; withdraw any left in the store.
+    if (notice.kind === "review") return "cancel";
     if (age < ATTENTION_DELAY) return "wait";
     if (!notice.requestId) return "cancel";
     if (await this.routerOwns(notice.directory, notice.sessionId, notice.requestId)) return "wait";
@@ -471,8 +418,7 @@ export class Attention {
     const epoch = this.epoch;
     const sessionEpoch = this.sessionEpochs.get(`${notice.directory}\0${notice.sessionId}`);
     try {
-      const board = notice.kind === "review" ? await this.backend.sessionBoard() : undefined;
-      const result = await this.check(notice, board);
+      const result = await this.check(notice);
       if (epoch !== this.epoch || this.stopped || sessionEpoch !== this.sessionEpochs.get(`${notice.directory}\0${notice.sessionId}`)) return "wait";
       if (result === "cancel") this.cancel(notice);
       if (result === "cancel") return "cancel";

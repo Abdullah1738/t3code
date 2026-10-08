@@ -157,7 +157,7 @@ test("control events decode into attention events", async () => {
   ]);
 });
 
-test("a finished root thread gets one review notice; imessage threads never do", async () => {
+test("finished threads never get a review notice", async () => {
   setSystemTime(now);
   const control = fakeControl();
   control.add({ threadId: "work", title: "Fix the build", state: "running", latestRunId: "run:thread:work:ordinal:1" });
@@ -165,18 +165,13 @@ test("a finished root thread gets one review notice; imessage threads never do",
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();
   expect(store.pendingSessionNotices()).toEqual([]);
-  expect(store.get(`session-notification-baseline:${BOARD_ACTIVATED}`)).toBeDefined();
   control.threads.get("work")!.state = "waiting";
   control.threads.get("chat")!.state = "waiting";
   await alerts.tick();
-  const [notice] = store.pendingSessionNotices();
-  expect(store.pendingSessionNotices()).toHaveLength(1);
-  expect(notice).toMatchObject({ kind: "review", sessionId: "work", directory: "/repo", workRevision: 1 });
   setSystemTime(now + 61_000);
   await alerts.tick();
-  expect(store.pendingOutbox().map(item => item.text)).toEqual(["[Robob] Fix the build is ready for review. Please attend to it in the Board."]);
-  await alerts.tick();
-  expect(store.pendingOutbox()).toHaveLength(1);
+  expect(store.pendingSessionNotices()).toEqual([]);
+  expect(store.pendingOutbox()).toEqual([]);
 });
 
 test("a pending approval on a root thread becomes an approval prompt with buttons", async () => {

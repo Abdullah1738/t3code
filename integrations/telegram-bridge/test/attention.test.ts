@@ -676,33 +676,27 @@ test("tapping a request that vanished retires the prompt as no longer pending", 
   expect(h.store.sessionNotice(id)?.state).toBe("cancelled");
 });
 
-test("review notices announce settled sessions once and ignore subsessions", async () => {
+test("settled sessions are never announced, and leftover review notices are withdrawn", async () => {
   const h = setup();
   const entry = { sessionId: "ses_1", directory: "/Chats", title: "Deployment review", state: "waiting" as const,
     status: "idle", workRevision: 3, updatedAt: now };
-  h.backend.board = { version: 1, revision: 1, activatedAt: 1, migrationComplete: true, entries: [entry] };
+  h.backend.board = { version: 1, revision: 1, activatedAt: 1, migrationComplete: true, entries: [{ ...entry, state: "running" as const, status: "busy", workRevision: 2 }] };
+  await h.attention.tick();
+  h.attention.processEvent(statusEvent("busy"));
+  h.attention.processEvent(statusEvent("idle"));
+  h.backend.board = { version: 1, revision: 2, activatedAt: 1, migrationComplete: true, entries: [entry] };
+  setSystemTime(now + 61_000);
+  await h.attention.tick();
+  await h.attention.tick();
+  expect(h.store.pendingSessionNotices()).toEqual([]);
+  expect(h.store.pendingOutbox()).toEqual([]);
+  // A review notice stored by an older bridge is cancelled, never sent.
   const notice: SessionNotice = { id: sessionNoticeId("/Chats", "ses_1", "review", 3), kind: "review", sessionId: "ses_1",
     directory: "/Chats", workRevision: 3, firstSeen: now, state: "pending" };
   h.store.saveSessionNotice(notice);
-  setSystemTime(now + 30_000);
   await h.attention.tick();
   expect(h.store.getOperation(notice.id)).toBeUndefined();
-  setSystemTime(now + 61_000);
-  await h.attention.tick();
-  const op = h.store.getOperation(notice.id);
-  expect(op).toMatchObject({ kind: "notification" });
-  expect(op?.text).toBe("[OpenChamber] Deployment review is ready for review. Please attend to it in Sessions.");
-  expect(op?.keyboard).toBeUndefined();
-  // Busy sessions and changed work revisions are never announced.
-  const stale: SessionNotice = { ...notice, id: sessionNoticeId("/Chats", "ses_1", "review", 4), workRevision: 4 };
-  h.backend.board = { version: 1, revision: 2, activatedAt: 1, migrationComplete: true, entries: [
-    { ...entry, workRevision: 5, status: "busy" },
-  ] };
-  h.store.saveSessionNotice(stale);
-  setSystemTime(now + 122_000);
-  await h.attention.tick();
-  expect(h.store.getOperation(stale.id)).toBeUndefined();
-  expect(h.store.sessionNotice(stale.id)?.state).toBe("cancelled");
+  expect(h.store.sessionNotice(notice.id)?.state).toBe("cancelled");
 });
 
 test("iMessage conversations and their subagents never prompt on Telegram, even with the iMessage bridge down", async () => {
@@ -724,16 +718,6 @@ test("iMessage conversations and their subagents never prompt on Telegram, even 
     ["question", "q_1", "ses_1"], ["question", "q_sub", "ses_sub"]] as const) {
     expect(h.store.sessionNotice(sessionNoticeId("/Chats", sessionId, kind, id))?.state).toBe("cancelled");
   }
-  // A review notice already queued for one is withdrawn too.
-  const entry = { sessionId: "ses_1", directory: "/Chats", title: "Robob", state: "waiting" as const, status: "idle", workRevision: 3, updatedAt: now };
-  h.backend.board = { version: 1, revision: 1, activatedAt: 1, migrationComplete: true, entries: [entry] };
-  const review: SessionNotice = { id: sessionNoticeId("/Chats", "ses_1", "review", 3), kind: "review", sessionId: "ses_1",
-    directory: "/Chats", workRevision: 3, firstSeen: now, state: "pending" };
-  h.store.saveSessionNotice(review);
-  setSystemTime(now + 120_000);
-  await h.attention.tick();
-  expect(h.store.getOperation(review.id)).toBeUndefined();
-  expect(h.store.sessionNotice(review.id)?.state).toBe("cancelled");
 });
 
 test("many requests under one iMessage conversation read its record once per tick", async () => {
@@ -863,21 +847,4 @@ test("forms a chat reply cannot answer are surfaced without buttons and never an
   expect(h.backend.questionReplies).toEqual([]);
   expect(h.store.getOperation("ack:902")?.text).toContain("does not accept custom text");
   expect(h.store.getOperation("ack:903")?.text).toContain("Choose one answer per question");
-});
-
-test("review notices wait while OpenCode still reports the session as running", async () => {
-  const h = setup();
-  const entry = { sessionId: "ses_1", directory: "/Chats", title: "Deployment review", state: "waiting" as const,
-    status: "idle", workRevision: 3, updatedAt: now };
-  h.backend.board = { version: 1, revision: 1, activatedAt: 1, migrationComplete: true, entries: [entry] };
-  const notice: SessionNotice = { id: sessionNoticeId("/Chats", "ses_1", "review", 3), kind: "review", sessionId: "ses_1",
-    directory: "/Chats", workRevision: 3, firstSeen: now, state: "pending" };
-  h.store.saveSessionNotice(notice);
-  h.backend.sessionStatuses = { ses_1: { type: "busy" } };
-  setSystemTime(now + 61_000);
-  await h.attention.tick();
-  expect(h.store.getOperation(notice.id)).toBeUndefined();
-  h.backend.sessionStatuses = {};
-  await h.attention.tick();
-  expect(h.store.getOperation(notice.id)).toMatchObject({ kind: "notification" });
 });

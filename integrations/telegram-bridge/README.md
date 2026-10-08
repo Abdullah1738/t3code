@@ -1,7 +1,7 @@
 # Telegram OpenChamber Bridge
 
 This directory documents the private Telegram bot bridge used with OpenChamber
-for alerts: notifications, reminders, review notices, and interactive prompts.
+for alerts: notifications, reminders, and interactive prompts.
 The bridge is intentionally kept as a separate package. It talks to OpenChamber
 through the authenticated loopback HTTP/SSE API and does not start a second
 OpenChamber or OpenCode backend.
@@ -42,18 +42,15 @@ under `~/.config/telegram-bridge/`.
   with fields a chat reply cannot answer (numbers, booleans, external links,
   conditional fields) still alert, without buttons, and are answered in
   OpenChamber.
-- Review notices come from the server-owned Sessions board
-  (`/api/session-board`). A review notice debounces for 60 seconds: a
-  continuation prompt bumps the session's work revision, cancels the pending
-  notice, and restarts the clock on the next settle. A session OpenCode still
-  lists as running never gets a review notice.
+- Settled sessions are not announced. "Ready for review" notices were retired
+  (2026-10-08) as noise; agents send a `notify` alert themselves when they need
+  the owner. Any review notice left in the store is cancelled, never sent.
 - An iMessage conversation that owns a pending request keeps Telegram silent:
   the bridge asks the spectrum bridge `GET /router` over its unix socket and
   defers while the route matches the request. Unreachable or malformed answers
   never block a Telegram prompt.
 - Sessions the iMessage bridge created carry `metadata.openchamber.origin:
-  "imessage"`. The board leaves them out, so they never get a review notice,
-  and their questions and approvals (including those of their subagents, found
+  "imessage"`. Their questions and approvals (including those of their subagents, found
   through the parent chain) are never prompted on Telegram, even while the
   iMessage bridge is down.
 - Reminders are durable: `remind` stores an explicit-offset ISO timestamp and
@@ -77,11 +74,9 @@ or `"backend": "robob"` in config.json (default `openchamber`), then
   user `message.completed` to changed, runtime-mode changes to invalidate).
 - Requests: `GET /requests`, scoped to a directory by each thread's folder.
   Replies use the respond route.
-- Reviews: read from Robob's session board (`GET /api/ardud/board`, same
-  bearer token). The server already leaves iMessage threads off the board,
-  files automated origins (automation, crw, watcher) under `scheduled` and
-  rolls subagents into their parent, so a root card that turns idle in
-  `waiting` gets one review notice. Notices say `[Robob]` and point at the Board.
+- Board: read from Robob's session board (`GET /api/ardud/board`, same
+  bearer token) only to find directories with running or attention-needing
+  threads. It no longer produces review notices.
 - iMessage family: every thread reports its root's origin, so subagents of an
   iMessage chat stay quiet without a parent walk.
 
