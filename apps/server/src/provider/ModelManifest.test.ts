@@ -6,7 +6,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
-import { HttpClient, HttpClientResponse } from "effect/unstable/http";
+import { HttpClient, HttpClientResponse } from "effect/http";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -333,13 +333,13 @@ const INVALID_REMOTE_MANIFESTS: ReadonlyArray<ModelManifest.ModelManifestData> =
   }),
 ];
 
-const httpClientLayer = (handler: () => Response) =>
+const layerHttpClient = (handler: () => Response) =>
   Layer.succeed(
     HttpClient.HttpClient,
     HttpClient.make((request) => Effect.succeed(HttpClientResponse.fromWeb(request, handler()))),
   );
 
-const serviceLayers = (input: {
+const layerService = (input: {
   readonly prefix: string;
   readonly response: () => Response;
   readonly settings?: Parameters<typeof ServerSettings.layerTest>[0];
@@ -349,7 +349,7 @@ const serviceLayers = (input: {
     Layer.provideMerge(
       ServerSettings.layerTest({ enableProviderUpdateChecks: true, ...input.settings }),
     ),
-    Layer.provideMerge(httpClientLayer(input.response)),
+    Layer.provideMerge(layerHttpClient(input.response)),
   );
 
 describe("ModelManifest service", () => {
@@ -375,7 +375,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-force-refresh-test",
           response: () => Response.json(fetchCount++ === 0 ? REMOTE_MANIFEST : updated),
         }),
@@ -397,7 +397,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-force-retry-test",
           response: () =>
             fetchCount++ === 1
@@ -420,7 +420,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-force-initial-retry-test",
           response: () =>
             fetchCount++ === 0
@@ -444,7 +444,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-fetch-test",
           response: () => Response.json(REMOTE_MANIFEST),
         }),
@@ -468,7 +468,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-stale-fetch-test",
           response: () => Response.json(remote),
         }),
@@ -483,7 +483,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-malformed-test",
           response: () => Response.json({ version: 999, nonsense: true }),
         }),
@@ -510,7 +510,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-last-good-test",
           response: () => Response.json(responses[responseIndex]),
         }),
@@ -550,7 +550,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-newer-bundle-test",
           response: () => Response.json(REMOTE_MANIFEST),
         }),
@@ -563,7 +563,7 @@ describe("ModelManifest service", () => {
       let fetchCount = 0;
       const service = yield* ModelManifest.make.pipe(
         Effect.provide(
-          httpClientLayer(() => {
+          layerHttpClient(() => {
             fetchCount += 1;
             return Response.json(REMOTE_MANIFEST);
           }),
@@ -575,7 +575,7 @@ describe("ModelManifest service", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-optout-test",
           response: () => Response.json(REMOTE_MANIFEST),
           settings: { enableProviderUpdateChecks: false },
@@ -609,7 +609,7 @@ it.effect("caches valid compatibility policies and keeps them after a malformed 
   }).pipe(
     Effect.scoped,
     Effect.provide(
-      serviceLayers({
+      layerService({
         prefix: "model-manifest-compatibility-test",
         response: () =>
           Response.json(

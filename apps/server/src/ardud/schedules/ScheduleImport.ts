@@ -21,7 +21,7 @@ import {
   HttpServerRequest,
   HttpServerRespondable,
   HttpServerResponse,
-} from "effect/unstable/http";
+} from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import {
@@ -89,7 +89,8 @@ const importOne = Effect.fn("ArdudScheduleImport.importOne")(function* (input: {
   };
 
   if (dryRun) {
-    const next = enabled ? nextScheduledRunAt(item.schedule, now) : null;
+    const next =
+      enabled && item.schedule.type !== "webhook" ? nextScheduledRunAt(item.schedule, now) : null;
     return {
       ...base,
       projectId: Option.isSome(found) ? found.value.id : null,

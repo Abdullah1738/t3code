@@ -17,7 +17,7 @@ import {
   HttpServerRequest,
   HttpServerResponse,
   HttpServerRespondable,
-} from "effect/unstable/http";
+} from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import {

@@ -22,7 +22,7 @@ import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
-import * as OrchestrationEventStore from "../../persistence/Services/OrchestrationEventStore.ts";
+import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import { forkParked } from "../../serverActivation.ts";
 import {

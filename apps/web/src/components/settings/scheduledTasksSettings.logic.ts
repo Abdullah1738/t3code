@@ -3,11 +3,13 @@ import {
   type ProjectId,
   ScheduledTaskId,
   type ScheduledTask,
+  type ScheduledTaskUpsertSchedule,
   type ModelSelection,
   type RuntimeMode,
   type ProviderInteractionMode,
   type ServerSettings,
 } from "@t3tools/contracts";
+import { parseMaxDeliveryAge } from "@t3tools/client-runtime/scheduled-task-webhook";
 
 import {
   resolveProjectSettings,
@@ -47,7 +49,7 @@ export function validateScheduledTasksSearch(raw: Record<string, unknown>) {
   };
 }
 
-type ScheduleMode = "fixed" | "interval" | "cron" | "once";
+export type ScheduleMode = "fixed" | "interval" | "cron" | "once" | "webhook";
 export type WorkspaceMode = "root" | "worktree" | "existing_worktree";
 
 export interface DraftState {
@@ -79,6 +81,53 @@ export interface DraftState {
    * (reasoning, temperature, …) when the model itself is left unchanged.
    */
   readonly baseModelSelection: ModelSelection | null;
+  readonly signatureEnabled: boolean;
+  readonly signatureHeader: string;
+  readonly signatureEncoding: "hex" | "base64";
+  readonly signaturePrefix: string;
+  /** Write-only: empty keeps the secret already stored on the server. */
+  readonly signatureSecret: string;
+  /** Minutes as typed; empty runs every held request regardless of age. */
+  readonly maxDeliveryAgeMinutes: string;
+}
+
+/** GitHub's signature settings, the most common sender. */
+export const WEBHOOK_SIGNATURE_DEFAULTS = {
+  signatureHeader: "x-hub-signature-256",
+  signatureEncoding: "hex",
+  signaturePrefix: "sha256=",
+} as const;
+
+/** Null when the draft's webhook age limit is invalid; the caller reports it and does not save. */
+export function scheduleFromDraft(draft: DraftState): ScheduledTaskUpsertSchedule | null {
+  if (draft.scheduleMode === "webhook") {
+    const maxDeliveryAgeMinutes = parseMaxDeliveryAge(draft.maxDeliveryAgeMinutes);
+    if (maxDeliveryAgeMinutes === undefined) return null;
+    const secret = draft.signatureSecret.trim();
+    return {
+      type: "webhook",
+      signature: draft.signatureEnabled
+        ? {
+            header: draft.signatureHeader.trim(),
+            encoding: draft.signatureEncoding,
+            prefix: draft.signaturePrefix,
+            ...(secret ? { secret } : {}),
+          }
+        : null,
+      maxDeliveryAgeMinutes,
+    };
+  }
+  if (draft.scheduleMode === "interval") {
+    const everyMs = Math.round(Number(draft.intervalMinutes) * 60_000);
+    return { type: "interval", everyMs };
+  }
+  const selectedEveryDay = draft.weekdays.size === 0 || draft.weekdays.size === 7;
+  return {
+    type: "fixed_time",
+    timeOfDay: draft.timeOfDay || "09:00",
+    ...(selectedEveryDay ? {} : { weekdays: [...draft.weekdays].toSorted() }),
+    ...(draft.fixedTimeZoned ? { timeZone: draft.fork.timeZone.trim() } : {}),
+  };
 }
 
 export function taskToDraft(task: ScheduledTask): DraftState {
@@ -95,7 +144,7 @@ export function taskToDraft(task: ScheduledTask): DraftState {
     scheduleMode:
       schedule.type === "interval"
         ? "interval"
-        : schedule.type === "cron" || schedule.type === "once"
+        : schedule.type === "cron" || schedule.type === "once" || schedule.type === "webhook"
           ? schedule.type
           : "fixed",
     intervalMinutes:
@@ -120,6 +169,19 @@ export function taskToDraft(task: ScheduledTask): DraftState {
     runtimeMode: task.runtimeMode,
     interactionMode: task.interactionMode,
     baseModelSelection: task.modelSelection,
+    ...(schedule.type === "webhook" && schedule.signature !== null
+      ? {
+          signatureEnabled: true,
+          signatureHeader: schedule.signature.header,
+          signatureEncoding: schedule.signature.encoding,
+          signaturePrefix: schedule.signature.prefix,
+        }
+      : { signatureEnabled: false, ...WEBHOOK_SIGNATURE_DEFAULTS }),
+    signatureSecret: "",
+    maxDeliveryAgeMinutes:
+      schedule.type === "webhook" && schedule.maxDeliveryAgeMinutes != null
+        ? String(schedule.maxDeliveryAgeMinutes)
+        : "",
   };
 }
 

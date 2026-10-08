@@ -1,14 +1,14 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlClient from "effect/sql/SqlClient";
 
-import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import * as Sqlite from "../../persistence/Sqlite.ts";
 import { blankRow } from "./BoardModel.ts";
 import * as BoardStore from "./BoardStore.ts";
 import { parseOpenChamberLedger, planOpenChamberImport } from "./openchamberImport.ts";
 
-const TestLayer = BoardStore.layer.pipe(Layer.provideMerge(SqlitePersistenceMemory));
+const TestLayer = BoardStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
 
 it.layer(TestLayer)("session board store", (it) => {
   it.effect("creates its tables idempotently and round-trips rows and revision", () =>

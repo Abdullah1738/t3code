@@ -32,7 +32,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
