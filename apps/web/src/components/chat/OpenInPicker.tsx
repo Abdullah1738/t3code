@@ -206,7 +206,8 @@ export const OpenInPicker = memo(function OpenInPicker({
   environmentId,
   keybindings,
   availableEditors,
-  openInCwd,
+  openInPath,
+  pathKind,
   presentation = "toolbar",
   compact = false,
   enableShortcut = true,
@@ -215,7 +216,8 @@ export const OpenInPicker = memo(function OpenInPicker({
   environmentId: EnvironmentId;
   keybindings: ResolvedKeybindingsConfig;
   availableEditors: ReadonlyArray<EditorId>;
-  openInCwd: string | null;
+  openInPath: string | null;
+  pathKind: "file" | "folder";
   presentation?: "toolbar" | "menu";
   compact?: boolean;
   enableShortcut?: boolean;
@@ -245,7 +247,7 @@ export const OpenInPicker = memo(function OpenInPicker({
 
   const openInEditor = useCallback(
     (editorId: EditorId | null) => {
-      if (!openInCwd) return;
+      if (!openInPath) return;
       const editor = editorId ?? preferredEditor;
       if (!editor) return;
       if (remote.mode === "remote-unavailable") return;
@@ -253,7 +255,8 @@ export const OpenInPicker = memo(function OpenInPicker({
         const url = buildRemoteOpenUrl({
           editor,
           host: remote.host.host,
-          absolutePath: openInCwd,
+          absolutePath: openInPath,
+          pathKind,
         });
         if (url === undefined) return;
         // Only record hint-seen/preferred when the shell actually accepted
@@ -269,7 +272,7 @@ export const OpenInPicker = memo(function OpenInPicker({
       const result = openInEditorMutation({
         environmentId,
         input: {
-          cwd: openInCwd,
+          cwd: openInPath,
           editor,
         },
       });
@@ -279,8 +282,9 @@ export const OpenInPicker = memo(function OpenInPicker({
     [
       environmentId,
       markRemoteHintSeen,
-      openInCwd,
+      openInPath,
       openInEditorMutation,
+      pathKind,
       preferredEditor,
       remote,
       setPreferredEditor,
@@ -296,7 +300,7 @@ export const OpenInPicker = memo(function OpenInPicker({
     if (!enableShortcut || !canOpenEditor) return;
     const handler = (e: globalThis.KeyboardEvent) => {
       if (!isOpenFavoriteEditorShortcut(e, keybindings)) return;
-      if (!openInCwd) return;
+      if (!openInPath) return;
       if (!preferredEditor) return;
       if (
         remote.mode === "local-exec" &&
@@ -314,7 +318,7 @@ export const OpenInPicker = memo(function OpenInPicker({
     enableShortcut,
     environmentId,
     keybindings,
-    openInCwd,
+    openInPath,
     openInEditor,
     preferredEditor,
     remote.mode,
@@ -337,7 +341,7 @@ export const OpenInPicker = memo(function OpenInPicker({
           {options.map(({ label, Icon, value, kind }) => (
             <MenuItem
               density={presentation === "menu" ? "touch" : "default"}
-              disabled={!openInCwd || !canOpenEditor}
+              disabled={!openInPath || !canOpenEditor}
               key={value}
               onClick={() => openInEditor(value)}
             >
@@ -364,7 +368,7 @@ export const OpenInPicker = memo(function OpenInPicker({
           <MenuItem
             density={presentation === "menu" ? "touch" : "default"}
 
-            disabled={!openInCwd || !canOpenEditor}
+            disabled={!openInPath || !canOpenEditor}
             onClick={() => openInEditor(preferredEditor)}
           >
             <primaryOption.Icon className={cn("size-4", getOpenInIconClass(primaryOption.kind))} />
@@ -399,7 +403,7 @@ export const OpenInPicker = memo(function OpenInPicker({
         variant={isPanel ? "ghost" : "outline"}
         part="primary"
         panel={isPanel}
-        disabled={!preferredEditor || !openInCwd || !canOpenEditor}
+        disabled={!preferredEditor || !openInPath || !canOpenEditor}
         onClick={() => openInEditor(preferredEditor)}
       >
         {primaryOption?.Icon ? (

@@ -58,3 +58,21 @@ export function setMarkdownTaskChecked(
 
   return `${markdown.slice(0, markerOffset + 1)}${checked ? "x" : " "}${markdown.slice(markerOffset + 2)}`;
 }
+
+/**
+ * What a remote editor link should open, or null while unknown. Only trust what
+ * the latest read proved: a non-file stat means a folder, binary data means a
+ * file, and any other failure (missing path, denied access) leaves it unknown.
+ * The error wins over contents, which can be left over from an earlier read.
+ */
+export function remoteOpenPathKind(input: {
+  readonly hasContents: boolean;
+  readonly readError: ProjectReadFileError | null;
+}): "file" | "folder" | null {
+  if (input.readError !== null) {
+    if (input.readError.failure === "path_not_file") return "folder";
+    if (input.readError.failure === "binary_file") return "file";
+    return null;
+  }
+  return input.hasContents ? "file" : null;
+}

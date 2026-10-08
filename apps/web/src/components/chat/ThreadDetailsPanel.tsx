@@ -123,7 +123,8 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   keybindings={props.keybindings}
                   environmentId={props.environmentId}
                   availableEditors={props.availableEditors}
-                  openInCwd={props.gitCwd}
+                  openInPath={props.gitCwd}
+                  pathKind="folder"
                   displayMode="panel"
                 />
               ) : null}

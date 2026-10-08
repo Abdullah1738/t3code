@@ -10,6 +10,7 @@ import {
 import {
   filePreviewReadErrorMessage,
   isMarkdownPreviewFile,
+  remoteOpenPathKind,
   resolveFilePreviewPath,
   setMarkdownTaskChecked,
   shouldShowFileExplorer,
@@ -187,5 +188,48 @@ describe("resolveFilePreviewPath", () => {
         shouldShowFileExplorer({ relativePath, explorerOpen: false, attachmentOpen: false }),
       ).toBe(true);
     }
+  });
+});
+
+describe("remoteOpenPathKind", () => {
+  const readError = (failure: NonNullable<ProjectReadFileError["failure"]>) =>
+    new ProjectReadFileError({
+      cwd: "/workspace",
+      relativePath: "notes.md",
+      failure,
+      operation: "open",
+    });
+
+  it("is a file once the read returns contents", () => {
+    expect(remoteOpenPathKind({ hasContents: true, readError: null })).toBe("file");
+  });
+
+  it("is a file when the read finds binary data", () => {
+    expect(remoteOpenPathKind({ hasContents: false, readError: readError("binary_file") })).toBe(
+      "file",
+    );
+  });
+
+  it("is a folder when the path is not a regular file", () => {
+    expect(remoteOpenPathKind({ hasContents: false, readError: readError("path_not_file") })).toBe(
+      "folder",
+    );
+  });
+
+  it("trusts the latest read error over contents left from an earlier read", () => {
+    expect(remoteOpenPathKind({ hasContents: true, readError: readError("path_not_file") })).toBe(
+      "folder",
+    );
+    expect(
+      remoteOpenPathKind({ hasContents: true, readError: readError("operation_failed") }),
+    ).toBe(null);
+  });
+
+  it.each([
+    ["while loading", null],
+    ["after a failed open", readError("operation_failed")],
+    ["outside the workspace", readError("workspace_path_outside_root")],
+  ])("is unknown %s", (_label, error) => {
+    expect(remoteOpenPathKind({ hasContents: false, readError: error })).toBe(null);
   });
 });

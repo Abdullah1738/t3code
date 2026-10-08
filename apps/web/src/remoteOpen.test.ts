@@ -119,50 +119,130 @@ describe("resolveRemoteOpenState", () => {
 });
 
 describe("buildRemoteOpenUrl", () => {
-  it("builds a vscode-remote deep link", () => {
+  it.each([
+    ["/home/user/.local/share/app/settings.json", "/home/user/.local/share/app/settings.json"],
+    ["/tmp/README", "/tmp/README"],
+    ["/tmp/my file #1?.json", "/tmp/my%20file%20%231%3F.json"],
+    ["C:\\Users\\user\\settings.json", "/C%3A/Users/user/settings.json"],
+    ["/tmp/project.code-workspace", "/tmp/project.code-workspace"],
+  ])("opens %s as a remote file", (absolutePath, encodedPath) => {
+    expect(
+      buildRemoteOpenUrl({
+        editor: "vscode",
+        host: "sol",
+        absolutePath,
+        pathKind: "file",
+      }),
+    ).toBe(`vscode://vscode-remote/ssh-remote+sol${encodedPath}:1`);
+  });
+
+  it("builds a vscode-remote folder deep link", () => {
     expect(
       buildRemoteOpenUrl({
         editor: "vscode",
         host: "sol.tail1234.ts.net",
         absolutePath: "/home/theo/code/my repo",
+        pathKind: "folder",
       }),
     ).toBe("vscode://vscode-remote/ssh-remote+sol.tail1234.ts.net/home/theo/code/my%20repo");
   });
 
-  it("uses the fork's scheme", () => {
-    expect(buildRemoteOpenUrl({ editor: "cursor", host: "sol", absolutePath: "/tmp/x" })).toBe(
-      "cursor://vscode-remote/ssh-remote+sol/tmp/x",
-    );
+  it.each(["cursor", "vscode-insiders", "vscodium"] as const)("uses %s's scheme", (editor) => {
+    expect(
+      buildRemoteOpenUrl({ editor, host: "sol", absolutePath: "/tmp/x", pathKind: "file" }),
+    ).toBe(`${editor}://vscode-remote/ssh-remote+sol/tmp/x:1`);
+    expect(
+      buildRemoteOpenUrl({ editor, host: "sol", absolutePath: "/tmp/x", pathKind: "folder" }),
+    ).toBe(`${editor}://vscode-remote/ssh-remote+sol/tmp/x`);
+  });
+
+  it.each([
+    ["/tmp/notes:12", "/tmp"],
+    ["/tmp/foo:12:bar.txt", "/tmp"],
+    ["/tmp/trailing:", "/tmp"],
+    ["/notes:3", "/"],
+  ])("opens the folder of %s, which VS Code would read as a line", (absolutePath, folder) => {
+    expect(
+      buildRemoteOpenUrl({ editor: "vscode", host: "sol", absolutePath, pathKind: "file" }),
+    ).toBe(`vscode://vscode-remote/ssh-remote+sol${folder}`);
+  });
+
+  it.each([
+    ["/tmp/folder:12/notes:3", "file", "/tmp/folder%3A12/"],
+    ["/tmp/release:2", "folder", "/tmp/release%3A2/"],
+  ] as const)(
+    "ends %s with a slash so VS Code keeps it a folder",
+    (absolutePath, pathKind, url) => {
+      expect(buildRemoteOpenUrl({ editor: "vscode", host: "sol", absolutePath, pathKind })).toBe(
+        `vscode://vscode-remote/ssh-remote+sol${url}`,
+      );
+    },
+  );
+
+  it("keeps colons that are not line numbers in file links", () => {
+    expect(
+      buildRemoteOpenUrl({
+        editor: "vscode",
+        host: "sol",
+        absolutePath: "/tmp/build:release.log",
+        pathKind: "file",
+      }),
+    ).toBe("vscode://vscode-remote/ssh-remote+sol/tmp/build%3Arelease.log:1");
+  });
+
+  it("keeps folders with file extensions as folders", () => {
+    expect(
+      buildRemoteOpenUrl({
+        editor: "vscode",
+        host: "sol",
+        absolutePath: "/tmp/project.json",
+        pathKind: "folder",
+      }),
+    ).toBe("vscode://vscode-remote/ssh-remote+sol/tmp/project.json");
   });
 
   it("roots Windows paths", () => {
     expect(
-      buildRemoteOpenUrl({ editor: "vscode", host: "sol", absolutePath: "C:\\Users\\theo" }),
+      buildRemoteOpenUrl({
+        editor: "vscode",
+        host: "sol",
+        absolutePath: "C:\\Users\\theo",
+        pathKind: "folder",
+      }),
     ).toBe("vscode://vscode-remote/ssh-remote+sol/C%3A/Users/theo");
   });
 
-  it("builds Zed's ssh deep link", () => {
+  it.each(["file", "folder"] as const)("keeps Zed's ssh deep link for a %s", (pathKind) => {
     expect(
       buildRemoteOpenUrl({
         editor: "zed",
         host: "sol.tail1234.ts.net",
         absolutePath: "/home/theo/code/my repo",
+        pathKind,
       }),
     ).toBe("zed://ssh/sol.tail1234.ts.net/home/theo/code/my%20repo");
   });
 
-  it("drops the Windows drive letter for Zed", () => {
-    expect(
-      buildRemoteOpenUrl({ editor: "zed", host: "sol", absolutePath: "C:\\Users\\theo" }),
-    ).toBe("zed://ssh/sol/Users/theo");
-    expect(buildRemoteOpenUrl({ editor: "zed", host: "sol", absolutePath: "/C:/project" })).toBe(
-      "zed://ssh/sol/C%3A/project",
-    );
-  });
+  it.each(["file", "folder"] as const)(
+    "drops the Windows drive letter for a Zed %s",
+    (pathKind) => {
+      expect(
+        buildRemoteOpenUrl({
+          editor: "zed",
+          host: "sol",
+          absolutePath: "C:\\Users\\theo",
+          pathKind,
+        }),
+      ).toBe("zed://ssh/sol/Users/theo");
+      expect(
+        buildRemoteOpenUrl({ editor: "zed", host: "sol", absolutePath: "/C:/project", pathKind }),
+      ).toBe("zed://ssh/sol/C%3A/project");
+    },
+  );
 
   it("returns undefined for editors without remote support", () => {
-    expect(buildRemoteOpenUrl({ editor: "idea", host: "sol", absolutePath: "/tmp/x" })).toBe(
-      undefined,
-    );
+    expect(
+      buildRemoteOpenUrl({ editor: "idea", host: "sol", absolutePath: "/tmp/x", pathKind: "file" }),
+    ).toBe(undefined);
   });
 });

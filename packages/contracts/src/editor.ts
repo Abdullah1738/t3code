@@ -120,6 +120,7 @@ export const buildRemoteOpenUrl = (input: {
   readonly editor: EditorId;
   readonly host: string;
   readonly absolutePath: string;
+  readonly pathKind: "file" | "folder";
 }): string | undefined => {
   const scheme = remoteSchemeForEditor(input.editor);
   if (scheme === undefined) {
@@ -138,8 +139,31 @@ export const buildRemoteOpenUrl = (input: {
     const encodedZedPath = zedPath.split("/").map(encodeURIComponent).join("/");
     return `${scheme}://ssh/${encodedHost}${encodedZedPath}`;
   }
-  const encodedPath = rootedPath.split("/").map(encodeURIComponent).join("/");
-  return `${scheme}://vscode-remote/ssh-remote+${encodedHost}${encodedPath}`;
+  // A :line suffix makes VS Code's remote URL handler open a file instead of a folder.
+  // VS Code decodes the path and then drops every numeric `:` segment as a line or
+  // column, so a file like `notes:12` would open a different path. Open the
+  // file's folder for those instead.
+  const opensAsFile = input.pathKind === "file" && survivesVsCodeLineParsing(rootedPath);
+  const targetPath =
+    opensAsFile || input.pathKind === "folder" ? rootedPath : parentPath(rootedPath);
+  const encodedPath = targetPath.split("/").map(encodeURIComponent).join("/");
+  // A folder ending in `:<digits>` would also read as a file with a line, and a
+  // trailing slash stops that match.
+  const suffix = opensAsFile ? ":1" : /:\d+$/.test(targetPath) ? "/" : "";
+  return `${scheme}://vscode-remote/ssh-remote+${encodedHost}${encodedPath}${suffix}`;
+};
+
+// Mirrors VS Code's parseLineAndColumnAware: any `:` segment that reads as a
+// number (including an empty one) is taken as a line or column, not path.
+const survivesVsCodeLineParsing = (path: string): boolean =>
+  path
+    .split(":")
+    .slice(1)
+    .every((segment) => Number.isNaN(Number(segment)));
+
+const parentPath = (path: string): string => {
+  const index = path.lastIndexOf("/");
+  return index <= 0 ? "/" : path.slice(0, index);
 };
 
 /**

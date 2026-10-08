@@ -102,6 +102,7 @@ import { projectFileCacheKey } from "./fileContentRevision";
 import {
   filePreviewReadErrorMessage,
   isMarkdownPreviewFile,
+  remoteOpenPathKind,
   resolveFilePreviewPath,
   setMarkdownTaskChecked,
   shouldShowFileExplorer,
@@ -1138,6 +1139,10 @@ export default function FilePreviewPanel({
     isBrowserPreviewFile(previewPath);
   const absolutePath =
     relativePath && attachment === undefined ? resolvePathLinkTarget(relativePath, cwd) : null;
+  const remotePathKind = remoteOpenPathKind({
+    hasContents: file.data !== null,
+    readError: file.readError,
+  });
   const onFilePostRender = useFileLineReveal(relativePath, revealLine, revealRequestId);
   useWorkspaceMutationRefresh({
     enabled:
@@ -1251,7 +1256,12 @@ export default function FilePreviewPanel({
               environmentId={environmentId}
               keybindings={keybindings}
               availableEditors={availableEditors}
-              openInCwd={absolutePath}
+              openInPath={
+                remoteOpenState.mode === "remote-links" && remotePathKind === null
+                  ? null
+                  : absolutePath
+              }
+              pathKind={remotePathKind ?? "file"}
               compact
             />
           ) : null}

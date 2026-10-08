@@ -128,7 +128,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-async function renderPicker() {
+async function renderPicker(pathKind: "file" | "folder" = "folder") {
   await act(async () => {
     for (const listener of state.listeners) listener();
     const node = (
@@ -136,7 +136,8 @@ async function renderPicker() {
         environmentId={selected}
         keybindings={DEFAULT_RESOLVED_KEYBINDINGS}
         availableEditors={editors}
-        openInCwd="/work/project"
+        openInPath="/work/project"
+        pathKind={pathKind}
         compact
       />
     );
@@ -198,13 +199,16 @@ describe("host editor access", () => {
 });
 
 describe("client editor links", () => {
-  it("opens an SSH editor URL without host operate permission", async () => {
+  it.each([
+    ["file", ":1"],
+    ["folder", ""],
+  ] as const)("opens an SSH %s URL without host operate permission", async (pathKind, suffix) => {
     state.remote = { mode: "remote-links", host: { kind: "ssh-alias", host: "test-host" } };
-    await renderPicker();
+    await renderPicker(pathKind);
     expect(primaryButton().props.disabled).toBe(false);
     await act(async () => primaryButton().props.onClick());
     expect(state.openUrl).toHaveBeenCalledExactlyOnceWith(
-      "vscode://vscode-remote/ssh-remote+test-host/work/project",
+      `vscode://vscode-remote/ssh-remote+test-host/work/project${suffix}`,
     );
     expect(state.run).not.toHaveBeenCalled();
     expect(state.markHintSeen).toHaveBeenCalledOnce();
