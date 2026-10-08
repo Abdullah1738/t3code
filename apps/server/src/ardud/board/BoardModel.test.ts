@@ -275,10 +275,45 @@ describe("session board model", () => {
     expect(f.lanes()).toEqual([["t_cron", "running"]]);
     f.status("t_cron", "idle");
     expect(f.lanes()).toEqual([["t_cron", "scheduled"]]);
-    // A new prompt keeps it a scheduled card.
-    f.prompt("t_cron", 200);
+    // The schedule's next run stays a scheduled card.
+    f.prompt("t_cron", 200, { scheduledHint: true });
     f.status("t_cron", "idle");
     expect(f.lanes()).toEqual([["t_cron", "scheduled"]]);
+  });
+
+  it("returns a once-scheduled thread to review when the user prompts it", () => {
+    const f = fixture();
+    f.add("t_cell");
+    f.prompt("t_cell", 120);
+    f.act("review", "t_cell");
+    // A watcher schedule wakes the thread once.
+    f.prompt("t_cell", 200, { scheduledHint: true });
+    f.status("t_cell", "idle");
+    expect(f.lanes()).toEqual([["t_cell", "scheduled"]]);
+    // The next prompt is the user's, so its result needs review.
+    f.prompt("t_cell", 300);
+    f.status("t_cell", "working");
+    expect(f.lanes()).toEqual([["t_cell", "running"]]);
+    f.status("t_cell", "idle");
+    expect(f.lanes()).toEqual([["t_cell", "waiting"]]);
+  });
+
+  it("corrects a persisted scheduled card whose latest prompt is not a scheduled run", () => {
+    const f = fixture();
+    f.add("t_cell");
+    f.prompt("t_cell", 120, { scheduledHint: true });
+    expect(f.lanes()).toEqual([["t_cell", "scheduled"]]);
+    f.observe("t_cell", { scheduledHint: false });
+    expect(f.lanes()).toEqual([["t_cell", "waiting"]]);
+  });
+
+  it("keeps automated origins scheduled through user prompts", () => {
+    const f = fixture();
+    f.model.origins.set("t_crw", "crw");
+    f.add("t_crw");
+    f.prompt("t_crw", 120);
+    f.prompt("t_crw", 200, { scheduledHint: false });
+    expect(f.lanes()).toEqual([["t_crw", "scheduled"]]);
   });
 
   it("shows a pending scheduled run as running after a restart until it is read", () => {

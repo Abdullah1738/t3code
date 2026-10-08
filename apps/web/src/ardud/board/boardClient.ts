@@ -13,8 +13,7 @@ import type {
 } from "@t3tools/contracts";
 import { create } from "zustand";
 
-import { readDesktopPrimaryBearerToken } from "../../environments/primary/desktopAuth";
-import { resolvePrimaryEnvironmentHttpUrl } from "../../environments/primary";
+import { resolveBoardEndpoint } from "./boardEnvironment";
 
 /**
  * Client for the fork's session board (/api/ardud/board). The server pushes
@@ -40,27 +39,14 @@ export const useBoardStore = create<BoardState>(() => ({
   error: null,
 }));
 
-// Same-origin web relies on the session cookie. Desktop (custom-scheme origin)
-// authenticates with a bearer token; the server answers CORS with "*", which
-// browsers reject for credentialed requests, so cookies must be omitted there.
-function boardCredentials(url: string): RequestCredentials {
-  if (typeof window === "undefined" || window.desktopBridge !== undefined) return "omit";
-  return new URL(url, window.location.href).origin === window.location.origin ? "include" : "omit";
-}
-
-async function authHeaders(): Promise<Record<string, string>> {
-  const token = await readDesktopPrimaryBearerToken().catch(() => null);
-  return token ? { authorization: `Bearer ${token}` } : {};
-}
-
 async function request<A>(path: string, init?: { body?: unknown }): Promise<A> {
-  const url = resolvePrimaryEnvironmentHttpUrl(`/api/ardud/board${path}`);
-  const response = await fetch(url, {
+  const endpoint = await resolveBoardEndpoint(`/api/ardud/board${path}`);
+  const response = await fetch(endpoint.url, {
     method: init ? "POST" : "GET",
-    credentials: boardCredentials(url),
+    credentials: endpoint.credentials,
     cache: "no-store",
     headers: {
-      ...(await authHeaders()),
+      ...endpoint.headers,
       ...(init ? { "content-type": "application/json" } : {}),
     },
     ...(init ? { body: JSON.stringify(init.body ?? {}) } : {}),
@@ -105,11 +91,11 @@ async function runStream(signal: AbortSignal) {
   while (!signal.aborted) {
     try {
       useBoardStore.setState({ connection: "connecting" });
-      const url = resolvePrimaryEnvironmentHttpUrl("/api/ardud/board/events");
-      const response = await fetch(url, {
-        credentials: boardCredentials(url),
+      const endpoint = await resolveBoardEndpoint("/api/ardud/board/events");
+      const response = await fetch(endpoint.url, {
+        credentials: endpoint.credentials,
         cache: "no-store",
-        headers: { ...(await authHeaders()), accept: "text/event-stream" },
+        headers: { ...endpoint.headers, accept: "text/event-stream" },
         signal,
       });
       if (!response.ok || response.body === null) {

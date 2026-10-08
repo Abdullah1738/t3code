@@ -20,8 +20,8 @@ import { toastManager } from "../../components/ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
 import { cn } from "../../lib/utils";
 import { useProjects } from "../../state/entities";
-import { usePrimaryEnvironmentId } from "../../state/environments";
 import { boardActions, subscribeBoard, useBoardStore, type BoardEntry } from "./boardClient";
+import { useBoardEnvironmentId } from "./boardEnvironment";
 import { errorMessage, undoToast } from "./boardToasts";
 
 // One in-flight guard per (thread, work revision) so the header button and the
@@ -52,11 +52,11 @@ export function ThreadReviewControls(props: { environmentId: EnvironmentId; thre
   useEffect(() => subscribeBoard(), []);
   const navigate = useNavigate();
   const queue = useReviewQueue();
-  // The board only tracks the primary environment's threads, so a thread from
+  // The board only tracks one environment's threads, so a thread from
   // another environment is never "current" even if its id collides.
-  const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const onPrimary = props.environmentId === primaryEnvironmentId;
-  const threadId = onPrimary ? props.threadId : null;
+  const boardEnvironmentId = useBoardEnvironmentId();
+  const onBoardEnvironment = props.environmentId === boardEnvironmentId;
+  const threadId = onBoardEnvironment ? props.threadId : null;
   const current = useBoardStore((state) =>
     threadId === null ? undefined : state.entries.get(threadId),
   );
@@ -73,14 +73,14 @@ export function ThreadReviewControls(props: { environmentId: EnvironmentId; thre
 
   const go = useCallback(
     (entry: BoardEntry | undefined) => {
-      if (!entry || primaryEnvironmentId === null) return;
+      if (!entry || boardEnvironmentId === null) return;
       setOpen(false);
       void navigate({
         to: "/$environmentId/$threadId",
-        params: { environmentId: primaryEnvironmentId, threadId: entry.threadId },
+        params: { environmentId: boardEnvironmentId, threadId: entry.threadId },
       });
     },
-    [navigate, primaryEnvironmentId],
+    [navigate, boardEnvironmentId],
   );
 
   // Previous/next walk the queue relative to this thread. When this thread isn't

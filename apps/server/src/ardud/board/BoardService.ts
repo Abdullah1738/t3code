@@ -202,13 +202,16 @@ const make = Effect.gen(function* () {
           : yield* store
               .scheduledThreads(lookup)
               .pipe(Effect.mapError((cause) => new BoardUnavailableError({ cause })));
+      const checked = new Set(lookup);
       const final = patches.map(({ observation, patch }) => {
-        const row = patch.rows[0];
-        return scheduled.has(observation.threadId) &&
-          observation.deleted !== true &&
-          row !== undefined &&
-          !row.scheduled
-          ? model.observe({ ...observation, scheduledHint: true })
+        if (observation.deleted === true || !checked.has(observation.threadId)) return patch;
+        // Re-read with what the latest prompt says: a scheduled run, or a
+        // card persisted as scheduled that a later non-scheduled prompt owns.
+        const row = patch.rows[0] ?? model.rows.get(observation.threadId);
+        if (row === undefined) return patch;
+        const fromSchedule = scheduled.has(observation.threadId);
+        return fromSchedule !== row.scheduled
+          ? model.observe({ ...observation, scheduledHint: fromSchedule })
           : patch;
       });
       yield* persist(final.flatMap((patch) => patch.rows));

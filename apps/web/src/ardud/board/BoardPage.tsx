@@ -22,7 +22,6 @@ import {
 } from "@t3tools/client-runtime/ardud/board";
 import { sortScopedProjectsForSidebar } from "../../components/Sidebar.logic";
 import { useNewThreadHandler } from "../../hooks/useHandleNewThread";
-import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useProjects, useThreadShells } from "../../state/entities";
 import { cn } from "../../lib/utils";
 import { Badge } from "../../components/ui/badge";
@@ -36,6 +35,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/toolt
 import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../../components/WorkspaceBreadcrumb";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { boardActions, subscribeBoard, useBoardStore, type BoardEntry } from "./boardClient";
+import { useBoardEnvironmentId } from "./boardEnvironment";
 import { errorMessage, undoToast } from "./boardToasts";
 
 type Lane = BoardEntry["state"];
@@ -357,7 +357,7 @@ const BoardCard = memo(function BoardCard(props: {
 }) {
   const { entry, busy } = props;
   const navigate = useNavigate();
-  const environmentId = usePrimaryEnvironmentId();
+  const environmentId = useBoardEnvironmentId();
   const projects = useProjects();
   const project = projects.find(
     (candidate) => candidate.id === entry.projectId && candidate.environmentId === environmentId,

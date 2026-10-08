@@ -67,7 +67,10 @@ export interface ThreadObservation {
   readonly settledByUser?: boolean;
   /** Whether t3 currently shows the thread as settled. */
   readonly settled?: boolean;
-  /** The thread was started by a scheduled task. */
+  /**
+   * Whether the thread's latest prompt came from a scheduled task, when known.
+   * False corrects a card persisted as scheduled; undefined leaves it alone.
+   */
   readonly scheduledHint?: boolean;
 }
 
@@ -254,11 +257,15 @@ export class BoardModel {
     if (prompt !== null && (row.promptAt === null || prompt > row.promptAt)) {
       row = { ...row, promptAt: prompt, deleted: false };
       if (prompt >= this.activatedAt && !quiet) {
+        // Lane provenance follows the latest prompt: a user follow-up to a
+        // thread a schedule once woke is review work again. The caller re-adds
+        // the scheduled hint when this prompt came from a scheduled task.
         row = {
           ...row,
           pending: true,
           reviewed: false,
           backlog: false,
+          scheduled: false,
           completedFrom: null,
           workRevision: row.workRevision + 1,
           updatedAt: Math.max(row.updatedAt, prompt),
@@ -290,6 +297,9 @@ export class BoardModel {
     if ((observation.scheduledHint === true || automated) && !row.scheduled) {
       // Baselined automated threads have no prompt-driven stamp; date the card.
       row = { ...row, scheduled: true, updatedAt: row.updatedAt || (row.promptAt ?? now) };
+    } else if (observation.scheduledHint === false && !automated && row.scheduled) {
+      // A card persisted as scheduled whose latest prompt is not a scheduled run.
+      row = { ...row, scheduled: false };
     }
     // The user settled the thread in t3: mark its card Done. t3 only lets a
     // thread settle once its turn ended, so background work draining under it
