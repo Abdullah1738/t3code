@@ -49,7 +49,8 @@ class DeliveryTests(unittest.TestCase):
         with patch.object(t.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps({'hits': hits}))), patch.object(t, 'run', side_effect=response) as body:
             rows, errors = t.mail_evidence({'app':'amazon', 'order':'408-5401303-9857106', 'placed_at':'2026-10-05T21:15:00+04:00'})
             self.assertEqual(rows[0]['stage'], 'delivered')
-            self.assertEqual(sum(c.args[0][1] == 'message' for c in body.call_args_list), 1)
+            self.assertEqual(sum(c.args[0][1] in ('message', 'read') for c in body.call_args_list), 1)
+            self.assertEqual(body.call_args_list[-1].args[0][:3], ['mailsearch', 'read', 'gmail'])
             self.assertEqual(errors, [])
             self.assertIn('after:2026/10/04', t.subprocess.run.call_args.args[0][-1])
 

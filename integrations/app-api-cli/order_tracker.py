@@ -158,9 +158,10 @@ def mail_evidence(cfg):
             continue
         try:
             query = f'from {DOMAINS[cfg["app"]][0]} and after {search_day}'
-            listing = json.loads(run(['himalaya', 'envelope', 'search', '-a', account, '-m', 'Inbox', '-s', '10', '--json', query], min(8, deadline-time.monotonic())))
+            # himalaya-heal: refreshes the OAuth token and retries on XOAUTH2 failures.
+            listing = json.loads(run(['himalaya-heal', 'envelope', 'search', '-a', account, '-m', 'Inbox', '-s', '10', '--json', query], min(8, deadline-time.monotonic())))
             for h in listing.get('envelopes', []):
-                hits.append({'account': account, 'folder': 'Inbox', 'uid': h['id'],
+                hits.append({'account': account, 'folder': 'Inbox', 'uid': h['id'], 'via': 'himalaya',
                              'from': (h.get('from') or [{}])[0].get('email', ''),
                              'subject': h.get('subject', ''), 'date': h.get('date')})
         except (RuntimeError, subprocess.TimeoutExpired, ValueError):
@@ -185,7 +186,13 @@ def mail_evidence(cfg):
                 errors.append('email_read_budget_exhausted')
                 break
             try:
-                body = run(['himalaya', 'message', 'read', '-a', h['account'], '-m', h['folder'], str(h['uid'])], min(12, deadline-time.monotonic()))
+                # mailsearch hits carry IMAP UIDs; its reader self-heals OAuth (token refresh,
+                # other Outlook frontends). Fallback hits carry himalaya IDs.
+                if h.get('via') == 'himalaya':
+                    args = ['himalaya-heal', 'message', 'read', '-a', h['account'], '-m', h['folder'], str(h['uid'])]
+                else:
+                    args = ['mailsearch', 'read', h['account'], h['folder'], str(h['uid'])]
+                body = run(args, min(12, deadline-time.monotonic()))
             except (RuntimeError, subprocess.TimeoutExpired):
                 errors.append('email_read_unavailable')
                 continue
