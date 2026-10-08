@@ -331,7 +331,7 @@ export function ThreadDetailsPrRow({
               }
             : null;
 
-  const openRow = (text: string, part: "row" | "link-primary") => (
+  const openRow = (text: string, part: "row" | "primary") => (
     <Tooltip>
       <TooltipTrigger
         render={
