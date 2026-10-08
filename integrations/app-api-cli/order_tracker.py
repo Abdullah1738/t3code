@@ -35,6 +35,12 @@ ALIASES = {'minutes': 'noon', 'nownow': 'noon', 'noon-minutes': 'noon',
 DOMAINS = {'talabat': ('talabat.com',), 'noon': ('noon.com',),
            'careem': ('careem.com',), 'amazon': ('amazon.ae', 'amazon.com')}
 TERMINAL = {'delivered', 'cancelled'}
+# Talabat emails the account's "service charges Receipt" when an order completes
+# (8 Oct 2026: 12:36:16 for an owner-reported 12:36 arrival). The order ID is only
+# in the PDF attachment, which Gmail's X-GM-RAW search indexes.
+RECEIPT_ACCOUNTS = ('gmail',)
+RECEIPT_POLL_S = 45
+RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
 RANK = {'unknown': -1, 'placed': 0, 'preparing': 1, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 
@@ -197,6 +203,38 @@ def mail_evidence(cfg):
     return out, errors
 
 
+def talabat_receipt(cfg):
+    """Exact-order delivered evidence from Talabat's completion receipt email."""
+    search_day = dt.datetime.fromisoformat(cfg['placed_at']).date() - dt.timedelta(days=1)
+    query = f'from:talabat.com subject:receipt "{cfg["order"]}" after:{search_day.strftime("%Y/%m/%d")}'
+    args = ['mailsearch', '--json', '-t', '8', '-n', '5']
+    for account in RECEIPT_ACCOUNTS:
+        args += ['-a', account]
+    p = subprocess.run(args + [query], capture_output=True, text=True, timeout=12, env=store.clean_env())
+    data = json.loads(p.stdout)
+    errors = [f'receipt_email_unavailable:{a}' for a, s in data.get('status', {}).items() if not s.get('ok')]
+    placed = epoch(cfg['placed_at'])
+    for h in sorted(data.get('hits', []), key=lambda h: h.get('date') or ''):
+        domain = parseaddr(h.get('from', ''))[1].split('@')[-1].lower()
+        if not (domain == 'talabat.com' or domain.endswith('.talabat.com')):
+            continue
+        if not RECEIPT_SUBJECT.search(h.get('subject', '')):
+            continue
+        try:
+            # mailsearch prints the message date in this Mac's local time.
+            sent = dt.datetime.strptime(h['date'], '%Y-%m-%d %H:%M').astimezone()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if sent.timestamp() < placed - 60:
+            continue
+        return {'stage': 'delivered', 'source': 'talabat_receipt_email', 'confidence': 'exact_order',
+                'observed_at': sent.astimezone(dt.timezone.utc).isoformat(), 'email_date': sent.isoformat(),
+                'scope': 'order', 'evidence': 'Talabat service-charges receipt for this order ID '
+                '(sent when the order is completed): ' + h.get('subject', '')[:200],
+                'mail_key': f'{h.get("account")}:{h.get("folder")}:{h.get("uid")}'}, errors
+    return None, errors
+
+
 def single_allowed(cfg):
     if not cfg.get('single_active_order'):
         return False
@@ -227,7 +265,18 @@ def fetch(cfg, state, now):
             errors.append('native_status_unknown')
         except OrderError as exc:
             errors.append('native_' + str(exc).lower())
-    if now - state.get('mail_checked', 0) >= 300:
+    if cfg['app'] == 'talabat':
+        # Primary Talabat delivery signal while native order auth is guest-only.
+        if not state.get('receipt') and now - state.get('receipt_checked', 0) >= RECEIPT_POLL_S:
+            state['receipt_checked'] = now
+            try:
+                state['receipt'], state['receipt_errors'] = talabat_receipt(cfg)
+            except (RuntimeError, subprocess.TimeoutExpired, ValueError, OSError):
+                state['receipt_errors'] = ['receipt_email_unavailable']
+        if state.get('receipt'):
+            evidence.append(state['receipt'])
+        errors.extend(state.get('receipt_errors', []))
+    if now - state.get('mail_checked', 0) >= 300 and not state.get('receipt'):
         try:
             mails, errs = mail_evidence(cfg)
             state['mail_checked'] = now

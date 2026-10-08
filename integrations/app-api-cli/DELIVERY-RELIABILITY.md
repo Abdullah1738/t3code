@@ -62,3 +62,26 @@ complete detection-to-recipient loop and compare reported arrival times.
 Several older registrations are active without watchers; don't rearm them and
 send old delivery texts without checking owner context. Reconciliation records
 must distinguish historical investigation from live detection.
+
+## Talabat receipt email, 8 October 2026
+
+Lazy Cat 3943292030 (Moni) was delivered at 12:36 Dubai, but the watcher only
+fired `eta_elapsed` at 12:54. Native tracking is still guest-only
+(`ACCOUNT_CAPTURE_REQUIRED_GUEST_CATALOG_ONLY`). The phone journal got no
+Talabat order pushes that day. Generic email matching skipped the one signal
+that existed: Talabat's "Your service charges Receipt" email in `gmail`,
+sent 12:36:16. Its subject has no status word, and the order ID is only in the
+PDF attachment, which Gmail search indexes. So `classify(subject)` returned
+`unknown`, and the email was never treated as delivery evidence.
+
+From 25 Sep to 8 Oct, every Talabat order got one of these receipts, and each
+one's PDF order ID matched. Sent times line up with arrival: 12:36 vs a reported
+12:36 on 8 Oct, and 13:28 vs about 13:24 on 7 Oct.
+For Talabat orders, `talabat_receipt()` now runs an exact-ID Gmail search
+(`from:talabat.com subject:receipt "ID"`) every 45s. It checks the sender
+domain, the subject and the send time (must be after placement). A match counts
+as exact-order `delivered` evidence, alongside native status and pushes.
+Replay test: a check at 12:37 fires `stage_change delivered` once, with no later
+`eta_elapsed`. Amazon `email_*_unavailable` errors on 8 Oct came from
+intermittent Outlook XOAUTH2 failures and slow body reads. Gmail and
+mailsearch work. Receipts still depend on gmail OAuth health.
