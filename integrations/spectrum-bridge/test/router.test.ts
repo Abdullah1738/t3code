@@ -2223,6 +2223,53 @@ test("exhausted downloads persist one clear failure across reopen and never repl
   expect(h.backend.creates).toEqual([]);
 });
 
+test("a file Photon cannot download is copied from the Mac's Messages store instead of failing", async () => {
+  const pdf = Buffer.from("%PDF-1.7\nlocal\n%%EOF");
+  const requests: unknown[] = [];
+  const h = filesSetup({ recoverAttachment: async request => {
+    requests.push(request);
+    return { file: { data: pdf, mimeType: "application/pdf", name: "catalogue.pdf" }, detail: { reason: "copied", chatId: 1431 } };
+  } });
+  h.transport.downloadAttachment = async () => { throw new TransportError("attachmentTimeout", false); };
+  setSystemTime(10_000);
+  h.input("file", "What's rare?", { attachments: [{ ...attachment("application/pdf", pdf.length), fileName: "catalogue.pdf" }] });
+  await h.router.tick();
+  expect(requests).toEqual([{ fileName: "catalogue.pdf", totalBytes: pdf.length, mimeType: "application/pdf", receivedAt: 10_000, maxBytes: MAX_INCOMING_BYTES }]);
+  expect(h.controls()).toEqual([]);
+  expect(h.backend.prompts).toHaveLength(1);
+  const directory = join(h.root, "ses_1", "attachments");
+  expect(readFileSync(join(directory, readdirSync(directory)[0]!))).toEqual(pdf);
+  expect(h.backend.prompts[0]!.system).toContain("catalogue.pdf");
+});
+
+test("when the local copy also fails the turn still reaches the agent with a pull-it-yourself note", async () => {
+  let recoveries = 0;
+  const h = filesSetup({ recoverAttachment: async () => {
+    recoveries++;
+    return { detail: { reason: "messagesDownloadTimedOut", chatId: 1431, messageGuid: "MSG-GUID", missing: true } };
+  } });
+  let attempts = 0;
+  h.transport.downloadAttachment = async () => { attempts++; throw new TransportError("attachmentTimeout", true); };
+  setSystemTime(10_000);
+  h.input("file", "What's rare?", { attachments: [{ ...attachment("application/pdf", 67_578_445, "spc-att-1"), fileName: "VIC.pdf" }] });
+  for (const time of [10_000, 12_000, 16_000]) {
+    setSystemTime(time);
+    await h.router.tick();
+  }
+  expect(attempts).toBe(3);
+  expect(recoveries).toBe(1);
+  expect(h.controls()).toEqual([]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.text).toBe("What's rare?");
+  const system = h.backend.prompts[0]!.system!;
+  expect(system).toContain(`"VIC.pdf"`);
+  expect(system).toContain(`attachment guid "spc-att-1"`);
+  expect(system).toContain("imsg chat id 1431");
+  expect(system).toContain(`message guid "MSG-GUID"`);
+  expect(system).toContain("not yet downloaded from iCloud");
+  expect(system).toContain("AXPress the attachment bubble");
+});
+
 test("allows an empty file after the exact byte limit without accepting even one extra byte", async () => {
   for (const extraBytes of [0, 1]) {
     const h = filesSetup();

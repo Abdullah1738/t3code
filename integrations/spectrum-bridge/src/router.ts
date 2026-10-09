@@ -9,6 +9,7 @@ import { classifyDownloadFailure, ownerChatGuid, TransportError, type Normalized
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
 import { imessagePreferences } from "./preferred-model.ts";
 import { isAudio, SttError, type SttInput } from "./stt.ts";
+import type { Recover, RecoveryDetail } from "./local-attachments.ts";
 import { MAX_BLOB_BYTES, type InboundRecord, type OutboxPoll, type OutboxRecord, type Store } from "./store.ts";
 
 type Route = { id: string; directory: string; generation: number; createdAt?: number };
@@ -71,6 +72,8 @@ type Options = {
   openCodeConfigRoot?: string; quietMs?: number;
   /** Speech to text for voice messages. Without it, audio is stored like any other file. */
   transcribe?: (input: SttInput) => Promise<string>;
+  /** Fallback when Photon cannot download a file: copy it from this Mac's Messages store. */
+  recoverAttachment?: Recover;
   appsRoot?: string;
   /** Invisible rotation onto a fresh session: by age, or by the last observed context size. */
   rotateAfterMs?: number; rotateAtTokens?: number;
@@ -108,6 +111,19 @@ const FAILURE_NOTICE_GRACE = 5 * 60_000;
 type DeferredNotice = { turn: Turn; text: string; at: number };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const MiB = 1024 * 1024;
+/** imsg lookups, a Messages iCloud download of up to 90 seconds, and the copy. */
+const LOCAL_RECOVERY_MS = 240_000;
+
+/** Tells the agent a file did not arrive and how to fetch it from Messages itself. */
+function undeliveredNote(attachment: NormalizedInbound["attachments"][number], detail: RecoveryDetail & { photon?: string }): string {
+  const size = Number.isSafeInteger(attachment.totalBytes) ? `${(attachment.totalBytes / MiB).toFixed(1)} MB` : "unknown size";
+  const where = [
+    detail.chatId === undefined ? "" : `imsg chat id ${detail.chatId}`,
+    detail.messageGuid ? `message guid ${JSON.stringify(detail.messageGuid)}` : "",
+    detail.path ? `Messages path ${JSON.stringify(detail.path)}` : "",
+  ].filter(Boolean).join(", ");
+  return `- The owner sent ${JSON.stringify(attachment.fileName || "a file")} (${attachment.mimeType || "unknown type"}, ${size}, attachment guid ${JSON.stringify(attachment.guid)}), but the bridge could not download it (Photon: ${detail.photon ?? "failed"}; local Messages copy: ${detail.reason}${detail.missing ? ", not yet downloaded from iCloud" : ""}).${where ? ` Found in Messages: ${where}.` : ""} Pull it yourself before answering: find it with \`imsg history --chat-id <id> --attachments --json\` (match transfer_name), and if the file is missing, open that chat in Messages with cua-driver, AXPress the attachment bubble whose label has the file name, wait for the file to appear at original_path, then read it from there (the imsg skill has the steps). Only if that also fails, tell the owner briefly and ask them to resend.`;
+}
 /** Rows the bridge injects itself (secure-form notices, watcher wakes): never owner text, never a provider message. */
 const synthetic = (id: string) => id.startsWith("secret:") || id.startsWith("wake:");
 /**
@@ -1056,10 +1072,14 @@ export class Router {
       if (busy) { this.unsealBatch(row.id); return; }
     }
     const downloaded: (Parameters<typeof prepareIncoming>[0] & { guid: string })[] = [];
+    const undelivered: string[] = [];
     total = 0;
     for (const attachment of input.attachments) {
       const key = `incoming-file:${hash(attachment.guid)}`;
       const cached = this.store.get<{ sha256: string; size: number; mimeType: string; name: string }>(key);
+      // A file already given up on (Photon and the local copy) is passed on as a note.
+      const gaveUp = cached ? undefined : this.store.get<RecoveryDetail & { photon: string } | null>(`${key}:local`);
+      if (gaveUp) { undelivered.push(undeliveredNote(attachment, gaveUp)); continue; }
       const retry = this.store.get<{ attempts: number; nextAt: number }>(`${key}:retry`) ?? { attempts: 0, nextAt: 0 };
       if (!cached && retry.nextAt > Date.now()) { this.unsealBatch(row.id); return; }
       try {
@@ -1093,6 +1113,34 @@ export class Router {
           this.store.set(`${key}:retry`, { attempts: retry.attempts + 1, nextAt: Date.now() + 2_000 * 2 ** retry.attempts });
           this.unsealBatch(row.id);
           return;
+        }
+        if (failure.code !== "attachmentTooLarge" && this.options.recoverAttachment) {
+          // Photon gave up: pull the file from this Mac's Messages instead of dropping the turn.
+          let result: Awaited<ReturnType<Recover>>;
+          try {
+            result = await bounded(this.options.recoverAttachment({
+              fileName: attachment.fileName, totalBytes: attachment.totalBytes, mimeType: attachment.mimeType,
+              ...(input.receivedAt === undefined ? {} : { receivedAt: input.receivedAt }),
+              maxBytes: Math.max(1, MAX_INCOMING_BYTES - total),
+            }), LOCAL_RECOVERY_MS);
+          } catch { result = { detail: { reason: "recoveryTimedOut" } }; }
+          this.options.log?.("attachment-local-recovery", /^[A-Za-z]{1,32}$/.test(result.detail.reason) ? result.detail.reason : "unknown");
+          const recovered = result.file;
+          if (recovered && recovered.data instanceof Uint8Array && total + recovered.data.byteLength <= MAX_INCOMING_BYTES) {
+            total += recovered.data.byteLength;
+            if (recovered.data.byteLength <= MAX_BLOB_BYTES) this.store.db.transaction(() => {
+              const sha256 = this.store.putBlob(recovered.data);
+              this.store.set(key, { sha256, size: recovered.data.byteLength, mimeType: recovered.mimeType, name: recovered.name });
+            }).immediate();
+            if (interrupted()) return;
+            downloaded.push({ ...recovered, guid: attachment.guid });
+            continue;
+          }
+          const detail = { ...result.detail, photon: failure.code };
+          this.store.set(`${key}:local`, detail);
+          if (interrupted()) return;
+          undelivered.push(undeliveredNote(attachment, detail));
+          continue;
         }
         const reason = failure.code === "attachmentTooLarge" ? "Those files are over 100 MB total; could you send fewer?"
           : failure.code === "invalidAttachment" ? "That attachment came through broken. Mind resending it?"
@@ -1166,7 +1214,7 @@ export class Router {
     if (interrupted()) return;
     if (!this.current(activeRoute)) return;
     const parts: FilePart[] = [];
-    const notes: string[] = [];
+    const notes: string[] = [...undelivered];
     let previewBytes = 0;
     try {
       for (const file of files) {

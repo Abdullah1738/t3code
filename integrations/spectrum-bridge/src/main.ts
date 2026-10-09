@@ -17,6 +17,7 @@ import { Router } from "./router.ts";
 import { sweepSecrets } from "./secrets.ts";
 import { Store } from "./store.ts";
 import { transcribe } from "./stt.ts";
+import { createAttachmentRecovery } from "./local-attachments.ts";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -130,9 +131,12 @@ async function main(): Promise<void> {
   let chatGuid = store.get<string>("chatGuid");
   let paired = store.get<boolean>("paired") === true;
   if (chatGuid) { chatGuid = canonicalOwnerChat(chatGuid, config.owner); store.set("chatGuid", chatGuid); }
+  const recoverAttachment = createAttachmentRecovery({
+    rememberedChat: { get: () => store.get<number>("imsgChatId"), set: id => store.set("imsgChatId", id) },
+  });
   const makeRouter = () => chatGuid ? new Router(store, backend, photon, {
     ...config, chatGuid, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
-    transcribe: input => transcribe(input), log,
+    transcribe: input => transcribe(input), log, recoverAttachment,
   }) : undefined;
   router = makeRouter();
   const health = { photonLastOk: 0, backendLastOk: 0, lastError: "", startedAt: Date.now() };
