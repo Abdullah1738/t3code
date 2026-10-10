@@ -66,7 +66,10 @@ import {
 } from "../ui/alert-dialog";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { THREAD_DETAILS_PANEL_ICON_CLASS } from "./threadDetailsPanelStyles";
+import {
+  THREAD_DETAILS_PANEL_ICON_CLASS,
+  THREAD_DETAILS_PANEL_LABEL_CLASS,
+} from "./threadDetailsPanelStyles";
 
 export function ThreadDetailsPrRow({
   environmentId,
@@ -346,7 +349,9 @@ export function ThreadDetailsPrRow({
         }
       >
         {icon}
-        <span className="min-w-0 flex-1 truncate text-left">{text}</span>
+        <span className={cn("min-w-0 flex-1 truncate text-left", THREAD_DETAILS_PANEL_LABEL_CLASS)}>
+          {text}
+        </span>
       </TooltipTrigger>
       {rowTooltip}
     </Tooltip>

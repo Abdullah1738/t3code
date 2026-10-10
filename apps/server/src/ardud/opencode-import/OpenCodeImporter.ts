@@ -36,9 +36,9 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
-import * as IdAllocator from "../../orchestration-v2/IdAllocator.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
-import { makeSubagentChildThread } from "../../orchestration-v2/SubagentProjection.ts";
+import { makeSubagentChildThread } from "@t3tools/provider-core/server/subagentProjection";
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as OpenCodeHttp from "./OpenCodeHttp.ts";
