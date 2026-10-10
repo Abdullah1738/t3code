@@ -252,7 +252,7 @@ function ReviewQueueList(props: {
                 aria-current={active ? "true" : undefined}
                 onClick={() => props.onOpen(entry)}
                 className={cn(
-                  "flex w-full min-w-0 flex-col items-start gap-0.5 rounded-md px-2 py-1.5 pr-9 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring",
+                  "flex w-full min-w-0 flex-col items-start gap-0.5 rounded-md px-2 py-1.5 pr-9 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
                   active && "bg-accent",
                 )}
               >

@@ -124,6 +124,35 @@ const basic = (password: string) =>
   `Basic ${Buffer.from(`opencode:${password}`, "utf8").toString("base64")}`;
 
 /**
+ * Server URL and password of the opencode provider instance (the default
+ * `opencode` slot first), when both are set. Instance config is driver-owned
+ * and untyped here, so read it defensively.
+ */
+const openCodeServerConfig = (
+  instances: Readonly<Record<string, { readonly driver: string; readonly config?: unknown }>>,
+) => {
+  const candidates = [
+    instances["opencode"],
+    ...Object.values(instances).filter((instance) => instance.driver === "opencode"),
+  ];
+  for (const instance of candidates) {
+    if (instance === undefined || instance.driver !== "opencode") continue;
+    const config = instance.config;
+    if (config === null || typeof config !== "object") continue;
+    const { serverUrl, serverPassword } = config as Record<string, unknown>;
+    if (
+      typeof serverUrl === "string" &&
+      typeof serverPassword === "string" &&
+      serverUrl.trim().length > 0 &&
+      serverPassword.length > 0
+    ) {
+      return { serverUrl: serverUrl.trim(), serverPassword };
+    }
+  }
+  return undefined;
+};
+
+/**
  * The OpenCode server to read: the opencode provider's configured server URL
  * and password, else the local shared service's `service.json`.
  */
@@ -135,8 +164,8 @@ export const resolveConnection = (input: {
     if (Option.isSome(input.settings)) {
       const settings = yield* input.settings.value.getSettings.pipe(Effect.option);
       if (Option.isSome(settings)) {
-        const opencode = settings.value.providers.opencode;
-        if (opencode.serverUrl.trim().length > 0 && opencode.serverPassword.length > 0) {
+        const opencode = openCodeServerConfig(settings.value.providerInstances);
+        if (opencode !== undefined) {
           return {
             baseUrl: opencode.serverUrl.replace(/\/+$/, ""),
             authorization: basic(opencode.serverPassword),

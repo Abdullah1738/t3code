@@ -23,6 +23,11 @@ describe("faviconUrlForOrigin", () => {
     "http://service.test",
     "http://private.onion",
     "http://127.1..",
+    "https://grafana.corp",
+    "https://build.lan",
+    "https://wiki.intranet",
+    "https://grafana.internal.acme-corp.com",
+    "https://jira.corp.acme-corp.com:8443",
   ])("does not disclose %s to the favicon provider", (origin) => {
     expect(faviconUrlForOrigin(origin)).toBeNull();
   });

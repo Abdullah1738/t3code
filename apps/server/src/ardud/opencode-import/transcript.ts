@@ -17,8 +17,8 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
-import { openCodeToolTurnItem } from "../../orchestration-v2/Adapters/OpenCodeToolItems.ts";
-import { subagentThreadTitle } from "../../orchestration-v2/SubagentProjection.ts";
+import { openCodeToolTurnItem } from "@t3tools/provider-opencode/server/toolItems";
+import { subagentThreadTitle } from "@t3tools/provider-core/server/subagentProjection";
 import type { OpenCodeMessage, OpenCodePart, OpenCodeSession } from "./OpenCodeHttp.ts";
 
 export const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
