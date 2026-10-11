@@ -255,6 +255,8 @@ export interface ChatBackend {
   markImessageOrigin(id: string, directory?: string): Promise<"marked" | "already" | "missing">;
   /** Settles every other idle iMessage chat once the route moves to `keepId`. Best effort; returns how many it settled. */
   retireOthers?(keepId: string): Promise<number>;
+  /** True when the agent in this chat can reset its own context in place (Robob's t3_context_reset tool). */
+  resetsContext?(id: string): boolean;
   getSession(id: string, directory: string): Promise<SessionRecord | undefined>;
   children(id: string, directory: string): Promise<SessionRecord[]>;
   messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;

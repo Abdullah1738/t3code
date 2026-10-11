@@ -4,6 +4,7 @@ import { isEffect, type Photon, type ReactionKind } from "./photon.ts";
 import type { Router } from "./router.ts";
 import { forgetSecret, newToken, putSecretRequest, readSecret, SECRET_REQUEST_TTL_MS, SecretError, validFieldName, validFields,
   validToken } from "./secrets.ts";
+import { sessionMatches } from "./session.ts";
 import type { OutboxOperation, Store } from "./store.ts";
 
 type Options = {
@@ -106,10 +107,9 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
   const id = `${prefix}:${hash(dedupeKey)}`;
   const created = store.db.transaction(() => {
     const route = store.get<{ id: string; generation: number } | null>("route");
-    if (route?.id !== sessionId || !Number.isSafeInteger(route.generation) || route.generation < 0) {
-      throw new ApiError(409);
-    }
-    const operation: OutboxOperation = { id, kind: "conversation", ...content, sessionId, generation: route!.generation };
+    if (!sessionMatches(route, sessionId)) throw new ApiError(409);
+    // Delivery and the origin backfill match on the bare id.
+    const operation: OutboxOperation = { id, kind: "conversation", ...content, sessionId: route.id, generation: route.generation };
     const key = `api:${prefix}:${id}`;
     const spec = JSON.stringify(operation);
     const saved = store.get<{ spec: string }>(key);
@@ -270,19 +270,22 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const formFields = body.fields.map(({ name, label, type }) => ({ name, label, type }));
         const id = `secret-form:${hash(dedupeKey)}`;
         const savedKey = `api:secret-form:${id}`;
-        const spec = JSON.stringify({ purpose, fields: formFields, sessionId });
         const currentRoute = () => {
           const route = store.get<{ id: string; generation: number } | null>("route");
-          if (route?.id !== sessionId || !Number.isSafeInteger(route.generation) || route.generation < 0) throw new ApiError(409);
+          if (!sessionMatches(route, sessionId)) throw new ApiError(409);
           return route;
         };
+        // The canonical chat id, so a retry may name the session either way. The
+        // generation keeps a key reused after an in-place /new from replaying the
+        // previous conversation's form.
+        const asked = currentRoute();
+        const spec = JSON.stringify({ purpose, fields: formFields, sessionId: asked.id, generation: asked.generation });
         const replay = () => {
           const saved = store.get<SavedSecretRequest>(savedKey);
           if (!saved) return;
           if (saved.spec !== spec) throw new ApiError(409);
           return saved.result;
         };
-        currentRoute();
         const earlier = replay();
         if (earlier) return json(earlier, 200);
         let base: string;
@@ -293,12 +296,13 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         const result = { token, url: `${base.replace(/\/+$/, "")}/_secret/${token}`, expiresAt: now + SECRET_REQUEST_TTL_MS };
         const outcome = store.db.transaction(() => {
           const route = currentRoute();
+          if (route.generation !== asked.generation) throw new ApiError(409);
           // A concurrent request with the same key may have won while publishing.
           const raced = replay();
           if (raced) return { result: raced, created: false };
-          putSecretRequest(store, token, { sessionId, generation: route.generation, purpose, fields: formFields,
+          putSecretRequest(store, token, { sessionId: route.id, generation: route.generation, purpose, fields: formFields,
             createdAt: now, expiresAt: result.expiresAt, state: "open" });
-          store.enqueue({ id, kind: "conversation", text: "", sessionId, generation: route.generation,
+          store.enqueue({ id, kind: "conversation", text: "", sessionId: route.id, generation: route.generation,
             app: { url: result.url, caption: "Secure form", subcaption: purpose } });
           store.set(savedKey, { spec, result } satisfies SavedSecretRequest);
           return { result, created: true };
