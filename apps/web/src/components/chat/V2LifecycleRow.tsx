@@ -108,14 +108,17 @@ export function V2LifecycleRow(props: {
       item.beforeTokenCount === undefined && item.afterTokenCount === undefined
         ? null
         : `${item.beforeTokenCount ?? "?"} → ${item.afterTokenCount ?? "?"} tokens`;
+    // ardud: agent-requested context resets reuse the compaction divider.
     const label =
-      item.status === "failed"
-        ? "Context compaction failed"
-        : item.status === "cancelled" || item.status === "interrupted"
-          ? "Context compaction stopped"
-          : item.status === "pending" || item.status === "running" || item.status === "waiting"
-            ? "Compacting context"
-            : "Context compacted";
+      item.title === "Context reset"
+        ? item.title
+        : item.status === "failed"
+          ? "Context compaction failed"
+          : item.status === "cancelled" || item.status === "interrupted"
+            ? "Context compaction stopped"
+            : item.status === "pending" || item.status === "running" || item.status === "waiting"
+              ? "Compacting context"
+              : "Context compacted";
     return (
       <TimelineSystemDivider label={label} detail={item.summary ?? tokenDetail} icon={MinusIcon} />
     );

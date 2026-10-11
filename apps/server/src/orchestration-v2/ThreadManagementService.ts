@@ -116,6 +116,8 @@ export interface ThreadManagementSendInput {
   readonly mode: ThreadManagementSendMode;
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
+  /** ardud: start the message on a fresh provider thread (context reset). */
+  readonly contextReset?: boolean;
 }
 
 export interface ThreadManagementSendResult {
@@ -631,6 +633,7 @@ const make = Effect.gen(function* () {
         dispatchMode,
         createdBy: input.createdBy,
         creationSource: input.creationSource,
+        ...(input.contextReset === true ? { contextReset: true } : {}),
       });
       const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
         messageIds: [input.messageId],

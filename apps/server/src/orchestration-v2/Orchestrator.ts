@@ -130,6 +130,7 @@ import {
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
+import { contextResetTurnItem } from "../ardud/context-reset/divider.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDispatchError>()(
@@ -1815,6 +1816,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   payload: handoffTurnItem,
                 },
               ]),
+          // ardud: divider for a run that starts a fresh provider thread.
+          ...(queuedRun.contextReset === true
+            ? [
+                {
+                  type: "turn-item.updated" as const,
+                  threadId,
+                  runId: queuedRun.id,
+                  nodeId: rootNodeId,
+                  providerInstanceId: queuedRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: contextResetTurnItem({
+                    id: idAllocator.derive.runSignalTurnItem({
+                      runId: queuedRun.id,
+                      signal: "context-reset",
+                    }),
+                    threadId,
+                    run: queuedRun,
+                    nodeId: rootNodeId,
+                    providerThread: queuedProviderThread,
+                    now,
+                  }),
+                },
+              ]
+            : []),
           ...sessionsToDetach.map((session) => ({
             type: "provider-session.detached" as const,
             threadId,
@@ -4900,10 +4925,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const now = yield* DateTime.now;
         const ordinal = nextRunOrdinal(projection);
         const runId = idAllocator.derive.run({ threadId: command.threadId, ordinal });
+        // ardud: a context reset always mints a fresh provider thread.
         const targetProviderThread =
-          modelSelection.instanceId === queueProviderThread.providerInstanceId
-            ? queueProviderThread
-            : rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0];
+          command.contextReset === true
+            ? undefined
+            : modelSelection.instanceId === queueProviderThread.providerInstanceId
+              ? queueProviderThread
+              : rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0];
         const queuedAdapter = yield* providerAdapters
           .get(modelSelection.instanceId)
           .pipe(mapDispatchError(command));
@@ -5007,6 +5035,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ? {}
             : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
           ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+          ...(command.contextReset === true ? { contextReset: true } : {}),
         };
         const attempt: OrchestrationV2RunAttempt = {
           id: attemptId,
@@ -5238,6 +5267,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               }),
           ),
         );
+        // ardud: a context reset always mints a fresh provider thread.
+        const reusedProviderThread =
+          command.contextReset === true ? undefined : activeProviderThread;
         const providerSessionId =
           activeProviderThread?.providerSessionId ??
           (yield* mapDispatchError(command)(
@@ -5248,7 +5280,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
           ));
         const providerThreadId =
-          activeProviderThread?.id ??
+          reusedProviderThread?.id ??
           idAllocator.derive.providerThread({
             driver: adapter.driver,
             nativeThreadId: `pending:${runId}`,
@@ -5270,7 +5302,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .pipe(mapDispatchError(command))
           : null;
         const providerThread: OrchestrationV2ProviderThread =
-          activeProviderThread === undefined
+          reusedProviderThread === undefined
             ? {
                 id: providerThreadId,
                 driver: adapter.driver,
@@ -5289,11 +5321,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 updatedAt: now,
               }
             : {
-                ...activeProviderThread,
+                ...reusedProviderThread,
                 providerSessionId,
                 lastRunOrdinal: ordinal,
                 handoffIds: appendContextHandoffId(
-                  activeProviderThread.handoffIds,
+                  reusedProviderThread.handoffIds,
                   legacyImportHandoff?.id ?? null,
                 ),
                 updatedAt: now,
@@ -5350,6 +5382,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ? { workspacePreparation: dispatchMode.workspaceStrategy }
             : {}),
           ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+          ...(command.contextReset === true ? { contextReset: true } : {}),
           ...wakeWorkStartedAt(projection.runs, command),
         };
         const attempt: OrchestrationV2RunAttempt = {
@@ -5546,6 +5579,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             payload: preparationTurnItem,
           });
         }
+        // ardud: divider for an agent-requested context reset.
+        if (command.contextReset === true) {
+          yield* emitEvent({
+            type: "turn-item.updated",
+            threadId: command.threadId,
+            runId,
+            nodeId: rootNodeId,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: contextResetTurnItem({
+              id: idAllocator.derive.runSignalTurnItem({ runId, signal: "context-reset" }),
+              threadId: command.threadId,
+              run: { id: runId, ordinal },
+              nodeId: rootNodeId,
+              providerThread,
+              now,
+            }),
+          });
+        }
         const pendingEffect = {
           id: `effect:${command.commandId}:provider-turn.start:${runId}`,
           commandId: command.commandId,
@@ -5622,10 +5674,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
+      // ardud: a context reset always mints a fresh provider thread.
       const targetProviderThread =
-        isProviderSwitch && !canResumeAcrossInstances
-          ? rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0]
-          : activeProviderThread;
+        command.contextReset === true
+          ? undefined
+          : isProviderSwitch && !canResumeAcrossInstances
+            ? rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0]
+            : activeProviderThread;
       const providerSessionId =
         (canResumeAcrossInstances ? undefined : targetProviderThread?.providerSessionId) ??
         (yield* mapDispatchError(command)(
@@ -6044,6 +6099,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
+        ...(command.contextReset === true ? { contextReset: true } : {}),
         ...wakeWorkStartedAt(projection.runs, command),
       };
       const attempt: OrchestrationV2RunAttempt = {
@@ -6419,6 +6475,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           providerInstanceId: modelSelection.instanceId,
           occurredAt: now,
           payload: handoffTurnItem,
+        });
+      }
+      // ardud: divider for a run that starts a fresh provider thread.
+      if (command.contextReset === true) {
+        yield* emitEvent({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          runId,
+          nodeId: rootNodeId,
+          providerInstanceId: modelSelection.instanceId,
+          occurredAt: now,
+          payload: contextResetTurnItem({
+            id: idAllocator.derive.runSignalTurnItem({ runId, signal: "context-reset" }),
+            threadId: command.threadId,
+            run: { id: runId, ordinal },
+            nodeId: rootNodeId,
+            providerThread,
+            now,
+          }),
         });
       }
       yield* emitEvent({
