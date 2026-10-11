@@ -288,6 +288,9 @@ export function summarizeT3ToolCalls(
     case "secret-request":
       label = phrase("Asked for", "ask for", quantity(selected.length, "secret"));
       break;
+    case "context-reset":
+      label = phrase("Reset", "reset", `thread context ${times}`);
+      break;
     case "worktree-handoff":
       label = phrase(
         "Handed off to",

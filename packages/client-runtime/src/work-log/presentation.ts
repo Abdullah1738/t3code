@@ -53,8 +53,10 @@ export function contextCompactionLabel(
   item: Pick<
     Extract<OrchestrationV2TurnItem, { type: "compaction" }>,
     "status" | "beforeTokenCount" | "afterTokenCount"
-  >,
+  > & { readonly title?: string | null },
 ): string {
+  // ardud: agent-requested context resets reuse the compaction item.
+  if (item.title === "Context reset") return item.title;
   if (item.status === "running") return "Compacting context";
   if (item.beforeTokenCount !== undefined && item.afterTokenCount !== undefined) {
     return `Context compacted ${formatTokens(item.beforeTokenCount)} → ${formatTokens(item.afterTokenCount)} tokens`;
@@ -623,6 +625,7 @@ function summaryActionPriority(action: ToolGroupAction | T3McpToolSummaryAction)
     case "queue-reorder":
     case "queue-steer":
     case "question-respond":
+    case "context-reset":
     case "worktree-handoff":
     case "project-create":
     case "project-update":

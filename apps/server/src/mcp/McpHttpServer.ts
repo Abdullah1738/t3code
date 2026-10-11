@@ -48,6 +48,10 @@ import {
 import * as WorktreeHandlers from "./toolkits/worktree/handlers.ts";
 import { WorktreeToolkit } from "./toolkits/worktree/tools.ts";
 import * as WorktreeMcpService from "./WorktreeMcpService.ts";
+// ardud fork: same-thread context reset tool.
+import * as ContextResetHandlers from "../ardud/context-reset/handlers.ts";
+import * as ContextResetService from "../ardud/context-reset/ContextResetService.ts";
+import { ContextResetToolkit } from "../ardud/context-reset/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -820,6 +824,10 @@ const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,
   WorktreeHandlers.layer,
 ).pipe(Layer.provide(WorktreeMcpService.layer));
+const layerContextResetToolkitRegistration = toolkitRegistration(
+  ContextResetToolkit,
+  ContextResetHandlers.layer,
+).pipe(Layer.provide(ContextResetService.layer));
 
 const layerPreviewControlsRegistration = toolkitRegistration(
   PreviewControlsToolkit,
@@ -875,6 +883,7 @@ export const layer = Layer.mergeAll(
   layerEnvironmentToolkit,
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,
+  layerContextResetToolkitRegistration,
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,
