@@ -283,6 +283,8 @@ Evidence fails closed: anything not positively identified is `unknown`, and the 
   again makes the result `unknown`.
 - Frontend `done` needs a successful run of the repo's configured deploy workflow
   (`deploy-dev.yml`) that executed a deploy job and whose head contains the requested sha.
+  crypko-frontend's CI (`ci.yml`) also deploys dev: a push run on `main-dev` whose `Deploy to Dev`
+  job succeeded counts too (a skipped job does not), and runtime is the deploy that finished last.
 - Terraform, DDL and migration outcomes are recorded by hand (`release reconcile`), not read from logs.
 - No ECS readback yet: deployed means the deploy workflow succeeded with matching inputs, not that
   every ECS service runs the digest with `rolloutState=COMPLETED`.

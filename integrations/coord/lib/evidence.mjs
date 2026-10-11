@@ -22,6 +22,10 @@ export const FRONTEND_DEPLOY = {
   'equicom-crypto/crypko-frontend': 'deploy-dev.yml',
   'equicom-crypto/backoffice-frontend': 'deploy-dev.yml',
 };
+// Frontends whose CI workflow also deploys dev: on a push to the deploy branch, from this job.
+export const FRONTEND_CI_DEPLOY = {
+  'equicom-crypto/crypko-frontend': { workflow: 'ci.yml', job: 'Deploy to Dev' },
+};
 // GitHub only allows re-running a workflow run within 30 days of its creation; one day of margin.
 const RERUN_WINDOW = 31 * 86400;
 const MAX_PAGES = 10;
@@ -40,6 +44,7 @@ const ghJson = async (gh, args) => JSON.parse((await gh(args)) || 'null');
 const unknown = reason => ({ state: 'unknown', reason, why: reason });
 const sec = t => Math.floor((Date.parse(t ?? '') || 0) / 1000);
 const attemptTime = r => sec(r.run_started_at ?? r.created_at);
+const endTime = r => sec(r.updated_at ?? r.run_started_at ?? r.created_at);
 const isWorkflow = (r, file) => (r?.path ?? '').split('@')[0].endsWith(`/${file}`);
 
 // The deploy workflow validates its inputs in two log lines; both must agree on env and binary.
@@ -90,8 +95,8 @@ export async function deployRunInputs(id, { gh = ghText, attempt = 1 } = {}) {
 // A run's latest attempt that provably changed nothing does not erase what an earlier attempt of the
 // same run did. `probe(attempt)` classifies one attempt: { skip } (provably changed nothing), { match, data },
 // { unknown }, or {} (another target). Walks back from the latest attempt; the first attempt that is not
-// a skip decides the run, and its start time (`at`) is the run's place in the execution order.
-async function throughAttempts(gh, repo, r, probe) {
+// a skip decides the run, and its `time` (start by default) is the run's place in the execution order.
+async function throughAttempts(gh, repo, r, probe, time = attemptTime) {
   const latest = r.run_attempt ?? 1;
   for (let k = latest; k >= 1; k--) {
     let a = r;
@@ -102,7 +107,7 @@ async function throughAttempts(gh, repo, r, probe) {
     }
     const m = await probe(a);
     if (m?.skip) continue;
-    return { ...m, attempt: k, at: attemptTime(a) };
+    return { ...m, attempt: k, at: time(a) };
   }
   return {};
 }
@@ -112,13 +117,14 @@ async function throughAttempts(gh, repo, r, probe) {
 // that matches, is unknown, or is unfinished, and only once every workflow has been paged back past that
 // attempt's time minus the rerun window (no unseen run can have a newer attempt). Otherwise: unknown.
 // `identify` may place a run earlier than its latest attempt (`at`), when only an earlier attempt of it
-// did anything; the order is then recomputed with that time.
-async function latestAttempt({ gh, repo, workflows, identify, maxPages = MAX_PAGES }) {
+// did anything; the order is then recomputed with that time. `time` orders attempts (start by default);
+// `query` adds list filters per workflow file.
+async function latestAttempt({ gh, repo, workflows, identify, maxPages = MAX_PAGES, query = {}, time = attemptTime }) {
   maxPages ??= MAX_PAGES;
   const seen = new Map();
   const memo = new Map();
   const eff = new Map();
-  const when = r => eff.get(r._key) ?? attemptTime(r);
+  const when = r => eff.get(r._key) ?? time(r);
   const lists = Object.fromEntries(workflows.map(w => [w, { page: 0, done: false, oldest: Infinity }]));
   for (;;) {
     let decided = null;
@@ -132,7 +138,7 @@ async function latestAttempt({ gh, repo, workflows, identify, maxPages = MAX_PAG
           try { m = await identify(r); } catch (e) { m = { unknown: `run ${r.id} attempt ${r.run_attempt ?? 1} unreadable: ${e.message}` }; }
           memo.set(r._key, { r, m });
         }
-        if (m.at !== undefined && m.at < attemptTime(r) && !eff.has(r._key)) { eff.set(r._key, m.at); again = true; break; }
+        if (m.at !== undefined && m.at < time(r) && !eff.has(r._key)) { eff.set(r._key, m.at); again = true; break; }
         if (m.unknown) { decided = { r, out: unknown(m.unknown) }; break; }
         if (m.match) { decided = { r, out: { state: 'known', r, attempt: m.attempt ?? r.run_attempt ?? 1, data: m.data, considered: () => [...memo.values()].map(x => x.r) } }; break; }
       }
@@ -143,7 +149,7 @@ async function latestAttempt({ gh, repo, workflows, identify, maxPages = MAX_PAG
     for (const w of more) {
       const l = lists[w];
       if (l.page >= maxPages) return unknown(`run list of ${w} not covered after ${maxPages} pages`);
-      const res = await ghJson(gh, ['api', `repos/${repo}/actions/workflows/${w}/runs?per_page=100&page=${++l.page}`]);
+      const res = await ghJson(gh, ['api', `repos/${repo}/actions/workflows/${w}/runs?per_page=100&page=${++l.page}${query[w] ?? ''}`]);
       const runs = res?.workflow_runs ?? [];
       for (const r of runs) { seen.set(`${w}:${r.id}`, { ...r, _key: `${w}:${r.id}` }); l.oldest = Math.min(l.oldest, sec(r.created_at)); }
       if (runs.length < 100) l.done = true;
@@ -208,20 +214,46 @@ async function frontendExecuted(gh, repo, r) {
   return executed;
 }
 
-// What is live for a frontend repo: the head of its newest executed deploy-workflow attempt.
+// The CI workflow's dev deploy job in one attempt: 'none' (not a push to the deploy branch, or the job never
+// started), 'missing' (the attempt has jobs but not that one), or the job's conclusion.
+async function ciDeploy(gh, repo, r) {
+  if (r.event !== 'push' || r.head_branch !== BRANCH) return 'none';
+  const key = `feci:${repo}:${r.id}:${r.run_attempt ?? 1}`;
+  const hit = get('SELECT inputs FROM run_inputs WHERE run_id=?', key);
+  if (hit) return JSON.parse(hit.inputs).deploy;
+  const { jobs, done } = await attemptJobs(gh, repo, r.id, r.run_attempt ?? 1, { logs: false });
+  if (!done) throw new Error('jobs not finished');
+  const j = jobs.find(x => x.name === FRONTEND_CI_DEPLOY[repo].job);
+  const started = j && j.conclusion !== 'skipped' && (!Array.isArray(j.steps) || j.steps.some(s => s.conclusion !== 'skipped'));
+  const deploy = !j ? (jobs.length ? 'missing' : 'none') : started ? j.conclusion : 'none';
+  run('INSERT OR REPLACE INTO run_inputs (run_id,inputs,at) VALUES (?,?,?)', key, JSON.stringify({ deploy }), Math.floor(Date.now() / 1000));
+  return deploy;
+}
+
+// What is live for a frontend repo: the head of its newest executed deploy-workflow attempt. A repo whose
+// CI also deploys has two sources; then the attempt that finished last wins.
 // Returns { state: 'known'|'unknown', sha, tag: null, digest: null, run, attempt, reason }.
 export async function frontendRuntime({ repo, env = 'dev', gh = ghText } = {}) {
   requireEnv(env);
   repo = String(repo ?? '').toLowerCase();
   const wf = FRONTEND_DEPLOY[repo];
   if (!wf) return shape('unknown', { reason: `no deploy workflow configured for ${repo}` });
+  const ci = FRONTEND_CI_DEPLOY[repo];
+  const time = ci ? endTime : attemptTime;
   const found = await latestAttempt({
-    gh, repo, workflows: [wf],
+    gh, repo, workflows: ci ? [wf, ci.workflow] : [wf], time,
+    query: ci ? { [ci.workflow]: `&event=push&branch=${BRANCH}` } : {},
     identify: r => throughAttempts(gh, repo, r, async a => {
+      if (ci && isWorkflow(a, ci.workflow)) {
+        const d = await ciDeploy(gh, repo, a);
+        if (d === 'none') return { skip: true };
+        if (d !== 'success' || a.conclusion !== 'success') return { unknown: `latest CI run ${a.id} attempt ${a.run_attempt}: ${ci.job} ${d}, run ${a.conclusion}` };
+        return { match: true, data: { sha: a.head_sha } };
+      }
       if (!(await frontendExecuted(gh, repo, a))) return { skip: true };
       if (a.conclusion !== 'success') return { unknown: `latest deploy run ${a.id} attempt ${a.run_attempt} ended ${a.conclusion}` };
       return { match: true, data: { sha: a.head_sha } };
-    }),
+    }, time),
   }).catch(e => unknown(e.message));
   if (found.state !== 'known') return shape('unknown', { reason: found.reason });
   const moved = await recheckConsidered(gh, repo, found);
@@ -310,13 +342,15 @@ async function observeFrontend(r, gh) {
   if (!r.deploy_run) return { state: 'running', why: 'no deploy run recorded' };
   const wf = FRONTEND_DEPLOY[r.repo];
   if (!wf) return unknown(`no deploy workflow configured for ${r.repo}`);
+  const ci = FRONTEND_CI_DEPLOY[r.repo];
   const d = await runInfo(r.repo, r.deploy_run, { gh });
-  if (!isWorkflow(d, wf)) return unknown(`run ${r.deploy_run} is ${d?.path}, not ${wf}`);
+  const viaCi = ci && isWorkflow(d, ci.workflow);
+  if (!viaCi && !isWorkflow(d, wf)) return unknown(`run ${r.deploy_run} is ${d?.path}, not ${wf}${ci ? ` or ${ci.workflow}` : ''}`);
   if (d.status !== 'completed') return { state: 'running', why: 'deploy run not finished' };
   if (d.conclusion !== 'success')
     return (await recheck(gh, r.repo, d).catch(() => false)) ? { state: 'failed', failure: `deploy run ${d.conclusion}` } : unknown(`run ${d.id} changed while reading`);
   let executed;
-  try { executed = await frontendExecuted(gh, r.repo, d); } catch (e) { return unknown(`deploy run jobs unreadable: ${e.message}`); }
+  try { executed = viaCi ? (await ciDeploy(gh, r.repo, d)) === 'success' : await frontendExecuted(gh, r.repo, d); } catch (e) { return unknown(`deploy run jobs unreadable: ${e.message}`); }
   if (!executed) return unknown(`deploy run ${d.id} executed no deploy job`);
   let ok;
   try { ok = await contains(r.repo, r.git_sha, d.head_sha, { gh }); } catch (e) { return unknown(`compare failed: ${e.message}`); }
