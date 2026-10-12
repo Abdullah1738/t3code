@@ -290,6 +290,12 @@ test("an unmapped ses_ route is retired so the next text starts a fresh chat", a
   expect(await retireUnresolvedRoute(store, backend)).toBe(false);
 });
 
+test("Robob threads reset their own context; imported ses_ routes don't", () => {
+  const backend = fakeControl().backend();
+  expect(backend.resetsContext("thread-1")).toBe(true);
+  expect(backend.resetsContext("ses_legacy")).toBe(false);
+});
+
 test("SSE parser yields id, event and JSON data, skipping comments", async () => {
   const body = new Response(": ping\n\nid: 7\nevent: thread.status\ndata: {\"type\":\"thread.status\",\"state\":\"idle\"}\n\nid: 8\ndata: not json\n\n").body!;
   const frames = [];

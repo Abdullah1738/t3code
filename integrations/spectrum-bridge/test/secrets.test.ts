@@ -272,6 +272,30 @@ describe("secret API routes", () => {
     expect((await h.call("/secret-request", { ...request, purpose: "Other" })).status).toBe(409);
   });
 
+  test("secret-request names the session by marker or bare id, and a key reused after /new doesn't replay the old form", async () => {
+    const h = setup();
+    const first = await h.call("/secret-request", { ...request, sessionId: "current@5" });
+    expect(first.status).toBe(202);
+    const result = await first.json();
+    const bare = await h.call("/secret-request", request);
+    expect(bare.status).toBe(200);
+    expect(await bare.json()).toEqual(result);
+    store.set("route", { id: "current", generation: 6 });
+    expect((await h.call("/secret-request", { ...request, sessionId: "current@5" })).status).toBe(409);
+    expect((await h.call("/secret-request", request)).status).toBe(409);
+    expect(store.pendingOutbox()).toHaveLength(1);
+    expect(h.published()).toBe(1);
+  });
+
+  test("secret-request refuses a form whose conversation was reset while it was publishing", async () => {
+    const h = setup(async () => {
+      store.set("route", { id: "current", generation: 6 });
+      return "https://mac.tailnet.ts.net:18400";
+    });
+    expect((await h.call("/secret-request", request)).status).toBe(409);
+    expect(store.pendingOutbox()).toEqual([]);
+  });
+
   test("secret-request validates input, the route, and publishing", async () => {
     const h = setup();
     for (const body of [{ ...request, fields: [] }, { ...request, fields: Array(9).fill(FIELDS[0]) },

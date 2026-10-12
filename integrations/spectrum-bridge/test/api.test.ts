@@ -246,6 +246,23 @@ test("session files bind the current generation and reject stale, missing, or ma
   expect(h.reactions).toEqual([]);
 });
 
+test("a chat reset in place keeps its id, so a generation-tagged session rejects sends from before the reset", async () => {
+  const h = setup();
+  h.store.set("route", { id: "current", generation: 7 });
+  const id = `file:${hash(file.dedupeKey)}`;
+  expect((await h.post("/files", { ...file, sessionId: "current@7" })).status).toBe(202);
+  // The canonical chat id is stored, never the tag.
+  expect(h.store.getOperation(id)).toMatchObject({ sessionId: "current", generation: 7 });
+  expect((await h.post("/files", { ...file, sessionId: "current@6", dedupeKey: "stale" })).status).toBe(409);
+  expect((await h.post("/files", { ...file, sessionId: "other@7", dedupeKey: "other" })).status).toBe(409);
+  h.store.set("route", { id: "current", generation: 8 });
+  expect((await h.post("/files", { ...file, sessionId: "current@7", dedupeKey: "after-reset" })).status).toBe(409);
+  // The bare id still follows the live chat (robob-watch and wacli-guard read it from the route).
+  expect((await h.post("/files", { ...file, dedupeKey: "bare" })).status).toBe(202);
+  expect(h.store.getOperation(`file:${hash("bare")}`)).toMatchObject({ sessionId: "current", generation: 8 });
+  for (const key of ["stale", "other", "after-reset"]) expect(h.store.getOperation(`file:${hash(key)}`)).toBeUndefined();
+});
+
 test("file dedupe conflicts and transaction failures roll back blob, operation, and metadata changes", async () => {
   const h = setup();
   h.store.set("route", { id: "current", generation: 1 });

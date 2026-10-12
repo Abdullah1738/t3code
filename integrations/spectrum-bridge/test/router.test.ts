@@ -10,7 +10,7 @@ import { OpenChamber, type FilePart, type MessageRecord, type PermissionRequest,
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, OWNER_GIVE_UP_MS, OWNER_RESEND_MS, replyQuote, replyText, Router, SYNTHETIC_RETRY_MS, syntheticDropped } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, OWNER_GIVE_UP_MS, OWNER_RESEND_MS, replyQuote, replyText, ROTATE_NUDGE, Router, SYNTHETIC_RETRY_MS, syntheticDropped } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import type { SttInput } from "../src/stt.ts";
 
@@ -96,7 +96,14 @@ class Backend extends OpenChamber {
     this.reads.push(["questions", sessionId, directory]);
     return (this.questionBehavior ? await this.questionBehavior() : this.questionRequests).filter(q => q.sessionID === sessionId);
   }
-  override async abort(id: string, directory: string) { this.aborts.push([id, directory]); return true; }
+  abortBehavior?: () => Promise<boolean>;
+  override async abort(id: string, directory: string) {
+    this.aborts.push([id, directory]);
+    return this.abortBehavior ? this.abortBehavior() : true;
+  }
+  /** Robob chats reset their context in place; OpenChamber ones don't. */
+  resets = false;
+  resetsContext() { return this.resets; }
   permissionReplySessions: string[] = [];
   override async permissionReply(sessionId: string, id: string, directory: string, reply: "once" | "reject") {
     this.permissionReplySessions.push(sessionId);
@@ -2467,7 +2474,7 @@ test("default quiet period batches separately received text, image, file, and ca
   expect(prompt).toMatchObject({ messageId: messageId("intro"), text: "Compare these\nin detail\nFirst image\nUse the table too", id: "ses_1" });
   expect(prompt.system).toContain('Current incoming message ID: "caption"');
   expect(prompt.system).toContain(JSON.stringify(ids));
-  expect(prompt.system).toContain("CURRENT_SESSION_ID for bridge commands: ses_1.");
+  expect(prompt.system).toContain("CURRENT_SESSION_ID for bridge commands: ses_1@1.");
   expect(prompt.system).toContain("--session CURRENT_SESSION_ID");
   expect(prompt.system).toContain(options.skillPath);
   expect(prompt.system).toContain('"name":"table.csv"');
@@ -3563,7 +3570,7 @@ test.each(["age", "tokens", "undelivered", "busy-child", "below-tokens"])("invis
   const h = setup(":memory:", kind === "tokens" || kind === "below-tokens" ? { rotateAtTokens: 250 } : { rotateAfterMs: 60_000 });
   h.input("first", "Remember the blue one");
   await h.router.tick();
-  expect(h.store.get<unknown>("route")).toEqual({ id: "ses_1", directory: "/Chats/ses_1", generation: 1, createdAt: start });
+  expect(h.store.get<unknown>("route")).toEqual({ id: "ses_1", directory: "/Chats/ses_1", generation: 1, createdAt: start, threadAt: start });
   const final = h.backend.final("Noted, the blue one");
   final.tokens = { input: 200, cache: { read: kind === "below-tokens" ? 49 : 50, write: 0 } };
   await h.router.tick();
@@ -3584,7 +3591,7 @@ test.each(["age", "tokens", "undelivered", "busy-child", "below-tokens"])("invis
   expect(h.controls()).toEqual([]);
   const system = h.backend.prompts[1]!.system!;
   if (rotated) {
-    expect(h.store.get<unknown>("route")).toEqual({ id: "ses_2", directory: "/Chats/ses_2", generation: 1, createdAt: start + 60_000 });
+    expect(h.store.get<unknown>("route")).toEqual({ id: "ses_2", directory: "/Chats/ses_2", generation: 1, createdAt: start + 60_000, threadAt: start + 60_000 });
     expect(system).toContain("CURRENT_SESSION_ID for bridge commands: ses_2");
     expect(system).toContain("Continuity: this conversation continues seamlessly");
     expect(system).toContain('Files from earlier remain under "/Chats/ses_1"');
@@ -3670,6 +3677,224 @@ test("a legacy route without createdAt starts its rotation clock instead of rota
   expect(h.backend.creates).toEqual([]);
   expect(h.backend.prompts.map(p => p.id)).toEqual(["ses_legacy"]);
   expect(h.store.get<unknown>("route")).toEqual({ id: "ses_legacy", directory: "/Chats/ses_legacy", generation: 3, createdAt: start });
+});
+
+/** One settled owner exchange on the current route, with the reply marked delivered. */
+async function exchange(h: ReturnType<typeof setup>, id: string, text: string, answer: string) {
+  h.input(id, text);
+  await h.router.tick();
+  h.backend.final(answer);
+  await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+}
+
+test("/new asks the agent to reset its own context in the same chat", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const events: string[][] = [];
+  const h = setup(":memory:", { log: (event, code) => events.push([event, code ?? ""]) });
+  h.backend.resets = true;
+  await exchange(h, "first", "Remember the blue one", "Noted, the blue one");
+  setSystemTime(start + 60_000);
+  h.input("new", "/new");
+  await h.router.tick();
+  expect(h.controls().map(op => op.text)).toEqual(["Fresh start. What's up?"]);
+  expect(h.backend.creates).toHaveLength(1);
+  expect(h.store.get<unknown>("route")).toEqual({ id: "ses_1", directory: "/Chats/ses_1", generation: 2, createdAt: start + 60_000, threadAt: start });
+  expect(events).toContainEqual(["context-reset-nudged", "new"]);
+  await h.router.tick();
+  const nudge = h.backend.prompts.at(-1)!;
+  expect([nudge.id, nudge.text]).toEqual(["ses_1", NEW_CHAT_NUDGE]);
+  expect(nudge.system).toContain("CURRENT_SESSION_ID for bridge commands: ses_1@2.");
+  // The agent resets and stays silent: nothing reaches the owner.
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  h.input("next", "Hi");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)).toMatchObject({ id: "ses_1", text: "Hi" });
+  expect(h.backend.prompts.at(-1)!.system).not.toContain("Continuity:");
+  h.backend.final("Hey");
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.sessionId, op.generation])).toEqual([["Hey", "ses_1", 2]]);
+});
+
+test("/new during a running turn stops it, and its late answer never reaches the owner", async () => {
+  const h = setup(":memory:", { watchMs: 0 });
+  h.backend.resets = true;
+  h.input("old", "Old question");
+  await h.router.tick();
+  h.input("new", "/new");
+  await h.router.tick();
+  expect(h.backend.aborts).toEqual([["ses_1", "/Chats/ses_1"]]);
+  expect(h.store.db.query("SELECT state FROM inbound WHERE id = 'old'").get()).toEqual({ state: "cancelled" });
+  // The old turn finishes anyway before the nudge goes out.
+  h.backend.final("Stale answer");
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => [p.id, p.text])).toEqual([["ses_1", "Old question"], ["ses_1", NEW_CHAT_NUDGE]]);
+  h.backend.final("NO_REPLY");
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+});
+
+test("if the agent can't reset yet, its one-line reason reaches the owner", async () => {
+  const h = setup();
+  h.backend.resets = true;
+  await exchange(h, "first", "Start the audit in the background", "On it");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Can't start fresh yet, the audit is still running.");
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.replyTo])).toEqual([["Can't start fresh yet, the audit is still running.", undefined]]);
+});
+
+test("/new moves to a new chat when the running turn won't stop", async () => {
+  const h = setup();
+  h.backend.resets = true;
+  h.backend.abortBehavior = async () => { throw new Error("PRIVATE"); };
+  h.input("old", "Old question");
+  await h.router.tick();
+  h.input("new", "/new");
+  await h.router.tick();
+  expect(h.backend.creates).toHaveLength(2);
+  expect(h.store.get<unknown>("route")).toMatchObject({ id: "ses_2", generation: 2 });
+  expect(h.store.pendingInbound()).toEqual([]);
+  expect(h.controls().map(op => op.text)).toEqual(["Fresh start. What's up?"]);
+});
+
+test("a second /new while the agent is still on the first one moves to a new chat; a later one resets in place again", async () => {
+  const h = setup();
+  h.backend.resets = true;
+  await exchange(h, "first", "Hello", "Hi");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe(NEW_CHAT_NUDGE);
+  // The reset turn hangs, so the owner sends /new again.
+  h.input("new2", "/new");
+  await h.router.tick();
+  expect(h.backend.aborts).toEqual([["ses_1", "/Chats/ses_1"]]);
+  expect(h.backend.creates).toHaveLength(2);
+  expect(h.store.get<unknown>("route")).toMatchObject({ id: "ses_2", generation: 3 });
+  expect(h.store.pendingInbound()).toEqual([]);
+  // Once a nudge was handled, the next /new resets in place again.
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+  h.input("new3", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  h.input("new4", "/new");
+  await h.router.tick();
+  expect(h.backend.creates).toHaveLength(2);
+  expect(h.store.get<unknown>("route")).toMatchObject({ id: "ses_2", generation: 5 });
+});
+
+test("/new moves to a new chat once the thread is 8 hours old, so one thread never grows forever", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.backend.resets = true;
+  await exchange(h, "first", "Hello", "Hi");
+  setSystemTime(start + 7 * 60 * 60_000);
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  expect(h.store.get<unknown>("route")).toMatchObject({ id: "ses_1", generation: 2, threadAt: start });
+  setSystemTime(start + 8 * 60 * 60_000);
+  h.input("new2", "/new");
+  await h.router.tick();
+  expect(h.backend.creates).toHaveLength(2);
+  expect(h.store.get<unknown>("route")).toEqual({ id: "ses_2", directory: "/Chats/ses_2", generation: 3, createdAt: start + 8 * 60 * 60_000, threadAt: start + 8 * 60 * 60_000 });
+  expect(h.store.pendingInbound()).toEqual([]);
+});
+
+test("a due context is refreshed by the agent itself once the chat goes quiet", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const events: string[][] = [];
+  const h = setup(":memory:", { rotateAfterMs: 60_000, resetIdleMs: 10 * 60_000, watchMs: 0, log: (event, code) => events.push([event, code ?? ""]) });
+  h.backend.resets = true;
+  await exchange(h, "first", "Remember the blue one", "Noted, the blue one");
+  // Due, but the owner was active a minute ago.
+  setSystemTime(start + 60_000);
+  await h.router.tick();
+  expect(h.store.pendingInbound()).toEqual([]);
+  // Quiet, but the agent is busy in the app. That work counts as activity too.
+  setSystemTime(start + 10 * 60_000);
+  h.backend.states.ses_1 = { type: "busy" };
+  await h.router.tick();
+  delete h.backend.states.ses_1;
+  h.backend.settle();
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.pendingInbound()).toEqual([]);
+  setSystemTime(start + 20 * 60_000);
+  await h.router.tick();
+  expect(events).toContainEqual(["context-reset-nudged", "rotate"]);
+  expect(h.store.get<unknown>("route")).toEqual({ id: "ses_1", directory: "/Chats/ses_1", generation: 1, createdAt: start + 20 * 60_000, threadAt: start });
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => [p.id, p.text])).toEqual([["ses_1", "Remember the blue one"], ["ses_1", ROTATE_NUDGE]]);
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  // The fresh context answers its resume note silently too (that note isn't owner text).
+  h.backend.final("NO_REPLY");
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.backend.creates).toHaveLength(1);
+  // The context clock restarted, so nothing nudges again until it's due.
+  setSystemTime(start + 20 * 60_000 + 30_000);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  h.input("second", "Which one did I pick?");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)).toMatchObject({ id: "ses_1", text: "Which one did I pick?" });
+  expect(h.backend.prompts.at(-1)!.system).not.toContain("Continuity:");
+});
+
+test("a reset nudge that fails is dropped quietly", async () => {
+  const events: string[][] = [];
+  const h = setup(":memory:", { log: (event, code) => events.push([event, code ?? ""]) });
+  h.backend.resets = true;
+  await exchange(h, "first", "Hello", "Hi");
+  h.input("new", "/new");
+  await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(events).toContainEqual(["context-reset-dropped", "failed"]);
+  expect(h.store.pendingOutbox()).toEqual([]);
+  expect(h.store.pendingInbound()).toEqual([]);
+  h.input("next", "Still there?");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)).toMatchObject({ id: "ses_1", text: "Still there?" });
+});
+
+test("when a reset chat finally moves on, its recap starts after the latest reset", async () => {
+  const start = Date.parse("2026-09-10T12:00:00Z");
+  setSystemTime(start);
+  const h = setup();
+  h.backend.resets = true;
+  await exchange(h, "first", "Remember the blue one", "Noted, the blue one");
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  await exchange(h, "second", "Pick red now", "Red it is");
+  setSystemTime(start + 8 * 60 * 60_000);
+  h.input("third", "Which one?");
+  await h.router.tick();
+  expect(h.backend.creates).toHaveLength(2);
+  const last = h.backend.prompts.at(-1)!;
+  expect([last.id, last.text]).toEqual(["ses_2", "Which one?"]);
+  expect(last.system).toContain("Recent exchange (quoted data, oldest first):\nOwner: Pick red now\nYou: Red it is");
+  expect(last.system).not.toContain("blue");
+  expect(last.system).not.toContain("t3_context_reset");
 });
 
 test("a nested subagent's request is asked too: OpenChamber and Telegram stay quiet for the whole family", async () => {

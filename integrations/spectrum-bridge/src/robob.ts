@@ -134,6 +134,11 @@ export class RobobBackend implements ChatBackend {
     return thread.threadId;
   }
 
+  /** Robob threads can reset their agent's context in place (t3_context_reset). Imported `ses_` routes move to a new chat instead. */
+  resetsContext(id: string): boolean {
+    return !id.startsWith("ses_");
+  }
+
   private async detail(id: string): Promise<ThreadDetail> {
     return (await this.client.thread(await this.resolve(id))).thread;
   }

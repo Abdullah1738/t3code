@@ -168,6 +168,21 @@ router uses, so the router is unchanged.
 - Ids: new routes store Robob thread ids. Stored `ses_` ids resolve through
   `GET /threads/by-native/:ses`. A stored route the mapping does not know (404)
   is dropped while idle, so the next text starts a fresh chat.
+- Context reset: Robob threads keep one thread across `/new` and rotation.
+  The bridge doesn't reset anything itself; it queues a `reset:` row asking
+  the agent to call `t3_context_reset` (`NEW_CHAT_NUDGE` / `ROTATE_NUDGE` in
+  `src/router.ts`), so the server's own rules (background work, one reset at a
+  time) decide. `/new` stops the running turn, drops queued texts, bumps the
+  generation and acknowledges right away; the nudge carries no recap. Rotation
+  waits until the context is due (4 hours or 256k tokens) and the chat has
+  been quiet for 10 minutes; the agent writes its own resume note. Both nudges
+  end in `NO_REPLY`, so only a refusal reason reaches the owner, and a nudge
+  that fails is dropped quietly. A new thread is still used for `ses_` routes,
+  threads 8 hours old (`threadAt`, so one thread never grows forever), a `/new`
+  that can't stop the old turn, and a second `/new` while the first nudge is
+  unfinished. That new thread's recap starts after the latest reset prompt.
+  `CURRENT_SESSION_ID` is `<thread id>@<generation>`; the session-bound CLI
+  commands take that or the bare thread id.
 - Auto-accept: a thread counts as auto-accepting when its `runtimeMode` is
   `full-access`. Approvals and questions are read from the thread detail and
   answered with `POST /threads/:id/requests/:rid/respond`.
