@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - command ids only need a random UUID.
 import * as NodeCrypto from "node:crypto";
 
 import {
