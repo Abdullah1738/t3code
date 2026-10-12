@@ -96,8 +96,9 @@ Leaving reasoning level or service tier unset uses the provider's own configurat
 ## Quote an assistant response
 
 On web and desktop, select text within one assistant response and choose
-**Cite in composer**. You can add a comment about the quote and write instructions
-around it.
+**Cite in composer**. On iOS and Android, select text in an assistant response and
+choose **Cite** from the selection menu. You can add a comment about the quote and
+write instructions around it.
 
 Select the quote in a draft or sent message to return to its source. If the source
 is unavailable or has changed, the saved quote remains readable.
@@ -109,8 +110,9 @@ delete it like other inline context. Copying, reloading, and restoring a
 with its quote, and sending tells the agent which words were quoted and which comment you wrote.
 The quoted text and comment count toward the message limit.
 
-Mobile displays saved quotes and comments, but does not create citations or
-navigate to their sources.
+On mobile, citing opens the quote so you can add a comment right away. Tap a quote chip in
+the draft later to read the quote, change its comment, or remove it. Mobile does not navigate
+to a quote's source yet.
 
 ## Recall a sent prompt
 

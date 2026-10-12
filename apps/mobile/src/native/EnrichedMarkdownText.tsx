@@ -239,6 +239,20 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
       mimeTypes: { "app.t3.context-fragment": props.contextClipboardFragment! },
     };
   }, [props.contextClipboardFragment, props.markdown]);
+  const { onCite } = props;
+  const contextMenuItems = useMemo(
+    () =>
+      onCite
+        ? [
+            {
+              text: "Cite",
+              icon: "quote.closing",
+              onPress: ({ text }: { text: string }) => onCite(text),
+            },
+          ]
+        : undefined,
+    [onCite],
+  );
   const markdownStyle = useMemo(
     () => ({ ...enrichedStyle(props.textStyle, themeAppearance === "dark"), linkVariants }),
     [props.textStyle, themeAppearance, linkVariants],
@@ -332,6 +346,7 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
           onLinkLongPress={onLinkLongPress}
           linkContextMenuItems={linkContextMenuItems}
           linkPillContent={linkPillContent}
+          contextMenuItems={contextMenuItems}
         />
       </View>
     );

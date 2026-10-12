@@ -4,8 +4,12 @@ import {
   ProjectId,
   ProviderInstanceId,
   ComposerContextId,
+  EnvironmentId,
+  MessageId,
+  ThreadId,
   type OrchestrationMessageContext,
 } from "@t3tools/contracts";
+import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
 import { collectComposerInlineTokens } from "@t3tools/shared/composerInlineTokens";
 import {
   ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
@@ -162,6 +166,28 @@ describe("mobile composer context", () => {
     const text = `Use $playwright and [app.ts](src/app.ts) with ${reference} then ${reference}`;
     const tokens = composerContextEditorTokens(text, collectComposerInlineTokens(text));
     expect(tokens.map((token) => token.type)).toEqual(["skill", "mention", "context", "context"]);
+    for (const token of tokens) expect(text.slice(token.start, token.end)).toBe(token.source);
+  });
+
+  it("collapses an assistant quote into one chip labelled like web", () => {
+    const quote = serializeAssistantCitation({
+      version: 1,
+      environmentId: EnvironmentId.make("environment-1"),
+      threadId: ThreadId.make("thread-1"),
+      messageId: MessageId.make("message-1"),
+      text: "Use   the retry\nqueue",
+      comment: "Why here?",
+      start: 0,
+      end: 19,
+      prefix: "",
+      suffix: "",
+    });
+    const text = `Check ${quote} in [app.ts](src/app.ts) now`;
+    const tokens = composerContextEditorTokens(text, collectComposerInlineTokens(text));
+    expect(tokens.map((token) => [token.type, token.value])).toEqual([
+      ["citation", "Why here?"],
+      ["mention", "src/app.ts"],
+    ]);
     for (const token of tokens) expect(text.slice(token.start, token.end)).toBe(token.source);
   });
 

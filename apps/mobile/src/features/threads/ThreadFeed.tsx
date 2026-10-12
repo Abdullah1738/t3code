@@ -310,6 +310,15 @@ export interface ThreadFeedProps {
   readonly onEndFollowEnabledChange?: (enabled: boolean) => void;
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill>;
   readonly onUseArtifactTemplate?: (template: CodexArtifactTemplate) => void;
+  /** Adds Cite to the selection menu of assistant replies. */
+  readonly onCiteAssistantText?: (request: AssistantTextCiteRequest) => void;
+}
+
+export interface AssistantTextCiteRequest {
+  readonly messageId: MessageId;
+  /** The reply's rendered Markdown, which the selected text is located in. */
+  readonly markdown: string;
+  readonly selectedText: string;
 }
 
 async function waitForThreadShell(
@@ -814,9 +823,26 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
   readonly onUseArtifactTemplate?: ((template: CodexArtifactTemplate) => void) | undefined;
   readonly renderImage: MarkdownImageRenderer;
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill> | undefined;
+  readonly messageId?: MessageId | undefined;
+  readonly onCiteAssistantText?: ((selection: AssistantTextCiteRequest) => void) | undefined;
 }) {
   const liveMarkdown = useLiveThreadLinkLabels(props.markdown, props.environmentId);
   const segments = useMemo(() => splitCodexArtifactTemplateMarkdown(liveMarkdown), [liveMarkdown]);
+  const { messageId, onCiteAssistantText } = props;
+  const cite = useCallback(
+    (selectedText: string) => {
+      if (messageId === undefined || onCiteAssistantText === undefined) return;
+      // Positions and context come from the whole reply, not the block the selection sits in.
+      const markdown = segments
+        .flatMap((segment) =>
+          segment.kind === "markdown" ? [renderCodexFileCitationsAsMarkdown(segment.markdown)] : [],
+        )
+        .join("\n\n");
+      onCiteAssistantText({ messageId, markdown, selectedText });
+    },
+    [messageId, onCiteAssistantText, segments],
+  );
+  const onCite = messageId !== undefined && onCiteAssistantText !== undefined ? cite : undefined;
 
   return segments.map((segment) => {
     if (segment.kind === "artifact-template") {
@@ -839,6 +865,7 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
         textStyle={props.markdownStyles.nativeTextStyle}
         {...props.linkHandlers}
         renderImage={props.renderImage}
+        onCite={onCite}
       />
     );
   });
@@ -982,6 +1009,7 @@ function renderFeedEntry(
     ThreadFeedProps,
     | "environmentId"
     | "onUseArtifactTemplate"
+    | "onCiteAssistantText"
     | "skills"
     | "dispatchingMessageId"
     | "onEditPendingMessage"
@@ -1403,6 +1431,8 @@ function renderFeedEntry(
               onUseArtifactTemplate={props.onUseArtifactTemplate}
               renderImage={props.renderMarkdownImage}
               skills={props.skills}
+              messageId={message.id}
+              onCiteAssistantText={props.onCiteAssistantText}
             />
           </MarkdownImageAvailableWidthContext>
         ) : null}
@@ -2513,6 +2543,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
               dispatchingMessageId: props.dispatchingMessageId,
               onEditPendingMessage: props.onEditPendingMessage,
               onUseArtifactTemplate: props.onUseArtifactTemplate,
+              onCiteAssistantText: props.onCiteAssistantText,
               threadId: props.threadId,
               copiedRowId,
               expandedWorkRows,
@@ -2590,6 +2621,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       onToggleWorkRow,
       props.environmentId,
       props.onUseArtifactTemplate,
+      props.onCiteAssistantText,
       props.threadId,
       props.threadTitle,
       props.skills,
