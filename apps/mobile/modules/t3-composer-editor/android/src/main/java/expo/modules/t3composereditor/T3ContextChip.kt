@@ -160,6 +160,25 @@ class T3ContextChip(
           line(7f, 8f, 17f, 8f)
           line(7f, 12f, 14f, 12f)
         }
+        // lucide `quote`, the glyph web draws on a citation: two closing quote marks.
+        "quote.closing" -> {
+          for (x in floatArrayOf(0f, 11f)) {
+            moveTo(x + 5f, 3f)
+            quadTo(x + 3f, 3f, x + 3f, 5f)
+            lineTo(x + 3f, 11f)
+            quadTo(x + 3f, 13f, x + 5f, 13f)
+            quadTo(x + 6f, 13f, x + 6f, 14f)
+            lineTo(x + 6f, 15f)
+            quadTo(x + 6f, 17f, x + 4f, 17f)
+            quadTo(x + 3f, 17f, x + 3f, 18f)
+            lineTo(x + 3f, 20f)
+            quadTo(x + 3f, 21f, x + 4f, 21f)
+            quadTo(x + 10f, 21f, x + 10f, 15f)
+            lineTo(x + 10f, 5f)
+            quadTo(x + 10f, 3f, x + 8f, 3f)
+            close()
+          }
+        }
         "terminal", "play.rectangle", "photo" -> {
           addRoundRect(2f, 4f, 22f, 20f, 2f, 2f, Path.Direction.CW)
           when (symbol) {

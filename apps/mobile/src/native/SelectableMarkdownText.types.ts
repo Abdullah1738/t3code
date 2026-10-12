@@ -79,6 +79,8 @@ export interface SelectableMarkdownTextProps {
   readonly renderImage?: MarkdownImageRenderer;
   readonly resolveImageSource?: MarkdownImageSourceResolver;
   readonly onImagePress?: (href: string) => void;
+  /** Adds Cite to the text selection menu and receives the selected text. */
+  readonly onCite?: (selectedText: string) => void;
   readonly marginTop?: number;
   readonly marginBottom?: number;
 }
