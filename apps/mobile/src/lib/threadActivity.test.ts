@@ -2619,6 +2619,28 @@ describe("html renders", () => {
       expect(entries.map((entry) => entry.type)).toEqual(["activity-group"]);
     }
   });
+
+  const recorded: OrchestrationV2TurnItem = {
+    ...base("item-page", "2026-06-20T00:00:02.600Z", 3),
+    type: "html_render",
+    htmlRender: page,
+  };
+
+  it("shows a page a Code Mode script published, whatever the script returned", () => {
+    const script = renderCall({ toolName: "execute", status: "failed", output: { ok: false } });
+    const entries = buildThreadFeed([projected(script, 0), projected(recorded, 1)]);
+    expect(entries.map((entry) => entry.type)).toEqual(["activity-group", "html-render"]);
+    expect(entries[1]).toMatchObject({ type: "html-render", render: page, runId });
+  });
+
+  it("shows a direct call's page once, even after the call rendered alone", () => {
+    const call = projected(renderCall(), 0);
+    expect(buildThreadFeed([call]).map((entry) => entry.type)).toEqual(["html-render"]);
+    // The same row object, now cached as a page, becomes a tool row again.
+    const entries = buildThreadFeed([call, projected(recorded, 1)]);
+    expect(entries.map((entry) => entry.type)).toEqual(["activity-group", "html-render"]);
+    expect(entries[1]).toMatchObject({ render: page });
+  });
 });
 
 describe("MCP apps", () => {

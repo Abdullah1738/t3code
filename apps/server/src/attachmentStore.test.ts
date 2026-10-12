@@ -248,6 +248,7 @@ describe("threadHtmlRenderAttachmentIds", () => {
     const own = createAttachmentId("thread-a", "html")!;
     const other = createAttachmentId("thread-b", "html")!;
     const render = (attachmentId: string, extra = {}) => ({
+      type: "dynamic_tool" as const,
       toolName: "mcp__t3-code__html_render",
       output: [
         {
@@ -261,9 +262,24 @@ describe("threadHtmlRenderAttachmentIds", () => {
         render(own),
         render(other),
         render(createAttachmentId("thread-a", "html")!, { isError: true }),
-        { toolName: "mcp__t3-code__html_preview", output: render(own).output },
+        {
+          type: "dynamic_tool",
+          toolName: "mcp__t3-code__html_preview",
+          output: render(own).output,
+        },
       ]),
     ).toEqual([own]);
+  });
+
+  it("returns pages the thread recorded, whatever tool published them", () => {
+    const recorded = createAttachmentId("thread-a", "html")!;
+    const other = createAttachmentId("thread-b", "html")!;
+    expect(
+      threadHtmlRenderAttachmentIds("thread-a", [
+        { type: "html_render", htmlRender: { attachmentId: recorded } },
+        { type: "html_render", htmlRender: { attachmentId: other } },
+      ]),
+    ).toEqual([recorded]);
   });
 
   it("includes captured MCP App documents from any tool", () => {
@@ -271,6 +287,7 @@ describe("threadHtmlRenderAttachmentIds", () => {
     expect(
       threadHtmlRenderAttachmentIds("thread-a", [
         {
+          type: "dynamic_tool",
           toolName: "weather.get_weather",
           output: {
             t3McpApp: {

@@ -1460,6 +1460,29 @@ const OrchestrationV2SecretRequestFields = {
   secretStatus: OrchestrationV2SecretRequestStatus,
 } as const;
 
+/**
+ * A page an agent published with `html_render`, as the tool returned it. The
+ * bounds match what clients accept from a tool result.
+ */
+const OrchestrationV2HtmlRender = Schema.Struct({
+  attachmentId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  title: Schema.String.check(Schema.isMaxLength(200)),
+  height: Schema.Finite,
+  heights: Schema.optional(
+    Schema.Array(Schema.Tuple([Schema.Int, Schema.Finite])).check(Schema.isMaxLength(24)),
+  ),
+});
+
+/**
+ * The server records each published page in the calling thread, so it shows
+ * whatever tool or script made the call (OpenCode Code Mode runs it inside
+ * `execute`).
+ */
+const OrchestrationV2HtmlRenderFields = {
+  type: Schema.Literal("html_render"),
+  htmlRender: OrchestrationV2HtmlRender,
+} as const;
+
 export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -1642,6 +1665,10 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     ...OrchestrationV2SecretRequestFields,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2TurnItemBaseFields,
+    ...OrchestrationV2HtmlRenderFields,
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2418,6 +2445,10 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     ...OrchestrationV2SecretRequestFields,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2TurnItemJsonBaseFields,
+    ...OrchestrationV2HtmlRenderFields,
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
@@ -3241,6 +3272,17 @@ const OrchestrationV2InternalCommand = Schema.Union([
     reason: Schema.String,
     placeholder: Schema.optional(Schema.String),
     secretStatus: OrchestrationV2SecretRequestStatus,
+  }),
+  /**
+   * Records a page `html_render` published, in the caller's run. Internal, so
+   * only the server that stored the page can put one in a thread.
+   */
+  Schema.Struct({
+    type: Schema.Literal("html_render.record"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    htmlRender: OrchestrationV2HtmlRender,
   }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;

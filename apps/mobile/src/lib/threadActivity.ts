@@ -66,8 +66,8 @@ import type { HtmlRenderReference } from "@t3tools/shared/htmlRender";
 import type { McpAppReference } from "@t3tools/shared/mcpApp";
 import {
   compactDynamicToolOutput,
-  htmlRenderFromToolItem,
   mcpAppFromToolItem,
+  threadHtmlRenders,
 } from "@t3tools/shared/toolOutput";
 import * as DateTime from "effect/DateTime";
 
@@ -582,6 +582,8 @@ function itemIcon(item: OrchestrationV2TurnItem): ThreadFeedActivity["icon"] {
       return "zap";
     case "secret_request":
       return "lock";
+    case "html_render":
+      return "browser";
   }
 }
 
@@ -638,6 +640,8 @@ function itemSummary(
       return "Thread created";
     case "secret_request":
       return item.label;
+    case "html_render":
+      return item.htmlRender.title;
     case "dynamic_tool": {
       const classified = classifyToolActivity({
         itemType: "dynamic_tool_call",
@@ -697,6 +701,8 @@ function itemPreview(item: OrchestrationV2TurnItem): string | null {
       return item.targetThreadId;
     case "secret_request":
       return item.reason || null;
+    case "html_render":
+      return null;
     case "subagent":
       return item.result ?? item.progress ?? item.prompt;
     case "dynamic_tool":
@@ -1763,6 +1769,7 @@ export function buildThreadFeed(
         : [],
     ),
   );
+  const renders = threadHtmlRenders(visibleTurnItems.map((row) => row.item));
   for (const row of visibleTurnItems) {
     const item = row.item;
     if (turnItemIsWorkspacePreparation(item)) continue;
@@ -1774,17 +1781,18 @@ export function buildThreadFeed(
       continue;
     }
     const attemptId = resolveAttemptId(item);
+    // A running or failed render stays an ordinary work row, as does a call
+    // whose page the thread recorded on its own.
+    const render = renders.get(item);
     const cached = projectedEntriesCache.get(row);
-    if (cached?.attemptId === attemptId) {
+    if (
+      cached?.attemptId === attemptId &&
+      (cached.entry.type === "html-render") === (render !== undefined)
+    ) {
       entries.push(cached.entry);
       continue;
     }
     const createdAt = DateTime.formatIso(item.startedAt ?? item.updatedAt);
-    // A running or failed render stays an ordinary work row.
-    const render =
-      item.type === "dynamic_tool" && item.status === "completed"
-        ? htmlRenderFromToolItem(item)
-        : undefined;
     if (render) {
       const entry: RawThreadFeedEntry = {
         type: "html-render",

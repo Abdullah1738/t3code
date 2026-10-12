@@ -1,4 +1,4 @@
-import type { ThreadId } from "@t3tools/contracts";
+import { CommandId, type ThreadId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   clampHtmlRenderHeight,
@@ -32,6 +32,7 @@ import { createAttachmentId } from "../attachmentStore.ts";
 import { resolveRootCliCommand } from "../cli/invocation.ts";
 import * as ServerConfig from "../config.ts";
 import * as HeadlessChrome from "./headlessChrome.ts";
+import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 import * as PreviewBrowserHost from "../preview/PreviewBrowserHost.ts";
 
@@ -101,7 +102,9 @@ export class HtmlRender extends Context.Service<
     /**
      * Stores a prepared page as a thread attachment for clients to show inline,
      * measuring its height at each client width when the preview browser is
-     * already installed.
+     * already installed. A page published during one of the thread's runs is
+     * also recorded in that run, so it shows whatever tool or script called
+     * this, and stays even when the call that published it fails afterwards.
      */
     readonly publish: (input: {
       readonly threadId: ThreadId;
@@ -335,6 +338,7 @@ const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const config = yield* ServerConfig.ServerConfig;
   const previewBrowser = yield* PreviewBrowser.PreviewBrowser;
+  const threads = yield* ThreadManagementService.ThreadManagementService;
   const services = yield* Effect.context<
     FileSystem.FileSystem | Path.Path | ChildProcessSpawner.ChildProcessSpawner
   >();
@@ -401,6 +405,56 @@ const make = Effect.gen(function* () {
       Effect.withSpan("HtmlRender.measure"),
     );
 
+  /**
+   * Records the page in the thread's live run. A page published outside a run
+   * (one that just ended) reaches the thread only through the caller's tool
+   * result, as before pages were recorded. "orphaned" means the thread was
+   * deleted first, so nothing will ever clean the page up.
+   */
+  const record = (threadId: ThreadId, htmlRender: HtmlRenderReference) =>
+    Effect.gen(function* () {
+      const { thread, runs } = yield* threads.getThreadRecords(threadId, ["runs"], {
+        turnItemTypes: [],
+        messageRoles: [],
+      });
+      if (thread.deletedAt !== null) return "orphaned" as const;
+      const run = ThreadManagementService.latestActiveRun({ runs });
+      if (run === undefined || run.rootNodeId === null) return "unrecorded" as const;
+      return yield* threads
+        .dispatch({
+          type: "html_render.record",
+          commandId: CommandId.make(`command:html-render:${htmlRender.attachmentId}`),
+          threadId,
+          runId: run.id,
+          htmlRender,
+        })
+        .pipe(
+          Effect.as("recorded" as const),
+          // A delete that won the race refuses the record; anything else
+          // leaves the tool result to show the page.
+          Effect.catch((error) =>
+            threads
+              .getThreadRecords(threadId, [])
+              .pipe(
+                Effect.flatMap(({ thread: current }) =>
+                  current.deletedAt === null
+                    ? Effect.fail(error)
+                    : Effect.succeed("orphaned" as const),
+                ),
+              ),
+          ),
+        );
+    }).pipe(
+      // The page is stored and the caller still gets its reference, so a
+      // direct call shows it either way.
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Could not record an HTML render in its thread.", cause).pipe(
+          Effect.as("unrecorded" as const),
+        ),
+      ),
+      Effect.withSpan("HtmlRender.record"),
+    );
+
   // The bootstrap goes in first so its head scan never runs over inlined image data.
   const inline = (html: string) =>
     inlineLocalImages(injectHtmlRenderBootstrap(html)).pipe(Effect.provideContext(services));
@@ -432,19 +486,39 @@ const make = Effect.gen(function* () {
     if (attachmentId === null || filePath === null) {
       return yield* new HtmlRenderStoreError({ cause: new Error("Invalid thread id.") });
     }
-    const heights = yield* fileSystem.writeFileString(filePath, html).pipe(
-      Effect.mapError((cause) => new HtmlRenderStoreError({ cause })),
-      Effect.andThen(measure(html)),
-      // Only the returned reference lets thread deletion find the page, so a
-      // publish that fails or is interrupted before returning removes it.
-      Effect.onError(() => fileSystem.remove(filePath, { force: true }).pipe(Effect.ignore)),
+    const remove = fileSystem.remove(filePath, { force: true }).pipe(Effect.ignore);
+    let recorded = false;
+    return yield* Effect.gen(function* () {
+      const heights = yield* fileSystem.writeFileString(filePath, html).pipe(
+        Effect.mapError((cause) => new HtmlRenderStoreError({ cause })),
+        Effect.andThen(measure(html)),
+      );
+      const reference = {
+        attachmentId,
+        title: input.title.trim().slice(0, HTML_RENDER_MAX_TITLE_LENGTH) || "HTML",
+        height: clampHtmlRenderHeight(input.height),
+        ...(heights === undefined ? {} : { heights }),
+      } satisfies HtmlRenderReference;
+      // Set before the region ends: an interruption delivered after a record
+      // commits must not remove the page the thread now shows.
+      const outcome = yield* record(input.threadId, reference).pipe(
+        Effect.tap((result) =>
+          Effect.sync(() => {
+            recorded = result === "recorded";
+          }),
+        ),
+        Effect.uninterruptible,
+      );
+      if (outcome === "orphaned") {
+        yield* remove;
+        return yield* new HtmlRenderStoreError({ cause: new Error("The thread was deleted.") });
+      }
+      return reference;
+    }).pipe(
+      // Thread deletion finds a page through its recorded item or the returned
+      // reference, so a publish that fails or is interrupted before either removes it.
+      Effect.onError(() => (recorded ? Effect.void : remove)),
     );
-    return {
-      attachmentId,
-      title: input.title.trim().slice(0, HTML_RENDER_MAX_TITLE_LENGTH) || "HTML",
-      height: clampHtmlRenderHeight(input.height),
-      ...(heights === undefined ? {} : { heights }),
-    } satisfies HtmlRenderReference;
   });
 
   const preview = Effect.fn("HtmlRender.preview")(function* (input: {

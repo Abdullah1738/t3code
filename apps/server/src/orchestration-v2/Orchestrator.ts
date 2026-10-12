@@ -59,7 +59,7 @@ import {
   RuntimeMode,
   ThreadLinkedPullRequest,
   ThreadId,
-  type TurnItemId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
@@ -133,6 +133,10 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
+import {
+  parseThreadSegmentFromAttachmentId,
+  toSafeThreadAttachmentSegment,
+} from "../attachmentStore.ts";
 
 export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDispatchError>()(
   "OrchestratorDispatchError",
@@ -489,6 +493,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.created.record":
       return command.parentThreadId;
     case "secret_request.record":
+    case "html_render.record":
       return command.threadId;
     case "thread.fork":
     case "thread.merge_back":
@@ -7296,6 +7301,86 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  /**
+   * Records a page `html_render` published, in the run that called it. Clients
+   * show the item whatever tool or script made the call, and deleting the
+   * thread finds the page through it.
+   */
+  const dispatchHtmlRenderRecord = Effect.fn("orchestrationV2.dispatch.htmlRenderRecord")(
+    function* (
+      command: Extract<OrchestrationV2InternalCommand, { readonly type: "html_render.record" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const reject = (cause: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      // Pages are stored per thread; one minted for another thread never shows here.
+      const segment = toSafeThreadAttachmentSegment(command.threadId);
+      if (
+        segment === null ||
+        parseThreadSegmentFromAttachmentId(command.htmlRender.attachmentId) !== segment
+      ) {
+        return yield* reject(`Page ${command.htmlRender.attachmentId} belongs to another thread.`);
+      }
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs", "attempts", "providerTurns"])
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
+      // Deletion cancels the thread's runs and snapshots its pages under this
+      // same lock, so a page recorded after it would never be cleaned up.
+      if (projection.thread.deletedAt !== null) {
+        return yield* reject(`Thread ${command.threadId} was deleted.`);
+      }
+      // The run's current root: a steer may have replaced the one the caller saw.
+      const run = projection.runs.find((candidate) => candidate.id === command.runId);
+      const nodeId = run?.rootNodeId ?? null;
+      if (run === undefined || nodeId === null || !isBlockingRun(run)) {
+        return yield* reject(`Run ${command.runId} is not running in this thread.`);
+      }
+      const now = yield* DateTime.now;
+      // One page, one item: the command id derives from the page too, so a
+      // replay finds its receipt instead of recording the page again.
+      const turnItem: OrchestrationV2TurnItem = {
+        id: TurnItemId.make(
+          `turn-item:html-render:${encodeURIComponent(command.htmlRender.attachmentId)}`,
+        ),
+        threadId: command.threadId,
+        runId: command.runId,
+        nodeId,
+        providerThreadId: run.providerThreadId,
+        providerTurnId: providerTurnForRun(projection, run)?.id ?? null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: yield* nextTurnItemOrdinal(projection),
+        status: "completed",
+        title: command.htmlRender.title,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "html_render",
+        htmlRender: command.htmlRender,
+      };
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        runId: command.runId,
+        nodeId,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: turnItem,
+      });
+    },
+  );
+
   const dispatchRuntimeRequestRespond = (
     command: Extract<OrchestrationV2Command, { readonly type: "runtime-request.respond" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -10929,6 +11014,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "secret_request.record":
         yield* dispatchSecretRequestRecord(command, events);
+        break;
+      case "html_render.record":
+        yield* dispatchHtmlRenderRecord(command, events);
         break;
       default:
         return yield* dispatchUnsupported(command);

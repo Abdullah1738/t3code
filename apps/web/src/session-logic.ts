@@ -25,7 +25,11 @@ import {
 import type { HtmlRenderReference } from "@t3tools/shared/htmlRender";
 import { turnItemDetailRevision } from "@t3tools/client-runtime/work-log/item-detail";
 import type { McpAppReference } from "@t3tools/shared/mcpApp";
-import { htmlRenderFromToolItem, mcpAppFromToolItem } from "@t3tools/shared/toolOutput";
+import {
+  htmlRenderFromToolItem,
+  mcpAppFromToolItem,
+  threadHtmlRenders,
+} from "@t3tools/shared/toolOutput";
 import {
   contextCompactionLabel,
   workEntryIndicatesToolFailure,
@@ -624,6 +628,7 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
         : [],
     ),
   );
+  const htmlRenders = threadHtmlRenders(input.visibleTurnItems.map(({ item }) => item));
   for (const row of input.visibleTurnItems) {
     const { item } = row;
     if (turnItemIsWorkspacePreparation(item)) continue;
@@ -714,10 +719,7 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
       continue;
     }
 
-    const htmlRender =
-      item.type === "dynamic_tool" && item.status === "completed"
-        ? htmlRenderFromToolItem(item)
-        : undefined;
+    const htmlRender = htmlRenders.get(item);
     if (htmlRender !== undefined) {
       entries.push({
         id: item.id,
@@ -953,7 +955,8 @@ function reuseTimelineEntries(
   ) {
     return null;
   }
-  // Answer rows can replace a message already present in the retained prefix.
+  // Answer rows can replace a message already present in the retained prefix,
+  // and a recorded page hides its tool call's copy wherever that call is.
   if (
     appended &&
     input.visibleTurnItems
@@ -961,7 +964,9 @@ function reuseTimelineEntries(
       .some(
         ({ item }) =>
           (item.type === "user_input_request" && item.questionAnswer !== undefined) ||
-          (item.type === "user_message" && item.messageId.startsWith("async-answer:")),
+          (item.type === "user_message" && item.messageId.startsWith("async-answer:")) ||
+          item.type === "html_render" ||
+          (item.type === "dynamic_tool" && htmlRenderFromToolItem(item) !== undefined),
       )
   )
     return null;

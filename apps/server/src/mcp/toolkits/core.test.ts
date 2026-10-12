@@ -302,6 +302,8 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
                 activeRunId: RunId.make("mcp-core-run"),
                 providerInstanceId: ProviderInstanceId.make("codex"),
               } as OrchestrationV2ThreadShell),
+            // No run in the projection, so the tool result alone carries the page.
+            getThreadRecords: () => Effect.succeed({ runs: [] } as never),
           }),
         ),
       ),

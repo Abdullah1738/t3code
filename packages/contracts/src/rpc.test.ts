@@ -55,6 +55,18 @@ describe("WebSocket RPC contracts", () => {
         }),
       ),
     ).toBe(true);
+    // Only the server that stored a page can show it in a thread.
+    expect(
+      Exit.isFailure(
+        decode({
+          type: "html_render.record",
+          commandId: "forged-page",
+          threadId: "thread-1",
+          runId: "run-1",
+          htmlRender: { attachmentId: "thread-2-page-html", title: "Page", height: 300 },
+        }),
+      ),
+    ).toBe(true);
     expect(
       Exit.isSuccess(
         decode({

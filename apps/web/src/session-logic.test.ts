@@ -1369,6 +1369,62 @@ describe("HTML renders in the timeline", () => {
     expect(entries.some((entry) => entry.kind === "html-render")).toBe(false);
     expect(entries.find((entry) => entry.id === "render")?.kind).toBe("work");
   });
+
+  const recorded = (id: string, second: number): OrchestrationV2TurnItem => ({
+    ...base(id, second),
+    type: "html_render",
+    htmlRender,
+  });
+
+  it("shows a page a Code Mode script published, whatever the script returned", () => {
+    const script: OrchestrationV2TurnItem = {
+      ...base("execute", 2),
+      status: "failed",
+      type: "dynamic_tool",
+      toolName: "execute",
+      input: {},
+      output: { content: [{ type: "text", text: "TypeError after rendering" }], isError: true },
+    };
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [script, recorded("page", 3)].map(visible),
+      optimisticMessages: [],
+    });
+    expect(entries.map((entry) => [entry.id, entry.kind])).toEqual([
+      ["execute", "work"],
+      ["page", "html-render"],
+    ]);
+  });
+
+  it("shows a direct call's page once when the server recorded it", () => {
+    const call = renderCall("completed", { structuredContent: { htmlRender }, content: [] });
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [call, recorded("page", 3)].map(visible),
+      optimisticMessages: [],
+    });
+    expect(
+      entries.filter((entry) => entry.kind === "html-render").map((entry) => entry.id),
+    ).toEqual(["page"]);
+    expect(entries.find((entry) => entry.id === "render")?.kind).toBe("work");
+  });
+
+  it("drops a direct call's copy when its recorded page streams in after it", () => {
+    const call = visible(
+      renderCall("completed", { structuredContent: { htmlRender }, content: [] }),
+    );
+    const before = deriveTimelineEntriesFromVisibleTurnItemsWithState({
+      visibleTurnItems: [call],
+      optimisticMessages: [],
+    });
+    expect(before.entries.map((entry) => entry.kind)).toEqual(["html-render"]);
+    const after = deriveTimelineEntriesFromVisibleTurnItemsWithState(
+      { visibleTurnItems: [call, visible(recorded("page", 3))], optimisticMessages: [] },
+      before,
+    );
+    expect(after.entries.map((entry) => [entry.id, entry.kind])).toEqual([
+      ["render", "work"],
+      ["page", "html-render"],
+    ]);
+  });
 });
 
 describe("work-log failure policy (#7999/#7893)", () => {
