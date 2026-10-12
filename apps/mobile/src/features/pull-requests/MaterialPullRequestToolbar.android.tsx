@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { BackHandler, Keyboard, View, type TextInputInstance } from "react-native";
 import { AndroidHeaderIconButton, AndroidScreenHeader } from "../../components/AndroidScreenHeader";
 import { CompactBrandTitle } from "../../components/CompactBrandTitle";
+import { MOBILE_APP_NAME } from "../../lib/mobileBranding";
 import { MaterialSearchField } from "../../components/MaterialSearchField";
 import { WorkspaceConnectionTitle } from "../home/WorkspaceConnectionTitle";
 import { useHardwareKeyboardCommand } from "../keyboard/hardwareKeyboardCommands";
@@ -69,7 +70,7 @@ export function MaterialPullRequestToolbar(props: { readonly onRequestVisibility
               brand={
                 <CompactBrandTitle
                   allowFontScaling={false}
-                  accessibilityLabel="T3 Code, Pull requests"
+                  accessibilityLabel={`${MOBILE_APP_NAME}, Pull requests`}
                 />
               }
               onPress={() =>
