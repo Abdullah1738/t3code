@@ -2617,6 +2617,9 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
           out("event.subscribe"),
           out("session.active"),
           replyData("session.active", { [CHILD]: { type: "running" } }),
+          // The still-running child's history tells which run its call is in.
+          out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+          reply("message.list", { data: [], cursor: {} }),
           out("permission.list", { sessionID: CHILD }),
           replyData("permission.list", []),
           out("session.form.list", { sessionID: CHILD }),
@@ -2733,6 +2736,9 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
           out("event.subscribe"),
           out("session.active"),
           replyData("session.active", { [CHILD]: { type: "running" } }),
+          // The still-running child's history tells which run its call is in.
+          out("message.list", { sessionID: CHILD, order: "desc", limit: "50" }),
+          reply("message.list", { data: [], cursor: {} }),
           out("permission.list", { sessionID: CHILD }),
           replyData("permission.list", []),
           out("session.form.list", { sessionID: CHILD }),
