@@ -237,6 +237,21 @@ that driver; an explicit `providerInstanceId` is honored exactly and fails
 when unavailable. Selecting a different provider without a model uses that
 provider's first advertised model.
 
+A provider runs a runtime mode it does not offer as `approval-required`, so a
+child would ask for approval on every command. `orchestrator_capabilities`
+lists `runtimeModes` only for a provider that offers some of the modes, and
+omits it for a provider that offers all of them. When the target lists
+`runtimeModes`, an explicit `runtimeMode` outside that list is refused, and an
+inherited mode steps down to the broadest mode the target offers.
+
+Each delegated review round uses a new `delegate_task` call with the original brief,
+prior findings, responses, and unresolved objections. Track each round by its own `taskId` and use
+a distinct `clientRequestId` per round, stable across retries of that round.
+`childThreadId` is backing storage, not a target for another review round through
+`t3_thread_send`. Ordinary thread messaging remains available for user-requested
+conversations; it does not reopen a completed task. There is no task-level follow-up
+API for preserving the same reviewer session.
+
 Delegation requires an active parent run owned by the MCP credential's
 provider session. The request becomes the V2 command
 `delegated_task.request`.
@@ -282,10 +297,11 @@ the published task result.
 
 Stops the child thread with the internal `thread.stop` command, then stops every
 task the child delegated, and disposes automatic parent delivery. Like a user Stop,
-`thread.stop` interrupts the running turn and holds queued turns. A nonterminal
-task with no interruptible run is rejected. A terminal task returns its existing
-status, and its child thread still stops, including later runs. Published task
-results remain available. It accepts an optional cancellation reason.
+`thread.stop` interrupts the running turn, holds queued turns, and ends pull request
+watches. A nonterminal task with no interruptible run is rejected. A terminal task
+returns its existing status, and its child thread still stops, including later
+runs and watch wakes. Published task results remain available. It accepts an
+optional cancellation reason.
 
 ### `create_threads`
 
