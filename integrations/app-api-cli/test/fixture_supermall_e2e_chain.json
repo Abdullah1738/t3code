@@ -1,0 +1,264 @@
+{
+ "add_path": "/_svc/cart-v1/cart/item/aaa9dcee08bdd46c/1?showCart",
+ "add_req": {
+  "isFouponSelected": false,
+  "isInstallationSelected": false
+ },
+ "add_resp": {
+  "apiVersion": 2,
+  "count": 1,
+  "items": [
+   {
+    "offerCode": "aaa9dcee08bdd46c",
+    "quantity": 1,
+    "quantityMax": 3,
+    "quantityMin": 1,
+    "skuConfig": "ZC3D2FE430033CA47B932Z"
+   }
+  ],
+  "offers": [
+   {
+    "offerCode": "aaa9dcee08bdd46c",
+    "quantity": 1,
+    "quantityMax": 3,
+    "quantityMin": 1,
+    "skuConfig": "ZC3D2FE430033CA47B932Z"
+   }
+  ],
+  "version": 3
+ },
+ "captured_order": "NAEIA0000960441",
+ "captured_total": 25.49,
+ "cart_empty": {
+  "apiVersion": 2,
+  "count": 0,
+  "items": [],
+  "offers": [],
+  "version": 3
+ },
+ "place_req": {
+  "total": 25.49
+ },
+ "place_resp": "NAEIA0000960441",
+ "search": {
+  "hits": [
+   {
+    "brand": "Quest",
+    "flags": [
+     "quick_atc",
+     "rocket",
+     "vat_refund_eligible",
+     "sm_gifting",
+     "nano"
+    ],
+    "is_buyable": true,
+    "name": "Vanilla Protein Milkshake",
+    "offer_code": "aaa9dcee08bdd46c",
+    "price": 18.48,
+    "rocket": {
+     "estimation_text": "GET IN <b>1 HR 59 MINS</b>",
+     "offer_code": "aaa9dcee08bdd46c",
+     "price": 18.48,
+     "sale_price": 17,
+     "sku_config": "ZC3D2FE430033CA47B932Z"
+    },
+    "sale_price": 17,
+    "sku": "ZC3D2FE430033CA47B932Z",
+    "sku_config": "ZC3D2FE430033CA47B932Z",
+    "stock_minimum_quantity": 1
+   }
+  ]
+ },
+ "session_req": {
+  "shouldUpdateSession": true
+ },
+ "session_resp": {
+  "addressCode": "487167e42d7ffb2992c46fb1df0b3a90",
+  "addressKey": "487167e42d7ffb2992c46fb1df0b3a90-1",
+  "deliveryOptions": {
+   "receiver_phone_code": "available",
+   "silent_delivery": {
+    "action": "info",
+    "buttonIcon": "https://a.nooncdn.com/rn/noon/sales/donot-contact-me-button-selected-revamp-v2-en.png",
+    "description": "Delivery agent will not contact you or ring the door bell and will leave the order at your doorstep.",
+    "icon": "https://a.nooncdn.com/rn/noon/sales/donot-contact-me-revamp-v2-en.png",
+    "info": "Our delivery agent will not contact you or ring the door bell and will leave the order at your doorstep.",
+    "infoIcon": "https://a.nooncdn.com/rn/noon/sales/donot-contact-me-revamp-v2-en.png",
+    "message": "Leave at my door",
+    "note": {
+     "backgroundHexa": "#EFF3FD",
+     "content": "Please ensure your address is accurate or provide alternate receiver detail for smooth contactless delivery.",
+     "icon": "https://a.nooncdn.com/rn/noon/sales/silent-delivery-note-en.png"
+    },
+    "status": "active",
+    "type": "checkbox"
+   }
+  },
+  "isCvvRequired": false,
+  "orderPaymentAmount": 25.49,
+  "paymentAmount": 25.49,
+  "paymentCurrencyCode": "AED",
+  "paymentMethods": [
+   {
+    "cards": [],
+    "code": "google_pay",
+    "name": "Google Pay",
+    "status": "available"
+   },
+   {
+    "cards": [
+     {
+      "id": "<secret>",
+      "isDefault": true,
+      "isSelected": true,
+      "mask": "52287301xxxx5542",
+      "type": "MASTERCARD"
+     },
+     {
+      "id": "<secret>",
+      "isDefault": false,
+      "isSelected": false,
+      "mask": "419649xxxxxx9963",
+      "type": "VISA"
+     },
+     {
+      "id": "<secret>",
+      "isDefault": false,
+      "isSelected": false,
+      "mask": "53178019xxxx4746",
+      "type": "MASTERCARD"
+     },
+     {
+      "id": "<secret>",
+      "isDefault": false,
+      "isSelected": false,
+      "mask": "44217800xxxx9546",
+      "type": "VISA"
+     },
+     {
+      "id": "<secret>",
+      "isDefault": false,
+      "isSelected": false,
+      "mask": "531780xxxxxx8669",
+      "type": "MASTERCARD"
+     }
+    ],
+    "code": "cc_noonpay",
+    "name": "Debit/Credit Card",
+    "status": "active"
+   },
+   {
+    "cards": [],
+    "code": "tabby",
+    "name": "Tabby",
+    "status": "disabled"
+   },
+   {
+    "cards": [],
+    "code": "tamara",
+    "name": "Tamara",
+    "status": "disabled"
+   },
+   {
+    "cards": [],
+    "code": "cod",
+    "name": "Cash On Delivery",
+    "status": "disabled"
+   },
+   {
+    "cards": [],
+    "code": "nopayment",
+    "name": "Store Credits",
+    "status": "disabled"
+   }
+  ],
+  "paymentMethodsVersion": 2,
+  "shipments": [
+   {
+    "id": "aaa9dcee08bdd46c-0",
+    "isRocket": true,
+    "isSlotBased": false,
+    "items": [
+     {
+      "brand": "Quest",
+      "flags": [
+       "rocket",
+       "vat_refund_eligible",
+       "nano",
+       "quick_atc",
+       "sm_gifting"
+      ],
+      "offerCode": "aaa9dcee08bdd46c",
+      "quantity": 1,
+      "skuConfig": "ZC3D2FE430033CA47B932Z",
+      "unitPrice": "17.00"
+     }
+    ],
+    "promises": [
+     {
+      "analytics": {
+       "tag": "rocket"
+      },
+      "deliveryDate": "2026-10-11T00:37:00",
+      "isSelected": true,
+      "message": "<normal>Get in <b>1 hr 8 mins</b></normal>"
+     },
+     {
+      "analytics": {
+       "tag": "ndd"
+      },
+      "deliveryDate": "2026-10-11T18:00:00",
+      "isSelected": false,
+      "message": "<normal>Get it <b>tomorrow</b></normal> <small><steel>(9 AM to 6 PM)</steel></small>"
+     }
+    ]
+   }
+  ],
+  "subtotal": 17.0,
+  "total": 25.49,
+  "useCredits": false,
+  "version": 3,
+  "walletAmount": 0.0
+ },
+ "status_pending": {
+  "addressKey": null,
+  "clientSecret": null,
+  "countryCode": null,
+  "isVatRefundEligible": null,
+  "lang": null,
+  "paymentError": null,
+  "paymentErrorMsg": null,
+  "status": "pending",
+  "statusMessage": "Payment pending",
+  "total": null
+ },
+ "status_success": {
+  "addressKey": "487167e42d7ffb2992c46fb1df0b3a90-1",
+  "clientSecret": null,
+  "countryCode": "ae",
+  "isVatRefundEligible": false,
+  "lang": "en",
+  "paymentError": null,
+  "paymentErrorMsg": null,
+  "shipments": [
+   {
+    "items": [
+     {
+      "quantity": 1,
+      "skuConfig": "ZC3D2FE430033CA47B932Z",
+      "unitPrice": "17.00"
+     }
+    ],
+    "promises": [
+     {
+      "isSelected": true,
+      "message": "<small><steel>Arriving in</steel></small><br/><b>1 hr 8 mins</b>"
+     }
+    ]
+   }
+  ],
+  "status": "success",
+  "statusMessage": "Your order is successfully placed",
+  "total": "25.49"
+ }
+}

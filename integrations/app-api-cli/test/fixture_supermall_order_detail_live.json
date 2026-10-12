@@ -1,0 +1,189 @@
+{
+ "createdAt": "2026-10-10T23:30:07+04:00",
+ "extendedWarranty": null,
+ "gifting": null,
+ "invoice": {
+  "sections": [
+   {
+    "entries": [
+     {
+      "amount": "\ue001 17.00",
+      "message": null,
+      "title": "Subtotal (1 item)"
+     },
+     {
+      "amount": "\ue001 5.00",
+      "message": null,
+      "title": "Shipping fee"
+     },
+     {
+      "amount": "\ue001 3.49",
+      "message": null,
+      "title": "Supermall service fees"
+     }
+    ],
+    "groups": [
+     {
+      "amount": "\ue001 17.00",
+      "cashbackMessage": null,
+      "collapsable": false,
+      "entries": [
+       {
+        "amount": "\ue001 17.00",
+        "message": null,
+        "title": "Subtotal (1 item)"
+       }
+      ],
+      "hasShippingFees": false,
+      "isCashback": false,
+      "isCoupon": false,
+      "title": null
+     },
+     {
+      "amount": "\ue001 8.49",
+      "cashbackMessage": null,
+      "collapsable": true,
+      "entries": [
+       {
+        "amount": "\ue001 5.00",
+        "message": null,
+        "title": "Shipping fee"
+       },
+       {
+        "amount": "\ue001 3.49",
+        "message": null,
+        "title": "Supermall service fees"
+       }
+      ],
+      "hasShippingFees": true,
+      "isCashback": false,
+      "isCoupon": false,
+      "title": "Fees paid"
+     }
+    ],
+    "title": "Order details"
+   },
+   {
+    "entries": [
+     {
+      "amount": "<strong>\ue001 25.49</strong>",
+      "message": null,
+      "title": "<strong>Total paid</strong> <small>(inc. VAT)</small>"
+     }
+    ],
+    "groups": [
+     {
+      "amount": "\ue001 25.49",
+      "cashbackMessage": null,
+      "collapsable": false,
+      "entries": [
+       {
+        "amount": "<strong>\ue001 25.49</strong>",
+        "message": null,
+        "title": "<strong>Total paid</strong> <small>(inc. VAT)</small>"
+       }
+      ],
+      "hasShippingFees": false,
+      "isCashback": false,
+      "isCoupon": false,
+      "title": null
+     }
+    ],
+    "title": ""
+   }
+  ]
+ },
+ "isVatRefundEligible": null,
+ "itemGroups": [
+  {
+   "isTextVisible": true,
+   "itemNr": null,
+   "items": [
+    {
+     "brand": "Quest",
+     "extendedWarranty": null,
+     "feeRefund": null,
+     "flags": [
+      "sm_gifting",
+      "rocket",
+      "quick_atc",
+      "nano",
+      "vat_refund_eligible"
+     ],
+     "isGiftingSelected": false,
+     "isReturnable": false,
+     "itemNr": "NAEIA0000960441-1",
+     "offerCode": "aaa9dcee08bdd46c",
+     "originalPrice": null,
+     "quantity": 1,
+     "reviews": null,
+     "shipmentNr": "NAEIA0000960441-S1",
+     "sku": "ZC3D2FE430033CA47B932Z-1",
+     "skuConfig": "ZC3D2FE430033CA47B932Z",
+     "title": "Vanilla Protein Milkshake ",
+     "unitPrice": 17.0,
+     "variantGroups": [],
+     "virtualBundleCode": null,
+     "warranty": null
+    }
+   ],
+   "orderNr": "NAEIA0000960441",
+   "shipmentNr": "NAEIA0000960441-S1",
+   "subStatus": {
+    "highStatus": "Out For Delivery",
+    "highStatusCode": "out_for_delivery",
+    "highStatusColor": "#38AE07",
+    "highStatusColorCode": "green",
+    "subStatus": "updated"
+   },
+   "subText": "Out For Delivery \u00b7 Updated",
+   "text": "Arriving 17 Mins"
+  }
+ ],
+ "metadata": {
+  "isAgent": false,
+  "isNano": false,
+  "mapRefreshSec": 4,
+  "pageRefreshSec": null,
+  "riderIcon": null
+ },
+ "orderNr": "NAEIA0000960441",
+ "payment": {
+  "emi": null,
+  "paymentMethod": "Debit/Credit Card",
+  "paymentMethodCode": "cc_noonpay",
+  "paymentMethods": [
+   {
+    "amount": "25.49",
+    "code": "mastercard",
+    "title": "MASTERCARD xxxx5542"
+   }
+  ],
+  "title": "Paid with"
+ },
+ "paymentMethod": "Debit/Credit Card",
+ "paymentMethodCode": "cc_noonpay",
+ "shippingAddress": {},
+ "shippingPreferences": {
+  "delivery": [
+   {
+    "code": "silent_delivery",
+    "description": "Delivery agent will not contact you or ring the door bell and leave the order at your doorstep.",
+    "isChangeable": false,
+    "name": "Leave at my door",
+    "status": "active"
+   }
+  ]
+ },
+ "trackActions": {
+  "view_invoice": {
+   "actionCode": "view_invoice",
+   "text": "View order invoices"
+  },
+  "view_invoice_status": {
+   "actionCode": "view_invoice_status",
+   "text": "View invoice"
+  }
+ },
+ "tradeInRef": null
+}

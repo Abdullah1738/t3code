@@ -1,0 +1,422 @@
+{
+ "captured_order": "NNGAANNWEFJMZW8A",
+ "captured_total": 31.45,
+ "correct_preference_req": {
+  "deliveryPreference": {
+   "dont_ring_the_bell": true,
+   "leave_it_at_my_door": true
+  },
+  "sessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164"
+ },
+ "create_req": {
+  "modifiers": {},
+  "productCode": "P4372707388695472A",
+  "storeCode": "SPNNYSAKBB"
+ },
+ "create_resp": {
+  "data": {
+   "addressCode": "487167e42d7ffb2992c46fb1df0b3a90",
+   "addressVersion": 1,
+   "channelCode": "noon",
+   "checkoutSessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164",
+   "creditCardMask": null,
+   "currencyCode": "AED",
+   "deliveryPreference": {
+    "dont_ring_the_bell": true,
+    "leave_it_at_my_door": true
+   },
+   "driverNotes": "",
+   "hasPaymentSubscription": false,
+   "notes": "",
+   "orderCashFee": 0.0,
+   "orderDeliveryFee": 6.45,
+   "orderDiscount": 0.0,
+   "orderHandlingFee": 0.0,
+   "orderPaymentAmount": 31.45,
+   "orderRiderTip": 0.0,
+   "orderServiceFee": 4.5,
+   "orderSmallOrderFee": 0.0,
+   "orderSubtotal": 20.5,
+   "orderSubtotalDiscounted": 20.5,
+   "orderTotal": 31.45,
+   "orderWalletAmount": 0.0,
+   "paymentMethodCode": null,
+   "products": [
+    {
+     "maxQty": 2,
+     "modifiers": [],
+     "name": "Grenade Protein Shake, White Chocolate",
+     "price": 20.5,
+     "productCode": "P4372707388695472A",
+     "productTypeCode": "non_weighable",
+     "qty": 1.0
+    }
+   ],
+   "storeCode": "SPNNYSAKBB",
+   "storeInfo": {
+    "nameEn": "Spinneys",
+    "storeCode": "SPNNYSAKBB"
+   },
+   "totalQuantity": 1
+  }
+ },
+ "edit_payment_req": {
+  "creditCardMask": "52287301xxxx5542",
+  "paymentMethodCode": "prepaid",
+  "paymentToken": "<secret>",
+  "prepaid_payment_method_code": "cc_noonpay",
+  "sessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164",
+  "walletAmount": 0
+ },
+ "edit_payment_resp": {
+  "data": {
+   "addressCode": "487167e42d7ffb2992c46fb1df0b3a90",
+   "addressVersion": 1,
+   "channelCode": "noon",
+   "checkoutSessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164",
+   "creditCardMask": "52287301xxxx5542",
+   "currencyCode": "AED",
+   "deliveryPreference": {
+    "dont_ring_the_bell": true,
+    "leave_it_at_my_door": true
+   },
+   "driverNotes": "",
+   "hasPaymentSubscription": true,
+   "notes": "",
+   "orderCashFee": 0.0,
+   "orderDeliveryFee": 6.45,
+   "orderDiscount": 0.0,
+   "orderHandlingFee": 0.0,
+   "orderPaymentAmount": 31.45,
+   "orderRiderTip": 0.0,
+   "orderServiceFee": 4.5,
+   "orderSmallOrderFee": 0.0,
+   "orderSubtotal": 20.5,
+   "orderSubtotalDiscounted": 20.5,
+   "orderTotal": 31.45,
+   "orderWalletAmount": 0.0,
+   "paymentMethodCode": "prepaid",
+   "products": [
+    {
+     "maxQty": 2,
+     "modifiers": [],
+     "name": "Grenade Protein Shake, White Chocolate",
+     "price": 20.5,
+     "productCode": "P4372707388695472A",
+     "productTypeCode": "non_weighable",
+     "qty": 1.0
+    }
+   ],
+   "storeCode": "SPNNYSAKBB",
+   "storeInfo": {
+    "nameEn": "Spinneys",
+    "storeCode": "SPNNYSAKBB"
+   },
+   "totalQuantity": 1
+  }
+ },
+ "home_active": {
+  "data": {
+   "active": [],
+   "cart": {
+    "orderSubtotal": 1399.0,
+    "orderTotal": 1403.5,
+    "sessionCode": "81998b2c-811c-440d-914f-9b1f8eff1f4a",
+    "storeCode": "NTHNGQ3AZ3"
+   }
+  }
+ },
+ "home_clear": {
+  "data": {
+   "active": [],
+   "cart": {
+    "orderSubtotal": 1399.0,
+    "orderTotal": 1403.5,
+    "sessionCode": "81998b2c-811c-440d-914f-9b1f8eff1f4a",
+    "storeCode": "NTHNGQ3AZ3"
+   }
+  }
+ },
+ "paymentcards": {
+  "data": [
+   {
+    "ccMasked": "52287301xxxx5542",
+    "ccType": "MASTERCARD",
+    "id": "<secret>",
+    "isDefault": true,
+    "isDeleted": false
+   },
+   {
+    "ccMasked": "419649xxxxxx9963",
+    "ccType": "VISA",
+    "id": "<secret>",
+    "isDefault": false,
+    "isDeleted": false
+   },
+   {
+    "ccMasked": "53178019xxxx4746",
+    "ccType": "MASTERCARD",
+    "id": "<secret>",
+    "isDefault": false,
+    "isDeleted": false
+   },
+   {
+    "ccMasked": "44217800xxxx9546",
+    "ccType": "VISA",
+    "id": "<secret>",
+    "isDefault": false,
+    "isDeleted": false
+   },
+   {
+    "ccMasked": "531780xxxxxx8669",
+    "ccType": "MASTERCARD",
+    "id": "<secret>",
+    "isDefault": false,
+    "isDeleted": false
+   }
+  ]
+ },
+ "place_req": {
+  "sessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164",
+  "total": 31.45
+ },
+ "place_resp": {
+  "data": {
+   "order": {
+    "creditCardMask": "52287301xxxx5542",
+    "customerStatusCode": "placed",
+    "logisticsStatusCode": "not_initiated",
+    "orderDeliveryFee": 6.45,
+    "orderNr": "NNGAANNWEFJMZW8A",
+    "orderPaymentAmount": 31.45,
+    "orderRef": "2981",
+    "orderServiceFee": 4.5,
+    "orderStatusCode": "pending_acceptance",
+    "orderSubtotal": 20.5,
+    "orderTotal": 31.45,
+    "orderWalletAmount": 0.0,
+    "paymentMethodCode": "prepaid",
+    "prepaidPaymentMisc": {
+     "cobrandCardInfo": null,
+     "isCvvRequired": "<secret>",
+     "prepaidPaymentMethodCode": "cc_noonpay"
+    },
+    "products": [
+     {
+      "productCode": "P4372707388695472A",
+      "qty": 1.0
+     }
+    ],
+    "storeStatusCode": "pending_acceptance"
+   },
+   "session": null
+  }
+ },
+ "product_edit_req": {
+  "modifiers": {},
+  "notes": null,
+  "productCode": "P5997551102819847A",
+  "qty": 2,
+  "sessionCode": "3fdf4aef-0240-460a-9711-1fd2ba21e775"
+ },
+ "recent": {
+  "data": {
+   "carts": [
+    {
+     "checkoutSessionCode": "3fdf4aef-0240-460a-9711-1fd2ba21e775",
+     "storeCode": "FRNPRXS2P9"
+    },
+    {
+     "checkoutSessionCode": "81998b2c-811c-440d-914f-9b1f8eff1f4a",
+     "storeCode": "NTHNGQ3AZ3"
+    }
+   ]
+  }
+ },
+ "subscription_list": {
+  "data": [
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   },
+   {
+    "paymentToken": "<secret>"
+   }
+  ]
+ },
+ "tracking_placed": {
+  "data": {
+   "address": {
+    "description": "BanyanTree Hillside - Flat 2104, D 61 - Dubai - Dubai"
+   },
+   "addressChangeStatus": "available",
+   "description": "Awaiting confirmation from the merchant",
+   "estimate": null,
+   "needHelpActions": [
+    {
+     "actionCode": "chat_support",
+     "title": "Chat support"
+    },
+    {
+     "actionCode": "order_details",
+     "title": "View order details"
+    },
+    {
+     "actionCode": "cancel_order",
+     "title": "Cancel order"
+    }
+   ],
+   "orderStatusCode": "pending_acceptance",
+   "paymentMessage": null,
+   "status": "placed",
+   "store": {
+    "nameEn": "Spinneys",
+    "phone": "<secret>"
+   },
+   "title": "Your order has been placed"
+  }
+ },
+ "tracking_preparing": {
+  "data": {
+   "address": {
+    "description": "BanyanTree Hillside - Flat 2104, D 61 - Dubai - Dubai"
+   },
+   "addressChangeStatus": "available",
+   "description": "We're sending a rider to pick it up",
+   "estimate": "02:20PM - 02:35PM",
+   "needHelpActions": [
+    {
+     "actionCode": "chat_support",
+     "title": "Chat support"
+    },
+    {
+     "actionCode": "order_details",
+     "title": "View order details"
+    }
+   ],
+   "orderStatusCode": "pending_approval",
+   "paymentMessage": null,
+   "status": "preparing",
+   "store": {
+    "nameEn": "Spinneys",
+    "phone": "<secret>"
+   },
+   "title": "Your order is being prepared"
+  }
+ },
+ "validate_req": {
+  "sessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164"
+ },
+ "validate_resp": {
+  "data": {
+   "addressCode": "487167e42d7ffb2992c46fb1df0b3a90",
+   "addressVersion": 1,
+   "channelCode": "noon",
+   "checkoutSessionCode": "ba6fa894-5f37-4f6a-a5ff-8d99546e7164",
+   "creditCardMask": "52287301xxxx5542",
+   "currencyCode": "AED",
+   "deliveryPreference": {
+    "dont_ring_the_bell": false,
+    "leave_it_at_my_door": false
+   },
+   "driverNotes": "",
+   "hasPaymentSubscription": true,
+   "notes": "",
+   "orderCashFee": 0.0,
+   "orderDeliveryFee": 6.45,
+   "orderDiscount": 0.0,
+   "orderHandlingFee": 0.0,
+   "orderPaymentAmount": 31.45,
+   "orderRiderTip": 0.0,
+   "orderServiceFee": 4.5,
+   "orderSmallOrderFee": 0.0,
+   "orderSubtotal": 20.5,
+   "orderSubtotalDiscounted": 20.5,
+   "orderTotal": 31.45,
+   "orderWalletAmount": 0.0,
+   "paymentMethodCode": "prepaid",
+   "products": [
+    {
+     "maxQty": 2,
+     "modifiers": [],
+     "name": "Grenade Protein Shake, White Chocolate",
+     "price": 20.5,
+     "productCode": "P4372707388695472A",
+     "productTypeCode": "non_weighable",
+     "qty": 1.0
+    }
+   ],
+   "storeCode": "SPNNYSAKBB",
+   "storeInfo": {
+    "nameEn": "Spinneys",
+    "storeCode": "SPNNYSAKBB"
+   },
+   "totalQuantity": 1
+  }
+ }
+}

@@ -1,0 +1,820 @@
+{
+ "captured_order": "IAEGAA148ODSUNJWBA",
+ "captured_total": 17.25,
+ "complete": {
+  "req": {
+   "adcbTokenCode": null,
+   "applePayToken": null,
+   "clientSecret": "<secret>",
+   "cvvEncryption": {
+    "encCvv": "<secret>",
+    "publicKeyName": "key_1"
+   },
+   "googlePayToken": null,
+   "idCustomerToken": "<secret>",
+   "idEmiPlan": null,
+   "installments": null,
+   "paymentMethodCode": "cc_noonpay",
+   "paymentProviderCode": "NOON_PAY",
+   "paymentType": null,
+   "tenorMonth": null
+  },
+  "resp": {
+   "amount": 17.25,
+   "authorization_adjustment": null,
+   "authorized_amount": 0.0,
+   "captured_amount": 0.0,
+   "card_category": null,
+   "card_country": null,
+   "card_issuer": null,
+   "cc_masked": "522873xxxxxx5542",
+   "cc_type": "MASTERCARD",
+   "currency_code": "AED",
+   "customer_code": "<secret>",
+   "error_code": null,
+   "error_hint": null,
+   "error_instructions": null,
+   "error_message": null,
+   "error_msg": null,
+   "id_token": "<secret>",
+   "is_3ds_failure": false,
+   "is_cc_payment": true,
+   "is_refund_skipped_emi": false,
+   "last_refund_at": null,
+   "message": null,
+   "payment_link": null,
+   "payment_method_code": "cc_noonpay",
+   "payment_provider_code": "NOON_PAY",
+   "redirect_url": null,
+   "reference": "IAEGAA148ODSUNJWBA",
+   "refunded_amount": 0.0,
+   "reversed_amount": 0.0,
+   "status": "payment_pending",
+   "subscription_id": "<secret>",
+   "transaction_status": "CREATED",
+   "use_new_webview": false
+  }
+ },
+ "config": {
+  "available_payment_methods": [
+   "cc_noonpay",
+   "apple_pay",
+   "google_pay",
+   "adcb_touchpoints"
+  ],
+  "cvv_encryption": {
+   "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1TXO40nx74ROz/8be0FD\n1lJj32As1RTT4//6mLWsFOdP7EK9DTFL3LpJPAM4MqiTW0EGyZ3VgVpthtcyet20\nyo2ZyrqiJFcJLB/GIag3XaHbNrORLOCzDd5dBKzuLwpsXrVU0Z6kvOMw7MbweMBh\n6/bx1HNLrqTZTgnQeB4d7YwHTU+xxbHCpPC2/ILh2Qk+/GdZCIL2SCowMMMeB/0m\nfCRv6dveB5FtOLP4mT37250qEHPSTlkH8INFlG7DAFmX5ex7ZAqRLOeVlLXNmIzH\n/VJJkUksc+q/jrms1al7dXfdNdbtFmuCYebjgOtnLAuEXGZ87PZsfEGpn5pzR+uX\nPQIDAQAB\n-----END PUBLIC KEY-----\n",
+   "public_key_name": "key_1"
+  },
+  "new_algorithm": true
+ },
+ "get_active": {
+  "req": {},
+  "resp": {
+   "activeOrders": []
+  }
+ },
+ "order_get_after_payment": {
+  "activeReturns": [],
+  "addressKey": "487167e42d7ffb2992c46fb1df0b3a90-1",
+  "canceledItemsPopup": {
+   "message": "You would not be charged for these items. We would be waving the delivery fee of \ue001 8 because of the inconvenience",
+   "title": "Sorry, we had to cancel some items since they went out of stock"
+  },
+  "completedReturns": [],
+  "countryCode": "ae",
+  "couponCode": null,
+  "creditCardBin": "522873",
+  "creditCardMask": "52287301xxxx5542",
+  "creditCardType": "MASTERCARD",
+  "csHelpLabels": {
+   "Order Number": "IAEGAA148ODSUNJWBA",
+   "Order Status": "confirmed",
+   "agent_refund_blocked": "No",
+   "appCountry": "UAE",
+   "auto_refund_blocked": "No",
+   "customerCode": "<secret>",
+   "delay_flag": "No",
+   "orderNumber": "IAEGAA148ODSUNJWBA",
+   "order_total": "17.25",
+   "pageCode": "index_pre_pickup",
+   "payment_mode": "Credit Card",
+   "tpc": 396,
+   "vvip": "No",
+   "wh_code": "W00000148A"
+  },
+  "csHelpProvider": "freshdesk",
+  "currencyCode": "AED",
+  "deliveredAt": null,
+  "deliveryCodeComponent": null,
+  "deliveryDisclaimer": null,
+  "deliveryPreferences": [
+   {
+    "code": "dont_ring_the_bell",
+    "disabledToast": null,
+    "icon": "https://z.nooncdn.com/rn/instant/icons/dp_do_not_ring1.png",
+    "isDisabled": false,
+    "name": "Do not ring the bell",
+    "revampIcon": "https://z.nooncdn.com/rn/instant/cart-revamp/bell.png",
+    "type": "toggle",
+    "value": true,
+    "warning": null
+   },
+   {
+    "code": "leave_it_at_my_door",
+    "disabledToast": null,
+    "icon": "https://z.nooncdn.com/rn/instant/icons/dp_leave_door.png",
+    "isDisabled": false,
+    "name": "Leave it at my door",
+    "revampIcon": "https://z.nooncdn.com/rn/instant/cart-revamp/door.png",
+    "type": "toggle",
+    "value": true,
+    "warning": null
+   }
+  ],
+  "deliveryType": "direct_customer_delivery",
+  "discountCode": null,
+  "discountDestination": null,
+  "discountTarget": null,
+  "driverNotes": "Leave at door. Don't ring bell. Don't call.",
+  "estimatedDeliveryAt": "2026-10-10T13:30:52",
+  "estimatedDeliveryText": "Arrives between:<br><b>01:30 - 01:35 PM</b>",
+  "estimatedPickupAt": "2026-10-10T13:23:21",
+  "helpMode": "cs_workflow",
+  "humanizedPaymentErrorMsg": "We're sorry, but there's been an issue with your payment and we're unable to process it at this time.",
+  "idEmiPlan": null,
+  "initialOrderDetails": {
+   "bulky_order_fee": 0,
+   "cod_fee": 0,
+   "convenience_fee": 0,
+   "delivery_fee": "8",
+   "driver_tip": "0.000",
+   "gift_bag_fee": 0,
+   "is_service_fee_enabled": 0,
+   "late_night_fee": "0",
+   "order_cashback": 0,
+   "order_discount": 0,
+   "order_subtotal": "6.250",
+   "order_total": "17.25",
+   "payment_fee": 0,
+   "service_fee": "0",
+   "small_order_fee": "3"
+  },
+  "installmentCount": null,
+  "isDropoffFlow": false,
+  "isInReturnWindow": false,
+  "isInvoiceReady": false,
+  "isPaymentSubscriptionUsed": false,
+  "isTrackable": true,
+  "isWithDc": false,
+  "itemCountDesc": "1 item",
+  "itemSections": [
+   {
+    "icon": null,
+    "items": [
+     {
+      "brand": "Nada",
+      "bundle": null,
+      "cancelSubsection": null,
+      "customizationSubtitle": null,
+      "imageKey": "pzsku/Z1EE72CD4422F492ACC23Z/45/1753295916/2676a600-0835-4436-bc31-69774c3072f9",
+      "infoText": null,
+      "isBundleDeal": false,
+      "isCustomizable": false,
+      "isDisabled": false,
+      "isDonationFreebie": false,
+      "isFreebie": false,
+      "isGift": false,
+      "itemCode": "Z1EE72CD4422F492ACC23Z-1",
+      "media": [
+       {
+        "isAbsolutePath": true,
+        "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1753295916/2676a600-0835-4436-bc31-69774c3072f9.jpg",
+        "type": "image"
+       },
+       {
+        "isAbsolutePath": true,
+        "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1753295924/e6b8da36-694c-47bf-aa41-c4aefca821ae.jpg",
+        "type": "image"
+       },
+       {
+        "isAbsolutePath": true,
+        "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1761561608/df175c21-5599-438e-ad86-1b324461f108.jpg",
+        "type": "image"
+       }
+      ],
+      "nameCustomizationParent": null,
+      "nameCustomizationTitle": null,
+      "priceText": "\ue001 <b>6.25</b>",
+      "productLabel": null,
+      "qty": 1,
+      "sku": "Z1EE72CD4422F492ACC23Z-1",
+      "subtitle": "320ml - 30g Protein",
+      "title": "Vanilla Low Fat Protein Milk"
+     }
+    ],
+    "subtitle": null,
+    "title": "Confirmed (1 item)",
+    "toolTip": null
+   }
+  ],
+  "items": [
+   {
+    "brand": "Nada",
+    "brandAr": "\u0646\u062f\u0649",
+    "brandEn": "Nada",
+    "bundle": null,
+    "cancelReason": null,
+    "cancelSubsection": null,
+    "customizationSubtitle": null,
+    "idPartner": 9411,
+    "imageKey": "pzsku/Z1EE72CD4422F492ACC23Z/45/1753295916/2676a600-0835-4436-bc31-69774c3072f9",
+    "infoText": null,
+    "isBundleDeal": false,
+    "isCustomizable": false,
+    "isDisabled": false,
+    "isDonationFreebie": false,
+    "isFreebie": false,
+    "isGift": false,
+    "itemCode": "Z1EE72CD4422F492ACC23Z-1",
+    "media": [
+     {
+      "isAbsolutePath": true,
+      "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1753295916/2676a600-0835-4436-bc31-69774c3072f9.jpg",
+      "type": "image"
+     },
+     {
+      "isAbsolutePath": true,
+      "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1753295924/e6b8da36-694c-47bf-aa41-c4aefca821ae.jpg",
+      "type": "image"
+     },
+     {
+      "isAbsolutePath": true,
+      "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1761561608/df175c21-5599-438e-ad86-1b324461f108.jpg",
+      "type": "image"
+     }
+    ],
+    "nameCustomizationParent": null,
+    "nameCustomizationTitle": null,
+    "price": 6.25,
+    "priceText": "\ue001 <b>6.25</b>",
+    "productLabel": null,
+    "qty": 1,
+    "sku": "Z1EE72CD4422F492ACC23Z-1",
+    "status": "Confirmed",
+    "statusCode": "confirmed",
+    "subtitle": "320ml - 30g Protein",
+    "title": "Vanilla Low Fat Protein Milk",
+    "titleAr": "\u0646\u062f\u0649 \u062d\u0644\u064a\u0628 \u0642\u0644\u064a\u0644 \u0627\u0644\u062f\u0633\u0645 \u0628\u0646\u0643\u0647\u0629 \u0627\u0644\u0641\u0627\u0646\u064a\u0644\u064a\u0627",
+    "titleEn": "Nada Vanilla Low Fat Protein Milk"
+   }
+  ],
+  "needHelpCtaText": null,
+  "orderCashback": 0,
+  "orderCodFee": 0,
+  "orderConvenienceFee": 0,
+  "orderDeliveryFee": 8,
+  "orderDisclaimer": null,
+  "orderDiscount": 0,
+  "orderDriverTip": 0,
+  "orderGiftBagFee": 0,
+  "orderLateNightFee": 0,
+  "orderNr": "IAEGAA148ODSUNJWBA",
+  "orderPaymentAmount": 17.25,
+  "orderRating": {
+   "canBeEdited": false,
+   "canBeRated": false,
+   "editRatingLabel": null,
+   "editRatingLabelColor": null,
+   "rateOrderIcon": null,
+   "rateOrderText": null,
+   "rateOrderTextColor": null,
+   "ratingBadge": null
+  },
+  "orderServiceFee": 0,
+  "orderSmallOrderFee": 3,
+  "orderSubtotal": 6.25,
+  "orderSummary": [
+   {
+    "entries": [
+     {
+      "bgGradientColors": null,
+      "title": "Subtotal (1 Item)",
+      "titleIcon": null,
+      "titleIconPosition": "after",
+      "value": "\ue001 6.25"
+     },
+     {
+      "bgGradientColors": null,
+      "title": "Delivery Fee",
+      "titleIcon": null,
+      "titleIconPosition": "after",
+      "value": "\ue001 8"
+     },
+     {
+      "bgGradientColors": null,
+      "title": "Small Order Fee",
+      "titleIcon": null,
+      "titleIconPosition": "after",
+      "value": "\ue001 3.00"
+     }
+    ]
+   },
+   {
+    "entries": [
+     {
+      "bgGradientColors": null,
+      "title": "<b>Amount Paid</b>",
+      "titleIcon": null,
+      "titleIconPosition": "after",
+      "value": "<b>\ue001 17.25</b>"
+     }
+    ]
+   }
+  ],
+  "orderTotal": 17.25,
+  "orderWalletCaptured": 0.0,
+  "paidDeliveryFee": 8,
+  "paidSmallOrderFee": 3,
+  "paymentErrorMsg": "We're sorry, but there's been an issue with your payment and we're unable to process it at this time.",
+  "paymentIntentToken": "<secret>",
+  "paymentMethodCode": "cc_noonpay",
+  "paymentType": null,
+  "placedAt": "2026-10-10T13:18:29",
+  "placedOnText": "Placed on Oct 10 \u2022 1:18 PM",
+  "poTipPaymentMethodConfigs": [
+   {
+    "code": "",
+    "desc": "Your saved cards",
+    "iconUrl": null,
+    "paymentOptions": [
+     {
+      "code": "cc_noonpay",
+      "desc": null,
+      "descColorGradient": null,
+      "iconCode": null,
+      "isActive": true,
+      "note": null
+     }
+    ]
+   },
+   {
+    "code": "",
+    "desc": "Other Payment Options",
+    "iconUrl": null,
+    "paymentOptions": [
+     {
+      "code": "google_pay",
+      "desc": "Google Pay",
+      "descColorGradient": null,
+      "iconCode": "google_pay",
+      "isActive": true,
+      "note": null
+     }
+    ]
+   }
+  ],
+  "pollFreqMs": 4000,
+  "preorderState": null,
+  "proofOfDeliverySection": null,
+  "receiverPhoneCode": null,
+  "refundInfoText": null,
+  "returnRequests": [],
+  "rider": null,
+  "shouldStillPoll": true,
+  "status": "Confirmed",
+  "statusCode": "confirmed",
+  "statusColor": "#2969FF",
+  "statusTitle": "Ongoing",
+  "whCode": "W00000148A"
+ },
+ "order_get_pending": {
+  "activeReturns": [],
+  "addressKey": "487167e42d7ffb2992c46fb1df0b3a90-1",
+  "canceledItemsPopup": {
+   "message": "You would not be charged for these items. We would be waving the delivery fee of \ue001 8 because of the inconvenience",
+   "title": "Sorry, we had to cancel some items since they went out of stock"
+  },
+  "completedReturns": [],
+  "countryCode": "ae",
+  "couponCode": null,
+  "creditCardBin": "522873",
+  "creditCardMask": "52287301xxxx5542",
+  "creditCardType": "MASTERCARD",
+  "csHelpLabels": {
+   "Order Number": "IAEGAA148ODSUNJWBA",
+   "Order Status": "pending",
+   "agent_refund_blocked": "No",
+   "appCountry": "UAE",
+   "auto_refund_blocked": "No",
+   "customerCode": "<secret>",
+   "delay_flag": "No",
+   "orderNumber": "IAEGAA148ODSUNJWBA",
+   "order_total": "17.25",
+   "pageCode": "index_pending",
+   "payment_mode": "Credit Card",
+   "tpc": 396,
+   "vvip": "No",
+   "wh_code": "W00000148A"
+  },
+  "csHelpProvider": "freshdesk",
+  "currencyCode": "AED",
+  "deliveredAt": null,
+  "deliveryCodeComponent": null,
+  "deliveryDisclaimer": null,
+  "deliveryPreferences": [
+   {
+    "code": "dont_ring_the_bell",
+    "disabledToast": null,
+    "icon": "https://z.nooncdn.com/rn/instant/icons/dp_do_not_ring1.png",
+    "isDisabled": false,
+    "name": "Do not ring the bell",
+    "revampIcon": "https://z.nooncdn.com/rn/instant/cart-revamp/bell.png",
+    "type": "toggle",
+    "value": true,
+    "warning": null
+   },
+   {
+    "code": "leave_it_at_my_door",
+    "disabledToast": null,
+    "icon": "https://z.nooncdn.com/rn/instant/icons/dp_leave_door.png",
+    "isDisabled": false,
+    "name": "Leave it at my door",
+    "revampIcon": "https://z.nooncdn.com/rn/instant/cart-revamp/door.png",
+    "type": "toggle",
+    "value": true,
+    "warning": null
+   }
+  ],
+  "deliveryType": "direct_customer_delivery",
+  "discountCode": null,
+  "discountDestination": null,
+  "discountTarget": null,
+  "driverNotes": "Leave at door. Don't ring bell. Don't call.",
+  "estimatedDeliveryAt": "2026-10-10T13:28:57",
+  "estimatedDeliveryText": null,
+  "estimatedPickupAt": "2026-10-10T13:21:25",
+  "helpMode": "cs_workflow",
+  "humanizedPaymentErrorMsg": "We're sorry, but there's been an issue with your payment and we're unable to process it at this time.",
+  "idEmiPlan": null,
+  "initialOrderDetails": {
+   "bulky_order_fee": 0,
+   "cod_fee": 0,
+   "convenience_fee": 0,
+   "delivery_fee": "8",
+   "driver_tip": "0.000",
+   "gift_bag_fee": 0,
+   "is_service_fee_enabled": 0,
+   "late_night_fee": "0",
+   "order_cashback": 0,
+   "order_discount": 0,
+   "order_subtotal": "6.250",
+   "order_total": "17.25",
+   "payment_fee": 0,
+   "service_fee": "0",
+   "small_order_fee": "3"
+  },
+  "installmentCount": null,
+  "isDropoffFlow": false,
+  "isInReturnWindow": false,
+  "isInvoiceReady": false,
+  "isPaymentSubscriptionUsed": false,
+  "isTrackable": false,
+  "isWithDc": false,
+  "itemCountDesc": "1 item",
+  "itemSections": [
+   {
+    "icon": null,
+    "items": [
+     {
+      "brand": "Nada",
+      "bundle": null,
+      "cancelSubsection": null,
+      "customizationSubtitle": null,
+      "imageKey": "pzsku/Z1EE72CD4422F492ACC23Z/45/1753295916/2676a600-0835-4436-bc31-69774c3072f9",
+      "infoText": null,
+      "isBundleDeal": false,
+      "isCustomizable": false,
+      "isDisabled": false,
+      "isDonationFreebie": false,
+      "isFreebie": false,
+      "isGift": false,
+      "itemCode": "Z1EE72CD4422F492ACC23Z-1",
+      "media": [
+       {
+        "isAbsolutePath": true,
+        "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1753295916/2676a600-0835-4436-bc31-69774c3072f9.jpg",
+        "type": "image"
+       },
+       {
+        "isAbsolutePath": true,
+        "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1753295924/e6b8da36-694c-47bf-aa41-c4aefca821ae.jpg",
+        "type": "image"
+       },
+       {
+        "isAbsolutePath": true,
+        "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1761561608/df175c21-5599-438e-ad86-1b324461f108.jpg",
+        "type": "image"
+       }
+      ],
+      "nameCustomizationParent": null,
+      "nameCustomizationTitle": null,
+      "priceText": "\ue001 <b>6.25</b>",
+      "productLabel": null,
+      "qty": 1,
+      "sku": "Z1EE72CD4422F492ACC23Z-1",
+      "subtitle": "320ml - 30g Protein",
+      "title": "Vanilla Low Fat Protein Milk"
+     }
+    ],
+    "subtitle": null,
+    "title": "Confirmed (1 item)",
+    "toolTip": null
+   }
+  ],
+  "items": [
+   {
+    "brand": "Nada",
+    "brandAr": "\u0646\u062f\u0649",
+    "brandEn": "Nada",
+    "bundle": null,
+    "cancelReason": null,
+    "cancelSubsection": null,
+    "customizationSubtitle": null,
+    "idPartner": 9411,
+    "imageKey": "pzsku/Z1EE72CD4422F492ACC23Z/45/1753295916/2676a600-0835-4436-bc31-69774c3072f9",
+    "infoText": null,
+    "isBundleDeal": false,
+    "isCustomizable": false,
+    "isDisabled": false,
+    "isDonationFreebie": false,
+    "isFreebie": false,
+    "isGift": false,
+    "itemCode": "Z1EE72CD4422F492ACC23Z-1",
+    "media": [
+     {
+      "isAbsolutePath": true,
+      "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1753295916/2676a600-0835-4436-bc31-69774c3072f9.jpg",
+      "type": "image"
+     },
+     {
+      "isAbsolutePath": true,
+      "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1753295924/e6b8da36-694c-47bf-aa41-c4aefca821ae.jpg",
+      "type": "image"
+     },
+     {
+      "isAbsolutePath": true,
+      "path": "https://f.nooncdn.com/p/pzsku/Z1EE72CD4422F492ACC23Z/45/1761561608/df175c21-5599-438e-ad86-1b324461f108.jpg",
+      "type": "image"
+     }
+    ],
+    "nameCustomizationParent": null,
+    "nameCustomizationTitle": null,
+    "price": 6.25,
+    "priceText": "\ue001 <b>6.25</b>",
+    "productLabel": null,
+    "qty": 1,
+    "sku": "Z1EE72CD4422F492ACC23Z-1",
+    "status": "Confirmed",
+    "statusCode": "confirmed",
+    "subtitle": "320ml - 30g Protein",
+    "title": "Vanilla Low Fat Protein Milk",
+    "titleAr": "\u0646\u062f\u0649 \u062d\u0644\u064a\u0628 \u0642\u0644\u064a\u0644 \u0627\u0644\u062f\u0633\u0645 \u0628\u0646\u0643\u0647\u0629 \u0627\u0644\u0641\u0627\u0646\u064a\u0644\u064a\u0627",
+    "titleEn": "Nada Vanilla Low Fat Protein Milk"
+   }
+  ],
+  "needHelpCtaText": null,
+  "orderCashback": 0,
+  "orderCodFee": 0,
+  "orderConvenienceFee": 0,
+  "orderDeliveryFee": 8,
+  "orderDisclaimer": null,
+  "orderDiscount": 0,
+  "orderDriverTip": 0,
+  "orderGiftBagFee": 0,
+  "orderLateNightFee": 0,
+  "orderNr": "IAEGAA148ODSUNJWBA",
+  "orderPaymentAmount": 17.25,
+  "orderRating": {
+   "canBeEdited": false,
+   "canBeRated": false,
+   "editRatingLabel": null,
+   "editRatingLabelColor": null,
+   "rateOrderIcon": null,
+   "rateOrderText": null,
+   "rateOrderTextColor": null,
+   "ratingBadge": null
+  },
+  "orderServiceFee": 0,
+  "orderSmallOrderFee": 3,
+  "orderSubtotal": 6.25,
+  "orderSummary": [
+   {
+    "entries": [
+     {
+      "bgGradientColors": null,
+      "title": "Subtotal (1 Item)",
+      "titleIcon": null,
+      "titleIconPosition": "after",
+      "value": "\ue001 6.25"
+     },
+     {
+      "bgGradientColors": null,
+      "title": "Delivery Fee",
+      "titleIcon": null,
+      "titleIconPosition": "after",
+      "value": "\ue001 8"
+     },
+     {
+      "bgGradientColors": null,
+      "title": "Small Order Fee",
+      "titleIcon": null,
+      "titleIconPosition": "after",
+      "value": "\ue001 3.00"
+     }
+    ]
+   },
+   {
+    "entries": [
+     {
+      "bgGradientColors": null,
+      "title": "<b>Amount Paid</b>",
+      "titleIcon": null,
+      "titleIconPosition": "after",
+      "value": "<b>\ue001 17.25</b>"
+     }
+    ]
+   }
+  ],
+  "orderTotal": 17.25,
+  "orderWalletCaptured": 0.0,
+  "paidDeliveryFee": 8,
+  "paidSmallOrderFee": 3,
+  "paymentErrorMsg": "We're sorry, but there's been an issue with your payment and we're unable to process it at this time.",
+  "paymentIntentToken": "<secret>",
+  "paymentMethodCode": "cc_noonpay",
+  "paymentType": null,
+  "placedAt": "2026-10-10T13:18:29",
+  "placedOnText": "Placed on Oct 10 \u2022 1:18 PM",
+  "poTipPaymentMethodConfigs": [
+   {
+    "code": "",
+    "desc": "Your saved cards",
+    "iconUrl": null,
+    "paymentOptions": [
+     {
+      "code": "cc_noonpay",
+      "desc": null,
+      "descColorGradient": null,
+      "iconCode": null,
+      "isActive": true,
+      "note": null
+     }
+    ]
+   },
+   {
+    "code": "",
+    "desc": "Other Payment Options",
+    "iconUrl": null,
+    "paymentOptions": [
+     {
+      "code": "google_pay",
+      "desc": "Google Pay",
+      "descColorGradient": null,
+      "iconCode": "google_pay",
+      "isActive": true,
+      "note": null
+     }
+    ]
+   }
+  ],
+  "pollFreqMs": 4000,
+  "preorderState": null,
+  "proofOfDeliverySection": null,
+  "receiverPhoneCode": null,
+  "refundInfoText": null,
+  "returnRequests": [],
+  "rider": null,
+  "shouldStillPoll": true,
+  "status": "Payment Pending",
+  "statusCode": "pending",
+  "statusColor": "#2969FF",
+  "statusTitle": "Ongoing",
+  "whCode": "W00000148A"
+ },
+ "place": {
+  "req": {
+   "total": 17.25
+  },
+  "resp": {
+   "error_modal": {},
+   "order_nr": "IAEGAA148ODSUNJWBA",
+   "success": true
+  }
+ },
+ "status_3ds_enroll": {
+  "amount": 17.25,
+  "authorization_adjustment": null,
+  "authorized_amount": 0.0,
+  "captured_amount": 0.0,
+  "card_category": null,
+  "card_country": null,
+  "card_issuer": null,
+  "cc_masked": "522873xxxxxx5542",
+  "cc_type": "MASTERCARD",
+  "currency_code": "AED",
+  "customer_code": "<secret>",
+  "error_code": "0",
+  "error_hint": null,
+  "error_instructions": null,
+  "error_message": null,
+  "error_msg": null,
+  "id_token": "<secret>",
+  "is_3ds_failure": false,
+  "is_cc_payment": true,
+  "is_refund_skipped_emi": false,
+  "last_refund_at": null,
+  "message": null,
+  "payment_link": null,
+  "payment_method_code": "cc_noonpay",
+  "payment_provider_code": "NOON_PAY",
+  "redirect_url": "https://pay.noonpayments.com/en/default/index?info=s%2F9ckyZHEEQ%2FzJYwzbVqa2hLzW7mVE3%2F6rJwhUVMhihaLTiHn8z5I3kJIS9x",
+  "reference": "IAEGAA148ODSUNJWBA",
+  "refunded_amount": 0.0,
+  "reversed_amount": 0.0,
+  "status": "payment_ready_to_redirect",
+  "subscription_id": "<secret>",
+  "transaction_status": "3DS_ENROLL_INITIATED",
+  "use_new_webview": false
+ },
+ "status_confirmed": {
+  "amount": 17.25,
+  "authorization_adjustment": null,
+  "authorized_amount": 17.25,
+  "captured_amount": 17.25,
+  "card_category": null,
+  "card_country": null,
+  "card_issuer": null,
+  "cc_masked": "522873xxxxxx5542",
+  "cc_type": "MASTERCARD",
+  "currency_code": "AED",
+  "customer_code": "<secret>",
+  "error_code": "0",
+  "error_hint": null,
+  "error_instructions": null,
+  "error_message": null,
+  "error_msg": null,
+  "id_token": "<secret>",
+  "is_3ds_failure": false,
+  "is_cc_payment": true,
+  "is_refund_skipped_emi": false,
+  "last_refund_at": null,
+  "message": null,
+  "payment_link": null,
+  "payment_method_code": "cc_noonpay",
+  "payment_provider_code": "NOON_PAY",
+  "redirect_url": null,
+  "reference": "IAEGAA148ODSUNJWBA",
+  "refunded_amount": 0.0,
+  "reversed_amount": 0.0,
+  "status": "payment_confirmed",
+  "subscription_id": "<secret>",
+  "transaction_status": "CAPTURED",
+  "use_new_webview": false
+ },
+ "status_pending_created": {
+  "amount": 17.25,
+  "authorization_adjustment": null,
+  "authorized_amount": 0.0,
+  "captured_amount": 0.0,
+  "card_category": null,
+  "card_country": null,
+  "card_issuer": null,
+  "cc_masked": "522873xxxxxx5542",
+  "cc_type": "MASTERCARD",
+  "currency_code": "AED",
+  "customer_code": "<secret>",
+  "error_code": null,
+  "error_hint": null,
+  "error_instructions": null,
+  "error_message": null,
+  "error_msg": null,
+  "id_token": "<secret>",
+  "is_3ds_failure": false,
+  "is_cc_payment": true,
+  "is_refund_skipped_emi": false,
+  "last_refund_at": null,
+  "message": null,
+  "payment_link": null,
+  "payment_method_code": "cc_noonpay",
+  "payment_provider_code": "NOON_PAY",
+  "redirect_url": null,
+  "reference": "IAEGAA148ODSUNJWBA",
+  "refunded_amount": 0.0,
+  "reversed_amount": 0.0,
+  "status": "payment_pending",
+  "subscription_id": "<secret>",
+  "transaction_status": "CREATED",
+  "use_new_webview": false
+ }
+}

@@ -1,0 +1,21 @@
+{
+  "provenance": "2026-10-11 live prepare-only quote monetary projection; no account data, cart IDs or payment material",
+  "branch_id": 22632,
+  "item_id": 3739746911,
+  "choice_id": 3739746913,
+  "original_item_minor": 3400,
+  "choice_minor": 0,
+  "choice_menu_prices": {"pr": 0, "opr": -1},
+  "route_minor": 1900,
+  "amount": "25.6",
+  "discountsTotal": "15",
+  "row": {"quantity": 1, "price": "AED 19.00", "total": "AED 19.00"},
+  "charges": [
+    {"type": "SubTotal", "amount": 34, "value": "AED 34.00"},
+    {"type": "Coupon", "amount": 15},
+    {"type": "SmallOrderFee", "amount": 1, "value": "AED 1.00"},
+    {"type": "DeliveryFee", "amount": 3.9, "value": "AED 3.90"},
+    {"type": "ServiceFee", "amount": 1.7, "value": "AED 1.70"},
+    {"type": "Total", "amount": 25.6, "value": "AED 25.60"}
+  ]
+}
