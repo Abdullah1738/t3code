@@ -2,16 +2,18 @@ import { MenuView } from "@react-native-menu/menu";
 import {
   cloneElement,
   isValidElement,
+  useCallback,
   useMemo,
   useRef,
   type ComponentProps,
   type ReactElement,
 } from "react";
-import type { ColorValue, PressableProps } from "react-native";
+import type { ColorValue, GestureResponderEvent, PressableProps } from "react-native";
 import { withUniwind } from "uniwind";
 import { useAppearancePreferences } from "../features/settings/appearance/AppearancePreferencesProvider";
 import { withMenuActionIconColors } from "../lib/menu-action-colors";
 import type { ControlPillMenuProps } from "./ControlPillMenu.types";
+import { ControlPillMenuPressGate } from "./ControlPillMenuPressGate";
 
 const ThemedMenuView = withUniwind(
   function NativeMenuView({
@@ -46,37 +48,45 @@ export function ControlPillMenu(props: ControlPillMenuProps) {
   const isDarkMode = themeAppearance === "dark";
   const menuPress = useRef({ isPreparing: false, isOpen: false, suppressPress: false });
   const pendingPress = useRef<(() => void) | null>(null);
+  const gatePress = useCallback(
+    (event: GestureResponderEvent, press: (event: GestureResponderEvent) => void) => {
+      // Accessibility clicks have no touch identifier and must not inherit
+      // cancellation from a previous physical gesture.
+      const isTouch = typeof event.nativeEvent.identifier === "number";
+      if (isTouch ? menuPress.current.suppressPress : menuPress.current.isOpen) {
+        return;
+      }
+      if (isTouch && menuPress.current.isPreparing) {
+        // A release can arrive between native menu preparation and display.
+        // Let UIKit's display/cancel callback decide this press's outcome.
+        event.persist();
+        pendingPress.current = () => press(event);
+        return;
+      }
+      press(event);
+    },
+    [],
+  );
 
   const { className: _className, ...menuProps } = props;
   let children = menuProps.children;
   if (props.shouldOpenOnLongPress && isValidElement(children)) {
     const child = children as ReactElement<Pick<PressableProps, "onTouchStart" | "onPress">>;
-    children = cloneElement(child, {
-      onTouchStart: (event) => {
-        // Reset for a new touch, not onPressIn, which also fires when a
-        // finger moves out of the row and back during the same gesture.
-        menuPress.current.isPreparing = false;
-        menuPress.current.suppressPress = menuPress.current.isOpen;
-        pendingPress.current = null;
-        child.props.onTouchStart?.(event);
-      },
-      onPress: (event) => {
-        // Accessibility clicks have no touch identifier and must not inherit
-        // cancellation from a previous physical gesture.
-        const isTouch = typeof event.nativeEvent.identifier === "number";
-        if (isTouch ? menuPress.current.suppressPress : menuPress.current.isOpen) {
-          return;
-        }
-        if (isTouch && menuPress.current.isPreparing) {
-          // A release can arrive between native menu preparation and display.
-          // Let UIKit's display/cancel callback decide this press's outcome.
-          event.persist();
-          pendingPress.current = () => child.props.onPress?.(event);
-          return;
-        }
-        child.props.onPress?.(event);
-      },
-    });
+    children = (
+      <ControlPillMenuPressGate value={gatePress}>
+        {cloneElement(child, {
+          onTouchStart: (event) => {
+            // Reset for a new touch, not onPressIn, which also fires when a
+            // finger moves out of the row and back during the same gesture.
+            menuPress.current.isPreparing = false;
+            menuPress.current.suppressPress = menuPress.current.isOpen;
+            pendingPress.current = null;
+            child.props.onTouchStart?.(event);
+          },
+          onPress: (event) => gatePress(event, (pressEvent) => child.props.onPress?.(pressEvent)),
+        })}
+      </ControlPillMenuPressGate>
+    );
     menuProps.onMenuInteractionStart = () => {
       menuPress.current.isPreparing = true;
       props.onMenuInteractionStart?.();
