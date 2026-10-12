@@ -57,6 +57,7 @@ import {
   ThreadListV2SnoozedShelfHeader,
   ThreadListV2WorkingShelfHeader,
 } from "../threads/thread-list-v2-items";
+import { useThreadListSweepController } from "../threads/thread-list-sweep";
 import { useThreadRowProviderInstanceResolver } from "../threads/thread-provider-instance";
 import {
   buildThreadListV2Items,
@@ -557,6 +558,14 @@ export function HomeScreen(props: HomeScreenProps) {
     activeReorderEnvironmentIds,
     titleRegenerationEnvironmentIds,
   } = listEnvironments;
+  const sweepController = useThreadListSweepController({
+    listRef,
+    settlementEnvironmentIds,
+    snoozeEnvironmentIds,
+    onSettleThread: handleSettleThread,
+    onUnsettleThread: handleUnsettleThread,
+    onUnsnoozeThread: handleUnsnoozeThread,
+  });
   const resolveProviderInstance = useThreadRowProviderInstanceResolver(providersByEnvironmentId);
   const pendingOrder = usePendingThreadOrder(nowMinute, snoozeWakeTick);
   // Up/down menu availability for every card, computed once per section per
@@ -833,11 +842,13 @@ export function HomeScreen(props: HomeScreenProps) {
           onSwipeableClose={handleSwipeableClose}
           onSwipeableWillOpen={handleSwipeableWillOpen}
           simultaneousSwipeGesture={homeScrollGesture}
+          sweepController={sweepController}
           activationKey={item.key}
         />
       );
     },
     [
+      sweepController,
       handleDeleteThread,
       activeReorderEnvironmentIds,
       handleMoveThread,

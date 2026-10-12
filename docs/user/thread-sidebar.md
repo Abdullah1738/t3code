@@ -141,10 +141,11 @@ worktree settles, manually or automatically, even if a terminal there still runs
 command such as a dev server. Threads in the project's main checkout skip it. Its terminal
 closes when the command succeeds and stays open when it fails.
 
-On web and desktop, press a thread's **Settle** button and drag up or down to
-settle every thread in that section between it and the one you release on.
-The **Un-settle** and **Wake** buttons work the same way in their sections.
-Press `Escape` while dragging to cancel.
+Press a thread's **Settle** button and drag up or down to settle every thread
+in that section between it and the one you release on. The **Un-settle** and
+**Wake** buttons work the same way in their sections. On web and desktop, press
+`Escape` while dragging to cancel. On iPad, the buttons appear when you hover a
+thread with a trackpad or mouse.
 
 By default, environments settle inactive threads after three days and settle
 threads whose pull request merged. A closed pull request can also settle an idle
