@@ -226,7 +226,6 @@ import {
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
-import { SidebarBoardNav } from "../ardud/board/SidebarBoardNav";
 const SIDEBAR_SORT_LABELS: Record<SidebarProjectSortOrder, string> = {
   updated_at: "Last user message",
   created_at: "Created at",
@@ -3073,7 +3072,6 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
         // Lifted above the stage backdrop, whose fade bleeds below the
         // header and would otherwise paint across the search row's outline.
         <SidebarGroup className="z-[1]">
-          <SidebarBoardNav className="mb-1" />
           <SidebarMenu>
             <SidebarMenuItem>
               <CommandDialogTrigger

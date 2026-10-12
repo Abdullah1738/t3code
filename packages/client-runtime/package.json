@@ -55,10 +55,6 @@
       "types": "./src/ardud/scheduleDraft.ts",
       "default": "./src/ardud/scheduleDraft.ts"
     },
-    "./ardud/board": {
-      "types": "./src/ardud/board.ts",
-      "default": "./src/ardud/board.ts"
-    },
     "./connection": {
       "types": "./src/connection/index.ts",
       "default": "./src/connection/index.ts"

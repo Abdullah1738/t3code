@@ -38,8 +38,6 @@ import {
 } from "../WorkspaceBreadcrumb";
 import { observeResize } from "~/lib/observeResize";
 import { cn } from "~/lib/utils";
-// ardud fork: in-thread review controls (complete + review queue).
-import { ThreadReviewControls } from "../../ardud/board/ThreadReviewControls";
 import { useClientSettings } from "../../hooks/useSettings";
 
 interface ChatHeaderProps {
@@ -438,7 +436,6 @@ export const ChatHeader = memo(function ChatHeader({
           )}
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
-      <ThreadReviewControls environmentId={activeThreadEnvironmentId} threadId={activeThreadId} />
     </div>
   );
 });

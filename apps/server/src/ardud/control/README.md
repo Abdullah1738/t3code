@@ -264,17 +264,17 @@ t3ctl native ses_...
 
 ### telegram-bridge (`src/openchamber.ts`, `attention.ts`, `notification-events.ts`)
 
-| OpenChamber                                                                                        | t3 control API                                                                                                                                       |
-| -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/session-board` (+ `openchamber:session-board.updated`)                                   | Session board worker's `/api/ardud/board/*`. Until it lands, `GET /threads` with `state` and `pendingRequest` covers running, waiting and attention. |
-| `GET /api/permission/request`, `GET /api/form` (directory-wide)                                    | `GET /requests` (all threads; `?origin=none` excludes iMessage)                                                                                      |
-| reply/cancel permission and form                                                                   | `respond` as above                                                                                                                                   |
-| `GET /api/session/active`                                                                          | `GET /threads?active=true`                                                                                                                           |
-| `GET /api/permission-auto-accept` (+ `.updated` event)                                             | `runtimeMode` on each thread; `thread.updated` with `change: thread.runtime-mode-updated`                                                            |
-| Events `form.created`, `permission.asked` / `form.replied`, `form.cancelled`, `permission.replied` | `request.opened` / `request.resolved`                                                                                                                |
-| `session.execution.started` / `succeeded`, `failed`, `interrupted`                                 | `thread.status` (`state` running, or waiting/idle; `status` failed, interrupted, ...)                                                                |
-| `session.inbox.enqueued` (user), `session.renamed`                                                 | `message.completed` with `role: "user"`; `thread.updated`                                                                                            |
-| `sessionOrigin` / `IMESSAGE_ORIGIN` filtering                                                      | `origin` on every summary and event                                                                                                                  |
+| OpenChamber                                                                                        | t3 control API                                                                                                                                  |
+| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/session-board` (+ `openchamber:session-board.updated`)                                   | `GET /api/ardud/board` (read-only snapshot, no events). `GET /threads` with `state` and `pendingRequest` covers running, waiting and attention. |
+| `GET /api/permission/request`, `GET /api/form` (directory-wide)                                    | `GET /requests` (all threads; `?origin=none` excludes iMessage)                                                                                 |
+| reply/cancel permission and form                                                                   | `respond` as above                                                                                                                              |
+| `GET /api/session/active`                                                                          | `GET /threads?active=true`                                                                                                                      |
+| `GET /api/permission-auto-accept` (+ `.updated` event)                                             | `runtimeMode` on each thread; `thread.updated` with `change: thread.runtime-mode-updated`                                                       |
+| Events `form.created`, `permission.asked` / `form.replied`, `form.cancelled`, `permission.replied` | `request.opened` / `request.resolved`                                                                                                           |
+| `session.execution.started` / `succeeded`, `failed`, `interrupted`                                 | `thread.status` (`state` running, or waiting/idle; `status` failed, interrupted, ...)                                                           |
+| `session.inbox.enqueued` (user), `session.renamed`                                                 | `message.completed` with `role: "user"`; `thread.updated`                                                                                       |
+| `sessionOrigin` / `IMESSAGE_ORIGIN` filtering                                                      | `origin` on every summary and event                                                                                                             |
 
 ### crw (`lib/sessions.mjs`, `lib/util.mjs`)
 
@@ -329,7 +329,9 @@ favourites and recents, `session.send` to a thread in another project, and
   all t3 has.
 - No synthetic or system context record before a prompt (spectrum's channel
   guidance). Prepend it to the message.
-- No session board here; the session-board worker owns `/api/ardud/board/*`.
+- No session board here. The board UI is gone; only its read-only snapshot,
+  `GET /api/ardud/board` (`apps/server/src/ardud/board/`), is left for the
+  telegram bridge.
 - `ardud_opencode_import` is only filled by the importer (opencode-import
   branch). Before that, `by-native` resolves only sessions t3 itself created.
 - Tokens come from `t3 auth session issue` with administrative scopes. There is

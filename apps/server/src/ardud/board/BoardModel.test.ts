@@ -2,8 +2,6 @@ import { describe, expect, it } from "@effect/vitest";
 
 import {
   BoardModel,
-  decideAction,
-  type BoardAction,
   type LiveStatus,
   type Observation,
   type ThreadObservation,
@@ -56,15 +54,12 @@ const fixture = () => {
     status: (threadId: string, live: LiveStatus, extra?: Partial<ThreadObservation>) => unknown;
     attention: (threadId: string, kind: "question" | "approval" | null) => unknown;
     observe: (threadId: string, extra?: Partial<ThreadObservation>) => unknown;
+    settle: (threadId: string) => unknown;
+    backlog: (threadId: string) => void;
     deleted: (threadId: string) => unknown;
     entries: () => ReturnType<BoardModel["entries"]>;
     lanes: () => Array<[string, string]>;
     token: (threadId: string) => number;
-    act: (
-      action: BoardAction,
-      threadId: string,
-      workRevision?: number,
-    ) => ReturnType<typeof decideAction>;
   } = {
     model,
     tick: (ms = 10) => (clock += ms),
@@ -90,21 +85,22 @@ const fixture = () => {
       observe(read(threadId, { attention: kind === null ? null : { kind, count: 1 } })),
     observe: (threadId: string, extra: Partial<ThreadObservation> = {}) =>
       observe(read(threadId, extra)),
+    settle: (threadId: string) => observe(read(threadId, { settled: true, settledByUser: true })),
+    // Backlog rows are left over from the board UI; nothing creates new ones.
+    backlog: (threadId: string) => {
+      const row = model.rows.get(threadId)!;
+      model.rows.set(threadId, {
+        ...row,
+        pending: false,
+        reviewed: true,
+        backlog: true,
+        completedFrom: null,
+      });
+    },
     deleted: (threadId: string) => observe({ threadId, deleted: true }),
     entries: () => model.entries(),
     lanes: () => model.entries().map((entry): [string, string] => [entry.threadId, entry.state]),
     token: (threadId: string) => model.rows.get(threadId)!.workRevision,
-    act: (action: BoardAction, threadId: string, workRevision = f.token(threadId)) => {
-      const decision = decideAction({
-        action,
-        row: model.rows.get(threadId),
-        workRevision,
-        running: model.isRunning(threadId),
-        now: clock,
-      });
-      if (decision._tag === "commit") model.rows.set(threadId, decision.row);
-      return decision;
-    },
   };
   return f;
 };
@@ -144,7 +140,6 @@ describe("session board model", () => {
     f.prompt("t_a");
     f.status("t_a", "background");
     expect(f.entries()).toMatchObject([{ state: "running", status: "background" }]);
-    expect(f.act("review", "t_a")).toMatchObject({ _tag: "conflict", reason: "running" });
     f.status("t_a", "idle");
     expect(f.lanes()).toEqual([["t_a", "waiting"]]);
   });
@@ -176,18 +171,17 @@ describe("session board model", () => {
     expect(Object.fromEntries(f.lanes())).toEqual({ t_src: "waiting", t_fork: "running" });
   });
 
-  it("retains waiting work until a manual review; a later prompt brings it back", () => {
+  it("retains waiting work until the user settles it; a later prompt brings it back", () => {
     const f = fixture();
     f.add("t_a");
     f.prompt("t_a");
     f.status("t_a", "idle");
-    const token = f.token("t_a");
-    expect(f.act("review", "t_a")).toMatchObject({ _tag: "commit" });
+    f.settle("t_a");
     expect(f.entries()).toEqual([]);
     f.observe("t_a");
     expect(f.entries()).toEqual([]);
     f.prompt("t_a", 140);
-    expect(f.entries()).toMatchObject([{ state: "waiting", workRevision: token + 1 }]);
+    expect(f.entries()).toMatchObject([{ state: "waiting" }]);
   });
 
   it("does not treat old prompts, renames or duplicate idles as new work", () => {
@@ -195,7 +189,7 @@ describe("session board model", () => {
     f.add("t_a");
     f.prompt("t_a");
     f.status("t_a", "idle");
-    f.act("review", "t_a");
+    f.settle("t_a");
     f.prompt("t_a", 120);
     f.prompt("t_a", 10);
     f.observe("t_a", { title: "renamed" });
@@ -203,69 +197,48 @@ describe("session board model", () => {
     expect(f.entries()).toEqual([]);
   });
 
-  it("shows genuine activity after a review before the user message is seen", () => {
+  it("shows genuine activity after a settle before the user message is seen", () => {
     const f = fixture();
     f.add("t_a");
     f.prompt("t_a");
     f.status("t_a", "idle");
-    f.act("review", "t_a");
+    f.settle("t_a");
     f.status("t_a", "working");
     expect(f.lanes()).toEqual([["t_a", "running"]]);
     f.status("t_a", "idle");
     expect(f.lanes()).toEqual([["t_a", "waiting"]]);
   });
 
-  it("persists backlog as an acknowledged lane and returns it to review for new work", () => {
+  it("keeps a backlog row in Later and returns it to review for new work", () => {
     const f = fixture();
     f.add("t_a");
     f.prompt("t_a");
     f.status("t_a", "idle");
     const token = f.token("t_a");
-    f.act("backlog", "t_a");
+    f.backlog("t_a");
     expect(f.entries()).toMatchObject([{ state: "backlog", workRevision: token }]);
-    expect(f.act("restore", "t_a", token)).toMatchObject({ _tag: "commit" });
-    expect(f.entries()).toMatchObject([{ state: "waiting", workRevision: token + 1 }]);
-    f.act("backlog", "t_a");
     f.prompt("t_a", 180);
-    expect(f.entries()).toMatchObject([{ state: "waiting", workRevision: token + 2 }]);
+    expect(f.entries()).toMatchObject([{ state: "waiting", workRevision: token + 1 }]);
   });
 
   it.each(["waiting", "backlog", "scheduled"] as const)(
-    "completes a %s card and Undo restores its exact lane",
+    "completes a %s card when the user settles its thread",
     (lane: "waiting" | "backlog" | "scheduled") => {
       const f = fixture();
       f.add("t_a");
       if (lane === "scheduled") f.prompt("t_a", 120, { scheduledHint: true });
       else f.prompt("t_a");
       f.status("t_a", "idle");
-      if (lane === "backlog") f.act("backlog", "t_a");
-      const token = f.token("t_a");
+      if (lane === "backlog") f.backlog("t_a");
       expect(f.lanes()).toEqual([["t_a", lane]]);
-      f.act("review", "t_a", token);
+      f.settle("t_a");
       expect(f.entries()).toEqual([]);
       expect(f.model.rows.get("t_a")?.completedFrom).toBe(lane);
-      expect(f.act("restore", "t_a", token)).toMatchObject({ _tag: "commit" });
-      expect(f.entries()).toMatchObject([{ state: lane, workRevision: token + 1 }]);
+      // Later reads of the still-settled thread keep it done.
+      f.observe("t_a", { settled: true });
+      expect(f.entries()).toEqual([]);
     },
   );
-
-  it("rejects running and stale reviews; undo needs the original token", () => {
-    const f = fixture();
-    f.add("t_a");
-    f.prompt("t_a");
-    f.status("t_a", "working");
-    expect(f.act("review", "t_a")).toMatchObject({ _tag: "conflict", reason: "running" });
-    f.status("t_a", "idle");
-    const token = f.token("t_a");
-    expect(f.act("review", "t_a", token)._tag).toBe("commit");
-    expect(f.act("review", "t_a", token)._tag).toBe("noop");
-    expect(f.act("restore", "t_a", token)._tag).toBe("commit");
-    expect(f.act("review", "t_a", token)).toMatchObject({ _tag: "conflict", reason: "stale" });
-    const newer = f.token("t_a");
-    f.act("review", "t_a", newer);
-    f.prompt("t_a", 150);
-    expect(f.act("restore", "t_a", newer)).toMatchObject({ _tag: "conflict", reason: "stale" });
-  });
 
   it("keeps scheduled provenance while running and after settling, with no review", () => {
     const f = fixture();
@@ -285,7 +258,7 @@ describe("session board model", () => {
     const f = fixture();
     f.add("t_cell");
     f.prompt("t_cell", 120);
-    f.act("review", "t_cell");
+    f.settle("t_cell");
     // A watcher schedule wakes the thread once.
     f.prompt("t_cell", 200, { scheduledHint: true });
     f.status("t_cell", "idle");
@@ -344,28 +317,6 @@ describe("session board model", () => {
     expect(f.model.rows.get("t_crw")?.updatedAt).toBe(50);
   });
 
-  it("completes a card when the user settles its thread, and keeps a later restore", () => {
-    const f = fixture();
-    f.prompt("t1");
-    expect(f.lanes()).toEqual([["t1", "waiting"]]);
-    f.observe("t1", { settled: true, settledByUser: true });
-    expect(f.lanes()).toEqual([]);
-    expect(f.model.rows.get("t1")?.completedFrom).toBe("waiting");
-    // Later reads of the still-settled thread don't undo a restore.
-    expect(f.act("restore", "t1")._tag).toBe("commit");
-    f.observe("t1", { settled: true });
-    expect(f.lanes()).toEqual([["t1", "waiting"]]);
-  });
-
-  it("completes a Later card on a user settle", () => {
-    const f = fixture();
-    f.prompt("t1");
-    f.act("backlog", "t1");
-    f.observe("t1", { settled: true, settledByUser: true });
-    expect(f.lanes()).toEqual([]);
-    expect(f.model.rows.get("t1")?.completedFrom).toBe("backlog");
-  });
-
   it("completes on a settle while background work drains, and clears once it ends", () => {
     const f = fixture();
     f.prompt("t1");
@@ -378,7 +329,7 @@ describe("session board model", () => {
   it("ignores a settled shell without a user settle (startup, auto-settle)", () => {
     const f = fixture();
     f.prompt("t1");
-    f.act("backlog", "t1");
+    f.backlog("t1");
     f.observe("t1", { settled: true });
     expect(f.lanes()).toEqual([["t1", "backlog"]]);
   });
@@ -410,41 +361,36 @@ describe("session board model", () => {
     expect(f.entries()[0]?.attention).toBeUndefined();
   });
 
-  it("shows a reviewed root again while one of its requests is open", () => {
+  it("shows a settled root again while one of its requests is open", () => {
     const f = fixture();
     f.add("t_root");
     f.prompt("t_root");
     f.status("t_root", "idle");
-    f.act("review", "t_root");
+    f.settle("t_root");
     f.attention("t_root", "approval");
     expect(f.entries()).toMatchObject([{ state: "waiting", attention: { kind: "approval" } }]);
     f.attention("t_root", null);
     expect(f.entries()).toEqual([]);
   });
 
-  it("keeps a reviewed root hidden when its subagent starts running", () => {
+  it("keeps a settled root hidden when its subagent starts running", () => {
     const f = fixture();
     f.add("t_root");
     f.child("t_sub", "t_root");
     f.prompt("t_root");
     f.status("t_root", "idle");
-    f.act("review", "t_root");
+    f.settle("t_root");
     f.status("t_sub", "working");
     expect(f.entries()).toEqual([]);
   });
 
-  it("retains a deleted card until it is ticked, then allows Undo", () => {
+  it("keeps a deleted card with a deleted status", () => {
     const f = fixture();
     f.add("t_a");
     f.prompt("t_a");
     f.status("t_a", "working");
     f.deleted("t_a");
     expect(f.entries()).toMatchObject([{ state: "waiting", status: "deleted" }]);
-    const token = f.token("t_a");
-    expect(f.act("review", "t_a", token)._tag).toBe("commit");
-    expect(f.entries()).toEqual([]);
-    expect(f.act("restore", "t_a", token)._tag).toBe("commit");
-    expect(f.entries()).toMatchObject([{ status: "deleted" }]);
   });
 
   describe("scheduled runs", () => {
@@ -459,7 +405,7 @@ describe("session board model", () => {
       return rows.map((row) => row.threadId);
     };
 
-    it("keeps one card per schedule and completes the older runs like a review", () => {
+    it("keeps one card per schedule and completes the older runs", () => {
       const f = fixture();
       run(f, "t_1", 120);
       run(f, "t_2", 140);
@@ -473,14 +419,11 @@ describe("session board model", () => {
         completedFrom: "scheduled",
         workRevision: token,
       });
-      // Undo still works with the token the card last showed.
-      expect(f.act("restore", "t_1", token)._tag).toBe("commit");
       expect(supersede(f)).toEqual([]);
-      expect(f.lanes().map(([id]) => id)).toContain("t_1");
-      // The schedule's next run replaces the restored card too.
+      // The schedule's next run replaces the previous one too.
       f.tick(1_000);
       run(f, "t_3", 3_000);
-      expect(supersede(f).sort()).toEqual(["t_1", "t_2"]);
+      expect(supersede(f)).toEqual(["t_2"]);
       expect(Object.fromEntries(f.lanes())).toEqual({ t_3: "scheduled", t_other: "scheduled" });
     });
 
@@ -514,7 +457,7 @@ describe("session board model", () => {
     it("never touches backlog cards, ungrouped cards or the newest run", () => {
       const f = fixture();
       run(f, "t_1", 120);
-      f.act("backlog", "t_1");
+      f.backlog("t_1");
       f.add("t_plain");
       f.prompt("t_plain", 125);
       f.model.schedules.set("t_plain", null);

@@ -69,18 +69,9 @@ export function HomeHeader(props: HomeHeaderProps) {
           // Static header config (glass, title, fonts) lives in Stack.tsx
           // (GLASS_HEADER_OPTIONS). Only dynamic values are set here.
           headerTintColor: iconColor,
-          unstable_headerRightItems: () => {
-            const boardItem = withNativeGlassHeaderItem({
-              accessibilityLabel: "Open board",
-              icon: { name: "rectangle.3.group", type: "sfSymbol" } as const,
-              identifier: "home-board",
-              label: "",
-              onPress: props.onOpenBoard,
-              type: "button",
-            });
-            return sidebarHeader
+          unstable_headerRightItems: () =>
+            sidebarHeader
               ? [
-                  boardItem,
                   ...createSidebarHeaderItems({
                     filterIcon: hasCustomListOptions
                       ? "line.3.horizontal.decrease.circle.fill"
@@ -103,7 +94,6 @@ export function HomeHeader(props: HomeHeaderProps) {
                     : []),
                 ]
               : [
-                  boardItem,
                   withNativeGlassHeaderItem({
                     accessibilityLabel: "Open settings",
                     icon: { name: "ellipsis", type: "sfSymbol" } as const,
@@ -112,8 +102,7 @@ export function HomeHeader(props: HomeHeaderProps) {
                     onPress: props.onOpenSettings,
                     type: "button",
                   }),
-                ];
-          },
+                ],
           // The keys below are set per-branch (not `undefined`) so a later
           // reapply cannot clobber options owned by NativeHeaderToolbar.
           ...(sidebarHeader

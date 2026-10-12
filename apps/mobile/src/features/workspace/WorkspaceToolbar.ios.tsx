@@ -109,12 +109,6 @@ export function WorkspaceToolbar(props: {
           icon="magnifyingglass"
           onPress={focusSearch}
         />
-        {/* ardud fork: session board. */}
-        <NativeHeaderToolbar.Button
-          accessibilityLabel="Open board"
-          icon="rectangle.3.group"
-          onPress={() => navigation.navigate("Board")}
-        />
       </NativeHeaderToolbar>
       <NativeHeaderToolbar placement="bottom">
         {nativeToolbarCompose ? <NativeHeaderToolbar.Spacer flexible /> : null}

@@ -8,7 +8,7 @@ import type { LiveStatus, Observation } from "./BoardModel.ts";
  * turn but still drains background work (subagents, background commands), so
  * the card stays Running instead of asking for review.
  */
-export function liveStatusOf(shell: OrchestrationV2ThreadShell): LiveStatus {
+function liveStatusOf(shell: OrchestrationV2ThreadShell): LiveStatus {
   switch (shell.activityRunStatus) {
     case "preparing":
     case "starting":

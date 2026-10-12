@@ -102,7 +102,6 @@ export function HomeHeader(props: HomeHeaderProps) {
         filterCustomized={hasCustomListOptions}
         onFilterAction={handleMenuAction}
         onOpenSettings={props.onOpenSettings}
-        onOpenBoard={props.onOpenBoard}
         onOpenEnvironments={props.onOpenEnvironments}
       />
     </>

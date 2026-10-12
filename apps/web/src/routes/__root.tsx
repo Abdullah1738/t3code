@@ -8,6 +8,7 @@ import {
   createRootRoute,
   type ErrorComponentProps,
   useLocation,
+  useNavigate,
   useRouter,
 } from "@tanstack/react-router";
 import { Check, Copy } from "lucide";
@@ -144,9 +145,16 @@ function RootRouteView() {
   const pathname = useLocation({ select: (location) => location.pathname });
   const { authGateState } = Route.useRouteContext();
   const primaryEnvironmentAuthenticated = authGateState.status === "authenticated";
+  const returningFromWelcomeRef = useRef(pathname === "/welcome");
   const hostedPromptLinkLanding = useHostedPromptLinkLanding(
     authGateState.status === "hosted-static",
   );
+
+  useEffect(() => {
+    if (pathname === "/welcome") {
+      returningFromWelcomeRef.current = true;
+    }
+  }, [pathname]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -177,8 +185,8 @@ function RootRouteView() {
     );
   }
 
-  // Show onboarding over the workspace, keeping startup dialogs suspended
-  // until setup finishes.
+  // Show onboarding over the workspace, keeping automatic thread navigation
+  // and other startup dialogs suspended until setup finishes.
   if (pathname === "/welcome") {
     return (
       <ToastProvider>
@@ -217,8 +225,8 @@ function RootRouteView() {
     </CommandPalette>
   );
 
-  // FirstRunGate holds back everything below it — including EventRouter —
-  // until the first-run
+  // FirstRunGate holds back everything below it — including EventRouter,
+  // whose welcome payload navigates into a thread — until the first-run
   // decision is known, so a fresh install renders nothing (not the shell,
   // not a flash of threads) before landing on the welcome wizard.
   return (
@@ -253,7 +261,9 @@ function RootRouteView() {
           <ProjectCloneToastCoordinator />
           <PullRequestGuideRunCoordinator />
           <HostedStaticEnvironmentBootstrap />
-          {primaryEnvironmentAuthenticated ? <EventRouter /> : null}
+          {primaryEnvironmentAuthenticated ? (
+            <EventRouter skipInitialBootstrapNavigation={returningFromWelcomeRef.current} />
+          ) : null}
           {primaryEnvironmentAuthenticated ? <ProviderUpdateLaunchNotification /> : null}
           {/* Hosted Nightly is "hosted-static", not authenticated, and needs it too. */}
           <NightlyMobileBetaNotice />
@@ -495,12 +505,21 @@ function AuthenticatedTracingBootstrap() {
   return null;
 }
 
-function EventRouter() {
+function EventRouter({
+  skipInitialBootstrapNavigation,
+}: {
+  readonly skipInitialBootstrapNavigation: boolean;
+}) {
+  const navigate = useNavigate();
+  const pathname = useLocation({ select: (loc) => loc.pathname });
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
   const primaryEnvironment = usePrimaryEnvironment();
   const serverConfig = useAtomValue(primaryServerConfigAtom);
   const serverConfigEvent = useAtomValue(primaryServerConfigEventAtom);
   const serverWelcome = useAtomValue(primaryServerWelcomeAtom);
+  const readPathname = useEffectEvent(() => pathname);
+  const handledBootstrapThreadIdRef = useRef<string | null>(null);
+  const skipInitialBootstrapNavigationRef = useRef(skipInitialBootstrapNavigation);
   const handledConfigEventRef = useRef(serverConfigEvent);
   const [keybindingsToastController] = useState<KeybindingsUpdateToastController>(() =>
     createKeybindingsUpdateToastController({}),
@@ -510,7 +529,10 @@ function EventRouter() {
     if (!payload) return;
 
     setActiveEnvironmentId(payload.environment.environmentId);
-    if (payload.bootstrapProjectId) {
+    void (async () => {
+      if (!payload.bootstrapProjectId || !payload.bootstrapThreadId) {
+        return;
+      }
       const bootstrapProject = readProject(
         scopeProjectRef(payload.environment.environmentId, payload.bootstrapProjectId),
       );
@@ -524,10 +546,29 @@ function EventRouter() {
         scopedProjectKey(
           scopeProjectRef(payload.environment.environmentId, payload.bootstrapProjectId),
         );
-      // "/" is the board home, so the bootstrap thread only gets its project
-      // expanded in the sidebar instead of replacing the home route.
       useUiStateStore.getState().setProjectExpanded(bootstrapProjectKey, true);
-    }
+
+      if (readPathname() !== "/") {
+        return;
+      }
+      if (skipInitialBootstrapNavigationRef.current) {
+        skipInitialBootstrapNavigationRef.current = false;
+        handledBootstrapThreadIdRef.current = payload.bootstrapThreadId;
+        return;
+      }
+      if (handledBootstrapThreadIdRef.current === payload.bootstrapThreadId) {
+        return;
+      }
+      await navigate({
+        to: "/$environmentId/$threadId",
+        params: {
+          environmentId: payload.environment.environmentId,
+          threadId: payload.bootstrapThreadId,
+        },
+        replace: true,
+      });
+      handledBootstrapThreadIdRef.current = payload.bootstrapThreadId;
+    })().catch(() => undefined);
   });
 
   const handleServerConfigUpdated = useEffectEvent(() => {
