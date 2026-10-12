@@ -9,7 +9,7 @@ import {
   threadSearchMatchKey,
   type EnvironmentThreadSearchMatch,
 } from "@t3tools/client-runtime/state/thread-search";
-import { LegendList } from "@legendapp/list/react-native";
+import { LegendList, type LegendListRef } from "@legendapp/list/react-native";
 import type { MenuAction } from "@react-native-menu/menu";
 import { useAtomValue } from "@effect/atom-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -63,6 +63,7 @@ import {
   ThreadListV2SnoozedShelfHeader,
   ThreadListV2WorkingShelfHeader,
 } from "./thread-list-v2-items";
+import { useThreadListSweepController } from "./thread-list-sweep";
 import { useThreadRowProviderInstanceResolver } from "./thread-provider-instance";
 import {
   buildThreadListV2Items,
@@ -143,6 +144,7 @@ function ThreadNavigationSidebarPane(
   const searchInputRef = useRef<TextInputInstance>(null);
   const searchBarRef = useRef<SearchBarCommands>(null);
   const openSwipeableRef = useRef<SwipeableMethods | null>(null);
+  const listRef = useRef<LegendListRef>(null);
   const sidebarScrollGesture = useNativeGesture();
   const {
     archiveThread,
@@ -325,6 +327,14 @@ function ThreadNavigationSidebarPane(
     activeReorderEnvironmentIds,
     titleRegenerationEnvironmentIds,
   } = listEnvironments;
+  const sweepController = useThreadListSweepController({
+    listRef,
+    settlementEnvironmentIds,
+    snoozeEnvironmentIds,
+    onSettleThread: settleThread,
+    onUnsettleThread: unsettleThread,
+    onUnsnoozeThread: unsnoozeThread,
+  });
   const resolveProviderInstance = useThreadRowProviderInstanceResolver(providersByEnvironmentId);
   const pendingOrder = usePendingThreadOrder(nowMinute, snoozeWakeTick);
   // Up/down menu availability for every card, computed once per section per
@@ -749,6 +759,7 @@ function ThreadNavigationSidebarPane(
               onSwipeableClose={handleSwipeableClose}
               onSwipeableWillOpen={handleSwipeableWillOpen}
               simultaneousSwipeGesture={sidebarScrollGesture}
+              sweepController={sweepController}
             />
           );
         }
@@ -828,6 +839,7 @@ function ThreadNavigationSidebarPane(
       sidebarScrollGesture,
       snoozeEnvironmentIds,
       snoozeThread,
+      sweepController,
       toggleSettledShelf,
       toggleSnoozedShelf,
       toggleWorkingShelf,
@@ -927,6 +939,7 @@ function ThreadNavigationSidebarPane(
           <SwipeableScrollGateProvider enabled={swipeEnabled}>
             <GestureDetector gesture={sidebarScrollGesture}>
               <LegendList
+                ref={listRef}
                 data={listItems}
                 drawDistance={500}
                 estimatedItemSize={64}
@@ -993,6 +1006,7 @@ function ThreadNavigationSidebarPane(
           <SwipeableScrollGateProvider enabled={swipeEnabled}>
             <GestureDetector gesture={sidebarScrollGesture}>
               <LegendList
+                ref={listRef}
                 data={listItems}
                 drawDistance={500}
                 estimatedItemSize={64}

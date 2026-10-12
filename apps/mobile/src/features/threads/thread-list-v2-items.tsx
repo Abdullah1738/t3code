@@ -53,6 +53,12 @@ import {
 import { QueuedMessageIcon } from "./queued-message-icon";
 import { shouldRecedeThreadRow } from "./thread-row-emphasis";
 import { ThreadSearchMatchExcerpt } from "./thread-search-match";
+import {
+  ThreadListRowActionSlot,
+  useThreadListSweptAction,
+  type ThreadListSweepController,
+} from "./thread-list-sweep";
+import { threadListSweepActionFor } from "./threadListSweep";
 
 /**
  * Thread List v2 renders one flat native list: rich edge-to-edge rows for
@@ -582,6 +588,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly searchMatch?: EnvironmentThreadSearchMatch;
   readonly searchQuery?: string;
   readonly simultaneousSwipeGesture?: ComponentProps<typeof ThreadSwipeable>["simultaneousWith"];
+  /** Lets a pointer drag on the row's action button sweep it across the list. */
+  readonly sweepController?: ThreadListSweepController;
 }) {
   const { width: windowWidth } = useWindowDimensions();
   const {
@@ -700,6 +708,23 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     snoozable: canSnooze(thread, { now: new Date().toISOString() }),
     snoozed: snoozedRow,
   });
+  // Pointer hover offers the lifecycle action as a button, like the web
+  // sidebar; dragging it sweeps the action across the section.
+  const pointerAction = canOperateThread
+    ? threadListSweepActionFor({
+        variant,
+        snoozed: snoozedRow,
+        settlementSupported: props.settlementSupported,
+        snoozeSupported: props.snoozeSupported,
+      })
+    : null;
+  const sweptAction = useThreadListSweptAction(props.sweepController, thread);
+  const handlePointerAction =
+    pointerAction === "settle"
+      ? handleSettle
+      : pointerAction === "unsettle"
+        ? handleUnsettle
+        : handleUnsnooze;
   const snoozePresets = useMemo(
     () => (swipeActions.secondary === "snooze" ? resolveSnoozePresets(new Date()) : ([] as const)),
     [props.snoozePresetMinute, swipeActions.secondary],
@@ -1002,38 +1027,59 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             type="monochrome"
           />
         ) : null}
-        {statusLabel ? (
-          <View className="flex-row items-center gap-1">
-            <SymbolView
-              name={statusLabel.icon}
-              size={13}
-              tintColorClassName={
-                selected ? selectedThreadRowColors.iconTintClassName : statusLabel.iconTintClassName
-              }
-              type="monochrome"
-              weight="semibold"
-            />
+        <ThreadListRowActionSlot
+          action={pointerAction}
+          controller={props.sweepController}
+          foregroundClassName={
+            selected
+              ? selectedThreadRowColors.foregroundClassName
+              : rowAppearance.foregroundClassName
+          }
+          iconTintClassName={
+            selected
+              ? selectedThreadRowColors.iconTintClassName
+              : rowAppearance.mutedIconTintClassName
+          }
+          onPress={handlePointerAction}
+          swept={sweptAction}
+          thread={thread}
+          variant="card"
+        >
+          {statusLabel ? (
+            <View className="flex-row items-center gap-1">
+              <SymbolView
+                name={statusLabel.icon}
+                size={13}
+                tintColorClassName={
+                  selected
+                    ? selectedThreadRowColors.iconTintClassName
+                    : statusLabel.iconTintClassName
+                }
+                type="monochrome"
+                weight="semibold"
+              />
+              <Text
+                className={cn(
+                  "text-xs font-t3-bold",
+                  selected ? selectedThreadRowColors.foregroundClassName : statusLabel.className,
+                )}
+              >
+                {statusLabel.label}
+              </Text>
+            </View>
+          ) : (
             <Text
               className={cn(
-                "text-xs font-t3-bold",
-                selected ? selectedThreadRowColors.foregroundClassName : statusLabel.className,
+                "text-xs tabular-nums",
+                selected
+                  ? selectedThreadRowColors.foregroundClassName
+                  : rowAppearance.tertiaryForegroundClassName,
               )}
             >
-              {statusLabel.label}
+              {timeLabel}
             </Text>
-          </View>
-        ) : (
-          <Text
-            className={cn(
-              "text-xs tabular-nums",
-              selected
-                ? selectedThreadRowColors.foregroundClassName
-                : rowAppearance.tertiaryForegroundClassName,
-            )}
-          >
-            {timeLabel}
-          </Text>
-        )}
+          )}
+        </ThreadListRowActionSlot>
       </View>
       <Text
         className={cn(
@@ -1195,6 +1241,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         key={`${thread.environmentId}:${thread.id}`}
         interactionClassName={rowAppearance.interactionClassName}
         interactionOpacity={rowAppearance.interactionOpacity}
+        highlighted={sweptAction !== null}
         className={rowAppearance.className}
         accessibilityHint={swipeAccessibilityHint}
         accessibilityLabel={
@@ -1228,6 +1275,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         key={`${thread.environmentId}:${thread.id}`}
         interactionClassName={rowAppearance.interactionClassName}
         interactionOpacity={rowAppearance.interactionOpacity}
+        highlighted={sweptAction !== null}
         accessibilityHint={swipeAccessibilityHint}
         accessibilityLabel={
           props.hasQueuedMessages ? `${thread.title}, messages queued to send` : thread.title
@@ -1282,21 +1330,40 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             ) : null}
           </View>
           {props.hasQueuedMessages ? <QueuedMessageIcon selected={selected} /> : null}
-          <Text
-            className={cn(
-              "text-sm tabular-nums",
+          <ThreadListRowActionSlot
+            action={pointerAction}
+            controller={props.sweepController}
+            foregroundClassName={
               selected
-                ? selectedThreadRowColors.mutedForegroundClassName
-                : snoozedRow
-                  ? rowAppearance.mutedForegroundClassName
-                  : rowAppearance.tertiaryForegroundClassName,
-            )}
-            style={{ fontFamily: MONO_FONT }}
+                ? selectedThreadRowColors.foregroundClassName
+                : rowAppearance.foregroundClassName
+            }
+            iconTintClassName={
+              selected
+                ? selectedThreadRowColors.iconTintClassName
+                : rowAppearance.mutedIconTintClassName
+            }
+            onPress={handlePointerAction}
+            swept={sweptAction}
+            thread={thread}
+            variant="slim"
           >
-            {snoozedRow && props.snoozeWakeLabelText !== undefined
-              ? props.snoozeWakeLabelText
-              : timeLabel}
-          </Text>
+            <Text
+              className={cn(
+                "text-sm tabular-nums",
+                selected
+                  ? selectedThreadRowColors.mutedForegroundClassName
+                  : snoozedRow
+                    ? rowAppearance.mutedForegroundClassName
+                    : rowAppearance.tertiaryForegroundClassName,
+              )}
+              style={{ fontFamily: MONO_FONT }}
+            >
+              {snoozedRow && props.snoozeWakeLabelText !== undefined
+                ? props.snoozeWakeLabelText
+                : timeLabel}
+            </Text>
+          </ThreadListRowActionSlot>
         </View>
       </RowPressable>
     );
