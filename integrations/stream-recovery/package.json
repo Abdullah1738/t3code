@@ -1,0 +1,11 @@
+{
+  "name": "stream-recovery",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "stream-recovery": "cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
