@@ -1137,9 +1137,12 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
       setComposerDraftText(draftKey, inserted.text);
       const caret = { start: inserted.caret, end: inserted.caret };
       rememberComposerDraftSelection(draftKey, inserted.text, caret);
+      // Like web, citing goes straight to the quote's comment.
       requestAnimationFrame(() => {
-        composerEditorRef.current?.focus();
-        composerEditorRef.current?.setSelection(caret);
+        const editor = composerEditorRef.current;
+        // The composer can switch drafts first, e.g. when a queued run being edited starts.
+        if (!editor?.openNewCitation(draftKey, inserted.citation)) return;
+        editor.setSelection(caret);
       });
     },
     [

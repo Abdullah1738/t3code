@@ -110,8 +110,9 @@ delete it like other inline context. Copying, reloading, and restoring a
 with its quote, and sending tells the agent which words were quoted and which comment you wrote.
 The quoted text and comment count toward the message limit.
 
-On mobile, tap a quote chip in the draft to read the quote, change its comment, or
-remove it. Mobile does not navigate to a quote's source yet.
+On mobile, citing opens the quote so you can add a comment right away. Tap a quote chip in
+the draft later to read the quote, change its comment, or remove it. Mobile does not navigate
+to a quote's source yet.
 
 ## Recall a sent prompt
 

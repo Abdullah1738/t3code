@@ -11,6 +11,8 @@ export function AssistantCitationSheet(props: {
   readonly citation: AssistantCitation;
   /** Restores a comment the draft could not take, so it can be shortened. */
   readonly initialComment?: string | undefined;
+  /** Focuses the comment field, for a quote that was just cited. */
+  readonly autoFocus?: boolean;
   readonly onClose: (comment: string) => void;
   /** Omitted when the draft is read-only. */
   readonly onRemove?: () => void;
@@ -37,6 +39,7 @@ export function AssistantCitationSheet(props: {
       >
         {props.onRemove ? (
           <TextInput
+            autoFocus={props.autoFocus}
             multiline
             scrollEnabled={false}
             textAlignVertical="top"

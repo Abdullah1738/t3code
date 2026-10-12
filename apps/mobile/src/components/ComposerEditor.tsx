@@ -2,7 +2,7 @@ import { ComposerContextId, PROVIDER_SEND_TURN_MAX_INPUT_CHARS } from "@t3tools/
 import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import { useNavigation } from "@react-navigation/native";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useImperativeHandle, useMemo, useRef, useState, type Ref } from "react";
 import { Alert } from "react-native";
 import type { EnvironmentId } from "@t3tools/contracts";
 import {
@@ -13,7 +13,10 @@ import {
 import { encodeComposerContextFragment } from "@t3tools/shared/composerContextClipboard";
 import { collectComposerContextReferences } from "@t3tools/shared/composerContextReferences";
 import { ComposerEditor as NativeComposerEditor } from "../native/T3ComposerEditor";
-import type { ComposerEditorProps as NativeComposerEditorProps } from "../native/T3ComposerEditor";
+import type {
+  ComposerEditorHandle as NativeComposerEditorHandle,
+  ComposerEditorProps as NativeComposerEditorProps,
+} from "../native/T3ComposerEditor";
 import {
   appendComposerDraftAttachments,
   createComposerDraftContextHistory,
@@ -37,7 +40,18 @@ import {
   type ComposerDocumentAttachment,
 } from "../lib/composerContext";
 
-export type ComposerEditorProps = NativeComposerEditorProps & {
+type ComposerChip = { source: string; start: number; end: number };
+
+export interface ComposerEditorHandle extends NativeComposerEditorHandle {
+  /**
+   * Opens a just-inserted quote's sheet with its comment field focused. Returns false when the
+   * editor has moved on to another draft since the quote went into `draftKey`.
+   */
+  openNewCitation: (draftKey: string, chip: ComposerChip) => boolean;
+}
+
+export type ComposerEditorProps = Omit<NativeComposerEditorProps, "ref"> & {
+  readonly ref?: Ref<ComposerEditorHandle>;
   readonly draftKey?: string | null;
   readonly environmentId?: EnvironmentId;
   readonly onOpenMention?: (path: string) => void;
@@ -54,6 +68,7 @@ export type ComposerEditorProps = NativeComposerEditorProps & {
 };
 
 export function ComposerEditor({
+  ref,
   draftKey,
   environmentId,
   onOpenMention,
@@ -80,12 +95,27 @@ export function ComposerEditor({
       appendComposerDraftAttachments(draftKey, restored.attachments, { allowOverflow: true });
     }
   };
-  const [selected, setSelected] = useState<{
-    source: string;
-    start: number;
-    end: number;
-    comment?: string;
-  } | null>(null);
+  const currentDraftKey = draftKey ?? null;
+  const [selected, setSelected] = useState<
+    (ComposerChip & { draftKey: string | null; comment?: string; isNewCitation?: boolean }) | null
+  >(null);
+  // A chip's sheet belongs to the draft it was opened from.
+  if (selected && selected.draftKey !== currentDraftKey) setSelected(null);
+  const nativeRef = useRef<NativeComposerEditorHandle>(null);
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus: () => nativeRef.current?.focus(),
+      blur: () => nativeRef.current?.blur(),
+      setSelection: (selection) => nativeRef.current?.setSelection(selection),
+      openNewCitation: (chipDraftKey, chip) => {
+        if (chipDraftKey !== currentDraftKey) return false;
+        setSelected({ ...chip, draftKey: chipDraftKey, isNewCitation: true });
+        return true;
+      },
+    }),
+    [currentDraftKey],
+  );
   const importRef = useRef<AbortController | null>(null);
   const [importing, setImporting] = useState(false);
   useEffect(
@@ -191,6 +221,7 @@ export function ComposerEditor({
     <>
       <NativeComposerEditor
         {...props}
+        ref={nativeRef}
         enterBehavior={props.enterBehavior ?? preferredEnterBehavior}
         onChangeText={changeText}
         readOnly={props.readOnly || importing}
@@ -213,7 +244,7 @@ export function ComposerEditor({
             onOpenAttachment(document);
             return;
           }
-          setSelected(selection);
+          setSelected({ ...selection, draftKey: currentDraftKey });
         }}
         onSelectionChange={(selection) => {
           if (draftKey)
@@ -233,8 +264,11 @@ export function ComposerEditor({
           key={`${selected.start}:${selected.source}`}
           citation={selectedCitation}
           initialComment={selected.comment}
+          autoFocus={selected.isNewCitation === true}
           onClose={(comment) => {
             setSelected(null);
+            // After citing, go back to writing around the quote.
+            if (selected.isNewCitation) requestAnimationFrame(() => nativeRef.current?.focus());
             if (!editable || comment.trim() === (selectedCitation.comment ?? "")) return;
             const source = serializeAssistantCitation(
               withAssistantCitationComment(selectedCitation, comment),
@@ -243,9 +277,9 @@ export function ComposerEditor({
               props.value.length - selected.source.length + source.length >
               PROVIDER_SEND_TURN_MAX_INPUT_CHARS
             ) {
-              const { source: chip, start, end } = selected;
+              const chip = selected;
               Alert.alert("The draft is too long", "Shorten the draft or the comment.", [
-                { text: "OK", onPress: () => setSelected({ source: chip, start, end, comment }) },
+                { text: "OK", onPress: () => setSelected({ ...chip, comment }) },
               ]);
               return;
             }
@@ -312,8 +346,4 @@ export function ComposerEditor({
     </>
   );
 }
-export type {
-  ComposerEditorHandle,
-  ComposerEditorSelection,
-  ComposerTextPaste,
-} from "../native/T3ComposerEditor";
+export type { ComposerEditorSelection, ComposerTextPaste } from "../native/T3ComposerEditor";
