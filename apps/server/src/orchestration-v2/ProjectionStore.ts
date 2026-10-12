@@ -4733,12 +4733,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     `,
         // Pages published by html_render, and captured MCP App documents,
         // live in the attachment store too.
-        sql<{ payload_json: string }>`
-      SELECT payload_json
+        sql<{ type: string; payload_json: string }>`
+      SELECT type, payload_json
       FROM orchestration_v2_projection_turn_items
       WHERE thread_id = ${threadId}
-        AND type = 'dynamic_tool'
-        AND (payload_json LIKE '%htmlRender%' OR payload_json LIKE ${`%${MCP_APP_OUTPUT_KEY}%`})
+        AND (type = 'html_render' OR (type = 'dynamic_tool'
+          AND (payload_json LIKE '%htmlRender%' OR payload_json LIKE ${`%${MCP_APP_OUTPUT_KEY}%`})))
     `,
       ]).pipe(
         Effect.map(([messages, renders]) => [
@@ -4748,7 +4748,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               threadId,
               renders.map((row) => {
                 const item = parseEncodedPayload(row.payload_json);
+                if (row.type === "html_render") {
+                  const page = item.htmlRender as { readonly attachmentId?: unknown } | undefined;
+                  return {
+                    type: "html_render" as const,
+                    htmlRender: {
+                      attachmentId: typeof page?.attachmentId === "string" ? page.attachmentId : "",
+                    },
+                  };
+                }
                 return {
+                  type: "dynamic_tool" as const,
                   toolName: typeof item.toolName === "string" ? item.toolName : null,
                   output: item.output,
                 };
@@ -6252,7 +6262,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               ...threadHtmlRenderAttachmentIds(
                 threadId,
                 projection.turnItems.flatMap((item) =>
-                  item.type === "dynamic_tool" ? [item] : [],
+                  item.type === "dynamic_tool" || item.type === "html_render" ? [item] : [],
                 ),
               ),
             ]),

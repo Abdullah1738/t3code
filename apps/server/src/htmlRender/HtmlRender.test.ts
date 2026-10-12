@@ -1,7 +1,13 @@
 // @effect-diagnostics nodeBuiltinImport:off - plain local servers stand in for LAN services.
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
-import { ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  NodeId,
+  type OrchestrationV2ServerCommand,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   HTML_RENDER_MEASURE_FONTS,
@@ -23,6 +29,8 @@ import * as NodeURL from "node:url";
 
 import { resolveAttachmentPathById } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
+import { OrchestratorDispatchError } from "../orchestration-v2/Orchestrator.ts";
+import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as HtmlRender from "./HtmlRender.ts";
 import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 
@@ -30,11 +38,18 @@ import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 // example one T3 installed under <T3 home>/tools/chrome-headless-shell.
 const TEST_BROWSER_ENV = "T3CODE_TEST_HEADLESS_SHELL";
 
+// Threads with no run: publishing records nothing, as outside a turn.
+const layerNoRuns = Layer.mock(ThreadManagementService.ThreadManagementService)({
+  getThreadRecords: (threadId) =>
+    Effect.succeed({ thread: { id: threadId, deletedAt: null }, runs: [] } as never),
+});
+
 const layerHtmlRender = (
   executable?: string,
   installed: Effect.Effect<Option.Option<string>> = Effect.succeed(
     Option.fromUndefinedOr(executable),
   ),
+  layerThreads: Layer.Layer<ThreadManagementService.ThreadManagementService> = layerNoRuns,
 ) =>
   HtmlRender.layer.pipe(
     Layer.provide(
@@ -49,10 +64,50 @@ const layerHtmlRender = (
         }),
       ),
     ),
+    Layer.provide(layerThreads),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-html-render-" })),
     Layer.provideMerge(NodeServices.layer),
   );
 const layerTest = layerHtmlRender();
+
+const runId = RunId.make("run:html-render");
+/**
+ * A thread whose latest run is live, recording each command it is sent.
+ * `thread.deletedAt` reads `deleted`, so a dispatch can delete the thread.
+ */
+const layerLiveRun = (
+  dispatched: Array<OrchestrationV2ServerCommand>,
+  dispatch: (
+    command: OrchestrationV2ServerCommand,
+  ) => ReturnType<ThreadManagementService.ThreadManagementService["Service"]["dispatch"]> = () =>
+    Effect.succeed({ sequence: 1, storedEvents: [] }),
+  deleted: { current: boolean } = { current: false },
+) =>
+  Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (threadId) =>
+      Effect.sync(
+        () =>
+          ({
+            thread: { id: threadId, deletedAt: deleted.current ? "deleted" : null },
+            runs: [
+              { id: RunId.make("run:old"), ordinal: 1, status: "completed", rootNodeId: null },
+              { id: runId, ordinal: 2, status: "running", rootNodeId: NodeId.make("node:root") },
+            ],
+          }) as never,
+      ),
+    dispatch: (command) => {
+      dispatched.push(command);
+      return dispatch(command);
+    },
+  });
+
+const storedPages = Effect.gen(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const config = yield* ServerConfig.ServerConfig;
+  return (yield* fileSystem.readDirectory(config.attachmentsDir, { recursive: true })).filter(
+    (name) => name.endsWith(".html"),
+  );
+});
 
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -199,6 +254,186 @@ describe("HtmlRender", () => {
       expect(html).toContain("<p>Quarterly revenue</p>");
     }).pipe(Effect.provide(layerTest)),
   );
+
+  it.effect("records each page in the calling thread's live run", () => {
+    const dispatched: Array<OrchestrationV2ServerCommand> = [];
+    return Effect.gen(function* () {
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const threadId = ThreadId.make("thread-html-record");
+      const first = yield* htmlRender.publish({
+        threadId,
+        html: "<p>1</p>",
+        title: "A",
+        height: 200,
+      });
+      const second = yield* htmlRender.publish({
+        threadId,
+        html: "<p>2</p>",
+        title: "B",
+        height: 300,
+      });
+
+      expect(dispatched).toEqual(
+        [first, second].map((page) => ({
+          type: "html_render.record",
+          commandId: CommandId.make(`command:html-render:${page.attachmentId}`),
+          threadId,
+          runId,
+          htmlRender: page,
+        })),
+      );
+    }).pipe(Effect.provide(layerHtmlRender(undefined, undefined, layerLiveRun(dispatched))));
+  });
+
+  it.effect("records nothing for a thread with no live run", () => {
+    const dispatched: Array<OrchestrationV2ServerCommand> = [];
+    return Effect.gen(function* () {
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const reference = yield* htmlRender.publish({
+        threadId: ThreadId.make("thread-html-idle"),
+        html: "<p>x</p>",
+        title: "X",
+        height: 200,
+      });
+      expect(dispatched).toEqual([]);
+      expect(yield* storedPages).toEqual([`${reference.attachmentId}.html`]);
+    }).pipe(
+      Effect.provide(
+        layerHtmlRender(
+          undefined,
+          undefined,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: (threadId) =>
+              Effect.succeed({
+                thread: { id: threadId, deletedAt: null },
+                runs: [{ id: runId, ordinal: 1, status: "completed", rootNodeId: null }],
+              } as never),
+            dispatch: (command) => {
+              dispatched.push(command);
+              return Effect.succeed({ sequence: 1, storedEvents: [] });
+            },
+          }),
+        ),
+      ),
+    );
+  });
+
+  it.effect("keeps the page and returns it when recording fails", () => {
+    const dispatched: Array<OrchestrationV2ServerCommand> = [];
+    return Effect.gen(function* () {
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const reference = yield* htmlRender.publish({
+        threadId: ThreadId.make("thread-html-record-fails"),
+        html: "<p>x</p>",
+        title: "X",
+        height: 200,
+      });
+      expect(dispatched).toHaveLength(1);
+      // The tool result still carries the page, so a direct call shows it.
+      expect(yield* storedPages).toEqual([`${reference.attachmentId}.html`]);
+    }).pipe(
+      Effect.provide(
+        layerHtmlRender(
+          undefined,
+          undefined,
+          layerLiveRun(dispatched, (command) =>
+            Effect.fail(
+              new OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "Run is not active.",
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+  });
+
+  it.effect("keeps a page that was recorded while its publish was interrupted", () => {
+    const dispatched: Array<OrchestrationV2ServerCommand> = [];
+    return Effect.gen(function* () {
+      const dispatching = yield* Deferred.make<void>();
+      const commit = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const htmlRender = yield* HtmlRender.HtmlRender;
+        const publishing = yield* htmlRender
+          .publish({
+            threadId: ThreadId.make("thread-html-record-interrupted"),
+            html: "<p>x</p>",
+            title: "X",
+            height: 200,
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(dispatching);
+        // The caller gives up while the record is committing; the commit wins
+        // and the interruption lands as soon as the record returns.
+        publishing.interruptUnsafe();
+        yield* Deferred.succeed(commit, undefined);
+        yield* Fiber.await(publishing);
+        expect(dispatched).toHaveLength(1);
+        expect(yield* storedPages).toHaveLength(1);
+      }).pipe(
+        Effect.provide(
+          layerHtmlRender(
+            undefined,
+            undefined,
+            layerLiveRun(dispatched, () =>
+              Deferred.succeed(dispatching, undefined).pipe(
+                Effect.andThen(Deferred.await(commit)),
+                Effect.as({ sequence: 1, storedEvents: [] }),
+              ),
+            ),
+          ),
+        ),
+      );
+    });
+  });
+
+  it.effect("removes the page when the thread is deleted before it is recorded", () => {
+    const dispatched: Array<OrchestrationV2ServerCommand> = [];
+    const deleted = { current: false };
+    return Effect.gen(function* () {
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const error = yield* htmlRender
+        .publish({
+          threadId: ThreadId.make("thread-html-record-deleted"),
+          html: "<p>x</p>",
+          title: "X",
+          height: 200,
+        })
+        .pipe(Effect.flip);
+      expect(error._tag).toBe("HtmlRenderStoreError");
+      expect(dispatched).toHaveLength(1);
+      // Deletion snapshotted the thread's pages before this one, so it goes now.
+      expect(yield* storedPages).toEqual([]);
+    }).pipe(
+      Effect.provide(
+        layerHtmlRender(
+          undefined,
+          undefined,
+          layerLiveRun(
+            dispatched,
+            (command) =>
+              Effect.sync(() => {
+                deleted.current = true;
+              }).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new OrchestratorDispatchError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      cause: "Thread was deleted.",
+                    }),
+                  ),
+                ),
+              ),
+            deleted,
+          ),
+        ),
+      ),
+    );
+  });
 
   it.effect("removes the page when publishing is interrupted", () =>
     Effect.gen(function* () {
