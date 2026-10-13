@@ -26,7 +26,7 @@ export class ContextResetService extends Context.Service<
       input: ContextResetMcpInput,
     ) => Effect.Effect<ContextResetMcpResult, OrchestratorMcpFailure>;
   }
->()("t3/ardud/ContextResetService") {}
+>()("t3/ardud/context-reset/ContextResetService") {}
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
   new OrchestratorMcpFailure({ code, message });

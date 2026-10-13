@@ -1,6 +1,5 @@
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
-import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -36,11 +35,6 @@ const DDL = [
     thread_id   TEXT PRIMARY KEY,
     origin      TEXT NOT NULL,
     created_at  TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_opencode_import (
-    native_session_id TEXT PRIMARY KEY,
-    thread_id         TEXT NOT NULL UNIQUE,
-    imported_at       TEXT NOT NULL
   )`,
 ];
 
@@ -121,20 +115,6 @@ export class BoardStore extends Context.Service<
     readonly origins: (
       threadIds?: ReadonlyArray<string>,
     ) => Effect.Effect<ReadonlyMap<string, string>, BoardStoreError>;
-    readonly rememberOrigins: (
-      entries: ReadonlyArray<{ readonly threadId: string; readonly origin: string }>,
-    ) => Effect.Effect<number, BoardStoreError>;
-    readonly setOrigin: (input: {
-      readonly threadId: string;
-      readonly origin: string;
-    }) => Effect.Effect<void, BoardStoreError>;
-    readonly importedThreads: (
-      sessionIds: ReadonlyArray<string>,
-    ) => Effect.Effect<ReadonlyMap<string, string>, BoardStoreError>;
-    /** Which of these t3 threads exist and are not deleted. */
-    readonly existingThreads: (
-      threadIds: ReadonlyArray<string>,
-    ) => Effect.Effect<ReadonlySet<string>, BoardStoreError>;
     /** Threads whose latest prompt came from a scheduled task, with that task's id. */
     readonly scheduledThreads: (
       threadIds: ReadonlyArray<string>,
@@ -236,51 +216,6 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail("read origins")),
     );
 
-  const rememberOrigins = (
-    entries: ReadonlyArray<{ readonly threadId: string; readonly origin: string }>,
-  ) =>
-    Effect.gen(function* () {
-      if (entries.length === 0) return 0;
-      const now = DateTime.formatIso(yield* DateTime.now);
-      let written = 0;
-      yield* sql.withTransaction(
-        Effect.forEach(
-          entries,
-          (entry) =>
-            sql`
-              INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
-              VALUES (${entry.threadId}, ${entry.origin}, ${now})
-              ON CONFLICT (thread_id) DO NOTHING
-              RETURNING thread_id
-            `.pipe(Effect.tap((rows) => Effect.sync(() => (written += rows.length)))),
-          { discard: true },
-        ),
-      );
-      return written;
-    }).pipe(Effect.mapError(fail("write origins")));
-
-  const setOrigin = (input: { readonly threadId: string; readonly origin: string }) =>
-    Effect.gen(function* () {
-      const now = DateTime.formatIso(yield* DateTime.now);
-      yield* sql`
-        INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
-        VALUES (${input.threadId}, ${input.origin}, ${now})
-        ON CONFLICT (thread_id) DO UPDATE SET origin = excluded.origin
-      `;
-    }).pipe(Effect.mapError(fail("write origin")));
-
-  const importedThreads = (sessionIds: ReadonlyArray<string>) =>
-    chunked(
-      sessionIds,
-      (chunk) => sql<{ readonly native_session_id: string; readonly thread_id: string }>`
-        SELECT native_session_id, thread_id FROM ardud_opencode_import
-        WHERE native_session_id IN ${sql.in(chunk)}
-      `,
-    ).pipe(
-      Effect.map((rows) => new Map(rows.map((row) => [row.native_session_id, row.thread_id]))),
-      Effect.mapError(fail("read import mapping")),
-    );
-
   // Read-only look at the upstream message projection: a scheduled task's
   // prompt carries its task id.
   const scheduledThreads = (threadIds: ReadonlyArray<string>) =>
@@ -300,28 +235,7 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail("read scheduled prompts")),
     );
 
-  const existingThreads = (threadIds: ReadonlyArray<string>) =>
-    chunked(
-      threadIds,
-      (chunk) => sql<{ readonly thread_id: string }>`
-        SELECT thread_id FROM orchestration_v2_projection_threads
-        WHERE thread_id IN ${sql.in(chunk)} AND deleted_at IS NULL
-      `,
-    ).pipe(
-      Effect.map((rows) => new Set(rows.map((row) => row.thread_id))),
-      Effect.mapError(fail("read threads")),
-    );
-
-  return BoardStore.of({
-    existingThreads,
-    load,
-    save,
-    origins,
-    rememberOrigins,
-    setOrigin,
-    importedThreads,
-    scheduledThreads,
-  });
+  return BoardStore.of({ load, save, origins, scheduledThreads });
 });
 
 export const layer = Layer.effect(BoardStore, make);

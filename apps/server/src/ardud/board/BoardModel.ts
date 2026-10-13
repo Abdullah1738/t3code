@@ -10,7 +10,8 @@ import type {
  * The session board's rules, ported from OpenChamber's session-board runtime.
  * Pure: the service feeds it thread observations and persists the rows it
  * returns. Root threads and forks get cards; subagent threads never do, they
- * only keep their parent running and roll their requests up to it.
+ * only keep their parent running and roll their requests up to it. A user
+ * settle in t3 completes a card; there are no card actions any more.
  */
 
 export type CompletedFrom = "waiting" | "backlog" | "scheduled";
@@ -41,7 +42,7 @@ export interface BoardRow {
  */
 export type LiveStatus = "working" | "queued" | "background" | "idle";
 
-export const isActive = (status: LiveStatus | undefined): boolean =>
+const isActive = (status: LiveStatus | undefined): boolean =>
   status !== undefined && status !== "idle";
 
 /** What one read of a thread shell says about it. */
@@ -98,9 +99,9 @@ export interface LiveInfo {
 }
 
 /** Origins whose threads never reach the board (they talk to the owner elsewhere). */
-export const QUIET_ORIGINS: ReadonlySet<string> = new Set(["imessage"]);
+const QUIET_ORIGINS: ReadonlySet<string> = new Set(["imessage"]);
 /** Origins whose threads land in the Scheduled lane instead of Waiting for review. */
-export const AUTOMATED_ORIGINS: ReadonlySet<string> = new Set(["automation", "crw", "watcher"]);
+const AUTOMATED_ORIGINS: ReadonlySet<string> = new Set(["automation", "crw", "watcher"]);
 
 export const blankRow = (threadId: string, title = threadId): BoardRow => ({
   threadId,
@@ -125,7 +126,7 @@ export interface ObservePatch {
   readonly creates: boolean;
 }
 
-export const sameRow = (left: BoardRow, right: BoardRow) =>
+const sameRow = (left: BoardRow, right: BoardRow) =>
   left.projectId === right.projectId &&
   left.title === right.title &&
   left.promptAt === right.promptAt &&
@@ -473,66 +474,4 @@ export class BoardModel {
         right.updatedAt - left.updatedAt || left.threadId.localeCompare(right.threadId),
     );
   }
-}
-
-export type BoardAction = "review" | "backlog" | "restore";
-
-export type ActionDecision =
-  | { readonly _tag: "commit"; readonly row: BoardRow }
-  | { readonly _tag: "noop" }
-  | { readonly _tag: "conflict"; readonly reason: "stale" | "running" | "not-restorable" };
-
-/**
- * Decides a card action on fresh state. `workRevision` is the token the user
- * acted on; it must still name the row's current work. Review and Backlog are
- * both acknowledgements; Restore undoes one with its pre-completion token.
- */
-export function decideAction(input: {
-  readonly action: BoardAction;
-  readonly row: BoardRow | undefined;
-  readonly workRevision: number;
-  readonly running: boolean;
-  readonly now: number;
-}): ActionDecision {
-  const { action, row } = input;
-  if (row === undefined || row.workRevision !== input.workRevision) {
-    return { _tag: "conflict", reason: "stale" };
-  }
-  if (!row.deleted && input.running) return { _tag: "conflict", reason: "running" };
-  if (action === "restore") {
-    if (!row.reviewed || row.pending) return { _tag: "conflict", reason: "not-restorable" };
-    const restored: BoardRow =
-      row.completedFrom === "backlog"
-        ? { ...row, pending: false, reviewed: true, backlog: true }
-        : row.completedFrom === "scheduled"
-          ? { ...row, pending: false, reviewed: false, backlog: false }
-          : { ...row, pending: true, reviewed: false, backlog: false };
-    return {
-      _tag: "commit",
-      row: {
-        ...restored,
-        completedFrom: null,
-        workRevision: row.workRevision + 1,
-        updatedAt: input.now,
-      },
-    };
-  }
-  if (action === "backlog") {
-    if (row.backlog) return { _tag: "noop" };
-    return {
-      _tag: "commit",
-      row: { ...row, pending: false, reviewed: true, backlog: true, completedFrom: null },
-    };
-  }
-  if (row.reviewed && !row.backlog) return { _tag: "noop" };
-  return {
-    _tag: "commit",
-    row: {
-      ...row,
-      pending: false,
-      reviewed: true,
-      backlog: false,
-      completedFrom: row.backlog ? "backlog" : row.scheduled ? "scheduled" : "waiting",
-    },
-  };
 }

@@ -1,3 +1,5 @@
+import { type OrchestrationV2TurnItem, ThreadId, TurnItemId } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -13,7 +15,7 @@ import {
   readHtmlRenderReference,
 } from "./htmlRender.ts";
 import { T3_CODE_DARK_THEME_COLORS, T3_CODE_LIGHT_THEME_COLORS } from "./themePalettes.ts";
-import { htmlRenderFromToolItem } from "./toolOutput.ts";
+import { htmlRenderFromToolItem, threadHtmlRenders } from "./toolOutput.ts";
 
 const reference = { attachmentId: "thread-abc-123.html", title: "Chart", height: 420 };
 
@@ -176,6 +178,85 @@ describe("htmlRenderFromToolItem", () => {
     expect(
       htmlRenderFromToolItem({ toolName: "html_render", output: { ...result, isError: true } }),
     ).toBeUndefined();
+  });
+});
+
+describe("threadHtmlRenders", () => {
+  const base = {
+    threadId: ThreadId.make("thread-abc"),
+    runId: null,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 1,
+    status: "completed",
+    title: null,
+    startedAt: null,
+    completedAt: null,
+    updatedAt: DateTime.makeUnsafe(0),
+  } as const;
+  const recorded = (htmlRender: typeof reference, id = htmlRender.attachmentId) =>
+    ({
+      ...base,
+      id: TurnItemId.make(`recorded:${id}`),
+      type: "html_render",
+      htmlRender,
+    }) satisfies OrchestrationV2TurnItem;
+  const call = (
+    id: string,
+    toolName: string,
+    output: unknown,
+    status: OrchestrationV2TurnItem["status"] = "completed",
+  ) =>
+    ({
+      ...base,
+      id: TurnItemId.make(id),
+      status,
+      type: "dynamic_tool",
+      toolName,
+      input: {},
+      output,
+    }) satisfies OrchestrationV2TurnItem;
+  const result = (htmlRender: typeof reference) => ({ htmlRender, message: "Shown." });
+
+  it("shows every page a script published, whatever the script returned", () => {
+    const chart = { ...reference, attachmentId: "thread-abc-chart-html", title: "Chart" };
+    const table = { ...reference, attachmentId: "thread-abc-table-html", title: "Table" };
+    // Code Mode's execute call returned something else, or failed after publishing.
+    const script = call("execute", "execute", { ok: true }, "failed");
+    const pages = threadHtmlRenders([recorded(chart), script, recorded(table)]);
+    expect([...pages.values()]).toEqual([chart, table]);
+    expect(pages.has(script)).toBe(false);
+  });
+
+  it("shows a direct call's page once, at the recorded item", () => {
+    const direct = call("direct", "mcp__t3-code__html_render", result(reference));
+    const page = recorded(reference);
+    const pages = threadHtmlRenders([direct, page]);
+    expect([...pages.keys()]).toEqual([page]);
+    expect(pages.get(page)).toEqual(reference);
+  });
+
+  it("still shows a direct call's page when nothing recorded it", () => {
+    const direct = call("direct", "t3-code.html_render", result(reference));
+    expect(threadHtmlRenders([direct]).get(direct)).toEqual(reference);
+    // A running or failed call stays an ordinary tool row.
+    expect(
+      threadHtmlRenders([call("running", "html_render", result(reference), "running")]).size,
+    ).toBe(0);
+  });
+
+  it("never shows a page an execute result points at", () => {
+    // A script can return any thread's page id; only recorded pages show.
+    const script = call("execute", "execute", result(reference));
+    expect(threadHtmlRenders([script]).size).toBe(0);
+  });
+
+  it("bounds a recorded page like a tool result", () => {
+    const page = recorded({ ...reference, height: 99_999 });
+    expect(threadHtmlRenders([page]).get(page)?.height).toBe(HTML_RENDER_MAX_HEIGHT);
   });
 });
 

@@ -47,6 +47,7 @@ import { isProviderNativeSubagentThread } from "@t3tools/contracts";
 import type { QueuedRunEdit } from "../../state/queued-run-edit";
 import type { FollowUpBehavior } from "../../lib/followUpBehavior";
 import type { ActiveTurnComposerAction } from "@t3tools/client-runtime/state/composer-dispatch";
+import { voiceInputBlocksSubmission } from "@t3tools/client-runtime/voice-input";
 import * as Haptics from "expo-haptics";
 import {
   memo,
@@ -142,7 +143,20 @@ import {
   ThreadComposer,
 } from "./ThreadComposer";
 import { ComposerPopoverHost } from "./ComposerPopoverHost";
-import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
+import {
+  type AssistantTextCiteRequest,
+  ThreadFeed,
+  type ThreadFeedHistoryControls,
+} from "./ThreadFeed";
+import {
+  createMobileAssistantCitation,
+  insertAssistantCitation,
+} from "../../lib/assistantCitationSelection";
+import {
+  captureComposerDraftInsertion,
+  rememberComposerDraftSelection,
+  setComposerDraftText,
+} from "../../state/use-composer-drafts";
 import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
 import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
 import { useThreadQueuedCount } from "./ThreadQueueControl";
@@ -173,9 +187,15 @@ export interface ThreadDetailScreenProps {
    * The server has not created this thread yet. "preparing" runs while the
    * queued creation is delivered (a worktree may be checking out); "failed"
    * is a rejected creation whose content went back to the project draft.
+   * `serverOwned` marks a thread the server already created that is still
+   * setting up its worktree; follow-ups queue on the server behind that setup.
    */
   readonly creationState:
-    | { readonly kind: "preparing"; readonly preparingWorktree: boolean }
+    | {
+        readonly kind: "preparing";
+        readonly preparingWorktree: boolean;
+        readonly serverOwned: boolean;
+      }
     | { readonly kind: "failed"; readonly reason: string; readonly onEditTask: () => void }
     | null;
   readonly activePendingApproval: PendingApproval | null;
@@ -1077,6 +1097,64 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     [props.onChangeDraftMessage],
   );
 
+  const composerBusy =
+    props.activePendingApproval !== null || props.activePendingUserInput !== null;
+  const handleCiteAssistantText = useCallback(
+    (request: AssistantTextCiteRequest) => {
+      const draftKey = props.composerDraftKey;
+      if (draftKey === null || composerBusy || composerSlotHidden) {
+        Alert.alert(
+          "The composer is not ready",
+          "Try citing the selection after the connection or pending input is resolved.",
+        );
+        return;
+      }
+      const citation = createMobileAssistantCitation({
+        environmentId: props.environmentId,
+        threadId: props.selectedThread.id,
+        ...request,
+      });
+      if (citation === "too-long") {
+        Alert.alert("Selection is too long to cite", "Select less text and try again.");
+        return;
+      }
+      if (citation === null) return;
+      // Dictation holds this draft read-only and drops its transcript if the draft changes.
+      if (
+        voiceInputSession.ownerKey === draftKey &&
+        voiceInputBlocksSubmission(voiceInputSession.controller.currentState)
+      ) {
+        Alert.alert("The composer is not ready", "Try citing the selection after dictation ends.");
+        return;
+      }
+      const target = captureComposerDraftInsertion(draftKey);
+      const inserted = insertAssistantCitation(target.text, target, citation);
+      if (inserted === null) {
+        Alert.alert("The draft is too long", "Shorten the draft before adding this quote.");
+        return;
+      }
+      draftMessageRef.current = inserted.text;
+      setComposerDraftText(draftKey, inserted.text);
+      const caret = { start: inserted.caret, end: inserted.caret };
+      rememberComposerDraftSelection(draftKey, inserted.text, caret);
+      // Like web, citing goes straight to the quote's comment.
+      requestAnimationFrame(() => {
+        const editor = composerEditorRef.current;
+        // The composer can switch drafts first, e.g. when a queued run being edited starts.
+        if (!editor?.openNewCitation(draftKey, inserted.citation)) return;
+        editor.setSelection(caret);
+      });
+    },
+    [
+      composerBusy,
+      composerSlotHidden,
+      props.composerDraftKey,
+      props.environmentId,
+      props.selectedThread.id,
+      voiceInputSession,
+    ],
+  );
+
   const handleScrollToEnd = useCallback(() => {
     void Haptics.selectionAsync();
     void scrollMessageToEnd({ animated: true, closeKeyboard: false }).catch(() => {
@@ -1185,6 +1263,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onEndFollowEnabledChange={setEndFollowEnabled}
               skills={selectedProviderSkills}
               onUseArtifactTemplate={handleUseArtifactTemplate}
+              {...(isProviderSubagent ? {} : { onCiteAssistantText: handleCiteAssistantText })}
             />
           </RenderErrorBoundary>
         </View>
@@ -1439,11 +1518,14 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                         canStopThread={props.canStopThread}
                         environmentId={props.environmentId}
                         projectCwd={props.threadCwd ?? props.projectWorkspaceRoot}
-                        // Follow-ups typed during setup wait in the draft: queueing
-                        // them against a thread id the server may still reject
-                        // would strand them in the outbox.
+                        // Follow-ups typed before the server creates the thread wait in
+                        // the draft: queueing them against a thread id the server may
+                        // still reject would strand them in the outbox.
                         sendBlockedReason={
-                          props.creationState?.kind === "preparing" ? "Starting the task…" : null
+                          props.creationState?.kind === "preparing" &&
+                          !props.creationState.serverOwned
+                            ? "Starting the task…"
+                            : null
                         }
                         draftKey={props.composerDraftKey ?? undefined}
                         followUpBehavior={props.followUpBehavior}

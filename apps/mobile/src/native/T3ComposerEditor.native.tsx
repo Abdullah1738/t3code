@@ -16,15 +16,9 @@ import {
 import type { NativeSyntheticEvent, ViewProps } from "react-native";
 import { Image, Platform, StyleSheet } from "react-native";
 
-import {
-  markdownFileIconSource,
-  markdownIconAssetUri,
-} from "@t3tools/mobile-markdown-text/file-icons";
-import {
-  composerChipSizeSuffix,
-  contextChipPresentation,
-} from "@t3tools/mobile-markdown-text/markdown";
-import { resolveMarkdownFileIcon } from "@t3tools/mobile-markdown-text/links";
+import { markdownFileIconSource, markdownIconAssetUri } from "../lib/markdownFileIcons";
+import { composerChipSizeSuffix, contextChipPresentation } from "../lib/composerChipPresentation";
+import { resolveMarkdownFileIcon } from "../lib/markdownLinks";
 import { MOBILE_TYPOGRAPHY } from "../lib/typography";
 import { useNativePaste } from "../lib/useNativePaste";
 import { useFontFamily } from "../lib/useFontFamily";
@@ -182,7 +176,9 @@ export function ComposerEditor({
               ? (skillLabels.get(token.value) ?? token.value)
               : token.type === "context"
                 ? `${token.label}${props.context?.records.some((record) => record.contextId === token.contextId) ? "" : " · unavailable"}`
-                : basename(token.value),
+                : token.type === "citation"
+                  ? token.value
+                  : basename(token.value),
           detail: token.type === "context" ? composerChipSizeSuffix(record) : "",
           // Only a mention wears per-filetype artwork. An attachment chip keeps the tinted
           // monochrome glyph web draws for it: coloured artwork ignores the chip's accent and

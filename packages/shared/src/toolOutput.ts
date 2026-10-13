@@ -1,5 +1,6 @@
 import {
   isProviderSendTurnSupportedImageMimeType,
+  type OrchestrationV2TurnItem,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
 } from "@t3tools/contracts";
 import * as Predicate from "effect/Predicate";
@@ -190,6 +191,39 @@ export function htmlRenderFromToolItem(item: {
   if (resolveT3McpToolId(item.toolName) !== HTML_RENDER_TOOL_NAME) return undefined;
   const output = compactDynamicToolOutput(item.output);
   return output?.isError ? undefined : output?.htmlRender;
+}
+
+/**
+ * The page each turn item shows. The server records every page published
+ * during a run as its own `html_render` item, so a tool call whose page was
+ * recorded shows as an ordinary tool row instead of a second copy. A call
+ * from before pages were recorded, or from outside a run, still shows its page.
+ */
+export function threadHtmlRenders(
+  items: Iterable<OrchestrationV2TurnItem>,
+): ReadonlyMap<OrchestrationV2TurnItem, HtmlRenderReference> {
+  const pages = new Map<OrchestrationV2TurnItem, HtmlRenderReference>();
+  const calls: Array<readonly [OrchestrationV2TurnItem, HtmlRenderReference]> = [];
+  const recorded = new Set<string>();
+  for (const item of items) {
+    const page =
+      item.type === "html_render"
+        ? readHtmlRenderReference(item.htmlRender)
+        : item.type === "dynamic_tool" && item.status === "completed"
+          ? htmlRenderFromToolItem(item)
+          : undefined;
+    if (page === undefined) continue;
+    if (item.type === "html_render") {
+      recorded.add(page.attachmentId);
+      pages.set(item, page);
+    } else {
+      calls.push([item, page]);
+    }
+  }
+  for (const [item, page] of calls) {
+    if (!recorded.has(page.attachmentId)) pages.set(item, page);
+  }
+  return pages;
 }
 
 /**

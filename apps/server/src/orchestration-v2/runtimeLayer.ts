@@ -247,13 +247,15 @@ const layerArdudOpenCodeImporterProvided = ArdudOpenCodeImporter.layer.pipe(
 );
 const layerThreadManagementProvided = ThreadManagementService.layerWithLegacyImporter.pipe(
   Layer.provide(
-    Layer.merge(
+    Layer.mergeAll(
       layerOrchestratorProvided,
       withOpenCodeTranscripts.pipe(
         Layer.provide(
           Layer.merge(layerLegacyV1ThreadImporterProvided, layerArdudOpenCodeImporterProvided),
         ),
       ),
+      layerCommandReceiptStoreProvided,
+      layerProviderSessionManagerProvided,
     ),
   ),
 );

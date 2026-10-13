@@ -1,7 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
-import * as BoardImport from "./BoardImport.ts";
 import * as BoardService from "./BoardService.ts";
 import * as BoardStore from "./BoardStore.ts";
 
@@ -11,8 +10,4 @@ export const ArdudBoardLive = Layer.effectDiscard(
     const board = yield* BoardService.BoardService;
     yield* board.start;
   }),
-).pipe(
-  Layer.provideMerge(BoardImport.layer),
-  Layer.provideMerge(BoardService.layer),
-  Layer.provideMerge(BoardStore.layer),
-);
+).pipe(Layer.provideMerge(BoardService.layer), Layer.provideMerge(BoardStore.layer));

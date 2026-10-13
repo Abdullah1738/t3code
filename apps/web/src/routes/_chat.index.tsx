@@ -1,15 +1,23 @@
+import { RefreshIcon } from "~/components/ui/refresh-icon";
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { LinkIcon, PlusIcon } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { isLocalEnvironmentDisabled } from "../localEnvironment";
 import { isElectron } from "../env";
-import { BoardPage } from "../ardud/board/BoardPage";
 import { NoProjectsHero } from "../components/NoProjectsHero";
+import { sortScopedProjectsForSidebar } from "../components/Sidebar.logic";
 import { Button } from "../components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../components/ui/empty";
 import { SidebarInset } from "../components/ui/sidebar";
 import { WorkspacePageHeader } from "../components/WorkspacePageHeader";
-import { useAllEnvironmentShellsBootstrapped, useProjects } from "../state/entities";
+import { useNewThreadHandler } from "../hooks/useHandleNewThread";
+import {
+  useAllEnvironmentShellsBootstrapped,
+  useProjects,
+  useThreadShells,
+} from "../state/entities";
 import { useEnvironments } from "../state/environments";
 import { APP_DISPLAY_NAME } from "~/branding";
 import { hasCloudPublicConfig } from "~/cloud/publicConfig";
@@ -23,24 +31,83 @@ function ChatIndexRouteView() {
     if (environments.length === 0) return <HostedStaticOnboardingState />;
   }
 
-  return <BoardHome />;
+  return <IndexDraftLanding />;
 }
 
 /**
- * ardud fork: the session board is the home page. Falls back to the
- * add-project hero when no project exists yet.
+ * Landing on the index route drops straight into a draft thread for the most
+ * recently active project, so the first screen is a prompt instead of a dead
+ * end. Falls back to an add-project hero when no project exists yet.
  */
-function BoardHome() {
+function IndexDraftLanding() {
   const projects = useProjects();
+  const threads = useThreadShells();
   const bootstrapped = useAllEnvironmentShellsBootstrapped();
+  const handleNewThread = useNewThreadHandler();
+  const startingRef = useRef(false);
+  const [startState, setStartState] = useState({ failed: false, retryRequest: 0 });
 
-  if (!bootstrapped) return null;
-  if (projects.length === 0) {
-    // First-run routing to the welcome wizard happens in FirstRunGate at the
-    // root, before this route ever renders.
-    return <NoProjectsHero />;
+  const mostRecentProject = useMemo(
+    () =>
+      bootstrapped
+        ? (sortScopedProjectsForSidebar(projects, threads, "updated_at")[0] ?? null)
+        : null,
+    [bootstrapped, projects, threads],
+  );
+
+  useEffect(() => {
+    if (mostRecentProject === null || startingRef.current) {
+      return;
+    }
+    startingRef.current = true;
+    void handleNewThread(scopeProjectRef(mostRecentProject.environmentId, mostRecentProject.id), {
+      replace: true,
+    }).catch(() => {
+      startingRef.current = false;
+      setStartState((state) => ({ ...state, failed: true }));
+    });
+  }, [handleNewThread, mostRecentProject, startState.retryRequest]);
+
+  if (!bootstrapped) {
+    return null;
   }
-  return <BoardPage />;
+  if (mostRecentProject !== null) {
+    return startState.failed ? (
+      <DraftStartError
+        onRetry={() => {
+          setStartState((state) => ({
+            failed: false,
+            retryRequest: state.retryRequest + 1,
+          }));
+        }}
+      />
+    ) : null;
+  }
+  // First-run routing to the welcome wizard happens in FirstRunGate at the
+  // root, before this route ever renders.
+  return <NoProjectsHero />;
+}
+
+function DraftStartError({ onRetry }: { readonly onRetry: () => void }) {
+  return (
+    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
+      {isElectron ? <WorkspacePageHeader electron /> : null}
+      <Empty className="flex-1">
+        <EmptyHeader className="max-w-md">
+          <EmptyTitle>Couldn’t start a new thread</EmptyTitle>
+          <EmptyDescription>
+            The project is still available. Try opening the draft again.
+          </EmptyDescription>
+          <div className="mt-5 flex justify-center">
+            <Button size="sm" onClick={onRetry}>
+              <RefreshIcon size="md" />
+              Try again
+            </Button>
+          </div>
+        </EmptyHeader>
+      </Empty>
+    </SidebarInset>
+  );
 }
 
 export const Route = createFileRoute("/_chat/")({

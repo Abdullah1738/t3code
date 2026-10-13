@@ -9,15 +9,13 @@ import {
   Globe2Icon,
   SearchIcon,
   SquarePenIcon,
-  TerminalIcon,
   TriangleAlertIcon,
 } from "lucide-react";
 import {
   ChangeRequestStatusIcon,
   prStatusIndicator,
   PrStatusTooltipContent,
-  terminalStatusFromRunningIds,
-  synchronizeTerminalPulse,
+  ThreadTerminalStatusButton,
   ThreadStatusLabel,
   ThreadWorktreeIndicator,
   useLinkedThreadPullRequest,
@@ -226,7 +224,6 @@ import {
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
-import { SidebarBoardNav } from "../ardud/board/SidebarBoardNav";
 const SIDEBAR_SORT_LABELS: Record<SidebarProjectSortOrder, string> = {
   updated_at: "Last user message",
   created_at: "Created at",
@@ -507,7 +504,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     ? resolveThreadCurrentPullRequestLink(thread.pullRequests)
     : null;
   const prStatus = prStatusIndicator(pr, linkedPullRequestStatus?.sourceControlProvider);
-  const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
   const isConfirmingArchive =
     canOperateThread && confirmingArchiveThreadKey === threadKey && !isThreadRunning;
   const threadMetaClassName = isConfirmingArchive
@@ -850,25 +846,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
             </Tooltip>
           )}
           <ThreadWorktreeIndicator thread={thread} />
-          {terminalStatus && (
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <span
-                    role="img"
-                    aria-label={terminalStatus.label}
-                    className={`inline-flex items-center justify-center ${terminalStatus.colorClass}`}
-                  />
-                }
-              >
-                <TerminalIcon
-                  className={`size-3 ${terminalStatus.pulse ? "motion-safe:animate-status-pulse" : ""}`}
-                  onAnimationStart={synchronizeTerminalPulse}
-                />
-              </TooltipTrigger>
-              <TooltipPopup side="top">{terminalStatus.label}</TooltipPopup>
-            </Tooltip>
-          )}
+          <ThreadTerminalStatusButton
+            threadRef={threadRef}
+            terminalIds={runningTerminalIds}
+            onThreadActivate={navigateToThread}
+          />
           <div
             className={`flex min-w-12 justify-end ${
               isRemoteThread ? "max-sm:min-w-24" : "max-sm:min-w-20"
@@ -3073,7 +3055,6 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
         // Lifted above the stage backdrop, whose fade bleeds below the
         // header and would otherwise paint across the search row's outline.
         <SidebarGroup className="z-[1]">
-          <SidebarBoardNav className="mb-1" />
           <SidebarMenu>
             <SidebarMenuItem>
               <CommandDialogTrigger

@@ -4,10 +4,15 @@ import {
   ProjectId,
   ProviderInstanceId,
   ComposerContextId,
+  EnvironmentId,
+  MessageId,
+  ThreadId,
   type OrchestrationMessageContext,
 } from "@t3tools/contracts";
+import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
 import { collectComposerInlineTokens } from "@t3tools/shared/composerInlineTokens";
 import {
+  ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
   collectComposerContextReferences,
   formatComposerContextReference,
   projectComposerContextForProvider,
@@ -164,6 +169,28 @@ describe("mobile composer context", () => {
     for (const token of tokens) expect(text.slice(token.start, token.end)).toBe(token.source);
   });
 
+  it("collapses an assistant quote into one chip labelled like web", () => {
+    const quote = serializeAssistantCitation({
+      version: 1,
+      environmentId: EnvironmentId.make("environment-1"),
+      threadId: ThreadId.make("thread-1"),
+      messageId: MessageId.make("message-1"),
+      text: "Use   the retry\nqueue",
+      comment: "Why here?",
+      start: 0,
+      end: 19,
+      prefix: "",
+      suffix: "",
+    });
+    const text = `Check ${quote} in [app.ts](src/app.ts) now`;
+    const tokens = composerContextEditorTokens(text, collectComposerInlineTokens(text));
+    expect(tokens.map((token) => [token.type, token.value])).toEqual([
+      ["citation", "Why here?"],
+      ["mention", "src/app.ts"],
+    ]);
+    for (const token of tokens) expect(text.slice(token.start, token.end)).toBe(token.source);
+  });
+
   it("removes deleted payloads but keeps the screenshot linked to a remaining annotation", () => {
     const context: OrchestrationMessageContext = {
       version: 1,
@@ -207,6 +234,52 @@ describe("mobile composer context", () => {
 });
 
 describe("host context compatibility", () => {
+  it("sends an image-only prompt as the attachment-only prompt and keeps the image", () => {
+    const context: OrchestrationMessageContext = { version: 1, records: [image] };
+    const reference = formatComposerContextReference(image);
+    expect(serializeComposerMessageForServer(reference, context, true)).toEqual({
+      text: ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
+      context,
+    });
+    const withProse = `${reference} what is this?`;
+    expect(serializeComposerMessageForServer(withProse, context, true)).toEqual({
+      text: withProse,
+      context,
+    });
+  });
+
+  it("carries the current PR diff file within the composer wire limits", () => {
+    const metadata = {
+      number: 42,
+      title: "Fix checkout",
+      url: "https://github.com/example/repo/pull/42",
+      headBranch: "fix-checkout",
+      baseBranch: "main",
+      state: "open" as const,
+      isDraft: false,
+    };
+    const record = pullRequestComposerContext(metadata, "pr-42", "src/checkout.ts");
+    expect(record.filePath).toBe("src/checkout.ts");
+    const prompt = projectComposerContextForProvider({
+      text: formatComposerContextReference(record),
+      records: [record],
+    });
+    expect(prompt).toContain(metadata.url);
+    expect(prompt).toContain("src/checkout.ts");
+    expect(composerContextSendBlockReason({ version: 1, records: [record] })).toBeNull();
+    const large = pullRequestComposerContext(
+      {
+        ...metadata,
+        title: "x".repeat(3000),
+        headBranch: "y".repeat(3000),
+        baseBranch: "z".repeat(3000),
+      },
+      "pr-42",
+      `src/${"[long file]".repeat(500)}.ts`,
+    );
+    expect(composerContextSendBlockReason({ version: 1, records: [large] })).toBeNull();
+  });
+
   it.each(["existing-thread", "new-task"])("serializes %s sends for an older host", (path) => {
     const pr = pullRequestComposerContext(
       {
