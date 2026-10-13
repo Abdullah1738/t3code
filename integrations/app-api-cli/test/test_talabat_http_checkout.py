@@ -924,23 +924,31 @@ class GroceryDiscountQuoteTests(unittest.TestCase):
     """Split-fee era quotes: GroceryDiscountType promo, undiscounted SubTotal."""
 
     def test_parse_quote_accepts_grocery_discount_split_fees(self):
-        home, config, card, store, items, cart, parsed0, data = context()
-        parsed = h.parse_cart({'id': 'synthetic-owned-cart', 'items': [
-            {'product_id': PRODUCT, 'quantity': 2, 'increment_weight': None}],
-            'subtotal_after_discount': 21.6, 'total': 31.56}, store, items)
-        checkout = data['checkout']
-        data['tracking']['cartId'] = parsed.cart_id
-        checkout['branchId'] = store.branch_id
-        checkout['amount'] = 31.56
-        checkout['cart']['items'] = [{'id': '333', 'itemGuid': PRODUCT,
-                                      'quantity': 2, 'price': '10.80', 'total': '21.60'}]
-        checkout['paymentSummary']['items'] = [
-            {'type': 'SubTotal', 'amount': 24}, {'type': 'GroceryDiscountType', 'amount': 2.4},
-            {'type': 'DeliveryFee', 'amount': 9}, {'type': 'ServiceFee', 'amount': 0.96},
-            {'type': 'Total', 'amount': 31.56}]
-        body = h.prepare_body(store, home, selection=None, features={'paySupportsTPro': False})
-        quote = h.parse_quote(data, parsed, home, body, None)
-        self.assertEqual(quote.amount_minor, 3156)
+        for vertical in ('mart', 'shops'):
+            with self.subTest(vertical=vertical):
+                home, config, card, store, items, cart, parsed0, data = context(vertical)
+                parsed = h.parse_cart({'id': 'synthetic-owned-cart', 'items': [
+                    {'product_id': PRODUCT, 'quantity': 2, 'increment_weight': None}],
+                    'subtotal_after_discount': 21.6, 'total': 31.56}, store, items)
+                checkout = data['checkout']
+                data['tracking']['cartId'] = parsed.cart_id
+                checkout['branchId'] = store.branch_id
+                checkout['amount'] = 31.56
+                checkout['cart']['items'] = [{'id': '333', 'itemGuid': PRODUCT,
+                                              'quantity': 2, 'price': '10.80', 'total': '21.60'}]
+                checkout['paymentSummary']['items'] = [
+                    {'type': 'SubTotal', 'amount': 24}, {'type': 'GroceryDiscountType', 'amount': 2.4},
+                    {'type': 'DeliveryFee', 'amount': 9}, {'type': 'ServiceFee', 'amount': 0.96},
+                    {'type': 'Total', 'amount': 31.56}]
+                body = h.prepare_body(store, home, selection=None, features={'paySupportsTPro': False})
+                quote = h.parse_quote(data, parsed, home, body, None)
+                self.assertEqual(quote.amount_minor, 3156)
+                # Exact net cart truth still stops a coherent but changed quote.
+                checkout['cart']['items'][0].update(price='10.90', total='21.80')
+                checkout['paymentSummary']['items'][1]['amount'] = 2.2
+                checkout['paymentSummary']['items'][-1]['amount'] = checkout['amount'] = 31.76
+                with self.assertRaisesRegex(h.orders.TalabatError, 'QUOTE_AMOUNT_RECONCILIATION_FAILED'):
+                    h.parse_quote(data, parsed, home, body, None)
 
     def test_parse_quote_still_accepts_undiscounted_shape(self):
         home, config, card, store, items, cart, parsed0, data = context()

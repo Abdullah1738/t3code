@@ -243,7 +243,7 @@ class ItemNoteFlowTests(unittest.TestCase):
         self.calls = []
         self.menu = {'vendor':{'result':{'restaurant':{'bid':44444}}},
                      'menu':{'result':{'menu':{'menuSection':[
-                         {'nm':'Shakes','itm':[{'id':12345,'nm':'Vanilla protein shake','pr':25,'opr':25,'icc':False},
+                         {'nm':'Shakes','itm':[{'id':12345,'nm':'Vanilla protein shake','pr':15,'opr':15,'icc':False},
                                                {'id':12346,'nm':'Chamomile tea','pr':18,'opr':18,'icc':False}]}]}}}}
         pool = Path(temp.name) / 'pool.txt'
         pool.write_text('[pp+0x7c80] String: "%s"\n' % KEY)
@@ -310,6 +310,42 @@ class ItemNoteFlowTests(unittest.TestCase):
         self.assertIsNone(state['order_id']); self.assertEqual(state['reserved_minor'],0)
         self.assertEqual(self.calls[-1][0:2],('GET','/cart/v1/900'))
 
+    def test_prepare_only_discounted_item_without_choices(self):
+        # My Six Pak's 2026-10-13 quote: strike-through unit price, net row
+        # total, and a waived delivery fee whose display still shows AED4.90.
+        self.raw['cart']['items'][0]['quantity'] = 1
+        self.raw['cart']['totalValue'] = 75
+        self.menu['menu']['result']['menu']['menuSection'][0]['itm'][0].update(pr=75, opr=105)
+        checkout = self.quote['checkout']
+        checkout.update(amount='79.9', discountsTotal='30')
+        checkout['cart']['items'][0].update(quantity=1, price='AED 105.00', total='AED 75.00')
+        checkout['paymentSummary']['items'] = [
+            {'type':'SubTotal','amount':105,'value':'AED 105.00'},
+            {'type':'AutoAppliedDiscount','amount':30,'value':'- AED 30.00'},
+            {'type':'DeliveryFee','amount':0,'value':'AED 4.90'},
+            {'type':'ServiceFee','amount':4.9,'value':'AED 4.90'},
+            {'type':'Total','amount':79.9,'value':'AED 79.90'}]
+        with patch.object(cli,'CommerceAuth',return_value=self.auth), \
+                patch.object(commerce,'CommerceAuth',return_value=self.auth), \
+                patch.object(h.shared,'verticals_key',return_value=KEY), \
+                patch.object(commerce.TalabatFlow,'purchase',side_effect=AssertionError('purchase forbidden')), \
+                patch.object(cli,'register_tracking',side_effect=AssertionError('tracker forbidden')), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = cli.main(['order','talabat','--vertical','restaurants','--branch','44444',
+                '--item','12345','--quantity','1','--apk-pool',self.pool,'--item-note',NOTE,'--prepare-only'])
+        result = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result['state'], 'PREPARED_NOT_ORDERED')
+        self.assertEqual(result['review']['payable_minor'], 7990)
+        self.assertFalse(result['financial_send'])
+        self.assertTrue(result['cart_readback_verified'])
+        self.assertEqual(result['review']['item_notes'][0]['note'], NOTE)
+        state = journal.inspect(result['flow_id'])
+        self.assertIsNone(state['order_id'])
+        self.assertEqual(state['reserved_minor'], 0)
+        self.assertFalse(any(x['kind'] in ('place', 'payment') for x in state['operations']))
+        self.assertEqual(self.calls[-1][0:2], ('GET','/cart/v1/900'))
+
     def test_prepare_only_cli_accepts_items_file_with_choices_and_duplicate_lines(self):
         rows = {'items':[
             {'item_id': 12345, 'quantity': 2, 'note': NOTE,
@@ -332,7 +368,7 @@ class ItemNoteFlowTests(unittest.TestCase):
         self.quote['checkout']['amount'] = 89
         self.raw['cart']['totalValue'] = 84
         menu_section = self.menu['menu']['result']['menu']['menuSection'][0]
-        menu_section['itm'][0]['icc'] = True
+        menu_section['itm'][0].update(icc=True, pr=25, opr=25)
         self.menu_choices = {'result': {'choiceForItem': [{'itemId': '12345', 'choiceSections': [{
             'id': CHOICE_SECTION_ID, 'iid': 12345, 'nm': 'Extras', 'mnq': 0, 'mxq': 2,
             'ich': [{'id': CHOICE_ID, 'nm': CHOICE_NAME, 'pr': 14.4, 'opr': 16, 'subCategories': None}]}]}]}}

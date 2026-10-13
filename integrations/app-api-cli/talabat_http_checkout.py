@@ -273,7 +273,7 @@ def _line_undiscounted(store, items, choice_catalog, item_prices):
     (total != price*qty), so the only exact merchant-truth anchor is the
     live menu/choices catalog: item original price + choice original prices.
     """
-    if store.vertical != 'restaurants' or type(item_prices) is not dict or type(choice_catalog) is not dict:
+    if store.vertical != 'restaurants' or type(item_prices) is not dict:
         return ()
     result = []
     for x in items:
@@ -282,6 +282,11 @@ def _line_undiscounted(store, items, choice_catalog, item_prices):
             return ()
         line = base * x.quantity
         for cid, cqty, _subs in x.choices:
+            # No choices means no choice catalog is needed. Requiring one for
+            # plain items discarded their menu-price anchor and made net CCX
+            # totals fail the legacy unit-price-times-quantity check.
+            if type(choice_catalog) is not dict:
+                return ()
             choice = choice_catalog.get(cid)
             if type(choice) is not dict or type(choice.get('original_price_minor')) is not int:
                 return ()
@@ -551,7 +556,8 @@ def parse_quote(data, cart, home, body, selection, *, now=None):
             # included in total but not in the per-unit price display). Exact
             # merchant truth is the catalog-undiscounted bound per line.
             bound = undiscounted[cart.items.index(item)]
-            if total > bound:
+            if (total > bound or (not item.choices and
+                    price * item.quantity not in (bound, total))):
                 fail('QUOTE_ITEM_PRICE_MISMATCH')
         elif price * row['quantity'] != total:
             fail('QUOTE_ITEM_PRICE_MISMATCH')
