@@ -43,6 +43,7 @@ RECEIPT_POLL_S = 45
 RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
 RANK = {'unknown': -1, 'placed': 0, 'preparing': 1, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
+TRACKING_PROBLEM_REPEAT_S = 86400
 
 
 def stamp(value=None):
@@ -534,16 +535,29 @@ def transition(result, state, cfg, now):
     if cfg.get('eta') and now > epoch(cfg['eta']) + 300 and state.get('status') not in TERMINAL and not state.get('delay_sent'):
         state['delay_sent'] = True
         events.append({'kind': 'eta_elapsed', 'message': 'Checkout ETA passed by 5 minutes; delivery is not confirmed. This is not proof the order is still undelivered.'})
-    if (result.get('errors') or (current == 'unknown' and not result.get('candidate') and not result.get('aftercare_evidence'))) and now - state.get('coverage_alert_at', 0) > 3600 and now - epoch(cfg['registered_at']) > 600 and state.get('status') not in TERMINAL:
-        state['coverage_alert'] = True
-        state['coverage_alert_at'] = now
-        events.append({'kind': 'tracking_problem', 'errors': result['errors'] or ['no_order_status_evidence']})
+    if (result.get('errors') or (current == 'unknown' and not result.get('candidate') and not result.get('aftercare_evidence'))) and now - epoch(cfg['registered_at']) > 600 and state.get('status') not in TERMINAL:
+        errors = result.get('errors') or ['no_order_status_evidence']
+        # Alert when an error is new at this confirmed stage; errors that persist,
+        # clear or flap (cached mail errors do) repeat at most once a day.
+        keys = [json.dumps([e, state.get('status', 'unknown')]) for e in sorted(set(errors))]
+        alerts = state.get('tracking_problem_alerts') or {}
+        legacy = state.pop('coverage_alert_at', None)
+        if legacy and not alerts and now - legacy <= 7200:
+            # Older state kept only the last hourly alert; recent means this problem is ongoing.
+            alerts = dict.fromkeys(keys, legacy)
+        alerts = {k: v for k, v in alerts.items() if now - v < TRACKING_PROBLEM_REPEAT_S}
+        if any(k not in alerts for k in keys):
+            alerts.update(dict.fromkeys(keys, now))
+            state['coverage_alert'] = True
+            events.append({'kind': 'tracking_problem', 'errors': errors})
+        state['tracking_problem_alerts'] = alerts
     if not state.get('primed'):
         events = []
         # Baseline stage only; overdue/coverage alerts must fire on the next tick.
         state.pop('delay_sent', None)
         state.pop('coverage_alert', None)
         state.pop('coverage_alert_at', None)
+        state.pop('tracking_problem_alerts', None)
         state['primed'] = True
     return events
 

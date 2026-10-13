@@ -51,6 +51,54 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(t.transition(result, state, self.cfg(), time.time()), [])
         self.assertNotEqual(state.get('status'), 'delivered')
 
+    def problem_cfg(self, at):
+        return dict(self.cfg(), app='noon', order='N123', eta=None, registered_at=t.stamp(at - 3600))
+
+    def problems(self, result, state, cfg, at):
+        return [e for e in t.transition(result, state, cfg, at) if e['kind'] == 'tracking_problem']
+
+    def test_same_tracking_problem_alerts_once_per_day(self):
+        at = time.time()
+        cfg, state = self.problem_cfg(at), {}
+        result = lambda: {'status': 'unknown', 'errors': ['native_status_unknown']}
+        self.assertEqual(t.transition(result(), state, cfg, at), [])  # priming tick stays quiet
+        self.assertEqual(self.problems(result(), state, cfg, at + 60),
+                         [{'kind': 'tracking_problem', 'errors': ['native_status_unknown']}])
+        fired = [h for h in range(1, 49) if self.problems(result(), state, cfg, at + 60 + h * 3600)]
+        self.assertEqual(fired, [24, 48])
+
+    def test_changed_tracking_problem_alerts_immediately(self):
+        at = time.time()
+        cfg, state = self.problem_cfg(at), {'primed': True, 'status': 'placed'}
+        first = {'status': 'unknown', 'errors': ['native_status_unknown', 'email_read_unavailable']}
+        self.assertEqual(len(self.problems(first, state, cfg, at)), 1)
+        reordered = dict(first, errors=['email_read_unavailable', 'native_status_unknown'])
+        self.assertEqual(self.problems(reordered, state, cfg, at + 60), [])
+        # A clearing or flapping error is not a new problem.
+        self.assertEqual(self.problems(dict(first, errors=['native_status_unknown']), state, cfg, at + 120), [])
+        self.assertEqual(self.problems(first, state, cfg, at + 180), [])
+        changed = dict(first, errors=['native_auth_expired', 'native_status_unknown'])
+        self.assertEqual(self.problems(changed, state, cfg, at + 240)[0]['errors'], changed['errors'])
+        # A new confirmed stage with the same errors is a new signature.
+        moved = {'status': 'out for delivery', 'errors': ['native_status_unknown']}
+        self.assertEqual(len(self.problems(moved, state, cfg, at + 300)), 1)
+        self.assertEqual(self.problems(moved, state, cfg, at + 3900), [])
+        state['status'] = 'delivered'
+        self.assertEqual(self.problems(changed, state, cfg, at + 4000), [])
+
+    def test_legacy_hourly_alert_state_does_not_refire(self):
+        at = time.time()
+        cfg = self.problem_cfg(at)
+        state = {'primed': True, 'status': 'out for delivery', 'coverage_alert': True,
+                 'coverage_alert_at': at - 3700}
+        result = lambda: {'status': 'unknown', 'errors': ['native_status_unknown']}
+        self.assertEqual(self.problems(result(), state, cfg, at), [])
+        self.assertNotIn('coverage_alert_at', state)
+        self.assertEqual(self.problems(result(), state, cfg, at - 3700 + 86401)[0]['kind'], 'tracking_problem')
+        # A stale legacy alert belonged to an earlier, resolved problem.
+        stale = {'primed': True, 'status': 'placed', 'coverage_alert': True, 'coverage_alert_at': at - 5 * 3600}
+        self.assertEqual(len(self.problems(result(), stale, cfg, at)), 1)
+
     def test_native_partial_delivery_is_preserved_not_whole_completion(self):
         cfg = dict(self.cfg(), app='noon', order='N123')
         native = {'status': 'unknown', 'coverage': 'bounded', 'whole_order_complete': False,

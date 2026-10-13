@@ -37,7 +37,8 @@ stay in Keychain; no raw notification dumps or mail bodies are stored.
 - ID-less delivery-window pushes wake verification, never certify arrival.
 - Email status candidates ranked before body reads, Gmail sender fallback plus
   Moni Inbox, one-day search overlap, 35s total mail budget. Per-account errors
-  named; coverage problems repeat hourly while unresolved.
+  named; a coverage problem alerts when a new error appears or the confirmed
+  stage changes, otherwise it repeats at most daily while unresolved.
 - Amazon package events dedupe per message, do not mark whole-order terminal.
 
 ## Verification
