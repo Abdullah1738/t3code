@@ -7,6 +7,7 @@ import {
   providerThreadFor, robobNativeMessageId, truncate, toMs, hhmm,
 } from './lib/detect.mjs';
 import * as io from './lib/io.mjs';
+import { stallScan } from './lib/stallwatch.mjs';
 
 const SETTLE_MS = 90_000;
 const STALE_HELD_MS = 24 * 3600_000;
@@ -248,8 +249,16 @@ async function scan(opts) {
       }
       report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
     }
+    let stalls = [];
+    if (!opts.seed) {
+      try {
+        stalls = await stallScan({ state, now, dryRun: opts.dryRun, verbose: opts.verbose, log });
+      } catch (err) {
+        log(`stall watch failed: ${err?.message || err}`);
+      }
+    }
     if (!opts.dryRun) { state.lastScan = new Date(now).toISOString(); io.saveState(state, now); }
-    if (opts.json) console.log(JSON.stringify(report, null, 2));
+    if (opts.json) console.log(JSON.stringify({ incidents: report, stalls }, null, 2));
   } finally {
     release();
   }
@@ -260,6 +269,9 @@ function status() {
   console.log(`last scan: ${state.lastScan || 'never'}`);
   for (const [id, h] of Object.entries(state.handled).sort()) {
     console.log(`${id}  ${h.done ? 'done' : 'retrying'}  ${h.at}  ${h.summary || ''}`);
+  }
+  for (const [id, s] of Object.entries(state.stalls).sort()) {
+    console.log(`${id}  ${s.done ? s.outcome : 'following up'}  ${s.at}  ${s.summary || `${s.action} | ${s.title}`}`);
   }
 }
 

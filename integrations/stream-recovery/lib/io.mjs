@@ -162,6 +162,19 @@ export async function sendToThread(threadId, text, { clientRequestId, mode = "au
   return ctl("POST", `/threads/${encodeURIComponent(threadId)}/send`, { text, mode, clientRequestId });
 }
 
+export async function threadByNative(ses) {
+  try {
+    return (await ctl("GET", `/threads/by-native/${encodeURIComponent(ses)}`)).thread ?? null;
+  } catch (e) {
+    if (e.status === 404) return null;
+    throw e;
+  }
+}
+
+export async function interruptThread(threadId, { clientRequestId, reason } = {}) {
+  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason });
+}
+
 // Orchestration command over the Robob WebSocket RPC (same path the web app uses).
 export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
   const { url, token } = control();
@@ -245,6 +258,25 @@ export async function ocForms(ses) {
   return (await oc(`/api/session/${ses}/form`))?.data ?? [];
 }
 
+export async function ocPermissions(ses) {
+  return (await oc(`/api/session/${ses}/permission`))?.data ?? [];
+}
+
+// Newest messages only (newest first), for the stall watch.
+export async function ocTail(ses, limit = 2) {
+  return (await oc(`/api/session/${ses}/message?limit=${limit}`))?.data ?? null;
+}
+
+export async function ocChildren(ses) {
+  return ((await oc(`/api/session?parentID=${encodeURIComponent(ses)}&limit=200`))?.data ?? []).map((s) => s.id);
+}
+
+// Returns true when OpenCode stopped an active execution, false when idle.
+export async function ocInterrupt(ses) {
+  const res = await oc(`/api/session/${ses}/interrupt`, { method: "POST" });
+  return Boolean(res?.interrupted ?? res?.data?.interrupted);
+}
+
 // ---------- Telegram ----------
 
 export function telegram({ text, severity = "info", key }) {
@@ -263,15 +295,17 @@ export function telegram({ text, severity = "info", key }) {
 const statePath = () => join(PATHS.dataDir, "state.json");
 
 export function loadState() {
-  if (!existsSync(statePath())) return { handled: {}, lastScan: null };
+  if (!existsSync(statePath())) return { handled: {}, lastScan: null, watch: {}, stalls: {} };
   const s = parse(readFileSync(statePath(), "utf8"));
-  return { handled: s.handled ?? {}, lastScan: s.lastScan ?? null };
+  return { handled: s.handled ?? {}, lastScan: s.lastScan ?? null, watch: s.watch ?? {}, stalls: s.stalls ?? {} };
 }
 
 export function saveState(state, now = Date.now()) {
   mkdirSync(PATHS.dataDir, { recursive: true });
-  for (const [id, v] of Object.entries(state.handled)) {
-    if (now - Date.parse(v.at) > 14 * 86_400_000) delete state.handled[id];
+  for (const key of ["handled", "stalls"]) {
+    for (const [id, v] of Object.entries(state[key] ?? {})) {
+      if (now - Date.parse(v.at) > 14 * 86_400_000) delete state[key][id];
+    }
   }
   const tmp = `${statePath()}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2));

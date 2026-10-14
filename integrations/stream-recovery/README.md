@@ -34,6 +34,38 @@ block every later queued message.
 Handled incidents are recorded in `~/.local/share/stream-recovery/data/state.json`.
 An incident that hit errors is retried on later scans, up to 3 attempts.
 
+## Stall watch
+
+Every scan also checks the sessions OpenCode reports as running
+(`/api/session/active`) for ones that stopped moving without failing, e.g. a
+model stream that died mid tool call and left the session "running" for hours.
+
+- It fingerprints each session's newest two messages. Text and reasoning parts
+  carry no timestamps, so the quiet clock starts at the later of the first
+  scan that saw the current fingerprint and the newest timestamp in it. A
+  freshly started watcher therefore needs a full limit before it acts, and a
+  dry run against a scratch state dir never finds a stall.
+- Limits: 30 min when waiting on the model (twice the opus `chunkTimeout`). A
+  running shell gets its own `timeout` (default 2 min) plus 30 min, or 8h when
+  its timeout is off. Other running tools and subagents get 2h, since a running
+  tool's output never shows up in the message. Sessions waiting on a question,
+  form or permission are never touched, and neither is a parent whose subagent
+  session is still active.
+- A stuck session that is its Robob thread's current session is interrupted
+  through Robob (`POST /threads/:id/interrupt`). If OpenCode is still running
+  2 min later, it is interrupted in OpenCode directly. When Robob has no run to
+  stop, OpenCode is interrupted right away. Subagent sessions, unmapped
+  sessions and old sessions of a thread that moved on are interrupted in
+  OpenCode only.
+- Once Robob's run and OpenCode's session have both let go, a thread whose run
+  was interrupted gets a note telling it to carry on. crw, iMessage and
+  archived threads get none (crw nudges its own jobs once they are idle).
+- One Telegram summary per stall (`stream-recovery:st-<ses>-<quiet start>`):
+  info when cleared, error when it is still stuck 10 min after the interrupt.
+  After 3 interrupts of one session in 24h it only reports.
+
+Stalls are kept in the same state file (`watch`, `stalls`).
+
 ## Commands
 
 ```bash
@@ -42,7 +74,8 @@ node cli.mjs status
 ```
 
 - `--dry-run` shows the plan without sending anything or touching state.
-- `--seed` marks every incident found as handled without acting.
+- `--seed` marks every incident found as handled without acting, and skips the
+  stall watch.
 - Use `STREAM_RECOVERY_DATA=<dir>` to dry-run against a scratch state dir.
 
 ## Install
