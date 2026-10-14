@@ -12,8 +12,8 @@ item_id is a positive int (number or numeric string) for restaurants and a
 UUID string for mart/shops. Notes are exact Unicode with no local length
 cap (control characters are rejected; the server governs real limits).
 Choices are restaurant-only and must reference option ids the live menu
-exposes; only empty sub-choice lists are accepted until a nested payload is
-observed. No invented count/quantity/spending ceilings: provider schema and
+exposes. sub_choice_ids selects immediate children of that option, each once.
+No invented count/quantity/spending ceilings: provider schema and
 exact readback validation govern.
 """
 import re
@@ -67,10 +67,11 @@ def _parse_choices(raw, *, vertical):
             subs = []
         if type(subs) is not list:
             _fail('FOOD_ITEM_CHOICES_INVALID')
-        if subs:
-            # Nested sub-choice payload is not observed on the wire; never guess.
-            _fail('FOOD_SUBCHOICES_UNPROVEN')
-        choices.append((choice_id, quantity, ()))
+        if any(type(s) is not int or not 0 < s < 2**63 for s in subs):
+            _fail('FOOD_ITEM_CHOICES_INVALID')
+        if len(set(subs)) != len(subs):
+            _fail('FOOD_SUBCHOICE_DUPLICATED_IN_LINE')
+        choices.append((choice_id, quantity, tuple(sorted(subs))))
     if len({cid for cid, _quantity, _subs in choices}) != len(choices):
         _fail('FOOD_CHOICE_DUPLICATED_IN_LINE')
     return tuple(choices)

@@ -119,7 +119,11 @@ def talabat_discovery(args):
         if item is None:
             journal.fail('EXACT_CATALOG_ITEM_UNAVAILABLE')
         choices=fetch_item_choices(checkout,args.branch,item_id)
-        result.update(item=asdict(item),choices=asdict(choices))
+        result.update(item=asdict(item),choices=asdict(choices),choice_selection={
+            'choice_id':'sections[].options[].option_id',
+            'sub_choice_ids':'selected option.sub_categories[].options[].option_id',
+            'nested_depth_supported':1,'nested_parent_quantity_supported':1,
+            'child_quantity':1,'required_sections_enforced':True})
     return result
 
 
@@ -156,7 +160,9 @@ def capabilities():
             'item_notes':'exact_cart_quote_readback_live_verified_2026_10_11',
             'item_note_purchase_live_verified':True,'food_choices_supported':True,
             'food_choices_cart_live_verified':True,'food_choices_purchase_live_verified':True,
-            'nested_subchoices_supported':False,'multi_item_baskets':True,
+            'nested_subchoices_supported':True,'nested_subchoices_depth':1,
+            'nested_subchoices_cart_live_verified':True,
+            'nested_subchoices_purchase_live_verified':False,'multi_item_baskets':True,
             'multi_item_cart_live_verified':True,'multi_item_purchase_live_verified':True}},
         'talabat_order_scope':'arbitrary_catalog_items_and_multiple_lines',
         'spending_policy':'caller_managed_no_cli_order_or_campaign_cap',

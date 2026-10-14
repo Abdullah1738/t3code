@@ -96,8 +96,8 @@ class ChoiceCatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(orders.TalabatError, 'FOOD_CHOICE_DUPLICATED_IN_LINE'):
             mc.validate_line_choices(item, ((549025015, 1, ()), (549025015, 1, ()),
                                             (549025100, 1, ())))
-        # Non-empty sub-choices are unproven on the wire.
-        with self.assertRaisesRegex(orders.TalabatError, 'FOOD_SUBCHOICES_UNPROVEN'):
+        # A top-level option is not a child of a different option.
+        with self.assertRaisesRegex(orders.TalabatError, 'MENU_SUBCHOICE_UNKNOWN_FOR_PARENT'):
             mc.validate_line_choices(item, ((549025015, 1, (549025100,)), (549025100, 1, ())))
         # Zero/invalid quantities.
         for bad in (((549025015, 0, ()), (549025100, 1, ())), ((549025015, True, ()), (549025100, 1, ()))):

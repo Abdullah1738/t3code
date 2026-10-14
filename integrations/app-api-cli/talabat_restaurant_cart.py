@@ -141,7 +141,7 @@ def _manifest(items, item_notes=()):
                 _fail('FOOD_ITEM_CHOICES_INVALID')
         if len({c[0] for c in choices}) != len(choices):
             _fail('FOOD_CHOICE_DUPLICATED_IN_LINE')
-        key = (item_id, note, tuple(sorted((c[0], c[1]) for c in choices)))
+        key = (item_id, note, tuple(sorted((c[0], c[1], tuple(sorted(c[2]))) for c in choices)))
         if key in lines:
             previous = lines[key]
             lines[key] = (item_id, previous[1] + quantity, note, choices)
@@ -154,9 +154,9 @@ def _manifest(items, item_notes=()):
 def choices_echo(row):
     """Structurally validate one cart echo row's choices fields.
 
-    Returns (choice_id list, {id: details row}, choicesString). The echo must
-    carry the plain int id list and matching details rows; ids without a
-    detail row (or the reverse) are corrupt, not a different item.
+    Returns (flattened id list, {parent id: details row}, choicesString).
+    Native children are nested in subChoicesDetails, but included in the
+    flattened choices list. Both representations must agree exactly.
     """
     ids = row.get('choices')
     details = row.get('choicesDetails')
@@ -169,13 +169,19 @@ def choices_echo(row):
     if len(set(ids)) != len(ids) or type(details) is not list:
         _fail('FOOD_CART_ECHO_CHOICES_INVALID')
     per = {}
+    seen = set()
     for detail in details:
         if (type(detail) is not dict or not _positive(detail.get('id'))
                 or type(detail.get('quantity')) is not int or detail['quantity'] < 1
-                or detail['id'] in per):
+                or detail['id'] in seen):
             _fail('FOOD_CART_ECHO_CHOICES_INVALID')
         per[detail['id']] = detail
-    if set(per) != set(ids):
+        seen.add(detail['id'])
+        for child in _sub_details(detail).values():
+            if child['id'] in seen:
+                _fail('FOOD_CART_ECHO_CHOICES_INVALID')
+            seen.add(child['id'])
+    if seen != set(ids):
         _fail('FOOD_CART_ECHO_CHOICES_INVALID')
     label = row.get('choicesString')
     if type(label) is not str and label is not None:
@@ -185,6 +191,27 @@ def choices_echo(row):
     if not ids and label not in (None, ''):
         _fail('FOOD_CART_ECHO_CHOICES_INVALID')
     return ids, per, label
+
+
+def _sub_details(detail):
+    rows = detail.get('subChoicesDetails', [])
+    if type(rows) is not list:
+        _fail('FOOD_CART_ECHO_CHOICES_INVALID')
+    result = {}
+    for row in rows:
+        if (type(row) is not dict or not _positive(row.get('id'))
+                or type(row.get('quantity')) is not int or row['quantity'] < 1
+                or row['id'] in result or row.get('subChoicesDetails', []) != []):
+            _fail('FOOD_CART_ECHO_CHOICES_INVALID')
+        result[row['id']] = row
+    return result
+
+
+def _check_choice_name(detail, info):
+    names = detail.get('localeNames')
+    english = [n.get('value') for n in names if type(n) is dict and n.get('locale') == 'en'] if type(names) is list else []
+    if info is None or english != [info['name']]:
+        _fail('FOOD_CART_ECHO_CHOICES_INVALID')
 
 
 def choices_echo_matches(row, expected_choices, catalog=None):
@@ -198,19 +225,22 @@ def choices_echo_matches(row, expected_choices, catalog=None):
     expected = {c[0]: c[1] for c in expected_choices}
     if expected != {cid: detail['quantity'] for cid, detail in per.items()}:
         return False
+    for choice_id, _quantity, subs in expected_choices:
+        children = _sub_details(per[choice_id])
+        if {sid: 1 for sid in subs} != {sid: detail['quantity'] for sid, detail in children.items()}:
+            return False
     if catalog is not None:
         for cid, detail in per.items():
             info = catalog.get(cid)
             if info is None or detail.get('itemChoiceSectionId') != info['section_id']:
                 _fail('FOOD_CART_ECHO_CHOICES_INVALID')
-            names = detail.get('localeNames')
-            en = None
-            if type(names) is list:
-                for name in names:
-                    if type(name) is dict and name.get('locale') == 'en':
-                        en = name.get('value')
-            if en != info['name']:
-                _fail('FOOD_CART_ECHO_CHOICES_INVALID')
+            _check_choice_name(detail, info)
+            for sid, child in _sub_details(detail).items():
+                child_info = info.get('sub_choices', {}).get(sid)
+                _check_choice_name(child, child_info)
+                # Native child rows omit section id; when present it must agree.
+                if 'itemChoiceSectionId' in child and child['itemChoiceSectionId'] != child_info['section_id']:
+                    _fail('FOOD_CART_ECHO_CHOICES_INVALID')
     return True
 
 
@@ -362,13 +392,19 @@ def read_owned_cart(get_json, owned, allowed_totals=(), choice_catalog=None):
 
 def _seed_row(menu_id, line_id, quantity, note, choices, catalog):
     details = []
-    for choice_id, choice_quantity, _subs in choices:
+    for choice_id, choice_quantity, subs in choices:
         info = (catalog or {}).get(choice_id)
+        children = []
+        for sid in subs:
+            child = (info or {}).get('sub_choices', {}).get(sid)
+            children.append({'id': sid, 'quantity': 1,
+                             'localeNames': [{'locale': 'en', 'value': child['name']}] if child else []})
         details.append({'id': choice_id, 'quantity': choice_quantity,
+                        'subChoicesDetails': children,
                         'itemChoiceSectionId': info['section_id'] if info else 0,
                         'localeNames': [{'locale': 'en', 'value': info['name']}] if info else []})
     row = {'menuItemId': menu_id, 'id': line_id, 'quantity': quantity,
-           'specialRequest': note, 'choices': [c[0] for c in choices],
+           'specialRequest': note, 'choices': [cid for c in choices for cid in (c[0], *c[2])],
            'choicesDetails': details}
     if details:
         # The synthetic label only needs to be nonempty when choices exist;

@@ -70,7 +70,7 @@ class BasketShapeTests(unittest.TestCase):
             self.assertEqual(parse_items([row], vertical='restaurants'), (h.Item(1, 1),))
         for choices in (549025015, [{'choice_id': 549025015, 'oops': 1}], ['549025015'],
                         [{'choice_id': 'x'}], [{'choice_id': 0}], [{'choice_id': 549025015, 'quantity': 0}],
-                        [{'choice_id': 549025015, 'sub_choice_ids': [1]}],
+                        [{'choice_id': 549025015, 'sub_choice_ids': [True]}],
                         [{'choice_id': 549025015}, {'choiceId': 549025015}]):
             with self.subTest(choices=choices), self.assertRaises(orders.TalabatError):
                 parse_items([{'item_id': 1, 'choices': choices}], vertical='restaurants')

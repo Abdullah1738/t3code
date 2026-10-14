@@ -153,7 +153,9 @@ class ItemNoteContractTests(unittest.TestCase):
         parsed = h.parse_quote(quote, cart, home, body, selection)
         review = h.project_quote(parsed)
         self.assertEqual(review['item_choices'], [{'item_id': 12345, 'quantity': 2, 'note': '',
-                                                   'choices': [{'choice_id': CHOICE_ID, 'quantity': CHOICE_QTY}]}])
+                                                   'choices_label': CHOICE_NAME,
+                                                   'choices': [{'choice_id': CHOICE_ID, 'quantity': CHOICE_QTY,
+                                                                'sub_choice_ids': []}]}])
         for label in ('', 'Wrong topping', None):
             bad = copy.deepcopy(quote)
             bad['checkout']['cart']['items'][0]['choicesString'] = label
@@ -357,16 +359,16 @@ class ItemNoteFlowTests(unittest.TestCase):
         items = (h.Item(12345,2,note=NOTE,choices=((CHOICE_ID,1,()),)), h.Item(12346,1))
         self.raw['cart']['items'][0].update(choice_echo_row(), id=333, quantity=2, specialRequest=NOTE)
         self.raw['cart']['items'].append({'id':334,'menuItemId':12346,'quantity':1,'specialRequest':''})
-        # Catalog-truth pricing: 2x25.00 item + 16.00 choice, 1x18.00 tea.
+        # Each of the 2x25.00 items carries its 16.00 choice, plus 1x18.00 tea.
         self.quote['checkout']['cart']['items'][0].update(
-            id='333', quantity=2, price='25.00', total='66.00', specialRequest=NOTE, choicesString=CHOICE_NAME)
+            id='333', quantity=2, price='25.00', total='82.00', specialRequest=NOTE, choicesString=CHOICE_NAME)
         self.quote['checkout']['cart']['items'].append(
             {'id':'334','quantity':1,'price':'18.00','total':'18.00','specialRequest':'','choicesString':''})
         self.quote['checkout']['paymentSummary']['items'] = [
-            {'type':'SubTotal','amount':84},{'type':'DeliveryFee','amount':3},
-            {'type':'ServiceFee','amount':2},{'type':'Total','amount':89}]
-        self.quote['checkout']['amount'] = 89
-        self.raw['cart']['totalValue'] = 84
+            {'type':'SubTotal','amount':100},{'type':'DeliveryFee','amount':3},
+            {'type':'ServiceFee','amount':2},{'type':'Total','amount':105}]
+        self.quote['checkout']['amount'] = 105
+        self.raw['cart']['totalValue'] = 100
         menu_section = self.menu['menu']['result']['menu']['menuSection'][0]
         menu_section['itm'][0].update(icc=True, pr=25, opr=25)
         self.menu_choices = {'result': {'choiceForItem': [{'itemId': '12345', 'choiceSections': [{
@@ -381,7 +383,7 @@ class ItemNoteFlowTests(unittest.TestCase):
         with patch.object(h,'_wire',side_effect=wire_with_choices):
             flow = self.flow(items=items)
             review = flow.prepare(verticals_key=KEY)
-        self.assertEqual(review['item_choices'][0]['choices'],[{'choice_id':CHOICE_ID,'quantity':1}])
+        self.assertEqual(review['item_choices'][0]['choices'],[{'choice_id':CHOICE_ID,'quantity':1,'sub_choice_ids':[]}])
         self.assertTrue(any('/menubff/v3/' in p for _,p,_ in self.calls))
 
     def test_conflicting_menu_names_refused_before_cart_creation(self):

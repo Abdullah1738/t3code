@@ -174,7 +174,7 @@ class Item:
 
 
 def _choices_key(item):
-    return tuple(sorted((c[0], c[1]) for c in item.choices))
+    return tuple(sorted((c[0], c[1], tuple(sorted(c[2]))) for c in item.choices))
 
 
 def _items(store, items):
@@ -228,7 +228,7 @@ def cart_body(store, home, items):
         # f1dea8/f1e1b8; Rider is the native delivery-mode literal, not Delivery.
         # choices rows are the OBSERVED native payload (2026-10-11 capture):
         # choiceId is the chosen option id from ich[], with its own quantity
-        # and an empty subChoiceIds list.
+        # and immediate child option ids (Latea capture, 2026-10-14).
         return {'branchId': store.branch_id, 'countryId': 4, 'areaId': home['area_id'],
                 'deliveryInformation': {'deliveryMode': 'Rider', 'latitude': float(home['latitude']),
                                         'longitude': float(home['longitude'])},
@@ -281,7 +281,7 @@ def _line_undiscounted(store, items, choice_catalog, item_prices):
         if type(base) is not int or base < 0:
             return ()
         line = base * x.quantity
-        for cid, cqty, _subs in x.choices:
+        for cid, cqty, subs in x.choices:
             # No choices means no choice catalog is needed. Requiring one for
             # plain items discarded their menu-price anchor and made net CCX
             # totals fail the legacy unit-price-times-quantity check.
@@ -290,7 +290,14 @@ def _line_undiscounted(store, items, choice_catalog, item_prices):
             choice = choice_catalog.get(cid)
             if type(choice) is not dict or type(choice.get('original_price_minor')) is not int:
                 return ()
-            line += choice['original_price_minor'] * cqty
+            # Choice quantity is per item, just like specialRequest; every
+            # unit on a multi-quantity line carries the same customization.
+            line += choice['original_price_minor'] * cqty * x.quantity
+            for sub_id in subs:
+                child = choice.get('sub_choices', {}).get(sub_id)
+                if type(child) is not dict or type(child.get('original_price_minor')) is not int:
+                    return ()
+                line += child['original_price_minor'] * x.quantity
         result.append(line)
     return tuple(result)
 
@@ -1141,7 +1148,7 @@ class Checkout:
             if item.choices and not entry.customizable:
                 fail('MENU_ITEM_NOT_CUSTOMIZABLE')
         catalog = {}
-        for menu_id in sorted({x.item_id for x in items if x.choices}):
+        for menu_id in sorted({x.item_id for x in items if index.get(x.item_id).customizable}):
             item_choices = menu_choices.fetch_item_choices(self, branch_id, menu_id)
             for item in items:
                 if item.item_id == menu_id:
@@ -1153,7 +1160,7 @@ class Checkout:
         # truth; items without a usable original price simply disable that
         # anchor (e.g. create-your-own rows priced through choices only).
         prices = {entry.item_id: entry.original_price_minor for entry in index.entries.values()
-                  if type(entry.original_price_minor) is int and entry.original_price_minor > 0}
+                  if type(entry.original_price_minor) is int and entry.original_price_minor >= 0}
         if prices:
             self._item_prices = {**(self._item_prices or {}), **prices}
         return Store('restaurants', branch_id, 0, False)
@@ -1358,6 +1365,8 @@ def project_quote(quote):
                                 for x in quote.cart.items if x.note]
     if any(x.choices for x in quote.cart.items):
         review['item_choices'] = [{'item_id':x.item_id, 'quantity':x.quantity, 'note':x.note,
-                                   'choices':[{'choice_id':c[0], 'quantity':c[1]} for c in x.choices]}
-                                  for x in quote.cart.items if x.choices]
+                                   'choices':[{'choice_id':c[0], 'quantity':c[1],
+                                               'sub_choice_ids':list(c[2])} for c in x.choices],
+                                   'choices_label':quote.cart.line_choice_labels[index]}
+                                  for index,x in enumerate(quote.cart.items) if x.choices]
     return review

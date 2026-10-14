@@ -193,9 +193,9 @@ class QuoteParserDefectTests(unittest.TestCase):
         body = h.prepare_body(cart.store, home, features={'paySupportsTPro': False})
         self.assertEqual(h.parse_quote(quote_data, replace(cart, line_undiscounted=anchor),
                                       home, body, None).amount_minor, 2560)
-        # No general 'missing price means free' shortcut. Unproved original
-        # prices of paid choices remain unknown, not invented list prices.
-        for price, original in ((None, -1), (1, -1), (0, None), (0, -2), (0, False)):
+        # No general 'missing price means free' shortcut. Only the explicit
+        # no-original-price sentinel can use a valid current price.
+        for price, original in ((None, -1), (0, None), (0, -2), (0, False)):
             with self.subTest(price=price, original=original):
                 raw = copy.deepcopy(data)
                 raw['result']['choiceForItem'][0]['choiceSections'][0]['ich'][0].update(pr=price, opr=original)
@@ -230,7 +230,7 @@ class QuoteParserDefectTests(unittest.TestCase):
                 quote = h.parse_quote(data, cart, home, body, selection)
                 self.assertEqual(quote.amount_minor, 2560)
                 self.assertEqual(h.project_quote(quote)['item_choices'][0]['choices'],
-                                 [{'choice_id': 3739746913, 'quantity': 1}])
+                                 [{'choice_id': 3739746913, 'quantity': 1, 'sub_choice_ids': []}])
 
     def test_right_bite_fee_and_discount_reconciliation_stays_exact(self):
         for change in ('unknown_fee', 'duplicate_fee', 'duplicate_discount', 'fee_wrong',

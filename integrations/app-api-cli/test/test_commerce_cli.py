@@ -29,7 +29,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(food['food_choices_supported'])
         self.assertTrue(food['food_choices_cart_live_verified'])
         self.assertTrue(food['food_choices_purchase_live_verified'])
-        self.assertFalse(food['nested_subchoices_supported'])
+        self.assertTrue(food['nested_subchoices_supported'])
+        self.assertEqual(food['nested_subchoices_depth'],1)
+        self.assertTrue(food['nested_subchoices_cart_live_verified'])
+        self.assertFalse(food['nested_subchoices_purchase_live_verified'])
         self.assertTrue(food['multi_item_baskets'])
         self.assertTrue(food['multi_item_purchase_live_verified'])
         for vertical in ('mart','shops'):

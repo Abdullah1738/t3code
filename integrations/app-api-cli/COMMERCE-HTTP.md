@@ -60,9 +60,14 @@ All seven lanes accept `--items-file FILE` (or `-` for stdin), a JSON array or
 - Main/Supermall: `{"sku_config":"SKU_CONFIG","quantity":1}`.
 - Talabat: `{"item_id":ITEM_ID,"quantity":1}`, with grocery UUIDs or food integer
   IDs. Restaurants additionally accept `note` and `choices` rows of
-  `{"choice_id":CHOICE_ID,"quantity":1,"sub_choice_ids":[]}`. Resolve choices from
+  `{"choice_id":CHOICE_ID,"quantity":1,"sub_choice_ids":[CHILD_OPTION_ID]}`. Resolve choices from
   the exact live menu; required groups, selection cardinality and quantities are
-  validated. Nonempty nested subchoices are unproved and refused, not guessed.
+  validated for the selected parent. Child IDs come from that option's
+  `sub_categories[].options`, each selected once. One child level with parent
+  quantity 1 is supported; deeper descendants and nested parent quantities >1
+  remain unproved and reject. Item quantity may exceed 1. Cart IDs, nested
+  parent/child echo, names, quantities, quote labels and paid child costs must
+  all reconcile. Same-item lines with different child choices stay distinct.
 
 Many items stay in one checkout/flow; do not silently split a requested basket.
 Unverified merchant variants, modifiers and scheduled slots still require an

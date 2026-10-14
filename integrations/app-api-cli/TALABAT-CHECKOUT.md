@@ -1,12 +1,28 @@
 # Talabat checkout — contract research and historical observations
 
-## Current implementation (11 October 2026)
+## Current implementation (14 October 2026)
 
 The disabled-adapter and test-scope statements in the dated research below are
 historical, not current CLI restrictions. `commerce order talabat` now supports
 arbitrary catalog items and multiple lines in Mart, Shops and Restaurants via
-`--items-file`. Restaurants support live-menu-validated basic choices/add-ons
-and exact item notes; nonempty nested subchoices remain unproved and rejected.
+`--items-file`. Restaurants support live-menu-validated choices/add-ons,
+one-level nested subchoices and exact item notes. `sub_choice_ids` contains
+integer option IDs from the selected parent's `sub_categories`; required and
+optional child groups obey their live bounds. Empty required groups fail before
+cart creation with `MENU_SUBCHOICE_SECTION_BOUNDS_FAILED`. Nested parent quantity
+must be 1; deeper child groups remain unsupported. Item quantity may exceed 1.
+The native payload uses `subChoiceIds`, while cart echoes flatten IDs in `choices`
+and retain parent ownership in `choicesDetails[].subChoicesDetails`. Verify both.
+Native numeric `opr:-1` uses the valid current price as the original-price anchor
+for both items and paid/free choices. Choice costs apply to every item unit.
+Prepare-only proof: two Large Peach Iced Teas at Dunkin676187, AED42 subtotal /
+AED44.10 payable, exact quiet quote and cart readback, then abandoned; no purchase.
+Nested prepare-only proof (14 October): Latea745022 Brown Sugar Boba With Milk,
+two Cold700ml with 50% Sugar + paid Crystal Jelly, plus a separate Cold700ml with
+25% Sugar. Two distinct rows, three units, AED65.25 payable; initial and quiet
+quotes plus fresh owned-cart GET verified. Flow2399abbe-4ca8-44d0-9c08-884cbf1b086e
+was cleared with captured per-line quantity-zero PUTs, empty cart GET verified,
+then released. No order or payment was sent; nested paid-order proof is pending.
 There are no local category/count/quantity/spending-policy caps. Caller agents
 enforce authorization and budgets; exact Home/card5542/quiet, merchant constraints,
 foreign-cart ownership and financial-at-most-once checks remain mandatory.
