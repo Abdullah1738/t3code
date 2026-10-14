@@ -4618,6 +4618,75 @@ it.layer(layerSharedApplicationDataPlaneTest)("visited projection", (it) => {
   );
 });
 
+it.layer(Layer.fresh(layerSharedApplicationDataPlaneTest))("compact read-state events", (it) => {
+  it.effect("keeps the activity-bearing event a later visit would otherwise supersede", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("compact-read-state");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("compact-read-state-create"),
+        threadId,
+        projectId: ProjectId.make("compact-read-state-project"),
+        title: "Read state",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+
+      // A later visit is read state only: clients keep updatedAt from the
+      // rename, so compaction must keep the rename. Two visits supersede each
+      // other, and a later rename supersedes a visit.
+      const threadEvents = () => sql<{ event_type: string }>`
+        SELECT event_type FROM orchestration_events
+        WHERE stream_id = ${threadId}
+          AND event_type IN ('thread.metadata-updated', 'thread.visited')
+        ORDER BY sequence
+      `;
+      yield* orchestrator.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make("compact-read-state-rename"),
+        threadId,
+        title: "Renamed before visit",
+      });
+      for (const [commandId, visitedAt] of [
+        ["compact-read-state-visit", "2026-10-13T14:00:00.000Z"],
+        ["compact-read-state-visit-again", "2026-10-13T15:00:00.000Z"],
+      ] as const) {
+        yield* orchestrator.dispatch({
+          type: "thread.visit",
+          commandId: CommandId.make(commandId),
+          threadId,
+          visitedAt,
+        });
+      }
+      yield* maintenance.compactEventStore;
+      assert.deepEqual(
+        (yield* threadEvents()).map((row) => row.event_type),
+        ["thread.metadata-updated", "thread.visited"],
+      );
+      yield* orchestrator.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make("compact-read-state-rename-again"),
+        threadId,
+        title: "Renamed after visit",
+      });
+      yield* maintenance.compactEventStore;
+      assert.deepEqual(
+        (yield* threadEvents()).map((row) => row.event_type),
+        ["thread.metadata-updated"],
+      );
+      assert.isTrue((yield* maintenance.rebuild).valid);
+    }),
+  );
+});
+
 it.layer(layerSharedApplicationDataPlaneTest)("shared application data plane", (it) => {
   it.effect("orders retained project transactions and V2 thread transactions in one source", () =>
     Effect.gen(function* () {
