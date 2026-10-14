@@ -555,6 +555,26 @@ def binding(flow_id):
                 'account_hash': row['account_hash'], 'scope_hash': row['scope_hash']}
 
 
+def completed_order_binding(*, app, vertical, account_hash, order_id):
+    """Attribute an exact account/order to its completed flow; no state changes.
+
+    Remote fulfilment may still be active after payment, exact confirmation and
+    tracker registration completed locally. Unknown, released, wrong-lane and
+    unfinished orders cannot use this evidence to permit another checkout.
+    """
+    if (type(app) is not str or app not in VERTICALS or type(vertical) is not str
+            or vertical not in VERTICALS[app] or not _hash(account_hash)
+            or not _order(order_id)):
+        fail('JOURNAL_ORDER_LOOKUP_INVALID')
+    with _db() as db:
+        row = db.execute(
+            'SELECT f.id,f.scope_hash FROM orders o JOIN flows f ON f.id=o.flow_id '
+            'AND f.app=o.app AND f.account_hash=o.account_hash AND f.order_id=o.order_id '
+            "WHERE o.app=? AND o.account_hash=? AND o.order_id=? AND f.vertical=? AND f.state='COMPLETE'",
+            (app, account_hash, order_id, vertical)).fetchone()
+        return {'flow_id': row['id'], 'scope_hash': row['scope_hash']} if row is not None else None
+
+
 def flow_created_at(flow_id):
     """Creation time for lane-local expiry windows (e.g. 24h resume limits)."""
     with _db() as db:

@@ -595,7 +595,7 @@ class NowNowCheckout:
         return self._call('payment_subscription_list', {}, timeout, project=project)
 
     def home(self, *, timeout=12):
-        """Order homepage readback; any active order blocks a new place."""
+        """Order homepage readback; the coordinator checks journal attribution."""
         def project(data):
             row = _data(data)
             active = row.get('active')

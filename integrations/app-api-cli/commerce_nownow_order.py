@@ -286,12 +286,27 @@ class NowNowOrderFlow:
         return True
 
     # -- guards -------------------------------------------------------------
-    def guard(self, *, timeout=25):
-        """Active order or existing store cart blocks a new place."""
+    def guard_active_orders(self, *, timeout=25):
+        """Allow only completed, attributed purchases for a distinct scope."""
         active = self.client.home(timeout=timeout).projection['active_orders']
-        if active:
-            print(json.dumps({'phase': 'active_order_blocker', 'active_orders': active}), flush=True)
+        blockers = []
+        for order in active:
+            binding = journal.completed_order_binding(
+                app='noon', vertical='nownow', account_hash=self.account_hash,
+                order_id=order['order'])
+            # scope_hash includes store, products, quantities and verified home.
+            # A paid but still-in-flight duplicate remains blocked. Remote status
+            # alone never proves that a prior financial send was reconciled.
+            if binding is None or binding['scope_hash'] == self.scope_hash:
+                blockers.append(order)
+        if blockers:
+            print(json.dumps({'phase': 'active_order_blocker', 'active_orders': blockers}), flush=True)
             _fail('NOWNOW_ACTIVE_ORDER_PRESENT')
+        return active
+
+    def guard(self, *, timeout=25):
+        """Unresolved/duplicate active order or existing store cart blocks."""
+        active = self.guard_active_orders(timeout=timeout)
         carts = self.client.recent_carts(timeout=timeout).projection['carts']
         stores = {row.get('store_code') for row in carts if not row.get('empty')}
         if self.store_code in stores:
@@ -299,7 +314,7 @@ class NowNowOrderFlow:
             _fail('NOWNOW_STORE_CART_PRESENT')
         self.card = saved_card(self.client, timeout=timeout)
         corroborate_token(self.client, self.card, timeout=timeout)
-        return {'active_orders': 0, 'store_cart_clear': True,
+        return {'active_orders': len(active), 'store_cart_clear': True,
                 'card_last4': '5542', 'token_corroborated': True}
 
     # -- lifecycle ----------------------------------------------------------
@@ -639,17 +654,14 @@ class NowNowOrderFlow:
     def prepare_only(self, *, timeout=25):
         """Build and review the exact basket, then STOP before any financial send.
 
-        Fresh flow: full guard (no active orders, no foreign store cart) ->
+        Fresh flow: full guard (attributed distinct orders, no foreign store cart) ->
         create + per-line edits -> validate -> card -> quiet -> final
         readback review. Resumed flow: consumed writes are never re-sent; the
         live store session is adopted read-only and must match the exact
         manifest. place() stays unauthorised; the flow remains ACTIVE.
         """
         consumed = self.consumed() if self.opened else set()
-        active = self.client.home(timeout=timeout).projection['active_orders']
-        if active:
-            print(json.dumps({'phase': 'active_order_blocker', 'active_orders': active}), flush=True)
-            _fail('NOWNOW_ACTIVE_ORDER_PRESENT')
+        self.guard_active_orders(timeout=timeout)
         if self.card is None:
             self.card = saved_card(self.client, timeout=timeout)
             corroborate_token(self.client, self.card, timeout=timeout)

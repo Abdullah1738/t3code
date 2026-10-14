@@ -16,8 +16,11 @@ tests: `test/test_commerce_nownow_order.py`.
 
 ## Lane lifecycle (every mutation journalled at-most-once)
 
-1. **Guard** (reads only): `GET v1/order/homepage` → any `active[]` order blocks
-   (`NOWNOW_ACTIVE_ORDER_PRESENT`); `POST v1/session/recent` → an existing cart for
+1. **Guard** (reads only): `GET v1/order/homepage` → each `active[]` order must
+   belong to an exact same-account NowNow journal-COMPLETE flow with a different
+   scope (store, products, quantities, home). Unattributed, unfinished or same-scope
+   orders block (`NOWNOW_ACTIVE_ORDER_PRESENT`); fulfilment still in flight on a
+   completed distinct purchase does not. `POST v1/session/recent` → an existing cart for
    our store is never adopted (`NOWNOW_STORE_CART_PRESENT`); saved card from
    `GET customer-v1/customer/paymentcards` (unique live default Mastercard 5542) and
    its token corroborated in `POST v1/payment/subscription/list {}` (the numeric
@@ -65,8 +68,9 @@ tests: `test/test_commerce_nownow_order.py`.
 
 ## Guard rails
 
-- Active order / foreign store cart / ambiguous saved card / inactive token: STOP
-  before any write.
+- Unattributed, unfinished or duplicate-scope active order / foreign store cart /
+  ambiguous saved card / inactive token: STOP before any write. Journal-COMPLETE
+  means paid, exactly confirmed and tracked, not necessarily delivered.
 - Fee/address/manifest anomalies: STOP before place (`NOWNOW_*` codes); at most ONE
   place per flow (journal-enforced); financial retry never happens.
 - Review freshness ≤ 60s at place; flow resume ≤ 24h (`NOWNOW_FLOW_EXPIRED_24H`);
