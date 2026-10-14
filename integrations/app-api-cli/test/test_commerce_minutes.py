@@ -419,7 +419,9 @@ class ResumeAndCloseTests(unittest.TestCase):
                 (watcher_root/'watchers'/'order-noon-iaega123'/'watcher.json').write_text(
                     jsonlib.dumps({'watcher':True}))
                 registration=flow.register_tracker('minutes Grenade white chocolate x1 (CLI E2E test)')
-            self.assertEqual(registration,{'watcher':'order-noon-iaega123','registered':True})
+            self.assertEqual(registration,{'watcher':'order-noon-iaega123','registered':True,
+                'for':'owner','tracker_id':'order-noon-iaega123','watcher_registered':True,
+                'moni_notified':'skipped','moni_notice_failed':False,'moni_notice_held':False})
             command=run.call_args.args[0]
             self.assertEqual(command[command.index('--placed-at')+1],'2026-10-10T13:18:29+04:00')
             self.assertEqual(command[command.index('--eta')+1],'2026-10-10T13:28:57+04:00')

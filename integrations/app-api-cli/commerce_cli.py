@@ -15,16 +15,23 @@ from commerce_flow import FlowGate, account_hash
 from commerce_basket_input import input_items
 import talabat_http_checkout as talabat
 import talabat_http_orders as talabat_orders
+import order_watch_receipt
 
 
-def register_tracking(flow, label):
-    """Register the exact returned ID, then read back its durable registration."""
+def register_tracking(flow, label, recipient='owner', *, paid=True):
+    """Register the exact returned ID, then read back its durable registration.
+
+    Unpaid/unknown outcomes are tracked too, but Moni's placement text is held
+    until payment is confirmed; recover-payment's paid re-add releases it.
+    """
     state=journal.inspect(flow.flow_id)
     order=state['order_id']
     if not order:journal.fail('EXACT_ORDER_ID_UNAVAILABLE')
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app',state['app'],'--order',order,
-             '--for','owner','--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),'--label',label]
+             *order_watch_receipt.command_args(recipient),
+             '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),'--label',label,
+             *([] if paid else ['--hold-placed-text'])]
     try:
         result=subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=125)
     except (OSError,subprocess.TimeoutExpired):
@@ -35,11 +42,12 @@ def register_tracking(flow, label):
         watcher=json.loads((Path.home()/'.local/share/robob-watch/watchers'/name/'watcher.json').read_text())
     except (OSError,ValueError):
         journal.fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
-    if result.returncode or config.get('order')!=order or config.get('watcher')!=name or not watcher:
+    exit_ok,receipt=order_watch_receipt.parse(result.stdout,result.returncode,recipient,name)
+    if not exit_ok or config.get('order')!=order or config.get('watcher')!=name or not watcher:
         journal.fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
     # A fast delivery may close a correctly registered watcher before readback.
     flow.gate.tracker_registered(order,{'watcher':name,'active':config.get('active') is True})
-    return {'watcher':name,'registered':True}
+    return {'watcher':name,'registered':True,**receipt}
 
 
 def purchase_talabat(args):
@@ -73,14 +81,18 @@ def purchase_talabat(args):
         return {'ok':True,'state':'PREPARED_NOT_ORDERED','flow_id':flow.flow_id,
                 'review':review,'cart_readback_verified':True,'financial_send':False}
     tracking_registration=None
+    result=None
     try:
         result=flow.purchase()
     finally:
         # A returned order must be tracked even when payment validation or its
         # receipt raises. This never repeats place or submits a payment fallback.
         if journal.inspect(flow.flow_id)['order_id']:
-            tracking_registration=register_tracking(flow,args.label)
-    if tracking_registration is not None:result['tracking']=tracking_registration
+            paid=isinstance(result,dict) and result.get('state')=='PAYMENT_REPORTED_SUCCESS'
+            tracking_registration=register_tracking(flow,args.label,args.recipient,paid=paid)
+    if tracking_registration is not None:
+        result['tracking']=tracking_registration
+        result.update(order_watch_receipt.fields(tracking_registration))
     if result['state']=='PAYMENT_REPORTED_SUCCESS':
         tracking=flow.checkout.track()
         flow.gate.exact_order(tracking)
@@ -257,7 +269,7 @@ def order_minutes(args):
         journal.fail('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY' if paid['timed_out']
                      else 'MINUTES_PAYMENT_FAILED_NO_RETRY')
     tracking=flow.verify_tracking()
-    registration=flow.register_tracker(args.label)
+    registration=flow.register_tracker(args.label,recipient=args.recipient)
     journal.complete(flow.flow_id)
     return {'ok':True,'flow_id':flow.flow_id,'order':placed['order'],
         'items':items,
@@ -269,7 +281,7 @@ def order_minutes(args):
                 'confirmed_at':dt.datetime.now(dt.timezone.utc).isoformat()},
         'delivery_status':tracking['status'],'eta':tracking.get('eta'),
         'tracking':tracking,'watcher':registration['watcher'],'notify':notify,
-        'financial_retry':False}
+        **order_watch_receipt.fields(registration),'financial_retry':False}
 
 
 def order_nownow(args):
@@ -306,13 +318,14 @@ def order_nownow(args):
     print(json.dumps({'flow_id':flow.flow_id,'phase':'placed','order':placed['order']}),flush=True)
     tracking=flow.poll_tracking()
     paid=flow.confirm_paid(tracking)
-    registration=flow.register_tracker(args.label,eta=tracking.get('estimate'))
+    registration=flow.register_tracker(args.label,eta=tracking.get('estimate'),recipient=args.recipient)
     journal.complete(flow.flow_id)
     return {'ok':True,'flow_id':flow.flow_id,'order':flow.order,
             'items':items,'store_code':args.store_code,
             'payable_minor':flow.review['payable_minor'],'paid':paid,
             'delivery_status':tracking['status'],
             'eta':tracking.get('estimate'),'watcher':registration['watcher'],
+            **order_watch_receipt.fields(registration),
             'financial_retry':False}
 
 
@@ -350,13 +363,14 @@ def order_main(args):
     paid=flow.await_success()
     flow.confirm_paid()
     tracking=flow.verify_tracking()
-    registration=flow.register_tracker(args.label)
+    registration=flow.register_tracker(args.label,recipient=args.recipient)
     journal.complete(flow.flow_id)
     return {'ok':True,'flow_id':flow.flow_id,'order':flow.order,
             'items':items,
             'payable_minor':flow.review['payable_minor'],'paid':paid,
             'delivery_status':tracking.get('status'),'tracking':tracking,
-            'watcher':registration['watcher'],'financial_retry':False}
+            'watcher':registration['watcher'],**order_watch_receipt.fields(registration),
+            'financial_retry':False}
 
 
 def order_supermall(args):
@@ -378,7 +392,7 @@ def order_supermall(args):
             if args.prepare_only:
                 journal.fail('PREPARE_ONLY_FLOW_ALREADY_ORDERED')
             result = SupermallOrderFlow.resume_paid(args.resume_flow, label=args.label,
-                                                    eta=args.eta)
+                                                    eta=args.eta, recipient=args.recipient)
             return result
         flow = SupermallOrderFlow.resume_active(args.resume_flow, items=items, auth=auth)
         print(json.dumps({'flow_id': flow.flow_id, 'phase': 'resumed'}), flush=True)
@@ -401,13 +415,15 @@ def order_supermall(args):
     paid = flow.await_success()
     flow.confirm_paid()
     tracking = flow.verify_tracking()
-    registration = flow.register_tracker(args.label, eta=flow.review.get('eta'))
+    registration = flow.register_tracker(args.label, eta=flow.review.get('eta'),
+                                         recipient=args.recipient)
     journal.complete(flow.flow_id)
     return {'ok': True, 'flow_id': flow.flow_id, 'order': flow.order,
             'items': items,
             'payable_minor': flow.review['payable_minor'], 'paid': paid,
             'delivery_status': tracking.get('status'), 'tracking': tracking,
             'eta': flow.review.get('eta'), 'watcher': registration['watcher'],
+            **order_watch_receipt.fields(registration),
             'financial_retry': False}
 
 
@@ -437,7 +453,8 @@ def await_payment_flow(args):
     tracking=flow.verify_tracking()
     if not flow.review.get('eta') and tracking.get('eta'):
         flow.review['eta']=tracking['eta']
-    registration=flow.register_tracker('minutes CLI E2E test order (resumed)')
+    registration=flow.register_tracker('minutes CLI E2E test order (resumed)',
+                                       recipient=getattr(args,'recipient','owner'))
     journal.complete(args.flow_id)
     return {'ok':True,'flow_id':args.flow_id,'order':flow.review['order'],
         'paid':{'payment_status':paid['payment_status'],
@@ -446,7 +463,8 @@ def await_payment_flow(args):
                 'captured_minor':paid.get('captured_minor'),'polls':paid['polls'],
                 'confirmed_at':dt.datetime.now(dt.timezone.utc).isoformat()},
         'delivery_status':tracking['status'],'eta':tracking.get('eta'),
-        'tracking':tracking,'watcher':registration['watcher'],'financial_retry':False}
+        'tracking':tracking,'watcher':registration['watcher'],
+        **order_watch_receipt.fields(registration),'financial_retry':False}
 
 
 def release_flow(args):
@@ -588,7 +606,7 @@ def review_contract(vertical):
     journal.fail('INVALID_COMMERCE_VERTICAL')
 
 
-def recover_talabat(flow_id, *, max_reads=90):
+def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
     if binding['app']!='talabat':journal.fail('TALABAT_FLOW_REQUIRED')
     store=receipts.load(**binding)
@@ -597,7 +615,7 @@ def recover_talabat(flow_id, *, max_reads=90):
     def finish_recovered(state, reason, next_index):
         """Close a conclusive paid flow read-only: reconcile fence, exact-order
         readback, tracker readback (registering once if missing), completion."""
-        completed=False; completion_error=None
+        completed=False; completion_error=None; notice={}
         if state=='PAYMENT_REPORTED_SUCCESS' and journal.inspect(flow_id)['order_id']:
             try:
                 if journal.inspect(flow_id)['state']=='FENCED':
@@ -626,15 +644,21 @@ def recover_talabat(flow_id, *, max_reads=90):
                     registered=(cfg.get('order')==order and cfg.get('watcher')==name and bool(watch))
                 except (OSError,ValueError):
                     registered=False
-                if not registered:
+                who='moni' if registered and cfg.get('for')=='moni' else recipient
+                closed=registered and cfg.get('active') is False
+                if not registered or (who=='moni' and not closed):
+                    # Re-adding an existing watcher only releases a placement
+                    # text held while payment was unconfirmed; never twice.
                     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
                     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app','talabat','--order',order,
-                             '--for','owner','--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),
+                             *order_watch_receipt.command_args(who),
+                             '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),
                              '--label','talabat recovered paid order']
                     try:
-                        subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=125)
+                        added=subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=125)
                     except (OSError,subprocess.TimeoutExpired):
                         journal.fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
+                    notice=order_watch_receipt.parse(added.stdout,added.returncode,who,name)[1]
                     try:
                         cfg=json.loads(cfg_path.read_text()); watch=json.loads(watch_path.read_text())
                         registered=(cfg.get('order')==order and cfg.get('watcher')==name and bool(watch))
@@ -649,7 +673,8 @@ def recover_talabat(flow_id, *, max_reads=90):
                 completion_error=getattr(exc,'code',None) or str(exc)
         return {'state':state,'reason':reason,'flow_id':flow_id,
                 'next_index':next_index,'financial_retry':False,
-                'completed':completed,'completion_error':completion_error}
+                'completed':completed,'completion_error':completion_error,
+                **(order_watch_receipt.fields(notice) if notice else {})}
 
     if cursor.stopped and cursor.result.state != 'PAYMENT_UNKNOWN':
         # A conclusive stored result (success/error/blocked/challenge) settles
@@ -668,9 +693,9 @@ def recover_talabat(flow_id, *, max_reads=90):
     return finish_recovered(result.state, result.reason, poller.next_index)
 
 
-def recover_payment(flow_id, *, max_reads=90):
+def recover_payment(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
-    if binding['app']=='talabat':return recover_talabat(flow_id,max_reads=max_reads)
+    if binding['app']=='talabat':return recover_talabat(flow_id,max_reads=max_reads,recipient=recipient)
     if binding['vertical']=='nownow' and journal.preorder_status(flow_id)['operations']:
         from commerce_preorder import recover
         return recover(flow_id)
@@ -690,6 +715,13 @@ def basket_arguments(parser, flag):
         help='quantity for the single-item flag (default 1); not combined with --items-file')
     parser.add_argument('--prepare-only',action='store_true',
         help='create/review the basket with exact readback, without ordering or paying (not read-only)')
+    recipient_argument(parser)
+
+
+def recipient_argument(parser):
+    parser.add_argument('--for',dest='recipient',choices=order_watch_receipt.RECIPIENTS,default='owner',
+        help='who ordered; moni = order-watch texts her the placement (once per order) and routes arrival texts to her. '
+             'Label as "Store: items" for that text')
 
 
 def talabat_arguments(parser):
@@ -718,6 +750,7 @@ def main(argv=None):
     inspect=commands.add_parser('inspect');inspect.add_argument('flow_id')
     recover=commands.add_parser('recover-payment');recover.add_argument('flow_id')
     recover.add_argument('--max-reads',type=int,default=90)
+    recipient_argument(recover)
     track=commands.add_parser('track');track.add_argument('flow_id')
     exact=commands.add_parser('track-exact');exact.add_argument('app',choices=('noon','talabat'))
     exact.add_argument('vertical');exact.add_argument('order')
@@ -770,6 +803,7 @@ def main(argv=None):
     await_cmd.add_argument('flow_id')
     await_cmd.add_argument('--minutes',type=float,default=4.0)
     await_cmd.add_argument('--no-notify',action='store_true')
+    recipient_argument(await_cmd)
     release=commands.add_parser('release-flow',
         help='Evidence-reviewed local release: failed Talabat quote with no financial send, or verified never-paid order')
     release.add_argument('flow_id')
@@ -793,7 +827,8 @@ def main(argv=None):
         elif args.command=='release-flow':result=release_flow(args)
         elif args.command=='abandon-flow':result=abandon_flow(args)
         elif args.command=='inspect':result=journal.inspect(args.flow_id)
-        elif args.command=='recover-payment':result=recover_payment(args.flow_id,max_reads=args.max_reads)
+        elif args.command=='recover-payment':
+            result=recover_payment(args.flow_id,max_reads=args.max_reads,recipient=args.recipient)
         elif args.command=='order-status':
             from commerce_order_status import status
             result=status(args.flow_id)

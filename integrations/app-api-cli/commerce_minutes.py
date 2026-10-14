@@ -12,6 +12,7 @@ import uuid
 import commerce_journal as j
 import commerce_receipts as receipts
 import noon_minutes_checkout as m
+import order_watch_receipt
 from noon_auth_lifecycle import NoonAuthLifecycle
 from noon_checkout import AccountHome
 
@@ -555,11 +556,12 @@ class MinutesFlow:
             evidence_hash=j.digest(tracking),order_id=self.review['order'])
         return tracking
 
-    def register_tracker(self,label,*,placed_at=None,eta=None):
+    def register_tracker(self,label,*,placed_at=None,eta=None,recipient='owner'):
         """order-watch add with durable readback; observe TRACKER_REGISTERED."""
         order=self.review['order']
         name=f"order-noon-{order.lower()}"
-        command=[WATCH_BIN,'add','--app','noon','--order',order,'--for','owner',
+        command=[WATCH_BIN,'add','--app','noon','--order',order,
+                 *order_watch_receipt.command_args(recipient),
                  '--placed-at',placed_at or self.review.get('placed_at')
                  or dt.datetime.now(dt.timezone(dt.timedelta(hours=4))).isoformat(),
                  '--label',label]
@@ -576,11 +578,12 @@ class MinutesFlow:
             watcher=json.loads((WATCH_WATCHERS/name/'watcher.json').read_text())
         except (OSError,ValueError):
             j.fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
-        if result.returncode or config.get('order')!=order or config.get('active') is not True or not watcher:
+        exit_ok,receipt=order_watch_receipt.parse(result.stdout,result.returncode,recipient,name)
+        if not exit_ok or config.get('order')!=order or config.get('active') is not True or not watcher:
             j.fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
         j.observe(self.flow_id,'payment_complete',outcome='TRACKER_REGISTERED',
             evidence_hash=j.digest({'watcher':name,'active':True}),order_id=order)
-        return {'watcher':name,'registered':True}
+        return {'watcher':name,'registered':True,**receipt}
 
     @classmethod
     def resume_payment(cls, flow_id, *, auth=None):

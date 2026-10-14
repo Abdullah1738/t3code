@@ -27,6 +27,7 @@ import commerce_journal as journal
 import commerce_receipts as receipts
 import noon_http_orders as core
 import noon_marketplace_checkout as market
+import order_watch_receipt
 import noon_minutes_checkout as seam
 from noon_auth_lifecycle import NoonAuthLifecycle
 
@@ -596,9 +597,10 @@ class MainOrderFlow:
                         evidence_hash=journal.digest(tracking), order_id=self.order)
         return tracking
 
-    def register_tracker(self, label):
+    def register_tracker(self, label, *, recipient='owner'):
         name = f"order-noon-{self.order.lower()}"
-        command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order, '--for', 'owner',
+        command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order,
+                   *order_watch_receipt.command_args(recipient),
                    '--placed-at', dt.datetime.now(dt.timezone(dt.timedelta(hours=4))).isoformat(),
                    '--label', label]
         env = {k: v for k, v in os.environ.items()
@@ -613,13 +615,14 @@ class MainOrderFlow:
             watcher = json.loads((WATCH_WATCHERS / name / 'watcher.json').read_text())
         except (OSError, ValueError):
             _fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
-        if result.returncode or config.get('order') != self.order \
+        exit_ok, receipt = order_watch_receipt.parse(result.stdout, result.returncode, recipient, name)
+        if not exit_ok or config.get('order') != self.order \
                 or config.get('active') is not True or not watcher:
             _fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
         journal.observe(self.flow_id, 'place', outcome='TRACKER_REGISTERED',
                         evidence_hash=journal.digest({'watcher': name, 'active': True}),
                         order_id=self.order)
-        return {'watcher': name, 'registered': True}
+        return {'watcher': name, 'registered': True, **receipt}
 
     # -- resume --------------------------------------------------------------
     @classmethod

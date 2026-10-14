@@ -26,6 +26,7 @@ import uuid
 import commerce_journal as journal
 import commerce_receipts as receipts
 import noon_nownow_checkout as native
+import order_watch_receipt
 from noon_auth_lifecycle import NoonAuthLifecycle
 from noon_checkout import AccountHome
 
@@ -556,10 +557,11 @@ class NowNowOrderFlow:
         return {'paid': True, 'signal': 'place_200_plus_native_tracking',
                 'need_help_actions': tracking.get('need_help_actions')}
 
-    def register_tracker(self, label, *, eta=None):
+    def register_tracker(self, label, *, eta=None, recipient='owner'):
         """order-watch add with durable readback; observe TRACKER_REGISTERED."""
         name = f"order-noon-{self.order.lower()}"
-        command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order, '--for', 'owner',
+        command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order,
+                   *order_watch_receipt.command_args(recipient),
                    '--placed-at', dt.datetime.now(dt.timezone(dt.timedelta(hours=4))).isoformat(),
                    '--label', label]
         if eta:
@@ -576,13 +578,14 @@ class NowNowOrderFlow:
             watcher = json.loads((WATCH_WATCHERS / name / 'watcher.json').read_text())
         except (OSError, ValueError):
             _fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
-        if result.returncode or config.get('order') != self.order \
+        exit_ok, receipt = order_watch_receipt.parse(result.stdout, result.returncode, recipient, name)
+        if not exit_ok or config.get('order') != self.order \
                 or config.get('active') is not True or not watcher:
             _fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
         journal.observe(self.flow_id, 'place', outcome='TRACKER_REGISTERED',
                         evidence_hash=journal.digest({'watcher': name, 'active': True}),
                         order_id=self.order)
-        return {'watcher': name, 'registered': True}
+        return {'watcher': name, 'registered': True, **receipt}
 
     # -- resume --------------------------------------------------------------
     @classmethod

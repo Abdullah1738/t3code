@@ -39,6 +39,7 @@ import commerce_journal as journal
 import commerce_receipts as receipts
 import noon_http_orders as core
 import noon_marketplace_checkout as market
+import order_watch_receipt
 import noon_minutes_checkout as seam
 from noon_auth_lifecycle import NoonAuthLifecycle
 
@@ -674,14 +675,15 @@ class SupermallOrderFlow:
                         evidence_hash=journal.digest(tracking), order_id=self.order)
         return tracking
 
-    def register_tracker(self, label, eta=None):
+    def register_tracker(self, label, eta=None, *, recipient='owner'):
         if eta is not None:
             try:
                 dt.datetime.fromisoformat(eta)
             except ValueError:
                 _fail('SUPERMALL_WATCHER_ETA_INVALID')
         name = f"order-noon-{self.order.lower()}"
-        command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order, '--for', 'owner',
+        command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order,
+                   *order_watch_receipt.command_args(recipient),
                    '--placed-at', dt.datetime.now(DUBAI).isoformat()]
         if eta is not None:
             command += ['--eta', eta]
@@ -698,14 +700,15 @@ class SupermallOrderFlow:
             watcher = json.loads((WATCH_WATCHERS / name / 'watcher.json').read_text())
         except (OSError, ValueError):
             _fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
-        if result.returncode or config.get('order') != self.order \
+        exit_ok, receipt = order_watch_receipt.parse(result.stdout, result.returncode, recipient, name)
+        if not exit_ok or config.get('order') != self.order \
                 or config.get('active') is not True or not watcher:
             _fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
         journal.observe(self.flow_id, 'place', outcome='TRACKER_REGISTERED',
                         evidence_hash=journal.digest({'watcher': name, 'active': True,
                                                       'eta': eta}),
                         order_id=self.order)
-        return {'watcher': name, 'registered': True}
+        return {'watcher': name, 'registered': True, **receipt}
 
     # -- resume --------------------------------------------------------------
     @classmethod
@@ -777,7 +780,7 @@ class SupermallOrderFlow:
 
     @classmethod
     def resume_paid(cls, flow_id, *, label, eta=None, auth=None,
-                    request=market.native_request):
+                    request=market.native_request, recipient='owner'):
         """Restart-safe read-only completion of a paid, unconfirmed supermall flow.
 
         Requires the order id and a PAYMENT_REPORTED_SUCCESS observation; only
@@ -817,11 +820,11 @@ class SupermallOrderFlow:
             _fail('SUPERMALL_EXACT_TRACKING_NOT_CONFIRMED')
         journal.observe(flow_id, 'place', outcome='EXACT_ORDER_CONFIRMED',
                         evidence_hash=journal.digest(tracking), order_id=self.order)
-        registration = self.register_tracker(label, eta=eta)
+        registration = self.register_tracker(label, eta=eta, recipient=recipient)
         journal.complete(flow_id)
         return {'ok': True, 'flow_id': flow_id, 'order': self.order,
                 'tracking': tracking, 'watcher': registration['watcher'],
-                'financial_retry': False}
+                **order_watch_receipt.fields(registration), 'financial_retry': False}
 
     # resume_paid uses read-only plumbing: mutations are denied, receipts only journal.
     def _paid_headers(self, operation, deadline):
