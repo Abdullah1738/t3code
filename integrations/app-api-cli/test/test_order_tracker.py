@@ -57,47 +57,155 @@ class TrackerTest(unittest.TestCase):
     def problems(self, result, state, cfg, at):
         return [e for e in t.transition(result, state, cfg, at) if e['kind'] == 'tracking_problem']
 
-    def test_same_tracking_problem_alerts_once_per_day(self):
+    def test_error_families_strip_account_suffixes(self):
+        self.assertEqual(t.error_family('email_account_unavailable:juno'), 'email_account_unavailable')
+        for error in ('native_status_unknown', 'email_account_unavailable:outlook', 'no_order_status_evidence',
+                      'native_account_capture_required_guest_catalog_only', 'amazon_message_read_timeout',
+                      'amazon_account_timeout', 'notifications_RuntimeError', 'notifications_priority_hold'):
+            self.assertTrue(t.quiet_error(error), error)
+        for error in ('native_auth_expired', 'native_schema_changed', 'native_order_mismatch_or_schema_changed'):
+            self.assertFalse(t.quiet_error(error), error)
+
+    def test_quiet_errors_need_three_failing_checks(self):
         at = time.time()
         cfg, state = self.problem_cfg(at), {}
         result = lambda: {'status': 'unknown', 'errors': ['native_status_unknown']}
         self.assertEqual(t.transition(result(), state, cfg, at), [])  # priming tick stays quiet
-        self.assertEqual(self.problems(result(), state, cfg, at + 60),
-                         [{'kind': 'tracking_problem', 'errors': ['native_status_unknown']}])
-        fired = [h for h in range(1, 49) if self.problems(result(), state, cfg, at + 60 + h * 3600)]
-        self.assertEqual(fired, [24, 48])
+        self.assertEqual(self.problems(result(), state, cfg, at + 60), [])
+        self.assertEqual(self.problems(result(), state, cfg, at + 120)[0]['errors'], ['native_status_unknown'])
+        # A passing check resets the streak.
+        state = {'primed': True}
+        self.assertEqual(self.problems(result(), state, cfg, at), [])
+        self.assertEqual(self.problems({'status': 'preparing', 'errors': []}, state, cfg, at + 60), [])
+        self.assertEqual(self.problems(result(), state, cfg, at + 120), [])
+        self.assertEqual(self.problems(result(), state, cfg, at + 180), [])
+        self.assertEqual(len(self.problems(result(), state, cfg, at + 240)), 1)
 
-    def test_changed_tracking_problem_alerts_immediately(self):
+    def test_quiet_errors_wait_for_eta(self):
+        at = time.time()
+        cfg = dict(self.problem_cfg(at), eta=t.stamp(at + 3600))
+        state = {'primed': True, 'status': 'placed'}
+        flapping = [['native_status_unknown', 'email_account_unavailable:' + a]
+                    for a in ('fund', 'outlook', 'juno', 'gmail')] + [['amazon_message_read_timeout'],
+                    ['amazon_account_timeout'], ['notifications_RuntimeError'], ['no_order_status_evidence']]
+        fired = [i for i, errors in enumerate(flapping)
+                 if self.problems({'status': 'unknown', 'errors': errors}, state, cfg, at + i * 300)]
+        self.assertEqual(fired, [])
+        self.assertEqual(state['tracking_problem_suppressed'], 'transient_source_errors')
+        after = at + 3600 + 301
+        self.assertEqual(len(self.problems({'status': 'unknown', 'errors': ['amazon_account_timeout']},
+                                           state, cfg, after)), 1)
+
+    def test_real_error_wakes_once_before_eta(self):
+        at = time.time()
+        cfg = dict(self.problem_cfg(at), eta=t.stamp(at + 3600))
+        state = {'primed': True, 'status': 'placed'}
+        bad = {'status': 'unknown', 'errors': ['native_auth_expired', 'native_status_unknown']}
+        events = self.problems(bad, state, cfg, at)
+        self.assertEqual(events[0]['error_families'], ['native_auth_expired', 'native_status_unknown'])
+        self.assertEqual(self.problems(bad, state, cfg, at + 60), [])
+
+    def test_one_tracking_problem_per_day_regardless_of_error_mix(self):
         at = time.time()
         cfg, state = self.problem_cfg(at), {'primed': True, 'status': 'placed'}
-        first = {'status': 'unknown', 'errors': ['native_status_unknown', 'email_read_unavailable']}
-        self.assertEqual(len(self.problems(first, state, cfg, at)), 1)
-        reordered = dict(first, errors=['email_read_unavailable', 'native_status_unknown'])
-        self.assertEqual(self.problems(reordered, state, cfg, at + 60), [])
-        # A clearing or flapping error is not a new problem.
-        self.assertEqual(self.problems(dict(first, errors=['native_status_unknown']), state, cfg, at + 120), [])
-        self.assertEqual(self.problems(first, state, cfg, at + 180), [])
-        changed = dict(first, errors=['native_auth_expired', 'native_status_unknown'])
-        self.assertEqual(self.problems(changed, state, cfg, at + 240)[0]['errors'], changed['errors'])
-        # A new confirmed stage with the same errors is a new signature.
-        moved = {'status': 'out for delivery', 'errors': ['native_status_unknown']}
-        self.assertEqual(len(self.problems(moved, state, cfg, at + 300)), 1)
-        self.assertEqual(self.problems(moved, state, cfg, at + 3900), [])
+        mixes = [['native_auth_expired'], ['native_schema_changed'], ['native_http_500', 'email_read_unavailable'],
+                 ['native_auth_expired', 'email_account_unavailable:juno']]
+        fired = [h for h in range(0, 49)
+                 if self.problems({'status': 'unknown', 'errors': mixes[h % 4]}, state, cfg, at + h * 3600)]
+        self.assertEqual(fired, [0, 24, 48])
+        self.assertEqual(state['tracking_problem_suppressed'], None)
+        # A new confirmed stage is a stage_change wake, not a fresh tracking_problem.
+        moved = {'status': 'out for delivery', 'errors': ['native_auth_expired']}
+        kinds = [e['kind'] for e in t.transition(moved, state, cfg, at + 49 * 3600)]
+        self.assertEqual(kinds, ['stage_change'])
         state['status'] = 'delivered'
-        self.assertEqual(self.problems(changed, state, cfg, at + 4000), [])
+        self.assertEqual(self.problems({'status': 'unknown', 'errors': ['native_auth_expired']}, state, cfg,
+                                       at + 80 * 3600), [])
 
-    def test_legacy_hourly_alert_state_does_not_refire(self):
+    def test_partial_delivery_with_open_eta_never_wakes_tracking_problem(self):
+        # NAEIA0061290509 on 14 Oct: S1 delivered, S2 due 1 Nov, ~9 wakes for flapping errors.
+        at = time.time()
+        cfg = dict(self.problem_cfg(at), eta=t.stamp(at + 18 * 86400))
+        state = {'primed': True, 'status': 'out for delivery',
+                 'parts_delivered_seen': ['native:item:N123-1'],
+                 'native_items_delivered_seen': {'N123-1': 'N123-S1'}}
+        errors = [['native_status_unknown'], ['native_status_unknown', 'email_account_unavailable:juno'],
+                  ['native_auth_expired'], ['native_marketplace_reads_failed']]
+        fired = [h for h in range(0, 72)
+                 if self.problems({'status': 'unknown', 'errors': errors[h % 4]}, state, cfg, at + h * 3600)]
+        self.assertEqual(fired, [])
+        self.assertEqual(state['tracking_problem_suppressed'], 'partial_delivery_eta_open')
+        # The remaining shipment is still announced as soon as it lands.
+        result = {'status': 'unknown', 'errors': ['native_status_unknown'],
+                  'partial_evidence': [{'stage': 'delivered', 'scope': 'shipment', 'shipment_id': 'N123-S2',
+                                        'evidence_key': 'native:shipment:N123-S2', 'source': 'native_order_api'}]}
+        self.assertEqual([e['kind'] for e in t.transition(result, state, cfg, at + 73 * 3600)],
+                         ['shipment_delivered'])
+        # After the ETA, persistent failures may wake once.
+        late = at + 18 * 86400 + 600
+        fired = [i for i in range(3)
+                 if self.problems({'status': 'unknown', 'errors': ['native_status_unknown']}, state, cfg, late + i)]
+        self.assertEqual(fired, [0])
+
+    def test_app_eta_survives_failing_ticks_without_checkout_eta(self):
+        at = time.time()
+        cfg = self.problem_cfg(at)  # lanes like Talabat/Main register without --eta
+        state = {'primed': True, 'status': 'placed'}
+        ok = {'status': 'preparing', 'errors': [], 'eta': t.stamp(at + 3600), 'eta_source': 'native_order_api'}
+        self.assertEqual(self.problems(ok, state, cfg, at), [])
+        fired = [i for i in range(1, 6)
+                 if self.problems({'status': 'unknown', 'errors': ['native_status_unknown'], 'eta': None},
+                                  state, cfg, at + i * 60)]
+        self.assertEqual(fired, [])
+        self.assertEqual(len(self.problems({'status': 'unknown', 'errors': ['native_status_unknown']},
+                                           state, cfg, at + 3600 + 301)), 1)
+
+    def test_live_naeia_state_stays_quiet(self):
+        at = t.epoch('2026-10-14T20:04:27+00:00')
+        cfg = {'app': 'noon', 'order': 'NAEIA0061290509', 'for': 'moni', 'eta': '2026-11-01T23:59:00+04:00',
+               'placed_at': '2026-10-11T17:39:34+04:00', 'registered_at': '2026-10-11T13:42:48+00:00'}
+        state = {'primed': True, 'status': 'out for delivery', 'coverage_alert': True,
+                 'parts_delivered_seen': ['native:item:NAEIA0061290509-2', 'native:item:NAEIA0061290509-1'],
+                 'tracking_problem_alerts': {'["native_status_unknown", "out for delivery"]': at - 86000,
+                                             '["email_account_unavailable:juno", "out for delivery"]': at - 90000}}
+        for i, errors in enumerate([['native_status_unknown', 'email_account_unavailable:juno'],
+                                    ['native_status_unknown', 'email_account_unavailable:gmail'],
+                                    ['native_status_unknown']] * 4):
+            self.assertEqual(self.problems({'status': 'unknown', 'errors': errors}, state, cfg, at + i * 300), [])
+        self.assertNotIn('tracking_problem_alerts', state)
+        self.assertEqual(state['tracking_problem_last_at'], at - 86000)
+
+    def test_legacy_alert_state_migrates_to_daily_cap(self):
         at = time.time()
         cfg = self.problem_cfg(at)
+        result = lambda: {'status': 'unknown', 'errors': ['native_auth_expired']}
         state = {'primed': True, 'status': 'out for delivery', 'coverage_alert': True,
                  'coverage_alert_at': at - 3700}
-        result = lambda: {'status': 'unknown', 'errors': ['native_status_unknown']}
         self.assertEqual(self.problems(result(), state, cfg, at), [])
         self.assertNotIn('coverage_alert_at', state)
         self.assertEqual(self.problems(result(), state, cfg, at - 3700 + 86401)[0]['kind'], 'tracking_problem')
-        # A stale legacy alert belonged to an earlier, resolved problem.
-        stale = {'primed': True, 'status': 'placed', 'coverage_alert': True, 'coverage_alert_at': at - 5 * 3600}
+        stale = {'primed': True, 'status': 'placed', 'tracking_problem_alerts': {'x': at - 2 * 86400}}
         self.assertEqual(len(self.problems(result(), stale, cfg, at)), 1)
+
+    def test_verified_mail_bodies_are_not_reread_each_tick(self):
+        cfg = dict(self.cfg(), app='noon', order='NAEIA1', **{'for': 'owner'})
+        hits = [{'account': 'icloud', 'folder': 'Inbox', 'uid': 1, 'from': 'noon <no-reply@noon.com>',
+                 'subject': 'Your noon shipment has been delivered!', 'date': '2026-10-12 10:48'},
+                {'account': 'icloud', 'folder': 'Inbox', 'uid': 2, 'from': 'noon <no-reply@noon.com>',
+                 'subject': 'Your order is out for delivery', 'date': '2026-10-11 10:48'}]
+        search = mock.Mock(stdout=json.dumps({'status': {'gmail': {'ok': True}}, 'hits': hits}), returncode=0)
+        verified = {}
+        bodies = {'1': 'Order NAEIA1 delivered', '2': 'Order NAEIA9 dispatched'}
+        with mock.patch.object(t.subprocess, 'run', return_value=search), \
+             mock.patch.object(t, 'run', side_effect=lambda args, timeout: bodies[args[-1]]) as read:
+            first, _ = t.mail_evidence(cfg, verified)
+            self.assertEqual(read.call_count, 2)
+            second, errors = t.mail_evidence(cfg, verified)
+            self.assertEqual(read.call_count, 2)
+        self.assertEqual(verified, {'icloud:Inbox:1': True, 'icloud:Inbox:2': False})
+        self.assertEqual([e['stage'] for e in first], ['delivered'])
+        self.assertEqual([(e['stage'], e['mail_key']) for e in second], [('delivered', 'icloud:Inbox:1')])
+        self.assertEqual(errors, [])
 
     def test_native_partial_delivery_is_preserved_not_whole_completion(self):
         cfg = dict(self.cfg(), app='noon', order='N123')

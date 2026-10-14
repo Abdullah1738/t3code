@@ -44,6 +44,48 @@ RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
 RANK = {'unknown': -1, 'placed': 0, 'preparing': 1, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 TRACKING_PROBLEM_REPEAT_S = 86400
+TRACKING_PROBLEM_QUIET_STREAK = 3
+# Source outages and known coverage gaps that flap tick to tick (14 Oct 2026:
+# ~25 wakes across four orders, none actionable). Matched on the error family,
+# i.e. the code before any ':<account>' suffix.
+QUIET_ERROR_FAMILIES = {
+    'native_status_unknown', 'native_account_capture_required_guest_catalog_only',
+    'native_marketplace_reads_failed', 'native_native_read_failed', 'no_order_status_evidence',
+    'email_account_unavailable', 'email_fallback_unavailable', 'email_fallback_budget_exhausted',
+    'email_read_unavailable', 'email_read_budget_exhausted', 'email_unavailable',
+    'some_email_accounts_unavailable', 'receipt_email_unavailable', 'notification_collector_stale',
+    'amazon_email_unavailable', 'amazon_account_unavailable', 'amazon_account_search_unverified',
+    'amazon_mailsearch_unavailable_or_invalid_response', 'amazon_mailsearch_nonzero_exit',
+    'amazon_message_read_failed', 'amazon_message_read_or_parse_failed',
+    'amazon_read_limit_exceeded', 'amazon_search_results_truncated',
+}
+
+
+def error_family(error):
+    return str(error).split(':', 1)[0]
+
+
+def quiet_error(error):
+    family = error_family(error)
+    return (family in QUIET_ERROR_FAMILIES or family.startswith('notifications_')
+            or 'timeout' in family or 'deadline' in family)
+
+
+def eta_open(cfg, result, now, state=None):
+    """True while the latest promised arrival (plus grace) is still ahead."""
+    etas = []
+    for value in (cfg.get('eta'), result.get('eta'), (state or {}).get('known_eta')):
+        try:
+            etas.append(epoch(value))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return bool(etas) and now <= max(etas) + 300
+
+
+def part_delivered(result, state):
+    return bool(state.get('parts_delivered_seen') or state.get('shipments_seen')
+                or state.get('native_items_delivered_seen')
+                or any(p.get('stage') == 'delivered' for p in result.get('partial_evidence', [])))
 
 
 def stamp(value=None):
@@ -133,7 +175,10 @@ def notifications(dump, cfg, single=False):
     return out
 
 
-def mail_evidence(cfg):
+def mail_evidence(cfg, verified=None):
+    # verified: per-order {mail_key: bool} of bodies already read for the exact
+    # ID, so ID-less subjects are not re-read on every 5-minute mail tick.
+    verified = {} if verified is None else verified
     deadline = time.monotonic() + 35
     # Gmail's search-day timezone and himalaya's exclusive `after` otherwise
     # exclude same-day UAE deliveries (especially orders placed after midnight).
@@ -178,7 +223,13 @@ def mail_evidence(cfg):
         if stage == 'unknown':
             continue
         # The mail search matches body too; verify ID in the actual message.
-        if not contains_id(subject, cfg['order']):
+        mail_key = f'{h["account"]}:{h["folder"]}:{h["uid"]}'
+        # Only mailsearch IMAP UIDs are stable enough to cache.
+        cacheable = h.get('via') != 'himalaya'
+        if not contains_id(subject, cfg['order']) and cacheable and mail_key in verified:
+            if not verified[mail_key]:
+                continue
+        elif not contains_id(subject, cfg['order']):
             if reads >= 4:
                 errors.append('email_read_budget_exhausted')
                 break
@@ -198,14 +249,18 @@ def mail_evidence(cfg):
                 errors.append('email_read_unavailable')
                 continue
             if not contains_id(body, cfg['order']):
+                if cacheable:
+                    verified[mail_key] = False
                 continue
+            if cacheable:
+                verified[mail_key] = True
         # Only subject carries current status; bodies can include old timeline steps.
         if stage != 'unknown':
             out.append({'stage': stage, 'observed_at': stamp(), 'source': 'order_email',
                         'email_date': h.get('date'),
                         'scope': 'shipment' if cfg['app'] == 'amazon' else 'order',
                         'confidence': 'exact_order', 'evidence': subject[:300],
-                        'mail_key': f'{h["account"]}:{h["folder"]}:{h["uid"]}'})
+                        'mail_key': mail_key})
         if len(out) >= 2:
             break
     return out, errors
@@ -427,7 +482,10 @@ def fetch(cfg, state, now):
         errors.extend(state.get('receipt_errors', []))
     if now - state.get('mail_checked', 0) >= 300 and not state.get('receipt'):
         try:
-            mails, errs = mail_evidence(cfg)
+            verified = state.setdefault('mail_bodies_verified', {})
+            if len(verified) > 200:
+                verified.clear()
+            mails, errs = mail_evidence(cfg, verified)
             state['mail_checked'] = now
             state['mail_cache'] = mails
             state['mail_errors'] = errs
@@ -535,22 +593,37 @@ def transition(result, state, cfg, now):
     if cfg.get('eta') and now > epoch(cfg['eta']) + 300 and state.get('status') not in TERMINAL and not state.get('delay_sent'):
         state['delay_sent'] = True
         events.append({'kind': 'eta_elapsed', 'message': 'Checkout ETA passed by 5 minutes; delivery is not confirmed. This is not proof the order is still undelivered.'})
-    if (result.get('errors') or (current == 'unknown' and not result.get('candidate') and not result.get('aftercare_evidence'))) and now - epoch(cfg['registered_at']) > 600 and state.get('status') not in TERMINAL:
+    failing = bool(result.get('errors') or (current == 'unknown' and not result.get('candidate')
+                                             and not result.get('aftercare_evidence')))
+    if result.get('eta') and result.get('eta_source') not in (None, 'checkout_supplied'):
+        # Failing ticks only carry the checkout ETA; remember the app's own.
+        state['known_eta'] = result['eta']
+    state['tracking_problem_streak'] = state.get('tracking_problem_streak', 0) + 1 if failing else 0
+    # Older state kept per-error alert times (or one hourly stamp); the latest
+    # of them is this order's last tracking_problem wake.
+    legacy = [state.pop('coverage_alert_at', None), *(state.pop('tracking_problem_alerts', None) or {}).values()]
+    legacy = [v for v in legacy if isinstance(v, (int, float))]
+    if legacy and not state.get('tracking_problem_last_at'):
+        state['tracking_problem_last_at'] = max(legacy)
+    if failing and now - epoch(cfg['registered_at']) > 600 and state.get('status') not in TERMINAL:
         errors = result.get('errors') or ['no_order_status_evidence']
-        # Alert when an error is new at this confirmed stage; errors that persist,
-        # clear or flap (cached mail errors do) repeat at most once a day.
-        keys = [json.dumps([e, state.get('status', 'unknown')]) for e in sorted(set(errors))]
-        alerts = state.get('tracking_problem_alerts') or {}
-        legacy = state.pop('coverage_alert_at', None)
-        if legacy and not alerts and now - legacy <= 7200:
-            # Older state kept only the last hourly alert; recent means this problem is ongoing.
-            alerts = dict.fromkeys(keys, legacy)
-        alerts = {k: v for k, v in alerts.items() if now - v < TRACKING_PROBLEM_REPEAT_S}
-        if any(k not in alerts for k in keys):
-            alerts.update(dict.fromkeys(keys, now))
+        last = state.get('tracking_problem_last_at') or 0
+        if part_delivered(result, state) and eta_open(cfg, result, now, state):
+            reason = 'partial_delivery_eta_open'
+        elif all(quiet_error(e) for e in errors) and (
+                state['tracking_problem_streak'] < TRACKING_PROBLEM_QUIET_STREAK or eta_open(cfg, result, now, state)):
+            reason = 'transient_source_errors'
+        elif now - last < TRACKING_PROBLEM_REPEAT_S:
+            reason = 'daily_cap'
+        else:
+            reason = None
+            state['tracking_problem_last_at'] = now
             state['coverage_alert'] = True
-            events.append({'kind': 'tracking_problem', 'errors': errors})
-        state['tracking_problem_alerts'] = alerts
+            events.append({'kind': 'tracking_problem', 'errors': errors,
+                           'error_families': sorted({error_family(e) for e in errors})})
+        state['tracking_problem_suppressed'] = reason
+    else:
+        state.pop('tracking_problem_suppressed', None)
     if not state.get('primed'):
         events = []
         # Baseline stage only; overdue/coverage alerts must fire on the next tick.
@@ -558,6 +631,7 @@ def transition(result, state, cfg, now):
         state.pop('coverage_alert', None)
         state.pop('coverage_alert_at', None)
         state.pop('tracking_problem_alerts', None)
+        state.pop('tracking_problem_last_at', None)
         state['primed'] = True
     return events
 
