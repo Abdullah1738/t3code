@@ -3736,6 +3736,16 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         yield* removeMcp(state.mcp);
         state.mcp = undefined;
       }
+      // A location reload discards runtime registrations without closing this
+      // session. Keep the credential, but do not trust our cached registration.
+      if (wanted !== undefined && state.mcp !== undefined) {
+        const registered = yield* client.mcp.list({ location: { directory } }).pipe(
+          Effect.timeout(INVENTORY_TIMEOUT),
+          Effect.map((listed) => listed.data.some((entry) => entry.name === name)),
+          Effect.catch(() => Effect.succeed(true)),
+        );
+        if (!registered) state.mcp = undefined;
+      }
       // T3's tools are an addition: a server that cannot add them still runs the turn.
       if (wanted !== undefined && state.mcp === undefined) {
         const added = yield* client.mcp

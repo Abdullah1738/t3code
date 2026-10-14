@@ -4718,6 +4718,133 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       }).pipe(Effect.scoped),
   );
 
+  it.effect("restores a reused MCP registration missing after a location reload", () =>
+    Effect.gen(function* () {
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      yield* mcpSessions.set({
+        environmentId: EnvironmentId.make("environment:opencode2-adapter"),
+        threadId,
+        providerSessionId: "mcp:opencode2-adapter",
+        providerInstanceId: instanceId,
+        endpoint: "http://127.0.0.1:3773/mcp",
+        authorizationHeader: "Bearer thread-credential",
+        browserToolsAvailable: false,
+      });
+      yield* Effect.addFinalizer(() => mcpSessions.clear(threadId));
+      const server = "t3-code-thread_opencode2-adapter";
+      const registration = [
+        out("mcp.add", {
+          server,
+          "location[directory]": WORK,
+          config: {
+            type: "remote",
+            url: "http://127.0.0.1:3773/mcp",
+            headers: { Authorization: "Bearer thread-credential" },
+            oauth: false,
+          },
+        }),
+        reply("mcp.add", null),
+      ];
+      const prompt = [
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ];
+      const { runtime, thread } = yield* resumed([
+        ...registration,
+        ...prompt,
+        // A still-connected registration is reused without another add.
+        out("mcp.list", { "location[directory]": WORK }),
+        reply("mcp.list", {
+          location: { directory: WORK },
+          data: [{ name: server, status: { status: "connected" } }],
+        }),
+        ...prompt,
+        // The location forgot the runtime entry; restore the same credential.
+        out("mcp.list", { "location[directory]": WORK }),
+        reply("mcp.list", { location: { directory: WORK }, data: [] }),
+        ...registration,
+        ...prompt,
+        // Inventory failure is best effort: keep the existing registration.
+        out("mcp.list", { "location[directory]": WORK }),
+        reply("mcp.list", { status: 503, body: { error: "inventory unavailable" } }),
+        ...prompt,
+        out("mcp.remove", { server, "location[directory]": WORK }),
+        reply("mcp.remove", null),
+      ]);
+      for (let ordinal = 0; ordinal < 4; ordinal++) {
+        const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        yield* runtime.startTurn(turnInput(thread));
+        assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+      }
+      yield* runtime.unloadThread!({ providerThread: thread });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("cancels turn startup while a reused MCP registration check is pending", () =>
+    Effect.gen(function* () {
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      yield* mcpSessions.set({
+        environmentId: EnvironmentId.make("environment:opencode2-adapter"),
+        threadId,
+        providerSessionId: "mcp:opencode2-adapter",
+        providerInstanceId: instanceId,
+        endpoint: "http://127.0.0.1:3773/mcp",
+        authorizationHeader: "Bearer thread-credential",
+        browserToolsAvailable: false,
+      });
+      yield* Effect.addFinalizer(() => mcpSessions.clear(threadId));
+      const server = "t3-code-thread_opencode2-adapter";
+      const gate = makeProviderReplayGate(["inventory-pending"]);
+      const prompt = [
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ];
+      const { runtime, thread } = yield* resumed(
+        [
+          out("mcp.add", "<any>"),
+          reply("mcp.add", null),
+          ...prompt,
+          out("mcp.list", { "location[directory]": WORK }),
+          reply("mcp.list", "<hang>"),
+          // Receipt that the pending inventory request was consumed, not a sleep.
+          event(
+            "session.model.selected",
+            {
+              sessionID: "ses_inventory_receipt",
+              model: { providerID: "opencode", id: "big-pickle" },
+            },
+            "inventory-pending",
+          ),
+          out("mcp.list", { "location[directory]": WORK }),
+          reply("mcp.list", {
+            location: { directory: WORK },
+            data: [{ name: server, status: { status: "connected" } }],
+          }),
+          ...prompt,
+          out("mcp.remove", { server, "location[directory]": WORK }),
+          reply("mcp.remove", null),
+        ],
+        { replayGate: gate },
+      );
+      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* runtime.startTurn(turnInput(thread));
+      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+      const starting = yield* runtime.startTurn(turnInput(thread)).pipe(Effect.forkScoped);
+      assert.isTrue(yield* Effect.promise(() => gate.waitForReached("inventory-pending")));
+      yield* Fiber.interrupt(starting);
+      const cancelled = yield* Fiber.await(starting);
+      gate.release("inventory-pending");
+      assert.isTrue(Exit.isFailure(cancelled) && Cause.hasInterruptsOnly(cancelled.cause));
+      // No prompt was sent for the cancelled start, and no turn was left active.
+      const nextTerminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* runtime.startTurn(turnInput(thread));
+      assert.equal((yield* Fiber.join(nextTerminal))?.status, "completed");
+      yield* runtime.unloadThread!({ providerThread: thread });
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("registers a long thread id's MCP server under a name OpenCode accepts", () =>
     Effect.gen(function* () {
       // Spelled out, this delegated thread's server name would be 120 characters.
