@@ -107,8 +107,8 @@ const importOne = Effect.fn("ArdudScheduleImport.importOne")(function* (input: {
     projectId = found.value.id;
   } else {
     const created = yield* projects.bootstrap({
-      commandId: CommandId.make(`ardud-schedule-import:project:${yield* crypto.randomUUIDv4}`),
-      projectId: ProjectId.make(yield* crypto.randomUUIDv4),
+      commandId: CommandId.make(`ardud-schedule-import:project:${yield* crypto.randomUUIDv4()}`),
+      projectId: ProjectId.make(yield* crypto.randomUUIDv4()),
       title: path.basename(item.workspaceRoot) || "project",
       workspaceRoot: item.workspaceRoot,
     });
