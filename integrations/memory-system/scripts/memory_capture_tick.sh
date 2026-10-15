@@ -1,8 +1,7 @@
 #!/bin/bash
 # Raw capture stage (launchd com.abdullah.memory-sync, every 120 s): copy new
 # OpenCode messages into opencode_raw.db and project them into memory.db.
-# It has its own lock and deadline and never waits on fact extraction (that
-# runs separately in memory_extract_tick.sh). It also runs the stall watcher.
+# It has its own lock and deadline. It also runs the stall watcher.
 set -u
 ROOT="$HOME/.local/share/memory-system"
 cd "$ROOT" || exit 1

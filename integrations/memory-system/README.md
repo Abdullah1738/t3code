@@ -1,76 +1,80 @@
-# Memory System
+# Memory System (recall)
 
-Personal long-term memory for AI agent work (Codex, Hermes, OpenCode). Lossless
-merge of past sessions, continuous sync, semantic decision memory with
-supersession, near-real-time cross-session recall, and a self-triaging janitor.
+Every session Abdullah has had with AI agents (Codex, Hermes, OpenCode/Robob) in
+one SQLite store, with instant search, Haiku answers over the transcripts and a
+cautious auto-recall plugin. No extracted facts, profiles or graphs: the
+transcripts are the memory.
 
-This directory holds **only the system**: source, scripts, schema, docs.
-It never holds runtime data.
+This directory holds only the system: source, scripts, schema. It never holds
+runtime data.
 
 ## Layout
 
-- `src/` - pipeline + runtime
-  - `sync_opencode_v2.py` - incremental OpenCode session sync (canonical ledger)
-  - `chronological_extractor.py` - glm-5.3-flash fact extraction (resumable, `--active`, `--changed-since`)
-  - `embed_facts.py` / `memory_retrieval.py` - Qwen3-Embedding-0.6B vectors + hybrid recall (MPS, fp16)
-  - `consolidate.py` - dedupe/supersede/contradict judge (candidates -> clusters -> judge -> apply/rollback)
-  - `flatten_pointers.py` - collapse multi-hop superseded_by_id chains
-  - `profile_compiler.py` - compile personal profile from facts
-  - `build_text_fts.py` - one-off, resumable build of `episodic_text_fts` (text-only history index used by default searches; writers need SQLite >= 3.47; not in `schema.sql`, so run it after a DB rebuild or searches fall back to the slower `episodic_fts` path)
-  - `memory_mcp.py` - MCP server (streamable-HTTP `/mcp`, port 18765): memory_recall, memory_search_history, memory_session_context, memory_profile, memory_remember
-  - `janitor.py` - daily scan: orphans, contradictions, coverage gaps, low-confidence profile facts. Autofix safe, Telegram digest for questions.
-- `scripts/` - shell entry points (sync tick, embed/candidate chain, FTS rebuild)
-- `sql/`, `schema/` - DDL
-- `docs/` - design + research notes
+- `src/sync_opencode_v2.py` - incremental OpenCode capture into `episodic_events`
+  (Codex and Hermes were one-time imports).
+- `src/build_text_fts.py` - builds `episodic_text_fts`, the contentless
+  user/assistant text index the search uses (writers need SQLite >= 3.47; not in
+  `schema.sql`, so run it after a DB rebuild).
+- `src/recall_core.py` - read-only search and reading: query planning with
+  FTS5 doc frequencies (AND the rarest terms, drop common ones), session ranking,
+  the session catalog (`data/recall_catalog.db`: title, dir, dates, parent),
+  transcript rendering and id resolution.
+- `src/recall_ask.py` - Haiku 5.5 (via 9router) plans searches, answers
+  questions with [n] citations, and gates auto-recall notes (defaults to none).
+- `src/recall_server.py` - MCP server on 127.0.0.1:18765 (`/mcp`: `recall_ask`,
+  `recall_search`, `recall_read`, `recall_list`) plus `POST /api/inject`,
+  `POST /api/ask`, `GET /api/health`. Refreshes the catalog every 60 s.
+- `src/recall_cli.py` - the `recall` CLI (`list`, `query`, `search`, `view`,
+  `inject`, `refresh`).
+- `src/health_check.py`, `session_reaper.py`, `location_reaper.py`,
+  `backend.py`, `dropbox_mirror.py` - ops.
+- `scripts/` - capture tick, backup, stall watch, cold archive, LaunchAgent
+  plists.
+
+The OpenCode plugin that calls `/api/inject` lives outside the fork at
+`~/.config/opencode/plugin/recall.ts` (config `~/.config/opencode/recall.json`).
 
 ## Runtime data lives elsewhere
 
-All databases, vectors, logs and the live state file are **not** in this repo:
-
 ```
 ~/.local/share/memory-system/
-  data/            memory.db, codex_raw.db (symlink -> ExternalSSD), opencode_raw.db,
-                   fact_vectors.db, consolidation.db
-  logs/            tick/janitor/extract logs, janitor_last.json
-  HANDOFF.md       live build + ops state (source of truth for where things stand)
+  data/   memory.db (episodic_events + FTS), opencode_raw.db, recall_catalog.db
+  logs/   capture/backup/health logs, recall_server.log, recall-inject.jsonl,
+          recall-plugin.jsonl
+  .venv/  Python 3.14 with mcp, starlette, uvicorn (recall server only)
 ```
 
-Nothing under `data/`, `logs/`, `venv/`, `.venv/` or any `*.db`/`*.wal` belongs in
-git. Secrets (provider API keys) stay in `~/.config/opencode/` and are read at
-runtime, never committed.
+Nothing under `data/`, `logs/` or `.venv/` belongs in git.
 
 ## LaunchAgents (gui/501)
 
-- `com.abdullah.memory-sync` - sync + extract tick, every 120s
-- `com.abdullah.memory-mcp` - MCP server on 127.0.0.1:18765. The plist sets
-  `SoftResourceLimits`/`HardResourceLimits` `NumberOfFiles` to 8192; launchd's
-  default soft limit of 256 is too low for many concurrent client sessions.
-  Reference copy: `scripts/com.abdullah.memory-mcp.plist`.
-- `com.abdullah.memory-janitor` - daily 09:00 triage sweep, Telegram digest
+- `com.abdullah.memory-sync` - capture tick, every 120 s
+- `com.abdullah.recall` - recall server on 127.0.0.1:18765. The plist raises
+  `NumberOfFiles` to 8192; launchd's default 256 is too low for many clients.
+  Reference copy: `scripts/com.abdullah.recall.plist`.
+- `com.abdullah.memory-health` - health check every 15 min (capture, recall,
+  backups, disk), Telegram on failure
+- `com.abdullah.memory-backup` - restic every 4 h, mirrored to Dropbox
 - `com.abdullah.session-reaper` (30 min) and `com.abdullah.location-reaper` (5 min)
 
 ## Backend (OpenChamber or Robob)
 
-`session_reaper.py`, `location_reaper.py` and the janitor's review session pick
-their backend in `src/backend.py` from `MEMORY_BACKEND`:
+`session_reaper.py` and `location_reaper.py` pick their backend in
+`src/backend.py` from `MEMORY_BACKEND`:
 
 - `openchamber` (default): OpenCode endpoints through OpenChamber
-  (`OPENCHAMBER_URL`), OpenChamber scheduled tasks and session board.
+  (`OPENCHAMBER_URL`).
 - `robob`: OpenCode endpoints on the OpenCode service directly
   (`OPENCODE_SERVICE_URL`, default `http://127.0.0.1:49374`, basic auth `opencode`
   with `OPENCODE_SERVER_PASSWORD` or `~/.config/opencode-service/password`), the
   Robob control API (`T3_CONTROL_URL`/`T3_CONTROL_TOKEN` or
   `~/.robob/ardud-control.json`), and Robob's state DB read-only
-  (`ROBOB_STATE_DB`, default `~/.robob/userdata/statev2.sqlite`) for scheduled
-  task sessions and the board backlog. The reaper deletes nothing while the
-  Robob board can't be read, and archives the Robob thread of each deleted root
-  session. The janitor opens its review as a Robob thread.
+  (`ROBOB_STATE_DB`, default `~/.robob/userdata/statev2.sqlite`) for the board
+  backlog. The reaper deletes nothing while the Robob board can't be read, and
+  archives the Robob thread of each deleted root session.
 
-Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` and `bash tests/test_stages.sh`.
+Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` and
+`bash tests/test_stages.sh`.
 
-## Working agreement
-
-Agents that fix or extend the memory system commit and push to `main` in this
-repo. Keep changes commit-sized, use Conventional Commits, and never commit
-runtime data, secrets, or personal facts. See `HANDOFF.md` in the runtime dir
-for the current operational state before making changes.
+Deploy: `integrations/deploy.zsh memory-system`, then
+`launchctl kickstart -k gui/$(id -u)/com.abdullah.recall`.

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Raw-capture stall watcher. Called at the start of both the capture and the
-# extract ticks (two separate launchd jobs), so it still runs if one of them
-# is wedged. Pure bash plus system binaries, so it works while Homebrew
-# python launches hang. When the last successful capture is older than
-# MEMORY_STALL_SECS (default 6 h), it sends ONE Telegram alert per stall
-# episode. The episode ends when capture succeeds again.
+# Raw-capture stall watcher. Called at the start of each capture tick; the
+# health check (com.abdullah.memory-health) also flags capture lag. Pure bash
+# plus system binaries, so it works while Homebrew python launches hang.
+# When the last successful capture is older than MEMORY_STALL_SECS (default
+# 6 h), it sends ONE Telegram alert per stall episode. The episode ends
+# when capture succeeds again.
 #
 # --test-notify sends a clearly labelled test alert and exits.
 set -u
@@ -68,7 +68,7 @@ fi
 
 # one alert per stall episode (episode id = last successful capture time)
 [ "$(cat "$ALERTED" 2>/dev/null)" = "$last_ok" ] && exit 0
-# take a tiny lock so the capture and extract ticks don't both send. A lock
+# take a tiny lock so overlapping ticks don't both send. A lock
 # left by a killed watcher (older than 5 min; a send takes at most ~60 s)
 # is removed, otherwise no alert could ever be sent again.
 WL="$STATE_DIR/stall_watch.lock"

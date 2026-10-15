@@ -4,9 +4,7 @@
 Checks that the whole pipeline is flowing, not just that processes exist:
   sync      raw capture stage (com.abdullah.memory-sync) succeeded recently
   lag       native OpenCode sessions older than 30 min are in memory.db
-  extract   fact extraction is keeping up and under budget
-  mcp       memory MCP answers on :18765
-  janitor   daily janitor ran and exited 0
+  recall    recall server answers on :18765 and its session catalog keeps up
   backup    last memory backup succeeded recently
   backup_lock  no backup run is hung (>2 h) or died holding logs/backup.lock
   dropbox   Dropbox copy of the live backup repo is complete (name + size)
@@ -20,13 +18,10 @@ failing) and an all-clear when it recovers. --dry-run prints and never
 notifies.
 """
 import argparse
-import datetime as dt
-import glob
 import json
 import os
 import re
 import shutil
-import socket
 import sqlite3
 import subprocess
 import time
@@ -47,8 +42,8 @@ TG_CLI = os.path.join(HOME, ".local/share/telegram-bridge/src/cli.ts")
 SYNC_MAX_AGE = 15 * 60          # tick every 120 s
 LAG_GRACE_MS = 30 * 60 * 1000   # settle window is 10 min
 LAG_MAX = 3
-EXTRACT_MAX_AGE = 6 * 3600
-BUDGET = float(os.environ.get("MEMORY_EXTRACT_MONTHLY_BUDGET", "1000"))
+RECALL_URL = "http://127.0.0.1:18765/api/health"
+RECALL_MAX_LAG = 20000          # events the session catalog may trail by
 BACKUP_MAX_AGE = 9 * 3600       # backup every 4 h
 BACKUP_LOCK_MAX_AGE = 2 * 3600  # runs take up to ~1.7 h
 DISK_MIN_GB = 30
@@ -117,72 +112,17 @@ def check_lag():
     return True, f"{len(behind)} sessions behind"
 
 
-def check_extract():
-    mem = ro(MEM_DB)
-    last_run = mem.execute("SELECT max(created_at) FROM extraction_runs").fetchone()[0] or 0
-    newest_event = mem.execute(
-        "SELECT max(timestamp) FROM episodic_events WHERE source='opencode' AND timestamp > ?",
-        (time.time() - 2 * 86400,)).fetchone()[0] or 0
-    month = dt.date.today().replace(day=1).strftime("%s")
-    spent = mem.execute("SELECT coalesce(sum(cost_usd),0) FROM extraction_runs WHERE created_at >= ?",
-                        (int(month),)).fetchone()[0]
-    if spent > 0.9 * BUDGET:
-        return False, f"extraction spent ${spent:.0f} of ${BUDGET:.0f} this month"
-    # Only stale if there is new conversation the extractor has not looked at.
-    if newest_event - last_run > EXTRACT_MAX_AGE:
-        return False, f"no fact extraction for {int((time.time()-last_run)/3600)} h despite new sessions"
-    _, _, loaded = launchd_exit("com.abdullah.memory-extract")
-    if not loaded:
-        return False, "memory-extract launch agent not loaded"
-    st = stage_status("extract") or {}
-    if st.get("state") in ("timeout", "failed") and time.time() - (st.get("last_ok_ts") or 0) > 3600:
-        return False, f"extraction runs failing (last: {st.get('state')} rc={st.get('rc')}), no success for {int((time.time() - (st.get('last_ok_ts') or 0)) / 60)} min"
-    errs = 0
-    files = sorted(glob.glob(os.path.join(LOGS, "extract-*.log")))[-1:]
-    lines = [l for f in files for l in open(f, errors="replace") if l.startswith("DONE: ")][-10:]
-    for l in lines:
-        m = re.search(r"api_err=(\d+)", l)
-        errs += int(m.group(1)) if m else 0
-    if len(lines) >= 5 and errs >= 10:
-        return False, f"{errs} extractor API errors in the last {len(lines)} ticks"
-    return True, f"last run {int((time.time()-last_run)/60)} min ago, ${spent:.0f} this month"
-
-
-def check_mcp():
+def check_recall():
+    import urllib.request
     try:
-        with socket.create_connection(("127.0.0.1", 18765), timeout=5):
-            pass
-    except OSError as e:
-        return False, f"memory MCP not reachable on :18765 ({e})"
-    return True, "listening"
-
-
-def check_janitor():
-    code, runs, loaded = launchd_exit("com.abdullah.memory-janitor")
-    if not loaded:
-        return False, "memory-janitor launch agent not loaded"
-    if runs and code not in ("0", "(never exited)"):
-        return False, f"janitor last exit code {code} (see logs/janitor.err.log)"
-    p = os.path.join(LOGS, "janitor_last.json")
-    if os.path.exists(p) and time.time() - os.path.getmtime(p) > 50 * 3600:
-        return False, f"janitor has not run for {int((time.time()-os.path.getmtime(p))/3600)} h"
-    # review session state (OpenChamber "Memory janitor review" sessions)
-    rs = os.path.join(LOGS, "janitor-review", "state.json")
-    try:
-        st = json.load(open(rs))
-    except Exception:
-        st = None
-    if st:
-        status = st.get("status")
-        if status == "failed":
-            return False, f"janitor review session could not be opened: {str(st.get('error', ''))[:200]}"
-        if status == "pending":
-            age_d = (time.time() - (st.get("created_at") or 0)) / 86400
-            if age_d > 7:
-                return False, f"janitor review {st.get('review')} pending {int(age_d)} days (session {st.get('session_id')})"
-            return True, f"exit {code}; review {st.get('review')} pending ({st.get('items')} items)"
-        return True, f"exit {code}; review {st.get('review')} {status}"
-    return True, f"exit {code}"
+        with urllib.request.urlopen(RECALL_URL, timeout=10) as r:
+            st = json.loads(r.read())
+    except Exception as e:
+        return False, f"recall server not answering on :18765 ({e})"
+    lag = st.get("catalog_lag")
+    if isinstance(lag, int) and lag > RECALL_MAX_LAG:
+        return False, f"recall session catalog {lag} events behind (refresh: {str(st.get('catalog_refresh'))[:120]})"
+    return True, f"up, catalog lag {lag}"
 
 
 def check_backup():
@@ -327,8 +267,8 @@ def check_worktree_reaper():
     return True, f"removed {len(st.get('removed', []))} worktrees this run, {st.get('worktrees', '?')} checked"
 
 
-CHECKS = [("sync", check_sync), ("lag", check_lag), ("extract", check_extract),
-          ("mcp", check_mcp), ("janitor", check_janitor), ("backup", check_backup),
+CHECKS = [("sync", check_sync), ("lag", check_lag), ("recall", check_recall),
+          ("backup", check_backup),
           ("backup_lock", check_backup_lock),
           ("dropbox", check_dropbox), ("disk", check_disk), ("cold_finalize", check_cold_finalize),
           ("session_reaper", check_session_reaper), ("location_reaper", check_location_reaper),
@@ -381,7 +321,7 @@ def main():
         lines = [f"- {n}: {results[n]['msg']}" for n in new_fail]
         text = "Memory system problem:\n" + "\n".join(lines)
         key = "memory-health:" + today + ":" + ",".join(f"{n}@{failing[n]['since']}" for n in sorted(new_fail))
-        if notify("error" if any(n in ("sync", "backup", "backup_lock", "mcp") for n in new_fail) else "attention", text, key):
+        if notify("error" if any(n in ("sync", "backup", "backup_lock", "recall") for n in new_fail) else "attention", text, key):
             for n in new_fail:
                 failing[n]["notified_day"] = today
     if recovered:

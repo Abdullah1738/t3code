@@ -106,10 +106,12 @@ replicate() { # live-path replica-name
     log "replica $db behind after sync (replica=$got live>=$want), retrying"
   done
 }
-for db in memory.db opencode_raw.db consolidation.db fact_vectors.db; do
+# recall_catalog.db is derived from memory.db (rebuilt in ~1 min), so it is not backed up.
+for db in memory.db opencode_raw.db; do
   [ -f "$DATA/$db" ] && replicate "$DATA/$db" "$db"
 done
-"$SQLITE" "$DATA/agent_notes.db" ".backup '$STAGE/agent_notes.db'" 2>>"$LOG" || fail replica "agent_notes.db backup failed"
+# Replicas of retired databases (facts, vectors, notes) drop out of new snapshots.
+rm -f "$STAGE"/consolidation.db* "$STAGE"/fact_vectors.db* "$STAGE"/agent_notes.db* 2>/dev/null
 # Robob's state DB holds the session board, schedules and the OpenCode import
 # map, which nothing else backs up. Optional: skipped until Robob is installed.
 # sqlite3_rsync, not .backup: the CLI's .backup restarts whenever Robob writes
@@ -121,7 +123,7 @@ ROBOB_DB="${ROBOB_STATE_DB:-$HOME/.robob/userdata/statev2.sqlite}"
 # only confirm each replica opens and has a schema (quick_check on the 70 GB
 # memory.db takes too long). Don't compare against live again: rows inserted
 # after the sync can carry old timestamps (reprojection), so that races.
-for db in memory.db opencode_raw.db consolidation.db fact_vectors.db agent_notes.db robob-state.sqlite; do
+for db in memory.db opencode_raw.db robob-state.sqlite; do
   [ -f "$STAGE/$db" ] || continue
   q=$("$SQLITE" -readonly "$STAGE/$db" "SELECT count(*) > 0 FROM sqlite_master;" 2>&1 | head -1)
   [ "$q" = "1" ] || fail verify "$db replica unreadable: $q"
@@ -131,9 +133,10 @@ mkdir -p "$STAGE/files"
   --include='profile*' --include='*.md' --include='*.json' --include='*.txt' --exclude='*' \
   "$DATA/" "$STAGE/files/data/" >>"$LOG" 2>&1 || fail files "rsync data files"
 /opt/homebrew/bin/rsync -a --delete --exclude='__pycache__' --exclude='*.pyc' \
-  "$ROOT/src" "$ROOT/scripts" "$ROOT/schema" "$ROOT/sql" "$ROOT/HANDOFF.md" \
+  "$ROOT/src" "$ROOT/scripts" "$ROOT/HANDOFF.md" \
   "$STAGE/files/" >>"$LOG" 2>&1 || fail files "rsync code"
-cp -p "$HOME/Library/LaunchAgents/"com.abdullah.memory-*.plist "$STAGE/files/" 2>/dev/null
+cp -p "$HOME/Library/LaunchAgents/"com.abdullah.memory-*.plist \
+  "$HOME/Library/LaunchAgents/com.abdullah.recall.plist" "$STAGE/files/" 2>/dev/null
 
 # 2. snapshot
 out=$(nice -n 10 "$RESTIC" backup --host ardud-mac --tag memory-live --json --quiet \

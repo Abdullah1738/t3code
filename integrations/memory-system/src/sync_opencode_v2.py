@@ -246,7 +246,7 @@ class Sync:
         self.mem.commit()
         self.att = Attachments(self.mem)
         self.stats = dict(sessions=0, raw_upserts=0, projected=0, reprojected=0,
-                          legacy=0, unsettled=0, rows=0, relinked=0)
+                          legacy=0, unsettled=0, rows=0)
 
     # ------------------------------------------------------------ source reads
     def changed_sessions(self):
@@ -357,24 +357,16 @@ class Sync:
             else:
                 self.stats["projected"] += 1
             rows = project(mid, mtype, d, sess, self.att)
-            new_ids = {}
             ts = tc // 1000
             for turn_id, speaker, ctype, content, model, tokens, meta in rows:
                 meta = dict(meta, seq=seq)
-                cur = m.execute(
+                m.execute(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,"
                     "content,content_type,model,tokens_used,metadata_json)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (SOURCE, sid, turn_id, ts, speaker, content or "", ctype, model, tokens,
                      json.dumps(meta, ensure_ascii=False)))
-                new_ids[turn_id] = cur.lastrowid
                 self.stats["rows"] += 1
-            for oid, oturn in old:
-                nid = new_ids.get(oturn) or new_ids.get(mid)
-                if nid:
-                    c = m.execute("UPDATE semantic_facts SET source_event_id=?"
-                                  " WHERE source_event_id=?", (nid, oid))
-                    self.stats["relinked"] += c.rowcount
             m.execute("INSERT OR REPLACE INTO opencode_sync_messages VALUES (?,?,?,?,?,?)",
                       (mid, sid, tu, 1, 0, int(time.time())))
 

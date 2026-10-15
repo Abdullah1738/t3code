@@ -23,7 +23,6 @@ setup() { # fake-or-real sqlite3_rsync
   "$SQLITE" "$R/data/memory.db" "PRAGMA journal_mode=wal;
     CREATE TABLE episodic_events(id INTEGER PRIMARY KEY, timestamp INTEGER);
     INSERT INTO episodic_events VALUES (1,$old),(2,$old);" >/dev/null
-  "$SQLITE" "$R/data/agent_notes.db" "CREATE TABLE n(x);"
   if [ "$1" = fake ]; then
     # silent no-op on later runs: exit 0 and leave the replica untouched
     printf '#!/bin/bash\n[ -f "${@: -1}" ] || cp "${@: -2:1}" "${@: -1}"\nexit 0\n' > "$R/bin/sqlite3_rsync"
