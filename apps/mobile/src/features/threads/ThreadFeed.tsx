@@ -842,7 +842,9 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
       // Positions and context come from the whole reply, not the block the selection sits in.
       const markdown = segments
         .flatMap((segment) =>
-          segment.kind === "markdown" ? [renderCodexFileCitationsAsMarkdown(segment.markdown)] : [],
+          segment.kind === "markdown"
+            ? [renderCodexInlineDirectivesAsMarkdown(segment.markdown)]
+            : [],
         )
         .join("\n\n");
       onCiteAssistantText({ messageId, markdown, selectedText });
