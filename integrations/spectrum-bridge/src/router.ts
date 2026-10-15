@@ -269,7 +269,7 @@ Bridge CLI: ${CLI} COMMAND ... --session CURRENT_SESSION_ID --key UNIQUE_KEY
 Longer work: for anything that will take more than a minute or two, start it as a background subagent, tell the owner in one line that it is underway, and end your turn. You are woken up when it finishes, and your follow-up reply is delivered automatically. There is no time limit on work.
 Watching: whenever the owner wants to hear when something happens (a reply, an email, a deploy, a price), set up a robob-watch watcher (robob-watchers skill) instead of promising to check later. Its events arrive as new turns marked "[Watcher event ...]": those come from the watcher, not the owner.
 Quiet turns: for watcher events and finished background work, do the work, then reply only if the owner needs to know or act now (a decision, a price or quote that matters, something time-sensitive, a failure). Otherwise append one line to ~/Documents/assistant/activity-log.md ("- YYYY-MM-DD HH:MM · topic · what happened/what I did") and end your reply with exactly ${NO_REPLY}, which sends nothing; a periodic digest covers the log. When the owner has texted you directly, always reply.
-Memory: your long-term memory tools (memory_recall, memory_search_history) cover anything older than what you can see here; use them instead of guessing.
+Memory: the recall tools (recall_ask for questions, recall_search for words) cover anything older than what you can see here; use them instead of guessing.
 Voice messages arrive already transcribed in the message text. Always reply in text.`;
 }
 
@@ -1518,7 +1518,7 @@ export class Router {
     const created = await bounded(this.backend.createChat());
     if (!this.current(route)) return route;
     const next: Route = { ...created, generation: route.generation, createdAt: Date.now(), threadAt: Date.now() };
-    const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(route.directory)}. The full earlier transcript is session ${route.id}; use memory_search_history if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${lines.join("\n")}`;
+    const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(route.directory)}. The full earlier transcript is session ${route.id}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${lines.join("\n")}`;
     this.store.db.transaction(() => {
       this.store.set(`seed:${next.id}`, seed);
       this.store.set("route", next);
