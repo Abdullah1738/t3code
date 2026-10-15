@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS episodic_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     
     -- Provenance
-    source TEXT NOT NULL CHECK(source IN ('codex', 'hermes', 'opencode')),
+    source TEXT NOT NULL CHECK(source IN ('codex', 'hermes', 'opencode', 'muse')),
     session_id TEXT NOT NULL,
     turn_id TEXT,
     timestamp INTEGER NOT NULL, -- Unix timestamp

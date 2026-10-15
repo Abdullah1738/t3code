@@ -135,6 +135,18 @@ mkdir -p "$STAGE/files"
 /opt/homebrew/bin/rsync -a --delete --exclude='__pycache__' --exclude='*.pyc' \
   "$ROOT/src" "$ROOT/scripts" "$ROOT/HANDOFF.md" \
   "$STAGE/files/" >>"$LOG" 2>&1 || fail files "rsync code"
+# Muse Code's own session logs are the raw source for its rows in memory.db
+# (append-only JSONL, like opencode_raw.db is for OpenCode).
+MUSE_SESSIONS="${XDG_DATA_HOME:-$HOME/.local/share}/muse/sessions"
+if [ -d "$MUSE_SESSIONS" ]; then
+  # Skip Muse's live scratch (spool/tmp files, its own SQLite DBs, locks). rsync
+  # exits 24 when a file vanishes mid-copy; that's fine for a live tree.
+  mrc=0
+  /opt/homebrew/bin/rsync -a --delete --delete-excluded --exclude='.msp-view-v1/' --exclude='.spool/' \
+    --exclude='*.tmp' --exclude='*.lock' --exclude='*.sqlite3*' --exclude='*.db' --exclude='*.db-*' \
+    "$MUSE_SESSIONS/" "$STAGE/files/muse-sessions/" >>"$LOG" 2>&1 || mrc=$?
+  [ "$mrc" = 0 ] || [ "$mrc" = 24 ] || fail files "rsync muse sessions rc=$mrc"
+fi
 cp -p "$HOME/Library/LaunchAgents/"com.abdullah.memory-*.plist \
   "$HOME/Library/LaunchAgents/com.abdullah.recall.plist" "$STAGE/files/" 2>/dev/null
 

@@ -1,4 +1,4 @@
-"""recall: search and read every past agent session (Codex, Hermes, OpenCode).
+"""recall: search and read every past agent session (Codex, Hermes, OpenCode, Muse Code).
 
   recall list [words] [--cwd DIR] [--source S] [--since 7d] [-n 20] [--all]
   recall query <words> [--tools] [--cwd DIR] [--source S] [--since/--until] [-n 10]
@@ -113,7 +113,7 @@ def format_list(rows: list[dict]) -> str:
 
 def _common(p: argparse.ArgumentParser, *, window: bool = True) -> None:
     p.add_argument("--json", action="store_true")
-    p.add_argument("--source", choices=["codex", "hermes", "opencode"])
+    p.add_argument("--source", choices=["codex", "hermes", "opencode", "muse"])
     p.add_argument("--cwd", help="only sessions in this directory (or below)")
     if window:
         p.add_argument("--since", help="YYYY-MM-DD, 7d, 3w, 2m")

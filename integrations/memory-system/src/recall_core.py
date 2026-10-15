@@ -666,6 +666,7 @@ CREATE TABLE IF NOT EXISTS sessions(
   updated_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS sessions_last ON sessions(last_ts DESC);
+CREATE INDEX IF NOT EXISTS sessions_parent ON sessions(parent_id);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -724,6 +725,19 @@ def compute_session(con: sqlite3.Connection, session_id: str) -> dict | None:
                 title = r[0] or title
                 cwd = r[1] or cwd
                 parent_id = r[2]
+    elif source == "muse":
+        # sync_muse.py keeps Robob thread titles and parents for Muse sessions.
+        try:
+            r = con.execute(
+                "SELECT title, cwd, parent_id, model FROM muse_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+        except sqlite3.Error:
+            r = None
+        if r:
+            title = r[0] or title
+            cwd = r[1] or cwd
+            parent_id = r[2]
+            model = r[3] or model
     if not title or re.match(r"^(New session|Untitled)\b", title or ""):
         title = (first_prompt or "")[:90] or title
     return {
@@ -768,6 +782,22 @@ def set_catalog_meta(key: str, value) -> None:
     con.commit()
 
 
+def _refresh_muse_meta(con) -> int:
+    """Muse titles/parents can arrive after a log goes quiet (Robob maps threads late)."""
+    since = int(catalog_meta("muse_meta_at") or 0)
+    try:
+        rows = con.execute(
+            "SELECT session_id, updated_at FROM muse_sessions WHERE updated_at > ?", (since,)
+        ).fetchall()
+    except sqlite3.Error:
+        return 0
+    if not rows:
+        return 0
+    done = _compute_and_store(con, [r[0] for r in rows])
+    set_catalog_meta("muse_meta_at", max(r[1] for r in rows))
+    return done
+
+
 def refresh_catalog(full: bool = False, progress=None, deadline: Deadline | None = None) -> dict:
     """Recompute sessions touched since the last watermark (or all of them)."""
     con = mem()
@@ -775,7 +805,8 @@ def refresh_catalog(full: bool = False, progress=None, deadline: Deadline | None
     max_id = con.execute("SELECT max(id) FROM episodic_events").fetchone()[0] or 0
     wm = 0 if full else int(catalog_meta("watermark") or 0)
     if wm >= max_id:
-        return {"updated": 0, "watermark": wm, "elapsed_ms": 0}
+        n = _refresh_muse_meta(con)
+        return {"updated": n, "watermark": wm, "elapsed_ms": int((time.monotonic() - t0) * 1000)}
     if wm == 0:
         # Full build: every session once, watermark only at the end.
         ids = [r[0] for r in con.execute("SELECT DISTINCT session_id FROM episodic_events INDEXED BY idx_episodic_session_timestamp")]
@@ -794,6 +825,7 @@ def refresh_catalog(full: bool = False, progress=None, deadline: Deadline | None
         done += _compute_and_store(con, ids, progress)
         wm = hi
         set_catalog_meta("watermark", wm)
+    done += _refresh_muse_meta(con)
     set_catalog_meta("refreshed_at", int(time.time()))
     return {"updated": done, "watermark": wm, "elapsed_ms": int((time.monotonic() - t0) * 1000)}
 
@@ -933,23 +965,27 @@ def lineage(session_id: str | None, days: int = 14, max_ids: int = 1500) -> froz
             rows = []
         roots |= {sid for sid, t in rows if base_title(t or "") == base}
     out = set(roots)
-    if oc is not None:
-        frontier = list(roots)
-        for _ in range(4):
-            if not frontier or len(out) >= max_ids:
-                break
-            nxt = []
-            for i in range(0, len(frontier), 400):
-                chunk = frontier[i : i + 400]
+    # Children come from OpenCode's own session tree and from the catalog, which
+    # also knows other harnesses' children (e.g. Muse threads a session delegated).
+    sources = [catalog()] + ([oc] if oc is not None else [])
+    frontier = list(roots)
+    for _ in range(4):
+        if not frontier or len(out) >= max_ids:
+            break
+        nxt = []
+        for i in range(0, len(frontier), 400):
+            chunk = frontier[i : i + 400]
+            marks = ",".join("?" * len(chunk))
+            for con in sources:
+                table = "session_v2" if con is oc else "sessions"
+                key = "id" if con is oc else "session_id"
                 try:
-                    nxt += [r[0] for r in oc.execute(
-                        f"SELECT id FROM session_v2 WHERE parent_id IN ({','.join('?' * len(chunk))})", chunk
-                    )]
+                    nxt += [r[0] for r in con.execute(f"SELECT {key} FROM {table} WHERE parent_id IN ({marks})", chunk)]
                 except sqlite3.Error:
-                    break
-            nxt = [s for s in nxt if s not in out]
-            out.update(nxt)
-            frontier = nxt
+                    continue
+        nxt = [s for s in dict.fromkeys(nxt) if s not in out]
+        out.update(nxt)
+        frontier = nxt
     res = frozenset(list(out)[:max_ids])
     if len(_lineage_cache) > 500:
         _lineage_cache.clear()

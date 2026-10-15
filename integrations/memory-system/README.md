@@ -1,6 +1,6 @@
 # Memory System (recall)
 
-Every session Abdullah has had with AI agents (Codex, Hermes, OpenCode/Robob) in
+Every session Abdullah has had with AI agents (Codex, Hermes, OpenCode/Robob, Muse Code) in
 one SQLite store, with instant search, Haiku answers over the transcripts and a
 cautious auto-recall plugin. No extracted facts, profiles or graphs: the
 transcripts are the memory.
@@ -12,6 +12,11 @@ runtime data.
 
 - `src/sync_opencode_v2.py` - incremental OpenCode capture into `episodic_events`
   (Codex and Hermes were one-time imports).
+- `src/sync_muse.py` - incremental Muse Code capture (source `muse`): tails each
+  `~/.local/share/muse/sessions/**/session.jsonl` from its last byte offset
+  (`muse_sync_files`), projects prompts, answers, reasoning summaries and tool
+  calls/results, skips Muse's reminder-observer children, and keeps Robob thread
+  titles and parents in `muse_sessions`. Runs inside the capture tick.
 - `src/build_text_fts.py` - builds `episodic_text_fts`, the contentless
   user/assistant text index the search uses (writers need SQLite >= 3.47; not in
   `schema.sql`, so run it after a DB rebuild).

@@ -29,7 +29,7 @@ LOG_DIR = Path(os.environ.get("RECALL_LOG_DIR", rc.ROOT / "logs"))
 INJECT_LOG = LOG_DIR / "recall-inject.jsonl"
 _log_lock = threading.Lock()
 
-INSTRUCTIONS = """Recall searches every past agent session the user has had (Codex, Hermes, OpenCode; 28k+ sessions since 2025-08).
+INSTRUCTIONS = """Recall searches every past agent session the user has had (Codex, Hermes, OpenCode, Muse Code; 28k+ sessions since 2025-08).
 - recall_ask: a question in plain words -> short cited answer (Haiku reads the matching sessions). Start here.
 - recall_search: exact keyword search -> matching sessions with snippets. Use for names, ids, error strings, commands (include_tools).
 - recall_read: read a session or a slice of it (ref like <session>#e<event> or <session>#40-60).
@@ -48,7 +48,7 @@ def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", s
     """Answer a question from past agent sessions, with [n] citations and the sessions listed underneath.
 
     Ask in plain words ("what did we decide about kafka for crpko?", "how did we fix the talabat voucher bug?").
-    cwd: only sessions from this project directory. since/until: YYYY-MM-DD or 7d/3w/2m. source: codex|hermes|opencode.
+    cwd: only sessions from this project directory. since/until: YYYY-MM-DD or 7d/3w/2m. source: codex|hermes|opencode|muse.
     """
     try:
         res = ra.ask(

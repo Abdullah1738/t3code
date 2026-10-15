@@ -86,7 +86,7 @@ def _json_obj(text: str) -> dict:
 # ---------------------------------------------------------------------------
 # query planning
 
-PLAN_SYSTEM = """You turn a request into full-text searches over the user's past AI-agent sessions (Codex, Hermes, OpenCode transcripts, ~28k sessions).
+PLAN_SYSTEM = """You turn a request into full-text searches over the user's past AI-agent sessions (Codex, Hermes, OpenCode and Muse Code transcripts, ~28k sessions).
 The index is keyword FTS: every word in a query must appear in one message. Use 1-4 distinctive words per query: names, tools, repos, services, error strings, ticket ids, people, products. No filler words, no "discussed/decided/remember".
 Give 2-5 queries, most specific first; include a synonym or alternate spelling when likely useful.
 Reply with JSON only: {"search": true|false, "queries": ["..."], "since": "YYYY-MM-DD"|null}

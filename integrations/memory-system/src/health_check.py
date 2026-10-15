@@ -4,6 +4,7 @@
 Checks that the whole pipeline is flowing, not just that processes exist:
   sync      raw capture stage (com.abdullah.memory-sync) succeeded recently
   lag       native OpenCode sessions older than 30 min are in memory.db
+  muse_lag  Muse capture ran cleanly; logs quiet for 10 min are fully captured
   recall    recall server answers on :18765 and its session catalog keeps up
   backup    last memory backup succeeded recently
   backup_lock  no backup run is hung (>2 h) or died holding logs/backup.lock
@@ -32,6 +33,7 @@ DATA = os.path.join(ROOT, "data")
 LOGS = os.path.join(ROOT, "logs")
 MEM_DB = os.path.join(DATA, "memory.db")
 OC_DB = os.path.join(HOME, ".local/share/opencode/opencode.db")
+MUSE_SESSIONS = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "muse/sessions")
 LIVE_REPO = "/Volumes/ExternalSSD/memory-system-backup/restic/live"
 DROPBOX_LIVE = "/Backups/memory-system/live"
 STATE = os.path.join(LOGS, "health_state.json")
@@ -42,6 +44,7 @@ TG_CLI = os.path.join(HOME, ".local/share/telegram-bridge/src/cli.ts")
 SYNC_MAX_AGE = 15 * 60          # tick every 120 s
 LAG_GRACE_MS = 30 * 60 * 1000   # settle window is 10 min
 LAG_MAX = 3
+MUSE_LAG_GRACE = 10 * 60        # a log may run ahead of memory.db this long
 RECALL_URL = "http://127.0.0.1:18765/api/health"
 RECALL_MAX_LAG = 20000          # events the session catalog may trail by
 BACKUP_MAX_AGE = 9 * 3600       # backup every 4 h
@@ -110,6 +113,47 @@ def check_lag():
     if len(behind) > LAG_MAX:
         return False, f"{len(behind)} OpenCode sessions not synced into memory.db (e.g. {behind[0]})"
     return True, f"{len(behind)} sessions behind"
+
+
+def check_muse_lag():
+    """Muse capture ran cleanly, and logs that grew MUSE_LAG_GRACE ago are fully captured."""
+    if not os.path.isdir(MUSE_SESSIONS):
+        return True, "no Muse sessions"
+    try:
+        st = json.load(open(os.path.join(LOGS, "muse_last.json")))
+    except Exception:
+        st = None
+    if st is not None:
+        age = time.time() - (st.get("ts") or 0)
+        if age > SYNC_MAX_AGE:
+            return False, f"Muse capture last ran {int(age / 60)} min ago"
+        if not st.get("ok"):
+            errs = "; ".join(st.get("errors") or [])[:200]
+            return False, f"Muse capture failed: {errs or 'see logs/capture-*.log'}"
+    mem = ro(MEM_DB)
+    try:
+        known = {p: (size, skip) for p, size, skip in mem.execute("SELECT path, size, skip FROM muse_sync_files")}
+    except sqlite3.Error:
+        known = {}
+    cutoff = time.time() - MUSE_LAG_GRACE
+    behind = []
+    for dirpath, dirnames, filenames in os.walk(MUSE_SESSIONS):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("tool-outputs", "approval-review")]
+        if "session.jsonl" not in filenames:
+            continue
+        path = os.path.join(dirpath, "session.jsonl")
+        try:
+            fst = os.stat(path)
+        except OSError:
+            continue
+        if fst.st_mtime > cutoff:
+            continue
+        size, skip = known.get(path, (None, 0))
+        if not skip and size != fst.st_size:
+            behind.append(os.path.basename(dirpath))
+    if len(behind) > LAG_MAX:
+        return False, f"{len(behind)} Muse Code sessions not synced into memory.db (e.g. {behind[0]})"
+    return True, f"{len(behind)} Muse sessions behind"
 
 
 def check_recall():
@@ -267,7 +311,7 @@ def check_worktree_reaper():
     return True, f"removed {len(st.get('removed', []))} worktrees this run, {st.get('worktrees', '?')} checked"
 
 
-CHECKS = [("sync", check_sync), ("lag", check_lag), ("recall", check_recall),
+CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("recall", check_recall),
           ("backup", check_backup),
           ("backup_lock", check_backup_lock),
           ("dropbox", check_dropbox), ("disk", check_disk), ("cold_finalize", check_cold_finalize),

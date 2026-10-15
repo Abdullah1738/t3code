@@ -204,10 +204,10 @@ def with_retry(db, fn, tries=120):
             r = fn()
             db.commit()
             return r
-        except sqlite3.OperationalError as e:
+        except Exception as e:
             if db.in_transaction:
-                db.rollback()
-            if "locked" not in str(e) and "busy" not in str(e):
+                db.rollback()  # never leave the write lock held on a failure
+            if not isinstance(e, sqlite3.OperationalError) or ("locked" not in str(e) and "busy" not in str(e)):
                 raise
             time.sleep(min(1 + i, 20))
     raise RuntimeError("database busy after retries")
