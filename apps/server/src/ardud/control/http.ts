@@ -412,7 +412,7 @@ const makeRoutes = Effect.gen(function* () {
       return session;
     });
 
-  const uuid = crypto.randomUUIDv4.pipe(Effect.orDie);
+  const uuid = crypto.randomUUIDv4().pipe(Effect.orDie);
   const commandIdFor = (operation: string, clientRequestId: string | undefined) =>
     clientRequestId === undefined
       ? uuid.pipe(Effect.map((id) => CommandId.make(`ardud-control:${operation}:${id}`)))
