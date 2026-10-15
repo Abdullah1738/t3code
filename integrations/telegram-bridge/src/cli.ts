@@ -18,6 +18,12 @@ export const validMimeType = (value: unknown): value is string =>
   typeof value === "string" && value.length <= 100 && !/[^\x21-\x7e]/.test(value)
   && /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(value);
 
+/** Matches the bridge's /notify source rule: at most 40 chars of [A-Za-z0-9 ._-]. */
+export function sanitizeSource(value: string): string {
+  const cleaned = value.replace(/[^A-Za-z0-9 ._-]+/g, "-").replace(/-{2,}/g, "-").trim().slice(0, 40).trim().replace(/^-+|-+$/g, "");
+  return cleaned || "agent";
+}
+
 export function parseCommand(args: string[]): Command {
   const optionsByCommand: Record<string, string[]> = {
     health: [],
@@ -90,7 +96,7 @@ export function parseCommand(args: string[]): Command {
       }
       return {
         method: "POST", path: "/notify",
-        body: { source: required(values.source, "--source"), severity, text: required(values.text, "--text"), dedupeKey: required(values.key, "--key") },
+        body: { source: sanitizeSource(required(values.source, "--source")), severity, text: required(values.text, "--text"), dedupeKey: required(values.key, "--key") },
       };
     }
     case "send-file": {

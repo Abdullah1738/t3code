@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import * as os from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadCommandPayload, MAX_FILE_BYTES, parseCommand } from "../src/cli.ts";
+import { loadCommandPayload, MAX_FILE_BYTES, parseCommand, sanitizeSource } from "../src/cli.ts";
 
 const at = "2026-09-11T09:30:00+04:00";
 const notify = ["notify", "--source", "tests", "--text", "hello", "--key", "event-1"];
@@ -22,6 +22,14 @@ describe("parseCommand", () => {
       method: "POST", path: "/notify",
       body: { source: "tests", severity: "info", text: "hello", dedupeKey: "event-1" },
     });
+  });
+
+  test("sanitizes --source to the bridge's accepted shape", () => {
+    expect(parseCommand(["notify", "--source", "risk-liquidation-latest#58", "--text", "hi", "--key", "k"]).body?.source)
+      .toBe("risk-liquidation-latest-58");
+    expect(sanitizeSource("  a!!b   c/d  ")).toBe("a-b   c-d");
+    expect(sanitizeSource("x".repeat(60))).toHaveLength(40);
+    expect(sanitizeSource("#### ")).toBe("agent");
   });
 
   test("parses send-file purely as a local reference with an optional caption and MIME", () => {
