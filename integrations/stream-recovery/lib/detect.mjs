@@ -169,9 +169,6 @@ export function planThread(input, { staleMs = 6 * 3_600_000 } = {}) {
   const plan = { threadId: thread.threadId, title: thread.title, origin: thread.origin ?? null, resumeQueue: held.length > 0 };
 
   if (thread.archived) return { ...plan, action: "skip", reason: "archived", resumeQueue: false };
-  if (thread.origin === "crw") {
-    return { ...plan, action: held.length ? "release" : "skip", reason: "crw review thread (crw handles it)" };
-  }
   if (thread.origin === "imessage") {
     const report = lost.length > 0 || reply != null;
     return { ...plan, action: report ? "report" : held.length ? "release" : "skip", reason: "iMessage bridge thread" };
@@ -288,12 +285,13 @@ export function serverStartWindow(start, { marginMs = 60_000, startupMs = 5 * 60
 export function trackServer(servers, current, now, { keep = 20 } = {}) {
   const list = (servers ?? []).map((s) => ({ ...s }));
   if (!current) return list;
-  const known = list.find((s) => s.pid === current.pid && s.readyMs === current.readyMs);
+  const service = current.service ?? 'robob';
+  const known = list.find((s) => (s.service ?? 'robob') === service && s.pid === current.pid && s.readyMs === current.readyMs);
   if (known) {
     known.lastSeenMs = now;
     return list;
   }
-  const prev = list.at(-1);
+  const prev = list.findLast((s) => (s.service ?? 'robob') === service);
   list.push({ ...current, firstSeenMs: now, lastSeenMs: now, prevSeenMs: prev?.lastSeenMs ?? null });
   return list.slice(-keep);
 }
@@ -303,7 +301,7 @@ export function trackServer(servers, current, now, { keep = 20 } = {}) {
 // A cluster is a restart when it spans >= minThreads root threads with >=
 // minBurst rows, or when any row falls in a server start window. A burst in
 // one thread tree alone is a Stop (or task_cancel), not a restart.
-export function findRestartIncidents(subs, { serverStarts = [], gapMs = 10_000, minBurst = 3, minThreads = 2 } = {}) {
+export function findRestartIncidents(subs, { runs = [], serverStarts = [], gapMs = 10_000, minBurst = 3, minThreads = 2 } = {}) {
   const windows = serverStarts.map((s) => serverStartWindow(s)).filter(Boolean);
   const rows = subs
     .filter((s) => s.result == null)
@@ -316,7 +314,7 @@ export function findRestartIncidents(subs, { serverStarts = [], gapMs = 10_000, 
     if (last && s.ms - last.at(-1).ms <= gapMs) last.push(s);
     else clusters.push([s]);
   }
-  return clusters
+  const incidents = clusters
     .map((cluster) => {
       const roots = new Set(cluster.map((s) => s.rootThreadId ?? s.parentThreadId ?? s.thread_id));
       const burst = cluster.length >= minBurst && roots.size >= minThreads;
@@ -324,17 +322,49 @@ export function findRestartIncidents(subs, { serverStarts = [], gapMs = 10_000, 
       if (!burst && !win) return null;
       return {
         kind: "restart",
-        id: restartIncidentId(cluster[0].ms),
+        id: win?.start.incidentId ?? restartIncidentId(cluster[0].ms),
         startMs: cluster[0].ms,
         endMs: cluster.at(-1).ms,
         failAllMs: cluster[0].ms,
         reason: win ? "server start" : "burst",
         serverStart: win?.start ?? null,
+        windowFrom: win?.from ?? cluster[0].ms - 60_000,
+        windowTo: win?.to ?? cluster.at(-1).ms + 60_000,
         runs: [],
         subagents: cluster.map(({ ms, ...s }) => ({ ...s, parentThreadId: s.parentThreadId ?? s.thread_id })),
       };
     })
     .filter(Boolean);
+  // A slow startup can cancel separate thread trees more than ten seconds
+  // apart. They still belong to one restart, with one note per thread.
+  const merged = [];
+  for (const incident of incidents) {
+    const same = incident.serverStart && merged.find((i) => i.serverStart === incident.serverStart);
+    if (same) {
+      same.endMs = Math.max(same.endMs, incident.endMs);
+      same.subagents.push(...incident.subagents);
+    } else merged.push(incident);
+  }
+  for (const run of runs) {
+    if (!['cancelled', 'failed'].includes(run.status) || isNestedThreadId(run.thread_id)) continue;
+    if (run.status === 'cancelled' && !run.started_at && !run.dispatched) continue;
+    const ms = toMs(run.completed_at);
+    let incident = merged.find((i) => ms >= i.windowFrom && ms <= i.windowTo);
+    if (!incident) {
+      const win = windows.find((w) => ms >= w.from && ms <= w.to);
+      if (!win) continue;
+      incident = {
+        kind: 'restart', id: win.start.incidentId ?? restartIncidentId(win.start.readyMs), startMs: ms, endMs: ms,
+        failAllMs: ms, reason: 'server start', serverStart: win.start,
+        windowFrom: win.from, windowTo: win.to, runs: [], subagents: [],
+      };
+      merged.push(incident);
+    }
+    incident.runs.push(run);
+    incident.startMs = Math.min(incident.startMs, ms);
+    incident.endMs = Math.max(incident.endMs, ms);
+  }
+  return merged;
 }
 
 const REDO_SUFFIX = /\s*\((?:resume|resumed|retry|re-?run|re-?launch|continue|continued|finish|restart|restarted)\b[^)]*\)\s*$/;
@@ -393,32 +423,34 @@ export const RESTART_STALE_REASON = "only stale subagents (idle for hours before
 const NEEDS = new Set(["cut", "running", "finished"]);
 
 // lost: [{status: cut | running | finished | stale | redispatched | delivered, ...}]
-export function planRestartThread({ thread, lost = [] }) {
+export function planRestartThread({ thread, lost = [], turnCut = false, held = [], busy = false }) {
   const plan = { threadId: thread.threadId, title: thread.title, origin: thread.origin ?? null, resumeQueue: false };
   if (thread.archived) return { ...plan, action: "skip", reason: "archived" };
-  if (thread.origin === "crw") return { ...plan, action: "skip", reason: "crw review thread (crw handles it)" };
+  if (busy) return { ...plan, action: 'skip', reason: 'fresh turn is running' };
   const needs = lost.filter((l) => NEEDS.has(l.status));
   if (thread.origin === "imessage") {
-    return { ...plan, action: needs.length ? "report" : "skip", reason: "iMessage bridge thread" };
+    return { ...plan, action: turnCut || lost.length || held.length ? "report" : "skip", reason: "iMessage bridge thread" };
   }
-  if (!needs.length) {
+  if (!turnCut && !held.length && !lost.some((l) => l.status !== 'stale')) {
     const reason = lost.length && lost.every((l) => l.status === "stale") ? RESTART_STALE_REASON : "already re-dispatched or delivered";
     return { ...plan, action: "skip", reason };
   }
-  return { ...plan, action: "note", reason: `${needs.length} lost subagent(s) to pick up` };
+  return { ...plan, resumeQueue: held.length > 0, action: "note", reason: turnCut ? 'own turn cut off by restart' : `${needs.length} lost subagent(s) to pick up` };
 }
 
 const PROMPT_MAX = 1_200;
 const PROMPTS_TOTAL = 10_000;
 
-export function buildRestartNote({ incident, lost = [], turnCut = false, ocUrl }) {
+export function buildRestartNote({ incident, lost = [], turnCut = false, held = [], staleHeld = [], ocUrl }) {
   const at = hhmm(incident.failAllMs ?? incident.startMs);
   const needs = lost.filter((l) => NEEDS.has(l.status));
   const done = lost.filter((l) => l.status === "redispatched" || l.status === "delivered");
   const auth = `-u "opencode:$(cat ~/.config/opencode-service/password)"`;
   const parts = [
-    `[stream-recovery] Robob restarted at ${at} and cancelled ${needs.length} background subagent(s) this thread had running. Robob will not deliver their results, so nothing will wake you for them.` +
+    `[stream-recovery] ${incident.serverStart?.service === 'opencode' ? 'OpenCode' : 'Robob'} restarted at ${at}` +
+      (needs.length ? ` and cancelled ${needs.length} background subagent(s) this thread had running. Robob will not deliver their results, so nothing will wake you for them.` : '.') +
       (turnCut ? ` Your own turn was cut off by the same restart; carry on from where you were.` : ""),
+    `On every macOS boot, dirhelper -machineBoot fully wipes $TMPDIR. Scratch files under $TMPDIR/opencode are gone after a Mac reboot; reconstruct missing briefs and reports from durable files or session history before resuming work.`,
   ];
   let budget = PROMPTS_TOTAL;
   const lines = needs.map((l, i) => {
@@ -438,15 +470,15 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, ocUrl }
     }
     return `${head}cut off by the restart.${prompt}`;
   });
-  parts.push(`Lost subagents:\n${lines.join("\n")}`);
+  if (lines.length) parts.push(`Lost subagents:\n${lines.join("\n")}`);
   if (done.length) {
     parts.push(
       `Already handled, no action needed: ` +
         done
           .map((l) =>
             l.status === "redispatched"
-              ? `"${truncate(l.title ?? "subagent", 60)}" (re-dispatched as "${truncate(l.redo?.title ?? "subagent", 60)}" at ${hhmm(l.redo?.started_at)})`
-              : `"${truncate(l.title ?? "subagent", 60)}" (its result is in your history)`,
+               ? `"${truncate(l.title ?? "subagent", 60)}" (session ${l.sessionId ?? 'unknown'}; re-dispatched as "${truncate(l.redo?.title ?? "subagent", 60)}" at ${hhmm(l.redo?.started_at)})`
+               : `"${truncate(l.title ?? "subagent", 60)}" (session ${l.sessionId ?? 'unknown'}; its result is in your history)`,
           )
           .join("; ") +
         ".",
@@ -457,17 +489,22 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, ocUrl }
       `For each cut-off subagent you still need, resume it with your subagent tool: pass its session id as the session to continue, with a short prompt such as "Robob restarted and cut you off. Carry on from where you stopped and finish the task." It keeps its context. Re-dispatch from the original prompt only if the resume fails. Skip any you no longer need or already relaunched.`,
     );
   }
+  if (staleHeld.length) parts.push(`Cancelled stale held coordination pulses (over 2h old):\n` + staleHeld.map((r) =>
+    `- ${r.run_id}, queued ${hhmm(r.requested_at)}: ${fence(truncate(r.text ?? '', 240))}`).join('\n'));
+  if (held.length) parts.push(`Robob had held ${held.length} queued message(s). Recovery is releasing the queue; these reach you as separate turns.`);
   parts.push(
-    `Read a subagent's output with: curl -s ${auth} "${ocUrl}/api/session/<ses>/message?limit=5" (newest first). Then post a one-line status and carry on. If you already handed this lane to a newer thread, pass anything relevant to it and stop.`,
+    (lost.length ? `Read a subagent's output with: curl -s ${auth} "${ocUrl}/api/session/<ses>/message?limit=5" (newest first). ` : '') +
+    `Then post a one-line status and carry on. If you already handed this lane to a newer thread, pass this recovery note, including every listed child session and result, to it and stop.`,
   );
   return parts.join("\n\n");
 }
 
 export function buildRestartSummary({ incident, results }) {
-  const threads = new Set(incident.subagents.map((s) => s.parentThreadId ?? s.thread_id)).size;
+  const threads = new Set([...incident.subagents.map((s) => s.parentThreadId ?? s.thread_id), ...(incident.runs ?? []).map((r) => r.thread_id)]).size;
   const lines = [
     `Robob restart at ${hhmm(incident.failAllMs ?? incident.startMs)} cancelled ${incident.subagents.length} background subagent(s) in ${threads} thread(s).`,
   ];
+  if (incident.runs?.length) lines.push(`${incident.runs.length} own turn(s) were cut off by the restart.`);
   const name = (r) => truncate(r.plan.title ?? r.plan.threadId, 40);
   const needCount = (r) => (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).length;
   const noted = results.filter((r) => r.plan.action === "note" && r.ok);
@@ -482,8 +519,10 @@ export function buildRestartSummary({ incident, results }) {
     const lost = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).map((l) => `"${truncate(l.title ?? l.sessionId, 60)}" (${l.sessionId})`);
     lines.push(`iMessage (${name(r)}): lost ${lost.join(", ")}; the thread was not told.`);
   }
-  const held = results.filter((r) => r.held > 0 && r.plan.reason !== "archived");
-  if (held.length) lines.push(`Queued messages Robob is holding (resume them in Robob if still wanted): ${held.map((r) => `${name(r)} (${r.held})`).join("; ")}.`);
+  const released = results.filter((r) => r.queueOk);
+  if (released.length) lines.push(`Released held queues: ${released.map((r) => `${name(r)} (${r.held}, ${r.staleHeld?.length ?? 0} stale pulses cancelled)`).join('; ')}.`);
+  const held = results.filter((r) => r.held > 0 && !r.queueOk && r.plan.reason !== 'archived');
+  if (held.length) lines.push(`Queues still held: ${held.map((r) => `${name(r)} (${r.held})`).join('; ')}.`);
   const failed = results.filter((r) => r.error);
   if (failed.length) lines.push(`Errors: ${failed.map((r) => `${name(r)}: ${truncate(r.error, 120)}`).join("; ")}.`);
   const attention = results.some((r) => r.plan.action === "report") || failed.length > 0;

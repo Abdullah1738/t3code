@@ -18,7 +18,7 @@ block every later queued message.
    error, or a burst of 3+ subagents failed within 2s with no result.
 2. Waits 90s after the last failure, then per affected thread (failed-run
    threads plus the top-level parents of lost subagents):
-   - skips archived threads, crw review threads (crw owns them), threads that
+    - skips archived threads, threads that
      recovered on their own with nothing pending, and stale sessions;
    - finds user messages that never reached OpenCode (by Robob prompt ids
      `msg_t3_turn_<ses>:<attempt>` / `msg_t3_steer_<ses>:<message>`), replies
@@ -41,14 +41,17 @@ every native background subagent Robob still had open as `cancelled` with no
 result. Their wake-ups never come, so parents sit idle or start over. Each scan
 also looks for those:
 
-- Reads `cancelled` provider-native subagents (statev2, read-only). A cluster
+- Reads `cancelled` provider-native subagents and top-level `cancelled`/`failed`
+  runs (statev2, read-only). Cancelled queued messages and user Stops are excluded. A cluster
   (rows <= 10s apart) is a restart when it has 3+ rows across 2+ top-level
-  thread trees, or when any row falls in a Robob server start window.
+  thread trees, or when any row falls in a Robob/OpenCode server start window.
+  Own turns in that window get recovered even when no children were running.
 - Server start signal: `~/.robob/userdata/server-runtime.json` (`pid`,
   `startedAt` = ready time, written after startup recovery) plus the process
   start from `ps -o lstart=`. Scans keep a short history in `state.servers`;
   the window runs from the last scan that saw the previous server (so shutdown
   cancels count) or process start minus 60s, to ready plus 60s.
+  OpenCode's LaunchAgent PID and process start supply its independent window.
 - Not a restart: a user Stop (Robob marks those subagents `interrupted`), a
   burst inside one thread tree, delegated `task_cancel` (app-owned rows), and
   sessions the stall watch interrupted itself.
@@ -59,13 +62,24 @@ also looks for those:
   `(resume)`-style suffix), still running, finished (result never delivered,
   or delivered: in Robob or in the parent's OpenCode history after a later
   turn), cut, or stale (idle 6h+ before the restart).
-- One note per parent thread with something left (control API, mode auto,
+- One note per affected idle thread, including crw and handed-off parents (control API, mode queue,
   `clientRequestId` = incident id) listing title, model, child session, start
   time, and the original prompt (statev2 `payload.prompt`) or the finished
-  result, and asking it to resume each cut one by session id. Archived, crw
-  and iMessage threads get no note; iMessage ones go in the summary.
+  result, and asking it to resume each cut one by session id. Handled children
+  are still listed so a parent can pass them to its replacement thread. Notes
+  explain that macOS boot wipes `$TMPDIR`, including `$TMPDIR/opencode`.
+  Archived threads and threads stopped since the restart get no note;
+  iMessage threads are reported in the summary.
+- Rechecks active turns in both Robob and OpenCode before mutations. Fresh
+  turns are deferred until idle; queue delivery cannot interrupt or steer a racing turn.
+  Per-thread progress and the durable message receipt prevent resends after
+  partial failures. Restart failures are excluded from the stream-loss scan.
+- Cancels held `[coord]` messages older than 2h with a verified `coord:`
+  client-request namespace, lists them in the note, and resumes the remaining
+  queue with idempotent commands. Other messages, including legacy lane pulses
+  without verifiable provenance, are preserved regardless of age.
 - One Telegram summary per restart (`stream-recovery:rs-<time>`), including
-  threads whose queued messages Robob is holding. Incident ids start `rs-`.
+  queue recovery results. Incident ids start `rs-`.
 
 ## Stall watch
 

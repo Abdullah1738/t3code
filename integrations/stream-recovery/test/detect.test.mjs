@@ -85,8 +85,8 @@ const base = (over = {}) => ({
 test('planThread decisions', () => {
   assert.equal(planThread(base()).action, 'note');
   assert.equal(planThread(base({ thread: { ...base().thread, archived: true } })).action, 'skip');
-  assert.equal(planThread(base({ thread: { ...base().thread, origin: 'crw' } })).action, 'skip');
-  assert.equal(planThread(base({ thread: { ...base().thread, origin: 'crw' }, held: [{}] })).action, 'release');
+  assert.equal(planThread(base({ thread: { ...base().thread, origin: 'crw' } })).action, 'note');
+  assert.equal(planThread(base({ thread: { ...base().thread, origin: 'crw' }, held: [{}] })).action, 'note');
   assert.equal(planThread(base({ thread: { ...base().thread, origin: 'imessage' }, lost: [{}] })).action, 'report');
   assert.equal(planThread(base({ recovered: true })).action, 'skip');
   assert.equal(planThread(base({ recovered: true, orphans: [{ status: 'running' }] })).action, 'note');

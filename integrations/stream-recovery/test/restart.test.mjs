@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { restartRunsSince, queuedRuns, restartNoteRun, stoppedSince } from '../lib/io.mjs';
 import {
   findRestartIncidents, serverStartWindow, trackServer, findRedispatch, normTitle, childOutcome,
   planRestartThread, buildRestartNote, buildRestartSummary, restartIncidentId, RESTART_STALE_REASON,
@@ -111,10 +113,10 @@ test('childOutcome tells finished from cut from stale', () => {
 test('planRestartThread', () => {
   const thread = { threadId: 't', title: 'Lane', origin: null, archived: false };
   assert.equal(planRestartThread({ thread, lost: [{ status: 'cut' }] }).action, 'note');
-  assert.equal(planRestartThread({ thread, lost: [{ status: 'redispatched' }, { status: 'delivered' }] }).action, 'skip');
+  assert.equal(planRestartThread({ thread, lost: [{ status: 'redispatched' }, { status: 'delivered' }] }).action, 'note');
   assert.equal(planRestartThread({ thread, lost: [{ status: 'stale' }] }).reason, RESTART_STALE_REASON);
   assert.equal(planRestartThread({ thread: { ...thread, archived: true }, lost: [{ status: 'cut' }] }).action, 'skip');
-  assert.equal(planRestartThread({ thread: { ...thread, origin: 'crw' }, lost: [{ status: 'cut' }] }).action, 'skip');
+  assert.equal(planRestartThread({ thread: { ...thread, origin: 'crw' }, lost: [{ status: 'cut' }] }).action, 'note');
   assert.equal(planRestartThread({ thread: { ...thread, origin: 'imessage' }, lost: [{ status: 'cut' }] }).action, 'report');
 });
 
@@ -132,7 +134,7 @@ test('buildRestartNote lists each lost subagent with model, session, start and p
   assert.match(note, /Read PACKET-G1\.md and fix the test\./);
   assert.match(note, /finished at 18:13Z, but its result never reached you/);
   assert.match(note, /Commit 4832395cb\./);
-  assert.match(note, /Already handled, no action needed: "Astra final r3" \(re-dispatched as "Astra final r3 \(retry\)" at 18:19Z\)/);
+  assert.match(note, /Already handled, no action needed: "Astra final r3" \(session unknown; re-dispatched as "Astra final r3 \(retry\)" at 18:19Z\)/);
   assert.match(note, /pass its session id as the session to continue/);
   const s = buildRestartSummary({ incident: { ...incident, subagents: [{ parentThreadId: 'a' }, { parentThreadId: 'b' }] }, results: [
     { plan: { threadId: 'a', title: 'Crpko kafka cell', action: 'note' }, ok: true, lostSubs: lost },
@@ -146,11 +148,18 @@ test('buildRestartNote lists each lost subagent with model, session, start and p
 
 // ---------- restartScan with a fake io ----------
 
-function fakeIo({ subs, threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {} }) {
-  const calls = { send: [], telegram: [] };
+function fakeIo({ subs = [], runs = [], threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {}, messages = {}, active = [] }) {
+  const calls = { send: [], telegram: [], commands: [], saves: [] };
   const io = {
     OC_URL: 'http://oc',
     serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
+    openCodeRuntime: () => null,
+    restartRunsSince: () => runs,
+    restartNoteRun: () => null,
+    stoppedSince: () => false,
+    messageText: (_db, id) => messages[id] ?? '',
+    dispatchCommand: async (command) => { calls.commands.push(command); },
+    saveState: (state) => { calls.saves.push(JSON.parse(JSON.stringify(state))); },
     cancelledSubagentsSince: () => subs.map((s) => ({ ...s })),
     subagentParent: () => null,
     threadRoot: () => null,
@@ -159,7 +168,7 @@ function fakeIo({ subs, threads, later = {}, oc = {}, delivered = new Set(), ins
     turnCutAndIdle: () => false,
     runStartedSince: (_db, threadId) => (runAfter ?? []).includes(threadId),
     queuedRuns: (_db, threadId) => (held[threadId] ?? []),
-    activeSessions: async () => new Set(),
+    activeSessions: async () => new Set(active),
     ocMessages: async (ses) => ({ messages: oc[ses] ?? [], complete: true }),
     ocSession: async (ses) => ({ id: ses, parentID: `${ses}_parent` }),
     getThread: async (id) => threads[id] ?? null,
@@ -194,7 +203,7 @@ test('restartScan sends one note per affected thread and one summary, then never
   assert.deepEqual(calls.send.map((c) => c.threadId).sort(), ['batch', 'kafka', 'pbdraft']);
   for (const c of calls.send) {
     assert.equal(c.clientRequestId, 'rs-20261015T181745Z');
-    assert.equal(c.mode, 'auto');
+    assert.equal(c.mode, 'queue');
   }
   const batch = calls.send.find((c) => c.threadId === 'batch').text;
   assert.match(batch, /cancelled 2 background subagent/);
@@ -237,7 +246,7 @@ test('restartScan waits to settle, for the installer, and never acts on a dry ru
   assert.equal(state.handled['rs-20261015T181745Z'].summary, 'seeded');
 });
 
-test('restartScan skips threads whose subagents finished and were delivered, or were idle for hours', async () => {
+test('restartScan reports delivered children for handoffs but skips stale children', async () => {
   const finished = (text) => [{ type: 'assistant', finish: 'stop', time: { created: T0 - 60_000 }, content: [{ type: 'text', text }] }];
   const subs = [
     sub('d1', 'kafka', 0), sub('o1', 'pbdraft', 100, { started_at: iso(T0 - 2 * 86_400_000) }), sub('c1', 'batch', 200),
@@ -259,15 +268,15 @@ test('restartScan skips threads whose subagents finished and were delivered, or 
   const state = { handled: {}, servers: [] };
   const [r] = await restartScan(scanArgs(state), io);
   const by = Object.fromEntries(r.results.map((x) => [x.plan.threadId, x]));
-  assert.equal(by.kafka.plan.action, 'skip');
+   assert.equal(by.kafka.plan.action, 'note');
   assert.equal(by.pbdraft.plan.reason, RESTART_STALE_REASON);
-  assert.equal(by.tc3.plan.action, 'skip');
+   assert.equal(by.tc3.plan.action, 'note');
   assert.deepEqual(by.tc3.lostSubs.map((l) => l.status), ['delivered']);
   assert.equal(by.batch.plan.action, 'note');
   assert.deepEqual(by.batch.lostSubs.map((l) => l.status), ['cut', 'finished']);
-  assert.deepEqual(calls.send.map((c) => c.threadId), ['batch']);
-  assert.match(calls.send[0].text, /fixed in abc123/);
-  assert.match(calls.telegram[0].text, /Queued messages Robob is holding .*Batch-fix Crpko tickets \(1\)/);
+   assert.deepEqual(calls.send.map((c) => c.threadId), ['kafka', 'batch', 'tc3']);
+   assert.match(calls.send.find((c) => c.threadId === 'batch').text, /fixed in abc123/);
+   assert.match(calls.telegram[0].text, /Released held queues: Batch-fix Crpko tickets \(1, 0 stale pulses cancelled\)/);
 });
 
 test('a result in the parent history only counts once the parent ran again', async () => {
@@ -291,4 +300,259 @@ test('cancels from the stall watch interrupting a session are not a restart', as
   const report = await restartScan(scanArgs({ handled: {}, servers: [], stalls }), io);
   assert.equal(report.length, 0);
   assert.equal(calls.telegram.length, 0);
+});
+
+const run = (threadId, over = {}) => ({
+  run_id: `run:thread:${encodeURIComponent(threadId)}:ordinal:19`, thread_id: threadId, ordinal: 19,
+  status: 'cancelled', requested_at: iso(T0 - 6 * 3_600_000), started_at: iso(T0 - 6 * 3_600_000 + 60_000),
+  completed_at: iso(T0 + 7_000), ...over,
+});
+
+test('run-only restarts include failed starts, not interrupted turns or cancelled queued messages', () => {
+  const start = { pid: 1, readyMs: T0 + 10_000, procStartMs: T0 - 60_000 };
+  const runs = [run('arch'), run('failed', { status: 'failed', started_at: null }),
+    run('stop', { status: 'interrupted' }), run('queued', { started_at: null }),
+    run('thread:provider:opencode:native-thread:ses_child'), run('old', { completed_at: iso(T0 - 3_600_000) })];
+  assert.equal(findRestartIncidents([], { runs }).length, 0);
+  const [incident] = findRestartIncidents([], { runs, serverStarts: [start] });
+  assert.deepEqual(incident.runs.map((r) => r.thread_id), ['arch', 'failed']);
+  assert.equal(incident.subagents.length, 0);
+});
+
+test('slow shutdown clusters and run-only threads share one restart', () => {
+  const start = { pid: 1, readyMs: T0 + 60_000, procStartMs: T0 - 60_000 };
+  const [incident, extra] = findRestartIncidents([sub('a', 'parent', 0), sub('b', 'parent', 30_000)], {
+    runs: [run('arch')], serverStarts: [start],
+  });
+  assert.equal(extra, undefined);
+  assert.equal(incident.subagents.length, 2);
+  assert.equal(incident.runs.length, 1);
+  start.incidentId = incident.id;
+  // A sliding lookback dropping the earliest row must not change the key.
+  assert.equal(findRestartIncidents([sub('b', 'parent', 30_000)], { serverStarts: [start] })[0].id, incident.id);
+});
+
+test('restartScan recovers own turns and crw reviewers without needing cancelled children', async () => {
+  const { io, calls } = fakeIo({
+    runs: [run('arch'), run('crw', { status: 'failed' })],
+    subs: [sub('review', 'crw', 0)],
+    threads: { arch: { title: 'Architecture lane' }, crw: { title: 'mobile_app#306', origin: 'crw' } },
+  });
+  const state = { handled: {}, servers: [] };
+  const report = await restartScan(scanArgs(state), io);
+  assert.equal(report.runIds.size, 2);
+  assert.deepEqual(calls.send.map((s) => s.threadId), ['arch', 'crw']);
+  assert.match(calls.send[0].text, /Your own turn was cut off/);
+  assert.doesNotMatch(calls.send[0].text, /Lost subagents:|cancelled 0/);
+  assert.match(calls.send[0].text, /dirhelper -machineBoot fully wipes \$TMPDIR/);
+  assert.match(calls.send[1].text, /ses_review/);
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 2);
+});
+
+test('OpenCode-only restarts recover own turns and track sightings separately from Robob', async () => {
+  const { io, calls } = fakeIo({ runs: [run('arch', { status: 'failed' })], threads: { arch: { title: 'Architecture' } } });
+  io.serverRuntime = () => ({ pid: 8, procStartMs: T0 - 86_400_000, readyMs: T0 - 86_400_000 });
+  io.openCodeRuntime = () => ({ service: 'opencode', pid: 9, procStartMs: T0, readyMs: T0 });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 1);
+  assert.match(calls.send[0].text, /^\[stream-recovery\] OpenCode restarted/);
+  assert.equal(state.servers[1].prevSeenMs, null);
+});
+
+test('handed-off parents still get child session IDs even if every child looks handled', async () => {
+  const { io, calls } = fakeIo({ subs: [sub('sol', 'old', 0)], threads: { old: { title: 'Old lane' } },
+    later: { old: [{ subagent_id: 'redo', provider_thread_id: pt('ses_sol'), started_at: iso(T0 + 1_000), title: 'Sol resumed' }] },
+  });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+  assert.equal(calls.send.length, 1);
+  assert.match(calls.send[0].text, /session ses_sol; re-dispatched/);
+  assert.match(calls.send[0].text, /pass this recovery note, including every listed child session and result/);
+});
+
+test('held queues drop only stale coordination pulses and keep old owner messages', async () => {
+  const coordId = 'ardud-control:send:arch:coord%3Awake%3Aabc';
+  const held = [
+    { run_id: 'run:20', held: true, requested_at: iso(T0 - 5 * 3_600_000), user_message_id: coordId },
+    { run_id: 'run:21', held: true, requested_at: iso(T0 - 4 * 3_600_000), user_message_id: 'm21' },
+    { run_id: 'run:22', held: true, requested_at: iso(T0 - 3_600_000), user_message_id: 'm22' },
+    { run_id: 'run:23', held: true, requested_at: iso(T0 - 5 * 3_600_000), user_message_id: 'owner' },
+  ];
+  const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: { title: 'Arch', activeRunId: null } }, held: { arch: held },
+    messages: { [coordId]: '[coord] 4 unacked deliveries. Read coord inbox.', m21: '[lane-pulse] 4 unacked deliveries.', m22: '[lane-pulse] recent', owner: '[coord] Please investigate this quoted pulse.' },
+  });
+  const state = { handled: {}, servers: [] };
+  const [result] = await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.commands.map((c) => [c.type, c.runId]), [
+    ['queued-run.cancel', 'run:20'], ['queue.resume', undefined],
+  ]);
+  assert.match(calls.send[0].text, /run:20, queued/);
+  assert.match(calls.send[0].text, /held 3 queued message/);
+  assert.equal(result.results[0].queueOk, true);
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.commands.length, 2);
+});
+
+test('queue retry after a sent note never sends the note again', async () => {
+  const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: { title: 'Arch', activeRunId: null } },
+    held: { arch: [{ run_id: 'held', held: true, requested_at: iso(T0) }] },
+  });
+  let tries = 0;
+  io.dispatchCommand = async (command) => { calls.commands.push(command); if (++tries === 1) throw new Error('lost queue reply'); };
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 1);
+  assert.equal(Object.values(state.handled)[0].done, false);
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 1);
+  assert.equal(calls.commands.length, 2);
+  assert.equal(calls.commands[0].commandId, calls.commands[1].commandId);
+  assert.equal(Object.values(state.handled)[0].done, true);
+});
+
+test('durable message receipt covers a crash between send and state save', async () => {
+  const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: { title: 'Arch', activeRunId: 'recovery-run', status: 'running' } },
+    held: { arch: [{ run_id: 'held', held: true, requested_at: iso(T0) }] },
+  });
+  io.restartNoteRun = () => 'recovery-run';
+  await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+  assert.equal(calls.send.length, 0);
+  assert.deepEqual(calls.commands.map((c) => c.type), ['queue.resume']);
+});
+
+test('fresh running turns and OpenCode-active parents get no note or queue changes', async () => {
+  for (const over of [{ activeRunId: 'fresh', status: 'running' }, { nativeSessionId: 'ses_busy' }, { pendingRequest: { kind: 'question' } }]) {
+    const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: { title: 'Arch', ...over } }, active: ['ses_busy'],
+      held: { arch: [{ held: true }] },
+    });
+    await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+    assert.equal(calls.send.length + calls.commands.length, 0);
+  }
+});
+
+test('busy threads defer queue recovery until idle without resending to recovered siblings', async () => {
+  const thread = { title: 'Arch', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('arch'), run('other')], threads: { arch: thread, other: { title: 'Other' } },
+    held: { arch: [{ run_id: 'held', held: true, requested_at: iso(T0) }] },
+  });
+  const state = { handled: {}, servers: [] };
+  for (let i = 0; i < 4; i++) await restartScan(scanArgs(state), io);
+  assert.equal(Object.values(state.handled)[0].done, false);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['other']);
+  thread.activeRunId = null;
+  thread.status = 'completed';
+  await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['other', 'arch']);
+  assert.deepEqual(calls.commands.map((c) => c.type), ['queue.resume']);
+  assert.equal(Object.values(state.handled)[0].done, true);
+});
+
+test('a later user Stop is a barrier to recovering an older cancelled turn', async () => {
+  const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: { title: 'Arch', status: 'interrupted' } },
+    held: { arch: [{ held: true }] },
+  });
+  io.stoppedSince = () => true;
+  const [report] = await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+  assert.equal(report.results[0].plan.reason, 'stopped after the restart');
+  assert.equal(calls.send.length + calls.commands.length, 0);
+});
+
+test('deferral neither consumes failure retries nor expires at the discovery lookback', async () => {
+  const thread = { title: 'Arch', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: thread },
+    held: { arch: [{ run_id: 'held', held: true, requested_at: iso(T0) }] },
+  });
+  let state = { handled: {}, servers: [] };
+  for (let i = 0; i < 4; i++) await restartScan(scanArgs(state), io);
+  // Like a later LaunchAgent invocation, reload state after the normal 3h
+  // discovery window and even the 6h age floor no longer contain the cut.
+  state = JSON.parse(JSON.stringify(state));
+  io.restartRunsSince = () => [];
+  thread.activeRunId = null;
+  thread.status = 'completed';
+  const send = io.sendToThread;
+  io.sendToThread = async () => { throw new Error('one transient failure'); };
+  const args = scanArgs(state, { now: T0 + 8 * 3_600_000, sinceIso: iso(T0 + 5 * 3_600_000), floorMs: T0 + 2 * 3_600_000 });
+  await restartScan(args, io);
+  assert.equal(Object.values(state.handled)[0].done, false);
+  assert.equal(Object.values(state.handled)[0].threads.arch.failures, 1);
+  io.sendToThread = send;
+  await restartScan(args, io);
+  assert.equal(calls.send.length, 1);
+  assert.deepEqual(calls.commands.map((c) => c.type), ['queue.resume']);
+  assert.equal(Object.values(state.handled)[0].done, true);
+});
+
+test('an exhausted failing thread does not finalize its still-busy sibling', async () => {
+  const busy = { title: 'Arch', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('arch'), run('broken')], threads: { arch: busy, broken: { title: 'Broken' } } });
+  const send = io.sendToThread;
+  io.sendToThread = async (id, text, opts) => { if (id === 'broken') throw new Error('down'); return send(id, text, opts); };
+  const state = { handled: {}, servers: [] };
+  for (let i = 0; i < 4; i++) await restartScan(scanArgs(state), io);
+  assert.equal(Object.values(state.handled)[0].done, false);
+  assert.equal(Object.values(state.handled)[0].threads.broken.failures, 3);
+  busy.activeRunId = null;
+  busy.status = 'completed';
+  await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['arch']);
+  assert.equal(Object.values(state.handled)[0].done, true);
+});
+
+test('a turn starting while child history is read is rechecked before mutations', async () => {
+  const { io, calls } = fakeIo({ subs: [sub('x', 'arch', 0)], threads: {} });
+  let reads = 0;
+  io.getThread = async () => ({ title: 'Arch', activeRunId: ++reads > 1 ? 'new' : null });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+  assert.equal(reads, 2);
+  assert.equal(calls.send.length + calls.commands.length, 0);
+});
+
+test('successful thread delivery is not retried when a sibling fails', async () => {
+  const { io, calls } = fakeIo({ runs: [run('arch'), run('other')], threads: { arch: { title: 'Arch' }, other: { title: 'Other' } } });
+  const send = io.sendToThread;
+  let failed = false;
+  io.sendToThread = async (id, text, opts) => {
+    if (id === 'other' && !failed) { failed = true; throw new Error('temporarily down'); }
+    return send(id, text, opts);
+  };
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['arch', 'other']);
+});
+
+test('read-only projection queries use real payload shapes and exclude Stops and children', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`create table orchestration_v2_projection_threads(thread_id text, payload_json text);
+    create table orchestration_v2_projection_runs(run_id text,thread_id text,ordinal integer,status text,requested_at text,completed_at text,payload_json text);
+    create table orchestration_v2_projection_turn_items(run_id text,type text);
+    create table orchestration_v2_projection_messages(message_id text,thread_id text,run_id text,payload_json text);`);
+  const add = (id, status, startedAt, parentThreadId = null) => {
+    const r = run(id, { status });
+    db.prepare('insert into orchestration_v2_projection_threads values (?,?)').run(id, JSON.stringify({ lineage: { parentThreadId, rootThreadId: parentThreadId ?? id }, activeRunId: null }));
+    db.prepare('insert into orchestration_v2_projection_runs values (?,?,?,?,?,?,?)').run(r.run_id, id, r.ordinal, status, r.requested_at, r.completed_at,
+      JSON.stringify({ startedAt, queueHeld: true, userMessageId: `msg:${id}` }));
+  };
+  add('mcp:03976a70', 'cancelled', iso(T0 - 4_000));
+  add('failed-start', 'failed', null);
+  add('user-stop', 'interrupted', iso(T0 - 4_000));
+  add('cancelled-queue', 'cancelled', null);
+  add('child', 'cancelled', iso(T0 - 4_000), 'parent');
+  add('queued', 'queued', null);
+  add('starting', 'cancelled', null);
+  db.prepare('insert into orchestration_v2_projection_turn_items values (?,?)').run(run('starting').run_id, 'user_message');
+  const candidates = restartRunsSince(db, iso(T0));
+  assert.deepEqual(candidates.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'starting']);
+  const [incident] = findRestartIncidents([], { runs: candidates, serverStarts: [{ readyMs: T0 + 10_000 }] });
+  assert.deepEqual(incident.runs.map((r) => r.thread_id), ['mcp:03976a70', 'failed-start', 'starting']);
+  assert.equal(stoppedSince(db, 'user-stop', iso(T0)), true);
+  assert.equal(stoppedSince(db, 'mcp:03976a70', iso(T0)), false);
+  assert.equal(queuedRuns(db, 'queued')[0].held, true);
+  const id = 'rs-20261016T191520Z';
+  db.prepare('insert into orchestration_v2_projection_messages values (?,?,?,?)').run(`ardud-control:send:mcp:03976a70:${id}`, 'mcp:03976a70', 'note-run', '{}');
+  assert.equal(restartNoteRun(db, 'mcp:03976a70', id), 'note-run');
+  assert.equal(restartNoteRun(db, 'other', id), null);
+  db.close();
 });

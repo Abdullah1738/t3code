@@ -60,9 +60,8 @@ async function gatherThread({ db, incident, threadId, active, now, verbose }) {
   const held = queued.filter((r) => !staleHeld.includes(r))
     .map((r) => ({ ...r, text: io.messageText(db, r.user_message_id) }));
 
-  // Archived and crw threads only ever get their held queue released, so skip
-  // the OpenCode reads for them (those are the slow part of a scan).
-  if (thread.archived || thread.origin === 'crw') {
+  // Archived threads need no OpenCode reads (the slow part of a scan).
+  if (thread.archived) {
     const plan = planThread({
       thread: { threadId, title: thread.title, origin: thread.origin, archived: thread.archived, nativeSessionId: thread.nativeSessionId },
       failedRuns: failed.map((r) => ({ completedAt: r.completed_at })),
@@ -186,11 +185,18 @@ async function scan(opts) {
     const sinceMs = opts.since ? Date.parse(opts.since) : Math.max(floor, last);
     const sinceIso = new Date(sinceMs).toISOString();
     const db = io.openDb(io.PATHS.db);
+    // Restart recovery owns failures inside its window. Do it first so a
+    // failed run cannot get both a stream-loss note and a restart note.
+    const restartSince = opts.since ? sinceIso
+      : new Date(Math.max(floor, state.lastScan ? Date.parse(state.lastScan) - RESTART_LOOKBACK_MS : floor)).toISOString();
+    const restarts = await restartScan({
+      db, state, now, sinceIso: restartSince, floorMs: floor, dryRun: opts.dryRun, seed: opts.seed, verbose: opts.verbose, log,
+    });
     const runs = io.failedRunsSince(db, sinceIso);
     const subs = io.failedSubagentsSince(db, sinceIso);
     const signals = [
-      ...runs.map((r) => ({ ...r, kind: 'run', at: r.completed_at, threadId: r.thread_id })),
-      ...subs.map((s) => ({ ...s, kind: 'subagent', at: s.completed_at })),
+      ...runs.filter((r) => !restarts.runIds.has(r.run_id)).map((r) => ({ ...r, kind: 'run', at: r.completed_at, threadId: r.thread_id })),
+      ...subs.filter((s) => !restarts.runIds.has(s.run_id)).map((s) => ({ ...s, kind: 'subagent', at: s.completed_at })),
     ];
     const incidents = findIncidents(signals);
     if (opts.verbose) log(`since ${sinceIso}: ${runs.length} failed runs, ${subs.length} failed subagents, ${incidents.length} incident(s)`);
@@ -250,18 +256,6 @@ async function scan(opts) {
         };
       }
       report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
-    }
-    let restarts = [];
-    try {
-      // A shutdown's cancels can sit for a while before Robob is back to take
-      // the notes, so look further back than the stream-loss scan does.
-      const restartSince = opts.since ? sinceIso
-        : new Date(Math.max(floor, state.lastScan ? Date.parse(state.lastScan) - RESTART_LOOKBACK_MS : floor)).toISOString();
-      restarts = await restartScan({
-        db, state, now, sinceIso: restartSince, floorMs: floor, dryRun: opts.dryRun, seed: opts.seed, verbose: opts.verbose, log,
-      });
-    } catch (err) {
-      log(`restart watch failed: ${err?.message || err}`);
     }
     let stalls = [];
     if (!opts.seed) {

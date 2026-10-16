@@ -73,6 +73,41 @@ export function cancelledSubagentsSince(db, sinceIso) {
     .all(sinceIso);
 }
 
+// A user_message turn item materializes when a queued turn starts, before
+// startedAt is set. It distinguishes cancelled starts from cancelled queues.
+export function restartRunsSince(db, sinceIso) {
+  return db.prepare(
+    `select r.run_id, r.thread_id, r.ordinal, r.status, r.requested_at, r.completed_at,
+            json_extract(r.payload_json,'$.startedAt') started_at,
+            exists(select 1 from orchestration_v2_projection_turn_items i
+              where i.run_id=r.run_id and i.type='user_message') dispatched
+       from orchestration_v2_projection_runs r
+       join orchestration_v2_projection_threads t on t.thread_id=r.thread_id
+      where r.completed_at >= ? and r.status in ('cancelled','failed')
+        and (r.status='failed' or json_extract(r.payload_json,'$.startedAt') is not null
+          or exists(select 1 from orchestration_v2_projection_turn_items i
+            where i.run_id=r.run_id and i.type='user_message'))
+        and json_extract(t.payload_json,'$.lineage.parentThreadId') is null
+        and r.thread_id not like 'thread:provider:%'
+      order by r.completed_at`,
+  ).all(sinceIso);
+}
+
+export function stoppedSince(db, threadId, sinceIso) {
+  // A later explicit Stop is a barrier even if other turns ran in between.
+  return Boolean(db.prepare(
+    `select 1 from orchestration_v2_projection_runs
+      where thread_id=? and status='interrupted' and completed_at >= ? limit 1`,
+  ).get(threadId, sinceIso));
+}
+
+export function restartNoteRun(db, threadId, incidentId) {
+  const messageId = `ardud-control:send:${threadId}:${encodeURIComponent(incidentId)}`;
+  return db.prepare(
+    `select run_id from orchestration_v2_projection_messages where thread_id=? and message_id=?`,
+  ).get(threadId, messageId)?.run_id ?? null;
+}
+
 export function threadRoot(db, threadId) {
   return (
     db
@@ -260,6 +295,19 @@ export function serverRuntime() {
   });
   const procStartMs = r.status === 0 ? Date.parse(`${r.stdout.trim()} UTC`) : NaN;
   return { pid: s.pid, readyMs, procStartMs: Number.isFinite(procStartMs) ? procStartMs : null };
+}
+
+// OpenCode can restart without Robob. Its LaunchAgent PID plus process start
+// supplies a restart window even when no native children were in flight.
+export function openCodeRuntime() {
+  const agent = spawnSync('launchctl', ['list', 'com.ardud.opencode-service'], { encoding: 'utf8', timeout: 5_000 });
+  const pid = Number(/"PID"\s*=\s*(\d+)/.exec(agent.stdout ?? '')?.[1]);
+  if (!pid) return null;
+  const proc = spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+    env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' }, encoding: 'utf8', timeout: 5_000,
+  });
+  const ms = proc.status === 0 ? Date.parse(`${proc.stdout.trim()} UTC`) : NaN;
+  return Number.isFinite(ms) ? { service: 'opencode', pid, readyMs: ms, procStartMs: ms } : null;
 }
 
 // install-robob-resume.zsh keeps pending.json until it has sent its own

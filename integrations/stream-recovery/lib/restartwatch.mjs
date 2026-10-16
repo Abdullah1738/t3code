@@ -13,6 +13,7 @@ import {
 // resume message) to re-dispatch first, so the note can say so.
 export const RESTART_SETTLE_MS = 180_000;
 export const INSTALLER_WAIT_MS = 30 * 60_000;
+export const STALE_PULSE_MS = 2 * 3_600_000;
 const MAX_ATTEMPTS = 3;
 
 const errText = (err) => String(err?.message || err).slice(0, 300);
@@ -66,24 +67,76 @@ async function lostSubagent({ io, db, sub, active, incident }) {
   return lost;
 }
 
-async function handleThread({ io, db, incident, threadId, subs, active, dryRun }) {
+const threadBusy = (thread, active) => Boolean(thread.activeRunId || thread.pendingRequest
+  || ['preparing', 'starting', 'running', 'waiting'].includes(thread.status)
+  || active.has(thread.nativeSessionId));
+
+async function handleThread({ io, db, incident, threadId, subs, active, dryRun, now, progress, save }) {
   const thread = await io.getThread(threadId);
   if (!thread) return null;
   const info = { threadId, title: thread.title, origin: thread.origin, archived: thread.archived };
-  if (thread.archived || thread.origin === "crw") {
+  if (thread.archived) {
     return { plan: planRestartThread({ thread: info }), ok: true, lostSubs: subs.map((s) => ({ title: s.title, status: "skipped" })), error: null };
   }
+  if (io.stoppedSince(db, threadId, isoOf(incident.startMs))) {
+    return { plan: { ...planRestartThread({ thread: info }), action: 'skip', reason: 'stopped after the restart' }, ok: true, lostSubs: [], error: null };
+  }
+  const noteRun = io.restartNoteRun(db, threadId, incident.id);
+  const alreadySent = progress.noteSent || noteRun != null;
+  const ownRecovery = noteRun != null && thread.activeRunId === noteRun;
+  const turnCut = incident.runs.some((r) => r.thread_id === threadId);
+  const queued = io.queuedRuns(db, threadId).filter((r) => r.held)
+    .map((r) => ({ ...r, text: io.messageText(db, r.user_message_id) }));
   const lost = [];
   for (const sub of subs) lost.push(await lostSubagent({ io, db, sub, active, incident }));
-  const plan = planRestartThread({ thread: info, lost });
-  const held = io.queuedRuns(db, threadId).filter((r) => r.held).length;
-  const res = { plan, ok: true, lostSubs: lost, held, error: null, note: null };
+  const plan = planRestartThread({ thread: info, lost, turnCut, held: queued,
+    busy: !ownRecovery && threadBusy(thread, active) });
+  const staleHeld = [...(progress.staleHeld ?? [])];
+  for (const r of queued) {
+    // Keep real owner messages, regardless of age. These pulses only ask the
+    // lane to re-read its durable inbox, so replaying hours of them adds noise.
+    const automated = r.user_message_id?.startsWith(`ardud-control:send:${threadId}:coord%3A`) && /^\[coord[\] ]/.test(r.text ?? '');
+    if (toMs(r.requested_at) < now - STALE_PULSE_MS && automated
+      && !staleHeld.some((s) => s.run_id === r.run_id)) staleHeld.push(r);
+  }
+  const held = queued.filter((r) => !staleHeld.some((s) => s.run_id === r.run_id));
+  const res = { plan, ok: true, lostSubs: lost, held: queued.length, staleHeld, queueOk: progress.queueOk ?? null, turnCut, error: null, note: null };
+  if (plan.reason === 'fresh turn is running') res.deferred = true;
   if (plan.action !== "note") return res;
-  const turnCut = io.turnCutAndIdle(db, threadId, isoOf(incident.startMs - 60_000), isoOf(incident.endMs + 60_000));
-  res.note = buildRestartNote({ incident, lost, turnCut, ocUrl: io.OC_URL });
+  res.note = buildRestartNote({ incident, lost, turnCut, held, staleHeld, ocUrl: io.OC_URL });
   if (dryRun) return res;
   try {
-    await io.sendToThread(threadId, res.note, { clientRequestId: incident.id, mode: "auto" });
+    // Child history reads may have taken seconds. Recheck immediately before
+    // mutations, and don't steer a new turn that arrived while gathering.
+    const fresh = await io.getThread(threadId);
+    const freshActive = await io.activeSessions();
+    if (!fresh || fresh.archived || (!(noteRun && fresh.activeRunId === noteRun) && threadBusy(fresh, freshActive))
+      || fresh.latestRunId !== thread.latestRunId) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'thread changed during recovery' };
+      res.deferred = true;
+      return res;
+    }
+    if (io.stoppedSince(db, threadId, isoOf(incident.startMs))) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'stopped after the restart' };
+      return res;
+    }
+    progress.staleHeld = staleHeld;
+    save();
+    for (const r of staleHeld.filter((s) => queued.some((q) => q.run_id === s.run_id))) {
+      await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId, runId: r.run_id });
+    }
+    if (!alreadySent) {
+      // queue is also safe if a turn starts between the read and the send:
+      // unlike auto it cannot steer or interrupt that turn.
+      await io.sendToThread(threadId, res.note, { clientRequestId: incident.id, mode: 'queue' });
+      progress.noteSent = true;
+      save();
+    }
+    if (queued.length && !progress.queueOk) {
+      await io.dispatchCommand({ type: 'queue.resume', commandId: `${incident.id}:resume:${threadId}`, threadId });
+      progress.queueOk = res.queueOk = true;
+      save();
+    }
   } catch (err) {
     res.ok = false;
     res.error = errText(err);
@@ -106,18 +159,37 @@ function stallInterrupted(state, ses, cancelMs) {
 
 export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = false, seed = false, verbose = false, log }, io = realIo) {
   state.servers = trackServer(state.servers, io.serverRuntime(), now);
+  state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
   const subs = io.cancelledSubagentsSince(db, sinceIso)
     .filter((s) => !stallInterrupted(state, sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
   for (const s of subs) {
     s.parentThreadId = topParent(io, db, s.thread_id) ?? s.thread_id;
     s.rootThreadId = io.threadRoot(db, s.parentThreadId) ?? s.parentThreadId;
   }
-  const incidents = findRestartIncidents(subs, { serverStarts: state.servers });
-  if (verbose) log(`since ${sinceIso}: ${subs.length} cancelled subagents, ${incidents.length} restart incident(s)`);
+  const runs = io.restartRunsSince(db, sinceIso);
+  const incidents = findRestartIncidents(subs, { runs, serverStarts: state.servers });
+  // Deferred fresh work can outlive the discovery lookback. Keep its original
+  // rows until every affected thread is handled, without widening DB scans.
+  for (const [id, entry] of Object.entries(state.handled)) {
+    if (!id.startsWith('rs-') || entry.done || !entry.incident) continue;
+    const current = incidents.find((i) => i.id === id);
+    if (!current) incidents.push(entry.incident);
+    else {
+      current.runs = [...entry.incident.runs, ...current.runs.filter((r) => !entry.incident.runs.some((old) => old.run_id === r.run_id))];
+      current.subagents = [...entry.incident.subagents, ...current.subagents.filter((s) => !entry.incident.subagents.some((old) => old.subagent_id === s.subagent_id))];
+      current.startMs = Math.min(current.startMs, entry.incident.startMs);
+      current.endMs = Math.max(current.endMs, entry.incident.endMs);
+    }
+  }
+  if (verbose) log(`since ${sinceIso}: ${subs.length} cancelled subagents, ${runs.length} cut runs, ${incidents.length} restart incident(s)`);
 
   const report = [];
+  // The stream-loss scan must not also recover these same failed turns,
+  // including while a restart is settling or was already handled.
+  report.runIds = new Set(incidents.flatMap((i) => i.runs.map((r) => r.run_id)));
   let robobUp = null;
   for (const incident of incidents) {
+    if (incident.serverStart) incident.serverStart.incidentId = incident.id;
     const prev = state.handled[incident.id];
     if (prev?.done) {
       if (verbose) log(`${incident.id}: already handled`);
@@ -127,7 +199,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       log(`${incident.id}: still settling`);
       continue;
     }
-    if (incident.endMs < floorMs) {
+    if (incident.endMs < floorMs && !prev?.incident) {
       if (!dryRun) state.handled[incident.id] = { at: isoOf(now), done: true, summary: "too old, skipped" };
       continue;
     }
@@ -150,23 +222,41 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       log(`${incident.id}: Robob is not reachable, retrying next scan`);
       continue;
     }
-    const active = await safe(() => io.activeSessions(), new Set());
+    // Fail closed: if OpenCode cannot tell us what's active, retry later.
+    const active = await io.activeSessions();
     const byThread = new Map();
+    for (const r of incident.runs) byThread.set(r.thread_id, []);
     for (const s of incident.subagents) byThread.set(s.parentThreadId, [...(byThread.get(s.parentThreadId) ?? []), s]);
     const server = incident.serverStart ? `, server pid ${incident.serverStart.pid} ready ${hhmm(incident.serverStart.readyMs)}` : "";
-    log(`${incident.id}: Robob restart at ${hhmm(incident.startMs)} (${incident.reason}${server}), ${incident.subagents.length} subagents cancelled in ${byThread.size} threads${dryRun ? " (dry run)" : ""}`);
+    log(`${incident.id}: restart at ${hhmm(incident.startMs)} (${incident.reason}${server}), ${incident.runs.length} own turns, ${incident.subagents.length} subagents cancelled in ${byThread.size} threads${dryRun ? " (dry run)" : ""}`);
 
     const results = [];
+    const entry = { ...prev, incident, at: isoOf(now), threads: { ...prev?.threads } };
+    const save = () => {
+      if (!dryRun) {
+        state.handled[incident.id] = entry;
+        io.saveState(state, now);
+      }
+    };
     for (const [threadId, list] of byThread) {
+      if (entry.threads[threadId]?.done) continue;
       let res;
       try {
-        res = await handleThread({ io, db, incident, threadId, subs: list, active, dryRun });
+        const progress = entry.threads[threadId] ??= {};
+        res = await handleThread({ io, db, incident, threadId, subs: list, active, dryRun, now, progress, save });
+        if (res?.ok && !res.deferred && !dryRun) { progress.done = true; save(); }
       } catch (err) {
         res = { plan: { threadId, title: threadId, action: "skip", reason: "error" }, ok: false, error: errText(err), lostSubs: [] };
       }
       if (!res) {
         if (verbose) log(`  ${threadId}: not found in Robob`);
         continue;
+      }
+      if (res.error && !dryRun) {
+        const progress = entry.threads[threadId];
+        progress.failures = (progress.failures ?? 0) + 1;
+        if (progress.failures >= MAX_ATTEMPTS) progress.done = true;
+        save();
       }
       results.push(res);
       const p = res.plan;
@@ -198,9 +288,11 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       }
       const errors = results.filter((r) => r.error).length;
       const attempts = (prev?.attempts || 0) + 1;
+      const telegramFailures = (prev?.telegramFailures ?? 0) + (sent ? 0 : 1);
+      const pending = [...byThread.keys()].some((id) => !entry.threads[id]?.done);
       state.handled[incident.id] = {
-        at: isoOf(now), attempts, errors, telegram: sent,
-        done: (errors === 0 && sent) || attempts >= MAX_ATTEMPTS,
+        ...entry, at: isoOf(now), attempts, errors, telegram: sent, telegramFailures,
+        done: !pending && (sent || telegramFailures >= MAX_ATTEMPTS),
         summary: summary.text.split("\n")[0],
       };
     }
