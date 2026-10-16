@@ -352,6 +352,22 @@ class GateTest(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertNotIn("</recall>", items[0]["fact"])
 
+    def test_secret_filter_keeps_paths_and_shas(self):
+        keep = [
+            "Read /Users/ardud/.config/opencode/skills/crpko/crpko-pr-build-lens/references/HAIKU-WORKER.md first",
+            "The packet is /Volumes/ExternalSSD/crpko-devops/tmp/museexp/packets/a-muse.md",
+            "Merged at 0683bd3f2a9c4e1b7d6f5a8c9e0b1d2f3a4b5c6d on main-dev",
+        ]
+        drop = [
+            "Use token: abcdef123456 for the API",
+            "The key is AbCdEf0123456789GhIjKlMnOpQrStUvWxYz0123456789",
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWX12 works",
+        ]
+        for text in keep:
+            self.assertIsNone(ra.SECRET_RE.search(text), text)
+        for text in drop:
+            self.assertIsNotNone(ra.SECRET_RE.search(text), text)
+
     def test_vet_grounding_echo_repeat(self):
         sources = [
             {"n": 1, "block": "user: we decided to grow ClickHouse replica volumes 625->782 GiB (CRP-12972) serially, no restart"},

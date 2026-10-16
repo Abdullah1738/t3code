@@ -28,7 +28,9 @@ _pool = cf.ThreadPoolExecutor(max_workers=16, thread_name_prefix="recall")
 SECRET_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY"
     r"|\b(password|passwd|secret|token|api[_ -]?key|mnemonic|seed phrase|private key)\b\s*[:=]\s*\S{6,}"
-    r"|\b[A-Za-z0-9+/_-]{40,}={0,2}\b)",
+    # Long opaque blobs: upper, lower and digits mixed, no path separators, so
+    # file paths and git SHAs (lowercase hex) stay readable.
+    r"|(?<![\w/.-])(?-i:(?=[A-Za-z0-9+_-]*[A-Z])(?=[A-Za-z0-9+_-]*[a-z])(?=[A-Za-z0-9+_-]*\d)[A-Za-z0-9+_-]{40,}={0,2})(?![\w/.-]))",
     re.I,
 )
 
