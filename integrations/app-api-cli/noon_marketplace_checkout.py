@@ -458,6 +458,24 @@ def _http_error(status):
     return {401: 'AUTH_EXPIRED', 403: 'AUTH_FORBIDDEN', 429: 'RATE_LIMITED'}.get(status, 'HTTP_' + str(status))
 
 
+def _response_error(op, response, deadline):
+    code = _http_error(response.code)
+    if op.name == 'order_status' and response.code == 400:
+        # Checkout records can disappear while order-v2 still has a paid,
+        # undelivered order. Recognize only the observed error, never a generic
+        # 400/404. Decode bounded gzip/JSON in RAM; don't retain upstream bodies.
+        try:
+            with core.read_deadline(deadline):
+                data = decode(response.read(MAX_BYTES + 1))
+            error = data.get('error') if isinstance(data, dict) else None
+            if (isinstance(error, dict) and type(error.get('code')) is int
+                    and error['code'] == 404 and error.get('message') == 'Order not found'):
+                return 'CHECKOUT_ORDER_NOT_FOUND'
+        except (MarketplaceError, core.NoonError, OSError, http.client.HTTPException):
+            pass
+    return code
+
+
 def native_request(op, headers, deadline, *, response_observer):
     """One send. Observe every repeated Set-Cookie verbatim before decode/errors.
 
@@ -477,9 +495,10 @@ def native_request(op, headers, deadline, *, response_observer):
     except urllib.error.HTTPError as exc:
         try:
             _observe_response(exc, response_observer)
+            code = _response_error(op, exc, deadline)
         finally:
             exc.close()
-        raise MarketplaceError(_http_error(exc.code), http_status=exc.code) from None
+        raise MarketplaceError(code, http_status=exc.code) from None
 
 
 class MarketplaceClient:

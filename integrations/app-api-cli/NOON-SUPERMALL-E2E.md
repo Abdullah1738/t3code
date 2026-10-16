@@ -54,9 +54,11 @@ tests: `test/test_commerce_supermall_order.py`,
 1. **Guard** (reads): `GET cart-v1/cart` must be empty (a foreign basket is
    never replaced); `GET order-v2/orders/active` + per-order order-status:
    paid/success prior orders (e.g. the rocket order still in flight) are
-   surfaced, any pending/failed order stops everything
-   (`SUPERMALL_ACTIVE_ORDER_PRESENT`); catalog rocket resolve; quantity ≥
-   stock minimum.
+   surfaced. An expired checkout record (HTTP 400, exact `Order not found` /
+   code 404 body) requires matching `Paid with` and `Total paid` evidence from
+   that order's durable order-v2 detail. Pending/failed/unproved orders still
+   stop everything (`SUPERMALL_ACTIVE_ORDER_PRESENT`); catalog rocket resolve;
+   quantity ≥ stock minimum. This fallback never confirms a new placement.
 2. **Quick add** (mutation): captured route above → cart readback must hold
    exactly our offer at the requested quantity
    (`SUPERMALL_EXACT_ADDED_MANIFEST_MISMATCH` fences).

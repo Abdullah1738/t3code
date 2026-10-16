@@ -91,7 +91,12 @@ One guard refinement was proven live: the captured order NAEIA0042714780
 (delivery tomorrow) is still an active marketplace order. Per the task recipe
 ("cart + order-status of previous") the guard now reads each prior active
 order's order-status: paid/success orders are surfaced and the lane proceeds;
-any pending/unpaid or erroring order stops it (`MAIN_ACTIVE_ORDER_PRESENT`).
+pending/unpaid orders stop it (`MAIN_ACTIVE_ORDER_PRESENT`). If checkout-status
+returns HTTP 400 with `error.code=404`, `error.message="Order not found"`, the
+guard checks the exact durable order-v2 detail instead: `Paid with` card payment
+must match its `Total paid` invoice amount. Missing/conflicting evidence and all
+other errors still block. This fallback is only for previous active orders,
+never payment recovery or confirmation of a new placement.
 
 ## Multi-item baskets + prepare-only (2026-10-11, paid live)
 

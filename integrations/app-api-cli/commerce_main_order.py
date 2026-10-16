@@ -25,6 +25,7 @@ import uuid
 
 import commerce_journal as journal
 import commerce_receipts as receipts
+from commerce_marketplace_preflight import prior_order_paid
 import noon_http_orders as core
 import noon_marketplace_checkout as market
 import order_watch_receipt
@@ -313,9 +314,9 @@ class MainOrderFlow:
         """Nonempty basket or a pending-unpaid marketplace order blocks place.
 
         Task recipe 2026-10-10: cart + order-status of previous orders. An
-        active order whose order-status reads success (paid, e.g. yesterday's
-        confirmed shipment still in flight) is surfaced, not a blocker; any
-        pending/failed/erroring order stops the lane.
+        active paid order is surfaced, not a blocker. If its checkout record
+        expired, require matching durable order-v2 payment/invoice evidence.
+        Pending, failed and unproved orders still stop the lane.
         """
         cart = self.client.cart().summary()
         if cart['empty'] is not True:
@@ -324,15 +325,11 @@ class MainOrderFlow:
         active = active_marketplace_orders(timeout=timeout)
         paid_prior = []
         for row in active:
-            response = self.client.call('order_status', order=row['order'], timeout=timeout)
-            data = response.data if isinstance(response.data, dict) else {}
-            status = data.get('status')
-            if (status != 'success' or data.get('paymentError')
-                    or data.get('paymentErrorMsg')):
+            if not prior_order_paid(self.client, row['order'], timeout=timeout):
                 print(json.dumps({'phase': 'active_order_blocker',
                                   'active_orders': active}), flush=True)
                 _fail('MAIN_ACTIVE_ORDER_PRESENT')
-            paid_prior.append({'order': row['order'], 'status': status})
+            paid_prior.append({'order': row['order'], 'status': 'success'})
         if active:
             print(json.dumps({'phase': 'prior_orders_paid', 'prior': paid_prior}), flush=True)
         resolved = self._resolve_all(timeout=timeout)
@@ -496,10 +493,7 @@ class MainOrderFlow:
         consumed = self._consumed_names() if self.opened else set()
         active = active_marketplace_orders(timeout=timeout)
         for row in active:
-            response = self.client.call('order_status', order=row['order'], timeout=timeout)
-            data = response.data if isinstance(response.data, dict) else {}
-            if (data.get('status') != 'success' or data.get('paymentError')
-                    or data.get('paymentErrorMsg')):
+            if not prior_order_paid(self.client, row['order'], timeout=timeout):
                 print(json.dumps({'phase': 'active_order_blocker',
                                   'active_orders': active}), flush=True)
                 _fail('MAIN_ACTIVE_ORDER_PRESENT')

@@ -84,6 +84,51 @@ class WireResponse:
 
 
 class MarketplaceTests(unittest.TestCase):
+    def test_expired_checkout_order_has_specific_error_without_retaining_body(self):
+        body = {'error': {'message': 'Order not found', 'code': 404},
+                'private': 'must-not-be-retained'}
+        for service in ('main', 'supermall'):
+            for compressed in (False, True):
+                with self.subTest(service=service, compressed=compressed):
+                    h = Harness(service=service, native=True)
+                    op = m.operation(service, 'order_status', order='NTEST1')
+                    raw = json.dumps(body).encode()
+                    response = WireResponse(op, raw, h.events, 400)
+                    error = urllib.error.HTTPError(response.url, 400, 'Bad Request',
+                        response.headers, io.BytesIO(gzip.compress(raw) if compressed else raw))
+                    with patch.object(m.urllib.request, 'build_opener') as build:
+                        build.return_value.open.side_effect = error
+                        exc = self.assert_code('CHECKOUT_ORDER_NOT_FOUND',
+                                               lambda: h.client.order_status('NTEST1'))
+                        self.assertEqual(build.return_value.open.call_count, 1)
+                    self.assertEqual(exc.http_status, 400)
+                    self.assertFalse(exc.may_have_sent)
+                    self.assertEqual(h.cookies[0][1], COOKIES)
+                    self.assertEqual(h.receipts, [])
+                    self.assertNotIn('must-not-be-retained', repr(vars(exc)))
+
+    def test_other_http_errors_never_become_expired_checkout_evidence(self):
+        missing = {'error': {'message': 'Order not found', 'code': 404}}
+        cases = [('cart', {}, 400, missing), ('session', {}, 400, missing),
+                 ('place', {'total': 1}, 400, missing),
+                 ('order_status', {'order': 'NTEST1'}, 404, missing),
+                 ('order_status', {'order': 'NTEST1'}, 400, {'error': {'code': 404}}),
+                 ('order_status', {'order': 'NTEST1'}, 400,
+                  {'error': {'message': 'Order not found', 'code': '404'}}),
+                 ('order_status', {'order': 'NTEST1'}, 400, b'{broken'),
+                 ('order_status', {'order': 'NTEST1'}, 400, b'x' * (m.MAX_BYTES + 1))]
+        for name, args, status, body in cases:
+            with self.subTest(name=name, status=status):
+                h = Harness(native=True)
+                op = m.operation('main', name, **args)
+                raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+                response = WireResponse(op, raw, h.events, status)
+                with patch.object(m.urllib.request, 'build_opener') as build:
+                    build.return_value.open.side_effect = urllib.error.HTTPError(
+                        response.url, status, 'Bad Request', response.headers, io.BytesIO(raw))
+                    self.assert_code('HTTP_' + str(status), lambda: h.client.call(name, **args))
+                    self.assertEqual(build.return_value.open.call_count, 1)
+
     def test_populated_native_groups_are_not_discarded_for_top_level_empty_items(self):
         body={'count':1,'offers':[{'offerCode':'offer'}],'items':[],
               'groups':[{'items':[{'offerCode':'offer','variantKey':'','quantity':1,'isSelectedForCheckout':True}]}]}
