@@ -53,7 +53,8 @@ class FlowTests(unittest.TestCase):
             PaymentResult('PAYMENT_REPORTED_SUCCESS','EXACT_TRANSACTION_ASYNC_STATUS_SUCCESS',ORDER,'txn'),
             'http_status':200, 'next_index':1})
         self.gate.exact_order({'order':ORDER,'source':'native_order_api','identity_verified':True,
-                              'account_verified':True,'status':'preparing'})
+                              'account_verified':True,'status':'preparing',
+                              'order_account_verified':True,'order_list_present':True})
         self.gate.tracker_registered(ORDER, {'watcher_id':'order-talabat-'+ORDER})
         self.assertEqual(j.complete(FLOW)['state'], 'COMPLETE')
         self.assertEqual(j.inspect(FLOW)['campaign_reserved_minor'],2000)
@@ -87,6 +88,22 @@ class FlowTests(unittest.TestCase):
         with self.assertRaises(j.JournalError): self.gate.exact_order({'order':ORDER,'status':'delivered'})
         self.gate.before_talabat(self.record('payment'))
         with self.assertRaises(j.JournalError): self.gate.before_talabat(self.record('payment'))
+
+    def test_tracking_echo_and_profile_cannot_close_unpaid_or_unlisted_order(self):
+        self.place()
+        tracking={'order':ORDER,'source':'native_order_api','identity_verified':True,
+                  'account_verified':True,'status':'pending confirmation',
+                  'order_account_verified':True,'order_list_present':True}
+        with self.assertRaisesRegex(j.JournalError,'PAYMENT_AND_ACCOUNT_ORDER_LIST_REQUIRED'):
+            self.gate.exact_order(tracking)
+        self.gate.before_talabat(self.record('payment'))
+        self.gate.talabat_receipt({'operation':'payment','result':
+            PaymentResult('PAYMENT_REPORTED_SUCCESS','TALABAT_SYNC_NORMAL_RETURN',ORDER,'txn'),
+            'http_status':200})
+        for changes in ({'order_list_present':False},{'order_account_verified':False}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                    j.JournalError,'PAYMENT_AND_ACCOUNT_ORDER_LIST_REQUIRED'):
+                self.gate.exact_order({**tracking,**changes})
 
 
 if __name__ == '__main__':

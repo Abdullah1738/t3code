@@ -1350,8 +1350,7 @@ class Checkout:
         if auth.expiry(self.saved['auth']) <= time.time() + 1:
             fail('AUTH_EXPIRED_RENEWAL_REQUIRED')
         order_id = self.placed.order_id
-        data = orders.request(orders.TRACKING + order_id, self.saved, deadline)
-        return orders.project(data, order_id)
+        return orders.track_bound(order_id, self.saved, deadline)
 
 
 def project_quote(quote):

@@ -336,7 +336,8 @@ class CLIPassThroughTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     args.vertical, args.branch, args.apk_pool = 'restaurants', 1, 'pool'
                     flow.prepare.return_value = {'payable_minor': 100}
-                    flow.checkout.track.return_value = {'order': '3999', 'status': 'preparing'}
+                    flow.checkout.track.return_value = {'order': '3999', 'status': 'preparing',
+                        'order_list_present': True, 'order_account_verified': True}
                     cli.purchase_talabat(args)
                 self.assertEqual(register.call_args.kwargs['paid'], not hold)
                 self.assertEqual(register.call_args.args[2], 'moni')

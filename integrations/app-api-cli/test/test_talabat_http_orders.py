@@ -51,6 +51,61 @@ def active_screen(status='order_delivering', title='Arrives in 10 mins'):
 
 
 class TalabatHttpTest(unittest.TestCase):
+    def setUp(self):
+        # Offline ownership evidence for the existing tracking/renewal tests.
+        # Missing/partial/error history cases have their own regression module.
+        listing = patch('talabat_http_list.page_request', return_value={
+            'orders': [{'id': '123', 'status': 'Delivered'}],
+            'is_last_page': True, 'total_orders': 1})
+        listing.start()
+        self.addCleanup(listing.stop)
+
+    def test_confirming_variants_are_pre_preparing_not_terminal(self):
+        for raw in ('order_confirming', 'order_confirmingdelayed'):
+            with self.subTest(raw=raw):
+                result = http.project(active_screen(raw), '123')
+                self.assertEqual(result['status'], 'pending confirmation')
+                self.assertNotIn(result['status'], order_tracker.TERMINAL)
+                self.assertEqual(result['raw_status'], raw)
+                self.assertEqual(result['status_source'], 'common_tracking_event_attributes.delivery_status')
+                self.assertIsNone(result['rider'])
+                self.assertIsNone(result['eta_text'])
+
+    def test_confirming_tracker_does_not_fallback_or_wake_tracking_problem(self):
+        s, now = saved(), 10000
+        cfg = {'app': 'talabat', 'order': '123', 'registered_at': order_tracker.stamp(now - 60)}
+        for raw in ('order_confirming', 'order_confirmingdelayed'):
+            state = {'primed': True, 'status': 'unknown', 'tracking_problem_streak': 3}
+            with self.subTest(raw=raw), patch.object(http, 'load', return_value=s), \
+                    patch.object(http, 'request', side_effect=lambda path, *_:
+                                 s['expected_profile'] if path == http.PROFILE else screen(status=raw)), \
+                    patch.object(order_tracker, 'talabat_receipt', side_effect=AssertionError('no receipt fallback')), \
+                    patch.object(order_tracker, 'mail_evidence', side_effect=AssertionError('no mail fallback')), \
+                    patch.object(order_tracker.store, 'evidence', side_effect=AssertionError('no push fallback')), \
+                    patch.object(order_tracker, 'run', side_effect=AssertionError('no phone')):
+                for tick in range(4):
+                    result = order_tracker.fetch(cfg, state, now + tick * 60)
+                    events = order_tracker.transition(result, state, cfg, now + tick * 60)
+                    self.assertEqual(result['status'], 'pending confirmation')
+                    self.assertEqual(result['raw_status'], raw)
+                    self.assertEqual(result['errors'], [])
+                    self.assertEqual(events, [])
+                    self.assertEqual(state['tracking_problem_streak'], 0)
+
+    def test_commerce_exact_tracking_confirming_variants_are_read_only(self):
+        import commerce_cli
+        s = saved()
+        for vertical in ('shops', 'mart', 'restaurants'):
+            for raw in ('order_confirming', 'order_confirmingdelayed'):
+                with self.subTest(vertical=vertical, raw=raw), patch.object(http, 'load', return_value=s), \
+                        patch.object(http, 'request', side_effect=[s['expected_profile'], screen(status=raw)]) as request, \
+                        patch.object(commerce_cli.talabat, '_wire', side_effect=AssertionError('no checkout transport')), \
+                        patch.object(commerce_cli.journal, 'consume', side_effect=AssertionError('no financial sends')):
+                    result = commerce_cli.track_exact('talabat', vertical, '123')
+                self.assertEqual(result['status'], 'pending confirmation')
+                self.assertEqual(result['raw_status'], raw)
+                self.assertEqual([c.args[0] for c in request.call_args_list], [http.PROFILE, http.TRACKING + '123'])
+
     def test_nearby_requires_exact_visible_subtitle_and_delivering_enum(self):
         data = active_screen(title='Arrives within 5 mins')
         cell = data['widgets']['header_with_lifecycle_order_component']['data']['children'][1]['data']['component']['properties']['order_container']['properties']['cells'][0]['properties']
@@ -325,7 +380,7 @@ class TalabatHttpTest(unittest.TestCase):
             http.project(screen('456'), '123')
 
     def test_unknown_states_fail_closed(self):
-        for status in ['order_placed', 'delivery_expected', 'order_cancelled']:
+        for status in ['order_placed', 'delivery_expected', 'order_cancelled', 'order_confirming_new_state']:
             self.assertEqual(http.project(screen(status=status), '123')['status'], 'unknown')
         with self.assertRaises(http.TalabatError):
             http.project({'common_tracking_event_attributes': screen()['common_tracking_event_attributes']}, '123')

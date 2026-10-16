@@ -50,8 +50,9 @@ class DispositionTests(unittest.TestCase):
         local={'order_id':'12345','state':'FENCED','reserved_minor':4109,'campaign_reserved_minor':5834,'operations':[{'kind':'place'}]}
         auth=Mock();auth.fresh_before_mutation.return_value.mutation_account.return_value=saved
         with patch.object(c.journal,'binding',return_value=binding),patch.object(c.journal,'inspect',return_value=local), \
-                patch.object(c.receipts,'load') as load,patch.object(h.orders,'request',return_value={}), \
-                patch.object(h.orders,'project',return_value={'order':'12345','raw_status':'order_confirmingdelayed','status':'unknown','identity_verified':True,'account_verified':True}), \
+                patch.object(c.receipts,'load') as load,patch.object(h.orders,'request',return_value={
+                    'type':'OrderTrackingScreen','common_tracking_event_attributes':{
+                        'order_id':'12345','delivery_status':'order_confirmingdelayed'}}), \
                 patch.object(h,'_wire',return_value=h.WireResponse(422,{'status':'Error','error':{}})) as wire:
             load.return_value.snapshot.return_value=SimpleNamespace(receipts=[SimpleNamespace(operation='place',order_id='12345',transaction_id='PRIVATE-TXN')])
             result=c.reconcile(binding['flow_id'],auth=auth)
@@ -59,6 +60,8 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(wire.call_args.kwargs['params']['encryptedTransactionId'],'PRIVATE-TXN')
         self.assertNotIn('PRIVATE-TXN',str(result))
         self.assertEqual(result['disposition'],'retain_fence_and_reservation')
+        self.assertEqual(result['evidence'][0]['projection']['status'],'pending confirmation')
+        self.assertFalse(result['reservation_release_allowed'])
 
 
 if __name__=='__main__':unittest.main()

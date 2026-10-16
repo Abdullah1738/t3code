@@ -148,12 +148,17 @@ class FlowGate:
     def exact_order(self, tracking):
         current = journal.inspect(self.flow_id)
         order = current['order_id']
+        if current['app'] == 'talabat' and (
+                type(tracking) is not dict or tracking.get('order_list_present') is not True
+                or tracking.get('order_account_verified') is not True
+                or not journal.payment_reported(self.flow_id)):
+            journal.fail('TALABAT_PAYMENT_AND_ACCOUNT_ORDER_LIST_REQUIRED')
         if (type(tracking) is not dict or tracking.get('order') != order
                 or tracking.get('identity_verified') is not True
                 or tracking.get('account_verified') is not True
                 or tracking.get('source') != 'native_order_api'
                 or not order or tracking.get('status') not in
-                {'placed', 'preparing', 'picked up', 'out for delivery', 'nearby', 'delivered'}):
+                {'pending confirmation', 'placed', 'preparing', 'picked up', 'out for delivery', 'nearby', 'delivered'}):
             journal.fail('EXACT_TRACKING_NOT_CONFIRMED')
         operation = 'payment' if any(x['kind'] == 'payment' for x in current['operations']) else 'place'
         journal.observe(self.flow_id, operation, outcome='EXACT_ORDER_CONFIRMED',

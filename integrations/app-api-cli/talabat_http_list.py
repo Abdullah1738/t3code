@@ -89,7 +89,7 @@ def list_orders(page=0, pages=1, limit=20, timeout=20):
     return http.read_with_renewal(lambda saved, end: _list_orders(saved, end, page, pages, limit), deadline)
 
 
-def _list_orders(saved, deadline, page, pages, limit):
+def _list_orders(saved, deadline, page, pages, limit, *, stop_at=None):
     orders, seen, totals = [], set(), []
     rows_fetched = pages_fetched = duplicates = 0
     is_last = False
@@ -111,7 +111,7 @@ def _list_orders(saved, deadline, page, pages, limit):
             seen.add(result['order'])
             if len(orders) < limit:
                 orders.append(result)
-        if is_last or len(orders) >= limit:
+        if is_last or len(orders) >= limit or (stop_at is not None and stop_at in seen):
             break
         if not rows:
             raise http.TalabatError('ORDER_LIST_PAGINATION_STALLED')

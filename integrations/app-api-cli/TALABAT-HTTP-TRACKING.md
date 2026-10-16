@@ -84,12 +84,31 @@ Active test order 3944138092 supplied these independent/HTTP observations:
 | 18:50:51 | Still order_delivering/nearby, but rider description became past tense | nearby; rider suppressed |
 | 18:51:12.942 | First sampled order_delivered; actual title Order delivered / Enjoy your order! | delivered; ETA/rider null |
 
-Raw delivery_status is preserved. `order_almostready -> preparing`,
+Raw delivery_status is preserved. `order_confirming` and `order_confirmingdelayed`
+map to `pending confirmation`; delayed confirmation also occurs with payment
+errors, so neither enum proves payment or merchant acceptance. `order_almostready -> preparing`,
 `order_delivering -> out for delivery`, `order_delivered -> delivered` are
 verified. Nearby requires **both** order_delivering and the exact visible
 same-order subtitle “Your order is nearby”; `status_source` records that cell.
 Unknown enums remain unknown, even if familiar-looking text is elsewhere.
 List `Preparing`, `Delivering`, `Delivered` are verified; list ETA/rider stay null.
+
+Tracking verifies profile authentication separately from exact order-ID echo and
+account ownership. `account_verified`/`order_account_verified` require membership
+in the same account's native order list (up to five 75-row pages, same read budget,
+stopping at the page that contains the order). The exact row proves membership
+even if new orders shift the pages. A complete consistent history proves absence;
+truncated/changing/unavailable history leaves absence unknown. Unlisted fulfilled-looking records are not
+delivery proof. A pure projector sets profile/account verification false.
+Neither tracking nor list membership verifies payment capture.
+
+The delayed enum carries an actionable `merchant_confirmation_delayed` problem
+in exact reads. The durable tracker wakes once after 30 minutes from its explicit
+timezone-aware placement timestamp (registration, then first sighting as
+fallbacks), even with a future ETA; priming cannot swallow that alert. It asks
+for exact payment completion and merchant/stock checks, without diagnosing the
+cause or authorizing a replacement. Pending records stay tracked and financial
+fences remain intact.
 
 Finite sampling is capped at 15 minutes / 45 calls, at least 20 seconds between
 samples or the upstream meta interval if longer (observed meta: 10 seconds).
@@ -100,7 +119,7 @@ within its 15-minute cap. Detection time is not an assertion of physical arrival
 
 ## Remaining limits
 
-No verified placed, picked-up or cancelled enum yet. No absolute ETA timezone,
+No verified picked-up or cancelled enum yet. No absolute ETA timezone,
 rider contact details or account-benefit/address assertions. New SDUI layouts,
 hidden/ambiguous cells or unknown visibility controls produce null details rather
 than guessed visibility. Order history is bounded, not a snapshot transaction.

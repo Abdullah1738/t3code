@@ -49,7 +49,7 @@ TERMINAL = {'delivered', 'cancelled'}
 RECEIPT_ACCOUNTS = ('gmail',)
 RECEIPT_POLL_S = 45
 RECEIPT_SUBJECT = re.compile(r'\bservice charges receipt\b', re.I)
-RANK = {'unknown': -1, 'placed': 0, 'preparing': 1, 'picked up': 2,
+RANK = {'unknown': -1, 'pending confirmation': 0, 'placed': 0, 'preparing': 1, 'picked up': 2,
         'out for delivery': 3, 'nearby': 4, 'delivered': 5, 'cancelled': 5}
 TRACKING_PROBLEM_REPEAT_S = 86400
 TRACKING_PROBLEM_QUIET_STREAK = 3
@@ -538,11 +538,39 @@ def fetch(cfg, state, now):
         from native_orders import track, OrderError
         try:
             native = track(cfg['app'], cfg['order'], timeout=8)
+            if cfg['app'] == 'talabat' and native.get('raw_status') == 'order_confirmingdelayed':
+                from talabat_http_orders import CONFIRMATION_DELAY_S, confirmation_problem
+                first_seen = state.setdefault('talabat_confirmation_delayed_since', now)
+                since, source = first_seen, 'first_observed_delay'
+                # Only explicit timezone-aware local registration/placement
+                # evidence, never guessed server timestamps or ETA subtraction.
+                for key in ('placed_at', 'registered_at'):
+                    try:
+                        observed = epoch(cfg.get(key))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if observed <= now:
+                        since, source = observed, key
+                        break
+                native['confirmation_pending_seconds'] = max(0, int(now - since))
+                native['confirmation_age_source'] = source
+                native.pop('problem', None)
+                if now - since >= CONFIRMATION_DELAY_S:
+                    native['problem'] = {**confirmation_problem(),
+                        'pending_seconds': native['confirmation_pending_seconds'], 'age_source': source}
+            elif cfg['app'] == 'talabat':
+                state.pop('talabat_confirmation_delayed_since', None)
             native_details.update({k: native[k] for k in (
                 'shipments', 'items', 'scope', 'whole_order_complete', 'truncated',
                 'warnings', 'partial', 'read_coverage', 'eta_window', 'eta_relative_minutes', 'status_text', 'status_source',
                 'status_text_source', 'raw_status', 'manifest_complete', 'manifest_source',
-                'manifest_item_count', 'observed_item_count', 'manifest_items') if k in native})
+                'manifest_item_count', 'observed_item_count', 'manifest_items',
+                'merchant_acceptance', 'confirmation_pending_seconds', 'confirmation_age_source',
+                'profile_verified', 'account_verified', 'order_id_verified', 'order_account_verified',
+                'order_list_present', 'order_list_verification', 'order_list_error',
+                'purchase_confirmed', 'payment_capture_verified') if k in native})
+            if cfg['app'] == 'talabat' and native.get('problem'):
+                native_details['problem'] = native['problem']
             native_details['native_coverage'] = native['coverage']
             for part in native.get('shipments', []):
                 if part.get('status') not in TERMINAL or part.get('scope') not in {'item', 'shipment'}:
@@ -567,8 +595,10 @@ def fetch(cfg, state, now):
                          'rider': native.get('rider'),
                         'checked_at': stamp(now), 'errors': [], 'coverage': native['coverage'],
                         'evidence': [{'stage': native['status'], 'source': 'native_order_api',
-                                      'confidence': 'exact_order', 'observed_at': stamp(now),
-                                       'evidence': 'Authenticated native order response; exact order ID verified.'}]}
+                                       'confidence': 'exact_order', 'observed_at': stamp(now),
+                                        'evidence': ('Exact native record; payment and merchant acceptance are unconfirmed.'
+                                            if native['status'] == 'pending confirmation' else
+                                            'Authenticated native order response; exact order ID verified.')}]}
             errors.append('native_status_unknown')
         except OrderError as exc:
             errors.append('native_' + str(exc).lower())
@@ -689,6 +719,9 @@ def transition(result, state, cfg, now):
     for key in ('candidate', 'problem'):
         item = result.get(key)
         if item:
+            if (key == 'problem' and item['stage'] == 'merchant_confirmation_delayed'
+                    and not state.get('primed')):
+                continue  # Do not consume the one-time wake while priming.
             signature = item['stage']  # stage-only dedupe, no timestamp noise
             if signature not in state.setdefault(key + '_seen', []):
                 state[key + '_seen'].append(signature)
@@ -825,6 +858,8 @@ def main(argv=None):
         saved = read(Path.home() / '.local/share/robob-watch/watchers' / wid / 'order-tracker-state.json')
         result = fetch(cfg, {}, time.time())
         result['last_confirmed_status'] = saved.get('status', 'unknown')
+        if result['status'] == 'pending confirmation' and result['last_confirmed_status'] == 'placed':
+            result['last_confirmed_status'] = 'pending confirmation'
         print(json.dumps(result, indent=2))
     else:
         watchpath = WATCHERS / wid / 'watcher.json'

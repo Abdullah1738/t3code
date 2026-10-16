@@ -25,9 +25,19 @@ MAX_BYTES = 2_000_000
 # Only independently verified native enums. New states stay unknown, not guessed.
 STAGES = {'order_delivered': 'delivered', 'order_almostready': 'preparing',
           'order_delivering': 'out for delivery', 'order_preparing': 'preparing',
-          'order_confirming': 'placed'}
-# order_confirmingdelayed (the unpaid-zombie shape) deliberately stays unmapped.
+          'order_confirming': 'pending confirmation', 'order_confirmingdelayed': 'pending confirmation'}
+# Confirmation (including delayed) is pre-preparing, not payment/acceptance proof.
+# The delayed enum is also returned for orders whose payment reports Error.
 ACTIVE = {'preparing', 'out for delivery'}
+CONFIRMATION_DELAY_S = 30 * 60
+
+
+def confirmation_problem():
+    return {'stage': 'merchant_confirmation_delayed', 'source': 'native_order_api',
+            'confidence': 'exact_order', 'cause_verified': False,
+            'message': 'Merchant acceptance is not confirmed (order_confirmingdelayed). '
+                       'Check payment completion and merchant/stock status in the app; '
+                       'the cause is unverified. Reconcile this exact order and payment before any replacement purchase.'}
 
 
 class TalabatError(Exception):
@@ -278,12 +288,66 @@ def project(data, order):
     if stage == 'out for delivery' and details['status_text'] == 'Your order is nearby':
         stage = 'nearby'
         stage_source = details['status_text_source']
-    return {'ok': True, 'app': 'talabat', 'order': order, 'source': 'native_order_api',
+    result = {'ok': True, 'app': 'talabat', 'order': order, 'source': 'native_order_api',
             'status': stage, 'raw_status': raw, 'status_source': stage_source,
-            'account_verified': True, 'identity_verified': True,
+            'account_verified': False, 'profile_verified': False, 'identity_verified': True,
+            'order_id_verified': True, 'order_account_verified': False,
+            'order_list_present': None, 'purchase_confirmed': False,
+            'payment_capture_verified': None,
             'eta': None, **details,
             'checked_at': dt.datetime.now(dt.timezone.utc).isoformat(),
-            'coverage': 'verified_preparing_out_for_delivery_nearby_delivered; display_eta_only_no_absolute_timezone; instantiated_rider_name_only'}
+            'coverage': 'exact_record_pending_confirmation_preparing_out_for_delivery_nearby_delivered; payment_capture_unverified; display_eta_only_no_absolute_timezone; instantiated_rider_name_only'}
+    if raw in ('order_confirming', 'order_confirmingdelayed'):
+        result['merchant_acceptance'] = 'unconfirmed'
+        result['status_text'] = 'Merchant acceptance is not confirmed.'
+        result['status_text_source'] = stage_source
+    if raw == 'order_confirmingdelayed':
+        # Exact tracking has no verified placement timestamp. Surface the native
+        # delay immediately; the durable tracker adds the 30-minute wake threshold.
+        result['problem'] = confirmation_problem()
+    return result
+
+
+def bind_account_order(result, saved, deadline):
+    """Profile auth and an order-ID echo are not account-order ownership proof.
+
+    Query the same authenticated app order list. A complete bounded history may
+    establish absence; a partial history/outage only leaves membership unknown.
+    Paging stops at the exact order. A shifting snapshot (new orders arriving)
+    only weakens absence; the exact row in this account's list stays proof.
+    No payment/capture assertion comes from this list.
+    """
+    from talabat_http_list import _list_orders, MAX_PAGES, PAGE_SIZE
+    result = {**result, 'profile_verified': True}
+    try:
+        history = _list_orders(saved, deadline, 0, MAX_PAGES, MAX_PAGES * PAGE_SIZE,
+                               stop_at=result['order'])
+        present = any(row['order'] == result['order'] for row in history['orders'])
+        if not present and (history['pagination']['snapshot_changed'] or history['truncated']):
+            present = None
+        result.update(order_list_present=present, order_account_verified=present is True,
+                      account_verified=present is True,
+                      order_list_verification=('present' if present is True else
+                          'absent_from_complete_history' if present is False else 'not_found_in_bounded_history'),
+                      order_list_source='/vendor-list/v1/orders/country/4',
+                      order_list_pages=history['pagination']['pages_fetched'])
+    except TalabatError as exc:
+        # Authentication failures belong to the outer one-renewal read loop.
+        if str(exc) in ('AUTH_EXPIRED_RENEWAL_REQUIRED', 'AUTH_FORBIDDEN', 'ACCOUNT_IDENTITY_MISMATCH'):
+            raise
+        result.update(order_list_verification='unavailable', order_list_error=str(exc))
+    if result['order_account_verified'] is not True and result['status'] != 'pending confirmation':
+        result.update(status='unknown', eta=None, eta_text=None, rider=None)
+    return result
+
+
+def track_bound(order, saved, deadline):
+    if not isinstance(order, str) or not re.fullmatch(r'[0-9]{1,20}', order):
+        raise TalabatError('INVALID_ORDER_ID')
+    verify_profile(request(PROFILE, saved, deadline), saved)
+    result = bind_account_order(project(request(TRACKING + order, saved, deadline), order), saved, deadline)
+    remaining_time(deadline)
+    return result
 
 
 def track(order, timeout=10):
@@ -291,4 +355,5 @@ def track(order, timeout=10):
         raise TalabatError('INVALID_ORDER_ID')
     from talabat_auth import new_deadline
     deadline = new_deadline(timeout)
-    return read_with_renewal(lambda saved, end: project(request(TRACKING + order, saved, end), order), deadline)
+    return read_with_renewal(lambda saved, end: bind_account_order(
+        project(request(TRACKING + order, saved, end), order), saved, end), deadline)

@@ -17,6 +17,11 @@ import talabat_http_checkout as talabat
 import talabat_http_orders as talabat_orders
 import order_watch_receipt
 
+RECONCILE_NOT_REORDER=('An order ID may already exist and payment may have been sent. Do not place another '
+                       'order. Run "commerce recover-payment {flow}" and "commerce order-status {flow}".')
+RECOVERY_NOT_REORDER=('Still unconfirmed. Do not place another order. Check "commerce order-status {flow}" '
+                      'and "commerce reconcile-order {flow}"; rerun recover-payment later.')
+
 
 def register_tracking(flow, label, recipient='owner', *, paid=True):
     """Register the exact returned ID, then read back its durable registration.
@@ -82,21 +87,47 @@ def purchase_talabat(args):
                 'review':review,'cart_readback_verified':True,'financial_send':False}
     tracking_registration=None
     result=None
+    confirmed=False
+    tracking=None
     try:
         result=flow.purchase()
+        result.update(ok=False, purchase_confirmed=False, financial_retry=False,
+                      payment_reported_success=result['state']=='PAYMENT_REPORTED_SUCCESS',
+                      payment_capture_verified=None, delivery_status='pending confirmation')
+        order=journal.inspect(flow.flow_id)['order_id']
+        if order:
+            result['order']=order  # Recovery identity, never a placement claim.
+        if result['state']=='PAYMENT_REPORTED_SUCCESS':
+            # A failed verification read must not hide the reported payment and
+            # order identity behind a bare error code; that invites a re-order.
+            try:
+                tracking=flow.checkout.track()
+                result['order_verification']=tracking
+                if tracking.get('order_list_present') is not True or tracking.get('order_account_verified') is not True:
+                    result['error']='TALABAT_ORDER_LIST_CONFIRMATION_REQUIRED'
+                else:
+                    flow.gate.exact_order(tracking)
+                    confirmed=True
+            except Exception as exc:
+                code=getattr(exc,'code',None) or str(exc)
+                result['error']='TALABAT_ORDER_VERIFICATION_FAILED'
+                result['verification_error']=(code if type(code) is str and re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code)
+                                              else 'ORDER_VERIFICATION_READ_FAILED')
+        else:
+            result['error']='TALABAT_PAYMENT_NOT_CONFIRMED'
+        if not confirmed:
+            result['next_action']=RECONCILE_NOT_REORDER.format(flow=flow.flow_id)
     finally:
         # A returned order must be tracked even when payment validation or its
         # receipt raises. This never repeats place or submits a payment fallback.
         if journal.inspect(flow.flow_id)['order_id']:
-            paid=isinstance(result,dict) and result.get('state')=='PAYMENT_REPORTED_SUCCESS'
-            tracking_registration=register_tracking(flow,args.label,args.recipient,paid=paid)
+            tracking_registration=register_tracking(flow,args.label,args.recipient,paid=confirmed)
     if tracking_registration is not None:
         result['tracking']=tracking_registration
         result.update(order_watch_receipt.fields(tracking_registration))
-    if result['state']=='PAYMENT_REPORTED_SUCCESS':
-        tracking=flow.checkout.track()
-        flow.gate.exact_order(tracking)
+    if confirmed:
         journal.complete(flow.flow_id)
+        result.update(ok=True,purchase_confirmed=True)
         result['order']=tracking['order'];result['delivery_status']=tracking['status']
         result['payable_minor']=review['payable_minor']
     return result
@@ -629,7 +660,7 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
                 def no_mutation(_):journal.fail('RECOVERY_READ_ONLY')
                 gate=FlowGate(**binding,receipt_sink=store,request_check=no_mutation)
                 gate.opened=True
-                tracking=talabat_orders.track(order)
+                tracking=talabat_orders.track_bound(order,saved,talabat.auth.new_deadline(20))
                 gate.exact_order(tracking)
                 name=f"order-talabat-{order.lower()}"
                 cfg_path=Path.home()/'.local/state/order-tracker/orders'/f'{name}.json'
@@ -671,9 +702,14 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
                 completed=True
             except Exception as exc:
                 completion_error=getattr(exc,'code',None) or str(exc)
-        return {'state':state,'reason':reason,'flow_id':flow_id,
+        return {'ok':completed,'purchase_confirmed':completed,
+                'payment_reported_success':state=='PAYMENT_REPORTED_SUCCESS',
+                'payment_capture_verified':None,
+                'order':journal.inspect(flow_id)['order_id'],
+                'state':state,'reason':reason,'flow_id':flow_id,
                 'next_index':next_index,'financial_retry':False,
                 'completed':completed,'completion_error':completion_error,
+                **({} if completed else {'next_action':RECOVERY_NOT_REORDER.format(flow=flow_id)}),
                 **(order_watch_receipt.fields(notice) if notice else {})}
 
     if cursor.stopped and cursor.result.state != 'PAYMENT_UNKNOWN':

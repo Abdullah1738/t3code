@@ -370,8 +370,11 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(observation.state, 'PAYMENT_PENDING')
                 result = client.submit_payment()
                 self.assertEqual(result.state, 'PAYMENT_REPORTED_SUCCESS')
-                with patch.object(h.orders, 'request', return_value={'type': 'OrderTrackingScreen',
-                        'common_tracking_event_attributes': {'order_id': '1234567890', 'delivery_status': 'order_delivered'}}) as tracking:
+                with patch.object(h.orders, 'request', side_effect=[client.saved['expected_profile'],
+                        {'type': 'OrderTrackingScreen', 'common_tracking_event_attributes':
+                         {'order_id': '1234567890', 'delivery_status': 'order_delivered'}}]) as tracking, \
+                        patch('talabat_http_list.page_request', return_value={'orders':[
+                            {'id':'1234567890','status':'Delivered'}],'is_last_page':True,'total_orders':1}):
                     self.assertEqual(client.track()['status'], 'delivered')
                     self.assertEqual(tracking.call_args.args[0], h.orders.TRACKING + '1234567890')
                 self.assertEqual([x['operation'] for x in self.records],
@@ -729,8 +732,11 @@ class LifecycleTests(unittest.TestCase):
         old_deadline = time.monotonic() - 130
         client.deadline = old_deadline
         client.created_at = time.monotonic() - 200
-        with patch.object(h.orders, 'request', return_value={'type':'OrderTrackingScreen',
-                'common_tracking_event_attributes':{'order_id':'1234567890','delivery_status':'order_delivered'}}) as read:
+        with patch.object(h.orders, 'request', side_effect=[client.saved['expected_profile'],
+                {'type':'OrderTrackingScreen', 'common_tracking_event_attributes':
+                 {'order_id':'1234567890','delivery_status':'order_delivered'}}]) as read, \
+                patch('talabat_http_list.page_request', return_value={'orders':[
+                    {'id':'1234567890','status':'Delivered'}],'is_last_page':True,'total_orders':1}):
             before = time.monotonic()
             self.assertEqual(client.track(timeout=7)['status'], 'delivered')
             self.assertGreaterEqual(read.call_args.args[2], before + 7)

@@ -18,8 +18,7 @@ def status(flow_id, *, auth=None):
         from talabat_auth import new_deadline
         saved=auth.fresh_before_mutation('talabat',binding['vertical']).mutation_account(binding['vertical'])
         if account_hash(saved)!=binding['account_hash']:journal.fail('RECOVERY_ACCOUNT_CHANGED')
-        data=orders.request(orders.TRACKING+order,saved,new_deadline(15))
-        result=orders.project(data,order)
+        result=orders.track_bound(order,saved,new_deadline(20))
         return {**result,'flow_id':flow_id,'financial_retry':False,
                 'reserved_minor':local['reserved_minor'],'journal_state':local['state']}
     if binding['vertical'] in ('main','supermall'):

@@ -77,6 +77,27 @@ For Talabat, `recover-payment` restores the exact received transaction and nativ
 polling cursor. For Minutes, it reads the exact persisted order, including a
 terminal failed result. It never reconstructs a checkout or resends place/payment.
 Payment success is distinct from exact order confirmation and delivery tracking.
+Talabat order/recovery returns `ok:false` (exit 1) and `purchase_confirmed:false`
+until the exact transaction reports success **and** the same authenticated
+account's order list contains the returned ID. Tracker registration for a pending
+record is diagnostic only; Moni's placement notice stays held until both checks
+pass. `order_confirming`/`order_confirmingdelayed` mean `pending confirmation`,
+never `placed`. A pure tracking ID echo cannot prove account ownership; tracking
+now distinguishes `profile_verified`, `order_id_verified`, `order_account_verified`
+and `order_list_present`. Missing IDs in truncated history remain unknown.
+`payment_capture_verified:null` is intentional: Talabat's observed terminal
+payment `Success` is not an issuer capture/settlement ledger. Do not claim a
+bank charge from tracking, an order ID, or a successful process exit alone.
+Every unconfirmed result keeps `order`, `payment_reported_success` and a
+`next_action` (reconcile with `recover-payment`/`order-status`, never re-order).
+A failed verification read after reported success is
+`TALABAT_ORDER_VERIFICATION_FAILED`, not a bare transport error.
+
+After a Talabat `--prepare-only`, continue the **same** intent with
+`--resume-flow FLOW_UUID`; omitting it correctly refuses with
+`JOURNAL_ACCOUNT_RECONCILIATION_REQUIRED`. That local ownership refusal is not
+a merchant rejection or reason to replace the prepared basket.
+
 The full paid Minutes flow — guard, sync, place, encrypted-CVV completion, 3DS
 Telegram wait, paid triple, tracking and watcher — is documented in
 [NOON-MINUTES-E2E.md](NOON-MINUTES-E2E.md).

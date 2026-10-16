@@ -73,8 +73,9 @@ def reconcile(flow_id, *, auth=None):
         if account_hash(saved)!=binding['account_hash']:journal.fail('RECOVERY_ACCOUNT_CHANGED')
         data=h.orders.request(h.orders.TRACKING+order,saved,h.auth.new_deadline(15))
         projection=h.orders.project(data,order)
+        projection['profile_verified']=True
         evidence.append(_evidence('/order-tracking/v4/order-tracking/<exact-order>','GET',
-            {k:projection.get(k) for k in ('order','status','raw_status','identity_verified','account_verified')},
+            {k:projection.get(k) for k in ('order','status','raw_status','identity_verified','account_verified','profile_verified')},
             checked_at=_now(),reference=order))
         txn=placed[0].transaction_id
         if not txn:journal.fail('EXACT_TRANSACTION_RECEIPT_REQUIRED')
