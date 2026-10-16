@@ -6,7 +6,7 @@ import * as realIo from "./io.mjs";
 import {
   buildRestartNote, buildRestartSummary, childOutcome, findRedispatch, findRestartIncidents, hhmm,
   isNestedThreadId, planRestartThread, providerThreadFor, resultInHistory, sessionFromProviderThread, toMs,
-  trackServer, truncate,
+  trackServer, truncate, RESTART_BUSY_REASON,
 } from "./detect.mjs";
 
 // Long enough for a thread that resumes on its own (or gets the installer's
@@ -14,6 +14,9 @@ import {
 export const RESTART_SETTLE_MS = 180_000;
 export const INSTALLER_WAIT_MS = 30 * 60_000;
 export const STALE_PULSE_MS = 2 * 3_600_000;
+// How long a busy thread is held back. Past this, a thread that is still busy
+// or has run again since its cut counts as resumed and gets no note.
+export const RESTART_RESUME_WINDOW_MS = 30 * 60_000;
 const MAX_ATTEMPTS = 3;
 
 const errText = (err) => String(err?.message || err).slice(0, 300);
@@ -67,11 +70,16 @@ async function lostSubagent({ io, db, sub, active, incident }) {
   return lost;
 }
 
+// The window runs from when Robob was back (ready), not from the shutdown
+// cancels, so a long outage does not use it up. It does not wait for the
+// installer: its own resume message is what resumes those threads.
+const resumeWindowStart = (incident) => Math.max(incident.endMs, toMs(incident.serverStart?.readyMs) || 0);
+
 const threadBusy = (thread, active) => Boolean(thread.activeRunId || thread.pendingRequest
   || ['preparing', 'starting', 'running', 'waiting'].includes(thread.status)
   || active.has(thread.nativeSessionId));
 
-async function handleThread({ io, db, incident, threadId, subs, active, dryRun, now, progress, save }) {
+async function handleThread({ io, db, incident, threadId, subs, active, dryRun, now, windowStart, progress, save }) {
   const thread = await io.getThread(threadId);
   if (!thread) return null;
   const info = { threadId, title: thread.title, origin: thread.origin, archived: thread.archived };
@@ -84,12 +92,18 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
   const noteRun = io.restartNoteRun(db, threadId, incident.id);
   const alreadySent = progress.noteSent || noteRun != null;
   const ownRecovery = noteRun != null && thread.activeRunId === noteRun;
-  const turnCut = incident.runs.some((r) => r.thread_id === threadId);
+  const cuts = incident.runs.filter((r) => r.thread_id === threadId);
+  const turnCut = cuts.length > 0;
   const queued = io.queuedRuns(db, threadId).filter((r) => r.held)
     .map((r) => ({ ...r, text: io.messageText(db, r.user_message_id) }));
   const lost = [];
   for (const sub of subs) lost.push(await lostSubagent({ io, db, sub, active, incident }));
-  const plan = planRestartThread({ thread: info, lost, turnCut, held: queued,
+  // Past the hold-back window a thread that is busy, or ran again after its
+  // cut, has moved on; a late "carry on" note would only confuse it.
+  const windowOver = now - windowStart >= RESTART_RESUME_WINDOW_MS;
+  const cutMs = Math.min(...[...cuts, ...subs].map((r) => toMs(r.completed_at)).filter(Number.isFinite), incident.endMs);
+  const ranAgain = windowOver && !alreadySent && io.runStartedSince(db, threadId, isoOf(cutMs));
+  const plan = planRestartThread({ thread: info, lost, turnCut, held: queued, ranAgain, windowOver, noteSent: alreadySent,
     busy: !ownRecovery && threadBusy(thread, active) });
   const staleHeld = [...(progress.staleHeld ?? [])];
   for (const r of queued) {
@@ -101,17 +115,26 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
   }
   const held = queued.filter((r) => !staleHeld.some((s) => s.run_id === r.run_id));
   const res = { plan, ok: true, lostSubs: lost, held: queued.length, staleHeld, queueOk: progress.queueOk ?? null, turnCut, error: null, note: null };
-  if (plan.reason === 'fresh turn is running') res.deferred = true;
-  if (plan.action !== "note") return res;
-  res.note = buildRestartNote({ incident, lost, turnCut, held, staleHeld, ocUrl: io.OC_URL });
+  if (plan.reason === RESTART_BUSY_REASON) res.deferred = true;
+  const sending = plan.action === "note" && !alreadySent;
+  // Resumed and already-noted threads still get their held queue released:
+  // queue.resume never interrupts a running turn, the queue just starts after it.
+  const releasing = (plan.action === "note" || plan.action === "resumed") && queued.length > 0 && !progress.queueOk;
+  if (sending) res.note = buildRestartNote({ incident, lost, turnCut, held, staleHeld, ocUrl: io.OC_URL });
+  if (!sending && !releasing) return res;
   if (dryRun) return res;
   try {
     // Child history reads may have taken seconds. Recheck immediately before
     // mutations, and don't steer a new turn that arrived while gathering.
     const fresh = await io.getThread(threadId);
-    const freshActive = await io.activeSessions();
-    if (!fresh || fresh.archived || (!(noteRun && fresh.activeRunId === noteRun) && threadBusy(fresh, freshActive))
-      || fresh.latestRunId !== thread.latestRunId) {
+    if (!fresh || fresh.archived) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'thread changed during recovery' };
+      res.deferred = true;
+      return res;
+    }
+    const freshActive = sending ? await io.activeSessions() : null;
+    if (sending && ((!(noteRun && fresh.activeRunId === noteRun) && threadBusy(fresh, freshActive))
+      || fresh.latestRunId !== thread.latestRunId)) {
       res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'thread changed during recovery' };
       res.deferred = true;
       return res;
@@ -125,7 +148,7 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
     for (const r of staleHeld.filter((s) => queued.some((q) => q.run_id === s.run_id))) {
       await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId, runId: r.run_id });
     }
-    if (!alreadySent) {
+    if (sending) {
       // queue is also safe if a turn starts between the read and the send:
       // unlike auto it cannot steer or interrupt that turn.
       await io.sendToThread(threadId, res.note, { clientRequestId: incident.id, mode: 'queue' });
@@ -143,6 +166,21 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
   }
   return res;
 }
+
+// What the final summary needs from a settled thread, kept in state across scans.
+const summaryResult = (r) => ({
+  plan: { threadId: r.plan.threadId, title: r.plan.title ?? null, action: r.plan.action, reason: r.plan.reason },
+  ok: r.ok, error: r.error ?? null, turnCut: Boolean(r.turnCut), held: r.held ?? 0, queueOk: r.queueOk ?? null,
+  staleHeld: (r.staleHeld ?? []).map((s) => ({ run_id: s.run_id })),
+  lostSubs: (r.lostSubs ?? []).map((l) => ({ status: l.status, title: l.title ?? null, sessionId: l.sessionId ?? null })),
+});
+
+// A finished incident keeps only what idempotency needs (per-thread done and
+// noteSent flags), not the prompts and queued texts it carried while open.
+const slim = ({ incident, threads, ...rest }) => ({
+  ...rest,
+  threads: Object.fromEntries(Object.entries(threads ?? {}).map(([id, t]) => [id, { done: t.done, noteSent: t.noteSent, queueOk: t.queueOk }])),
+});
 
 const counts = (lost) => {
   const c = {};
@@ -231,7 +269,9 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
     log(`${incident.id}: restart at ${hhmm(incident.startMs)} (${incident.reason}${server}), ${incident.runs.length} own turns, ${incident.subagents.length} subagents cancelled in ${byThread.size} threads${dryRun ? " (dry run)" : ""}`);
 
     const results = [];
+    const all = [];
     const entry = { ...prev, incident, at: isoOf(now), threads: { ...prev?.threads } };
+    const windowStart = resumeWindowStart(incident);
     const save = () => {
       if (!dryRun) {
         state.handled[incident.id] = entry;
@@ -239,26 +279,38 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       }
     };
     for (const [threadId, list] of byThread) {
-      if (entry.threads[threadId]?.done) continue;
+      if (entry.threads[threadId]?.done) {
+        // Threads settled by an older version carry no stored result.
+        all.push(entry.threads[threadId].result
+          ?? { plan: { threadId, title: threadId, action: "skip", reason: "handled earlier" }, ok: true, lostSubs: [], error: null });
+        continue;
+      }
       let res;
+      const progress = entry.threads[threadId] ??= {};
       try {
-        const progress = entry.threads[threadId] ??= {};
-        res = await handleThread({ io, db, incident, threadId, subs: list, active, dryRun, now, progress, save });
-        if (res?.ok && !res.deferred && !dryRun) { progress.done = true; save(); }
+        res = await handleThread({ io, db, incident, threadId, subs: list, active, dryRun, now, windowStart, progress, save });
+        if (res?.ok && !res.deferred && !dryRun) progress.done = true;
       } catch (err) {
         res = { plan: { threadId, title: threadId, action: "skip", reason: "error" }, ok: false, error: errText(err), lostSubs: [] };
       }
       if (!res) {
         if (verbose) log(`  ${threadId}: not found in Robob`);
-        continue;
+        res = { plan: { threadId, title: threadId, action: "skip", reason: "not found in Robob" }, ok: true, lostSubs: [], error: null };
+        if (!dryRun) {
+          progress.missing = (progress.missing ?? 0) + 1;
+          if (progress.missing >= MAX_ATTEMPTS) progress.done = true;
+        }
       }
       if (res.error && !dryRun) {
-        const progress = entry.threads[threadId];
         progress.failures = (progress.failures ?? 0) + 1;
         if (progress.failures >= MAX_ATTEMPTS) progress.done = true;
+      }
+      if (!dryRun) {
+        if (progress.done) progress.result = summaryResult(res);
         save();
       }
       results.push(res);
+      all.push(res);
       const p = res.plan;
       log(`  ${p.action.padEnd(7)} ${threadId} | ${truncate(p.title || "", 60)} | ${p.reason} | ${counts(res.lostSubs)}${res.error ? ` | ERROR ${res.error}` : ""}`);
       if (verbose) {
@@ -270,14 +322,20 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
         if (dryRun && res.note) log(`    note:\n${truncate(res.note, 1500)}`);
       }
     }
-    const summary = buildRestartSummary({ incident, results });
+    const summary = buildRestartSummary({ incident, results: all });
     // Archiving several threads at once also cancels their subagents; that is
     // not worth a ping.
-    const quiet = results.length > 0 && results.every((r) => r.plan.reason === "archived");
+    const quiet = all.length > 0 && all.every((r) => r.plan.reason === "archived");
+    // One summary per restart, sent once every thread is settled (held-back
+    // threads settle within RESTART_RESUME_WINDOW_MS), so it names them all.
+    const pending = dryRun ? [] : [...byThread.keys()].filter((id) => !entry.threads[id]?.done);
     if (dryRun) {
       log(`summary (${quiet ? "not sent, all archived" : summary.severity}):\n${summary.text}`);
-    } else if (quiet) {
+    } else if (quiet && !pending.length) {
       state.handled[incident.id] = { at: isoOf(now), done: true, summary: "only archived threads, no action" };
+    } else if (pending.length) {
+      log(`${incident.id}: ${pending.length} thread(s) not settled yet, summary waits`);
+      state.handled[incident.id] = { ...entry, at: isoOf(now), done: false };
     } else {
       let sent = true;
       try {
@@ -286,14 +344,11 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
         sent = false;
         log(`telegram failed: ${errText(err)}`);
       }
-      const errors = results.filter((r) => r.error).length;
-      const attempts = (prev?.attempts || 0) + 1;
       const telegramFailures = (prev?.telegramFailures ?? 0) + (sent ? 0 : 1);
-      const pending = [...byThread.keys()].some((id) => !entry.threads[id]?.done);
+      const done = sent || telegramFailures >= MAX_ATTEMPTS;
       state.handled[incident.id] = {
-        ...entry, at: isoOf(now), attempts, errors, telegram: sent, telegramFailures,
-        done: !pending && (sent || telegramFailures >= MAX_ATTEMPTS),
-        summary: summary.text.split("\n")[0],
+        ...(done ? slim(entry) : entry), at: isoOf(now), errors: all.filter((r) => r.error).length, telegram: sent, telegramFailures,
+        done, summary: summary.text.split("\n")[0],
       };
     }
     report.push({

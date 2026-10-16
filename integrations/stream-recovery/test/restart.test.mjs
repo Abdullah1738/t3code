@@ -5,8 +5,9 @@ import { restartRunsSince, queuedRuns, restartNoteRun, stoppedSince } from '../l
 import {
   findRestartIncidents, serverStartWindow, trackServer, findRedispatch, normTitle, childOutcome,
   planRestartThread, buildRestartNote, buildRestartSummary, restartIncidentId, RESTART_STALE_REASON,
+  RESTART_RESUMED_REASON,
 } from '../lib/detect.mjs';
-import { restartScan, RESTART_SETTLE_MS } from '../lib/restartwatch.mjs';
+import { restartScan, RESTART_SETTLE_MS, RESTART_RESUME_WINDOW_MS } from '../lib/restartwatch.mjs';
 
 // Fixtures modelled on the 15 Oct 18:17Z restart (statev2 rows, OpenCode messages).
 const T0 = Date.parse('2026-10-15T18:17:44.747Z');
@@ -140,8 +141,8 @@ test('buildRestartNote lists each lost subagent with model, session, start and p
     { plan: { threadId: 'a', title: 'Crpko kafka cell', action: 'note' }, ok: true, lostSubs: lost },
     { plan: { threadId: 'b', title: 'iMessage', action: 'report' }, ok: true, lostSubs: [lost[0]] },
   ] });
-  assert.match(s.text, /^Robob restart at 18:17Z cancelled 2 background subagent\(s\) in 2 thread\(s\)\./);
-  assert.match(s.text, /Told to pick them up: Crpko kafka cell \(2\)/);
+  assert.match(s.text, /^Robob restart at 18:17Z hit 2 thread\(s\): 0 with their own turn cut off, 2 background subagent\(s\) cancelled\./);
+  assert.match(s.text, /Noted: Crpko kafka cell \(2 subagent\(s\) to pick up, 1 handled subagent\(s\) listed\)/);
   assert.match(s.text, /iMessage \(iMessage\): lost "Haiku TC#251 r3 test fix" \(ses_cut\)/);
   assert.equal(s.severity, 'attention');
 });
@@ -276,7 +277,8 @@ test('restartScan reports delivered children for handoffs but skips stale childr
   assert.deepEqual(by.batch.lostSubs.map((l) => l.status), ['cut', 'finished']);
    assert.deepEqual(calls.send.map((c) => c.threadId), ['kafka', 'batch', 'tc3']);
    assert.match(calls.send.find((c) => c.threadId === 'batch').text, /fixed in abc123/);
-   assert.match(calls.telegram[0].text, /Released held queues: Batch-fix Crpko tickets \(1, 0 stale pulses cancelled\)/);
+  assert.match(calls.telegram[0].text, /Queue released: Batch-fix Crpko tickets \(1\)\./);
+  assert.match(calls.telegram[0].text, /Skipped: Crpko pbdraft cell \(only stale subagents/);
 });
 
 test('a result in the parent history only counts once the parent ran again', async () => {
@@ -555,4 +557,179 @@ test('read-only projection queries use real payload shapes and exclude Stops and
   assert.equal(restartNoteRun(db, 'mcp:03976a70', id), 'note-run');
   assert.equal(restartNoteRun(db, 'other', id), null);
   db.close();
+});
+
+// ---------- hold-back window and summary naming ----------
+
+const READY = Date.parse('2026-10-15T18:17:53.316Z');
+const afterWindow = (state) => scanArgs(state, { now: READY + RESTART_RESUME_WINDOW_MS + 60_000 });
+
+test('a thread still busy past the hold-back window counts as resumed: no note, held queue released', async () => {
+  const busy = { title: 'Crpko tc cell', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('tc')], threads: { tc: busy },
+    held: { tc: [{ run_id: 'held', held: true, requested_at: iso(T0) }] },
+  });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length + calls.commands.length + calls.telegram.length, 0);
+  assert.equal(Object.values(state.handled)[0].done, false);
+  const [report] = await restartScan(afterWindow(state), io);
+  assert.equal(report.results[0].plan.action, 'resumed');
+  assert.equal(report.results[0].plan.reason, RESTART_RESUMED_REASON);
+  assert.equal(calls.send.length, 0);
+  assert.deepEqual(calls.commands.map((c) => c.type), ['queue.resume']);
+  assert.equal(calls.telegram.length, 1);
+  assert.match(calls.telegram[0].text, /Resumed by themselves \(no note\): Crpko tc cell \(turn cut\)\./);
+  assert.match(calls.telegram[0].text, /Queue released: Crpko tc cell \(1\)\./);
+  assert.equal(Object.values(state.handled)[0].done, true);
+  await restartScan(afterWindow(state), io);
+  assert.equal(calls.send.length + calls.telegram.length, 1);
+});
+
+test('past the window a thread that ran again and went idle is resumed; one with no later run still gets its note', async () => {
+  const { io, calls } = fakeIo({ runs: [run('moved'), run('stuck')], runAfter: ['moved'],
+    threads: { moved: { title: 'Moved on' }, stuck: { title: 'Stuck lane' } },
+  });
+  const [report] = await restartScan(afterWindow({ handled: {}, servers: [] }), io);
+  const by = Object.fromEntries(report.results.map((r) => [r.plan.threadId, r.plan.action]));
+  assert.deepEqual(by, { moved: 'resumed', stuck: 'note' });
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['stuck']);
+  assert.match(calls.send[0].text, /Your own turn was cut off/);
+});
+
+test('a busy thread that goes idle inside the window gets the note; the window does not apply once it was sent', async () => {
+  const thread = { title: 'Arch', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: thread } });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 0);
+  thread.activeRunId = null;
+  thread.status = 'completed';
+  await restartScan(scanArgs(state, { now: READY + RESTART_RESUME_WINDOW_MS - 60_000 }), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['arch']);
+  assert.equal(Object.values(state.handled)[0].done, true);
+});
+
+test('the window counts from when Robob was ready, not from the shutdown cancels', async () => {
+  const busy = { title: 'Arch', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('arch', { completed_at: iso(T0 - 20 * 60_000) })], threads: { arch: busy } });
+  // Robob came back 20 min after the shutdown cancel; it has been up for 20 min.
+  io.serverRuntime = () => ({ pid: 5, procStartMs: T0 - 60_000, readyMs: T0 });
+  const state = { handled: {}, servers: [{ pid: 4, readyMs: T0 - 86_400_000, lastSeenMs: T0 - 21 * 60_000 }] };
+  const [report] = await restartScan(scanArgs(state, { now: T0 + 20 * 60_000 }), io);
+  assert.equal(report.results[0].plan.reason, 'fresh turn is running');
+  assert.equal(calls.send.length + calls.telegram.length, 0);
+});
+
+test('the summary waits until every thread settles and names each one by bucket', async () => {
+  const busy = { title: 'Crpko cell-risk (resume 10-15)', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({
+    runs: [run('bo'), run('risk'), run('imsg'), run('gone')],
+    subs: [sub('k1', 'kafka', 1_000), sub('k2', 'kafka', 1_100)],
+    later: { kafka: [{ subagent_id: 'r', title: 'worker k2 (resume)', provider_thread_id: pt('ses_r'), started_at: iso(T0 + 120_000) }] },
+    threads: {
+      bo: { title: 'Crpko cell-bo lane' }, risk: busy, imsg: { title: 'iMessage', origin: 'imessage' },
+      gone: { title: 'Old lane', archived: true }, kafka: { title: 'Crpko kafka cell' },
+    },
+    held: { bo: [{ run_id: 'h1', held: true, requested_at: iso(T0) }] },
+  });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.telegram.length, 0);
+  assert.deepEqual(calls.send.map((c) => c.threadId).sort(), ['bo', 'kafka']);
+  await restartScan(afterWindow(state), io);
+  assert.equal(calls.send.length, 2);
+  assert.equal(calls.telegram.length, 1);
+  const text = calls.telegram[0].text;
+  assert.match(text, /^Robob restart at 18:17Z hit 5 thread\(s\): 4 with their own turn cut off, 2 background subagent\(s\) cancelled\./);
+  assert.match(text, /Noted: Crpko cell-bo lane \(turn cut\); Crpko kafka cell \(1 subagent\(s\) to pick up, 1 handled subagent\(s\) listed\)\./);
+  assert.doesNotMatch(text, /\(0\)/);
+  assert.match(text, /Resumed by themselves \(no note\): Crpko cell-risk \(resume 10-15\) \(turn cut\)\./);
+  assert.match(text, /Queue released: Crpko cell-bo lane \(1\)\./);
+  assert.match(text, /Skipped: Old lane \(archived\)\./);
+  assert.match(text, /iMessage \(iMessage\): turn cut; the thread was not told\./);
+  assert.equal(calls.telegram[0].severity, 'attention');
+});
+
+test('buildRestartSummary counts threads from results too and labels own-turn notes', () => {
+  const incident = { startMs: T0, failAllMs: T0, subagents: [], runs: [{ thread_id: 'a' }, { thread_id: 'a' }, { thread_id: 'b' }] };
+  const s = buildRestartSummary({ incident, results: [
+    { plan: { threadId: 'a', title: 'Lane A', action: 'note' }, ok: true, turnCut: true, lostSubs: [] },
+    { plan: { threadId: 'b', title: null, action: 'skip', reason: 'stopped after the restart' }, ok: true, lostSubs: [] },
+  ] });
+  assert.match(s.text, /^Robob restart at 18:17Z hit 2 thread\(s\): 2 with their own turn cut off, 0 background/);
+  assert.match(s.text, /Noted: Lane A \(turn cut\)\./);
+  assert.match(s.text, /Skipped: b \(stopped after the restart\)\./);
+  assert.equal(s.severity, 'info');
+});
+
+test('inside the window a thread that ran again and went idle still gets the note (it never learned its turn was cut)', async () => {
+  const thread = { title: 'cell-devops2', activeRunId: 'coord-wake', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('d2')], runAfter: ['d2'], threads: { d2: thread } });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  thread.activeRunId = null;
+  thread.status = 'completed';
+  await restartScan(scanArgs(state, { now: T0 + 20 * 60_000 }), io);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['d2']);
+});
+
+test('a sent note is never re-sent or relabelled past the window; only its held queue is released', async () => {
+  const { io, calls } = fakeIo({ runs: [run('arch')], runAfter: ['arch'],
+    threads: { arch: { title: 'Arch', activeRunId: 'another', status: 'running' } },
+    held: { arch: [{ run_id: 'h', held: true, requested_at: iso(T0) }] },
+  });
+  io.restartNoteRun = () => 'note-run';
+  const [report] = await restartScan(afterWindow({ handled: {}, servers: [] }), io);
+  assert.equal(report.results[0].plan.action, 'note');
+  assert.equal(report.results[0].plan.reason, 'note already sent');
+  assert.equal(calls.send.length, 0);
+  assert.deepEqual(calls.commands.map((c) => c.type), ['queue.resume']);
+});
+
+test('past the window archived, stopped and iMessage threads never get a queue release; dry runs change nothing', async () => {
+  const held = [{ run_id: 'h', held: true, requested_at: iso(T0) }];
+  const make = () => fakeIo({ runs: [run('gone'), run('stop'), run('imsg')], runAfter: ['gone', 'stop', 'imsg'],
+    threads: { gone: { title: 'Gone', archived: true }, stop: { title: 'Stopped' }, imsg: { title: 'iMessage', origin: 'imessage', activeRunId: 'x' } },
+    held: { gone: held, stop: held, imsg: held },
+  });
+  const live = make();
+  live.io.stoppedSince = (_db, id) => id === 'stop';
+  const state = { handled: {}, servers: [] };
+  const [report] = await restartScan(afterWindow(state), live.io);
+  assert.deepEqual(report.results.map((r) => r.plan.action), ['skip', 'skip', 'report']);
+  assert.equal(live.calls.send.length + live.calls.commands.length, 0);
+  const dry = make();
+  const dryState = { handled: {}, servers: [] };
+  await restartScan({ ...afterWindow(dryState), dryRun: true }, dry.io);
+  assert.equal(dry.calls.send.length + dry.calls.commands.length + dry.calls.telegram.length + dry.calls.saves.length, 0);
+  assert.deepEqual(dryState.handled, {});
+});
+
+test('a thread Robob cannot find is retried before the summary names it', async () => {
+  const { io, calls } = fakeIo({ runs: [run('arch'), run('ghost')], threads: { arch: { title: 'Arch' } } });
+  const state = { handled: {}, servers: [] };
+  for (let i = 0; i < 2; i++) await restartScan(scanArgs(state), io);
+  assert.equal(calls.telegram.length, 0);
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.telegram.length, 1);
+  assert.match(calls.telegram[0].text, /Skipped: ghost \(not found in Robob\)\./);
+  assert.deepEqual(calls.send.map((c) => c.threadId), ['arch']);
+});
+
+test('leftover state from the previous version still gets a summary naming every thread, and finished state is slimmed', async () => {
+  const busy = { title: 'Busy', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('old'), run('busy')], threads: { old: { title: 'Old' }, busy } });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  const entry = Object.values(state.handled)[0];
+  delete entry.threads.old.result;
+  await restartScan(afterWindow(state), io);
+  assert.equal(calls.telegram.length, 1);
+  assert.match(calls.telegram[0].text, /Resumed by themselves \(no note\): Busy \(turn cut\)\./);
+  assert.match(calls.telegram[0].text, /Skipped: old \(handled earlier\)\./);
+  const done = Object.values(state.handled)[0];
+  assert.equal(done.done, true);
+  assert.equal(done.incident, undefined);
+  assert.deepEqual(done.threads.old, { done: true, noteSent: true, queueOk: undefined });
 });

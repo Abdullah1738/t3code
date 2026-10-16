@@ -420,22 +420,42 @@ export const resultInHistory = (messages, ses) =>
   (messages ?? []).some((m) => String(m?.text ?? "").startsWith(`<subagent sessionID="${ses}"`));
 
 export const RESTART_STALE_REASON = "only stale subagents (idle for hours before the restart)";
+export const RESTART_BUSY_REASON = "fresh turn is running";
+export const RESTART_RESUMED_REASON = "resumed by itself";
 const NEEDS = new Set(["cut", "running", "finished"]);
+const HANDLED = new Set(["redispatched", "delivered"]);
 
 // lost: [{status: cut | running | finished | stale | redispatched | delivered, ...}]
-export function planRestartThread({ thread, lost = [], turnCut = false, held = [], busy = false }) {
+// busy: a turn, question or OpenCode session is live on the thread now.
+// ranAgain: a run started on the thread since its cut.
+// windowOver: the hold-back for busy threads has run out.
+// noteSent: this incident's note already reached the thread.
+export function planRestartThread({
+  thread, lost = [], turnCut = false, held = [], busy = false, ranAgain = false, windowOver = false, noteSent = false,
+}) {
   const plan = { threadId: thread.threadId, title: thread.title, origin: thread.origin ?? null, resumeQueue: false };
   if (thread.archived) return { ...plan, action: "skip", reason: "archived" };
-  if (busy) return { ...plan, action: 'skip', reason: 'fresh turn is running' };
   const needs = lost.filter((l) => NEEDS.has(l.status));
   if (thread.origin === "imessage") {
     return { ...plan, action: turnCut || lost.length || held.length ? "report" : "skip", reason: "iMessage bridge thread" };
   }
+  if (noteSent) return { ...plan, action: "note", reason: "note already sent", resumeQueue: held.length > 0 };
   if (!turnCut && !held.length && !lost.some((l) => l.status !== 'stale')) {
     const reason = lost.length && lost.every((l) => l.status === "stale") ? RESTART_STALE_REASON : "already re-dispatched or delivered";
     return { ...plan, action: "skip", reason };
   }
-  return { ...plan, resumeQueue: held.length > 0, action: "note", reason: turnCut ? 'own turn cut off by restart' : `${needs.length} lost subagent(s) to pick up` };
+  if (windowOver && (busy || ranAgain)) {
+    return { ...plan, action: "resumed", reason: RESTART_RESUMED_REASON, resumeQueue: held.length > 0 };
+  }
+  if (busy) return { ...plan, action: "skip", reason: RESTART_BUSY_REASON };
+  const reason = turnCut
+    ? "own turn cut off by restart"
+    : needs.length
+      ? `${needs.length} lost subagent(s) to pick up`
+      : lost.some((l) => HANDLED.has(l.status))
+        ? "handled subagents listed for handoff"
+        : "held queue to release";
+  return { ...plan, resumeQueue: held.length > 0, action: "note", reason };
 }
 
 const PROMPT_MAX = 1_200;
@@ -499,35 +519,54 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
   return parts.join("\n\n");
 }
 
+// One line per bucket, every thread named: noted, resumed by itself, queue
+// released, skipped (with reason), iMessage reports, queues still held, errors.
 export function buildRestartSummary({ incident, results }) {
-  const threads = new Set([...incident.subagents.map((s) => s.parentThreadId ?? s.thread_id), ...(incident.runs ?? []).map((r) => r.thread_id)]).size;
+  const runs = incident.runs ?? [];
+  const threads = new Set([...incident.subagents.map((s) => s.parentThreadId ?? s.thread_id), ...runs.map((r) => r.thread_id)]);
+  for (const r of results) threads.add(r.plan.threadId);
+  const turnThreads = new Set(runs.map((r) => r.thread_id));
   const lines = [
-    `Robob restart at ${hhmm(incident.failAllMs ?? incident.startMs)} cancelled ${incident.subagents.length} background subagent(s) in ${threads} thread(s).`,
+    `Robob restart at ${hhmm(incident.failAllMs ?? incident.startMs)} hit ${threads.size} thread(s): ${turnThreads.size} with their own turn cut off, ${incident.subagents.length} background subagent(s) cancelled.`,
   ];
-  if (incident.runs?.length) lines.push(`${incident.runs.length} own turn(s) were cut off by the restart.`);
-  const name = (r) => truncate(r.plan.title ?? r.plan.threadId, 40);
-  const needCount = (r) => (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).length;
-  const noted = results.filter((r) => r.plan.action === "note" && r.ok);
-  if (noted.length) lines.push(`Told to pick them up: ${noted.map((r) => `${name(r)} (${needCount(r)})`).join("; ")}.`);
-  const skipped = results.filter((r) => r.plan.action === "skip");
-  if (skipped.length) {
-    const reasons = {};
-    for (const r of skipped) reasons[r.plan.reason] = (reasons[r.plan.reason] ?? 0) + 1;
-    lines.push(`Left alone: ${Object.entries(reasons).map(([k, v]) => `${v} ${k}`).join(", ")}.`);
+  const name = (r) => truncate(r.plan.title || r.plan.threadId, 40);
+  const what = (r) => {
+    const parts = [];
+    if (r.turnCut) parts.push("turn cut");
+    const need = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).length;
+    const done = (r.lostSubs ?? []).filter((l) => HANDLED.has(l.status)).length;
+    if (need) parts.push(`${need} subagent(s) to pick up`);
+    if (done) parts.push(`${done} handled subagent(s) listed`);
+    return parts.length ? ` (${parts.join(", ")})` : "";
+  };
+  // Capped per bucket so a big restart still fits one Telegram message.
+  const list = (rs, fmt) => rs.slice(0, SUMMARY_NAMES).map(fmt).join("; ") + (rs.length > SUMMARY_NAMES ? `; +${rs.length - SUMMARY_NAMES} more` : "");
+  const noted = results.filter((r) => r.plan.action === "note" && r.ok && !r.error);
+  if (noted.length) lines.push(`Noted: ${list(noted, (r) => `${name(r)}${what(r)}`)}.`);
+  const resumed = results.filter((r) => r.plan.action === "resumed");
+  if (resumed.length) lines.push(`Resumed by themselves (no note): ${list(resumed, (r) => `${name(r)}${what(r)}`)}.`);
+  const released = results.filter((r) => r.queueOk);
+  if (released.length) {
+    lines.push(`Queue released: ${list(released, (r) => `${name(r)} (${r.held}${r.staleHeld?.length ? `, ${r.staleHeld.length} stale pulse(s) cancelled` : ""})`)}.`);
   }
+  const skipped = results.filter((r) => r.plan.action === "skip" && !r.error);
+  if (skipped.length) lines.push(`Skipped: ${list(skipped, (r) => `${name(r)} (${r.plan.reason})`)}.`);
   for (const r of results.filter((x) => x.plan.action === "report")) {
     const lost = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).map((l) => `"${truncate(l.title ?? l.sessionId, 60)}" (${l.sessionId})`);
-    lines.push(`iMessage (${name(r)}): lost ${lost.join(", ")}; the thread was not told.`);
+    const bits = [r.turnCut ? "turn cut" : null, lost.length ? `lost ${lost.join(", ")}` : null].filter(Boolean);
+    lines.push(`iMessage (${name(r)}): ${bits.join("; ") || "affected"}; the thread was not told.`);
   }
-  const released = results.filter((r) => r.queueOk);
-  if (released.length) lines.push(`Released held queues: ${released.map((r) => `${name(r)} (${r.held}, ${r.staleHeld?.length ?? 0} stale pulses cancelled)`).join('; ')}.`);
-  const held = results.filter((r) => r.held > 0 && !r.queueOk && r.plan.reason !== 'archived');
-  if (held.length) lines.push(`Queues still held: ${held.map((r) => `${name(r)} (${r.held})`).join('; ')}.`);
+  const held = results.filter((r) => r.held > 0 && !r.queueOk && r.plan.reason !== "archived");
+  if (held.length) lines.push(`Queues still held: ${list(held, (r) => `${name(r)} (${r.held})`)}.`);
   const failed = results.filter((r) => r.error);
-  if (failed.length) lines.push(`Errors: ${failed.map((r) => `${name(r)}: ${truncate(r.error, 120)}`).join("; ")}.`);
-  const attention = results.some((r) => r.plan.action === "report") || failed.length > 0;
+  if (failed.length) lines.push(`Errors: ${list(failed, (r) => `${name(r)}: ${truncate(r.error, 120)}`)}.`);
+  // A thread that moved on without being told about cut subagents may need a look.
+  const unpicked = resumed.some((r) => (r.lostSubs ?? []).some((l) => NEEDS.has(l.status)));
+  const attention = results.some((r) => r.plan.action === "report") || failed.length > 0 || unpicked;
   return { text: truncate(lines.join("\n"), 3500), severity: attention ? "attention" : "info" };
 }
+
+const SUMMARY_NAMES = 12;
 
 export function buildSummary({ incident, results }) {
   const runs = incident.runs.length;

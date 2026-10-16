@@ -72,14 +72,24 @@ also looks for those:
   iMessage threads are reported in the summary.
 - Rechecks active turns in both Robob and OpenCode before mutations. Fresh
   turns are deferred until idle; queue delivery cannot interrupt or steer a racing turn.
+  The hold-back lasts 30 min from when Robob was ready again
+  (`RESTART_RESUME_WINDOW_MS`). A thread that goes idle inside the window gets
+  the note (a coord wake in between does not tell it its turn was cut). After
+  the window, a thread that is still busy or has started a run since its cut
+  counts as resumed by itself: no note, but its held queue is still released.
+  A note already sent is never re-sent or relabelled.
   Per-thread progress and the durable message receipt prevent resends after
   partial failures. Restart failures are excluded from the stream-loss scan.
 - Cancels held `[coord]` messages older than 2h with a verified `coord:`
   client-request namespace, lists them in the note, and resumes the remaining
   queue with idempotent commands. Other messages, including legacy lane pulses
   without verifiable provenance, are preserved regardless of age.
-- One Telegram summary per restart (`stream-recovery:rs-<time>`), including
-  queue recovery results. Incident ids start `rs-`.
+- One Telegram summary per restart (`stream-recovery:rs-<time>`), sent once
+  every affected thread has settled. It names each thread (up to 12 per line)
+  under noted, resumed by themselves, queue released and skipped (with the
+  reason), plus iMessage reports, queues still held and errors. A thread Robob
+  cannot find is retried 3 scans first. Finished incidents keep only per-thread
+  flags in state. Incident ids start `rs-`.
 
 ## Stall watch
 
