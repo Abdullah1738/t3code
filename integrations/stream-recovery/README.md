@@ -34,6 +34,39 @@ block every later queued message.
 Handled incidents are recorded in `~/.local/share/stream-recovery/data/state.json`.
 An incident that hit errors is retried on later scans, up to 3 attempts.
 
+## Restart watch
+
+A Robob restart (app update, crash, install) runs startup recovery, which marks
+every native background subagent Robob still had open as `cancelled` with no
+result. Their wake-ups never come, so parents sit idle or start over. Each scan
+also looks for those:
+
+- Reads `cancelled` provider-native subagents (statev2, read-only). A cluster
+  (rows <= 10s apart) is a restart when it has 3+ rows across 2+ top-level
+  thread trees, or when any row falls in a Robob server start window.
+- Server start signal: `~/.robob/userdata/server-runtime.json` (`pid`,
+  `startedAt` = ready time, written after startup recovery) plus the process
+  start from `ps -o lstart=`. Scans keep a short history in `state.servers`;
+  the window runs from the last scan that saw the previous server (so shutdown
+  cancels count) or process start minus 60s, to ready plus 60s.
+- Not a restart: a user Stop (Robob marks those subagents `interrupted`), a
+  burst inside one thread tree, delegated `task_cancel` (app-owned rows), and
+  sessions the stall watch interrupted itself.
+- Waits 3 min after the last cancel, and while `install-robob-resume.zsh` still
+  has `restart-snapshots/pending.json` (up to 30 min), so threads that resume on
+  their own go first.
+- Per lost subagent: re-dispatched (same session resumed, or same title with a
+  `(resume)`-style suffix), still running, finished (result never delivered,
+  or delivered: in Robob or in the parent's OpenCode history after a later
+  turn), cut, or stale (idle 6h+ before the restart).
+- One note per parent thread with something left (control API, mode auto,
+  `clientRequestId` = incident id) listing title, model, child session, start
+  time, and the original prompt (statev2 `payload.prompt`) or the finished
+  result, and asking it to resume each cut one by session id. Archived, crw
+  and iMessage threads get no note; iMessage ones go in the summary.
+- One Telegram summary per restart (`stream-recovery:rs-<time>`), including
+  threads whose queued messages Robob is holding. Incident ids start `rs-`.
+
 ## Stall watch
 
 Every scan also checks the sessions OpenCode reports as running
@@ -64,7 +97,7 @@ model stream that died mid tool call and left the session "running" for hours.
   info when cleared, error when it is still stuck 10 min after the interrupt.
   After 3 interrupts of one session in 24h it only reports.
 
-Stalls are kept in the same state file (`watch`, `stalls`).
+Stalls are kept in the same state file (`watch`, `stalls`, `servers`).
 
 ## Commands
 
@@ -74,8 +107,8 @@ node cli.mjs status
 ```
 
 - `--dry-run` shows the plan without sending anything or touching state.
-- `--seed` marks every incident found as handled without acting, and skips the
-  stall watch.
+- `--seed` marks every incident found (stream drops and restarts) as handled
+  without acting, and skips the stall watch.
 - Use `STREAM_RECOVERY_DATA=<dir>` to dry-run against a scratch state dir.
 
 ## Install

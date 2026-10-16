@@ -2,7 +2,7 @@
 // Robob orchestration WebSocket RPC, OpenCode service API, Telegram, state file.
 import { DatabaseSync } from "node:sqlite";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -58,6 +58,78 @@ export function failedSubagentsSince(db, sinceIso) {
         where status='failed' and completed_at >= ? order by completed_at`,
     )
     .all(sinceIso);
+}
+
+// Native subagents Robob closed as cancelled (restart recovery does this).
+export function cancelledSubagentsSince(db, sinceIso) {
+  return db
+    .prepare(
+      `select subagent_id, thread_id, run_id, provider_thread_id, child_thread_id, started_at, completed_at,
+              json_extract(payload_json,'$.result') result, json_extract(payload_json,'$.title') title,
+              json_extract(payload_json,'$.prompt') prompt, json_extract(payload_json,'$.model') model
+         from orchestration_v2_projection_subagents
+        where status='cancelled' and origin='provider_native' and completed_at >= ? order by completed_at`,
+    )
+    .all(sinceIso);
+}
+
+export function threadRoot(db, threadId) {
+  return (
+    db
+      .prepare(`select json_extract(payload_json,'$.lineage.rootThreadId') r from orchestration_v2_projection_threads where thread_id=?`)
+      .get(threadId)?.r ?? null
+  );
+}
+
+export function subagentsStartedSince(db, threadId, sinceIso) {
+  return db
+    .prepare(
+      `select subagent_id, provider_thread_id, started_at, status, json_extract(payload_json,'$.title') title
+         from orchestration_v2_projection_subagents where thread_id=? and started_at >= ? order by started_at`,
+    )
+    .all(threadId, sinceIso);
+}
+
+export function runStartedSince(db, threadId, sinceIso) {
+  return Boolean(
+    db
+      .prepare(
+        `select 1 from orchestration_v2_projection_runs
+          where thread_id=? and json_extract(payload_json,'$.startedAt') >= ? limit 1`,
+      )
+      .get(threadId, sinceIso),
+  );
+}
+
+// Whether the thread's own turn was cancelled between fromIso and toIso and
+// nothing ran on it since.
+export function turnCutAndIdle(db, threadId, fromIso, toIso) {
+  const cut = db
+    .prepare(
+      `select ordinal from orchestration_v2_projection_runs
+        where thread_id=? and status='cancelled' and completed_at between ? and ?
+          and json_extract(payload_json,'$.startedAt') is not null
+        order by ordinal desc limit 1`,
+    )
+    .get(threadId, fromIso, toIso);
+  if (!cut) return false;
+  return !db
+    .prepare(`select 1 from orchestration_v2_projection_runs where thread_id=? and ordinal > ? and status != 'queued' limit 1`)
+    .get(threadId, cut.ordinal);
+}
+
+// Whether a subagent's completion reached the thread (OpenCode delivers it as
+// a "<subagent sessionID=...>" user message), optionally only up to untilIso.
+export function subagentResultSeen(db, threadId, sinceIso, ses, untilIso = "9999") {
+  return Boolean(
+    db
+      .prepare(
+        `select 1 from orchestration_v2_projection_messages
+          where thread_id=? and created_at >= ? and created_at <= ? and role='user'
+            and json_extract(payload_json,'$.text') like ? limit 1`,
+      )
+      .get(threadId, sinceIso, untilIso, `<subagent sessionID="${ses}"%`),
+  );
 }
 
 // Parent of a nested child thread id ("thread:provider:...native-thread:ses_X").
@@ -155,6 +227,49 @@ export async function getThread(threadId) {
   } catch (e) {
     if (e.status === 404) return null;
     throw e;
+  }
+}
+
+export async function robobHealthy() {
+  try {
+    await ctl("GET", "/health");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The running Robob server: server-runtime.json is published once startup
+// recovery is done (startedAt = ready time) and removed on shutdown. The
+// process start comes from ps, as serverOwnership.ts reads it.
+export function serverRuntime() {
+  const path = join(HOME, ".robob/userdata/server-runtime.json");
+  if (!existsSync(path)) return null;
+  const s = parse(readFileSync(path, "utf8"));
+  const readyMs = Date.parse(s.startedAt);
+  if (!Number.isInteger(s.pid) || !Number.isFinite(readyMs)) return null;
+  try {
+    process.kill(s.pid, 0);
+  } catch {
+    return null;
+  }
+  const r = spawnSync("ps", ["-p", String(s.pid), "-o", "lstart="], {
+    env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  const procStartMs = r.status === 0 ? Date.parse(`${r.stdout.trim()} UTC`) : NaN;
+  return { pid: s.pid, readyMs, procStartMs: Number.isFinite(procStartMs) ? procStartMs : null };
+}
+
+// install-robob-resume.zsh keeps pending.json until it has sent its own
+// "resume" message to the threads it snapshotted. Returns its mtime or null.
+export function installerResumePendingMs() {
+  const path = join(HOME, ".robob/restart-snapshots/pending.json");
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return null;
   }
 }
 
@@ -295,9 +410,12 @@ export function telegram({ text, severity = "info", key }) {
 const statePath = () => join(PATHS.dataDir, "state.json");
 
 export function loadState() {
-  if (!existsSync(statePath())) return { handled: {}, lastScan: null, watch: {}, stalls: {} };
+  if (!existsSync(statePath())) return { handled: {}, lastScan: null, watch: {}, stalls: {}, servers: [] };
   const s = parse(readFileSync(statePath(), "utf8"));
-  return { handled: s.handled ?? {}, lastScan: s.lastScan ?? null, watch: s.watch ?? {}, stalls: s.stalls ?? {} };
+  return {
+    handled: s.handled ?? {}, lastScan: s.lastScan ?? null, watch: s.watch ?? {}, stalls: s.stalls ?? {},
+    servers: s.servers ?? [],
+  };
 }
 
 export function saveState(state, now = Date.now()) {

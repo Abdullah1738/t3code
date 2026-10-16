@@ -260,6 +260,236 @@ export function buildNote({ incident, plan, lost = [], reply = null, orphans = [
   return parts.join("\n\n");
 }
 
+// ---------- Robob restarts ----------
+// Startup recovery marks every native subagent Robob still had open as
+// cancelled with no result (ProviderRuntimeRecoveryService). A user Stop marks
+// them interrupted, and a task_cancel or OpenCode interrupt cancels one at a
+// time, so a cross-thread burst or a cancel right at a server start is a restart.
+
+export const restartIncidentId = (startMs) =>
+  "rs-" + new Date(startMs).toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
+
+// start: {pid, readyMs, procStartMs, prevSeenMs}. readyMs is
+// server-runtime.json's startedAt, published once startup recovery is done;
+// procStartMs is the process start from ps; prevSeenMs is the last scan that
+// saw the previous server alive, so a graceful shutdown's cancels count too.
+export function serverStartWindow(start, { marginMs = 60_000, startupMs = 5 * 60_000, maxDownMs = 30 * 60_000 } = {}) {
+  const ready = toMs(start?.readyMs);
+  if (!Number.isFinite(ready)) return null;
+  const proc = toMs(start?.procStartMs);
+  const launched = Number.isFinite(proc) && proc <= ready ? proc : ready - startupMs;
+  const prev = toMs(start?.prevSeenMs);
+  const from = Math.max(Math.min(launched - marginMs, Number.isFinite(prev) ? prev : Infinity), launched - maxDownMs);
+  return { from, to: ready + marginMs, start };
+}
+
+// servers: [{pid, readyMs, procStartMs, firstSeenMs, lastSeenMs, prevSeenMs}]
+// as seen by earlier scans; current: io.serverRuntime(). Returns a new list.
+export function trackServer(servers, current, now, { keep = 20 } = {}) {
+  const list = (servers ?? []).map((s) => ({ ...s }));
+  if (!current) return list;
+  const known = list.find((s) => s.pid === current.pid && s.readyMs === current.readyMs);
+  if (known) {
+    known.lastSeenMs = now;
+    return list;
+  }
+  const prev = list.at(-1);
+  list.push({ ...current, firstSeenMs: now, lastSeenMs: now, prevSeenMs: prev?.lastSeenMs ?? null });
+  return list.slice(-keep);
+}
+
+// subs: cancelled subagent rows {completed_at, result, thread_id,
+// parentThreadId, rootThreadId}. Clusters the result-less ones (gap <= gapMs).
+// A cluster is a restart when it spans >= minThreads root threads with >=
+// minBurst rows, or when any row falls in a server start window. A burst in
+// one thread tree alone is a Stop (or task_cancel), not a restart.
+export function findRestartIncidents(subs, { serverStarts = [], gapMs = 10_000, minBurst = 3, minThreads = 2 } = {}) {
+  const windows = serverStarts.map((s) => serverStartWindow(s)).filter(Boolean);
+  const rows = subs
+    .filter((s) => s.result == null)
+    .map((s) => ({ ...s, ms: toMs(s.completed_at) }))
+    .filter((s) => Number.isFinite(s.ms))
+    .sort((a, b) => a.ms - b.ms);
+  const clusters = [];
+  for (const s of rows) {
+    const last = clusters.at(-1);
+    if (last && s.ms - last.at(-1).ms <= gapMs) last.push(s);
+    else clusters.push([s]);
+  }
+  return clusters
+    .map((cluster) => {
+      const roots = new Set(cluster.map((s) => s.rootThreadId ?? s.parentThreadId ?? s.thread_id));
+      const burst = cluster.length >= minBurst && roots.size >= minThreads;
+      const win = windows.find((w) => cluster.some((s) => s.ms >= w.from && s.ms <= w.to));
+      if (!burst && !win) return null;
+      return {
+        kind: "restart",
+        id: restartIncidentId(cluster[0].ms),
+        startMs: cluster[0].ms,
+        endMs: cluster.at(-1).ms,
+        failAllMs: cluster[0].ms,
+        reason: win ? "server start" : "burst",
+        serverStart: win?.start ?? null,
+        runs: [],
+        subagents: cluster.map(({ ms, ...s }) => ({ ...s, parentThreadId: s.parentThreadId ?? s.thread_id })),
+      };
+    })
+    .filter(Boolean);
+}
+
+const REDO_SUFFIX = /\s*\((?:resume|resumed|retry|re-?run|re-?launch|continue|continued|finish|restart|restarted)\b[^)]*\)\s*$/;
+export const normTitle = (title) => String(title ?? "").toLowerCase().replace(REDO_SUFFIX, "").replace(/\s+/g, " ").trim();
+
+// later: subagent rows started on the same thread after the cancel. The parent
+// re-dispatched the lost one if it resumed the same session or relaunched it
+// under the same title (optionally with a "(resume)"-style suffix).
+export function findRedispatch(lost, later) {
+  const title = normTitle(lost.title);
+  const cutMs = toMs(lost.completed_at);
+  return (
+    later.find((s) => {
+      if (s.subagent_id === lost.subagent_id || !(toMs(s.started_at) >= cutMs - 1_000)) return false;
+      const ses = sessionFromProviderThread(s.provider_thread_id);
+      if (lost.sessionId && ses === lost.sessionId) return true;
+      return title.length >= 6 && normTitle(s.title) === title;
+    }) ?? null
+  );
+}
+
+// messages: newest-first OpenCode messages of the child session. Returns
+// {status: finished | cut | stale, lastMs, finishedMs, excerpt, model}.
+export function childOutcome(messages, { incidentMs, staleMs = 6 * 3_600_000 } = {}) {
+  const list = Array.isArray(messages) ? messages : [];
+  let lastMs = 0;
+  for (const m of list) {
+    for (const v of Object.values(m?.time ?? {})) {
+      const ms = toMs(v);
+      if (Number.isFinite(ms) && ms > lastMs) lastMs = ms;
+    }
+  }
+  const assistant = list.find((m) => m?.type === "assistant" && m.model);
+  const model = assistant ? [assistant.model.providerID, assistant.model.id].filter(Boolean).join("/") : null;
+  const base = { lastMs: lastMs || null, finishedMs: null, excerpt: null, model };
+  if (lastMs && lastMs < incidentMs - staleMs) return { ...base, status: "stale" };
+  const head = list.find((m) => m?.type !== "idle" && m?.type !== "system");
+  if (head?.type === "assistant" && head.finish === "stop" && !head.error) {
+    const text = assistantText(head);
+    return {
+      ...base,
+      status: "finished",
+      finishedMs: toMs(head.time?.completed ?? head.time?.created) || null,
+      excerpt: text ? truncate(text, 600) : null,
+    };
+  }
+  return { ...base, status: "cut" };
+}
+
+// OpenCode hands a finished background subagent's result to its parent as a
+// synthetic "<subagent sessionID=...>" message, even when Robob drops the wake.
+export const resultInHistory = (messages, ses) =>
+  (messages ?? []).some((m) => String(m?.text ?? "").startsWith(`<subagent sessionID="${ses}"`));
+
+export const RESTART_STALE_REASON = "only stale subagents (idle for hours before the restart)";
+const NEEDS = new Set(["cut", "running", "finished"]);
+
+// lost: [{status: cut | running | finished | stale | redispatched | delivered, ...}]
+export function planRestartThread({ thread, lost = [] }) {
+  const plan = { threadId: thread.threadId, title: thread.title, origin: thread.origin ?? null, resumeQueue: false };
+  if (thread.archived) return { ...plan, action: "skip", reason: "archived" };
+  if (thread.origin === "crw") return { ...plan, action: "skip", reason: "crw review thread (crw handles it)" };
+  const needs = lost.filter((l) => NEEDS.has(l.status));
+  if (thread.origin === "imessage") {
+    return { ...plan, action: needs.length ? "report" : "skip", reason: "iMessage bridge thread" };
+  }
+  if (!needs.length) {
+    const reason = lost.length && lost.every((l) => l.status === "stale") ? RESTART_STALE_REASON : "already re-dispatched or delivered";
+    return { ...plan, action: "skip", reason };
+  }
+  return { ...plan, action: "note", reason: `${needs.length} lost subagent(s) to pick up` };
+}
+
+const PROMPT_MAX = 1_200;
+const PROMPTS_TOTAL = 10_000;
+
+export function buildRestartNote({ incident, lost = [], turnCut = false, ocUrl }) {
+  const at = hhmm(incident.failAllMs ?? incident.startMs);
+  const needs = lost.filter((l) => NEEDS.has(l.status));
+  const done = lost.filter((l) => l.status === "redispatched" || l.status === "delivered");
+  const auth = `-u "opencode:$(cat ~/.config/opencode-service/password)"`;
+  const parts = [
+    `[stream-recovery] Robob restarted at ${at} and cancelled ${needs.length} background subagent(s) this thread had running. Robob will not deliver their results, so nothing will wake you for them.` +
+      (turnCut ? ` Your own turn was cut off by the same restart; carry on from where you were.` : ""),
+  ];
+  let budget = PROMPTS_TOTAL;
+  const lines = needs.map((l, i) => {
+    const head = `${i + 1}. "${truncate(l.title ?? "subagent", 100)}"${l.model ? ` (${l.model})` : ""}, session ${l.sessionId ?? "unknown"}, started ${l.startedAt ? hhmm(l.startedAt) : "?"}${l.nestedUnder ? `, launched by ${l.nestedUnder}` : ""}: `;
+    if (l.status === "running") return `${head}still running in OpenCode, but its wake-up won't reach you through Robob. Don't relaunch it; check its output before you finish your turn.`;
+    if (l.status === "finished") {
+      const quote = l.excerpt ? `:\n   > ${fence(l.excerpt).replace(/\n/g, "\n   > ")}` : ".";
+      return `${head}finished at ${l.finishedMs ? hhmm(l.finishedMs) : "?"}, but its result never reached you${quote}`;
+    }
+    let prompt = "";
+    if (l.prompt && budget > 0) {
+      const text = truncate(l.prompt.trim(), Math.min(PROMPT_MAX, budget));
+      budget -= text.length;
+      prompt = `\n   Original prompt${text.length < l.prompt.trim().length ? " (start)" : ""}:\n   \`\`\`\n${fence(text)}\n   \`\`\``;
+    } else if (l.prompt) {
+      prompt = `\n   Original prompt: in your earlier subagent call.`;
+    }
+    return `${head}cut off by the restart.${prompt}`;
+  });
+  parts.push(`Lost subagents:\n${lines.join("\n")}`);
+  if (done.length) {
+    parts.push(
+      `Already handled, no action needed: ` +
+        done
+          .map((l) =>
+            l.status === "redispatched"
+              ? `"${truncate(l.title ?? "subagent", 60)}" (re-dispatched as "${truncate(l.redo?.title ?? "subagent", 60)}" at ${hhmm(l.redo?.started_at)})`
+              : `"${truncate(l.title ?? "subagent", 60)}" (its result is in your history)`,
+          )
+          .join("; ") +
+        ".",
+    );
+  }
+  if (needs.some((l) => l.status === "cut")) {
+    parts.push(
+      `For each cut-off subagent you still need, resume it with your subagent tool: pass its session id as the session to continue, with a short prompt such as "Robob restarted and cut you off. Carry on from where you stopped and finish the task." It keeps its context. Re-dispatch from the original prompt only if the resume fails. Skip any you no longer need or already relaunched.`,
+    );
+  }
+  parts.push(
+    `Read a subagent's output with: curl -s ${auth} "${ocUrl}/api/session/<ses>/message?limit=5" (newest first). Then post a one-line status and carry on. If you already handed this lane to a newer thread, pass anything relevant to it and stop.`,
+  );
+  return parts.join("\n\n");
+}
+
+export function buildRestartSummary({ incident, results }) {
+  const threads = new Set(incident.subagents.map((s) => s.parentThreadId ?? s.thread_id)).size;
+  const lines = [
+    `Robob restart at ${hhmm(incident.failAllMs ?? incident.startMs)} cancelled ${incident.subagents.length} background subagent(s) in ${threads} thread(s).`,
+  ];
+  const name = (r) => truncate(r.plan.title ?? r.plan.threadId, 40);
+  const needCount = (r) => (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).length;
+  const noted = results.filter((r) => r.plan.action === "note" && r.ok);
+  if (noted.length) lines.push(`Told to pick them up: ${noted.map((r) => `${name(r)} (${needCount(r)})`).join("; ")}.`);
+  const skipped = results.filter((r) => r.plan.action === "skip");
+  if (skipped.length) {
+    const reasons = {};
+    for (const r of skipped) reasons[r.plan.reason] = (reasons[r.plan.reason] ?? 0) + 1;
+    lines.push(`Left alone: ${Object.entries(reasons).map(([k, v]) => `${v} ${k}`).join(", ")}.`);
+  }
+  for (const r of results.filter((x) => x.plan.action === "report")) {
+    const lost = (r.lostSubs ?? []).filter((l) => NEEDS.has(l.status)).map((l) => `"${truncate(l.title ?? l.sessionId, 60)}" (${l.sessionId})`);
+    lines.push(`iMessage (${name(r)}): lost ${lost.join(", ")}; the thread was not told.`);
+  }
+  const held = results.filter((r) => r.held > 0 && r.plan.reason !== "archived");
+  if (held.length) lines.push(`Queued messages Robob is holding (resume them in Robob if still wanted): ${held.map((r) => `${name(r)} (${r.held})`).join("; ")}.`);
+  const failed = results.filter((r) => r.error);
+  if (failed.length) lines.push(`Errors: ${failed.map((r) => `${name(r)}: ${truncate(r.error, 120)}`).join("; ")}.`);
+  const attention = results.some((r) => r.plan.action === "report") || failed.length > 0;
+  return { text: truncate(lines.join("\n"), 3500), severity: attention ? "attention" : "info" };
+}
+
 export function buildSummary({ incident, results }) {
   const runs = incident.runs.length;
   const threads = new Set(incident.runs.map((r) => r.threadId)).size;

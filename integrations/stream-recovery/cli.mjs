@@ -8,10 +8,12 @@ import {
 } from './lib/detect.mjs';
 import * as io from './lib/io.mjs';
 import { stallScan } from './lib/stallwatch.mjs';
+import { restartScan } from './lib/restartwatch.mjs';
 
 const SETTLE_MS = 90_000;
 const STALE_HELD_MS = 24 * 3600_000;
 const MAX_ATTEMPTS = 3;
+const RESTART_LOOKBACK_MS = 3 * 3600_000;
 
 function parseArgs(argv) {
   const [cmd = 'scan', ...rest] = argv;
@@ -249,6 +251,18 @@ async function scan(opts) {
       }
       report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
     }
+    let restarts = [];
+    try {
+      // A shutdown's cancels can sit for a while before Robob is back to take
+      // the notes, so look further back than the stream-loss scan does.
+      const restartSince = opts.since ? sinceIso
+        : new Date(Math.max(floor, state.lastScan ? Date.parse(state.lastScan) - RESTART_LOOKBACK_MS : floor)).toISOString();
+      restarts = await restartScan({
+        db, state, now, sinceIso: restartSince, floorMs: floor, dryRun: opts.dryRun, seed: opts.seed, verbose: opts.verbose, log,
+      });
+    } catch (err) {
+      log(`restart watch failed: ${err?.message || err}`);
+    }
     let stalls = [];
     if (!opts.seed) {
       try {
@@ -258,7 +272,7 @@ async function scan(opts) {
       }
     }
     if (!opts.dryRun) { state.lastScan = new Date(now).toISOString(); io.saveState(state, now); }
-    if (opts.json) console.log(JSON.stringify({ incidents: report, stalls }, null, 2));
+    if (opts.json) console.log(JSON.stringify({ incidents: report, restarts, stalls }, null, 2));
   } finally {
     release();
   }
