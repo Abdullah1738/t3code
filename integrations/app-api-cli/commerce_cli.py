@@ -716,6 +716,21 @@ def basket_arguments(parser, flag):
     parser.add_argument('--prepare-only',action='store_true',
         help='create/review the basket with exact readback, without ordering or paying (not read-only)')
     recipient_argument(parser)
+    parser.add_argument('--moni-go',default=None,metavar='HER_WORDS',
+        help="required with --for moni unless --prepare-only: Moni's own go, quoted from her chat (checked against "
+             'her messages in the last 45 min; fails closed with MONI_GO_NOT_FOUND)')
+
+
+def require_moni_go(args):
+    """Moni's own go must be on record before anything is placed for her.
+
+    Abdullah's standing approval pays for her orders; it never picks them.
+    Prepare-only runs never place, so they don't need it.
+    """
+    placing=args.command=='test-talabat-shops' or args.command=='order'
+    if not placing or getattr(args,'recipient','owner')!='moni' or getattr(args,'prepare_only',False):return None
+    import moni_go
+    return moni_go.verify(getattr(args,'moni_go',None) or '')
 
 
 def recipient_argument(parser):
@@ -812,6 +827,7 @@ def main(argv=None):
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
     try:
+        moni_go=require_moni_go(args)
         if args.command=='capabilities':result=capabilities()
         elif args.command in ('menu','choices'):result=talabat_discovery(args)
         elif args.command=='restaurant-cart-contract':
@@ -852,6 +868,7 @@ def main(argv=None):
             state=journal.inspect(args.flow_id)
             if not state['order_id']:journal.fail('EXACT_ORDER_ID_UNAVAILABLE')
             result=track_exact(state['app'],state['vertical'],state['order_id'])
+        if moni_go and isinstance(result,dict):result={**result,'moni_go':moni_go}
         print(json.dumps(result))
         return 1 if result.get('ok') is False else 0
     except Exception as exc:

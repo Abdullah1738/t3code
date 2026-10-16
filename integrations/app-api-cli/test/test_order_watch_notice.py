@@ -310,8 +310,9 @@ class CLIPassThroughTests(unittest.TestCase):
                                (['order', 'nownow', '--product-code', 'P', '--store-code', 'S'], 'order_nownow'),
                                (['order', 'main', '--sku-config', 'Z'], 'order_main'),
                                (['order', 'supermall', '--sku-config', 'Z'], 'order_supermall')):
-            for extra, expected in (([], 'owner'), (['--for', 'moni'], 'moni')):
+            for extra, expected in (([], 'owner'), (['--for', 'moni', '--moni-go', 'yes order it'], 'moni')):
                 with self.subTest(lane=prefix[1], extra=extra), \
+                        mock.patch('moni_go.verify', return_value={'message_id': 1}), \
                         mock.patch.object(cli, target, return_value={'ok': True}) as lane, \
                         contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(cli.main([*prefix, *extra]), 0)
@@ -374,8 +375,10 @@ class CLIPassThroughTests(unittest.TestCase):
                                               'moni_notified': 'sent', 'moni_notice_failed': False}
         with mock.patch('commerce_nownow_order.NowNowOrderFlow', return_value=flow), \
                 mock.patch.object(cli, 'CommerceAuth'), mock.patch.object(cli.journal, 'complete'), \
+                mock.patch('moni_go.verify', return_value={'message_id': 1}), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
-            code = cli.main(['order', 'nownow', '--product-code', 'P', '--store-code', 'S', '--for', 'moni'])
+            code = cli.main(['order', 'nownow', '--product-code', 'P', '--store-code', 'S', '--for', 'moni',
+                             '--moni-go', 'yes order it'])
         final = json.loads(out.getvalue().splitlines()[-1])
         self.assertEqual(code, 0)
         self.assertEqual(flow.register_tracker.call_args.kwargs['recipient'], 'moni')
