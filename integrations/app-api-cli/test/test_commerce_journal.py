@@ -483,6 +483,8 @@ class ReleaseTest(unittest.TestCase):
         self.fenced_unpaid_flow()
         self.fence_it()
         with sqlite3.connect(self.root/'journal.sqlite') as db:
+            db.execute('DROP TABLE owner_attestations')
+            db.execute('PRAGMA user_version=1')
             db.execute('DROP INDEX active_account')
             db.execute("CREATE UNIQUE INDEX active_account "
                        "ON flows(app, account_hash) WHERE state != 'COMPLETE'")

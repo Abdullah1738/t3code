@@ -640,6 +640,8 @@ def review_contract(vertical):
 def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
     if binding['app']!='talabat':journal.fail('TALABAT_FLOW_REQUIRED')
+    if journal.inspect(flow_id)['state']==journal.OWNER_ATTESTED_UNCHARGED:
+        journal.fail('JOURNAL_FLOW_OWNER_ATTESTED_UNCHARGED')
     store=receipts.load(**binding)
     cursor=store.snapshot().talabat_readback()
 
@@ -807,6 +809,11 @@ def main(argv=None):
     exact.add_argument('vertical');exact.add_argument('order')
     status=commands.add_parser('order-status');status.add_argument('flow_id')
     disposition=commands.add_parser('reconcile-order');disposition.add_argument('flow_id')
+    disposition.add_argument('--owner-attest-no-charge',action='store_true',
+        help='terminal Talabat close using explicit owner evidence plus fresh exact provider checks; never retries')
+    disposition.add_argument('--evidence',metavar='TEXT',
+        help='owner no-charge statement and source/context, retained in the private journal')
+    disposition.add_argument('--attested-by',choices=('owner',))
     cart=commands.add_parser('marketplace-cart');cart.add_argument('service',choices=('main','supermall'))
     preflight=commands.add_parser('checkout-check');preflight.add_argument('vertical',choices=('main','supermall','nownow','minutes'))
     contract=commands.add_parser('review-contract');contract.add_argument('vertical',choices=('main','supermall','nownow'))
@@ -885,8 +892,13 @@ def main(argv=None):
             from commerce_order_status import status
             result=status(args.flow_id)
         elif args.command=='reconcile-order':
-            from commerce_reconcile import reconcile
-            result=reconcile(args.flow_id)
+            from commerce_reconcile import reconcile, owner_attest_no_charge
+            if args.owner_attest_no_charge:
+                result=owner_attest_no_charge(args.flow_id,evidence=args.evidence,attested_by=args.attested_by)
+            elif args.evidence is not None or args.attested_by is not None:
+                journal.fail('OWNER_ATTESTATION_FLAG_REQUIRED')
+            else:
+                result=reconcile(args.flow_id)
         elif args.command=='marketplace-cart':
             from commerce_marketplace import MarketplaceFlow
             result=MarketplaceFlow(args.service).cart()

@@ -578,12 +578,31 @@ class ReceiptStore:
     binding: Binding
 
     def snapshot(self):
+        with self.locked_snapshot() as result:
+            return result
+
+    @contextmanager
+    def locked_snapshot(self):
+        """Hold receipt publication while committing a reviewed local disposition.
+
+        Never perform network reads while holding this lock. A payment-success
+        receipt published before the disposition must veto the close, even if its
+        corresponding journal observation has not been written yet.
+        """
+        failure = None
         with _directory(write=True) as fd:
             flows = _scan(fd)
             _require(self.binding.flow_id in flows, 'RECEIPT_FLOW_UNKNOWN')
             result = flows[self.binding.flow_id]
             _require(result.binding == self.binding, 'RECEIPT_BINDING_MISMATCH')
-            return result
+            try:
+                yield result
+            except Exception as exc:
+                # The storage wrapper sanitizes its own errors. A caller's
+                # journal refusal must keep its code after unlocking.
+                failure = exc
+        if failure is not None:
+            raise failure
 
     def holders(self, value, *, exclude_flow=None):
         """Flow ids whose receipts hold an identity value (cart id/binding).

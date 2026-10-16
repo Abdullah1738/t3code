@@ -102,13 +102,37 @@ The full paid Minutes flow — guard, sync, place, encrypted-CVV completion, 3DS
 Telegram wait, paid triple, tracking and watcher — is documented in
 [NOON-MINUTES-E2E.md](NOON-MINUTES-E2E.md).
 
-`reconcile-order` reads the persisted place receipt first, then the exact native
+Plain `reconcile-order` reads the persisted place receipt first, then the exact native
 order and available intent/transaction status. It reports route/method/time and
 projected-evidence/reference hashes without exposing private intent material.
-It cannot release a reservation or reopen a flow. Failed/zero-total orders and
+It does not release a reservation or reopen a flow. Failed/zero-total orders and
 status errors do not establish no charge. The current missing interface is an
 authoritative exact-attempt authorization/capture/void/expiry disposition. Normal
 fulfillment tracking and client payment-status responses are not that ledger.
+
+For a fenced Talabat payment with explicit owner no-charge evidence:
+
+```sh
+commerce reconcile-order FLOW_UUID --owner-attest-no-charge \
+  --evidence "Owner checked the card statement on DATE: no AMOUNT charge for order ORDER_ID." \
+  --attested-by owner
+commerce inspect FLOW_UUID
+```
+
+All three flags are required. The command revalidates the bound account and makes
+fresh exact-order and retained-transaction GETs. Only `order_confirmingdelayed`
+with payment `Error`/`error` qualifies; active/delivered orders, success/capture or
+authorization, pending/continuation states, unknown response shapes, unavailable
+reads, and any stored success refuse. The observed `error`/`errors` display fields
+are supported. No provider status is treated as proof of no charge.
+
+The journal atomically records the owner's evidence verbatim, `attested_by`, UTC
+epoch timestamp, order/amount, redacted provider checks and an audit hash, and
+transitions to terminal `OWNER_ATTESTED_UNCHARGED`, freeing the account slot.
+`inspect` exposes `owner_attestation`. Reservations and consumed operations,
+cart/order/transaction identities remain retained. The old flow cannot resume or
+retry. This is an explicit owner disposition, not cancellation/refund confirmation
+or permission to place a replacement order; it sends no financial request.
 
 Before each mutation, a verified one-use auth snapshot must be obtained. Auth
 failure after dispatch does not authorize repeating the mutation. Unknown cart
