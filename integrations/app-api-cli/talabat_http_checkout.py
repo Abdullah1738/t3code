@@ -766,10 +766,11 @@ def parse_async_status(status, data, context):
     payment_status_params(context)
     state, reason = 'PAYMENT_UNKNOWN', 'STATUS_READ_FAILED_NO_RETRY'
     if status in (200, 422) and type(status) is int and type(data) is dict:
-        if (set(data) <= {'status', 'error', 'fallback', 'redirectUrl', 'hyperPayCheckoutId'}
+        if (set(data) <= {'status', 'error', 'errors', 'fallback', 'redirectUrl', 'hyperPayCheckoutId'}
                 and all(data.get(k) is None or type(data[k]) is str for k in ('status', 'redirectUrl', 'hyperPayCheckoutId'))
-                and all(data.get(k) is None or type(data[k]) is dict for k in ('error', 'fallback'))):
-            signal = data.get('status')
+                and all(data.get(k) is None or type(data[k]) is dict for k in ('error', 'errors', 'fallback'))):
+            signal = data['status'].strip().lower() if data.get('status') is not None else None
+            errors = [data[k] for k in ('error', 'errors') if data.get(k) is not None]
             if data.get('fallback') is not None:
                 state, reason = 'PAYMENT_BLOCKED', 'FALLBACK_NOT_FOLLOWED'
             # A supplied continuation must not hide behind an empty string.
@@ -778,11 +779,17 @@ def parse_async_status(status, data, context):
                 state, reason = 'CHALLENGE_REQUIRED', 'REDIRECT_NOT_FOLLOWED'
             elif data.get('hyperPayCheckoutId') is not None:
                 state, reason = 'PAYMENT_BLOCKED', 'SDK_BRANCH_NOT_SUPPORTED'
-            elif data.get('error') is not None or signal == 'error':
+            elif errors or signal == 'error':
                 state, reason = 'PAYMENT_ERROR_REPORTED', 'NO_ROLLBACK_OR_RETRY_ASSUMED'
-            elif status == 200 and signal is not None and signal.strip().lower() == 'success':
+                # Native v2 now returns Error plus duplicate error/errors maps.
+                # Recognize only the observed processor diagnostic, never expose
+                # arbitrary exception text or treat a decline as no-charge proof.
+                if signal == 'error' and errors and all(error.get('exception') ==
+                        '20051 - Insufficient funds, please try again with another card.' for error in errors):
+                    reason = 'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY'
+            elif status == 200 and signal == 'success':
                 state, reason = 'PAYMENT_REPORTED_SUCCESS', 'EXACT_TRANSACTION_ASYNC_STATUS_SUCCESS'
-            elif status == 200 and (signal is None or signal.strip().lower() == 'pending'):
+            elif status == 200 and (signal is None or signal == 'pending'):
                 state, reason = 'PAYMENT_PENDING', 'ASYNC_STATUS_PENDING'
             else:
                 reason = 'ASYNC_STATUS_LITERAL_UNSUPPORTED'
