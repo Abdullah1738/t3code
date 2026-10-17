@@ -10,6 +10,7 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 
 import {
+  actorKey,
   decideSend,
   doorbellAction,
   noiseFor,
@@ -42,7 +43,7 @@ const sub = (
   mode: Subscription["mode"],
   wakeOn: Subscription["wakeOn"] = [],
 ): Subscription => ({
-  id: SubscriptionId.make(`sub-${Math.random()}`),
+  id: SubscriptionId.make(`sub-${actorKey(subscriber)}-${mode}`),
   roomId: RoomId.make("room"),
   subscriber,
   mode,

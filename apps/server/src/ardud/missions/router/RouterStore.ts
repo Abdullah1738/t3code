@@ -1,6 +1,7 @@
 import {
   MissionMessage,
   ReadPosition,
+  Room,
   Subscription,
   type MissionId,
   type MissionMessageId,
@@ -14,16 +15,18 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type { SqlError } from "effect/sql/SqlError";
 
 import type { MemberKind } from "./model.ts";
 
 /**
- * Router tables. Rooms and knocks are core mission records; the high-volume
- * parts (messages, bodies, subscriptions, read positions, membership and the
- * doorbell bookkeeping) live here. Message writes run inside a core commit
- * (`MissionCommit.alongside`) so the room record, the `message.posted` event
- * and the message row land in one transaction.
+ * Router tables. Knocks are core mission records (the owner inbox reads them);
+ * rooms and the high-volume parts (messages, bodies, subscriptions, read
+ * positions, membership and the doorbell bookkeeping) live here. Writes run
+ * inside a core commit (`MissionCommit.alongside`) so the timeline event and
+ * the router rows land in one transaction.
  *
+ * - `rooms`: one row per room; `lastSeq`/`lastMessageAt` move with each post.
  * - `messages`: one row per message, `seq` per mission, optional idempotency key.
  * - `deliveries`: one row per (thread, message) that should wake the thread.
  *   `wake_id` set = covered by a doorbell; `read` = the thread read past it.
@@ -32,6 +35,15 @@ import type { MemberKind } from "./model.ts";
  * - `members`: explicit membership (`thread:<id>` or `session:<id>`).
  */
 const DDL = [
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_rooms (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    room_json TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_mission_router_rooms_by_mission
+    ON ardud_mission_router_rooms (mission_id, kind)`,
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_messages (
     mission_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
@@ -107,6 +119,8 @@ const DDL = [
   )`,
 ];
 
+const encodeRoom = Schema.encodeSync(Schema.fromJsonString(Room));
+const decodeRoom = Schema.decodeUnknownSync(Schema.fromJsonString(Room));
 const encodeMessage = Schema.encodeSync(Schema.fromJsonString(MissionMessage));
 const decodeMessage = Schema.decodeUnknownSync(Schema.fromJsonString(MissionMessage));
 const encodeSubscription = Schema.encodeSync(Schema.fromJsonString(Subscription));
@@ -144,9 +158,39 @@ export interface StoredMessage {
   readonly contentHash: string;
 }
 
+/** What a create-if-missing batch (the coord import) writes. */
+export interface RouterBatch {
+  readonly rooms: ReadonlyArray<Room>;
+  readonly messages: ReadonlyArray<{
+    readonly message: MissionMessage;
+    readonly body: string | null;
+    readonly contentHash: string;
+  }>;
+  readonly subscriptions: ReadonlyArray<{
+    readonly subscription: Subscription;
+    readonly key: string;
+  }>;
+  readonly readPositions: ReadonlyArray<{ readonly position: ReadPosition; readonly key: string }>;
+}
+
+export type RouterRowKind = "room" | "message" | "subscription" | "read-position";
+
 export class RouterStore extends Context.Service<
   RouterStore,
   {
+    /** Inserts or replaces a room. Runs inside a core commit. */
+    readonly putRoom: (room: Room) => Effect.Effect<void>;
+    readonly room: (id: RoomId) => Effect.Effect<Room | null>;
+    readonly rooms: (missionId: MissionId) => Effect.Effect<ReadonlyArray<Room>>;
+    /**
+     * Which ids already exist. Read positions use `<roomId>|<readerKey>`.
+     */
+    readonly existingIds: (
+      kind: RouterRowKind,
+      ids: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlySet<string>>;
+    /** Create-if-missing; existing rows are left as they are. Runs inside a core commit. */
+    readonly insertMissing: (batch: RouterBatch) => Effect.Effect<void>;
     readonly lastMessageSeq: (missionId: MissionId) => Effect.Effect<number>;
     /** Runs inside a core commit; the row, its body and its deliveries land together. */
     readonly insertMessage: (input: {
@@ -261,7 +305,136 @@ const make = Effect.gen(function* () {
     label: row.label,
   });
 
+  const roomRow = (room: Room) => ({
+    id: room.id,
+    mission_id: room.missionId,
+    kind: room.kind,
+    created_at: room.createdAt,
+    room_json: encodeRoom(room),
+  });
+
+  const messageRows = (input: {
+    readonly message: MissionMessage;
+    readonly contentHash: string;
+  }) => ({
+    mission_id: input.message.missionId,
+    seq: input.message.seq,
+    id: input.message.id,
+    room_id: input.message.roomId,
+    kind: input.message.kind,
+    msg_key: input.message.key,
+    content_hash: input.contentHash,
+    created_at: input.message.createdAt,
+    message_json: encodeMessage(input.message),
+  });
+
+  const existingIn = (
+    kind: RouterRowKind,
+    ids: ReadonlyArray<string>,
+  ): Effect.Effect<ReadonlyArray<{ readonly id: string }>, SqlError> => {
+    switch (kind) {
+      case "room":
+        return sql<{ readonly id: string }>`
+          SELECT id AS "id" FROM ardud_mission_router_rooms WHERE ${sql.in("id", ids)}
+        `;
+      case "message":
+        return sql<{ readonly id: string }>`
+          SELECT id AS "id" FROM ardud_mission_router_messages WHERE ${sql.in("id", ids)}
+        `;
+      case "subscription":
+        return sql<{ readonly id: string }>`
+          SELECT id AS "id" FROM ardud_mission_router_subscriptions WHERE ${sql.in("id", ids)}
+        `;
+      case "read-position": {
+        const roomIds = [...new Set(ids.map((id) => id.slice(0, id.indexOf("|"))))];
+        const wanted = new Set(ids);
+        return sql<{ readonly id: string }>`
+          SELECT room_id || '|' || reader_key AS "id" FROM ardud_mission_router_reads
+          WHERE ${sql.in("room_id", roomIds)}
+        `.pipe(Effect.map((rows) => rows.filter((row) => wanted.has(row.id))));
+      }
+    }
+  };
+
   return RouterStore.of({
+    putRoom: (room) =>
+      write(sql`
+        INSERT INTO ardud_mission_router_rooms ${sql.insert(roomRow(room))}
+        ON CONFLICT (id) DO UPDATE SET
+          kind = excluded.kind,
+          room_json = excluded.room_json
+      `),
+
+    room: (id) =>
+      read(
+        sql<{ readonly json: string }>`
+          SELECT room_json AS "json" FROM ardud_mission_router_rooms WHERE id = ${id}
+        `.pipe(Effect.map((rows) => (rows[0] === undefined ? null : decodeRoom(rows[0].json)))),
+      ),
+
+    rooms: (missionId) =>
+      read(
+        sql<{ readonly json: string }>`
+          SELECT room_json AS "json" FROM ardud_mission_router_rooms
+          WHERE mission_id = ${missionId} ORDER BY created_at, id
+        `.pipe(Effect.map((rows) => rows.map((row) => decodeRoom(row.json)))),
+      ),
+
+    existingIds: (kind, ids) =>
+      ids.length === 0
+        ? Effect.succeed(new Set<string>())
+        : read(existingIn(kind, ids).pipe(Effect.map((rows) => new Set(rows.map((r) => r.id))))),
+
+    insertMissing: (batch) =>
+      write(
+        Effect.gen(function* () {
+          for (const room of batch.rooms) {
+            yield* sql`
+              INSERT INTO ardud_mission_router_rooms ${sql.insert(roomRow(room))}
+              ON CONFLICT DO NOTHING
+            `;
+          }
+          for (const entry of batch.messages) {
+            const inserted = yield* sql<{ readonly id: string }>`
+              INSERT INTO ardud_mission_router_messages ${sql.insert(messageRows(entry))}
+              ON CONFLICT DO NOTHING
+              RETURNING id AS "id"
+            `;
+            if (inserted.length > 0 && entry.body !== null) {
+              yield* sql`
+                INSERT INTO ardud_mission_router_bodies ${sql.insert({
+                  message_id: entry.message.id,
+                  body: entry.body,
+                })}
+                ON CONFLICT DO NOTHING
+              `;
+            }
+          }
+          for (const { subscription, key } of batch.subscriptions) {
+            yield* sql`
+              INSERT INTO ardud_mission_router_subscriptions ${sql.insert({
+                id: subscription.id,
+                room_id: subscription.roomId,
+                subscriber_key: key,
+                subscription_json: encodeSubscription(subscription),
+              })}
+              ON CONFLICT DO NOTHING
+            `;
+          }
+          for (const { position, key } of batch.readPositions) {
+            yield* sql`
+              INSERT INTO ardud_mission_router_reads ${sql.insert({
+                room_id: position.roomId,
+                reader_key: key,
+                seq: position.seq,
+                position_json: encodeReadPosition(position),
+              })}
+              ON CONFLICT DO NOTHING
+            `;
+          }
+        }),
+      ),
+
     lastMessageSeq: (missionId) =>
       read(
         sql<{ readonly seq: number | null }>`
@@ -273,17 +446,9 @@ const make = Effect.gen(function* () {
       write(
         Effect.gen(function* () {
           yield* sql`
-            INSERT INTO ardud_mission_router_messages ${sql.insert({
-              mission_id: message.missionId,
-              seq: message.seq,
-              id: message.id,
-              room_id: message.roomId,
-              kind: message.kind,
-              msg_key: message.key,
-              content_hash: contentHash,
-              created_at: message.createdAt,
-              message_json: encodeMessage(message),
-            })}
+            INSERT INTO ardud_mission_router_messages ${sql.insert(
+              messageRows({ message, contentHash }),
+            )}
           `;
           if (body !== null) {
             yield* sql`
