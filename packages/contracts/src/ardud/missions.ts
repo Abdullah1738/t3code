@@ -302,6 +302,9 @@ export const Milestone = Schema.Struct({
   /** Why it is at risk, or what closed it. */
   statusNote: Schema.NullOr(Schema.String),
   itemIds: Schema.Array(WorkItemId),
+  // --- core additions ---
+  /** Fields only the owner may change. Missing means none. */
+  lockedFields: Schema.optional(LockedFields),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -342,6 +345,9 @@ export const Lane = Schema.Struct({
   status: LaneStatus,
   /** Why it is stuck, waiting or parked. */
   statusReason: Schema.NullOr(Schema.String),
+  // --- core additions ---
+  /** Fields only the owner may change. Missing means none. */
+  lockedFields: Schema.optional(LockedFields),
   leadRoleId: Schema.NullOr(RoleId),
   /** Thread currently doing the lane's work (the lead's binding). */
   threadId: Schema.NullOr(ThreadId),
@@ -1149,6 +1155,9 @@ export const WorkItem = Schema.Struct({
   title: TrimmedNonEmptyString,
   kind: Schema.Literals(["ticket", "pr", "deploy", "investigation", "doc", "other"]),
   stage: WorkStage,
+  // --- core additions ---
+  /** Fields only the owner may change. Missing means none. */
+  lockedFields: Schema.optional(LockedFields),
   /** Who holds the ball right now. */
   heldBy: Schema.NullOr(MissionActor),
   blockedBy: Schema.Array(MissionRecordRef),
@@ -1206,6 +1215,11 @@ export const MissionEventKind = Schema.Literals([
   "lane.split",
   "lane.merged",
   "lane.retired",
+  // --- core additions ---
+  "milestone.created",
+  "lane.updated",
+  "work-item.created",
+  "work-item.updated",
   "role.created",
   "role.model-changed",
   "role.bound",
@@ -1433,6 +1447,18 @@ export const MissionStreamItem = Schema.Union([
 ]);
 export type MissionStreamItem = typeof MissionStreamItem.Type;
 
+// --- core additions ---
+
+/**
+ * One mission's stream: an `overview` first, then record upserts/removes in
+ * `seq` order, with a fresh `overview` after each batch of changes.
+ */
+export const MissionSubscribeItem = Schema.Union([
+  Schema.TaggedStruct("overview", { seq: NonNegativeInt, overview: MissionOverview }),
+  MissionStreamItem,
+]);
+export type MissionSubscribeItem = typeof MissionSubscribeItem.Type;
+
 // ---------------------------------------------------------------------------
 // Inputs (owner and agent commands). Provenance comes from the transport.
 
@@ -1521,6 +1547,143 @@ export const ReorderSubMissionsInput = Schema.Struct({
   order: Schema.Array(SubMissionId),
 });
 export type ReorderSubMissionsInput = typeof ReorderSubMissionsInput.Type;
+
+// --- core additions ---
+
+export const MissionSubscribeInput = Schema.Struct({ missionId: MissionId });
+export type MissionSubscribeInput = typeof MissionSubscribeInput.Type;
+
+/** Omit `missionId` (or pass null) for the inbox across every mission. */
+export const MissionInboxInput = Schema.Struct({
+  missionId: Schema.optional(Schema.NullOr(MissionId)),
+});
+export type MissionInboxInput = typeof MissionInboxInput.Type;
+
+/** Owner only: pause, resume (active), drain or archive a mission. */
+export const SetMissionStatusInput = Schema.Struct({
+  missionId: MissionId,
+  status: MissionStatus,
+});
+export type SetMissionStatusInput = typeof SetMissionStatusInput.Type;
+
+export const SetSubMissionStatusInput = Schema.Struct({
+  subMissionId: SubMissionId,
+  status: SubMissionStatus,
+});
+export type SetSubMissionStatusInput = typeof SetSubMissionStatusInput.Type;
+
+/** Owner only: focus mode. Null clears it. */
+export const SetMissionFocusInput = Schema.Struct({
+  missionId: MissionId,
+  subMissionId: Schema.NullOr(SubMissionId),
+});
+export type SetMissionFocusInput = typeof SetMissionFocusInput.Type;
+
+/** The owner opened the mission; the feed and direction check restart from now. */
+export const MarkMissionSeenInput = Schema.Struct({ missionId: MissionId });
+export type MarkMissionSeenInput = typeof MarkMissionSeenInput.Type;
+
+/** Owner (or an import) only. */
+export const CreateMissionInput = Schema.Struct({
+  missionId: Schema.optional(MissionId),
+  slug: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  goal: Schema.optional(Schema.String),
+  tier: Schema.optional(MissionTier),
+  weight: Schema.optional(PositiveInt),
+  guaranteedShare: Schema.optional(Share),
+  borrowCeiling: Schema.optional(Share),
+  projectId: Schema.optional(Schema.NullOr(ProjectId)),
+});
+export type CreateMissionInput = typeof CreateMissionInput.Type;
+
+/** Tier, weight and shares are owner only. Locked fields are owner only. */
+export const UpdateMissionInput = Schema.Struct({
+  missionId: MissionId,
+  title: Schema.optional(TrimmedNonEmptyString),
+  goal: Schema.optional(Schema.String),
+  tier: Schema.optional(MissionTier),
+  weight: Schema.optional(PositiveInt),
+  guaranteedShare: Schema.optional(Share),
+  borrowCeiling: Schema.optional(Share),
+  projectId: Schema.optional(Schema.NullOr(ProjectId)),
+  masterRoleId: Schema.optional(Schema.NullOr(RoleId)),
+});
+export type UpdateMissionInput = typeof UpdateMissionInput.Type;
+
+/**
+ * Creates a sub-mission when `subMissionId` is new (title required; it joins
+ * the bottom of the order), otherwise updates the given fields.
+ */
+export const UpsertSubMissionInput = Schema.Struct({
+  missionId: MissionId,
+  subMissionId: Schema.optional(SubMissionId),
+  title: Schema.optional(TrimmedNonEmptyString),
+  intent: Schema.optional(Schema.String),
+  fillIdleCapacity: Schema.optional(Schema.Boolean),
+  coordinatorRoleId: Schema.optional(Schema.NullOr(RoleId)),
+  intendedEffort: Schema.optional(Schema.NullOr(Share)),
+  status: Schema.optional(SubMissionStatus),
+});
+export type UpsertSubMissionInput = typeof UpsertSubMissionInput.Type;
+
+/** Creates when `milestoneId` is new (title and subMissionId required). */
+export const UpsertMilestoneInput = Schema.Struct({
+  missionId: MissionId,
+  milestoneId: Schema.optional(MilestoneId),
+  subMissionId: Schema.optional(SubMissionId),
+  title: Schema.optional(TrimmedNonEmptyString),
+  targetAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  status: Schema.optional(MilestoneStatus),
+  statusNote: Schema.optional(Schema.NullOr(Schema.String)),
+  itemIds: Schema.optional(Schema.Array(WorkItemId)),
+});
+export type UpsertMilestoneInput = typeof UpsertMilestoneInput.Type;
+
+/**
+ * Creates when `laneId` is new (name required). A new `subMissionId` moves
+ * the lane; status `parked`, `retired` or back to work parks, retires or
+ * resumes it.
+ */
+export const UpsertLaneInput = Schema.Struct({
+  missionId: MissionId,
+  laneId: Schema.optional(LaneId),
+  subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
+  name: Schema.optional(TrimmedNonEmptyString),
+  purpose: Schema.optional(Schema.String),
+  status: Schema.optional(LaneStatus),
+  statusReason: Schema.optional(Schema.NullOr(Schema.String)),
+  leadRoleId: Schema.optional(Schema.NullOr(RoleId)),
+  threadId: Schema.optional(Schema.NullOr(ThreadId)),
+  currentItemId: Schema.optional(Schema.NullOr(WorkItemId)),
+});
+export type UpsertLaneInput = typeof UpsertLaneInput.Type;
+
+/** Creates when `workItemId` is new (title required). */
+export const UpsertWorkItemInput = Schema.Struct({
+  missionId: MissionId,
+  workItemId: Schema.optional(WorkItemId),
+  subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
+  laneId: Schema.optional(Schema.NullOr(LaneId)),
+  milestoneId: Schema.optional(Schema.NullOr(MilestoneId)),
+  title: Schema.optional(TrimmedNonEmptyString),
+  kind: Schema.optional(WorkItem.fields.kind),
+  stage: Schema.optional(WorkStage),
+  heldBy: Schema.optional(Schema.NullOr(MissionActor)),
+  blockedBy: Schema.optional(Schema.Array(MissionRecordRef)),
+  dependsOn: Schema.optional(Schema.Array(WorkItemId)),
+  pullRequest: Schema.optional(Schema.NullOr(PullRequestKey)),
+  links: Schema.optional(Schema.Array(MissionLink)),
+  facts: Schema.optional(WorkItem.fields.facts),
+});
+export type UpsertWorkItemInput = typeof UpsertWorkItemInput.Type;
+
+/** What a mutation committed: its timeline seq and the record it wrote. */
+export const MissionMutationResult = Schema.Struct({
+  seq: NonNegativeInt,
+  ref: MissionRecordRef,
+});
+export type MissionMutationResult = typeof MissionMutationResult.Type;
 
 export const SetRoleModelInput = Schema.Struct({
   roleId: RoleId,

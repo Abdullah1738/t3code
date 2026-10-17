@@ -72,7 +72,12 @@ it.layer(TestLayer)("MissionStore", (it) => {
       `;
       assert.deepStrictEqual(
         tables.map((row) => row.name),
-        ["ardud_mission_counters", "ardud_mission_events", "ardud_mission_records"],
+        [
+          "ardud_mission_counters",
+          "ardud_mission_events",
+          "ardud_mission_owner_looks",
+          "ardud_mission_records",
+        ],
       );
     }),
   );
