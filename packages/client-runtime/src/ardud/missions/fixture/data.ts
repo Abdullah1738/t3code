@@ -3,12 +3,17 @@
 // owner update, the lane roster and the PR backlog. Lane names, tickets, PRs and
 // decisions are real. Thread ids are left out on purpose.
 //
-// Fixture-made values (no live source yet): the owner's intended effort shares,
-// the mission's usage share, the knock, and the drafted heads-up text. Measured
-// effort is each sub-mission's share of coord events in the 24h before 08:33.
+// Fixture-made values (no live source yet): the intended effort shares (marked
+// as master proposals), the mission's usage share, the knock, the draft texts
+// and draft notes, suggestion counts and the two editor/governor suggestions.
+// Measured effort is each sub-mission's share of coord events in the 24h
+// before 08:33. Room messages are real coord summaries (`roomMessages.ts`).
 //
 // Everything here is plain encoded data; `index.ts` decodes it through the
 // contract schemas, so a contract change that breaks the fixture fails fast.
+
+import type { MissionPoolUsage } from "../source.ts";
+import { controlReceipts, messageRows, roomMembers } from "./roomMessages.ts";
 
 const AT = (time: string, day = 17) => `2026-10-${day}T${time}:00.000Z`;
 
@@ -673,30 +678,200 @@ export const asks = [
   },
 ];
 
+const github = (repo: string, number: number) => ({
+  kind: "pull-request",
+  label: `${repo}#${number}`,
+  url: `https://github.com/Equicom-Crypto/${repo}/pull/${number}`,
+  ref: `${repo}#${number}`,
+});
+
+const draft = (
+  id: string,
+  audience: string,
+  channel: string,
+  target: object,
+  text: string,
+  appliedNoteIds: ReadonlyArray<string>,
+  createdAt: string,
+  decided: { status: string; approvedText: string | null; at: string } | null = null,
+) => ({
+  id,
+  missionId: CRPKO,
+  audience,
+  channel,
+  target,
+  text,
+  approvedText: decided?.approvedText ?? null,
+  writerRoleId: ROLE_MASTER,
+  source: { kind: "master", ref: null },
+  appliedNoteIds,
+  status: decided?.status ?? "pending",
+  rewriteNote: null,
+  decidedBy: decided ? { _tag: "owner-app", surface: "web", sessionId: null } : null,
+  decidedAt: decided?.at ?? null,
+  sentAt: decided?.status === "sent" ? decided.at : null,
+  createdAt,
+});
+
+// Draft texts are fixture-made in the owner's review voice; the PR facts are real.
 export const drafts = [
+  draft(
+    "draft-pavan-risk-124",
+    "Pavan",
+    "github",
+    { kind: "pull-request", label: "risk#124", url: null, ref: "risk#124" },
+    "Heads-up: risk#131 (CRP-13313) merged at 02:12 UTC and changed four files your draft #124 also changes. Please rebase #124 on main-dev before your next push so the overlap shows up early.",
+    ["draft-note-plain", "draft-note-github-shape"],
+    AT("08:05"),
+  ),
+  draft(
+    "draft-dylan-bo-334",
+    "Dylan",
+    "github",
+    github("backoffice-core", 334),
+    "Hi Dylan, hope your week went well! backoffice-core#334 now conflicts with main-dev, so review can't finish. Please rebase it and push; the KYC tier upsert changes themselves look fine so far.",
+    ["draft-note-github-shape"],
+    AT("08:18"),
+  ),
+  draft(
+    "draft-sharath-mobile-306",
+    "Sharath",
+    "github",
+    github("crpko_mobile_app", 306),
+    "Hi Sharath, thanks for the update! The transfer screen rebuild in crpko_mobile_app#306 passes checks. One thing before merge: the transfer details screen still reads the fee from the old quote field.",
+    ["draft-note-github-shape"],
+    AT("07:31"),
+    {
+      status: "sent",
+      approvedText:
+        "The transfer screen rebuild in crpko_mobile_app#306 passes checks. Before merge: the transfer details screen still reads the fee from the old quote field. Read it from the new quote response instead.",
+      at: AT("07:44"),
+    },
+  ),
+];
+
+/** Owner notes on how drafts should read. Fixture-made, from the owner's feedback-writing guide. */
+export const draftNotes = [
   {
-    id: "draft-pavan-risk-124",
-    missionId: CRPKO,
-    audience: "Pavan",
-    channel: "github",
-    target: { kind: "pull-request", label: "risk#124", url: null, ref: "risk#124" },
-    text: "Heads-up: risk#131 (CRP-13313) merged at 02:12 UTC and changed four files your draft #124 also changes. Please rebase #124 on main-dev before your next push so the overlap shows up early.",
-    approvedText: null,
-    writerRoleId: ROLE_MASTER,
-    source: { kind: "master", ref: null },
-    appliedNoteIds: [],
-    status: "pending",
-    rewriteNote: null,
-    decidedBy: null,
-    decidedAt: null,
-    sentAt: null,
-    createdAt: AT("08:05"),
+    id: "draft-note-plain",
+    missionId: null,
+    scope: { _tag: "all" },
+    text: "Plain, direct English. No hype, no emojis, no sign-off.",
+    source: "import",
+    active: true,
+    createdAt: AT("09:00", 9),
+    updatedAt: AT("09:00", 9),
   },
+  {
+    id: "draft-note-github-shape",
+    missionId: null,
+    scope: { _tag: "channel", channel: "github" },
+    text: "Say what is wrong, why it matters, and the smallest thing that would close it. Exact paths and symbols in backticks.",
+    source: "import",
+    active: true,
+    createdAt: AT("09:00", 9),
+    updatedAt: AT("09:00", 9),
+  },
+  {
+    id: "draft-note-no-process",
+    missionId: CRPKO,
+    scope: { _tag: "all" },
+    text: "Never mention agents, lanes, batches or the review process to developers.",
+    source: "owner",
+    active: true,
+    createdAt: AT("11:20", 12),
+    updatedAt: AT("11:20", 12),
+  },
+  {
+    id: "draft-note-sharath-cliq",
+    missionId: CRPKO,
+    scope: { _tag: "person", name: "Sharath" },
+    text: "Point to the screen and the field, not the file.",
+    source: "owner",
+    active: false,
+    createdAt: AT("15:05", 13),
+    updatedAt: AT("10:40", 15),
+  },
+];
+
+/** crw review threads waiting on the owner at 08:33. */
+const approval = (
+  repo: string,
+  number: number,
+  author: string,
+  title: string,
+  detail: string,
+  createdAt: string,
+  stale: { reason: string; at: string } | null = null,
+) => ({
+  id: `approval-${repo}-${number}`,
+  missionId: CRPKO,
+  kind: "merge",
+  title: `${repo}#${number}: ${title}`,
+  detail: `${author}'s PR. ${detail}`,
+  requestedBy: "crw",
+  links: [github(repo, number)],
+  status: stale ? "stale-closed" : "pending",
+  staleReason: stale?.reason ?? null,
+  decidedBy: stale ? { _tag: "system", component: "crw" } : null,
+  decidedAt: stale?.at ?? null,
+  createdAt,
+});
+
+export const approvals = [
+  approval(
+    "crpko-devops",
+    759,
+    "Nishwanth",
+    "bound Risk placement alert suppression during releases",
+    "Re-review of 30dca697 is done; checks pass and it merges cleanly. The previous round asked for five fixes.",
+    "2026-10-16T21:18:57.000Z",
+  ),
+  approval(
+    "crpko_mobile_app",
+    306,
+    "Sharath",
+    "rebuild the transfer screen and add transfer details (CRP-12568)",
+    "Review at 451f5722 is done; checks pass and it merges cleanly.",
+    "2026-10-16T20:14:00.000Z",
+  ),
+  approval(
+    "backoffice-core",
+    334,
+    "Dylan",
+    "support unverified tier upserts (CRP-12585)",
+    "Review at 9d55d741 is done; checks pass but it conflicts with main-dev.",
+    "2026-10-16T13:31:00.000Z",
+  ),
+  approval(
+    "compliance-kyc",
+    290,
+    "Ilhaan",
+    "read Backoffice data from authoritative shards",
+    "Review at a1f129c2 is done; checks pass and it merges cleanly.",
+    "2026-10-16T06:54:00.000Z",
+  ),
+  approval(
+    "crpko_mobile_app",
+    279,
+    "Furqan",
+    "source the futures leverage cap from the instrument risk tier schedule (CRP-10352)",
+    "Review was at d3a0ad25.",
+    "2026-10-12T10:05:00.000Z",
+    { reason: "New head 9c4e39d7 pushed at 08:22; a fresh review is queued.", at: AT("08:22") },
+  ),
 ];
 
 /** Drafts, approvals and knocks carry no sub-mission in the contract; the fixture files them here. */
 export const recordSubMission: Record<string, string> = {
   "draft-pavan-risk-124": SUB.support,
+  "draft-dylan-bo-334": SUB.support,
+  "draft-sharath-mobile-306": SUB.support,
+  "approval-crpko-devops-759": SUB.support,
+  "approval-crpko_mobile_app-306": SUB.support,
+  "approval-backoffice-core-334": SUB.support,
+  "approval-compliance-kyc-290": SUB.support,
+  "approval-crpko_mobile_app-279": SUB.support,
   "knock-batch-fix": SUB.wave,
 };
 
@@ -739,7 +914,87 @@ export const suggestions = [
     decidedAt: null,
     createdAt: AT("08:30"),
   },
+  // Fixture-made: the editor's read of the 07:44 Sharath edit (opener removed).
+  {
+    id: "suggestion-no-opener",
+    missionId: null,
+    targetKind: "draft-note",
+    target: null,
+    title: "Add a draft note: no opener",
+    before: null,
+    after: { scope: { _tag: "all" }, text: "No opening pleasantry; start with the point." },
+    diffText: "+ All drafts: No opening pleasantry; start with the point.",
+    why: "You removed the opening pleasantry from 4 of the last 5 drafts you edited.",
+    evidence: [
+      {
+        kind: "draft",
+        id: "draft-sharath-mobile-306",
+        label: "Sharath draft on crpko_mobile_app#306",
+      },
+    ],
+    author: "editor",
+    acceptor: "owner",
+    status: "open",
+    dismissReason: null,
+    outcome: null,
+    decidedBy: null,
+    decidedAt: null,
+    createdAt: AT("07:45"),
+  },
+  // Fixture-made: a governor proposal on the review pool, from the 08:16 quota read.
+  {
+    id: "suggestion-review-slot",
+    missionId: CRPKO,
+    targetKind: "pool",
+    target: { kind: "pool", id: "pool-codex-reviews", label: "Codex reviews" },
+    title: "Keep the one usable Codex review slot for Monday-critical PRs only",
+    before: { reserve: [] },
+    after: { reserve: ["risk#68", "TC pbv2 stack", "TC#234"] },
+    diffText: "- reserve: none\n+ reserve: risk#68, TC pbv2 stack, TC#234",
+    why: "Codex reviews are at 1 of 6 usable until the weekly limits reset in about 5 days; the 08:25 control already routes Monday-critical PRs to the live slot.",
+    evidence: [
+      { kind: "message", id: "msg-10212", label: "control 10212, 08:25" },
+      { kind: "url", label: "08:05 owner update", url: null, ref: "OWNER-UPDATES.md" },
+    ],
+    author: "governor",
+    acceptor: "owner",
+    status: "open",
+    dismissReason: null,
+    outcome: null,
+    decidedBy: null,
+    decidedAt: null,
+    createdAt: AT("08:27"),
+  },
 ];
+
+/** Acceptance record per author and target kind (fixture-made counts). `shown` includes open ones. */
+export const suggestionStats = [
+  { author: "scribe", targetKind: "schedule", shown: 10, accepted: 6, dismissed: 3, bar: "normal" },
+  { author: "scribe", targetKind: "rule", shown: 5, accepted: 1, dismissed: 4, bar: "raised" },
+  {
+    author: "editor",
+    targetKind: "draft-note",
+    shown: 7,
+    accepted: 5,
+    dismissed: 1,
+    bar: "normal",
+  },
+  { author: "governor", targetKind: "pool", shown: 5, accepted: 2, dismissed: 2, bar: "normal" },
+  {
+    author: "master",
+    targetKind: "sub-mission-order",
+    shown: 3,
+    accepted: 0,
+    dismissed: 3,
+    bar: "high",
+  },
+];
+
+interface FyiSource {
+  /** coord seq the quote comes from; stands in for the lane thread event. */
+  readonly seq: number;
+  readonly quote: string;
+}
 
 const fyiNote = (
   id: string,
@@ -747,21 +1002,36 @@ const fyiNote = (
   summary: string,
   at: string,
   severity: string,
+  extra: {
+    type?: string;
+    laneId?: string | null;
+    basis?: string;
+    evidence?: string;
+    citation?: string;
+    sources?: ReadonlyArray<FyiSource>;
+    evidenceLinks?: ReadonlyArray<object>;
+  } = {},
 ) => ({
   id,
   missionId: CRPKO,
   subMissionId,
-  laneId: null,
-  type: "owner-must-know",
+  laneId: extra.laneId ?? null,
+  type: extra.type ?? "owner-must-know",
   summary,
-  sources: [],
-  basis: "observed",
+  // Placeholder thread id: real lane thread ids are left out on purpose.
+  sources: (extra.sources ?? []).map(({ seq, quote }) => ({
+    threadId: "fixture-thread-coord",
+    quote,
+    fromEvent: seq,
+    toEvent: seq,
+  })),
+  basis: extra.basis ?? "observed",
   severity,
   confidence: 0.9,
   author: "scribe",
-  citation: "unchecked",
-  evidence: "matched",
-  evidenceLinks: [],
+  citation: extra.citation ?? "verified",
+  evidence: extra.evidence ?? "matched",
+  evidenceLinks: extra.evidenceLinks ?? [],
   replacesNoteId: null,
   ackedBy: [],
   createdAt: at,
@@ -774,6 +1044,16 @@ export const notes = [
     "Positions v2 + Risk #68 is still at risk for Monday. Full positions v2 cutover is about 30 Oct to 5 Nov.",
     AT("08:05"),
     "high",
+    {
+      sources: [
+        {
+          seq: 10208,
+          quote:
+            "#68 r4: 19 P2 split into 7 packets; ask: run 4 parallel Haiku workers (3 r4 + risk5) given claude 20/30 usable",
+        },
+      ],
+      evidence: "not-applicable",
+    },
   ),
   fyiNote(
     "note-ingestor-rollback",
@@ -781,6 +1061,17 @@ export const notes = [
     "The ClickHouse ingestor release rolled back in 13 minutes (startup query too big). No data damage. Fix is CRP-13358.",
     AT("06:52"),
     "medium",
+    {
+      laneId: "lane-cell-devops2",
+      sources: [
+        {
+          seq: 10093,
+          quote:
+            "Ingestor release docs119-dev.1 ROLLED BACK 06:20Z ... All modes back on 94c92482, no data damage, readback clean.",
+        },
+      ],
+      evidenceLinks: [{ kind: "ticket", label: "CRP-13358", url: null, ref: "CRP-13358" }],
+    },
   ),
   fyiNote(
     "note-terraform-partial",
@@ -788,6 +1079,40 @@ export const notes = [
     "Terraform apply landed 76 of 77 rows; the Kafka copy-pause doc refused its parameter name. One-line fix in crpko-devops#778.",
     AT("08:09"),
     "low",
+    {
+      laneId: "lane-cell-devops",
+      sources: [
+        {
+          seq: 10180,
+          quote:
+            "(d) PARTIAL: run 39015351901 failed creating SSM doc crpko-dev-kafka-tiered-copy-pause (param name approval_ref not alphanumeric, #748).",
+        },
+      ],
+      evidenceLinks: [github("crpko-devops", 778)],
+    },
+  ),
+  // A lane's claim the scribe could not match yet: crpko-devops#778 shows no
+  // green checks in the 08:21 status, so evidence is missing.
+  fyiNote(
+    "note-kafka-fix-claim",
+    SUB.releases,
+    "cell-kafka says the copy-pause parameter fix is open with a repo-wide test; no CI run is linked yet.",
+    AT("08:21"),
+    "low",
+    {
+      type: "claim-of-done",
+      laneId: "lane-cell-kafka",
+      basis: "claimed",
+      evidence: "missing",
+      citation: "unchecked",
+      sources: [
+        {
+          seq: 10204,
+          quote: "crpko-devops #778 copy-pause param fix open at b5bf7044",
+        },
+      ],
+      evidenceLinks: [github("crpko-devops", 778)],
+    },
   ),
 ];
 
@@ -1024,48 +1349,272 @@ export const usageShares: Record<string, number | null> = {
   [JUNO]: null,
 };
 
+/**
+ * The pools each mission draws on. Claude and Codex are the 08:16 quota read
+ * from control 10212; offbox spend and the dev lock are read from offbox's cap
+ * file and the coord `tf:dev` claim (released 08:07:53 after the apply).
+ */
+export const poolUsage: Record<string, ReadonlyArray<MissionPoolUsage>> = {
+  [CRPKO]: [
+    {
+      _tag: "accounts",
+      id: "pool-claude",
+      label: "Claude",
+      usable: 20,
+      total: 30,
+      sampledAt: AT("08:16"),
+    },
+    {
+      _tag: "accounts",
+      id: "pool-codex-reviews",
+      label: "Codex reviews",
+      usable: 1,
+      total: 6,
+      sampledAt: AT("08:16"),
+    },
+    {
+      _tag: "budget",
+      id: "pool-offbox",
+      label: "Offbox",
+      spent: 61.69,
+      cap: 500,
+      currency: "USD",
+      sampledAt: AT("08:33"),
+    },
+    {
+      _tag: "lock",
+      id: "pool-dev-env",
+      label: "Dev env",
+      holder: null,
+      since: "2026-10-17T08:07:53.000Z",
+      sampledAt: AT("08:33"),
+    },
+  ],
+  [JUNO]: [],
+};
+
 const room = (
   id: string,
   kind: string,
   title: string,
-  lastSeq: number,
-  lastMessageAt: string,
-  messagesPerHour: number,
-  actionableShare: number,
+  noise: { messagesPerHour: number; actionableShare: number; wastedWakes: number },
   subMissionId: string | null = null,
+  workItemId: string | null = null,
 ) => ({
   id,
   missionId: CRPKO,
   subMissionId,
   kind,
   title,
-  workItemId: null,
+  workItemId,
   archived: false,
-  lastSeq,
-  lastMessageAt,
-  noise: { messagesPerHour, actionableShare, wastedWakes: 0 },
+  noise,
   createdAt: CREATED,
 });
 
-// The five coord channels, with their real last 24h rate and actionable share.
-export const rooms = [
-  room("room-delivery", "sub-mission", "delivery", 10219, AT("08:33"), 59.4, 0.55, SUB.wave),
-  room("room-arch", "arch", "arch", 10205, AT("08:22"), 1.9, 0.78, SUB.upkeep),
-  room("room-release", "release", "release", 10155, AT("07:51"), 0.6, 0.71, SUB.releases),
-  room("room-control", "control", "control", 10212, AT("08:25"), 0.9, 0.95),
-  room("room-observe", "custom", "observe", 10210, AT("08:24"), 1.4, 0.21, SUB.observe),
+// The five coord channels plus the busiest work item (CRP-12350, risk#68),
+// split out of delivery. Noise is the real last 24h: messages per hour, share
+// of blockers/requests/decisions/controls, and status posts that still woke a
+// lane (the coord shim delivered them; rooms would not).
+export const roomDefs = [
+  room(
+    "room-delivery",
+    "sub-mission",
+    "delivery",
+    { messagesPerHour: 48.8, actionableShare: 0.53, wastedWakes: 588 },
+    SUB.wave,
+  ),
+  room(
+    "room-crp-12350",
+    "work-item",
+    "CRP-12350 · risk#68 snapshot",
+    { messagesPerHour: 10.5, actionableShare: 0.65, wastedWakes: 81 },
+    SUB.wave,
+    "CRP-12350",
+  ),
+  room(
+    "room-arch",
+    "arch",
+    "arch",
+    { messagesPerHour: 1.8, actionableShare: 0.77, wastedWakes: 4 },
+    SUB.upkeep,
+  ),
+  room(
+    "room-release",
+    "release",
+    "release",
+    { messagesPerHour: 0.6, actionableShare: 0.71, wastedWakes: 4 },
+    SUB.releases,
+  ),
+  room("room-control", "control", "control", {
+    messagesPerHour: 0.9,
+    actionableShare: 0.95,
+    wastedWakes: 1,
+  }),
+  room(
+    "room-observe",
+    "custom",
+    "observe",
+    { messagesPerHour: 1.4, actionableShare: 0.21, wastedWakes: 18 },
+    SUB.observe,
+  ),
 ];
 
-/** Messages since the owner last looked, per room (coord events after 05:06 UTC). */
-export const roomUnread: Record<string, number> = {
-  "room-delivery": 180,
-  "room-arch": 6,
-  "room-release": 4,
-  "room-control": 3,
-  "room-observe": 4,
+/** The owner's read position per room: the last coord seq before 05:06 UTC. */
+export const ownerReadSeq: Record<string, number> = {
+  "room-delivery": 10022,
+  "room-crp-12350": 10016,
+  "room-arch": 10018,
+  "room-release": 9775,
+  "room-control": 10005,
+  "room-observe": 10015,
 };
+
+/** Roles on the Crpko roster; any other sender is a lane named after itself. */
+export const roleSenders: Record<string, string> = { master: ROLE_MASTER };
+
+export const forks = [
+  // Fixture-made: an earlier owner side question, answered and archived.
+  {
+    fork: {
+      id: "fork-ingestor-owner",
+      missionId: CRPKO,
+      kind: "owner-question",
+      masterThreadId: "fixture-thread-crpko-master",
+      forkThreadId: "fixture-thread-fork-ingestor",
+      origin: { kind: "note", id: "note-ingestor-rollback", label: "Ingestor rollback" },
+      status: "archived",
+      summaryLine: "Owner asked whether the rollback lost data; fork confirmed readback was clean.",
+      commitsMission: false,
+      createdAt: AT("07:02"),
+      closedAt: AT("07:09"),
+    },
+    question: "Did the ingestor rollback lose any rows?",
+  },
+];
 
 export const ownerLastLookedAt: Record<string, string | null> = {
   [CRPKO]: OWNER_LAST_LOOKED_AT,
   [JUNO]: AT("19:30", 14),
 };
+
+const senderActor = (sender: string) => {
+  const roleId = roleSenders[sender];
+  return roleId ? { _tag: "role", roleId } : { _tag: "lane", laneId: `lane-${sender}` };
+};
+
+const roomMission = new Map(roomDefs.map((def) => [def.id, def.missionId]));
+
+/** Coord events as room messages. Bodies are left out, so `hasBody` is false. */
+export const messages = messageRows.map(([seq, roomId, kind, sender, workItem, time, summary]) => {
+  const receipt = controlReceipts[seq];
+  return {
+    id: `msg-${seq}`,
+    missionId: roomMission.get(roomId) ?? CRPKO,
+    roomId,
+    seq,
+    kind,
+    author: senderActor(sender),
+    provenance: { _tag: "import", source: "coord.db" },
+    to: [],
+    summary,
+    hasBody: false,
+    key: null,
+    workItemId: workItem,
+    links:
+      workItem !== null && /^CRP-\d+$/.test(workItem)
+        ? [{ kind: "ticket", label: workItem, url: null, ref: workItem }]
+        : [],
+    receipt: receipt ? { reached: receipt[0], total: receipt[1], pending: receipt[2] } : null,
+    isCorrection: false,
+    createdAt: `2026-10-17T${time}.000Z`,
+  };
+});
+
+/**
+ * Who hears each room: everyone the coord shim delivered to in the last 24h,
+ * on the default wake rules (requests, blockers and controls wake; status
+ * wakes nobody). The owner reads every room without being woken.
+ */
+export const roomSubscriptions = roomDefs.flatMap((def) => [
+  ...(roomMembers[def.id] ?? []).map((member) => ({
+    id: `sub-${def.id}-${member}`,
+    roomId: def.id,
+    subscriber: senderActor(member),
+    mode: "wake",
+    wakeOn:
+      member === "master"
+        ? ["request", "blocker", "control", "evidence"]
+        : ["request", "blocker", "control"],
+    createdAt: CREATED,
+  })),
+  {
+    id: `sub-${def.id}-owner`,
+    roomId: def.id,
+    subscriber: { _tag: "owner" },
+    mode: "read",
+    wakeOn: [],
+    createdAt: CREATED,
+  },
+]);
+
+const rule = (
+  id: string,
+  number: number,
+  title: string,
+  quote: string,
+  masterReading: string,
+  quotedAt: string,
+) => ({
+  id,
+  missionId: CRPKO,
+  number,
+  title,
+  quote,
+  quotedAt,
+  provenance: { _tag: "import", source: "STANDING-RULES" },
+  masterReading,
+  scope: { subMissionIds: [], roleKinds: [], laneIds: [] },
+  activation: "",
+  status: "active",
+  version: 1,
+  acks: [],
+  appliedCount: 0,
+  brokenCount: 0,
+  lastReliedAt: null,
+  lockedFields: [],
+  createdAt: quotedAt,
+  updatedAt: quotedAt,
+});
+
+/**
+ * The three newest Crpko standing rules. Rule 103 is the owner's words; the
+ * 104 and 105 quotes are the master's broadcast wording (controls 10136,
+ * 10141), since the owner's originals are not in the copied state.
+ */
+export const rules = [
+  rule(
+    "rule-103",
+    103,
+    "Owner questions never default",
+    "Always wait for my answer. If a master can't decide wait on it. Anything the answer blocks should wait on it, and anything it doesn't and all other lanes should continue freely",
+    "Owner questions have no default or deadline; only the branch the answer blocks waits, everything else continues; a 'default X if no answer' blocker is not a go.",
+    AT("01:04"),
+  ),
+  rule(
+    "rule-104",
+    104,
+    "PR factories ramp up",
+    "Factories ramp to 10 Haiku workers and 25 open PRs each.",
+    "Non-Monday PRs are review-queued; Sol fires at the Codex reset.",
+    AT("07:34"),
+  ),
+  rule(
+    "rule-105",
+    105,
+    "Withdrawal-failure tickets go to service leads",
+    "DF-251 withdrawal-failure tickets go to the service leads and devs; only CRP-13349 DevOps stays ours.",
+    "cell-custody drops CRP-13357, cell-edge drops CRP-13351, fab-svc drops 13352/13353.",
+    AT("07:37"),
+  ),
+];
