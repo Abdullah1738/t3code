@@ -350,21 +350,53 @@ import {
 import { SecretRequestAnswerInput, SecretRequestError } from "./secretRequest.ts";
 // ardud missions: core
 import {
+  AckNoteInput,
+  AnswerAskInput,
+  Ask,
+  Call,
+  CloseForkInput,
   CreateMissionInput,
-  LockFieldInput,
+  DecideApprovalInput,
+  DecideDraftInput,
+  DecideSuggestionInput,
+  Draft,
+  DraftNote,
   MarkMissionSeenInput,
+  MergeLanesInput,
+  MergeSubMissionsInput,
   MissionError,
+  MissionFork,
   MissionInbox,
   MissionInboxInput,
   MissionMutationResult,
   MissionStreamItem,
   MissionSubscribeInput,
   MissionSubscribeItem,
+  Note,
+  ReactToCallInput,
+  ReopenAskInput,
+  ReopenDraftInput,
+  ReopenSuggestionInput,
   ReorderSubMissionsInput,
+  RequestRuleChangeInput,
+  ResolveRuleChangeInput,
+  RouteApprovalInput,
+  Rule,
+  RuleChangeRequest,
+  SaveDraftNoteInput,
+  SetApprovalRoutingInput,
   SetMissionFocusInput,
   SetMissionStatusInput,
   SetSubMissionStatusInput,
+  SplitLaneInput,
+  StartForkInput,
+  Suggestion,
+  UpdateForkInput,
   UpdateMissionInput,
+  UpsertLaneInput,
+  UpsertRuleInput,
+  UpsertSubMissionInput,
+  WithdrawAskInput,
 } from "./ardud/missions.ts";
 import {
   ProjectCloneActionInput,
@@ -551,8 +583,34 @@ export const WS_METHODS = {
   missionsSetFocus: "missions.setFocus",
   missionsSetSubMissionStatus: "missions.setSubMissionStatus",
   missionsReorderSubMissions: "missions.reorderSubMissions",
-  missionsLockField: "missions.lockField",
   missionsMarkSeen: "missions.markSeen",
+  missionsUpsertSubMission: "missions.upsertSubMission",
+  missionsMergeSubMissions: "missions.mergeSubMissions",
+  missionsUpsertLane: "missions.upsertLane",
+  missionsSplitLane: "missions.splitLane",
+  missionsMergeLanes: "missions.mergeLanes",
+  missionsDecideApproval: "missions.decideApproval",
+  missionsRouteApproval: "missions.routeApproval",
+  missionsSetApprovalRouting: "missions.setApprovalRouting",
+  missionsUpsertRule: "missions.upsertRule",
+  missionsRequestRuleChange: "missions.requestRuleChange",
+  missionsResolveRuleChange: "missions.resolveRuleChange",
+  missionsAnswerAsk: "missions.answerAsk",
+  missionsWithdrawAsk: "missions.withdrawAsk",
+  missionsReopenAsk: "missions.reopenAsk",
+  missionsReactToCall: "missions.reactToCall",
+  missionsDecideDraft: "missions.decideDraft",
+  missionsReopenDraft: "missions.reopenDraft",
+  missionsSaveDraftNote: "missions.saveDraftNote",
+  missionsDecideSuggestion: "missions.decideSuggestion",
+  missionsReopenSuggestion: "missions.reopenSuggestion",
+  missionsStartFork: "missions.startFork",
+  missionsCloseFork: "missions.closeFork",
+  missionsUpdateFork: "missions.updateFork",
+  missionsAckNote: "missions.ackNote",
+  // Slots, router: missionsDecideKnock, missionsPostMessage, missionsMarkRead.
+  // Slots, policy: missionsSetRoleModel, missionsSetPoolCapacity,
+  // missionsUpdateReviewPolicy.
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -1925,16 +1983,116 @@ const WsMissionsReorderSubMissionsRpc = Rpc.make(WS_METHODS.missionsReorderSubMi
   success: MissionMutationResult,
   error: MissionRpcError,
 });
-const WsMissionsLockFieldRpc = Rpc.make(WS_METHODS.missionsLockField, {
-  payload: LockFieldInput,
-  success: MissionMutationResult,
-  error: MissionRpcError,
-});
 const WsMissionsMarkSeenRpc = Rpc.make(WS_METHODS.missionsMarkSeen, {
   payload: MarkMissionSeenInput,
   success: MissionMutationResult,
   error: MissionRpcError,
 });
+const missionRpc = <
+  const Tag extends string,
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+>(
+  tag: Tag,
+  payload: Payload,
+  success: Success,
+) => Rpc.make(tag, { payload, success, error: MissionRpcError });
+const WsMissionsUpsertSubMissionRpc = missionRpc(
+  WS_METHODS.missionsUpsertSubMission,
+  UpsertSubMissionInput,
+  MissionMutationResult,
+);
+const WsMissionsMergeSubMissionsRpc = missionRpc(
+  WS_METHODS.missionsMergeSubMissions,
+  MergeSubMissionsInput,
+  MissionMutationResult,
+);
+const WsMissionsUpsertLaneRpc = missionRpc(
+  WS_METHODS.missionsUpsertLane,
+  UpsertLaneInput,
+  MissionMutationResult,
+);
+const WsMissionsSplitLaneRpc = missionRpc(
+  WS_METHODS.missionsSplitLane,
+  SplitLaneInput,
+  MissionMutationResult,
+);
+const WsMissionsMergeLanesRpc = missionRpc(
+  WS_METHODS.missionsMergeLanes,
+  MergeLanesInput,
+  MissionMutationResult,
+);
+const WsMissionsDecideApprovalRpc = missionRpc(
+  WS_METHODS.missionsDecideApproval,
+  DecideApprovalInput,
+  MissionMutationResult,
+);
+const WsMissionsRouteApprovalRpc = missionRpc(
+  WS_METHODS.missionsRouteApproval,
+  RouteApprovalInput,
+  MissionMutationResult,
+);
+const WsMissionsSetApprovalRoutingRpc = missionRpc(
+  WS_METHODS.missionsSetApprovalRouting,
+  SetApprovalRoutingInput,
+  MissionMutationResult,
+);
+const WsMissionsUpsertRuleRpc = missionRpc(WS_METHODS.missionsUpsertRule, UpsertRuleInput, Rule);
+const WsMissionsRequestRuleChangeRpc = missionRpc(
+  WS_METHODS.missionsRequestRuleChange,
+  RequestRuleChangeInput,
+  RuleChangeRequest,
+);
+const WsMissionsResolveRuleChangeRpc = missionRpc(
+  WS_METHODS.missionsResolveRuleChange,
+  ResolveRuleChangeInput,
+  RuleChangeRequest,
+);
+const WsMissionsAnswerAskRpc = missionRpc(WS_METHODS.missionsAnswerAsk, AnswerAskInput, Ask);
+const WsMissionsWithdrawAskRpc = missionRpc(WS_METHODS.missionsWithdrawAsk, WithdrawAskInput, Ask);
+const WsMissionsReopenAskRpc = missionRpc(WS_METHODS.missionsReopenAsk, ReopenAskInput, Ask);
+const WsMissionsReactToCallRpc = missionRpc(WS_METHODS.missionsReactToCall, ReactToCallInput, Call);
+const WsMissionsDecideDraftRpc = missionRpc(
+  WS_METHODS.missionsDecideDraft,
+  DecideDraftInput,
+  Draft,
+);
+const WsMissionsReopenDraftRpc = missionRpc(
+  WS_METHODS.missionsReopenDraft,
+  ReopenDraftInput,
+  Draft,
+);
+const WsMissionsSaveDraftNoteRpc = missionRpc(
+  WS_METHODS.missionsSaveDraftNote,
+  SaveDraftNoteInput,
+  DraftNote,
+);
+const WsMissionsDecideSuggestionRpc = missionRpc(
+  WS_METHODS.missionsDecideSuggestion,
+  DecideSuggestionInput,
+  Suggestion,
+);
+const WsMissionsReopenSuggestionRpc = missionRpc(
+  WS_METHODS.missionsReopenSuggestion,
+  ReopenSuggestionInput,
+  Suggestion,
+);
+const WsMissionsStartForkRpc = missionRpc(
+  WS_METHODS.missionsStartFork,
+  StartForkInput,
+  MissionFork,
+);
+const WsMissionsCloseForkRpc = missionRpc(
+  WS_METHODS.missionsCloseFork,
+  CloseForkInput,
+  MissionFork,
+);
+const WsMissionsUpdateForkRpc = missionRpc(
+  WS_METHODS.missionsUpdateFork,
+  UpdateForkInput,
+  MissionFork,
+);
+const WsMissionsAckNoteRpc = missionRpc(WS_METHODS.missionsAckNote, AckNoteInput, Note);
 
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
@@ -1983,8 +2141,31 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsSetFocusRpc,
   WsMissionsSetSubMissionStatusRpc,
   WsMissionsReorderSubMissionsRpc,
-  WsMissionsLockFieldRpc,
   WsMissionsMarkSeenRpc,
+  WsMissionsUpsertSubMissionRpc,
+  WsMissionsMergeSubMissionsRpc,
+  WsMissionsUpsertLaneRpc,
+  WsMissionsSplitLaneRpc,
+  WsMissionsMergeLanesRpc,
+  WsMissionsDecideApprovalRpc,
+  WsMissionsRouteApprovalRpc,
+  WsMissionsSetApprovalRoutingRpc,
+  WsMissionsUpsertRuleRpc,
+  WsMissionsRequestRuleChangeRpc,
+  WsMissionsResolveRuleChangeRpc,
+  WsMissionsAnswerAskRpc,
+  WsMissionsWithdrawAskRpc,
+  WsMissionsReopenAskRpc,
+  WsMissionsReactToCallRpc,
+  WsMissionsDecideDraftRpc,
+  WsMissionsReopenDraftRpc,
+  WsMissionsSaveDraftNoteRpc,
+  WsMissionsDecideSuggestionRpc,
+  WsMissionsReopenSuggestionRpc,
+  WsMissionsStartForkRpc,
+  WsMissionsCloseForkRpc,
+  WsMissionsUpdateForkRpc,
+  WsMissionsAckNoteRpc,
 ).middleware(RpcScopeAuthorization);
 
 /** Every WebSocket RPC not in a domain group merged into `WsRpcGroup` below. */
