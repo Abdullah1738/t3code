@@ -76,7 +76,11 @@ export const verifyInbound = (
   if (candidates.length === 0) {
     return refuse("invalid", `${command.what} has no text to check against the iMessage.`);
   }
-  if (!candidates.some((text) => said.includes(` ${text} `))) {
+  // A one-character option id ("a", "2") only counts as the whole reply;
+  // inside a sentence it is just a word.
+  const says = (text: string) =>
+    text.length === 1 ? said.trim() === text : said.includes(` ${text} `);
+  if (!candidates.some(says)) {
     return refuse(
       "provenance-invalid",
       `iMessage ${inboundId} does not say "${command.expected[0] ?? ""}".`,

@@ -71,6 +71,20 @@ describe("iMessage provenance", () => {
     expect(
       expectedForAnswer({ text: "", option: { id: "pg", label: "Postgres" } }).expected,
     ).toEqual(["Postgres", "pg"]);
+    const byLetter = expectedForAnswer({ text: "", option: { id: "a", label: "Online" } });
+    const check = (text: string) =>
+      Result.isSuccess(
+        verifyInbound({
+          inboundId: "spc-msg-1",
+          inbound: owner(text),
+          ...byLetter,
+          notBefore: opened,
+          what: "Answer",
+        }),
+      );
+    expect(check("A")).toBe(true);
+    expect(check("go online")).toBe(true);
+    expect(check("take a break first")).toBe(false);
     const approve = expectedForDraftDecision({ action: "approve" });
     const ok = verifyInbound({
       inboundId: "spc-msg-1",

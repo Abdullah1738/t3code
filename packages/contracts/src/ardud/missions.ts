@@ -1246,6 +1246,7 @@ export const MissionEventKind = Schema.Literals([
   "ask.reopened",
   "call.reacted",
   "draft-note.updated",
+  "note.acked",
   // --- end asks additions ---
   "field.locked",
   "field.unlocked",
