@@ -368,6 +368,30 @@ export function moveSubMissionInput(
   return { missionId: overview.mission.id, order: next };
 }
 
+export interface FocusChoice {
+  readonly id: SubMissionId | null;
+  /** "No focus", or "2. Architecture upkeep" in the owner's order. */
+  readonly title: string;
+  readonly selected: boolean;
+}
+
+/** "No focus" plus every active sub-mission; paused and closed ones can't take focus. */
+export function focusChoices(
+  overview: Pick<MissionOverview, "mission" | "subMissions">,
+): FocusChoice[] {
+  const focus = overview.mission.focusSubMissionId;
+  return [
+    { id: null, title: "No focus", selected: focus === null },
+    ...priorityStack(overview.subMissions)
+      .filter((row) => row.subMission.status === "active")
+      .map((row) => ({
+        id: row.subMission.id,
+        title: `${row.position}. ${row.subMission.title}`,
+        selected: focus === row.subMission.id,
+      })),
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // Feed
 

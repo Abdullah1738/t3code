@@ -27,6 +27,7 @@ import {
   blockersView,
   criticalPathScreenView,
   feedView,
+  focusChoices,
   missionListRows,
   moveSubMissionInput,
   overviewHeaderView,
@@ -238,6 +239,24 @@ describe("mission list and overview", () => {
     expect(input?.order.slice(0, 2)).toEqual([rows[1]!.id, top]);
     await source.reorderSubMissions(input!);
     expect(priorityStackView(overviewOf(source)).rows[1]!.id).toBe(top);
+  });
+
+  it("offers no focus plus active sub-missions, marking the current focus", async () => {
+    const source = fixture();
+    const overview = overviewOf(source);
+    const choices = focusChoices(overview);
+    expect(choices[0]).toEqual({
+      id: null,
+      title: "No focus",
+      selected: overview.mission.focusSubMissionId === null,
+    });
+    const active = overview.subMissions.filter((sub) => sub.status === "active");
+    expect(choices).toHaveLength(active.length + 1);
+    expect(choices[1]!.title).toMatch(/^1\. /);
+    const target = choices[2]!.id!;
+    await source.setMissionFocus({ missionId: CRPKO, subMissionId: target });
+    const selected = focusChoices(overviewOf(source)).filter((choice) => choice.selected);
+    expect(selected.map((choice) => choice.id)).toEqual([target]);
   });
 });
 
