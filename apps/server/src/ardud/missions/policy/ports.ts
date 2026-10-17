@@ -6,6 +6,8 @@ import {
   MissionError,
   ScheduledTaskUpsertInput,
   type ModelSelection,
+  type MissionProvenance,
+  type Suggestion,
   type SuccessionMove,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -21,6 +23,7 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import * as ProcessRunner from "../../../processRunner.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { stateFromShell } from "../../control/model.ts";
+import * as AsksService from "../asks/AsksService.ts";
 import type { HolderThread } from "./roles.ts";
 import {
   crwBudgetWindow,
@@ -56,6 +59,15 @@ export class PolicySuccession extends Context.Service<
     readonly move: (from: ThreadId, to: ThreadId) => Effect.Effect<ReadonlyArray<SuccessionMove>>;
   }
 >()("t3/ardud/missions/policy/ports/PolicySuccession") {}
+
+/**
+ * Where governor suggestions go: the asks track's suggestion inbox. Proposing
+ * never fails the caller; a refused duplicate is just logged.
+ */
+export class PolicySuggestions extends Context.Service<
+  PolicySuggestions,
+  { readonly propose: (suggestion: Suggestion) => Effect.Effect<void> }
+>()("t3/ardud/missions/policy/ports/PolicySuggestions") {}
 
 /** Reads an observed pool's usage from its outside system. Read-only by construction. */
 export class PolicySampler extends Context.Service<
@@ -262,6 +274,44 @@ const makeSampler = Effect.gen(function* () {
 
 export const samplerLayer = Layer.effect(PolicySampler, makeSampler).pipe(
   Layer.provide(ProcessRunner.layer),
+);
+
+const GOVERNOR: MissionProvenance = { _tag: "system", component: "governor" };
+
+/** Governor suggestions through `AsksService.proposeSuggestion`, authored by the governor. */
+export const suggestionsLayer = Layer.effect(
+  PolicySuggestions,
+  Effect.gen(function* () {
+    const asks = yield* AsksService.AsksService;
+    return PolicySuggestions.of({
+      propose: (suggestion) =>
+        asks
+          .proposeSuggestion(
+            {
+              missionId: suggestion.missionId,
+              targetKind: suggestion.targetKind,
+              target: suggestion.target,
+              title: suggestion.title,
+              before: suggestion.before,
+              after: suggestion.after,
+              diffText: suggestion.diffText,
+              why: suggestion.why,
+              evidence: suggestion.evidence,
+              acceptor: suggestion.acceptor,
+            },
+            GOVERNOR,
+          )
+          .pipe(
+            Effect.asVoid,
+            Effect.catch((error) =>
+              Effect.logDebug("mission governor suggestion not filed", {
+                title: suggestion.title,
+                detail: error.detail,
+              }),
+            ),
+          ),
+    });
+  }),
 );
 
 export const portsLayer = Layer.mergeAll(threadsLayer, successionLayer, samplerLayer);

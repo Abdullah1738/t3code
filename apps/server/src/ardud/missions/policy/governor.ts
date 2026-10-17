@@ -319,7 +319,7 @@ function belowGuaranteeSuggestion(input: GovernorInput, pressure: PoolPressure):
       before: { status: lane.status },
       after: { status: "parked" },
       diffText: `status ${lane.status} -> parked`,
-      why: `${pressure.reason}. Every mission is at or below its guarantee, so only the owner can park more.`,
+      why: `${pressure.reason}. Every mission is at or below its guarantee, so the governor will not park more on its own.`,
       acceptor: "owner",
     },
     input.now,

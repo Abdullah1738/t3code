@@ -1362,6 +1362,8 @@ export const MissionEventKind = Schema.Literals([
   "role.succession",
   // --- policy additions ---
   "role.unbound",
+  "role.updated",
+  "role.retired",
   "room.created",
   "room.archived",
   "subscription.changed",
@@ -2014,6 +2016,59 @@ export const ReconcileHoldInput = Schema.Struct({
   evidence: TrimmedNonEmptyString,
 });
 export type ReconcileHoldInput = typeof ReconcileHoldInput.Type;
+
+/** Edits a role's descriptive fields. Model changes go through `SetRoleModelInput`. */
+export const UpdateRoleInput = Schema.Struct({
+  roleId: RoleId,
+  name: Schema.optional(TrimmedNonEmptyString),
+  description: Schema.optional(Schema.String),
+  writesPublicText: Schema.optional(Schema.Boolean),
+});
+export type UpdateRoleInput = typeof UpdateRoleInput.Type;
+
+/** Retires a custom role: its holders are unbound and the role is removed. */
+export const RetireRoleInput = Schema.Struct({
+  roleId: RoleId,
+  note: Schema.optional(Schema.String),
+});
+export type RetireRoleInput = typeof RetireRoleInput.Type;
+
+/** Edits a pool's name, unit or cross-mission priority order. Capacity has its own input. */
+export const UpdatePoolInput = Schema.Struct({
+  poolId: PoolId,
+  name: Schema.optional(TrimmedNonEmptyString),
+  unit: Schema.optional(TrimmedNonEmptyString),
+  priority: Schema.optional(Schema.Array(MissionId)),
+});
+export type UpdatePoolInput = typeof UpdatePoolInput.Type;
+
+/** What the governor sees and would do on its next tick. */
+export const GovernorView = Schema.Struct({
+  pressure: Schema.Array(
+    Schema.Struct({ poolId: PoolId, level: PoolPressureLevel, reason: Schema.String }),
+  ),
+  shares: Schema.Array(
+    Schema.Struct({
+      missionId: MissionId,
+      dominant: Schema.Number,
+      weighted: Schema.Number,
+      aboveGuarantee: Schema.Boolean,
+    }),
+  ),
+  actions: Schema.Array(
+    Schema.Struct({
+      action: Schema.Literals(["park", "park-at-safe-point", "resume"]),
+      laneId: LaneId,
+      missionId: MissionId,
+      reason: Schema.String,
+    }),
+  ),
+  admissions: Schema.Array(
+    Schema.Struct({ missionId: MissionId, canAdmit: Schema.Boolean, reason: Schema.String }),
+  ),
+  at: IsoDateTime,
+});
+export type GovernorView = typeof GovernorView.Type;
 // --- end policy additions ---
 
 // --- asks additions ---
