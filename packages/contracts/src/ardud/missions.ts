@@ -1241,6 +1241,12 @@ export const MissionEventKind = Schema.Literals([
   "approval.decided",
   "fork.opened",
   "fork.closed",
+  // --- asks additions ---
+  "ask.superseded",
+  "ask.reopened",
+  "call.reacted",
+  "draft-note.updated",
+  // --- end asks additions ---
   "field.locked",
   "field.unlocked",
   "governor.action",
