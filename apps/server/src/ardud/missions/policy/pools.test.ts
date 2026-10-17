@@ -12,8 +12,6 @@ import {
   admitQueue,
   expireHolds,
   inUse,
-  mayChangeCapacity,
-  mayCreatePool,
   mergeEntries,
   newPool,
   queueOrder,
@@ -270,36 +268,23 @@ describe("pools", () => {
     const a = take(pool, [], crpko, T0).entry;
     const b = take(pool, [a], juno, T0).entry;
     let entries = mergeEntries([a], [b]);
-    const lowered = setCapacity(pool, entries, 1, { byOwner: true, now: at(1) });
+    const lowered = setCapacity(pool, entries, 1, at(1));
     expect(lowered.overBy).toBe(1);
     expect(entries.every(({ hold }) => hold.status === "active")).toBe(true);
     expect(errorCode(() => take(lowered.pool, entries, crpko, at(2)))).toBe("pool-full");
 
     const queued = take(lowered.pool, entries, side, at(2), { queue: true }).entry;
     entries = mergeEntries(entries, [queued]);
-    const raised = setCapacity(lowered.pool, entries, 3, { byOwner: true, now: at(3) });
+    const raised = setCapacity(lowered.pool, entries, 3, at(3));
     expect(raised.admitted.map(({ hold }) => hold.missionId)).toEqual([side]);
     expect(raised.overBy).toBe(0);
   });
 
-  it("lets only the owner change global capacity or anything locked", () => {
+  it("never refuses a capacity change on scope or locks", () => {
     const global = slots(2);
-    expect(errorCode(() => setCapacity(global, [], 3, { byOwner: false, now: T0 }))).toBe(
-      "forbidden",
-    );
-    expect(mayChangeCapacity(global, { byOwner: false, masterOf: [crpko] })).toBe(false);
-
-    const env = devEnv();
-    expect(mayChangeCapacity(env, { byOwner: false, masterOf: [crpko] })).toBe(true);
-    expect(mayChangeCapacity(env, { byOwner: false, masterOf: [juno] })).toBe(false);
-    const locked = { ...env, lockedFields: ["capacity"] };
-    expect(errorCode(() => setCapacity(locked, [], 2, { byOwner: false, now: T0 }))).toBe("locked");
-    expect(setCapacity(locked, [], 2, { byOwner: true, now: T0 }).pool.capacity).toBe(2);
-
-    expect(
-      mayCreatePool({ _tag: "mission", missionId: crpko }, { byOwner: false, masterOf: [crpko] }),
-    ).toBe(true);
-    expect(mayCreatePool({ _tag: "global" }, { byOwner: false, masterOf: [crpko] })).toBe(false);
+    expect(setCapacity(global, [], 3, T0).pool.capacity).toBe(3);
+    const locked = { ...devEnv(), lockedFields: ["capacity"] };
+    expect(setCapacity(locked, [], 2, T0).pool.capacity).toBe(2);
   });
 
   it("counts observed usage and advisory holds without refusing", () => {

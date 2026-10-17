@@ -58,7 +58,7 @@ describe("model changes", () => {
   const master = newRole({ missionId, kind: "master" }, now);
 
   it("waits for a busy holder's next turn and never switches it mid-turn", () => {
-    const pending = requestModelChange(master, HAIKU, { byOwner: false, now: later });
+    const pending = requestModelChange(master, HAIKU, later);
     expect(sameModel(pending.modelSelection, OPUS_XHIGH)).toBe(true);
     expect(sameModel(pending.pendingModelSelection!, HAIKU)).toBe(true);
 
@@ -80,7 +80,7 @@ describe("model changes", () => {
   });
 
   it("treats a holder already on the new model as applied and gone threads as done", () => {
-    const pending = requestModelChange(master, HAIKU, { byOwner: false, now: later });
+    const pending = requestModelChange(master, HAIKU, later);
     const plan = planModelApply(pending, [
       { threadId: threadA, exists: true, idle: false, modelSelection: HAIKU },
       { threadId: threadB, exists: false, idle: false, modelSelection: null },
@@ -90,20 +90,13 @@ describe("model changes", () => {
   });
 
   it("asking for the current model cancels a pending change", () => {
-    const pending = requestModelChange(master, HAIKU, { byOwner: false, now: later });
-    expect(
-      requestModelChange(pending, OPUS_XHIGH, { byOwner: false, now: later }).pendingModelSelection,
-    ).toBeNull();
+    const pending = requestModelChange(master, HAIKU, later);
+    expect(requestModelChange(pending, OPUS_XHIGH, later).pendingModelSelection).toBeNull();
   });
 
-  it("an owner lock refuses master changes but not owner changes", () => {
+  it("never refuses on a locked field", () => {
     const locked = { ...master, lockedFields: ["modelSelection"] };
-    expect(() => requestModelChange(locked, HAIKU, { byOwner: false, now: later })).toThrow(
-      /locked/,
-    );
-    expect(
-      requestModelChange(locked, HAIKU, { byOwner: true, now: later }).pendingModelSelection,
-    ).not.toBeNull();
+    expect(requestModelChange(locked, HAIKU, later).pendingModelSelection).not.toBeNull();
   });
 });
 
@@ -119,7 +112,7 @@ describe("drift", () => {
   });
 
   it("a holder still on the old model during a pending change is not drift", () => {
-    const pending = requestModelChange(master, HAIKU, { byOwner: false, now: later });
+    const pending = requestModelChange(master, HAIKU, later);
     expect(detectDrift(pending, binding, OPUS_XHIGH)).toBeNull();
     expect(detectDrift(pending, binding, HAIKU)).toBeNull();
     expect(detectDrift(pending, binding, SOL_XHIGH)).not.toBeNull();

@@ -256,7 +256,7 @@ function queueSuggestions(input: GovernorInput): ReadonlyArray<Suggestion> {
     const stale = waiting.filter(
       (hold) => nowMs - Date.parse(hold.createdAt) >= QUEUE_WAIT_SUGGEST_MS,
     );
-    if (stale.length === 0 || pool.lockedFields.includes("capacity")) continue;
+    if (stale.length === 0) continue;
     const extra = stale.reduce((sum, hold) => sum + hold.amount, 0);
     const capacity = pool.capacity + extra;
     out.push(

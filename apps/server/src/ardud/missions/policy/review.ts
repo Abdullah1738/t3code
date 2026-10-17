@@ -29,7 +29,7 @@ import {
 } from "@t3tools/contracts";
 
 import { matchesGlob } from "./glob.ts";
-import { defaultRoleId, isLocked } from "./roles.ts";
+import { defaultRoleId } from "./roles.ts";
 
 export const REVIEWER_STAGE_ID = ReviewStageId.make("reviewer");
 export const FINAL_STAGE_ID = ReviewStageId.make("final");
@@ -222,10 +222,11 @@ export interface EffectiveVerdict {
 }
 
 /**
- * Which verdict decides the ladder. The owner's latest word wins over
- * everything. Otherwise a hard trigger forces critical, even over a master
- * reclassification. Otherwise the latest verdict stands. No verdict means
- * normal.
+ * Which verdict decides the ladder: the newest one, whoever made it (owner or
+ * master). A hard trigger counts as a verdict the moment it first fires, so
+ * it forces critical over anything recorded before it; a later owner or
+ * master reclassification wins over it like over any other verdict. No
+ * verdict means normal.
  */
 export function effectiveVerdict(input: {
   readonly policy: ReviewPolicy;
@@ -235,10 +236,7 @@ export function effectiveVerdict(input: {
   readonly now: string;
 }): EffectiveVerdict {
   const ordered = newestFirst(input.verdicts);
-  const owner = ordered.find((verdict) => verdict.source === "owner");
-  if (owner) return { verdict: owner, critical: owner.critical, unrecordedTrigger: null };
-
-  const storedTrigger = ordered.find((verdict) => verdict.source === "hard-trigger");
+  const storedTrigger = ordered.some((verdict) => verdict.source === "hard-trigger");
   const fired = input.facts ? firedTriggers(input.policy.guide, input.facts) : [];
   if (fired.length > 0 && !storedTrigger) {
     const verdict = triggerVerdict({
@@ -250,9 +248,6 @@ export function effectiveVerdict(input: {
       now: input.now,
     });
     return { verdict, critical: true, unrecordedTrigger: verdict };
-  }
-  if (storedTrigger) {
-    return { verdict: storedTrigger, critical: true, unrecordedTrigger: null };
   }
   const latest = ordered[0] ?? null;
   return { verdict: latest, critical: latest?.critical ?? false, unrecordedTrigger: null };
@@ -538,7 +533,7 @@ export function validatePolicy(policy: ReviewPolicy, roles: ReadonlyArray<Role>)
   }
 }
 
-/** Policy fields a master edit may touch. The owner may lock any of them. */
+/** Policy fields an edit may touch. */
 export type PolicyField = "guide" | "stages" | "ladders" | "commonRules" | "judgedBy";
 
 export interface PolicyEdit {
@@ -555,28 +550,19 @@ export interface PolicyEdit {
 }
 
 /**
- * Applies an edit. Locked fields refuse non-owner edits. A guide edit bumps
- * the guide version; any edit bumps the policy version.
+ * Applies an edit. A guide edit bumps the guide version; any edit bumps the
+ * policy version. Nothing refuses on `lockedFields`.
  */
 export function editPolicy(
   policy: ReviewPolicy,
   edit: PolicyEdit,
-  options: { readonly by: MissionActor; readonly byOwner: boolean; readonly now: string },
+  options: { readonly by: MissionActor; readonly now: string },
 ): ReviewPolicy {
   const touched = (Object.keys(edit) as Array<PolicyField>).filter(
     (field) => edit[field] !== undefined,
   );
   if (touched.length === 0) {
     throw new MissionError({ code: "invalid", detail: "the edit changes nothing" });
-  }
-  if (!options.byOwner) {
-    const locked = touched.filter((field) => isLocked(policy.lockedFields, field));
-    if (locked.length > 0) {
-      throw new MissionError({
-        code: "locked",
-        detail: `the owner locked ${locked.join(", ")} on this review policy`,
-      });
-    }
   }
   const guide = edit.guide
     ? {

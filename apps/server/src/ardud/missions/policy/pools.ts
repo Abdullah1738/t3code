@@ -428,54 +428,23 @@ export interface CapacityChange {
 }
 
 /**
- * Changes capacity at any time. Lowering it never evicts a running hold; new
- * holds simply wait until use drops. Raising it admits the queue.
+ * Changes capacity at any time, for any pool scope. Lowering it never evicts
+ * a running hold; new holds simply wait until use drops. Raising it admits
+ * the queue. Who may call this is the service's business (owner or master).
  */
 export function setCapacity(
   pool: Pool,
   entries: ReadonlyArray<HoldEntry>,
   capacity: number,
-  options: { readonly byOwner: boolean; readonly now: string },
+  now: string,
 ): CapacityChange {
   if (!validCapacity(capacity)) fail("invalid", "capacity must be a number of at least 0");
-  if (!options.byOwner && pool.lockedFields.includes("capacity")) {
-    fail("locked", `the owner locked the capacity of ${pool.name}`);
-  }
-  if (!options.byOwner && pool.scope._tag === "global") {
-    fail("forbidden", `${pool.name} is a global pool; only the owner changes its capacity`);
-  }
-  const next: Pool = { ...pool, capacity, updatedAt: options.now };
+  const next: Pool = { ...pool, capacity, updatedAt: now };
   return {
     pool: next,
-    admitted: admitQueue(next, entries, options.now),
+    admitted: admitQueue(next, entries, now),
     overBy: Math.max(0, inUse(next, entries) - capacity),
   };
-}
-
-/** Who may change a pool's capacity: the owner always, a master only inside its missions. */
-export function mayChangeCapacity(
-  pool: Pool,
-  actor: { readonly byOwner: boolean; readonly masterOf: ReadonlyArray<MissionId> },
-): boolean {
-  if (actor.byOwner) return true;
-  if (pool.lockedFields.includes("capacity")) return false;
-  switch (pool.scope._tag) {
-    case "global":
-      return false;
-    case "mission":
-      return actor.masterOf.includes(pool.scope.missionId);
-    case "shared":
-      return pool.scope.missionIds.some((missionId) => actor.masterOf.includes(missionId));
-  }
-}
-
-/** Masters create pools for their own mission only. Shared and global pools are owner-made. */
-export function mayCreatePool(
-  scope: PoolScope,
-  actor: { readonly byOwner: boolean; readonly masterOf: ReadonlyArray<MissionId> },
-): boolean {
-  if (actor.byOwner) return true;
-  return scope._tag === "mission" && actor.masterOf.includes(scope.missionId);
 }
 
 /** Records a usage sample from an outside backend. Native pools derive usage from holds instead. */

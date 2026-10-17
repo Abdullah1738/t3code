@@ -222,7 +222,7 @@ describe("new heads", () => {
 });
 
 describe("verdicts", () => {
-  it("the owner's reclassification wins over the master's guide verdict", () => {
+  it("the owner's reclassification wins over the master's guide verdict, and the newest word stands", () => {
     const policy = defaultReviewPolicy(missionId, tick());
     const byMaster = verdict(policy, true, master, null);
     const byOwner = verdict(policy, false, owner, byMaster);
@@ -239,11 +239,11 @@ describe("verdicts", () => {
     expect(result.plan.verdict?.id).toBe(byOwner.id);
     expect(result.plan.mergeAllowed).toBe(true);
 
-    // A later master reclassification does not undo the owner's word.
+    // The master can reclassify again after the owner; the newest word stands.
     const later = verdict(policy, true, master, byOwner);
     expect(later.source).toBe("reclassified");
-    const still = plan(policy, "h1", [byMaster, byOwner, later], []);
-    expect(still.plan.ladderId).toBe(NORMAL_LADDER_ID);
+    const again = plan(policy, "h1", [byMaster, byOwner, later], []);
+    expect(again.plan.ladderId).toBe(CRITICAL_LADDER_ID);
   });
 
   it("a master reclassification replaces the earlier master verdict", () => {
@@ -259,7 +259,7 @@ describe("verdicts", () => {
     const policy = editPolicy(
       defaultReviewPolicy(missionId, tick()),
       { guide: crpkoRule89Guide(tick(), master) },
-      { by: master, byOwner: false, now: tick() },
+      { by: master, now: tick() },
     );
     const normal = verdict(policy, false, master, null);
     const result = plan(policy, "h1", [normal], [record(REVIEWER_STAGE_ID, "h1", "clear")], {
@@ -277,7 +277,12 @@ describe("verdicts", () => {
     expect(later.plan.ladderId).toBe(CRITICAL_LADDER_ID);
     expect(later.unrecordedTrigger).toBeNull();
 
-    // Only the owner can turn a triggered PR back to normal.
+    // A later reclassification (owner or master) can turn it back to normal,
+    // and the stored trigger does not fire again.
+    const masterCall = verdict(policy, false, master, stored);
+    const back = plan(policy, "h1", [normal, stored, masterCall], [], { changedLines: 1800 });
+    expect(back.plan.ladderId).toBe(NORMAL_LADDER_ID);
+    expect(back.unrecordedTrigger).toBeNull();
     const ownerCall = verdict(policy, false, owner, stored);
     expect(plan(policy, "h1", [normal, stored, ownerCall], []).plan.ladderId).toBe(
       NORMAL_LADDER_ID,
@@ -296,7 +301,7 @@ describe("verdicts", () => {
           ],
         },
       },
-      { by: master, byOwner: false, now: tick() },
+      { by: master, now: tick() },
     );
     expect(plan(policy, "h1", [], [], { paths: ["services/custody/sign.go"] }).plan.ladderId).toBe(
       CRITICAL_LADDER_ID,
@@ -313,7 +318,7 @@ describe("verdicts", () => {
     const policy = editPolicy(
       defaultReviewPolicy(missionId, tick()),
       { guide: { text: "real funds are critical" } },
-      { by: master, byOwner: false, now: tick() },
+      { by: master, now: tick() },
     );
     expect(policy.guide.version).toBe(1);
     const result = plan(policy, "h1", [], [record(REVIEWER_STAGE_ID, "h1", "clear")]);
@@ -333,23 +338,13 @@ describe("verdicts", () => {
 });
 
 describe("policy edits", () => {
-  it("owner locks refuse master edits but not owner edits", () => {
+  it("never refuses on locked fields and bumps versions", () => {
     const policy = { ...defaultReviewPolicy(missionId, tick()), lockedFields: ["guide"] };
-    expect(() =>
-      editPolicy(policy, { guide: { text: "x" } }, { by: master, byOwner: false, now: tick() }),
-    ).toThrow(/locked/);
-    const edited = editPolicy(
-      policy,
-      { guide: { text: "x" } },
-      { by: owner, byOwner: true, now: tick() },
-    );
+    const edited = editPolicy(policy, { guide: { text: "x" } }, { by: master, now: tick() });
     expect(edited.guide.text).toBe("x");
+    expect(edited.guide.version).toBe(policy.guide.version + 1);
+    expect(edited.guide.authoredBy).toEqual(master);
     expect(edited.version).toBe(2);
-    // Other fields stay editable.
-    expect(
-      editPolicy(policy, { commonRules: ["a"] }, { by: master, byOwner: false, now: tick() })
-        .commonRules,
-    ).toEqual(["a"]);
   });
 
   it("custom ladders add their stages after the base ladder", () => {
@@ -378,7 +373,7 @@ describe("policy edits", () => {
           },
         ],
       },
-      { by: master, byOwner: false, now: tick() },
+      { by: master, now: tick() },
     );
     validatePolicy(policy, roles);
     const result = reviewPlan({

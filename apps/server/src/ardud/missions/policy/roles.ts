@@ -178,28 +178,15 @@ export function defaultLaneRoles(
   return LANE_ROLE_KINDS.map((kind) => newRole({ missionId, kind, laneId }, now));
 }
 
-export function isLocked(lockedFields: ReadonlyArray<string>, field: string): boolean {
-  return lockedFields.includes(field);
-}
-
 /**
  * Asks for a model change. The role keeps running its current model until
  * every holder picks the new one up at its next turn (see `planModelApply`).
- * Asking for the current model cancels a pending change.
+ * Asking for the current model cancels a pending change. Nothing refuses on
+ * `lockedFields`: the owner and the master can always change a role's model.
  */
-export function requestModelChange(
-  role: Role,
-  modelSelection: ModelSelection,
-  options: { readonly byOwner: boolean; readonly now: string },
-): Role {
-  if (!options.byOwner && isLocked(role.lockedFields, "modelSelection")) {
-    throw new MissionError({
-      code: "locked",
-      detail: `the owner locked the model of role ${role.id}`,
-    });
-  }
+export function requestModelChange(role: Role, modelSelection: ModelSelection, now: string): Role {
   const pending = sameModel(role.modelSelection, modelSelection) ? null : modelSelection;
-  return { ...role, pendingModelSelection: pending, updatedAt: options.now };
+  return { ...role, pendingModelSelection: pending, updatedAt: now };
 }
 
 /** What a bound thread looks like right now, read from its thread shell. */
