@@ -1124,6 +1124,91 @@ export const ReviewPlan = Schema.Struct({
 });
 export type ReviewPlan = typeof ReviewPlan.Type;
 
+// --- policy additions ---
+
+/** What the hard triggers read about a PR. Without facts only stored verdicts count. */
+export const PullRequestFacts = Schema.Struct({
+  changedLines: Schema.optional(NonNegativeInt),
+  paths: Schema.optional(Schema.Array(Schema.String)),
+  labels: Schema.optional(Schema.Array(Schema.String)),
+});
+export type PullRequestFacts = typeof PullRequestFacts.Type;
+
+/** A holder running a different model than its role says, as model keys. */
+export const RoleDrift = Schema.Struct({
+  roleId: RoleId,
+  bindingId: RoleBindingId,
+  threadId: ThreadId,
+  expected: Schema.String,
+  observed: Schema.String,
+});
+export type RoleDrift = typeof RoleDrift.Type;
+
+export const RolesSnapshot = Schema.Struct({
+  missionId: MissionId,
+  roles: Schema.Array(Role),
+  /** Registry defaults not stored yet. They act like stored roles and are stored on first change. */
+  defaults: Schema.Array(RoleId),
+  /** Every binding, newest first, so ended ones show the succession history. */
+  bindings: Schema.Array(RoleBinding),
+  drift: Schema.Array(RoleDrift),
+});
+export type RolesSnapshot = typeof RolesSnapshot.Type;
+
+export const ReviewPolicySnapshot = Schema.Struct({
+  policy: ReviewPolicy,
+  /** False until someone edits the policy; the default ladders apply meanwhile. */
+  stored: Schema.Boolean,
+});
+export type ReviewPolicySnapshot = typeof ReviewPolicySnapshot.Type;
+
+export const PoolPressureLevel = Schema.Literals(["ok", "tight", "exhausted"]);
+export type PoolPressureLevel = typeof PoolPressureLevel.Type;
+
+export const PoolView = Schema.Struct({
+  /** `usage` is live: held amounts for native pools, the latest sample otherwise. */
+  pool: Pool,
+  /** Open holds: active and reconcile-required, then queued in admission order. */
+  holds: Schema.Array(PoolHold),
+  inUse: Schema.Number,
+  pressure: PoolPressureLevel,
+  pressureReason: Schema.String,
+  /** Observed pools only sample once a read-only source is configured. */
+  sourceConfigured: Schema.Boolean,
+});
+export type PoolView = typeof PoolView.Type;
+
+export const PoolsSnapshot = Schema.Struct({
+  pools: Schema.Array(PoolView),
+  at: IsoDateTime,
+});
+export type PoolsSnapshot = typeof PoolsSnapshot.Type;
+
+export const TakeHoldResult = Schema.Struct({
+  hold: PoolHold,
+  /** 1-based place in the queue when the hold is queued. */
+  queuePosition: Schema.NullOr(PositiveInt),
+  /** Advisory pools never refuse; this says the hold went over capacity. */
+  overCapacity: Schema.Boolean,
+});
+export type TakeHoldResult = typeof TakeHoldResult.Type;
+
+/** What a succession carried to the new thread; unsupported moves say so instead of failing. */
+export const SuccessionMove = Schema.Struct({
+  what: Schema.Literals(["schedules", "subscriptions", "children"]),
+  moved: NonNegativeInt,
+  failed: NonNegativeInt,
+  supported: Schema.Boolean,
+});
+export type SuccessionMove = typeof SuccessionMove.Type;
+
+export const SucceedRoleResult = Schema.Struct({
+  ended: RoleBinding,
+  binding: RoleBinding,
+  moves: Schema.Array(SuccessionMove),
+});
+export type SucceedRoleResult = typeof SucceedRoleResult.Type;
+
 // ---------------------------------------------------------------------------
 // Work items
 
@@ -1210,6 +1295,8 @@ export const MissionEventKind = Schema.Literals([
   "role.model-changed",
   "role.bound",
   "role.succession",
+  // --- policy additions ---
+  "role.unbound",
   "room.created",
   "room.archived",
   "subscription.changed",
@@ -1234,6 +1321,9 @@ export const MissionEventKind = Schema.Literals([
   "pool.hold-taken",
   "pool.hold-released",
   "pool.hold-expired",
+  // --- policy additions ---
+  "pool.hold-queued",
+  "pool.hold-reconciled",
   "review-policy.updated",
   "criticality.recorded",
   "review.recorded",
@@ -1588,6 +1678,115 @@ export const UpsertRuleInput = Schema.Struct({
   status: Schema.optional(RuleStatus),
 });
 export type UpsertRuleInput = typeof UpsertRuleInput.Type;
+
+// --- policy additions ---
+
+export const CreateRoleInput = Schema.Struct({
+  missionId: MissionId,
+  kind: RoleKind,
+  laneId: Schema.optional(LaneId),
+  name: Schema.optional(TrimmedNonEmptyString),
+  description: Schema.optional(Schema.String),
+  /** Defaults to the registry model for the kind; required for `custom`. */
+  modelSelection: Schema.optional(ModelSelection),
+});
+export type CreateRoleInput = typeof CreateRoleInput.Type;
+
+export const BindRoleInput = Schema.Struct({
+  roleId: RoleId,
+  threadId: ThreadId,
+  reason: Schema.optional(RoleBindingReason),
+  handoffNote: Schema.optional(Schema.String),
+  /** Keep the role's other holders bound (lane workers). By default they end. */
+  shared: Schema.optional(Schema.Boolean),
+});
+export type BindRoleInput = typeof BindRoleInput.Type;
+
+export const UnbindRoleInput = Schema.Struct({
+  roleId: RoleId,
+  threadId: ThreadId,
+  note: Schema.optional(Schema.String),
+});
+export type UnbindRoleInput = typeof UnbindRoleInput.Type;
+
+/** The new thread already exists (launched or reset by the caller). */
+export const SucceedRoleInput = Schema.Struct({
+  roleId: RoleId,
+  threadId: ThreadId,
+  handoffNote: TrimmedNonEmptyString,
+  /** The holder being replaced; needed only when the role has several holders. */
+  fromThreadId: Schema.optional(ThreadId),
+});
+export type SucceedRoleInput = typeof SucceedRoleInput.Type;
+
+export const EditReviewPolicyInput = Schema.Struct({
+  missionId: MissionId,
+  stages: Schema.optional(Schema.Array(ReviewStage)),
+  ladders: Schema.optional(Schema.Array(ReviewLadder)),
+  commonRules: Schema.optional(Schema.Array(Schema.String)),
+  judgedBy: Schema.optional(ReviewPolicy.fields.judgedBy),
+});
+export type EditReviewPolicyInput = typeof EditReviewPolicyInput.Type;
+
+/** The role and model default from the stage's role when not given. */
+export const RecordReviewInput = Schema.Struct({
+  missionId: MissionId,
+  pullRequest: PullRequestKey,
+  stageId: ReviewStageId,
+  headSha: TrimmedNonEmptyString,
+  verdict: ReviewRecord.fields.verdict,
+  findings: Schema.optional(NonNegativeInt),
+  severeFindings: Schema.optional(NonNegativeInt),
+  links: Schema.optional(Schema.Array(MissionLink)),
+  model: Schema.optional(TrimmedNonEmptyString),
+});
+export type RecordReviewInput = typeof RecordReviewInput.Type;
+
+export const ReviewPlanRequest = Schema.Struct({
+  missionId: MissionId,
+  pullRequest: PullRequestKey,
+  headSha: TrimmedNonEmptyString,
+  /** When given, a fired hard trigger is recorded as the PR's verdict. */
+  facts: Schema.optional(PullRequestFacts),
+  /** Extra ladders whose condition the caller says applies (e.g. a mobile gate). */
+  customLadderIds: Schema.optional(Schema.Array(ReviewLadderId)),
+});
+export type ReviewPlanRequest = typeof ReviewPlanRequest.Type;
+
+export const CreatePoolInput = Schema.Struct({
+  poolId: Schema.optional(PoolId),
+  name: TrimmedNonEmptyString,
+  unit: TrimmedNonEmptyString,
+  capacity: Schema.Number,
+  scope: PoolScope,
+  kind: PoolKind,
+  backend: PoolBackend,
+  enforcement: Schema.optional(Pool.fields.enforcement),
+  priority: Schema.optional(Schema.Array(MissionId)),
+});
+export type CreatePoolInput = typeof CreatePoolInput.Type;
+
+export const SetPoolCapacityInput = Schema.Struct({
+  poolId: PoolId,
+  capacity: Schema.Number,
+});
+export type SetPoolCapacityInput = typeof SetPoolCapacityInput.Type;
+
+export const RenewHoldInput = Schema.Struct({
+  holdId: PoolHoldId,
+  fence: PositiveInt,
+  ttlSeconds: PositiveInt,
+});
+export type RenewHoldInput = typeof RenewHoldInput.Type;
+
+/** Closes an expired hold. Evidence says what really happened to the work. */
+export const ReconcileHoldInput = Schema.Struct({
+  holdId: PoolHoldId,
+  fence: PositiveInt,
+  outcome: Schema.Literals(["done", "not-started", "rolled-back"]),
+  evidence: TrimmedNonEmptyString,
+});
+export type ReconcileHoldInput = typeof ReconcileHoldInput.Type;
 
 // ---------------------------------------------------------------------------
 // Errors
