@@ -469,6 +469,29 @@ export const BroadcastReceipt = Schema.Struct({
 });
 export type BroadcastReceipt = typeof BroadcastReceipt.Type;
 
+// --- coord additions ---
+/**
+ * The coord event a message mirrors: imported history, or a post that came in
+ * through the coord forward shim. Keeps the coord-only fields so the shim can
+ * answer `coord inbox` with the same rows coord itself returned.
+ */
+export const CoordEventRef = Schema.Struct({
+  /** coord channel id (control, release, arch, observe, delivery). */
+  channel: TrimmedNonEmptyString,
+  /** coord actor id that posted it. */
+  sender: TrimmedNonEmptyString,
+  /** coord's canonical sha256 of the post fields; same key + other hash = conflict. */
+  bodyHash: Schema.NullOr(Schema.String),
+  workId: Schema.NullOr(Schema.String),
+  environment: Schema.NullOr(Schema.String),
+  expectedRevision: Schema.NullOr(Schema.String),
+  authorityRef: Schema.NullOr(Schema.String),
+  /** coord seq this replies to. */
+  replyTo: Schema.NullOr(NonNegativeInt),
+});
+export type CoordEventRef = typeof CoordEventRef.Type;
+// --- end coord additions ---
+
 /** List shape of a room message. `body` loads on open via a separate call. */
 export const MissionMessage = Schema.Struct({
   id: MissionMessageId,
@@ -492,6 +515,10 @@ export const MissionMessage = Schema.Struct({
   /** Owner post marked "correct the master": the scribe offers it as a rule. */
   isCorrection: Schema.Boolean,
   createdAt: IsoDateTime,
+  // --- coord additions ---
+  /** Set when the message mirrors a coord event (import or forward shim). */
+  coord: Schema.optional(CoordEventRef),
+  // --- end coord additions ---
 });
 export type MissionMessage = typeof MissionMessage.Type;
 
@@ -1139,6 +1166,24 @@ export const WorkStage = Schema.Literals([
 ]);
 export type WorkStage = typeof WorkStage.Type;
 
+// --- coord additions ---
+/** A deferred item: parked work that comes back when its trigger fires. */
+export const WorkItemDeferral = Schema.Struct({
+  /** Id in the deferral register it came from, e.g. `DF-12`. */
+  registerId: TrimmedNonEmptyString,
+  status: Schema.Literals(["deferred", "fired", "done", "closed"]),
+  /** Who deferred it and when, as written. */
+  deferredBy: Schema.String,
+  why: Schema.String,
+  /** What brings it back. */
+  trigger: Schema.String,
+  source: Schema.String,
+  /** Later updates and outcomes, as written. */
+  notes: Schema.Array(Schema.String),
+});
+export type WorkItemDeferral = typeof WorkItemDeferral.Type;
+// --- end coord additions ---
+
 /** Done is three facts: merged at the exact head, deployed and read back, behaviour exercised. */
 export const WorkItem = Schema.Struct({
   id: WorkItemId,
@@ -1162,6 +1207,10 @@ export const WorkItem = Schema.Struct({
   }),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- coord additions ---
+  /** Set for deferred items; `stage` stays where the work was parked. */
+  deferral: Schema.optional(WorkItemDeferral),
+  // --- end coord additions ---
 });
 export type WorkItem = typeof WorkItem.Type;
 
