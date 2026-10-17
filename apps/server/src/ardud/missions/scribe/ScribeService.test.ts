@@ -2,24 +2,25 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
-import type { Ask } from "@t3tools/contracts";
+import { MissionId, type Ask } from "@t3tools/contracts";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as MissionStore from "../store/MissionStore.ts";
 import type { ScribeBatchInput, ScribeNoteDraft } from "./batch.ts";
-import { MissionRecords, memoryLayer } from "./ports.ts";
 import * as ScribeService from "./ScribeService.ts";
 import * as ScribeStore from "./ScribeStore.ts";
 import {
   LANE_THREAD,
   MASTER_THREAD,
   MISSION_ID,
+  putRecord,
   seedMission,
   seedTranscript,
 } from "./testFixtures.ts";
 
 const TestLayer = ScribeService.layer.pipe(
   Layer.provideMerge(ScribeStore.layer),
-  Layer.provideMerge(memoryLayer(() => "2026-10-17T12:00:00.000Z")),
+  Layer.provideMerge(MissionStore.layer),
   Layer.provideMerge(Sqlite.layerMemory),
 );
 
@@ -116,7 +117,7 @@ it.layer(TestLayer)("scribe service", (it) => {
   it.effect("stores checked notes once; a rerun of the same range posts nothing", () =>
     Effect.gen(function* () {
       const service = yield* ScribeService.ScribeService;
-      const records = yield* MissionRecords;
+      const store = yield* MissionStore.MissionStore;
       const posted = batch({
         notes: [
           note({}),
@@ -142,21 +143,32 @@ it.layer(TestLayer)("scribe service", (it) => {
       assert.equal(first.failed, 1);
       assert.equal(first.cursor, 2000004);
 
-      const notes = yield* records.list("note", { missionId: MISSION_ID });
+      const notes = yield* store.list("note", { missionId: MissionId.make(MISSION_ID) });
       assert.equal(notes.length, 3);
       const claim = notes.find((stored) => stored.type === "claim-of-done");
       assert.equal(claim?.evidence, "mismatch");
       assert.equal(notes.find((stored) => stored.type === "risk")?.citation, "failed");
-      const events = yield* records.eventsSince(MISSION_ID, 0, 100);
-      assert.deepStrictEqual(
-        events.map((event) => event.kind),
-        ["note.recorded", "note.recorded"],
+      const seeded = 3;
+      const events = (yield* store.eventsSince(MissionId.make(MISSION_ID), seeded)).filter(
+        (event) => event.kind === "note.recorded",
       );
+      // One event per verified note, then one for the batch's failed citations.
+      const verifiedIds = notes
+        .filter((stored) => stored.citation === "verified")
+        .map((stored) => stored.id as string);
+      assert.deepStrictEqual(
+        events.map((event) => event.subject?.id ?? null).toSorted(),
+        [...verifiedIds, null].toSorted(),
+      );
+      assert.isNull(events.at(-1)?.subject ?? null);
 
       const again = yield* service.ingest(posted);
       assert.isTrue(again.duplicate);
-      assert.equal((yield* records.list("note", { missionId: MISSION_ID })).length, 3);
-      assert.equal((yield* records.eventsSince(MISSION_ID, 0, 100)).length, 2);
+      assert.equal(
+        (yield* store.list("note", { missionId: MissionId.make(MISSION_ID) })).length,
+        3,
+      );
+      assert.equal((yield* store.eventsSince(MissionId.make(MISSION_ID), 0)).length, seeded + 3);
 
       const lanes = yield* service.lanes(MISSION_ID);
       assert.equal(lanes[0]?.cursor, 2000004);
@@ -247,7 +259,6 @@ it.layer(TestLayer)("scribe reports", (it) => {
   it.effect("saves a report and the next one closes out what it left open", () =>
     Effect.gen(function* () {
       yield* seedMission;
-      const records = yield* MissionRecords;
       const service = yield* ScribeService.ScribeService;
       const ask = {
         id: "ask-go",
@@ -266,7 +277,7 @@ it.layer(TestLayer)("scribe reports", (it) => {
         createdAt: "2026-10-17T05:00:00.000Z",
         updatedAt: "2026-10-17T05:00:00.000Z",
       } as unknown as Ask;
-      yield* records.upsert({ _tag: "ask", record: ask }, []);
+      yield* putRecord({ _tag: "ask", record: ask });
 
       const first = yield* service.report({
         missionId: MISSION_ID,
@@ -281,22 +292,19 @@ it.layer(TestLayer)("scribe reports", (it) => {
         ["ask:ask-go"],
       );
 
-      yield* records.upsert(
-        {
-          _tag: "ask",
-          record: {
-            ...ask,
-            status: "answered",
-            answer: {
-              optionId: "yes",
-              text: "go ahead",
-              provenance: { _tag: "owner-app", surface: "web", sessionId: null },
-              answeredAt: "2026-10-17T09:00:00.000Z",
-            },
-          } as unknown as Ask,
-        },
-        [],
-      );
+      yield* putRecord({
+        _tag: "ask",
+        record: {
+          ...ask,
+          status: "answered",
+          answer: {
+            optionId: "yes",
+            text: "go ahead",
+            provenance: { _tag: "owner-app", surface: "web", sessionId: null },
+            answeredAt: "2026-10-17T09:00:00.000Z",
+          },
+        } as unknown as Ask,
+      });
       const second = yield* service.report({
         missionId: MISSION_ID,
         kind: "update",

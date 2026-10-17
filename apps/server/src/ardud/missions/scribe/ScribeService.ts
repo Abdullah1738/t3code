@@ -2,14 +2,20 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as SqlClient from "effect/sql/SqlClient";
 
-import { MissionError, Note, type MissionActor, type MissionProvenance } from "@t3tools/contracts";
+import {
+  MissionError,
+  MissionId,
+  Note,
+  type MissionActor,
+  type MissionProvenance,
+} from "@t3tools/contracts";
 
+import { MissionStore, type MissionCommit } from "../store/MissionStore.ts";
 import { assembleBatch, type BatchStats, type ScribeBatchInput } from "./batch.ts";
 import { currentNotes, rankFyi } from "./notes.ts";
-import { MissionRecords } from "./ports.ts";
 import { type BuiltReport, buildReport, type ReportKind } from "./reports.ts";
 import { ScribeStore, type ScribeStoreError } from "./ScribeStore.ts";
 
@@ -18,6 +24,12 @@ import { ScribeStore, type ScribeStoreError } from "./ScribeStore.ts";
  * every posted batch (citations, claim evidence, `replaces`) and stores the
  * notes in core's record store. A batch at or behind the lane cursor is a
  * duplicate and writes nothing, so a retried post is harmless.
+ *
+ * Each verified note is its own commit with a `note.recorded` event, so the
+ * timeline and feed show one line per note. Notes whose quote did not check
+ * out are kept (they feed the pass rate) under a single event per batch. The
+ * batch row and the new cursor ride on the last commit; if the server dies
+ * part-way, the retry skips note ids it already stored and finishes the batch.
  */
 
 const decodeNote = Schema.decodeUnknownEffect(Note);
@@ -81,7 +93,12 @@ export interface ReportRequest {
 }
 
 const WINDOW_HOURS: Record<ReportKind, number> = { update: 4, daily: 24 };
-const EVENT_SCAN_LIMIT = 20_000;
+/** Notes read for ranking and reports: the newest this many per mission. */
+const NOTE_WINDOW = 5000;
+/** Events read for "You asked" (owner messages in the window). */
+const EVENT_WINDOW = 500;
+/** Longest `replaces` chain followed when validating a new note. */
+const CHAIN_DEPTH = 50;
 
 const clipLine = (text: string, max = 400): string => {
   const line = text.replace(/\s+/gu, " ").trim();
@@ -138,41 +155,59 @@ export class ScribeService extends Context.Service<
 >()("t3/ardud/missions/scribe/ScribeService") {}
 
 const make = Effect.gen(function* () {
-  const records = yield* MissionRecords;
-  const store = yield* ScribeStore;
-  const sql = yield* SqlClient.SqlClient;
+  const store = yield* MissionStore;
+  const scribe = yield* ScribeStore;
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
 
   const requireMission = (missionId: string) =>
-    records
-      .get("mission", missionId)
-      .pipe(
-        Effect.flatMap((mission) =>
-          mission === null
-            ? Effect.fail(new MissionError({ code: "not-found", detail: `mission ${missionId}` }))
-            : Effect.succeed(mission),
-        ),
-      );
+    store.get("mission", missionId).pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () =>
+            Effect.fail(new MissionError({ code: "not-found", detail: `mission ${missionId}` })),
+          onSome: Effect.succeed,
+        }),
+      ),
+    );
+
+  const recentNotes = (missionId: string) =>
+    store.list("note", { missionId: MissionId.make(missionId), limit: NOTE_WINDOW });
+
+  /** The notes a batch touches: its own ids plus every `replaces` chain it points into. */
+  const knownNotesFor = (ids: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const byId = new Map<string, Note>();
+      let next = [...new Set(ids)];
+      for (let depth = 0; next.length > 0 && depth < CHAIN_DEPTH; depth += 1) {
+        const found = yield* store.list("note", { ids: next });
+        for (const note of found) byId.set(note.id, note);
+        next = found
+          .map((note) => note.replacesNoteId)
+          .filter((id): id is NonNullable<typeof id> => id !== null && !byId.has(id));
+      }
+      return byId;
+    });
 
   const cursorFor = (missionId: string, threadId: string, startAt: string) =>
-    store
+    scribe
       .cursor(missionId, threadId)
       .pipe(
         Effect.flatMap((stored) =>
-          stored === null ? store.startCursor(threadId, startAt) : Effect.succeed(stored),
+          stored === null ? scribe.startCursor(threadId, startAt) : Effect.succeed(stored),
         ),
       );
 
   const lanes = (missionId: string) =>
     Effect.gen(function* () {
       const mission = yield* requireMission(missionId);
-      const subMissions = yield* records.list("sub-mission", { missionId });
+      const id = MissionId.make(missionId);
+      const subMissions = yield* store.list("sub-mission", { missionId: id });
       const titleOf = (id: string | null) =>
         id === null ? null : (subMissions.find((sub) => sub.id === id)?.title ?? null);
       const out: ScribeLane[] = [];
       const seen = new Set<string>();
-      for (const lane of yield* records.list("lane", { missionId })) {
+      for (const lane of yield* store.list("lane", { missionId: id })) {
         if (lane.threadId === null || lane.status === "retired" || seen.has(lane.threadId))
           continue;
         seen.add(lane.threadId);
@@ -190,7 +225,7 @@ const make = Effect.gen(function* () {
       }
       // The master thread is read too: its decisions and owner messages matter most.
       if (mission.masterRoleId !== null) {
-        const bindings = yield* records.list("role-binding", {});
+        const bindings = yield* store.list("role-binding", { status: ["bound"] });
         const master = bindings.find(
           (binding) => binding.roleId === mission.masterRoleId && binding.endedAt === null,
         );
@@ -212,7 +247,7 @@ const make = Effect.gen(function* () {
     });
 
   const openNotes = (missionId: string, threadId: string) =>
-    records.list("note", { missionId }).pipe(
+    recentNotes(missionId).pipe(
       Effect.map((notes) =>
         currentNotes(notes)
           .filter(
@@ -240,21 +275,27 @@ const make = Effect.gen(function* () {
         });
       }
       yield* requireMission(input.missionId);
-      const cursor = (yield* store.cursor(input.missionId, input.threadId)) ?? 0;
+      const missionId = MissionId.make(input.missionId);
+      const cursor = (yield* scribe.cursor(input.missionId, input.threadId)) ?? 0;
       if (input.toEvent <= cursor) {
         return { duplicate: true, accepted: 0, failed: 0, cursor, stats: null } as IngestResult;
       }
       const at = yield* now;
-      const events = yield* store.transcript(input.threadId, input.fromEvent, input.toEvent);
-      const pullRequests = yield* store.pullRequests(input.threadId);
-      const existing = yield* records.list("note", { missionId: input.missionId });
-      const assembled = assembleBatch(input, {
+      const events = yield* scribe.transcript(input.threadId, input.fromEvent, input.toEvent);
+      const pullRequests = yield* scribe.pullRequests(input.threadId);
+      // First pass only to learn the ids and `replaces` targets this batch touches.
+      const draftIds = assembleBatch(input, {
         events,
         pullRequests,
-        knownNotes: new Map(existing.map((note) => [note.id as string, note])),
+        knownNotes: new Map(),
         now: at,
-      });
-      const known = new Set(existing.map((note) => note.id as string));
+      }).notes.map((note) => note.id as string);
+      const replaces = input.notes.flatMap((note) =>
+        note.replaces === null ? [] : [note.replaces],
+      );
+      const known = yield* knownNotesFor([...draftIds, ...replaces]);
+      const assembled = assembleBatch(input, { events, pullRequests, knownNotes: known, now: at });
+
       const fresh: Note[] = [];
       for (const draft of assembled.notes) {
         if (known.has(draft.id)) continue;
@@ -266,57 +307,70 @@ const make = Effect.gen(function* () {
           ),
         );
       }
-      yield* sql
-        .withTransaction(
-          Effect.gen(function* () {
-            for (const note of fresh) {
-              yield* records.upsert(
-                { _tag: "note", record: note },
-                note.citation === "verified"
-                  ? [
-                      {
-                        kind: "note.recorded",
-                        actor: SCRIBE_ACTOR,
-                        provenance: SCRIBE_PROVENANCE,
-                        summary: clipLine(`${note.type}: ${note.summary}`),
-                        subject: { kind: "note", id: note.id },
-                        payload: {
-                          laneId: note.laneId,
-                          severity: note.severity,
-                          evidence: note.evidence,
-                          replacesNoteId: note.replacesNoteId,
-                        },
-                      },
-                    ]
-                  : [],
-              );
-            }
-            yield* store.writeBatch({
-              batch: {
-                batchId: `${input.missionId}|${input.threadId}|${input.fromEvent}|${input.toEvent}`,
-                missionId: input.missionId,
-                threadId: input.threadId,
-                fromEvent: input.fromEvent,
-                toEvent: input.toEvent,
-                model: input.model,
-                inputTokens: input.usage.input,
-                outputTokens: input.usage.output,
-                stats: assembled.stats,
-                createdAt: at,
-              },
-              candidates: assembled.candidates,
-              cursor: input.toEvent,
-            });
-          }),
-        )
-        .pipe(
-          Effect.catchTags({
-            SqlError: (cause) =>
-              Effect.fail(
-                new MissionError({ code: "conflict", detail: `ingest: ${cause.message}` }),
-              ),
-          }),
-        );
+
+      const commits: MissionCommit[] = fresh
+        .filter((note) => note.citation === "verified")
+        .map((note) => ({
+          event: {
+            missionId,
+            kind: "note.recorded",
+            actor: SCRIBE_ACTOR,
+            provenance: SCRIBE_PROVENANCE,
+            summary: clipLine(`${note.type}: ${note.summary}`),
+            subject: { kind: "note", id: note.id },
+            payload: {
+              laneId: note.laneId,
+              severity: note.severity,
+              citation: note.citation,
+              evidence: note.evidence,
+              replacesNoteId: note.replacesNoteId,
+            },
+            at,
+          },
+          upserts: [{ _tag: "note", record: note }],
+        }));
+      const failed = fresh.filter((note) => note.citation !== "verified");
+      if (failed.length > 0) {
+        commits.push({
+          event: {
+            missionId,
+            kind: "note.recorded",
+            actor: SCRIBE_ACTOR,
+            provenance: SCRIBE_PROVENANCE,
+            summary: `Scribe kept ${failed.length} note(s) whose quote did not match the transcript; they stay out of FYI.`,
+            subject: null,
+            payload: { citation: "failed", noteIds: failed.map((note) => note.id) },
+            at,
+          },
+          upserts: failed.map((note) => ({ _tag: "note" as const, record: note })),
+        });
+      }
+
+      const batchWrite = scribe
+        .writeBatch({
+          batch: {
+            batchId: `${input.missionId}|${input.threadId}|${input.fromEvent}|${input.toEvent}`,
+            missionId: input.missionId,
+            threadId: input.threadId,
+            fromEvent: input.fromEvent,
+            toEvent: input.toEvent,
+            model: input.model,
+            inputTokens: input.usage.input,
+            outputTokens: input.usage.output,
+            stats: assembled.stats,
+            createdAt: at,
+          },
+          candidates: assembled.candidates,
+          cursor: input.toEvent,
+        })
+        // Same contract as core's store: storage faults are defects.
+        .pipe(Effect.orDie);
+
+      const last = commits.pop();
+      for (const commit of commits) yield* store.commit(commit);
+      if (last === undefined) yield* batchWrite;
+      else yield* store.commit({ ...last, alongside: batchWrite });
+
       return {
         duplicate: false,
         accepted: assembled.stats.verified,
@@ -328,22 +382,23 @@ const make = Effect.gen(function* () {
 
   const fyi = (missionId: string, limit: number) =>
     Effect.gen(function* () {
-      const notes = yield* records.list("note", { missionId });
-      const editor = yield* store.editorState(missionId);
+      const notes = yield* recentNotes(missionId);
+      const editor = yield* scribe.editorState(missionId);
       const order = (editor?.payload as { readonly fyiOrder?: ReadonlyArray<string> } | null)
         ?.fyiOrder;
       return rankFyi(notes, { limit, ...(order === undefined ? {} : { editorOrder: order }) });
     });
 
   const stats = (missionId: string, sinceIso: string | null) =>
-    store.batches(missionId, sinceIso).pipe(Effect.map(summarizeStats));
+    scribe.batches(missionId, sinceIso).pipe(Effect.map(summarizeStats));
 
   const report = (request: ReportRequest) =>
     Effect.gen(function* () {
       const { missionId, kind } = request;
       const mission = yield* requireMission(missionId);
       const to = request.to ?? (yield* now);
-      const previous = yield* store.lastReport(missionId, kind);
+      const id = MissionId.make(missionId);
+      const previous = yield* scribe.lastReport(missionId, kind);
       const usablePrevious = previous !== null && previous.coversTo < to ? previous : null;
       const from =
         request.from ??
@@ -359,23 +414,24 @@ const make = Effect.gen(function* () {
       }
       const [subMissions, milestones, lanes, asks, calls, approvals, workItems, notes] =
         yield* Effect.all([
-          records.list("sub-mission", { missionId }),
-          records.list("milestone", { missionId }),
-          records.list("lane", { missionId }),
-          records.list("ask", { missionId }),
-          records.list("call", { missionId }),
-          records.list("approval", { missionId }),
-          records.list("work-item", { missionId }),
-          records.list("note", { missionId }),
+          store.list("sub-mission", { missionId: id }),
+          store.list("milestone", { missionId: id }),
+          store.list("lane", { missionId: id }),
+          store.list("ask", { missionId: id }),
+          store.list("call", { missionId: id }),
+          store.list("approval", { missionId: id }),
+          store.list("work-item", { missionId: id }),
+          recentNotes(missionId),
         ]);
-      const suggestions = yield* records.list("suggestion", { missionId });
-      const events = yield* records.eventsSince(missionId, 0, EVENT_SCAN_LIMIT);
-      const editor = yield* store.editorState(missionId);
+      const suggestions = yield* store.list("suggestion", { missionId: id });
+      // Newest first from core; reports only need the window's owner messages.
+      const events = (yield* store.recentEvents(id, EVENT_WINDOW)).toReversed();
+      const editor = yield* scribe.editorState(missionId);
       const editorLine = (editor?.payload as { readonly bottomLine?: unknown } | null)?.bottomLine;
-      const batches = yield* store.batches(missionId, from);
+      const batches = yield* scribe.batches(missionId, from);
       const usage = batches.length === 0 ? null : summarizeStats(batches);
       const updates =
-        kind === "daily" ? yield* store.reportsBetween(missionId, "update", from, to) : [];
+        kind === "daily" ? yield* scribe.reportsBetween(missionId, "update", from, to) : [];
       const built = buildReport({
         kind,
         from,
@@ -400,7 +456,7 @@ const make = Effect.gen(function* () {
         usage,
       });
       if (request.save) {
-        yield* store.saveReport({
+        yield* scribe.saveReport({
           reportId: `${missionId}|${kind}|${to}`,
           missionId,
           kind,

@@ -2,9 +2,10 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import type { Lane, Mission, MissionRecord, RoleBinding } from "@t3tools/contracts";
+import { MissionId, type Lane, type Mission, type RoleBinding } from "@t3tools/contracts";
 
-import { MissionRecords } from "./ports.ts";
+import { MissionStore } from "../store/MissionStore.ts";
+import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import { toJson } from "./ScribeStore.ts";
 
 export const MISSION_ID = "mission-crpko";
@@ -59,13 +60,26 @@ export const masterBinding = {
   endedAt: null,
 } as unknown as RoleBinding;
 
+/** Writes one record into core's store under a plain system event. */
+export const putRecord = (record: MissionStoreRecord, at = "2026-10-17T00:00:00.000Z") =>
+  Effect.gen(function* () {
+    const store = yield* MissionStore;
+    return yield* store.upsert(record, {
+      missionId: MissionId.make(MISSION_ID),
+      kind: "import.applied",
+      actor: { _tag: "system", component: "test" },
+      provenance: { _tag: "system", component: "test" },
+      summary: `seed ${record._tag}`,
+      subject: null,
+      at,
+    });
+  });
+
 /** Seeds the mission, lane and master binding into the record store. */
 export const seedMission = Effect.gen(function* () {
-  const records = yield* MissionRecords;
-  const put = (record: MissionRecord) => records.upsert(record, []);
-  yield* put({ _tag: "mission", record: mission });
-  yield* put({ _tag: "lane", record: lane });
-  yield* put({ _tag: "role-binding", record: masterBinding });
+  yield* putRecord({ _tag: "mission", record: mission });
+  yield* putRecord({ _tag: "lane", record: lane });
+  yield* putRecord({ _tag: "role-binding", record: masterBinding });
 });
 
 const filled = (
