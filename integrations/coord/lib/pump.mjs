@@ -5,11 +5,11 @@
 // At-least-once: the clientRequestId is deterministic per (thread, covered deliveries), so a resend after a
 // crash between send and mark replays the first result in Robob instead of posting twice.
 import { createHash } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { tx, get, all, run } from './db.mjs';
-import { clock, gate, DEFAULTS, releaseObserve } from './coord.mjs';
+import { clock, gate, DEFAULTS, releaseObserve, messaging } from './coord.mjs';
+import { controlConfig } from './control.mjs';
+
+export { controlConfig };
 
 const PREFIX = '/api/ardud/control';
 const MAX_ATTEMPTS = 8;
@@ -30,24 +30,6 @@ const sec = iso => (iso ? Math.floor(Date.parse(iso) / 1000) : 0);
 const heldQueue = (info, t, after = HEAL.heldQueueAfter) => info?.state === 'queued' &&
   t - Math.max(0, ...(info.recentRuns ?? []).flatMap(r => [sec(r.requestedAt), sec(r.startedAt), sec(r.completedAt)])) >= after;
 const longRun = (info, t) => info?.state === 'running' && !!info.run?.startedAt && t - sec(info.run.startedAt) >= HEAL.longRunAfter;
-
-export function controlConfig(o = {}) {
-  let url = o.url ?? process.env.T3_CONTROL_URL;
-  let token = o.token ?? process.env.T3_CONTROL_TOKEN;
-  if (!url || !token) {
-    const file = process.env.T3_CONTROL_TOKEN_FILE ?? join(homedir(), '.robob', 'ardud-control.json');
-    try {
-      if (statSync(file).mode & 0o077) throw new Error(`${file} must be chmod 600`);
-      const s = JSON.parse(readFileSync(file, 'utf8'));
-      url ??= s.url;
-      token ??= s.token;
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw e;
-    }
-  }
-  if (!url || !token) throw new Error('no control API url/token');
-  return { url: url.replace(/\/+$/, ''), token };
-}
 
 async function call(cfg, method, path, body) {
   const res = await fetch(`${cfg.url}${PREFIX}${path}`, {
@@ -347,6 +329,9 @@ async function sweep(cfg, look, queue, res) {
 export async function deliver({ cfg, limit = 50, seq, send = sendToThread, look = threadDetail, queue = queueApi, unackedAfter = DEFAULTS.unackedAfter } = {}) {
   const res = { sent: [], failed: [], retry: [], reminded: [], wakes: [], held: 0, skipped: 0, healed: 0, heals: [], stuck: [],
     superseded: 0, supersedes: [], queueErrors: [] };
+  // messaging=robob: Robob's doorbell wakes threads; coord rings nobody and leaves its own deliveries as they are.
+  const m = messaging();
+  if (m.mode === 'robob') return { ...res, messaging: { mode: m.mode, mission: m.mission } };
   cfg ??= controlConfig();
   const one = seq == null ? null : Number(seq);
   if (one == null) await sweep(cfg, look, queue, res);

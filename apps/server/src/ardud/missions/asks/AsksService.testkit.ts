@@ -1,0 +1,217 @@
+// Shared fixtures for missions asks tests (service and MCP tools).
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import {
+  LaneId,
+  MissionError,
+  MissionId,
+  ProviderInstanceId,
+  RoleBindingId,
+  RoleId,
+  ThreadId,
+  WorkItemId,
+  type Lane,
+  type Mission,
+  type MissionProvenance,
+  type Role,
+  type RoleBinding,
+  type RoleKind,
+  type WorkItem,
+} from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+
+import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as MissionService from "../MissionService.ts";
+import * as MissionStore from "../store/MissionStore.ts";
+import * as AsksService from "./AsksService.ts";
+import * as Inbound from "./inbound.ts";
+import * as Ports from "./ports.ts";
+import type { InboundMessage } from "./provenance.ts";
+
+export const at = "2026-10-17T08:00:00.000Z";
+export const missionId = MissionId.make("m-1");
+export const masterThread = ThreadId.make("t-master");
+export const laneThread = ThreadId.make("t-lane");
+export const writerThread = ThreadId.make("t-writer");
+export const strayThread = ThreadId.make("t-stray");
+
+export const ownerApp: MissionProvenance = { _tag: "owner-app", surface: "web", sessionId: "s-1" };
+export const agent = (threadId: ThreadId): MissionProvenance => ({
+  _tag: "agent",
+  threadId,
+  roleId: null,
+});
+export const governor: MissionProvenance = { _tag: "system", component: "governor" };
+
+export const mission: Mission = {
+  id: missionId,
+  slug: "m-1",
+  title: "Mission one",
+  goal: "Ship it",
+  status: "active",
+  tier: "P1",
+  weight: 1,
+  guaranteedShare: 0.2,
+  borrowCeiling: 0.5,
+  projectId: null,
+  masterRoleId: RoleId.make("role-master"),
+  focusSubMissionId: null,
+  health: "unknown",
+  lockedFields: [],
+  createdAt: at,
+  updatedAt: at,
+};
+
+export const role = (id: string, kind: RoleKind, laneId: LaneId | null = null): Role => ({
+  id: RoleId.make(id),
+  missionId,
+  kind,
+  name: id,
+  description: "",
+  modelSelection: { instanceId: ProviderInstanceId.make("opencode"), model: "opus" },
+  pendingModelSelection: null,
+  laneId,
+  writesPublicText: true,
+  lockedFields: [],
+  createdAt: at,
+  updatedAt: at,
+});
+
+export const binding = (id: string, roleId: string, threadId: ThreadId): RoleBinding => ({
+  id: RoleBindingId.make(id),
+  roleId: RoleId.make(roleId),
+  threadId,
+  reason: "initial",
+  handoffNote: null,
+  observedModel: null,
+  boundAt: at,
+  endedAt: null,
+});
+
+export const lane: Lane = {
+  id: LaneId.make("lane-api"),
+  missionId,
+  subMissionId: null,
+  name: "API",
+  purpose: "",
+  status: "working",
+  statusReason: null,
+  leadRoleId: null,
+  threadId: laneThread,
+  currentItemId: null,
+  lastEvidence: null,
+  context: null,
+  lastActiveAt: null,
+  createdAt: at,
+  updatedAt: at,
+};
+
+export const item = (id: string): WorkItem => ({
+  id: WorkItemId.make(id),
+  missionId,
+  subMissionId: null,
+  laneId: lane.id,
+  milestoneId: null,
+  title: `Item ${id}`,
+  kind: "ticket",
+  stage: "pr",
+  heldBy: null,
+  blockedBy: [],
+  dependsOn: [],
+  pullRequest: null,
+  links: [],
+  facts: { mergedAtHead: null, deployedReadback: null, exercised: null },
+  createdAt: at,
+  updatedAt: at,
+});
+
+export interface Delivery {
+  readonly threadId: ThreadId;
+  readonly text: string;
+  readonly asOwner: boolean;
+}
+
+export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
+  const deliveries: Delivery[] = [];
+  const forks: Array<{ readonly sourceThreadId: ThreadId; readonly title: string }> = [];
+  const threads = Layer.succeed(
+    Ports.AsksThreads,
+    Ports.AsksThreads.of({
+      fork: ({ sourceThreadId, title, key }) =>
+        Effect.sync(() => {
+          forks.push({ sourceThreadId, title });
+          return ThreadId.make(`fork-thread-${key}`);
+        }),
+      deliver: ({ threadId, text, asOwner }) =>
+        Effect.sync(() => {
+          deliveries.push({ threadId, text, asOwner });
+        }),
+    }),
+  );
+  const lookup = Layer.succeed(
+    Inbound.InboundLookup,
+    Inbound.InboundLookup.of({
+      find: (id) => Effect.succeed(inbound.find((message) => message.id === id) ?? null),
+    }),
+  );
+  const layer = Layer.mergeAll(AsksService.layer, MissionService.layer).pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(
+        MissionStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)),
+        lookup,
+        Ports.signalsDeliver.pipe(Layer.provideMerge(threads)),
+        Ports.roomsPending,
+        Ports.appliersPending,
+        NodeServices.layer,
+      ),
+    ),
+  );
+  return { deliveries, forks, layer };
+};
+
+export const seed = Effect.gen(function* () {
+  const store = yield* MissionStore.MissionStore;
+  yield* store.commit({
+    event: {
+      missionId,
+      kind: "mission.created",
+      actor: { _tag: "system", component: "test" },
+      provenance: { _tag: "system", component: "test" },
+      summary: "seed",
+      subject: null,
+    },
+    upserts: [
+      { _tag: "mission", record: mission },
+      { _tag: "role", record: role("role-master", "master") },
+      { _tag: "role", record: role("role-writer", "writer") },
+      { _tag: "role-binding", record: binding("b-master", "role-master", masterThread) },
+      { _tag: "role-binding", record: binding("b-writer", "role-writer", writerThread) },
+      { _tag: "lane", record: lane },
+      { _tag: "work-item", record: item("wi-held") },
+      { _tag: "work-item", record: item("wi-free") },
+    ],
+  });
+});
+
+export const askInput = (question: string, extra: Record<string, unknown> = {}) => ({
+  missionId,
+  question,
+  context: "Two ways to run the migration.",
+  options: [
+    { id: "a", label: "Online", detail: "" },
+    { id: "b", label: "Offline window", detail: "" },
+  ],
+  recommendation: { optionId: "a", reason: "No downtime." },
+  blocks: [
+    { kind: "work-item", id: "wi-held" },
+    { kind: "lane", id: "lane-api" },
+  ],
+  costOfWaiting: "The migration lane idles.",
+  ...extra,
+});
+
+export const failureCode = <A, R>(effect: Effect.Effect<A, MissionError, R>) =>
+  effect.pipe(
+    Effect.flip,
+    Effect.map((error) => error.code),
+  );
