@@ -123,6 +123,10 @@ import { SettingsProjectGroupingRouteScreen } from "./features/settings/Settings
 import { SettingsProjectOverviewRouteScreen } from "./features/settings/SettingsProjectOverviewRouteScreen";
 import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
+// ardud missions: ui-mobile
+import { MissionOverviewRouteScreen } from "./ardud/missions/MissionOverviewRouteScreen";
+import { MissionsRouteScreen } from "./ardud/missions/MissionsRouteScreen";
+// end ardud missions: ui-mobile
 import { SettingsAboutRouteScreen } from "./features/settings/SettingsAboutRouteScreen";
 import { SettingsNotificationsRouteScreen } from "./features/settings/SettingsNotificationsRouteScreen";
 import { SettingsRouteScreen } from "./features/settings/SettingsRouteScreen";
@@ -791,6 +795,18 @@ const RootStackConfig = createWorkspaceStackNavigator({
       linking: THREAD_LINKING_PREFIX,
       options: GLASS_HEADER_OPTIONS,
     }),
+    // ardud missions: ui-mobile
+    Missions: createNativeStackScreen({
+      screen: MissionsRouteScreen,
+      linking: "missions",
+      options: { ...GLASS_HEADER_OPTIONS, title: "Missions" },
+    }),
+    MissionOverview: createNativeStackScreen({
+      screen: MissionOverviewRouteScreen,
+      linking: "missions/:missionId",
+      options: { ...GLASS_HEADER_OPTIONS, title: "Mission" },
+    }),
+    // end ardud missions: ui-mobile
     ThreadTerminal: createNativeStackScreen({
       screen: ThreadTerminalRouteScreen,
       linking: `${THREAD_LINKING_PREFIX}/terminal`,
