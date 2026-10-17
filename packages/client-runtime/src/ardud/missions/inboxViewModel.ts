@@ -687,3 +687,41 @@ export function fyiView(note: Note): FyiView {
     sourceEvent: source?.fromEvent ?? null,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Keyboard
+
+/** What a key press does in the inbox list. */
+export type InboxKeyAction =
+  | { readonly type: "move"; readonly delta: 1 | -1 }
+  | { readonly type: "pick-option"; readonly optionId: string }
+  | { readonly type: "edit" };
+
+export interface InboxKeyInput {
+  readonly key: string;
+  /** Ctrl, Meta or Alt held: leave the key to the browser and the app. */
+  readonly modified: boolean;
+  /** Focus is in a text field: typing never triggers inbox actions. */
+  readonly typing: boolean;
+  readonly selected: InboxEntry | null;
+}
+
+/**
+ * j/k move, 1-9 pick that option on the selected ask, e opens the editor on
+ * the selected draft or knock. A number only picks; the owner still sends.
+ */
+export function inboxKeyAction(input: InboxKeyInput): InboxKeyAction | null {
+  if (input.modified || input.typing) return null;
+  if (input.key === "j") return { type: "move", delta: 1 };
+  if (input.key === "k") return { type: "move", delta: -1 };
+  const selected = input.selected;
+  if (selected === null) return null;
+  if (input.key === "e") {
+    return selected.kind === "draft" || selected.kind === "knock" ? { type: "edit" } : null;
+  }
+  if (selected.kind === "ask" && /^[1-9]$/.test(input.key)) {
+    const option = selected.record.options[Number(input.key) - 1];
+    return option ? { type: "pick-option", optionId: option.id } : null;
+  }
+  return null;
+}

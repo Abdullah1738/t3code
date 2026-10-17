@@ -1,6 +1,6 @@
 import { memo, useCallback, useMemo, useState } from "react";
-import { Link, useParams } from "@tanstack/react-router";
-import { ChevronRightIcon } from "lucide-react";
+import { Link, useLocation, useParams } from "@tanstack/react-router";
+import { ChevronRightIcon, InboxIcon } from "lucide-react";
 import * as Schema from "effect/Schema";
 
 import type { Lane, MissionId, MissionListItem } from "@t3tools/contracts";
@@ -10,6 +10,7 @@ import {
   healthLabel,
   sortLanesProblemsFirst,
   splitQuietLanes,
+  totalNeedsYou,
   type LaneFold,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -75,6 +76,7 @@ export function MissionsSidebarGroup() {
       </div>
       {expanded ? (
         <ul className="flex flex-col gap-0.5">
+          <InboxRow count={totalNeedsYou(missions)} onNavigate={closeMobileSidebar} />
           {missions.map((mission) => (
             <MissionSidebarRow
               key={mission.id}
@@ -187,6 +189,33 @@ const MissionSidebarRow = memo(function MissionSidebarRow(props: {
     </li>
   );
 });
+
+/** Top row of the group: the all-missions inbox and everything waiting on the owner. */
+function InboxRow(props: { count: number; onNavigate: () => void }) {
+  const isActive = useLocation({ select: (location) => location.pathname === "/missions/inbox" });
+  return (
+    <li>
+      <Link
+        to="/missions/inbox"
+        onClick={props.onNavigate}
+        aria-current={isActive ? "page" : undefined}
+        className={cn(
+          rowClassName,
+          "gap-2 ps-2 pe-1 text-sm font-medium text-sidebar-foreground",
+          isActive ? "bg-sidebar-row-active" : "hover:bg-sidebar-row-hover",
+        )}
+      >
+        <InboxIcon aria-hidden className="size-3.5 shrink-0 text-sidebar-muted-foreground" />
+        <span className="min-w-0 flex-1 truncate">Inbox</span>
+        {props.count > 0 ? (
+          <span className="shrink-0 text-2xs font-medium text-warning-foreground tabular-nums">
+            {badgeCount(props.count)}
+          </span>
+        ) : null}
+      </Link>
+    </li>
+  );
+}
 
 function NeedsYouLink(props: { missionId: MissionId; count: number; onNavigate: () => void }) {
   if (props.count === 0) return null;

@@ -186,6 +186,11 @@ export function needsYouLine(
   return parts.length === 0 ? null : parts.join(", ");
 }
 
+/** Everything waiting on the owner across missions: the sidebar Inbox row count. */
+export function totalNeedsYou(missions: ReadonlyArray<{ readonly needsYou: number }>): number {
+  return missions.reduce((total, mission) => total + mission.needsYou, 0);
+}
+
 export function badgeCount(count: number, cap = 99): string {
   return count > cap ? `${cap}+` : String(count);
 }

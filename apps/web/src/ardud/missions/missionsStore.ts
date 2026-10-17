@@ -1,16 +1,24 @@
 import { useSyncExternalStore } from "react";
 
 import type {
+  DraftNote,
   Lane,
   MissionId,
   MissionInbox,
   MissionListSnapshot,
-  MissionOverview,
+  RoomId,
+  RoomPage,
+  Rule,
+  SuggestionStats,
 } from "@t3tools/contracts";
 import {
   createFixtureMissionsSource,
   createKeyedSnapshotStores,
   createSnapshotStore,
+  type MissionForkEntry,
+  type MissionInboxHistory,
+  type MissionOverviewSnapshot,
+  type MissionRoomEntry,
   type MissionsSource,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -23,14 +31,35 @@ export const missionsSource: MissionsSource = createFixtureMissionsSource({ surf
 const listStore = createSnapshotStore<MissionListSnapshot>((emit) =>
   missionsSource.subscribeList(emit),
 );
-const overviewStores = createKeyedSnapshotStores<MissionId, MissionOverview | null>((id, emit) =>
-  missionsSource.subscribeOverview(id, emit),
+const overviewStores = createKeyedSnapshotStores<MissionId, MissionOverviewSnapshot | null>(
+  (id, emit) => missionsSource.subscribeOverview(id, emit),
 );
 const laneStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Lane>>((id, emit) =>
   missionsSource.subscribeLanes(id, emit),
 );
 const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInbox>((id, emit) =>
   missionsSource.subscribeInbox(id, emit),
+);
+const historyStores = createKeyedSnapshotStores<MissionId | null, MissionInboxHistory>((id, emit) =>
+  missionsSource.subscribeInboxHistory(id, emit),
+);
+const draftNoteStores = createKeyedSnapshotStores<MissionId | null, ReadonlyArray<DraftNote>>(
+  (id, emit) => missionsSource.subscribeDraftNotes(id, emit),
+);
+const statsStore = createSnapshotStore<ReadonlyArray<SuggestionStats>>((emit) =>
+  missionsSource.subscribeSuggestionStats(emit),
+);
+const forkStores = createKeyedSnapshotStores<MissionId | null, ReadonlyArray<MissionForkEntry>>(
+  (id, emit) => missionsSource.subscribeForks(id, emit),
+);
+const ruleStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Rule>>((id, emit) =>
+  missionsSource.subscribeRules(id, emit),
+);
+const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<MissionRoomEntry>>(
+  (id, emit) => missionsSource.subscribeRooms(id, emit),
+);
+const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit) =>
+  missionsSource.subscribeRoom(id, emit),
 );
 
 /** `undefined` until the source has answered once. */
@@ -39,7 +68,9 @@ export function useMissionList(): MissionListSnapshot | undefined {
 }
 
 /** `undefined` while loading, `null` when the mission does not exist. */
-export function useMissionOverview(missionId: MissionId): MissionOverview | null | undefined {
+export function useMissionOverview(
+  missionId: MissionId,
+): MissionOverviewSnapshot | null | undefined {
   const store = overviewStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
 }
@@ -54,6 +85,51 @@ export function useMissionInbox(missionId: MissionId | null): MissionInbox | und
   const store = inboxStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
 }
+
+/** What the owner decided in the last day, newest first. */
+export function useMissionInboxHistory(
+  missionId: MissionId | null,
+): MissionInboxHistory | undefined {
+  const store = historyStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** Draft notes that apply to the mission, including global ones. */
+export function useDraftNotes(missionId: MissionId | null): ReadonlyArray<DraftNote> | undefined {
+  const store = draftNoteStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function useSuggestionStats(): ReadonlyArray<SuggestionStats> | undefined {
+  return useSyncExternalStore(statsStore.subscribe, statsStore.get);
+}
+
+/** Forks of the master, newest first. */
+export function useMissionForks(
+  missionId: MissionId | null,
+): ReadonlyArray<MissionForkEntry> | undefined {
+  const store = forkStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function useMissionRules(missionId: MissionId): ReadonlyArray<Rule> | undefined {
+  const store = ruleStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function useMissionRooms(missionId: MissionId): ReadonlyArray<MissionRoomEntry> | undefined {
+  const store = roomListStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** The newest page of one room; older pages load through the source. */
+export function useRoomPage(roomId: RoomId | null): RoomPage | null | undefined {
+  const store = roomStores(roomId ?? NO_ROOM);
+  const page = useSyncExternalStore(store.subscribe, store.get);
+  return roomId === null ? null : page;
+}
+
+const NO_ROOM = "" as RoomId;
 
 /** A mission error's detail, or a plain fallback for anything else. */
 export function missionErrorMessage(error: unknown): string {

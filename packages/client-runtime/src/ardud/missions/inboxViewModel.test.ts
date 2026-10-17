@@ -16,6 +16,7 @@ import {
   fyiView,
   groupDraftNotes,
   inboxEntries,
+  inboxKeyAction,
   keepSelection,
   moveSelection,
   openForkFor,
@@ -397,5 +398,36 @@ describe("forks and FYI", () => {
       quote: "fix open at b5bf7044",
       sourceEvent: 10204,
     });
+  });
+});
+
+describe("inbox keys", () => {
+  const askEntry = () => {
+    const record = ask();
+    return { kind: "ask" as const, key: `ask:${record.id}`, record };
+  };
+
+  it("moves with j/k and ignores keys while typing or with modifiers", () => {
+    expect(inboxKeyAction({ key: "j", modified: false, typing: false, selected: null })).toEqual({
+      type: "move",
+      delta: 1,
+    });
+    expect(inboxKeyAction({ key: "k", modified: false, typing: true, selected: null })).toBeNull();
+    expect(inboxKeyAction({ key: "j", modified: true, typing: false, selected: null })).toBeNull();
+  });
+
+  it("picks an ask option by number without sending it", () => {
+    const entry = askEntry();
+    const first = entry.record.options[0]!;
+    expect(inboxKeyAction({ key: "1", modified: false, typing: false, selected: entry })).toEqual({
+      type: "pick-option",
+      optionId: first.id,
+    });
+    expect(
+      inboxKeyAction({ key: "9", modified: false, typing: false, selected: entry }),
+    ).toBeNull();
+    expect(
+      inboxKeyAction({ key: "e", modified: false, typing: false, selected: entry }),
+    ).toBeNull();
   });
 });

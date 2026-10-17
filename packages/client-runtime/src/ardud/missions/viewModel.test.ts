@@ -24,6 +24,7 @@ import {
   sortLanesProblemsFirst,
   splitFeed,
   splitQuietLanes,
+  totalNeedsYou,
   usageView,
 } from "./viewModel.ts";
 
@@ -137,6 +138,11 @@ describe("health and needs-you", () => {
     expect(counts.total).toBe(4);
     expect(needsYouLine(counts)).toBe("2 decisions, 1 to approve, 1 knock");
     expect(needsYouLine({ decide: 0, approve: 0, knocks: 0 })).toBeNull();
+  });
+
+  it("adds every mission's needs-you count for the inbox row", () => {
+    expect(totalNeedsYou([{ needsYou: 8 }, { needsYou: 0 }, { needsYou: 3 }])).toBe(11);
+    expect(totalNeedsYou([])).toBe(0);
   });
 });
 
