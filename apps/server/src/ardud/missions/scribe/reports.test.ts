@@ -184,7 +184,7 @@ const base: ReportInput = {
     open: [
       { ref: "ask:ask-wording", label: "Withdrawal wording", since: "2026-10-17T03:00:00.000Z" },
       { ref: "ask:ask-kafka", label: "Kafka phase 2 go", since: "2026-10-17T03:00:00.000Z" },
-      { ref: "note:note-gone", label: "Something removed", since: "2026-10-17T03:00:00.000Z" },
+      { ref: "note:note-gone", label: "Something removed.", since: "2026-10-17T03:00:00.000Z" },
     ],
   },
   updates: [],

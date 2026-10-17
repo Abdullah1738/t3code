@@ -107,6 +107,10 @@ const sentence = (text: string) => {
   return /[.!?:]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 };
 
+/** One "Left hanging" line; the label is bold and ends with a colon, so drop its own full stop. */
+const hangingLine = (input: ReportInput, item: OpenItem) =>
+  `- **${item.label.trim().replace(/[.:]+$/, "")}:** ${resolveOpenItem(input, item)}`;
+
 const isOwnerProvenance = (provenance: { readonly _tag: string } | null | undefined) =>
   provenance?._tag === "owner-app" || provenance?._tag === "owner-imessage";
 
@@ -454,9 +458,7 @@ export const buildUpdate = (input: ReportInput): BuiltReport => {
   const waiting = waitingOnOwner(v);
   const mismatches = mismatchLines(v);
   const worth = rankFyi(v.windowNotes, { limit: 8 }).map((note) => noteLine(v, note));
-  const hanging = (input.previous?.open ?? []).map(
-    (item) => `- **${item.label}:** ${resolveOpenItem(input, item)}`,
-  );
+  const hanging = (input.previous?.open ?? []).map((item) => hangingLine(input, item));
   const failedCitations = input.notes.filter(
     (note) => note.citation === "failed" && inWindow(note.createdAt, input.from, input.to),
   ).length;
@@ -604,9 +606,7 @@ export const buildDaily = (input: ReportInput): BuiltReport => {
   for (const update of input.updates) {
     for (const item of update.open) hangingSeen.set(item.ref, item);
   }
-  const hanging = [...hangingSeen.values()].map(
-    (item) => `- **${item.label}:** ${resolveOpenItem(input, item)}`,
-  );
+  const hanging = [...hangingSeen.values()].map((item) => hangingLine(input, item));
   const failedCitations = input.notes.filter(
     (note) => note.citation === "failed" && inWindow(note.createdAt, input.from, input.to),
   ).length;
