@@ -12,16 +12,7 @@ import type { Ask, Lane, LaneCounts, Milestone, MissionHealth } from "@t3tools/c
  * - unknown: nothing to judge yet.
  */
 
-const RANK: Record<MissionHealth, number> = { unknown: 0, green: 1, amber: 2, red: 3 };
 const CONTEXT_WARN_RATIO = 0.85;
-
-export const worstHealth = (values: Iterable<MissionHealth>): MissionHealth => {
-  let worst: MissionHealth = "unknown";
-  for (const value of values) {
-    if (RANK[value] > RANK[worst]) worst = value;
-  }
-  return worst;
-};
 
 export interface HealthInputs {
   readonly lanes: ReadonlyArray<Lane>;

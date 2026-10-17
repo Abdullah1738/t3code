@@ -30,8 +30,7 @@ const UNLOCKABLE_FIELDS: ReadonlySet<string> = new Set([
 /** Fields that never count as a change when comparing two versions. */
 const BOOKKEEPING_FIELDS: ReadonlySet<string> = new Set(["updatedAt", "lockedFields"]);
 
-export const isAgentProvenance = (provenance: MissionProvenance): boolean =>
-  provenance._tag === "agent";
+const isAgentProvenance = (provenance: MissionProvenance): boolean => provenance._tag === "agent";
 
 export const sameValue = (left: unknown, right: unknown): boolean => {
   if (left === right) return true;
