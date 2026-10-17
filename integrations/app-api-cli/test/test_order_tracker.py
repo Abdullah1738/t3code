@@ -24,6 +24,13 @@ class TrackerTest(unittest.TestCase):
             self.assertNotEqual(t.classify(text), 'delivered')
         self.assertEqual(t.classify('Your order has been delivered'), 'delivered')
 
+    def test_poll_interval_backs_off_while_eta_is_far(self):
+        now = time.time()
+        self.assertEqual(t.poll_interval(t.stamp(now + 7 * 3600), now), 900)
+        self.assertEqual(t.poll_interval(t.stamp(now + 2 * 3600), now), 300)
+        self.assertEqual(t.poll_interval(t.stamp(now + 1800), now), 60)
+        self.assertEqual(t.poll_interval(None, now), 60)
+
     def test_notification_identity_and_age(self):
         cfg = self.cfg()
         def dump(text, timestamp=None):

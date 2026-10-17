@@ -79,6 +79,19 @@ def quiet_error(error):
             or 'timeout' in family or 'deadline' in family)
 
 
+def poll_interval(eta, now=None):
+    """Seconds between checks: sparser while the promised ETA is far away."""
+    try:
+        remaining = epoch(eta) - (time.time() if now is None else now)
+    except (AttributeError, TypeError, ValueError):
+        return 60
+    if remaining > 6 * 3600:
+        return 900
+    if remaining > 3600:
+        return 300
+    return 60
+
+
 def eta_open(cfg, result, now, state=None):
     """True while the latest promised arrival (plus grace) is still ahead."""
     etas = []
@@ -900,7 +913,7 @@ def main(argv=None):
             # slow or failed prime is retried on schedule once the watcher exists.
             try:
                 print(run(['robob-watch', 'add', '--id', wid, '--title', f'{app} {args.order} delivery ({cfg["for"]})',
-                           '--check', command, '--interval', '60', '--mode', 'wake', '--expires', args.expires,
+                           '--check', command, '--interval', str(poll_interval(args.eta)), '--mode', 'wake', '--expires', args.expires,
                            '--max-fires', '0', '--session', args.session, '--context', context], 80))
             except (RuntimeError, subprocess.TimeoutExpired):
                 if not watchpath.exists():
