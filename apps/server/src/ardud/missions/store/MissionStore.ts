@@ -41,6 +41,8 @@ import {
  * - `ardud_mission_events`: the append-only timeline, one row per commit.
  * - `ardud_mission_counters`: per-mission `seq` (`mission:<id>`) and the global
  *   list `revision`, bumped in the same transaction as the writes.
+ * - `ardud_mission_owner_looks`: when the owner last opened each mission. Not a
+ *   timeline item, so it bypasses the event log.
  */
 const DDL = [
   `CREATE TABLE IF NOT EXISTS ardud_mission_records (
@@ -68,6 +70,10 @@ const DDL = [
   `CREATE TABLE IF NOT EXISTS ardud_mission_counters (
     scope TEXT PRIMARY KEY,
     value INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ardud_mission_owner_looks (
+    mission_id TEXT PRIMARY KEY,
+    looked_at TEXT NOT NULL
   )`,
 ];
 
@@ -166,6 +172,8 @@ export class MissionStore extends Context.Service<
     ) => Effect.Effect<ReadonlyArray<MissionEvent>, MissionError>;
     readonly latestSeq: (missionId: MissionId) => Effect.Effect<number>;
     readonly revision: Effect.Effect<number>;
+    readonly ownerLastLookedAt: (missionId: MissionId) => Effect.Effect<string | null>;
+    readonly markOwnerLooked: (missionId: MissionId, at: string) => Effect.Effect<void>;
     /**
      * Committed changes in commit order: each commit's record upserts and
      * removes, then its `event` upsert, all with the same (missionId, seq).
@@ -417,6 +425,19 @@ const make = Effect.gen(function* () {
     recentEvents,
     latestSeq: (missionId) => readCounter(`mission:${missionId}`),
     revision: readCounter(REVISION_SCOPE),
+    ownerLastLookedAt: (missionId) =>
+      sql<{ readonly lookedAt: string }>`
+        SELECT looked_at AS "lookedAt" FROM ardud_mission_owner_looks WHERE mission_id = ${missionId}
+      `.pipe(
+        Effect.map((rows) => rows[0]?.lookedAt ?? null),
+        NodeSqliteClient.readOnly,
+        Effect.orDie,
+      ),
+    markOwnerLooked: (missionId, at) =>
+      sql`
+        INSERT INTO ardud_mission_owner_looks (mission_id, looked_at) VALUES (${missionId}, ${at})
+        ON CONFLICT (mission_id) DO UPDATE SET looked_at = excluded.looked_at
+      `.pipe(Effect.asVoid, Effect.orDie),
     subscribe: PubSub.subscribe(changes),
   });
 });
