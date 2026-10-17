@@ -475,6 +475,29 @@ export const BroadcastReceipt = Schema.Struct({
 });
 export type BroadcastReceipt = typeof BroadcastReceipt.Type;
 
+// --- coord additions ---
+/**
+ * The coord event a message mirrors: imported history, or a post that came in
+ * through the coord forward shim. Keeps the coord-only fields so the shim can
+ * answer `coord inbox` with the same rows coord itself returned.
+ */
+export const CoordEventRef = Schema.Struct({
+  /** coord channel id (control, release, arch, observe, delivery). */
+  channel: TrimmedNonEmptyString,
+  /** coord actor id that posted it. */
+  sender: TrimmedNonEmptyString,
+  /** coord's canonical sha256 of the post fields; same key + other hash = conflict. */
+  bodyHash: Schema.NullOr(Schema.String),
+  workId: Schema.NullOr(Schema.String),
+  environment: Schema.NullOr(Schema.String),
+  expectedRevision: Schema.NullOr(Schema.String),
+  authorityRef: Schema.NullOr(Schema.String),
+  /** coord seq this replies to. */
+  replyTo: Schema.NullOr(NonNegativeInt),
+});
+export type CoordEventRef = typeof CoordEventRef.Type;
+// --- end coord additions ---
+
 /** List shape of a room message. `body` loads on open via a separate call. */
 export const MissionMessage = Schema.Struct({
   id: MissionMessageId,
@@ -498,6 +521,10 @@ export const MissionMessage = Schema.Struct({
   /** Owner post marked "correct the master": the scribe offers it as a rule. */
   isCorrection: Schema.Boolean,
   createdAt: IsoDateTime,
+  // --- coord additions ---
+  /** Set when the message mirrors a coord event (import or forward shim). */
+  coord: Schema.optional(CoordEventRef),
+  // --- end coord additions ---
 });
 export type MissionMessage = typeof MissionMessage.Type;
 
@@ -1153,6 +1180,26 @@ export const WorkStage = Schema.Literals([
 ]);
 export type WorkStage = typeof WorkStage.Type;
 
+// --- coord additions ---
+/** A deferred item: parked work that comes back when its trigger fires. */
+export const WorkItemDeferral = Schema.Struct({
+  /** Id in the deferral register it came from, e.g. `DF-12`. */
+  registerId: TrimmedNonEmptyString,
+  status: Schema.Literals(["deferred", "fired", "done", "closed"]),
+  /** The deferred work in full, as written; `title` is its first line. */
+  what: Schema.String,
+  /** Who deferred it and when, as written. */
+  deferredBy: Schema.String,
+  why: Schema.String,
+  /** What brings it back. */
+  trigger: Schema.String,
+  source: Schema.String,
+  /** Later updates and outcomes, as written. */
+  notes: Schema.Array(Schema.String),
+});
+export type WorkItemDeferral = typeof WorkItemDeferral.Type;
+// --- end coord additions ---
+
 /** Done is three facts: merged at the exact head, deployed and read back, behaviour exercised. */
 export const WorkItem = Schema.Struct({
   id: WorkItemId,
@@ -1179,6 +1226,10 @@ export const WorkItem = Schema.Struct({
   }),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- coord additions ---
+  /** Set for deferred items; `stage` stays where the work was parked. */
+  deferral: Schema.optional(WorkItemDeferral),
+  // --- end coord additions ---
 });
 export type WorkItem = typeof WorkItem.Type;
 
@@ -1239,6 +1290,12 @@ export const MissionEventKind = Schema.Literals([
   "ask.answered",
   "ask.withdrawn",
   "call.made",
+  // --- scribe additions ---
+  /** The scribe (or editor/master) recorded a note; subject is the note. */
+  "note.recorded",
+  /** The editor refreshed the bottom line, FYI ranking and feed. */
+  "editor.updated",
+  // --- end scribe additions ---
   "rule.created",
   "rule.updated",
   "rule.retired",
@@ -1267,6 +1324,13 @@ export const MissionEventKind = Schema.Literals([
   "approval.decided",
   "fork.opened",
   "fork.closed",
+  // --- asks additions ---
+  "ask.superseded",
+  "ask.reopened",
+  "call.reacted",
+  "draft-note.updated",
+  "note.acked",
+  // --- end asks additions ---
   "field.locked",
   "field.unlocked",
   "governor.action",
@@ -1780,6 +1844,81 @@ export const UpsertRuleInput = Schema.Struct({
   status: Schema.optional(RuleStatus),
 });
 export type UpsertRuleInput = typeof UpsertRuleInput.Type;
+
+// --- asks additions ---
+
+/** The asker or the owner takes an open ask back; what it held is released. */
+export const WithdrawAskInput = Schema.Struct({
+  askId: AskId,
+  reason: Schema.String,
+});
+export type WithdrawAskInput = typeof WithdrawAskInput.Type;
+
+/** Owner-only: an answered ask goes back to open (the way out of an answer). */
+export const ReopenAskInput = Schema.Struct({
+  askId: AskId,
+  reason: Schema.String,
+});
+export type ReopenAskInput = typeof ReopenAskInput.Type;
+
+/** Owner-only reaction to a master's call in the direction check; null clears it. */
+export const ReactToCallInput = Schema.Struct({
+  callId: CallId,
+  reaction: Schema.NullOr(Schema.Literals(["ok", "discuss", "overruled"])),
+  note: Schema.optional(Schema.String),
+});
+export type ReactToCallInput = typeof ReactToCallInput.Type;
+
+/** Owner-only: write, edit or retire a draft note. */
+export const SaveDraftNoteInput = Schema.Struct({
+  noteId: Schema.optional(DraftNoteId),
+  missionId: Schema.NullOr(MissionId),
+  scope: DraftNoteScope,
+  text: TrimmedNonEmptyString,
+  active: Schema.optional(Schema.Boolean),
+});
+export type SaveDraftNoteInput = typeof SaveDraftNoteInput.Type;
+
+/** Owner-only: an approved or dropped draft goes back to pending. */
+export const ReopenDraftInput = Schema.Struct({
+  draftId: DraftId,
+});
+export type ReopenDraftInput = typeof ReopenDraftInput.Type;
+
+/** Owner-only: a dismissed suggestion goes back to open. */
+export const ReopenSuggestionInput = Schema.Struct({
+  suggestionId: SuggestionId,
+});
+export type ReopenSuggestionInput = typeof ReopenSuggestionInput.Type;
+
+/**
+ * Fork the master's thread at its latest stable point: Discuss on a card, or
+ * a side question answered from the master's context without disturbing it.
+ */
+export const StartForkInput = Schema.Struct({
+  missionId: MissionId,
+  kind: Schema.Literals(["discuss", "dev-question", "owner-question"]),
+  origin: Schema.NullOr(Schema.Union([MissionRecordRef, MissionLink])),
+  question: Schema.optional(TrimmedNonEmptyString),
+});
+export type StartForkInput = typeof StartForkInput.Type;
+
+/** A fork ends with one line for the master; only the owner can say it commits the mission. */
+export const CloseForkInput = Schema.Struct({
+  forkId: ForkId,
+  summaryLine: TrimmedNonEmptyString,
+  commitsMission: Schema.optional(Schema.Boolean),
+});
+export type CloseForkInput = typeof CloseForkInput.Type;
+
+/** Owner-only fork follow-ups: mark an answered fork as committing, archive it, or reopen it. */
+export const UpdateForkInput = Schema.Struct({
+  forkId: ForkId,
+  action: Schema.Literals(["commits-mission", "archive", "reopen"]),
+});
+export type UpdateForkInput = typeof UpdateForkInput.Type;
+
+// --- end asks additions ---
 
 // ---------------------------------------------------------------------------
 // Errors

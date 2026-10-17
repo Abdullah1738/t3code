@@ -52,6 +52,9 @@ import * as WorktreeMcpService from "./WorktreeMcpService.ts";
 import * as ContextResetHandlers from "../ardud/context-reset/handlers.ts";
 import * as ContextResetService from "../ardud/context-reset/ContextResetService.ts";
 import { ContextResetToolkit } from "../ardud/context-reset/tools.ts";
+// ardud missions: asks
+import * as MissionsHandlers from "../ardud/missions/tools/handlers.ts";
+import { MissionsToolkit } from "../ardud/missions/tools/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -824,6 +827,11 @@ const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,
   WorktreeHandlers.layer,
 ).pipe(Layer.provide(WorktreeMcpService.layer));
+// ardud missions: asks (AsksService comes from ArdudMissionsLive in server.ts)
+const layerMissionsToolkitRegistration = toolkitRegistration(
+  MissionsToolkit,
+  MissionsHandlers.layer,
+);
 const layerContextResetToolkitRegistration = toolkitRegistration(
   ContextResetToolkit,
   ContextResetHandlers.layer,
@@ -884,6 +892,8 @@ export const layer = Layer.mergeAll(
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,
   layerContextResetToolkitRegistration,
+  // ardud missions: asks
+  layerMissionsToolkitRegistration,
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,
