@@ -10,6 +10,7 @@ import {
   ReviewStageId,
   type Role,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "@effect/vitest";
 
 import { ASTRA_XHIGH, SOL_XHIGH, sameModel } from "./models.ts";
@@ -36,7 +37,10 @@ const owner: MissionActor = { _tag: "owner" };
 const roles = defaultMissionRoles(missionId, "2026-10-17T00:00:00.000Z");
 
 let clock = 0;
-const tick = () => new Date(Date.UTC(2026, 9, 17, 1, 0, clock++)).toISOString();
+const tick = () =>
+  DateTime.formatIso(
+    DateTime.add(DateTime.makeUnsafe("2026-10-17T01:00:00.000Z"), { seconds: clock++ }),
+  );
 
 function record(
   stageId: ReviewRecord["stageId"],
