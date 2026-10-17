@@ -9,10 +9,15 @@ import {
   MissionId,
   MissionLink,
   MissionRecordRef,
+  MissionMutationResult,
   NoteId,
   OrchestratorMcpFailure,
   PostMessageInput,
   TrimmedNonEmptyString,
+  UpsertLaneInput,
+  UpsertMilestoneInput,
+  UpsertSubMissionInput,
+  UpsertWorkItemInput,
   WithdrawAskInput,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
@@ -21,6 +26,7 @@ import * as Schema from "effect/Schema";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as AsksService from "../asks/AsksService.ts";
+import * as MissionService from "../MissionService.ts";
 import { MakeCallInput, OpenAskRequest, ProposeSuggestionInput } from "../asks/inputs.ts";
 import { WATCH_KINDS } from "../asks/watch.ts";
 
@@ -267,6 +273,49 @@ const MissionNoteAckTool = Tool.make("mission_note_ack", {
   dependencies,
 });
 
+// Master plan tools: core's writes with the master's agent provenance.
+const planDependencies = [...dependencies, MissionService.MissionService];
+
+const MissionSubMissionTool = Tool.make("mission_sub_mission", {
+  description:
+    "As the mission's master, create a sub-mission (new subMissionId or none, title required) or update one. Owner-only and locked fields are refused.",
+  parameters: UpsertSubMissionInput,
+  success: MissionMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: planDependencies,
+});
+
+const MissionMilestoneTool = Tool.make("mission_milestone", {
+  description:
+    "As the mission's master, create a milestone (title and subMissionId required) or update its target, status, note or items.",
+  parameters: UpsertMilestoneInput,
+  success: MissionMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: planDependencies,
+});
+
+const MissionLaneTool = Tool.make("mission_lane", {
+  description:
+    "As the mission's master, create a lane (name required) or update it: move it to another sub-mission, park, retire or resume it, set its lead, thread or current item. A lane an open ask holds keeps waiting until the owner answers (parking or retiring it is still allowed).",
+  parameters: UpsertLaneInput,
+  success: MissionMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: planDependencies,
+});
+
+const MissionWorkItemTool = Tool.make("mission_work_item", {
+  description:
+    "As the mission's master, create a work item (title required) or update its stage, lane, milestone, holder, dependencies, PR, links or facts. Ask holds in blockedBy come only from open asks and are kept as they are.",
+  parameters: UpsertWorkItemInput,
+  success: MissionMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: planDependencies,
+});
+
 interface ToolConfig {
   readonly parameters: Schema.Constraint;
   readonly success: Schema.Constraint;
@@ -318,4 +367,8 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionForkTool, "Fork the master for a question"),
   writeTool(MissionForkCloseTool, "Close a fork"),
   writeTool(MissionNoteAckTool, "Acknowledge a note"),
+  writeTool(MissionSubMissionTool, "Create or update a sub-mission"),
+  writeTool(MissionMilestoneTool, "Create or update a milestone"),
+  writeTool(MissionLaneTool, "Create or update a lane"),
+  writeTool(MissionWorkItemTool, "Create or update a work item"),
 );

@@ -70,3 +70,52 @@ export const heldLane = (lane: Lane, asks: ReadonlyArray<Ask>, now: string): Lan
   }
   return null;
 };
+
+/**
+ * A master's work-item write with ask holds kept: ask refs in `blockedBy`
+ * come only from open asks' `blocks`, so the master can neither add nor drop
+ * them by hand.
+ */
+export const keepWorkItemHolds = <
+  I extends { readonly blockedBy?: ReadonlyArray<MissionRecordRef> | undefined },
+>(
+  itemId: WorkItem["id"] | undefined,
+  input: I,
+  asks: ReadonlyArray<Ask>,
+): I => {
+  if (input.blockedBy === undefined) return input;
+  const holding =
+    itemId === undefined ? [] : asksHolding({ kind: "work-item", id: itemId }, asks).map(askRef);
+  return {
+    ...input,
+    blockedBy: [...input.blockedBy.filter((ref) => ref.kind !== "ask"), ...holding],
+  };
+};
+
+/**
+ * Why a master may not change a lane's status right now, or null. A lane an
+ * open ask holds keeps waiting until the owner answers; the master can still
+ * park or retire it, or withdraw or supersede the ask.
+ */
+export const laneHoldConflict = (
+  laneId: Lane["id"] | undefined,
+  change: {
+    readonly status?: Lane["status"] | undefined;
+    readonly statusReason?: string | null | undefined;
+  },
+  asks: ReadonlyArray<Ask>,
+): string | null => {
+  if (laneId === undefined) return null;
+  const line = waitingOn({ kind: "lane", id: laneId }, asks);
+  if (line === null) return null;
+  const status = change.status;
+  const reasonChange =
+    change.statusReason !== undefined && (status === undefined || status === "waiting");
+  if (
+    (status !== undefined && status !== "waiting" && status !== "parked" && status !== "retired") ||
+    reasonChange
+  ) {
+    return `Lane ${laneId} is ${line}. It waits until the owner answers; withdraw or supersede the ask to change that.`;
+  }
+  return null;
+};

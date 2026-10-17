@@ -36,6 +36,7 @@ import * as PreviewAutomationBroker from "../../PreviewAutomationBroker.ts";
 import * as PreviewBrowser from "../../../preview/PreviewBrowser.ts";
 // ardud missions: asks
 import * as AsksService from "../../../ardud/missions/asks/AsksService.ts";
+import * as MissionService from "../../../ardud/missions/MissionService.ts";
 
 const layerStubServices = Layer.mergeAll(
   Layer.mock(Orchestrator.OrchestratorV2)({}),
@@ -61,6 +62,7 @@ const layerStubServices = Layer.mergeAll(
   Layer.mock(ThreadSearch.ThreadSearch)({}),
   // ardud missions: asks
   Layer.mock(AsksService.AsksService)({}),
+  Layer.mock(MissionService.MissionService)({}),
 );
 
 const ToolsListPayload = Schema.fromJsonString(

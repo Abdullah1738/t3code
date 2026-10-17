@@ -276,6 +276,59 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("lets only the master change the plan, keeping ask holds", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const master = threadCaller(masterThread);
+      const created = yield* call("mission_work_item", master, {
+        missionId,
+        workItemId: "wi-new",
+        title: "Write the runbook",
+      });
+      expect(created.isError).toBe(false);
+      const store = yield* MissionStore.MissionStore;
+      const events = yield* store.recentEvents(missionId, 1);
+      // Core records the write as the master role the calling thread holds.
+      expect(events[0]?.actor).toEqual({ _tag: "role", roleId: "role-master" });
+
+      // A lane thread is not the master.
+      const lane = yield* call("mission_work_item", threadCaller(laneThread), {
+        missionId,
+        workItemId: "wi-free",
+        stage: "review",
+      });
+      expect(lane.isError).toBe(true);
+      expect(lane.text).toContain("forbidden");
+
+      // Ask holds stay as the asks set them, whatever the master sends.
+      yield* call("mission_ask", master, askInput("Online or offline?"));
+      const rewritten = yield* call("mission_work_item", master, {
+        missionId,
+        workItemId: "wi-held",
+        blockedBy: [{ kind: "work-item", id: "wi-free" }],
+      });
+      expect(rewritten.isError).toBe(false);
+      const held = Option.getOrThrow(yield* store.get("work-item", WorkItemId.make("wi-held")));
+      expect(held.blockedBy.map((ref) => ref.kind).toSorted()).toEqual(["ask", "work-item"]);
+
+      // A held lane keeps waiting until the owner answers; parking is still allowed.
+      const resumed = yield* call("mission_lane", master, {
+        missionId,
+        laneId: "lane-api",
+        status: "working",
+      });
+      expect(resumed.isError).toBe(true);
+      expect(resumed.text).toContain("waiting on ask");
+      const parked = yield* call("mission_lane", master, {
+        missionId,
+        laneId: "lane-api",
+        status: "parked",
+      });
+      expect(parked.isError).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("builds a watch check for a mission", () => {
     const { layer } = toolsLayer();
     return Effect.gen(function* () {

@@ -21,6 +21,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import * as Inbound from "./inbound.ts";
@@ -153,7 +154,7 @@ export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
       find: (id) => Effect.succeed(inbound.find((message) => message.id === id) ?? null),
     }),
   );
-  const layer = AsksService.layer.pipe(
+  const layer = Layer.mergeAll(AsksService.layer, MissionService.layer).pipe(
     Layer.provideMerge(
       Layer.mergeAll(
         MissionStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)),

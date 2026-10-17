@@ -221,6 +221,8 @@ export class AsksService extends Context.Service<
     readonly suggestionStats: () => Fx<ReadonlyArray<SuggestionStats>>;
     readonly forks: (filter: ListFilter) => Fx<ReadonlyArray<MissionFork>>;
     readonly notes: (missionId: MissionId) => Fx<ReadonlyArray<Note>>;
+    /** Who the caller is in a mission: its roles, lanes, open forks and whether it is the master. */
+    readonly standing: (missionId: MissionId, provenance: MissionProvenance) => Fx<Standing>;
     // Asks
     readonly openAsk: (raw: unknown, provenance: MissionProvenance) => Fx<Ask>;
     readonly answerAsk: (
@@ -1149,7 +1151,7 @@ const make = Effect.gen(function* () {
         }),
         openSuggestions: yield* store.list("suggestion", { missionId, status: ["open"] }),
         openForks: yield* store.list("fork", { missionId, status: ["open"] }),
-        directionCheck: directionCheck(calls, null),
+        directionCheck: directionCheck(calls, yield* store.ownerLastLookedAt(missionId)),
         lanes: lanes.map(({ id, name, status, statusReason }) => ({
           id,
           name,
@@ -1200,6 +1202,8 @@ const make = Effect.gen(function* () {
     suggestionStats: () => store.list("suggestion").pipe(Effect.map(suggestionStats)),
     forks: (filter) => listWith("fork", filter),
     notes: (missionId) => store.list("note", { missionId }),
+    standing: (missionId, provenance) =>
+      standingIn(missionId, provenance).pipe(Effect.map(({ standing }) => standing)),
     openAsk: (raw, provenance) => serialized(openAskCommand(raw, provenance)),
     answerAsk: (input, provenance) =>
       serialized(answerAskCommand(input, provenance)).pipe(

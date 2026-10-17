@@ -1,10 +1,17 @@
-import { MissionError, OrchestratorMcpFailure, type MissionProvenance } from "@t3tools/contracts";
+import {
+  MissionError,
+  OrchestratorMcpFailure,
+  type MissionId,
+  type MissionProvenance,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as AsksService from "../asks/AsksService.ts";
+import { keepWorkItemHolds, laneHoldConflict } from "../asks/holds.ts";
 import { watchAddCommand, watchCheckCommand } from "../asks/watch.ts";
+import * as MissionService from "../MissionService.ts";
 import { MissionsToolkit } from "./tools.ts";
 
 /** The `mission` CLI as robob-watch checks call it (on PATH once installed). */
@@ -44,17 +51,46 @@ export const callerProvenance = (
   };
 };
 
-const withCaller = <A>(
+const withCaller = <A, R = never>(
   run: (
     asks: AsksService.AsksService["Service"],
     provenance: MissionProvenance,
-  ) => Effect.Effect<A, MissionError | OrchestratorMcpFailure>,
+  ) => Effect.Effect<A, MissionError | OrchestratorMcpFailure, R>,
 ) =>
   Effect.gen(function* () {
     const scope = yield* McpInvocationContext.McpInvocationContext;
     const asks = yield* AsksService.AsksService;
     return yield* run(asks, callerProvenance(scope));
   }).pipe(Effect.catchTags({ MissionError: (error) => Effect.fail(toolFailure(error)) }));
+
+/**
+ * Plan writes are the master's: the calling thread must hold the mission's
+ * master role, and core records the write as that role.
+ */
+const asMaster = <A>(
+  missionId: MissionId,
+  run: (
+    missions: MissionService.MissionService["Service"],
+    asks: AsksService.AsksService["Service"],
+    provenance: MissionProvenance,
+  ) => Effect.Effect<A, MissionError>,
+) =>
+  withCaller((asks, provenance) =>
+    Effect.gen(function* () {
+      const standing = yield* asks.standing(missionId, provenance);
+      if (!standing.isMaster) {
+        return yield* new MissionError({
+          code: "forbidden",
+          detail: `Only mission ${missionId}'s master changes its plan.`,
+        });
+      }
+      const missions = yield* MissionService.MissionService;
+      return yield* run(missions, asks, standing.caller.provenance);
+    }),
+  );
+
+const openAsks = (asks: AsksService.AsksService["Service"], missionId: MissionId) =>
+  asks.asks({ missionId, status: ["open"] });
 
 const handlers = {
   mission_status: McpToolAccess.reads((input) =>
@@ -207,6 +243,43 @@ const handlers = {
   mission_note_ack: McpToolAccess.actsAsCaller((input) =>
     withCaller((asks, provenance) =>
       asks.ackNote(input.noteId, provenance).pipe(Effect.map((note) => ({ note }))),
+    ),
+  ),
+  mission_sub_mission: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.upsertSubMission(provenance, input),
+    ),
+  ),
+  mission_milestone: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.upsertMilestone(provenance, input),
+    ),
+  ),
+  mission_lane: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, asks, provenance) =>
+      Effect.gen(function* () {
+        const conflict = laneHoldConflict(
+          input.laneId,
+          input,
+          yield* openAsks(asks, input.missionId),
+        );
+        if (conflict !== null) {
+          return yield* new MissionError({ code: "conflict", detail: conflict });
+        }
+        return yield* missions.upsertLane(provenance, input);
+      }),
+    ),
+  ),
+  mission_work_item: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, asks, provenance) =>
+      Effect.gen(function* () {
+        const held = keepWorkItemHolds(
+          input.workItemId,
+          input,
+          yield* openAsks(asks, input.missionId),
+        );
+        return yield* missions.upsertWorkItem(provenance, held);
+      }),
     ),
   ),
 } satisfies McpToolAccess.Handlers<typeof MissionsToolkit.tools>;
