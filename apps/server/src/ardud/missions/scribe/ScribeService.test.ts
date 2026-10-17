@@ -152,15 +152,16 @@ it.layer(TestLayer)("scribe service", (it) => {
       const events = (yield* store.eventsSince(MissionId.make(MISSION_ID), seeded)).filter(
         (event) => event.kind === "note.recorded",
       );
-      // One event per verified note, then one for the batch's failed citations.
+      // One event for the whole batch, naming its strongest verified note.
       const verifiedIds = notes
         .filter((stored) => stored.citation === "verified")
         .map((stored) => stored.id as string);
+      assert.equal(events.length, 1);
+      assert.equal(events[0]?.subject?.id, claim?.id);
       assert.deepStrictEqual(
-        events.map((event) => event.subject?.id ?? null).toSorted(),
-        [...verifiedIds, null].toSorted(),
+        ((events[0]?.payload as { noteIds?: string[] } | null)?.noteIds ?? []).toSorted(),
+        verifiedIds.toSorted(),
       );
-      assert.isNull(events.at(-1)?.subject ?? null);
 
       const again = yield* service.ingest(posted);
       assert.isTrue(again.duplicate);
@@ -168,7 +169,7 @@ it.layer(TestLayer)("scribe service", (it) => {
         (yield* store.list("note", { missionId: MissionId.make(MISSION_ID) })).length,
         3,
       );
-      assert.equal((yield* store.eventsSince(MissionId.make(MISSION_ID), 0)).length, seeded + 3);
+      assert.equal((yield* store.eventsSince(MissionId.make(MISSION_ID), 0)).length, seeded + 1);
 
       const lanes = yield* service.lanes(MISSION_ID);
       assert.equal(lanes[0]?.cursor, 2000004);
@@ -239,6 +240,60 @@ it.layer(TestLayer)("scribe service", (it) => {
         "claim-of-done",
         "deviation",
       ]);
+    }),
+  );
+
+  it.effect("an overlapping batch only notes events past the cursor", () =>
+    Effect.gen(function* () {
+      const service = yield* ScribeService.ScribeService;
+      const store = yield* MissionStore.MissionStore;
+      yield* seedTranscript({
+        threadId: LANE_THREAD,
+        run: 4,
+        requestedAt: "2026-10-17T04:00:00.000Z",
+        items: [
+          {
+            ordinal: 4000001,
+            type: "assistant_message",
+            payload: { text: "Holding the backfill until the master answers about dev data." },
+          },
+        ],
+      });
+      const stored = yield* store.list("note", { missionId: MissionId.make(MISSION_ID) });
+      const before = stored.length;
+      const risksBefore = stored.filter((note) => note.type === "risk").length;
+      // A second pass that started from an older cursor re-notes event 3000001.
+      const result = yield* service.ingest(
+        batch({
+          fromEvent: 2000001,
+          toEvent: 4000001,
+          notes: [
+            note({
+              type: "risk",
+              summary: "Backfill size unknown.",
+              quote: "the ledger table has 40 rows",
+              event: 3000001,
+              fromEvent: 3000001,
+              toEvent: 3000001,
+            }),
+            note({
+              type: "blocker",
+              summary: "Backfill waits on the master.",
+              quote: "Holding the backfill until the master answers",
+              event: 4000001,
+              fromEvent: 4000001,
+              toEvent: 4000001,
+            }),
+          ],
+        }),
+      );
+      assert.isFalse(result.duplicate);
+      assert.equal(result.accepted, 1);
+      assert.equal(result.stats?.dropped, 1);
+      const after = yield* store.list("note", { missionId: MissionId.make(MISSION_ID) });
+      assert.equal(after.length, before + 1);
+      assert.equal(after.filter((note) => note.type === "risk").length, risksBefore);
+      assert.isTrue(after.some((note) => note.type === "blocker"));
     }),
   );
 
@@ -341,6 +396,20 @@ it.layer(TestLayer)("scribe reports", (it) => {
         }),
       );
       assert.equal(empty._tag === "MissionError" ? empty.code : empty._tag, "invalid");
+
+      const garbage = yield* Effect.flip(
+        service.report({ missionId: MISSION_ID, kind: "update", to: "x", save: false }),
+      );
+      assert.equal(garbage._tag === "MissionError" ? garbage.code : garbage._tag, "invalid");
+      // A short ISO form is normalized, so it still lines up with saved windows.
+      const short = yield* service.report({
+        missionId: MISSION_ID,
+        kind: "update",
+        to: "2026-10-17T16:00Z",
+        save: false,
+      });
+      assert.equal(short.coversFrom, "2026-10-17T12:00:00.000Z");
+      assert.equal(short.coversTo, "2026-10-17T16:00:00.000Z");
     }),
   );
 });

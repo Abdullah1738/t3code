@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 
 import {
   MissionError,
@@ -11,6 +12,7 @@ import {
   Note,
   Suggestion,
   type MissionActor,
+  type MissionEvent,
   type MissionProvenance,
 } from "@t3tools/contracts";
 
@@ -24,7 +26,7 @@ import {
   type EditorState,
   readEditorState,
 } from "./editor.ts";
-import { currentNotes, rankFyi } from "./notes.ts";
+import { currentNotes, fyiScore, rankFyi } from "./notes.ts";
 import { type BuiltReport, buildReport, type ReportKind } from "./reports.ts";
 import { ScribeStore, type ScribeStoreError, toJson } from "./ScribeStore.ts";
 
@@ -34,11 +36,11 @@ import { ScribeStore, type ScribeStoreError, toJson } from "./ScribeStore.ts";
  * notes in core's record store. A batch at or behind the lane cursor is a
  * duplicate and writes nothing, so a retried post is harmless.
  *
- * Each verified note is its own commit with a `note.recorded` event, so the
- * timeline and feed show one line per note. Notes whose quote did not check
- * out are kept (they feed the pass rate) under a single event per batch. The
- * batch row and the new cursor ride on the last commit; if the server dies
- * part-way, the retry skips note ids it already stored and finishes the batch.
+ * A batch is one commit: its notes (verified and failed alike; failed ones
+ * feed the pass rate and never reach FYI), one `note.recorded` event naming
+ * the strongest verified note, the batch row and the new cursor. Either all
+ * of it lands or none of it does. Ingests are serialized, and a batch that
+ * reaches back behind the cursor only counts for its new events.
  */
 
 const decodeNote = Schema.decodeUnknownEffect(Note);
@@ -135,8 +137,10 @@ const EDITOR_WINDOW_HOURS = 24;
 const WINDOW_HOURS: Record<ReportKind, number> = { update: 4, daily: 24 };
 /** Notes read for ranking and reports: the newest this many per mission. */
 const NOTE_WINDOW = 5000;
-/** Events read for "You asked" (owner messages in the window). */
-const EVENT_WINDOW = 500;
+/** Page size when reading the event log for a report window. */
+const EVENT_PAGE = 500;
+/** Hard stop for one report's event read (40 pages). */
+const EVENT_PAGES_MAX = 40;
 /** Longest `replaces` chain followed when validating a new note. */
 const CHAIN_DEPTH = 50;
 
@@ -203,6 +207,8 @@ export class ScribeService extends Context.Service<
 const make = Effect.gen(function* () {
   const store = yield* MissionStore;
   const scribe = yield* ScribeStore;
+  // One batch at a time, so the cursor check and the write see the same cursor.
+  const ingestLock = yield* Semaphore.make(1);
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -216,6 +222,42 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+
+  const isoTime = (field: string, value: string) =>
+    Option.match(DateTime.make(value), {
+      onNone: () =>
+        Effect.fail(
+          new MissionError({ code: "invalid", detail: `${field} is not a time: ${value}` }),
+        ),
+      onSome: (time) => Effect.succeed(DateTime.formatIso(DateTime.toUtc(time))),
+    });
+
+  /**
+   * Events from about `fromIso` on, oldest first. Event times mostly rise with
+   * seq (imports may backdate a few), so binary search the start and back off
+   * one page; the report filters to its window anyway.
+   */
+  const eventsFrom = (missionId: MissionId, fromIso: string) =>
+    Effect.gen(function* () {
+      let lo = 1;
+      let hi = (yield* store.latestSeq(missionId)) + 1;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const [event] = yield* store.eventsSince(missionId, mid - 1, 1);
+        if (event === undefined || event.at > fromIso) hi = mid;
+        else lo = mid + 1;
+      }
+      const out: MissionEvent[] = [];
+      let after = Math.max(0, lo - 1 - EVENT_PAGE);
+      for (let page = 0; page < EVENT_PAGES_MAX; page += 1) {
+        const events = yield* store.eventsSince(missionId, after, EVENT_PAGE);
+        out.push(...events);
+        const last = events.at(-1);
+        if (events.length < EVENT_PAGE || last === undefined) break;
+        after = last.seq;
+      }
+      return out;
+    });
 
   const recentNotes = (missionId: string) =>
     store.list("note", { missionId: MissionId.make(missionId), limit: NOTE_WINDOW });
@@ -312,20 +354,38 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const ingest = (input: ScribeBatchInput) =>
+  const ingest = (posted: ScribeBatchInput) =>
     Effect.gen(function* () {
-      if (!(input.fromEvent <= input.toEvent)) {
+      if (!(posted.fromEvent <= posted.toEvent)) {
         return yield* new MissionError({
           code: "invalid",
-          detail: `batch range ${input.fromEvent}..${input.toEvent}`,
+          detail: `batch range ${posted.fromEvent}..${posted.toEvent}`,
         });
       }
-      yield* requireMission(input.missionId);
-      const missionId = MissionId.make(input.missionId);
-      const cursor = (yield* scribe.cursor(input.missionId, input.threadId)) ?? 0;
-      if (input.toEvent <= cursor) {
+      yield* requireMission(posted.missionId);
+      const missionId = MissionId.make(posted.missionId);
+      const cursor = (yield* scribe.cursor(posted.missionId, posted.threadId)) ?? 0;
+      if (posted.toEvent <= cursor) {
         return { duplicate: true, accepted: 0, failed: 0, cursor, stats: null } as IngestResult;
       }
+      // A batch that overlaps what is already noted only counts for the new
+      // part: notes and candidates reaching back to or behind the cursor are
+      // dropped, so two passes over the same events cannot note them twice.
+      const start = Math.max(posted.fromEvent, cursor + 1);
+      const notesAfter = posted.notes.filter(
+        (note) => Math.min(note.fromEvent, note.event) >= start,
+      );
+      const candidatesAfter = posted.candidates.filter((candidate) => candidate.event >= start);
+      const input: ScribeBatchInput = {
+        ...posted,
+        fromEvent: start,
+        notes: notesAfter,
+        candidates: candidatesAfter,
+        droppedCount:
+          posted.droppedCount +
+          (posted.notes.length - notesAfter.length) +
+          (posted.candidates.length - candidatesAfter.length),
+      };
       const at = yield* now;
       const events = yield* scribe.transcript(input.threadId, input.fromEvent, input.toEvent);
       const pullRequests = yield* scribe.pullRequests(input.threadId);
@@ -354,43 +414,18 @@ const make = Effect.gen(function* () {
         );
       }
 
-      const commits: MissionCommit[] = fresh
+      const verified = fresh
         .filter((note) => note.citation === "verified")
-        .map((note) => ({
-          event: {
-            missionId,
-            kind: "note.recorded",
-            actor: SCRIBE_ACTOR,
-            provenance: SCRIBE_PROVENANCE,
-            summary: clipLine(`${note.type}: ${note.summary}`),
-            subject: { kind: "note", id: note.id },
-            payload: {
-              laneId: note.laneId,
-              severity: note.severity,
-              citation: note.citation,
-              evidence: note.evidence,
-              replacesNoteId: note.replacesNoteId,
-            },
-            at,
-          },
-          upserts: [{ _tag: "note", record: note }],
-        }));
+        .toSorted((a, b) => fyiScore(b) - fyiScore(a));
       const failed = fresh.filter((note) => note.citation !== "verified");
-      if (failed.length > 0) {
-        commits.push({
-          event: {
-            missionId,
-            kind: "note.recorded",
-            actor: SCRIBE_ACTOR,
-            provenance: SCRIBE_PROVENANCE,
-            summary: `Scribe kept ${failed.length} note(s) whose quote did not match the transcript; they stay out of FYI.`,
-            subject: null,
-            payload: { citation: "failed", noteIds: failed.map((note) => note.id) },
-            at,
-          },
-          upserts: failed.map((note) => ({ _tag: "note" as const, record: note })),
-        });
-      }
+      const strongest = verified[0];
+      const lane = input.laneId ?? input.threadId;
+      const summary =
+        strongest === undefined
+          ? `Scribe kept ${failed.length} note(s) from ${lane} whose quote did not match the transcript; they stay out of FYI.`
+          : verified.length === 1
+            ? `${strongest.type}: ${strongest.summary}`
+            : `${verified.length} notes from ${lane}. Strongest: ${strongest.type}: ${strongest.summary}`;
 
       const batchWrite = scribe
         .writeBatch({
@@ -411,11 +446,46 @@ const make = Effect.gen(function* () {
         })
         // Same contract as core's store: storage faults are defects.
         .pipe(Effect.orDie);
+      // The cursor must not have moved since this batch was checked; if it
+      // did, the whole commit rolls back and the runner re-reads its lanes.
+      const guardedWrite = Effect.gen(function* () {
+        const current =
+          (yield* scribe.cursor(input.missionId, input.threadId).pipe(Effect.orDie)) ?? 0;
+        if (current !== cursor) {
+          return yield* new MissionError({
+            code: "conflict",
+            detail: `lane cursor moved from ${cursor} to ${current} while the batch was checked`,
+          });
+        }
+        yield* batchWrite;
+      });
 
-      const last = commits.pop();
-      for (const commit of commits) yield* store.commit(commit);
-      if (last === undefined) yield* batchWrite;
-      else yield* store.commit({ ...last, alongside: batchWrite });
+      if (fresh.length === 0) {
+        yield* guardedWrite;
+      } else {
+        const commit: MissionCommit = {
+          event: {
+            missionId,
+            kind: "note.recorded",
+            actor: SCRIBE_ACTOR,
+            provenance: SCRIBE_PROVENANCE,
+            summary: clipLine(summary),
+            subject: strongest === undefined ? null : { kind: "note", id: strongest.id },
+            payload: {
+              laneId: input.laneId,
+              threadId: input.threadId,
+              fromEvent: input.fromEvent,
+              toEvent: input.toEvent,
+              noteIds: verified.map((note) => note.id),
+              failedNoteIds: failed.map((note) => note.id),
+            },
+            at,
+          },
+          upserts: fresh.map((note) => ({ _tag: "note" as const, record: note })),
+          alongside: guardedWrite,
+        };
+        yield* store.commit(commit);
+      }
 
       return {
         duplicate: false,
@@ -424,7 +494,7 @@ const make = Effect.gen(function* () {
         cursor: input.toEvent,
         stats: assembled.stats,
       } as IngestResult;
-    });
+    }).pipe(ingestLock.withPermit);
 
   const fyi = (missionId: string, limit: number) =>
     Effect.gen(function* () {
@@ -443,16 +513,19 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { missionId, kind } = request;
       const mission = yield* requireMission(missionId);
-      const to = request.to ?? (yield* now);
+      // Windows are compared as strings below and in SQL, so every bound is
+      // normalized to the same ISO form first.
+      const to = request.to === undefined ? yield* now : yield* isoTime("to", request.to);
       const id = MissionId.make(missionId);
       const previous = yield* scribe.lastReport(missionId, kind);
       const usablePrevious = previous !== null && previous.coversTo < to ? previous : null;
       const from =
-        request.from ??
-        usablePrevious?.coversTo ??
-        DateTime.formatIso(
-          DateTime.subtract(DateTime.makeUnsafe(to), { hours: WINDOW_HOURS[kind] }),
-        );
+        request.from !== undefined
+          ? yield* isoTime("from", request.from)
+          : (usablePrevious?.coversTo ??
+            DateTime.formatIso(
+              DateTime.subtract(DateTime.makeUnsafe(to), { hours: WINDOW_HOURS[kind] }),
+            ));
       if (from >= to) {
         return yield* new MissionError({
           code: "invalid",
@@ -471,8 +544,8 @@ const make = Effect.gen(function* () {
           recentNotes(missionId),
         ]);
       const suggestions = yield* store.list("suggestion", { missionId: id });
-      // Newest first from core; reports only need the window's owner messages.
-      const events = (yield* store.recentEvents(id, EVENT_WINDOW)).toReversed();
+      // "You asked" needs every owner message in the window, so page the log.
+      const events = yield* eventsFrom(id, from);
       const editor = (yield* editorStateOf(missionId))?.state ?? null;
       const batches = yield* scribe.batches(missionId, from);
       const usage = batches.length === 0 ? null : summarizeStats(batches);
