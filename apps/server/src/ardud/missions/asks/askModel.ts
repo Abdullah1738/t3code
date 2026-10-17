@@ -385,7 +385,7 @@ export const supersedeAsk = (command: SupersedeAskCommand): Outcome<Supersession
       record: superseded,
       events: [
         {
-          kind: "ask.withdrawn",
+          kind: "ask.superseded",
           actor: ask.askedBy,
           provenance: replacement.caller.provenance,
           summary: clipSummary(`Superseded by ${replacement.id}: ${ask.question}`),
@@ -423,12 +423,12 @@ export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> =
     record,
     events: [
       {
-        kind: "ask.opened",
+        kind: "ask.reopened",
         actor: { _tag: "owner" },
         provenance,
         summary: clipSummary(`Reopened: ${ask.question}`),
         subject: askRef(ask),
-        payload: { reopened: true, reason: command.reason, previousAnswer: ask.answer },
+        payload: { reason: command.reason, previousAnswer: ask.answer },
       },
     ],
   });

@@ -120,9 +120,7 @@ export const reactToCall = (command: ReactToCallCommand): Outcome<Transition<Cal
     record,
     events: [
       {
-        // The contract has no dedicated reaction kind; a reaction is a fresh
-        // statement about the call, distinguished by its payload.
-        kind: "call.made",
+        kind: "call.reacted",
         actor: { _tag: "owner" },
         provenance,
         summary: clipSummary(

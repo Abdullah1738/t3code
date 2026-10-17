@@ -62,6 +62,7 @@ describe("calls", () => {
       reactToCall({ ...base, reaction: "discuss", provenance: ownerApp }),
     );
     expect(reacted.record.ownerReaction).toBe("discuss");
+    expect(reacted.events[0]?.kind).toBe("call.reacted");
     expect(reacted.events[0]?.payload).toMatchObject({
       reaction: "discuss",
       previousReaction: null,

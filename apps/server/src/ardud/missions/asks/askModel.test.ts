@@ -298,6 +298,7 @@ describe("reverse states", () => {
       "lane-api",
       "wi-2",
     ]);
+    expect(outcome.superseded.events[0]?.kind).toBe("ask.superseded");
     expect(outcome.superseded.events[0]?.payload).toMatchObject({ supersededBy: "ask-2" });
   });
 
@@ -319,6 +320,7 @@ describe("reverse states", () => {
       reopenAsk({ ask: answered, provenance: ownerApp, reason: "Changed my mind", now }),
     );
     expect(reopened.record.status).toBe("open");
+    expect(reopened.events[0]?.kind).toBe("ask.reopened");
     expect(waitingOn({ kind: "work-item", id: "wi-1" }, [reopened.record])).not.toBeNull();
   });
 });
