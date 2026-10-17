@@ -34,6 +34,8 @@ import { Route as SettingsAppearanceRouteImport } from './routes/settings.appear
 import { Route as ProjectsProjectKeyRouteImport } from './routes/projects.$projectKey'
 import { Route as ChatPullRequestsRouteImport } from './routes/_chat.pull-requests'
 import { Route as ChatNewRouteImport } from './routes/_chat.new'
+import { Route as ChatMissionsInboxRouteImport } from './routes/_chat.missions.inbox'
+import { Route as ChatMissionsMissionIdRouteImport } from './routes/_chat.missions.$missionId'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
 import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$environmentId.$threadId'
 
@@ -162,6 +164,16 @@ const ChatNewRoute = ChatNewRouteImport.update({
   path: '/new',
   getParentRoute: () => ChatRoute,
 } as any)
+const ChatMissionsInboxRoute = ChatMissionsInboxRouteImport.update({
+  id: '/missions/inbox',
+  path: '/missions/inbox',
+  getParentRoute: () => ChatRoute,
+} as any)
+const ChatMissionsMissionIdRoute = ChatMissionsMissionIdRouteImport.update({
+  id: '/missions/$missionId',
+  path: '/missions/$missionId',
+  getParentRoute: () => ChatRoute,
+} as any)
 const ChatDraftDraftIdRoute = ChatDraftDraftIdRouteImport.update({
   id: '/draft/$draftId',
   path: '/draft/$draftId',
@@ -201,6 +213,8 @@ export interface FileRoutesByFullPath {
   '/settings/storage': typeof SettingsStorageRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/missions/$missionId': typeof ChatMissionsMissionIdRoute
+  '/missions/inbox': typeof ChatMissionsInboxRoute
 }
 export interface FileRoutesByTo {
   '/connect': typeof ConnectRoute
@@ -229,6 +243,8 @@ export interface FileRoutesByTo {
   '/': typeof ChatIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/missions/$missionId': typeof ChatMissionsMissionIdRoute
+  '/missions/inbox': typeof ChatMissionsInboxRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -259,6 +275,8 @@ export interface FileRoutesById {
   '/_chat/': typeof ChatIndexRoute
   '/_chat/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/_chat/missions/$missionId': typeof ChatMissionsMissionIdRoute
+  '/_chat/missions/inbox': typeof ChatMissionsInboxRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -289,6 +307,8 @@ export interface FileRouteTypes {
     | '/settings/storage'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/missions/$missionId'
+    | '/missions/inbox'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/connect'
@@ -317,6 +337,8 @@ export interface FileRouteTypes {
     | '/'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/missions/$missionId'
+    | '/missions/inbox'
   id:
     | '__root__'
     | '/_chat'
@@ -346,6 +368,8 @@ export interface FileRouteTypes {
     | '/_chat/'
     | '/_chat/$environmentId/$threadId'
     | '/_chat/draft/$draftId'
+    | '/_chat/missions/$missionId'
+    | '/_chat/missions/inbox'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -536,6 +560,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatNewRouteImport
       parentRoute: typeof ChatRoute
     }
+    '/_chat/missions/inbox': {
+      id: '/_chat/missions/inbox'
+      path: '/missions/inbox'
+      fullPath: '/missions/inbox'
+      preLoaderRoute: typeof ChatMissionsInboxRouteImport
+      parentRoute: typeof ChatRoute
+    }
+    '/_chat/missions/$missionId': {
+      id: '/_chat/missions/$missionId'
+      path: '/missions/$missionId'
+      fullPath: '/missions/$missionId'
+      preLoaderRoute: typeof ChatMissionsMissionIdRouteImport
+      parentRoute: typeof ChatRoute
+    }
     '/_chat/draft/$draftId': {
       id: '/_chat/draft/$draftId'
       path: '/draft/$draftId'
@@ -559,6 +597,8 @@ interface ChatRouteChildren {
   ChatIndexRoute: typeof ChatIndexRoute
   ChatEnvironmentIdThreadIdRoute: typeof ChatEnvironmentIdThreadIdRoute
   ChatDraftDraftIdRoute: typeof ChatDraftDraftIdRoute
+  ChatMissionsMissionIdRoute: typeof ChatMissionsMissionIdRoute
+  ChatMissionsInboxRoute: typeof ChatMissionsInboxRoute
 }
 
 const ChatRouteChildren: ChatRouteChildren = {
@@ -567,6 +607,8 @@ const ChatRouteChildren: ChatRouteChildren = {
   ChatIndexRoute: ChatIndexRoute,
   ChatEnvironmentIdThreadIdRoute: ChatEnvironmentIdThreadIdRoute,
   ChatDraftDraftIdRoute: ChatDraftDraftIdRoute,
+  ChatMissionsMissionIdRoute: ChatMissionsMissionIdRoute,
+  ChatMissionsInboxRoute: ChatMissionsInboxRoute,
 }
 
 const ChatRouteWithChildren = ChatRoute._addFileChildren(ChatRouteChildren)
