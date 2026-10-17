@@ -1,0 +1,39 @@
+{
+  "sku": "Z07CA1BF1FECD6D401974Z-1",
+  "title": "SHOT Iced Caramel Macchiato",
+  "customizationConfig": null,
+  "customizationOptions": [
+    {"modifierGroup":"cup_size_dummy_colddrinks","title":"Choose size","modifierType":"checkbox","minSelection":1,"maxSelection":1,"modifiers":[
+      {"modifierCode":"coffee_regular_colddrinks","title":"Regular Size (470ml | 16 oz)","price":0,"isPreselected":true}
+    ]},
+    {"modifierGroup":"coffee_blend","title":"Choose coffee beans","modifierType":"checkbox","minSelection":1,"maxSelection":1,"modifiers":[
+      {"modifierCode":"dark_roast","title":"Shot Signature Dark Roast","price":0,"isPreselected":false},
+      {"modifierCode":"medium_roast","title":"Ethiopian Medium by Coffee Planet","price":0,"isPreselected":false},
+      {"modifierCode":"decaf","title":"Colombian Decaf by Coffee Planet","price":0,"isPreselected":false}
+    ]},
+    {"modifierGroup":"type_of_milk","title":"Choose type of milk","modifierType":"checkbox","minSelection":1,"maxSelection":1,"modifiers":[
+      {"modifierCode":"full_fat_milk","title":"Full-fat Fresh Milk","price":0,"isPreselected":false},
+      {"modifierCode":"low_fat_milk","title":"Low-fat Fresh Milk","price":0,"isPreselected":false},
+      {"modifierCode":"almond_milk","title":"Almond Milk","price":4,"isPreselected":false},
+      {"modifierCode":"oat_milk","title":"Oat Milk","price":4,"isPreselected":false},
+      {"modifierCode":"coconut_milk","title":"Coconut Milk","price":4,"isPreselected":false}
+    ]},
+    {"modifierGroup":"type_of_sugar2","title":"Choose sugar option","modifierType":"checkbox","minSelection":0,"maxSelection":1,"modifiers":[
+      {"modifierCode":"no_sugar2","title":"Regular / No Added Sugar","price":0,"isPreselected":false},
+      {"modifierCode":"extra_sweet","title":"Extra Sweet","price":0,"isPreselected":false},
+      {"modifierCode":"white_sugar2","title":"White Sugar Sachet","price":0,"isPreselected":false},
+      {"modifierCode":"brown_sugar2","title":"Brown Sugar Sachet","price":0,"isPreselected":false},
+      {"modifierCode":"sugarfree_sweetener2","title":"Sugarfree Sweetener Sachet","price":0,"isPreselected":false}
+    ]},
+    {"modifierGroup":"additional_shots","title":"Choose additional shots","modifierType":"checkbox","minSelection":0,"maxSelection":1,"modifiers":[
+      {"modifierCode":"one_shot","title":"One Additional Shot","price":3,"isPreselected":false},
+      {"modifierCode":"two_shots","title":"Two Additional Shots","price":5,"isPreselected":false}
+    ]},
+    {"modifierGroup":"add_syrup","title":"Choose additional syrup","modifierType":"checkbox","minSelection":0,"maxSelection":1,"modifiers":[
+      {"modifierCode":"dark_chocolate","title":"Dark Chocolate","price":4,"isPreselected":false},
+      {"modifierCode":"white_chocolate","title":"White Chocolate","price":4,"isPreselected":false},
+      {"modifierCode":"caramel","title":"Caramel","price":4,"isPreselected":false},
+      {"modifierCode":"french_vanilla","title":"French Vanilla","price":4,"isPreselected":false}
+    ]}
+  ]
+}

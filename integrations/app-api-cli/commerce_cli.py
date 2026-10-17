@@ -795,6 +795,13 @@ def main(argv=None):
     commands=parser.add_subparsers(dest='command',required=True)
     commands.add_parser('capabilities')
     commands.add_parser('restaurant-cart-contract')
+    options=commands.add_parser('item-options',help='Read Minutes option groups; no cart changes')
+    options.add_argument('vertical',choices=('minutes',))
+    options.add_argument('--sku',required=True)
+    options.add_argument('--query',help='Product-name search hint; result must match --sku exactly')
+    clear=commands.add_parser('clear-cart',help='Clear an unchanged cart owned by a closed, cart-only Minutes flow')
+    clear.add_argument('vertical',choices=('minutes',))
+    clear.add_argument('--flow',dest='flow_id',required=True)
     for name in ('menu','choices'):
         discovery=commands.add_parser(name,help='Read Talabat menu items or item choices; never changes a cart')
         discovery.add_argument('app',choices=('talabat',))
@@ -872,6 +879,13 @@ def main(argv=None):
     try:
         moni_go=require_moni_go(args)
         if args.command=='capabilities':result=capabilities()
+        elif args.command=='item-options':
+            from noon_minutes_options import read_options
+            result={'ok':True,'financial_send':False,'cart_mutation_sent':False,
+                    **read_options(args.sku,query=args.query)}
+        elif args.command=='clear-cart':
+            from commerce_minutes_cleanup import clear_cart
+            result=clear_cart(args.flow_id)
         elif args.command in ('menu','choices'):result=talabat_discovery(args)
         elif args.command=='restaurant-cart-contract':
             from talabat_restaurant_cart import contract
@@ -920,6 +934,11 @@ def main(argv=None):
         print(json.dumps(result))
         return 1 if result.get('ok') is False else 0
     except Exception as exc:
+        from noon_minutes_options import OptionsError
+        if isinstance(exc,OptionsError):
+            print(json.dumps({'ok':False,'error':exc.code,'details':exc.details,
+                              'financial_send':False,'financial_retry':False}))
+            return 1
         code=str(exc)
         preparation=re.fullmatch(r'PREPARATION_FAILED:(quote_(?:initial|initial_quiet|selected|selected_quiet|final_quiet)):([A-Z][A-Z0-9_]{1,99})',code)
         if isinstance(exc,talabat.orders.TalabatError) and preparation:

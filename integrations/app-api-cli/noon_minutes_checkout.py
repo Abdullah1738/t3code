@@ -16,6 +16,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import zlib
 
 import noon_http_orders as tracking
@@ -26,6 +27,7 @@ HOST = 'api-app-instant.noon.com'
 MAX_BYTES = 2_000_000
 QUIET_NOTE = "Leave at door. Don't ring bell. Don't call."
 ROUTES = {
+    'catalog_search': ('GET', HOST, '/_svc/catalog/search'),
     'session_get': ('POST', HOST, '/_svc/instant/session/get'),
     'sync': ('POST', HOST, '/_svc/instant/session/sync'),
     'instructions': ('POST', HOST, '/_svc/instant/session/delivery-instructions/set'),
@@ -158,7 +160,7 @@ def _observe_response(response, observer):
         raise MinutesError('RESPONSE_OBSERVATION_FAILED') from None
 
 
-def native_request(route, headers, deadline, payload, *, response_observer):
+def native_request(route, headers, deadline, payload, *, response_observer, query=None):
     """One request; response_observer(observation) runs before read/decode/errors.
 
     The observer must capture metadata in RAM, not retain auth yet: mutation
@@ -169,6 +171,13 @@ def native_request(route, headers, deadline, payload, *, response_observer):
     require(route in ROUTES, 'ENDPOINT_DENIED')
     require(callable(response_observer), 'RESPONSE_OBSERVER_REQUIRED')
     method, host, path = ROUTES[route]
+    if query is not None:
+        require(route == 'catalog_search' and payload is None and isinstance(query,dict)
+                and set(query) == {'q', 'page', 'rows', 'productsOnly'}
+                and isinstance(query['q'], str) and 0 < len(query['q']) <= 200
+                and query['page'] == 1 and query['rows'] == 50 and query['productsOnly'] == '1',
+                'INVALID_CATALOG_QUERY')
+        path += '?' + urllib.parse.urlencode(query)
     encoded = _json(payload) if payload is not None else None
     req = urllib.request.Request('https://' + host + path, headers=_headers(headers),
                                  method=method, data=encoded)
@@ -485,6 +494,28 @@ def project_active(data):
     return {'active': out, 'count': len(out), 'resend_allowed': False}
 
 
+def review_manifest(lines, expected_skus, *, mismatch='MANIFEST_MISMATCH'):
+    """Only explicitly flagged, zero-priced, unrequested gifts may be additional."""
+    expected_skus = _skus(expected_skus)
+    requested = {x['sku'] for x in expected_skus}
+    normal, gifts = [], []
+    for row in lines:
+        require(not row['bundle_present'] and not row['deal_code']
+                and row['cart_line_type'] in (None, 'normal'), 'SPECIAL_LINES_REQUIRE_REVIEW')
+        if row['is_freebie'] is True:
+            prices = [row[k] for k in ('price_minor', 'offer_price_minor', 'sale_price_minor')]
+            require(row['sku'] not in requested and row['quantity'] > 0
+                    and row['price_minor'] == 0 and all(x in (None, 0) for x in prices)
+                    and not row['modifiers'], 'SPECIAL_LINES_REQUIRE_REVIEW')
+            gifts.append(row)
+        else:
+            normal.append(row)
+    actual = sorted((x['sku'], x['quantity'], tuple(sorted(x['modifiers']))) for x in normal)
+    expected = sorted((x['sku'], x['qty'], tuple(sorted(x['modifiers']))) for x in expected_skus)
+    require(actual == expected and bool(actual), mismatch)
+    return normal, gifts
+
+
 def review_snapshot(snapshot, *, expected_skus, expected_total_minor, required_preferences, card):
     """Check exact review bindings. Parent still reviews all displayed fee rows.
 
@@ -500,12 +531,10 @@ def review_snapshot(snapshot, *, expected_skus, expected_total_minor, required_p
     require((p['summary'] is not None or p['summary_v2'] is not None)
             and p['subtotal_minor'] is not None, 'SUMMARY_REQUIRED')
     require(not p['bundle_oos_present'] and p['is_shutdown'] is False, 'CART_NOT_ORDERABLE')
-    require(all(not row['bundle_present'] and not row['is_freebie'] and not row['deal_code'] for row in p['lines']), 'SPECIAL_LINES_REQUIRE_REVIEW')
-    actual = sorted((x['sku'], x['quantity'], tuple(sorted(x['modifiers']))) for x in p['lines'])
-    expected = sorted((x['sku'], x['qty'], tuple(sorted(x['modifiers']))) for x in _skus(expected_skus))
-    require(actual == expected and actual, 'MANIFEST_MISMATCH')
+    normal, _ = review_manifest(p['lines'], expected_skus)
     # Merchant per-line cap from the observed cart; None means the server caps silently.
-    for row in p['lines']:
+    # Noon gives automatically added gifts qtyMax=0 (not customer-addable).
+    for row in normal:
         require(row['qty_max'] is None or row['quantity'] <= row['qty_max'],
                 'MERCHANT_QTY_MAX_EXCEEDED')
     payment = p['payment']

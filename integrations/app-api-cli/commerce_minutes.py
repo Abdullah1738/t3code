@@ -12,6 +12,7 @@ import uuid
 import commerce_journal as j
 import commerce_receipts as receipts
 import noon_minutes_checkout as m
+import noon_minutes_options as options
 import order_watch_receipt
 from noon_auth_lifecycle import NoonAuthLifecycle
 from noon_checkout import AccountHome
@@ -136,8 +137,12 @@ def _rows(rows):
         return rows  # let m._skus raise its native INVALID_LINES
     out=[]
     for row in rows:
-        if isinstance(row,dict) and 'modifiers' not in row:
-            row=dict(row); row['modifiers']=()
+        if isinstance(row,dict):
+            row=dict(row)
+            query=row.pop('catalog_query',None)
+            m.require(query is None or isinstance(query,str) and 0 < len(query.strip()) <= 200,
+                      'INVALID_CATALOG_QUERY')
+            row.setdefault('modifiers',())
         out.append(row)
     return out
 
@@ -147,9 +152,12 @@ class MinutesFlow:
         # Lane-native validation strictly BEFORE any auth/network work.
         if skus is not None and items is not None:
             j.fail('MINUTES_ITEMS_CONFLICT')
-        self.skus=m._skus(_rows(skus if skus is not None else items))
+        rows=skus if skus is not None else items
+        self.skus=m._skus(_rows(rows))
         if not self.skus:
             j.fail('MINUTES_SKUS_REQUIRED')
+        m.require(all(x['qty'] > 0 for x in self.skus), 'INVALID_QUANTITY')
+        self.catalog_queries={row['sku']:row.get('catalog_query') for row in rows}
         self.auth=auth or NoonAuthLifecycle()
         self.snapshot=self.auth.fresh_before_mutation('minutes')
         j.require_account_available('noon',self.snapshot.account_ref)
@@ -234,9 +242,19 @@ class MinutesFlow:
     def fill_empty(self):
         if self.current is None or self.current.projection['lines']:
             j.fail('EXISTING_MINUTES_CART_MUST_NOT_BE_REPLACED')
+        if not getattr(self,'_options_validated',False):
+            self.validate_options()
         self._expect('sync',{'skus':self.skus,'bundles':[],'refresh':False})
         self.current=self.client.sync(skus=self.skus,bundles=[],refresh=False,before_send=self._before,timeout=25)
+        m.review_manifest(self.current.projection['lines'],self.skus)
         return self.current.projection
+
+    def validate_options(self):
+        for item in self.skus:
+            catalog=options.read_options(item['sku'],
+                query=self.catalog_queries.get(item['sku']),auth=self.auth)
+            options.validate_selection(item,catalog)
+        self._options_validated=True
 
     def refresh_cart_readback(self):
         """Re-read the exact current session, never replay a cart mutation.
@@ -273,10 +291,8 @@ class MinutesFlow:
                                   'card':'5542','quiet':True,'extras':False})
         if self.scope_hash!=binding['scope_hash'] or self.snapshot.account_ref!=binding['account_hash']:
             j.fail('MINUTES_RECOVERY_SCOPE_MISMATCH')
-        actual=[(x['sku'],x['quantity'],tuple(x['modifiers'])) for x in self.current.projection['lines']]
-        expected=[(x['sku'],x['qty'],tuple(x['modifiers'])) for x in self.skus]
-        if actual!=expected or any(x['is_freebie'] or x['bundle_present'] or x['deal_code'] for x in self.current.projection['lines']):
-            j.fail('MINUTES_RECOVERY_MANIFEST_MISMATCH')
+        m.review_manifest(self.current.projection['lines'],self.skus,
+                          mismatch='MINUTES_RECOVERY_MANIFEST_MISMATCH')
         request=hashlib.sha256(m._json({'skus':self.skus,'bundles':[],'refresh':False})).hexdigest()
         j.reconcile_preparation(flow_id,'sync',request_hash=request,evidence_hash=j.digest(self.current.projection))
         self.opened=True;self.expected=None;self.review=None;self.cookies_in_ram=[]
@@ -317,12 +333,8 @@ class MinutesFlow:
                                   'card':'5542','quiet':True,'extras':False})
         if self.scope_hash!=binding['scope_hash'] or self.snapshot.account_ref!=binding['account_hash']:
             j.fail('MINUTES_RECOVERY_SCOPE_MISMATCH')
-        actual=[(x['sku'],x['quantity'],tuple(x['modifiers'])) for x in self.current.projection['lines']]
-        expected=[(x['sku'],x['qty'],tuple(x['modifiers'])) for x in self.skus]
-        if any(x['is_freebie'] or x['bundle_present'] or x['deal_code'] for x in self.current.projection['lines']):
-            j.fail('MINUTES_RECOVERY_MANIFEST_MISMATCH')
-        if sorted(actual)!=sorted(expected):
-            j.fail('MINUTES_RECOVERY_MANIFEST_MISMATCH')
+        m.review_manifest(self.current.projection['lines'],self.skus,
+                          mismatch='MINUTES_RECOVERY_MANIFEST_MISMATCH')
         self.opened=True;self.expected=None;self.review=None;self.intent=None
         self.cookies_in_ram=[]
         self.cart_hash=j.digest({'flow_id':flow_id,'account':self.snapshot.account_ref,'scope':self.scope_hash})
@@ -363,8 +375,11 @@ class MinutesFlow:
             required_preferences=('dont_ring_the_bell','leave_it_at_my_door'),card=card)
         self.review={'digest':digest,'amount':p['total_minor']}
         self.card=card
+        _,gifts=m.review_manifest(p['lines'],self.skus)
         return {'payable_minor':p['total_minor'],'subtotal_minor':p['subtotal_minor'],'fees':fees,
-                'card_last4':'5542','home':'Banyantree2104','quiet':True,'review_hash':digest}
+                'card_last4':'5542','home':'Banyantree2104','quiet':True,'review_hash':digest,
+                'provider_added_freebies':[{'sku':x['sku'],'title':x['title'],
+                    'quantity':x['quantity'],'price_minor':0} for x in gifts]}
 
     def prepare_only(self):
         """Non-financial prepare-only: cart fill, quiet, frozen review; STOP.
@@ -380,6 +395,8 @@ class MinutesFlow:
                     if self.opened else set())
         if self.current is None:
             if 'session_get' not in consumed:
+                # Check every required group before even opening a cart flow.
+                self.validate_options()
                 self.initial_session()
             if 'sync' not in consumed:
                 self.fill_empty()
