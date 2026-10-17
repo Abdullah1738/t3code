@@ -348,6 +348,24 @@ import {
   ScheduledTaskMutationResult,
 } from "./scheduledTask.ts";
 import { SecretRequestAnswerInput, SecretRequestError } from "./secretRequest.ts";
+// ardud missions: core
+import {
+  CreateMissionInput,
+  LockFieldInput,
+  MarkMissionSeenInput,
+  MissionError,
+  MissionInbox,
+  MissionInboxInput,
+  MissionMutationResult,
+  MissionStreamItem,
+  MissionSubscribeInput,
+  MissionSubscribeItem,
+  ReorderSubMissionsInput,
+  SetMissionFocusInput,
+  SetMissionStatusInput,
+  SetSubMissionStatusInput,
+  UpdateMissionInput,
+} from "./ardud/missions.ts";
 import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
@@ -522,6 +540,19 @@ export const WS_METHODS = {
   secretsAnswerRequest: "secrets.answerRequest",
   scheduledTasksListWebhookDeliveries: "scheduledTasks.listWebhookDeliveries",
   scheduledTasksGetWebhookDelivery: "scheduledTasks.getWebhookDelivery",
+
+  // ardud missions: core
+  missionsSubscribeList: "missions.subscribeList",
+  missionsSubscribe: "missions.subscribe",
+  missionsInbox: "missions.inbox",
+  missionsCreate: "missions.create",
+  missionsUpdate: "missions.update",
+  missionsSetStatus: "missions.setStatus",
+  missionsSetFocus: "missions.setFocus",
+  missionsSetSubMissionStatus: "missions.setSubMissionStatus",
+  missionsReorderSubMissions: "missions.reorderSubMissions",
+  missionsLockField: "missions.lockField",
+  missionsMarkSeen: "missions.markSeen",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -1844,6 +1875,67 @@ const WsScheduledTasksGetWebhookDeliveryRpc = Rpc.make(
   },
 );
 
+// ardud missions: core
+const MissionRpcError = Schema.Union([MissionError, EnvironmentAuthorizationError]);
+const WsMissionsSubscribeListRpc = Rpc.make(WS_METHODS.missionsSubscribeList, {
+  payload: Schema.Struct({}),
+  success: MissionStreamItem,
+  error: MissionRpcError,
+  stream: true,
+});
+const WsMissionsSubscribeRpc = Rpc.make(WS_METHODS.missionsSubscribe, {
+  payload: MissionSubscribeInput,
+  success: MissionSubscribeItem,
+  error: MissionRpcError,
+  stream: true,
+});
+const WsMissionsInboxRpc = Rpc.make(WS_METHODS.missionsInbox, {
+  payload: MissionInboxInput,
+  success: MissionInbox,
+  error: MissionRpcError,
+  stream: true,
+});
+const WsMissionsCreateRpc = Rpc.make(WS_METHODS.missionsCreate, {
+  payload: CreateMissionInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsUpdateRpc = Rpc.make(WS_METHODS.missionsUpdate, {
+  payload: UpdateMissionInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsSetStatusRpc = Rpc.make(WS_METHODS.missionsSetStatus, {
+  payload: SetMissionStatusInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsSetFocusRpc = Rpc.make(WS_METHODS.missionsSetFocus, {
+  payload: SetMissionFocusInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsSetSubMissionStatusRpc = Rpc.make(WS_METHODS.missionsSetSubMissionStatus, {
+  payload: SetSubMissionStatusInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsReorderSubMissionsRpc = Rpc.make(WS_METHODS.missionsReorderSubMissions, {
+  payload: ReorderSubMissionsInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsLockFieldRpc = Rpc.make(WS_METHODS.missionsLockField, {
+  payload: LockFieldInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsMarkSeenRpc = Rpc.make(WS_METHODS.missionsMarkSeen, {
+  payload: MarkMissionSeenInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
@@ -1875,7 +1967,28 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
   { error: EnvironmentAuthorizationError },
 ) {}
 
-export const WsRpcGroup = RpcGroup.make(
+// ardud missions: core
+/**
+ * Missions RPCs form their own group so the server implements them in a
+ * separate handler layer. A single `toLayer` over every WebSocket RPC hits
+ * TypeScript's instantiation depth limit near 200 RPCs (upstream cf13507f05).
+ */
+export const WsMissionsRpcGroup = RpcGroup.make(
+  WsMissionsSubscribeListRpc,
+  WsMissionsSubscribeRpc,
+  WsMissionsInboxRpc,
+  WsMissionsCreateRpc,
+  WsMissionsUpdateRpc,
+  WsMissionsSetStatusRpc,
+  WsMissionsSetFocusRpc,
+  WsMissionsSetSubMissionStatusRpc,
+  WsMissionsReorderSubMissionsRpc,
+  WsMissionsLockFieldRpc,
+  WsMissionsMarkSeenRpc,
+).middleware(RpcScopeAuthorization);
+
+/** Every WebSocket RPC not in a domain group merged into `WsRpcGroup` below. */
+export const WsCoreRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
@@ -2070,3 +2183,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeShellRpc,
   WsOrchestrationV2SubscribeThreadRpc,
 ).middleware(RpcScopeAuthorization);
+
+export const WsRpcGroup = WsCoreRpcGroup.merge(
+  // ardud missions: core
+  WsMissionsRpcGroup,
+);

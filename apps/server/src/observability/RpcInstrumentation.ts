@@ -208,6 +208,18 @@ const RPC_AGGREGATES = {
   [WS_METHODS.subscribeServerLifecycle]: "server",
   [WS_METHODS.subscribeAuthAccess]: "auth",
   [WS_METHODS.subscribeBackgroundPolicy]: "server",
+  // ardud missions: core
+  [WS_METHODS.missionsSubscribeList]: "missions",
+  [WS_METHODS.missionsSubscribe]: "missions",
+  [WS_METHODS.missionsInbox]: "missions",
+  [WS_METHODS.missionsCreate]: "missions",
+  [WS_METHODS.missionsUpdate]: "missions",
+  [WS_METHODS.missionsSetStatus]: "missions",
+  [WS_METHODS.missionsSetFocus]: "missions",
+  [WS_METHODS.missionsSetSubMissionStatus]: "missions",
+  [WS_METHODS.missionsReorderSubMissions]: "missions",
+  [WS_METHODS.missionsLockField]: "missions",
+  [WS_METHODS.missionsMarkSeen]: "missions",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";
