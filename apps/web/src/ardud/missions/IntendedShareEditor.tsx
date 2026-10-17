@@ -3,19 +3,16 @@ import { useState } from "react";
 import {
   formatPercent,
   INTENDED_EFFORT_SOURCE_LABEL,
-  parseShareInput,
   type PriorityStackRow,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../components/ui/popover";
-import { toastManager } from "../../components/ui/toast";
-import { runMissionAction } from "./missionActions";
-import { missionsSource } from "./missionsStore";
+import { handBackIntendedShare, setIntendedShare } from "./missionCommands";
 
-// Presentation plus form state. Parsing lives in client-runtime
-// (`parseShareInput`); the source locks the field on an owner edit.
+// Presentation plus form state. Parsing and the source call live in
+// missionCommands; the source locks the field on an owner edit.
 
 /**
  * The intended share on one priority-stack row: who set it and an editor.
@@ -28,27 +25,14 @@ export function IntendedShareEditor(props: { row: PriorityStackRow }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const save = async (share: number | null) => {
+  const run = async (action: Promise<boolean>) => {
     setBusy(true);
-    const sent = await runMissionAction(
-      missionsSource.setIntendedEffort({ subMissionId: sub.id, share }),
-      "Couldn't change the share",
-    );
+    const sent = await action;
     setBusy(false);
     if (sent) setOpen(false);
   };
-  const submit = () => {
-    const parsed = parseShareInput(text);
-    if (!parsed.ok) {
-      toastManager.add({
-        type: "warning",
-        title: "Couldn't change the share",
-        description: parsed.error,
-      });
-      return;
-    }
-    void save(parsed.share);
-  };
+  const submit = () => void run(setIntendedShare(sub.id, text));
+  const handBack = () => void run(handBackIntendedShare(sub.id));
 
   return (
     <Popover
@@ -92,13 +76,7 @@ export function IntendedShareEditor(props: { row: PriorityStackRow }) {
           </p>
           <div className="flex flex-wrap justify-end gap-2">
             {row.intendedBy === "owner" ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                disabled={busy}
-                onClick={() => void save(null)}
-              >
+              <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={handBack}>
                 Hand back to master
               </Button>
             ) : null}

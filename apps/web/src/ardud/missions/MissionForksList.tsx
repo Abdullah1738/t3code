@@ -2,7 +2,6 @@ import { useState } from "react";
 
 import type { MissionId } from "@t3tools/contracts";
 import {
-  askTheMissionInput,
   FORK_KIND_LABEL,
   forkTitle,
   formatRelative,
@@ -11,10 +10,10 @@ import {
 
 import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
-import { runMissionAction, submitMissionInput } from "./missionActions";
-import { missionsSource, useMissionForks } from "./missionsStore";
+import { askTheMission, closeFork } from "./missionCommands";
+import { useMissionForks } from "./missionsStore";
 
-// Presentation over `useMissionForks`; the only logic is calling the source.
+// Presentation over `useMissionForks`; actions come from missionCommands.
 
 /**
  * Open forks of the master (Discuss threads and the owner's side questions).
@@ -38,16 +37,7 @@ export function MissionForksList(props: { missionId: MissionId | null; nowMs: nu
               {formatRelative(entry.fork.createdAt, props.nowMs)} · thread not connected yet
             </p>
           </div>
-          <Button
-            size="xs"
-            variant="ghost"
-            onClick={() =>
-              void runMissionAction(
-                missionsSource.archiveFork({ forkId: entry.fork.id }),
-                "Couldn't close the discussion",
-              )
-            }
-          >
+          <Button size="xs" variant="ghost" onClick={() => void closeFork(entry.fork.id)}>
             Close
           </Button>
         </li>
@@ -62,11 +52,7 @@ export function AskTheMissionForm(props: { missionId: MissionId; onAsked?: () =>
   const [busy, setBusy] = useState(false);
   const ask = async () => {
     setBusy(true);
-    const sent = await submitMissionInput(
-      askTheMissionInput(props.missionId, question),
-      (input) => missionsSource.openFork(input),
-      "Couldn't ask the mission",
-    );
+    const sent = await askTheMission(props.missionId, question);
     setBusy(false);
     if (!sent) return;
     setQuestion("");

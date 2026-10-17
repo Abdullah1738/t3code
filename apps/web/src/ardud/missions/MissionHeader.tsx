@@ -35,11 +35,10 @@ import {
   MenuTrigger,
 } from "../../components/ui/menu";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../components/ui/popover";
-import { requestConfirmDialog } from "../../confirmDialog";
 import { cn } from "../../lib/utils";
-import { runMissionAction } from "./missionActions";
+import { setMissionFocus, toggleMissionPaused } from "./missionCommands";
 import { AskTheMissionForm, MissionForksList } from "./MissionForksList";
-import { missionsSource, useMissionForks, useMissionList } from "./missionsStore";
+import { useMissionForks, useMissionList } from "./missionsStore";
 import { HEALTH_BADGE_VARIANT, LANE_DOT_CLASS } from "./missionTone";
 
 const NO_FOCUS = "none";
@@ -122,10 +121,7 @@ function FocusMenu(props: { overview: MissionOverview }) {
     const subMissionId =
       typeof value === "string" && value !== NO_FOCUS ? (value as SubMissionId) : null;
     if (subMissionId === mission.focusSubMissionId) return;
-    void runMissionAction(
-      missionsSource.setMissionFocus({ missionId: mission.id, subMissionId }),
-      "Could not change focus",
-    );
+    void setMissionFocus(mission.id, subMissionId);
   };
   return (
     <Menu>
@@ -169,20 +165,8 @@ function PauseButton(props: {
   title: string;
   paused: boolean;
 }) {
-  const toggle = async () => {
-    if (!props.paused) {
-      const confirmed = await (requestConfirmDialog(
-        `Pause ${props.title}? Lanes stop at their next safe point and nothing new starts until you resume.`,
-      ) ?? Promise.resolve(true));
-      if (!confirmed) return;
-    }
-    await runMissionAction(
-      missionsSource.setMissionPaused({ missionId: props.missionId, paused: !props.paused }),
-      props.paused ? "Could not resume the mission" : "Could not pause the mission",
-    );
-  };
   return (
-    <Button variant="outline" size="sm" onClick={() => void toggle()}>
+    <Button variant="outline" size="sm" onClick={() => void toggleMissionPaused(props)}>
       {props.paused ? <PlayIcon aria-hidden /> : <PauseIcon aria-hidden />}
       {props.paused ? "Resume" : "Pause"}
     </Button>

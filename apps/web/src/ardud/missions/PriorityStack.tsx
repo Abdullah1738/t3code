@@ -30,8 +30,7 @@ import {
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { cn } from "../../lib/utils";
-import { runMissionAction } from "./missionActions";
-import { missionsSource } from "./missionsStore";
+import { reorderSubMissions } from "./missionCommands";
 import { IntendedShareEditor } from "./IntendedShareEditor";
 import { HEALTH_DOT_CLASS } from "./missionTone";
 import { MissionSection } from "./MissionSection";
@@ -67,10 +66,7 @@ export function PriorityStack(props: {
     if (!over || active.id === over.id) return;
     const next = moveInOrder(order, active.id as SubMissionId, over.id as SubMissionId);
     setPendingOrder(next);
-    void runMissionAction(
-      missionsSource.reorderSubMissions({ missionId: props.mission.id, order: next }),
-      "Could not reorder sub-missions",
-    ).then(() => setPendingOrder(null));
+    void reorderSubMissions(props.mission.id, next).then(() => setPendingOrder(null));
   };
 
   return (

@@ -27,8 +27,8 @@ import {
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
-import { runMissionAction } from "./missionActions";
-import { missionsSource, useMissionForks } from "./missionsStore";
+import { markMissionSeen, reactToCall } from "./missionCommands";
+import { useMissionForks } from "./missionsStore";
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { MissionSection } from "./MissionSection";
 import { PriorityStack } from "./PriorityStack";
@@ -259,14 +259,7 @@ function DirectionCheckRow(props: {
   const [busy, setBusy] = useState(false);
   const react = (reaction: "ok" | "discuss") => {
     setBusy(true);
-    void runMissionAction(
-      missionsSource.reactToCall({
-        missionId: props.missionId,
-        callId: item.ref.id as Parameters<typeof missionsSource.reactToCall>[0]["callId"],
-        reaction,
-      }),
-      "Could not record your reaction",
-    ).then(() => setBusy(false));
+    void reactToCall(props.missionId, item.ref.id, reaction).then(() => setBusy(false));
   };
   return (
     <li className="flex min-w-0 flex-col gap-2 py-2.5 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:gap-4">
@@ -330,11 +323,7 @@ function Feed(props: { overview: MissionOverview; nowMs: number }) {
       : overview.feed.length > 0
         ? "Nothing new"
         : undefined;
-  const markSeen = () =>
-    void runMissionAction(
-      missionsSource.markMissionSeen({ missionId: overview.mission.id }),
-      "Could not mark as seen",
-    );
+  const markSeen = () => void markMissionSeen(overview.mission.id);
   return (
     <MissionSection
       title={sinceLastLookedLabel(overview.ownerLastLookedAt, nowMs)}

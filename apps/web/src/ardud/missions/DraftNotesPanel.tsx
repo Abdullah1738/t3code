@@ -2,7 +2,6 @@ import { useState } from "react";
 
 import type { DraftChannel, MissionId } from "@t3tools/contracts";
 import {
-  addDraftNoteInput,
   DRAFT_CHANNEL_LABEL,
   DRAFT_CHANNELS,
   groupDraftNotes,
@@ -20,11 +19,12 @@ import {
 } from "../../components/ui/select";
 import { Switch } from "../../components/ui/switch";
 import { Textarea } from "../../components/ui/textarea";
-import { runMissionAction, submitMissionInput } from "./missionActions";
-import { missionsSource, useDraftNotes } from "./missionsStore";
+import { addDraftNote, setDraftNoteActive } from "./missionCommands";
+import { useDraftNotes } from "./missionsStore";
 
 // Draft notes ("how I want drafts to be"): list, add, turn off. Presentation
-// plus form state; grouping and validation come from client-runtime.
+// plus form state; grouping comes from client-runtime, actions from
+// missionCommands.
 
 type ScopeKind = DraftNoteScopeChoice["kind"];
 
@@ -53,12 +53,7 @@ export function DraftNotesPanel(props: { missionId: MissionId | null }) {
                     size="sm"
                     aria-label={note.active ? "Turn off" : "Turn on"}
                     checked={note.active}
-                    onCheckedChange={(active) =>
-                      void runMissionAction(
-                        missionsSource.setDraftNoteActive({ draftNoteId: note.id, active }),
-                        "Couldn't change the note",
-                      )
-                    }
+                    onCheckedChange={(active) => void setDraftNoteActive(note.id, active)}
                   />
                   <span className={note.active ? "text-foreground" : "text-muted-foreground"}>
                     {note.text}
@@ -84,11 +79,7 @@ function AddDraftNoteForm(props: { missionId: MissionId | null }) {
     kind === "all" ? { kind } : kind === "channel" ? { kind, channel } : { kind, name: person };
   const add = async () => {
     setBusy(true);
-    const sent = await submitMissionInput(
-      addDraftNoteInput(props.missionId, scope, text),
-      (input) => missionsSource.addDraftNote(input),
-      "Couldn't add the note",
-    );
+    const sent = await addDraftNote(props.missionId, scope, text);
     setBusy(false);
     if (sent) setText("");
   };
