@@ -12,8 +12,11 @@ export const MARKER =
 const MARKER_PREFIX = '<!-- UPDATES-INSERT-BELOW';
 const STORY = /<!-- STORY-START[\s\S]*?<!-- STORY-END -->/;
 
-// Files this exporter must never write: the live hand-kept reports.
-const LIVE = [/\/crpko-devops\/tmp\/coordinator-study-[^/]+\/status\//];
+// Files this exporter must never write: the live hand-kept reports. Case
+// does not count: the external volume is case-insensitive.
+const LIVE = [/\/crpko-devops\/tmp\/coordinator-study-[^/]+\/status\//i];
+// First line of every daily this exporter writes; anything else is not ours.
+const DAILY_STAMP = '<!-- scribe daily -->';
 
 const header = (title) =>
   [
@@ -28,10 +31,10 @@ const header = (title) =>
 const real = (path) => {
   const abs = resolve(path);
   try {
-    return realpathSync(abs);
+    return realpathSync.native(abs);
   } catch {
     try {
-      return resolve(realpathSync(dirname(abs)), abs.split('/').pop());
+      return resolve(realpathSync.native(dirname(abs)), abs.split('/').pop());
     } catch {
       return abs;
     }
@@ -68,4 +71,18 @@ export const exportUpdate = (path, section, { title = 'Mission' } = {}) => {
   const { text, inserted } = insertUpdate(current, section);
   if (inserted || !existsSync(path)) writeFileSync(path, text);
   return { path, inserted };
+};
+
+/**
+ * Writes a daily summary to `path`. Refuses the live report files, and only
+ * overwrites a file this exporter wrote before (it starts with a stamp line).
+ */
+export const exportDaily = (path, text) => {
+  if (isLiveReport(path)) throw new Error(`refusing to write the live report file ${path}`);
+  if (existsSync(path) && !readFileSync(path, 'utf8').startsWith(DAILY_STAMP)) {
+    throw new Error(`refusing to overwrite ${path}: it was not written by scribe`);
+  }
+  mkdirSync(dirname(resolve(path)), { recursive: true });
+  writeFileSync(path, `${DAILY_STAMP}\n${text.endsWith('\n') ? text : `${text}\n`}`);
+  return { path, inserted: true };
 };

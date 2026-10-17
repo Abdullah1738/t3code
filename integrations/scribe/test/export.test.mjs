@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MARKER, exportUpdate, insertUpdate, isLiveReport } from '../lib/export.mjs';
+import { MARKER, exportDaily, exportUpdate, insertUpdate, isLiveReport } from '../lib/export.mjs';
 
 const FILE = [
   '# Crpko: running update for Abdullah',
@@ -68,4 +68,24 @@ test('the live Crpko report file is refused', () => {
   assert.equal(isLiveReport(live), true);
   assert.throws(() => exportUpdate(live, section), /refusing to write the live report file/);
   assert.equal(isLiveReport(join(tmpdir(), 'OWNER-UPDATES.md')), false);
+});
+
+test('the live check ignores case, and the daily export refuses live and foreign files', () => {
+  const shouty =
+    '/Volumes/ExternalSSD/Crpko-Devops/tmp/coordinator-study-20261002/status/OWNER-UPDATES.md';
+  assert.equal(isLiveReport(shouty), true);
+  assert.throws(() => exportDaily(shouty, '# daily\n'), /refusing to write the live report file/);
+  const dir = mkdtempSync(join(tmpdir(), 'scribe-daily-'));
+  try {
+    const path = join(dir, 'DAILY.md');
+    exportDaily(path, '# day one\n');
+    exportDaily(path, '# day two\n');
+    assert.ok(readFileSync(path, 'utf8').includes('# day two'));
+    const foreign = join(dir, 'notes.md');
+    writeFileSync(foreign, 'my own notes\n');
+    assert.throws(() => exportDaily(foreign, '# daily\n'), /not written by scribe/);
+    assert.equal(readFileSync(foreign, 'utf8'), 'my own notes\n');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

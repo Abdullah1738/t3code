@@ -132,7 +132,7 @@ async function report(opts) {
   if (!opts.mission || !['update', 'daily'].includes(opts.kind)) {
     throw new Error('report needs --mission and --kind update|daily');
   }
-  const { exportUpdate } = await import('./lib/export.mjs');
+  const { exportDaily, exportUpdate } = await import('./lib/export.mjs');
   const client = serverClient();
   const built = await client.report({
     missionId: opts.mission,
@@ -145,7 +145,7 @@ async function report(opts) {
   const written =
     opts.kind === 'update'
       ? exportUpdate(out, built.text, { title: opts.title || opts.mission })
-      : (write(out, built.text), { path: out, inserted: true });
+      : exportDaily(out, built.text);
   return { ...written, coversFrom: built.coversFrom, coversTo: built.coversTo, open: built.open.length };
 }
 
