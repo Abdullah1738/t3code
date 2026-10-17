@@ -83,3 +83,27 @@ export const watchCheckCommand = (input: {
     "--cursor",
     '"$WATCH_DIR/mission-cursor"',
   ].join(" ");
+
+/** The `robob-watch add` line that installs a watch as a wake-mode watcher. */
+export const watchAddCommand = (input: {
+  readonly cli: string;
+  readonly missionId: string;
+  readonly kinds: ReadonlyArray<WatchKind>;
+  readonly intervalSeconds?: number;
+}): string =>
+  [
+    "robob-watch add",
+    "--id",
+    shellQuote(`mission-${input.missionId}-${input.kinds.join("-")}`),
+    "--title",
+    shellQuote(`Mission ${input.missionId}: ${input.kinds.join(", ")}`),
+    "--check",
+    shellQuote(watchCheckCommand(input)),
+    "--mode wake",
+    "--interval",
+    String(input.intervalSeconds ?? 120),
+    "--context",
+    shellQuote(
+      `Mission ${input.missionId} changed (${input.kinds.join(", ")}). Read it with mission_status or mission_digest.`,
+    ),
+  ].join(" ");
