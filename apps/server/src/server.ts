@@ -186,6 +186,8 @@ import { ardudBoardRouteLayer } from "./ardud/board/http.ts";
 // ardud fork: OpenCode session import
 import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
+// ardud missions: core
+import { ArdudMissionsLive } from "./ardud/missions/layer.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
@@ -602,6 +604,8 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ReplayMarkers.layer,
   ArdudBoardLive,
   ArdudOpenCodeImportLive,
+  // ardud missions: core
+  ArdudMissionsLive,
   // Catches overrides left behind by a project deleted before this cleanup
   // existed, or by a cleanup write that failed. See ProjectService.delete
   // for the normal (on-delete) path.
