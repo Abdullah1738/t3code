@@ -32,12 +32,12 @@ import { countLanes } from "./health.ts";
  */
 
 const SUMMARY_MAX = 400;
-export const DIRECTION_CHECK_LIMIT = 20;
-export const FEED_LIMIT = 30;
-export const CRITICAL_PATH_LIMIT = 30;
+const DIRECTION_CHECK_LIMIT = 20;
+const FEED_LIMIT = 30;
+const CRITICAL_PATH_LIMIT = 30;
 export const INBOX_LIST_LIMIT = 50;
 
-export const cutSummary = (text: string): string => {
+const cutSummary = (text: string): string => {
   const trimmed = text.trim();
   if (trimmed.length === 0) return "(no summary)";
   return trimmed.length <= SUMMARY_MAX ? trimmed : `${trimmed.slice(0, SUMMARY_MAX - 1)}…`;

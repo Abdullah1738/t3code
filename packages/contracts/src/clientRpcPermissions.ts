@@ -47,6 +47,15 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.scheduledTasksRunNow]: AuthOrchestrationOperateScope,
   [WS_METHODS.scheduledTasksRotateWebhookToken]: AuthOrchestrationOperateScope,
   [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: AuthOrchestrationOperateScope,
+  // ardud missions: core
+  [WS_METHODS.missionsCreate]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsUpdate]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetStatus]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetFocus]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetSubMissionStatus]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsReorderSubMissions]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsLockField]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsMarkSeen]: AuthOrchestrationOperateScope,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 
