@@ -1595,6 +1595,81 @@ export const UpsertRuleInput = Schema.Struct({
 });
 export type UpsertRuleInput = typeof UpsertRuleInput.Type;
 
+// --- asks additions ---
+
+/** The asker or the owner takes an open ask back; what it held is released. */
+export const WithdrawAskInput = Schema.Struct({
+  askId: AskId,
+  reason: Schema.String,
+});
+export type WithdrawAskInput = typeof WithdrawAskInput.Type;
+
+/** Owner-only: an answered ask goes back to open (the way out of an answer). */
+export const ReopenAskInput = Schema.Struct({
+  askId: AskId,
+  reason: Schema.String,
+});
+export type ReopenAskInput = typeof ReopenAskInput.Type;
+
+/** Owner-only reaction to a master's call in the direction check; null clears it. */
+export const ReactToCallInput = Schema.Struct({
+  callId: CallId,
+  reaction: Schema.NullOr(Schema.Literals(["ok", "discuss", "overruled"])),
+  note: Schema.optional(Schema.String),
+});
+export type ReactToCallInput = typeof ReactToCallInput.Type;
+
+/** Owner-only: write, edit or retire a draft note. */
+export const SaveDraftNoteInput = Schema.Struct({
+  noteId: Schema.optional(DraftNoteId),
+  missionId: Schema.NullOr(MissionId),
+  scope: DraftNoteScope,
+  text: TrimmedNonEmptyString,
+  active: Schema.optional(Schema.Boolean),
+});
+export type SaveDraftNoteInput = typeof SaveDraftNoteInput.Type;
+
+/** Owner-only: an approved or dropped draft goes back to pending. */
+export const ReopenDraftInput = Schema.Struct({
+  draftId: DraftId,
+});
+export type ReopenDraftInput = typeof ReopenDraftInput.Type;
+
+/** Owner-only: a dismissed suggestion goes back to open. */
+export const ReopenSuggestionInput = Schema.Struct({
+  suggestionId: SuggestionId,
+});
+export type ReopenSuggestionInput = typeof ReopenSuggestionInput.Type;
+
+/**
+ * Fork the master's thread at its latest stable point: Discuss on a card, or
+ * a side question answered from the master's context without disturbing it.
+ */
+export const StartForkInput = Schema.Struct({
+  missionId: MissionId,
+  kind: Schema.Literals(["discuss", "dev-question", "owner-question"]),
+  origin: Schema.NullOr(Schema.Union([MissionRecordRef, MissionLink])),
+  question: Schema.optional(TrimmedNonEmptyString),
+});
+export type StartForkInput = typeof StartForkInput.Type;
+
+/** A fork ends with one line for the master; only the owner can say it commits the mission. */
+export const CloseForkInput = Schema.Struct({
+  forkId: ForkId,
+  summaryLine: TrimmedNonEmptyString,
+  commitsMission: Schema.optional(Schema.Boolean),
+});
+export type CloseForkInput = typeof CloseForkInput.Type;
+
+/** Owner-only fork follow-ups: mark an answered fork as committing, archive it, or reopen it. */
+export const UpdateForkInput = Schema.Struct({
+  forkId: ForkId,
+  action: Schema.Literals(["commits-mission", "archive", "reopen"]),
+});
+export type UpdateForkInput = typeof UpdateForkInput.Type;
+
+// --- end asks additions ---
+
 // ---------------------------------------------------------------------------
 // Errors
 
