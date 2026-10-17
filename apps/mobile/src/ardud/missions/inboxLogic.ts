@@ -120,7 +120,7 @@ export function useDraftCard(draft: Draft): DraftCardState {
     drop: () =>
       confirmAction({
         title: "Drop this draft?",
-        message: "Nothing is sent and the writer is not asked again.",
+        message: "The draft is not sent.",
         confirmLabel: "Drop",
         destructive: true,
         onConfirm: () => decide("Could not drop the draft", { action: "drop" }),
@@ -156,7 +156,7 @@ export function useApprovalCard(approval: Approval): ApprovalCardState {
     reject: () =>
       confirmAction({
         title: `Reject "${approval.title}"?`,
-        message: "The requester is told it was rejected, with your note if you wrote one.",
+        message: "Your note goes with the rejection if you wrote one.",
         confirmLabel: "Reject",
         destructive: true,
         onConfirm: () => decide("Could not reject", "reject"),
@@ -202,7 +202,7 @@ export function useKnockCard(knock: Knock): KnockCardState {
     drop: () =>
       confirmAction({
         title: "Drop this knock?",
-        message: `The master never sees it. "${knock.fromTitle}" is not told.`,
+        message: "The master never sees it.",
         confirmLabel: "Drop",
         destructive: true,
         onConfirm: () => decide("Could not drop the knock", { action: "drop" }),

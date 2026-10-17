@@ -244,7 +244,7 @@ export function SuggestionCard(props: { readonly suggestion: Suggestion }) {
           autoFocus
           value={card.dismissReason}
           onChangeText={card.setDismissReason}
-          placeholder="Why not? (optional, teaches the scribe)"
+          placeholder="Why not? (optional)"
           accessibilityLabel="Dismiss reason"
         />
       ) : null}
