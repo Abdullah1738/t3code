@@ -15,7 +15,7 @@ import {
   readPositionId,
 } from "./apply.ts";
 import { coordActorFor, HAIKU_XHIGH, OPUS_XHIGH, parseCoordBodyText } from "./coordIds.ts";
-import { awaitingStaleReason, buildImportPlan, workLinks } from "./mapping.ts";
+import { awaitingStaleReason, buildImportPlan, crwApprovalId, workLinks } from "./mapping.ts";
 import type { ImportSources } from "./readers.ts";
 import { countChecks } from "./report.ts";
 import { parseDeferred, parseLanePulse, parseLaneRoster, parseStandingRules } from "./sources.ts";
@@ -287,7 +287,7 @@ describe("buildImportPlan", () => {
   it("opens approvals for review decisions still with us and closes stale ones", () => {
     const p = plan();
     const approval = (id: string) => p.core.approvals.find((a) => a.id === id)!;
-    expect(approval("crpko:approval:crw:Equicom-Crypto/edge-api#9")).toMatchObject({
+    expect(approval("crpko:approval:crw:Equicom-Crypto/edge-api#9@abc123")).toMatchObject({
       status: "pending",
       requestedBy: "crw",
       staleReason: null,
@@ -346,6 +346,12 @@ describe("workLinks and coordActorFor", () => {
     ]);
     expect(workLinks("harness")).toEqual([]);
     expect(workLinks(null)).toEqual([]);
+  });
+  it("uses the crw adapter's approval id for review decisions", () => {
+    expect(crwApprovalId("crpko", "o/r#1", "0123456789abcdef")).toBe(
+      "crpko:approval:crw:o/r#1@0123456789ab",
+    );
+    expect(crwApprovalId("crpko", "o/r#1", null)).toBe("crpko:approval:crw:o/r#1");
   });
   it("maps mission actors back to coord actors", () => {
     expect(coordActorFor("crpko", { _tag: "role", roleId: RoleId.make("crpko:master") })).toBe(
@@ -449,7 +455,7 @@ it.layer(TestLayer)("applyImport over existing records", (it) => {
       if (Option.isSome(kept)) assert.strictEqual(kept.value.title, "INR is out");
       const approval = yield* store.get(
         "approval",
-        ApprovalId.make("crpko:approval:crw:Equicom-Crypto/edge-api#9"),
+        ApprovalId.make("crpko:approval:crw:Equicom-Crypto/edge-api#9@abc123"),
       );
       if (Option.isNone(approval)) return assert.fail("approval missing");
       const record: Approval = approval.value;

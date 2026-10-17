@@ -187,6 +187,10 @@ const FINISHED_TICKETS = new Set([
   "QA Automated Tested",
 ]);
 
+/** Approval id the crw adapter uses for one review decision: `<mission>:approval:crw:<pr>@<head12>`. */
+export const crwApprovalId = (missionId: string, prKey: string, headSha: string | null): string =>
+  `${missionId}:approval:crw:${prKey}${headSha ? `@${headSha.slice(0, 12)}` : ""}`;
+
 /**
  * Why an Awaiting Decision thread is stale, or null while it still needs the
  * owner. Mirrors crw's ticketsAway: open PR, repo not excluded, and every live
@@ -589,7 +593,9 @@ export const buildImportPlan = (sources: ImportSources, options: ImportOptions):
       const stale = awaitingStaleReason(a, crw.config);
       const tickets = a.tickets.map((t) => `${t.id} ${t.state}`).join(", ") || "none";
       approvals.push({
-        id: ApprovalId.make(`${m}:approval:crw:${a.prKey}`),
+        // Same id the crw adapter opens (`<pr>@<head12>`), so its later open of this head
+        // settles as already open instead of creating a duplicate.
+        id: ApprovalId.make(crwApprovalId(m, a.prKey, a.headSha)),
         missionId: m,
         kind: "other",
         title: `Review decision: ${a.prKey} ${firstLine(a.title, "")}`.trim(),
