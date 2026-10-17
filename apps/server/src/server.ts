@@ -188,6 +188,8 @@ import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 // ardud missions: core
 import { ArdudMissionsLive } from "./ardud/missions/layer.ts";
+// ardud missions: asks
+import { missionsDeskRouteLayer } from "./ardud/missions/asks/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
@@ -744,6 +746,8 @@ const layerMakeRoutes = Layer.mergeAll(
     controlRouteLayer,
     ardudBoardRouteLayer,
     openCodeImportRouteLayer,
+    // ardud missions: asks
+    missionsDeskRouteLayer,
     ServerHttp.layerStaticAndDevRoute,
     Ws.layer,
   ),
