@@ -30,7 +30,12 @@ import type {
   SuggestionTargetKind,
 } from "@t3tools/contracts";
 
-import type { AddDraftNoteInput, MissionForkEntry, MissionInboxHistory } from "./source.ts";
+import type {
+  AddDraftNoteInput,
+  MissionForkEntry,
+  MissionInboxHistory,
+  OpenForkInput,
+} from "./source.ts";
 import { diffStats, diffWords, type DiffSegment, type DiffStats } from "./textDiff.ts";
 import { actorLabel, refLabel } from "./viewModel.ts";
 
@@ -269,6 +274,30 @@ export function openForkFor(
         entry.fork.origin.id === ref.id,
     ) ?? null
   );
+}
+
+/**
+ * "Discuss first" on an ask: a fork of the master about that ask instead of
+ * an answer. The ask stays open; whatever the owner types opens the fork.
+ */
+export function discussAskInput(
+  ask: Pick<Ask, "id" | "missionId" | "question">,
+  note: string,
+): OpenForkInput {
+  const question = note.trim();
+  return {
+    missionId: ask.missionId,
+    kind: "discuss",
+    origin: { kind: "ask", id: ask.id, label: ask.question },
+    ...(question === "" ? {} : { question }),
+  };
+}
+
+/** "Ask the mission": an owner side question answered by a fork of the master. */
+export function askTheMissionInput(missionId: MissionId, question: string): Result<OpenForkInput> {
+  const trimmed = question.trim();
+  if (trimmed === "") return err("Write the question first.");
+  return ok({ missionId, kind: "owner-question", origin: null, question: trimmed });
 }
 
 export function forkTitle(entry: MissionForkEntry): string {

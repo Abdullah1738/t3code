@@ -5,12 +5,14 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   addDraftNoteInput,
   answerAskInput,
+  askTheMissionInput,
   askView,
   blocksLine,
   decideDraftInput,
   decideKnockInput,
   decideSuggestionInput,
   defaultInboxTab,
+  discussAskInput,
   draftNotesFor,
   draftOwnerEdit,
   fyiView,
@@ -367,6 +369,31 @@ describe("forks and FYI", () => {
     ];
     expect(openForkFor(forks, { kind: "call", id: "call-1" })?.fork.id).toBe("open");
     expect(openForkFor(forks, { kind: "call", id: "call-2" })).toBeNull();
+  });
+
+  it("opens a Discuss fork on an ask without answering it", () => {
+    expect(discussAskInput(ask(), "  ")).toEqual({
+      missionId: "m",
+      kind: "discuss",
+      origin: { kind: "ask", id: "ask-1", label: "Stamp r004 now?" },
+    });
+    expect(discussAskInput(ask(), " why not both? ").question).toBe("why not both?");
+  });
+
+  it("needs a question before asking the mission", () => {
+    expect(askTheMissionInput("m" as never, " ")).toEqual({
+      ok: false,
+      error: "Write the question first.",
+    });
+    expect(askTheMissionInput("m" as never, " Is risk#68 on time? ")).toEqual({
+      ok: true,
+      value: {
+        missionId: "m",
+        kind: "owner-question",
+        origin: null,
+        question: "Is risk#68 on time?",
+      },
+    });
   });
 
   it("separates observed from claimed and shows the evidence state", () => {

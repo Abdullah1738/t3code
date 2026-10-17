@@ -1,16 +1,26 @@
 import { useMemo } from "react";
 import { Link } from "@tanstack/react-router";
-import { CrosshairIcon, MessageCircleQuestionIcon, PauseIcon, PlayIcon } from "lucide-react";
+import {
+  CrosshairIcon,
+  InboxIcon,
+  MessageCircleQuestionIcon,
+  PauseIcon,
+  PlayIcon,
+} from "lucide-react";
 
-import type { MissionOverview, SubMissionId } from "@t3tools/contracts";
+import type { MissionId, MissionOverview, SubMissionId } from "@t3tools/contracts";
 import {
   foldLaneCounts,
   formatCountdown,
   formatDayLabel,
   healthLabel,
   nextMilestone,
+  poolUsageView,
   priorityStack,
+  splitForks,
   usageView,
+  badgeCount,
+  type MissionOverviewSnapshot,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Badge } from "../../components/ui/badge";
@@ -28,13 +38,14 @@ import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../compo
 import { requestConfirmDialog } from "../../confirmDialog";
 import { cn } from "../../lib/utils";
 import { runMissionAction } from "./missionActions";
-import { missionsSource } from "./missionsStore";
+import { AskTheMissionForm, MissionForksList } from "./MissionForksList";
+import { missionsSource, useMissionForks, useMissionList } from "./missionsStore";
 import { HEALTH_BADGE_VARIANT, LANE_DOT_CLASS } from "./missionTone";
 
 const NO_FOCUS = "none";
 
 /** Goal, milestone countdown, health, usage and the owner's mission controls. */
-export function MissionSummary(props: { overview: MissionOverview; nowMs: number }) {
+export function MissionSummary(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
   const { overview, nowMs } = props;
   const { mission } = overview;
   const paused = mission.status === "paused";
@@ -89,10 +100,12 @@ export function MissionSummary(props: { overview: MissionOverview; nowMs: number
           </span>
         ) : null}
       </div>
+      <PoolUsageLine pools={overview.poolUsage} nowMs={nowMs} masterRoleId={mission.masterRoleId} />
       <div className="flex flex-wrap items-center gap-2">
         <FocusMenu overview={overview} />
         <PauseButton missionId={mission.id} title={mission.title} paused={paused} />
-        <AskTheMission title={mission.title} />
+        <InboxButton missionId={mission.id} />
+        <AskTheMission missionId={mission.id} title={mission.title} nowMs={nowMs} />
       </div>
     </div>
   );
@@ -176,28 +189,76 @@ function PauseButton(props: {
   );
 }
 
-/** Stub: asking forks the master so the answer costs no master turn. */
-function AskTheMission(props: { title: string }) {
+/**
+ * "Ask the mission" plus the open discussions (Discuss forks and side
+ * questions), so every open fork is one tap from the header.
+ */
+function AskTheMission(props: { missionId: MissionId; title: string; nowMs: number }) {
+  const forks = useMissionForks(props.missionId);
+  const openCount = forks ? splitForks(forks).open.length : 0;
   return (
     <Popover>
       <PopoverTrigger render={<Button variant="default" size="sm" />}>
         <MessageCircleQuestionIcon aria-hidden />
         Ask the mission
+        {openCount > 0 ? <span className="tabular-nums">· {openCount} open</span> : null}
       </PopoverTrigger>
-      <PopoverPopup align="start" side="bottom" className="w-72">
+      <PopoverPopup align="start" side="bottom" className="w-80">
         <PopoverTitle>Ask {props.title}</PopoverTitle>
-        <p className="mt-1 text-sm text-muted-foreground">
-          A fork of the master will answer from the mission's records, without taking a master turn.
-          Not connected yet; it arrives with rooms.
-        </p>
-        <p className="mt-2 text-xs text-muted-foreground">
-          Until then, open the master thread or the{" "}
-          <Link to="/missions/inbox" className="underline underline-offset-2">
-            inbox
-          </Link>
-          .
-        </p>
+        <div className="mt-2 flex flex-col gap-3">
+          <AskTheMissionForm missionId={props.missionId} />
+          <div className="flex flex-col gap-1">
+            <h3 className="text-xs font-medium text-muted-foreground">Open discussions</h3>
+            <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
+          </div>
+        </div>
       </PopoverPopup>
     </Popover>
+  );
+}
+
+/** Header entry to this mission's inbox, with what waits on the owner. */
+function InboxButton(props: { missionId: MissionId }) {
+  const list = useMissionList();
+  const count = list?.missions.find((mission) => mission.id === props.missionId)?.needsYou ?? 0;
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      render={<Link to="/missions/inbox" search={{ mission: props.missionId }} />}
+    >
+      <InboxIcon aria-hidden />
+      Inbox
+      {count > 0 ? <span className="tabular-nums">· {badgeCount(count)}</span> : null}
+    </Button>
+  );
+}
+
+/** One compact line per pool the mission draws on. */
+function PoolUsageLine(props: {
+  pools: MissionOverviewSnapshot["poolUsage"];
+  nowMs: number;
+  masterRoleId: string | null;
+}) {
+  if (props.pools.length === 0) return null;
+  return (
+    <ul aria-label="Pool usage" className="flex flex-wrap gap-x-3 gap-y-1 text-xs">
+      {props.pools.map((pool) => {
+        const view = poolUsageView(pool, props.nowMs, props.masterRoleId);
+        return (
+          <li
+            key={view.id}
+            className={cn(
+              view.tone === "out" && "text-destructive-foreground",
+              view.tone === "tight" && "text-warning-foreground",
+              (view.tone === "ok" || view.tone === "held") && "text-muted-foreground",
+            )}
+          >
+            {view.label} <span className="tabular-nums">{view.value}</span>
+            <span className="sr-only">. {view.detail}</span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }

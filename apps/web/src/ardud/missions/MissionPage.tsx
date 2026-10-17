@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 
-import type { MissionId, MissionOverview } from "@t3tools/contracts";
+import type { MissionId, MissionOverview, RoomId } from "@t3tools/contracts";
 import { healthLabel } from "@t3tools/client-runtime/ardud/missions";
 
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
@@ -21,6 +21,7 @@ import { MissionSummary } from "./MissionHeader";
 import { MissionOverviewTab } from "./MissionOverviewTab";
 import { MISSION_TAB_LABEL, MISSION_TABS, type MissionTab } from "./missionSearch";
 import { useMissionOverview } from "./missionsStore";
+import { RoomsTab } from "./RoomsTab";
 import { HEALTH_DOT_CLASS } from "./missionTone";
 import { useNowMs } from "./useNowMs";
 
@@ -29,6 +30,7 @@ export function MissionPage(props: {
   missionId: MissionId;
   tab: MissionTab;
   highlightSubMissionId: string | null;
+  roomId: RoomId | null;
 }) {
   const overview = useMissionOverview(props.missionId);
   const nowMs = useNowMs();
@@ -80,6 +82,8 @@ export function MissionPage(props: {
                     nowMs={nowMs}
                     highlightSubMissionId={props.highlightSubMissionId}
                   />
+                ) : props.tab === "rooms" ? (
+                  <RoomsTab missionId={props.missionId} roomId={props.roomId} nowMs={nowMs} />
                 ) : (
                   <TabPlaceholder tab={props.tab} overview={overview} />
                 )}
@@ -122,8 +126,7 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
   );
 }
 
-const TAB_PLACEHOLDER: Record<Exclude<MissionTab, "overview">, string> = {
-  rooms: "Rooms are where lanes and the master talk. They arrive in a later round.",
+const TAB_PLACEHOLDER: Record<Exclude<MissionTab, "overview" | "rooms">, string> = {
   lanes: "Every lane with its status, last evidence and context gauge. Coming in a later round.",
   work: "Tickets, PRs and deploys moving through review, merge and readback. Coming in a later round.",
   rules: "Standing rules, the review policy and change requests. Coming in a later round.",
@@ -132,7 +135,7 @@ const TAB_PLACEHOLDER: Record<Exclude<MissionTab, "overview">, string> = {
 };
 
 function TabPlaceholder(props: {
-  tab: Exclude<MissionTab, "overview">;
+  tab: Exclude<MissionTab, "overview" | "rooms">;
   overview: MissionOverview;
 }) {
   return (

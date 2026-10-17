@@ -16,6 +16,7 @@ import {
   formatDayLabel,
   formatRelative,
   isDraftFeedItem,
+  openForkFor,
   orderBlockerGroups,
   refKey,
   refLabel,
@@ -27,7 +28,7 @@ import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
 import { runMissionAction } from "./missionActions";
-import { missionsSource } from "./missionsStore";
+import { missionsSource, useMissionForks } from "./missionsStore";
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { MissionSection } from "./MissionSection";
 import { PriorityStack } from "./PriorityStack";
@@ -222,6 +223,7 @@ function CriticalPath(props: { overview: MissionOverview; nowMs: number }) {
 function DirectionCheck(props: { overview: MissionOverview; nowMs: number }) {
   const { overview, nowMs } = props;
   const items = overview.directionCheck;
+  const forks = useMissionForks(overview.mission.id) ?? [];
   return (
     <MissionSection
       title="Direction check"
@@ -236,6 +238,7 @@ function DirectionCheck(props: { overview: MissionOverview; nowMs: number }) {
               key={refKey(item.ref)}
               item={item}
               missionId={overview.mission.id}
+              discussing={openForkFor(forks, item.ref) !== null}
               nowMs={nowMs}
             />
           ))}
@@ -248,6 +251,8 @@ function DirectionCheck(props: { overview: MissionOverview; nowMs: number }) {
 function DirectionCheckRow(props: {
   item: DirectionCheckItem;
   missionId: MissionOverview["mission"]["id"];
+  /** An open Discuss fork exists for this call (fork threads are not linked yet). */
+  discussing: boolean;
   nowMs: number;
 }) {
   const { item } = props;
@@ -277,10 +282,17 @@ function DirectionCheckRow(props: {
           <CheckIcon aria-hidden />
           Fine
         </Button>
-        <Button variant="ghost" size="sm" disabled={busy} onClick={() => react("discuss")}>
-          <MessagesSquareIcon aria-hidden />
-          Discuss
-        </Button>
+        {props.discussing ? (
+          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+            <MessagesSquareIcon aria-hidden className="size-3.5" />
+            Discussing · thread not connected yet
+          </span>
+        ) : (
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => react("discuss")}>
+            <MessagesSquareIcon aria-hidden />
+            Discuss
+          </Button>
+        )}
       </div>
     </li>
   );

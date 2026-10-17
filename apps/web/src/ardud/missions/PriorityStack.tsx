@@ -23,6 +23,7 @@ import {
   effortNote,
   formatPercent,
   healthLabel,
+  intendedTotal,
   moveInOrder,
   priorityStack,
   type PriorityStackRow,
@@ -31,6 +32,7 @@ import {
 import { cn } from "../../lib/utils";
 import { runMissionAction } from "./missionActions";
 import { missionsSource } from "./missionsStore";
+import { IntendedShareEditor } from "./IntendedShareEditor";
 import { HEALTH_DOT_CLASS } from "./missionTone";
 import { MissionSection } from "./MissionSection";
 
@@ -54,6 +56,7 @@ export function PriorityStack(props: {
     [rows],
   );
   const note = useMemo(() => effortNote(rows), [rows]);
+  const planned = useMemo(() => intendedTotal(rows), [rows]);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -73,7 +76,7 @@ export function PriorityStack(props: {
   return (
     <MissionSection
       title="Priority stack"
-      caption="Bar: master effort, last 24h. Tick: your intended share."
+      caption="Bar: master effort, last 24h. Tick: intended share (master proposes, you can set it)."
     >
       <DndContext
         sensors={sensors}
@@ -100,6 +103,10 @@ export function PriorityStack(props: {
         </SortableContext>
       </DndContext>
       {note ? <p className="text-xs text-muted-foreground">{note}</p> : null}
+      <p className="text-xs text-muted-foreground">
+        {planned.label}
+        {planned.balanced ? "" : " (intended shares don't add up to 100%)"}
+      </p>
       <p className="text-xs text-muted-foreground/70">
         Drag to reorder. Lower sub-missions park first when capacity is short; "fills idle" ones
         only take what is left.
@@ -189,9 +196,7 @@ function PriorityStackItem(props: {
         )}
       >
         {actual === null ? "–" : formatPercent(actual)}
-        {intended !== null ? (
-          <span className="text-muted-foreground"> / {formatPercent(intended)}</span>
-        ) : null}
+        <IntendedShareEditor row={row} />
       </span>
       <EffortBar actual={actual} intended={intended} label={effortLabel} drift={row.drift} />
     </li>
