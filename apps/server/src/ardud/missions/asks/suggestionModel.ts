@@ -249,23 +249,20 @@ export interface DecideSuggestionCommand {
   readonly now: string;
 }
 
-const mayDecide = (command: DecideSuggestionCommand): boolean => {
-  if (callerIsOwner(command.caller)) return true;
-  return (
-    command.suggestion.acceptor === "master" &&
-    command.callerIsMaster &&
-    command.suggestion.author !== "master"
-  );
-};
+/**
+ * The owner or the mission's master decides any suggestion (owner rule,
+ * 17 Oct 2026: nothing is owner only). `acceptor` only says whose inbox it
+ * lands in; the decision event records who decided.
+ */
+const mayDecide = (command: DecideSuggestionCommand): boolean =>
+  callerIsOwner(command.caller) || command.callerIsMaster;
 
 export const decideSuggestion = (command: DecideSuggestionCommand): Outcome<SuggestionDecision> => {
   const { suggestion, input, caller } = command;
   if (input.suggestionId !== suggestion.id)
     return refuse("invalid", "Decision is for a different suggestion.");
   if (!mayDecide(command)) {
-    return suggestion.acceptor === "owner"
-      ? refuse("provenance-required", "Only the owner decides this suggestion.")
-      : refuse("forbidden", "Only the owner or the mission's master decides this suggestion.");
+    return refuse("forbidden", "Only the owner or the mission's master decides this suggestion.");
   }
   if (suggestion.status !== "open") {
     return refuse("conflict", `Suggestion ${suggestion.id} is ${suggestion.status}.`);
@@ -330,9 +327,13 @@ export const reopenSuggestion = (
   suggestion: Suggestion,
   provenance: MissionProvenance,
   now: string,
+  callerIsMaster = false,
 ): Outcome<Transition<Suggestion>> => {
-  if (!isOwnerProvenance(provenance)) {
-    return refuse("provenance-required", "Only the owner reopens a dismissed suggestion.");
+  if (!isOwnerProvenance(provenance) && !callerIsMaster) {
+    return refuse(
+      "forbidden",
+      "Only the owner or the mission's master reopens a dismissed suggestion.",
+    );
   }
   if (suggestion.status !== "dismissed") {
     return refuse(

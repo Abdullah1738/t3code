@@ -2,7 +2,6 @@
 import * as NodeCrypto from "node:crypto";
 
 import {
-  isOwnerProvenance,
   LaneId,
   MilestoneId,
   MissionError,
@@ -11,7 +10,6 @@ import {
   WorkItemId,
   type CreateMissionInput,
   type Lane,
-  type LockFieldInput,
   type MarkMissionSeenInput,
   type Milestone,
   type Mission,
@@ -38,30 +36,40 @@ import * as Semaphore from "effect/Semaphore";
 
 import type * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
+import { makeApprovalWrites } from "./approvals.ts";
+import type { WriteKit } from "./kit.ts";
 import { actorOf } from "./provenance.ts";
-import {
-  changedFields,
-  checkWrite,
-  isLockableField,
-  refuseAgents,
-  requireOwner,
-  SUB_MISSION_ORDER_FIELD,
-  withLock,
-} from "./rules.ts";
+import { changedFields, requireOwner } from "./rules.ts";
+import { makeStructureWrites } from "./structure.ts";
 
 /**
- * Core mutations: missions, sub-missions, milestones, lanes, work items,
- * locks, status changes and the owner's sub-mission order. Provenance is an
- * argument the transport fills; it never comes from the input.
+ * Core mutations: missions, sub-missions, milestones, lanes, work items and
+ * status changes. Provenance is an argument the transport fills; it never
+ * comes from the input. Nothing here is owner only: the owner and the
+ * mission's master use the same methods, and the transports decide who may
+ * call them (WS: paired owner clients; MCP: the master). Every change is a
+ * timeline event carrying actor and provenance, which is how the owner sees
+ * what the master changed.
  *
  * Writes run one at a time (read, check, commit) so checks see the state the
  * commit replaces. A write that changes nothing commits nothing and returns
  * the mission's current seq.
  */
 
-const MISSION_OWNER_ONLY = ["tier", "weight", "guaranteedShare", "borrowCeiling"] as const;
 const OPEN_SUB_MISSIONS = ["active", "paused"];
 const ORDER_SCAN_LIMIT = 5000;
+
+/** Timeline kind for a mission status change. */
+const missionStatusEvent = (
+  before: Mission["status"],
+  after: Mission["status"],
+): MissionEventKind => {
+  if (after === "paused") return "mission.paused";
+  if (after === "archived") return "mission.archived";
+  if (before === "archived") return "mission.unarchived";
+  if (before === "paused" && after === "active") return "mission.resumed";
+  return "mission.updated";
+};
 
 const invalid = (detail: string) => new MissionError({ code: "invalid", detail });
 const notFound = (kind: string, id: string) =>
@@ -83,14 +91,6 @@ const definedOnly = <T extends object>(value: T): { [K in keyof T]?: Exclude<T[K
   };
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
-
-interface LockTarget {
-  readonly missionId: MissionId;
-  readonly label: string;
-  readonly record: object;
-  readonly lockedFields: ReadonlyArray<string> | undefined;
-  readonly rebuild: (lockedFields: ReadonlyArray<string>, now: string) => MissionStoreRecord;
-}
 
 export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
   Effect.gen(function* () {
@@ -166,7 +166,6 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
     const createMission = (provenance: MissionProvenance, input: CreateMissionInput) =>
       serial(
         Effect.gen(function* () {
-          yield* failIf(refuseAgents(provenance, "create missions"));
           const id = input.missionId ?? MissionId.make(newId("mission"));
           if (Option.isSome(yield* store.get("mission", id))) {
             return yield* new MissionError({ code: "conflict", detail: `Mission ${id} exists.` });
@@ -207,7 +206,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
         }),
       );
 
-    /** Applies a mission change after the lock and owner-only checks. */
+    /** Applies a mission change; a write that changes nothing commits nothing. */
     const writeMission = (
       provenance: MissionProvenance,
       before: Mission,
@@ -217,15 +216,6 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
       Effect.gen(function* () {
         const changed = changedFields(before, next);
         if (changed.length === 0) return yield* unchanged(before.id, missionRef(before));
-        yield* failIf(
-          checkWrite({
-            provenance,
-            ref: missionRef(before),
-            lockedFields: before.lockedFields,
-            changed,
-            ownerOnly: [...MISSION_OWNER_ONLY, "status", "focusSubMissionId"],
-          }),
-        );
         const record: Mission = { ...next, updatedAt: yield* nowIso };
         const kind = kindFor(changed);
         return yield* commit(provenance, {
@@ -255,14 +245,9 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
     const setMissionStatus = (provenance: MissionProvenance, input: SetMissionStatusInput) =>
       serial(
         Effect.gen(function* () {
-          yield* failIf(refuseAgents(provenance, "pause, drain or resume a mission"));
           const before = yield* loadMission(input.missionId);
           return yield* writeMission(provenance, before, { ...before, status: input.status }, () =>
-            input.status === "paused"
-              ? "mission.paused"
-              : before.status === "paused" && input.status === "active"
-                ? "mission.resumed"
-                : "mission.updated",
+            missionStatusEvent(before.status, input.status),
           );
         }),
       );
@@ -271,7 +256,6 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
     const setMissionFocus = (provenance: MissionProvenance, input: SetMissionFocusInput) =>
       serial(
         Effect.gen(function* () {
-          yield* failIf(refuseAgents(provenance, "set focus mode"));
           const before = yield* loadMission(input.missionId);
           if (input.subMissionId !== null) {
             const subMission = yield* need(
@@ -325,16 +309,6 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
           const next: SubMission = { ...before, ...patch };
           const changed = changedFields(before, next);
           if (changed.length === 0) return yield* unchanged(mission.id, subMissionRef(before));
-          const pausing = before.status === "paused" || next.status === "paused";
-          yield* failIf(
-            checkWrite({
-              provenance,
-              ref: subMissionRef(before),
-              lockedFields: before.lockedFields,
-              changed,
-              ownerOnly: pausing ? ["status"] : [],
-            }),
-          );
           const record: SubMission = { ...next, updatedAt: now };
           const closing = changed.includes("status") && record.status === "closed";
           return yield* commit(provenance, {
@@ -350,15 +324,6 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
         }
 
         if (patch.title === undefined) return yield* invalid("A new sub-mission needs a title.");
-        yield* failIf(
-          checkWrite({
-            provenance,
-            ref: { kind: "sub-mission", id: subMissionId ?? "new", label: patch.title },
-            lockedFields: undefined,
-            changed: patch.status === "paused" ? ["status"] : [],
-            ownerOnly: ["status"],
-          }),
-        );
         const open = yield* openSubMissions(mission.id);
         const record: SubMission = {
           id: subMissionId ?? SubMissionId.make(newId("sub")),
@@ -388,7 +353,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
     const upsertSubMission = (provenance: MissionProvenance, input: UpsertSubMissionInput) =>
       serial(upsertSubMissionNow(provenance, input));
 
-    /** Pausing and resuming are owner only; agents may close or reopen. */
+    /** Pause, resume, close or reopen one sub-mission. */
     const setSubMissionStatus = (provenance: MissionProvenance, input: SetSubMissionStatusInput) =>
       serial(
         Effect.gen(function* () {
@@ -405,23 +370,11 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
         }),
       );
 
-    /**
-     * Sets the order of every open sub-mission in one event. Once the owner
-     * has ordered them the order locks (`subMissionOrder` on the mission) and
-     * only the owner reorders; the owner can unlock it.
-     */
+    /** Sets the order of every open sub-mission in one event. */
     const reorderSubMissions = (provenance: MissionProvenance, input: ReorderSubMissionsInput) =>
       serial(
         Effect.gen(function* () {
           const mission = yield* loadMission(input.missionId);
-          yield* failIf(
-            checkWrite({
-              provenance,
-              ref: missionRef(mission),
-              lockedFields: mission.lockedFields,
-              changed: [SUB_MISSION_ORDER_FIELD],
-            }),
-          );
           const open = yield* openSubMissions(mission.id);
           const byId = new Map(open.map((subMission) => [subMission.id as string, subMission]));
           const listed = new Set<string>(input.order);
@@ -439,29 +392,14 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
               ? []
               : [{ _tag: "sub-mission", record: { ...subMission, order, updatedAt: now } }];
           });
-          const lock =
-            isOwnerProvenance(provenance) &&
-            !mission.lockedFields.includes(SUB_MISSION_ORDER_FIELD);
-          if (moved.length === 0 && !lock) return yield* unchanged(mission.id, missionRef(mission));
-          const missionUpdate: Array<MissionStoreRecord> = lock
-            ? [
-                {
-                  _tag: "mission",
-                  record: {
-                    ...mission,
-                    lockedFields: withLock(mission.lockedFields, SUB_MISSION_ORDER_FIELD, true),
-                    updatedAt: now,
-                  },
-                },
-              ]
-            : [];
+          if (moved.length === 0) return yield* unchanged(mission.id, missionRef(mission));
           return yield* commit(provenance, {
             missionId: mission.id,
             kind: "sub-mission.reordered",
             summary: `Sub-missions of "${mission.title}" reordered`,
             ref: missionRef(mission),
-            upserts: [...moved, ...missionUpdate],
-            payload: { order: input.order, orderLocked: lock },
+            upserts: moved,
+            payload: { order: input.order },
           });
         }),
       );
@@ -493,14 +431,6 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
             const next: Milestone = { ...before, ...patch };
             const changed = changedFields(before, next);
             if (changed.length === 0) return yield* unchanged(mission.id, milestoneRef(before));
-            yield* failIf(
-              checkWrite({
-                provenance,
-                ref: milestoneRef(before),
-                lockedFields: before.lockedFields,
-                changed,
-              }),
-            );
             const record: Milestone = { ...next, updatedAt: now };
             return yield* commit(provenance, {
               missionId: mission.id,
@@ -570,14 +500,6 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
             const next: Lane = { ...before, ...patch };
             const changed = changedFields(before, next);
             if (changed.length === 0) return yield* unchanged(mission.id, laneRef(before));
-            yield* failIf(
-              checkWrite({
-                provenance,
-                ref: laneRef(before),
-                lockedFields: before.lockedFields,
-                changed,
-              }),
-            );
             const record: Lane = { ...next, updatedAt: now };
             const kind = laneEventKind(before, record, changed);
             return yield* commit(provenance, {
@@ -648,14 +570,6 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
             const next: WorkItem = { ...before, ...patch };
             const changed = changedFields(before, next);
             if (changed.length === 0) return yield* unchanged(mission.id, workItemRef(before));
-            yield* failIf(
-              checkWrite({
-                provenance,
-                ref: workItemRef(before),
-                lockedFields: before.lockedFields,
-                changed,
-              }),
-            );
             const record: WorkItem = { ...next, updatedAt: now };
             return yield* commit(provenance, {
               missionId: mission.id,
@@ -698,151 +612,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
         }),
       );
 
-    // --- locks and owner looks ------------------------------------------------------
-
-    const lockTarget = (ref: MissionRecordRef): Effect.Effect<LockTarget, MissionError> =>
-      Effect.gen(function* () {
-        switch (ref.kind) {
-          case "mission": {
-            const r = yield* need(store.get("mission", ref.id), ref.kind, ref.id);
-            return {
-              missionId: r.id,
-              label: r.title,
-              record: r,
-              lockedFields: r.lockedFields,
-              rebuild: (lockedFields, updatedAt) => ({
-                _tag: "mission",
-                record: { ...r, lockedFields, updatedAt },
-              }),
-            };
-          }
-          case "sub-mission": {
-            const r = yield* need(store.get("sub-mission", ref.id), ref.kind, ref.id);
-            return {
-              missionId: r.missionId,
-              label: r.title,
-              record: r,
-              lockedFields: r.lockedFields,
-              rebuild: (lockedFields, updatedAt) => ({
-                _tag: "sub-mission",
-                record: { ...r, lockedFields, updatedAt },
-              }),
-            };
-          }
-          case "milestone": {
-            const r = yield* need(store.get("milestone", ref.id), ref.kind, ref.id);
-            return {
-              missionId: r.missionId,
-              label: r.title,
-              record: r,
-              lockedFields: r.lockedFields,
-              rebuild: (lockedFields, updatedAt) => ({
-                _tag: "milestone",
-                record: { ...r, lockedFields, updatedAt },
-              }),
-            };
-          }
-          case "lane": {
-            const r = yield* need(store.get("lane", ref.id), ref.kind, ref.id);
-            return {
-              missionId: r.missionId,
-              label: r.name,
-              record: r,
-              lockedFields: r.lockedFields,
-              rebuild: (lockedFields, updatedAt) => ({
-                _tag: "lane",
-                record: { ...r, lockedFields, updatedAt },
-              }),
-            };
-          }
-          case "work-item": {
-            const r = yield* need(store.get("work-item", ref.id), ref.kind, ref.id);
-            return {
-              missionId: r.missionId,
-              label: r.title,
-              record: r,
-              lockedFields: r.lockedFields,
-              rebuild: (lockedFields, updatedAt) => ({
-                _tag: "work-item",
-                record: { ...r, lockedFields, updatedAt },
-              }),
-            };
-          }
-          case "role": {
-            const r = yield* need(store.get("role", ref.id), ref.kind, ref.id);
-            return {
-              missionId: r.missionId,
-              label: r.name,
-              record: r,
-              lockedFields: r.lockedFields,
-              rebuild: (lockedFields, updatedAt) => ({
-                _tag: "role",
-                record: { ...r, lockedFields, updatedAt },
-              }),
-            };
-          }
-          case "rule": {
-            const r = yield* need(store.get("rule", ref.id), ref.kind, ref.id);
-            if (r.missionId === null) {
-              return yield* invalid("Global rules are owner only already; lock mission rules.");
-            }
-            return {
-              missionId: r.missionId,
-              label: r.title,
-              record: r,
-              lockedFields: r.lockedFields,
-              rebuild: (lockedFields, updatedAt) => ({
-                _tag: "rule",
-                record: { ...r, lockedFields, updatedAt },
-              }),
-            };
-          }
-          case "review-policy": {
-            const r = yield* need(store.get("review-policy", ref.id), ref.kind, ref.id);
-            return {
-              missionId: r.missionId,
-              label: "review policy",
-              record: r,
-              lockedFields: r.lockedFields,
-              rebuild: (lockedFields, updatedAt) => ({
-                _tag: "review-policy",
-                record: { ...r, lockedFields, updatedAt },
-              }),
-            };
-          }
-          default:
-            return yield* invalid(`${ref.kind} records have no lockable fields.`);
-        }
-      });
-
-    /** Owner only. Locked fields refuse every other writer until unlocked. */
-    const lockField = (provenance: MissionProvenance, input: LockFieldInput) =>
-      serial(
-        Effect.gen(function* () {
-          yield* failIf(requireOwner(provenance, "lock or unlock fields"));
-          const target = yield* lockTarget(input.ref);
-          if (!isLockableField(input.ref.kind, target.record, input.field)) {
-            return yield* invalid(`${input.field} is not a lockable field of ${input.ref.kind}.`);
-          }
-          const ref: MissionRecordRef = {
-            kind: input.ref.kind,
-            id: input.ref.id,
-            label: target.label,
-          };
-          const lockedFields = withLock(target.lockedFields, input.field, input.locked);
-          if (lockedFields.length === (target.lockedFields ?? []).length) {
-            return yield* unchanged(target.missionId, ref);
-          }
-          return yield* commit(provenance, {
-            missionId: target.missionId,
-            kind: input.locked ? "field.locked" : "field.unlocked",
-            summary: `${input.locked ? "Locked" : "Unlocked"} ${input.field} on ${input.ref.kind} "${target.label}"`,
-            ref,
-            upserts: [target.rebuild(lockedFields, yield* nowIso)],
-            payload: { field: input.field },
-          });
-        }),
-      );
+    // --- owner looks ---------------------------------------------------------------
 
     /** Records when the owner last opened the mission; feed and direction check start there. */
     const markSeen = (provenance: MissionProvenance, input: MarkMissionSeenInput) =>
@@ -852,6 +622,8 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
         yield* store.markOwnerLooked(mission.id, yield* nowIso);
         return yield* unchanged(mission.id, missionRef(mission));
       });
+
+    const kit: WriteKit = { store, serial, loadMission, unchanged, commit };
 
     return {
       createMission,
@@ -864,8 +636,9 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
       upsertMilestone,
       upsertLane,
       upsertWorkItem,
-      lockField,
       markSeen,
+      ...makeStructureWrites(kit),
+      ...makeApprovalWrites(kit),
     };
   });
 

@@ -185,16 +185,11 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
     }),
   );
 
-  it.effect("lets the master change a locked role model; nothing refuses on locks", () =>
+  it.effect("lets the master change any role model; nothing refuses on locks", () =>
     Effect.gen(function* () {
-      const { missions, policy } = yield* setup;
+      const { policy } = yield* setup;
       const reviewer = RoleId.make("crpko:verifier");
       yield* policy.updateRole(MASTER, { roleId: reviewer, description: "checks the build" });
-      yield* missions.lockField(OWNER, {
-        ref: { kind: "role", id: reviewer },
-        field: "modelSelection",
-        locked: true,
-      });
       yield* policy.setRoleModel(MASTER, { roleId: reviewer, modelSelection: HAIKU, reason: "" });
       const role = (yield* policy.roles(CRPKO)).roles.find((r) => r.id === reviewer)!;
       assert.strictEqual(modelKey(role.modelSelection), modelKey(HAIKU));

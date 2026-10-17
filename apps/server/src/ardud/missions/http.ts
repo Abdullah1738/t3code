@@ -1,18 +1,13 @@
 import {
+  ApprovalId,
+  ApprovalStatus,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  CloseStaleApprovalInput,
   MissionId,
-  ReorderSubMissionsInput,
-  RoleId,
-  ThreadId,
-  UpdateMissionInput,
-  UpsertLaneInput,
-  UpsertMilestoneInput,
-  UpsertSubMissionInput,
-  UpsertWorkItemInput,
+  OpenApprovalInput,
   type MissionError,
   type MissionErrorCode,
-  type MissionMutationResult,
   type MissionProvenance,
 } from "@t3tools/contracts";
 import * as Data from "effect/Data";
@@ -26,14 +21,17 @@ import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as MissionService from "./MissionService.ts";
 
 /**
- * Missions HTTP API at /api/ardud/missions, for the `mission` CLI and other
- * local callers. Same bearer auth and `{ ok, ... }` envelope as the control
- * API: reads need orchestration:read, writes orchestration:operate.
+ * Missions HTTP API at /api/ardud/missions, for the `mission` CLI and local
+ * systems. Same bearer auth and `{ ok, ... }` envelope as the control API:
+ * reads need orchestration:read, writes orchestration:operate.
  *
- * A token holder is never the owner. Writes are agent writes and must name the
- * calling thread in `x-t3-thread-id` (optionally `x-t3-role-id`); the owner's
- * locks and owner-only fields still apply. Other tracks mount their own routes
- * under this prefix and register them in `layer.ts`.
+ * A token holder is never the owner and never a thread: HTTP cannot prove
+ * which thread is calling (`x-t3-thread-id` was only a claim). So the plan
+ * writes that depend on the caller (the master's) are refused here and point
+ * at the MCP tool, which knows the calling thread. HTTP keeps reads and
+ * `system` writes by named components: crw opens and stale-closes its
+ * approvals in its own name. Other tracks mount their own routes under this
+ * prefix and register them in `layer.ts`.
  */
 export const MISSIONS_ROUTE_PREFIX = "/api/ardud/missions";
 
@@ -99,14 +97,23 @@ const errorResponse = (error: MissionsHttpError) =>
 
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeMissionId = Schema.decodeUnknownEffect(MissionId);
-const decodeThreadId = Schema.decodeUnknownEffect(ThreadId);
-const decodeRoleId = Schema.decodeUnknownEffect(RoleId);
-const decodeUpdateMission = Schema.decodeUnknownEffect(UpdateMissionInput);
-const decodeUpsertSubMission = Schema.decodeUnknownEffect(UpsertSubMissionInput);
-const decodeReorder = Schema.decodeUnknownEffect(ReorderSubMissionsInput);
-const decodeUpsertMilestone = Schema.decodeUnknownEffect(UpsertMilestoneInput);
-const decodeUpsertLane = Schema.decodeUnknownEffect(UpsertLaneInput);
-const decodeUpsertWorkItem = Schema.decodeUnknownEffect(UpsertWorkItemInput);
+const decodeApprovalIds = Schema.decodeUnknownEffect(Schema.Array(ApprovalId));
+const decodeApprovalStatuses = Schema.decodeUnknownEffect(Schema.Array(ApprovalStatus));
+const decodeOpenApproval = Schema.decodeUnknownEffect(OpenApprovalInput);
+const decodeCloseStaleApproval = Schema.decodeUnknownEffect(CloseStaleApprovalInput);
+
+/** Components that may open and stale-close approvals over HTTP, in their own name. */
+const APPROVAL_COMPONENTS: ReadonlySet<string> = new Set(["crw"]);
+
+/** Plan writes that only the calling thread may make, and the MCP tool to use instead. */
+const THREAD_WRITES = [
+  { path: "/mission", tool: "mission_update" },
+  { path: "/sub-missions", tool: "mission_sub_mission" },
+  { path: "/sub-missions/reorder", tool: "mission_sub_mission_reorder" },
+  { path: "/milestones", tool: "mission_milestone" },
+  { path: "/lanes", tool: "mission_lane" },
+  { path: "/work-items", tool: "mission_work_item" },
+] as const;
 
 const searchParams = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
@@ -138,28 +145,9 @@ const decodeBody = <A>(decode: (input: unknown) => Effect.Effect<A, Schema.Schem
     );
   });
 
-/** Agent provenance from the caller's headers. Never read from the body. */
-const agentProvenance = Effect.gen(function* () {
-  const request = yield* HttpServerRequest.HttpServerRequest;
-  const threadHeader = request.headers["x-t3-thread-id"];
-  if (threadHeader === undefined || threadHeader.trim().length === 0) {
-    return yield* new MissionsHttpError({
-      code: "forbidden",
-      message: "Mission writes need the calling thread in x-t3-thread-id.",
-      missionCode: "provenance-required",
-    });
-  }
-  const threadId = yield* decodeThreadId(threadHeader).pipe(
-    Effect.mapError(() => fail("invalid_request", "x-t3-thread-id is not a thread id.")),
-  );
-  const roleHeader = request.headers["x-t3-role-id"];
-  const roleId =
-    roleHeader === undefined || roleHeader.trim().length === 0
-      ? null
-      : yield* decodeRoleId(roleHeader).pipe(
-          Effect.mapError(() => fail("invalid_request", "x-t3-role-id is not a role id.")),
-        );
-  return { _tag: "agent", threadId, roleId } satisfies MissionProvenance;
+const systemProvenance = (component: string): MissionProvenance => ({
+  _tag: "system",
+  component,
 });
 
 /** `since` is a seq (digits) or an ISO time; missing means the latest events. */
@@ -246,50 +234,89 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, inbox: yield* missions.inbox(missionId) });
   });
 
-  const write = <I>(
-    decode: (input: unknown) => Effect.Effect<I, Schema.SchemaError>,
-    run: (
-      provenance: MissionProvenance,
-      input: I,
-    ) => Effect.Effect<MissionMutationResult, MissionError>,
-  ) =>
+  const refuseThreadWrite = (tool: string) =>
     Effect.gen(function* () {
-      yield* authenticate(AuthOrchestrationOperateScope);
-      const provenance = yield* agentProvenance;
-      const input = yield* decodeBody(decode);
-      return json({ ok: true, ...(yield* run(provenance, input)) });
+      yield* authenticate(AuthOrchestrationReadScope);
+      return yield* new MissionsHttpError({
+        code: "forbidden",
+        message: `HTTP cannot prove which thread is calling, so this write is not taken here. Use the MCP tool ${tool} from the mission's master thread.`,
+        missionCode: "provenance-required",
+      });
     });
+
+  const approvals = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    const params = yield* searchParams;
+    const missionId = yield* missionParam(params.get("mission"));
+    if (missionId === null) {
+      return yield* fail("invalid_request", "approvals needs ?mission=<id>.");
+    }
+    const ids = params.getAll("id");
+    const statuses = params.getAll("status");
+    const exact =
+      ids.length === 0
+        ? undefined
+        : yield* decodeApprovalIds(ids).pipe(
+            Effect.mapError(() => fail("invalid_request", "id must be an approval id.")),
+          );
+    const status =
+      statuses.length === 0
+        ? undefined
+        : yield* decodeApprovalStatuses(statuses).pipe(
+            Effect.mapError(() =>
+              fail(
+                "invalid_request",
+                "status must be pending, approved, rejected or stale-closed.",
+              ),
+            ),
+          );
+    const found = yield* missions.approvals({
+      missionId,
+      ...(exact === undefined ? {} : { ids: exact }),
+      ...(status === undefined ? {} : { status }),
+    });
+    return json({ ok: true, approvals: found });
+  });
+
+  const openApproval = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationOperateScope);
+    const input = yield* decodeBody(decodeOpenApproval);
+    if (!APPROVAL_COMPONENTS.has(input.requestedBy)) {
+      return yield* fail(
+        "forbidden",
+        `Only ${[...APPROVAL_COMPONENTS].join(", ")} open approvals over HTTP.`,
+      );
+    }
+    const result = yield* missions.openApproval(systemProvenance(input.requestedBy), input);
+    return json({ ok: true, ...result });
+  });
+
+  const closeStaleApproval = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationOperateScope);
+    const input = yield* decodeBody(decodeCloseStaleApproval);
+    const [record] = yield* missions.approvals({
+      missionId: input.missionId,
+      ids: [input.approvalId],
+    });
+    // A missing record falls through to the service's not-found.
+    const component = record?.requestedBy ?? "crw";
+    if (!APPROVAL_COMPONENTS.has(component)) {
+      return yield* fail("forbidden", `Approval ${input.approvalId} was not opened over HTTP.`);
+    }
+    const result = yield* missions.closeStaleApproval(systemProvenance(component), input);
+    return json({ ok: true, ...result });
+  });
 
   const p = MISSIONS_ROUTE_PREFIX;
   return [
     HttpRouter.route("GET", `${p}/status`, handle(status)),
     HttpRouter.route("GET", `${p}/digest`, handle(digest)),
     HttpRouter.route("GET", `${p}/inbox`, handle(inbox)),
-    HttpRouter.route(
-      "POST",
-      `${p}/mission`,
-      handle(write(decodeUpdateMission, missions.updateMission)),
-    ),
-    HttpRouter.route(
-      "POST",
-      `${p}/sub-missions`,
-      handle(write(decodeUpsertSubMission, missions.upsertSubMission)),
-    ),
-    HttpRouter.route(
-      "POST",
-      `${p}/sub-missions/reorder`,
-      handle(write(decodeReorder, missions.reorderSubMissions)),
-    ),
-    HttpRouter.route(
-      "POST",
-      `${p}/milestones`,
-      handle(write(decodeUpsertMilestone, missions.upsertMilestone)),
-    ),
-    HttpRouter.route("POST", `${p}/lanes`, handle(write(decodeUpsertLane, missions.upsertLane))),
-    HttpRouter.route(
-      "POST",
-      `${p}/work-items`,
-      handle(write(decodeUpsertWorkItem, missions.upsertWorkItem)),
+    HttpRouter.route("GET", `${p}/approvals`, handle(approvals)),
+    HttpRouter.route("POST", `${p}/approvals/open`, handle(openApproval)),
+    HttpRouter.route("POST", `${p}/approvals/stale`, handle(closeStaleApproval)),
+    ...THREAD_WRITES.map(({ path, tool }) =>
+      HttpRouter.route("POST", `${p}${path}`, handle(refuseThreadWrite(tool))),
     ),
   ] as const;
 });

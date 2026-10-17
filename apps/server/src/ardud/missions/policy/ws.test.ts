@@ -29,7 +29,10 @@ it.layer(testLayer(ports.layer))("mission policy WS handlers", (it) => {
 
       const cli = makePolicyWsHandlers(
         policy,
-        ownerAppProvenance({ surface: "cli", sessionId: "session-cli" }),
+        ownerAppProvenance({
+          surface: "cli",
+          session: { sessionId: "session-cli", subject: "one-time-token" },
+        }),
       );
       const refused = yield* Effect.flip(cli[M.setRoleModel](change));
       assert.equal(refused.code, "provenance-required");
@@ -41,7 +44,10 @@ it.layer(testLayer(ports.layer))("mission policy WS handlers", (it) => {
 
       const app = makePolicyWsHandlers(
         policy,
-        ownerAppProvenance({ surface: "web", sessionId: "session-web" }),
+        ownerAppProvenance({
+          surface: "web",
+          session: { sessionId: "session-web", subject: "one-time-token" },
+        }),
       );
       const changed = yield* app[M.setRoleModel](change);
       const [event] = yield* missions.eventsSince(CRPKO, changed.seq - 1);

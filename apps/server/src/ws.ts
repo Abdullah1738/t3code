@@ -129,8 +129,7 @@ import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts"
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 // ardud missions: core
-import * as Missions from "./ardud/missions/MissionService.ts";
-import { makeMissionWsHandlers } from "./ardud/missions/ws.ts";
+import { missionWsHandlers } from "./ardud/missions/ws.ts";
 // ardud missions: policy
 import { ownerAppProvenance } from "./ardud/missions/core/provenance.ts";
 import * as MissionPolicy from "./ardud/missions/policy/PolicyService.ts";
@@ -1220,15 +1219,10 @@ const layerWsMissionsRpc = (
   clientOrigin: OrchestrationClientOrigin,
 ) =>
   ServerWsMissionsRpcGroup.toLayer(
-    Effect.gen(function* () {
-      const missions = yield* Missions.MissionService;
-      return ServerWsMissionsRpcGroup.of(
-        makeMissionWsHandlers(missions, {
-          surface: clientOrigin.surface,
-          sessionId: currentSession.sessionId,
-        }),
-      );
-    }),
+    Effect.map(
+      missionWsHandlers({ surface: clientOrigin.surface, session: currentSession }),
+      (handlers) => ServerWsMissionsRpcGroup.of(handlers),
+    ),
   );
 
 // ardud missions: policy
@@ -1241,10 +1235,7 @@ const layerWsMissionsPolicyRpc = (
       ServerWsMissionsPolicyRpcGroup.of(
         makePolicyWsHandlers(
           policy,
-          ownerAppProvenance({
-            surface: clientOrigin.surface,
-            sessionId: currentSession.sessionId,
-          }),
+          ownerAppProvenance({ surface: clientOrigin.surface, session: currentSession }),
         ),
       ),
     ),

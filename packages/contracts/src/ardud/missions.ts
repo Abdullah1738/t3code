@@ -223,7 +223,7 @@ export const PullRequestKey = Schema.Struct({
 });
 export type PullRequestKey = typeof PullRequestKey.Type;
 
-/** Field names the owner locked on a record. Only the owner edits a locked field. */
+/** Field names once locked on a record. Unused since 17 Oct 2026: nothing is locked. */
 export const LockedFields = Schema.Array(TrimmedNonEmptyString);
 export type LockedFields = typeof LockedFields.Type;
 
@@ -254,6 +254,11 @@ export const Mission = Schema.Struct({
   lockedFields: LockedFields,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- core additions ---
+  /** Who decides which approvals and drafts; first match wins, none means the owner. */
+  approvalRouting: Schema.optional(
+    Schema.Array(Schema.suspend((): Schema.Codec<ApprovalRoute> => ApprovalRoute)),
+  ),
 });
 export type Mission = typeof Mission.Type;
 
@@ -303,7 +308,7 @@ export const Milestone = Schema.Struct({
   statusNote: Schema.NullOr(Schema.String),
   itemIds: Schema.Array(WorkItemId),
   // --- core additions ---
-  /** Fields only the owner may change. Missing means none. */
+  /** Unused since 17 Oct 2026: nothing is locked. */
   lockedFields: Schema.optional(LockedFields),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -346,7 +351,7 @@ export const Lane = Schema.Struct({
   /** Why it is stuck, waiting or parked. */
   statusReason: Schema.NullOr(Schema.String),
   // --- core additions ---
-  /** Fields only the owner may change. Missing means none. */
+  /** Unused since 17 Oct 2026: nothing is locked. */
   lockedFields: Schema.optional(LockedFields),
   leadRoleId: Schema.NullOr(RoleId),
   /** Thread currently doing the lane's work (the lead's binding). */
@@ -739,7 +744,7 @@ export const RuleAck = Schema.Struct({
 });
 export type RuleAck = typeof RuleAck.Type;
 
-/** An owner rule. Only the owner creates, edits or retires one; the master can suggest. */
+/** An owner rule, in the owner's words. The owner or the master writes, edits or retires one. */
 export const Rule = Schema.Struct({
   id: RuleId,
   missionId: Schema.NullOr(MissionId),
@@ -944,6 +949,13 @@ export type DraftNote = typeof DraftNote.Type;
 export const ApprovalStatus = Schema.Literals(["pending", "approved", "rejected", "stale-closed"]);
 export type ApprovalStatus = typeof ApprovalStatus.Type;
 
+// --- core additions ---
+
+/** Who decides an approval or a draft. The owner can always decide either way. */
+export const Approver = Schema.Literals(["owner", "master"]);
+export type Approver = typeof Approver.Type;
+// --- end core additions ---
+
 export const Approval = Schema.Struct({
   id: ApprovalId,
   missionId: MissionId,
@@ -959,8 +971,52 @@ export const Approval = Schema.Struct({
   decidedBy: Schema.NullOr(MissionProvenance),
   decidedAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
+  // --- core additions ---
+  /** The note that came with the approve or reject. */
+  decisionNote: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Who decides it, from the mission's approval routing. Missing means owner. */
+  approver: Schema.optional(Approver),
+  /** Why the master last re-routed it. */
+  routeNote: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type Approval = typeof Approval.Type;
+
+// --- core additions ---
+
+/** Records written before routing existed have no approver: they are the owner's. */
+export const approverOf = (approval: Pick<Approval, "approver">): Approver =>
+  approval.approver ?? "owner";
+
+/**
+ * What a routing row matches; a missing field matches anything. `repository`
+ * is `owner/repo`, read from the approval's pull-request link. Draft rows are
+ * for the asks track, which routes drafts with the same table.
+ */
+export const ApprovalRouteMatch = Schema.Union([
+  Schema.TaggedStruct("approval", {
+    kind: Schema.optional(Approval.fields.kind),
+    repository: Schema.optional(TrimmedNonEmptyString),
+  }),
+  Schema.TaggedStruct("draft", {
+    channel: Schema.optional(DraftChannel),
+    audience: Schema.optional(TrimmedNonEmptyString),
+    person: Schema.optional(TrimmedNonEmptyString),
+  }),
+]);
+export type ApprovalRouteMatch = typeof ApprovalRouteMatch.Type;
+
+/**
+ * One row of a mission's approval routing. The owner and the master edit the
+ * table; the first matching row wins and no match means the owner.
+ */
+export const ApprovalRoute = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  match: ApprovalRouteMatch,
+  approver: Approver,
+  note: Schema.optional(Schema.NullOr(Schema.String)),
+});
+export type ApprovalRoute = typeof ApprovalRoute.Type;
+// --- end core additions ---
 
 // ---------------------------------------------------------------------------
 // Pools
@@ -1288,7 +1344,7 @@ export const WorkItem = Schema.Struct({
   kind: Schema.Literals(["ticket", "pr", "deploy", "investigation", "doc", "other"]),
   stage: WorkStage,
   // --- core additions ---
-  /** Fields only the owner may change. Missing means none. */
+  /** Unused since 17 Oct 2026: nothing is locked. */
   lockedFields: Schema.optional(LockedFields),
   /** Who holds the ball right now. */
   heldBy: Schema.NullOr(MissionActor),
@@ -1352,6 +1408,17 @@ export const MissionEventKind = Schema.Literals([
   "lane.merged",
   "lane.retired",
   // --- core additions ---
+  "mission.archived",
+  "mission.unarchived",
+  /** Payload `{ into }`: its lanes, milestones and work items moved there. */
+  "sub-mission.merged",
+  "approval.stale-closed",
+  /** Payload `{ approver, reason }`: a pending approval moved to the other approver. */
+  "approval.routed",
+  /** Payload `{ routes, reason }`: the mission's approval routing table changed. */
+  "approval-routing.updated",
+  "rule.applied",
+  "rule.broken",
   "milestone.created",
   "lane.updated",
   "work-item.created",
@@ -1715,7 +1782,7 @@ export const MissionInboxInput = Schema.Struct({
 });
 export type MissionInboxInput = typeof MissionInboxInput.Type;
 
-/** Owner only: pause, resume (active), drain or archive a mission. */
+/** Pause, resume (active), drain, archive or unarchive a mission. Owner or master. */
 export const SetMissionStatusInput = Schema.Struct({
   missionId: MissionId,
   status: MissionStatus,
@@ -1728,7 +1795,7 @@ export const SetSubMissionStatusInput = Schema.Struct({
 });
 export type SetSubMissionStatusInput = typeof SetSubMissionStatusInput.Type;
 
-/** Owner only: focus mode. Null clears it. */
+/** Focus mode. Null clears it. Owner or master. */
 export const SetMissionFocusInput = Schema.Struct({
   missionId: MissionId,
   subMissionId: Schema.NullOr(SubMissionId),
@@ -1739,7 +1806,7 @@ export type SetMissionFocusInput = typeof SetMissionFocusInput.Type;
 export const MarkMissionSeenInput = Schema.Struct({ missionId: MissionId });
 export type MarkMissionSeenInput = typeof MarkMissionSeenInput.Type;
 
-/** Owner (or an import) only. */
+/** Owner, a master or an import. */
 export const CreateMissionInput = Schema.Struct({
   missionId: Schema.optional(MissionId),
   slug: TrimmedNonEmptyString,
@@ -1753,7 +1820,7 @@ export const CreateMissionInput = Schema.Struct({
 });
 export type CreateMissionInput = typeof CreateMissionInput.Type;
 
-/** Tier, weight and shares are owner only. Locked fields are owner only. */
+/** Any field, by the owner or the mission's master. */
 export const UpdateMissionInput = Schema.Struct({
   missionId: MissionId,
   title: Schema.optional(TrimmedNonEmptyString),
@@ -1881,6 +1948,7 @@ export const ReleaseHoldInput = Schema.Struct({
 });
 export type ReleaseHoldInput = typeof ReleaseHoldInput.Type;
 
+/** Unused since 17 Oct 2026: nothing is locked. Kept so old clients decode. */
 export const LockFieldInput = Schema.Struct({
   ref: MissionRecordRef,
   field: TrimmedNonEmptyString,
@@ -1896,7 +1964,7 @@ export const RequestRuleChangeInput = Schema.Struct({
 });
 export type RequestRuleChangeInput = typeof RequestRuleChangeInput.Type;
 
-/** Owner-only rule edits: write, edit wording/scope, retire. */
+/** Write, edit wording/scope, or retire a rule. Owner or the mission's master. */
 export const UpsertRuleInput = Schema.Struct({
   ruleId: Schema.optional(RuleId),
   missionId: Schema.NullOr(MissionId),
@@ -1905,6 +1973,8 @@ export const UpsertRuleInput = Schema.Struct({
   scope: Schema.optional(RuleScope),
   activation: Schema.optional(Schema.String),
   status: Schema.optional(RuleStatus),
+  /** The master's reading of the rule. */
+  masterReading: Schema.optional(Schema.String),
 });
 export type UpsertRuleInput = typeof UpsertRuleInput.Type;
 
@@ -2070,6 +2140,92 @@ export const GovernorView = Schema.Struct({
 });
 export type GovernorView = typeof GovernorView.Type;
 // --- end policy additions ---
+
+/** The master records that it relied on a rule, or that work broke it. */
+export const RecordRuleUseInput = Schema.Struct({
+  ruleId: RuleId,
+  outcome: Schema.Literals(["applied", "broken"]),
+  note: Schema.optional(Schema.String),
+});
+export type RecordRuleUseInput = typeof RecordRuleUseInput.Type;
+
+/** Close a rule-change request: applied, declined, or withdrawn by its asker. */
+export const ResolveRuleChangeInput = Schema.Struct({
+  requestId: RuleChangeRequestId,
+  status: Schema.Literals(["applied", "declined", "withdrawn"]),
+  response: Schema.String,
+});
+export type ResolveRuleChangeInput = typeof ResolveRuleChangeInput.Type;
+
+/** A system (crw) asks for a decision. Same id and still pending is a no-op. */
+export const OpenApprovalInput = Schema.Struct({
+  missionId: MissionId,
+  approvalId: ApprovalId,
+  kind: Approval.fields.kind,
+  title: TrimmedNonEmptyString,
+  detail: Schema.String,
+  requestedBy: TrimmedNonEmptyString,
+  links: Schema.Array(MissionLink),
+});
+export type OpenApprovalInput = typeof OpenApprovalInput.Type;
+
+/** A system closes its pending approval as stale. Never counts as a decision. */
+export const CloseStaleApprovalInput = Schema.Struct({
+  missionId: MissionId,
+  approvalId: ApprovalId,
+  reason: TrimmedNonEmptyString,
+});
+export type CloseStaleApprovalInput = typeof CloseStaleApprovalInput.Type;
+
+/** Replace a mission's approval routing table. Owner or the mission's master. */
+export const SetApprovalRoutingInput = Schema.Struct({
+  missionId: MissionId,
+  routes: Schema.Array(ApprovalRoute),
+  reason: Schema.optional(Schema.String),
+});
+export type SetApprovalRoutingInput = typeof SetApprovalRoutingInput.Type;
+
+/** Move one pending approval to the other approver, with a reason. */
+export const RouteApprovalInput = Schema.Struct({
+  approvalId: ApprovalId,
+  approver: Approver,
+  reason: TrimmedNonEmptyString,
+});
+export type RouteApprovalInput = typeof RouteApprovalInput.Type;
+
+export const AckNoteInput = Schema.Struct({
+  noteId: NoteId,
+});
+export type AckNoteInput = typeof AckNoteInput.Type;
+
+/** Split work off a lane into a new lane; listed work items move with it. */
+export const SplitLaneInput = Schema.Struct({
+  missionId: MissionId,
+  laneId: LaneId,
+  newLaneId: Schema.optional(LaneId),
+  name: TrimmedNonEmptyString,
+  purpose: Schema.optional(Schema.String),
+  /** Defaults to the source lane's sub-mission. */
+  subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
+  workItemIds: Schema.optional(Schema.Array(WorkItemId)),
+});
+export type SplitLaneInput = typeof SplitLaneInput.Type;
+
+/** Fold a lane into another: its work items move, the lane retires. */
+export const MergeLanesInput = Schema.Struct({
+  missionId: MissionId,
+  laneId: LaneId,
+  intoLaneId: LaneId,
+});
+export type MergeLanesInput = typeof MergeLanesInput.Type;
+
+/** Fold a sub-mission into another: lanes, milestones and work items move, it closes. */
+export const MergeSubMissionsInput = Schema.Struct({
+  missionId: MissionId,
+  subMissionId: SubMissionId,
+  intoSubMissionId: SubMissionId,
+});
+export type MergeSubMissionsInput = typeof MergeSubMissionsInput.Type;
 
 // --- asks additions ---
 

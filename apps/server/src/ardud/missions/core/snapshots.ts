@@ -23,6 +23,7 @@ import type {
   Suggestion,
   WorkItem,
 } from "@t3tools/contracts";
+import { approverOf } from "@t3tools/contracts";
 
 import { countLanes } from "./health.ts";
 
@@ -229,7 +230,7 @@ const actorKey = (actor: MissionActor): string => {
   }
 };
 
-/** Open asks, approvals and drafts wait on the owner; blocked work and stuck lanes on whoever holds them. */
+/** Open asks, drafts and owner-routed approvals wait on the owner; the rest on whoever holds them. */
 export const buildBlockers = (inputs: BlockerInputs): Array<BlockerGroup> => {
   const roleNames = new Map(inputs.roles.map((role) => [role.id as string, role.name]));
   const laneNames = new Map(inputs.lanes.map((lane) => [lane.id as string, lane.name]));
@@ -262,8 +263,18 @@ export const buildBlockers = (inputs: BlockerInputs): Array<BlockerGroup> => {
   for (const ask of newestFirst(inputs.openAsks, (ask) => ask.createdAt)) {
     add(owner, { kind: "ask", id: ask.id, label: ask.question });
   }
+  // Master-routed approvals wait on the master role (see the mission's approval routing).
+  const masterRole = inputs.roles.find((role) => role.kind === "master");
+  const master: MissionActor =
+    masterRole === undefined
+      ? { _tag: "system", component: "master" }
+      : { _tag: "role", roleId: masterRole.id };
   for (const approval of newestFirst(inputs.pendingApprovals, (approval) => approval.createdAt)) {
-    add(owner, { kind: "approval", id: approval.id, label: approval.title });
+    add(approverOf(approval) === "master" ? master : owner, {
+      kind: "approval",
+      id: approval.id,
+      label: approval.title,
+    });
   }
   for (const draft of newestFirst(inputs.pendingDrafts, (draft) => draft.createdAt)) {
     add(owner, { kind: "draft", id: draft.id, label: draft.audience });
@@ -401,18 +412,22 @@ export interface InboxInputs {
 export const buildInbox = (inputs: InboxInputs): MissionInbox => {
   const bounded = <T extends { readonly createdAt: string }>(items: ReadonlyArray<T>) =>
     newestFirst(items, (item) => item.createdAt).slice(0, INBOX_LIST_LIMIT);
+  // The owner's inbox holds approvals routed to him; the master's wait on the master.
+  const ownerApprovals = inputs.pendingApprovals.filter(
+    (approval) => approverOf(approval) === "owner",
+  );
   return {
     revision: inputs.revision,
     counts: {
       decide: inputs.openAsks.length,
-      approve: inputs.pendingApprovals.length + inputs.pendingDrafts.length,
+      approve: ownerApprovals.length + inputs.pendingDrafts.length,
       knocks: inputs.pendingKnocks.length,
       suggestions: inputs.suggestions.length,
       fyi: inputs.fyi.length,
     },
     asks: bounded(inputs.openAsks),
     drafts: bounded(inputs.pendingDrafts),
-    approvals: bounded(inputs.pendingApprovals),
+    approvals: bounded(ownerApprovals),
     knocks: bounded(inputs.pendingKnocks),
     suggestions: bounded(inputs.suggestions),
     fyi: inputs.fyi.slice(0, INBOX_LIST_LIMIT),

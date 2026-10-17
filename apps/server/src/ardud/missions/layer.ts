@@ -2,6 +2,8 @@ import * as Layer from "effect/Layer";
 
 import * as AsksService from "./asks/AsksService.ts";
 import { missionsDeskRouteLayer } from "./asks/http.ts";
+import * as RuleService from "./core/RuleService.ts";
+import { editorWiringLayer } from "./editorWiring.ts";
 import { missionsRouteLayer } from "./http.ts";
 import * as MissionService from "./MissionService.ts";
 import { policyRouteLayer } from "./policy/http.ts";
@@ -14,13 +16,19 @@ import * as MissionStore from "./store/MissionStore.ts";
  * Missions services. Other tracks add their layer here, one line each, and
  * read and write through `MissionStore` (see store/MissionStore.ts).
  */
-export const ArdudMissionsLive = Layer.mergeAll(
+const MissionTracksLive = Layer.mergeAll(
   MissionService.layer,
   // tracks: add one line per track layer below
   ScribeLive,
   AsksService.layerLive,
   PolicyLive,
-).pipe(Layer.provideMerge(MissionStore.layer));
+);
+
+/** Services built on the tracks: rules, and the scribe registered as editor. */
+export const ArdudMissionsLive = Layer.mergeAll(RuleService.layer, editorWiringLayer).pipe(
+  Layer.provideMerge(MissionTracksLive),
+  Layer.provideMerge(MissionStore.layer),
+);
 
 /**
  * HTTP routes under /api/ardud/missions. Other tracks add their route layer

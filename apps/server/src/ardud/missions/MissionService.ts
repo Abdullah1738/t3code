@@ -1,8 +1,13 @@
 import {
   MissionError,
+  type Approval,
+  type ApprovalStatus,
+  type CloseStaleApprovalInput,
   type CreateMissionInput,
-  type LockFieldInput,
+  type DecideApprovalInput,
   type MarkMissionSeenInput,
+  type MergeLanesInput,
+  type MergeSubMissionsInput,
   type MissionEvent,
   type MissionId,
   type MissionInbox,
@@ -13,10 +18,14 @@ import {
   type MissionProvenance,
   type MissionStreamItem,
   type MissionSubscribeItem,
+  type OpenApprovalInput,
   type ReorderSubMissionsInput,
+  type RouteApprovalInput,
+  type SetApprovalRoutingInput,
   type SetMissionFocusInput,
   type SetMissionStatusInput,
   type SetSubMissionStatusInput,
+  type SplitLaneInput,
   type UpdateMissionInput,
   type UpsertLaneInput,
   type UpsertMilestoneInput,
@@ -30,6 +39,7 @@ import * as Option from "effect/Option";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import { makeEffort } from "./core/effort.ts";
 import type { MissionEditor } from "./core/ports.ts";
 import { HEALTH_TTL_MS, makeReads } from "./core/reads.ts";
 import { sameValue } from "./core/rules.ts";
@@ -68,6 +78,7 @@ export interface MissionDigest {
 
 const DIGEST_LIMIT = 200;
 const DIGEST_RECENT = 50;
+const APPROVALS_LIMIT = 200;
 const INITIAL_LANES_LIMIT = 200;
 
 /** Changes that alter a list row (counts, health inputs, order, titles). */
@@ -169,15 +180,34 @@ export class MissionService extends Context.Service<
     readonly upsertMilestone: Write<UpsertMilestoneInput>;
     readonly upsertLane: Write<UpsertLaneInput>;
     readonly upsertWorkItem: Write<UpsertWorkItemInput>;
-    readonly lockField: Write<LockFieldInput>;
     readonly markSeen: Write<MarkMissionSeenInput>;
+    readonly splitLane: Write<SplitLaneInput>;
+    readonly mergeLanes: Write<MergeLanesInput>;
+    readonly mergeSubMissions: Write<MergeSubMissionsInput>;
+
+    /** Approvals of one mission, newest first; `ids` reads exact records (crw reads its decisions). */
+    readonly approvals: (input: {
+      readonly missionId: MissionId;
+      readonly ids?: ReadonlyArray<string>;
+      readonly status?: ReadonlyArray<ApprovalStatus>;
+    }) => Effect.Effect<ReadonlyArray<Approval>, MissionError>;
+    /** Systems (crw) open and stale-close approvals in their own component name. */
+    readonly openApproval: Write<OpenApprovalInput>;
+    readonly closeStaleApproval: Write<CloseStaleApprovalInput>;
+    /** The owner decides any pending approval; the master only those routed to it. */
+    readonly decideApproval: Write<DecideApprovalInput>;
+    /** Owner or master: move one pending approval to the other approver, with a reason. */
+    readonly routeApproval: Write<RouteApprovalInput>;
+    /** Owner or master: replace the mission's approval routing table. */
+    readonly setApprovalRouting: Write<SetApprovalRoutingInput>;
   }
 >()("t3/ardud/missions/MissionService") {}
 
 const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
   let editor: MissionEditor | null = null;
-  const reads = makeReads(store, () => editor);
+  const effort = yield* makeEffort;
+  const reads = makeReads(store, () => editor, effort);
   const writes = yield* makeWrites(store);
 
   /** Subscribes before reading the snapshot so nothing between the two is lost. */
@@ -333,6 +363,14 @@ const make = Effect.gen(function* () {
     registerEditor: (next) =>
       Effect.sync(() => {
         editor = next;
+      }),
+    approvals: (input) =>
+      store.list("approval", {
+        missionId: input.missionId,
+        ...(input.ids === undefined ? {} : { ids: input.ids }),
+        ...(input.status === undefined ? {} : { status: input.status }),
+        order: "newest",
+        limit: APPROVALS_LIMIT,
       }),
     ...writes,
   });
