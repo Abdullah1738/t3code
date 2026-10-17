@@ -68,5 +68,6 @@ export * from "./worktreeSetup.ts";
 // ardud fork
 export * from "./ardud/board.ts";
 export * from "./ardud/contextReset.ts";
+export * from "./ardud/missions.ts";
 export * from "./secretRequest.ts";
 export * from "./clientRpcPermissions.ts";
