@@ -1,11 +1,16 @@
 import {
+  ApprovalId,
+  ApprovalStatus,
   AskId,
   AskStatus,
+  CreateMissionInput,
   DecideSuggestionInput,
   DraftChannel,
   DraftId,
   DraftStatus,
   ForkId,
+  MergeLanesInput,
+  MergeSubMissionsInput,
   MissionId,
   MissionLink,
   MissionRecordRef,
@@ -13,10 +18,21 @@ import {
   NoteId,
   OrchestratorMcpFailure,
   PostMessageInput,
+  RecordRuleUseInput,
+  ReorderSubMissionsInput,
+  RequestRuleChangeInput,
+  ResolveRuleChangeInput,
+  RouteApprovalInput,
+  SetApprovalRoutingInput,
+  SetMissionFocusInput,
+  SetMissionStatusInput,
+  SplitLaneInput,
   TrimmedNonEmptyString,
+  UpdateMissionInput,
   UpsertLaneInput,
   UpsertMilestoneInput,
   UpsertSubMissionInput,
+  UpsertRuleInput,
   UpsertWorkItemInput,
   WithdrawAskInput,
 } from "@t3tools/contracts";
@@ -26,6 +42,7 @@ import * as Schema from "effect/Schema";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as AsksService from "../asks/AsksService.ts";
+import * as RuleService from "../core/RuleService.ts";
 import * as MissionService from "../MissionService.ts";
 import { MakeCallInput, OpenAskRequest, ProposeSuggestionInput } from "../asks/inputs.ts";
 import { WATCH_KINDS } from "../asks/watch.ts";
@@ -228,7 +245,7 @@ const MissionSuggestTool = Tool.make("mission_suggest", {
 
 const MissionSuggestionDecideTool = Tool.make("mission_suggestion_decide", {
   description:
-    "As the mission's master, accept, accept with edits, or dismiss a suggestion addressed to the master that you did not author. Owner-addressed suggestions are his to decide.",
+    "As the mission's master, accept, accept with edits, or dismiss any suggestion in the mission, including ones addressed to the owner. The timeline records that the master decided it.",
   parameters: DecideSuggestionInput,
   success: Schema.Struct({ suggestion: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
@@ -278,7 +295,7 @@ const planDependencies = [...dependencies, MissionService.MissionService];
 
 const MissionSubMissionTool = Tool.make("mission_sub_mission", {
   description:
-    "As the mission's master, create a sub-mission (new subMissionId or none, title required) or update one. Owner-only and locked fields are refused.",
+    "As the mission's master, create a sub-mission (new subMissionId or none, title required) or update any of its fields, including closing it (status closed).",
   parameters: UpsertSubMissionInput,
   success: MissionMutationResult,
   failure: OrchestratorMcpFailure,
@@ -314,6 +331,152 @@ const MissionWorkItemTool = Tool.make("mission_work_item", {
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies: planDependencies,
+});
+
+// Master controls (owner rule, 17 Oct 2026: everything the owner can do, the
+// master can do). Same service methods as the owner's Robob UI; each change is
+// a timeline event recorded as the master.
+const missionWriteTool = <Name extends string, P extends Schema.Constraint>(
+  name: Name,
+  description: string,
+  parameters: P,
+) =>
+  Tool.make(name, {
+    description,
+    parameters,
+    success: MissionMutationResult,
+    failure: OrchestratorMcpFailure,
+    failureMode: "return",
+    dependencies: planDependencies,
+  });
+
+const MissionCreateTool = missionWriteTool(
+  "mission_create",
+  "As a mission master, create a new mission (slug and title required; tier, weight and shares optional). It starts active with no master.",
+  CreateMissionInput,
+);
+
+const MissionUpdateTool = missionWriteTool(
+  "mission_update",
+  "As the mission's master, change any mission field: title, goal, tier, weight, guaranteed share, borrow ceiling, project or master role.",
+  UpdateMissionInput,
+);
+
+const MissionSetStatusTool = missionWriteTool(
+  "mission_set_status",
+  "As the mission's master, pause (paused), resume (active), drain (draining), archive (archived) or unarchive (active) the mission.",
+  SetMissionStatusInput,
+);
+
+const MissionFocusTool = missionWriteTool(
+  "mission_focus",
+  "As the mission's master, turn focus mode on for one open sub-mission, or off with subMissionId null. Focus has no end time; it stays until someone turns it off.",
+  SetMissionFocusInput,
+);
+
+const MissionSubMissionReorderTool = missionWriteTool(
+  "mission_sub_mission_reorder",
+  "As the mission's master, reorder the open sub-missions. `order` must list every open sub-mission exactly once.",
+  ReorderSubMissionsInput,
+);
+
+const MissionSubMissionMergeTool = missionWriteTool(
+  "mission_sub_mission_merge",
+  "As the mission's master, merge one sub-mission into another: its lanes, milestones and work items move to intoSubMissionId, it closes, and focus follows if it had it.",
+  MergeSubMissionsInput,
+);
+
+const MissionLaneSplitTool = missionWriteTool(
+  "mission_lane_split",
+  "As the mission's master, split a lane: a new lane (name required) takes the listed work items from it, in the same sub-mission unless subMissionId says otherwise.",
+  SplitLaneInput,
+);
+
+const MissionLaneMergeTool = missionWriteTool(
+  "mission_lane_merge",
+  "As the mission's master, merge a lane into another: its work items move to intoLaneId and it retires. A lane an open ask holds cannot be merged away until the ask is answered or withdrawn.",
+  MergeLanesInput,
+);
+
+const MissionApprovalsTool = Tool.make("mission_approvals", {
+  description:
+    "A mission's approvals, newest first: crw merge approvals and others, each with its approver (owner or master), status, decision and any re-route reason.",
+  parameters: Schema.Struct({
+    missionId: MissionId,
+    status: Schema.optional(Schema.Array(ApprovalStatus)),
+  }),
+  success: Schema.Struct({ approvals: Records }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: planDependencies,
+});
+
+const MissionApprovalDecideTool = missionWriteTool(
+  "mission_approval_decide",
+  "As the mission's master, approve or reject a pending approval routed to the master (with an optional note). Approvals routed to the owner are his; re-route one first with mission_approval_route if he agreed. Stale-closed approvals never count, and an approval only covers the head it names.",
+  Schema.Struct({
+    missionId: MissionId,
+    approvalId: ApprovalId,
+    action: Schema.Literals(["approve", "reject"]),
+    note: Schema.optional(Schema.String),
+  }),
+);
+
+const MissionApprovalRouteTool = missionWriteTool(
+  "mission_approval_route",
+  "As the mission's master, send one pending approval to the owner or to the master, with the reason. The reason is logged and shown with the approval.",
+  Schema.Struct({ missionId: MissionId, ...RouteApprovalInput.fields }),
+);
+
+const MissionApprovalRoutingTool = missionWriteTool(
+  "mission_approval_routing",
+  "As the mission's master, replace the mission's approval routing table: rows matched in order, first match wins. An approval row matches by kind and repository (owner/repo); a draft row by channel, audience or person. Anything no row matches goes to the owner. Applies to approvals opened from now on.",
+  SetApprovalRoutingInput,
+);
+
+const ruleDependencies = [...planDependencies, RuleService.RuleService];
+
+const MissionRuleTool = Tool.make("mission_rule", {
+  description:
+    "As the mission's master, write a rule (no ruleId), or edit any rule's wording, scope, activation or your reading, or retire it (status retired). missionId null means a rule for every mission. Changing the quote bumps the rule's version.",
+  parameters: UpsertRuleInput,
+  success: Schema.Struct({ rule: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: ruleDependencies,
+});
+
+const MissionRuleUseTool = Tool.make("mission_rule_use", {
+  description:
+    "As the mission's master, record that a rule was applied or broken, with a short note. It counts on the rule and goes on the timeline.",
+  parameters: RecordRuleUseInput,
+  success: Schema.Struct({ rule: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: ruleDependencies,
+});
+
+const MissionRuleChangeTool = Tool.make("mission_rule_change", {
+  description:
+    "Ask for a change to a rule, in words. Anyone in the mission may ask; the owner or the master resolves it with mission_rule_change_resolve.",
+  parameters: Schema.Struct({
+    ruleId: RequestRuleChangeInput.fields.ruleId,
+    request: RequestRuleChangeInput.fields.request,
+  }),
+  success: Schema.Struct({ request: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: ruleDependencies,
+});
+
+const MissionRuleChangeResolveTool = Tool.make("mission_rule_change_resolve", {
+  description:
+    "As the mission's master, resolve an open rule change request: applied (edit the rule with mission_rule too), declined, or withdrawn, with your response.",
+  parameters: ResolveRuleChangeInput,
+  success: Schema.Struct({ request: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: ruleDependencies,
 });
 
 interface ToolConfig {
@@ -371,4 +534,20 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionMilestoneTool, "Create or update a milestone"),
   writeTool(MissionLaneTool, "Create or update a lane"),
   writeTool(MissionWorkItemTool, "Create or update a work item"),
+  writeTool(MissionCreateTool, "Create a mission"),
+  writeTool(MissionUpdateTool, "Update a mission"),
+  writeTool(MissionSetStatusTool, "Pause, resume, drain or archive a mission"),
+  writeTool(MissionFocusTool, "Set or clear focus mode"),
+  writeTool(MissionSubMissionReorderTool, "Reorder sub-missions"),
+  writeTool(MissionSubMissionMergeTool, "Merge sub-missions"),
+  writeTool(MissionLaneSplitTool, "Split a lane"),
+  writeTool(MissionLaneMergeTool, "Merge lanes"),
+  readTool(MissionApprovalsTool, "Mission approvals"),
+  writeTool(MissionApprovalDecideTool, "Decide an approval routed to the master"),
+  writeTool(MissionApprovalRouteTool, "Route one approval"),
+  writeTool(MissionApprovalRoutingTool, "Set approval routing"),
+  writeTool(MissionRuleTool, "Write, edit or retire a rule"),
+  writeTool(MissionRuleUseTool, "Record a rule applied or broken"),
+  writeTool(MissionRuleChangeTool, "Ask for a rule change"),
+  writeTool(MissionRuleChangeResolveTool, "Resolve a rule change request"),
 );
