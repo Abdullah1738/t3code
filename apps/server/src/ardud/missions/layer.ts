@@ -1,7 +1,10 @@
 import * as Layer from "effect/Layer";
 
+import * as AsksService from "./asks/AsksService.ts";
+import { missionsDeskRouteLayer } from "./asks/http.ts";
 import { missionsRouteLayer } from "./http.ts";
 import * as MissionService from "./MissionService.ts";
+import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
 import * as MissionStore from "./store/MissionStore.ts";
 
@@ -13,6 +16,7 @@ export const ArdudMissionsLive = Layer.mergeAll(
   MissionService.layer,
   // tracks: add one line per track layer below
   ScribeLive,
+  AsksService.layerLive,
 ).pipe(Layer.provideMerge(MissionStore.layer));
 
 /**
@@ -22,4 +26,6 @@ export const ArdudMissionsLive = Layer.mergeAll(
 export const ArdudMissionsRoutesLive = Layer.mergeAll(
   missionsRouteLayer,
   // tracks: add one line per track route layer below
+  scribeRouteLayer,
+  missionsDeskRouteLayer,
 );
