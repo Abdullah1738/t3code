@@ -1217,6 +1217,12 @@ export const MissionEventKind = Schema.Literals([
   "ask.answered",
   "ask.withdrawn",
   "call.made",
+  // --- scribe additions ---
+  /** The scribe (or editor/master) recorded a note; subject is the note. */
+  "note.recorded",
+  /** The editor refreshed the bottom line, FYI ranking and feed. */
+  "editor.updated",
+  // --- end scribe additions ---
   "rule.created",
   "rule.updated",
   "rule.retired",
