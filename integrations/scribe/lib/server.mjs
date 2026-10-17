@@ -49,7 +49,7 @@ export function serverClient({ url, token, fetchImpl = fetch, timeoutMs = 30_000
     postBatch: async (batch) => (await call('POST', '/batches', batch)).result,
     editorInput: async (missionId) => (await call('GET', `/editor/input${q({ missionId })}`)).input,
     postEditor: async (output) => (await call('POST', '/editor', output)).result,
-    report: async (missionId, kind, since) => (await call('GET', `/reports/${kind}${q({ missionId, since })}`)).report,
+    report: async (request) => (await call('POST', '/reports', request)).report,
   };
 }
 

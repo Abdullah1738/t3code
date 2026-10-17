@@ -34,16 +34,21 @@ matched|mismatch|missing`). That code lives in
 node cli.mjs run [--mission ID] [--slices 10]       # every mission lane, via the server
 node cli.mjs dry-run --thread THREAD_ID [--from EVENT | --since ISO] [--slices 3] [--out DIR]
 node cli.mjs editor --mission ID [--out FILE]      # one Opus editor pass, by hand
-node cli.mjs report --mission ID --kind update|daily [--since ISO] [--out FILE]
+node cli.mjs report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--out FILE]
 ```
 
 `dry-run` never touches the server: cursors and notes go to `DIR/state.json`,
 batches to `DIR/batches.jsonl` and raw model replies to `DIR/replies.jsonl`.
 The default output directory is `$TMPDIR/opencode/missions-scribe/`.
 
-`report --kind update` writes in the `OWNER-UPDATES.md` format: it inserts the
-new section below the `UPDATES-INSERT-BELOW` marker of the target file and
-leaves the story block alone. It never defaults to a live project file.
+`report` asks the server to build the 4h update or the daily summary from
+mission data (records, verified notes, events; no model call). `--save` keeps
+it so the next report of that kind starts where it ended and closes out what it
+left open. `--kind update` exports in the `OWNER-UPDATES.md` format: the new
+section goes below the `UPDATES-INSERT-BELOW` marker of the target file
+(created when missing), the story block is left alone, and a section already in
+the file is not written twice. The default target is scratch, and the live
+Crpko status files are refused.
 
 Environment: `SCRIBE_DB`, `SCRIBE_ROUTER_URL`, `SCRIBE_MODEL`,
 `SCRIBE_EDITOR_MODEL`, `SCRIBE_OUT`, `SCRIBE_CONTROL_FILE` (defaults to

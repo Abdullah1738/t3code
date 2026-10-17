@@ -5,7 +5,8 @@
 //   scribe dry-run --thread ID [--name N] [--since ISO | --from EVENT] [--slices N] [--out DIR]
 //                                                   one lane, real model, notes to files only
 //   scribe editor --mission ID [--out FILE]         one Opus editor pass (bottom line, FYI, feed, suggestions)
-//   scribe report --mission ID --kind update|daily [--since ISO] [--out FILE]
+//   scribe report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--out FILE]
+//                                                   build a report from mission data; export it (scratch by default)
 //
 // Never runs on a timer by itself; a mission schedule or a person starts it.
 import { tmpdir } from 'node:os';
@@ -120,14 +121,24 @@ async function editor(opts) {
 }
 
 async function report(opts) {
-  if (!opts.mission || !opts.kind) throw new Error('report needs --mission and --kind update|daily');
+  if (!opts.mission || !['update', 'daily'].includes(opts.kind)) {
+    throw new Error('report needs --mission and --kind update|daily');
+  }
   const { exportUpdate } = await import('./lib/export.mjs');
   const client = serverClient();
-  const text = await client.report(opts.mission, opts.kind, opts.since);
+  const built = await client.report({
+    missionId: opts.mission,
+    kind: opts.kind,
+    from: opts.since,
+    to: opts.to,
+    save: Boolean(opts.save),
+  });
   const out = opts.out || join(SCRATCH, opts.kind === 'daily' ? 'DAILY.md' : 'OWNER-UPDATES.md');
-  if (opts.kind === 'update') exportUpdate(out, text);
-  else write(out, text);
-  return { out, chars: text.length };
+  const written =
+    opts.kind === 'update'
+      ? exportUpdate(out, built.text, { title: opts.title || opts.mission })
+      : (write(out, built.text), { path: out, inserted: true });
+  return { ...written, coversFrom: built.coversFrom, coversTo: built.coversTo, open: built.open.length };
 }
 
 const write = (path, text) => {
