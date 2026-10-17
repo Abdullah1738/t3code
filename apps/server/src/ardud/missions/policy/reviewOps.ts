@@ -1,4 +1,5 @@
 import {
+  CriticalityVerdictId,
   ReviewRecordId,
   type CriticalityVerdict,
   type EditReviewPolicyInput,
@@ -26,11 +27,11 @@ import {
   eventDraft,
   failWith,
   missionRoles,
-  newId,
   nowIso,
   requireGovern,
   requireMission,
   resolveCaller,
+  shortId,
   systemCaller,
   type Caller,
   type PolicyDeps,
@@ -203,6 +204,17 @@ const recordsFor = (deps: PolicyDeps, missionId: MissionId, pullRequest: PullReq
     return ids.length === 0 ? [] : yield* deps.store.list("review", { ids });
   });
 
+/**
+ * Verdict ids carry the PR's running count so two verdicts in the same
+ * millisecond still sort in the order they were made.
+ */
+const sequenced = (verdict: CriticalityVerdict, count: number): CriticalityVerdict => ({
+  ...verdict,
+  id: CriticalityVerdictId.make(
+    `${verdict.missionId}:${pullRequestLabel(verdict.pullRequest)}:${verdict.createdAt}:${String(count + 1).padStart(6, "0")}:${verdict.source}`,
+  ),
+});
+
 const saveVerdict = (deps: PolicyDeps, caller: Caller, verdict: CriticalityVerdict) =>
   deps.store.commit({
     event: eventDraft(
@@ -229,9 +241,8 @@ const saveVerdict = (deps: PolicyDeps, caller: Caller, verdict: CriticalityVerdi
   });
 
 /**
- * Records whether a PR is critical. The master judges (lane leads too when the
- * policy delegates); the owner's word is final and later master changes do
- * not override it.
+ * Records whether a PR is critical. The owner or the master judges (lane leads
+ * too when the policy delegates); the newest verdict wins, whoever made it.
  */
 export const recordCriticality = (
   deps: PolicyDeps,
@@ -253,8 +264,9 @@ export const recordCriticality = (
     const reason = input.reason.trim();
     if (reason.length === 0) return yield* failWith("invalid", "A verdict needs a reason.");
     const now = yield* nowIso;
-    const previous = latestVerdict(yield* verdictsFor(deps, input.missionId, input.pullRequest));
-    const verdict = newVerdict({
+    const existing = yield* verdictsFor(deps, input.missionId, input.pullRequest);
+    const previous = latestVerdict(existing);
+    const made = newVerdict({
       missionId: input.missionId,
       pullRequest: input.pullRequest,
       critical: input.critical,
@@ -264,6 +276,7 @@ export const recordCriticality = (
       previous,
       now,
     });
+    const verdict = sequenced(made, existing.length);
     const committed = yield* saveVerdict(deps, caller, verdict);
     return { seq: committed.seq, ref: verdictRef(verdict) };
   });
@@ -293,8 +306,10 @@ export const recordReview = (
       );
     }
     const model = input.model ?? (yield* callerModelKey(deps, caller, role));
+    const earlier = yield* deps.policyStore.reviewIds("review", input.missionId, input.pullRequest);
     const record: ReviewRecord = {
-      id: ReviewRecordId.make(newId("review")),
+      // The running count keeps same-millisecond records in the order they were made.
+      id: ReviewRecordId.make(shortId(`review-${String(earlier.length + 1).padStart(6, "0")}`)),
       missionId: input.missionId,
       pullRequest: input.pullRequest,
       stageId: stage.id,
@@ -353,11 +368,12 @@ export const planReview = (
     const now = yield* nowIso;
     const { policy } = yield* loadPolicy(deps, request.missionId);
     const roles = yield* missionRoles(deps, request.missionId, now);
+    const verdicts = yield* verdictsFor(deps, request.missionId, request.pullRequest);
     const result = reviewPlan({
       policy,
       pullRequest: request.pullRequest,
       headSha: request.headSha,
-      verdicts: yield* verdictsFor(deps, request.missionId, request.pullRequest),
+      verdicts,
       records: yield* recordsFor(deps, request.missionId, request.pullRequest),
       roles: roles.all,
       customLadderIds: request.customLadderIds,
@@ -365,7 +381,11 @@ export const planReview = (
       now,
     });
     if (result.unrecordedTrigger !== null) {
-      yield* saveVerdict(deps, systemCaller(POLICY_PROVENANCE), result.unrecordedTrigger);
+      yield* saveVerdict(
+        deps,
+        systemCaller(POLICY_PROVENANCE),
+        sequenced(result.unrecordedTrigger, verdicts.length),
+      );
     }
     return result.plan;
   });
