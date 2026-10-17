@@ -26,16 +26,11 @@ const TOKENS: Record<string, ReadonlyArray<AuthEnvironmentScope>> = {
 const owner: MissionProvenance = { _tag: "owner-app", surface: "web", sessionId: "session-1" };
 const missionId = MissionId.make("m-http");
 
-// The owner creates the mission and locks its goal before any HTTP caller shows up.
+// The owner creates the mission before any HTTP caller shows up.
 const seeded = Layer.effectDiscard(
   Effect.gen(function* () {
     const missions = yield* MissionService.MissionService;
     yield* missions.createMission(owner, { missionId, slug: "http", title: "HTTP mission" });
-    yield* missions.lockField(owner, {
-      ref: { kind: "mission", id: missionId },
-      field: "goal",
-      locked: true,
-    });
   }),
 );
 
@@ -119,74 +114,146 @@ describe("missions routes", () => {
     }
   });
 
-  it("takes agent provenance from the headers, never from the body", async () => {
+  it("refuses plan writes that would trust a thread header, naming the MCP tool", async () => {
     const { handler, dispose } = makeHandler();
     try {
-      const anonymous = await handler(
-        request("/sub-missions", {
-          token: "Bearer operator",
-          body: { missionId, title: "Rails", provenance: owner },
-        }),
-      );
-      expect(anonymous.status).toBe(403);
-      expect(await anonymous.json()).toMatchObject({
-        ok: false,
-        error: { code: "forbidden", missionCode: "provenance-required" },
-      });
+      for (const [path, tool] of [
+        ["/mission", "mission_update"],
+        ["/sub-missions", "mission_sub_mission"],
+        ["/sub-missions/reorder", "mission_sub_mission_reorder"],
+        ["/milestones", "mission_milestone"],
+        ["/lanes", "mission_lane"],
+        ["/work-items", "mission_work_item"],
+      ] as const) {
+        const response = await handler(
+          request(path, {
+            token: "Bearer operator",
+            headers: { "x-t3-thread-id": "thread-master" },
+            body: { missionId, title: "Rails", provenance: owner },
+          }),
+        );
+        expect(response.status).toBe(403);
+        const body = (await response.json()) as {
+          ok: boolean;
+          error: { code: string; missionCode: string; message: string };
+        };
+        expect(body).toMatchObject({
+          ok: false,
+          error: { code: "forbidden", missionCode: "provenance-required" },
+        });
+        expect(body.error.message).toContain(tool);
+      }
 
-      const created = await handler(
-        request("/sub-missions", {
-          token: "Bearer operator",
-          headers: { "x-t3-thread-id": "thread-master" },
-          body: { missionId, title: "Rails", provenance: owner },
-        }),
-      );
-      expect(created.status).toBe(200);
-      const result = (await created.json()) as { ok: boolean; seq: number; ref: { kind: string } };
-      expect(result).toMatchObject({ ok: true, ref: { kind: "sub-mission" } });
-
+      // Nothing was written.
       const digest = await handler(
-        request(`/digest?mission=${missionId}&since=${result.seq - 1}`, { token: "Bearer reader" }),
+        request(`/digest?mission=${missionId}&since=1`, { token: "Bearer reader" }),
       );
-      const events = (await digest.json()) as {
-        latestSeq: number;
-        events: Array<{ kind: string; provenance: MissionProvenance }>;
-      };
-      expect(events.latestSeq).toBe(result.seq);
-      expect(events.events.map((event) => event.kind)).toEqual(["sub-mission.created"]);
-      expect(events.events[0]?.provenance).toEqual({
-        _tag: "agent",
-        threadId: "thread-master",
-        roleId: null,
-      });
+      expect(((await digest.json()) as { events: unknown[] }).events).toEqual([]);
     } finally {
       await dispose();
     }
   });
 
-  it("maps owner-only, locked and missing records to HTTP errors", async () => {
+  it("takes crw approvals as system writes and serves decisions back", async () => {
     const { handler, dispose } = makeHandler();
     try {
-      const asMaster = (path: string, body: unknown) =>
-        handler(
-          request(path, {
-            token: "Bearer operator",
-            headers: { "x-t3-thread-id": "thread-master" },
-            body,
-          }),
-        );
+      const approvalId = "crpko:approval:crw:acme/api#7@aaaaaaaaaaaa";
+      const open = {
+        missionId,
+        approvalId,
+        kind: "merge",
+        title: "Good to merge: acme/api#7 Fix the thing",
+        detail: "looks right\n\nDecide in the review thread (head aaaaaaaaaaaa).",
+        requestedBy: "crw",
+        links: [
+          {
+            kind: "pull-request",
+            label: "acme/api#7",
+            url: "https://github.com/acme/api/pull/7",
+            ref: "aaaaaaaaaaaa",
+          },
+        ],
+      };
+      const post = (path: string, body: unknown, token = "Bearer operator") =>
+        handler(request(path, { token, body }));
 
-      const tier = await asMaster("/mission", { missionId, tier: "P0" });
-      expect(tier.status).toBe(403);
-      expect(await tier.json()).toMatchObject({ error: { missionCode: "forbidden" } });
+      expect((await post("/approvals/open", open, "Bearer reader")).status).toBe(403);
+      const opened = await post("/approvals/open", open);
+      expect(opened.status).toBe(200);
+      // Opening the same id again is settled, not a second record.
+      expect((await post("/approvals/open", open)).status).toBe(200);
+      // Only named components open approvals.
+      const stranger = await post("/approvals/open", {
+        ...open,
+        approvalId: `${approvalId}~2`,
+        requestedBy: "someone",
+      });
+      expect(stranger.status).toBe(403);
 
-      const goal = await asMaster("/mission", { missionId, goal: "Agent goal" });
-      expect(goal.status).toBe(403);
-      expect(await goal.json()).toMatchObject({ error: { missionCode: "locked" } });
+      const pending = await handler(
+        request(`/approvals?mission=${missionId}&status=pending`, { token: "Bearer reader" }),
+      );
+      const listed = (await pending.json()) as {
+        approvals: Array<{ id: string; approver: string; status: string }>;
+      };
+      expect(listed.approvals.map((approval) => [approval.id, approval.status])).toEqual([
+        [approvalId, "pending"],
+      ]);
+      expect(listed.approvals[0]?.approver).toBe("owner");
 
-      const malformed = await asMaster("/lanes", { missionId, status: "sleeping" });
-      expect(malformed.status).toBe(400);
+      const stale = await post("/approvals/stale", {
+        missionId,
+        approvalId,
+        reason: "head moved to cccccccccccc",
+      });
+      expect(stale.status).toBe(200);
+      const again = await post("/approvals/stale", { missionId, approvalId, reason: "again" });
+      expect(again.status).toBe(200);
+      const missing = await post("/approvals/stale", {
+        missionId,
+        approvalId: `${approvalId}~9`,
+        reason: "PR closed",
+      });
+      expect(missing.status).toBe(404);
+      // A stale-closed approval cannot be opened again under the same id.
+      const reopened = await post("/approvals/open", open);
+      expect(reopened.status).toBe(409);
 
+      const read = await handler(
+        request(`/approvals?mission=${missionId}&id=${encodeURIComponent(approvalId)}`, {
+          token: "Bearer reader",
+        }),
+      );
+      const closed = (await read.json()) as {
+        approvals: Array<{ status: string; staleReason: string; decidedBy: unknown }>;
+      };
+      expect(closed.approvals).toHaveLength(1);
+      expect(closed.approvals[0]).toMatchObject({
+        status: "stale-closed",
+        staleReason: "head moved to cccccccccccc",
+      });
+
+      const digest = await handler(
+        request(`/digest?mission=${missionId}&since=1`, { token: "Bearer reader" }),
+      );
+      const events = (await digest.json()) as {
+        events: Array<{ kind: string; provenance: MissionProvenance }>;
+      };
+      expect(events.events.map((event) => event.kind)).toEqual([
+        "approval.opened",
+        "approval.stale-closed",
+      ]);
+      for (const event of events.events) {
+        expect(event.provenance).toEqual({ _tag: "system", component: "crw" });
+      }
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("maps missing records and bad queries to HTTP errors", async () => {
+    const { handler, dispose } = makeHandler();
+    try {
       const noMission = await handler(request("/digest", { token: "Bearer reader" }));
       expect(noMission.status).toBe(400);
       const unknown = await handler(request("/digest?mission=m-nope", { token: "Bearer reader" }));
@@ -199,6 +266,8 @@ describe("missions routes", () => {
         request(`/digest?mission=${missionId}&since=yesterday-ish`, { token: "Bearer reader" }),
       );
       expect(badSince.status).toBe(400);
+      const noApprovalsMission = await handler(request("/approvals", { token: "Bearer reader" }));
+      expect(noApprovalsMission.status).toBe(400);
     } finally {
       await dispose();
     }

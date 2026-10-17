@@ -1,5 +1,6 @@
 import {
   MissionError,
+  approverOf,
   type Lane,
   type Milestone,
   type MissionHealth,
@@ -17,6 +18,7 @@ import * as Option from "effect/Option";
 
 import type * as MissionStore from "../store/MissionStore.ts";
 import { countLanes, judgeHealth } from "./health.ts";
+import type { MissionEffort } from "./effort.ts";
 import type { MissionEditor } from "./ports.ts";
 import {
   buildBlockers,
@@ -88,6 +90,7 @@ const notFound = (missionId: string) =>
 export const makeReads = (
   store: MissionStore.MissionStore["Service"],
   currentEditor: () => MissionEditor | null,
+  effort: MissionEffort | null = null,
 ) => {
   const healthCache = new Map<string, HealthEntry>();
 
@@ -170,7 +173,9 @@ export const makeReads = (
             subMissions: records.subMissions,
             lanes: records.lanes,
             openAsks: records.openAsks,
-            pendingApprovals: approvals.get(mission.id)?.length ?? 0,
+            pendingApprovals: (approvals.get(mission.id) ?? []).filter(
+              (approval) => approverOf(approval) === "owner",
+            ).length,
             pendingDrafts: drafts.get(mission.id)?.length ?? 0,
             pendingKnocks: knocks.get(mission.id)?.length ?? 0,
             health: entry.mission,
@@ -208,9 +213,11 @@ export const makeReads = (
       const entry = yield* healthOf(missionId, { subMissions, lanes, openAsks, milestones });
       const editor = currentEditor();
       const view = editor === null ? null : yield* editor.view(missionId);
+      const healthy = withHealth(subMissions, entry);
       return {
         mission: { ...mission.value, health: entry.mission },
-        subMissions: withHealth(subMissions, entry),
+        subMissions:
+          effort === null ? healthy : yield* effort.withActualEffort(missionId, healthy, lanes),
         milestones,
         bottomLine: view?.bottomLine ?? "",
         bottomLineAt: view?.bottomLineAt ?? null,

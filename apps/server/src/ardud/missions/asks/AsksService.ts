@@ -919,7 +919,13 @@ const make = Effect.gen(function* () {
   const reopenSuggestionCommand = (input: ReopenSuggestionInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const suggestion = yield* need("suggestion", input.suggestionId);
-      const reopened = yield* fromOutcome(reopenSuggestion(suggestion, provenance, yield* now));
+      const callerIsMaster =
+        suggestion.missionId === null
+          ? false
+          : (yield* standingIn(suggestion.missionId, provenance)).standing.isMaster;
+      const reopened = yield* fromOutcome(
+        reopenSuggestion(suggestion, provenance, yield* now, callerIsMaster),
+      );
       yield* persist(suggestion.missionId, reopened.events, [
         { _tag: "suggestion", record: reopened.record },
       ]);

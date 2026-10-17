@@ -10,6 +10,7 @@ import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as AsksService from "../asks/AsksService.ts";
 import { keepWorkItemHolds, laneHoldConflict } from "../asks/holds.ts";
+import * as RuleService from "../core/RuleService.ts";
 import { watchAddCommand, watchCheckCommand } from "../asks/watch.ts";
 import * as MissionService from "../MissionService.ts";
 import { MissionsToolkit } from "./tools.ts";
@@ -21,7 +22,6 @@ const REFUSALS: ReadonlySet<MissionError["code"]> = new Set([
   "forbidden",
   "provenance-required",
   "provenance-invalid",
-  "locked",
 ]);
 
 /** Mission errors reach the agent as tool errors carrying the mission's own wording. */
@@ -91,6 +91,43 @@ const asMaster = <A>(
 
 const openAsks = (asks: AsksService.AsksService["Service"], missionId: MissionId) =>
   asks.asks({ missionId, status: ["open"] });
+
+/** New missions belong to no mission yet: any mission's master may create one. */
+const asAnyMaster = <A>(
+  run: (
+    missions: MissionService.MissionService["Service"],
+    provenance: MissionProvenance,
+  ) => Effect.Effect<A, MissionError>,
+) =>
+  withCaller((asks, provenance) =>
+    Effect.gen(function* () {
+      for (const mission of yield* asks.missions()) {
+        const standing = yield* asks.standing(mission.id, provenance);
+        if (standing.isMaster) {
+          const missions = yield* MissionService.MissionService;
+          return yield* run(missions, standing.caller.provenance);
+        }
+      }
+      return yield* new MissionError({
+        code: "forbidden",
+        detail: "Only a mission's master creates missions.",
+      });
+    }),
+  );
+
+/** Rules carry their own owner-or-master check; the caller is passed as it stands. */
+const withRules = <A>(
+  run: (
+    rules: RuleService.RuleService["Service"],
+    provenance: MissionProvenance,
+  ) => Effect.Effect<A, MissionError>,
+) =>
+  withCaller((_asks, provenance) =>
+    Effect.gen(function* () {
+      const rules = yield* RuleService.RuleService;
+      return yield* run(rules, provenance);
+    }),
+  );
 
 const handlers = {
   mission_status: McpToolAccess.reads((input) =>
@@ -280,6 +317,109 @@ const handlers = {
         );
         return yield* missions.upsertWorkItem(provenance, held);
       }),
+    ),
+  ),
+  mission_create: McpToolAccess.actsAsCaller((input) =>
+    asAnyMaster((missions, provenance) => missions.createMission(provenance, input)),
+  ),
+  mission_update: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.updateMission(provenance, input),
+    ),
+  ),
+  mission_set_status: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.setMissionStatus(provenance, input),
+    ),
+  ),
+  mission_focus: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.setMissionFocus(provenance, input),
+    ),
+  ),
+  mission_sub_mission_reorder: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.reorderSubMissions(provenance, input),
+    ),
+  ),
+  mission_sub_mission_merge: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.mergeSubMissions(provenance, input),
+    ),
+  ),
+  mission_lane_split: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.splitLane(provenance, input),
+    ),
+  ),
+  mission_lane_merge: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, asks, provenance) =>
+      Effect.gen(function* () {
+        const conflict = laneHoldConflict(
+          input.laneId,
+          { status: "retired" },
+          yield* openAsks(asks, input.missionId),
+        );
+        if (conflict !== null) {
+          return yield* new MissionError({ code: "conflict", detail: conflict });
+        }
+        return yield* missions.mergeLanes(provenance, input);
+      }),
+    ),
+  ),
+  mission_approvals: McpToolAccess.reads((input) =>
+    withCaller(() =>
+      Effect.gen(function* () {
+        const missions = yield* MissionService.MissionService;
+        const approvals = yield* missions.approvals({
+          missionId: input.missionId,
+          ...(input.status === undefined ? {} : { status: input.status }),
+        });
+        return { approvals };
+      }),
+    ),
+  ),
+  mission_approval_decide: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.decideApproval(provenance, {
+        approvalId: input.approvalId,
+        action: input.action,
+        ...(input.note === undefined ? {} : { note: input.note }),
+      }),
+    ),
+  ),
+  mission_approval_route: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.routeApproval(provenance, {
+        approvalId: input.approvalId,
+        approver: input.approver,
+        reason: input.reason,
+      }),
+    ),
+  ),
+  mission_approval_routing: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.setApprovalRouting(provenance, input),
+    ),
+  ),
+  mission_rule: McpToolAccess.actsAsCaller((input) =>
+    withRules((rules, provenance) =>
+      rules.upsertRule(provenance, input).pipe(Effect.map((rule) => ({ rule }))),
+    ),
+  ),
+  mission_rule_use: McpToolAccess.actsAsCaller((input) =>
+    withRules((rules, provenance) =>
+      rules.recordRuleUse(provenance, input).pipe(Effect.map((rule) => ({ rule }))),
+    ),
+  ),
+  mission_rule_change: McpToolAccess.actsAsCaller((input) =>
+    withRules((rules, provenance) =>
+      rules.requestRuleChange(provenance, input).pipe(Effect.map((request) => ({ request }))),
+    ),
+  ),
+  mission_rule_change_resolve: McpToolAccess.actsAsCaller((input) =>
+    withRules((rules, provenance) =>
+      rules.resolveRuleChange(provenance, input).pipe(Effect.map((request) => ({ request }))),
     ),
   ),
 } satisfies McpToolAccess.Handlers<typeof MissionsToolkit.tools>;

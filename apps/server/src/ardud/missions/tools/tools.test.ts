@@ -1,5 +1,11 @@
 import { describe, expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ThreadId, WorkItemId } from "@t3tools/contracts";
+import {
+  ApprovalId,
+  EnvironmentId,
+  ProviderInstanceId,
+  ThreadId,
+  WorkItemId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -21,6 +27,8 @@ import {
   strayThread,
   writerThread,
 } from "../asks/AsksService.testkit.ts";
+import * as RuleService from "../core/RuleService.ts";
+import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as MissionsHandlers from "./handlers.ts";
 import { MissionsToolkit } from "./tools.ts";
@@ -67,6 +75,7 @@ const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
     layer: McpHttpServer.toolkitRegistration(MissionsToolkit, MissionsHandlers.layer).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
       Layer.provideMerge(liveThreadsLayer),
+      Layer.provideMerge(RuleService.layer),
       Layer.provideMerge(layer),
     ),
   };
@@ -326,6 +335,158 @@ describe("mission MCP tools", () => {
         status: "parked",
       });
       expect(parked.isError).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("gives the master every plan control, each on the timeline as the master", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const master = threadCaller(masterThread);
+      const lane = threadCaller(laneThread);
+      const store = yield* MissionStore.MissionStore;
+      const run = (name: string, args: Record<string, unknown>) =>
+        Effect.map(call(name, master, args), (outcome) => {
+          expect(outcome.isError, `${name}: ${outcome.text}`).toBe(false);
+          return outcome.structured;
+        });
+
+      // A new mission, then this mission's plan.
+      const created = yield* run("mission_create", { slug: "side", title: "Side mission" });
+      expect(created.ref).toMatchObject({ kind: "mission" });
+      const start = yield* store.latestSeq(missionId);
+      yield* run("mission_update", { missionId, tier: "P0", guaranteedShare: 0.4 });
+      const a = yield* run("mission_sub_mission", { missionId, subMissionId: "sm-a", title: "A" });
+      yield* run("mission_sub_mission", { missionId, subMissionId: "sm-b", title: "B" });
+      expect(a.ref).toMatchObject({ id: "sm-a" });
+      yield* run("mission_sub_mission_reorder", { missionId, order: ["sm-b", "sm-a"] });
+      yield* run("mission_lane", { missionId, laneId: "lane-api", subMissionId: "sm-a" });
+      yield* run("mission_lane_split", {
+        missionId,
+        laneId: "lane-api",
+        newLaneId: "lane-docs",
+        name: "Docs",
+        workItemIds: ["wi-free"],
+      });
+      yield* run("mission_lane_merge", { missionId, laneId: "lane-docs", intoLaneId: "lane-api" });
+      yield* run("mission_focus", { missionId, subMissionId: "sm-a" });
+      yield* run("mission_sub_mission_merge", {
+        missionId,
+        subMissionId: "sm-a",
+        intoSubMissionId: "sm-b",
+      });
+      yield* run("mission_sub_mission", { missionId, subMissionId: "sm-b", status: "closed" });
+      yield* run("mission_set_status", { missionId, status: "paused" });
+      yield* run("mission_set_status", { missionId, status: "active" });
+      yield* run("mission_approval_routing", {
+        missionId,
+        routes: [{ id: "all", match: { _tag: "approval" }, approver: "master" }],
+        reason: "Owner handed merges to the master",
+      });
+      const rule = yield* run("mission_rule", {
+        missionId,
+        title: "Plain words",
+        quote: "Write plainly.",
+      });
+      const ruleId = (rule.rule as { id: string }).id;
+      yield* run("mission_rule_use", { ruleId, outcome: "applied" });
+      yield* run("mission_set_status", { missionId, status: "archived" });
+
+      const events = yield* store.eventsSince(missionId, start);
+      expect(events.map((event) => event.kind)).toEqual([
+        "mission.updated",
+        "sub-mission.created",
+        "sub-mission.created",
+        "sub-mission.reordered",
+        "lane.moved",
+        "lane.split",
+        "lane.merged",
+        "mission.updated",
+        "sub-mission.merged",
+        "sub-mission.closed",
+        "mission.paused",
+        "mission.resumed",
+        "approval-routing.updated",
+        "rule.created",
+        "rule.applied",
+        "mission.archived",
+      ]);
+      // Plan writes carry the master role; rule writes the master's thread (the rule
+      // service checks the binding itself, rules can be global).
+      for (const event of events) {
+        expect(event.actor).toEqual(
+          event.kind.startsWith("rule.")
+            ? { _tag: "thread", threadId: masterThread }
+            : { _tag: "role", roleId: "role-master" },
+        );
+      }
+
+      // A lane thread gets none of these controls.
+      for (const [name, args] of [
+        ["mission_create", { slug: "lane-made", title: "Lane made" }],
+        ["mission_set_status", { missionId, status: "active" }],
+        ["mission_sub_mission_reorder", { missionId, order: [] }],
+        ["mission_approval_routing", { missionId, routes: [] }],
+        ["mission_rule", { missionId, title: "Mine", quote: "Lanes rule." }],
+      ] as const) {
+        const refused = yield* call(name, lane, args);
+        expect(refused.isError, name).toBe(true);
+        expect(refused.text, name).toContain("forbidden");
+      }
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("lets the master decide the approvals routed to it, and only those", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const master = threadCaller(masterThread);
+      const missions = yield* MissionService.MissionService;
+      const crw = { _tag: "system" as const, component: "crw" };
+      const open = (approvalId: string) =>
+        missions.openApproval(crw, {
+          missionId,
+          approvalId: ApprovalId.make(approvalId),
+          kind: "merge",
+          title: `Good to merge: ${approvalId}`,
+          detail: "",
+          requestedBy: "crw",
+          links: [],
+        });
+      yield* open("ap-owner");
+      const ownerRouted = yield* call("mission_approval_decide", master, {
+        missionId,
+        approvalId: "ap-owner",
+        action: "approve",
+      });
+      expect(ownerRouted.isError).toBe(true);
+      expect(ownerRouted.text).toContain("routed to the owner");
+
+      const rerouted = yield* call("mission_approval_route", master, {
+        missionId,
+        approvalId: "ap-owner",
+        approver: "master",
+        reason: "Owner said dependency bumps are mine",
+      });
+      expect(rerouted.isError).toBe(false);
+      const decided = yield* call("mission_approval_decide", master, {
+        missionId,
+        approvalId: "ap-owner",
+        action: "approve",
+        note: "Bump only",
+      });
+      expect(decided.isError).toBe(false);
+      const listed = yield* call("mission_approvals", master, { missionId });
+      const approvals = listed.structured.approvals as Array<{
+        id: string;
+        status: string;
+        approver: string;
+        routeNote: string;
+      }>;
+      expect(
+        approvals.map((approval) => [approval.id, approval.status, approval.approver]),
+      ).toEqual([["ap-owner", "approved", "master"]]);
+      expect(approvals[0]?.routeNote).toBe("Owner said dependency bumps are mine");
     }).pipe(Effect.provide(layer));
   });
 

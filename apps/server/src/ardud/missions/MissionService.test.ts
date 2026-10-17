@@ -35,7 +35,6 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as Sqlite from "../../persistence/Sqlite.ts";
-import { ownerAppProvenance } from "./core/provenance.ts";
 import * as MissionService from "./MissionService.ts";
 import * as MissionStore from "./store/MissionStore.ts";
 
@@ -235,102 +234,73 @@ const addSubMission = (
   });
 
 it.layer(TestLayer)("MissionService", (it) => {
-  it.effect("only the owner creates missions or changes owner-only fields", () =>
+  it.effect("the master changes anything the owner can, and the timeline says who", () =>
     Effect.gen(function* () {
       const service = yield* MissionService.MissionService;
-      const refused = yield* Effect.flip(
-        service.createMission(master, { slug: "agent-made", title: "Agent made" }),
-      );
-      assert.equal(refused.code, "forbidden");
-
-      const missionId = yield* createMission("m-owner-only");
-      for (const write of [
-        service.updateMission(master, { missionId, tier: "P0" }),
-        service.updateMission(master, { missionId, guaranteedShare: 0.5 }),
-        service.setMissionStatus(master, { missionId, status: "paused" }),
-        service.setMissionFocus(master, { missionId, subMissionId: null }),
-        service.lockField(master, {
-          ref: { kind: "mission", id: missionId },
-          field: "goal",
-          locked: true,
-        }),
-        service.markSeen(master, { missionId }),
-      ]) {
-        assert.equal((yield* Effect.flip(write)).code, "forbidden");
-      }
-
-      // The master may still edit the fields it owns.
-      yield* service.updateMission(master, { missionId, goal: "Ship the import" });
-      const paused = yield* service.setMissionStatus(owner, { missionId, status: "paused" });
-      const events = yield* service.eventsSince(missionId, paused.seq - 1);
-      assert.deepStrictEqual(
-        events.map((event) => event.kind),
-        ["mission.paused"],
-      );
-    }),
-  );
-
-  it.effect("locked fields refuse the master and give way to the owner", () =>
-    Effect.gen(function* () {
-      const service = yield* MissionService.MissionService;
-      const missionId = yield* createMission("m-locks");
-      const subMissionId = yield* addSubMission(master, missionId, "Import");
+      const store = yield* MissionStore.MissionStore;
+      const created = yield* service.createMission(master, {
+        missionId: MissionId.make("m-master"),
+        slug: "master-made",
+        title: "Master made",
+      });
+      const missionId = MissionId.make(created.ref.id);
+      const a = yield* addSubMission(master, missionId, "A");
+      const b = yield* addSubMission(master, missionId, "B");
       const laneResult = yield* service.upsertLane(master, {
         missionId,
         name: "api",
-        subMissionId,
+        subMissionId: a,
       });
+      const laneId = LaneId.make(laneResult.ref.id);
 
-      yield* service.lockField(owner, {
-        ref: { kind: "sub-mission", id: subMissionId },
-        field: "title",
-        locked: true,
-      });
-      yield* service.lockField(owner, {
-        ref: { kind: "lane", id: laneResult.ref.id },
-        field: "status",
-        locked: true,
-      });
-
-      const renamed = yield* Effect.flip(
-        service.upsertSubMission(master, { missionId, subMissionId, title: "Renamed" }),
-      );
-      assert.equal(renamed.code, "locked");
-      const parked = yield* Effect.flip(
-        service.upsertLane(master, {
-          missionId,
-          laneId: LaneId.make(laneResult.ref.id),
-          status: "parked",
-        }),
-      );
-      assert.equal(parked.code, "locked");
-
-      // Unlocked fields stay open to the master; the owner overrides locks.
-      yield* service.upsertSubMission(master, { missionId, subMissionId, intent: "Move data" });
-      yield* service.upsertSubMission(owner, { missionId, subMissionId, title: "Renamed" });
-
-      const unknownField = yield* Effect.flip(
-        service.lockField(owner, {
-          ref: { kind: "sub-mission", id: subMissionId },
-          field: "nope",
-          locked: true,
-        }),
-      );
-      assert.equal(unknownField.code, "invalid");
-
-      yield* service.lockField(owner, {
-        ref: { kind: "sub-mission", id: subMissionId },
-        field: "title",
-        locked: false,
-      });
-      yield* service.upsertSubMission(master, { missionId, subMissionId, title: "Master's" });
-      const store = yield* MissionStore.MissionStore;
-      const stored = yield* store.get("sub-mission", subMissionId);
-      assert.isTrue(Option.isSome(stored));
-      if (Option.isSome(stored)) {
-        assert.equal(stored.value.title, "Master's");
-        assert.deepStrictEqual(stored.value.lockedFields, []);
+      // Former owner-only fields, a reorder after the owner's, a lane move and a close.
+      yield* service.updateMission(master, { missionId, tier: "P0", guaranteedShare: 0.5 });
+      yield* service.reorderSubMissions(owner, { missionId, order: [b, a] });
+      yield* service.reorderSubMissions(master, { missionId, order: [a, b] });
+      yield* service.upsertSubMission(master, { missionId, subMissionId: b, title: "Renamed" });
+      yield* service.upsertLane(master, { missionId, laneId, subMissionId: b });
+      yield* service.setMissionFocus(master, { missionId, subMissionId: b });
+      yield* service.upsertSubMission(master, { missionId, subMissionId: a, status: "closed" });
+      for (const status of ["paused", "active", "archived", "active"] as const) {
+        yield* service.setMissionStatus(master, { missionId, status });
       }
+
+      const events = yield* service.eventsSince(missionId, 0);
+      assert.deepStrictEqual(
+        events.map((event) => event.kind),
+        [
+          "mission.created",
+          "sub-mission.created",
+          "sub-mission.created",
+          "lane.created",
+          "mission.updated",
+          "sub-mission.reordered",
+          "sub-mission.reordered",
+          "sub-mission.updated",
+          "lane.moved",
+          "mission.updated",
+          "sub-mission.closed",
+          "mission.paused",
+          "mission.resumed",
+          "mission.archived",
+          "mission.unarchived",
+        ],
+      );
+      for (const event of events.filter((event) => event.kind !== "sub-mission.reordered")) {
+        assert.deepStrictEqual(event.provenance, master);
+        assert.deepStrictEqual(event.actor, { _tag: "thread", threadId: master.threadId });
+      }
+      assert.deepStrictEqual(
+        events.filter((event) => event.kind === "sub-mission.reordered").map((e) => e.actor),
+        [{ _tag: "owner" }, { _tag: "thread", threadId: master.threadId }],
+      );
+      const mission = Option.getOrThrow(yield* store.get("mission", missionId));
+      assert.equal(mission.tier, "P0");
+      assert.equal(mission.focusSubMissionId, b);
+      assert.deepStrictEqual(mission.lockedFields, []);
+
+      // Marking the mission seen is the owner's own look, not a control.
+      assert.equal((yield* Effect.flip(service.markSeen(master, { missionId }))).code, "forbidden");
     }),
   );
 
@@ -342,26 +312,16 @@ it.layer(TestLayer)("MissionService", (it) => {
       // A provenance smuggled into a request body is not part of the input; decoding drops it.
       const smuggled = yield* decodeUpdateMission({ missionId, tier: "P0", provenance: owner });
       assert.isFalse("provenance" in smuggled);
-      assert.equal((yield* Effect.flip(service.updateMission(master, smuggled))).code, "forbidden");
 
       const body = yield* decodeUpdateMission({ missionId, goal: "Agent goal", provenance: owner });
       const result = yield* service.updateMission(master, body);
       const [event] = yield* service.eventsSince(missionId, result.seq - 1);
       assert.deepStrictEqual(event?.provenance, master);
       assert.deepStrictEqual(event?.actor, { _tag: "thread", threadId: master.threadId });
-
-      // Transport side: only Robob clients are the owner; anything else has no owner provenance.
-      assert.deepStrictEqual(ownerAppProvenance({ surface: "mobile", sessionId: "s-9" }), {
-        _tag: "owner-app",
-        surface: "mobile",
-        sessionId: "s-9",
-      });
-      assert.isNull(ownerAppProvenance({ surface: "cli", sessionId: "s-9" }));
-      assert.isNull(ownerAppProvenance({ surface: undefined, sessionId: "s-9" }));
     }),
   );
 
-  it.effect("an owner reorder writes one event, bumps seq and locks the order", () =>
+  it.effect("a reorder writes one event and bumps seq; nothing locks the order", () =>
     Effect.gen(function* () {
       const service = yield* MissionService.MissionService;
       const store = yield* MissionStore.MissionStore;
@@ -391,17 +351,16 @@ it.layer(TestLayer)("MissionService", (it) => {
           [a, 2],
         ],
       );
-      assert.include(overview.mission.lockedFields, "subMissionOrder");
+      assert.deepStrictEqual(overview.mission.lockedFields, []);
 
-      const masterAfter = yield* Effect.flip(
-        service.reorderSubMissions(master, { missionId, order: [a, b, c] }),
-      );
-      assert.equal(masterAfter.code, "locked");
       const incomplete = yield* Effect.flip(
         service.reorderSubMissions(owner, { missionId, order: [a, b] }),
       );
       assert.equal(incomplete.code, "invalid");
       assert.equal(yield* store.latestSeq(missionId), before + 1);
+      // The master can reorder again after the owner.
+      yield* service.reorderSubMissions(master, { missionId, order: [a, b, c] });
+      assert.equal(yield* store.latestSeq(missionId), before + 2);
     }),
   );
 

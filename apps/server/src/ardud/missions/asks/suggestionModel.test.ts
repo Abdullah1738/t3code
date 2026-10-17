@@ -189,19 +189,19 @@ describe("deciding suggestions", () => {
     ).toBe("invalid");
   });
 
-  it("agents cannot decide owner suggestions; the master decides master ones but never its own", () => {
-    const ownerOnly = open("owner");
+  it("the master decides any suggestion; other agents decide none", () => {
+    const forOwner = open("owner");
     expect(
       code(
         decideSuggestion({
-          suggestion: ownerOnly,
-          input: { suggestionId: ownerOnly.id, action: "accept" },
+          suggestion: forOwner,
+          input: { suggestionId: forOwner.id, action: "accept" },
           caller: master,
           callerIsMaster: true,
           now,
         }),
       ),
-    ).toBe("provenance-required");
+    ).toBe("ok");
     const forMaster = open("master", "governor");
     expect(
       code(
@@ -236,7 +236,7 @@ describe("deciding suggestions", () => {
     ).toBe("invalid");
   });
 
-  it("dismissal records the reason; the owner can reopen it", () => {
+  it("dismissal records the reason; the owner or the master can reopen it", () => {
     const suggestion = open("owner");
     const dismissed = Result.getOrThrow(
       decideSuggestion({
@@ -249,9 +249,8 @@ describe("deciding suggestions", () => {
     );
     expect(dismissed.apply).toBeNull();
     expect(dismissed.record.dismissReason).toBe("Not now");
-    expect(code(reopenSuggestion(dismissed.record, master.provenance, now))).toBe(
-      "provenance-required",
-    );
+    expect(code(reopenSuggestion(dismissed.record, editor.provenance, now))).toBe("forbidden");
+    expect(code(reopenSuggestion(dismissed.record, master.provenance, now, true))).toBe("ok");
     expect(Result.getOrThrow(reopenSuggestion(dismissed.record, ownerApp, now)).record.status).toBe(
       "open",
     );

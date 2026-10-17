@@ -2,6 +2,8 @@
 // mission: shell access to Robob missions over the control API
 // (/api/ardud/missions/desk). Prints JSON unless --text. Read-only except
 // answers and draft decisions, which need the owner's iMessage inbound id.
+// Every other write goes through the mission_* MCP tools: HTTP cannot prove
+// which thread is calling.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
@@ -31,6 +33,10 @@ milestone-at-risk, lane-stalled, swarm-paused.
 
 Answers and approvals are refused unless the inbound id is a real iMessage
 from the owner's or Moni's chat that says the same thing.
+
+Everything else that changes a mission (plan, lanes, approvals, rules, asks,
+forks) goes through the mission_* MCP tools from the calling thread, never this
+CLI: HTTP cannot prove which thread is calling.
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, or ${DEFAULT_TOKEN_FILE}.`;
 
@@ -216,7 +222,9 @@ async function main() {
     case "watch-check":
       return watchCheck(need(args[0] ?? flags.mission, "MISSION"));
     default:
-      return fail(`unknown command ${command}\n\n${HELP}`);
+      return fail(
+        `unknown command ${command}. Mission writes use the mission_* MCP tools.\n\n${HELP}`,
+      );
   }
 }
 
