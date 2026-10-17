@@ -120,8 +120,20 @@ export const alignRole = (
     const applied: Array<ThreadId> = [];
     const confirmed: Array<ThreadId> = [];
     const waiting: Array<ThreadId> = [];
+    const accepted: Array<ThreadId> = [];
     for (const binding of active) {
       if (!needsAlignment(role, binding)) continue;
+      // An imported holder keeps whatever it runs until someone changes the
+      // role's model; a mismatch shows as drift, never as a switch.
+      if (
+        binding.reason === "import" &&
+        binding.observedModel === null &&
+        role.pendingModelSelection === null
+      ) {
+        changed.push({ ...binding, observedModel: key });
+        accepted.push(binding.threadId);
+        continue;
+      }
       const step = holderStep(target, yield* deps.threads.view(binding.threadId));
       switch (step._tag) {
         case "gone":
@@ -163,6 +175,7 @@ export const alignRole = (
     const parts = [
       applied.length > 0 ? `set on ${applied.length} idle holder(s) for their next turn` : null,
       confirmed.length > 0 ? `already running on ${confirmed.length} holder(s)` : null,
+      accepted.length > 0 ? `${accepted.length} imported holder(s) keep their model` : null,
       waiting.length > 0 ? `${waiting.length} busy holder(s) pick it up after their turn` : null,
       finished ? "every holder has it now" : null,
     ].filter((part) => part !== null);
@@ -173,7 +186,7 @@ export const alignRole = (
         "role.model-changed",
         `${role.name}: ${key} ${parts.join("; ")}`,
         roleRef(nextRole),
-        { phase: "applied", model: key, applied, confirmed, waiting, finished },
+        { phase: "applied", model: key, applied, confirmed, accepted, waiting, finished },
       ),
       upserts,
     });
