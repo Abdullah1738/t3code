@@ -9,15 +9,24 @@ import {
   MissionError,
   MissionId,
   Note,
+  Suggestion,
   type MissionActor,
   type MissionProvenance,
 } from "@t3tools/contracts";
 
 import { MissionStore, type MissionCommit } from "../store/MissionStore.ts";
 import { assembleBatch, type BatchStats, type ScribeBatchInput } from "./batch.ts";
+import {
+  buildEditorInput,
+  checkEditorOutput,
+  type EditorFeedItem,
+  type EditorInput,
+  type EditorState,
+  readEditorState,
+} from "./editor.ts";
 import { currentNotes, rankFyi } from "./notes.ts";
 import { type BuiltReport, buildReport, type ReportKind } from "./reports.ts";
-import { ScribeStore, type ScribeStoreError } from "./ScribeStore.ts";
+import { ScribeStore, type ScribeStoreError, toJson } from "./ScribeStore.ts";
 
 /**
  * Server side of the scribe: hands the runner its lanes and cursors, checks
@@ -33,6 +42,7 @@ import { ScribeStore, type ScribeStoreError } from "./ScribeStore.ts";
  */
 
 const decodeNote = Schema.decodeUnknownEffect(Note);
+const decodeSuggestion = Schema.decodeUnknownEffect(Suggestion);
 
 export const SCRIBE_ACTOR: MissionActor = { _tag: "system", component: "scribe" };
 export const SCRIBE_PROVENANCE: MissionProvenance = { _tag: "system", component: "scribe" };
@@ -91,6 +101,36 @@ export interface ReportRequest {
   /** Keep the report so the next one closes out what it left open. */
   readonly save: boolean;
 }
+
+export interface EditorApply {
+  readonly missionId: string;
+  /** The `since` of the input the editor read; the server rebuilds that input to check against. */
+  readonly since: string;
+  readonly reply: unknown;
+  readonly model: string | null;
+  readonly usage: { readonly input: number; readonly output: number };
+}
+
+export interface EditorResult {
+  readonly bottomLine: string | null;
+  readonly fyi: number;
+  readonly feed: number;
+  readonly opened: ReadonlyArray<string>;
+  readonly dropped: number;
+  readonly rejected: ReadonlyArray<string>;
+}
+
+export interface EditorView {
+  readonly bottomLine: string | null;
+  readonly bottomLineAt: string;
+  readonly fyiOrder: ReadonlyArray<string>;
+  readonly feed: ReadonlyArray<EditorFeedItem>;
+}
+
+export const EDITOR_ACTOR: MissionActor = { _tag: "system", component: "editor" };
+export const EDITOR_PROVENANCE: MissionProvenance = { _tag: "system", component: "editor" };
+/** How far back the editor reads notes, calls and shipped work. */
+const EDITOR_WINDOW_HOURS = 24;
 
 const WINDOW_HOURS: Record<ReportKind, number> = { update: 4, daily: 24 };
 /** Notes read for ranking and reports: the newest this many per mission. */
@@ -151,6 +191,12 @@ export class ScribeService extends Context.Service<
     ) => Effect.Effect<ScribeStats, ScribeError>;
     /** Build the 4h update or the daily summary from mission data. */
     readonly report: (request: ReportRequest) => Effect.Effect<BuiltReport, ScribeError>;
+    /** What the hourly editor pass reads. */
+    readonly editorInput: (missionId: string) => Effect.Effect<EditorInput, ScribeError>;
+    /** Check and store one editor reply; re-applying the same reply opens nothing new. */
+    readonly applyEditor: (request: EditorApply) => Effect.Effect<EditorResult, ScribeError>;
+    /** The editor's latest bottom line, FYI order and feed, for the overview. */
+    readonly editorView: (missionId: string) => Effect.Effect<EditorView | null, ScribeError>;
   }
 >()("t3/ardud/missions/scribe/ScribeService") {}
 
@@ -383,10 +429,11 @@ const make = Effect.gen(function* () {
   const fyi = (missionId: string, limit: number) =>
     Effect.gen(function* () {
       const notes = yield* recentNotes(missionId);
-      const editor = yield* scribe.editorState(missionId);
-      const order = (editor?.payload as { readonly fyiOrder?: ReadonlyArray<string> } | null)
-        ?.fyiOrder;
-      return rankFyi(notes, { limit, ...(order === undefined ? {} : { editorOrder: order }) });
+      const editor = yield* editorStateOf(missionId);
+      return rankFyi(notes, {
+        limit,
+        ...(editor === null ? {} : { editorOrder: editor.state.fyiOrder }),
+      });
     });
 
   const stats = (missionId: string, sinceIso: string | null) =>
@@ -426,8 +473,7 @@ const make = Effect.gen(function* () {
       const suggestions = yield* store.list("suggestion", { missionId: id });
       // Newest first from core; reports only need the window's owner messages.
       const events = (yield* store.recentEvents(id, EVENT_WINDOW)).toReversed();
-      const editor = yield* scribe.editorState(missionId);
-      const editorLine = (editor?.payload as { readonly bottomLine?: unknown } | null)?.bottomLine;
+      const editor = (yield* editorStateOf(missionId))?.state ?? null;
       const batches = yield* scribe.batches(missionId, from);
       const usage = batches.length === 0 ? null : summarizeStats(batches);
       const updates =
@@ -450,8 +496,8 @@ const make = Effect.gen(function* () {
         previous: usablePrevious,
         updates,
         bottomLine:
-          typeof editorLine === "string" && editor !== null
-            ? { text: editorLine, at: editor.updatedAt }
+          editor?.bottomLine != null && editor.bottomLineAt !== null
+            ? { text: editor.bottomLine, at: editor.bottomLineAt }
             : null,
         usage,
       });
@@ -470,7 +516,218 @@ const make = Effect.gen(function* () {
       return built;
     });
 
-  return ScribeService.of({ lanes, openNotes, ingest, fyi, stats, report });
+  const editorStateOf = (missionId: string) =>
+    scribe
+      .editorState(missionId)
+      .pipe(
+        Effect.map((row) =>
+          row === null ? null : { state: readEditorState(row.payload), updatedAt: row.updatedAt },
+        ),
+      );
+
+  /** Rebuild exactly what the editor reads for a window starting at `since`. */
+  const editorInputSince = (missionId: string, since: string, at: string) =>
+    Effect.gen(function* () {
+      const mission = yield* requireMission(missionId);
+      const id = MissionId.make(missionId);
+      const [
+        lanes,
+        asks,
+        approvals,
+        calls,
+        workItems,
+        milestones,
+        notes,
+        suggestions,
+        rules,
+        roles,
+      ] = yield* Effect.all([
+        store.list("lane", { missionId: id }),
+        store.list("ask", { missionId: id }),
+        store.list("approval", { missionId: id }),
+        store.list("call", { missionId: id }),
+        store.list("work-item", { missionId: id }),
+        store.list("milestone", { missionId: id }),
+        recentNotes(missionId),
+        store.list("suggestion", { missionId: id }),
+        store.list("rule", { missionId: id }),
+        store.list("role", { missionId: id }),
+      ]);
+      const candidates = yield* scribe.candidates(missionId, "open");
+      const previous = yield* editorStateOf(missionId);
+      return buildEditorInput({
+        mission,
+        now: at,
+        since,
+        previousBottomLine: previous?.state.bottomLine ?? null,
+        lanes,
+        asks,
+        approvals,
+        calls,
+        workItems,
+        milestones,
+        notes,
+        candidates: candidates.map((row) => row.candidate),
+        suggestions,
+        rules,
+        roles,
+      });
+    });
+
+  const editorInput = (missionId: string) =>
+    Effect.gen(function* () {
+      const at = yield* now;
+      const since = DateTime.formatIso(
+        DateTime.subtract(DateTime.makeUnsafe(at), { hours: EDITOR_WINDOW_HOURS }),
+      );
+      return yield* editorInputSince(missionId, since, at);
+    });
+
+  const applyEditor = (request: EditorApply) =>
+    Effect.gen(function* () {
+      const { missionId } = request;
+      const at = yield* now;
+      const input = yield* editorInputSince(missionId, request.since, at);
+      const plan = checkEditorOutput(request.reply, input);
+      const id = MissionId.make(missionId);
+
+      const opened: string[] = [];
+      for (const draft of plan.suggestions) {
+        // Ids come from target and title, so a replayed reply finds its own suggestion.
+        if (Option.isSome(yield* store.get("suggestion", draft.id))) continue;
+        const record = yield* decodeSuggestion({
+          id: draft.id,
+          missionId,
+          targetKind: draft.targetKind,
+          target: draft.target,
+          title: draft.title,
+          before: null,
+          after: draft.after,
+          diffText: draft.diffText,
+          why: draft.why,
+          evidence: draft.evidence,
+          author: "editor",
+          acceptor: draft.acceptor,
+          status: "open",
+          dismissReason: null,
+          outcome: null,
+          decidedBy: null,
+          decidedAt: null,
+          createdAt: at,
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new MissionError({ code: "invalid", detail: `suggestion: ${cause.message}` }),
+          ),
+        );
+        const merge = Effect.forEach(
+          draft.candidateIds,
+          (candidateId) => scribe.setCandidateStatus(candidateId, "merged", draft.id, at),
+          { discard: true },
+        ).pipe(Effect.orDie);
+        yield* store.commit({
+          event: {
+            missionId: id,
+            kind: "suggestion.opened",
+            actor: EDITOR_ACTOR,
+            provenance: EDITOR_PROVENANCE,
+            summary: clipLine(`Suggestion (editor): ${draft.title}`),
+            subject: { kind: "suggestion", id: draft.id, label: draft.title },
+            payload: {
+              author: "editor",
+              targetKind: draft.targetKind,
+              acceptor: draft.acceptor,
+              candidateIds: draft.candidateIds,
+            },
+            at,
+          },
+          upserts: [{ _tag: "suggestion", record }],
+          alongside: merge,
+        });
+        opened.push(draft.id);
+      }
+      for (const drop of plan.droppedCandidates) {
+        yield* scribe.setCandidateStatus(drop.id, "dropped", null, at);
+      }
+
+      const previous = (yield* editorStateOf(missionId))?.state ?? null;
+      const state: EditorState = {
+        bottomLine: plan.bottomLine ?? previous?.bottomLine ?? null,
+        bottomLineAt: plan.bottomLine === null ? (previous?.bottomLineAt ?? null) : at,
+        fyiOrder: plan.fyiOrder,
+        feed: plan.feed,
+        since: request.since,
+        model: request.model,
+        rejected: plan.rejected,
+      };
+      const changed =
+        previous === null ||
+        opened.length > 0 ||
+        previous.bottomLine !== state.bottomLine ||
+        toJson(previous.fyiOrder) !== toJson(state.fyiOrder) ||
+        toJson(previous.feed) !== toJson(state.feed);
+      if (changed) {
+        yield* store.commit({
+          event: {
+            missionId: id,
+            kind: "editor.updated",
+            actor: EDITOR_ACTOR,
+            provenance: EDITOR_PROVENANCE,
+            summary: clipLine(
+              plan.bottomLine === null
+                ? "Editor pass kept the previous bottom line."
+                : `Bottom line: ${plan.bottomLine}`,
+            ),
+            subject: null,
+            payload: {
+              fyi: plan.fyiOrder.length,
+              feed: plan.feed.length,
+              opened,
+              dropped: plan.droppedCandidates.length,
+              rejected: plan.rejected.length,
+              model: request.model,
+              usage: request.usage,
+            },
+            at,
+          },
+          alongside: scribe.saveEditorState(missionId, state, at).pipe(Effect.orDie),
+        });
+      }
+      return {
+        bottomLine: state.bottomLine,
+        fyi: plan.fyiOrder.length,
+        feed: plan.feed.length,
+        opened,
+        dropped: plan.droppedCandidates.length,
+        rejected: plan.rejected,
+      } satisfies EditorResult;
+    });
+
+  const editorView = (missionId: string) =>
+    editorStateOf(missionId).pipe(
+      Effect.map((row) =>
+        row === null
+          ? null
+          : ({
+              bottomLine: row.state.bottomLine,
+              bottomLineAt: row.state.bottomLineAt ?? row.updatedAt,
+              fyiOrder: row.state.fyiOrder,
+              feed: row.state.feed,
+            } satisfies EditorView),
+      ),
+    );
+
+  return ScribeService.of({
+    lanes,
+    openNotes,
+    ingest,
+    fyi,
+    stats,
+    report,
+    editorInput,
+    applyEditor,
+    editorView,
+  });
 });
 
 export const layer = Layer.effect(ScribeService, make);

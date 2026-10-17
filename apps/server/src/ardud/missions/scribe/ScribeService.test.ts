@@ -344,3 +344,120 @@ it.layer(TestLayer)("scribe reports", (it) => {
     }),
   );
 });
+
+it.layer(TestLayer)("scribe editor", (it) => {
+  it.effect(
+    "applies an editor reply once: suggestion opened, candidate merged, FYI reordered",
+    () =>
+      Effect.gen(function* () {
+        yield* seedMission;
+        yield* seedTranscript({
+          threadId: LANE_THREAD,
+          run: 2,
+          requestedAt: "2026-10-17T02:00:00.000Z",
+          items,
+        });
+        const service = yield* ScribeService.ScribeService;
+        const store = yield* MissionStore.MissionStore;
+        const scribe = yield* ScribeStore.ScribeStore;
+        yield* service.ingest(
+          batch({
+            notes: [
+              note({}),
+              note({
+                type: "owner-must-know",
+                severity: "high",
+                summary: "Lane says rewards#216 is merged and live on dev.",
+                quote: "Merged rewards#216 and the deploy is live on dev.",
+                event: 2000004,
+                fromEvent: 2000004,
+                toEvent: 2000004,
+              }),
+            ],
+            candidates: [
+              {
+                targetKind: "rule",
+                title: "Masters give a deadline with every ask",
+                proposal: "Every master ask names when it is needed.",
+                why: "Lane had to guess the deadline.",
+                quote: "Please finish the rewards backfill today.",
+                event: 2000001,
+              },
+            ],
+          }),
+        );
+
+        const input = yield* service.editorInput(MISSION_ID);
+        assert.equal(input.notes.length, 2);
+        assert.equal(input.candidates.length, 1);
+        const [first, second] = input.notes;
+        const candidateId = input.candidates[0]?.id ?? "";
+
+        const reply = {
+          bottomLine: "Money lane says the rewards fix is live; the PR still reads open.",
+          // Editor puts the assumption first, ahead of the owner-must-know note.
+          fyiOrder: [second?.id, first?.id],
+          feed: [{ kind: "note", summary: "Rewards fix claimed live", ref: `note:${first?.id}` }],
+          suggestions: [
+            {
+              targetKind: "rule",
+              title: "Masters give a deadline with every ask",
+              change: "Add a rule: every master ask names when it is needed.",
+              why: "The money lane had to guess.",
+              fromCandidates: [candidateId],
+            },
+          ],
+        };
+        const applied = yield* service.applyEditor({
+          missionId: MISSION_ID,
+          since: input.since,
+          reply,
+          model: "cc/claude-opus-5-5",
+          usage: { input: 5000, output: 600 },
+        });
+        assert.equal(applied.opened.length, 1);
+        assert.deepStrictEqual(applied.rejected, []);
+
+        const suggestion = yield* store.get("suggestion", applied.opened[0] ?? "");
+        assert.isTrue(suggestion._tag === "Some");
+        if (suggestion._tag === "Some") {
+          assert.equal(suggestion.value.author, "editor");
+          assert.equal(suggestion.value.acceptor, "owner");
+          assert.equal(suggestion.value.status, "open");
+        }
+        const merged = yield* scribe.candidates(MISSION_ID, "merged");
+        assert.deepStrictEqual(
+          merged.map((row) => [row.candidate.id, row.suggestionId]),
+          [[candidateId, applied.opened[0] ?? null]],
+        );
+
+        const fyi = yield* service.fyi(MISSION_ID, 5);
+        assert.deepStrictEqual(
+          fyi.map((shown) => shown.id),
+          [second?.id, first?.id],
+        );
+        const view = yield* service.editorView(MISSION_ID);
+        assert.equal(view?.bottomLine, reply.bottomLine);
+        assert.equal(view?.feed.length, 1);
+
+        const kinds = (yield* store.eventsSince(MissionId.make(MISSION_ID), 0)).map(
+          (event) => event.kind,
+        );
+        assert.deepStrictEqual(kinds.slice(-2), ["suggestion.opened", "editor.updated"]);
+
+        // Replaying the same reply opens nothing and records no new event.
+        const replay = yield* service.applyEditor({
+          missionId: MISSION_ID,
+          since: input.since,
+          reply,
+          model: "cc/claude-opus-5-5",
+          usage: { input: 5000, output: 600 },
+        });
+        assert.deepStrictEqual(replay.opened, []);
+        assert.equal(
+          (yield* store.eventsSince(MissionId.make(MISSION_ID), 0)).length,
+          kinds.length,
+        );
+      }),
+  );
+});
