@@ -10,6 +10,7 @@ import { MissionError, Note, type MissionActor, type MissionProvenance } from "@
 import { assembleBatch, type BatchStats, type ScribeBatchInput } from "./batch.ts";
 import { currentNotes, rankFyi } from "./notes.ts";
 import { MissionRecords } from "./ports.ts";
+import { type BuiltReport, buildReport, type ReportKind } from "./reports.ts";
 import { ScribeStore, type ScribeStoreError } from "./ScribeStore.ts";
 
 /**
@@ -68,6 +69,20 @@ export interface ScribeStats {
 
 export type ScribeError = MissionError | ScribeStoreError;
 
+export interface ReportRequest {
+  readonly missionId: string;
+  readonly kind: ReportKind;
+  /** End of the window; defaults to now. */
+  readonly to?: string | undefined;
+  /** Start of the window; defaults to the last report of this kind, else 4h/24h back. */
+  readonly from?: string | undefined;
+  /** Keep the report so the next one closes out what it left open. */
+  readonly save: boolean;
+}
+
+const WINDOW_HOURS: Record<ReportKind, number> = { update: 4, daily: 24 };
+const EVENT_SCAN_LIMIT = 20_000;
+
 const clipLine = (text: string, max = 400): string => {
   const line = text.replace(/\s+/gu, " ").trim();
   return line.length <= max ? line : `${line.slice(0, max - 1).trimEnd()}…`;
@@ -117,6 +132,8 @@ export class ScribeService extends Context.Service<
       missionId: string,
       sinceIso: string | null,
     ) => Effect.Effect<ScribeStats, ScribeError>;
+    /** Build the 4h update or the daily summary from mission data. */
+    readonly report: (request: ReportRequest) => Effect.Effect<BuiltReport, ScribeError>;
   }
 >()("t3/ardud/missions/scribe/ScribeService") {}
 
@@ -321,7 +338,83 @@ const make = Effect.gen(function* () {
   const stats = (missionId: string, sinceIso: string | null) =>
     store.batches(missionId, sinceIso).pipe(Effect.map(summarizeStats));
 
-  return ScribeService.of({ lanes, openNotes, ingest, fyi, stats });
+  const report = (request: ReportRequest) =>
+    Effect.gen(function* () {
+      const { missionId, kind } = request;
+      const mission = yield* requireMission(missionId);
+      const to = request.to ?? (yield* now);
+      const previous = yield* store.lastReport(missionId, kind);
+      const usablePrevious = previous !== null && previous.coversTo < to ? previous : null;
+      const from =
+        request.from ??
+        usablePrevious?.coversTo ??
+        DateTime.formatIso(
+          DateTime.subtract(DateTime.makeUnsafe(to), { hours: WINDOW_HOURS[kind] }),
+        );
+      if (from >= to) {
+        return yield* new MissionError({
+          code: "invalid",
+          detail: `report window ${from} to ${to}`,
+        });
+      }
+      const [subMissions, milestones, lanes, asks, calls, approvals, workItems, notes] =
+        yield* Effect.all([
+          records.list("sub-mission", { missionId }),
+          records.list("milestone", { missionId }),
+          records.list("lane", { missionId }),
+          records.list("ask", { missionId }),
+          records.list("call", { missionId }),
+          records.list("approval", { missionId }),
+          records.list("work-item", { missionId }),
+          records.list("note", { missionId }),
+        ]);
+      const suggestions = yield* records.list("suggestion", { missionId });
+      const events = yield* records.eventsSince(missionId, 0, EVENT_SCAN_LIMIT);
+      const editor = yield* store.editorState(missionId);
+      const editorLine = (editor?.payload as { readonly bottomLine?: unknown } | null)?.bottomLine;
+      const batches = yield* store.batches(missionId, from);
+      const usage = batches.length === 0 ? null : summarizeStats(batches);
+      const updates =
+        kind === "daily" ? yield* store.reportsBetween(missionId, "update", from, to) : [];
+      const built = buildReport({
+        kind,
+        from,
+        to,
+        mission,
+        subMissions,
+        milestones,
+        lanes,
+        asks,
+        calls,
+        approvals,
+        workItems,
+        notes,
+        suggestions,
+        events,
+        previous: usablePrevious,
+        updates,
+        bottomLine:
+          typeof editorLine === "string" && editor !== null
+            ? { text: editorLine, at: editor.updatedAt }
+            : null,
+        usage,
+      });
+      if (request.save) {
+        yield* store.saveReport({
+          reportId: `${missionId}|${kind}|${to}`,
+          missionId,
+          kind,
+          coversFrom: from,
+          coversTo: to,
+          open: built.open,
+          text: built.text,
+          createdAt: yield* now,
+        });
+      }
+      return built;
+    });
+
+  return ScribeService.of({ lanes, openNotes, ingest, fyi, stats, report });
 });
 
 export const layer = Layer.effect(ScribeService, make);

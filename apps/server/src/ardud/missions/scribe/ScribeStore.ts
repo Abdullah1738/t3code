@@ -6,6 +6,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import type { BatchStats, ScribeCandidate } from "./batch.ts";
 import { type PullRequestFact, pullRequestFacts } from "./evidence.ts";
+import type { OpenItem, ReportKind } from "./reports.ts";
 import { type TranscriptEvent, transcriptEvent } from "./transcriptText.ts";
 
 /**
@@ -102,19 +103,13 @@ export interface CandidateRecord {
 export interface ReportRecord {
   readonly reportId: string;
   readonly missionId: string;
-  readonly kind: "update" | "daily";
+  readonly kind: ReportKind;
   readonly coversFrom: string;
   readonly coversTo: string;
   /** Items left open at the end of this report; the next one closes them out. */
   readonly open: ReadonlyArray<OpenItem>;
   readonly text: string;
   readonly createdAt: string;
-}
-
-export interface OpenItem {
-  readonly ref: string;
-  readonly label: string;
-  readonly since: string;
 }
 
 /** What `ingest` writes beside core's records, in the same transaction. */
@@ -241,11 +236,11 @@ export class ScribeStore extends Context.Service<
     ) => Effect.Effect<void, ScribeStoreError>;
     readonly lastReport: (
       missionId: string,
-      kind: "update" | "daily",
+      kind: ReportKind,
     ) => Effect.Effect<ReportRecord | null, ScribeStoreError>;
     readonly reportsBetween: (
       missionId: string,
-      kind: "update" | "daily",
+      kind: ReportKind,
       fromIso: string,
       toIso: string,
     ) => Effect.Effect<ReadonlyArray<ReportRecord>, ScribeStoreError>;
@@ -403,7 +398,7 @@ const make = Effect.gen(function* () {
         payload_json = excluded.payload_json, updated_at = excluded.updated_at
     `.pipe(Effect.asVoid, Effect.mapError(fail("save editor state")));
 
-  const lastReport = (missionId: string, kind: "update" | "daily") =>
+  const lastReport = (missionId: string, kind: ReportKind) =>
     sql<ReportRow>`
       SELECT * FROM ardud_mission_scribe_report
       WHERE mission_id = ${missionId} AND kind = ${kind}
@@ -413,12 +408,7 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail("read last report")),
     );
 
-  const reportsBetween = (
-    missionId: string,
-    kind: "update" | "daily",
-    fromIso: string,
-    toIso: string,
-  ) =>
+  const reportsBetween = (missionId: string, kind: ReportKind, fromIso: string, toIso: string) =>
     sql<ReportRow>`
       SELECT * FROM ardud_mission_scribe_report
       WHERE mission_id = ${missionId} AND kind = ${kind}

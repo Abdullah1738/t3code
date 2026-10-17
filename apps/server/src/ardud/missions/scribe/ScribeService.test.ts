@@ -2,6 +2,8 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import type { Ask } from "@t3tools/contracts";
+
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import type { ScribeBatchInput, ScribeNoteDraft } from "./batch.ts";
 import { MissionRecords, memoryLayer } from "./ports.ts";
@@ -237,6 +239,100 @@ it.layer(TestLayer)("scribe service", (it) => {
         service.ingest(batch({ fromEvent: 9000002, toEvent: 9000001 })),
       );
       assert.equal(backwards._tag === "MissionError" ? backwards.code : backwards._tag, "invalid");
+    }),
+  );
+});
+
+it.layer(TestLayer)("scribe reports", (it) => {
+  it.effect("saves a report and the next one closes out what it left open", () =>
+    Effect.gen(function* () {
+      yield* seedMission;
+      const records = yield* MissionRecords;
+      const service = yield* ScribeService.ScribeService;
+      const ask = {
+        id: "ask-go",
+        missionId: MISSION_ID,
+        subMissionId: null,
+        askedBy: { _tag: "lane", laneId: "lane-money" },
+        question: "Ship the rewards backfill?",
+        context: "",
+        options: [{ id: "yes", label: "Yes", detail: "" }],
+        recommendation: null,
+        blocks: [],
+        costOfWaiting: "",
+        urgency: "normal",
+        status: "open",
+        answer: null,
+        createdAt: "2026-10-17T05:00:00.000Z",
+        updatedAt: "2026-10-17T05:00:00.000Z",
+      } as unknown as Ask;
+      yield* records.upsert({ _tag: "ask", record: ask }, []);
+
+      const first = yield* service.report({
+        missionId: MISSION_ID,
+        kind: "update",
+        to: "2026-10-17T08:00:00.000Z",
+        save: true,
+      });
+      assert.equal(first.coversFrom, "2026-10-17T04:00:00.000Z");
+      assert.include(first.text, "**Needs you:**\n- **Ship the rewards backfill?** Waiting 3h.");
+      assert.deepStrictEqual(
+        first.open.map((item) => item.ref),
+        ["ask:ask-go"],
+      );
+
+      yield* records.upsert(
+        {
+          _tag: "ask",
+          record: {
+            ...ask,
+            status: "answered",
+            answer: {
+              optionId: "yes",
+              text: "go ahead",
+              provenance: { _tag: "owner-app", surface: "web", sessionId: null },
+              answeredAt: "2026-10-17T09:00:00.000Z",
+            },
+          } as unknown as Ask,
+        },
+        [],
+      );
+      const second = yield* service.report({
+        missionId: MISSION_ID,
+        kind: "update",
+        to: "2026-10-17T12:00:00.000Z",
+        save: true,
+      });
+      assert.equal(second.coversFrom, "2026-10-17T08:00:00.000Z");
+      assert.include(
+        second.text,
+        "**Left hanging from 08:00:**\n- **Ship the rewards backfill?:** **Done.** Answered: go ahead.",
+      );
+      assert.include(
+        second.text,
+        "**Your decisions since 08:00:**\n- Ship the rewards backfill? Yes: go ahead.",
+      );
+      assert.include(second.text, "**Needs you:** Nothing.");
+
+      const daily = yield* service.report({
+        missionId: MISSION_ID,
+        kind: "daily",
+        to: "2026-10-17T12:00:00.000Z",
+        save: false,
+      });
+      assert.include(daily.text, "Behind this summary: 2 update(s) at 08:00, 12:00 UTC.");
+      assert.include(daily.text, "- **Ship the rewards backfill?:** **Done.** Answered: go ahead.");
+
+      const empty = yield* Effect.flip(
+        service.report({
+          missionId: MISSION_ID,
+          kind: "update",
+          from: "2026-10-17T12:00:00.000Z",
+          to: "2026-10-17T12:00:00.000Z",
+          save: false,
+        }),
+      );
+      assert.equal(empty._tag === "MissionError" ? empty.code : empty._tag, "invalid");
     }),
   );
 });
