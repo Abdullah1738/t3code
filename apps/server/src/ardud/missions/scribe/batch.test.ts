@@ -162,4 +162,22 @@ describe("assembleBatch", () => {
     expect(result.notes[1]?.replacesNoteId).toBeNull();
     expect(result.stats.replaceRejected).toBe(1);
   });
+
+  it("never lets a note with a failed quote replace a verified one", () => {
+    const old = assembleBatch(input([draft({})]), context).notes[0]!;
+    const result = assembleBatch(
+      input([
+        draft({
+          type: "risk",
+          summary: "Made-up follow-up.",
+          quote: "the ledger turned out to be full",
+          replaces: old.id,
+        }),
+      ]),
+      { ...context, knownNotes: new Map([[old.id, old]]) },
+    );
+    expect(result.notes[0]?.citation).toBe("failed");
+    expect(result.notes[0]?.replacesNoteId).toBeNull();
+    expect(result.stats.replaceRejected).toBe(1);
+  });
 });

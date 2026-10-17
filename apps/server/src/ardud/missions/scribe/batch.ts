@@ -166,7 +166,11 @@ export const assembleBatch = (input: ScribeBatchInput, context: BatchContext): A
 
     let replacesNoteId = draft.replaces;
     if (replacesNoteId !== null) {
-      const problem = checkReplaces({ id, missionId: input.missionId, replacesNoteId }, known);
+      // A note whose quote failed must never retire a verified one.
+      const problem =
+        citation.citation === "verified"
+          ? checkReplaces({ id, missionId: input.missionId, replacesNoteId }, known)
+          : "citation-failed";
       if (problem !== null) {
         replaceRejected += 1;
         replacesNoteId = null;

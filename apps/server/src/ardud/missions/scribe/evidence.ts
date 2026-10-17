@@ -29,8 +29,8 @@ export interface PullRequestFact {
   readonly repository: string;
   readonly number: number;
   readonly url: string | null;
-  /** Lower-case: open, merged, closed. */
-  readonly state: string;
+  /** Lower-case: open, merged, closed; null when the thread has no snapshot yet. */
+  readonly state: string | null;
   readonly checksState: string | null;
 }
 
@@ -71,7 +71,7 @@ const RUN_PATTERN = /\b(?:actions\/runs\/|runs?\s*(?:id\s*)?#?)(\d{8,12})\b/giu;
 const DIGEST_PATTERN = /\bsha256:([0-9a-f]{12,64})\b/giu;
 const SHA_PATTERN = /\b(?:commit|head|sha|merged at|@)\s*[:=]?\s*([0-9a-f]{7,40})\b/giu;
 
-const CLAIMS_MERGED = /\bmerged?\b|\blanded\b/iu;
+const CLAIMS_MERGED = /\bmerged\b|\blanded\b/iu;
 const CLAIMS_GREEN = /\bgreen\b|\bpass(?:ed|ing|es)?\b|\bsucce(?:ss|eded)\b|\bclean\b/iu;
 
 const NOT_REPOS = new Set(["pr", "prs", "pull", "issue", "seq", "incident", "rule", "item"]);
@@ -151,7 +151,7 @@ const checkPullRequest = (ref: EvidenceRef, claim: string, facts: EvidenceFacts)
   );
   const claimsMerged = CLAIMS_MERGED.test(claim);
   const claimsGreen = CLAIMS_GREEN.test(claim);
-  let state: string | null = fact?.state.toLowerCase() ?? null;
+  let state: string | null = fact?.state ?? null;
   let source = fact === undefined ? "" : `PR snapshot ${fact.repository}#${fact.number}`;
   if (state === null) {
     const mention = new RegExp(
@@ -186,7 +186,8 @@ const checkRun = (ref: EvidenceRef, claim: string, facts: EvidenceFacts): RefChe
   const text = latest.text;
   const failed = /\b(failure|failed|cancelled|timed_out)\b|✗|X\s+(?:build|test)/iu.test(text);
   const passed = /\b(success|completed\s+success|succeeded)\b|✓/iu.test(text);
-  if (failed && !passed && CLAIMS_GREEN.test(claim)) {
+  // A failed run still prints ✓ for the steps that passed, so failure wins.
+  if (failed && CLAIMS_GREEN.test(claim)) {
     return { ref, verdict: "mismatch", reason: `claimed green, run failed at e${latest.event}` };
   }
   if (passed || failed) {
@@ -278,7 +279,8 @@ export const pullRequestFacts = (threadPayload: unknown): ReadonlyArray<PullRequ
       repository,
       number,
       url: typeof entry.url === "string" ? entry.url : null,
-      state: typeof snapshot.state === "string" ? snapshot.state.toLowerCase() : "unknown",
+      // No snapshot yet: leave state unknown so tool output can answer.
+      state: typeof snapshot.state === "string" ? snapshot.state.toLowerCase() : null,
       checksState: typeof snapshot.checksState === "string" ? snapshot.checksState : null,
     });
   }

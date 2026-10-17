@@ -187,4 +187,49 @@ describe("claim-of-done evidence", () => {
     expect(checkEvidence("all done, everything shipped", facts).evidence).toBe("missing");
     expect(checkEvidence("merged rewards#999", facts).evidence).toBe("missing");
   });
+
+  it("does not read 'ready to merge' as a merged claim", () => {
+    const open = pullRequestFacts({
+      pullRequests: [{ repository: "acme/app", number: 45, snapshot: { state: "OPEN" } }],
+    });
+    expect(
+      checkEvidence("PR #45 is green, ready to merge", { pullRequests: open, events: [] }).evidence,
+    ).toBe("matched");
+  });
+
+  it("uses tool output when the linked PR has no snapshot yet", () => {
+    const pullRequests = pullRequestFacts({
+      pullRequests: [{ repository: "acme/app", number: 45, snapshot: null }],
+    });
+    expect(pullRequests[0]?.state).toBeNull();
+    const merged = [
+      transcriptEvent({
+        threadId: THREAD,
+        ordinal: 20,
+        type: "command_execution",
+        payload: { input: "gh pr view 45 --json state", output: '{"state":"MERGED"}', exitCode: 0 },
+      }),
+    ];
+    expect(checkEvidence("Merged PR #45", { pullRequests, events: merged }).evidence).toBe(
+      "matched",
+    );
+  });
+
+  it("flags a green claim when the run failed even with some passing steps", () => {
+    const run = [
+      transcriptEvent({
+        threadId: THREAD,
+        ordinal: 21,
+        type: "command_execution",
+        payload: {
+          input: "gh run view 18273645501",
+          output: "X main CI · 18273645501\n✓ lint\nX test failed\nconclusion: failure",
+          exitCode: 1,
+        },
+      }),
+    ];
+    expect(
+      checkEvidence("CI run 18273645501 is green", { pullRequests: [], events: run }).evidence,
+    ).toBe("mismatch");
+  });
 });
