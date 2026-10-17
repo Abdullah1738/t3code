@@ -4,14 +4,16 @@
 //   scribe run [--mission ID] [--slices N]          one pass over every lane the server lists
 //   scribe dry-run --thread ID [--name N] [--since ISO | --from EVENT] [--slices N] [--out DIR]
 //                                                   one lane, real model, notes to files only
-//   scribe editor --mission ID [--out FILE]         one Opus editor pass (bottom line, FYI, feed, suggestions)
+//   scribe editor --mission ID [--input FILE] [--out FILE]
+//                                                   one Opus editor pass (bottom line, FYI, feed, suggestions);
+//                                                   --out or --input keeps the reply in a file and stores nothing
 //   scribe report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--out FILE]
 //                                                   build a report from mission data; export it (scratch by default)
 //
 // Never runs on a timer by itself; a mission schedule or a person starts it.
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { appendFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { chat, EDITOR_MODEL, SCRIBE_MODEL } from './lib/model.mjs';
 import { eventsAfter, firstEventSince, openDb, threadInfo } from './lib/source.mjs';
@@ -110,14 +112,20 @@ async function run(opts) {
 async function editor(opts) {
   if (!opts.mission) throw new Error('editor needs --mission');
   const { runEditor } = await import('./lib/editor.mjs');
-  const client = serverClient();
+  // --input reads a saved editor input instead of asking the server (a dry pass by hand).
+  const client = opts.input ? null : serverClient();
+  const input = opts.input
+    ? JSON.parse(readFileSync(opts.input, 'utf8'))
+    : await client.editorInput(opts.mission);
   const result = await runEditor({
-    input: await client.editorInput(opts.mission),
+    input,
     ask: ask(EDITOR_MODEL),
-    post: opts.out ? null : (output) => client.postEditor(output),
+    model: EDITOR_MODEL,
+    post: opts.out || !client ? null : (output) => client.postEditor(output),
   });
-  if (opts.out) write(opts.out, `${JSON.stringify(result.output, null, 2)}\n`);
-  return result.summary;
+  const out = opts.out || (client ? null : join(SCRATCH, 'editor-reply.json'));
+  if (out) write(out, `${JSON.stringify(result.output, null, 2)}\n`);
+  return { ...result.summary, ...(out ? { out } : {}) };
 }
 
 async function report(opts) {
