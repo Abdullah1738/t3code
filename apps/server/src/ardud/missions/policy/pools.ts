@@ -41,8 +41,8 @@ export interface NewPoolInput {
   readonly scope: PoolScope;
   readonly kind: PoolKind;
   readonly backend: PoolBackend;
-  readonly enforcement?: Pool["enforcement"];
-  readonly priority?: ReadonlyArray<MissionId>;
+  readonly enforcement?: Pool["enforcement"] | undefined;
+  readonly priority?: ReadonlyArray<MissionId> | undefined;
 }
 
 const fail = (code: MissionError["code"], detail: string): never => {
@@ -149,8 +149,9 @@ export function queuePosition(
   return index === -1 ? null : index + 1;
 }
 
-export function nextFence(entries: ReadonlyArray<HoldEntry>): number {
-  return entries.reduce((max, { hold }) => Math.max(max, hold.fence), 0) + 1;
+/** `lastFence` is the highest fence ever issued on the pool, for callers that only load open holds. */
+export function nextFence(entries: ReadonlyArray<HoldEntry>, lastFence = 0): number {
+  return entries.reduce((max, { hold }) => Math.max(max, hold.fence), lastFence) + 1;
 }
 
 const leaseUntil = (now: string, ttlSeconds: number): string =>
@@ -165,6 +166,8 @@ export interface TakeRequest {
   readonly purpose: string;
   readonly ttlSeconds: number;
   readonly queue?: boolean | undefined;
+  /** Highest fence ever issued on the pool, when `entries` holds only open holds. */
+  readonly lastFence?: number | undefined;
 }
 
 export interface TakeResult {
@@ -200,7 +203,7 @@ export function takeHold(
 
   const used = inUse(pool, entries);
   const fits = used + amount <= pool.capacity;
-  const fence = nextFence(entries);
+  const fence = nextFence(entries, request.lastFence ?? 0);
   const base: PoolHold = {
     id: PoolHoldId.make(`${pool.id}#${fence}`),
     poolId: pool.id,

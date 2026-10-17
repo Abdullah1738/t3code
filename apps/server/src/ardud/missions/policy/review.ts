@@ -326,7 +326,7 @@ export interface ReviewPlanInput {
   readonly verdicts: ReadonlyArray<CriticalityVerdict>;
   readonly records: ReadonlyArray<ReviewRecord>;
   readonly roles: ReadonlyArray<Role>;
-  readonly customLadderIds?: ReadonlyArray<ReviewLadder["id"]>;
+  readonly customLadderIds?: ReadonlyArray<ReviewLadder["id"]> | undefined;
   readonly facts?: PullRequestFacts | undefined;
   readonly now: string;
 }
@@ -542,14 +542,16 @@ export function validatePolicy(policy: ReviewPolicy, roles: ReadonlyArray<Role>)
 export type PolicyField = "guide" | "stages" | "ladders" | "commonRules" | "judgedBy";
 
 export interface PolicyEdit {
-  readonly guide?: {
-    readonly text: string;
-    readonly hardTriggers?: ReadonlyArray<CriticalityTrigger>;
-  };
-  readonly stages?: ReadonlyArray<ReviewStage>;
-  readonly ladders?: ReadonlyArray<ReviewLadder>;
-  readonly commonRules?: ReadonlyArray<string>;
-  readonly judgedBy?: ReviewPolicy["judgedBy"];
+  readonly guide?:
+    | {
+        readonly text: string;
+        readonly hardTriggers?: ReadonlyArray<CriticalityTrigger> | undefined;
+      }
+    | undefined;
+  readonly stages?: ReadonlyArray<ReviewStage> | undefined;
+  readonly ladders?: ReadonlyArray<ReviewLadder> | undefined;
+  readonly commonRules?: ReadonlyArray<string> | undefined;
+  readonly judgedBy?: ReviewPolicy["judgedBy"] | undefined;
 }
 
 /**

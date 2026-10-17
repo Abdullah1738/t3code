@@ -135,12 +135,12 @@ export function defaultRoleId(
 export interface NewRoleInput {
   readonly missionId: MissionId;
   readonly kind: RoleKind;
-  readonly laneId?: LaneId | null;
-  readonly id?: RoleId;
-  readonly name?: string;
-  readonly description?: string;
-  readonly modelSelection?: ModelSelection;
-  readonly writesPublicText?: boolean;
+  readonly laneId?: LaneId | null | undefined;
+  readonly id?: RoleId | undefined;
+  readonly name?: string | undefined;
+  readonly description?: string | undefined;
+  readonly modelSelection?: ModelSelection | undefined;
+  readonly writesPublicText?: boolean | undefined;
 }
 
 export function newRole(input: NewRoleInput, now: string): Role {
@@ -231,15 +231,34 @@ export interface ModelApplyPlan {
 export function planModelApply(role: Role, holders: ReadonlyArray<HolderThread>): ModelApplyPlan {
   const target = role.pendingModelSelection;
   if (!target) return { steps: [], complete: true };
-  const steps = holders.map((holder): HolderStep => {
-    if (!holder.exists) return { _tag: "gone", threadId: holder.threadId };
-    if (holder.modelSelection && sameModel(holder.modelSelection, target)) {
-      return { _tag: "applied", threadId: holder.threadId };
-    }
-    if (!holder.idle) return { _tag: "wait-for-turn", threadId: holder.threadId };
-    return { _tag: "apply", threadId: holder.threadId, modelSelection: target };
-  });
+  const steps = holders.map((holder) => holderStep(target, holder));
   return { steps, complete: steps.every((step) => step._tag !== "wait-for-turn") };
+}
+
+/** One holder's step towards `target`: never a switch while a run is active. */
+export function holderStep(target: ModelSelection, holder: HolderThread): HolderStep {
+  if (!holder.exists) return { _tag: "gone", threadId: holder.threadId };
+  if (holder.modelSelection && sameModel(holder.modelSelection, target)) {
+    return { _tag: "applied", threadId: holder.threadId };
+  }
+  if (!holder.idle) return { _tag: "wait-for-turn", threadId: holder.threadId };
+  return { _tag: "apply", threadId: holder.threadId, modelSelection: target };
+}
+
+/** The model a role's holders should run: the pending change once asked for. */
+export function roleTarget(role: Role): ModelSelection {
+  return role.pendingModelSelection ?? role.modelSelection;
+}
+
+/**
+ * Whether a holder still has to pick up the role's model. `observedModel` is
+ * the model the policy last put on (or accepted for) the binding: a fresh
+ * binding (null), a model change and a cancelled change all move it, while a
+ * thread someone switched by hand keeps the policy's key and shows as drift
+ * rather than being switched back.
+ */
+export function needsAlignment(role: Role, binding: RoleBinding): boolean {
+  return binding.endedAt === null && binding.observedModel !== modelKey(roleTarget(role));
 }
 
 /** Moves the pending model into place once every holder has it. */
