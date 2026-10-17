@@ -1,4 +1,10 @@
-import { ORCHESTRATION_V2_WS_METHODS, WS_METHODS, type WsRpcGroup } from "@t3tools/contracts";
+import {
+  // ardud missions: policy
+  MISSIONS_POLICY_AGGREGATES,
+  ORCHESTRATION_V2_WS_METHODS,
+  WS_METHODS,
+  type WsRpcGroup,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as References from "effect/References";
@@ -220,6 +226,8 @@ const RPC_AGGREGATES = {
   [WS_METHODS.missionsReorderSubMissions]: "missions",
   [WS_METHODS.missionsLockField]: "missions",
   [WS_METHODS.missionsMarkSeen]: "missions",
+  // ardud missions: policy
+  ...MISSIONS_POLICY_AGGREGATES,
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

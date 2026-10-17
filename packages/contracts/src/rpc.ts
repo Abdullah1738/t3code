@@ -366,6 +366,8 @@ import {
   SetSubMissionStatusInput,
   UpdateMissionInput,
 } from "./ardud/missions.ts";
+// ardud missions: policy
+import { MissionsPolicyRpcs } from "./ardud/missionsPolicyRpc.ts";
 import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
@@ -1987,6 +1989,9 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsMarkSeenRpc,
 ).middleware(RpcScopeAuthorization);
 
+// ardud missions: policy
+export const WsMissionsPolicyRpcGroup = MissionsPolicyRpcs.middleware(RpcScopeAuthorization);
+
 /** Every WebSocket RPC not in a domain group merged into `WsRpcGroup` below. */
 export const WsCoreRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
@@ -2187,4 +2192,6 @@ export const WsCoreRpcGroup = RpcGroup.make(
 export const WsRpcGroup = WsCoreRpcGroup.merge(
   // ardud missions: core
   WsMissionsRpcGroup,
+  // ardud missions: policy
+  WsMissionsPolicyRpcGroup,
 );

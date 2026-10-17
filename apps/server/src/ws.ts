@@ -104,6 +104,8 @@ import {
   // ardud missions: core
   WsCoreRpcGroup,
   WsMissionsRpcGroup,
+  // ardud missions: policy
+  WsMissionsPolicyRpcGroup,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import {
@@ -129,6 +131,10 @@ import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 // ardud missions: core
 import * as Missions from "./ardud/missions/MissionService.ts";
 import { makeMissionWsHandlers } from "./ardud/missions/ws.ts";
+// ardud missions: policy
+import { ownerAppProvenance } from "./ardud/missions/core/provenance.ts";
+import * as MissionPolicy from "./ardud/missions/policy/PolicyService.ts";
+import { makePolicyWsHandlers } from "./ardud/missions/policy/ws.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import {
   archivedShellStreamItemFromThreadShell,
@@ -558,6 +564,8 @@ const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
 // ardud missions: core (domain groups get their own handler layer, see rpc.ts)
 const ServerWsCoreRpcGroup = WsCoreRpcGroup.middleware(RpcInstrumentation);
 const ServerWsMissionsRpcGroup = WsMissionsRpcGroup.middleware(RpcInstrumentation);
+// ardud missions: policy
+const ServerWsMissionsPolicyRpcGroup = WsMissionsPolicyRpcGroup.middleware(RpcInstrumentation);
 // When a resuming client's cursor is more than this many events behind the
 // current head, skip the per-event catch-up replay and send a fresh shell
 // snapshot instead. Replaying each intervening event costs a shell refetch;
@@ -1221,6 +1229,25 @@ const layerWsMissionsRpc = (
         }),
       );
     }),
+  );
+
+// ardud missions: policy
+const layerWsMissionsPolicyRpc = (
+  currentSession: EnvironmentAuth.AuthenticatedSession,
+  clientOrigin: OrchestrationClientOrigin,
+) =>
+  ServerWsMissionsPolicyRpcGroup.toLayer(
+    Effect.map(MissionPolicy.PolicyService, (policy) =>
+      ServerWsMissionsPolicyRpcGroup.of(
+        makePolicyWsHandlers(
+          policy,
+          ownerAppProvenance({
+            surface: clientOrigin.surface,
+            sessionId: currentSession.sessionId,
+          }),
+        ),
+      ),
+    ),
   );
 
 const layerWsRpc = (
@@ -3253,6 +3280,8 @@ export const layer = Layer.unwrap(
               // ardud missions: core
               layerWsMissionsRpc(session, clientOrigin),
             ).pipe(
+              // ardud missions: policy
+              Layer.merge(layerWsMissionsPolicyRpc(session, clientOrigin)),
               Layer.provideMerge(RpcSerialization.layerJson),
               // Request fibers run in the handlers' context, so this reporter sees
               // their defects, not the rest of the server's.

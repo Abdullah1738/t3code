@@ -8,6 +8,8 @@ import {
 } from "./auth.ts";
 import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
 import { WS_METHODS } from "./rpc.ts";
+// ardud missions: policy
+import { MISSIONS_POLICY_GUARDED_SCOPES } from "./ardud/missionsPolicyRpc.ts";
 
 /** Incremental client enforcement; the server still authorizes every request. */
 export const CLIENT_GUARDED_RPC_SCOPES = {
@@ -56,6 +58,8 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.missionsReorderSubMissions]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsLockField]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsMarkSeen]: AuthOrchestrationOperateScope,
+  // ardud missions: policy
+  ...MISSIONS_POLICY_GUARDED_SCOPES,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 

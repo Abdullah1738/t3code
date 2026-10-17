@@ -26,6 +26,8 @@ import {
   AuthTerminalReadScope,
   type AuthEnvironmentScope,
   EnvironmentAuthorizationError,
+  // ardud missions: policy
+  MISSIONS_POLICY_READ_SCOPES,
   RpcScopeAuthorization,
   WS_METHODS,
   WsRpcGroup,
@@ -217,6 +219,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.missionsSubscribeList]: AuthOrchestrationReadScope,
   [WS_METHODS.missionsSubscribe]: AuthOrchestrationReadScope,
   [WS_METHODS.missionsInbox]: AuthOrchestrationReadScope,
+  // ardud missions: policy
+  ...MISSIONS_POLICY_READ_SCOPES,
 } as const satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>;
 
 export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {
