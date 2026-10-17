@@ -1172,6 +1172,8 @@ export const WorkItemDeferral = Schema.Struct({
   /** Id in the deferral register it came from, e.g. `DF-12`. */
   registerId: TrimmedNonEmptyString,
   status: Schema.Literals(["deferred", "fired", "done", "closed"]),
+  /** The deferred work in full, as written; `title` is its first line. */
+  what: Schema.String,
   /** Who deferred it and when, as written. */
   deferredBy: Schema.String,
   why: Schema.String,
