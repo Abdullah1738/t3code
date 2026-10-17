@@ -1634,6 +1634,44 @@ export const MessageBodyInput = Schema.Struct({
 });
 export type MessageBodyInput = typeof MessageBodyInput.Type;
 
+/** The rooms of one mission. */
+export const MissionRoomsInput = Schema.Struct({
+  missionId: MissionId,
+});
+export type MissionRoomsInput = typeof MissionRoomsInput.Type;
+
+/** Join, retune or mute a room for one subscriber. */
+export const SubscribeRoomInput = Schema.Struct({
+  roomId: RoomId,
+  subscriber: MissionActor,
+  mode: SubscriptionMode,
+  /** Kinds that wake the subscriber. Defaults to request, blocker and control in wake mode. */
+  wakeOn: Schema.optional(Schema.Array(MissionMessageKind)),
+});
+export type SubscribeRoomInput = typeof SubscribeRoomInput.Type;
+
+/**
+ * Who a membership is for: an owner-attached thread, or a control-API
+ * session registered as a mission service (crw, the coord shim, watchers).
+ */
+export const MissionMemberPrincipal = Schema.Union([
+  Schema.TaggedStruct("thread", { threadId: ThreadId }),
+  Schema.TaggedStruct("session", {
+    sessionId: TrimmedNonEmptyString,
+    label: TrimmedNonEmptyString,
+  }),
+]);
+export type MissionMemberPrincipal = typeof MissionMemberPrincipal.Type;
+
+/** Owner only: attach or detach a thread, or register or drop a service session. */
+export const SetMissionMemberInput = Schema.Struct({
+  missionId: MissionId,
+  principal: MissionMemberPrincipal,
+  /** False detaches. */
+  member: Schema.Boolean,
+});
+export type SetMissionMemberInput = typeof SetMissionMemberInput.Type;
+
 export const ReorderSubMissionsInput = Schema.Struct({
   missionId: MissionId,
   /** Every active sub-mission id, in the new order. */
