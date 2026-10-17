@@ -43,6 +43,10 @@ def normalize(value):
         kcal = re.search(r'(\d+(?:\.\d+)?)\s*(?:kcal|calories)', desc, re.I)
         if kcal and out['calories_kcal'] is None:
             out['calories_kcal'] = float(kcal[1])
+        if out['calories_kcal'] is None:
+            kcal = re.search(r'(\d+(?:\.\d+)?)\s*(?:kcal|calories)', str(out.get('size') or ''), re.I)
+            if kcal:
+                out['calories_kcal'] = float(kcal[1])
         size = str(out.get('size') or out.get('name') or '')
         m = re.search(r'(?<![\d.])(\d+(?:\.\d+)?)\s*(kg|ml|litres?|liters?|l|g)\b', size, re.I)
         out.setdefault('size', None)
