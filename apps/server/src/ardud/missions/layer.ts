@@ -6,6 +6,7 @@ import * as RuleService from "./core/RuleService.ts";
 import { editorWiringLayer } from "./editorWiring.ts";
 import { missionsRouteLayer } from "./http.ts";
 import * as MissionService from "./MissionService.ts";
+import { RouterAsksRoomsLive, RouterLive } from "./router/layer.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
 import * as MissionStore from "./store/MissionStore.ts";
@@ -18,7 +19,8 @@ const MissionTracksLive = Layer.mergeAll(
   MissionService.layer,
   // tracks: add one line per track layer below
   ScribeLive,
-  AsksService.layerLive,
+  AsksService.layerLive.pipe(Layer.provide(RouterAsksRoomsLive)),
+  RouterLive,
 );
 
 /** Services built on the tracks: rules, and the scribe registered as editor. */

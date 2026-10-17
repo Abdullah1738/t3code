@@ -1251,11 +1251,9 @@ export const layer = Layer.effect(AsksService, make);
  */
 export const layerLive = layer.pipe(
   Layer.provideMerge(
-    Layer.mergeAll(
-      Inbound.layer,
-      Ports.signalsDeliver,
-      Ports.roomsPending,
-      Ports.appliersPending,
-    ).pipe(Layer.provideMerge(Ports.threadsLayer)),
+    // ardud missions: router (AsksRooms comes from the router in missions/layer.ts)
+    Layer.mergeAll(Inbound.layer, Ports.signalsDeliver, Ports.appliersPending).pipe(
+      Layer.provideMerge(Ports.threadsLayer),
+    ),
   ),
 );

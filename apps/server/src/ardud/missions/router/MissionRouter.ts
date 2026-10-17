@@ -907,53 +907,61 @@ const make = Effect.gen(function* () {
   // ---------------------------------------------------------------------------
   // Doorbell
 
+  const pokeUnlocked = (threadId: ThreadId): Effect.Effect<void, MissionError> =>
+    Effect.gen(function* () {
+      const unread = yield* rooms.unreadDeliveries(threadId);
+      if (unread.length === 0) return;
+      let bell = yield* rooms.doorbell(threadId);
+      const facts = yield* threads.facts(threadId);
+      const activity = facts?.activity ?? "missing";
+      // An outstanding wake on an idle thread means its run ended while no
+      // settle reached us (a restart, a dropped event): clear it here.
+      if (bell?.outstanding === true && activity === "idle") {
+        yield* rooms.settle(threadId, yield* nowIso);
+        bell = yield* rooms.doorbell(threadId);
+      }
+      const action = doorbellAction(
+        { outstanding: bell?.outstanding ?? false, rungSeq: bell?.rungSeq ?? 0 },
+        activity,
+        unread.map((delivery) => ({ seq: delivery.seq, covered: delivery.wakeId !== null })),
+      );
+      if (action._tag === "none") return;
+      if (action._tag === "fold") {
+        if (bell?.wakeId) yield* rooms.coverDeliveries(threadId, bell.wakeId);
+        return;
+      }
+      const newest = unread.reduce((a, b) => (b.seq > a.seq ? b : a));
+      const titles = new Set<string>();
+      for (const roomId of new Set(unread.map((delivery) => delivery.roomId))) {
+        const room = yield* rooms.room(roomId);
+        titles.add(room?.title ?? roomId);
+      }
+      const newestMessage = yield* rooms.messageById(newest.messageId);
+      const wakeId = wakeRequestId(newest.missionId, threadId, action.upToSeq);
+      yield* threads.send({
+        threadId,
+        text: wakeLine({
+          unread: action.unread,
+          rooms: [...titles],
+          newest:
+            newestMessage === null
+              ? `#${newest.seq}`
+              : `#${newestMessage.seq} ${newestMessage.kind}: ${newestMessage.summary.slice(0, 120)}`,
+        }),
+        key: wakeId,
+        asOwner: false,
+      });
+      yield* rooms.ring({
+        threadId,
+        missionId: newest.missionId,
+        wakeId,
+        upToSeq: action.upToSeq,
+        at: yield* nowIso,
+      });
+    });
+
   const poke = (threadId: ThreadId): Effect.Effect<void, MissionError> =>
-    bellLock.withPermit(
-      Effect.gen(function* () {
-        const unread = yield* rooms.unreadDeliveries(threadId);
-        if (unread.length === 0) return;
-        const bell = yield* rooms.doorbell(threadId);
-        const facts = yield* threads.facts(threadId);
-        const action = doorbellAction(
-          { outstanding: bell?.outstanding ?? false, rungSeq: bell?.rungSeq ?? 0 },
-          facts?.activity ?? "missing",
-          unread.map((delivery) => ({ seq: delivery.seq, covered: delivery.wakeId !== null })),
-        );
-        if (action._tag === "none") return;
-        if (action._tag === "fold") {
-          if (bell?.wakeId) yield* rooms.coverDeliveries(threadId, bell.wakeId);
-          return;
-        }
-        const newest = unread.reduce((a, b) => (b.seq > a.seq ? b : a));
-        const titles = new Set<string>();
-        for (const roomId of new Set(unread.map((delivery) => delivery.roomId))) {
-          const room = yield* rooms.room(roomId);
-          titles.add(room?.title ?? roomId);
-        }
-        const newestMessage = yield* rooms.messageById(newest.messageId);
-        const wakeId = wakeRequestId(newest.missionId, threadId, action.upToSeq);
-        yield* threads.send({
-          threadId,
-          text: wakeLine({
-            unread: action.unread,
-            rooms: [...titles],
-            newest:
-              newestMessage === null
-                ? `#${newest.seq}`
-                : `#${newestMessage.seq} ${newestMessage.kind}: ${newestMessage.summary.slice(0, 120)}`,
-          }),
-          key: wakeId,
-          asOwner: false,
-        });
-        yield* rooms.ring({
-          threadId,
-          missionId: newest.missionId,
-          wakeId,
-          upToSeq: action.upToSeq,
-          at: yield* nowIso,
-        });
-      }),
-    );
+    bellLock.withPermit(pokeUnlocked(threadId));
 
   const settled = (threadId: ThreadId) =>
     Effect.gen(function* () {
