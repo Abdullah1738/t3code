@@ -11,11 +11,14 @@ import {
   formatCountdown,
   formatRelative,
   groupBlockers,
+  intendedTotal,
   laneCountsOf,
   moveInOrder,
   needsYouCounts,
   needsYouLine,
   nextMilestone,
+  parseShareInput,
+  poolUsageView,
   priorityStack,
   rollUpHealth,
   sortLanesProblemsFirst,
@@ -183,7 +186,7 @@ describe("priority stack", () => {
       ["support", 2, "under"],
       ["factory", 3, "over"],
     ]);
-    expect(effortNote(rows)).toBe("factory (3rd) took 19% of the effort; you set 5%.");
+    expect(effortNote(rows)).toBe("factory (3rd) took 19% of the effort; master proposed 5%.");
   });
 
   it("stays quiet when effort follows the order", () => {
@@ -265,5 +268,79 @@ describe("feed and time", () => {
     expect(usageView(0.94)).toEqual({ label: "94% of its share", tone: "normal" });
     expect(usageView(1.24)).toEqual({ label: "Borrowing: 1.2× its share", tone: "borrowing" });
     expect(usageView(null).tone).toBe("unknown");
+  });
+
+  it("shows each pool the mission draws on as one compact entry", () => {
+    const sampledAt = "2026-10-17T08:16:00.000Z";
+    expect(
+      poolUsageView(
+        { _tag: "accounts", id: "claude", label: "Claude", usable: 20, total: 30, sampledAt },
+        NOW,
+      ),
+    ).toMatchObject({
+      value: "20/30",
+      tone: "ok",
+      detail: "Claude: 20 of 30 usable (read 17m ago)",
+    });
+    expect(
+      poolUsageView(
+        { _tag: "accounts", id: "codex", label: "Codex reviews", usable: 1, total: 6, sampledAt },
+        NOW,
+      ).tone,
+    ).toBe("tight");
+    expect(
+      poolUsageView(
+        {
+          _tag: "budget",
+          id: "offbox",
+          label: "Offbox",
+          spent: 61.69,
+          cap: 500,
+          currency: "USD",
+          sampledAt,
+        },
+        NOW,
+      ),
+    ).toMatchObject({ value: "$62 of $500", tone: "ok" });
+    expect(
+      poolUsageView(
+        {
+          _tag: "lock",
+          id: "dev",
+          label: "Dev env",
+          holder: "lane-cell-devops",
+          since: sampledAt,
+          sampledAt,
+        },
+        NOW,
+      ),
+    ).toMatchObject({ value: "held by cell-devops", tone: "held" });
+    expect(
+      poolUsageView(
+        { _tag: "lock", id: "dev", label: "Dev env", holder: null, since: null, sampledAt },
+        NOW,
+      ).value,
+    ).toBe("free");
+  });
+});
+
+describe("intended effort", () => {
+  it("knows who set the share from the locked field", () => {
+    const rows = priorityStack([
+      subMission("mine", 0, { intendedEffort: 0.6, lockedFields: ["intendedEffort"] }),
+      subMission("proposed", 1, { intendedEffort: 0.3 }),
+      subMission("unset", 2),
+    ]);
+    expect(rows.map((row) => row.intendedBy)).toEqual(["owner", "master", "none"]);
+    expect(intendedTotal(rows)).toEqual({ total: 0.9, label: "90% planned", balanced: false });
+  });
+
+  it("reads typed shares as percent, fraction, or empty to hand back", () => {
+    expect(parseShareInput("40")).toEqual({ ok: true, share: 0.4 });
+    expect(parseShareInput(" 12.5% ")).toEqual({ ok: true, share: 0.125 });
+    expect(parseShareInput("0.4")).toEqual({ ok: true, share: 0.4 });
+    expect(parseShareInput("")).toEqual({ ok: true, share: null });
+    expect(parseShareInput("140").ok).toBe(false);
+    expect(parseShareInput("lots").ok).toBe(false);
   });
 });

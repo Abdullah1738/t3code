@@ -259,10 +259,18 @@ describe("fixture missions source", () => {
     const source = createFixtureMissionsSource({ now });
     const forks = latest<ReadonlyArray<MissionForkEntry>>((l) => source.subscribeForks(CRPKO, l));
     const callId = "call-10211" as never;
+    const overview = latest<MissionOverviewSnapshot | null>((l) =>
+      source.subscribeOverview(CRPKO, l),
+    );
     await source.reactToCall({ missionId: CRPKO, callId, reaction: "discuss" });
     const discuss = forks.value.find((entry) => entry.fork.kind === "discuss")!;
     expect(discuss.fork.status).toBe("open");
     expect(discuss.fork.origin).toMatchObject({ kind: "call", id: "call-10211" });
+    // The call stays in the direction check while its Discuss fork is open.
+    const inCheck = () => overview.value!.directionCheck.some((item) => item.ref.id === callId);
+    expect(inCheck()).toBe(true);
+    await source.reactToCall({ missionId: CRPKO, callId: "call-10194" as never, reaction: "ok" });
+    expect(overview.value!.directionCheck.some((item) => item.ref.id === "call-10194")).toBe(false);
     // Asking again on the same call reuses the open fork.
     const again = await source.openFork({
       missionId: CRPKO,
@@ -282,6 +290,8 @@ describe("fixture missions source", () => {
     expect(forks.value[0]?.fork.id).toBe(asked.fork.id);
     await source.archiveFork({ forkId: asked.fork.id });
     expect(forks.value[0]?.fork.status).toBe("archived");
+    await source.archiveFork({ forkId: discuss.fork.id });
+    expect(inCheck()).toBe(false);
   });
 
   it("an owner edit of intended effort locks the field; handing back restores the proposal", async () => {

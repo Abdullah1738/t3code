@@ -12,6 +12,8 @@ import type {
   SubMission,
 } from "@t3tools/contracts";
 
+import type { MissionPoolUsage } from "./source.ts";
+
 // Pure view helpers shared by the web and mobile mission screens. Everything
 // here takes contract snapshots and returns display-ready values, so both
 // clients word things the same way.
@@ -213,6 +215,28 @@ export function refKey(ref: Pick<MissionRecordRef, "kind" | "id">): string {
   return `${ref.kind}:${ref.id}`;
 }
 
+/**
+ * Short display name for an actor. The mission's master role reads as
+ * "master" and lanes drop their `lane-` prefix, matching how the coordinator
+ * names them in rooms.
+ */
+export function actorLabel(actor: MissionActor, masterRoleId: string | null = null): string {
+  switch (actor._tag) {
+    case "owner":
+      return "you";
+    case "role":
+      return actor.roleId === masterRoleId ? "master" : actor.roleId;
+    case "lane":
+      return actor.laneId.replace(/^lane-/, "");
+    case "thread":
+      return "a thread";
+    case "system":
+      return actor.component;
+    case "person":
+      return actor.name;
+  }
+}
+
 export interface HeldItem {
   readonly holder: MissionActor;
   readonly holderLabel: string;
@@ -309,13 +333,65 @@ export function refLabel(ref: Pick<MissionRecordRef, "id" | "label">): string {
 
 export type EffortDrift = "over" | "under" | "even" | "unknown";
 
+/**
+ * Who set the intended share. The master proposes shares; an owner edit locks
+ * the field (contract `lockedFields`) so the master cannot overwrite it.
+ */
+export type IntendedEffortSource = "owner" | "master" | "none";
+
+export const INTENDED_EFFORT_FIELD = "intendedEffort";
+
 export interface PriorityStackRow {
   readonly subMission: SubMission;
   /** 1-based position in the owner's order. */
   readonly position: number;
   readonly intended: number | null;
+  readonly intendedBy: IntendedEffortSource;
   readonly actual: number | null;
   readonly drift: EffortDrift;
+}
+
+export function intendedEffortSource(
+  subMission: Pick<SubMission, "intendedEffort" | "lockedFields">,
+): IntendedEffortSource {
+  if (subMission.lockedFields.includes(INTENDED_EFFORT_FIELD)) return "owner";
+  return subMission.intendedEffort === null ? "none" : "master";
+}
+
+export const INTENDED_EFFORT_SOURCE_LABEL: Record<IntendedEffortSource, string> = {
+  owner: "set by you",
+  master: "proposed by master",
+  none: "no share set",
+};
+
+/**
+ * Reads what the owner typed as a share: "40", "40%", "0.4" all mean 40%.
+ * Empty means "hand back to the master". Returns an error for anything else.
+ */
+export function parseShareInput(
+  text: string,
+):
+  | { readonly ok: true; readonly share: number | null }
+  | { readonly ok: false; readonly error: string } {
+  const trimmed = text.trim().replace(/%$/, "").trim();
+  if (trimmed === "") return { ok: true, share: null };
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return { ok: false, error: "Enter a percentage, like 40." };
+  const value = Number(trimmed);
+  // "0.4" reads as a fraction; "1" and up read as percent.
+  const share = value < 1 && trimmed.includes(".") ? value : value / 100;
+  if (share > 1) return { ok: false, error: "A share can't be over 100%." };
+  return { ok: true, share: Math.round(share * 1000) / 1000 };
+}
+
+/** Sum of intended shares across open sub-missions, and how far it is from 100%. */
+export function intendedTotal(rows: ReadonlyArray<Pick<PriorityStackRow, "intended">>): {
+  readonly total: number;
+  readonly label: string;
+  readonly balanced: boolean;
+} {
+  const total = Math.round(rows.reduce((sum, row) => sum + (row.intended ?? 0), 0) * 1000) / 1000;
+  const rounded = Math.round(total * 100);
+  return { total, label: `${rounded}% planned`, balanced: Math.abs(rounded - 100) <= 1 };
 }
 
 /** Effort is "off" when it misses the owner's share by more than this (absolute share). */
@@ -338,6 +414,7 @@ export function priorityStack(subMissions: ReadonlyArray<SubMission>): PriorityS
       subMission,
       position: index + 1,
       intended: subMission.intendedEffort,
+      intendedBy: intendedEffortSource(subMission),
       actual: subMission.actualEffort,
       drift: effortDrift(subMission.intendedEffort, subMission.actualEffort),
     }));
@@ -362,9 +439,11 @@ export function effortNote(rows: ReadonlyArray<PriorityStackRow>): string | null
   const actual = formatPercent(worst.actual ?? 0);
   const intended = formatPercent(worst.intended ?? 0);
   const name = worst.subMission.title;
+  const target =
+    worst.intendedBy === "owner" ? `you set ${intended}` : `master proposed ${intended}`;
   return worst.drift === "over"
-    ? `${name} (${ordinal(worst.position)}) took ${actual} of the effort; you set ${intended}.`
-    : `${name} (${ordinal(worst.position)}) got ${actual} of the effort against your ${intended}.`;
+    ? `${name} (${ordinal(worst.position)}) took ${actual} of the effort; ${target}.`
+    : `${name} (${ordinal(worst.position)}) got ${actual} of the effort; ${target}.`;
 }
 
 /**
@@ -544,6 +623,80 @@ export function usageView(usageShare: number | null): UsageView {
     return { label: `Borrowing: ${formatMultiplier(usageShare)} its share`, tone: "borrowing" };
   }
   return { label: `${formatPercent(usageShare)} of its share`, tone: "normal" };
+}
+
+export type PoolTone = "ok" | "tight" | "out" | "held";
+
+export interface PoolUsageView {
+  readonly id: string;
+  readonly label: string;
+  /** "20/30", "$62 of $500", "free" or "held by cell-devops". */
+  readonly value: string;
+  readonly tone: PoolTone;
+  /** Longer form for a tooltip or screen reader. */
+  readonly detail: string;
+}
+
+/** Accounts at or below this usable share read as tight. */
+export const POOL_TIGHT_SHARE = 0.34;
+
+function formatMoney(amount: number, currency: string): string {
+  const symbol = currency === "USD" ? "$" : `${currency} `;
+  return `${symbol}${Math.round(amount)}`;
+}
+
+/** One compact entry per pool the mission draws on, for the header usage line. */
+export function poolUsageView(
+  pool: MissionPoolUsage,
+  nowMs: number,
+  masterRoleId: string | null = null,
+): PoolUsageView {
+  const sampled = formatRelative(pool.sampledAt, nowMs);
+  switch (pool._tag) {
+    case "accounts": {
+      const share = pool.total === 0 ? 0 : pool.usable / pool.total;
+      const tone: PoolTone = pool.usable === 0 ? "out" : share <= POOL_TIGHT_SHARE ? "tight" : "ok";
+      return {
+        id: pool.id,
+        label: pool.label,
+        value: `${pool.usable}/${pool.total}`,
+        tone,
+        detail: `${pool.label}: ${pool.usable} of ${pool.total} usable (read ${sampled})`,
+      };
+    }
+    case "budget": {
+      const share = pool.cap === 0 ? 1 : pool.spent / pool.cap;
+      const tone: PoolTone = share >= 1 ? "out" : share >= 1 - POOL_TIGHT_SHARE ? "tight" : "ok";
+      const spent = formatMoney(pool.spent, pool.currency);
+      const cap = formatMoney(pool.cap, pool.currency);
+      return {
+        id: pool.id,
+        label: pool.label,
+        value: `${spent} of ${cap}`,
+        tone,
+        detail: `${pool.label}: ${spent} spent of ${cap} this month (read ${sampled})`,
+      };
+    }
+    case "lock": {
+      const holder =
+        pool.holder === null
+          ? null
+          : pool.holder === masterRoleId
+            ? "master"
+            : pool.holder.replace(/^lane-/, "");
+      const since = pool.since === null ? "" : ` since ${formatRelative(pool.since, nowMs)}`;
+      return {
+        id: pool.id,
+        label: pool.label,
+        value: holder === null ? "free" : `held by ${holder}`,
+        tone: holder === null ? "ok" : "held",
+        detail:
+          holder === null
+            ? `${pool.label}: free${since === "" ? "" : `, released${since.replace(" since", "")}`}`
+            : `${pool.label}: held by ${holder}${since}`,
+      };
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
