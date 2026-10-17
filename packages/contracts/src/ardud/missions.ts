@@ -59,6 +59,8 @@ export const NoteId = missionEntityId("NoteId");
 export type NoteId = typeof NoteId.Type;
 export const RuleId = missionEntityId("RuleId");
 export type RuleId = typeof RuleId.Type;
+export const RuleChangeRequestId = missionEntityId("RuleChangeRequestId");
+export type RuleChangeRequestId = typeof RuleChangeRequestId.Type;
 export const SuggestionId = missionEntityId("SuggestionId");
 export type SuggestionId = typeof SuggestionId.Type;
 export const DraftId = missionEntityId("DraftId");
@@ -172,6 +174,7 @@ export const MissionRecordKind = Schema.Literals([
   "call",
   "note",
   "rule",
+  "rule-change-request",
   "suggestion",
   "draft",
   "draft-note",
@@ -731,6 +734,37 @@ export const Rule = Schema.Struct({
 });
 export type Rule = typeof Rule.Type;
 
+export const RuleChangeRequestStatus = Schema.Literals([
+  "open",
+  "applied",
+  "declined",
+  "withdrawn",
+]);
+export type RuleChangeRequestStatus = typeof RuleChangeRequestStatus.Type;
+
+/**
+ * The owner asks the master to modify a rule ("send a modification request to master").
+ * The master answers with a proposed new wording or a reason; only the owner applies it.
+ */
+export const RuleChangeRequest = Schema.Struct({
+  id: RuleChangeRequestId,
+  ruleId: RuleId,
+  missionId: Schema.NullOr(MissionId),
+  /** What the owner wants changed, in their words. */
+  request: Schema.String,
+  provenance: MissionProvenance,
+  status: RuleChangeRequestStatus,
+  /** The master's proposed wording or scope, if it has one. */
+  proposedQuote: Schema.NullOr(Schema.String),
+  proposedScope: Schema.NullOr(RuleScope),
+  masterResponse: Schema.NullOr(Schema.String),
+  /** Discuss fork opened for this request, if any. */
+  forkId: Schema.NullOr(ForkId),
+  createdAt: IsoDateTime,
+  resolvedAt: Schema.NullOr(IsoDateTime),
+});
+export type RuleChangeRequest = typeof RuleChangeRequest.Type;
+
 // ---------------------------------------------------------------------------
 // Suggestions
 
@@ -1186,6 +1220,8 @@ export const MissionEventKind = Schema.Literals([
   "rule.created",
   "rule.updated",
   "rule.retired",
+  "rule.change-requested",
+  "rule.change-resolved",
   "suggestion.opened",
   "suggestion.decided",
   "draft.opened",
@@ -1365,6 +1401,7 @@ export const MissionRecord = Schema.Union([
   Schema.TaggedStruct("call", { record: Call }),
   Schema.TaggedStruct("note", { record: Note }),
   Schema.TaggedStruct("rule", { record: Rule }),
+  Schema.TaggedStruct("rule-change-request", { record: RuleChangeRequest }),
   Schema.TaggedStruct("suggestion", { record: Suggestion }),
   Schema.TaggedStruct("draft", { record: Draft }),
   Schema.TaggedStruct("draft-note", { record: DraftNote }),
@@ -1531,6 +1568,26 @@ export const LockFieldInput = Schema.Struct({
   locked: Schema.Boolean,
 });
 export type LockFieldInput = typeof LockFieldInput.Type;
+
+export const RequestRuleChangeInput = Schema.Struct({
+  ruleId: RuleId,
+  request: TrimmedNonEmptyString,
+  /** Open a Discuss fork of the master on this request. */
+  discuss: Schema.optional(Schema.Boolean),
+});
+export type RequestRuleChangeInput = typeof RequestRuleChangeInput.Type;
+
+/** Owner-only rule edits: write, edit wording/scope, retire. */
+export const UpsertRuleInput = Schema.Struct({
+  ruleId: Schema.optional(RuleId),
+  missionId: Schema.NullOr(MissionId),
+  title: TrimmedNonEmptyString,
+  quote: TrimmedNonEmptyString,
+  scope: Schema.optional(RuleScope),
+  activation: Schema.optional(Schema.String),
+  status: Schema.optional(RuleStatus),
+});
+export type UpsertRuleInput = typeof UpsertRuleInput.Type;
 
 // ---------------------------------------------------------------------------
 // Errors
