@@ -15,8 +15,10 @@ import {
   draftOwnerEdit,
   fyiView,
   groupDraftNotes,
+  INITIAL_INBOX_UI,
   inboxEntries,
   inboxKeyAction,
+  inboxUiReducer,
   keepSelection,
   moveSelection,
   openForkFor,
@@ -429,5 +431,75 @@ describe("inbox keys", () => {
     expect(
       inboxKeyAction({ key: "e", modified: false, typing: false, selected: entry }),
     ).toBeNull();
+  });
+});
+
+describe("inbox screen state", () => {
+  const keys = ["ask:a", "draft:b", "knock:c"];
+
+  it("starts with nothing selected or picked", () => {
+    expect(INITIAL_INBOX_UI).toEqual({ selectedKey: null, editingKey: null, picked: {} });
+  });
+
+  it("moves, picks and edits from keys", () => {
+    let state = inboxUiReducer(INITIAL_INBOX_UI, {
+      type: "key",
+      action: { type: "move", delta: 1 },
+      keys,
+    });
+    expect(state.selectedKey).toBe("ask:a");
+    state = inboxUiReducer(state, {
+      type: "key",
+      action: { type: "pick-option", optionId: "hold" },
+      keys,
+    });
+    expect(state.picked).toEqual({ "ask:a": "hold" });
+    state = inboxUiReducer(state, { type: "key", action: { type: "move", delta: 1 }, keys });
+    state = inboxUiReducer(state, { type: "key", action: { type: "edit" }, keys });
+    expect(state).toMatchObject({ selectedKey: "draft:b", editingKey: "draft:b" });
+  });
+
+  it("ignores pick and edit keys with nothing selected", () => {
+    const state = inboxUiReducer(INITIAL_INBOX_UI, {
+      type: "key",
+      action: { type: "edit" },
+      keys,
+    });
+    expect(state).toBe(INITIAL_INBOX_UI);
+  });
+
+  it("clicking an option selects the ask; clicking it off clears the pick", () => {
+    let state = inboxUiReducer(INITIAL_INBOX_UI, {
+      type: "pick",
+      key: "ask:a",
+      optionId: "stamp-now",
+    });
+    expect(state).toMatchObject({ selectedKey: "ask:a", picked: { "ask:a": "stamp-now" } });
+    state = inboxUiReducer(state, { type: "pick", key: "ask:a", optionId: null });
+    expect(state.picked).toEqual({});
+  });
+
+  it("moves to the next item and closes the editor when the edited item leaves", () => {
+    let state = inboxUiReducer(INITIAL_INBOX_UI, { type: "edit", key: "draft:b" });
+    state = inboxUiReducer(state, {
+      type: "entries-changed",
+      previousKeys: keys,
+      nextKeys: ["ask:a", "knock:c"],
+    });
+    expect(state).toMatchObject({ selectedKey: "knock:c", editingKey: null });
+  });
+
+  it("clears selection and editor on another tab but keeps picks", () => {
+    let state = inboxUiReducer(INITIAL_INBOX_UI, { type: "pick", key: "ask:a", optionId: "hold" });
+    state = inboxUiReducer(state, { type: "edit", key: "draft:b" });
+    state = inboxUiReducer(state, { type: "scope-changed" });
+    expect(state).toEqual({ selectedKey: null, editingKey: null, picked: { "ask:a": "hold" } });
+  });
+
+  it("forgets the pick and editor of a decided item", () => {
+    let state = inboxUiReducer(INITIAL_INBOX_UI, { type: "pick", key: "ask:a", optionId: "hold" });
+    state = inboxUiReducer(state, { type: "done", key: "ask:a" });
+    expect(state.picked).toEqual({});
+    expect(state.selectedKey).toBe("ask:a");
   });
 });

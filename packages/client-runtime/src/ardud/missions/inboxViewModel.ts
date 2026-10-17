@@ -725,3 +725,95 @@ export function inboxKeyAction(input: InboxKeyInput): InboxKeyAction | null {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Inbox screen state
+
+/**
+ * What the inbox screen remembers between renders. Shared by web and mobile
+ * so both clients move, pick and edit the same way.
+ */
+export interface InboxUiState {
+  readonly selectedKey: string | null;
+  /** Draft or knock whose editor is open. */
+  readonly editingKey: string | null;
+  /** Option the owner picked per ask key. Only the owner sets these; nothing is preset. */
+  readonly picked: Readonly<Record<string, string>>;
+}
+
+export const INITIAL_INBOX_UI: InboxUiState = { selectedKey: null, editingKey: null, picked: {} };
+
+export type InboxUiEvent =
+  | { readonly type: "select"; readonly key: string | null }
+  | { readonly type: "key"; readonly action: InboxKeyAction; readonly keys: ReadonlyArray<string> }
+  | { readonly type: "pick"; readonly key: string; readonly optionId: string | null }
+  | { readonly type: "edit"; readonly key: string | null }
+  /** The visible list changed (a decision landed, the tab or mission filter changed). */
+  | {
+      readonly type: "entries-changed";
+      readonly previousKeys: ReadonlyArray<string>;
+      readonly nextKeys: ReadonlyArray<string>;
+    }
+  /** The item was decided: forget its pick and close its editor. */
+  | { readonly type: "done"; readonly key: string }
+  /** Another tab or mission filter: nothing carries over except picks. */
+  | { readonly type: "scope-changed" };
+
+function withoutPick(picked: Readonly<Record<string, string>>, key: string) {
+  if (!(key in picked)) return picked;
+  const next = { ...picked };
+  delete next[key];
+  return next;
+}
+
+export function inboxUiReducer(state: InboxUiState, event: InboxUiEvent): InboxUiState {
+  switch (event.type) {
+    case "select":
+      return state.selectedKey === event.key ? state : { ...state, selectedKey: event.key };
+    case "key": {
+      const action = event.action;
+      if (action.type === "move") {
+        const selectedKey = moveSelection(event.keys, state.selectedKey, action.delta);
+        return selectedKey === state.selectedKey ? state : { ...state, selectedKey };
+      }
+      if (state.selectedKey === null) return state;
+      if (action.type === "edit") return { ...state, editingKey: state.selectedKey };
+      return { ...state, picked: { ...state.picked, [state.selectedKey]: action.optionId } };
+    }
+    case "pick":
+      return {
+        ...state,
+        selectedKey: event.key,
+        picked:
+          event.optionId === null
+            ? withoutPick(state.picked, event.key)
+            : { ...state.picked, [event.key]: event.optionId },
+      };
+    case "edit":
+      return {
+        ...state,
+        editingKey: event.key,
+        selectedKey: event.key ?? state.selectedKey,
+      };
+    case "entries-changed": {
+      const selectedKey = keepSelection(event.previousKeys, event.nextKeys, state.selectedKey);
+      const editingKey =
+        state.editingKey !== null && event.nextKeys.includes(state.editingKey)
+          ? state.editingKey
+          : null;
+      return selectedKey === state.selectedKey && editingKey === state.editingKey
+        ? state
+        : { ...state, selectedKey, editingKey };
+    }
+    case "scope-changed":
+      return state.selectedKey === null && state.editingKey === null
+        ? state
+        : { ...state, selectedKey: null, editingKey: null };
+    case "done":
+      return {
+        ...state,
+        editingKey: state.editingKey === event.key ? null : state.editingKey,
+        picked: withoutPick(state.picked, event.key),
+      };
+  }
+}

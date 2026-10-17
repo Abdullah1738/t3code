@@ -75,6 +75,16 @@ export function useMissionOverview(
   return useSyncExternalStore(store.subscribe, store.get);
 }
 
+/**
+ * The mission's master role id, so actor labels can say "master". `null` for
+ * global records and missions without a master.
+ */
+export function useMasterRoleId(missionId: MissionId | null): string | null {
+  const store = overviewStores(missionId ?? NO_MISSION);
+  const overview = useSyncExternalStore(store.subscribe, store.get);
+  return missionId === null ? null : (overview?.mission.masterRoleId ?? null);
+}
+
 export function useMissionLanes(missionId: MissionId): ReadonlyArray<Lane> | undefined {
   const store = laneStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
@@ -130,6 +140,7 @@ export function useRoomPage(roomId: RoomId | null): RoomPage | null | undefined 
 }
 
 const NO_ROOM = "" as RoomId;
+const NO_MISSION = "" as MissionId;
 
 /** A mission error's detail, or a plain fallback for anything else. */
 export function missionErrorMessage(error: unknown): string {

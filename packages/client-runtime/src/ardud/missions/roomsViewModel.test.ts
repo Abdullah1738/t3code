@@ -17,6 +17,9 @@ import {
   roomTimeline,
   ruleFromCorrection,
   wakesFor,
+  INITIAL_ROOM_UI,
+  roomUiReducer,
+  roomView,
 } from "./roomsViewModel.ts";
 import { diffWords, parseDiffLines } from "./textDiff.ts";
 
@@ -296,5 +299,65 @@ describe("text diff", () => {
       { kind: "removed", text: "sweeps: stopped" },
       { kind: "added", text: "sweeps: every 30 min" },
     ]);
+  });
+});
+
+describe("open room state", () => {
+  const page = (messages: ReturnType<typeof message>[], ownerReadSeq: number, hasOlder = true) => ({
+    room: room("r", "control"),
+    messages,
+    hasOlder,
+    ownerReadSeq,
+  });
+
+  it("pins the read marker to where the owner was when the room opened", () => {
+    let state = roomUiReducer(INITIAL_ROOM_UI, { type: "open", roomId: "r" });
+    state = roomUiReducer(state, { type: "page", page: page([], 4) });
+    expect(state.markerSeq).toBe(4);
+    // Marking read moves the live position; the marker stays put.
+    state = roomUiReducer(state, { type: "page", page: page([], 9) });
+    expect(state.markerSeq).toBe(4);
+    const view = roomView(page([message(5, "decision"), message(9, "request")], 9), state);
+    expect(view.rows.map((row) => row.kind)).toEqual(["read-marker", "message", "message"]);
+    expect(view.markRead).toBeNull();
+  });
+
+  it("asks to mark the newest message read once", () => {
+    const state = roomUiReducer(INITIAL_ROOM_UI, { type: "open", roomId: "r" });
+    expect(roomView(page([message(5, "decision")], 3), state).markRead).toBe(5);
+  });
+
+  it("merges older pages and stops when the start is reached", () => {
+    let state = roomUiReducer(INITIAL_ROOM_UI, { type: "open", roomId: "r" });
+    const live = page([message(10, "decision")], 10);
+    expect(roomView(live, state).olderRequest).toEqual({ roomId: "r", beforeSeq: 10, limit: 40 });
+    state = roomUiReducer(state, { type: "older-start" });
+    expect(roomView(live, state).olderRequest).toBeNull();
+    state = roomUiReducer(state, {
+      type: "older-done",
+      page: { messages: [message(7, "request")], hasOlder: false },
+    });
+    const view = roomView(live, state);
+    expect(view.messages.map((m) => m.seq)).toEqual([7, 10]);
+    expect(view.hasOlder).toBe(false);
+    expect(view.olderRequest).toBeNull();
+  });
+
+  it("resets loaded pages and composer when another room opens, keeping rule offers", () => {
+    let state = roomUiReducer(INITIAL_ROOM_UI, { type: "open", roomId: "r" });
+    state = roomUiReducer(state, { type: "text", text: "hold the deploy" });
+    state = roomUiReducer(state, { type: "rule-offered", messageId: "msg-1" });
+    state = roomUiReducer(state, { type: "toggle-run", key: "status:2" });
+    state = roomUiReducer(state, { type: "open", roomId: "other" });
+    expect(state.text).toBe("");
+    expect(state.expandedRuns.size).toBe(0);
+    expect(state.offeredRuleIds.has("msg-1")).toBe(true);
+  });
+
+  it("clears the composer back to the whole room after sending", () => {
+    let state = roomUiReducer(INITIAL_ROOM_UI, { type: "target", target: { kind: "correction" } });
+    state = roomUiReducer(state, { type: "text", text: "No Friday deploys." });
+    state = roomUiReducer(state, { type: "sent" });
+    expect(state).toMatchObject({ text: "", target: { kind: "room" } });
   });
 });

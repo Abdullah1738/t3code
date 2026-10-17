@@ -437,3 +437,124 @@ export function pendingRuleOffer(
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Open room screen state
+
+/**
+ * What the open-room screen remembers between renders. Shared by web and
+ * mobile. The read marker is pinned to where the owner was when the room
+ * opened, so marking the room read on open does not make it vanish.
+ */
+export interface RoomUiState {
+  readonly roomId: string | null;
+  /** Owner read position when the room opened; the marker stays here. */
+  readonly markerSeq: number | null;
+  /** Older pages loaded on scroll, oldest first. */
+  readonly older: ReadonlyArray<MissionMessage>;
+  /** An older page came back with nothing before it. */
+  readonly olderExhausted: boolean;
+  readonly loadingOlder: boolean;
+  readonly expandedRuns: ReadonlySet<string>;
+  readonly target: ComposerTarget;
+  readonly text: string;
+  /** Corrections already offered as a rule (saved or waved off). */
+  readonly offeredRuleIds: ReadonlySet<string>;
+}
+
+export const INITIAL_ROOM_UI: RoomUiState = {
+  roomId: null,
+  markerSeq: null,
+  older: [],
+  olderExhausted: false,
+  loadingOlder: false,
+  expandedRuns: new Set(),
+  target: { kind: "room" },
+  text: "",
+  offeredRuleIds: new Set(),
+};
+
+export type RoomUiEvent =
+  | { readonly type: "open"; readonly roomId: string | null }
+  | { readonly type: "page"; readonly page: Pick<RoomPage, "room" | "ownerReadSeq"> }
+  | { readonly type: "older-start" }
+  | { readonly type: "older-done"; readonly page: Pick<RoomPage, "messages" | "hasOlder"> }
+  | { readonly type: "older-failed" }
+  | { readonly type: "toggle-run"; readonly key: string }
+  | { readonly type: "target"; readonly target: ComposerTarget }
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "sent" }
+  | { readonly type: "rule-offered"; readonly messageId: string };
+
+export function roomUiReducer(state: RoomUiState, event: RoomUiEvent): RoomUiState {
+  switch (event.type) {
+    case "open":
+      return event.roomId === state.roomId
+        ? state
+        : {
+            ...INITIAL_ROOM_UI,
+            roomId: event.roomId,
+            offeredRuleIds: state.offeredRuleIds,
+          };
+    case "page":
+      if (event.page.room.id !== state.roomId || state.markerSeq !== null) return state;
+      return { ...state, markerSeq: event.page.ownerReadSeq };
+    case "older-start":
+      return state.loadingOlder ? state : { ...state, loadingOlder: true };
+    case "older-done":
+      return {
+        ...state,
+        loadingOlder: false,
+        older: mergeMessages(state.older, event.page.messages),
+        olderExhausted: !event.page.hasOlder,
+      };
+    case "older-failed":
+      return { ...state, loadingOlder: false };
+    case "toggle-run": {
+      const expandedRuns = new Set(state.expandedRuns);
+      if (!expandedRuns.delete(event.key)) expandedRuns.add(event.key);
+      return { ...state, expandedRuns };
+    }
+    case "target":
+      return { ...state, target: event.target };
+    case "text":
+      return { ...state, text: event.text };
+    case "sent":
+      return { ...state, text: "", target: { kind: "room" } };
+    case "rule-offered":
+      return { ...state, offeredRuleIds: new Set([...state.offeredRuleIds, event.messageId]) };
+  }
+}
+
+export interface RoomView {
+  /** Loaded messages, oldest first. */
+  readonly messages: ReadonlyArray<MissionMessage>;
+  readonly hasOlder: boolean;
+  readonly rows: ReadonlyArray<TimelineRow>;
+  /** Next older page to load on scroll, or `null`. */
+  readonly olderRequest: LoadRoomPageInput | null;
+  /** Read position to store now that the newest message is on screen. */
+  readonly markRead: number | null;
+}
+
+/** Everything the open room renders, from the live page plus the screen state. */
+export function roomView(
+  page: Pick<RoomPage, "room" | "messages" | "hasOlder" | "ownerReadSeq">,
+  state: RoomUiState,
+  dayOf?: (iso: string) => string,
+): RoomView {
+  const messages = mergeMessages(state.older, page.messages);
+  const hasOlder = state.older.length > 0 ? !state.olderExhausted : page.hasOlder;
+  const markerSeq =
+    state.roomId === page.room.id ? (state.markerSeq ?? page.ownerReadSeq) : page.ownerReadSeq;
+  return {
+    messages,
+    hasOlder,
+    rows: roomTimeline(messages, markerSeq, {
+      expandedRuns: state.expandedRuns,
+      ...(dayOf ? { dayOf } : {}),
+    }),
+    olderRequest: state.loadingOlder ? null : olderPageRequest(page.room.id, messages, hasOlder),
+    markRead: nextReadSeq(page.ownerReadSeq, newestSeq(page.messages)),
+  };
+}
