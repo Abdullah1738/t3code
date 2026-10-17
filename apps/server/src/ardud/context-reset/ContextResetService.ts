@@ -4,6 +4,7 @@ import {
   type ContextResetMcpResult,
   isOrchestrationV2WorkActive,
   MessageId,
+  type OrchestrationV2ThreadProjection,
   OrchestratorMcpFailure,
   ProviderSessionId,
 } from "@t3tools/contracts";
@@ -35,6 +36,73 @@ const errorMessage = (error: unknown) =>
   typeof error === "object" && error !== null && "message" in error
     ? String(error.message)
     : String(error);
+
+export interface RunningBackgroundWork {
+  readonly id: string;
+  readonly title: string | null;
+  readonly kind: string;
+  /** A delegated task with its own T3 thread, stopped with `thread.stop`. */
+  readonly appOwned: boolean;
+}
+
+type BackgroundProjection = Pick<
+  OrchestrationV2ThreadProjection,
+  "thread" | "subagents" | "providerThreads"
+>;
+
+/**
+ * Work that still runs for the thread. An OpenCode background subagent shows
+ * up both as a subagent and on its provider thread's roster under the same
+ * task id, so it counts once. A roster entry whose subagent already finished
+ * is left over from a missed settle and does not count.
+ */
+export const runningBackgroundWork = (
+  projection: BackgroundProjection,
+): ReadonlyArray<RunningBackgroundWork> => {
+  const known = new Map<string, OrchestrationV2ThreadProjection["subagents"][number]>();
+  for (const subagent of projection.subagents) {
+    const nativeId = subagent.nativeTaskRef?.nativeId;
+    if (nativeId != null) known.set(nativeId, subagent);
+    if (subagent.childThreadId != null) known.set(subagent.childThreadId, subagent);
+  }
+  const running: Array<RunningBackgroundWork> = projection.subagents
+    .filter((subagent) => isOrchestrationV2WorkActive(subagent.status))
+    .map((subagent) => ({
+      id: subagent.nativeTaskRef?.nativeId ?? subagent.id,
+      title: subagent.title ?? null,
+      kind: subagent.origin === "app_owned" ? "delegated task" : "subagent",
+      appOwned: subagent.origin === "app_owned",
+    }));
+  const activeProviderThread = projection.providerThreads.find(
+    (providerThread) => providerThread.id === projection.thread.activeProviderThreadId,
+  );
+  for (const task of activeProviderThread?.pendingBackgroundTasks ?? []) {
+    const childThreadId = "childThreadId" in task ? task.childThreadId : undefined;
+    const match =
+      known.get(task.taskId) ??
+      (childThreadId === undefined ? undefined : known.get(childThreadId));
+    if (match !== undefined) continue;
+    running.push({
+      id: task.taskId,
+      title: task.description ?? null,
+      kind: task.kind,
+      appOwned: false,
+    });
+  }
+  return running;
+};
+
+const describeWork = (work: RunningBackgroundWork) =>
+  `${work.kind} ${work.title === null ? work.id : `"${work.title}" (${work.id})`}`;
+
+export const stoppedWorkNote = (work: ReadonlyArray<RunningBackgroundWork>) =>
+  [
+    "",
+    "",
+    "---",
+    "This context reset stopped the background work below before it finished. Relaunch what you still need:",
+    ...work.map((item) => `- ${describeWork(item)}`),
+  ].join("\n");
 
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
@@ -72,6 +140,7 @@ const make = Effect.gen(function* () {
           noteCommandId: CommandId.make(part("command", "context-reset-note")),
           noteMessageId: MessageId.make(part("message", "context-reset-note")),
           detachCommandId: CommandId.make(part("command", "context-reset-detach")),
+          stopCommandId: part("command", "context-reset-stop"),
         };
       }),
       Effect.orDie,
@@ -103,32 +172,26 @@ const make = Effect.gen(function* () {
 
     // A fresh session cannot take over background work the old one started:
     // its results would land in a session that no longer exists.
-    const activeSubagents = projection.subagents.filter((subagent) =>
-      isOrchestrationV2WorkActive(subagent.status),
-    );
-    const activeProviderThread = projection.providerThreads.find(
-      (providerThread) => providerThread.id === projection.thread.activeProviderThreadId,
-    );
-    const pendingBackgroundTasks = activeProviderThread?.pendingBackgroundTasks ?? [];
-    if (activeSubagents.length > 0 || pendingBackgroundTasks.length > 0) {
-      const count = activeSubagents.length + pendingBackgroundTasks.length;
+    const running = runningBackgroundWork(projection);
+    if (running.length > 0 && input.cancelBackgroundWork !== true) {
+      const count = running.length;
       return yield* failure(
         "invalid_request",
-        `This thread still has ${count} running background task${count === 1 ? "" : "s"}. Wait for them to finish (or stop them) before resetting context.`,
+        `This thread still has ${count} running background task${count === 1 ? "" : "s"}: ${running.map(describeWork).join("; ")}. Wait for them to finish, or call t3_context_reset again with cancelBackgroundWork: true to stop them and reset (the stopped items are listed in the resume note).`,
       );
     }
 
-    const { noteCommandId, noteMessageId, detachCommandId } = yield* ids(scope);
+    const { noteCommandId, noteMessageId, detachCommandId, stopCommandId } = yield* ids(scope);
 
     // Queue the note first: it runs on a fresh provider thread once the
-    // current turn ends, so a failed detach below still resets context.
+    // current turn ends, so a failed stop or detach below still resets context.
     const sent = yield* threadManagement
       .sendToThread({
         projectId: projection.thread.projectId,
         commandId: noteCommandId,
         threadId,
         messageId: noteMessageId,
-        text: input.note,
+        text: running.length > 0 ? `${input.note}${stoppedWorkNote(running)}` : input.note,
         attachments: [],
         mode: "queue",
         contextReset: true,
@@ -140,6 +203,37 @@ const make = Effect.gen(function* () {
           failure("orchestration_error", `Unable to queue the resume note: ${errorMessage(error)}`),
         ),
       );
+
+    let stopped = true;
+    if (running.length > 0) {
+      const stopFailed = (cause: unknown) =>
+        Effect.logWarning("context reset could not stop background work", {
+          threadId,
+          cause,
+        }).pipe(Effect.andThen(Effect.sync(() => (stopped = false))));
+      if (running.some((work) => work.appOwned)) {
+        yield* threadManagement
+          .stopDelegatedTasks({
+            threadId,
+            commandId: CommandId.make(`${stopCommandId}:delegated`),
+            reason: "Context reset.",
+          })
+          .pipe(Effect.catchCause(stopFailed));
+      }
+      // Interrupting the calling run is the Stop path: the provider stops the
+      // run's background subagents and tasks, then T3 settles what it shows.
+      // A plain interrupt leaves the queue alone, so the resume note runs next.
+      if (running.some((work) => !work.appOwned)) {
+        yield* threadManagement
+          .interruptThread({
+            projectId: projection.thread.projectId,
+            commandId: CommandId.make(`${stopCommandId}:interrupt`),
+            threadId,
+            reason: "Context reset: stopping background work.",
+          })
+          .pipe(Effect.catchCause(stopFailed));
+      }
+    }
 
     const detached = yield* threadManagement
       .dispatch({
@@ -159,11 +253,16 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    const stopNote = stopped
+      ? ""
+      : " Some background work could not be stopped and may still finish into the old session.";
     const result: ContextResetMcpResult = {
       delivery: sent.delivery,
-      note: detached
-        ? "Context reset scheduled. Your current turn ends now; a fresh session starts with the resume note as its only context. Do not do any more work in this turn."
-        : "Resume note queued for a fresh session, but the current session could not be ended. End your turn now; the fresh session starts when it ends.",
+      note:
+        (detached
+          ? "Context reset scheduled. Your current turn ends now; a fresh session starts with the resume note as its only context. Do not do any more work in this turn."
+          : "Resume note queued for a fresh session, but the current session could not be ended. End your turn now; the fresh session starts when it ends.") +
+        stopNote,
     };
     return result;
   });
@@ -180,9 +279,13 @@ const make = Effect.gen(function* () {
           );
         }
         resetsInFlight.add(threadId);
-        return restore(performReset(scope, input)).pipe(
-          Effect.ensuring(Effect.sync(() => resetsInFlight.delete(threadId))),
-        );
+        // Stopping background work interrupts the caller's own turn, which can
+        // drop this MCP request; the reset must still finish once it starts.
+        const run =
+          input.cancelBackgroundWork === true
+            ? performReset(scope, input)
+            : restore(performReset(scope, input));
+        return run.pipe(Effect.ensuring(Effect.sync(() => resetsInFlight.delete(threadId))));
       });
     },
   );
