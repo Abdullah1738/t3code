@@ -5,7 +5,7 @@
  * scheduled task row) and calls `guardSend`; nothing here reads identity
  * from a request body.
  */
-import { OrchestratorMcpFailure, type ThreadId } from "@t3tools/contracts";
+import { OrchestratorMcpFailure, type MissionProvenance, type ThreadId } from "@t3tools/contracts";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 
@@ -105,8 +105,14 @@ export const guardMcpWrite = (input: {
 export const controlSendPath = (clientRequestId: string | undefined): SendPath =>
   clientRequestId?.startsWith("coord:") === true ? "coord-shim" : "control-api";
 
+/**
+ * A control session's send. `owner` is set only when the iMessage bridge
+ * relays an inbound that verified as the owner's or Moni's (see
+ * `guard/imessage.ts`); every other control send is the session itself.
+ */
 export const guardControlSend = (input: {
   readonly session: { readonly sessionId: string; readonly subject: string };
+  readonly owner?: MissionProvenance | null | undefined;
   readonly targetThreadId: ThreadId;
   readonly text: string;
   readonly commandId: string;
@@ -115,7 +121,9 @@ export const guardControlSend = (input: {
   decide(
     controlSendPath(input.clientRequestId),
     input.targetThreadId,
-    { _tag: "session", sessionId: input.session.sessionId, subject: input.session.subject },
+    input.owner == null
+      ? { _tag: "session", sessionId: input.session.sessionId, subject: input.session.subject }
+      : { _tag: "owner", provenance: input.owner },
     input.text,
     input.commandId,
   );

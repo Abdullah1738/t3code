@@ -1,10 +1,12 @@
 /**
- * The control API (HTTP bearer tokens: the CLI, bridges, coord) is never the
+ * The control API (HTTP bearer tokens: the CLI, bridges, coord) is not the
  * owner. Its writes are stamped `system`, the authenticated session is kept
  * beside them, and an answer to a pending request is judged like any other
- * send before the request changes state.
+ * send before the request changes state. The one exception is the iMessage
+ * bridge relaying an inbound that verifies as the owner's or Moni's
+ * (`imessage.ts`): that write is his.
  */
-import type { ThreadId } from "@t3tools/contracts";
+import type { MissionProvenance, ThreadId } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 
 import { guardSender, type SendGuardFailed, type SendRefused } from "../router/guardPaths.ts";
@@ -20,11 +22,21 @@ interface ControlSession {
 /** What the control API writes as. Named component identities come from core. */
 export const CONTROL_ACTOR = "system" as const;
 
-export const controlPrincipal = (session: ControlSession): GuardPrincipal => ({
-  _tag: "session",
-  sessionId: session.sessionId,
-  subject: session.subject,
-});
+/** How a control write is stamped: `user` only for a verified iMessage of his. */
+export const controlActor = (owner: MissionProvenance | null): "user" | typeof CONTROL_ACTOR =>
+  owner === null ? CONTROL_ACTOR : "user";
+
+/**
+ * Who a control write is from: the session, or the owner when the iMessage
+ * bridge relayed a verified inbound of his (see `imessage.ts`).
+ */
+export const controlPrincipal = (
+  session: ControlSession,
+  owner?: MissionProvenance | null,
+): GuardPrincipal =>
+  owner == null
+    ? { _tag: "session", sessionId: session.sessionId, subject: session.subject }
+    : { _tag: "owner", provenance: owner };
 
 /**
  * An answer from a control session reaches the agent as provider input or as
@@ -33,6 +45,7 @@ export const controlPrincipal = (session: ControlSession): GuardPrincipal => ({
  */
 export const guardControlRespond = (input: {
   readonly session: ControlSession;
+  readonly owner?: MissionProvenance | null | undefined;
   readonly threadId: ThreadId;
   readonly requestId: string;
   readonly decision?: string | undefined;
@@ -43,7 +56,7 @@ export const guardControlRespond = (input: {
   guardSender({
     path: "request-respond",
     targetThreadId: input.threadId,
-    from: controlPrincipal(input.session),
+    from: controlPrincipal(input.session, input.owner),
     text: requestAnswerText(input),
     requestKey: input.commandId,
   });
@@ -54,4 +67,5 @@ export const recordControlWrite = (
   kind: Extract<AuthorityKind, "message" | "thread">,
   subjectId: string,
   session: ControlSession,
-): Effect.Effect<void> => store.record(kind, subjectId, controlPrincipal(session));
+  owner?: MissionProvenance | null,
+): Effect.Effect<void> => store.record(kind, subjectId, controlPrincipal(session, owner));

@@ -14,6 +14,7 @@ import {
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -72,6 +73,14 @@ export const membershipGuard = Effect.gen(function* () {
   return seen;
 });
 
+/** When every pending request in `projectionFor` opened. */
+export const askedAt = DateTime.makeUnsafe("2026-10-18T10:00:00.000Z");
+
+/**
+ * Every thread has three pending requests: `request-1` asks "release"
+ * (options "Ship it" and "Hold"), `request-2` asks to approve a command, and
+ * `request-3` asks "release" and "notes" together.
+ */
 export const projectionFor = (threadId: ThreadId): OrchestrationV2ThreadProjection =>
   ({
     ...idleThreadProjection(liveThreadShell(threadId)),
@@ -82,9 +91,56 @@ export const projectionFor = (threadId: ThreadId): OrchestrationV2ThreadProjecti
         kind: "user_input",
         status: "pending",
         responseCapability: { type: "message" },
+        createdAt: askedAt,
+      },
+      {
+        id: "request-2",
+        kind: "command",
+        status: "pending",
+        responseCapability: { type: "live", providerSessionId: "provider-session" },
+        createdAt: askedAt,
+      },
+      {
+        id: "request-3",
+        kind: "user_input",
+        status: "pending",
+        responseCapability: { type: "message" },
+        createdAt: askedAt,
       },
     ],
-    turnItems: [{ type: "user_input_request", requestId: "request-1", questions: [] }],
+    turnItems: [
+      {
+        type: "user_input_request",
+        requestId: "request-1",
+        questions: [
+          {
+            id: "release",
+            header: "Release",
+            question: "Ship the release?",
+            options: [
+              { label: "Ship it", description: "Ship now." },
+              { label: "Hold", description: "Wait for review." },
+            ],
+          },
+        ],
+      },
+      {
+        type: "user_input_request",
+        requestId: "request-3",
+        questions: [
+          {
+            id: "release",
+            header: "Release",
+            question: "Ship the release?",
+            options: [
+              { label: "Ship it", description: "Ship now." },
+              { label: "Hold", description: "Wait for review." },
+            ],
+          },
+          { id: "notes", header: "Notes", question: "Anything to add?", options: [] },
+        ],
+      },
+    ],
   }) as unknown as OrchestrationV2ThreadProjection;
 
 export interface Delivered {

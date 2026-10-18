@@ -53,9 +53,11 @@ import { guardControlSend, type SendRefused } from "../missions/router/guardPath
 import { optionalAuthorityStore } from "../missions/guard/authority.ts";
 import {
   CONTROL_ACTOR,
+  controlActor,
   guardControlRespond,
   recordControlWrite,
 } from "../missions/guard/control.ts";
+import { optionalIMessageOwner } from "../missions/guard/imessage.ts";
 import {
   formatModel,
   lastAssistantText,
@@ -224,6 +226,8 @@ const SendBody = Schema.Struct({
   variant: OptionalString,
   attachments: Schema.optional(Schema.Array(Attachment)),
   clientRequestId: OptionalString,
+  // ardud missions: guard - the iMessage the bridge is relaying, checked against its store.
+  inboundId: OptionalString,
 });
 
 const InterruptBody = Schema.Struct({
@@ -238,6 +242,8 @@ const RespondBody = Schema.Struct({
   answers: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   dismiss: Schema.optional(Schema.Boolean),
   clientRequestId: OptionalString,
+  // ardud missions: guard - the iMessage the bridge is relaying, checked against its store.
+  inboundId: OptionalString,
 });
 
 const OriginBody = Schema.Struct({ origin: Schema.NullOr(Schema.String) });
@@ -406,6 +412,7 @@ const makeRoutes = Effect.gen(function* () {
     board._tag === "Some" ? board.value.refreshThread(threadId).pipe(Effect.ignore) : Effect.void;
   // ardud missions: guard - control sessions are kept beside what they write.
   const guardAuthority = yield* optionalAuthorityStore;
+  const imessageOwner = yield* optionalIMessageOwner;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -861,9 +868,19 @@ const makeRoutes = Effect.gen(function* () {
     const body = yield* decodeBody(decodeSendBody);
     const shell = yield* getShell(threadId);
     const commandId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
+    // ardud missions: guard - the owner's word only when the bridge relays a verified iMessage.
+    const owner = yield* imessageOwner.relay({
+      session,
+      inboundId: body.inboundId,
+      threadId: shell.id,
+      text: body.text,
+      attachments: body.attachments?.length ?? 0,
+      mode: body.mode,
+    });
     // ardud missions: router - mission member threads only take sends the guard passes.
     const refused = yield* guardControlSend({
       session,
+      owner,
       targetThreadId: shell.id,
       text: body.text,
       commandId,
@@ -896,7 +913,7 @@ const makeRoutes = Effect.gen(function* () {
           ...(modelSelection === undefined ? {} : { modelSelection }),
           mode: body.mode ?? "auto",
           // ardud missions: guard - a bearer token is not the owner typing.
-          createdBy: CONTROL_ACTOR,
+          createdBy: controlActor(owner),
           creationSource: "server",
         }).pipe(Effect.provide(intakeContext)),
       )
@@ -908,7 +925,7 @@ const makeRoutes = Effect.gen(function* () {
         ),
       );
     // ardud missions: guard
-    yield* recordControlWrite(guardAuthority, "message", result.message.id, session);
+    yield* recordControlWrite(guardAuthority, "message", result.message.id, session, owner);
     return json({
       ok: true,
       threadId: shell.id,
@@ -1008,14 +1025,28 @@ const makeRoutes = Effect.gen(function* () {
       };
     }
     // ardud missions: guard - the answer is judged before the request changes
-    // state, so a routed or knocked answer leaves it pending.
-    const refused = yield* guardControlRespond({
-      session,
-      threadId: ThreadId.make(threadId),
-      requestId,
+    // state, so a routed or knocked answer leaves it pending. It is the owner's
+    // only when the bridge relays a verified iMessage that says exactly this.
+    const answer = {
       decision: command.type === "runtime-request.respond" ? command.decision : undefined,
       answers: command.type === "runtime-request.respond" ? command.answers : undefined,
       dismissed: command.type === "thread.user-input.dismiss",
+    };
+    const owner = yield* imessageOwner.answer({
+      session,
+      inboundId: body.inboundId,
+      threadId,
+      requestId,
+      askedAt: request.createdAt,
+      turnItems: records.turnItems,
+      ...answer,
+    });
+    const refused = yield* guardControlRespond({
+      session,
+      owner,
+      threadId: ThreadId.make(threadId),
+      requestId,
+      ...answer,
       commandId,
     }).pipe(
       Effect.as(null),
