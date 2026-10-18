@@ -12,10 +12,14 @@ import * as Schema from "effect/Schema";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
+import { componentProvenance } from "../core/provenance.ts";
 import { type ScribeError, ScribeService } from "./ScribeService.ts";
 
 /** Routes the scribe runner calls, under the missions HTTP prefix. */
 export const SCRIBE_ROUTE_PREFIX = "/api/ardud/missions/scribe";
+
+export const SCRIBE_CREDENTIAL_REQUIRED =
+  "Scribe writes need the scribe component credential (t3 ardud component-token issue scribe).";
 
 type ErrorCode =
   | "unauthorized"
@@ -175,7 +179,33 @@ const makeRoutes = Effect.gen(function* () {
       if (!session.scopes.includes(scope)) {
         return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
       }
+      return session;
     });
+
+  /**
+   * Writes come from the scribe runner only, proven by its own component
+   * credential. The control token and other components can read but never
+   * write notes, editor results or saved reports, because the master reads
+   * them as the scribe's word. The service records the scribe's actor, which
+   * is the only credential that gets this far.
+   */
+  const authenticateScribe = Effect.gen(function* () {
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
+    const caller = componentProvenance(session);
+    if (caller?._tag !== "system") {
+      return yield* fail("forbidden", SCRIBE_CREDENTIAL_REQUIRED);
+    }
+    if (caller.component !== "scribe") {
+      return yield* fail(
+        "forbidden",
+        `This credential is ${caller.component}; it cannot write as the scribe.`,
+      );
+    }
+    yield* Effect.annotateCurrentSpan({
+      "ardud.missions.session_id": session.sessionId,
+      "ardud.missions.component": caller.component,
+    });
+  });
 
   /** Run a service call and map its errors onto HTTP codes. */
   const call = <A, R>(effect: Effect.Effect<A, ScribeError, R>) =>
@@ -218,7 +248,7 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   const postBatch = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    yield* authenticateScribe;
     const body = yield* decodeBody(decodeBatch);
     return json({ ok: true, result: yield* call(scribe.ingest(body)) });
   });
@@ -230,7 +260,7 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   const postEditor = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    yield* authenticateScribe;
     const body = yield* decodeBody(decodeEditor);
     return json({ ok: true, result: yield* call(scribe.applyEditor(body)) });
   });
@@ -238,9 +268,11 @@ const makeRoutes = Effect.gen(function* () {
   const postReport = Effect.gen(function* () {
     const body = yield* decodeBody(decodeReport);
     // Building is a read; keeping the report for the next close-out is a write.
-    yield* authenticate(
-      body.save === true ? AuthOrchestrationOperateScope : AuthOrchestrationReadScope,
-    );
+    if (body.save === true) {
+      yield* authenticateScribe;
+    } else {
+      yield* authenticate(AuthOrchestrationReadScope);
+    }
     const report = yield* call(
       scribe.report({
         missionId: body.missionId,
@@ -279,8 +311,9 @@ const makeRoutes = Effect.gen(function* () {
 });
 
 /**
- * Scribe routes. Same bearer auth as the control API: reads need
- * orchestration:read, writes need orchestration:operate. Core mounts this next
- * to its own `/api/ardud/missions/*` routes.
+ * Scribe routes. Reads need orchestration:read. Writes (batches, editor
+ * results, saved reports) need the scribe component credential
+ * (`t3 ardud component-token issue scribe`). Core mounts this next to its own
+ * `/api/ardud/missions/*` routes.
  */
 export const scribeRouteLayer = HttpRouter.addAll(makeRoutes);
