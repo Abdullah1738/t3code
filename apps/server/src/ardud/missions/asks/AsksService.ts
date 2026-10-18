@@ -9,10 +9,13 @@ import {
   MissionId,
   NoteId,
   SuggestionId,
+  type AnnotateDraftInput,
   type AnswerAskInput,
   type Ask,
   type Call,
   type CloseForkInput,
+  type CloseStaleDraftInput,
+  type ReportDraftSentInput,
   type DecideDraftInput,
   type DecideSuggestionInput,
   type DirectionCheckItem,
@@ -27,16 +30,20 @@ import {
   type MissionProvenance,
   type MissionRecordRef,
   type Note,
+  type OpenSystemDraftInput,
   type PostMessageInput,
   type ReactToCallInput,
   type ReopenAskInput,
   type ReopenDraftInput,
   type ReopenSuggestionInput,
+  type RouteDraftInput,
   type SaveDraftNoteInput,
+  type SetDraftNoteActiveInput,
   type StartForkInput,
   type Suggestion,
   type SuggestionAuthor,
   type SuggestionStats,
+  type SystemDraftDecision,
   type UpdateForkInput,
   type WithdrawAskInput,
 } from "@t3tools/contracts";
@@ -50,6 +57,8 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
+import { cleanAnnotation, routeApprover } from "../core/approvals.ts";
+import { isMasterAnywhere } from "../core/master.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
 import {
@@ -63,14 +72,23 @@ import {
 import { directionCheck, makeCall, reactToCall } from "./callModel.ts";
 import { draftNoteFromSuggestion, learnFromEdits } from "./draftLearning.ts";
 import {
+  annotateDraft,
+  annotationOf,
+  closeStaleDraft,
   decideDraft,
   draftExamples,
   type DraftExample,
+  epochOf,
   notesFor,
+  openSystemDraft,
   reopenDraft,
+  reportDraftSent,
   reviseDraft,
+  revisionOf,
+  routeDraft,
   saveDraftNote,
   submitDraft,
+  systemDraftDecision,
 } from "./draftModel.ts";
 import {
   archiveFork,
@@ -95,12 +113,7 @@ import {
   type SubmitDraftInput,
 } from "./inputs.ts";
 import * as Ports from "./ports.ts";
-import {
-  expectedForAnswer,
-  expectedForDraftDecision,
-  type ExpectedText,
-  verifyInbound,
-} from "./provenance.ts";
+import { answerCheck, draftDecisionCheck, type ReplyCheck, verifyInbound } from "./provenance.ts";
 import {
   clipSummary,
   dedupeRefs,
@@ -118,11 +131,13 @@ import {
   type Standing,
 } from "./standing.ts";
 import {
+  acceptorFor,
   decideSuggestion,
   proposeSuggestion,
   recordOutcome,
   reopenSuggestion,
   suggestionStats,
+  type SuggestionApplication,
 } from "./suggestionModel.ts";
 
 /**
@@ -193,6 +208,15 @@ export interface ListFilter {
   readonly status?: ReadonlyArray<string> | undefined;
 }
 
+export interface ProposeOptions {
+  /**
+   * A stable id for authors that may propose the same thing twice (the
+   * editor replays its plan). An existing suggestion with this id is returned
+   * as it is.
+   */
+  readonly id?: SuggestionId | undefined;
+}
+
 type Fx<A> = Effect.Effect<A, MissionError>;
 
 export class AsksService extends Context.Service<
@@ -245,14 +269,42 @@ export class AsksService extends Context.Service<
       provenance: MissionProvenance,
     ) => Fx<DraftDecisionResult>;
     readonly reopenDraft: (input: ReopenDraftInput, provenance: MissionProvenance) => Fx<Draft>;
+    /** Owner or master hands one pending draft to the other approver, with a reason. */
+    readonly routeDraft: (input: RouteDraftInput, provenance: MissionProvenance) => Fx<Draft>;
     readonly saveDraftNote: (
       input: SaveDraftNoteInput,
       provenance: MissionProvenance,
     ) => Fx<DraftNote>;
+    readonly setDraftNoteActive: (
+      input: SetDraftNoteActiveInput,
+      provenance: MissionProvenance,
+    ) => Fx<DraftNote>;
+    /** Owner or master sets a waiting draft's summary and flag chips. */
+    readonly annotateDraft: (input: AnnotateDraftInput, provenance: MissionProvenance) => Fx<Draft>;
+    /** A system (crw) opens a draft for one exact head, closing its older ones for the target. */
+    readonly openSystemDraft: (
+      input: OpenSystemDraftInput,
+      provenance: MissionProvenance,
+    ) => Fx<Draft>;
+    readonly closeStaleDraft: (
+      input: CloseStaleDraftInput,
+      provenance: MissionProvenance,
+    ) => Fx<Draft>;
+    /** The decision a system may act on for one draft at one head. */
+    readonly systemDraftDecision: (
+      input: { readonly draftId: DraftId; readonly head: string; readonly requestedBy: string },
+      provenance: MissionProvenance,
+    ) => Fx<SystemDraftDecision>;
+    /** The requesting system reports it posted (or failed to post) the approved text. */
+    readonly reportDraftSent: (
+      input: ReportDraftSentInput,
+      provenance: MissionProvenance,
+    ) => Fx<Draft>;
     // Suggestions
     readonly proposeSuggestion: (
       input: ProposeSuggestionInput,
       provenance: MissionProvenance,
+      options?: ProposeOptions,
     ) => Fx<Suggestion>;
     readonly decideSuggestion: (
       input: DecideSuggestionInput,
@@ -291,7 +343,7 @@ const make = Effect.gen(function* () {
   const threads = yield* Ports.AsksThreads;
   const signals = yield* Ports.AsksSignals;
   const rooms = yield* Ports.AsksRooms;
-  const appliers = yield* Ports.SuggestionAppliers;
+  const appliers = yield* Ports.SuggestionApplierRegistry;
   const crypto = yield* Crypto.Crypto;
   const lock = yield* Semaphore.make(1);
   const serialized = <A, E, R>(effect: Effect.Effect<A, E, R>) => lock.withPermits(1)(effect);
@@ -380,8 +432,9 @@ const make = Effect.gen(function* () {
   const ownerVoice = (command: {
     readonly provenance: MissionProvenance;
     readonly inboundId: string | undefined;
-    readonly expected: ExpectedText;
+    readonly check: ReplyCheck;
     readonly notBefore: string;
+    readonly skewMs?: number;
     readonly what: string;
   }) =>
     Effect.gen(function* () {
@@ -392,9 +445,9 @@ const make = Effect.gen(function* () {
         verifyInbound({
           inboundId: command.inboundId,
           inbound: message,
-          expected: command.expected.expected,
-          contradicts: command.expected.contradicts,
+          check: command.check,
           notBefore: command.notBefore,
+          ...(command.skewMs === undefined ? {} : { skewMs: command.skewMs }),
           what: command.what,
         }),
       );
@@ -550,14 +603,11 @@ const make = Effect.gen(function* () {
   const answerAskCommand = (input: AnswerAskInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const ask = yield* need("ask", input.askId);
-      const option =
-        input.optionId === null
-          ? null
-          : (ask.options.find((candidate) => candidate.id === input.optionId) ?? null);
+      // The reply must carry the exact answer: the option he picked and nothing turning it around.
       const voice = yield* ownerVoice({
         provenance,
         inboundId: input.inboundId,
-        expected: expectedForAnswer({ text: input.text, option }),
+        check: answerCheck({ options: ask.options, optionId: input.optionId, text: input.text }),
         notBefore: ask.updatedAt,
         what: "Answering an ask",
       });
@@ -673,7 +723,7 @@ const make = Effect.gen(function* () {
 
   const submitDraftCommand = (input: SubmitDraftInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
-      const { standing } = yield* standingIn(input.missionId, provenance);
+      const { cast, standing } = yield* standingIn(input.missionId, provenance);
       if (provenance._tag === "agent" && !isParticipant(standing)) {
         return yield* fail(
           "forbidden",
@@ -681,7 +731,36 @@ const make = Effect.gen(function* () {
         );
       }
       const writer = standing.roles.find((role) => role.kind === "writer") ?? null;
+      // The role the text comes from: the writer role when held, else the role it speaks as.
+      const speaking = standing.caller.provenance;
+      const drafting =
+        writer ??
+        (speaking._tag === "agent"
+          ? (standing.roles.find((role) => role.id === speaking.roleId) ?? null)
+          : null);
+      if (drafting !== null && !drafting.writesPublicText) {
+        return yield* fail(
+          "forbidden",
+          `Role ${drafting.name} does not write public text (the master's switch); hand the text to a writer role and let it draft.`,
+        );
+      }
+      const binding =
+        drafting === null || speaking._tag !== "agent"
+          ? undefined
+          : cast.bindings.find(
+              (candidate) =>
+                candidate.roleId === drafting.id &&
+                candidate.endedAt === null &&
+                candidate.threadId === speaking.threadId,
+            );
       const notes = yield* allDraftNotes(input.missionId);
+      // A draft names one audience; routes match it as the person as well.
+      const route = routeApprover(cast.mission?.approvalRouting, {
+        _tag: "draft",
+        channel: input.channel,
+        audience: input.audience,
+        person: input.audience,
+      });
       const existing = yield* store.list("draft", {
         missionId: input.missionId,
         status: ["pending", "rewrite-requested"],
@@ -697,6 +776,8 @@ const make = Effect.gen(function* () {
           source: draftSource(standing),
           writerRoleId: writer?.id ?? null,
           caller: standing.caller,
+          route,
+          writtenBy: { roleId: drafting?.id ?? null, model: binding?.observedModel ?? null },
           notes,
           existing,
           now: yield* now,
@@ -754,35 +835,89 @@ const make = Effect.gen(function* () {
   const decideDraftCommand = (input: DecideDraftInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const draft = yield* need("draft", input.draftId);
+      // The inbound must postdate the draft's current epoch. After a revision or reopen there
+      // is no skew allowance: a reply to the earlier text or decision never counts.
       const voice = yield* ownerVoice({
         provenance,
         inboundId: input.inboundId,
-        expected: expectedForDraftDecision(input),
-        notBefore: draft.createdAt,
+        check: draftDecisionCheck(input),
+        notBefore: epochOf(draft),
+        ...(revisionOf(draft) > 0 ? { skewMs: 0 } : {}),
         what: "Deciding a draft",
       });
+      // A master's decision is recorded under its role, never as the owner.
+      const { standing } = yield* standingIn(draft.missionId, voice);
       const decided = yield* fromOutcome(
-        decideDraft({ draft, input, provenance: voice, now: yield* now }),
+        decideDraft({
+          draft,
+          input,
+          provenance: standing.caller.provenance,
+          callerIsMaster: standing.isMaster,
+          now: yield* now,
+        }),
       );
       yield* persist(draft.missionId, decided.events, [{ _tag: "draft", record: decided.record }]);
-      const suggestions = decided.edit === null ? [] : yield* learnFrom(draft.missionId);
+      // Only the owner's own edits teach the house style.
+      const suggestions =
+        decided.edit === null || !isOwnerProvenance(voice) ? [] : yield* learnFrom(draft.missionId);
       return { draft: decided.record, suggestions };
     });
 
   const reopenDraftCommand = (input: ReopenDraftInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const draft = yield* need("draft", input.draftId);
-      const reopened = yield* fromOutcome(reopenDraft(draft, provenance, yield* now));
+      const { standing } = yield* standingIn(draft.missionId, provenance);
+      const reopened = yield* fromOutcome(
+        reopenDraft(draft, standing.caller.provenance, standing.isMaster, yield* now),
+      );
       yield* persist(draft.missionId, reopened.events, [
         { _tag: "draft", record: reopened.record },
       ]);
       return reopened.record;
     });
 
+  const routeDraftCommand = (input: RouteDraftInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const { standing } = yield* standingIn(draft.missionId, provenance);
+      const routed = yield* fromOutcome(
+        routeDraft({
+          draft,
+          approver: input.approver,
+          reason: input.reason,
+          provenance: standing.caller.provenance,
+          callerIsMaster: standing.isMaster,
+        }),
+      );
+      if (routed.events.length === 0) return routed.record;
+      yield* persist(draft.missionId, routed.events, [{ _tag: "draft", record: routed.record }]);
+      return routed.record;
+    });
+
+  /**
+   * The owner anywhere; a master for its mission's notes, or for global ones from any mission.
+   * In a mission the writer is recorded as its role, not the bare thread.
+   */
+  const draftNoteWriter = (missionId: MissionId | null, provenance: MissionProvenance) =>
+    missionId === null
+      ? Effect.map(isMasterAnywhere(store, provenance), (isMaster) => ({ isMaster, provenance }))
+      : Effect.map(standingIn(missionId, provenance), ({ standing }) => ({
+          isMaster: standing.isMaster,
+          provenance: standing.caller.provenance,
+        }));
+
   const saveDraftNoteCommand = (input: SaveDraftNoteInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const existing = input.noteId === undefined ? null : yield* need("draft-note", input.noteId);
+      // A note stays where it was written; the writer's standing is checked there.
+      if (existing !== null && existing.missionId !== input.missionId) {
+        return yield* fail(
+          "invalid",
+          `Draft note ${existing.id} belongs to ${existing.missionId ?? "every mission"}; save a new note instead of moving it.`,
+        );
+      }
       if (input.missionId !== null) yield* need("mission", input.missionId);
+      const writer = yield* draftNoteWriter(input.missionId, provenance);
       const saved = yield* fromOutcome(
         saveDraftNote({
           id: input.noteId ?? DraftNoteId.make(yield* newId("draft-note")),
@@ -791,8 +926,11 @@ const make = Effect.gen(function* () {
           scope: input.scope,
           text: input.text,
           active: input.active ?? existing?.active ?? true,
+          // `source` predates master writes: "owner" means a direct write (not a suggestion
+          // or an import). `writtenBy` on the note names who actually wrote it.
           source: existing?.source ?? "owner",
-          provenance,
+          provenance: writer.provenance,
+          callerIsMaster: writer.isMaster,
           notes: yield* allDraftNotes(input.missionId),
           now: yield* now,
         }),
@@ -801,6 +939,126 @@ const make = Effect.gen(function* () {
         { _tag: "draft-note", record: saved.record },
       ]);
       return saved.record;
+    });
+
+  const setDraftNoteActiveCommand = (
+    input: SetDraftNoteActiveInput,
+    provenance: MissionProvenance,
+  ) =>
+    Effect.gen(function* () {
+      const note = yield* need("draft-note", input.draftNoteId);
+      if (note.active === input.active) return note;
+      return yield* saveDraftNoteCommand(
+        {
+          noteId: note.id,
+          missionId: note.missionId,
+          scope: note.scope,
+          text: note.text,
+          active: input.active,
+        },
+        provenance,
+      );
+    });
+
+  const annotateDraftCommand = (input: AnnotateDraftInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const { standing } = yield* standingIn(draft.missionId, provenance);
+      const annotation = yield* cleanAnnotation(annotationOf(draft), input);
+      const annotated = yield* fromOutcome(
+        annotateDraft({
+          draft,
+          annotation,
+          provenance: standing.caller.provenance,
+          callerIsMaster: standing.isMaster,
+        }),
+      );
+      if (annotated.events.length === 0) return annotated.record;
+      yield* persist(draft.missionId, annotated.events, [
+        { _tag: "draft", record: annotated.record },
+      ]);
+      return annotated.record;
+    });
+
+  const openSystemDraftCommand = (input: OpenSystemDraftInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const mission = yield* need("mission", input.missionId);
+      const current = Option.getOrNull(yield* store.get("draft", input.draftId));
+      const annotation = yield* cleanAnnotation({ summary: null, flags: [] }, input);
+      const opened = yield* fromOutcome(
+        openSystemDraft({
+          input,
+          annotation,
+          provenance,
+          current,
+          existing: yield* store.list("draft", {
+            missionId: input.missionId,
+            status: ["pending", "rewrite-requested"],
+          }),
+          route: routeApprover(mission.approvalRouting, {
+            _tag: "draft",
+            channel: input.channel,
+            audience: input.audience,
+            person: input.audience,
+          }),
+          notes: yield* allDraftNotes(input.missionId),
+          now: yield* now,
+        }),
+      );
+      if (opened.events.length === 0) return opened.record;
+      yield* persist(input.missionId, opened.events, [
+        { _tag: "draft", record: opened.record },
+        ...opened.closed.map((record) => ({ _tag: "draft" as const, record })),
+      ]);
+      return opened.record;
+    });
+
+  const closeStaleDraftCommand = (input: CloseStaleDraftInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const closed = yield* fromOutcome(
+        closeStaleDraft({
+          draft,
+          requestedBy: input.requestedBy,
+          reason: input.reason,
+          provenance,
+          now: yield* now,
+        }),
+      );
+      if (closed.events.length === 0) return closed.record;
+      yield* persist(draft.missionId, closed.events, [{ _tag: "draft", record: closed.record }]);
+      return closed.record;
+    });
+
+  const systemDraftDecisionRead = (
+    input: { readonly draftId: DraftId; readonly head: string; readonly requestedBy: string },
+    provenance: MissionProvenance,
+  ) =>
+    Effect.gen(function* () {
+      if (!(provenance._tag === "system" && provenance.component === input.requestedBy)) {
+        return yield* fail("forbidden", `Only ${input.requestedBy} reads its own drafts.`);
+      }
+      const draft = yield* need("draft", input.draftId);
+      if (draft.requestedBy !== input.requestedBy) {
+        return yield* fail(
+          "forbidden",
+          `Draft ${draft.id} was not opened by ${input.requestedBy}.`,
+        );
+      }
+      return systemDraftDecision(draft, input.head);
+    });
+
+  const reportDraftSentCommand = (input: ReportDraftSentInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const reported = yield* fromOutcome(
+        reportDraftSent({ draft, input, provenance, now: yield* now }),
+      );
+      if (reported.events.length === 0) return reported.record;
+      yield* persist(draft.missionId, reported.events, [
+        { _tag: "draft", record: reported.record },
+      ]);
+      return reported.record;
     });
 
   // -------------------------------------------------------------------------
@@ -821,7 +1079,11 @@ const make = Effect.gen(function* () {
     return role === undefined ? null : (role.kind as SuggestionAuthor);
   };
 
-  const proposeSuggestionCommand = (input: ProposeSuggestionInput, provenance: MissionProvenance) =>
+  const proposeSuggestionCommand = (
+    input: ProposeSuggestionInput,
+    provenance: MissionProvenance,
+    options?: ProposeOptions,
+  ) =>
     Effect.gen(function* () {
       if (isOwnerProvenance(provenance)) {
         return yield* fail(
@@ -829,8 +1091,9 @@ const make = Effect.gen(function* () {
           "The owner changes things directly; suggestions come from agents.",
         );
       }
-      const standing =
-        input.missionId === null ? null : (yield* standingIn(input.missionId, provenance)).standing;
+      const inMission =
+        input.missionId === null ? null : yield* standingIn(input.missionId, provenance);
+      const standing = inMission?.standing ?? null;
       const author = suggestionAuthor(standing, provenance);
       if (author === null) {
         return yield* fail(
@@ -838,20 +1101,34 @@ const make = Effect.gen(function* () {
           "Suggestions come from the master, the scribe, the editor, the governor or code checks.",
         );
       }
+      const target = input.target ?? null;
+      const acceptor = acceptorFor({
+        targetKind: input.targetKind,
+        target,
+        author,
+        requested: input.acceptor,
+        masterRoleId:
+          inMission?.cast.mission?.masterRoleId ??
+          inMission?.cast.roles.find((role) => role.kind === "master")?.id ??
+          null,
+      });
+      if (options?.id !== undefined && Option.isSome(yield* store.get("suggestion", options.id))) {
+        return yield* need("suggestion", options.id);
+      }
       const proposed = yield* fromOutcome(
         proposeSuggestion({
-          id: SuggestionId.make(yield* newId("suggestion")),
+          id: options?.id ?? SuggestionId.make(yield* newId("suggestion")),
           proposal: {
             missionId: input.missionId,
             targetKind: input.targetKind,
-            target: input.target ?? null,
+            target,
             title: input.title,
             before: input.before ?? null,
             after: input.after,
             diffText: input.diffText,
             why: input.why,
             evidence: input.evidence,
-            acceptor: input.acceptor ?? "owner",
+            acceptor,
           },
           author,
           caller: standing?.caller ?? bareCaller(provenance),
@@ -865,66 +1142,137 @@ const make = Effect.gen(function* () {
       return proposed.record;
     });
 
-  const decideSuggestionCommand = (input: DecideSuggestionInput, provenance: MissionProvenance) =>
+  /** The caller's standing for a suggestion: a mission's master, or any master for a global one. */
+  const suggestionStanding = (suggestion: Suggestion, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      if (suggestion.missionId !== null) {
+        const { standing } = yield* standingIn(suggestion.missionId, provenance);
+        return { caller: standing.caller, isMaster: standing.isMaster };
+      }
+      return {
+        caller: bareCaller(provenance),
+        isMaster: !isOwnerProvenance(provenance) && (yield* isMasterAnywhere(store, provenance)),
+      };
+    });
+
+  interface PendingApplication {
+    readonly record: Suggestion;
+    readonly application: SuggestionApplication | null;
+    readonly decisionId: MissionEvent["id"];
+    readonly decider: MissionProvenance;
+  }
+
+  /**
+   * Commits the decision. Draft notes are asks' own records and save in the
+   * same commit; other kinds come back for their track's applier.
+   */
+  const decideSuggestionStep = (input: DecideSuggestionInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const suggestion = yield* need("suggestion", input.suggestionId);
-      const standing =
-        suggestion.missionId === null
-          ? null
-          : (yield* standingIn(suggestion.missionId, provenance)).standing;
+      const { caller, isMaster } = yield* suggestionStanding(suggestion, provenance);
       const at = yield* now;
       const decided = yield* fromOutcome(
-        decideSuggestion({
-          suggestion,
-          input,
-          caller: standing?.caller ?? bareCaller(provenance),
-          callerIsMaster: standing?.isMaster ?? false,
-          now: at,
-        }),
+        decideSuggestion({ suggestion, input, caller, callerIsMaster: isMaster, now: at }),
       );
+      const decider = decided.record.decidedBy ?? provenance;
       let record = decided.record;
       const events: ModelEvent[] = [...decided.events];
       const upserts: MissionStoreRecord[] = [];
-      if (decided.apply !== null) {
-        if (decided.apply.targetKind === "draft-note") {
-          const applied = draftNoteFromSuggestion({
-            id: DraftNoteId.make(yield* newId("draft-note")),
-            after: decided.apply.after,
-            target: decided.apply.target,
-            provenance: decided.record.decidedBy ?? provenance,
-            notes: yield* allDraftNotes(suggestion.missionId),
-            now: at,
-          });
-          if (Result.isSuccess(applied)) {
-            record = recordOutcome(record, `Saved draft note ${applied.success.record.id}.`);
-            events.push(...applied.success.events);
-            upserts.push({ _tag: "draft-note", record: applied.success.record });
-          } else if (applied.failure.code === "conflict") {
-            record = recordOutcome(record, "Already covered by an active draft note.");
-          } else {
-            return yield* applied.failure;
-          }
+      let application: SuggestionApplication | null = decided.apply;
+      if (application !== null && application.targetKind === "draft-note") {
+        const applied = draftNoteFromSuggestion({
+          id: DraftNoteId.make(yield* newId("draft-note")),
+          after: application.after,
+          target: application.target,
+          suggestionMissionId: suggestion.missionId,
+          provenance: decider,
+          callerIsMaster: isMaster,
+          notes: yield* allDraftNotes(suggestion.missionId),
+          now: at,
+        });
+        application = null;
+        if (Result.isSuccess(applied)) {
+          record = recordOutcome(record, `Saved draft note ${applied.success.record.id}.`);
+          events.push(...applied.success.events);
+          upserts.push({ _tag: "draft-note", record: applied.success.record });
+        } else if (applied.failure.code === "conflict") {
+          record = recordOutcome(record, "Already covered by an active draft note.");
         } else {
-          const outcome = yield* appliers.apply(
-            decided.apply,
-            decided.record.decidedBy ?? provenance,
-          );
-          record = recordOutcome(record, outcome);
+          record = recordOutcome(record, `Not applied: ${applied.failure.detail}`);
         }
       }
-      yield* persist(suggestion.missionId, events, [{ _tag: "suggestion", record }, ...upserts]);
+      const committed = yield* persist(suggestion.missionId, events, [
+        { _tag: "suggestion", record },
+        ...upserts,
+      ]);
+      const pending: PendingApplication = {
+        record,
+        application,
+        decisionId: committed.id,
+        decider,
+      };
+      return pending;
+    });
+
+  /** Records what the applier did, as an event following the decision. */
+  const recordApplied = (pending: PendingApplication, outcome: string, applied: boolean) =>
+    Effect.gen(function* () {
+      const current = yield* need("suggestion", pending.record.id);
+      const record = recordOutcome(current, outcome);
+      yield* store.commit({
+        event: {
+          missionId: record.missionId ?? GLOBAL_TIMELINE,
+          kind: "suggestion.applied",
+          actor: { _tag: "system", component: "asks" },
+          provenance: pending.decider,
+          summary: clipSummary(`${applied ? "Applied" : "Not applied"}: ${record.title}`),
+          subject: { kind: "suggestion", id: record.id, label: record.title },
+          causedBy: pending.decisionId,
+          payload: { outcome, applied, targetKind: record.targetKind },
+        },
+        upserts: [{ _tag: "suggestion", record }],
+      });
       return record;
     });
+
+  /**
+   * Decide, then apply outside the asks lock (appliers run other tracks'
+   * services, which may call back into asks). Every event the applier's
+   * service commits follows from the decision event, whose subject is the
+   * suggestion. An applier refusal is an outcome, not a failed decision.
+   *
+   * Once the decision commits, applying and recording run to the end even if
+   * the caller goes away, and a crash in the applier is recorded too, so an
+   * accepted suggestion never sits without an outcome.
+   */
+  const decideSuggestionCommand = (input: DecideSuggestionInput, provenance: MissionProvenance) =>
+    Effect.uninterruptible(
+      Effect.gen(function* () {
+        const pending = yield* serialized(decideSuggestionStep(input, provenance));
+        if (pending.application === null) return pending.record;
+        const result = yield* appliers.apply(pending.application, pending.decider).pipe(
+          Effect.map((outcome) => ({ outcome, applied: outcome.startsWith("Applied") })),
+          Effect.catch((error: MissionError) =>
+            Effect.succeed({ outcome: `Not applied: ${error.detail}`, applied: false }),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.as(Effect.logWarning("missions: suggestion applier crashed", cause), {
+              outcome: "Not applied: the applier failed unexpectedly.",
+              applied: false,
+            }),
+          ),
+          Effect.provideService(MissionStore.MissionCause, pending.decisionId),
+        );
+        return yield* serialized(recordApplied(pending, result.outcome, result.applied));
+      }),
+    );
 
   const reopenSuggestionCommand = (input: ReopenSuggestionInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const suggestion = yield* need("suggestion", input.suggestionId);
-      const callerIsMaster =
-        suggestion.missionId === null
-          ? false
-          : (yield* standingIn(suggestion.missionId, provenance)).standing.isMaster;
+      const { caller, isMaster } = yield* suggestionStanding(suggestion, provenance);
       const reopened = yield* fromOutcome(
-        reopenSuggestion(suggestion, provenance, yield* now, callerIsMaster),
+        reopenSuggestion(suggestion, caller.provenance, yield* now, isMaster),
       );
       yield* persist(suggestion.missionId, reopened.events, [
         { _tag: "suggestion", record: reopened.record },
@@ -938,6 +1286,7 @@ const make = Effect.gen(function* () {
   const forkOpening = (
     fork: MissionFork,
     question: string | undefined,
+    provenance: MissionProvenance,
   ): {
     readonly text: string;
     readonly asOwner: boolean;
@@ -956,7 +1305,8 @@ const make = Effect.gen(function* () {
         };
       case "owner-question":
       case "discuss":
-        return asked.length > 0 ? { asOwner: true, text: asked } : null;
+        // Only the owner's own words reach the fork as the owner.
+        return asked.length > 0 ? { asOwner: isOwnerProvenance(provenance), text: asked } : null;
     }
   };
 
@@ -979,6 +1329,7 @@ const make = Effect.gen(function* () {
           origin,
           caller: standing.caller,
           masterThreadId: standing.masterThreadId,
+          callerIsMaster: standing.isMaster,
         }),
       );
       const id = ForkId.make(yield* newId("fork"));
@@ -994,13 +1345,15 @@ const make = Effect.gen(function* () {
           origin,
           caller: standing.caller,
           masterThreadId,
+          callerIsMaster: standing.isMaster,
           id,
           forkThreadId,
+          question: input.question,
           now: yield* now,
         }),
       );
       yield* persist(input.missionId, opened.events, [{ _tag: "fork", record: opened.record }]);
-      const opening = forkOpening(opened.record, input.question);
+      const opening = forkOpening(opened.record, input.question, provenance);
       const delivered =
         opening === null
           ? false
@@ -1049,12 +1402,14 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const fork = yield* need("fork", input.forkId);
       const at = yield* now;
+      const { standing } = yield* standingIn(fork.missionId, provenance);
       switch (input.action) {
         case "commits-mission": {
           const closing = yield* fromOutcome(
             markForkCommits({
               fork,
-              provenance,
+              provenance: standing.caller.provenance,
+              callerIsMaster: standing.isMaster,
               noteId: NoteId.make(yield* newId("note")),
               now: at,
             }),
@@ -1062,7 +1417,6 @@ const make = Effect.gen(function* () {
           return yield* finishFork(fork, closing, `fork:${fork.id}:commits:${at}`);
         }
         case "archive": {
-          const { standing } = yield* standingIn(fork.missionId, provenance);
           const mayArchive =
             isOwnerProvenance(provenance) ||
             standing.isMaster ||
@@ -1080,7 +1434,9 @@ const make = Effect.gen(function* () {
           return { fork: archived.record, delivered: false, note: null };
         }
         case "reopen": {
-          const reopened = yield* fromOutcome(reopenFork(fork, provenance));
+          const reopened = yield* fromOutcome(
+            reopenFork(fork, standing.caller.provenance, standing.isMaster),
+          );
           yield* persist(fork.missionId, reopened.events, [
             { _tag: "fork", record: reopened.record },
           ]);
@@ -1228,10 +1584,19 @@ const make = Effect.gen(function* () {
     reviseDraft: (input, provenance) => serialized(reviseDraftCommand(input, provenance)),
     decideDraft: (input, provenance) => serialized(decideDraftCommand(input, provenance)),
     reopenDraft: (input, provenance) => serialized(reopenDraftCommand(input, provenance)),
+    routeDraft: (input, provenance) => serialized(routeDraftCommand(input, provenance)),
     saveDraftNote: (input, provenance) => serialized(saveDraftNoteCommand(input, provenance)),
-    proposeSuggestion: (input, provenance) =>
-      serialized(proposeSuggestionCommand(input, provenance)),
-    decideSuggestion: (input, provenance) => serialized(decideSuggestionCommand(input, provenance)),
+    setDraftNoteActive: (input, provenance) =>
+      serialized(setDraftNoteActiveCommand(input, provenance)),
+    annotateDraft: (input, provenance) => serialized(annotateDraftCommand(input, provenance)),
+    openSystemDraft: (input, provenance) => serialized(openSystemDraftCommand(input, provenance)),
+    closeStaleDraft: (input, provenance) => serialized(closeStaleDraftCommand(input, provenance)),
+    reportDraftSent: (input, provenance) => serialized(reportDraftSentCommand(input, provenance)),
+    systemDraftDecision: systemDraftDecisionRead,
+    proposeSuggestion: (input, provenance, options) =>
+      serialized(proposeSuggestionCommand(input, provenance, options)),
+    // Serializes its own steps: the applier runs outside the lock.
+    decideSuggestion: decideSuggestionCommand,
     reopenSuggestion: (input, provenance) => serialized(reopenSuggestionCommand(input, provenance)),
     startFork: (input, provenance) => serialized(startForkCommand(input, provenance)),
     closeFork: (input, provenance) => serialized(closeForkCommand(input, provenance)),
@@ -1247,12 +1612,13 @@ export const layer = Layer.effect(AsksService, make);
  * The service with this server's ports: iMessage lookups against the bridge
  * and Moni's chat, forks and deliveries through thread management, a direct
  * queued line to the asker until the router's wakes merge, and typed seams
- * for rooms (router) and suggestion targets owned by other tracks.
+ * for rooms (router). Suggestion appliers register into the registry from
+ * the tracks that own them (see wiring.ts).
  */
 export const layerLive = layer.pipe(
   Layer.provideMerge(
     // ardud missions: router (AsksRooms comes from the router in missions/layer.ts)
-    Layer.mergeAll(Inbound.layer, Ports.signalsDeliver, Ports.appliersPending).pipe(
+    Layer.mergeAll(Inbound.layer, Ports.signalsDeliver, Ports.applierRegistry).pipe(
       Layer.provideMerge(Ports.threadsLayer),
     ),
   ),

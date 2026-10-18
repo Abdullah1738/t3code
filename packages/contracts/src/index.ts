@@ -70,5 +70,7 @@ export * from "./ardud/board.ts";
 export * from "./ardud/contextReset.ts";
 export * from "./ardud/missions.ts";
 export * from "./ardud/missionsPolicyRpc.ts";
+// ardud missions: asks
+export * from "./ardud/missionsAsksRpc.ts";
 export * from "./secretRequest.ts";
 export * from "./clientRpcPermissions.ts";

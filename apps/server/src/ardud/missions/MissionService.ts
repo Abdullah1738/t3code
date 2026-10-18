@@ -1,5 +1,6 @@
 import {
   MissionError,
+  type AnnotateApprovalInput,
   type Approval,
   type ApprovalStatus,
   type CloseStaleApprovalInput,
@@ -200,6 +201,9 @@ export class MissionService extends Context.Service<
     readonly routeApproval: Write<RouteApprovalInput>;
     /** Owner or master: replace the mission's approval routing table. */
     readonly setApprovalRouting: Write<SetApprovalRoutingInput>;
+    // ardud missions: asks
+    /** Owner or master: set the summary and flag chips on a pending approval. */
+    readonly annotateApproval: Write<AnnotateApprovalInput>;
   }
 >()("t3/ardud/missions/MissionService") {}
 

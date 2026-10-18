@@ -1,4 +1,4 @@
-import { ApprovalId, RoleId, type Approval } from "@t3tools/contracts";
+import { ApprovalId, PoolId, RoleId, type Approval } from "@t3tools/contracts";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -6,16 +6,27 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import { routeApprover } from "../core/approvals.ts";
+import { PolicyService } from "../policy/PolicyService.ts";
+import { makePorts, testLayer } from "../policy/testing.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import {
   applyImport,
+  applyPools,
   diffImport,
+  diffPools,
   failingWrite,
   memoryRouterSink,
   readPositionId,
 } from "./apply.ts";
 import { coordActorFor, HAIKU_XHIGH, OPUS_XHIGH, parseCoordBodyText } from "./coordIds.ts";
-import { awaitingStaleReason, buildImportPlan, crwApprovalId, workLinks } from "./mapping.ts";
+import {
+  awaitingStaleReason,
+  buildImportPlan,
+  crwApprovalId,
+  reviewPoolId,
+  workLinks,
+} from "./mapping.ts";
 import type { ImportSources } from "./readers.ts";
 import { countChecks } from "./report.ts";
 import { parseDeferred, parseLanePulse, parseLaneRoster, parseStandingRules } from "./sources.ts";
@@ -159,6 +170,8 @@ const sources = (crwState: { prState?: string; ticketState?: string } = {}): Imp
     config: {
       excludedRepos: ["Equicom-Crypto/Crpko-Marketing-Site"],
       activeStates: ["In Review", "Code OK - Pending"],
+      maxReviewsPerTick: 6,
+      maxReviewsPerDay: 200,
     },
     syncedAt: T0 + 200,
   },
@@ -303,7 +316,12 @@ describe("buildImportPlan", () => {
 });
 
 describe("awaitingStaleReason", () => {
-  const config = { excludedRepos: ["o/site"], activeStates: ["In Review"] };
+  const config = {
+    excludedRepos: ["o/site"],
+    activeStates: ["In Review"],
+    maxReviewsPerTick: null,
+    maxReviewsPerDay: null,
+  };
   const a = (over: object) => ({
     prKey: "o/r#1",
     awaitingSince: null,
@@ -484,6 +502,94 @@ it.layer(TestLayer)("applyImport with a failing router", (it) => {
       const retry = yield* applyImport(plan(), router.sink);
       assert.strictEqual(retry.created.room, 2);
       assert.strictEqual(retry.created.mission, undefined);
+    }),
+  );
+});
+
+describe("approval routing and review pools", () => {
+  it("routes every draft and every crw approval to the owner, as data", () => {
+    const routes = plan().core.mission.approvalRouting ?? [];
+    expect(routes.map((r) => [r.id, r.match._tag, r.approver])).toEqual([
+      ["crpko:route:drafts", "draft", "owner"],
+      ["crpko:route:approvals", "approval", "owner"],
+    ]);
+    const draft = {
+      _tag: "draft",
+      channel: "github",
+      audience: "PR author",
+      person: null,
+    } as const;
+    expect(routeApprover(routes, draft)).toEqual({
+      approver: "owner",
+      routeId: "crpko:route:drafts",
+    });
+    const approval = { _tag: "approval", kind: "merge", repository: "Equicom-Crypto/x" } as const;
+    expect(routeApprover(routes, approval)).toEqual({
+      approver: "owner",
+      routeId: "crpko:route:approvals",
+    });
+  });
+
+  it("plans no review pool unless asked, and sizes each kind from crw's caps", () => {
+    expect(plan().policy.pools).toEqual([]);
+    const both = buildImportPlan(sources(), {
+      missionId: "crpko",
+      reviewPools: ["lease", "budget"],
+    });
+    expect(
+      both.policy.pools.map((p) => [p.poolId, p.kind, p.backend, p.capacity, p.scope]),
+    ).toEqual([
+      [
+        "crpko:pool:review-day",
+        "budget",
+        "crw-config",
+        200,
+        { _tag: "mission", missionId: "crpko" },
+      ],
+      ["crpko:pool:review-slots", "lease", "native", 6, { _tag: "mission", missionId: "crpko" }],
+    ]);
+    const s = sources();
+    const noCaps = buildImportPlan(
+      { ...s, crw: { ...s.crw!, config: { ...s.crw!.config, maxReviewsPerTick: null } } },
+      { missionId: "crpko", reviewPools: ["lease"] },
+    );
+    expect(noCaps.policy.pools).toEqual([]);
+    expect(noCaps.warnings).toContain(
+      "review pool (lease) not planned: crw config.json has no max_reviews_per_tick",
+    );
+  });
+});
+
+const policyLayer = testLayer(makePorts().layer);
+
+it.layer(policyLayer)("applyPools", (it) => {
+  it.effect("creates the review pool through policy once, never touching an existing one", () =>
+    Effect.gen(function* () {
+      const policy = yield* PolicyService;
+      const p = buildImportPlan(sources(), { missionId: "crpko", reviewPools: ["lease"] });
+      yield* applyImport(p, null);
+
+      expect((yield* diffPools(p)).create).toBe(1);
+      const first = yield* applyPools(p);
+      expect(first.created).toBe(1);
+      const view = (yield* policy.pools({ missionId: p.missionId })).pools.find(
+        (v) => v.pool.id === reviewPoolId("crpko", "lease"),
+      );
+      expect(view?.pool.capacity).toBe(6);
+      expect(view?.pool.enforcement).toBe("enforced");
+
+      // The master moves the capacity; a re-import reports it and leaves it.
+      yield* policy.setPoolCapacity(
+        { _tag: "system", component: "test" },
+        { poolId: PoolId.make("crpko:pool:review-slots"), capacity: 2 },
+      );
+      const again = yield* applyPools(p);
+      expect(again.created).toBe(0);
+      expect(again.diff.differIds).toEqual(["crpko:pool:review-slots"]);
+      const kept = (yield* policy.pools({ missionId: p.missionId })).pools.find(
+        (v) => v.pool.id === "crpko:pool:review-slots",
+      );
+      expect(kept?.pool.capacity).toBe(2);
     }),
   );
 });

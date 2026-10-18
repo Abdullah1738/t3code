@@ -1,13 +1,14 @@
-import type {
-  ForkId,
-  MissionFork,
-  MissionId,
-  MissionLink,
-  MissionProvenance,
-  MissionRecordRef,
-  Note,
-  NoteId,
-  ThreadId,
+import {
+  isOwnerProvenance,
+  type ForkId,
+  type MissionFork,
+  type MissionId,
+  type MissionLink,
+  type MissionProvenance,
+  type MissionRecordRef,
+  type Note,
+  type NoteId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Result from "effect/Result";
 
@@ -76,24 +77,25 @@ export interface StartForkCommand {
   readonly caller: MissionCaller;
   /** Threads that hold the master role; the fork always starts from one of them. */
   readonly masterThreadId: ThreadId | null;
+  readonly callerIsMaster: boolean;
 }
 
 /**
- * Who may fork the master: the owner for Discuss and his own questions;
- * the owner, master or an answerer for dev questions. Returns the thread to fork.
+ * Who may fork the master: owner questions are the owner's own words, so only
+ * he opens one. The owner or the master opens a Discuss fork (the master's
+ * opening is never delivered as the owner); dev questions come from the
+ * owner, the master or an answerer. Returns the thread to fork.
  */
 export const checkStartFork = (command: StartForkCommand): Outcome<ThreadId> => {
   if (command.masterThreadId === null) {
     return refuse("not-found", "This mission has no master thread to fork.");
   }
   const owner = callerIsOwner(command.caller);
-  if ((command.kind === "discuss" || command.kind === "owner-question") && !owner) {
-    return refuse(
-      "provenance-required",
-      command.kind === "discuss"
-        ? "Only the owner opens a Discuss fork."
-        : "Owner questions come from the owner.",
-    );
+  if (command.kind === "owner-question" && !owner) {
+    return refuse("provenance-required", "Owner questions come from the owner.");
+  }
+  if (command.kind === "discuss" && !owner && !command.callerIsMaster) {
+    return refuse("forbidden", "Only the owner or the mission's master opens a Discuss fork.");
   }
   return ok(command.masterThreadId);
 };
@@ -101,6 +103,8 @@ export const checkStartFork = (command: StartForkCommand): Outcome<ThreadId> => 
 export interface OpenForkCommand extends StartForkCommand {
   readonly id: ForkId;
   readonly forkThreadId: ThreadId;
+  /** What the fork asks, as the owner or master typed it. */
+  readonly question?: string | undefined;
   readonly now: string;
 }
 
@@ -119,6 +123,7 @@ export const openFork = (command: OpenForkCommand): Outcome<Transition<MissionFo
     commitsMission: false,
     createdAt: command.now,
     closedAt: null,
+    question: command.question?.trim() || null,
   };
   return ok({
     record,
@@ -127,7 +132,7 @@ export const openFork = (command: OpenForkCommand): Outcome<Transition<MissionFo
         kind: "fork.opened",
         actor: actorOf(command.caller.provenance),
         provenance: command.caller.provenance,
-        summary: clipSummary(forkTitle(command.kind, command.origin)),
+        summary: clipSummary(forkTitle(command.kind, command.origin, command.question)),
         subject: forkRef(record),
         payload: { forkThreadId: command.forkThreadId, origin: command.origin },
       },
@@ -186,7 +191,7 @@ export interface ForkClosing extends Transition<MissionFork> {
 export interface CloseForkCommand {
   readonly fork: MissionFork;
   readonly summaryLine: string;
-  /** Only the owner can say a fork commits the mission. */
+  /** The owner or the master can say a fork commits the mission. */
   readonly commitsMission: boolean;
   readonly caller: MissionCaller;
   readonly noteId: NoteId;
@@ -215,7 +220,8 @@ const commitNote = (fork: MissionFork, id: NoteId, now: string): Note => ({
 
 /**
  * End a fork with its one-line summary. The fork's own thread, the master or
- * the owner can close it; only the owner can mark it as committing the mission.
+ * the owner can close it; the owner or the master can mark it as committing
+ * the mission, and the timeline names whoever did.
  */
 export const closeFork = (command: CloseForkCommand): Outcome<ForkClosing> => {
   const { fork, caller } = command;
@@ -227,8 +233,8 @@ export const closeFork = (command: CloseForkCommand): Outcome<ForkClosing> => {
   if (!owner && !inFork && !isMaster) {
     return refuse("forbidden", "Only the fork, its master or the owner can close it.");
   }
-  if (command.commitsMission && !owner) {
-    return refuse("provenance-required", "Only the owner can say a fork commits the mission.");
+  if (command.commitsMission && !owner && !isMaster) {
+    return refuse("forbidden", "Only the owner or the master says a fork commits the mission.");
   }
   const line = oneLine(command.summaryLine);
   if (Result.isFailure(line)) return Result.fail(line.failure);
@@ -256,23 +262,26 @@ export const closeFork = (command: CloseForkCommand): Outcome<ForkClosing> => {
   });
 };
 
-/** The owner says an answered fork commits the mission after all. */
+/** The owner or the master says an answered fork commits the mission after all. */
 export const markForkCommits = (command: {
   readonly fork: MissionFork;
   readonly provenance: MissionProvenance;
+  readonly callerIsMaster: boolean;
   readonly noteId: NoteId;
   readonly now: string;
 }): Outcome<ForkClosing> => {
   const { fork, provenance } = command;
-  if (provenance._tag !== "owner-app" && provenance._tag !== "owner-imessage") {
-    return refuse("provenance-required", "Only the owner can say a fork commits the mission.");
+  if (!isOwnerProvenance(provenance) && !command.callerIsMaster) {
+    return refuse("forbidden", "Only the owner or the master says a fork commits the mission.");
   }
   if (fork.status === "open") return refuse("conflict", "Close the fork with its summary first.");
   if (fork.commitsMission) return refuse("conflict", "This fork already commits the mission.");
   const record: MissionFork = { ...fork, commitsMission: true };
   return ok({
     record,
-    delivery: deliveryFor(record, provenance),
+    // The summary line came from whoever closed the fork, so marking it later
+    // never passes it to the master as the owner's words.
+    delivery: { ...deliveryFor(record, provenance), asOwner: false },
     note: commitNote(record, command.noteId, command.now),
     events: [
       {
@@ -287,7 +296,7 @@ export const markForkCommits = (command: {
   });
 };
 
-/** Answered forks are archived; the owner can reopen one to keep talking. */
+/** Answered forks are archived; the owner or the master can reopen one to keep talking. */
 export const archiveFork = (
   fork: MissionFork,
   provenance: MissionProvenance,
@@ -312,9 +321,10 @@ export const archiveFork = (
 export const reopenFork = (
   fork: MissionFork,
   provenance: MissionProvenance,
+  callerIsMaster: boolean,
 ): Outcome<Transition<MissionFork>> => {
-  if (provenance._tag !== "owner-app" && provenance._tag !== "owner-imessage") {
-    return refuse("provenance-required", "Only the owner reopens a fork.");
+  if (!isOwnerProvenance(provenance) && !callerIsMaster) {
+    return refuse("forbidden", "Only the owner or the mission's master reopens a fork.");
   }
   if (fork.status === "open") return refuse("conflict", "The fork is already open.");
   const record: MissionFork = { ...fork, status: "open", closedAt: null };

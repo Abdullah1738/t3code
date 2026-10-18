@@ -88,6 +88,8 @@ const submit = (overrides: Partial<SubmitDraftCommand> = {}) =>
     caller: writer,
     notes,
     existing: [],
+    route: { approver: "owner", routeId: null },
+    writtenBy: { roleId: writerRole, model: null },
     now,
     ...overrides,
   });
@@ -98,8 +100,9 @@ const approveEdited = (draft: Draft, editedText: string, at: string) =>
   Result.getOrThrow(
     decideDraft({
       draft,
-      input: { draftId: draft.id, action: "approve", editedText },
+      input: { draftId: draft.id, action: "approve", editedText, revision: draft.revision ?? 0 },
       provenance: ownerApp,
+      callerIsMaster: false,
       now: at,
     }),
   );
@@ -129,9 +132,19 @@ describe("drafts", () => {
       draft,
       input: { draftId: draft.id, action: "approve" },
       provenance: writer.provenance,
+      callerIsMaster: false,
       now,
     });
     expect(Result.isFailure(agentTry) && agentTry.failure.code).toBe("provenance-required");
+    // In the app an approval names the revision the owner read.
+    const blind = decideDraft({
+      draft,
+      input: { draftId: draft.id, action: "approve" },
+      provenance: ownerApp,
+      callerIsMaster: false,
+      now,
+    });
+    expect(Result.isFailure(blind) && blind.failure.code).toBe("invalid");
     const decision = approveEdited(draft, "The fix is merged.", now);
     expect(decision.record.status).toBe("approved");
     expect(decision.record.approvedText).toBe("The fix is merged.");
@@ -145,6 +158,7 @@ describe("drafts", () => {
       draft: decision.record,
       input: { draftId: draft.id, action: "drop" },
       provenance: ownerApp,
+      callerIsMaster: false,
       now,
     });
     expect(Result.isFailure(again) && again.failure.code).toBe("conflict");
@@ -161,6 +175,7 @@ describe("drafts", () => {
       draft,
       input: { draftId: draft.id, action: "approve", inboundId: "guid-2" },
       provenance,
+      callerIsMaster: false,
       now,
     });
     expect(Result.isFailure(mismatch) && mismatch.failure.code).toBe("provenance-invalid");
@@ -168,6 +183,7 @@ describe("drafts", () => {
       draft,
       input: { draftId: draft.id, action: "approve", inboundId: "guid-1" },
       provenance,
+      callerIsMaster: false,
       now,
     });
     expect(Result.isSuccess(okDecision)).toBe(true);
@@ -179,6 +195,7 @@ describe("drafts", () => {
       draft,
       input: { draftId: draft.id, action: "rewrite" },
       provenance: ownerApp,
+      callerIsMaster: false,
       now,
     });
     expect(Result.isFailure(noNote) && noNote.failure.code).toBe("invalid");
@@ -187,6 +204,7 @@ describe("drafts", () => {
         draft,
         input: { draftId: draft.id, action: "rewrite", rewriteNote: "Mention the PR" },
         provenance: ownerApp,
+        callerIsMaster: false,
         now,
       }),
     );
@@ -205,9 +223,9 @@ describe("drafts", () => {
     expect(revised.record.status).toBe("pending");
     const approved = approveEdited(revised.record, "Merged in #12.", now).record;
     expect(approved.approvedText).toBeNull();
-    const reopened = Result.getOrThrow(reopenDraft(approved, ownerApp, now));
+    const reopened = Result.getOrThrow(reopenDraft(approved, ownerApp, false, now));
     expect(reopened.record.status).toBe("pending");
-    expect(Result.isFailure(reopenDraft(approved, writer.provenance, now))).toBe(true);
+    expect(Result.isFailure(reopenDraft(approved, writer.provenance, false, now))).toBe(true);
   });
 
   it("examples prefer the same person and use the approved text", () => {
@@ -224,6 +242,31 @@ describe("drafts", () => {
     expect(examples.map((example) => example.text)).toEqual(["Merged.", "Done."]);
     expect(examples[0]?.edited).toBe(true);
   });
+
+  it("R5: a master's approvals never teach writers the owner's voice", () => {
+    const masterProvenance: MissionProvenance = {
+      _tag: "agent",
+      threadId: ThreadId.make("t-master"),
+      roleId: RoleId.make("role-master"),
+    };
+    const draft: Draft = { ...pending(), approver: "master" };
+    const byMaster = Result.getOrThrow(
+      decideDraft({
+        draft,
+        input: {
+          draftId: draft.id,
+          action: "approve",
+          editedText: "Merged, master style.",
+          revision: 0,
+        },
+        provenance: masterProvenance,
+        callerIsMaster: true,
+        now: "2026-10-17T11:00:00.000Z",
+      }),
+    ).record;
+    expect(byMaster.status).toBe("approved");
+    expect(draftExamples({ missionId, channel: "cliq", audience: "Sami" }, [byMaster])).toEqual([]);
+  });
 });
 
 describe("draft notes", () => {
@@ -236,6 +279,7 @@ describe("draft notes", () => {
       text: "No opener.",
       active: true,
       source: "owner" as const,
+      callerIsMaster: false,
       notes,
       now,
     };
@@ -338,6 +382,8 @@ describe("edit learning", () => {
         after: decision.apply?.after,
         target: decision.apply?.target ?? null,
         provenance: ownerApp,
+        callerIsMaster: false,
+        suggestionMissionId: open.missionId,
         notes: [],
         now,
       }),
@@ -348,6 +394,8 @@ describe("edit learning", () => {
       after: decision.apply?.after,
       target: null,
       provenance: editorCaller.provenance,
+      callerIsMaster: false,
+      suggestionMissionId: open.missionId,
       notes: [],
       now,
     });

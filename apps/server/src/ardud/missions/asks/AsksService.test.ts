@@ -84,7 +84,7 @@ describe("AsksService", () => {
   it.effect("takes an iMessage answer only with a verified inbound from the owner or Moni", () => {
     const { layer } = harness([
       { id: "spc-msg-1", chat: "owner", text: "Go offline window", receivedAt: Date.parse(at) },
-      { id: "moni-guid-1", chat: "moni", text: "online is fine", receivedAt: Date.parse(at) },
+      { id: "moni-guid-1", chat: "moni", text: "online please", receivedAt: Date.parse(at) },
       { id: "wake:abc", chat: "owner", text: "offline window", receivedAt: Date.parse(at) },
     ]);
     return Effect.gen(function* () {
@@ -233,6 +233,7 @@ describe("AsksService", () => {
             draftId: draft.id,
             action: "approve",
             editedText: `Update ${index}: the fix is merged.`,
+            revision: 0,
           },
           ownerApp,
         );
@@ -326,6 +327,14 @@ describe("AsksService", () => {
         yield* failureCode(
           asks.startFork({ missionId, kind: "discuss", origin }, agent(laneThread)),
         ),
+      ).toBe("forbidden");
+      expect(
+        yield* failureCode(
+          asks.startFork(
+            { missionId, kind: "owner-question", origin, question: "Ship today?" },
+            agent(masterThread),
+          ),
+        ),
       ).toBe("provenance-required");
 
       const started = yield* asks.startFork(
@@ -348,7 +357,7 @@ describe("AsksService", () => {
             forkThread,
           ),
         ),
-      ).toBe("provenance-required");
+      ).toBe("forbidden");
       const closed = yield* asks.closeFork(
         { forkId: started.fork.id, summaryLine: "Pause the API lane until Monday." },
         forkThread,

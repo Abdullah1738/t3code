@@ -42,18 +42,23 @@ export const EDITOR_LIMITS = {
   candidates: 30,
 } as const;
 
-/** Who accepts a suggestion, by what it changes. Owner-owned things go to the owner. */
+/**
+ * Whose inbox a suggestion lands in, by what it changes (plan 1.7 as amended
+ * 17 Oct): the master decides its control surface, the owner decides draft
+ * notes and rules (his words). Asks has the final say when it stores the
+ * suggestion: one about the master's own role goes to the owner as well.
+ */
 export const ACCEPTOR: Record<SuggestionTargetKind, "owner" | "master"> = {
   rule: "owner",
-  "role-model": "owner",
-  "review-policy": "owner",
-  "criticality-guide": "owner",
-  pool: "owner",
-  schedule: "owner",
+  "draft-note": "owner",
+  "role-model": "master",
+  "review-policy": "master",
+  "criticality-guide": "master",
+  pool: "master",
+  schedule: "master",
   "sub-mission-order": "master",
   role: "master",
   lane: "master",
-  "draft-note": "master",
 };
 
 /** The record kind a suggestion may point at, per target kind. */

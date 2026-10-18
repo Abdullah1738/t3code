@@ -148,6 +148,33 @@ export interface ProposeSuggestionCommand {
   readonly now: string;
 }
 
+/**
+ * Whose inbox a suggestion lands in (plan 1.7 as amended 17 Oct). The master
+ * decides anything in its control surface; the owner decides draft notes,
+ * rules (his own words) and anything about the master's own behaviour,
+ * including the master's suggestions about itself. Either may decide any
+ * suggestion; this only picks who is asked.
+ */
+export const acceptorFor = (input: {
+  readonly targetKind: SuggestionTargetKind;
+  readonly target: MissionRecordRef | null;
+  readonly author: SuggestionAuthor;
+  /** What the author asked for, if anything. Owner requests always stand. */
+  readonly requested: SuggestionAcceptor | undefined;
+  /** The mission's master role, when the suggestion belongs to a mission. */
+  readonly masterRoleId: string | null;
+}): SuggestionAcceptor => {
+  if (input.requested === "owner") return "owner";
+  if (input.author === "master") return "owner";
+  if (input.targetKind === "draft-note" || input.targetKind === "rule") return "owner";
+  const aboutMaster =
+    (input.targetKind === "role" || input.targetKind === "role-model") &&
+    input.target !== null &&
+    input.masterRoleId !== null &&
+    input.target.id === input.masterRoleId;
+  return aboutMaster ? "owner" : "master";
+};
+
 export const proposeSuggestion = (
   command: ProposeSuggestionCommand,
 ): Outcome<Transition<Suggestion>> => {
@@ -353,7 +380,7 @@ export const reopenSuggestion = (
     events: [
       {
         kind: "suggestion.opened",
-        actor: { _tag: "owner" },
+        actor: actorOf(provenance),
         provenance,
         summary: clipSummary(`Reopened suggestion: ${suggestion.title}`),
         subject: suggestionRef(record),

@@ -240,6 +240,21 @@ const handlers = {
   mission_draft_approve: McpToolAccess.actsAsCaller((input) =>
     withCaller((asks, provenance) => asks.decideDraft(input, provenance)),
   ),
+  mission_draft_route: McpToolAccess.actsAsCaller((input) =>
+    withCaller((asks, provenance) =>
+      asks.routeDraft(input, provenance).pipe(Effect.map((draft) => ({ draft }))),
+    ),
+  ),
+  mission_draft_annotate: McpToolAccess.actsAsCaller((input) =>
+    withCaller((asks, provenance) =>
+      asks.annotateDraft(input, provenance).pipe(Effect.map((draft) => ({ draft }))),
+    ),
+  ),
+  mission_draft_note: McpToolAccess.actsAsCaller((input) =>
+    withCaller((asks, provenance) =>
+      asks.saveDraftNote(input, provenance).pipe(Effect.map((note) => ({ note }))),
+    ),
+  ),
   mission_post: McpToolAccess.actsAsCaller((input) =>
     withCaller((asks, provenance) =>
       asks.post(input, provenance).pipe(Effect.map((message) => ({ message }))),
@@ -273,8 +288,25 @@ const handlers = {
   mission_fork_close: McpToolAccess.actsAsCaller((input) =>
     withCaller((asks, provenance) =>
       asks
-        .closeFork({ forkId: input.forkId, summaryLine: input.summaryLine }, provenance)
+        .closeFork(input, provenance)
         .pipe(Effect.map(({ fork, delivered }) => ({ fork, delivered }))),
+    ),
+  ),
+  mission_fork_update: McpToolAccess.actsAsCaller((input) =>
+    withCaller((asks, provenance) =>
+      asks
+        .updateFork(input, provenance)
+        .pipe(Effect.map(({ fork, delivered }) => ({ fork, delivered }))),
+    ),
+  ),
+  mission_draft_reopen: McpToolAccess.actsAsCaller((input) =>
+    withCaller((asks, provenance) =>
+      asks.reopenDraft(input, provenance).pipe(Effect.map((draft) => ({ draft }))),
+    ),
+  ),
+  mission_suggestion_reopen: McpToolAccess.actsAsCaller((input) =>
+    withCaller((asks, provenance) =>
+      asks.reopenSuggestion(input, provenance).pipe(Effect.map((suggestion) => ({ suggestion }))),
     ),
   ),
   mission_note_ack: McpToolAccess.actsAsCaller((input) =>
@@ -394,6 +426,15 @@ const handlers = {
         approvalId: input.approvalId,
         approver: input.approver,
         reason: input.reason,
+      }),
+    ),
+  ),
+  mission_approval_annotate: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.annotateApproval(provenance, {
+        approvalId: input.approvalId,
+        ...(input.summary === undefined ? {} : { summary: input.summary }),
+        ...(input.flags === undefined ? {} : { flags: input.flags }),
       }),
     ),
   ),

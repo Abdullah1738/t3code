@@ -208,7 +208,7 @@ describe("governor", () => {
     expect(decision.suggestions).toHaveLength(1);
     expect(decision.suggestions[0]).toMatchObject({
       author: "governor",
-      acceptor: "owner",
+      acceptor: "master",
       targetKind: "lane",
       target: { kind: "lane", id: "release" },
       status: "open",

@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AuthSessionId } from "@t3tools/contracts";
+import { AuthSessionId, DraftId } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -18,6 +18,7 @@ import {
   harness,
   masterThread,
   missionId,
+  ownerApp,
   seed,
   writerThread,
 } from "./AsksService.testkit.ts";
@@ -191,6 +192,220 @@ describe("missions desk HTTP", () => {
         _tag: "owner-imessage",
         chat: "moni",
       });
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("lets crw open a draft per head and read only that head's decision", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const open = (head: string, draftId: string) => ({
+        missionId,
+        draftId,
+        requestedBy: "crw",
+        audience: "PR author",
+        channel: "github",
+        target: { kind: "pull-request", label: "crpko/api#7", url: null, ref: "crpko/api#7" },
+        head,
+        text: "Feedback required: the retry loop never backs off.",
+        flags: ["core change"],
+      });
+      const result = yield* withDesk(async (handle) => {
+        const readOnly = await handle(
+          request("/drafts/open", "Bearer read", open("aaa111", "crw-1")),
+        );
+        const stranger = await handle(
+          request("/drafts/open", "Bearer operate", {
+            ...open("aaa111", "crw-1"),
+            requestedBy: "bot",
+          }),
+        );
+        const opened = await body(
+          await handle(request("/drafts/open", "Bearer operate", open("aaa111", "crw-1"))),
+        );
+        const noHead = await handle(
+          request("/drafts/crw-1/decision?requestedBy=crw", "Bearer read"),
+        );
+        const waiting = await body(
+          await handle(
+            request("/drafts/crw-1/decision?head=aaa111&requestedBy=crw", "Bearer read"),
+          ),
+        );
+        return { readOnly, stranger, opened, noHead, waiting };
+      });
+      expect(result.readOnly.status).toBe(403);
+      expect(result.stranger.status).toBe(403);
+      expect(result.opened.draft).toMatchObject({
+        requestedBy: "crw",
+        head: "aaa111",
+        flags: ["core change"],
+      });
+      expect(result.noHead.status).toBe(400);
+      expect(result.waiting.decision.state).toBe("pending");
+
+      yield* asks.decideDraft(
+        {
+          draftId: result.opened.draft.id,
+          action: "approve",
+          editedText: "Please add a backoff.",
+          revision: 0,
+        },
+        ownerApp,
+      );
+      const after = yield* withDesk(async (handle) => {
+        const decided = await body(
+          await handle(
+            request("/drafts/crw-1/decision?head=aaa111&requestedBy=crw", "Bearer read"),
+          ),
+        );
+        const otherHead = await body(
+          await handle(
+            request("/drafts/crw-1/decision?head=bbb222&requestedBy=crw", "Bearer read"),
+          ),
+        );
+        const stale = await handle(
+          request("/drafts/stale", "Bearer operate", {
+            draftId: "crw-1",
+            requestedBy: "crw",
+            reason: "head moved",
+          }),
+        );
+        return { decided, otherHead, stale };
+      });
+      expect(after.decided.decision).toMatchObject({
+        state: "approved",
+        text: "Please add a backoff.",
+        edited: true,
+      });
+      expect(after.otherHead.decision.state).toBe("stale");
+      expect(after.stale.status).toBe(409);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("takes crw's send report only for an approved draft at the revision it read", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const target = { kind: "pull-request", label: "crpko/api#8", url: null, ref: "crpko/api#8" };
+      const comment = (n: number) => ({
+        kind: "url",
+        label: `comment ${n}`,
+        url: `https://github.com/crpko/api/pull/8#issuecomment-${n}`,
+        ref: null,
+      });
+      const report = (revision: number, outcome: Record<string, unknown>, extra = {}) =>
+        request("/drafts/sent", "Bearer operate", {
+          draftId: "crw-8",
+          requestedBy: "crw",
+          revision,
+          outcome,
+          ...extra,
+        });
+      const early = yield* withDesk(async (handle) => {
+        await handle(
+          request("/drafts/open", "Bearer operate", {
+            missionId,
+            draftId: "crw-8",
+            requestedBy: "crw",
+            audience: "PR author",
+            channel: "github",
+            target,
+            head: "ccc333",
+            text: "Feedback required: add a test.",
+          }),
+        );
+        return {
+          pending: await handle(report(0, { _tag: "sent", link: comment(1) })),
+        };
+      });
+      expect(early.pending.status).toBe(409);
+
+      // The owner reopens once, so the approval is at revision 1.
+      const first = yield* asks.decideDraft(
+        { draftId: DraftId.make("crw-8"), action: "drop" },
+        ownerApp,
+      );
+      yield* asks.reopenDraft({ draftId: first.draft.id }, ownerApp);
+      yield* asks.decideDraft(
+        { draftId: first.draft.id, action: "approve", revision: 1 },
+        ownerApp,
+      );
+
+      const result = yield* withDesk(async (handle) => {
+        const readOnly = await handle(
+          request("/drafts/sent", "Bearer read", {
+            draftId: "crw-8",
+            requestedBy: "crw",
+            revision: 1,
+            outcome: { _tag: "sent", link: comment(1) },
+          }),
+        );
+        const stranger = await handle(
+          report(1, { _tag: "sent", link: comment(1) }, { requestedBy: "bot" }),
+        );
+        const oldRevision = await handle(report(0, { _tag: "sent", link: comment(1) }));
+        const failed = await body(await handle(report(1, { _tag: "send-failed", reason: "403" })));
+        const failedAgain = await body(
+          await handle(report(1, { _tag: "send-failed", reason: "403" })),
+        );
+        const decision = await body(
+          await handle(
+            request("/drafts/crw-8/decision?head=ccc333&requestedBy=crw", "Bearer read"),
+          ),
+        );
+        const sent = await body(await handle(report(1, { _tag: "sent", link: comment(1) })));
+        const sentAgain = await body(await handle(report(1, { _tag: "sent", link: comment(1) })));
+        const otherLink = await handle(report(1, { _tag: "sent", link: comment(2) }));
+        const failAfter = await handle(report(1, { _tag: "send-failed", reason: "late" }));
+        const afterSent = await body(
+          await handle(
+            request("/drafts/crw-8/decision?head=ccc333&requestedBy=crw", "Bearer read"),
+          ),
+        );
+        return {
+          readOnly,
+          stranger,
+          oldRevision,
+          failed,
+          failedAgain,
+          decision,
+          sent,
+          sentAgain,
+          otherLink,
+          failAfter,
+          afterSent,
+        };
+      });
+      expect(result.readOnly.status).toBe(403);
+      expect(result.stranger.status).toBe(403);
+      expect(result.oldRevision.status).toBe(409);
+      expect(result.failed.draft).toMatchObject({ status: "send-failed", sendError: "403" });
+      expect(result.failedAgain.draft).toMatchObject({ status: "send-failed", sendError: "403" });
+      expect(result.decision.decision).toMatchObject({
+        state: "approved",
+        revision: 1,
+        delivery: "send-failed",
+      });
+      expect(result.sent.draft).toMatchObject({
+        status: "sent",
+        sentLink: comment(1),
+        sendError: null,
+      });
+      expect(result.sent.draft.sentAt).not.toBeNull();
+      expect(result.sentAgain.draft.sentAt).toBe(result.sent.draft.sentAt);
+      expect(result.otherLink.status).toBe(409);
+      expect(result.failAfter.status).toBe(409);
+      expect(result.afterSent.decision).toMatchObject({ state: "approved", delivery: "sent" });
+
+      // One event per real change: failed once, sent once.
+      const store = yield* MissionStore.MissionStore;
+      const kinds = (yield* store.recentEvents(missionId, 50))
+        .filter((event) => event.subject?.id === "crw-8")
+        .map((event) => event.kind);
+      expect(kinds.filter((kind) => kind === "draft.sent")).toHaveLength(1);
+      expect(kinds.filter((kind) => kind === "draft.send-failed")).toHaveLength(1);
     }).pipe(Effect.provide(layer));
   });
 

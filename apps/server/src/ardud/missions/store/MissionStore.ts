@@ -103,6 +103,16 @@ export interface MissionEventDraft {
   readonly at?: string;
 }
 
+/**
+ * The event every commit in scope follows from, when a write runs on behalf of
+ * an earlier decision (an accepted suggestion applying through the owning
+ * service's own method). A draft's own `causedBy` wins.
+ */
+export const MissionCause = Context.Reference<MissionEventId | null>(
+  "t3/ardud/missions/store/MissionCause",
+  { defaultValue: () => null },
+);
+
 export interface MissionCommit {
   readonly event: MissionEventDraft;
   readonly upserts?: ReadonlyArray<MissionStoreRecord>;
@@ -235,6 +245,7 @@ const make = Effect.gen(function* () {
       const removes = input.removes ?? [];
       const at = draft.at ?? DateTime.formatIso(yield* DateTime.now);
       const eventId = MissionEventId.make(`event-${NodeCrypto.randomUUID()}`);
+      const cause = yield* MissionCause;
 
       // Encode before touching sqlite so invalid input never opens a transaction.
       const encodedRecords = yield* Effect.forEach(upserts, (entry) =>
@@ -258,7 +269,7 @@ const make = Effect.gen(function* () {
           provenance: draft.provenance,
           summary: cutSummary(draft.summary),
           subject: draft.subject,
-          causedBy: draft.causedBy ?? null,
+          causedBy: draft.causedBy ?? cause,
           payload: draft.payload ?? null,
           at,
         };

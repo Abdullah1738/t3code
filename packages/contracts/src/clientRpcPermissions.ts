@@ -10,6 +10,8 @@ import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
 import { WS_METHODS } from "./rpc.ts";
 // ardud missions: policy
 import { MISSIONS_POLICY_GUARDED_SCOPES } from "./ardud/missionsPolicyRpc.ts";
+// ardud missions: asks
+import { MISSIONS_ASKS_GUARDED_SCOPES } from "./ardud/missionsAsksRpc.ts";
 
 /** Incremental client enforcement; the server still authorizes every request. */
 export const CLIENT_GUARDED_RPC_SCOPES = {
@@ -59,6 +61,8 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.missionsMarkSeen]: AuthOrchestrationOperateScope,
   // ardud missions: policy
   ...MISSIONS_POLICY_GUARDED_SCOPES,
+  // ardud missions: asks
+  ...MISSIONS_ASKS_GUARDED_SCOPES,
   [WS_METHODS.missionsUpsertSubMission]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsMergeSubMissions]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsUpsertLane]: AuthOrchestrationOperateScope,

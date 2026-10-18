@@ -1,6 +1,8 @@
 import {
   // ardud missions: policy
   MISSIONS_POLICY_AGGREGATES,
+  // ardud missions: asks
+  MISSIONS_ASKS_AGGREGATES,
   ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
   type WsRpcGroup,
@@ -227,6 +229,8 @@ const RPC_AGGREGATES = {
   [WS_METHODS.missionsMarkSeen]: "missions",
   // ardud missions: policy
   ...MISSIONS_POLICY_AGGREGATES,
+  // ardud missions: asks
+  ...MISSIONS_ASKS_AGGREGATES,
   [WS_METHODS.missionsUpsertSubMission]: "missions",
   [WS_METHODS.missionsMergeSubMissions]: "missions",
   [WS_METHODS.missionsUpsertLane]: "missions",

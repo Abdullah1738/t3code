@@ -416,6 +416,8 @@ import {
 } from "./ardud/missions.ts";
 // ardud missions: policy
 import { MissionsPolicyRpcs } from "./ardud/missionsPolicyRpc.ts";
+// ardud missions: asks
+import { MissionsAsksRpcs } from "./ardud/missionsAsksRpc.ts";
 import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
@@ -2238,6 +2240,8 @@ export const WsMissionsRpcGroup = RpcGroup.make(
 
 // ardud missions: policy
 export const WsMissionsPolicyRpcGroup = MissionsPolicyRpcs.middleware(RpcScopeAuthorization);
+// ardud missions: asks
+export const WsMissionsAsksRpcGroup = MissionsAsksRpcs.middleware(RpcScopeAuthorization);
 
 /** Every WebSocket RPC not in a domain group merged into `WsRpcGroup` below. */
 export const WsCoreRpcGroup = RpcGroup.make(
@@ -2441,4 +2445,6 @@ export const WsRpcGroup = WsCoreRpcGroup.merge(
   WsMissionsRpcGroup,
   // ardud missions: policy
   WsMissionsPolicyRpcGroup,
+  // ardud missions: asks
+  WsMissionsAsksRpcGroup,
 );

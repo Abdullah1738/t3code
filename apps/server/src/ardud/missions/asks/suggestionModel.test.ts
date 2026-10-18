@@ -11,6 +11,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Result from "effect/Result";
 
 import {
+  acceptorFor,
   barFor,
   decideSuggestion,
   proposeSuggestion,
@@ -254,5 +255,37 @@ describe("deciding suggestions", () => {
     expect(Result.getOrThrow(reopenSuggestion(dismissed.record, ownerApp, now)).record.status).toBe(
       "open",
     );
+  });
+});
+
+describe("acceptorFor", () => {
+  const pick = (overrides: Partial<Parameters<typeof acceptorFor>[0]>) =>
+    acceptorFor({
+      targetKind: "lane",
+      target: { kind: "lane", id: "lane-api" },
+      author: "governor",
+      requested: undefined,
+      masterRoleId: "role-master",
+      ...overrides,
+    });
+
+  it("sends the master's control surface to the master", () => {
+    expect(pick({})).toBe("master");
+    expect(pick({ targetKind: "pool", target: { kind: "pool", id: "p" } })).toBe("master");
+    expect(pick({ targetKind: "role-model", target: { kind: "role", id: "role-writer" } })).toBe(
+      "master",
+    );
+    // An author asking for the master cannot pull an owner kind back.
+    expect(pick({ targetKind: "draft-note", target: null, requested: "master" })).toBe("owner");
+  });
+
+  it("keeps draft notes, rules and the master's own behaviour with the owner", () => {
+    expect(pick({ targetKind: "draft-note", target: null, author: "editor" })).toBe("owner");
+    expect(pick({ targetKind: "rule", target: null })).toBe("owner");
+    expect(pick({ targetKind: "role-model", target: { kind: "role", id: "role-master" } })).toBe(
+      "owner",
+    );
+    expect(pick({ author: "master" })).toBe("owner");
+    expect(pick({ requested: "owner" })).toBe("owner");
   });
 });
