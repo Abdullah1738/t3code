@@ -10,6 +10,7 @@ import {
   EnvironmentInternalError,
   type EnvironmentInternalErrorReason,
   EnvironmentOperationForbiddenError,
+  type EnvironmentOperationForbiddenReason,
   EnvironmentRequestInvalidError,
   type EnvironmentRequestInvalidReason,
   EnvironmentResourceNotFoundError,
@@ -133,7 +134,7 @@ export function failEnvironmentScopeRequired(requiredScope: AuthEnvironmentScope
   );
 }
 
-function failEnvironmentOperationForbidden(reason: "current_session_revoke_not_allowed") {
+function failEnvironmentOperationForbidden(reason: EnvironmentOperationForbiddenReason) {
   return currentEnvironmentTraceId.pipe(
     Effect.flatMap((traceId) =>
       Effect.fail(
@@ -508,8 +509,13 @@ export const layer = HttpApiBuilder.group(
             return { revoked };
           },
           Effect.catchTags({
-            ServerAuthForbiddenOperationError: () =>
-              failEnvironmentOperationForbidden("current_session_revoke_not_allowed"),
+            ServerAuthForbiddenOperationError: (error) =>
+              failEnvironmentOperationForbidden(
+                // ardud missions: core
+                error.reason === "owner_session"
+                  ? "owner_session_revoke_not_allowed"
+                  : "current_session_revoke_not_allowed",
+              ),
           }),
           Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
             failEnvironmentInternal("client_session_revoke_failed", error),

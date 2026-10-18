@@ -468,10 +468,13 @@ export class ServerAuthMcpApprovalCodeError extends Schema.TaggedError<ServerAut
 
 export class ServerAuthForbiddenOperationError extends Schema.TaggedError<ServerAuthForbiddenOperationError>()(
   "ServerAuthForbiddenOperationError",
-  {},
+  // ardud missions: core
+  { reason: Schema.optional(Schema.Literal("owner_session")) },
 ) {
   override get message(): string {
-    return "The current authentication session cannot revoke itself.";
+    return this.reason === "owner_session"
+      ? "Only an owner session can revoke an owner session."
+      : "The current authentication session cannot revoke itself.";
   }
 }
 
@@ -766,6 +769,12 @@ export const make = Effect.gen(function* () {
               ),
             ),
           );
+  // Strict variant for revocation: a failed lookup fails the revoke, so an
+  // owner session is never revoked by a guess.
+  const isOwnerSession = (sessionId: AuthSessionId) =>
+    devAuth?.sessionId === sessionId
+      ? Effect.succeed(true)
+      : origins.originOf(sessionId).pipe(Effect.map((origin) => origin?._tag === "owner"));
   const withOrigin = <S extends { readonly sessionId: AuthSessionId }>(session: S) =>
     originOf(session.sessionId).pipe(
       Effect.map((origin) => (origin === null ? session : { ...session, origin })),
@@ -1314,15 +1323,34 @@ export const make = Effect.gen(function* () {
     if (currentSessionId === targetSessionId) {
       return yield* new ServerAuthForbiddenOperationError({});
     }
+    // ardud missions: core
+    const owner = (sessionId: AuthSessionId) =>
+      isOwnerSession(sessionId).pipe(
+        Effect.mapError((cause) => new ServerAuthSessionRevocationError({ cause })),
+      );
+    if ((yield* owner(targetSessionId)) && !(yield* owner(currentSessionId))) {
+      return yield* new ServerAuthForbiddenOperationError({ reason: "owner_session" });
+    }
     return yield* revokeSession(targetSessionId);
   });
 
   const revokeOtherClientSessions: EnvironmentAuth["Service"]["revokeOtherClientSessions"] = (
     currentSessionId,
   ) =>
-    revokeOtherSessionsExcept(currentSessionId).pipe(
-      Effect.withSpan("EnvironmentAuth.revokeOtherClientSessions"),
-    );
+    // ardud missions: core - a session that is not the owner's spares owner sessions.
+    Effect.gen(function* () {
+      const owner = (sessionId: AuthSessionId) =>
+        isOwnerSession(sessionId).pipe(
+          Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
+        );
+      if (yield* owner(currentSessionId)) return yield* revokeOtherSessionsExcept(currentSessionId);
+      let revoked = 0;
+      for (const session of yield* listSessions()) {
+        if (session.sessionId === currentSessionId || (yield* owner(session.sessionId))) continue;
+        if (yield* revokeSession(session.sessionId)) revoked += 1;
+      }
+      return revoked;
+    }).pipe(Effect.withSpan("EnvironmentAuth.revokeOtherClientSessions"));
 
   const issueStartupPairingUrl: EnvironmentAuth["Service"]["issueStartupPairingUrl"] = (baseUrl) =>
     issueStartupPairingCredential().pipe(
