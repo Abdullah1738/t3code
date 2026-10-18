@@ -40,7 +40,8 @@ import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../compo
 import { cn } from "../../lib/utils";
 import { setMissionFocus, toggleMissionPaused } from "./missionCommands";
 import { AskTheMissionForm, MissionForksList } from "./MissionForksList";
-import { useMissionForks, useMissionList } from "./missionsStore";
+import { useMissionForks, useMissionList, useOwnerRequests } from "./missionsStore";
+import { RequestsUnreadLink } from "./sections/YourRequests";
 import { HEALTH_BADGE_VARIANT, LANE_DOT_CLASS } from "./missionTone";
 
 /** Goal, milestone countdown, health, usage and the owner's mission controls. */
@@ -104,6 +105,7 @@ export function MissionSummary(props: { overview: MissionOverviewSnapshot; nowMs
         <FocusMenu overview={overview} />
         <PauseButton missionId={mission.id} title={mission.title} paused={paused} />
         <InboxButton missionId={mission.id} />
+        <RequestsUnread missionId={mission.id} />
         <AskTheMission missionId={mission.id} title={mission.title} nowMs={nowMs} />
       </div>
     </div>
@@ -203,6 +205,12 @@ function AskTheMission(props: { missionId: MissionId; title: string; nowMs: numb
   );
 }
 
+function RequestsUnread(props: { missionId: MissionId }) {
+  return (
+    <RequestsUnreadLink missionId={props.missionId} requests={useOwnerRequests(props.missionId)} />
+  );
+}
+
 /** Header entry to this mission's inbox, with what waits on the owner. */
 function InboxButton(props: { missionId: MissionId }) {
   const list = useMissionList();
@@ -215,7 +223,9 @@ function InboxButton(props: { missionId: MissionId }) {
     >
       <InboxIcon aria-hidden />
       Inbox
-      {count > 0 ? <span className="tabular-nums">· {badgeCount(count)}</span> : null}
+      {count > 0 ? (
+        <span className="text-update-foreground tabular-nums">{badgeCount(count)}</span>
+      ) : null}
     </Button>
   );
 }

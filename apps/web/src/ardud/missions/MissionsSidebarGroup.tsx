@@ -8,6 +8,7 @@ import {
   badgeCount,
   foldLaneCounts,
   healthLabel,
+  isRequestUnread,
   sortLanesProblemsFirst,
   splitQuietLanes,
   totalNeedsYou,
@@ -18,7 +19,7 @@ import { CollapsibleSectionHeader } from "../../components/ui/collapsible-sectio
 import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
-import { useMissionLanes, useMissionList } from "./missionsStore";
+import { useMissionLanes, useMissionList, useOwnerRequests } from "./missionsStore";
 import { HEALTH_DOT_CLASS, LANE_DOT_CLASS, LANE_TEXT_CLASS } from "./missionTone";
 
 const SIDEBAR_STATE_KEY = "t3code:ardud-missions:sidebar";
@@ -148,6 +149,7 @@ const MissionSidebarRow = memo(function MissionSidebarRow(props: {
             </span>
           ) : null}
         </Link>
+        <RequestsAnsweredLink missionId={mission.id} onNavigate={onNavigate} />
         <NeedsYouLink missionId={mission.id} count={mission.needsYou} onNavigate={onNavigate} />
       </div>
       {isOpen ? (
@@ -238,6 +240,28 @@ function PortfolioRow(props: { onNavigate: () => void }) {
         <span className="min-w-0 flex-1 truncate">Portfolio</span>
       </Link>
     </li>
+  );
+}
+
+/** Answered requests the owner has not opened: an update dot and the count. */
+function RequestsAnsweredLink(props: { missionId: MissionId; onNavigate: () => void }) {
+  const requests = useOwnerRequests(props.missionId);
+  const unread = useMemo(() => (requests ?? []).filter(isRequestUnread), [requests]);
+  const first = unread[0];
+  if (!first) return null;
+  const label = `${unread.length} ${unread.length === 1 ? "request" : "requests"} answered`;
+  return (
+    <Link
+      to="/missions/$missionId"
+      params={{ missionId: props.missionId }}
+      search={{ request: first.id }}
+      onClick={props.onNavigate}
+      aria-label={label}
+      className="flex h-5 shrink-0 items-center gap-1 rounded-full px-1 text-2xs font-medium text-update-foreground tabular-nums outline-none hover:bg-update/12 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+    >
+      <span aria-hidden className="size-1.5 rounded-full bg-update" />
+      {badgeCount(unread.length)}
+    </Link>
   );
 }
 

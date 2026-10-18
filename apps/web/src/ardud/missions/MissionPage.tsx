@@ -26,6 +26,7 @@ import { RolesTab } from "./RolesTab";
 import { RoomsTab } from "./RoomsTab";
 import { RulesTab } from "./RulesTab";
 import { TimelineTab } from "./TimelineTab";
+import { ViewsTab } from "./ViewsTab";
 import { WorkTab } from "./WorkTab";
 import { HEALTH_DOT_CLASS } from "./missionTone";
 import { useNowMs } from "./useNowMs";
@@ -36,6 +37,8 @@ export function MissionPage(props: {
   tab: MissionTab;
   highlightSubMissionId: string | null;
   roomId: RoomId | null;
+  /** Owner request opened on the overview. */
+  requestId: string | null;
 }) {
   const overview = useMissionOverview(props.missionId);
   const nowMs = useNowMs();
@@ -86,6 +89,7 @@ export function MissionPage(props: {
                     overview={overview}
                     nowMs={nowMs}
                     highlightSubMissionId={props.highlightSubMissionId}
+                    openRequestId={props.requestId}
                   />
                 ) : props.tab === "rooms" ? (
                   <RoomsTab missionId={props.missionId} roomId={props.roomId} nowMs={nowMs} />
@@ -101,6 +105,8 @@ export function MissionPage(props: {
                   />
                 ) : props.tab === "roles" ? (
                   <RolesTab missionId={props.missionId} nowMs={nowMs} />
+                ) : props.tab === "views" ? (
+                  <ViewsTab missionId={props.missionId} nowMs={nowMs} />
                 ) : (
                   <TimelineTab missionId={props.missionId} />
                 )}

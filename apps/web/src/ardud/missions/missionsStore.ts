@@ -21,7 +21,9 @@ import {
   type ApprovalRoutingTable,
   type MissionForkEntry,
   type MissionInboxSnapshot,
+  type MissionLayout,
   type MissionOverviewSnapshot,
+  type OwnerRequest,
   type MissionPoolsSnapshot,
   type MissionReviewSnapshot,
   type MissionRolesSnapshot,
@@ -123,6 +125,24 @@ const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Missio
 const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit) =>
   missionsSource.subscribeRoom(id, emit),
 );
+const layoutStores = createKeyedSnapshotStores<MissionId, MissionLayout>((id, emit) =>
+  missionsSource.subscribeLayout(id, emit),
+);
+const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
+  (id, emit) => missionsSource.subscribeRequests(id, emit),
+);
+
+/** The mission's overview sections, in order, with what was hidden or removed. */
+export function useMissionLayout(missionId: MissionId): MissionLayout | undefined {
+  const store = layoutStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** What the owner asked or told the master, newest activity first. */
+export function useOwnerRequests(missionId: MissionId): ReadonlyArray<OwnerRequest> | undefined {
+  const store = requestStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
 
 /** `undefined` until the source has answered once. */
 export function useMissionList(): MissionListSnapshot | undefined {

@@ -34,12 +34,12 @@ import { cn } from "../../lib/utils";
 import { reorderSubMissions } from "./missionCommands";
 import { IntendedShareEditor } from "./IntendedShareEditor";
 import { HEALTH_DOT_CLASS } from "./missionTone";
-import { MissionSection } from "./MissionSection";
 
 /**
  * Sub-missions in the owner's order. The bar is the master's measured effort
  * over the last 24 hours; the tick is the share the owner intended. Dragging
- * reorders; the master works the queue top-down.
+ * reorders; the master works the queue top-down. Renders the list only; the
+ * overview section around it owns the heading.
  */
 export function PriorityStack(props: {
   mission: Mission;
@@ -76,10 +76,7 @@ export function PriorityStack(props: {
   };
 
   return (
-    <MissionSection
-      title="Priority stack"
-      caption="Bar: master effort, last 24h. Tick: intended share (you or the master can set it)."
-    >
+    <div className="flex min-w-0 flex-col gap-2">
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
@@ -106,15 +103,17 @@ export function PriorityStack(props: {
         </SortableContext>
       </DndContext>
       {note ? <p className="text-xs text-muted-foreground">{note}</p> : null}
-      <p className="text-xs text-muted-foreground">
-        {planned.label}
-        {planned.balanced ? "" : " (intended shares don't add up to 100%)"}
-      </p>
-      <p className="text-xs text-muted-foreground/70">
-        Drag to reorder. Lower sub-missions park first when capacity is short; "fills idle" ones
-        only take what is left.
-      </p>
-    </MissionSection>
+      {planned.total > 0 ? (
+        <p
+          className={cn(
+            "text-xs tabular-nums",
+            planned.balanced ? "text-muted-foreground" : "text-warning-foreground",
+          )}
+        >
+          {planned.label}
+        </p>
+      ) : null}
+    </div>
   );
 }
 

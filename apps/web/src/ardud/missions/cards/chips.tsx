@@ -173,3 +173,97 @@ export function AgeElement(props: { age: AgeView; at: string; prefix?: string })
 export function ChipRow(props: { children: ReactNode }) {
   return <div className="flex min-w-0 flex-wrap items-center gap-1.5">{props.children}</div>;
 }
+
+export type StateGlyphKind = "ok" | "done" | "risk" | "bad" | "wait" | "idle" | "park" | "unknown";
+
+const STATE_GLYPH_CLASS: Record<StateGlyphKind, string> = {
+  ok: "text-success-foreground",
+  done: "text-success-foreground",
+  risk: "text-warning-foreground",
+  bad: "text-error-foreground",
+  wait: "text-muted-foreground",
+  idle: "text-muted-foreground",
+  park: "text-muted-foreground",
+  unknown: "text-muted-foreground",
+};
+
+/** 12px state glyph from the sprite: shape and colour both carry the state. */
+export function StateGlyph(props: { kind: StateGlyphKind; label?: string }) {
+  const a11y = props.label
+    ? ({ role: "img", "aria-label": props.label } as const)
+    : ({ "aria-hidden": true } as const);
+  return (
+    <svg
+      viewBox="0 0 12 12"
+      {...a11y}
+      className={cn("size-3 shrink-0", STATE_GLYPH_CLASS[props.kind])}
+    >
+      {props.kind === "ok" ? <circle cx="6" cy="6" r="4.5" fill="currentColor" /> : null}
+      {props.kind === "done" ? (
+        <>
+          <circle cx="6" cy="6" r="5.25" fill="currentColor" />
+          <path
+            d="M3.6 6.2 5.3 7.9 8.5 4.4"
+            fill="none"
+            className="stroke-background"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </>
+      ) : null}
+      {props.kind === "risk" ? <path d="M6 1.2l5.2 9.3H.8z" fill="currentColor" /> : null}
+      {props.kind === "bad" ? (
+        <rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="currentColor" />
+      ) : null}
+      {props.kind === "wait" ? (
+        <>
+          <circle cx="6" cy="6" r="4.6" fill="none" stroke="currentColor" strokeWidth="1.5" />
+          <path d="M6 1.4a4.6 4.6 0 0 1 0 9.2z" fill="currentColor" />
+        </>
+      ) : null}
+      {props.kind === "idle" ? (
+        <circle cx="6" cy="6" r="4.4" fill="none" stroke="currentColor" strokeWidth="1.5" />
+      ) : null}
+      {props.kind === "park" ? (
+        <>
+          <rect x="2.6" y="2" width="2.4" height="8" rx=".8" fill="currentColor" />
+          <rect x="7" y="2" width="2.4" height="8" rx=".8" fill="currentColor" />
+        </>
+      ) : null}
+      {props.kind === "unknown" ? (
+        <circle
+          cx="6"
+          cy="6"
+          r="4.4"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeDasharray="2 1.6"
+        />
+      ) : null}
+    </svg>
+  );
+}
+
+/** Tiny update-coloured dot: something new the owner has not opened. */
+export function UnreadDot(props: { label?: string }) {
+  return (
+    <span
+      {...(props.label ? { role: "img", "aria-label": props.label } : { "aria-hidden": true })}
+      className="size-1.5 shrink-0 rounded-full bg-update"
+    />
+  );
+}
+
+/** "by you" / "by master" provenance marker: the author's 14px avatar. */
+export function ByMarker(props: { by: "owner" | "master"; label?: string }) {
+  return (
+    <span
+      role="img"
+      aria-label={props.label ?? (props.by === "owner" ? "By you" : "By the master")}
+    >
+      <Avatar kind={props.by === "owner" ? "you" : "master"} small />
+    </span>
+  );
+}

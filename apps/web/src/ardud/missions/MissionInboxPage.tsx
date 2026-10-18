@@ -10,7 +10,6 @@ import {
   INBOX_TABS,
   inboxTabCounts,
   staleApprovals,
-  type InboxEntry,
   type InboxRouteFilter,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -29,15 +28,7 @@ import { isElectron } from "../../env";
 import { cn } from "../../lib/utils";
 import { CardList, CardListItem } from "./cards/CardFrame";
 import { DraftNotesPanel } from "./DraftNotesPanel";
-import {
-  ApprovalCard,
-  AskCard,
-  ClosedApprovalRow,
-  DraftCard,
-  KnockCard,
-  NoteCard,
-  SuggestionCard,
-} from "./InboxCards";
+import { ClosedApprovalRow, InboxEntryCard } from "./InboxCards";
 import { MissionForksList } from "./MissionForksList";
 import { MissionSection } from "./MissionSection";
 import { RoutingPanel } from "./RoutingPanel";
@@ -268,94 +259,14 @@ function InboxTabBody(props: {
   const list = useMissionList();
   // Sample track records would misstate a live author, so they stay hidden.
   const stats = isSampleFeed("suggestion-stats") ? null : (allStats ?? []);
-  const actions = inboxActions(screen.dispatch);
-
-  const card = (entry: InboxEntry) => {
-    const selected = screen.ui.selectedKey === entry.key;
-    const onSelect = () => screen.dispatch({ type: "select", key: entry.key });
-    const editing = screen.ui.editingKey === entry.key;
-    const onEdit = (open: boolean) =>
-      screen.dispatch({ type: "edit", key: open ? entry.key : null });
-    switch (entry.kind) {
-      case "ask":
-        return (
-          <AskCard
-            ask={entry.record}
-            selected={selected}
-            onSelect={onSelect}
-            picked={screen.ui.picked[entry.key] ?? null}
-            onPick={(optionId) => screen.dispatch({ type: "pick", key: entry.key, optionId })}
-            forks={forks}
-            nowMs={nowMs}
-            list={list}
-            masterRoleId={masterRoleId}
-            actions={actions}
-          />
-        );
-      case "draft":
-        return (
-          <DraftCard
-            draft={entry.record}
-            selected={selected}
-            onSelect={onSelect}
-            editing={editing}
-            onEdit={onEdit}
-            notes={draftNotes}
-            masterRoleId={masterRoleId}
-            nowMs={nowMs}
-            list={list}
-            actions={actions}
-          />
-        );
-      case "approval":
-        return (
-          <ApprovalCard
-            approval={entry.record}
-            selected={selected}
-            onSelect={onSelect}
-            masterRoleId={masterRoleId}
-            nowMs={nowMs}
-            list={list}
-            actions={actions}
-          />
-        );
-      case "knock":
-        return (
-          <KnockCard
-            knock={entry.record}
-            selected={selected}
-            onSelect={onSelect}
-            editing={editing}
-            onEdit={onEdit}
-            nowMs={nowMs}
-            list={list}
-            actions={actions}
-          />
-        );
-      case "suggestion":
-        return (
-          <SuggestionCard
-            suggestion={entry.record}
-            selected={selected}
-            onSelect={onSelect}
-            stats={stats}
-            nowMs={nowMs}
-            list={list}
-            actions={actions}
-          />
-        );
-      case "note":
-        return (
-          <NoteCard
-            note={entry.record}
-            selected={selected}
-            onSelect={onSelect}
-            nowMs={nowMs}
-            list={list}
-            actions={actions}
-          />
-        );
-    }
+  const deps = {
+    forks,
+    draftNotes,
+    stats,
+    list,
+    masterRoleId,
+    nowMs,
+    actions: inboxActions(screen.dispatch),
   };
 
   return (
@@ -365,7 +276,9 @@ function InboxTabBody(props: {
       ) : (
         <CardList label={INBOX_TAB_LABEL[props.tab]}>
           {screen.entries.map((entry) => (
-            <CardListItem key={entry.key}>{card(entry)}</CardListItem>
+            <CardListItem key={entry.key}>
+              <InboxEntryCard entry={entry} ui={screen.ui} dispatch={screen.dispatch} deps={deps} />
+            </CardListItem>
           ))}
         </CardList>
       )}

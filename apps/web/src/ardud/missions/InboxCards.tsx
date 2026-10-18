@@ -34,6 +34,9 @@ import {
   suggestionAfterText,
   suggestionTrackRecord,
   textEdit,
+  type InboxEntry,
+  type InboxUiEvent,
+  type InboxUiState,
   type MissionForkEntry,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -685,4 +688,95 @@ export function NoteCard(props: CardContext & { note: Note; actions: InboxAction
       <RefsBlock refs={note.evidenceLinks} />
     </CardFrame>
   );
+}
+
+// ---------------------------------------------------------------------------
+// One inbox entry, whichever kind it is
+
+/** What every entry card reads besides its record. */
+export interface EntryCardDeps {
+  readonly forks: ReadonlyArray<MissionForkEntry>;
+  readonly draftNotes: ReadonlyArray<DraftNote>;
+  /** `null` while suggestion track records are sample data. */
+  readonly stats: ReadonlyArray<SuggestionStats> | null;
+  readonly list: MissionListSnapshot | undefined;
+  readonly masterRoleId: string | null;
+  readonly nowMs: number;
+  readonly actions: InboxActions;
+  readonly size?: CardFrameProps["size"];
+}
+
+/** Renders an inbox entry with its card, wired to a selection/edit/pick reducer. */
+export function InboxEntryCard(props: {
+  entry: InboxEntry;
+  ui: InboxUiState;
+  dispatch: (event: InboxUiEvent) => void;
+  deps: EntryCardDeps;
+}) {
+  const { entry, ui, dispatch, deps } = props;
+  const context: CardContext = {
+    selected: ui.selectedKey === entry.key,
+    onSelect: () => dispatch({ type: "select", key: entry.key }),
+    nowMs: deps.nowMs,
+    list: deps.list,
+    ...(deps.size ? { size: deps.size } : {}),
+  };
+  const editing = ui.editingKey === entry.key;
+  const onEdit = (open: boolean) => dispatch({ type: "edit", key: open ? entry.key : null });
+  switch (entry.kind) {
+    case "ask":
+      return (
+        <AskCard
+          {...context}
+          ask={entry.record}
+          picked={ui.picked[entry.key] ?? null}
+          onPick={(optionId) => dispatch({ type: "pick", key: entry.key, optionId })}
+          forks={deps.forks}
+          masterRoleId={deps.masterRoleId}
+          actions={deps.actions}
+        />
+      );
+    case "draft":
+      return (
+        <DraftCard
+          {...context}
+          draft={entry.record}
+          editing={editing}
+          onEdit={onEdit}
+          notes={deps.draftNotes}
+          masterRoleId={deps.masterRoleId}
+          actions={deps.actions}
+        />
+      );
+    case "approval":
+      return (
+        <ApprovalCard
+          {...context}
+          approval={entry.record}
+          masterRoleId={deps.masterRoleId}
+          actions={deps.actions}
+        />
+      );
+    case "knock":
+      return (
+        <KnockCard
+          {...context}
+          knock={entry.record}
+          editing={editing}
+          onEdit={onEdit}
+          actions={deps.actions}
+        />
+      );
+    case "suggestion":
+      return (
+        <SuggestionCard
+          {...context}
+          suggestion={entry.record}
+          stats={deps.stats}
+          actions={deps.actions}
+        />
+      );
+    case "note":
+      return <NoteCard {...context} note={entry.record} actions={deps.actions} />;
+  }
 }

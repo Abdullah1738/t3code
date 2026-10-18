@@ -9,6 +9,7 @@ export const MISSION_TABS = [
   "rules",
   "roles",
   "timeline",
+  "views",
 ] as const;
 
 export type MissionTab = (typeof MISSION_TABS)[number];
@@ -21,6 +22,7 @@ export const MISSION_TAB_LABEL: Record<MissionTab, string> = {
   rules: "Rules",
   roles: "Roles",
   timeline: "Timeline",
+  views: "Views",
 };
 
 export interface MissionSearch {
@@ -30,6 +32,8 @@ export interface MissionSearch {
   readonly sub?: string;
   /** Open room on the rooms tab. */
   readonly room?: string;
+  /** Open owner request on the overview. */
+  readonly request?: string;
 }
 
 const nonEmpty = (value: unknown): string | undefined =>
@@ -39,10 +43,12 @@ export function parseMissionSearch(raw: Record<string, unknown>): MissionSearch 
   const tab = MISSION_TABS.find((candidate) => candidate === raw.tab);
   const sub = nonEmpty(raw.sub);
   const room = tab === "rooms" ? nonEmpty(raw.room) : undefined;
+  const request = tab === undefined ? nonEmpty(raw.request) : undefined;
   return {
     ...(tab !== undefined && tab !== "overview" ? { tab } : {}),
     ...(sub !== undefined ? { sub } : {}),
     ...(room !== undefined ? { room } : {}),
+    ...(request !== undefined ? { request } : {}),
   };
 }
 
