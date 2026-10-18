@@ -5,16 +5,19 @@
  * so it rings the doorbell like every other delivery. Keys come from the
  * event id, so a replayed event posts nothing new.
  *
- * Events committed while the server is down are not replayed; the master
- * still sees those records in mission_approvals / mission_drafts.
+ * The feed keeps a cursor per mission. After downtime it replays what it
+ * missed once, as one summary message per mission (bounded to the newest
+ * events), then follows live. Its first ever run starts at the present.
  */
 import {
   approverOf,
   type MissionEvent,
+  type MissionId,
   type MissionMessageKind,
   type MissionProvenance,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -22,15 +25,19 @@ import * as Stream from "effect/Stream";
 
 import { forkParked } from "../../../serverActivation.ts";
 import { clipSummary } from "../asks/shared.ts";
-import { castOf } from "../core/master.ts";
 import * as ScribeService from "../scribe/ScribeService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
-import { masterRoleOf } from "./cast.ts";
+import { masterRoleOf, readCast } from "./cast.ts";
 import { controlRoomId, MissionRouter } from "./MissionRouter.ts";
+import { RouterStore } from "./RouterStore.ts";
 
 export const MASTER_FEED_COMPONENT = "master-inbox";
 const FEED_PROVENANCE: MissionProvenance = { _tag: "system", component: MASTER_FEED_COMPONENT };
 const DIGEST_FEED_MAX = 8;
+/** Missed events scanned per mission after downtime; older ones are only counted. */
+export const BACKFILL_SCAN_MAX = 2_000;
+const BACKFILL_PAGE = 500;
+const LIVE_MISSIONS = ["active", "paused", "draining"];
 
 const ROUTED_KINDS = new Set([
   "approval.opened",
@@ -59,12 +66,13 @@ export const digestText = (view: ScribeService.EditorView | null): string | null
 export interface MasterFeedDeps {
   readonly router: MissionRouter["Service"];
   readonly store: MissionStore.MissionStore["Service"];
+  readonly rooms: RouterStore["Service"];
   /** The digest body for a mission's latest editor pass. */
   readonly digest: (event: MissionEvent) => Effect.Effect<string | null>;
 }
 
 /** Handles one committed mission event; everything it does not concern is ignored. */
-export const makeMasterFeed = ({ router, store, digest }: MasterFeedDeps) => {
+export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps) => {
   const routedNotice = (event: MissionEvent) =>
     Effect.gen(function* () {
       const subject = event.subject;
@@ -118,12 +126,43 @@ export const makeMasterFeed = ({ router, store, digest }: MasterFeedDeps) => {
       return null;
     });
 
-  const handle = (event: MissionEvent): Effect.Effect<void> =>
+  const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const liveKey = (event: MissionEvent) => `master-inbox:${event.id}`;
+
+  const cursorWrite = (missionId: MissionId, seq: number) =>
+    Effect.gen(function* () {
+      const at = yield* nowIso;
+      yield* rooms.advanceFeedCursor({ component: MASTER_FEED_COMPONENT, missionId, seq, at });
+    });
+
+  /**
+   * Missions whose cursor stays put for this run because their backfill did
+   * not finish; the next start replays them again. `blind` holds every
+   * mission (the backfill could not even list them).
+   */
+  const holds = new Set<MissionId>();
+  let blind = false;
+
+  /** Moves a cursor forward. A failed write is logged; the feed keeps going. */
+  const advance = (missionId: MissionId, seq: number): Effect.Effect<void> =>
+    blind || holds.has(missionId)
+      ? Effect.void
+      : cursorWrite(missionId, seq).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("missions router: master inbox cursor failed", {
+              missionId,
+              seq,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+
+  const deliver = (event: MissionEvent): Effect.Effect<void> =>
     Effect.gen(function* () {
       if (event.kind !== "editor.updated" && !ROUTED_KINDS.has(event.kind)) return;
       const notice = yield* noticeFor(event);
       if (notice === null) return;
-      const cast = yield* castOf(store, event.missionId);
+      const cast = yield* readCast(store, event.missionId);
       const master = masterRoleOf(cast);
       if (cast.mission === null || master === null) return;
       if (cast.mission.status === "archived") return;
@@ -135,7 +174,7 @@ export const makeMasterFeed = ({ router, store, digest }: MasterFeedDeps) => {
           summary: clipSummary(notice.summary),
           body: notice.body,
           to: [{ _tag: "role", roleId: master.id }],
-          key: `master-inbox:${event.id}`,
+          key: liveKey(event),
         },
         provenance: FEED_PROVENANCE,
         author: event.actor,
@@ -151,7 +190,154 @@ export const makeMasterFeed = ({ router, store, digest }: MasterFeedDeps) => {
       ),
     );
 
-  return { handle };
+  /** One live event: deliver it, then move the mission's cursor past it. Never fails. */
+  const handle = (event: MissionEvent): Effect.Effect<void> =>
+    deliver(event).pipe(Effect.andThen(advance(event.missionId, event.seq)));
+
+  /** The feed-relevant events after `fromSeq` up to `toSeq`, newest `BACKFILL_SCAN_MAX` only. */
+  const missedEvents = (missionId: MissionId, fromSeq: number, toSeq: number) =>
+    Effect.gen(function* () {
+      const start = Math.max(fromSeq, toSeq - BACKFILL_SCAN_MAX);
+      const events: MissionEvent[] = [];
+      let after = start;
+      while (after < toSeq) {
+        const page = yield* store.eventsSince(missionId, after, BACKFILL_PAGE);
+        if (page.length === 0) break;
+        for (const event of page) if (event.seq <= toSeq) events.push(event);
+        after = page[page.length - 1]!.seq;
+      }
+      return { events, unscanned: start - fromSeq };
+    });
+
+  /** What the master missed in one mission, as one notice; null when nothing is still open. */
+  const missedNotice = (missionId: MissionId, fromSeq: number, toSeq: number) =>
+    Effect.gen(function* () {
+      const { events, unscanned } = yield* missedEvents(missionId, fromSeq, toSeq);
+      const relevant = events.filter(
+        (event) => event.kind === "editor.updated" || ROUTED_KINDS.has(event.kind),
+      );
+      // The digest is the editor's current view, so only the newest pass matters;
+      // an approval or draft routed twice is one item.
+      const latestDigest = relevant.findLast((event) => event.kind === "editor.updated");
+      const seen = new Set<string>();
+      const picked: MissionEvent[] = [];
+      for (const event of relevant.toReversed()) {
+        if (event.kind === "editor.updated") {
+          if (event === latestDigest) picked.push(event);
+          continue;
+        }
+        const key = event.subject === null ? event.id : `${event.subject.kind}:${event.subject.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        picked.push(event);
+      }
+      const notices: Notice[] = [];
+      for (const event of picked.toReversed()) {
+        // Delivered live before a crash, ahead of its cursor: not missed.
+        if ((yield* rooms.messageByKey(missionId, liveKey(event))) !== null) continue;
+        const notice = yield* noticeFor(event);
+        if (notice !== null) notices.push(notice);
+      }
+      if (notices.length === 0) return null;
+      const lines = [
+        `While the server was down, ${notices.length} item(s) reached this mission for the master:`,
+        ...notices.map((notice) => `\n## ${notice.summary}\n${notice.body}`),
+        ...(unscanned > 0 ? [`\n${unscanned} older event(s) were not scanned.`] : []),
+      ];
+      const missed: Notice = {
+        kind: notices.some((notice) => notice.kind === "request") ? "request" : "evidence",
+        summary: `Missed while the server was down: ${notices.length} item(s)`,
+        body: lines.join("\n"),
+      };
+      return missed;
+    });
+
+  /** One mission's missed range as one message; its cursor moves in the same commit. */
+  const replayMission = (missionId: MissionId, fromSeq: number) =>
+    Effect.gen(function* () {
+      const toSeq = yield* store.latestSeq(missionId);
+      if (toSeq <= fromSeq) return toSeq;
+      const notice = yield* missedNotice(missionId, fromSeq, toSeq);
+      const master = notice === null ? null : masterRoleOf(yield* readCast(store, missionId));
+      if (notice !== null && master !== null) {
+        yield* router.relay({
+          input: {
+            missionId,
+            roomId: controlRoomId(missionId),
+            kind: notice.kind,
+            summary: clipSummary(notice.summary),
+            body: notice.body,
+            to: [{ _tag: "role", roleId: master.id }],
+            key: `master-inbox:backfill:${missionId}:${toSeq}`,
+          },
+          provenance: FEED_PROVENANCE,
+          author: { _tag: "system", component: MASTER_FEED_COMPONENT },
+          authorThread: null,
+          alongside: cursorWrite(missionId, toSeq),
+        });
+      }
+      yield* cursorWrite(missionId, toSeq);
+      return toSeq;
+    });
+
+  /**
+   * Replays what the master missed since each mission's cursor, once: one
+   * summary message per mission, then the cursor moves to `latestSeq`. The
+   * first ever run only records cursors. Returns the seq each mission was
+   * replayed up to, so the live stream skips events already covered.
+   *
+   * A mission whose replay fails keeps its cursor for the whole run (live
+   * events still reach the master, they just do not move it), so the next
+   * start replays the range again; events delivered live are skipped then.
+   */
+  const backfill: Effect.Effect<ReadonlyMap<MissionId, number>> = Effect.suspend(() => {
+    const covered = new Map<MissionId, number>();
+    return Effect.gen(function* () {
+      const missions = yield* store.listAll("mission", LIVE_MISSIONS);
+      const started = yield* rooms.feedStarted(MASTER_FEED_COMPONENT);
+      const cursors = yield* rooms.feedCursors(MASTER_FEED_COMPONENT);
+      let complete = true;
+      for (const mission of missions) {
+        const known = cursors.get(mission.id);
+        // A mission with a cursor always replays; one without replays from the
+        // start, unless this is the feed's first run, which starts at the present.
+        const replays = started || known !== undefined;
+        const replay = replays
+          ? replayMission(mission.id, known ?? 0)
+          : store.latestSeq(mission.id).pipe(Effect.tap((seq) => cursorWrite(mission.id, seq)));
+        const outcome = yield* replay.pipe(
+          Effect.map((seq): number | null => seq),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("missions router: master inbox backfill failed", {
+              missionId: mission.id,
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as(null)),
+          ),
+        );
+        if (outcome === null) {
+          holds.add(mission.id);
+          complete = false;
+        } else if (replays) {
+          covered.set(mission.id, outcome);
+        }
+      }
+      // A first run that missed a cursor runs as a first run again next time.
+      if (!started && complete) {
+        yield* rooms.markFeedStarted(MASTER_FEED_COMPONENT, yield* nowIso);
+      }
+      return covered;
+    }).pipe(
+      Effect.catchCause((cause) => {
+        // Could not even read the missions: hold every cursor this run.
+        blind = true;
+        return Effect.logWarning("missions router: master inbox backfill failed", {
+          cause: Cause.pretty(cause),
+        }).pipe(Effect.as(covered));
+      }),
+    );
+  });
+
+  return { handle, backfill };
 };
 
 /** Follows the mission store and feeds the master's inbox for the life of the server. */
@@ -159,25 +345,33 @@ export const masterFeedLayer = Layer.effectDiscard(
   Effect.gen(function* () {
     const router = yield* MissionRouter;
     const store = yield* MissionStore.MissionStore;
+    const rooms = yield* RouterStore;
     const scribe = yield* ScribeService.ScribeService;
     const feed = makeMasterFeed({
       router,
       store,
+      rooms,
       digest: (event) =>
         scribe.editorView(event.missionId).pipe(
           Effect.map(digestText),
           Effect.catchCause(() => Effect.succeed(null)),
         ),
     });
+    // Subscribe before the backfill reads its snapshot, so no commit falls
+    // between them; events the backfill covered are skipped live.
     const subscription = yield* store.subscribe;
     yield* forkParked(
-      Stream.fromSubscription(subscription).pipe(
-        Stream.runForEach((item) =>
-          item._tag === "upsert" && item.record._tag === "event"
-            ? feed.handle(item.record.record)
-            : Effect.void,
-        ),
-      ),
+      Effect.gen(function* () {
+        const covered = yield* feed.backfill;
+        yield* Stream.fromSubscription(subscription).pipe(
+          Stream.runForEach((item) => {
+            if (item._tag !== "upsert" || item.record._tag !== "event") return Effect.void;
+            const event = item.record.record;
+            if (event.seq <= (covered.get(event.missionId) ?? 0)) return Effect.void;
+            return feed.handle(event);
+          }),
+        );
+      }),
     );
   }),
 );

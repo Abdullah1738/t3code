@@ -149,7 +149,18 @@ const DDL = [
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_mission_router_reminders_by_mission
     ON ardud_mission_router_reminders (mission_id, seq)`,
+  // How far each feed (the master inbox) has read a mission's event log.
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_feed_cursors (
+    component TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (component, mission_id)
+  )`,
 ];
+
+/** The feed-cursor row that marks a feed as having run once. */
+const FEED_STARTED = "";
 
 const encodeRoom = Schema.encodeSync(Schema.fromJsonString(Room));
 const decodeRoom = Schema.decodeUnknownSync(Schema.fromJsonString(Room));
@@ -359,6 +370,19 @@ export class RouterStore extends Context.Service<
       missionId: MissionId,
       limit: number,
     ) => Effect.Effect<ReadonlyArray<AttentionRow>>;
+    /** Whether a feed finished its first run (after which it replays what it missed). */
+    readonly feedStarted: (component: string) => Effect.Effect<boolean>;
+    /** Marks a feed's first run done, once every mission has its cursor. */
+    readonly markFeedStarted: (component: string, at: string) => Effect.Effect<void>;
+    /** Every mission cursor a feed holds. */
+    readonly feedCursors: (component: string) => Effect.Effect<ReadonlyMap<MissionId, number>>;
+    /** Cursors only move forward. */
+    readonly advanceFeedCursor: (input: {
+      readonly component: string;
+      readonly missionId: MissionId;
+      readonly seq: number;
+      readonly at: string;
+    }) => Effect.Effect<void>;
   }
 >()("t3/ardud/missions/router/RouterStore") {}
 
@@ -1079,6 +1103,51 @@ const make = Effect.gen(function* () {
           ),
         ),
       ),
+
+    feedStarted: (component) =>
+      read(
+        sql<{ readonly component: string }>`
+          SELECT component AS "component" FROM ardud_mission_router_feed_cursors
+          WHERE component = ${component} AND mission_id = ${FEED_STARTED}
+        `.pipe(Effect.map((rows) => rows.length > 0)),
+      ),
+
+    markFeedStarted: (component, at) =>
+      write(sql`
+        INSERT INTO ardud_mission_router_feed_cursors ${sql.insert({
+          component,
+          mission_id: FEED_STARTED,
+          seq: 0,
+          updated_at: at,
+        })}
+        ON CONFLICT (component, mission_id) DO NOTHING
+      `),
+
+    feedCursors: (component) =>
+      read(
+        sql<{ readonly missionId: string; readonly seq: number }>`
+          SELECT mission_id AS "missionId", seq AS "seq"
+          FROM ardud_mission_router_feed_cursors
+          WHERE component = ${component} AND mission_id <> ${FEED_STARTED}
+        `.pipe(
+          Effect.map(
+            (rows) => new Map(rows.map((row) => [row.missionId as MissionId, Number(row.seq)])),
+          ),
+        ),
+      ),
+
+    advanceFeedCursor: ({ component, missionId, seq, at }) =>
+      write(sql`
+        INSERT INTO ardud_mission_router_feed_cursors ${sql.insert({
+          component,
+          mission_id: missionId,
+          seq,
+          updated_at: at,
+        })}
+        ON CONFLICT (component, mission_id) DO UPDATE SET
+          seq = MAX(seq, excluded.seq),
+          updated_at = excluded.updated_at
+      `),
   });
 });
 
