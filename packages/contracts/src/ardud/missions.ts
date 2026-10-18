@@ -1723,6 +1723,8 @@ export const RecoveryThread = Schema.Struct({
   instruction: Schema.NullOr(Schema.String),
   noticeAt: Schema.NullOr(IsoDateTime),
   decidedBy: Schema.NullOr(MissionActor),
+  /** Who gave `instruction` (the owner or the master role); later decisions keep it. */
+  instructionBy: Schema.optional(Schema.NullOr(MissionActor)),
 });
 export type RecoveryThread = typeof RecoveryThread.Type;
 

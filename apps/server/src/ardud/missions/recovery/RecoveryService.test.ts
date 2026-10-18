@@ -3,6 +3,7 @@ import {
   MissionError,
   PoolHoldId,
   PoolId,
+  RoleId,
   ThreadId,
   type Lane,
   type PoolHold,
@@ -486,6 +487,64 @@ it.effect("the master and the owner steer the plan; nobody else can", () => {
     assert.strictEqual(yield* recovery.tick, 1);
     assert.strictEqual(fake.sent.at(-1)?.threadId, laneThread);
     assert.isNull((yield* recovery.status(missionId)).state);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("recovery records the deciding principal, never the claimed thread", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane, webLane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    yield* cutRun(webThread, 1, "vp test run");
+    assert.isNotNull(yield* boot);
+    const recovery = yield* RecoveryService.RecoveryService;
+    const store = yield* MissionStore.MissionStore;
+
+    const status = yield* recovery.resume(agent(masterThread), {
+      missionId,
+      mode: "hold",
+      threadId: webThread,
+      instruction: "Rebase first.",
+    });
+    const held = status.incident?.threads.find((thread) => thread.threadId === webThread);
+    // The master acts as its role, as asks and policy record it.
+    assert.deepStrictEqual(held?.decidedBy, { _tag: "role", roleId: RoleId.make("role-master") });
+    assert.deepStrictEqual(held?.instructionBy, {
+      _tag: "role",
+      roleId: RoleId.make("role-master"),
+    });
+    yield* recovery.setSettings(ownerApp, { missionId, resumePerMinute: 6 });
+    const events = (yield* store.eventsSince(missionId, 0)).filter(
+      (event) => event.kind.startsWith("recovery.") && event.kind !== "recovery.incident-opened",
+    );
+    assert.deepStrictEqual(
+      events.map((event) => [event.kind, event.actor, event.provenance]),
+      [
+        [
+          "recovery.thread-decided",
+          { _tag: "role", roleId: RoleId.make("role-master") },
+          { _tag: "agent", threadId: masterThread, roleId: RoleId.make("role-master") },
+        ],
+        ["recovery.settings-changed", { _tag: "owner" }, ownerApp],
+      ],
+    );
+
+    // The owner sends it on; the instruction stays the master's.
+    yield* recovery.resume(ownerApp, { missionId, mode: "now", threadId: webThread });
+    assert.include(fake.sent.at(-1)?.text ?? "", "From the master: Rebase first.");
+
+    // A restart report is a component's finding; nothing else is relabelled as one.
+    const report = {
+      reportId: "rs-x",
+      cause: "opencode-restart" as const,
+      startAt: plus(RESTART),
+      endAt: plus(RESTART + 10),
+      threads: [{ threadId: laneThread, runIds: [], childIds: [] }],
+    };
+    for (const caller of [ownerApp, agent(masterThread)]) {
+      const refused = yield* Effect.flip(recovery.report(caller, report));
+      assert.strictEqual(refused.code, "provenance-invalid");
+    }
   }).pipe(Effect.provide(layer));
 });
 

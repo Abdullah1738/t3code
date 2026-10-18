@@ -12,9 +12,22 @@ import { laneThread, masterThread, missionId } from "../asks/AsksService.testkit
 import { RECOVERY_ROUTE_PREFIX, recoveryRouteLayer } from "./http.ts";
 import { harness, world } from "./testkit.ts";
 
+const READ_OPERATE: ReadonlyArray<AuthEnvironmentScope> = [
+  "orchestration:read",
+  "orchestration:operate",
+];
+
 const TOKENS: Record<string, ReadonlyArray<AuthEnvironmentScope>> = {
   "Bearer reader": ["orchestration:read"],
-  "Bearer operator": ["orchestration:read", "orchestration:operate"],
+  "Bearer operator": READ_OPERATE,
+  "Bearer recovery": READ_OPERATE,
+  "Bearer scribe": READ_OPERATE,
+};
+
+/** Component credentials carry their origin; the shared operate token has none. */
+const ORIGINS: Record<string, { readonly _tag: "component"; readonly component: string }> = {
+  "Bearer recovery": { _tag: "component", component: "stream-recovery" },
+  "Bearer scribe": { _tag: "component", component: "scribe" },
 };
 
 const makeHandler = () => {
@@ -25,7 +38,9 @@ const makeHandler = () => {
       Layer.provide(
         Layer.mock(EnvironmentAuth.EnvironmentAuth)({
           authenticateHttpRequest: (request) => {
-            const scopes = TOKENS[request.headers.authorization ?? ""];
+            const token = request.headers.authorization ?? "";
+            const scopes = TOKENS[token];
+            const origin = ORIGINS[token];
             return scopes === undefined
               ? Effect.fail(new EnvironmentAuth.ServerAuthMissingCredentialError({}))
               : Effect.succeed({
@@ -33,6 +48,7 @@ const makeHandler = () => {
                   subject: "test",
                   method: "bearer-access-token" as const,
                   scopes,
+                  ...(origin === undefined ? {} : { origin }),
                 });
           },
         }),
@@ -76,16 +92,26 @@ const report = {
 };
 
 describe("mission recovery routes", () => {
-  it("lets stream-recovery report with the control token and answers which threads are members", async () => {
+  it("takes restart reports only from stream-recovery's own credential", async () => {
     const { handler, dispose } = makeHandler();
     try {
       expect((await handler(request("/incident", { body: report }))).status).toBe(401);
       expect(
         (await handler(request("/incident", { token: "Bearer reader", body: report }))).status,
       ).toBe(403);
+      // The shared operate token used to be labelled stream-recovery.
+      const shared = await handler(
+        request("/incident", { token: "Bearer operator", body: report }),
+      );
+      expect(shared.status).toBe(403);
+      expect(JSON.stringify(await shared.json())).toContain(
+        "t3 ardud component-token issue stream-recovery",
+      );
+      const other = await handler(request("/incident", { token: "Bearer scribe", body: report }));
+      expect(other.status).toBe(403);
 
       const posted = await handler(
-        request("/incident", { token: "Bearer operator", body: report }),
+        request("/incident", { token: "Bearer recovery", body: report }),
       );
       expect(posted.status).toBe(200);
       expect(await posted.json()).toEqual({
@@ -106,7 +132,7 @@ describe("mission recovery routes", () => {
       );
 
       const bad = await handler(
-        request("/incident", { token: "Bearer operator", body: { ...report, cause: "reboot" } }),
+        request("/incident", { token: "Bearer recovery", body: { ...report, cause: "reboot" } }),
       );
       expect(bad.status).toBe(400);
     } finally {
@@ -114,36 +140,33 @@ describe("mission recovery routes", () => {
     }
   });
 
-  it("takes resume and settings only from the master thread, named in the headers", async () => {
+  it("never takes resume or settings over HTTP, whatever thread the headers claim", async () => {
     const { handler, dispose } = makeHandler();
     try {
-      const settings = { missionId, resumePerMinute: 2 };
-      const anonymous = await handler(
-        request("/settings", { token: "Bearer operator", body: settings }),
-      );
-      expect(anonymous.status).toBe(403);
-
-      const lane = await handler(
-        request("/settings", {
-          token: "Bearer operator",
-          headers: { "x-t3-thread-id": laneThread },
-          body: settings,
-        }),
-      );
-      expect(lane.status).toBe(403);
-
-      const master = await handler(
-        request("/settings", {
-          token: "Bearer operator",
-          headers: { "x-t3-thread-id": masterThread },
-          body: settings,
-        }),
-      );
-      expect(master.status).toBe(200);
-      expect(await master.json()).toEqual({
-        ok: true,
-        settings: { missionId, resumePerMinute: 2, masterLeadSeconds: 60 },
-      });
+      const claim = { "x-t3-thread-id": masterThread };
+      expect(
+        (await handler(request("/settings", { body: { missionId, resumePerMinute: 2 } }))).status,
+      ).toBe(401);
+      for (const token of ["Bearer operator", "Bearer recovery"]) {
+        const settings = await handler(
+          request("/settings", {
+            token,
+            headers: claim,
+            body: { missionId, resumePerMinute: 2 },
+          }),
+        );
+        expect(settings.status).toBe(403);
+        expect(JSON.stringify(await settings.json())).toContain("mission_recovery_settings");
+        const resume = await handler(
+          request("/resume", {
+            token,
+            headers: claim,
+            body: { missionId, mode: "now", threadId: laneThread, instruction: "Deploy prod." },
+          }),
+        );
+        expect(resume.status).toBe(403);
+        expect(JSON.stringify(await resume.json())).toContain("mission_recovery_resume");
+      }
 
       const status = await handler(
         request(`/status?missionId=${missionId}`, { token: "Bearer reader" }),
@@ -151,7 +174,7 @@ describe("mission recovery routes", () => {
       const body = (await status.json()) as {
         status: { settings: { resumePerMinute: number }; state: unknown; incident: unknown };
       };
-      expect(body.status.settings.resumePerMinute).toBe(2);
+      expect(body.status.settings.resumePerMinute).toBe(4);
       expect(body.status.state).toBeNull();
       expect(body.status.incident).toBeNull();
     } finally {

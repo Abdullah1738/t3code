@@ -3,9 +3,6 @@ import {
   AuthOrchestrationReadScope,
   MissionId,
   RecoveryReportInput,
-  RecoveryResumeInput,
-  RecoverySettingsInput,
-  RoleId,
   ThreadId,
   type MissionError,
   type MissionProvenance,
@@ -21,8 +18,8 @@ import { RecoveryService } from "./RecoveryService.ts";
 
 export const RECOVERY_ROUTE_PREFIX = "/api/ardud/missions/recovery";
 
-/** stream-recovery is the only system reporter today. */
-const REPORTER: MissionProvenance = { _tag: "system", component: "stream-recovery" };
+/** The one component that reports restarts (`t3 ardud component-token issue stream-recovery`). */
+export const RECOVERY_REPORTER = "stream-recovery";
 
 type ErrorCode =
   | "unauthorized"
@@ -68,12 +65,8 @@ const errorResponse = (error: RecoveryHttpError) =>
 
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeReport = Schema.decodeUnknownEffect(RecoveryReportInput);
-const decodeResume = Schema.decodeUnknownEffect(RecoveryResumeInput);
-const decodeSettings = Schema.decodeUnknownEffect(RecoverySettingsInput);
 const decodeMissionId = Schema.decodeUnknownEffect(MissionId);
 const decodeThreadIds = Schema.decodeUnknownEffect(Schema.Array(ThreadId));
-const decodeThreadId = Schema.decodeUnknownEffect(ThreadId);
-const decodeRoleId = Schema.decodeUnknownEffect(RoleId);
 
 const decodeBody = <A>(decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>) =>
   Effect.gen(function* () {
@@ -98,26 +91,6 @@ const searchParams = Effect.gen(function* () {
   return Option.isSome(url) ? url.value.searchParams : new URLSearchParams();
 });
 
-/** Agent provenance from the caller's headers, as in the core mission routes. */
-const agentProvenance = Effect.gen(function* () {
-  const request = yield* HttpServerRequest.HttpServerRequest;
-  const threadHeader = request.headers["x-t3-thread-id"]?.trim() ?? "";
-  if (threadHeader.length === 0) {
-    return yield* fail("forbidden", "Recovery changes need the calling thread in x-t3-thread-id.");
-  }
-  const threadId = yield* decodeThreadId(threadHeader).pipe(
-    Effect.mapError(() => fail("invalid_request", "x-t3-thread-id is not a thread id.")),
-  );
-  const roleHeader = request.headers["x-t3-role-id"]?.trim() ?? "";
-  const roleId =
-    roleHeader.length === 0
-      ? null
-      : yield* decodeRoleId(roleHeader).pipe(
-          Effect.mapError(() => fail("invalid_request", "x-t3-role-id is not a role id.")),
-        );
-  return { _tag: "agent", threadId, roleId } satisfies MissionProvenance;
-});
-
 type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
 
 const makeRoutes = Effect.gen(function* () {
@@ -139,6 +112,42 @@ const makeRoutes = Effect.gen(function* () {
       if (!session.scopes.includes(scope)) {
         return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
       }
+      return session;
+    });
+
+  /** Only stream-recovery's own credential reports; the shared control token does not. */
+  const reporter = (session: EnvironmentAuth.AuthenticatedSession) => {
+    const component = session.origin?._tag === "component" ? session.origin.component : null;
+    if (component === null) {
+      return Effect.fail(
+        fail(
+          "forbidden",
+          `Restart reports need ${RECOVERY_REPORTER}'s own component credential (t3 ardud component-token issue ${RECOVERY_REPORTER}).`,
+        ),
+      );
+    }
+    if (component !== RECOVERY_REPORTER) {
+      return Effect.fail(
+        fail(
+          "forbidden",
+          `This credential is ${component}; only ${RECOVERY_REPORTER} reports restarts.`,
+        ),
+      );
+    }
+    return Effect.succeed({ _tag: "system", component } satisfies MissionProvenance);
+  };
+
+  /**
+   * HTTP cannot prove which thread or person is calling, so recovery controls
+   * are not taken here. A valid reader learns where they are taken instead.
+   */
+  const refuseControl = (tool: string, rpc: string) =>
+    Effect.gen(function* () {
+      yield* authenticate(AuthOrchestrationReadScope);
+      return yield* fail(
+        "forbidden",
+        `HTTP cannot prove who is calling, so recovery changes are not taken here. The master uses the MCP tool ${tool} from its thread; the owner uses the Robob app (${rpc}).`,
+      );
     });
 
   const call = <A, R>(effect: Effect.Effect<A, MissionError, R>) =>
@@ -150,9 +159,9 @@ const makeRoutes = Effect.gen(function* () {
 
   /** stream-recovery's findings; answers which threads mission recovery takes over. */
   const postIncident = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const provenance = yield* reporter(yield* authenticate(AuthOrchestrationOperateScope));
     const input = yield* decodeBody(decodeReport);
-    return json({ ok: true, ...(yield* call(recovery.report(REPORTER, input))) });
+    return json({ ok: true, ...(yield* call(recovery.report(provenance, input))) });
   });
 
   /** `threadIds=a,b`: which of these threads belong to a live mission. */
@@ -177,19 +186,8 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, status: yield* call(recovery.status(missionId)) });
   });
 
-  const postResume = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
-    const provenance = yield* agentProvenance;
-    const input = yield* decodeBody(decodeResume);
-    return json({ ok: true, status: yield* call(recovery.resume(provenance, input)) });
-  });
-
-  const postSettings = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
-    const provenance = yield* agentProvenance;
-    const input = yield* decodeBody(decodeSettings);
-    return json({ ok: true, settings: yield* call(recovery.setSettings(provenance, input)) });
-  });
+  const postResume = refuseControl("mission_recovery_resume", "missions.recovery.resume");
+  const postSettings = refuseControl("mission_recovery_settings", "missions.recovery.settings");
 
   const handle = <R>(
     effect: Effect.Effect<HttpServerResponse.HttpServerResponse, RecoveryHttpError, R>,
@@ -215,7 +213,9 @@ const makeRoutes = Effect.gen(function* () {
 
 /**
  * Recovery routes, same bearer auth as the control API. A token holder is
- * never the owner: resume and settings changes name the calling thread, and
- * only the mission's master thread may make them over HTTP.
+ * never the owner and never a thread (`x-t3-thread-id` was only a claim), so
+ * HTTP keeps reads and stream-recovery's restart report, which needs that
+ * component's own credential. Resume and settings changes come from the
+ * master's MCP tools or the owner's paired app over WebSocket.
  */
 export const recoveryRouteLayer = HttpRouter.addAll(makeRoutes);
