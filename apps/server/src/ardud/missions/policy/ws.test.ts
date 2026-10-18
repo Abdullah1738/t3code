@@ -31,7 +31,10 @@ it.layer(testLayer(ports.layer))("mission policy WS handlers", (it) => {
         policy,
         ownerAppProvenance({
           surface: "cli",
-          session: { sessionId: "session-cli", subject: "one-time-token" },
+          session: {
+            sessionId: "session-cli",
+            origin: { _tag: "owner", source: "cli" },
+          },
         }),
       );
       const refused = yield* Effect.flip(cli[M.setRoleModel](change));
@@ -46,7 +49,10 @@ it.layer(testLayer(ports.layer))("mission policy WS handlers", (it) => {
         policy,
         ownerAppProvenance({
           surface: "web",
-          session: { sessionId: "session-web", subject: "one-time-token" },
+          session: {
+            sessionId: "session-web",
+            origin: { _tag: "owner", source: "cli" },
+          },
         }),
       );
       const changed = yield* app[M.setRoleModel](change);

@@ -16,7 +16,11 @@ import * as MissionRouter from "./MissionRouter.ts";
 import { fakeRouterThreads, routerOverFakes } from "./MissionRouter.testkit.ts";
 import { makeRouterWsHandlers } from "./ws.ts";
 
-const paired = { sessionId: "session-app", subject: "one-time-token" };
+const paired = {
+  sessionId: "session-app",
+  subject: "one-time-token",
+  origin: { _tag: "owner", source: "cli" },
+} as const;
 const cliIssued = { sessionId: "session-cli", subject: "cli-issued-session" };
 const control = RoomId.make(`${missionId}:room:control`);
 

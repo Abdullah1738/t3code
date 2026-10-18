@@ -444,7 +444,11 @@ export const layer = HttpApiBuilder.group(
                 return yield* failEnvironmentScopeRequired(delegatedScope);
               }
             }
-            return yield* serverAuth.issuePairingCredential(args.payload);
+            // ardud missions: core
+            // The issuer decides whether the link carries the owner mark.
+            return yield* serverAuth.issuePairingCredential(args.payload, {
+              sessionId: session.sessionId,
+            });
           },
           Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
             failEnvironmentInternal("pairing_credential_issuance_failed", error),

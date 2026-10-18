@@ -31,7 +31,13 @@ const TestLayer = RuleService.layer.pipe(
   Layer.provideMerge(harness().layer),
 );
 
-const paired = { sessionId: "session-app", subject: "one-time-token" };
+const paired = {
+  sessionId: "session-app",
+  subject: "one-time-token",
+  origin: { _tag: "owner", source: "cli" },
+} as const;
+// Paired-looking subject, but the link was minted by a nonowner issuer.
+const strangerPaired = { sessionId: "session-stranger", subject: "one-time-token" };
 const cliIssued = { sessionId: "session-cli", subject: "cli-issued-session" };
 const mcpClient = { sessionId: "session-mcp", subject: "mcp-client" };
 
@@ -69,6 +75,7 @@ it.layer(TestLayer)("missions WS handlers", (it) => {
         none: missionWsHandlers({ surface: undefined, session: paired }),
         issued: missionWsHandlers({ surface: "web", session: cliIssued }),
         mcp: missionWsHandlers({ surface: "web", session: mcpClient }),
+        stranger: missionWsHandlers({ surface: "web", session: strangerPaired }),
       });
       for (const connection of Object.values(handlers)) {
         const write = connection as unknown as Record<

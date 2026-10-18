@@ -11,6 +11,11 @@ import * as References from "effect/References";
 import { Argument, Command, Flag, GlobalFlag } from "effect/cli";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+// ardud missions: core
+import {
+  isReservedSessionSubject,
+  ReservedSessionSubjectError,
+} from "../ardud/auth/SessionOrigins.ts";
 
 import {
   formatIssuedPairingCredential,
@@ -101,6 +106,8 @@ const pairingCreateCommand = Command.make("create", {
             subject: "one-time-token",
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
             ...(Option.isSome(flags.label) ? { label: flags.label.value } : {}),
+            // ardud missions: core
+            ownerSource: "cli",
           });
           const output = formatIssuedPairingCredential(issued, {
             json: flags.json,
@@ -176,6 +183,11 @@ const sessionIssueCommand = Command.make("issue", {
       flags,
       (environmentAuth) =>
         Effect.gen(function* () {
+          // ardud missions: core
+          // Server-made subjects are not for hand-issued tokens.
+          if (Option.isSome(flags.subject) && isReservedSessionSubject(flags.subject.value)) {
+            return yield* new ReservedSessionSubjectError({ subject: flags.subject.value });
+          }
           const issued = yield* environmentAuth.issueSession({
             scopes: flags.scopes,
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
