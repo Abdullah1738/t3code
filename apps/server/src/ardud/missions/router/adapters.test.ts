@@ -9,13 +9,25 @@ import {
   type Room,
   type Subscription,
 } from "@t3tools/contracts";
+import { AskId, LaneId, WorkItemId, type Ask } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import {
+  at as seededAt,
+  laneThread,
+  missionId as seededMission,
+  seed,
+  writerThread,
+} from "../asks/AsksService.testkit.ts";
+import { AsksSignals } from "../asks/ports.ts";
 import { readPositionId } from "../import/apply.ts";
-import { routerImportSink } from "./adapters.ts";
+import * as MissionStore from "../store/MissionStore.ts";
+import { asksSignalsLayer, routerImportSink } from "./adapters.ts";
+import { controlRoomId } from "./MissionRouter.ts";
+import { fakeRouterThreads, routerOverFakes } from "./MissionRouter.testkit.ts";
 import * as RouterStore from "./RouterStore.ts";
 
 const TestLayer = RouterStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
@@ -110,3 +122,64 @@ it.layer(TestLayer)("routerImportSink", (it) => {
     }),
   );
 });
+
+const answered: Ask = {
+  id: AskId.make("ask-1"),
+  missionId: seededMission,
+  subMissionId: null,
+  askedBy: { _tag: "role", roleId: RoleId.make("role-writer") },
+  question: "Ship the migration tonight?",
+  context: "",
+  options: [{ id: "yes", label: "Yes", detail: "" }],
+  recommendation: null,
+  blocks: [{ kind: "work-item", id: "wi-held" }],
+  costOfWaiting: "",
+  urgency: "normal",
+  status: "answered",
+  answer: {
+    optionId: "yes",
+    text: "after the backup",
+    provenance: { _tag: "owner-app", surface: "web", sessionId: "s-1" },
+    answeredAt: seededAt,
+  },
+  createdAt: seededAt,
+  updatedAt: seededAt,
+};
+
+it.effect(
+  "a resolved ask rings the asker and the released item's lane through the doorbell",
+  () => {
+    const threads = fakeRouterThreads();
+    const layer = asksSignalsLayer.pipe(
+      Layer.provideMerge(routerOverFakes(threads)),
+      Layer.provideMerge(MissionStore.layer),
+      Layer.provideMerge(Sqlite.layerMemory),
+    );
+    return Effect.gen(function* () {
+      yield* seed;
+      const signals = yield* AsksSignals;
+      const store = yield* RouterStore.RouterStore;
+      const released = [{ kind: "work-item", id: WorkItemId.make("wi-held") }] as const;
+      yield* signals.askResolved({ ask: answered, askerThreadId: writerThread, released });
+      // A replay of the same resolution is the same message, not a second wake.
+      yield* signals.askResolved({ ask: answered, askerThreadId: writerThread, released });
+
+      const page = yield* store.roomMessages(controlRoomId(seededMission), null, 10);
+      assert.strictEqual(page.messages.length, 1);
+      const message = page.messages[0]!;
+      assert.strictEqual(message.kind, "decision");
+      assert.include(message.summary, "after the backup");
+      assert.deepStrictEqual(message.to, [
+        { _tag: "role", roleId: RoleId.make("role-writer") },
+        { _tag: "lane", laneId: LaneId.make("lane-api") },
+      ]);
+      const wakes = threads.sent.filter((sent) => sent.key.startsWith("mission-wake:"));
+      assert.deepStrictEqual(wakes.map((sent) => sent.threadId).toSorted(), [
+        laneThread,
+        writerThread,
+      ]);
+      // Nothing reached a thread except through the doorbell.
+      assert.strictEqual(threads.sent.length, wakes.length);
+    }).pipe(Effect.provide(layer));
+  },
+);

@@ -8,7 +8,7 @@ import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import { forkParked } from "../../../serverActivation.ts";
 import { TERMINAL_RUN_STATUSES } from "../../control/model.ts";
-import { asksRoomsLayer } from "./adapters.ts";
+import { asksRoomsLayer, asksSignalsLayer } from "./adapters.ts";
 import * as CoordShim from "./coordShim.ts";
 import { installSendGuard, requireSendGuard } from "./guardHook.ts";
 import * as MissionRouter from "./MissionRouter.ts";
@@ -30,8 +30,14 @@ export const RouterServicesLive = CoordShim.layer.pipe(
   Layer.provideMerge(Layer.mergeAll(RouterStore.layer, threadsLayer)),
 );
 
-/** Asks' `AsksRooms` port backed by the router (same instance as `RouterLive`). */
-export const RouterAsksRoomsLive = asksRoomsLayer.pipe(Layer.provide(RouterServicesLive));
+/**
+ * Asks' `AsksRooms` and `AsksSignals` ports backed by the router (same
+ * instance as `RouterLive`): posts go into rooms, and resolved asks ring the
+ * doorbell of the asker and of whoever holds the released records.
+ */
+export const RouterAsksPortsLive = Layer.mergeAll(asksRoomsLayer, asksSignalsLayer).pipe(
+  Layer.provide(RouterServicesLive),
+);
 
 /**
  * What a finished or paused run means for the doorbell: a run that ended

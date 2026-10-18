@@ -1610,15 +1610,14 @@ export const layer = Layer.effect(AsksService, make);
 
 /**
  * The service with this server's ports: iMessage lookups against the bridge
- * and Moni's chat, forks and deliveries through thread management, a direct
- * queued line to the asker until the router's wakes merge, and typed seams
- * for rooms (router). Suggestion appliers register into the registry from
+ * and Moni's chat, forks and deliveries through thread management, and typed
+ * seams for rooms and answer signals (router's doorbell). Suggestion appliers register into the registry from
  * the tracks that own them (see wiring.ts).
  */
 export const layerLive = layer.pipe(
   Layer.provideMerge(
-    // ardud missions: router (AsksRooms comes from the router in missions/layer.ts)
-    Layer.mergeAll(Inbound.layer, Ports.signalsDeliver, Ports.applierRegistry).pipe(
+    // ardud missions: router (AsksRooms and AsksSignals come from the router in missions/layer.ts)
+    Layer.mergeAll(Inbound.layer, Ports.applierRegistry).pipe(
       Layer.provideMerge(Ports.threadsLayer),
     ),
   ),
