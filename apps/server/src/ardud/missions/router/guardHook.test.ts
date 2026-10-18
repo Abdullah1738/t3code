@@ -6,6 +6,7 @@ import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  checkSend,
   guardSend,
   installSendGuard,
   requireSendGuard,
@@ -80,3 +81,42 @@ describe("send guard slot", () => {
     }),
   );
 });
+
+// --- router additions: r3 ---
+describe("check-only slot", () => {
+  it.effect("checkSend asks the installed check and never the acting guard", () =>
+    Effect.gen(function* () {
+      let acted = 0;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* installSendGuard(
+            () => {
+              acted += 1;
+              return Effect.succeed(knocked);
+            },
+            () => Effect.succeed({ _tag: "knock", missionId: "m-1" as never, reason: "outsider" }),
+          );
+          assert.deepStrictEqual(yield* checkSend(request), {
+            _tag: "knock",
+            missionId: "m-1" as never,
+            reason: "outsider",
+          });
+          assert.strictEqual(acted, 0);
+        }),
+      );
+      // A guard installed without a check refuses rather than acting.
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* installSendGuard(() => {
+            acted += 1;
+            return Effect.succeed(knocked);
+          });
+          const exit = yield* Effect.exit(checkSend(request));
+          assert.isTrue(Exit.isFailure(exit));
+          assert.strictEqual(acted, 0);
+        }),
+      );
+    }),
+  );
+});
+// --- end router additions ---

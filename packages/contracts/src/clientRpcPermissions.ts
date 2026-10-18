@@ -12,6 +12,8 @@ import { WS_METHODS } from "./rpc.ts";
 import { MISSIONS_POLICY_GUARDED_SCOPES } from "./ardud/missionsPolicyRpc.ts";
 // ardud missions: asks
 import { MISSIONS_ASKS_GUARDED_SCOPES } from "./ardud/missionsAsksRpc.ts";
+// ardud missions: recovery
+import { MISSIONS_RECOVERY_GUARDED_SCOPES } from "./ardud/missionsRecoveryRpc.ts";
 
 /** Incremental client enforcement; the server still authorizes every request. */
 export const CLIENT_GUARDED_RPC_SCOPES = {
@@ -63,6 +65,8 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   ...MISSIONS_POLICY_GUARDED_SCOPES,
   // ardud missions: asks
   ...MISSIONS_ASKS_GUARDED_SCOPES,
+  // ardud missions: recovery
+  ...MISSIONS_RECOVERY_GUARDED_SCOPES,
   [WS_METHODS.missionsUpsertSubMission]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsMergeSubMissions]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsUpsertLane]: AuthOrchestrationOperateScope,

@@ -110,6 +110,9 @@ export class PolicyService extends Context.Service<
     readonly runGovernor: (mode?: GovernorMode) => Fx<GovernorDecision>;
     /** Expires overdue holds and puts pending role models on idle holders. */
     readonly sweep: Fx<void>;
+    // ardud missions: recovery
+    /** Flips holds whose lease ran out to reconcile-required; recovery runs it on boot. */
+    readonly expireHolds: Fx<void>;
     readonly sampleObservers: Fx<number>;
     /** Background loops: sweep every 30s, governor every 5 min, observers every 15 min. */
     readonly start: Effect.Effect<void, never, Scope.Scope>;
@@ -197,6 +200,8 @@ const make = (options: PolicyOptions) =>
       governor: governorView(deps),
       runGovernor: governor,
       sweep,
+      // ardud missions: recovery
+      expireHolds: Pools.sweepHolds(deps),
       sampleObservers: Pools.sampleObservers(deps),
       start,
     });

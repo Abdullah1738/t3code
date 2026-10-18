@@ -32,6 +32,7 @@ import {
   type RoleBinding,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -41,9 +42,9 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 
-import { masterThreadOf, threadOfActor, type MissionCast } from "../asks/standing.ts";
-import { actorOf } from "../core/provenance.ts";
+import { standingOf, threadOfActor, type MissionCast } from "../asks/standing.ts";
 import { buildCriticalPath } from "../core/snapshots.ts";
+import * as PolicyService from "../policy/PolicyService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import * as Model from "./model.ts";
@@ -73,6 +74,13 @@ const OPEN_HOLDS = ["queued", "active", "reconcile-required"];
 const WAITING_ASK = /waiting on ask ([^:;]+): ([^;]*)/;
 
 type SeenEntry = { readonly key: string; readonly threadId: string };
+
+/** Who decided a recovery change, as it is recorded. */
+interface Decider {
+  readonly by: "owner" | "master";
+  readonly actor: MissionActor;
+  readonly provenance: MissionProvenance;
+}
 
 interface MissionView {
   readonly mission: Mission;
@@ -188,6 +196,8 @@ export const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
   const recovery = yield* RecoveryStore.RecoveryStore;
   const delivery = yield* RecoveryDelivery.RecoveryDelivery;
+  // Optional so recovery still runs where the policy track is not built.
+  const policy = yield* Effect.serviceOption(PolicyService.PolicyService);
   const lock = yield* Semaphore.make(1);
   const bootRef = yield* Ref.make<RecoveryStore.BootInfo | null>(null);
   const bootChecked = yield* Ref.make(false);
@@ -673,10 +683,29 @@ export const make = Effect.gen(function* () {
     return info;
   });
 
+  /**
+   * Leases that ran out while the server was down become reconcile-required
+   * first. Best effort: a failure here never costs the boot incident.
+   */
+  const expireHolds = Option.match(policy, {
+    onNone: () => Effect.void,
+    onSome: (service) =>
+      service.expireHolds.pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) =>
+            Effect.logWarning("missions recovery: expiring pool holds failed", {
+              cause: Cause.pretty(cause),
+            }),
+        ),
+      ),
+  });
+
   const detectBoot = lock.withPermit(
     Effect.gen(function* () {
       const info = yield* start;
       yield* Ref.set(bootChecked, true);
+      yield* expireHolds;
       const key = `boot:${info.bootId}`;
       if ((yield* recovery.seenKeys([key])).size > 0) return null;
       const now = yield* nowIso;
@@ -988,23 +1017,39 @@ export const make = Effect.gen(function* () {
 
   // --- owner and master controls ---
 
+  /**
+   * The principal deciding a recovery change, as recorded on the thread and
+   * its event: the owner, or the master role held by the calling thread. The
+   * caller comes from the transport (MCP invocation, owner's app session).
+   */
   const authorize = (missionId: MissionId, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const cast = yield* castOf(missionId);
-      if (isOwnerProvenance(provenance)) return "owner";
-      if (provenance._tag === "agent" && masterThreadOf(cast) === provenance.threadId)
-        return "master";
+      if (isOwnerProvenance(provenance)) {
+        return { by: "owner", actor: { _tag: "owner" }, provenance } as const satisfies Decider;
+      }
+      if (provenance._tag === "agent") {
+        const standing = standingOf(cast, provenance);
+        const caller = standing.caller.provenance;
+        if (standing.isMaster && caller._tag === "agent" && caller.roleId !== null) {
+          return {
+            by: "master",
+            actor: { _tag: "role", roleId: caller.roleId },
+            provenance: caller,
+          } as const satisfies Decider;
+        }
+      }
       return yield* new MissionError({
         code: "forbidden",
         detail: `Only the owner or mission ${missionId}'s master changes its recovery.`,
       });
     });
 
-  const resume = (provenance: MissionProvenance, input: RecoveryResumeInput) =>
+  const resume = (caller: MissionProvenance, input: RecoveryResumeInput) =>
     lock
       .withPermit(
         Effect.gen(function* () {
-          const by = yield* authorize(input.missionId, provenance);
+          const { by, actor, provenance } = yield* authorize(input.missionId, caller);
           const now = yield* nowIso;
           const open = yield* openIncidentFor(input.missionId);
           if (open === null)
@@ -1024,7 +1069,6 @@ export const make = Effect.gen(function* () {
           if (!targeted && input.mode !== "order" && input.mode !== "release") {
             return yield* invalid(`Mode ${input.mode} needs a threadId or laneId.`);
           }
-          const actor = actorOf(provenance);
           let incident = open;
           let summary: string;
           switch (input.mode) {
@@ -1131,6 +1175,7 @@ export const make = Effect.gen(function* () {
             for (const thread of targets) {
               incident = patchThread(incident, thread, {
                 instruction: input.instruction,
+                instructionBy: actor,
                 decidedBy: actor,
               });
             }
@@ -1170,10 +1215,10 @@ export const make = Effect.gen(function* () {
       )
       .pipe(Effect.andThen(status(input.missionId)));
 
-  const setSettings = (provenance: MissionProvenance, input: RecoverySettingsInput) =>
+  const setSettings = (caller: MissionProvenance, input: RecoverySettingsInput) =>
     lock.withPermit(
       Effect.gen(function* () {
-        const by = yield* authorize(input.missionId, provenance);
+        const { by, actor, provenance } = yield* authorize(input.missionId, caller);
         const now = yield* nowIso;
         const current = yield* settingsOf(input.missionId);
         const next: MissionRecoverySettings = {
@@ -1185,7 +1230,7 @@ export const make = Effect.gen(function* () {
           event: {
             missionId: input.missionId,
             kind: "recovery.settings-changed",
-            actor: actorOf(provenance),
+            actor,
             provenance,
             summary: `Recovery pace set by ${by}: ${next.resumePerMinute} per minute, lanes start ${next.masterLeadSeconds}s after the master's note.`,
             subject: null,
@@ -1220,6 +1265,12 @@ export const make = Effect.gen(function* () {
   const report = (provenance: MissionProvenance, input: RecoveryReportInput) =>
     lock.withPermit(
       Effect.gen(function* () {
+        if (provenance._tag !== "system") {
+          return yield* new MissionError({
+            code: "provenance-invalid",
+            detail: "Restart reports come from a system component's own credential.",
+          });
+        }
         const members = yield* membersOf(input.threads.map((thread) => thread.threadId));
         if (input.dryRun === true || members.length === 0) {
           return { incidentId: null, members, missions: [] } satisfies RecoveryReportResult;
@@ -1238,7 +1289,7 @@ export const make = Effect.gen(function* () {
           incident = yield* collect({
             cause: input.cause,
             id: `rcv-${input.reportId}`,
-            source: provenance._tag === "system" ? provenance.component : "stream-recovery",
+            source: provenance.component,
             window: { from: input.startAt, to: input.endAt > now ? input.endAt : now },
             windowEnd: input.endAt,
             downSeconds: null,

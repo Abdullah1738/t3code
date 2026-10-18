@@ -14,7 +14,7 @@ import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 // ardud missions: core
 import {
   isReservedSessionSubject,
-  OWNER_ALREADY_PAIRED,
+  MAC_LINK_NOT_OWNER,
   ReservedSessionSubjectError,
 } from "../ardud/auth/SessionOrigins.ts";
 
@@ -107,11 +107,9 @@ const pairingCreateCommand = Command.make("create", {
             subject: "one-time-token",
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
             ...(Option.isSome(flags.label) ? { label: flags.label.value } : {}),
-            // ardud missions: core
-            ownerSource: "cli",
           });
           // ardud missions: core
-          if (issued.ownerMarked === false) yield* Console.error(OWNER_ALREADY_PAIRED);
+          yield* Console.error(MAC_LINK_NOT_OWNER);
           const output = formatIssuedPairingCredential(issued, {
             json: flags.json,
             ...(Option.isSome(flags.baseUrl) ? { baseUrl: flags.baseUrl.value } : {}),

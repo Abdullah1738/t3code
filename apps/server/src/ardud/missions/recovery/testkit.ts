@@ -28,6 +28,9 @@ import {
   role,
 } from "../asks/AsksService.testkit.ts";
 import * as MissionService from "../MissionService.ts";
+import * as PolicyService from "../policy/PolicyService.ts";
+import * as PolicyStore from "../policy/PolicyStore.ts";
+import { makePorts } from "../policy/testing.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import * as RecoveryDelivery from "./RecoveryDelivery.ts";
@@ -89,8 +92,17 @@ export interface Sent {
   readonly key: string;
 }
 
-/** A recovery service over an in-memory database with a fake delivery port. */
-export const harness = () => {
+/**
+ * A recovery service over an in-memory database with a fake delivery port;
+ * `withPolicy` builds the policy service (pools and holds) next to it.
+ */
+export const harness = (
+  options: {
+    readonly withPolicy?: boolean;
+    /** A stand-in policy service, e.g. one whose hold expiry fails. */
+    readonly policy?: Layer.Layer<PolicyService.PolicyService>;
+  } = {},
+) => {
   const fake = {
     sent: [] as Array<Sent>,
     busy: new Set<string>(),
@@ -112,8 +124,16 @@ export const harness = () => {
       timeZone: "UTC",
     }),
   );
+  const policy =
+    options.policy ??
+    (options.withPolicy
+      ? PolicyService.layer.pipe(
+          Layer.provideMerge(Layer.mergeAll(PolicyStore.layer, makePorts().layer)),
+        )
+      : Layer.empty);
   const layer = RecoveryService.layer.pipe(
-    Layer.provideMerge(Layer.mergeAll(RecoveryStore.layer, delivery, MissionService.layer)),
+    Layer.provideMerge(Layer.mergeAll(RecoveryStore.layer, delivery, policy)),
+    Layer.provideMerge(MissionService.layer),
     Layer.provideMerge(MissionStore.layer),
     Layer.provideMerge(Sqlite.layerMemory),
   );

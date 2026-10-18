@@ -7711,7 +7711,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             messageId: MessageId.make(`async-answer:${command.requestId}`),
             text: replies.join("\n\n"),
             attachments: [],
-            createdBy: "user",
+            // ardud missions: core - the answering principal, not a hard-coded human.
+            createdBy: command.createdBy ?? "system",
             creationSource: "server",
             dispatchMode,
           },

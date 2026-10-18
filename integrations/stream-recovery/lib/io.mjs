@@ -9,7 +9,6 @@ import { join } from "node:path";
 const HOME = process.env.HOME || homedir();
 export const PATHS = {
   db: process.env.STREAM_RECOVERY_DB || join(HOME, ".robob/userdata/statev2.sqlite"),
-  control: join(HOME, ".robob/ardud-control.json"),
   ocPassword: join(HOME, ".config/opencode-service/password"),
   dataDir: process.env.STREAM_RECOVERY_DATA || join(HOME, ".local/share/stream-recovery/data"),
   bun: join(HOME, ".bun/bin/bun"),
@@ -227,15 +226,42 @@ export function threadMessageIdsSince(db, threadId, sinceIso) {
 
 // ---------- Robob control API ----------
 
+// Robob's address and credential. The component credential comes first
+// (T3_CONTROL_TOKEN_FILE, from `t3 ardud component-token issue stream-recovery`),
+// then the shared ~/.robob/ardud-control.json. Mission recovery takes restart
+// reports only from the stream-recovery credential. Token files must be chmod 600.
+export function controlConfig(env = process.env, home = HOME) {
+  const shared = join(home, ".robob/ardud-control.json");
+  const files = [env.T3_CONTROL_TOKEN_FILE, shared].filter(Boolean);
+  let file = {};
+  for (const path of env.T3_CONTROL_TOKEN && env.T3_CONTROL_URL ? [] : files) {
+    let mode;
+    try {
+      mode = statSync(path).mode;
+    } catch (e) {
+      if (e.code === "ENOENT") continue;
+      throw e;
+    }
+    if (mode & 0o077) throw new Error(`${path} must be chmod 600`);
+    try {
+      file = JSON.parse(readFileSync(path, "utf8"));
+    } catch (e) {
+      throw new Error(`${path} is not valid JSON: ${e.message}`);
+    }
+    if (file?.token) break;
+  }
+  file ??= {};
+  const token = env.T3_CONTROL_TOKEN || file.token;
+  if (!token) throw new Error(`no control token (${files.join(", ")})`);
+  return {
+    url: (env.T3_CONTROL_URL || file.url || "http://127.0.0.1:3773").replace(/\/+$/, ""),
+    token,
+  };
+}
+
 let controlCfg;
 function control() {
-  if (!controlCfg) {
-    const cfg = parse(readFileSync(PATHS.control, "utf8"));
-    controlCfg = {
-      url: (process.env.T3_CONTROL_URL || cfg.url || "http://127.0.0.1:3773").replace(/\/$/, ""),
-      token: process.env.T3_CONTROL_TOKEN || cfg.token,
-    };
-  }
+  controlCfg ??= controlConfig();
   return controlCfg;
 }
 
@@ -265,6 +291,13 @@ async function api(method, path, body) {
 // body: {reportId, cause, startAt, endAt, threads: [{threadId, runIds, childIds}], dryRun?}
 export async function missionRecoveryReport(body) {
   return api("POST", "/api/ardud/missions/recovery/incident", body);
+}
+
+// Which of these threads belong to a live mission. A read: works with the
+// shared token when the report itself is refused for lack of the credential.
+export async function missionRecoveryMembers(threadIds) {
+  const query = encodeURIComponent(threadIds.join(","));
+  return (await api("GET", `/api/ardud/missions/recovery/members?threadIds=${query}`)).members ?? [];
 }
 
 export async function getThread(threadId) {

@@ -149,9 +149,13 @@ test('buildRestartNote lists each lost subagent with model, session, start and p
 
 // ---------- restartScan with a fake io ----------
 
-function fakeIo({ subs = [], runs = [], threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {}, messages = {}, active = [], mission = null }) {
-  const calls = { send: [], telegram: [], commands: [], saves: [], mission: [] };
+function fakeIo({ subs = [], runs = [], threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {}, messages = {}, active = [], mission = null, missionMembers = () => [] }) {
+  const calls = { send: [], telegram: [], commands: [], saves: [], mission: [], members: [] };
   const io = {
+    missionRecoveryMembers: async (threadIds) => {
+      calls.members.push(threadIds);
+      return missionMembers(threadIds);
+    },
     missionRecoveryReport: async (body) => {
       calls.mission.push(body);
       if (typeof mission === 'function') return mission(body);
@@ -806,4 +810,23 @@ test('mission recovery is told dry runs as dry runs, retried when down, and skip
   const old = fakeIo({ subs: restartBurst(), threads, mission: () => { throw Object.assign(new Error('not found'), { status: 404 }); } });
   await restartScan(scanArgs({ handled: {}, servers: [] }), old.io);
   assert.deepEqual(old.calls.send.map((c) => c.threadId).sort(), ['batch', 'kafka', 'pbdraft']);
+});
+
+test('without its own credential the report is refused, and mission members are still left to mission recovery', async () => {
+  const refused = () => { throw Object.assign(new Error('forbidden'), { status: 403 }); };
+  const { io, calls } = fakeIo({
+    subs: restartBurst(), threads, mission: refused,
+    missionMembers: (ids) => ids.filter((id) => id === 'kafka').map((threadId) => ({ threadId, missionIds: ['m-1'] })),
+  });
+  const state = { handled: {}, servers: [] };
+  const [report] = await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.members.map((ids) => [...ids].sort()), [['batch', 'kafka', 'pbdraft', 'tc3']]);
+  assert.deepEqual(calls.send.map((c) => c.threadId).sort(), ['batch', 'pbdraft']);
+  assert.equal(report.results.find((r) => r.plan.threadId === 'kafka').plan.action, 'mission');
+  assert.equal(state.handled['rs-20261015T181745Z'].done, true);
+
+  // A Robob that refuses the read too owns no threads.
+  const closed = fakeIo({ subs: restartBurst(), threads, mission: refused, missionMembers: refused });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), closed.io);
+  assert.deepEqual(closed.calls.send.map((c) => c.threadId).sort(), ['batch', 'kafka', 'pbdraft']);
 });

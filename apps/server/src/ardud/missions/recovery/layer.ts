@@ -7,6 +7,7 @@ import * as Stream from "effect/Stream";
 
 import { forkParked } from "../../../serverActivation.ts";
 import * as MissionService from "../MissionService.ts";
+import { installContinuationGate } from "./continuationGate.ts";
 import * as RecoveryDelivery from "./RecoveryDelivery.ts";
 import * as RecoveryService from "./RecoveryService.ts";
 import * as RecoveryStore from "./RecoveryStore.ts";
@@ -18,8 +19,9 @@ import * as RecoveryStore from "./RecoveryStore.ts";
 const enabled = Config.Boolean("T3CODE_ARDUD_MISSIONS_RECOVERY").pipe(Config.withDefault(true));
 
 /**
- * The server continues cut runs on its own right after boot. Waiting this long
- * lets those continuations land, so notices know which turns already resumed.
+ * The server settles the runs a restart cut right after boot, and continues
+ * those of threads outside missions. Waiting this long lets that land, so the
+ * plan sees final run states (and any continuation the gate did not stop).
  */
 const BOOT_DELAY = "45 seconds";
 const TICK_EVERY = "15 seconds";
@@ -37,12 +39,19 @@ const logged =
       ),
     );
 
-const loops = Layer.effectDiscard(
+/** The loops alone, over a provided RecoveryService (tests use a fake delivery). */
+export const RecoveryLoops = Layer.effectDiscard(
   Effect.gen(function* () {
     const missions = yield* MissionService.MissionService;
     const recovery = yield* RecoveryService.RecoveryService;
     yield* missions.registerRecovery({ state: recovery.state });
     if (!(yield* enabled.pipe(Effect.orElseSucceed(() => true)))) return;
+
+    // Robob's own restart continuation leaves member threads to recovery,
+    // which wakes them in order with what was lost.
+    yield* installContinuationGate((threadId) =>
+      recovery.members([threadId]).pipe(Effect.map((members) => members.length > 0)),
+    );
 
     const ticks = recovery.tick.pipe(
       logged("notice round"),
@@ -81,7 +90,7 @@ const loops = Layer.effectDiscard(
 );
 
 /** Restart and interruption recovery for mission threads. Needs MissionService. */
-export const RecoveryLive = loops.pipe(
+export const RecoveryLive = RecoveryLoops.pipe(
   Layer.provideMerge(RecoveryService.layer),
   Layer.provideMerge(Layer.mergeAll(RecoveryStore.layer, RecoveryDelivery.layer)),
 );

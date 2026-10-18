@@ -7,14 +7,27 @@ import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 
+import type { SessionOrigin } from "../../auth/SessionOrigins.ts";
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import type { ScribeBatchInput } from "./batch.ts";
-import { scribeRouteLayer, SCRIBE_ROUTE_PREFIX } from "./http.ts";
+import { scribeRouteLayer, SCRIBE_CREDENTIAL_REQUIRED, SCRIBE_ROUTE_PREFIX } from "./http.ts";
 import { ScribeService } from "./ScribeService.ts";
 
-const TOKENS: Record<string, ReadonlyArray<AuthEnvironmentScope>> = {
-  "Bearer reader": ["orchestration:read"],
-  "Bearer operator": ["orchestration:read", "orchestration:operate"],
+const READ_OPERATE: ReadonlyArray<AuthEnvironmentScope> = [
+  "orchestration:read",
+  "orchestration:operate",
+];
+
+const TOKENS: Record<
+  string,
+  { readonly scopes: ReadonlyArray<AuthEnvironmentScope>; readonly origin?: SessionOrigin }
+> = {
+  "Bearer reader": { scopes: ["orchestration:read"] },
+  // The shared control token: operate scope, but no component identity.
+  "Bearer operator": { scopes: READ_OPERATE },
+  "Bearer crw": { scopes: READ_OPERATE, origin: { _tag: "component", component: "crw" } },
+  "Bearer scribe": { scopes: READ_OPERATE, origin: { _tag: "component", component: "scribe" } },
+  "Bearer owner": { scopes: READ_OPERATE, origin: { _tag: "owner", source: "desktop" } },
 };
 
 const batch: ScribeBatchInput = {
@@ -44,20 +57,21 @@ const batch: ScribeBatchInput = {
   model: "cc/claude-haiku-5-5",
 };
 
-const handlerWith = (ingested: Array<ScribeBatchInput>) =>
+const handlerWith = (ingested: Array<ScribeBatchInput>, writes: Array<string> = []) =>
   HttpRouter.toWebHandler(
     scribeRouteLayer.pipe(
       Layer.provide(
         Layer.mock(EnvironmentAuth.EnvironmentAuth)({
           authenticateHttpRequest: (request) => {
-            const scopes = TOKENS[request.headers.authorization ?? ""];
-            return scopes === undefined
+            const token = TOKENS[request.headers.authorization ?? ""];
+            return token === undefined
               ? Effect.fail(new EnvironmentAuth.ServerAuthMissingCredentialError({}))
               : Effect.succeed({
                   sessionId: AuthSessionId.make("test-session"),
                   subject: "test",
                   method: "bearer-access-token" as const,
-                  scopes,
+                  scopes: token.scopes,
+                  ...(token.origin ? { origin: token.origin } : {}),
                 });
           },
         }),
@@ -77,6 +91,22 @@ const handlerWith = (ingested: Array<ScribeBatchInput>) =>
                 failed: 0,
                 cursor: input.toEvent,
                 stats: null,
+              };
+            }),
+          applyEditor: (input) =>
+            Effect.sync(() => {
+              writes.push(`editor:${input.missionId}`);
+              return { bottomLine: null, fyi: 0, feed: 0, opened: [], dropped: 0, rejected: [] };
+            }),
+          report: (input) =>
+            Effect.sync(() => {
+              writes.push(`report:${input.kind}:${input.save ? "saved" : "built"}`);
+              return {
+                kind: input.kind,
+                coversFrom: "2026-10-18T08:00:00.000Z",
+                coversTo: "2026-10-18T12:00:00.000Z",
+                text: "Nothing new.",
+                open: [],
               };
             }),
         }),
@@ -100,7 +130,7 @@ const request = (path: string, init: { token?: string; body?: unknown } = {}) =>
 };
 
 describe("scribe routes", () => {
-  it("needs a token, and the operate scope to post a batch", async () => {
+  it("needs a token, and the scribe's credential to post a batch", async () => {
     const ingested: Array<ScribeBatchInput> = [];
     const { handler, dispose } = handlerWith(ingested);
     try {
@@ -109,15 +139,74 @@ describe("scribe routes", () => {
       const reader = await handler(request("/batches", { token: "Bearer reader", body: batch }));
       expect(reader.status).toBe(403);
       expect(ingested).toHaveLength(0);
-      const operator = await handler(
-        request("/batches", { token: "Bearer operator", body: batch }),
-      );
-      expect(operator.status).toBe(200);
-      expect(await operator.json()).toEqual({
+      const scribe = await handler(request("/batches", { token: "Bearer scribe", body: batch }));
+      expect(scribe.status).toBe(200);
+      expect(await scribe.json()).toEqual({
         ok: true,
         result: { duplicate: false, accepted: 1, failed: 0, cursor: 4, stats: null },
       });
       expect(ingested[0]?.notes[0]?.quote).toBe("Three store tests still fail.");
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("N4: only the scribe's own credential writes; anyone with read can still read", async () => {
+    const ingested: Array<ScribeBatchInput> = [];
+    const writes: Array<string> = [];
+    const { handler, dispose } = handlerWith(ingested, writes);
+    const editor = {
+      missionId: "mission-crpko",
+      since: "2026-10-18T08:00:00.000Z",
+      reply: { bottomLine: "All good." },
+      model: null,
+      usage: { input: 1, output: 1 },
+    };
+    const saveReport = { missionId: "mission-crpko", kind: "update", save: true };
+    try {
+      for (const token of ["Bearer operator", "Bearer crw", "Bearer owner"]) {
+        for (const [path, body] of [
+          ["/batches", batch],
+          ["/editor", editor],
+          ["/reports", saveReport],
+        ] as const) {
+          const response = await handler(request(path, { token, body }));
+          expect(response.status, `${token} ${path}`).toBe(403);
+          const { error } = (await response.json()) as { error: { message: string } };
+          expect(error.message).toBe(
+            token === "Bearer crw"
+              ? "This credential is crw; it cannot write as the scribe."
+              : SCRIBE_CREDENTIAL_REQUIRED,
+          );
+        }
+      }
+      expect(ingested).toHaveLength(0);
+      expect(writes).toEqual([]);
+
+      for (const [path, body] of [
+        ["/batches", batch],
+        ["/editor", editor],
+        ["/reports", saveReport],
+      ] as const) {
+        const response = await handler(request(path, { token: "Bearer scribe", body }));
+        expect(response.status, path).toBe(200);
+      }
+      expect(ingested).toHaveLength(1);
+      expect(writes).toEqual(["editor:mission-crpko", "report:update:saved"]);
+
+      // Building a report without keeping it, and the lane list, stay reads.
+      const built = await handler(
+        request("/reports", {
+          token: "Bearer reader",
+          body: { missionId: "mission-crpko", kind: "update" },
+        }),
+      );
+      expect(built.status).toBe(200);
+      expect(writes.at(-1)).toBe("report:update:built");
+      const lanes = await handler(
+        request("/lanes?missionId=mission-crpko", { token: "Bearer operator" }),
+      );
+      expect(lanes.status).toBe(200);
     } finally {
       await dispose();
     }
@@ -129,7 +218,7 @@ describe("scribe routes", () => {
     try {
       const bad = await handler(
         request("/batches", {
-          token: "Bearer operator",
+          token: "Bearer scribe",
           body: { ...batch, notes: [{ ...batch.notes[0], type: "gossip" }] },
         }),
       );

@@ -3,12 +3,14 @@ import {
   MissionError,
   PoolHoldId,
   PoolId,
+  RoleId,
   ThreadId,
   type Lane,
   type PoolHold,
   type RecoveryIncident,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
@@ -22,7 +24,9 @@ import {
   role,
 } from "../asks/AsksService.testkit.ts";
 import * as MissionService from "../MissionService.ts";
+import * as PolicyService from "../policy/PolicyService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import * as Model from "./model.ts";
 import * as RecoveryService from "./RecoveryService.ts";
 import * as RecoveryStore from "./RecoveryStore.ts";
 import {
@@ -389,6 +393,73 @@ it.effect("a hold whose lease ran out during the outage means reconcile first", 
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("boot flips policy holds whose lease ran out before planning the resume", () => {
+  const { layer } = harness({ withPolicy: true });
+  return Effect.gen(function* () {
+    yield* TestClock.setTime(T0 + (RESTART - 900) * 1000);
+    yield* world({ lanes: [lane] });
+    const policy = yield* PolicyService.PolicyService;
+    const pool = yield* policy.createPool(ownerApp, {
+      poolId: PoolId.make("pool-dev-deploy"),
+      name: "Dev deploy",
+      unit: "slot",
+      capacity: 1,
+      scope: { _tag: "mission", missionId },
+      kind: "lease",
+      backend: "native",
+    });
+    const taken = yield* policy.takeHold(agent(laneThread), {
+      poolId: PoolId.make(pool.ref.id),
+      missionId,
+      purpose: "dev deploy",
+      ttlSeconds: 600,
+    });
+    yield* TestClock.setTime(T0 + RESTART * 1000);
+    yield* previousBoot(plus(RESTART - 120));
+    yield* cutRun(laneThread, 1, "./deploy.zsh dev");
+
+    const incident = yield* boot;
+    const holdOf = (snapshot: typeof incident) =>
+      snapshot?.threads.find((thread) => thread.threadId === laneThread)?.holds[0];
+    assert.strictEqual(holdOf(incident)?.status, "reconcile-required");
+    assert.isTrue(holdOf(incident)?.reconcileRequired);
+    const view = yield* policy.pools({ missionId });
+    assert.strictEqual(view.pools[0]?.holds[0]?.id, taken.hold.id);
+    assert.strictEqual(view.pools[0]?.holds[0]?.status, "reconcile-required");
+    const missions = yield* MissionService.MissionService;
+    const kinds = (yield* missions.eventsSince(missionId, 0)).map((event) => event.kind);
+    assert.isBelow(kinds.indexOf("pool.hold-expired"), kinds.indexOf("recovery.incident-opened"));
+    assert.isAtLeast(kinds.indexOf("pool.hold-expired"), 0);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a failing hold expiry never costs the boot incident or later scans", () => {
+  const { layer } = harness({
+    policy: Layer.mock(PolicyService.PolicyService)({
+      expireHolds: Effect.die(new Error("policy store is gone")),
+    }),
+  });
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    const incident = yield* boot;
+    assert.deepStrictEqual(
+      threadsOf(incident).find((thread) => thread.threadId === laneThread)?.action,
+      "resume",
+    );
+    // Scans run once the boot was checked, failure or not.
+    yield* runRow({
+      threadId: laneThread,
+      ordinal: 2,
+      status: "failed",
+      completedAt: plus(RESTART + 120),
+    });
+    yield* TestClock.setTime(T0 + (RESTART + 600) * 1000);
+    const recovery = yield* RecoveryService.RecoveryService;
+    assert.strictEqual((yield* recovery.scan)?.cause, "run-interrupted");
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("resumes follow sub-mission order at the mission's pace and skip busy threads", () => {
   const { fake, layer } = harness();
   const laneIn = (name: string, sub: string): Lane => ({
@@ -486,6 +557,71 @@ it.effect("the master and the owner steer the plan; nobody else can", () => {
     assert.strictEqual(yield* recovery.tick, 1);
     assert.strictEqual(fake.sent.at(-1)?.threadId, laneThread);
     assert.isNull((yield* recovery.status(missionId)).state);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("recovery records the deciding principal, never the claimed thread", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane, webLane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    yield* cutRun(webThread, 1, "vp test run");
+    assert.isNotNull(yield* boot);
+    const recovery = yield* RecoveryService.RecoveryService;
+    const store = yield* MissionStore.MissionStore;
+
+    const status = yield* recovery.resume(agent(masterThread), {
+      missionId,
+      mode: "hold",
+      threadId: webThread,
+      instruction: "Rebase first.",
+    });
+    const held = status.incident?.threads.find((thread) => thread.threadId === webThread);
+    // The master acts as its role, as asks and policy record it.
+    assert.deepStrictEqual(held?.decidedBy, { _tag: "role", roleId: RoleId.make("role-master") });
+    assert.deepStrictEqual(held?.instructionBy, {
+      _tag: "role",
+      roleId: RoleId.make("role-master"),
+    });
+    yield* recovery.setSettings(ownerApp, { missionId, resumePerMinute: 6 });
+    const events = (yield* store.eventsSince(missionId, 0)).filter(
+      (event) => event.kind.startsWith("recovery.") && event.kind !== "recovery.incident-opened",
+    );
+    assert.deepStrictEqual(
+      events.map((event) => [event.kind, event.actor, event.provenance]),
+      [
+        [
+          "recovery.thread-decided",
+          { _tag: "role", roleId: RoleId.make("role-master") },
+          { _tag: "agent", threadId: masterThread, roleId: RoleId.make("role-master") },
+        ],
+        ["recovery.settings-changed", { _tag: "owner" }, ownerApp],
+      ],
+    );
+
+    // The owner sends it on; the instruction stays the master's.
+    yield* recovery.resume(ownerApp, { missionId, mode: "now", threadId: webThread });
+    assert.include(fake.sent.at(-1)?.text ?? "", "From the master: Rebase first.");
+    // A row with no recorded author is not credited to whoever decided last.
+    const unattributed = Model.threadNotice(
+      { cause: "server-restart", at: "09:00" },
+      { ...held!, instructionBy: undefined, decidedBy: { _tag: "owner" } },
+    );
+    assert.include(unattributed, "Recovery instruction: Rebase first.");
+    assert.notInclude(unattributed, "From the owner");
+
+    // A restart report is a component's finding; nothing else is relabelled as one.
+    const report = {
+      reportId: "rs-x",
+      cause: "opencode-restart" as const,
+      startAt: plus(RESTART),
+      endAt: plus(RESTART + 10),
+      threads: [{ threadId: laneThread, runIds: [], childIds: [] }],
+    };
+    for (const caller of [ownerApp, agent(masterThread)]) {
+      const refused = yield* Effect.flip(recovery.report(caller, report));
+      assert.strictEqual(refused.code, "provenance-invalid");
+    }
   }).pipe(Effect.provide(layer));
 });
 

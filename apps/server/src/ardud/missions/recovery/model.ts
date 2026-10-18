@@ -3,6 +3,7 @@
 import type {
   LaneId,
   LaneStatus,
+  MissionActor,
   MissionId,
   MissionRecoverySettings,
   MissionRecoveryState,
@@ -500,6 +501,22 @@ const successionChildren = (lost: ReadonlyArray<RecoveryLostChild>) =>
         )
         .replace("Resume each one:", "Adopt each one if the work still matters:");
 
+/**
+ * Who an instruction is from, as recorded by the service: the owner, or the
+ * master role. Anything else is not dressed up as either, and a later
+ * decision (`decidedBy`) never stands in for the instruction's author.
+ */
+const instructionLabel = (decidedBy: MissionActor | null): string => {
+  switch (decidedBy?._tag) {
+    case "owner":
+      return "From the owner";
+    case "role":
+      return "From the master";
+    default:
+      return "Recovery instruction";
+  }
+};
+
 /** The message one mission thread gets. */
 export const threadNotice = (context: NoticeContext, thread: RecoveryThread) => {
   const waits = thread.action === "notice-only" && thread.roleKind !== "master";
@@ -535,9 +552,7 @@ export const threadNotice = (context: NoticeContext, thread: RecoveryThread) => 
     );
   }
   if (thread.instruction !== null) {
-    parts.push(
-      `From the ${thread.decidedBy?._tag === "owner" ? "owner" : "master"}: ${thread.instruction}`,
-    );
+    parts.push(`${instructionLabel(thread.instructionBy ?? null)}: ${thread.instruction}`);
   }
   if (waits) {
     parts.push(`Your work stays as it is (${thread.reason}): do not restart it now.`);

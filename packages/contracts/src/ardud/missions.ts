@@ -257,7 +257,9 @@ export const Mission = Schema.Struct({
   // --- core additions ---
   /** Who decides which approvals and drafts; first match wins, none means the owner. */
   approvalRouting: Schema.optional(
-    Schema.Array(Schema.suspend((): Schema.Codec<ApprovalRoute> => ApprovalRoute)),
+    Schema.Array(
+      Schema.suspend((): Schema.Codec<ApprovalRoute, ApprovalRouteEncoded> => ApprovalRoute),
+    ),
   ),
 });
 export type Mission = typeof Mission.Type;
@@ -1037,16 +1039,24 @@ export const approverOf = (approval: Pick<Approval, "approver">): Approver =>
  * What a routing row matches; a missing field matches anything. `repository`
  * is `owner/repo`, read from the approval's pull-request link. Draft rows are
  * for the asks track, which routes drafts with the same table.
+ *
+ * `subMissionId` and `workItemId` match the work the approval or draft is
+ * about, so the master can take a whole sub-mission's items. An approval's
+ * work item is the one whose pull request is the approval's PR link.
  */
 export const ApprovalRouteMatch = Schema.Union([
   Schema.TaggedStruct("approval", {
     kind: Schema.optional(Approval.fields.kind),
     repository: Schema.optional(TrimmedNonEmptyString),
+    subMissionId: Schema.optional(SubMissionId),
+    workItemId: Schema.optional(WorkItemId),
   }),
   Schema.TaggedStruct("draft", {
     channel: Schema.optional(DraftChannel),
     audience: Schema.optional(TrimmedNonEmptyString),
     person: Schema.optional(TrimmedNonEmptyString),
+    subMissionId: Schema.optional(SubMissionId),
+    workItemId: Schema.optional(WorkItemId),
   }),
 ]);
 export type ApprovalRouteMatch = typeof ApprovalRouteMatch.Type;
@@ -1062,6 +1072,7 @@ export const ApprovalRoute = Schema.Struct({
   note: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type ApprovalRoute = typeof ApprovalRoute.Type;
+export type ApprovalRouteEncoded = typeof ApprovalRoute.Encoded;
 // --- end core additions ---
 
 // ---------------------------------------------------------------------------
@@ -1723,6 +1734,8 @@ export const RecoveryThread = Schema.Struct({
   instruction: Schema.NullOr(Schema.String),
   noticeAt: Schema.NullOr(IsoDateTime),
   decidedBy: Schema.NullOr(MissionActor),
+  /** Who gave `instruction` (the owner or the master role); later decisions keep it. */
+  instructionBy: Schema.optional(Schema.NullOr(MissionActor)),
 });
 export type RecoveryThread = typeof RecoveryThread.Type;
 
@@ -2078,8 +2091,10 @@ export const SubscribeRoomInput = Schema.Struct({
 export type SubscribeRoomInput = typeof SubscribeRoomInput.Type;
 
 /**
- * Who a membership is for: an owner-attached thread, or a control-API
- * session registered as a mission service (crw, the coord shim, watchers).
+ * Who a membership is for: an owner-attached thread, a control-API session
+ * registered as a mission service (crw, watchers), or a coord actor name
+ * (`master`, a lane, a system subscriber such as `crw`) the `coord` component
+ * credential may speak and read as through the coord shim.
  */
 export const MissionMemberPrincipal = Schema.Union([
   Schema.TaggedStruct("thread", { threadId: ThreadId }),
@@ -2087,13 +2102,14 @@ export const MissionMemberPrincipal = Schema.Union([
     sessionId: TrimmedNonEmptyString,
     label: TrimmedNonEmptyString,
   }),
+  Schema.TaggedStruct("coord", { actor: TrimmedNonEmptyString }),
 ]);
 export type MissionMemberPrincipal = typeof MissionMemberPrincipal.Type;
 
 /**
- * Owner or the mission's master: attach or detach a thread, or register or
- * drop a service session. Only the owner attaches a thread that belongs to
- * another mission.
+ * Owner or the mission's master: attach or detach a thread, register or drop
+ * a service session, or enrol or drop a coord actor for the coord component.
+ * Only the owner attaches a thread that belongs to another mission.
  */
 export const SetMissionMemberInput = Schema.Struct({
   missionId: MissionId,

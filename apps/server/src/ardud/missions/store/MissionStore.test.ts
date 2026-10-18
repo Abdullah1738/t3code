@@ -1,4 +1,13 @@
-import { MissionId, SubMissionId, type Mission, type SubMission } from "@t3tools/contracts";
+import {
+  ForkId,
+  MissionId,
+  RoleBindingId,
+  RoleId,
+  SubMissionId,
+  ThreadId,
+  type Mission,
+  type SubMission,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -201,4 +210,86 @@ it.layer(TestLayer)("MissionStore", (it) => {
       assert.equal(yield* store.latestSeq(MissionId.make("m-invalid")), 0);
     }),
   );
+
+  // --- router additions ---
+  it.effect("finds every mission a thread is in, by index, past the list cap", () =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const sql = yield* SqlClient.SqlClient;
+      const thread = ThreadId.make("t-indexed");
+      const binding = (id: string, threadId: ThreadId, endedAt: string | null = null) =>
+        ({
+          _tag: "role-binding",
+          record: {
+            id: RoleBindingId.make(id),
+            roleId: RoleId.make("role-x"),
+            threadId,
+            reason: "initial",
+            handoffNote: null,
+            observedModel: null,
+            boundAt: at,
+            endedAt,
+          },
+        }) as const;
+      yield* store.commit({
+        event: event("m-bound"),
+        upserts: [
+          { _tag: "mission", record: mission("m-bound") },
+          binding("b-ended", thread, at),
+          ...Array.from({ length: 1_001 }, (_, index) =>
+            binding(`b-crowd-${index}`, ThreadId.make(`t-crowd-${index}`)),
+          ),
+        ],
+      });
+      yield* store.commit({
+        event: event("m-forked"),
+        upserts: [
+          { _tag: "mission", record: mission("m-forked") },
+          {
+            _tag: "fork",
+            record: {
+              id: ForkId.make("fork-1"),
+              missionId: MissionId.make("m-forked"),
+              kind: "discuss",
+              masterThreadId: ThreadId.make("t-master"),
+              forkThreadId: thread,
+              origin: null,
+              status: "archived",
+              summaryLine: null,
+              commitsMission: false,
+              createdAt: at,
+              closedAt: at,
+            },
+          },
+        ],
+      });
+      yield* store.upsert({ _tag: "mission", record: mission("m-other") }, event("m-other"));
+
+      // Any status counts: the router decides what a record grants.
+      assert.deepStrictEqual(yield* store.missionsOfThread(thread), [
+        MissionId.make("m-bound"),
+        MissionId.make("m-forked"),
+      ]);
+      assert.deepStrictEqual(yield* store.missionsOfThread(ThreadId.make("t-crowd-1000")), [
+        MissionId.make("m-bound"),
+      ]);
+      assert.deepStrictEqual(yield* store.missionsOfThread(ThreadId.make("t-nowhere")), []);
+
+      const bound = yield* store.listAllInMission("role-binding", MissionId.make("m-bound"), [
+        "bound",
+      ]);
+      assert.equal(bound.length, 1_001);
+      assert.equal(
+        (yield* store.list("role-binding", { missionId: MissionId.make("m-bound") })).length,
+        1_000,
+      );
+
+      const plan = yield* sql<{ readonly detail: string }>`
+        EXPLAIN QUERY PLAN SELECT mission_id FROM ardud_mission_records
+        WHERE json_extract(record_json, '$.record.threadId') = ${thread} AND kind = 'role-binding'
+      `;
+      assert.isTrue(plan.some((row) => row.detail.includes("ardud_mission_records_by_thread")));
+    }),
+  );
+  // --- end router additions ---
 });

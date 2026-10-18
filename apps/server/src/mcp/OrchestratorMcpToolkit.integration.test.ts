@@ -1646,11 +1646,14 @@ describe("orchestrator MCP toolkit", () => {
               kind: "user_input",
             });
             // What the card's Save sends (secrets.answerRequest).
-            yield* secretRequests.answer({
-              threadId: parentThreadId,
-              turnItemId: card.id,
-              answer: { type: "save", secret: "github-webhook-secret" },
-            });
+            yield* secretRequests.answer(
+              {
+                threadId: parentThreadId,
+                turnItemId: card.id,
+                answer: { type: "save", secret: "github-webhook-secret" },
+              },
+              { _tag: "owner-app", surface: "web", sessionId: "s-owner" },
+            );
             const secretCall = yield* Fiber.join(secretFiber);
             expect(secretCall.isError).toBe(false);
             const secretResult = secretCall.structuredContent as {

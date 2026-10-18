@@ -3,6 +3,7 @@ import * as NodeHttp from "node:http";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { AuthStandardClientScopes } from "@t3tools/contracts";
@@ -20,6 +21,8 @@ import {
   SERVICE_LAUNCHER_PROTOCOL,
 } from "../cloud/serviceProtocol.ts";
 import * as ServiceLauncherClient from "../cloud/serviceLauncherClient.ts";
+// ardud missions: core
+import { MAC_LINK_NOT_OWNER } from "../ardud/auth/SessionOrigins.ts";
 import {
   makePersistedServerRuntimeState,
   persistServerRuntimeState,
@@ -233,6 +236,45 @@ describe("t3 pair", () => {
         }>;
         assert.lengthOf(credentials, 1);
         assert.deepEqual(credentials[0]?.scopes, ["orchestration:read", "relay:read"]);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  // ardud missions: core
+  it.effect("N1: links made on the Mac are never owner links, even before any owner", () =>
+    withDescriptorServer((origin) =>
+      Effect.gen(function* () {
+        const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-owner-test-"));
+        yield* persistServerRuntimeState({
+          path: NodePath.join(baseDir, "userdata", "server-runtime.json"),
+          state: yield* makePersistedServerRuntimeState({
+            config: { host: "127.0.0.1", devUrl: undefined },
+            port: Number(new URL(origin).port),
+          }),
+        });
+
+        const stderr = yield* provideCliTestLayers(
+          Effect.gen(function* () {
+            yield* runCli(["pair", "--base-dir", baseDir]);
+            yield* runCli(["auth", "pairing", "create", "--base-dir", baseDir]);
+            return yield* TestConsole.errorLines;
+          }),
+        );
+        expect(stderr.filter((line) => line === MAC_LINK_NOT_OWNER)).toHaveLength(2);
+
+        const db = new NodeSqlite.DatabaseSync(
+          NodePath.join(baseDir, "userdata", "statev2.sqlite"),
+        );
+        try {
+          expect(db.prepare("SELECT COUNT(*) AS n FROM auth_pairing_links").get()).toEqual({
+            n: 2,
+          });
+          expect(db.prepare("SELECT COUNT(*) AS n FROM ardud_mission_owner_grants").get()).toEqual({
+            n: 0,
+          });
+        } finally {
+          db.close();
+        }
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   );

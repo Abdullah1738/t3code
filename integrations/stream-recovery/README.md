@@ -91,13 +91,22 @@ also looks for those:
   cannot find is retried 3 scans first. Finished incidents keep only per-thread
   flags in state. Incident ids start `rs-`.
 - Mission members belong to Robob's mission recovery. Each restart is posted
-  once to `POST /api/ardud/missions/recovery/incident` (same control token,
-  `reportId` = incident id, cut run ids and cancelled child ids per thread);
-  the reply lists which threads are mission members. Those get no note here
+  once to `POST /api/ardud/missions/recovery/incident` (`reportId` = incident
+  id, cut run ids and cancelled child ids per thread). Robob takes that report
+  only from stream-recovery's own credential: `t3 ardud component-token issue
+  stream-recovery`, saved as `{ "url", "token" }` (chmod 600) and named by
+  `T3_CONTROL_TOKEN_FILE` in the LaunchAgent env. The reply lists which
+  threads are mission members. Those get no note here
   and no busy hold-back (mission recovery sends its own notice, master first,
   paced), but their held queue is still released. The summary adds one line per
-  mission. If the route is unreachable the incident waits up to 3 scans, then
-  everyone is noted as before; an older Robob (401/403/404) owns no threads.
+  mission. Without the credential the shared `~/.robob/ardud-control.json` is
+  used and Robob refuses the report (403); stream-recovery then only asks
+  `GET .../members` which threads are members and leaves them alone (mission
+  recovery still finds their cut turns through its own boot check and scans).
+  If the route is unreachable the incident waits up to 3 scans, then everyone
+  is noted as before; an older Robob (401/404, or 403 on the read too) owns no
+  threads. A token file that is not valid JSON or readable by others is an
+  error, not a fallback.
 
 ## Stall watch
 

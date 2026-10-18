@@ -9,6 +9,10 @@
  * `{ ok: false, error: { code, message, ...extra } }`, which coord rethrows as
  * its own error. Anything unexpected answers 503 without a code, which coord
  * reports as `messaging_unavailable` so its caller retries the same key.
+ *
+ * The caller is whoever the credential's origin row names, never a body
+ * field: only the `coord` component credential gets through (see
+ * `coordShim.ts` for which actors it may speak for).
  */
 import {
   AuthOrchestrationOperateScope,
@@ -141,13 +145,15 @@ const makeRoutes = Effect.gen(function* () {
           status: 403,
         });
       }
-      return session;
+      return session.origin?._tag === "component" ? session.origin.component : null;
     });
 
   const post = authenticate(AuthOrchestrationOperateScope).pipe(
-    Effect.andThen(decodeBody(decodePost)),
-    Effect.flatMap((body) =>
-      shim.post({
+    Effect.flatMap((component) =>
+      decodeBody(decodePost).pipe(Effect.map((body) => ({ component, body }))),
+    ),
+    Effect.flatMap(({ component, body }) =>
+      shim.post(component, {
         mission: body.mission,
         channel: body.channel,
         as: body.as,
@@ -168,9 +174,9 @@ const makeRoutes = Effect.gen(function* () {
   );
 
   const inbox = authenticate(AuthOrchestrationReadScope).pipe(
-    Effect.andThen(searchParams),
-    Effect.flatMap((params) =>
+    Effect.flatMap((component) =>
       Effect.gen(function* () {
+        const params = yield* searchParams;
         const mission = yield* decodeMission(params.get("mission") ?? "").pipe(
           Effect.mapError(() => invalid("mission is required")),
         );
@@ -181,7 +187,7 @@ const makeRoutes = Effect.gen(function* () {
         if (after === null || limit === null) {
           return yield* invalid("after and limit must be non-negative integers");
         }
-        const events = yield* shim.inbox({
+        const events = yield* shim.inbox(component, {
           mission,
           as,
           unacked: params.get("unacked") === "1",
@@ -194,8 +200,9 @@ const makeRoutes = Effect.gen(function* () {
   );
 
   const ack = authenticate(AuthOrchestrationOperateScope).pipe(
-    Effect.andThen(decodeBody(decodeAck)),
-    Effect.flatMap((body) => shim.ack(body)),
+    Effect.flatMap((component) =>
+      decodeBody(decodeAck).pipe(Effect.flatMap((body) => shim.ack(component, body))),
+    ),
     Effect.map((acked) => json({ ok: true, acked })),
   );
 

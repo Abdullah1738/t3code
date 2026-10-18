@@ -24,6 +24,8 @@ import * as SecretRequests from "./SecretRequests.ts";
 const threadId = ThreadId.make("thread-orchestrator");
 const turnItemId = TurnItemId.make("turn-item:secret-request:1");
 const projectId = ProjectId.make("project-1");
+/** ardud missions: core - the paired owner's session, the only one that answers a card. */
+const owner = { _tag: "owner-app", surface: "web", sessionId: "s-owner" } as const;
 
 /** Runs `body` against the service with an in-memory store and a thread holding one request. */
 const withService = <A, E>(
@@ -142,11 +144,14 @@ const valuesOf = (stored: Map<string, Uint8Array>) =>
 it.effect("a saved answer becomes a one-use ref, and the thread only learns it was saved", () =>
   withService(({ service, stored, dispatched }) =>
     Effect.gen(function* () {
-      yield* service.answer({
-        threadId,
-        turnItemId,
-        answer: { type: "save", secret: "ghp_secret" },
-      });
+      yield* service.answer(
+        {
+          threadId,
+          turnItemId,
+          answer: { type: "save", secret: "ghp_secret" },
+        },
+        owner,
+      );
       assert.equal(dispatched.length, 1);
       assert.include(dispatched[0] as object, {
         type: "secret_request.record",
@@ -167,11 +172,14 @@ it.effect("a saved answer becomes a one-use ref, and the thread only learns it w
 it.effect("two concurrent uses of one ref hand the value out once", () =>
   withService(({ service }) =>
     Effect.gen(function* () {
-      yield* service.answer({
-        threadId,
-        turnItemId,
-        answer: { type: "save", secret: "ghp_secret" },
-      });
+      yield* service.answer(
+        {
+          threadId,
+          turnItemId,
+          answer: { type: "save", secret: "ghp_secret" },
+        },
+        owner,
+      );
       const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
       const results = yield* Effect.all(
         [service.consume({ ref, projectId }), service.consume({ ref, projectId })].map(
@@ -189,9 +197,12 @@ it.effect("a save that loses to the card closing deletes the value and says so",
     ({ service, stored }) =>
       Effect.gen(function* () {
         const error = yield* service
-          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } })
+          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } }, owner)
           .pipe(Effect.flip);
-        assert.equal(error.reason, "agent_stopped");
+        assert.equal(
+          error._tag === "SecretRequestError" ? error.reason : error._tag,
+          "agent_stopped",
+        );
         assert.isFalse(valuesOf(stored).some((value) => value.includes("ghp_secret")));
       }),
     { closedFirst: true },
@@ -203,14 +214,20 @@ it.effect("a save whose record failed can be saved again", () =>
     ({ service }) =>
       Effect.gen(function* () {
         const failed = yield* service
-          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } })
+          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } }, owner)
           .pipe(Effect.flip);
-        assert.equal(failed.reason, "record_failed");
-        yield* service.answer({
-          threadId,
-          turnItemId,
-          answer: { type: "save", secret: "ghp_secret" },
-        });
+        assert.equal(
+          failed._tag === "SecretRequestError" ? failed.reason : failed._tag,
+          "record_failed",
+        );
+        yield* service.answer(
+          {
+            threadId,
+            turnItemId,
+            answer: { type: "save", secret: "ghp_secret" },
+          },
+          owner,
+        );
         const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
         assert.equal(yield* service.consume({ ref, projectId }), "ghp_secret");
       }),
@@ -223,13 +240,16 @@ it.effect("a save whose record and cleanup both failed is finished by saving aga
     ({ service }) =>
       Effect.gen(function* () {
         yield* service
-          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } })
+          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } }, owner)
           .pipe(Effect.flip);
-        yield* service.answer({
-          threadId,
-          turnItemId,
-          answer: { type: "save", secret: "ghp_secret" },
-        });
+        yield* service.answer(
+          {
+            threadId,
+            turnItemId,
+            answer: { type: "save", secret: "ghp_secret" },
+          },
+          owner,
+        );
         assert.isTrue(Option.isSome(yield* service.savedRef({ threadId, turnItemId })));
       }),
     { failedRecords: 1, removeFails: true },
@@ -239,11 +259,14 @@ it.effect("a save whose record and cleanup both failed is finished by saving aga
 it.effect("a ref only works in the project it was entered for", () =>
   withService(({ service }) =>
     Effect.gen(function* () {
-      yield* service.answer({
-        threadId,
-        turnItemId,
-        answer: { type: "save", secret: "ghp_secret" },
-      });
+      yield* service.answer(
+        {
+          threadId,
+          turnItemId,
+          answer: { type: "save", secret: "ghp_secret" },
+        },
+        owner,
+      );
       const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
       const elsewhere = yield* service
         .consume({ ref, projectId: ProjectId.make("project-other") })
@@ -258,15 +281,46 @@ it.effect("a ref only works in the project it was entered for", () =>
 it.effect("declining stores nothing, and a request is answered once", () =>
   withService(({ service, stored, dispatched }) =>
     Effect.gen(function* () {
-      yield* service.answer({ threadId, turnItemId, answer: { type: "decline" } });
+      yield* service.answer({ threadId, turnItemId, answer: { type: "decline" } }, owner);
       assert.deepEqual(valuesOf(stored), []);
       assert.isTrue(Option.isNone(yield* service.savedRef({ threadId, turnItemId })));
       const late = yield* service
-        .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } })
+        .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } }, owner)
         .pipe(Effect.flip);
       assert.include(late.message, "already answered");
       assert.equal(dispatched.length, 1);
       assert.deepEqual(valuesOf(stored), []);
+    }),
+  ),
+);
+
+// ardud missions: core
+it.effect("N7: only the paired owner answers a card; nobody else stores or records anything", () =>
+  withService(({ service, stored, dispatched }) =>
+    Effect.gen(function* () {
+      const others = [
+        null,
+        { _tag: "system", component: "crw" },
+        { _tag: "agent", threadId: ThreadId.make("thread-agent"), roleId: null },
+        { _tag: "owner-imessage", chat: "owner", inboundId: "inbound-1" },
+      ] as const;
+      for (const answeredBy of others) {
+        for (const answer of [
+          { type: "save", secret: "ghp_secret" },
+          { type: "decline" },
+        ] as const) {
+          const refused = yield* service
+            .answer({ threadId, turnItemId, answer }, answeredBy)
+            .pipe(Effect.flip);
+          assert.equal(refused._tag, "EnvironmentAuthorizationError");
+          assert.notInclude(refused.message, "ghp_secret");
+        }
+      }
+      assert.deepEqual(valuesOf(stored), []);
+      assert.equal(dispatched.length, 0);
+      // The card is still pending for the owner.
+      yield* service.answer({ threadId, turnItemId, answer: { type: "decline" } }, owner);
+      assert.equal(dispatched.length, 1);
     }),
   ),
 );
@@ -294,11 +348,14 @@ it.effect("traces and counts a saved answer without ever recording the value", (
     const before = yield* counted;
     yield* withService(({ service }) =>
       Effect.gen(function* () {
-        yield* service.answer({
-          threadId,
-          turnItemId,
-          answer: { type: "save", secret: "ghp_secret" },
-        });
+        yield* service.answer(
+          {
+            threadId,
+            turnItemId,
+            answer: { type: "save", secret: "ghp_secret" },
+          },
+          owner,
+        );
         const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
         yield* service.consume({ ref, projectId });
       }),
@@ -321,11 +378,14 @@ it.effect("works in threads with long ids, such as a delegated subagent's", () =
   return withService(
     ({ service, stored }) =>
       Effect.gen(function* () {
-        yield* service.answer({
-          threadId: delegatedThreadId,
-          turnItemId,
-          answer: { type: "save", secret: "ghp_secret" },
-        });
+        yield* service.answer(
+          {
+            threadId: delegatedThreadId,
+            turnItemId,
+            answer: { type: "save", secret: "ghp_secret" },
+          },
+          owner,
+        );
         // Store names never grow with the thread id, so they fit any filesystem.
         assert.isTrue(Array.from(stored.keys()).every((name) => name.length < 100));
         const ref = Option.getOrThrow(
@@ -342,7 +402,7 @@ it.effect("refuses an answer once the agent that asked has stopped", () =>
     ({ service, stored, dispatched }) =>
       Effect.gen(function* () {
         const late = yield* service
-          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } })
+          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } }, owner)
           .pipe(Effect.flip);
         assert.include(late.message, "has stopped");
         assert.deepEqual(valuesOf(stored), []);
@@ -399,11 +459,14 @@ it.effect("a used value that cannot be deleted is not handed out", () =>
   withService(
     ({ service }) =>
       Effect.gen(function* () {
-        yield* service.answer({
-          threadId,
-          turnItemId,
-          answer: { type: "save", secret: "ghp_secret" },
-        });
+        yield* service.answer(
+          {
+            threadId,
+            turnItemId,
+            answer: { type: "save", secret: "ghp_secret" },
+          },
+          owner,
+        );
         const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
         const failed = yield* service.consume({ ref, projectId }).pipe(Effect.flip);
         assert.include(failed.message, "Could not use");
