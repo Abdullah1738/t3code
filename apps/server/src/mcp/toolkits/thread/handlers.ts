@@ -22,6 +22,8 @@ import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { ThreadToolkit } from "./tools.ts";
+// ardud missions: router
+import { guardMcpWrite } from "../../../ardud/missions/router/guardPaths.ts";
 
 function queueEntry(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
@@ -70,6 +72,28 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
     });
   return { ...context, request, item };
 });
+// ardud missions: router - text an agent pushes into another thread goes through the send guard.
+const guardThreadWrite = Effect.fn("mcp.guardThreadWrite")(function* (input: {
+  readonly path: "queued-edit" | "merge-back" | "request-respond";
+  readonly threadId: ThreadId | undefined;
+  readonly text: string;
+}) {
+  const { caller, projection, scope } = yield* readThread(input.threadId);
+  // Same caller, target and text decide once, so a retried call never knocks twice.
+  const sender = caller?.id ?? scope.client?.sessionId ?? "unknown";
+  const requestKey = `${input.path}:${sender}:${projection.thread.id}:${input.text}`;
+  yield* guardMcpWrite({
+    path: input.path,
+    targetThreadId: projection.thread.id,
+    caller: {
+      thread: caller === undefined ? undefined : { id: caller.id, title: caller.title },
+      client: scope.client,
+    },
+    text: input.text,
+    requestKey,
+  });
+});
+
 /** A tool that changes `threadId`, or the caller's own thread when it is omitted. */
 const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A, E, R>(
   handle: (params: P) => Effect.Effect<A, E, R>,
@@ -140,6 +164,12 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       Effect.gen(function* () {
         const context = yield* readThread(input.targetThreadId);
         const source = yield* readThread(input.sourceThreadId);
+        // ardud missions: router
+        yield* guardThreadWrite({
+          path: "merge-back",
+          threadId: input.targetThreadId,
+          text: `Merge back from thread ${source.projection.thread.id} (${source.projection.thread.title}).`,
+        });
         const result = yield* context.threads
           .dispatch({
             type: "thread.merge_back",
@@ -219,6 +249,12 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   t3_pending_request_respond: writesThread((input) =>
     Effect.gen(function* () {
       const { threads, projection } = yield* readQuestion(input);
+      // ardud missions: router
+      yield* guardThreadWrite({
+        path: "request-respond",
+        threadId: projection.thread.id,
+        text: `Answer to request ${input.requestId} (${Object.keys(input.answers).join(", ")}).`,
+      });
       const result = yield* threads
         .dispatch({
           type: "runtime-request.respond",
@@ -260,12 +296,17 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     }),
   ),
   t3_queue_edit: writesThread((input) =>
-    dispatch(input.threadId, (common) => ({
-      ...common,
-      type: "queued-run.edit",
-      runId: input.queuedRunId,
-      text: input.text,
-    })),
+    // ardud missions: router - editing a queued message rewrites what the thread will read.
+    guardThreadWrite({ path: "queued-edit", threadId: input.threadId, text: input.text }).pipe(
+      Effect.andThen(
+        dispatch(input.threadId, (common) => ({
+          ...common,
+          type: "queued-run.edit",
+          runId: input.queuedRunId,
+          text: input.text,
+        })),
+      ),
+    ),
   ),
   t3_queue_cancel: writesThread((input) =>
     dispatch(input.threadId, (common) => ({

@@ -9,6 +9,7 @@ import { missionsRouteLayer } from "./http.ts";
 import * as MissionService from "./MissionService.ts";
 import { policyRouteLayer } from "./policy/http.ts";
 import { PolicyLive } from "./policy/layer.ts";
+import { RouterAsksRoomsLive, RouterLive } from "./router/layer.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
 import * as MissionStore from "./store/MissionStore.ts";
@@ -21,8 +22,10 @@ const MissionTracksLive = Layer.mergeAll(
   MissionService.layer,
   // tracks: add one line per track layer below
   ScribeLive,
-  AsksService.layerLive,
-  PolicyLive,
+  AsksService.layerLive.pipe(Layer.provide(RouterAsksRoomsLive)),
+  // policy builds the same AsksService layer, so it needs the same router port
+  PolicyLive.pipe(Layer.provide(RouterAsksRoomsLive)),
+  RouterLive,
 );
 
 /**

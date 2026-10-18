@@ -1,0 +1,107 @@
+import {
+  DecideKnockInput,
+  MarkReadInput,
+  MissionId,
+  OrchestratorMcpFailure,
+  RoomPageInput,
+  SubscribeRoomInput,
+} from "@t3tools/contracts";
+import { Tool, Toolkit } from "effect/ai";
+import * as Schema from "effect/Schema";
+
+import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import { MissionRouter } from "./MissionRouter.ts";
+
+/**
+ * Router tools for agents in mission threads. The calling thread comes from
+ * the MCP invocation context, never from parameters. Posting is `mission_post`
+ * (asks track), which goes through the same router.
+ */
+
+const dependencies = [
+  McpInvocationContext.McpInvocationContext,
+  ThreadManagementService.ThreadManagementService,
+  MissionRouter,
+];
+
+const Records = Schema.Array(Schema.Unknown);
+
+const MissionInboxTool = Tool.make("mission_inbox", {
+  description:
+    "Your unread mission messages, oldest first (up to 30, with bodies): requests, blockers, controls and evidence addressed to you or your roles. Handle them, then call mission_mark_read for each room so the doorbell stops.",
+  parameters: Tool.EmptyParams,
+  success: Schema.Struct({ unread: Schema.Number, entries: Records }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionMarkReadTool = Tool.make("mission_mark_read", {
+  description:
+    "Mark a room read up to a message seq. Reading is the acknowledgement: do not post an ack message.",
+  parameters: MarkReadInput,
+  success: Schema.Struct({ position: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionRoomsTool = Tool.make("mission_rooms", {
+  description: "The rooms of a mission you belong to, with their last seq and noise.",
+  parameters: Schema.Struct({ missionId: MissionId }),
+  success: Schema.Struct({ rooms: Records }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionRoomTool = Tool.make("mission_room", {
+  description:
+    "Open a room: its newest message summaries (default 50, at most 200), subscriptions and receipts. Pass beforeSeq for older pages. Message bodies come from mission_inbox.",
+  parameters: RoomPageInput,
+  success: Schema.Struct({ page: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionSubscribeTool = Tool.make("mission_subscribe", {
+  description:
+    "Join, retune or mute a room for yourself (your thread, a role or lane you hold). mode wake rings you for wakeOn kinds (default request, blocker, control); read follows without ringing; mute stops both. The master may set any member's subscription.",
+  parameters: SubscribeRoomInput,
+  success: Schema.Struct({ subscription: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionKnocksTool = Tool.make("mission_knocks", {
+  description:
+    "As the mission's master, the pending knocks you may decide: sends from outside the mission to its members. Knocks addressed to the master are the owner's alone.",
+  parameters: Schema.Struct({ missionId: MissionId }),
+  success: Schema.Struct({ knocks: Records }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionKnockDecideTool = Tool.make("mission_knock_decide", {
+  description:
+    "As the mission's master, forward (optionally edited, optionally to another member) or drop a pending knock that is not addressed to the master.",
+  parameters: DecideKnockInput,
+  success: Schema.Struct({ knock: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+export const RouterToolkit = Toolkit.make(
+  MissionInboxTool,
+  MissionMarkReadTool,
+  MissionRoomsTool,
+  MissionRoomTool,
+  MissionSubscribeTool,
+  MissionKnocksTool,
+  MissionKnockDecideTool,
+);

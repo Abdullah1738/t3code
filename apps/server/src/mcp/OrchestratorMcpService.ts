@@ -98,6 +98,8 @@ import {
 } from "./McpInvocationContext.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+// ardud missions: router
+import { guardMcpWrite } from "../ardud/missions/router/guardPaths.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -1760,6 +1762,26 @@ const make = Effect.gen(function* () {
           createdBy: existing.createdBy,
           creationSource: existing.creationSource,
         };
+        // ardud missions: router - rewriting or re-enabling a schedule bound to a
+        // mission member is a send into that thread, so it goes through the guard.
+        const deliversNewText =
+          (input.prompt !== undefined && input.prompt !== existing.prompt) ||
+          (input.enabled === true && !existing.enabled);
+        if (threadId !== null && deliversNewText) {
+          yield* guardMcpWrite({
+            path: "schedule-edit",
+            targetThreadId: threadId,
+            caller: {
+              thread:
+                parent === undefined
+                  ? undefined
+                  : { id: parent.thread.id, title: parent.thread.title },
+              client: scope.client,
+            },
+            text: upsertInput.prompt,
+            requestKey: `schedule-edit:${existing.id}:${upsertInput.prompt}`,
+          });
+        }
         const { task } = yield* scheduledTasks
           .upsert(upsertInput)
           .pipe(
@@ -2608,14 +2630,25 @@ const make = Effect.gen(function* () {
           requestKey: key,
           operation: "thread-send",
         });
+        const commandId = stableCommandId({ scope, requestKey: key, operation: "thread-send" });
+        // ardud missions: router - mission member threads only take sends the guard passes.
+        yield* guardMcpWrite({
+          path: "thread-send",
+          targetThreadId: input.threadId,
+          caller: {
+            thread:
+              parent === undefined
+                ? undefined
+                : { id: parent.thread.id, title: parent.thread.title },
+            client: scope.client,
+          },
+          text: input.message,
+          requestKey: commandId,
+        });
         const result = yield* threadManagement
           .sendToThread({
             projectId: target.thread.projectId,
-            commandId: stableCommandId({
-              scope,
-              requestKey: key,
-              operation: "thread-send",
-            }),
+            commandId,
             threadId: input.threadId,
             ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
             messageId,

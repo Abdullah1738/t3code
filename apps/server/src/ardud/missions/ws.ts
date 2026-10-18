@@ -19,6 +19,9 @@ import * as AsksService from "./asks/AsksService.ts";
 import { ownerAppProvenance } from "./core/provenance.ts";
 import * as RuleService from "./core/RuleService.ts";
 import * as MissionService from "./MissionService.ts";
+// ardud missions: router
+import { MissionRouter } from "./router/MissionRouter.ts";
+import { makeRouterWsHandlers } from "./router/ws.ts";
 
 /** The WS connection a handler set serves: its surface label and auth session. */
 export interface MissionWsConnection {
@@ -122,5 +125,10 @@ export const missionWsHandlers = (connection: MissionWsConnection) =>
     const missions = yield* MissionService.MissionService;
     const asks = yield* AsksService.AsksService;
     const rules = yield* RuleService.RuleService;
-    return makeMissionWsHandlers({ missions, asks, rules }, connection);
+    // ardud missions: router - rooms, messages and knocks
+    const router = yield* MissionRouter;
+    return {
+      ...makeMissionWsHandlers({ missions, asks, rules }, connection),
+      ...makeRouterWsHandlers(router, connection),
+    };
   });
