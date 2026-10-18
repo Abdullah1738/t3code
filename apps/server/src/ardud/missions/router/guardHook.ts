@@ -10,7 +10,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 
-import type { SendPath, SendSender } from "./model.ts";
+import type { GuardDecision, SendPath, SendSender } from "./model.ts";
 
 /** One attempt to put text into a thread, as the transport saw it. */
 export interface SendGuardRequest {
@@ -39,7 +39,13 @@ export type SendGuardOutcome =
 
 type SendGuard = (request: SendGuardRequest) => Effect.Effect<SendGuardOutcome, MissionError>;
 
+/** What `checkSend` needs: a send's path, target and sender, without its text. */
+export type SendCheckRequest = Pick<SendGuardRequest, "path" | "targetThreadId" | "from">;
+
+type SendCheck = (request: SendCheckRequest) => Effect.Effect<GuardDecision, MissionError>;
+
 const PASS: SendGuardOutcome = { _tag: "pass" };
+const NOT_MEMBER: GuardDecision = { _tag: "not-member" };
 
 /** How long a send waits for the guard to come up before it is refused. */
 const STARTUP_WAIT = Duration.seconds(10);
@@ -53,6 +59,7 @@ const STARTUP_POLL = Duration.millis(50);
 // and is refused rather than delivered. Without the mark (no missions) every
 // send passes, which is the pre-missions behaviour.
 let installed: SendGuard | null = null;
+let installedCheck: SendCheck | null = null;
 let required = false;
 
 /** Called once by the server that runs missions, before any send path can fire. */
@@ -93,23 +100,57 @@ export const guardSend = (
     return awaitInstalled.pipe(Effect.flatMap((guard) => guard(request)));
   });
 
+// --- router additions ---
 /**
- * Installs the guard for the scope. There is one owner at a time: a second
- * install while one is live is a wiring bug and dies rather than silently
- * replacing the first (whose release would then leave sends unguarded).
+ * The guard's decision for a send, with no side effects: nothing is posted,
+ * knocked or logged. For a caller that must know before it acts (for example
+ * before creating something it would then send into). The decision can go
+ * stale; the real send still goes through `guardSend`. Same startup rule as
+ * `guardSend`: without missions every check is `not-member`.
  */
-export const installSendGuard = (guard: SendGuard): Effect.Effect<void, never, Scope.Scope> =>
+export const checkSend = (request: SendCheckRequest): Effect.Effect<GuardDecision, MissionError> =>
+  Effect.suspend(() => {
+    if (installed !== null) return checkWith(request);
+    if (!required) return Effect.succeed(NOT_MEMBER);
+    return awaitInstalled.pipe(Effect.andThen(Effect.suspend(() => checkWith(request))));
+  });
+
+const checkWith = (request: SendCheckRequest): Effect.Effect<GuardDecision, MissionError> =>
+  installedCheck === null
+    ? Effect.fail(
+        new MissionError({
+          code: "conflict",
+          detail: "The installed mission send guard cannot check a send without acting on it.",
+        }),
+      )
+    : installedCheck(request);
+// --- end router additions ---
+
+/**
+ * Installs the guard (and optionally its side-effect-free check) for the
+ * scope. There is one owner at a time: a second install while one is live is
+ * a wiring bug and dies rather than silently replacing the first (whose
+ * release would then leave sends unguarded).
+ */
+export const installSendGuard = (
+  guard: SendGuard,
+  check?: SendCheck,
+): Effect.Effect<void, never, Scope.Scope> =>
   Effect.acquireRelease(
     Effect.suspend(() => {
       if (installed !== null) {
         return Effect.die(new Error("The mission send guard is already installed."));
       }
       installed = guard;
+      installedCheck = check ?? null;
       return Effect.void;
     }),
     () =>
       Effect.sync(() => {
-        if (installed === guard) installed = null;
+        if (installed === guard) {
+          installed = null;
+          installedCheck = null;
+        }
       }),
   );
 

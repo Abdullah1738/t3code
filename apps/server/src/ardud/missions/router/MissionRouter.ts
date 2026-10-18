@@ -16,6 +16,7 @@ import {
   type MissionAttention,
   type MissionAttentionInput,
   type MissionMessage,
+  type MissionMemberPrincipal,
   type MissionMessageBody,
   type MissionMutationResult,
   type MissionProvenance,
@@ -40,8 +41,8 @@ import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
 import { clipSummary } from "../asks/shared.ts";
-import { castOf } from "../core/master.ts";
 import { actorOf } from "../core/provenance.ts";
+import type { GuardPrincipal } from "../guard/principal.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import {
   actorsOfThread,
@@ -50,11 +51,12 @@ import {
   labelOf,
   masterRoleOf,
   masterThreadsOf,
+  readCast,
   recordMembership,
   threadsOfActor,
   type RouterCast,
 } from "./cast.ts";
-import type { SendGuardOutcome, SendGuardRequest } from "./guardHook.ts";
+import type { SendCheckRequest, SendGuardOutcome, SendGuardRequest } from "./guardHook.ts";
 import { contentHashOf, sha256 } from "./hash.ts";
 import {
   actorKey,
@@ -70,11 +72,12 @@ import {
   wakeLine,
   wakeRequestId,
   wakeTargets,
+  type GuardDecision,
   type Member,
   type MemberKind,
   type SendSender,
 } from "./model.ts";
-import { RouterThreads } from "./ports.ts";
+import { RouterThreads, type ThreadFacts } from "./ports.ts";
 import {
   REMIND_AFTER_MS,
   REMIND_GAP_MS,
@@ -101,7 +104,7 @@ const PAGE_DEFAULT = 50;
 const PAGE_MAX = 200;
 const INBOX_MAX = 30;
 const ATTENTION_MAX = 200;
-const LIVE_MISSIONS = ["active", "paused", "draining"];
+const LIVE_MISSIONS: ReadonlySet<string> = new Set(["active", "paused", "draining"]);
 const MEMBER_RANK: Record<MemberKind, number> = { master: 0, created: 1, attached: 2, service: 3 };
 
 const fail = (code: MissionError["code"], detail: string) => new MissionError({ code, detail });
@@ -124,9 +127,66 @@ const standardRoom = (missionId: MissionId, roomId: RoomId) => {
 
 export const controlRoomId = (missionId: MissionId) => RoomId.make(`${missionId}:room:control`);
 
+/** The member-table key for a coord actor the `coord` component may act as. */
+export const coordMemberPrincipal = (actor: string) => `coord:${actor}`;
+
+const memberRowOf = (
+  principal: MissionMemberPrincipal,
+): { readonly principal: string; readonly label: string | null; readonly kind: MemberKind } => {
+  switch (principal._tag) {
+    case "thread":
+      return { principal: `thread:${principal.threadId}`, label: null, kind: "attached" };
+    case "session":
+      return {
+        principal: `session:${principal.sessionId}`,
+        label: principal.label,
+        kind: "service",
+      };
+    case "coord":
+      return {
+        principal: coordMemberPrincipal(principal.actor),
+        label: principal.actor,
+        kind: "service",
+      };
+  }
+};
+
+/**
+ * A thread made by the owner or by this mission's current master is the
+ * master's own. After a master handoff the old master thread is no longer a
+ * member, so neither are the threads it forked; the new master enrols any it
+ * keeps.
+ */
+const sponsoredBy = (cast: RouterCast, creator: GuardPrincipal | null): boolean =>
+  creator !== null &&
+  (creator._tag === "owner" ||
+    (creator._tag === "thread" && masterThreadsOf(cast).includes(creator.threadId)));
+
 /** The thread an agent provenance speaks for; null for everyone else. */
 const actingThread = (provenance: MissionProvenance): ThreadId | null =>
   provenance._tag === "agent" ? provenance.threadId : null;
+
+export type ThreadReadiness = "idle" | "busy" | "gone";
+
+/** A system producer's notice for one thread (see `MissionRouter.notify`). */
+export interface SystemNotice {
+  readonly threadId: ThreadId;
+  readonly text: string;
+  /** Stable per notice: a retry with the same key is delivered once. */
+  readonly key: string;
+  /** The producing component, e.g. `stream-recovery`; the post's author. */
+  readonly producer: string;
+}
+
+export type SystemNoticeOutcome =
+  | {
+      readonly _tag: "posted";
+      readonly missionId: MissionId;
+      readonly roomId: RoomId;
+      readonly messageId: MissionMessageId;
+      readonly seq: number;
+    }
+  | { readonly _tag: "sent" };
 
 /**
  * A post from a trusted server component that already resolved who is
@@ -138,6 +198,8 @@ export interface RelayRequest {
   readonly author: MissionActor;
   readonly authorThread: ThreadId | null;
   readonly coord?: CoordEventRef;
+  /** Written in the message's own transaction (the master feed's cursor): both land or neither. */
+  readonly alongside?: Effect.Effect<void, MissionError>;
 }
 
 /** Provenance for a guarded sender, from the transport context only. */
@@ -228,10 +290,26 @@ export class MissionRouter extends Context.Service<
     readonly inbox: (threadId: ThreadId) => Effect.Effect<AgentInbox, MissionError>;
     /** The send guard. Every path into a thread calls this through guardHook. */
     readonly guard: (request: SendGuardRequest) => Effect.Effect<SendGuardOutcome, MissionError>;
+    /** The guard's decision without acting on it: nothing is posted, knocked or logged. */
+    readonly checkSend: (request: SendCheckRequest) => Effect.Effect<GuardDecision, MissionError>;
     /** Ring, fold or hold a thread's doorbell for its unread deliveries. */
     readonly poke: (threadId: ThreadId) => Effect.Effect<void, MissionError>;
     /** A run on the thread ended: clear its outstanding wake and look again. */
     readonly settled: (threadId: ThreadId) => Effect.Effect<void, MissionError>;
+    /**
+     * Whether a thread can take a notice now: `gone` when it no longer exists
+     * or is archived, `idle` when no turn is running, else `busy` (also when
+     * it cannot be read).
+     */
+    readonly readiness: (threadId: ThreadId) => Effect.Effect<ThreadReadiness>;
+    /**
+     * Delivers a system producer's notice (recovery's continuation notices).
+     * A mission member gets it as a control-room request addressed to it,
+     * posted as the producer, and its doorbell rings when it is free. Any
+     * other thread gets the text queued directly. `key` makes retries land
+     * once on either path. A gone thread fails `not-found`.
+     */
+    readonly notify: (notice: SystemNotice) => Effect.Effect<SystemNoticeOutcome, MissionError>;
     /**
      * Posts for a trusted server component that resolved the speaker itself
      * (the coord shim). Same rules as `post` after that: dense seqs, key
@@ -272,7 +350,7 @@ const make = Effect.gen(function* () {
   const bellLock = yield* Semaphore.make(1);
 
   const loadCast = (missionId: MissionId): Effect.Effect<RouterCast, MissionError> =>
-    castOf(store, missionId);
+    readCast(store, missionId);
 
   const loadRoom = (roomId: RoomId) =>
     Effect.gen(function* () {
@@ -286,10 +364,37 @@ const make = Effect.gen(function* () {
 
   const explicitMembers = (threadId: ThreadId) => rooms.membersByPrincipal(`thread:${threadId}`);
 
-  const liveCasts = Effect.gen(function* () {
-    const missions = yield* store.list("mission", { status: LIVE_MISSIONS });
-    return yield* Effect.forEach(missions, (mission) => loadCast(mission.id));
-  });
+  /**
+   * Every live mission that could count the thread as a member: missions
+   * whose records name it (role bindings, lanes, forks) and missions holding
+   * an explicit member row for it. Both lookups are complete indexed reads
+   * keyed by the thread, never a capped list of missions.
+   */
+  const candidateCasts = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const ids = new Set<MissionId>(yield* store.missionsOfThread(threadId));
+      for (const row of yield* explicitMembers(threadId)) ids.add(row.missionId);
+      const casts: RouterCast[] = [];
+      for (const id of [...ids].toSorted()) {
+        const cast = yield* loadCast(id);
+        if (cast.mission !== null && LIVE_MISSIONS.has(cast.mission.status)) casts.push(cast);
+      }
+      return casts;
+    });
+
+  /** Which missions a membership lookup considers for a thread. */
+  type CastScope = (threadId: ThreadId) => Effect.Effect<ReadonlyArray<RouterCast>, MissionError>;
+  const within =
+    (cast: RouterCast): CastScope =>
+    () =>
+      Effect.succeed([cast]);
+  const everywhere: CastScope = candidateCasts;
+  const elsewhere =
+    (missionId: MissionId): CastScope =>
+    (threadId) =>
+      candidateCasts(threadId).pipe(
+        Effect.map((casts) => casts.filter((cast) => cast.missionId !== missionId)),
+      );
 
   const pickMember = (candidates: ReadonlyArray<Member>): Member | null =>
     [...candidates].sort((a, b) => MEMBER_RANK[a.kind] - MEMBER_RANK[b.kind])[0] ?? null;
@@ -310,20 +415,29 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * Direct membership, or `created` when the thread's parent or root is the
-   * master or one of its threads. A thread whose lineage cannot be read fails
-   * the lookup rather than counting as an outsider, so the guard fails closed.
+   * Direct membership, or `created` when the thread descends from the master
+   * or one of its threads and its recorded creator is the owner or that
+   * mission's master. Lineage alone proves nothing: a lane forking itself, a
+   * subagent child or a legacy fork with no recorded creator is not the
+   * master's own (the master can still enrol it with `mission_set_member`).
+   * A thread whose lineage cannot be read fails the lookup rather than
+   * counting as an outsider, so the guard fails closed.
    */
-  const membershipIn = (casts: ReadonlyArray<RouterCast>, threadId: ThreadId) =>
+  const membershipIn = (scope: CastScope, threadId: ThreadId) =>
     Effect.gen(function* () {
-      const direct = yield* directMembership(casts, threadId);
+      const direct = yield* directMembership(yield* scope(threadId), threadId);
       if (direct !== null) return direct;
       const facts = yield* threads.facts(threadId);
       if (facts === null) return null;
+      let creator: GuardPrincipal | null | undefined;
       for (const ancestor of [facts.parentThreadId, facts.rootThreadId]) {
         if (ancestor === null || ancestor === threadId) continue;
-        const parent = yield* directMembership(casts, ancestor);
-        if (parent !== null && (parent.kind === "master" || parent.kind === "created")) {
+        const ancestorCasts = yield* scope(ancestor);
+        const parent = yield* directMembership(ancestorCasts, ancestor);
+        if (parent === null || (parent.kind !== "master" && parent.kind !== "created")) continue;
+        if (creator === undefined) creator = yield* threads.creator(threadId);
+        const cast = ancestorCasts.find((each) => each.missionId === parent.missionId);
+        if (cast !== undefined && sponsoredBy(cast, creator)) {
           return { missionId: parent.missionId, threadId, kind: "created" } satisfies Member;
         }
       }
@@ -337,7 +451,7 @@ const make = Effect.gen(function* () {
         return yield* fail("provenance-invalid", "Imports do not read or post through the router.");
       }
       if (provenance._tag !== "agent") return;
-      const member = yield* membershipIn([yield* loadCast(missionId)], provenance.threadId);
+      const member = yield* membershipIn(within(yield* loadCast(missionId)), provenance.threadId);
       if (member === null) {
         return yield* fail(
           "forbidden",
@@ -361,7 +475,7 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           switch (actor._tag) {
             case "thread": {
-              if ((yield* membershipIn([cast], actor.threadId)) === null) {
+              if ((yield* membershipIn(within(cast), actor.threadId)) === null) {
                 return yield* fail(
                   "forbidden",
                   `Thread ${actor.threadId} is not a member of mission ${cast.missionId}.`,
@@ -459,10 +573,12 @@ const make = Effect.gen(function* () {
     readonly authorThread?: ThreadId | null;
     /** Coord fields of a post that came through the coord shim. */
     readonly coord?: CoordEventRef;
+    /** Written in the message's transaction; skipped when the key already posted. */
+    readonly alongside?: Effect.Effect<void, MissionError>;
   }
 
   /** Writes one message after the caller's checks. Serialized so seqs stay dense per mission. */
-  const postChecked = ({ input, provenance, author, authorThread, coord }: PostPlan) =>
+  const postChecked = ({ input, provenance, author, authorThread, coord, alongside }: PostPlan) =>
     postLock.withPermit(
       Effect.gen(function* () {
         const room = yield* ensureRoom(input.missionId, input.roomId, provenance);
@@ -584,6 +700,7 @@ const make = Effect.gen(function* () {
             [
               rooms.putRoom({ ...room, lastSeq: seq, lastMessageAt: at }),
               rooms.insertMessage({ message, body, contentHash, deliveries, recipients: ledger }),
+              ...(alongside === undefined ? [] : [alongside]),
             ],
             { discard: true },
           ),
@@ -618,7 +735,7 @@ const make = Effect.gen(function* () {
         for (const threadId of threadsOfActor(cast, actor)) {
           if (threadId === authorThread || out.has(threadId)) continue;
           if (masters.has(threadId) && !fromOwner && !addressed) continue;
-          const member = yield* membershipIn([cast], threadId).pipe(
+          const member = yield* membershipIn(within(cast), threadId).pipe(
             Effect.catchTags({ MissionError: () => Effect.succeed(null) }),
           );
           if (member === null) continue;
@@ -956,21 +1073,15 @@ const make = Effect.gen(function* () {
       if (!owner && input.member && input.principal._tag === "thread") {
         // Attaching would let this mission post into the thread, so a master
         // may not pull in a thread that already belongs to another mission.
-        const others = (yield* liveCasts).filter((each) => each.missionId !== input.missionId);
-        const elsewhere = yield* membershipIn(others, input.principal.threadId);
-        if (elsewhere !== null) {
+        const other = yield* membershipIn(elsewhere(input.missionId), input.principal.threadId);
+        if (other !== null) {
           return yield* fail(
             "forbidden",
-            `Thread ${input.principal.threadId} belongs to mission ${elsewhere.missionId}; only the owner can attach it here.`,
+            `Thread ${input.principal.threadId} belongs to mission ${other.missionId}; only the owner can attach it here.`,
           );
         }
       }
-      const principal =
-        input.principal._tag === "thread"
-          ? `thread:${input.principal.threadId}`
-          : `session:${input.principal.sessionId}`;
-      const label = input.principal._tag === "thread" ? null : input.principal.label;
-      const kind: MemberKind = input.principal._tag === "thread" ? "attached" : "service";
+      const { principal, label, kind } = memberRowOf(input.principal);
       const at = yield* nowIso;
       const result = yield* store.commit({
         event: {
@@ -978,11 +1089,11 @@ const make = Effect.gen(function* () {
           kind: "member.changed",
           actor: actorOf(provenance),
           provenance,
-          summary: `${input.member ? "Added" : "Removed"} ${kind} member ${label ?? principal}`,
+          summary: `${input.member ? "Added" : "Removed"} ${kind} member ${input.principal._tag === "session" ? label : principal}`,
           subject:
             input.principal._tag === "thread"
               ? { kind: "thread", id: input.principal.threadId }
-              : { kind: "mission", id: input.missionId, label: input.principal.label },
+              : { kind: "mission", id: input.missionId, label: label ?? principal },
           payload: { principal, kind, member: input.member },
           at,
         },
@@ -1040,7 +1151,7 @@ const make = Effect.gen(function* () {
           );
         }
         for (const threadId of targets) {
-          if ((yield* membershipIn([cast], threadId)) === null) {
+          if ((yield* membershipIn(within(cast), threadId)) === null) {
             return yield* fail(
               "forbidden",
               `Thread ${threadId} is not a member of mission ${cast.missionId}.`,
@@ -1086,14 +1197,16 @@ const make = Effect.gen(function* () {
   // ---------------------------------------------------------------------------
   // Send guard
 
-  const guard = (request: SendGuardRequest) =>
+  /** The guard's decision and the facts behind it. Reads only. */
+  const decide = (request: SendCheckRequest) =>
     Effect.gen(function* () {
-      const casts = yield* liveCasts;
-      const target = yield* membershipIn(casts, request.targetThreadId);
-      if (target === null) return { _tag: "pass" } satisfies SendGuardOutcome;
+      const target = yield* membershipIn(everywhere, request.targetThreadId);
+      if (target === null) {
+        return { decision: { _tag: "not-member" } as GuardDecision, target: null };
+      }
       const from = request.from;
       let sender: Member | null = null;
-      if (from._tag === "thread") sender = yield* membershipIn(casts, from.threadId);
+      if (from._tag === "thread") sender = yield* membershipIn(everywhere, from.threadId);
       if (from._tag === "session") {
         const rows = yield* rooms.membersByPrincipal(`session:${from.sessionId}`);
         const row = rows.find((each) => each.missionId === target.missionId) ?? rows[0];
@@ -1103,11 +1216,22 @@ const make = Effect.gen(function* () {
             : { missionId: row.missionId, threadId: request.targetThreadId, kind: row.kind };
       }
       const decision = decideSend({ target, sender, from, targetThreadId: request.targetThreadId });
+      return { decision, target };
+    });
+
+  const checkSend = (request: SendCheckRequest) =>
+    decide(request).pipe(Effect.map(({ decision }) => decision));
+
+  const guard = (request: SendGuardRequest) =>
+    Effect.gen(function* () {
+      const { decision, target } = yield* decide(request);
+      if (target === null) return { _tag: "pass" } satisfies SendGuardOutcome;
+      const from = request.from;
       const provenance = senderProvenance(from);
-      const cast = casts.find((each) => each.missionId === target.missionId);
+      const cast = yield* loadCast(target.missionId);
       const targetLabel =
         target.kind === "master"
-          ? `the ${cast?.mission?.title ?? target.missionId} master`
+          ? `the ${cast.mission?.title ?? target.missionId} master`
           : `thread ${request.targetThreadId}`;
       const logDecision = (outcome: string, extra: Record<string, unknown> = {}) =>
         store.appendEvent({
@@ -1274,6 +1398,72 @@ const make = Effect.gen(function* () {
       yield* poke(threadId);
     });
 
+  // --- router additions: system delivery (recovery) ---
+  const isGone = (facts: ThreadFacts | null) =>
+    facts === null || facts.archived || facts.activity === "missing";
+
+  const readiness = (threadId: ThreadId) =>
+    threads.facts(threadId).pipe(
+      Effect.map((facts): ThreadReadiness =>
+        isGone(facts) ? "gone" : facts?.activity === "idle" ? "idle" : "busy",
+      ),
+      Effect.catchTags({ MissionError: () => Effect.succeed<ThreadReadiness>("busy") }),
+    );
+
+  const notify = (input: SystemNotice) =>
+    Effect.gen(function* () {
+      if (isGone(yield* threads.facts(input.threadId))) {
+        return yield* fail("not-found", `Thread ${input.threadId} is gone.`);
+      }
+      const member = yield* membershipIn(everywhere, input.threadId);
+      if (member === null) {
+        yield* threads.send({
+          threadId: input.threadId,
+          text: input.text,
+          key: `recovery:${input.key}`,
+          asOwner: false,
+        });
+        return { _tag: "sent" } satisfies SystemNoticeOutcome;
+      }
+      const provenance: MissionProvenance = { _tag: "system", component: input.producer };
+      const roomId = controlRoomId(member.missionId);
+      const { message, fresh } = yield* relay({
+        input: {
+          missionId: member.missionId,
+          roomId,
+          kind: "request",
+          summary: clipSummary(input.text),
+          body: input.text,
+          to: [{ _tag: "thread", threadId: input.threadId }],
+          key: `recovery:${sha256(input.key).slice(0, 32)}`,
+        },
+        provenance,
+        author: actorOf(provenance),
+        authorThread: null,
+      });
+      // A retry finds the message already posted and rings nothing, so ring
+      // here: a ring that failed last time gets another go. The doorbell only
+      // rings for deliveries still unread, so this is a no-op otherwise.
+      if (!fresh) {
+        yield* poke(input.threadId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("missions router: doorbell failed", {
+              threadId: input.threadId,
+              cause,
+            }),
+          ),
+        );
+      }
+      return {
+        _tag: "posted",
+        missionId: member.missionId,
+        roomId,
+        messageId: message.id,
+        seq: message.seq,
+      } satisfies SystemNoticeOutcome;
+    });
+  // --- end router additions ---
+
   /** One thread's reminder, under the bell lock. True when it was sent. */
   const remindThread = (
     threadId: ThreadId,
@@ -1401,8 +1591,11 @@ const make = Effect.gen(function* () {
     knocks,
     inbox,
     guard,
+    checkSend,
     poke,
     settled,
+    readiness,
+    notify,
     relay,
     roomTuning,
     tuneRoom,

@@ -5,6 +5,9 @@ import * as Layer from "effect/Layer";
 
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import { stateFromShell } from "../../control/model.ts";
+import { optionalAuthorityStore } from "../guard/authority.ts";
+import { forkCreator } from "../guard/forks.ts";
+import type { GuardPrincipal } from "../guard/principal.ts";
 import type { ThreadActivity } from "./model.ts";
 
 /** What the router needs to know about a thread. */
@@ -14,6 +17,8 @@ export interface ThreadFacts {
   readonly activity: ThreadActivity;
   readonly parentThreadId: ThreadId | null;
   readonly rootThreadId: ThreadId | null;
+  /** Archived threads take no deliveries. */
+  readonly archived: boolean;
 }
 
 /**
@@ -26,6 +31,12 @@ export class RouterThreads extends Context.Service<
   RouterThreads,
   {
     readonly facts: (threadId: ThreadId) => Effect.Effect<ThreadFacts | null, MissionError>;
+    /**
+     * Who made the thread, as the guard recorded it when the thread was
+     * forked. `null` when nothing was recorded (legacy forks, subagent
+     * children): lineage alone never makes such a thread a mission member.
+     */
+    readonly creator: (threadId: ThreadId) => Effect.Effect<GuardPrincipal | null>;
     /** Queues `text` in the thread. `key` makes retries land once. */
     readonly send: (input: {
       readonly threadId: ThreadId;
@@ -46,6 +57,7 @@ export const threadsLayer = Layer.effect(
   RouterThreads,
   Effect.gen(function* () {
     const threads = yield* ThreadManagementService.ThreadManagementService;
+    const authority = yield* optionalAuthorityStore;
     const shellOf = (threadId: ThreadId) =>
       threads
         .getThreadShell(threadId)
@@ -65,9 +77,11 @@ export const threadsLayer = Layer.effect(
                       : stateFromShell(shell),
                   parentThreadId: shell.lineage.parentThreadId,
                   rootThreadId: shell.lineage.rootThreadId,
+                  archived: shell.archivedAt !== null && shell.archivedAt !== undefined,
                 },
           ),
         ),
+      creator: (threadId) => forkCreator(authority, threadId),
       send: ({ threadId, text, key, asOwner }) =>
         Effect.gen(function* () {
           const shell = yield* shellOf(threadId);

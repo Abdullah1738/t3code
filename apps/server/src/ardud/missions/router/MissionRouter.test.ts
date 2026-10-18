@@ -169,6 +169,7 @@ describe("send guard", () => {
     const h = harness();
     const child = ThreadId.make("t-child");
     h.parents.set(child, masterThread);
+    h.creators.set(child, { _tag: "thread", threadId: masterThread, title: "Master" });
     return Effect.gen(function* () {
       yield* seed;
       const router = yield* MissionRouter.MissionRouter;
@@ -180,6 +181,161 @@ describe("send guard", () => {
       assert.strictEqual(routed._tag, "routed");
     }).pipe(Effect.provide(h.layer));
   });
+
+  // --- router additions: r3 ---
+  it.effect("a fork counts as the master's only when the owner or the master created it", () => {
+    const h = harness();
+    const ownerFork = ThreadId.make("t-owner-fork");
+    const laneFork = ThreadId.make("t-lane-fork");
+    const legacyFork = ThreadId.make("t-legacy-fork");
+    const strayFork = ThreadId.make("t-stray-fork");
+    h.parents.set(ownerFork, masterThread);
+    h.creators.set(ownerFork, { _tag: "owner", provenance: ownerApp });
+    // The lane forked itself: its lineage is the mission's, its creator is not the master.
+    h.parents.set(laneFork, laneThread);
+    h.creators.set(laneFork, { _tag: "thread", threadId: laneThread, title: "Lane" });
+    // Forked before creators were recorded.
+    h.parents.set(legacyFork, masterThread);
+    // Someone else forked the master.
+    h.parents.set(strayFork, masterThread);
+    h.creators.set(strayFork, { _tag: "thread", threadId: strayThread, title: "Stray" });
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const toMaster = (from: ThreadId) =>
+        router.checkSend({
+          path: "thread-send",
+          targetThreadId: masterThread,
+          from: fromThread(from),
+        });
+      assert.strictEqual((yield* toMaster(ownerFork))._tag, "route");
+      for (const outsider of [laneFork, legacyFork, strayFork]) {
+        const decision = yield* toMaster(outsider);
+        assert.deepStrictEqual(decision, { _tag: "knock", missionId, reason: "outsider" });
+      }
+      // Not members, so a stranger's send to them is none of the guard's business.
+      const toLegacy = yield* router.guard(guardRequest(fromThread(strayThread), legacyFork));
+      assert.deepStrictEqual(toLegacy, { _tag: "pass" });
+      // The master enrols the legacy fork with its member tool; then it is in.
+      yield* router.setMember(
+        { missionId, principal: { _tag: "thread", threadId: legacyFork }, member: true },
+        agent(masterThread),
+      );
+      assert.strictEqual((yield* toMaster(legacyFork))._tag, "route");
+      const changed = (yield* store.eventsSince(missionId, 0)).filter(
+        (event) => event.kind === "member.changed",
+      );
+      assert.strictEqual(changed.length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("checkSend decides without posting, knocking, logging or ringing", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const before = yield* store.latestSeq(missionId);
+      const check = (from: SendSender, target: ThreadId) =>
+        router.checkSend({ path: "thread-send", targetThreadId: target, from });
+      assert.deepStrictEqual(yield* check(fromThread(strayThread), masterThread), {
+        _tag: "knock",
+        missionId,
+        reason: "outsider",
+      });
+      assert.deepStrictEqual(yield* check(fromThread(laneThread), masterThread), {
+        _tag: "route",
+        missionId,
+        author: { _tag: "thread", threadId: laneThread },
+        reason: "member",
+      });
+      assert.deepStrictEqual(yield* check({ _tag: "owner", provenance: ownerApp }, masterThread), {
+        _tag: "allow",
+        missionId,
+        reason: "owner",
+      });
+      assert.deepStrictEqual(yield* check(fromThread(laneThread), ThreadId.make("t-elsewhere")), {
+        _tag: "not-member",
+      });
+      assert.strictEqual(yield* store.latestSeq(missionId), before);
+      assert.deepStrictEqual(yield* store.list("knock", { missionId }), []);
+      // Nothing was posted: the control room was never even opened.
+      assert.strictEqual(
+        yield* failureCode(router.roomPage({ roomId: control }, ownerApp)),
+        "not-found",
+      );
+      assert.deepStrictEqual(h.sent, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("membership sees a mission older than the newest thousand", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      const router = yield* MissionRouter.MissionRouter;
+      // 1,001 newer live missions push mission one out of any capped listing.
+      yield* store.commit({
+        event: {
+          missionId: MissionId.make("m-crowd-0"),
+          kind: "mission.created",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "crowd",
+          subject: null,
+        },
+        upserts: Array.from({ length: 1_001 }, (_, index) => ({
+          _tag: "mission" as const,
+          record: {
+            ...mission,
+            id: MissionId.make(`m-crowd-${index}`),
+            slug: `m-crowd-${index}`,
+            updatedAt: "2026-10-18T08:00:00.000Z",
+          },
+        })),
+      });
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), masterThread));
+      assert.strictEqual(outcome._tag, "knocked");
+      assert.deepStrictEqual(h.sent, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("membership sees the master past a thousand newer bindings", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "role.bound",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "crowd",
+          subject: null,
+        },
+        upserts: Array.from({ length: 1_001 }, (_, index) => ({
+          _tag: "role-binding" as const,
+          record: {
+            ...binding(`b-crowd-${index}`, "role-writer", ThreadId.make(`t-crowd-${index}`)),
+            boundAt: "2026-10-18T08:00:00.000Z",
+          },
+        })),
+      });
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), masterThread));
+      assert.strictEqual(outcome._tag, "knocked");
+      // The oldest crowd thread is a member too.
+      const crowd = yield* router.checkSend({
+        path: "thread-send",
+        targetThreadId: masterThread,
+        from: fromThread(ThreadId.make("t-crowd-0")),
+      });
+      assert.strictEqual(crowd._tag, "route");
+    }).pipe(Effect.provide(h.layer));
+  });
+  // --- end router additions ---
 
   it.effect("an anonymous control-API session knocks until registered as a mission service", () => {
     const h = harness();
@@ -831,3 +987,109 @@ describe("reminders", () => {
     }).pipe(Effect.provide(h.layer));
   });
 });
+
+// --- router additions: r3 ---
+describe("system delivery", () => {
+  it.effect("readiness reads idle, busy and gone without failing", () => {
+    const h = harness();
+    const archived = ThreadId.make("t-archived");
+    const gone = ThreadId.make("t-gone");
+    const unreadable = ThreadId.make("t-unreadable");
+    h.activity.set(laneThread, "running");
+    h.archived.add(archived);
+    h.gone.add(gone);
+    h.unreadable.add(unreadable);
+    return Effect.gen(function* () {
+      const router = yield* MissionRouter.MissionRouter;
+      assert.strictEqual(yield* router.readiness(masterThread), "idle");
+      assert.strictEqual(yield* router.readiness(laneThread), "busy");
+      assert.strictEqual(yield* router.readiness(archived), "gone");
+      assert.strictEqual(yield* router.readiness(gone), "gone");
+      assert.strictEqual(yield* router.readiness(unreadable), "busy");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a member's notice goes through its control room and rings its doorbell once", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const notice = {
+        threadId: writerThread,
+        text: "Your last turn was cut off by a restart. Pick up where you left off.",
+        key: "incident-1:m-1:t-writer",
+        producer: "stream-recovery",
+      };
+      const outcome = yield* router.notify(notice);
+      if (outcome._tag !== "posted") return assert.fail("expected a posted notice");
+      assert.strictEqual(outcome.missionId, missionId);
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.strictEqual(page.messages.length, 1);
+      assert.deepStrictEqual(page.messages[0]!.author, {
+        _tag: "system",
+        component: "stream-recovery",
+      });
+      assert.deepStrictEqual(page.messages[0]!.to, [{ _tag: "thread", threadId: writerThread }]);
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
+      // A retry lands on the same message and rings nothing new.
+      assert.deepStrictEqual(yield* router.notify(notice), outcome);
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
+      assert.strictEqual(h.sent.length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a non-member's notice is queued directly; a gone thread is not found", () => {
+    const h = harness();
+    const gone = ThreadId.make("t-gone");
+    h.gone.add(gone);
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const outcome = yield* router.notify({
+        threadId: strayThread,
+        text: "Resume.",
+        key: "incident-1:none:t-stray",
+        producer: "stream-recovery",
+      });
+      assert.deepStrictEqual(outcome, { _tag: "sent" });
+      assert.deepStrictEqual(h.sent, [
+        {
+          threadId: strayThread,
+          text: "Resume.",
+          key: "recovery:incident-1:none:t-stray",
+          asOwner: false,
+        },
+      ]);
+      const code = yield* failureCode(
+        router.notify({ threadId: gone, text: "Resume.", key: "k", producer: "stream-recovery" }),
+      );
+      assert.strictEqual(code, "not-found");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a retried notice rings the doorbell its first attempt failed to ring", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const notice = {
+        threadId: writerThread,
+        text: "Your last turn was cut off by a restart.",
+        key: "incident-2:m-1:t-writer",
+        producer: "stream-recovery",
+      };
+      // The message commits but the ring fails.
+      h.refuseSend.add(writerThread);
+      const first = yield* router.notify(notice);
+      assert.strictEqual(first._tag, "posted");
+      assert.deepStrictEqual(wakesFor(h.sent, writerThread), []);
+      // Recovery retries the same notice: same message, and now the ring.
+      h.refuseSend.delete(writerThread);
+      assert.deepStrictEqual(yield* router.notify(notice), first);
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.strictEqual(page.messages.length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+// --- end router additions ---
