@@ -3,6 +3,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
@@ -24,6 +25,7 @@ import {
   type EditorFeedItem,
   type EditorInput,
   type EditorState,
+  type EditorSuggestionDraft,
   readEditorState,
 } from "./editor.ts";
 import { currentNotes, fyiScore, rankFyi } from "./notes.ts";
@@ -129,6 +131,16 @@ export interface EditorView {
   readonly feed: ReadonlyArray<EditorFeedItem>;
 }
 
+/**
+ * Proposes one editor suggestion through asks (bars, dedupe, acceptor).
+ * Returns the stored suggestion; an existing one with the draft's id comes
+ * back as it is.
+ */
+export type EditorSuggestionSink = (
+  missionId: MissionId,
+  draft: EditorSuggestionDraft,
+) => Effect.Effect<Suggestion, MissionError>;
+
 export const EDITOR_ACTOR: MissionActor = { _tag: "system", component: "editor" };
 export const EDITOR_PROVENANCE: MissionProvenance = { _tag: "system", component: "editor" };
 /** How far back the editor reads notes, calls and shipped work. */
@@ -201,6 +213,11 @@ export class ScribeService extends Context.Service<
     readonly applyEditor: (request: EditorApply) => Effect.Effect<EditorResult, ScribeError>;
     /** The editor's latest bottom line, FYI order and feed, for the overview. */
     readonly editorView: (missionId: string) => Effect.Effect<EditorView | null, ScribeError>;
+    /**
+     * Send editor suggestions through asks from now on. Until a sink is set
+     * (tests, a server without asks) the editor writes them to the store.
+     */
+    readonly routeSuggestions: (sink: EditorSuggestionSink) => Effect.Effect<void>;
   }
 >()("t3/ardud/missions/scribe/ScribeService") {}
 
@@ -209,6 +226,7 @@ const make = Effect.gen(function* () {
   const scribe = yield* ScribeStore;
   // One batch at a time, so the cursor check and the write see the same cursor.
   const ingestLock = yield* Semaphore.make(1);
+  const suggestionSink = yield* Ref.make<EditorSuggestionSink | null>(null);
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -665,9 +683,28 @@ const make = Effect.gen(function* () {
       const id = MissionId.make(missionId);
 
       const opened: string[] = [];
+      const refused: string[] = [];
+      const sink = yield* Ref.get(suggestionSink);
       for (const draft of plan.suggestions) {
         // Ids come from target and title, so a replayed reply finds its own suggestion.
         if (Option.isSome(yield* store.get("suggestion", draft.id))) continue;
+        if (sink !== null) {
+          const proposed = yield* sink(id, draft).pipe(
+            Effect.map((suggestion) => suggestion.id),
+            Effect.catch((error: MissionError) => {
+              refused.push(`suggestion: ${draft.title} refused (${error.detail})`);
+              return Effect.succeed(null);
+            }),
+          );
+          if (proposed === null) continue;
+          yield* Effect.forEach(
+            draft.candidateIds,
+            (candidateId) => scribe.setCandidateStatus(candidateId, "merged", proposed, at),
+            { discard: true },
+          );
+          opened.push(proposed);
+          continue;
+        }
         const record = yield* decodeSuggestion({
           id: draft.id,
           missionId,
@@ -723,6 +760,7 @@ const make = Effect.gen(function* () {
         yield* scribe.setCandidateStatus(drop.id, "dropped", null, at);
       }
 
+      const rejected = [...plan.rejected, ...refused];
       const previous = (yield* editorStateOf(missionId))?.state ?? null;
       const state: EditorState = {
         bottomLine: plan.bottomLine ?? previous?.bottomLine ?? null,
@@ -731,7 +769,7 @@ const make = Effect.gen(function* () {
         feed: plan.feed,
         since: request.since,
         model: request.model,
-        rejected: plan.rejected,
+        rejected,
       };
       const changed =
         previous === null ||
@@ -772,7 +810,7 @@ const make = Effect.gen(function* () {
         feed: plan.feed.length,
         opened,
         dropped: plan.droppedCandidates.length,
-        rejected: plan.rejected,
+        rejected,
       } satisfies EditorResult;
     });
 
@@ -800,6 +838,7 @@ const make = Effect.gen(function* () {
     editorInput,
     applyEditor,
     editorView,
+    routeSuggestions: (sink) => Ref.set(suggestionSink, sink),
   });
 });
 

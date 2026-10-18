@@ -282,8 +282,8 @@ function queueSuggestions(input: GovernorInput): ReadonlyArray<Suggestion> {
 
 /**
  * Lanes left when nothing is parkable: every mission is at or below its
- * guarantee. Parking below a guarantee is the owner's call, so the governor
- * proposes the lowest-priority lane instead of parking it.
+ * guarantee. The governor never parks below a guarantee on its own, so it
+ * proposes the lowest-priority lane to the master instead.
  */
 function belowGuaranteeSuggestion(input: GovernorInput, pressure: PoolPressure): Suggestion | null {
   const shares = missionShares(input);
@@ -320,7 +320,8 @@ function belowGuaranteeSuggestion(input: GovernorInput, pressure: PoolPressure):
       after: { status: "parked" },
       diffText: `status ${lane.status} -> parked`,
       why: `${pressure.reason}. Every mission is at or below its guarantee, so the governor will not park more on its own.`,
-      acceptor: "owner",
+      // Lanes are the master's control surface (plan 1.7 as amended 17 Oct).
+      acceptor: "master",
     },
     input.now,
   );

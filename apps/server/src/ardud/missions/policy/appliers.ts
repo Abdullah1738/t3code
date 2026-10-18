@@ -4,9 +4,9 @@
  * methods a person's edit uses, so the change lands on the timeline with the
  * decider's actor and provenance.
  *
- * Wiring: asks resolves `SuggestionAppliers` when it decides a suggestion.
- * `appliersFor(policy)` builds one; kinds other tracks own keep the pending
- * outcome line.
+ * Wiring: asks/wiring.ts registers `appliersFor(policy)` for the policy kinds
+ * in asks' applier registry; asks calls it when such a suggestion is accepted.
+ * Kinds other tracks own say so in the outcome.
  */
 import {
   CriticalityTrigger,

@@ -277,7 +277,12 @@ export const buildBlockers = (inputs: BlockerInputs): Array<BlockerGroup> => {
     });
   }
   for (const draft of newestFirst(inputs.pendingDrafts, (draft) => draft.createdAt)) {
-    add(owner, { kind: "draft", id: draft.id, label: draft.audience });
+    // ardud missions: asks (drafts route like approvals)
+    add(approverOf(draft) === "master" ? master : owner, {
+      kind: "draft",
+      id: draft.id,
+      label: draft.audience,
+    });
   }
   for (const item of inputs.workItems) {
     if (item.stage !== "done" && item.blockedBy.length > 0) {
@@ -416,17 +421,19 @@ export const buildInbox = (inputs: InboxInputs): MissionInbox => {
   const ownerApprovals = inputs.pendingApprovals.filter(
     (approval) => approverOf(approval) === "owner",
   );
+  // ardud missions: asks (drafts route like approvals)
+  const ownerDrafts = inputs.pendingDrafts.filter((draft) => approverOf(draft) === "owner");
   return {
     revision: inputs.revision,
     counts: {
       decide: inputs.openAsks.length,
-      approve: ownerApprovals.length + inputs.pendingDrafts.length,
+      approve: ownerApprovals.length + ownerDrafts.length,
       knocks: inputs.pendingKnocks.length,
       suggestions: inputs.suggestions.length,
       fyi: inputs.fyi.length,
     },
     asks: bounded(inputs.openAsks),
-    drafts: bounded(inputs.pendingDrafts),
+    drafts: bounded(ownerDrafts),
     approvals: bounded(ownerApprovals),
     knocks: bounded(inputs.pendingKnocks),
     suggestions: bounded(inputs.suggestions),

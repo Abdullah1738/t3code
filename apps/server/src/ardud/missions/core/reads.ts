@@ -176,7 +176,10 @@ export const makeReads = (
             pendingApprovals: (approvals.get(mission.id) ?? []).filter(
               (approval) => approverOf(approval) === "owner",
             ).length,
-            pendingDrafts: drafts.get(mission.id)?.length ?? 0,
+            // ardud missions: asks (drafts route like approvals)
+            pendingDrafts: (drafts.get(mission.id) ?? []).filter(
+              (draft) => approverOf(draft) === "owner",
+            ).length,
             pendingKnocks: knocks.get(mission.id)?.length ?? 0,
             health: entry.mission,
             subMissionHealth: entry.subMissions,

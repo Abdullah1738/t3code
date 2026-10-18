@@ -2,6 +2,7 @@ import {
   approverOf,
   isOwnerProvenance,
   MissionError,
+  type AnnotateApprovalInput,
   type Approval,
   type ApprovalId,
   type ApprovalRoute,
@@ -36,6 +37,68 @@ import { sameValue } from "./rules.ts";
  * carries the head it was asked at, so a decision on an older head never
  * approves a newer one.
  */
+
+// ardud missions: asks (summary and flag chips on approvals and drafts)
+const SUMMARY_MAX = 400;
+const FLAG_MAX = 40;
+const FLAGS_MAX = 12;
+
+export interface Annotation {
+  readonly summary: string | null;
+  readonly flags: ReadonlyArray<string>;
+}
+
+/**
+ * Cleans a summary and flag labels for an approval or draft: trimmed, empty summary is none,
+ * flags deduped case-insensitively in the order given. Labels are free text; only their size
+ * is checked, since they show as chips.
+ */
+export const cleanAnnotation = (
+  before: Annotation,
+  input: {
+    readonly summary?: string | null | undefined;
+    readonly flags?: ReadonlyArray<string> | undefined;
+  },
+): Effect.Effect<Annotation, MissionError> => {
+  const summary = input.summary === undefined ? before.summary : input.summary?.trim() || null;
+  if (summary !== null && summary.length > SUMMARY_MAX) {
+    return Effect.fail(
+      new MissionError({
+        code: "invalid",
+        detail: `Keep the summary to one or two lines (at most ${SUMMARY_MAX} characters).`,
+      }),
+    );
+  }
+  if (input.flags === undefined) return Effect.succeed({ summary, flags: before.flags });
+  const flags: Array<string> = [];
+  const seen = new Set<string>();
+  for (const raw of input.flags) {
+    const flag = raw.trim();
+    if (flag.length === 0 || seen.has(flag.toLowerCase())) continue;
+    if (flag.length > FLAG_MAX) {
+      return Effect.fail(
+        new MissionError({
+          code: "invalid",
+          detail: `Flag "${flag.slice(0, FLAG_MAX)}..." is too long; flags are short labels (at most ${FLAG_MAX} characters).`,
+        }),
+      );
+    }
+    seen.add(flag.toLowerCase());
+    flags.push(flag);
+  }
+  if (flags.length > FLAGS_MAX) {
+    return Effect.fail(
+      new MissionError({ code: "invalid", detail: `At most ${FLAGS_MAX} flags.` }),
+    );
+  }
+  return Effect.succeed({ summary, flags });
+};
+
+export const sameAnnotation = (left: Annotation, right: Annotation) =>
+  left.summary === right.summary &&
+  left.flags.length === right.flags.length &&
+  left.flags.every((flag, index) => flag === right.flags[index]);
+// ardud missions: end asks
 
 /** What an approval or a draft looks like to the routing table. */
 export type RouteSubject =
@@ -171,6 +234,8 @@ export const makeApprovalWrites = (kit: WriteKit) => {
           decisionNote: null,
           approver: route.approver,
           routeNote: null,
+          // ardud missions: asks
+          ...(yield* cleanAnnotation({ summary: null, flags: [] }, input)),
         };
         return yield* commit(provenance, {
           missionId: mission.id,
@@ -312,5 +377,40 @@ export const makeApprovalWrites = (kit: WriteKit) => {
       }),
     );
 
-  return { openApproval, closeStaleApproval, decideApproval, routeApproval, setApprovalRouting };
+  // ardud missions: asks
+  /** Owner or master: set the summary and flag chips on a pending approval. */
+  const annotateApproval = (provenance: MissionProvenance, input: AnnotateApprovalInput) =>
+    serial(
+      Effect.gen(function* () {
+        const before = yield* loadApproval(input.approvalId);
+        yield* requireOwnerOrMaster(before.missionId, provenance, "annotate an approval");
+        if (before.status !== "pending") {
+          return yield* fail("conflict", `Approval ${before.id} is ${before.status}, not pending.`);
+        }
+        const previous = { summary: before.summary ?? null, flags: before.flags ?? [] };
+        const next = yield* cleanAnnotation(previous, input);
+        if (sameAnnotation(previous, next)) {
+          return yield* unchanged(before.missionId, approvalRef(before));
+        }
+        const record: Approval = { ...before, summary: next.summary, flags: next.flags };
+        const chips = next.flags.length > 0 ? ` [${next.flags.join(", ")}]` : "";
+        return yield* commit(provenance, {
+          missionId: before.missionId,
+          kind: "approval.annotated",
+          summary: `Annotated: ${record.title}${chips}`,
+          ref: approvalRef(record),
+          upserts: [{ _tag: "approval", record }],
+          payload: { summary: next.summary, flags: next.flags, previous },
+        });
+      }),
+    );
+
+  return {
+    openApproval,
+    closeStaleApproval,
+    decideApproval,
+    routeApproval,
+    setApprovalRouting,
+    annotateApproval,
+  };
 };
