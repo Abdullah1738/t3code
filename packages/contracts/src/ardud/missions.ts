@@ -658,6 +658,14 @@ export const Ask = Schema.Struct({
   answer: Schema.NullOr(AskAnswer),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- asks additions ---
+  /** Answer epoch: advances on every reopen. Missing means 0. */
+  revision: Schema.optional(NonNegativeInt),
+  /** When the current epoch began; an answer's evidence must not predate it. Missing means createdAt. */
+  revisedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  /** iMessages that answered an earlier epoch; they never answer this ask again. */
+  spentInboundIds: Schema.optional(Schema.Array(Schema.String)),
+  // --- end asks additions ---
 });
 export type Ask = typeof Ask.Type;
 

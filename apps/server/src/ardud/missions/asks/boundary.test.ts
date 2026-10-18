@@ -223,6 +223,67 @@ describe("boundary review regressions", () => {
     },
   );
 
+  it.effect("N9: a reopened ask takes no iMessage from before the reopen", () => {
+    const { layer } = harness([
+      owner("msg-offline", "offline window", T0 + MINUTE),
+      owner("msg-early", "offline window", T0 + 90_000),
+      owner("msg-online", "online", T0 + 3 * MINUTE),
+      owner("msg-both", "offline window", T0 + MINUTE),
+    ]);
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const ask = yield* asks.openAsk(askInput("Which way?"), master);
+      expect(ask.revision ?? 0).toBe(0);
+
+      yield* TestClock.setTime(T0 + MINUTE + 10_000);
+      const answered = yield* asks.answerAsk(
+        { askId: ask.id, optionId: "b", text: "", inboundId: "msg-offline" },
+        relay,
+      );
+      expect(answered.ask.status).toBe("answered");
+
+      // He takes it back a minute later, well inside the usual clock skew.
+      yield* TestClock.setTime(T0 + 2 * MINUTE);
+      const reopened = yield* asks.reopenAsk({ askId: ask.id, reason: "Not sure" }, ownerApp);
+      expect(reopened.revision).toBe(1);
+      expect(reopened.spentInboundIds).toEqual(["msg-offline"]);
+      // The reply that answered the earlier epoch can't answer this one.
+      expect(
+        yield* failureCode(
+          asks.answerAsk(
+            { askId: ask.id, optionId: "b", text: "", inboundId: "msg-offline" },
+            relay,
+          ),
+        ),
+      ).toBe("provenance-invalid");
+      // Nor can any other reply from before the reopen, even seconds before it.
+      expect(
+        yield* failureCode(
+          asks.answerAsk({ askId: ask.id, optionId: "b", text: "", inboundId: "msg-early" }, relay),
+        ),
+      ).toBe("provenance-invalid");
+      const again = yield* asks.answerAsk(
+        { askId: ask.id, optionId: "a", text: "", inboundId: "msg-online" },
+        relay,
+      );
+      expect(again.ask.answer?.optionId).toBe("a");
+
+      // One reply may still answer two asks that were both open when it arrived.
+      yield* TestClock.setTime(T0);
+      const first = yield* asks.openAsk(askInput("Staging?"), master);
+      const second = yield* asks.openAsk(askInput("Production?"), master);
+      for (const each of [first, second]) {
+        const decided = yield* asks.answerAsk(
+          { askId: each.id, optionId: "b", text: "", inboundId: "msg-both" },
+          relay,
+        );
+        expect(decided.ask.status).toBe("answered");
+      }
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("M3: a master accepts a draft-note suggestion under its own name", () => {
     const { layer } = harness();
     return Effect.gen(function* () {

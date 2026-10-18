@@ -366,6 +366,38 @@ describe("reverse states", () => {
     expect(reopened.events[0]?.kind).toBe("ask.reopened");
     expect(waitingOn({ kind: "work-item", id: "wi-1" }, [reopened.record])).not.toBeNull();
   });
+
+  it("N9: a reopen starts a new epoch and spends the iMessage that answered the old one", () => {
+    const ask = opened();
+    const imessage: MissionProvenance = {
+      _tag: "owner-imessage",
+      chat: "owner",
+      inboundId: "in-1",
+    };
+    const answerWith = (target: Ask, inboundId: string) =>
+      answerAsk({
+        ask: target,
+        input: { askId: target.id, optionId: "a", text: "", inboundId },
+        provenance: { ...imessage, inboundId },
+        asks: [target],
+        now,
+      });
+    const answered = Result.getOrThrow(answerWith(ask, "in-1")).record;
+    const later = "2026-10-17T11:00:00.000Z";
+    const reopened = Result.getOrThrow(
+      reopenAsk({ ask: answered, provenance: ownerApp, reason: "", now: later }),
+    ).record;
+    expect(reopened.revision).toBe(1);
+    expect(reopened.revisedAt).toBe(later);
+    expect(reopened.spentInboundIds).toEqual(["in-1"]);
+    expect(errorCode(answerWith(reopened, "in-1"))).toBe("provenance-invalid");
+    const second = Result.getOrThrow(answerWith(reopened, "in-2")).record;
+    const twice = Result.getOrThrow(
+      reopenAsk({ ask: second, provenance: ownerApp, reason: "", now: later }),
+    ).record;
+    expect(twice.revision).toBe(2);
+    expect(twice.spentInboundIds).toEqual(["in-1", "in-2"]);
+  });
 });
 
 describe("recommendation follow rate", () => {

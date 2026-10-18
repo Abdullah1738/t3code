@@ -63,6 +63,8 @@ import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
 import {
   answerAsk,
+  askEpochOf,
+  askRevisionOf,
   openAsk,
   rejectAskDefaults,
   reopenAsk,
@@ -608,7 +610,9 @@ const make = Effect.gen(function* () {
         provenance,
         inboundId: input.inboundId,
         check: answerCheck({ options: ask.options, optionId: input.optionId, text: input.text }),
-        notBefore: ask.updatedAt,
+        // After a reopen nothing said before the new epoch counts, not even within clock skew.
+        notBefore: askEpochOf(ask),
+        ...(askRevisionOf(ask) > 0 ? { skewMs: 0 } : {}),
         what: "Answering an ask",
       });
       const asks = yield* store.list("ask", { missionId: ask.missionId });
