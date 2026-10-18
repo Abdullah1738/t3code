@@ -11,6 +11,7 @@ import { policyRouteLayer } from "./policy/http.ts";
 import { PolicyLive } from "./policy/layer.ts";
 import { coordShimRouteLayer } from "./router/coordHttp.ts";
 import { RouterAsksPortsLive, RouterLive } from "./router/layer.ts";
+import { masterFeedLayer } from "./router/masterFeed.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
 import * as MissionStore from "./store/MissionStore.ts";
@@ -37,6 +38,8 @@ export const ArdudMissionsLive = Layer.mergeAll(
   RuleService.layer,
   editorWiringLayer,
   asksWiringLayer.pipe(Layer.provide(RuleService.layer)),
+  // the master's inbox feed: editor digests, master-routed approvals and drafts
+  masterFeedLayer,
 ).pipe(Layer.provideMerge(MissionTracksLive), Layer.provideMerge(MissionStore.layer));
 
 /**

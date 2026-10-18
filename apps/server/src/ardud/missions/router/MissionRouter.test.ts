@@ -507,6 +507,40 @@ describe("doorbell", () => {
       assert.strictEqual(wakesFor(h.sent, masterThread).length, 1);
     }).pipe(Effect.provide(h.layer));
   });
+
+  it.effect("a blocker escalated to the master wakes it; one left in the room does not", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const master = { _tag: "role", roleId: RoleId.make("role-master") } as const;
+      yield* router.subscribe(
+        { roomId: control, subscriber: master, mode: "wake", wakeOn: ["blocker"] },
+        ownerApp,
+      );
+      yield* router.post(
+        { missionId, roomId: control, kind: "blocker", summary: "CI is red on main" },
+        agent(laneThread),
+      );
+      assert.deepStrictEqual(wakesFor(h.sent, masterThread), []);
+      yield* router.post(
+        {
+          missionId,
+          roomId: control,
+          kind: "blocker",
+          summary: "Need a call on the schema change",
+          to: [master],
+        },
+        agent(laneThread),
+      );
+      assert.strictEqual(wakesFor(h.sent, masterThread).length, 1);
+      const inbox = yield* router.inbox(masterThread);
+      assert.deepStrictEqual(
+        inbox.entries.map((entry) => entry.message.summary),
+        ["Need a call on the schema change"],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
 });
 
 describe("rooms", () => {
