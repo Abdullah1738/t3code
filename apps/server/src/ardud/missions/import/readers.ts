@@ -92,6 +92,9 @@ export interface CrwHold {
 export interface CrwConfig {
   readonly excludedRepos: ReadonlyArray<string>;
   readonly activeStates: ReadonlyArray<string>;
+  /** crw's own review caps today; the import sizes the mission's review pool from them. */
+  readonly maxReviewsPerTick: number | null;
+  readonly maxReviewsPerDay: number | null;
 }
 
 export interface CrwSnapshot {
@@ -154,14 +157,22 @@ const DEFAULT_ACTIVE_STATES = ["In Review", "Code OK - Pending"];
 
 export const readCrwConfig = (path: string | null): CrwConfig => {
   if (path === null || !NodeFS.existsSync(path))
-    return { excludedRepos: [], activeStates: DEFAULT_ACTIVE_STATES };
+    return {
+      excludedRepos: [],
+      activeStates: DEFAULT_ACTIVE_STATES,
+      maxReviewsPerTick: null,
+      maxReviewsPerDay: null,
+    };
   const raw = JSON.parse(NodeFS.readFileSync(path, "utf8")) as Record<string, unknown>;
   const strings = (v: unknown) =>
     Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  const cap = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
   const active = strings(raw.active_states);
   return {
     excludedRepos: strings(raw.excluded_repos),
     activeStates: active.length > 0 ? active : DEFAULT_ACTIVE_STATES,
+    maxReviewsPerTick: cap(raw.max_reviews_per_tick),
+    maxReviewsPerDay: cap(raw.max_reviews_per_day),
   };
 };
 

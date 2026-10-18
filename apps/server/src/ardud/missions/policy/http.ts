@@ -45,14 +45,19 @@ import { PoolSource } from "./sources.ts";
  * envelope as the rest of the missions API.
  *
  * A token holder is never the owner. A write that names its thread in
- * `x-t3-thread-id` (optionally `x-t3-role-id`) acts as that agent; one that
- * does not (crw, scripts) acts as the control API, a server component that may
+ * `x-t3-thread-id` (optionally `x-t3-role-id`) acts as that agent. A named
+ * server component (`x-t3-component`, one of POLICY_COMPONENTS: crw) acts in
+ * its own name, so its holds and review records say who took them. Anything
+ * else (scripts) acts as the control API. Components and the control API may
  * do what a master may.
  */
 export const POLICY_CONTROL_PROVENANCE: MissionProvenance = {
   _tag: "system",
   component: "control-api",
 };
+
+/** Components that call the policy routes in their own name with the control token. */
+export const POLICY_COMPONENTS: ReadonlySet<string> = new Set(["crw"]);
 
 type HttpErrorCode =
   | "unauthorized"
@@ -185,12 +190,20 @@ const decodeBody = <A>(decodeInput: (input: unknown) => Effect.Effect<A, Schema.
     );
   });
 
-/** The calling agent from its headers, or the control API when no thread is named. */
+/** The calling agent or named component from its headers, else the control API. */
 const callerProvenance = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const threadHeader = request.headers["x-t3-thread-id"];
+  const component = request.headers["x-t3-component"]?.trim() ?? "";
   if (threadHeader === undefined || threadHeader.trim().length === 0) {
-    return POLICY_CONTROL_PROVENANCE;
+    if (component.length === 0) return POLICY_CONTROL_PROVENANCE;
+    if (!POLICY_COMPONENTS.has(component)) {
+      return yield* fail("forbidden", `x-t3-component ${component} is not a known component.`);
+    }
+    return { _tag: "system", component } satisfies MissionProvenance;
+  }
+  if (component.length > 0) {
+    return yield* fail("invalid_request", "Name a thread or a component, not both.");
   }
   const threadId = yield* decodeThreadId(threadHeader.trim()).pipe(
     Effect.mapError(() => fail("invalid_request", "x-t3-thread-id is not a thread id.")),

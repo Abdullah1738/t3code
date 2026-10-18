@@ -11,6 +11,8 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import { PolicyService } from "../policy/PolicyService.ts";
+import { PolicyStore } from "../policy/PolicyStore.ts";
 import { MissionStore } from "../store/MissionStore.ts";
 import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
 import { actorKey, IMPORT_COMPONENT } from "./coordIds.ts";
@@ -367,6 +369,52 @@ export const applyImport = (plan: ImportPlan, sink: RouterImportSink | null) =>
     }
 
     return { diff: state.diff, commits, created, closed } satisfies ApplyResult;
+  });
+
+// ---- policy records ----------------------------------------------------
+
+const POOL_FIELDS = ["name", "unit", "capacity", "scope", "kind", "backend"] as const;
+
+const diffPools$ = (plan: ImportPlan) =>
+  Effect.gen(function* () {
+    const policy = yield* PolicyStore;
+    const create: Array<ImportPlan["policy"]["pools"][number]> = [];
+    const differIds: Array<string> = [];
+    for (const input of plan.policy.pools) {
+      const current = yield* policy.pool(input.poolId);
+      if (current === null) create.push(input);
+      else if (POOL_FIELDS.some((f) => canonical(current[f]) !== canonical(input[f])))
+        differIds.push(input.poolId);
+    }
+    const diff: KindDiff = {
+      kind: "pool",
+      planned: plan.policy.pools.length,
+      create: create.length,
+      unchanged: plan.policy.pools.length - create.length - differIds.length,
+      differs: differIds.length,
+      close: 0,
+      differIds,
+    };
+    return { diff, create };
+  });
+
+/** Compares the planned review pools with the policy store. Writes nothing. */
+export const diffPools = (plan: ImportPlan) => diffPools$(plan).pipe(Effect.map((p) => p.diff));
+
+/**
+ * Creates the planned pools that are missing, through the policy service (so
+ * they get its validation and `pool.created` events). Run after the core
+ * records: a pool needs its mission. An existing pool is never changed; the
+ * master may have moved its capacity since.
+ */
+export const applyPools = (plan: ImportPlan) =>
+  Effect.gen(function* () {
+    const service = yield* PolicyService;
+    const { diff, create } = yield* diffPools$(plan);
+    for (const input of create) {
+      yield* service.createPool({ _tag: "import", source: "crw config.json" }, input);
+    }
+    return { diff, created: create.length };
   });
 
 /** In-memory sink, for tests and for dry runs that diff against an empty router. */

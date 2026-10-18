@@ -115,6 +115,16 @@ export const renderReport = (input: {
   );
   out.push(`  deferred work items: ${tally(core.workItems, (w) => w.deferral?.status ?? "none")}`);
   out.push(`  approvals: ${tally(core.approvals, (a) => `${a.requestedBy}/${a.status}`)}`);
+  out.push(
+    `  approval routing: ${(core.mission.approvalRouting ?? []).map((r) => `${r.match._tag} -> ${r.approver}`).join(", ") || "none (owner)"}`,
+  );
+  out.push(
+    `  review pools: ${
+      plan.policy.pools
+        .map((p) => `${p.poolId} (${p.kind}, ${p.backend}, capacity ${p.capacity} ${p.unit})`)
+        .join(", ") || "none (not requested: pass --review-pool lease|budget)"
+    }`,
+  );
   out.push(`  rooms: ${tally(plan.router.rooms, (r) => r.kind)}`);
   out.push(`  messages: ${tally(plan.router.messages, (m) => m.message.kind)}`);
   out.push(
