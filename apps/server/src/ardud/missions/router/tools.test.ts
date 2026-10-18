@@ -175,4 +175,63 @@ describe("router MCP tools", () => {
       expect(dropped.isError).toBe(false);
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect("parameters are strict: unknown keys are refused, nested ones too", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const refused = (name: string, args: Record<string, unknown>) =>
+        Effect.exit(call(name, masterThread, args)).pipe(
+          Effect.map((exit) => exit._tag === "Failure" || exit.value.isError),
+        );
+      expect(yield* refused("mission_inbox", { threadId: writerThread })).toBe(true);
+      expect(
+        yield* refused("mission_subscribe", {
+          roomId: control,
+          subscriber: { _tag: "thread", threadId: writerThread, asOwner: true },
+          mode: "wake",
+        }),
+      ).toBe(true);
+      expect(
+        yield* refused("mission_set_member", {
+          missionId,
+          principal: { _tag: "thread", threadId: strayThread },
+          member: true,
+          provenance: { _tag: "owner-app", surface: "web", sessionId: null },
+        }),
+      ).toBe(true);
+      // The same calls without the extra keys go through.
+      const subscribed = yield* call("mission_subscribe", masterThread, {
+        roomId: control,
+        subscriber: { _tag: "thread", threadId: writerThread },
+        mode: "wake",
+      });
+      expect(subscribed.isError).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("the master registers members; other threads cannot", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const args = {
+        missionId,
+        principal: { _tag: "session", sessionId: "s-crw", label: "crw" },
+        member: true,
+      };
+      const lane = yield* call("mission_set_member", laneThread, args);
+      expect(lane.isError).toBe(true);
+      const master = yield* call("mission_set_member", masterThread, args);
+      expect(master.isError).toBe(false);
+      const router = yield* MissionRouter.MissionRouter;
+      const outcome = yield* router.guard({
+        path: "control-api",
+        targetThreadId: masterThread,
+        from: { _tag: "session", sessionId: "s-crw", subject: "crw" },
+        text: "review done",
+        requestKey: "tools-test:3",
+      });
+      expect(outcome._tag).toBe("routed");
+    }).pipe(Effect.provide(layer));
+  });
 });

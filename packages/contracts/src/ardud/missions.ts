@@ -1822,7 +1822,11 @@ export const MissionMemberPrincipal = Schema.Union([
 ]);
 export type MissionMemberPrincipal = typeof MissionMemberPrincipal.Type;
 
-/** Owner only: attach or detach a thread, or register or drop a service session. */
+/**
+ * Owner or the mission's master: attach or detach a thread, or register or
+ * drop a service session. Only the owner attaches a thread that belongs to
+ * another mission.
+ */
 export const SetMissionMemberInput = Schema.Struct({
   missionId: MissionId,
   principal: MissionMemberPrincipal,

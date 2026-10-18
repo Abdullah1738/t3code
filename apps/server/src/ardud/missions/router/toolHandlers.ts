@@ -79,6 +79,9 @@ const handlers = {
       router.decideKnock(input, provenance).pipe(Effect.map((knock) => ({ knock }))),
     ),
   ),
+  mission_set_member: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) => router.setMember(input, provenance)),
+  ),
 } satisfies McpToolAccess.Handlers<typeof RouterToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(RouterToolkit, handlers);

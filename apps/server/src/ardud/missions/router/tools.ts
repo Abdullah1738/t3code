@@ -4,6 +4,7 @@ import {
   MissionId,
   OrchestratorMcpFailure,
   RoomPageInput,
+  SetMissionMemberInput,
   SubscribeRoomInput,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
@@ -96,12 +97,44 @@ const MissionKnockDecideTool = Tool.make("mission_knock_decide", {
   dependencies,
 });
 
+const MissionSetMemberTool = Tool.make("mission_set_member", {
+  description:
+    "As the mission's master, attach or remove a member: a thread (it can then read and post in the mission's rooms and be reached by members) or a service session (its sends are routed as mission traffic). You cannot attach a thread that already belongs to another mission; the owner can.",
+  parameters: SetMissionMemberInput,
+  success: Schema.Struct({ seq: Schema.Number, ref: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+interface ToolConfig {
+  readonly parameters: Schema.Constraint;
+  readonly success: Schema.Constraint;
+  readonly failure: Schema.Constraint;
+  readonly failureMode: Tool.FailureMode;
+}
+
+// Strict everywhere so unknown keys, nested ones included, are refused.
+const annotated = <Name extends string, Config extends ToolConfig, R>(
+  tool: Tool.Tool<Name, Config, R>,
+  title: string,
+  readonly: boolean,
+) =>
+  tool
+    .annotate(Tool.Title, title)
+    .annotate(Tool.Readonly, readonly)
+    .annotate(Tool.Destructive, false)
+    .annotate(Tool.Idempotent, readonly)
+    .annotate(Tool.OpenWorld, false)
+    .annotate(Tool.Strict, true);
+
 export const RouterToolkit = Toolkit.make(
-  MissionInboxTool,
-  MissionMarkReadTool,
-  MissionRoomsTool,
-  MissionRoomTool,
-  MissionSubscribeTool,
-  MissionKnocksTool,
-  MissionKnockDecideTool,
+  annotated(MissionInboxTool, "Mission inbox", true),
+  annotated(MissionMarkReadTool, "Mark a mission room read", false),
+  annotated(MissionRoomsTool, "Mission rooms", true),
+  annotated(MissionRoomTool, "Mission room", true),
+  annotated(MissionSubscribeTool, "Subscribe to a mission room", false),
+  annotated(MissionKnocksTool, "Mission knocks", true),
+  annotated(MissionKnockDecideTool, "Decide a mission knock", false),
+  annotated(MissionSetMemberTool, "Set a mission member", false),
 );
