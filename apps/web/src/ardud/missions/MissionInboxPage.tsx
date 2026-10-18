@@ -27,6 +27,7 @@ import { WorkspacePageContainer } from "../../components/WorkspacePageContainer"
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { cn } from "../../lib/utils";
+import { CardList, CardListItem } from "./cards/CardFrame";
 import { DraftNotesPanel } from "./DraftNotesPanel";
 import {
   ApprovalCard,
@@ -264,6 +265,7 @@ function InboxTabBody(props: {
   const forks = useMissionForks(props.missionId) ?? [];
   const draftNotes = useDraftNotes(props.missionId) ?? [];
   const allStats = useSuggestionStats();
+  const list = useMissionList();
   // Sample track records would misstate a live author, so they stay hidden.
   const stats = isSampleFeed("suggestion-stats") ? null : (allStats ?? []);
   const actions = inboxActions(screen.dispatch);
@@ -285,6 +287,7 @@ function InboxTabBody(props: {
             onPick={(optionId) => screen.dispatch({ type: "pick", key: entry.key, optionId })}
             forks={forks}
             nowMs={nowMs}
+            list={list}
             masterRoleId={masterRoleId}
             actions={actions}
           />
@@ -300,6 +303,7 @@ function InboxTabBody(props: {
             notes={draftNotes}
             masterRoleId={masterRoleId}
             nowMs={nowMs}
+            list={list}
             actions={actions}
           />
         );
@@ -311,6 +315,7 @@ function InboxTabBody(props: {
             onSelect={onSelect}
             masterRoleId={masterRoleId}
             nowMs={nowMs}
+            list={list}
             actions={actions}
           />
         );
@@ -323,6 +328,7 @@ function InboxTabBody(props: {
             editing={editing}
             onEdit={onEdit}
             nowMs={nowMs}
+            list={list}
             actions={actions}
           />
         );
@@ -334,6 +340,7 @@ function InboxTabBody(props: {
             onSelect={onSelect}
             stats={stats}
             nowMs={nowMs}
+            list={list}
             actions={actions}
           />
         );
@@ -344,6 +351,7 @@ function InboxTabBody(props: {
             selected={selected}
             onSelect={onSelect}
             nowMs={nowMs}
+            list={list}
             actions={actions}
           />
         );
@@ -355,11 +363,11 @@ function InboxTabBody(props: {
       {screen.entries.length === 0 ? (
         <p className="text-sm text-muted-foreground">{EMPTY_LINE[props.tab]}</p>
       ) : (
-        <ul className="flex flex-col gap-3">
+        <CardList label={INBOX_TAB_LABEL[props.tab]}>
           {screen.entries.map((entry) => (
-            <li key={entry.key}>{card(entry)}</li>
+            <CardListItem key={entry.key}>{card(entry)}</CardListItem>
           ))}
-        </ul>
+        </CardList>
       )}
       {props.tab === "decide" ? (
         <MissionSection title="Open discussions">
@@ -403,7 +411,7 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
         </div>
       ))}
       {closed.length > 0 ? (
-        <ul className="flex flex-col gap-1">
+        <ul className="flex flex-col gap-4">
           {closed.map((approval) => (
             <ClosedApprovalRow key={approval.id} approval={approval} nowMs={props.nowMs} />
           ))}

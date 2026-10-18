@@ -3,6 +3,7 @@ export * from "./store.ts";
 export * from "./viewModel.ts";
 export * from "./changeLog.ts";
 export * from "./inboxViewModel.ts";
+export * from "./cardViewModel.ts";
 export * from "./routingViewModel.ts";
 export * from "./roomsViewModel.ts";
 export * from "./lanesViewModel.ts";

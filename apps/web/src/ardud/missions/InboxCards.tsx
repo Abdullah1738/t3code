@@ -1,30 +1,33 @@
-import { useState, type ReactNode } from "react";
+import { useState } from "react";
 
 import {
   approverOf,
   type Approval,
+  type Approver,
   type Ask,
   type Draft,
   type DraftNote,
   type Knock,
+  type MissionListSnapshot,
   type Note,
   type Suggestion,
   type SuggestionStats,
 } from "@t3tools/contracts";
 import {
   actorLabel,
+  APPROVAL_KICKER,
   APPROVAL_STATUS_LABEL,
-  APPROVER_LABEL,
   askView,
-  DRAFT_CHANNEL_LABEL,
+  cardSubMission,
+  draftKicker,
   draftNotesFor,
   draftNoteScopeLabel,
-  formatRelative,
+  draftTitle,
+  noteFlags,
+  noteKicker,
   fyiView,
-  decideLine,
   openForkFor,
   parseDiffLines,
-  refLabel,
   routeLine,
   SUGGESTION_AUTHOR_LABEL,
   SUGGESTION_TARGET_LABEL,
@@ -34,320 +37,429 @@ import {
   type MissionForkEntry,
 } from "@t3tools/client-runtime/ardud/missions";
 
-import { Badge } from "../../components/ui/badge";
-import { Button } from "../../components/ui/button";
-import { Kbd } from "../../components/ui/kbd";
 import { Textarea } from "../../components/ui/textarea";
-import { cn } from "../../lib/utils";
-import { MissionLinkList, MissionLinkText } from "./MissionLinkText";
+import {
+  ChoiceBlock,
+  DraftBlock,
+  FactsBlock,
+  FlagsBlock,
+  LineDiffBlock,
+  LinksBlock,
+  RefsBlock,
+  TextBlock,
+  type DraftPerson,
+} from "./cards/blocks";
+import { CardFrame, type CardAction, type CardFrameProps } from "./cards/CardFrame";
+import { APPROVER_NAME, PersonChip } from "./cards/chips";
 import { rerouteRecord } from "./operationCommands";
-import { LineDiff, WordDiff } from "./TextDiffView";
 import { inboxItemDomId, type InboxActions } from "./useInboxScreen";
 
-// Inbox cards. Presentation plus local text-field state; decisions, input
-// validation and wording come from client-runtime (inboxViewModel) through
-// `InboxActions`. Restyle freely.
+// Inbox cards: each maps one record onto the card frame and its blocks.
+// Decisions, validation and wording come from client-runtime through
+// `InboxActions`; local state is only what the owner is typing.
 
-function InboxCard(props: {
-  itemKey: string;
-  selected: boolean;
-  onSelect: () => void;
-  children: ReactNode;
+interface CardContext {
+  readonly selected: boolean;
+  readonly onSelect: () => void;
+  readonly nowMs: number;
+  readonly list: MissionListSnapshot | undefined;
+  readonly size?: CardFrameProps["size"];
+}
+
+function frame(
+  context: CardContext,
+  key: string,
+): Pick<CardFrameProps, "domId" | "selected" | "onSelect" | "nowMs" | "size"> {
+  return {
+    domId: inboxItemDomId(key),
+    selected: context.selected,
+    onSelect: context.onSelect,
+    nowMs: context.nowMs,
+    ...(context.size ? { size: context.size } : {}),
+  };
+}
+
+/** Runs one decision at a time so its buttons disable while it is in flight. */
+function useBusy() {
+  const [busy, setBusy] = useState(false);
+  const run = async (action: () => Promise<boolean>): Promise<boolean> => {
+    setBusy(true);
+    const sent = await action();
+    setBusy(false);
+    return sent;
+  };
+  return [busy, run] as const;
+}
+
+/** A short reason field for Rewrite, Drop-with-reason and Move. */
+function ReasonField(props: {
+  label: string;
+  placeholder: string;
+  value: string;
+  onChange: (value: string) => void;
 }) {
   return (
-    <article
-      id={inboxItemDomId(props.itemKey)}
-      data-selected={props.selected || undefined}
-      onClickCapture={props.onSelect}
-      onFocusCapture={props.onSelect}
-      className={cn(
-        "flex min-w-0 flex-col gap-2 rounded-lg border p-3 text-sm",
-        props.selected ? "border-ring" : "border-border/60",
-      )}
-    >
-      {props.children}
-    </article>
+    <Textarea
+      size="sm"
+      aria-label={props.label}
+      placeholder={props.placeholder}
+      autoFocus
+      value={props.value}
+      onChange={(event) => props.onChange(event.target.value)}
+    />
   );
-}
-
-function Meta(props: { children: ReactNode }) {
-  return <p className="text-xs text-muted-foreground">{props.children}</p>;
-}
-
-function Actions(props: { children: ReactNode }) {
-  return <div className="flex flex-wrap items-center gap-2">{props.children}</div>;
 }
 
 // ---------------------------------------------------------------------------
 // Decide
 
-export function AskCard(props: {
-  ask: Ask;
-  selected: boolean;
-  onSelect: () => void;
-  picked: string | null;
-  onPick: (optionId: string | null) => void;
-  forks: ReadonlyArray<MissionForkEntry>;
-  nowMs: number;
-  masterRoleId: string | null;
-  actions: InboxActions;
-}) {
+export function AskCard(
+  props: CardContext & {
+    ask: Ask;
+    picked: string | null;
+    onPick: (optionId: string | null) => void;
+    forks: ReadonlyArray<MissionForkEntry>;
+    masterRoleId: string | null;
+    actions: InboxActions;
+  },
+) {
   const { ask } = props;
   const view = askView(ask, props.nowMs, props.masterRoleId);
   const discussing = openForkFor(props.forks, { kind: "ask", id: ask.id });
   const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
-  const run = async (action: () => Promise<boolean>, clear: boolean) => {
-    setBusy(true);
-    const sent = await action();
-    setBusy(false);
-    if (sent && clear) setText("");
-  };
+  const [busy, run] = useBusy();
+  const advisorName = view.askedBy === "master" ? "Master" : view.askedBy;
+  const actions: CardAction[] = [
+    {
+      key: "answer",
+      primary: true,
+      disabled: busy || (props.picked === null && text.trim() === ""),
+      onRun: () =>
+        void run(() => props.actions.answer(ask, props.picked, text)).then((sent) => {
+          if (sent) setText("");
+        }),
+    },
+    {
+      key: "discuss",
+      disabled: busy || discussing !== null,
+      onRun: () =>
+        void run(() => props.actions.discuss(ask, text)).then((sent) => {
+          if (sent) setText("");
+        }),
+    },
+  ];
   return (
-    <InboxCard itemKey={`ask:${ask.id}`} selected={props.selected} onSelect={props.onSelect}>
-      <Meta>
-        Asked by {view.askedBy} · {view.waiting}
-        {view.urgent ? " · P0" : ""}
-      </Meta>
-      <h3 className="font-medium text-foreground">{ask.question}</h3>
-      {ask.context ? <p className="text-muted-foreground">{ask.context}</p> : null}
-      {view.recommendation ? <p>{view.recommendation}</p> : null}
-      <p className="text-muted-foreground">{view.blocks}</p>
-      {ask.costOfWaiting ? (
-        <p className="text-muted-foreground">Cost of waiting: {ask.costOfWaiting}</p>
-      ) : null}
-      <div role="group" aria-label="Options" className="flex flex-col gap-1.5">
-        {view.options.map((option) => {
-          const isPicked = props.picked === option.id;
-          return (
-            <Button
-              key={option.id}
-              variant={isPicked ? "secondary" : "outline"}
-              size="sm-multiline"
-              aria-pressed={isPicked}
-              onClick={() => props.onPick(isPicked ? null : option.id)}
-            >
-              {option.shortcut ? <Kbd>{option.shortcut}</Kbd> : null}
-              <span>
-                {option.label}
-                {option.recommended ? " (master's recommendation)" : ""}
-              </span>
-            </Button>
-          );
-        })}
-      </div>
+    <CardFrame
+      {...frame(props, `ask:${ask.id}`)}
+      kicker={view.urgent ? "Urgent decision" : "Decision"}
+      subMission={cardSubMission(props.list, ask.missionId, ask.subMissionId)}
+      since={ask.createdAt}
+      title={ask.question}
+      actions={actions}
+      approver="owner"
+    >
+      <TextBlock text={ask.context} tone="meta" maxLines={4} />
+      <ChoiceBlock
+        options={view.options}
+        picked={props.picked}
+        onPick={props.onPick}
+        advisor={{ kind: view.askedBy === "master" ? "master" : "person", name: advisorName }}
+        advice={ask.recommendation?.reason.trim() || null}
+        disabled={busy}
+      />
+      <FactsBlock
+        rows={[
+          { label: "If you wait", value: ask.costOfWaiting },
+          {
+            label: "Blocks",
+            value: ask.blocks.length > 0 ? <RefsBlock refs={ask.blocks} /> : null,
+          },
+          { label: "Discussing", value: discussing ? "Open in a fork of the master" : null },
+        ]}
+      />
       <Textarea
         size="sm"
         aria-label="Your answer"
-        placeholder="Answer in your own words, with or without an option"
+        placeholder="Or answer in your own words"
         value={text}
         onChange={(event) => setText(event.target.value)}
       />
-      <Actions>
-        <Button
-          size="sm"
-          disabled={busy || (props.picked === null && text.trim() === "")}
-          onClick={() => void run(() => props.actions.answer(ask, props.picked, text), true)}
-        >
-          Send answer
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={busy}
-          onClick={() => void run(() => props.actions.discuss(ask, text), true)}
-        >
-          Discuss first
-        </Button>
-        {discussing ? <Meta>Discussing in a fork of the master.</Meta> : null}
-      </Actions>
-    </InboxCard>
+    </CardFrame>
   );
 }
 
 // ---------------------------------------------------------------------------
 // Approve
 
-export function DraftCard(props: {
-  draft: Draft;
-  selected: boolean;
-  onSelect: () => void;
-  editing: boolean;
-  onEdit: (open: boolean) => void;
-  notes: ReadonlyArray<DraftNote>;
-  masterRoleId: string | null;
-  nowMs: number;
-  actions: InboxActions;
-}) {
+/** Move a draft or approval to the other approver, with a reason. */
+function useMove(record: Draft | Approval, kind: "draft" | "approval") {
+  const [moving, setMoving] = useState(false);
+  const [reason, setReason] = useState("");
+  const to: Approver = approverOf(record) === "owner" ? "master" : "owner";
+  const submit = async () => {
+    if (await rerouteRecord(kind, record, to, reason)) {
+      setMoving(false);
+      setReason("");
+      return true;
+    }
+    return false;
+  };
+  return { moving, setMoving, reason, setReason, to, submit };
+}
+
+export function DraftCard(
+  props: CardContext & {
+    draft: Draft;
+    editing: boolean;
+    onEdit: (open: boolean) => void;
+    notes: ReadonlyArray<DraftNote>;
+    masterRoleId: string | null;
+    actions: InboxActions;
+  },
+) {
   const { draft } = props;
   const [edited, setEdited] = useState(draft.text);
   const [rewriting, setRewriting] = useState(false);
   const [rewriteNote, setRewriteNote] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busy, run] = useBusy();
+  const move = useMove(draft, "draft");
   const notes = draftNotesFor(draft, props.notes);
-  const liveEdit = props.editing ? textEdit(draft.text, edited) : null;
-  const decide = async (decision: Parameters<InboxActions["decideDraft"]>[1]) => {
-    setBusy(true);
-    await props.actions.decideDraft(draft, decision);
-    setBusy(false);
-  };
-  const writer = draft.writerRoleId
-    ? actorLabel({ _tag: "role", roleId: draft.writerRoleId } as never, props.masterRoleId)
-    : draft.source.kind;
+  const edit = textEdit(draft.text, edited);
+  const writerRole = draft.writtenBy?.roleId ?? draft.writerRoleId;
+  const writer =
+    writerRole === null
+      ? draft.source.kind
+      : actorLabel({ _tag: "role", roleId: writerRole }, props.masterRoleId);
+  const people: DraftPerson[] = [
+    { kind: "person", name: draft.audience, prefix: "To " },
+    {
+      kind: writer === "master" ? "master" : "person",
+      name: writer === "master" ? "Master" : writer,
+      prefix: "Written by ",
+    },
+  ];
+  const decide = (decision: Parameters<InboxActions["decideDraft"]>[1]) =>
+    void run(() => props.actions.decideDraft(draft, decision));
+  const actions: CardAction[] = rewriting
+    ? [
+        {
+          key: "rewrite",
+          label: "Send back",
+          primary: true,
+          disabled: busy || rewriteNote.trim() === "",
+          onRun: () => decide({ action: "rewrite", note: rewriteNote }),
+        },
+        { key: "cancel", onRun: () => setRewriting(false) },
+      ]
+    : move.moving
+      ? [
+          {
+            key: "move",
+            label: `Move to ${APPROVER_NAME[move.to]}`,
+            primary: true,
+            disabled: busy || move.reason.trim() === "",
+            onRun: () => void run(move.submit),
+          },
+          { key: "cancel", onRun: () => move.setMoving(false) },
+        ]
+      : [
+          edit.changed
+            ? {
+                key: "send",
+                label: "Edit and approve",
+                primary: true,
+                disabled: busy,
+                onRun: () => decide({ action: "edit-approve", editedText: edited }),
+              }
+            : {
+                key: "send",
+                primary: true,
+                disabled: busy,
+                onRun: () => decide({ action: "approve" }),
+              },
+          ...(props.editing
+            ? [
+                {
+                  key: "cancel" as const,
+                  onRun: () => {
+                    setEdited(draft.text);
+                    props.onEdit(false);
+                  },
+                },
+              ]
+            : [
+                { key: "rewrite" as const, disabled: busy, onRun: () => setRewriting(true) },
+                {
+                  key: "drop" as const,
+                  disabled: busy,
+                  onRun: () => decide({ action: "drop" }),
+                },
+              ]),
+          {
+            key: "move",
+            label: `Move to ${APPROVER_NAME[move.to]}`,
+            disabled: busy,
+            onRun: () => move.setMoving(true),
+          },
+          {
+            key: "discuss",
+            disabled: busy,
+            onRun: () =>
+              void run(() =>
+                props.actions.discussRecord(draft.missionId, {
+                  kind: "draft",
+                  id: draft.id,
+                  label: draftTitle(draft),
+                }),
+              ),
+          },
+        ];
   return (
-    <InboxCard itemKey={`draft:${draft.id}`} selected={props.selected} onSelect={props.onSelect}>
-      <Meta>
-        Draft to {draft.audience} · {DRAFT_CHANNEL_LABEL[draft.channel]} ·{" "}
-        <MissionLinkText link={draft.target} /> · written by {writer} ·{" "}
-        {formatRelative(draft.createdAt, props.nowMs)}
-      </Meta>
-      <RouteMeta record={draft} kind="draft" />
-      {props.editing ? (
-        <>
-          <Textarea
-            aria-label="Edit the draft"
-            autoFocus
-            value={edited}
-            onChange={(event) => setEdited(event.target.value)}
-          />
-          {liveEdit?.changed ? (
-            <div className="flex flex-col gap-1">
-              <Meta>
-                Your changes: {liveEdit.stats.addedWords} words added, {liveEdit.stats.removedWords}{" "}
-                removed
-              </Meta>
-              <WordDiff segments={liveEdit.segments} />
-            </div>
-          ) : null}
-        </>
-      ) : (
-        <p className="whitespace-pre-wrap text-foreground">{draft.text}</p>
-      )}
-      {notes.applied.length > 0 ? (
-        <Meta>
-          Notes applied:{" "}
-          {notes.applied
-            .map((note) => `${draftNoteScopeLabel(note.scope)}: ${note.text}`)
-            .join(" · ")}
-        </Meta>
-      ) : null}
-      {notes.skipped.length > 0 ? (
-        <Meta>
-          Notes not listed by the writer: {notes.skipped.map((note) => note.text).join(" · ")}
-        </Meta>
-      ) : null}
+    <CardFrame
+      {...frame(props, `draft:${draft.id}`)}
+      kicker={draftKicker(draft)}
+      since={draft.createdAt}
+      title={draftTitle(draft)}
+      actions={actions}
+      approver={approverOf(draft)}
+    >
+      <LinksBlock links={[draft.target]}>
+        {draft.head ? (
+          <span className="font-mono text-xs text-muted-foreground">
+            <span className="sr-only">Head commit </span>
+            {draft.head.slice(0, 7)}
+          </span>
+        ) : null}
+      </LinksBlock>
+      <FlagsBlock flags={draft.flags ?? []} />
+      <TextBlock text={routeLine(draft) ?? ""} tone="meta" maxLines={2} />
+      <DraftBlock
+        channel={draft.channel}
+        people={people}
+        text={draft.text}
+        edit={{
+          editing: props.editing,
+          value: edited,
+          onChange: setEdited,
+          onStart: () => props.onEdit(true),
+          onUndo: () => {
+            setEdited(draft.text);
+            props.onEdit(false);
+          },
+          diff: edit.segments,
+        }}
+      />
+      <FactsBlock
+        rows={[
+          {
+            label: "Notes applied",
+            value:
+              notes.applied.length > 0
+                ? notes.applied
+                    .map((note) => `${draftNoteScopeLabel(note.scope)}: ${note.text}`)
+                    .join("\n")
+                : null,
+          },
+          { label: "Send failed", value: draft.sendError ?? null },
+          {
+            label: "Notes not listed",
+            value:
+              notes.skipped.length > 0 ? notes.skipped.map((note) => note.text).join("\n") : null,
+          },
+        ]}
+      />
       {rewriting ? (
-        <Textarea
-          size="sm"
-          aria-label="What should change"
+        <ReasonField
+          label="What should change"
           placeholder="What should the writer change?"
-          autoFocus
           value={rewriteNote}
-          onChange={(event) => setRewriteNote(event.target.value)}
+          onChange={setRewriteNote}
         />
       ) : null}
-      <Actions>
-        {props.editing ? (
-          <>
-            <Button
-              size="sm"
-              disabled={busy}
-              onClick={() => void decide({ action: "edit-approve", editedText: edited })}
-            >
-              Approve edited
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                setEdited(draft.text);
-                props.onEdit(false);
-              }}
-            >
-              Cancel edit
-            </Button>
-          </>
-        ) : rewriting ? (
-          <>
-            <Button
-              size="sm"
-              disabled={busy}
-              onClick={() => void decide({ action: "rewrite", note: rewriteNote })}
-            >
-              Send back for rewrite
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setRewriting(false)}>
-              Cancel
-            </Button>
-          </>
-        ) : (
-          <>
-            <Button size="sm" disabled={busy} onClick={() => void decide({ action: "approve" })}>
-              Approve
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => props.onEdit(true)}>
-              <Kbd>e</Kbd> Edit
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => setRewriting(true)}>
-              Request rewrite
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={busy}
-              onClick={() => void decide({ action: "drop" })}
-            >
-              Drop
-            </Button>
-          </>
-        )}
-      </Actions>
-    </InboxCard>
+      {move.moving ? (
+        <ReasonField
+          label="Why move it?"
+          placeholder="Why move it?"
+          value={move.reason}
+          onChange={move.setReason}
+        />
+      ) : null}
+    </CardFrame>
   );
 }
 
-export function ApprovalCard(props: {
-  approval: Approval;
-  selected: boolean;
-  onSelect: () => void;
-  masterRoleId: string | null;
-  nowMs: number;
-  actions: InboxActions;
-}) {
+export function ApprovalCard(
+  props: CardContext & {
+    approval: Approval;
+    masterRoleId: string | null;
+    actions: InboxActions;
+  },
+) {
   const { approval } = props;
-  const [busy, setBusy] = useState(false);
-  const decide = async (action: "approve" | "reject") => {
-    setBusy(true);
-    await props.actions.decideApproval(approval, action);
-    setBusy(false);
-  };
+  const [busy, run] = useBusy();
+  const move = useMove(approval, "approval");
+  const decide = (action: "approve" | "reject") =>
+    void run(() => props.actions.decideApproval(approval, action));
+  const actions: CardAction[] = move.moving
+    ? [
+        {
+          key: "move",
+          label: `Move to ${APPROVER_NAME[move.to]}`,
+          primary: true,
+          disabled: busy || move.reason.trim() === "",
+          onRun: () => void run(move.submit),
+        },
+        { key: "cancel", onRun: () => move.setMoving(false) },
+      ]
+    : [
+        { key: "approve", primary: true, disabled: busy, onRun: () => decide("approve") },
+        { key: "reject", disabled: busy, onRun: () => decide("reject") },
+        {
+          key: "move",
+          label: `Move to ${APPROVER_NAME[move.to]}`,
+          disabled: busy,
+          onRun: () => move.setMoving(true),
+        },
+        {
+          key: "discuss",
+          disabled: busy,
+          onRun: () =>
+            void run(() =>
+              props.actions.discussRecord(approval.missionId, {
+                kind: "approval",
+                id: approval.id,
+                label: approval.title,
+              }),
+            ),
+        },
+      ];
   return (
-    <InboxCard
-      itemKey={`approval:${approval.id}`}
-      selected={props.selected}
-      onSelect={props.onSelect}
+    <CardFrame
+      {...frame(props, `approval:${approval.id}`)}
+      kicker={APPROVAL_KICKER[approval.kind]}
+      since={approval.createdAt}
+      title={approval.title}
+      actions={actions}
+      approver={approverOf(approval)}
     >
-      <Meta>
-        {approval.kind} approval · requested by {approval.requestedBy} ·{" "}
-        {formatRelative(approval.createdAt, props.nowMs)}
-      </Meta>
-      <RouteMeta record={approval} kind="approval" />
-      <h3 className="font-medium text-foreground">{approval.title}</h3>
-      {approval.detail ? <p className="text-muted-foreground">{approval.detail}</p> : null}
-      {approval.links.length > 0 ? (
-        <Meta>
-          <MissionLinkList links={approval.links} />
-        </Meta>
+      <LinksBlock links={approval.links} />
+      <FlagsBlock flags={approval.flags ?? []} />
+      <TextBlock text={approval.summary ?? approval.detail} tone="meta" maxLines={4} />
+      <FactsBlock
+        rows={[
+          { label: "Requested by", value: approval.requestedBy },
+          { label: "Moved because", value: routeLine(approval) },
+        ]}
+      />
+      {move.moving ? (
+        <ReasonField
+          label="Why move it?"
+          placeholder="Why move it?"
+          value={move.reason}
+          onChange={move.setReason}
+        />
       ) : null}
-      <Actions>
-        <Button size="sm" disabled={busy} onClick={() => void decide("approve")}>
-          Approve
-        </Button>
-        <Button size="sm" variant="outline" disabled={busy} onClick={() => void decide("reject")}>
-          Reject
-        </Button>
-      </Actions>
-    </InboxCard>
+    </CardFrame>
   );
 }
 
@@ -355,13 +467,17 @@ export function ApprovalCard(props: {
 export function ClosedApprovalRow(props: { approval: Approval; nowMs: number }) {
   const { approval } = props;
   return (
-    <li className="text-sm">
-      <span className="text-foreground">{approval.title}</span>{" "}
-      <span className="text-muted-foreground">
-        · {APPROVAL_STATUS_LABEL[approval.status]}
-        {approval.decidedAt ? ` ${formatRelative(approval.decidedAt, props.nowMs)}` : ""}
-        {approval.staleReason ? ` · ${approval.staleReason}` : ""}
-      </span>
+    <li>
+      <CardFrame
+        kicker={APPROVAL_KICKER[approval.kind]}
+        since={approval.decidedAt ?? approval.createdAt}
+        nowMs={props.nowMs}
+        title={approval.title}
+        done={{
+          verb: APPROVAL_STATUS_LABEL[approval.status],
+          ...(approval.staleReason ? { detail: approval.staleReason } : {}),
+        }}
+      />
     </li>
   );
 }
@@ -369,136 +485,136 @@ export function ClosedApprovalRow(props: { approval: Approval; nowMs: number }) 
 // ---------------------------------------------------------------------------
 // Knocks
 
-export function KnockCard(props: {
-  knock: Knock;
-  selected: boolean;
-  onSelect: () => void;
-  editing: boolean;
-  onEdit: (open: boolean) => void;
-  nowMs: number;
-  actions: InboxActions;
-}) {
+export function KnockCard(
+  props: CardContext & {
+    knock: Knock;
+    editing: boolean;
+    onEdit: (open: boolean) => void;
+    actions: InboxActions;
+  },
+) {
   const { knock } = props;
   const [edited, setEdited] = useState(knock.summary);
-  const [busy, setBusy] = useState(false);
-  const decide = async (decision: Parameters<InboxActions["decideKnock"]>[1]) => {
-    setBusy(true);
-    await props.actions.decideKnock(knock, decision);
-    setBusy(false);
-  };
+  const [busy, run] = useBusy();
+  const edit = textEdit(knock.summary, edited);
+  const decide = (decision: Parameters<InboxActions["decideKnock"]>[1]) =>
+    void run(() => props.actions.decideKnock(knock, decision));
+  const actions: CardAction[] = [
+    {
+      key: "forward",
+      label: edit.changed ? "Forward edited" : "Forward",
+      primary: true,
+      disabled: busy,
+      onRun: () =>
+        decide(edit.changed ? { action: "forward", editedText: edited } : { action: "forward" }),
+    },
+    ...(props.editing ? [] : [{ key: "edit" as const, onRun: () => props.onEdit(true) }]),
+    { key: "dismiss", disabled: busy, onRun: () => decide({ action: "drop" }) },
+  ];
   return (
-    <InboxCard itemKey={`knock:${knock.id}`} selected={props.selected} onSelect={props.onSelect}>
-      <Meta>
-        From “{knock.fromTitle}” · via {knock.path} · {formatRelative(knock.createdAt, props.nowMs)}
-      </Meta>
+    <CardFrame
+      {...frame(props, `knock:${knock.id}`)}
+      kicker="Knock"
+      since={knock.createdAt}
+      title={knock.summary}
+      actions={actions}
+      approver="owner"
+    >
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <PersonChip kind="person" name={knock.fromTitle} prefix="From " />
+      </div>
+      <TextBlock text={knock.body ?? ""} tone="meta" maxLines={6} />
+      <FactsBlock rows={[{ label: "Via", value: knock.path }]} />
       {props.editing ? (
-        <Textarea
-          aria-label="What to forward"
-          autoFocus
-          value={edited}
-          onChange={(event) => setEdited(event.target.value)}
+        <DraftBlock
+          channel={null}
+          people={[{ kind: "master", name: "Master", prefix: "To " }]}
+          text={knock.summary}
+          edit={{
+            editing: true,
+            value: edited,
+            onChange: setEdited,
+            onStart: () => props.onEdit(true),
+            onUndo: () => {
+              setEdited(knock.summary);
+              props.onEdit(false);
+            },
+            diff: edit.segments,
+          }}
         />
-      ) : (
-        <p className="text-foreground">{knock.summary}</p>
-      )}
-      {knock.body && !props.editing ? (
-        <p className="whitespace-pre-wrap text-muted-foreground">{knock.body}</p>
       ) : null}
-      <Actions>
-        {props.editing ? (
-          <>
-            <Button
-              size="sm"
-              disabled={busy}
-              onClick={() => void decide({ action: "forward", editedText: edited })}
-            >
-              Forward edited
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                setEdited(knock.summary);
-                props.onEdit(false);
-              }}
-            >
-              Cancel edit
-            </Button>
-          </>
-        ) : (
-          <>
-            <Button size="sm" disabled={busy} onClick={() => void decide({ action: "forward" })}>
-              Forward to master
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => props.onEdit(true)}>
-              <Kbd>e</Kbd> Edit + forward
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={busy}
-              onClick={() => void decide({ action: "drop" })}
-            >
-              Drop
-            </Button>
-          </>
-        )}
-      </Actions>
-    </InboxCard>
+    </CardFrame>
   );
 }
 
 // ---------------------------------------------------------------------------
 // Suggestions
 
-export function SuggestionCard(props: {
-  suggestion: Suggestion;
-  selected: boolean;
-  onSelect: () => void;
-  /** `null` when the server has no track record to show. */
-  stats: ReadonlyArray<SuggestionStats> | null;
-  nowMs: number;
-  actions: InboxActions;
-}) {
+export function SuggestionCard(
+  props: CardContext & {
+    suggestion: Suggestion;
+    /** `null` when the server has no track record to show. */
+    stats: ReadonlyArray<SuggestionStats> | null;
+    actions: InboxActions;
+  },
+) {
   const { suggestion } = props;
   const [mode, setMode] = useState<"idle" | "edit" | "dismiss">("idle");
   const [edited, setEdited] = useState(() => suggestionAfterText(suggestion));
   const [reason, setReason] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busy, run] = useBusy();
   const record = props.stats === null ? null : suggestionTrackRecord(props.stats, suggestion);
-  const decide = async (decision: Parameters<InboxActions["decideSuggestion"]>[1]) => {
-    setBusy(true);
-    await props.actions.decideSuggestion(suggestion, decision);
-    setBusy(false);
-  };
+  const decide = (decision: Parameters<InboxActions["decideSuggestion"]>[1]) =>
+    void run(() => props.actions.decideSuggestion(suggestion, decision));
+  const actions: CardAction[] =
+    mode === "edit"
+      ? [
+          {
+            key: "accept",
+            label: "Accept edited",
+            primary: true,
+            disabled: busy,
+            onRun: () => decide({ action: "accept-edited", editedText: edited }),
+          },
+          { key: "cancel", onRun: () => setMode("idle") },
+        ]
+      : mode === "dismiss"
+        ? [
+            {
+              key: "dismiss-suggestion",
+              primary: true,
+              disabled: busy,
+              onRun: () => decide({ action: "dismiss", reason }),
+            },
+            { key: "cancel", onRun: () => setMode("idle") },
+          ]
+        : [
+            {
+              key: "accept",
+              primary: true,
+              disabled: busy,
+              onRun: () => decide({ action: "accept" }),
+            },
+            { key: "edit", disabled: busy, onRun: () => setMode("edit") },
+            { key: "dismiss-suggestion", disabled: busy, onRun: () => setMode("dismiss") },
+          ];
   return (
-    <InboxCard
-      itemKey={`suggestion:${suggestion.id}`}
-      selected={props.selected}
-      onSelect={props.onSelect}
+    <CardFrame
+      {...frame(props, `suggestion:${suggestion.id}`)}
+      kicker={SUGGESTION_TARGET_LABEL[suggestion.targetKind]}
+      since={suggestion.createdAt}
+      title={suggestion.title}
+      actions={actions}
+      approver={suggestion.acceptor}
     >
-      <Meta>
-        {SUGGESTION_TARGET_LABEL[suggestion.targetKind]}
-        {suggestion.target ? ` · ${refLabel(suggestion.target)}` : ""} · from{" "}
-        {SUGGESTION_AUTHOR_LABEL[suggestion.author]}
-        {record ? ` (${record.author.label})` : ""} ·{" "}
-        {suggestion.acceptor === "owner" ? "you decide" : "master decides, you can overrule"} ·{" "}
-        {formatRelative(suggestion.createdAt, props.nowMs)}
-      </Meta>
-      <h3 className="font-medium text-foreground">{suggestion.title}</h3>
-      <LineDiff lines={parseDiffLines(suggestion.diffText)} />
-      {suggestion.why ? <p className="text-muted-foreground">Why: {suggestion.why}</p> : null}
-      {suggestion.evidence.length > 0 ? (
-        <Meta>
-          Evidence: <MissionLinkList links={suggestion.evidence} />
-        </Meta>
-      ) : null}
-      {record?.kind ? (
-        <Meta>
-          On {SUGGESTION_TARGET_LABEL[suggestion.targetKind].toLowerCase()}: {record.kind.label}
-          {record.kind.bar !== "normal" ? ` · bar ${record.kind.bar}` : ""}
-        </Meta>
-      ) : null}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <PersonChip
+          kind={suggestion.author === "master" ? "master" : "person"}
+          name={SUGGESTION_AUTHOR_LABEL[suggestion.author]}
+          prefix="From "
+        />
+        {suggestion.target ? <RefsBlock refs={[suggestion.target]} /> : null}
+      </div>
       {mode === "edit" ? (
         <Textarea
           aria-label="Edited change"
@@ -506,166 +622,67 @@ export function SuggestionCard(props: {
           value={edited}
           onChange={(event) => setEdited(event.target.value)}
         />
-      ) : null}
+      ) : (
+        <LineDiffBlock lines={parseDiffLines(suggestion.diffText)} />
+      )}
+      <TextBlock text={suggestion.why} tone="meta" maxLines={3} />
+      <RefsBlock refs={suggestion.evidence} />
+      <FactsBlock
+        rows={[
+          { label: "Track record", value: record?.author.label ?? null },
+          {
+            label: `On ${SUGGESTION_TARGET_LABEL[suggestion.targetKind].toLowerCase()}`,
+            value: record?.kind
+              ? `${record.kind.label}${record.kind.bar !== "normal" ? `, bar ${record.kind.bar}` : ""}`
+              : null,
+          },
+        ]}
+      />
       {mode === "dismiss" ? (
-        <Textarea
-          size="sm"
-          aria-label="Why dismiss"
+        <ReasonField
+          label="Why dismiss"
           placeholder="Why not? The author learns from this."
-          autoFocus
           value={reason}
-          onChange={(event) => setReason(event.target.value)}
+          onChange={setReason}
         />
       ) : null}
-      <Actions>
-        {mode === "idle" ? (
-          <>
-            <Button size="sm" disabled={busy} onClick={() => void decide({ action: "accept" })}>
-              Accept
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => setMode("edit")}>
-              Accept edited
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setMode("dismiss")}>
-              Dismiss
-            </Button>
-          </>
-        ) : (
-          <>
-            <Button
-              size="sm"
-              disabled={busy}
-              onClick={() =>
-                void decide(
-                  mode === "edit"
-                    ? { action: "accept-edited", editedText: edited }
-                    : { action: "dismiss", reason },
-                )
-              }
-            >
-              {mode === "edit" ? "Accept this version" : "Dismiss"}
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setMode("idle")}>
-              Cancel
-            </Button>
-          </>
-        )}
-      </Actions>
-    </InboxCard>
+    </CardFrame>
   );
 }
 
 // ---------------------------------------------------------------------------
 // FYI
 
-const SEVERITY_BADGE = {
-  low: "outline",
-  medium: "secondary",
-  high: "warning",
-  critical: "error",
-} as const;
-
-export function NoteCard(props: {
-  note: Note;
-  selected: boolean;
-  onSelect: () => void;
-  nowMs: number;
-  actions: InboxActions;
-}) {
+export function NoteCard(props: CardContext & { note: Note; actions: InboxActions }) {
   const { note } = props;
   const view = fyiView(note);
-  const [busy, setBusy] = useState(false);
+  const [busy, run] = useBusy();
   return (
-    <InboxCard itemKey={`note:${note.id}`} selected={props.selected} onSelect={props.onSelect}>
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge variant={SEVERITY_BADGE[view.severity]} size="sm">
-          {view.severity}
-        </Badge>
-        <Meta>
-          {view.heading} · {view.basis}
-          {view.evidence ? ` · ${view.evidence.label}` : ""}
-          {view.citation ? ` · ${view.citation}` : ""} ·{" "}
-          {formatRelative(note.createdAt, props.nowMs)}
-        </Meta>
-      </div>
-      <p className="text-foreground">{note.summary}</p>
+    <CardFrame
+      {...frame(props, `note:${note.id}`)}
+      kicker={noteKicker(note)}
+      subMission={cardSubMission(props.list, note.missionId, note.subMissionId)}
+      since={note.createdAt}
+      title={note.summary}
+      actions={[
+        {
+          key: "ack",
+          primary: true,
+          disabled: busy,
+          onRun: () => void run(() => props.actions.ack(note)),
+        },
+      ]}
+      approver={null}
+    >
+      <FlagsBlock flags={noteFlags(note)} />
       {view.quote ? (
-        <blockquote className="border-s-2 border-border ps-2 text-muted-foreground">
-          “{view.quote}”{view.sourceEvent !== null ? ` (coord #${view.sourceEvent})` : ""}
-        </blockquote>
+        <TextBlock
+          text={`“${view.quote}”${view.sourceEvent !== null ? ` coord #${view.sourceEvent}` : ""}`}
+          tone="meta"
+          maxLines={4}
+        />
       ) : null}
-      {note.evidenceLinks.length > 0 ? (
-        <Meta>
-          <MissionLinkList links={note.evidenceLinks} />
-        </Meta>
-      ) : null}
-      <Actions>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            await props.actions.ack(note);
-            setBusy(false);
-          }}
-        >
-          Got it
-        </Button>
-      </Actions>
-    </InboxCard>
-  );
-}
-
-/**
- * Whose inbox a draft or approval is routed to and why, with a way to move it.
- * Whoever it waits on, you can still decide it here.
- */
-function RouteMeta(props: { record: Draft | Approval; kind: "draft" | "approval" }) {
-  const [moving, setMoving] = useState(false);
-  const [reason, setReason] = useState("");
-  const to = approverOf(props.record) === "owner" ? "master" : "owner";
-  const note = routeLine(props.record);
-  return (
-    <div className="flex flex-col gap-1 text-xs text-muted-foreground">
-      <p className="flex flex-wrap items-center gap-x-3 gap-y-1">
-        <span>{decideLine(props.record)}</span>
-        {note ? <span>{note}</span> : null}
-        <button
-          type="button"
-          className="underline"
-          onClick={(event) => {
-            event.stopPropagation();
-            setMoving(!moving);
-          }}
-        >
-          Move to {APPROVER_LABEL[to]}
-        </button>
-      </p>
-      {moving ? (
-        <form
-          className="flex flex-wrap gap-2"
-          onClick={(event) => event.stopPropagation()}
-          onSubmit={async (event) => {
-            event.preventDefault();
-            if (await rerouteRecord(props.kind, props.record, to, reason)) {
-              setMoving(false);
-              setReason("");
-            }
-          }}
-        >
-          <Textarea
-            size="sm"
-            aria-label="Why move it?"
-            placeholder="Why move it?"
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-          />
-          <Button type="submit" size="sm" variant="outline">
-            Move
-          </Button>
-        </form>
-      ) : null}
-    </div>
+      <RefsBlock refs={note.evidenceLinks} />
+    </CardFrame>
   );
 }

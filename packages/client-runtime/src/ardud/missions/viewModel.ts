@@ -583,6 +583,27 @@ export function formatRelative(atIso: string, nowMs: number, timeZone?: string):
   return formatDayLabel(atIso, timeZone);
 }
 
+/** How long something has waited: under an hour, under a day, or longer. */
+export type AgeTier = "minutes" | "hours" | "days";
+
+export interface AgeView {
+  /** "now", "52m", "5h", "1d 14h". */
+  readonly label: string;
+  readonly tier: AgeTier;
+}
+
+/** The card age element: a short span since `atIso`, and how loud to show it. */
+export function ageView(atIso: string, nowMs: number): AgeView | null {
+  const diff = nowMs - Date.parse(atIso);
+  if (!Number.isFinite(diff)) return null;
+  if (diff < MINUTE_MS) return { label: "now", tier: "minutes" };
+  if (diff < HOUR_MS) return { label: `${Math.floor(diff / MINUTE_MS)}m`, tier: "minutes" };
+  if (diff < DAY_MS) return { label: `${Math.floor(diff / HOUR_MS)}h`, tier: "hours" };
+  const days = Math.floor(diff / DAY_MS);
+  const hours = Math.floor((diff % DAY_MS) / HOUR_MS);
+  return { label: hours > 0 ? `${days}d ${hours}h` : `${days}d`, tier: "days" };
+}
+
 /** "Since you last looked (4h ago)" heading text. */
 export function sinceLastLookedLabel(ownerLastLookedAt: string | null, nowMs: number): string {
   if (ownerLastLookedAt === null) return "Everything so far";
