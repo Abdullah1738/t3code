@@ -16,6 +16,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
@@ -85,6 +86,25 @@ it("leaves commands that do not create durable authored content unchanged", () =
       creationSource: "web",
     }),
   ).toBe(command);
+});
+
+// ardud missions: core
+it("M4: stamps who answered a runtime request, over anything the client sent", () => {
+  const command: OrchestrationV2Command = {
+    type: "runtime-request.respond",
+    commandId: CommandId.make("command:thread-management:respond"),
+    threadId: ThreadId.make("thread:thread-management:respond"),
+    requestId: RuntimeRequestId.make("request:thread-management:respond"),
+    answers: { color: "Blue" },
+    createdBy: "user",
+  };
+
+  const stamped = ThreadManagementService.withCreationProvenance(command, {
+    createdBy: "system",
+    creationSource: "web",
+  });
+  expect(stamped).toMatchObject({ type: "runtime-request.respond", createdBy: "system" });
+  expect(stamped).not.toHaveProperty("creationSource");
 });
 
 it("identifies every existing thread that must be hydrated before dispatch", () => {

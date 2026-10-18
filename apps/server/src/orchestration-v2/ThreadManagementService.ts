@@ -75,6 +75,9 @@ export function withCreationProvenance(
     case "thread.merge_back":
     case "delegated_task.request":
       return { ...command, ...provenance };
+    // ardud missions: core - an answer becomes a message; keep who sent it.
+    case "runtime-request.respond":
+      return { ...command, createdBy: provenance.createdBy };
     default:
       return command;
   }
