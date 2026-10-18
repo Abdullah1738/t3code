@@ -1,9 +1,14 @@
-import type { MissionError, ThreadId } from "@t3tools/contracts";
+import type {
+  MissionError,
+  OrchestrationV2AppThread,
+  OrchestrationV2Run,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 
-/** True when mission recovery resumes this thread itself after a restart. */
+/** True when this thread belongs to a live mission, so recovery resumes it. */
 type Owns = (threadId: ThreadId) => Effect.Effect<boolean, MissionError>;
 
 // The restart continuation runs in the effect worker, which is built below
@@ -16,13 +21,24 @@ let installed: Owns | null = null;
  * Asked by Robob's own "Continue where you left off." before it wakes a run
  * the restart cut. Recovery wakes its member threads in order with a notice
  * that says what was lost, so a second, blind continuation would only race
- * it. A failing check never blocks the continuation.
+ * it. Recovery takes only what it will see itself: a run that had started
+ * (an unstarted prepared continuation never shows up as cut) on a thread that
+ * is not a subagent child (its parent's bookkeeping hangs off Robob's own
+ * continuation). A failing check never blocks the continuation.
  */
-export const recoveryOwnsRestartedThread = (threadId: ThreadId): Effect.Effect<boolean> =>
-  Effect.suspend(() => (installed === null ? Effect.succeed(false) : installed(threadId))).pipe(
+export const recoveryTakesRestartedRun = (
+  thread: Pick<OrchestrationV2AppThread, "id" | "lineage">,
+  source: Pick<OrchestrationV2Run, "startedAt">,
+): Effect.Effect<boolean> =>
+  Effect.suspend(() => {
+    const owns = installed;
+    if (owns === null || source.startedAt === null) return Effect.succeed(false);
+    if (thread.lineage.relationshipToParent === "subagent") return Effect.succeed(false);
+    return owns(thread.id);
+  }).pipe(
     Effect.catchCause((cause) =>
       Effect.logWarning("missions recovery could not check a restarted thread", {
-        threadId,
+        threadId: thread.id,
         cause: Cause.pretty(cause),
       }).pipe(Effect.as(false)),
     ),

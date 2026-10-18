@@ -1132,9 +1132,42 @@ it.effect("leaves a mission member's cut turn to mission recovery", () =>
         ? Effect.fail(new MissionError({ code: "conflict", detail: "store unavailable" }))
         : Effect.succeed(owned),
     );
-    assert.deepEqual(yield* continuationTexts(cutMidTurn()), []);
+    const member = (
+      lineage: { parentThreadId: ThreadId; relationshipToParent: "fork" | "subagent" } | null,
+      runExtra: Record<string, unknown> = { startedAt: now },
+    ) => {
+      const cut = cutMidTurn(runExtra);
+      return {
+        ...cut,
+        thread: {
+          ...cut.thread,
+          lineage: {
+            parentThreadId: null,
+            relationshipToParent: null,
+            rootThreadId: threadId,
+            ...lineage,
+          },
+        },
+      } as OrchestrationV2ThreadProjection;
+    };
+    const parent = ThreadId.make("thread:parent");
+    assert.deepEqual(yield* continuationTexts(member(null)), []);
+    assert.deepEqual(
+      yield* continuationTexts(member({ parentThreadId: parent, relationshipToParent: "fork" })),
+      [],
+    );
+    // Recovery only sees runs that started, and a subagent child's parent waits on Robob's own wake.
+    assert.deepEqual(yield* continuationTexts(member(null, { startedAt: null })), [
+      "Continue where you left off.",
+    ]);
+    assert.deepEqual(
+      yield* continuationTexts(
+        member({ parentThreadId: parent, relationshipToParent: "subagent" }),
+      ),
+      ["Continue where you left off."],
+    );
     // A settled turn only gets its background-work note, which recovery cannot give.
-    const base = makeProjection();
+    const base = member(null);
     const settled = {
       ...base,
       runs: [
@@ -1148,9 +1181,9 @@ it.effect("leaves a mission member's cut turn to mission recovery", () =>
     } as unknown as OrchestrationV2ThreadProjection;
     assert.lengthOf(yield* continuationTexts(settled), 1);
     owned = false;
-    assert.deepEqual(yield* continuationTexts(cutMidTurn()), ["Continue where you left off."]);
+    assert.deepEqual(yield* continuationTexts(member(null)), ["Continue where you left off."]);
     // A check that fails never blocks the continuation.
     owned = "broken";
-    assert.deepEqual(yield* continuationTexts(cutMidTurn()), ["Continue where you left off."]);
+    assert.deepEqual(yield* continuationTexts(member(null)), ["Continue where you left off."]);
   }).pipe(Effect.scoped),
 );
