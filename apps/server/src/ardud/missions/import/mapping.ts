@@ -2,12 +2,15 @@ import {
   ApprovalId,
   LaneId,
   MissionId,
+  PoolId,
   RoleBindingId,
   RuleId,
   SubscriptionId,
   ThreadId,
   WorkItemId,
   type Approval,
+  type ApprovalRoute,
+  type CreatePoolInput,
   type Lane,
   type Mission,
   type MissionActor,
@@ -72,6 +75,11 @@ export interface CoreImport {
   readonly approvals: ReadonlyArray<Approval>;
 }
 
+/** Records the policy service owns, created through it (create-missing). */
+export interface PolicyImport {
+  readonly pools: ReadonlyArray<CreatePoolInput & { readonly poolId: PoolId }>;
+}
+
 export interface SourceCounts {
   readonly coordActors: number;
   readonly coordChannels: number;
@@ -95,14 +103,89 @@ export interface ImportPlan {
   readonly asOf: string;
   readonly core: CoreImport;
   readonly router: RouterImport;
+  readonly policy: PolicyImport;
   readonly counts: SourceCounts;
   readonly warnings: ReadonlyArray<string>;
 }
 
+/** How crw's review caps become a mission pool; the owner picks (no default). */
+export type ReviewPoolKind = "lease" | "budget";
+
 export interface ImportOptions {
   readonly missionId: string;
   readonly missionTitle?: string;
+  /** Review pools to create from crw's config.json caps. Empty or missing: none. */
+  readonly reviewPools?: ReadonlyArray<ReviewPoolKind>;
 }
+
+/** Pool ids per kind, so a re-run with the same kind finds its pool. */
+export const reviewPoolId = (missionId: string, kind: ReviewPoolKind) =>
+  PoolId.make(`${missionId}:pool:${kind === "lease" ? "review-slots" : "review-day"}`);
+
+/**
+ * The starting approval routing: every draft and every approval (crw is the
+ * one component that opens them) goes to the owner. Data, not code: the owner
+ * and the master change it with setApprovalRouting.
+ */
+export const importApprovalRouting = (missionId: string): ReadonlyArray<ApprovalRoute> => [
+  {
+    id: `${missionId}:route:drafts`,
+    match: { _tag: "draft" },
+    approver: "owner",
+    note: "Imported start: every draft goes to the owner.",
+  },
+  {
+    id: `${missionId}:route:approvals`,
+    match: { _tag: "approval" },
+    approver: "owner",
+    note: "Imported start: every crw approval goes to the owner.",
+  },
+];
+
+/**
+ * crw's review caps as mission pools scoped to the mission. A lease pool
+ * (native holds, one per review in flight) takes max_reviews_per_tick; a
+ * budget pool (crw-config backend, advisory, counted over crw's rolling day)
+ * takes max_reviews_per_day.
+ */
+export const reviewPoolInputs = (
+  missionId: MissionId,
+  config: { readonly maxReviewsPerTick: number | null; readonly maxReviewsPerDay: number | null },
+  kinds: ReadonlyArray<ReviewPoolKind>,
+  warnings: Array<string>,
+): PolicyImport["pools"] => {
+  const out: Array<CreatePoolInput & { readonly poolId: PoolId }> = [];
+  for (const kind of [...new Set(kinds)].toSorted()) {
+    const capacity = kind === "lease" ? config.maxReviewsPerTick : config.maxReviewsPerDay;
+    const field = kind === "lease" ? "max_reviews_per_tick" : "max_reviews_per_day";
+    if (capacity === null) {
+      warnings.push(`review pool (${kind}) not planned: crw config.json has no ${field}`);
+      continue;
+    }
+    out.push(
+      kind === "lease"
+        ? {
+            poolId: reviewPoolId(missionId, kind),
+            name: "Crpko review slots",
+            unit: "review",
+            capacity,
+            scope: { _tag: "mission", missionId },
+            kind: "lease",
+            backend: "native",
+          }
+        : {
+            poolId: reviewPoolId(missionId, kind),
+            name: "Crpko reviews per day",
+            unit: "review",
+            capacity,
+            scope: { _tag: "mission", missionId },
+            kind: "budget",
+            backend: "crw-config",
+          },
+    );
+  }
+  return out;
+};
 
 const iso = (unixSeconds: number) => DateTime.formatIso(DateTime.makeUnsafe(unixSeconds * 1000));
 
@@ -647,15 +730,23 @@ export const buildImportPlan = (sources: ImportSources, options: ImportOptions):
     focusSubMissionId: null,
     health: "unknown",
     lockedFields: [],
+    approvalRouting: importApprovalRouting(m),
     createdAt: missionCreatedAt,
     updatedAt: missionCreatedAt,
   };
+  const reviewPools =
+    options.reviewPools !== undefined && options.reviewPools.length > 0
+      ? sources.crw === null
+        ? (warnings.push("review pools not planned: no crw config given"), [])
+        : reviewPoolInputs(m, sources.crw.config, options.reviewPools, warnings)
+      : [];
 
   return {
     missionId: m,
     asOf,
     core: { mission, roles, bindings, lanes, rules, workItems, approvals },
     router: { rooms, messages, subscriptions, readPositions },
+    policy: { pools: reviewPools },
     counts: {
       coordActors: coord.actors.length,
       coordChannels: coord.channels.length,
