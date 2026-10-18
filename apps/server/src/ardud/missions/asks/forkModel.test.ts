@@ -50,6 +50,7 @@ const open = (
     origin,
     caller,
     masterThreadId,
+    callerIsMaster: caller === master,
     forkThreadId,
     now,
   });
@@ -58,8 +59,9 @@ const code = (result: Result.Result<unknown, { code: string }>) =>
   Result.isFailure(result) ? result.failure.code : "ok";
 
 describe("forks", () => {
-  it("only the owner opens Discuss and his own questions; dev questions can come from the master", () => {
-    expect(code(open(master))).toBe("provenance-required");
+  it("M3: the master opens Discuss and dev forks; owner questions stay the owner's", () => {
+    expect(code(open(master))).toBe("ok");
+    expect(code(open(stranger))).toBe("forbidden");
     expect(code(open(master, "owner-question"))).toBe("provenance-required");
     expect(code(open(master, "dev-question"))).toBe("ok");
     const fork = Result.getOrThrow(open(owner)).record;
@@ -73,7 +75,7 @@ describe("forks", () => {
     expect(openForkFor([fork], missionId, "dev-question", origin)).toBeUndefined();
   });
 
-  it("closes with one line for the master and does not commit the mission unless the owner says so", () => {
+  it("closes with one line for the master and commits the mission only when the owner or master says so", () => {
     const fork = Result.getOrThrow(open(owner)).record;
     expect(
       code(
@@ -110,7 +112,7 @@ describe("forks", () => {
           now,
         }),
       ),
-    ).toBe("provenance-required");
+    ).toBe("forbidden");
 
     const closed = Result.getOrThrow(
       closeFork({
@@ -131,27 +133,44 @@ describe("forks", () => {
       commitsMission: false,
     });
 
+    expect(
+      code(
+        markForkCommits({
+          fork: closed.record,
+          provenance: forkThread.provenance,
+          callerIsMaster: false,
+          noteId: NoteId.make("n-3"),
+          now,
+        }),
+      ),
+    ).toBe("forbidden");
     const committed = Result.getOrThrow(
       markForkCommits({
         fork: closed.record,
         provenance: owner.provenance,
+        callerIsMaster: false,
         noteId: NoteId.make("n-2"),
         now,
       }),
     );
     expect(committed.record.commitsMission).toBe(true);
     expect(committed.delivery.text).toContain("This commits the mission");
+    // M3: the fork thread wrote that summary line, so it never reaches the master as the owner's words.
+    expect(committed.delivery.asOwner).toBe(false);
     expect(committed.note).toMatchObject({ id: "n-2", type: "decision", ackedBy: [] });
-    expect(
-      code(
-        markForkCommits({
-          fork: closed.record,
-          provenance: master.provenance,
-          noteId: NoteId.make("n-3"),
-          now,
-        }),
-      ),
-    ).toBe("provenance-required");
+
+    // The master can say so too, under its own name and never as the owner.
+    const byMaster = Result.getOrThrow(
+      markForkCommits({
+        fork: closed.record,
+        provenance: master.provenance,
+        callerIsMaster: true,
+        noteId: NoteId.make("n-4"),
+        now,
+      }),
+    );
+    expect(byMaster.events[0]?.actor).toEqual({ _tag: "role", roleId: "role-master" });
+    expect(byMaster.delivery.asOwner).toBe(false);
   });
 
   it("owner-closed Discuss forks reach the master as the owner's decision", () => {
@@ -170,7 +189,7 @@ describe("forks", () => {
     expect(closed.note?.summary).toBe("[Discussed: Use Postgres] Ship it on Friday");
   });
 
-  it("archives answered forks and lets the owner reopen them", () => {
+  it("M3: archives answered forks and lets the owner or the master reopen them", () => {
     const fork = Result.getOrThrow(open(owner)).record;
     expect(code(archiveFork(fork, owner.provenance))).toBe("conflict");
     const closed = Result.getOrThrow(
@@ -185,7 +204,12 @@ describe("forks", () => {
     ).record;
     const archived = Result.getOrThrow(archiveFork(closed, master.provenance)).record;
     expect(archived.status).toBe("archived");
-    expect(code(reopenFork(archived, master.provenance))).toBe("provenance-required");
-    expect(Result.getOrThrow(reopenFork(archived, owner.provenance)).record.status).toBe("open");
+    expect(code(reopenFork(archived, forkThread.provenance, false))).toBe("forbidden");
+    expect(Result.getOrThrow(reopenFork(archived, owner.provenance, false)).record.status).toBe(
+      "open",
+    );
+    const reopened = Result.getOrThrow(reopenFork(archived, master.provenance, true));
+    expect(reopened.record.status).toBe("open");
+    expect(reopened.events[0]?.actor).toEqual({ _tag: "role", roleId: "role-master" });
   });
 });

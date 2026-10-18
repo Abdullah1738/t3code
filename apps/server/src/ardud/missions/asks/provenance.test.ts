@@ -10,8 +10,9 @@ import * as Result from "effect/Result";
 
 import { findInImsgHistory, makeInboundLookup } from "./inbound.ts";
 import {
-  expectedForAnswer,
-  expectedForDraftDecision,
+  answerCheck,
+  draftDecisionCheck,
+  type ReplyCheck,
   verifyInbound,
   type InboundMessage,
 } from "./provenance.ts";
@@ -26,84 +27,175 @@ const owner = (text: string, id = "spc-msg-1"): InboundMessage => ({
   receivedAt: after,
 });
 
-const verify = (
-  inbound: InboundMessage | null,
-  expected: ReadonlyArray<string>,
-  id = "spc-msg-1",
-) => verifyInbound({ inboundId: id, inbound, expected, notBefore: opened, what: "Answer" });
+const OPTIONS = [
+  { id: "pg", label: "Postgres" },
+  { id: "sqlite", label: "SQLite" },
+];
+
+const verify = (inbound: InboundMessage | null, check: ReplyCheck, id = "spc-msg-1") =>
+  verifyInbound({ inboundId: id, inbound, check, notBefore: opened, what: "Answer" });
 
 const code = (result: ReturnType<typeof verify>) =>
   Result.isFailure(result) ? result.failure.code : "ok";
 
+const picks = (optionId: string | null, text = "", options = OPTIONS) => {
+  const check = answerCheck({ options, optionId, text });
+  return (reply: string) => code(verify(owner(reply), check)) === "ok";
+};
+
+const decides = (input: Parameters<typeof draftDecisionCheck>[0]) => {
+  const check = draftDecisionCheck(input);
+  return (reply: string) => code(verify(owner(reply), check)) === "ok";
+};
+
 describe("iMessage provenance", () => {
-  it("accepts a real owner or Moni message that says the answer", () => {
-    const ok = verify(owner("Go with Postgres, keep it simple"), ["go with postgres"]);
+  it("accepts a real owner or Moni message that carries the answer", () => {
+    const ok = verify(
+      owner("Go with Postgres"),
+      answerCheck({ options: OPTIONS, optionId: "pg", text: "" }),
+    );
     expect(Result.getOrThrow(ok)).toEqual({
       _tag: "owner-imessage",
       chat: "owner",
       inboundId: "spc-msg-1",
     });
-    const moni = verify({ ...owner("Yes ship it!"), chat: "moni" }, ["ship it"]);
+    const moni = verify(
+      { ...owner("Yes ship it!"), chat: "moni" },
+      draftDecisionCheck({ action: "approve" }),
+    );
     expect(Result.getOrThrow(moni).chat).toBe("moni");
   });
 
   it("refuses bridge wakes, secrets and resets even when the text matches", () => {
     for (const id of ["wake:abc", "secret:abc", "reset:abc"]) {
-      expect(code(verify(owner("postgres", id), ["postgres"], id))).toBe("provenance-invalid");
+      expect(
+        code(
+          verify(
+            owner("postgres", id),
+            answerCheck({ options: OPTIONS, optionId: "pg", text: "" }),
+            id,
+          ),
+        ),
+      ).toBe("provenance-invalid");
     }
   });
 
   it("refuses unknown ids, text that does not match, and messages older than the ask", () => {
-    expect(code(verify(null, ["postgres"]))).toBe("provenance-invalid");
-    expect(code(verify(owner("use sqlite"), ["postgres"]))).toBe("provenance-invalid");
-    expect(code(verify(owner("postgresql"), ["postgres"]))).toBe("provenance-invalid");
+    const pg = answerCheck({ options: OPTIONS, optionId: "pg", text: "" });
+    expect(code(verify(null, pg))).toBe("provenance-invalid");
+    expect(code(verify(owner("use sqlite"), pg))).toBe("provenance-invalid");
+    expect(code(verify(owner("postgresql"), pg))).toBe("provenance-invalid");
     expect(
-      code(
-        verify({ ...owner("postgres"), receivedAt: Date.parse(opened) - 10 * 60_000 }, [
-          "postgres",
-        ]),
-      ),
+      code(verify({ ...owner("postgres"), receivedAt: Date.parse(opened) - 10 * 60_000 }, pg)),
     ).toBe("provenance-invalid");
-    expect(code(verify(owner("postgres"), ["postgres"], " "))).toBe("provenance-required");
+    expect(code(verify(owner("postgres"), pg, " "))).toBe("provenance-required");
   });
 
-  it("checks what each decision must say", () => {
+  it("allows no clock skew before a revision epoch when asked to", () => {
+    const check = draftDecisionCheck({ action: "approve" });
+    const early = { ...owner("ok send it"), receivedAt: Date.parse(opened) - 30_000 };
+    const loose = verifyInbound({
+      inboundId: "spc-msg-1",
+      inbound: early,
+      check,
+      notBefore: opened,
+      what: "Approval",
+    });
+    expect(code(loose)).toBe("ok");
+    const strict = verifyInbound({
+      inboundId: "spc-msg-1",
+      inbound: early,
+      check,
+      notBefore: opened,
+      skewMs: 0,
+      what: "Approval",
+    });
+    expect(code(strict)).toBe("provenance-invalid");
+  });
+
+  // Sol H8: free text cannot stand in for a different option, and a negated
+  // or contradictory reply never picks the option it mentions.
+  it("H8: an answer by iMessage must name the chosen option and nothing against it", () => {
+    const deploy = picks("deploy", "", [
+      { id: "deploy", label: "Deploy" },
+      { id: "hold", label: "Hold" },
+    ]);
+    expect(deploy("deploy")).toBe(true);
+    expect(deploy("go deploy please")).toBe(true);
+    expect(deploy("do not deploy")).toBe(false);
+    expect(deploy("deploy? no, hold")).toBe(false);
+    expect(deploy("deploy not yet")).toBe(false);
+    expect(deploy("hold")).toBe(false);
+    expect(deploy("keep it safe")).toBe(false);
+    // An option by iMessage is the option and nothing else: no extra words
+    // (they could say anything about it) and no question.
     expect(
-      expectedForAnswer({ text: "", option: { id: "pg", label: "Postgres" } }).expected,
-    ).toEqual(["Postgres", "pg"]);
-    const byLetter = expectedForAnswer({ text: "", option: { id: "a", label: "Online" } });
-    const check = (text: string) =>
-      Result.isSuccess(
-        verifyInbound({
-          inboundId: "spc-msg-1",
-          inbound: owner(text),
-          ...byLetter,
-          notBefore: opened,
-          what: "Answer",
-        }),
-      );
-    expect(check("A")).toBe(true);
-    expect(check("go online")).toBe(true);
-    expect(check("take a break first")).toBe(false);
-    const approve = expectedForDraftDecision({ action: "approve" });
-    const ok = verifyInbound({
-      inboundId: "spc-msg-1",
-      inbound: owner("ok send it"),
-      ...approve,
-      notBefore: opened,
-      what: "Approval",
-    });
-    expect(Result.isSuccess(ok)).toBe(true);
-    const mixed = verifyInbound({
-      inboundId: "spc-msg-1",
-      inbound: owner("ok actually dont send"),
-      ...approve,
-      notBefore: opened,
-      what: "Approval",
-    });
-    expect(code(mixed)).toBe("provenance-invalid");
-    const edited = expectedForDraftDecision({ action: "approve", editedText: "Merged, thanks." });
-    expect(edited.expected).toEqual(["Merged, thanks."]);
+      picks("deploy", "keep it safe", [{ id: "deploy", label: "Deploy" }])("keep it safe"),
+    ).toBe(false);
+    expect(picks("pg", "keep it simple")("postgres keep it simple")).toBe(false);
+    expect(picks("pg", "just kidding")("postgres just kidding")).toBe(false);
+    expect(deploy("Deploy would be a disaster")).toBe(false);
+    expect(deploy("deploy isn't safe")).toBe(false);
+    expect(deploy("Deploy?")).toBe(false);
+    expect(deploy("deploy, thanks")).toBe(true);
+    // One-letter ids count only as the whole reply.
+    const letter = picks("a", "", [
+      { id: "a", label: "Online" },
+      { id: "b", label: "Offline window" },
+    ]);
+    expect(letter("A")).toBe(true);
+    expect(letter("go online")).toBe(true);
+    expect(letter("take a break first")).toBe(false);
+    expect(letter("online or offline window")).toBe(false);
+    // Free-text answers are his whole reply as typed (spacing aside), so a
+    // relay can't change a symbol or a sign on the way.
+    expect(picks(null, "Ship Friday!")("Ship  Friday!")).toBe(true);
+    expect(picks(null, "ship friday")("Ship Friday!")).toBe(false);
+    expect(picks(null, "budget 100")("budget -100")).toBe(false);
+    expect(picks(null, "ship friday")("dont ship friday")).toBe(false);
+  });
+
+  // Sol H9: approval needs approval words and nothing else; an edit needs the
+  // edited text after them. No substring or OR of approval words.
+  it("H9: a draft decision by iMessage must say exactly that decision", () => {
+    const approve = decides({ action: "approve" });
+    expect(approve("ok send it")).toBe(true);
+    expect(approve("Approve")).toBe(true);
+    expect(approve("do not approve")).toBe(false);
+    expect(approve("ok actually dont send")).toBe(false);
+    expect(approve("yes but change the second line")).toBe(false);
+    const edited = decides({ action: "approve", editedText: "hello world" });
+    expect(edited("approve: hello world")).toBe(true);
+    expect(edited("ok send it\nhello world")).toBe(true);
+    expect(edited("ok send it with hello world")).toBe(false);
+    expect(edited("Do not send the line hello world.")).toBe(false);
+    expect(edited("hello world")).toBe(false);
+    expect(edited("approve")).toBe(false);
+    expect(edited("approve?: hello world")).toBe(false);
+    // The edit is compared as typed, so a relay can't swap symbols in it.
+    expect(
+      decides({ action: "approve", editedText: "see evil.example.com" })(
+        "ok: see evil-example.com",
+      ),
+    ).toBe(false);
+    expect(decides({ action: "approve", editedText: "pay -100" })("ok: pay 100")).toBe(false);
+    expect(decides({ action: "approve", editedText: "pay -100" })("ok: pay -100")).toBe(true);
+    // An approval prefix can't carry a refusal or nothing as the edit.
+    expect(decides({ action: "approve", editedText: "don't send it" })("ok: don't send it")).toBe(
+      false,
+    );
+    expect(decides({ action: "approve", editedText: "no wait" })("yes: no wait")).toBe(false);
+    expect(decides({ action: "approve", editedText: "it" })("ok send it")).toBe(false);
+    expect(decides({ action: "approve", editedText: "!!!" })("ok: !!!")).toBe(false);
+    const rewrite = decides({ action: "rewrite", rewriteNote: "shorter please" });
+    expect(rewrite("rewrite: shorter please")).toBe(true);
+    expect(rewrite("rewrite shorter please")).toBe(false);
+    expect(rewrite("shorter please")).toBe(false);
+    expect(rewrite("send it: shorter please")).toBe(false);
+    const drop = decides({ action: "drop" });
+    expect(drop("drop it")).toBe(true);
+    expect(drop("dont send")).toBe(true);
+    expect(drop("dont drop it")).toBe(false);
   });
 });
 

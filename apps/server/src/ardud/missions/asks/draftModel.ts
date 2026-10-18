@@ -5,9 +5,16 @@
  * past approved examples every time, and the owner's edits teach new notes
  * (see draftLearning.ts). Sending is a later step; approving records
  * `approved` and stops.
+ *
+ * Routing: the mission's routing table picks the approver (owner or master)
+ * when a draft opens; owner or master can re-route a waiting draft with a
+ * reason. The approver decides, the owner can always decide, and a draft
+ * routed to the owner waits for him like an ask (no default, no deadline).
  */
 import {
+  approverOf,
   isOwnerProvenance,
+  type Approver,
   type DecideDraftInput,
   type Draft,
   type DraftChannel,
@@ -19,8 +26,11 @@ import {
   type MissionLink,
   type MissionProvenance,
   type MissionRecordRef,
+  type OpenSystemDraftInput,
   type RoleId,
+  type SystemDraftDecision,
 } from "@t3tools/contracts";
+import * as Result from "effect/Result";
 
 import {
   actorOf,
@@ -104,7 +114,10 @@ export interface DraftExample {
   readonly edited: boolean;
 }
 
-/** Recent approved texts for the same channel, same person first: the house style by example. */
+/**
+ * Recent owner-approved texts for the same channel, same person first: the
+ * house style by example. A master's approvals don't teach the owner's voice.
+ */
 export const draftExamples = (
   address: DraftAddress,
   drafts: ReadonlyArray<Draft>,
@@ -115,7 +128,9 @@ export const draftExamples = (
       (draft) =>
         draft.channel === address.channel &&
         (draft.status === "approved" || draft.status === "sent") &&
-        draft.decidedAt !== null,
+        draft.decidedAt !== null &&
+        draft.decidedBy !== null &&
+        isOwnerProvenance(draft.decidedBy),
     )
     .toSorted((left, right) => {
       const person =
@@ -145,6 +160,10 @@ export interface SubmitDraftCommand {
   readonly notes: ReadonlyArray<DraftNote>;
   /** Drafts already in the mission, for dedupe. */
   readonly existing: ReadonlyArray<Draft>;
+  /** What the mission's routing table says (see `routeApprover`). */
+  readonly route: { readonly approver: Approver; readonly routeId: string | null };
+  /** The role the caller drafts as and the model its binding last ran on. */
+  readonly writtenBy: NonNullable<Draft["writtenBy"]>;
   readonly now: string;
 }
 
@@ -196,7 +215,18 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
     decidedAt: null,
     sentAt: null,
     createdAt: command.now,
+    approver: command.route.approver,
+    routeNote: null,
+    summary: null,
+    flags: [],
+    writtenBy: command.writtenBy,
+    requestedBy: null,
+    head: null,
+    staleReason: null,
+    revision: 0,
+    revisedAt: command.now,
   };
+  const asks = command.route.approver === "master" ? " (for the master)" : "";
   return ok({
     record,
     events: [
@@ -204,12 +234,50 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
         kind: "draft.opened",
         actor: actorOf(caller.provenance),
         provenance: caller.provenance,
-        summary: clipSummary(`Draft for ${audience} (${command.channel}): ${text}`),
+        summary: clipSummary(`Draft for ${audience} (${command.channel})${asks}: ${text}`),
         subject: draftRef(record),
-        payload: { appliedNoteIds: record.appliedNoteIds, source: command.source },
+        payload: {
+          appliedNoteIds: record.appliedNoteIds,
+          source: command.source,
+          approver: command.route.approver,
+          routeId: command.route.routeId,
+        },
       },
     ],
   });
+};
+
+/** The draft's decision epoch: 0 when written, +1 on every revision and reopen. */
+export const revisionOf = (draft: Pick<Draft, "revision">): number => draft.revision ?? 0;
+
+/** When the current epoch began; a decision's evidence must not predate it. */
+export const epochOf = (draft: Pick<Draft, "revisedAt" | "createdAt">): string =>
+  draft.revisedAt ?? draft.createdAt;
+
+/** Starts a new epoch: whatever was said about the earlier text or decision no longer counts. */
+const nextEpoch = (draft: Draft, now: string): Pick<Draft, "revision" | "revisedAt"> => ({
+  revision: revisionOf(draft) + 1,
+  revisedAt: now,
+});
+
+/** Who may act on a draft as its approver: the owner always, the master when routed to it. */
+const approverCheck = (
+  draft: Draft,
+  provenance: MissionProvenance,
+  callerIsMaster: boolean,
+  verb: string,
+): Outcome<null> => {
+  if (isOwnerProvenance(provenance)) return ok(null);
+  if (approverOf(draft) === "owner") {
+    return refuse(
+      "provenance-required",
+      `Draft ${draft.id} is routed to the owner; he ${verb} it.`,
+    );
+  }
+  if (!callerIsMaster) {
+    return refuse("forbidden", `Only the mission's master or the owner ${verb} draft ${draft.id}.`);
+  }
+  return ok(null);
 };
 
 const sameTarget = (left: MissionLink, right: MissionLink) =>
@@ -230,22 +298,41 @@ export interface DraftDecision extends Transition<Draft> {
 export interface DecideDraftCommand {
   readonly draft: Draft;
   readonly input: DecideDraftInput;
-  /** Owner app session, or the verified iMessage inbound. */
+  /** Owner app session, the verified iMessage inbound, or the master's own call. */
   readonly provenance: MissionProvenance;
+  /** The caller is the draft mission's master. */
+  readonly callerIsMaster: boolean;
   readonly now: string;
 }
 
 export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision> => {
   const { draft, input, provenance } = command;
-  if (!isOwnerProvenance(provenance)) {
-    return refuse("provenance-required", "Only the owner approves, rewrites or drops drafts.");
-  }
+  const allowed = approverCheck(draft, provenance, command.callerIsMaster, "decides");
+  if (Result.isFailure(allowed)) return Result.fail(allowed.failure);
   if (provenance._tag === "owner-imessage" && provenance.inboundId !== input.inboundId) {
     return refuse("provenance-invalid", "The verified inbound does not match this decision.");
   }
   if (input.draftId !== draft.id) return refuse("invalid", "Decision is for a different draft.");
   if (draft.status !== "pending") {
     return refuse("conflict", `Draft ${draft.id} is ${draft.status}.`);
+  }
+  // An approval in the app or by a master binds to the text the decider read;
+  // an iMessage approval binds through the revision epoch instead.
+  if (
+    input.action === "approve" &&
+    input.revision === undefined &&
+    provenance._tag !== "owner-imessage"
+  ) {
+    return refuse(
+      "invalid",
+      `Approving draft ${draft.id} needs the revision you read (now ${revisionOf(draft)}).`,
+    );
+  }
+  if (input.revision !== undefined && input.revision !== revisionOf(draft)) {
+    return refuse(
+      "conflict",
+      `Draft ${draft.id} changed since revision ${input.revision} (now ${revisionOf(draft)}); decide what it says now.`,
+    );
   }
   const decided = { decidedBy: provenance, decidedAt: command.now };
   switch (input.action) {
@@ -334,6 +421,16 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
   ) {
     return refuse("forbidden", "Only the draft's writer revises it.");
   }
+  const requestedBy = draft.requestedBy ?? null;
+  if (
+    requestedBy !== null &&
+    !(caller.provenance._tag === "system" && caller.provenance.component === requestedBy)
+  ) {
+    return refuse(
+      "forbidden",
+      `Draft ${draft.id} belongs to ${requestedBy}; it opens a new draft for the head instead.`,
+    );
+  }
   if (draft.status !== "rewrite-requested" && draft.status !== "pending") {
     return refuse("conflict", `Draft ${draft.id} is ${draft.status}.`);
   }
@@ -348,6 +445,7 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
     appliedNoteIds: applied.map((note) => note.id),
     decidedBy: null,
     decidedAt: null,
+    ...nextEpoch(draft, command.now),
   };
   return ok({
     record,
@@ -360,6 +458,7 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
         subject: draftRef(record),
         payload: {
           revision: true,
+          epoch: revisionOf(record),
           previousText: draft.text,
           rewriteNote: draft.rewriteNote,
           appliedNoteIds: record.appliedNoteIds,
@@ -369,14 +468,20 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
   });
 };
 
-/** The way back out: the owner un-approves (before it is sent) or un-drops a draft. */
+/** The way back out: the approver un-approves (before it is sent) or un-drops a draft. */
 export const reopenDraft = (
   draft: Draft,
   provenance: MissionProvenance,
+  callerIsMaster: boolean,
   now: string,
 ): Outcome<Transition<Draft>> => {
-  if (!isOwnerProvenance(provenance)) {
-    return refuse("provenance-required", "Only the owner reopens a draft.");
+  const allowed = approverCheck(draft, provenance, callerIsMaster, "reopens");
+  if (Result.isFailure(allowed)) return Result.fail(allowed.failure);
+  if ((draft.staleReason ?? null) !== null) {
+    return refuse(
+      "conflict",
+      `Draft ${draft.id} was closed as stale (${draft.staleReason}); its head moved, so it no longer counts.`,
+    );
   }
   if (draft.status !== "approved" && draft.status !== "dropped") {
     return refuse(
@@ -390,6 +495,7 @@ export const reopenDraft = (
     approvedText: null,
     decidedBy: null,
     decidedAt: null,
+    ...nextEpoch(draft, now),
   };
   return ok({
     record,
@@ -398,17 +504,340 @@ export const reopenDraft = (
         action: "reopen",
         previousStatus: draft.status,
         previousApprovedText: draft.approvedText,
+        epoch: revisionOf(record),
         at: now,
       }),
     ],
   });
 };
 
-/** Owner-approved edit pairs on record: the raw material for edit learning. */
+export interface RouteDraftCommand {
+  readonly draft: Draft;
+  readonly approver: Approver;
+  readonly reason: string;
+  readonly provenance: MissionProvenance;
+  readonly callerIsMaster: boolean;
+}
+
+/**
+ * Owner or master sends one waiting draft to the other approver. The reason
+ * lands on the record and the timeline; routing to the current approver is a
+ * no-op.
+ */
+export const routeDraft = (command: RouteDraftCommand): Outcome<Transition<Draft>> => {
+  const { draft, provenance } = command;
+  if (!isOwnerProvenance(provenance) && !command.callerIsMaster) {
+    return refuse("forbidden", "Only the owner or the mission's master re-routes a draft.");
+  }
+  if (!awaitingOwner(draft)) {
+    return refuse(
+      "conflict",
+      `Draft ${draft.id} is ${draft.status}; only waiting drafts re-route.`,
+    );
+  }
+  const reason = command.reason.trim();
+  if (reason.length === 0) return refuse("invalid", "Say why the draft moves.");
+  const from = approverOf(draft);
+  if (from === command.approver) return ok({ record: draft, events: [] });
+  const record: Draft = { ...draft, approver: command.approver, routeNote: reason };
+  return ok({
+    record,
+    events: [
+      {
+        kind: "draft.routed",
+        actor: actorOf(provenance),
+        provenance,
+        summary: clipSummary(
+          `Routed to the ${command.approver}: draft for ${draft.audience} (${draft.channel}) (${reason})`,
+        ),
+        subject: draftRef(record),
+        payload: { approver: command.approver, from, reason },
+      },
+    ],
+  });
+};
+
+export interface DraftAnnotation {
+  readonly summary: string | null;
+  readonly flags: ReadonlyArray<string>;
+}
+
+export const annotationOf = (draft: Draft): DraftAnnotation => ({
+  summary: draft.summary ?? null,
+  flags: draft.flags ?? [],
+});
+
+const chips = (flags: ReadonlyArray<string>) =>
+  flags.length === 0 ? "" : ` [${flags.join(", ")}]`;
+
+/**
+ * Owner or master sets a waiting draft's short summary and flag chips (already cleaned, see
+ * `cleanAnnotation`). Same values are a no-op.
+ */
+export const annotateDraft = (command: {
+  readonly draft: Draft;
+  readonly annotation: DraftAnnotation;
+  readonly provenance: MissionProvenance;
+  readonly callerIsMaster: boolean;
+}): Outcome<Transition<Draft>> => {
+  const { draft, annotation, provenance } = command;
+  if (!isOwnerProvenance(provenance) && !command.callerIsMaster) {
+    return refuse("forbidden", "Only the owner or the mission's master annotates a draft.");
+  }
+  if (!awaitingOwner(draft)) {
+    return refuse("conflict", `Draft ${draft.id} is ${draft.status}; only waiting drafts change.`);
+  }
+  const previous = annotationOf(draft);
+  if (
+    previous.summary === annotation.summary &&
+    previous.flags.length === annotation.flags.length &&
+    previous.flags.every((flag, index) => flag === annotation.flags[index])
+  ) {
+    return ok({ record: draft, events: [] });
+  }
+  const record: Draft = { ...draft, summary: annotation.summary, flags: [...annotation.flags] };
+  return ok({
+    record,
+    events: [
+      {
+        kind: "draft.annotated",
+        actor: actorOf(provenance),
+        provenance,
+        summary: clipSummary(
+          `Annotated: draft for ${draft.audience} (${draft.channel})${chips(annotation.flags)}`,
+        ),
+        subject: draftRef(record),
+        payload: { summary: annotation.summary, flags: annotation.flags, previous },
+      },
+    ],
+  });
+};
+
+const STALE_STATES: ReadonlySet<Draft["status"]> = new Set(["pending", "rewrite-requested"]);
+
+const staleClose = (
+  draft: Draft,
+  reason: string,
+  provenance: MissionProvenance,
+  now: string,
+): Transition<Draft> => {
+  const record: Draft = {
+    ...draft,
+    status: "dropped",
+    staleReason: reason,
+    decidedBy: null,
+    decidedAt: now,
+  };
+  return {
+    record,
+    events: [
+      {
+        kind: "draft.stale-closed",
+        actor: actorOf(provenance),
+        provenance,
+        summary: clipSummary(
+          `Closed as stale: draft for ${draft.audience} (${draft.channel}) (${reason})`,
+        ),
+        subject: draftRef(record),
+        payload: { reason, head: draft.head ?? null, previousStatus: draft.status },
+      },
+    ],
+  };
+};
+
+const requesterCheck = (provenance: MissionProvenance, requestedBy: string): Outcome<null> =>
+  provenance._tag === "system" && provenance.component === requestedBy
+    ? ok(null)
+    : refuse("forbidden", `Only ${requestedBy} opens or closes its own drafts.`);
+
+const shortHead = (head: string) => head.slice(0, 12);
+
+export interface OpenSystemDraftCommand {
+  readonly input: OpenSystemDraftInput;
+  readonly annotation: DraftAnnotation;
+  readonly provenance: MissionProvenance;
+  /** The same id, when it exists already. */
+  readonly current: Draft | null;
+  /** The mission's drafts, to stale-close the ones for an older head. */
+  readonly existing: ReadonlyArray<Draft>;
+  readonly route: { readonly approver: Approver; readonly routeId: string | null };
+  readonly notes: ReadonlyArray<DraftNote>;
+  readonly now: string;
+}
+
+export interface SystemDraftOpened {
+  readonly record: Draft;
+  /** Older drafts for the same target from the same system, closed as stale. */
+  readonly closed: ReadonlyArray<Draft>;
+  readonly events: ReadonlyArray<Transition<Draft>["events"][number]>;
+}
+
+/**
+ * A system (crw) opens a draft for one exact head. Same id and head is a no-op, the same id
+ * for another head is refused, and opening a new head stale-closes the system's waiting drafts
+ * for that target, so an older head never reads as decided.
+ */
+export const openSystemDraft = (command: OpenSystemDraftCommand): Outcome<SystemDraftOpened> => {
+  const { input, provenance } = command;
+  const allowed = requesterCheck(provenance, input.requestedBy);
+  if (Result.isFailure(allowed)) return Result.fail(allowed.failure);
+  if (command.current !== null) {
+    const current = command.current;
+    if (current.requestedBy !== input.requestedBy || current.missionId !== input.missionId) {
+      return refuse("conflict", `Draft id ${current.id} is taken by another draft.`);
+    }
+    if (current.head !== input.head) {
+      return refuse(
+        "conflict",
+        `Draft ${current.id} is for head ${shortHead(current.head ?? "none")}; open head ${shortHead(input.head)} under a new id.`,
+      );
+    }
+    return ok({ record: current, closed: [], events: [] });
+  }
+  // One waiting system draft per target: a new head or a re-draft replaces the older ones.
+  const closed = command.existing
+    .filter(
+      (draft) =>
+        draft.missionId === input.missionId &&
+        draft.requestedBy === input.requestedBy &&
+        STALE_STATES.has(draft.status) &&
+        sameTarget(draft.target, input.target),
+    )
+    .map((draft) =>
+      staleClose(
+        draft,
+        draft.head === input.head
+          ? `replaced by ${input.draftId}`
+          : `head moved to ${shortHead(input.head)}`,
+        provenance,
+        command.now,
+      ),
+    );
+  const address = { missionId: input.missionId, channel: input.channel, audience: input.audience };
+  const applied = notesFor(address, command.notes);
+  const record: Draft = {
+    id: input.draftId,
+    missionId: input.missionId,
+    audience: input.audience,
+    channel: input.channel,
+    target: input.target,
+    text: input.text,
+    approvedText: null,
+    writerRoleId: null,
+    // Draft sources predate system drafts; `requestedBy` says which system wrote it.
+    source: { kind: "editor", ref: null },
+    appliedNoteIds: applied.map((note) => note.id),
+    status: "pending",
+    rewriteNote: null,
+    decidedBy: null,
+    decidedAt: null,
+    sentAt: null,
+    createdAt: command.now,
+    approver: command.route.approver,
+    routeNote: null,
+    summary: command.annotation.summary,
+    flags: [...command.annotation.flags],
+    writtenBy: { roleId: null, model: null },
+    requestedBy: input.requestedBy,
+    head: input.head,
+    staleReason: null,
+    revision: 0,
+    revisedAt: command.now,
+  };
+  const asks = command.route.approver === "master" ? " (for the master)" : "";
+  return ok({
+    record,
+    closed: closed.map((transition) => transition.record),
+    events: [
+      {
+        kind: "draft.opened",
+        actor: actorOf(provenance),
+        provenance,
+        summary: clipSummary(
+          `Draft for ${input.audience} (${input.channel}, head ${shortHead(input.head)})${asks}: ${input.text}`,
+        ),
+        subject: draftRef(record),
+        payload: {
+          appliedNoteIds: record.appliedNoteIds,
+          source: record.source,
+          approver: command.route.approver,
+          routeId: command.route.routeId,
+          requestedBy: input.requestedBy,
+          head: input.head,
+          staleClosed: closed.map((transition) => transition.record.id),
+        },
+      },
+      ...closed.flatMap((transition) => transition.events),
+    ],
+  });
+};
+
+/** The requesting system closes its own waiting draft as stale. Already stale is a no-op. */
+export const closeStaleDraft = (command: {
+  readonly draft: Draft;
+  readonly requestedBy: string;
+  readonly reason: string;
+  readonly provenance: MissionProvenance;
+  readonly now: string;
+}): Outcome<Transition<Draft>> => {
+  const { draft } = command;
+  const allowed = requesterCheck(command.provenance, command.requestedBy);
+  if (Result.isFailure(allowed)) return Result.fail(allowed.failure);
+  if (draft.requestedBy !== command.requestedBy) {
+    return refuse("forbidden", `Draft ${draft.id} was not opened by ${command.requestedBy}.`);
+  }
+  if ((draft.staleReason ?? null) !== null) return ok({ record: draft, events: [] });
+  if (!STALE_STATES.has(draft.status)) {
+    return refuse("conflict", `Draft ${draft.id} is ${draft.status}; a decided draft stays.`);
+  }
+  const reason = command.reason.trim();
+  if (reason.length === 0) return refuse("invalid", "Say why the draft is stale.");
+  return ok(staleClose(draft, reason, command.provenance, command.now));
+};
+
+/**
+ * What a system may act on for one draft at one head. Only a decision on exactly that head
+ * counts; a stale draft or any other head reads as `stale`.
+ */
+export const systemDraftDecision = (draft: Draft, head: string): SystemDraftDecision => {
+  const base = { draftId: draft.id, head, text: null, edited: false, rewriteNote: null };
+  if ((draft.staleReason ?? null) !== null || draft.head !== head) {
+    return { ...base, state: "stale", decidedAt: null };
+  }
+  switch (draft.status) {
+    case "pending":
+      return { ...base, state: "pending", decidedAt: null };
+    case "approved":
+    case "sent":
+    case "send-failed": {
+      const edited = draft.approvedText !== null && draft.approvedText !== draft.text;
+      return {
+        ...base,
+        state: "approved",
+        text: draft.approvedText ?? draft.text,
+        edited,
+        decidedAt: draft.decidedAt,
+      };
+    }
+    case "rewrite-requested":
+      return {
+        ...base,
+        state: "rewrite-requested",
+        rewriteNote: draft.rewriteNote,
+        decidedAt: draft.decidedAt,
+      };
+    case "dropped":
+      return { ...base, state: "dropped", decidedAt: draft.decidedAt };
+  }
+};
+
+/** Edit pairs the owner approved: the raw material for edit learning. */
 export const ownerEdits = (drafts: ReadonlyArray<Draft>): Array<DraftEdit & { draft: Draft }> =>
   drafts
     .filter(
       (draft) =>
+        draft.decidedBy !== null &&
+        isOwnerProvenance(draft.decidedBy) &&
         (draft.status === "approved" ||
           draft.status === "sent" ||
           draft.status === "send-failed") &&
@@ -436,6 +865,8 @@ export interface SaveDraftNoteCommand {
   readonly active: boolean;
   readonly source: DraftNote["source"];
   readonly provenance: MissionProvenance;
+  /** The caller is a master (of the note's mission, or of any mission for a global note). */
+  readonly callerIsMaster: boolean;
   /** All notes, for dedupe. */
   readonly notes: ReadonlyArray<DraftNote>;
   readonly now: string;
@@ -448,13 +879,17 @@ const sameScope = (left: DraftNoteScope, right: DraftNoteScope) =>
     (right._tag === "person" && normalizeText(left.name) === normalizeText(right.name)));
 
 /**
- * Create, edit, retire or restore a note. Only the owner writes notes; an
- * accepted suggestion writes one with the owner's acceptance as provenance.
+ * Create, edit, retire or restore a note. The owner and masters write notes;
+ * other agents suggest them, and an accepted suggestion writes one with the
+ * decider's provenance.
  */
 export const saveDraftNote = (command: SaveDraftNoteCommand): Outcome<Transition<DraftNote>> => {
   const { provenance, existing } = command;
-  if (!isOwnerProvenance(provenance)) {
-    return refuse("provenance-required", "Only the owner writes draft notes; agents suggest them.");
+  if (!isOwnerProvenance(provenance) && !command.callerIsMaster) {
+    return refuse(
+      "forbidden",
+      "Only the owner or a master writes draft notes; agents suggest them.",
+    );
   }
   const text = command.text.trim();
   if (text.length === 0) return refuse("invalid", "A draft note needs text.");
@@ -479,6 +914,7 @@ export const saveDraftNote = (command: SaveDraftNoteCommand): Outcome<Transition
     active: command.active,
     createdAt: existing?.createdAt ?? command.now,
     updatedAt: command.now,
+    writtenBy: actorOf(provenance),
   };
   const action =
     existing === null
@@ -493,7 +929,7 @@ export const saveDraftNote = (command: SaveDraftNoteCommand): Outcome<Transition
     events: [
       {
         kind: "draft-note.updated",
-        actor: { _tag: "owner" },
+        actor: actorOf(provenance),
         provenance,
         summary: clipSummary(`Draft note ${action} (${describeScope(command.scope)}): ${text}`),
         subject: draftNoteRef(record),

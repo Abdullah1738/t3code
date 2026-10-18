@@ -13,6 +13,7 @@ import {
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
 
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { SuggestionApplication } from "./suggestionModel.ts";
@@ -198,27 +199,59 @@ export const SUGGESTION_OWNERS: Readonly<Record<SuggestionTargetKind, string>> =
   "draft-note": "asks",
 };
 
+/** Applies an accepted suggestion and returns the outcome line. */
+export type SuggestionApply = (
+  application: SuggestionApplication,
+  provenance: MissionProvenance,
+) => Effect.Effect<string, MissionError>;
+
 /**
- * Applies an accepted suggestion through the owning service, the same call a
- * human edit makes, and returns the outcome line. Draft notes apply inside
- * asks; the others wait for their track (outcome says so, nothing applies).
+ * One track's applier: applies an accepted suggestion through the owning
+ * service, the same call a human edit makes, and returns the outcome line.
  */
 export class SuggestionAppliers extends Context.Service<
   SuggestionAppliers,
-  {
-    readonly apply: (
-      application: SuggestionApplication,
-      provenance: MissionProvenance,
-    ) => Effect.Effect<string, MissionError>;
-  }
+  { readonly apply: SuggestionApply }
 >()("t3/ardud/missions/asks/ports/SuggestionAppliers") {}
 
-export const appliersPending = Layer.succeed(
-  SuggestionAppliers,
-  SuggestionAppliers.of({
-    apply: (application) =>
-      Effect.succeed(
-        `Accepted; not applied yet: the ${SUGGESTION_OWNERS[application.targetKind]} service for ${application.targetKind} is not wired.`,
-      ),
+/**
+ * Where tracks register their appliers. Asks reads it when a suggestion is
+ * accepted, so policy and core can register from their own layers without
+ * asks depending on them (they depend on asks). A kind nobody registered
+ * applies nothing and the outcome says so.
+ */
+export class SuggestionApplierRegistry extends Context.Service<
+  SuggestionApplierRegistry,
+  {
+    readonly register: (
+      kinds: ReadonlyArray<SuggestionTargetKind>,
+      apply: SuggestionApply,
+    ) => Effect.Effect<void>;
+    readonly apply: SuggestionApply;
+  }
+>()("t3/ardud/missions/asks/ports/SuggestionApplierRegistry") {}
+
+export const notWired = (kind: SuggestionTargetKind) =>
+  `Accepted; not applied: nothing applies ${kind} suggestions on this server (the ${SUGGESTION_OWNERS[kind]} service is not wired).`;
+
+export const applierRegistry = Layer.effect(
+  SuggestionApplierRegistry,
+  Effect.gen(function* () {
+    const appliers = yield* Ref.make(new Map<SuggestionTargetKind, SuggestionApply>());
+    return SuggestionApplierRegistry.of({
+      register: (kinds, apply) =>
+        Ref.update(appliers, (current) => {
+          const next = new Map(current);
+          for (const kind of kinds) next.set(kind, apply);
+          return next;
+        }),
+      apply: (application, provenance) =>
+        Effect.flatMap(Ref.get(appliers), (current) => {
+          const apply = current.get(application.targetKind);
+          return apply === undefined
+            ? Effect.succeed(notWired(application.targetKind))
+            : apply(application, provenance);
+        }),
+    });
   }),
 );

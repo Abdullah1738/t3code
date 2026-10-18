@@ -216,14 +216,18 @@ const changeOf = (suggestion: Suggestion): DraftNoteChange | null => {
 };
 
 /**
- * Accepting a draft-note suggestion: the same note save the owner makes by
- * hand, carrying his acceptance as provenance and `source: "suggestion"`.
+ * Accepting a draft-note suggestion: the same note save the owner or master
+ * makes by hand, carrying the decider's provenance and `source: "suggestion"`.
  */
 export const draftNoteFromSuggestion = (input: {
   readonly id: DraftNoteId;
   readonly after: unknown;
   readonly target: MissionRecordRef | null;
+  /** The suggestion's own mission: the note it saves lands there and nowhere else. */
+  readonly suggestionMissionId: MissionId | null;
   readonly provenance: MissionProvenance;
+  /** The decider is a master (who may write notes directly too). */
+  readonly callerIsMaster: boolean;
   readonly notes: ReadonlyArray<DraftNote>;
   readonly now: string;
 }): Outcome<Transition<DraftNote>> => {
@@ -232,12 +236,21 @@ export const draftNoteFromSuggestion = (input: {
     return refuse("invalid", "The accepted change is not a draft note (scope and text).");
   }
   const change = decoded.success;
+  if (change.missionId !== input.suggestionMissionId) {
+    return refuse(
+      "invalid",
+      `The suggestion belongs to ${input.suggestionMissionId ?? "every mission"} but writes a note for ${change.missionId ?? "every mission"}; suggest it there.`,
+    );
+  }
   const existing =
     input.target === null
       ? null
       : (input.notes.find((note) => note.id === input.target?.id) ?? null);
   if (input.target !== null && existing === null) {
     return refuse("not-found", `Draft note ${input.target.id} is gone.`);
+  }
+  if (existing !== null && existing.missionId !== change.missionId) {
+    return refuse("invalid", `Draft note ${existing.id} belongs to another mission.`);
   }
   return saveDraftNote({
     id: existing?.id ?? input.id,
@@ -248,6 +261,7 @@ export const draftNoteFromSuggestion = (input: {
     active: change.active ?? true,
     source: "suggestion",
     provenance: input.provenance,
+    callerIsMaster: input.callerIsMaster,
     notes: input.notes,
     now: input.now,
   });

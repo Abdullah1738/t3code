@@ -161,7 +161,7 @@ export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
         lookup,
         Ports.signalsDeliver.pipe(Layer.provideMerge(threads)),
         Ports.roomsPending,
-        Ports.appliersPending,
+        Ports.applierRegistry,
         NodeServices.layer,
       ),
     ),
@@ -189,6 +189,50 @@ export const seed = Effect.gen(function* () {
       { _tag: "lane", record: lane },
       { _tag: "work-item", record: item("wi-held") },
       { _tag: "work-item", record: item("wi-free") },
+    ],
+  });
+});
+
+export const otherMissionId = MissionId.make("m-2");
+export const otherMasterThread = ThreadId.make("t-master-2");
+export const otherLane: Lane = {
+  ...lane,
+  id: LaneId.make("lane-other"),
+  missionId: otherMissionId,
+  threadId: ThreadId.make("t-lane-2"),
+};
+
+/** A second mission whose master holds a custom role, found through masterRoleId. */
+export const seedOther = Effect.gen(function* () {
+  const store = yield* MissionStore.MissionStore;
+  yield* store.commit({
+    event: {
+      missionId: otherMissionId,
+      kind: "mission.created",
+      actor: { _tag: "system", component: "test" },
+      provenance: { _tag: "system", component: "test" },
+      summary: "seed other",
+      subject: null,
+    },
+    upserts: [
+      {
+        _tag: "mission",
+        record: {
+          ...mission,
+          id: otherMissionId,
+          slug: "m-2",
+          masterRoleId: RoleId.make("role-lead-2"),
+        },
+      },
+      {
+        _tag: "role",
+        record: { ...role("role-lead-2", "custom"), missionId: otherMissionId },
+      },
+      {
+        _tag: "role-binding",
+        record: binding("b-lead-2", "role-lead-2", otherMasterThread),
+      },
+      { _tag: "lane", record: otherLane },
     ],
   });
 });
