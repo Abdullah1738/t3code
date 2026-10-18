@@ -34,7 +34,7 @@ def register_tracking(flow, label, recipient='owner', *, paid=True):
     if not order:journal.fail('EXACT_ORDER_ID_UNAVAILABLE')
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app',state['app'],'--order',order,
-             *order_watch_receipt.command_args(recipient),
+             *order_watch_receipt.command_args(recipient,state.get('reserved_minor')),
              '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),'--label',label,
              *([] if paid else ['--hold-placed-text'])]
     try:
@@ -684,7 +684,7 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
                     # text held while payment was unconfirmed; never twice.
                     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
                     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app','talabat','--order',order,
-                             *order_watch_receipt.command_args(who),
+                             *order_watch_receipt.command_args(who,order_watch_receipt.reserved_minor(journal,flow_id)),
                              '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),
                              '--label','talabat recovered paid order']
                     try:

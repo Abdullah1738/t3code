@@ -261,6 +261,35 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(result['status'], 'out for delivery')
         self.assertEqual(result['partial_evidence'][0]['item_id'], 'N123-1')
 
+    def test_moni_gets_no_progress_wakes_but_owner_does(self):
+        at = time.time()
+        for recipient, expected in (('moni', []), ('owner', [{'kind': 'stage_change', 'status': 'nearby'}])):
+            with self.subTest(recipient=recipient):
+                cfg = dict(self.cfg(), **{'for': recipient, 'eta': None})
+                state = {'primed': True, 'status': 'out for delivery'}
+                events = t.transition({'status': 'nearby', 'errors': []}, state, cfg, at)
+                self.assertEqual(events, expected)
+                self.assertEqual(state['status'], 'nearby')
+
+    def test_moni_arrival_still_wakes_on_delivered(self):
+        cfg = dict(self.cfg(), **{'for': 'moni'})
+        state = {'primed': True, 'status': 'nearby'}
+        self.assertEqual(t.transition({'status': 'delivered', 'errors': []}, state, cfg, time.time()),
+                         [{'kind': 'stage_change', 'status': 'delivered'}])
+
+    def test_moni_eta_elapsed_does_not_wake(self):
+        cfg = dict(self.cfg(), **{'for': 'moni'})
+        state = {'primed': True, 'status': 'preparing'}
+        self.assertEqual(t.transition(self.result('preparing'), state, cfg, time.time()), [])
+        self.assertTrue(state['delay_sent'])
+
+    def test_moni_progress_candidate_is_not_a_wake(self):
+        cfg = dict(self.cfg(), **{'for': 'moni'})
+        state = {'primed': True, 'delay_sent': True}
+        result = self.result()
+        result['candidate'] = {'stage': 'nearby', 'evidence': 'App says nearby'}
+        self.assertEqual(t.transition(result, state, cfg, time.time()), [])
+
     def test_shipment_to_item_arrival_is_not_duplicate(self):
         state = {'primed': True, 'delay_sent': True}
         cfg = self.cfg()

@@ -677,7 +677,7 @@ class SupermallOrderFlow:
                 _fail('SUPERMALL_WATCHER_ETA_INVALID')
         name = f"order-noon-{self.order.lower()}"
         command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order,
-                   *order_watch_receipt.command_args(recipient),
+                   *order_watch_receipt.command_args(recipient, order_watch_receipt.reserved_minor(journal, self.flow_id)),
                    '--placed-at', dt.datetime.now(DUBAI).isoformat()]
         if eta is not None:
             command += ['--eta', eta]

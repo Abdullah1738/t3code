@@ -115,6 +115,14 @@ class AddNoticeTests(unittest.TestCase):
         self.assertEqual((self.sends, self.robob_calls), ([], []))
         self.assertFalse((self.root / 'state' / 'orders' / 'order-talabat-3999000666.json').exists())
 
+    def test_total_flag_is_stored_and_sent_in_placed_text(self):
+        code, row = self.add('--total', 'AED 47.25', order='3999000110')
+        self.assertEqual((code, row['moni_notified']), (0, 'sent'))
+        text = self.sends[-1][self.sends[-1].index('--text') + 1]
+        self.assertEqual(text, 'Ordered: 2x Brown Sugar Boba With Milk from Latea, AED 47.25. ETA in 25-35 mins.')
+        stored = t.read(self.root / 'state' / 'orders' / 'order-talabat-3999000110.json')
+        self.assertEqual(stored['total'], 'AED 47.25')
+
     def test_failed_send_is_reported_and_never_resent_blind(self):
         self.imsg_code = 1
         code, row = self.add(order='3999000777')
@@ -207,6 +215,13 @@ class PlacementTextTests(unittest.TestCase):
         self.assertEqual(self.text('amazon', 'Amazon.ae Zalcoon spin mop + bucket', '2026-10-15T23:59:00+04:00'),
                          'Ordered: Zalcoon spin mop + bucket from Amazon. ETA by tonight.')
 
+    def test_total_comes_from_config_or_result(self):
+        self.assertEqual(t.placement_text({'app': 'noon', 'label': 'protein bars', 'total': 'AED 12'}, None, None, self.NOW),
+                         'Ordered: protein bars from noon, AED 12.')
+        self.assertEqual(t.placement_text({'app': 'noon', 'label': 'protein bars'}, {'total': 'AED 9.5'}, None, self.NOW),
+                         'Ordered: protein bars from noon, AED 9.5.')
+        self.assertEqual(self.text('talabat', 'Talabat order'), 'Placed your Talabat order.')
+
     def test_generic_lane_labels_and_eta_fallbacks(self):
         self.assertEqual(self.text('noon', 'Noon Minutes order', result={'eta': '2026-10-15T10:25:00+04:00'}),
                          'Placed your noon order. ETA around 10:25am.')
@@ -240,6 +255,22 @@ class ReceiptParseTests(unittest.TestCase):
         self.assertEqual(receipt.parse('', 0, 'owner', 'w')[1]['moni_notified'], 'skipped')
         with self.assertRaises(ValueError):
             receipt.command_args('someone')
+
+
+class CommandArgsTotalTests(unittest.TestCase):
+    def test_int_total_is_passed_as_aed_amount(self):
+        self.assertEqual(receipt.command_args('moni', 4725),
+                         ['--for', 'moni', '--total', 'AED 47.25'])
+        self.assertEqual(receipt.command_args('owner', 900), ['--for', 'owner', '--total', 'AED 9.00'])
+
+    def test_missing_zero_negative_or_bool_total_adds_nothing(self):
+        for total in (None, 0, -5, True, False, 47.25, '4725'):
+            with self.subTest(total=total):
+                self.assertEqual(receipt.command_args('moni', total), ['--for', 'moni'])
+
+    def test_invalid_recipient_still_raises(self):
+        with self.assertRaises(ValueError):
+            receipt.command_args('someone', 4725)
 
 
 class LaneRegistrationTests(unittest.TestCase):
