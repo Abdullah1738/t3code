@@ -60,9 +60,6 @@ export interface IssuedPairingLink {
   readonly label?: string;
   readonly createdAt: DateTime.Utc;
   readonly expiresAt: DateTime.Utc;
-  // ardud missions: core
-  /** Asked for with `ownerSource`: whether the link pairs an owner device. */
-  readonly ownerMarked?: boolean;
 }
 
 export interface IssuedBearerSession {
@@ -471,10 +468,13 @@ export class ServerAuthMcpApprovalCodeError extends Schema.TaggedError<ServerAut
 
 export class ServerAuthForbiddenOperationError extends Schema.TaggedError<ServerAuthForbiddenOperationError>()(
   "ServerAuthForbiddenOperationError",
-  {},
+  // ardud missions: core
+  { reason: Schema.optional(Schema.Literal("owner_session")) },
 ) {
   override get message(): string {
-    return "The current authentication session cannot revoke itself.";
+    return this.reason === "owner_session"
+      ? "Only an owner session can revoke an owner session."
+      : "The current authentication session cannot revoke itself.";
   }
 }
 
@@ -516,9 +516,6 @@ export class EnvironmentAuth extends Context.Service<
       readonly subject?: string;
       readonly proofKeyThumbprint?: string;
       readonly purpose?: "startup";
-      // ardud missions: core
-      /** Set only by owner-run issuers (`t3 pair`, the startup URL). */
-      readonly ownerSource?: SessionOrigins.OwnerSource;
     }) => Effect.Effect<IssuedPairingLink, ServerAuthInternalError>;
     readonly issuePairingCredential: (
       input?: AuthCreatePairingCredentialInput,
@@ -758,7 +755,7 @@ export const make = Effect.gen(function* () {
   // A failed lookup only costs the missions owner claim, never authentication.
   const originOf = (sessionId: AuthSessionId) =>
     devAuth?.sessionId === sessionId
-      ? Effect.succeed<SessionOrigins.SessionOrigin | null>({ _tag: "owner", source: "dev-token" })
+      ? Effect.succeed<SessionOrigins.MintedOrigin | null>({ _tag: "owner", source: "dev-token" })
       : origins
           .originOf(sessionId)
           .pipe(
@@ -769,34 +766,45 @@ export const make = Effect.gen(function* () {
               ),
             ),
           );
+  // Strict variant for revocation: a failed lookup fails the revoke, so an
+  // owner session is never revoked by a guess.
+  const isOwnerSession = (sessionId: AuthSessionId) =>
+    devAuth?.sessionId === sessionId
+      ? Effect.succeed(true)
+      : origins.originOf(sessionId).pipe(Effect.map((origin) => origin?._tag === "owner"));
   const withOrigin = <S extends { readonly sessionId: AuthSessionId }>(session: S) =>
     originOf(session.sessionId).pipe(
       Effect.map((origin) => (origin === null ? session : { ...session, origin })),
     );
   // The origin a session minted from this grant gets: the desktop app's own
-  // bootstrap, dev mode's credential, or a pairing link an owner issuer marked.
-  // Every owner session claims the server once; a link made on the Mac
-  // (`t3 pair`, the startup URL) only makes an owner if it is the first claim.
+  // bootstrap, dev mode's credential, or a link an owner session issued.
+  // Links made on the Mac (`t3 pair`, the startup URL) are never marked.
   const grantOrigin = (credential: string, method: string) =>
     Effect.gen(function* () {
-      const source: SessionOrigins.OwnerSource | null =
+      const source: SessionOrigins.MintedOwnerSource | null =
         method === "desktop-bootstrap"
           ? "desktop"
           : method === "reusable-dev-token"
             ? "dev-token"
             : yield* origins.ownerGrant(credential);
       if (source === null) return null;
-      // In dev mode the `.env` credential is the owner, so Mac links never are.
-      if (SessionOrigins.isBootstrapSource(source) && devAuth !== undefined) return null;
-      const first = yield* origins.claimOwner(source);
-      return SessionOrigins.isBootstrapSource(source) && !first
-        ? null
-        : ({ _tag: "owner", source } satisfies SessionOrigins.SessionOrigin);
+      // The claim is a record, not a gate, so failing to write it never
+      // keeps the owner out.
+      yield* origins
+        .claimOwner(source)
+        .pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Could not record the owner claim.").pipe(
+              Effect.annotateLogs({ cause: String(cause) }),
+            ),
+          ),
+        );
+      return { _tag: "owner", source } satisfies SessionOrigins.MintedOrigin;
     });
   // Written before the token leaves; if it cannot be, the new session is revoked.
   const recordOrigin = (
     sessionId: AuthSessionId,
-    origin: SessionOrigins.SessionOrigin | null,
+    origin: SessionOrigins.MintedOrigin | null,
   ): Effect.Effect<void, SessionOrigins.SessionOriginsError> =>
     origin === null
       ? Effect.void
@@ -1133,15 +1141,22 @@ export const make = Effect.gen(function* () {
     readonly label?: string;
     readonly purpose?: "startup";
     // ardud missions: core
-    readonly ownerSource?: SessionOrigins.OwnerSource;
+    readonly ownerSource?: "paired-client";
   }) =>
     createPairingLink({
       scopes: input.scopes,
       subject: input.subject,
       ...(input.label ? { label: input.label } : {}),
       ...(input.purpose ? { purpose: input.purpose } : {}),
-      ...(input.ownerSource ? { ownerSource: input.ownerSource } : {}),
     }).pipe(
+      // ardud missions: core - marked before the credential is handed out.
+      Effect.tap((issued) =>
+        input.ownerSource === undefined
+          ? Effect.void
+          : origins
+              .markOwnerGrant(issued.credential, input.ownerSource)
+              .pipe(Effect.mapError((cause) => new ServerAuthPairingLinkCreationError({ cause }))),
+      ),
       Effect.map(
         (issued) =>
           ({
@@ -1166,18 +1181,7 @@ export const make = Effect.gen(function* () {
         ...(input?.proofKeyThumbprint ? { proofKeyThumbprint: input.proofKeyThumbprint } : {}),
         ...(input?.purpose ? { purpose: input.purpose } : {}),
       });
-      // ardud missions: core
-      const ownerMarked =
-        input?.ownerSource === undefined
-          ? undefined
-          : SessionOrigins.isBootstrapSource(input.ownerSource) &&
-              (devAuth !== undefined || (yield* origins.ownerClaimed()))
-            ? false
-            : yield* origins
-                .markOwnerGrant(issued.credential, input.ownerSource)
-                .pipe(Effect.as(true));
       return {
-        ...(ownerMarked === undefined ? {} : { ownerMarked }),
         id: issued.id,
         credential: issued.credential,
         scopes: input?.scopes ?? AuthStandardClientScopes,
@@ -1288,8 +1292,6 @@ export const make = Effect.gen(function* () {
         scopes: AuthAdministrativeScopes,
         subject: INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT,
         purpose: "startup",
-        // ardud missions: core
-        ownerSource: "startup",
       });
       if (!devAuth) {
         return fallback.pipe(Effect.withSpan("EnvironmentAuth.issueStartupPairingCredential"));
@@ -1331,15 +1333,36 @@ export const make = Effect.gen(function* () {
     if (currentSessionId === targetSessionId) {
       return yield* new ServerAuthForbiddenOperationError({});
     }
+    // ardud missions: core
+    const owner = (sessionId: AuthSessionId) =>
+      isOwnerSession(sessionId).pipe(
+        Effect.mapError((cause) => new ServerAuthSessionRevocationError({ cause })),
+      );
+    if ((yield* owner(targetSessionId)) && !(yield* owner(currentSessionId))) {
+      return yield* new ServerAuthForbiddenOperationError({ reason: "owner_session" });
+    }
     return yield* revokeSession(targetSessionId);
   });
 
   const revokeOtherClientSessions: EnvironmentAuth["Service"]["revokeOtherClientSessions"] = (
     currentSessionId,
   ) =>
-    revokeOtherSessionsExcept(currentSessionId).pipe(
-      Effect.withSpan("EnvironmentAuth.revokeOtherClientSessions"),
-    );
+    // ardud missions: core - a session that is not the owner's spares owner sessions.
+    Effect.gen(function* () {
+      const owner = (sessionId: AuthSessionId) =>
+        isOwnerSession(sessionId).pipe(
+          Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
+        );
+      if (yield* owner(currentSessionId)) return yield* revokeOtherSessionsExcept(currentSessionId);
+      // One at a time and not atomic: a failure stops partway, and a session
+      // paired meanwhile is left alone. Owner sessions are never touched.
+      let revoked = 0;
+      for (const session of yield* listSessions()) {
+        if (session.sessionId === currentSessionId || (yield* owner(session.sessionId))) continue;
+        if (yield* revokeSession(session.sessionId)) revoked += 1;
+      }
+      return revoked;
+    }).pipe(Effect.withSpan("EnvironmentAuth.revokeOtherClientSessions"));
 
   const issueStartupPairingUrl: EnvironmentAuth["Service"]["issueStartupPairingUrl"] = (baseUrl) =>
     issueStartupPairingCredential().pipe(

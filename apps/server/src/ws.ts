@@ -2222,7 +2222,13 @@ const layerWsRpc = (
           ),
         [WS_METHODS.secretsAnswerRequest]: (input) =>
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-            Effect.andThen(secretRequests.answer(input)),
+            // ardud missions: core - only the paired owner answers a secret card.
+            Effect.andThen(
+              secretRequests.answer(
+                input,
+                ownerAppProvenance({ surface: clientOrigin.surface, session: currentSession }),
+              ),
+            ),
           ),
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(

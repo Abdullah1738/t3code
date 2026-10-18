@@ -19,6 +19,7 @@ import {
   type OpenApprovalInput,
   type RouteApprovalInput,
   type SetApprovalRoutingInput,
+  type WorkItem,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -100,23 +101,37 @@ export const sameAnnotation = (left: Annotation, right: Annotation) =>
   left.flags.every((flag, index) => flag === right.flags[index]);
 // ardud missions: end asks
 
+/**
+ * The work an approval or draft is about. Missing or null matches no row that
+ * names a sub-mission or work item.
+ */
+interface RouteWork {
+  readonly subMissionId?: string | null | undefined;
+  readonly workItemId?: string | null | undefined;
+}
+
 /** What an approval or a draft looks like to the routing table. */
 export type RouteSubject =
-  | {
+  | ({
       readonly _tag: "approval";
       readonly kind: Approval["kind"];
       readonly repository: string | null;
-    }
-  | {
+    } & RouteWork)
+  | ({
       readonly _tag: "draft";
       readonly channel: DraftChannel;
       readonly audience: string;
       readonly person: string | null;
-    };
+    } & RouteWork);
 
 const sameText = (a: string, b: string | null) => b !== null && a.toLowerCase() === b.toLowerCase();
 
+const matchesWork = (match: RouteWork, subject: RouteWork) =>
+  (match.subMissionId === undefined || match.subMissionId === subject.subMissionId) &&
+  (match.workItemId === undefined || match.workItemId === subject.workItemId);
+
 const matches = (match: ApprovalRouteMatch, subject: RouteSubject): boolean => {
+  if (!matchesWork(match, subject)) return false;
   if (match._tag === "approval") {
     if (subject._tag !== "approval") return false;
     if (match.kind !== undefined && match.kind !== subject.kind) return false;
@@ -154,6 +169,61 @@ export const repositoryOf = (links: ReadonlyArray<MissionLink>): string | null =
   return null;
 };
 
+const GITHUB_PULL_NUMBER = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/i;
+const PR_KEY_NUMBER = /^([\w.-]+\/[\w.-]+)#(\d+)$/;
+
+/** The first pull-request link that names its repo and number, as a key. */
+export const pullRequestOf = (
+  links: ReadonlyArray<MissionLink>,
+): { readonly repository: string; readonly number: number } | null => {
+  for (const link of links) {
+    if (link.kind !== "pull-request") continue;
+    const found =
+      PR_KEY_NUMBER.exec(link.label) ??
+      (link.url === null ? null : GITHUB_PULL_NUMBER.exec(link.url));
+    if (found?.[1] !== undefined && found[2] !== undefined) {
+      return { repository: found[1], number: Number(found[2]) };
+    }
+  }
+  return null;
+};
+
+/**
+ * The work an approval is about: the mission's work item whose pull request
+ * is the approval's PR link. Two items on the same PR name no item; they name
+ * the sub-mission only when they share it. No match is no work, so rows that
+ * name a sub-mission or item skip it.
+ */
+export const approvalWork = (
+  links: ReadonlyArray<MissionLink>,
+  items: ReadonlyArray<WorkItem>,
+): { readonly subMissionId: string | null; readonly workItemId: string | null } => {
+  const pullRequest = pullRequestOf(links);
+  const onPullRequest =
+    pullRequest === null
+      ? []
+      : items.filter(
+          (item) =>
+            item.pullRequest !== null &&
+            item.pullRequest.number === pullRequest.number &&
+            sameText(pullRequest.repository, item.pullRequest.repository),
+        );
+  const subMissions = new Set(onPullRequest.map((item) => item.subMissionId));
+  const [only] = onPullRequest;
+  return {
+    subMissionId: subMissions.size === 1 ? (only?.subMissionId ?? null) : null,
+    workItemId: onPullRequest.length === 1 ? (only?.id ?? null) : null,
+  };
+};
+
+/** Some approval row routes by the work an approval is about. */
+const routesByWork = (routes: ReadonlyArray<ApprovalRoute> | undefined) =>
+  (routes ?? []).some(
+    (route) =>
+      route.match._tag === "approval" &&
+      (route.match.subMissionId !== undefined || route.match.workItemId !== undefined),
+  );
+
 const fail = (code: MissionError["code"], detail: string) =>
   Effect.fail(new MissionError({ code, detail }));
 
@@ -190,6 +260,35 @@ export const makeApprovalWrites = (kit: WriteKit) => {
       );
     });
 
+  /** Rows that name a sub-mission or work item name one in this mission. */
+  const requireRoutedWork = (missionId: MissionId, routes: ReadonlyArray<ApprovalRoute>) =>
+    Effect.forEach(
+      routes,
+      (route) =>
+        Effect.gen(function* () {
+          const { subMissionId, workItemId } = route.match;
+          if (subMissionId !== undefined) {
+            const found = yield* store.get("sub-mission", subMissionId);
+            if (Option.isNone(found) || found.value.missionId !== missionId) {
+              return yield* fail(
+                "invalid",
+                `Route ${route.id}: no sub-mission ${subMissionId} in mission ${missionId}.`,
+              );
+            }
+          }
+          if (workItemId !== undefined) {
+            const found = yield* store.get("work-item", workItemId);
+            if (Option.isNone(found) || found.value.missionId !== missionId) {
+              return yield* fail(
+                "invalid",
+                `Route ${route.id}: no work item ${workItemId} in mission ${missionId}.`,
+              );
+            }
+          }
+        }),
+      { discard: true },
+    );
+
   /** Systems open approvals in their own name. */
   const requireRequester = (provenance: MissionProvenance, requestedBy: string) =>
     provenance._tag === "system" && provenance.component === requestedBy
@@ -212,10 +311,15 @@ export const makeApprovalWrites = (kit: WriteKit) => {
           }
           return yield* unchanged(mission.id, approvalRef(before));
         }
+        // Only read the mission's items when a row routes by them.
+        const work = routesByWork(mission.approvalRouting)
+          ? approvalWork(input.links, yield* store.list("work-item", { missionId: mission.id }))
+          : { subMissionId: null, workItemId: null };
         const route = routeApprover(mission.approvalRouting, {
           _tag: "approval",
           kind: input.kind,
           repository: repositoryOf(input.links),
+          ...work,
         });
         const now = yield* nowIso;
         const record: Approval = {
@@ -243,7 +347,12 @@ export const makeApprovalWrites = (kit: WriteKit) => {
           summary: `${input.requestedBy} asks the ${route.approver}: ${record.title}`,
           ref: approvalRef(record),
           upserts: [{ _tag: "approval", record }],
-          payload: { approver: route.approver, routeId: route.routeId },
+          payload: {
+            approver: route.approver,
+            routeId: route.routeId,
+            ...(work.subMissionId === null ? {} : { subMissionId: work.subMissionId }),
+            ...(work.workItemId === null ? {} : { workItemId: work.workItemId }),
+          },
         });
       }),
     );
@@ -354,6 +463,7 @@ export const makeApprovalWrites = (kit: WriteKit) => {
         if (ids.size !== input.routes.length) {
           return yield* fail("invalid", "Approval routing rows need distinct ids.");
         }
+        yield* requireRoutedWork(mission.id, input.routes);
         const ref: MissionRecordRef = { kind: "mission", id: mission.id, label: mission.title };
         if (sameValue(mission.approvalRouting ?? [], input.routes)) {
           return yield* unchanged(mission.id, ref);

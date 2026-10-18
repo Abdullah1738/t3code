@@ -1310,6 +1310,134 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
     }),
   );
 
+  // ardud missions: core
+  it.effect("M4: an answer turned into a message keeps who answered", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+
+      const answerAs = Effect.fn("runtimeLayerTest.answerAs")(function* (
+        name: string,
+        createdBy: "user" | "agent" | "system" | undefined,
+      ) {
+        const threadId = ThreadId.make(`${name}-thread`);
+        const requestId = RuntimeRequestId.make(`${name}-request`);
+        const nodeId = NodeId.make(`${name}-node`);
+        const now = yield* DateTime.now;
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`${name}-create`),
+          createdBy: "user",
+          creationSource: "web",
+          threadId,
+          projectId: ProjectId.make(`${name}-project`),
+          title: "Who answered",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: process.cwd(),
+        });
+        yield* eventSink.write({
+          commandId: CommandId.make(`${name}-seed`),
+          events: [
+            {
+              id: EventId.make(`${name}-node-event`),
+              type: "node.updated",
+              threadId,
+              nodeId,
+              occurredAt: now,
+              payload: {
+                id: nodeId,
+                threadId,
+                runId: null,
+                parentNodeId: null,
+                rootNodeId: nodeId,
+                kind: "user_input_request",
+                status: "waiting",
+                countsForRun: false,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                runtimeRequestId: requestId,
+                checkpointScopeId: null,
+                startedAt: now,
+                completedAt: null,
+              },
+            },
+            {
+              id: EventId.make(`${name}-request-event`),
+              type: "runtime-request.updated",
+              threadId,
+              nodeId,
+              occurredAt: now,
+              payload: {
+                id: requestId,
+                nodeId,
+                providerTurnId: null,
+                nativeRequestRef: null,
+                kind: "user_input",
+                status: "pending",
+                responseCapability: { type: "message" },
+                createdAt: now,
+                resolvedAt: null,
+              },
+            },
+            {
+              id: EventId.make(`${name}-item-event`),
+              type: "turn-item.updated",
+              threadId,
+              nodeId,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make(`${name}-item`),
+                type: "user_input_request",
+                threadId,
+                runId: null,
+                nodeId,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "waiting",
+                title: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+                requestId,
+                responseMode: "message",
+                questions: [
+                  { id: "color", header: "Color", question: "Which color?", options: [] },
+                ],
+              },
+            },
+          ],
+        });
+        yield* orchestrator.dispatch({
+          type: "runtime-request.respond",
+          commandId: CommandId.make(`${name}-answer`),
+          threadId,
+          requestId,
+          answers: { color: "Blue" },
+          ...(createdBy === undefined ? {} : { createdBy }),
+        });
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        assert.lengthOf(projection.messages, 1);
+        return projection.messages[0]?.createdBy;
+      });
+
+      // A non-owner session (or the control token) answered: not the owner.
+      assert.equal(yield* answerAs("runtime-who-answered-session", "system"), "system");
+      // The owner answered from the app.
+      assert.equal(yield* answerAs("runtime-who-answered-owner", "user"), "user");
+      // An agent answered through MCP.
+      assert.equal(yield* answerAs("runtime-who-answered-agent", "agent"), "agent");
+      // A server-side caller that named nobody is never recorded as a human.
+      assert.equal(yield* answerAs("runtime-who-answered-unnamed", undefined), "system");
+    }),
+  );
+
   it.effect("merges an explicit provider-finished run while checkpoint capture is pending", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
