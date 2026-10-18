@@ -22,7 +22,7 @@ import * as MissionService from "../MissionService.ts";
 import { HAIKU, modelKey } from "../policy/models.ts";
 import * as PolicyService from "../policy/PolicyService.ts";
 import * as PolicyStore from "../policy/PolicyStore.ts";
-import { makePorts, SYSTEM } from "../policy/testing.ts";
+import { makePorts, OWNER } from "../policy/testing.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
@@ -203,7 +203,7 @@ describe("suggestion appliers", () => {
       expect(snapshot.policy.guide.text).toBe("Settlement math is critical.");
       expect(snapshot.policy.commonRules).toEqual(["No round cap."]);
 
-      yield* policy.createPool(SYSTEM, {
+      yield* policy.createPool(OWNER, {
         poolId: PoolId.make("m-1-review-slots"),
         name: "Review slots",
         unit: "review",

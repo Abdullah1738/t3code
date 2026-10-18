@@ -27,7 +27,11 @@ import {
 import { asksWsHandlers } from "./ws.ts";
 
 const M = MISSIONS_ASKS_WS_METHODS;
-const paired = { sessionId: "session-app", subject: "one-time-token" };
+const paired = {
+  sessionId: "session-app",
+  subject: "one-time-token",
+  origin: { _tag: "owner" as const, source: "cli" as const },
+};
 const cliIssued = { sessionId: "session-cli", subject: "cli-issued-session" };
 const ticket = { kind: "ticket" as const, label: "CRP-1", url: null, ref: "CRP-1" };
 
