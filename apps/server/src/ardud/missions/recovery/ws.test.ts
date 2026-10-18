@@ -36,6 +36,20 @@ it.effect("owner recovery changes need a paired Robob client; the status read do
     const before = yield* cli[M.status]({ missionId });
     assert.equal(before.settings.resumePerMinute, 4);
 
+    // A web connection made with a component's or an unpaired credential is not the owner.
+    for (const origin of [
+      { _tag: "component", component: "stream-recovery" } as const,
+      undefined,
+    ]) {
+      const other = ownerAppProvenance({
+        surface: "web",
+        session: { sessionId: "session-other", ...(origin ? { origin } : {}) },
+      });
+      const handlers = makeRecoveryWsHandlers(recovery, other);
+      const denied = yield* Effect.flip(handlers[M.settings]({ missionId, resumePerMinute: 9 }));
+      assert.equal(denied.code, "provenance-required");
+    }
+
     const app = makeRecoveryWsHandlers(recovery, session("web"));
     const settings = yield* app[M.settings]({ missionId, resumePerMinute: 9 });
     assert.equal(settings.resumePerMinute, 9);

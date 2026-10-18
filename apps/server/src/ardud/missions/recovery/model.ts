@@ -503,7 +503,8 @@ const successionChildren = (lost: ReadonlyArray<RecoveryLostChild>) =>
 
 /**
  * Who an instruction is from, as recorded by the service: the owner, or the
- * master role. Anything else is not dressed up as either.
+ * master role. Anything else is not dressed up as either, and a later
+ * decision (`decidedBy`) never stands in for the instruction's author.
  */
 const instructionLabel = (decidedBy: MissionActor | null): string => {
   switch (decidedBy?._tag) {
@@ -551,9 +552,7 @@ export const threadNotice = (context: NoticeContext, thread: RecoveryThread) => 
     );
   }
   if (thread.instruction !== null) {
-    parts.push(
-      `${instructionLabel(thread.instructionBy ?? thread.decidedBy)}: ${thread.instruction}`,
-    );
+    parts.push(`${instructionLabel(thread.instructionBy ?? null)}: ${thread.instruction}`);
   }
   if (waits) {
     parts.push(`Your work stays as it is (${thread.reason}): do not restart it now.`);

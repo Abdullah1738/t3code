@@ -26,6 +26,7 @@ import {
 import * as MissionService from "../MissionService.ts";
 import * as PolicyService from "../policy/PolicyService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import * as Model from "./model.ts";
 import * as RecoveryService from "./RecoveryService.ts";
 import * as RecoveryStore from "./RecoveryStore.ts";
 import {
@@ -601,6 +602,13 @@ it.effect("recovery records the deciding principal, never the claimed thread", (
     // The owner sends it on; the instruction stays the master's.
     yield* recovery.resume(ownerApp, { missionId, mode: "now", threadId: webThread });
     assert.include(fake.sent.at(-1)?.text ?? "", "From the master: Rebase first.");
+    // A row with no recorded author is not credited to whoever decided last.
+    const unattributed = Model.threadNotice(
+      { cause: "server-restart", at: "09:00" },
+      { ...held!, instructionBy: undefined, decidedBy: { _tag: "owner" } },
+    );
+    assert.include(unattributed, "Recovery instruction: Rebase first.");
+    assert.notInclude(unattributed, "From the owner");
 
     // A restart report is a component's finding; nothing else is relabelled as one.
     const report = {
