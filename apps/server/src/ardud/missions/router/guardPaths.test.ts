@@ -60,6 +60,7 @@ import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "../../control/http.ts";
+import { authorizeScheduleChange } from "../guard/schedules.ts";
 import { installSendGuard, type SendGuardOutcome, type SendGuardRequest } from "./guardHook.ts";
 
 const missionId = MissionId.make("m-1");
@@ -333,8 +334,17 @@ describe("MCP orchestrator", () => {
           Layer.mock(SecretRequests.SecretRequests)({}),
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({
             list: () => Effect.succeed({ tasks }),
-            upsert: () =>
-              Ref.update(delivered, (count) => count + 1).pipe(Effect.as({ task: tasks[0]! })),
+            // The real service authorizes every change as the principal the
+            // transport provides; this stand-in does the same.
+            upsert: (input) =>
+              authorizeScheduleChange({
+                taskId: tasks[0]!.id,
+                threads: [tasks[0]!.threadId, input.threadId],
+                text: input.prompt,
+              }).pipe(
+                Effect.andThen(Ref.update(delivered, (count) => count + 1)),
+                Effect.as({ task: tasks[0]! }),
+              ),
           }),
         ),
       ),
@@ -370,7 +380,7 @@ describe("MCP orchestrator", () => {
     ),
   );
 
-  it.effect("rewriting the prompt of a schedule bound to a member asks the guard", () =>
+  it.effect("every change to a schedule bound to a member asks the guard as the caller", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const seen = yield* fakeGuard(knocked);
@@ -397,18 +407,21 @@ describe("MCP orchestrator", () => {
         });
         assert.strictEqual(yield* Ref.get(delivered), 0);
 
-        // A title change puts no new text into the thread, so it skips the guard.
-        yield* mcp.pipe(
+        // A change that keeps the prompt (title, trigger, signature) still
+        // changes when and how text reaches the member, so it is judged too.
+        const retitled = yield* mcp.pipe(
           Effect.flatMap((orchestrator) =>
             orchestrator.updateScheduledTask(threadScope, {
               scheduledTaskId: task.id,
               title: "Master check-in (hourly)",
             }),
           ),
+          Effect.flip,
           Effect.provide(layer),
         );
-        assert.strictEqual(seen.length, 1);
-        assert.strictEqual(yield* Ref.get(delivered), 1);
+        assert.strictEqual(retitled.code, "capability_denied");
+        assert.strictEqual(seen.length, 2);
+        assert.strictEqual(yield* Ref.get(delivered), 0);
       }),
     ),
   );
@@ -541,7 +554,7 @@ describe("MCP thread toolkits", () => {
 
 describe("scheduled task runs", () => {
   it.effect(
-    "a run into a bound thread asks the guard as the schedule and records the refusal",
+    "a run of a schedule with no recorded creator asks the guard and records the refusal",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -605,7 +618,8 @@ describe("scheduled task runs", () => {
               _tag: "schedule",
               scheduledTaskId: "task-agent",
               title: "Lane nudge",
-              createdBy: "agent",
+              // createdBy says "agent", but nothing recorded who made it.
+              creator: null,
             },
             text: "Nudge the master about the release.",
           });

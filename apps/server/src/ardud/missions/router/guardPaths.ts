@@ -9,6 +9,7 @@ import { OrchestratorMcpFailure, type ThreadId } from "@t3tools/contracts";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 
+import { recordedSender, type GuardPrincipal } from "../guard/principal.ts";
 import { guardRefusal, guardSend, type SendGuardOutcome } from "./guardHook.ts";
 import type { SendPath, SendSender } from "./model.ts";
 
@@ -24,6 +25,20 @@ export class SendRefused extends Data.TaggedError("SendRefused")<{
 export class SendGuardFailed extends Data.TaggedError("SendGuardFailed")<{
   readonly message: string;
 }> {}
+
+/**
+ * One guarded send as `from`. Callers that already hold a principal (WS
+ * session, schedule authority, pull request watch initiator) use this
+ * directly; the adapters below build theirs from their transport.
+ */
+export const guardSender = (input: {
+  readonly path: SendPath;
+  readonly targetThreadId: ThreadId;
+  readonly from: SendSender;
+  readonly text: string;
+  readonly requestKey: string;
+}): Effect.Effect<void, SendRefused | SendGuardFailed> =>
+  decide(input.path, input.targetThreadId, input.from, input.text, input.requestKey);
 
 const decide = (
   path: SendPath,
@@ -49,7 +64,7 @@ export interface McpSendCaller {
   readonly client: { readonly sessionId: string; readonly label: string } | undefined;
 }
 
-export const mcpSender = (caller: McpSendCaller): SendSender =>
+export const mcpSender = (caller: McpSendCaller): GuardPrincipal =>
   caller.thread !== undefined
     ? { _tag: "thread", threadId: caller.thread.id, title: caller.thread.title }
     : {
@@ -105,13 +120,14 @@ export const guardControlSend = (input: {
     input.commandId,
   );
 
-/** A scheduled task firing into its bound thread. */
+/**
+ * A scheduled task firing into its bound thread, speaking as whoever
+ * authorized it (see `recordedSender`): the invoker for a manual run, else
+ * the recorded authority. A task with nothing recorded is never self.
+ */
 export const guardScheduledRun = (input: {
-  readonly task: {
-    readonly id: string;
-    readonly title: string;
-    readonly createdBy: "user" | "agent" | "system";
-  };
+  readonly task: { readonly id: string; readonly title: string };
+  readonly authority: GuardPrincipal | null;
   readonly targetThreadId: ThreadId;
   readonly text: string;
   readonly commandId: string;
@@ -119,12 +135,12 @@ export const guardScheduledRun = (input: {
   decide(
     "scheduled-task",
     input.targetThreadId,
-    {
-      _tag: "schedule",
+    recordedSender({
+      authority: input.authority,
+      targetThreadId: input.targetThreadId,
       scheduledTaskId: input.task.id,
       title: input.task.title,
-      createdBy: input.task.createdBy,
-    },
+    }),
     input.text,
     input.commandId,
   );

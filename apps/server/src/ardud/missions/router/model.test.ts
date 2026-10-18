@@ -19,6 +19,7 @@ import {
   wakeRequestId,
   wakeTargets,
   type Member,
+  type ScheduleCreator,
   type SendSender,
 } from "./model.ts";
 
@@ -152,7 +153,7 @@ describe("decideSend", () => {
       decideSend({
         target: member(master, "master"),
         sender: null,
-        from: { _tag: "schedule", scheduledTaskId: "t", title: "tick", createdBy: "user" },
+        from: { _tag: "schedule", scheduledTaskId: "t", title: "tick", creator: { _tag: "owner" } },
         targetThreadId: master,
       }),
     ).toEqual({ _tag: "allow", missionId: mission, reason: "owner-schedule" });
@@ -164,6 +165,33 @@ describe("decideSend", () => {
         targetThreadId: master,
       })._tag,
     ).toBe("knock");
+  });
+
+  // H7: a schedule's createdBy label is caller-written, so only the recorded
+  // creator counts. A thread's schedule passes into that thread alone.
+  it("passes a thread's schedule into itself and knocks it anywhere else", () => {
+    const schedule = (creator: ScheduleCreator | null) =>
+      decideSend({
+        target: member(master, "master"),
+        sender: null,
+        from: { _tag: "schedule", scheduledTaskId: "t", title: "tick", creator },
+        targetThreadId: master,
+      });
+    expect(schedule({ _tag: "thread", threadId: master })).toEqual({
+      _tag: "allow",
+      missionId: mission,
+      reason: "self-schedule",
+    });
+    expect(schedule({ _tag: "thread", threadId: lane })).toEqual({
+      _tag: "knock",
+      missionId: mission,
+      reason: "agent-schedule",
+    });
+    expect(schedule(null)).toEqual({
+      _tag: "knock",
+      missionId: mission,
+      reason: "unrecorded-schedule",
+    });
   });
 });
 
