@@ -404,6 +404,11 @@ describe("routing by sub-mission and work item", () => {
         subMissionId: wave,
         workItemId: "wi-wave-1",
       });
+      // An approval with no known work says so by leaving the fields out.
+      const looseOpened = (yield* missions.eventsSince(missionId, routed.seq)).find(
+        (event) => event.kind === "approval.opened" && event.subject?.id === loose.approvalId,
+      );
+      assert.deepStrictEqual(looseOpened?.payload, { approver: "owner", routeId: null });
 
       // The master decides the wave's approval; the owner can still decide it too.
       yield* missions.decideApproval(master, { approvalId: first.approvalId, action: "approve" });

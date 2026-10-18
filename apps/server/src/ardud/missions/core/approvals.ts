@@ -347,7 +347,12 @@ export const makeApprovalWrites = (kit: WriteKit) => {
           summary: `${input.requestedBy} asks the ${route.approver}: ${record.title}`,
           ref: approvalRef(record),
           upserts: [{ _tag: "approval", record }],
-          payload: { approver: route.approver, routeId: route.routeId, ...work },
+          payload: {
+            approver: route.approver,
+            routeId: route.routeId,
+            ...(work.subMissionId === null ? {} : { subMissionId: work.subMissionId }),
+            ...(work.workItemId === null ? {} : { workItemId: work.workItemId }),
+          },
         });
       }),
     );
