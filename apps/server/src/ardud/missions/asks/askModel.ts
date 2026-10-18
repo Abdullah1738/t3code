@@ -424,9 +424,24 @@ export interface ReopenAskCommand {
 /** The ask's answer epoch: 0 when opened, +1 on every reopen. */
 export const askRevisionOf = (ask: Pick<Ask, "revision">): number => ask.revision ?? 0;
 
+type AskClock = Pick<Ask, "revision" | "revisedAt" | "status" | "createdAt" | "updatedAt">;
+
+/**
+ * An open ask reopened before asks kept an epoch: no revision, but touched
+ * after it opened. Only a reopen moves an open ask's updatedAt.
+ */
+const reopenedUnversioned = (ask: AskClock): boolean =>
+  ask.revision === undefined &&
+  ask.status === "open" &&
+  Date.parse(ask.updatedAt) > Date.parse(ask.createdAt);
+
 /** When the current epoch began; an answer's evidence must not predate it. */
-export const askEpochOf = (ask: Pick<Ask, "revisedAt" | "createdAt">): string =>
-  ask.revisedAt ?? ask.createdAt;
+export const askEpochOf = (ask: AskClock): string =>
+  reopenedUnversioned(ask) ? ask.updatedAt : (ask.revisedAt ?? ask.createdAt);
+
+/** Whether the ask was reopened, so its epoch allows no clock skew. */
+export const askReopened = (ask: AskClock): boolean =>
+  askRevisionOf(ask) > 0 || reopenedUnversioned(ask);
 
 const spentInbounds = (ask: Pick<Ask, "spentInboundIds">): ReadonlyArray<string> =>
   ask.spentInboundIds ?? [];

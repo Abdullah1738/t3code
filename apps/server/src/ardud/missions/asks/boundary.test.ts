@@ -284,6 +284,54 @@ describe("boundary review regressions", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("N9: an ask reopened before asks kept an epoch still takes nothing older", () => {
+    const { layer } = harness([
+      owner("msg-early", "offline window", T0 + 90_000),
+      owner("msg-late", "online", T0 + 3 * MINUTE),
+    ]);
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const store = yield* MissionStore.MissionStore;
+      const ask = yield* asks.openAsk(askInput("Which way?"), master);
+      // Stored by an older build: reopened at T0+2min, with no revision fields.
+      const {
+        revision: _revision,
+        revisedAt: _revisedAt,
+        spentInboundIds: _spent,
+        ...legacy
+      } = ask;
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "ask.reopened",
+          actor: { _tag: "system", component: "missions" },
+          provenance: ownerApp,
+          summary: "Ask reopened",
+          subject: { kind: "ask", id: ask.id },
+        },
+        upserts: [
+          // T0 + 2 minutes.
+          { _tag: "ask", record: { ...legacy, updatedAt: "2026-10-17T08:02:00.000Z" } },
+        ],
+      });
+
+      yield* TestClock.setTime(T0 + 4 * MINUTE);
+      // Within the old clock skew of the reopen, but before it.
+      expect(
+        yield* failureCode(
+          asks.answerAsk({ askId: ask.id, optionId: "b", text: "", inboundId: "msg-early" }, relay),
+        ),
+      ).toBe("provenance-invalid");
+      const answered = yield* asks.answerAsk(
+        { askId: ask.id, optionId: "a", text: "", inboundId: "msg-late" },
+        relay,
+      );
+      expect(answered.ask.answer?.optionId).toBe("a");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("M3: a master accepts a draft-note suggestion under its own name", () => {
     const { layer } = harness();
     return Effect.gen(function* () {
