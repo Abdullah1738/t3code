@@ -61,6 +61,8 @@ import { PolicyToolkit } from "../ardud/missions/policy/tools.ts";
 // ardud missions: router
 import * as RouterToolHandlers from "../ardud/missions/router/toolHandlers.ts";
 import { RouterToolkit } from "../ardud/missions/router/tools.ts";
+// ardud missions: recovery
+import * as MissionsRecoveryTools from "../ardud/missions/tools/recovery.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -842,6 +844,11 @@ const layerMissionsToolkitRegistration = toolkitRegistration(
 const layerPolicyToolkitRegistration = toolkitRegistration(PolicyToolkit, PolicyToolHandlers.layer);
 // ardud missions: router (MissionRouter comes from ArdudMissionsLive in server.ts)
 const layerRouterToolkitRegistration = toolkitRegistration(RouterToolkit, RouterToolHandlers.layer);
+// ardud missions: recovery (RecoveryService comes from ArdudMissionsLive in server.ts)
+const layerMissionsRecoveryToolkitRegistration = toolkitRegistration(
+  MissionsRecoveryTools.RecoveryToolkit,
+  MissionsRecoveryTools.layer,
+);
 const layerContextResetToolkitRegistration = toolkitRegistration(
   ContextResetToolkit,
   ContextResetHandlers.layer,
@@ -908,6 +915,8 @@ export const layer = Layer.mergeAll(
   layerPolicyToolkitRegistration,
   // ardud missions: router
   layerRouterToolkitRegistration,
+  // ardud missions: recovery
+  layerMissionsRecoveryToolkitRegistration,
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,

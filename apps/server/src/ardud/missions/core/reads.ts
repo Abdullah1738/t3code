@@ -19,7 +19,7 @@ import * as Option from "effect/Option";
 import type * as MissionStore from "../store/MissionStore.ts";
 import { countLanes, judgeHealth } from "./health.ts";
 import type { MissionEffort } from "./effort.ts";
-import type { MissionEditor } from "./ports.ts";
+import type { MissionEditor, MissionRecoveryReader } from "./ports.ts";
 import {
   buildBlockers,
   buildCriticalPath,
@@ -91,6 +91,8 @@ export const makeReads = (
   store: MissionStore.MissionStore["Service"],
   currentEditor: () => MissionEditor | null,
   effort: MissionEffort | null = null,
+  // ardud missions: recovery
+  currentRecovery: () => MissionRecoveryReader | null = () => null,
 ) => {
   const healthCache = new Map<string, HealthEntry>();
 
@@ -217,6 +219,9 @@ export const makeReads = (
       const editor = currentEditor();
       const view = editor === null ? null : yield* editor.view(missionId);
       const healthy = withHealth(subMissions, entry);
+      // ardud missions: recovery
+      const recovery = currentRecovery();
+      const recoveryState = recovery === null ? null : yield* recovery.state(missionId);
       return {
         mission: { ...mission.value, health: entry.mission },
         subMissions:
@@ -239,6 +244,8 @@ export const makeReads = (
         feed: view?.feed ?? buildFeed({ events, notes, since }),
         lanes: countLanes(lanes),
         ownerLastLookedAt: since,
+        // ardud missions: recovery
+        recovery: recoveryState,
       };
     });
 

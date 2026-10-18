@@ -43,6 +43,8 @@ import * as PolicyService from "../../../ardud/missions/policy/PolicyService.ts"
 import * as RuleService from "../../../ardud/missions/core/RuleService.ts";
 // ardud missions: router
 import { MissionRouter } from "../../../ardud/missions/router/MissionRouter.ts";
+// ardud missions: recovery
+import * as RecoveryService from "../../../ardud/missions/recovery/RecoveryService.ts";
 
 const layerStubServices = Layer.mergeAll(
   Layer.mock(Orchestrator.OrchestratorV2)({}),
@@ -75,6 +77,8 @@ const layerStubServices = Layer.mergeAll(
   Layer.mock(RuleService.RuleService)({}),
   // ardud missions: router
   Layer.mock(MissionRouter)({}),
+  // ardud missions: recovery
+  Layer.mock(RecoveryService.RecoveryService)({}),
 );
 
 const ToolsListPayload = Schema.fromJsonString(

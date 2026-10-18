@@ -10,6 +10,8 @@ import * as MissionService from "./MissionService.ts";
 import { policyRouteLayer } from "./policy/http.ts";
 import { PolicyLive } from "./policy/layer.ts";
 import { RouterAsksRoomsLive, RouterLive } from "./router/layer.ts";
+import { recoveryRouteLayer } from "./recovery/http.ts";
+import { RecoveryLive } from "./recovery/layer.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
 import * as MissionStore from "./store/MissionStore.ts";
@@ -36,6 +38,8 @@ export const ArdudMissionsLive = Layer.mergeAll(
   RuleService.layer,
   editorWiringLayer,
   asksWiringLayer.pipe(Layer.provide(RuleService.layer)),
+  // ardud missions: recovery (needs MissionService from the tracks below)
+  RecoveryLive,
 ).pipe(Layer.provideMerge(MissionTracksLive), Layer.provideMerge(MissionStore.layer));
 
 /**
@@ -48,4 +52,5 @@ export const ArdudMissionsRoutesLive = Layer.mergeAll(
   scribeRouteLayer,
   missionsDeskRouteLayer,
   policyRouteLayer,
+  recoveryRouteLayer,
 );

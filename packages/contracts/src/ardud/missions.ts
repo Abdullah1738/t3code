@@ -1538,6 +1538,13 @@ export const MissionEventKind = Schema.Literals([
   "approval.annotated",
   "draft.send-failed",
   // --- end asks additions ---
+  // --- recovery additions ---
+  "recovery.incident-opened",
+  "recovery.notice-sent",
+  "recovery.thread-decided",
+  "recovery.incident-cleared",
+  "recovery.settings-changed",
+  // --- end recovery additions ---
   "field.locked",
   "field.unlocked",
   "governor.action",
@@ -1630,6 +1637,210 @@ export const FeedItem = Schema.Struct({
 });
 export type FeedItem = typeof FeedItem.Type;
 
+// --- recovery additions ---
+
+/** What interrupted mission threads: Robob itself, OpenCode, one run, or a role handoff. */
+export const RecoveryCause = Schema.Literals([
+  "server-restart",
+  "opencode-restart",
+  "run-interrupted",
+  "succession",
+]);
+export type RecoveryCause = typeof RecoveryCause.Type;
+
+/**
+ * What recovery does for one thread. resume: notice plus a resume turn, paced.
+ * reconcile-first: same, but the cut run was inside a mutation, so the thread
+ * checks exact state before continuing. notice-only: tell it what it lost and
+ * leave it as it is (paused mission, parked lane, focus hold, owner ask).
+ * skip: nothing to do (stopped by the owner, archived, nothing lost).
+ */
+export const RecoveryAction = Schema.Literals(["resume", "reconcile-first", "notice-only", "skip"]);
+export type RecoveryAction = typeof RecoveryAction.Type;
+
+/** pending: queued in resume order. held: waiting on the installer, the master or the thread going idle. */
+export const RecoveryThreadState = Schema.Literals([
+  "pending",
+  "held",
+  "sent",
+  "decided",
+  "skipped",
+  "failed",
+]);
+export type RecoveryThreadState = typeof RecoveryThreadState.Type;
+
+export const RecoveryLostChild = Schema.Struct({
+  title: Schema.String,
+  kind: Schema.Literals(["native-subagent", "delegated-task"]),
+  /** Native subagent: its OpenCode session id. Delegated task: its task node id. */
+  ref: Schema.NullOr(Schema.String),
+  childThreadId: Schema.NullOr(ThreadId),
+  lastStatus: Schema.String,
+  /** One line of what it was doing, from its last progress or message. */
+  doing: Schema.NullOr(Schema.String),
+});
+export type RecoveryLostChild = typeof RecoveryLostChild.Type;
+
+export const RecoveryHeldHold = Schema.Struct({
+  holdId: PoolHoldId,
+  poolId: PoolId,
+  purpose: Schema.String,
+  status: PoolHoldStatus,
+  leaseExpiresAt: Schema.NullOr(IsoDateTime),
+  /** The lease ran out while things were down: reconcile before trusting it. */
+  reconcileRequired: Schema.Boolean,
+});
+export type RecoveryHeldHold = typeof RecoveryHeldHold.Type;
+
+export const RecoveryThread = Schema.Struct({
+  missionId: MissionId,
+  threadId: ThreadId,
+  title: Schema.String,
+  roleId: Schema.NullOr(RoleId),
+  roleKind: Schema.NullOr(RoleKind),
+  laneId: Schema.NullOr(LaneId),
+  laneName: Schema.NullOr(Schema.String),
+  subMissionId: Schema.NullOr(SubMissionId),
+  /** Resume order inside the mission; the master is 0. */
+  position: NonNegativeInt,
+  cutRunId: Schema.NullOr(Schema.String),
+  lastActivity: Schema.NullOr(Schema.String),
+  lastActivityAt: Schema.NullOr(IsoDateTime),
+  /** Robob's own restart continuation already started a turn for the cut run. */
+  serverContinued: Schema.Boolean,
+  /** Why the run stopped when something said so: a stall-watch reason or a provider error. */
+  interruptReason: Schema.NullOr(Schema.String),
+  /** Succession only: the thread that held the role before. */
+  handoffFrom: Schema.NullOr(Schema.Struct({ threadId: ThreadId, title: Schema.String })),
+  lostChildren: Schema.Array(RecoveryLostChild),
+  holds: Schema.Array(RecoveryHeldHold),
+  action: RecoveryAction,
+  reason: Schema.String,
+  state: RecoveryThreadState,
+  stateReason: Schema.NullOr(Schema.String),
+  /** Extra instruction the master or owner added for this thread's notice. */
+  instruction: Schema.NullOr(Schema.String),
+  noticeAt: Schema.NullOr(IsoDateTime),
+  decidedBy: Schema.NullOr(MissionActor),
+});
+export type RecoveryThread = typeof RecoveryThread.Type;
+
+export const RecoveryIncident = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  cause: RecoveryCause,
+  /** Component that reported it: "missions-recovery" (boot, scans) or "stream-recovery". */
+  source: Schema.String,
+  detectedAt: IsoDateTime,
+  windowStart: IsoDateTime,
+  windowEnd: IsoDateTime,
+  /** Gap between the last heartbeat and the next start, when Robob itself was down. */
+  downSeconds: Schema.NullOr(NonNegativeInt),
+  missionIds: Schema.Array(MissionId),
+  threads: Schema.Array(RecoveryThread),
+  clearedAt: Schema.NullOr(IsoDateTime),
+});
+export type RecoveryIncident = typeof RecoveryIncident.Type;
+
+/** Overview badge: "Recovered from restart at HH:MM", gone once every thread is resumed or decided. */
+export const MissionRecoveryState = Schema.Struct({
+  incidentId: TrimmedNonEmptyString,
+  cause: RecoveryCause,
+  at: IsoDateTime,
+  label: Schema.String,
+  total: NonNegativeInt,
+  pending: NonNegativeInt,
+  reconcile: NonNegativeInt,
+});
+export type MissionRecoveryState = typeof MissionRecoveryState.Type;
+
+export const MissionRecoverySettings = Schema.Struct({
+  missionId: MissionId,
+  /** Resume turns started per minute after a restart. */
+  resumePerMinute: PositiveInt.check(Schema.isLessThanOrEqualTo(60)),
+  /** How long lanes wait after the master's notice before resuming, unless the master releases them. */
+  masterLeadSeconds: NonNegativeInt.check(Schema.isLessThanOrEqualTo(3600)),
+});
+export type MissionRecoverySettings = typeof MissionRecoverySettings.Type;
+
+export const MissionRecoveryStatus = Schema.Struct({
+  missionId: MissionId,
+  settings: MissionRecoverySettings,
+  state: Schema.NullOr(MissionRecoveryState),
+  /** Latest incident that touched this mission, threads limited to it. */
+  incident: Schema.NullOr(RecoveryIncident),
+});
+export type MissionRecoveryStatus = typeof MissionRecoveryStatus.Type;
+
+/**
+ * Master or owner steering one incident's resume. now: send this thread's
+ * notice next. hold: keep it unsent. release: let held or waiting threads go.
+ * skip: decide it needs no resume. order: resume in this thread order.
+ */
+export const RecoveryResumeInput = Schema.Struct({
+  missionId: MissionId,
+  mode: Schema.Literals(["now", "hold", "release", "skip", "order"]),
+  threadId: Schema.optional(ThreadId),
+  laneId: Schema.optional(LaneId),
+  order: Schema.optional(Schema.Array(ThreadId)),
+  instruction: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(1000))),
+});
+export type RecoveryResumeInput = typeof RecoveryResumeInput.Type;
+
+export const RecoverySettingsInput = Schema.Struct({
+  missionId: MissionId,
+  resumePerMinute: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(60))),
+  masterLeadSeconds: Schema.optional(NonNegativeInt.check(Schema.isLessThanOrEqualTo(3600))),
+});
+export type RecoverySettingsInput = typeof RecoverySettingsInput.Type;
+
+/** A thread another detector (stream-recovery's restart watch) saw interrupted. */
+export const RecoveryReportThread = Schema.Struct({
+  threadId: ThreadId,
+  runIds: Schema.Array(Schema.String),
+  /** Subagent rows (native session nodes or delegated task nodes) it saw cancelled. */
+  childIds: Schema.Array(Schema.String),
+});
+export type RecoveryReportThread = typeof RecoveryReportThread.Type;
+
+export const RecoveryReportInput = Schema.Struct({
+  /** The reporter's own incident id; reporting it again returns the same incident. */
+  reportId: TrimmedNonEmptyString,
+  cause: RecoveryCause,
+  startAt: IsoDateTime,
+  endAt: IsoDateTime,
+  threads: Schema.Array(RecoveryReportThread),
+  /** Plan only: say which threads are mission members, write and send nothing. */
+  dryRun: Schema.optional(Schema.Boolean),
+});
+export type RecoveryReportInput = typeof RecoveryReportInput.Type;
+
+export const RecoveryMember = Schema.Struct({
+  threadId: ThreadId,
+  missionIds: Schema.Array(MissionId),
+});
+export type RecoveryMember = typeof RecoveryMember.Type;
+
+/** One line per mission for the reporter's own summary. */
+export const RecoveryReportMission = Schema.Struct({
+  missionId: MissionId,
+  title: Schema.String,
+  threads: NonNegativeInt,
+  resume: NonNegativeInt,
+  reconcile: NonNegativeInt,
+  noticeOnly: NonNegativeInt,
+});
+export type RecoveryReportMission = typeof RecoveryReportMission.Type;
+
+/** Members are handled by mission recovery; the reporter leaves them alone. */
+export const RecoveryReportResult = Schema.Struct({
+  incidentId: Schema.NullOr(Schema.String),
+  members: Schema.Array(RecoveryMember),
+  missions: Schema.Array(RecoveryReportMission),
+});
+export type RecoveryReportResult = typeof RecoveryReportResult.Type;
+
+// --- end recovery additions ---
+
 /** Mission page header + overview tab. Bounded: lists carry summaries, not bodies. */
 export const MissionOverview = Schema.Struct({
   mission: Mission,
@@ -1647,6 +1858,10 @@ export const MissionOverview = Schema.Struct({
   lanes: LaneCounts,
   /** When the owner last opened this mission; feed and direction check are "since". */
   ownerLastLookedAt: Schema.NullOr(IsoDateTime),
+  // --- recovery additions ---
+  /** Set while threads are still being resumed after a restart or interruption. */
+  recovery: Schema.optional(Schema.NullOr(MissionRecoveryState)),
+  // --- end recovery additions ---
 });
 export type MissionOverview = typeof MissionOverview.Type;
 
