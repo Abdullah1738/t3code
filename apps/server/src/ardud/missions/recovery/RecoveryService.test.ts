@@ -23,6 +23,7 @@ import {
   role,
 } from "../asks/AsksService.testkit.ts";
 import * as MissionService from "../MissionService.ts";
+import * as PolicyService from "../policy/PolicyService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as RecoveryService from "./RecoveryService.ts";
 import * as RecoveryStore from "./RecoveryStore.ts";
@@ -387,6 +388,46 @@ it.effect("a hold whose lease ran out during the outage means reconcile first", 
       fake.sent[1]?.text,
       "[mission recovery] Robob restarted at 09:00. Your turn was cut while you were running `./deploy.zsh dev`. You had no background children. Before anything else, check the exact state of what was in flight. You were inside a deploy (`./deploy.zsh dev`). You hold pool pool-dev-deploy hold hold-1 (dev deploy, lease ran out, now reconcile-required). Do not repeat it blindly: read back whether it happened, then finish it or roll forward. Then continue your work.",
     );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("boot flips policy holds whose lease ran out before planning the resume", () => {
+  const { layer } = harness({ withPolicy: true });
+  return Effect.gen(function* () {
+    yield* TestClock.setTime(T0 + (RESTART - 900) * 1000);
+    yield* world({ lanes: [lane] });
+    const policy = yield* PolicyService.PolicyService;
+    const pool = yield* policy.createPool(ownerApp, {
+      poolId: PoolId.make("pool-dev-deploy"),
+      name: "Dev deploy",
+      unit: "slot",
+      capacity: 1,
+      scope: { _tag: "mission", missionId },
+      kind: "lease",
+      backend: "native",
+    });
+    const taken = yield* policy.takeHold(agent(laneThread), {
+      poolId: PoolId.make(pool.ref.id),
+      missionId,
+      purpose: "dev deploy",
+      ttlSeconds: 600,
+    });
+    yield* TestClock.setTime(T0 + RESTART * 1000);
+    yield* previousBoot(plus(RESTART - 120));
+    yield* cutRun(laneThread, 1, "./deploy.zsh dev");
+
+    const incident = yield* boot;
+    const holdOf = (snapshot: typeof incident) =>
+      snapshot?.threads.find((thread) => thread.threadId === laneThread)?.holds[0];
+    assert.strictEqual(holdOf(incident)?.status, "reconcile-required");
+    assert.isTrue(holdOf(incident)?.reconcileRequired);
+    const view = yield* policy.pools({ missionId });
+    assert.strictEqual(view.pools[0]?.holds[0]?.id, taken.hold.id);
+    assert.strictEqual(view.pools[0]?.holds[0]?.status, "reconcile-required");
+    const missions = yield* MissionService.MissionService;
+    const kinds = (yield* missions.eventsSince(missionId, 0)).map((event) => event.kind);
+    assert.isBelow(kinds.indexOf("pool.hold-expired"), kinds.indexOf("recovery.incident-opened"));
+    assert.isAtLeast(kinds.indexOf("pool.hold-expired"), 0);
   }).pipe(Effect.provide(layer));
 });
 

@@ -43,6 +43,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import { standingOf, threadOfActor, type MissionCast } from "../asks/standing.ts";
 import { buildCriticalPath } from "../core/snapshots.ts";
+import * as PolicyService from "../policy/PolicyService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import * as Model from "./model.ts";
@@ -194,6 +195,8 @@ export const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
   const recovery = yield* RecoveryStore.RecoveryStore;
   const delivery = yield* RecoveryDelivery.RecoveryDelivery;
+  // Optional so recovery still runs where the policy track is not built.
+  const policy = yield* Effect.serviceOption(PolicyService.PolicyService);
   const lock = yield* Semaphore.make(1);
   const bootRef = yield* Ref.make<RecoveryStore.BootInfo | null>(null);
   const bootChecked = yield* Ref.make(false);
@@ -679,9 +682,24 @@ export const make = Effect.gen(function* () {
     return info;
   });
 
+  /** Leases that ran out while the server was down become reconcile-required first. */
+  const expireHolds = Option.match(policy, {
+    onNone: () => Effect.void,
+    onSome: (service) =>
+      service.expireHolds.pipe(
+        Effect.catchTags({
+          MissionError: (error) =>
+            Effect.logWarning("missions recovery: expiring pool holds failed", {
+              error: error.message,
+            }),
+        }),
+      ),
+  });
+
   const detectBoot = lock.withPermit(
     Effect.gen(function* () {
       const info = yield* start;
+      yield* expireHolds;
       yield* Ref.set(bootChecked, true);
       const key = `boot:${info.bootId}`;
       if ((yield* recovery.seenKeys([key])).size > 0) return null;
