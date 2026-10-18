@@ -138,6 +138,33 @@ describe("draft routing", () => {
     },
   );
 
+  it.effect("M3: the master reopens a draft the owner decided; the lane cannot", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const missions = yield* MissionService.MissionService;
+
+      const draft = yield* asks.submitDraft(draftFor("linear", "Merged, see CRP-1."), writer);
+      expect(draft.approver).toBe("owner");
+      yield* asks.decideDraft({ draftId: draft.id, action: "drop" }, ownerApp);
+
+      expect(yield* failureCode(asks.reopenDraft({ draftId: draft.id }, laneAgent))).toBe(
+        "forbidden",
+      );
+      const reopened = yield* asks.reopenDraft({ draftId: draft.id }, master);
+      expect(reopened.status).toBe("pending");
+      expect(reopened.approver).toBe("owner");
+      // Back in front of the owner, who still decides it.
+      expect((yield* missions.inbox(missionId)).drafts.map((d) => d.id)).toEqual([draft.id]);
+      expect(
+        yield* failureCode(
+          asks.decideDraft({ draftId: draft.id, action: "approve", revision: 1 }, master),
+        ),
+      ).toBe("provenance-required");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("annotates waiting drafts and refuses roles that do not write public text", () => {
     const { layer } = harness();
     return Effect.gen(function* () {

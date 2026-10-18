@@ -228,6 +228,32 @@ describe("drafts", () => {
     expect(Result.isFailure(reopenDraft(approved, writer.provenance, false, now))).toBe(true);
   });
 
+  it("M3: the master reopens a draft the owner decided; approving it again still needs him", () => {
+    const master: MissionProvenance = {
+      _tag: "agent",
+      threadId: ThreadId.make("t-master"),
+      roleId: null,
+    };
+    const approved = approveEdited(pending(), "The fix is merged.", now).record;
+    expect(approved.approver).toBe("owner");
+    const reopened = Result.getOrThrow(reopenDraft(approved, master, true, now));
+    expect(reopened.record.status).toBe("pending");
+    expect(reopened.record.revision).toBe(1);
+    expect(reopened.events[0]?.actor).toEqual({ _tag: "thread", threadId: "t-master" });
+
+    const again = decideDraft({
+      draft: reopened.record,
+      input: { draftId: approved.id, action: "approve", revision: 1 },
+      provenance: master,
+      callerIsMaster: true,
+      now,
+    });
+    expect(Result.isFailure(again) && again.failure.code).toBe("provenance-required");
+
+    const strangerReopen = reopenDraft(approved, writer.provenance, false, now);
+    expect(Result.isFailure(strangerReopen) && strangerReopen.failure.code).toBe("forbidden");
+  });
+
   it("examples prefer the same person and use the approved text", () => {
     const first = approveEdited(pending(), "Merged.", "2026-10-17T11:00:00.000Z").record;
     const other = approveEdited(

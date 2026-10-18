@@ -340,7 +340,7 @@ const MissionForkUpdateTool = Tool.make("mission_fork_update", {
 
 const MissionDraftReopenTool = Tool.make("mission_draft_reopen", {
   description:
-    "As the mission's master, put an approved or dropped draft routed to you back to pending. Drafts routed to the owner stay his. Reopening starts a new revision, so earlier approvals no longer count.",
+    "As the mission's master, put an approved or dropped draft back to pending, including one the owner decided. It goes back to its approver: a draft routed to the owner still waits for him. Reopening starts a new revision, so earlier approvals no longer count.",
   parameters: ReopenDraftInput,
   success: Schema.Struct({ draft: Schema.Unknown }),
   failure: OrchestratorMcpFailure,

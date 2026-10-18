@@ -469,15 +469,21 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
   });
 };
 
-/** The way back out: the approver un-approves (before it is sent) or un-drops a draft. */
+/**
+ * The way back out: un-approve (before it is sent) or un-drop a draft. The
+ * owner or the mission's master reopens any decided draft, including one
+ * routed to the owner: reopening only puts it back in front of its approver,
+ * so it needs no owner proof. Approving it again still does.
+ */
 export const reopenDraft = (
   draft: Draft,
   provenance: MissionProvenance,
   callerIsMaster: boolean,
   now: string,
 ): Outcome<Transition<Draft>> => {
-  const allowed = approverCheck(draft, provenance, callerIsMaster, "reopens");
-  if (Result.isFailure(allowed)) return Result.fail(allowed.failure);
+  if (!isOwnerProvenance(provenance) && !callerIsMaster) {
+    return refuse("forbidden", `Only the mission's master or the owner reopens draft ${draft.id}.`);
+  }
   if ((draft.staleReason ?? null) !== null) {
     return refuse(
       "conflict",
