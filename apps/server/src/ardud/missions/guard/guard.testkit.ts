@@ -73,8 +73,11 @@ export const membershipGuard = Effect.gen(function* () {
   return seen;
 });
 
-/** When every pending request in `projectionFor` opened. */
-export const askedAt = DateTime.makeUnsafe("2026-10-18T10:00:00.000Z");
+/**
+ * When every pending request in `projectionFor` opened: ten minutes before
+ * the tests load, since the control routes judge answers on the real clock.
+ */
+export const askedAt = DateTime.makeUnsafe(Date.now() - 10 * 60_000);
 
 /**
  * Every thread has three pending requests: `request-1` asks "release"

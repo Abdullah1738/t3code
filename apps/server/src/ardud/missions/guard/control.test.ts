@@ -397,7 +397,8 @@ describe("iMessage bridge provenance (coordinator call, 18 Oct)", () => {
         typed("in-yes", "yes please", { minutesAgo: 5 }),
         typed("in-no", "no", { minutesAgo: 5 }),
         typed("in-hold", "Hold", { minutesAgo: 5 }),
-        typed("in-early", "Ship it", { receivedAt: at(-1) }),
+        // A second before the request opened: no skew for answers.
+        typed("in-early", "Ship it", { receivedAt: DateTime.toEpochMillis(askedAt) - 1000 }),
         typed("in-chatty", "yes but only after the tests", { minutesAgo: 5 }),
         typed("in-form", "Ship it", { minutesAgo: 5 }),
         typed("in-stale", "Ship it", { minutesAgo: 90 }),
