@@ -741,7 +741,23 @@ const make = Effect.gen(function* () {
    * What a writer's draft is about. The work item and sub-mission must be the mission's; the
    * sub-mission defaults to the work item's, then to the writer's lane's.
    */
-  const draftAbout = (input: SubmitDraftInput, standing: Standing) =>
+  /**
+   * The lanes a lane-bound caller may name a draft after, or null when it may
+   * name any: the owner, the master, its forks and mission-wide roles.
+   */
+  const ownLanes = (cast: MissionCast, standing: Standing): ReadonlySet<string> | null => {
+    if (standing.caller.provenance._tag !== "agent" || standing.isMaster) return null;
+    if (standing.forks.length > 0 || standing.roles.some((role) => role.laneId === null)) {
+      return null;
+    }
+    const laneIds = new Set<string>(standing.lanes.map((lane) => lane.id));
+    for (const role of standing.roles) if (role.laneId !== null) laneIds.add(role.laneId);
+    return new Set<string>(
+      cast.lanes.filter((lane) => laneIds.has(lane.id)).map((lane) => lane.id),
+    );
+  };
+
+  const draftAbout = (input: SubmitDraftInput, cast: MissionCast, standing: Standing) =>
     Effect.gen(function* () {
       const item =
         input.workItemId === undefined
@@ -751,6 +767,14 @@ const make = Effect.gen(function* () {
         return yield* fail(
           "not-found",
           `No work item ${input.workItemId} in mission ${input.missionId}.`,
+        );
+      }
+      // What a draft is about picks its route, so a lane names only its own work.
+      const lanes = ownLanes(cast, standing);
+      if (lanes !== null && item !== null && (item.laneId === null || !lanes.has(item.laneId))) {
+        return yield* fail(
+          "forbidden",
+          `Work item ${item.id} is not in a lane this thread works; name only your own lane's work.`,
         );
       }
       if (input.subMissionId !== undefined) {
@@ -765,6 +789,16 @@ const make = Effect.gen(function* () {
           return yield* fail(
             "invalid",
             `Work item ${item.id} is in sub-mission ${item.subMissionId}, not ${input.subMissionId}.`,
+          );
+        }
+        const laneWork =
+          lanes === null ||
+          item?.subMissionId === input.subMissionId ||
+          cast.lanes.some((lane) => lanes.has(lane.id) && lane.subMissionId === input.subMissionId);
+        if (!laneWork) {
+          return yield* fail(
+            "forbidden",
+            `Sub-mission ${input.subMissionId} holds none of this thread's lanes; name only your own lane's work.`,
           );
         }
       }
@@ -826,7 +860,7 @@ const make = Effect.gen(function* () {
                 candidate.threadId === speaking.threadId,
             );
       const notes = yield* allDraftNotes(input.missionId);
-      const about = yield* draftAbout(input, standing);
+      const about = yield* draftAbout(input, cast, standing);
       // A draft names one audience; routes match it as the person as well.
       const route = routeDraftApprover(cast.mission?.approvalRouting, input, about);
       const existing = yield* store.list("draft", {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   ApprovalId,
   DraftId,
+  LaneId,
   RoleId,
   SubMissionId,
   WorkItemId,
@@ -310,6 +311,78 @@ describe("draft routing", () => {
         subMissionId: "sm-wave",
         workItemId: "wi-wave",
       });
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a lane names a draft only after its own lane's work", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const store = yield* MissionStore.MissionStore;
+      const wave: SubMission = {
+        id: SubMissionId.make("sm-wave"),
+        missionId,
+        title: "Architecture wave",
+        intent: "",
+        order: 0,
+        fillIdleCapacity: false,
+        status: "active",
+        coordinatorRoleId: null,
+        intendedEffort: null,
+        actualEffort: null,
+        health: "unknown",
+        lockedFields: [],
+        createdAt: "2026-10-17T08:00:00.000Z",
+        updatedAt: "2026-10-17T08:00:00.000Z",
+      };
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "sub-mission.created",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "seed",
+          subject: null,
+        },
+        upserts: [
+          { _tag: "sub-mission", record: wave },
+          {
+            _tag: "work-item",
+            record: { ...item("wi-web"), laneId: LaneId.make("lane-web"), subMissionId: wave.id },
+          },
+        ],
+      });
+
+      // Its own lane's item is fine.
+      const own = yield* asks.submitDraft(
+        { ...draftFor("linear", "API item done."), workItemId: WorkItemId.make("wi-free") },
+        laneAgent,
+      );
+      expect(own.workItemId).toBe("wi-free");
+      // Another lane's item, or a sub-mission none of its lanes is in, would pick another route.
+      expect(
+        yield* failureCode(
+          asks.submitDraft(
+            { ...draftFor("linear", "Web item done."), workItemId: WorkItemId.make("wi-web") },
+            laneAgent,
+          ),
+        ),
+      ).toBe("forbidden");
+      expect(
+        yield* failureCode(
+          asks.submitDraft(
+            { ...draftFor("linear", "Wave done."), subMissionId: wave.id },
+            laneAgent,
+          ),
+        ),
+      ).toBe("forbidden");
+      // A mission-wide writer may name any of the mission's work.
+      const writes = yield* asks.submitDraft(
+        { ...draftFor("linear", "Web item merged."), workItemId: WorkItemId.make("wi-web") },
+        writer,
+      );
+      expect(writes).toMatchObject({ workItemId: "wi-web", subMissionId: "sm-wave" });
     }).pipe(Effect.provide(layer));
   });
 
