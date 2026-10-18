@@ -11,6 +11,7 @@ function MissionInboxRouteView() {
     <MissionInboxPage
       missionId={(search.mission ?? null) as MissionId | null}
       tab={search.tab ?? null}
+      route={search.route ?? "owner"}
     />
   );
 }

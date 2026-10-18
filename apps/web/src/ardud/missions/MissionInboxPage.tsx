@@ -5,10 +5,13 @@ import {
   defaultInboxTab,
   draftOwnerEdit,
   formatRelative,
+  INBOX_ROUTE_FILTER_LABEL,
   INBOX_TAB_LABEL,
   INBOX_TABS,
+  inboxTabCounts,
   staleApprovals,
   type InboxEntry,
+  type InboxRouteFilter,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Kbd } from "../../components/ui/kbd";
@@ -36,6 +39,7 @@ import {
 } from "./InboxCards";
 import { MissionForksList } from "./MissionForksList";
 import { MissionSection } from "./MissionSection";
+import { RoutingPanel } from "./RoutingPanel";
 import {
   useDraftNotes,
   useMasterRoleId,
@@ -54,14 +58,18 @@ import { useNowMs } from "./useNowMs";
  * mission or all of them. Selection, keys and decisions run through
  * `useInboxScreen` (client-runtime reducer); this file is layout.
  */
-export function MissionInboxPage(props: { missionId: MissionId | null; tab: InboxTab | null }) {
+export function MissionInboxPage(props: {
+  missionId: MissionId | null;
+  tab: InboxTab | null;
+  route: InboxRouteFilter;
+}) {
   const list = useMissionList();
   const nowMs = useNowMs();
   const mission = list?.missions.find((item) => item.id === props.missionId) ?? null;
   const inbox = useMissionInbox(props.missionId);
   // No tab in the URL: the first tab with something in it.
-  const tab = props.tab ?? (inbox ? defaultInboxTab(inbox) : "decide");
-  const screen = useInboxScreen(props.missionId, tab);
+  const tab = props.tab ?? (inbox ? defaultInboxTab(inbox, props.route) : "decide");
+  const screen = useInboxScreen(props.missionId, tab, props.route);
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -93,10 +101,27 @@ export function MissionInboxPage(props: { missionId: MissionId | null; tab: Inbo
         </WorkspacePageHeader>
         <ScrollArea className="min-h-0 flex-1">
           <WorkspacePageContainer width="readable" className="min-h-full gap-4">
-            <InboxScopeLinks missionId={props.missionId} tab={props.tab} />
-            <InboxTabs missionId={props.missionId} tab={tab} counts={inbox?.counts} />
+            <InboxScopeLinks missionId={props.missionId} tab={props.tab} route={props.route} />
+            <InboxRouteLinks
+              missionId={props.missionId}
+              tab={props.tab}
+              route={props.route}
+              masterCount={inbox ? inbox.masterCounts.approve + inbox.masterCounts.suggestions : 0}
+            />
+            <InboxTabs
+              missionId={props.missionId}
+              tab={tab}
+              route={props.route}
+              counts={inbox ? inboxTabCounts(inbox, props.route) : undefined}
+            />
             {inbox ? (
-              <InboxTabBody missionId={props.missionId} tab={tab} screen={screen} nowMs={nowMs} />
+              <InboxTabBody
+                missionId={props.missionId}
+                tab={tab}
+                route={props.route}
+                screen={screen}
+                nowMs={nowMs}
+              />
             ) : (
               <p className="text-sm text-muted-foreground">Loading…</p>
             )}
@@ -109,10 +134,17 @@ export function MissionInboxPage(props: { missionId: MissionId | null; tab: Inbo
 }
 
 /** One mission or all of them. */
-function InboxScopeLinks(props: { missionId: MissionId | null; tab: InboxTab | null }) {
+function InboxScopeLinks(props: {
+  missionId: MissionId | null;
+  tab: InboxTab | null;
+  route: InboxRouteFilter;
+}) {
   const list = useMissionList();
   if (!list || list.missions.length < 2) return null;
-  const tabSearch = props.tab ? { tab: props.tab } : {};
+  const tabSearch = {
+    ...(props.tab ? { tab: props.tab } : {}),
+    ...(props.route === "master" ? { route: "master" as const } : {}),
+  };
   const linkClass = (active: boolean) =>
     cn(
       "rounded px-1.5 py-0.5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
@@ -138,9 +170,43 @@ function InboxScopeLinks(props: { missionId: MissionId | null; tab: InboxTab | n
   );
 }
 
+/** The owner's inbox (default) or what is routed to the master. Both can be decided here. */
+function InboxRouteLinks(props: {
+  missionId: MissionId | null;
+  tab: InboxTab | null;
+  route: InboxRouteFilter;
+  masterCount: number;
+}) {
+  const base = {
+    ...(props.missionId ? { mission: props.missionId } : {}),
+    ...(props.tab ? { tab: props.tab } : {}),
+  };
+  const linkClass = (active: boolean) =>
+    cn(
+      "rounded px-1.5 py-0.5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+      active ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+    );
+  return (
+    <nav aria-label="Whose inbox" className="flex flex-wrap gap-1 text-sm">
+      <Link to="/missions/inbox" search={base} className={linkClass(props.route === "owner")}>
+        {INBOX_ROUTE_FILTER_LABEL.owner}
+      </Link>
+      <Link
+        to="/missions/inbox"
+        search={{ ...base, route: "master" }}
+        className={linkClass(props.route === "master")}
+      >
+        {INBOX_ROUTE_FILTER_LABEL.master}
+        {props.masterCount > 0 ? ` (${props.masterCount})` : ""}
+      </Link>
+    </nav>
+  );
+}
+
 function InboxTabs(props: {
   missionId: MissionId | null;
   tab: InboxTab;
+  route: InboxRouteFilter;
   counts: Record<InboxTab, number> | undefined;
 }) {
   return (
@@ -153,7 +219,11 @@ function InboxTabs(props: {
             <li key={tab} className="shrink-0">
               <Link
                 to="/missions/inbox"
-                search={{ ...(props.missionId ? { mission: props.missionId } : {}), tab }}
+                search={{
+                  ...(props.missionId ? { mission: props.missionId } : {}),
+                  tab,
+                  ...(props.route === "master" ? { route: "master" as const } : {}),
+                }}
                 aria-current={active ? "page" : undefined}
                 className={cn(
                   "flex h-9 items-center gap-1.5 border-b-2 px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
@@ -184,6 +254,7 @@ const EMPTY_LINE: Record<InboxTab, string> = {
 function InboxTabBody(props: {
   missionId: MissionId | null;
   tab: InboxTab;
+  route: InboxRouteFilter;
   screen: ReturnType<typeof useInboxScreen>;
   nowMs: number;
 }) {
@@ -235,6 +306,7 @@ function InboxTabBody(props: {
             approval={entry.record}
             selected={selected}
             onSelect={onSelect}
+            masterRoleId={masterRoleId}
             nowMs={nowMs}
             actions={actions}
           />
@@ -293,6 +365,7 @@ function InboxTabBody(props: {
       ) : null}
       {props.tab === "approve" ? (
         <>
+          {props.missionId ? <RoutingPanel missionId={props.missionId} /> : null}
           <ApproveHistory missionId={props.missionId} nowMs={nowMs} />
           <MissionSection title="Draft notes" caption="How you want drafts to be.">
             <DraftNotesPanel missionId={props.missionId} />

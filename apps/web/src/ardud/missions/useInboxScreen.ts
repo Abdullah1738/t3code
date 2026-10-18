@@ -21,6 +21,7 @@ import {
   inboxUiReducer,
   INITIAL_INBOX_UI,
   type DraftDecision,
+  type InboxRouteFilter,
   type InboxEntry,
   type InboxUiEvent,
   type SuggestionDecision,
@@ -45,15 +46,22 @@ function isTypingTarget(target: EventTarget | null): boolean {
  * the open editor, plus j/k / 1-9 / e on the window. The logic lives in the
  * client-runtime reducer; this hook only wires it to React and the DOM.
  */
-export function useInboxScreen(missionId: MissionId | null, tab: InboxTab) {
+export function useInboxScreen(
+  missionId: MissionId | null,
+  tab: InboxTab,
+  route: InboxRouteFilter = "owner",
+) {
   const inbox = useMissionInbox(missionId);
-  const entries = useMemo(() => (inbox ? inboxEntries(inbox, tab) : []), [inbox, tab]);
+  const entries = useMemo(
+    () => (inbox ? inboxEntries(inbox, tab, route) : []),
+    [inbox, tab, route],
+  );
   const [ui, dispatch] = useReducer(inboxUiReducer, INITIAL_INBOX_UI);
   const selected = entries.find((entry) => entry.key === ui.selectedKey) ?? null;
 
   // Another mission filter or tab starts fresh; a decision in the same list
   // keeps the selection on the next item.
-  const scope = `${missionId ?? "*"}|${tab}`;
+  const scope = `${missionId ?? "*"}|${tab}|${route}`;
   const previous = useRef<{ scope: string; keys: ReadonlyArray<string> }>({ scope, keys: [] });
   useEffect(() => {
     const nextKeys = entries.map((entry) => entry.key);

@@ -51,6 +51,8 @@ export interface MissionInboxSearch {
   readonly mission?: string;
   /** Open tab. Omitted means "the first tab with something in it". */
   readonly tab?: InboxTab;
+  /** "master" shows what is routed to the master; omitted is the owner's inbox. */
+  readonly route?: "master";
 }
 
 export function parseMissionInboxSearch(raw: Record<string, unknown>): MissionInboxSearch {
@@ -58,5 +60,6 @@ export function parseMissionInboxSearch(raw: Record<string, unknown>): MissionIn
   return {
     ...(mission !== undefined ? { mission } : {}),
     ...(isInboxTab(raw.tab) ? { tab: raw.tab } : {}),
+    ...(raw.route === "master" ? { route: "master" as const } : {}),
   };
 }

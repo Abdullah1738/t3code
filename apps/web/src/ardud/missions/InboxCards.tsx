@@ -3,7 +3,6 @@ import { useState, type ReactNode } from "react";
 import type {
   Approval,
   Ask,
-  Draft,
   DraftNote,
   Knock,
   Note,
@@ -13,21 +12,27 @@ import type {
 import {
   actorLabel,
   APPROVAL_STATUS_LABEL,
+  APPROVER_LABEL,
   askView,
   DRAFT_CHANNEL_LABEL,
   draftNotesFor,
   draftNoteScopeLabel,
   formatRelative,
   fyiView,
+  decideLine,
   openForkFor,
   parseDiffLines,
   refLabel,
+  routeLine,
   SUGGESTION_AUTHOR_LABEL,
   SUGGESTION_TARGET_LABEL,
   suggestionAfterText,
   suggestionTrackRecord,
   textEdit,
   type MissionForkEntry,
+  type Routed,
+  type RoutedApproval,
+  type RoutedDraft,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Badge } from "../../components/ui/badge";
@@ -36,6 +41,7 @@ import { Kbd } from "../../components/ui/kbd";
 import { Textarea } from "../../components/ui/textarea";
 import { cn } from "../../lib/utils";
 import { MissionLinkList, MissionLinkText } from "./MissionLinkText";
+import { rerouteRecord } from "./operationCommands";
 import { LineDiff, WordDiff } from "./TextDiffView";
 import { inboxItemDomId, type InboxActions } from "./useInboxScreen";
 
@@ -164,7 +170,7 @@ export function AskCard(props: {
 // Approve
 
 export function DraftCard(props: {
-  draft: Draft;
+  draft: RoutedDraft;
   selected: boolean;
   onSelect: () => void;
   editing: boolean;
@@ -196,6 +202,7 @@ export function DraftCard(props: {
         <MissionLinkText link={draft.target} /> · written by {writer} ·{" "}
         {formatRelative(draft.createdAt, props.nowMs)}
       </Meta>
+      <RouteMeta record={draft} kind="draft" masterRoleId={props.masterRoleId} />
       {props.editing ? (
         <>
           <Textarea
@@ -301,9 +308,10 @@ export function DraftCard(props: {
 }
 
 export function ApprovalCard(props: {
-  approval: Approval;
+  approval: RoutedApproval;
   selected: boolean;
   onSelect: () => void;
+  masterRoleId: string | null;
   nowMs: number;
   actions: InboxActions;
 }) {
@@ -324,6 +332,7 @@ export function ApprovalCard(props: {
         {approval.kind} approval · requested by {approval.requestedBy} ·{" "}
         {formatRelative(approval.createdAt, props.nowMs)}
       </Meta>
+      <RouteMeta record={approval} kind="approval" masterRoleId={props.masterRoleId} />
       <h3 className="font-medium text-foreground">{approval.title}</h3>
       {approval.detail ? <p className="text-muted-foreground">{approval.detail}</p> : null}
       {approval.links.length > 0 ? (
@@ -604,5 +613,60 @@ export function NoteCard(props: {
         </Button>
       </Actions>
     </InboxCard>
+  );
+}
+
+/**
+ * Whose inbox a draft or approval is routed to and why, with a way to move it.
+ * Whoever it waits on, you can still decide it here.
+ */
+function RouteMeta(props: {
+  record: Routed & { readonly id: string };
+  kind: "draft" | "approval";
+  masterRoleId: string | null;
+}) {
+  const [moving, setMoving] = useState(false);
+  const [reason, setReason] = useState("");
+  const to = props.record.approver === "owner" ? "master" : "owner";
+  return (
+    <div className="flex flex-col gap-1 text-xs text-muted-foreground">
+      <p>
+        {routeLine(props.record, props.masterRoleId)} · {decideLine(props.record)} ·{" "}
+        <button
+          type="button"
+          className="underline"
+          onClick={(event) => {
+            event.stopPropagation();
+            setMoving(!moving);
+          }}
+        >
+          Move to {APPROVER_LABEL[to]}
+        </button>
+      </p>
+      {moving ? (
+        <form
+          className="flex flex-wrap gap-2"
+          onClick={(event) => event.stopPropagation()}
+          onSubmit={async (event) => {
+            event.preventDefault();
+            if (await rerouteRecord(props.kind, props.record.id, to, reason)) {
+              setMoving(false);
+              setReason("");
+            }
+          }}
+        >
+          <Textarea
+            size="sm"
+            aria-label="Why move it?"
+            placeholder="Why move it?"
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+          />
+          <Button type="submit" size="sm" variant="outline">
+            Move
+          </Button>
+        </form>
+      ) : null}
+    </div>
   );
 }
