@@ -3,6 +3,9 @@ import datetime as dt
 import io
 import json
 import unittest
+import os as _os, tempfile as _tempfile
+# The live card-status record must never decide these tests.
+_os.environ['CARD_STATUS_FILE']=_os.path.join(_tempfile.mkdtemp(prefix='card-status-test-'),'card-status.json')
 from unittest.mock import Mock, patch
 
 import commerce_cli as c
