@@ -12,6 +12,7 @@ import {
   type MissionProvenance,
   type MissionRecordRef,
   type MissionStreamItem,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
@@ -58,6 +59,13 @@ const DDL = [
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_mission_records_by_mission
     ON ardud_mission_records (mission_id, kind, updated_at)`,
+  // --- router additions ---
+  // Complete thread lookups for membership: which records name a thread.
+  `CREATE INDEX IF NOT EXISTS ardud_mission_records_by_thread
+    ON ardud_mission_records (json_extract(record_json, '$.record.threadId'), kind)`,
+  `CREATE INDEX IF NOT EXISTS ardud_mission_records_by_fork_thread
+    ON ardud_mission_records (json_extract(record_json, '$.record.forkThreadId'), kind)`,
+  // --- end router additions ---
   `CREATE TABLE IF NOT EXISTS ardud_mission_events (
     mission_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
@@ -189,6 +197,28 @@ export class MissionStore extends Context.Service<
      * removes, then its `event` upsert, all with the same (missionId, seq).
      */
     readonly subscribe: Effect.Effect<PubSub.Subscription<MissionStreamItem>, never, Scope.Scope>;
+    // --- router additions ---
+    /**
+     * Every record of a kind in one mission, uncapped. For authorization
+     * reads that must see the whole cast; `list` stops at its limit.
+     */
+    readonly listAllInMission: <K extends MissionStoreKind>(
+      kind: K,
+      missionId: MissionId,
+      status?: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyArray<MissionRecordOf<K>>, MissionError>;
+    /** Every record of a kind across all missions, uncapped (oldest first). */
+    readonly listAll: <K extends MissionStoreKind>(
+      kind: K,
+      status?: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyArray<MissionRecordOf<K>>, MissionError>;
+    /**
+     * Every mission with a role binding or lane naming the thread, or a fork
+     * that is the thread, in any status. Complete: an indexed lookup with no
+     * limit, so a mission missing here cannot claim the thread by its records.
+     */
+    readonly missionsOfThread: (threadId: ThreadId) => Effect.Effect<ReadonlyArray<MissionId>>;
+    // --- end router additions ---
   }
 >()("t3/ardud/missions/store/MissionStore") {}
 
@@ -402,6 +432,64 @@ const make = Effect.gen(function* () {
       );
     });
 
+  // --- router additions ---
+  const listUncapped = <K extends MissionStoreKind>(
+    kind: K,
+    missionId: MissionId | null,
+    status?: ReadonlyArray<string>,
+  ) =>
+    Effect.gen(function* () {
+      if (status !== undefined && status.length === 0) return [];
+      const clauses = [
+        sql`kind = ${kind}`,
+        ...(missionId === null ? [] : [sql`mission_id = ${missionId}`]),
+        ...(status === undefined ? [] : [sql.in("status", status)]),
+      ];
+      const rows = yield* sql<RecordRow & { readonly id: string }>`
+        SELECT id AS "id", record_json AS "recordJson" FROM ardud_mission_records
+        WHERE ${sql.and(clauses)}
+        ORDER BY updated_at ASC, id ASC
+      `.pipe(NodeSqliteClient.readOnly, Effect.orDie);
+      return yield* Effect.forEach(rows, (row) =>
+        decodeStoredRecord(kind, row.id, row.recordJson).pipe(
+          Effect.flatMap((decoded) =>
+            decoded._tag === kind
+              ? Effect.succeed(decoded.record as MissionRecordOf<K>)
+              : Effect.fail(invalid(`Stored ${kind} ${row.id} holds a ${decoded._tag} record.`)),
+          ),
+        ),
+      );
+    });
+
+  const listAllInMission = <K extends MissionStoreKind>(
+    kind: K,
+    missionId: MissionId,
+    status?: ReadonlyArray<string>,
+  ) => listUncapped(kind, missionId, status);
+
+  const listAll = <K extends MissionStoreKind>(kind: K, status?: ReadonlyArray<string>) =>
+    listUncapped(kind, null, status);
+
+  const missionsOfThread = (threadId: ThreadId) =>
+    sql<{ readonly missionId: MissionId }>`
+      SELECT DISTINCT mission_id AS "missionId" FROM (
+        SELECT mission_id FROM ardud_mission_records
+        WHERE json_extract(record_json, '$.record.threadId') = ${threadId}
+          AND kind IN ('role-binding', 'lane')
+        UNION
+        SELECT mission_id FROM ardud_mission_records
+        WHERE json_extract(record_json, '$.record.forkThreadId') = ${threadId}
+          AND kind = 'fork'
+      )
+      WHERE mission_id IS NOT NULL
+      ORDER BY mission_id
+    `.pipe(
+      Effect.map((rows) => rows.map((row) => row.missionId)),
+      NodeSqliteClient.readOnly,
+      Effect.orDie,
+    );
+  // --- end router additions ---
+
   const eventsSince = (missionId: MissionId, afterSeq: number, limit = MAX_EVENTS_PAGE) =>
     Effect.gen(function* () {
       const bounded = Math.min(Math.max(limit, 1), MAX_EVENTS_PAGE);
@@ -450,6 +538,11 @@ const make = Effect.gen(function* () {
         ON CONFLICT (mission_id) DO UPDATE SET looked_at = excluded.looked_at
       `.pipe(Effect.asVoid, Effect.orDie),
     subscribe: PubSub.subscribe(changes),
+    // --- router additions ---
+    listAllInMission,
+    listAll,
+    missionsOfThread,
+    // --- end router additions ---
   });
 });
 
