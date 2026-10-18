@@ -2091,8 +2091,10 @@ export const SubscribeRoomInput = Schema.Struct({
 export type SubscribeRoomInput = typeof SubscribeRoomInput.Type;
 
 /**
- * Who a membership is for: an owner-attached thread, or a control-API
- * session registered as a mission service (crw, the coord shim, watchers).
+ * Who a membership is for: an owner-attached thread, a control-API session
+ * registered as a mission service (crw, watchers), or a coord actor name
+ * (`master`, a lane, a system subscriber such as `crw`) the `coord` component
+ * credential may speak and read as through the coord shim.
  */
 export const MissionMemberPrincipal = Schema.Union([
   Schema.TaggedStruct("thread", { threadId: ThreadId }),
@@ -2100,13 +2102,14 @@ export const MissionMemberPrincipal = Schema.Union([
     sessionId: TrimmedNonEmptyString,
     label: TrimmedNonEmptyString,
   }),
+  Schema.TaggedStruct("coord", { actor: TrimmedNonEmptyString }),
 ]);
 export type MissionMemberPrincipal = typeof MissionMemberPrincipal.Type;
 
 /**
- * Owner or the mission's master: attach or detach a thread, or register or
- * drop a service session. Only the owner attaches a thread that belongs to
- * another mission.
+ * Owner or the mission's master: attach or detach a thread, register or drop
+ * a service session, or enrol or drop a coord actor for the coord component.
+ * Only the owner attaches a thread that belongs to another mission.
  */
 export const SetMissionMemberInput = Schema.Struct({
   missionId: MissionId,

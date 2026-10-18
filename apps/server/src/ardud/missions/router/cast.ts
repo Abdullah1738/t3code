@@ -14,7 +14,10 @@ import type {
   ThreadId,
   WorkItem,
 } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 
+import type * as MissionStore from "../store/MissionStore.ts";
 import type { MemberKind } from "./model.ts";
 
 export interface RouterCast {
@@ -27,6 +30,22 @@ export interface RouterCast {
   /** Open forks only. */
   readonly forks: ReadonlyArray<MissionFork>;
 }
+
+/**
+ * A mission's whole cast. Membership and wake decisions read this, so it uses
+ * the store's uncapped per-mission reads: a cast cut at a list limit would
+ * silently drop members.
+ */
+export const readCast = (store: MissionStore.MissionStore["Service"], missionId: MissionId) =>
+  Effect.gen(function* () {
+    const mission = Option.getOrNull(yield* store.get("mission", missionId));
+    const roles = yield* store.listAllInMission("role", missionId);
+    const bindings = yield* store.listAllInMission("role-binding", missionId, ["bound"]);
+    const lanes = yield* store.listAllInMission("lane", missionId);
+    const forks = yield* store.listAllInMission("fork", missionId, ["open"]);
+    const cast: RouterCast = { missionId, mission, roles, bindings, lanes, forks };
+    return cast;
+  });
 
 const boundThreads = (cast: RouterCast, roleId: Role["id"]): ReadonlyArray<ThreadId> =>
   cast.bindings

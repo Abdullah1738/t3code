@@ -73,7 +73,7 @@ export const RouterLive = Layer.effectDiscard(
   Effect.gen(function* () {
     const router = yield* MissionRouter.MissionRouter;
     const engine = yield* Orchestrator.OrchestratorV2;
-    yield* installSendGuard(router.guard);
+    yield* installSendGuard(router.guard, router.checkSend);
     yield* forkParked(
       Stream.runForEach(engine.streamDomainEvents, onDomainEvent(router)).pipe(
         Effect.catchCause((cause) =>

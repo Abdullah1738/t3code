@@ -22,7 +22,15 @@ import * as HttpRouter from "effect/http/HttpRouter";
 
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
-import { at, binding, mission, role } from "../asks/AsksService.testkit.ts";
+import {
+  agent,
+  at,
+  binding,
+  failureCode,
+  mission,
+  ownerApp,
+  role,
+} from "../asks/AsksService.testkit.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { routerImportSink } from "./adapters.ts";
 import { COORD_SHIM_PREFIX, coordShimRouteLayer } from "./coordHttp.ts";
@@ -120,18 +128,47 @@ const seedCrpko = Effect.gen(function* () {
       });
     }),
   });
+  // The owner enrols the coord actors the forward-mode credential may speak for.
+  const router = yield* MissionRouter.MissionRouter;
+  for (const actor of ["master", "cell-a", "cell-b", "crw"]) {
+    yield* enrol(router, actor, ownerApp);
+  }
 });
 
+const enrol = (
+  router: MissionRouter.MissionRouter["Service"],
+  actor: string,
+  provenance: Parameters<MissionRouter.MissionRouter["Service"]["setMember"]>[1],
+  member = true,
+) =>
+  router.setMember({ missionId: crpko, principal: { _tag: "coord", actor }, member }, provenance);
+
+/**
+ * `test-token` is the coord component credential; `broad-token` is an
+ * operate token with no component origin (the shared control token);
+ * `crw-token` is another component's credential.
+ */
+const sessions: Record<string, { readonly subject: string; readonly component: string | null }> = {
+  "Bearer test-token": { subject: "component:coord", component: "coord" },
+  "Bearer broad-token": { subject: "control", component: null },
+  "Bearer crw-token": { subject: "component:crw", component: "crw" },
+};
+
 const fakeAuth = {
-  authenticateHttpRequest: (request: HttpServerRequest.HttpServerRequest) =>
-    request.headers.authorization === "Bearer test-token"
-      ? Effect.succeed({
-          sessionId: AuthSessionId.make("session-coord"),
-          subject: "coord-shim",
+  authenticateHttpRequest: (request: HttpServerRequest.HttpServerRequest) => {
+    const session = sessions[request.headers.authorization ?? ""];
+    return session === undefined
+      ? Effect.fail(new EnvironmentAuth.ServerAuthInvalidCredentialError({ diagnostic: "none" }))
+      : Effect.succeed({
+          sessionId: AuthSessionId.make(`session-${session.subject}`),
+          subject: session.subject,
           method: "bearer-access-token" as const,
           scopes: ["orchestration:read" as const, "orchestration:operate" as const],
-        })
-      : Effect.fail(new EnvironmentAuth.ServerAuthInvalidCredentialError({ diagnostic: "none" })),
+          ...(session.component === null
+            ? {}
+            : { origin: { _tag: "component" as const, component: session.component } }),
+        });
+  },
 } as unknown as EnvironmentAuth.EnvironmentAuth["Service"];
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -216,8 +253,9 @@ const withShim = <A>(use: (handler: Handler) => Promise<A>) =>
 const call = async (
   handle: Handler,
   entry: Pick<Recorded, "method" | "path" | "query" | "body">,
+  token?: string,
 ) => {
-  const response = await handle(toRequest(entry));
+  const response = await handle(toRequest(entry, token));
   return { status: response.status, reply: (await response.json()) as Record<string, any> };
 };
 
@@ -309,6 +347,8 @@ describe("coord forward shim", () => {
           },
         ],
       });
+      // Enrolled, but the mission has no actor by that name.
+      yield* enrol(yield* MissionRouter.MissionRouter, "stranger", ownerApp);
       const { unbound, stranger, badToken } = yield* withShim(async (handle) => ({
         unbound: await call(handle, shimPost({ key: "u1", as: "cell-b" })),
         stranger: await call(handle, shimPost({ key: "u2", as: "stranger" })),
@@ -437,6 +477,117 @@ describe("coord forward shim", () => {
         }),
       ]);
       expect(after.reply.events).toEqual([]);
+    }).pipe(Effect.provide(h.layer));
+  });
+  it.live("only the coord component credential reaches the shim", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seedCrpko;
+      const inboxOf = (as: string) => ({
+        method: "GET",
+        path: `${COORD_SHIM_PREFIX}/inbox`,
+        query: { mission: "crpko", as, unacked: "0", after: "0", limit: "100" },
+      });
+      const ackOf = (as: string) => ({
+        method: "POST",
+        path: `${COORD_SHIM_PREFIX}/ack`,
+        body: { mission: "crpko", as, refs: ["1"] },
+      });
+      const result = yield* withShim(async (handle) => {
+        const out: Record<string, { status: number; reply: Record<string, any> }> = {};
+        // A broad operate token tries to speak as a lane to the master, and as the master.
+        out.broadAsLane = await call(
+          handle,
+          shimPost({ key: "x1", kind: "request", to: ["master"] }),
+          "broad-token",
+        );
+        out.broadAsMaster = await call(
+          handle,
+          shimPost({ key: "x2", as: "master", to: ["cell-a"] }),
+          "broad-token",
+        );
+        out.broadInbox = await call(handle, inboxOf("master"), "broad-token");
+        out.broadAck = await call(handle, ackOf("master"), "broad-token");
+        // Another component's credential is refused the same way.
+        out.crwPost = await call(handle, shimPost({ key: "x3", as: "crw" }), "crw-token");
+        out.crwInbox = await call(handle, inboxOf("crw"), "crw-token");
+        return out;
+      });
+      for (const each of Object.values(result)) {
+        expect(each.status).toBe(403);
+        expect(each.reply.error.code).toBe("forbidden");
+      }
+      // Nothing was posted or rung.
+      expect(h.threads.sent).toEqual([]);
+      const router = yield* MissionRouter.MissionRouter;
+      expect((yield* router.inbox(T.master)).entries).toEqual([]);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.live(
+    "coord speaks only for actors enrolled to it, and only the owner or master enrols",
+    () => {
+      const h = harness();
+      return Effect.gen(function* () {
+        yield* seedCrpko;
+        const router = yield* MissionRouter.MissionRouter;
+        const masterAgent = agent(T.master);
+        // The master drops cell-b's enrolment; a lane cannot add it back.
+        yield* enrol(router, "cell-b", masterAgent, false);
+        const laneTries = yield* failureCode(enrol(router, "cell-b", agent(T.a)));
+        const refused = yield* withShim(async (handle) => ({
+          post: await call(handle, shimPost({ key: "e1", as: "cell-b", to: ["master"] })),
+          inbox: await call(handle, {
+            method: "GET",
+            path: `${COORD_SHIM_PREFIX}/inbox`,
+            query: { mission: "crpko", as: "cell-b", unacked: "0", after: "0", limit: "100" },
+          }),
+          ack: await call(handle, {
+            method: "POST",
+            path: `${COORD_SHIM_PREFIX}/ack`,
+            body: { mission: "crpko", as: "cell-b", refs: ["1"] },
+          }),
+        }));
+        // The master enrols it again and coord may speak for it.
+        yield* enrol(router, "cell-b", masterAgent);
+        const allowed = yield* withShim((handle) =>
+          call(handle, shimPost({ key: "e2", as: "cell-b", to: ["master"] })),
+        );
+        expect(laneTries).toBe("forbidden");
+        for (const each of Object.values(refused)) {
+          expect(each.status).toBe(403);
+          expect(each.reply.error.code).toBe("forbidden");
+        }
+        expect(allowed.reply).toEqual({ ok: true, seq: 1, recipients: ["master"] });
+        const store = yield* MissionStore.MissionStore;
+        const changes = (yield* store.eventsSince(crpko, 0, 500)).filter(
+          (event) =>
+            event.kind === "member.changed" &&
+            (event.payload as { principal?: string } | null)?.principal === "coord:cell-b",
+        );
+        expect(changes.map((event) => event.payload)).toEqual([
+          { principal: "coord:cell-b", kind: "service", member: true },
+          { principal: "coord:cell-b", kind: "service", member: false },
+          { principal: "coord:cell-b", kind: "service", member: true },
+        ]);
+      }).pipe(Effect.provide(h.layer));
+    },
+  );
+
+  it.live("an event key another actor posted is a conflict, not a replay", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seedCrpko;
+      const result = yield* withShim(async (handle) => ({
+        posted: await call(handle, shimPost({ key: "k-same", as: "cell-a", to: ["master"] })),
+        // Same key and body hash, sent as another enrolled actor.
+        asOther: await call(handle, shimPost({ key: "k-same", as: "cell-b", to: ["master"] })),
+        replay: await call(handle, shimPost({ key: "k-same", as: "cell-a", to: ["master"] })),
+      }));
+      expect(result.posted.reply).toMatchObject({ ok: true, seq: 1 });
+      expect(result.asOther.status).toBe(409);
+      expect(result.asOther.reply.error.code).toBe("conflict");
+      expect(result.replay.reply).toEqual({ ok: true, seq: 1, duplicate: true });
     }).pipe(Effect.provide(h.layer));
   });
 });

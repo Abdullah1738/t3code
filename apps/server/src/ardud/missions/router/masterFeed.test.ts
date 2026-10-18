@@ -1,5 +1,6 @@
 import {
   ApprovalId,
+  MissionError,
   RoleId,
   type Approval,
   type MissionEvent,
@@ -34,7 +35,8 @@ const feedOf = (digest: string | null) =>
   Effect.gen(function* () {
     const router = yield* MissionRouter;
     const store = yield* MissionStore.MissionStore;
-    return makeMasterFeed({ router, store, digest: () => Effect.succeed(digest) });
+    const rooms = yield* RouterStore.RouterStore;
+    return makeMasterFeed({ router, store, rooms, digest: () => Effect.succeed(digest) });
   });
 
 const controlMessages = Effect.gen(function* () {
@@ -73,6 +75,19 @@ const openApproval = (record: Approval, provenance: MissionProvenance = crw) =>
       upserts: [{ _tag: "approval", record }],
     });
     return result.event;
+  });
+
+const editorPass = (summary: string) =>
+  Effect.gen(function* () {
+    const store = yield* MissionStore.MissionStore;
+    return yield* store.appendEvent({
+      missionId,
+      kind: "editor.updated",
+      actor: { _tag: "system", component: "editor" },
+      provenance: editor,
+      summary,
+      subject: null,
+    });
   });
 
 const wakesFor = (sent: ReadonlyArray<{ threadId: string; key: string }>) =>
@@ -158,6 +173,118 @@ describe("master inbox feed", () => {
       yield* feed.handle(yield* openApproval(approval("10", "master"), agent(masterThread)));
       assert.strictEqual((yield* controlMessages).length, 1);
       assert.deepStrictEqual(wakesFor(h.threads.sent), []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("after downtime the master gets what it missed, once, in one message", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      // The feed's first run starts at the present: nothing before it replays.
+      const first = yield* feedOf("Bottom line: Ship the API tonight.");
+      yield* openApproval(approval("1", "master"));
+      yield* first.backfill;
+      assert.strictEqual((yield* controlMessages).length, 0);
+
+      // Live delivery moves the cursor, so a restart does not repeat it.
+      const live = yield* openApproval(approval("2", "master"));
+      yield* first.handle(live);
+      assert.strictEqual((yield* controlMessages).length, 1);
+
+      // Down: these commits reach no feed.
+      yield* openApproval(approval("3", "master"));
+      yield* openApproval(approval("4", "owner"));
+      yield* editorPass("Bottom line: Hold the API.");
+      yield* editorPass("Bottom line: Ship the API tonight.");
+
+      // Restart: one summary to the master, holding only what it missed.
+      const restarted = yield* feedOf("Bottom line: Ship the API tonight.");
+      yield* restarted.backfill;
+      const messages = yield* controlMessages;
+      assert.strictEqual(messages.length, 2);
+      const missed = messages[1]!;
+      assert.strictEqual(missed.kind, "request");
+      assert.deepStrictEqual(missed.to, [masterRole]);
+      assert.include(missed.summary, "2 item(s)");
+      const rooms = yield* RouterStore.RouterStore;
+      const body = (yield* rooms.messageBody(missed.id)) ?? "";
+      assert.include(body, "acme/api#3");
+      assert.include(body, "Bottom line: Ship the API tonight.");
+      assert.notInclude(body, "acme/api#2");
+      assert.notInclude(body, "acme/api#4");
+      assert.deepStrictEqual(wakesFor(h.threads.sent), [masterThread, masterThread]);
+
+      // Once: another restart with nothing new posts nothing.
+      yield* (yield* feedOf(null)).backfill;
+      assert.strictEqual((yield* controlMessages).length, 2);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a cursor that cannot be written neither stops the feed nor repeats a delivery", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* (yield* feedOf(null)).backfill;
+      const router = yield* MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const rooms = yield* RouterStore.RouterStore;
+      // The cursor table fails, as a crash right after each delivery would leave it.
+      const broken = makeMasterFeed({
+        router,
+        store,
+        rooms: { ...rooms, advanceFeedCursor: () => Effect.die("disk full") },
+        digest: () => Effect.succeed(null),
+      });
+      yield* broken.handle(yield* openApproval(approval("1", "master")));
+      yield* broken.handle(yield* openApproval(approval("2", "master")));
+      assert.strictEqual((yield* controlMessages).length, 2);
+      const wakes = wakesFor(h.threads.sent).length;
+
+      // The restart finds both behind the cursor but already delivered.
+      yield* (yield* feedOf(null)).backfill;
+      assert.strictEqual((yield* controlMessages).length, 2);
+      assert.strictEqual(wakesFor(h.threads.sent).length, wakes);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a backfill that failed replays at the next start, even after live events", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* (yield* feedOf(null)).backfill;
+      // Down: the master misses #3.
+      yield* openApproval(approval("3", "master"));
+
+      // This start's replay fails; a live event still reaches the master.
+      const router = yield* MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const rooms = yield* RouterStore.RouterStore;
+      const flaky = makeMasterFeed({
+        router: {
+          ...router,
+          relay: (request) =>
+            request.input.key?.startsWith("master-inbox:backfill:") === true
+              ? Effect.fail(new MissionError({ code: "conflict", detail: "store busy" }))
+              : router.relay(request),
+        },
+        store,
+        rooms,
+        digest: () => Effect.succeed(null),
+      });
+      yield* flaky.backfill;
+      assert.strictEqual((yield* controlMessages).length, 0);
+      yield* flaky.handle(yield* openApproval(approval("5", "master")));
+      assert.strictEqual((yield* controlMessages).length, 1);
+
+      // The next start replays #3, and only #3.
+      yield* (yield* feedOf(null)).backfill;
+      const messages = yield* controlMessages;
+      assert.strictEqual(messages.length, 2);
+      const body = (yield* rooms.messageBody(messages[1]!.id)) ?? "";
+      assert.include(body, "acme/api#3");
+      assert.notInclude(body, "acme/api#5");
+      yield* (yield* feedOf(null)).backfill;
+      assert.strictEqual((yield* controlMessages).length, 2);
     }).pipe(Effect.provide(h.layer));
   });
 });
