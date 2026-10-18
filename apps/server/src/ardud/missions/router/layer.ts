@@ -9,10 +9,16 @@ import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import { forkParked } from "../../../serverActivation.ts";
 import { TERMINAL_RUN_STATUSES } from "../../control/model.ts";
 import { asksRoomsLayer } from "./adapters.ts";
-import { installSendGuard } from "./guardHook.ts";
+import { installSendGuard, requireSendGuard } from "./guardHook.ts";
 import * as MissionRouter from "./MissionRouter.ts";
 import { threadsLayer } from "./ports.ts";
 import * as RouterStore from "./RouterStore.ts";
+
+// A server that loads the router runs missions, and layers below it (the
+// scheduler, MCP, the control API) can try a send before `RouterLive` is up.
+// Marking the guard required at load makes those sends wait for it and fail
+// closed, instead of passing unchecked.
+requireSendGuard();
 
 /**
  * The router service with its tables and the real thread port. Referenced

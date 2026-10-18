@@ -250,14 +250,16 @@ const make = Effect.gen(function* () {
       return pickMember(candidates);
     });
 
-  /** Direct membership, or `created` when the thread's parent or root is the master or one of its threads. */
+  /**
+   * Direct membership, or `created` when the thread's parent or root is the
+   * master or one of its threads. A thread whose lineage cannot be read fails
+   * the lookup rather than counting as an outsider, so the guard fails closed.
+   */
   const membershipIn = (casts: ReadonlyArray<RouterCast>, threadId: ThreadId) =>
     Effect.gen(function* () {
       const direct = yield* directMembership(casts, threadId);
       if (direct !== null) return direct;
-      const facts = yield* threads
-        .facts(threadId)
-        .pipe(Effect.catchTags({ MissionError: () => Effect.succeed(null) }));
+      const facts = yield* threads.facts(threadId);
       if (facts === null) return null;
       for (const ancestor of [facts.parentThreadId, facts.rootThreadId]) {
         if (ancestor === null || ancestor === threadId) continue;
@@ -287,6 +289,43 @@ const make = Effect.gen(function* () {
 
   const isMaster = (cast: RouterCast, provenance: MissionProvenance) =>
     provenance._tag === "agent" && masterThreadsOf(cast).includes(provenance.threadId);
+
+  /**
+   * Every actor a message, subscription or forward names must belong to the
+   * mission: threads are members, roles and lanes exist in it. Owner, people
+   * and system components have no thread, so nothing reaches past the mission.
+   */
+  const requireInMission = (cast: RouterCast, actors: ReadonlyArray<MissionActor>) =>
+    Effect.forEach(
+      actors,
+      (actor) =>
+        Effect.gen(function* () {
+          switch (actor._tag) {
+            case "thread": {
+              if ((yield* membershipIn([cast], actor.threadId)) === null) {
+                return yield* fail(
+                  "forbidden",
+                  `Thread ${actor.threadId} is not a member of mission ${cast.missionId}.`,
+                );
+              }
+              return;
+            }
+            case "role":
+              if (!cast.roles.some((role) => role.id === actor.roleId)) {
+                return yield* fail("not-found", `No role ${actor.roleId} in ${cast.missionId}.`);
+              }
+              return;
+            case "lane":
+              if (!cast.lanes.some((lane) => lane.id === actor.laneId)) {
+                return yield* fail("not-found", `No lane ${actor.laneId} in ${cast.missionId}.`);
+              }
+              return;
+            default:
+              return;
+          }
+        }),
+      { discard: true },
+    );
 
   // ---------------------------------------------------------------------------
   // Rooms
@@ -395,6 +434,7 @@ const make = Effect.gen(function* () {
           }
         }
         const cast = yield* loadCast(input.missionId);
+        yield* requireInMission(cast, input.to ?? []);
         const item: WorkItem | null =
           input.workItemId === undefined
             ? null
@@ -447,7 +487,7 @@ const make = Effect.gen(function* () {
           isCorrection,
           createdAt: at,
         };
-        const deliveries = deliveryThreads(cast, message, subscriptions, item, provenance);
+        const deliveries = yield* deliveryThreads(cast, message, subscriptions, item, provenance);
         yield* store.commit({
           event: {
             missionId: input.missionId,
@@ -474,6 +514,8 @@ const make = Effect.gen(function* () {
   /**
    * Threads a message wakes. The master's thread wakes only for what is
    * addressed to it or comes from the owner; the author never wakes itself.
+   * Only the mission's own members get a delivery, so a stale subscription
+   * or a thread that has left cannot carry a message out of the mission.
    */
   const deliveryThreads = (
     cast: RouterCast,
@@ -481,22 +523,30 @@ const make = Effect.gen(function* () {
     subscriptions: ReadonlyArray<Subscription>,
     item: WorkItem | null,
     provenance: MissionProvenance,
-  ): ReadonlyArray<ThreadId> => {
-    const targets = wakeTargets(message, { subscriptions, itemWatchers: itemWatchers(cast, item) });
-    const masters = new Set(masterThreadsOf(cast));
-    const fromOwner = message.author._tag === "owner";
-    const authorThread = provenance._tag === "agent" ? provenance.threadId : null;
-    const out = new Set<ThreadId>();
-    for (const actor of targets) {
-      const addressed = message.to.some((each) => sameActor(each, actor));
-      for (const threadId of threadsOfActor(cast, actor)) {
-        if (threadId === authorThread) continue;
-        if (masters.has(threadId) && !fromOwner && !addressed) continue;
-        out.add(threadId);
+  ) =>
+    Effect.gen(function* () {
+      const targets = wakeTargets(message, {
+        subscriptions,
+        itemWatchers: itemWatchers(cast, item),
+      });
+      const masters = new Set(masterThreadsOf(cast));
+      const fromOwner = message.author._tag === "owner";
+      const authorThread = provenance._tag === "agent" ? provenance.threadId : null;
+      const out = new Set<ThreadId>();
+      for (const actor of targets) {
+        const addressed = message.to.some((each) => sameActor(each, actor));
+        for (const threadId of threadsOfActor(cast, actor)) {
+          if (threadId === authorThread || out.has(threadId)) continue;
+          if (masters.has(threadId) && !fromOwner && !addressed) continue;
+          const member = yield* membershipIn([cast], threadId).pipe(
+            Effect.catchTags({ MissionError: () => Effect.succeed(null) }),
+          );
+          if (member === null) continue;
+          out.add(threadId);
+        }
       }
-    }
-    return [...out];
-  };
+      return [...out] as ReadonlyArray<ThreadId>;
+    });
 
   const afterPost = (
     provenance: MissionProvenance,
@@ -645,6 +695,7 @@ const make = Effect.gen(function* () {
           "Agents subscribe only themselves (the master may subscribe anyone).",
         );
       }
+      yield* requireInMission(cast, [input.subscriber]);
       const key = actorKey(input.subscriber);
       const existing = (yield* rooms.subscriptions(room.id)).find(
         (sub) => actorKey(sub.subscriber) === key,
@@ -679,6 +730,18 @@ const make = Effect.gen(function* () {
       const owner = isOwnerProvenance(provenance);
       if (!owner && !isMaster(cast, provenance)) {
         return yield* fail("forbidden", "Only the owner or the mission's master changes members.");
+      }
+      if (!owner && input.member && input.principal._tag === "thread") {
+        // Attaching would let this mission post into the thread, so a master
+        // may not pull in a thread that already belongs to another mission.
+        const others = (yield* liveCasts).filter((each) => each.missionId !== input.missionId);
+        const elsewhere = yield* membershipIn(others, input.principal.threadId);
+        if (elsewhere !== null) {
+          return yield* fail(
+            "forbidden",
+            `Thread ${input.principal.threadId} belongs to mission ${elsewhere.missionId}; only the owner can attach it here.`,
+          );
+        }
       }
       const principal =
         input.principal._tag === "thread"
@@ -744,12 +807,23 @@ const make = Effect.gen(function* () {
         if (forwardedTo === null) {
           return yield* fail("invalid", "Say who to forward this knock to.");
         }
+        // A knock is forwarded inside its own mission only: the internal send
+        // below skips the guard, so it must never reach another mission's thread.
+        yield* requireInMission(cast, [forwardedTo]);
         const targets = threadsOfActor(cast, forwardedTo);
         if (targets.length === 0) {
           return yield* fail(
             "invalid",
             `${labelOf(cast, forwardedTo)} has no thread to receive it.`,
           );
+        }
+        for (const threadId of targets) {
+          if ((yield* membershipIn([cast], threadId)) === null) {
+            return yield* fail(
+              "forbidden",
+              `Thread ${threadId} is not a member of mission ${cast.missionId}.`,
+            );
+          }
         }
         yield* Effect.forEach(
           targets,

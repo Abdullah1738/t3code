@@ -23,6 +23,7 @@ import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { ThreadToolkit } from "./tools.ts";
 // ardud missions: router
+import { answerText } from "../../../ardud/missions/router/answers.ts";
 import { guardMcpWrite } from "../../../ardud/missions/router/guardPaths.ts";
 
 function queueEntry(
@@ -248,12 +249,12 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   ),
   t3_pending_request_respond: writesThread((input) =>
     Effect.gen(function* () {
-      const { threads, projection } = yield* readQuestion(input);
+      const { threads, projection, item } = yield* readQuestion(input);
       // ardud missions: router
       yield* guardThreadWrite({
         path: "request-respond",
         threadId: projection.thread.id,
-        text: `Answer to request ${input.requestId} (${Object.keys(input.answers).join(", ")}).`,
+        text: answerText({ ...input, questions: item.questions }),
       });
       const result = yield* threads
         .dispatch({

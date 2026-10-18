@@ -1,4 +1,4 @@
-import type { ThreadId } from "@t3tools/contracts";
+import { MissionError, type ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -22,24 +22,30 @@ export const fakeRouterThreads = () => {
   const sent: Sent[] = [];
   const activity = new Map<ThreadId, ThreadActivity>();
   const parents = new Map<ThreadId, ThreadId>();
+  /** Threads whose facts cannot be read (the thread store fails for them). */
+  const unreadable = new Set<ThreadId>();
   const layer = Layer.succeed(
     RouterThreads,
     RouterThreads.of({
       facts: (threadId) =>
-        Effect.sync(() => ({
-          threadId,
-          title: threadId,
-          activity: activity.get(threadId) ?? "idle",
-          parentThreadId: parents.get(threadId) ?? null,
-          rootThreadId: parents.get(threadId) ?? null,
-        })),
+        unreadable.has(threadId)
+          ? Effect.fail(
+              new MissionError({ code: "conflict", detail: `Cannot read thread ${threadId}.` }),
+            )
+          : Effect.sync(() => ({
+              threadId,
+              title: threadId,
+              activity: activity.get(threadId) ?? "idle",
+              parentThreadId: parents.get(threadId) ?? null,
+              rootThreadId: parents.get(threadId) ?? null,
+            })),
       send: (input) =>
         Effect.sync(() => {
           sent.push(input);
         }),
     }),
   );
-  return { sent, activity, parents, layer };
+  return { sent, activity, parents, unreadable, layer };
 };
 
 /** The router over its tables and the fake threads; needs MissionStore and SQL. */

@@ -1,5 +1,6 @@
 import {
   KnockId,
+  MissionId,
   RoleId,
   RoomId,
   ThreadId,
@@ -14,16 +15,20 @@ import * as Option from "effect/Option";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import {
   agent,
+  binding,
   failureCode,
   laneThread,
   masterThread,
+  mission,
   missionId,
   ownerApp,
+  role,
   seed,
   strayThread,
   writerThread,
 } from "../asks/AsksService.testkit.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import { answerText } from "./answers.ts";
 import type { SendGuardRequest } from "./guardHook.ts";
 import * as MissionRouter from "./MissionRouter.ts";
 import type { SendSender } from "./model.ts";
@@ -212,6 +217,150 @@ describe("send guard", () => {
         guardRequest(fromThread(laneThread), ThreadId.make("t-elsewhere")),
       );
       assert.deepStrictEqual(outcome, { _tag: "pass" });
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
+/** A second live mission whose master is `t-other-master`. */
+const otherMission = MissionId.make("m-2");
+const otherMaster = ThreadId.make("t-other-master");
+const seedOther = Effect.gen(function* () {
+  const store = yield* MissionStore.MissionStore;
+  yield* store.commit({
+    event: {
+      missionId: otherMission,
+      kind: "mission.created",
+      actor: { _tag: "system", component: "test" },
+      provenance: { _tag: "system", component: "test" },
+      summary: "seed",
+      subject: null,
+    },
+    upserts: [
+      {
+        _tag: "mission",
+        record: {
+          ...mission,
+          id: otherMission,
+          slug: "m-2",
+          masterRoleId: RoleId.make("m2-master"),
+        },
+      },
+      { _tag: "role", record: { ...role("m2-master", "master"), missionId: otherMission } },
+      { _tag: "role-binding", record: binding("b-m2-master", "m2-master", otherMaster) },
+    ],
+  });
+});
+
+describe("mission boundaries", () => {
+  it.effect("posts cannot address or deliver to a thread outside the mission", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const router = yield* MissionRouter.MissionRouter;
+      for (const provenance of [agent(masterThread), ownerApp]) {
+        const code = yield* failureCode(
+          router.post(
+            request("hello neighbour", { to: [{ _tag: "thread", threadId: otherMaster }] }),
+            provenance,
+          ),
+        );
+        assert.strictEqual(code, "forbidden");
+      }
+      const ghostRole = yield* failureCode(
+        router.post(
+          request("hello role", { to: [{ _tag: "role", roleId: RoleId.make("m2-master") }] }),
+          agent(masterThread),
+        ),
+      );
+      assert.strictEqual(ghostRole, "not-found");
+      assert.deepStrictEqual(
+        h.sent.filter((each) => each.threadId === otherMaster),
+        [],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the master cannot subscribe a foreign thread to wake it with room traffic", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const router = yield* MissionRouter.MissionRouter;
+      const code = yield* failureCode(
+        router.subscribe(
+          {
+            roomId: control,
+            subscriber: { _tag: "thread", threadId: otherMaster },
+            mode: "wake",
+          },
+          agent(masterThread),
+        ),
+      );
+      assert.strictEqual(code, "forbidden");
+      yield* router.post({ ...request("broadcast"), kind: "control" }, agent(masterThread));
+      assert.deepStrictEqual(
+        h.sent.filter((each) => each.threadId === otherMaster),
+        [],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("knocks are only forwarded to threads of the knock's mission", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const router = yield* MissionRouter.MissionRouter;
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), laneThread));
+      if (outcome._tag !== "knocked") return assert.fail("expected a knock");
+      for (const provenance of [agent(masterThread), ownerApp]) {
+        const code = yield* failureCode(
+          router.decideKnock(
+            {
+              knockId: outcome.knockId,
+              action: "forward",
+              forwardTo: { _tag: "thread", threadId: otherMaster },
+            },
+            provenance,
+          ),
+        );
+        assert.strictEqual(code, "forbidden");
+      }
+      assert.deepStrictEqual(h.sent, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("only the owner attaches another mission's thread", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const router = yield* MissionRouter.MissionRouter;
+      const attach = (provenance: MissionProvenance) =>
+        router.setMember(
+          { missionId, principal: { _tag: "thread", threadId: otherMaster }, member: true },
+          provenance,
+        );
+      assert.strictEqual(yield* failureCode(attach(agent(masterThread))), "forbidden");
+      // The master manages its own mission's registrations.
+      yield* router.setMember(
+        { missionId, principal: { _tag: "thread", threadId: strayThread }, member: true },
+        agent(masterThread),
+      );
+      yield* attach(ownerApp);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("an unreadable target thread fails the guard instead of passing", () => {
+    const h = harness();
+    const unknown = ThreadId.make("t-unreadable");
+    h.unreadable.add(unknown);
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const code = yield* failureCode(router.guard(guardRequest(fromThread(strayThread), unknown)));
+      assert.strictEqual(code, "conflict");
     }).pipe(Effect.provide(h.layer));
   });
 });
@@ -439,6 +588,43 @@ describe("rooms", () => {
       const clash = yield* failureCode(router.post(request("twice", { key: "k-1" }), ownerApp));
       assert.strictEqual(clash, "conflict");
       assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a routed answer keeps the submitted values, and so does a knock", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const text = answerText({
+        requestId: "req-1",
+        questions: [
+          {
+            id: "env",
+            header: "Environment",
+            question: "Where should it deploy?",
+            options: [{ label: "dev", description: "" }],
+          },
+        ],
+        answers: { env: "dev", confirm: true },
+      });
+      const answer = (from: SendSender, key: string): SendGuardRequest => ({
+        path: "request-respond",
+        targetThreadId: masterThread,
+        from,
+        text,
+        requestKey: key,
+      });
+      const routed = yield* router.guard(answer(fromThread(laneThread), "answer:1"));
+      if (routed._tag !== "routed") return assert.fail("expected a routed answer");
+      const body = yield* router.messageBody({ messageId: routed.messageId }, ownerApp);
+      assert.include(body.body, "Environment (Where should it deploy?): dev");
+      assert.include(body.body, "confirm: true");
+      const knocked = yield* router.guard(answer(fromThread(strayThread), "answer:2"));
+      if (knocked._tag !== "knocked") return assert.fail("expected a knock");
+      const knock = Option.getOrThrow(yield* store.get("knock", knocked.knockId));
+      assert.strictEqual(knock.body, text);
     }).pipe(Effect.provide(h.layer));
   });
 

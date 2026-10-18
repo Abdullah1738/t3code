@@ -135,7 +135,7 @@ const projectionFor = (threadId: ThreadId) =>
         ...idleThreadProjection(liveThreadShell(threadId)),
         messages: [{ attachments: [storedFile] }],
         runtimeRequests: [{ id: pendingRequest, kind: "user_input", status: "pending" }],
-        turnItems: [{ type: "user_input_request", requestId: pendingRequest }],
+        turnItems: [{ type: "user_input_request", requestId: pendingRequest, questions: [] }],
       }) as unknown as OrchestrationV2ThreadProjection;
 
 /** Thread management that records anything that would reach a thread. */
