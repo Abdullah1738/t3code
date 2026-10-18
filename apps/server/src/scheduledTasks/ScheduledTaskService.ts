@@ -65,7 +65,8 @@ import { authorityStore } from "../ardud/missions/guard/authority.ts";
 import {
   authorizeScheduleChange,
   guardScheduleRun,
-  recordScheduleAuthority,
+  scheduleAuthorityChange,
+  withScheduleAuthority,
 } from "../ardud/missions/guard/schedules.ts";
 
 /** Path prefix of the environment route that receives webhook requests. */
@@ -1194,13 +1195,19 @@ export const layer = Layer.effect(
           lastRunError: existingTask?.lastRunError ?? null,
           runCount: existingTask?.runCount ?? 0,
         };
-        yield* saveTask(task, input.requireExisting === true, webhook);
-        // ardud missions: guard
-        yield* recordScheduleAuthority(guardAuthority, {
+        // ardud missions: guard - the task and the authority it runs under land together.
+        yield* withScheduleAuthority({
+          sql,
+          store: guardAuthority,
           taskId: id,
-          principal,
-          previousThreadId: existingTask?.threadId ?? null,
-          threadId: task.threadId,
+          authority: yield* scheduleAuthorityChange(guardAuthority, {
+            taskId: id,
+            principal,
+            created: existingTask === null,
+            previousThreadId: existingTask?.threadId ?? null,
+            threadId: task.threadId,
+          }),
+          write: saveTask(task, input.requireExisting === true, webhook),
         });
         yield* notifyChanged;
         return { task: (yield* findTask(id)) ?? task };
@@ -1224,7 +1231,7 @@ export const layer = Layer.effect(
         const next = nextRunAt({ enabled: input.enabled, schedule: existing.schedule }, now);
         // RETURNING so a task deleted between the load and this UPDATE is a
         // visible not-found error, not a false success.
-        const updated = yield* sql<{ task_id: string }>`
+        const update = sql<{ task_id: string }>`
           UPDATE scheduled_tasks
           SET enabled = ${input.enabled ? 1 : 0},
               next_run_at = ${next},
@@ -1235,14 +1242,20 @@ export const layer = Layer.effect(
           Effect.mapError((cause) =>
             taskError("Could not update schedule task.", { taskId: input.id, cause }),
           ),
+          Effect.flatMap((updated) =>
+            updated.length === 0
+              ? Effect.fail(taskError("Schedule task not found.", { taskId: input.id }))
+              : Effect.void,
+          ),
         );
-        if (updated.length === 0) {
-          return yield* taskError("Schedule task not found.", { taskId: input.id });
-        }
-        // ardud missions: guard
-        if (input.enabled && principal !== undefined) {
-          yield* guardAuthority.record("scheduled-task", input.id, principal);
-        }
+        // ardud missions: guard - whoever resumes it is who its runs speak as.
+        yield* withScheduleAuthority({
+          sql,
+          store: guardAuthority,
+          taskId: input.id,
+          authority: input.enabled ? principal : undefined,
+          write: update,
+        });
         yield* notifyChanged;
         return {
           task: { ...existing, enabled: input.enabled, nextRunAt: next, updatedAt: iso(now) },
@@ -1263,8 +1276,15 @@ export const layer = Layer.effect(
                 }),
               ),
         ),
-        Effect.andThen(deleteRow(input.id)),
-        Effect.tap(() => guardAuthority.forget("scheduled-task", input.id)),
+        Effect.andThen(
+          withScheduleAuthority({
+            sql,
+            store: guardAuthority,
+            taskId: input.id,
+            authority: null,
+            write: deleteRow(input.id),
+          }),
+        ),
         Effect.andThen(
           Effect.all([
             Ref.update(webhookRateWindows, (windows) => {

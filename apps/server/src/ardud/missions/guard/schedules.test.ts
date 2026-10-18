@@ -229,7 +229,7 @@ describe("schedules bound to mission members (H7)", () => {
   );
 });
 
-describe("schedule responses (N6)", () => {
+describe("schedule responses and authority durability (N6)", () => {
   const cliConnection = {
     surface: "cli" as const,
     session: { sessionId: "session-cli", subject: "cli-issued-session" },
@@ -282,6 +282,97 @@ describe("schedule responses (N6)", () => {
           sql,
         }).visibleWebhook(raw);
         assert.isDefined(ownerView.task.webhook);
+      }),
+    ),
+  );
+
+  /** Makes every write to the authority table fail. */
+  const breakAuthorityWrites = (sql: SqlClient.SqlClient) =>
+    Effect.gen(function* () {
+      yield* authorityStore(sql).read("scheduled-task", "warm-up");
+      for (const event of ["INSERT", "UPDATE", "DELETE"]) {
+        yield* sql.unsafe(
+          `CREATE TRIGGER fail_authority_${event.toLowerCase()} BEFORE ${event} ON ardud_mission_guard_authority BEGIN SELECT RAISE(ABORT, 'injected authority failure'); END`,
+        );
+      }
+    });
+
+  it.effect("a failed authority write never leaves an edit under the old authority", () =>
+    run(({ service, store, sql, seen }) =>
+      Effect.gen(function* () {
+        const id = ScheduledTaskId.make("scheduled-task:check");
+        yield* service.upsert(yield* taskInput()).pipe(as(owner));
+        yield* breakAuthorityWrites(sql);
+        // The master edits its own schedule: it passes, and would become the authority.
+        const error = yield* service
+          .upsert(yield* taskInput({ prompt: "Ship the release now." }))
+          .pipe(as(asThread(master)), Effect.flip);
+        assert.equal(error._tag, "ScheduledTaskError");
+        assert.isFalse(refusedByGuard(error));
+        const { tasks } = yield* service.list();
+        assert.equal(tasks[0]?.prompt, "Check in on the release.");
+        assert.deepStrictEqual(yield* store.read("scheduled-task", id), owner);
+        // A run still speaks with the authority the saved content was made under.
+        yield* service.runNow({ id });
+        assert.deepStrictEqual(seen.at(-1)?.from, {
+          _tag: "schedule",
+          scheduledTaskId: id,
+          title: "Release check",
+          creator: { _tag: "owner" },
+        });
+        assert.equal(seen.at(-1)?.text, "Check in on the release.");
+      }),
+    ),
+  );
+
+  it.effect("a failed authority write on create leaves no task behind", () =>
+    run(({ service, sql }) =>
+      Effect.gen(function* () {
+        yield* breakAuthorityWrites(sql);
+        const error = yield* service
+          .upsert(yield* taskInput())
+          .pipe(as(asThread(master)), Effect.flip);
+        assert.equal(error._tag, "ScheduledTaskError");
+        assert.equal((yield* service.list()).tasks.length, 0);
+      }),
+    ),
+  );
+
+  it.effect("a failed authority write on resume leaves the task paused", () =>
+    run(({ service, store, sql }) =>
+      Effect.gen(function* () {
+        const id = ScheduledTaskId.make("scheduled-task:check");
+        yield* service.upsert(yield* taskInput({ enabled: false })).pipe(as(owner));
+        yield* breakAuthorityWrites(sql);
+        const error = yield* service
+          .setEnabled({ id, enabled: true })
+          .pipe(as(asThread(master)), Effect.flip);
+        assert.equal(error._tag, "ScheduledTaskError");
+        assert.isFalse((yield* service.list()).tasks[0]?.enabled ?? true);
+        assert.deepStrictEqual(yield* store.read("scheduled-task", id), owner);
+      }),
+    ),
+  );
+
+  it.effect("a task made in-process never inherits a stale authority row", () =>
+    run(({ service, store }) =>
+      Effect.gen(function* () {
+        const id = ScheduledTaskId.make("scheduled-task:check");
+        // A row left behind by an earlier task under the same id.
+        yield* store.record("scheduled-task", id, owner);
+        yield* service.upsert(yield* taskInput());
+        assert.isNull(yield* store.read("scheduled-task", id));
+      }),
+    ),
+  );
+
+  it.effect("deleting a task clears its authority with it", () =>
+    run(({ service, store }) =>
+      Effect.gen(function* () {
+        const id = ScheduledTaskId.make("scheduled-task:check");
+        yield* service.upsert(yield* taskInput()).pipe(as(owner));
+        yield* service.delete({ id }).pipe(as(owner));
+        assert.isNull(yield* store.read("scheduled-task", id));
       }),
     ),
   );
