@@ -205,7 +205,7 @@ describe("pools and recovery view model", () => {
     expect(view.causeLabel).toBe("Server restart");
     expect(view.progressLine).toBe("9 threads: 4 resumed, 5 decided, 0 waiting");
     expect(view.settled[0]).toMatchObject({ name: "cell-tc2", childrenLine: "4 children lost" });
-    expect(recoveryBanner(incident, () => "15:41")).toBeNull();
+    expect(recoveryBanner(null)).toBeNull();
 
     const open: RecoveryIncident = {
       ...incident,
@@ -214,9 +214,30 @@ describe("pools and recovery view model", () => {
         index < 2 ? { ...member, state: "pending", settledAt: null } : member,
       ),
     };
-    expect(recoveryBanner(open, () => "15:41")).toBe(
-      "Recovered from restart at 15:41: 2 threads still to resume or decide",
+    expect(
+      recoveryBanner({
+        incidentId: open.id,
+        cause: open.cause,
+        at: open.detectedAt,
+        label: "Recovered from restart at 15:41",
+        total: 9,
+        pending: 2,
+        reconcile: 1,
+      }),
+    ).toBe(
+      "Recovered from restart at 15:41: 2 of 9 threads still to resume or decide, 1 to reconcile first",
     );
+    expect(
+      recoveryBanner({
+        incidentId: open.id,
+        cause: open.cause,
+        at: open.detectedAt,
+        label: "Recovered from restart at 15:41",
+        total: 9,
+        pending: 0,
+        reconcile: 0,
+      }),
+    ).toBeNull();
     expect(recoveryView(open).pending.map((row) => row.name)).toEqual(["cell-tc2", "cell-md"]);
     incidents.close();
   });

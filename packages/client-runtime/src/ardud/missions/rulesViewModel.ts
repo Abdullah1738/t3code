@@ -1,6 +1,7 @@
 import type {
   Lane,
   MissionId,
+  ResolveRuleChangeInput,
   Rule,
   RuleChangeRequest,
   RuleChangeRequestId,
@@ -11,12 +12,7 @@ import type {
 } from "@t3tools/contracts";
 
 import { changeIndex, lastChangedLine } from "./changeLog.ts";
-import type {
-  FieldChange,
-  MissionRuleBook,
-  ResolveRuleChangeInput,
-  RuleAuditFinding,
-} from "./source.ts";
+import type { FieldChange, MissionRuleBook, RuleAuditFinding } from "./source.ts";
 import { actorLabel } from "./viewModel.ts";
 
 // Rules tab: each rule with the owner's quote, the master's reading, scope,
@@ -257,7 +253,11 @@ export function resolveRuleChangeInput(
 ): Result<ResolveRuleChangeInput> {
   const trimmed = response.trim();
   if (action === "decline" && !trimmed) return err("Say why the change is declined.");
-  return ok({ changeRequestId, action, response: trimmed });
+  return ok({
+    requestId: changeRequestId,
+    status: action === "apply" ? "applied" : "declined",
+    response: trimmed,
+  });
 }
 
 /** Lanes a scope can name, for the scope picker. Retired lanes are left out. */

@@ -1,4 +1,6 @@
 import type {
+  ApprovalRouteMatch,
+  Approver,
   CriticalityTrigger,
   Lane,
   MissionId,
@@ -17,21 +19,19 @@ import {
   moveLaneInput,
   newRuleInput,
   nudgeLaneInput,
+  flipRouteInput,
   removeRouteInput,
   reorderPortfolioInput,
+  rerouteRecordInput,
   resolveRuleChangeInput,
-  setApprovalRouteInput,
   setCriticalityGuideInput,
-  setDraftRouteInput,
   setLaneParkedInput,
+  setRouteInput,
   setPoolCapacityInput,
   setRoleModelInput,
   setRuleStatusInput,
   splitLaneInput,
-  type ApprovalRouteMatch,
   type ApprovalRoutingTable,
-  type Approver,
-  type DraftRouteMatch,
   type RerouteRecordInput,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -171,35 +171,32 @@ export function setPoolCapacity(poolId: PoolId, capacity: string, reason: string
 let nextRouteId = 0;
 const newRouteId = () => `route-${Date.now().toString(36)}-${nextRouteId++}`;
 
-export function setDraftRoute(
-  table: ApprovalRoutingTable,
-  match: DraftRouteMatch,
-  approver: Approver,
-) {
-  return submitMissionInput(
-    setDraftRouteInput(table, match, approver, newRouteId),
-    (input) => missionsSource.setApprovalRouting(input),
-    "Couldn't change the routing",
-  );
-}
-
-export function setApprovalRoute(
+/** Sets who one match goes to: changes the row that matches it or adds one. */
+export function setRoute(
   table: ApprovalRoutingTable,
   match: ApprovalRouteMatch,
   approver: Approver,
 ) {
   return submitMissionInput(
-    setApprovalRouteInput(table, match, approver, newRouteId),
+    setRouteInput(table, match, approver, newRouteId),
     (input) => missionsSource.setApprovalRouting(input),
     "Couldn't change the routing",
   );
 }
 
-export function removeRoute(table: ApprovalRoutingTable, ruleId: string) {
+export function flipRoute(table: ApprovalRoutingTable, routeId: string) {
   return submitMissionInput(
-    removeRouteInput(table, ruleId),
+    flipRouteInput(table, routeId),
     (input) => missionsSource.setApprovalRouting(input),
-    "Couldn't remove the rule",
+    "Couldn't change the routing",
+  );
+}
+
+export function removeRoute(table: ApprovalRoutingTable, routeId: string) {
+  return submitMissionInput(
+    removeRouteInput(table, routeId),
+    (input) => missionsSource.setApprovalRouting(input),
+    "Couldn't remove the row",
   );
 }
 
@@ -218,15 +215,12 @@ export function movePortfolioMission(
 /** Moves one pending draft or approval to the other inbox. Needs a reason; it is logged. */
 export function rerouteRecord(
   kind: RerouteRecordInput["kind"],
-  id: string,
+  record: { readonly id: string; readonly approver?: Approver | undefined },
   approver: Approver,
   reason: string,
 ) {
-  const trimmed = reason.trim();
   return submitMissionInput(
-    trimmed
-      ? { ok: true as const, value: { kind, id, approver, reason: trimmed } }
-      : { ok: false as const, error: "Say why it should move." },
+    rerouteRecordInput(kind, record, approver, reason),
     (input) => missionsSource.rerouteRecord(input),
     "Couldn't move it",
   );

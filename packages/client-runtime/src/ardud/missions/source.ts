@@ -1,62 +1,64 @@
 import type {
+  AckNoteInput,
   AnswerAskInput,
-  Approval,
-  Ask,
-  CallId,
+  Approver,
   CriticalityVerdict,
-  DraftChannel,
-  LaneId,
-  MissionActor,
-  MissionEvent,
-  MissionEventId,
-  MissionEventKind,
-  MissionTier,
-  Pool,
-  PoolHold,
-  PoolHoldId,
-  PoolId,
-  ReviewPolicy,
-  ReviewRecord,
-  Role,
-  RoleBinding,
-  RoleId,
-  RuleChangeRequest,
-  RuleChangeRequestId,
-  RuleId,
-  SetCriticalityGuideInput,
-  SetRoleModelInput,
-  WorkItem,
   DecideApprovalInput,
   DecideDraftInput,
   DecideKnockInput,
   DecideSuggestionInput,
-  Draft,
   DraftNote,
-  DraftNoteId,
   DraftNoteScope,
   ForkId,
-  Knock,
   Lane,
+  LaneId,
+  MarkMissionSeenInput,
   MarkReadInput,
+  MergeLanesInput,
+  MissionActor,
+  MissionEvent,
+  MissionEventId,
+  MissionEventKind,
   MissionFork,
   MissionId,
   MissionInbox,
+  MissionInboxHistory,
   MissionLink,
   MissionListSnapshot,
   MissionMessage,
   MissionOverview,
   MissionRecordRef,
-  NoteId,
+  MissionRoutingTable,
+  MissionTier,
+  PoolHoldId,
+  PoolId,
+  PoolsSnapshot,
   PostMessageInput,
+  ReactToCallInput,
   ReorderSubMissionsInput,
+  ResolveRuleChangeInput,
+  ReviewPolicy,
+  ReviewRecord,
+  RoleId,
+  RolesSnapshot,
   Room,
   RoomId,
   RoomPage,
   Rule,
+  RuleChangeRequest,
+  RuleId,
+  SetApprovalRoutingInput,
+  SetCriticalityGuideInput,
+  SetDraftNoteActiveInput,
+  SetMissionFocusInput,
+  SetPoolCapacityInput as ContractSetPoolCapacityInput,
+  SetRoleModelInput,
+  SplitLaneInput,
   SubMissionId,
   Suggestion,
   SuggestionStats,
   UpsertRuleInput,
+  WorkItem,
 } from "@t3tools/contracts";
 
 export type Unsubscribe = () => void;
@@ -69,27 +71,6 @@ export type Listener<T> = (value: T) => void;
 export interface SetMissionPausedInput {
   readonly missionId: MissionId;
   readonly paused: boolean;
-}
-
-/**
- * Focus mode: only `subMissionId` admits new work; everything below it parks at
- * safe points. Focus has no end time and no trigger: it stays on until the
- * owner or the master sets `null` ("End focus").
- */
-export interface SetMissionFocusInput {
-  readonly missionId: MissionId;
-  readonly subMissionId: SubMissionId | null;
-}
-
-/** Owner reaction to a direction-check call: "ok" accepts, "discuss" forks the master. */
-export interface ReactToCallInput {
-  readonly missionId: MissionId;
-  readonly callId: CallId;
-  readonly reaction: "ok" | "discuss";
-}
-
-export interface MarkMissionSeenInput {
-  readonly missionId: MissionId;
 }
 
 export interface MissionRoomEntry {
@@ -150,96 +131,36 @@ export interface FieldChange {
   readonly at: string;
 }
 
-/** The overview plus the per-pool usage line and who last changed what. */
+/**
+ * The overview plus the per-pool usage line and who last changed what. The
+ * contract's `recovery` carries the open restart incident, if any.
+ */
 export interface MissionOverviewSnapshot extends MissionOverview {
   readonly poolUsage: ReadonlyArray<MissionPoolUsage>;
   /** Latest change per field of the mission and its sub-missions. */
   readonly changes: ReadonlyArray<FieldChange>;
-  /**
-   * An open restart incident, until every affected thread resumed or was decided.
-   * UI-side shape; named apart from the contract's `recovery` until ui-web r4
-   * switches to MissionRecoveryState.
-   */
-  readonly recoveryIncident: RecoveryIncident | null;
 }
 
 // --- Approval routing ------------------------------------------------------
 
-/** Whose inbox a draft, approval or suggestion lands in. */
-export type Approver = "owner" | "master";
-
-export type DraftRouteMatch =
-  | { readonly _tag: "channel"; readonly channel: DraftChannel }
-  | { readonly _tag: "person"; readonly name: string };
-
-export type ApprovalRouteMatch =
-  | { readonly _tag: "kind"; readonly kind: Approval["kind"] }
-  | { readonly _tag: "repo"; readonly repository: string };
-
-export interface RouteRule<Match> {
-  readonly id: string;
-  readonly match: Match;
-  readonly approver: Approver;
-}
-
 /**
- * Mission routing table. The owner and the master edit it the same way; each
- * edit is a timeline event. It picks the approver when a record is created
- * (person beats channel for drafts, repo beats kind for approvals); anything
- * no rule matches goes to the owner. Editing the table never moves records
- * that already exist.
+ * The contract routing table plus who last changed each row. The first
+ * matching row wins and no match goes to the owner; editing the table never
+ * moves records that already exist. `changes` uses the mission as the ref and
+ * the row id as the field (`rules` is the table as a whole).
  */
-export interface ApprovalRoutingTable {
-  readonly missionId: MissionId;
-  readonly version: number;
-  readonly draftRules: ReadonlyArray<RouteRule<DraftRouteMatch>>;
-  readonly approvalRules: ReadonlyArray<RouteRule<ApprovalRouteMatch>>;
-  readonly updatedAt: string;
-  /**
-   * Latest change per rule: the ref is the mission and the field is the rule
-   * id; field `rules` is the table as a whole.
-   */
+export interface ApprovalRoutingTable extends MissionRoutingTable {
   readonly changes: ReadonlyArray<FieldChange>;
 }
 
-/** Why a record went to its approver. */
-export type RouteReason =
-  | { readonly _tag: "rule"; readonly ruleId: string; readonly label: string }
-  | { readonly _tag: "fallback" }
-  | {
-      readonly _tag: "rerouted";
-      readonly from: Approver;
-      readonly by: MissionActor;
-      readonly reason: string;
-      readonly at: string;
-    };
-
-export interface Routed {
-  readonly approver: Approver;
-  readonly route: RouteReason;
-}
-
-export type RoutedDraft = Draft & Routed;
-export type RoutedApproval = Approval & Routed;
-
 /**
  * The inbox with every pending draft and approval, whichever inbox it is
- * routed to. `counts` count only what is routed to the owner (asks, knocks
- * and FYI notes are always the owner's); `masterCounts` count what waits on
- * the master. The owner can read and decide either.
+ * routed to (`approverOf` on each record). `counts` count only what is routed
+ * to the owner (asks, knocks and FYI notes are always the owner's);
+ * `masterCounts` count what waits on the master. The owner can decide either.
  */
-export interface MissionInboxSnapshot extends Omit<MissionInbox, "drafts" | "approvals"> {
-  readonly drafts: ReadonlyArray<RoutedDraft>;
-  readonly approvals: ReadonlyArray<RoutedApproval>;
+export interface MissionInboxSnapshot extends MissionInbox {
   readonly masterCounts: { readonly approve: number; readonly suggestions: number };
-}
-
-export interface SetApprovalRoutingInput {
-  readonly missionId: MissionId;
-  /** The table version the edit was made against; a stale edit is a conflict. */
-  readonly expectedVersion: number;
-  readonly draftRules: ReadonlyArray<RouteRule<DraftRouteMatch>>;
-  readonly approvalRules: ReadonlyArray<RouteRule<ApprovalRouteMatch>>;
 }
 
 /** Moves one pending draft or approval to the other inbox. Logged with the reason. */
@@ -290,27 +211,16 @@ export interface HandOffLaneInput {
 }
 
 export interface SetLaneParkedInput {
+  readonly missionId: MissionId;
   readonly laneId: LaneId;
   readonly parked: boolean;
   readonly reason?: string;
 }
 
 export interface MoveLaneInput {
+  readonly missionId: MissionId;
   readonly laneId: LaneId;
   readonly subMissionId: SubMissionId;
-}
-
-export interface SplitLaneInput {
-  readonly laneId: LaneId;
-  /** Name of the new lane; it starts idle in the same sub-mission. */
-  readonly name: string;
-  readonly purpose: string;
-}
-
-/** Retires `laneId` into `intoLaneId`; its work items move along. */
-export interface MergeLanesInput {
-  readonly laneId: LaneId;
-  readonly intoLaneId: LaneId;
 }
 
 export interface MissionWorkSnapshot {
@@ -341,27 +251,10 @@ export interface MissionRuleBook {
   readonly changes: ReadonlyArray<FieldChange>;
 }
 
-export interface ResolveRuleChangeInput {
-  readonly changeRequestId: RuleChangeRequestId;
-  readonly action: "apply" | "decline";
-  readonly response: string;
-}
-
 // --- Roles, review policy, pools, recovery --------------------------------
 
-/** Mirrors the policy track's `RolesSnapshot`, plus attribution. */
-export interface MissionRolesSnapshot {
-  readonly missionId: MissionId;
-  readonly roles: ReadonlyArray<Role>;
-  /** Newest first. */
-  readonly bindings: ReadonlyArray<RoleBinding>;
-  readonly drift: ReadonlyArray<{
-    readonly roleId: RoleId;
-    readonly bindingId: string;
-    readonly threadId: string;
-    readonly expected: string;
-    readonly observed: string;
-  }>;
+/** The policy track's `RolesSnapshot`, plus attribution. */
+export interface MissionRolesSnapshot extends RolesSnapshot {
   /** Latest change per role field (`modelSelection`, `writesPublicText`). */
   readonly changes: ReadonlyArray<FieldChange>;
 }
@@ -376,26 +269,14 @@ export interface MissionReviewSnapshot {
   readonly changes: ReadonlyArray<FieldChange>;
 }
 
-/** Mirrors the policy track's `PoolView`. */
-export interface MissionPoolView {
-  readonly pool: Pool;
-  /** Active and reconcile-required holds, then the queue in admission order. */
-  readonly holds: ReadonlyArray<PoolHold>;
-  readonly inUse: number;
-  readonly pressure: "ok" | "tight" | "exhausted";
-  readonly pressureReason: string;
-}
-
-export interface MissionPoolsSnapshot {
-  readonly pools: ReadonlyArray<MissionPoolView>;
-  readonly at: string;
+/** The policy track's `PoolsSnapshot`, plus attribution. */
+export interface MissionPoolsSnapshot extends PoolsSnapshot {
   /** Latest change per pool field (`capacity`, `enforcement`, `priority`). */
   readonly changes: ReadonlyArray<FieldChange>;
 }
 
-export interface SetPoolCapacityInput {
-  readonly poolId: PoolId;
-  readonly capacity: number;
+/** The contract input plus the reason the screen asks for; the policy RPC has no reason field yet. */
+export interface SetPoolCapacityInput extends ContractSetPoolCapacityInput {
   readonly reason: string;
 }
 
@@ -485,6 +366,7 @@ export interface SetPortfolioOrderInput {
  * last (see `FieldChange`). `null` clears the share.
  */
 export interface SetIntendedEffortInput {
+  readonly missionId: MissionId;
   readonly subMissionId: SubMissionId;
   readonly share: number | null;
 }
@@ -520,27 +402,6 @@ export interface AddDraftNoteInput {
   readonly missionId: MissionId | null;
   readonly scope: DraftNoteScope;
   readonly text: string;
-}
-
-export interface SetDraftNoteActiveInput {
-  readonly draftNoteId: DraftNoteId;
-  readonly active: boolean;
-}
-
-export interface AckNoteInput {
-  readonly noteId: NoteId;
-}
-
-/**
- * Owner items decided recently, newest first, so the inbox can show what just
- * happened: the edit diff on an approved draft, approvals that closed as stale.
- */
-export interface MissionInboxHistory {
-  readonly asks: ReadonlyArray<Ask>;
-  readonly drafts: ReadonlyArray<Draft>;
-  readonly approvals: ReadonlyArray<Approval>;
-  readonly knocks: ReadonlyArray<Knock>;
-  readonly suggestions: ReadonlyArray<Suggestion>;
 }
 
 export interface LoadRoomPageInput {
@@ -665,7 +526,7 @@ export interface MissionsSource {
   handOffLane(input: HandOffLaneInput): Promise<void>;
   setLaneParked(input: SetLaneParkedInput): Promise<void>;
   moveLane(input: MoveLaneInput): Promise<void>;
-  splitLane(input: SplitLaneInput): Promise<Lane>;
+  splitLane(input: SplitLaneInput): Promise<void>;
   mergeLanes(input: MergeLanesInput): Promise<void>;
 
   /** Applies on the role's next turn (`pendingModelSelection` until then). */

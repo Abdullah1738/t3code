@@ -15,7 +15,6 @@ import {
   formatCountdown,
   formatDayLabel,
   formatRelative,
-  formatTimeOfDay,
   isDraftFeedItem,
   openForkFor,
   orderBlockerGroups,
@@ -65,7 +64,7 @@ export function MissionOverviewTab(props: {
 
 /** Shown while a restart incident still has threads to resume or decide. */
 function RecoveryLine(props: { overview: MissionOverviewSnapshot }) {
-  const line = recoveryBanner(props.overview.recoveryIncident, (iso) => formatTimeOfDay(iso));
+  const line = recoveryBanner(props.overview.recovery);
   if (!line) return null;
   return (
     <Link
@@ -280,7 +279,7 @@ function DirectionCheckRow(props: {
   const [busy, setBusy] = useState(false);
   const react = (reaction: "ok" | "discuss") => {
     setBusy(true);
-    void reactToCall(props.missionId, item.ref.id, reaction).then(() => setBusy(false));
+    void reactToCall(item.ref.id, reaction).then(() => setBusy(false));
   };
   return (
     <li className="flex min-w-0 flex-col gap-2 py-2.5 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:gap-4">

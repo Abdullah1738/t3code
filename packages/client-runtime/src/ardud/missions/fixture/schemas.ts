@@ -1,9 +1,9 @@
-// Schemas for the UI-side shapes the fixture seeds (routing, rule audit,
-// recovery, timeline). The contracts do not carry these yet; decoding the
-// fixture through them keeps the seed data honest until they do.
+// Schemas for the shapes the fixture seeds that the contracts do not carry as
+// records (routing history, rule audit, recovery, timeline). Decoding the
+// seed through them keeps the data honest.
 import {
-  Approval,
-  DraftChannel,
+  ApprovalRoute,
+  Approver,
   LaneId,
   MissionActor,
   MissionEvent,
@@ -12,7 +12,6 @@ import {
   PoolHoldId,
   RoleId,
   RuleId,
-  TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -23,27 +22,10 @@ export const TimelineEventSeed = Schema.Struct({
   kind: Schema.Union([MissionEventKind, Schema.Literals(PROPOSED_MISSION_EVENT_KINDS)]),
 });
 
-const Approver = Schema.Literals(["owner", "master"]);
-
-const DraftRouteMatch = Schema.Union([
-  Schema.TaggedStruct("channel", { channel: DraftChannel }),
-  Schema.TaggedStruct("person", { name: TrimmedNonEmptyString }),
-]);
-
-const ApprovalRouteMatch = Schema.Union([
-  Schema.TaggedStruct("kind", { kind: Approval.fields.kind }),
-  Schema.TaggedStruct("repo", { repository: TrimmedNonEmptyString }),
-]);
-
+/** A routing table as of `updatedAt`; the fixture keeps the older versions to route seeded records. */
 export const RoutingTableSeed = Schema.Struct({
   missionId: MissionId,
-  version: Schema.Number,
-  draftRules: Schema.Array(
-    Schema.Struct({ id: TrimmedNonEmptyString, match: DraftRouteMatch, approver: Approver }),
-  ),
-  approvalRules: Schema.Array(
-    Schema.Struct({ id: TrimmedNonEmptyString, match: ApprovalRouteMatch, approver: Approver }),
-  ),
+  routes: Schema.Array(ApprovalRoute),
   updatedAt: Schema.String,
 });
 

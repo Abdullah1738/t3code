@@ -1307,32 +1307,28 @@ export const ruleSuggestions = [
 /** made: the table. Version 1 is the cutover (everything to the owner). */
 export const routing = {
   missionId: CRPKO,
-  version: 2,
-  draftRules: [
-    { id: "route-draft-github", match: { _tag: "channel", channel: "github" }, approver: "owner" },
-    { id: "route-draft-cliq", match: { _tag: "channel", channel: "cliq" }, approver: "master" },
-  ],
-  approvalRules: [
-    { id: "route-approval-merge", match: { _tag: "kind", kind: "merge" }, approver: "owner" },
+  // First matching row wins: the repository row sits above the merge row.
+  routes: [
     {
       id: "route-approval-crpko-devops",
-      match: { _tag: "repo", repository: "crpko-devops" },
+      match: { _tag: "approval", repository: "Equicom-Crypto/crpko-devops" },
       approver: "master",
     },
+    { id: "route-draft-github", match: { _tag: "draft", channel: "github" }, approver: "owner" },
+    { id: "route-draft-cliq", match: { _tag: "draft", channel: "cliq" }, approver: "master" },
+    { id: "route-approval-merge", match: { _tag: "approval", kind: "merge" }, approver: "owner" },
   ],
   updatedAt: AT("12:00", 16),
 };
 
-/** Routing at the time each record was created; table v1 before 16 Oct 12:00. */
 export const routingV1 = {
   ...routing,
-  version: 1,
-  draftRules: routing.draftRules.filter((rule) => rule.id === "route-draft-github"),
-  approvalRules: routing.approvalRules.filter((rule) => rule.id === "route-approval-merge"),
+  routes: routing.routes.filter(
+    (route) => route.id === "route-draft-github" || route.id === "route-approval-merge",
+  ),
   updatedAt: AT("06:00", 16),
 };
 
-/** made: one pending draft the master moved to its own inbox. */
 export const reroutes = [
   {
     kind: "draft",

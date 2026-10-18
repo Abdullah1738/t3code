@@ -20,6 +20,7 @@ import type {
   InboxTab,
   Knock,
   MissionId,
+  MissionInboxHistory,
   MissionRecordRef,
   Note,
   NoteType,
@@ -33,11 +34,8 @@ import { routedTo, suggestionsFor, type InboxRouteFilter } from "./routingViewMo
 import type {
   AddDraftNoteInput,
   MissionForkEntry,
-  MissionInboxHistory,
   MissionInboxSnapshot,
   OpenForkInput,
-  RoutedApproval,
-  RoutedDraft,
 } from "./source.ts";
 import { diffStats, diffWords, type DiffSegment, type DiffStats } from "./textDiff.ts";
 import { actorLabel, refLabel } from "./viewModel.ts";
@@ -107,8 +105,8 @@ export function defaultInboxTab(
 
 export type InboxEntry =
   | { readonly kind: "ask"; readonly key: string; readonly record: Ask }
-  | { readonly kind: "draft"; readonly key: string; readonly record: RoutedDraft }
-  | { readonly kind: "approval"; readonly key: string; readonly record: RoutedApproval }
+  | { readonly kind: "draft"; readonly key: string; readonly record: Draft }
+  | { readonly kind: "approval"; readonly key: string; readonly record: Approval }
   | { readonly kind: "knock"; readonly key: string; readonly record: Knock }
   | { readonly kind: "suggestion"; readonly key: string; readonly record: Suggestion }
   | { readonly kind: "note"; readonly key: string; readonly record: Note };

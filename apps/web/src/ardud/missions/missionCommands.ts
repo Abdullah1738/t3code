@@ -48,9 +48,9 @@ export function reorderSubMissions(missionId: MissionId, order: ReadonlyArray<Su
 }
 
 /** "Fine" accepts the call; "Discuss" also opens a Discuss fork of the master. */
-export function reactToCall(missionId: MissionId, callId: string, reaction: "ok" | "discuss") {
+export function reactToCall(callId: string, reaction: "ok" | "discuss") {
   return runMissionAction(
-    missionsSource.reactToCall({ missionId, callId: callId as CallId, reaction }),
+    missionsSource.reactToCall({ callId: callId as CallId, reaction }),
     "Could not record your reaction",
   );
 }
@@ -60,10 +60,10 @@ export function markMissionSeen(missionId: MissionId) {
 }
 
 /** Parses "40", "40%" or "0.4"; an empty field clears the share. */
-export function setIntendedShare(subMissionId: SubMissionId, text: string) {
+export function setIntendedShare(missionId: MissionId, subMissionId: SubMissionId, text: string) {
   const parsed = parseShareInput(text);
   return submitMissionInput(
-    parsed.ok ? { ok: true, value: { subMissionId, share: parsed.share } } : parsed,
+    parsed.ok ? { ok: true, value: { missionId, subMissionId, share: parsed.share } } : parsed,
     (input) => missionsSource.setIntendedEffort(input),
     "Couldn't change the share",
   );

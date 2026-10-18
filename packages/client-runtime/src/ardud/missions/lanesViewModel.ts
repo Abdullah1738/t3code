@@ -3,9 +3,11 @@ import type {
   Lane,
   LaneId,
   LaneStatus,
+  MergeLanesInput,
   ModelSelection,
   Role,
   RoleBinding,
+  SplitLaneInput,
   SubMission,
   SubMissionId,
   WorkItem,
@@ -13,11 +15,9 @@ import type {
 
 import type {
   HandOffLaneInput,
-  MergeLanesInput,
   MoveLaneInput,
   NudgeLaneInput,
   SetLaneParkedInput,
-  SplitLaneInput,
 } from "./source.ts";
 import { formatPercent, sortLanesProblemsFirst, splitQuietLanes } from "./viewModel.ts";
 
@@ -242,19 +242,19 @@ export function handOffLaneInput(laneId: LaneId, note: string): Result<HandOffLa
 
 /** `parked` is what the person asked for, so a lane that changed meanwhile isn't flipped back. */
 export function setLaneParkedInput(
-  lane: Pick<Lane, "id">,
+  lane: Pick<Lane, "id" | "missionId">,
   parked: boolean,
   reason: string,
 ): SetLaneParkedInput {
   const trimmed = reason.trim();
   return parked && trimmed
-    ? { laneId: lane.id, parked, reason: trimmed }
-    : { laneId: lane.id, parked };
+    ? { missionId: lane.missionId, laneId: lane.id, parked, reason: trimmed }
+    : { missionId: lane.missionId, laneId: lane.id, parked };
 }
 
 export function moveLaneInput(lane: Lane, subMissionId: SubMissionId): Result<MoveLaneInput> {
   if (lane.subMissionId === subMissionId) return err("The lane is already in that sub-mission.");
-  return ok({ laneId: lane.id, subMissionId });
+  return ok({ missionId: lane.missionId, laneId: lane.id, subMissionId });
 }
 
 export function splitLaneInput(
@@ -268,7 +268,7 @@ export function splitLaneInput(
   if (lanes.some((other) => other.name.toLowerCase() === trimmed.toLowerCase())) {
     return err(`There is already a lane called ${trimmed}.`);
   }
-  return ok({ laneId: lane.id, name: trimmed, purpose: purpose.trim() });
+  return ok({ missionId: lane.missionId, laneId: lane.id, name: trimmed, purpose: purpose.trim() });
 }
 
 /** Lanes `lane` can merge into: same mission, not itself, not retired. */
@@ -283,5 +283,5 @@ export function mergeLanesInput(lane: Lane, into: Lane): Result<MergeLanesInput>
   if (into.id === lane.id) return err("Pick another lane to merge into.");
   if (into.missionId !== lane.missionId) return err("Lanes merge only within one mission.");
   if (into.status === "retired") return err(`${into.name} is retired.`);
-  return ok({ laneId: lane.id, intoLaneId: into.id });
+  return ok({ missionId: lane.missionId, laneId: lane.id, intoLaneId: into.id });
 }

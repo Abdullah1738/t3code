@@ -1,5 +1,6 @@
 import {
   Approval,
+  approverOf,
   Ask,
   Call,
   Draft,
@@ -9,6 +10,7 @@ import {
   Milestone,
   Mission,
   MissionFork,
+  type MissionInboxHistory,
   type MissionListItem,
   type MissionListSnapshot,
   MissionMessage,
@@ -30,20 +32,16 @@ import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
 import { latestFieldChanges } from "../changeLog.ts";
-import { reroute, routeApproval, routeDraft } from "../routingViewModel.ts";
+import { routeApproval, routeDraft, routeMatchKey } from "../routingViewModel.ts";
 import type {
   ApprovalRoutingTable,
   Listener,
   MissionForkEntry,
-  MissionInboxHistory,
   MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionPoolUsage,
   MissionRoomEntry,
   MissionsSource,
-  Routed,
-  RoutedApproval,
-  RoutedDraft,
   Unsubscribe,
 } from "../source.ts";
 import { groupBlockers, laneCountsOf, type HeldItem } from "../viewModel.ts";
@@ -89,24 +87,6 @@ const decodeRule = Schema.decodeUnknownSync(Rule);
 const decodeRoutingTables = Schema.decodeUnknownSync(Schema.Array(RoutingTableSeed));
 const decodeRoutingTableExit = Schema.decodeUnknownExit(RoutingTableSeed);
 
-/** One key per thing a routing rule can match, so two rules never fight over it. */
-type RouteMatch = (
-  | ApprovalRoutingTableRecord["draftRules"]
-  | ApprovalRoutingTableRecord["approvalRules"]
-)[number]["match"];
-
-const matchKey = (match: RouteMatch) => {
-  switch (match._tag) {
-    case "channel":
-      return `channel:${match.channel}`;
-    case "person":
-      return `person:${match.name.toLowerCase()}`;
-    case "kind":
-      return `kind:${match.kind}`;
-    case "repo":
-      return `repo:${match.repository.toLowerCase()}`;
-  }
-};
 const decodeReroutes = Schema.decodeUnknownSync(Schema.Array(RerouteSeed));
 
 type ApprovalRoutingTableRecord = typeof RoutingTableSeed.Type;
@@ -120,7 +100,7 @@ function tableAt(
   return (
     tables
       .filter((table) => table.missionId === missionId && table.updatedAt <= createdAt)
-      .sort((left, right) => right.version - left.version)[0] ?? null
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ?? null
   );
 }
 
@@ -265,61 +245,28 @@ export function createFixtureMissionsSource(
   const nowIso = () => DateTime.formatIso(DateTime.makeUnsafe(now()));
   const log = createEventLog({ nowIso, provenance: ownerProvenance });
 
-  // Each pending draft and approval keeps the approver it was routed to at
-  // creation (or by a later re-route); editing the table never moves it.
-  const routes = new Map<string, Routed>();
-  const routeKey = (kind: "draft" | "approval", id: string) => `${kind}:${id}`;
+  // Each draft and approval keeps the approver it was routed to at creation
+  // (or by a later move, with the reason in `routeNote`); editing the table
+  // never moves it. Seeded records are routed by the table in force then.
   {
     const seeded = decodeRoutingTables([ops.routingV1, ops.routing]);
-    for (const draft of drafts) {
-      routes.set(
-        routeKey("draft", draft.id),
-        routeDraft(tableAt(seeded, draft.missionId, draft.createdAt), draft),
-      );
-    }
-    for (const approval of approvals) {
-      routes.set(
-        routeKey("approval", approval.id),
-        routeApproval(tableAt(seeded, approval.missionId, approval.createdAt), approval),
-      );
-    }
+    drafts.forEach((draft, index) => {
+      const { approver } = routeDraft(tableAt(seeded, draft.missionId, draft.createdAt), draft);
+      drafts[index] = { ...draft, approver, routeNote: null };
+    });
+    approvals.forEach((approval, index) => {
+      const table = tableAt(seeded, approval.missionId, approval.createdAt);
+      const { approver } = routeApproval(table, approval);
+      approvals[index] = { ...approval, approver, routeNote: null };
+    });
     for (const move of decodeReroutes(ops.reroutes)) {
-      const current = routes.get(routeKey(move.kind, move.id));
-      if (!current) continue;
-      const moved = reroute(
-        current,
-        move.approver,
-        data.masterActor as MissionActor,
-        move.reason,
-        move.at,
-      );
-      if (moved.ok) routes.set(routeKey(move.kind, move.id), moved.value);
+      const list: Array<Draft | Approval> = move.kind === "draft" ? drafts : approvals;
+      const index = list.findIndex((record) => record.id === move.id);
+      const record = list[index];
+      if (record) list[index] = { ...record, approver: move.approver, routeNote: move.reason };
     }
   }
-  // A record first seen without a route is routed by the table at that moment
-  // and keeps that route; later table edits never move it.
-  const routeOf = (kind: "draft" | "approval", record: Draft | Approval): Routed => {
-    const key = routeKey(kind, record.id);
-    const known = routes.get(key);
-    if (known) return known;
-    const table = routingTables.find((t) => t.missionId === record.missionId) ?? null;
-    const routed =
-      kind === "draft"
-        ? routeDraft(table, record as Draft)
-        : routeApproval(table, record as Approval);
-    routes.set(key, routed);
-    return routed;
-  };
-  const routedDraft = (draft: Draft): RoutedDraft => {
-    const { approver, route } = routeOf("draft", draft);
-    return { ...draft, approver, route };
-  };
-  const routedApproval = (approval: Approval): RoutedApproval => {
-    const { approver, route } = routeOf("approval", approval);
-    return { ...approval, approver, route };
-  };
-  const toOwner = (kind: "draft" | "approval") => (record: Draft | Approval) =>
-    routeOf(kind, record).approver === "owner";
+  const toOwner = (record: Draft | Approval) => approverOf(record) === "owner";
 
   const subMissionOf = (record: { readonly id: string }) =>
     data.recordSubMission[record.id] ?? null;
@@ -367,8 +314,8 @@ export function createFixtureMissionsSource(
       subMissionId === null || (record.subMissionId ?? subMissionOf(record)) === subMissionId;
     return (
       openAsks(missionId).filter(inScope).length +
-      pendingDrafts(missionId).filter(toOwner("draft")).filter(inScope).length +
-      pendingApprovals(missionId).filter(toOwner("approval")).filter(inScope).length +
+      pendingDrafts(missionId).filter(toOwner).filter(inScope).length +
+      pendingApprovals(missionId).filter(toOwner).filter(inScope).length +
       pendingKnocks(missionId).filter(inScope).length
     );
   }
@@ -425,7 +372,7 @@ export function createFixtureMissionsSource(
       item: { kind: "ask" as const, id: ask.id, label: ask.question },
     }));
     const fromDrafts = pendingDrafts(missionId).map((draft) => ({
-      ...(toOwner("draft")(draft) ? owner : master),
+      ...(toOwner(draft) ? owner : master),
       item: {
         kind: "draft" as const,
         id: draft.id,
@@ -486,7 +433,7 @@ export function createFixtureMissionsSource(
                 (event.subject?.kind === "mission" || event.subject?.kind === "sub-mission"),
             ),
         ),
-        recoveryIncident: operations.openIncident(missionId),
+        recovery: operations.openRecovery(missionId),
       };
     });
   }
@@ -494,13 +441,13 @@ export function createFixtureMissionsSource(
   function inbox(missionId: string | null): MissionInboxSnapshot {
     return memo(`inbox:${missionId ?? "*"}`, () => {
       const inboxAsks = newestFirst(openAsks(missionId));
-      const inboxDrafts = newestFirst(pendingDrafts(missionId)).map(routedDraft);
-      const inboxApprovals = newestFirst(pendingApprovals(missionId)).map(routedApproval);
+      const inboxDrafts = newestFirst(pendingDrafts(missionId));
+      const inboxApprovals = newestFirst(pendingApprovals(missionId));
       const inboxKnocks = newestFirst(pendingKnocks(missionId));
       const inboxSuggestions = newestFirst(openSuggestions(missionId));
       const inboxFyi = fyi(missionId);
       const routedTo = (approver: "owner" | "master") =>
-        [...inboxDrafts, ...inboxApprovals].filter((r) => r.approver === approver).length;
+        [...inboxDrafts, ...inboxApprovals].filter((r) => approverOf(r) === approver).length;
       const acceptedBy = (acceptor: "owner" | "master") =>
         inboxSuggestions.filter((s) => s.acceptor === acceptor).length;
       return {
@@ -574,6 +521,7 @@ export function createFixtureMissionsSource(
 
   function inboxHistory(missionId: string | null): MissionInboxHistory {
     return memo(`history:${missionId ?? "*"}`, () => ({
+      since: DateTime.formatIso(DateTime.makeUnsafe(now() - HISTORY_WINDOW_MS)),
       asks: asks.filter(
         (a) =>
           a.status !== "open" &&
@@ -876,13 +824,13 @@ export function createFixtureMissionsSource(
       return Promise.resolve();
     },
 
-    reactToCall({ missionId, callId, reaction }) {
-      const target = calls.find((c) => c.id === callId && c.missionId === missionId);
+    reactToCall({ callId, reaction }) {
+      const target = calls.find((c) => c.id === callId);
       if (!target) return fail("not-found", `Call ${callId} not found.`);
       replace(calls, { ...target, ownerReaction: reaction });
       if (reaction === "discuss") {
         openForkRecord({
-          missionId,
+          missionId: target.missionId,
           kind: "discuss",
           origin: { kind: "call", id: target.id, label: target.title },
           question: null,
@@ -892,8 +840,10 @@ export function createFixtureMissionsSource(
       return Promise.resolve();
     },
 
-    setIntendedEffort({ subMissionId, share }) {
-      const subMission = subMissions.find((s) => s.id === subMissionId);
+    setIntendedEffort({ missionId, subMissionId, share }) {
+      const subMission = subMissions.find(
+        (s) => s.id === subMissionId && s.missionId === missionId,
+      );
       if (!subMission) return fail("not-found", `Sub-mission ${subMissionId} not found.`);
       if (share !== null && !(Number.isFinite(share) && share >= 0 && share <= 1)) {
         return fail("invalid", "An effort share is between 0 and 1.");
@@ -1023,7 +973,7 @@ export function createFixtureMissionsSource(
           label: `${draft.audience} on ${draft.target.label}`,
         },
         summary: `Draft to ${draft.audience}: ${input.action}`,
-        payload: { action: input.action, approver: routeOf("draft", draft).approver },
+        payload: { action: input.action, approver: approverOf(draft) },
       });
       switch (input.action) {
         case "approve":
@@ -1124,7 +1074,7 @@ export function createFixtureMissionsSource(
         kind: "approval.decided",
         subject: { kind: "approval", id: approval.id, label: approval.title },
         summary: `${input.action === "approve" ? "Approved" : "Rejected"} ${approval.title}`,
-        payload: { action: input.action, approver: routeOf("approval", approval).approver },
+        payload: { action: input.action, approver: approverOf(approval) },
       });
       commit();
       return Promise.resolve();
@@ -1287,76 +1237,67 @@ export function createFixtureMissionsSource(
       return Promise.resolve(rule);
     },
 
-    setApprovalRouting({ missionId, expectedVersion, draftRules, approvalRules }) {
+    setApprovalRouting({ missionId, routes, reason }) {
       if (!findMission(missionId)) return fail("not-found", `Mission ${missionId} not found.`);
       const current = routingTables.find((t) => t.missionId === missionId) ?? null;
-      const version = current?.version ?? 0;
-      if (expectedVersion !== version) {
-        return fail("conflict", "The routing table changed since you opened it.");
-      }
-      const at = nowIso();
-      const decoded = decodeRoutingTableExit({
-        missionId,
-        version: version + 1,
-        draftRules,
-        approvalRules,
-        updatedAt: at,
-      });
+      const decoded = decodeRoutingTableExit({ missionId, routes, updatedAt: nowIso() });
       if (decoded._tag === "Failure") {
-        return fail("invalid", "Each rule needs a channel, person, kind or repo to match.");
+        return fail("invalid", "Each row needs something to match and an approver.");
       }
       const next = decoded.value;
-      const ids = [...next.draftRules, ...next.approvalRules].map((rule) => rule.id);
-      if (new Set(ids).size !== ids.length) return fail("invalid", "Two rules share an id.");
-      const matches = [...next.draftRules, ...next.approvalRules].map((rule) =>
-        matchKey(rule.match),
-      );
-      if (new Set(matches).size !== matches.length) {
-        return fail("invalid", "Two rules match the same thing.");
+      const ids = next.routes.map((row) => row.id);
+      if (new Set(ids).size !== ids.length) return fail("invalid", "Two rows share an id.");
+      const keys = next.routes.map((row) => routeMatchKey(row.match));
+      if (new Set(keys).size !== keys.length) {
+        return fail("invalid", "Two rows match the same thing.");
       }
+      const before = new Map((current?.routes ?? []).map((row) => [row.id, JSON.stringify(row)]));
+      const changed = [
+        ...next.routes.filter((row) => before.get(row.id) !== JSON.stringify(row)).map((r) => r.id),
+        ...[...before.keys()].filter((id) => !next.routes.some((row) => row.id === id)),
+      ];
+      const reordered =
+        current !== null &&
+        changed.length === 0 &&
+        current.routes.map((row) => row.id).join() !== ids.join();
+      if (changed.length === 0 && !reordered) return Promise.resolve(routingTable(missionId)!);
       const index = routingTables.findIndex((t) => t.missionId === missionId);
       if (index >= 0) routingTables[index] = next;
       else routingTables.push(next);
-      const before = new Map(
-        [...(current?.draftRules ?? []), ...(current?.approvalRules ?? [])].map((rule) => [
-          rule.id,
-          JSON.stringify(rule),
-        ]),
-      );
-      const after = [...next.draftRules, ...next.approvalRules];
-      const changed = [
-        ...after.filter((rule) => before.get(rule.id) !== JSON.stringify(rule)).map((r) => r.id),
-        ...[...before.keys()].filter((id) => !after.some((rule) => rule.id === id)),
-      ];
+      const toMaster = next.routes.filter((row) => row.approver === "master").length;
       log.record({
         missionId,
         kind: "routing.updated",
         subject: { kind: "mission", id: missionId },
-        summary: `Routing table v${next.version}`,
-        payload: { changed: ["rules", ...changed], version: next.version },
+        summary: clampSummary(
+          `Approval routing: ${next.routes.length} rows, ${toMaster} to the master${
+            reason?.trim() ? `. ${reason.trim()}` : ""
+          }`,
+        ),
+        payload: { changed: ["rules", ...changed] },
       });
       commit();
       return Promise.resolve(routingTable(missionId)!);
     },
 
     rerouteRecord({ kind, id, approver, reason }) {
-      const record =
-        kind === "draft" ? drafts.find((d) => d.id === id) : approvals.find((a) => a.id === id);
+      const list: Array<Draft | Approval> = kind === "draft" ? drafts : approvals;
+      const index = list.findIndex((record) => record.id === id);
+      const record = list[index];
       if (!record)
         return fail("not-found", `${kind === "draft" ? "Draft" : "Approval"} ${id} not found.`);
       if (record.status !== "pending") return fail("conflict", "Only a pending record can move.");
-      const moved = reroute(routeOf(kind, record), approver, { _tag: "owner" }, reason, nowIso());
-      if (!moved.ok) return fail("invalid", moved.error);
-      routes.set(routeKey(kind, id), moved.value);
+      const why = reason.trim();
+      if (why === "") return fail("invalid", "Say why it should move.");
+      const from = approverOf(record);
+      if (from === approver) return Promise.resolve();
+      list[index] = { ...record, approver, routeNote: why };
       log.record({
         missionId: record.missionId,
         kind: "record.rerouted",
         subject: { kind, id },
-        summary: `Moved to ${approver === "owner" ? "you" : "master"}: ${moved.value.route._tag === "rerouted" ? moved.value.route.reason : reason}`,
-        payload: {
-          from: moved.value.route._tag === "rerouted" ? moved.value.route.from : null,
-          to: approver,
-        },
+        summary: clampSummary(`Moved to ${approver === "owner" ? "you" : "master"}: ${why}`),
+        payload: { from, to: approver },
       });
       commit();
       return Promise.resolve();

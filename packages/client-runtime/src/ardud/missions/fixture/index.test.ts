@@ -1,6 +1,8 @@
 import {
+  approverOf,
   type DraftNote,
   type MissionId,
+  type MissionInboxHistory,
   type MissionListSnapshot,
   type MissionOverview,
   MissionError,
@@ -16,7 +18,6 @@ import { describe, expect, it } from "vite-plus/test";
 import type {
   ApprovalRoutingTable,
   MissionForkEntry,
-  MissionInboxHistory,
   MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionRoomEntry,
@@ -153,11 +154,7 @@ describe("fixture missions source", () => {
     const source = createFixtureMissionsSource({ now });
     const juno = latest<MissionOverview | null>((l) => source.subscribeOverview(JUNO, l));
     const lanes = latest((l) => source.subscribeLanes(CRPKO, l));
-    await source.reactToCall({
-      missionId: CRPKO,
-      callId: "call-10211" as never,
-      reaction: "ok",
-    });
+    await source.reactToCall({ callId: "call-10211" as never, reaction: "ok" });
     expect(juno.count).toBe(1);
     expect(lanes.count).toBe(1);
   });
@@ -267,14 +264,14 @@ describe("fixture missions source", () => {
     const overview = latest<MissionOverviewSnapshot | null>((l) =>
       source.subscribeOverview(CRPKO, l),
     );
-    await source.reactToCall({ missionId: CRPKO, callId, reaction: "discuss" });
+    await source.reactToCall({ callId, reaction: "discuss" });
     const discuss = forks.value.find((entry) => entry.fork.kind === "discuss")!;
     expect(discuss.fork.status).toBe("open");
     expect(discuss.fork.origin).toMatchObject({ kind: "call", id: "call-10211" });
     // The call stays in the direction check while its Discuss fork is open.
     const inCheck = () => overview.value!.directionCheck.some((item) => item.ref.id === callId);
     expect(inCheck()).toBe(true);
-    await source.reactToCall({ missionId: CRPKO, callId: "call-10194" as never, reaction: "ok" });
+    await source.reactToCall({ callId: "call-10194" as never, reaction: "ok" });
     expect(overview.value!.directionCheck.some((item) => item.ref.id === "call-10194")).toBe(false);
     // Asking again on the same call reuses the open fork.
     const again = await source.openFork({
@@ -311,14 +308,14 @@ describe("fixture missions source", () => {
     expect(changeOf("crpko-arch-wave")?.actor).toEqual({ _tag: "role", roleId: "crpko-master" });
     expect(changeOf("crpko-releases")?.actor).toEqual({ _tag: "owner" });
 
-    await source.setIntendedEffort({ subMissionId: wave().id, share: 0.6 });
+    await source.setIntendedEffort({ missionId: CRPKO, subMissionId: wave().id, share: 0.6 });
     expect(wave().intendedEffort).toBe(0.6);
     expect(wave().lockedFields).not.toContain("intendedEffort");
     expect(changeOf("crpko-arch-wave")?.actor).toEqual({ _tag: "owner" });
     await expect(
-      source.setIntendedEffort({ subMissionId: wave().id, share: 1.4 }),
+      source.setIntendedEffort({ missionId: CRPKO, subMissionId: wave().id, share: 1.4 }),
     ).rejects.toBeInstanceOf(MissionError);
-    await source.setIntendedEffort({ subMissionId: wave().id, share: null });
+    await source.setIntendedEffort({ missionId: CRPKO, subMissionId: wave().id, share: null });
     expect(wave().intendedEffort).toBeNull();
   });
 
@@ -347,38 +344,35 @@ describe("fixture missions source", () => {
     const source = createFixtureMissionsSource({ now });
     const inbox = latest<MissionInboxSnapshot>((l) => source.subscribeInbox(CRPKO, l));
     const routing = latest<ApprovalRoutingTable | null>((l) => source.subscribeRouting(CRPKO, l));
-    const approverOf = (id: string) =>
-      [...inbox.value.drafts, ...inbox.value.approvals].find((r) => r.id === id)?.approver;
+    const routedTo = (id: string) => {
+      const record = [...inbox.value.drafts, ...inbox.value.approvals].find((r) => r.id === id);
+      return record && approverOf(record);
+    };
 
-    expect(approverOf("approval-crpko-devops-759")).toBe("master");
-    expect(approverOf("approval-backoffice-core-334")).toBe("owner");
+    expect(routedTo("approval-crpko-devops-759")).toBe("master");
+    expect(routedTo("approval-backoffice-core-334")).toBe("owner");
     // Moved by the master with a reason.
     const moved = inbox.value.drafts.find((d) => d.id === "draft-dylan-bo-334")!;
     expect(moved.approver).toBe("master");
-    expect(moved.route._tag).toBe("rerouted");
-    // Who changed each routing rule last: v1 by the master, v2 additions by the owner.
-    const ruleChange = (id: string) => routing.value!.changes.find((c) => c.field === id)?.actor;
-    expect(ruleChange("route-draft-github")).toEqual({ _tag: "role", roleId: "crpko-master" });
-    expect(ruleChange("route-approval-crpko-devops")).toEqual({ _tag: "owner" });
+    expect(moved.routeNote).toContain("conflicts with main-dev");
+    // Who changed each row last: v1 by the master, v2 additions by the owner.
+    const rowChange = (id: string) => routing.value!.changes.find((c) => c.field === id)?.actor;
+    expect(rowChange("route-draft-github")).toEqual({ _tag: "role", roleId: "crpko-master" });
+    expect(rowChange("route-approval-crpko-devops")).toEqual({ _tag: "owner" });
 
     // Editing the table never moves what already exists.
     const table = routing.value!;
     await source.setApprovalRouting({
       missionId: CRPKO,
-      expectedVersion: table.version,
-      draftRules: table.draftRules,
-      approvalRules: table.approvalRules.filter((r) => r.id !== "route-approval-crpko-devops"),
+      routes: table.routes.filter((r) => r.id !== "route-approval-crpko-devops"),
     });
-    expect(routing.value!.version).toBe(table.version + 1);
-    expect(approverOf("approval-crpko-devops-759")).toBe("master");
-    await expect(
-      source.setApprovalRouting({
-        missionId: CRPKO,
-        expectedVersion: table.version,
-        draftRules: [],
-        approvalRules: [],
-      }),
-    ).rejects.toBeInstanceOf(MissionError);
+    expect(routing.value!.routes.map((r) => r.id)).not.toContain("route-approval-crpko-devops");
+    expect(
+      routing.value!.changes.find((c) => c.field === "route-approval-crpko-devops")?.actor,
+    ).toEqual({
+      _tag: "owner",
+    });
+    expect(routedTo("approval-crpko-devops-759")).toBe("master");
 
     // A single record moves with a reason; without one it is refused.
     await expect(
@@ -395,7 +389,7 @@ describe("fixture missions source", () => {
       approver: "owner",
       reason: "I want to see this one.",
     });
-    expect(approverOf("approval-crpko-devops-759")).toBe("owner");
+    expect(routedTo("approval-crpko-devops-759")).toBe("owner");
     expect(inbox.value.counts.approve).toBe(5);
 
     // The owner can decide a record that waits on the master.
@@ -404,38 +398,26 @@ describe("fixture missions source", () => {
     expect(inbox.value.masterCounts.approve).toBe(0);
   });
 
-  it("starts a routing table from nothing and refuses bad or clashing rules", async () => {
+  it("starts a routing table from nothing and refuses bad or clashing rows", async () => {
     const source = createFixtureMissionsSource({ now });
     const routing = latest<ApprovalRoutingTable | null>((l) => source.subscribeRouting(JUNO, l));
     expect(routing.value).toBeNull();
-    const rule = (id: string, name: string) => ({
+    const row = (id: string, person: string) => ({
       id,
-      match: { _tag: "person" as const, name },
+      match: { _tag: "draft" as const, person },
       approver: "master" as const,
     });
     await expect(
-      source.setApprovalRouting({
-        missionId: JUNO,
-        expectedVersion: 0,
-        draftRules: [rule("a", " ")],
-        approvalRules: [],
-      }),
+      source.setApprovalRouting({ missionId: JUNO, routes: [row("a", " ")] }),
     ).rejects.toMatchObject({ code: "invalid" });
     await expect(
       source.setApprovalRouting({
         missionId: JUNO,
-        expectedVersion: 0,
-        draftRules: [rule("a", "Pavan"), rule("b", "pavan")],
-        approvalRules: [],
+        routes: [row("a", "Pavan"), row("b", "pavan")],
       }),
     ).rejects.toMatchObject({ code: "invalid" });
-    await source.setApprovalRouting({
-      missionId: JUNO,
-      expectedVersion: 0,
-      draftRules: [rule("a", "Pavan")],
-      approvalRules: [],
-    });
-    expect(routing.value?.version).toBe(1);
+    await source.setApprovalRouting({ missionId: JUNO, routes: [row("a", "Pavan")] });
+    expect(routing.value?.routes.map((r) => r.id)).toEqual(["a"]);
     expect(routing.value?.changes.find((c) => c.field === "a")?.actor).toEqual({ _tag: "owner" });
   });
 
