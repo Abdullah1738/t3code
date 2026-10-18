@@ -11,6 +11,7 @@ import {
   ViewTemplate,
   ViewTemplateDefinition,
   viewLayoutPinsStrip,
+  viewPinnedStrip,
   viewMatchesOverlap,
   VIEW_ACTIONS,
   viewActionAllowed,
@@ -141,5 +142,28 @@ describe("pinned strip", () => {
     expect(viewLayoutPinsStrip(layout, 3)).toBe(false);
     expect(viewLayoutPinsStrip(hidden, 0)).toBe(false);
     expect(viewLayoutPinsStrip(hidden, 2)).toBe(true);
+  });
+
+  it("pins unread answered requests only when Your requests is off the overview", () => {
+    const keys = layout.entries.map((entry) => entry.key);
+    expect(keys.indexOf("your-requests")).toBe(keys.indexOf("needs-you") + 1);
+    expect(layout.entries.find((entry) => entry.key === "your-requests")?.region).toBe("main");
+    expect(viewPinnedStrip(layout, { ownerWaiting: 2, requestsUnread: 2 })).toEqual({
+      needsYou: false,
+      requests: false,
+    });
+    const noRequests = {
+      ...layout,
+      entries: layout.entries.map((entry) =>
+        entry.key === "your-requests" ? { ...entry, hidden: true } : entry,
+      ),
+    };
+    expect(viewPinnedStrip(noRequests, { ownerWaiting: 0, requestsUnread: 0 }).requests).toBe(
+      false,
+    );
+    expect(viewPinnedStrip(noRequests, { ownerWaiting: 0, requestsUnread: 1 })).toEqual({
+      needsYou: false,
+      requests: true,
+    });
   });
 });

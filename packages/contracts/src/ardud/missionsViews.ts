@@ -72,6 +72,9 @@ export const ViewBackingKind = Schema.Literals([
   "note",
   "knock",
   "suggestion",
+  // Router's owner request record (kind `owner-request`), named by string so
+  // views do not depend on the router contract block.
+  "owner-request",
 ]);
 export type ViewBackingKind = typeof ViewBackingKind.Type;
 
@@ -98,6 +101,9 @@ export const ViewActionKey = Schema.Literals([
   "comment",
   "discuss",
   "open",
+  "reply",
+  "settle",
+  "reopen",
 ]);
 export type ViewActionKey = typeof ViewActionKey.Type;
 
@@ -187,6 +193,25 @@ export const VIEW_ACTIONS: { readonly [K in ViewActionKey]: ViewActionSpec } = {
     master: "mission_fork",
   },
   open: { label: "Open", kinds: ALL_KINDS, owner: null, master: null },
+  // Owner requests: method names follow router round 4 and are confirmed there.
+  reply: {
+    label: "Reply",
+    kinds: ["owner-request"],
+    owner: "missions.requests.reply",
+    master: "mission_request_reply",
+  },
+  settle: {
+    label: "Settle",
+    kinds: ["owner-request"],
+    owner: "missions.requests.settle",
+    master: "mission_request_settle",
+  },
+  reopen: {
+    label: "Reopen",
+    kinds: ["owner-request"],
+    owner: "missions.requests.reopen",
+    master: "mission_request_settle",
+  },
 };
 
 export const viewActionAllowed = (action: ViewActionKey, kind: ViewBackingKind): boolean =>
@@ -470,6 +495,7 @@ export const ViewBuiltinSectionKind = Schema.Literals([
   "with-the-master",
   "sub-missions",
   "since-last-looked",
+  "your-requests",
 ]);
 export type ViewBuiltinSectionKind = typeof ViewBuiltinSectionKind.Type;
 
@@ -600,9 +626,13 @@ export const DEFAULT_STARTER_LAYOUT: ViewStarterLayout = {
     entries: [
       builtinEntry("header-stats", "header"),
       ...ViewTabKind.literals.map(tabEntry),
+      // Stacked (one column) order is entry order: Needs you, then Your
+      // requests directly under it. Side by side, Your requests tops the main
+      // column next to Needs you at the top of the rail.
+      builtinEntry("needs-you", "rail"),
+      builtinEntry("your-requests", "main"),
       builtinEntry("sub-missions", "main"),
       builtinEntry("since-last-looked", "main"),
-      builtinEntry("needs-you", "rail"),
       builtinEntry("path-to-milestone", "rail"),
       builtinEntry("with-the-master", "rail"),
     ],
@@ -623,6 +653,7 @@ export const VIEW_BUILTIN_SECTION_TITLES: { readonly [K in ViewBuiltinSectionKin
   "with-the-master": "With the master",
   "sub-missions": "Sub-missions",
   "since-last-looked": "Since you last looked",
+  "your-requests": "Your requests",
 };
 export const VIEW_TAB_TITLES: { readonly [K in ViewTabKind]: string } = {
   overview: "Overview",
@@ -650,16 +681,23 @@ export const viewLayoutShowsOverview = (layout: ViewLayoutDefinition): boolean =
   );
 };
 
-/** Whether the layout shows Needs you on the overview. */
-export const viewLayoutShowsNeedsYou = (layout: ViewLayoutDefinition): boolean =>
+const showsBuiltin = (layout: ViewLayoutDefinition, kind: ViewBuiltinSectionKind): boolean =>
   viewLayoutShowsOverview(layout) &&
   layout.entries.some(
     (entry) =>
       !entry.hidden &&
       entry.section._tag === "builtin" &&
-      entry.section.kind === "needs-you" &&
+      entry.section.kind === kind &&
       OVERVIEW_REGIONS.has(entry.region),
   );
+
+/** Whether the layout shows Needs you on the overview. */
+export const viewLayoutShowsNeedsYou = (layout: ViewLayoutDefinition): boolean =>
+  showsBuiltin(layout, "needs-you");
+
+/** Whether the layout shows Your requests on the overview. */
+export const viewLayoutShowsYourRequests = (layout: ViewLayoutDefinition): boolean =>
+  showsBuiltin(layout, "your-requests");
 
 /**
  * Items waiting on the owner never disappear: when Needs you is hidden,
@@ -667,6 +705,23 @@ export const viewLayoutShowsNeedsYou = (layout: ViewLayoutDefinition): boolean =
  */
 export const viewLayoutPinsStrip = (layout: ViewLayoutDefinition, ownerWaiting: number): boolean =>
   ownerWaiting > 0 && !viewLayoutShowsNeedsYou(layout);
+
+export const ViewPinned = Schema.Struct({
+  /** Items waiting on the owner while Needs you is not on the overview. */
+  needsYou: Schema.Boolean,
+  /** Answered requests the owner has not read while Your requests is not on the overview. */
+  requests: Schema.Boolean,
+});
+export type ViewPinned = typeof ViewPinned.Type;
+
+/** What the pinned strip carries; it shows when either part is set. */
+export const viewPinnedStrip = (
+  layout: ViewLayoutDefinition,
+  waiting: { readonly ownerWaiting: number; readonly requestsUnread: number },
+): ViewPinned => ({
+  needsYou: viewLayoutPinsStrip(layout, waiting.ownerWaiting),
+  requests: waiting.requestsUnread > 0 && !viewLayoutShowsYourRequests(layout),
+});
 
 // ---------------------------------------------------------------------------
 // Bindable paths
@@ -775,6 +830,18 @@ export const VIEW_PATHS: { readonly [K in ViewPathScope]: PathTable } = {
     author: "enum",
     acceptor: "enum",
     status: "enum",
+    createdAt: "time",
+  },
+  // Router round 4 record. `lastReply` is the master's latest message on the
+  // request (asked of router to keep on the record).
+  "owner-request": {
+    title: "text",
+    status: "enum",
+    lastReply: "text",
+    lastOwnerAt: "time",
+    lastMasterAt: "time",
+    links: "refs",
+    settledAt: "time",
     createdAt: "time",
   },
   milestone: {
@@ -965,6 +1032,20 @@ const BUILTIN_DEFINITIONS: { readonly [K in ViewBackingKind]: ViewTemplateDefini
     actions: ["accept", "dismiss-suggestion", "discuss"],
     primary: "accept",
   },
+  "owner-request": {
+    key: "request",
+    name: "Your request",
+    backing: "owner-request",
+    kicker: "Your request",
+    title: "record.title",
+    body: [
+      text("record.lastReply", "body", 4),
+      facts(["Status", "record.status"], ["Replied", "record.lastMasterAt"]),
+      { _tag: "refs", bind: "record.links" },
+    ],
+    actions: ["reply", "settle", "reopen", "open"],
+    primary: "reply",
+  },
 };
 
 export const builtinViewTemplateId = (kind: ViewBackingKind): string =>
@@ -1003,7 +1084,15 @@ export type ViewBackedRecord =
   | { readonly kind: "work-item"; readonly record: WorkItem }
   | { readonly kind: "note"; readonly record: Note }
   | { readonly kind: "knock"; readonly record: Knock }
-  | { readonly kind: "suggestion"; readonly record: Suggestion };
+  | { readonly kind: "suggestion"; readonly record: Suggestion }
+  | { readonly kind: "owner-request"; readonly record: ViewOwnerRequestRecord };
+
+/** The part of router's owner request record that views read. */
+export interface ViewOwnerRequestRecord {
+  readonly id: string;
+  readonly status: string;
+  readonly subMissionId?: string | null;
+}
 
 const explicitTemplateOf = (record: object): string | null => {
   const view = (record as { readonly view?: { readonly templateId?: unknown } }).view;
@@ -1034,6 +1123,8 @@ export const viewMatchSubjectOf = (backed: ViewBackedRecord): ViewMatchSubject =
     case "work-item":
     case "note":
       return { kind: backed.kind, templateId, subMissionId: backed.record.subMissionId };
+    case "owner-request":
+      return { kind: backed.kind, templateId, subMissionId: backed.record.subMissionId ?? null };
     case "knock":
     case "suggestion":
       return { kind: backed.kind, templateId };
@@ -1287,7 +1378,11 @@ export const MissionViewsSnapshot = Schema.Struct({
   starter: ViewStarterLayout,
   /** Items waiting on the owner (decide + approve + knocks + suggestions). */
   ownerWaiting: NonNegativeInt,
+  /** Answered owner requests the owner has not read yet. */
+  requestsUnread: NonNegativeInt,
+  /** True when the pinned strip shows (either part of `pinned`). */
   pinnedStrip: Schema.Boolean,
+  pinned: ViewPinned,
   changesToday: NonNegativeInt,
 });
 export type MissionViewsSnapshot = typeof MissionViewsSnapshot.Type;

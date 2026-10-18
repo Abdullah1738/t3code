@@ -31,6 +31,7 @@ import {
   ViewCatalog,
   ViewHistory,
   ViewHistoryInput,
+  ViewPinned,
   ViewPreview,
 } from "./missionsViews.ts";
 
@@ -62,7 +63,9 @@ export const MissionViewsFeedItem = Schema.Union([
   Schema.TaggedStruct("waiting", {
     missionId: MissionId,
     ownerWaiting: Schema.Number,
+    requestsUnread: Schema.Number,
     pinnedStrip: Schema.Boolean,
+    pinned: ViewPinned,
   }),
 ]);
 export type MissionViewsFeedItem = typeof MissionViewsFeedItem.Type;
