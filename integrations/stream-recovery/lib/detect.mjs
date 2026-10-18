@@ -521,7 +521,9 @@ export function buildRestartNote({ incident, lost = [], turnCut = false, held = 
 
 // One line per bucket, every thread named: noted, resumed by itself, queue
 // released, skipped (with reason), iMessage reports, queues still held, errors.
-export function buildRestartSummary({ incident, results }) {
+// missions: Robob mission recovery's per-mission counts; their threads get the
+// mission notice instead of a stream-recovery note, one line per mission.
+export function buildRestartSummary({ incident, results, missions = [] }) {
   const runs = incident.runs ?? [];
   const threads = new Set([...incident.subagents.map((s) => s.parentThreadId ?? s.thread_id), ...runs.map((r) => r.thread_id)]);
   for (const r of results) threads.add(r.plan.threadId);
@@ -543,6 +545,11 @@ export function buildRestartSummary({ incident, results }) {
   const list = (rs, fmt) => rs.slice(0, SUMMARY_NAMES).map(fmt).join("; ") + (rs.length > SUMMARY_NAMES ? `; +${rs.length - SUMMARY_NAMES} more` : "");
   const noted = results.filter((r) => r.plan.action === "note" && r.ok && !r.error);
   if (noted.length) lines.push(`Noted: ${list(noted, (r) => `${name(r)}${what(r)}`)}.`);
+  for (const m of missions) {
+    const parts = [m.resume ? `${m.resume} to resume` : null, m.reconcile ? `${m.reconcile} to reconcile first` : null,
+      m.noticeOnly ? `${m.noticeOnly} notice only` : null].filter(Boolean);
+    lines.push(`Mission "${truncate(m.title, 40)}": ${m.threads} thread(s)${parts.length ? ` (${parts.join(", ")})` : ""}, master first, then paced by mission recovery.`);
+  }
   const resumed = results.filter((r) => r.plan.action === "resumed");
   if (resumed.length) lines.push(`Resumed by themselves (no note): ${list(resumed, (r) => `${name(r)}${what(r)}`)}.`);
   const released = results.filter((r) => r.queueOk);
