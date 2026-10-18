@@ -33,6 +33,9 @@ import type { MemberKind } from "./model.ts";
  * - `doorbells`: at most one outstanding wake per thread.
  * - `wakes`: every ring, for the noise meter's wasted-wake count.
  * - `members`: explicit membership (`thread:<id>` or `session:<id>`).
+ * - `recipients`: coord's delivery ledger, one row per (message, recipient
+ *   actor key) with `pending`/`skipped` and an ack time. It answers the coord
+ *   shim's inbox and ack the way coord.db did; wakes stay with `deliveries`.
  */
 const DDL = [
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_rooms (
@@ -117,6 +120,17 @@ const DDL = [
     settled_at TEXT,
     acted INTEGER NOT NULL DEFAULT 0
   )`,
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_recipients (
+    mission_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    room_id TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    status TEXT NOT NULL,
+    acked_at TEXT,
+    PRIMARY KEY (mission_id, seq, recipient)
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_mission_router_recipients_by_actor
+    ON ardud_mission_router_recipients (mission_id, recipient, seq)`,
 ];
 
 const encodeRoom = Schema.encodeSync(Schema.fromJsonString(Room));
@@ -158,6 +172,21 @@ export interface StoredMessage {
   readonly contentHash: string;
 }
 
+/** One coord-ledger row: who a message was for and whether it should wake them. */
+export interface RecipientRow {
+  readonly key: string;
+  readonly status: "pending" | "skipped";
+  readonly ackedAt: string | null;
+}
+
+/** A message as the coord inbox sees it for one actor. */
+export interface RecipientEntry {
+  readonly message: MissionMessage;
+  readonly body: string | null;
+  readonly delivery: "pending" | "skipped" | "acked";
+  readonly ackedAt: string | null;
+}
+
 /** What a create-if-missing batch (the coord import) writes. */
 export interface RouterBatch {
   readonly rooms: ReadonlyArray<Room>;
@@ -165,6 +194,7 @@ export interface RouterBatch {
     readonly message: MissionMessage;
     readonly body: string | null;
     readonly contentHash: string;
+    readonly recipients?: ReadonlyArray<RecipientRow>;
   }>;
   readonly subscriptions: ReadonlyArray<{
     readonly subscription: Subscription;
@@ -198,7 +228,47 @@ export class RouterStore extends Context.Service<
       readonly body: string | null;
       readonly contentHash: string;
       readonly deliveries: ReadonlyArray<ThreadId>;
+      readonly recipients?: ReadonlyArray<RecipientRow>;
     }) => Effect.Effect<void>;
+    readonly messageBySeq: (
+      missionId: MissionId,
+      seq: number,
+    ) => Effect.Effect<MissionMessage | null>;
+    /** Coord inbox: messages with a ledger row for any of `keys`, oldest first. */
+    readonly recipientInbox: (input: {
+      readonly missionId: MissionId;
+      readonly keys: ReadonlyArray<string>;
+      readonly after: number;
+      readonly unackedOnly: boolean;
+      readonly limit: number;
+    }) => Effect.Effect<ReadonlyArray<RecipientEntry>>;
+    /** Ledger rows of one message for any of `keys`. */
+    readonly recipientsOf: (
+      missionId: MissionId,
+      seq: number,
+      keys: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyArray<RecipientRow>>;
+    readonly ackRecipients: (input: {
+      readonly missionId: MissionId;
+      readonly keys: ReadonlyArray<string>;
+      readonly at: string;
+      /** One message, or everything in `roomId` up to `upToSeq`. */
+      readonly scope:
+        | { readonly _tag: "seq"; readonly seq: number }
+        | { readonly _tag: "room"; readonly roomId: RoomId; readonly upToSeq: number };
+    }) => Effect.Effect<void>;
+    /** Lowest unacked ledger seq in a room for any of `keys`, or null. */
+    readonly firstUnacked: (
+      missionId: MissionId,
+      roomId: RoomId,
+      keys: ReadonlyArray<string>,
+    ) => Effect.Effect<number | null>;
+    /** Marks one message's delivery to a thread read. */
+    readonly readDelivery: (
+      threadId: ThreadId,
+      missionId: MissionId,
+      seq: number,
+    ) => Effect.Effect<void>;
     readonly messageByKey: (
       missionId: MissionId,
       key: string,
@@ -278,6 +348,17 @@ interface MemberDbRow {
   readonly label: string | null;
 }
 
+interface InboxDbRow {
+  readonly json: string;
+  readonly body: string | null;
+  readonly open: number;
+  readonly status: string | null;
+  readonly ackedAt: string | null;
+}
+
+const toStatus = (status: string | null): "pending" | "skipped" =>
+  status === "pending" ? "pending" : "skipped";
+
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* Effect.forEach(DDL, (statement) => sql.unsafe(statement), { discard: true }).pipe(
@@ -327,6 +408,26 @@ const make = Effect.gen(function* () {
     created_at: input.message.createdAt,
     message_json: encodeMessage(input.message),
   });
+
+  const insertRecipients = (
+    message: MissionMessage,
+    recipients: ReadonlyArray<RecipientRow> | undefined,
+  ) =>
+    Effect.forEach(
+      recipients ?? [],
+      (row) => sql`
+        INSERT INTO ardud_mission_router_recipients ${sql.insert({
+          mission_id: message.missionId,
+          seq: message.seq,
+          room_id: message.roomId,
+          recipient: row.key,
+          status: row.status,
+          acked_at: row.ackedAt,
+        })}
+        ON CONFLICT DO NOTHING
+      `,
+      { discard: true },
+    );
 
   const existingIn = (
     kind: RouterRowKind,
@@ -409,6 +510,7 @@ const make = Effect.gen(function* () {
                 ON CONFLICT DO NOTHING
               `;
             }
+            if (inserted.length > 0) yield* insertRecipients(entry.message, entry.recipients);
           }
           for (const { subscription, key } of batch.subscriptions) {
             yield* sql`
@@ -442,7 +544,7 @@ const make = Effect.gen(function* () {
         `.pipe(Effect.map((rows) => Number(rows[0]?.seq ?? 0))),
       ),
 
-    insertMessage: ({ message, body, contentHash, deliveries }) =>
+    insertMessage: ({ message, body, contentHash, deliveries, recipients }) =>
       write(
         Effect.gen(function* () {
           yield* sql`
@@ -472,8 +574,103 @@ const make = Effect.gen(function* () {
               ON CONFLICT (thread_id, mission_id, seq) DO NOTHING
             `;
           }
+          yield* insertRecipients(message, recipients);
         }),
       ),
+
+    messageBySeq: (missionId, seq) =>
+      read(
+        sql<{ readonly json: string }>`
+          SELECT message_json AS "json" FROM ardud_mission_router_messages
+          WHERE mission_id = ${missionId} AND seq = ${seq}
+        `.pipe(Effect.map((rows) => (rows[0] === undefined ? null : decodeMessage(rows[0].json)))),
+      ),
+
+    recipientInbox: ({ missionId, keys, after, unackedOnly, limit }) =>
+      keys.length === 0
+        ? Effect.succeed([])
+        : read(
+            sql<InboxDbRow>`
+              SELECT m.message_json AS "json", b.body AS "body",
+                SUM(CASE WHEN r.acked_at IS NULL THEN 1 ELSE 0 END) AS "open",
+                MIN(CASE WHEN r.acked_at IS NULL THEN r.status END) AS "status",
+                MAX(r.acked_at) AS "ackedAt"
+              FROM ardud_mission_router_recipients r
+              JOIN ardud_mission_router_messages m
+                ON m.mission_id = r.mission_id AND m.seq = r.seq
+              LEFT JOIN ardud_mission_router_bodies b ON b.message_id = m.id
+              WHERE r.mission_id = ${missionId} AND r.seq > ${after}
+                AND ${sql.in("r.recipient", keys)}
+              GROUP BY r.seq
+              ${unackedOnly ? sql`HAVING SUM(CASE WHEN r.acked_at IS NULL THEN 1 ELSE 0 END) > 0` : sql``}
+              ORDER BY r.seq
+              LIMIT ${limit}
+            `.pipe(
+              Effect.map((rows) =>
+                rows.map((row): RecipientEntry => ({
+                  message: decodeMessage(row.json),
+                  body: row.body,
+                  delivery: Number(row.open) > 0 ? toStatus(row.status) : "acked",
+                  ackedAt: Number(row.open) > 0 ? null : row.ackedAt,
+                })),
+              ),
+            ),
+          ),
+
+    recipientsOf: (missionId, seq, keys) =>
+      keys.length === 0
+        ? Effect.succeed([])
+        : read(
+            sql<{
+              readonly key: string;
+              readonly status: string;
+              readonly ackedAt: string | null;
+            }>`
+              SELECT recipient AS "key", status AS "status", acked_at AS "ackedAt"
+              FROM ardud_mission_router_recipients
+              WHERE mission_id = ${missionId} AND seq = ${seq} AND ${sql.in("recipient", keys)}
+              ORDER BY recipient
+            `.pipe(
+              Effect.map((rows) =>
+                rows.map((row) => ({
+                  key: row.key,
+                  status: toStatus(row.status),
+                  ackedAt: row.ackedAt,
+                })),
+              ),
+            ),
+          ),
+
+    ackRecipients: ({ missionId, keys, at, scope }) =>
+      keys.length === 0
+        ? Effect.void
+        : write(sql`
+            UPDATE ardud_mission_router_recipients SET acked_at = ${at}
+            WHERE mission_id = ${missionId} AND acked_at IS NULL
+              AND ${sql.in("recipient", keys)}
+              AND ${
+                scope._tag === "seq"
+                  ? sql`seq = ${scope.seq}`
+                  : sql`room_id = ${scope.roomId} AND seq <= ${scope.upToSeq}`
+              }
+          `),
+
+    firstUnacked: (missionId, roomId, keys) =>
+      keys.length === 0
+        ? Effect.succeed(null)
+        : read(
+            sql<{ readonly seq: number | null }>`
+              SELECT MIN(seq) AS "seq" FROM ardud_mission_router_recipients
+              WHERE mission_id = ${missionId} AND room_id = ${roomId} AND acked_at IS NULL
+                AND ${sql.in("recipient", keys)}
+            `.pipe(Effect.map((rows) => (rows[0]?.seq == null ? null : Number(rows[0].seq)))),
+          ),
+
+    readDelivery: (threadId, missionId, seq) =>
+      write(sql`
+        UPDATE ardud_mission_router_deliveries SET read = 1
+        WHERE thread_id = ${threadId} AND mission_id = ${missionId} AND seq = ${seq}
+      `),
 
     messageByKey: (missionId, key) =>
       read(

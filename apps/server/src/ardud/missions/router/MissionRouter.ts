@@ -7,6 +7,7 @@ import {
   RoomId,
   SubscriptionId,
   ThreadId,
+  type CoordEventRef,
   type DecideKnockInput,
   type Knock,
   type MarkReadInput,
@@ -69,7 +70,7 @@ import {
   type SendSender,
 } from "./model.ts";
 import { RouterThreads } from "./ports.ts";
-import { RouterStore } from "./RouterStore.ts";
+import { RouterStore, type RecipientRow } from "./RouterStore.ts";
 
 /** One unread message waiting for a thread, as `mission_inbox` shows it. */
 export interface InboxEntry {
@@ -109,6 +110,22 @@ const standardRoom = (missionId: MissionId, roomId: RoomId) => {
 };
 
 export const controlRoomId = (missionId: MissionId) => RoomId.make(`${missionId}:room:control`);
+
+/** The thread an agent provenance speaks for; null for everyone else. */
+const actingThread = (provenance: MissionProvenance): ThreadId | null =>
+  provenance._tag === "agent" ? provenance.threadId : null;
+
+/**
+ * A post from a trusted server component that already resolved who is
+ * speaking (the coord shim). Not reachable from MCP or WS.
+ */
+export interface RelayRequest {
+  readonly input: PostMessageInput;
+  readonly provenance: MissionProvenance;
+  readonly author: MissionActor;
+  readonly authorThread: ThreadId | null;
+  readonly coord?: CoordEventRef;
+}
 
 /** Provenance for a guarded sender, from the transport context only. */
 const senderProvenance = (from: SendSender): MissionProvenance => {
@@ -202,6 +219,14 @@ export class MissionRouter extends Context.Service<
     readonly poke: (threadId: ThreadId) => Effect.Effect<void, MissionError>;
     /** A run on the thread ended: clear its outstanding wake and look again. */
     readonly settled: (threadId: ThreadId) => Effect.Effect<void, MissionError>;
+    /**
+     * Posts for a trusted server component that resolved the speaker itself
+     * (the coord shim). Same rules as `post` after that: dense seqs, key
+     * idempotency, in-mission recipients, the doorbell.
+     */
+    readonly relay: (
+      request: RelayRequest,
+    ) => Effect.Effect<{ readonly message: MissionMessage; readonly fresh: boolean }, MissionError>;
   }
 >()("t3/ardud/missions/router/MissionRouter") {}
 
@@ -396,10 +421,14 @@ const make = Effect.gen(function* () {
     readonly input: PostMessageInput;
     readonly provenance: MissionProvenance;
     readonly author: MissionActor;
+    /** The thread speaking when the provenance is not that agent's (the coord shim). */
+    readonly authorThread?: ThreadId | null;
+    /** Coord fields of a post that came through the coord shim. */
+    readonly coord?: CoordEventRef;
   }
 
   /** Writes one message after the caller's checks. Serialized so seqs stay dense per mission. */
-  const postChecked = ({ input, provenance, author }: PostPlan) =>
+  const postChecked = ({ input, provenance, author, authorThread, coord }: PostPlan) =>
     postLock.withPermit(
       Effect.gen(function* () {
         const room = yield* ensureRoom(input.missionId, input.roomId, provenance);
@@ -420,7 +449,13 @@ const make = Effect.gen(function* () {
         if (key !== null) {
           const prior = yield* rooms.messageByKey(input.missionId, key);
           if (prior !== null) {
-            if (prior.contentHash === contentHash) {
+            // Coord posts compare coord's own hash, the one its CLI sent.
+            const same =
+              coord === undefined
+                ? prior.contentHash === contentHash
+                : prior.message.coord !== undefined &&
+                  prior.message.coord.bodyHash === coord.bodyHash;
+            if (same) {
               return {
                 message: prior.message,
                 fresh: false,
@@ -486,8 +521,11 @@ const make = Effect.gen(function* () {
           receipt: input.kind === "control" ? receiptFor(seq, recipients, () => 0) : null,
           isCorrection,
           createdAt: at,
+          ...(coord === undefined ? {} : { coord }),
         };
-        const deliveries = yield* deliveryThreads(cast, message, subscriptions, item, provenance);
+        const speaker = authorThread ?? actingThread(provenance);
+        const deliveries = yield* deliveryThreads(cast, message, subscriptions, item, speaker);
+        const ledger = ledgerFor(cast, message, subscriptions, speaker);
         yield* store.commit({
           event: {
             missionId: input.missionId,
@@ -502,7 +540,7 @@ const make = Effect.gen(function* () {
           alongside: Effect.all(
             [
               rooms.putRoom({ ...room, lastSeq: seq, lastMessageAt: at }),
-              rooms.insertMessage({ message, body, contentHash, deliveries }),
+              rooms.insertMessage({ message, body, contentHash, deliveries, recipients: ledger }),
             ],
             { discard: true },
           ),
@@ -522,7 +560,7 @@ const make = Effect.gen(function* () {
     message: MissionMessage,
     subscriptions: ReadonlyArray<Subscription>,
     item: WorkItem | null,
-    provenance: MissionProvenance,
+    authorThread: ThreadId | null,
   ) =>
     Effect.gen(function* () {
       const targets = wakeTargets(message, {
@@ -531,7 +569,6 @@ const make = Effect.gen(function* () {
       });
       const masters = new Set(masterThreadsOf(cast));
       const fromOwner = message.author._tag === "owner";
-      const authorThread = provenance._tag === "agent" ? provenance.threadId : null;
       const out = new Set<ThreadId>();
       for (const actor of targets) {
         const addressed = message.to.some((each) => sameActor(each, actor));
@@ -548,13 +585,43 @@ const make = Effect.gen(function* () {
       return [...out] as ReadonlyArray<ThreadId>;
     });
 
+  /**
+   * Coord's delivery ledger for a message: the addressed actors, or else every
+   * subscriber of the room, minus the owner and the author. `pending` when it
+   * should reach a thread (addressed, or a wake subscription), else `skipped`,
+   * the way coord.db marked them.
+   */
+  const ledgerFor = (
+    cast: RouterCast,
+    message: MissionMessage,
+    subscriptions: ReadonlyArray<Subscription>,
+    speaker: ThreadId | null,
+  ): ReadonlyArray<RecipientRow> => {
+    const candidates =
+      message.to.length > 0
+        ? message.to.map((actor) => ({ actor, wake: true }))
+        : subscriptions.map((sub) => ({ actor: sub.subscriber, wake: sub.mode === "wake" }));
+    const out = new Map<string, RecipientRow>();
+    for (const { actor, wake } of candidates) {
+      if (actor._tag === "owner" || sameActor(actor, message.author)) continue;
+      const threads = threadsOfActor(cast, actor);
+      // The speaking thread's own role or lane is the author too.
+      if (speaker !== null && threads.includes(speaker)) continue;
+      const key = actorKey(actor);
+      if (out.has(key)) continue;
+      const pending = wake && threads.length > 0;
+      out.set(key, { key, status: pending ? "pending" : "skipped", ackedAt: null });
+    }
+    return [...out.values()];
+  };
+
   const afterPost = (
-    provenance: MissionProvenance,
+    speaker: ThreadId | null,
     deliveries: ReadonlyArray<ThreadId>,
   ): Effect.Effect<void> =>
     Effect.gen(function* () {
       // Posting during a wake counts as acting on it.
-      if (provenance._tag === "agent") yield* rooms.markActed(provenance.threadId);
+      if (speaker !== null) yield* rooms.markActed(speaker);
       yield* Effect.forEach(
         deliveries,
         (threadId) =>
@@ -580,8 +647,22 @@ const make = Effect.gen(function* () {
       }
       yield* requireReader(input.missionId, provenance);
       const result = yield* postChecked({ input, provenance, author: actorOf(provenance) });
-      if (result.fresh) yield* afterPost(provenance, result.deliveries);
+      if (result.fresh) yield* afterPost(actingThread(provenance), result.deliveries);
       return result.message;
+    });
+
+  const relay = (request: RelayRequest) =>
+    Effect.gen(function* () {
+      const mission = Option.getOrNull(yield* store.get("mission", request.input.missionId));
+      if (mission === null) {
+        return yield* fail("not-found", `No mission ${request.input.missionId}.`);
+      }
+      if (mission.status === "archived") {
+        return yield* fail("conflict", `Mission ${mission.title} is archived.`);
+      }
+      const result = yield* postChecked(request);
+      if (result.fresh) yield* afterPost(request.authorThread, result.deliveries);
+      return { message: result.message, fresh: result.fresh };
     });
 
   // ---------------------------------------------------------------------------
@@ -661,6 +742,13 @@ const make = Effect.gen(function* () {
       if (provenance._tag === "agent") {
         yield* rooms.readDeliveries(provenance.threadId, room.id, seq);
       }
+      // Reading a room in Robob acks it in coord's terms too.
+      yield* rooms.ackRecipients({
+        missionId: room.missionId,
+        keys: readersOf(cast, provenance).map(actorKey),
+        at: updatedAt,
+        scope: { _tag: "room", roomId: room.id, upToSeq: seq },
+      });
       return stored[0] ?? { roomId: room.id, reader: actorOf(provenance), seq, updatedAt };
     });
 
@@ -927,7 +1015,7 @@ const make = Effect.gen(function* () {
           });
           if (result.fresh) {
             yield* logDecision("routed", { messageId: result.message.id, seq: result.message.seq });
-            yield* afterPost(provenance, result.deliveries);
+            yield* afterPost(actingThread(provenance), result.deliveries);
           }
           return {
             _tag: "routed",
@@ -1095,6 +1183,7 @@ const make = Effect.gen(function* () {
     guard,
     poke,
     settled,
+    relay,
   });
 });
 

@@ -9,6 +9,7 @@ import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import { forkParked } from "../../../serverActivation.ts";
 import { TERMINAL_RUN_STATUSES } from "../../control/model.ts";
 import { asksRoomsLayer } from "./adapters.ts";
+import * as CoordShim from "./coordShim.ts";
 import { installSendGuard, requireSendGuard } from "./guardHook.ts";
 import * as MissionRouter from "./MissionRouter.ts";
 import { threadsLayer } from "./ports.ts";
@@ -24,7 +25,8 @@ requireSendGuard();
  * The router service with its tables and the real thread port. Referenced
  * by the asks ports and by `RouterLive`, so both share one instance.
  */
-export const RouterServicesLive = MissionRouter.layer.pipe(
+export const RouterServicesLive = CoordShim.layer.pipe(
+  Layer.provideMerge(MissionRouter.layer),
   Layer.provideMerge(Layer.mergeAll(RouterStore.layer, threadsLayer)),
 );
 

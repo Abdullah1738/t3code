@@ -8,6 +8,7 @@ import { missionsRouteLayer } from "./http.ts";
 import * as MissionService from "./MissionService.ts";
 import { policyRouteLayer } from "./policy/http.ts";
 import { PolicyLive } from "./policy/layer.ts";
+import { coordShimRouteLayer } from "./router/coordHttp.ts";
 import { RouterAsksRoomsLive, RouterLive } from "./router/layer.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
@@ -43,4 +44,5 @@ export const ArdudMissionsRoutesLive = Layer.mergeAll(
   scribeRouteLayer,
   missionsDeskRouteLayer,
   policyRouteLayer,
+  coordShimRouteLayer,
 );
