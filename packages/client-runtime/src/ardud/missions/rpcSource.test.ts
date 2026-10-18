@@ -144,6 +144,7 @@ describe("rpc missions source", () => {
       "portfolio",
       "recovery",
       "requests",
+      "sections",
       "suggestion-stats",
       "timeline",
       "work",

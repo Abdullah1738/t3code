@@ -1,7 +1,15 @@
 import type { MissionId, MissionListSnapshot, SubMissionId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { cardSubMission, draftKicker, draftTitle, noteFlags } from "./cardViewModel.ts";
+import {
+  cardSubMission,
+  draftKicker,
+  draftTitle,
+  entryHeadline,
+  masterRoutedEntries,
+  noteFlags,
+  ownerWaitingEntries,
+} from "./cardViewModel.ts";
 
 const MISSION = "crpko-engineering" as MissionId;
 const SUB = "sub-release" as SubMissionId;
@@ -50,5 +58,30 @@ describe("card wording", () => {
       { label: "No evidence", tone: "warning" },
       { label: "Quote differs", tone: "error" },
     ]);
+  });
+});
+
+describe("waiting entries", () => {
+  it("lists what waits on the owner oldest first and what the master holds apart", async () => {
+    const { createFixtureMissionsSource } = await import("./fixture/index.ts");
+    const source = createFixtureMissionsSource();
+    let inbox: Parameters<typeof ownerWaitingEntries>[0] | undefined;
+    const stop = source.subscribeInbox(MISSION, (value) => {
+      inbox = value;
+    });
+    stop();
+    if (!inbox) throw new Error("no inbox");
+    const waiting = ownerWaitingEntries(inbox);
+    expect(waiting.length).toBe(inbox.counts.decide + inbox.counts.approve + inbox.counts.knocks);
+    const times = waiting.map((entry) => entry.record.createdAt);
+    expect(times).toEqual([...times].sort());
+    const first = waiting[0];
+    if (!first) throw new Error("nothing waiting");
+    const headline = entryHeadline(first);
+    expect(headline.kicker.length).toBeGreaterThan(0);
+    expect(headline.since).toBe(first.record.createdAt);
+    expect(
+      masterRoutedEntries(inbox).every((entry) => !waiting.some((w) => w.key === entry.key)),
+    ).toBe(true);
   });
 });

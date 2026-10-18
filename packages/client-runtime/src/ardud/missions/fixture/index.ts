@@ -49,6 +49,7 @@ import * as data from "./data.ts";
 import { createEventLog } from "./eventLog.ts";
 import { createOperations } from "./operations.ts";
 import * as ops from "./opsData.ts";
+import { createRequests } from "./requests.ts";
 import { RerouteSeed, RoutingTableSeed } from "./schemas.ts";
 import { clampSummary, fail, newestFirst, replace } from "./util.ts";
 
@@ -721,6 +722,15 @@ export function createFixtureMissionsSource(
     postNudge,
   });
 
+  const requests = createRequests({
+    memo,
+    commit,
+    watch,
+    nowIso,
+    localId,
+    ownerWaiting: (missionId) => needsYou(missionId, null),
+  });
+
   function findMission(missionId: string) {
     return missions.find((m) => m.id === missionId);
   }
@@ -742,6 +752,7 @@ export function createFixtureMissionsSource(
     subscribeRoom: (roomId, listener) => watch(() => roomPage(roomId), listener),
     subscribeRouting: (missionId, listener) => watch(() => routingTable(missionId), listener),
     ...operations.source,
+    ...requests,
 
     loadRoomPage({ roomId, beforeSeq, limit }) {
       const room = rooms.find((r) => r.id === roomId);

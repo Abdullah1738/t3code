@@ -7,7 +7,13 @@ import type {
   SubMissionId,
 } from "@t3tools/contracts";
 
-import { NOTE_TYPE_LABEL } from "./inboxViewModel.ts";
+import {
+  inboxEntries,
+  NOTE_TYPE_LABEL,
+  SUGGESTION_TARGET_LABEL,
+  type InboxEntry,
+} from "./inboxViewModel.ts";
+import type { MissionInboxSnapshot } from "./source.ts";
 
 // Wording for the card frame: kickers, flags and the sub-mission link. Pure,
 // so the views track can reuse it when a template binds the same fields.
@@ -74,4 +80,59 @@ export function cardSubMission(
   const sub = mission?.subMissions.find((candidate) => candidate.id === subMissionId);
   if (!sub) return null;
   return { missionId, subMissionId: sub.id, rank: sub.order + 1, title: sub.title };
+}
+
+export interface EntryHeadline {
+  readonly kicker: string;
+  readonly title: string;
+  /** When it started waiting. */
+  readonly since: string;
+}
+
+/** Kicker, title and age of any inbox entry, for one-line rows (pinned strip, lists). */
+export function entryHeadline(entry: InboxEntry): EntryHeadline {
+  const since = entry.record.createdAt;
+  switch (entry.kind) {
+    case "ask":
+      return {
+        kicker: entry.record.urgency === "p0" ? "Urgent decision" : "Decision",
+        title: entry.record.question,
+        since,
+      };
+    case "draft":
+      return { kicker: draftKicker(entry.record), title: draftTitle(entry.record), since };
+    case "approval":
+      return { kicker: APPROVAL_KICKER[entry.record.kind], title: entry.record.title, since };
+    case "knock":
+      return { kicker: "Knock", title: entry.record.summary, since };
+    case "suggestion":
+      return {
+        kicker: SUGGESTION_TARGET_LABEL[entry.record.targetKind],
+        title: entry.record.title,
+        since,
+      };
+    case "note":
+      return { kicker: noteKicker(entry.record), title: entry.record.summary, since };
+  }
+}
+
+/**
+ * What waits on the owner in one inbox, longest waiting first: decisions,
+ * drafts and approvals routed to the owner, knocks. Its length is the
+ * mission's needs-you count.
+ */
+export function ownerWaitingEntries(inbox: MissionInboxSnapshot): InboxEntry[] {
+  return [
+    ...inboxEntries(inbox, "decide"),
+    ...inboxEntries(inbox, "approve"),
+    ...inboxEntries(inbox, "knocks"),
+  ].sort((left, right) => left.record.createdAt.localeCompare(right.record.createdAt));
+}
+
+/** Items routed to the master that the owner can still decide: drafts, approvals, suggestions. */
+export function masterRoutedEntries(inbox: MissionInboxSnapshot): InboxEntry[] {
+  return [
+    ...inboxEntries(inbox, "approve", "master"),
+    ...inboxEntries(inbox, "suggestions", "master"),
+  ];
 }

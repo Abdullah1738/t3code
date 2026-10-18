@@ -105,6 +105,7 @@ export const RPC_SAMPLED_FEEDS: ReadonlySet<SampledFeed> = new Set<SampledFeed>(
   "suggestion-stats",
   "recovery",
   "requests",
+  "sections",
 ]);
 
 /** Newest events kept per mission feed, for change attribution and refresh triggers. */
@@ -1034,6 +1035,19 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       bus.emit("pools");
     },
     setPortfolioOrder: (input) => fallback.setPortfolioOrder(input),
+
+    // Section lists keep the live mission id: they hold no mission data.
+    subscribeLayout: (missionId, listener) => fallback.subscribeLayout(missionId, listener),
+    changeSection: (input) => fallback.changeSection(input),
+    // Requests are sample threads, so they live under the sample mission.
+    subscribeRequests: (missionId, listener) =>
+      fallback.subscribeRequests(sampleId(missionId), listener),
+    openRequest: (input) =>
+      fallback.openRequest({ ...input, missionId: sampleId(input.missionId) }),
+    replyRequest: (input) => fallback.replyRequest(input),
+    settleRequest: (input) => fallback.settleRequest(input),
+    reopenRequest: (input) => fallback.reopenRequest(input),
+    markRequestRead: (input) => fallback.markRequestRead(input),
   };
 }
 

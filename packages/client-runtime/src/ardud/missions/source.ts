@@ -61,6 +61,8 @@ import type {
   WorkItem,
 } from "@t3tools/contracts";
 
+import type { ChangeSectionInput, MissionLayout } from "./sections.ts";
+
 export type Unsubscribe = () => void;
 export type Listener<T> = (value: T) => void;
 
@@ -404,6 +406,50 @@ export interface AddDraftNoteInput {
   readonly text: string;
 }
 
+// --- Owner requests ---
+// UI-side until the router track publishes `OwnerRequest` (record kind
+// owner-request) and its RPCs. The owner asks or tells the master something;
+// the master answers in the same thread and links what it made from it.
+
+export type OwnerRequestStatus = "waiting" | "answered" | "settled";
+
+export interface OwnerRequestMessage {
+  readonly id: string;
+  readonly author: "owner" | "master";
+  readonly text: string;
+  readonly at: string;
+  /** Records the master made or touched for this request: work items, asks, forks, rules. */
+  readonly refs: ReadonlyArray<MissionRecordRef>;
+}
+
+export interface OwnerRequest {
+  readonly id: string;
+  readonly missionId: MissionId;
+  readonly title: string;
+  readonly status: OwnerRequestStatus;
+  /** Oldest first. */
+  readonly messages: ReadonlyArray<OwnerRequestMessage>;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  /** When the owner last opened it; an answer after this is unread. */
+  readonly readAt: string | null;
+  readonly settledAt: string | null;
+}
+
+export interface OpenRequestInput {
+  readonly missionId: MissionId;
+  readonly text: string;
+}
+
+export interface ReplyRequestInput {
+  readonly requestId: string;
+  readonly text: string;
+}
+
+export interface RequestIdInput {
+  readonly requestId: string;
+}
+
 /**
  * Feeds a source may serve from sample data. Each names the screen section it
  * fills, so the section can say so once.
@@ -415,6 +461,7 @@ export const SAMPLED_FEEDS = [
   "suggestion-stats",
   "recovery",
   "requests",
+  "sections",
 ] as const;
 export type SampledFeed = (typeof SAMPLED_FEEDS)[number];
 
@@ -552,4 +599,22 @@ export interface MissionsSource {
   setCriticalityGuide(input: SetCriticalityGuideInput): Promise<void>;
   setPoolCapacity(input: SetPoolCapacityInput): Promise<void>;
   setPortfolioOrder(input: SetPortfolioOrderInput): Promise<void>;
+
+  /** The mission overview's section list; sample until the views track lands. */
+  subscribeLayout(missionId: MissionId, listener: Listener<MissionLayout>): Unsubscribe;
+  /** Hide, show, move, remove or restore one section; logged as the owner's change. */
+  changeSection(input: ChangeSectionInput): Promise<void>;
+
+  /** The owner's requests to the master, newest activity first. Sample until the router track lands. */
+  subscribeRequests(
+    missionId: MissionId,
+    listener: Listener<ReadonlyArray<OwnerRequest>>,
+  ): Unsubscribe;
+  /** Starts a request from the composer. */
+  openRequest(input: OpenRequestInput): Promise<OwnerRequest>;
+  replyRequest(input: ReplyRequestInput): Promise<void>;
+  settleRequest(input: RequestIdInput): Promise<void>;
+  reopenRequest(input: RequestIdInput): Promise<void>;
+  /** The owner opened the request; clears its unread dot. */
+  markRequestRead(input: RequestIdInput): Promise<void>;
 }

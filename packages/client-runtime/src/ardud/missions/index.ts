@@ -14,6 +14,8 @@ export * from "./poolsViewModel.ts";
 export * from "./timelineViewModel.ts";
 export * from "./portfolioViewModel.ts";
 export * from "./textDiff.ts";
+export * from "./sections.ts";
+export * from "./requestsViewModel.ts";
 export { createFixtureMissionsSource, type FixtureMissionsSourceOptions } from "./fixture/index.ts";
 export * from "./rpcSource.ts";
 export { createAtomMissionsTransport } from "./rpcTransport.ts";
