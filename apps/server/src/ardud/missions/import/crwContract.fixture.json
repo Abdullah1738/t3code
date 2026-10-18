@@ -1,0 +1,176 @@
+{
+  "about": "The exact requests crw's missions adapter sends to Robob (test/missions.test.mjs asserts the adapter still sends these bodies). The Robob fork copies this file into apps/server/src/ardud/missions/import/crwContract.fixture.json and replays it against the real route layers, so a shape change on either side fails a test. Calls carry the control token and the header x-t3-component: crw, never x-t3-thread-id. $hold.id and $hold.fence stand for the hold the take-hold call returned.",
+  "component": "crw",
+  "mission": "crpko",
+  "pool": "crpko:pool:reviews",
+  "requests": [
+    {
+      "name": "open approval",
+      "method": "POST",
+      "path": "/approvals/open",
+      "body": {
+        "missionId": "crpko",
+        "approvalId": "crpko:approval:crw:Equicom-Crypto/edge-api#901@aaaaaaaaaaaa",
+        "kind": "merge",
+        "title": "Good to merge: Equicom-Crypto/edge-api#901 Fix the thing",
+        "detail": "looks right\n\nDecide here, or reply Approved in the review thread (head aaaaaaaaaaaa).",
+        "requestedBy": "crw",
+        "links": [
+          {
+            "kind": "pull-request",
+            "label": "Equicom-Crypto/edge-api#901",
+            "url": "https://github.com/Equicom-Crypto/edge-api/pull/901",
+            "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "summary": "looks right",
+        "flags": ["padding"]
+      },
+      "expect": { "status": 200, "keys": ["ok", "seq", "ref"] },
+      "repeat": { "status": 200 }
+    },
+    {
+      "name": "read approvals",
+      "method": "GET",
+      "path": "/approvals?mission=crpko&id=crpko%3Aapproval%3Acrw%3AEquicom-Crypto%2Fedge-api%23901%40aaaaaaaaaaaa",
+      "expect": { "status": 200, "keys": ["ok", "approvals"] }
+    },
+    {
+      "name": "record review",
+      "method": "POST",
+      "path": "/reviews",
+      "body": {
+        "missionId": "crpko",
+        "pullRequest": { "repository": "Equicom-Crypto/edge-api", "number": 901 },
+        "stageId": "reviewer",
+        "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "verdict": "clear",
+        "links": [
+          {
+            "kind": "pull-request",
+            "label": "Equicom-Crypto/edge-api#901",
+            "url": "https://github.com/Equicom-Crypto/edge-api/pull/901",
+            "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ]
+      },
+      "expect": { "status": 200, "keys": ["ok", "seq", "ref"] }
+    },
+    {
+      "name": "review plan",
+      "method": "POST",
+      "path": "/review-plan",
+      "body": {
+        "missionId": "crpko",
+        "pullRequest": { "repository": "Equicom-Crypto/edge-api", "number": 901 },
+        "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expect": { "status": 200, "keys": ["ok", "plan"] }
+    },
+    {
+      "name": "roles",
+      "method": "GET",
+      "path": "/roles?missionId=crpko",
+      "expect": {
+        "status": 200,
+        "keys": ["ok", "missionId", "roles", "defaults", "bindings", "drift"]
+      }
+    },
+    {
+      "name": "pools",
+      "method": "GET",
+      "path": "/pools?missionId=crpko",
+      "expect": { "status": 200, "keys": ["ok", "pools", "at"] }
+    },
+    {
+      "name": "take hold",
+      "method": "POST",
+      "path": "/pools/holds",
+      "body": {
+        "poolId": "crpko:pool:reviews",
+        "missionId": "crpko",
+        "amount": 1,
+        "purpose": "crw review Equicom-Crypto/edge-api#950 at dddddddddddd",
+        "ttlSeconds": 25200
+      },
+      "expect": { "status": 200, "keys": ["ok", "hold", "queuePosition", "overCapacity"] }
+    },
+    {
+      "name": "release hold",
+      "method": "POST",
+      "path": "/pools/holds/release",
+      "body": {
+        "holdId": "$hold.id",
+        "fence": "$hold.fence",
+        "note": "review delivered (Good to merge)"
+      },
+      "expect": { "status": 200, "keys": ["ok", "seq", "ref"] }
+    },
+    {
+      "name": "close stale approval",
+      "method": "POST",
+      "path": "/approvals/stale",
+      "body": {
+        "missionId": "crpko",
+        "approvalId": "crpko:approval:crw:Equicom-Crypto/edge-api#901@aaaaaaaaaaaa",
+        "reason": "head moved to cccccccccccc"
+      },
+      "expect": { "status": 200, "keys": ["ok", "seq", "ref"] },
+      "repeat": { "status": 200 }
+    },
+    {
+      "name": "close the imported approval a draft replaces",
+      "method": "POST",
+      "path": "/approvals/stale",
+      "body": {
+        "missionId": "crpko",
+        "approvalId": "crpko:approval:crw:Equicom-Crypto/edge-api#901@aaaaaaaaaaaa",
+        "reason": "replaced by a feedback draft"
+      },
+      "expect": { "status": 200, "keys": ["ok", "seq", "ref"] }
+    },
+    {
+      "name": "open draft",
+      "route": "desk",
+      "method": "POST",
+      "path": "/desk/drafts/open",
+      "body": {
+        "missionId": "crpko",
+        "draftId": "crpko:draft:crw:Equicom-Crypto/edge-api#901@aaaaaaaaaaaa",
+        "requestedBy": "crw",
+        "audience": "dev1 (PR author)",
+        "channel": "github",
+        "target": {
+          "kind": "pull-request",
+          "label": "Equicom-Crypto/edge-api#901",
+          "url": "https://github.com/Equicom-Crypto/edge-api/pull/901",
+          "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "text": "fix the thing",
+        "summary": "looks right",
+        "flags": ["padding"]
+      },
+      "expect": { "status": 200, "keys": ["ok", "draft"] }
+    },
+    {
+      "name": "read draft decision",
+      "route": "desk",
+      "method": "GET",
+      "path": "/desk/drafts/crpko%3Adraft%3Acrw%3AEquicom-Crypto%2Fedge-api%23901%40aaaaaaaaaaaa/decision?head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&requestedBy=crw",
+      "expect": { "status": 200, "keys": ["ok", "decision"] }
+    },
+    {
+      "name": "close stale draft",
+      "route": "desk",
+      "method": "POST",
+      "path": "/desk/drafts/stale",
+      "body": {
+        "draftId": "crpko:draft:crw:Equicom-Crypto/edge-api#901@aaaaaaaaaaaa",
+        "requestedBy": "crw",
+        "reason": "head moved to cccccccccccc"
+      },
+      "expect": { "status": 200, "keys": ["ok", "draft"] }
+    }
+  ]
+}
