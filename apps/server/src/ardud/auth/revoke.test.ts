@@ -11,6 +11,7 @@ import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
@@ -227,3 +228,55 @@ it.layer(Layer.provideMerge(layerAuth, NodeServices.layer))("missions owner sess
     ),
   );
 });
+
+// Its own layer: this test drops the origins table out from under the server.
+it.layer(Layer.provideMerge(layerAuth, NodeServices.layer))(
+  "missions owner sessions, origins unreadable",
+  (it) => {
+    it.effect("when a session's origin cannot be read, nothing is revoked on a guess", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const auth = yield* EnvironmentAuth.EnvironmentAuth;
+          const sessions = yield* SessionStore.SessionStore;
+          const sql = yield* SqlClient.SqlClient;
+          const post = yield* makeServer;
+
+          // Neither session's origin has been read yet, so neither is cached.
+          const control = yield* auth.issueSession({ label: "bridges" });
+          const before = new Set((yield* auth.listSessions()).map((session) => session.sessionId));
+          const desktop = yield* auth.createBrowserSession(DESKTOP_TOKEN, client);
+          const desktopId = (yield* auth.listSessions()).find(
+            (session) => !before.has(session.sessionId),
+          )?.sessionId;
+          expect(desktopId).toBeDefined();
+          yield* sql`DROP TABLE ardud_mission_session_origins`;
+
+          const revoke = yield* post(
+            "/api/auth/clients/revoke",
+            { authorization: `Bearer ${control.token}` },
+            { sessionId: desktopId },
+          );
+          expect(revoke).toMatchObject({
+            status: 500,
+            body: { reason: "client_session_revoke_failed" },
+          });
+          const others = yield* post("/api/auth/clients/revoke-others", {
+            authorization: `Bearer ${control.token}`,
+          });
+          expect(others).toMatchObject({
+            status: 500,
+            body: { reason: "client_session_revoke_failed" },
+          });
+          expect(
+            yield* auth
+              .authenticateHttpRequest({
+                cookies: { [sessions.cookieName]: desktop.sessionToken },
+                headers: {},
+              } as never)
+              .pipe(Effect.as(true)),
+          ).toBe(true);
+        }),
+      ),
+    );
+  },
+);

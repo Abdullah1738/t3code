@@ -1344,6 +1344,8 @@ export const make = Effect.gen(function* () {
           Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
         );
       if (yield* owner(currentSessionId)) return yield* revokeOtherSessionsExcept(currentSessionId);
+      // One at a time and not atomic: a failure stops partway, and a session
+      // paired meanwhile is left alone. Owner sessions are never touched.
       let revoked = 0;
       for (const session of yield* listSessions()) {
         if (session.sessionId === currentSessionId || (yield* owner(session.sessionId))) continue;
