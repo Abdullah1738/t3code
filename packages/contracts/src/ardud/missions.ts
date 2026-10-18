@@ -188,6 +188,12 @@ export const MissionRecordKind = Schema.Literals([
   "approval",
   "fork",
   "thread",
+  // --- views additions ---
+  "view-template",
+  "view-section",
+  "view-layout",
+  "view-starter-layout",
+  // --- end views additions ---
 ]);
 export type MissionRecordKind = typeof MissionRecordKind.Type;
 
@@ -1546,6 +1552,21 @@ export const MissionEventKind = Schema.Literals([
   "recovery.incident-cleared",
   "recovery.settings-changed",
   // --- end recovery additions ---
+  // --- views additions ---
+  "view.template-defined",
+  "view.template-updated",
+  "view.template-removed",
+  "view.template-restored",
+  "view.section-placed",
+  "view.section-updated",
+  "view.section-moved",
+  "view.section-removed",
+  "view.section-restored",
+  "view.layout-changed",
+  "view.layout-restored",
+  "view.starter-layout-changed",
+  "view.starter-layout-restored",
+  // --- end views additions ---
   "field.locked",
   "field.unlocked",
   "governor.action",
