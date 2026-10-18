@@ -10,6 +10,10 @@
  * - `startup`: the pairing URL the server prints at startup.
  * - `cli`: `t3 pair` / `t3 auth pairing create`, run by whoever can read the
  *   server's state on the Mac.
+ *
+ *   These two only count until the server has an owner (see
+ *   `isBootstrapSource` and `claimOwner`): they pair the first owner device,
+ *   once. Every owner session, whatever its source, makes that claim.
  * - `desktop`: the desktop app pairing its own renderer.
  * - `dev-token`: dev mode's reusable credential from the owner's `.env`.
  * - `paired-client`: a pairing link created from a session that is itself an
@@ -35,6 +39,20 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 export type OwnerSource = "startup" | "cli" | "desktop" | "dev-token" | "paired-client";
+
+/**
+ * Links made on the Mac rather than from an owner device. Anything that can
+ * run commands as the owner's user can make one, agent shells included, so
+ * they only pair the first owner device. Once any owner session has existed
+ * this stays closed, even after every owner session expires or is revoked:
+ * new owner devices are paired from an owner device (Settings > Connections)
+ * or come from the desktop app's own bootstrap.
+ */
+export const isBootstrapSource = (source: OwnerSource) => source === "startup" || source === "cli";
+
+/** What `t3 pair` / `t3 auth pairing create` print (to stderr) when the link is not an owner link. */
+export const OWNER_ALREADY_PAIRED =
+  "Note: this server already has an owner, so this link pairs a device that is not the owner. To add an owner device, make the link from an owner device (Settings > Connections) or use the desktop app.";
 
 const OWNER_SOURCES: ReadonlySet<string> = new Set<OwnerSource>([
   "startup",
@@ -71,6 +89,13 @@ export interface SessionOriginsShape {
   readonly originOf: (
     sessionId: string,
   ) => Effect.Effect<SessionOrigin | null, SessionOriginsError>;
+  /**
+   * Notes that the server has an owner. True only for the first caller ever;
+   * a link made on the Mac makes an owner only if it wins this.
+   */
+  readonly claimOwner: (source: OwnerSource) => Effect.Effect<boolean, SessionOriginsError>;
+  /** Whether the server has ever had an owner session, live or not. */
+  readonly ownerClaimed: () => Effect.Effect<boolean, SessionOriginsError>;
   readonly componentSessions: () => Effect.Effect<
     ReadonlyArray<{
       readonly sessionId: string;
@@ -123,6 +148,13 @@ export const make = Effect.gen(function* () {
       created_at TEXT NOT NULL
     )
   `.pipe(Effect.mapError(fail("ensure-owner-grants")));
+  yield* sql`
+    CREATE TABLE IF NOT EXISTS ardud_mission_owner_claim (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      source TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `.pipe(Effect.mapError(fail("ensure-owner-claim")));
 
   // Origins never change, so a cached answer (including "none") stays right.
   // The row is written before its token exists, so "none" is never premature.
@@ -180,6 +212,26 @@ export const make = Effect.gen(function* () {
           Effect.mapError(fail("read-session-origin")),
         );
 
+  // One row. The insert is atomic, so two links exchanged at once cannot both
+  // be the first owner. Not cached: pairing is rare, and a headless server's
+  // owner who lost every device recovers by deleting the row by hand.
+  const claimOwner: SessionOriginsShape["claimOwner"] = (source) =>
+    Effect.gen(function* () {
+      const createdAt = yield* now;
+      const rows = yield* sql<{ readonly id: number }>`
+        INSERT OR IGNORE INTO ardud_mission_owner_claim (id, source, created_at)
+        VALUES (1, ${source}, ${createdAt})
+        RETURNING id
+      `;
+      return rows.length > 0;
+    }).pipe(Effect.mapError(fail("claim-owner")));
+
+  const ownerClaimed: SessionOriginsShape["ownerClaimed"] = () =>
+    sql<{ readonly id: number }>`SELECT id FROM ardud_mission_owner_claim`.pipe(
+      Effect.map((rows) => rows.length > 0),
+      Effect.mapError(fail("read-owner-claim")),
+    );
+
   const componentSessions: SessionOriginsShape["componentSessions"] = () =>
     sql<{ readonly session_id: string; readonly detail: string; readonly created_at: string }>`
       SELECT session_id, detail, created_at FROM ardud_mission_session_origins
@@ -196,7 +248,15 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("list-component-sessions")),
     );
 
-  return SessionOrigins.of({ markOwnerGrant, ownerGrant, record, originOf, componentSessions });
+  return SessionOrigins.of({
+    markOwnerGrant,
+    ownerGrant,
+    record,
+    originOf,
+    claimOwner,
+    ownerClaimed,
+    componentSessions,
+  });
 });
 
 export const layer = Layer.effect(SessionOrigins, make);

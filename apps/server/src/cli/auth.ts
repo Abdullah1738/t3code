@@ -14,6 +14,7 @@ import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 // ardud missions: core
 import {
   isReservedSessionSubject,
+  OWNER_ALREADY_PAIRED,
   ReservedSessionSubjectError,
 } from "../ardud/auth/SessionOrigins.ts";
 
@@ -109,6 +110,8 @@ const pairingCreateCommand = Command.make("create", {
             // ardud missions: core
             ownerSource: "cli",
           });
+          // ardud missions: core
+          if (issued.ownerMarked === false) yield* Console.error(OWNER_ALREADY_PAIRED);
           const output = formatIssuedPairingCredential(issued, {
             json: flags.json,
             ...(Option.isSome(flags.baseUrl) ? { baseUrl: flags.baseUrl.value } : {}),

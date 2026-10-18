@@ -60,6 +60,9 @@ export interface IssuedPairingLink {
   readonly label?: string;
   readonly createdAt: DateTime.Utc;
   readonly expiresAt: DateTime.Utc;
+  // ardud missions: core
+  /** Asked for with `ownerSource`: whether the link pairs an owner device. */
+  readonly ownerMarked?: boolean;
 }
 
 export interface IssuedBearerSession {
@@ -752,13 +755,19 @@ export const make = Effect.gen(function* () {
   const devAuth = resolveReusableDevAuth(config);
   // ardud missions: core
   const origins = yield* SessionOrigins.SessionOrigins;
+  // A failed lookup only costs the missions owner claim, never authentication.
   const originOf = (sessionId: AuthSessionId) =>
     devAuth?.sessionId === sessionId
       ? Effect.succeed<SessionOrigins.SessionOrigin | null>({ _tag: "owner", source: "dev-token" })
       : origins
           .originOf(sessionId)
           .pipe(
-            Effect.mapError((cause) => new ServerAuthSessionCredentialValidationError({ cause })),
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not read the session origin; treating it as none.").pipe(
+                Effect.annotateLogs({ cause: String(cause) }),
+                Effect.as(null),
+              ),
+            ),
           );
   const withOrigin = <S extends { readonly sessionId: AuthSessionId }>(session: S) =>
     originOf(session.sessionId).pipe(
@@ -766,26 +775,34 @@ export const make = Effect.gen(function* () {
     );
   // The origin a session minted from this grant gets: the desktop app's own
   // bootstrap, dev mode's credential, or a pairing link an owner issuer marked.
+  // Every owner session claims the server once; a link made on the Mac
+  // (`t3 pair`, the startup URL) only makes an owner if it is the first claim.
   const grantOrigin = (credential: string, method: string) =>
-    method === "desktop-bootstrap"
-      ? Effect.succeed<SessionOrigins.SessionOrigin | null>({ _tag: "owner", source: "desktop" })
-      : method === "reusable-dev-token"
-        ? Effect.succeed<SessionOrigins.SessionOrigin | null>({
-            _tag: "owner",
-            source: "dev-token",
-          })
-        : origins
-            .ownerGrant(credential)
-            .pipe(
-              Effect.map((source): SessionOrigins.SessionOrigin | null =>
-                source === null ? null : { _tag: "owner", source },
-              ),
-            );
+    Effect.gen(function* () {
+      const source: SessionOrigins.OwnerSource | null =
+        method === "desktop-bootstrap"
+          ? "desktop"
+          : method === "reusable-dev-token"
+            ? "dev-token"
+            : yield* origins.ownerGrant(credential);
+      if (source === null) return null;
+      // In dev mode the `.env` credential is the owner, so Mac links never are.
+      if (SessionOrigins.isBootstrapSource(source) && devAuth !== undefined) return null;
+      const first = yield* origins.claimOwner(source);
+      return SessionOrigins.isBootstrapSource(source) && !first
+        ? null
+        : ({ _tag: "owner", source } satisfies SessionOrigins.SessionOrigin);
+    });
+  // Written before the token leaves; if it cannot be, the new session is revoked.
   const recordOrigin = (
     sessionId: AuthSessionId,
     origin: SessionOrigins.SessionOrigin | null,
   ): Effect.Effect<void, SessionOrigins.SessionOriginsError> =>
-    origin === null ? Effect.void : origins.record(sessionId, origin);
+    origin === null
+      ? Effect.void
+      : origins
+          .record(sessionId, origin)
+          .pipe(Effect.tapError(() => sessions.revoke(sessionId).pipe(Effect.ignore)));
 
   const authenticateToken = (
     token: string,
@@ -953,9 +970,17 @@ export const make = Effect.gen(function* () {
       .consume(credential)
       .pipe(Effect.mapError(toBootstrapExchangeError));
     // ardud missions: core
-    const origin = yield* grantOrigin(credential, grant.method).pipe(
-      Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
-    );
+    // A browser re-pairing over its own owner cookie stays the owner.
+    const replacedOrigin =
+      previousSession?.method === "browser-session-cookie"
+        ? yield* originOf(previousSession.sessionId)
+        : null;
+    const origin =
+      replacedOrigin?._tag === "owner"
+        ? replacedOrigin
+        : yield* grantOrigin(credential, grant.method).pipe(
+            Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
+          );
     const session = yield* sessions
       .issue({
         method: "browser-session-cookie",
@@ -1142,10 +1167,17 @@ export const make = Effect.gen(function* () {
         ...(input?.purpose ? { purpose: input.purpose } : {}),
       });
       // ardud missions: core
-      if (input?.ownerSource) {
-        yield* origins.markOwnerGrant(issued.credential, input.ownerSource);
-      }
+      const ownerMarked =
+        input?.ownerSource === undefined
+          ? undefined
+          : SessionOrigins.isBootstrapSource(input.ownerSource) &&
+              (devAuth !== undefined || (yield* origins.ownerClaimed()))
+            ? false
+            : yield* origins
+                .markOwnerGrant(issued.credential, input.ownerSource)
+                .pipe(Effect.as(true));
       return {
+        ...(ownerMarked === undefined ? {} : { ownerMarked }),
         id: issued.id,
         credential: issued.credential,
         scopes: input?.scopes ?? AuthStandardClientScopes,

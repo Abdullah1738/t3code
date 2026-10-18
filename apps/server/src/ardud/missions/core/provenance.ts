@@ -60,6 +60,10 @@ export const componentProvenance = (session: OriginSession): MissionProvenance |
     ? { _tag: "system", component: session.origin.component }
     : null;
 
+/** Why an owner action was refused, and what to do about it. */
+export const OWNER_SESSION_REQUIRED =
+  "Owner actions need a Robob web, desktop or mobile session paired by the owner. A device paired before this check, or from a link the owner did not make, is not the owner: pair it again from an owner device (Settings > Connections).";
+
 /** The timeline actor for a write. */
 export const actorOf = (provenance: MissionProvenance): MissionActor => {
   switch (provenance._tag) {

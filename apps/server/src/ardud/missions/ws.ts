@@ -17,7 +17,7 @@ import * as Effect from "effect/Effect";
 
 import type { SessionOrigin } from "../auth/SessionOrigins.ts";
 import * as AsksService from "./asks/AsksService.ts";
-import { ownerAppProvenance } from "./core/provenance.ts";
+import { OWNER_SESSION_REQUIRED, ownerAppProvenance } from "./core/provenance.ts";
 import * as RuleService from "./core/RuleService.ts";
 import * as MissionService from "./MissionService.ts";
 // ardud missions: router
@@ -62,7 +62,7 @@ export const makeMissionWsHandlers = (
         ? Effect.fail(
             new MissionError({
               code: "provenance-required",
-              detail: "Owner actions need a paired Robob web, desktop or mobile session.",
+              detail: OWNER_SESSION_REQUIRED,
             }),
           )
         : write(provenance, input);
