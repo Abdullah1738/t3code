@@ -5,16 +5,22 @@ import type {
   OwnerSurface,
 } from "@t3tools/contracts";
 
+import type { SessionOrigin } from "../../auth/SessionOrigins.ts";
+
 /**
- * Provenance is decided by the transport, never read from a request body:
+ * Provenance is decided by the transport, never read from a request body or a
+ * request header:
  *
- * - WS from a session that was created by pairing a Robob client is the owner
- *   (`owner-app`, with the auth session id). See `isPairedClientSession`.
+ * - WS from a session minted from an owner-issued pairing grant is the owner
+ *   (`owner-app`, with the auth session id). The proof is the session's origin
+ *   claim (ardud/auth/SessionOrigins.ts), written when the session was minted
+ *   and never changed. The subject string is not proof.
  * - iMessage answers are `owner-imessage` once the asks track verified the
  *   inbound id.
  * - MCP tools are `agent`, bound to the calling thread.
- * - The control API (HTTP) is `system` for named components (crw), and the
- *   iMessage answer path above. It never claims a thread or the owner.
+ * - The control API (HTTP) is `system`: the named component its credential was
+ *   minted for (`componentProvenance`), or the shared control token. It never
+ *   claims a thread or the owner.
  */
 const OWNER_SURFACES: ReadonlySet<ClientSurface> = new Set<OwnerSurface>([
   "web",
@@ -25,49 +31,38 @@ const OWNER_SURFACES: ReadonlySet<ClientSurface> = new Set<OwnerSurface>([
 const isOwnerSurface = (surface: ClientSurface): surface is OwnerSurface =>
   OWNER_SURFACES.has(surface);
 
-/**
- * Auth session subjects that only come from consuming a pairing grant (a
- * browser cookie session for web and the desktop renderer, or the bearer/DPoP
- * session a mobile or desktop client exchanges its pairing credential for).
- * See `createBrowserSession` and `exchangeBootstrapCredentialForAccessToken`
- * in auth/EnvironmentAuth.ts; the subject is the grant's.
- *
- * Never the owner: `cli-issued-session` (`t3 auth session issue`, the control
- * token, project and import CLIs), `cloud-cli`, `mcp-client` (MCP OAuth), and
- * any custom subject.
- */
-const PAIRED_CLIENT_SUBJECTS: ReadonlySet<string> = new Set([
-  // createPairingLink / issuePairingCredential: `t3 pair`, Settings > Connections.
-  "one-time-token",
-  // The startup pairing URL the server prints.
-  "administrative-bootstrap",
-  // The desktop app pairing its own renderer.
-  "desktop-bootstrap",
-  // A T3 Connect client paired through the tunnel.
-  "cloud-connect",
-  // Dev mode's reusable browser credential and its exchanged sessions.
-  "reusable-dev-token",
-  "reusable-dev-token-child",
-]);
+export interface OriginSession {
+  readonly sessionId: string;
+  readonly origin?: SessionOrigin | undefined;
+}
 
-export const isPairedClientSession = (session: { readonly subject: string }) =>
-  PAIRED_CLIENT_SUBJECTS.has(session.subject);
+/** True when the session was minted from an owner-issued pairing grant. */
+export const isOwnerSession = (session: OriginSession) => session.origin?._tag === "owner";
 
 /**
- * The owner, when the WS session was created by pairing a Robob client and the
+ * The owner, when the session carries the owner origin claim and the
  * connection says it is a client UI. The surface only labels which UI; the
- * session subject is the proof. `null` otherwise (the CLI, an MCP or
- * CLI-issued token, a client claiming to be web).
+ * origin claim is the proof. `null` otherwise (the CLI, an MCP or CLI-issued
+ * token, a client paired by a nonowner issuer, a session from before origin
+ * claims existed).
  */
 export const ownerAppProvenance = (input: {
   readonly surface: ClientSurface | undefined;
-  readonly session: { readonly sessionId: string; readonly subject: string };
+  readonly session: OriginSession;
 }): MissionProvenance | null =>
-  input.surface !== undefined &&
-  isOwnerSurface(input.surface) &&
-  isPairedClientSession(input.session)
+  input.surface !== undefined && isOwnerSurface(input.surface) && isOwnerSession(input.session)
     ? { _tag: "owner-app", surface: input.surface, sessionId: input.session.sessionId }
     : null;
+
+/** The named component a session was minted for, as system provenance. */
+export const componentProvenance = (session: OriginSession): MissionProvenance | null =>
+  session.origin?._tag === "component"
+    ? { _tag: "system", component: session.origin.component }
+    : null;
+
+/** Why an owner action was refused, and what to do about it. */
+export const OWNER_SESSION_REQUIRED =
+  "Owner actions need a Robob web, desktop or mobile session paired by the owner. A device paired before this check, or from a link the owner did not make, is not the owner: pair it again from an owner device (Settings > Connections).";
 
 /** The timeline actor for a write. */
 export const actorOf = (provenance: MissionProvenance): MissionActor => {

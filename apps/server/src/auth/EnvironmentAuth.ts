@@ -46,6 +46,8 @@ import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./Reusa
 import { verifyRequestDpopProof } from "./dpop.ts";
 import { DESKTOP_RENDERER_ORIGINS } from "../httpCors.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+// ardud missions: core
+import * as SessionOrigins from "../ardud/auth/SessionOrigins.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -58,6 +60,9 @@ export interface IssuedPairingLink {
   readonly label?: string;
   readonly createdAt: DateTime.Utc;
   readonly expiresAt: DateTime.Utc;
+  // ardud missions: core
+  /** Asked for with `ownerSource`: whether the link pairs an owner device. */
+  readonly ownerMarked?: boolean;
 }
 
 export interface IssuedBearerSession {
@@ -112,6 +117,9 @@ export interface AuthenticatedSession {
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly proofKeyThumbprint?: string;
   readonly expiresAt?: DateTime.DateTime;
+  // ardud missions: core
+  /** Who minted the grant this session came from. Absent: neither the owner nor a component. */
+  readonly origin?: SessionOrigins.SessionOrigin;
 }
 
 const serverAuthInternalErrorContext = {
@@ -508,9 +516,15 @@ export class EnvironmentAuth extends Context.Service<
       readonly subject?: string;
       readonly proofKeyThumbprint?: string;
       readonly purpose?: "startup";
+      // ardud missions: core
+      /** Set only by owner-run issuers (`t3 pair`, the startup URL). */
+      readonly ownerSource?: SessionOrigins.OwnerSource;
     }) => Effect.Effect<IssuedPairingLink, ServerAuthInternalError>;
     readonly issuePairingCredential: (
       input?: AuthCreatePairingCredentialInput,
+      // ardud missions: core
+      /** The session asking. Its link is owner-issued only when it is an owner session. */
+      issuer?: { readonly sessionId: AuthSessionId },
     ) => Effect.Effect<AuthPairingCredentialResult, ServerAuthInternalError>;
     readonly issueStartupPairingCredential: () => Effect.Effect<
       AuthPairingCredentialResult,
@@ -739,6 +753,56 @@ export const make = Effect.gen(function* () {
   const descriptor = yield* policy.getDescriptor();
   const config = yield* ServerConfig.ServerConfig;
   const devAuth = resolveReusableDevAuth(config);
+  // ardud missions: core
+  const origins = yield* SessionOrigins.SessionOrigins;
+  // A failed lookup only costs the missions owner claim, never authentication.
+  const originOf = (sessionId: AuthSessionId) =>
+    devAuth?.sessionId === sessionId
+      ? Effect.succeed<SessionOrigins.SessionOrigin | null>({ _tag: "owner", source: "dev-token" })
+      : origins
+          .originOf(sessionId)
+          .pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not read the session origin; treating it as none.").pipe(
+                Effect.annotateLogs({ cause: String(cause) }),
+                Effect.as(null),
+              ),
+            ),
+          );
+  const withOrigin = <S extends { readonly sessionId: AuthSessionId }>(session: S) =>
+    originOf(session.sessionId).pipe(
+      Effect.map((origin) => (origin === null ? session : { ...session, origin })),
+    );
+  // The origin a session minted from this grant gets: the desktop app's own
+  // bootstrap, dev mode's credential, or a pairing link an owner issuer marked.
+  // Every owner session claims the server once; a link made on the Mac
+  // (`t3 pair`, the startup URL) only makes an owner if it is the first claim.
+  const grantOrigin = (credential: string, method: string) =>
+    Effect.gen(function* () {
+      const source: SessionOrigins.OwnerSource | null =
+        method === "desktop-bootstrap"
+          ? "desktop"
+          : method === "reusable-dev-token"
+            ? "dev-token"
+            : yield* origins.ownerGrant(credential);
+      if (source === null) return null;
+      // In dev mode the `.env` credential is the owner, so Mac links never are.
+      if (SessionOrigins.isBootstrapSource(source) && devAuth !== undefined) return null;
+      const first = yield* origins.claimOwner(source);
+      return SessionOrigins.isBootstrapSource(source) && !first
+        ? null
+        : ({ _tag: "owner", source } satisfies SessionOrigins.SessionOrigin);
+    });
+  // Written before the token leaves; if it cannot be, the new session is revoked.
+  const recordOrigin = (
+    sessionId: AuthSessionId,
+    origin: SessionOrigins.SessionOrigin | null,
+  ): Effect.Effect<void, SessionOrigins.SessionOriginsError> =>
+    origin === null
+      ? Effect.void
+      : origins
+          .record(sessionId, origin)
+          .pipe(Effect.tapError(() => sessions.revoke(sessionId).pipe(Effect.ignore)));
 
   const authenticateToken = (
     token: string,
@@ -766,6 +830,8 @@ export const make = Effect.gen(function* () {
         ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
         ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
       })),
+      // ardud missions: core
+      Effect.flatMap(withOrigin),
     );
 
   const resolveRequestCredential = (request: HttpServerRequest.HttpServerRequest) => {
@@ -903,6 +969,18 @@ export const make = Effect.gen(function* () {
     const grant = yield* bootstrapCredentials
       .consume(credential)
       .pipe(Effect.mapError(toBootstrapExchangeError));
+    // ardud missions: core
+    // A browser re-pairing over its own owner cookie stays the owner.
+    const replacedOrigin =
+      previousSession?.method === "browser-session-cookie"
+        ? yield* originOf(previousSession.sessionId)
+        : null;
+    const origin =
+      replacedOrigin?._tag === "owner"
+        ? replacedOrigin
+        : yield* grantOrigin(credential, grant.method).pipe(
+            Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
+          );
     const session = yield* sessions
       .issue({
         method: "browser-session-cookie",
@@ -917,6 +995,10 @@ export const make = Effect.gen(function* () {
         },
       })
       .pipe(Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })));
+    // ardud missions: core
+    yield* recordOrigin(session.sessionId, origin).pipe(
+      Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
+    );
     return {
       response: {
         authenticated: true,
@@ -983,7 +1065,13 @@ export const make = Effect.gen(function* () {
             if (grantedScopes.length === 0) {
               return yield* new ServerAuthScopeNotGrantedError({});
             }
-            return yield* sessions
+            // ardud missions: core
+            const origin = yield* grantOrigin(credential, grant.method).pipe(
+              Effect.mapError(
+                (cause) => new ServerAuthAuthenticatedAccessTokenIssueError({ cause }),
+              ),
+            );
+            const issued = yield* sessions
               .issue({
                 method: input?.proofKeyThumbprint ? "dpop-access-token" : "bearer-access-token",
                 subject: grant.subject,
@@ -1007,6 +1095,13 @@ export const make = Effect.gen(function* () {
                   (cause) => new ServerAuthAuthenticatedAccessTokenIssueError({ cause }),
                 ),
               );
+            // ardud missions: core
+            yield* recordOrigin(issued.sessionId, origin).pipe(
+              Effect.mapError(
+                (cause) => new ServerAuthAuthenticatedAccessTokenIssueError({ cause }),
+              ),
+            );
+            return issued;
           }),
         ),
         Effect.flatMap((session) =>
@@ -1037,12 +1132,15 @@ export const make = Effect.gen(function* () {
     readonly subject: string;
     readonly label?: string;
     readonly purpose?: "startup";
+    // ardud missions: core
+    readonly ownerSource?: SessionOrigins.OwnerSource;
   }) =>
     createPairingLink({
       scopes: input.scopes,
       subject: input.subject,
       ...(input.label ? { label: input.label } : {}),
       ...(input.purpose ? { purpose: input.purpose } : {}),
+      ...(input.ownerSource ? { ownerSource: input.ownerSource } : {}),
     }).pipe(
       Effect.map(
         (issued) =>
@@ -1068,7 +1166,18 @@ export const make = Effect.gen(function* () {
         ...(input?.proofKeyThumbprint ? { proofKeyThumbprint: input.proofKeyThumbprint } : {}),
         ...(input?.purpose ? { purpose: input.purpose } : {}),
       });
+      // ardud missions: core
+      const ownerMarked =
+        input?.ownerSource === undefined
+          ? undefined
+          : SessionOrigins.isBootstrapSource(input.ownerSource) &&
+              (devAuth !== undefined || (yield* origins.ownerClaimed()))
+            ? false
+            : yield* origins
+                .markOwnerGrant(issued.credential, input.ownerSource)
+                .pipe(Effect.as(true));
       return {
+        ...(ownerMarked === undefined ? {} : { ownerMarked }),
         id: issued.id,
         credential: issued.credential,
         scopes: input?.scopes ?? AuthStandardClientScopes,
@@ -1154,12 +1263,24 @@ export const make = Effect.gen(function* () {
       Effect.withSpan("EnvironmentAuth.revokeOtherSessionsExcept"),
     );
 
-  const issuePairingCredential: EnvironmentAuth["Service"]["issuePairingCredential"] = (input) =>
-    issuePairingCredentialForSubject({
-      scopes: input?.scopes ?? AuthStandardClientScopes,
-      subject: "one-time-token",
-      ...(input?.label ? { label: input.label } : {}),
-    }).pipe(Effect.withSpan("EnvironmentAuth.issuePairingCredential"));
+  const issuePairingCredential: EnvironmentAuth["Service"]["issuePairingCredential"] = (
+    input,
+    issuer,
+  ) =>
+    // ardud missions: core
+    // Only an owner session passes the owner mark on; any other issuer
+    // (a control token, a component) still gets a link, minus the mark.
+    (issuer === undefined ? Effect.succeed(null) : originOf(issuer.sessionId)).pipe(
+      Effect.flatMap((issuerOrigin) =>
+        issuePairingCredentialForSubject({
+          scopes: input?.scopes ?? AuthStandardClientScopes,
+          subject: "one-time-token",
+          ...(input?.label ? { label: input.label } : {}),
+          ...(issuerOrigin?._tag === "owner" ? { ownerSource: "paired-client" as const } : {}),
+        }),
+      ),
+      Effect.withSpan("EnvironmentAuth.issuePairingCredential"),
+    );
 
   const issueStartupPairingCredential: EnvironmentAuth["Service"]["issueStartupPairingCredential"] =
     () => {
@@ -1167,6 +1288,8 @@ export const make = Effect.gen(function* () {
         scopes: AuthAdministrativeScopes,
         subject: INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT,
         purpose: "startup",
+        // ardud missions: core
+        ownerSource: "startup",
       });
       if (!devAuth) {
         return fallback.pipe(Effect.withSpan("EnvironmentAuth.issueStartupPairingCredential"));
@@ -1264,6 +1387,8 @@ export const make = Effect.gen(function* () {
               scopes: session.scopes,
               ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
             })),
+            // ardud missions: core
+            Effect.flatMap(withOrigin),
           );
         }
       }
@@ -1379,6 +1504,8 @@ export const make = Effect.gen(function* () {
 });
 
 export const layer = Layer.effect(EnvironmentAuth, make).pipe(
+  // ardud missions: core
+  Layer.provideMerge(SessionOrigins.layer),
   Layer.provideMerge(PairingGrantStore.layer),
   Layer.provideMerge(SessionStore.layer),
   Layer.provideMerge(EnvironmentAuthPolicy.layer),

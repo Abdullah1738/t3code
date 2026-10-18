@@ -12,6 +12,7 @@ import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 
+import type { SessionOrigin } from "../auth/SessionOrigins.ts";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import { MISSIONS_ROUTE_PREFIX, missionsRouteLayer } from "./http.ts";
@@ -21,6 +22,12 @@ import * as MissionStore from "./store/MissionStore.ts";
 const TOKENS: Record<string, ReadonlyArray<AuthEnvironmentScope>> = {
   "Bearer reader": ["orchestration:read"],
   "Bearer operator": ["orchestration:read", "orchestration:operate"],
+  "Bearer crw": ["orchestration:read", "orchestration:operate"],
+  "Bearer scribe": ["orchestration:read", "orchestration:operate"],
+};
+const ORIGINS: Record<string, SessionOrigin> = {
+  "Bearer crw": { _tag: "component", component: "crw" },
+  "Bearer scribe": { _tag: "component", component: "scribe" },
 };
 
 const owner: MissionProvenance = { _tag: "owner-app", surface: "web", sessionId: "session-1" };
@@ -54,6 +61,9 @@ const makeHandler = () =>
                   subject: "test",
                   method: "bearer-access-token" as const,
                   scopes,
+                  ...(ORIGINS[request.headers.authorization ?? ""]
+                    ? { origin: ORIGINS[request.headers.authorization ?? ""] }
+                    : {}),
                 });
           },
         }),
@@ -174,10 +184,12 @@ describe("missions routes", () => {
           },
         ],
       };
-      const post = (path: string, body: unknown, token = "Bearer operator") =>
+      const post = (path: string, body: unknown, token = "Bearer crw") =>
         handler(request(path, { token, body }));
 
       expect((await post("/approvals/open", open, "Bearer reader")).status).toBe(403);
+      // The shared control token no longer speaks for crw by naming it in the body.
+      expect((await post("/approvals/open", open, "Bearer operator")).status).toBe(403);
       const opened = await post("/approvals/open", open);
       expect(opened.status).toBe(200);
       // Opening the same id again is settled, not a second record.
@@ -246,6 +258,35 @@ describe("missions routes", () => {
       for (const event of events.events) {
         expect(event.provenance).toEqual({ _tag: "system", component: "crw" });
       }
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("a component credential acts only for its own component on approvals", async () => {
+    const { handler, dispose } = makeHandler();
+    try {
+      const open = (approvalId: string, requestedBy: string) => ({
+        missionId,
+        approvalId,
+        kind: "merge",
+        title: "Good to merge",
+        detail: "looks right",
+        requestedBy,
+        links: [],
+      });
+      const post = (path: string, body: unknown, token: string) =>
+        handler(request(path, { token, body }));
+      // crw's credential opens crw's approval; scribe's cannot claim to be crw.
+      expect((await post("/approvals/open", open("a-1", "crw"), "Bearer crw")).status).toBe(200);
+      expect((await post("/approvals/open", open("a-2", "crw"), "Bearer scribe")).status).toBe(403);
+      expect((await post("/approvals/open", open("a-3", "scribe"), "Bearer scribe")).status).toBe(
+        403,
+      );
+      const stale = { missionId, approvalId: "a-1", reason: "head moved" };
+      expect((await post("/approvals/stale", stale, "Bearer scribe")).status).toBe(403);
+      expect((await post("/approvals/stale", stale, "Bearer operator")).status).toBe(403);
+      expect((await post("/approvals/stale", stale, "Bearer crw")).status).toBe(200);
     } finally {
       await dispose();
     }

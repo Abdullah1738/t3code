@@ -1,5 +1,5 @@
 {
-  "about": "The exact requests crw's missions adapter sends to Robob (test/missions.test.mjs asserts the adapter still sends these bodies). The Robob fork copies this file into apps/server/src/ardud/missions/import/crwContract.fixture.json and replays it against the real route layers, so a shape change on either side fails a test. Calls carry the control token and the header x-t3-component: crw, never x-t3-thread-id. $hold.id and $hold.fence stand for the hold the take-hold call returned.",
+  "about": "The exact requests crw's missions adapter sends to Robob (test/missions.test.mjs asserts the adapter still sends these bodies). The Robob fork copies this file into apps/server/src/ardud/missions/import/crwContract.fixture.json and replays it against the real route layers, so a shape change on either side fails a test. Calls carry crw's own component credential (t3 ardud component-token issue crw); the server knows the caller is crw from that token, and no identity header (x-t3-component, x-t3-thread-id) is sent. $hold.id and $hold.fence stand for the hold the take-hold call returned.",
   "component": "crw",
   "mission": "crpko",
   "pool": "crpko:pool:reviews",

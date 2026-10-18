@@ -36,6 +36,8 @@ import * as Schema from "effect/Schema";
 import { Command, Flag, GlobalFlag } from "effect/cli";
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 
+// ardud missions: core
+import { OWNER_ALREADY_PAIRED } from "../ardud/auth/SessionOrigins.ts";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import { resolveBaseDir } from "../os-jank.ts";
@@ -438,6 +440,8 @@ const mintPairingLink = Effect.fn("pair.mintPairingLink")(function* (input: {
       scopes: input.scopes,
       subject: "one-time-token",
       label: Option.getOrElse(input.label, () => "t3 pair"),
+      // ardud missions: core
+      ownerSource: "cli",
       ...(Option.isSome(input.ttl) ? { ttl: input.ttl.value } : {}),
     });
   }).pipe(
@@ -527,6 +531,8 @@ export const pairCommand = Command.make("pair", {
         label: flags.label,
       });
       const pairingUrl = buildPairingUrl(pairingBaseUrl, issued.credential);
+      // ardud missions: core
+      if (issued.ownerMarked === false) yield* Console.error(OWNER_ALREADY_PAIRED);
 
       yield* Console.log(
         formatPairOutput({

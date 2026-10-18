@@ -15,18 +15,27 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import type { SessionOrigin } from "../auth/SessionOrigins.ts";
 import * as AsksService from "./asks/AsksService.ts";
-import { ownerAppProvenance } from "./core/provenance.ts";
+import { OWNER_SESSION_REQUIRED, ownerAppProvenance } from "./core/provenance.ts";
 import * as RuleService from "./core/RuleService.ts";
 import * as MissionService from "./MissionService.ts";
 // ardud missions: router
 import { MissionRouter } from "./router/MissionRouter.ts";
 import { makeRouterWsHandlers } from "./router/ws.ts";
 
-/** The WS connection a handler set serves: its surface label and auth session. */
+/**
+ * The WS connection a handler set serves: its surface label and auth session.
+ * `origin` is the session's immutable origin claim; it, not `subject`, decides
+ * whether the caller is the owner.
+ */
 export interface MissionWsConnection {
   readonly surface: ClientSurface | undefined;
-  readonly session: { readonly sessionId: string; readonly subject: string };
+  readonly session: {
+    readonly sessionId: string;
+    readonly subject: string;
+    readonly origin?: SessionOrigin | undefined;
+  };
 }
 
 export interface MissionWsServices {
@@ -37,8 +46,8 @@ export interface MissionWsServices {
 
 /**
  * Missions WS handlers. Reads stream to any connection with read scope. Every
- * write is an owner action: it runs only on a paired Robob client session
- * (see `ownerAppProvenance`) and calls the same service method the master's
+ * write is an owner action: it runs only on a Robob client session paired by
+ * the owner (see `ownerAppProvenance`) and calls the same service method the master's
  * MCP tools call, with owner provenance.
  */
 export const makeMissionWsHandlers = (
@@ -53,7 +62,7 @@ export const makeMissionWsHandlers = (
         ? Effect.fail(
             new MissionError({
               code: "provenance-required",
-              detail: "Owner actions need a paired Robob web, desktop or mobile session.",
+              detail: OWNER_SESSION_REQUIRED,
             }),
           )
         : write(provenance, input);

@@ -11,11 +11,14 @@ import {
   type PullRequestKey,
   type RecordCriticalityInput,
   type RecordReviewInput,
+  type RecordTriggerFactsInput,
+  type RecordTriggerFactsResult,
   type ReviewPlan,
   type ReviewPlanRequest,
   type ReviewPolicy,
   type ReviewPolicySnapshot,
   type ReviewRecord,
+  type RoleId,
   type SetCriticalityGuideInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -23,6 +26,7 @@ import * as Option from "effect/Option";
 
 import {
   POLICY_PROVENANCE,
+  activeBindings,
   attempt,
   eventDraft,
   failWith,
@@ -40,6 +44,7 @@ import { callerModelKey } from "./roleOps.ts";
 import {
   defaultReviewPolicy,
   editPolicy,
+  effectiveVerdict,
   latestVerdict,
   mayJudge,
   newVerdict,
@@ -281,6 +286,35 @@ export const recordCriticality = (
     return { seq: committed.seq, ref: verdictRef(verdict) };
   });
 
+// ardud missions: core
+/** Components that run review stages and record them in their own name. */
+export const REVIEW_RECORDERS: ReadonlySet<string> = new Set(["crw"]);
+
+/**
+ * Who may record a stage's review: the owner, the master, the policy's own
+ * components, a review runner (crw), or a thread bound to the stage's role.
+ * A record moves the merge gate, so nobody else does.
+ */
+const mayRecordStage = (
+  deps: PolicyDeps,
+  caller: Caller,
+  missionId: MissionId,
+  roleId: RoleId,
+): Effect.Effect<boolean, MissionError> => {
+  const { provenance } = caller;
+  if (caller.byOwner || caller.isMaster || caller.trusted) return Effect.succeed(true);
+  if (provenance._tag === "system")
+    return Effect.succeed(REVIEW_RECORDERS.has(provenance.component));
+  if (provenance._tag !== "agent") return Effect.succeed(false);
+  return activeBindings(deps, missionId).pipe(
+    Effect.map((bindings) =>
+      bindings.some(
+        (binding) => binding.threadId === provenance.threadId && binding.roleId === roleId,
+      ),
+    ),
+  );
+};
+
 /**
  * Stores one review run as evidence bound to the exact head it read. The
  * stage's role is recorded; the model defaults to what the calling thread runs.
@@ -297,6 +331,13 @@ export const recordReview = (
     const { policy } = yield* loadPolicy(deps, input.missionId);
     const stage = policy.stages.find((candidate) => candidate.id === input.stageId);
     if (!stage) return yield* failWith("invalid", `Unknown review stage ${input.stageId}.`);
+    // ardud missions: core
+    if (!(yield* mayRecordStage(deps, caller, input.missionId, stage.roleId))) {
+      return yield* failWith(
+        "forbidden",
+        `Only the owner, the master, crw or a thread holding ${stage.roleId} records ${stage.label}.`,
+      );
+    }
     const roles = yield* missionRoles(deps, input.missionId, now);
     const role = roles.all.find((candidate) => candidate.id === stage.roleId);
     if (!role) {
@@ -355,9 +396,9 @@ export const recordReview = (
 
 /**
  * What a PR needs next at `headSha`: its verdict, each stage's state, the next
- * stage with its role and model, and whether it may merge. When facts are
- * given and a hard trigger fires, the policy records the critical verdict
- * itself.
+ * stage with its role and model, and whether it may merge. A pure read: facts
+ * that fire a hard trigger count in this plan only. `recordTriggerFacts`
+ * records them.
  */
 export const planReview = (
   deps: PolicyDeps,
@@ -368,24 +409,59 @@ export const planReview = (
     const now = yield* nowIso;
     const { policy } = yield* loadPolicy(deps, request.missionId);
     const roles = yield* missionRoles(deps, request.missionId, now);
-    const verdicts = yield* verdictsFor(deps, request.missionId, request.pullRequest);
     const result = reviewPlan({
       policy,
       pullRequest: request.pullRequest,
       headSha: request.headSha,
-      verdicts,
+      verdicts: yield* verdictsFor(deps, request.missionId, request.pullRequest),
       records: yield* recordsFor(deps, request.missionId, request.pullRequest),
       roles: roles.all,
       customLadderIds: request.customLadderIds,
       facts: request.facts,
       now,
     });
-    if (result.unrecordedTrigger !== null) {
-      yield* saveVerdict(
-        deps,
-        systemCaller(POLICY_PROVENANCE),
-        sequenced(result.unrecordedTrigger, verdicts.length),
+    // ardud missions: core (M2) - reading never stores a verdict.
+    return result.plan;
+  });
+
+// ardud missions: core (M2)
+/** Components that read PR facts from the forge and may report them. */
+export const TRIGGER_REPORTERS: ReadonlySet<string> = new Set(["crw"]);
+
+/**
+ * Records a fired hard trigger as the PR's verdict, in the reporter's name.
+ * Only the component that read the facts from the forge (crw) reports them;
+ * the owner and the master judge a PR directly with `recordCriticality`.
+ * Nothing fires, or a trigger is already on record: nothing is written.
+ */
+export const recordTriggerFacts = (
+  deps: PolicyDeps,
+  provenance: MissionProvenance,
+  input: RecordTriggerFactsInput,
+): Effect.Effect<RecordTriggerFactsResult, MissionError> =>
+  Effect.gen(function* () {
+    yield* requireMission(deps, input.missionId);
+    const caller = yield* resolveCaller(deps, provenance, input.missionId);
+    if (!(provenance._tag === "system" && TRIGGER_REPORTERS.has(provenance.component))) {
+      return yield* failWith(
+        "forbidden",
+        "Only crw reports the PR facts a hard trigger reads; the owner or the master records a verdict with mission_criticality.",
       );
     }
-    return result.plan;
+    const now = yield* nowIso;
+    const { policy } = yield* loadPolicy(deps, input.missionId);
+    const verdicts = yield* verdictsFor(deps, input.missionId, input.pullRequest);
+    const { unrecordedTrigger } = effectiveVerdict({
+      policy,
+      pullRequest: input.pullRequest,
+      verdicts,
+      facts: input.facts,
+      now,
+    });
+    if (unrecordedTrigger === null) {
+      return { recorded: false, verdict: latestVerdict(verdicts) };
+    }
+    const verdict = sequenced({ ...unrecordedTrigger, decidedBy: caller.actor }, verdicts.length);
+    yield* saveVerdict(deps, caller, verdict);
+    return { recorded: true, verdict };
   });

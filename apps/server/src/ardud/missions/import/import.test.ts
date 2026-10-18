@@ -578,9 +578,9 @@ it.layer(policyLayer)("applyPools", (it) => {
       expect(view?.pool.capacity).toBe(6);
       expect(view?.pool.enforcement).toBe("enforced");
 
-      // The master moves the capacity; a re-import reports it and leaves it.
+      // The owner moves the capacity; a re-import reports it and leaves it.
       yield* policy.setPoolCapacity(
-        { _tag: "system", component: "test" },
+        { _tag: "owner-app", surface: "web", sessionId: "session-1" },
         { poolId: PoolId.make("crpko:pool:review-slots"), capacity: 2 },
       );
       const again = yield* applyPools(p);

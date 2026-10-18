@@ -6,6 +6,7 @@ import {
   ThreadId,
   type MissionEvent,
   type MissionId,
+  type MissionProvenance,
   type PoolHoldId,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
@@ -21,6 +22,7 @@ import { CRPKO, JUNO, OWNER, SYSTEM, agent, makePorts, testLayer } from "./testi
 const ports = makePorts();
 const MASTER = agent("thread-master");
 const STRANGER = agent("thread-stranger");
+const CRW = { _tag: "system", component: "crw" } as const;
 const pr = { repository: "crpko/trading-core", number: 412 };
 
 const kinds = (events: ReadonlyArray<MissionEvent>) => events.map((event) => event.kind);
@@ -246,7 +248,7 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       assert.strictEqual(modelKey(plan.next!.modelSelection), modelKey(SOL_XHIGH));
 
       const record = (stageId: typeof reviewer, headSha: string, verdict: "clear" | "findings") =>
-        policy.recordReview(SYSTEM, {
+        policy.recordReview(CRW, {
           missionId: CRPKO,
           pullRequest: pr,
           stageId,
@@ -308,9 +310,28 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       });
       assert.strictEqual(plan.verdict?.source, "hard-trigger");
       assert.isTrue(plan.verdict?.critical);
-      // Stored: the plan without facts still sees it.
+      // M2: reading the plan with facts stored nothing.
+      plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: big, headSha: "a1" });
+      assert.strictEqual(plan.ladderId, "normal");
+      assert.isNull(plan.verdict);
+
+      // crw reports the facts it read; the trigger lands in crw's name.
+      const reported = yield* policy.recordTriggerFacts(CRW, {
+        missionId: CRPKO,
+        pullRequest: big,
+        facts: { changedLines: 2400 },
+      });
+      assert.isTrue(reported.recorded);
+      assert.deepStrictEqual(reported.verdict?.decidedBy, { _tag: "system", component: "crw" });
       plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: big, headSha: "a1" });
       assert.strictEqual(plan.ladderId, "critical");
+      // Reported again: already on record, nothing new.
+      const again = yield* policy.recordTriggerFacts(CRW, {
+        missionId: CRPKO,
+        pullRequest: big,
+        facts: { changedLines: 2400 },
+      });
+      assert.isFalse(again.recorded);
 
       yield* policy.recordCriticality(MASTER, {
         missionId: CRPKO,
@@ -346,6 +367,138 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
         }),
       );
       assert.strictEqual(forbidden.code, "forbidden");
+    }),
+  );
+
+  it.effect("M2: invented facts never become a verdict from a read or an unvouched caller", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      const quiet = { repository: "crpko/ledger", number: 78 };
+      yield* policy.setCriticalityGuide(MASTER, {
+        missionId: CRPKO,
+        text: "XL diffs are critical.",
+        hardTriggers: [{ _tag: "changed-lines", atLeast: 1500 }],
+      });
+      // Anyone may read a plan with whatever facts they like; nothing is stored.
+      for (let read = 0; read < 3; read++) {
+        yield* policy.reviewPlan({
+          missionId: CRPKO,
+          pullRequest: quiet,
+          headSha: "b1",
+          facts: { changedLines: 99_999, labels: ["critical"] },
+        });
+      }
+      let plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: quiet, headSha: "b1" });
+      assert.isNull(plan.verdict);
+      assert.strictEqual(plan.ladderId, "normal");
+
+      // A stranger thread, an MCP client, the shared control token, even the
+      // master: only crw read the facts from the forge, so only crw reports them.
+      for (const caller of [
+        STRANGER,
+        MASTER,
+        OWNER,
+        { _tag: "system", component: "mcp" } as const,
+        { _tag: "system", component: "control-api" } as const,
+      ]) {
+        const refused = yield* Effect.flip(
+          policy.recordTriggerFacts(caller, {
+            missionId: CRPKO,
+            pullRequest: quiet,
+            facts: { changedLines: 99_999 },
+          }),
+        );
+        assert.strictEqual(refused.code, "forbidden");
+      }
+      plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: quiet, headSha: "b1" });
+      assert.isNull(plan.verdict);
+
+      // The master judges the PR directly instead, in its own name.
+      yield* policy.recordCriticality(MASTER, {
+        missionId: CRPKO,
+        pullRequest: quiet,
+        critical: true,
+        reason: "touches the ledger",
+      });
+      plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: quiet, headSha: "b1" });
+      assert.strictEqual(plan.verdict?.decidedBy._tag, "role");
+    }),
+  );
+
+  it.effect("only a reviewer of the stage, crw, the master or the owner records a review", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      const gated = { repository: "crpko/ledger", number: 80 };
+      const reviewer = RoleId.make("crpko:reviewer");
+      const record = (caller: MissionProvenance) =>
+        policy.recordReview(caller, {
+          missionId: CRPKO,
+          pullRequest: gated,
+          stageId: ReviewStageId.make("reviewer"),
+          headSha: "g1",
+          verdict: "clear",
+        });
+      const reviewerState = policy
+        .reviewPlan({ missionId: CRPKO, pullRequest: gated, headSha: "g1" })
+        .pipe(
+          Effect.map((plan) => plan.stages.find((stage) => stage.stageId === "reviewer")?.state),
+        );
+
+      // A stray thread, the shared control token, an MCP client, another component:
+      // none can mark a stage clear, which is what opens the merge gate.
+      for (const caller of [
+        STRANGER,
+        { _tag: "system", component: "control-api" } as const,
+        { _tag: "system", component: "mcp-client:laptop" } as const,
+        { _tag: "system", component: "scribe" } as const,
+      ]) {
+        const refused = yield* Effect.flip(record(caller));
+        assert.strictEqual(refused.code, "forbidden");
+      }
+      assert.strictEqual(yield* reviewerState, "pending");
+
+      // A thread bound to the stage's role records it; so do crw, the master and the owner.
+      const holder = agent("thread-reviewer");
+      ports.threads.set("thread-reviewer", { exists: true, idle: true, modelSelection: SOL_XHIGH });
+      yield* policy.bindRole(MASTER, {
+        roleId: reviewer,
+        threadId: ThreadId.make("thread-reviewer"),
+      });
+      for (const caller of [holder, CRW, MASTER, OWNER]) {
+        yield* record(caller);
+      }
+      assert.strictEqual(yield* reviewerState, "done-at-head");
+    }),
+  );
+
+  it.effect("H3: callers from outside do not govern; only the policy's own components do", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      const outsiders = [
+        { _tag: "system", component: "control-api" } as const,
+        { _tag: "system", component: "mcp" } as const,
+        { _tag: "system", component: "mcp-client:laptop" } as const,
+        CRW,
+      ];
+      for (const caller of outsiders) {
+        const refused = yield* Effect.flip(
+          policy.setRoleModel(caller, {
+            roleId: RoleId.make("crpko:reviewer"),
+            modelSelection: HAIKU,
+            reason: "cheaper",
+          }),
+        );
+        assert.strictEqual(refused.code, "forbidden");
+        const verdict = yield* Effect.flip(
+          policy.recordCriticality(caller, {
+            missionId: CRPKO,
+            pullRequest: pr,
+            critical: false,
+            reason: "trust me",
+          }),
+        );
+        assert.strictEqual(verdict.code, "forbidden");
+      }
     }),
   );
 

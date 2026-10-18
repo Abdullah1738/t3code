@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import { OWNER_SESSION_REQUIRED } from "../core/provenance.ts";
 import type * as PolicyService from "./PolicyService.ts";
 
 /**
@@ -28,7 +29,7 @@ export const makePolicyWsHandlers = (
           Effect.fail(
             new MissionError({
               code: "provenance-required",
-              detail: "Owner actions need a Robob web, desktop or mobile connection.",
+              detail: OWNER_SESSION_REQUIRED,
             }),
           )
       : (input: I) => write(owner, input);

@@ -90,7 +90,7 @@ const ReviewPolicyTool = tool(
 
 const ReviewPlanTool = tool(
   "mission_review_plan",
-  "What a PR needs next at an exact head: its criticality verdict, the ladder, each stage's state (done-at-head, done-at-older-head, pending, needs-rerun), the next stage with its role and model, and whether merge is allowed. Pass facts (changed lines, paths, labels) so hard triggers can fire; a fired trigger is recorded as the PR's verdict.",
+  "What a PR needs next at an exact head: its criticality verdict, the ladder, each stage's state (done-at-head, done-at-older-head, pending, needs-rerun), the next stage with its role and model, and whether merge is allowed. Pass facts (changed lines, paths, labels) to see whether a hard trigger fires; this read never records it (use mission_criticality to record a verdict).",
   ReviewPlanRequest,
   ReviewPlan,
 );
@@ -276,7 +276,7 @@ const writeTool = <Name extends string, Config extends ToolConfig, R>(
 export const PolicyToolkit = Toolkit.make(
   readTool(RolesTool, "Mission roles"),
   readTool(ReviewPolicyTool, "Mission review policy"),
-  // Reading a plan can record a fired hard trigger, which is still a read for the caller.
+  // ardud missions: core (M2) - a pure read; facts never store a verdict.
   readTool(ReviewPlanTool, "PR review plan"),
   readTool(PoolsTool, "Mission pools"),
   readTool(GovernorTool, "Mission governor"),
