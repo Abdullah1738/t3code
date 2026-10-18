@@ -256,6 +256,7 @@ describe("schedule responses and authority durability (N6)", () => {
         yield* service
           .upsert(yield* taskInput({ threadId: free, schedule: { type: "webhook" } }))
           .pipe(as(owner));
+        // The calls go through the connection's guard, as the WS handlers make them.
         const guard = makeWsGuard({ ...cliConnection, sql });
         const id = ScheduledTaskId.make("scheduled-task:check");
         const replies = [
@@ -264,15 +265,10 @@ describe("schedule responses and authority durability (N6)", () => {
           yield* guard.schedules(service.rotateWebhookToken({ id })),
         ];
         for (const reply of replies) {
-          assert.isDefined(reply.task.webhook?.path);
-          const visible = yield* guard.visibleWebhook(reply);
-          assert.isUndefined(visible.task.webhook);
-          assert.notInclude(JSON.stringify(visible), "/hooks/");
+          assert.isUndefined(reply.task.webhook);
+          assert.notInclude(JSON.stringify(reply), "/hooks/");
         }
-        const raw = yield* service.setEnabled({ id, enabled: true }).pipe(as(owner));
-        const { task } = yield* guard.visibleWebhook(raw);
-        assert.isUndefined(task.webhook, "the cli connection still cannot see it");
-        const ownerView = yield* makeWsGuard({
+        const ownerReply = yield* makeWsGuard({
           surface: "web",
           session: {
             sessionId: "session-owner",
@@ -280,8 +276,8 @@ describe("schedule responses and authority durability (N6)", () => {
             origin: { _tag: "owner", source: "cli" },
           },
           sql,
-        }).visibleWebhook(raw);
-        assert.isDefined(ownerView.task.webhook);
+        }).schedules(service.setEnabled({ id, enabled: false }));
+        assert.isDefined(ownerReply.task.webhook?.path, "the owner still sees it");
       }),
     ),
   );

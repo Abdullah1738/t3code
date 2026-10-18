@@ -2190,8 +2190,7 @@ const layerWsRpc = (
             ),
           ),
         // ardud missions: guard - schedule calls run as this connection, and a
-        // member-bound webhook URL is shown only to its authority, in every
-        // response that carries a task.
+        // member-bound webhook URL is shown only to its authority.
         [WS_METHODS.scheduledTasksList]: (_input) =>
           scheduledTasks
             .list()
@@ -2204,13 +2203,10 @@ const layerWsRpc = (
               Stream.mapEffect(missionGuard.visibleWebhooks),
             ),
         [WS_METHODS.scheduledTasksUpsert]: (input) =>
-          missionGuard
-            .schedules(scheduledTasks.upsert(input))
-            .pipe(Effect.flatMap(missionGuard.visibleWebhook)),
+          missionGuard.schedules(scheduledTasks.upsert(input)),
         [WS_METHODS.scheduledTasksSetEnabled]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(missionGuard.schedules(scheduledTasks.setEnabled(input))),
-            Effect.flatMap(missionGuard.visibleWebhook),
           ),
         [WS_METHODS.scheduledTasksDelete]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
@@ -2219,12 +2215,10 @@ const layerWsRpc = (
         [WS_METHODS.scheduledTasksRunNow]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(missionGuard.schedules(scheduledTasks.runNow(input))),
-            Effect.flatMap(missionGuard.visibleWebhook),
           ),
         [WS_METHODS.scheduledTasksRotateWebhookToken]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(missionGuard.schedules(scheduledTasks.rotateWebhookToken(input))),
-            Effect.flatMap(missionGuard.visibleWebhook),
           ),
         [WS_METHODS.secretsAnswerRequest]: (input) =>
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
