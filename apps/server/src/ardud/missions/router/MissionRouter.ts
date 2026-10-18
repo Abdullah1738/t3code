@@ -1,5 +1,6 @@
 import {
   KnockId,
+  isOwnerProvenance,
   MissionError,
   MissionId,
   MissionMessageId,
@@ -185,6 +186,14 @@ export class MissionRouter extends Context.Service<
       input: DecideKnockInput,
       provenance: MissionProvenance,
     ) => Effect.Effect<Knock, MissionError>;
+    /**
+     * Pending knocks the caller may decide: all of them for the owner, and for
+     * the master only those not addressed to a master thread.
+     */
+    readonly knocks: (
+      missionId: MissionId,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<ReadonlyArray<Knock>, MissionError>;
     /** Unread messages delivered to a thread, oldest first, bounded. */
     readonly inbox: (threadId: ThreadId) => Effect.Effect<AgentInbox, MissionError>;
     /** The send guard. Every path into a thread calls this through guardHook. */
@@ -515,7 +524,7 @@ const make = Effect.gen(function* () {
       if (mission.status === "archived") {
         return yield* fail("conflict", `Mission ${mission.title} is archived.`);
       }
-      const owner = provenance._tag === "owner-app" || provenance._tag === "owner-imessage";
+      const owner = isOwnerProvenance(provenance);
       if (input.isCorrection === true && !owner) {
         return yield* fail("forbidden", "Only the owner posts corrections to the master.");
       }
@@ -667,7 +676,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const cast = yield* loadCast(input.missionId);
       if (cast.mission === null) return yield* fail("not-found", `No mission ${input.missionId}.`);
-      const owner = provenance._tag === "owner-app" || provenance._tag === "owner-imessage";
+      const owner = isOwnerProvenance(provenance);
       if (!owner && !isMaster(cast, provenance)) {
         return yield* fail("forbidden", "Only the owner or the mission's master changes members.");
       }
@@ -713,7 +722,7 @@ const make = Effect.gen(function* () {
         return yield* fail("conflict", `Knock ${knock.id} was already ${knock.status}.`);
       }
       const cast = yield* loadCast(knock.missionId);
-      const owner = provenance._tag === "owner-app" || provenance._tag === "owner-imessage";
+      const owner = isOwnerProvenance(provenance);
       const toMaster =
         knock.targetThreadId !== undefined && masterThreadsOf(cast).includes(knock.targetThreadId);
       if (!owner && !(isMaster(cast, provenance) && !toMaster)) {
@@ -969,6 +978,20 @@ const make = Effect.gen(function* () {
       yield* poke(threadId);
     });
 
+  const knocks = (missionId: MissionId, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const pending = yield* store.list("knock", { missionId, status: ["pending"] });
+      if (isOwnerProvenance(provenance)) return pending;
+      const cast = yield* loadCast(missionId);
+      if (!isMaster(cast, provenance)) {
+        return yield* fail("forbidden", "Only the owner or the mission's master reads knocks.");
+      }
+      const masters = masterThreadsOf(cast);
+      return pending.filter(
+        (knock) => knock.targetThreadId === undefined || !masters.includes(knock.targetThreadId),
+      );
+    });
+
   const inbox = (threadId: ThreadId) =>
     Effect.gen(function* () {
       const unread = yield* rooms.unreadDeliveries(threadId);
@@ -993,6 +1016,7 @@ const make = Effect.gen(function* () {
     subscribe,
     setMember,
     decideKnock,
+    knocks,
     inbox,
     guard,
     poke,

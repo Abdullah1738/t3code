@@ -55,6 +55,9 @@ import { ContextResetToolkit } from "../ardud/context-reset/tools.ts";
 // ardud missions: asks
 import * as MissionsHandlers from "../ardud/missions/tools/handlers.ts";
 import { MissionsToolkit } from "../ardud/missions/tools/tools.ts";
+// ardud missions: router
+import * as RouterToolHandlers from "../ardud/missions/router/toolHandlers.ts";
+import { RouterToolkit } from "../ardud/missions/router/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -832,6 +835,8 @@ const layerMissionsToolkitRegistration = toolkitRegistration(
   MissionsToolkit,
   MissionsHandlers.layer,
 );
+// ardud missions: router (MissionRouter comes from ArdudMissionsLive in server.ts)
+const layerRouterToolkitRegistration = toolkitRegistration(RouterToolkit, RouterToolHandlers.layer);
 const layerContextResetToolkitRegistration = toolkitRegistration(
   ContextResetToolkit,
   ContextResetHandlers.layer,
@@ -894,6 +899,8 @@ export const layer = Layer.mergeAll(
   layerContextResetToolkitRegistration,
   // ardud missions: asks
   layerMissionsToolkitRegistration,
+  // ardud missions: router
+  layerRouterToolkitRegistration,
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,
