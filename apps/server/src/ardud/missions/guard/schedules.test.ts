@@ -5,7 +5,7 @@
  */
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, describe, it } from "@effect/vitest";
-import { ScheduledTaskUpsertInput } from "@t3tools/contracts";
+import { ScheduledTaskId, ScheduledTaskUpsertInput } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -20,6 +20,7 @@ import * as Scheduler from "../../../scheduling/Scheduler.ts";
 import * as SecretRequests from "../../../secrets/SecretRequests.ts";
 import { authorityStore } from "./authority.ts";
 import {
+  free,
   lane,
   makeDelivered,
   master,
@@ -29,6 +30,7 @@ import {
 } from "./guard.testkit.ts";
 import { CurrentPrincipal, type GuardPrincipal } from "./principal.ts";
 import { refusedByGuard, withoutHiddenWebhooks } from "./schedules.ts";
+import { makeWsGuard } from "./ws.ts";
 
 const decodeUpsert = Schema.decodeUnknownEffect(ScheduledTaskUpsertInput);
 
@@ -91,8 +93,9 @@ const harness = Effect.gen(function* () {
     ),
   );
   const service = yield* ScheduledTaskService.ScheduledTaskService.pipe(Effect.provide(context));
-  const store = authorityStore(yield* SqlClient.SqlClient);
-  return { service, store, seen, delivered };
+  const sql = yield* SqlClient.SqlClient;
+  const store = authorityStore(sql);
+  return { service, store, seen, delivered, sql };
 });
 
 const run = <A, E>(body: (h: Effect.Success<typeof harness>) => Effect.Effect<A, E, Scope.Scope>) =>
@@ -221,6 +224,64 @@ describe("schedules bound to mission members (H7)", () => {
           .pipe(as(asThread(lane)), Effect.flip);
         assert.isTrue(refusedByGuard(error));
         assert.deepStrictEqual(seen.at(-1)?.from, { _tag: "thread", threadId: lane, title: lane });
+      }),
+    ),
+  );
+});
+
+describe("schedule responses (N6)", () => {
+  const cliConnection = {
+    surface: "cli" as const,
+    session: { sessionId: "session-cli", subject: "cli-issued-session" },
+  };
+
+  it.effect("a no-op pause or resume is still judged before it answers", () =>
+    run(({ service }) =>
+      Effect.gen(function* () {
+        yield* service.upsert(yield* taskInput({ schedule: { type: "webhook" } })).pipe(as(owner));
+        for (const enabled of [true, false, true]) {
+          const error = yield* service
+            .setEnabled({ id: ScheduledTaskId.make("scheduled-task:check"), enabled })
+            .pipe(as(asThread(outsider)), Effect.flip);
+          assert.isTrue(refusedByGuard(error));
+        }
+      }),
+    ),
+  );
+
+  it.effect("a reply to an unrelated operate caller carries no webhook path", () =>
+    run(({ service, sql }) =>
+      Effect.gen(function* () {
+        // Bound to a thread outside every mission, so the call passes the guard.
+        yield* service
+          .upsert(yield* taskInput({ threadId: free, schedule: { type: "webhook" } }))
+          .pipe(as(owner));
+        const guard = makeWsGuard({ ...cliConnection, sql });
+        const id = ScheduledTaskId.make("scheduled-task:check");
+        const replies = [
+          yield* guard.schedules(service.setEnabled({ id, enabled: true })),
+          yield* guard.schedules(service.setEnabled({ id, enabled: false })),
+          yield* guard.schedules(service.rotateWebhookToken({ id })),
+        ];
+        for (const reply of replies) {
+          assert.isDefined(reply.task.webhook?.path);
+          const visible = yield* guard.visibleWebhook(reply);
+          assert.isUndefined(visible.task.webhook);
+          assert.notInclude(JSON.stringify(visible), "/hooks/");
+        }
+        const raw = yield* service.setEnabled({ id, enabled: true }).pipe(as(owner));
+        const { task } = yield* guard.visibleWebhook(raw);
+        assert.isUndefined(task.webhook, "the cli connection still cannot see it");
+        const ownerView = yield* makeWsGuard({
+          surface: "web",
+          session: {
+            sessionId: "session-owner",
+            subject: "one-time-token",
+            origin: { _tag: "owner", source: "cli" },
+          },
+          sql,
+        }).visibleWebhook(raw);
+        assert.isDefined(ownerView.task.webhook);
       }),
     ),
   );

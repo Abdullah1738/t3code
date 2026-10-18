@@ -9,6 +9,7 @@ import type {
   ClientSurface,
   McpAppUpdateModelContextInput,
   OrchestrationV2Command,
+  ScheduledTask,
   ScheduledTaskListResult,
   ThreadId,
 } from "@t3tools/contracts";
@@ -29,7 +30,7 @@ import {
   type WsSession,
 } from "./principal.ts";
 import { requestAnswerText } from "./requests.ts";
-import { withoutHiddenWebhooks } from "./schedules.ts";
+import { withoutHiddenWebhook, withoutHiddenWebhooks } from "./schedules.ts";
 import { authorizeWatch } from "./watches.ts";
 
 interface GuardedWrite {
@@ -187,6 +188,11 @@ export const makeWsGuard = (input: {
     visibleWebhooks: (result: ScheduledTaskListResult) =>
       withoutHiddenWebhooks(store, principal, result.tasks).pipe(
         Effect.map((tasks): ScheduledTaskListResult => ({ tasks })),
+      ),
+    /** The same, for a call that answers with one task. */
+    visibleWebhook: <T extends { readonly task: ScheduledTask }>(result: T) =>
+      withoutHiddenWebhook(store, principal, result.task).pipe(
+        Effect.map((task): T => ({ ...result, task })),
       ),
   };
 };

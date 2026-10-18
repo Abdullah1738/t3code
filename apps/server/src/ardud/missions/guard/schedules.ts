@@ -136,23 +136,32 @@ export const webhookVisible = (
     return authority !== null && samePrincipal(authority, principal);
   });
 
-/** Drops webhook URLs the caller may not see. */
+/**
+ * Drops the webhook endpoint if the caller may not see it. The whole endpoint
+ * goes, since its `path` carries the token even when there is no public URL.
+ */
+export const withoutHiddenWebhook = <T extends Pick<ScheduledTask, "id" | "threadId" | "webhook">>(
+  store: AuthorityStore,
+  principal: GuardPrincipal | undefined,
+  task: T,
+): Effect.Effect<T> =>
+  task.webhook === undefined
+    ? Effect.succeed(task)
+    : webhookVisible(store, principal, task).pipe(
+        Effect.map((visible) => {
+          if (visible) return task;
+          const { webhook: _hidden, ...rest } = task;
+          return rest as T;
+        }),
+      );
+
+/** Drops webhook endpoints the caller may not see. */
 export const withoutHiddenWebhooks = <T extends Pick<ScheduledTask, "id" | "threadId" | "webhook">>(
   store: AuthorityStore,
   principal: GuardPrincipal | undefined,
   tasks: ReadonlyArray<T>,
 ): Effect.Effect<Array<T>> =>
-  Effect.forEach(tasks, (task) =>
-    task.webhook === undefined
-      ? Effect.succeed(task)
-      : webhookVisible(store, principal, task).pipe(
-          Effect.map((visible) => {
-            if (visible) return task;
-            const { webhook: _hidden, ...rest } = task;
-            return rest as T;
-          }),
-        ),
-  );
+  Effect.forEach(tasks, (task) => withoutHiddenWebhook(store, principal, task));
 
 /** Whether a schedule call failed because the guard refused it. */
 export const refusedByGuard = (error: ScheduledTaskError): boolean =>

@@ -1209,13 +1209,14 @@ export const layer = Layer.effect(
     const setEnabled: ScheduledTaskService["Service"]["setEnabled"] = (input) =>
       Effect.gen(function* () {
         const existing = yield* loadTask(input.id);
-        if (existing.enabled === input.enabled) return { task: existing };
-        // ardud missions: guard - resuming delivers the prompt again.
+        // ardud missions: guard - resuming delivers the prompt again. Checked
+        // before the no-op return, which would otherwise hand back the task.
         const principal = yield* authorizeScheduleChange({
           taskId: input.id,
           threads: [existing.threadId],
           text: input.enabled ? existing.prompt : `Pause the schedule "${existing.title}".`,
         });
+        if (existing.enabled === input.enabled) return { task: existing };
         const now = yield* localNow;
         if (input.enabled && onceRunInPast(existing.schedule, now)) {
           return yield* taskError(ONCE_IN_PAST_MESSAGE, { taskId: input.id });
