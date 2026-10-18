@@ -1,7 +1,7 @@
 // Regressions for the boundary review (Sol, H8-H10 and M3) and the round 2
 // self-review: each test walks one exploit chain end to end.
 import { describe, expect, it } from "@effect/vitest";
-import { DraftNoteId, type MissionLink } from "@t3tools/contracts";
+import { DraftNoteId, type MissionLink, type Suggestion } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -426,6 +426,91 @@ describe("boundary review regressions", () => {
       );
       expect(decided.status).toBe("accepted");
       expect(decided.outcome).toBe("Not applied: the applier failed unexpectedly.");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("an accepted suggestion the last process never applied applies at startup", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const store = yield* MissionStore.MissionStore;
+      const propose = (title: string) =>
+        asks.proposeSuggestion(
+          {
+            missionId,
+            targetKind: "lane",
+            target: { kind: "lane", id: "lane-api" },
+            title,
+            after: { name: title },
+            diffText: `API -> ${title}`,
+            why: "It grew.",
+            evidence: [{ kind: "lane", id: "lane-api" }],
+          },
+          governor,
+        );
+      // The state a crash leaves: the decision committed, no outcome yet.
+      const acceptedThenCrashed = (suggestion: Suggestion) =>
+        store.commit({
+          event: {
+            missionId,
+            kind: "suggestion.decided",
+            actor: { _tag: "thread", threadId: masterThread },
+            provenance: master,
+            summary: `Suggestion accepted: ${suggestion.title}`,
+            subject: { kind: "suggestion", id: suggestion.id, label: suggestion.title },
+            payload: { action: "accept" },
+          },
+          upserts: [
+            {
+              _tag: "suggestion",
+              record: { ...suggestion, status: "accepted", decidedBy: master, decidedAt: at },
+            },
+          ],
+        });
+      const fresh = yield* propose("API v2");
+      const freshDecision = yield* acceptedThenCrashed(fresh);
+      // This one's applier committed its change before the crash.
+      const halfDone = yield* propose("API v3");
+      const halfDoneDecision = yield* acceptedThenCrashed(halfDone);
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "lane.updated",
+          actor: { _tag: "system", component: "missions" },
+          provenance: master,
+          summary: "Lane renamed",
+          subject: { kind: "lane", id: "lane-api" },
+          causedBy: halfDoneDecision.event.id,
+        },
+      });
+
+      const applied: string[] = [];
+      const registry = yield* Ports.SuggestionApplierRegistry;
+      yield* registry.register(["lane"], (application) =>
+        Effect.sync(() => {
+          applied.push(application.suggestion.id);
+          return `Applied: lane renamed to ${(application.after as { name: string }).name}.`;
+        }),
+      );
+
+      yield* asks.applyPendingSuggestions;
+      expect(applied).toEqual([fresh.id]);
+      const outcomeOf = (id: string) =>
+        store
+          .get("suggestion", id)
+          .pipe(Effect.map((found) => (found._tag === "Some" ? found.value.outcome : null)));
+      expect(yield* outcomeOf(fresh.id)).toBe("Applied: lane renamed to API v2.");
+      expect(yield* outcomeOf(halfDone.id)).toMatch(/^Applied before a restart/);
+      const events = yield* store.eventsSince(missionId, 0);
+      const appliedEvents = events.filter((event) => event.kind === "suggestion.applied");
+      expect(appliedEvents.map((event) => event.causedBy).toSorted()).toEqual(
+        [freshDecision.event.id, halfDoneDecision.event.id].toSorted(),
+      );
+
+      // A second sweep finds nothing left to do.
+      yield* asks.applyPendingSuggestions;
+      expect(applied).toEqual([fresh.id]);
     }).pipe(Effect.provide(layer));
   });
 

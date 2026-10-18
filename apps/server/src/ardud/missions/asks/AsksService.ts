@@ -316,6 +316,8 @@ export class AsksService extends Context.Service<
       input: ReopenSuggestionInput,
       provenance: MissionProvenance,
     ) => Fx<Suggestion>;
+    /** Startup: applies accepted suggestions the last process left without an outcome. */
+    readonly applyPendingSuggestions: Fx<ReadonlyArray<Suggestion>>;
     // Forks
     readonly startFork: (input: StartForkInput, provenance: MissionProvenance) => Fx<ForkResult>;
     readonly closeFork: (input: CloseForkInput, provenance: MissionProvenance) => Fx<ForkResult>;
@@ -349,6 +351,12 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const lock = yield* Semaphore.make(1);
   const serialized = <A, E, R>(effect: Effect.Effect<A, E, R>) => lock.withPermits(1)(effect);
+
+  /**
+   * Suggestions whose applier runs in this process. Claimed under the asks
+   * lock with the decision, so the startup sweep never runs one twice.
+   */
+  const applying = new Set<string>();
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
   const newId = (prefix: string) =>
@@ -1214,6 +1222,7 @@ const make = Effect.gen(function* () {
         decisionId: committed.id,
         decider,
       };
+      if (application !== null) applying.add(record.id);
       return pending;
     });
 
@@ -1253,22 +1262,127 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const pending = yield* serialized(decideSuggestionStep(input, provenance));
         if (pending.application === null) return pending.record;
-        const result = yield* appliers.apply(pending.application, pending.decider).pipe(
-          Effect.map((outcome) => ({ outcome, applied: outcome.startsWith("Applied") })),
-          Effect.catch((error: MissionError) =>
-            Effect.succeed({ outcome: `Not applied: ${error.detail}`, applied: false }),
-          ),
-          Effect.catchCause((cause) =>
-            Effect.as(Effect.logWarning("missions: suggestion applier crashed", cause), {
-              outcome: "Not applied: the applier failed unexpectedly.",
-              applied: false,
-            }),
-          ),
-          Effect.provideService(MissionStore.MissionCause, pending.decisionId),
-        );
-        return yield* serialized(recordApplied(pending, result.outcome, result.applied));
+        return yield* applyDecided(pending, pending.application);
       }),
     );
+
+  /** Runs a claimed decision's applier and records what it did. */
+  const applyDecided = (pending: PendingApplication, application: SuggestionApplication) =>
+    Effect.gen(function* () {
+      const result = yield* appliers.apply(application, pending.decider).pipe(
+        Effect.map((outcome) => ({ outcome, applied: outcome.startsWith("Applied") })),
+        Effect.catch((error: MissionError) =>
+          Effect.succeed({ outcome: `Not applied: ${error.detail}`, applied: false }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.as(Effect.logWarning("missions: suggestion applier crashed", cause), {
+            outcome: "Not applied: the applier failed unexpectedly.",
+            applied: false,
+          }),
+        ),
+        Effect.provideService(MissionStore.MissionCause, pending.decisionId),
+      );
+      return yield* serialized(recordApplied(pending, result.outcome, result.applied));
+    }).pipe(Effect.ensuring(Effect.sync(() => applying.delete(pending.record.id))));
+
+  /**
+   * The latest decision event of each listed suggestion on a timeline, and
+   * whether anything the applier committed already follows from it.
+   */
+  const decisionTrail = (timeline: MissionId, ids: ReadonlySet<string>) =>
+    Effect.gen(function* () {
+      const trail = new Map<string, { decision: MissionEvent; followed: boolean }>();
+      const byDecision = new Map<string, string>();
+      let afterSeq = 0;
+      for (;;) {
+        const page = yield* store.eventsSince(timeline, afterSeq, 500);
+        for (const event of page) {
+          if (
+            event.kind === "suggestion.decided" &&
+            event.subject?.kind === "suggestion" &&
+            ids.has(event.subject.id)
+          ) {
+            trail.set(event.subject.id, { decision: event, followed: false });
+            byDecision.set(event.id, event.subject.id);
+          } else if (event.causedBy !== null) {
+            const id = byDecision.get(event.causedBy);
+            const entry = id === undefined ? undefined : trail.get(id);
+            if (entry !== undefined && entry.decision.id === event.causedBy) entry.followed = true;
+          }
+        }
+        const last = page.at(-1);
+        if (last === undefined || page.length < 500) return trail;
+        afterSeq = last.seq;
+      }
+    });
+
+  /**
+   * After a restart: accepted suggestions that never got an outcome because
+   * the server stopped between the decision and its applier. One whose
+   * applier already committed something is not run twice; the outcome says
+   * so. The rest apply now, caused by their decision like a live accept.
+   */
+  const applyPendingSuggestionsCommand = Effect.gen(function* () {
+    const claimed = yield* serialized(
+      Effect.gen(function* () {
+        const accepted = yield* store.list("suggestion", { status: ["accepted", "edited"] });
+        const waiting = accepted.filter(
+          (suggestion) =>
+            suggestion.outcome === null &&
+            suggestion.targetKind !== "draft-note" &&
+            !applying.has(suggestion.id),
+        );
+        const timelines = new Map<MissionId, Suggestion[]>();
+        for (const suggestion of waiting) {
+          const timeline = suggestion.missionId ?? GLOBAL_TIMELINE;
+          timelines.set(timeline, [...(timelines.get(timeline) ?? []), suggestion]);
+        }
+        const found: Array<{ pending: PendingApplication; followed: boolean }> = [];
+        for (const [timeline, suggestions] of timelines) {
+          const trail = yield* decisionTrail(
+            timeline,
+            new Set(suggestions.map((suggestion) => suggestion.id)),
+          );
+          for (const record of suggestions) {
+            const entry = trail.get(record.id);
+            if (entry === undefined) {
+              yield* Effect.logWarning(
+                `missions: accepted suggestion ${record.id} has no decision event; left unapplied`,
+              );
+              continue;
+            }
+            applying.add(record.id);
+            found.push({
+              pending: {
+                record,
+                application: {
+                  suggestion: record,
+                  targetKind: record.targetKind,
+                  target: record.target,
+                  after: record.after,
+                },
+                decisionId: entry.decision.id,
+                decider: record.decidedBy ?? entry.decision.provenance,
+              },
+              followed: entry.followed,
+            });
+          }
+        }
+        return found;
+      }),
+    );
+    return yield* Effect.forEach(claimed, ({ pending, followed }) =>
+      followed || pending.application === null
+        ? serialized(
+            recordApplied(
+              pending,
+              "Applied before a restart: its changes follow the decision on the timeline, but the server stopped before recording the outcome.",
+              true,
+            ),
+          ).pipe(Effect.ensuring(Effect.sync(() => applying.delete(pending.record.id))))
+        : applyDecided(pending, pending.application),
+    );
+  });
 
   const reopenSuggestionCommand = (input: ReopenSuggestionInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
@@ -1601,6 +1715,7 @@ const make = Effect.gen(function* () {
     // Serializes its own steps: the applier runs outside the lock.
     decideSuggestion: decideSuggestionCommand,
     reopenSuggestion: (input, provenance) => serialized(reopenSuggestionCommand(input, provenance)),
+    applyPendingSuggestions: Effect.uninterruptible(applyPendingSuggestionsCommand),
     startFork: (input, provenance) => serialized(startForkCommand(input, provenance)),
     closeFork: (input, provenance) => serialized(closeForkCommand(input, provenance)),
     updateFork: (input, provenance) => serialized(updateForkCommand(input, provenance)),
