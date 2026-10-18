@@ -24,21 +24,35 @@ import {
 } from "./AsksService.testkit.ts";
 import { MISSIONS_DESK_PREFIX, missionsDeskRouteLayer, sinceMillis } from "./http.ts";
 
+const READ = ["orchestration:read" as const];
+const OPERATE = ["orchestration:read" as const, "orchestration:operate" as const];
 const SCOPES = {
-  "Bearer read": ["orchestration:read" as const],
-  "Bearer operate": ["orchestration:read" as const, "orchestration:operate" as const],
+  "Bearer read": READ,
+  "Bearer operate": OPERATE,
+  // Component credentials (`t3 ardud component-token issue <name>`).
+  "Bearer crw-read": READ,
+  "Bearer crw": OPERATE,
+  "Bearer scribe": OPERATE,
+};
+const COMPONENT: Partial<Record<keyof typeof SCOPES, string>> = {
+  "Bearer crw-read": "crw",
+  "Bearer crw": "crw",
+  "Bearer scribe": "scribe",
 };
 
 const fakeAuth = {
   authenticateHttpRequest: (request: HttpServerRequest.HttpServerRequest) => {
-    const scopes = SCOPES[request.headers.authorization as keyof typeof SCOPES];
+    const token = request.headers.authorization as keyof typeof SCOPES;
+    const scopes = SCOPES[token];
+    const component = COMPONENT[token];
     return scopes === undefined
       ? Effect.fail(new EnvironmentAuth.ServerAuthInvalidCredentialError({ diagnostic: "none" }))
       : Effect.succeed({
           sessionId: AuthSessionId.make("session-1"),
-          subject: "mission-cli",
+          subject: component === undefined ? "mission-cli" : `component:${component}`,
           method: "bearer-access-token" as const,
           scopes,
+          ...(component === undefined ? {} : { origin: { _tag: "component" as const, component } }),
         });
   },
 } as unknown as EnvironmentAuth.EnvironmentAuth["Service"];
@@ -213,29 +227,60 @@ describe("missions desk HTTP", () => {
       });
       const result = yield* withDesk(async (handle) => {
         const readOnly = await handle(
-          request("/drafts/open", "Bearer read", open("aaa111", "crw-1")),
+          request("/drafts/open", "Bearer crw-read", open("aaa111", "crw-1")),
         );
         const stranger = await handle(
-          request("/drafts/open", "Bearer operate", {
+          request("/drafts/open", "Bearer crw", {
             ...open("aaa111", "crw-1"),
             requestedBy: "bot",
           }),
         );
+        // N5: naming crw in the body is not crw's credential.
+        const controlToken = await handle(
+          request("/drafts/open", "Bearer operate", open("aaa111", "crw-1")),
+        );
+        const otherComponent = await handle(
+          request("/drafts/open", "Bearer scribe", open("aaa111", "crw-1")),
+        );
         const opened = await body(
-          await handle(request("/drafts/open", "Bearer operate", open("aaa111", "crw-1"))),
+          await handle(request("/drafts/open", "Bearer crw", open("aaa111", "crw-1"))),
         );
         const noHead = await handle(
-          request("/drafts/crw-1/decision?requestedBy=crw", "Bearer read"),
+          request("/drafts/crw-1/decision?requestedBy=crw", "Bearer crw-read"),
         );
+        const controlRead = await handle(
+          request("/drafts/crw-1/decision?head=aaa111&requestedBy=crw", "Bearer read"),
+        );
+        // Identity headers count for nothing, so they are refused even when they agree.
+        const named = request("/drafts/crw-1/decision?head=aaa111", "Bearer crw-read");
+        named.headers.set("x-t3-component", "crw");
+        const namedHeader = await handle(named);
+        const role = request("/drafts/crw-1/decision?head=aaa111", "Bearer crw-read");
+        role.headers.set("x-t3-role-id", "role-master");
+        const roleHeader = await handle(role);
         const waiting = await body(
-          await handle(
-            request("/drafts/crw-1/decision?head=aaa111&requestedBy=crw", "Bearer read"),
-          ),
+          await handle(request("/drafts/crw-1/decision?head=aaa111", "Bearer crw-read")),
         );
-        return { readOnly, stranger, opened, noHead, waiting };
+        return {
+          readOnly,
+          stranger,
+          controlToken,
+          otherComponent,
+          opened,
+          noHead,
+          controlRead,
+          namedHeader,
+          roleHeader,
+          waiting,
+        };
       });
+      expect(result.namedHeader.status).toBe(403);
+      expect(result.roleHeader.status).toBe(400);
       expect(result.readOnly.status).toBe(403);
       expect(result.stranger.status).toBe(403);
+      expect(result.controlToken.status).toBe(403);
+      expect(result.otherComponent.status).toBe(403);
+      expect(result.controlRead.status).toBe(403);
       expect(result.opened.draft).toMatchObject({
         requestedBy: "crw",
         head: "aaa111",
@@ -256,23 +301,31 @@ describe("missions desk HTTP", () => {
       const after = yield* withDesk(async (handle) => {
         const decided = await body(
           await handle(
-            request("/drafts/crw-1/decision?head=aaa111&requestedBy=crw", "Bearer read"),
+            request("/drafts/crw-1/decision?head=aaa111&requestedBy=crw", "Bearer crw-read"),
           ),
         );
         const otherHead = await body(
           await handle(
-            request("/drafts/crw-1/decision?head=bbb222&requestedBy=crw", "Bearer read"),
+            request("/drafts/crw-1/decision?head=bbb222&requestedBy=crw", "Bearer crw-read"),
           ),
         );
-        const stale = await handle(
+        const controlStale = await handle(
           request("/drafts/stale", "Bearer operate", {
             draftId: "crw-1",
             requestedBy: "crw",
             reason: "head moved",
           }),
         );
-        return { decided, otherHead, stale };
+        const stale = await handle(
+          request("/drafts/stale", "Bearer crw", {
+            draftId: "crw-1",
+            requestedBy: "crw",
+            reason: "head moved",
+          }),
+        );
+        return { decided, otherHead, controlStale, stale };
       });
+      expect(after.controlStale.status).toBe(403);
       expect(after.decided.decision).toMatchObject({
         state: "approved",
         text: "Please add a backoff.",
@@ -295,8 +348,13 @@ describe("missions desk HTTP", () => {
         url: `https://github.com/crpko/api/pull/8#issuecomment-${n}`,
         ref: null,
       });
-      const report = (revision: number, outcome: Record<string, unknown>, extra = {}) =>
-        request("/drafts/sent", "Bearer operate", {
+      const report = (
+        revision: number,
+        outcome: Record<string, unknown>,
+        extra = {},
+        token: keyof typeof SCOPES = "Bearer crw",
+      ) =>
+        request("/drafts/sent", token, {
           draftId: "crw-8",
           requestedBy: "crw",
           revision,
@@ -305,7 +363,7 @@ describe("missions desk HTTP", () => {
         });
       const early = yield* withDesk(async (handle) => {
         await handle(
-          request("/drafts/open", "Bearer operate", {
+          request("/drafts/open", "Bearer crw", {
             missionId,
             draftId: "crw-8",
             requestedBy: "crw",
@@ -335,7 +393,7 @@ describe("missions desk HTTP", () => {
 
       const result = yield* withDesk(async (handle) => {
         const readOnly = await handle(
-          request("/drafts/sent", "Bearer read", {
+          request("/drafts/sent", "Bearer crw-read", {
             draftId: "crw-8",
             requestedBy: "crw",
             revision: 1,
@@ -345,6 +403,9 @@ describe("missions desk HTTP", () => {
         const stranger = await handle(
           report(1, { _tag: "sent", link: comment(1) }, { requestedBy: "bot" }),
         );
+        const controlToken = await handle(
+          report(1, { _tag: "sent", link: comment(1) }, {}, "Bearer operate"),
+        );
         const oldRevision = await handle(report(0, { _tag: "sent", link: comment(1) }));
         const failed = await body(await handle(report(1, { _tag: "send-failed", reason: "403" })));
         const failedAgain = await body(
@@ -352,7 +413,7 @@ describe("missions desk HTTP", () => {
         );
         const decision = await body(
           await handle(
-            request("/drafts/crw-8/decision?head=ccc333&requestedBy=crw", "Bearer read"),
+            request("/drafts/crw-8/decision?head=ccc333&requestedBy=crw", "Bearer crw-read"),
           ),
         );
         const sent = await body(await handle(report(1, { _tag: "sent", link: comment(1) })));
@@ -361,12 +422,13 @@ describe("missions desk HTTP", () => {
         const failAfter = await handle(report(1, { _tag: "send-failed", reason: "late" }));
         const afterSent = await body(
           await handle(
-            request("/drafts/crw-8/decision?head=ccc333&requestedBy=crw", "Bearer read"),
+            request("/drafts/crw-8/decision?head=ccc333&requestedBy=crw", "Bearer crw-read"),
           ),
         );
         return {
           readOnly,
           stranger,
+          controlToken,
           oldRevision,
           failed,
           failedAgain,
@@ -380,6 +442,7 @@ describe("missions desk HTTP", () => {
       });
       expect(result.readOnly.status).toBe(403);
       expect(result.stranger.status).toBe(403);
+      expect(result.controlToken.status).toBe(403);
       expect(result.oldRevision.status).toBe(409);
       expect(result.failed.draft).toMatchObject({ status: "send-failed", sendError: "403" });
       expect(result.failedAgain.draft).toMatchObject({ status: "send-failed", sendError: "403" });

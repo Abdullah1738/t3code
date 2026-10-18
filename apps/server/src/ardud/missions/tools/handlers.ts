@@ -233,7 +233,18 @@ const handlers = {
         return invalid("A new draft needs missionId, audience, channel and target.");
       }
       return asks
-        .submitDraft({ missionId, audience, channel, target, text: input.text }, provenance)
+        .submitDraft(
+          {
+            missionId,
+            audience,
+            channel,
+            target,
+            text: input.text,
+            ...(input.subMissionId === undefined ? {} : { subMissionId: input.subMissionId }),
+            ...(input.workItemId === undefined ? {} : { workItemId: input.workItemId }),
+          },
+          provenance,
+        )
         .pipe(Effect.map((draft) => ({ draft })));
     }),
   ),

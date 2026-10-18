@@ -32,6 +32,7 @@ import {
   type Outcome,
   type Transition,
 } from "./shared.ts";
+import { optionCollision } from "./provenance.ts";
 
 /** Fields that would let an ask resolve itself. Rejected wherever they appear. */
 export const FORBIDDEN_ASK_KEYS: ReadonlyArray<string> = [
@@ -185,6 +186,9 @@ export const openAsk = (command: OpenAskCommand): Outcome<Transition<Ask>> => {
     if (optionIds.has(option.id)) return refuse("invalid", `Duplicate option id ${option.id}.`);
     optionIds.add(option.id);
   }
+  // He answers by naming an option; two options one reply could name are refused here.
+  const collision = optionCollision(input.options);
+  if (collision !== null) return refuse("invalid", collision);
   const recommendation = input.recommendation ?? null;
   if (
     recommendation !== null &&
@@ -273,6 +277,12 @@ export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => 
   }
   if (ask.id !== input.askId) return refuse("invalid", "Answer is for a different ask.");
   if (ask.status !== "open") return refuse("conflict", `Ask ${ask.id} is ${ask.status}.`);
+  if (provenance._tag === "owner-imessage" && spentInbounds(ask).includes(provenance.inboundId)) {
+    return refuse(
+      "provenance-invalid",
+      `iMessage ${provenance.inboundId} answered ask ${ask.id} before it was reopened; it does not answer it again.`,
+    );
+  }
   const text = input.text.trim();
   if (input.optionId !== null && optionLabel(ask, input.optionId) === null) {
     return refuse("invalid", `Option ${input.optionId} is not one of the ask's options.`);
@@ -411,14 +421,56 @@ export interface ReopenAskCommand {
   readonly now: string;
 }
 
-/** The owner takes an answer back; the ask holds its records again. */
+/** The ask's answer epoch: 0 when opened, +1 on every reopen. */
+export const askRevisionOf = (ask: Pick<Ask, "revision">): number => ask.revision ?? 0;
+
+type AskClock = Pick<Ask, "revision" | "revisedAt" | "status" | "createdAt" | "updatedAt">;
+
+/**
+ * An open ask reopened before asks kept an epoch: no revision, but touched
+ * after it opened. Only a reopen moves an open ask's updatedAt.
+ */
+const reopenedUnversioned = (ask: AskClock): boolean =>
+  ask.revision === undefined &&
+  ask.status === "open" &&
+  Date.parse(ask.updatedAt) > Date.parse(ask.createdAt);
+
+/** When the current epoch began; an answer's evidence must not predate it. */
+export const askEpochOf = (ask: AskClock): string =>
+  reopenedUnversioned(ask) ? ask.updatedAt : (ask.revisedAt ?? ask.createdAt);
+
+/** Whether the ask was reopened, so its epoch allows no clock skew. */
+export const askReopened = (ask: AskClock): boolean =>
+  askRevisionOf(ask) > 0 || reopenedUnversioned(ask);
+
+const spentInbounds = (ask: Pick<Ask, "spentInboundIds">): ReadonlyArray<string> =>
+  ask.spentInboundIds ?? [];
+
+/**
+ * The owner takes an answer back; the ask holds its records again. A new
+ * epoch starts, and the iMessage that gave the old answer is spent for this
+ * ask, so relaying it again cannot answer the reopened ask.
+ */
 export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> => {
   const { ask, provenance } = command;
   if (!isOwnerProvenance(provenance)) {
     return refuse("provenance-required", "Only the owner reopens an ask.");
   }
   if (ask.status !== "answered") return refuse("conflict", `Ask ${ask.id} is ${ask.status}.`);
-  const record: Ask = { ...ask, status: "open", answer: null, updatedAt: command.now };
+  const evidence = ask.answer?.provenance;
+  const spent =
+    evidence?._tag === "owner-imessage" && !spentInbounds(ask).includes(evidence.inboundId)
+      ? [...spentInbounds(ask), evidence.inboundId]
+      : spentInbounds(ask);
+  const record: Ask = {
+    ...ask,
+    status: "open",
+    answer: null,
+    updatedAt: command.now,
+    revision: askRevisionOf(ask) + 1,
+    revisedAt: command.now,
+    spentInboundIds: spent,
+  };
   return ok({
     record,
     events: [
@@ -428,7 +480,7 @@ export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> =
         provenance,
         summary: clipSummary(`Reopened: ${ask.question}`),
         subject: askRef(ask),
-        payload: { reason: command.reason, previousAnswer: ask.answer },
+        payload: { reason: command.reason, previousAnswer: ask.answer, epoch: record.revision },
       },
     ],
   });

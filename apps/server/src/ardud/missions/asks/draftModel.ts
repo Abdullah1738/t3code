@@ -14,6 +14,7 @@
 import {
   approverOf,
   isOwnerProvenance,
+  type ApprovalRoute,
   type Approver,
   type DecideDraftInput,
   type Draft,
@@ -29,10 +30,13 @@ import {
   type OpenSystemDraftInput,
   type ReportDraftSentInput,
   type RoleId,
+  type SubMissionId,
   type SystemDraftDecision,
+  type WorkItemId,
 } from "@t3tools/contracts";
 import * as Result from "effect/Result";
 
+import { routeApprover } from "../core/approvals.ts";
 import {
   actorOf,
   callerActsAs,
@@ -147,6 +151,51 @@ export const draftExamples = (
       edited: draft.approvedText !== null && draft.approvedText !== draft.text,
     }));
 
+/** The sub-mission and work item a draft is about; routing rows can name either. */
+export interface DraftAbout {
+  readonly subMissionId: SubMissionId | null;
+  readonly workItemId: WorkItemId | null;
+}
+
+const NOT_ABOUT: DraftAbout = { subMissionId: null, workItemId: null };
+
+/**
+ * Picks a draft's approver from the mission's routing table: first matching row, else the owner.
+ * Channel, audience and person match as for core's `routeApprover`; a row that also names a
+ * sub-mission or work item matches only drafts about it.
+ */
+export const routeDraftApprover = (
+  routes: ReadonlyArray<ApprovalRoute> | undefined,
+  draft: { readonly channel: DraftChannel; readonly audience: string },
+  about: DraftAbout,
+): { readonly approver: Approver; readonly routeId: string | null } => {
+  const row = (routes ?? []).find((route) => {
+    if (route.match._tag !== "draft") return false;
+    const { subMissionId, workItemId } = route.match;
+    if (subMissionId !== undefined && subMissionId !== about.subMissionId) return false;
+    if (workItemId !== undefined && workItemId !== about.workItemId) return false;
+    // `about` rides along so core's matcher can take over these fields once it knows them.
+    const subject = { _tag: "draft", ...draft, person: draft.audience, ...about } as const;
+    return routeApprover([route], subject).routeId !== null;
+  });
+  return row === undefined
+    ? { approver: "owner", routeId: null }
+    : { approver: row.approver, routeId: row.id };
+};
+
+const PULL_LABEL = /^([\w.-]+\/[\w.-]+)#(\d+)$/;
+const PULL_URL = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/i;
+
+/** `owner/repo` and number of a pull-request link (label `owner/repo#N` or a GitHub URL). */
+export const pullRequestKeyOf = (
+  link: MissionLink,
+): { readonly repository: string; readonly number: number } | null => {
+  if (link.kind !== "pull-request") return null;
+  const found = PULL_LABEL.exec(link.label) ?? (link.url === null ? null : PULL_URL.exec(link.url));
+  if (found === null || found[1] === undefined || found[2] === undefined) return null;
+  return { repository: found[1], number: Number(found[2]) };
+};
+
 export interface SubmitDraftCommand {
   readonly id: DraftId;
   readonly missionId: MissionId;
@@ -165,6 +214,8 @@ export interface SubmitDraftCommand {
   readonly route: { readonly approver: Approver; readonly routeId: string | null };
   /** The role the caller drafts as and the model its binding last ran on. */
   readonly writtenBy: NonNullable<Draft["writtenBy"]>;
+  /** What it is about; missing means nothing in particular. */
+  readonly about?: DraftAbout;
   readonly now: string;
 }
 
@@ -226,6 +277,7 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
     staleReason: null,
     revision: 0,
     revisedAt: command.now,
+    ...(command.about ?? NOT_ABOUT),
   };
   const asks = command.route.approver === "master" ? " (for the master)" : "";
   return ok({
@@ -242,6 +294,8 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
           source: command.source,
           approver: command.route.approver,
           routeId: command.route.routeId,
+          subMissionId: record.subMissionId ?? null,
+          workItemId: record.workItemId ?? null,
         },
       },
     ],
@@ -469,15 +523,21 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
   });
 };
 
-/** The way back out: the approver un-approves (before it is sent) or un-drops a draft. */
+/**
+ * The way back out: un-approve (before it is sent) or un-drop a draft. The
+ * owner or the mission's master reopens any decided draft, including one
+ * routed to the owner: reopening only puts it back in front of its approver,
+ * so it needs no owner proof. Approving it again still does.
+ */
 export const reopenDraft = (
   draft: Draft,
   provenance: MissionProvenance,
   callerIsMaster: boolean,
   now: string,
 ): Outcome<Transition<Draft>> => {
-  const allowed = approverCheck(draft, provenance, callerIsMaster, "reopens");
-  if (Result.isFailure(allowed)) return Result.fail(allowed.failure);
+  if (!isOwnerProvenance(provenance) && !callerIsMaster) {
+    return refuse("forbidden", `Only the mission's master or the owner reopens draft ${draft.id}.`);
+  }
   if ((draft.staleReason ?? null) !== null) {
     return refuse(
       "conflict",
@@ -663,6 +723,8 @@ export interface OpenSystemDraftCommand {
   readonly existing: ReadonlyArray<Draft>;
   readonly route: { readonly approver: Approver; readonly routeId: string | null };
   readonly notes: ReadonlyArray<DraftNote>;
+  /** What it is about (the work item its pull request belongs to); missing means nothing. */
+  readonly about?: DraftAbout;
   readonly now: string;
 }
 
@@ -744,6 +806,7 @@ export const openSystemDraft = (command: OpenSystemDraftCommand): Outcome<System
     staleReason: null,
     revision: 0,
     revisedAt: command.now,
+    ...(command.about ?? NOT_ABOUT),
   };
   const asks = command.route.approver === "master" ? " (for the master)" : "";
   return ok({
@@ -763,6 +826,8 @@ export const openSystemDraft = (command: OpenSystemDraftCommand): Outcome<System
           source: record.source,
           approver: command.route.approver,
           routeId: command.route.routeId,
+          subMissionId: record.subMissionId ?? null,
+          workItemId: record.workItemId ?? null,
           requestedBy: input.requestedBy,
           head: input.head,
           staleClosed: closed.map((transition) => transition.record.id),

@@ -26,6 +26,7 @@ import {
   type MissionActor,
   type MissionEvent,
   type MissionFork,
+  type MissionLink,
   type MissionMessage,
   type MissionProvenance,
   type MissionRecordRef,
@@ -57,12 +58,14 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
-import { cleanAnnotation, routeApprover } from "../core/approvals.ts";
+import { cleanAnnotation } from "../core/approvals.ts";
 import { isMasterAnywhere } from "../core/master.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
 import {
   answerAsk,
+  askEpochOf,
+  askReopened,
   openAsk,
   rejectAskDefaults,
   reopenAsk,
@@ -77,15 +80,18 @@ import {
   closeStaleDraft,
   decideDraft,
   draftExamples,
+  type DraftAbout,
   type DraftExample,
   epochOf,
   notesFor,
   openSystemDraft,
+  pullRequestKeyOf,
   reopenDraft,
   reportDraftSent,
   reviseDraft,
   revisionOf,
   routeDraft,
+  routeDraftApprover,
   saveDraftNote,
   submitDraft,
   systemDraftDecision,
@@ -314,6 +320,8 @@ export class AsksService extends Context.Service<
       input: ReopenSuggestionInput,
       provenance: MissionProvenance,
     ) => Fx<Suggestion>;
+    /** Startup: applies accepted suggestions the last process left without an outcome. */
+    readonly applyPendingSuggestions: Fx<ReadonlyArray<Suggestion>>;
     // Forks
     readonly startFork: (input: StartForkInput, provenance: MissionProvenance) => Fx<ForkResult>;
     readonly closeFork: (input: CloseForkInput, provenance: MissionProvenance) => Fx<ForkResult>;
@@ -347,6 +355,12 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const lock = yield* Semaphore.make(1);
   const serialized = <A, E, R>(effect: Effect.Effect<A, E, R>) => lock.withPermits(1)(effect);
+
+  /**
+   * Suggestions whose applier runs in this process. Claimed under the asks
+   * lock with the decision, so the startup sweep never runs one twice.
+   */
+  const applying = new Set<string>();
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
   const newId = (prefix: string) =>
@@ -608,7 +622,9 @@ const make = Effect.gen(function* () {
         provenance,
         inboundId: input.inboundId,
         check: answerCheck({ options: ask.options, optionId: input.optionId, text: input.text }),
-        notBefore: ask.updatedAt,
+        // After a reopen nothing said before the new epoch counts, not even within clock skew.
+        notBefore: askEpochOf(ask),
+        ...(askReopened(ask) ? { skewMs: 0 } : {}),
         what: "Answering an ask",
       });
       const asks = yield* store.list("ask", { missionId: ask.missionId });
@@ -721,6 +737,96 @@ const make = Effect.gen(function* () {
     return { kind: "editor", ref: null };
   };
 
+  /**
+   * What a writer's draft is about. The work item and sub-mission must be the mission's; the
+   * sub-mission defaults to the work item's, then to the writer's lane's.
+   */
+  /**
+   * The lanes a lane-bound caller may name a draft after, or null when it may
+   * name any: the owner, the master, its forks and mission-wide roles.
+   */
+  const ownLanes = (cast: MissionCast, standing: Standing): ReadonlySet<string> | null => {
+    if (standing.caller.provenance._tag !== "agent" || standing.isMaster) return null;
+    if (standing.forks.length > 0 || standing.roles.some((role) => role.laneId === null)) {
+      return null;
+    }
+    const laneIds = new Set<string>(standing.lanes.map((lane) => lane.id));
+    for (const role of standing.roles) if (role.laneId !== null) laneIds.add(role.laneId);
+    return new Set<string>(
+      cast.lanes.filter((lane) => laneIds.has(lane.id)).map((lane) => lane.id),
+    );
+  };
+
+  const draftAbout = (input: SubmitDraftInput, cast: MissionCast, standing: Standing) =>
+    Effect.gen(function* () {
+      const item =
+        input.workItemId === undefined
+          ? null
+          : Option.getOrNull(yield* store.get("work-item", input.workItemId));
+      if (input.workItemId !== undefined && item?.missionId !== input.missionId) {
+        return yield* fail(
+          "not-found",
+          `No work item ${input.workItemId} in mission ${input.missionId}.`,
+        );
+      }
+      // What a draft is about picks its route, so a lane names only its own work.
+      const lanes = ownLanes(cast, standing);
+      if (lanes !== null && item !== null && (item.laneId === null || !lanes.has(item.laneId))) {
+        return yield* fail(
+          "forbidden",
+          `Work item ${item.id} is not in a lane this thread works; name only your own lane's work.`,
+        );
+      }
+      if (input.subMissionId !== undefined) {
+        const named = Option.getOrNull(yield* store.get("sub-mission", input.subMissionId));
+        if (named?.missionId !== input.missionId) {
+          return yield* fail(
+            "not-found",
+            `No sub-mission ${input.subMissionId} in mission ${input.missionId}.`,
+          );
+        }
+        if (item?.subMissionId != null && item.subMissionId !== input.subMissionId) {
+          return yield* fail(
+            "invalid",
+            `Work item ${item.id} is in sub-mission ${item.subMissionId}, not ${input.subMissionId}.`,
+          );
+        }
+        const laneWork =
+          lanes === null ||
+          item?.subMissionId === input.subMissionId ||
+          cast.lanes.some((lane) => lanes.has(lane.id) && lane.subMissionId === input.subMissionId);
+        if (!laneWork) {
+          return yield* fail(
+            "forbidden",
+            `Sub-mission ${input.subMissionId} holds none of this thread's lanes; name only your own lane's work.`,
+          );
+        }
+      }
+      const about: DraftAbout = {
+        subMissionId:
+          input.subMissionId ?? item?.subMissionId ?? standing.lanes[0]?.subMissionId ?? null,
+        workItemId: item?.id ?? null,
+      };
+      return about;
+    });
+
+  /** A system draft is about the work item that owns its pull request, when exactly one does. */
+  const systemDraftAbout = (missionId: MissionId, target: MissionLink) =>
+    Effect.gen(function* () {
+      const key = pullRequestKeyOf(target);
+      if (key === null) return { subMissionId: null, workItemId: null } satisfies DraftAbout;
+      const owners = (yield* store.list("work-item", { missionId })).filter(
+        (item) =>
+          item.pullRequest !== null &&
+          item.pullRequest.number === key.number &&
+          item.pullRequest.repository.toLowerCase() === key.repository.toLowerCase(),
+      );
+      const [only] = owners;
+      return owners.length === 1 && only !== undefined
+        ? ({ subMissionId: only.subMissionId, workItemId: only.id } satisfies DraftAbout)
+        : ({ subMissionId: null, workItemId: null } satisfies DraftAbout);
+    });
+
   const submitDraftCommand = (input: SubmitDraftInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const { cast, standing } = yield* standingIn(input.missionId, provenance);
@@ -754,13 +860,9 @@ const make = Effect.gen(function* () {
                 candidate.threadId === speaking.threadId,
             );
       const notes = yield* allDraftNotes(input.missionId);
+      const about = yield* draftAbout(input, cast, standing);
       // A draft names one audience; routes match it as the person as well.
-      const route = routeApprover(cast.mission?.approvalRouting, {
-        _tag: "draft",
-        channel: input.channel,
-        audience: input.audience,
-        person: input.audience,
-      });
+      const route = routeDraftApprover(cast.mission?.approvalRouting, input, about);
       const existing = yield* store.list("draft", {
         missionId: input.missionId,
         status: ["pending", "rewrite-requested"],
@@ -778,6 +880,7 @@ const make = Effect.gen(function* () {
           caller: standing.caller,
           route,
           writtenBy: { roleId: drafting?.id ?? null, model: binding?.observedModel ?? null },
+          about,
           notes,
           existing,
           now: yield* now,
@@ -926,9 +1029,8 @@ const make = Effect.gen(function* () {
           scope: input.scope,
           text: input.text,
           active: input.active ?? existing?.active ?? true,
-          // `source` predates master writes: "owner" means a direct write (not a suggestion
-          // or an import). `writtenBy` on the note names who actually wrote it.
-          source: existing?.source ?? "owner",
+          // `source` is where the note started; `writtenBy` names who last changed it.
+          source: existing?.source ?? (isOwnerProvenance(writer.provenance) ? "owner" : "master"),
           provenance: writer.provenance,
           callerIsMaster: writer.isMaster,
           notes: yield* allDraftNotes(input.missionId),
@@ -985,6 +1087,7 @@ const make = Effect.gen(function* () {
       const mission = yield* need("mission", input.missionId);
       const current = Option.getOrNull(yield* store.get("draft", input.draftId));
       const annotation = yield* cleanAnnotation({ summary: null, flags: [] }, input);
+      const about = yield* systemDraftAbout(input.missionId, input.target);
       const opened = yield* fromOutcome(
         openSystemDraft({
           input,
@@ -995,12 +1098,8 @@ const make = Effect.gen(function* () {
             missionId: input.missionId,
             status: ["pending", "rewrite-requested"],
           }),
-          route: routeApprover(mission.approvalRouting, {
-            _tag: "draft",
-            channel: input.channel,
-            audience: input.audience,
-            person: input.audience,
-          }),
+          route: routeDraftApprover(mission.approvalRouting, input, about),
+          about,
           notes: yield* allDraftNotes(input.missionId),
           now: yield* now,
         }),
@@ -1211,6 +1310,7 @@ const make = Effect.gen(function* () {
         decisionId: committed.id,
         decider,
       };
+      if (application !== null) applying.add(record.id);
       return pending;
     });
 
@@ -1250,22 +1350,185 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const pending = yield* serialized(decideSuggestionStep(input, provenance));
         if (pending.application === null) return pending.record;
-        const result = yield* appliers.apply(pending.application, pending.decider).pipe(
-          Effect.map((outcome) => ({ outcome, applied: outcome.startsWith("Applied") })),
-          Effect.catch((error: MissionError) =>
-            Effect.succeed({ outcome: `Not applied: ${error.detail}`, applied: false }),
-          ),
-          Effect.catchCause((cause) =>
-            Effect.as(Effect.logWarning("missions: suggestion applier crashed", cause), {
-              outcome: "Not applied: the applier failed unexpectedly.",
-              applied: false,
-            }),
-          ),
-          Effect.provideService(MissionStore.MissionCause, pending.decisionId),
-        );
-        return yield* serialized(recordApplied(pending, result.outcome, result.applied));
+        return yield* applyDecided(pending, pending.application);
       }),
     );
+
+  /** Runs a claimed decision's applier and records what it did. */
+  const applyDecided = (pending: PendingApplication, application: SuggestionApplication) =>
+    Effect.gen(function* () {
+      const result = yield* appliers.apply(application, pending.decider).pipe(
+        Effect.map((outcome) => ({ outcome, applied: outcome.startsWith("Applied") })),
+        Effect.catch((error: MissionError) =>
+          Effect.succeed({ outcome: `Not applied: ${error.detail}`, applied: false }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.as(Effect.logWarning("missions: suggestion applier crashed", cause), {
+            outcome: "Not applied: the applier failed unexpectedly.",
+            applied: false,
+          }),
+        ),
+        Effect.provideService(MissionStore.MissionCause, pending.decisionId),
+      );
+      return yield* serialized(recordApplied(pending, result.outcome, result.applied));
+    }).pipe(Effect.ensuring(Effect.sync(() => applying.delete(pending.record.id))));
+
+  // After a restart, an accepted suggestion with no outcome stopped between
+  // its decision and its applier. What the sweep may do depends on the kind.
+  const APPLIED_BEFORE_RESTART =
+    "Applied before a restart: its change follows the decision on the timeline, but the server stopped before recording the outcome.";
+  const PARTLY_BEFORE_RESTART =
+    "Applied before a restart, possibly in part: the server stopped before recording the outcome. Check it, and suggest anything missing again.";
+  const TOO_OLD_AFTER_RESTART =
+    "Not applied: the server stopped before applying it, and the decision is more than a day old. Suggest it again if it still holds.";
+  const RESTART_SWEEP_MAX_AGE_MS = 24 * 60 * 60_000;
+
+  /**
+   * Accepting these makes something once: a new rule, a lane split or a lane
+   * merge, so running one twice does it twice. Every other applier sets
+   * values, and running it again finishes what a crash cut short.
+   */
+  const runsOnce = (record: Suggestion): boolean => {
+    if (record.targetKind === "rule") return record.target?.kind !== "rule";
+    if (record.targetKind !== "lane") return false;
+    const after = record.after;
+    return (
+      typeof after === "object" && after !== null && ("split" in after || "mergeInto" in after)
+    );
+  };
+
+  /** Every event on a timeline, oldest first, a page at a time. */
+  const eachEvent = (timeline: MissionId, visit: (event: MissionEvent) => void) =>
+    Effect.gen(function* () {
+      let afterSeq = 0;
+      for (;;) {
+        const page = yield* store.eventsSince(timeline, afterSeq, 500);
+        for (const event of page) visit(event);
+        const last = page.at(-1);
+        if (last === undefined || page.length < 500) return;
+        afterSeq = last.seq;
+      }
+    });
+
+  /** The mission a lane change lands on, which a global suggestion doesn't name. */
+  const laneMissionOf = (record: Suggestion) =>
+    record.targetKind === "lane" && record.target?.kind === "lane"
+      ? store
+          .get("lane", record.target.id)
+          .pipe(Effect.map((lane) => (Option.isSome(lane) ? lane.value.missionId : null)))
+      : Effect.succeed(null);
+
+  /**
+   * Startup sweep. Claims the waiting suggestions under the asks lock, then
+   * reads the timelines and applies outside it, so a live decision never
+   * waits on the scan and a failed scan releases its claims.
+   */
+  const applyPendingSuggestionsCommand = Effect.gen(function* () {
+    const claimed = yield* serialized(
+      Effect.gen(function* () {
+        const accepted = yield* store.list("suggestion", { status: ["accepted", "edited"] });
+        const waiting = accepted.filter(
+          (suggestion) =>
+            suggestion.outcome === null &&
+            suggestion.targetKind !== "draft-note" &&
+            !applying.has(suggestion.id),
+        );
+        for (const suggestion of waiting) applying.add(suggestion.id);
+        return waiting;
+      }),
+    );
+    return yield* sweepClaimed(claimed).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          for (const suggestion of claimed) applying.delete(suggestion.id);
+        }),
+      ),
+    );
+  });
+
+  /**
+   * A one-shot change counts as done when anything follows its decision,
+   * on the suggestion's timeline or the lane's mission. A value-setting
+   * change runs again. A decision more than a day old is not applied late.
+   */
+  const sweepClaimed = (claimed: ReadonlyArray<Suggestion>) =>
+    Effect.gen(function* () {
+      const timelineOf = (suggestion: Suggestion) => suggestion.missionId ?? GLOBAL_TIMELINE;
+      const decisions = new Map<string, MissionEvent>();
+      const decisionIds = new Set<string>();
+      const followed = new Set<string>();
+      const trace = (event: MissionEvent) => {
+        if (event.causedBy !== null && decisionIds.has(event.causedBy)) {
+          followed.add(event.causedBy);
+        }
+      };
+      const own = new Map<MissionId, Set<string>>();
+      for (const suggestion of claimed) {
+        const ids = own.get(timelineOf(suggestion)) ?? new Set<string>();
+        own.set(timelineOf(suggestion), ids.add(suggestion.id));
+      }
+      for (const [timeline, ids] of own) {
+        yield* eachEvent(timeline, (event) => {
+          if (
+            event.kind === "suggestion.decided" &&
+            event.subject?.kind === "suggestion" &&
+            ids.has(event.subject.id)
+          ) {
+            decisions.set(event.subject.id, event);
+            decisionIds.add(event.id);
+          } else trace(event);
+        });
+      }
+      const elsewhere = new Set<MissionId>();
+      for (const suggestion of claimed) {
+        const decision = decisions.get(suggestion.id);
+        if (decision === undefined || followed.has(decision.id) || !runsOnce(suggestion)) continue;
+        const landing = yield* laneMissionOf(suggestion);
+        if (landing !== null && landing !== timelineOf(suggestion)) elsewhere.add(landing);
+      }
+      for (const timeline of elsewhere) yield* eachEvent(timeline, trace);
+
+      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+      const swept: Suggestion[] = [];
+      for (const record of claimed) {
+        const decision = decisions.get(record.id);
+        if (decision === undefined) {
+          yield* Effect.logWarning(
+            `missions: accepted suggestion ${record.id} has no decision event; left unapplied`,
+          );
+          continue;
+        }
+        const application: SuggestionApplication = {
+          suggestion: record,
+          targetKind: record.targetKind,
+          target: record.target,
+          after: record.after,
+        };
+        const pending: PendingApplication = {
+          record,
+          application,
+          decisionId: decision.id,
+          decider: record.decidedBy ?? decision.provenance,
+        };
+        const done = followed.has(decision.id);
+        const tooOld =
+          nowMs - Date.parse(record.decidedAt ?? decision.at) > RESTART_SWEEP_MAX_AGE_MS;
+        const settled =
+          done && runsOnce(record)
+            ? { outcome: APPLIED_BEFORE_RESTART, applied: true }
+            : tooOld
+              ? done
+                ? { outcome: PARTLY_BEFORE_RESTART, applied: true }
+                : { outcome: TOO_OLD_AFTER_RESTART, applied: false }
+              : null;
+        swept.push(
+          settled === null
+            ? yield* applyDecided(pending, application)
+            : yield* serialized(recordApplied(pending, settled.outcome, settled.applied)),
+        );
+      }
+      return swept;
+    });
 
   const reopenSuggestionCommand = (input: ReopenSuggestionInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
@@ -1598,6 +1861,7 @@ const make = Effect.gen(function* () {
     // Serializes its own steps: the applier runs outside the lock.
     decideSuggestion: decideSuggestionCommand,
     reopenSuggestion: (input, provenance) => serialized(reopenSuggestionCommand(input, provenance)),
+    applyPendingSuggestions: Effect.uninterruptible(applyPendingSuggestionsCommand),
     startFork: (input, provenance) => serialized(startForkCommand(input, provenance)),
     closeFork: (input, provenance) => serialized(closeForkCommand(input, provenance)),
     updateFork: (input, provenance) => serialized(updateForkCommand(input, provenance)),

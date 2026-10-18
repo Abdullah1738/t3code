@@ -9,6 +9,7 @@ import {
   SubMissionId,
   SuggestionTargetKind,
   TrimmedNonEmptyString,
+  WorkItemId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -46,6 +47,10 @@ export const SubmitDraftInput = Schema.Struct({
   channel: DraftChannel,
   target: MissionLink,
   text: TrimmedNonEmptyString,
+  /** The sub-mission it is about; defaults to the work item's, then the writer's lane's. */
+  subMissionId: Schema.optional(SubMissionId),
+  /** The work item it is about. */
+  workItemId: Schema.optional(WorkItemId),
 });
 export type SubmitDraftInput = typeof SubmitDraftInput.Type;
 

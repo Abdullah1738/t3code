@@ -1,7 +1,7 @@
 // Regressions for the boundary review (Sol, H8-H10 and M3) and the round 2
 // self-review: each test walks one exploit chain end to end.
 import { describe, expect, it } from "@effect/vitest";
-import { DraftNoteId, type MissionLink } from "@t3tools/contracts";
+import { DraftNoteId, type MissionLink, type Suggestion } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -223,6 +223,115 @@ describe("boundary review regressions", () => {
     },
   );
 
+  it.effect("N9: a reopened ask takes no iMessage from before the reopen", () => {
+    const { layer } = harness([
+      owner("msg-offline", "offline window", T0 + MINUTE),
+      owner("msg-early", "offline window", T0 + 90_000),
+      owner("msg-online", "online", T0 + 3 * MINUTE),
+      owner("msg-both", "offline window", T0 + MINUTE),
+    ]);
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const ask = yield* asks.openAsk(askInput("Which way?"), master);
+      expect(ask.revision ?? 0).toBe(0);
+
+      yield* TestClock.setTime(T0 + MINUTE + 10_000);
+      const answered = yield* asks.answerAsk(
+        { askId: ask.id, optionId: "b", text: "", inboundId: "msg-offline" },
+        relay,
+      );
+      expect(answered.ask.status).toBe("answered");
+
+      // He takes it back a minute later, well inside the usual clock skew.
+      yield* TestClock.setTime(T0 + 2 * MINUTE);
+      const reopened = yield* asks.reopenAsk({ askId: ask.id, reason: "Not sure" }, ownerApp);
+      expect(reopened.revision).toBe(1);
+      expect(reopened.spentInboundIds).toEqual(["msg-offline"]);
+      // The reply that answered the earlier epoch can't answer this one.
+      expect(
+        yield* failureCode(
+          asks.answerAsk(
+            { askId: ask.id, optionId: "b", text: "", inboundId: "msg-offline" },
+            relay,
+          ),
+        ),
+      ).toBe("provenance-invalid");
+      // Nor can any other reply from before the reopen, even seconds before it.
+      expect(
+        yield* failureCode(
+          asks.answerAsk({ askId: ask.id, optionId: "b", text: "", inboundId: "msg-early" }, relay),
+        ),
+      ).toBe("provenance-invalid");
+      const again = yield* asks.answerAsk(
+        { askId: ask.id, optionId: "a", text: "", inboundId: "msg-online" },
+        relay,
+      );
+      expect(again.ask.answer?.optionId).toBe("a");
+
+      // One reply may still answer two asks that were both open when it arrived.
+      yield* TestClock.setTime(T0);
+      const first = yield* asks.openAsk(askInput("Staging?"), master);
+      const second = yield* asks.openAsk(askInput("Production?"), master);
+      for (const each of [first, second]) {
+        const decided = yield* asks.answerAsk(
+          { askId: each.id, optionId: "b", text: "", inboundId: "msg-both" },
+          relay,
+        );
+        expect(decided.ask.status).toBe("answered");
+      }
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("N9: an ask reopened before asks kept an epoch still takes nothing older", () => {
+    const { layer } = harness([
+      owner("msg-early", "offline window", T0 + 90_000),
+      owner("msg-late", "online", T0 + 3 * MINUTE),
+    ]);
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const store = yield* MissionStore.MissionStore;
+      const ask = yield* asks.openAsk(askInput("Which way?"), master);
+      // Stored by an older build: reopened at T0+2min, with no revision fields.
+      const {
+        revision: _revision,
+        revisedAt: _revisedAt,
+        spentInboundIds: _spent,
+        ...legacy
+      } = ask;
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "ask.reopened",
+          actor: { _tag: "system", component: "missions" },
+          provenance: ownerApp,
+          summary: "Ask reopened",
+          subject: { kind: "ask", id: ask.id },
+        },
+        upserts: [
+          // T0 + 2 minutes.
+          { _tag: "ask", record: { ...legacy, updatedAt: "2026-10-17T08:02:00.000Z" } },
+        ],
+      });
+
+      yield* TestClock.setTime(T0 + 4 * MINUTE);
+      // Within the old clock skew of the reopen, but before it.
+      expect(
+        yield* failureCode(
+          asks.answerAsk({ askId: ask.id, optionId: "b", text: "", inboundId: "msg-early" }, relay),
+        ),
+      ).toBe("provenance-invalid");
+      const answered = yield* asks.answerAsk(
+        { askId: ask.id, optionId: "a", text: "", inboundId: "msg-late" },
+        relay,
+      );
+      expect(answered.ask.answer?.optionId).toBe("a");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("M3: a master accepts a draft-note suggestion under its own name", () => {
     const { layer } = harness();
     return Effect.gen(function* () {
@@ -258,6 +367,31 @@ describe("boundary review regressions", () => {
         _tag: "role",
         roleId: "role-master",
       });
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a draft note a master writes says it came from the master", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const theirs = yield* asks.saveDraftNote(
+        { missionId, scope: { _tag: "all" }, text: "No exclamation marks." },
+        master,
+      );
+      expect(theirs.source).toBe("master");
+      const his = yield* asks.saveDraftNote(
+        { missionId, scope: { _tag: "all" }, text: "Sign with initials." },
+        ownerApp,
+      );
+      expect(his.source).toBe("owner");
+      // An edit keeps where the note started and records who changed it.
+      const edited = yield* asks.saveDraftNote(
+        { noteId: theirs.id, missionId, scope: { _tag: "all" }, text: "No exclamation marks!" },
+        ownerApp,
+      );
+      expect(edited.source).toBe("master");
+      expect(edited.writtenBy).toEqual({ _tag: "owner" });
     }).pipe(Effect.provide(layer));
   });
 
@@ -340,6 +474,128 @@ describe("boundary review regressions", () => {
       );
       expect(decided.status).toBe("accepted");
       expect(decided.outcome).toBe("Not applied: the applier failed unexpectedly.");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("an accepted suggestion the last process never applied applies at startup", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* TestClock.setTime(T0 + MINUTE);
+      const asks = yield* AsksService.AsksService;
+      const store = yield* MissionStore.MissionStore;
+      const propose = (title: string, after: unknown = { name: title }) =>
+        asks.proposeSuggestion(
+          {
+            missionId,
+            targetKind: "lane",
+            target: { kind: "lane", id: "lane-api" },
+            title,
+            after,
+            diffText: `API -> ${title}`,
+            why: "It grew.",
+            evidence: [{ kind: "lane", id: "lane-api" }],
+          },
+          governor,
+        );
+      const split = (title: string) => propose(title, { split: { name: title } });
+      // The state a crash leaves: the decision committed, no outcome yet.
+      const acceptedThenCrashed = (
+        suggestion: Suggestion,
+        options: { readonly global?: boolean; readonly decidedAt?: string } = {},
+      ) =>
+        store.commit({
+          event: {
+            missionId: options.global ? AsksService.GLOBAL_TIMELINE : missionId,
+            kind: "suggestion.decided",
+            actor: { _tag: "thread", threadId: masterThread },
+            provenance: master,
+            summary: `Suggestion accepted: ${suggestion.title}`,
+            subject: { kind: "suggestion", id: suggestion.id, label: suggestion.title },
+            payload: { action: "accept" },
+          },
+          upserts: [
+            {
+              _tag: "suggestion",
+              record: {
+                ...suggestion,
+                ...(options.global ? { missionId: null } : {}),
+                status: "accepted",
+                decidedBy: master,
+                decidedAt: options.decidedAt ?? at,
+              },
+            },
+          ],
+        });
+      // What the applier committed before the crash, on the lane's mission.
+      const appliedBeforeCrash = (
+        decision: MissionStore.MissionCommitResult,
+        kind: "lane.updated" | "lane.split",
+      ) =>
+        store.commit({
+          event: {
+            missionId,
+            kind,
+            actor: { _tag: "system", component: "missions" },
+            provenance: master,
+            summary: "Lane changed",
+            subject: { kind: "lane", id: "lane-api" },
+            causedBy: decision.event.id,
+          },
+        });
+
+      const fresh = yield* propose("API v2");
+      yield* acceptedThenCrashed(fresh);
+      // Its rename committed, then the server stopped: setting it again is harmless.
+      const halfDone = yield* propose("API v3");
+      yield* appliedBeforeCrash(yield* acceptedThenCrashed(halfDone), "lane.updated");
+      // Splitting again would add a second lane, so a split that left its
+      // mark is not run again, even when it landed on another timeline.
+      const splitDone = yield* split("API edge");
+      yield* appliedBeforeCrash(yield* acceptedThenCrashed(splitDone), "lane.split");
+      const globalSplitDone = yield* split("API batch");
+      yield* appliedBeforeCrash(
+        yield* acceptedThenCrashed(globalSplitDone, { global: true }),
+        "lane.split",
+      );
+      const splitPending = yield* split("API admin");
+      yield* acceptedThenCrashed(splitPending);
+      // Decided two days ago: too late to apply quietly.
+      const stale = yield* propose("API v0");
+      yield* acceptedThenCrashed(stale, {
+        decidedAt: "2026-10-15T08:00:00.000Z",
+      });
+
+      const applied: string[] = [];
+      const registry = yield* Ports.SuggestionApplierRegistry;
+      yield* registry.register(["lane"], (application) =>
+        Effect.sync(() => {
+          applied.push(application.suggestion.id);
+          return `Applied: ${application.suggestion.title}.`;
+        }),
+      );
+
+      yield* asks.applyPendingSuggestions;
+      expect(applied.toSorted()).toEqual([fresh.id, halfDone.id, splitPending.id].toSorted());
+      const outcomeOf = (id: string) =>
+        store
+          .get("suggestion", id)
+          .pipe(Effect.map((found) => (found._tag === "Some" ? found.value.outcome : null)));
+      expect(yield* outcomeOf(fresh.id)).toBe("Applied: API v2.");
+      expect(yield* outcomeOf(halfDone.id)).toBe("Applied: API v3.");
+      expect(yield* outcomeOf(splitPending.id)).toBe("Applied: API admin.");
+      expect(yield* outcomeOf(splitDone.id)).toMatch(/^Applied before a restart:/);
+      expect(yield* outcomeOf(globalSplitDone.id)).toMatch(/^Applied before a restart:/);
+      expect(yield* outcomeOf(stale.id)).toMatch(/^Not applied: .*more than a day old/);
+      const outcomes = [
+        ...(yield* store.eventsSince(missionId, 0)),
+        ...(yield* store.eventsSince(AsksService.GLOBAL_TIMELINE, 0)),
+      ].filter((event) => event.kind === "suggestion.applied");
+      expect(outcomes).toHaveLength(6);
+
+      // A second sweep finds nothing left to do.
+      yield* asks.applyPendingSuggestions;
+      expect(applied).toHaveLength(3);
     }).pipe(Effect.provide(layer));
   });
 

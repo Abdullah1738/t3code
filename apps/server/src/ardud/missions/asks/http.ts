@@ -6,7 +6,9 @@
  *
  * Systems in SYSTEM_DRAFT_COMPONENTS (crw) also open drafts here for one exact
  * code head, stale-close their own, read the decision for that head and report
- * the approved text as sent (or failed) for the revision they read.
+ * the approved text as sent (or failed) for the revision they read. The caller
+ * is the component named by its own credential (`t3 ardud component-token issue
+ * crw`); a body `requestedBy` may only repeat it, and identity headers are refused.
  */
 import {
   AskId,
@@ -128,9 +130,17 @@ const DecideBody = Schema.Struct({
   revision: Schema.optional(NonNegativeInt),
 });
 const decodeDecideBody = Schema.decodeUnknownEffect(DecideBody);
-const decodeOpenSystemDraft = Schema.decodeUnknownEffect(OpenSystemDraftInput);
-const decodeCloseStaleDraft = Schema.decodeUnknownEffect(CloseStaleDraftInput);
-const decodeReportDraftSent = Schema.decodeUnknownEffect(ReportDraftSentInput);
+// The credential names the system; a body `requestedBy` is optional and may only repeat it.
+const claimedBy = { requestedBy: Schema.optional(TrimmedNonEmptyString) };
+const decodeOpenSystemDraft = Schema.decodeUnknownEffect(
+  Schema.Struct({ ...OpenSystemDraftInput.fields, ...claimedBy }),
+);
+const decodeCloseStaleDraft = Schema.decodeUnknownEffect(
+  Schema.Struct({ ...CloseStaleDraftInput.fields, ...claimedBy }),
+);
+const decodeReportDraftSent = Schema.decodeUnknownEffect(
+  Schema.Struct({ ...ReportDraftSentInput.fields, ...claimedBy }),
+);
 
 const searchParams = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
@@ -342,73 +352,107 @@ const makeRoutes = Effect.gen(function* () {
     }),
   );
 
+  // ardud missions: asks (N5)
   /**
-   * The system a draft route acts for. TODO(core r3): take the caller from core's named component
-   * credentials instead of the body's `requestedBy` and the `x-t3-component` claim.
+   * The system a draft route acts for: the component its credential was minted for
+   * (`t3 ardud component-token issue crw`), never a body field or a header. A body or query
+   * `requestedBy` may only repeat it. Identity headers are refused outright so a caller relying on
+   * them learns they count for nothing.
    */
-  const systemComponent = (requestedBy: string | null) =>
+  const systemCaller = (scope: Parameters<typeof authenticate>[0]) =>
     Effect.gen(function* () {
-      if (requestedBy === null || !SYSTEM_DRAFT_COMPONENTS.has(requestedBy)) {
+      const session = yield* authenticate(scope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      if (request.headers["x-t3-component"] !== undefined) {
         return yield* fail(
           "forbidden",
-          `Only ${[...SYSTEM_DRAFT_COMPONENTS].join(", ")} open or read system drafts over HTTP.`,
+          "x-t3-component is not accepted. The credential says which system is calling.",
         );
       }
-      const request = yield* HttpServerRequest.HttpServerRequest;
-      if (request.headers["x-t3-thread-id"] !== undefined) {
-        return yield* fail("invalid_request", "A thread can't act for a system draft.");
+      for (const header of ["x-t3-thread-id", "x-t3-role-id"]) {
+        if (request.headers[header] !== undefined) {
+          return yield* fail(
+            "invalid_request",
+            `${header} is not accepted. A thread or role can't act for a system draft.`,
+          );
+        }
       }
-      const claimed = request.headers["x-t3-component"]?.trim();
-      if (claimed !== undefined && claimed !== requestedBy) {
-        return yield* fail("forbidden", `x-t3-component ${claimed} is not ${requestedBy}.`);
+      const component = session.origin?._tag === "component" ? session.origin.component : null;
+      const allowed = [...SYSTEM_DRAFT_COMPONENTS].join(", ");
+      if (component === null) {
+        return yield* fail(
+          "forbidden",
+          `System drafts over HTTP need the system's own component credential (t3 ardud component-token issue ${allowed}).`,
+        );
       }
-      return requestedBy;
+      if (!SYSTEM_DRAFT_COMPONENTS.has(component)) {
+        return yield* fail("forbidden", `Only ${allowed} open or read system drafts over HTTP.`);
+      }
+      return component;
     });
 
-  const openSystemDraft = write(
-    Effect.gen(function* () {
-      const input = yield* decodeBody(decodeOpenSystemDraft);
-      const component = yield* systemComponent(input.requestedBy);
-      const draft = yield* asks.openSystemDraft(input, systemProvenance(component));
-      return json({ ok: true, draft });
-    }),
-  );
+  /** A `requestedBy` claim is optional; one that names anyone but the caller is refused. */
+  const sameCaller = (component: string, claimed: string | undefined) =>
+    claimed === undefined || claimed === component
+      ? Effect.succeed(component)
+      : Effect.fail(
+          fail("forbidden", `This credential is ${component}; it cannot act for ${claimed}.`),
+        );
 
-  const closeStaleDraft = write(
-    Effect.gen(function* () {
-      const input = yield* decodeBody(decodeCloseStaleDraft);
-      const component = yield* systemComponent(input.requestedBy);
-      const draft = yield* asks.closeStaleDraft(input, systemProvenance(component));
-      return json({ ok: true, draft });
-    }),
-  );
+  const openSystemDraft = Effect.gen(function* () {
+    const component = yield* systemCaller(AuthOrchestrationOperateScope);
+    const body = yield* decodeBody(decodeOpenSystemDraft);
+    const requestedBy = yield* sameCaller(component, body.requestedBy);
+    const draft = yield* asks.openSystemDraft(
+      { ...body, requestedBy },
+      systemProvenance(requestedBy),
+    );
+    return json({ ok: true, draft });
+  });
 
-  /** Body `{ draftId, requestedBy, revision, outcome: sent{link} | send-failed{reason} }`. */
-  const reportDraftSent = write(
-    Effect.gen(function* () {
-      const input = yield* decodeBody(decodeReportDraftSent);
-      const component = yield* systemComponent(input.requestedBy);
-      const draft = yield* asks.reportDraftSent(input, systemProvenance(component));
-      return json({ ok: true, draft });
-    }),
-  );
+  const closeStaleDraft = Effect.gen(function* () {
+    const component = yield* systemCaller(AuthOrchestrationOperateScope);
+    const body = yield* decodeBody(decodeCloseStaleDraft);
+    const requestedBy = yield* sameCaller(component, body.requestedBy);
+    const draft = yield* asks.closeStaleDraft(
+      { ...body, requestedBy },
+      systemProvenance(requestedBy),
+    );
+    return json({ ok: true, draft });
+  });
 
-  /** `?head=<sha>&requestedBy=crw`: only a decision on exactly that head counts. */
-  const draftDecision = read(
-    Effect.gen(function* () {
-      const draftId = DraftId.make(yield* param("draftId"));
-      const query = yield* searchParams;
-      const head = query.get("head")?.trim() ?? "";
-      if (head.length === 0)
-        return yield* fail("invalid_request", "The head query parameter is required.");
-      const component = yield* systemComponent(query.get("requestedBy")?.trim() ?? null);
-      const decision = yield* asks.systemDraftDecision(
-        { draftId, head, requestedBy: component },
-        systemProvenance(component),
-      );
-      return json({ ok: true, decision });
-    }),
-  );
+  /** Body `{ draftId, revision, outcome: sent{link} | send-failed{reason}, requestedBy? }`. */
+  const reportDraftSent = Effect.gen(function* () {
+    const component = yield* systemCaller(AuthOrchestrationOperateScope);
+    const body = yield* decodeBody(decodeReportDraftSent);
+    const requestedBy = yield* sameCaller(component, body.requestedBy);
+    const draft = yield* asks.reportDraftSent(
+      { ...body, requestedBy },
+      systemProvenance(requestedBy),
+    );
+    return json({ ok: true, draft });
+  });
+
+  /** `?head=<sha>[&requestedBy=crw]`: only a decision on exactly that head counts. */
+  const draftDecision = Effect.gen(function* () {
+    const component = yield* systemCaller(AuthOrchestrationReadScope);
+    const draftId = DraftId.make(yield* param("draftId"));
+    const query = yield* searchParams;
+    const claimed = query.get("requestedBy")?.trim();
+    const requestedBy = yield* sameCaller(
+      component,
+      claimed === undefined || claimed.length === 0 ? undefined : claimed,
+    );
+    const head = query.get("head")?.trim() ?? "";
+    if (head.length === 0)
+      return yield* fail("invalid_request", "The head query parameter is required.");
+    const decision = yield* asks.systemDraftDecision(
+      { draftId, head, requestedBy },
+      systemProvenance(requestedBy),
+    );
+    return json({ ok: true, decision });
+  });
+  // end ardud missions: asks (N5)
 
   const events = read(
     Effect.gen(function* () {

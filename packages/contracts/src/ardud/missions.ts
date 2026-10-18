@@ -660,6 +660,14 @@ export const Ask = Schema.Struct({
   answer: Schema.NullOr(AskAnswer),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- asks additions ---
+  /** Answer epoch: advances on every reopen. Missing means 0. */
+  revision: Schema.optional(NonNegativeInt),
+  /** When the current epoch began; an answer's evidence must not predate it. Missing means createdAt. */
+  revisedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  /** iMessages that answered an earlier epoch; they never answer this ask again. */
+  spentInboundIds: Schema.optional(Schema.Array(Schema.String)),
+  // --- end asks additions ---
 });
 export type Ask = typeof Ask.Type;
 
@@ -957,6 +965,10 @@ export const Draft = Schema.Struct({
   sentLink: Schema.optional(Schema.NullOr(MissionLink)),
   /** Why the last send failed; cleared when a later send succeeds. */
   sendError: Schema.optional(Schema.NullOr(Schema.String)),
+  /** The sub-mission it is about; routing rows can match it. Missing means none. */
+  subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
+  /** The work item it is about; routing rows can match it. Missing means none. */
+  workItemId: Schema.optional(Schema.NullOr(WorkItemId)),
   // --- end asks additions ---
 });
 export type Draft = typeof Draft.Type;
@@ -974,7 +986,8 @@ export const DraftNote = Schema.Struct({
   missionId: Schema.NullOr(MissionId),
   scope: DraftNoteScope,
   text: TrimmedNonEmptyString,
-  source: Schema.Literals(["owner", "suggestion", "import"]),
+  /** Where the note came from. "master" (asks addition) is a direct write by a mission's master. */
+  source: Schema.Literals(["owner", "master", "suggestion", "import"]),
   active: Schema.Boolean,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,

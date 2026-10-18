@@ -12,6 +12,7 @@ import { findInImsgHistory, makeInboundLookup } from "./inbound.ts";
 import {
   answerCheck,
   draftDecisionCheck,
+  optionCollision,
   type ReplyCheck,
   verifyInbound,
   type InboundMessage,
@@ -153,6 +154,166 @@ describe("iMessage provenance", () => {
     expect(picks(null, "ship friday")("Ship Friday!")).toBe(false);
     expect(picks(null, "budget 100")("budget -100")).toBe(false);
     expect(picks(null, "ship friday")("dont ship friday")).toBe(false);
+  });
+
+  // Sol N8: an option is compared as typed, so signs, currency, percentages
+  // and URLs count, and a reply that could name two options names neither.
+  it("N8: an option keeps its symbols and an ambiguous reply picks nothing", () => {
+    const pay = [
+      { id: "minus", label: "Pay -100" },
+      { id: "plus", label: "Pay +100" },
+    ];
+    expect(picks("plus", "", pay)("Pay +100")).toBe(true);
+    expect(picks("plus", "", pay)("go with pay +100, thanks")).toBe(true);
+    expect(picks("minus", "", pay)("Pay -100")).toBe(true);
+    expect(picks("plus", "", pay)("Pay -100")).toBe(false);
+    expect(picks("minus", "", pay)("Pay +100")).toBe(false);
+    expect(picks("minus", "", pay)("pay 100")).toBe(false);
+    const money = [
+      { id: "usd", label: "$100" },
+      { id: "pct", label: "100%" },
+    ];
+    expect(picks("pct", "", money)("100%")).toBe(true);
+    expect(picks("usd", "", money)("100%")).toBe(false);
+    expect(picks("usd", "", money)("100")).toBe(false);
+    const hosts = [
+      { id: "dot", label: "evil.example.com" },
+      { id: "dash", label: "evil-example.com" },
+    ];
+    expect(picks("dash", "", hosts)("evil-example.com")).toBe(true);
+    expect(picks("dot", "", hosts)("evil-example.com")).toBe(false);
+    // Two labels, a label and an id, or two ids that read the same: no tie-break.
+    const labels = [
+      { id: "x", label: "Postgres" },
+      { id: "y", label: "postgres" },
+    ];
+    expect(picks("x", "", labels)("postgres")).toBe(false);
+    expect(picks("y", "", labels)("postgres")).toBe(false);
+    const labelVsId = [
+      { id: "b", label: "Plan A" },
+      { id: "c", label: "b" },
+    ];
+    expect(picks("b", "", labelVsId)("b")).toBe(false);
+    expect(picks("c", "", labelVsId)("b")).toBe(false);
+    expect(picks("b", "", labelVsId)("plan a")).toBe(true);
+    const ids = [
+      { id: "A", label: "First" },
+      { id: "a", label: "Second" },
+    ];
+    expect(picks("A", "", ids)("a")).toBe(false);
+    expect(picks("A", "", ids)("first")).toBe(true);
+    // A lead word inside one label can make a reply name two options.
+    const lead = [
+      { id: "cached", label: "Use cache" },
+      { id: "plain", label: "Cache" },
+    ];
+    expect(picks("plain", "", lead)("use cache")).toBe(false);
+    expect(picks("cached", "", lead)("use cache")).toBe(false);
+  });
+
+  it("N8: option sets that one reply could read two ways are named at creation", () => {
+    expect(
+      optionCollision([
+        { id: "minus", label: "Pay -100" },
+        { id: "plus", label: "Pay +100" },
+      ]),
+    ).toBeNull();
+    expect(optionCollision(OPTIONS)).toBeNull();
+    for (const options of [
+      [
+        { id: "x", label: "Postgres" },
+        { id: "y", label: "postgres" },
+      ],
+      [
+        { id: "b", label: "Plan A" },
+        { id: "c", label: "b" },
+      ],
+      [
+        { id: "A", label: "First" },
+        { id: "a", label: "Second" },
+      ],
+      [
+        { id: "cached", label: "Use cache" },
+        { id: "plain", label: "Cache" },
+      ],
+      [
+        { id: "a", label: "Deploy." },
+        { id: "b", label: "deploy" },
+      ],
+    ]) {
+      expect(optionCollision(options)).not.toBeNull();
+    }
+  });
+
+  // Review of N8: a lead or courtesy word can itself be an option, so "yes,
+  // no" names both options and records neither.
+  it("N8: a lead or courtesy word that is itself an option makes the reply ambiguous", () => {
+    const yesNo = [
+      { id: "y", label: "Yes" },
+      { id: "n", label: "No" },
+    ];
+    expect(optionCollision(yesNo)).toBeNull();
+    expect(picks("y", "", yesNo)("yes")).toBe(true);
+    expect(picks("n", "", yesNo)("No.")).toBe(true);
+    expect(picks("n", "", yesNo)("yes, no")).toBe(false);
+    expect(picks("n", "", yesNo)("Yes. No.")).toBe(false);
+    expect(picks("y", "", yesNo)("yes, no")).toBe(false);
+    const goStop = [
+      { id: "g", label: "Go" },
+      { id: "s", label: "Stop" },
+    ];
+    expect(picks("g", "", goStop)("go")).toBe(true);
+    expect(picks("s", "", goStop)("go, stop")).toBe(false);
+    const byId = [
+      { id: "go", label: "Rollback" },
+      { id: "ship", label: "Ship" },
+    ];
+    expect(optionCollision(byId)).toBeNull();
+    expect(picks("ship", "", byId)("ship")).toBe(true);
+    expect(picks("ship", "", byId)("go ship")).toBe(false);
+  });
+
+  // Review of N8: quotes, brackets and an approving emoji around an option
+  // don't change it; a sign or a disapproving emoji still does.
+  it("N8: an option may be quoted, bracketed or closed with an approving emoji", () => {
+    expect(picks("pg")("Postgres 👍")).toBe(true);
+    expect(picks("pg")("Postgres thx 🙏")).toBe(true);
+    expect(picks("pg")('"Postgres"')).toBe(true);
+    expect(picks("pg")("\u201CPostgres\u201D")).toBe(true);
+    expect(picks("pg")("Postgres 👎")).toBe(false);
+    const letters = [
+      { id: "a", label: "Online" },
+      { id: "b", label: "Offline window" },
+    ];
+    expect(picks("b", "", letters)("(b)")).toBe(true);
+    expect(picks("b", "", letters)("B)")).toBe(true);
+    const pay = [
+      { id: "minus", label: "Pay -100" },
+      { id: "plain", label: "Pay 100" },
+    ];
+    expect(picks("minus", "", pay)("Pay -100 👍🏽")).toBe(true);
+    // "(100)" can be a negative amount, so brackets around digits stay.
+    expect(picks("plain", "", pay)("Pay (100)")).toBe(false);
+  });
+
+  // Review of N8: the checks run inside the asks lock, so long labels must
+  // stay cheap.
+  it("N8: checking long option labels stays fast", () => {
+    const long = (seed: number) =>
+      Array.from({ length: 300 }, (_, index) => `w${seed}x${index}`).join(" ");
+    const options = Array.from({ length: 20 }, (_, index) => ({
+      id: `o${index}`,
+      label: long(index),
+    }));
+    const leads = Array.from({ length: 20 }, (_, index) => ({
+      id: `g${index}`,
+      label: `${"go ".repeat(300)}${index}`,
+    }));
+    const started = performance.now();
+    expect(optionCollision(options)).toBeNull();
+    expect(optionCollision(leads)).toBeNull();
+    expect(picks("g3", "", leads)(`${"go ".repeat(300)}3 ${"thanks ".repeat(300)}`)).toBe(true);
+    expect(performance.now() - started).toBeLessThan(2_000);
   });
 
   // Sol H9: approval needs approval words and nothing else; an edit needs the
