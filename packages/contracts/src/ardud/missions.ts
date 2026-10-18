@@ -2112,7 +2112,10 @@ export const ReviewPlanRequest = Schema.Struct({
   missionId: MissionId,
   pullRequest: PullRequestKey,
   headSha: TrimmedNonEmptyString,
-  /** When given, a fired hard trigger is recorded as the PR's verdict. */
+  /**
+   * When given, a fired hard trigger counts in this plan only. Reading a plan
+   * never records anything; RecordTriggerFactsInput does that.
+   */
   facts: Schema.optional(PullRequestFacts),
   /** Extra ladders whose condition the caller says applies (e.g. a mobile gate). */
   customLadderIds: Schema.optional(Schema.Array(ReviewLadderId)),
@@ -2207,6 +2210,27 @@ export const GovernorView = Schema.Struct({
 });
 export type GovernorView = typeof GovernorView.Type;
 // --- end policy additions ---
+
+// --- core additions ---
+/**
+ * Verified PR facts from the owner, the master or the component that read
+ * them (crw). A fired hard trigger becomes the PR's verdict, in the caller's
+ * name.
+ */
+export const RecordTriggerFactsInput = Schema.Struct({
+  missionId: MissionId,
+  pullRequest: PullRequestKey,
+  facts: PullRequestFacts,
+});
+export type RecordTriggerFactsInput = typeof RecordTriggerFactsInput.Type;
+
+export const RecordTriggerFactsResult = Schema.Struct({
+  /** False when no trigger fired or one is already on record. */
+  recorded: Schema.Boolean,
+  verdict: Schema.NullOr(CriticalityVerdict),
+});
+export type RecordTriggerFactsResult = typeof RecordTriggerFactsResult.Type;
+// --- end core additions ---
 
 /** The master records that it relied on a rule, or that work broke it. */
 export const RecordRuleUseInput = Schema.Struct({
