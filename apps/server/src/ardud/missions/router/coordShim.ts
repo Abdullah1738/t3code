@@ -18,7 +18,6 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-import { castOf } from "../core/master.ts";
 import {
   coordActorFor,
   coordBodyText,
@@ -27,8 +26,8 @@ import {
 } from "../import/coordIds.ts";
 import { workLinks } from "../import/mapping.ts";
 import * as MissionStore from "../store/MissionStore.ts";
-import { actorsOfThread, masterRoleOf, threadsOfActor, type RouterCast } from "./cast.ts";
-import { MissionRouter } from "./MissionRouter.ts";
+import { actorsOfThread, masterRoleOf, readCast, threadsOfActor, type RouterCast } from "./cast.ts";
+import { coordMemberPrincipal, MissionRouter } from "./MissionRouter.ts";
 import { actorKey } from "./model.ts";
 import { RouterStore, type RecipientEntry } from "./RouterStore.ts";
 
@@ -38,10 +37,16 @@ import { RouterStore, type RecipientEntry } from "./RouterStore.ts";
  * those here, so the messages live in Robob's rooms and ring Robob's
  * doorbell. Replies use coord's own shapes and refusal codes (see
  * `integrations/coord/lib/forward.mjs` and `test/fake-missions.mjs`), so
- * nothing on coord's side can tell the difference. The HTTP caller is the
- * `coord-shim` system component; the coord actor named in the body speaks.
+ * nothing on coord's side can tell the difference.
+ *
+ * Only the `coord` component credential reaches the shim, and it speaks only
+ * for the coord actors the owner or the mission's master enrolled to it
+ * (`mission_set_member` with a `coord` principal). The actor named in `as`
+ * picks one of those; it never grants anything by itself.
  */
 
+/** The component credential coord's forward mode authenticates as. */
+export const COORD_COMPONENT = "coord";
 export const COORD_SHIM_COMPONENT = "coord-shim";
 const SHIM_PROVENANCE: MissionProvenance = { _tag: "system", component: COORD_SHIM_COMPONENT };
 const INBOX_LIMIT_MAX = 1000;
@@ -126,13 +131,17 @@ export type CoordAckEntry =
 export class CoordShim extends Context.Service<
   CoordShim,
   {
+    /** `component` is the caller's authenticated component, or null for any other credential. */
     readonly post: (
+      component: string | null,
       input: CoordPostInput,
     ) => Effect.Effect<CoordPostReply, CoordRefusal | MissionError>;
     readonly inbox: (
+      component: string | null,
       input: CoordInboxInput,
     ) => Effect.Effect<ReadonlyArray<CoordEventRow>, CoordRefusal | MissionError>;
     readonly ack: (
+      component: string | null,
       input: CoordAckInput,
     ) => Effect.Effect<ReadonlyArray<CoordAckEntry>, CoordRefusal | MissionError>;
   }
@@ -155,6 +164,27 @@ const make = Effect.gen(function* () {
       const mission = Option.getOrNull(yield* store.get("mission", missionId));
       if (mission === null) return yield* refuse("not_found", `no mission ${missionId}`, 404);
       return mission;
+    });
+
+  /**
+   * The caller must be the coord component, and the actor it names must be
+   * enrolled to it in this mission. Checked before anything else is read, so
+   * an unenrolled caller learns nothing about the mission's events.
+   */
+  const requireEnrolled = (component: string | null, missionId: MissionId, name: string) =>
+    Effect.gen(function* () {
+      if (component !== COORD_COMPONENT) {
+        return yield* refuse("forbidden", "only the coord component credential uses the shim", 403);
+      }
+      yield* requireMission(missionId);
+      const rows = yield* rooms.membersByPrincipal(coordMemberPrincipal(name));
+      if (!rows.some((row) => row.missionId === missionId)) {
+        return yield* refuse(
+          "forbidden",
+          `coord is not enrolled to act as ${name} in ${missionId}`,
+          403,
+        );
+      }
     });
 
   /** System components the mission knows: those subscribed to one of its rooms. */
@@ -215,21 +245,25 @@ const make = Effect.gen(function* () {
     return [...keys];
   };
 
-  const reader = (missionId: MissionId, name: string) =>
+  const reader = (component: string | null, missionId: MissionId, name: string) =>
     Effect.gen(function* () {
-      yield* requireMission(missionId);
-      const cast = yield* castOf(store, missionId);
+      yield* requireEnrolled(component, missionId, name);
+      const cast = yield* readCast(store, missionId);
       const actor = actorNamed(cast, yield* systemNames(missionId), name);
       return { cast, actor };
     });
 
-  const post = (input: CoordPostInput) =>
+  const post = (component: string | null, input: CoordPostInput) =>
     Effect.gen(function* () {
       const missionId = input.mission;
-      yield* requireMission(missionId);
+      yield* requireEnrolled(component, missionId, input.as);
       const prior = yield* rooms.messageByKey(missionId, input.key);
       if (prior !== null) {
-        if (prior.message.coord?.bodyHash === input.hash) {
+        // A replay is the same actor's same event; another actor's key is a conflict.
+        if (
+          prior.message.coord?.sender === input.as &&
+          prior.message.coord.bodyHash === input.hash
+        ) {
           return { seq: prior.message.seq, duplicate: true } as const;
         }
         return yield* refuse("conflict", `event ${input.key} exists with a different body`, 409, {
@@ -248,7 +282,7 @@ const make = Effect.gen(function* () {
         return yield* refuse("channel_archived", `channel ${input.channel} is archived`);
       }
 
-      const cast = yield* castOf(store, missionId);
+      const cast = yield* readCast(store, missionId);
       const systems = yield* systemNames(missionId);
       const author = actorNamed(cast, systems, input.as);
       if (author === null) return yield* refuse("unknown_actor", `no actor ${input.as}`);
@@ -339,9 +373,9 @@ const make = Effect.gen(function* () {
     };
   };
 
-  const inbox = (input: CoordInboxInput) =>
+  const inbox = (component: string | null, input: CoordInboxInput) =>
     Effect.gen(function* () {
-      const { cast, actor } = yield* reader(input.mission, input.as);
+      const { cast, actor } = yield* reader(component, input.mission, input.as);
       // coord answers an unknown reader with an empty inbox.
       if (actor === null) return [];
       const entries = yield* rooms.recipientInbox({
@@ -354,10 +388,10 @@ const make = Effect.gen(function* () {
       return entries.map((entry) => rowOf(cast, entry));
     });
 
-  const ack = (input: CoordAckInput) =>
+  const ack = (component: string | null, input: CoordAckInput) =>
     Effect.gen(function* () {
       const missionId = input.mission;
-      const { cast, actor } = yield* reader(missionId, input.as);
+      const { cast, actor } = yield* reader(component, missionId, input.as);
       const keys = actor === null ? [] : readerKeys(cast, actor);
       // Every ref must resolve and be addressed to the reader before any is acked.
       const targets: Array<{
