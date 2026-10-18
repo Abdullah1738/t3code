@@ -514,7 +514,7 @@ const MissionApprovalAnnotateTool = missionWriteTool(
 
 const MissionApprovalRoutingTool = missionWriteTool(
   "mission_approval_routing",
-  "As the mission's master, replace the mission's approval routing table: rows matched in order, first match wins. An approval row matches by kind and repository (owner/repo); a draft row by channel, audience or person. Anything no row matches goes to the owner. Applies to approvals opened from now on.",
+  "As the mission's master, replace the mission's approval routing table: rows matched in order, first match wins. An approval row matches by kind, repository (owner/repo), sub-mission or work item (the item whose pull request the approval is for); a draft row by channel, audience or person. Anything no row matches goes to the owner. Applies to approvals opened from now on.",
   SetApprovalRoutingInput,
 );
 

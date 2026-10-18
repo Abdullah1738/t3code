@@ -255,6 +255,169 @@ describe("approvals", () => {
   });
 });
 
+describe("routing by sub-mission and work item", () => {
+  it("rows match the work the approval or draft is about", () => {
+    const routes = [
+      {
+        id: "item",
+        match: { _tag: "approval" as const, workItemId: WorkItemId.make("wi-1") },
+        approver: "owner" as const,
+      },
+      {
+        id: "wave",
+        match: { _tag: "approval" as const, subMissionId: SubMissionId.make("sm-wave") },
+        approver: "master" as const,
+      },
+      {
+        id: "wave-drafts",
+        match: {
+          _tag: "draft" as const,
+          channel: "email" as const,
+          subMissionId: SubMissionId.make("sm-wave"),
+        },
+        approver: "master" as const,
+      },
+    ];
+    const approval = { _tag: "approval" as const, kind: "merge" as const, repository: null };
+    assert.deepStrictEqual(
+      routeApprover(routes, { ...approval, subMissionId: "sm-wave", workItemId: "wi-1" }),
+      { approver: "owner", routeId: "item" },
+    );
+    assert.deepStrictEqual(
+      routeApprover(routes, { ...approval, subMissionId: "sm-wave", workItemId: "wi-2" }),
+      { approver: "master", routeId: "wave" },
+    );
+    // No known work never matches a row that names work.
+    assert.deepStrictEqual(routeApprover(routes, approval), { approver: "owner", routeId: null });
+    const draft = { _tag: "draft" as const, channel: "email" as const, audience: "Bank" };
+    assert.deepStrictEqual(
+      routeApprover(routes, { ...draft, person: null, subMissionId: "sm-wave" }),
+      { approver: "master", routeId: "wave-drafts" },
+    );
+    assert.deepStrictEqual(routeApprover(routes, { ...draft, person: null }), {
+      approver: "owner",
+      routeId: null,
+    });
+  });
+
+  it.effect("the master takes a whole sub-mission's approvals; the owner still decides any", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const missions = yield* MissionService.MissionService;
+      const wave = SubMissionId.make(
+        (yield* missions.upsertSubMission(master, { missionId, title: "Architecture wave" })).ref
+          .id,
+      );
+      const other = SubMissionId.make(
+        (yield* missions.upsertSubMission(master, { missionId, title: "Billing" })).ref.id,
+      );
+      const onPr = (id: string, subMissionId: SubMissionId, number: number) =>
+        missions.upsertWorkItem(master, {
+          missionId,
+          workItemId: WorkItemId.make(id),
+          subMissionId,
+          title: `PR ${number}`,
+          kind: "pr",
+          pullRequest: { repository: "acme/api", number },
+        });
+      yield* onPr("wi-wave-1", wave, 11);
+      yield* onPr("wi-wave-2", wave, 12);
+      yield* onPr("wi-billing", other, 13);
+
+      // Rows must name work in this mission.
+      assert.equal(
+        yield* failureCode(
+          missions.setApprovalRouting(master, {
+            missionId,
+            routes: [
+              {
+                id: "ghost",
+                match: { _tag: "approval", subMissionId: SubMissionId.make("sm-ghost") },
+                approver: "master",
+              },
+            ],
+          }),
+        ),
+        "invalid",
+      );
+      assert.equal(
+        yield* failureCode(
+          missions.setApprovalRouting(master, {
+            missionId,
+            routes: [
+              {
+                id: "ghost-item",
+                match: { _tag: "approval", workItemId: WorkItemId.make("wi-ghost") },
+                approver: "master",
+              },
+            ],
+          }),
+        ),
+        "invalid",
+      );
+
+      // The owner told the master these are its call; one item stays the owner's.
+      const routed = yield* missions.setApprovalRouting(master, {
+        missionId,
+        routes: [
+          {
+            id: "keep-12",
+            match: { _tag: "approval", workItemId: WorkItemId.make("wi-wave-2") },
+            approver: "owner",
+          },
+          {
+            id: "wave",
+            match: { _tag: "approval", subMissionId: wave },
+            approver: "master",
+          },
+        ],
+        reason: "Owner: I don't need to approve the architecture wave",
+      });
+      const routingEvent = (yield* missions.eventsSince(missionId, routed.seq - 1))[0];
+      assert.equal(routingEvent?.kind, "approval-routing.updated");
+
+      const first = crwApproval("11", "aaaaaaaaaaaa");
+      const kept = crwApproval("12", "bbbbbbbbbbbb");
+      const billing = crwApproval("13", "cccccccccccc");
+      const loose = crwApproval("99", "dddddddddddd");
+      for (const input of [first, kept, billing, loose]) {
+        yield* missions.openApproval(crw, input);
+      }
+      const records = yield* missions.approvals({
+        missionId,
+        ids: [first.approvalId, kept.approvalId, billing.approvalId, loose.approvalId],
+      });
+      const approverFor = (id: ApprovalId) => records.find((record) => record.id === id)?.approver;
+      assert.equal(approverFor(first.approvalId), "master");
+      assert.equal(approverFor(kept.approvalId), "owner");
+      assert.equal(approverFor(billing.approvalId), "owner");
+      assert.equal(approverFor(loose.approvalId), "owner");
+
+      // The opened event says which work and row decided it.
+      const opened = (yield* missions.eventsSince(missionId, routed.seq)).find(
+        (event) => event.kind === "approval.opened" && event.subject?.id === first.approvalId,
+      );
+      assert.deepStrictEqual(opened?.payload, {
+        approver: "master",
+        routeId: "wave",
+        subMissionId: wave,
+        workItemId: "wi-wave-1",
+      });
+
+      // The master decides the wave's approval; the owner can still decide it too.
+      yield* missions.decideApproval(master, { approvalId: first.approvalId, action: "approve" });
+      assert.equal(
+        yield* failureCode(
+          missions.decideApproval(master, { approvalId: kept.approvalId, action: "approve" }),
+        ),
+        "provenance-required",
+      );
+      yield* missions.decideApproval(ownerApp, { approvalId: kept.approvalId, action: "approve" });
+    }).pipe(Effect.provide(layer));
+  });
+});
+
 describe("master structure controls", () => {
   it.effect("the master splits and merges lanes and merges sub-missions, on the timeline", () => {
     const { layer } = harness();
