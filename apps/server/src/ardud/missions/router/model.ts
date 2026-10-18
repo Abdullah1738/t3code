@@ -38,7 +38,10 @@ export type SendPath =
   | "thread-send"
   | "thread-send-attachments"
   | "queued-edit"
-  | "scheduled-task";
+  | "merge-back"
+  | "request-respond"
+  | "scheduled-task"
+  | "schedule-edit";
 
 /**
  * Who is sending, taken from the authenticated transport context only.

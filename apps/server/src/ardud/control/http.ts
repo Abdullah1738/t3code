@@ -47,6 +47,8 @@ import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
 import { BoardService } from "../board/BoardService.ts";
+// ardud missions: router
+import { guardControlSend, type SendRefused } from "../missions/router/guardPaths.ts";
 import {
   formatModel,
   lastAssistantText,
@@ -110,6 +112,18 @@ const json = (body: unknown, status = 200) =>
 
 const errorResponse = (error: ControlError) =>
   json({ ok: false, error: { code: error.code, message: error.message } }, STATUS[error.code]);
+
+// ardud missions: router - a guarded send is refused with 403 and says where it went.
+const controlRefusal = (threadId: ThreadId, refusal: SendRefused) =>
+  json(
+    {
+      ok: false,
+      threadId,
+      error: { code: "forbidden", message: refusal.message },
+      guard: refusal.outcome,
+    },
+    STATUS.forbidden,
+  );
 
 // ---------------------------------------------------------------------------
 // Request helpers
@@ -830,11 +844,26 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   const send = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeSendBody);
     const shell = yield* getShell(threadId);
     const commandId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
+    // ardud missions: router - mission member threads only take sends the guard passes.
+    const refused = yield* guardControlSend({
+      session,
+      targetThreadId: shell.id,
+      text: body.text,
+      commandId,
+      clientRequestId: body.clientRequestId,
+    }).pipe(
+      Effect.as(null),
+      Effect.catchTags({
+        SendRefused: (refusal) => Effect.succeed(controlRefusal(shell.id, refusal)),
+        SendGuardFailed: (error) => Effect.fail(fail("unavailable", error.message)),
+      }),
+    );
+    if (refused !== null) return refused;
     const modelSelection =
       body.model === undefined && body.variant === undefined
         ? undefined

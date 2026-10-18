@@ -49,8 +49,10 @@ let installed: SendGuard | null = null;
 /**
  * The single membership check every path into a thread calls before it
  * delivers: control API sends (and the coord shim riding on them),
- * `t3_thread_send`, `t3_thread_send_attachments`, `t3_queue_edit` and
- * scheduled task runs. Anything other than `pass` means: do not deliver.
+ * `t3_thread_send`, `t3_thread_send_attachments`, `t3_queue_edit`,
+ * `t3_thread_merge_back`, `t3_pending_request_respond`, scheduled task runs
+ * and MCP edits of a bound schedule's prompt. Adapters live in
+ * `guardPaths.ts`. Anything other than `pass` means: do not deliver.
  */
 export const guardSend = (
   request: SendGuardRequest,

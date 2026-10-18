@@ -59,6 +59,8 @@ import {
   type WebhookRequest,
 } from "./webhookTemplate.ts";
 import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerification.ts";
+// ardud missions: router
+import { guardScheduledRun } from "../ardud/missions/router/guardPaths.ts";
 
 /** Path prefix of the environment route that receives webhook requests. */
 export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
@@ -831,20 +833,30 @@ export const layer = Layer.effect(
                 }),
               )
             : yield* Effect.exit(
-                threadManagement.sendToThread({
-                  projectId: active.projectId,
-                  commandId,
-                  threadId: ThreadId.make(active.threadId),
-                  messageId,
-                  scheduledTaskId: active.id,
+                // ardud missions: router - a run into a mission member thread goes through the guard.
+                guardScheduledRun({
+                  task: active,
+                  targetThreadId: ThreadId.make(active.threadId),
                   text: prompt,
-                  attachments: [],
-                  modelSelection: active.modelSelection,
-                  // Scheduled prompts must not interrupt tools in the bound thread.
-                  mode: "queue",
-                  createdBy: active.createdBy,
-                  creationSource: active.creationSource,
-                }),
+                  commandId,
+                }).pipe(
+                  Effect.andThen(
+                    threadManagement.sendToThread({
+                      projectId: active.projectId,
+                      commandId,
+                      threadId: ThreadId.make(active.threadId),
+                      messageId,
+                      scheduledTaskId: active.id,
+                      text: prompt,
+                      attachments: [],
+                      modelSelection: active.modelSelection,
+                      // Scheduled prompts must not interrupt tools in the bound thread.
+                      mode: "queue",
+                      createdBy: active.createdBy,
+                      creationSource: active.creationSource,
+                    }),
+                  ),
+                ),
               );
 
         const completedAt = yield* localNow;
