@@ -615,11 +615,44 @@ export const DEFAULT_STARTER_LAYOUT: ViewStarterLayout = {
   changeNote: null,
 };
 
+/** Default titles; a layout entry's `title` overrides them. */
+export const VIEW_BUILTIN_SECTION_TITLES: { readonly [K in ViewBuiltinSectionKind]: string } = {
+  "header-stats": "Mission header",
+  "needs-you": "Needs you",
+  "path-to-milestone": "Path to milestone",
+  "with-the-master": "With the master",
+  "sub-missions": "Sub-missions",
+  "since-last-looked": "Since you last looked",
+};
+export const VIEW_TAB_TITLES: { readonly [K in ViewTabKind]: string } = {
+  overview: "Overview",
+  board: "Board",
+  changes: "Changes",
+  calls: "Calls",
+  rooms: "Rooms",
+  lanes: "Lanes",
+  work: "Work",
+  rules: "Rules",
+  roles: "Roles",
+  timeline: "Timeline",
+  views: "Views",
+};
+
 /** Regions where a built-in page section shows on the mission overview. */
 const OVERVIEW_REGIONS: ReadonlySet<ViewRegion> = new Set(["header", "main", "rail"]);
 
+/** The overview page is gone when its tab is hidden or removed while other tabs remain. */
+export const viewLayoutShowsOverview = (layout: ViewLayoutDefinition): boolean => {
+  const tabs = layout.entries.filter((entry) => entry.section._tag === "tab");
+  if (tabs.length === 0) return true;
+  return tabs.some(
+    (entry) => !entry.hidden && entry.section._tag === "tab" && entry.section.tab === "overview",
+  );
+};
+
 /** Whether the layout shows Needs you on the overview. */
 export const viewLayoutShowsNeedsYou = (layout: ViewLayoutDefinition): boolean =>
+  viewLayoutShowsOverview(layout) &&
   layout.entries.some(
     (entry) =>
       !entry.hidden &&
@@ -764,6 +797,9 @@ export const VIEW_PATHS: { readonly [K in ViewPathScope]: PathTable } = {
 
 /** Section-level values a section body may bind outside its list rows. */
 export const VIEW_SECTION_PATHS: PathTable = { count: "number", total: "number" };
+
+/** Row paths for `refs` sections, whose rows mix record kinds. */
+export const VIEW_REF_ROW_PATHS: PathTable = { title: "text", kind: "enum", status: "enum" };
 
 /** Value kinds each binding slot accepts. */
 const SCALAR: ReadonlyArray<ViewValueKind> = [
@@ -1200,7 +1236,10 @@ export const PreviewViewInput = Schema.Struct({
 export type PreviewViewInput = typeof PreviewViewInput.Type;
 
 export const ViewIssueCode = Schema.Literals([
+  "shape",
   "unknown-node",
+  "node-not-allowed",
+  "duplicate",
   "bad-binding",
   "binding-kind",
   "action-not-allowed",
@@ -1240,7 +1279,7 @@ export type MissionViewsInput = typeof MissionViewsInput.Type;
 export const MissionViewsSnapshot = Schema.Struct({
   missionId: MissionId,
   catalogVersion: PositiveInt,
-  /** Latest view change seq for this mission (0 before any). */
+  /** Counts view changes to this mission and to the starter layout (0 before any). */
   revision: NonNegativeInt,
   templates: Schema.Array(ViewTemplate),
   sections: Schema.Array(ViewSection),
