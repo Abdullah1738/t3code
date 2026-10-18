@@ -184,6 +184,31 @@ const makeRoutes = Effect.gen(function* () {
       if (!session.scopes.includes(scope)) {
         return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
       }
+      return session;
+    });
+
+  // ardud missions: core (H3)
+  /**
+   * The component an approval route acts for. A component credential is that
+   * component and may only act for itself. The shared control token still
+   * names the component in the body until cutover retires it.
+   */
+  const approvalComponent = (session: EnvironmentAuth.AuthenticatedSession, named: string) =>
+    Effect.gen(function* () {
+      const component = session.origin?._tag === "component" ? session.origin.component : null;
+      if (component !== null && component !== named) {
+        return yield* fail(
+          "forbidden",
+          `This credential is ${component}; it cannot act for ${named}.`,
+        );
+      }
+      if (!APPROVAL_COMPONENTS.has(named)) {
+        return yield* fail(
+          "forbidden",
+          `Only ${[...APPROVAL_COMPONENTS].join(", ")} open approvals over HTTP.`,
+        );
+      }
+      return systemProvenance(named);
     });
 
   const handle = <R>(
@@ -279,20 +304,15 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   const openApproval = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
     const input = yield* decodeBody(decodeOpenApproval);
-    if (!APPROVAL_COMPONENTS.has(input.requestedBy)) {
-      return yield* fail(
-        "forbidden",
-        `Only ${[...APPROVAL_COMPONENTS].join(", ")} open approvals over HTTP.`,
-      );
-    }
-    const result = yield* missions.openApproval(systemProvenance(input.requestedBy), input);
+    const provenance = yield* approvalComponent(session, input.requestedBy);
+    const result = yield* missions.openApproval(provenance, input);
     return json({ ok: true, ...result });
   });
 
   const closeStaleApproval = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
     const input = yield* decodeBody(decodeCloseStaleApproval);
     const [record] = yield* missions.approvals({
       missionId: input.missionId,
@@ -303,7 +323,8 @@ const makeRoutes = Effect.gen(function* () {
     if (!APPROVAL_COMPONENTS.has(component)) {
       return yield* fail("forbidden", `Approval ${input.approvalId} was not opened over HTTP.`);
     }
-    const result = yield* missions.closeStaleApproval(systemProvenance(component), input);
+    const provenance = yield* approvalComponent(session, component);
+    const result = yield* missions.closeStaleApproval(provenance, input);
     return json({ ok: true, ...result });
   });
 

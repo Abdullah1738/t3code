@@ -21,6 +21,7 @@ import { CRPKO, JUNO, OWNER, SYSTEM, agent, makePorts, testLayer } from "./testi
 const ports = makePorts();
 const MASTER = agent("thread-master");
 const STRANGER = agent("thread-stranger");
+const CRW = { _tag: "system", component: "crw" } as const;
 const pr = { repository: "crpko/trading-core", number: 412 };
 
 const kinds = (events: ReadonlyArray<MissionEvent>) => events.map((event) => event.kind);
@@ -308,9 +309,28 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       });
       assert.strictEqual(plan.verdict?.source, "hard-trigger");
       assert.isTrue(plan.verdict?.critical);
-      // Stored: the plan without facts still sees it.
+      // M2: reading the plan with facts stored nothing.
+      plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: big, headSha: "a1" });
+      assert.strictEqual(plan.ladderId, "normal");
+      assert.isNull(plan.verdict);
+
+      // crw reports the facts it read; the trigger lands in crw's name.
+      const reported = yield* policy.recordTriggerFacts(CRW, {
+        missionId: CRPKO,
+        pullRequest: big,
+        facts: { changedLines: 2400 },
+      });
+      assert.isTrue(reported.recorded);
+      assert.deepStrictEqual(reported.verdict?.decidedBy, { _tag: "system", component: "crw" });
       plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: big, headSha: "a1" });
       assert.strictEqual(plan.ladderId, "critical");
+      // Reported again: already on record, nothing new.
+      const again = yield* policy.recordTriggerFacts(CRW, {
+        missionId: CRPKO,
+        pullRequest: big,
+        facts: { changedLines: 2400 },
+      });
+      assert.isFalse(again.recorded);
 
       yield* policy.recordCriticality(MASTER, {
         missionId: CRPKO,
@@ -346,6 +366,88 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
         }),
       );
       assert.strictEqual(forbidden.code, "forbidden");
+    }),
+  );
+
+  it.effect("M2: invented facts never become a verdict from a read or an unvouched caller", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      const quiet = { repository: "crpko/ledger", number: 78 };
+      yield* policy.setCriticalityGuide(MASTER, {
+        missionId: CRPKO,
+        text: "XL diffs are critical.",
+        hardTriggers: [{ _tag: "changed-lines", atLeast: 1500 }],
+      });
+      // Anyone may read a plan with whatever facts they like; nothing is stored.
+      for (let read = 0; read < 3; read++) {
+        yield* policy.reviewPlan({
+          missionId: CRPKO,
+          pullRequest: quiet,
+          headSha: "b1",
+          facts: { changedLines: 99_999, labels: ["critical"] },
+        });
+      }
+      let plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: quiet, headSha: "b1" });
+      assert.isNull(plan.verdict);
+      assert.strictEqual(plan.ladderId, "normal");
+
+      // A stranger thread, an MCP client, the shared control token: none vouch for facts.
+      for (const caller of [
+        STRANGER,
+        { _tag: "system", component: "mcp" } as const,
+        { _tag: "system", component: "control-api" } as const,
+      ]) {
+        const refused = yield* Effect.flip(
+          policy.recordTriggerFacts(caller, {
+            missionId: CRPKO,
+            pullRequest: quiet,
+            facts: { changedLines: 99_999 },
+          }),
+        );
+        assert.strictEqual(refused.code, "forbidden");
+      }
+      plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: quiet, headSha: "b1" });
+      assert.isNull(plan.verdict);
+
+      // The master may, in its own name.
+      const byMaster = yield* policy.recordTriggerFacts(MASTER, {
+        missionId: CRPKO,
+        pullRequest: quiet,
+        facts: { changedLines: 2000 },
+      });
+      assert.isTrue(byMaster.recorded);
+      assert.strictEqual(byMaster.verdict?.decidedBy._tag, "role");
+    }),
+  );
+
+  it.effect("H3: callers from outside do not govern; only the policy's own components do", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      const outsiders = [
+        { _tag: "system", component: "control-api" } as const,
+        { _tag: "system", component: "mcp" } as const,
+        { _tag: "system", component: "mcp-client:laptop" } as const,
+        CRW,
+      ];
+      for (const caller of outsiders) {
+        const refused = yield* Effect.flip(
+          policy.setRoleModel(caller, {
+            roleId: RoleId.make("crpko:reviewer"),
+            modelSelection: HAIKU,
+            reason: "cheaper",
+          }),
+        );
+        assert.strictEqual(refused.code, "forbidden");
+        const verdict = yield* Effect.flip(
+          policy.recordCriticality(caller, {
+            missionId: CRPKO,
+            pullRequest: pr,
+            critical: false,
+            reason: "trust me",
+          }),
+        );
+        assert.strictEqual(verdict.code, "forbidden");
+      }
     }),
   );
 

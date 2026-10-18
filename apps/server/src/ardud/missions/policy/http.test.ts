@@ -7,40 +7,56 @@ import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 
+import type { SessionOrigin } from "../../auth/SessionOrigins.ts";
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import { MISSIONS_ROUTE_PREFIX } from "../http.ts";
 import * as MissionService from "../MissionService.ts";
 import { policyRouteLayer } from "./http.ts";
 import { PolicyService } from "./PolicyService.ts";
-import { CRPKO, OWNER, SYSTEM, makePorts, testLayer } from "./testing.ts";
+import { CRPKO, OWNER, makePorts, testLayer } from "./testing.ts";
 
 const TOKENS: Record<string, ReadonlyArray<AuthEnvironmentScope>> = {
   "Bearer reader": ["orchestration:read"],
   "Bearer operator": ["orchestration:read", "orchestration:operate"],
+  "Bearer crw": ["orchestration:read", "orchestration:operate"],
+  "Bearer scribe": ["orchestration:read", "orchestration:operate"],
+};
+
+/** Component credentials: the server knows who they are from the session, not a header. */
+const ORIGINS: Record<string, SessionOrigin> = {
+  "Bearer crw": { _tag: "component", component: "crw" },
+  "Bearer scribe": { _tag: "component", component: "scribe" },
 };
 
 const REVIEW_POOL = PoolId.make("crpko-review-slots");
 const pr = { repository: "crpko/trading-core", number: 412 };
 
-// The owner creates Crpko; a server component sets up a one-slot review pool.
-const seeded = Layer.effectDiscard(
-  Effect.gen(function* () {
-    const missions = yield* MissionService.MissionService;
-    const policy = yield* PolicyService;
-    yield* missions.createMission(OWNER, { missionId: CRPKO, slug: "crpko", title: "Crpko" });
-    yield* policy.createPool(SYSTEM, {
-      poolId: REVIEW_POOL,
-      name: "Crpko review slots",
-      unit: "review",
-      capacity: 1,
-      scope: { _tag: "mission", missionId: CRPKO },
-      kind: "lease",
-      backend: "native",
-    });
-  }),
-);
+// The owner creates Crpko with a one-slot review pool, and optionally a hard trigger.
+const seeded = (trigger: boolean) =>
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const missions = yield* MissionService.MissionService;
+      const policy = yield* PolicyService;
+      yield* missions.createMission(OWNER, { missionId: CRPKO, slug: "crpko", title: "Crpko" });
+      yield* policy.createPool(OWNER, {
+        poolId: REVIEW_POOL,
+        name: "Crpko review slots",
+        unit: "review",
+        capacity: 1,
+        scope: { _tag: "mission", missionId: CRPKO },
+        kind: "lease",
+        backend: "native",
+      });
+      if (!trigger) return;
+      yield* policy.setCriticalityGuide(OWNER, {
+        missionId: CRPKO,
+        text: "XL diffs are critical.",
+        hardTriggers: [{ _tag: "changed-lines", atLeast: 1500 }],
+      });
+    }),
+  );
 
-const makeHandler = () => {
+const makeHandler = (options: { readonly trigger?: boolean } = {}) => {
   const ports = makePorts();
   ports.threads.set("thread-stranger", { exists: true, idle: true, modelSelection: null });
   return HttpRouter.toWebHandler(
@@ -56,11 +72,16 @@ const makeHandler = () => {
                   subject: "test",
                   method: "bearer-access-token" as const,
                   scopes,
+                  ...(ORIGINS[request.headers.authorization ?? ""]
+                    ? { origin: ORIGINS[request.headers.authorization ?? ""] }
+                    : {}),
                 });
           },
         }),
       ),
-      Layer.provide(seeded.pipe(Layer.provideMerge(testLayer(ports.layer)))),
+      Layer.provide(
+        seeded(options.trigger ?? false).pipe(Layer.provideMerge(testLayer(ports.layer))),
+      ),
       Layer.provide(
         HttpPlatform.layer.pipe(
           Layer.provideMerge(NodeServices.layer),
@@ -233,28 +254,146 @@ describe("mission policy routes", () => {
     }
   });
 
-  it("acts as the named agent thread when one is given", async () => {
+  it("H3: a header never names the caller, and HTTP does not govern", async () => {
     const { handler, dispose } = makeHandler();
     try {
-      const stranger = await handler(
-        request("/pools/capacity", {
-          token: "Bearer operator",
-          headers: { "x-t3-thread-id": "thread-stranger" },
-          body: { poolId: REVIEW_POOL, capacity: 4 },
-        }),
-      );
-      expect(stranger.status).toBe(403);
+      const take = {
+        poolId: REVIEW_POOL,
+        missionId: "crpko",
+        amount: 1,
+        purpose: "x",
+        ttlSeconds: 60,
+      };
+      // Any identity header is refused outright, with or without a token that could act.
+      for (const headers of [
+        { "x-t3-thread-id": "thread-master" },
+        { "x-t3-thread-id": "thread-master", "x-t3-role-id": "crpko:master" },
+        { "x-t3-component": "crw" },
+      ]) {
+        for (const token of ["Bearer operator", "Bearer crw"]) {
+          const spoofed = await handler(request("/pools/holds", { token, headers, body: take }));
+          expect(spoofed.status).toBe(400);
+        }
+      }
 
-      const control = await handler(
-        request("/pools/capacity", {
-          token: "Bearer operator",
-          body: { poolId: REVIEW_POOL, capacity: 4 },
-        }),
+      // Governance is not an HTTP operation for anyone: not the control token, not crw.
+      const governance: Array<[string, unknown]> = [
+        ["/pools/capacity", { poolId: REVIEW_POOL, capacity: 4 }],
+        ["/pools", { name: "x", unit: "y", capacity: 1, scope: { _tag: "global" } }],
+        [
+          "/roles/model",
+          {
+            roleId: "crpko:reviewer",
+            modelSelection: { provider: "opencode", model: "x" },
+            reason: "x",
+          },
+        ],
+        ["/criticality", { missionId: "crpko", pullRequest: pr, critical: false, reason: "x" }],
+        ["/review-policy/guide", { missionId: "crpko", text: "" }],
+        ["/pools/holds/reconcile", { holdId: "x", fence: 1, outcome: "released" }],
+      ];
+      for (const [path, payload] of governance) {
+        for (const token of ["Bearer operator", "Bearer crw"]) {
+          const refused = await handler(request(path, { token, body: payload }));
+          expect(refused.status).toBe(403);
+          expect((await body(refused)).error?.missionCode).toBe("provenance-required");
+        }
+      }
+      const pools = await body(
+        await handler(request("/pools?missionId=crpko", { token: "Bearer reader" })),
       );
-      expect(control.status).toBe(200);
+      expect((pools.pools as Array<{ pool: { capacity: number } }>)[0]?.pool.capacity).toBe(1);
 
       const governor = await body(await handler(request("/governor", { token: "Bearer reader" })));
       expect(governor.ok).toBe(true);
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("crw's own credential acts as crw; another component's credential does not write policy", async () => {
+    const { handler, dispose } = makeHandler();
+    try {
+      const taken = await body(
+        await handler(
+          request("/pools/holds", {
+            token: "Bearer crw",
+            body: {
+              poolId: REVIEW_POOL,
+              missionId: "crpko",
+              amount: 1,
+              purpose: "review",
+              ttlSeconds: 60,
+            },
+          }),
+        ),
+      );
+      expect((taken.hold as { holder: unknown }).holder).toEqual({
+        _tag: "system",
+        component: "crw",
+      });
+
+      const scribe = await handler(
+        request("/reviews", {
+          token: "Bearer scribe",
+          body: {
+            missionId: "crpko",
+            pullRequest: pr,
+            stageId: "reviewer",
+            headSha: "abc",
+            verdict: "clear",
+          },
+        }),
+      );
+      expect(scribe.status).toBe(403);
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("M2: the plan is a pure read; only a vouched reporter records trigger facts", async () => {
+    const { handler, dispose } = makeHandler({ trigger: true });
+    try {
+      const big = { repository: "crpko/ledger", number: 9 };
+      const plan = async (token: string, facts?: unknown) =>
+        (
+          await body(
+            await handler(
+              request("/review-plan", {
+                token,
+                body: {
+                  missionId: "crpko",
+                  pullRequest: big,
+                  headSha: "h1",
+                  ...(facts ? { facts } : {}),
+                },
+              }),
+            ),
+          )
+        ).plan as { verdict: { source: string; decidedBy: unknown } | null; ladderId: string };
+
+      // Invented facts on a read: the answer previews the trigger, nothing is stored.
+      expect((await plan("Bearer reader", { changedLines: 99_999 })).verdict?.source).toBe(
+        "hard-trigger",
+      );
+      expect((await plan("Bearer reader")).verdict).toBeNull();
+
+      // Neither a reader nor the shared control token vouches for facts.
+      const facts = { missionId: "crpko", pullRequest: big, facts: { changedLines: 2400 } };
+      for (const token of ["Bearer reader", "Bearer operator"]) {
+        const refused = await handler(request("/criticality/facts", { token, body: facts }));
+        expect(refused.status).toBe(403);
+      }
+      expect((await plan("Bearer reader")).verdict).toBeNull();
+
+      // crw's own credential records it, in crw's name.
+      const reported = await body(
+        await handler(request("/criticality/facts", { token: "Bearer crw", body: facts })),
+      );
+      expect(reported.recorded).toBe(true);
+      const stored = await plan("Bearer reader");
+      expect(stored.ladderId).toBe("critical");
+      expect(stored.verdict?.decidedBy).toEqual({ _tag: "system", component: "crw" });
     } finally {
       await dispose();
     }

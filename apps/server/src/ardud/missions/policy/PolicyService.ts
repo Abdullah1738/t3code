@@ -14,6 +14,8 @@ import type {
   ReconcileHoldInput,
   RecordCriticalityInput,
   RecordReviewInput,
+  RecordTriggerFactsInput,
+  RecordTriggerFactsResult,
   ReleaseHoldInput,
   RenewHoldInput,
   RetireRoleInput,
@@ -87,8 +89,11 @@ export class PolicyService extends Context.Service<
     readonly setCriticalityGuide: Write<SetCriticalityGuideInput>;
     readonly recordCriticality: Write<RecordCriticalityInput>;
     readonly recordReview: Write<RecordReviewInput>;
-    /** What a pull request needs next at this head, and whether it may merge. */
+    /** What a pull request needs next at this head, and whether it may merge. Never writes. */
     readonly reviewPlan: (request: ReviewPlanRequest) => Fx<ReviewPlan>;
+    // ardud missions: core (M2)
+    /** Verified PR facts from the owner, the master or crw; a fired trigger is recorded. */
+    readonly recordTriggerFacts: Write<RecordTriggerFactsInput, RecordTriggerFactsResult>;
     // Pools
     readonly pools: (filter: { readonly missionId?: MissionId | undefined }) => Fx<PoolsSnapshot>;
     readonly createPool: Write<CreatePoolInput>;
@@ -178,6 +183,8 @@ const make = (options: PolicyOptions) =>
       recordCriticality: (provenance, input) => Reviews.recordCriticality(deps, provenance, input),
       recordReview: (provenance, input) => Reviews.recordReview(deps, provenance, input),
       reviewPlan: (request) => Reviews.planReview(deps, request),
+      recordTriggerFacts: (provenance, input) =>
+        Reviews.recordTriggerFacts(deps, provenance, input),
       pools: (filter) => Pools.poolsSnapshot(deps, filter),
       createPool: (provenance, input) => Pools.createPool(deps, provenance, input),
       updatePool: (provenance, input) => Pools.updatePool(deps, provenance, input),

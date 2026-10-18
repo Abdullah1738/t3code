@@ -7,12 +7,13 @@ import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 
+import type { SessionOrigin } from "../../auth/SessionOrigins.ts";
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import { MISSIONS_ROUTE_PREFIX, missionsRouteLayer } from "../http.ts";
 import * as MissionService from "../MissionService.ts";
 import { policyRouteLayer } from "../policy/http.ts";
 import { PolicyService } from "../policy/PolicyService.ts";
-import { CRPKO, OWNER, SYSTEM, makePorts, testLayer } from "../policy/testing.ts";
+import { CRPKO, OWNER, makePorts, testLayer } from "../policy/testing.ts";
 import fixture from "./crwContract.fixture.json" with { type: "json" };
 
 // crw's missions adapter (crw repo, lib/missions.mjs) sends exactly the
@@ -33,9 +34,18 @@ interface FixtureRequest {
 }
 
 const requests = fixture.requests as ReadonlyArray<FixtureRequest>;
-const TOKEN = "Bearer control";
+// crw's own component credential, and two that are not crw.
+const TOKEN = "Bearer crw-component";
+const CONTROL = "Bearer control";
+const SCRIBE = "Bearer scribe-component";
 const TOKENS: Record<string, ReadonlyArray<AuthEnvironmentScope>> = {
   [TOKEN]: ["orchestration:read", "orchestration:operate"],
+  [CONTROL]: ["orchestration:read", "orchestration:operate"],
+  [SCRIBE]: ["orchestration:read", "orchestration:operate"],
+};
+const ORIGINS: Record<string, SessionOrigin> = {
+  [TOKEN]: { _tag: "component", component: fixture.component },
+  [SCRIBE]: { _tag: "component", component: "scribe" },
 };
 
 // Mission Crpko and its review pool, as the import and the master set them up.
@@ -44,7 +54,7 @@ const seeded = Layer.effectDiscard(
     const missions = yield* MissionService.MissionService;
     const policy = yield* PolicyService;
     yield* missions.createMission(OWNER, { missionId: CRPKO, slug: "crpko", title: "Crpko" });
-    yield* policy.createPool(SYSTEM, {
+    yield* policy.createPool(OWNER, {
       poolId: PoolId.make(fixture.pool),
       name: "Crpko review slots",
       unit: "review",
@@ -67,10 +77,13 @@ const makeHandler = () => {
             return scopes === undefined
               ? Effect.fail(new EnvironmentAuth.ServerAuthMissingCredentialError({}))
               : Effect.succeed({
-                  sessionId: AuthSessionId.make("crw-control"),
-                  subject: "crw",
+                  sessionId: AuthSessionId.make("crw-component"),
+                  subject: "component:crw",
                   method: "bearer-access-token" as const,
                   scopes,
+                  ...(ORIGINS[request.headers.authorization ?? ""]
+                    ? { origin: ORIGINS[request.headers.authorization ?? ""] }
+                    : {}),
                 });
           },
         }),
@@ -89,13 +102,11 @@ const makeHandler = () => {
 
 type Json = Record<string, unknown>;
 
-// crw sends the control token and names itself; it never sends x-t3-thread-id.
-const crwRequest = (entry: FixtureRequest, body: Json | undefined) => {
+// crw sends its own component credential and no identity header; the server
+// derives {system, crw} from the session.
+const crwRequest = (entry: FixtureRequest, body: Json | undefined, token = TOKEN) => {
   const url = `http://env.local${MISSIONS_ROUTE_PREFIX}${entry.path}`;
-  const headers: Record<string, string> = {
-    authorization: TOKEN,
-    "x-t3-component": fixture.component,
-  };
+  const headers: Record<string, string> = { authorization: token };
   if (body === undefined) return new Request(url, { method: entry.method, headers });
   headers["content-type"] = "application/json";
   return new Request(url, { method: entry.method, headers, body: JSON.stringify(body) });
@@ -190,19 +201,28 @@ describe("crw adapter contract", () => {
     }
   });
 
-  it("refuses a component it does not know and a thread posing as crw", async () => {
+  it("acts as crw only for crw's credential, never for a header", async () => {
     const { handler, dispose } = makeHandler();
     try {
       const take = requests.find((entry) => entry.name === "take hold");
+      const open = requests.find((entry) => entry.name === "open approval");
       expect(take).toBeDefined();
-      if (take === undefined) return;
-      const stranger = crwRequest(take, take.body);
-      stranger.headers.set("x-t3-component", "someone");
-      expect((await handler(stranger)).status).toBe(403);
+      expect(open).toBeDefined();
+      if (take === undefined || open === undefined) return;
 
-      const both = crwRequest(take, take.body);
-      both.headers.set("x-t3-thread-id", "thread-master");
-      expect((await handler(both)).status).toBe(400);
+      // The old header is refused, whatever token carries it.
+      for (const token of [TOKEN, CONTROL]) {
+        const named = crwRequest(take, take.body, token);
+        named.headers.set("x-t3-component", "crw");
+        expect((await handler(named)).status).toBe(400);
+        const thread = crwRequest(take, take.body, token);
+        thread.headers.set("x-t3-thread-id", "thread-master");
+        expect((await handler(thread)).status).toBe(400);
+      }
+
+      // Another component's credential cannot take crw's holds or open crw's approvals.
+      expect((await handler(crwRequest(take, take.body, SCRIBE))).status).toBe(403);
+      expect((await handler(crwRequest(open, open.body, SCRIBE))).status).toBe(403);
     } finally {
       await dispose();
     }

@@ -1,29 +1,13 @@
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
-  BindRoleInput,
-  CreatePoolInput,
-  CreateRoleInput,
-  EditReviewPolicyInput,
   MissionId,
-  PoolId,
-  ReconcileHoldInput,
-  RecordCriticalityInput,
   RecordReviewInput,
+  RecordTriggerFactsInput,
   ReleaseHoldInput,
   RenewHoldInput,
-  RetireRoleInput,
   ReviewPlanRequest,
-  RoleId,
-  SetCriticalityGuideInput,
-  SetPoolCapacityInput,
-  SetRoleModelInput,
-  SucceedRoleInput,
   TakeHoldInput,
-  ThreadId,
-  UnbindRoleInput,
-  UpdatePoolInput,
-  UpdateRoleInput,
   type MissionError,
   type MissionErrorCode,
   type MissionProvenance,
@@ -36,28 +20,32 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import { MISSIONS_ROUTE_PREFIX } from "../http.ts";
+import { componentProvenance } from "../core/provenance.ts";
 import { PolicyService } from "./PolicyService.ts";
-import { PoolSource } from "./sources.ts";
 
 /**
  * Policy routes under /api/ardud/missions: roles, review policy and plan,
  * pools and holds, and the governor. Same bearer auth and `{ ok, ... }`
  * envelope as the rest of the missions API.
  *
- * A token holder is never the owner. A write that names its thread in
- * `x-t3-thread-id` (optionally `x-t3-role-id`) acts as that agent. A named
- * server component (`x-t3-component`, one of POLICY_COMPONENTS: crw) acts in
- * its own name, so its holds and review records say who took them. Anything
- * else (scripts) acts as the control API. Components and the control API may
- * do what a master may.
+ * ardud missions: core (H3). Who calls comes from the token, never from a
+ * header. A component credential (`t3 ardud component-token issue crw`)
+ * acts as that component; the shared control token acts as the control API
+ * until cutover. Either way HTTP only carries reads and the named operations
+ * crw needs: record a review, report PR facts, take, renew and release a
+ * hold. Governance (roles, review policy, verdicts, pool admin) needs a
+ * proven thread or the owner, so it goes through the MCP tools or the app.
  */
 export const POLICY_CONTROL_PROVENANCE: MissionProvenance = {
   _tag: "system",
   component: "control-api",
 };
 
-/** Components that call the policy routes in their own name with the control token. */
+/** Components whose credential may make the named policy writes in their own name. */
 export const POLICY_COMPONENTS: ReadonlySet<string> = new Set(["crw"]);
+
+/** Headers older callers sent to claim an identity. Refused, so nobody thinks they still work. */
+const IDENTITY_HEADERS = ["x-t3-thread-id", "x-t3-role-id", "x-t3-component"] as const;
 
 type HttpErrorCode =
   | "unauthorized"
@@ -121,32 +109,13 @@ const errorResponse = (error: PolicyHttpError) =>
 
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeMissionId = Schema.decodeUnknownEffect(MissionId);
-const decodeThreadId = Schema.decodeUnknownEffect(ThreadId);
-const decodeRoleId = Schema.decodeUnknownEffect(RoleId);
-
-const SetPoolSourceBody = Schema.Struct({ poolId: PoolId, source: Schema.NullOr(PoolSource) });
-
 const decode = {
-  createRole: Schema.decodeUnknownEffect(CreateRoleInput),
-  updateRole: Schema.decodeUnknownEffect(UpdateRoleInput),
-  retireRole: Schema.decodeUnknownEffect(RetireRoleInput),
-  setRoleModel: Schema.decodeUnknownEffect(SetRoleModelInput),
-  bindRole: Schema.decodeUnknownEffect(BindRoleInput),
-  unbindRole: Schema.decodeUnknownEffect(UnbindRoleInput),
-  succeedRole: Schema.decodeUnknownEffect(SucceedRoleInput),
-  editReviewPolicy: Schema.decodeUnknownEffect(EditReviewPolicyInput),
-  setCriticalityGuide: Schema.decodeUnknownEffect(SetCriticalityGuideInput),
-  recordCriticality: Schema.decodeUnknownEffect(RecordCriticalityInput),
   recordReview: Schema.decodeUnknownEffect(RecordReviewInput),
+  recordTriggerFacts: Schema.decodeUnknownEffect(RecordTriggerFactsInput),
   reviewPlan: Schema.decodeUnknownEffect(ReviewPlanRequest),
-  createPool: Schema.decodeUnknownEffect(CreatePoolInput),
-  updatePool: Schema.decodeUnknownEffect(UpdatePoolInput),
-  setPoolCapacity: Schema.decodeUnknownEffect(SetPoolCapacityInput),
-  setPoolSource: Schema.decodeUnknownEffect(SetPoolSourceBody),
   takeHold: Schema.decodeUnknownEffect(TakeHoldInput),
   releaseHold: Schema.decodeUnknownEffect(ReleaseHoldInput),
   renewHold: Schema.decodeUnknownEffect(RenewHoldInput),
-  reconcileHold: Schema.decodeUnknownEffect(ReconcileHoldInput),
 };
 
 const searchParams = Effect.gen(function* () {
@@ -190,33 +159,46 @@ const decodeBody = <A>(decodeInput: (input: unknown) => Effect.Effect<A, Schema.
     );
   });
 
-/** The calling agent or named component from its headers, else the control API. */
-const callerProvenance = Effect.gen(function* () {
-  const request = yield* HttpServerRequest.HttpServerRequest;
-  const threadHeader = request.headers["x-t3-thread-id"];
-  const component = request.headers["x-t3-component"]?.trim() ?? "";
-  if (threadHeader === undefined || threadHeader.trim().length === 0) {
-    if (component.length === 0) return POLICY_CONTROL_PROVENANCE;
-    if (!POLICY_COMPONENTS.has(component)) {
-      return yield* fail("forbidden", `x-t3-component ${component} is not a known component.`);
+/**
+ * The caller, from its session alone: a component credential is that
+ * component; any other token is the control API.
+ */
+const callerProvenance = (session: EnvironmentAuth.AuthenticatedSession) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const header = IDENTITY_HEADERS.find((name) => request.headers[name] !== undefined);
+    if (header !== undefined) {
+      return yield* fail(
+        "invalid_request",
+        `${header} is not accepted. The token says who is calling; thread writes go through the MCP tools.`,
+      );
     }
-    return { _tag: "system", component } satisfies MissionProvenance;
-  }
-  if (component.length > 0) {
-    return yield* fail("invalid_request", "Name a thread or a component, not both.");
-  }
-  const threadId = yield* decodeThreadId(threadHeader.trim()).pipe(
-    Effect.mapError(() => fail("invalid_request", "x-t3-thread-id is not a thread id.")),
-  );
-  const roleHeader = request.headers["x-t3-role-id"];
-  const roleId =
-    roleHeader === undefined || roleHeader.trim().length === 0
-      ? null
-      : yield* decodeRoleId(roleHeader.trim()).pipe(
-          Effect.mapError(() => fail("invalid_request", "x-t3-role-id is not a role id.")),
-        );
-  return { _tag: "agent", threadId, roleId } satisfies MissionProvenance;
-});
+    const component = componentProvenance(session);
+    if (component === null) return POLICY_CONTROL_PROVENANCE;
+    if (component._tag === "system" && !POLICY_COMPONENTS.has(component.component)) {
+      return yield* fail("forbidden", `${component.component} does not write policy records.`);
+    }
+    return component;
+  });
+
+/** Governance over HTTP: refused with the MCP tool to use instead. */
+const GOVERNANCE_TOOLS = {
+  "/roles": "mission_role_create",
+  "/roles/update": "mission_role_update",
+  "/roles/retire": "mission_role_retire",
+  "/roles/model": "mission_role_model",
+  "/roles/bind": "mission_role_bind",
+  "/roles/unbind": "mission_role_unbind",
+  "/roles/succeed": "mission_role_succeed",
+  "/review-policy": "mission_review_policy_edit",
+  "/review-policy/guide": "mission_criticality_guide",
+  "/criticality": "mission_criticality",
+  "/pools": "mission_pool_create",
+  "/pools/update": "mission_pool_update",
+  "/pools/capacity": "mission_pool_capacity",
+  "/pools/source": "the crw import",
+  "/pools/holds/reconcile": "mission_hold_reconcile",
+} as const;
 
 const makeRoutes = Effect.gen(function* () {
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
@@ -239,6 +221,7 @@ const makeRoutes = Effect.gen(function* () {
       if (!session.scopes.includes(scope)) {
         return yield* fail("forbidden", `This token lacks the ${scope} scope.`);
       }
+      return session;
     });
 
   const handle = <R>(
@@ -262,10 +245,20 @@ const makeRoutes = Effect.gen(function* () {
     run: (provenance: MissionProvenance, input: I) => Effect.Effect<A, MissionError>,
   ) =>
     Effect.gen(function* () {
-      yield* authenticate(AuthOrchestrationOperateScope);
-      const provenance = yield* callerProvenance;
+      const session = yield* authenticate(AuthOrchestrationOperateScope);
+      const provenance = yield* callerProvenance(session);
       const input = yield* decodeBody(decodeInput);
       return json({ ok: true, ...(yield* run(provenance, input)) });
+    });
+
+  const refuseGovernance = (tool: string) =>
+    Effect.gen(function* () {
+      yield* authenticate(AuthOrchestrationOperateScope);
+      return yield* new PolicyHttpError({
+        code: "forbidden",
+        message: `HTTP cannot prove a thread or the owner, so governance is not taken here. Use ${tool} from the mission's master thread, or the Robob app.`,
+        missionCode: "provenance-required",
+      });
     });
 
   const roles = Effect.gen(function* () {
@@ -278,7 +271,7 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, ...(yield* policy.reviewPolicy(yield* requireMissionQuery)) });
   });
 
-  // A read, so the read scope is enough. With `facts` it also records a fired hard trigger.
+  // A pure read, so the read scope is enough. Facts preview a trigger; they never record one.
   const reviewPlan = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const request = yield* decodeBody(decode.reviewPlan);
@@ -306,33 +299,25 @@ const makeRoutes = Effect.gen(function* () {
     run: (provenance: MissionProvenance, input: I) => Effect.Effect<A, MissionError>,
   ) => HttpRouter.route("POST", `${p}${path}`, handle(write(decodeInput, run)));
 
+  const refused = Object.entries(GOVERNANCE_TOOLS).map(([path, tool]) =>
+    HttpRouter.route("POST", `${p}${path}`, handle(refuseGovernance(tool))),
+  );
+
   return [
     HttpRouter.route("GET", `${p}/roles`, handle(roles)),
-    post("/roles", decode.createRole, policy.createRole),
-    post("/roles/update", decode.updateRole, policy.updateRole),
-    post("/roles/retire", decode.retireRole, policy.retireRole),
-    post("/roles/model", decode.setRoleModel, policy.setRoleModel),
-    post("/roles/bind", decode.bindRole, policy.bindRole),
-    post("/roles/unbind", decode.unbindRole, policy.unbindRole),
-    post("/roles/succeed", decode.succeedRole, policy.succeedRole),
     HttpRouter.route("GET", `${p}/review-policy`, handle(reviewPolicy)),
-    post("/review-policy", decode.editReviewPolicy, policy.editReviewPolicy),
-    post("/review-policy/guide", decode.setCriticalityGuide, policy.setCriticalityGuide),
-    post("/criticality", decode.recordCriticality, policy.recordCriticality),
     post("/reviews", decode.recordReview, policy.recordReview),
+    // ardud missions: core (M2) - verified PR facts, recorded in the reporter's name.
+    post("/criticality/facts", decode.recordTriggerFacts, policy.recordTriggerFacts),
     HttpRouter.route("POST", `${p}/review-plan`, handle(reviewPlan)),
     HttpRouter.route("GET", `${p}/pools`, handle(pools)),
-    post("/pools", decode.createPool, policy.createPool),
-    post("/pools/update", decode.updatePool, policy.updatePool),
-    post("/pools/capacity", decode.setPoolCapacity, policy.setPoolCapacity),
-    post("/pools/source", decode.setPoolSource, policy.setPoolSource),
     post("/pools/holds", decode.takeHold, policy.takeHold),
     post("/pools/holds/release", decode.releaseHold, policy.releaseHold),
     post("/pools/holds/renew", decode.renewHold, (provenance, input) =>
       policy.renewHold(provenance, input).pipe(Effect.map((hold) => ({ hold }))),
     ),
-    post("/pools/holds/reconcile", decode.reconcileHold, policy.reconcileHold),
     HttpRouter.route("GET", `${p}/governor`, handle(governor)),
+    ...refused,
   ] as const;
 });
 

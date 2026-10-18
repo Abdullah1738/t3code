@@ -17,7 +17,7 @@ import { appliersFor } from "./appliers.ts";
 import { HAIKU, OPUS_XHIGH, SOL_XHIGH, modelKey } from "./models.ts";
 import * as PolicyService from "./PolicyService.ts";
 import { newBinding, newRole } from "./roles.ts";
-import { CRPKO, OWNER, SYSTEM, agent, makePorts, testLayer } from "./testing.ts";
+import { CRPKO, OWNER, agent, makePorts, testLayer } from "./testing.ts";
 
 const ports = makePorts();
 const MASTER = agent("thread-master");
@@ -113,7 +113,7 @@ it.layer(testLayer(ports.layer))("policy suggestion appliers", (it) => {
       assert.strictEqual(review.policy.guide.text, "Settlement math is critical.");
       assert.deepStrictEqual(review.policy.commonRules, ["No round cap."]);
 
-      yield* policy.createPool(SYSTEM, {
+      yield* policy.createPool(OWNER, {
         poolId: PoolId.make("crpko-review-slots"),
         name: "Crpko review slots",
         unit: "review",

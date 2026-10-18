@@ -76,6 +76,19 @@ export const failIf = (error: MissionError | null): Effect.Effect<void, MissionE
 export const POLICY_PROVENANCE: MissionProvenance = { _tag: "system", component: "mission-policy" };
 export const GOVERNOR_PROVENANCE: MissionProvenance = { _tag: "system", component: "governor" };
 
+// ardud missions: core
+/**
+ * The policy's own components. Only these (and imports) act with a master's
+ * reach. A component that calls in from outside (crw over HTTP, an MCP client,
+ * the control API) is just a named caller: it takes holds and records what it
+ * read, but it does not govern.
+ */
+const INTERNAL_COMPONENTS: ReadonlySet<string> = new Set([
+  "mission-policy",
+  "governor",
+  "review-policy",
+]);
+
 /** Timeline for changes that belong to no mission (global pools). Same id the asks track uses. */
 export const GLOBAL_TIMELINE = MissionId.make("missions-global");
 
@@ -83,7 +96,7 @@ export const GLOBAL_TIMELINE = MissionId.make("missions-global");
 export interface Caller {
   readonly provenance: MissionProvenance;
   readonly byOwner: boolean;
-  /** Server components and imports: may do what a master may. */
+  /** The policy's own components and imports: may do what a master may. */
   readonly trusted: boolean;
   readonly threadId: ThreadId | null;
   /** The caller's role in the mission, proved by an active binding of its thread. */
@@ -96,7 +109,9 @@ export interface Caller {
 export const baseCaller = (provenance: MissionProvenance): Caller => ({
   provenance,
   byOwner: isOwnerProvenance(provenance),
-  trusted: provenance._tag === "system" || provenance._tag === "import",
+  trusted:
+    (provenance._tag === "system" && INTERNAL_COMPONENTS.has(provenance.component)) ||
+    provenance._tag === "import",
   threadId: provenance._tag === "agent" ? provenance.threadId : null,
   role: null,
   isMaster: false,
@@ -162,7 +177,7 @@ export const mayGovern = (caller: Caller): boolean =>
 
 /**
  * A caller for changes that span missions (pools of any scope). The owner,
- * server components and the master of any mission may make them; an agent
+ * the policy's own components and the master of any mission may make them; an agent
  * acts as its master role, preferring one in `preferred`.
  */
 export const governingCaller = (

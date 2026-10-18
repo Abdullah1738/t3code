@@ -11,6 +11,8 @@ import {
   type PullRequestKey,
   type RecordCriticalityInput,
   type RecordReviewInput,
+  type RecordTriggerFactsInput,
+  type RecordTriggerFactsResult,
   type ReviewPlan,
   type ReviewPlanRequest,
   type ReviewPolicy,
@@ -40,6 +42,7 @@ import { callerModelKey } from "./roleOps.ts";
 import {
   defaultReviewPolicy,
   editPolicy,
+  effectiveVerdict,
   latestVerdict,
   mayJudge,
   newVerdict,
@@ -355,9 +358,9 @@ export const recordReview = (
 
 /**
  * What a PR needs next at `headSha`: its verdict, each stage's state, the next
- * stage with its role and model, and whether it may merge. When facts are
- * given and a hard trigger fires, the policy records the critical verdict
- * itself.
+ * stage with its role and model, and whether it may merge. A pure read: facts
+ * that fire a hard trigger count in this plan only. `recordTriggerFacts`
+ * records them.
  */
 export const planReview = (
   deps: PolicyDeps,
@@ -368,24 +371,60 @@ export const planReview = (
     const now = yield* nowIso;
     const { policy } = yield* loadPolicy(deps, request.missionId);
     const roles = yield* missionRoles(deps, request.missionId, now);
-    const verdicts = yield* verdictsFor(deps, request.missionId, request.pullRequest);
     const result = reviewPlan({
       policy,
       pullRequest: request.pullRequest,
       headSha: request.headSha,
-      verdicts,
+      verdicts: yield* verdictsFor(deps, request.missionId, request.pullRequest),
       records: yield* recordsFor(deps, request.missionId, request.pullRequest),
       roles: roles.all,
       customLadderIds: request.customLadderIds,
       facts: request.facts,
       now,
     });
-    if (result.unrecordedTrigger !== null) {
-      yield* saveVerdict(
-        deps,
-        systemCaller(POLICY_PROVENANCE),
-        sequenced(result.unrecordedTrigger, verdicts.length),
+    // ardud missions: core (M2) - reading never stores a verdict.
+    return result.plan;
+  });
+
+// ardud missions: core (M2)
+/** Components that read PR facts from the forge and may report them. */
+export const TRIGGER_REPORTERS: ReadonlySet<string> = new Set(["crw"]);
+
+/**
+ * Records a fired hard trigger as the PR's verdict, in the reporter's name.
+ * Only callers that can vouch for the facts report them: the owner, the
+ * mission's master, or the component that read them (crw). Nothing fires, or
+ * a trigger is already on record: nothing is written.
+ */
+export const recordTriggerFacts = (
+  deps: PolicyDeps,
+  provenance: MissionProvenance,
+  input: RecordTriggerFactsInput,
+): Effect.Effect<RecordTriggerFactsResult, MissionError> =>
+  Effect.gen(function* () {
+    yield* requireMission(deps, input.missionId);
+    const caller = yield* resolveCaller(deps, provenance, input.missionId);
+    const reporter = provenance._tag === "system" && TRIGGER_REPORTERS.has(provenance.component);
+    if (!(caller.byOwner || caller.isMaster || reporter)) {
+      return yield* failWith(
+        "forbidden",
+        "Only the owner, the master or crw reports the facts a hard trigger reads.",
       );
     }
-    return result.plan;
+    const now = yield* nowIso;
+    const { policy } = yield* loadPolicy(deps, input.missionId);
+    const verdicts = yield* verdictsFor(deps, input.missionId, input.pullRequest);
+    const { unrecordedTrigger } = effectiveVerdict({
+      policy,
+      pullRequest: input.pullRequest,
+      verdicts,
+      facts: input.facts,
+      now,
+    });
+    if (unrecordedTrigger === null) {
+      return { recorded: false, verdict: latestVerdict(verdicts) };
+    }
+    const verdict = sequenced({ ...unrecordedTrigger, decidedBy: caller.actor }, verdicts.length);
+    yield* saveVerdict(deps, caller, verdict);
+    return { recorded: true, verdict };
   });
