@@ -9,6 +9,7 @@ import type {
   ClientSurface,
   McpAppUpdateModelContextInput,
   OrchestrationV2Command,
+  ScheduledTask,
   ScheduledTaskListResult,
   ThreadId,
 } from "@t3tools/contracts";
@@ -29,7 +30,7 @@ import {
   type WsSession,
 } from "./principal.ts";
 import { requestAnswerText } from "./requests.ts";
-import { withoutHiddenWebhooks } from "./schedules.ts";
+import { withoutHiddenWebhook, withoutHiddenWebhooks } from "./schedules.ts";
 import { authorizeWatch } from "./watches.ts";
 
 interface GuardedWrite {
@@ -98,6 +99,15 @@ const modelContextText = (input: McpAppUpdateModelContextInput): string => {
   }
   return ["Update this conversation's app context:", ...texts].join("\n");
 };
+
+const carriesTask = <A>(result: A): result is A & { readonly task: ScheduledTask } =>
+  typeof result === "object" &&
+  result !== null &&
+  "task" in result &&
+  typeof result.task === "object" &&
+  result.task !== null &&
+  "id" in result.task &&
+  "threadId" in result.task;
 
 export const makeWsGuard = (input: {
   readonly surface: ClientSurface | undefined;
@@ -180,9 +190,20 @@ export const makeWsGuard = (input: {
         `${update.threadId}:${update.itemId}:${text}`,
       );
     },
-    /** Runs a scheduled task call as this connection. */
-    schedules: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      Effect.provideService(effect, CurrentPrincipal, principal),
+    /**
+     * Runs a scheduled task call as this connection. A reply that carries a
+     * task hides its webhook like a list does, whatever the call was.
+     */
+    schedules: <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+      Effect.provideService(effect, CurrentPrincipal, principal).pipe(
+        Effect.flatMap((result) =>
+          carriesTask(result)
+            ? withoutHiddenWebhook(store, principal, result.task).pipe(
+                Effect.map((task) => ({ ...result, task })),
+              )
+            : Effect.succeed(result),
+        ),
+      ),
     /** Hides webhook URLs of member-bound tasks this connection did not authorize. */
     visibleWebhooks: (result: ScheduledTaskListResult) =>
       withoutHiddenWebhooks(store, principal, result.tasks).pipe(

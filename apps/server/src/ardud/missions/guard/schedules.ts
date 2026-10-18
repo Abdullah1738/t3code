@@ -15,6 +15,8 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import type * as SqlClient from "effect/sql/SqlClient";
+import { isSqlError } from "effect/sql/SqlError";
 
 import {
   guardScheduledRun,
@@ -57,38 +59,89 @@ export const authorizeScheduleChange = (input: {
   });
 
 /**
- * Records who authorized a save. An in-process retarget (master succession)
- * carries a thread's own schedule over to the thread it moved to; any other
- * in-process save leaves the record alone.
+ * What a save does to the task's recorded authority: the principal to bind,
+ * `null` to clear it, or `undefined` to leave it. `withScheduleAuthority`
+ * reads and binds it in the same transaction as the save, so a failed write
+ * never leaves an older authority behind a newer task.
+ *
+ * A caller that passed the guard becomes the authority. An in-process create
+ * has none, so a row left by an earlier task with the same id is cleared. An
+ * in-process retarget (master succession) carries a thread's own schedule over
+ * to the thread it moved to. Any other in-process save leaves the record
+ * alone, so the runs keep speaking as whoever last authorized the task through
+ * a transport; an in-process caller acting for someone runs as them by
+ * providing `CurrentPrincipal`.
  */
-export const recordScheduleAuthority = (
+export const scheduleAuthorityChange = (
   store: AuthorityStore,
   input: {
     readonly taskId: ScheduledTaskId;
     readonly principal: GuardPrincipal | undefined;
+    readonly created: boolean;
     readonly previousThreadId: string | null;
     readonly threadId: string | null;
   },
-): Effect.Effect<void> =>
+): Effect.Effect<GuardPrincipal | null | undefined> =>
   Effect.gen(function* () {
-    if (input.principal !== undefined) {
-      return yield* store.record("scheduled-task", input.taskId, input.principal);
-    }
+    if (input.principal !== undefined) return input.principal;
+    if (input.created) return null;
     if (
       input.previousThreadId === null ||
       input.threadId === null ||
       input.previousThreadId === input.threadId
     ) {
-      return;
+      return undefined;
     }
     const authority = yield* store.read("scheduled-task", input.taskId);
-    if (authority?._tag === "thread" && authority.threadId === input.previousThreadId) {
-      yield* store.record("scheduled-task", input.taskId, {
-        ...authority,
-        threadId: ThreadId.make(input.threadId),
-      });
-    }
+    return authority?._tag === "thread" && authority.threadId === input.previousThreadId
+      ? { ...authority, threadId: ThreadId.make(input.threadId) }
+      : undefined;
   });
+
+/**
+ * Runs a schedule write and its authority change (see
+ * `scheduleAuthorityChange`) in one transaction, so the write and the
+ * authority it runs under land together or not at all. A failed bind rolls the
+ * write back and fails the call.
+ */
+export const withScheduleAuthority = <A, E, R>(input: {
+  readonly sql: SqlClient.SqlClient;
+  readonly store: AuthorityStore;
+  readonly taskId: ScheduledTaskId;
+  readonly authority: Effect.Effect<GuardPrincipal | null | undefined>;
+  readonly write: Effect.Effect<A, E, R>;
+}): Effect.Effect<A, E | ScheduledTaskError, R> =>
+  input.sql
+    .withTransaction(
+      Effect.gen(function* () {
+        const authority = yield* input.authority;
+        const result = yield* input.write;
+        if (authority !== undefined) {
+          yield* input.store.bind("scheduled-task", input.taskId, authority).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ScheduledTaskError({
+                  message: "Could not record who authorized the schedule task.",
+                  taskId: input.taskId,
+                  cause,
+                }),
+            ),
+          );
+        }
+        return result;
+      }),
+    )
+    .pipe(
+      Effect.mapError((error) =>
+        isSqlError(error)
+          ? new ScheduledTaskError({
+              message: "Could not save the schedule task.",
+              taskId: input.taskId,
+              cause: error,
+            })
+          : error,
+      ),
+    );
 
 /**
  * Who a run speaks as: the invoker of a manual run, else the recorded
@@ -136,23 +189,32 @@ export const webhookVisible = (
     return authority !== null && samePrincipal(authority, principal);
   });
 
-/** Drops webhook URLs the caller may not see. */
+/**
+ * Drops the webhook endpoint if the caller may not see it. The whole endpoint
+ * goes, since its `path` carries the token even when there is no public URL.
+ */
+export const withoutHiddenWebhook = <T extends Pick<ScheduledTask, "id" | "threadId" | "webhook">>(
+  store: AuthorityStore,
+  principal: GuardPrincipal | undefined,
+  task: T,
+): Effect.Effect<T> =>
+  task.webhook === undefined
+    ? Effect.succeed(task)
+    : webhookVisible(store, principal, task).pipe(
+        Effect.map((visible) => {
+          if (visible) return task;
+          const { webhook: _hidden, ...rest } = task;
+          return rest as T;
+        }),
+      );
+
+/** Drops webhook endpoints the caller may not see. */
 export const withoutHiddenWebhooks = <T extends Pick<ScheduledTask, "id" | "threadId" | "webhook">>(
   store: AuthorityStore,
   principal: GuardPrincipal | undefined,
   tasks: ReadonlyArray<T>,
 ): Effect.Effect<Array<T>> =>
-  Effect.forEach(tasks, (task) =>
-    task.webhook === undefined
-      ? Effect.succeed(task)
-      : webhookVisible(store, principal, task).pipe(
-          Effect.map((visible) => {
-            if (visible) return task;
-            const { webhook: _hidden, ...rest } = task;
-            return rest as T;
-          }),
-        ),
-  );
+  Effect.forEach(tasks, (task) => withoutHiddenWebhook(store, principal, task));
 
 /** Whether a schedule call failed because the guard refused it. */
 export const refusedByGuard = (error: ScheduledTaskError): boolean =>

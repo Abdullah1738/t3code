@@ -13,6 +13,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as SqlError from "effect/sql/SqlError";
 import { threadPullRequestKeyOf } from "@t3tools/shared/threadPullRequests";
 
 import type { GuardPrincipal } from "./principal.ts";
@@ -47,22 +48,31 @@ export interface AuthorityStore {
   ) => Effect.Effect<void>;
   readonly read: (kind: AuthorityKind, subjectId: string) => Effect.Effect<GuardPrincipal | null>;
   readonly forget: (kind: AuthorityKind, subjectId: string) => Effect.Effect<void>;
+  /**
+   * Sets the authority as part of the caller's write: a principal replaces the
+   * row, null removes it. A failure fails the caller, so run it in the same
+   * transaction as the record it belongs to and both roll back together.
+   */
+  readonly bind: (
+    kind: AuthorityKind,
+    subjectId: string,
+    principal: GuardPrincipal | null,
+  ) => Effect.Effect<void, SqlError.SqlError>;
 }
 
 const ready = new WeakSet<SqlClient.SqlClient>();
 
+/** Creates the authority table, for a caller writing to it in bulk. */
+export const ensureAuthorityTable = (sql: SqlClient.SqlClient) => sql.unsafe(DDL);
+
 export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
-  const ensure = Effect.suspend(() =>
-    ready.has(sql)
-      ? Effect.void
-      : sql.unsafe(DDL).pipe(
-          Effect.andThen(
-            Effect.sync(() => {
-              ready.add(sql);
-            }),
-          ),
-        ),
-  );
+  // A table made inside a transaction that rolls back is gone again, so it
+  // is remembered as ready only when made outside one.
+  const ensure = Effect.gen(function* () {
+    if (ready.has(sql)) return;
+    yield* sql.unsafe(DDL);
+    if (Option.isNone(yield* Effect.serviceOption(sql.transactionService))) ready.add(sql);
+  });
   return {
     record: (kind, subjectId, principal) =>
       Effect.gen(function* () {
@@ -117,6 +127,24 @@ export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
           }),
         ),
       ),
+    bind: (kind, subjectId, principal) =>
+      Effect.gen(function* () {
+        yield* ensure;
+        if (principal === null) {
+          yield* sql`
+            DELETE FROM ardud_mission_guard_authority WHERE kind = ${kind} AND subject_id = ${subjectId}
+          `;
+          return;
+        }
+        const recordedAt = DateTime.formatIso(yield* DateTime.now);
+        yield* sql`
+          INSERT INTO ardud_mission_guard_authority (kind, subject_id, principal_json, recorded_at)
+          VALUES (${kind}, ${subjectId}, ${encodePrincipal(principal)}, ${recordedAt})
+          ON CONFLICT (kind, subject_id) DO UPDATE SET
+            principal_json = excluded.principal_json,
+            recorded_at = excluded.recorded_at
+        `;
+      }),
   };
 };
 
@@ -125,6 +153,7 @@ const noAuthority: AuthorityStore = {
   record: () => Effect.void,
   read: () => Effect.succeed(null),
   forget: () => Effect.void,
+  bind: () => Effect.void,
 };
 
 /**
