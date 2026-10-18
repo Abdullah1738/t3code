@@ -77,6 +77,7 @@ export const membershipGuard = Effect.gen(function* () {
  * When every pending request in `projectionFor` opened: ten minutes before
  * the tests load, since the control routes judge answers on the real clock.
  */
+// @effect-diagnostics-next-line globalDate:off - the control routes judge answers on the real clock.
 export const askedAt = DateTime.makeUnsafe(Date.now() - 10 * 60_000);
 
 /**
