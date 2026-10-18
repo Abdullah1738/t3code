@@ -920,6 +920,30 @@ export const Draft = Schema.Struct({
   decidedAt: Schema.NullOr(IsoDateTime),
   sentAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
+  // --- asks additions ---
+  /** Who decides it; picked by the mission's routing table. Missing means the owner. */
+  approver: Schema.optional(Schema.suspend((): Schema.Codec<Approver> => Approver)),
+  /** Why it went to that approver: the matched route, or the re-route reason. */
+  routeNote: Schema.optional(Schema.NullOr(Schema.String)),
+  /** One or two lines for the approver; set by the writer, a system (crw) or the master. */
+  summary: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Free short labels shown as chips (e.g. "core change"); no fixed list. */
+  flags: Schema.optional(Schema.Array(Schema.String)),
+  /** The role that wrote it and the model its thread was observed on. */
+  writtenBy: Schema.optional(
+    Schema.Struct({ roleId: Schema.NullOr(RoleId), model: Schema.NullOr(Schema.String) }),
+  ),
+  /** System that opened it (e.g. `crw`); missing for drafts from mission threads. */
+  requestedBy: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Exact code head the text is about (crw drafts); decisions count only for this head. */
+  head: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Set when the system closed it because its head moved; it is then dropped and never counts. */
+  staleReason: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Decision epoch: advances on every revision and reopen. Missing means 0. */
+  revision: Schema.optional(NonNegativeInt),
+  /** When the current epoch began; a decision's evidence must not predate it. Missing means createdAt. */
+  revisedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  // --- end asks additions ---
 });
 export type Draft = typeof Draft.Type;
 
@@ -940,6 +964,10 @@ export const DraftNote = Schema.Struct({
   active: Schema.Boolean,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- asks additions ---
+  /** Who wrote or last changed it (the owner or a master). Missing on older notes. */
+  writtenBy: Schema.optional(MissionActor),
+  // --- end asks additions ---
 });
 export type DraftNote = typeof DraftNote.Type;
 
@@ -978,6 +1006,12 @@ export const Approval = Schema.Struct({
   approver: Schema.optional(Approver),
   /** Why the master last re-routed it. */
   routeNote: Schema.optional(Schema.NullOr(Schema.String)),
+  // --- asks additions ---
+  /** One or two lines for the approver; from the requester (crw) or the master's annotation. */
+  summary: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Free short labels shown as chips (e.g. "authorization risk"); no fixed list. */
+  flags: Schema.optional(Schema.Array(Schema.String)),
+  // --- end asks additions ---
 });
 export type Approval = typeof Approval.Type;
 
@@ -1384,6 +1418,10 @@ export const MissionFork = Schema.Struct({
   commitsMission: Schema.Boolean,
   createdAt: IsoDateTime,
   closedAt: Schema.NullOr(IsoDateTime),
+  // --- asks additions ---
+  /** The question the fork was opened with, when one was given. */
+  question: Schema.optional(Schema.NullOr(Schema.String)),
+  // --- end asks additions ---
 });
 export type MissionFork = typeof MissionFork.Type;
 
@@ -1477,6 +1515,11 @@ export const MissionEventKind = Schema.Literals([
   "call.reacted",
   "draft-note.updated",
   "note.acked",
+  "draft.routed",
+  "suggestion.applied",
+  "draft.annotated",
+  "draft.stale-closed",
+  "approval.annotated",
   // --- end asks additions ---
   "field.locked",
   "field.unlocked",
@@ -1716,6 +1759,10 @@ export const DecideDraftInput = Schema.Struct({
   editedText: Schema.optional(Schema.String),
   rewriteNote: Schema.optional(Schema.String),
   inboundId: Schema.optional(TrimmedNonEmptyString),
+  // --- asks additions ---
+  /** The draft revision the decider saw; a decision for an older revision is refused. */
+  revision: Schema.optional(NonNegativeInt),
+  // --- end asks additions ---
 });
 export type DecideDraftInput = typeof DecideDraftInput.Type;
 
@@ -2166,6 +2213,10 @@ export const OpenApprovalInput = Schema.Struct({
   detail: Schema.String,
   requestedBy: TrimmedNonEmptyString,
   links: Schema.Array(MissionLink),
+  // --- asks additions ---
+  summary: Schema.optional(Schema.NullOr(Schema.String)),
+  flags: Schema.optional(Schema.Array(Schema.String)),
+  // --- end asks additions ---
 });
 export type OpenApprovalInput = typeof OpenApprovalInput.Type;
 
@@ -2251,7 +2302,7 @@ export const ReactToCallInput = Schema.Struct({
 });
 export type ReactToCallInput = typeof ReactToCallInput.Type;
 
-/** Owner-only: write, edit or retire a draft note. */
+/** The owner or a master: write, edit or retire a draft note. */
 export const SaveDraftNoteInput = Schema.Struct({
   noteId: Schema.optional(DraftNoteId),
   missionId: Schema.NullOr(MissionId),
@@ -2261,13 +2312,13 @@ export const SaveDraftNoteInput = Schema.Struct({
 });
 export type SaveDraftNoteInput = typeof SaveDraftNoteInput.Type;
 
-/** Owner-only: an approved or dropped draft goes back to pending. */
+/** The draft's approver (the owner always): an approved or dropped draft goes back to pending. */
 export const ReopenDraftInput = Schema.Struct({
   draftId: DraftId,
 });
 export type ReopenDraftInput = typeof ReopenDraftInput.Type;
 
-/** Owner-only: a dismissed suggestion goes back to open. */
+/** The owner or the mission's master: a dismissed suggestion goes back to open. */
 export const ReopenSuggestionInput = Schema.Struct({
   suggestionId: SuggestionId,
 });
@@ -2293,12 +2344,148 @@ export const CloseForkInput = Schema.Struct({
 });
 export type CloseForkInput = typeof CloseForkInput.Type;
 
-/** Owner-only fork follow-ups: mark an answered fork as committing, archive it, or reopen it. */
+/** Fork follow-ups for the owner or the master: mark an answered fork as committing, archive it, or reopen it. */
 export const UpdateForkInput = Schema.Struct({
   forkId: ForkId,
   action: Schema.Literals(["commits-mission", "archive", "reopen"]),
 });
 export type UpdateForkInput = typeof UpdateForkInput.Type;
+
+/** Owner or master: send one pending draft to the other approver; the reason is logged. */
+export const RouteDraftInput = Schema.Struct({
+  draftId: DraftId,
+  approver: Approver,
+  reason: TrimmedNonEmptyString,
+});
+export type RouteDraftInput = typeof RouteDraftInput.Type;
+
+/** Turn a draft note off or back on without rewriting it. */
+export const SetDraftNoteActiveInput = Schema.Struct({
+  draftNoteId: DraftNoteId,
+  active: Schema.Boolean,
+});
+export type SetDraftNoteActiveInput = typeof SetDraftNoteActiveInput.Type;
+
+/**
+ * Feed scope: a mission's records plus the global ones, or only the global
+ * ones when `missionId` is null.
+ */
+export const MissionFeedInput = Schema.Struct({
+  missionId: Schema.NullOr(MissionId),
+});
+export type MissionFeedInput = typeof MissionFeedInput.Type;
+
+/**
+ * A record feed: one `snapshot` of the current records, then `upsert` and
+ * `remove` deltas as they commit. Deltas can repeat what the snapshot already
+ * holds; applying them by record id converges.
+ */
+export const MissionFeedItem = Schema.Union([
+  Schema.TaggedStruct("snapshot", {
+    revision: NonNegativeInt,
+    records: Schema.Array(MissionRecord),
+  }),
+  Schema.TaggedStruct("upsert", {
+    missionId: Schema.NullOr(MissionId),
+    seq: NonNegativeInt,
+    record: MissionRecord,
+  }),
+  Schema.TaggedStruct("remove", {
+    missionId: Schema.NullOr(MissionId),
+    seq: NonNegativeInt,
+    ref: MissionRecordRef,
+  }),
+]);
+export type MissionFeedItem = typeof MissionFeedItem.Type;
+
+/** A mission's approval routing table as it stands; resent whenever it changes. */
+export const MissionRoutingTable = Schema.Struct({
+  missionId: MissionId,
+  routes: Schema.Array(ApprovalRoute),
+  updatedAt: IsoDateTime,
+});
+export type MissionRoutingTable = typeof MissionRoutingTable.Type;
+
+/** Decided inbox items for one mission (or every mission when null) over the last N days. */
+export const MissionInboxHistoryInput = Schema.Struct({
+  missionId: Schema.NullOr(MissionId),
+  /** Default 7, at most 90. */
+  days: Schema.optional(PositiveInt),
+  /** Per kind. Default 50, at most 200. */
+  limit: Schema.optional(PositiveInt),
+});
+export type MissionInboxHistoryInput = typeof MissionInboxHistoryInput.Type;
+
+/** Each list is newest decision first and capped at the requested limit. */
+export const MissionInboxHistory = Schema.Struct({
+  since: IsoDateTime,
+  asks: Schema.Array(Ask),
+  drafts: Schema.Array(Draft),
+  approvals: Schema.Array(Approval),
+  knocks: Schema.Array(Knock),
+  suggestions: Schema.Array(Suggestion),
+});
+export type MissionInboxHistory = typeof MissionInboxHistory.Type;
+
+/**
+ * Owner or master: set the short summary and flag chips on a pending draft or approval. A field
+ * left out stays as it is; `null` summary or `[]` flags clears it.
+ */
+export const AnnotateDraftInput = Schema.Struct({
+  draftId: DraftId,
+  summary: Schema.optional(Schema.NullOr(Schema.String)),
+  flags: Schema.optional(Schema.Array(Schema.String)),
+});
+export type AnnotateDraftInput = typeof AnnotateDraftInput.Type;
+
+export const AnnotateApprovalInput = Schema.Struct({
+  approvalId: ApprovalId,
+  summary: Schema.optional(Schema.NullOr(Schema.String)),
+  flags: Schema.optional(Schema.Array(Schema.String)),
+});
+export type AnnotateApprovalInput = typeof AnnotateApprovalInput.Type;
+
+/**
+ * A system (crw) opens a draft for one exact code head. Reopening the same id with the same head
+ * is a no-op; a new head on the same target stale-closes the older pending drafts.
+ */
+export const OpenSystemDraftInput = Schema.Struct({
+  missionId: MissionId,
+  draftId: DraftId,
+  requestedBy: TrimmedNonEmptyString,
+  audience: TrimmedNonEmptyString,
+  channel: DraftChannel,
+  target: MissionLink,
+  head: TrimmedNonEmptyString,
+  text: TrimmedNonEmptyString,
+  summary: Schema.optional(Schema.NullOr(Schema.String)),
+  flags: Schema.optional(Schema.Array(Schema.String)),
+});
+export type OpenSystemDraftInput = typeof OpenSystemDraftInput.Type;
+
+/** A system closes its own pending draft because the head moved. Never counts as a decision. */
+export const CloseStaleDraftInput = Schema.Struct({
+  draftId: DraftId,
+  requestedBy: TrimmedNonEmptyString,
+  reason: TrimmedNonEmptyString,
+});
+export type CloseStaleDraftInput = typeof CloseStaleDraftInput.Type;
+
+/**
+ * What a system may act on for one draft and head. `state` is `pending` until a decision exists
+ * for exactly that head; a stale draft, another head or a reopened draft never reads as decided.
+ */
+export const SystemDraftDecision = Schema.Struct({
+  draftId: DraftId,
+  head: Schema.String,
+  state: Schema.Literals(["pending", "approved", "rewrite-requested", "dropped", "stale"]),
+  /** The text to post: the owner's edit when he edited it, else the draft text. Approved only. */
+  text: Schema.NullOr(Schema.String),
+  edited: Schema.Boolean,
+  rewriteNote: Schema.NullOr(Schema.String),
+  decidedAt: Schema.NullOr(IsoDateTime),
+});
+export type SystemDraftDecision = typeof SystemDraftDecision.Type;
 
 // --- end asks additions ---
 
