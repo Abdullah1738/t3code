@@ -62,18 +62,17 @@ export interface AuthorityStore {
 
 const ready = new WeakSet<SqlClient.SqlClient>();
 
+/** Creates the authority table, for a caller writing to it in bulk. */
+export const ensureAuthorityTable = (sql: SqlClient.SqlClient) => sql.unsafe(DDL);
+
 export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
-  const ensure = Effect.suspend(() =>
-    ready.has(sql)
-      ? Effect.void
-      : sql.unsafe(DDL).pipe(
-          Effect.andThen(
-            Effect.sync(() => {
-              ready.add(sql);
-            }),
-          ),
-        ),
-  );
+  // A table made inside a transaction that rolls back is gone again, so it
+  // is remembered as ready only when made outside one.
+  const ensure = Effect.gen(function* () {
+    if (ready.has(sql)) return;
+    yield* sql.unsafe(DDL);
+    if (Option.isNone(yield* Effect.serviceOption(sql.transactionService))) ready.add(sql);
+  });
   return {
     record: (kind, subjectId, principal) =>
       Effect.gen(function* () {
@@ -130,9 +129,7 @@ export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
       ),
     bind: (kind, subjectId, principal) =>
       Effect.gen(function* () {
-        // Not the cached `ensure`: a table made inside a transaction that
-        // rolls back must not be remembered as ready.
-        yield* sql.unsafe(DDL);
+        yield* ensure;
         if (principal === null) {
           yield* sql`
             DELETE FROM ardud_mission_guard_authority WHERE kind = ${kind} AND subject_id = ${subjectId}

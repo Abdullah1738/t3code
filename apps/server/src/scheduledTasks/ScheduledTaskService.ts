@@ -1200,7 +1200,7 @@ export const layer = Layer.effect(
           sql,
           store: guardAuthority,
           taskId: id,
-          authority: yield* scheduleAuthorityChange(guardAuthority, {
+          authority: scheduleAuthorityChange(guardAuthority, {
             taskId: id,
             principal,
             created: existingTask === null,
@@ -1253,7 +1253,7 @@ export const layer = Layer.effect(
           sql,
           store: guardAuthority,
           taskId: input.id,
-          authority: input.enabled ? principal : undefined,
+          authority: Effect.succeed(input.enabled ? principal : undefined),
           write: update,
         });
         yield* notifyChanged;
@@ -1281,7 +1281,7 @@ export const layer = Layer.effect(
             sql,
             store: guardAuthority,
             taskId: input.id,
-            authority: null,
+            authority: Effect.succeed(null),
             write: deleteRow(input.id),
           }),
         ),
