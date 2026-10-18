@@ -245,6 +245,194 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("lets the master route, annotate and decide drafts and keep draft notes", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const master = threadCaller(masterThread);
+      const writer = threadCaller(writerThread);
+      const submitted = yield* call("mission_draft", writer, {
+        missionId,
+        audience: "Sam",
+        channel: "cliq",
+        target: { kind: "url", label: "Cliq DM", url: null, ref: "sam" },
+        text: "Deploy is done.",
+      });
+      const draftId = (submitted.structured.draft as { id: string }).id;
+
+      // Owner-routed by default, so the master can't decide it until it routes it to itself.
+      const early = yield* call("mission_draft_approve", master, { draftId, action: "approve" });
+      expect(early.isError).toBe(true);
+      const laneRoute = yield* call("mission_draft_route", threadCaller(laneThread), {
+        draftId,
+        approver: "master",
+        reason: "routine",
+      });
+      expect(laneRoute.isError).toBe(true);
+      const routed = yield* call("mission_draft_route", master, {
+        draftId,
+        approver: "master",
+        reason: "routine status line",
+      });
+      expect(routed.structured.draft).toMatchObject({
+        approver: "master",
+        routeNote: "routine status line",
+      });
+      const annotated = yield* call("mission_draft_annotate", master, {
+        draftId,
+        summary: "Deploy note to Sam",
+        flags: ["routine"],
+      });
+      expect(annotated.structured.draft).toMatchObject({
+        summary: "Deploy note to Sam",
+        flags: ["routine"],
+      });
+      // Approving names the revision the master read.
+      const blind = yield* call("mission_draft_approve", master, { draftId, action: "approve" });
+      expect(blind.isError).toBe(true);
+      expect(blind.text).toContain("needs the revision you read");
+      const approved = yield* call("mission_draft_approve", master, {
+        draftId,
+        action: "approve",
+        revision: 0,
+      });
+      expect(approved.isError).toBe(false);
+      expect((approved.structured.draft as { status: string }).status).toBe("approved");
+
+      const saved = yield* call("mission_draft_note", master, {
+        missionId,
+        scope: { _tag: "person", name: "Sam" },
+        text: "Sam likes one line.",
+      });
+      expect(saved.isError).toBe(false);
+      const note = saved.structured.note as { id: string; active: boolean; writtenBy: unknown };
+      expect(note.writtenBy).toMatchObject({ _tag: "role", roleId: "role-master" });
+      const off = yield* call("mission_draft_note", master, {
+        noteId: note.id,
+        missionId,
+        scope: { _tag: "person", name: "Sam" },
+        text: "Sam likes one line.",
+        active: false,
+      });
+      expect((off.structured.note as { active: boolean }).active).toBe(false);
+      const laneNote = yield* call("mission_draft_note", threadCaller(laneThread), {
+        missionId,
+        scope: { _tag: "all" },
+        text: "Shout.",
+      });
+      expect(laneNote.isError).toBe(true);
+
+      const missions = yield* MissionService.MissionService;
+      const approvalId = ApprovalId.make("m-1:approval:crw:acme/api#9@cccccccccccc");
+      yield* missions.openApproval(
+        { _tag: "system", component: "crw" },
+        {
+          missionId,
+          approvalId,
+          kind: "merge",
+          title: "Good to merge: acme/api#9",
+          detail: "Decide in the review thread.",
+          requestedBy: "crw",
+          links: [],
+        },
+      );
+      const chips = yield* call("mission_approval_annotate", master, {
+        missionId,
+        approvalId,
+        summary: "Small retry fix",
+        flags: ["padding"],
+      });
+      expect(chips.isError).toBe(false);
+      const [approval] = yield* missions.approvals({ missionId, ids: [approvalId] });
+      expect(approval).toMatchObject({ summary: "Small retry fix", flags: ["padding"] });
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("M3: the master reopens drafts, suggestions and forks under its own name", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const master = threadCaller(masterThread);
+      const lane = threadCaller(laneThread);
+      const asks = yield* AsksService.AsksService;
+      const submitted = yield* call("mission_draft", threadCaller(writerThread), {
+        missionId,
+        audience: "Sam",
+        channel: "cliq",
+        target: { kind: "url", label: "Cliq DM", url: null, ref: "sam" },
+        text: "Deploy is done.",
+      });
+      const draftId = (submitted.structured.draft as { id: string }).id;
+      yield* call("mission_draft_route", master, {
+        draftId,
+        approver: "master",
+        reason: "routine status line",
+      });
+      const stale = yield* call("mission_draft_approve", master, {
+        draftId,
+        action: "approve",
+        revision: 3,
+      });
+      expect(stale.isError).toBe(true);
+      expect(stale.text).toContain("changed since revision 3");
+      yield* call("mission_draft_approve", master, { draftId, action: "drop", revision: 0 });
+      expect((yield* call("mission_draft_reopen", lane, { draftId })).isError).toBe(true);
+      const reopened = yield* call("mission_draft_reopen", master, { draftId });
+      expect(reopened.structured.draft).toMatchObject({ status: "pending", revision: 1 });
+
+      const suggestion = yield* asks.proposeSuggestion(
+        {
+          missionId,
+          targetKind: "lane",
+          target: { kind: "lane", id: "lane-api" },
+          title: "Rename the API lane",
+          after: { name: "API v2" },
+          diffText: "name: API -> API v2",
+          why: "Matches the repo.",
+          evidence: [{ kind: "lane", id: "lane-api" }],
+        },
+        { _tag: "system", component: "governor" },
+      );
+      yield* call("mission_suggestion_decide", master, {
+        suggestionId: suggestion.id,
+        action: "dismiss",
+        dismissReason: "not now",
+      });
+      expect(
+        (yield* call("mission_suggestion_reopen", lane, { suggestionId: suggestion.id })).isError,
+      ).toBe(true);
+      const back = yield* call("mission_suggestion_reopen", master, {
+        suggestionId: suggestion.id,
+      });
+      expect(back.structured.suggestion).toMatchObject({ status: "open" });
+      const store = yield* MissionStore.MissionStore;
+      const events = yield* store.recentEvents(missionId, 20);
+      expect(
+        events.find((event) => event.summary.startsWith("Reopened suggestion"))?.actor,
+      ).toEqual({ _tag: "role", roleId: "role-master" });
+
+      const fork = yield* call("mission_fork", master, {
+        missionId,
+        question: "Why the retry?",
+      });
+      const forkId = (fork.structured.fork as { id: string }).id;
+      yield* call("mission_fork_close", master, {
+        forkId,
+        summaryLine: "Retry stays.",
+        commitsMission: true,
+      });
+      const reopenedFork = yield* call("mission_fork_update", master, { forkId, action: "reopen" });
+      expect(reopenedFork.structured.fork).toMatchObject({ status: "open" });
+      expect((yield* call("mission_fork_update", lane, { forkId, action: "reopen" })).isError).toBe(
+        true,
+      );
+      const closing = (yield* store.recentEvents(missionId, 20)).find(
+        (event) => event.kind === "fork.closed",
+      );
+      expect(closing?.actor).toEqual({ _tag: "role", roleId: "role-master" });
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("forks the master for a dev question and returns one line to it", () => {
     const { deliveries, layer } = toolsLayer();
     return Effect.gen(function* () {

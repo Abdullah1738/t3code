@@ -3,16 +3,22 @@
  * robob-watch checks. Same auth and `{ ok, ... }` envelope as
  * `/api/ardud/control`. Callers here are never the owner: answers and draft
  * approvals only pass with an iMessage inbound id the server verifies.
+ *
+ * Systems in SYSTEM_DRAFT_COMPONENTS (crw) also open drafts here for one exact
+ * code head, stale-close their own, and read the decision for that head.
  */
 import {
   AskId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  CloseStaleDraftInput,
   DraftId,
   MissionError,
   type MissionEvent,
   MissionId,
   type MissionProvenance,
+  NonNegativeInt,
+  OpenSystemDraftInput,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import * as Data from "effect/Data";
@@ -40,6 +46,14 @@ const MISSION_CLI = "mission";
 
 /** Everything arriving here is a token holder, not the owner typing in Robob. */
 export const CONTROL_PROVENANCE: MissionProvenance = { _tag: "system", component: "control-api" };
+
+/** Systems that open their own drafts over HTTP, in their own name. */
+const SYSTEM_DRAFT_COMPONENTS: ReadonlySet<string> = new Set(["crw"]);
+
+const systemProvenance = (component: string): MissionProvenance => ({
+  _tag: "system",
+  component,
+});
 
 type DeskErrorCode =
   | "unauthorized"
@@ -109,8 +123,11 @@ const DecideBody = Schema.Struct({
   editedText: Schema.optional(Schema.String),
   rewriteNote: Schema.optional(Schema.String),
   inboundId: TrimmedNonEmptyString,
+  revision: Schema.optional(NonNegativeInt),
 });
 const decodeDecideBody = Schema.decodeUnknownEffect(DecideBody);
+const decodeOpenSystemDraft = Schema.decodeUnknownEffect(OpenSystemDraftInput);
+const decodeCloseStaleDraft = Schema.decodeUnknownEffect(CloseStaleDraftInput);
 
 const searchParams = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
@@ -314,10 +331,56 @@ const makeRoutes = Effect.gen(function* () {
           inboundId: body.inboundId,
           ...(body.editedText === undefined ? {} : { editedText: body.editedText }),
           ...(body.rewriteNote === undefined ? {} : { rewriteNote: body.rewriteNote }),
+          ...(body.revision === undefined ? {} : { revision: body.revision }),
         },
         CONTROL_PROVENANCE,
       );
       return json({ ok: true, draft: result.draft, suggestions: result.suggestions });
+    }),
+  );
+
+  const systemComponent = (requestedBy: string | null) =>
+    requestedBy !== null && SYSTEM_DRAFT_COMPONENTS.has(requestedBy)
+      ? Effect.succeed(requestedBy)
+      : Effect.fail(
+          fail(
+            "forbidden",
+            `Only ${[...SYSTEM_DRAFT_COMPONENTS].join(", ")} open or read system drafts over HTTP.`,
+          ),
+        );
+
+  const openSystemDraft = write(
+    Effect.gen(function* () {
+      const input = yield* decodeBody(decodeOpenSystemDraft);
+      const component = yield* systemComponent(input.requestedBy);
+      const draft = yield* asks.openSystemDraft(input, systemProvenance(component));
+      return json({ ok: true, draft });
+    }),
+  );
+
+  const closeStaleDraft = write(
+    Effect.gen(function* () {
+      const input = yield* decodeBody(decodeCloseStaleDraft);
+      const component = yield* systemComponent(input.requestedBy);
+      const draft = yield* asks.closeStaleDraft(input, systemProvenance(component));
+      return json({ ok: true, draft });
+    }),
+  );
+
+  /** `?head=<sha>&requestedBy=crw`: only a decision on exactly that head counts. */
+  const draftDecision = read(
+    Effect.gen(function* () {
+      const draftId = DraftId.make(yield* param("draftId"));
+      const query = yield* searchParams;
+      const head = query.get("head")?.trim() ?? "";
+      if (head.length === 0)
+        return yield* fail("invalid_request", "The head query parameter is required.");
+      const component = yield* systemComponent(query.get("requestedBy")?.trim() ?? null);
+      const decision = yield* asks.systemDraftDecision(
+        { draftId, head, requestedBy: component },
+        systemProvenance(component),
+      );
+      return json({ ok: true, decision });
     }),
   );
 
@@ -409,6 +472,9 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("POST", `${p}/asks/:askId/answer`, handle(answer)),
     HttpRouter.route("GET", `${p}/drafts`, handle(listDrafts)),
     HttpRouter.route("POST", `${p}/drafts/:draftId/decide`, handle(decide)),
+    HttpRouter.route("POST", `${p}/drafts/open`, handle(openSystemDraft)),
+    HttpRouter.route("POST", `${p}/drafts/stale`, handle(closeStaleDraft)),
+    HttpRouter.route("GET", `${p}/drafts/:draftId/decision`, handle(draftDecision)),
     HttpRouter.route("GET", `${p}/events`, handle(events)),
     HttpRouter.route("GET", `${p}/watch`, handle(watch)),
   ] as const;

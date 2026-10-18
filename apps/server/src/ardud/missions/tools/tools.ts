@@ -1,4 +1,6 @@
 import {
+  AnnotateApprovalInput,
+  AnnotateDraftInput,
   ApprovalId,
   ApprovalStatus,
   AskId,
@@ -15,19 +17,25 @@ import {
   MissionLink,
   MissionRecordRef,
   MissionMutationResult,
+  NonNegativeInt,
   NoteId,
   OrchestratorMcpFailure,
   PostMessageInput,
   RecordRuleUseInput,
+  ReopenDraftInput,
+  ReopenSuggestionInput,
   ReorderSubMissionsInput,
   RequestRuleChangeInput,
   ResolveRuleChangeInput,
   RouteApprovalInput,
+  RouteDraftInput,
+  SaveDraftNoteInput,
   SetApprovalRoutingInput,
   SetMissionFocusInput,
   SetMissionStatusInput,
   SplitLaneInput,
   TrimmedNonEmptyString,
+  UpdateForkInput,
   UpdateMissionInput,
   UpsertLaneInput,
   UpsertMilestoneInput,
@@ -52,7 +60,9 @@ import { WATCH_KINDS } from "../asks/watch.ts";
  * calling thread (MCP invocation context), never from parameters, and every
  * tool is strict: an unknown key such as `default` or `askedBy` is refused.
  * The only owner-voiced writes are answers and draft decisions that carry the
- * id of the owner's (or Moni's) iMessage, which the server verifies.
+ * id of the owner's (or Moni's) iMessage, which the server verifies. The
+ * master decides, re-routes and annotates drafts and approvals routed to it
+ * and edits draft notes through the same service methods the owner uses.
  */
 
 const dependencies = [
@@ -193,7 +203,7 @@ const MissionCallTool = Tool.make("mission_call", {
 
 const MissionDraftTool = Tool.make("mission_draft", {
   description:
-    "Submit outward text (Linear, GitHub, Cliq, iMessage, WhatsApp, email) as a draft for the owner to approve; nothing is sent. Load mission_drafts guideFor first. To answer a rewrite request pass draftId and the new text.",
+    "Submit outward text (Linear, GitHub, Cliq, iMessage, WhatsApp, email) as a draft for its approver (the routing table picks owner or master); nothing is sent. Load mission_drafts guideFor first. Refused when your role does not write public text: hand the text to a writer role. To answer a rewrite request pass draftId and the new text.",
   parameters: Schema.Struct({
     draftId: Schema.optional(DraftId),
     missionId: Schema.optional(MissionId),
@@ -210,15 +220,49 @@ const MissionDraftTool = Tool.make("mission_draft", {
 
 const MissionDraftApproveTool = Tool.make("mission_draft_approve", {
   description:
-    "Record the owner's decision on a draft that arrived by iMessage: approve (optionally with his edited text), rewrite with his note, or drop. inboundId must be his (or Moni's) incoming iMessage containing that decision. Approval records the draft as approved; sending is separate.",
+    "Decide a draft: approve (optionally with edited text), rewrite with a note, or drop. For the owner's decision that arrived by iMessage pass inboundId (his or Moni's incoming iMessage containing it). Without inboundId you decide as the mission's master, which works only for drafts routed to the master. Approval records the draft as approved; sending is separate.",
   parameters: Schema.Struct({
     draftId: DraftId,
     action: Schema.Literals(["approve", "rewrite", "drop"]),
     editedText: Schema.optional(TrimmedNonEmptyString),
     rewriteNote: Schema.optional(TrimmedNonEmptyString),
-    inboundId: TrimmedNonEmptyString,
+    inboundId: Schema.optional(TrimmedNonEmptyString),
+    revision: Schema.optional(NonNegativeInt).annotate({
+      description:
+        "The draft revision you read (its `revision` field, 0 when missing). Required to approve without an inboundId; a draft revised or reopened since then is refused, so you decide the text it says now.",
+    }),
   }),
   success: Schema.Struct({ draft: Schema.Unknown, suggestions: Records }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionDraftRouteTool = Tool.make("mission_draft_route", {
+  description:
+    "As the mission's master, send one waiting draft to the owner or to the master, with the reason. The reason is logged and shown with the draft.",
+  parameters: RouteDraftInput,
+  success: Schema.Struct({ draft: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionDraftAnnotateTool = Tool.make("mission_draft_annotate", {
+  description:
+    "As the mission's master, set a waiting draft's short summary (one or two lines) and flags (short free labels shown as chips). Omit a field to keep it; flags replace the list.",
+  parameters: AnnotateDraftInput,
+  success: Schema.Struct({ draft: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionDraftNoteTool = Tool.make("mission_draft_note", {
+  description:
+    "As a mission's master, save a draft note (how outward text should read), edit one (pass noteId) or turn it off or on (active). Scope: all, a channel, or a person. missionId null means every mission. Writers load matching notes with mission_drafts guideFor.",
+  parameters: SaveDraftNoteInput,
+  success: Schema.Struct({ note: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
@@ -272,9 +316,43 @@ const MissionForkTool = Tool.make("mission_fork", {
 
 const MissionForkCloseTool = Tool.make("mission_fork_close", {
   description:
-    "End a fork with one line for the master (what was answered or decided). Only the owner can mark a fork as committing the mission.",
-  parameters: Schema.Struct({ forkId: ForkId, summaryLine: TrimmedNonEmptyString }),
+    "End a fork with one line for the master (what was answered or decided). The mission's master (or the owner) can also mark it as committing the mission; the timeline names who did.",
+  parameters: Schema.Struct({
+    forkId: ForkId,
+    summaryLine: TrimmedNonEmptyString,
+    commitsMission: Schema.optional(Schema.Boolean),
+  }),
   success: Schema.Struct({ fork: Schema.Unknown, delivered: Schema.Boolean }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionForkUpdateTool = Tool.make("mission_fork_update", {
+  description:
+    "As the mission's master, follow up on a fork: reopen it to keep talking, mark an answered fork as committing the mission, or archive it. Recorded as the master, never as the owner.",
+  parameters: UpdateForkInput,
+  success: Schema.Struct({ fork: Schema.Unknown, delivered: Schema.Boolean }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionDraftReopenTool = Tool.make("mission_draft_reopen", {
+  description:
+    "As the mission's master, put an approved or dropped draft routed to you back to pending. Drafts routed to the owner stay his. Reopening starts a new revision, so earlier approvals no longer count.",
+  parameters: ReopenDraftInput,
+  success: Schema.Struct({ draft: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionSuggestionReopenTool = Tool.make("mission_suggestion_reopen", {
+  description:
+    "As the mission's master, put a dismissed suggestion back to open. The timeline records that the master reopened it.",
+  parameters: ReopenSuggestionInput,
+  success: Schema.Struct({ suggestion: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,
@@ -428,6 +506,12 @@ const MissionApprovalRouteTool = missionWriteTool(
   Schema.Struct({ missionId: MissionId, ...RouteApprovalInput.fields }),
 );
 
+const MissionApprovalAnnotateTool = missionWriteTool(
+  "mission_approval_annotate",
+  "As the mission's master, set a pending approval's short summary (one or two lines) and flags (short free labels shown as chips), e.g. when it arrived without them. Omit a field to keep it; flags replace the list.",
+  Schema.Struct({ missionId: MissionId, ...AnnotateApprovalInput.fields }),
+);
+
 const MissionApprovalRoutingTool = missionWriteTool(
   "mission_approval_routing",
   "As the mission's master, replace the mission's approval routing table: rows matched in order, first match wins. An approval row matches by kind and repository (owner/repo); a draft row by channel, audience or person. Anything no row matches goes to the owner. Applies to approvals opened from now on.",
@@ -523,12 +607,18 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionAskAnswerTool, "Record the owner's iMessage answer"),
   writeTool(MissionCallTool, "Record a call"),
   writeTool(MissionDraftTool, "Submit a draft"),
-  writeTool(MissionDraftApproveTool, "Record the owner's iMessage draft decision"),
+  writeTool(MissionDraftApproveTool, "Decide a draft"),
+  writeTool(MissionDraftReopenTool, "Reopen a draft"),
+  writeTool(MissionDraftRouteTool, "Route one draft"),
+  writeTool(MissionDraftAnnotateTool, "Annotate a draft"),
+  writeTool(MissionDraftNoteTool, "Save, edit or turn off a draft note"),
   writeTool(MissionPostTool, "Post to a mission room"),
   writeTool(MissionSuggestTool, "Suggest a change"),
   writeTool(MissionSuggestionDecideTool, "Decide a master suggestion"),
+  writeTool(MissionSuggestionReopenTool, "Reopen a dismissed suggestion"),
   writeTool(MissionForkTool, "Fork the master for a question"),
   writeTool(MissionForkCloseTool, "Close a fork"),
+  writeTool(MissionForkUpdateTool, "Reopen, commit or archive a fork"),
   writeTool(MissionNoteAckTool, "Acknowledge a note"),
   writeTool(MissionSubMissionTool, "Create or update a sub-mission"),
   writeTool(MissionMilestoneTool, "Create or update a milestone"),
@@ -545,6 +635,7 @@ export const MissionsToolkit = Toolkit.make(
   readTool(MissionApprovalsTool, "Mission approvals"),
   writeTool(MissionApprovalDecideTool, "Decide an approval routed to the master"),
   writeTool(MissionApprovalRouteTool, "Route one approval"),
+  writeTool(MissionApprovalAnnotateTool, "Annotate an approval"),
   writeTool(MissionApprovalRoutingTool, "Set approval routing"),
   writeTool(MissionRuleTool, "Write, edit or retire a rule"),
   writeTool(MissionRuleUseTool, "Record a rule applied or broken"),

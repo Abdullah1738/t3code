@@ -18,6 +18,7 @@ import {
   harness,
   masterThread,
   missionId,
+  ownerApp,
   seed,
   writerThread,
 } from "./AsksService.testkit.ts";
@@ -191,6 +192,94 @@ describe("missions desk HTTP", () => {
         _tag: "owner-imessage",
         chat: "moni",
       });
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("lets crw open a draft per head and read only that head's decision", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const open = (head: string, draftId: string) => ({
+        missionId,
+        draftId,
+        requestedBy: "crw",
+        audience: "PR author",
+        channel: "github",
+        target: { kind: "pull-request", label: "crpko/api#7", url: null, ref: "crpko/api#7" },
+        head,
+        text: "Feedback required: the retry loop never backs off.",
+        flags: ["core change"],
+      });
+      const result = yield* withDesk(async (handle) => {
+        const readOnly = await handle(
+          request("/drafts/open", "Bearer read", open("aaa111", "crw-1")),
+        );
+        const stranger = await handle(
+          request("/drafts/open", "Bearer operate", {
+            ...open("aaa111", "crw-1"),
+            requestedBy: "bot",
+          }),
+        );
+        const opened = await body(
+          await handle(request("/drafts/open", "Bearer operate", open("aaa111", "crw-1"))),
+        );
+        const noHead = await handle(
+          request("/drafts/crw-1/decision?requestedBy=crw", "Bearer read"),
+        );
+        const waiting = await body(
+          await handle(
+            request("/drafts/crw-1/decision?head=aaa111&requestedBy=crw", "Bearer read"),
+          ),
+        );
+        return { readOnly, stranger, opened, noHead, waiting };
+      });
+      expect(result.readOnly.status).toBe(403);
+      expect(result.stranger.status).toBe(403);
+      expect(result.opened.draft).toMatchObject({
+        requestedBy: "crw",
+        head: "aaa111",
+        flags: ["core change"],
+      });
+      expect(result.noHead.status).toBe(400);
+      expect(result.waiting.decision.state).toBe("pending");
+
+      yield* asks.decideDraft(
+        {
+          draftId: result.opened.draft.id,
+          action: "approve",
+          editedText: "Please add a backoff.",
+          revision: 0,
+        },
+        ownerApp,
+      );
+      const after = yield* withDesk(async (handle) => {
+        const decided = await body(
+          await handle(
+            request("/drafts/crw-1/decision?head=aaa111&requestedBy=crw", "Bearer read"),
+          ),
+        );
+        const otherHead = await body(
+          await handle(
+            request("/drafts/crw-1/decision?head=bbb222&requestedBy=crw", "Bearer read"),
+          ),
+        );
+        const stale = await handle(
+          request("/drafts/stale", "Bearer operate", {
+            draftId: "crw-1",
+            requestedBy: "crw",
+            reason: "head moved",
+          }),
+        );
+        return { decided, otherHead, stale };
+      });
+      expect(after.decided.decision).toMatchObject({
+        state: "approved",
+        text: "Please add a backoff.",
+        edited: true,
+      });
+      expect(after.otherHead.decision.state).toBe("stale");
+      expect(after.stale.status).toBe(409);
     }).pipe(Effect.provide(layer));
   });
 
