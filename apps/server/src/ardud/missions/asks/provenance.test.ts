@@ -245,6 +245,77 @@ describe("iMessage provenance", () => {
     }
   });
 
+  // Review of N8: a lead or courtesy word can itself be an option, so "yes,
+  // no" names both options and records neither.
+  it("N8: a lead or courtesy word that is itself an option makes the reply ambiguous", () => {
+    const yesNo = [
+      { id: "y", label: "Yes" },
+      { id: "n", label: "No" },
+    ];
+    expect(optionCollision(yesNo)).toBeNull();
+    expect(picks("y", "", yesNo)("yes")).toBe(true);
+    expect(picks("n", "", yesNo)("No.")).toBe(true);
+    expect(picks("n", "", yesNo)("yes, no")).toBe(false);
+    expect(picks("n", "", yesNo)("Yes. No.")).toBe(false);
+    expect(picks("y", "", yesNo)("yes, no")).toBe(false);
+    const goStop = [
+      { id: "g", label: "Go" },
+      { id: "s", label: "Stop" },
+    ];
+    expect(picks("g", "", goStop)("go")).toBe(true);
+    expect(picks("s", "", goStop)("go, stop")).toBe(false);
+    const byId = [
+      { id: "go", label: "Rollback" },
+      { id: "ship", label: "Ship" },
+    ];
+    expect(optionCollision(byId)).toBeNull();
+    expect(picks("ship", "", byId)("ship")).toBe(true);
+    expect(picks("ship", "", byId)("go ship")).toBe(false);
+  });
+
+  // Review of N8: quotes, brackets and an approving emoji around an option
+  // don't change it; a sign or a disapproving emoji still does.
+  it("N8: an option may be quoted, bracketed or closed with an approving emoji", () => {
+    expect(picks("pg")("Postgres 👍")).toBe(true);
+    expect(picks("pg")("Postgres thx 🙏")).toBe(true);
+    expect(picks("pg")('"Postgres"')).toBe(true);
+    expect(picks("pg")("\u201CPostgres\u201D")).toBe(true);
+    expect(picks("pg")("Postgres 👎")).toBe(false);
+    const letters = [
+      { id: "a", label: "Online" },
+      { id: "b", label: "Offline window" },
+    ];
+    expect(picks("b", "", letters)("(b)")).toBe(true);
+    expect(picks("b", "", letters)("B)")).toBe(true);
+    const pay = [
+      { id: "minus", label: "Pay -100" },
+      { id: "plain", label: "Pay 100" },
+    ];
+    expect(picks("minus", "", pay)("Pay -100 👍🏽")).toBe(true);
+    // "(100)" can be a negative amount, so brackets around digits stay.
+    expect(picks("plain", "", pay)("Pay (100)")).toBe(false);
+  });
+
+  // Review of N8: the checks run inside the asks lock, so long labels must
+  // stay cheap.
+  it("N8: checking long option labels stays fast", () => {
+    const long = (seed: number) =>
+      Array.from({ length: 300 }, (_, index) => `w${seed}x${index}`).join(" ");
+    const options = Array.from({ length: 20 }, (_, index) => ({
+      id: `o${index}`,
+      label: long(index),
+    }));
+    const leads = Array.from({ length: 20 }, (_, index) => ({
+      id: `g${index}`,
+      label: `${"go ".repeat(300)}${index}`,
+    }));
+    const started = performance.now();
+    expect(optionCollision(options)).toBeNull();
+    expect(optionCollision(leads)).toBeNull();
+    expect(picks("g3", "", leads)(`${"go ".repeat(300)}3 ${"thanks ".repeat(300)}`)).toBe(true);
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
   // Sol H9: approval needs approval words and nothing else; an edit needs the
   // edited text after them. No substring or OR of approval words.
   it("H9: a draft decision by iMessage must say exactly that decision", () => {
