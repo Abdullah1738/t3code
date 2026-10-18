@@ -155,8 +155,12 @@ export interface MissionOverviewSnapshot extends MissionOverview {
   readonly poolUsage: ReadonlyArray<MissionPoolUsage>;
   /** Latest change per field of the mission and its sub-missions. */
   readonly changes: ReadonlyArray<FieldChange>;
-  /** An open restart incident, until every affected thread resumed or was decided. */
-  readonly recovery: RecoveryIncident | null;
+  /**
+   * An open restart incident, until every affected thread resumed or was decided.
+   * UI-side shape; named apart from the contract's `recovery` until ui-web r4
+   * switches to MissionRecoveryState.
+   */
+  readonly recoveryIncident: RecoveryIncident | null;
 }
 
 // --- Approval routing ------------------------------------------------------

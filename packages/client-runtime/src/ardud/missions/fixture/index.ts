@@ -486,7 +486,7 @@ export function createFixtureMissionsSource(
                 (event.subject?.kind === "mission" || event.subject?.kind === "sub-mission"),
             ),
         ),
-        recovery: operations.openIncident(missionId),
+        recoveryIncident: operations.openIncident(missionId),
       };
     });
   }

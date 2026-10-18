@@ -65,7 +65,7 @@ export function MissionOverviewTab(props: {
 
 /** Shown while a restart incident still has threads to resume or decide. */
 function RecoveryLine(props: { overview: MissionOverviewSnapshot }) {
-  const line = recoveryBanner(props.overview.recovery, (iso) => formatTimeOfDay(iso));
+  const line = recoveryBanner(props.overview.recoveryIncident, (iso) => formatTimeOfDay(iso));
   if (!line) return null;
   return (
     <Link
