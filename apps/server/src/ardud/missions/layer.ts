@@ -9,6 +9,8 @@ import { missionsRouteLayer } from "./http.ts";
 import * as MissionService from "./MissionService.ts";
 import { policyRouteLayer } from "./policy/http.ts";
 import { PolicyLive } from "./policy/layer.ts";
+import { recoveryRouteLayer } from "./recovery/http.ts";
+import { RecoveryLive } from "./recovery/layer.ts";
 import { coordShimRouteLayer } from "./router/coordHttp.ts";
 import { RouterAsksPortsLive, RouterLive } from "./router/layer.ts";
 import { masterFeedLayer } from "./router/masterFeed.ts";
@@ -40,6 +42,8 @@ export const ArdudMissionsLive = Layer.mergeAll(
   asksWiringLayer.pipe(Layer.provide(RuleService.layer)),
   // the master's inbox feed: editor digests, master-routed approvals and drafts
   masterFeedLayer,
+  // ardud missions: recovery (needs MissionService from the tracks below)
+  RecoveryLive,
 ).pipe(Layer.provideMerge(MissionTracksLive), Layer.provideMerge(MissionStore.layer));
 
 /**
@@ -53,4 +57,5 @@ export const ArdudMissionsRoutesLive = Layer.mergeAll(
   missionsDeskRouteLayer,
   policyRouteLayer,
   coordShimRouteLayer,
+  recoveryRouteLayer,
 );

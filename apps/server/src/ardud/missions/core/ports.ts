@@ -1,4 +1,10 @@
-import type { FeedItem, MissionError, MissionId, Note } from "@t3tools/contracts";
+import type {
+  FeedItem,
+  MissionError,
+  MissionId,
+  MissionRecoveryState,
+  Note,
+} from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 
 /**
@@ -21,3 +27,10 @@ export interface MissionEditor {
     limit: number,
   ) => Effect.Effect<ReadonlyArray<Note>, MissionError>;
 }
+
+// ardud missions: recovery
+/** The recovery track's overview badge; registered with `MissionService.registerRecovery`. */
+export interface MissionRecoveryReader {
+  readonly state: (missionId: MissionId) => Effect.Effect<MissionRecoveryState | null>;
+}
+// end ardud missions: recovery

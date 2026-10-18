@@ -79,7 +79,35 @@ const threadBusy = (thread, active) => Boolean(thread.activeRunId || thread.pend
   || ['preparing', 'starting', 'running', 'waiting'].includes(thread.status)
   || active.has(thread.nativeSessionId));
 
-async function handleThread({ io, db, incident, threadId, subs, active, dryRun, now, windowStart, progress, save }) {
+// Robob's mission recovery owns notes for mission members: it sends one
+// notice per thread, master first and paced. Report every restart to it and
+// leave its members' notes alone. An older Robob without the route owns none.
+const missionCause = (incident) =>
+  incident.serverStart && (incident.serverStart.service ?? 'robob') === 'robob' ? 'server-restart' : 'opencode-restart';
+
+async function missionReport({ io, incident, byThread, prev, dryRun }) {
+  if (!dryRun && prev?.missionReport) return prev.missionReport;
+  const threads = [...byThread].map(([threadId, list]) => ({
+    threadId,
+    runIds: incident.runs.filter((r) => r.thread_id === threadId).map((r) => r.run_id),
+    childIds: list.map((s) => s.subagent_id),
+  }));
+  try {
+    const res = await io.missionRecoveryReport({
+      reportId: incident.id, cause: missionCause(incident), startAt: isoOf(incident.startMs), endAt: isoOf(incident.endMs),
+      threads, ...(dryRun ? { dryRun: true } : {}),
+    });
+    return { incidentId: res.incidentId ?? null, members: (res.members ?? []).map((m) => m.threadId), missions: res.missions ?? [] };
+  } catch (err) {
+    if ([401, 403, 404].includes(err?.status)) return { incidentId: null, members: [], missions: [], unavailable: true };
+    const failures = (prev?.missionFailures ?? 0) + 1;
+    // Never hold a restart back for good: past the retries this scan notes everyone.
+    if (failures >= MAX_ATTEMPTS) return { incidentId: null, members: [], missions: [], error: errText(err) };
+    return { retry: true, failures, error: errText(err) };
+  }
+}
+
+async function handleThread({ io, db, incident, threadId, subs, active, dryRun, now, windowStart, progress, save, missionMember = false }) {
   const thread = await io.getThread(threadId);
   if (!thread) return null;
   const info = { threadId, title: thread.title, origin: thread.origin, archived: thread.archived };
@@ -103,8 +131,13 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
   const windowOver = now - windowStart >= RESTART_RESUME_WINDOW_MS;
   const cutMs = Math.min(...[...cuts, ...subs].map((r) => toMs(r.completed_at)).filter(Number.isFinite), incident.endMs);
   const ranAgain = windowOver && !alreadySent && io.runStartedSince(db, threadId, isoOf(cutMs));
-  const plan = planRestartThread({ thread: info, lost, turnCut, held: queued, ranAgain, windowOver, noteSent: alreadySent,
+  let plan = planRestartThread({ thread: info, lost, turnCut, held: queued, ranAgain, windowOver, noteSent: alreadySent,
     busy: !ownRecovery && threadBusy(thread, active) });
+  // Mission recovery waits for the thread to go idle itself, so a busy member
+  // needs no hold-back here; its held queue is still released.
+  if (missionMember && ((plan.action === "note" && !alreadySent) || plan.reason === RESTART_BUSY_REASON)) {
+    plan = { ...plan, action: "mission", reason: "mission recovery notes it" };
+  }
   const staleHeld = [...(progress.staleHeld ?? [])];
   for (const r of queued) {
     // Keep real owner messages, regardless of age. These pulses only ask the
@@ -119,7 +152,7 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
   const sending = plan.action === "note" && !alreadySent;
   // Resumed and already-noted threads still get their held queue released:
   // queue.resume never interrupts a running turn, the queue just starts after it.
-  const releasing = (plan.action === "note" || plan.action === "resumed") && queued.length > 0 && !progress.queueOk;
+  const releasing = ["note", "resumed", "mission"].includes(plan.action) && queued.length > 0 && !progress.queueOk;
   if (sending) res.note = buildRestartNote({ incident, lost, turnCut, held, staleHeld, ocUrl: io.OC_URL });
   if (!sending && !releasing) return res;
   if (dryRun) return res;
@@ -268,9 +301,21 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
     const server = incident.serverStart ? `, server pid ${incident.serverStart.pid} ready ${hhmm(incident.serverStart.readyMs)}` : "";
     log(`${incident.id}: restart at ${hhmm(incident.startMs)} (${incident.reason}${server}), ${incident.runs.length} own turns, ${incident.subagents.length} subagents cancelled in ${byThread.size} threads${dryRun ? " (dry run)" : ""}`);
 
+    const mission = await missionReport({ io, incident, byThread, prev, dryRun });
+    if (mission.retry) {
+      log(`${incident.id}: mission recovery unreachable (${mission.error}), retrying next scan`);
+      if (!dryRun) {
+        state.handled[incident.id] = { ...prev, incident, at: isoOf(now), done: false, threads: { ...prev?.threads }, missionFailures: mission.failures };
+        io.saveState(state, now);
+      }
+      continue;
+    }
+    const members = new Set(mission.members);
+    if (members.size) log(`${incident.id}: ${members.size} mission member thread(s) left to mission recovery (${mission.incidentId ?? "dry run"})`);
+
     const results = [];
     const all = [];
-    const entry = { ...prev, incident, at: isoOf(now), threads: { ...prev?.threads } };
+    const entry = { ...prev, incident, at: isoOf(now), threads: { ...prev?.threads }, ...(dryRun ? {} : { missionReport: mission }) };
     const windowStart = resumeWindowStart(incident);
     const save = () => {
       if (!dryRun) {
@@ -288,7 +333,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       let res;
       const progress = entry.threads[threadId] ??= {};
       try {
-        res = await handleThread({ io, db, incident, threadId, subs: list, active, dryRun, now, windowStart, progress, save });
+        res = await handleThread({ io, db, incident, threadId, subs: list, active, dryRun, now, windowStart, progress, save, missionMember: members.has(threadId) });
         if (res?.ok && !res.deferred && !dryRun) progress.done = true;
       } catch (err) {
         res = { plan: { threadId, title: threadId, action: "skip", reason: "error" }, ok: false, error: errText(err), lostSubs: [] };
@@ -322,7 +367,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
         if (dryRun && res.note) log(`    note:\n${truncate(res.note, 1500)}`);
       }
     }
-    const summary = buildRestartSummary({ incident, results: all });
+    const summary = buildRestartSummary({ incident, results: all, missions: mission.missions });
     // Archiving several threads at once also cancels their subagents; that is
     // not worth a ping.
     const quiet = all.length > 0 && all.every((r) => r.plan.reason === "archived");

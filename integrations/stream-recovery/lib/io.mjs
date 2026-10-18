@@ -240,8 +240,12 @@ function control() {
 }
 
 export async function ctl(method, path, body) {
+  return api(method, `/api/ardud/control${path}`, body);
+}
+
+async function api(method, path, body) {
   const { url, token } = control();
-  const res = await fetch(`${url}/api/ardud/control${path}`, {
+  const res = await fetch(`${url}${path}`, {
     method,
     headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
@@ -254,6 +258,13 @@ export async function ctl(method, path, body) {
     throw e;
   }
   return data;
+}
+
+// Hands a restart incident to Robob's mission recovery. It records the incident
+// for mission members (deduped by reportId) and returns which threads it owns.
+// body: {reportId, cause, startAt, endAt, threads: [{threadId, runIds, childIds}], dryRun?}
+export async function missionRecoveryReport(body) {
+  return api("POST", "/api/ardud/missions/recovery/incident", body);
 }
 
 export async function getThread(threadId) {

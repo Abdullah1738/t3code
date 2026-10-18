@@ -282,6 +282,8 @@ import {
   useComboboxFilter,
 } from "./ui/combobox";
 import { SidebarContent, SidebarGroup, useSidebar } from "./ui/sidebar";
+// ardud missions: ui-web
+import { MissionsSidebarGroup } from "../ardud/missions/MissionsSidebarGroup";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { SidebarHeaderIconButton, SidebarThreadHeader } from "./sidebar/SidebarThreadHeader";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from "./ui/menu";
@@ -5146,6 +5148,9 @@ export default function Sidebar() {
           </SidebarGroup>
         }
       >
+        {/* ardud missions: ui-web */}
+        {!isSearchingThreads ? <MissionsSidebarGroup /> : null}
+        {/* end ardud missions: ui-web */}
         <SidebarGroup className="flex-1" role="presentation">
           {isSearchingThreads ? (
             threadSearchResults.length > 0 ? (
