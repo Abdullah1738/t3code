@@ -243,6 +243,15 @@ const RPC_AGGREGATES = {
   [WS_METHODS.missionsCloseFork]: "missions",
   [WS_METHODS.missionsUpdateFork]: "missions",
   [WS_METHODS.missionsAckNote]: "missions",
+  // ardud missions: router
+  [WS_METHODS.missionsRooms]: "missions",
+  [WS_METHODS.missionsRoomPage]: "missions",
+  [WS_METHODS.missionsMessageBody]: "missions",
+  [WS_METHODS.missionsPostMessage]: "missions",
+  [WS_METHODS.missionsMarkRead]: "missions",
+  [WS_METHODS.missionsSubscribeRoom]: "missions",
+  [WS_METHODS.missionsSetMember]: "missions",
+  [WS_METHODS.missionsDecideKnock]: "missions",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

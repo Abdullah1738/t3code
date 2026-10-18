@@ -22,9 +22,14 @@ import {
 import * as RuleService from "./core/RuleService.ts";
 import * as AsksService from "./asks/AsksService.ts";
 import * as MissionService from "./MissionService.ts";
+// ardud missions: router
+import { fakeRouterThreads, routerOverFakes } from "./router/MissionRouter.testkit.ts";
 import { makeMissionWsHandlers, missionWsHandlers } from "./ws.ts";
 
-const TestLayer = RuleService.layer.pipe(Layer.provideMerge(harness().layer));
+const TestLayer = RuleService.layer.pipe(
+  Layer.provideMerge(routerOverFakes(fakeRouterThreads())),
+  Layer.provideMerge(harness().layer),
+);
 
 const paired = { sessionId: "session-app", subject: "one-time-token" };
 const cliIssued = { sessionId: "session-cli", subject: "cli-issued-session" };
@@ -34,7 +39,15 @@ const mcpClient = { sessionId: "session-mcp", subject: "mcp-client" };
 const WRITE_METHODS = Object.values(WS_METHODS).filter(
   (method) =>
     method.startsWith("missions.") &&
-    !["missions.subscribeList", "missions.subscribe", "missions.inbox"].includes(method),
+    ![
+      "missions.subscribeList",
+      "missions.subscribe",
+      "missions.inbox",
+      // ardud missions: router
+      "missions.rooms",
+      "missions.roomPage",
+      "missions.messageBody",
+    ].includes(method),
 );
 
 it("every missions write is guarded by the operate scope", () => {

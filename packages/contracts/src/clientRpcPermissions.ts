@@ -79,6 +79,12 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.missionsCloseFork]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsUpdateFork]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsAckNote]: AuthOrchestrationOperateScope,
+  // ardud missions: router
+  [WS_METHODS.missionsPostMessage]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsMarkRead]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSubscribeRoom]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetMember]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsDecideKnock]: AuthOrchestrationOperateScope,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 

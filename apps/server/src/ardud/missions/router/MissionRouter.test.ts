@@ -26,47 +26,17 @@ import {
 import * as MissionStore from "../store/MissionStore.ts";
 import type { SendGuardRequest } from "./guardHook.ts";
 import * as MissionRouter from "./MissionRouter.ts";
-import type { SendSender, ThreadActivity } from "./model.ts";
-import { RouterThreads } from "./ports.ts";
-import * as RouterStore from "./RouterStore.ts";
-
-interface Sent {
-  readonly threadId: ThreadId;
-  readonly text: string;
-  readonly key: string;
-  readonly asOwner: boolean;
-}
+import type { SendSender } from "./model.ts";
+import { fakeRouterThreads, routerOverFakes, type Sent } from "./MissionRouter.testkit.ts";
 
 /** A fake thread world: nothing here can reach a real thread. */
 const harness = () => {
-  const sent: Sent[] = [];
-  const activity = new Map<ThreadId, ThreadActivity>();
-  const parents = new Map<ThreadId, ThreadId>();
-  const threads = Layer.succeed(
-    RouterThreads,
-    RouterThreads.of({
-      facts: (threadId) =>
-        Effect.sync(() => ({
-          threadId,
-          title: threadId,
-          activity: activity.get(threadId) ?? "idle",
-          parentThreadId: parents.get(threadId) ?? null,
-          rootThreadId: parents.get(threadId) ?? null,
-        })),
-      send: (input) =>
-        Effect.sync(() => {
-          sent.push(input);
-        }),
-    }),
+  const threads = fakeRouterThreads();
+  const layer = routerOverFakes(threads).pipe(
+    Layer.provideMerge(MissionStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
   );
-  const layer = MissionRouter.layer.pipe(
-    Layer.provideMerge(
-      Layer.mergeAll(RouterStore.layer, MissionStore.layer, threads).pipe(
-        Layer.provideMerge(Sqlite.layerMemory),
-      ),
-    ),
-  );
-  return { sent, activity, parents, layer };
+  return { ...threads, layer };
 };
 
 const control = RoomId.make(`${missionId}:room:control`);

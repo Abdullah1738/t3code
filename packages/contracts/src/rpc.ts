@@ -397,6 +397,22 @@ import {
   UpsertRuleInput,
   UpsertSubMissionInput,
   WithdrawAskInput,
+  // ardud missions: router
+  DecideKnockInput,
+  Knock,
+  MarkReadInput,
+  MessageBodyInput,
+  MissionMessage,
+  MissionMessageBody,
+  MissionRoomsInput,
+  PostMessageInput,
+  ReadPosition,
+  Room,
+  RoomPage,
+  RoomPageInput,
+  SetMissionMemberInput,
+  SubscribeRoomInput,
+  Subscription,
 } from "./ardud/missions.ts";
 import {
   ProjectCloneActionInput,
@@ -608,7 +624,15 @@ export const WS_METHODS = {
   missionsCloseFork: "missions.closeFork",
   missionsUpdateFork: "missions.updateFork",
   missionsAckNote: "missions.ackNote",
-  // Slots, router: missionsDecideKnock, missionsPostMessage, missionsMarkRead.
+  // ardud missions: router
+  missionsRooms: "missions.rooms",
+  missionsRoomPage: "missions.roomPage",
+  missionsMessageBody: "missions.messageBody",
+  missionsPostMessage: "missions.postMessage",
+  missionsMarkRead: "missions.markRead",
+  missionsSubscribeRoom: "missions.subscribeRoom",
+  missionsSetMember: "missions.setMember",
+  missionsDecideKnock: "missions.decideKnock",
   // Slots, policy: missionsSetRoleModel, missionsSetPoolCapacity,
   // missionsUpdateReviewPolicy.
 
@@ -2093,6 +2117,39 @@ const WsMissionsUpdateForkRpc = missionRpc(
   MissionFork,
 );
 const WsMissionsAckNoteRpc = missionRpc(WS_METHODS.missionsAckNote, AckNoteInput, Note);
+// ardud missions: router
+const WsMissionsRoomsRpc = missionRpc(
+  WS_METHODS.missionsRooms,
+  MissionRoomsInput,
+  Schema.Array(Room),
+);
+const WsMissionsRoomPageRpc = missionRpc(WS_METHODS.missionsRoomPage, RoomPageInput, RoomPage);
+const WsMissionsMessageBodyRpc = missionRpc(
+  WS_METHODS.missionsMessageBody,
+  MessageBodyInput,
+  MissionMessageBody,
+);
+const WsMissionsPostMessageRpc = missionRpc(
+  WS_METHODS.missionsPostMessage,
+  PostMessageInput,
+  MissionMessage,
+);
+const WsMissionsMarkReadRpc = missionRpc(WS_METHODS.missionsMarkRead, MarkReadInput, ReadPosition);
+const WsMissionsSubscribeRoomRpc = missionRpc(
+  WS_METHODS.missionsSubscribeRoom,
+  SubscribeRoomInput,
+  Subscription,
+);
+const WsMissionsSetMemberRpc = missionRpc(
+  WS_METHODS.missionsSetMember,
+  SetMissionMemberInput,
+  MissionMutationResult,
+);
+const WsMissionsDecideKnockRpc = missionRpc(
+  WS_METHODS.missionsDecideKnock,
+  DecideKnockInput,
+  Knock,
+);
 
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
@@ -2166,6 +2223,15 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsCloseForkRpc,
   WsMissionsUpdateForkRpc,
   WsMissionsAckNoteRpc,
+  // ardud missions: router
+  WsMissionsRoomsRpc,
+  WsMissionsRoomPageRpc,
+  WsMissionsMessageBodyRpc,
+  WsMissionsPostMessageRpc,
+  WsMissionsMarkReadRpc,
+  WsMissionsSubscribeRoomRpc,
+  WsMissionsSetMemberRpc,
+  WsMissionsDecideKnockRpc,
 ).middleware(RpcScopeAuthorization);
 
 /** Every WebSocket RPC not in a domain group merged into `WsRpcGroup` below. */
