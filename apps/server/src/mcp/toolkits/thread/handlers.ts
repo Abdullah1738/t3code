@@ -25,6 +25,10 @@ import { ThreadToolkit } from "./tools.ts";
 // ardud missions: router
 import { answerText } from "../../../ardud/missions/router/answers.ts";
 import { guardMcpWrite } from "../../../ardud/missions/router/guardPaths.ts";
+// ardud missions: guard
+import { optionalAuthorityStore } from "../../../ardud/missions/guard/authority.ts";
+import { guardFork } from "../../../ardud/missions/guard/forks.ts";
+import { guardFailure, mcpPrincipal, schedulesAs } from "../../../ardud/missions/guard/mcp.ts";
 
 function queueEntry(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
@@ -110,9 +114,11 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           code: "invalid_request",
           message: "The scheduled task was not found.",
         });
+      // ardud missions: guard - a manual run speaks as the caller, not the task's creator.
+      const { caller, scope } = yield* readCaller();
       const { task } = yield* scheduler
         .runNow({ id: input.taskId })
-        .pipe(Effect.mapError(unavailable));
+        .pipe(schedulesAs(mcpPrincipal(scope, caller)), Effect.mapError(unavailable));
       return {
         taskId: task.id,
         threadId: task.threadId,
@@ -141,9 +147,18 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   ),
   t3_thread_fork: writesThread((input) =>
     Effect.gen(function* () {
-      const { threads, projection } = yield* readThread(input.threadId);
+      const { threads, projection, caller, scope } = yield* readThread(input.threadId);
       const commandId = yield* newCommandId();
       const targetThreadId = ThreadId.make(`${commandId}:fork`);
+      // ardud missions: guard - forking a mission member copies its context into a
+      // thread that inherits its lineage, so only those who may reach it may fork it,
+      // and the fork's creator is recorded apart from that lineage.
+      yield* guardFork(yield* optionalAuthorityStore, {
+        caller: mcpPrincipal(scope, caller),
+        sourceThreadId: projection.thread.id,
+        targetThreadId,
+        title: input.title,
+      }).pipe(Effect.mapError(guardFailure));
       const result = yield* threads
         .dispatch({
           type: "thread.fork",

@@ -41,7 +41,26 @@ export type SendPath =
   | "merge-back"
   | "request-respond"
   | "scheduled-task"
-  | "schedule-edit";
+  | "schedule-edit"
+  /** A non-owner app/CLI session writing through the generic WS dispatch. */
+  | "ws-dispatch"
+  /** A launch that reuses an existing thread id. */
+  | "thread-launch"
+  /** A delegated task started under someone else's thread. */
+  | "delegate"
+  /** Recording a created child under someone else's run. */
+  | "created-record"
+  /** Starting or retargeting a pull request watch on someone else's thread. */
+  | "pr-watch"
+  /** A pull request watch waking its thread with PR activity. */
+  | "pr-watch-wake"
+  /** Forking a member thread. */
+  | "fork";
+
+/** Who created or last authorized a schedule, as recorded by the guard. */
+export type ScheduleCreator =
+  | { readonly _tag: "owner" }
+  | { readonly _tag: "thread"; readonly threadId: ThreadId };
 
 /**
  * Who is sending, taken from the authenticated transport context only.
@@ -56,12 +75,15 @@ export type SendSender =
   | { readonly _tag: "session"; readonly sessionId: string; readonly subject: string }
   /** An OAuth MCP client outside Robob. */
   | { readonly _tag: "mcp-client"; readonly sessionId: string; readonly label: string }
-  /** A scheduled task firing into its bound thread. */
+  /**
+   * A scheduled task firing into its bound thread. `creator` is the recorded
+   * authority, null when nothing was recorded (legacy or unknown origin).
+   */
   | {
       readonly _tag: "schedule";
       readonly scheduledTaskId: string;
       readonly title: string;
-      readonly createdBy: "user" | "agent" | "system";
+      readonly creator: ScheduleCreator | null;
     };
 
 export type GuardReason =
@@ -75,7 +97,8 @@ export type GuardReason =
   | "outsider"
   | "other-mission"
   | "anonymous"
-  | "agent-schedule";
+  | "agent-schedule"
+  | "unrecorded-schedule";
 
 export type GuardDecision =
   /** Target is not in any mission: the guard has no say. */
@@ -103,8 +126,9 @@ export interface GuardFacts {
 /**
  * Membership decides who may reach a member thread. Owner typing passes.
  * The master reaches its own members directly. Other members and member
- * services are routed through rooms. Schedules the owner made pass; an
- * agent's schedule may only fire into its own thread. Everything else knocks.
+ * services are routed through rooms. Schedules the owner made pass; a
+ * thread's schedule passes only into that same thread, and a schedule with no
+ * recorded creator is never treated as self. Everything else knocks.
  */
 export const decideSend = (facts: GuardFacts): GuardDecision => {
   const { target, sender, from } = facts;
@@ -118,10 +142,12 @@ export const decideSend = (facts: GuardFacts): GuardDecision => {
     case "owner":
       return allow("owner");
     case "schedule":
-      if (from.createdBy === "user" || from.createdBy === "system") return allow("owner-schedule");
-      // MCP binds an agent's schedule to the creating thread only, so a bound
-      // agent schedule is that thread talking to itself.
-      return allow("self-schedule");
+      // The stored creator decides, never the task's createdBy label: any
+      // operate-scope caller can write that label.
+      if (from.creator === null) return knock("unrecorded-schedule");
+      if (from.creator._tag === "owner") return allow("owner-schedule");
+      if (from.creator.threadId === facts.targetThreadId) return allow("self-schedule");
+      return knock("agent-schedule");
     case "thread": {
       if (from.threadId === facts.targetThreadId) return allow("self");
       if (!sameMission) return knock(sender === null ? "outsider" : "other-mission");

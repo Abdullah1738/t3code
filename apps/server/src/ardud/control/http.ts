@@ -49,6 +49,13 @@ import * as ControlStore from "./ControlStore.ts";
 import { BoardService } from "../board/BoardService.ts";
 // ardud missions: router
 import { guardControlSend, type SendRefused } from "../missions/router/guardPaths.ts";
+// ardud missions: guard
+import { optionalAuthorityStore } from "../missions/guard/authority.ts";
+import {
+  CONTROL_ACTOR,
+  guardControlRespond,
+  recordControlWrite,
+} from "../missions/guard/control.ts";
 import {
   formatModel,
   lastAssistantText,
@@ -397,6 +404,8 @@ const makeRoutes = Effect.gen(function* () {
   const board = yield* Effect.serviceOption(BoardService);
   const refreshBoard = (threadId: string) =>
     board._tag === "Some" ? board.value.refreshThread(threadId).pipe(Effect.ignore) : Effect.void;
+  // ardud missions: guard - control sessions are kept beside what they write.
+  const guardAuthority = yield* optionalAuthorityStore;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -636,7 +645,7 @@ const makeRoutes = Effect.gen(function* () {
     });
 
   const createThread = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
     const body = yield* decodeBody(decodeCreateThreadBody);
     const target = yield* resolveProject(body);
     const settings = yield* settingsService.getSettings.pipe(
@@ -698,11 +707,14 @@ const makeRoutes = Effect.gen(function* () {
                   attachments,
                 },
               }),
-          createdBy: "user",
+          // ardud missions: guard - a bearer token is not the owner typing.
+          createdBy: CONTROL_ACTOR,
           creationSource: "server",
         }).pipe(Effect.provide(intakeContext)),
       )
       .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+    // ardud missions: guard
+    yield* recordControlWrite(guardAuthority, "thread", launched.threadId, session);
     if (body.origin !== undefined && body.origin.trim().length > 0) {
       yield* store
         .setOrigin(launched.threadId, body.origin.trim())
@@ -883,7 +895,8 @@ const makeRoutes = Effect.gen(function* () {
           attachments: toChatAttachments(body.attachments),
           ...(modelSelection === undefined ? {} : { modelSelection }),
           mode: body.mode ?? "auto",
-          createdBy: "user",
+          // ardud missions: guard - a bearer token is not the owner typing.
+          createdBy: CONTROL_ACTOR,
           creationSource: "server",
         }).pipe(Effect.provide(intakeContext)),
       )
@@ -894,6 +907,8 @@ const makeRoutes = Effect.gen(function* () {
             : fail("conflict", errorDetail(cause)),
         ),
       );
+    // ardud missions: guard
+    yield* recordControlWrite(guardAuthority, "message", result.message.id, session);
     return json({
       ok: true,
       threadId: shell.id,
@@ -929,7 +944,7 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   const respond = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
     const requestId = yield* param("requestId");
     const body = yield* decodeBody(decodeRespondBody);
@@ -992,6 +1007,24 @@ const makeRoutes = Effect.gen(function* () {
         decision,
       };
     }
+    // ardud missions: guard - the answer is judged before the request changes
+    // state, so a routed or knocked answer leaves it pending.
+    const refused = yield* guardControlRespond({
+      session,
+      threadId: ThreadId.make(threadId),
+      requestId,
+      decision: command.type === "runtime-request.respond" ? command.decision : undefined,
+      answers: command.type === "runtime-request.respond" ? command.answers : undefined,
+      dismissed: command.type === "thread.user-input.dismiss",
+      commandId,
+    }).pipe(
+      Effect.as(null),
+      Effect.catchTags({
+        SendRefused: (refusal) => Effect.succeed(controlRefusal(ThreadId.make(threadId), refusal)),
+        SendGuardFailed: (error) => Effect.fail(fail("unavailable", error.message)),
+      }),
+    );
+    if (refused !== null) return refused;
     const result = yield* dispatch(command);
     return json({ ok: true, threadId, requestId, sequence: result.sequence });
   });

@@ -60,7 +60,13 @@ import {
 } from "./webhookTemplate.ts";
 import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerification.ts";
 // ardud missions: router
-import { guardScheduledRun } from "../ardud/missions/router/guardPaths.ts";
+// ardud missions: guard
+import { authorityStore } from "../ardud/missions/guard/authority.ts";
+import {
+  authorizeScheduleChange,
+  guardScheduleRun,
+  recordScheduleAuthority,
+} from "../ardud/missions/guard/schedules.ts";
 
 /** Path prefix of the environment route that receives webhook requests. */
 export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
@@ -399,6 +405,8 @@ export const layer = Layer.effect(
   ScheduledTaskService,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    // ardud missions: guard - who authorized each task, read when it fires.
+    const guardAuthority = authorityStore(sql);
     const crypto = yield* Crypto.Crypto;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -834,7 +842,8 @@ export const layer = Layer.effect(
               )
             : yield* Effect.exit(
                 // ardud missions: router - a run into a mission member thread goes through the guard.
-                guardScheduledRun({
+                // ardud missions: guard - it speaks as the invoker or the recorded authority.
+                guardScheduleRun(guardAuthority, {
                   task: active,
                   targetThreadId: ThreadId.make(active.threadId),
                   text: prompt,
@@ -1087,6 +1096,12 @@ export const layer = Layer.effect(
         // keep their run history, and so real load failures propagate instead
         // of silently resetting an existing row.
         const existingTask = yield* findTask(id);
+        // ardud missions: guard - a change to a bound task is a send into its thread.
+        const principal = yield* authorizeScheduleChange({
+          taskId: id,
+          threads: [existingTask?.threadId, input.threadId],
+          text: input.prompt,
+        });
         // Keep the existing next_run_at when the schedule itself is untouched:
         // editing a title or prompt must not postpone (or resurrect) a due
         // run — only schedule/enabled changes restart the clock.
@@ -1162,7 +1177,12 @@ export const layer = Layer.effect(
           modelSelection: input.modelSelection,
           runtimeMode: input.runtimeMode,
           interactionMode: input.interactionMode,
-          createdBy: existingTask?.createdBy ?? input.createdBy ?? "user",
+          createdBy:
+            existingTask?.createdBy ??
+            // ardud missions: guard - a bearer session cannot stamp its schedule as the owner's.
+            (principal?._tag === "session" ? "system" : undefined) ??
+            input.createdBy ??
+            "user",
           creationSource: input.creationSource ?? "web",
           createdAt: existingTask?.createdAt ?? iso(now),
           updatedAt: iso(now),
@@ -1175,6 +1195,13 @@ export const layer = Layer.effect(
           runCount: existingTask?.runCount ?? 0,
         };
         yield* saveTask(task, input.requireExisting === true, webhook);
+        // ardud missions: guard
+        yield* recordScheduleAuthority(guardAuthority, {
+          taskId: id,
+          principal,
+          previousThreadId: existingTask?.threadId ?? null,
+          threadId: task.threadId,
+        });
         yield* notifyChanged;
         return { task: (yield* findTask(id)) ?? task };
       });
@@ -1183,6 +1210,12 @@ export const layer = Layer.effect(
       Effect.gen(function* () {
         const existing = yield* loadTask(input.id);
         if (existing.enabled === input.enabled) return { task: existing };
+        // ardud missions: guard - resuming delivers the prompt again.
+        const principal = yield* authorizeScheduleChange({
+          taskId: input.id,
+          threads: [existing.threadId],
+          text: input.enabled ? existing.prompt : `Pause the schedule "${existing.title}".`,
+        });
         const now = yield* localNow;
         if (input.enabled && onceRunInPast(existing.schedule, now)) {
           return yield* taskError(ONCE_IN_PAST_MESSAGE, { taskId: input.id });
@@ -1205,6 +1238,10 @@ export const layer = Layer.effect(
         if (updated.length === 0) {
           return yield* taskError("Schedule task not found.", { taskId: input.id });
         }
+        // ardud missions: guard
+        if (input.enabled && principal !== undefined) {
+          yield* guardAuthority.record("scheduled-task", input.id, principal);
+        }
         yield* notifyChanged;
         return {
           task: { ...existing, enabled: input.enabled, nextRunAt: next, updatedAt: iso(now) },
@@ -1212,7 +1249,21 @@ export const layer = Layer.effect(
       });
 
     const deleteTask: ScheduledTaskService["Service"]["delete"] = (input) =>
-      deleteRow(input.id).pipe(
+      // ardud missions: guard - only a caller who may reach the bound thread deletes its task.
+      findTask(input.id).pipe(
+        Effect.flatMap((existing) =>
+          existing === null
+            ? Effect.void
+            : Effect.asVoid(
+                authorizeScheduleChange({
+                  taskId: input.id,
+                  threads: [existing.threadId],
+                  text: `Delete the schedule "${existing.title}".`,
+                }),
+              ),
+        ),
+        Effect.andThen(deleteRow(input.id)),
+        Effect.tap(() => guardAuthority.forget("scheduled-task", input.id)),
         Effect.andThen(
           Effect.all([
             Ref.update(webhookRateWindows, (windows) => {
@@ -1254,6 +1305,12 @@ export const layer = Layer.effect(
         if (task.schedule.type !== "webhook") {
           return yield* taskError("Only webhook tasks have a URL token.", { taskId: input.id });
         }
+        // ardud missions: guard - a new URL is a new way into the bound thread.
+        yield* authorizeScheduleChange({
+          taskId: input.id,
+          threads: [task.threadId],
+          text: `Rotate the webhook URL of the schedule "${task.title}".`,
+        });
         const token = yield* newWebhookToken;
         const now = yield* localNow;
         // Matching created_at keeps a rotation from landing on a task deleted

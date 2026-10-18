@@ -138,6 +138,8 @@ import * as MissionPolicy from "./ardud/missions/policy/PolicyService.ts";
 import { makePolicyWsHandlers } from "./ardud/missions/policy/ws.ts";
 // ardud missions: asks
 import { asksWsHandlers } from "./ardud/missions/asks/ws.ts";
+// ardud missions: guard
+import { makeWsGuard } from "./ardud/missions/guard/ws.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import {
   archivedShellStreamItemFromThreadShell,
@@ -1270,6 +1272,12 @@ const layerWsRpc = (
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const sql = yield* SqlClient.SqlClient;
+      // ardud missions: guard - classify this connection once for the send guard.
+      const missionGuard = makeWsGuard({
+        surface: clientOrigin.surface,
+        session: currentSession,
+        sql,
+      });
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
       const intakeContext = yield* Effect.context<
         | ThreadManagementService.ThreadManagementService
@@ -1580,7 +1588,8 @@ const layerWsRpc = (
                       ...(input.updatedAt === undefined ? {} : { updatedAt: input.updatedAt }),
                     },
                   },
-                  createdBy: "user",
+                  // ardud missions: guard
+                  createdBy: missionGuard.actor,
                   creationSource: "web",
                 }),
               ),
@@ -1916,17 +1925,23 @@ const layerWsRpc = (
             Effect.andThen(
               startup
                 .enqueueCommand(
-                  // A retry also restarts the preparation work the launch owns.
-                  (command.type === "prepared-run.retry"
-                    ? threadLaunch.retryPreparation(command)
-                    : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          createdBy: "user",
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
-                      )
-                  ).pipe(Effect.provide(intakeContext)),
+                  // ardud missions: guard - a non-owner session's text into an
+                  // existing thread goes through the send guard first.
+                  missionGuard.command(command).pipe(
+                    Effect.andThen(
+                      // A retry also restarts the preparation work the launch owns.
+                      (command.type === "prepared-run.retry"
+                        ? threadLaunch.retryPreparation(command)
+                        : ThreadMessageIntake.dispatchCommand(
+                            ThreadManagementService.withCreationProvenance(command, {
+                              createdBy: missionGuard.actor,
+                              creationSource:
+                                "creationSource" in command ? command.creationSource : "web",
+                            }),
+                          )
+                      ).pipe(Effect.provide(intakeContext)),
+                    ),
+                  ),
                 )
                 .pipe(
                   Effect.tap(() => recordClientCommandAnalytics(command)),
@@ -2064,9 +2079,17 @@ const layerWsRpc = (
                               : { context: input.initialMessage.context }),
                           },
                         }),
-                    createdBy: "user",
+                    // ardud missions: guard
+                    createdBy: missionGuard.actor,
                     creationSource: input.creationSource ?? "web",
-                  }).pipe(Effect.provide(intakeContext)),
+                  }).pipe(
+                    Effect.provide(intakeContext),
+                    // ardud missions: guard - reusing an existing thread is a send into it.
+                    (launch) =>
+                      missionGuard
+                        .launch({ ...input, text: input.initialMessage?.text })
+                        .pipe(Effect.andThen(launch)),
+                  ),
                 )
                 .pipe(
                   Effect.tap(() =>
@@ -2114,6 +2137,21 @@ const layerWsRpc = (
                         message: cause.message,
                         cause,
                       }),
+                    // ardud missions: guard
+                    SendRefused: (cause) =>
+                      new OrchestrationV2ThreadLaunchError({
+                        commandId: input.commandId,
+                        projectId: input.projectId,
+                        message: cause.message,
+                        cause,
+                      }),
+                    SendGuardFailed: (cause) =>
+                      new OrchestrationV2ThreadLaunchError({
+                        commandId: input.commandId,
+                        projectId: input.projectId,
+                        message: cause.message,
+                        cause,
+                      }),
                   }),
                 ),
             ),
@@ -2128,26 +2166,36 @@ const layerWsRpc = (
               Effect.andThen(subscribeOrchestrationV2Thread(input)),
             ),
           ),
+        // ardud missions: guard - schedule calls run as this connection, and a
+        // member-bound webhook URL is shown only to its authority.
         [WS_METHODS.scheduledTasksList]: (_input) =>
-          scheduledTasks.list().pipe(Effect.map(withVisibleWebhookUrls)),
+          scheduledTasks
+            .list()
+            .pipe(Effect.map(withVisibleWebhookUrls), Effect.flatMap(missionGuard.visibleWebhooks)),
         [WS_METHODS.scheduledTasksSubscribe]: (_input) =>
-          scheduledTasks.subscribeList().pipe(Stream.map(withVisibleWebhookUrls)),
-        [WS_METHODS.scheduledTasksUpsert]: (input) => scheduledTasks.upsert(input),
+          scheduledTasks
+            .subscribeList()
+            .pipe(
+              Stream.map(withVisibleWebhookUrls),
+              Stream.mapEffect(missionGuard.visibleWebhooks),
+            ),
+        [WS_METHODS.scheduledTasksUpsert]: (input) =>
+          missionGuard.schedules(scheduledTasks.upsert(input)),
         [WS_METHODS.scheduledTasksSetEnabled]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(scheduledTasks.setEnabled(input)),
+            Effect.andThen(missionGuard.schedules(scheduledTasks.setEnabled(input))),
           ),
         [WS_METHODS.scheduledTasksDelete]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(scheduledTasks.delete(input)),
+            Effect.andThen(missionGuard.schedules(scheduledTasks.delete(input))),
           ),
         [WS_METHODS.scheduledTasksRunNow]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(scheduledTasks.runNow(input)),
+            Effect.andThen(missionGuard.schedules(scheduledTasks.runNow(input))),
           ),
         [WS_METHODS.scheduledTasksRotateWebhookToken]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
-            Effect.andThen(scheduledTasks.rotateWebhookToken(input)),
+            Effect.andThen(missionGuard.schedules(scheduledTasks.rotateWebhookToken(input))),
           ),
         [WS_METHODS.secretsAnswerRequest]: (input) =>
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
@@ -2333,7 +2381,18 @@ const layerWsRpc = (
           }),
         [WS_METHODS.mcpAppsCallTool]: (input) => mcpAppRequests.callTool(input),
         [WS_METHODS.mcpAppsToolInfo]: (input) => mcpAppRequests.toolInfo(input),
-        [WS_METHODS.mcpAppsUpdateModelContext]: (input) => mcpAppRequests.updateModelContext(input),
+        [WS_METHODS.mcpAppsUpdateModelContext]: (input) =>
+          // ardud missions: guard - app context reaches the conversation's next turn.
+          missionGuard.modelContext(input).pipe(
+            Effect.mapError(
+              (cause) =>
+                new EnvironmentAuthorizationError({
+                  message: cause.message,
+                  requiredScope: AuthOrchestrationOperateScope,
+                }),
+            ),
+            Effect.andThen(mcpAppRequests.updateModelContext(input)),
+          ),
         [WS_METHODS.mcpAppsReadResource]: (input) => mcpAppRequests.readResource(input),
         [WS_METHODS.providerUploadFeedback]: (input) =>
           Effect.gen(function* () {

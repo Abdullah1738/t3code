@@ -32,6 +32,9 @@ import {
 } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { forkParked } from "../serverActivation.ts";
+// ardud missions: guard
+import { optionalAuthorityStore } from "../ardud/missions/guard/authority.ts";
+import { admitWatchWake } from "../ardud/missions/guard/watches.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { evaluatePullRequestWatch, pullRequestWatchMessage } from "./pullRequestWatch.ts";
@@ -197,6 +200,8 @@ export const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const pullRequests = yield* PullRequestService.PullRequestService;
   const crypto = yield* Crypto.Crypto;
+  // ardud missions: guard
+  const guardAuthority = yield* optionalAuthorityStore;
 
   // Reads in a row that failed, per pull request. Kept in memory: a restart only delays the stop.
   const readFailures = new Map<string, number>();
@@ -226,6 +231,16 @@ export const make = Effect.gen(function* () {
   ) =>
     Effect.gen(function* () {
       const uuid = yield* crypto.randomUUIDv4();
+      // ardud missions: guard - a wake speaks as the watch's initiator; a refused
+      // one is held by the guard, and the watch state is still recorded.
+      const admitted =
+        wake !== undefined &&
+        (yield* admitWatchWake(guardAuthority, {
+          threadId: target.thread.id,
+          link: target.link,
+          text: wake.text,
+          wakeId: uuid,
+        }));
       yield* engine.dispatch({
         type: "thread.pull-request-watch.sync",
         commandId: CommandId.make(`server:pr-watch:${target.thread.id}:${uuid}`),
@@ -233,7 +248,7 @@ export const make = Effect.gen(function* () {
         ...identityOf(target.link),
         startedAt: target.watch.startedAt,
         watch: next,
-        ...(wake === undefined
+        ...(wake === undefined || !admitted
           ? {}
           : { wake: { ...wake, messageId: MessageId.make(`message:pr-watch:${uuid}`) } }),
       });
