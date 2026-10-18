@@ -32,6 +32,7 @@ import {
   type RoleBinding,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -682,25 +683,29 @@ export const make = Effect.gen(function* () {
     return info;
   });
 
-  /** Leases that ran out while the server was down become reconcile-required first. */
+  /**
+   * Leases that ran out while the server was down become reconcile-required
+   * first. Best effort: a failure here never costs the boot incident.
+   */
   const expireHolds = Option.match(policy, {
     onNone: () => Effect.void,
     onSome: (service) =>
       service.expireHolds.pipe(
-        Effect.catchTags({
-          MissionError: (error) =>
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) =>
             Effect.logWarning("missions recovery: expiring pool holds failed", {
-              error: error.message,
+              cause: Cause.pretty(cause),
             }),
-        }),
+        ),
       ),
   });
 
   const detectBoot = lock.withPermit(
     Effect.gen(function* () {
       const info = yield* start;
-      yield* expireHolds;
       yield* Ref.set(bootChecked, true);
+      yield* expireHolds;
       const key = `boot:${info.bootId}`;
       if ((yield* recovery.seenKeys([key])).size > 0) return null;
       const now = yield* nowIso;

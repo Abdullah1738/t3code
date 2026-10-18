@@ -10,6 +10,7 @@ import {
   type RecoveryIncident,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
@@ -428,6 +429,33 @@ it.effect("boot flips policy holds whose lease ran out before planning the resum
     const kinds = (yield* missions.eventsSince(missionId, 0)).map((event) => event.kind);
     assert.isBelow(kinds.indexOf("pool.hold-expired"), kinds.indexOf("recovery.incident-opened"));
     assert.isAtLeast(kinds.indexOf("pool.hold-expired"), 0);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a failing hold expiry never costs the boot incident or later scans", () => {
+  const { layer } = harness({
+    policy: Layer.mock(PolicyService.PolicyService)({
+      expireHolds: Effect.die(new Error("policy store is gone")),
+    }),
+  });
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    const incident = yield* boot;
+    assert.deepStrictEqual(
+      threadsOf(incident).find((thread) => thread.threadId === laneThread)?.action,
+      "resume",
+    );
+    // Scans run once the boot was checked, failure or not.
+    yield* runRow({
+      threadId: laneThread,
+      ordinal: 2,
+      status: "failed",
+      completedAt: plus(RESTART + 120),
+    });
+    yield* TestClock.setTime(T0 + (RESTART + 600) * 1000);
+    const recovery = yield* RecoveryService.RecoveryService;
+    assert.strictEqual((yield* recovery.scan)?.cause, "run-interrupted");
   }).pipe(Effect.provide(layer));
 });
 

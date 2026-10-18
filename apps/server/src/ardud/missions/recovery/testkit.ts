@@ -96,7 +96,13 @@ export interface Sent {
  * A recovery service over an in-memory database with a fake delivery port;
  * `withPolicy` builds the policy service (pools and holds) next to it.
  */
-export const harness = (options: { readonly withPolicy?: boolean } = {}) => {
+export const harness = (
+  options: {
+    readonly withPolicy?: boolean;
+    /** A stand-in policy service, e.g. one whose hold expiry fails. */
+    readonly policy?: Layer.Layer<PolicyService.PolicyService>;
+  } = {},
+) => {
   const fake = {
     sent: [] as Array<Sent>,
     busy: new Set<string>(),
@@ -118,11 +124,13 @@ export const harness = (options: { readonly withPolicy?: boolean } = {}) => {
       timeZone: "UTC",
     }),
   );
-  const policy = options.withPolicy
-    ? PolicyService.layer.pipe(
-        Layer.provideMerge(Layer.mergeAll(PolicyStore.layer, makePorts().layer)),
-      )
-    : Layer.empty;
+  const policy =
+    options.policy ??
+    (options.withPolicy
+      ? PolicyService.layer.pipe(
+          Layer.provideMerge(Layer.mergeAll(PolicyStore.layer, makePorts().layer)),
+        )
+      : Layer.empty);
   const layer = RecoveryService.layer.pipe(
     Layer.provideMerge(Layer.mergeAll(RecoveryStore.layer, delivery, policy)),
     Layer.provideMerge(MissionService.layer),
