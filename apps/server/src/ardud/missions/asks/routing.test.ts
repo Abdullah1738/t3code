@@ -3,8 +3,11 @@ import {
   ApprovalId,
   DraftId,
   RoleId,
+  SubMissionId,
+  WorkItemId,
   type MissionLink,
   type MissionProvenance,
+  type SubMission,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
@@ -15,6 +18,7 @@ import {
   agent,
   failureCode,
   harness,
+  item,
   laneThread,
   masterThread,
   missionId,
@@ -162,6 +166,150 @@ describe("draft routing", () => {
           asks.decideDraft({ draftId: draft.id, action: "approve", revision: 1 }, master),
         ),
       ).toBe("provenance-required");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("routes drafts by the sub-mission or work item they are about", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const missions = yield* MissionService.MissionService;
+      const store = yield* MissionStore.MissionStore;
+      const wave: SubMission = {
+        id: SubMissionId.make("sm-wave"),
+        missionId,
+        title: "Architecture wave",
+        intent: "",
+        order: 0,
+        fillIdleCapacity: false,
+        status: "active",
+        coordinatorRoleId: null,
+        intendedEffort: null,
+        actualEffort: null,
+        health: "unknown",
+        lockedFields: [],
+        createdAt: "2026-10-17T08:00:00.000Z",
+        updatedAt: "2026-10-17T08:00:00.000Z",
+      };
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "sub-mission.created",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "seed",
+          subject: null,
+        },
+        upserts: [
+          { _tag: "sub-mission", record: wave },
+          { _tag: "sub-mission", record: { ...wave, id: SubMissionId.make("sm-other"), order: 1 } },
+          {
+            _tag: "work-item",
+            record: {
+              ...item("wi-wave"),
+              subMissionId: wave.id,
+              pullRequest: { repository: "acme/api", number: 8 },
+            },
+          },
+        ],
+      });
+      yield* missions.setApprovalRouting(master, {
+        missionId,
+        routes: [
+          { id: "wave", match: { _tag: "draft", subMissionId: "sm-wave" }, approver: "master" },
+          {
+            id: "free-email",
+            match: { _tag: "draft", channel: "email", workItemId: "wi-free" },
+            approver: "master",
+          },
+        ],
+        reason: "The wave is routine",
+      });
+
+      // A draft about a work item in the wave goes to the master; its sub-mission is filled in.
+      const aboutItem = yield* asks.submitDraft(
+        { ...draftFor("linear", "Wave item merged."), workItemId: WorkItemId.make("wi-wave") },
+        writer,
+      );
+      expect(aboutItem).toMatchObject({
+        approver: "master",
+        subMissionId: "sm-wave",
+        workItemId: "wi-wave",
+      });
+      const named = yield* asks.submitDraft(
+        { ...draftFor("linear", "Wave plan posted."), subMissionId: wave.id },
+        writer,
+      );
+      expect(named.approver).toBe("master");
+      // Rows that name a sub-mission or work item never match drafts about nothing.
+      const plain = yield* asks.submitDraft(draftFor("linear", "Unrelated update."), writer);
+      expect(plain).toMatchObject({ approver: "owner", subMissionId: null, workItemId: null });
+      const freeEmail = yield* asks.submitDraft(
+        { ...draftFor("email", "Free item done."), workItemId: WorkItemId.make("wi-free") },
+        writer,
+      );
+      expect(freeEmail.approver).toBe("master");
+      const freeLinear = yield* asks.submitDraft(
+        { ...draftFor("linear", "Free item done."), workItemId: WorkItemId.make("wi-free") },
+        writer,
+      );
+      expect(freeLinear.approver).toBe("owner");
+
+      // What a draft says it is about must exist in the mission and agree.
+      expect(
+        yield* failureCode(
+          asks.submitDraft(
+            { ...draftFor("linear", "Ghost."), workItemId: WorkItemId.make("wi-ghost") },
+            writer,
+          ),
+        ),
+      ).toBe("not-found");
+      expect(
+        yield* failureCode(
+          asks.submitDraft(
+            { ...draftFor("linear", "Ghost."), subMissionId: SubMissionId.make("sm-ghost") },
+            writer,
+          ),
+        ),
+      ).toBe("not-found");
+      expect(
+        yield* failureCode(
+          asks.submitDraft(
+            {
+              ...draftFor("linear", "Mixed."),
+              subMissionId: SubMissionId.make("sm-other"),
+              workItemId: WorkItemId.make("wi-wave"),
+            },
+            writer,
+          ),
+        ),
+      ).toBe("invalid");
+
+      // crw's draft on the wave item's pull request is about that item.
+      const review = yield* asks.openSystemDraft(
+        {
+          missionId,
+          draftId: DraftId.make("d-review"),
+          requestedBy: "crw",
+          audience: "acme/api#8",
+          channel: "github",
+          target: pullRequest,
+          head: "c".repeat(40),
+          text: "Feedback required: fix the retry.",
+        },
+        crw,
+      );
+      expect(review).toMatchObject({ approver: "master", workItemId: "wi-wave" });
+
+      const opened = (yield* store.eventsSince(missionId, 0, 500)).find(
+        (event) => event.kind === "draft.opened" && event.subject?.id === aboutItem.id,
+      );
+      expect(opened?.payload).toMatchObject({
+        routeId: "wave",
+        subMissionId: "sm-wave",
+        workItemId: "wi-wave",
+      });
     }).pipe(Effect.provide(layer));
   });
 

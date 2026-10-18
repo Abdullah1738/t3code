@@ -34,6 +34,7 @@ import {
   SetMissionFocusInput,
   SetMissionStatusInput,
   SplitLaneInput,
+  SubMissionId,
   TrimmedNonEmptyString,
   UpdateForkInput,
   UpdateMissionInput,
@@ -43,6 +44,7 @@ import {
   UpsertRuleInput,
   UpsertWorkItemInput,
   WithdrawAskInput,
+  WorkItemId,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
@@ -203,7 +205,7 @@ const MissionCallTool = Tool.make("mission_call", {
 
 const MissionDraftTool = Tool.make("mission_draft", {
   description:
-    "Submit outward text (Linear, GitHub, Cliq, iMessage, WhatsApp, email) as a draft for its approver (the routing table picks owner or master); nothing is sent. Load mission_drafts guideFor first. Refused when your role does not write public text: hand the text to a writer role. To answer a rewrite request pass draftId and the new text.",
+    "Submit outward text (Linear, GitHub, Cliq, iMessage, WhatsApp, email) as a draft for its approver (the routing table picks owner or master); nothing is sent. Load mission_drafts guideFor first. Pass workItemId and/or subMissionId when the text is about one, so routing rows for it apply (the sub-mission defaults to the work item's, then your lane's). Refused when your role does not write public text: hand the text to a writer role. To answer a rewrite request pass draftId and the new text.",
   parameters: Schema.Struct({
     draftId: Schema.optional(DraftId),
     missionId: Schema.optional(MissionId),
@@ -211,6 +213,8 @@ const MissionDraftTool = Tool.make("mission_draft", {
     channel: Schema.optional(DraftChannel),
     target: Schema.optional(MissionLink),
     text: TrimmedNonEmptyString,
+    subMissionId: Schema.optional(SubMissionId),
+    workItemId: Schema.optional(WorkItemId),
   }),
   success: Schema.Struct({ draft: Schema.Unknown }),
   failure: OrchestratorMcpFailure,

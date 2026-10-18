@@ -963,6 +963,10 @@ export const Draft = Schema.Struct({
   sentLink: Schema.optional(Schema.NullOr(MissionLink)),
   /** Why the last send failed; cleared when a later send succeeds. */
   sendError: Schema.optional(Schema.NullOr(Schema.String)),
+  /** The sub-mission it is about; routing rows can match it. Missing means none. */
+  subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
+  /** The work item it is about; routing rows can match it. Missing means none. */
+  workItemId: Schema.optional(Schema.NullOr(WorkItemId)),
   // --- end asks additions ---
 });
 export type Draft = typeof Draft.Type;
@@ -1056,6 +1060,12 @@ export const ApprovalRouteMatch = Schema.Union([
     channel: Schema.optional(DraftChannel),
     audience: Schema.optional(TrimmedNonEmptyString),
     person: Schema.optional(TrimmedNonEmptyString),
+    // --- asks additions ---
+    /** Drafts about this sub-mission id (named by the writer, or its work item's or lane's). */
+    subMissionId: Schema.optional(TrimmedNonEmptyString),
+    /** Drafts about this work item id. */
+    workItemId: Schema.optional(TrimmedNonEmptyString),
+    // --- end asks additions ---
   }),
 ]);
 export type ApprovalRouteMatch = typeof ApprovalRouteMatch.Type;

@@ -26,6 +26,7 @@ import {
   type MissionActor,
   type MissionEvent,
   type MissionFork,
+  type MissionLink,
   type MissionMessage,
   type MissionProvenance,
   type MissionRecordRef,
@@ -57,7 +58,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
-import { cleanAnnotation, routeApprover } from "../core/approvals.ts";
+import { cleanAnnotation } from "../core/approvals.ts";
 import { isMasterAnywhere } from "../core/master.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
@@ -79,15 +80,18 @@ import {
   closeStaleDraft,
   decideDraft,
   draftExamples,
+  type DraftAbout,
   type DraftExample,
   epochOf,
   notesFor,
   openSystemDraft,
+  pullRequestKeyOf,
   reopenDraft,
   reportDraftSent,
   reviseDraft,
   revisionOf,
   routeDraft,
+  routeDraftApprover,
   saveDraftNote,
   submitDraft,
   systemDraftDecision,
@@ -733,6 +737,62 @@ const make = Effect.gen(function* () {
     return { kind: "editor", ref: null };
   };
 
+  /**
+   * What a writer's draft is about. The work item and sub-mission must be the mission's; the
+   * sub-mission defaults to the work item's, then to the writer's lane's.
+   */
+  const draftAbout = (input: SubmitDraftInput, standing: Standing) =>
+    Effect.gen(function* () {
+      const item =
+        input.workItemId === undefined
+          ? null
+          : Option.getOrNull(yield* store.get("work-item", input.workItemId));
+      if (input.workItemId !== undefined && item?.missionId !== input.missionId) {
+        return yield* fail(
+          "not-found",
+          `No work item ${input.workItemId} in mission ${input.missionId}.`,
+        );
+      }
+      if (input.subMissionId !== undefined) {
+        const named = Option.getOrNull(yield* store.get("sub-mission", input.subMissionId));
+        if (named?.missionId !== input.missionId) {
+          return yield* fail(
+            "not-found",
+            `No sub-mission ${input.subMissionId} in mission ${input.missionId}.`,
+          );
+        }
+        if (item?.subMissionId != null && item.subMissionId !== input.subMissionId) {
+          return yield* fail(
+            "invalid",
+            `Work item ${item.id} is in sub-mission ${item.subMissionId}, not ${input.subMissionId}.`,
+          );
+        }
+      }
+      const about: DraftAbout = {
+        subMissionId:
+          input.subMissionId ?? item?.subMissionId ?? standing.lanes[0]?.subMissionId ?? null,
+        workItemId: item?.id ?? null,
+      };
+      return about;
+    });
+
+  /** A system draft is about the work item that owns its pull request, when exactly one does. */
+  const systemDraftAbout = (missionId: MissionId, target: MissionLink) =>
+    Effect.gen(function* () {
+      const key = pullRequestKeyOf(target);
+      if (key === null) return { subMissionId: null, workItemId: null } satisfies DraftAbout;
+      const owners = (yield* store.list("work-item", { missionId })).filter(
+        (item) =>
+          item.pullRequest !== null &&
+          item.pullRequest.number === key.number &&
+          item.pullRequest.repository.toLowerCase() === key.repository.toLowerCase(),
+      );
+      const [only] = owners;
+      return owners.length === 1 && only !== undefined
+        ? ({ subMissionId: only.subMissionId, workItemId: only.id } satisfies DraftAbout)
+        : ({ subMissionId: null, workItemId: null } satisfies DraftAbout);
+    });
+
   const submitDraftCommand = (input: SubmitDraftInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const { cast, standing } = yield* standingIn(input.missionId, provenance);
@@ -766,13 +826,9 @@ const make = Effect.gen(function* () {
                 candidate.threadId === speaking.threadId,
             );
       const notes = yield* allDraftNotes(input.missionId);
+      const about = yield* draftAbout(input, standing);
       // A draft names one audience; routes match it as the person as well.
-      const route = routeApprover(cast.mission?.approvalRouting, {
-        _tag: "draft",
-        channel: input.channel,
-        audience: input.audience,
-        person: input.audience,
-      });
+      const route = routeDraftApprover(cast.mission?.approvalRouting, input, about);
       const existing = yield* store.list("draft", {
         missionId: input.missionId,
         status: ["pending", "rewrite-requested"],
@@ -790,6 +846,7 @@ const make = Effect.gen(function* () {
           caller: standing.caller,
           route,
           writtenBy: { roleId: drafting?.id ?? null, model: binding?.observedModel ?? null },
+          about,
           notes,
           existing,
           now: yield* now,
@@ -996,6 +1053,7 @@ const make = Effect.gen(function* () {
       const mission = yield* need("mission", input.missionId);
       const current = Option.getOrNull(yield* store.get("draft", input.draftId));
       const annotation = yield* cleanAnnotation({ summary: null, flags: [] }, input);
+      const about = yield* systemDraftAbout(input.missionId, input.target);
       const opened = yield* fromOutcome(
         openSystemDraft({
           input,
@@ -1006,12 +1064,8 @@ const make = Effect.gen(function* () {
             missionId: input.missionId,
             status: ["pending", "rewrite-requested"],
           }),
-          route: routeApprover(mission.approvalRouting, {
-            _tag: "draft",
-            channel: input.channel,
-            audience: input.audience,
-            person: input.audience,
-          }),
+          route: routeDraftApprover(mission.approvalRouting, input, about),
+          about,
           notes: yield* allDraftNotes(input.missionId),
           now: yield* now,
         }),
