@@ -5,11 +5,13 @@
  * recorded apart from its lineage (see `forkCreator`).
  */
 import type { OrchestrationV2DomainEvent, ThreadId } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import type * as SqlClient from "effect/sql/SqlClient";
 import type * as SqlError from "effect/sql/SqlError";
 
 import { guardSender, type SendGuardFailed, type SendRefused } from "../router/guardPaths.ts";
-import type { AuthorityStore } from "./authority.ts";
+import { ensureAuthorityTable, type AuthorityStore } from "./authority.ts";
 import { principalKey, type GuardPrincipal } from "./principal.ts";
 
 /**
@@ -71,4 +73,39 @@ export const recordChildCreators = (
         : Effect.void;
     },
     { discard: true },
+  );
+
+/**
+ * Children created before their creators were recorded get their parent as
+ * creator. Runs at each startup (one pass over the thread projections); a
+ * recorded creator is never replaced.
+ */
+export const backfillChildCreators = (sql: SqlClient.SqlClient): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    yield* ensureAuthorityTable(sql);
+    const recordedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* sql`
+      INSERT INTO ardud_mission_guard_authority (kind, subject_id, principal_json, recorded_at)
+      SELECT
+        'fork',
+        thread_id,
+        json_object(
+          '_tag', 'thread',
+          'threadId', json_extract(payload_json, '$.lineage.parentThreadId'),
+          'title', ''
+        ),
+        ${recordedAt}
+      FROM orchestration_v2_projection_threads
+      WHERE CASE WHEN json_valid(payload_json) THEN
+        json_extract(payload_json, '$.lineage.relationshipToParent') = 'subagent'
+        AND json_type(payload_json, '$.lineage.parentThreadId') = 'text'
+        ELSE 0 END
+      ON CONFLICT (kind, subject_id) DO NOTHING
+    `;
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("missions guard: could not record creators of earlier children", {
+        cause,
+      }),
+    ),
   );

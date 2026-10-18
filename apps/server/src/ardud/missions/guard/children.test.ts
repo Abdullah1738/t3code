@@ -178,6 +178,42 @@ describe("children spawned by a thread (router r3 sponsorship)", () => {
     }).pipe(Effect.provide(layer)),
   );
 
+  it.effect("children from before the guard get their parent as creator at startup", () =>
+    Effect.gen(function* () {
+      yield* seed;
+      const sql = yield* SqlClient.SqlClient;
+      const store = authorityStore(sql);
+      const now = yield* DateTime.now;
+      const master = rootThread(masterThread, now);
+      const earlier = childOf(master, ThreadId.make("t-earlier"), "provider", now);
+      const owned = childOf(master, ThreadId.make("t-owned"), "provider", now);
+      yield* write(master);
+      yield* write(earlier, owned);
+      // As if both were made before creators were recorded, one since claimed by the owner.
+      yield* store.bind("fork", earlier.id, null);
+      yield* store.bind("fork", owned.id, {
+        _tag: "owner",
+        provenance: { _tag: "owner-app", surface: "web", sessionId: "s-1" },
+      });
+      assert.strictEqual((yield* toMaster(earlier.id))._tag, "knock");
+
+      // The next server start builds the event sink again.
+      const memoMap = yield* Layer.makeMemoMap;
+      yield* Effect.scoped(
+        Effect.flatMap(Effect.scope, (scope) =>
+          Layer.buildWithMemoMap(EventSink.layer, memoMap, scope),
+        ),
+      );
+      assert.deepStrictEqual(yield* forkCreator(store, earlier.id), {
+        _tag: "thread",
+        threadId: masterThread,
+        title: "",
+      });
+      assert.strictEqual((yield* toMaster(earlier.id))._tag, "route");
+      assert.strictEqual((yield* forkCreator(store, owned.id))?._tag, "owner");
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.effect("a child is never created without its recorded creator", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

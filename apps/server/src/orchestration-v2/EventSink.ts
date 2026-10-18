@@ -35,7 +35,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 // ardud missions: guard
 import { authorityStore } from "../ardud/missions/guard/authority.ts";
-import { recordChildCreators } from "../ardud/missions/guard/forks.ts";
+import { backfillChildCreators, recordChildCreators } from "../ardud/missions/guard/forks.ts";
 
 /**
  * ERRORS
@@ -227,6 +227,7 @@ const layerBase: Layer.Layer<
     const sql = yield* SqlClient.SqlClient;
     // ardud missions: guard
     const guardAuthority = authorityStore(sql);
+    yield* backfillChildCreators(sql);
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
