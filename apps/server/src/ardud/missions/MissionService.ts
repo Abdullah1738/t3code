@@ -30,7 +30,7 @@ import * as Option from "effect/Option";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-import type { MissionEditor } from "./core/ports.ts";
+import type { MissionEditor, MissionRecoveryReader } from "./core/ports.ts";
 import { HEALTH_TTL_MS, makeReads } from "./core/reads.ts";
 import { sameValue } from "./core/rules.ts";
 import { makeWrites } from "./core/writes.ts";
@@ -158,6 +158,9 @@ export class MissionService extends Context.Service<
     readonly changes: Stream.Stream<MissionStreamItem>;
     /** The scribe's editor; replaces core's own bottom line, feed and FYI ranking. */
     readonly registerEditor: (editor: MissionEditor) => Effect.Effect<void>;
+    // ardud missions: recovery
+    /** The recovery track's overview badge ("Recovered from restart at HH:MM"). */
+    readonly registerRecovery: (reader: MissionRecoveryReader) => Effect.Effect<void>;
 
     readonly createMission: Write<CreateMissionInput>;
     readonly updateMission: Write<UpdateMissionInput>;
@@ -177,7 +180,13 @@ export class MissionService extends Context.Service<
 const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
   let editor: MissionEditor | null = null;
-  const reads = makeReads(store, () => editor);
+  // ardud missions: recovery
+  let recovery: MissionRecoveryReader | null = null;
+  const reads = makeReads(
+    store,
+    () => editor,
+    () => recovery,
+  );
   const writes = yield* makeWrites(store);
 
   /** Subscribes before reading the snapshot so nothing between the two is lost. */
@@ -333,6 +342,11 @@ const make = Effect.gen(function* () {
     registerEditor: (next) =>
       Effect.sync(() => {
         editor = next;
+      }),
+    // ardud missions: recovery
+    registerRecovery: (next) =>
+      Effect.sync(() => {
+        recovery = next;
       }),
     ...writes,
   });

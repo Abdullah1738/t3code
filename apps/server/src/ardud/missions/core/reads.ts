@@ -17,7 +17,7 @@ import * as Option from "effect/Option";
 
 import type * as MissionStore from "../store/MissionStore.ts";
 import { countLanes, judgeHealth } from "./health.ts";
-import type { MissionEditor } from "./ports.ts";
+import type { MissionEditor, MissionRecoveryReader } from "./ports.ts";
 import {
   buildBlockers,
   buildCriticalPath,
@@ -88,6 +88,8 @@ const notFound = (missionId: string) =>
 export const makeReads = (
   store: MissionStore.MissionStore["Service"],
   currentEditor: () => MissionEditor | null,
+  // ardud missions: recovery
+  currentRecovery: () => MissionRecoveryReader | null = () => null,
 ) => {
   const healthCache = new Map<string, HealthEntry>();
 
@@ -208,6 +210,9 @@ export const makeReads = (
       const entry = yield* healthOf(missionId, { subMissions, lanes, openAsks, milestones });
       const editor = currentEditor();
       const view = editor === null ? null : yield* editor.view(missionId);
+      // ardud missions: recovery
+      const recovery = currentRecovery();
+      const recoveryState = recovery === null ? null : yield* recovery.state(missionId);
       return {
         mission: { ...mission.value, health: entry.mission },
         subMissions: withHealth(subMissions, entry),
@@ -229,6 +234,8 @@ export const makeReads = (
         feed: view?.feed ?? buildFeed({ events, notes, since }),
         lanes: countLanes(lanes),
         ownerLastLookedAt: since,
+        // ardud missions: recovery
+        recovery: recoveryState,
       };
     });
 
