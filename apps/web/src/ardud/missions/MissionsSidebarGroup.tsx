@@ -1,6 +1,6 @@
 import { memo, useCallback, useMemo, useState } from "react";
 import { Link, useLocation, useParams } from "@tanstack/react-router";
-import { ChevronRightIcon, InboxIcon } from "lucide-react";
+import { ChevronRightIcon, InboxIcon, LayersIcon } from "lucide-react";
 import * as Schema from "effect/Schema";
 
 import type { Lane, MissionId, MissionListItem } from "@t3tools/contracts";
@@ -77,6 +77,7 @@ export function MissionsSidebarGroup() {
       {expanded ? (
         <ul className="flex flex-col gap-0.5">
           <InboxRow count={totalNeedsYou(missions)} onNavigate={closeMobileSidebar} />
+          <PortfolioRow onNavigate={closeMobileSidebar} />
           {missions.map((mission) => (
             <MissionSidebarRow
               key={mission.id}
@@ -212,6 +213,29 @@ function InboxRow(props: { count: number; onNavigate: () => void }) {
             {badgeCount(props.count)}
           </span>
         ) : null}
+      </Link>
+    </li>
+  );
+}
+
+function PortfolioRow(props: { onNavigate: () => void }) {
+  const isActive = useLocation({
+    select: (location) => location.pathname === "/missions/portfolio",
+  });
+  return (
+    <li>
+      <Link
+        to="/missions/portfolio"
+        onClick={props.onNavigate}
+        aria-current={isActive ? "page" : undefined}
+        className={cn(
+          rowClassName,
+          "gap-2 ps-2 pe-1 text-sm font-medium text-sidebar-foreground",
+          isActive ? "bg-sidebar-row-active" : "hover:bg-sidebar-row-hover",
+        )}
+      >
+        <LayersIcon aria-hidden className="size-3.5 shrink-0 text-sidebar-muted-foreground" />
+        <span className="min-w-0 flex-1 truncate">Portfolio</span>
       </Link>
     </li>
   );

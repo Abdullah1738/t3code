@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 
-import type { MissionId, MissionOverview, RoomId } from "@t3tools/contracts";
+import type { MissionId, RoomId } from "@t3tools/contracts";
 import { healthLabel } from "@t3tools/client-runtime/ardud/missions";
 
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
@@ -17,11 +17,16 @@ import { WorkspacePageContainer } from "../../components/WorkspacePageContainer"
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { cn } from "../../lib/utils";
+import { LanesTab } from "./LanesTab";
 import { MissionSummary } from "./MissionHeader";
 import { MissionOverviewTab } from "./MissionOverviewTab";
 import { MISSION_TAB_LABEL, MISSION_TABS, type MissionTab } from "./missionSearch";
 import { useMissionOverview } from "./missionsStore";
+import { RolesTab } from "./RolesTab";
 import { RoomsTab } from "./RoomsTab";
+import { RulesTab } from "./RulesTab";
+import { TimelineTab } from "./TimelineTab";
+import { WorkTab } from "./WorkTab";
 import { HEALTH_DOT_CLASS } from "./missionTone";
 import { useNowMs } from "./useNowMs";
 
@@ -84,8 +89,20 @@ export function MissionPage(props: {
                   />
                 ) : props.tab === "rooms" ? (
                   <RoomsTab missionId={props.missionId} roomId={props.roomId} nowMs={nowMs} />
+                ) : props.tab === "lanes" ? (
+                  <LanesTab overview={overview} nowMs={nowMs} />
+                ) : props.tab === "work" ? (
+                  <WorkTab missionId={props.missionId} nowMs={nowMs} />
+                ) : props.tab === "rules" ? (
+                  <RulesTab
+                    missionId={props.missionId}
+                    subMissions={overview.subMissions}
+                    nowMs={nowMs}
+                  />
+                ) : props.tab === "roles" ? (
+                  <RolesTab missionId={props.missionId} nowMs={nowMs} />
                 ) : (
-                  <TabPlaceholder tab={props.tab} overview={overview} />
+                  <TimelineTab missionId={props.missionId} />
                 )}
               </>
             )}
@@ -123,30 +140,6 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
         })}
       </ul>
     </nav>
-  );
-}
-
-const TAB_PLACEHOLDER: Record<Exclude<MissionTab, "overview" | "rooms">, string> = {
-  lanes: "Every lane with its status, last evidence and context gauge. Coming in a later round.",
-  work: "Tickets, PRs and deploys moving through review, merge and readback. Coming in a later round.",
-  rules: "Standing rules, the review policy and change requests. Coming in a later round.",
-  roles: "Roles, their models and who writes public text. Coming in a later round.",
-  timeline: "The mission's history and its living brief. Coming in a later round.",
-};
-
-function TabPlaceholder(props: {
-  tab: Exclude<MissionTab, "overview" | "rooms">;
-  overview: MissionOverview;
-}) {
-  return (
-    <div className="flex rounded-lg border border-dashed border-border/70">
-      <Empty size="compact">
-        <EmptyHeader>
-          <EmptyTitle>{MISSION_TAB_LABEL[props.tab]}</EmptyTitle>
-          <EmptyDescription>{TAB_PLACEHOLDER[props.tab]}</EmptyDescription>
-        </EmptyHeader>
-      </Empty>
-    </div>
   );
 }
 
