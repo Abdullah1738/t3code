@@ -10,9 +10,9 @@
  * against `--target` (an empty in-memory store when omitted) and prints the
  * report. Nothing is written anywhere except the report file.
  *
- * `--apply` writes core records into `--target`, which must be a scratch copy
- * (never the live Robob database; the running server owns that one). The live
- * import runs inside the server once the router can take rooms and messages.
+ * `--apply` writes core records and the router's rooms, messages,
+ * subscriptions and read positions into `--target`, which must be a scratch
+ * copy (never the live Robob database; the running server owns that one).
  */
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
@@ -21,8 +21,11 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+// ardud missions: router (router tables back the import's router side)
+import { routerImportSink } from "../router/adapters.ts";
+import * as RouterStore from "../router/RouterStore.ts";
 import * as MissionStore from "../store/MissionStore.ts";
-import { applyImport, diffImport, memoryRouterSink } from "./apply.ts";
+import { applyImport, diffImport } from "./apply.ts";
 import { buildImportPlan } from "./mapping.ts";
 import { readSources } from "./readers.ts";
 import { renderReport } from "./report.ts";
@@ -62,13 +65,11 @@ const paths = {
 
 const plan = buildImportPlan(readSources(paths), { missionId: values.mission });
 const target = values.target ?? ":memory:";
-// The router has no tables yet; an empty in-memory sink stands in for it.
-const router = memoryRouterSink();
 
 const program = Effect.gen(function* () {
-  const diff = yield* diffImport(plan, router.sink);
-  // Router parts are only diffed here: with no router tables there is nowhere real to write them.
-  const applied = values.apply ? yield* applyImport(plan, null) : undefined;
+  const router = yield* routerImportSink;
+  const diff = yield* diffImport(plan, router);
+  const applied = values.apply ? yield* applyImport(plan, router) : undefined;
   return renderReport({
     plan,
     diff,
@@ -82,12 +83,14 @@ const program = Effect.gen(function* () {
     against:
       target === ":memory:"
         ? "empty store and empty router (in memory)"
-        : `store ${target}; router: empty in-memory stand-in (diffed, never written)`,
+        : `store and router tables in ${target}`,
     ...(applied === undefined ? {} : { applied }),
   });
 }).pipe(
   Effect.provide(
-    MissionStore.layer.pipe(Layer.provide(NodeSqliteClient.layer({ filename: target }))),
+    Layer.mergeAll(MissionStore.layer, RouterStore.layer).pipe(
+      Layer.provide(NodeSqliteClient.layer({ filename: target })),
+    ),
   ),
 );
 

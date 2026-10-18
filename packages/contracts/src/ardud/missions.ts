@@ -599,6 +599,14 @@ export const Knock = Schema.Struct({
   forwardedTo: Schema.NullOr(MissionActor),
   decidedAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
+  // --- router additions ---
+  /** The member thread the sender tried to reach. */
+  targetThreadId: Schema.optional(ThreadId),
+  /**
+   * What kind of sender knocked. For anything but a thread, `fromThreadId`
+   * is a label such as `control-api:<subject>`, not a real thread.
+   */
+  senderKind: Schema.optional(Schema.Literals(["thread", "session", "mcp-client", "schedule"])),
 });
 export type Knock = typeof Knock.Type;
 
@@ -1456,6 +1464,10 @@ export const MissionEventKind = Schema.Literals([
   "draft.sent",
   "knock.received",
   "knock.decided",
+  // --- router additions ---
+  "message.posted",
+  "send.guarded",
+  "member.changed",
   "pool.created",
   "pool.updated",
   "pool.hold-taken",
@@ -1763,6 +1775,61 @@ export const MarkReadInput = Schema.Struct({
   seq: NonNegativeInt,
 });
 export type MarkReadInput = typeof MarkReadInput.Type;
+
+// --- router additions ---
+
+/** Open a room: the newest page, or the page before `beforeSeq` for older messages. */
+export const RoomPageInput = Schema.Struct({
+  roomId: RoomId,
+  beforeSeq: Schema.optional(PositiveInt),
+  /** Defaults to 50, at most 200. */
+  limit: Schema.optional(PositiveInt),
+});
+export type RoomPageInput = typeof RoomPageInput.Type;
+
+/** Load one message body when it is opened. */
+export const MessageBodyInput = Schema.Struct({
+  messageId: MissionMessageId,
+});
+export type MessageBodyInput = typeof MessageBodyInput.Type;
+
+/** The rooms of one mission. */
+export const MissionRoomsInput = Schema.Struct({
+  missionId: MissionId,
+});
+export type MissionRoomsInput = typeof MissionRoomsInput.Type;
+
+/** Join, retune or mute a room for one subscriber. */
+export const SubscribeRoomInput = Schema.Struct({
+  roomId: RoomId,
+  subscriber: MissionActor,
+  mode: SubscriptionMode,
+  /** Kinds that wake the subscriber. Defaults to request, blocker and control in wake mode. */
+  wakeOn: Schema.optional(Schema.Array(MissionMessageKind)),
+});
+export type SubscribeRoomInput = typeof SubscribeRoomInput.Type;
+
+/**
+ * Who a membership is for: an owner-attached thread, or a control-API
+ * session registered as a mission service (crw, the coord shim, watchers).
+ */
+export const MissionMemberPrincipal = Schema.Union([
+  Schema.TaggedStruct("thread", { threadId: ThreadId }),
+  Schema.TaggedStruct("session", {
+    sessionId: TrimmedNonEmptyString,
+    label: TrimmedNonEmptyString,
+  }),
+]);
+export type MissionMemberPrincipal = typeof MissionMemberPrincipal.Type;
+
+/** Owner only: attach or detach a thread, or register or drop a service session. */
+export const SetMissionMemberInput = Schema.Struct({
+  missionId: MissionId,
+  principal: MissionMemberPrincipal,
+  /** False detaches. */
+  member: Schema.Boolean,
+});
+export type SetMissionMemberInput = typeof SetMissionMemberInput.Type;
 
 export const ReorderSubMissionsInput = Schema.Struct({
   missionId: MissionId,
