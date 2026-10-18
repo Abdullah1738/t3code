@@ -59,20 +59,12 @@ export function markMissionSeen(missionId: MissionId) {
   return runMissionAction(missionsSource.markMissionSeen({ missionId }), "Could not mark as seen");
 }
 
-/** Parses "40", "40%" or "0.4"; an empty field hands the share back to the master. */
+/** Parses "40", "40%" or "0.4"; an empty field clears the share. */
 export function setIntendedShare(subMissionId: SubMissionId, text: string) {
   const parsed = parseShareInput(text);
   return submitMissionInput(
     parsed.ok ? { ok: true, value: { subMissionId, share: parsed.share } } : parsed,
     (input) => missionsSource.setIntendedEffort(input),
-    "Couldn't change the share",
-  );
-}
-
-/** Unlocks the field so the master's proposal shows again. */
-export function handBackIntendedShare(subMissionId: SubMissionId) {
-  return runMissionAction(
-    missionsSource.setIntendedEffort({ subMissionId, share: null }),
     "Couldn't change the share",
   );
 }

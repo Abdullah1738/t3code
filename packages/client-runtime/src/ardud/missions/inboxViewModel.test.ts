@@ -20,6 +20,7 @@ import {
   INITIAL_INBOX_UI,
   inboxEntries,
   inboxKeyAction,
+  inboxTabCounts,
   inboxUiReducer,
   keepSelection,
   moveSelection,
@@ -28,7 +29,7 @@ import {
   suggestionTrackRecord,
   waitingLabel,
 } from "./inboxViewModel.ts";
-import type { MissionForkEntry } from "./source.ts";
+import type { Approver, MissionForkEntry, MissionInboxSnapshot } from "./source.ts";
 
 const T0 = "2026-10-17T08:00:00.000Z";
 const NOW = Date.parse("2026-10-17T08:33:00.000Z");
@@ -120,8 +121,27 @@ const suggestion = (overrides: Record<string, unknown> = {}) =>
     ...overrides,
   });
 
-const emptyInbox = (overrides: Record<string, unknown> = {}) =>
-  decodeInbox({
+const approval = (id: string, createdAt: string) => ({
+  id,
+  missionId: "m",
+  kind: "merge",
+  title: `Merge ${id}`,
+  detail: "",
+  requestedBy: "crw",
+  links: [],
+  status: "pending",
+  staleReason: null,
+  decidedBy: null,
+  decidedAt: null,
+  createdAt,
+});
+
+/** A routed inbox; every draft and approval goes to the owner unless `routes` says master. */
+const emptyInbox = (
+  overrides: Record<string, unknown> = {},
+  routes: Record<string, Approver> = {},
+): MissionInboxSnapshot => {
+  const inbox = decodeInbox({
     revision: 1,
     counts: { decide: 0, approve: 0, knocks: 0, suggestions: 0, fyi: 0 },
     asks: [],
@@ -132,6 +152,23 @@ const emptyInbox = (overrides: Record<string, unknown> = {}) =>
     fyi: [],
     ...overrides,
   });
+  const routed = <T extends { readonly id: string }>(record: T) => ({
+    ...record,
+    approver: routes[record.id] ?? ("owner" as const),
+    route: { _tag: "fallback" as const },
+  });
+  const drafts = inbox.drafts.map(routed);
+  const approvals = inbox.approvals.map(routed);
+  return {
+    ...inbox,
+    drafts,
+    approvals,
+    masterCounts: {
+      approve: [...drafts, ...approvals].filter((r) => r.approver === "master").length,
+      suggestions: inbox.suggestions.filter((s) => s.acceptor === "master").length,
+    },
+  };
+};
 
 describe("Decide", () => {
   it("shows the recommendation as advice and never preselects it", () => {
@@ -185,27 +222,49 @@ describe("tabs and keyboard selection", () => {
   it("mixes drafts and approvals newest first on Approve", () => {
     const inbox = emptyInbox({
       drafts: [draft({ id: "d-old", createdAt: "2026-10-17T07:00:00.000Z" })],
-      approvals: [
-        {
-          id: "a-new",
-          missionId: "m",
-          kind: "merge",
-          title: "Merge #1",
-          detail: "",
-          requestedBy: "crw",
-          links: [],
-          status: "pending",
-          staleReason: null,
-          decidedBy: null,
-          decidedAt: null,
-          createdAt: "2026-10-17T08:00:00.000Z",
-        },
-      ],
+      approvals: [approval("a-new", "2026-10-17T08:00:00.000Z")],
     });
     expect(inboxEntries(inbox, "approve").map((entry) => entry.key)).toEqual([
       "approval:a-new",
       "draft:d-old",
     ]);
+  });
+
+  it("shows what is routed to the owner by default and the master's records on the filter", () => {
+    const inbox = emptyInbox(
+      {
+        asks: [ask()],
+        drafts: [draft({ id: "d-mine" }), draft({ id: "d-master" })],
+        approvals: [approval("a-master", "2026-10-17T07:00:00.000Z")],
+        suggestions: [
+          suggestion({ id: "s-master" }),
+          suggestion({ id: "s-mine", acceptor: "owner" }),
+        ],
+        counts: { decide: 1, approve: 1, knocks: 0, suggestions: 1, fyi: 0 },
+      },
+      { "d-master": "master", "a-master": "master" },
+    );
+    expect(inboxEntries(inbox, "approve").map((entry) => entry.key)).toEqual(["draft:d-mine"]);
+    expect(inboxEntries(inbox, "approve", "master").map((entry) => entry.key)).toEqual([
+      "draft:d-master",
+      "approval:a-master",
+    ]);
+    expect(inboxEntries(inbox, "suggestions").map((entry) => entry.key)).toEqual([
+      "suggestion:s-mine",
+    ]);
+    expect(inboxEntries(inbox, "suggestions", "master").map((entry) => entry.key)).toEqual([
+      "suggestion:s-master",
+    ]);
+    // Asks are always the owner's.
+    expect(inboxEntries(inbox, "decide", "master")).toEqual([]);
+    expect(inboxTabCounts(inbox, "master")).toEqual({
+      decide: 0,
+      approve: 2,
+      knocks: 0,
+      suggestions: 1,
+      fyi: 0,
+    });
+    expect(defaultInboxTab(inbox, "master")).toBe("approve");
   });
 
   it("moves with j/k and clamps at the ends", () => {

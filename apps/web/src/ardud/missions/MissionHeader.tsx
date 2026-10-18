@@ -29,9 +29,11 @@ import {
   Menu,
   MenuGroup,
   MenuGroupLabel,
+  MenuItem,
   MenuPopup,
   MenuRadioGroup,
   MenuRadioItem,
+  MenuSeparator,
   MenuTrigger,
 } from "../../components/ui/menu";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../components/ui/popover";
@@ -40,8 +42,6 @@ import { setMissionFocus, toggleMissionPaused } from "./missionCommands";
 import { AskTheMissionForm, MissionForksList } from "./MissionForksList";
 import { useMissionForks, useMissionList } from "./missionsStore";
 import { HEALTH_BADGE_VARIANT, LANE_DOT_CLASS } from "./missionTone";
-
-const NO_FOCUS = "none";
 
 /** Goal, milestone countdown, health, usage and the owner's mission controls. */
 export function MissionSummary(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
@@ -116,36 +116,32 @@ function FocusMenu(props: { overview: MissionOverview }) {
     () => priorityStack(props.overview.subMissions),
     [props.overview.subMissions],
   );
+  const focusOn = mission.focusSubMissionId !== null;
   const focused = rows.find((row) => row.subMission.id === mission.focusSubMissionId);
+  const focusTitle = focused?.subMission.title ?? "a closed sub-mission";
+  // Focus has no end time: it stays on until someone ends it here (or the master does).
   const setFocus = (value: unknown) => {
-    const subMissionId =
-      typeof value === "string" && value !== NO_FOCUS ? (value as SubMissionId) : null;
-    if (subMissionId === mission.focusSubMissionId) return;
-    void setMissionFocus(mission.id, subMissionId);
+    if (typeof value !== "string" || value === mission.focusSubMissionId) return;
+    void setMissionFocus(mission.id, value as SubMissionId);
   };
   return (
     <Menu>
       <MenuTrigger
         render={
           <Button
-            variant={focused ? "secondary" : "outline"}
+            variant={focusOn ? "secondary" : "outline"}
             size="sm"
-            aria-label={focused ? `Focus: ${focused.subMission.title}` : "Focus mode"}
+            aria-label={focusOn ? `Focus: ${focusTitle}` : "Focus mode"}
           />
         }
       >
         <CrosshairIcon aria-hidden />
-        <span className="max-w-48 truncate">
-          {focused ? `Focus: ${focused.subMission.title}` : "Focus"}
-        </span>
+        <span className="max-w-48 truncate">{focusOn ? `Focus: ${focusTitle}` : "Focus"}</span>
       </MenuTrigger>
       <MenuPopup align="start" side="bottom">
         <MenuGroup>
           <MenuGroupLabel>Only this sub-mission takes new work</MenuGroupLabel>
-          <MenuRadioGroup value={mission.focusSubMissionId ?? NO_FOCUS} onValueChange={setFocus}>
-            <MenuRadioItem value={NO_FOCUS} closeOnClick>
-              No focus
-            </MenuRadioItem>
+          <MenuRadioGroup value={mission.focusSubMissionId ?? ""} onValueChange={setFocus}>
             {rows
               .filter((row) => row.subMission.status === "active")
               .map((row) => (
@@ -155,6 +151,12 @@ function FocusMenu(props: { overview: MissionOverview }) {
               ))}
           </MenuRadioGroup>
         </MenuGroup>
+        {focusOn ? (
+          <>
+            <MenuSeparator />
+            <MenuItem onClick={() => void setMissionFocus(mission.id, null)}>End focus</MenuItem>
+          </>
+        ) : null}
       </MenuPopup>
     </Menu>
   );

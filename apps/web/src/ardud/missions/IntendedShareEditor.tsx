@@ -2,37 +2,34 @@ import { useState } from "react";
 
 import {
   formatPercent,
-  INTENDED_EFFORT_SOURCE_LABEL,
+  intendedShareLine,
   type PriorityStackRow,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../components/ui/popover";
-import { handBackIntendedShare, setIntendedShare } from "./missionCommands";
+import { setIntendedShare } from "./missionCommands";
 
 // Presentation plus form state. Parsing and the source call live in
-// missionCommands; the source locks the field on an owner edit.
+// missionCommands. Nothing locks: the owner and the master write the same
+// field, and the row says who changed it last.
 
-/**
- * The intended share on one priority-stack row: who set it and an editor.
- * The master proposes; an owner edit locks the field until handed back.
- */
-export function IntendedShareEditor(props: { row: PriorityStackRow }) {
+/** The intended share on one priority-stack row: who changed it last and an editor. */
+export function IntendedShareEditor(props: { row: PriorityStackRow; masterRoleId: string | null }) {
   const { row } = props;
   const sub = row.subMission;
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const changedLine = intendedShareLine(row, props.masterRoleId);
 
-  const run = async (action: Promise<boolean>) => {
+  const submit = async () => {
     setBusy(true);
-    const sent = await action;
+    const sent = await setIntendedShare(sub.id, text);
     setBusy(false);
     if (sent) setOpen(false);
   };
-  const submit = () => void run(setIntendedShare(sub.id, text));
-  const handBack = () => void run(handBackIntendedShare(sub.id));
 
   return (
     <Popover
@@ -46,12 +43,10 @@ export function IntendedShareEditor(props: { row: PriorityStackRow }) {
         render={<Button variant="ghost" size="xs" />}
         aria-label={`Intended share for ${sub.title}: ${
           row.intended === null ? "none" : formatPercent(row.intended)
-        }, ${INTENDED_EFFORT_SOURCE_LABEL[row.intendedBy]}`}
+        }, ${changedLine}`}
       >
         {row.intended === null ? "set share" : formatPercent(row.intended)}
-        <span className="text-muted-foreground">
-          {INTENDED_EFFORT_SOURCE_LABEL[row.intendedBy]}
-        </span>
+        <span className="text-muted-foreground">{changedLine}</span>
       </PopoverTrigger>
       <PopoverPopup align="end" side="bottom" className="w-64">
         <PopoverTitle>Intended share for {sub.title}</PopoverTitle>
@@ -59,7 +54,7 @@ export function IntendedShareEditor(props: { row: PriorityStackRow }) {
           className="mt-2 flex flex-col gap-2"
           onSubmit={(event) => {
             event.preventDefault();
-            submit();
+            void submit();
           }}
         >
           <Input
@@ -72,14 +67,9 @@ export function IntendedShareEditor(props: { row: PriorityStackRow }) {
             onChange={(event) => setText(event.target.value)}
           />
           <p className="text-xs text-muted-foreground">
-            Your value locks the field; the master can't overwrite it.
+            The master can change it too. Leave it empty to clear the share.
           </p>
-          <div className="flex flex-wrap justify-end gap-2">
-            {row.intendedBy === "owner" ? (
-              <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={handBack}>
-                Hand back to master
-              </Button>
-            ) : null}
+          <div className="flex justify-end">
             <Button type="submit" size="sm" disabled={busy}>
               Save
             </Button>

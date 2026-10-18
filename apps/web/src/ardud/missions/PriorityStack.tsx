@@ -19,6 +19,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { GripVerticalIcon } from "lucide-react";
 
 import type { Mission, SubMission, SubMissionId } from "@t3tools/contracts";
+import type { FieldChange } from "@t3tools/client-runtime/ardud/missions";
 import {
   effortNote,
   formatPercent,
@@ -43,9 +44,14 @@ import { MissionSection } from "./MissionSection";
 export function PriorityStack(props: {
   mission: Mission;
   subMissions: ReadonlyArray<SubMission>;
+  changes: ReadonlyArray<FieldChange>;
   highlightId: string | null;
 }) {
-  const rows = useMemo(() => priorityStack(props.subMissions), [props.subMissions]);
+  const rows = useMemo(
+    () => priorityStack(props.subMissions, props.changes),
+    [props.subMissions, props.changes],
+  );
+  const masterRoleId = props.mission.masterRoleId;
   const sourceOrder = useMemo(() => rows.map((row) => row.subMission.id), [rows]);
   // Optimistic order while the source applies a drag; cleared when it lands.
   const [pendingOrder, setPendingOrder] = useState<ReadonlyArray<SubMissionId> | null>(null);
@@ -54,7 +60,7 @@ export function PriorityStack(props: {
     () => new Map(rows.map((row) => [row.subMission.id, row] as const)),
     [rows],
   );
-  const note = useMemo(() => effortNote(rows), [rows]);
+  const note = useMemo(() => effortNote(rows, masterRoleId), [rows, masterRoleId]);
   const planned = useMemo(() => intendedTotal(rows), [rows]);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -72,7 +78,7 @@ export function PriorityStack(props: {
   return (
     <MissionSection
       title="Priority stack"
-      caption="Bar: master effort, last 24h. Tick: intended share (master proposes, you can set it)."
+      caption="Bar: master effort, last 24h. Tick: intended share (you or the master can set it)."
     >
       <DndContext
         sensors={sensors}
@@ -89,6 +95,7 @@ export function PriorityStack(props: {
                 <PriorityStackItem
                   key={id}
                   row={row}
+                  masterRoleId={masterRoleId}
                   position={index + 1}
                   focused={props.mission.focusSubMissionId === id}
                   highlighted={props.highlightId === id}
@@ -113,6 +120,7 @@ export function PriorityStack(props: {
 
 function PriorityStackItem(props: {
   row: PriorityStackRow;
+  masterRoleId: string | null;
   position: number;
   focused: boolean;
   highlighted: boolean;
@@ -192,7 +200,7 @@ function PriorityStackItem(props: {
         )}
       >
         {actual === null ? "–" : formatPercent(actual)}
-        <IntendedShareEditor row={row} />
+        <IntendedShareEditor row={row} masterRoleId={props.masterRoleId} />
       </span>
       <EffortBar actual={actual} intended={intended} label={effortLabel} drift={row.drift} />
     </li>

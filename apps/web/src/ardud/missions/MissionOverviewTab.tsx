@@ -15,13 +15,16 @@ import {
   formatCountdown,
   formatDayLabel,
   formatRelative,
+  formatTimeOfDay,
   isDraftFeedItem,
   openForkFor,
   orderBlockerGroups,
+  recoveryBanner,
   refKey,
   refLabel,
   sinceLastLookedLabel,
   splitFeed,
+  type MissionOverviewSnapshot,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Badge } from "../../components/ui/badge";
@@ -35,13 +38,14 @@ import { PriorityStack } from "./PriorityStack";
 
 /** Problems first: bottom line, what blocks, what to re-check, then the queue and the feed. */
 export function MissionOverviewTab(props: {
-  overview: MissionOverview;
+  overview: MissionOverviewSnapshot;
   nowMs: number;
   highlightSubMissionId: string | null;
 }) {
   const { overview, nowMs } = props;
   return (
     <div className="flex min-w-0 flex-col gap-4">
+      <RecoveryLine overview={overview} />
       <BottomLine overview={overview} nowMs={nowMs} />
       <div className="grid min-w-0 gap-4 lg:grid-cols-2">
         <Blockers groups={overview.blockers} missionId={overview.mission.id} />
@@ -51,10 +55,27 @@ export function MissionOverviewTab(props: {
       <PriorityStack
         mission={overview.mission}
         subMissions={overview.subMissions}
+        changes={overview.changes}
         highlightId={props.highlightSubMissionId}
       />
       <Feed overview={overview} nowMs={nowMs} />
     </div>
+  );
+}
+
+/** Shown while a restart incident still has threads to resume or decide. */
+function RecoveryLine(props: { overview: MissionOverviewSnapshot }) {
+  const line = recoveryBanner(props.overview.recovery, (iso) => formatTimeOfDay(iso));
+  if (!line) return null;
+  return (
+    <Link
+      to="/missions/$missionId"
+      params={{ missionId: props.overview.mission.id }}
+      search={{ tab: "roles" }}
+      className="rounded-lg border border-warning/40 bg-warning/8 px-4 py-2 text-sm text-foreground"
+    >
+      {line}
+    </Link>
   );
 }
 

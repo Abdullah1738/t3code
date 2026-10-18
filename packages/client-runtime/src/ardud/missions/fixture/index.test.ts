@@ -1,7 +1,6 @@
 import {
   type DraftNote,
   type MissionId,
-  type MissionInbox,
   type MissionListSnapshot,
   type MissionOverview,
   MissionError,
@@ -15,8 +14,10 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import type {
+  ApprovalRoutingTable,
   MissionForkEntry,
   MissionInboxHistory,
+  MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionRoomEntry,
 } from "../source.ts";
@@ -61,8 +62,10 @@ describe("fixture missions source", () => {
       "Observability",
     ]);
     expect(foldLaneCounts(crpko!.lanes).line).toBe("37 lanes: 21 working, 2 stuck, 14 idle");
-    // One open ask, two pending drafts, four crw approvals (one more closed as stale), one knock.
-    expect(crpko?.needsYou).toBe(8);
+    // One open ask, one knock, and what is routed to the owner: one draft (the
+    // other was moved to the master) and three crw approvals (crpko-devops goes
+    // to the master by the repo rule; one more closed as stale).
+    expect(crpko?.needsYou).toBe(6);
     expect(crpko?.subMissions.find((s) => s.id === "crpko-releases")?.needsYou).toBe(1);
     expect(juno?.status).toBe("paused");
     list.close();
@@ -110,7 +113,7 @@ describe("fixture missions source", () => {
 
   it("answering an ask clears it from needs-you and from the owner's blockers", async () => {
     const source = createFixtureMissionsSource({ now });
-    const inbox = latest<MissionInbox>((l) => source.subscribeInbox(CRPKO, l));
+    const inbox = latest<MissionInboxSnapshot>((l) => source.subscribeInbox(CRPKO, l));
     const overview = latest<MissionOverview | null>((l) => source.subscribeOverview(CRPKO, l));
     const ask = inbox.value.asks[0]!;
     await source.answerAsk({ askId: ask.id, optionId: ask.options[1]!.id, text: "" });
@@ -169,7 +172,7 @@ describe("fixture missions source", () => {
 
   it("answers post into the ask's room with owner provenance and only wake the asker", async () => {
     const source = createFixtureMissionsSource({ now });
-    const inbox = latest<MissionInbox>((l) => source.subscribeInbox(CRPKO, l));
+    const inbox = latest<MissionInboxSnapshot>((l) => source.subscribeInbox(CRPKO, l));
     const release = latest<RoomPage | null>((l) =>
       source.subscribeRoom("room-release" as RoomId, l),
     );
@@ -190,7 +193,7 @@ describe("fixture missions source", () => {
 
   it("keeps the edited text on an approved draft and refuses an empty rewrite note", async () => {
     const source = createFixtureMissionsSource({ now });
-    const inbox = latest<MissionInbox>((l) => source.subscribeInbox(CRPKO, l));
+    const inbox = latest<MissionInboxSnapshot>((l) => source.subscribeInbox(CRPKO, l));
     const history = latest<MissionInboxHistory>((l) => source.subscribeInboxHistory(CRPKO, l));
     const [first, second] = inbox.value.drafts;
     await expect(
@@ -205,10 +208,12 @@ describe("fixture missions source", () => {
 
   it("shows crw approvals pending and the moved head as closed stale", () => {
     const source = createFixtureMissionsSource({ now });
-    const inbox = latest<MissionInbox>((l) => source.subscribeInbox(CRPKO, l));
+    const inbox = latest<MissionInboxSnapshot>((l) => source.subscribeInbox(CRPKO, l));
     const history = latest<MissionInboxHistory>((l) => source.subscribeInboxHistory(CRPKO, l));
     expect(inbox.value.approvals).toHaveLength(4);
-    expect(inbox.value.counts.approve).toBe(6);
+    // Two drafts and four approvals pending; four wait on the owner, two on the master.
+    expect(inbox.value.counts.approve).toBe(4);
+    expect(inbox.value.masterCounts.approve).toBe(2);
     expect(history.value.approvals.map((a) => a.status)).toEqual(["stale-closed"]);
   });
 
@@ -231,7 +236,7 @@ describe("fixture missions source", () => {
 
   it("counts decided suggestions into their author's acceptance record", async () => {
     const source = createFixtureMissionsSource({ now });
-    const inbox = latest<MissionInbox>((l) => source.subscribeInbox(CRPKO, l));
+    const inbox = latest<MissionInboxSnapshot>((l) => source.subscribeInbox(CRPKO, l));
     const stats = latest<ReadonlyArray<SuggestionStats>>((l) => source.subscribeSuggestionStats(l));
     const scribe = () =>
       stats.value.find((row) => row.author === "scribe" && row.targetKind === "schedule")!;
@@ -248,7 +253,7 @@ describe("fixture missions source", () => {
 
   it("acks an FYI note out of the inbox", async () => {
     const source = createFixtureMissionsSource({ now });
-    const inbox = latest<MissionInbox>((l) => source.subscribeInbox(CRPKO, l));
+    const inbox = latest<MissionInboxSnapshot>((l) => source.subscribeInbox(CRPKO, l));
     const first = inbox.value.fyi[0]!;
     await source.ackNote({ noteId: first.id as NoteId });
     expect(inbox.value.fyi.some((n) => n.id === first.id)).toBe(false);
@@ -294,22 +299,187 @@ describe("fixture missions source", () => {
     expect(inCheck()).toBe(false);
   });
 
-  it("an owner edit of intended effort locks the field; handing back restores the proposal", async () => {
+  it("records who last changed the intended share and locks nothing", async () => {
     const source = createFixtureMissionsSource({ now });
     const overview = latest<MissionOverviewSnapshot | null>((l) =>
       source.subscribeOverview(CRPKO, l),
     );
     const wave = () => overview.value!.subMissions.find((s) => s.id === "crpko-arch-wave")!;
-    const proposed = wave().intendedEffort;
+    const changeOf = (id: string) =>
+      overview.value!.changes.find((c) => c.ref.id === id && c.field === "intendedEffort");
+    // The seeded log has a mix: the master set the wave's share, the owner set releases'.
+    expect(changeOf("crpko-arch-wave")?.actor).toEqual({ _tag: "role", roleId: "crpko-master" });
+    expect(changeOf("crpko-releases")?.actor).toEqual({ _tag: "owner" });
+
     await source.setIntendedEffort({ subMissionId: wave().id, share: 0.6 });
     expect(wave().intendedEffort).toBe(0.6);
-    expect(wave().lockedFields).toContain("intendedEffort");
+    expect(wave().lockedFields).not.toContain("intendedEffort");
+    expect(changeOf("crpko-arch-wave")?.actor).toEqual({ _tag: "owner" });
     await expect(
       source.setIntendedEffort({ subMissionId: wave().id, share: 1.4 }),
     ).rejects.toBeInstanceOf(MissionError);
     await source.setIntendedEffort({ subMissionId: wave().id, share: null });
-    expect(wave().intendedEffort).toBe(proposed);
-    expect(wave().lockedFields).not.toContain("intendedEffort");
+    expect(wave().intendedEffort).toBeNull();
+  });
+
+  it("ends focus only when it is turned off, and logs both", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const overview = latest<MissionOverviewSnapshot | null>((l) =>
+      source.subscribeOverview(CRPKO, l),
+    );
+    await source.setMissionFocus({
+      missionId: CRPKO,
+      subMissionId: "crpko-releases" as SubMissionId,
+    });
+    expect(overview.value!.mission.focusSubMissionId).toBe("crpko-releases");
+    await source.setMissionFocus({ missionId: CRPKO, subMissionId: null });
+    expect(overview.value!.mission.focusSubMissionId).toBeNull();
+    const timeline = latest<ReadonlyArray<{ readonly summary: string }>>((l) =>
+      source.subscribeTimeline(CRPKO, l),
+    );
+    expect(timeline.value.slice(0, 2).map((e) => e.summary)).toEqual([
+      "Ended focus",
+      "Focus on Releases and dev environment",
+    ]);
+  });
+
+  it("routes drafts and approvals at creation and lets the owner decide either inbox", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const inbox = latest<MissionInboxSnapshot>((l) => source.subscribeInbox(CRPKO, l));
+    const routing = latest<ApprovalRoutingTable | null>((l) => source.subscribeRouting(CRPKO, l));
+    const approverOf = (id: string) =>
+      [...inbox.value.drafts, ...inbox.value.approvals].find((r) => r.id === id)?.approver;
+
+    expect(approverOf("approval-crpko-devops-759")).toBe("master");
+    expect(approverOf("approval-backoffice-core-334")).toBe("owner");
+    // Moved by the master with a reason.
+    const moved = inbox.value.drafts.find((d) => d.id === "draft-dylan-bo-334")!;
+    expect(moved.approver).toBe("master");
+    expect(moved.route._tag).toBe("rerouted");
+    // Who changed each routing rule last: v1 by the master, v2 additions by the owner.
+    const ruleChange = (id: string) => routing.value!.changes.find((c) => c.field === id)?.actor;
+    expect(ruleChange("route-draft-github")).toEqual({ _tag: "role", roleId: "crpko-master" });
+    expect(ruleChange("route-approval-crpko-devops")).toEqual({ _tag: "owner" });
+
+    // Editing the table never moves what already exists.
+    const table = routing.value!;
+    await source.setApprovalRouting({
+      missionId: CRPKO,
+      expectedVersion: table.version,
+      draftRules: table.draftRules,
+      approvalRules: table.approvalRules.filter((r) => r.id !== "route-approval-crpko-devops"),
+    });
+    expect(routing.value!.version).toBe(table.version + 1);
+    expect(approverOf("approval-crpko-devops-759")).toBe("master");
+    await expect(
+      source.setApprovalRouting({
+        missionId: CRPKO,
+        expectedVersion: table.version,
+        draftRules: [],
+        approvalRules: [],
+      }),
+    ).rejects.toBeInstanceOf(MissionError);
+
+    // A single record moves with a reason; without one it is refused.
+    await expect(
+      source.rerouteRecord({
+        kind: "approval",
+        id: "approval-crpko-devops-759",
+        approver: "owner",
+        reason: " ",
+      }),
+    ).rejects.toBeInstanceOf(MissionError);
+    await source.rerouteRecord({
+      kind: "approval",
+      id: "approval-crpko-devops-759",
+      approver: "owner",
+      reason: "I want to see this one.",
+    });
+    expect(approverOf("approval-crpko-devops-759")).toBe("owner");
+    expect(inbox.value.counts.approve).toBe(5);
+
+    // The owner can decide a record that waits on the master.
+    await source.decideDraft({ draftId: moved.id, action: "drop" });
+    expect(inbox.value.drafts.some((d) => d.id === moved.id)).toBe(false);
+    expect(inbox.value.masterCounts.approve).toBe(0);
+  });
+
+  it("starts a routing table from nothing and refuses bad or clashing rules", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const routing = latest<ApprovalRoutingTable | null>((l) => source.subscribeRouting(JUNO, l));
+    expect(routing.value).toBeNull();
+    const rule = (id: string, name: string) => ({
+      id,
+      match: { _tag: "person" as const, name },
+      approver: "master" as const,
+    });
+    await expect(
+      source.setApprovalRouting({
+        missionId: JUNO,
+        expectedVersion: 0,
+        draftRules: [rule("a", " ")],
+        approvalRules: [],
+      }),
+    ).rejects.toMatchObject({ code: "invalid" });
+    await expect(
+      source.setApprovalRouting({
+        missionId: JUNO,
+        expectedVersion: 0,
+        draftRules: [rule("a", "Pavan"), rule("b", "pavan")],
+        approvalRules: [],
+      }),
+    ).rejects.toMatchObject({ code: "invalid" });
+    await source.setApprovalRouting({
+      missionId: JUNO,
+      expectedVersion: 0,
+      draftRules: [rule("a", "Pavan")],
+      approvalRules: [],
+    });
+    expect(routing.value?.version).toBe(1);
+    expect(routing.value?.changes.find((c) => c.field === "a")?.actor).toEqual({ _tag: "owner" });
+  });
+
+  it("keeps a rule's version and acks unless its wording, scope or activation change", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const rules = latest<ReadonlyArray<Rule>>((l) => source.subscribeRules(CRPKO, l));
+    const rule104 = () => rules.value.find((r) => r.id === "rule-104")!;
+    const before = rule104();
+    const same = await source.upsertRule({
+      ruleId: before.id,
+      missionId: before.missionId,
+      title: before.title,
+      quote: before.quote,
+    });
+    expect(same).toBe(before);
+    await source.upsertRule({
+      ruleId: before.id,
+      missionId: before.missionId,
+      title: before.title,
+      quote: before.quote,
+      status: "retired",
+    });
+    expect(rule104()).toMatchObject({ status: "retired", version: before.version });
+    expect(rule104().acks).toEqual(before.acks);
+    await source.upsertRule({
+      ruleId: before.id,
+      missionId: before.missionId,
+      title: before.title,
+      quote: before.quote,
+      activation: "Always",
+    });
+    expect(rule104().version).toBe(before.version + 1);
+  });
+
+  it("lists a draft routed to the master under the master's blockers", () => {
+    const source = createFixtureMissionsSource({ now });
+    const overview = latest<MissionOverviewSnapshot | null>((l) =>
+      source.subscribeOverview(CRPKO, l),
+    );
+    const holderOf = (id: string) =>
+      overview.value!.blockers.find((group) => group.items.some((item) => item.id === id))
+        ?.holderLabel;
+    expect(holderOf("draft-dylan-bo-334")).toBe("master");
+    expect(holderOf("draft-pavan-risk-124")).toBe("you");
   });
 
   it("carries the pool usage line on the overview", () => {

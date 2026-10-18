@@ -12,7 +12,7 @@ import type {
   SubMission,
 } from "@t3tools/contracts";
 
-import type { MissionPoolUsage } from "./source.ts";
+import type { FieldChange, MissionPoolUsage } from "./source.ts";
 
 // Pure view helpers shared by the web and mobile mission screens. Everything
 // here takes contract snapshots and returns display-ready values, so both
@@ -338,40 +338,37 @@ export function refLabel(ref: Pick<MissionRecordRef, "id" | "label">): string {
 
 export type EffortDrift = "over" | "under" | "even" | "unknown";
 
-/**
- * Who set the intended share. The master proposes shares; an owner edit locks
- * the field (contract `lockedFields`) so the master cannot overwrite it.
- */
-export type IntendedEffortSource = "owner" | "master" | "none";
-
+/** Event-log field name for a sub-mission's intended share. */
 export const INTENDED_EFFORT_FIELD = "intendedEffort";
 
 export interface PriorityStackRow {
   readonly subMission: SubMission;
-  /** 1-based position in the owner's order. */
+  /** 1-based position in the mission's order. */
   readonly position: number;
   readonly intended: number | null;
-  readonly intendedBy: IntendedEffortSource;
+  /**
+   * Who last changed the intended share (owner or master, same method, no
+   * lock). `null` when no logged change touched it, e.g. an imported value.
+   */
+  readonly intendedChange: FieldChange | null;
   readonly actual: number | null;
   readonly drift: EffortDrift;
 }
 
-export function intendedEffortSource(
-  subMission: Pick<SubMission, "intendedEffort" | "lockedFields">,
-): IntendedEffortSource {
-  if (subMission.lockedFields.includes(INTENDED_EFFORT_FIELD)) return "owner";
-  return subMission.intendedEffort === null ? "none" : "master";
+/** "last changed by master", "no share set", or "not changed since import". */
+export function intendedShareLine(
+  row: Pick<PriorityStackRow, "intended" | "intendedChange">,
+  masterRoleId: string | null,
+): string {
+  if (row.intendedChange) {
+    return `last changed by ${actorLabel(row.intendedChange.actor, masterRoleId)}`;
+  }
+  return row.intended === null ? "no share set" : "not changed since import";
 }
 
-export const INTENDED_EFFORT_SOURCE_LABEL: Record<IntendedEffortSource, string> = {
-  owner: "set by you",
-  master: "proposed by master",
-  none: "no share set",
-};
-
 /**
- * Reads what the owner typed as a share: "40", "40%", "0.4" all mean 40%.
- * Empty means "hand back to the master". Returns an error for anything else.
+ * Reads a typed share: "40", "40%", "0.4" all mean 40%. Empty clears the
+ * share. Returns an error for anything else.
  */
 export function parseShareInput(
   text: string,
@@ -410,8 +407,19 @@ export function effortDrift(intended: number | null, actual: number | null): Eff
   return "even";
 }
 
-/** Open sub-missions in the owner's order (closed ones drop out of the stack). */
-export function priorityStack(subMissions: ReadonlyArray<SubMission>): PriorityStackRow[] {
+/**
+ * Open sub-missions in the mission's order (closed ones drop out of the
+ * stack). `changes` is the overview's field-change list.
+ */
+export function priorityStack(
+  subMissions: ReadonlyArray<SubMission>,
+  changes: ReadonlyArray<FieldChange> = [],
+): PriorityStackRow[] {
+  const intendedChanges = new Map(
+    changes
+      .filter((c) => c.ref.kind === "sub-mission" && c.field === INTENDED_EFFORT_FIELD)
+      .map((c) => [c.ref.id, c]),
+  );
   return [...subMissions]
     .filter((subMission) => subMission.status !== "closed")
     .sort((left, right) => left.order - right.order || left.title.localeCompare(right.title))
@@ -419,17 +427,20 @@ export function priorityStack(subMissions: ReadonlyArray<SubMission>): PriorityS
       subMission,
       position: index + 1,
       intended: subMission.intendedEffort,
-      intendedBy: intendedEffortSource(subMission),
+      intendedChange: intendedChanges.get(subMission.id) ?? null,
       actual: subMission.actualEffort,
       drift: effortDrift(subMission.intendedEffort, subMission.actualEffort),
     }));
 }
 
 /**
- * One sentence about the biggest gap between where effort went and where the
- * owner wants it, or `null` when effort roughly follows the order.
+ * One sentence about the biggest gap between where effort went and the
+ * intended share, or `null` when effort roughly follows the order.
  */
-export function effortNote(rows: ReadonlyArray<PriorityStackRow>): string | null {
+export function effortNote(
+  rows: ReadonlyArray<PriorityStackRow>,
+  masterRoleId: string | null = null,
+): string | null {
   let worst: PriorityStackRow | null = null;
   let worstGap = 0;
   for (const row of rows) {
@@ -444,8 +455,9 @@ export function effortNote(rows: ReadonlyArray<PriorityStackRow>): string | null
   const actual = formatPercent(worst.actual ?? 0);
   const intended = formatPercent(worst.intended ?? 0);
   const name = worst.subMission.title;
-  const target =
-    worst.intendedBy === "owner" ? `you set ${intended}` : `master proposed ${intended}`;
+  const target = worst.intendedChange
+    ? `${actorLabel(worst.intendedChange.actor, masterRoleId)} set ${intended}`
+    : `the plan is ${intended}`;
   return worst.drift === "over"
     ? `${name} (${ordinal(worst.position)}) took ${actual} of the effort; ${target}.`
     : `${name} (${ordinal(worst.position)}) got ${actual} of the effort; ${target}.`;
@@ -609,6 +621,26 @@ export function formatDayLabel(atIso: string, timeZone?: string): string {
   const atMs = Date.parse(atIso);
   if (!Number.isFinite(atMs)) return "";
   return formatter.format(atMs).replace(",", "");
+}
+
+const timeOfDayFormatters = new Map<string, Intl.DateTimeFormat>();
+
+/** "15:41" in the reader's time zone (or `timeZone` when given). */
+export function formatTimeOfDay(atIso: string, timeZone?: string): string {
+  const key = timeZone ?? "";
+  let formatter = timeOfDayFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      ...(timeZone ? { timeZone } : {}),
+    });
+    timeOfDayFormatters.set(key, formatter);
+  }
+  const atMs = Date.parse(atIso);
+  if (!Number.isFinite(atMs)) return "";
+  return formatter.format(atMs);
 }
 
 // ---------------------------------------------------------------------------

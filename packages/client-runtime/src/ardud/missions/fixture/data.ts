@@ -1,10 +1,10 @@
 // Fixture records for the Missions screens, taken from the real Crpko
 // coordinator state on Sat 17 Oct 2026 (~08:33 UTC): coord events, the 08:05
 // owner update, the lane roster and the PR backlog. Lane names, tickets, PRs and
-// decisions are real. Thread ids are left out on purpose.
+// decisions are real. Lane threads, roles and models live in `opsData.ts`.
 //
-// Fixture-made values (no live source yet): the intended effort shares (marked
-// as master proposals), the mission's usage share, the knock, the draft texts
+// Fixture-made values (no live source yet): the intended effort shares (who
+// last changed each is in `opsData.ts` events), the mission's usage share, the knock, the draft texts
 // and draft notes, suggestion counts and the two editor/governor suggestions.
 // Measured effort is each sub-mission's share of coord events in the 24h
 // before 08:33. Room messages are real coord summaries (`roomMessages.ts`).
@@ -15,18 +15,18 @@
 import type { MissionPoolUsage } from "../source.ts";
 import { controlReceipts, messageRows, roomMembers } from "./roomMessages.ts";
 
-const AT = (time: string, day = 17) => `2026-10-${day}T${time}:00.000Z`;
+export const AT = (time: string, day = 17) => `2026-10-${day}T${time}:00.000Z`;
 
 export const FIXTURE_NOW = AT("08:33");
 export const OWNER_LAST_LOOKED_AT = AT("05:06");
 const MONDAY = "2026-10-19T05:00:00.000Z";
-const CREATED = AT("00:00", 2);
+export const CREATED = AT("00:00", 2);
 
-const CRPKO = "crpko-engineering";
-const JUNO = "juno-intents";
+export const CRPKO = "crpko-engineering";
+export const JUNO = "juno-intents";
 
-const ROLE_MASTER = "crpko-master";
-const ROLE_ARCH = "crpko-arch";
+export const ROLE_MASTER = "crpko-master";
+export const ROLE_ARCH = "crpko-arch";
 
 export const SUB = {
   wave: "crpko-arch-wave",
@@ -639,7 +639,7 @@ export const lanes = [
   ),
 ];
 
-const masterActor = { _tag: "role", roleId: ROLE_MASTER };
+export const masterActor = { _tag: "role", roleId: ROLE_MASTER };
 
 export const asks = [
   {
@@ -678,7 +678,7 @@ export const asks = [
   },
 ];
 
-const github = (repo: string, number: number) => ({
+export const github = (repo: string, number: number) => ({
   kind: "pull-request",
   label: `${repo}#${number}`,
   url: `https://github.com/Equicom-Crypto/${repo}/pull/${number}`,
@@ -1557,64 +1557,3 @@ export const roomSubscriptions = roomDefs.flatMap((def) => [
     createdAt: CREATED,
   },
 ]);
-
-const rule = (
-  id: string,
-  number: number,
-  title: string,
-  quote: string,
-  masterReading: string,
-  quotedAt: string,
-) => ({
-  id,
-  missionId: CRPKO,
-  number,
-  title,
-  quote,
-  quotedAt,
-  provenance: { _tag: "import", source: "STANDING-RULES" },
-  masterReading,
-  scope: { subMissionIds: [], roleKinds: [], laneIds: [] },
-  activation: "",
-  status: "active",
-  version: 1,
-  acks: [],
-  appliedCount: 0,
-  brokenCount: 0,
-  lastReliedAt: null,
-  lockedFields: [],
-  createdAt: quotedAt,
-  updatedAt: quotedAt,
-});
-
-/**
- * The three newest Crpko standing rules. Rule 103 is the owner's words; the
- * 104 and 105 quotes are the master's broadcast wording (controls 10136,
- * 10141), since the owner's originals are not in the copied state.
- */
-export const rules = [
-  rule(
-    "rule-103",
-    103,
-    "Owner questions never default",
-    "Always wait for my answer. If a master can't decide wait on it. Anything the answer blocks should wait on it, and anything it doesn't and all other lanes should continue freely",
-    "Owner questions have no default or deadline; only the branch the answer blocks waits, everything else continues; a 'default X if no answer' blocker is not a go.",
-    AT("01:04"),
-  ),
-  rule(
-    "rule-104",
-    104,
-    "PR factories ramp up",
-    "Factories ramp to 10 Haiku workers and 25 open PRs each.",
-    "Non-Monday PRs are review-queued; Sol fires at the Codex reset.",
-    AT("07:34"),
-  ),
-  rule(
-    "rule-105",
-    105,
-    "Withdrawal-failure tickets go to service leads",
-    "DF-251 withdrawal-failure tickets go to the service leads and devs; only CRP-13349 DevOps stays ours.",
-    "cell-custody drops CRP-13357, cell-edge drops CRP-13351, fab-svc drops 13352/13353.",
-    AT("07:37"),
-  ),
-];

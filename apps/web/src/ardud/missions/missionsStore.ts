@@ -4,7 +4,6 @@ import type {
   DraftNote,
   Lane,
   MissionId,
-  MissionInbox,
   MissionListSnapshot,
   RoomId,
   RoomPage,
@@ -15,11 +14,21 @@ import {
   createFixtureMissionsSource,
   createKeyedSnapshotStores,
   createSnapshotStore,
+  type ApprovalRoutingTable,
   type MissionForkEntry,
   type MissionInboxHistory,
+  type MissionInboxSnapshot,
   type MissionOverviewSnapshot,
+  type MissionPoolsSnapshot,
+  type MissionReviewSnapshot,
+  type MissionRolesSnapshot,
   type MissionRoomEntry,
+  type MissionRuleBook,
   type MissionsSource,
+  type MissionTimelineEvent,
+  type MissionWorkSnapshot,
+  type PortfolioSnapshot,
+  type RecoveryIncident,
 } from "@t3tools/client-runtime/ardud/missions";
 
 // The web client's one missions source. The fixture is built from real Crpko
@@ -37,8 +46,35 @@ const overviewStores = createKeyedSnapshotStores<MissionId, MissionOverviewSnaps
 const laneStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Lane>>((id, emit) =>
   missionsSource.subscribeLanes(id, emit),
 );
-const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInbox>((id, emit) =>
+const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInboxSnapshot>((id, emit) =>
   missionsSource.subscribeInbox(id, emit),
+);
+const routingStores = createKeyedSnapshotStores<MissionId, ApprovalRoutingTable | null>(
+  (id, emit) => missionsSource.subscribeRouting(id, emit),
+);
+const workStores = createKeyedSnapshotStores<MissionId, MissionWorkSnapshot>((id, emit) =>
+  missionsSource.subscribeWork(id, emit),
+);
+const ruleBookStores = createKeyedSnapshotStores<MissionId, MissionRuleBook>((id, emit) =>
+  missionsSource.subscribeRuleBook(id, emit),
+);
+const roleStores = createKeyedSnapshotStores<MissionId, MissionRolesSnapshot>((id, emit) =>
+  missionsSource.subscribeRoles(id, emit),
+);
+const reviewStores = createKeyedSnapshotStores<MissionId, MissionReviewSnapshot | null>(
+  (id, emit) => missionsSource.subscribeReviewPolicy(id, emit),
+);
+const poolStores = createKeyedSnapshotStores<MissionId, MissionPoolsSnapshot>((id, emit) =>
+  missionsSource.subscribePools(id, emit),
+);
+const recoveryStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<RecoveryIncident>>(
+  (id, emit) => missionsSource.subscribeRecovery(id, emit),
+);
+const timelineStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<MissionTimelineEvent>>(
+  (id, emit) => missionsSource.subscribeTimeline(id, emit),
+);
+const portfolioStore = createSnapshotStore<PortfolioSnapshot>((emit) =>
+  missionsSource.subscribePortfolio(emit),
 );
 const historyStores = createKeyedSnapshotStores<MissionId | null, MissionInboxHistory>((id, emit) =>
   missionsSource.subscribeInboxHistory(id, emit),
@@ -91,9 +127,63 @@ export function useMissionLanes(missionId: MissionId): ReadonlyArray<Lane> | und
 }
 
 /** Inbox for one mission, or across every mission when `missionId` is null. */
-export function useMissionInbox(missionId: MissionId | null): MissionInbox | undefined {
+export function useMissionInbox(missionId: MissionId | null): MissionInboxSnapshot | undefined {
   const store = inboxStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** The mission's approval routing table; `null` when it has none yet. */
+export function useApprovalRouting(missionId: MissionId): ApprovalRoutingTable | null | undefined {
+  const store = routingStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function useMissionWork(missionId: MissionId): MissionWorkSnapshot | undefined {
+  const store = workStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function useMissionRuleBook(missionId: MissionId): MissionRuleBook | undefined {
+  const store = ruleBookStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function useMissionRoles(missionId: MissionId): MissionRolesSnapshot | undefined {
+  const store = roleStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** `null` when the mission has no review policy. */
+export function useMissionReviewPolicy(
+  missionId: MissionId,
+): MissionReviewSnapshot | null | undefined {
+  const store = reviewStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function useMissionPools(missionId: MissionId): MissionPoolsSnapshot | undefined {
+  const store = poolStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** Restart incidents that touched the mission, newest first. */
+export function useMissionRecovery(
+  missionId: MissionId,
+): ReadonlyArray<RecoveryIncident> | undefined {
+  const store = recoveryStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** The mission's event log, newest first. */
+export function useMissionTimeline(
+  missionId: MissionId,
+): ReadonlyArray<MissionTimelineEvent> | undefined {
+  const store = timelineStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function usePortfolio(): PortfolioSnapshot | undefined {
+  return useSyncExternalStore(portfolioStore.subscribe, portfolioStore.get);
 }
 
 /** What the owner decided in the last day, newest first. */

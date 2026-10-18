@@ -1,4 +1,12 @@
-import { BlockerGroup, FeedItem, Milestone, SubMission } from "@t3tools/contracts";
+import {
+  BlockerGroup,
+  FeedItem,
+  type MissionActor,
+  MissionEventId,
+  Milestone,
+  RoleId,
+  SubMission,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -10,7 +18,9 @@ import {
   foldLaneCounts,
   formatCountdown,
   formatRelative,
+  formatTimeOfDay,
   groupBlockers,
+  intendedShareLine,
   intendedTotal,
   laneCountsOf,
   moveInOrder,
@@ -32,6 +42,8 @@ const decodeSubMission = Schema.decodeUnknownSync(SubMission);
 const decodeMilestone = Schema.decodeUnknownSync(Milestone);
 const decodeFeedItem = Schema.decodeUnknownSync(FeedItem);
 const decodeBlockerGroup = Schema.decodeUnknownSync(BlockerGroup);
+const decodeEventId = Schema.decodeUnknownSync(MissionEventId);
+const decodeRoleId = Schema.decodeUnknownSync(RoleId);
 
 const T0 = "2026-10-17T08:00:00.000Z";
 const NOW = Date.parse("2026-10-17T08:33:00.000Z");
@@ -192,7 +204,7 @@ describe("priority stack", () => {
       ["support", 2, "under"],
       ["factory", 3, "over"],
     ]);
-    expect(effortNote(rows)).toBe("factory (3rd) took 19% of the effort; master proposed 5%.");
+    expect(effortNote(rows)).toBe("factory (3rd) took 19% of the effort; the plan is 5%.");
   });
 
   it("stays quiet when effort follows the order", () => {
@@ -268,6 +280,8 @@ describe("feed and time", () => {
     expect(formatRelative("2026-10-17T05:06:00Z", NOW)).toBe("3h ago");
     expect(formatRelative("2026-10-15T08:00:00Z", NOW)).toBe("2d ago");
     expect(formatRelative("2026-10-01T08:00:00Z", NOW, "UTC")).toBe("Thu 1 Oct");
+    expect(formatTimeOfDay("2026-10-04T15:41:48Z", "UTC")).toBe("15:41");
+    expect(formatTimeOfDay("not a time", "UTC")).toBe("");
   });
 
   it("describes usage against the guaranteed share", () => {
@@ -331,17 +345,49 @@ describe("feed and time", () => {
 });
 
 describe("intended effort", () => {
-  it("knows who set the share from the locked field", () => {
-    const rows = priorityStack([
-      subMission("mine", 0, { intendedEffort: 0.6, lockedFields: ["intendedEffort"] }),
-      subMission("proposed", 1, { intendedEffort: 0.3 }),
-      subMission("unset", 2),
-    ]);
-    expect(rows.map((row) => row.intendedBy)).toEqual(["owner", "master", "none"]);
-    expect(intendedTotal(rows)).toEqual({ total: 0.9, label: "90% planned", balanced: false });
+  const change = (id: string, actor: MissionActor, at: string) => ({
+    ref: { kind: "sub-mission" as const, id },
+    field: "intendedEffort",
+    actor,
+    eventId: decodeEventId(`evt-${id}`),
+    at,
   });
 
-  it("reads typed shares as percent, fraction, or empty to hand back", () => {
+  it("says who changed the share last from the event log, and ignores locks", () => {
+    const rows = priorityStack(
+      [
+        subMission("mine", 0, { intendedEffort: 0.6 }),
+        // A stale owner lock means nothing now: the master changed it last.
+        subMission("theirs", 1, { intendedEffort: 0.3, lockedFields: ["intendedEffort"] }),
+        subMission("imported", 2, { intendedEffort: 0.05 }),
+        subMission("unset", 3),
+      ],
+      [
+        change("mine", { _tag: "owner" }, T0),
+        change("theirs", { _tag: "role", roleId: decodeRoleId("crpko-master") }, T0),
+        { ...change("mine", { _tag: "owner" }, T0), field: "title" },
+      ],
+    );
+    expect(rows.map((row) => intendedShareLine(row, "crpko-master"))).toEqual([
+      "last changed by you",
+      "last changed by master",
+      "not changed since import",
+      "no share set",
+    ]);
+    expect(intendedTotal(rows)).toEqual({ total: 0.95, label: "95% planned", balanced: false });
+  });
+
+  it("names whoever set the share in the drift note", () => {
+    const rows = priorityStack(
+      [subMission("factory", 0, { intendedEffort: 0.05, actualEffort: 0.19 })],
+      [change("factory", { _tag: "owner" }, T0)],
+    );
+    expect(effortNote(rows, "crpko-master")).toBe(
+      "factory (1st) took 19% of the effort; you set 5%.",
+    );
+  });
+
+  it("reads typed shares as percent, fraction, or empty to clear", () => {
     expect(parseShareInput("40")).toEqual({ ok: true, share: 0.4 });
     expect(parseShareInput(" 12.5% ")).toEqual({ ok: true, share: 0.125 });
     expect(parseShareInput("0.4")).toEqual({ ok: true, share: 0.4 });

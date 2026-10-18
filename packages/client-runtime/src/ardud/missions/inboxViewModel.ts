@@ -20,7 +20,6 @@ import type {
   InboxTab,
   Knock,
   MissionId,
-  MissionInbox,
   MissionRecordRef,
   Note,
   NoteType,
@@ -30,11 +29,15 @@ import type {
   SuggestionTargetKind,
 } from "@t3tools/contracts";
 
+import { routedTo, suggestionsFor, type InboxRouteFilter } from "./routingViewModel.ts";
 import type {
   AddDraftNoteInput,
   MissionForkEntry,
   MissionInboxHistory,
+  MissionInboxSnapshot,
   OpenForkInput,
+  RoutedApproval,
+  RoutedDraft,
 } from "./source.ts";
 import { diffStats, diffWords, type DiffSegment, type DiffStats } from "./textDiff.ts";
 import { actorLabel, refLabel } from "./viewModel.ts";
@@ -72,50 +75,88 @@ export function isInboxTab(value: unknown): value is InboxTab {
   return typeof value === "string" && (INBOX_TABS as ReadonlyArray<string>).includes(value);
 }
 
+/**
+ * Per-tab counts for one inbox view. "Routed to master" only changes Approve
+ * and Suggestions; asks, knocks and FYI are always the owner's.
+ */
+export function inboxTabCounts(
+  inbox: Pick<MissionInboxSnapshot, "counts" | "masterCounts">,
+  route: InboxRouteFilter = "owner",
+): Record<InboxTab, number> {
+  if (route === "owner") return inbox.counts;
+  return {
+    decide: 0,
+    approve: inbox.masterCounts.approve,
+    knocks: 0,
+    suggestions: inbox.masterCounts.suggestions,
+    fyi: 0,
+  };
+}
+
 /** The first tab with something in it, in tab order; Decide when all are empty. */
-export function defaultInboxTab(inbox: Pick<MissionInbox, "counts">): InboxTab {
-  return INBOX_TABS.find((tab) => inbox.counts[tab] > 0) ?? "decide";
+export function defaultInboxTab(
+  inbox: Pick<MissionInboxSnapshot, "counts"> & Partial<Pick<MissionInboxSnapshot, "masterCounts">>,
+  route: InboxRouteFilter = "owner",
+): InboxTab {
+  const counts =
+    route === "master" && inbox.masterCounts
+      ? inboxTabCounts({ counts: inbox.counts, masterCounts: inbox.masterCounts }, route)
+      : inbox.counts;
+  return INBOX_TABS.find((tab) => counts[tab] > 0) ?? (route === "master" ? "approve" : "decide");
 }
 
 export type InboxEntry =
   | { readonly kind: "ask"; readonly key: string; readonly record: Ask }
-  | { readonly kind: "draft"; readonly key: string; readonly record: Draft }
-  | { readonly kind: "approval"; readonly key: string; readonly record: Approval }
+  | { readonly kind: "draft"; readonly key: string; readonly record: RoutedDraft }
+  | { readonly kind: "approval"; readonly key: string; readonly record: RoutedApproval }
   | { readonly kind: "knock"; readonly key: string; readonly record: Knock }
   | { readonly kind: "suggestion"; readonly key: string; readonly record: Suggestion }
   | { readonly kind: "note"; readonly key: string; readonly record: Note };
 
 /**
  * The items one tab lists, in display order. Approve mixes drafts and crw
- * approvals newest first; FYI keeps the source's ranking.
+ * approvals newest first; FYI keeps the source's ranking. `route` picks the
+ * owner's inbox (default) or what is routed to the master; the owner can
+ * read and decide both.
  */
-export function inboxEntries(inbox: MissionInbox, tab: InboxTab): InboxEntry[] {
+export function inboxEntries(
+  inbox: MissionInboxSnapshot,
+  tab: InboxTab,
+  route: InboxRouteFilter = "owner",
+): InboxEntry[] {
+  const owners = route === "owner";
   switch (tab) {
     case "decide":
-      return inbox.asks.map((record) => ({ kind: "ask", key: `ask:${record.id}`, record }));
+      return owners
+        ? inbox.asks.map((record) => ({ kind: "ask", key: `ask:${record.id}`, record }))
+        : [];
     case "approve":
       return [
-        ...inbox.drafts.map((record): InboxEntry => ({
+        ...routedTo(inbox.drafts, route).map((record): InboxEntry => ({
           kind: "draft",
           key: `draft:${record.id}`,
           record,
         })),
-        ...inbox.approvals.map((record): InboxEntry => ({
+        ...routedTo(inbox.approvals, route).map((record): InboxEntry => ({
           kind: "approval",
           key: `approval:${record.id}`,
           record,
         })),
       ].sort((left, right) => right.record.createdAt.localeCompare(left.record.createdAt));
     case "knocks":
-      return inbox.knocks.map((record) => ({ kind: "knock", key: `knock:${record.id}`, record }));
+      return owners
+        ? inbox.knocks.map((record) => ({ kind: "knock", key: `knock:${record.id}`, record }))
+        : [];
     case "suggestions":
-      return inbox.suggestions.map((record) => ({
+      return suggestionsFor(inbox.suggestions, route).map((record) => ({
         kind: "suggestion",
         key: `suggestion:${record.id}`,
         record,
       }));
     case "fyi":
-      return inbox.fyi.map((record) => ({ kind: "note", key: `note:${record.id}`, record }));
+      return owners
+        ? inbox.fyi.map((record) => ({ kind: "note", key: `note:${record.id}`, record }))
+        : [];
   }
 }
 

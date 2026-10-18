@@ -8,10 +8,7 @@ import {
   Lane,
   Milestone,
   Mission,
-  MissionError,
-  type MissionErrorCode,
   MissionFork,
-  type MissionInbox,
   type MissionListItem,
   type MissionListSnapshot,
   MissionMessage,
@@ -32,18 +29,30 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
+import { latestFieldChanges } from "../changeLog.ts";
+import { reroute, routeApproval, routeDraft } from "../routingViewModel.ts";
 import type {
+  ApprovalRoutingTable,
   Listener,
   MissionForkEntry,
   MissionInboxHistory,
+  MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionPoolUsage,
   MissionRoomEntry,
   MissionsSource,
+  Routed,
+  RoutedApproval,
+  RoutedDraft,
   Unsubscribe,
 } from "../source.ts";
 import { groupBlockers, laneCountsOf, type HeldItem } from "../viewModel.ts";
 import * as data from "./data.ts";
+import { createEventLog } from "./eventLog.ts";
+import { createOperations } from "./operations.ts";
+import * as ops from "./opsData.ts";
+import { RerouteSeed, RoutingTableSeed } from "./schemas.ts";
+import { clampSummary, fail, newestFirst, replace } from "./util.ts";
 
 const HeldItemFixture = Schema.Struct({
   holder: Schema.Struct({ actor: MissionActor, label: Schema.String }),
@@ -77,6 +86,43 @@ const decodeMessage = Schema.decodeUnknownSync(MissionMessage);
 const decodeSubscriptions = Schema.decodeUnknownSync(Schema.Array(Subscription));
 const decodeRules = Schema.decodeUnknownSync(Schema.Array(Rule));
 const decodeRule = Schema.decodeUnknownSync(Rule);
+const decodeRoutingTables = Schema.decodeUnknownSync(Schema.Array(RoutingTableSeed));
+const decodeRoutingTableExit = Schema.decodeUnknownExit(RoutingTableSeed);
+
+/** One key per thing a routing rule can match, so two rules never fight over it. */
+type RouteMatch = (
+  | ApprovalRoutingTableRecord["draftRules"]
+  | ApprovalRoutingTableRecord["approvalRules"]
+)[number]["match"];
+
+const matchKey = (match: RouteMatch) => {
+  switch (match._tag) {
+    case "channel":
+      return `channel:${match.channel}`;
+    case "person":
+      return `person:${match.name.toLowerCase()}`;
+    case "kind":
+      return `kind:${match.kind}`;
+    case "repo":
+      return `repo:${match.repository.toLowerCase()}`;
+  }
+};
+const decodeReroutes = Schema.decodeUnknownSync(Schema.Array(RerouteSeed));
+
+type ApprovalRoutingTableRecord = typeof RoutingTableSeed.Type;
+
+/** The table in force when a record was created: the newest one updated at or before it. */
+function tableAt(
+  tables: ReadonlyArray<ApprovalRoutingTableRecord>,
+  missionId: string,
+  createdAt: string,
+): ApprovalRoutingTableRecord | null {
+  return (
+    tables
+      .filter((table) => table.missionId === missionId && table.updatedAt <= createdAt)
+      .sort((left, right) => right.version - left.version)[0] ?? null
+  );
+}
 
 /** Newest room page size; a page reaches further back to show the first unread. */
 const ROOM_PAGE_SIZE = 40;
@@ -95,10 +141,6 @@ export interface FixtureMissionsSourceOptions {
 const SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3 } as const;
 const TIER_RANK = { P0: 0, P1: 1, P2: 2 } as const;
 
-function fail(code: MissionErrorCode, detail: string): Promise<never> {
-  return Promise.reject(new MissionError({ code, detail }));
-}
-
 /** Snapshot content without its top-level `revision`, for change detection. */
 function contentKey(value: unknown): string {
   return JSON.stringify(value, (key, entry: unknown) => (key === "revision" ? undefined : entry));
@@ -110,16 +152,6 @@ function originKey(origin: MissionFork["origin"]): string | null {
   return "id" in origin
     ? `${origin.kind}:${origin.id}`
     : `${origin.kind}:${origin.ref ?? origin.url ?? origin.label}`;
-}
-
-/** Fits text into a message summary (400 characters, trimmed). */
-function clampSummary(text: string): string {
-  const trimmed = text.trim();
-  return trimmed.length <= 400 ? trimmed : `${trimmed.slice(0, 399).trimEnd()}…`;
-}
-
-function newestFirst<T extends { readonly createdAt: string }>(items: ReadonlyArray<T>): T[] {
-  return [...items].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 }
 
 /**
@@ -138,18 +170,20 @@ export function createFixtureMissionsSource(
   const missions: Mission[] = [...decodeMissions(data.missions)];
   const subMissions: SubMission[] = [...decodeSubMissions(data.subMissions)];
   const milestones = decodeMilestones(data.milestones);
-  const lanes = decodeLanes(data.lanes);
+  const lanes: Lane[] = [...decodeLanes(ops.lanes)];
   const asks: Ask[] = [...decodeAsks(data.asks)];
   const drafts: Draft[] = [...decodeDrafts(data.drafts)];
   const knocks: Knock[] = [...decodeKnocks(data.knocks)];
-  const suggestions: Suggestion[] = [...decodeSuggestions(data.suggestions)];
+  const suggestions: Suggestion[] = [
+    ...decodeSuggestions([...data.suggestions, ...ops.ruleSuggestions]),
+  ];
   const approvals: Approval[] = [...decodeApprovals(data.approvals)];
   const notes: Note[] = [...decodeNotes(data.notes)];
   const calls: Call[] = [...decodeCalls(data.calls)];
   const draftNotes: DraftNote[] = [...decodeDraftNotes(data.draftNotes)];
   const stats: SuggestionStats[] = [...decodeStats(data.suggestionStats)];
   const forks: MissionForkEntry[] = [...decodeForks(data.forks)];
-  const rules: Rule[] = [...decodeRules(data.rules)];
+  const rules: Rule[] = [...decodeRules(ops.rules)];
   const poolUsage = new Map<string, ReadonlyArray<MissionPoolUsage>>(
     Object.entries(data.poolUsage),
   );
@@ -180,8 +214,7 @@ export function createFixtureMissionsSource(
     item,
   }));
   const ownerLastLookedAt = new Map<string, string | null>(Object.entries(data.ownerLastLookedAt));
-  // The master's proposed share per sub-mission, restored when the owner hands it back.
-  const masterIntended = new Map(subMissions.map((s) => [s.id as string, s.intendedEffort]));
+  const routingTables: ApprovalRoutingTableRecord[] = [...decodeRoutingTables([ops.routing])];
 
   let revision = 1;
   const listeners = new Set<() => void>();
@@ -230,6 +263,63 @@ export function createFixtureMissionsSource(
     sessionId: null,
   });
   const nowIso = () => DateTime.formatIso(DateTime.makeUnsafe(now()));
+  const log = createEventLog({ nowIso, provenance: ownerProvenance });
+
+  // Each pending draft and approval keeps the approver it was routed to at
+  // creation (or by a later re-route); editing the table never moves it.
+  const routes = new Map<string, Routed>();
+  const routeKey = (kind: "draft" | "approval", id: string) => `${kind}:${id}`;
+  {
+    const seeded = decodeRoutingTables([ops.routingV1, ops.routing]);
+    for (const draft of drafts) {
+      routes.set(
+        routeKey("draft", draft.id),
+        routeDraft(tableAt(seeded, draft.missionId, draft.createdAt), draft),
+      );
+    }
+    for (const approval of approvals) {
+      routes.set(
+        routeKey("approval", approval.id),
+        routeApproval(tableAt(seeded, approval.missionId, approval.createdAt), approval),
+      );
+    }
+    for (const move of decodeReroutes(ops.reroutes)) {
+      const current = routes.get(routeKey(move.kind, move.id));
+      if (!current) continue;
+      const moved = reroute(
+        current,
+        move.approver,
+        data.masterActor as MissionActor,
+        move.reason,
+        move.at,
+      );
+      if (moved.ok) routes.set(routeKey(move.kind, move.id), moved.value);
+    }
+  }
+  // A record first seen without a route is routed by the table at that moment
+  // and keeps that route; later table edits never move it.
+  const routeOf = (kind: "draft" | "approval", record: Draft | Approval): Routed => {
+    const key = routeKey(kind, record.id);
+    const known = routes.get(key);
+    if (known) return known;
+    const table = routingTables.find((t) => t.missionId === record.missionId) ?? null;
+    const routed =
+      kind === "draft"
+        ? routeDraft(table, record as Draft)
+        : routeApproval(table, record as Approval);
+    routes.set(key, routed);
+    return routed;
+  };
+  const routedDraft = (draft: Draft): RoutedDraft => {
+    const { approver, route } = routeOf("draft", draft);
+    return { ...draft, approver, route };
+  };
+  const routedApproval = (approval: Approval): RoutedApproval => {
+    const { approver, route } = routeOf("approval", approval);
+    return { ...approval, approver, route };
+  };
+  const toOwner = (kind: "draft" | "approval") => (record: Draft | Approval) =>
+    routeOf(kind, record).approver === "owner";
 
   const subMissionOf = (record: { readonly id: string }) =>
     data.recordSubMission[record.id] ?? null;
@@ -268,14 +358,17 @@ export function createFixtureMissionsSource(
           right.createdAt.localeCompare(left.createdAt),
       );
 
-  /** Open asks, pending drafts and approvals, and knocks, per contract `needsYou`. */
+  /**
+   * Open asks, knocks, and the pending drafts and approvals routed to the
+   * owner, per contract `needsYou`. What waits on the master is not counted.
+   */
   function needsYou(missionId: string, subMissionId: string | null): number {
     const inScope = (record: { readonly id: string; readonly subMissionId?: string | null }) =>
       subMissionId === null || (record.subMissionId ?? subMissionOf(record)) === subMissionId;
     return (
       openAsks(missionId).filter(inScope).length +
-      pendingDrafts(missionId).filter(inScope).length +
-      pendingApprovals(missionId).filter(inScope).length +
+      pendingDrafts(missionId).filter(toOwner("draft")).filter(inScope).length +
+      pendingApprovals(missionId).filter(toOwner("approval")).filter(inScope).length +
       pendingKnocks(missionId).filter(inScope).length
     );
   }
@@ -320,14 +413,19 @@ export function createFixtureMissionsSource(
     });
   }
 
-  function ownerHeld(missionId: string): HeldItem[] {
+  /** Asks and pending drafts, each held by whoever has to decide it. */
+  function inboxHeld(missionId: string): HeldItem[] {
     const owner = { holder: { _tag: "owner" } as const, holderLabel: "you" };
+    const masterRoleId = findMission(missionId)?.masterRoleId ?? null;
+    const master = masterRoleId
+      ? { holder: { _tag: "role", roleId: masterRoleId } as MissionActor, holderLabel: "master" }
+      : owner;
     const fromAsks = openAsks(missionId).map((ask) => ({
       ...owner,
       item: { kind: "ask" as const, id: ask.id, label: ask.question },
     }));
     const fromDrafts = pendingDrafts(missionId).map((draft) => ({
-      ...owner,
+      ...(toOwner("draft")(draft) ? owner : master),
       item: {
         kind: "draft" as const,
         id: draft.id,
@@ -373,32 +471,48 @@ export function createFixtureMissionsSource(
         usageShare: data.usageShares[missionId] ?? null,
         directionCheck,
         criticalPath: isCrpko ? criticalPath : [],
-        blockers: groupBlockers([...ownerHeld(missionId), ...(isCrpko ? held : [])]),
+        blockers: groupBlockers([...inboxHeld(missionId), ...(isCrpko ? held : [])]),
         feed: isCrpko ? feed : [],
         lanes: laneCountsOf(lanes.filter((l) => l.missionId === missionId)),
         ownerLastLookedAt: lastLooked,
         poolUsage: poolUsage.get(missionId) ?? [],
+        changes: latestFieldChanges(
+          log
+            .all()
+            .filter(
+              (event) =>
+                event.missionId === missionId &&
+                event.kind !== "routing.updated" &&
+                (event.subject?.kind === "mission" || event.subject?.kind === "sub-mission"),
+            ),
+        ),
+        recovery: operations.openIncident(missionId),
       };
     });
   }
 
-  function inbox(missionId: string | null): MissionInbox {
+  function inbox(missionId: string | null): MissionInboxSnapshot {
     return memo(`inbox:${missionId ?? "*"}`, () => {
       const inboxAsks = newestFirst(openAsks(missionId));
-      const inboxDrafts = newestFirst(pendingDrafts(missionId));
-      const inboxApprovals = newestFirst(pendingApprovals(missionId));
+      const inboxDrafts = newestFirst(pendingDrafts(missionId)).map(routedDraft);
+      const inboxApprovals = newestFirst(pendingApprovals(missionId)).map(routedApproval);
       const inboxKnocks = newestFirst(pendingKnocks(missionId));
       const inboxSuggestions = newestFirst(openSuggestions(missionId));
       const inboxFyi = fyi(missionId);
+      const routedTo = (approver: "owner" | "master") =>
+        [...inboxDrafts, ...inboxApprovals].filter((r) => r.approver === approver).length;
+      const acceptedBy = (acceptor: "owner" | "master") =>
+        inboxSuggestions.filter((s) => s.acceptor === acceptor).length;
       return {
         revision,
         counts: {
           decide: inboxAsks.length,
-          approve: inboxDrafts.length + inboxApprovals.length,
+          approve: routedTo("owner"),
           knocks: inboxKnocks.length,
-          suggestions: inboxSuggestions.length,
+          suggestions: acceptedBy("owner"),
           fyi: inboxFyi.length,
         },
+        masterCounts: { approve: routedTo("master"), suggestions: acceptedBy("master") },
         asks: inboxAsks,
         drafts: inboxDrafts,
         approvals: inboxApprovals,
@@ -614,13 +728,53 @@ export function createFixtureMissionsSource(
     return entry;
   }
 
-  function findMission(missionId: string) {
-    return missions.find((m) => m.id === missionId);
+  function routingTable(missionId: string): ApprovalRoutingTable | null {
+    return memo(`routing:${missionId}`, () => {
+      const table = routingTables.find((t) => t.missionId === missionId);
+      if (!table) return null;
+      return {
+        ...table,
+        changes: latestFieldChanges(
+          log
+            .all()
+            .filter((event) => event.kind === "routing.updated" && event.subject?.id === missionId),
+        ),
+      };
+    });
   }
 
-  function replace<T extends { readonly id: string }>(list: T[], next: T) {
-    const index = list.findIndex((entry) => entry.id === next.id);
-    if (index >= 0) list[index] = next;
+  function postNudge(lane: Lane, note: string) {
+    const room = roomForSubMission(lane.missionId, lane.subMissionId);
+    if (!room) return;
+    postOwnerMessage(room, {
+      kind: "request",
+      summary: clampSummary(`${lane.name}: ${note}`),
+      to: [{ _tag: "lane", laneId: lane.id }],
+      links: [],
+      isCorrection: false,
+      hasBody: false,
+      key: null,
+      workItemId: lane.currentItemId,
+    });
+  }
+
+  const operations = createOperations({
+    missions,
+    subMissions,
+    lanes,
+    suggestions,
+    log,
+    memo,
+    commit,
+    watch,
+    nowIso,
+    localId,
+    missionRules,
+    postNudge,
+  });
+
+  function findMission(missionId: string) {
+    return missions.find((m) => m.id === missionId);
   }
 
   return {
@@ -636,6 +790,8 @@ export function createFixtureMissionsSource(
     subscribeRules: (missionId, listener) => watch(() => missionRules(missionId), listener),
     subscribeRooms: (missionId, listener) => watch(() => missionRooms(missionId), listener),
     subscribeRoom: (roomId, listener) => watch(() => roomPage(roomId), listener),
+    subscribeRouting: (missionId, listener) => watch(() => routingTable(missionId), listener),
+    ...operations.source,
 
     loadRoomPage({ roomId, beforeSeq, limit }) {
       const room = rooms.find((r) => r.id === roomId);
@@ -655,12 +811,22 @@ export function createFixtureMissionsSource(
       ) {
         return fail("invalid", "The new order must list every active sub-mission once.");
       }
+      if (input.order.every((id, order) => active.find((s) => s.id === id)?.order === order)) {
+        return Promise.resolve();
+      }
       const at = nowIso();
       input.order.forEach((id, order) => {
         const subMission = subMissions.find((s) => s.id === id);
         if (subMission && subMission.order !== order) {
           replace(subMissions, { ...subMission, order, updatedAt: at });
         }
+      });
+      log.record({
+        missionId: input.missionId,
+        kind: "sub-mission.reordered",
+        subject: { kind: "mission", id: input.missionId },
+        summary: "Reordered the sub-missions",
+        payload: { order: input.order },
       });
       commit();
       return Promise.resolve();
@@ -671,7 +837,15 @@ export function createFixtureMissionsSource(
       if (!mission) return fail("not-found", `Mission ${missionId} not found.`);
       if (mission.status === "archived")
         return fail("conflict", "Archived missions cannot resume.");
+      if ((mission.status === "paused") === paused) return Promise.resolve();
       replace(missions, { ...mission, status: paused ? "paused" : "active", updatedAt: nowIso() });
+      log.record({
+        missionId,
+        kind: paused ? "mission.paused" : "mission.resumed",
+        subject: { kind: "mission", id: missionId, label: mission.title },
+        summary: `${paused ? "Paused" : "Resumed"} ${mission.title}`,
+        payload: { changed: ["status"], status: paused ? "paused" : "active" },
+      });
       commit();
       return Promise.resolve();
     },
@@ -685,7 +859,19 @@ export function createFixtureMissionsSource(
       ) {
         return fail("invalid", `Sub-mission ${subMissionId} is not part of ${missionId}.`);
       }
+      if (subMissions.some((s) => s.id === subMissionId && s.status === "closed")) {
+        return fail("invalid", "A closed sub-mission can't take the focus.");
+      }
+      if (mission.focusSubMissionId === subMissionId) return Promise.resolve();
       replace(missions, { ...mission, focusSubMissionId: subMissionId, updatedAt: nowIso() });
+      const focus = subMissions.find((s) => s.id === subMissionId);
+      log.record({
+        missionId,
+        kind: "mission.updated",
+        subject: { kind: "mission", id: missionId, label: mission.title },
+        summary: focus ? `Focus on ${focus.title}` : "Ended focus",
+        payload: { changed: ["focusSubMissionId"], focusSubMissionId: subMissionId },
+      });
       commit();
       return Promise.resolve();
     },
@@ -712,23 +898,20 @@ export function createFixtureMissionsSource(
       if (share !== null && !(Number.isFinite(share) && share >= 0 && share <= 1)) {
         return fail("invalid", "An effort share is between 0 and 1.");
       }
-      const others = subMission.lockedFields.filter((field) => field !== "intendedEffort");
-      replace(
-        subMissions,
-        share === null
-          ? {
-              ...subMission,
-              intendedEffort: masterIntended.get(subMission.id) ?? null,
-              lockedFields: others,
-              updatedAt: nowIso(),
-            }
-          : {
-              ...subMission,
-              intendedEffort: share,
-              lockedFields: [...others, "intendedEffort"],
-              updatedAt: nowIso(),
-            },
-      );
+      if (subMission.intendedEffort === share) return Promise.resolve();
+      // Nothing locks: the owner and the master write the share the same way,
+      // and the event log says who changed it last.
+      replace(subMissions, { ...subMission, intendedEffort: share, updatedAt: nowIso() });
+      log.record({
+        missionId: subMission.missionId,
+        kind: "sub-mission.updated",
+        subject: { kind: "sub-mission", id: subMission.id, label: subMission.title },
+        summary:
+          share === null
+            ? `Cleared the planned share of ${subMission.title}`
+            : `${subMission.title} planned at ${Math.round(share * 100)}%`,
+        payload: { changed: ["intendedEffort"], intendedEffort: share },
+      });
       commit();
       return Promise.resolve();
     },
@@ -829,7 +1012,19 @@ export function createFixtureMissionsSource(
       if (input.action === "rewrite" && !input.rewriteNote?.trim()) {
         return fail("invalid", "Say what the rewrite should change.");
       }
+      // The owner can decide any draft, whoever it is routed to.
       const decided = { ...draft, decidedBy: ownerProvenance(), decidedAt: at };
+      log.record({
+        missionId: draft.missionId,
+        kind: "draft.decided",
+        subject: {
+          kind: "draft",
+          id: draft.id,
+          label: `${draft.audience} on ${draft.target.label}`,
+        },
+        summary: `Draft to ${draft.audience}: ${input.action}`,
+        payload: { action: input.action, approver: routeOf("draft", draft).approver },
+      });
       switch (input.action) {
         case "approve":
           replace(drafts, {
@@ -917,11 +1112,19 @@ export function createFixtureMissionsSource(
       if (!approval) return fail("not-found", `Approval ${input.approvalId} not found.`);
       if (approval.status !== "pending")
         return fail("conflict", "This approval is already decided.");
+      // The owner can decide any approval, whoever it is routed to.
       replace(approvals, {
         ...approval,
         status: input.action === "approve" ? "approved" : "rejected",
         decidedBy: ownerProvenance(),
         decidedAt: nowIso(),
+      });
+      log.record({
+        missionId: approval.missionId,
+        kind: "approval.decided",
+        subject: { kind: "approval", id: approval.id, label: approval.title },
+        summary: `${input.action === "approve" ? "Approved" : "Rejected"} ${approval.title}`,
+        payload: { action: input.action, approver: routeOf("approval", approval).approver },
       });
       commit();
       return Promise.resolve();
@@ -1016,6 +1219,20 @@ export function createFixtureMissionsSource(
       const existing = input.ruleId ? rules.find((r) => r.id === input.ruleId) : undefined;
       if (input.ruleId && !existing) return fail("not-found", `Rule ${input.ruleId} not found.`);
       const scope = input.scope ?? { subMissionIds: [], roleKinds: [], laneIds: [] };
+      const edited = existing
+        ? (["title", "quote", "scope", "activation", "status"] as const).filter((field) => {
+            const next =
+              field === "title" || field === "quote"
+                ? input[field]
+                : (input[field] ?? existing[field]);
+            return JSON.stringify(existing[field]) !== JSON.stringify(next);
+          })
+        : [];
+      if (existing && edited.length === 0) return Promise.resolve(existing);
+      // Acks are per version: only a change to what lanes follow asks them to ack again.
+      const reAck = edited.some(
+        (field) => field === "quote" || field === "scope" || field === "activation",
+      );
       const rule = existing
         ? decodeRule({
             ...existing,
@@ -1025,7 +1242,7 @@ export function createFixtureMissionsSource(
             scope: input.scope ?? existing.scope,
             activation: input.activation ?? existing.activation,
             status: input.status ?? existing.status,
-            version: existing.version + 1,
+            version: reAck ? existing.version + 1 : existing.version,
             updatedAt: at,
           })
         : decodeRule({
@@ -1051,8 +1268,98 @@ export function createFixtureMissionsSource(
           });
       if (existing) replace(rules, rule);
       else rules.push(rule);
+      // A global rule belongs to every mission's rule book, so each timeline logs it.
+      const homes = rule.missionId !== null ? [rule.missionId] : missions.map((m) => m.id);
+      for (const missionId of homes) {
+        log.record({
+          missionId,
+          kind: existing
+            ? rule.status === "retired"
+              ? "rule.retired"
+              : "rule.updated"
+            : "rule.created",
+          subject: { kind: "rule", id: rule.id, label: rule.title },
+          summary: `${existing ? "Edited" : "Added"} rule: ${rule.title}`,
+          payload: existing ? { changed: edited, version: rule.version } : null,
+        });
+      }
       commit();
       return Promise.resolve(rule);
+    },
+
+    setApprovalRouting({ missionId, expectedVersion, draftRules, approvalRules }) {
+      if (!findMission(missionId)) return fail("not-found", `Mission ${missionId} not found.`);
+      const current = routingTables.find((t) => t.missionId === missionId) ?? null;
+      const version = current?.version ?? 0;
+      if (expectedVersion !== version) {
+        return fail("conflict", "The routing table changed since you opened it.");
+      }
+      const at = nowIso();
+      const decoded = decodeRoutingTableExit({
+        missionId,
+        version: version + 1,
+        draftRules,
+        approvalRules,
+        updatedAt: at,
+      });
+      if (decoded._tag === "Failure") {
+        return fail("invalid", "Each rule needs a channel, person, kind or repo to match.");
+      }
+      const next = decoded.value;
+      const ids = [...next.draftRules, ...next.approvalRules].map((rule) => rule.id);
+      if (new Set(ids).size !== ids.length) return fail("invalid", "Two rules share an id.");
+      const matches = [...next.draftRules, ...next.approvalRules].map((rule) =>
+        matchKey(rule.match),
+      );
+      if (new Set(matches).size !== matches.length) {
+        return fail("invalid", "Two rules match the same thing.");
+      }
+      const index = routingTables.findIndex((t) => t.missionId === missionId);
+      if (index >= 0) routingTables[index] = next;
+      else routingTables.push(next);
+      const before = new Map(
+        [...(current?.draftRules ?? []), ...(current?.approvalRules ?? [])].map((rule) => [
+          rule.id,
+          JSON.stringify(rule),
+        ]),
+      );
+      const after = [...next.draftRules, ...next.approvalRules];
+      const changed = [
+        ...after.filter((rule) => before.get(rule.id) !== JSON.stringify(rule)).map((r) => r.id),
+        ...[...before.keys()].filter((id) => !after.some((rule) => rule.id === id)),
+      ];
+      log.record({
+        missionId,
+        kind: "routing.updated",
+        subject: { kind: "mission", id: missionId },
+        summary: `Routing table v${next.version}`,
+        payload: { changed: ["rules", ...changed], version: next.version },
+      });
+      commit();
+      return Promise.resolve(routingTable(missionId)!);
+    },
+
+    rerouteRecord({ kind, id, approver, reason }) {
+      const record =
+        kind === "draft" ? drafts.find((d) => d.id === id) : approvals.find((a) => a.id === id);
+      if (!record)
+        return fail("not-found", `${kind === "draft" ? "Draft" : "Approval"} ${id} not found.`);
+      if (record.status !== "pending") return fail("conflict", "Only a pending record can move.");
+      const moved = reroute(routeOf(kind, record), approver, { _tag: "owner" }, reason, nowIso());
+      if (!moved.ok) return fail("invalid", moved.error);
+      routes.set(routeKey(kind, id), moved.value);
+      log.record({
+        missionId: record.missionId,
+        kind: "record.rerouted",
+        subject: { kind, id },
+        summary: `Moved to ${approver === "owner" ? "you" : "master"}: ${moved.value.route._tag === "rerouted" ? moved.value.route.reason : reason}`,
+        payload: {
+          from: moved.value.route._tag === "rerouted" ? moved.value.route.from : null,
+          to: approver,
+        },
+      });
+      commit();
+      return Promise.resolve();
     },
   };
 }
