@@ -44,3 +44,14 @@ test('refuses token files others can read and fails without any token', () => {
   assert.throws(() => controlConfig({ T3_CONTROL_TOKEN_FILE: loose }, dir), /chmod 600/);
   assert.throws(() => controlConfig({}, dir), /no control token/);
 });
+
+test('a malformed token file fails loudly, and env alone needs no file', () => {
+  const dir = home();
+  const broken = join(dir, 'broken.json');
+  writeFileSync(broken, '{"token": ');
+  chmodSync(broken, 0o600);
+  assert.throws(() => controlConfig({ T3_CONTROL_TOKEN_FILE: broken }, dir), /not valid JSON/);
+  const loose = write(join(dir, '.robob/ardud-control.json'), { token: 'shared' }, 0o644);
+  assert.ok(loose);
+  assert.deepEqual(controlConfig({ T3_CONTROL_URL: 'http://h:1', T3_CONTROL_TOKEN: 'env' }, dir), { url: 'http://h:1', token: 'env' });
+});

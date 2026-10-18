@@ -99,9 +99,25 @@ async function missionReport({ io, incident, byThread, prev, dryRun }) {
     });
     return { incidentId: res.incidentId ?? null, members: (res.members ?? []).map((m) => m.threadId), missions: res.missions ?? [] };
   } catch (err) {
-    if ([401, 403, 404].includes(err?.status)) return { incidentId: null, members: [], missions: [], unavailable: true };
+    // Refused for lack of stream-recovery's own credential: mission recovery
+    // still resumes its members from its own boot check and scans, so only
+    // ask which threads those are and leave them alone.
+    if (err?.status === 403) return missionMembersOnly({ io, threads, prev });
+    if ([401, 404].includes(err?.status)) return { incidentId: null, members: [], missions: [], unavailable: true };
     const failures = (prev?.missionFailures ?? 0) + 1;
     // Never hold a restart back for good: past the retries this scan notes everyone.
+    if (failures >= MAX_ATTEMPTS) return { incidentId: null, members: [], missions: [], error: errText(err) };
+    return { retry: true, failures, error: errText(err) };
+  }
+}
+
+async function missionMembersOnly({ io, threads, prev }) {
+  try {
+    const members = await io.missionRecoveryMembers(threads.map((t) => t.threadId));
+    return { incidentId: null, members: members.map((m) => m.threadId), missions: [], unrecorded: true };
+  } catch (err) {
+    if ([401, 403, 404].includes(err?.status)) return { incidentId: null, members: [], missions: [], unavailable: true };
+    const failures = (prev?.missionFailures ?? 0) + 1;
     if (failures >= MAX_ATTEMPTS) return { incidentId: null, members: [], missions: [], error: errText(err) };
     return { retry: true, failures, error: errText(err) };
   }
@@ -311,7 +327,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       continue;
     }
     const members = new Set(mission.members);
-    if (members.size) log(`${incident.id}: ${members.size} mission member thread(s) left to mission recovery (${mission.incidentId ?? "dry run"})`);
+    if (members.size) log(`${incident.id}: ${members.size} mission member thread(s) left to mission recovery (${mission.incidentId ?? (mission.unrecorded ? "report refused: no stream-recovery credential; its own scans" : "dry run")})`);
 
     const results = [];
     const all = [];
