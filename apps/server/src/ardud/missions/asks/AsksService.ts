@@ -930,9 +930,8 @@ const make = Effect.gen(function* () {
           scope: input.scope,
           text: input.text,
           active: input.active ?? existing?.active ?? true,
-          // `source` predates master writes: "owner" means a direct write (not a suggestion
-          // or an import). `writtenBy` on the note names who actually wrote it.
-          source: existing?.source ?? "owner",
+          // `source` is where the note started; `writtenBy` names who last changed it.
+          source: existing?.source ?? (isOwnerProvenance(writer.provenance) ? "owner" : "master"),
           provenance: writer.provenance,
           callerIsMaster: writer.isMaster,
           notes: yield* allDraftNotes(input.missionId),

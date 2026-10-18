@@ -980,7 +980,8 @@ export const DraftNote = Schema.Struct({
   missionId: Schema.NullOr(MissionId),
   scope: DraftNoteScope,
   text: TrimmedNonEmptyString,
-  source: Schema.Literals(["owner", "suggestion", "import"]),
+  /** Where the note came from. "master" (asks addition) is a direct write by a mission's master. */
+  source: Schema.Literals(["owner", "master", "suggestion", "import"]),
   active: Schema.Boolean,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,

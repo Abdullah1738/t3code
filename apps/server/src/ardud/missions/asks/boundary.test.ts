@@ -322,6 +322,31 @@ describe("boundary review regressions", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("a draft note a master writes says it came from the master", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const theirs = yield* asks.saveDraftNote(
+        { missionId, scope: { _tag: "all" }, text: "No exclamation marks." },
+        master,
+      );
+      expect(theirs.source).toBe("master");
+      const his = yield* asks.saveDraftNote(
+        { missionId, scope: { _tag: "all" }, text: "Sign with initials." },
+        ownerApp,
+      );
+      expect(his.source).toBe("owner");
+      // An edit keeps where the note started and records who changed it.
+      const edited = yield* asks.saveDraftNote(
+        { noteId: theirs.id, missionId, scope: { _tag: "all" }, text: "No exclamation marks!" },
+        ownerApp,
+      );
+      expect(edited.source).toBe("master");
+      expect(edited.writtenBy).toEqual({ _tag: "owner" });
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("R2: a master can't rewrite or move another mission's draft notes", () => {
     const { layer } = harness();
     return Effect.gen(function* () {
