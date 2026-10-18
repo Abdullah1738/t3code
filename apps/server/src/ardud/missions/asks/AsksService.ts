@@ -1373,42 +1373,55 @@ const make = Effect.gen(function* () {
       return yield* serialized(recordApplied(pending, result.outcome, result.applied));
     }).pipe(Effect.ensuring(Effect.sync(() => applying.delete(pending.record.id))));
 
+  // After a restart, an accepted suggestion with no outcome stopped between
+  // its decision and its applier. What the sweep may do depends on the kind.
+  const APPLIED_BEFORE_RESTART =
+    "Applied before a restart: its change follows the decision on the timeline, but the server stopped before recording the outcome.";
+  const PARTLY_BEFORE_RESTART =
+    "Applied before a restart, possibly in part: the server stopped before recording the outcome. Check it, and suggest anything missing again.";
+  const TOO_OLD_AFTER_RESTART =
+    "Not applied: the server stopped before applying it, and the decision is more than a day old. Suggest it again if it still holds.";
+  const RESTART_SWEEP_MAX_AGE_MS = 24 * 60 * 60_000;
+
   /**
-   * The latest decision event of each listed suggestion on a timeline, and
-   * whether anything the applier committed already follows from it.
+   * Accepting these makes something once: a new rule, a lane split or a lane
+   * merge, so running one twice does it twice. Every other applier sets
+   * values, and running it again finishes what a crash cut short.
    */
-  const decisionTrail = (timeline: MissionId, ids: ReadonlySet<string>) =>
+  const runsOnce = (record: Suggestion): boolean => {
+    if (record.targetKind === "rule") return record.target?.kind !== "rule";
+    if (record.targetKind !== "lane") return false;
+    const after = record.after;
+    return (
+      typeof after === "object" && after !== null && ("split" in after || "mergeInto" in after)
+    );
+  };
+
+  /** Every event on a timeline, oldest first, a page at a time. */
+  const eachEvent = (timeline: MissionId, visit: (event: MissionEvent) => void) =>
     Effect.gen(function* () {
-      const trail = new Map<string, { decision: MissionEvent; followed: boolean }>();
-      const byDecision = new Map<string, string>();
       let afterSeq = 0;
       for (;;) {
         const page = yield* store.eventsSince(timeline, afterSeq, 500);
-        for (const event of page) {
-          if (
-            event.kind === "suggestion.decided" &&
-            event.subject?.kind === "suggestion" &&
-            ids.has(event.subject.id)
-          ) {
-            trail.set(event.subject.id, { decision: event, followed: false });
-            byDecision.set(event.id, event.subject.id);
-          } else if (event.causedBy !== null) {
-            const id = byDecision.get(event.causedBy);
-            const entry = id === undefined ? undefined : trail.get(id);
-            if (entry !== undefined && entry.decision.id === event.causedBy) entry.followed = true;
-          }
-        }
+        for (const event of page) visit(event);
         const last = page.at(-1);
-        if (last === undefined || page.length < 500) return trail;
+        if (last === undefined || page.length < 500) return;
         afterSeq = last.seq;
       }
     });
 
+  /** The mission a lane change lands on, which a global suggestion doesn't name. */
+  const laneMissionOf = (record: Suggestion) =>
+    record.targetKind === "lane" && record.target?.kind === "lane"
+      ? store
+          .get("lane", record.target.id)
+          .pipe(Effect.map((lane) => (Option.isSome(lane) ? lane.value.missionId : null)))
+      : Effect.succeed(null);
+
   /**
-   * After a restart: accepted suggestions that never got an outcome because
-   * the server stopped between the decision and its applier. One whose
-   * applier already committed something is not run twice; the outcome says
-   * so. The rest apply now, caused by their decision like a live accept.
+   * Startup sweep. Claims the waiting suggestions under the asks lock, then
+   * reads the timelines and applies outside it, so a live decision never
+   * waits on the scan and a failed scan releases its claims.
    */
   const applyPendingSuggestionsCommand = Effect.gen(function* () {
     const claimed = yield* serialized(
@@ -1420,57 +1433,102 @@ const make = Effect.gen(function* () {
             suggestion.targetKind !== "draft-note" &&
             !applying.has(suggestion.id),
         );
-        const timelines = new Map<MissionId, Suggestion[]>();
-        for (const suggestion of waiting) {
-          const timeline = suggestion.missionId ?? GLOBAL_TIMELINE;
-          timelines.set(timeline, [...(timelines.get(timeline) ?? []), suggestion]);
-        }
-        const found: Array<{ pending: PendingApplication; followed: boolean }> = [];
-        for (const [timeline, suggestions] of timelines) {
-          const trail = yield* decisionTrail(
-            timeline,
-            new Set(suggestions.map((suggestion) => suggestion.id)),
-          );
-          for (const record of suggestions) {
-            const entry = trail.get(record.id);
-            if (entry === undefined) {
-              yield* Effect.logWarning(
-                `missions: accepted suggestion ${record.id} has no decision event; left unapplied`,
-              );
-              continue;
-            }
-            applying.add(record.id);
-            found.push({
-              pending: {
-                record,
-                application: {
-                  suggestion: record,
-                  targetKind: record.targetKind,
-                  target: record.target,
-                  after: record.after,
-                },
-                decisionId: entry.decision.id,
-                decider: record.decidedBy ?? entry.decision.provenance,
-              },
-              followed: entry.followed,
-            });
-          }
-        }
-        return found;
+        for (const suggestion of waiting) applying.add(suggestion.id);
+        return waiting;
       }),
     );
-    return yield* Effect.forEach(claimed, ({ pending, followed }) =>
-      followed || pending.application === null
-        ? serialized(
-            recordApplied(
-              pending,
-              "Applied before a restart: its changes follow the decision on the timeline, but the server stopped before recording the outcome.",
-              true,
-            ),
-          ).pipe(Effect.ensuring(Effect.sync(() => applying.delete(pending.record.id))))
-        : applyDecided(pending, pending.application),
+    return yield* sweepClaimed(claimed).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          for (const suggestion of claimed) applying.delete(suggestion.id);
+        }),
+      ),
     );
   });
+
+  /**
+   * A one-shot change counts as done when anything follows its decision,
+   * on the suggestion's timeline or the lane's mission. A value-setting
+   * change runs again. A decision more than a day old is not applied late.
+   */
+  const sweepClaimed = (claimed: ReadonlyArray<Suggestion>) =>
+    Effect.gen(function* () {
+      const timelineOf = (suggestion: Suggestion) => suggestion.missionId ?? GLOBAL_TIMELINE;
+      const decisions = new Map<string, MissionEvent>();
+      const decisionIds = new Set<string>();
+      const followed = new Set<string>();
+      const trace = (event: MissionEvent) => {
+        if (event.causedBy !== null && decisionIds.has(event.causedBy)) {
+          followed.add(event.causedBy);
+        }
+      };
+      const own = new Map<MissionId, Set<string>>();
+      for (const suggestion of claimed) {
+        const ids = own.get(timelineOf(suggestion)) ?? new Set<string>();
+        own.set(timelineOf(suggestion), ids.add(suggestion.id));
+      }
+      for (const [timeline, ids] of own) {
+        yield* eachEvent(timeline, (event) => {
+          if (
+            event.kind === "suggestion.decided" &&
+            event.subject?.kind === "suggestion" &&
+            ids.has(event.subject.id)
+          ) {
+            decisions.set(event.subject.id, event);
+            decisionIds.add(event.id);
+          } else trace(event);
+        });
+      }
+      const elsewhere = new Set<MissionId>();
+      for (const suggestion of claimed) {
+        const decision = decisions.get(suggestion.id);
+        if (decision === undefined || followed.has(decision.id) || !runsOnce(suggestion)) continue;
+        const landing = yield* laneMissionOf(suggestion);
+        if (landing !== null && landing !== timelineOf(suggestion)) elsewhere.add(landing);
+      }
+      for (const timeline of elsewhere) yield* eachEvent(timeline, trace);
+
+      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+      const swept: Suggestion[] = [];
+      for (const record of claimed) {
+        const decision = decisions.get(record.id);
+        if (decision === undefined) {
+          yield* Effect.logWarning(
+            `missions: accepted suggestion ${record.id} has no decision event; left unapplied`,
+          );
+          continue;
+        }
+        const application: SuggestionApplication = {
+          suggestion: record,
+          targetKind: record.targetKind,
+          target: record.target,
+          after: record.after,
+        };
+        const pending: PendingApplication = {
+          record,
+          application,
+          decisionId: decision.id,
+          decider: record.decidedBy ?? decision.provenance,
+        };
+        const done = followed.has(decision.id);
+        const tooOld =
+          nowMs - Date.parse(record.decidedAt ?? decision.at) > RESTART_SWEEP_MAX_AGE_MS;
+        const settled =
+          done && runsOnce(record)
+            ? { outcome: APPLIED_BEFORE_RESTART, applied: true }
+            : tooOld
+              ? done
+                ? { outcome: PARTLY_BEFORE_RESTART, applied: true }
+                : { outcome: TOO_OLD_AFTER_RESTART, applied: false }
+              : null;
+        swept.push(
+          settled === null
+            ? yield* applyDecided(pending, application)
+            : yield* serialized(recordApplied(pending, settled.outcome, settled.applied)),
+        );
+      }
+      return swept;
+    });
 
   const reopenSuggestionCommand = (input: ReopenSuggestionInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {

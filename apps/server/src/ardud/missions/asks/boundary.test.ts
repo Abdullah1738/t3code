@@ -481,27 +481,32 @@ describe("boundary review regressions", () => {
     const { layer } = harness();
     return Effect.gen(function* () {
       yield* seed;
+      yield* TestClock.setTime(T0 + MINUTE);
       const asks = yield* AsksService.AsksService;
       const store = yield* MissionStore.MissionStore;
-      const propose = (title: string) =>
+      const propose = (title: string, after: unknown = { name: title }) =>
         asks.proposeSuggestion(
           {
             missionId,
             targetKind: "lane",
             target: { kind: "lane", id: "lane-api" },
             title,
-            after: { name: title },
+            after,
             diffText: `API -> ${title}`,
             why: "It grew.",
             evidence: [{ kind: "lane", id: "lane-api" }],
           },
           governor,
         );
+      const split = (title: string) => propose(title, { split: { name: title } });
       // The state a crash leaves: the decision committed, no outcome yet.
-      const acceptedThenCrashed = (suggestion: Suggestion) =>
+      const acceptedThenCrashed = (
+        suggestion: Suggestion,
+        options: { readonly global?: boolean; readonly decidedAt?: string } = {},
+      ) =>
         store.commit({
           event: {
-            missionId,
+            missionId: options.global ? AsksService.GLOBAL_TIMELINE : missionId,
             kind: "suggestion.decided",
             actor: { _tag: "thread", threadId: masterThread },
             provenance: master,
@@ -512,25 +517,53 @@ describe("boundary review regressions", () => {
           upserts: [
             {
               _tag: "suggestion",
-              record: { ...suggestion, status: "accepted", decidedBy: master, decidedAt: at },
+              record: {
+                ...suggestion,
+                ...(options.global ? { missionId: null } : {}),
+                status: "accepted",
+                decidedBy: master,
+                decidedAt: options.decidedAt ?? at,
+              },
             },
           ],
         });
+      // What the applier committed before the crash, on the lane's mission.
+      const appliedBeforeCrash = (
+        decision: MissionStore.MissionCommitResult,
+        kind: "lane.updated" | "lane.split",
+      ) =>
+        store.commit({
+          event: {
+            missionId,
+            kind,
+            actor: { _tag: "system", component: "missions" },
+            provenance: master,
+            summary: "Lane changed",
+            subject: { kind: "lane", id: "lane-api" },
+            causedBy: decision.event.id,
+          },
+        });
+
       const fresh = yield* propose("API v2");
-      const freshDecision = yield* acceptedThenCrashed(fresh);
-      // This one's applier committed its change before the crash.
+      yield* acceptedThenCrashed(fresh);
+      // Its rename committed, then the server stopped: setting it again is harmless.
       const halfDone = yield* propose("API v3");
-      const halfDoneDecision = yield* acceptedThenCrashed(halfDone);
-      yield* store.commit({
-        event: {
-          missionId,
-          kind: "lane.updated",
-          actor: { _tag: "system", component: "missions" },
-          provenance: master,
-          summary: "Lane renamed",
-          subject: { kind: "lane", id: "lane-api" },
-          causedBy: halfDoneDecision.event.id,
-        },
+      yield* appliedBeforeCrash(yield* acceptedThenCrashed(halfDone), "lane.updated");
+      // Splitting again would add a second lane, so a split that left its
+      // mark is not run again, even when it landed on another timeline.
+      const splitDone = yield* split("API edge");
+      yield* appliedBeforeCrash(yield* acceptedThenCrashed(splitDone), "lane.split");
+      const globalSplitDone = yield* split("API batch");
+      yield* appliedBeforeCrash(
+        yield* acceptedThenCrashed(globalSplitDone, { global: true }),
+        "lane.split",
+      );
+      const splitPending = yield* split("API admin");
+      yield* acceptedThenCrashed(splitPending);
+      // Decided two days ago: too late to apply quietly.
+      const stale = yield* propose("API v0");
+      yield* acceptedThenCrashed(stale, {
+        decidedAt: "2026-10-15T08:00:00.000Z",
       });
 
       const applied: string[] = [];
@@ -538,27 +571,31 @@ describe("boundary review regressions", () => {
       yield* registry.register(["lane"], (application) =>
         Effect.sync(() => {
           applied.push(application.suggestion.id);
-          return `Applied: lane renamed to ${(application.after as { name: string }).name}.`;
+          return `Applied: ${application.suggestion.title}.`;
         }),
       );
 
       yield* asks.applyPendingSuggestions;
-      expect(applied).toEqual([fresh.id]);
+      expect(applied.toSorted()).toEqual([fresh.id, halfDone.id, splitPending.id].toSorted());
       const outcomeOf = (id: string) =>
         store
           .get("suggestion", id)
           .pipe(Effect.map((found) => (found._tag === "Some" ? found.value.outcome : null)));
-      expect(yield* outcomeOf(fresh.id)).toBe("Applied: lane renamed to API v2.");
-      expect(yield* outcomeOf(halfDone.id)).toMatch(/^Applied before a restart/);
-      const events = yield* store.eventsSince(missionId, 0);
-      const appliedEvents = events.filter((event) => event.kind === "suggestion.applied");
-      expect(appliedEvents.map((event) => event.causedBy).toSorted()).toEqual(
-        [freshDecision.event.id, halfDoneDecision.event.id].toSorted(),
-      );
+      expect(yield* outcomeOf(fresh.id)).toBe("Applied: API v2.");
+      expect(yield* outcomeOf(halfDone.id)).toBe("Applied: API v3.");
+      expect(yield* outcomeOf(splitPending.id)).toBe("Applied: API admin.");
+      expect(yield* outcomeOf(splitDone.id)).toMatch(/^Applied before a restart:/);
+      expect(yield* outcomeOf(globalSplitDone.id)).toMatch(/^Applied before a restart:/);
+      expect(yield* outcomeOf(stale.id)).toMatch(/^Not applied: .*more than a day old/);
+      const outcomes = [
+        ...(yield* store.eventsSince(missionId, 0)),
+        ...(yield* store.eventsSince(AsksService.GLOBAL_TIMELINE, 0)),
+      ].filter((event) => event.kind === "suggestion.applied");
+      expect(outcomes).toHaveLength(6);
 
       // A second sweep finds nothing left to do.
       yield* asks.applyPendingSuggestions;
-      expect(applied).toEqual([fresh.id]);
+      expect(applied).toHaveLength(3);
     }).pipe(Effect.provide(layer));
   });
 
