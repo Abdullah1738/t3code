@@ -229,6 +229,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.missionsRooms]: AuthOrchestrationReadScope,
   [WS_METHODS.missionsRoomPage]: AuthOrchestrationReadScope,
   [WS_METHODS.missionsMessageBody]: AuthOrchestrationReadScope,
+  [WS_METHODS.missionsRoomTuning]: AuthOrchestrationReadScope,
+  [WS_METHODS.missionsAttention]: AuthOrchestrationReadScope,
 } as const satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>;
 
 export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {

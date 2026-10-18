@@ -99,4 +99,29 @@ describe("router WS handlers", () => {
       assert.deepStrictEqual(h.sent, []);
     }).pipe(Effect.provide(h.layer));
   });
+
+  it.effect("the owner tunes rooms from the app; any client reads the rules", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const app = makeRouterWsHandlers(router, { surface: "web", session: paired });
+      const cli = makeRouterWsHandlers(router, { surface: "web", session: cliIssued });
+      const tune = { roomId: control, muted: true } as const;
+      assert.strictEqual(
+        yield* failureCode(cli[WS_METHODS.missionsTuneRoom](tune)),
+        "provenance-required",
+      );
+      const tuned = yield* app[WS_METHODS.missionsTuneRoom](tune);
+      assert.strictEqual(tuned.muted, true);
+      const read = yield* cli[WS_METHODS.missionsRoomTuning]({ roomId: control });
+      assert.strictEqual(read.muted, true);
+      assert.strictEqual(
+        yield* failureCode(cli[WS_METHODS.missionsAttention]({ missionId })),
+        "provenance-required",
+      );
+      const view = yield* app[WS_METHODS.missionsAttention]({ missionId });
+      assert.deepStrictEqual(view.entries, []);
+    }).pipe(Effect.provide(h.layer));
+  });
 });

@@ -93,6 +93,7 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.missionsSubscribeRoom]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsSetMember]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsDecideKnock]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsTuneRoom]: AuthOrchestrationOperateScope,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 

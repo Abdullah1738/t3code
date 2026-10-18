@@ -11,6 +11,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import {
@@ -650,6 +651,149 @@ describe("rooms", () => {
       const body = yield* router.messageBody({ messageId: newest.messages[1]!.id }, ownerApp);
       assert.strictEqual(body.body, "body 5");
       assert.strictEqual(newest.room.noise?.messagesPerHour, 5);
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
+describe("room tuning", () => {
+  const writerRule = {
+    subscriber: { _tag: "role", roleId: RoleId.make("role-writer") },
+    mode: "wake",
+    wakeOn: ["request"],
+  } as const;
+
+  it.effect("a muted room wakes only the actors a message names", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const tuned = yield* router.tuneRoom(
+        { roomId: control, muted: true, rules: [writerRule] },
+        agent(masterThread),
+      );
+      assert.strictEqual(tuned.muted, true);
+      assert.deepStrictEqual(
+        tuned.subscriptions.map((sub) => [sub.subscriber, sub.mode, sub.wakeOn]),
+        [[writerRule.subscriber, "wake", ["request"]]],
+      );
+      yield* router.post(request("anyone?"), agent(laneThread));
+      assert.deepStrictEqual(wakesFor(h.sent, writerThread), []);
+      yield* router.post(request("writer, this one", { to: toWriter }), agent(laneThread));
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
+      yield* router.markRead({ roomId: control, seq: 2 }, agent(writerThread));
+      yield* router.settled(writerThread);
+
+      yield* router.tuneRoom({ roomId: control, muted: false }, ownerApp);
+      yield* router.post(request("anyone now?"), agent(laneThread));
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 2);
+
+      const read = yield* router.roomTuning({ roomId: control }, agent(laneThread));
+      assert.strictEqual(read.muted, false);
+      assert.strictEqual(read.subscriptions.length, 1);
+      const events = yield* (yield* MissionStore.MissionStore).eventsSince(missionId, 0);
+      assert.deepStrictEqual(
+        events.filter((event) => event.kind === "room.tuned").map((event) => event.payload),
+        [
+          { muted: true, rules: [{ ...writerRule, wakeOn: ["request"] }] },
+          { muted: false, rules: [] },
+        ],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("only the owner or the master tunes, with one rule per subscriber", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      assert.strictEqual(
+        yield* failureCode(router.tuneRoom({ roomId: control, muted: true }, agent(laneThread))),
+        "forbidden",
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.tuneRoom({ roomId: control, rules: [writerRule, writerRule] }, ownerApp),
+        ),
+        "invalid",
+      );
+      assert.strictEqual(
+        yield* failureCode(router.tuneRoom({ roomId: control }, ownerApp)),
+        "invalid",
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.tuneRoom(
+            {
+              roomId: control,
+              rules: [{ subscriber: { _tag: "thread", threadId: strayThread }, mode: "wake" }],
+            },
+            agent(masterThread),
+          ),
+        ),
+        "forbidden",
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
+describe("reminders", () => {
+  const remindersFor = (sent: ReadonlyArray<Sent>, threadId: ThreadId) =>
+    sent.filter((each) => each.threadId === threadId && each.key.startsWith("mission-remind:"));
+
+  it.effect("an idle thread gets one reminder per delivery, then the master sees it", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* router.post(request("review my draft", { to: toWriter }), agent(laneThread));
+      assert.strictEqual(yield* router.remind, 0);
+
+      yield* TestClock.adjust("31 minutes");
+      h.activity.set(writerThread, "running");
+      assert.strictEqual(yield* router.remind, 0);
+      h.activity.set(writerThread, "idle");
+      assert.strictEqual(yield* router.remind, 1);
+      const [reminder] = remindersFor(h.sent, writerThread);
+      assert.include(reminder?.text ?? "", "unread for over 30 minutes");
+      assert.strictEqual(yield* router.remind, 0);
+
+      yield* TestClock.adjust("31 minutes");
+      assert.strictEqual(yield* router.remind, 0);
+      assert.strictEqual(remindersFor(h.sent, writerThread).length, 1);
+
+      const view = yield* router.attention({ missionId }, agent(masterThread));
+      assert.deepStrictEqual(
+        view.entries.map((entry) => [entry.threadId, entry.message.summary]),
+        [[writerThread, "review my draft"]],
+      );
+      assert.strictEqual(
+        yield* failureCode(router.attention({ missionId }, agent(laneThread))),
+        "forbidden",
+      );
+
+      yield* router.markRead({ roomId: control, seq: 1 }, agent(writerThread));
+      assert.deepStrictEqual((yield* router.attention({ missionId }, ownerApp)).entries, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a thread is reminded at most once per 30 minutes", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* router.post(request("first", { to: toWriter }), agent(laneThread));
+      yield* TestClock.adjust("20 minutes");
+      yield* router.post(request("second", { to: toWriter }), agent(laneThread));
+      yield* TestClock.adjust("11 minutes");
+      assert.strictEqual(yield* router.remind, 1);
+      yield* TestClock.adjust("20 minutes");
+      // "second" is now stale too, but the last reminder was 20 minutes ago.
+      assert.strictEqual(yield* router.remind, 0);
+      yield* TestClock.adjust("11 minutes");
+      assert.strictEqual(yield* router.remind, 1);
+      assert.strictEqual(remindersFor(h.sent, writerThread).length, 2);
+      yield* TestClock.adjust("31 minutes");
+      assert.strictEqual(yield* router.remind, 0);
     }).pipe(Effect.provide(h.layer));
   });
 });

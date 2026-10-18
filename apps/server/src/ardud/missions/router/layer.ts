@@ -1,6 +1,7 @@
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 
 import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
@@ -13,6 +14,7 @@ import * as CoordShim from "./coordShim.ts";
 import { installSendGuard, requireSendGuard } from "./guardHook.ts";
 import * as MissionRouter from "./MissionRouter.ts";
 import { threadsLayer } from "./ports.ts";
+import { REMIND_SWEEP } from "./reminders.ts";
 import * as RouterStore from "./RouterStore.ts";
 
 // A server that loads the router runs missions, and layers below it (the
@@ -64,8 +66,8 @@ const onDomainEvent =
   };
 
 /**
- * Installs the send guard for every transport into a thread, and follows
- * run updates so doorbells ring when threads go idle (no polling).
+ * Installs the send guard for every transport into a thread, follows run
+ * updates so doorbells ring when threads go idle, and sweeps for reminders.
  */
 export const RouterLive = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -80,6 +82,11 @@ export const RouterLive = Layer.effectDiscard(
           }),
         ),
       ),
+    );
+    // Reminders look for stale deliveries on a slow timer; each pass is
+    // bounded by the 30-minute rules in reminders.ts, not by the timer.
+    yield* forkParked(
+      router.remind.pipe(Effect.repeat(Schedule.spaced(REMIND_SWEEP)), Effect.asVoid),
     );
   }),
 ).pipe(Layer.provideMerge(RouterServicesLive));

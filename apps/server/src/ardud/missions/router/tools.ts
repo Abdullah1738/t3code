@@ -1,11 +1,14 @@
 import {
   DecideKnockInput,
   MarkReadInput,
+  MissionAttentionInput,
   MissionId,
   OrchestratorMcpFailure,
   RoomPageInput,
+  RoomTuningInput,
   SetMissionMemberInput,
   SubscribeRoomInput,
+  TuneRoomInput,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
@@ -107,6 +110,36 @@ const MissionSetMemberTool = Tool.make("mission_set_member", {
   dependencies,
 });
 
+const MissionRoomTuningTool = Tool.make("mission_room_tuning", {
+  description:
+    "A room's wake rules: whether it is muted and each subscriber's mode and wakeOn kinds.",
+  parameters: RoomTuningInput,
+  success: Schema.Struct({ tuning: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionTuneRoomTool = Tool.make("mission_tune_room", {
+  description:
+    "As the mission's master, mute or unmute a room and set wake rules for any of its subscribers (mode wake|read|mute, wakeOn kinds), as one logged change. A muted room wakes only the actors a message names.",
+  parameters: TuneRoomInput,
+  success: Schema.Struct({ tuning: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionAttentionTool = Tool.make("mission_attention", {
+  description:
+    "As the mission's master, messages members left unread after their one reminder. The router does not ring for them again; chase or reassign them yourself.",
+  parameters: MissionAttentionInput,
+  success: Schema.Struct({ entries: Records }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
 interface ToolConfig {
   readonly parameters: Schema.Constraint;
   readonly success: Schema.Constraint;
@@ -137,4 +170,7 @@ export const RouterToolkit = Toolkit.make(
   annotated(MissionKnocksTool, "Mission knocks", true),
   annotated(MissionKnockDecideTool, "Decide a mission knock", false),
   annotated(MissionSetMemberTool, "Set a mission member", false),
+  annotated(MissionRoomTuningTool, "Mission room wake rules", true),
+  annotated(MissionTuneRoomTool, "Tune a mission room", false),
+  annotated(MissionAttentionTool, "Mission attention", true),
 );

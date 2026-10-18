@@ -13,6 +13,8 @@ import {
   type MarkReadInput,
   type MessageBodyInput,
   type MissionActor,
+  type MissionAttention,
+  type MissionAttentionInput,
   type MissionMessage,
   type MissionMessageBody,
   type MissionMutationResult,
@@ -22,9 +24,12 @@ import {
   type Room,
   type RoomPage,
   type RoomPageInput,
+  type RoomTuning,
+  type RoomTuningInput,
   type SetMissionMemberInput,
   type SubscribeRoomInput,
   type Subscription,
+  type TuneRoomInput,
   type WorkItem,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -70,7 +75,14 @@ import {
   type SendSender,
 } from "./model.ts";
 import { RouterThreads } from "./ports.ts";
-import { RouterStore, type RecipientRow } from "./RouterStore.ts";
+import {
+  REMIND_AFTER_MS,
+  REMIND_GAP_MS,
+  reminderDue,
+  reminderLine,
+  reminderRequestId,
+} from "./reminders.ts";
+import { RouterStore, type DeliveryRow, type RecipientRow } from "./RouterStore.ts";
 
 /** One unread message waiting for a thread, as `mission_inbox` shows it. */
 export interface InboxEntry {
@@ -88,6 +100,7 @@ export interface AgentInbox {
 const PAGE_DEFAULT = 50;
 const PAGE_MAX = 200;
 const INBOX_MAX = 30;
+const ATTENTION_MAX = 200;
 const LIVE_MISSIONS = ["active", "paused", "draining"];
 const MEMBER_RANK: Record<MemberKind, number> = { master: 0, created: 1, attached: 2, service: 3 };
 
@@ -227,6 +240,27 @@ export class MissionRouter extends Context.Service<
     readonly relay: (
       request: RelayRequest,
     ) => Effect.Effect<{ readonly message: MissionMessage; readonly fresh: boolean }, MissionError>;
+    /** A room's mute flag and subscriptions, for any reader of the mission. */
+    readonly roomTuning: (
+      input: RoomTuningInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<RoomTuning, MissionError>;
+    /** Owner or master: mute a room and set wake rules for its subscribers, as one event. */
+    readonly tuneRoom: (
+      input: TuneRoomInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<RoomTuning, MissionError>;
+    /**
+     * One reminder for each idle thread holding deliveries unread for over 30
+     * minutes, at most one per thread per 30 minutes; a delivery is reminded
+     * once. Returns how many threads were reminded.
+     */
+    readonly remind: Effect.Effect<number>;
+    /** Owner or master: deliveries still unread after their one reminder. */
+    readonly attention: (
+      input: MissionAttentionInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<MissionAttention, MissionError>;
   }
 >()("t3/ardud/missions/router/MissionRouter") {}
 
@@ -524,8 +558,17 @@ const make = Effect.gen(function* () {
           ...(coord === undefined ? {} : { coord }),
         };
         const speaker = authorThread ?? actingThread(provenance);
-        const deliveries = yield* deliveryThreads(cast, message, subscriptions, item, speaker);
-        const ledger = ledgerFor(cast, message, subscriptions, speaker);
+        // A muted room wakes only the actors a message names itself.
+        const silent =
+          (yield* rooms.tuning(room.id))?.muted === true &&
+          (input.to ?? []).length === 0 &&
+          !isCorrection;
+        const deliveries = silent
+          ? ([] as ReadonlyArray<ThreadId>)
+          : yield* deliveryThreads(cast, message, subscriptions, item, speaker);
+        const ledger = ledgerFor(cast, message, subscriptions, speaker).map((row) =>
+          silent ? { ...row, status: "skipped" as const } : row,
+        );
         yield* store.commit({
           event: {
             missionId: input.missionId,
@@ -809,6 +852,97 @@ const make = Effect.gen(function* () {
         alongside: rooms.upsertSubscription(subscription, key),
       });
       return subscription;
+    });
+
+  const tuningOf = (room: Room) =>
+    Effect.gen(function* () {
+      const row = yield* rooms.tuning(room.id);
+      return {
+        roomId: room.id,
+        missionId: room.missionId,
+        muted: row?.muted ?? false,
+        subscriptions: [...(yield* rooms.subscriptions(room.id))],
+        updatedAt: row?.updatedAt ?? null,
+      } satisfies RoomTuning;
+    });
+
+  const roomTuning = (input: RoomTuningInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const room = yield* loadRoom(input.roomId);
+      yield* requireReader(room.missionId, provenance);
+      return yield* tuningOf(room);
+    });
+
+  const tuneRoom = (input: TuneRoomInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const room = yield* openRoom(input.roomId, provenance);
+      const cast = yield* loadCast(room.missionId);
+      if (!isOwnerProvenance(provenance) && !isMaster(cast, provenance)) {
+        return yield* fail("forbidden", "Only the owner or the mission's master tunes a room.");
+      }
+      const rules = input.rules ?? [];
+      if (input.muted === undefined && rules.length === 0) {
+        return yield* fail("invalid", "Say whether the room is muted, or give at least one rule.");
+      }
+      const keys = rules.map((rule) => actorKey(rule.subscriber));
+      if (new Set(keys).size !== keys.length) {
+        return yield* fail("invalid", "Give each subscriber one rule.");
+      }
+      if (rules.some((rule) => rule.subscriber._tag === "owner")) {
+        return yield* fail("invalid", "The owner is not a room subscriber.");
+      }
+      yield* requireInMission(
+        cast,
+        rules.map((rule) => rule.subscriber),
+      );
+      const at = yield* nowIso;
+      const existing = yield* rooms.subscriptions(room.id);
+      const subscriptions = rules.map((rule, index): Subscription => {
+        const key = keys[index]!;
+        const prior = existing.find((sub) => actorKey(sub.subscriber) === key);
+        return {
+          id: prior?.id ?? SubscriptionId.make(`${room.id}:sub:${key}`),
+          roomId: room.id,
+          subscriber: rule.subscriber,
+          mode: rule.mode,
+          wakeOn: [...(rule.wakeOn ?? defaultWakeOn(rule.mode))],
+          createdAt: prior?.createdAt ?? at,
+        };
+      });
+      const muted = input.muted ?? (yield* rooms.tuning(room.id))?.muted ?? false;
+      const parts = [
+        ...(input.muted === undefined ? [] : [muted ? "muted" : "unmuted"]),
+        ...(rules.length === 0
+          ? []
+          : [`${rules.length} wake rule${rules.length === 1 ? "" : "s"}`]),
+      ];
+      yield* store.commit({
+        event: {
+          missionId: room.missionId,
+          kind: "room.tuned",
+          actor: actorOf(provenance),
+          provenance,
+          summary: clipSummary(`${room.title} tuned: ${parts.join(", ")}`),
+          subject: { kind: "room", id: room.id, label: room.title },
+          payload: {
+            muted,
+            rules: subscriptions.map(({ subscriber, mode, wakeOn }) => ({
+              subscriber,
+              mode,
+              wakeOn,
+            })),
+          },
+          at,
+        },
+        alongside: Effect.all(
+          [
+            rooms.putTuning({ roomId: room.id, missionId: room.missionId, muted, updatedAt: at }),
+            ...subscriptions.map((sub, index) => rooms.upsertSubscription(sub, keys[index]!)),
+          ],
+          { discard: true },
+        ),
+      });
+      return yield* tuningOf(room);
     });
 
   const setMember = (input: SetMissionMemberInput, provenance: MissionProvenance) =>
@@ -1140,6 +1274,92 @@ const make = Effect.gen(function* () {
       yield* poke(threadId);
     });
 
+  /** One thread's reminder, under the bell lock. True when it was sent. */
+  const remindThread = (
+    threadId: ThreadId,
+    stale: ReadonlyArray<DeliveryRow>,
+    gapCutoff: string,
+  ): Effect.Effect<boolean, MissionError> =>
+    Effect.gen(function* () {
+      if (!reminderDue(yield* rooms.lastReminderAt(threadId), gapCutoff)) return false;
+      const facts = yield* threads.facts(threadId);
+      if (facts?.activity !== "idle") return false;
+      // Idle with an outstanding wake: that run ended without a settle.
+      if ((yield* rooms.doorbell(threadId))?.outstanding === true) {
+        yield* rooms.settle(threadId, yield* nowIso);
+      }
+      const unread = yield* rooms.unreadDeliveries(threadId);
+      const titles = new Set<string>();
+      for (const roomId of new Set(unread.map((delivery) => delivery.roomId))) {
+        titles.add((yield* rooms.room(roomId))?.title ?? roomId);
+      }
+      const oldest = stale.reduce((a, b) => (b.seq < a.seq ? b : a));
+      const newest = unread.reduce((a, b) => (b.seq > a.seq ? b : a), oldest);
+      const wakeId = reminderRequestId(newest.missionId, threadId, newest.seq);
+      yield* threads.send({
+        threadId,
+        text: reminderLine({
+          unread: unread.length,
+          rooms: [...titles],
+          oldest: yield* rooms.messageById(oldest.messageId),
+        }),
+        key: wakeId,
+        asOwner: false,
+      });
+      const at = yield* nowIso;
+      yield* rooms.ring({
+        threadId,
+        missionId: newest.missionId,
+        wakeId,
+        upToSeq: newest.seq,
+        at,
+      });
+      yield* rooms.markReminded(stale, at);
+      return true;
+    });
+
+  const remind = Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const ago = (ms: number) => DateTime.formatIso(DateTime.subtract(now, { milliseconds: ms }));
+    const stale = yield* rooms.staleDeliveries(ago(REMIND_AFTER_MS));
+    const byThread = new Map<ThreadId, DeliveryRow[]>();
+    for (const delivery of stale) {
+      const list = byThread.get(delivery.threadId) ?? [];
+      list.push(delivery);
+      byThread.set(delivery.threadId, list);
+    }
+    let reminded = 0;
+    for (const [threadId, rows] of byThread) {
+      const sent = yield* bellLock
+        .withPermit(remindThread(threadId, rows, ago(REMIND_GAP_MS)))
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("missions router: reminder failed", { threadId, cause }).pipe(
+              Effect.as(false),
+            ),
+          ),
+        );
+      if (sent) reminded += 1;
+    }
+    return reminded;
+  });
+
+  const attention = (input: MissionAttentionInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const cast = yield* loadCast(input.missionId);
+      if (!isOwnerProvenance(provenance) && !isMaster(cast, provenance)) {
+        return yield* fail(
+          "forbidden",
+          "Only the owner or the mission's master reads the attention view.",
+        );
+      }
+      const rows = yield* rooms.attention(input.missionId, ATTENTION_MAX);
+      return {
+        missionId: input.missionId,
+        entries: rows.map((row) => ({ ...row })),
+      } satisfies MissionAttention;
+    });
+
   const knocks = (missionId: MissionId, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const pending = yield* store.list("knock", { missionId, status: ["pending"] });
@@ -1184,6 +1404,10 @@ const make = Effect.gen(function* () {
     poke,
     settled,
     relay,
+    roomTuning,
+    tuneRoom,
+    remind,
+    attention,
   });
 });
 

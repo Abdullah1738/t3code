@@ -413,6 +413,11 @@ import {
   SetMissionMemberInput,
   SubscribeRoomInput,
   Subscription,
+  MissionAttention,
+  MissionAttentionInput,
+  RoomTuning,
+  RoomTuningInput,
+  TuneRoomInput,
 } from "./ardud/missions.ts";
 // ardud missions: policy
 import { MissionsPolicyRpcs } from "./ardud/missionsPolicyRpc.ts";
@@ -637,6 +642,9 @@ export const WS_METHODS = {
   missionsSubscribeRoom: "missions.subscribeRoom",
   missionsSetMember: "missions.setMember",
   missionsDecideKnock: "missions.decideKnock",
+  missionsRoomTuning: "missions.roomTuning",
+  missionsTuneRoom: "missions.tuneRoom",
+  missionsAttention: "missions.attention",
   // Slots, policy: missionsSetRoleModel, missionsSetPoolCapacity,
   // missionsUpdateReviewPolicy.
 
@@ -2154,6 +2162,17 @@ const WsMissionsDecideKnockRpc = missionRpc(
   DecideKnockInput,
   Knock,
 );
+const WsMissionsRoomTuningRpc = missionRpc(
+  WS_METHODS.missionsRoomTuning,
+  RoomTuningInput,
+  RoomTuning,
+);
+const WsMissionsTuneRoomRpc = missionRpc(WS_METHODS.missionsTuneRoom, TuneRoomInput, RoomTuning);
+const WsMissionsAttentionRpc = missionRpc(
+  WS_METHODS.missionsAttention,
+  MissionAttentionInput,
+  MissionAttention,
+);
 
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
@@ -2236,6 +2255,9 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsSubscribeRoomRpc,
   WsMissionsSetMemberRpc,
   WsMissionsDecideKnockRpc,
+  WsMissionsRoomTuningRpc,
+  WsMissionsTuneRoomRpc,
+  WsMissionsAttentionRpc,
 ).middleware(RpcScopeAuthorization);
 
 // ardud missions: policy

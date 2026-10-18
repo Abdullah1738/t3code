@@ -36,6 +36,9 @@ import type { MemberKind } from "./model.ts";
  * - `recipients`: coord's delivery ledger, one row per (message, recipient
  *   actor key) with `pending`/`skipped` and an ack time. It answers the coord
  *   shim's inbox and ack the way coord.db did; wakes stay with `deliveries`.
+ * - `tuning`: per-room mute flag and when the owner or master last tuned it.
+ * - `reminders`: deliveries that got their one reminder. Still unread after it
+ *   means the master's attention view, never another ring.
  */
 const DDL = [
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_rooms (
@@ -131,6 +134,21 @@ const DDL = [
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_mission_router_recipients_by_actor
     ON ardud_mission_router_recipients (mission_id, recipient, seq)`,
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_tuning (
+    room_id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL,
+    muted INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_reminders (
+    thread_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    reminded_at TEXT NOT NULL,
+    PRIMARY KEY (thread_id, mission_id, seq)
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_mission_router_reminders_by_mission
+    ON ardud_mission_router_reminders (mission_id, seq)`,
 ];
 
 const encodeRoom = Schema.encodeSync(Schema.fromJsonString(Room));
@@ -170,6 +188,20 @@ export interface MemberRow {
 export interface StoredMessage {
   readonly message: MissionMessage;
   readonly contentHash: string;
+}
+
+export interface TuningRow {
+  readonly roomId: RoomId;
+  readonly missionId: MissionId;
+  readonly muted: boolean;
+  readonly updatedAt: string;
+}
+
+/** A delivery reminded once and still unread. */
+export interface AttentionRow {
+  readonly threadId: ThreadId;
+  readonly message: MissionMessage;
+  readonly remindedAt: string;
 }
 
 /** One coord-ledger row: who a message was for and whether it should wake them. */
@@ -315,6 +347,18 @@ export class RouterStore extends Context.Service<
     readonly settle: (threadId: ThreadId, at: string) => Effect.Effect<boolean>;
     readonly markActed: (threadId: ThreadId) => Effect.Effect<void>;
     readonly wastedWakesSince: (roomId: RoomId, sinceIso: string) => Effect.Effect<number>;
+    readonly tuning: (roomId: RoomId) => Effect.Effect<TuningRow | null>;
+    /** Runs inside a core commit (the `room.tuned` event). */
+    readonly putTuning: (row: TuningRow) => Effect.Effect<void>;
+    /** Unread deliveries never reminded whose message was posted at or before `cutoffIso`. */
+    readonly staleDeliveries: (cutoffIso: string) => Effect.Effect<ReadonlyArray<DeliveryRow>>;
+    readonly lastReminderAt: (threadId: ThreadId) => Effect.Effect<string | null>;
+    readonly markReminded: (rows: ReadonlyArray<DeliveryRow>, at: string) => Effect.Effect<void>;
+    /** Reminded deliveries of a mission that are still unread, oldest first. */
+    readonly attention: (
+      missionId: MissionId,
+      limit: number,
+    ) => Effect.Effect<ReadonlyArray<AttentionRow>>;
   }
 >()("t3/ardud/missions/router/RouterStore") {}
 
@@ -931,6 +975,109 @@ const make = Effect.gen(function* () {
             AND w.acted = 0
             AND w.rung_at >= ${sinceIso}
         `.pipe(Effect.map((rows) => Number(rows[0]?.count ?? 0))),
+      ),
+
+    tuning: (roomId) =>
+      read(
+        sql<{
+          readonly roomId: string;
+          readonly missionId: string;
+          readonly muted: number;
+          readonly updatedAt: string;
+        }>`
+          SELECT room_id AS "roomId", mission_id AS "missionId", muted AS "muted",
+            updated_at AS "updatedAt"
+          FROM ardud_mission_router_tuning WHERE room_id = ${roomId}
+        `.pipe(
+          Effect.map((rows) => {
+            const row = rows[0];
+            return row === undefined
+              ? null
+              : {
+                  roomId: row.roomId as RoomId,
+                  missionId: row.missionId as MissionId,
+                  muted: Number(row.muted) === 1,
+                  updatedAt: row.updatedAt,
+                };
+          }),
+        ),
+      ),
+
+    putTuning: (row) =>
+      write(sql`
+        INSERT INTO ardud_mission_router_tuning ${sql.insert({
+          room_id: row.roomId,
+          mission_id: row.missionId,
+          muted: row.muted ? 1 : 0,
+          updated_at: row.updatedAt,
+        })}
+        ON CONFLICT (room_id) DO UPDATE SET
+          muted = excluded.muted,
+          updated_at = excluded.updated_at
+      `),
+
+    staleDeliveries: (cutoffIso) =>
+      read(
+        sql<DeliveryDbRow>`
+          SELECT d.thread_id AS "threadId", d.mission_id AS "missionId", d.seq AS "seq",
+            d.room_id AS "roomId", d.message_id AS "messageId", d.wake_id AS "wakeId"
+          FROM ardud_mission_router_deliveries d
+          JOIN ardud_mission_router_messages m
+            ON m.mission_id = d.mission_id AND m.seq = d.seq
+          LEFT JOIN ardud_mission_router_reminders r
+            ON r.thread_id = d.thread_id AND r.mission_id = d.mission_id AND r.seq = d.seq
+          WHERE d.read = 0 AND r.thread_id IS NULL AND m.created_at <= ${cutoffIso}
+          ORDER BY d.thread_id, d.mission_id, d.seq
+        `.pipe(Effect.map((rows) => rows.map(toDelivery))),
+      ),
+
+    lastReminderAt: (threadId) =>
+      read(
+        sql<{ readonly at: string | null }>`
+          SELECT MAX(reminded_at) AS "at"
+          FROM ardud_mission_router_reminders WHERE thread_id = ${threadId}
+        `.pipe(Effect.map((rows) => rows[0]?.at ?? null)),
+      ),
+
+    markReminded: (rows, at) =>
+      write(
+        Effect.forEach(
+          rows,
+          (row) => sql`
+            INSERT INTO ardud_mission_router_reminders ${sql.insert({
+              thread_id: row.threadId,
+              mission_id: row.missionId,
+              seq: row.seq,
+              reminded_at: at,
+            })}
+            ON CONFLICT (thread_id, mission_id, seq) DO NOTHING
+          `,
+          { discard: true },
+        ).pipe(sql.withTransaction),
+      ),
+
+    attention: (missionId, limit) =>
+      read(
+        sql<{ readonly threadId: string; readonly json: string; readonly remindedAt: string }>`
+          SELECT r.thread_id AS "threadId", m.message_json AS "json",
+            r.reminded_at AS "remindedAt"
+          FROM ardud_mission_router_reminders r
+          JOIN ardud_mission_router_deliveries d
+            ON d.thread_id = r.thread_id AND d.mission_id = r.mission_id AND d.seq = r.seq
+          JOIN ardud_mission_router_messages m
+            ON m.mission_id = r.mission_id AND m.seq = r.seq
+          WHERE r.mission_id = ${missionId} AND d.read = 0
+          ORDER BY r.seq, r.thread_id
+          LIMIT ${limit}
+        `.pipe(
+          Effect.map((rows) =>
+            rows.map((row) => ({
+              threadId: row.threadId as ThreadId,
+              message: decodeMessage(row.json),
+              remindedAt: row.remindedAt,
+            })),
+          ),
+        ),
       ),
   });
 });

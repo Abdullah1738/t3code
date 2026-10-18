@@ -82,6 +82,21 @@ const handlers = {
   mission_set_member: McpToolAccess.actsAsCaller((input) =>
     asCaller((router, _threadId, provenance) => router.setMember(input, provenance)),
   ),
+  mission_room_tuning: McpToolAccess.readsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.roomTuning(input, provenance).pipe(Effect.map((tuning) => ({ tuning }))),
+    ),
+  ),
+  mission_tune_room: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.tuneRoom(input, provenance).pipe(Effect.map((tuning) => ({ tuning }))),
+    ),
+  ),
+  mission_attention: McpToolAccess.readsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.attention(input, provenance).pipe(Effect.map(({ entries }) => ({ entries }))),
+    ),
+  ),
 } satisfies McpToolAccess.Handlers<typeof RouterToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(RouterToolkit, handlers);

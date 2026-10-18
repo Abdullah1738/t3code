@@ -234,4 +234,25 @@ describe("router MCP tools", () => {
       expect(outcome._tag).toBe("routed");
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect("the master tunes a room through its tool; any member reads the rules", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const args = {
+        roomId: control,
+        muted: true,
+        rules: [{ subscriber: { _tag: "thread", threadId: writerThread }, mode: "read" }],
+      };
+      expect((yield* call("mission_tune_room", laneThread, args)).isError).toBe(true);
+      expect((yield* call("mission_tune_room", masterThread, args)).isError).toBe(false);
+      const read = yield* call("mission_room_tuning", laneThread, { roomId: control });
+      expect(read.structured).toMatchObject({
+        tuning: { muted: true, subscriptions: [{ mode: "read", wakeOn: [] }] },
+      });
+      const attention = yield* call("mission_attention", masterThread, { missionId });
+      expect(attention.structured).toEqual({ entries: [] });
+      expect((yield* call("mission_attention", laneThread, { missionId })).isError).toBe(true);
+    }).pipe(Effect.provide(layer));
+  });
 });

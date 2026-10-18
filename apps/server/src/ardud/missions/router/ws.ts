@@ -5,6 +5,7 @@ import {
   type MissionProvenance,
   type MissionRoomsInput,
   type RoomPageInput,
+  type RoomTuningInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
@@ -16,9 +17,10 @@ import type { MissionRouter } from "./MissionRouter.ts";
 const CLIENT_READER: MissionProvenance = { _tag: "system", component: "ws-client" };
 
 /**
- * Router WS handlers: rooms, pages and bodies for any connection with read
- * scope; posting, reading, subscriptions, members and knock decisions only
- * from a paired Robob client session, with owner provenance from the session.
+ * Router WS handlers: rooms, pages, bodies and room wake rules for any
+ * connection with read scope; posting, reading, subscriptions, members, knock
+ * decisions, room tuning and the attention view only from a paired Robob
+ * client session, with owner provenance from the session.
  */
 export const makeRouterWsHandlers = (
   router: MissionRouter["Service"],
@@ -48,5 +50,9 @@ export const makeRouterWsHandlers = (
     [WS_METHODS.missionsSubscribeRoom]: asOwner(router.subscribe),
     [WS_METHODS.missionsSetMember]: asOwner(router.setMember),
     [WS_METHODS.missionsDecideKnock]: asOwner(router.decideKnock),
+    [WS_METHODS.missionsRoomTuning]: (input: RoomTuningInput) => router.roomTuning(input, reader),
+    [WS_METHODS.missionsTuneRoom]: asOwner(router.tuneRoom),
+    // The attention view is the owner's and the master's, so it needs the paired session too.
+    [WS_METHODS.missionsAttention]: asOwner(router.attention),
   } as const;
 };

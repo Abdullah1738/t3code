@@ -1510,6 +1510,7 @@ export const MissionEventKind = Schema.Literals([
   "message.posted",
   "send.guarded",
   "member.changed",
+  "room.tuned",
   "pool.created",
   "pool.updated",
   "pool.hold-taken",
@@ -1893,6 +1894,67 @@ export const ReorderSubMissionsInput = Schema.Struct({
   order: Schema.Array(SubMissionId),
 });
 export type ReorderSubMissionsInput = typeof ReorderSubMissionsInput.Type;
+
+/** One subscriber's rule in a room: how it hears the room and which kinds wake it. */
+export const RoomWakeRule = Schema.Struct({
+  subscriber: MissionActor,
+  mode: SubscriptionMode,
+  /** Kinds that wake the subscriber. Defaults to request, blocker and control in wake mode. */
+  wakeOn: Schema.optional(Schema.Array(MissionMessageKind)),
+});
+export type RoomWakeRule = typeof RoomWakeRule.Type;
+
+/** Read one room's wake rules. */
+export const RoomTuningInput = Schema.Struct({
+  roomId: RoomId,
+});
+export type RoomTuningInput = typeof RoomTuningInput.Type;
+
+/**
+ * Owner or the mission's master: mute or unmute a room and set wake rules for
+ * any of its subscribers, as one logged change. A muted room wakes only the
+ * actors a message names.
+ */
+export const TuneRoomInput = Schema.Struct({
+  roomId: RoomId,
+  muted: Schema.optional(Schema.Boolean),
+  rules: Schema.optional(Schema.Array(RoomWakeRule)),
+});
+export type TuneRoomInput = typeof TuneRoomInput.Type;
+
+/** A room's wake rules: whether it is muted, and every subscription in it. */
+export const RoomTuning = Schema.Struct({
+  roomId: RoomId,
+  missionId: MissionId,
+  muted: Schema.Boolean,
+  subscriptions: Schema.Array(Subscription),
+  /** Last tuning change, null when the room was never tuned. */
+  updatedAt: Schema.NullOr(IsoDateTime),
+});
+export type RoomTuning = typeof RoomTuning.Type;
+
+/** The deliveries of one mission that were reminded once and are still unread. */
+export const MissionAttentionInput = Schema.Struct({
+  missionId: MissionId,
+});
+export type MissionAttentionInput = typeof MissionAttentionInput.Type;
+
+export const AttentionEntry = Schema.Struct({
+  threadId: ThreadId,
+  message: MissionMessage,
+  remindedAt: IsoDateTime,
+});
+export type AttentionEntry = typeof AttentionEntry.Type;
+
+/**
+ * The master's attention view: messages a thread left unread after its one
+ * reminder. The router never rings for them again.
+ */
+export const MissionAttention = Schema.Struct({
+  missionId: MissionId,
+  entries: Schema.Array(AttentionEntry),
+});
+export type MissionAttention = typeof MissionAttention.Type;
 
 // --- core additions ---
 
