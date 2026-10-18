@@ -29,6 +29,8 @@ import { guardMcpWrite } from "../../../ardud/missions/router/guardPaths.ts";
 import { optionalAuthorityStore } from "../../../ardud/missions/guard/authority.ts";
 import { guardFork } from "../../../ardud/missions/guard/forks.ts";
 import { guardFailure, mcpPrincipal, schedulesAs } from "../../../ardud/missions/guard/mcp.ts";
+// ardud missions: core
+import { principalActor } from "../../../ardud/missions/guard/principal.ts";
 
 function queueEntry(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
@@ -264,7 +266,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   ),
   t3_pending_request_respond: writesThread((input) =>
     Effect.gen(function* () {
-      const { threads, projection, item } = yield* readQuestion(input);
+      const { threads, projection, item, caller, scope } = yield* readQuestion(input);
       // ardud missions: router
       yield* guardThreadWrite({
         path: "request-respond",
@@ -278,6 +280,8 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           commandId: yield* newCommandId(),
           requestId: input.requestId,
           answers: input.answers,
+          // ardud missions: core - an agent's answer is recorded as the agent's.
+          createdBy: principalActor(mcpPrincipal(scope, caller)),
         })
         .pipe(Effect.mapError(dispatchFailure));
       return { sequence: result.sequence };
