@@ -128,6 +128,49 @@ describe("open ask", () => {
     expect(errorCode(openAsk(command({ input: stray })))).toBe("invalid");
   });
 
+  // Sol N8: he answers by naming an option, so two options one reply could
+  // name are refused when the ask opens.
+  it("N8: refuses options that read the same once case and lead words are set aside", () => {
+    const withOptions = (options: OpenAskInput["options"]) =>
+      openAsk(
+        command({
+          input: input({ options, recommendation: { optionId: options[0]!.id, reason: "" } }),
+        }),
+      );
+    expect(
+      errorCode(
+        withOptions([
+          { id: "a", label: "Postgres", detail: "" },
+          { id: "b", label: "postgres", detail: "" },
+        ]),
+      ),
+    ).toBe("invalid");
+    expect(
+      errorCode(
+        withOptions([
+          { id: "b", label: "Plan A", detail: "" },
+          { id: "c", label: "B", detail: "" },
+        ]),
+      ),
+    ).toBe("invalid");
+    expect(
+      errorCode(
+        withOptions([
+          { id: "cached", label: "Use cache", detail: "" },
+          { id: "plain", label: "Cache", detail: "" },
+        ]),
+      ),
+    ).toBe("invalid");
+    expect(
+      errorCode(
+        withOptions([
+          { id: "minus", label: "Pay -100", detail: "" },
+          { id: "plus", label: "Pay +100", detail: "" },
+        ]),
+      ),
+    ).toBe("ok");
+  });
+
   it("refuses asking as an identity the caller does not hold, and refuses the owner asking", () => {
     const other = command({ askedBy: { _tag: "lane", laneId: LaneId.make("lane-x") } });
     expect(errorCode(openAsk(other))).toBe("forbidden");

@@ -32,6 +32,7 @@ import {
   type Outcome,
   type Transition,
 } from "./shared.ts";
+import { optionCollision } from "./provenance.ts";
 
 /** Fields that would let an ask resolve itself. Rejected wherever they appear. */
 export const FORBIDDEN_ASK_KEYS: ReadonlyArray<string> = [
@@ -185,6 +186,9 @@ export const openAsk = (command: OpenAskCommand): Outcome<Transition<Ask>> => {
     if (optionIds.has(option.id)) return refuse("invalid", `Duplicate option id ${option.id}.`);
     optionIds.add(option.id);
   }
+  // He answers by naming an option; two options one reply could name are refused here.
+  const collision = optionCollision(input.options);
+  if (collision !== null) return refuse("invalid", collision);
   const recommendation = input.recommendation ?? null;
   if (
     recommendation !== null &&

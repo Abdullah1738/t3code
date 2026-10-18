@@ -89,8 +89,10 @@ export const verifyInbound = (
 
 // ---------------------------------------------------------------------------
 // Reply formats. Decision words are compared as normalized words (lowercase,
-// no punctuation, "don't" -> "dont"); any text that gets recorded (an edit, a
-// rewrite note, a free-text answer) must match what he typed up to whitespace.
+// no punctuation, "don't" -> "dont"); an option label or id is compared as
+// typed up to case, spacing and closing punctuation; any text that gets
+// recorded (an edit, a rewrite note, a free-text answer) must match what he
+// typed up to whitespace.
 // A reply must be exactly one of these shapes:
 //
 //   ask, option:      [go | go with | pick | choose | option | use | take | ok | yes] <label or id> [please | thanks]
@@ -304,19 +306,80 @@ interface AnswerOption {
   readonly label: string;
 }
 
-const formsOf = (option: AnswerOption): ReadonlyArray<Words> =>
-  [wordsOf(option.label), wordsOf(option.id)].filter((form) => form.length > 0);
+// An option is compared as he typed it, up to letter case, spacing, curly
+// quotes and closing punctuation (".", ",", "!", ";", ":"). Only the lead and
+// courtesy words around it are read as words. Signs, currency, percentages,
+// digits and URLs are part of the option, so "Pay -100" never matches
+// "Pay +100".
+const CLOSING_PUNCTUATION = /[\s.,!;:\u3002]+$/u;
 
-/** A one-letter id ("a", "2") inside a sentence is just a word. */
-const isLetter = (form: Words) => form.length === 1 && (form[0]?.length ?? 0) === 1;
+const optionKey = (text: string) =>
+  text
+    .normalize("NFKC")
+    .replace(/[\u2018\u2019\u02BC]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(CLOSING_PUNCTUATION, "");
+
+/** A lead or courtesy word as typed, without the punctuation that closes it. */
+const bareWord = (token: string) => token.replace(CLOSING_PUNCTUATION, "");
+
+/**
+ * Every option a reply names: [lead words] <label or id> [courtesy words], at
+ * every split. More than one means the reply is ambiguous; nothing breaks the
+ * tie.
+ */
+const optionsNamed = (options: ReadonlyArray<AnswerOption>, raw: string): ReadonlySet<string> => {
+  const tokens = optionKey(raw).split(" ");
+  const forms = options.map((option) => ({
+    id: option.id,
+    keys: new Set([optionKey(option.label), optionKey(option.id)].filter((key) => key.length > 0)),
+  }));
+  const named = new Set<string>();
+  for (let start = 0; start < tokens.length; start++) {
+    if (start > 0 && !coveredBy(tokens.slice(0, start).map(bareWord), SELECT)) continue;
+    for (let end = tokens.length; end > start; end--) {
+      if (end < tokens.length && !coveredBy(tokens.slice(end).map(bareWord), COURTESY)) continue;
+      const middle = tokens.slice(start, end).join(" ").replace(CLOSING_PUNCTUATION, "");
+      for (const form of forms) if (form.keys.has(middle)) named.add(form.id);
+    }
+  }
+  return named;
+};
+
+/**
+ * Why a set of options can't be answered by iMessage without ambiguity, or
+ * null: two options (by label, id, or one's label and the other's id) that
+ * one reply would name together, such as "Postgres" and "postgres" or a label
+ * "B" beside an option with id "b".
+ */
+export const optionCollision = (options: ReadonlyArray<AnswerOption>): string | null => {
+  for (const option of options) {
+    for (const form of [option.label, option.id]) {
+      for (const lead of ["", ...SELECT_WORDS]) {
+        for (const courtesy of ["", ...COURTESY_WORDS]) {
+          const reply = [lead, form, courtesy].filter((part) => part.length > 0).join(" ");
+          const named = [...optionsNamed(options, reply)];
+          if (named.length > 1) {
+            return `Options ${named.join(" and ")} read the same in a reply ("${reply}"); give each a distinct label and id.`;
+          }
+        }
+      }
+    }
+  }
+  return null;
+};
 
 /**
  * What an iMessage must be to answer an ask. With an option, the reply is
  * that option alone (its label or id, after an optional "go"/"pick", before an
  * optional "please"), so it never carries extra words the option could be
  * read against; a reply with more to say is recorded as a free-text answer
- * (no option) or confirmed in the app. Without an option, the reply is the
- * answer text as he typed it.
+ * (no option) or confirmed in the app. A reply that could name more than one
+ * option is refused. Without an option, the reply is the answer text as he
+ * typed it.
  */
 export const answerCheck = (input: {
   readonly options: ReadonlyArray<AnswerOption>;
@@ -333,36 +396,17 @@ export const answerCheck = (input: {
   }
   const optionId = input.optionId;
   const chosen = input.options.find((option) => option.id === optionId);
-  return ({ raw, words }) => {
+  return ({ raw }) => {
     if (chosen === undefined) return `offer option ${optionId}`;
     if (input.text.trim().length > 0) {
       return "stop at the option (record his extra words as a free-text answer instead)";
     }
     if (asksSomething(raw)) return "make a choice (it asks a question)";
-    // Every way to read the reply as [lead words] <option> [rest]; at each
-    // split the longest option form wins ("online with backup" over "online").
-    const parses: Array<{ readonly optionId: string; readonly rest: Words }> = [];
-    for (let split = 0; split < words.length; split++) {
-      if (split > 0 && !coveredBy(words.slice(0, split), SELECT)) continue;
-      const after = words.slice(split);
-      let best: { readonly optionId: string; readonly form: Words } | null = null;
-      for (const option of input.options) {
-        for (const form of formsOf(option)) {
-          if (!startsWith(after, form)) continue;
-          if (isLetter(form) && after.length !== 1) continue;
-          if (best === null || form.length > best.form.length) best = { optionId: option.id, form };
-        }
-      }
-      if (best !== null)
-        parses.push({ optionId: best.optionId, rest: after.slice(best.form.length) });
-    }
-    const named = new Set(parses.map((parse) => parse.optionId));
-    if (!named.has(optionId)) return `pick "${chosen.label}" (option ${optionId})`;
+    const named = optionsNamed(input.options, raw);
     if (named.size > 1) return "pick one option unambiguously";
-    const alone = parses.some(
-      (parse) =>
-        parse.optionId === optionId && (parse.rest.length === 0 || coveredBy(parse.rest, COURTESY)),
-    );
-    return alone ? null : `say only the option ("${chosen.label}")`;
+    if (named.size === 1 && !named.has(optionId)) {
+      return `pick "${chosen.label}" (option ${optionId})`;
+    }
+    return named.has(optionId) ? null : `say only the option ("${chosen.label}")`;
   };
 };

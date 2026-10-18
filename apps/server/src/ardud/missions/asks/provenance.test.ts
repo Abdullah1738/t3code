@@ -12,6 +12,7 @@ import { findInImsgHistory, makeInboundLookup } from "./inbound.ts";
 import {
   answerCheck,
   draftDecisionCheck,
+  optionCollision,
   type ReplyCheck,
   verifyInbound,
   type InboundMessage,
@@ -153,6 +154,95 @@ describe("iMessage provenance", () => {
     expect(picks(null, "ship friday")("Ship Friday!")).toBe(false);
     expect(picks(null, "budget 100")("budget -100")).toBe(false);
     expect(picks(null, "ship friday")("dont ship friday")).toBe(false);
+  });
+
+  // Sol N8: an option is compared as typed, so signs, currency, percentages
+  // and URLs count, and a reply that could name two options names neither.
+  it("N8: an option keeps its symbols and an ambiguous reply picks nothing", () => {
+    const pay = [
+      { id: "minus", label: "Pay -100" },
+      { id: "plus", label: "Pay +100" },
+    ];
+    expect(picks("plus", "", pay)("Pay +100")).toBe(true);
+    expect(picks("plus", "", pay)("go with pay +100, thanks")).toBe(true);
+    expect(picks("minus", "", pay)("Pay -100")).toBe(true);
+    expect(picks("plus", "", pay)("Pay -100")).toBe(false);
+    expect(picks("minus", "", pay)("Pay +100")).toBe(false);
+    expect(picks("minus", "", pay)("pay 100")).toBe(false);
+    const money = [
+      { id: "usd", label: "$100" },
+      { id: "pct", label: "100%" },
+    ];
+    expect(picks("pct", "", money)("100%")).toBe(true);
+    expect(picks("usd", "", money)("100%")).toBe(false);
+    expect(picks("usd", "", money)("100")).toBe(false);
+    const hosts = [
+      { id: "dot", label: "evil.example.com" },
+      { id: "dash", label: "evil-example.com" },
+    ];
+    expect(picks("dash", "", hosts)("evil-example.com")).toBe(true);
+    expect(picks("dot", "", hosts)("evil-example.com")).toBe(false);
+    // Two labels, a label and an id, or two ids that read the same: no tie-break.
+    const labels = [
+      { id: "x", label: "Postgres" },
+      { id: "y", label: "postgres" },
+    ];
+    expect(picks("x", "", labels)("postgres")).toBe(false);
+    expect(picks("y", "", labels)("postgres")).toBe(false);
+    const labelVsId = [
+      { id: "b", label: "Plan A" },
+      { id: "c", label: "b" },
+    ];
+    expect(picks("b", "", labelVsId)("b")).toBe(false);
+    expect(picks("c", "", labelVsId)("b")).toBe(false);
+    expect(picks("b", "", labelVsId)("plan a")).toBe(true);
+    const ids = [
+      { id: "A", label: "First" },
+      { id: "a", label: "Second" },
+    ];
+    expect(picks("A", "", ids)("a")).toBe(false);
+    expect(picks("A", "", ids)("first")).toBe(true);
+    // A lead word inside one label can make a reply name two options.
+    const lead = [
+      { id: "cached", label: "Use cache" },
+      { id: "plain", label: "Cache" },
+    ];
+    expect(picks("plain", "", lead)("use cache")).toBe(false);
+    expect(picks("cached", "", lead)("use cache")).toBe(false);
+  });
+
+  it("N8: option sets that one reply could read two ways are named at creation", () => {
+    expect(
+      optionCollision([
+        { id: "minus", label: "Pay -100" },
+        { id: "plus", label: "Pay +100" },
+      ]),
+    ).toBeNull();
+    expect(optionCollision(OPTIONS)).toBeNull();
+    for (const options of [
+      [
+        { id: "x", label: "Postgres" },
+        { id: "y", label: "postgres" },
+      ],
+      [
+        { id: "b", label: "Plan A" },
+        { id: "c", label: "b" },
+      ],
+      [
+        { id: "A", label: "First" },
+        { id: "a", label: "Second" },
+      ],
+      [
+        { id: "cached", label: "Use cache" },
+        { id: "plain", label: "Cache" },
+      ],
+      [
+        { id: "a", label: "Deploy." },
+        { id: "b", label: "deploy" },
+      ],
+    ]) {
+      expect(optionCollision(options)).not.toBeNull();
+    }
   });
 
   // Sol H9: approval needs approval words and nothing else; an edit needs the
