@@ -60,9 +60,6 @@ export interface IssuedPairingLink {
   readonly label?: string;
   readonly createdAt: DateTime.Utc;
   readonly expiresAt: DateTime.Utc;
-  // ardud missions: core
-  /** Asked for with `ownerSource`: whether the link pairs an owner device. */
-  readonly ownerMarked?: boolean;
 }
 
 export interface IssuedBearerSession {
@@ -517,8 +514,8 @@ export class EnvironmentAuth extends Context.Service<
       readonly proofKeyThumbprint?: string;
       readonly purpose?: "startup";
       // ardud missions: core
-      /** Set only by owner-run issuers (`t3 pair`, the startup URL). */
-      readonly ownerSource?: SessionOrigins.OwnerSource;
+      /** Set only by `issuePairingCredential` when the issuer is an owner session. */
+      readonly ownerSource?: "paired-client";
     }) => Effect.Effect<IssuedPairingLink, ServerAuthInternalError>;
     readonly issuePairingCredential: (
       input?: AuthCreatePairingCredentialInput,
@@ -774,9 +771,8 @@ export const make = Effect.gen(function* () {
       Effect.map((origin) => (origin === null ? session : { ...session, origin })),
     );
   // The origin a session minted from this grant gets: the desktop app's own
-  // bootstrap, dev mode's credential, or a pairing link an owner issuer marked.
-  // Every owner session claims the server once; a link made on the Mac
-  // (`t3 pair`, the startup URL) only makes an owner if it is the first claim.
+  // bootstrap, dev mode's credential, or a link an owner session issued.
+  // Links made on the Mac (`t3 pair`, the startup URL) are never marked.
   const grantOrigin = (credential: string, method: string) =>
     Effect.gen(function* () {
       const source: SessionOrigins.OwnerSource | null =
@@ -786,12 +782,8 @@ export const make = Effect.gen(function* () {
             ? "dev-token"
             : yield* origins.ownerGrant(credential);
       if (source === null) return null;
-      // In dev mode the `.env` credential is the owner, so Mac links never are.
-      if (SessionOrigins.isBootstrapSource(source) && devAuth !== undefined) return null;
-      const first = yield* origins.claimOwner(source);
-      return SessionOrigins.isBootstrapSource(source) && !first
-        ? null
-        : ({ _tag: "owner", source } satisfies SessionOrigins.SessionOrigin);
+      yield* origins.claimOwner(source);
+      return { _tag: "owner", source } satisfies SessionOrigins.SessionOrigin;
     });
   // Written before the token leaves; if it cannot be, the new session is revoked.
   const recordOrigin = (
@@ -1133,7 +1125,7 @@ export const make = Effect.gen(function* () {
     readonly label?: string;
     readonly purpose?: "startup";
     // ardud missions: core
-    readonly ownerSource?: SessionOrigins.OwnerSource;
+    readonly ownerSource?: "paired-client";
   }) =>
     createPairingLink({
       scopes: input.scopes,
@@ -1167,17 +1159,10 @@ export const make = Effect.gen(function* () {
         ...(input?.purpose ? { purpose: input.purpose } : {}),
       });
       // ardud missions: core
-      const ownerMarked =
-        input?.ownerSource === undefined
-          ? undefined
-          : SessionOrigins.isBootstrapSource(input.ownerSource) &&
-              (devAuth !== undefined || (yield* origins.ownerClaimed()))
-            ? false
-            : yield* origins
-                .markOwnerGrant(issued.credential, input.ownerSource)
-                .pipe(Effect.as(true));
+      if (input?.ownerSource !== undefined) {
+        yield* origins.markOwnerGrant(issued.credential, input.ownerSource);
+      }
       return {
-        ...(ownerMarked === undefined ? {} : { ownerMarked }),
         id: issued.id,
         credential: issued.credential,
         scopes: input?.scopes ?? AuthStandardClientScopes,
@@ -1288,8 +1273,6 @@ export const make = Effect.gen(function* () {
         scopes: AuthAdministrativeScopes,
         subject: INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT,
         purpose: "startup",
-        // ardud missions: core
-        ownerSource: "startup",
       });
       if (!devAuth) {
         return fallback.pipe(Effect.withSpan("EnvironmentAuth.issueStartupPairingCredential"));

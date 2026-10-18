@@ -5,19 +5,16 @@
  * The session subject is not proof of anything: anyone holding `access:write`
  * can mint a pairing link, and `t3 auth session issue --subject` picks any
  * subject. So the owner is not "a session with a paired-looking subject" but
- * "a session minted from a grant the owner issued":
+ * "a session minted from one of the owner's roots":
  *
- * - `startup`: the pairing URL the server prints at startup.
- * - `cli`: `t3 pair` / `t3 auth pairing create`, run by whoever can read the
- *   server's state on the Mac.
- *
- *   These two only count until the server has an owner (see
- *   `isBootstrapSource` and `claimOwner`): they pair the first owner device,
- *   once. Every owner session, whatever its source, makes that claim.
  * - `desktop`: the desktop app pairing its own renderer.
  * - `dev-token`: dev mode's reusable credential from the owner's `.env`.
  * - `paired-client`: a pairing link created from a session that is itself an
  *   owner session (Settings > Connections on the owner's paired client).
+ *
+ * Links made on the Mac (`t3 pair`, `t3 auth pairing create`, the startup
+ * URL) are never owner links, not even for the first device: anything that
+ * can run commands as the owner's user can make one, agent shells included.
  *
  * Pairing links minted by anyone else (a control token, an MCP client, T3
  * Connect) carry no owner mark, so the sessions they turn into are not owner
@@ -38,25 +35,17 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+/**
+ * `startup` and `cli` are never minted or read back as the owner. They stay in
+ * the type only so older test fixtures still compile.
+ */
 export type OwnerSource = "startup" | "cli" | "desktop" | "dev-token" | "paired-client";
 
-/**
- * Links made on the Mac rather than from an owner device. Anything that can
- * run commands as the owner's user can make one, agent shells included, so
- * they only pair the first owner device. Once any owner session has existed
- * this stays closed, even after every owner session expires or is revoked:
- * new owner devices are paired from an owner device (Settings > Connections)
- * or come from the desktop app's own bootstrap.
- */
-export const isBootstrapSource = (source: OwnerSource) => source === "startup" || source === "cli";
-
-/** What `t3 pair` / `t3 auth pairing create` print (to stderr) when the link is not an owner link. */
-export const OWNER_ALREADY_PAIRED =
-  "Note: this server already has an owner, so this link pairs a device that is not the owner. To add an owner device, make the link from an owner device (Settings > Connections) or use the desktop app.";
+/** What `t3 pair` / `t3 auth pairing create` print to stderr with every link. */
+export const MAC_LINK_NOT_OWNER =
+  "Note: a link made on the Mac pairs a device that is not the owner. To pair an owner device, make the link in the desktop app or on another owner device (Settings > Connections).";
 
 const OWNER_SOURCES: ReadonlySet<string> = new Set<OwnerSource>([
-  "startup",
-  "cli",
   "desktop",
   "dev-token",
   "paired-client",
@@ -90,8 +79,8 @@ export interface SessionOriginsShape {
     sessionId: string,
   ) => Effect.Effect<SessionOrigin | null, SessionOriginsError>;
   /**
-   * Notes that the server has an owner. True only for the first caller ever;
-   * a link made on the Mac makes an owner only if it wins this.
+   * Notes that the server has an owner. True only for the first caller ever.
+   * A record, not a gate: owner roots make owners whether or not it is set.
    */
   readonly claimOwner: (source: OwnerSource) => Effect.Effect<boolean, SessionOriginsError>;
   /** Whether the server has ever had an owner session, live or not. */
@@ -212,9 +201,8 @@ export const make = Effect.gen(function* () {
           Effect.mapError(fail("read-session-origin")),
         );
 
-  // One row. The insert is atomic, so two links exchanged at once cannot both
-  // be the first owner. Not cached: pairing is rare, and a headless server's
-  // owner who lost every device recovers by deleting the row by hand.
+  // One row, written by the first owner session ever. The insert is atomic,
+  // so exactly one caller sees `true`. Not cached: pairing is rare.
   const claimOwner: SessionOriginsShape["claimOwner"] = (source) =>
     Effect.gen(function* () {
       const createdAt = yield* now;

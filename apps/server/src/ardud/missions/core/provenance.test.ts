@@ -10,11 +10,12 @@ import * as SessionStore from "../../../auth/SessionStore.ts";
 import * as ServerConfig from "../../../config.ts";
 import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
-import { isReservedSessionSubject } from "../../auth/SessionOrigins.ts";
+import * as SessionOrigins from "../../auth/SessionOrigins.ts";
 import { issueComponentSession, listComponentSessions } from "../../auth/components.ts";
 import { componentProvenance, ownerAppProvenance } from "./provenance.ts";
 
 const DEV_TOKEN = "reusable-dev-auth-token-that-is-long-enough";
+const DESKTOP_TOKEN = "desktop-bootstrap-token";
 
 const layerServerConfig = (overrides?: Partial<ServerConfig.ServerConfig["Service"]>) =>
   Layer.effect(
@@ -62,13 +63,22 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
         const auth = yield* EnvironmentAuth.EnvironmentAuth;
         const sessions = yield* SessionStore.SessionStore;
 
-        // `t3 pair` on the Mac, exchanged for a browser cookie (web, desktop renderer).
-        const pairing = yield* auth.createPairingLink({ ownerSource: "cli" });
-        const browser = yield* auth.createBrowserSession(pairing.credential, client);
+        // The desktop app's own bootstrap, exchanged for its renderer's cookie.
+        const desktop = yield* auth.createBrowserSession(DESKTOP_TOKEN, client);
+        const desktopSession = yield* auth.authenticateHttpRequest(
+          cookieRequest(sessions.cookieName, desktop.sessionToken),
+        );
+        expect(desktopSession.origin).toEqual({ _tag: "owner", source: "desktop" });
+
+        // Settings > Connections on the desktop app, opened in a browser.
+        const fromDesktop = yield* auth.issuePairingCredential(undefined, {
+          sessionId: desktopSession.sessionId,
+        });
+        const browser = yield* auth.createBrowserSession(fromDesktop.credential, client);
         const browserSession = yield* auth.authenticateHttpRequest(
           cookieRequest(sessions.cookieName, browser.sessionToken),
         );
-        expect(browserSession.origin).toEqual({ _tag: "owner", source: "cli" });
+        expect(browserSession.origin).toEqual({ _tag: "owner", source: "paired-client" });
         expect(ownerAppProvenance({ surface: "web", session: browserSession })).toEqual({
           _tag: "owner-app",
           surface: "web",
@@ -77,12 +87,12 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
         expect(ownerAppProvenance({ surface: "cli", session: browserSession })).toBeNull();
         expect(ownerAppProvenance({ surface: undefined, session: browserSession })).toBeNull();
 
-        // The owner's paired client making a link for another device (Settings > Connections).
-        const fromOwner = yield* auth.issuePairingCredential(undefined, {
+        // That browser making a link for the phone.
+        const fromBrowser = yield* auth.issuePairingCredential(undefined, {
           sessionId: browserSession.sessionId,
         });
         const phone = yield* auth.exchangeBootstrapCredentialForAccessToken(
-          fromOwner.credential,
+          fromBrowser.credential,
           undefined,
           { ...client, deviceType: "mobile" },
         );
@@ -96,28 +106,11 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
           cookies: {},
           headers: {},
         } as never);
-        expect(socket.origin).toEqual({ _tag: "owner", source: "cli" });
-      }).pipe(Effect.provide(layerEnvironmentAuth())),
+        expect(socket.origin).toEqual({ _tag: "owner", source: "paired-client" });
+      }).pipe(Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: DESKTOP_TOKEN }))),
   );
 
-  it.effect("the startup pairing URL pairs the first owner device", () =>
-    Effect.gen(function* () {
-      const auth = yield* EnvironmentAuth.EnvironmentAuth;
-      const startup = yield* auth.issueStartupPairingCredential();
-      const mobile = yield* auth.exchangeBootstrapCredentialForAccessToken(
-        startup.credential,
-        undefined,
-        { ...client, deviceType: "mobile" },
-      );
-      const mobileSession = yield* auth.authenticateHttpRequest(bearerRequest(mobile.access_token));
-      expect(mobileSession.origin).toEqual({ _tag: "owner", source: "startup" });
-      expect(ownerAppProvenance({ surface: "mobile", session: mobileSession })?._tag).toBe(
-        "owner-app",
-      );
-    }).pipe(Effect.provide(layerEnvironmentAuth())),
-  );
-
-  it.effect("H1: once an owner device is paired, links made on the Mac no longer mint owners", () =>
+  it.effect("N1: links made on the Mac never pair the owner, not even the first device", () =>
     Effect.gen(function* () {
       const auth = yield* EnvironmentAuth.EnvironmentAuth;
       const sessions = yield* SessionStore.SessionStore;
@@ -129,30 +122,50 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
               auth.authenticateHttpRequest(cookieRequest(sessions.cookieName, paired.sessionToken)),
             ),
           );
+      const bearer = (credential: string) =>
+        auth
+          .exchangeBootstrapCredentialForAccessToken(credential, undefined, {
+            ...client,
+            deviceType: "mobile",
+          })
+          .pipe(
+            Effect.flatMap((token) =>
+              auth.authenticateHttpRequest(bearerRequest(token.access_token)),
+            ),
+          );
 
-      // Made before any owner device exists, used after one is paired.
-      const early = yield* auth.createPairingLink({ ownerSource: "cli" });
-      const first = yield* pair((yield* auth.createPairingLink({ ownerSource: "cli" })).credential);
-      expect(isOwner(first)).toBe(true);
+      // No owner yet. `t3 pair`, `t3 auth pairing create` and the startup URL are
+      // all things an agent shell can run, so none of them is an owner root.
+      const cliLink = yield* auth.createPairingLink({ subject: "one-time-token" });
+      const cliCookie = yield* pair(cliLink.credential);
+      expect(cliCookie.origin).toBeUndefined();
+      expect(isOwner(cliCookie)).toBe(false);
+      const cliBearer = yield* bearer((yield* auth.createPairingLink()).credential);
+      expect(isOwner(cliBearer)).toBe(false);
+      const startup = yield* bearer((yield* auth.issueStartupPairingCredential()).credential);
+      expect(startup.scopes).toContain("access:write");
+      expect(startup.origin).toBeUndefined();
+      expect(ownerAppProvenance({ surface: "mobile", session: startup })).toBeNull();
 
-      // An agent shell running `t3 pair` or reading the startup URL now gets a plain device.
-      const agentPair = yield* pair(
-        (yield* auth.createPairingLink({ ownerSource: "cli" })).credential,
+      // A device paired that way cannot pass an owner mark on either.
+      const relayed = yield* pair(
+        (yield* auth.issuePairingCredential(undefined, { sessionId: startup.sessionId }))
+          .credential,
       );
-      expect(agentPair.origin).toBeUndefined();
-      expect(isOwner(agentPair)).toBe(false);
-      const startup = yield* pair((yield* auth.issueStartupPairingCredential()).credential);
-      expect(isOwner(startup)).toBe(false);
-      expect(isOwner(yield* pair(early.credential))).toBe(false);
+      expect(isOwner(relayed)).toBe(false);
 
-      // The owner's browser opening a plain link over its own cookie stays the owner.
-      const firstCookie = yield* auth.createPairingLink({ ownerSource: "cli" });
+      // The desktop app is still the owner root.
+      const desktop = yield* pair(DESKTOP_TOKEN);
+      expect(desktop.origin).toEqual({ _tag: "owner", source: "desktop" });
+
+      // The owner's browser opening a plain Mac link over its own cookie stays the owner.
       const ownerBrowser = yield* auth.createBrowserSession(
-        (yield* auth.issuePairingCredential(undefined, { sessionId: first.sessionId })).credential,
+        (yield* auth.issuePairingCredential(undefined, { sessionId: desktop.sessionId }))
+          .credential,
         client,
       );
       const repaired = yield* auth.createBrowserSession(
-        firstCookie.credential,
+        (yield* auth.createPairingLink()).credential,
         client,
         ownerBrowser.sessionToken,
       );
@@ -163,52 +176,45 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
           ),
         ),
       ).toBe(true);
-
-      // The owner still adds devices from an owner device.
-      const fromOwner = yield* auth.issuePairingCredential(undefined, {
-        sessionId: first.sessionId,
-      });
-      expect(yield* pair(fromOwner.credential)).toMatchObject({
-        origin: { _tag: "owner", source: "paired-client" },
-      });
-
-      // Expiry or a revoke (any access:write token can revoke) does not reopen it.
-      for (const session of yield* auth.listSessions()) {
-        yield* auth.revokeSession(session.sessionId);
-      }
-      const relink = yield* auth.createPairingLink({ ownerSource: "cli" });
-      expect(relink.ownerMarked).toBe(false);
-      expect(isOwner(yield* pair(relink.credential))).toBe(false);
-      expect(isOwner(yield* pair((yield* auth.issueStartupPairingCredential()).credential))).toBe(
-        false,
+      // ...but a plain cookie re-pairing over a Mac link gains nothing.
+      const plainRepair = yield* auth.createBrowserSession(
+        (yield* auth.createPairingLink()).credential,
+        client,
+        (yield* auth.createBrowserSession((yield* auth.createPairingLink()).credential, client))
+          .sessionToken,
       );
-    }).pipe(Effect.provide(layerEnvironmentAuth())),
+      expect(
+        isOwner(
+          yield* auth.authenticateHttpRequest(
+            cookieRequest(sessions.cookieName, plainRepair.sessionToken),
+          ),
+        ),
+      ).toBe(false);
+    }).pipe(Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: DESKTOP_TOKEN }))),
   );
 
-  it.effect("H1: two Mac links exchanged at once make one owner, not two", () =>
+  it.effect("N1: the first owner session claims the server once, atomically", () =>
     Effect.gen(function* () {
       const auth = yield* EnvironmentAuth.EnvironmentAuth;
-      const sessions = yield* SessionStore.SessionStore;
-      const links = yield* Effect.all(
-        Array.from({ length: 4 }, () => auth.createPairingLink({ ownerSource: "cli" })),
+      const origins = yield* SessionOrigins.SessionOrigins;
+      expect(yield* origins.ownerClaimed()).toBe(false);
+      // Mac links never claim it.
+      yield* auth.exchangeBootstrapCredentialForAccessToken(
+        (yield* auth.issueStartupPairingCredential()).credential,
+        undefined,
+        client,
       );
-      expect(links.every((link) => link.ownerMarked === true)).toBe(true);
-      const paired = yield* Effect.all(
-        links.map((link) =>
-          auth
-            .createBrowserSession(link.credential, client)
-            .pipe(
-              Effect.flatMap((browser) =>
-                auth.authenticateHttpRequest(
-                  cookieRequest(sessions.cookieName, browser.sessionToken),
-                ),
-              ),
-            ),
+      expect(yield* origins.ownerClaimed()).toBe(false);
+      const launches = yield* Effect.all(
+        Array.from({ length: 4 }, () =>
+          auth.exchangeBootstrapCredentialForAccessToken(DESKTOP_TOKEN, undefined, client),
         ),
         { concurrency: "unbounded" },
       );
-      expect(paired.filter(isOwner)).toHaveLength(1);
-    }).pipe(Effect.provide(layerEnvironmentAuth())),
+      expect(launches).toHaveLength(4);
+      expect(yield* origins.ownerClaimed()).toBe(true);
+      expect(yield* origins.claimOwner("desktop")).toBe(false);
+    }).pipe(Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: DESKTOP_TOKEN }))),
   );
 
   it.effect("H1: a control token cannot mint an owner session through a pairing link", () =>
@@ -283,9 +289,9 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
           " one-time-token ",
           "component:crw",
         ]) {
-          expect(isReservedSessionSubject(subject), subject).toBe(true);
+          expect(SessionOrigins.isReservedSessionSubject(subject), subject).toBe(true);
         }
-        expect(isReservedSessionSubject("bridges")).toBe(false);
+        expect(SessionOrigins.isReservedSessionSubject("bridges")).toBe(false);
 
         // Even minted programmatically, the subject proves nothing.
         for (const subject of ["one-time-token", "desktop-bootstrap", "administrative-bootstrap"]) {
@@ -346,13 +352,13 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
     }).pipe(Effect.provide(layerEnvironmentAuth())),
   );
 
-  it.effect("the desktop app's own bootstrap is the owner, and closes Mac-made owner links", () =>
+  it.effect("the desktop app's own bootstrap is the owner, every launch", () =>
     Effect.gen(function* () {
       const auth = yield* EnvironmentAuth.EnvironmentAuth;
       const sessions = yield* SessionStore.SessionStore;
       const launch = () =>
         auth
-          .createBrowserSession("desktop-bootstrap-token", client)
+          .createBrowserSession(DESKTOP_TOKEN, client)
           .pipe(
             Effect.flatMap((renderer) =>
               auth.authenticateHttpRequest(
@@ -364,16 +370,12 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
       expect(session.origin).toEqual({ _tag: "owner", source: "desktop" });
       expect(ownerAppProvenance({ surface: "desktop", session })?._tag).toBe("owner-app");
 
-      const fromMac = yield* auth.createPairingLink({ ownerSource: "cli" });
-      expect(fromMac.ownerMarked).toBe(false);
       // The desktop app recovers the owner however many times it relaunches.
       for (const active of yield* auth.listSessions()) {
         yield* auth.revokeSession(active.sessionId);
       }
       expect((yield* launch()).origin).toEqual({ _tag: "owner", source: "desktop" });
-    }).pipe(
-      Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: "desktop-bootstrap-token" })),
-    ),
+    }).pipe(Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: DESKTOP_TOKEN }))),
   );
 
   it.effect("dev mode's reusable credential and its exchanged sessions are the owner", () =>
@@ -389,8 +391,7 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
       expect(childSession.origin).toEqual({ _tag: "owner", source: "dev-token" });
       expect(childSession.sessionId).not.toBe(dev.sessionId);
       // In dev the `.env` credential is the owner; a Mac link never is.
-      const fromMac = yield* auth.createPairingLink({ ownerSource: "cli" });
-      expect(fromMac.ownerMarked).toBe(false);
+      const fromMac = yield* auth.createPairingLink();
       const plain = yield* auth.exchangeBootstrapCredentialForAccessToken(
         fromMac.credential,
         undefined,
