@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   MessageId,
+  MissionError,
   NodeId,
   ProjectId,
   ProviderDriverKind,
@@ -27,6 +28,8 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+// ardud missions: recovery
+import { installContinuationGate } from "../ardud/missions/recovery/continuationGate.ts";
 
 const threadId = ThreadId.make("thread:restart");
 const runId = RunId.make("run:restart");
@@ -1118,4 +1121,36 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
         [],
       );
     }),
+);
+
+// ardud missions: recovery
+it.effect("leaves a mission member's cut turn to mission recovery", () =>
+  Effect.gen(function* () {
+    let owned: boolean | "broken" = true;
+    yield* installContinuationGate(() =>
+      owned === "broken"
+        ? Effect.fail(new MissionError({ code: "conflict", detail: "store unavailable" }))
+        : Effect.succeed(owned),
+    );
+    assert.deepEqual(yield* continuationTexts(cutMidTurn()), []);
+    // A settled turn only gets its background-work note, which recovery cannot give.
+    const base = makeProjection();
+    const settled = {
+      ...base,
+      runs: [
+        {
+          ...base.runs[0]!,
+          status: "completed",
+          restartCancelledBackgroundWork: [{ kind: "monitor" as const, label: "Watch CI run 42" }],
+        },
+      ],
+      providerTurns: [{ ...base.providerTurns[0]!, status: "completed" }],
+    } as unknown as OrchestrationV2ThreadProjection;
+    assert.lengthOf(yield* continuationTexts(settled), 1);
+    owned = false;
+    assert.deepEqual(yield* continuationTexts(cutMidTurn()), ["Continue where you left off."]);
+    // A check that fails never blocks the continuation.
+    owned = "broken";
+    assert.deepEqual(yield* continuationTexts(cutMidTurn()), ["Continue where you left off."]);
+  }).pipe(Effect.scoped),
 );
