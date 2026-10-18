@@ -47,6 +47,8 @@ const WRITE_METHODS = Object.values(WS_METHODS).filter(
       "missions.rooms",
       "missions.roomPage",
       "missions.messageBody",
+      "missions.roomTuning",
+      "missions.attention",
     ].includes(method),
 );
 
