@@ -184,10 +184,12 @@ describe("missions routes", () => {
           },
         ],
       };
-      const post = (path: string, body: unknown, token = "Bearer operator") =>
+      const post = (path: string, body: unknown, token = "Bearer crw") =>
         handler(request(path, { token, body }));
 
       expect((await post("/approvals/open", open, "Bearer reader")).status).toBe(403);
+      // The shared control token no longer speaks for crw by naming it in the body.
+      expect((await post("/approvals/open", open, "Bearer operator")).status).toBe(403);
       const opened = await post("/approvals/open", open);
       expect(opened.status).toBe(200);
       // Opening the same id again is settled, not a second record.
@@ -283,6 +285,7 @@ describe("missions routes", () => {
       );
       const stale = { missionId, approvalId: "a-1", reason: "head moved" };
       expect((await post("/approvals/stale", stale, "Bearer scribe")).status).toBe(403);
+      expect((await post("/approvals/stale", stale, "Bearer operator")).status).toBe(403);
       expect((await post("/approvals/stale", stale, "Bearer crw")).status).toBe(200);
     } finally {
       await dispose();

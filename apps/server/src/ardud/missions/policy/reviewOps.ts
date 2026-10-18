@@ -18,6 +18,7 @@ import {
   type ReviewPolicy,
   type ReviewPolicySnapshot,
   type ReviewRecord,
+  type RoleId,
   type SetCriticalityGuideInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -25,6 +26,7 @@ import * as Option from "effect/Option";
 
 import {
   POLICY_PROVENANCE,
+  activeBindings,
   attempt,
   eventDraft,
   failWith,
@@ -284,6 +286,35 @@ export const recordCriticality = (
     return { seq: committed.seq, ref: verdictRef(verdict) };
   });
 
+// ardud missions: core
+/** Components that run review stages and record them in their own name. */
+export const REVIEW_RECORDERS: ReadonlySet<string> = new Set(["crw"]);
+
+/**
+ * Who may record a stage's review: the owner, the master, the policy's own
+ * components, a review runner (crw), or a thread bound to the stage's role.
+ * A record moves the merge gate, so nobody else does.
+ */
+const mayRecordStage = (
+  deps: PolicyDeps,
+  caller: Caller,
+  missionId: MissionId,
+  roleId: RoleId,
+): Effect.Effect<boolean, MissionError> => {
+  const { provenance } = caller;
+  if (caller.byOwner || caller.isMaster || caller.trusted) return Effect.succeed(true);
+  if (provenance._tag === "system")
+    return Effect.succeed(REVIEW_RECORDERS.has(provenance.component));
+  if (provenance._tag !== "agent") return Effect.succeed(false);
+  return activeBindings(deps, missionId).pipe(
+    Effect.map((bindings) =>
+      bindings.some(
+        (binding) => binding.threadId === provenance.threadId && binding.roleId === roleId,
+      ),
+    ),
+  );
+};
+
 /**
  * Stores one review run as evidence bound to the exact head it read. The
  * stage's role is recorded; the model defaults to what the calling thread runs.
@@ -300,6 +331,13 @@ export const recordReview = (
     const { policy } = yield* loadPolicy(deps, input.missionId);
     const stage = policy.stages.find((candidate) => candidate.id === input.stageId);
     if (!stage) return yield* failWith("invalid", `Unknown review stage ${input.stageId}.`);
+    // ardud missions: core
+    if (!(yield* mayRecordStage(deps, caller, input.missionId, stage.roleId))) {
+      return yield* failWith(
+        "forbidden",
+        `Only the owner, the master, crw or a thread holding ${stage.roleId} records ${stage.label}.`,
+      );
+    }
     const roles = yield* missionRoles(deps, input.missionId, now);
     const role = roles.all.find((candidate) => candidate.id === stage.roleId);
     if (!role) {
@@ -392,9 +430,9 @@ export const TRIGGER_REPORTERS: ReadonlySet<string> = new Set(["crw"]);
 
 /**
  * Records a fired hard trigger as the PR's verdict, in the reporter's name.
- * Only callers that can vouch for the facts report them: the owner, the
- * mission's master, or the component that read them (crw). Nothing fires, or
- * a trigger is already on record: nothing is written.
+ * Only the component that read the facts from the forge (crw) reports them;
+ * the owner and the master judge a PR directly with `recordCriticality`.
+ * Nothing fires, or a trigger is already on record: nothing is written.
  */
 export const recordTriggerFacts = (
   deps: PolicyDeps,
@@ -404,11 +442,10 @@ export const recordTriggerFacts = (
   Effect.gen(function* () {
     yield* requireMission(deps, input.missionId);
     const caller = yield* resolveCaller(deps, provenance, input.missionId);
-    const reporter = provenance._tag === "system" && TRIGGER_REPORTERS.has(provenance.component);
-    if (!(caller.byOwner || caller.isMaster || reporter)) {
+    if (!(provenance._tag === "system" && TRIGGER_REPORTERS.has(provenance.component))) {
       return yield* failWith(
         "forbidden",
-        "Only the owner, the master or crw reports the facts a hard trigger reads.",
+        "Only crw reports the PR facts a hard trigger reads; the owner or the master records a verdict with mission_criticality.",
       );
     }
     const now = yield* nowIso;

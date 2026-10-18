@@ -29,17 +29,14 @@ import { PolicyService } from "./PolicyService.ts";
  * envelope as the rest of the missions API.
  *
  * ardud missions: core (H3). Who calls comes from the token, never from a
- * header. A component credential (`t3 ardud component-token issue crw`)
- * acts as that component; the shared control token acts as the control API
- * until cutover. Either way HTTP only carries reads and the named operations
- * crw needs: record a review, report PR facts, take, renew and release a
- * hold. Governance (roles, review policy, verdicts, pool admin) needs a
- * proven thread or the owner, so it goes through the MCP tools or the app.
+ * header. Reads take any token with the read scope. Writes are only the
+ * named operations crw needs (record a review, report PR facts, take, renew
+ * and release a hold) and only from a component credential
+ * (`t3 ardud component-token issue crw`), which acts as that component. The
+ * shared control token reads but does not write. Governance (roles, review
+ * policy, verdicts, pool admin) needs a proven thread or the owner, so it
+ * goes through the MCP tools or the app.
  */
-export const POLICY_CONTROL_PROVENANCE: MissionProvenance = {
-  _tag: "system",
-  component: "control-api",
-};
 
 /** Components whose credential may make the named policy writes in their own name. */
 export const POLICY_COMPONENTS: ReadonlySet<string> = new Set(["crw"]);
@@ -159,10 +156,7 @@ const decodeBody = <A>(decodeInput: (input: unknown) => Effect.Effect<A, Schema.
     );
   });
 
-/**
- * The caller, from its session alone: a component credential is that
- * component; any other token is the control API.
- */
+/** The caller, from its session alone: a component credential is that component. */
 const callerProvenance = (session: EnvironmentAuth.AuthenticatedSession) =>
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
@@ -174,7 +168,12 @@ const callerProvenance = (session: EnvironmentAuth.AuthenticatedSession) =>
       );
     }
     const component = componentProvenance(session);
-    if (component === null) return POLICY_CONTROL_PROVENANCE;
+    if (component === null) {
+      return yield* fail(
+        "forbidden",
+        "Policy writes over HTTP need a component credential (t3 ardud component-token issue crw).",
+      );
+    }
     if (component._tag === "system" && !POLICY_COMPONENTS.has(component.component)) {
       return yield* fail("forbidden", `${component.component} does not write policy records.`);
     }

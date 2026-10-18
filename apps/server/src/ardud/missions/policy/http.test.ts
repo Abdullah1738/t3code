@@ -172,7 +172,7 @@ describe("mission policy routes", () => {
 
       const recorded = await handler(
         request("/reviews", {
-          token: "Bearer operator",
+          token: "Bearer crw",
           body: {
             missionId: "crpko",
             pullRequest: pr,
@@ -217,7 +217,7 @@ describe("mission policy routes", () => {
       const take = (purpose: string) =>
         handler(
           request("/pools/holds", {
-            token: "Bearer operator",
+            token: "Bearer crw",
             body: { poolId: REVIEW_POOL, missionId: "crpko", amount: 1, purpose, ttlSeconds: 3600 },
           }),
         );
@@ -232,7 +232,7 @@ describe("mission policy routes", () => {
 
       const wrongFence = await handler(
         request("/pools/holds/release", {
-          token: "Bearer operator",
+          token: "Bearer crw",
           body: { holdId: hold.id, fence: 7, note: "done" },
         }),
       );
@@ -241,7 +241,7 @@ describe("mission policy routes", () => {
 
       const released = await handler(
         request("/pools/holds/release", {
-          token: "Bearer operator",
+          token: "Bearer crw",
           body: { holdId: hold.id, fence: hold.fence, note: "review delivered" },
         }),
       );
@@ -311,7 +311,7 @@ describe("mission policy routes", () => {
     }
   });
 
-  it("crw's own credential acts as crw; another component's credential does not write policy", async () => {
+  it("crw's own credential acts as crw; other credentials do not write policy", async () => {
     const { handler, dispose } = makeHandler();
     try {
       const taken = await body(
@@ -346,6 +346,31 @@ describe("mission policy routes", () => {
         }),
       );
       expect(scribe.status).toBe(403);
+
+      // The shared control token reads, but no longer writes in anyone's name.
+      const review = {
+        missionId: "crpko",
+        pullRequest: pr,
+        stageId: "reviewer",
+        headSha: "abc",
+        verdict: "clear",
+      };
+      const hold = {
+        poolId: REVIEW_POOL,
+        missionId: "crpko",
+        amount: 1,
+        purpose: "x",
+        ttlSeconds: 60,
+      };
+      for (const [path, payload] of [
+        ["/reviews", review],
+        ["/pools/holds", hold],
+      ] as const) {
+        const refused = await handler(request(path, { token: "Bearer operator", body: payload }));
+        expect(refused.status).toBe(403);
+      }
+      const roles = await handler(request("/roles?missionId=crpko", { token: "Bearer operator" }));
+      expect(roles.status).toBe(200);
     } finally {
       await dispose();
     }

@@ -220,9 +220,12 @@ describe("crw adapter contract", () => {
         expect((await handler(thread)).status).toBe(400);
       }
 
-      // Another component's credential cannot take crw's holds or open crw's approvals.
-      expect((await handler(crwRequest(take, take.body, SCRIBE))).status).toBe(403);
-      expect((await handler(crwRequest(open, open.body, SCRIBE))).status).toBe(403);
+      // Neither another component's credential nor the shared control token
+      // takes crw's holds or opens crw's approvals.
+      for (const token of [SCRIBE, CONTROL]) {
+        expect((await handler(crwRequest(take, take.body, token))).status).toBe(403);
+        expect((await handler(crwRequest(open, open.body, token))).status).toBe(403);
+      }
     } finally {
       await dispose();
     }

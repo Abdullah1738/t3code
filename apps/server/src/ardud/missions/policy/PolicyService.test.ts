@@ -6,6 +6,7 @@ import {
   ThreadId,
   type MissionEvent,
   type MissionId,
+  type MissionProvenance,
   type PoolHoldId,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
@@ -247,7 +248,7 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       assert.strictEqual(modelKey(plan.next!.modelSelection), modelKey(SOL_XHIGH));
 
       const record = (stageId: typeof reviewer, headSha: string, verdict: "clear" | "findings") =>
-        policy.recordReview(SYSTEM, {
+        policy.recordReview(CRW, {
           missionId: CRPKO,
           pullRequest: pr,
           stageId,
@@ -391,9 +392,12 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       assert.isNull(plan.verdict);
       assert.strictEqual(plan.ladderId, "normal");
 
-      // A stranger thread, an MCP client, the shared control token: none vouch for facts.
+      // A stranger thread, an MCP client, the shared control token, even the
+      // master: only crw read the facts from the forge, so only crw reports them.
       for (const caller of [
         STRANGER,
+        MASTER,
+        OWNER,
         { _tag: "system", component: "mcp" } as const,
         { _tag: "system", component: "control-api" } as const,
       ]) {
@@ -409,14 +413,61 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: quiet, headSha: "b1" });
       assert.isNull(plan.verdict);
 
-      // The master may, in its own name.
-      const byMaster = yield* policy.recordTriggerFacts(MASTER, {
+      // The master judges the PR directly instead, in its own name.
+      yield* policy.recordCriticality(MASTER, {
         missionId: CRPKO,
         pullRequest: quiet,
-        facts: { changedLines: 2000 },
+        critical: true,
+        reason: "touches the ledger",
       });
-      assert.isTrue(byMaster.recorded);
-      assert.strictEqual(byMaster.verdict?.decidedBy._tag, "role");
+      plan = yield* policy.reviewPlan({ missionId: CRPKO, pullRequest: quiet, headSha: "b1" });
+      assert.strictEqual(plan.verdict?.decidedBy._tag, "role");
+    }),
+  );
+
+  it.effect("only a reviewer of the stage, crw, the master or the owner records a review", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      const gated = { repository: "crpko/ledger", number: 80 };
+      const reviewer = RoleId.make("crpko:reviewer");
+      const record = (caller: MissionProvenance) =>
+        policy.recordReview(caller, {
+          missionId: CRPKO,
+          pullRequest: gated,
+          stageId: ReviewStageId.make("reviewer"),
+          headSha: "g1",
+          verdict: "clear",
+        });
+      const reviewerState = policy
+        .reviewPlan({ missionId: CRPKO, pullRequest: gated, headSha: "g1" })
+        .pipe(
+          Effect.map((plan) => plan.stages.find((stage) => stage.stageId === "reviewer")?.state),
+        );
+
+      // A stray thread, the shared control token, an MCP client, another component:
+      // none can mark a stage clear, which is what opens the merge gate.
+      for (const caller of [
+        STRANGER,
+        { _tag: "system", component: "control-api" } as const,
+        { _tag: "system", component: "mcp-client:laptop" } as const,
+        { _tag: "system", component: "scribe" } as const,
+      ]) {
+        const refused = yield* Effect.flip(record(caller));
+        assert.strictEqual(refused.code, "forbidden");
+      }
+      assert.strictEqual(yield* reviewerState, "pending");
+
+      // A thread bound to the stage's role records it; so do crw, the master and the owner.
+      const holder = agent("thread-reviewer");
+      ports.threads.set("thread-reviewer", { exists: true, idle: true, modelSelection: SOL_XHIGH });
+      yield* policy.bindRole(MASTER, {
+        roleId: reviewer,
+        threadId: ThreadId.make("thread-reviewer"),
+      });
+      for (const caller of [holder, CRW, MASTER, OWNER]) {
+        yield* record(caller);
+      }
+      assert.strictEqual(yield* reviewerState, "done-at-head");
     }),
   );
 

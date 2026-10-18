@@ -29,8 +29,8 @@ import * as MissionService from "./MissionService.ts";
  * which thread is calling (`x-t3-thread-id` was only a claim). So the plan
  * writes that depend on the caller (the master's) are refused here and point
  * at the MCP tool, which knows the calling thread. HTTP keeps reads and
- * `system` writes by named components: crw opens and stale-closes its
- * approvals in its own name. Other tracks mount their own routes under this
+ * `system` writes by named components, each with its own credential: crw
+ * opens and stale-closes its approvals in its own name. Other tracks mount their own routes under this
  * prefix and register them in `layer.ts`.
  */
 export const MISSIONS_ROUTE_PREFIX = "/api/ardud/missions";
@@ -189,14 +189,21 @@ const makeRoutes = Effect.gen(function* () {
 
   // ardud missions: core (H3)
   /**
-   * The component an approval route acts for. A component credential is that
-   * component and may only act for itself. The shared control token still
-   * names the component in the body until cutover retires it.
+   * The component an approval route acts for, from its credential
+   * (`t3 ardud component-token issue crw`). It may only act for itself; a
+   * token that is not a component credential, the shared control token
+   * included, does not open or close approvals.
    */
   const approvalComponent = (session: EnvironmentAuth.AuthenticatedSession, named: string) =>
     Effect.gen(function* () {
       const component = session.origin?._tag === "component" ? session.origin.component : null;
-      if (component !== null && component !== named) {
+      if (component === null) {
+        return yield* fail(
+          "forbidden",
+          `Approvals over HTTP need ${named}'s own component credential (t3 ardud component-token issue ${named}).`,
+        );
+      }
+      if (component !== named) {
         return yield* fail(
           "forbidden",
           `This credential is ${component}; it cannot act for ${named}.`,
