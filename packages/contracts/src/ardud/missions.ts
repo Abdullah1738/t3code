@@ -951,6 +951,10 @@ export const Draft = Schema.Struct({
   revision: Schema.optional(NonNegativeInt),
   /** When the current epoch began; a decision's evidence must not predate it. Missing means createdAt. */
   revisedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  /** Where the system posted the approved text (e.g. the PR comment), once it reports sent. */
+  sentLink: Schema.optional(Schema.NullOr(MissionLink)),
+  /** Why the last send failed; cleared when a later send succeeds. */
+  sendError: Schema.optional(Schema.NullOr(Schema.String)),
   // --- end asks additions ---
 });
 export type Draft = typeof Draft.Type;
@@ -1532,6 +1536,7 @@ export const MissionEventKind = Schema.Literals([
   "draft.annotated",
   "draft.stale-closed",
   "approval.annotated",
+  "draft.send-failed",
   // --- end asks additions ---
   "field.locked",
   "field.unlocked",
@@ -2551,8 +2556,31 @@ export const SystemDraftDecision = Schema.Struct({
   edited: Schema.Boolean,
   rewriteNote: Schema.NullOr(Schema.String),
   decidedAt: Schema.NullOr(IsoDateTime),
+  /** The draft revision this decision is for; a send report must name it. */
+  revision: NonNegativeInt,
+  /** Whether the system already reported posting the approved text. */
+  delivery: Schema.Literals(["unsent", "sent", "send-failed"]),
 });
 export type SystemDraftDecision = typeof SystemDraftDecision.Type;
+
+/** How a system's attempt to post an approved draft went. */
+export const DraftSendOutcome = Schema.Union([
+  Schema.TaggedStruct("sent", { link: MissionLink }),
+  Schema.TaggedStruct("send-failed", { reason: TrimmedNonEmptyString }),
+]);
+export type DraftSendOutcome = typeof DraftSendOutcome.Type;
+
+/**
+ * A system (crw) reports that it posted, or failed to post, the approved text of its own draft.
+ * Only an approved draft at exactly `revision` takes it; repeating the same report is a no-op.
+ */
+export const ReportDraftSentInput = Schema.Struct({
+  draftId: DraftId,
+  requestedBy: TrimmedNonEmptyString,
+  revision: NonNegativeInt,
+  outcome: DraftSendOutcome,
+});
+export type ReportDraftSentInput = typeof ReportDraftSentInput.Type;
 
 // --- end asks additions ---
 

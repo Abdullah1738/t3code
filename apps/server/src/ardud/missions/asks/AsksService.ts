@@ -15,6 +15,7 @@ import {
   type Call,
   type CloseForkInput,
   type CloseStaleDraftInput,
+  type ReportDraftSentInput,
   type DecideDraftInput,
   type DecideSuggestionInput,
   type DirectionCheckItem,
@@ -81,6 +82,7 @@ import {
   notesFor,
   openSystemDraft,
   reopenDraft,
+  reportDraftSent,
   reviseDraft,
   revisionOf,
   routeDraft,
@@ -293,6 +295,11 @@ export class AsksService extends Context.Service<
       input: { readonly draftId: DraftId; readonly head: string; readonly requestedBy: string },
       provenance: MissionProvenance,
     ) => Fx<SystemDraftDecision>;
+    /** The requesting system reports it posted (or failed to post) the approved text. */
+    readonly reportDraftSent: (
+      input: ReportDraftSentInput,
+      provenance: MissionProvenance,
+    ) => Fx<Draft>;
     // Suggestions
     readonly proposeSuggestion: (
       input: ProposeSuggestionInput,
@@ -1041,6 +1048,19 @@ const make = Effect.gen(function* () {
       return systemDraftDecision(draft, input.head);
     });
 
+  const reportDraftSentCommand = (input: ReportDraftSentInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const reported = yield* fromOutcome(
+        reportDraftSent({ draft, input, provenance, now: yield* now }),
+      );
+      if (reported.events.length === 0) return reported.record;
+      yield* persist(draft.missionId, reported.events, [
+        { _tag: "draft", record: reported.record },
+      ]);
+      return reported.record;
+    });
+
   // -------------------------------------------------------------------------
   // Suggestions
 
@@ -1571,6 +1591,7 @@ const make = Effect.gen(function* () {
     annotateDraft: (input, provenance) => serialized(annotateDraftCommand(input, provenance)),
     openSystemDraft: (input, provenance) => serialized(openSystemDraftCommand(input, provenance)),
     closeStaleDraft: (input, provenance) => serialized(closeStaleDraftCommand(input, provenance)),
+    reportDraftSent: (input, provenance) => serialized(reportDraftSentCommand(input, provenance)),
     systemDraftDecision: systemDraftDecisionRead,
     proposeSuggestion: (input, provenance, options) =>
       serialized(proposeSuggestionCommand(input, provenance, options)),

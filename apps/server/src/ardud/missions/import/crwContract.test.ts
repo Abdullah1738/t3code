@@ -8,6 +8,10 @@ import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
+import * as AsksService from "../asks/AsksService.ts";
+import { missionsDeskRouteLayer } from "../asks/http.ts";
+import * as Inbound from "../asks/inbound.ts";
+import * as AsksPorts from "../asks/ports.ts";
 import { MISSIONS_ROUTE_PREFIX, missionsRouteLayer } from "../http.ts";
 import * as MissionService from "../MissionService.ts";
 import { policyRouteLayer } from "../policy/http.ts";
@@ -56,10 +60,33 @@ const seeded = Layer.effectDiscard(
   }),
 );
 
+// The asks desk serves crw's drafts; nothing here forks threads or reads iMessage.
+const asksPorts = Layer.mergeAll(
+  Layer.succeed(
+    AsksPorts.AsksThreads,
+    AsksPorts.AsksThreads.of({
+      fork: () => Effect.die("crw never forks a thread"),
+      deliver: () => Effect.void,
+    }),
+  ),
+  Layer.succeed(
+    Inbound.InboundLookup,
+    Inbound.InboundLookup.of({ find: () => Effect.succeed(null) }),
+  ),
+  AsksPorts.signalsNoop,
+  AsksPorts.roomsPending,
+  AsksPorts.applierRegistry,
+  NodeServices.layer,
+);
+
 const makeHandler = () => {
   const ports = makePorts();
+  const services = AsksService.layer.pipe(
+    Layer.provide(asksPorts),
+    Layer.provideMerge(seeded.pipe(Layer.provideMerge(testLayer(ports.layer)))),
+  );
   return HttpRouter.toWebHandler(
-    Layer.mergeAll(policyRouteLayer, missionsRouteLayer).pipe(
+    Layer.mergeAll(policyRouteLayer, missionsRouteLayer, missionsDeskRouteLayer).pipe(
       Layer.provide(
         Layer.mock(EnvironmentAuth.EnvironmentAuth)({
           authenticateHttpRequest: (request) => {
@@ -75,7 +102,7 @@ const makeHandler = () => {
           },
         }),
       ),
-      Layer.provide(seeded.pipe(Layer.provideMerge(testLayer(ports.layer)))),
+      Layer.provide(services),
       Layer.provide(
         HttpPlatform.layer.pipe(
           Layer.provideMerge(NodeServices.layer),
@@ -181,6 +208,10 @@ describe("crw adapter contract", () => {
       expect(at(seen["take hold"], "hold.holder")).toEqual({ _tag: "system", component: "crw" });
       expect(at(seen["read approvals"], "approvals.requestedBy")).toBe("crw");
       expect(at(seen["read approvals"], "approvals.status")).toBe("pending");
+      // The summary and flags crw sends with the approval are kept for the owner's card.
+      const opened = requests.find((r) => r.name === "open approval")?.body;
+      expect(at(seen["read approvals"], "approvals.summary")).toBe(opened?.summary);
+      expect(at(seen["read approvals"], "approvals.flags")).toEqual(opened?.flags);
 
       // The plan answers for the exact head crw asked about.
       const asked = requests.find((r) => r.name === "review plan")?.body?.headSha;
@@ -208,7 +239,79 @@ describe("crw adapter contract", () => {
     }
   });
 
-  it.todo(
-    `serves the asks desk draft routes crw sends (${DESK.map((entry) => entry.name).join(", ")})`,
-  );
+  it(`serves the asks desk draft routes crw sends (${DESK.map((entry) => entry.name).join(", ")})`, async () => {
+    const { handler, dispose } = makeHandler();
+    try {
+      const seen: Record<string, Json> = {};
+      for (const entry of DESK) {
+        const response = await handler(crwRequest(entry, entry.body));
+        const answer = (await response.json()) as Json;
+        expect({ name: entry.name, status: response.status, answer }).toMatchObject({
+          name: entry.name,
+          status: entry.expect.status,
+        });
+        expect(Object.keys(answer).toSorted()).toEqual([...entry.expect.keys].toSorted());
+        seen[entry.name] = answer;
+      }
+      const opened = DESK.find((entry) => entry.name === "open draft")?.body;
+      expect(seen["open draft"]?.draft).toMatchObject({
+        id: opened?.draftId,
+        missionId: opened?.missionId,
+        requestedBy: "crw",
+        head: opened?.head,
+        channel: "github",
+        status: "pending",
+        approver: "owner",
+        summary: opened?.summary,
+        flags: opened?.flags,
+        revision: 0,
+      });
+      // Nobody decided it yet, so crw has nothing to post for that head.
+      expect(seen["read draft decision"]?.decision).toMatchObject({
+        draftId: opened?.draftId,
+        head: opened?.head,
+        state: "pending",
+        text: null,
+        revision: 0,
+        delivery: "unsent",
+      });
+      expect(seen["close stale draft"]?.draft).toMatchObject({
+        status: "dropped",
+        staleReason: "head moved to cccccccccccc",
+      });
+
+      // Once stale, the old head never reads as decided and can't be reported sent.
+      const read = DESK.find((entry) => entry.name === "read draft decision");
+      if (read === undefined) return;
+      const after = (await (await handler(crwRequest(read, undefined))).json()) as Json;
+      expect(at(after, "decision.state")).toBe("stale");
+      const sent = await handler(
+        crwRequest(
+          { name: "report sent", method: "POST", path: "/desk/drafts/sent", expect: read.expect },
+          {
+            draftId: opened?.draftId,
+            requestedBy: "crw",
+            revision: 0,
+            outcome: {
+              _tag: "sent",
+              link: { kind: "url", label: "comment", url: "https://example.test/c/1", ref: null },
+            },
+          },
+        ),
+      );
+      expect(sent.status).toBe(409);
+
+      // Another component's claim never reaches crw's drafts.
+      const open = DESK.find((entry) => entry.name === "open draft");
+      if (open === undefined) return;
+      const posing = crwRequest(open, open.body);
+      posing.headers.set("x-t3-component", "someone");
+      expect((await handler(posing)).status).toBe(403);
+      const thread = crwRequest(open, open.body);
+      thread.headers.set("x-t3-thread-id", "thread-master");
+      expect((await handler(thread)).status).toBe(400);
+    } finally {
+      await dispose();
+    }
+  });
 });

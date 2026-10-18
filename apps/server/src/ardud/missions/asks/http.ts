@@ -5,7 +5,8 @@
  * approvals only pass with an iMessage inbound id the server verifies.
  *
  * Systems in SYSTEM_DRAFT_COMPONENTS (crw) also open drafts here for one exact
- * code head, stale-close their own, and read the decision for that head.
+ * code head, stale-close their own, read the decision for that head and report
+ * the approved text as sent (or failed) for the revision they read.
  */
 import {
   AskId,
@@ -19,6 +20,7 @@ import {
   type MissionProvenance,
   NonNegativeInt,
   OpenSystemDraftInput,
+  ReportDraftSentInput,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import * as Data from "effect/Data";
@@ -128,6 +130,7 @@ const DecideBody = Schema.Struct({
 const decodeDecideBody = Schema.decodeUnknownEffect(DecideBody);
 const decodeOpenSystemDraft = Schema.decodeUnknownEffect(OpenSystemDraftInput);
 const decodeCloseStaleDraft = Schema.decodeUnknownEffect(CloseStaleDraftInput);
+const decodeReportDraftSent = Schema.decodeUnknownEffect(ReportDraftSentInput);
 
 const searchParams = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
@@ -339,15 +342,28 @@ const makeRoutes = Effect.gen(function* () {
     }),
   );
 
+  /**
+   * The system a draft route acts for. TODO(core r3): take the caller from core's named component
+   * credentials instead of the body's `requestedBy` and the `x-t3-component` claim.
+   */
   const systemComponent = (requestedBy: string | null) =>
-    requestedBy !== null && SYSTEM_DRAFT_COMPONENTS.has(requestedBy)
-      ? Effect.succeed(requestedBy)
-      : Effect.fail(
-          fail(
-            "forbidden",
-            `Only ${[...SYSTEM_DRAFT_COMPONENTS].join(", ")} open or read system drafts over HTTP.`,
-          ),
+    Effect.gen(function* () {
+      if (requestedBy === null || !SYSTEM_DRAFT_COMPONENTS.has(requestedBy)) {
+        return yield* fail(
+          "forbidden",
+          `Only ${[...SYSTEM_DRAFT_COMPONENTS].join(", ")} open or read system drafts over HTTP.`,
         );
+      }
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      if (request.headers["x-t3-thread-id"] !== undefined) {
+        return yield* fail("invalid_request", "A thread can't act for a system draft.");
+      }
+      const claimed = request.headers["x-t3-component"]?.trim();
+      if (claimed !== undefined && claimed !== requestedBy) {
+        return yield* fail("forbidden", `x-t3-component ${claimed} is not ${requestedBy}.`);
+      }
+      return requestedBy;
+    });
 
   const openSystemDraft = write(
     Effect.gen(function* () {
@@ -363,6 +379,16 @@ const makeRoutes = Effect.gen(function* () {
       const input = yield* decodeBody(decodeCloseStaleDraft);
       const component = yield* systemComponent(input.requestedBy);
       const draft = yield* asks.closeStaleDraft(input, systemProvenance(component));
+      return json({ ok: true, draft });
+    }),
+  );
+
+  /** Body `{ draftId, requestedBy, revision, outcome: sent{link} | send-failed{reason} }`. */
+  const reportDraftSent = write(
+    Effect.gen(function* () {
+      const input = yield* decodeBody(decodeReportDraftSent);
+      const component = yield* systemComponent(input.requestedBy);
+      const draft = yield* asks.reportDraftSent(input, systemProvenance(component));
       return json({ ok: true, draft });
     }),
   );
@@ -474,6 +500,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("POST", `${p}/drafts/:draftId/decide`, handle(decide)),
     HttpRouter.route("POST", `${p}/drafts/open`, handle(openSystemDraft)),
     HttpRouter.route("POST", `${p}/drafts/stale`, handle(closeStaleDraft)),
+    HttpRouter.route("POST", `${p}/drafts/sent`, handle(reportDraftSent)),
     HttpRouter.route("GET", `${p}/drafts/:draftId/decision`, handle(draftDecision)),
     HttpRouter.route("GET", `${p}/events`, handle(events)),
     HttpRouter.route("GET", `${p}/watch`, handle(watch)),

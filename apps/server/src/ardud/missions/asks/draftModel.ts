@@ -27,6 +27,7 @@ import {
   type MissionProvenance,
   type MissionRecordRef,
   type OpenSystemDraftInput,
+  type ReportDraftSentInput,
   type RoleId,
   type SystemDraftDecision,
 } from "@t3tools/contracts";
@@ -800,7 +801,17 @@ export const closeStaleDraft = (command: {
  * counts; a stale draft or any other head reads as `stale`.
  */
 export const systemDraftDecision = (draft: Draft, head: string): SystemDraftDecision => {
-  const base = { draftId: draft.id, head, text: null, edited: false, rewriteNote: null };
+  const delivery =
+    draft.status === "sent" ? "sent" : draft.status === "send-failed" ? "send-failed" : "unsent";
+  const base = {
+    draftId: draft.id,
+    head,
+    text: null,
+    edited: false,
+    rewriteNote: null,
+    revision: revisionOf(draft),
+    delivery,
+  } as const;
   if ((draft.staleReason ?? null) !== null || draft.head !== head) {
     return { ...base, state: "stale", decidedAt: null };
   }
@@ -829,6 +840,79 @@ export const systemDraftDecision = (draft: Draft, head: string): SystemDraftDeci
     case "dropped":
       return { ...base, state: "dropped", decidedAt: draft.decidedAt };
   }
+};
+
+/**
+ * The requesting system reports how posting the approved text went. Only an approved draft at
+ * exactly the reported revision takes a report; the same report again is a no-op, a failed send
+ * may later succeed, and a sent draft stays sent.
+ */
+export const reportDraftSent = (command: {
+  readonly draft: Draft;
+  readonly input: ReportDraftSentInput;
+  readonly provenance: MissionProvenance;
+  readonly now: string;
+}): Outcome<Transition<Draft>> => {
+  const { draft, input, provenance } = command;
+  const allowed = requesterCheck(provenance, input.requestedBy);
+  if (Result.isFailure(allowed)) return Result.fail(allowed.failure);
+  if (draft.requestedBy !== input.requestedBy) {
+    return refuse("forbidden", `Draft ${draft.id} was not opened by ${input.requestedBy}.`);
+  }
+  if ((draft.staleReason ?? null) !== null) {
+    return refuse("conflict", `Draft ${draft.id} was closed as stale; there is nothing to send.`);
+  }
+  if (revisionOf(draft) !== input.revision) {
+    return refuse(
+      "conflict",
+      `Draft ${draft.id} is at revision ${revisionOf(draft)}, not ${input.revision}; send what was approved now.`,
+    );
+  }
+  const { outcome } = input;
+  const unchanged = ok<Transition<Draft>>({ record: draft, events: [] });
+  switch (draft.status) {
+    case "sent":
+      return outcome._tag === "sent" && draft.sentLink && sameTarget(draft.sentLink, outcome.link)
+        ? unchanged
+        : refuse("conflict", `Draft ${draft.id} was already sent; it stays sent.`);
+    case "send-failed":
+      if (outcome._tag === "send-failed" && draft.sendError === outcome.reason) return unchanged;
+      break;
+    case "approved":
+      break;
+    default:
+      return refuse(
+        "conflict",
+        `Draft ${draft.id} is ${draft.status}; only an approved draft is sent.`,
+      );
+  }
+  const record: Draft =
+    outcome._tag === "sent"
+      ? { ...draft, status: "sent", sentAt: command.now, sentLink: outcome.link, sendError: null }
+      : { ...draft, status: "send-failed", sendError: outcome.reason };
+  return ok({
+    record,
+    events: [
+      {
+        kind: outcome._tag === "sent" ? "draft.sent" : "draft.send-failed",
+        actor: actorOf(provenance),
+        provenance,
+        summary: clipSummary(
+          outcome._tag === "sent"
+            ? `Sent: draft for ${draft.audience} (${draft.channel}) at ${outcome.link.label}`
+            : `Send failed: draft for ${draft.audience} (${draft.channel}) (${outcome.reason})`,
+        ),
+        subject: draftRef(record),
+        payload: {
+          revision: input.revision,
+          head: draft.head ?? null,
+          link: outcome._tag === "sent" ? outcome.link : null,
+          reason: outcome._tag === "send-failed" ? outcome.reason : null,
+          previousStatus: draft.status,
+        },
+      },
+    ],
+  });
 };
 
 /** Edit pairs the owner approved: the raw material for edit learning. */
