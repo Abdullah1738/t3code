@@ -8,13 +8,18 @@
  * "a session minted from one of the owner's roots":
  *
  * - `desktop`: the desktop app pairing its own renderer.
- * - `dev-token`: dev mode's reusable credential from the owner's `.env`.
+ * - `dev-token`: dev mode's reusable credential from the owner's `.env`. In
+ *   dev mode the startup URL carries this credential itself, so a browser
+ *   opened from it is the owner; that is the `.env` secret, not a Mac link.
+ *   If that credential no longer verifies, the startup URL falls back to an
+ *   ordinary Mac link, which is not an owner link.
  * - `paired-client`: a pairing link created from a session that is itself an
  *   owner session (Settings > Connections on the owner's paired client).
  *
  * Links made on the Mac (`t3 pair`, `t3 auth pairing create`, the startup
- * URL) are never owner links, not even for the first device: anything that
- * can run commands as the owner's user can make one, agent shells included.
+ * URL outside dev mode) are never owner links, not even for the first device:
+ * anything that can run commands as the owner's user can make one, agent
+ * shells included.
  *
  * Pairing links minted by anyone else (a control token, an MCP client, T3
  * Connect) carry no owner mark, so the sessions they turn into are not owner
@@ -35,17 +40,20 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+/** The owner roots: the only sources a grant or claim can be written with. */
+export type MintedOwnerSource = "desktop" | "dev-token" | "paired-client";
+
 /**
  * `startup` and `cli` are never minted or read back as the owner. They stay in
- * the type only so older test fixtures still compile.
+ * this decoded type only so older test fixtures still compile.
  */
-export type OwnerSource = "startup" | "cli" | "desktop" | "dev-token" | "paired-client";
+export type OwnerSource = "startup" | "cli" | MintedOwnerSource;
 
 /** What `t3 pair` / `t3 auth pairing create` print to stderr with every link. */
 export const MAC_LINK_NOT_OWNER =
   "Note: a link made on the Mac pairs a device that is not the owner. To pair an owner device, make the link in the desktop app or on another owner device (Settings > Connections).";
 
-const OWNER_SOURCES: ReadonlySet<string> = new Set<OwnerSource>([
+const OWNER_SOURCES: ReadonlySet<string> = new Set<MintedOwnerSource>([
   "desktop",
   "dev-token",
   "paired-client",
@@ -53,6 +61,11 @@ const OWNER_SOURCES: ReadonlySet<string> = new Set<OwnerSource>([
 
 export type SessionOrigin =
   | { readonly _tag: "owner"; readonly source: OwnerSource }
+  | { readonly _tag: "component"; readonly component: string };
+
+/** An origin that can be written or read back: owner origins only from owner roots. */
+export type MintedOrigin =
+  | { readonly _tag: "owner"; readonly source: MintedOwnerSource }
   | { readonly _tag: "component"; readonly component: string };
 
 export class SessionOriginsError extends Schema.TaggedError<SessionOriginsError>()(
@@ -64,26 +77,24 @@ export interface SessionOriginsShape {
   /** Marks a pairing credential as owner-issued, before it is handed out. */
   readonly markOwnerGrant: (
     credential: string,
-    source: OwnerSource,
+    source: MintedOwnerSource,
   ) => Effect.Effect<void, SessionOriginsError>;
   /** The owner source a pairing credential was marked with, if any. */
   readonly ownerGrant: (
     credential: string,
-  ) => Effect.Effect<OwnerSource | null, SessionOriginsError>;
+  ) => Effect.Effect<MintedOwnerSource | null, SessionOriginsError>;
   /** Records a session's origin. A second record for the same session is ignored. */
   readonly record: (
     sessionId: string,
-    origin: SessionOrigin,
+    origin: MintedOrigin,
   ) => Effect.Effect<void, SessionOriginsError>;
-  readonly originOf: (
-    sessionId: string,
-  ) => Effect.Effect<SessionOrigin | null, SessionOriginsError>;
+  readonly originOf: (sessionId: string) => Effect.Effect<MintedOrigin | null, SessionOriginsError>;
   /**
    * Notes that the server has an owner. True only for the first caller ever.
    * A record, not a gate: owner roots make owners whether or not it is set.
    */
-  readonly claimOwner: (source: OwnerSource) => Effect.Effect<boolean, SessionOriginsError>;
-  /** Whether the server has ever had an owner session, live or not. */
+  readonly claimOwner: (source: MintedOwnerSource) => Effect.Effect<boolean, SessionOriginsError>;
+  /** Whether the server has ever had an owner session, live or not. For tests and recovery checks. */
   readonly ownerClaimed: () => Effect.Effect<boolean, SessionOriginsError>;
   readonly componentSessions: () => Effect.Effect<
     ReadonlyArray<{
@@ -105,9 +116,9 @@ const hashCredential = (credential: string) =>
 const decodeOrigin = (row: {
   readonly origin: string;
   readonly detail: string;
-}): SessionOrigin | null => {
+}): MintedOrigin | null => {
   if (row.origin === "owner" && OWNER_SOURCES.has(row.detail)) {
-    return { _tag: "owner", source: row.detail as OwnerSource };
+    return { _tag: "owner", source: row.detail as MintedOwnerSource };
   }
   if (row.origin === "component" && row.detail.length > 0) {
     return { _tag: "component", component: row.detail };
@@ -147,8 +158,8 @@ export const make = Effect.gen(function* () {
 
   // Origins never change, so a cached answer (including "none") stays right.
   // The row is written before its token exists, so "none" is never premature.
-  const cache = new Map<string, SessionOrigin | null>();
-  const remember = (sessionId: string, origin: SessionOrigin | null) => {
+  const cache = new Map<string, MintedOrigin | null>();
+  const remember = (sessionId: string, origin: MintedOrigin | null) => {
     if (cache.size >= CACHE_LIMIT) cache.clear();
     cache.set(sessionId, origin);
   };
@@ -171,7 +182,9 @@ export const make = Effect.gen(function* () {
     `.pipe(
       Effect.map((rows) => {
         const source = rows[0]?.source;
-        return source !== undefined && OWNER_SOURCES.has(source) ? (source as OwnerSource) : null;
+        return source !== undefined && OWNER_SOURCES.has(source)
+          ? (source as MintedOwnerSource)
+          : null;
       }),
       Effect.mapError(fail("read-owner-grant")),
     );

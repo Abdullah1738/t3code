@@ -3,6 +3,7 @@ import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
@@ -215,6 +216,45 @@ it.layer(NodeServices.layer)("missions owner proof", (it) => {
       expect(yield* origins.ownerClaimed()).toBe(true);
       expect(yield* origins.claimOwner("desktop")).toBe(false);
     }).pipe(Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: DESKTOP_TOKEN }))),
+  );
+
+  it.effect("N1: of four claims at once, exactly one is the first", () =>
+    Effect.gen(function* () {
+      const origins = yield* SessionOrigins.SessionOrigins;
+      const claims = yield* Effect.all(
+        Array.from({ length: 4 }, () => origins.claimOwner("desktop")),
+        { concurrency: "unbounded" },
+      );
+      expect(claims.filter(Boolean)).toHaveLength(1);
+    }).pipe(Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: DESKTOP_TOKEN }))),
+  );
+
+  it.effect(
+    "N1: the owner claim is a record, so failing to write it never locks the owner out",
+    () =>
+      Effect.gen(function* () {
+        const auth = yield* EnvironmentAuth.EnvironmentAuth;
+        const sessions = yield* SessionStore.SessionStore;
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`DROP TABLE ardud_mission_owner_claim`;
+
+        const desktop = yield* auth.createBrowserSession(DESKTOP_TOKEN, client);
+        expect(
+          isOwner(
+            yield* auth.authenticateHttpRequest(
+              cookieRequest(sessions.cookieName, desktop.sessionToken),
+            ),
+          ),
+        ).toBe(true);
+        const launch = yield* auth.exchangeBootstrapCredentialForAccessToken(
+          DESKTOP_TOKEN,
+          undefined,
+          client,
+        );
+        expect(
+          isOwner(yield* auth.authenticateHttpRequest(bearerRequest(launch.access_token))),
+        ).toBe(true);
+      }).pipe(Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: DESKTOP_TOKEN }))),
   );
 
   it.effect("H1: a control token cannot mint an owner session through a pairing link", () =>

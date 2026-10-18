@@ -516,9 +516,6 @@ export class EnvironmentAuth extends Context.Service<
       readonly subject?: string;
       readonly proofKeyThumbprint?: string;
       readonly purpose?: "startup";
-      // ardud missions: core
-      /** Set only by `issuePairingCredential` when the issuer is an owner session. */
-      readonly ownerSource?: "paired-client";
     }) => Effect.Effect<IssuedPairingLink, ServerAuthInternalError>;
     readonly issuePairingCredential: (
       input?: AuthCreatePairingCredentialInput,
@@ -758,7 +755,7 @@ export const make = Effect.gen(function* () {
   // A failed lookup only costs the missions owner claim, never authentication.
   const originOf = (sessionId: AuthSessionId) =>
     devAuth?.sessionId === sessionId
-      ? Effect.succeed<SessionOrigins.SessionOrigin | null>({ _tag: "owner", source: "dev-token" })
+      ? Effect.succeed<SessionOrigins.MintedOrigin | null>({ _tag: "owner", source: "dev-token" })
       : origins
           .originOf(sessionId)
           .pipe(
@@ -784,20 +781,30 @@ export const make = Effect.gen(function* () {
   // Links made on the Mac (`t3 pair`, the startup URL) are never marked.
   const grantOrigin = (credential: string, method: string) =>
     Effect.gen(function* () {
-      const source: SessionOrigins.OwnerSource | null =
+      const source: SessionOrigins.MintedOwnerSource | null =
         method === "desktop-bootstrap"
           ? "desktop"
           : method === "reusable-dev-token"
             ? "dev-token"
             : yield* origins.ownerGrant(credential);
       if (source === null) return null;
-      yield* origins.claimOwner(source);
-      return { _tag: "owner", source } satisfies SessionOrigins.SessionOrigin;
+      // The claim is a record, not a gate, so failing to write it never
+      // keeps the owner out.
+      yield* origins
+        .claimOwner(source)
+        .pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Could not record the owner claim.").pipe(
+              Effect.annotateLogs({ cause: String(cause) }),
+            ),
+          ),
+        );
+      return { _tag: "owner", source } satisfies SessionOrigins.MintedOrigin;
     });
   // Written before the token leaves; if it cannot be, the new session is revoked.
   const recordOrigin = (
     sessionId: AuthSessionId,
-    origin: SessionOrigins.SessionOrigin | null,
+    origin: SessionOrigins.MintedOrigin | null,
   ): Effect.Effect<void, SessionOrigins.SessionOriginsError> =>
     origin === null
       ? Effect.void
@@ -1141,8 +1148,15 @@ export const make = Effect.gen(function* () {
       subject: input.subject,
       ...(input.label ? { label: input.label } : {}),
       ...(input.purpose ? { purpose: input.purpose } : {}),
-      ...(input.ownerSource ? { ownerSource: input.ownerSource } : {}),
     }).pipe(
+      // ardud missions: core - marked before the credential is handed out.
+      Effect.tap((issued) =>
+        input.ownerSource === undefined
+          ? Effect.void
+          : origins
+              .markOwnerGrant(issued.credential, input.ownerSource)
+              .pipe(Effect.mapError((cause) => new ServerAuthPairingLinkCreationError({ cause }))),
+      ),
       Effect.map(
         (issued) =>
           ({
@@ -1167,10 +1181,6 @@ export const make = Effect.gen(function* () {
         ...(input?.proofKeyThumbprint ? { proofKeyThumbprint: input.proofKeyThumbprint } : {}),
         ...(input?.purpose ? { purpose: input.purpose } : {}),
       });
-      // ardud missions: core
-      if (input?.ownerSource !== undefined) {
-        yield* origins.markOwnerGrant(issued.credential, input.ownerSource);
-      }
       return {
         id: issued.id,
         credential: issued.credential,
