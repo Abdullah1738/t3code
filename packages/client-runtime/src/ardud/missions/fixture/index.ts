@@ -726,6 +726,8 @@ export function createFixtureMissionsSource(
   }
 
   return {
+    // Every feed here is sample data; nothing is marked because nothing is live.
+    sampled: new Set(),
     subscribeList: (listener) => watch(listSnapshot, listener),
     subscribeOverview: (missionId, listener) => watch(() => overview(missionId), listener),
     subscribeLanes: (missionId, listener) => watch(() => missionLanes(missionId), listener),

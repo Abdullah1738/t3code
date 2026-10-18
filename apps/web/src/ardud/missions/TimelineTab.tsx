@@ -21,7 +21,7 @@ import {
 import { Button } from "../../components/ui/button";
 import { MutedLines } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
-import { useMasterRoleId, useMissionTimeline } from "./missionsStore";
+import { isSampleFeed, useMasterRoleId, useMissionTimeline } from "./missionsStore";
 
 // Timeline tab, placeholder presentation. Filters, lineage and successions
 // come from client-runtime (timelineViewModel).
@@ -60,7 +60,7 @@ export function TimelineTab(props: { missionId: MissionId }) {
         />
       </MissionSection>
 
-      <MissionSection title={`Events (${view.rows.length})`}>
+      <MissionSection title={`Events (${view.rows.length})`} sample={isSampleFeed("timeline")}>
         <ul className="flex flex-col divide-y divide-border/60">
           {view.rows.map((row) => (
             <li key={row.event.id} className="flex flex-col gap-0.5 py-1.5 text-sm">
@@ -104,7 +104,7 @@ export function TimelineTab(props: { missionId: MissionId }) {
         </ul>
       </MissionSection>
 
-      <MissionSection title="Successions">
+      <MissionSection title="Successions" sample={isSampleFeed("timeline")}>
         {view.successions.length === 0 ? (
           <p className="text-sm text-muted-foreground">No handoffs yet.</p>
         ) : (

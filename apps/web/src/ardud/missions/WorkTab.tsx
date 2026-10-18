@@ -11,7 +11,7 @@ import {
 
 import { MutedLines } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
-import { useMasterRoleId, useMissionWork } from "./missionsStore";
+import { isSampleFeed, useMasterRoleId, useMissionWork } from "./missionsStore";
 
 // Work tab, placeholder presentation. Pipeline stages, who holds the ball on
 // blocked items and the dependency edges come from client-runtime
@@ -33,7 +33,7 @@ export function WorkTab(props: { missionId: WorkItem["missionId"]; nowMs: number
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <MissionSection title="Blocked, by who holds the ball">
+      <MissionSection title="Blocked, by who holds the ball" sample={isSampleFeed("work")}>
         {view.blocked.length === 0 ? (
           <p className="text-sm text-muted-foreground">Nothing is blocked.</p>
         ) : (
@@ -55,7 +55,7 @@ export function WorkTab(props: { missionId: WorkItem["missionId"]; nowMs: number
         )}
       </MissionSection>
 
-      <MissionSection title="Pipeline">
+      <MissionSection title="Pipeline" sample={isSampleFeed("work")}>
         <ol className="flex flex-col gap-3 text-sm">
           {view.pipeline.map((column) => (
             <li key={column.stage} className="flex flex-col gap-1">
@@ -85,7 +85,7 @@ export function WorkTab(props: { missionId: WorkItem["missionId"]; nowMs: number
         </ol>
       </MissionSection>
 
-      <MissionSection title="Depends on">
+      <MissionSection title="Depends on" sample={isSampleFeed("work")}>
         {view.edges.length === 0 ? (
           <p className="text-sm text-muted-foreground">No dependencies recorded.</p>
         ) : (

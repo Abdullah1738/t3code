@@ -41,6 +41,7 @@ import { MissionForksList } from "./MissionForksList";
 import { MissionSection } from "./MissionSection";
 import { RoutingPanel } from "./RoutingPanel";
 import {
+  isSampleFeed,
   useDraftNotes,
   useMasterRoleId,
   useMissionForks,
@@ -262,7 +263,9 @@ function InboxTabBody(props: {
   const masterRoleId = useMasterRoleId(props.missionId);
   const forks = useMissionForks(props.missionId) ?? [];
   const draftNotes = useDraftNotes(props.missionId) ?? [];
-  const stats = useSuggestionStats() ?? [];
+  const allStats = useSuggestionStats();
+  // Sample track records would misstate a live author, so they stay hidden.
+  const stats = isSampleFeed("suggestion-stats") ? null : (allStats ?? []);
   const actions = inboxActions(screen.dispatch);
 
   const card = (entry: InboxEntry) => {

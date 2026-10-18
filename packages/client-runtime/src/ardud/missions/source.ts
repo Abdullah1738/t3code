@@ -404,6 +404,20 @@ export interface AddDraftNoteInput {
   readonly text: string;
 }
 
+/**
+ * Feeds a source may serve from sample data. Each names the screen section it
+ * fills, so the section can say so once.
+ */
+export const SAMPLED_FEEDS = [
+  "work",
+  "timeline",
+  "portfolio",
+  "suggestion-stats",
+  "recovery",
+  "requests",
+] as const;
+export type SampledFeed = (typeof SAMPLED_FEEDS)[number];
+
 export interface LoadRoomPageInput {
   readonly roomId: RoomId;
   /** Messages strictly older than this seq. */
@@ -418,10 +432,14 @@ export interface LoadRoomPageInput {
  * current value as soon as one is known, then again on every change. Mutations
  * reject with a contract `MissionError`.
  *
- * The fixture source implements this today; the WS RPC source from the core
- * track replaces it without touching the screens.
+ * Two implementations: the WS RPC source (`createRpcMissionsSource`) reads
+ * the server, and the fixture source serves sample data for design work
+ * (`?missionsFixture=1` on web). The RPC source fills the feeds that have no
+ * RPC yet from the fixture and lists them in `sampled`.
  */
 export interface MissionsSource {
+  /** Feeds served from sample data because the server has no RPC for them yet. */
+  readonly sampled: ReadonlySet<SampledFeed>;
   subscribeList(listener: Listener<MissionListSnapshot>): Unsubscribe;
   /** `null` means the mission does not exist (or was archived). */
   subscribeOverview(

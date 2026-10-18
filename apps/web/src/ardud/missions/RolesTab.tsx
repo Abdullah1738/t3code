@@ -20,6 +20,7 @@ import { Input } from "../../components/ui/input";
 import { MutedLines, PickForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import {
+  isSampleFeed,
   useMasterRoleId,
   useMissionList,
   useMissionPools,
@@ -323,7 +324,7 @@ function RecoverySection(props: { missionId: MissionId }) {
   const incidents = useMissionRecovery(props.missionId);
   if (!incidents || incidents.length === 0) return null;
   return (
-    <MissionSection title="Restart recovery">
+    <MissionSection title="Restart recovery" sample={isSampleFeed("recovery")}>
       <ul className="flex flex-col gap-3">
         {incidents.map((incident) => (
           <RecoveryItem key={incident.id} incident={incident} />

@@ -12,9 +12,12 @@ import type {
   SuggestionStats,
 } from "@t3tools/contracts";
 import {
+  createAtomMissionsTransport,
   createFixtureMissionsSource,
   createKeyedSnapshotStores,
+  createRpcMissionsSource,
   createSnapshotStore,
+  type SampledFeed,
   type ApprovalRoutingTable,
   type MissionForkEntry,
   type MissionInboxSnapshot,
@@ -31,9 +34,32 @@ import {
   type RecoveryIncident,
 } from "@t3tools/client-runtime/ardud/missions";
 
-// The web client's one missions source. The fixture is built from real Crpko
-// coordinator data; swap this line for the server RPC source when it lands.
-export const missionsSource: MissionsSource = createFixtureMissionsSource({ surface: "web" });
+import { connectionAtomRuntime } from "../../connection/runtime";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
+import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
+
+// The web client's one missions source: the primary server over WS RPC, with
+// fixture data filling the feeds the server does not serve yet (each listed in
+// `missionsSource.sampled`). `?missionsFixture=1` runs on the fixture alone.
+const useFixtureOnly =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).get("missionsFixture") === "1";
+const fixtureSource = createFixtureMissionsSource({ surface: "web" });
+export const missionsSource: MissionsSource = useFixtureOnly
+  ? fixtureSource
+  : createRpcMissionsSource({
+      transport: createAtomMissionsTransport({
+        runtime: connectionAtomRuntime,
+        registry: appAtomRegistry,
+        environmentId: primaryEnvironmentIdAtom,
+      }),
+      fallback: fixtureSource,
+    });
+
+/** True when a section's data comes from the fixture rather than the server. */
+export function isSampleFeed(feed: SampledFeed): boolean {
+  return missionsSource.sampled.has(feed);
+}
 
 // One subscription per screen-level store, shared by every component that
 // reads it. Rows never subscribe on their own.

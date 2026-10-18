@@ -455,7 +455,8 @@ export function SuggestionCard(props: {
   suggestion: Suggestion;
   selected: boolean;
   onSelect: () => void;
-  stats: ReadonlyArray<SuggestionStats>;
+  /** `null` when the server has no track record to show. */
+  stats: ReadonlyArray<SuggestionStats> | null;
   nowMs: number;
   actions: InboxActions;
 }) {
@@ -464,7 +465,7 @@ export function SuggestionCard(props: {
   const [edited, setEdited] = useState(() => suggestionAfterText(suggestion));
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
-  const record = suggestionTrackRecord(props.stats, suggestion);
+  const record = props.stats === null ? null : suggestionTrackRecord(props.stats, suggestion);
   const decide = async (decision: Parameters<InboxActions["decideSuggestion"]>[1]) => {
     setBusy(true);
     await props.actions.decideSuggestion(suggestion, decision);
@@ -479,7 +480,8 @@ export function SuggestionCard(props: {
       <Meta>
         {SUGGESTION_TARGET_LABEL[suggestion.targetKind]}
         {suggestion.target ? ` · ${refLabel(suggestion.target)}` : ""} · from{" "}
-        {SUGGESTION_AUTHOR_LABEL[suggestion.author]} ({record.author.label}) ·{" "}
+        {SUGGESTION_AUTHOR_LABEL[suggestion.author]}
+        {record ? ` (${record.author.label})` : ""} ·{" "}
         {suggestion.acceptor === "owner" ? "you decide" : "master decides, you can overrule"} ·{" "}
         {formatRelative(suggestion.createdAt, props.nowMs)}
       </Meta>
@@ -491,7 +493,7 @@ export function SuggestionCard(props: {
           Evidence: <MissionLinkList links={suggestion.evidence} />
         </Meta>
       ) : null}
-      {record.kind ? (
+      {record?.kind ? (
         <Meta>
           On {SUGGESTION_TARGET_LABEL[suggestion.targetKind].toLowerCase()}: {record.kind.label}
           {record.kind.bar !== "normal" ? ` · bar ${record.kind.bar}` : ""}
