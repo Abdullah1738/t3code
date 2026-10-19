@@ -302,6 +302,7 @@ describe("AsksService", () => {
           shown: 5,
           accepted: 0,
           dismissed: 5,
+          applied: 0,
           bar: "high",
         },
       ]);

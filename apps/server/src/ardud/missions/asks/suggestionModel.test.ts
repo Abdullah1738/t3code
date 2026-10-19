@@ -16,6 +16,7 @@ import {
   decideSuggestion,
   proposeSuggestion,
   reopenSuggestion,
+  missionSuggestionStats,
   suggestionStats,
   type ProposeSuggestionCommand,
   type SuggestionProposal,
@@ -90,8 +91,60 @@ describe("suggestion stats and bar", () => {
       decided("scribe", "dismissed", 5),
     ];
     expect(suggestionStats(records)).toEqual([
-      { author: "editor", targetKind: "rule", shown: 4, accepted: 2, dismissed: 1, bar: "normal" },
-      { author: "scribe", targetKind: "rule", shown: 1, accepted: 0, dismissed: 1, bar: "normal" },
+      {
+        author: "editor",
+        targetKind: "rule",
+        shown: 4,
+        accepted: 2,
+        dismissed: 1,
+        applied: 0,
+        bar: "normal",
+      },
+      {
+        author: "scribe",
+        targetKind: "rule",
+        shown: 1,
+        accepted: 0,
+        dismissed: 1,
+        applied: 0,
+        bar: "normal",
+      },
+    ]);
+  });
+
+  it("splits the record by mission and counts applied ones; the bar stays the source's", () => {
+    const other = MissionId.make("m2");
+    const inMission = (record: Suggestion, missionId: MissionId | null): Suggestion => ({
+      ...record,
+      missionId,
+    });
+    const records = [
+      { ...decided("editor", "accepted", 1), outcome: "Applied: rule updated." },
+      { ...decided("editor", "edited", 2), outcome: "Not applied: the rule is gone." },
+      decided("editor", "dismissed", 3),
+      ...[4, 5, 6, 7].map((index) => inMission(decided("editor", "dismissed", index), other)),
+      inMission(decided("scribe", "accepted", 8), null),
+    ];
+    const m1 = MissionId.make("m1");
+    expect(missionSuggestionStats(records, m1)).toEqual([
+      {
+        missionId: m1,
+        author: "editor",
+        targetKind: "rule",
+        shown: 3,
+        accepted: 2,
+        dismissed: 1,
+        applied: 1,
+        // Five of seven editor rule suggestions were dismissed across missions.
+        bar: "raised",
+      },
+    ]);
+    expect(
+      missionSuggestionStats(records, null).map((row) => [row.missionId, row.author, row.shown]),
+    ).toEqual([
+      [null, "scribe", 1],
+      [m1, "editor", 3],
+      [other, "editor", 4],
     ]);
   });
 

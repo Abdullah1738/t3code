@@ -4,6 +4,7 @@ import {
   DraftId,
   DraftNoteId,
   ForkId,
+  approverOf,
   isOwnerProvenance,
   MissionError,
   MissionId,
@@ -44,6 +45,7 @@ import {
   type Suggestion,
   type SuggestionAuthor,
   type SuggestionStats,
+  type MissionMasterInbox,
   type SystemDraftDecision,
   type UpdateForkInput,
   type WithdrawAskInput,
@@ -141,6 +143,7 @@ import {
   decideSuggestion,
   proposeSuggestion,
   recordOutcome,
+  missionSuggestionStats,
   reopenSuggestion,
   suggestionStats,
   type SuggestionApplication,
@@ -249,6 +252,12 @@ export class AsksService extends Context.Service<
     readonly draftNotes: (missionId: MissionId | null) => Fx<ReadonlyArray<DraftNote>>;
     readonly suggestions: (filter: ListFilter) => Fx<ReadonlyArray<Suggestion>>;
     readonly suggestionStats: () => Fx<ReadonlyArray<SuggestionStats>>;
+    /** Per mission, source and target kind, with applied counts (null: every mission). */
+    readonly missionSuggestionStats: (
+      missionId: MissionId | null,
+    ) => Fx<ReadonlyArray<SuggestionStats>>;
+    /** What waits on the master instead of the owner (null: every mission). */
+    readonly masterInbox: (missionId: MissionId | null) => Fx<MissionMasterInbox>;
     readonly forks: (filter: ListFilter) => Fx<ReadonlyArray<MissionFork>>;
     readonly notes: (missionId: MissionId) => Fx<ReadonlyArray<Note>>;
     /** Who the caller is in a mission: its roles, lanes, open forks and whether it is the master. */
@@ -333,6 +342,13 @@ export class AsksService extends Context.Service<
 >()("t3/ardud/missions/asks/AsksService") {}
 
 const fromOutcome = <A>(outcome: Outcome<A>): Fx<A> => Effect.fromResult(outcome);
+
+const MASTER_INBOX_LIST_LIMIT = 50;
+
+const newestOf = <T extends { readonly createdAt: string }>(items: ReadonlyArray<T>) =>
+  items
+    .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(0, MASTER_INBOX_LIST_LIMIT);
 
 const fail = (code: MissionError["code"], detail: string) =>
   Effect.fail(new MissionError({ code, detail }));
@@ -1805,6 +1821,33 @@ const make = Effect.gen(function* () {
       return { notes, examples: draftExamples(address, drafts) };
     });
 
+  const masterInbox = (missionId: MissionId | null): Fx<MissionMasterInbox> =>
+    Effect.gen(function* () {
+      if (missionId !== null) yield* need("mission", missionId);
+      const revision = yield* store.revision;
+      const every = <K extends "draft" | "approval" | "suggestion">(
+        kind: K,
+        status: ReadonlyArray<string>,
+      ) =>
+        missionId === null
+          ? store.listAll(kind, status)
+          : store.listAllInMission(kind, missionId, status);
+      const onMaster = <T extends Pick<Draft, "approver">>(items: ReadonlyArray<T>) =>
+        items.filter((item) => approverOf(item) === "master");
+      const drafts = onMaster(yield* every("draft", ["pending"]));
+      const approvals = onMaster(yield* every("approval", ["pending"]));
+      const suggestions = (yield* every("suggestion", ["open"])).filter(
+        (suggestion) => suggestion.acceptor === "master",
+      );
+      return {
+        revision,
+        counts: { approve: drafts.length + approvals.length, suggestions: suggestions.length },
+        drafts: newestOf(drafts),
+        approvals: newestOf(approvals),
+        suggestions: newestOf(suggestions),
+      };
+    });
+
   return AsksService.of({
     missions: () => store.list("mission"),
     desk,
@@ -1819,7 +1862,12 @@ const make = Effect.gen(function* () {
     draftGuide,
     draftNotes: (missionId) => allDraftNotes(missionId),
     suggestions: (filter) => listWith("suggestion", filter),
-    suggestionStats: () => store.list("suggestion").pipe(Effect.map(suggestionStats)),
+    suggestionStats: () => store.listAll("suggestion").pipe(Effect.map(suggestionStats)),
+    missionSuggestionStats: (missionId) =>
+      store
+        .listAll("suggestion")
+        .pipe(Effect.map((suggestions) => missionSuggestionStats(suggestions, missionId))),
+    masterInbox,
     forks: (filter) => listWith("fork", filter),
     notes: (missionId) => store.list("note", { missionId }),
     standing: (missionId, provenance) =>

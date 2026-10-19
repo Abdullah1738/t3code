@@ -974,6 +974,12 @@ export const SuggestionStats = Schema.Struct({
   dismissed: NonNegativeInt,
   /** Raised when most are dismissed; fewer get shown. */
   bar: Schema.Literals(["normal", "raised", "high"]),
+  // --- asks additions ---
+  /** Accepted ones whose change went through. */
+  applied: Schema.optional(NonNegativeInt),
+  /** Set on a mission's rows; absent on rows across every mission. */
+  missionId: Schema.optional(Schema.NullOr(MissionId)),
+  // --- end asks additions ---
 });
 export type SuggestionStats = typeof SuggestionStats.Type;
 
@@ -3192,6 +3198,29 @@ export const ReportDraftSentInput = Schema.Struct({
   outcome: DraftSendOutcome,
 });
 export type ReportDraftSentInput = typeof ReportDraftSentInput.Type;
+
+/** One mission, or every mission when null. */
+export const MissionScopeInput = Schema.Struct({
+  missionId: Schema.NullOr(MissionId),
+});
+export type MissionScopeInput = typeof MissionScopeInput.Type;
+
+/**
+ * What waits on the master rather than the owner: pending drafts and
+ * approvals routed to the master and open suggestions the master accepts.
+ * Counts are complete; lists are newest first and capped.
+ */
+export const MissionMasterInbox = Schema.Struct({
+  revision: NonNegativeInt,
+  counts: Schema.Struct({
+    approve: NonNegativeInt,
+    suggestions: NonNegativeInt,
+  }),
+  drafts: Schema.Array(Draft),
+  approvals: Schema.Array(Approval),
+  suggestions: Schema.Array(Suggestion),
+});
+export type MissionMasterInbox = typeof MissionMasterInbox.Type;
 
 // --- end asks additions ---
 
