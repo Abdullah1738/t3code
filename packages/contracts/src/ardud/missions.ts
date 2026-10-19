@@ -1367,6 +1367,12 @@ export const ReviewPolicySnapshot = Schema.Struct({
   policy: ReviewPolicy,
   /** False until someone edits the policy; the default ladders apply meanwhile. */
   stored: Schema.Boolean,
+  // --- policy additions ---
+  /** The mission's latest criticality verdicts, newest first (capped). */
+  verdicts: Schema.optional(Schema.Array(CriticalityVerdict)),
+  /** The mission's latest recorded review rounds, newest first (capped). */
+  reviews: Schema.optional(Schema.Array(ReviewRecord)),
+  // --- end policy additions ---
 });
 export type ReviewPolicySnapshot = typeof ReviewPolicySnapshot.Type;
 

@@ -90,8 +90,15 @@ export const reviewPolicySnapshot = (
 ): Effect.Effect<ReviewPolicySnapshot, MissionError> =>
   Effect.gen(function* () {
     yield* requireMission(deps, missionId);
-    return yield* loadPolicy(deps, missionId);
+    const loaded = yield* loadPolicy(deps, missionId);
+    const recent = { missionId, limit: RECENT_REVIEWS } as const;
+    const verdicts = yield* deps.store.list("criticality-verdict", recent);
+    const reviews = yield* deps.store.list("review", recent);
+    return { ...loaded, verdicts, reviews };
   });
+
+/** How many of the mission's latest verdicts and review rounds the snapshot carries. */
+const RECENT_REVIEWS = 100;
 
 const savePolicy = (
   deps: PolicyDeps,

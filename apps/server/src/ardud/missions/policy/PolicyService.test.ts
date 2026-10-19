@@ -290,6 +290,23 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
         ["done-at-older-head", "done-at-older-head"],
       );
       assert.isFalse(plan.mergeAllowed);
+
+      // The policy read carries the verdicts and rounds for the screen, newest first.
+      const snapshot = yield* policy.reviewPolicy(CRPKO);
+      assert.deepStrictEqual(
+        snapshot.verdicts?.map((verdict) => verdict.reason),
+        ["moves real funds"],
+      );
+      assert.deepStrictEqual(
+        snapshot.reviews?.map((review) => `${review.stageId}@${review.headSha}:${review.verdict}`),
+        [
+          "final@h3:clear",
+          "reviewer@h3:clear",
+          "final@h2:findings",
+          "reviewer@h2:clear",
+          "reviewer@h1:findings",
+        ],
+      );
     }),
   );
 
