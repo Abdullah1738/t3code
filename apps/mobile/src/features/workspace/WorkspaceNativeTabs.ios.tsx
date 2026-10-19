@@ -12,6 +12,10 @@ import { WorkspaceTabsContext, useWorkspaceTabs } from "./WorkspaceTabsContext";
 import type { WorkspaceTab } from "./workspace-tabs-state";
 import { NativeWorkspaceTabActivityContext } from "../../native/v5-workspace-context";
 import { useSystemWorkspaceTabBar } from "./useSystemWorkspaceTabBar";
+// ardud missions: desk-theme
+import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
+import { DEFAULT_MOBILE_THEME_ID } from "../../lib/mobileTheme";
+// end ardud missions: desk-theme
 
 // Tabler's git-pull-request geometry, rasterized at 1x/2x/3x for UIKit template images.
 const PULL_REQUEST_ICON = require("../../../assets/icons/pull-request.png");
@@ -63,6 +67,12 @@ export function WorkspaceNativeTabs(props: {
   const [provenance, setProvenance] = useState(0);
   const systemTabBar = useSystemWorkspaceTabBar();
   const selectedTab = workspace.state.selectedTab;
+  // ardud missions: desk-theme: Desk keeps the system material and tints it teal.
+  const appearance = useAppearancePreferences();
+  const tabBarTintColor =
+    appearance.themeId === DEFAULT_MOBILE_THEME_ID
+      ? appearance.themeVariables["--color-primary-text"]
+      : undefined;
   const request = useMemo(
     () => ({ selectedScreenKey: selectedTab, baseProvenance: provenance }),
     [selectedTab, provenance],
@@ -72,7 +82,11 @@ export function WorkspaceNativeTabs(props: {
       <Tabs.Host
         navStateRequest={request}
         tabBarHidden={props.hidden || !systemTabBar}
-        ios={{ tabBarControllerMode: "tabBar", tabBarMinimizeBehavior: "never" }}
+        ios={{
+          tabBarControllerMode: "tabBar",
+          tabBarMinimizeBehavior: "never",
+          tabBarTintColor, // ardud missions: desk-theme
+        }}
         onTabSelectionPrevented={({
           nativeEvent,
         }: NativeSyntheticEvent<TabSelectionPreventedEvent>) => {
