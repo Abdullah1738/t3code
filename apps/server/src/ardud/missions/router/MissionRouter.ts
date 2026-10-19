@@ -1067,7 +1067,12 @@ const make = Effect.gen(function* () {
       const cast = yield* loadCast(input.missionId);
       if (cast.mission === null) return yield* fail("not-found", `No mission ${input.missionId}.`);
       const owner = isOwnerProvenance(provenance);
-      if (!owner && !isMaster(cast, provenance)) {
+      // ardud missions: coord. The coord import enrols the actors coord.db
+      // binds to threads. It may only add coord members, never remove one or
+      // attach a thread or session.
+      const importEnrol =
+        provenance._tag === "import" && input.member && input.principal._tag === "coord";
+      if (!owner && !importEnrol && !isMaster(cast, provenance)) {
         return yield* fail("forbidden", "Only the owner or the mission's master changes members.");
       }
       if (!owner && input.member && input.principal._tag === "thread") {
