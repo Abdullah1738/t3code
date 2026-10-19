@@ -1,105 +1,283 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
-import type { WorkItem } from "@t3tools/contracts";
+import type { MissionId, WorkItem } from "@t3tools/contracts";
 import {
-  blockedWork,
-  formatRelative,
-  workEdges,
+  ageView,
+  OPEN_WORK_STAGES,
+  workBoard,
   workFacts,
-  workPipeline,
+  type WorkQuery,
+  type WorkRow,
 } from "@t3tools/client-runtime/ardud/missions";
 
-import { MutedLines } from "./MissionForms";
+import { cn } from "../../lib/utils";
+import { StateGlyph } from "./cards/chips";
+import { DESK_ROW, DeskChip, Figure, FoldRow, PageLine, Segmented } from "./deskParts";
 import { MissionSection } from "./MissionSection";
-import { isSampleFeed, useMasterRoleId, useMissionWork } from "./missionsStore";
+import { useMasterRoleId, useMissionOverview } from "./missionsStore";
+import { useWorkFeed } from "./useMissionFeeds";
 
-// Work tab, placeholder presentation. Pipeline stages, who holds the ball on
-// blocked items and the dependency edges come from client-runtime
-// (workViewModel).
+// Work tab: open work by holder (or stage), the stage strip, chains, the last
+// finished items and the deferred register. Grouping lives in workViewModel.
 
-export function WorkTab(props: { missionId: WorkItem["missionId"]; nowMs: number }) {
-  const work = useMissionWork(props.missionId);
+const OPEN_QUERY: WorkQuery = { stages: OPEN_WORK_STAGES };
+const DONE_QUERY: WorkQuery = { stages: ["done"], limit: 8 };
+const MOVING_SHOWN = 8;
+const REGISTER_SHOWN = 8;
+
+type Grouping = "holder" | "stage";
+const GROUPINGS = [
+  { value: "holder", label: "Holder" },
+  { value: "stage", label: "Stage" },
+] as const;
+
+export function WorkTab(props: { missionId: MissionId; nowMs: number }) {
+  const open = useWorkFeed(props.missionId, OPEN_QUERY);
+  const done = useWorkFeed(props.missionId, DONE_QUERY);
+  const overview = useMissionOverview(props.missionId);
   const masterRoleId = useMasterRoleId(props.missionId);
-  const view = useMemo(() => {
-    if (!work) return null;
-    return {
-      pipeline: workPipeline(work.items),
-      blocked: blockedWork(work.items, masterRoleId),
-      edges: workEdges(work.items),
-      titles: new Map(work.items.map((item) => [item.id as string, item.title])),
-    };
-  }, [work, masterRoleId]);
-  if (!view) return <p className="text-sm text-muted-foreground">Loading work…</p>;
+  const [grouping, setGrouping] = useState<Grouping>("holder");
+  const board = useMemo(() => {
+    if (!open) return null;
+    const titles = new Map(
+      (overview?.subMissions ?? []).map((sub) => [sub.id as string, sub.title]),
+    );
+    return workBoard(open.items, masterRoleId, titles);
+  }, [open, overview, masterRoleId]);
+  if (!board) return <p className="text-sm text-(--m-muted)">Loading work…</p>;
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <MissionSection title="Blocked, by who holds the ball" sample={isSampleFeed("work")}>
-        {view.blocked.length === 0 ? (
-          <p className="text-sm text-muted-foreground">Nothing is blocked.</p>
-        ) : (
-          <ul className="flex flex-col gap-3 text-sm">
-            {view.blocked.map((group) => (
-              <li key={group.holder} className="flex flex-col gap-1">
-                <span className="font-medium text-foreground">{group.holder}</span>
-                <ul className="flex flex-col gap-1 ps-3">
-                  {group.items.map((entry) => (
-                    <li key={entry.item.id}>
-                      {entry.item.title}
-                      <MutedLines lines={[entry.waitingOn]} />
-                    </li>
-                  ))}
-                </ul>
-              </li>
-            ))}
-          </ul>
-        )}
-      </MissionSection>
+      <PageLine
+        actions={
+          <Segmented label="Group by" value={grouping} options={GROUPINGS} onChange={setGrouping} />
+        }
+      >
+        <Figure>{board.open}</Figure> open
+        {board.withYou.length > 0 ? (
+          <>
+            , <Figure>{board.withYou.length}</Figure> with you
+          </>
+        ) : null}
+        {board.blocked.length > 0 ? (
+          <>
+            , <Figure>{board.blocked.length}</Figure> blocked
+          </>
+        ) : null}
+        .
+        {board.register.length > 0 ? (
+          <>
+            {" "}
+            <Figure>{board.register.length}</Figure> in the deferred register.
+          </>
+        ) : null}
+      </PageLine>
 
-      <MissionSection title="Pipeline" sample={isSampleFeed("work")}>
-        <ol className="flex flex-col gap-3 text-sm">
-          {view.pipeline.map((column) => (
-            <li key={column.stage} className="flex flex-col gap-1">
-              <span className="font-medium text-foreground">
-                {column.label} ({column.items.length})
-              </span>
-              {column.items.length > 0 ? (
-                <ul className="flex flex-col gap-1 ps-3">
-                  {column.items.map((item) => (
-                    <li key={item.id}>
-                      {item.title}
-                      <MutedLines
-                        lines={[
-                          item.pullRequest
-                            ? `${item.pullRequest.repository}#${item.pullRequest.number}`
-                            : null,
-                          ...workFacts(item),
-                          `Updated ${formatRelative(item.updatedAt, props.nowMs)}`,
-                        ]}
-                      />
-                    </li>
-                  ))}
-                </ul>
-              ) : null}
-            </li>
-          ))}
-        </ol>
-      </MissionSection>
+      <ol className="grid grid-cols-4 gap-1 sm:grid-cols-7" aria-label="Open work by stage">
+        {board.stages.map((stage) => (
+          <li
+            key={stage.stage}
+            className="flex flex-col rounded-lg bg-(--m-surface) px-3.5 pt-3 pb-3.5 sm:rounded-none sm:first:rounded-s-xl sm:last:rounded-e-xl"
+          >
+            <span className="text-xs text-(--m-muted)">{stage.label}</span>
+            <span className="text-2xl leading-tight text-(--m-text) tabular-nums">
+              {stage.count}
+            </span>
+          </li>
+        ))}
+      </ol>
 
-      <MissionSection title="Depends on" sample={isSampleFeed("work")}>
-        {view.edges.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No dependencies recorded.</p>
-        ) : (
-          <ul className="flex flex-col gap-1 text-sm">
-            {view.edges.map((edge) => (
-              <li key={`${edge.from}->${edge.to}`}>
-                {view.titles.get(edge.to) ?? edge.to} waits on{" "}
-                {view.titles.get(edge.from) ?? edge.from}
-                {edge.open ? "" : " (done)"}
-              </li>
-            ))}
-          </ul>
-        )}
-      </MissionSection>
+      <div className="grid min-w-0 gap-4 lg:grid-cols-12">
+        <div className="flex min-w-0 flex-col gap-4 lg:col-span-8 [&>*:last-child]:grow">
+          {grouping === "holder" ? (
+            <>
+              <RowPanel title="With you" rows={board.withYou} nowMs={props.nowMs} />
+              <RowPanel title="Blocked" rows={board.blocked} nowMs={props.nowMs} />
+              <RowPanel
+                title="Moving"
+                rows={board.moving}
+                nowMs={props.nowMs}
+                shown={MOVING_SHOWN}
+              />
+            </>
+          ) : (
+            board.byStage.map((group) => (
+              <RowPanel
+                key={group.stage}
+                title={group.label}
+                rows={group.rows}
+                nowMs={props.nowMs}
+                shown={MOVING_SHOWN}
+                hideStage
+              />
+            ))
+          )}
+        </div>
+
+        <div className="flex min-w-0 flex-col gap-4 lg:col-span-4 [&>*:last-child]:grow">
+          {board.chains.length > 0 ? (
+            <MissionSection title="Chains" caption={board.chains.length}>
+              <ul className="flex flex-col gap-2.5 text-sm">
+                {board.chains.map((chain) => (
+                  <li key={chain.id} className="flex min-w-0 flex-wrap items-baseline gap-1.5">
+                    {chain.name ? (
+                      <b className="w-20 shrink-0 truncate font-semibold">{chain.name}</b>
+                    ) : null}
+                    {chain.steps.map((step, index) => (
+                      <span key={step.id} className="inline-flex min-w-0 items-baseline gap-1.5">
+                        {index > 0 ? (
+                          <span aria-hidden className="text-(--m-muted)">
+                            →
+                          </span>
+                        ) : null}
+                        <span className="min-w-0">{step.title}</span>
+                      </span>
+                    ))}
+                  </li>
+                ))}
+              </ul>
+            </MissionSection>
+          ) : null}
+
+          {done && done.total > 0 ? (
+            <MissionSection title="Done" caption={done.total}>
+              <ul className="flex flex-col text-sm">
+                {done.items.map((item) => (
+                  <DoneRow key={item.id} item={item} nowMs={props.nowMs} />
+                ))}
+              </ul>
+            </MissionSection>
+          ) : null}
+
+          {board.register.length > 0 ? <RegisterPanel register={board.register} /> : null}
+        </div>
+      </div>
     </div>
+  );
+}
+
+function RowPanel(props: {
+  title: string;
+  rows: ReadonlyArray<WorkRow>;
+  nowMs: number;
+  shown?: number;
+  hideStage?: boolean;
+}) {
+  const [all, setAll] = useState(false);
+  if (props.rows.length === 0) return null;
+  const limit = props.shown ?? props.rows.length;
+  const rows = all ? props.rows : props.rows.slice(0, limit);
+  return (
+    <MissionSection title={props.title} caption={props.rows.length}>
+      <ul className="flex flex-col">
+        {rows.map((row) => (
+          <WorkRowItem
+            key={row.item.id}
+            row={row}
+            nowMs={props.nowMs}
+            hideStage={props.hideStage === true}
+          />
+        ))}
+      </ul>
+      {all ? null : (
+        <FoldRow hidden={props.rows.length - rows.length} onShow={() => setAll(true)} />
+      )}
+    </MissionSection>
+  );
+}
+
+function WorkRowItem(props: { row: WorkRow; nowMs: number; hideStage: boolean }) {
+  const { row } = props;
+  const age = ageView(row.item.updatedAt, props.nowMs);
+  return (
+    <li
+      className={cn(
+        "grid grid-cols-[16px_minmax(0,1fr)_auto] items-baseline gap-x-3.5 gap-y-0.5 py-2.75 text-sm",
+        DESK_ROW,
+      )}
+    >
+      <span className="self-center">
+        <StateGlyph
+          kind={row.glyph}
+          label={row.glyph === "risk" ? "With you" : row.glyph === "bad" ? "Blocked" : "Moving"}
+        />
+      </span>
+      <span className="min-w-0 truncate font-medium">{row.item.title}</span>
+      <span className="flex items-center justify-end gap-3.5 whitespace-nowrap">
+        {props.hideStage ? null : (
+          <span className="hidden w-21 text-(--m-muted) sm:inline">{row.stageLabel}</span>
+        )}
+        {row.holder ? <DeskChip className="max-w-32.5">{row.holder.name}</DeskChip> : null}
+        {age ? (
+          <time
+            dateTime={row.item.updatedAt}
+            className="w-16 text-end text-xs text-(--m-muted) tabular-nums"
+          >
+            {age.label}
+          </time>
+        ) : null}
+      </span>
+      {row.reason ? (
+        <span className="col-start-2 col-end-4 min-w-0 truncate text-xs text-(--m-muted)">
+          {row.reason}
+        </span>
+      ) : null}
+    </li>
+  );
+}
+
+function DoneRow(props: { item: WorkItem; nowMs: number }) {
+  const age = ageView(props.item.updatedAt, props.nowMs);
+  const fact = workFacts(props.item)[0];
+  return (
+    <li
+      className={cn(
+        "grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-3 gap-y-0.5 py-2.5",
+        DESK_ROW,
+      )}
+    >
+      <span className="min-w-0 truncate">{props.item.title}</span>
+      {age ? (
+        <time dateTime={props.item.updatedAt} className="text-xs text-(--m-muted) tabular-nums">
+          {age.label}
+        </time>
+      ) : null}
+      {fact ? (
+        <span className="col-span-2 min-w-0 truncate text-xs text-(--m-muted)">{fact}</span>
+      ) : null}
+    </li>
+  );
+}
+
+function RegisterPanel(props: { register: ReturnType<typeof workBoard>["register"] }) {
+  const [all, setAll] = useState(false);
+  const rows = all ? props.register : props.register.slice(0, REGISTER_SHOWN);
+  return (
+    <MissionSection title="Deferred register" caption={props.register.length}>
+      <ul className="flex flex-col text-sm">
+        {rows.map((entry) => (
+          <li
+            key={entry.item.id}
+            className={cn("grid grid-cols-[56px_minmax(0,1fr)] gap-x-3 gap-y-0.5 py-2.5", DESK_ROW)}
+          >
+            <span className="text-(--m-muted) tabular-nums">{entry.registerId}</span>
+            <span className="min-w-0">{entry.what}</span>
+            {entry.trigger ? (
+              <span
+                className={cn(
+                  "col-start-2 min-w-0 text-xs",
+                  entry.fired ? "text-(--m-warning)" : "text-(--m-muted)",
+                )}
+              >
+                {entry.fired ? `Fired: ${entry.trigger}` : entry.trigger}
+              </span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+      {all ? null : (
+        <FoldRow hidden={props.register.length - rows.length} onShow={() => setAll(true)} />
+      )}
+    </MissionSection>
   );
 }
