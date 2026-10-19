@@ -3117,6 +3117,11 @@ export const OrchestrationV2Command = Schema.Union([
     decision: Schema.optional(ProviderApprovalDecision),
     answers: Schema.optional(ProviderUserInputAnswers),
     attachmentsByQuestionId: Schema.optional(UserInputAttachments),
+    /**
+     * ardud missions: core - who answered, stamped by the server from the
+     * authenticated caller. Absent means a server-side caller, never a human.
+     */
+    createdBy: Schema.optional(OrchestrationV2Actor),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.user-input.dismiss"),

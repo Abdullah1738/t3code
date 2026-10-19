@@ -36,6 +36,8 @@ import * as Schema from "effect/Schema";
 import { Command, Flag, GlobalFlag } from "effect/cli";
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 
+// ardud missions: core
+import { MAC_LINK_NOT_OWNER } from "../ardud/auth/SessionOrigins.ts";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import { resolveBaseDir } from "../os-jank.ts";
@@ -527,6 +529,8 @@ export const pairCommand = Command.make("pair", {
         label: flags.label,
       });
       const pairingUrl = buildPairingUrl(pairingBaseUrl, issued.credential);
+      // ardud missions: core
+      yield* Console.error(MAC_LINK_NOT_OWNER);
 
       yield* Console.log(
         formatPairOutput({

@@ -47,6 +47,17 @@ import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
 import { BoardService } from "../board/BoardService.ts";
+// ardud missions: router
+import { guardControlSend, type SendRefused } from "../missions/router/guardPaths.ts";
+// ardud missions: guard
+import { optionalAuthorityStore } from "../missions/guard/authority.ts";
+import {
+  CONTROL_ACTOR,
+  controlActor,
+  guardControlRespond,
+  recordControlWrite,
+} from "../missions/guard/control.ts";
+import { optionalIMessageOwner } from "../missions/guard/imessage.ts";
 import {
   formatModel,
   lastAssistantText,
@@ -110,6 +121,18 @@ const json = (body: unknown, status = 200) =>
 
 const errorResponse = (error: ControlError) =>
   json({ ok: false, error: { code: error.code, message: error.message } }, STATUS[error.code]);
+
+// ardud missions: router - a guarded send is refused with 403 and says where it went.
+const controlRefusal = (threadId: ThreadId, refusal: SendRefused) =>
+  json(
+    {
+      ok: false,
+      threadId,
+      error: { code: "forbidden", message: refusal.message },
+      guard: refusal.outcome,
+    },
+    STATUS.forbidden,
+  );
 
 // ---------------------------------------------------------------------------
 // Request helpers
@@ -203,6 +226,8 @@ const SendBody = Schema.Struct({
   variant: OptionalString,
   attachments: Schema.optional(Schema.Array(Attachment)),
   clientRequestId: OptionalString,
+  // ardud missions: guard - the iMessage the bridge is relaying, checked against its store.
+  inboundId: OptionalString,
 });
 
 const InterruptBody = Schema.Struct({
@@ -217,6 +242,8 @@ const RespondBody = Schema.Struct({
   answers: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   dismiss: Schema.optional(Schema.Boolean),
   clientRequestId: OptionalString,
+  // ardud missions: guard - the iMessage the bridge is relaying, checked against its store.
+  inboundId: OptionalString,
 });
 
 const OriginBody = Schema.Struct({ origin: Schema.NullOr(Schema.String) });
@@ -383,6 +410,9 @@ const makeRoutes = Effect.gen(function* () {
   const board = yield* Effect.serviceOption(BoardService);
   const refreshBoard = (threadId: string) =>
     board._tag === "Some" ? board.value.refreshThread(threadId).pipe(Effect.ignore) : Effect.void;
+  // ardud missions: guard - control sessions are kept beside what they write.
+  const guardAuthority = yield* optionalAuthorityStore;
+  const imessageOwner = yield* optionalIMessageOwner;
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -622,7 +652,7 @@ const makeRoutes = Effect.gen(function* () {
     });
 
   const createThread = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
     const body = yield* decodeBody(decodeCreateThreadBody);
     const target = yield* resolveProject(body);
     const settings = yield* settingsService.getSettings.pipe(
@@ -684,11 +714,14 @@ const makeRoutes = Effect.gen(function* () {
                   attachments,
                 },
               }),
-          createdBy: "user",
+          // ardud missions: guard - a bearer token is not the owner typing.
+          createdBy: CONTROL_ACTOR,
           creationSource: "server",
         }).pipe(Effect.provide(intakeContext)),
       )
       .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+    // ardud missions: guard
+    yield* recordControlWrite(guardAuthority, "thread", launched.threadId, session);
     if (body.origin !== undefined && body.origin.trim().length > 0) {
       yield* store
         .setOrigin(launched.threadId, body.origin.trim())
@@ -830,11 +863,36 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   const send = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
     const body = yield* decodeBody(decodeSendBody);
     const shell = yield* getShell(threadId);
     const commandId = yield* commandIdFor(`send:${threadId}`, body.clientRequestId);
+    // ardud missions: guard - the owner's word only when the bridge relays a verified iMessage.
+    const owner = yield* imessageOwner.relay({
+      session,
+      inboundId: body.inboundId,
+      threadId: shell.id,
+      text: body.text,
+      attachments: body.attachments?.length ?? 0,
+      mode: body.mode,
+    });
+    // ardud missions: router - mission member threads only take sends the guard passes.
+    const refused = yield* guardControlSend({
+      session,
+      owner,
+      targetThreadId: shell.id,
+      text: body.text,
+      commandId,
+      clientRequestId: body.clientRequestId,
+    }).pipe(
+      Effect.as(null),
+      Effect.catchTags({
+        SendRefused: (refusal) => Effect.succeed(controlRefusal(shell.id, refusal)),
+        SendGuardFailed: (error) => Effect.fail(fail("unavailable", error.message)),
+      }),
+    );
+    if (refused !== null) return refused;
     const modelSelection =
       body.model === undefined && body.variant === undefined
         ? undefined
@@ -854,7 +912,8 @@ const makeRoutes = Effect.gen(function* () {
           attachments: toChatAttachments(body.attachments),
           ...(modelSelection === undefined ? {} : { modelSelection }),
           mode: body.mode ?? "auto",
-          createdBy: "user",
+          // ardud missions: guard - a bearer token is not the owner typing.
+          createdBy: controlActor(owner),
           creationSource: "server",
         }).pipe(Effect.provide(intakeContext)),
       )
@@ -865,6 +924,8 @@ const makeRoutes = Effect.gen(function* () {
             : fail("conflict", errorDetail(cause)),
         ),
       );
+    // ardud missions: guard
+    yield* recordControlWrite(guardAuthority, "message", result.message.id, session, owner);
     return json({
       ok: true,
       threadId: shell.id,
@@ -900,7 +961,7 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   const respond = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationOperateScope);
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
     const threadId = yield* param("threadId");
     const requestId = yield* param("requestId");
     const body = yield* decodeBody(decodeRespondBody);
@@ -963,6 +1024,38 @@ const makeRoutes = Effect.gen(function* () {
         decision,
       };
     }
+    // ardud missions: guard - the answer is judged before the request changes
+    // state, so a routed or knocked answer leaves it pending. It is the owner's
+    // only when the bridge relays a verified iMessage that says exactly this.
+    const answer = {
+      decision: command.type === "runtime-request.respond" ? command.decision : undefined,
+      answers: command.type === "runtime-request.respond" ? command.answers : undefined,
+      dismissed: command.type === "thread.user-input.dismiss",
+    };
+    const owner = yield* imessageOwner.answer({
+      session,
+      inboundId: body.inboundId,
+      threadId,
+      requestId,
+      askedAt: request.createdAt,
+      turnItems: records.turnItems,
+      ...answer,
+    });
+    const refused = yield* guardControlRespond({
+      session,
+      owner,
+      threadId: ThreadId.make(threadId),
+      requestId,
+      ...answer,
+      commandId,
+    }).pipe(
+      Effect.as(null),
+      Effect.catchTags({
+        SendRefused: (refusal) => Effect.succeed(controlRefusal(ThreadId.make(threadId), refusal)),
+        SendGuardFailed: (error) => Effect.fail(fail("unavailable", error.message)),
+      }),
+    );
+    if (refused !== null) return refused;
     const result = yield* dispatch(command);
     return json({ ok: true, threadId, requestId, sequence: result.sequence });
   });

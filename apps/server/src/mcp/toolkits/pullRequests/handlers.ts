@@ -30,6 +30,10 @@ import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequest
 import { pullRequestSyncKey } from "../../../pullRequest/pullRequestSyncKey.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
+// ardud missions: guard
+import { optionalAuthorityStore } from "../../../ardud/missions/guard/authority.ts";
+import { guardFailure, mcpPrincipal } from "../../../ardud/missions/guard/mcp.ts";
+import { authorizeWatch } from "../../../ardud/missions/guard/watches.ts";
 import {
   type ListThreadPullRequestsResult,
   PullRequestLinkFailedError,
@@ -203,6 +207,8 @@ const make = Effect.gen(function* () {
 
   const projects = yield* ProjectService.ProjectService;
   const crypto = yield* Crypto.Crypto;
+  // ardud missions: guard
+  const guardAuthority = yield* optionalAuthorityStore;
 
   const commandId = (tag: string, threadId: ThreadId) =>
     crypto.randomUUIDv4().pipe(
@@ -285,6 +291,16 @@ const make = Effect.gen(function* () {
     // so the watch starts and its first read ends it if the host still says closed.
     if (watching && before?.snapshot?.state === "merged") {
       return yield* new PullRequestNotOpenError({ state: "merged" });
+    }
+    // ardud missions: guard - a watch wakes its thread with the pull request's
+    // comments, so watching another thread must be able to reach it.
+    if (watching) {
+      const scope = yield* McpInvocationContext.requireMcpCapability("pull-requests");
+      yield* authorizeWatch(guardAuthority, {
+        principal: mcpPrincipal(scope, scope.thread?.threadId === thread.id ? thread : undefined),
+        threadId: thread.id,
+        link: target,
+      }).pipe(Effect.mapError(guardFailure));
     }
     yield* engine
       .dispatch({

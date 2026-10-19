@@ -348,6 +348,92 @@ import {
   ScheduledTaskMutationResult,
 } from "./scheduledTask.ts";
 import { SecretRequestAnswerInput, SecretRequestError } from "./secretRequest.ts";
+// ardud missions: core
+import {
+  AckNoteInput,
+  AnswerAskInput,
+  Ask,
+  Call,
+  CloseForkInput,
+  CreateMissionInput,
+  DecideApprovalInput,
+  DecideDraftInput,
+  DecideSuggestionInput,
+  Draft,
+  DraftNote,
+  MarkMissionSeenInput,
+  MergeLanesInput,
+  MergeSubMissionsInput,
+  MissionError,
+  MissionFork,
+  MissionInbox,
+  MissionInboxInput,
+  MissionMutationResult,
+  MissionStreamItem,
+  MissionSubscribeInput,
+  MissionSubscribeItem,
+  Note,
+  ReactToCallInput,
+  ReopenAskInput,
+  ReopenDraftInput,
+  ReopenSuggestionInput,
+  ReorderSubMissionsInput,
+  RequestRuleChangeInput,
+  ResolveRuleChangeInput,
+  RouteApprovalInput,
+  Rule,
+  RuleChangeRequest,
+  SaveDraftNoteInput,
+  SetApprovalRoutingInput,
+  SetMissionFocusInput,
+  SetMissionStatusInput,
+  SetSubMissionStatusInput,
+  SplitLaneInput,
+  StartForkInput,
+  Suggestion,
+  UpdateForkInput,
+  UpdateMissionInput,
+  UpsertLaneInput,
+  UpsertRuleInput,
+  UpsertSubMissionInput,
+  WithdrawAskInput,
+  // ardud missions: router
+  DecideKnockInput,
+  Knock,
+  MarkReadInput,
+  MessageBodyInput,
+  MissionMessage,
+  MissionMessageBody,
+  MissionRoomsInput,
+  PostMessageInput,
+  ReadPosition,
+  Room,
+  RoomPage,
+  RoomPageInput,
+  SetMissionMemberInput,
+  SubscribeRoomInput,
+  Subscription,
+  MissionAttention,
+  MissionAttentionInput,
+  RoomTuning,
+  RoomTuningInput,
+  TuneRoomInput,
+  OpenOwnerRequestInput,
+  OwnerRequest,
+  OwnerRequests,
+  OwnerRequestsInput,
+  ReopenOwnerRequestInput,
+  ReplyOwnerRequestInput,
+  SettleOwnerRequestInput,
+} from "./ardud/missions.ts";
+// ardud missions: policy
+import { MissionsPolicyRpcs } from "./ardud/missionsPolicyRpc.ts";
+// ardud missions: asks
+import { MissionsAsksRpcs } from "./ardud/missionsAsksRpc.ts";
+// ardud missions: recovery
+import { MissionsRecoveryRpcs } from "./ardud/missionsRecoveryRpc.ts";
+// ardud missions: views
+import { MissionsViewsRpcs } from "./ardud/missionsViewsRpc.ts";
 import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
@@ -522,6 +608,61 @@ export const WS_METHODS = {
   secretsAnswerRequest: "secrets.answerRequest",
   scheduledTasksListWebhookDeliveries: "scheduledTasks.listWebhookDeliveries",
   scheduledTasksGetWebhookDelivery: "scheduledTasks.getWebhookDelivery",
+
+  // ardud missions: core
+  missionsSubscribeList: "missions.subscribeList",
+  missionsSubscribe: "missions.subscribe",
+  missionsInbox: "missions.inbox",
+  missionsCreate: "missions.create",
+  missionsUpdate: "missions.update",
+  missionsSetStatus: "missions.setStatus",
+  missionsSetFocus: "missions.setFocus",
+  missionsSetSubMissionStatus: "missions.setSubMissionStatus",
+  missionsReorderSubMissions: "missions.reorderSubMissions",
+  missionsMarkSeen: "missions.markSeen",
+  missionsUpsertSubMission: "missions.upsertSubMission",
+  missionsMergeSubMissions: "missions.mergeSubMissions",
+  missionsUpsertLane: "missions.upsertLane",
+  missionsSplitLane: "missions.splitLane",
+  missionsMergeLanes: "missions.mergeLanes",
+  missionsDecideApproval: "missions.decideApproval",
+  missionsRouteApproval: "missions.routeApproval",
+  missionsSetApprovalRouting: "missions.setApprovalRouting",
+  missionsUpsertRule: "missions.upsertRule",
+  missionsRequestRuleChange: "missions.requestRuleChange",
+  missionsResolveRuleChange: "missions.resolveRuleChange",
+  missionsAnswerAsk: "missions.answerAsk",
+  missionsWithdrawAsk: "missions.withdrawAsk",
+  missionsReopenAsk: "missions.reopenAsk",
+  missionsReactToCall: "missions.reactToCall",
+  missionsDecideDraft: "missions.decideDraft",
+  missionsReopenDraft: "missions.reopenDraft",
+  missionsSaveDraftNote: "missions.saveDraftNote",
+  missionsDecideSuggestion: "missions.decideSuggestion",
+  missionsReopenSuggestion: "missions.reopenSuggestion",
+  missionsStartFork: "missions.startFork",
+  missionsCloseFork: "missions.closeFork",
+  missionsUpdateFork: "missions.updateFork",
+  missionsAckNote: "missions.ackNote",
+  // ardud missions: router
+  missionsRooms: "missions.rooms",
+  missionsRoomPage: "missions.roomPage",
+  missionsMessageBody: "missions.messageBody",
+  missionsPostMessage: "missions.postMessage",
+  missionsMarkRead: "missions.markRead",
+  missionsSubscribeRoom: "missions.subscribeRoom",
+  missionsSetMember: "missions.setMember",
+  missionsDecideKnock: "missions.decideKnock",
+  missionsRoomTuning: "missions.roomTuning",
+  missionsTuneRoom: "missions.tuneRoom",
+  missionsAttention: "missions.attention",
+  missionsOwnerRequests: "missions.ownerRequests",
+  missionsOpenOwnerRequest: "missions.openOwnerRequest",
+  missionsReplyOwnerRequest: "missions.replyOwnerRequest",
+  missionsSettleOwnerRequest: "missions.settleOwnerRequest",
+  missionsReopenOwnerRequest: "missions.reopenOwnerRequest",
+  // Slots, policy: missionsSetRoleModel, missionsSetPoolCapacity,
+  // missionsUpdateReviewPolicy.
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -1844,6 +1985,236 @@ const WsScheduledTasksGetWebhookDeliveryRpc = Rpc.make(
   },
 );
 
+// ardud missions: core
+const MissionRpcError = Schema.Union([MissionError, EnvironmentAuthorizationError]);
+const WsMissionsSubscribeListRpc = Rpc.make(WS_METHODS.missionsSubscribeList, {
+  payload: Schema.Struct({}),
+  success: MissionStreamItem,
+  error: MissionRpcError,
+  stream: true,
+});
+const WsMissionsSubscribeRpc = Rpc.make(WS_METHODS.missionsSubscribe, {
+  payload: MissionSubscribeInput,
+  success: MissionSubscribeItem,
+  error: MissionRpcError,
+  stream: true,
+});
+const WsMissionsInboxRpc = Rpc.make(WS_METHODS.missionsInbox, {
+  payload: MissionInboxInput,
+  success: MissionInbox,
+  error: MissionRpcError,
+  stream: true,
+});
+const WsMissionsCreateRpc = Rpc.make(WS_METHODS.missionsCreate, {
+  payload: CreateMissionInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsUpdateRpc = Rpc.make(WS_METHODS.missionsUpdate, {
+  payload: UpdateMissionInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsSetStatusRpc = Rpc.make(WS_METHODS.missionsSetStatus, {
+  payload: SetMissionStatusInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsSetFocusRpc = Rpc.make(WS_METHODS.missionsSetFocus, {
+  payload: SetMissionFocusInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsSetSubMissionStatusRpc = Rpc.make(WS_METHODS.missionsSetSubMissionStatus, {
+  payload: SetSubMissionStatusInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsReorderSubMissionsRpc = Rpc.make(WS_METHODS.missionsReorderSubMissions, {
+  payload: ReorderSubMissionsInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const WsMissionsMarkSeenRpc = Rpc.make(WS_METHODS.missionsMarkSeen, {
+  payload: MarkMissionSeenInput,
+  success: MissionMutationResult,
+  error: MissionRpcError,
+});
+const missionRpc = <
+  const Tag extends string,
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+>(
+  tag: Tag,
+  payload: Payload,
+  success: Success,
+) => Rpc.make(tag, { payload, success, error: MissionRpcError });
+const WsMissionsUpsertSubMissionRpc = missionRpc(
+  WS_METHODS.missionsUpsertSubMission,
+  UpsertSubMissionInput,
+  MissionMutationResult,
+);
+const WsMissionsMergeSubMissionsRpc = missionRpc(
+  WS_METHODS.missionsMergeSubMissions,
+  MergeSubMissionsInput,
+  MissionMutationResult,
+);
+const WsMissionsUpsertLaneRpc = missionRpc(
+  WS_METHODS.missionsUpsertLane,
+  UpsertLaneInput,
+  MissionMutationResult,
+);
+const WsMissionsSplitLaneRpc = missionRpc(
+  WS_METHODS.missionsSplitLane,
+  SplitLaneInput,
+  MissionMutationResult,
+);
+const WsMissionsMergeLanesRpc = missionRpc(
+  WS_METHODS.missionsMergeLanes,
+  MergeLanesInput,
+  MissionMutationResult,
+);
+const WsMissionsDecideApprovalRpc = missionRpc(
+  WS_METHODS.missionsDecideApproval,
+  DecideApprovalInput,
+  MissionMutationResult,
+);
+const WsMissionsRouteApprovalRpc = missionRpc(
+  WS_METHODS.missionsRouteApproval,
+  RouteApprovalInput,
+  MissionMutationResult,
+);
+const WsMissionsSetApprovalRoutingRpc = missionRpc(
+  WS_METHODS.missionsSetApprovalRouting,
+  SetApprovalRoutingInput,
+  MissionMutationResult,
+);
+const WsMissionsUpsertRuleRpc = missionRpc(WS_METHODS.missionsUpsertRule, UpsertRuleInput, Rule);
+const WsMissionsRequestRuleChangeRpc = missionRpc(
+  WS_METHODS.missionsRequestRuleChange,
+  RequestRuleChangeInput,
+  RuleChangeRequest,
+);
+const WsMissionsResolveRuleChangeRpc = missionRpc(
+  WS_METHODS.missionsResolveRuleChange,
+  ResolveRuleChangeInput,
+  RuleChangeRequest,
+);
+const WsMissionsAnswerAskRpc = missionRpc(WS_METHODS.missionsAnswerAsk, AnswerAskInput, Ask);
+const WsMissionsWithdrawAskRpc = missionRpc(WS_METHODS.missionsWithdrawAsk, WithdrawAskInput, Ask);
+const WsMissionsReopenAskRpc = missionRpc(WS_METHODS.missionsReopenAsk, ReopenAskInput, Ask);
+const WsMissionsReactToCallRpc = missionRpc(WS_METHODS.missionsReactToCall, ReactToCallInput, Call);
+const WsMissionsDecideDraftRpc = missionRpc(
+  WS_METHODS.missionsDecideDraft,
+  DecideDraftInput,
+  Draft,
+);
+const WsMissionsReopenDraftRpc = missionRpc(
+  WS_METHODS.missionsReopenDraft,
+  ReopenDraftInput,
+  Draft,
+);
+const WsMissionsSaveDraftNoteRpc = missionRpc(
+  WS_METHODS.missionsSaveDraftNote,
+  SaveDraftNoteInput,
+  DraftNote,
+);
+const WsMissionsDecideSuggestionRpc = missionRpc(
+  WS_METHODS.missionsDecideSuggestion,
+  DecideSuggestionInput,
+  Suggestion,
+);
+const WsMissionsReopenSuggestionRpc = missionRpc(
+  WS_METHODS.missionsReopenSuggestion,
+  ReopenSuggestionInput,
+  Suggestion,
+);
+const WsMissionsStartForkRpc = missionRpc(
+  WS_METHODS.missionsStartFork,
+  StartForkInput,
+  MissionFork,
+);
+const WsMissionsCloseForkRpc = missionRpc(
+  WS_METHODS.missionsCloseFork,
+  CloseForkInput,
+  MissionFork,
+);
+const WsMissionsUpdateForkRpc = missionRpc(
+  WS_METHODS.missionsUpdateFork,
+  UpdateForkInput,
+  MissionFork,
+);
+const WsMissionsAckNoteRpc = missionRpc(WS_METHODS.missionsAckNote, AckNoteInput, Note);
+// ardud missions: router
+const WsMissionsRoomsRpc = missionRpc(
+  WS_METHODS.missionsRooms,
+  MissionRoomsInput,
+  Schema.Array(Room),
+);
+const WsMissionsRoomPageRpc = missionRpc(WS_METHODS.missionsRoomPage, RoomPageInput, RoomPage);
+const WsMissionsMessageBodyRpc = missionRpc(
+  WS_METHODS.missionsMessageBody,
+  MessageBodyInput,
+  MissionMessageBody,
+);
+const WsMissionsPostMessageRpc = missionRpc(
+  WS_METHODS.missionsPostMessage,
+  PostMessageInput,
+  MissionMessage,
+);
+const WsMissionsMarkReadRpc = missionRpc(WS_METHODS.missionsMarkRead, MarkReadInput, ReadPosition);
+const WsMissionsSubscribeRoomRpc = missionRpc(
+  WS_METHODS.missionsSubscribeRoom,
+  SubscribeRoomInput,
+  Subscription,
+);
+const WsMissionsSetMemberRpc = missionRpc(
+  WS_METHODS.missionsSetMember,
+  SetMissionMemberInput,
+  MissionMutationResult,
+);
+const WsMissionsDecideKnockRpc = missionRpc(
+  WS_METHODS.missionsDecideKnock,
+  DecideKnockInput,
+  Knock,
+);
+const WsMissionsRoomTuningRpc = missionRpc(
+  WS_METHODS.missionsRoomTuning,
+  RoomTuningInput,
+  RoomTuning,
+);
+const WsMissionsTuneRoomRpc = missionRpc(WS_METHODS.missionsTuneRoom, TuneRoomInput, RoomTuning);
+const WsMissionsAttentionRpc = missionRpc(
+  WS_METHODS.missionsAttention,
+  MissionAttentionInput,
+  MissionAttention,
+);
+const WsMissionsOwnerRequestsRpc = missionRpc(
+  WS_METHODS.missionsOwnerRequests,
+  OwnerRequestsInput,
+  OwnerRequests,
+);
+const WsMissionsOpenOwnerRequestRpc = missionRpc(
+  WS_METHODS.missionsOpenOwnerRequest,
+  OpenOwnerRequestInput,
+  OwnerRequest,
+);
+const WsMissionsReplyOwnerRequestRpc = missionRpc(
+  WS_METHODS.missionsReplyOwnerRequest,
+  ReplyOwnerRequestInput,
+  OwnerRequest,
+);
+const WsMissionsSettleOwnerRequestRpc = missionRpc(
+  WS_METHODS.missionsSettleOwnerRequest,
+  SettleOwnerRequestInput,
+  OwnerRequest,
+);
+const WsMissionsReopenOwnerRequestRpc = missionRpc(
+  WS_METHODS.missionsReopenOwnerRequest,
+  ReopenOwnerRequestInput,
+  OwnerRequest,
+);
+
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
@@ -1875,7 +2246,77 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
   { error: EnvironmentAuthorizationError },
 ) {}
 
-export const WsRpcGroup = RpcGroup.make(
+// ardud missions: core
+/**
+ * Missions RPCs form their own group so the server implements them in a
+ * separate handler layer. A single `toLayer` over every WebSocket RPC hits
+ * TypeScript's instantiation depth limit near 200 RPCs (upstream cf13507f05).
+ */
+export const WsMissionsRpcGroup = RpcGroup.make(
+  WsMissionsSubscribeListRpc,
+  WsMissionsSubscribeRpc,
+  WsMissionsInboxRpc,
+  WsMissionsCreateRpc,
+  WsMissionsUpdateRpc,
+  WsMissionsSetStatusRpc,
+  WsMissionsSetFocusRpc,
+  WsMissionsSetSubMissionStatusRpc,
+  WsMissionsReorderSubMissionsRpc,
+  WsMissionsMarkSeenRpc,
+  WsMissionsUpsertSubMissionRpc,
+  WsMissionsMergeSubMissionsRpc,
+  WsMissionsUpsertLaneRpc,
+  WsMissionsSplitLaneRpc,
+  WsMissionsMergeLanesRpc,
+  WsMissionsDecideApprovalRpc,
+  WsMissionsRouteApprovalRpc,
+  WsMissionsSetApprovalRoutingRpc,
+  WsMissionsUpsertRuleRpc,
+  WsMissionsRequestRuleChangeRpc,
+  WsMissionsResolveRuleChangeRpc,
+  WsMissionsAnswerAskRpc,
+  WsMissionsWithdrawAskRpc,
+  WsMissionsReopenAskRpc,
+  WsMissionsReactToCallRpc,
+  WsMissionsDecideDraftRpc,
+  WsMissionsReopenDraftRpc,
+  WsMissionsSaveDraftNoteRpc,
+  WsMissionsDecideSuggestionRpc,
+  WsMissionsReopenSuggestionRpc,
+  WsMissionsStartForkRpc,
+  WsMissionsCloseForkRpc,
+  WsMissionsUpdateForkRpc,
+  WsMissionsAckNoteRpc,
+  // ardud missions: router
+  WsMissionsRoomsRpc,
+  WsMissionsRoomPageRpc,
+  WsMissionsMessageBodyRpc,
+  WsMissionsPostMessageRpc,
+  WsMissionsMarkReadRpc,
+  WsMissionsSubscribeRoomRpc,
+  WsMissionsSetMemberRpc,
+  WsMissionsDecideKnockRpc,
+  WsMissionsRoomTuningRpc,
+  WsMissionsTuneRoomRpc,
+  WsMissionsAttentionRpc,
+  WsMissionsOwnerRequestsRpc,
+  WsMissionsOpenOwnerRequestRpc,
+  WsMissionsReplyOwnerRequestRpc,
+  WsMissionsSettleOwnerRequestRpc,
+  WsMissionsReopenOwnerRequestRpc,
+).middleware(RpcScopeAuthorization);
+
+// ardud missions: policy
+export const WsMissionsPolicyRpcGroup = MissionsPolicyRpcs.middleware(RpcScopeAuthorization);
+// ardud missions: asks
+export const WsMissionsAsksRpcGroup = MissionsAsksRpcs.middleware(RpcScopeAuthorization);
+// ardud missions: recovery
+export const WsMissionsRecoveryRpcGroup = MissionsRecoveryRpcs.middleware(RpcScopeAuthorization);
+// ardud missions: views
+export const WsMissionsViewsRpcGroup = MissionsViewsRpcs.middleware(RpcScopeAuthorization);
+
+/** Every WebSocket RPC not in a domain group merged into `WsRpcGroup` below. */
+export const WsCoreRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
@@ -2070,3 +2511,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeShellRpc,
   WsOrchestrationV2SubscribeThreadRpc,
 ).middleware(RpcScopeAuthorization);
+
+export const WsRpcGroup = WsCoreRpcGroup.merge(
+  // ardud missions: core
+  WsMissionsRpcGroup,
+  // ardud missions: policy
+  WsMissionsPolicyRpcGroup,
+  // ardud missions: asks
+  WsMissionsAsksRpcGroup,
+  // ardud missions: recovery
+  WsMissionsRecoveryRpcGroup,
+  // ardud missions: views
+  WsMissionsViewsRpcGroup,
+);

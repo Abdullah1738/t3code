@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 
-import type { MissionId } from "@t3tools/contracts";
+import type { MissionId, RoomId } from "@t3tools/contracts";
 
 import { MissionPage } from "../ardud/missions/MissionPage";
 import { parseMissionSearch } from "../ardud/missions/missionSearch";
@@ -13,6 +13,8 @@ function MissionRouteView() {
       missionId={missionId as MissionId}
       tab={search.tab ?? "overview"}
       highlightSubMissionId={search.sub ?? null}
+      roomId={(search.room ?? null) as RoomId | null}
+      requestId={search.request ?? null}
     />
   );
 }

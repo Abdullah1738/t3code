@@ -1,4 +1,12 @@
-import { BlockerGroup, FeedItem, Milestone, SubMission } from "@t3tools/contracts";
+import {
+  BlockerGroup,
+  FeedItem,
+  type MissionActor,
+  MissionEventId,
+  Milestone,
+  RoleId,
+  SubMission,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -8,19 +16,26 @@ import {
   effortNote,
   feedCountsLine,
   foldLaneCounts,
+  ageView,
   formatCountdown,
   formatRelative,
+  formatTimeOfDay,
   groupBlockers,
+  intendedShareLine,
+  intendedTotal,
   laneCountsOf,
   moveInOrder,
   needsYouCounts,
   needsYouLine,
   nextMilestone,
+  parseShareInput,
+  poolUsageView,
   priorityStack,
   rollUpHealth,
   sortLanesProblemsFirst,
   splitFeed,
   splitQuietLanes,
+  totalNeedsYou,
   usageView,
 } from "./viewModel.ts";
 
@@ -28,6 +43,8 @@ const decodeSubMission = Schema.decodeUnknownSync(SubMission);
 const decodeMilestone = Schema.decodeUnknownSync(Milestone);
 const decodeFeedItem = Schema.decodeUnknownSync(FeedItem);
 const decodeBlockerGroup = Schema.decodeUnknownSync(BlockerGroup);
+const decodeEventId = Schema.decodeUnknownSync(MissionEventId);
+const decodeRoleId = Schema.decodeUnknownSync(RoleId);
 
 const T0 = "2026-10-17T08:00:00.000Z";
 const NOW = Date.parse("2026-10-17T08:33:00.000Z");
@@ -135,6 +152,11 @@ describe("health and needs-you", () => {
     expect(needsYouLine(counts)).toBe("2 decisions, 1 to approve, 1 knock");
     expect(needsYouLine({ decide: 0, approve: 0, knocks: 0 })).toBeNull();
   });
+
+  it("adds every mission's needs-you count for the inbox row", () => {
+    expect(totalNeedsYou([{ needsYou: 8 }, { needsYou: 0 }, { needsYou: 3 }])).toBe(11);
+    expect(totalNeedsYou([])).toBe(0);
+  });
 });
 
 describe("blockers", () => {
@@ -183,7 +205,7 @@ describe("priority stack", () => {
       ["support", 2, "under"],
       ["factory", 3, "over"],
     ]);
-    expect(effortNote(rows)).toBe("factory (3rd) took 19% of the effort; you set 5%.");
+    expect(effortNote(rows)).toBe("factory (3rd) took 19% of the effort; the plan is 5%.");
   });
 
   it("stays quiet when effort follows the order", () => {
@@ -253,17 +275,148 @@ describe("feed and time", () => {
     expect(formatCountdown("2026-10-17T05:33:00Z", NOW)).toBe("overdue 3h 0m");
   });
 
+  it("shortens ages and says how loud to show them", () => {
+    expect(ageView("2026-10-17T08:32:30Z", NOW)).toEqual({ label: "now", tier: "minutes" });
+    expect(ageView("2026-10-17T07:41:00Z", NOW)).toEqual({ label: "52m", tier: "minutes" });
+    expect(ageView("2026-10-17T03:00:00Z", NOW)).toEqual({ label: "5h", tier: "hours" });
+    expect(ageView("2026-10-15T18:30:00Z", NOW)).toEqual({ label: "1d 14h", tier: "days" });
+    expect(ageView("2026-10-15T08:33:00Z", NOW)).toEqual({ label: "2d", tier: "days" });
+    expect(ageView("not a time", NOW)).toBeNull();
+  });
+
   it("formats relative times", () => {
     expect(formatRelative("2026-10-17T08:32:30Z", NOW)).toBe("just now");
     expect(formatRelative("2026-10-17T08:00:00Z", NOW)).toBe("33m ago");
     expect(formatRelative("2026-10-17T05:06:00Z", NOW)).toBe("3h ago");
     expect(formatRelative("2026-10-15T08:00:00Z", NOW)).toBe("2d ago");
     expect(formatRelative("2026-10-01T08:00:00Z", NOW, "UTC")).toBe("Thu 1 Oct");
+    expect(formatTimeOfDay("2026-10-04T15:41:48Z", "UTC")).toBe("15:41");
+    expect(formatTimeOfDay("not a time", "UTC")).toBe("");
   });
 
   it("describes usage against the guaranteed share", () => {
     expect(usageView(0.94)).toEqual({ label: "94% of its share", tone: "normal" });
     expect(usageView(1.24)).toEqual({ label: "Borrowing: 1.2× its share", tone: "borrowing" });
     expect(usageView(null).tone).toBe("unknown");
+  });
+
+  it("shows each pool the mission draws on as one compact entry", () => {
+    const sampledAt = "2026-10-17T08:16:00.000Z";
+    expect(
+      poolUsageView(
+        { _tag: "accounts", id: "claude", label: "Claude", usable: 20, total: 30, sampledAt },
+        NOW,
+      ),
+    ).toMatchObject({
+      value: "20/30",
+      tone: "ok",
+      detail: "Claude: 20 of 30 usable (read 17m ago)",
+    });
+    expect(
+      poolUsageView(
+        { _tag: "accounts", id: "codex", label: "Codex reviews", usable: 1, total: 6, sampledAt },
+        NOW,
+      ).tone,
+    ).toBe("tight");
+    expect(
+      poolUsageView(
+        {
+          _tag: "budget",
+          id: "offbox",
+          label: "Offbox",
+          spent: 61.69,
+          cap: 500,
+          currency: "USD",
+          sampledAt,
+        },
+        NOW,
+      ),
+    ).toMatchObject({ value: "$62 of $500", tone: "ok" });
+    expect(
+      poolUsageView(
+        {
+          _tag: "budget",
+          id: "crpko:pool:review-day",
+          label: "Crpko reviews per day",
+          spent: 0,
+          cap: 8,
+          currency: "review",
+          sampledAt,
+        },
+        NOW,
+      ),
+    ).toMatchObject({ value: "0 of 8 reviews", tone: "ok" });
+    expect(
+      poolUsageView(
+        {
+          _tag: "lock",
+          id: "dev",
+          label: "Dev env",
+          holder: "lane-cell-devops",
+          since: sampledAt,
+          sampledAt,
+        },
+        NOW,
+      ),
+    ).toMatchObject({ value: "held by cell-devops", tone: "held" });
+    expect(
+      poolUsageView(
+        { _tag: "lock", id: "dev", label: "Dev env", holder: null, since: null, sampledAt },
+        NOW,
+      ).value,
+    ).toBe("free");
+  });
+});
+
+describe("intended effort", () => {
+  const change = (id: string, actor: MissionActor, at: string) => ({
+    ref: { kind: "sub-mission" as const, id },
+    field: "intendedEffort",
+    actor,
+    eventId: decodeEventId(`evt-${id}`),
+    at,
+  });
+
+  it("says who changed the share last from the event log, and ignores locks", () => {
+    const rows = priorityStack(
+      [
+        subMission("mine", 0, { intendedEffort: 0.6 }),
+        // A stale owner lock means nothing now: the master changed it last.
+        subMission("theirs", 1, { intendedEffort: 0.3, lockedFields: ["intendedEffort"] }),
+        subMission("imported", 2, { intendedEffort: 0.05 }),
+        subMission("unset", 3),
+      ],
+      [
+        change("mine", { _tag: "owner" }, T0),
+        change("theirs", { _tag: "role", roleId: decodeRoleId("crpko-master") }, T0),
+        { ...change("mine", { _tag: "owner" }, T0), field: "title" },
+      ],
+    );
+    expect(rows.map((row) => intendedShareLine(row, "crpko-master"))).toEqual([
+      "last changed by you",
+      "last changed by master",
+      "not changed since import",
+      "no share set",
+    ]);
+    expect(intendedTotal(rows)).toEqual({ total: 0.95, label: "95% planned", balanced: false });
+  });
+
+  it("names whoever set the share in the drift note", () => {
+    const rows = priorityStack(
+      [subMission("factory", 0, { intendedEffort: 0.05, actualEffort: 0.19 })],
+      [change("factory", { _tag: "owner" }, T0)],
+    );
+    expect(effortNote(rows, "crpko-master")).toBe(
+      "factory (1st) took 19% of the effort; you set 5%.",
+    );
+  });
+
+  it("reads typed shares as percent, fraction, or empty to clear", () => {
+    expect(parseShareInput("40")).toEqual({ ok: true, share: 0.4 });
+    expect(parseShareInput(" 12.5% ")).toEqual({ ok: true, share: 0.125 });
+    expect(parseShareInput("0.4")).toEqual({ ok: true, share: 0.4 });
+    expect(parseShareInput("")).toEqual({ ok: true, share: null });
+    expect(parseShareInput("140").ok).toBe(false);
+    expect(parseShareInput("lots").ok).toBe(false);
   });
 });

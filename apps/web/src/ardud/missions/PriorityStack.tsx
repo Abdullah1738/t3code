@@ -19,32 +19,38 @@ import { CSS } from "@dnd-kit/utilities";
 import { GripVerticalIcon } from "lucide-react";
 
 import type { Mission, SubMission, SubMissionId } from "@t3tools/contracts";
+import type { FieldChange } from "@t3tools/client-runtime/ardud/missions";
 import {
   effortNote,
   formatPercent,
-  healthLabel,
+  intendedTotal,
   moveInOrder,
   priorityStack,
   type PriorityStackRow,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { cn } from "../../lib/utils";
-import { runMissionAction } from "./missionActions";
-import { missionsSource } from "./missionsStore";
-import { HEALTH_DOT_CLASS } from "./missionTone";
-import { MissionSection } from "./MissionSection";
+import { reorderSubMissions } from "./missionCommands";
+import { IntendedShareEditor } from "./IntendedShareEditor";
+import { HealthGlyph } from "./cards/chips";
 
 /**
  * Sub-missions in the owner's order. The bar is the master's measured effort
  * over the last 24 hours; the tick is the share the owner intended. Dragging
- * reorders; the master works the queue top-down.
+ * reorders; the master works the queue top-down. Renders the list only; the
+ * overview section around it owns the heading.
  */
 export function PriorityStack(props: {
   mission: Mission;
   subMissions: ReadonlyArray<SubMission>;
+  changes: ReadonlyArray<FieldChange>;
   highlightId: string | null;
 }) {
-  const rows = useMemo(() => priorityStack(props.subMissions), [props.subMissions]);
+  const rows = useMemo(
+    () => priorityStack(props.subMissions, props.changes),
+    [props.subMissions, props.changes],
+  );
+  const masterRoleId = props.mission.masterRoleId;
   const sourceOrder = useMemo(() => rows.map((row) => row.subMission.id), [rows]);
   // Optimistic order while the source applies a drag; cleared when it lands.
   const [pendingOrder, setPendingOrder] = useState<ReadonlyArray<SubMissionId> | null>(null);
@@ -53,7 +59,8 @@ export function PriorityStack(props: {
     () => new Map(rows.map((row) => [row.subMission.id, row] as const)),
     [rows],
   );
-  const note = useMemo(() => effortNote(rows), [rows]);
+  const note = useMemo(() => effortNote(rows, masterRoleId), [rows, masterRoleId]);
+  const planned = useMemo(() => intendedTotal(rows), [rows]);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -64,17 +71,11 @@ export function PriorityStack(props: {
     if (!over || active.id === over.id) return;
     const next = moveInOrder(order, active.id as SubMissionId, over.id as SubMissionId);
     setPendingOrder(next);
-    void runMissionAction(
-      missionsSource.reorderSubMissions({ missionId: props.mission.id, order: next }),
-      "Could not reorder sub-missions",
-    ).then(() => setPendingOrder(null));
+    void reorderSubMissions(props.mission.id, next).then(() => setPendingOrder(null));
   };
 
   return (
-    <MissionSection
-      title="Priority stack"
-      caption="Bar: master effort, last 24h. Tick: your intended share."
-    >
+    <div className="flex min-w-0 flex-col gap-2">
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
@@ -90,6 +91,7 @@ export function PriorityStack(props: {
                 <PriorityStackItem
                   key={id}
                   row={row}
+                  masterRoleId={masterRoleId}
                   position={index + 1}
                   focused={props.mission.focusSubMissionId === id}
                   highlighted={props.highlightId === id}
@@ -100,16 +102,23 @@ export function PriorityStack(props: {
         </SortableContext>
       </DndContext>
       {note ? <p className="text-xs text-muted-foreground">{note}</p> : null}
-      <p className="text-xs text-muted-foreground/70">
-        Drag to reorder. Lower sub-missions park first when capacity is short; "fills idle" ones
-        only take what is left.
-      </p>
-    </MissionSection>
+      {planned.total > 0 ? (
+        <p
+          className={cn(
+            "text-xs tabular-nums",
+            planned.balanced ? "text-muted-foreground" : "text-warning-foreground",
+          )}
+        >
+          {planned.label}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
 function PriorityStackItem(props: {
   row: PriorityStackRow;
+  masterRoleId: string | null;
   position: number;
   focused: boolean;
   highlighted: boolean;
@@ -157,26 +166,18 @@ function PriorityStackItem(props: {
         <span className="w-4 shrink-0 text-end text-xs text-muted-foreground tabular-nums">
           {position}
         </span>
-        <span
-          role="img"
-          aria-label={paused ? "Paused" : healthLabel(sub.health)}
-          className={cn(
-            "size-2 shrink-0 rounded-full",
-            paused ? "bg-muted-foreground/25" : HEALTH_DOT_CLASS[sub.health],
-          )}
-        />
+        <HealthGlyph health={sub.health} paused={paused} />
         <span className={cn("min-w-0 truncate font-medium", paused && "text-muted-foreground")}>
           {sub.title}
         </span>
         {props.focused ? (
-          <span className="shrink-0 rounded-sm bg-info/10 px-1 text-2xs text-info-foreground">
+          <span className="shrink-0 rounded-sm bg-info/10 px-1 text-xs text-info-foreground">
             focus
           </span>
         ) : null}
         {sub.fillIdleCapacity ? (
-          <span className="shrink-0 text-2xs text-muted-foreground">fills idle</span>
+          <span className="shrink-0 text-xs text-muted-foreground">fills idle</span>
         ) : null}
-        {paused ? <span className="shrink-0 text-2xs text-muted-foreground">paused</span> : null}
       </div>
       <span
         className={cn(
@@ -189,9 +190,7 @@ function PriorityStackItem(props: {
         )}
       >
         {actual === null ? "–" : formatPercent(actual)}
-        {intended !== null ? (
-          <span className="text-muted-foreground"> / {formatPercent(intended)}</span>
-        ) : null}
+        <IntendedShareEditor row={row} masterRoleId={props.masterRoleId} />
       </span>
       <EffortBar actual={actual} intended={intended} label={effortLabel} drift={row.drift} />
     </li>

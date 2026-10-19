@@ -34,6 +34,20 @@ import * as McpHttpServer from "../../McpHttpServer.ts";
 import * as McpSessionRegistry from "../../McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "../../PreviewAutomationBroker.ts";
 import * as PreviewBrowser from "../../../preview/PreviewBrowser.ts";
+// ardud missions: asks
+import * as AsksService from "../../../ardud/missions/asks/AsksService.ts";
+import * as MissionService from "../../../ardud/missions/MissionService.ts";
+// ardud missions: policy
+import * as PolicyService from "../../../ardud/missions/policy/PolicyService.ts";
+// ardud missions: core
+import * as RuleService from "../../../ardud/missions/core/RuleService.ts";
+import * as MasterControls from "../../../ardud/missions/core/MasterControls.ts";
+// ardud missions: router
+import { MissionRouter } from "../../../ardud/missions/router/MissionRouter.ts";
+// ardud missions: recovery
+import * as RecoveryService from "../../../ardud/missions/recovery/RecoveryService.ts";
+// ardud missions: views
+import * as ViewService from "../../../ardud/missions/views/ViewService.ts";
 
 const layerStubServices = Layer.mergeAll(
   Layer.mock(Orchestrator.OrchestratorV2)({}),
@@ -57,6 +71,20 @@ const layerStubServices = Layer.mergeAll(
   Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({}),
   Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
   Layer.mock(ThreadSearch.ThreadSearch)({}),
+  // ardud missions: asks
+  Layer.mock(AsksService.AsksService)({}),
+  Layer.mock(MissionService.MissionService)({}),
+  // ardud missions: policy
+  Layer.mock(PolicyService.PolicyService)({}),
+  // ardud missions: core
+  Layer.mock(RuleService.RuleService)({}),
+  Layer.mock(MasterControls.MasterControls)({}),
+  // ardud missions: router
+  Layer.mock(MissionRouter)({}),
+  // ardud missions: recovery
+  Layer.mock(RecoveryService.RecoveryService)({}),
+  // ardud missions: views
+  Layer.mock(ViewService.ViewService)({}),
 );
 
 const ToolsListPayload = Schema.fromJsonString(

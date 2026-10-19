@@ -8,6 +8,14 @@ import {
 } from "./auth.ts";
 import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
 import { WS_METHODS } from "./rpc.ts";
+// ardud missions: policy
+import { MISSIONS_POLICY_GUARDED_SCOPES } from "./ardud/missionsPolicyRpc.ts";
+// ardud missions: asks
+import { MISSIONS_ASKS_GUARDED_SCOPES } from "./ardud/missionsAsksRpc.ts";
+// ardud missions: recovery
+import { MISSIONS_RECOVERY_GUARDED_SCOPES } from "./ardud/missionsRecoveryRpc.ts";
+// ardud missions: views
+import { MISSIONS_VIEWS_GUARDED_SCOPES } from "./ardud/missionsViewsRpc.ts";
 
 /** Incremental client enforcement; the server still authorizes every request. */
 export const CLIENT_GUARDED_RPC_SCOPES = {
@@ -47,6 +55,57 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.scheduledTasksRunNow]: AuthOrchestrationOperateScope,
   [WS_METHODS.scheduledTasksRotateWebhookToken]: AuthOrchestrationOperateScope,
   [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: AuthOrchestrationOperateScope,
+  // ardud missions: core
+  [WS_METHODS.missionsCreate]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsUpdate]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetStatus]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetFocus]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetSubMissionStatus]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsReorderSubMissions]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsMarkSeen]: AuthOrchestrationOperateScope,
+  // ardud missions: policy
+  ...MISSIONS_POLICY_GUARDED_SCOPES,
+  // ardud missions: asks
+  ...MISSIONS_ASKS_GUARDED_SCOPES,
+  // ardud missions: recovery
+  ...MISSIONS_RECOVERY_GUARDED_SCOPES,
+  // ardud missions: views
+  ...MISSIONS_VIEWS_GUARDED_SCOPES,
+  [WS_METHODS.missionsUpsertSubMission]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsMergeSubMissions]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsUpsertLane]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSplitLane]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsMergeLanes]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsDecideApproval]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsRouteApproval]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetApprovalRouting]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsUpsertRule]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsRequestRuleChange]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsResolveRuleChange]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsAnswerAsk]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsWithdrawAsk]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsReopenAsk]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsReactToCall]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsDecideDraft]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsReopenDraft]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSaveDraftNote]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsDecideSuggestion]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsReopenSuggestion]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsStartFork]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsCloseFork]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsUpdateFork]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsAckNote]: AuthOrchestrationOperateScope,
+  // ardud missions: router
+  [WS_METHODS.missionsPostMessage]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsMarkRead]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSubscribeRoom]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetMember]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsDecideKnock]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsTuneRoom]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsOpenOwnerRequest]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsReplyOwnerRequest]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSettleOwnerRequest]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsReopenOwnerRequest]: AuthOrchestrationOperateScope,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 

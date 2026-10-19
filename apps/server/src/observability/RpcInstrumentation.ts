@@ -1,4 +1,16 @@
-import { ORCHESTRATION_V2_WS_METHODS, WS_METHODS, type WsRpcGroup } from "@t3tools/contracts";
+import {
+  // ardud missions: policy
+  MISSIONS_POLICY_AGGREGATES,
+  // ardud missions: asks
+  MISSIONS_ASKS_AGGREGATES,
+  // ardud missions: recovery
+  MISSIONS_RECOVERY_AGGREGATES,
+  // ardud missions: views
+  MISSIONS_VIEWS_AGGREGATES,
+  ORCHESTRATION_V2_WS_METHODS,
+  WS_METHODS,
+  type WsRpcGroup,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as References from "effect/References";
@@ -208,6 +220,66 @@ const RPC_AGGREGATES = {
   [WS_METHODS.subscribeServerLifecycle]: "server",
   [WS_METHODS.subscribeAuthAccess]: "auth",
   [WS_METHODS.subscribeBackgroundPolicy]: "server",
+  // ardud missions: core
+  [WS_METHODS.missionsSubscribeList]: "missions",
+  [WS_METHODS.missionsSubscribe]: "missions",
+  [WS_METHODS.missionsInbox]: "missions",
+  [WS_METHODS.missionsCreate]: "missions",
+  [WS_METHODS.missionsUpdate]: "missions",
+  [WS_METHODS.missionsSetStatus]: "missions",
+  [WS_METHODS.missionsSetFocus]: "missions",
+  [WS_METHODS.missionsSetSubMissionStatus]: "missions",
+  [WS_METHODS.missionsReorderSubMissions]: "missions",
+  [WS_METHODS.missionsMarkSeen]: "missions",
+  // ardud missions: policy
+  ...MISSIONS_POLICY_AGGREGATES,
+  // ardud missions: asks
+  ...MISSIONS_ASKS_AGGREGATES,
+  // ardud missions: recovery
+  ...MISSIONS_RECOVERY_AGGREGATES,
+  // ardud missions: views
+  ...MISSIONS_VIEWS_AGGREGATES,
+  [WS_METHODS.missionsUpsertSubMission]: "missions",
+  [WS_METHODS.missionsMergeSubMissions]: "missions",
+  [WS_METHODS.missionsUpsertLane]: "missions",
+  [WS_METHODS.missionsSplitLane]: "missions",
+  [WS_METHODS.missionsMergeLanes]: "missions",
+  [WS_METHODS.missionsDecideApproval]: "missions",
+  [WS_METHODS.missionsRouteApproval]: "missions",
+  [WS_METHODS.missionsSetApprovalRouting]: "missions",
+  [WS_METHODS.missionsUpsertRule]: "missions",
+  [WS_METHODS.missionsRequestRuleChange]: "missions",
+  [WS_METHODS.missionsResolveRuleChange]: "missions",
+  [WS_METHODS.missionsAnswerAsk]: "missions",
+  [WS_METHODS.missionsWithdrawAsk]: "missions",
+  [WS_METHODS.missionsReopenAsk]: "missions",
+  [WS_METHODS.missionsReactToCall]: "missions",
+  [WS_METHODS.missionsDecideDraft]: "missions",
+  [WS_METHODS.missionsReopenDraft]: "missions",
+  [WS_METHODS.missionsSaveDraftNote]: "missions",
+  [WS_METHODS.missionsDecideSuggestion]: "missions",
+  [WS_METHODS.missionsReopenSuggestion]: "missions",
+  [WS_METHODS.missionsStartFork]: "missions",
+  [WS_METHODS.missionsCloseFork]: "missions",
+  [WS_METHODS.missionsUpdateFork]: "missions",
+  [WS_METHODS.missionsAckNote]: "missions",
+  // ardud missions: router
+  [WS_METHODS.missionsRooms]: "missions",
+  [WS_METHODS.missionsRoomPage]: "missions",
+  [WS_METHODS.missionsMessageBody]: "missions",
+  [WS_METHODS.missionsPostMessage]: "missions",
+  [WS_METHODS.missionsMarkRead]: "missions",
+  [WS_METHODS.missionsSubscribeRoom]: "missions",
+  [WS_METHODS.missionsSetMember]: "missions",
+  [WS_METHODS.missionsDecideKnock]: "missions",
+  [WS_METHODS.missionsRoomTuning]: "missions",
+  [WS_METHODS.missionsTuneRoom]: "missions",
+  [WS_METHODS.missionsAttention]: "missions",
+  [WS_METHODS.missionsOwnerRequests]: "missions",
+  [WS_METHODS.missionsOpenOwnerRequest]: "missions",
+  [WS_METHODS.missionsReplyOwnerRequest]: "missions",
+  [WS_METHODS.missionsSettleOwnerRequest]: "missions",
+  [WS_METHODS.missionsReopenOwnerRequest]: "missions",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

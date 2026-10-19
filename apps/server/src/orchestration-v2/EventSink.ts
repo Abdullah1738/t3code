@@ -33,6 +33,9 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+// ardud missions: guard
+import { authorityStore } from "../ardud/missions/guard/authority.ts";
+import { backfillChildCreators, recordChildCreators } from "../ardud/missions/guard/forks.ts";
 
 /**
  * ERRORS
@@ -222,6 +225,9 @@ const layerBase: Layer.Layer<
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    // ardud missions: guard
+    const guardAuthority = authorityStore(sql);
+    yield* backfillChildCreators(sql);
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -351,6 +357,11 @@ const layerBase: Layer.Layer<
         yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
           concurrency: 1,
         });
+        // ardud missions: guard - a spawned child's creator lands with the child.
+        yield* recordChildCreators(
+          guardAuthority,
+          storedEvents.map((stored) => stored.event),
+        );
         const sequence = storedEvents.at(-1)?.sequence;
         if (sequence !== undefined) {
           const now = DateTime.formatIso(yield* DateTime.now);

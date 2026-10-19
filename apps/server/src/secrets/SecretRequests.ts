@@ -30,6 +30,14 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+// ardud missions: core
+import type { EnvironmentAuthorizationError, MissionProvenance } from "@t3tools/contracts";
+import {
+  requireSecretAnswerAuthority,
+  secretStatusOf,
+  type MasterSecretClose,
+  type SecretAnswerInput,
+} from "../ardud/missions/core/secrets.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 
@@ -68,8 +76,14 @@ export class SecretRequests extends Context.Service<
     /**
      * Answers a pending request in a thread. Saving stores the value under a
      * new ref that the requesting tool reads from the request's status.
+     * ardud missions: core - `answeredBy` is the transport-derived caller;
+     * only the paired owner saves a value. A mission master's grant may
+     * decline or withdraw its own member's card, nothing else.
      */
-    readonly answer: (input: SecretRequestAnswerInput) => Effect.Effect<void, SecretRequestError>;
+    readonly answer: (
+      input: SecretRequestAnswerInput | SecretAnswerInput,
+      answeredBy: MissionProvenance | MasterSecretClose | null,
+    ) => Effect.Effect<void, SecretRequestError | EnvironmentAuthorizationError>;
     /** The ref minted when this request was saved, for the tool that asked. */
     readonly savedRef: (input: {
       readonly threadId: ThreadId;
@@ -95,12 +109,14 @@ const make = Effect.gen(function* () {
     yield* store.getOrCreateRandom("secret-request-salt", 32).pipe(Effect.orDie),
   ).toString("hex");
 
-  const answer: SecretRequests["Service"]["answer"] = (input) =>
+  const answer: SecretRequests["Service"]["answer"] = (input, answeredBy) =>
     Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan({
         "orchestration_v2.thread_id": input.threadId,
         "secret_request.answer": input.answer.type,
       });
+      // ardud missions: core
+      yield* requireSecretAnswerAuthority(input, answeredBy);
       const records = yield* threadManagement
         .getThreadRecords(input.threadId, ["runs", "turnItems"], {
           turnItemTypes: ["secret_request"],
@@ -142,7 +158,8 @@ const make = Effect.gen(function* () {
             ),
           );
       }
-      const secretStatus = input.answer.type === "save" ? "saved" : "declined";
+      // ardud missions: core - a master's withdraw closes the card as cancelled
+      const secretStatus = secretStatusOf(input.answer);
       yield* threadManagement
         .dispatch({
           type: "secret_request.record",

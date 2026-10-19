@@ -149,9 +149,18 @@ test('buildRestartNote lists each lost subagent with model, session, start and p
 
 // ---------- restartScan with a fake io ----------
 
-function fakeIo({ subs = [], runs = [], threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {}, messages = {}, active = [] }) {
-  const calls = { send: [], telegram: [], commands: [], saves: [] };
+function fakeIo({ subs = [], runs = [], threads, later = {}, oc = {}, delivered = new Set(), installerMs = null, runAfter = [], held = {}, messages = {}, active = [], mission = null, missionMembers = () => [] }) {
+  const calls = { send: [], telegram: [], commands: [], saves: [], mission: [], members: [] };
   const io = {
+    missionRecoveryMembers: async (threadIds) => {
+      calls.members.push(threadIds);
+      return missionMembers(threadIds);
+    },
+    missionRecoveryReport: async (body) => {
+      calls.mission.push(body);
+      if (typeof mission === 'function') return mission(body);
+      return mission ?? { ok: true, incidentId: null, members: [], missions: [] };
+    },
     OC_URL: 'http://oc',
     serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
     openCodeRuntime: () => null,
@@ -732,4 +741,121 @@ test('leftover state from the previous version still gets a summary naming every
   assert.equal(done.done, true);
   assert.equal(done.incident, undefined);
   assert.deepEqual(done.threads.old, { done: true, noteSent: true, queueOk: undefined });
+});
+
+// ---------- mission recovery hand-off ----------
+
+const missionReply = (members, missions = []) => ({
+  ok: true, incidentId: members.length ? 'rcv-rs-20261015T181745Z' : null,
+  members: members.map((threadId) => ({ threadId, missionIds: ['m-1'] })), missions,
+});
+
+test('mission members get no stream-recovery note; the incident goes to mission recovery and the summary names the mission', async () => {
+  const { io, calls } = fakeIo({
+    subs: restartBurst(), runs: [run('kafka')], threads,
+    held: { kafka: [{ run_id: 'held', held: true, requested_at: iso(T0) }] },
+    mission: missionReply(['kafka'], [{ missionId: 'm-1', title: 'Crpko launch', threads: 3, resume: 1, reconcile: 0, noticeOnly: 2 }]),
+  });
+  const state = { handled: {}, servers: [] };
+  const [report] = await restartScan(scanArgs(state), io);
+  assert.equal(calls.mission.length, 1);
+  const body = calls.mission[0];
+  assert.equal(body.reportId, 'rs-20261015T181745Z');
+  assert.equal(body.cause, 'server-restart');
+  assert.equal(body.dryRun, undefined);
+  const kafka = body.threads.find((t) => t.threadId === 'kafka');
+  assert.deepEqual(kafka.runIds, ['run:thread:kafka:ordinal:19']);
+  assert.deepEqual(kafka.childIds, ['node:provider:opencode:native-item:k1']);
+  // Non-members keep their notes; the member only gets its held queue released.
+  assert.deepEqual(calls.send.map((c) => c.threadId).sort(), ['batch', 'pbdraft']);
+  assert.deepEqual(calls.commands.map((c) => [c.type, c.threadId]), [['queue.resume', 'kafka']]);
+  assert.equal(report.results.find((r) => r.plan.threadId === 'kafka').plan.action, 'mission');
+  assert.match(calls.telegram[0].text, /Mission "Crpko launch": 3 thread\(s\) \(1 to resume, 2 notice only\), master first, then paced by mission recovery\./);
+  assert.equal(state.handled['rs-20261015T181745Z'].done, true);
+
+  // Done incidents are not reported again.
+  await restartScan(scanArgs(state, { now: T0 + 11 * 60_000 }), io);
+  assert.equal(calls.mission.length, 1);
+});
+
+test('a mission thread cut by boot after boot gets one summary line saying it waits for a human', async () => {
+  const stopped = { threadId: 'kafka', title: 'Kafka consumer', bootCuts: 3 };
+  const { io, calls } = fakeIo({
+    subs: restartBurst(), runs: [run('kafka')], threads,
+    mission: missionReply(['kafka'], [
+      { missionId: 'm-1', title: 'Crpko launch', threads: 2, resume: 0, reconcile: 0, noticeOnly: 1, stopped: [stopped] },
+    ]),
+  });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+  assert.equal(calls.telegram.length, 1);
+  const text = calls.telegram[0].text;
+  assert.match(text, /Mission "Crpko launch": 2 thread\(s\) \(1 notice only\), master first/);
+  assert.match(text, /Not resumed, same turn cut by boot after boot: Kafka consumer \(mission "Crpko launch", 3 boots\)\. Resume by hand from mission recovery, or ask the master\./);
+});
+
+test('a master cut by boot after boot is reported as told, not as waiting for a human', async () => {
+  const stopped = { threadId: 'pbdraft', title: 'Launch master', bootCuts: 3, master: true };
+  const { io, calls } = fakeIo({
+    subs: restartBurst(), runs: [run('pbdraft')], threads,
+    mission: missionReply(['pbdraft'], [
+      { missionId: 'm-1', title: 'Crpko launch', threads: 1, resume: 0, reconcile: 0, noticeOnly: 0, stopped: [stopped] },
+    ]),
+  });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+  const text = calls.telegram[0].text;
+  assert.match(text, /Not resumed, same turn cut by boot after boot: Launch master \(mission "Crpko launch", 3 boots, master told not to rerun it\)\./);
+  assert.doesNotMatch(text, /Resume by hand/);
+});
+
+test('a busy mission member is left to mission recovery instead of being held back', async () => {
+  const busy = { title: 'Arch', activeRunId: 'fresh', status: 'running' };
+  const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: busy }, mission: missionReply(['arch']) });
+  const state = { handled: {}, servers: [] };
+  await restartScan(scanArgs(state), io);
+  assert.equal(calls.send.length, 0);
+  assert.equal(Object.values(state.handled)[0].done, true);
+  assert.equal(calls.telegram.length, 1);
+});
+
+test('mission recovery is told dry runs as dry runs, retried when down, and skipped on an older Robob', async () => {
+  const dry = fakeIo({ subs: restartBurst(), threads, mission: missionReply(['kafka']) });
+  const state = { handled: {}, servers: [] };
+  const [report] = await restartScan(scanArgs(state, { dryRun: true }), dry.io);
+  assert.equal(dry.calls.mission[0].dryRun, true);
+  assert.equal(report.results.find((r) => r.plan.threadId === 'kafka').plan.action, 'mission');
+  assert.deepEqual(state.handled, {});
+
+  // Unreachable: no notes until it answers, then everyone gets one after three failures.
+  const down = fakeIo({ subs: restartBurst(), threads, mission: () => { throw Object.assign(new Error('fetch failed'), { status: undefined }); } });
+  const retry = { handled: {}, servers: [] };
+  await restartScan(scanArgs(retry), down.io);
+  await restartScan(scanArgs(retry), down.io);
+  assert.equal(down.calls.send.length, 0);
+  assert.equal(retry.handled['rs-20261015T181745Z'].missionFailures, 2);
+  await restartScan(scanArgs(retry), down.io);
+  assert.deepEqual(down.calls.send.map((c) => c.threadId).sort(), ['batch', 'kafka', 'pbdraft']);
+
+  // An older Robob without the route (404) owns no threads.
+  const old = fakeIo({ subs: restartBurst(), threads, mission: () => { throw Object.assign(new Error('not found'), { status: 404 }); } });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), old.io);
+  assert.deepEqual(old.calls.send.map((c) => c.threadId).sort(), ['batch', 'kafka', 'pbdraft']);
+});
+
+test('without its own credential the report is refused, and mission members are still left to mission recovery', async () => {
+  const refused = () => { throw Object.assign(new Error('forbidden'), { status: 403 }); };
+  const { io, calls } = fakeIo({
+    subs: restartBurst(), threads, mission: refused,
+    missionMembers: (ids) => ids.filter((id) => id === 'kafka').map((threadId) => ({ threadId, missionIds: ['m-1'] })),
+  });
+  const state = { handled: {}, servers: [] };
+  const [report] = await restartScan(scanArgs(state), io);
+  assert.deepEqual(calls.members.map((ids) => [...ids].sort()), [['batch', 'kafka', 'pbdraft', 'tc3']]);
+  assert.deepEqual(calls.send.map((c) => c.threadId).sort(), ['batch', 'pbdraft']);
+  assert.equal(report.results.find((r) => r.plan.threadId === 'kafka').plan.action, 'mission');
+  assert.equal(state.handled['rs-20261015T181745Z'].done, true);
+
+  // A Robob that refuses the read too owns no threads.
+  const closed = fakeIo({ subs: restartBurst(), threads, mission: refused, missionMembers: refused });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), closed.io);
+  assert.deepEqual(closed.calls.send.map((c) => c.threadId).sort(), ['batch', 'kafka', 'pbdraft']);
 });

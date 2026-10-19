@@ -211,6 +211,35 @@ run; if it moved past the pinned attempt the evidence must name the plan attempt
 for frontends; everything but `state` and `reason` is `null` when unknown). They throw
 `env_unsupported` for environments other than `dev`.
 
+## Messaging forward mode (Missions cutover)
+
+The control row `messaging` picks where `post`, `inbox` and `ack` live. `coord` (the default) is coord.db
+and the pump, exactly as before. `robob` forwards those three calls to the coord shim of the Robob missions
+API, for the mission named in the `messaging:mission` row. Only `master` switches it:
+
+```bash
+coord messaging                                   # show the mode
+coord messaging robob --as master --mission crpko --reason "cutover"
+coord messaging coord --as master --reason "rollback"
+```
+
+In robob mode:
+
+- Callers see coord's shapes and refusal codes (`{seq, recipients}`, `{seq, duplicate}`, `conflict` with
+  the first `seq`, `not_found`, `unknown_actor`, `not_addressed`...). The lib calls return a Promise of
+  that shape instead of a plain value; crw already awaits them, and the CLI awaits too.
+- The pump rings nobody (Robob's doorbell wakes threads) and `post` sends no delivery nudge. coord.db's
+  own deliveries stay as they were and drop out of `attention` and `drain`.
+- Claims, QA windows, releases, deps (`event_acked` reads coord.db), flags, pause/drain and the arch
+  queue stay in coord.db.
+- No local fallback: if Robob can't be reached the call fails with `messaging_unavailable` and nothing
+  is written. A post can be retried under the same key.
+- Location and token come from the same place as the pump's (`T3_CONTROL_URL`/`T3_CONTROL_TOKEN`, then
+  `~/.robob/ardud-control.json`). The shim contract is at the top of `lib/forward.mjs`.
+
+Switching back to `coord` resumes coord.db messaging and the pump. Messages posted while forwarded stay in
+Robob and are not copied back.
+
 ## Rules worth knowing
 
 - Same `event_key` + same body is a no-op; a different body is refused (`conflict`, 409).

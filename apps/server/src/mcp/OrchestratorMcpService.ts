@@ -98,6 +98,12 @@ import {
 } from "./McpInvocationContext.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+// ardud missions: router
+import { guardMcpWrite } from "../ardud/missions/router/guardPaths.ts";
+// ardud missions: guard
+import { optionalAuthorityStore } from "../ardud/missions/guard/authority.ts";
+import { mcpPrincipal, scheduleFailure, schedulesAs } from "../ardud/missions/guard/mcp.ts";
+import { webhookVisible } from "../ardud/missions/guard/schedules.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -909,6 +915,8 @@ const make = Effect.gen(function* () {
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+  // ardud missions: guard - schedule calls run as the MCP caller.
+  const guardAuthority = yield* optionalAuthorityStore;
   const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
   const projects = yield* ProjectService.ProjectService;
   const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
@@ -1598,9 +1606,16 @@ const make = Effect.gen(function* () {
       // This runs after a save, so a failed lookup of the bound thread hides
       // the webhook URL instead of reporting a saved task as an error.
       const modes = yield* scheduledTaskRunModes(task).pipe(Effect.option);
+      // ardud missions: guard - a bound task's URL is for its authority and its thread.
+      const visible = yield* webhookVisible(
+        guardAuthority,
+        mcpPrincipal(scope, caller.parent?.thread),
+        task,
+      );
       return scheduledTaskSummary(
         task,
         live &&
+          visible &&
           Option.isSome(modes) &&
           modes.value.every((mode) => withinLimits(caller.limits, mode)),
       );
@@ -1689,13 +1704,11 @@ const make = Effect.gen(function* () {
                 }),
               }),
         };
-        const { task } = yield* scheduledTasks
-          .upsert(upsertInput)
-          .pipe(
-            Effect.mapError((error) =>
-              failure("orchestration_error", `Could not schedule task: ${error.message}`),
-            ),
-          );
+        const { task } = yield* scheduledTasks.upsert(upsertInput).pipe(
+          // ardud missions: guard
+          schedulesAs(mcpPrincipal(scope, parent?.thread)),
+          Effect.mapError(scheduleFailure("Could not schedule task")),
+        );
         return yield* summarizeScheduledTask(scope, { parent, limits }, task);
       }),
     listScheduledTasks: (scope, input) =>
@@ -1760,12 +1773,13 @@ const make = Effect.gen(function* () {
           createdBy: existing.createdBy,
           creationSource: existing.creationSource,
         };
+        // ardud missions: guard - every change to a bound task is a send into its
+        // thread; the scheduler checks it against the guard as this caller.
         const { task } = yield* scheduledTasks
           .upsert(upsertInput)
           .pipe(
-            Effect.mapError((error) =>
-              failure("orchestration_error", `Could not update scheduled task: ${error.message}`),
-            ),
+            schedulesAs(mcpPrincipal(scope, parent?.thread)),
+            Effect.mapError(scheduleFailure("Could not update scheduled task")),
           );
         return yield* summarizeScheduledTask(scope, { parent, limits }, task);
       }),
@@ -1774,13 +1788,11 @@ const make = Effect.gen(function* () {
         const { parent, limits } = yield* loadCaller(scope);
         const existing = yield* loadScheduledTask(input.scheduledTaskId, limits);
         yield* assertLiveCallerForOtherProject(scope, parent, existing.projectId);
-        yield* scheduledTasks
-          .delete({ id: existing.id })
-          .pipe(
-            Effect.mapError((error) =>
-              failure("orchestration_error", `Could not delete scheduled task: ${error.message}`),
-            ),
-          );
+        yield* scheduledTasks.delete({ id: existing.id }).pipe(
+          // ardud missions: guard
+          schedulesAs(mcpPrincipal(scope, parent?.thread)),
+          Effect.mapError(scheduleFailure("Could not delete scheduled task")),
+        );
         return { scheduledTaskId: existing.id, deleted: true };
       }),
     requestSecret: (scope, input) =>
@@ -2608,14 +2620,25 @@ const make = Effect.gen(function* () {
           requestKey: key,
           operation: "thread-send",
         });
+        const commandId = stableCommandId({ scope, requestKey: key, operation: "thread-send" });
+        // ardud missions: router - mission member threads only take sends the guard passes.
+        yield* guardMcpWrite({
+          path: "thread-send",
+          targetThreadId: input.threadId,
+          caller: {
+            thread:
+              parent === undefined
+                ? undefined
+                : { id: parent.thread.id, title: parent.thread.title },
+            client: scope.client,
+          },
+          text: input.message,
+          requestKey: commandId,
+        });
         const result = yield* threadManagement
           .sendToThread({
             projectId: target.thread.projectId,
-            commandId: stableCommandId({
-              scope,
-              requestKey: key,
-              operation: "thread-send",
-            }),
+            commandId,
             threadId: input.threadId,
             ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
             messageId,

@@ -22,6 +22,7 @@ import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "../../cli/config.ts";
 import * as ServerConfig from "../../config.ts";
 import { readPersistedServerRuntimeState } from "../../serverRuntimeState.ts";
+import { componentTokenCommand } from "../auth/componentTokenCommand.ts";
 import { openCodeImportCommand } from "../opencode-import/command.ts";
 import {
   OpenChamberProjectFile,
@@ -173,5 +174,9 @@ export const importOpenChamberSchedulesCommand = Command.make("import-openchambe
 
 export const ardudCommand = Command.make("ardud").pipe(
   Command.withDescription("Fork-only maintenance commands."),
-  Command.withSubcommands([importOpenChamberSchedulesCommand, openCodeImportCommand]),
+  Command.withSubcommands([
+    importOpenChamberSchedulesCommand,
+    openCodeImportCommand,
+    componentTokenCommand,
+  ]),
 );

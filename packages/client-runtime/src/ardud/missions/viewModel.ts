@@ -12,6 +12,8 @@ import type {
   SubMission,
 } from "@t3tools/contracts";
 
+import type { FieldChange, MissionPoolUsage } from "./source.ts";
+
 // Pure view helpers shared by the web and mobile mission screens. Everything
 // here takes contract snapshots and returns display-ready values, so both
 // clients word things the same way.
@@ -184,6 +186,11 @@ export function needsYouLine(
   return parts.length === 0 ? null : parts.join(", ");
 }
 
+/** Everything waiting on the owner across missions: the sidebar Inbox row count. */
+export function totalNeedsYou(missions: ReadonlyArray<{ readonly needsYou: number }>): number {
+  return missions.reduce((total, mission) => total + mission.needsYou, 0);
+}
+
 export function badgeCount(count: number, cap = 99): string {
   return count > cap ? `${cap}+` : String(count);
 }
@@ -211,6 +218,28 @@ export function actorKey(actor: MissionActor): string {
 
 export function refKey(ref: Pick<MissionRecordRef, "kind" | "id">): string {
   return `${ref.kind}:${ref.id}`;
+}
+
+/**
+ * Short display name for an actor. The mission's master role reads as
+ * "master" and lanes drop their `lane-` prefix, matching how the coordinator
+ * names them in rooms.
+ */
+export function actorLabel(actor: MissionActor, masterRoleId: string | null = null): string {
+  switch (actor._tag) {
+    case "owner":
+      return "you";
+    case "role":
+      return actor.roleId === masterRoleId ? "master" : actor.roleId;
+    case "lane":
+      return actor.laneId.replace(/^lane-/, "");
+    case "thread":
+      return "a thread";
+    case "system":
+      return actor.component;
+    case "person":
+      return actor.name;
+  }
 }
 
 export interface HeldItem {
@@ -309,13 +338,62 @@ export function refLabel(ref: Pick<MissionRecordRef, "id" | "label">): string {
 
 export type EffortDrift = "over" | "under" | "even" | "unknown";
 
+/** Event-log field name for a sub-mission's intended share. */
+export const INTENDED_EFFORT_FIELD = "intendedEffort";
+
 export interface PriorityStackRow {
   readonly subMission: SubMission;
-  /** 1-based position in the owner's order. */
+  /** 1-based position in the mission's order. */
   readonly position: number;
   readonly intended: number | null;
+  /**
+   * Who last changed the intended share (owner or master, same method, no
+   * lock). `null` when no logged change touched it, e.g. an imported value.
+   */
+  readonly intendedChange: FieldChange | null;
   readonly actual: number | null;
   readonly drift: EffortDrift;
+}
+
+/** "last changed by master", "no share set", or "not changed since import". */
+export function intendedShareLine(
+  row: Pick<PriorityStackRow, "intended" | "intendedChange">,
+  masterRoleId: string | null,
+): string {
+  if (row.intendedChange) {
+    return `last changed by ${actorLabel(row.intendedChange.actor, masterRoleId)}`;
+  }
+  return row.intended === null ? "no share set" : "not changed since import";
+}
+
+/**
+ * Reads a typed share: "40", "40%", "0.4" all mean 40%. Empty clears the
+ * share. Returns an error for anything else.
+ */
+export function parseShareInput(
+  text: string,
+):
+  | { readonly ok: true; readonly share: number | null }
+  | { readonly ok: false; readonly error: string } {
+  const trimmed = text.trim().replace(/%$/, "").trim();
+  if (trimmed === "") return { ok: true, share: null };
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return { ok: false, error: "Enter a percentage, like 40." };
+  const value = Number(trimmed);
+  // "0.4" reads as a fraction; "1" and up read as percent.
+  const share = value < 1 && trimmed.includes(".") ? value : value / 100;
+  if (share > 1) return { ok: false, error: "A share can't be over 100%." };
+  return { ok: true, share: Math.round(share * 1000) / 1000 };
+}
+
+/** Sum of intended shares across open sub-missions, and how far it is from 100%. */
+export function intendedTotal(rows: ReadonlyArray<Pick<PriorityStackRow, "intended">>): {
+  readonly total: number;
+  readonly label: string;
+  readonly balanced: boolean;
+} {
+  const total = Math.round(rows.reduce((sum, row) => sum + (row.intended ?? 0), 0) * 1000) / 1000;
+  const rounded = Math.round(total * 100);
+  return { total, label: `${rounded}% planned`, balanced: Math.abs(rounded - 100) <= 1 };
 }
 
 /** Effort is "off" when it misses the owner's share by more than this (absolute share). */
@@ -329,8 +407,19 @@ export function effortDrift(intended: number | null, actual: number | null): Eff
   return "even";
 }
 
-/** Open sub-missions in the owner's order (closed ones drop out of the stack). */
-export function priorityStack(subMissions: ReadonlyArray<SubMission>): PriorityStackRow[] {
+/**
+ * Open sub-missions in the mission's order (closed ones drop out of the
+ * stack). `changes` is the overview's field-change list.
+ */
+export function priorityStack(
+  subMissions: ReadonlyArray<SubMission>,
+  changes: ReadonlyArray<FieldChange> = [],
+): PriorityStackRow[] {
+  const intendedChanges = new Map(
+    changes
+      .filter((c) => c.ref.kind === "sub-mission" && c.field === INTENDED_EFFORT_FIELD)
+      .map((c) => [c.ref.id, c]),
+  );
   return [...subMissions]
     .filter((subMission) => subMission.status !== "closed")
     .sort((left, right) => left.order - right.order || left.title.localeCompare(right.title))
@@ -338,16 +427,20 @@ export function priorityStack(subMissions: ReadonlyArray<SubMission>): PriorityS
       subMission,
       position: index + 1,
       intended: subMission.intendedEffort,
+      intendedChange: intendedChanges.get(subMission.id) ?? null,
       actual: subMission.actualEffort,
       drift: effortDrift(subMission.intendedEffort, subMission.actualEffort),
     }));
 }
 
 /**
- * One sentence about the biggest gap between where effort went and where the
- * owner wants it, or `null` when effort roughly follows the order.
+ * One sentence about the biggest gap between where effort went and the
+ * intended share, or `null` when effort roughly follows the order.
  */
-export function effortNote(rows: ReadonlyArray<PriorityStackRow>): string | null {
+export function effortNote(
+  rows: ReadonlyArray<PriorityStackRow>,
+  masterRoleId: string | null = null,
+): string | null {
   let worst: PriorityStackRow | null = null;
   let worstGap = 0;
   for (const row of rows) {
@@ -362,9 +455,12 @@ export function effortNote(rows: ReadonlyArray<PriorityStackRow>): string | null
   const actual = formatPercent(worst.actual ?? 0);
   const intended = formatPercent(worst.intended ?? 0);
   const name = worst.subMission.title;
+  const target = worst.intendedChange
+    ? `${actorLabel(worst.intendedChange.actor, masterRoleId)} set ${intended}`
+    : `the plan is ${intended}`;
   return worst.drift === "over"
-    ? `${name} (${ordinal(worst.position)}) took ${actual} of the effort; you set ${intended}.`
-    : `${name} (${ordinal(worst.position)}) got ${actual} of the effort against your ${intended}.`;
+    ? `${name} (${ordinal(worst.position)}) took ${actual} of the effort; ${target}.`
+    : `${name} (${ordinal(worst.position)}) got ${actual} of the effort; ${target}.`;
 }
 
 /**
@@ -487,6 +583,27 @@ export function formatRelative(atIso: string, nowMs: number, timeZone?: string):
   return formatDayLabel(atIso, timeZone);
 }
 
+/** How long something has waited: under an hour, under a day, or longer. */
+export type AgeTier = "minutes" | "hours" | "days";
+
+export interface AgeView {
+  /** "now", "52m", "5h", "1d 14h". */
+  readonly label: string;
+  readonly tier: AgeTier;
+}
+
+/** The card age element: a short span since `atIso`, and how loud to show it. */
+export function ageView(atIso: string, nowMs: number): AgeView | null {
+  const diff = nowMs - Date.parse(atIso);
+  if (!Number.isFinite(diff)) return null;
+  if (diff < MINUTE_MS) return { label: "now", tier: "minutes" };
+  if (diff < HOUR_MS) return { label: `${Math.floor(diff / MINUTE_MS)}m`, tier: "minutes" };
+  if (diff < DAY_MS) return { label: `${Math.floor(diff / HOUR_MS)}h`, tier: "hours" };
+  const days = Math.floor(diff / DAY_MS);
+  const hours = Math.floor((diff % DAY_MS) / HOUR_MS);
+  return { label: hours > 0 ? `${days}d ${hours}h` : `${days}d`, tier: "days" };
+}
+
 /** "Since you last looked (4h ago)" heading text. */
 export function sinceLastLookedLabel(ownerLastLookedAt: string | null, nowMs: number): string {
   if (ownerLastLookedAt === null) return "Everything so far";
@@ -527,6 +644,26 @@ export function formatDayLabel(atIso: string, timeZone?: string): string {
   return formatter.format(atMs).replace(",", "");
 }
 
+const timeOfDayFormatters = new Map<string, Intl.DateTimeFormat>();
+
+/** "15:41" in the reader's time zone (or `timeZone` when given). */
+export function formatTimeOfDay(atIso: string, timeZone?: string): string {
+  const key = timeZone ?? "";
+  let formatter = timeOfDayFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      ...(timeZone ? { timeZone } : {}),
+    });
+    timeOfDayFormatters.set(key, formatter);
+  }
+  const atMs = Date.parse(atIso);
+  if (!Number.isFinite(atMs)) return "";
+  return formatter.format(atMs);
+}
+
 // ---------------------------------------------------------------------------
 // Usage
 
@@ -544,6 +681,83 @@ export function usageView(usageShare: number | null): UsageView {
     return { label: `Borrowing: ${formatMultiplier(usageShare)} its share`, tone: "borrowing" };
   }
   return { label: `${formatPercent(usageShare)} of its share`, tone: "normal" };
+}
+
+export type PoolTone = "ok" | "tight" | "out" | "held";
+
+export interface PoolUsageView {
+  readonly id: string;
+  readonly label: string;
+  /** "20/30", "$62 of $500", "free" or "held by cell-devops". */
+  readonly value: string;
+  readonly tone: PoolTone;
+  /** Longer form for a tooltip or screen reader. */
+  readonly detail: string;
+}
+
+/** Accounts at or below this usable share read as tight. */
+export const POOL_TIGHT_SHARE = 0.34;
+
+/** Currency codes read as a prefix ("$62", "EUR 40"); any other unit is counted ("0 of 8 reviews"). */
+function formatBudget(spent: number, cap: number, unit: string): string {
+  if (unit === "USD") return `$${Math.round(spent)} of $${Math.round(cap)}`;
+  if (/^[A-Z]{3}$/.test(unit)) return `${unit} ${Math.round(spent)} of ${unit} ${Math.round(cap)}`;
+  const counted = Math.round(cap);
+  const noun = counted === 1 || unit.endsWith("s") ? unit : `${unit}s`;
+  return `${Math.round(spent)} of ${counted} ${noun}`;
+}
+
+/** One compact entry per pool the mission draws on, for the header usage line. */
+export function poolUsageView(
+  pool: MissionPoolUsage,
+  nowMs: number,
+  masterRoleId: string | null = null,
+): PoolUsageView {
+  const sampled = formatRelative(pool.sampledAt, nowMs);
+  switch (pool._tag) {
+    case "accounts": {
+      const share = pool.total === 0 ? 0 : pool.usable / pool.total;
+      const tone: PoolTone = pool.usable === 0 ? "out" : share <= POOL_TIGHT_SHARE ? "tight" : "ok";
+      return {
+        id: pool.id,
+        label: pool.label,
+        value: `${pool.usable}/${pool.total}`,
+        tone,
+        detail: `${pool.label}: ${pool.usable} of ${pool.total} usable (read ${sampled})`,
+      };
+    }
+    case "budget": {
+      const share = pool.cap === 0 ? 1 : pool.spent / pool.cap;
+      const tone: PoolTone = share >= 1 ? "out" : share >= 1 - POOL_TIGHT_SHARE ? "tight" : "ok";
+      const value = formatBudget(pool.spent, pool.cap, pool.currency);
+      return {
+        id: pool.id,
+        label: pool.label,
+        value,
+        tone,
+        detail: `${pool.label}: ${value} used (read ${sampled})`,
+      };
+    }
+    case "lock": {
+      const holder =
+        pool.holder === null
+          ? null
+          : pool.holder === masterRoleId
+            ? "master"
+            : pool.holder.replace(/^lane-/, "");
+      const since = pool.since === null ? "" : ` since ${formatRelative(pool.since, nowMs)}`;
+      return {
+        id: pool.id,
+        label: pool.label,
+        value: holder === null ? "free" : `held by ${holder}`,
+        tone: holder === null ? "ok" : "held",
+        detail:
+          holder === null
+            ? `${pool.label}: free${since === "" ? "" : `, released${since.replace(" since", "")}`}`
+            : `${pool.label}: held by ${holder}${since}`,
+      };
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

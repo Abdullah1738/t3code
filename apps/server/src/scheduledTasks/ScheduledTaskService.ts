@@ -59,6 +59,15 @@ import {
   type WebhookRequest,
 } from "./webhookTemplate.ts";
 import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerification.ts";
+// ardud missions: router
+// ardud missions: guard
+import { authorityStore } from "../ardud/missions/guard/authority.ts";
+import {
+  authorizeScheduleChange,
+  guardScheduleRun,
+  scheduleAuthorityChange,
+  withScheduleAuthority,
+} from "../ardud/missions/guard/schedules.ts";
 
 /** Path prefix of the environment route that receives webhook requests. */
 export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
@@ -397,6 +406,8 @@ export const layer = Layer.effect(
   ScheduledTaskService,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    // ardud missions: guard - who authorized each task, read when it fires.
+    const guardAuthority = authorityStore(sql);
     const crypto = yield* Crypto.Crypto;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -831,20 +842,31 @@ export const layer = Layer.effect(
                 }),
               )
             : yield* Effect.exit(
-                threadManagement.sendToThread({
-                  projectId: active.projectId,
-                  commandId,
-                  threadId: ThreadId.make(active.threadId),
-                  messageId,
-                  scheduledTaskId: active.id,
+                // ardud missions: router - a run into a mission member thread goes through the guard.
+                // ardud missions: guard - it speaks as the invoker or the recorded authority.
+                guardScheduleRun(guardAuthority, {
+                  task: active,
+                  targetThreadId: ThreadId.make(active.threadId),
                   text: prompt,
-                  attachments: [],
-                  modelSelection: active.modelSelection,
-                  // Scheduled prompts must not interrupt tools in the bound thread.
-                  mode: "queue",
-                  createdBy: active.createdBy,
-                  creationSource: active.creationSource,
-                }),
+                  commandId,
+                }).pipe(
+                  Effect.andThen(
+                    threadManagement.sendToThread({
+                      projectId: active.projectId,
+                      commandId,
+                      threadId: ThreadId.make(active.threadId),
+                      messageId,
+                      scheduledTaskId: active.id,
+                      text: prompt,
+                      attachments: [],
+                      modelSelection: active.modelSelection,
+                      // Scheduled prompts must not interrupt tools in the bound thread.
+                      mode: "queue",
+                      createdBy: active.createdBy,
+                      creationSource: active.creationSource,
+                    }),
+                  ),
+                ),
               );
 
         const completedAt = yield* localNow;
@@ -1075,6 +1097,12 @@ export const layer = Layer.effect(
         // keep their run history, and so real load failures propagate instead
         // of silently resetting an existing row.
         const existingTask = yield* findTask(id);
+        // ardud missions: guard - a change to a bound task is a send into its thread.
+        const principal = yield* authorizeScheduleChange({
+          taskId: id,
+          threads: [existingTask?.threadId, input.threadId],
+          text: input.prompt,
+        });
         // Keep the existing next_run_at when the schedule itself is untouched:
         // editing a title or prompt must not postpone (or resurrect) a due
         // run — only schedule/enabled changes restart the clock.
@@ -1150,7 +1178,12 @@ export const layer = Layer.effect(
           modelSelection: input.modelSelection,
           runtimeMode: input.runtimeMode,
           interactionMode: input.interactionMode,
-          createdBy: existingTask?.createdBy ?? input.createdBy ?? "user",
+          createdBy:
+            existingTask?.createdBy ??
+            // ardud missions: guard - a bearer session cannot stamp its schedule as the owner's.
+            (principal?._tag === "session" ? "system" : undefined) ??
+            input.createdBy ??
+            "user",
           creationSource: input.creationSource ?? "web",
           createdAt: existingTask?.createdAt ?? iso(now),
           updatedAt: iso(now),
@@ -1162,7 +1195,20 @@ export const layer = Layer.effect(
           lastRunError: existingTask?.lastRunError ?? null,
           runCount: existingTask?.runCount ?? 0,
         };
-        yield* saveTask(task, input.requireExisting === true, webhook);
+        // ardud missions: guard - the task and the authority it runs under land together.
+        yield* withScheduleAuthority({
+          sql,
+          store: guardAuthority,
+          taskId: id,
+          authority: scheduleAuthorityChange(guardAuthority, {
+            taskId: id,
+            principal,
+            created: existingTask === null,
+            previousThreadId: existingTask?.threadId ?? null,
+            threadId: task.threadId,
+          }),
+          write: saveTask(task, input.requireExisting === true, webhook),
+        });
         yield* notifyChanged;
         return { task: (yield* findTask(id)) ?? task };
       });
@@ -1170,6 +1216,13 @@ export const layer = Layer.effect(
     const setEnabled: ScheduledTaskService["Service"]["setEnabled"] = (input) =>
       Effect.gen(function* () {
         const existing = yield* loadTask(input.id);
+        // ardud missions: guard - resuming delivers the prompt again. Checked
+        // before the no-op return, which would otherwise hand back the task.
+        const principal = yield* authorizeScheduleChange({
+          taskId: input.id,
+          threads: [existing.threadId],
+          text: input.enabled ? existing.prompt : `Pause the schedule "${existing.title}".`,
+        });
         if (existing.enabled === input.enabled) return { task: existing };
         const now = yield* localNow;
         if (input.enabled && onceRunInPast(existing.schedule, now)) {
@@ -1178,7 +1231,7 @@ export const layer = Layer.effect(
         const next = nextRunAt({ enabled: input.enabled, schedule: existing.schedule }, now);
         // RETURNING so a task deleted between the load and this UPDATE is a
         // visible not-found error, not a false success.
-        const updated = yield* sql<{ task_id: string }>`
+        const update = sql<{ task_id: string }>`
           UPDATE scheduled_tasks
           SET enabled = ${input.enabled ? 1 : 0},
               next_run_at = ${next},
@@ -1189,10 +1242,20 @@ export const layer = Layer.effect(
           Effect.mapError((cause) =>
             taskError("Could not update schedule task.", { taskId: input.id, cause }),
           ),
+          Effect.flatMap((updated) =>
+            updated.length === 0
+              ? Effect.fail(taskError("Schedule task not found.", { taskId: input.id }))
+              : Effect.void,
+          ),
         );
-        if (updated.length === 0) {
-          return yield* taskError("Schedule task not found.", { taskId: input.id });
-        }
+        // ardud missions: guard - whoever resumes it is who its runs speak as.
+        yield* withScheduleAuthority({
+          sql,
+          store: guardAuthority,
+          taskId: input.id,
+          authority: Effect.succeed(input.enabled ? principal : undefined),
+          write: update,
+        });
         yield* notifyChanged;
         return {
           task: { ...existing, enabled: input.enabled, nextRunAt: next, updatedAt: iso(now) },
@@ -1200,7 +1263,28 @@ export const layer = Layer.effect(
       });
 
     const deleteTask: ScheduledTaskService["Service"]["delete"] = (input) =>
-      deleteRow(input.id).pipe(
+      // ardud missions: guard - only a caller who may reach the bound thread deletes its task.
+      findTask(input.id).pipe(
+        Effect.flatMap((existing) =>
+          existing === null
+            ? Effect.void
+            : Effect.asVoid(
+                authorizeScheduleChange({
+                  taskId: input.id,
+                  threads: [existing.threadId],
+                  text: `Delete the schedule "${existing.title}".`,
+                }),
+              ),
+        ),
+        Effect.andThen(
+          withScheduleAuthority({
+            sql,
+            store: guardAuthority,
+            taskId: input.id,
+            authority: Effect.succeed(null),
+            write: deleteRow(input.id),
+          }),
+        ),
         Effect.andThen(
           Effect.all([
             Ref.update(webhookRateWindows, (windows) => {
@@ -1242,6 +1326,12 @@ export const layer = Layer.effect(
         if (task.schedule.type !== "webhook") {
           return yield* taskError("Only webhook tasks have a URL token.", { taskId: input.id });
         }
+        // ardud missions: guard - a new URL is a new way into the bound thread.
+        yield* authorizeScheduleChange({
+          taskId: input.id,
+          threads: [task.threadId],
+          text: `Rotate the webhook URL of the schedule "${task.title}".`,
+        });
         const token = yield* newWebhookToken;
         const now = yield* localNow;
         // Matching created_at keeps a rotation from landing on a task deleted
