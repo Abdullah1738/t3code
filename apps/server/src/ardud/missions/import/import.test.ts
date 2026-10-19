@@ -1,4 +1,11 @@
-import { ApprovalId, PoolId, RoleId, type Approval } from "@t3tools/contracts";
+import {
+  ApprovalId,
+  PoolId,
+  RoleId,
+  ThreadId,
+  type Approval,
+  type MissionMemberPrincipal,
+} from "@t3tools/contracts";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -6,9 +13,14 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import { agent, failureCode } from "../asks/AsksService.testkit.ts";
 import { routeApprover } from "../core/approvals.ts";
 import { PolicyService } from "../policy/PolicyService.ts";
 import { makePorts, testLayer } from "../policy/testing.ts";
+import { routerImportSink } from "../router/adapters.ts";
+import * as CoordShim from "../router/coordShim.ts";
+import * as MissionRouter from "../router/MissionRouter.ts";
+import { fakeRouterThreads, routerOverFakes } from "../router/MissionRouter.testkit.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import {
   applyImport,
@@ -20,6 +32,7 @@ import {
   readPositionId,
 } from "./apply.ts";
 import { coordActorFor, HAIKU_XHIGH, OPUS_XHIGH, parseCoordBodyText } from "./coordIds.ts";
+import { applyEnrolments, diffEnrolments } from "./enrol.ts";
 import {
   awaitingStaleReason,
   buildImportPlan,
@@ -28,7 +41,7 @@ import {
   workLinks,
 } from "./mapping.ts";
 import type { ImportSources } from "./readers.ts";
-import { countChecks } from "./report.ts";
+import { countChecks, renderReport } from "./report.ts";
 import { parseDeferred, parseLanePulse, parseLaneRoster, parseStandingRules } from "./sources.ts";
 
 const TestLayer = MissionStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
@@ -590,6 +603,159 @@ it.layer(policyLayer)("applyPools", (it) => {
         (v) => v.pool.id === "crpko:pool:review-slots",
       );
       expect(kept?.pool.capacity).toBe(2);
+    }),
+  );
+});
+
+const routerThreads = fakeRouterThreads();
+const EnrolLayer = CoordShim.layer.pipe(
+  Layer.provideMerge(routerOverFakes(routerThreads)),
+  Layer.provideMerge(MissionStore.layer),
+  Layer.provideMerge(Sqlite.layerMemory),
+);
+const importProvenance = { _tag: "import", source: "coord.db" } as const;
+
+it.layer(EnrolLayer)("coord enrolment", (it) => {
+  it.effect("enrols every thread-bound coord actor once, so the shim accepts it", () =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const shim = yield* CoordShim.CoordShim;
+      const sink = yield* routerImportSink;
+      const p = plan();
+      const inbox = (as: string) =>
+        shim.inbox("coord", { mission: p.missionId, as, unacked: false, after: 0, limit: 50 });
+
+      expect(p.enrolments.enrol.map((e) => e.actor)).toEqual([
+        "cell-tc",
+        "cell-tc2",
+        "master",
+        "release",
+      ]);
+      expect(p.enrolments.unbound).toEqual([{ actor: "crw", kind: "process" }]);
+
+      yield* applyImport(p, sink);
+      const refused = yield* Effect.flip(inbox("cell-tc"));
+      expect(refused).toMatchObject({ _tag: "CoordRefusal", status: 403 });
+
+      expect((yield* diffEnrolments(p)).create).toBe(4);
+      const first = yield* applyEnrolments(p);
+      expect(first.enrolled).toEqual(["cell-tc", "cell-tc2", "master", "release"]);
+      const rows = yield* inbox("cell-tc");
+      expect(rows.length).toBeGreaterThan(0);
+      // crw has no thread in coord.db, so the import does not enrol it.
+      expect(yield* Effect.flip(inbox("crw"))).toMatchObject({ status: 403 });
+
+      const events = (yield* store.eventsSince(p.missionId, 0)).filter(
+        (e) => e.kind === "member.changed",
+      );
+      expect(events.map((e) => (e.payload as { principal: string }).principal)).toEqual([
+        "coord:cell-tc",
+        "coord:cell-tc2",
+        "coord:master",
+        "coord:release",
+      ]);
+      expect(events.every((e) => e.provenance._tag === "import")).toBe(true);
+      expect(events[0]?.actor).toEqual({ _tag: "system", component: "import:coord.db" });
+
+      const seq = yield* store.latestSeq(p.missionId);
+      const again = yield* applyEnrolments(plan());
+      expect(again.enrolled).toEqual([]);
+      expect(again.diff).toMatchObject({ create: 0, unchanged: 4, differs: 0 });
+      expect(yield* store.latestSeq(p.missionId)).toBe(seq);
+    }),
+  );
+
+  it.effect("keeps an actor the master removed out, and may only add coord members", () =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const router = yield* MissionRouter.MissionRouter;
+      const p = plan();
+      yield* applyImport(p, yield* routerImportSink);
+      yield* applyEnrolments(p);
+
+      yield* router.setMember(
+        {
+          missionId: p.missionId,
+          principal: { _tag: "coord", actor: "cell-tc2" },
+          member: false,
+        },
+        agent(ThreadId.make("ardud-control:thread:m")),
+      );
+      const seq = yield* store.latestSeq(p.missionId);
+      const again = yield* applyEnrolments(plan());
+      expect(again.enrolled).toEqual([]);
+      expect(again.diff).toMatchObject({ create: 0, unchanged: 3, differs: 1 });
+      expect(again.diff.differIds).toEqual(["cell-tc2"]);
+      expect(yield* store.latestSeq(p.missionId)).toBe(seq);
+
+      const set = (principal: MissionMemberPrincipal, member: boolean) =>
+        failureCode(
+          router.setMember({ missionId: p.missionId, principal, member }, importProvenance),
+        );
+      expect(yield* set({ _tag: "coord", actor: "cell-tc" }, false)).toBe("forbidden");
+      expect(yield* set({ _tag: "thread", threadId: ThreadId.make("mcp:tc") }, true)).toBe(
+        "forbidden",
+      );
+      expect(yield* set({ _tag: "session", sessionId: "s-9", label: "crw" }, true)).toBe(
+        "forbidden",
+      );
+    }),
+  );
+
+  it.effect("finds a removal past the first event page and reports each actor's state", () =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const router = yield* MissionRouter.MissionRouter;
+      const p = plan();
+      yield* applyImport(p, yield* routerImportSink);
+      yield* applyEnrolments(p);
+      const master = agent(ThreadId.make("ardud-control:thread:m"));
+      const member = (actor: string, on: boolean) =>
+        router.setMember(
+          { missionId: p.missionId, principal: { _tag: "coord", actor }, member: on },
+          master,
+        );
+
+      // Push the removal of coord:release onto the second page of mission events.
+      for (let n = 0; n < 520; n++) {
+        yield* store.appendEvent({
+          missionId: p.missionId,
+          kind: "import.applied",
+          actor: { _tag: "system", component: "coord-import" },
+          provenance: importProvenance,
+          summary: `filler ${n}`,
+          subject: null,
+        });
+      }
+      yield* member("release", false);
+      yield* member("cell-tc2", false);
+      yield* member("cell-tc2", true);
+      expect(yield* store.latestSeq(p.missionId)).toBeGreaterThan(500);
+
+      const diff = yield* diffEnrolments(p);
+      expect(diff).toMatchObject({ create: 0, unchanged: 3, differs: 1, createIds: [] });
+      expect(diff.differIds).toEqual(["release"]);
+
+      const report = renderReport({
+        plan: p,
+        diff: { kinds: [diff], routerAvailable: true },
+        mode: "dry-run",
+        paths: {},
+        against: "test store",
+      }).split("\n");
+      const section = report.slice(report.findIndex((l) => l.startsWith("Coord enrolments")));
+      const line = (actor: string) =>
+        section
+          .find((l) => l.split(/\s+/)[2] === actor)
+          ?.trim()
+          .split(/\s+/)[0];
+      expect(["cell-tc", "cell-tc2", "master", "release", "crw"].map(line)).toEqual([
+        "same",
+        "same",
+        "same",
+        "removed",
+        "skip",
+      ]);
     }),
   );
 });

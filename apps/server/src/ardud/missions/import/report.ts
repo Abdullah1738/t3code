@@ -1,4 +1,5 @@
 import type { ApplyResult, ImportDiff } from "./apply.ts";
+import { ENROLMENT_KIND, ENROLMENT_SOURCE, type EnrolmentDiff } from "./enrol.ts";
 import type { ImportPlan } from "./mapping.ts";
 
 /** Plain-text dry-run / apply report: source counts, count checks, diff, warnings. */
@@ -133,14 +134,17 @@ export const renderReport = (input: {
   );
   out.push(`  subscriptions: ${tally(plan.router.subscriptions, (s) => s.mode)}`);
   out.push(`  read positions: ${plan.router.readPositions.length}`);
+  out.push(
+    `  coord enrolments: ${plan.enrolments.enrol.length} thread-bound actors; not enrolled (no thread): ${plan.enrolments.unbound.length}`,
+  );
   out.push("");
   out.push("Diff against target");
   out.push(
-    `  ${pad("kind", 14)} ${padLeft("planned", 8)} ${padLeft("create", 8)} ${padLeft("same", 8)} ${padLeft("differs", 8)} ${padLeft("close", 6)}`,
+    `  ${pad("kind", 16)} ${padLeft("planned", 8)} ${padLeft("create", 8)} ${padLeft("same", 8)} ${padLeft("differs", 8)} ${padLeft("close", 6)}`,
   );
   for (const k of diff.kinds) {
     out.push(
-      `  ${pad(k.kind, 14)} ${padLeft(k.planned, 8)} ${padLeft(k.create, 8)} ${padLeft(k.unchanged, 8)} ${padLeft(k.differs, 8)} ${padLeft(k.close, 6)}`,
+      `  ${pad(k.kind, 16)} ${padLeft(k.planned, 8)} ${padLeft(k.create, 8)} ${padLeft(k.unchanged, 8)} ${padLeft(k.differs, 8)} ${padLeft(k.close, 6)}`,
     );
   }
   if (!diff.routerAvailable) out.push("  (router parts not diffed: no router sink)");
@@ -155,6 +159,32 @@ export const renderReport = (input: {
       `Applied: ${input.applied.commits} commits, closed ${input.applied.closed} stale approvals`,
     );
     for (const [k, n] of Object.entries(input.applied.created)) out.push(`  created ${k}: ${n}`);
+  }
+  out.push("");
+  out.push(
+    `Coord enrolments (${plan.enrolments.enrol.length}; principal coord:<actor>, import provenance ${ENROLMENT_SOURCE})`,
+  );
+  const enrolDiff = diff.kinds.find(
+    (k): k is EnrolmentDiff => k.kind === ENROLMENT_KIND && "createIds" in k,
+  );
+  const enrolling = new Set(enrolDiff?.createIds ?? []);
+  const keptOut = new Set(enrolDiff?.differIds ?? []);
+  const label = (actor: string) =>
+    enrolDiff === undefined
+      ? "planned"
+      : enrolling.has(actor)
+        ? "enrol"
+        : keptOut.has(actor)
+          ? "removed"
+          : "same";
+  for (const e of plan.enrolments.enrol) {
+    out.push(`  ${pad(label(e.actor), 8)} ${pad(e.actor, 20)} ${e.threadId}`);
+  }
+  if (keptOut.size > 0) out.push("  removed: the owner or master dropped it since; left out");
+  for (const u of plan.enrolments.unbound) {
+    out.push(
+      `  ${pad("skip", 8)} ${pad(u.actor, 20)} ${u.kind} actor, no thread in coord.db: owner or master enrols it before messaging=robob`,
+    );
   }
   out.push("");
   out.push("Approvals");

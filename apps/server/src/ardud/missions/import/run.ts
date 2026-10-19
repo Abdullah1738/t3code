@@ -10,9 +10,10 @@
  * against `--target` (an empty in-memory store when omitted) and prints the
  * report. Nothing is written anywhere except the report file.
  *
- * `--apply` writes core records, review pools and the router's rooms,
- * messages, subscriptions and read positions into `--target`, which must be a
- * scratch copy (never the live Robob database; the running server owns that one).
+ * `--apply` writes core records, review pools, the router's rooms, messages,
+ * subscriptions and read positions, and the coord enrolment of every
+ * thread-bound coord.db actor into `--target`, which must be a scratch copy
+ * (never the live Robob database; the running server owns that one).
  *
  * `--review-pool` plans crw's review caps as mission pools (lease: native
  * holds sized by max_reviews_per_tick; budget: crw-config sized by
@@ -21,6 +22,7 @@
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 
+import { MissionError } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -28,6 +30,8 @@ import * as Layer from "effect/Layer";
 import * as MissionService from "../MissionService.ts";
 // ardud missions: router (router tables back the import's router side)
 import { routerImportSink } from "../router/adapters.ts";
+import * as MissionRouter from "../router/MissionRouter.ts";
+import { RouterThreads } from "../router/ports.ts";
 import * as RouterStore from "../router/RouterStore.ts";
 import * as PolicyService from "../policy/PolicyService.ts";
 import * as PolicyStore from "../policy/PolicyStore.ts";
@@ -39,6 +43,7 @@ import {
 } from "../policy/ports.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { applyImport, applyPools, diffImport, diffPools } from "./apply.ts";
+import { applyEnrolments, diffEnrolments, ENROLMENT_KIND } from "./enrol.ts";
 import { buildImportPlan, type ReviewPoolKind } from "./mapping.ts";
 import { readSources } from "./readers.ts";
 import { renderReport } from "./report.ts";
@@ -91,8 +96,8 @@ const plan = buildImportPlan(readSources(paths), {
   reviewPools: reviewPools as ReadonlyArray<ReviewPoolKind>,
 });
 const target = values.target ?? ":memory:";
-// The import only creates pools, which touches none of these; they stand in
-// for the running server's threads, succession, suggestions and sampler.
+// Creating pools and enrolling coord actors touch none of these; they stand in
+// for the running server's threads, succession, suggestions, sampler and sends.
 const offlinePorts = Layer.mergeAll(
   Layer.succeed(
     PolicyThreads,
@@ -111,24 +116,41 @@ const offlinePorts = Layer.mergeAll(
         Effect.succeed({ used: 0, capacity: null, window: null, resetsAt: null, runOutAt: null }),
     }),
   ),
+  // Enrolling a coord actor reads and messages no thread.
+  Layer.succeed(
+    RouterThreads,
+    RouterThreads.of({
+      facts: () => Effect.succeed(null),
+      creator: () => Effect.succeed(null),
+      send: () =>
+        Effect.fail(
+          new MissionError({ code: "invalid", detail: "The offline import sends no messages." }),
+        ),
+    }),
+  ),
 );
 
 const program = Effect.gen(function* () {
   const router = yield* routerImportSink;
   const core = yield* diffImport(plan, router);
   const pools = yield* diffPools(plan);
-  const diff = { ...core, kinds: [...core.kinds, pools] };
+  const enrolments = yield* diffEnrolments(plan);
+  const diff = { ...core, kinds: [...core.kinds, pools, enrolments] };
   const coreApplied = values.apply ? yield* applyImport(plan, router) : undefined;
   const poolsApplied = values.apply ? yield* applyPools(plan) : undefined;
+  const enrolApplied = values.apply ? yield* applyEnrolments(plan) : undefined;
   const applied =
-    coreApplied === undefined || poolsApplied === undefined
+    coreApplied === undefined || poolsApplied === undefined || enrolApplied === undefined
       ? undefined
       : {
           ...coreApplied,
-          commits: coreApplied.commits + poolsApplied.created,
+          commits: coreApplied.commits + poolsApplied.created + enrolApplied.enrolled.length,
           created: {
             ...coreApplied.created,
             ...(poolsApplied.created > 0 ? { pool: poolsApplied.created } : {}),
+            ...(enrolApplied.enrolled.length > 0
+              ? { [ENROLMENT_KIND]: enrolApplied.enrolled.length }
+              : {}),
           },
         };
   return renderReport({
@@ -150,6 +172,7 @@ const program = Effect.gen(function* () {
 }).pipe(
   Effect.provide(
     PolicyService.layer.pipe(
+      Layer.provideMerge(MissionRouter.layer),
       Layer.provideMerge(PolicyStore.layer),
       Layer.provideMerge(MissionService.layer),
       Layer.provideMerge(offlinePorts),

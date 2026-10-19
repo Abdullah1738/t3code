@@ -97,12 +97,28 @@ export interface SourceCounts {
   readonly crwHolds: number;
 }
 
+/** A coord.db actor the import enrols as a coord member of the mission. */
+export interface CoordEnrolment {
+  readonly actor: string;
+  readonly threadId: ThreadId;
+}
+
+/**
+ * Coord actors the shim accepts for the mission. Only actors coord.db binds to
+ * a thread are enrolled; the rest are listed so the report can name them.
+ */
+export interface EnrolmentImport {
+  readonly enrol: ReadonlyArray<CoordEnrolment>;
+  readonly unbound: ReadonlyArray<{ readonly actor: string; readonly kind: string }>;
+}
+
 export interface ImportPlan {
   readonly missionId: MissionId;
   /** Snapshot time: the newest coord event or crw sync, used where a source has no time. */
   readonly asOf: string;
   readonly core: CoreImport;
   readonly router: RouterImport;
+  readonly enrolments: EnrolmentImport;
   readonly policy: PolicyImport;
   readonly counts: SourceCounts;
   readonly warnings: ReadonlyArray<string>;
@@ -296,6 +312,21 @@ export const awaitingStaleReason = (
   if (away.length > 0)
     return `ticket not with us: ${away.map((t) => `${t.id} ${t.state}`).join(", ")}`;
   return null;
+};
+
+/** Every coord.db actor bound to a thread becomes a coord member of the mission. */
+export const enrolmentsOf = (actors: ReadonlyArray<CoordActorRow>): EnrolmentImport => {
+  const byId = [...actors].sort((a, b) => a.id.localeCompare(b.id));
+  return {
+    enrol: byId.flatMap((a) =>
+      a.thread_id == null || a.thread_id.trim() === ""
+        ? []
+        : [{ actor: a.id, threadId: ThreadId.make(a.thread_id) }],
+    ),
+    unbound: byId.flatMap((a) =>
+      a.thread_id == null || a.thread_id.trim() === "" ? [{ actor: a.id, kind: a.kind }] : [],
+    ),
+  };
 };
 
 export const buildImportPlan = (sources: ImportSources, options: ImportOptions): ImportPlan => {
@@ -746,6 +777,7 @@ export const buildImportPlan = (sources: ImportSources, options: ImportOptions):
     asOf,
     core: { mission, roles, bindings, lanes, rules, workItems, approvals },
     router: { rooms, messages, subscriptions, readPositions },
+    enrolments: enrolmentsOf(coord.actors),
     policy: { pools: reviewPools },
     counts: {
       coordActors: coord.actors.length,
