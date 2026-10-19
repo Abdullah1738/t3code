@@ -27,13 +27,18 @@ import {
   LaneId,
   MissionActor,
   MissionId,
-  MissionLink,
   MissionRecordRef,
   MissionSummaryText,
   type Note,
   NoteType,
+  RecordView,
   SubMissionId,
   type Suggestion,
+  ViewFields,
+  ViewFieldValue,
+  ViewKey,
+  ViewKicker,
+  ViewTemplateId,
   WorkItem,
   WorkStage,
 } from "./missions.ts";
@@ -46,18 +51,15 @@ export const VIEW_CATALOG_VERSION = 1;
 const viewEntityId = <Brand extends string>(brand: Parameters<typeof Schema.brand<Brand>>[0]) =>
   TrimmedNonEmptyString.pipe(Schema.brand<Brand>(brand));
 
-export const ViewTemplateId = viewEntityId("ViewTemplateId");
-export type ViewTemplateId = typeof ViewTemplateId.Type;
+// Record view schemas live in missions.ts (records carry them); re-exported here.
+export { RecordView, ViewFields, ViewFieldValue, ViewKey, ViewKicker, ViewTemplateId };
 export const ViewSectionId = viewEntityId("ViewSectionId");
 export type ViewSectionId = typeof ViewSectionId.Type;
 
 /** Built-in template ids are `builtin:<kind>`. Stored templates never use the prefix. */
 export const BUILTIN_VIEW_TEMPLATE_PREFIX = "builtin:";
 
-export const ViewKey = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/));
-export type ViewKey = typeof ViewKey.Type;
 export const ViewLabel = TrimmedNonEmptyString.check(Schema.isMaxLength(60));
-export const ViewKicker = TrimmedNonEmptyString.check(Schema.isMaxLength(24));
 /** `record.<path>`, `field.<template field key>` or `row.<path>` (section lists). */
 export const ViewBind = Schema.String.check(
   Schema.isPattern(/^(record|field|row)\.[a-zA-Z][a-zA-Z0-9-]{0,39}$/),
@@ -318,27 +320,6 @@ export const ViewFieldSpec = Schema.Struct({
   choices: Schema.optionalKey(Schema.Array(ViewKicker).check(Schema.isMaxLength(8))),
 });
 export type ViewFieldSpec = typeof ViewFieldSpec.Type;
-
-export const ViewFieldValue = Schema.Union([
-  Schema.TaggedStruct("short", { value: Schema.String.check(Schema.isMaxLength(200)) }),
-  Schema.TaggedStruct("text", { value: Schema.String.check(Schema.isMaxLength(4000)) }),
-  Schema.TaggedStruct("number", { value: Schema.Finite }),
-  Schema.TaggedStruct("choice", { value: ViewKicker }),
-  Schema.TaggedStruct("flags", { value: Schema.Array(ViewKicker).check(Schema.isMaxLength(12)) }),
-  Schema.TaggedStruct("links", { value: Schema.Array(MissionLink).check(Schema.isMaxLength(12)) }),
-  Schema.TaggedStruct("refs", {
-    value: Schema.Array(MissionRecordRef).check(Schema.isMaxLength(20)),
-  }),
-]);
-export type ViewFieldValue = typeof ViewFieldValue.Type;
-export const ViewFields = Schema.Record(ViewKey, ViewFieldValue);
-export type ViewFields = typeof ViewFields.Type;
-/** What a backed record carries once records gain a `view` passthrough. */
-export const RecordView = Schema.Struct({
-  templateId: Schema.NullOr(ViewTemplateId),
-  fields: ViewFields,
-});
-export type RecordView = typeof RecordView.Type;
 
 // ---------------------------------------------------------------------------
 // Card templates

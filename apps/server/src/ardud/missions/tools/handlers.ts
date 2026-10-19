@@ -209,7 +209,10 @@ const handlers = {
           askId: input.askId,
           optionId: input.optionId ?? null,
           text: input.text,
-          inboundId: input.inboundId,
+          ...(input.inboundId === undefined ? {} : { inboundId: input.inboundId }),
+          ...(input.onOwnerCondition === undefined
+            ? {}
+            : { onOwnerCondition: input.onOwnerCondition }),
         },
         provenance,
       ),
@@ -224,7 +227,14 @@ const handlers = {
     withCaller((asks, provenance) => {
       if (input.draftId !== undefined) {
         return asks
-          .reviseDraft({ draftId: input.draftId, text: input.text }, provenance)
+          .reviseDraft(
+            {
+              draftId: input.draftId,
+              text: input.text,
+              ...(input.view === undefined ? {} : { view: input.view }),
+            },
+            provenance,
+          )
           .pipe(Effect.map((draft) => ({ draft })));
       }
       const { missionId, audience, channel, target } = input;
@@ -246,6 +256,7 @@ const handlers = {
             text: input.text,
             ...(input.subMissionId === undefined ? {} : { subMissionId: input.subMissionId }),
             ...(input.workItemId === undefined ? {} : { workItemId: input.workItemId }),
+            ...(input.view === undefined ? {} : { view: input.view }),
           },
           provenance,
         )

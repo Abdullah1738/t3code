@@ -128,7 +128,11 @@ export const askResolvedLine = (ask: Ask, released: ReadonlyArray<MissionRecordR
       ? ask.options.find((candidate) => candidate.id === ask.answer?.optionId)
       : undefined;
     const answer = [option?.label, ask.answer.text].filter((part) => part && part.length > 0);
-    return `[Mission ask ${ask.id} answered] ${ask.question} -> ${answer.join(" - ")}.${freed}`;
+    const how =
+      (ask.answer.onOwnerCondition ?? null) === null
+        ? "answered"
+        : "answered by the master on the owner's condition";
+    return `[Mission ask ${ask.id} ${how}] ${ask.question} -> ${answer.join(" - ")}.${freed}`;
   }
   return `[Mission ask ${ask.id} ${ask.status}] ${ask.question}.${freed}`;
 };

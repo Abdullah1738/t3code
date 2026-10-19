@@ -6,6 +6,7 @@ import {
   MissionLink,
   MissionRecordRef,
   OpenAskInput,
+  RecordView,
   SubMissionId,
   SuggestionTargetKind,
   TrimmedNonEmptyString,
@@ -51,6 +52,8 @@ export const SubmitDraftInput = Schema.Struct({
   subMissionId: Schema.optional(SubMissionId),
   /** The work item it is about. */
   workItemId: Schema.optional(WorkItemId),
+  /** The card template that draws it and its field values. */
+  view: Schema.optional(RecordView),
 });
 export type SubmitDraftInput = typeof SubmitDraftInput.Type;
 
@@ -58,6 +61,8 @@ export type SubmitDraftInput = typeof SubmitDraftInput.Type;
 export const ReviseDraftInput = Schema.Struct({
   draftId: DraftId,
   text: TrimmedNonEmptyString,
+  /** Replaces the card's view when given; otherwise the draft keeps its own. */
+  view: Schema.optional(RecordView),
 });
 export type ReviseDraftInput = typeof ReviseDraftInput.Type;
 
@@ -81,5 +86,6 @@ export const ProposeSuggestionInput = Schema.Struct({
   why: TrimmedNonEmptyString,
   evidence: Schema.Array(Schema.Union([MissionRecordRef, MissionLink])),
   acceptor: Schema.optional(Schema.Literals(["owner", "master"])),
+  view: Schema.optional(RecordView),
 });
 export type ProposeSuggestionInput = typeof ProposeSuggestionInput.Type;

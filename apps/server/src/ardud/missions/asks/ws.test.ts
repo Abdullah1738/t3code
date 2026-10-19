@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
+  ApprovalId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CLIENT_GUARDED_RPC_SCOPES,
@@ -17,11 +18,14 @@ import * as AsksService from "./AsksService.ts";
 import {
   agent,
   failureCode,
+  governor,
   harness,
   masterThread,
   missionId,
+  otherMissionId,
   ownerApp,
   seed,
+  seedOther,
   writerThread,
 } from "./AsksService.testkit.ts";
 import { asksWsHandlers } from "./ws.ts";
@@ -57,6 +61,8 @@ describe("asks WS RPCs", () => {
       M.subscribeDraftNotes,
       M.subscribeRouting,
       M.inboxHistory,
+      M.subscribeSuggestionStats,
+      M.subscribeMasterInbox,
     ];
     const writes = [M.routeDraft, M.setDraftNoteActive, M.annotateDraft, M.annotateApproval];
     for (const method of reads) {
@@ -138,4 +144,129 @@ describe("asks WS RPCs", () => {
       expect(off.writtenBy).toEqual({ _tag: "owner" });
     }).pipe(Effect.provide(RuleService.layer.pipe(Layer.provideMerge(layer))));
   });
+
+  it.effect(
+    "the master's queue, suggestion record and every mission's forks are real feeds",
+    () => {
+      const { layer } = harness();
+      return Effect.gen(function* () {
+        yield* seed;
+        yield* seedOther;
+        const asks = yield* AsksService.AsksService;
+        const missions = yield* MissionService.MissionService;
+        const master = agent(masterThread);
+        yield* missions.setApprovalRouting(master, {
+          missionId,
+          routes: [
+            { id: "email", match: { _tag: "draft", channel: "email" }, approver: "master" },
+            { id: "merges", match: { _tag: "approval", kind: "merge" }, approver: "master" },
+          ],
+        });
+        const approvalId = ApprovalId.make("m-1:approval:crw:acme/api#8");
+        yield* missions.openApproval(
+          { _tag: "system", component: "crw" },
+          {
+            missionId,
+            approvalId,
+            kind: "merge",
+            title: "Good to merge: acme/api#8",
+            detail: "Decide in the review thread.",
+            requestedBy: "crw",
+            links: [],
+          },
+        );
+        const draft = (channel: "email" | "linear", text: string) =>
+          asks.submitDraft(
+            { missionId, audience: "Sami", channel, target: ticket, text },
+            agent(writerThread),
+          );
+        const email = yield* draft("email", "The fix is merged.");
+        yield* draft("linear", "Merged, see CRP-1.");
+        const pool = yield* asks.proposeSuggestion(
+          {
+            missionId,
+            targetKind: "pool",
+            title: "Raise the pool",
+            after: { size: 3 },
+            diffText: "size -> 3",
+            why: "Lanes queue.",
+            evidence: [{ kind: "lane", id: "lane-api" }],
+          },
+          governor,
+        );
+        expect(pool.acceptor).toBe("master");
+        const origin = { kind: "lane" as const, id: "lane-api" };
+        const here = yield* asks.startFork({ missionId, kind: "discuss", origin }, ownerApp);
+        const there = yield* asks.startFork(
+          {
+            missionId: otherMissionId,
+            kind: "discuss",
+            origin: { kind: "lane", id: "lane-other" },
+          },
+          ownerApp,
+        );
+        const cli = yield* asksWsHandlers({ surface: "cli", session: cliIssued });
+
+        const everyFork = yield* firstItem(cli[M.subscribeForks]({ missionId: null }));
+        expect(snapshotIds(everyFork).toSorted()).toEqual([here.fork.id, there.fork.id].toSorted());
+
+        const elsewhere = yield* firstItem(
+          cli[M.subscribeMasterInbox]({ missionId: otherMissionId }),
+        );
+        expect(elsewhere?.counts).toEqual({ approve: 0, suggestions: 0 });
+
+        const row = {
+          missionId,
+          author: "governor",
+          targetKind: "pool",
+          shown: 1,
+          accepted: 0,
+          dismissed: 0,
+          applied: 0,
+          bar: "normal",
+        };
+        // The record follows decisions: one update per change.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const pull = yield* Stream.toPull(cli[M.subscribeSuggestionStats]({ missionId }));
+            const [first] = yield* pull;
+            expect(first).toEqual([row]);
+            yield* asks.decideSuggestion(
+              { suggestionId: pool.id, action: "dismiss", dismissReason: "Not now" },
+              master,
+            );
+            const [next] = yield* pull;
+            expect(next).toEqual([{ ...row, dismissed: 1 }]);
+          }),
+        );
+
+        // The master's queue holds what is routed to it, and follows decisions.
+        yield* asks.proposeSuggestion(
+          {
+            missionId,
+            targetKind: "pool",
+            title: "Raise the pool again",
+            after: { size: 4 },
+            diffText: "size -> 4",
+            why: "Lanes still queue.",
+            evidence: [{ kind: "lane", id: "lane-api" }],
+          },
+          governor,
+        );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const pull = yield* Stream.toPull(cli[M.subscribeMasterInbox]({ missionId: null }));
+            const [first] = yield* pull;
+            expect(first?.counts).toEqual({ approve: 2, suggestions: 1 });
+            expect(first?.drafts.map((record) => record.id)).toEqual([email.id]);
+            expect(first?.approvals.map((record) => record.id)).toEqual([approvalId]);
+            yield* asks.decideDraft({ draftId: email.id, action: "approve", revision: 0 }, master);
+            const [next] = yield* pull;
+            expect(next?.counts).toEqual({ approve: 1, suggestions: 1 });
+            expect(next?.drafts).toEqual([]);
+          }),
+        );
+      }).pipe(Effect.provide(RuleService.layer.pipe(Layer.provideMerge(layer))));
+    },
+  );
 });

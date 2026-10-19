@@ -12,6 +12,7 @@ import {
   type MissionLink,
   type MissionProvenance,
   type MissionRecordRef,
+  type RecordView,
   type Suggestion,
   type SuggestionAuthor,
   type SuggestionId,
@@ -46,6 +47,7 @@ export interface SuggestionProposal {
   readonly why: string;
   readonly evidence: ReadonlyArray<SuggestionEvidence>;
   readonly acceptor: SuggestionAcceptor;
+  readonly view?: RecordView;
 }
 
 /** Decided suggestions needed before an author's bar can move. */
@@ -78,39 +80,86 @@ export const barFor = (accepted: number, dismissed: number): SuggestionBar => {
 const statsKey = (author: SuggestionAuthor, targetKind: SuggestionTargetKind) =>
   `${author}|${targetKind}`;
 
+/** Whether the applier recorded that the accepted change went through. */
+export const wasApplied = (suggestion: Pick<Suggestion, "outcome">): boolean =>
+  suggestion.outcome?.startsWith("Applied") ?? false;
+
+interface StatsGroup {
+  missionId: MissionId | null;
+  author: SuggestionAuthor;
+  targetKind: SuggestionTargetKind;
+  shown: number;
+  accepted: number;
+  dismissed: number;
+  applied: number;
+}
+
+const countInto = (
+  groups: Map<string, StatsGroup>,
+  key: string,
+  suggestion: Suggestion,
+  missionId: MissionId | null,
+) => {
+  const group = groups.get(key) ?? {
+    missionId,
+    author: suggestion.author,
+    targetKind: suggestion.targetKind,
+    shown: 0,
+    accepted: 0,
+    dismissed: 0,
+    applied: 0,
+  };
+  group.shown += 1;
+  if (suggestion.status === "accepted" || suggestion.status === "edited") group.accepted += 1;
+  if (suggestion.status === "dismissed") group.dismissed += 1;
+  if (wasApplied(suggestion)) group.applied += 1;
+  groups.set(key, group);
+};
+
 /** Acceptance per author and target kind; "edited" counts as accepted. */
 export const suggestionStats = (suggestions: ReadonlyArray<Suggestion>): SuggestionStats[] => {
-  const groups = new Map<
-    string,
-    {
-      author: SuggestionAuthor;
-      targetKind: SuggestionTargetKind;
-      shown: number;
-      accepted: number;
-      dismissed: number;
-    }
-  >();
+  const groups = new Map<string, StatsGroup>();
   for (const suggestion of suggestions) {
-    const key = statsKey(suggestion.author, suggestion.targetKind);
-    const group = groups.get(key) ?? {
-      author: suggestion.author,
-      targetKind: suggestion.targetKind,
-      shown: 0,
-      accepted: 0,
-      dismissed: 0,
-    };
-    group.shown += 1;
-    if (suggestion.status === "accepted" || suggestion.status === "edited") group.accepted += 1;
-    if (suggestion.status === "dismissed") group.dismissed += 1;
-    groups.set(key, group);
+    countInto(groups, statsKey(suggestion.author, suggestion.targetKind), suggestion, null);
   }
   return [...groups.values()]
-    .map((group) => ({ ...group, bar: barFor(group.accepted, group.dismissed) }))
+    .map(({ missionId: _missionId, ...group }) => ({
+      ...group,
+      bar: barFor(group.accepted, group.dismissed),
+    }))
     .toSorted((left, right) =>
       statsKey(left.author, left.targetKind).localeCompare(
         statsKey(right.author, right.targetKind),
       ),
     );
+};
+
+/**
+ * The same record split by mission (null: global suggestions), for one
+ * mission or every mission when `missionId` is null. A row's bar is its
+ * author's bar on that target kind across every mission, the one proposals meet.
+ */
+export const missionSuggestionStats = (
+  suggestions: ReadonlyArray<Suggestion>,
+  missionId: MissionId | null,
+): SuggestionStats[] => {
+  const bars = new Map(
+    suggestionStats(suggestions).map((row) => [statsKey(row.author, row.targetKind), row.bar]),
+  );
+  const groups = new Map<string, StatsGroup>();
+  for (const suggestion of suggestions) {
+    if (missionId !== null && suggestion.missionId !== missionId) continue;
+    const key = `${suggestion.missionId ?? ""}|${statsKey(suggestion.author, suggestion.targetKind)}`;
+    countInto(groups, key, suggestion, suggestion.missionId);
+  }
+  const rowKey = (row: StatsGroup) =>
+    `${row.missionId ?? ""}|${statsKey(row.author, row.targetKind)}`;
+  return [...groups.values()]
+    .toSorted((left, right) => rowKey(left).localeCompare(rowKey(right)))
+    .map((group) => ({
+      ...group,
+      bar: bars.get(statsKey(group.author, group.targetKind)) ?? "normal",
+    }));
 };
 
 export const barOf = (
@@ -238,6 +287,7 @@ export const proposeSuggestion = (
     decidedBy: null,
     decidedAt: null,
     createdAt: command.now,
+    ...(proposal.view === undefined ? {} : { view: proposal.view }),
   };
   return ok({
     record,

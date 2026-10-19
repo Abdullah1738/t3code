@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
+  LaneId,
   PoolId,
   ProjectId,
   ScheduledTaskId,
@@ -353,6 +354,45 @@ describe("suggestion appliers", () => {
       );
       expect(global.outcome).toContain("Not applied");
       expect(global.outcome).toContain(`master of ${otherMissionId}`);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a schedule on a lane thread applies however many lanes the mission has", () => {
+    const { enabledCalls, layer } = testLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      // More recently touched lanes than one capped list page holds.
+      const later = "2026-10-17T09:00:00.000Z";
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "lane.created",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "many lanes",
+          subject: null,
+        },
+        upserts: Array.from({ length: 1001 }, (_, index) => ({
+          _tag: "lane" as const,
+          record: {
+            ...lane,
+            id: LaneId.make(`lane-extra-${index}`),
+            name: `Extra ${index}`,
+            threadId: null,
+            updatedAt: later,
+          },
+        })),
+      });
+      yield* registerSuggestionAppliers;
+      const paused = yield* acceptThrough(
+        "schedule",
+        null,
+        { taskId: "on-lane", enabled: false },
+        master,
+      );
+      expect(paused.decided.outcome).toBe("Applied: schedule Task on-lane paused.");
+      expect(enabledCalls).toEqual([{ id: "on-lane", enabled: false }]);
     }).pipe(Effect.provide(layer));
   });
 });

@@ -17,12 +17,15 @@ import {
   type MissionFeedItem,
   type MissionId,
   type MissionInboxHistoryInput,
+  type MissionMasterInbox,
   type MissionProvenance,
   type MissionRecord,
   type MissionRoutingTable,
+  type MissionScopeInput,
   type MissionStreamItem,
   type RouteDraftInput,
   type SetDraftNoteActiveInput,
+  type SuggestionStats,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -134,12 +137,19 @@ export const makeAsksWsHandlers = (
       }),
     );
 
-  const subscribeForks = (input: { readonly missionId: MissionId }) =>
+  /**
+   * Forks have no global ones: null means every mission's forks. That
+   * snapshot is the store's newest list (capped at its default limit).
+   */
+  const subscribeForks = (input: MissionScopeInput) =>
     feed(
       new Set<MissionStoreKind>(["fork"]),
-      inScope(input.missionId, false),
+      input.missionId === null ? () => true : inScope(input.missionId, false),
       Effect.map(
-        store.list("fork", { missionId: input.missionId, order: "newest" }),
+        store.list("fork", {
+          ...(input.missionId === null ? {} : { missionId: input.missionId }),
+          order: "newest",
+        }),
         tagged("fork"),
       ),
     );
@@ -189,6 +199,71 @@ export const makeAsksWsHandlers = (
         );
         return Stream.concat(Stream.make(first), updates);
       }),
+    );
+
+  /**
+   * A value recomputed once per commit that touched a record of `kinds` in
+   * scope, sent first and then only when its content (ignoring a top-level
+   * `revision`) changed.
+   */
+  const resent = <A>(
+    kinds: ReadonlySet<MissionStoreKind>,
+    missionId: MissionId | null,
+    read: Effect.Effect<A, MissionError>,
+  ): Stream.Stream<A, MissionError> =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const subscription = yield* store.subscribe;
+        const first = yield* read;
+        const contentOf = (value: A) =>
+          JSON.stringify(
+            typeof value === "object" && value !== null && !Array.isArray(value)
+              ? { ...value, revision: undefined }
+              : value,
+          );
+        const touches = (item: MissionStreamItem) =>
+          item._tag === "upsert"
+            ? kinds.has(item.record._tag as MissionStoreKind) &&
+              (missionId === null || item.missionId === missionId)
+            : item._tag === "remove" && kinds.has(item.ref.kind as MissionStoreKind);
+        const updates = Stream.fromSubscription(subscription).pipe(
+          // A commit publishes its records and then its event: re-read once, on the event.
+          Stream.mapAccum(
+            () => false,
+            (dirty, item) =>
+              item._tag === "upsert" && item.record._tag === "event"
+                ? ([false, dirty ? [item] : []] as const)
+                : ([dirty || touches(item), []] as const),
+          ),
+          Stream.mapEffect(() => read),
+          Stream.mapAccum(
+            () => contentOf(first),
+            (last, value) => {
+              const next = contentOf(value);
+              return [next, next === last ? [] : [value]] as const;
+            },
+          ),
+        );
+        return Stream.concat(Stream.make(first), updates);
+      }),
+    );
+
+  const subscribeSuggestionStats = (
+    input: MissionScopeInput,
+  ): Stream.Stream<ReadonlyArray<SuggestionStats>, MissionError> =>
+    resent(
+      new Set<MissionStoreKind>(["suggestion"]),
+      null,
+      asks.missionSuggestionStats(input.missionId),
+    );
+
+  const subscribeMasterInbox = (
+    input: MissionScopeInput,
+  ): Stream.Stream<MissionMasterInbox, MissionError> =>
+    resent(
+      new Set<MissionStoreKind>(["draft", "approval", "suggestion"]),
+      input.missionId,
+      asks.masterInbox(input.missionId),
     );
 
   const inboxHistory = (input: MissionInboxHistoryInput) =>
@@ -242,6 +317,8 @@ export const makeAsksWsHandlers = (
     ),
     [M.annotateDraft]: asOwner((input: AnnotateDraftInput, by) => asks.annotateDraft(input, by)),
     [M.annotateApproval]: asOwner(annotateApproval),
+    [M.subscribeSuggestionStats]: subscribeSuggestionStats,
+    [M.subscribeMasterInbox]: subscribeMasterInbox,
   } as const;
 };
 

@@ -2,6 +2,8 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   ApprovalId,
   EnvironmentId,
+  MissionError,
+  OwnerRequestId,
   ProviderInstanceId,
   ThreadId,
   TurnItemId,
@@ -36,6 +38,7 @@ import { MasterSecretClose } from "../core/secrets.ts";
 import * as RuleService from "../core/RuleService.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import { OwnerConditions } from "../discuss/OwnerConditions.ts";
 import * as MissionsHandlers from "./handlers.ts";
 import { MissionsToolkit } from "./tools.ts";
 
@@ -794,5 +797,65 @@ describe("mission MCP tools", () => {
       expect(client.isError).toBe(true);
       expect(answered).toHaveLength(2);
     }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("the master answers and decides for the owner by tool on a verified condition", () => {
+    const { layer } = toolsLayer();
+    const settled: Array<string> = [];
+    // Verifies request req-1 only; the router owns the real check.
+    const conditions = Layer.succeed(
+      OwnerConditions,
+      OwnerConditions.of({
+        verify: ({ condition }) =>
+          condition.requestId === OwnerRequestId.make("req-1")
+            ? Effect.void
+            : Effect.fail(new MissionError({ code: "forbidden", detail: "No such request." })),
+        settleFor: ({ subject }) => Effect.sync(() => void settled.push(subject.kind)),
+      }),
+    );
+    const onOwnerCondition = { requestId: "req-1", quote: "fine if it stays online" };
+    return Effect.gen(function* () {
+      yield* seed;
+      const master = threadCaller(masterThread);
+      const opened = yield* call("mission_ask", threadCaller(laneThread), askInput("Online?"));
+      const askId = (opened.structured.ask as { id: string }).id;
+
+      const unknown = yield* call("mission_ask_answer", master, {
+        askId,
+        optionId: "a",
+        text: "",
+        onOwnerCondition: { ...onOwnerCondition, requestId: "req-2" },
+      });
+      expect(unknown.isError).toBe(true);
+      const answered = yield* call("mission_ask_answer", master, {
+        askId,
+        optionId: "a",
+        text: "",
+        onOwnerCondition,
+      });
+      expect(answered.isError).toBe(false);
+      expect(answered.structured.ask).toMatchObject({
+        status: "answered",
+        answer: { onOwnerCondition, provenance: { _tag: "agent", threadId: masterThread } },
+      });
+
+      const submitted = yield* call("mission_draft", threadCaller(writerThread), {
+        missionId,
+        audience: "Sam",
+        channel: "cliq",
+        target: { kind: "url", label: "Cliq DM", url: null, ref: "sam" },
+        text: "Deploy is done.",
+      });
+      const draftId = (submitted.structured.draft as { id: string }).id;
+      const decided = yield* call("mission_draft_approve", master, {
+        draftId,
+        action: "approve",
+        revision: 0,
+        onOwnerCondition,
+      });
+      expect(decided.isError).toBe(false);
+      expect(decided.structured.draft).toMatchObject({ status: "approved", onOwnerCondition });
+      expect(settled).toEqual(["ask", "draft"]);
+    }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(conditions))));
   });
 });

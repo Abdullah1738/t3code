@@ -16,10 +16,12 @@ import {
   type MissionProvenance,
   type MissionRecordRef,
   type OpenAskInput,
+  type OwnerCondition,
 } from "@t3tools/contracts";
 import * as Result from "effect/Result";
 
 import {
+  actorOf,
   callerActsAs,
   callerIsOwner,
   clipSummary,
@@ -28,6 +30,7 @@ import {
   ok,
   recordKey,
   refuse,
+  spendCondition,
   type MissionCaller,
   type Outcome,
   type Transition,
@@ -228,6 +231,7 @@ export const openAsk = (command: OpenAskCommand): Outcome<Transition<Ask>> => {
     answer: null,
     createdAt: command.now,
     updatedAt: command.now,
+    ...(input.view === undefined ? {} : { view: input.view }),
   };
   return ok({
     record,
@@ -257,6 +261,13 @@ export interface AnswerAskCommand {
   readonly provenance: MissionProvenance;
   /** Every ask in the mission, to work out which holds the answer releases. */
   readonly asks: ReadonlyArray<Ask>;
+  /**
+   * Discuss: the master answers on a condition the owner stated about this ask.
+   * The caller has verified it against the owner's request already.
+   */
+  readonly onOwnerCondition?: OwnerCondition;
+  /** The caller is the ask mission's master. */
+  readonly callerIsMaster?: boolean;
   readonly now: string;
 }
 
@@ -270,7 +281,15 @@ const optionLabel = (ask: Ask, optionId: string | null): string | null =>
 
 export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => {
   const { ask, input, provenance } = command;
-  if (!isOwnerProvenance(provenance)) {
+  const condition = command.onOwnerCondition ?? null;
+  if (condition !== null) {
+    if (isOwnerProvenance(provenance)) {
+      return refuse("invalid", "The owner answers directly; owner conditions are for the master.");
+    }
+    if (command.callerIsMaster !== true) {
+      return refuse("forbidden", `Only the mission's master answers ask ${ask.id} for the owner.`);
+    }
+  } else if (!isOwnerProvenance(provenance)) {
     return refuse("provenance-required", "Only the owner answers asks.");
   }
   if (provenance._tag === "owner-imessage" && provenance.inboundId !== input.inboundId) {
@@ -284,6 +303,12 @@ export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => 
       `iMessage ${provenance.inboundId} answered ask ${ask.id} before it was reopened; it does not answer it again.`,
     );
   }
+  if (condition !== null && (ask.spentConditionIds ?? []).includes(condition.requestId)) {
+    return refuse(
+      "provenance-invalid",
+      `Owner request ${condition.requestId} answered ask ${ask.id} before it was reopened; it does not answer it again. Ask the owner in a new discussion.`,
+    );
+  }
   const text = input.text.trim();
   if (input.optionId !== null && optionLabel(ask, input.optionId) === null) {
     return refuse("invalid", `Option ${input.optionId} is not one of the ask's options.`);
@@ -294,7 +319,13 @@ export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => 
   const record: Ask = {
     ...ask,
     status: "answered",
-    answer: { optionId: input.optionId, text, provenance, answeredAt: command.now },
+    answer: {
+      optionId: input.optionId,
+      text,
+      provenance,
+      answeredAt: command.now,
+      ...(condition === null ? {} : { onOwnerCondition: condition }),
+    },
     updatedAt: command.now,
   };
   const released = releasedBy(ask, command.asks);
@@ -305,10 +336,11 @@ export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => 
     events: [
       {
         kind: "ask.answered",
-        actor: { _tag: "owner" },
+        // On a condition the master answers under its own role, never as the owner.
+        actor: condition === null ? { _tag: "owner" } : actorOf(provenance),
         provenance,
         summary: clipSummary(
-          `Answered ${ask.question}: ${[label, text].filter((part) => part && part.length > 0).join(" - ")}`,
+          `${condition === null ? "Answered" : "Answered on the owner's condition"} ${ask.question}: ${[label, text].filter((part) => part && part.length > 0).join(" - ")}`,
         ),
         subject: askRef(ask),
         payload: {
@@ -316,6 +348,7 @@ export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => 
           text,
           followedRecommendation: followedRecommendation(ask, input.optionId),
           released,
+          ...(condition === null ? {} : { onOwnerCondition: condition }),
         },
       },
     ],
@@ -332,14 +365,20 @@ export interface WithdrawAskCommand {
   readonly caller: MissionCaller;
   readonly reason: string;
   readonly asks: ReadonlyArray<Ask>;
+  /** The caller is the ask mission's master. */
+  readonly callerIsMaster?: boolean;
   readonly now: string;
 }
 
-/** The asker (or the owner) takes an open ask back; its holds lift. */
+/** The asker, the mission's master or the owner takes an open ask back; its holds lift. */
 export const withdrawAsk = (command: WithdrawAskCommand): Outcome<AskResolution> => {
   const { ask, caller } = command;
-  if (!callerIsOwner(caller) && !callerActsAs(caller, ask.askedBy)) {
-    return refuse("forbidden", "Only the asker or the owner withdraws an ask.");
+  const asAsker = callerActsAs(caller, ask.askedBy);
+  if (!callerIsOwner(caller) && !asAsker && command.callerIsMaster !== true) {
+    return refuse(
+      "forbidden",
+      "Only the asker, the mission's master or the owner withdraws an ask.",
+    );
   }
   if (ask.status !== "open") return refuse("conflict", `Ask ${ask.id} is ${ask.status}.`);
   const record: Ask = { ...ask, status: "withdrawn", updatedAt: command.now };
@@ -350,7 +389,11 @@ export const withdrawAsk = (command: WithdrawAskCommand): Outcome<AskResolution>
     events: [
       {
         kind: "ask.withdrawn",
-        actor: callerIsOwner(caller) ? { _tag: "owner" } : ask.askedBy,
+        actor: callerIsOwner(caller)
+          ? { _tag: "owner" }
+          : asAsker
+            ? ask.askedBy
+            : actorOf(caller.provenance),
         provenance: caller.provenance,
         summary: clipSummary(`Withdrawn: ${ask.question}`),
         subject: askRef(ask),
@@ -363,6 +406,8 @@ export const withdrawAsk = (command: WithdrawAskCommand): Outcome<AskResolution>
 export interface SupersedeAskCommand {
   readonly ask: Ask;
   readonly replacement: OpenAskCommand;
+  /** The caller is the ask mission's master: it may revise any open ask in the mission. */
+  readonly callerIsMaster?: boolean;
 }
 
 export interface Supersession {
@@ -371,13 +416,16 @@ export interface Supersession {
 }
 
 /**
- * The asker rewrites an open ask. The old one is marked superseded and the new
- * one inherits everything it held, so nothing is released in between.
+ * The asker (or the mission's master) rewrites an open ask. The old one is
+ * marked superseded and the new one inherits everything it held, so nothing is
+ * released in between. A master's revision keeps the original asker, so its
+ * answer still reaches the thread that asked.
  */
 export const supersedeAsk = (command: SupersedeAskCommand): Outcome<Supersession> => {
   const { ask, replacement } = command;
-  if (!callerActsAs(replacement.caller, ask.askedBy)) {
-    return refuse("forbidden", "Only the asker supersedes an ask.");
+  const asAsker = callerActsAs(replacement.caller, ask.askedBy);
+  if (!asAsker && command.callerIsMaster !== true) {
+    return refuse("forbidden", "Only the asker or the mission's master supersedes an ask.");
   }
   if (ask.status !== "open") return refuse("conflict", `Ask ${ask.id} is ${ask.status}.`);
   if (replacement.input.missionId !== ask.missionId) {
@@ -385,19 +433,30 @@ export const supersedeAsk = (command: SupersedeAskCommand): Outcome<Supersession
   }
   const opened = openAsk({
     ...replacement,
+    // The master revises in the asker's name; the asker keeps its ask.
+    ...(asAsker
+      ? {}
+      : {
+          askedBy: ask.askedBy,
+          caller: {
+            ...replacement.caller,
+            actors: [...replacement.caller.actors, ask.askedBy],
+          },
+        }),
     input: { ...replacement.input, blocks: [...ask.blocks, ...replacement.input.blocks] },
     existing: replacement.existing.filter((existing) => existing.id !== ask.id),
   });
   if (Result.isFailure(opened)) return Result.fail(opened.failure);
   const now = replacement.now;
   const superseded: Ask = { ...ask, status: "superseded", updatedAt: now };
+  const actor = asAsker ? ask.askedBy : actorOf(replacement.caller.provenance);
   return ok({
     superseded: {
       record: superseded,
       events: [
         {
           kind: "ask.superseded",
-          actor: ask.askedBy,
+          actor,
           provenance: replacement.caller.provenance,
           summary: clipSummary(`Superseded by ${replacement.id}: ${ask.question}`),
           subject: askRef(ask),
@@ -409,6 +468,7 @@ export const supersedeAsk = (command: SupersedeAskCommand): Outcome<Supersession
       record: opened.success.record,
       events: opened.success.events.map((event) => ({
         ...event,
+        ...(asAsker ? {} : { actor }),
         payload: { ...(event.payload as object), supersedes: ask.id },
       })),
     },
@@ -449,8 +509,8 @@ const spentInbounds = (ask: Pick<Ask, "spentInboundIds">): ReadonlyArray<string>
 
 /**
  * The owner takes an answer back; the ask holds its records again. A new
- * epoch starts, and the iMessage that gave the old answer is spent for this
- * ask, so relaying it again cannot answer the reopened ask.
+ * epoch starts, and the iMessage or owner condition that gave the old answer
+ * is spent for this ask, so relaying it again cannot answer the reopened ask.
  */
 export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> => {
   const { ask, provenance } = command;
@@ -463,6 +523,7 @@ export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> =
     evidence?._tag === "owner-imessage" && !spentInbounds(ask).includes(evidence.inboundId)
       ? [...spentInbounds(ask), evidence.inboundId]
       : spentInbounds(ask);
+  const condition = ask.answer?.onOwnerCondition ?? null;
   const record: Ask = {
     ...ask,
     status: "open",
@@ -471,6 +532,9 @@ export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> =
     revision: askRevisionOf(ask) + 1,
     revisedAt: command.now,
     spentInboundIds: spent,
+    ...(condition === null
+      ? {}
+      : { spentConditionIds: spendCondition(ask.spentConditionIds, condition.requestId) }),
   };
   return ok({
     record,

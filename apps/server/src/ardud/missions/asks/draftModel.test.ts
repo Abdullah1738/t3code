@@ -218,9 +218,16 @@ describe("drafts", () => {
     });
     expect(Result.isFailure(strangerRevision)).toBe(true);
     const revised = Result.getOrThrow(
-      reviseDraft({ draft: rewrite.record, text: "Merged in #12.", caller: writer, notes, now }),
+      reviseDraft({
+        draft: rewrite.record,
+        text: "Merged in #12.",
+        caller: writer,
+        notes,
+        now,
+      }),
     );
     expect(revised.record.status).toBe("pending");
+    expect(revised.record.previousText).toBe(rewrite.record.text);
     const approved = approveEdited(revised.record, "Merged in #12.", now).record;
     expect(approved.approvedText).toBeNull();
     const reopened = Result.getOrThrow(reopenDraft(approved, ownerApp, false, now));

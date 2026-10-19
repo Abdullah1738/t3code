@@ -244,6 +244,41 @@ export const MissionLink = Schema.Struct({
 });
 export type MissionLink = typeof MissionLink.Type;
 
+// --- asks additions ---
+/*
+ * The `view` passthrough a record carries for generative views: which card
+ * template drew it and the template field values the writer filled in. The
+ * schemas live here, not in missionsViews.ts, because the records below carry
+ * them and missionsViews.ts imports the records; missionsViews.ts re-exports
+ * them.
+ */
+export const ViewTemplateId = TrimmedNonEmptyString.pipe(Schema.brand("ViewTemplateId"));
+export type ViewTemplateId = typeof ViewTemplateId.Type;
+export const ViewKey = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/));
+export type ViewKey = typeof ViewKey.Type;
+export const ViewKicker = TrimmedNonEmptyString.check(Schema.isMaxLength(24));
+export const ViewFieldValue = Schema.Union([
+  Schema.TaggedStruct("short", { value: Schema.String.check(Schema.isMaxLength(200)) }),
+  Schema.TaggedStruct("text", { value: Schema.String.check(Schema.isMaxLength(4000)) }),
+  Schema.TaggedStruct("number", { value: Schema.Finite }),
+  Schema.TaggedStruct("choice", { value: ViewKicker }),
+  Schema.TaggedStruct("flags", { value: Schema.Array(ViewKicker).check(Schema.isMaxLength(12)) }),
+  Schema.TaggedStruct("links", { value: Schema.Array(MissionLink).check(Schema.isMaxLength(12)) }),
+  Schema.TaggedStruct("refs", {
+    value: Schema.Array(MissionRecordRef).check(Schema.isMaxLength(20)),
+  }),
+]);
+export type ViewFieldValue = typeof ViewFieldValue.Type;
+export const ViewFields = Schema.Record(ViewKey, ViewFieldValue);
+export type ViewFields = typeof ViewFields.Type;
+/** What a backed record carries: the template that draws it and its field values. */
+export const RecordView = Schema.Struct({
+  templateId: Schema.NullOr(ViewTemplateId),
+  fields: ViewFields,
+});
+export type RecordView = typeof RecordView.Type;
+// --- end asks additions ---
+
 export const PullRequestKey = Schema.Struct({
   repository: TrimmedNonEmptyString,
   number: PositiveInt,
@@ -632,6 +667,10 @@ export const Knock = Schema.Struct({
   forwardedTo: Schema.NullOr(MissionActor),
   decidedAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
+  // --- asks additions ---
+  /** Generative views: the card template that draws it and its field values. */
+  view: Schema.optional(RecordView),
+  // --- end asks additions ---
   // --- router additions ---
   /** The member thread the sender tried to reach. */
   targetThreadId: Schema.optional(ThreadId),
@@ -702,6 +741,10 @@ export const Ask = Schema.Struct({
   revisedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   /** iMessages that answered an earlier epoch; they never answer this ask again. */
   spentInboundIds: Schema.optional(Schema.Array(Schema.String)),
+  /** Generative views: the card template that draws it and its field values. */
+  view: Schema.optional(RecordView),
+  /** Owner requests whose condition answered an earlier epoch; they never answer this ask again. */
+  spentConditionIds: Schema.optional(Schema.Array(OwnerRequestId)),
   // --- end asks additions ---
 });
 export type Ask = typeof Ask.Type;
@@ -777,6 +820,10 @@ export const Note = Schema.Struct({
   replacesNoteId: Schema.NullOr(NoteId),
   ackedBy: Schema.Array(MissionActor),
   createdAt: IsoDateTime,
+  // --- asks additions ---
+  /** Generative views: the card template that draws it and its field values. */
+  view: Schema.optional(RecordView),
+  // --- end asks additions ---
 });
 export type Note = typeof Note.Type;
 
@@ -914,6 +961,10 @@ export const Suggestion = Schema.Struct({
   decidedBy: Schema.NullOr(MissionProvenance),
   decidedAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
+  // --- asks additions ---
+  /** Generative views: the card template that draws it and its field values. */
+  view: Schema.optional(RecordView),
+  // --- end asks additions ---
 });
 export type Suggestion = typeof Suggestion.Type;
 
@@ -925,6 +976,12 @@ export const SuggestionStats = Schema.Struct({
   dismissed: NonNegativeInt,
   /** Raised when most are dismissed; fewer get shown. */
   bar: Schema.Literals(["normal", "raised", "high"]),
+  // --- asks additions ---
+  /** Accepted ones whose change went through. */
+  applied: Schema.optional(NonNegativeInt),
+  /** Set on a mission's rows; absent on rows across every mission. */
+  missionId: Schema.optional(Schema.NullOr(MissionId)),
+  // --- end asks additions ---
 });
 export type SuggestionStats = typeof SuggestionStats.Type;
 
@@ -1012,6 +1069,12 @@ export const Draft = Schema.Struct({
   subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
   /** The work item it is about; routing rows can match it. Missing means none. */
   workItemId: Schema.optional(Schema.NullOr(WorkItemId)),
+  /** Generative views: the card template that draws it and its field values. */
+  view: Schema.optional(RecordView),
+  /** The text this one replaced when it was last revised. */
+  previousText: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Owner requests whose condition decided an earlier epoch; they never decide this draft again. */
+  spentConditionIds: Schema.optional(Schema.Array(OwnerRequestId)),
   // --- end asks additions ---
 });
 export type Draft = typeof Draft.Type;
@@ -1083,6 +1146,8 @@ export const Approval = Schema.Struct({
   summary: Schema.optional(Schema.NullOr(Schema.String)),
   /** Free short labels shown as chips (e.g. "authorization risk"); no fixed list. */
   flags: Schema.optional(Schema.Array(Schema.String)),
+  /** Generative views: the card template that draws it and its field values. */
+  view: Schema.optional(RecordView),
   // --- end asks additions ---
 });
 export type Approval = typeof Approval.Type;
@@ -1478,6 +1543,10 @@ export const WorkItem = Schema.Struct({
   /** Set for deferred items; `stage` stays where the work was parked. */
   deferral: Schema.optional(WorkItemDeferral),
   // --- end coord additions ---
+  // --- asks additions ---
+  /** Generative views: the card template that draws it and its field values. */
+  view: Schema.optional(RecordView),
+  // --- end asks additions ---
 });
 export type WorkItem = typeof WorkItem.Type;
 
@@ -2133,6 +2202,10 @@ export const AnswerAskInput = Schema.Struct({
   text: Schema.String,
   /** iMessage path only: the spectrum inbound id the server must verify. */
   inboundId: Schema.optional(TrimmedNonEmptyString),
+  // --- asks additions ---
+  /** The master answers for the owner: the owner request whose stated condition this meets. */
+  onOwnerCondition: Schema.optional(OwnerCondition),
+  // --- end asks additions ---
 });
 export type AnswerAskInput = typeof AnswerAskInput.Type;
 
@@ -2148,6 +2221,9 @@ export const OpenAskInput = Schema.Struct({
   blocks: Schema.Array(MissionRecordRef),
   costOfWaiting: Schema.String,
   urgency: Schema.optional(Schema.Literals(["normal", "p0"])),
+  // --- asks additions ---
+  view: Schema.optional(RecordView),
+  // --- end asks additions ---
 });
 export type OpenAskInput = typeof OpenAskInput.Type;
 
@@ -2161,6 +2237,8 @@ export const DecideDraftInput = Schema.Struct({
   // --- asks additions ---
   /** The draft revision the decider saw; a decision for an older revision is refused. */
   revision: Schema.optional(NonNegativeInt),
+  /** The master decides an owner-routed draft: the owner request whose stated condition this meets. */
+  onOwnerCondition: Schema.optional(OwnerCondition),
   // --- end asks additions ---
 });
 export type DecideDraftInput = typeof DecideDraftInput.Type;
@@ -2537,6 +2615,9 @@ export const UpsertWorkItemInput = Schema.Struct({
   pullRequest: Schema.optional(Schema.NullOr(PullRequestKey)),
   links: Schema.optional(Schema.Array(MissionLink)),
   facts: Schema.optional(WorkItem.fields.facts),
+  // --- asks additions ---
+  view: Schema.optional(RecordView),
+  // --- end asks additions ---
 });
 export type UpsertWorkItemInput = typeof UpsertWorkItemInput.Type;
 
@@ -2832,6 +2913,7 @@ export const OpenApprovalInput = Schema.Struct({
   // --- asks additions ---
   summary: Schema.optional(Schema.NullOr(Schema.String)),
   flags: Schema.optional(Schema.Array(Schema.String)),
+  view: Schema.optional(RecordView),
   // --- end asks additions ---
 });
 export type OpenApprovalInput = typeof OpenApprovalInput.Type;
@@ -3076,6 +3158,7 @@ export const OpenSystemDraftInput = Schema.Struct({
   text: TrimmedNonEmptyString,
   summary: Schema.optional(Schema.NullOr(Schema.String)),
   flags: Schema.optional(Schema.Array(Schema.String)),
+  view: Schema.optional(RecordView),
 });
 export type OpenSystemDraftInput = typeof OpenSystemDraftInput.Type;
 
@@ -3125,6 +3208,29 @@ export const ReportDraftSentInput = Schema.Struct({
   outcome: DraftSendOutcome,
 });
 export type ReportDraftSentInput = typeof ReportDraftSentInput.Type;
+
+/** One mission, or every mission when null. */
+export const MissionScopeInput = Schema.Struct({
+  missionId: Schema.NullOr(MissionId),
+});
+export type MissionScopeInput = typeof MissionScopeInput.Type;
+
+/**
+ * What waits on the master rather than the owner: pending drafts and
+ * approvals routed to the master and open suggestions the master accepts.
+ * Counts are complete; lists are newest first and capped.
+ */
+export const MissionMasterInbox = Schema.Struct({
+  revision: NonNegativeInt,
+  counts: Schema.Struct({
+    approve: NonNegativeInt,
+    suggestions: NonNegativeInt,
+  }),
+  drafts: Schema.Array(Draft),
+  approvals: Schema.Array(Approval),
+  suggestions: Schema.Array(Suggestion),
+});
+export type MissionMasterInbox = typeof MissionMasterInbox.Type;
 
 // --- end asks additions ---
 

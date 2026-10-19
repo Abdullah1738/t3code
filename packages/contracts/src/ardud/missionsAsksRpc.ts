@@ -28,9 +28,12 @@ import {
   MissionId,
   MissionInboxHistory,
   MissionInboxHistoryInput,
+  MissionMasterInbox,
   MissionRoutingTable,
+  MissionScopeInput,
   RouteDraftInput,
   SetDraftNoteActiveInput,
+  SuggestionStats,
 } from "./missions.ts";
 
 export const MISSIONS_ASKS_WS_METHODS = {
@@ -43,6 +46,8 @@ export const MISSIONS_ASKS_WS_METHODS = {
   setDraftNoteActive: "missions.asks.setDraftNoteActive",
   annotateDraft: "missions.asks.annotateDraft",
   annotateApproval: "missions.asks.annotateApproval",
+  subscribeSuggestionStats: "missions.asks.subscribeSuggestionStats",
+  subscribeMasterInbox: "missions.asks.subscribeMasterInbox",
 } as const;
 
 type AsksMethod = (typeof MISSIONS_ASKS_WS_METHODS)[keyof typeof MISSIONS_ASKS_WS_METHODS];
@@ -66,8 +71,11 @@ const M = MISSIONS_ASKS_WS_METHODS;
 export const MissionsAsksRpcs = RpcGroup.make(
   /** Rules and rule change requests: the mission's plus global (null: global only). */
   feed(M.subscribeRules, MissionFeedInput, MissionFeedItem),
-  /** One mission's forks, newest first in the snapshot; each carries its question. */
-  feed(M.subscribeForks, Schema.Struct({ missionId: MissionId }), MissionFeedItem),
+  /**
+   * One mission's forks (null: every mission's), newest first in the
+   * snapshot; each carries its question.
+   */
+  feed(M.subscribeForks, MissionScopeInput, MissionFeedItem),
   /** Draft notes, active and turned off: the mission's plus global (null: global only). */
   feed(M.subscribeDraftNotes, MissionFeedInput, MissionFeedItem),
   /** The mission's approval routing table, resent when it changes. */
@@ -78,6 +86,13 @@ export const MissionsAsksRpcs = RpcGroup.make(
   /** Summary and flag chips on a pending draft or approval. */
   call(M.annotateDraft, AnnotateDraftInput, Draft),
   call(M.annotateApproval, AnnotateApprovalInput, Approval),
+  /**
+   * Suggestion record per source and target kind, with applied counts: one
+   * mission's rows, or rows across every mission when null. Resent when it changes.
+   */
+  feed(M.subscribeSuggestionStats, MissionScopeInput, Schema.Array(SuggestionStats)),
+  /** What waits on the master (one mission, or every mission when null); resent when it changes. */
+  feed(M.subscribeMasterInbox, MissionScopeInput, MissionMasterInbox),
 );
 
 /** Reads: any client allowed to read orchestration state. */
@@ -87,6 +102,8 @@ export const MISSIONS_ASKS_READ_SCOPES = {
   [M.subscribeDraftNotes]: AuthOrchestrationReadScope,
   [M.subscribeRouting]: AuthOrchestrationReadScope,
   [M.inboxHistory]: AuthOrchestrationReadScope,
+  [M.subscribeSuggestionStats]: AuthOrchestrationReadScope,
+  [M.subscribeMasterInbox]: AuthOrchestrationReadScope,
 } as const;
 
 /** Writes: guarded on the client too (see `CLIENT_GUARDED_RPC_SCOPES`). */

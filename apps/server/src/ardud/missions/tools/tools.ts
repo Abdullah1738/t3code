@@ -18,10 +18,12 @@ import {
   MissionRecordRef,
   MissionMutationResult,
   NonNegativeInt,
+  OwnerCondition,
   NoteId,
   OrchestratorMcpFailure,
   PostMessageInput,
   RecordRuleUseInput,
+  RecordView,
   ReopenDraftInput,
   ReopenSuggestionInput,
   ReorderSubMissionsInput,
@@ -164,7 +166,7 @@ const MissionWatchTool = Tool.make("mission_watch", {
 
 const MissionAskTool = Tool.make("mission_ask", {
   description:
-    "Ask the owner a decision only he can make. Name exactly what it blocks (work items, lanes, drafts...): only those wait, everything else continues. There is no default, deadline or 'unless you say otherwise': the ask waits for his answer. Give options, a recommendation with its reason, and the cost of waiting. Pass supersedes to replace one of your open asks.",
+    "Ask the owner a decision only he can make. Name exactly what it blocks (work items, lanes, drafts...): only those wait, everything else continues. There is no default, deadline or 'unless you say otherwise': the ask waits for his answer. Give options, a recommendation with its reason, and the cost of waiting. Pass supersedes to replace one of your open asks; the mission's master may replace any open ask in its mission, and the asker keeps it.",
   parameters: OpenAskRequest,
   success: Schema.Struct({ ask: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
@@ -173,7 +175,8 @@ const MissionAskTool = Tool.make("mission_ask", {
 });
 
 const MissionAskWithdrawTool = Tool.make("mission_ask_withdraw", {
-  description: "Withdraw one of your open asks (no longer needed). Releases what it held.",
+  description:
+    "Withdraw an open ask that is no longer needed: one of yours, or as the mission's master any ask in it. Releases what it held. To change the question instead, open a new one with supersedes (the master may supersede any open ask in its mission; the asker keeps it).",
   parameters: WithdrawAskInput,
   success: Schema.Struct({ ask: Schema.Unknown, released: Records }),
   failure: OrchestratorMcpFailure,
@@ -183,12 +186,13 @@ const MissionAskWithdrawTool = Tool.make("mission_ask_withdraw", {
 
 const MissionAskAnswerTool = Tool.make("mission_ask_answer", {
   description:
-    "Record the owner's answer that arrived by iMessage. inboundId must be the incoming iMessage id from the owner's or Moni's chat, and that message must contain the answer text (or the chosen option); anything else is refused. Agents can never answer asks themselves.",
+    "Record the owner's answer to an ask. Either pass inboundId, the incoming iMessage id from the owner's or Moni's chat whose text contains the answer (or the chosen option), or, as the mission's master only, pass onOwnerCondition: the owner request about this ask and his exact words stating the condition your answer meets. The answer is then recorded as yours on his condition. Anything else is refused; agents never answer asks on their own.",
   parameters: Schema.Struct({
     askId: AskId,
     optionId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     text: Schema.String,
-    inboundId: TrimmedNonEmptyString,
+    inboundId: Schema.optional(TrimmedNonEmptyString),
+    onOwnerCondition: Schema.optional(OwnerCondition),
   }),
   success: Schema.Struct({ ask: Schema.Unknown, released: Records }),
   failure: OrchestratorMcpFailure,
@@ -208,7 +212,7 @@ const MissionCallTool = Tool.make("mission_call", {
 
 const MissionDraftTool = Tool.make("mission_draft", {
   description:
-    "Submit outward text (Linear, GitHub, Cliq, iMessage, WhatsApp, email) as a draft for its approver (the routing table picks owner or master); nothing is sent. Load mission_drafts guideFor first. Pass workItemId and/or subMissionId when the text is about one, so routing rows for it apply (the sub-mission defaults to the work item's, then your lane's). Refused when your role does not write public text: hand the text to a writer role. To answer a rewrite request pass draftId and the new text.",
+    "Submit outward text (Linear, GitHub, Cliq, iMessage, WhatsApp, email) as a draft for its approver (the routing table picks owner or master); nothing is sent. Load mission_drafts guideFor first. Pass workItemId and/or subMissionId when the text is about one, so routing rows for it apply (the sub-mission defaults to the work item's, then your lane's). Refused when your role does not write public text: hand the text to a writer role. To answer a rewrite request pass draftId and the new text; the mission's master may revise any draft in its mission this way, and the draft keeps the text it replaced as previousText.",
   parameters: Schema.Struct({
     draftId: Schema.optional(DraftId),
     missionId: Schema.optional(MissionId),
@@ -218,6 +222,7 @@ const MissionDraftTool = Tool.make("mission_draft", {
     text: TrimmedNonEmptyString,
     subMissionId: Schema.optional(SubMissionId),
     workItemId: Schema.optional(WorkItemId),
+    view: Schema.optional(RecordView),
   }),
   success: Schema.Struct({ draft: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
@@ -227,7 +232,7 @@ const MissionDraftTool = Tool.make("mission_draft", {
 
 const MissionDraftApproveTool = Tool.make("mission_draft_approve", {
   description:
-    "Decide a draft: approve (optionally with edited text), rewrite with a note, or drop. For the owner's decision that arrived by iMessage pass inboundId (his or Moni's incoming iMessage containing it). Without inboundId you decide as the mission's master, which works only for drafts routed to the master. Approval records the draft as approved; sending is separate.",
+    "Decide a draft: approve (optionally with edited text), rewrite with a note, or drop. For the owner's decision that arrived by iMessage pass inboundId (his or Moni's incoming iMessage containing it). Without inboundId you decide as the mission's master, which works for drafts routed to the master, or for one routed to the owner when you pass onOwnerCondition: the owner request about this draft and his exact words stating the condition your decision meets. Approval records the draft as approved; sending is separate.",
   parameters: Schema.Struct({
     draftId: DraftId,
     action: Schema.Literals(["approve", "rewrite", "drop"]),
@@ -238,6 +243,7 @@ const MissionDraftApproveTool = Tool.make("mission_draft_approve", {
       description:
         "The draft revision you read (its `revision` field, 0 when missing). Required to approve without an inboundId; a draft revised or reopened since then is refused, so you decide the text it says now.",
     }),
+    onOwnerCondition: Schema.optional(OwnerCondition),
   }),
   success: Schema.Struct({ draft: Schema.Unknown, suggestions: Records }),
   failure: OrchestratorMcpFailure,
