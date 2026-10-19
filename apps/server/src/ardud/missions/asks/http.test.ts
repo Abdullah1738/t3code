@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AuthSessionId, DraftId } from "@t3tools/contracts";
+import { ApprovalId, AuthSessionId, DraftId } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -10,6 +10,7 @@ import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
+import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
@@ -85,7 +86,9 @@ type Handler = (request: Request) => Promise<Response>;
 /** Serves the desk routes over the test's own AsksService instance. */
 const withDesk = <A>(use: (handler: Handler) => Promise<A>) =>
   Effect.gen(function* () {
-    const context = yield* Effect.context<AsksService.AsksService | MissionStore.MissionStore>();
+    const context = yield* Effect.context<
+      AsksService.AsksService | MissionService.MissionService | MissionStore.MissionStore
+    >();
     const routes = missionsDeskRouteLayer.pipe(
       Layer.provide(
         Layer.mergeAll(
@@ -236,6 +239,134 @@ describe("missions desk HTTP", () => {
         chat: "moni",
         quote: "the sara one is fine",
       });
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("gives his iMessage agent the owner's full view and his approvals and calls", () => {
+    const inbox: Array<InboundMessage> = [];
+    const { layer } = harness(inbox);
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const missions = yield* MissionService.MissionService;
+      const approvalId = ApprovalId.make("approval-merge-8");
+      yield* missions.openApproval(
+        { _tag: "system", component: "crw" },
+        {
+          missionId,
+          approvalId,
+          kind: "merge",
+          title: "Good to merge: acme/api#8",
+          detail: "Decide in the review thread.",
+          requestedBy: "crw",
+          links: [],
+        },
+      );
+      const call = yield* asks.makeCall(
+        {
+          missionId,
+          title: "Postgres over SQLite",
+          decision: "Use Postgres for the ledger.",
+          reason: "Concurrent writers.",
+        },
+        agent(masterThread),
+      );
+      const draft = yield* asks.submitDraft(
+        {
+          missionId,
+          audience: "Sara",
+          channel: "linear",
+          target: { kind: "file", label: "Mobile designs", url: null, ref: "designs/mobile.png" },
+          text: "New mobile designs attached.",
+        },
+        agent(writerThread),
+      );
+      inbox.push(typedInbound("spc-msg-7", "approve both of those", LATER));
+
+      const result = yield* withDesk(async (handle) => {
+        const get = async (path: string, token: keyof typeof SCOPES = "Bearer cli") =>
+          body(await handle(request(path, token)));
+        const view = {
+          needs: await get(`/needs?mission=${missionId}`),
+          approvals: await get(`/approvals?mission=${missionId}`),
+          calls: await get(`/calls?mission=${missionId}`),
+          draft: await get(`/drafts/${draft.id}`, "Bearer imessage"),
+          work: await get(`/work?mission=${missionId}&stage=ticket,pr&limit=1`),
+          timeline: await get(`/timeline?mission=${missionId}&limit=2`),
+          progress: await get(`/progress?mission=${missionId}`),
+          badStage: await get(`/work?mission=${missionId}&stage=shipped`),
+        };
+        // Other tokens keep the narrower reads.
+        const narrow = {
+          telegram: await get(`/needs?mission=${missionId}`, "Bearer telegram"),
+          control: await get(`/drafts/${draft.id}`, "Bearer read"),
+          crw: await get(`/progress?mission=${missionId}`, "Bearer crw-read"),
+        };
+        const decide = (token: keyof typeof SCOPES, inboundId: string) =>
+          handle(
+            request(`/approvals/${approvalId}/decide`, token, {
+              action: "approve",
+              inboundId,
+            }),
+          );
+        const react = (token: keyof typeof SCOPES, reaction: string) =>
+          handle(request(`/calls/${call.id}/react`, token, { reaction, inboundId: "spc-msg-7" }));
+        const actions = {
+          telegram: await body(await decide("Bearer telegram", "spc-msg-7")),
+          noInbound: await handle(
+            request(`/approvals/${approvalId}/decide`, "Bearer cli", {
+              action: "approve",
+            }),
+          ),
+          approved: await body(await decide("Bearer cli", "spc-msg-7")),
+          replay: await body(await decide("Bearer imessage", "spc-msg-7")),
+          // One message, two records: "approve both".
+          reacted: await body(await react("Bearer cli", "ok")),
+          reactedAgain: await body(await react("Bearer cli", "ok")),
+          changed: await body(await react("Bearer cli", "discuss")),
+        };
+        return { view, narrow, actions };
+      });
+
+      const { view, narrow, actions } = result;
+      expect(view.needs.ok).toBe(true);
+      expect(view.needs.inbox.approvals.map((a: { id: string }) => a.id)).toContain(approvalId);
+      expect(view.approvals.approvals.map((a: { id: string }) => a.id)).toEqual([approvalId]);
+      expect(view.calls.calls.map((c: { id: string }) => c.id)).toEqual([call.id]);
+      expect(view.draft.draft.text).toBe("New mobile designs attached.");
+      expect(view.draft.attachments).toEqual([
+        {
+          kind: "file",
+          label: "Mobile designs",
+          url: null,
+          path: "designs/mobile.png",
+          from: "target",
+        },
+      ]);
+      expect(view.work.items).toHaveLength(1);
+      expect(view.work.total).toBe(2);
+      expect(view.work.hasMore).toBe(true);
+      expect(view.timeline.entries.length).toBeGreaterThan(0);
+      expect(view.progress.progress.items.total).toBe(2);
+      expect(view.progress.progress.items.done).toBe(0);
+      expect(view.badStage).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+      expect(narrow.telegram).toMatchObject({ ok: false, error: { code: "forbidden" } });
+      expect(narrow.control).toMatchObject({ ok: false, error: { code: "forbidden" } });
+      expect(narrow.crw).toMatchObject({ ok: false, error: { code: "forbidden" } });
+
+      expect(actions.telegram).toMatchObject({ ok: false, error: { code: "forbidden" } });
+      expect(actions.noInbound.status).toBe(400);
+      expect(actions.approved.approval.status).toBe("approved");
+      expect(actions.approved.approval.decidedBy).toEqual({
+        _tag: "owner-imessage",
+        chat: "owner",
+        inboundId: "spc-msg-7",
+        quote: "approve both of those",
+      });
+      expect(actions.replay).toEqual(actions.approved);
+      expect(actions.reacted.call.ownerReaction).toBe("ok");
+      expect(actions.reactedAgain).toEqual(actions.reacted);
+      expect(actions.changed).toMatchObject({ ok: false, error: { code: "conflict" } });
     }).pipe(Effect.provide(layer));
   });
 

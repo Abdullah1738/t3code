@@ -1,10 +1,13 @@
 /**
  * Missions desk over the local control API, for the `mission` CLI and
  * robob-watch checks. Same auth and `{ ok, ... }` envelope as
- * `/api/ardud/control`. Callers here are never the owner: answers and draft
- * decisions pass only with the inbound id of the iMessage in which he said so,
- * redeemed once through the shared inbound ledger by the iMessage bridge or
- * mission CLI credential (any other caller is refused before the lookup).
+ * `/api/ardud/control`. Callers here are never the owner: answers, draft and
+ * approval decisions and call reactions pass only with the inbound id of the
+ * iMessage in which he said so, redeemed once through the shared inbound
+ * ledger by the iMessage bridge or mission CLI credential (any other caller is
+ * refused before the lookup). Those two credentials and his own sessions also
+ * read his full view (needs, approvals, calls, draft text and links, work,
+ * timeline, progress); other tokens keep the narrower reads.
  *
  * Systems in SYSTEM_DRAFT_COMPONENTS (crw) also open drafts here for one exact
  * code head, stale-close their own, read the decision for that head and report
@@ -13,19 +16,25 @@
  * crw`); a body `requestedBy` may only repeat it, and identity headers are refused.
  */
 import {
+  ApprovalId,
+  ApprovalStatus,
   AskId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  CallId,
   CloseStaleDraftInput,
   DraftId,
+  LaneId,
   MissionError,
   type MissionEvent,
   MissionId,
   type MissionProvenance,
   NonNegativeInt,
   OpenSystemDraftInput,
+  PositiveInt,
   ReportDraftSentInput,
   TrimmedNonEmptyString,
+  WorkStage,
 } from "@t3tools/contracts";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
@@ -38,10 +47,12 @@ import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import { parseSince } from "../../control/model.ts";
 import { componentProvenance, isOwnerSession, type OriginSession } from "../core/provenance.ts";
 import { inboundLedger } from "../guard/inboundActions.ts";
+import { MissionService } from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { askEpochOf, askReopened } from "./askModel.ts";
 import { AsksService } from "./AsksService.ts";
 import { epochOf, revisionOf } from "./draftModel.ts";
+import { draftAttachments, pendingAndRecent, progressOf } from "./ownerView.ts";
 import { canRedeemInbound } from "./provenance.ts";
 import {
   isWatchKind,
@@ -150,6 +161,28 @@ const DecideBody = Schema.Struct({
   revision: Schema.optional(NonNegativeInt),
 });
 const decodeDecideBody = Schema.decodeUnknownEffect(DecideBody);
+
+const ApprovalDecideBody = Schema.Struct({
+  action: Schema.Literals(["approve", "reject"]),
+  note: Schema.optional(Schema.String),
+  inboundId: TrimmedNonEmptyString,
+});
+const decodeApprovalDecideBody = Schema.decodeUnknownEffect(ApprovalDecideBody);
+
+const CallReactBody = Schema.Struct({
+  reaction: Schema.NullOr(Schema.Literals(["ok", "discuss", "overruled"])),
+  note: Schema.optional(Schema.String),
+  inboundId: TrimmedNonEmptyString,
+});
+const decodeCallReactBody = Schema.decodeUnknownEffect(CallReactBody);
+
+const decodeApprovalStatuses = Schema.decodeUnknownEffect(Schema.Array(ApprovalStatus));
+const decodeStages = Schema.decodeUnknownEffect(Schema.Array(WorkStage));
+const decodeLaneId = Schema.decodeUnknownEffect(LaneId);
+const decodePositiveInt = Schema.decodeUnknownEffect(PositiveInt);
+
+/** Decided approvals the owner's view keeps next to the pending ones. */
+const RECENT_APPROVALS = 10;
 // The credential names the system; a body `requestedBy` is optional and may only repeat it.
 const claimedBy = { requestedBy: Schema.optional(TrimmedNonEmptyString) };
 const decodeOpenSystemDraft = Schema.decodeUnknownEffect(
@@ -243,6 +276,7 @@ const WATCH_MAX_EVENTS = 5_000;
 const makeRoutes = Effect.gen(function* () {
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
   const asks = yield* AsksService;
+  const missions = yield* MissionService;
   const store = yield* MissionStore.MissionStore;
   const ledger = yield* inboundLedger;
 
@@ -268,6 +302,20 @@ const makeRoutes = Effect.gen(function* () {
 
   const read = <A, R>(effect: Effect.Effect<A, DeskError | MissionError, R>) =>
     authenticate(AuthOrchestrationReadScope).pipe(Effect.andThen(effect));
+  /** Reads of the owner's full view: his sessions, the bridge and the mission CLI. */
+  const ownerRead = <A, R>(effect: Effect.Effect<A, DeskError | MissionError, R>) =>
+    authenticate(AuthOrchestrationReadScope).pipe(
+      Effect.flatMap((session) =>
+        ownerView(session)
+          ? effect
+          : Effect.fail(
+              fail(
+                "forbidden",
+                "This is the owner's view: only his sessions, the iMessage bridge and the mission CLI credential read it.",
+              ),
+            ),
+      ),
+    );
   /** A write that needs to know its caller (iMessage redemption checks it first). */
   const writeAs = <A, R>(
     effect: (caller: MissionProvenance) => Effect.Effect<A, DeskError | MissionError, R>,
@@ -571,6 +619,9 @@ const makeRoutes = Effect.gen(function* () {
         );
       }
       const desk = yield* asks.desk(missionId);
+      const rawId = query.get("id")?.trim() ?? "";
+      const id = rawId.length === 0 ? undefined : rawId;
+      const about = id === undefined ? {} : { id };
       const afterRaw = query.get("after");
       if (afterRaw === null || afterRaw.trim() === "") {
         const interval = nonNegativeInt(query.get("interval"), 120);
@@ -578,11 +629,12 @@ const makeRoutes = Effect.gen(function* () {
           ok: true,
           matches: [],
           latestSeq: desk.latestSeq,
-          check: watchCheckCommand({ cli: MISSION_CLI, missionId, kinds }),
+          check: watchCheckCommand({ cli: MISSION_CLI, missionId, kinds, ...about }),
           add: watchAddCommand({
             cli: MISSION_CLI,
             missionId,
             kinds,
+            ...about,
             intervalSeconds: Math.min(Math.max(interval, 30), 3600),
           }),
         });
@@ -598,10 +650,220 @@ const makeRoutes = Effect.gen(function* () {
       }
       return json({
         ok: true,
-        matches: watchMatches(seen, kinds),
+        matches: watchMatches(seen, kinds, id),
         // A cursor past the log (store reset) snaps back to the current seq.
         latestSeq: seen.at(-1)?.seq ?? Math.min(cursor, desk.latestSeq),
       });
+    }),
+  );
+
+  // --- The owner's full view (his iMessage agent reads what the board shows him) ---
+
+  const recordAt = (kind: "approval" | "call", id: string) =>
+    store.get(kind, id).pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () =>
+            Effect.fail(new MissionError({ code: "not-found", detail: `No ${kind} ${id}.` })),
+          onSome: (record) => Effect.succeed({ at: record.createdAt }),
+        }),
+      ),
+    );
+
+  // Needs you: the inbox the board counts plus answered requests he has not read.
+  const needs = ownerRead(
+    Effect.gen(function* () {
+      const query = yield* searchParams;
+      const missionId = missionParam(query.get("mission")) ?? null;
+      const inbox = yield* missions.inbox(missionId);
+      const answered =
+        missionId === null
+          ? yield* store.listAll("owner-request", ["answered"])
+          : yield* store.listAllInMission("owner-request", missionId, ["answered"]);
+      return json({
+        ok: true,
+        inbox,
+        requests: answered.filter((request) => request.unreadForOwner),
+      });
+    }),
+  );
+
+  const listApprovals = ownerRead(
+    Effect.gen(function* () {
+      const query = yield* searchParams;
+      const missionId = yield* requireMission(query.get("mission"));
+      const statuses = listParam(query.get("status"));
+      if (statuses === undefined) {
+        const all = yield* missions.approvals({ missionId });
+        return json({ ok: true, approvals: pendingAndRecent(all, RECENT_APPROVALS) });
+      }
+      const status = yield* decodeApprovalStatuses(statuses).pipe(
+        Effect.mapError(() =>
+          fail("invalid_request", "status must be pending, approved, rejected or stale-closed."),
+        ),
+      );
+      return json({ ok: true, approvals: yield* missions.approvals({ missionId, status }) });
+    }),
+  );
+
+  const listCalls = ownerRead(
+    Effect.gen(function* () {
+      const query = yield* searchParams;
+      const missionId = yield* requireMission(query.get("mission"));
+      return json({ ok: true, calls: yield* asks.calls(missionId) });
+    }),
+  );
+
+  // A draft's full text and everything it links, so the agent can share it in the chat.
+  const showDraft = ownerRead(
+    Effect.gen(function* () {
+      const draftId = yield* param("draftId");
+      const found = yield* store.get("draft", draftId);
+      if (Option.isNone(found)) return yield* fail("not_found", `No draft ${draftId}.`);
+      return json({
+        ok: true,
+        draft: found.value,
+        attachments: draftAttachments(found.value),
+      });
+    }),
+  );
+
+  const optionalParam = <A>(
+    raw: string | null,
+    decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
+    message: string,
+  ) =>
+    raw === null || raw.trim() === ""
+      ? Effect.succeed(undefined)
+      : decode(raw.trim()).pipe(Effect.mapError(() => fail("invalid_request", message)));
+
+  const work = ownerRead(
+    Effect.gen(function* () {
+      const query = yield* searchParams;
+      const missionId = yield* requireMission(query.get("mission"));
+      const laneId = yield* optionalParam(query.get("lane"), decodeLaneId, "lane is a lane id.");
+      const stageList = listParam(query.get("stage"));
+      const stages =
+        stageList === undefined
+          ? undefined
+          : yield* decodeStages(stageList).pipe(
+              Effect.mapError(() =>
+                fail(
+                  "invalid_request",
+                  "stage must be ticket, pr, review, merge, deploy, readback, exercised or done.",
+                ),
+              ),
+            );
+      const limit = yield* optionalParam(
+        query.get("limit"),
+        (raw) => decodePositiveInt(Number(raw)),
+        "limit is a positive number.",
+      );
+      const offset = nonNegativeInt(query.get("offset"), 0);
+      const page = yield* missions.workItems({
+        missionId,
+        offset,
+        ...(laneId === undefined ? {} : { laneId }),
+        ...(stages === undefined ? {} : { stages }),
+        ...(limit === undefined ? {} : { limit: Math.min(limit, 500) }),
+      });
+      return json({ ok: true, ...page });
+    }),
+  );
+
+  const timeline = ownerRead(
+    Effect.gen(function* () {
+      const query = yield* searchParams;
+      const missionId = yield* requireMission(query.get("mission"));
+      const toPositive = (raw: unknown) => decodePositiveInt(Number(raw));
+      const beforeSeq = yield* optionalParam(
+        query.get("before"),
+        toPositive,
+        "before is an event seq.",
+      );
+      const limit = yield* optionalParam(
+        query.get("limit"),
+        toPositive,
+        "limit is a positive number.",
+      );
+      const page = yield* missions.timeline({
+        missionId,
+        ...(beforeSeq === undefined ? {} : { beforeSeq }),
+        ...(limit === undefined ? {} : { limit }),
+      });
+      return json({ ok: true, ...page });
+    }),
+  );
+
+  const progress = ownerRead(
+    Effect.gen(function* () {
+      const query = yield* searchParams;
+      const missionId = yield* requireMission(query.get("mission"));
+      const overview = yield* missions.overview(missionId);
+      const items = yield* store.listAllInMission("work-item", missionId);
+      return json({ ok: true, progress: progressOf(overview, items) });
+    }),
+  );
+
+  const decideApproval = writeAs((caller) =>
+    Effect.gen(function* () {
+      const approvalId = ApprovalId.make(yield* param("approvalId"));
+      const body = yield* decodeBody(decodeApprovalDecideBody);
+      return json(
+        yield* ledger.once(
+          {
+            caller,
+            inboundId: body.inboundId,
+            subject: `approval:${approvalId}`,
+            action: "decide",
+            payload: { action: body.action, note: body.note ?? null },
+            what: "Deciding an approval",
+            notBefore: () => recordAt("approval", approvalId),
+          },
+          (owner) =>
+            Effect.gen(function* () {
+              yield* missions.decideApproval(owner, {
+                approvalId,
+                action: body.action,
+                inboundId: body.inboundId,
+                ...(body.note === undefined ? {} : { note: body.note }),
+              });
+              const approval = yield* store.get("approval", approvalId);
+              return { ok: true, approval: Option.getOrNull(approval) };
+            }),
+        ),
+      );
+    }),
+  );
+
+  const reactToCall = writeAs((caller) =>
+    Effect.gen(function* () {
+      const callId = CallId.make(yield* param("callId"));
+      const body = yield* decodeBody(decodeCallReactBody);
+      return json(
+        yield* ledger.once(
+          {
+            caller,
+            inboundId: body.inboundId,
+            subject: `call:${callId}`,
+            action: "react",
+            payload: { reaction: body.reaction, note: body.note ?? null },
+            what: "Reacting to a call",
+            notBefore: () => recordAt("call", callId),
+          },
+          (owner) =>
+            asks
+              .reactToCall(
+                {
+                  callId,
+                  reaction: body.reaction,
+                  ...(body.note === undefined ? {} : { note: body.note }),
+                },
+                owner,
+              )
+              .pipe(Effect.map((call) => ({ ok: true, call }))),
+        ),
+      );
     }),
   );
 
@@ -636,6 +898,15 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("GET", `${p}/drafts/:draftId/decision`, handle(draftDecision)),
     HttpRouter.route("GET", `${p}/events`, handle(events)),
     HttpRouter.route("GET", `${p}/watch`, handle(watch)),
+    HttpRouter.route("GET", `${p}/needs`, handle(needs)),
+    HttpRouter.route("GET", `${p}/approvals`, handle(listApprovals)),
+    HttpRouter.route("POST", `${p}/approvals/:approvalId/decide`, handle(decideApproval)),
+    HttpRouter.route("GET", `${p}/calls`, handle(listCalls)),
+    HttpRouter.route("POST", `${p}/calls/:callId/react`, handle(reactToCall)),
+    HttpRouter.route("GET", `${p}/drafts/:draftId`, handle(showDraft)),
+    HttpRouter.route("GET", `${p}/work`, handle(work)),
+    HttpRouter.route("GET", `${p}/timeline`, handle(timeline)),
+    HttpRouter.route("GET", `${p}/progress`, handle(progress)),
   ] as const;
 });
 
