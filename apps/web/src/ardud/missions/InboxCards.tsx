@@ -135,7 +135,7 @@ export function AskCard(
   },
 ) {
   const { ask } = props;
-  const view = askView(ask, props.nowMs, props.masterRoleId);
+  const view = askView(ask, props.nowMs);
   const discussion = useCardDiscussion(
     ask.missionId,
     { kind: "ask", id: ask.id, label: ask.question },
@@ -143,7 +143,6 @@ export function AskCard(
   );
   const [text, setText] = useState("");
   const [busy, run] = useBusy();
-  const advisorName = view.askedBy === "master" ? "Master" : view.askedBy;
   const actions: CardAction[] = [
     {
       key: "answer",
@@ -171,7 +170,6 @@ export function AskCard(
         options={view.options}
         picked={props.picked}
         onPick={props.onPick}
-        advisor={{ kind: view.askedBy === "master" ? "master" : "person", name: advisorName }}
         advice={ask.recommendation?.reason.trim() || null}
         disabled={busy}
       />

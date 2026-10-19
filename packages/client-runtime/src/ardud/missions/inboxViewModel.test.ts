@@ -176,11 +176,11 @@ const emptyInbox = (
 };
 
 describe("Decide", () => {
-  it("shows the recommendation as advice and never preselects it", () => {
-    const view = askView(ask(), NOW, MASTER);
-    expect(view.askedBy).toBe("master");
+  it("shows the recommendation as advice, never says who asked and never preselects it", () => {
+    const view = askView(ask(), NOW);
     expect(view.waiting).toBe("waiting 38h");
-    expect(view.recommendation).toBe("Master recommends “Hold” because not needed for Monday.");
+    expect(view.recommendation).toBe("“Hold” is recommended because not needed for Monday.");
+    expect(Object.keys(view)).not.toContain("askedBy");
     expect(view.options.map((option) => [option.shortcut, option.recommended])).toEqual([
       [1, false],
       [2, true],
@@ -195,7 +195,7 @@ describe("Decide", () => {
       "Blocks CRP-13215 only. Everything else keeps running.",
     );
     expect(blocksLine([])).toBe("Blocks nothing. The mission keeps running.");
-    expect(recommendationLine(ask({ recommendation: null }), MASTER)).toBeNull();
+    expect(recommendationLine(ask({ recommendation: null }))).toBeNull();
   });
 
   it("needs an option or text to answer", () => {

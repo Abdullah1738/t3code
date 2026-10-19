@@ -288,11 +288,6 @@ export function RequestThread(props: {
           {REQUEST_STATUS_LABEL[request.status]}
         </span>
       </div>
-      {request.subject ? (
-        <div aria-label="About" className="flex min-w-0">
-          <RefChip record={request.subject} />
-        </div>
-      ) : null}
       <ol aria-label="Conversation" className="flex min-w-0 flex-col gap-3">
         {request.messages.map((message) => (
           <RequestMessage key={message.id} message={message} nowMs={props.nowMs} />

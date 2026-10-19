@@ -33,7 +33,7 @@ import type {
 import { routedTo, suggestionsFor, type InboxRouteFilter } from "./routingViewModel.ts";
 import type { AddDraftNoteInput, MissionInboxSnapshot } from "./source.ts";
 import { diffStats, diffWords, type DiffSegment, type DiffStats } from "./textDiff.ts";
-import { actorLabel, refLabel } from "./viewModel.ts";
+import { refLabel } from "./viewModel.ts";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -206,10 +206,6 @@ export function blocksLine(blocks: ReadonlyArray<MissionRecordRef>): string {
   return `Blocks ${blocks.map(refLabel).join(", ")} only. Everything else keeps running.`;
 }
 
-function capitalize(text: string): string {
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
-
 /** Lowercases a leading word ("Not needed" -> "not needed") but leaves "CRP-1" or "Kafka" alone when unclear. */
 function continueSentence(text: string): string {
   const trimmed = text.trim();
@@ -220,19 +216,19 @@ function continueSentence(text: string): string {
 }
 
 /**
- * The recommendation as advice: "Master recommends “Hold” because …".
- * `null` when the asker gave none. It is never applied without an answer.
+ * The recommendation as advice: "“Hold” is recommended because …". Who asked
+ * is left out on purpose (owner, 19 Oct): the question carries the context.
+ * `null` when there is none. It is never applied without an answer.
  */
-export function recommendationLine(ask: Ask, masterRoleId: string | null): string | null {
+export function recommendationLine(ask: Ask): string | null {
   const recommendation = ask.recommendation;
   if (recommendation === null) return null;
-  const who = capitalize(actorLabel(ask.askedBy, masterRoleId));
   const option = ask.options.find((candidate) => candidate.id === recommendation.optionId);
   const reason = recommendation.reason.trim();
-  if (!option) return reason === "" ? null : `${who} suggests: ${continueSentence(reason)}`;
+  if (!option) return reason === "" ? null : `Suggested: ${continueSentence(reason)}`;
   return reason === ""
-    ? `${who} recommends “${option.label}”.`
-    : `${who} recommends “${option.label}” because ${continueSentence(reason)}`;
+    ? `“${option.label}” is recommended.`
+    : `“${option.label}” is recommended because ${continueSentence(reason)}`;
 }
 
 export interface AskOptionView {
@@ -246,7 +242,6 @@ export interface AskOptionView {
 }
 
 export interface AskView {
-  readonly askedBy: string;
   readonly waiting: string;
   readonly blocks: string;
   readonly recommendation: string | null;
@@ -254,12 +249,11 @@ export interface AskView {
   readonly urgent: boolean;
 }
 
-export function askView(ask: Ask, nowMs: number, masterRoleId: string | null): AskView {
+export function askView(ask: Ask, nowMs: number): AskView {
   return {
-    askedBy: actorLabel(ask.askedBy, masterRoleId),
     waiting: waitingLabel(ask.createdAt, nowMs),
     blocks: blocksLine(ask.blocks),
-    recommendation: recommendationLine(ask, masterRoleId),
+    recommendation: recommendationLine(ask),
     options: ask.options.map((option, index) => ({
       id: option.id,
       label: option.label,

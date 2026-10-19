@@ -96,6 +96,19 @@ export function isRequestUnread(request: Pick<OwnerRequest, "status" | "unread">
   return request.status !== "settled" && request.unread;
 }
 
+/**
+ * A Discuss about a record. It lives on that record's card, never in Your
+ * requests (owner, 19 Oct: "Discussions stay on the item").
+ */
+export function isDiscussion(request: Pick<OwnerRequest, "subject">): boolean {
+  return request.subject !== null;
+}
+
+/** What Your requests lists and counts: the owner's own asks, not discussions. */
+export function yourRequests(requests: ReadonlyArray<OwnerRequest>): ReadonlyArray<OwnerRequest> {
+  return requests.filter((request) => !isDiscussion(request));
+}
+
 export function unreadRequestCount(requests: ReadonlyArray<OwnerRequest>): number {
   return requests.filter(isRequestUnread).length;
 }

@@ -1,34 +1,32 @@
-import { useState, type ReactNode } from "react";
-import { Link } from "@tanstack/react-router";
+import { useEffect, useState, type ReactNode } from "react";
 import { SendIcon } from "lucide-react";
 
 import type { MissionId, MissionRecordRef, OwnerCondition } from "@t3tools/contracts";
 import {
+  ageView,
   isRequestUnread,
-  REQUEST_STATUS_LABEL,
   requestAbout,
+  requestPreview,
   type OwnerRequest,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
 import type { CardAction } from "./cards/CardFrame";
-import { StateGlyph } from "./cards/chips";
+import { AgeElement, StateGlyph, UnreadDot } from "./cards/chips";
 import { discussRecord, markRequestRead, replyRequest, settleRequest } from "./missionCommands";
-import { useOwnerRequests } from "./missionsStore";
+import { useOwnerRequest, useOwnerRequests } from "./missionsStore";
 import { RequestMessage, STATUS_GLYPH } from "./sections/YourRequests";
 
-// Discuss on a Needs-you card: an owner request about the record. The card
-// shows the open conversation inline; the full thread lives under Your
-// requests. The record keeps waiting until someone decides it.
-
-/** Newest messages shown on a card; the rest are one click away. */
-const CARD_MESSAGES = 2;
+// Discuss on a card: an owner request about the record, kept on the record
+// (owner, 19 Oct: "Discussions stay on the item"). Closed, the card shows the
+// latest line and an unread mark; open, the whole conversation and a reply box
+// sit right above the card's decisions. It never shows under Your requests.
 
 export interface CardDiscussion {
   /** The card's Discuss action ("Discussing" once a request is open). */
   readonly action: CardAction | null;
-  /** The inline conversation and composer, or null when there is nothing to show. */
+  /** The discussion on the card, or null when there is nothing to show. */
   readonly panel: ReactNode;
 }
 
@@ -43,39 +41,94 @@ export function useCardDiscussion(
 ): CardDiscussion {
   const requests = useOwnerRequests(missionId);
   const request = requests ? requestAbout(requests, subject) : null;
-  const [composing, setComposing] = useState(false);
+  const [open, setOpen] = useState(false);
   if (missionId === null) return { action: null, panel: null };
   const action: CardAction = {
     key: "discuss",
     label: request ? "Discussing" : "Discuss",
-    onRun: () => {
-      if (request && isRequestUnread(request)) markRequestRead(request.id);
-      setComposing((open) => !open);
-    },
+    onRun: () => setOpen((value) => !value),
   };
-  const panel =
-    request || composing ? (
-      <DiscussPanel
-        missionId={missionId}
-        subject={subject}
+  let panel: ReactNode = null;
+  if (request && open) {
+    panel = (
+      <DiscussionThread
+        key={request.id}
         request={request}
-        composing={composing}
-        onClose={() => setComposing(false)}
+        onClose={() => setOpen(false)}
         nowMs={nowMs}
       />
-    ) : null;
+    );
+  } else if (request) {
+    panel = <DiscussionLine request={request} onOpen={() => setOpen(true)} nowMs={nowMs} />;
+  } else if (open) {
+    panel = (
+      <DiscussionComposer
+        onSend={(text) => discussRecord(missionId, subject, text)}
+        onClose={() => setOpen(false)}
+      />
+    );
+  }
   return { action, panel };
 }
 
-function DiscussPanel(props: {
-  missionId: MissionId;
-  subject: MissionRecordRef;
-  request: OwnerRequest | null;
-  composing: boolean;
-  onClose: () => void;
-  nowMs: number;
-}) {
+const PANEL_CLASS = "flex min-w-0 flex-col gap-2.5 rounded-lg bg-muted/50 px-3 py-2.5";
+
+/** Closed: the latest line, its age and an unread mark; opens the conversation. */
+function DiscussionLine(props: { request: OwnerRequest; onOpen: () => void; nowMs: number }) {
   const { request } = props;
+  const unread = isRequestUnread(request);
+  const last = request.messages.at(-1);
+  const age = last ? ageView(last.at, props.nowMs) : null;
+  return (
+    <button
+      type="button"
+      aria-label={`Open the discussion${unread ? ", the master replied" : ""}`}
+      onClick={props.onOpen}
+      className="grid min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-lg bg-muted/50 px-3 py-2 text-start outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+    >
+      <StateGlyph kind={STATUS_GLYPH[request.status]} />
+      <span className={unread ? "truncate text-sm font-medium" : "truncate text-sm"}>
+        {requestPreview(request)}
+      </span>
+      <span className="inline-flex shrink-0 items-center gap-1.5">
+        {unread ? <UnreadDot label="The master replied" /> : null}
+        {age && last ? <AgeElement age={age} at={last.at} /> : null}
+      </span>
+    </button>
+  );
+}
+
+/** Open: the whole conversation with full bodies, a reply box and Settle. */
+function DiscussionThread(props: { request: OwnerRequest; onClose: () => void; nowMs: number }) {
+  const request = useOwnerRequest(props.request.missionId, props.request.id) ?? props.request;
+  const unread = isRequestUnread(request);
+  useEffect(() => {
+    if (unread) markRequestRead(request.id);
+  }, [unread, request.id]);
+  return (
+    <section aria-label="Discussion with the master" className={PANEL_CLASS}>
+      <ol aria-label="Conversation" className="flex min-w-0 flex-col gap-2.5">
+        {request.messages.map((message) => (
+          <RequestMessage key={message.id} message={message} nowMs={props.nowMs} />
+        ))}
+      </ol>
+      <DiscussionComposer
+        reply
+        onSend={(text) => replyRequest(request.id, text)}
+        onSettle={() => settleRequest(request.id)}
+        onClose={props.onClose}
+      />
+    </section>
+  );
+}
+
+function DiscussionComposer(props: {
+  /** Replying in an open discussion rather than starting one. */
+  reply?: boolean;
+  onSend: (text: string) => Promise<boolean>;
+  onSettle?: () => Promise<boolean>;
+  onClose: () => void;
+}) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const run = async (action: () => Promise<boolean>, close: boolean) => {
@@ -86,94 +139,62 @@ function DiscussPanel(props: {
     setText("");
     if (close) props.onClose();
   };
-  // Replying goes to the open request; the first message opens one about the record.
-  const send = () =>
-    run(
-      () =>
-        request
-          ? replyRequest(request.id, text)
-          : discussRecord(props.missionId, props.subject, text),
-      false,
-    );
-  const recent = request ? request.messages.slice(-CARD_MESSAGES) : [];
-  return (
-    <section
-      aria-label="Discussion with the master"
-      className="flex min-w-0 flex-col gap-2.5 rounded-lg bg-muted/50 px-3 py-2.5"
+  const send = () => {
+    if (text.trim() !== "") void run(() => props.onSend(text), false);
+  };
+  const form = (
+    <form
+      className="flex min-w-0 flex-col gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        send();
+      }}
     >
-      {request ? (
-        <>
-          <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-            <StateGlyph kind={STATUS_GLYPH[request.status]} />
-            <span>{REQUEST_STATUS_LABEL[request.status]}</span>
-            <Link
-              to="/missions/$missionId"
-              params={{ missionId: props.missionId }}
-              search={{ request: request.id }}
-              className="ms-auto rounded-sm outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-            >
-              Open
-            </Link>
-          </div>
-          {recent.length > 0 ? (
-            <ol aria-label="Latest messages" className="flex min-w-0 flex-col gap-2.5">
-              {recent.map((message) => (
-                <RequestMessage key={message.id} message={message} nowMs={props.nowMs} compact />
-              ))}
-            </ol>
-          ) : null}
-        </>
-      ) : null}
-      {props.composing ? (
-        <form
-          className="flex min-w-0 flex-col gap-2"
-          onSubmit={(event) => {
+      <Textarea
+        size="sm"
+        autoFocus
+        aria-label={props.reply ? "Reply to the master" : "What to discuss"}
+        placeholder={props.reply ? "Reply" : "What do you want to talk through?"}
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
             event.preventDefault();
-            void send();
-          }}
-        >
-          <Textarea
+            send();
+          }
+        }}
+      />
+      <div className="flex min-w-0 items-center gap-1.5">
+        <Button type="submit" size="sm" variant="secondary" disabled={busy || text.trim() === ""}>
+          <SendIcon aria-hidden />
+          {props.reply ? "Reply" : "Send"}
+        </Button>
+        {props.onSettle ? (
+          <Button
+            type="button"
             size="sm"
-            autoFocus
-            aria-label={request ? "Reply to the master" : "What to discuss"}
-            placeholder={request ? "Reply" : "What do you want to talk through?"}
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                event.preventDefault();
-                void send();
-              }
+            variant="ghost-muted"
+            disabled={busy}
+            onClick={() => {
+              const settle = props.onSettle;
+              if (settle) void run(settle, true);
             }}
-          />
-          <div className="flex min-w-0 items-center gap-1.5">
-            <Button
-              type="submit"
-              size="sm"
-              variant="secondary"
-              disabled={busy || text.trim() === ""}
-            >
-              <SendIcon aria-hidden />
-              {request ? "Reply" : "Send"}
-            </Button>
-            {request ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost-muted"
-                disabled={busy}
-                onClick={() => void run(() => settleRequest(request.id), true)}
-              >
-                Settle
-              </Button>
-            ) : (
-              <Button type="button" size="sm" variant="ghost-muted" onClick={props.onClose}>
-                Cancel
-              </Button>
-            )}
-          </div>
-        </form>
-      ) : null}
+          >
+            Settle
+          </Button>
+        ) : null}
+        <Button type="button" size="sm" variant="ghost-muted" onClick={props.onClose}>
+          {props.reply ? "Close" : "Cancel"}
+        </Button>
+      </div>
+    </form>
+  );
+  // A reply sits inside the thread's panel; a first message gets its own.
+  return props.reply ? (
+    form
+  ) : (
+    <section aria-label="Discuss with the master" className={PANEL_CLASS}>
+      {form}
     </section>
   );
 }

@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 
 import type {
   DraftNote,
@@ -17,6 +17,7 @@ import {
   createKeyedSnapshotStores,
   createRpcMissionsSource,
   createSnapshotStore,
+  yourRequests,
   type SampledFeed,
   type ApprovalRoutingTable,
   type MissionInboxSnapshot,
@@ -142,7 +143,7 @@ const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | nul
 const NO_REQUESTS = { get: () => undefined, subscribe: () => () => {} };
 
 /**
- * What the owner asked or told the master, newest activity first. A record
+ * Every owner request, discussions included, newest activity first. A record
  * outside any mission (a global suggestion) has no requests.
  */
 export function useOwnerRequests(
@@ -150,6 +151,15 @@ export function useOwnerRequests(
 ): ReadonlyArray<OwnerRequest> | undefined {
   const store = missionId === null ? NO_REQUESTS : requestStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/**
+ * Your requests: the owner's own asks. Discussions about a record are left
+ * out; they live on that record's card.
+ */
+export function useYourRequests(missionId: MissionId): ReadonlyArray<OwnerRequest> | undefined {
+  const requests = useOwnerRequests(missionId);
+  return useMemo(() => (requests === undefined ? undefined : yourRequests(requests)), [requests]);
 }
 
 /** One request's whole conversation with full message bodies; null once gone. */

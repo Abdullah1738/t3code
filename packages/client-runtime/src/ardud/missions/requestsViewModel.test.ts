@@ -5,6 +5,7 @@ import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import {
   discussRequestInput,
   groupRequests,
+  isDiscussion,
   isRequestUnread,
   openRequestInput,
   ownerConditionOf,
@@ -12,11 +13,29 @@ import {
   requestPreview,
   requestTitle,
   unreadRequestCount,
+  yourRequests,
 } from "./requestsViewModel.ts";
 import type { MissionsSource, OwnerRequest } from "./source.ts";
 
 const CRPKO = "crpko-engineering" as MissionId;
 const now = () => Date.parse(FIXTURE_NOW) + 60_000;
+
+function request(overrides: Partial<OwnerRequest> & Pick<OwnerRequest, "id">): OwnerRequest {
+  return {
+    missionId: CRPKO,
+    title: overrides.id,
+    status: "answered",
+    messages: [],
+    hasOlder: false,
+    links: [],
+    subject: null,
+    unread: false,
+    createdAt: FIXTURE_NOW,
+    updatedAt: FIXTURE_NOW,
+    settledAt: null,
+    ...overrides,
+  };
+}
 
 function latest(source: MissionsSource) {
   let value: ReadonlyArray<OwnerRequest> = [];
@@ -91,6 +110,18 @@ describe("owner requests", () => {
     await source.settleRequest({ requestId: first.id });
     const fresh = await source.openRequest({ missionId: CRPKO, text: "Back again", subject });
     expect(fresh.id).not.toBe(first.id);
+  });
+
+  it("keeps discussions out of Your requests and its unread count", () => {
+    const own = request({ id: "own", subject: null, unread: true });
+    const talk = request({
+      id: "talk",
+      subject: { kind: "draft", id: "draft-1", label: "Release note" },
+      unread: true,
+    });
+    expect(isDiscussion(talk)).toBe(true);
+    expect(yourRequests([own, talk]).map((r) => r.id)).toEqual(["own"]);
+    expect(unreadRequestCount(yourRequests([own, talk]))).toBe(1);
   });
 
   it("finds the open request about a record and reads a decision made on a condition", async () => {

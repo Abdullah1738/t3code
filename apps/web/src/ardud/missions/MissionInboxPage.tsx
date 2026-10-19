@@ -15,7 +15,9 @@ import {
   INBOX_TAB_LABEL,
   INBOX_TABS,
   inboxTabCounts,
+  isRequestUnread,
   ownerConditionOf,
+  requestAbout,
   staleApprovals,
   totalNeedsYou,
   type InboxEntry,
@@ -46,7 +48,7 @@ import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { AgeElement, CountBadge, HealthGlyph, needsYouLabel } from "./cards/chips";
+import { AgeElement, CountBadge, HealthGlyph, needsYouLabel, UnreadDot } from "./cards/chips";
 import { ConditionNote } from "./DiscussPanel";
 import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
@@ -59,6 +61,7 @@ import {
   useMissionInbox,
   useMissionInboxHistory,
   useMissionList,
+  useOwnerRequests,
   useSuggestionStats,
 } from "./missionsStore";
 import { WordDiff } from "./TextDiffView";
@@ -503,6 +506,12 @@ function InboxRow(props: {
 }) {
   const row = entryRow(props.entry, props.missionList);
   const age = ageView(row.since, props.nowMs);
+  // The master replied in this item's discussion: the item says so, not Your requests.
+  const requests = useOwnerRequests(props.entry.record.missionId);
+  const talk = requests
+    ? requestAbout(requests, { kind: props.entry.kind, id: props.entry.record.id })
+    : null;
+  const replied = talk !== null && isRequestUnread(talk);
   return (
     <li>
       <button
@@ -516,7 +525,10 @@ function InboxRow(props: {
         )}
       >
         <span className="truncate font-medium">{row.title}</span>
-        {age ? <AgeElement age={age} at={row.since} prefix="waiting " /> : <span />}
+        <span className="inline-flex items-center gap-1.5">
+          {replied ? <UnreadDot label="The master replied in the discussion" /> : null}
+          {age ? <AgeElement age={age} at={row.since} prefix="waiting " /> : null}
+        </span>
         <span className="col-span-2 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
           <span className="shrink-0 font-medium">{row.kicker}</span>
           {row.sub ? (

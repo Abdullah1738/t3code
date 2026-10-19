@@ -39,7 +39,7 @@ import { cn } from "../../lib/utils";
 import { AgeElement, ByMarker, PersonChip, RefChip, StateGlyph } from "./cards/chips";
 import { useCardDiscussion } from "./DiscussPanel";
 import { markMissionSeen, reactToCall } from "./missionCommands";
-import { useMissionInbox, useMissionViews, useOwnerRequests } from "./missionsStore";
+import { useMissionInbox, useMissionViews, useYourRequests } from "./missionsStore";
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { PriorityStack } from "./PriorityStack";
 import { NeedsYouSection, PinnedStrip, WithTheMasterSection } from "./sections/NeedsYou";
@@ -66,7 +66,7 @@ export function MissionOverviewTab(props: {
   const missionId = overview.mission.id;
   const views = useMissionViews(missionId);
   const inbox = useMissionInbox(missionId);
-  const requests = useOwnerRequests(missionId);
+  const requests = useYourRequests(missionId);
   const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox).length : undefined), [inbox]);
   const unread = useMemo(() => unreadRequests(requests), [requests]);
   // The page's own inbox and request counts drive the pinned strip, so it

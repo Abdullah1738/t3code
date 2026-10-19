@@ -29,7 +29,7 @@ import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../compo
 import { cn } from "../../lib/utils";
 import { GlyphCount, HealthStatus } from "./cards/chips";
 import { setMissionFocus, toggleMissionPaused } from "./missionCommands";
-import { useMissionList, useOwnerRequests } from "./missionsStore";
+import { useMissionList, useYourRequests } from "./missionsStore";
 import {
   RequestComposer,
   RequestsUnreadLink,
@@ -258,7 +258,7 @@ function MissionStats(props: { overview: MissionOverviewSnapshot; nowMs: number 
 /** What waits on the owner here, and answers to their requests not yet read. */
 function NeedsYouStat(props: { missionId: MissionId }) {
   const list = useMissionList();
-  const requests = useOwnerRequests(props.missionId);
+  const requests = useYourRequests(props.missionId);
   const count = list?.missions.find((mission) => mission.id === props.missionId)?.needsYou ?? 0;
   const answered = unreadRequests(requests).length > 0;
   if (count === 0 && !answered) return null;

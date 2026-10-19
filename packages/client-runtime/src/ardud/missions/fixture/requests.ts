@@ -1,7 +1,7 @@
 import { MissionId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-import { isRequestUnread, requestTitle } from "../requestsViewModel.ts";
+import { isRequestUnread, requestTitle, yourRequests } from "../requestsViewModel.ts";
 import type { Listener, MissionsSource, OwnerRequest, Unsubscribe } from "../source.ts";
 import { AT, CRPKO } from "./data.ts";
 import { fail } from "./util.ts";
@@ -182,8 +182,9 @@ export function createRequests(ctx: RequestsContext): RequestsSource & {
   }
 
   return {
+    // Discussions count on their record's card, not under Your requests.
     unreadFor: (missionId) =>
-      missionRequests(missionId).filter((request) => isRequestUnread(request)).length,
+      yourRequests(missionRequests(missionId)).filter(isRequestUnread).length,
 
     subscribeRequests: (missionId, listener) => watch(() => missionRequests(missionId), listener),
 
