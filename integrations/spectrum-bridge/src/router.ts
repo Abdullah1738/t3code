@@ -219,8 +219,8 @@ export const refusalTitle = (title: unknown) => typeof title === "string" && REF
 /** A quoted reply needs a real provider message to point at. */
 const replyTarget = (id: string | undefined) => id === undefined || synthetic(id) ? {} : { replyTo: id };
 const CLI = `${process.execPath} ${fileURLToPath(new URL("./cli.ts", import.meta.url))}`;
-// The short consent grammar Robob also checks (missions guard, asks/provenance.ts):
-// only these phrases plus please or thanks, and never a question mark.
+// The short consent grammar for a runtime request: only these phrases plus please
+// or thanks, and never a question mark.
 const YES_PHRASES = ["yes", "approve", "approved", "ok", "go", "send it", "ship it"];
 const NO_PHRASES = ["no", "deny", "reject", "decline"];
 const COURTESY_PHRASES = ["please", "thanks", "thank you"];
@@ -1066,10 +1066,6 @@ export class Router {
         this.store.enqueue({
           id, kind: "control", text, sessionId: turn.id, generation: turn.generation,
           ...(poll ? { poll } : {}), ...(poll ? {} : replyTarget(turn.inboundId)),
-          // Robob counts his reply for this request only when it is tied to this message.
-          ...(entry.unsupported ? {} : {
-            notice: { kind: "runtime-request" as const, session: entry.requestSessionId ?? turn.id, recordId: entry.id },
-          }),
         });
       }
       this.store.set("pendingApprovals", entries);

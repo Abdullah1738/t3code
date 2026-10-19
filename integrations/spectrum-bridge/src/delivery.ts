@@ -318,8 +318,6 @@ export class Delivery {
             const existing = this.store.get<string>(key) ?? this.store.byProviderId(result.providerId)?.id;
             if (existing !== undefined && existing !== item.id) throw new Error("Provider alias conflict");
             this.store.set(key, item.id);
-            // Robob ties the owner's reply to the one decision this message asked for.
-            if (item.notice) this.store.recordNotice(result.providerId, item.id, item.notice, Date.now());
             if (final && item.poll) {
               this.store.db.query("DELETE FROM kv WHERE key = ?").run(`poll-seen:${result.providerId}`);
               this.store.set(`poll:${result.providerId}`, {
