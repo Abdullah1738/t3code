@@ -213,6 +213,11 @@ describe("mission list and overview", () => {
     const overview = overviewOf(fixture());
     const header = overviewHeaderView(overview, NOW);
     expect(header.lanesLine).toBe("37 lanes: 21 working, 2 stuck, 14 idle");
+    expect(header.stats.lanes).toEqual({ stuck: 2, waiting: overview.lanes.waiting, total: 37 });
+    if (header.stats.milestones) {
+      expect(header.stats.timeLeft).not.toBeNull();
+      expect(header.stats.milestones.total).toBeGreaterThan(0);
+    }
     const blockers = blockersView(overview);
     expect(blockers.groups.length).toBeGreaterThan(0);
     expect(blockers.caption).not.toBeNull();
@@ -265,11 +270,33 @@ describe("rooms", () => {
     const entries = first<ReadonlyArray<MissionRoomEntry>>((listener) =>
       fixture().subscribeRooms(CRPKO, listener),
     );
-    const rows = roomRows(entries, NOW);
+    const rows = roomRows(entries);
     expect(rows.length).toBe(entries.length);
     const firstRead = rows.findIndex((row) => row.unread === 0);
     if (firstRead >= 0) expect(rows.slice(firstRead).every((row) => row.unread === 0)).toBe(true);
     expect(unreadTotal(entries)).toBe(entries.reduce((sum, entry) => sum + entry.unread, 0));
     expect(rows.find((row) => row.title === "delivery")?.unreadBadge).toBe("99+");
+  });
+
+  it("leaves request rooms to Your requests and ranks rooms by sub-mission", () => {
+    const entries = first<ReadonlyArray<MissionRoomEntry>>((listener) =>
+      fixture().subscribeRooms(CRPKO, listener),
+    );
+    const sample = entries.find((entry) => entry.room.subMissionId !== null)!;
+    const requestRoom: MissionRoomEntry = {
+      room: { ...sample.room, id: `${sample.room.id}-request` as never, kind: "owner-request" },
+      unread: 4,
+    };
+    const subMissions = [
+      { id: sample.room.subMissionId!, title: "Risk snapshot", order: 2 },
+    ] as const;
+    const rows = roomRows([...entries, requestRoom], subMissions);
+    expect(rows.some((row) => row.id === requestRoom.room.id)).toBe(false);
+    expect(unreadTotal([...entries, requestRoom])).toBe(unreadTotal(entries));
+    expect(rows.find((row) => row.id === sample.room.id)?.place).toEqual({
+      rank: 3,
+      title: "Risk snapshot",
+    });
+    expect(rows.every((row) => row.rate === null || row.rate.endsWith("/h"))).toBe(true);
   });
 });

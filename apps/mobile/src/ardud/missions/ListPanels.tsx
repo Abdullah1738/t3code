@@ -105,11 +105,14 @@ export function MissionsListPanel(props: {
 function MissionRooms(props: {
   readonly missionId: MissionId;
   readonly title: string;
-  readonly nowMs: number;
+  readonly subMissions: MissionListRow["subMissions"];
 }) {
   const entries = useMissionRooms(props.missionId);
   if (entries === undefined) return null;
-  const rows = roomRows(entries, props.nowMs);
+  const rows = roomRows(
+    entries,
+    props.subMissions.map((sub) => ({ id: sub.id, title: sub.title, order: sub.position - 1 })),
+  );
   const unread = unreadTotal(entries);
   return (
     <Section title={props.title} caption={unread > 0 ? `${unread} unread` : "All read"}>
@@ -121,7 +124,14 @@ function MissionRooms(props: {
             <View key={room.id} className="flex-row items-center gap-2">
               <View className="flex-1 gap-0.5">
                 <Text className="text-sm font-t3-bold text-foreground">{room.title}</Text>
-                <Meta>{room.meta}</Meta>
+                <View className="flex-row gap-3">
+                  {room.place ? (
+                    <Meta>{`${room.place.rank} ${room.place.title}`}</Meta>
+                  ) : (
+                    <Meta>{room.kindLabel}</Meta>
+                  )}
+                  {room.rate ? <Meta>{room.rate}</Meta> : null}
+                </View>
               </View>
               {room.unreadBadge ? (
                 <Badge text={room.unreadBadge} accessibilityLabel={`${room.unread} unread`} />
@@ -136,7 +146,7 @@ function MissionRooms(props: {
 
 /** Round 1 lists rooms with unread counts; reading and posting come next. */
 export function RoomsPanel(props: {
-  readonly missions: ReadonlyArray<{ readonly id: MissionId; readonly title: string }> | undefined;
+  readonly missions: ReadonlyArray<MissionListRow> | undefined;
   readonly nowMs: number;
 }) {
   if (props.missions === undefined) return <Meta>Loading rooms…</Meta>;
@@ -150,7 +160,7 @@ export function RoomsPanel(props: {
           key={mission.id}
           missionId={mission.id}
           title={mission.title}
-          nowMs={props.nowMs}
+          subMissions={mission.subMissions}
         />
       ))}
       <Meta>Opening a room to read and post is not built yet.</Meta>

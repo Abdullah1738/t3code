@@ -132,13 +132,26 @@ export function missionListRows(missions: ReadonlyArray<MissionListItem>): Missi
 // ---------------------------------------------------------------------------
 // Overview header
 
+/** The overview's stat strip: each value is a number with a state, never a sentence. */
+export interface OverviewStatsView {
+  /** The next open milestone's day, "Mon 19 Oct", with the mission's health beside it. */
+  readonly nextDay: string | null;
+  /** "1d 20h", "due now", "overdue 3h". */
+  readonly timeLeft: string | null;
+  readonly milestones: {
+    readonly done: number;
+    readonly atRisk: number;
+    readonly total: number;
+  } | null;
+  readonly lanes: { readonly stuck: number; readonly waiting: number; readonly total: number };
+}
+
 export interface OverviewHeaderView {
   readonly goal: string;
   readonly tone: HealthTone;
   readonly toneLabel: string;
   readonly paused: boolean;
-  /** "Mon 19 Oct · 1d 20h · 3 at risk · 1/4 done", or `null` with no open milestone. */
-  readonly milestoneLine: string | null;
+  readonly stats: OverviewStatsView;
   readonly usage: ReturnType<typeof usageView>;
   readonly lanesLine: string;
   readonly focusTitle: string | null;
@@ -149,21 +162,23 @@ export function overviewHeaderView(overview: MissionOverview, nowMs: number): Ov
   const paused = mission.status === "paused";
   const tone = healthTone(mission.health, paused);
   const next = nextMilestone(overview.milestones);
-  const milestoneLine = next
-    ? [
-        formatDayLabel(next.targetAt),
-        formatCountdown(next.targetAt, nowMs),
-        ...(next.atRisk > 0 ? [`${next.atRisk} at risk`] : []),
-        `${next.done}/${next.total} done`,
-      ].join(" · ")
-    : null;
   const focus = overview.subMissions.find((sub) => sub.id === mission.focusSubMissionId);
+  const lanes = overview.lanes;
   return {
     goal: mission.goal,
     tone,
     toneLabel: healthToneLabel(tone),
     paused,
-    milestoneLine,
+    stats: {
+      nextDay: next ? formatDayLabel(next.targetAt) : null,
+      timeLeft: next ? formatCountdown(next.targetAt, nowMs) : null,
+      milestones: next ? { done: next.done, atRisk: next.atRisk, total: next.total } : null,
+      lanes: {
+        stuck: lanes.stuck,
+        waiting: lanes.waiting,
+        total: lanes.working + lanes.stuck + lanes.waiting + lanes.idle + lanes.parked,
+      },
+    },
     usage: usageView(overview.usageShare),
     lanesLine: foldLaneCounts(overview.lanes).line,
     focusTitle: focus?.title ?? null,
@@ -460,29 +475,39 @@ export const ROOM_KIND_LABEL: Readonly<Record<RoomKind, string>> = {
   arch: "Architecture",
   lane: "Lane",
   custom: "Custom",
+  "owner-request": "Request",
 };
 
 export interface RoomRowView {
   readonly id: MissionRoomEntry["room"]["id"];
   readonly title: string;
   readonly kindLabel: string;
+  /** Sub-mission rank and title, or `null` for standing rooms. */
+  readonly place: { readonly rank: number; readonly title: string } | null;
+  /** Messages per hour, "48.8/h", or `null` with no noise reading. */
+  readonly rate: string | null;
   readonly unread: number;
   readonly unreadBadge: string | null;
-  /** "Sub-mission · 59 msgs/h · 55% actionable · 2m ago" */
-  readonly meta: string;
 }
 
-function noiseParts(noise: MissionRoomEntry["room"]["noise"]): string[] {
-  if (!noise) return [];
+function roomRate(noise: MissionRoomEntry["room"]["noise"]): string | null {
+  if (!noise) return null;
   const rate = noise.messagesPerHour;
-  const rateText = rate >= 10 ? Math.round(rate).toString() : rate.toFixed(1);
-  return [`${rateText} msgs/h`, `${formatPercent(noise.actionableShare)} actionable`];
+  return `${rate >= 10 ? Math.round(rate).toString() : rate.toFixed(1)}/h`;
 }
 
-/** Rooms with unread messages first, then most recent; archived rooms drop out. */
-export function roomRows(entries: ReadonlyArray<MissionRoomEntry>, nowMs: number): RoomRowView[] {
+/**
+ * Rooms with unread messages first, then most recent. Archived rooms drop
+ * out, and so do request rooms: those conversations live under Your requests
+ * or on the item they discuss.
+ */
+export function roomRows(
+  entries: ReadonlyArray<MissionRoomEntry>,
+  subMissions: ReadonlyArray<Pick<ListSubMission, "id" | "title" | "order">> = [],
+): RoomRowView[] {
+  const ranked = [...subMissions].sort((left, right) => left.order - right.order);
   return entries
-    .filter((entry) => !entry.room.archived)
+    .filter((entry) => !entry.room.archived && entry.room.kind !== "owner-request")
     .sort((left, right) => {
       const unread = Number(right.unread > 0) - Number(left.unread > 0);
       if (unread !== 0) return unread;
@@ -490,20 +515,24 @@ export function roomRows(entries: ReadonlyArray<MissionRoomEntry>, nowMs: number
       const rightAt = right.room.lastMessageAt ? Date.parse(right.room.lastMessageAt) : 0;
       return rightAt - leftAt || left.room.title.localeCompare(right.room.title);
     })
-    .map(({ room, unread }) => ({
-      id: room.id,
-      title: room.title,
-      kindLabel: ROOM_KIND_LABEL[room.kind],
-      unread,
-      unreadBadge: unread > 0 ? badgeCount(unread) : null,
-      meta: [
-        ROOM_KIND_LABEL[room.kind],
-        ...noiseParts(room.noise),
-        ...(room.lastMessageAt ? [formatRelative(room.lastMessageAt, nowMs)] : []),
-      ].join(" · "),
-    }));
+    .map(({ room, unread }) => {
+      const index = ranked.findIndex((sub) => sub.id === room.subMissionId);
+      return {
+        id: room.id,
+        title: room.title,
+        kindLabel: ROOM_KIND_LABEL[room.kind],
+        place: index >= 0 ? { rank: ranked[index]!.order + 1, title: ranked[index]!.title } : null,
+        rate: roomRate(room.noise),
+        unread,
+        unreadBadge: unread > 0 ? badgeCount(unread) : null,
+      };
+    });
 }
 
 export function unreadTotal(entries: ReadonlyArray<MissionRoomEntry>): number {
-  return entries.reduce((sum, entry) => sum + (entry.room.archived ? 0 : entry.unread), 0);
+  return entries.reduce(
+    (sum, entry) =>
+      sum + (entry.room.archived || entry.room.kind === "owner-request" ? 0 : entry.unread),
+    0,
+  );
 }

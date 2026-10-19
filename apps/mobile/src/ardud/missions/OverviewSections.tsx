@@ -29,11 +29,46 @@ export function OverviewHeader(props: { readonly view: OverviewHeaderView }) {
         <Text className="text-sm font-t3-bold text-foreground">{view.toneLabel}</Text>
       </View>
       <Body>{view.goal}</Body>
-      {view.milestoneLine ? <Meta>Next milestone: {view.milestoneLine}</Meta> : null}
-      <Meta>{view.lanesLine}</Meta>
+      <View className="flex-row flex-wrap gap-x-5 gap-y-2">
+        {view.stats.nextDay ? <Stat label={view.stats.nextDay} value={view.toneLabel} /> : null}
+        {view.stats.timeLeft ? <Stat label="Time left" value={view.stats.timeLeft} /> : null}
+        {view.stats.milestones ? (
+          <Stat
+            label="Milestones"
+            value={`${view.stats.milestones.done} of ${view.stats.milestones.total}`}
+            warning={view.stats.milestones.atRisk > 0}
+          />
+        ) : null}
+        <Stat
+          label="Lanes"
+          value={`${view.stats.lanes.stuck} stuck of ${view.stats.lanes.total}`}
+          warning={view.stats.lanes.stuck > 0}
+        />
+      </View>
       <Meta warning={view.usage.tone === "borrowing"}>{view.usage.label}</Meta>
       {view.focusTitle ? <Meta>Focus: {view.focusTitle}</Meta> : null}
     </Card>
+  );
+}
+
+function Stat(props: {
+  readonly label: string;
+  readonly value: string;
+  readonly warning?: boolean;
+}) {
+  return (
+    <View className="gap-0.5">
+      <Meta>{props.label}</Meta>
+      <Text
+        className={
+          props.warning
+            ? "text-sm font-t3-bold text-adaptive-amber-700-300"
+            : "text-sm font-t3-bold text-foreground"
+        }
+      >
+        {props.value}
+      </Text>
+    </View>
   );
 }
 
