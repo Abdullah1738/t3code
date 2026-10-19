@@ -18,6 +18,7 @@ import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
@@ -38,9 +39,18 @@ import { openCodeUsageReader, type OpenCodeUsageReaderEnv } from "./usage.ts";
 import { readOpenCodeGoUsageLimits } from "./usageLimits.ts";
 import { loadOpenCode2Catalog } from "./openCode2Catalog.ts";
 import {
+  boundedCatalogRead,
+  catalogDiffersFromSnapshot,
+  followOpenCode2CatalogChanges,
+  isPendingSnapshot,
+  makeSettledOpenCode2ModelLoader,
+  openCode2CatalogChanges,
+  readSettledOpenCode2Models,
+  subscribeOpenCode2CatalogFrames,
+} from "./ardud/catalogSettle.ts";
+import {
   checkOpenCodeProviderStatus,
   loadOpenCode2Workspace,
-  makeOpenCode2ModelLoader,
   makePendingOpenCodeProvider,
   openCode2CommandsToServerProviderSlashCommands,
   openCode2SkillsToServerProviderSkills,
@@ -310,9 +320,18 @@ export const OpenCodeDriver: ProviderDriver<
           Effect.provideService(OpenCode2Server.OpenCode2Server, openCode2Server),
         ),
       });
-      const loadOpenCode2Models = yield* makeOpenCode2ModelLoader(
-        openCode2Server.withConnection(({ client }) =>
-          loadOpenCode2Catalog(client, host.paths.cwd),
+      // A location the server has not loaded yet lists a partial catalog until
+      // its plugins settle, so a listing counts once it holds still.
+      const readOpenCode2Catalog = (client: Parameters<typeof loadOpenCode2Catalog>[0]) =>
+        boundedCatalogRead(loadOpenCode2Catalog(client, host.paths.cwd));
+      const loadOpenCode2Models = yield* makeSettledOpenCode2ModelLoader(
+        openCode2Server.withConnection(({ client, events }) =>
+          openCode2CatalogChanges(events, host.paths.cwd).pipe(
+            Effect.flatMap((changed) =>
+              readSettledOpenCode2Models(readOpenCode2Catalog(client), changed),
+            ),
+            Effect.scoped,
+          ),
         ),
       );
       // A 2.x server lists skills and commands per directory, so one server
@@ -485,6 +504,46 @@ export const OpenCodeDriver: ProviderDriver<
             }),
         ),
       );
+
+      // Health checks do not run on an interval, so a configured 2.x server's
+      // later catalog changes re-read the models, and refresh when they moved.
+      // A spawned server is left alone: a standing subscription would keep it
+      // from stopping when idle.
+      if (effectiveConfig.enabled && effectiveConfig.serverUrl.trim().length > 0) {
+        yield* followOpenCode2CatalogChanges({
+          subscribe: Effect.gen(function* () {
+            const probed = yield* runtimeProbe.get;
+            if (probed.generation !== "v2") {
+              return yield* new OpenCodeRuntime.OpenCodeRuntimeError({
+                operation: "event.subscribe",
+                detail: "The configured server is not an OpenCode 2 server.",
+              });
+            }
+            return yield* subscribeOpenCode2CatalogFrames({
+              httpClient,
+              serverUrl: effectiveConfig.serverUrl,
+              serverPassword: effectiveConfig.serverPassword,
+              directory: host.paths.cwd,
+            });
+          }),
+          onChange: Effect.gen(function* () {
+            // A change during the startup probe is judged against its result.
+            const settled = yield* snapshot.getSnapshot.pipe(
+              Effect.repeat({
+                until: (current) => !isPendingSnapshot(current),
+                schedule: Schedule.spaced("500 millis"),
+              }),
+              Effect.timeoutOption("2 minutes"),
+            );
+            if (settled._tag === "None") return;
+            const current = settled.value;
+            const listed = yield* openCode2Server.withConnection(({ client }) =>
+              readOpenCode2Catalog(client),
+            );
+            if (catalogDiffersFromSnapshot(current, listed)) yield* snapshot.refresh;
+          }),
+        });
+      }
 
       return {
         instanceId,
