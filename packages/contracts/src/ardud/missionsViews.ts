@@ -670,7 +670,8 @@ export const VIEW_TAB_TITLES: { readonly [K in ViewTabKind]: string } = {
 };
 
 /** Regions where a built-in page section shows on the mission overview. */
-const OVERVIEW_REGIONS: ReadonlySet<ViewRegion> = new Set(["header", "main", "rail"]);
+/** Where Needs you and Your requests count as shown; the header carries stats only. */
+const OVERVIEW_REGIONS: ReadonlySet<ViewRegion> = new Set(["main", "rail"]);
 
 /** The overview page is gone when its tab is hidden or removed while other tabs remain. */
 export const viewLayoutShowsOverview = (layout: ViewLayoutDefinition): boolean => {
@@ -1251,6 +1252,7 @@ export const RestoreViewInput = Schema.Struct({
   missionId: MissionId,
   ref: ViewRef,
   toVersion: Schema.optionalKey(PositiveInt),
+  expectedVersion: Schema.optionalKey(PositiveInt),
   changeNote: Schema.optionalKey(MissionSummaryText),
 });
 export type RestoreViewInput = typeof RestoreViewInput.Type;
@@ -1268,6 +1270,7 @@ export type EditViewLayoutInput = typeof EditViewLayoutInput.Type;
 export const RestoreViewLayoutInput = Schema.Struct({
   missionId: MissionId,
   toVersion: PositiveInt,
+  expectedVersion: Schema.optionalKey(PositiveInt),
   changeNote: Schema.optionalKey(MissionSummaryText),
 });
 export type RestoreViewLayoutInput = typeof RestoreViewLayoutInput.Type;
@@ -1282,6 +1285,7 @@ export type EditStarterLayoutInput = typeof EditStarterLayoutInput.Type;
 
 export const RestoreStarterLayoutInput = Schema.Struct({
   toVersion: PositiveInt,
+  expectedVersion: Schema.optionalKey(PositiveInt),
   changeNote: Schema.optionalKey(MissionSummaryText),
 });
 export type RestoreStarterLayoutInput = typeof RestoreStarterLayoutInput.Type;
@@ -1383,6 +1387,10 @@ export const MissionViewsSnapshot = Schema.Struct({
   /** True when the pinned strip shows (either part of `pinned`). */
   pinnedStrip: Schema.Boolean,
   pinned: ViewPinned,
+  /**
+   * The master's view changes in the last 24 hours (starter edits included),
+   * against `layout.layout.limits.changesPerDay`. The owner is never metered.
+   */
   changesToday: NonNegativeInt,
 });
 export type MissionViewsSnapshot = typeof MissionViewsSnapshot.Type;
