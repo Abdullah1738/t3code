@@ -17,7 +17,6 @@ import { describe, expect, it } from "vite-plus/test";
 
 import type {
   ApprovalRoutingTable,
-  MissionForkEntry,
   MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionRoomEntry,
@@ -257,35 +256,18 @@ describe("fixture missions source", () => {
     expect(inbox.value.counts.fyi).toBe(inbox.value.fyi.length);
   });
 
-  it("a Discuss on a call is a request about it, and only Ask the mission forks", async () => {
+  it("a Discuss on a call is a request about it and keeps the call waiting", async () => {
     const source = createFixtureMissionsSource({ now });
-    const forks = latest<ReadonlyArray<MissionForkEntry>>((l) => source.subscribeForks(CRPKO, l));
-    const callId = "call-10211" as never;
     const overview = latest<MissionOverviewSnapshot | null>((l) =>
       source.subscribeOverview(CRPKO, l),
     );
     const inCheck = (id: string) => overview.value!.directionCheck.some((i) => i.ref.id === id);
-    const forksBefore = forks.value.length;
     const subject = { kind: "call" as const, id: "call-10211", label: "x" };
     const request = await source.openRequest({ missionId: CRPKO, text: "Why now?", subject });
     expect(request.subject).toMatchObject({ kind: "call", id: "call-10211" });
-    // No fork, and the call keeps waiting in the direction check.
-    expect(forks.value).toHaveLength(forksBefore);
-    expect(inCheck(callId)).toBe(true);
+    expect(inCheck("call-10211")).toBe(true);
     await source.reactToCall({ callId: "call-10194" as never, reaction: "ok" });
     expect(inCheck("call-10194")).toBe(false);
-    await expect(
-      source.openFork({ missionId: CRPKO, kind: "owner-question", origin: null, question: "" }),
-    ).rejects.toBeInstanceOf(MissionError);
-    const asked = await source.openFork({
-      missionId: CRPKO,
-      kind: "owner-question",
-      origin: null,
-      question: "Why is risk#68 still the Monday risk?",
-    });
-    expect(forks.value[0]?.fork.id).toBe(asked.fork.id);
-    await source.archiveFork({ forkId: asked.fork.id });
-    expect(forks.value[0]?.fork.status).toBe("archived");
   });
 
   it("records who last changed the intended share and locks nothing", async () => {

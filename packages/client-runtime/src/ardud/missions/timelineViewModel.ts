@@ -75,7 +75,7 @@ const PREFIXES: Record<string, { readonly group: TimelineKindGroup; readonly kic
   knock: { group: "inbox", kicker: "Knock" },
   note: { group: "inbox", kicker: "Note" },
   "secret-request": { group: "inbox", kicker: "Secret request" },
-  fork: { group: "inbox", kicker: "Side question" },
+  fork: { group: "inbox", kicker: "Question" },
   request: { group: "requests", kicker: "Request" },
   room: { group: "rooms", kicker: "Room" },
   message: { group: "rooms", kicker: "Message" },

@@ -19,7 +19,6 @@ import {
   createSnapshotStore,
   type SampledFeed,
   type ApprovalRoutingTable,
-  type MissionForkEntry,
   type MissionInboxSnapshot,
   type MissionOverviewSnapshot,
   type MissionViewsState,
@@ -112,9 +111,6 @@ const draftNoteStores = createKeyedSnapshotStores<MissionId | null, ReadonlyArra
 );
 const statsStore = createSnapshotStore<ReadonlyArray<SuggestionStats>>((emit) =>
   missionsSource.subscribeSuggestionStats(emit),
-);
-const forkStores = createKeyedSnapshotStores<MissionId | null, ReadonlyArray<MissionForkEntry>>(
-  (id, emit) => missionsSource.subscribeForks(id, emit),
 );
 const ruleStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Rule>>((id, emit) =>
   missionsSource.subscribeRules(id, emit),
@@ -269,14 +265,6 @@ export function useDraftNotes(missionId: MissionId | null): ReadonlyArray<DraftN
 
 export function useSuggestionStats(): ReadonlyArray<SuggestionStats> | undefined {
   return useSyncExternalStore(statsStore.subscribe, statsStore.get);
-}
-
-/** Forks of the master, newest first. */
-export function useMissionForks(
-  missionId: MissionId | null,
-): ReadonlyArray<MissionForkEntry> | undefined {
-  const store = forkStores(missionId);
-  return useSyncExternalStore(store.subscribe, store.get);
 }
 
 export function useMissionRules(missionId: MissionId): ReadonlyArray<Rule> | undefined {

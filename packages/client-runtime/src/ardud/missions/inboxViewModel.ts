@@ -31,12 +31,7 @@ import type {
 } from "@t3tools/contracts";
 
 import { routedTo, suggestionsFor, type InboxRouteFilter } from "./routingViewModel.ts";
-import type {
-  AddDraftNoteInput,
-  MissionForkEntry,
-  MissionInboxSnapshot,
-  OpenForkInput,
-} from "./source.ts";
+import type { AddDraftNoteInput, MissionInboxSnapshot } from "./source.ts";
 import { diffStats, diffWords, type DiffSegment, type DiffStats } from "./textDiff.ts";
 import { actorLabel, refLabel } from "./viewModel.ts";
 
@@ -287,56 +282,6 @@ export function answerAskInput(
   }
   if (answer.optionId === null && text === "") return err("Pick an option or write an answer.");
   return ok({ askId: ask.id, optionId: answer.optionId, text } as AnswerAskInput);
-}
-
-// ---------------------------------------------------------------------------
-// Forks (side questions). Discuss on a record is an owner request, not a fork.
-
-export const FORK_KIND_LABEL: Record<MissionForkEntry["fork"]["kind"], string> = {
-  discuss: "Discuss",
-  "dev-question": "Dev question",
-  "owner-question": "Your question",
-};
-
-/** The open fork about one record, if one was started before Discuss moved to requests. */
-export function openForkFor(
-  forks: ReadonlyArray<MissionForkEntry>,
-  ref: Pick<MissionRecordRef, "kind" | "id">,
-): MissionForkEntry | null {
-  return (
-    forks.find(
-      (entry) =>
-        entry.fork.status === "open" &&
-        entry.fork.origin !== null &&
-        "id" in entry.fork.origin &&
-        entry.fork.origin.kind === ref.kind &&
-        entry.fork.origin.id === ref.id,
-    ) ?? null
-  );
-}
-
-/** "Ask the mission": an owner side question answered by a fork of the master. */
-export function askTheMissionInput(missionId: MissionId, question: string): Result<OpenForkInput> {
-  const trimmed = question.trim();
-  if (trimmed === "") return err("Write the question first.");
-  return ok({ missionId, kind: "owner-question", origin: null, question: trimmed });
-}
-
-export function forkTitle(entry: MissionForkEntry): string {
-  if (entry.question) return entry.question;
-  const origin = entry.fork.origin;
-  if (origin === null) return "Side question";
-  return "id" in origin ? refLabel(origin) : origin.label;
-}
-
-export function splitForks(forks: ReadonlyArray<MissionForkEntry>): {
-  readonly open: ReadonlyArray<MissionForkEntry>;
-  readonly closed: ReadonlyArray<MissionForkEntry>;
-} {
-  return {
-    open: forks.filter((entry) => entry.fork.status === "open"),
-    closed: forks.filter((entry) => entry.fork.status !== "open"),
-  };
 }
 
 // ---------------------------------------------------------------------------

@@ -121,7 +121,12 @@ export function useRequestOpener(missionId: MissionId) {
   );
 }
 
-function RequestComposer(props: { missionId: MissionId; onOpened: (id: string) => void }) {
+/** Opens a new owner request; every question to the master starts here. */
+export function RequestComposer(props: {
+  missionId: MissionId;
+  onOpened: (id: string) => void;
+  autoFocus?: boolean;
+}) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const send = async () => {
@@ -143,6 +148,7 @@ function RequestComposer(props: { missionId: MissionId; onOpened: (id: string) =
     >
       <Textarea
         size="sm"
+        autoFocus={props.autoFocus}
         aria-label="Ask or tell the master"
         placeholder="Ask or tell the master"
         value={text}

@@ -14,7 +14,6 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   addDraftNoteInput,
   answerAskInput,
-  askTheMissionInput,
   askView,
   blocksLine,
   decideDraftInput,
@@ -32,12 +31,11 @@ import {
   inboxUiReducer,
   keepSelection,
   moveSelection,
-  openForkFor,
   recommendationLine,
   suggestionTrackRecord,
   waitingLabel,
 } from "./inboxViewModel.ts";
-import type { MissionForkEntry, MissionInboxSnapshot } from "./source.ts";
+import type { MissionInboxSnapshot } from "./source.ts";
 
 const T0 = "2026-10-17T08:00:00.000Z";
 const NOW = Date.parse("2026-10-17T08:33:00.000Z");
@@ -424,35 +422,7 @@ describe("knocks and suggestions", () => {
   });
 });
 
-describe("forks and FYI", () => {
-  it("finds the open fork about a record", () => {
-    const fork = (id: string, status: string, origin: unknown): MissionForkEntry =>
-      ({ fork: { id, status, kind: "discuss", origin }, question: null }) as never;
-    const forks = [
-      fork("closed", "archived", { kind: "call", id: "call-1" }),
-      fork("open", "open", { kind: "call", id: "call-1" }),
-      fork("link", "open", { kind: "url", label: "x", url: null, ref: null }),
-    ];
-    expect(openForkFor(forks, { kind: "call", id: "call-1" })?.fork.id).toBe("open");
-    expect(openForkFor(forks, { kind: "call", id: "call-2" })).toBeNull();
-  });
-
-  it("needs a question before asking the mission", () => {
-    expect(askTheMissionInput("m" as never, " ")).toEqual({
-      ok: false,
-      error: "Write the question first.",
-    });
-    expect(askTheMissionInput("m" as never, " Is risk#68 on time? ")).toEqual({
-      ok: true,
-      value: {
-        missionId: "m",
-        kind: "owner-question",
-        origin: null,
-        question: "Is risk#68 on time?",
-      },
-    });
-  });
-
+describe("FYI", () => {
   it("separates observed from claimed and shows the evidence state", () => {
     const note = decodeFyi({
       id: "n",

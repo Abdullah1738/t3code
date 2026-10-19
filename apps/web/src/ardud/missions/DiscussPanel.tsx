@@ -18,9 +18,9 @@ import { discussRecord, markRequestRead, replyRequest, settleRequest } from "./m
 import { useOwnerRequests } from "./missionsStore";
 import { RequestMessage, STATUS_GLYPH } from "./sections/YourRequests";
 
-// Discuss on a Needs-you card: an owner request about the record, never a
-// fork. The card shows the open conversation inline; the full thread lives
-// under Your requests. The record keeps waiting until someone decides it.
+// Discuss on a Needs-you card: an owner request about the record. The card
+// shows the open conversation inline; the full thread lives under Your
+// requests. The record keeps waiting until someone decides it.
 
 /** Newest messages shown on a card; the rest are one click away. */
 const CARD_MESSAGES = 2;

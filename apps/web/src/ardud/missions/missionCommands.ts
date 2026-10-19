@@ -1,7 +1,6 @@
 import type {
   CallId,
   DraftNoteId,
-  ForkId,
   MissionId,
   MissionRecordRef,
   SubMissionId,
@@ -9,7 +8,6 @@ import type {
 import {
   addDraftNoteInput,
   askSectionChangeText,
-  askTheMissionInput,
   discussRequestInput,
   discussSectionText,
   openRequestInput,
@@ -116,19 +114,6 @@ export function addDraftNote(
     (input) => missionsSource.addDraftNote(input),
     "Couldn't add the note",
   );
-}
-
-/** "Ask the mission": opens an owner-question fork of the master. */
-export function askTheMission(missionId: MissionId, question: string) {
-  return submitMissionInput(
-    askTheMissionInput(missionId, question),
-    (input) => missionsSource.openFork(input),
-    "Couldn't ask the mission",
-  );
-}
-
-export function closeFork(forkId: ForkId) {
-  return runMissionAction(missionsSource.archiveFork({ forkId }), "Couldn't close the discussion");
 }
 
 // --- Layout (views record) ---

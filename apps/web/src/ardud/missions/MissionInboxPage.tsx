@@ -16,7 +16,6 @@ import {
   INBOX_TABS,
   inboxTabCounts,
   ownerConditionOf,
-  splitForks,
   staleApprovals,
   totalNeedsYou,
   type InboxEntry,
@@ -51,14 +50,12 @@ import { AgeElement, CountBadge, HealthGlyph, needsYouLabel } from "./cards/chip
 import { ConditionNote } from "./DiscussPanel";
 import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
-import { MissionForksList } from "./MissionForksList";
 import { MissionSection } from "./MissionSection";
 import { RoutingPanel } from "./RoutingPanel";
 import {
   isSampleFeed,
   useDraftNotes,
   useMasterRoleId,
-  useMissionForks,
   useMissionInbox,
   useMissionInboxHistory,
   useMissionList,
@@ -309,7 +306,6 @@ function InboxBody(props: {
 }) {
   const { screen, nowMs } = props;
   const masterRoleId = useMasterRoleId(props.missionId);
-  const forks = useMissionForks(props.missionId) ?? NONE;
   const draftNotes = useDraftNotes(props.missionId) ?? NONE;
   const allStats = useSuggestionStats();
   const missionList = useMissionList();
@@ -329,7 +325,6 @@ function InboxBody(props: {
     [draftNotes, stats, missionList, masterRoleId, nowMs, actions],
   );
   const selected = screen.selected;
-  const openForks = splitForks(forks).open.length;
 
   const listView =
     screen.entries.length === 0 ? (
@@ -361,9 +356,7 @@ function InboxBody(props: {
       />
     </div>
   ));
-  const extras = (
-    <InboxExtras missionId={props.missionId} tab={props.tab} nowMs={nowMs} openForks={openForks} />
-  );
+  const extras = <InboxExtras missionId={props.missionId} tab={props.tab} nowMs={nowMs} />;
   const entryKeys = useMemo(() => screen.entries.map((entry) => entry.key), [screen.entries]);
   const paneRef = usePaneFocus(selected?.key ?? null, props.wide, entryKeys);
 
@@ -541,25 +534,9 @@ function InboxRow(props: {
   );
 }
 
-/** What sits under the list for a tab: open discussions, routing, history, draft notes. */
-function InboxExtras(props: {
-  missionId: MissionId | null;
-  tab: InboxTab;
-  nowMs: number;
-  openForks: number;
-}) {
-  if (props.tab === "decide") {
-    return (
-      <>
-        {props.openForks > 0 ? (
-          <MissionSection title="Open discussions">
-            <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
-          </MissionSection>
-        ) : null}
-        <AnsweredOnCondition missionId={props.missionId} />
-      </>
-    );
-  }
+/** What sits under the list for a tab: decisions on a condition, routing, history, draft notes. */
+function InboxExtras(props: { missionId: MissionId | null; tab: InboxTab; nowMs: number }) {
+  if (props.tab === "decide") return <AnsweredOnCondition missionId={props.missionId} />;
   if (props.tab !== "approve") return null;
   return (
     <>

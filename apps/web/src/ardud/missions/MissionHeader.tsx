@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { CrosshairIcon, MessageCircleQuestionIcon, PauseIcon, PlayIcon } from "lucide-react";
 
@@ -12,7 +12,6 @@ import {
   nextMilestone,
   poolUsageView,
   priorityStack,
-  splitForks,
   type MissionOverviewSnapshot,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -30,9 +29,13 @@ import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../compo
 import { cn } from "../../lib/utils";
 import { GlyphCount, HealthStatus } from "./cards/chips";
 import { setMissionFocus, toggleMissionPaused } from "./missionCommands";
-import { AskTheMissionForm, MissionForksList } from "./MissionForksList";
-import { useMissionForks, useMissionList, useOwnerRequests } from "./missionsStore";
-import { RequestsUnreadLink, unreadRequests } from "./sections/YourRequests";
+import { useMissionList, useOwnerRequests } from "./missionsStore";
+import {
+  RequestComposer,
+  RequestsUnreadLink,
+  unreadRequests,
+  useRequestOpener,
+} from "./sections/YourRequests";
 
 /** Title, the owner's controls, goal, focus and the mission's headline numbers. */
 export function MissionHead(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
@@ -54,7 +57,7 @@ export function MissionHead(props: { overview: MissionOverviewSnapshot; nowMs: n
             title={mission.title}
             paused={mission.status === "paused"}
           />
-          <AskTheMission missionId={mission.id} title={mission.title} nowMs={nowMs} />
+          <AskTheMaster missionId={mission.id} />
         </div>
       </div>
       {mission.goal ? (
@@ -134,35 +137,27 @@ function PauseButton(props: { missionId: MissionId; title: string; paused: boole
   );
 }
 
-/**
- * "Ask the mission" plus the open side-question forks, so every open fork is
- * one tap from the head. Discuss on a card is an owner request, not a fork.
- */
-function AskTheMission(props: { missionId: MissionId; title: string; nowMs: number }) {
-  const forks = useMissionForks(props.missionId);
-  const openCount = forks ? splitForks(forks).open.length : 0;
+/** A question to the master from any tab: it opens one of Your requests. */
+function AskTheMaster(props: { missionId: MissionId }) {
+  const [open, setOpen] = useState(false);
+  const openRequest = useRequestOpener(props.missionId);
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger render={<Button variant="outline" size="sm" />}>
         <MessageCircleQuestionIcon aria-hidden />
-        <span className="max-sm:sr-only">Ask the mission</span>
-        {openCount > 0 ? (
-          <span className="text-xs font-normal text-muted-foreground tabular-nums">
-            {openCount}
-            <span className="sr-only"> open</span>
-          </span>
-        ) : null}
+        <span className="max-sm:sr-only">Ask the master</span>
       </PopoverTrigger>
       <PopoverPopup align="end" side="bottom" className="w-80">
-        <PopoverTitle>Ask {props.title}</PopoverTitle>
-        <div className="mt-2 flex flex-col gap-3">
-          <AskTheMissionForm missionId={props.missionId} />
-          {openCount > 0 ? (
-            <div className="flex flex-col gap-1">
-              <h3 className="text-xs font-medium text-muted-foreground">Open discussions</h3>
-              <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
-            </div>
-          ) : null}
+        <PopoverTitle>Ask the master</PopoverTitle>
+        <div className="mt-2">
+          <RequestComposer
+            missionId={props.missionId}
+            autoFocus
+            onOpened={(id) => {
+              setOpen(false);
+              openRequest(id);
+            }}
+          />
         </div>
       </PopoverPopup>
     </Popover>
