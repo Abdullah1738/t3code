@@ -40,6 +40,7 @@ import { actorKey, type MemberKind } from "./model.ts";
  * - `tuning`: per-room mute flag and when the owner or master last tuned it.
  * - `reminders`: deliveries that got their one reminder. Still unread after it
  *   means the master's attention view, never another ring.
+ * - `notices`: the route each system notice took, so its retry takes the same.
  *
  * The guard's authority table is made here too, at boot: `checkSend` reads it
  * (fork lineage) and a read must never be what creates it.
@@ -161,6 +162,14 @@ const DDL = [
     seq INTEGER NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (component, mission_id)
+  )`,
+  // The route each system notice took (see `MissionRouter.notify`), so a retry
+  // takes the same one even if the thread's membership changed in between.
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_notices (
+    notice_key TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    mission_id TEXT,
+    at TEXT NOT NULL
   )`,
 ];
 
@@ -410,6 +419,21 @@ export class RouterStore extends Context.Service<
       readonly component: string;
       readonly missionId: MissionId;
       readonly seq: number;
+      readonly at: string;
+    }) => Effect.Effect<void>;
+    /**
+     * The route a system notice took: the mission whose control room it went
+     * through, or null when it was queued to the thread directly. Absent when
+     * the key never went out.
+     */
+    readonly noticeRoute: (
+      key: string,
+    ) => Effect.Effect<{ readonly missionId: MissionId | null } | null>;
+    /** Records a notice's route; the first one stands. */
+    readonly recordNotice: (input: {
+      readonly key: string;
+      readonly threadId: ThreadId;
+      readonly missionId: MissionId | null;
       readonly at: string;
     }) => Effect.Effect<void>;
   }
@@ -1242,6 +1266,32 @@ const make = Effect.gen(function* () {
         ON CONFLICT (component, mission_id) DO UPDATE SET
           seq = MAX(seq, excluded.seq),
           updated_at = excluded.updated_at
+      `),
+
+    noticeRoute: (key) =>
+      read(
+        sql<{ readonly missionId: string | null }>`
+          SELECT mission_id AS "missionId" FROM ardud_mission_router_notices
+          WHERE notice_key = ${key}
+        `.pipe(
+          Effect.map((rows) => {
+            const row = rows[0];
+            return row === undefined
+              ? null
+              : { missionId: row.missionId === null ? null : (row.missionId as MissionId) };
+          }),
+        ),
+      ),
+
+    recordNotice: ({ key, threadId, missionId, at }) =>
+      write(sql`
+        INSERT INTO ardud_mission_router_notices ${sql.insert({
+          notice_key: key,
+          thread_id: threadId,
+          mission_id: missionId,
+          at,
+        })}
+        ON CONFLICT (notice_key) DO NOTHING
       `),
   });
 });

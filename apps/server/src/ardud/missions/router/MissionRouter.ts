@@ -322,7 +322,8 @@ export class MissionRouter extends Context.Service<
      * A mission member gets it as a control-room request addressed to it,
      * posted as the producer, and its doorbell rings when it is free. Any
      * other thread gets the text queued directly. `key` makes retries land
-     * once on either path. A gone thread fails `not-found`.
+     * once: a retry takes the first attempt's path, whatever the thread's
+     * membership is by then. A gone thread fails `not-found`.
      */
     readonly notify: (notice: SystemNotice) => Effect.Effect<SystemNoticeOutcome, MissionError>;
     /**
@@ -1610,8 +1611,24 @@ const make = Effect.gen(function* () {
       if (isGone(yield* threads.facts(input.threadId))) {
         return yield* fail("not-found", `Thread ${input.threadId} is gone.`);
       }
-      const member = yield* membershipIn(everywhere, input.threadId);
+      // A retry takes the route the first attempt took, even if the thread
+      // joined or left a mission since: the other route would send it twice.
+      const route = yield* rooms.noticeRoute(input.key);
+      const member =
+        route === null
+          ? yield* membershipIn(everywhere, input.threadId)
+          : route.missionId === null
+            ? null
+            : { missionId: route.missionId };
       if (member === null) {
+        if (route === null) {
+          yield* rooms.recordNotice({
+            key: input.key,
+            threadId: input.threadId,
+            missionId: null,
+            at: yield* nowIso,
+          });
+        }
         yield* threads.send({
           threadId: input.threadId,
           text: input.text,
@@ -1635,6 +1652,12 @@ const make = Effect.gen(function* () {
         provenance,
         author: actorOf(provenance),
         authorThread: null,
+        alongside: rooms.recordNotice({
+          key: input.key,
+          threadId: input.threadId,
+          missionId: member.missionId,
+          at: yield* nowIso,
+        }),
       });
       // A retry finds the message already posted and rings nothing, so ring
       // here: a ring that failed last time gets another go. The doorbell only
