@@ -75,6 +75,7 @@ const DDL = [
 
 const BOOTS_KEPT = 20;
 const RECENT_INCIDENTS = 50;
+const MISSION_INCIDENTS = 50;
 const ITEMS_PER_RUN = 12;
 const IN_CHUNK = 400;
 
@@ -214,6 +215,10 @@ export class RecoveryStore extends Context.Service<
     readonly openIncidents: Effect.Effect<ReadonlyArray<RecoveryIncident>>;
     /** Newest first. */
     readonly recentIncidents: Effect.Effect<ReadonlyArray<RecoveryIncident>>;
+    // --- policy additions ---
+    /** Incidents that touched the mission, newest first (the latest MISSION_INCIDENTS). */
+    readonly incidentsOf: (missionId: MissionId) => Effect.Effect<ReadonlyArray<RecoveryIncident>>;
+    // --- end policy additions ---
 
     readonly settings: (missionId: MissionId) => Effect.Effect<MissionRecoverySettings | null>;
     readonly saveSettings: (settings: MissionRecoverySettings, at: string) => Effect.Effect<void>;
@@ -402,6 +407,17 @@ const make = Effect.gen(function* () {
       ORDER BY detected_at DESC LIMIT ${RECENT_INCIDENTS}
     `,
   ).pipe(Effect.flatMap(decodeRows));
+
+  const incidentsOf = (missionId: MissionId) =>
+    read(
+      sql<{ readonly incident_json: string }>`
+        SELECT incident_json FROM ardud_mission_recovery_incidents
+        WHERE EXISTS (
+          SELECT 1 FROM json_each(incident_json, '$.missionIds') WHERE value = ${missionId}
+        )
+        ORDER BY detected_at DESC LIMIT ${MISSION_INCIDENTS}
+      `,
+    ).pipe(Effect.flatMap(decodeRows));
 
   const settings = (missionId: MissionId) =>
     read(
@@ -786,6 +802,7 @@ const make = Effect.gen(function* () {
     incident,
     openIncidents,
     recentIncidents,
+    incidentsOf,
     settings,
     saveSettings,
     noticeClaim,

@@ -179,6 +179,12 @@ export class RecoveryService extends Context.Service<
       threadIds: ReadonlyArray<ThreadId>,
     ) => Effect.Effect<ReadonlyArray<RecoveryMember>, MissionError>;
     readonly status: (missionId: MissionId) => Effect.Effect<MissionRecoveryStatus, MissionError>;
+    // --- policy additions ---
+    /** Incidents that touched the mission, newest first, each narrowed to its threads. */
+    readonly incidents: (
+      missionId: MissionId,
+    ) => Effect.Effect<ReadonlyArray<RecoveryIncident>, MissionError>;
+    // --- end policy additions ---
     /** Owner or master: resume now, hold, release, skip, reorder, add an instruction. */
     readonly resume: (
       provenance: MissionProvenance,
@@ -1152,6 +1158,20 @@ export const make = Effect.gen(function* () {
       } satisfies MissionRecoveryStatus;
     });
 
+  // --- policy additions ---
+  const incidents = (missionId: MissionId) =>
+    Effect.gen(function* () {
+      const mission = yield* store.get("mission", missionId);
+      if (Option.isNone(mission)) return yield* notFound(`No mission ${missionId}.`);
+      const touched = yield* recovery.incidentsOf(missionId);
+      return touched.map((incident): RecoveryIncident => ({
+        ...incident,
+        missionIds: [missionId],
+        threads: missionThreads(incident, missionId),
+      }));
+    });
+  // --- end policy additions ---
+
   // --- owner and master controls ---
 
   /**
@@ -1563,6 +1583,7 @@ export const make = Effect.gen(function* () {
     report,
     members: membersOf,
     status,
+    incidents,
     resume,
     setSettings,
     onSuccession,

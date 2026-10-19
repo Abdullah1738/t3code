@@ -20,6 +20,7 @@ import {
   MissionId,
   MissionRecoverySettings,
   MissionRecoveryStatus,
+  RecoveryIncident,
   RecoveryResumeInput,
   RecoverySettingsInput,
 } from "./missions.ts";
@@ -28,6 +29,9 @@ export const MISSIONS_RECOVERY_WS_METHODS = {
   status: "missions.recovery.status",
   resume: "missions.recovery.resume",
   settings: "missions.recovery.settings",
+  // --- policy additions ---
+  incidents: "missions.recovery.incidents",
+  // --- end policy additions ---
 } as const;
 
 type RecoveryMethod =
@@ -49,11 +53,18 @@ export const MissionsRecoveryRpcs = RpcGroup.make(
   /** Resume now, hold, release, skip, reorder, or add an instruction. */
   call(M.resume, RecoveryResumeInput, MissionRecoveryStatus),
   call(M.settings, RecoverySettingsInput, MissionRecoverySettings),
+  // --- policy additions ---
+  /** Incidents that touched the mission, newest first, narrowed to its threads. */
+  call(M.incidents, Schema.Struct({ missionId: MissionId }), Schema.Array(RecoveryIncident)),
+  // --- end policy additions ---
 );
 
 /** Reads: any client allowed to read orchestration state. */
 export const MISSIONS_RECOVERY_READ_SCOPES = {
   [M.status]: AuthOrchestrationReadScope,
+  // --- policy additions ---
+  [M.incidents]: AuthOrchestrationReadScope,
+  // --- end policy additions ---
 } as const;
 
 /** Writes: guarded on the client too (see `CLIENT_GUARDED_RPC_SCOPES`). */
