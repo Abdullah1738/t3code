@@ -17,6 +17,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import type { SqlError } from "effect/sql/SqlError";
 
+import { ensureAuthorityTable } from "../guard/authority.ts";
 import { actorKey, type MemberKind } from "./model.ts";
 
 /**
@@ -39,6 +40,9 @@ import { actorKey, type MemberKind } from "./model.ts";
  * - `tuning`: per-room mute flag and when the owner or master last tuned it.
  * - `reminders`: deliveries that got their one reminder. Still unread after it
  *   means the master's attention view, never another ring.
+ *
+ * The guard's authority table is made here too, at boot: `checkSend` reads it
+ * (fork lineage) and a read must never be what creates it.
  */
 const DDL = [
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_rooms (
@@ -455,6 +459,7 @@ const toStatus = (status: string | null): "pending" | "skipped" =>
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* Effect.forEach(DDL, (statement) => sql.unsafe(statement), { discard: true }).pipe(
+    Effect.andThen(ensureAuthorityTable(sql)),
     Effect.orDie,
   );
 

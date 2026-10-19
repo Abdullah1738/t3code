@@ -10,6 +10,7 @@ import {
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as RouterStore from "./RouterStore.ts";
@@ -206,6 +207,21 @@ it.layer(TestLayer)("RouterStore", (it) => {
       );
       assert.isTrue(yield* store.removeMember(missionId, "thread:master"));
       assert.strictEqual((yield* store.membersByPrincipal("thread:master")).length, 0);
+    }),
+  );
+
+  it.effect("makes the guard's authority table at boot, before any read", () =>
+    Effect.gen(function* () {
+      yield* RouterStore.RouterStore;
+      const sql = yield* SqlClient.SqlClient;
+      const tables = yield* sql<{ readonly name: string }>`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = 'ardud_mission_guard_authority'
+      `;
+      assert.deepStrictEqual(
+        tables.map((table) => table.name),
+        ["ardud_mission_guard_authority"],
+      );
     }),
   );
 });
