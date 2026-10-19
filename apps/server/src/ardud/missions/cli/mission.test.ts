@@ -144,6 +144,69 @@ describe("mission CLI", () => {
   });
   // end ardud missions: router
 
+  it("reads his full view and acts for him only with the inbound id", async () => {
+    const { url, seen } = await listen(() => ({ ok: true }));
+    const via = ["--via", "imessage", "--inbound", "spc-msg-3"];
+    const commands = [
+      ["needs"],
+      ["approvals", "m-1"],
+      ["calls", "m-1"],
+      ["draft", "show", "draft-1"],
+      ["work", "m-1", "--stage", "ticket,pr", "--limit", "5"],
+      ["timeline", "m-1", "--before", "40"],
+      ["progress", "m-1"],
+      ["watch", "m-1", "--on", "request-replied", "--id", "request-1"],
+      ["approval", "approve", "approval-1", ...via],
+      ["call", "react", "call-1", "--reaction", "overruled", "--note", "keep v1", ...via],
+      ["request", "settle", "request-1", ...via],
+      ["request", "reopen", "request-1", "--note", "one more", ...via],
+      ["discuss", "draft:draft-1", "--mission", "m-1", "--text", "tighten the intro", ...via],
+    ];
+    for (const args of commands) {
+      const result = await run(url, args);
+      expect({ args, code: result.code, stderr: result.stderr }).toEqual({
+        args,
+        code: 0,
+        stderr: "",
+      });
+    }
+    expect(seen.map((entry) => `${entry.method} ${entry.url}`)).toEqual([
+      "GET /api/ardud/missions/desk/needs",
+      "GET /api/ardud/missions/desk/approvals?mission=m-1",
+      "GET /api/ardud/missions/desk/calls?mission=m-1",
+      "GET /api/ardud/missions/desk/drafts/draft-1",
+      "GET /api/ardud/missions/desk/work?mission=m-1&stage=ticket%2Cpr&limit=5",
+      "GET /api/ardud/missions/desk/timeline?mission=m-1&before=40",
+      "GET /api/ardud/missions/desk/progress?mission=m-1",
+      "GET /api/ardud/missions/desk/watch?mission=m-1&on=request-replied&id=request-1",
+      "POST /api/ardud/missions/desk/approvals/approval-1/decide",
+      "POST /api/ardud/missions/desk/calls/call-1/react",
+      "POST /api/ardud/missions/desk/requests/request-1/settle",
+      "POST /api/ardud/missions/desk/requests/request-1/reopen",
+      "POST /api/ardud/missions/desk/requests",
+    ]);
+    expect(seen.slice(8).map((entry) => JSON.parse(entry.body))).toEqual([
+      { action: "approve", inboundId: "spc-msg-3" },
+      { reaction: "overruled", inboundId: "spc-msg-3", note: "keep v1" },
+      { inboundId: "spc-msg-3" },
+      { inboundId: "spc-msg-3", note: "one more" },
+      {
+        missionId: "m-1",
+        text: "tighten the intro",
+        subject: { kind: "draft", id: "draft-1" },
+        inboundId: "spc-msg-3",
+      },
+    ]);
+
+    const refused = await Promise.all([
+      run(url, ["approval", "approve", "approval-1"]),
+      run(url, ["call", "react", "call-1", "--reaction", "fine", ...via]),
+      run(url, ["discuss", "draft-1", "--mission", "m-1", "--text", "hm", ...via]),
+    ]);
+    expect(refused.map((result) => result.code)).toEqual([2, 2, 2]);
+    expect(seen).toHaveLength(13);
+  });
+
   it("surfaces server refusals", async () => {
     const { url } = await listen(() => ({
       ok: false,

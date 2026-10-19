@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // mission: shell access to Robob missions over the control API
-// (/api/ardud/missions/desk). Prints JSON unless --text. Read-only except
-// answers, draft decisions and owner requests, which need the owner's
-// iMessage inbound id.
+// (/api/ardud/missions/desk). Prints JSON. With the mission-cli component
+// credential it reads everything the owner sees, and it acts for him only
+// with the inbound id of the iMessage in which he said so.
 // Every other write goes through the mission_* MCP tools: HTTP cannot prove
 // which thread is calling.
 import * as NodeFS from "node:fs";
@@ -25,24 +25,42 @@ const HELP = `mission <command> [options]
   draft approve DRAFT [--edit TEXT] --via imessage --inbound ID
   draft rewrite DRAFT --note TEXT --via imessage --inbound ID
   draft drop DRAFT --via imessage --inbound ID
+  draft show DRAFT                          full text plus attachments (paths, urls)
   requests MISSION [--status waiting-on-master|answered|settled]
   request open MISSION --text T --via imessage --inbound ID
   request reply REQUEST --text T --via imessage --inbound ID
+  request settle|reopen REQUEST [--note T] --via imessage --inbound ID
+  discuss KIND:ID --mission M --text T --via imessage --inbound ID
+  needs [--mission M]                       what the board shows him under Needs you
+  approvals MISSION [--status pending,approved]   default: pending plus recent
+  approval approve|reject APPROVAL [--note T] --via imessage --inbound ID
+  calls MISSION
+  call react CALL --reaction ok|discuss|overruled|none [--note T] --via imessage --inbound ID
+  work MISSION [--lane L] [--stage ticket,pr] [--offset N] [--limit N]
+  timeline MISSION [--before SEQ] [--limit N]
+  progress MISSION                          per sub-mission and milestone
   events MISSION [--after SEQ] [--limit N]
-  watch MISSION --on KINDS [--interval SECONDS]   prints the robob-watch command
-  watch-check MISSION --on KINDS --cursor FILE    one watcher tick: prints new matches only
+  watch MISSION --on KINDS [--id ID] [--interval SECONDS]   prints the robob-watch command
+  watch-check MISSION --on KINDS [--id ID] --cursor FILE    one tick: prints new matches only
 
 Watch kinds: ask-opened, ask-answered, draft-opened, suggestion-opened,
-milestone-at-risk, lane-stalled, swarm-paused.
+fork-closed, milestone-at-risk, lane-stalled, swarm-paused, request-replied,
+request-answered, approval-opened, work-item-done. --id narrows a watch to one
+record (a request, approval or work item).
 
-Answers, approvals and owner requests are refused unless the inbound id is a
-real iMessage from the owner's or Moni's chat that says the same thing.
+Actions for the owner need --via imessage --inbound ID: the id of the iMessage
+in which he told you to. The server checks it is a message he (or Moni) typed
+after the record opened, keeps his words as the quote, and lets one message
+do each action once. Pass your reading of his words as the option, text or
+note; never invent an inbound id.
 
-Everything else that changes a mission (plan, lanes, approvals, rules, asks)
-goes through the mission_* MCP tools from the calling thread, never this
-CLI: HTTP cannot prove which thread is calling.
+Everything else that changes a mission (plan, lanes, rules, asks) goes
+through the mission_* MCP tools from the calling thread, never this CLI: HTTP
+cannot prove which thread is calling.
 
-Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, or ${DEFAULT_TOKEN_FILE}.`;
+Connection: T3_CONTROL_URL plus MISSION_TOKEN (the mission-cli component
+credential) or T3_CONTROL_TOKEN, or ${DEFAULT_TOKEN_FILE}. Only the
+mission-cli credential reads his full view and acts for him.`;
 
 const { values: flags, positionals } = NodeUtil.parseArgs({
   allowPositionals: true,
@@ -62,7 +80,13 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     after: { type: "string" },
     limit: { type: "string" },
     on: { type: "string" },
+    id: { type: "string" },
     interval: { type: "string" },
+    reaction: { type: "string" },
+    lane: { type: "string" },
+    stage: { type: "string" },
+    offset: { type: "string" },
+    before: { type: "string" },
     cursor: { type: "string" },
     pretty: { type: "boolean" },
     help: { type: "boolean", short: "h" },
@@ -84,7 +108,10 @@ const query = (params) => {
 const id = (value, name) => encodeURIComponent(need(value, name));
 
 async function request(method, path, body) {
-  const { url, token } = discoverConfig({ url: flags.url, token: flags.token });
+  const { url, token } = discoverConfig({
+    url: flags.url,
+    token: flags.token ?? process.env.MISSION_TOKEN,
+  });
   const response = await fetch(`${url}${PREFIX}${path}`, {
     method,
     headers: {
@@ -135,7 +162,10 @@ async function watchCheck(missionId) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const result = await request("GET", `/watch${query({ mission: missionId, on, after })}`);
+  const result = await request(
+    "GET",
+    `/watch${query({ mission: missionId, on, id: flags.id, after })}`,
+  );
   NodeFS.mkdirSync(NodePath.dirname(cursorFile), { recursive: true });
   NodeFS.writeFileSync(cursorFile, `${result.latestSeq}\n`);
   if (result.matches.length === 0) return;
@@ -196,6 +226,7 @@ async function main() {
       );
     case "draft": {
       const [action, draftId] = args;
+      if (action === "show") return print(await request("GET", `/drafts/${id(draftId, "DRAFT")}`));
       if (action !== "approve" && action !== "rewrite" && action !== "drop") {
         return fail(`unknown draft action ${action ?? ""}\n\n${HELP}`);
       }
@@ -219,10 +250,19 @@ async function main() {
       );
     case "request": {
       const [action, target] = args;
+      if (action === "settle" || action === "reopen") {
+        const inboundId = ownerInbound();
+        return print(
+          await request("POST", `/requests/${id(target, "REQUEST")}/${action}`, {
+            inboundId,
+            ...(flags.note === undefined ? {} : { note: flags.note }),
+          }),
+        );
+      }
       if (action !== "open" && action !== "reply") {
         return fail(`unknown request action ${action ?? ""}\n\n${HELP}`);
       }
-      const text = need(flags.text, "--text (his words, exactly as he sent them)");
+      const text = need(flags.text, "--text (what he asked, in his words)");
       const inboundId = ownerInbound();
       if (action === "open") {
         return print(
@@ -237,7 +277,96 @@ async function main() {
         await request("POST", `/requests/${id(target, "REQUEST")}/reply`, { text, inboundId }),
       );
     }
+    case "discuss": {
+      // KIND:ID names the card he wants to talk about (draft:d-1, call:c-2...).
+      const ref = need(args[0], "KIND:ID");
+      const split = ref.indexOf(":");
+      if (split <= 0 || split === ref.length - 1) fail("discuss needs KIND:ID, e.g. draft:draft-1");
+      const text = need(flags.text, "--text (what he wants to discuss)");
+      const inboundId = ownerInbound();
+      return print(
+        await request("POST", "/requests", {
+          missionId: need(flags.mission, "--mission"),
+          text,
+          subject: { kind: ref.slice(0, split), id: ref.slice(split + 1) },
+          inboundId,
+        }),
+      );
+    }
     // end ardud missions: router
+    case "needs":
+      return print(await request("GET", `/needs${query({ mission: args[0] ?? flags.mission })}`));
+    case "approvals":
+      return print(
+        await request(
+          "GET",
+          `/approvals${query({ mission: need(args[0] ?? flags.mission, "MISSION"), status: flags.status })}`,
+        ),
+      );
+    case "approval": {
+      const [action, approvalId] = args;
+      if (action !== "approve" && action !== "reject") {
+        return fail(`unknown approval action ${action ?? ""}\n\n${HELP}`);
+      }
+      const inboundId = ownerInbound();
+      return print(
+        await request("POST", `/approvals/${id(approvalId, "APPROVAL")}/decide`, {
+          action,
+          inboundId,
+          ...(flags.note === undefined ? {} : { note: flags.note }),
+        }),
+      );
+    }
+    case "calls":
+      return print(
+        await request(
+          "GET",
+          `/calls${query({ mission: need(args[0] ?? flags.mission, "MISSION") })}`,
+        ),
+      );
+    case "call": {
+      const [action, callId] = args;
+      if (action !== "react") return fail(`unknown call action ${action ?? ""}\n\n${HELP}`);
+      const reaction = need(flags.reaction, "--reaction ok|discuss|overruled|none");
+      if (!["ok", "discuss", "overruled", "none"].includes(reaction)) {
+        fail("--reaction is ok, discuss, overruled or none");
+      }
+      const inboundId = ownerInbound();
+      return print(
+        await request("POST", `/calls/${id(callId, "CALL")}/react`, {
+          reaction: reaction === "none" ? null : reaction,
+          inboundId,
+          ...(flags.note === undefined ? {} : { note: flags.note }),
+        }),
+      );
+    }
+    case "work":
+      return print(
+        await request(
+          "GET",
+          `/work${query({
+            mission: need(args[0] ?? flags.mission, "MISSION"),
+            lane: flags.lane,
+            stage: flags.stage,
+            offset: flags.offset,
+            limit: flags.limit,
+          })}`,
+        ),
+      );
+    case "timeline":
+      return print(
+        await request(
+          "GET",
+          `/timeline${query({ mission: need(args[0] ?? flags.mission, "MISSION"), before: flags.before, limit: flags.limit })}`,
+        ),
+      );
+    case "progress":
+      return print(
+        await request(
+          "GET",
+          `/progress${query({ mission: need(args[0] ?? flags.mission, "MISSION") })}`,
+        ),
+      );
     case "events":
       return print(
         await request(
@@ -248,7 +377,7 @@ async function main() {
     case "watch": {
       const result = await request(
         "GET",
-        `/watch${query({ mission: need(args[0] ?? flags.mission, "MISSION"), on: need(flags.on, "--on"), interval: flags.interval })}`,
+        `/watch${query({ mission: need(args[0] ?? flags.mission, "MISSION"), on: need(flags.on, "--on"), id: flags.id, interval: flags.interval })}`,
       );
       return print({ check: result.check, add: result.add, latestSeq: result.latestSeq });
     }
