@@ -10,7 +10,7 @@ import { OWNER_SESSION_REQUIRED } from "../core/provenance.ts";
 import type { RecoveryService } from "./RecoveryService.ts";
 
 /**
- * Recovery WS handlers for the app. The status read needs orchestration:read;
+ * Recovery WS handlers for the app. The status and incident reads need orchestration:read;
  * resume and settings need orchestration:operate and run as the owner, so
  * they only work from a paired Robob client. The caller passes the owner
  * provenance it derived from the connection, or null when the connection is
@@ -37,5 +37,9 @@ export const makeRecoveryWsHandlers = (
     [M.status]: (input: { readonly missionId: MissionId }) => recovery.status(input.missionId),
     [M.resume]: asOwner(recovery.resume),
     [M.settings]: asOwner(recovery.setSettings),
+    // --- policy additions ---
+    [M.incidents]: (input: { readonly missionId: MissionId }) =>
+      recovery.incidents(input.missionId),
+    // --- end policy additions ---
   } as const;
 };

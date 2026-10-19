@@ -3,6 +3,7 @@ import {
   type BindRoleInput,
   type MissionError,
   type CreateRoleInput,
+  type HandOffLaneInput,
   type MissionId,
   type MissionMutationResult,
   type MissionProvenance,
@@ -14,15 +15,18 @@ import {
   type SetRoleModelInput,
   type SucceedRoleInput,
   type SucceedRoleResult,
+  type SuccessionMove,
   type ThreadId,
   type UnbindRoleInput,
   type UpdateRoleInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 
 import {
   POLICY_PROVENANCE,
+  activeBindings,
   attempt,
   bindingUpsert,
   eventDraft,
@@ -35,6 +39,7 @@ import {
   resolveCaller,
   roleRef,
   roleUpsert,
+  rolesByIds,
   shortId,
   systemCaller,
   type Caller,
@@ -67,9 +72,10 @@ export const rolesSnapshot = (
     yield* requireMission(deps, missionId);
     const now = yield* nowIso;
     const roles = yield* missionRoles(deps, missionId, now);
-    const bindings = (yield* deps.store.list("role-binding", { missionId })).toSorted(
-      newestBindingFirst,
-    );
+    // Every current holder, plus the most recent page of ended ones for history.
+    const active = yield* activeBindings(deps, missionId);
+    const ended = yield* deps.store.list("role-binding", { missionId, status: ["ended"] });
+    const bindings = [...active, ...ended].toSorted(newestBindingFirst);
     const byId = new Map(roles.all.map((role) => [role.id as string, role]));
     const drift: Array<RoleDrift> = [];
     for (const binding of bindings) {
@@ -89,10 +95,17 @@ export const rolesSnapshot = (
     };
   });
 
+/** A role's active holders, from a complete read of the mission's bindings. */
 const roleBindings = (deps: PolicyDeps, role: Role) =>
-  deps.store
-    .list("role-binding", { missionId: role.missionId })
-    .pipe(Effect.map((bindings) => bindings.filter((binding) => binding.roleId === role.id)));
+  activeBindings(deps, role.missionId).pipe(
+    Effect.map((bindings) => bindings.filter((binding) => binding.roleId === role.id)),
+  );
+
+/** An imported holder with no model on record yet keeps what it runs. */
+const keepsImportedModel = (role: Role, binding: RoleBinding) =>
+  binding.reason === "import" &&
+  binding.observedModel === null &&
+  role.pendingModelSelection === null;
 
 export interface AlignResult {
   readonly applied: ReadonlyArray<ThreadId>;
@@ -125,11 +138,7 @@ export const alignRole = (
       if (!needsAlignment(role, binding)) continue;
       // An imported holder keeps whatever it runs until someone changes the
       // role's model; a mismatch shows as drift, never as a switch.
-      if (
-        binding.reason === "import" &&
-        binding.observedModel === null &&
-        role.pendingModelSelection === null
-      ) {
+      if (keepsImportedModel(role, binding)) {
         changed.push({ ...binding, observedModel: key });
         accepted.push(binding.threadId);
         continue;
@@ -193,19 +202,75 @@ export const alignRole = (
     return { applied, waiting, finished };
   });
 
-/** One sweep over every role with a holder that still has to pick up its model. */
+/**
+ * Records, in one event per mission, that imported holders keep their model.
+ * Called with roles whose only pending work is that acceptance.
+ */
+const acceptImported = (
+  deps: PolicyDeps,
+  missionId: MissionId,
+  holders: ReadonlyArray<{ readonly role: Role; readonly binding: RoleBinding }>,
+) =>
+  Effect.gen(function* () {
+    const accepted = holders.map(({ role, binding }) => ({
+      roleId: role.id,
+      threadId: binding.threadId,
+      model: modelKey(roleTarget(role)),
+    }));
+    const roleCount = new Set(accepted.map((entry) => entry.roleId)).size;
+    yield* deps.store.commit({
+      event: eventDraft(
+        systemCaller(POLICY_PROVENANCE),
+        missionId,
+        "role.model-changed",
+        `${accepted.length} imported holder(s) keep their model across ${roleCount} role(s)`,
+        null,
+        { phase: "imported", accepted },
+      ),
+      upserts: holders.map(({ role, binding }) =>
+        bindingUpsert({ ...binding, observedModel: modelKey(roleTarget(role)) }),
+      ),
+    });
+  });
+
+/**
+ * One sweep over every role with a holder that still has to pick up its model.
+ * Imported holders that only need their model recorded are batched into one
+ * event per mission; a second sweep with nothing changed writes nothing.
+ */
 export const alignAll = (deps: PolicyDeps) =>
   Effect.gen(function* () {
-    const active = yield* deps.store.list("role-binding", { status: ["bound"] });
-    const roleIds = [...new Set(active.map((binding) => binding.roleId as string))];
-    if (roleIds.length === 0) return;
-    const roles = yield* deps.store.list("role", { ids: roleIds });
+    const active = yield* deps.store.listAll("role-binding", ["bound"]);
+    const roles = yield* rolesByIds(
+      deps,
+      active.map((binding) => binding.roleId),
+    );
+    const imported = new Map<MissionId, Array<{ role: Role; binding: RoleBinding }>>();
+    const individual: Array<Role> = [];
     for (const role of roles) {
-      const holders = active.filter((binding) => binding.roleId === role.id);
-      const due =
-        role.pendingModelSelection !== null ||
-        holders.some((binding) => needsAlignment(role, binding));
-      if (!due) continue;
+      const due = active.filter(
+        (binding) => binding.roleId === role.id && needsAlignment(role, binding),
+      );
+      if (role.pendingModelSelection === null && due.length === 0) continue;
+      if (due.length > 0 && due.every((binding) => keepsImportedModel(role, binding))) {
+        const batch = imported.get(role.missionId) ?? [];
+        batch.push(...due.map((binding) => ({ role, binding })));
+        imported.set(role.missionId, batch);
+      } else {
+        individual.push(role);
+      }
+    }
+    for (const [missionId, holders] of imported) {
+      yield* acceptImported(deps, missionId, holders).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("mission policy imported holder alignment failed", {
+            missionId,
+            detail: error.detail,
+          }),
+        ),
+      );
+    }
+    for (const role of individual) {
       yield* alignRole(deps, role).pipe(
         Effect.catch((error) =>
           Effect.logWarning("mission policy role alignment failed", {
@@ -553,8 +618,8 @@ export const succeedRole = (
       observedModel:
         holder.modelSelection !== null && modelKey(holder.modelSelection) === key ? key : null,
     };
-    const moves = yield* deps.succession.move(current.threadId, input.threadId);
-    const moved = moves
+    const portMoves = yield* deps.succession.move(current.threadId, input.threadId);
+    const moved = portMoves
       .filter((move) => move.supported && move.moved > 0)
       .map((move) => `${move.moved} ${move.what}`);
     yield* deps.store.commit({
@@ -569,7 +634,7 @@ export const succeedRole = (
           to: input.threadId,
           endedId: current.id,
           bindingId: next.id,
-          moves,
+          moves: portMoves,
         },
       ),
       upserts: [
@@ -579,8 +644,129 @@ export const succeedRole = (
       ],
     });
     yield* pointLaneAt(deps, role, input.threadId);
+    const subscriptions = yield* moveSubscriptions(
+      deps,
+      role.missionId,
+      current.threadId,
+      input.threadId,
+    );
     yield* alignRole(deps, role, { stored: true, caller });
-    return { ended: succession.ended, binding: next, moves };
+    return { ended: succession.ended, binding: next, moves: [...portMoves, subscriptions] };
+  });
+
+/**
+ * Room subscriptions held by the old thread itself go to the successor, once
+ * the old thread holds nothing else in the mission (a thread that keeps
+ * another role keeps its subscriptions). Needs the new thread to be a member,
+ * so it runs after the succession commits.
+ */
+const moveSubscriptions = (
+  deps: PolicyDeps,
+  missionId: MissionId,
+  from: ThreadId,
+  to: ThreadId,
+): Effect.Effect<SuccessionMove, MissionError> =>
+  Effect.gen(function* () {
+    if (deps.handoff === null) {
+      return { what: "subscriptions", moved: 0, failed: 0, supported: false } as const;
+    }
+    const stays = (yield* activeBindings(deps, missionId)).some(
+      (binding) => binding.threadId === from,
+    );
+    if (stays) return { what: "subscriptions", moved: 0, failed: 0, supported: true } as const;
+    return yield* deps.handoff.moveSubscriptions(missionId, from, to);
+  });
+
+/**
+ * Hands a lane's lead role to a new thread. Without `threadId` it launches one
+ * in the old lead's project and workspace on the role's model, then briefs it
+ * with the note. Everything is checked before the launch, so a refused handoff
+ * never leaves a stray thread. Running work on the old thread is left alone.
+ */
+export const handOffLane = (
+  deps: PolicyDeps,
+  provenance: MissionProvenance,
+  input: HandOffLaneInput,
+): Effect.Effect<SucceedRoleResult, MissionError> =>
+  Effect.gen(function* () {
+    const stored = yield* deps.store.get("lane", input.laneId);
+    if (Option.isNone(stored)) return yield* failWith("not-found", `No lane ${input.laneId}.`);
+    const lane = stored.value;
+    if (lane.status === "retired") {
+      return yield* failWith("invalid", `Lane ${lane.name} is retired.`);
+    }
+    const from = lane.threadId;
+    if (from === null)
+      return yield* failWith("conflict", "This lane has no lead thread to hand off.");
+    const now = yield* nowIso;
+    const { role } = yield* findRole(
+      deps,
+      lane.leadRoleId ?? defaultRoleId(lane.missionId, "lane-lead", lane.id),
+      now,
+    );
+    const caller = yield* resolveCaller(deps, provenance, lane.missionId);
+    yield* requireGovern(caller, "hand a lane off");
+    const holds = (yield* roleBindings(deps, role)).some((binding) => binding.threadId === from);
+    if (!holds) {
+      return yield* failWith(
+        "conflict",
+        `${role.name} is not held by ${from}, the lane's thread; bind the lead first.`,
+      );
+    }
+    if (input.threadId === undefined && deps.handoff === null) {
+      return yield* failWith(
+        "conflict",
+        "This server cannot launch a thread for the handoff; pass threadId.",
+      );
+    }
+    const launched =
+      input.threadId === undefined && deps.handoff !== null
+        ? yield* deps.handoff.launch({
+            from,
+            title: `${lane.name} lead`,
+            modelSelection: roleTarget(role),
+          })
+        : null;
+    const threadId = input.threadId ?? launched;
+    if (threadId === null) return yield* failWith("conflict", "No thread to hand the lane to.");
+    const result = yield* succeedRole(deps, provenance, {
+      roleId: role.id,
+      threadId,
+      fromThreadId: from,
+      handoffNote: input.handoffNote,
+    }).pipe(
+      // A concurrent handoff can win between our checks and the commit. The
+      // thread we launched is idle; say which one so nobody hunts for it.
+      Effect.catch((error) =>
+        launched === null
+          ? Effect.fail(error)
+          : failWith(error.code, `${error.detail} The launched thread ${launched} was left idle.`),
+      ),
+    );
+    if (launched !== null && deps.handoff !== null) {
+      yield* deps.handoff
+        .brief(
+          launched,
+          [
+            `You now lead lane "${lane.name}" in mission ${lane.missionId} as ${role.name}, taking over from thread ${from}.`,
+            "",
+            "Handoff note:",
+            "",
+            input.handoffNote,
+          ].join("\n"),
+          `handoff:${result.binding.id}`,
+        )
+        .pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("mission policy could not brief the new lane lead", {
+              laneId: lane.id,
+              threadId: launched,
+              detail: error.detail,
+            }),
+          ),
+        );
+    }
+    return result;
   });
 
 /** Stores a registry default (so it can carry a lock or a note like any stored role). */

@@ -3,8 +3,12 @@ import {
   MISSIONS_RECOVERY_GUARDED_SCOPES,
   MISSIONS_RECOVERY_READ_SCOPES,
   MISSIONS_RECOVERY_WS_METHODS as M,
+  MissionId,
   MissionsRecoveryRpcs,
+  ThreadId,
   WsRpcGroup,
+  type RecoveryIncident,
+  type RecoveryThread,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -13,7 +17,8 @@ import { missionId } from "../asks/AsksService.testkit.ts";
 import { ownerAppProvenance } from "../core/provenance.ts";
 import * as MissionService from "../MissionService.ts";
 import { RecoveryService } from "./RecoveryService.ts";
-import { harness, world } from "./testkit.ts";
+import * as RecoveryStore from "./RecoveryStore.ts";
+import { harness, plus, world } from "./testkit.ts";
 import { makeRecoveryWsHandlers } from "./ws.ts";
 
 const session = (surface: "cli" | "web") =>
@@ -79,4 +84,95 @@ it.effect("every recovery RPC is in the server group and declares exactly one sc
       assert.equal(Object.hasOwn(CLIENT_GUARDED_RPC_SCOPES, method), guarded, method);
     }
   }),
+);
+
+const recoveryThread = (missionOf: MissionId, threadId: string, position: number) =>
+  ({
+    missionId: missionOf,
+    threadId: ThreadId.make(threadId),
+    title: threadId,
+    roleId: null,
+    roleKind: null,
+    laneId: null,
+    laneName: null,
+    subMissionId: null,
+    position,
+    cutRunId: null,
+    lastActivity: null,
+    lastActivityAt: null,
+    serverContinued: false,
+    interruptReason: null,
+    handoffFrom: null,
+    lostChildren: [],
+    holds: [],
+    action: "resume",
+    reason: "cut by the restart",
+    state: "sent",
+    stateReason: null,
+    instruction: null,
+    noticeAt: null,
+    decidedBy: null,
+  }) satisfies RecoveryThread;
+
+const incidentAt = (
+  id: string,
+  seconds: number,
+  threads: ReadonlyArray<RecoveryThread>,
+): RecoveryIncident => ({
+  id,
+  cause: "server-restart",
+  source: "missions-recovery",
+  detectedAt: plus(seconds),
+  windowStart: plus(seconds - 60),
+  windowEnd: plus(seconds),
+  downSeconds: 60,
+  missionIds: [...new Set(threads.map((thread) => thread.missionId))],
+  threads,
+  clearedAt: seconds < 0 ? plus(seconds + 30) : null,
+});
+
+it.effect("the incident list reads every incident that touched the mission, newest first", () =>
+  Effect.gen(function* () {
+    yield* world();
+    const recovery = yield* RecoveryService;
+    const store = yield* RecoveryStore.RecoveryStore;
+    const other = MissionId.make("m-other");
+    // An old incident that touched the mission, then more than a page of
+    // newer ones elsewhere, then a recent shared one.
+    yield* store.saveIncident(
+      incidentAt("rcv-old", -7200, [recoveryThread(missionId, "t-master", 0)]),
+      plus(-7200),
+    );
+    for (let index = 0; index < 60; index += 1) {
+      yield* store.saveIncident(
+        incidentAt(`rcv-elsewhere-${index}`, -3600 + index, [recoveryThread(other, "t-x", 0)]),
+        plus(-3600 + index),
+      );
+    }
+    yield* store.saveIncident(
+      incidentAt("rcv-shared", 10, [
+        recoveryThread(other, "t-x", 0),
+        recoveryThread(missionId, "t-lane", 2),
+        recoveryThread(missionId, "t-master", 0),
+      ]),
+      plus(10),
+    );
+
+    const handlers = makeRecoveryWsHandlers(recovery, null);
+    const incidents = yield* handlers[M.incidents]({ missionId });
+    assert.deepStrictEqual(
+      incidents.map((incident) => incident.id),
+      ["rcv-shared", "rcv-old"],
+    );
+    const [shared] = incidents;
+    assert.deepStrictEqual(shared?.missionIds, [missionId]);
+    assert.deepStrictEqual(
+      shared?.threads.map((thread) => thread.threadId),
+      ["t-master", "t-lane"],
+    );
+    assert.isNotNull(incidents[1]?.clearedAt);
+
+    const missing = yield* Effect.flip(handlers[M.incidents]({ missionId: other }));
+    assert.equal(missing.code, "not-found");
+  }).pipe(Effect.provide(harness().layer)),
 );

@@ -1254,6 +1254,10 @@ export const Pool = Schema.Struct({
   lockedFields: LockedFields,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- policy additions ---
+  /** Why capacity was last set; null when the last change gave no reason. */
+  capacityReason: Schema.optional(Schema.NullOr(Schema.String)),
+  // --- end policy additions ---
 });
 export type Pool = typeof Pool.Type;
 
@@ -1434,6 +1438,12 @@ export const ReviewPolicySnapshot = Schema.Struct({
   policy: ReviewPolicy,
   /** False until someone edits the policy; the default ladders apply meanwhile. */
   stored: Schema.Boolean,
+  // --- policy additions ---
+  /** The mission's latest criticality verdicts, newest first (capped). */
+  verdicts: Schema.optional(Schema.Array(CriticalityVerdict)),
+  /** The mission's latest recorded review rounds, newest first (capped). */
+  reviews: Schema.optional(Schema.Array(ReviewRecord)),
+  // --- end policy additions ---
 });
 export type ReviewPolicySnapshot = typeof ReviewPolicySnapshot.Type;
 
@@ -2757,6 +2767,18 @@ export const SucceedRoleInput = Schema.Struct({
 });
 export type SucceedRoleInput = typeof SucceedRoleInput.Type;
 
+/**
+ * Hands a lane's lead role to a fresh thread. Without `threadId` the server
+ * launches one in the old lead's project and workspace and briefs it with the
+ * note; with it, that existing thread takes over.
+ */
+export const HandOffLaneInput = Schema.Struct({
+  laneId: LaneId,
+  handoffNote: TrimmedNonEmptyString,
+  threadId: Schema.optional(ThreadId),
+});
+export type HandOffLaneInput = typeof HandOffLaneInput.Type;
+
 export const EditReviewPolicyInput = Schema.Struct({
   missionId: MissionId,
   stages: Schema.optional(Schema.Array(ReviewStage)),
@@ -2810,6 +2832,10 @@ export type CreatePoolInput = typeof CreatePoolInput.Type;
 export const SetPoolCapacityInput = Schema.Struct({
   poolId: PoolId,
   capacity: Schema.Number,
+  // --- policy additions ---
+  /** Kept on the pool and in the change event. */
+  reason: Schema.optional(TrimmedNonEmptyString),
+  // --- end policy additions ---
 });
 export type SetPoolCapacityInput = typeof SetPoolCapacityInput.Type;
 

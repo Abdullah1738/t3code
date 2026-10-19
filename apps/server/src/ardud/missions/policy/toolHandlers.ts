@@ -81,6 +81,7 @@ const handlers = {
   mission_role_bind: write((policy) => policy.bindRole),
   mission_role_unbind: write((policy) => policy.unbindRole),
   mission_role_succeed: write((policy) => policy.succeedRole),
+  mission_lane_handoff: write((policy) => policy.handOffLane),
   mission_review_policy_edit: write((policy) => policy.editReviewPolicy),
   mission_criticality_guide: write((policy) => policy.setCriticalityGuide),
   mission_criticality: write((policy) => policy.recordCriticality),

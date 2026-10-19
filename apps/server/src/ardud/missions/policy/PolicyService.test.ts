@@ -159,7 +159,14 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       assert.isNotNull(result.ended.endedAt);
       assert.strictEqual(result.binding.reason, "succession");
       assert.strictEqual(result.binding.handoffNote, "brief is half written, see notes/editor.md");
-      assert.deepStrictEqual(result.moves, ports.moves);
+      // The old holder keeps nothing else here, so its own room subscriptions move too.
+      assert.deepStrictEqual(result.moves, [
+        ...ports.moves,
+        { what: "subscriptions", moved: 2, failed: 0, supported: true },
+      ]);
+      assert.deepStrictEqual(ports.subscriptionMoves, [
+        { missionId: CRPKO, from: "thread-editor-1", to: "thread-editor-2" },
+      ]);
       // The successor runs the role's model from its next turn.
       assert.deepStrictEqual(ports.setModelCalls, [
         { threadId: "thread-editor-2", model: modelKey(OPUS_XHIGH) },
@@ -290,6 +297,23 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
         ["done-at-older-head", "done-at-older-head"],
       );
       assert.isFalse(plan.mergeAllowed);
+
+      // The policy read carries the verdicts and rounds for the screen, newest first.
+      const snapshot = yield* policy.reviewPolicy(CRPKO);
+      assert.deepStrictEqual(
+        snapshot.verdicts?.map((verdict) => verdict.reason),
+        ["moves real funds"],
+      );
+      assert.deepStrictEqual(
+        snapshot.reviews?.map((review) => `${review.stageId}@${review.headSha}:${review.verdict}`),
+        [
+          "final@h3:clear",
+          "reviewer@h3:clear",
+          "final@h2:findings",
+          "reviewer@h2:clear",
+          "reviewer@h1:findings",
+        ],
+      );
     }),
   );
 
@@ -653,6 +677,40 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
         fence: waiting.hold.fence,
         note: "",
       });
+    }),
+  );
+
+  it.effect("keeps the reason for a capacity change on the pool and its event", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      const created = yield* policy.createPool(MASTER, {
+        poolId: PoolId.make("review-slots"),
+        name: "Review slots",
+        unit: "slot",
+        capacity: 2,
+        scope: { _tag: "mission", missionId: CRPKO },
+        kind: "lease",
+        backend: "native",
+      });
+      const poolId = PoolId.make(created.ref.id);
+      yield* policy.setPoolCapacity(OWNER, {
+        poolId,
+        capacity: 4,
+        reason: "Two more reviewers this week",
+      });
+      const view = (yield* policy.pools({})).pools.find((p) => p.pool.id === poolId)!;
+      assert.strictEqual(view.pool.capacity, 4);
+      assert.strictEqual(view.pool.capacityReason, "Two more reviewers this week");
+      const changed = (yield* events(CRPKO)).findLast((event) => event.kind === "pool.updated")!;
+      assert.include(changed.summary, "Two more reviewers this week");
+      assert.strictEqual(
+        (changed.payload as { readonly reason?: string }).reason,
+        "Two more reviewers this week",
+      );
+      // A change without a reason clears the old one rather than leaving it on a new number.
+      yield* policy.setPoolCapacity(OWNER, { poolId, capacity: 3 });
+      const cleared = (yield* policy.pools({})).pools.find((p) => p.pool.id === poolId)!;
+      assert.strictEqual(cleared.pool.capacityReason, null);
     }),
   );
 

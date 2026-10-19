@@ -43,6 +43,9 @@ export const makePolicyWsHandlers = (
     [M.bindRole]: asOwner(policy.bindRole),
     [M.unbindRole]: asOwner(policy.unbindRole),
     [M.succeedRole]: asOwner(policy.succeedRole),
+    // --- policy additions ---
+    [M.handOffLane]: asOwner(policy.handOffLane),
+    // --- end policy additions ---
     [M.reviewPolicy]: (input: { readonly missionId: MissionId }) =>
       policy.reviewPolicy(input.missionId),
     [M.editReviewPolicy]: asOwner(policy.editReviewPolicy),

@@ -3,9 +3,10 @@ import * as Layer from "effect/Layer";
 
 import * as AsksService from "../asks/AsksService.ts";
 import * as MissionService from "../MissionService.ts";
+import { RouterServicesLive } from "../router/layer.ts";
 import * as PolicyService from "./PolicyService.ts";
 import * as PolicyStore from "./PolicyStore.ts";
-import { portsLayer, suggestionsLayer } from "./ports.ts";
+import { handoffLayer, portsLayer, suggestionsLayer } from "./ports.ts";
 
 /**
  * The policy track: service, own tables, ports and background loops. Needs
@@ -21,7 +22,13 @@ export const PolicyLive = Layer.effectDiscard(
 ).pipe(
   Layer.provideMerge(PolicyService.layer),
   Layer.provideMerge(PolicyStore.layer),
-  Layer.provideMerge(Layer.mergeAll(portsLayer, suggestionsLayer)),
+  Layer.provideMerge(
+    Layer.mergeAll(
+      portsLayer,
+      suggestionsLayer,
+      handoffLayer.pipe(Layer.provide(RouterServicesLive)),
+    ),
+  ),
   Layer.provide(AsksService.layerLive),
   Layer.provide(MissionService.layer),
 );
