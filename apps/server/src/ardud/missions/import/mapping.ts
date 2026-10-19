@@ -638,6 +638,16 @@ export const buildImportPlan = (sources: ImportSources, options: ImportOptions):
       seq: p.seq,
       updatedAt: iso(p.at),
     }));
+  // The owner never read coord, but its history is not news: imported rooms open read up to the import.
+  for (const room of rooms) {
+    if (room.lastSeq === 0) continue;
+    readPositions.push({
+      roomId: room.id,
+      reader: { _tag: "owner" },
+      seq: room.lastSeq,
+      updatedAt: room.lastMessageAt ?? iso(0),
+    });
+  }
 
   // ---- rules ------------------------------------------------------------
   const rules: Array<Rule> = sources.rules.rules.map((r) => {

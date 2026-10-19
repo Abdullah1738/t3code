@@ -289,7 +289,10 @@ describe("buildImportPlan", () => {
       p.router.readPositions.map((r) => [readPositionId(r), r.seq]),
     );
     // master acked 1 and 3 in delivery but not 4; cell-tc acked 2 in control; crw never acked.
+    // The owner starts read up to each room's last message, so imported history is not unread.
     expect(positions).toEqual({
+      "crpko:room:control|owner": 2,
+      "crpko:room:delivery|owner": 4,
       "crpko:room:delivery|role:crpko:master": 3,
       "crpko:room:control|role:crpko:lane-lead:crpko:lane:cell-tc": 2,
       "crpko:room:delivery|role:crpko:lane-lead:crpko:lane:cell-tc": 3,
@@ -430,7 +433,7 @@ it.layer(TestLayer)("applyImport", (it) => {
         room: 2,
         message: 4,
         subscription: 4,
-        "read-position": 3,
+        "read-position": 5,
       });
       // The dry run wrote nothing.
       assert.strictEqual(yield* store.latestSeq(p.missionId), 0);
@@ -439,7 +442,7 @@ it.layer(TestLayer)("applyImport", (it) => {
       const first = yield* applyImport(p, router.sink);
       assert.strictEqual(first.created.message, 4);
       assert.strictEqual(router.rooms.size, 2);
-      assert.strictEqual(router.readPositions.size, 3);
+      assert.strictEqual(router.readPositions.size, 5);
       const seq = yield* store.latestSeq(p.missionId);
       assert.isTrue(seq > 0);
 
