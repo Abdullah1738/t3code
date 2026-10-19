@@ -1,14 +1,28 @@
-export const BUILT_IN_THEME_IDS = ["t3-chat", "grove", "ocean", "ember", "iris"] as const;
+export const BUILT_IN_THEME_IDS = [
+  // ardud missions: desk-theme
+  "desk",
+  // end ardud missions: desk-theme
+  "t3-chat",
+  "grove",
+  "ocean",
+  "ember",
+  "iris",
+] as const;
 
+// ardud missions: desk-theme
 /** The standard T3 Code palette, kept separate from the optional built-in theme library. */
-export const MOBILE_DEFAULT_THEME_ID = "t3-code";
+export const MOBILE_STANDARD_THEME_ID = "t3-code";
+/** The theme a fresh install starts on, on every client, until someone picks another. */
+export const DEFAULT_THEME_ID = "desk";
+export const MOBILE_DEFAULT_THEME_ID = DEFAULT_THEME_ID;
+// end ardud missions: desk-theme
 
 /**
  * Every palette the mobile app can render. Declared here so host-side tooling
  * (the app-store screenshot harness) can validate a requested theme without
  * importing React Native application code.
  */
-export const MOBILE_THEME_IDS = [MOBILE_DEFAULT_THEME_ID, ...BUILT_IN_THEME_IDS] as const;
+export const MOBILE_THEME_IDS = [MOBILE_STANDARD_THEME_ID, ...BUILT_IN_THEME_IDS] as const;
 
 /**
  * Ids a theme may not take: the appearance keywords a stored preference uses,
@@ -29,14 +43,14 @@ export const RESERVED_THEME_IDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Additionally closed to a machine publishing a theme: the mobile default is
+ * Additionally closed to a machine publishing a theme: the mobile standard is
  * not a web or desktop built-in, so a saved theme may legitimately carry that
  * id, but no client that follows published themes can resolve it -- publishing
  * it would report success and change nothing.
  */
 export const UNPUBLISHABLE_THEME_IDS: ReadonlySet<string> = new Set([
   ...RESERVED_THEME_IDS,
-  MOBILE_DEFAULT_THEME_ID,
+  MOBILE_STANDARD_THEME_ID,
 ]);
 
 export type BuiltInThemeId = (typeof BUILT_IN_THEME_IDS)[number];
@@ -937,7 +951,146 @@ export const IRIS_THEME: ThemeDefinition = {
   sidebarArtwork: true,
 };
 
+// ardud missions: desk-theme
+/** Desk: tonal panels on a plain ground with a teal action colour. The default for a fresh install. */
+export const DESK_THEME: ThemeDefinition = {
+  id: "desk",
+  label: "Desk",
+  appearance: "light",
+  colors: {
+    canvas: "oklch(1 0 0)",
+    chrome: "oklch(1 0 0)",
+    toolbar: "oklch(1 0 0)",
+    toolbarForeground: "oklch(0.24132 0.005785 121.88)",
+    toolbarBorder: "oklch(0.929879 0.005346 106.503)",
+    toolbarControl: "oklch(0.975582 0.002643 106.448)",
+    toolbarControlForeground: "oklch(0.24132 0.005785 121.88)",
+    toolbarControlHover: "oklch(0.942527 0.002666 106.45)",
+    surface: "oklch(0.975582 0.002643 106.448)",
+    surfaceRaised: "oklch(0.975582 0.002643 106.448)",
+    surfaceOverlay: "oklch(1 0 0)",
+    text: "oklch(0.24132 0.005785 121.88)",
+    textMuted: "oklch(0.498402 0.006234 106.624)",
+    border: "oklch(0.929879 0.005346 106.503)",
+    input: "oklch(0.884452 0.004061 106.482)",
+    focus: "oklch(0.48836 0.077332 185.461)",
+    accent: "oklch(0.48836 0.077332 185.461)",
+    accentForeground: "oklch(1 0 0)",
+    secondary: "oklch(0.942527 0.002666 106.45)",
+    secondaryForeground: "oklch(0.24132 0.005785 121.88)",
+    muted: "oklch(0.975582 0.002643 106.448)",
+    mutedForeground: "oklch(0.498402 0.006234 106.624)",
+    placeholder: "oklch(0.547361 0.006093 106.599)",
+    secondaryLabel: "oklch(0.498402 0.006234 106.624)",
+    iconMuted: "oklch(0.638864 0.005865 106.564)",
+    error: "oklch(0.500336 0.182051 29.513)",
+    errorForeground: "oklch(0.500336 0.182051 29.513)",
+    errorSurface: "oklch(0.962663 0.010896 24.321)",
+    warning: "oklch(0.473189 0.124699 46.201)",
+    warningForeground: "oklch(0.473189 0.124699 46.201)",
+    warningSurface: "oklch(0.963906 0.00759 61.453)",
+    update: "oklch(0.48836 0.077332 185.461)",
+    updateForeground: "oklch(0.48836 0.077332 185.461)",
+    updateSurface: "oklch(0.949337 0.011963 184.077)",
+    accentSurface: "oklch(0.942527 0.002666 106.45)",
+    accentSurfaceForeground: "oklch(0.24132 0.005785 121.88)",
+    messageSurface: "oklch(0.975582 0.002643 106.448)",
+    messageForeground: "oklch(0.24132 0.005785 121.88)",
+    messageAction: "oklch(0.48836 0.077332 185.461)",
+    messageActionForeground: "oklch(1 0 0)",
+    messageActionHover: "oklch(0.440755 0.069309 185.459)",
+    codeBackground: "oklch(0.975582 0.002643 106.448)",
+    codeForeground: "oklch(0.24132 0.005785 121.88)",
+    searchMatchBackground: "oklch(0.910441 0.108498 88.529)",
+    searchMatchForeground: "oklch(0.216164 0.028283 77.423)",
+    searchMatchActiveBackground: "oklch(0.774202 0.151946 74.331)",
+    searchMatchActiveForeground: "oklch(0.216164 0.028283 77.423)",
+    sidebar: "oklch(1 0 0)",
+    sidebarForeground: "oklch(0.24132 0.005785 121.88)",
+    sidebarMutedForeground: "oklch(0.498402 0.006234 106.624)",
+    sidebarControlSurface: "oklch(0.975582 0.002643 106.448)",
+    sidebarRowHover: "oklch(0.975582 0.002643 106.448)",
+    sidebarRowActive: "oklch(0.942527 0.002666 106.45)",
+    sidebarRowSelected: "oklch(0.949337 0.011963 184.077)",
+    sidebarBorder: "oklch(0.929879 0.005346 106.503)",
+    terminalBackground: "oklch(0.975582 0.002643 106.448)",
+    terminalForeground: "oklch(0.24132 0.005785 121.88)",
+    terminalCursor: "oklch(0.48836 0.077332 185.461)",
+    terminalSelection: "oklch(0.888433 0.016593 182.668)",
+    terminalScrollbar: "oklch(0.884452 0.004061 106.482)",
+    terminalScrollbarHover: "oklch(0.796925 0.006939 106.556)",
+  },
+  variants: {
+    dark: {
+      canvas: "oklch(0.167992 0.002046 106.618)",
+      chrome: "oklch(0.167992 0.002046 106.618)",
+      toolbar: "oklch(0.167992 0.002046 106.618)",
+      toolbarForeground: "oklch(0.957034 0.005308 106.499)",
+      toolbarBorder: "oklch(0.292032 0.005334 106.725)",
+      toolbarControl: "oklch(0.216998 0.003831 106.715)",
+      toolbarControlForeground: "oklch(0.957034 0.005308 106.499)",
+      toolbarControlHover: "oklch(0.283914 0.005371 106.737)",
+      surface: "oklch(0.216998 0.003831 106.715)",
+      surfaceRaised: "oklch(0.216998 0.003831 106.715)",
+      surfaceOverlay: "oklch(0.259566 0.003667 106.652)",
+      text: "oklch(0.957034 0.005308 106.499)",
+      textMuted: "oklch(0.733044 0.008494 106.607)",
+      border: "oklch(0.292032 0.005334 106.725)",
+      input: "oklch(0.358636 0.006755 106.735)",
+      focus: "oklch(0.743801 0.096631 184.208)",
+      accent: "oklch(0.743801 0.096631 184.208)",
+      accentForeground: "oklch(0.233512 0.034856 185.57)",
+      secondary: "oklch(0.292032 0.005334 106.725)",
+      secondaryForeground: "oklch(0.957034 0.005308 106.499)",
+      muted: "oklch(0.216998 0.003831 106.715)",
+      mutedForeground: "oklch(0.733044 0.008494 106.607)",
+      placeholder: "oklch(0.636143 0.00294 106.483)",
+      secondaryLabel: "oklch(0.733044 0.008494 106.607)",
+      iconMuted: "oklch(0.684431 0.008638 106.626)",
+      error: "oklch(0.589776 0.19549 24.02)",
+      errorForeground: "oklch(0.702184 0.189226 22.228)",
+      errorSurface: "oklch(0.251349 0.035241 22.694)",
+      warning: "oklch(0.781476 0.122205 73.186)",
+      warningForeground: "oklch(0.781476 0.122205 73.186)",
+      warningSurface: "oklch(0.261845 0.022807 75.326)",
+      update: "oklch(0.743801 0.096631 184.208)",
+      updateForeground: "oklch(0.786691 0.092013 183.985)",
+      updateSurface: "oklch(0.286942 0.033095 182.844)",
+      accentSurface: "oklch(0.283914 0.005371 106.737)",
+      accentSurfaceForeground: "oklch(0.957034 0.005308 106.499)",
+      messageSurface: "oklch(0.216998 0.003831 106.715)",
+      messageForeground: "oklch(0.957034 0.005308 106.499)",
+      messageAction: "oklch(0.743801 0.096631 184.208)",
+      messageActionForeground: "oklch(0.233512 0.034856 185.57)",
+      messageActionHover: "oklch(0.778038 0.086154 185.149)",
+      codeBackground: "oklch(0.216998 0.003831 106.715)",
+      codeForeground: "oklch(0.957034 0.005308 106.499)",
+      searchMatchBackground: "oklch(0.549168 0.09987 84.95)",
+      searchMatchForeground: "oklch(0.970151 0 0)",
+      searchMatchActiveBackground: "oklch(0.774202 0.151946 74.331)",
+      searchMatchActiveForeground: "oklch(0.216164 0.028283 77.423)",
+      sidebar: "oklch(0.167992 0.002046 106.618)",
+      sidebarForeground: "oklch(0.957034 0.005308 106.499)",
+      sidebarMutedForeground: "oklch(0.733044 0.008494 106.607)",
+      sidebarControlSurface: "oklch(0.216998 0.003831 106.715)",
+      sidebarRowHover: "oklch(0.216998 0.003831 106.715)",
+      sidebarRowActive: "oklch(0.283914 0.005371 106.737)",
+      sidebarRowSelected: "oklch(0.286942 0.033095 182.844)",
+      sidebarBorder: "oklch(0.292032 0.005334 106.725)",
+      terminalBackground: "oklch(0.216998 0.003831 106.715)",
+      terminalForeground: "oklch(0.957034 0.005308 106.499)",
+      terminalCursor: "oklch(0.743801 0.096631 184.208)",
+      terminalSelection: "oklch(0.36764 0.033098 180.964)",
+      terminalScrollbar: "oklch(0.358636 0.006755 106.735)",
+      terminalScrollbarHover: "oklch(0.501315 0.009319 106.731)",
+    },
+  },
+  sidebarArtwork: false,
+};
+// end ardud missions: desk-theme
+
 export const BUILT_IN_THEMES: ReadonlyArray<ThemeDefinition> = [
+  DESK_THEME, // ardud missions: desk-theme
   T3_CHAT_THEME,
   GROVE_THEME,
   OCEAN_THEME,

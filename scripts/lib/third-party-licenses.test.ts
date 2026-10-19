@@ -220,6 +220,24 @@ describe("third-party license generation", () => {
     );
   });
 
+  // ardud missions: desk-theme
+  it("ships the Instrument Sans OFL notice with the web and mobile apps", async () => {
+    const config = JSON.parse(
+      await NodeFSP.readFile(
+        NodePath.join(REPOSITORY_ROOT, "third-party-licenses.config.json"),
+        "utf8",
+      ),
+    ) as { customNotices: Array<{ name: string; bundles: string[]; noticeFile: string }> };
+    const notice = config.customNotices.find((entry) => entry.name === "Instrument Sans");
+    expect(notice?.bundles).toEqual(expect.arrayContaining(["web", "mobile"]));
+    const text = await NodeFSP.readFile(NodePath.join(REPOSITORY_ROOT, notice!.noticeFile), "utf8");
+    expect(text).toContain(
+      "Copyright 2022 The Instrument Sans Project Authors (https://github.com/Instrument/instrument-sans)",
+    );
+    expect(text).toContain("SIL OPEN FONT LICENSE Version 1.1");
+  });
+  // end ardud missions: desk-theme
+
   it("collects production packages and custom asset notices", async () => {
     const fixture = await createFixture();
     const manifest = await generateThirdPartyLicenseManifest({

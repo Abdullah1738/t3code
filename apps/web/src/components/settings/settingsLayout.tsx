@@ -209,7 +209,10 @@ export function SettingsSection({
           className="flex min-h-7 items-start justify-between gap-4 px-3 sm:px-4"
         >
           <div className="flex min-w-0 items-center gap-1">
-            <h2 className="flex min-h-7 items-center gap-2 text-sm font-normal text-foreground/70">
+            <h2
+              data-settings-section-title="" // ardud missions: desk-theme
+              className="flex min-h-7 items-center gap-2 text-sm font-normal text-foreground/70"
+            >
               {icon}
               {title}
             </h2>

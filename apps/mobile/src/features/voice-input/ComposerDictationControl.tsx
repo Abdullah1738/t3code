@@ -247,8 +247,8 @@ const VoiceWaveform = memo(function VoiceWaveform(props: {
 });
 
 /**
- * Renders the recording time in the system font: DM Sans has no tabular
- * figures, so `tabular-nums` alone would still let the width jitter.
+ * Renders the recording time in the system font with tabular figures, so the
+ * width never jitters as the seconds tick.
  */
 export function DictationElapsedTime(props: {
   readonly seconds: number;

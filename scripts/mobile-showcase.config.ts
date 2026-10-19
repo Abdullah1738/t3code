@@ -1,5 +1,5 @@
 import {
-  MOBILE_DEFAULT_THEME_ID,
+  MOBILE_STANDARD_THEME_ID, // ardud missions: desk-theme
   MOBILE_THEME_IDS,
   type MobileThemeId,
 } from "@t3tools/shared/themePalettes";
@@ -13,7 +13,7 @@ export type ShowcaseAppearance = "light" | "dark";
 
 /** Every palette the mobile appearance settings can select. */
 export const SHOWCASE_THEMES = MOBILE_THEME_IDS;
-export const DEFAULT_SHOWCASE_THEME = MOBILE_DEFAULT_THEME_ID;
+export const DEFAULT_SHOWCASE_THEME = MOBILE_STANDARD_THEME_ID; // ardud missions: desk-theme
 export type ShowcaseTheme = MobileThemeId;
 
 export interface ShowcaseStoreAssetSpec {

@@ -5,6 +5,7 @@ import {
   T3_CODE_DARK_THEME_COLORS,
   getThemeColorsForAppearance,
   MOBILE_DEFAULT_THEME_ID,
+  MOBILE_STANDARD_THEME_ID,
   MOBILE_THEME_IDS as SHARED_MOBILE_THEME_IDS,
   type MobileThemeId as SharedMobileThemeId,
   type ThemeAppearance,
@@ -15,7 +16,11 @@ import {
   type ThemePreviewColors,
 } from "@t3tools/shared/themePreview";
 
+// ardud missions: desk-theme
+/** What a fresh install shows. The standard palette stays selectable as "T3 Code". */
 export const DEFAULT_MOBILE_THEME_ID = MOBILE_DEFAULT_THEME_ID;
+export const STANDARD_MOBILE_THEME_ID = MOBILE_STANDARD_THEME_ID;
+// end ardud missions: desk-theme
 export const MOBILE_THEME_IDS = [...SHARED_MOBILE_THEME_IDS, "material-you"] as const;
 export type MobileThemeId = SharedMobileThemeId | "material-you";
 export type MobileThemeAppearance = ThemeAppearance;
@@ -26,9 +31,13 @@ export const MOBILE_THEME_OPTIONS: ReadonlyArray<{
   readonly id: MobileThemeId;
   readonly label: string;
 }> = [
-  { id: DEFAULT_MOBILE_THEME_ID, label: "T3 Code" },
+  { id: DEFAULT_MOBILE_THEME_ID, label: "Desk" }, // ardud missions: desk-theme
+  { id: STANDARD_MOBILE_THEME_ID, label: "T3 Code" },
   { id: "material-you", label: "Material You" },
-  ...BUILT_IN_THEMES.map((theme) => ({ id: theme.id as MobileThemeId, label: theme.label })),
+  ...BUILT_IN_THEMES.filter((theme) => theme.id !== DEFAULT_MOBILE_THEME_ID).map((theme) => ({
+    id: theme.id as MobileThemeId,
+    label: theme.label,
+  })),
 ];
 
 // Closed set: every key `createMobileThemeVariables` writes. Reads of a
@@ -376,7 +385,7 @@ export function getMobileThemeColors(
   themeId: SharedMobileThemeId,
   appearance: MobileThemeAppearance,
 ): ThemeColors {
-  if (themeId === DEFAULT_MOBILE_THEME_ID) {
+  if (themeId === STANDARD_MOBILE_THEME_ID) {
     return appearance === "dark" ? T3_CODE_DARK_THEME_COLORS : T3_CODE_LIGHT_THEME_COLORS;
   }
   const theme = BUILT_IN_THEMES.find((candidate) => candidate.id === themeId) ?? T3_CHAT_THEME;
@@ -392,7 +401,7 @@ export function getMobileThemeVariables(
   // Mobile groups and floating controls need a tonal fill, rather than the
   // nearly neutral raised surface used by desktop outlined cards.
   const groupedCard =
-    themeId === DEFAULT_MOBILE_THEME_ID
+    themeId === STANDARD_MOBILE_THEME_ID
       ? appearance === "light"
         ? colors.toolbarControlHover
         : colors.sidebarRowActive
@@ -402,7 +411,7 @@ export function getMobileThemeVariables(
           : colors.surface
         : colors.muted;
   const mobileColors =
-    themeId === DEFAULT_MOBILE_THEME_ID
+    themeId === STANDARD_MOBILE_THEME_ID
       ? {
           ...colors,
           messageSurface: flattenThemeColor(
@@ -420,7 +429,7 @@ export function getMobileThemeVariables(
     groupedCard,
     themeId === "t3-chat" && appearance === "dark"
       ? [colors.messageActionForeground, colors.messageAction]
-      : themeId !== DEFAULT_MOBILE_THEME_ID && themeId !== "t3-chat"
+      : themeId !== STANDARD_MOBILE_THEME_ID && themeId !== "t3-chat"
         ? [colors.messageAction, colors.messageActionForeground]
         : undefined,
   );
@@ -433,7 +442,7 @@ export function getMobileThemePreviewColors(
   themeId: MobileThemeId,
   appearance: MobileThemeAppearance,
 ): ThemePreviewColors {
-  if (themeId === DEFAULT_MOBILE_THEME_ID || themeId === "material-you")
+  if (themeId === STANDARD_MOBILE_THEME_ID || themeId === "material-you")
     return STANDARD_THEME_PREVIEW_COLORS[appearance];
   const theme = BUILT_IN_THEMES.find((candidate) => candidate.id === themeId) ?? T3_CHAT_THEME;
   const colors = getThemeColorsForAppearance(theme, appearance) ?? theme.colors;

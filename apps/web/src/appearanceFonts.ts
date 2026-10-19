@@ -16,9 +16,20 @@ import {
   MIN_INTERFACE_FONT_SIZE,
   MIN_PROMPT_FONT_SIZE,
 } from "@t3tools/contracts";
+import { DESK_THEME } from "@t3tools/shared/themePalettes"; // ardud missions: desk-theme
 
 export const DEFAULT_SANS_FONT_STACK =
   '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif';
+
+// ardud missions: desk-theme
+/** Desk sets its own interface face (index.css) while the user has not picked one. */
+export const DESK_SANS_FONT_LABEL = "Instrument Sans (Desk)";
+
+/** Names the interface font an empty preference renders in under the active theme. */
+export function resolveDefaultSansLabel(activeThemeId: string | null, systemLabel: string): string {
+  return activeThemeId === DESK_THEME.id ? DESK_SANS_FONT_LABEL : systemLabel;
+}
+// end ardud missions: desk-theme
 
 // Concrete names first: some engines alias `ui-monospace` to the
 // proportional system UI font, which would break every code surface.

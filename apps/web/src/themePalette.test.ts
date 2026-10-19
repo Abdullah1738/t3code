@@ -82,6 +82,17 @@ function contrastRatio(first: string, second: string): number {
 }
 
 describe("theme files", () => {
+  it("ships Desk as the first built-in with both appearances and no artwork", () => {
+    const desk = getThemeDefinition("desk");
+    expect(BUILT_IN_THEMES[0]?.id).toBe("desk");
+    expect(desk).toMatchObject({ id: "desk", label: "Desk", appearance: "light" });
+    expect(desk && getThemeModes(desk)).toEqual(["light", "dark"]);
+    expect(themeAllowsSidebarArtwork("desk")).toBe(false);
+    expect(isKnownThemePreference("desk")).toBe(true);
+    expect(resolveDesktopTheme("desk", undefined, "system")).toBe("system");
+    expect(resolveThemeAppearance("desk", true, undefined, "system")).toBe("dark");
+  });
+
   it("keeps every built-in palette value in canonical OKLCH form", () => {
     for (const theme of BUILT_IN_THEMES) {
       for (const colors of [theme.colors, ...Object.values(theme.variants ?? {})]) {
@@ -591,6 +602,39 @@ describe("theme files", () => {
       canvas: canonical("#111827"),
     });
     expect(getThemeColorsForMode(theme, "light")).toBeNull();
+  });
+
+  it("keeps a saved theme that already used the Desk id under a free id", () => {
+    const stored = new Map([
+      [
+        CUSTOM_THEMES_STORAGE_KEY,
+        JSON.stringify([
+          { id: "desk", label: "My desk", appearance: "dark", colors: { canvas: "#101010" } },
+          { id: "desk-2", label: "Desk two", appearance: "dark", colors: { canvas: "#202020" } },
+        ]),
+      ],
+    ]);
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => stored.get(key) ?? null,
+        setItem: (key: string, value: string) => stored.set(key, value),
+      },
+    });
+
+    invalidateCustomThemes();
+    expect(getCustomThemes().map((theme) => [theme.id, theme.label])).toEqual([
+      ["desk-3", "My desk"],
+      ["desk-2", "Desk two"],
+    ]);
+    expect(getThemeDefinition("desk")?.label).toBe("Desk");
+
+    removeCustomTheme("desk-2");
+    expect(JSON.parse(stored.get(CUSTOM_THEMES_STORAGE_KEY) ?? "[]")).toMatchObject([
+      { id: "desk-3", label: "My desk" },
+    ]);
+
+    vi.unstubAllGlobals();
+    invalidateCustomThemes();
   });
 
   it("invalidates cached themes when another tab clears localStorage", () => {

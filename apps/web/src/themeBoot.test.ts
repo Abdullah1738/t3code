@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import indexHtml from "../index.html?raw";
 import {
   CUSTOM_THEMES_STORAGE_KEY,
+  DESK_THEME,
   getDefaultThemeColors,
   getThemeColorsForMode,
   invalidateCustomThemes,
@@ -113,7 +114,7 @@ function runtimeResolvedAppearance(
   invalidateCustomThemes();
   try {
     const raw = storage[THEME_STORAGE_KEY] ?? null;
-    const theme = raw !== null && isKnownThemePreference(raw) ? raw : "system";
+    const theme = raw !== null && isKnownThemePreference(raw) ? raw : "desk";
     const followRaw = storage[THEME_FOLLOW_SYSTEM_STORAGE_KEY] ?? null;
     const appearanceRaw = storage[THEME_APPEARANCE_MODE_STORAGE_KEY] ?? null;
     const appearanceMode =
@@ -123,7 +124,7 @@ function runtimeResolvedAppearance(
           ? "system"
           : followRaw === "false"
             ? null
-            : theme === "system"
+            : theme === "system" || theme === "desk"
               ? "system"
               : null;
     const followSystem = appearanceMode === "system";
@@ -342,7 +343,14 @@ describe("index.html boot script", () => {
   // boot script's hand-maintained copy into a CI-enforced contract: any
   // palette change breaks this test until the copy in index.html is updated.
   it("keeps every built-in boot splash in sync with the real palettes", () => {
-    for (const theme of [T3_CHAT_THEME, GROVE_THEME, OCEAN_THEME, EMBER_THEME, IRIS_THEME]) {
+    for (const theme of [
+      DESK_THEME,
+      T3_CHAT_THEME,
+      GROVE_THEME,
+      OCEAN_THEME,
+      EMBER_THEME,
+      IRIS_THEME,
+    ]) {
       // The boot script resolves every built-in from a light base appearance.
       expect(theme.appearance).toBe("light");
       for (const mode of ["light", "dark"] as const) {
@@ -491,28 +499,44 @@ describe("index.html boot script", () => {
       prefersDark: false,
     });
 
-    expect(boot.themeId).toBeUndefined();
-    expect(boot.themeSelected).toBeUndefined();
-    expect(boot.backgroundColor).toBe("#ffffff");
-    expect(boot.metaContent).toBe("#ffffff");
+    expect(boot.themeId).toBe("desk");
+    expect(boot.themeSelected).toBe("true");
+    expect(boot.backgroundColor).toBe(DESK_THEME.colors.chrome);
+    expect(boot.metaContent).toBe(DESK_THEME.colors.chrome);
   });
 
-  it("leaves unknown preferences unthemed so the runtime default applies", () => {
-    const boot = runBootScript({
-      storage: { [THEME_STORAGE_KEY]: "gone-theme" },
-      prefersDark: true,
-    });
-    expect(boot.themeId).toBeUndefined();
-    expect(boot.themeSelected).toBeUndefined();
-    expect(boot.isDark).toBe(true);
+  it("paints Desk following the OS for a fresh install or an unknown preference", () => {
+    const deskDark = getThemeColorsForMode(DESK_THEME, "dark")!;
+    for (const storage of [{}, { [THEME_STORAGE_KEY]: "gone-theme" }]) {
+      const dark = runBootScript({ storage, prefersDark: true });
+      expect(dark.themeId).toBe("desk");
+      expect(dark.themeSelected).toBe("true");
+      expect(dark.isDark).toBe(true);
+      expect(dark.bootVariables["--boot-background"]).toBe(deskDark.canvas);
+      expect(dark.metaContent).toBe(deskDark.chrome);
+
+      const light = runBootScript({ storage, prefersDark: false });
+      expect(light.isDark).toBe(false);
+      expect(light.backgroundColor).toBe(DESK_THEME.colors.chrome);
+    }
   });
 
-  it("follows the OS appearance when storage is unavailable", () => {
+  it("keeps a picked theme or plain System instead of Desk", () => {
+    expect(
+      runBootScript({ storage: { [THEME_STORAGE_KEY]: "ocean" }, prefersDark: false }).themeId,
+    ).toBe("ocean");
+    const system = runBootScript({ storage: { [THEME_STORAGE_KEY]: "system" }, prefersDark: true });
+    expect(system.themeId).toBeUndefined();
+    expect(system.isDark).toBe(true);
+  });
+
+  it("paints Desk following the OS when storage is unavailable", () => {
     const light = runBootScript({ storageThrows: true, prefersDark: false });
     expect(light.isDark).toBe(false);
-    expect(light.themeId).toBeUndefined();
+    expect(light.themeId).toBe("desk");
 
     const dark = runBootScript({ storageThrows: true, prefersDark: true });
     expect(dark.isDark).toBe(true);
+    expect(dark.backgroundColor).toBe(getThemeColorsForMode(DESK_THEME, "dark")!.chrome);
   });
 });

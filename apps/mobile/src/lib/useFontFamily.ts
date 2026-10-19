@@ -1,8 +1,10 @@
+// ardud missions: desk-theme
 const FONT_FAMILIES = {
-  regular: "DMSans-Regular",
-  medium: "DMSans-Medium",
-  bold: "DMSans-Bold",
+  regular: "InstrumentSans-Regular",
+  medium: "InstrumentSans-Medium",
+  bold: "InstrumentSans-SemiBold",
 } as const;
+// end ardud missions: desk-theme
 
 /**
  * Resolves a font family for APIs that require a style object or native prop.

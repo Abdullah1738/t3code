@@ -114,11 +114,14 @@ const iosBundleIdentifier = isIosPersonalTeamBuild
   ? personalTeamBundleIdentifier!
   : variant.iosBundleIdentifier;
 
-const dmSansFonts = {
-  regular: "@expo-google-fonts/dm-sans/400Regular/DMSans_400Regular.ttf",
-  medium: "@expo-google-fonts/dm-sans/500Medium/DMSans_500Medium.ttf",
-  bold: "@expo-google-fonts/dm-sans/700Bold/DMSans_700Bold.ttf",
+// ardud missions: desk-theme
+// Instrument Sans (OFL 1.1, assets/fonts/OFL.txt). "bold" is the 600 weight.
+const appFonts = {
+  regular: "./assets/fonts/InstrumentSans_400Regular.ttf",
+  medium: "./assets/fonts/InstrumentSans_500Medium.ttf",
+  bold: "./assets/fonts/InstrumentSans_600SemiBold.ttf",
 } as const;
+// end ardud missions: desk-theme
 
 const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
   "expo-widgets",
@@ -326,21 +329,22 @@ const config: ExpoConfig = {
       "expo-font",
       {
         ios: {
-          fonts: [dmSansFonts.regular, dmSansFonts.medium, dmSansFonts.bold],
+          fonts: [appFonts.regular, appFonts.medium, appFonts.bold],
         },
         android: {
+          // ardud missions: desk-theme
           fonts: [
             {
-              fontFamily: "DMSans-Regular",
-              fontDefinitions: [{ path: dmSansFonts.regular, weight: 400 }],
+              fontFamily: "InstrumentSans-Regular",
+              fontDefinitions: [{ path: appFonts.regular, weight: 400 }],
             },
             {
-              fontFamily: "DMSans-Medium",
-              fontDefinitions: [{ path: dmSansFonts.medium, weight: 500 }],
+              fontFamily: "InstrumentSans-Medium",
+              fontDefinitions: [{ path: appFonts.medium, weight: 500 }],
             },
             {
-              fontFamily: "DMSans-Bold",
-              fontDefinitions: [{ path: dmSansFonts.bold, weight: 700 }],
+              fontFamily: "InstrumentSans-SemiBold",
+              fontDefinitions: [{ path: appFonts.bold, weight: 600 }],
             },
           ],
         },
