@@ -340,6 +340,7 @@ export const makeApprovalWrites = (kit: WriteKit) => {
           routeNote: null,
           // ardud missions: asks
           ...(yield* cleanAnnotation({ summary: null, flags: [] }, input)),
+          ...(input.view === undefined ? {} : { view: input.view }),
         };
         return yield* commit(provenance, {
           missionId: mission.id,

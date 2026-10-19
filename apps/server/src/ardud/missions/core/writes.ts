@@ -599,6 +599,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
             pullRequest: patch.pullRequest ?? null,
             links: patch.links ?? [],
             facts: patch.facts ?? { mergedAtHead: null, deployedReadback: null, exercised: null },
+            ...(patch.view === undefined ? {} : { view: patch.view }),
             createdAt: now,
             updatedAt: now,
           };

@@ -509,3 +509,33 @@ describe("master structure controls", () => {
     }).pipe(Effect.provide(layer));
   });
 });
+
+describe("views on create", () => {
+  it.effect("an approval and a work item keep the view they were opened with", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const missions = yield* MissionService.MissionService;
+      const store = yield* MissionStore.MissionStore;
+      const view = {
+        templateId: null,
+        fields: { note: { _tag: "short" as const, value: "ship after the freeze" } },
+      };
+      const approval = { ...crwApproval("21", "eeeeeeeeeeee"), view };
+      yield* missions.openApproval(crw, approval);
+      const opened = Option.getOrThrow(yield* store.get("approval", approval.approvalId));
+      assert.deepStrictEqual(opened.view, view);
+
+      const workItemId = WorkItemId.make("wi-viewed");
+      yield* missions.upsertWorkItem(master, {
+        missionId,
+        workItemId,
+        title: "Viewed item",
+        kind: "pr",
+        view,
+      });
+      const item = Option.getOrThrow(yield* store.get("work-item", workItemId));
+      assert.deepStrictEqual(item.view, view);
+    }).pipe(Effect.provide(layer));
+  });
+});
