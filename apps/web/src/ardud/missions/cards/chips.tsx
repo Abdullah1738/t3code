@@ -271,17 +271,6 @@ export function HealthGlyph(props: { health: MissionHealth; paused?: boolean }) 
   );
 }
 
-/** Health glyph plus its word ("At risk"), both in the state's colour. */
-export function HealthStatus(props: { health: MissionHealth; paused?: boolean }) {
-  const kind = props.paused ? "park" : HEALTH_GLYPH[props.health];
-  return (
-    <span className={cn("inline-flex items-center gap-1", STATE_GLYPH_CLASS[kind])}>
-      <StateGlyph kind={kind} />
-      {props.paused ? "Paused" : healthLabel(props.health)}
-    </span>
-  );
-}
-
 /** "1 needs you" / "3 need you": the spoken form of a needs-you count. */
 export function needsYouLabel(count: number) {
   return `${count} need${count === 1 ? "s" : ""} you`;

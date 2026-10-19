@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { useNavigate } from "@tanstack/react-router";
 import { ArrowLeftIcon, SendIcon } from "lucide-react";
 
 import type { MissionId } from "@t3tools/contracts";
@@ -385,27 +385,4 @@ export function RequestMessage(props: {
 export function unreadRequests(requests: ReadonlyArray<OwnerRequest> | undefined) {
   if (!requests) return [];
   return requests.filter(isRequestUnread);
-}
-
-/** Answered requests the owner has not opened, for the header count. */
-export function RequestsUnreadLink(props: {
-  missionId: MissionId;
-  requests: ReadonlyArray<OwnerRequest> | undefined;
-}) {
-  const unread = unreadRequests(props.requests);
-  const first = unread[0];
-  const count = unread.length;
-  if (!first) return null;
-  return (
-    <Link
-      to="/missions/$missionId"
-      params={{ missionId: props.missionId }}
-      search={{ request: first.id }}
-      className="inline-flex items-center gap-1.5 rounded-sm text-xs text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-    >
-      <UnreadDot />
-      <span className="tabular-nums">{count}</span>
-      <span>{count === 1 ? "answer" : "answers"}</span>
-    </Link>
-  );
 }

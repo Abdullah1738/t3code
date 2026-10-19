@@ -1,13 +1,8 @@
-import { useMemo } from "react";
-import { Link } from "@tanstack/react-router";
-
 import type { MissionId, RoomId } from "@t3tools/contracts";
-import { pageTabs, resolveMissionLayout } from "@t3tools/client-runtime/ardud/missions";
 
 import { Empty, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
 import { ScrollArea } from "../../components/ui/scroll-area";
 import { SidebarInset } from "../../components/ui/sidebar";
-import { Skeleton } from "../../components/ui/skeleton";
 import {
   WorkspaceBreadcrumb,
   WorkspaceBreadcrumbItem,
@@ -17,18 +12,18 @@ import {
 import { WorkspacePageContainer } from "../../components/WorkspacePageContainer";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
-import { cn } from "../../lib/utils";
 import { LanesTab } from "./LanesTab";
-import { MissionHead } from "./MissionHeader";
+import { MissionToolbar } from "./MissionHeader";
 import { MissionOverviewTab } from "./MissionOverviewTab";
-import { MISSION_TAB_LABEL, MISSION_TABS, type MissionTab } from "./missionSearch";
-import { useMissionOverview, useMissionViews } from "./missionsStore";
+import type { MissionTab } from "./missionSearch";
+import { useMissionOverview } from "./missionsStore";
 import { RolesTab } from "./RolesTab";
 import { RoomsTab } from "./RoomsTab";
 import { RulesTab } from "./RulesTab";
 import { TimelineTab } from "./TimelineTab";
 import { ViewsTab } from "./ViewsTab";
 import { WorkTab } from "./WorkTab";
+import { LoadingRows } from "./sections/NeedsYou";
 import { useNowMs } from "./useNowMs";
 
 /** A mission's page: header with the owner's controls, then one tab. */
@@ -70,8 +65,7 @@ export function MissionPage(props: {
               <MissionNotFound />
             ) : (
               <>
-                <MissionHead overview={overview} nowMs={nowMs} />
-                <MissionTabs missionId={props.missionId} tab={props.tab} />
+                <MissionToolbar overview={overview} tab={props.tab} />
                 {props.tab === "overview" ? (
                   <MissionOverviewTab
                     overview={overview}
@@ -107,55 +101,12 @@ export function MissionPage(props: {
   );
 }
 
-const ALL_TABS = MISSION_TABS.map((tab) => ({ tab, title: MISSION_TAB_LABEL[tab] }));
-
-/** The layout's tabs in its order and names; every tab until the views record loads. */
-function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
-  const views = useMissionViews(props.missionId);
-  const tabs = useMemo(
-    () =>
-      views
-        ? pageTabs(resolveMissionLayout(views.snapshot), MISSION_TAB_LABEL, props.tab)
-        : ALL_TABS,
-    [views, props.tab],
-  );
-  return (
-    <nav aria-label="Mission sections" className="overflow-x-auto border-b border-(--m-rule)">
-      <ul className="flex min-w-max gap-0.5">
-        {tabs.map(({ tab, title }) => {
-          const active = tab === props.tab;
-          return (
-            <li key={tab}>
-              <Link
-                to="/missions/$missionId"
-                params={{ missionId: props.missionId }}
-                search={tab === "overview" ? {} : { tab }}
-                aria-current={active ? "page" : undefined}
-                className={cn(
-                  "relative flex h-9 items-center px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
-                  active
-                    ? "font-medium text-(--m-text) after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-(--m-text)"
-                    : "text-(--m-muted) hover:text-(--m-text)",
-                )}
-              >
-                {title}
-              </Link>
-            </li>
-          );
-        })}
-      </ul>
-    </nav>
-  );
-}
-
 function MissionPageSkeleton() {
   return (
     <div className="flex flex-col gap-4" aria-busy="true">
       <h1 className="sr-only">Loading mission</h1>
-      <Skeleton className="h-4 w-2/3" />
-      <Skeleton className="h-6 w-1/2" />
-      <Skeleton className="h-24 w-full" />
-      <Skeleton className="h-40 w-full" />
+      <span aria-hidden className="h-3.5 w-2/5 rounded-md bg-(--m-active)" />
+      <LoadingRows />
     </div>
   );
 }
