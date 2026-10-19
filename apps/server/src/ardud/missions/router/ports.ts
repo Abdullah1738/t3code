@@ -33,10 +33,11 @@ export class RouterThreads extends Context.Service<
     readonly facts: (threadId: ThreadId) => Effect.Effect<ThreadFacts | null, MissionError>;
     /**
      * Who made the thread, as the guard recorded it when the thread was
-     * forked. `null` when nothing was recorded (legacy forks, subagent
-     * children): lineage alone never makes such a thread a mission member.
+     * forked. `null` when a successful read found nothing (legacy forks):
+     * lineage alone never makes such a thread a mission member. A record
+     * that cannot be read fails, and membership fails with it.
      */
-    readonly creator: (threadId: ThreadId) => Effect.Effect<GuardPrincipal | null>;
+    readonly creator: (threadId: ThreadId) => Effect.Effect<GuardPrincipal | null, MissionError>;
     /** Queues `text` in the thread. `key` makes retries land once. */
     readonly send: (input: {
       readonly threadId: ThreadId;

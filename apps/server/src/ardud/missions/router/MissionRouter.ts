@@ -368,7 +368,10 @@ const make = Effect.gen(function* () {
    * Every live mission that could count the thread as a member: missions
    * whose records name it (role bindings, lanes, forks) and missions holding
    * an explicit member row for it. Both lookups are complete indexed reads
-   * keyed by the thread, never a capped list of missions.
+   * keyed by the thread, never a capped list of missions. A record naming a
+   * mission that is not there fails the lookup: the thread may well belong to
+   * it, so the guard refuses rather than treat the thread as an outsider. A
+   * mission that loads and is archived is skipped, as before.
    */
   const candidateCasts = (threadId: ThreadId) =>
     Effect.gen(function* () {
@@ -377,7 +380,13 @@ const make = Effect.gen(function* () {
       const casts: RouterCast[] = [];
       for (const id of [...ids].toSorted()) {
         const cast = yield* loadCast(id);
-        if (cast.mission !== null && LIVE_MISSIONS.has(cast.mission.status)) casts.push(cast);
+        if (cast.mission === null) {
+          return yield* fail(
+            "conflict",
+            `Thread ${threadId} is recorded in mission ${id}, which cannot be found.`,
+          );
+        }
+        if (LIVE_MISSIONS.has(cast.mission.status)) casts.push(cast);
       }
       return casts;
     });
