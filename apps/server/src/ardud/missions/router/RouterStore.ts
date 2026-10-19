@@ -66,9 +66,7 @@ const DDL = [
     ON ardud_mission_router_messages (room_id, seq)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS ardud_mission_router_messages_by_key
     ON ardud_mission_router_messages (mission_id, msg_key) WHERE msg_key IS NOT NULL`,
-  // Owner-request keys carry the iMessage id, which must post once across missions.
-  `CREATE INDEX IF NOT EXISTS ardud_mission_router_messages_by_bare_key
-    ON ardud_mission_router_messages (msg_key) WHERE msg_key IS NOT NULL`,
+  `DROP INDEX IF EXISTS ardud_mission_router_messages_by_bare_key`,
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_bodies (
     message_id TEXT PRIMARY KEY,
     body TEXT NOT NULL
@@ -322,8 +320,11 @@ export class RouterStore extends Context.Service<
       missionId: MissionId,
       key: string,
     ) => Effect.Effect<StoredMessage | null>;
-    /** Missions holding a message with this key (an iMessage id posts once anywhere). */
-    readonly keyMissions: (key: string) => Effect.Effect<ReadonlyArray<MissionId>>;
+    /** Messages of a mission whose key starts with `prefix`, oldest first. */
+    readonly messagesByKeyPrefix: (
+      missionId: MissionId,
+      prefix: string,
+    ) => Effect.Effect<ReadonlyArray<StoredMessage>>;
     readonly messageById: (id: MissionMessageId) => Effect.Effect<MissionMessage | null>;
     readonly messageBody: (id: MissionMessageId) => Effect.Effect<string | null>;
     /** Newest `limit` messages of a room below `beforeSeq`, returned oldest first. */
@@ -780,13 +781,20 @@ const make = Effect.gen(function* () {
         ),
       ),
 
-    keyMissions: (key) =>
+    messagesByKeyPrefix: (missionId, prefix) =>
       read(
-        sql<{ readonly missionId: string }>`
-          SELECT DISTINCT mission_id AS "missionId"
+        // A range on the (mission_id, msg_key) index; LIKE would need escaping.
+        sql<MessageRow>`
+          SELECT message_json AS "json", content_hash AS "contentHash"
           FROM ardud_mission_router_messages
-          WHERE msg_key = ${key}
-        `.pipe(Effect.map((rows) => rows.map((row) => MissionId.make(row.missionId)))),
+          WHERE mission_id = ${missionId}
+            AND msg_key >= ${prefix} AND msg_key < ${`${prefix}\u{10FFFF}`}
+          ORDER BY seq ASC
+        `.pipe(
+          Effect.map((rows) =>
+            rows.map((row) => ({ message: decodeMessage(row.json), contentHash: row.contentHash })),
+          ),
+        ),
       ),
 
     messageById: (id) =>

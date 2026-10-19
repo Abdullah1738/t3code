@@ -465,7 +465,7 @@ describe("owner requests", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
-  it.effect("one iMessage writes once: one request, one mission", () => {
+  it.effect("one iMessage writes to each request once, and to several requests", () => {
     const h = harness();
     return Effect.gen(function* () {
       yield* seed;
@@ -476,24 +476,80 @@ describe("owner requests", () => {
       assert.strictEqual(retried.id, opened.id);
       assert.strictEqual(wakesFor(h.sent, masterThread).length, 1);
       const other = yield* router.openRequest({ missionId, text: "Docs?" }, ownerApp);
+      const third = yield* router.openRequest({ missionId, text: "Tests?" }, ownerApp);
       yield* router.settled(masterThread);
 
+      // "Go ahead on both": the same message answers two requests, once each.
+      const both = "Go ahead on both.";
+      yield* router.replyRequest({ requestId: other.id, text: both }, ownerIMessage);
+      yield* router.replyRequest({ requestId: third.id, text: both }, ownerIMessage);
+      yield* router.replyRequest({ requestId: other.id, text: both }, ownerIMessage);
+      // It may open a request in another mission too.
+      const elsewhere = yield* router.openRequest(
+        { missionId: otherMissionId, text: "Status?" },
+        ownerIMessage,
+      );
+      assert.notStrictEqual(elsewhere.id, opened.id);
+
       const refusals = [
-        // The same message cannot open a request in another mission...
-        router.openRequest({ missionId: otherMissionId, text: "Status?" }, ownerIMessage),
-        // ...or a second request here...
+        // Not a second request here...
         router.openRequest({ missionId, text: "Something else" }, ownerIMessage),
-        // ...or be posted as the owner's reply on another request.
-        router.replyRequest({ requestId: other.id, text: "Status?" }, ownerIMessage),
-        router.settleRequest({ requestId: other.id, note: "Status?" }, ownerIMessage),
+        // ...nor other words, or a settle, where it already wrote.
+        router.replyRequest({ requestId: other.id, text: "Something else" }, ownerIMessage),
+        router.settleRequest({ requestId: third.id, note: both }, ownerIMessage),
+        router.replyRequest({ requestId: opened.id, text: "Something else" }, ownerIMessage),
       ];
       for (const refused of refusals) {
         assert.strictEqual(yield* failureCode(refused), "conflict");
       }
-      assert.strictEqual(wakesFor(h.sent, masterThread).length, 2);
       assert.deepStrictEqual(
         (yield* requestEvents).map((event) => event.kind),
-        ["request.opened", "request.opened"],
+        [
+          "request.opened",
+          "request.opened",
+          "request.opened",
+          "request.replied",
+          "request.replied",
+        ],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("one iMessage can discuss two records, once each", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const free = { kind: "work-item", id: "wi-free" } as const;
+      const held = { kind: "work-item", id: "wi-held" } as const;
+      // One record already has an open discussion; the message adds to it.
+      const ongoing = yield* router.openRequest(
+        { missionId, text: "Is this blocked?", subject: held },
+        ownerApp,
+      );
+      const text = "Hold both until Monday.";
+      const onFree = yield* router.openRequest({ missionId, text, subject: free }, ownerIMessage);
+      const onHeld = yield* router.openRequest({ missionId, text, subject: held }, ownerIMessage);
+      assert.notStrictEqual(onFree.id, onHeld.id);
+      assert.strictEqual(onHeld.id, ongoing.id);
+      // Retries land on what each already wrote.
+      assert.strictEqual(
+        (yield* router.openRequest({ missionId, text, subject: held }, ownerIMessage)).id,
+        ongoing.id,
+      );
+      assert.strictEqual(
+        (yield* router.openRequest({ missionId, text, subject: free }, ownerIMessage)).id,
+        onFree.id,
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.openRequest({ missionId, text: "Other words.", subject: free }, ownerIMessage),
+        ),
+        "conflict",
+      );
+      assert.deepStrictEqual(
+        (yield* requestEvents).map((event) => event.kind),
+        ["request.opened", "request.opened", "request.replied"],
       );
     }).pipe(Effect.provide(h.layer));
   });

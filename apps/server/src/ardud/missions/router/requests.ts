@@ -163,11 +163,15 @@ const refOf = (request: OwnerRequest): MissionRecordRef => ({
 });
 
 /**
- * One key per iMessage across every mission: the same inbound message can
- * open or answer one request, once. Retries land on what it already wrote.
+ * One key per iMessage and request: the same inbound message can write to
+ * several requests ("approve both"), once each. Retries land on what it
+ * already wrote there.
  */
-const inboundKeyOf = (provenance: MissionProvenance) =>
-  provenance._tag === "owner-imessage" ? `owner-imessage:${provenance.inboundId}` : null;
+const inboundKeyOf = (provenance: MissionProvenance, requestId: OwnerRequestId) =>
+  provenance._tag === "owner-imessage"
+    ? `${inboundPrefixOf(provenance.inboundId)}${requestId}`
+    : null;
+const inboundPrefixOf = (inboundId: string) => `owner-imessage:${inboundId}:`;
 
 /** Mission-scoped store records a reply may link to; each must be in the request's mission. */
 const SCOPED_LINK_KINDS = [
@@ -391,8 +395,8 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
       });
 
     /**
-     * A keyed post lands once: refuse the key when it already wrote in another
-     * mission, or under a different request or text in this one.
+     * A keyed post lands once: refuse the key when it already wrote a
+     * different text or into another room.
      */
     const priorPost = (
       key: string | null,
@@ -400,12 +404,6 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
     ): Effect.Effect<"fresh" | "repeat", MissionError> =>
       Effect.gen(function* () {
         if (key === null) return "fresh";
-        const elsewhere = (yield* rooms.keyMissions(key)).filter(
-          (missionId) => missionId !== input.missionId,
-        );
-        if (elsewhere.length > 0) {
-          return yield* fail("conflict", "That message from the owner was already used elsewhere.");
-        }
         const prior = yield* rooms.messageByKey(input.missionId, key);
         if (prior === null) return "fresh";
         if (prior.message.roomId !== input.roomId || prior.contentHash !== postContentHash(input)) {
@@ -570,6 +568,34 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         };
       });
 
+    /**
+     * What an open about `subject` already wrote, when it is a retry: the
+     * message under its own key, or for an iMessage, the one it added to a
+     * request about the same record (it may have written to others too).
+     */
+    const appendedBefore = (
+      missionId: MissionId,
+      inboundId: string | null,
+      openKey: string,
+      subject: MissionRecordRef,
+    ) =>
+      Effect.gen(function* () {
+        const priors =
+          inboundId === null
+            ? [yield* rooms.messageByKey(missionId, openKey)].filter((prior) => prior !== null)
+            : yield* rooms.messagesByKeyPrefix(missionId, inboundPrefixOf(inboundId));
+        for (const prior of priors) {
+          const priorId = requestIdOfRoom(prior.message.roomId);
+          if (priorId === null) continue;
+          const request = yield* need(priorId);
+          // A plain key is one action: reused about another record, it conflicts.
+          if (inboundId === null || sameRef(request.subject, subject)) {
+            return { request, contentHash: prior.contentHash };
+          }
+        }
+        return null;
+      });
+
     /** The open request about a record, if there is one. */
     const openAbout = (missionId: MissionId, ref: MissionRecordRef) =>
       Effect.map(
@@ -684,34 +710,47 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           const subject =
             input.subject === undefined ? null : yield* subjectOf(mission.id, input.subject);
           const to = writer._tag === "owner" ? yield* masterAddress(cast) : [];
-          const inboundKey = inboundKeyOf(provenance);
-          const idKey = input.key ?? inboundKey;
+          const inboundId = provenance._tag === "owner-imessage" ? provenance.inboundId : null;
+          // One iMessage can discuss several records: each is its own request.
+          const idKey =
+            input.key ??
+            (inboundId === null
+              ? null
+              : `owner-imessage:${inboundId}${subject === null ? "" : `:${subject.kind}:${subject.id}`}`);
           const requestId =
             idKey === null
               ? OwnerRequestId.make(`request-${NodeCrypto.randomUUID()}`)
               : keyedRequestId(mission.id, idKey);
+          const inboundKey = inboundKeyOf(provenance, requestId);
           // One open conversation per record: Discuss again adds to it. The
           // added message keeps this open's own key, so a retry finds it even
           // after that request was settled.
-          const appendKey = idKey === null ? null : (inboundKey ?? `request:${requestId}:open`);
-          if (subject !== null && appendKey !== null) {
-            const prior = yield* rooms.messageByKey(mission.id, appendKey);
-            const priorRequest = prior === null ? null : requestIdOfRoom(prior.message.roomId);
-            if (prior !== null && priorRequest !== null) {
-              const earlier = yield* need(priorRequest);
+          const appendKey = (target: OwnerRequestId) =>
+            idKey === null
+              ? null
+              : (inboundKeyOf(provenance, target) ?? `request:${requestId}:open`);
+          if (subject !== null && idKey !== null) {
+            const prior = yield* appendedBefore(
+              mission.id,
+              inboundId,
+              `request:${requestId}:open`,
+              subject,
+            );
+            if (prior !== null) {
+              const earlier = prior.request;
               const same = postContentHash(
                 messageInput(
-                  { missionId: mission.id, roomId: prior.message.roomId },
+                  { missionId: mission.id, roomId: earlier.roomId },
                   "request",
                   input.text,
                   to,
-                  appendKey,
+                  appendKey(earlier.id),
                 ),
               );
               if (prior.contentHash !== same || !sameRef(earlier.subject, subject)) {
                 return yield* fail(
                   "conflict",
-                  `Key ${input.key ?? appendKey} already said something else in ${priorRequest}.`,
+                  `Key ${input.key ?? appendKey(earlier.id)} already said something else in ${earlier.id}.`,
                 );
               }
               return { result: earlier, speaker: null, deliveries: [] };
@@ -722,7 +761,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             return yield* replyLocked(
               { requestId: ongoing.id, text: input.text },
               provenance,
-              appendKey,
+              appendKey(ongoing.id),
             );
           }
           const roomId = requestRoomId(mission.id, requestId);
@@ -827,7 +866,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         const owner = writer._tag === "owner";
         const key =
           messageKey ??
-          inboundKeyOf(provenance) ??
+          inboundKeyOf(provenance, request.id) ??
           (input.key === undefined ? null : `request:${request.id}:${input.key}`);
         const to = owner ? yield* masterAddress(cast) : [];
         const message = messageInput(request, owner ? "request" : "status", input.text, to, key);
@@ -946,7 +985,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           owner ? "decision" : "status",
           noteText,
           to,
-          inboundKeyOf(provenance),
+          inboundKeyOf(provenance, request.id),
         );
         if ((yield* priorPost(note.key ?? null, note)) === "repeat") return none;
         let written: OwnerRequest | null = null;
@@ -1036,7 +1075,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             owner ? "request" : "status",
             text,
             to,
-            inboundKeyOf(provenance),
+            inboundKeyOf(provenance, request.id),
           );
           yield* priorPost(message.key ?? null, message);
           let written: OwnerRequest | null = null;
