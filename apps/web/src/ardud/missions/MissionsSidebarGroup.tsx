@@ -13,6 +13,7 @@ import { cn } from "../../lib/utils";
 import { CountBadge, GlyphCount, HealthGlyph, needsYouLabel, UnreadDot } from "./cards/chips";
 import { useMissionList, useYourRequests } from "./missionsStore";
 import { unreadRequests } from "./sections/YourRequests";
+import "./missions.css";
 
 const SIDEBAR_STATE_KEY = "t3code:ardud-missions:sidebar";
 const SidebarState = Schema.Struct({ collapsed: Schema.Boolean });
