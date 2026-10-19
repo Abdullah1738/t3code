@@ -335,6 +335,20 @@ describe("feed and time", () => {
     expect(
       poolUsageView(
         {
+          _tag: "budget",
+          id: "crpko:pool:review-day",
+          label: "Crpko reviews per day",
+          spent: 0,
+          cap: 8,
+          currency: "review",
+          sampledAt,
+        },
+        NOW,
+      ),
+    ).toMatchObject({ value: "0 of 8 reviews", tone: "ok" });
+    expect(
+      poolUsageView(
+        {
           _tag: "lock",
           id: "dev",
           label: "Dev env",
