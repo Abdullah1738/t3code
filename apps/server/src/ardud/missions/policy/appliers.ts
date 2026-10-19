@@ -134,7 +134,7 @@ export const applySuggestion = (
           done.push("details");
         }
         if (after.capacity !== undefined) {
-          yield* policy.setPoolCapacity(provenance, { poolId, capacity: after.capacity });
+          yield* policy.setPoolCapacity(provenance, { poolId, capacity: after.capacity, reason });
           done.push(`capacity ${after.capacity}`);
         }
         if (done.length === 0)

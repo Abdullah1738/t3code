@@ -349,8 +349,11 @@ export const setPoolCapacity = (
       const pool = yield* requirePool(deps, input.poolId);
       const caller = yield* poolGovernor(deps, provenance, pool, "change pool capacity");
       const entries = yield* expireAndLoad(deps, pool, now);
-      const change = yield* attempt(() => setCapacity(pool, entries, input.capacity, now));
+      const reason = input.reason ?? null;
+      const changed = yield* attempt(() => setCapacity(pool, entries, input.capacity, now));
+      const change = { ...changed, pool: { ...changed.pool, capacityReason: reason } };
       const over = change.overBy > 0 ? `; ${change.overBy} ${pool.unit} over until holds end` : "";
+      const why = reason === null ? "" : ` (${reason})`;
       const seq = yield* writeWithEvents(
         deps,
         [
@@ -358,8 +361,14 @@ export const setPoolCapacity = (
             caller,
             change.pool,
             "pool.updated",
-            `${pool.name} capacity ${pool.capacity} -> ${change.pool.capacity} ${pool.unit}${over}`,
-            { poolId: pool.id, field: "capacity", from: pool.capacity, to: change.pool.capacity },
+            `${pool.name} capacity ${pool.capacity} -> ${change.pool.capacity} ${pool.unit}${why}${over}`,
+            {
+              poolId: pool.id,
+              field: "capacity",
+              from: pool.capacity,
+              to: change.pool.capacity,
+              reason,
+            },
           ),
           ...admittedEvents(change.pool, change.admitted),
         ],

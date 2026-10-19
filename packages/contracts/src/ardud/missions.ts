@@ -1183,6 +1183,10 @@ export const Pool = Schema.Struct({
   lockedFields: LockedFields,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- policy additions ---
+  /** Why capacity was last set; null when the last change gave no reason. */
+  capacityReason: Schema.optional(Schema.NullOr(Schema.String)),
+  // --- end policy additions ---
 });
 export type Pool = typeof Pool.Type;
 
@@ -2710,6 +2714,10 @@ export type CreatePoolInput = typeof CreatePoolInput.Type;
 export const SetPoolCapacityInput = Schema.Struct({
   poolId: PoolId,
   capacity: Schema.Number,
+  // --- policy additions ---
+  /** Kept on the pool and in the change event. */
+  reason: Schema.optional(TrimmedNonEmptyString),
+  // --- end policy additions ---
 });
 export type SetPoolCapacityInput = typeof SetPoolCapacityInput.Type;
 

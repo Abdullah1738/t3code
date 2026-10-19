@@ -656,6 +656,40 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
     }),
   );
 
+  it.effect("keeps the reason for a capacity change on the pool and its event", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      const created = yield* policy.createPool(MASTER, {
+        poolId: PoolId.make("review-slots"),
+        name: "Review slots",
+        unit: "slot",
+        capacity: 2,
+        scope: { _tag: "mission", missionId: CRPKO },
+        kind: "lease",
+        backend: "native",
+      });
+      const poolId = PoolId.make(created.ref.id);
+      yield* policy.setPoolCapacity(OWNER, {
+        poolId,
+        capacity: 4,
+        reason: "Two more reviewers this week",
+      });
+      const view = (yield* policy.pools({})).pools.find((p) => p.pool.id === poolId)!;
+      assert.strictEqual(view.pool.capacity, 4);
+      assert.strictEqual(view.pool.capacityReason, "Two more reviewers this week");
+      const changed = (yield* events(CRPKO)).findLast((event) => event.kind === "pool.updated")!;
+      assert.include(changed.summary, "Two more reviewers this week");
+      assert.strictEqual(
+        (changed.payload as { readonly reason?: string }).reason,
+        "Two more reviewers this week",
+      );
+      // A change without a reason clears the old one rather than leaving it on a new number.
+      yield* policy.setPoolCapacity(OWNER, { poolId, capacity: 3 });
+      const cleared = (yield* policy.pools({})).pools.find((p) => p.pool.id === poolId)!;
+      assert.strictEqual(cleared.pool.capacityReason, null);
+    }),
+  );
+
   it.effect("parks an idle lane when a watched pool runs tight and resumes it after", () =>
     Effect.gen(function* () {
       const { missions, policy } = yield* setup;
