@@ -616,7 +616,7 @@ const EnrolLayer = CoordShim.layer.pipe(
 const importProvenance = { _tag: "import", source: "coord.db" } as const;
 
 it.layer(EnrolLayer)("coord enrolment", (it) => {
-  it.effect("enrols every thread-bound coord actor once, so the shim accepts it", () =>
+  it.effect("enrols every coord actor once, so the shim accepts it", () =>
     Effect.gen(function* () {
       const store = yield* MissionStore.MissionStore;
       const shim = yield* CoordShim.CoordShim;
@@ -628,22 +628,28 @@ it.layer(EnrolLayer)("coord enrolment", (it) => {
       expect(p.enrolments.enrol.map((e) => e.actor)).toEqual([
         "cell-tc",
         "cell-tc2",
+        "crw",
         "master",
         "release",
       ]);
-      expect(p.enrolments.unbound).toEqual([{ actor: "crw", kind: "process" }]);
+      // crw is a process actor: no thread in coord.db, enrolled all the same.
+      expect(p.enrolments.enrol.find((e) => e.actor === "crw")).toEqual({
+        actor: "crw",
+        kind: "process",
+        threadId: null,
+      });
 
       yield* applyImport(p, sink);
       const refused = yield* Effect.flip(inbox("cell-tc"));
       expect(refused).toMatchObject({ _tag: "CoordRefusal", status: 403 });
 
-      expect((yield* diffEnrolments(p)).create).toBe(4);
+      expect(yield* Effect.flip(inbox("crw"))).toMatchObject({ status: 403 });
+      expect((yield* diffEnrolments(p)).create).toBe(5);
       const first = yield* applyEnrolments(p);
-      expect(first.enrolled).toEqual(["cell-tc", "cell-tc2", "master", "release"]);
+      expect(first.enrolled).toEqual(["cell-tc", "cell-tc2", "crw", "master", "release"]);
       const rows = yield* inbox("cell-tc");
       expect(rows.length).toBeGreaterThan(0);
-      // crw has no thread in coord.db, so the import does not enrol it.
-      expect(yield* Effect.flip(inbox("crw"))).toMatchObject({ status: 403 });
+      yield* inbox("crw");
 
       const events = (yield* store.eventsSince(p.missionId, 0)).filter(
         (e) => e.kind === "member.changed",
@@ -651,6 +657,7 @@ it.layer(EnrolLayer)("coord enrolment", (it) => {
       expect(events.map((e) => (e.payload as { principal: string }).principal)).toEqual([
         "coord:cell-tc",
         "coord:cell-tc2",
+        "coord:crw",
         "coord:master",
         "coord:release",
       ]);
@@ -660,7 +667,7 @@ it.layer(EnrolLayer)("coord enrolment", (it) => {
       const seq = yield* store.latestSeq(p.missionId);
       const again = yield* applyEnrolments(plan());
       expect(again.enrolled).toEqual([]);
-      expect(again.diff).toMatchObject({ create: 0, unchanged: 4, differs: 0 });
+      expect(again.diff).toMatchObject({ create: 0, unchanged: 5, differs: 0 });
       expect(yield* store.latestSeq(p.missionId)).toBe(seq);
     }),
   );
@@ -673,19 +680,17 @@ it.layer(EnrolLayer)("coord enrolment", (it) => {
       yield* applyImport(p, yield* routerImportSink);
       yield* applyEnrolments(p);
 
-      yield* router.setMember(
-        {
-          missionId: p.missionId,
-          principal: { _tag: "coord", actor: "cell-tc2" },
-          member: false,
-        },
-        agent(ThreadId.make("ardud-control:thread:m")),
-      );
+      for (const actor of ["cell-tc2", "crw"]) {
+        yield* router.setMember(
+          { missionId: p.missionId, principal: { _tag: "coord", actor }, member: false },
+          agent(ThreadId.make("ardud-control:thread:m")),
+        );
+      }
       const seq = yield* store.latestSeq(p.missionId);
       const again = yield* applyEnrolments(plan());
       expect(again.enrolled).toEqual([]);
-      expect(again.diff).toMatchObject({ create: 0, unchanged: 3, differs: 1 });
-      expect(again.diff.differIds).toEqual(["cell-tc2"]);
+      expect(again.diff).toMatchObject({ create: 0, unchanged: 3, differs: 2 });
+      expect(again.diff.differIds).toEqual(["cell-tc2", "crw"]);
       expect(yield* store.latestSeq(p.missionId)).toBe(seq);
 
       const set = (principal: MissionMemberPrincipal, member: boolean) =>
@@ -730,10 +735,12 @@ it.layer(EnrolLayer)("coord enrolment", (it) => {
       yield* member("release", false);
       yield* member("cell-tc2", false);
       yield* member("cell-tc2", true);
+      // The layer is shared: the previous test removed crw. The master takes it back.
+      yield* member("crw", true);
       expect(yield* store.latestSeq(p.missionId)).toBeGreaterThan(500);
 
       const diff = yield* diffEnrolments(p);
-      expect(diff).toMatchObject({ create: 0, unchanged: 3, differs: 1, createIds: [] });
+      expect(diff).toMatchObject({ create: 0, unchanged: 4, differs: 1, createIds: [] });
       expect(diff.differIds).toEqual(["release"]);
 
       const report = renderReport({
@@ -754,8 +761,11 @@ it.layer(EnrolLayer)("coord enrolment", (it) => {
         "same",
         "same",
         "removed",
-        "skip",
+        "same",
       ]);
+      expect(section.find((l) => l.split(/\s+/)[2] === "crw")).toContain(
+        "(process actor, no thread)",
+      );
     }),
   );
 });

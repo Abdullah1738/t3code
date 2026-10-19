@@ -1,7 +1,8 @@
-// Enrols the coord actors coord.db binds to threads as coord members of the
-// mission, so the coord shim keeps accepting them. It goes through
-// `MissionRouter.setMember`, the method the owner and master use, under
-// `import` provenance, after the mission record exists.
+// Enrols every coord.db actor (thread-bound lanes and roles, and process actors
+// such as crw) as a coord member of the mission, so the coord shim keeps
+// accepting them. It goes through `MissionRouter.setMember`, the method the
+// owner and master use, under `import` provenance, after the mission record
+// exists.
 //
 // Create-missing only: an actor already enrolled is left alone, and one the
 // owner or master removed since (the latest `member.changed` for it is a

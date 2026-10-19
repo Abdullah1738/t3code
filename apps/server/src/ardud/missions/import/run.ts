@@ -11,8 +11,8 @@
  * report. Nothing is written anywhere except the report file.
  *
  * `--apply` writes core records, review pools, the router's rooms, messages,
- * subscriptions and read positions, and the coord enrolment of every
- * thread-bound coord.db actor into `--target`, which must be a scratch copy
+ * subscriptions and read positions, and the coord enrolment of every coord.db
+ * actor (crw included) into `--target`, which must be a scratch copy
  * (never the live Robob database; the running server owns that one).
  *
  * `--review-pool` plans crw's review caps as mission pools (lease: native

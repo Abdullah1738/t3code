@@ -135,7 +135,7 @@ export const renderReport = (input: {
   out.push(`  subscriptions: ${tally(plan.router.subscriptions, (s) => s.mode)}`);
   out.push(`  read positions: ${plan.router.readPositions.length}`);
   out.push(
-    `  coord enrolments: ${plan.enrolments.enrol.length} thread-bound actors; not enrolled (no thread): ${plan.enrolments.unbound.length}`,
+    `  coord enrolments: ${plan.enrolments.enrol.length} actors, ${plan.enrolments.enrol.filter((e) => e.threadId === null).length} without a thread`,
   );
   out.push("");
   out.push("Diff against target");
@@ -178,14 +178,11 @@ export const renderReport = (input: {
           ? "removed"
           : "same";
   for (const e of plan.enrolments.enrol) {
-    out.push(`  ${pad(label(e.actor), 8)} ${pad(e.actor, 20)} ${e.threadId}`);
-  }
-  if (keptOut.size > 0) out.push("  removed: the owner or master dropped it since; left out");
-  for (const u of plan.enrolments.unbound) {
     out.push(
-      `  ${pad("skip", 8)} ${pad(u.actor, 20)} ${u.kind} actor, no thread in coord.db: owner or master enrols it before messaging=robob`,
+      `  ${pad(label(e.actor), 8)} ${pad(e.actor, 20)} ${e.threadId ?? `(${e.kind} actor, no thread)`}`,
     );
   }
+  if (keptOut.size > 0) out.push("  removed: the owner or master dropped it since; left out");
   out.push("");
   out.push("Approvals");
   for (const a of core.approvals) {
