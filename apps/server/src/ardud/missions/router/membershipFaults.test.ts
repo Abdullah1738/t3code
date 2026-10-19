@@ -10,10 +10,11 @@ import {
   masterThread,
   mission,
   missionId,
+  ownerApp,
   seed,
   strayThread,
 } from "../asks/AsksService.testkit.ts";
-import { authorityStore } from "../guard/authority.ts";
+import { authorityStore, optionalAuthorityStore } from "../guard/authority.ts";
 import { forkCreator } from "../guard/forks.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as MissionRouter from "./MissionRouter.ts";
@@ -72,6 +73,18 @@ const strangerTo = (targetThreadId: ThreadId) =>
     });
   });
 
+const ownerTo = (targetThreadId: ThreadId) =>
+  Effect.gen(function* () {
+    const router = yield* MissionRouter.MissionRouter;
+    return yield* router.guard({
+      path: "thread-send",
+      targetThreadId,
+      from: { _tag: "owner", provenance: ownerApp },
+      text: "carry on",
+      requestKey: `owner:${targetThreadId}:1`,
+    });
+  });
+
 describe("membership fails closed on unreadable records (router r4, Sol r3 P4/P5)", () => {
   it.effect(
     "an unreadable or undecodable creator refuses the send; a missing one stays outside",
@@ -91,6 +104,10 @@ describe("membership fails closed on unreadable records (router r4, Sol r3 P4/P5
         // The recorded principal no longer decodes: refuse, never "outsider".
         yield* sql`UPDATE ardud_mission_guard_authority SET principal_json = '{"_tag":"nobody"}' WHERE subject_id = ${child}`;
         assert.strictEqual(yield* failureCode(strangerTo(child)), "conflict");
+        // The best-effort reader other callers use still reads it as nothing.
+        assert.isNull(yield* authorityStore(sql).read("fork", child));
+        // The owner passes whatever the membership, so a bad record never locks him out.
+        assert.deepStrictEqual(yield* ownerTo(child), { _tag: "pass" });
         // Absence proven by a successful read still leaves the legacy child outside.
         assert.deepStrictEqual(yield* strangerTo(legacy), { _tag: "pass" });
       }).pipe(Effect.provide(layer)),
@@ -148,6 +165,15 @@ describe("membership fails closed on unreadable records (router r4, Sol r3 P4/P5
       });
       assert.strictEqual(yield* failureCode(toMaster), "conflict");
       assert.strictEqual(yield* failureCode(strangerTo(masterThread)), "conflict");
+      assert.deepStrictEqual(yield* ownerTo(masterThread), { _tag: "pass" });
     }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("without an app database a creator lookup fails instead of proving absence", () =>
+    Effect.gen(function* () {
+      const store = yield* optionalAuthorityStore;
+      assert.isNull(yield* store.read("fork", child));
+      assert.strictEqual(yield* failureCode(forkCreator(store, child)), "conflict");
+    }),
   );
 });

@@ -1316,7 +1316,19 @@ const make = Effect.gen(function* () {
   /** The guard's decision and the facts behind it. Reads only. */
   const decide = (request: SendCheckRequest) =>
     Effect.gen(function* () {
-      const target = yield* membershipIn(everywhere, request.targetThreadId);
+      // The owner passes whatever the membership, so a record that cannot be
+      // read refuses everyone else but never locks the owner out.
+      const target = yield* membershipIn(everywhere, request.targetThreadId).pipe(
+        request.from._tag === "owner"
+          ? Effect.catchTags({
+              MissionError: (error) =>
+                Effect.logWarning("missions guard: owner send past an unreadable membership", {
+                  targetThreadId: request.targetThreadId,
+                  detail: error.detail,
+                }).pipe(Effect.as(null)),
+            })
+          : (effect) => effect,
+      );
       if (target === null) {
         return { decision: { _tag: "not-member" } as GuardDecision, target: null };
       }

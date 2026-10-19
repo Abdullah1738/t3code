@@ -55,11 +55,18 @@ export const forkCreator = (
   threadId: ThreadId,
 ): Effect.Effect<GuardPrincipal | null, MissionError> =>
   store.lookup("fork", threadId).pipe(
+    Effect.tapError((error) =>
+      Effect.logWarning("missions guard: could not read a fork's creator", {
+        threadId,
+        reason: error.message,
+      }),
+    ),
+    // Callers see that the record is unreadable; the database error stays in the log.
     Effect.mapError(
-      (error) =>
+      () =>
         new MissionError({
           code: "conflict",
-          detail: `Cannot read who created thread ${threadId}: ${error.message}`,
+          detail: `Cannot read who created thread ${threadId}, so mission membership is unknown.`,
         }),
     ),
   );

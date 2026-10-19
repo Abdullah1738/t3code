@@ -145,7 +145,7 @@ export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
           }).pipe(Effect.as(null)),
         ),
       ),
-    lookup: (kind, subjectId) => lookup(kind, subjectId),
+    lookup,
     forget: (kind, subjectId) =>
       Effect.gen(function* () {
         yield* ensure;
@@ -182,11 +182,17 @@ export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
   };
 };
 
-/** Nothing recorded and nothing remembered: every read is `null`. */
+/**
+ * Nothing recorded and nothing remembered: every read is `null`. `lookup`
+ * fails, because without a database no read can prove a record is absent.
+ */
 const noAuthority: AuthorityStore = {
   record: () => Effect.void,
   read: () => Effect.succeed(null),
-  lookup: () => Effect.succeed(null),
+  lookup: (kind, subjectId) =>
+    Effect.fail(
+      new AuthorityUnreadable({ kind, subjectId, message: "There is no app database to read." }),
+    ),
   forget: () => Effect.void,
   bind: () => Effect.void,
 };
