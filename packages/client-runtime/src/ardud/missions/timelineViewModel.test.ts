@@ -141,7 +141,8 @@ describe("timeline view model", () => {
   });
 
   it("puts every event kind in a named group, secret requests with the asks", () => {
-    for (const kind of MissionEventKind.literals) {
+    // Fork events leave the contract with the fork sweep; old ones read as "other".
+    for (const kind of MissionEventKind.literals.filter((kind) => !kind.startsWith("fork."))) {
       expect(kindGroup(kind), kind).not.toBe("other");
     }
     expect(TIMELINE_KIND_GROUP_LABEL[kindGroup("secret-request.closed")]).toBe(
