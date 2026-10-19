@@ -698,9 +698,13 @@ export interface PoolUsageView {
 /** Accounts at or below this usable share read as tight. */
 export const POOL_TIGHT_SHARE = 0.34;
 
-function formatMoney(amount: number, currency: string): string {
-  const symbol = currency === "USD" ? "$" : `${currency} `;
-  return `${symbol}${Math.round(amount)}`;
+/** Currency codes read as a prefix ("$62", "EUR 40"); any other unit is counted ("0 of 8 reviews"). */
+function formatBudget(spent: number, cap: number, unit: string): string {
+  if (unit === "USD") return `$${Math.round(spent)} of $${Math.round(cap)}`;
+  if (/^[A-Z]{3}$/.test(unit)) return `${unit} ${Math.round(spent)} of ${unit} ${Math.round(cap)}`;
+  const counted = Math.round(cap);
+  const noun = counted === 1 || unit.endsWith("s") ? unit : `${unit}s`;
+  return `${Math.round(spent)} of ${counted} ${noun}`;
 }
 
 /** One compact entry per pool the mission draws on, for the header usage line. */
@@ -725,14 +729,13 @@ export function poolUsageView(
     case "budget": {
       const share = pool.cap === 0 ? 1 : pool.spent / pool.cap;
       const tone: PoolTone = share >= 1 ? "out" : share >= 1 - POOL_TIGHT_SHARE ? "tight" : "ok";
-      const spent = formatMoney(pool.spent, pool.currency);
-      const cap = formatMoney(pool.cap, pool.currency);
+      const value = formatBudget(pool.spent, pool.cap, pool.currency);
       return {
         id: pool.id,
         label: pool.label,
-        value: `${spent} of ${cap}`,
+        value,
         tone,
-        detail: `${pool.label}: ${spent} spent of ${cap} this month (read ${sampled})`,
+        detail: `${pool.label}: ${value} used (read ${sampled})`,
       };
     }
     case "lock": {
