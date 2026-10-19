@@ -39,6 +39,8 @@ import type * as Stream from "effect/Stream";
 import type { EnvironmentRpcSuccess, EnvironmentUnaryRpcTag } from "../../rpc/client.ts";
 import type { WsRpcProtocolClient } from "../../rpc/protocol.ts";
 import { latestFieldChanges } from "./changeLog.ts";
+import { portfolioFromMissions } from "./portfolioViewModel.ts";
+import { listedRoomUnread, pageUnread } from "./roomsViewModel.ts";
 import type {
   FieldChange,
   Listener,
@@ -584,11 +586,15 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   );
 
   const roomsFeed = sharedFeeds<MissionId, ReadonlyArray<MissionRoomEntry>>((missionId, emit) => {
-    // Unread counts come from each room's newest page; a room is only read
-    // again when it has a newer message or the owner read or posted in it.
+    // Unread counts come from the room list once the router sends them (r5);
+    // until then from each room's newest page plus the gap back to the read
+    // mark. A room is only read again when it has a newer message or the
+    // owner read or posted in it.
     const counted = new Map<RoomId, { readonly lastSeq: number; readonly unread: number }>();
     const stale = new Set<RoomId>();
     const unreadOf = async (room: Room): Promise<number> => {
+      const listed = listedRoomUnread(room);
+      if (listed !== null) return room.archived ? 0 : listed;
       const known = counted.get(room.id);
       if (known !== undefined && known.lastSeq === room.lastSeq && !stale.has(room.id))
         return known.unread;
@@ -601,9 +607,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         roomId: room.id,
         limit: ROOM_PAGE_SIZE,
       });
-      const unread = page.messages.filter(
-        (message) => message.seq > page.ownerReadSeq && message.author._tag !== "owner",
-      ).length;
+      const unread = pageUnread(page);
       counted.set(room.id, { lastSeq: room.lastSeq, unread });
       return unread;
     };
@@ -956,7 +960,60 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       fallback.subscribeRecovery(sampleId(missionId), listener),
     subscribeTimeline: (missionId, listener) =>
       fallback.subscribeTimeline(sampleId(missionId), listener),
-    subscribePortfolio: (listener) => fallback.subscribePortfolio(listener),
+    // Until core r6 serves the portfolio read, build it from the live missions:
+    // the list names them and each overview carries shares and usage. Order,
+    // pool draws and reorders need the read, so the feed stays marked sample.
+    subscribePortfolio(listener) {
+      const feeds = new Map<
+        MissionId,
+        { state: MissionFeedState | undefined; readonly close: Unsubscribe }
+      >();
+      const send = () => {
+        const states = [...feeds.values()].map((feed) => feed.state);
+        if (states.some((state) => state === undefined || state.overview === undefined)) return;
+        const missions = states.flatMap((state) =>
+          state?.overview
+            ? [{ mission: state.overview.mission, usageShare: state.overview.usageShare }]
+            : [],
+        );
+        const changes = changesFor(
+          states.flatMap((state) => state?.events ?? []),
+          ["mission"],
+        );
+        listener(portfolioFromMissions(missions, changes));
+      };
+      const stopList = transport.stream(WS_METHODS.missionsSubscribeList, {}, (item) => {
+        if (item._tag !== "list") return;
+        const ids = new Set(
+          item.snapshot.missions
+            .filter((mission) => mission.status !== "archived")
+            .map((mission) => mission.id),
+        );
+        for (const [id, feed] of feeds) {
+          if (ids.has(id)) continue;
+          feed.close();
+          feeds.delete(id);
+        }
+        for (const id of ids) {
+          if (feeds.has(id)) continue;
+          const feed: { state: MissionFeedState | undefined; close: Unsubscribe } = {
+            state: undefined,
+            close: () => {},
+          };
+          feeds.set(id, feed);
+          feed.close = missionFeed(id, (state) => {
+            feed.state = state;
+            send();
+          });
+        }
+        send();
+      });
+      return () => {
+        stopList();
+        for (const feed of feeds.values()) feed.close();
+        feeds.clear();
+      };
+    },
     subscribeSuggestionStats: (listener) => fallback.subscribeSuggestionStats(listener),
 
     subscribeInboxHistory(missionId, listener) {
@@ -1170,7 +1227,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       await transport.request(POLICY.setPoolCapacity, { poolId, capacity });
       bus.emit("pools");
     },
-    setPortfolioOrder: (input) => fallback.setPortfolioOrder(input),
+    // core r6 adds the owner's setPortfolioOrder; the live missions can't be reordered before it.
+    setPortfolioOrder: () => notOnServer("Reordering missions"),
 
     subscribeViews(missionId, listener) {
       let snapshot: MissionViewsSnapshot | null | undefined;

@@ -1,6 +1,7 @@
 import {
   MissionEventKind,
   type DirectionCheckItem,
+  type Mission,
   type MissionActor,
   type MissionEventId,
   type MissionId,
@@ -16,7 +17,11 @@ import {
   newestChange,
 } from "./changeLog.ts";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
-import { portfolioView, reorderPortfolioInput } from "./portfolioViewModel.ts";
+import {
+  portfolioFromMissions,
+  portfolioView,
+  reorderPortfolioInput,
+} from "./portfolioViewModel.ts";
 import type { MissionTimelineEvent, PortfolioSnapshot } from "./source.ts";
 import {
   actorChoices,
@@ -304,5 +309,31 @@ describe("portfolio view model", () => {
       code: "invalid",
     });
     portfolio.close();
+  });
+
+  it("orders live missions by tier then weight when the server has no portfolio", () => {
+    const base = {
+      status: "active",
+      masterRoleId: null,
+      guaranteedShare: 0.4,
+      borrowCeiling: 0.8,
+    } as const;
+    const mission = (id: string, tier: "P0" | "P1" | "P2", weight: number) =>
+      ({ ...base, id, title: id, tier, weight }) as unknown as Mission;
+    const snapshot = portfolioFromMissions([
+      { mission: mission("background", "P2", 9), usageShare: null },
+      { mission: mission("light", "P1", 1), usageShare: 0.5 },
+      { mission: mission("heavy", "P1", 5), usageShare: 1.5 },
+      { mission: mission("top", "P0", 1), usageShare: 0 },
+    ]);
+    expect(snapshot.order).toEqual(["top", "heavy", "light", "background"]);
+    expect(snapshot.orderChange).toBeNull();
+    const rows = portfolioView(snapshot).rows;
+    expect(rows.map((row) => row.usedLine)).toEqual([
+      "Using 0%: borrowing 0%",
+      "Using 60%: borrowing 20%",
+      "Using 20%: borrowing 0%",
+      "Not measured yet",
+    ]);
   });
 });

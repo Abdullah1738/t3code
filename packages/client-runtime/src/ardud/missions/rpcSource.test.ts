@@ -22,6 +22,7 @@ import type {
   MissionRoomEntry,
   MissionViewsState,
   OwnerRequest,
+  PortfolioSnapshot,
 } from "./source.ts";
 import { viewSectionRequest } from "./views/layout.ts";
 
@@ -325,6 +326,64 @@ describe("rpc missions source", () => {
     await settle();
     expect(asked(WS_METHODS.missionsRoomPage).length).toBe(pagesBefore + 1);
     expect(rooms.last()?.map((entry) => entry.unread)).toEqual([0]);
+  });
+
+  it("builds the portfolio from the live missions until the server serves it", async () => {
+    const overview = fixtureOverview();
+    const { transport, live } = fakeTransport();
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const portfolio = collect<PortfolioSnapshot>((listener) => source.subscribePortfolio(listener));
+
+    const [list] = live(WS_METHODS.missionsSubscribeList);
+    list?.push({
+      _tag: "list",
+      snapshot: {
+        revision: 1,
+        missions: [
+          { id: CRPKO, status: "active" },
+          { id: LIVE, status: "archived" },
+        ],
+      },
+    });
+    // Waits for every live mission's overview; archived missions are left out.
+    expect(live(WS_METHODS.missionsSubscribe).map((stream) => stream.input)).toEqual([
+      { missionId: CRPKO },
+    ]);
+    expect(portfolio.seen).toEqual([]);
+
+    live(WS_METHODS.missionsSubscribe)[0]?.push({
+      _tag: "overview",
+      seq: 1,
+      overview: { ...overview, usageShare: 0.5 },
+    });
+    const snapshot = portfolio.last();
+    expect(snapshot?.order).toEqual([CRPKO]);
+    expect(snapshot?.missions[0]).toMatchObject({
+      missionId: CRPKO,
+      title: overview.mission.title,
+      guaranteedShare: overview.mission.guaranteedShare,
+      usedShare: 0.5 * overview.mission.guaranteedShare,
+      pools: [],
+    });
+    await expect(source.setPortfolioOrder({ order: [CRPKO] })).rejects.toBeInstanceOf(MissionError);
+
+    portfolio.close();
+    expect(live(WS_METHODS.missionsSubscribeList)).toHaveLength(0);
+    expect(live(WS_METHODS.missionsSubscribe)).toHaveLength(0);
+  });
+
+  it("takes unread counts from the room list when the router sends them", async () => {
+    const room = { id: ROOM, missionId: CRPKO, lastSeq: 400, archived: false, unreadForOwner: 312 };
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsRooms]: () => [room],
+    });
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const rooms = collect<ReadonlyArray<MissionRoomEntry>>((listener) =>
+      source.subscribeRooms(CRPKO, listener),
+    );
+    await settle();
+    expect(rooms.last()?.map((entry) => entry.unread)).toEqual([312]);
+    expect(asked(WS_METHODS.missionsRoomPage)).toHaveLength(0);
   });
 
   it("reads owner requests live, marks them read at the newest seq and refetches after a reply", async () => {
