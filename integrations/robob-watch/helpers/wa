@@ -4,6 +4,8 @@
 # Usage:
 #   wa status                 "online pid N" if the sync daemon is up (exit 1 otherwise)
 #   wa find <name|number>     search contacts -> jid | name | push name (lists phone JID and LID)
+#   wa check <number...> [--local-only]   is it on WhatsApp? local store first; misses get ONE live check that
+#                             pauses the sync daemon for at most ~25s (--local-only never goes live; exit 3 = busy, retry)
 #   wa chats [N]              recent chats: name (unread) | jid
 #   wa read <jid> [--more N]  last 40 messages "(dd-mm-yy HH:MM:SS) Me|Name: text" (phone JID + LID merged);
 #                             --more N shows N*40 more and asks the phone for older history when the store runs out
@@ -30,6 +32,7 @@ SVC="gui/$(id -u)/com.ardud.wacli-sync"
 PLIST="$HOME/Library/LaunchAgents/com.ardud.wacli-sync.plist"
 # Marker read by wacli-guard: while a backfill holds the daemon down, the guard leaves it alone (until the deadline).
 BACKFILL_MARK="$HOME/.wacli/.backfill-until"
+LCTL=${WA_LAUNCHCTL:-launchctl}
 OWNER=971585134795
 re_id='^[0-9a-f]{10}$'
 die() { print -r -- "$1" >&2; exit 2; }
@@ -74,8 +77,14 @@ claim_draft() {
 settle() { mv "$CLAIMED" "${CLAIMED%.sending.json}.$1.json"; }
 # (Re)load the sync agent: bootstrap if launchd lost it (bootout), kickstart otherwise.
 sync_up() {
-  if launchctl print "$SVC" >/dev/null 2>&1; then launchctl kickstart -k "$SVC"
-  else launchctl bootstrap "gui/$(id -u)" "$PLIST" || launchctl kickstart -k "$SVC"; fi
+  if "$LCTL" print "$SVC" >/dev/null 2>&1; then "$LCTL" kickstart -k "$SVC"
+  else "$LCTL" bootstrap "gui/$(id -u)" "$PLIST" || "$LCTL" kickstart -k "$SVC"; fi
+}
+
+# One daemon pause at a time (wa check and wa read --more): held until this process exits.
+live_lock() {
+  local f="$HOME/.wacli/.wa-check.lock"
+  mkdir -p "${f:h}" && zmodload zsh/system && : >> "$f" && zsystem flock -t ${WA_LOCK_WAIT:-35} "$f"
 }
 
 sub=${1:-help}; shift 2>/dev/null
@@ -86,6 +95,87 @@ case $sub in
     for i in {1..10}; do sleep 2; "$H" health >/dev/null 2>&1 && break; done
     "$H" health ;;
   find) "$H" find "$*" ;;
+  check)
+    # 19 Oct 2026: `wacli contacts check` needs the store lock the sync daemon holds, so direct calls all failed.
+    # The local store answers without the lock; only numbers it doesn't know get one live call, daemon paused.
+    local_only=0; nums=()
+    for a in "$@"; do if [[ $a == --local-only ]]; then local_only=1; else nums+=("$a"); fi; done
+    (( ${#nums} )) || die "usage: wa check <number> [number...] [--local-only]"
+    loc=$("$H" check "${nums[@]}") || exit $?
+    lines=(${(f)loc})
+    unknown=(${${(M)lines:#+<->" | unknown locally"}%% | *})
+    if (( local_only || ! ${#unknown} )); then print -l -- $lines; exit 0; fi
+    # One daemon pause at a time: a parallel wa check waits for this one instead of fighting over the store lock.
+    if ! live_lock; then
+      print -l -- $lines
+      print -r -- "wa check: another live check or history backfill is running; try again in a minute" >&2; exit 3
+    fi
+    # A backfill started by an older wa (no lock) may still have the daemon down: don't race it.
+    if [[ -f $BACKFILL_MARK ]]; then
+      until_ts=$(<"$BACKFILL_MARK")
+      if [[ $until_ts == <-> ]] && (( $(date +%s) < until_ts )); then
+        print -l -- $lines
+        print -r -- "wa check: the sync daemon is paused for a history backfill (until $(date -r $until_ts +%H:%M:%S)); run the live check again after that" >&2; exit 3
+      fi
+    fi
+    # Same bounded pause as wa read --more: wacli-guard leaves the daemon down until the marker's deadline,
+    # the daemon is reloaded on any exit or signal, and the wacli call is capped (~25s in total).
+    print -r -- $(( $(date +%s) + 60 )) > "$BACKFILL_MARK"
+    # Runs once: zsh keeps the script-level EXIT trap even after `trap -` inside a function.
+    restored=0
+    restore() {
+      (( restored )) && return 0; restored=1
+      # bootstrap right after bootout can fail (error 5) while launchd is still tearing down: retry once, then kickstart.
+      "$LCTL" bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 \
+        || { sleep 1; "$LCTL" bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || "$LCTL" kickstart -k "$SVC" >/dev/null 2>&1; }
+      rm -f "$BACKFILL_MARK"
+    }
+    trap restore EXIT; trap 'restore; exit 130' INT TERM HUP
+    deadline=$(( SECONDS + 25 ))
+    "$LCTL" bootout "$SVC" >/dev/null 2>&1
+    left=$(( deadline - SECONDS )); (( left < 5 )) && left=5
+    out=$("$W" --json --timeout ${left}s --lock-wait 8s contacts check "${unknown[@]}" 2>&1); rc=$?
+    restore
+    daemon="the sync daemon was reloaded"
+    if ! "$LCTL" print "$SVC" >/dev/null 2>&1; then
+      daemon="the sync daemon did NOT reload, run: wa start"
+      print -r -- "warning: $daemon" >&2
+    fi
+    print -r -- "$out" | /usr/bin/python3 -c '
+import json, sys
+rc, daemon, lines = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
+res, errs, other = None, [], []
+for raw in sys.stdin.read().splitlines():
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        d = None
+    if isinstance(d, dict) and d.get("success") is True and isinstance(d.get("data"), list):
+        res = {str(r.get("phone", "")).lstrip("+"): r for r in d["data"] if isinstance(r, dict)}
+    elif isinstance(d, dict) and d.get("error"):
+        errs.append(str(d["error"]))
+    elif raw.strip():
+        other.append(raw.strip())
+ok = rc == 0 and res is not None
+for l in lines:
+    n, _, rest = l.partition(" | ")
+    if rest != "unknown locally":
+        print(l)
+        continue
+    r = (res or {}).get(n.lstrip("+")) if ok else None
+    if not ok:
+        print(f"{n} | unknown (live check failed)")
+    elif r and r.get("registered"):
+        jid = r.get("jid") or n.lstrip("+") + "@s.whatsapp.net"
+        print(f"{n} | on WhatsApp | {jid}")
+    elif r and r.get("responded"):
+        print(f"{n} | NOT on WhatsApp")
+    else:
+        print(f"{n} | no answer from WhatsApp (unknown, try again later)")
+if not ok:
+    why = "; ".join(errs) or " / ".join(other)[:300] or "no output"
+    print(f"wa check: live check failed (wacli exit {rc}): {why}; {daemon}", file=sys.stderr)
+    sys.exit(1)' $rc "$daemon" "${lines[@]}" ;;
   chats) "$H" chats ${1:-40} ;;
   read)
     jid=$(norm ${1:?usage: wa read <jid> [--more N]}); shift
@@ -98,10 +188,18 @@ case $sub in
         # 4 Oct 2026: a caller's 120s timeout killed this mid-backfill and the daemon stayed booted out for 3h.
         # So: bounded total time (~75s), and the daemon is reloaded on any exit or signal; wacli-guard
         # restores it anyway once the marker's deadline passes.
+        # Same lock as wa check, so a live contacts check and a backfill never pause the daemon at once.
+        # 25s lock wait keeps the worst case (25 + 1 + 75 + 3) inside a caller's 120s timeout. Busy = exit 3, like wa check.
+        WA_LOCK_WAIT=${WA_LOCK_WAIT:-25} live_lock || { print -u2 "wa read --more: a live wa check is running; try again in a minute"; exit 3; }
         print -r -- $(( $(date +%s) + 150 )) > "$BACKFILL_MARK"
-        restore() { trap - EXIT INT TERM HUP; launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; rm -f "$BACKFILL_MARK"; }
+        restore() {
+          trap - EXIT INT TERM HUP
+          "$LCTL" bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+            || { sleep 1; "$LCTL" bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || "$LCTL" kickstart -k "$SVC" 2>/dev/null; }
+          rm -f "$BACKFILL_MARK"
+        }
         trap restore EXIT; trap 'restore; exit 130' INT TERM HUP
-        launchctl bootout "$SVC" 2>/dev/null; sleep 1
+        "$LCTL" bootout "$SVC" 2>/dev/null; sleep 1
         (( more > 2 )) && more=2
         deadline=$(( SECONDS + 75 ))
         for c in $("$H" resolve "$jid"); do
@@ -204,5 +302,5 @@ print(x.get("path") or x.get("Path") or x.get("local_path") or x.get("LocalPath"
     [[ -n $p && -f $p ]] || { print -r -- "$out" >&2; exit 1; }
     print -r -- "$p" ;;
   screen|tui) exec "$TUI" "$@" ;;
-  *) sed -n '2,21p' "$0" ;;
+  *) sed -n '2,23p' "$0" ;;
 esac
