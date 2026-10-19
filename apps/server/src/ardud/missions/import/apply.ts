@@ -92,6 +92,20 @@ const canonical = (value: unknown): string =>
       : v,
   );
 
+/**
+ * Where a lane sits is the mission plan's business (`plan.ts` reports it), so a
+ * lane the plan or the master moved still counts as the record the import made.
+ */
+const comparable = (kind: MissionStoreKind, record: unknown): unknown => {
+  if (kind !== "lane") return record;
+  const {
+    subMissionId: _subMissionId,
+    updatedAt: _updatedAt,
+    ...rest
+  } = record as Record<string, unknown>;
+  return rest;
+};
+
 type CorePlanned = {
   readonly kind: MissionStoreKind;
   readonly records: ReadonlyArray<MissionStoreRecord>;
@@ -139,7 +153,10 @@ const diffCore = (planned: CorePlanned) =>
       const current = existing.get(id);
       if (current === undefined) {
         create.push(entry);
-      } else if (canonical(current) === canonical(entry.record)) {
+      } else if (
+        canonical(comparable(planned.kind, current)) ===
+        canonical(comparable(planned.kind, entry.record))
+      ) {
         unchanged++;
       } else if (
         entry._tag === "approval" &&

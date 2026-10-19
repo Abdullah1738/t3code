@@ -1,10 +1,14 @@
 import {
   ApprovalId,
+  LaneId,
+  MilestoneId,
   PoolId,
   RoleId,
+  SubMissionId,
   ThreadId,
   type Approval,
   type MissionMemberPrincipal,
+  type MissionProvenance,
 } from "@t3tools/contracts";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -15,6 +19,7 @@ import * as Option from "effect/Option";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import { agent, failureCode } from "../asks/AsksService.testkit.ts";
 import { routeApprover } from "../core/approvals.ts";
+import * as MissionService from "../MissionService.ts";
 import { PolicyService } from "../policy/PolicyService.ts";
 import { makePorts, testLayer } from "../policy/testing.ts";
 import { routerImportSink } from "../router/adapters.ts";
@@ -30,6 +35,7 @@ import {
   failingWrite,
   memoryRouterSink,
   readPositionId,
+  type KindDiff,
 } from "./apply.ts";
 import { coordActorFor, HAIKU_XHIGH, OPUS_XHIGH, parseCoordBodyText } from "./coordIds.ts";
 import { applyEnrolments, diffEnrolments } from "./enrol.ts";
@@ -39,7 +45,9 @@ import {
   crwApprovalId,
   reviewPoolId,
   workLinks,
+  type ImportPlan,
 } from "./mapping.ts";
+import { applyPlan, diffPlan, parsePlan, type MissionPlan } from "./plan.ts";
 import type { ImportSources } from "./readers.ts";
 import { countChecks, renderReport } from "./report.ts";
 import { parseDeferred, parseLanePulse, parseLaneRoster, parseStandingRules } from "./sources.ts";
@@ -766,6 +774,332 @@ it.layer(EnrolLayer)("coord enrolment", (it) => {
       expect(section.find((l) => l.split(/\s+/)[2] === "crw")).toContain(
         "(process actor, no thread)",
       );
+    }),
+  );
+});
+
+const MISSION_PLAN = `{
+  "mission": "crpko",
+  "subMissions": [
+    {
+      "key": "arch-wave",
+      "title": "Architecture wave delivery",
+      "intent": "Land the wave",
+      "milestones": [
+        { "key": "arch-wave-done", "title": "Wave delivered", "due": "2026-10-19T18:00:00+04:00" },
+        { "key": "arch-wave-review", "title": "Wave reviewed" }
+      ],
+      "lanes": ["cell-tc", "crpko:lane:cell-tc2"]
+    },
+    {
+      "key": "pr-factory",
+      "title": "PR factory",
+      "fillIdleCapacity": true,
+      "lanes": ["backfill:latency-budgets"]
+    }
+  ],
+  "unplaced": [{ "lane": "retired:old-qa-threads", "reason": "retired before the plan" }]
+}
+`;
+
+const missionPlanFor = (p: ImportPlan, text = MISSION_PLAN): MissionPlan => {
+  const result = parsePlan(text, "plan.json", p);
+  if (result._tag !== "ok") throw new Error(result.errors.join("\n"));
+  return result.plan;
+};
+
+const PlanLayer = MissionService.layer.pipe(Layer.provideMerge(TestLayer));
+const ownerApp: MissionProvenance = { _tag: "owner-app", surface: "web", sessionId: "s-1" };
+const planRows = (kinds: ReadonlyArray<KindDiff>) =>
+  kinds.map((k) => [k.kind, k.create, k.unchanged, k.differs]);
+/** Runs the import and the plan once, as a first apply would. */
+const importAndPlan = Effect.gen(function* () {
+  const p = plan();
+  const mp = missionPlanFor(p);
+  yield* applyImport(p, memoryRouterSink().sink);
+  yield* applyPlan(mp, p.missionId);
+  return { p, mp, missionId: p.missionId };
+});
+
+it.layer(PlanLayer)("mission plan", (it) => {
+  it.effect(
+    "creates sub-missions, milestones and placements once; a second apply writes nothing",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* MissionStore.MissionStore;
+        const router = memoryRouterSink();
+        const p = plan();
+        const mp = missionPlanFor(p);
+        yield* applyImport(p, router.sink);
+        const afterImport = yield* store.latestSeq(p.missionId);
+
+        const dry = yield* diffPlan(mp, p.missionId);
+        expect(planRows(dry.kinds)).toEqual([
+          ["sub-mission", 2, 0, 0],
+          ["milestone", 2, 0, 0],
+          ["lane-placement", 3, 0, 0],
+        ]);
+        assert.strictEqual(yield* store.latestSeq(p.missionId), afterImport);
+
+        const first = yield* applyPlan(mp, p.missionId);
+        expect(first.created).toEqual({ "sub-mission": 2, milestone: 2, "lane-placement": 3 });
+        assert.strictEqual(first.commits, 7);
+        const prov = { _tag: "import", source: "mission plan" };
+        expect(
+          (yield* store.eventsSince(p.missionId, afterImport)).map((e) => [
+            e.kind,
+            e.subject?.id,
+            e.provenance,
+          ]),
+        ).toEqual([
+          ["sub-mission.created", "crpko:sub:arch-wave", prov],
+          ["sub-mission.created", "crpko:sub:pr-factory", prov],
+          ["milestone.created", "crpko:milestone:arch-wave-done", prov],
+          ["milestone.created", "crpko:milestone:arch-wave-review", prov],
+          ["lane.moved", "crpko:lane:cell-tc", prov],
+          ["lane.moved", "crpko:lane:cell-tc2", prov],
+          ["lane.moved", "crpko:lane:backfill:latency-budgets", prov],
+        ]);
+        const subs = yield* store.list("sub-mission", { missionId: p.missionId });
+        expect(
+          subs
+            .toSorted((a, b) => a.order - b.order)
+            .map((s) => [s.id, s.order, s.fillIdleCapacity]),
+        ).toEqual([
+          ["crpko:sub:arch-wave", 0, false],
+          ["crpko:sub:pr-factory", 1, true],
+        ]);
+        const done = yield* store.get("milestone", "crpko:milestone:arch-wave-done");
+        assert.isTrue(Option.isSome(done) && done.value.targetAt === "2026-10-19T14:00:00.000Z");
+        const tc = yield* store.get("lane", "crpko:lane:cell-tc");
+        assert.isTrue(Option.isSome(tc) && tc.value.subMissionId === "crpko:sub:arch-wave");
+
+        // A placed lane still counts as the record the import made.
+        const core = yield* diffImport(p, router.sink);
+        assert.isTrue(core.kinds.every((k) => k.create === 0 && k.differs === 0));
+
+        const seq = yield* store.latestSeq(p.missionId);
+        const second = yield* applyPlan(missionPlanFor(plan()), p.missionId);
+        assert.strictEqual(second.commits, 0);
+        assert.strictEqual(yield* store.latestSeq(p.missionId), seq);
+        expect(planRows(second.state.kinds)).toEqual([
+          ["sub-mission", 0, 2, 0],
+          ["milestone", 0, 2, 0],
+          ["lane-placement", 0, 3, 0],
+        ]);
+      }),
+  );
+});
+
+it.layer(PlanLayer)("mission plan after owner edits", (it) => {
+  it.effect("leaves what the owner changed since, and says so", () =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const service = yield* MissionService.MissionService;
+      const { p, mp, missionId } = yield* importAndPlan;
+      // The owner renames a sub-mission, moves cell-tc2 to the PR factory and
+      // takes cell-tc out of its sub-mission.
+      yield* service.upsertSubMission(ownerApp, {
+        missionId,
+        subMissionId: SubMissionId.make("crpko:sub:pr-factory"),
+        title: "PR factory (fill idle)",
+      });
+      yield* service.upsertLane(ownerApp, {
+        missionId,
+        laneId: LaneId.make("crpko:lane:cell-tc2"),
+        subMissionId: SubMissionId.make("crpko:sub:pr-factory"),
+      });
+      yield* service.upsertLane(ownerApp, {
+        missionId,
+        laneId: LaneId.make("crpko:lane:cell-tc"),
+        subMissionId: null,
+      });
+      const seq = yield* store.latestSeq(missionId);
+
+      const again = yield* applyPlan(mp, missionId);
+      assert.strictEqual(again.commits, 0);
+      assert.strictEqual(yield* store.latestSeq(missionId), seq);
+      expect(again.state.kinds.map((k) => [k.kind, k.unchanged, k.differIds])).toEqual([
+        ["sub-mission", 1, ["crpko:sub:pr-factory"]],
+        ["milestone", 2, []],
+        ["lane-placement", 1, ["crpko:lane:cell-tc", "crpko:lane:cell-tc2"]],
+      ]);
+      const report = renderReport({
+        plan: p,
+        diff: { kinds: again.state.kinds, routerAvailable: true },
+        mode: "dry-run",
+        paths: {},
+        against: "test store",
+        missionPlan: mp,
+        planState: again.state,
+      });
+      expect(report).toContain("differs  PR factory");
+      expect(report).toContain(
+        "lane differs  cell-tc2 (trading-core) (now in crpko:sub:pr-factory; kept)",
+      );
+      expect(report).toContain(
+        "lane differs  cell-tc (trading-core) (now in no sub-mission; kept)",
+      );
+      expect(report).toContain("unplaced Old QA threads: retired before the plan");
+      expect(report).toContain("milestone same     Wave delivered (due 2026-10-19T14:00:00.000Z)");
+    }),
+  );
+});
+
+// A later plan version adds a milestone and places a lane that the first one left out.
+const LATER_PLAN = MISSION_PLAN.replace(
+  '{ "key": "arch-wave-review", "title": "Wave reviewed" }',
+  '{ "key": "arch-wave-review", "title": "Wave reviewed" },\n        { "key": "arch-wave-retro", "title": "Wave retro" }',
+)
+  .replace(
+    '"lanes": ["backfill:latency-budgets"]',
+    '"lanes": ["backfill:latency-budgets", "retired:old-qa-threads"]',
+  )
+  .replace(/,\n  "unplaced": \[[^\]]*\]/, "");
+
+it.layer(PlanLayer)("mission plan after closes, parks and merges", (it) => {
+  it.effect("adds nothing to a closed sub-mission and re-places no lane someone took out", () =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const service = yield* MissionService.MissionService;
+      const { p, missionId } = yield* importAndPlan;
+      const later = missionPlanFor(p, LATER_PLAN);
+      expect(planRows((yield* diffPlan(later, missionId)).kinds)).toEqual([
+        ["sub-mission", 0, 2, 0],
+        ["milestone", 1, 2, 0],
+        ["lane-placement", 1, 3, 0],
+      ]);
+      const seqBefore = yield* store.latestSeq(missionId);
+
+      // The owner parks cell-tc out of its sub-mission in one edit (a lane.parked
+      // event, not lane.moved), saves the due time without milliseconds, merges
+      // the PR factory into the wave and closes the wave.
+      yield* service.upsertLane(ownerApp, {
+        missionId,
+        laneId: LaneId.make("crpko:lane:cell-tc"),
+        status: "parked",
+        subMissionId: null,
+      });
+      yield* service.upsertMilestone(ownerApp, {
+        missionId,
+        milestoneId: MilestoneId.make("crpko:milestone:arch-wave-done"),
+        targetAt: "2026-10-19T14:00:00Z",
+      });
+      yield* service.mergeSubMissions(ownerApp, {
+        missionId,
+        subMissionId: SubMissionId.make("crpko:sub:pr-factory"),
+        intoSubMissionId: SubMissionId.make("crpko:sub:arch-wave"),
+      });
+      yield* service.upsertSubMission(ownerApp, {
+        missionId,
+        subMissionId: SubMissionId.make("crpko:sub:arch-wave"),
+        status: "closed",
+      });
+      const last = yield* store.eventsSince(missionId, seqBefore);
+      expect(last.map((e) => e.kind)).toEqual([
+        "lane.parked",
+        "milestone.updated",
+        "sub-mission.merged",
+        "sub-mission.closed",
+      ]);
+      const seq = yield* store.latestSeq(missionId);
+
+      const again = yield* applyPlan(later, missionId);
+      assert.strictEqual(again.commits, 0);
+      assert.strictEqual(yield* store.latestSeq(missionId), seq);
+      expect(again.state.kinds.map((k) => [k.kind, k.create, k.unchanged, k.differIds])).toEqual([
+        ["sub-mission", 0, 0, ["crpko:sub:arch-wave", "crpko:sub:pr-factory"]],
+        // The due time saved without milliseconds is still the same moment.
+        ["milestone", 0, 2, ["crpko:milestone:arch-wave-retro"]],
+        [
+          "lane-placement",
+          0,
+          1,
+          // cell-tc was parked out, latency-budgets went with the merge, and the
+          // newly planned lane would land in a closed sub-mission.
+          [
+            "crpko:lane:cell-tc",
+            "crpko:lane:backfill:latency-budgets",
+            "crpko:lane:retired:old-qa-threads",
+          ],
+        ],
+      ]);
+      const report = renderReport({
+        plan: p,
+        diff: { kinds: again.state.kinds, routerAvailable: true },
+        mode: "dry-run",
+        paths: {},
+        against: "test store",
+        missionPlan: later,
+        planState: again.state,
+      });
+      const shut = "(sub-mission closed or another mission's; not";
+      expect(report).toContain(`milestone differs  Wave retro (due none) ${shut} created)`);
+      expect(report).toContain(`lane differs  Old QA threads ${shut} placed)`);
+      expect(report).toContain(
+        "lane differs  cell-tc (trading-core) (now in no sub-mission; kept)",
+      );
+      expect(report).toContain("lane differs  Latency budgets (now in crpko:sub:arch-wave; kept)");
+      expect(report).toContain(
+        "milestone not written (sub-mission closed or another mission's): crpko:milestone:arch-wave-retro",
+      );
+      expect(report).not.toContain("milestone differs (kept as is)");
+      expect(report).toContain(
+        "lane-placement differs (kept as is): crpko:lane:cell-tc, crpko:lane:backfill:latency-budgets",
+      );
+      expect(report).toContain(
+        "lane-placement not written (sub-mission closed or another mission's): crpko:lane:retired:old-qa-threads",
+      );
+    }),
+  );
+});
+
+it.layer(PlanLayer)("mission plan after a park and a retire", (it) => {
+  it.effect("does not re-place a lane someone parked into a sub-mission and retired out", () =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const service = yield* MissionService.MissionService;
+      const { p, missionId } = yield* importAndPlan;
+      // The edits sit past the scan's first page of events.
+      for (let n = 0; n < 520; n++)
+        yield* store.appendEvent({
+          missionId,
+          kind: "import.applied",
+          actor: { _tag: "system", component: "coord-import" },
+          provenance: ownerApp,
+          summary: `filler ${n}`,
+          subject: null,
+        });
+      // The first plan left old-qa-threads unplaced. The owner parks it into the
+      // wave, then retires it out again: lane.parked and lane.retired, no lane.moved.
+      const qa = LaneId.make("crpko:lane:retired:old-qa-threads");
+      yield* service.upsertLane(ownerApp, {
+        missionId,
+        laneId: qa,
+        status: "parked",
+        subMissionId: SubMissionId.make("crpko:sub:arch-wave"),
+      });
+      yield* service.upsertLane(ownerApp, {
+        missionId,
+        laneId: qa,
+        status: "retired",
+        subMissionId: null,
+      });
+      const seq = yield* store.latestSeq(missionId);
+      expect((yield* store.eventsSince(missionId, seq - 2)).map((e) => e.kind)).toEqual([
+        "lane.parked",
+        "lane.retired",
+      ]);
+
+      // The later plan puts it in the PR factory, which is still open.
+      const again = yield* applyPlan(missionPlanFor(p, LATER_PLAN), missionId);
+      assert.strictEqual(again.state.placements.get(qa)?.state, "differs");
+      assert.isFalse(again.state.blocked.has(qa));
+      // Only the new milestone is written.
+      expect(again.created).toEqual({ "sub-mission": 0, milestone: 1, "lane-placement": 0 });
+      const lane = yield* store.get("lane", qa);
+      assert.isTrue(Option.isSome(lane) && lane.value.subMissionId === null);
+      assert.strictEqual(yield* store.latestSeq(missionId), seq + 1);
     }),
   );
 });

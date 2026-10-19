@@ -1,6 +1,7 @@
 import type { ApplyResult, ImportDiff } from "./apply.ts";
 import { ENROLMENT_KIND, ENROLMENT_SOURCE, type EnrolmentDiff } from "./enrol.ts";
 import type { ImportPlan } from "./mapping.ts";
+import { renderPlan, type MissionPlan, type PlanState } from "./plan.ts";
 
 /** Plain-text dry-run / apply report: source counts, count checks, diff, warnings. */
 
@@ -68,6 +69,9 @@ export const renderReport = (input: {
   readonly paths: Readonly<Record<string, string | null>>;
   readonly against: string;
   readonly applied?: ApplyResult;
+  /** The `--plan` file, with its diff against the target when one was taken. */
+  readonly missionPlan?: MissionPlan;
+  readonly planState?: PlanState | undefined;
 }): string => {
   const { plan, diff } = input;
   const out: Array<string> = [];
@@ -148,11 +152,21 @@ export const renderReport = (input: {
     );
   }
   if (!diff.routerAvailable) out.push("  (router parts not diffed: no router sink)");
-  const differs = diff.kinds.filter((k) => k.differIds.length > 0);
-  for (const k of differs)
-    out.push(
-      `  ${k.kind} differs (kept as is): ${k.differIds.slice(0, 10).join(", ")}${k.differIds.length > 10 ? ", ..." : ""}`,
-    );
+  const few = (ids: ReadonlyArray<string>) =>
+    `${ids.slice(0, 10).join(", ")}${ids.length > 10 ? ", ..." : ""}`;
+  // Plan items aimed at a closed sub-mission were never written, so they are not "kept".
+  const planKinds = new Set(input.planState?.kinds.map((k) => k.kind) ?? []);
+  const blocked = (kind: string, id: string) =>
+    planKinds.has(kind) && input.planState?.blocked.has(id) === true;
+  for (const k of diff.kinds) {
+    const kept = k.differIds.filter((id) => !blocked(k.kind, id));
+    const skipped = k.differIds.filter((id) => blocked(k.kind, id));
+    if (kept.length > 0) out.push(`  ${k.kind} differs (kept as is): ${few(kept)}`);
+    if (skipped.length > 0)
+      out.push(
+        `  ${k.kind} not written (sub-mission closed or another mission's): ${few(skipped)}`,
+      );
+  }
   if (input.applied !== undefined) {
     out.push("");
     out.push(
@@ -184,6 +198,11 @@ export const renderReport = (input: {
   }
   if (keptOut.size > 0) out.push("  removed: the owner or master dropped it since; left out");
   out.push("");
+  if (input.missionPlan !== undefined) {
+    const names = new Map(core.lanes.map((l) => [l.id as string, l.name]));
+    out.push(...renderPlan(input.missionPlan, input.planState, (id) => names.get(id) ?? id));
+    out.push("");
+  }
   out.push("Approvals");
   for (const a of core.approvals) {
     out.push(`  ${pad(a.status, 13)} ${a.title}${a.staleReason ? ` (${a.staleReason})` : ""}`);
