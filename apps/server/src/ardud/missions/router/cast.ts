@@ -1,13 +1,12 @@
 /**
  * Who is who in one mission, read from core records: roles and their bound
- * threads, lanes, open forks. Pure helpers over a loaded cast, so wake
+ * threads, lanes. Pure helpers over a loaded cast, so wake
  * resolution and membership stay testable without a store.
  */
 import type {
   Lane,
   Mission,
   MissionActor,
-  MissionFork,
   MissionId,
   Role,
   RoleBinding,
@@ -27,8 +26,6 @@ export interface RouterCast {
   /** Bound role bindings only. */
   readonly bindings: ReadonlyArray<RoleBinding>;
   readonly lanes: ReadonlyArray<Lane>;
-  /** Open forks only. */
-  readonly forks: ReadonlyArray<MissionFork>;
 }
 
 /**
@@ -42,8 +39,7 @@ export const readCast = (store: MissionStore.MissionStore["Service"], missionId:
     const roles = yield* store.listAllInMission("role", missionId);
     const bindings = yield* store.listAllInMission("role-binding", missionId, ["bound"]);
     const lanes = yield* store.listAllInMission("lane", missionId);
-    const forks = yield* store.listAllInMission("fork", missionId, ["open"]);
-    const cast: RouterCast = { missionId, mission, roles, bindings, lanes, forks };
+    const cast: RouterCast = { missionId, mission, roles, bindings, lanes };
     return cast;
   });
 
@@ -96,7 +92,7 @@ export const actorsOfThread = (
 
 /**
  * How a thread belongs to this mission from its records alone: bound to the
- * master role, or holding another role, a lane or an open fork. Explicit
+ * master role, or holding another role or a lane. Explicit
  * attachments and thread lineage are added by the router.
  */
 export const recordMembership = (cast: RouterCast, threadId: ThreadId): MemberKind | null => {
@@ -107,8 +103,7 @@ export const recordMembership = (cast: RouterCast, threadId: ThreadId): MemberKi
   const holdsLane = cast.lanes.some(
     (lane) => lane.threadId === threadId && lane.status !== "retired",
   );
-  const holdsFork = cast.forks.some((fork) => fork.forkThreadId === threadId);
-  return holdsRole || holdsLane || holdsFork ? "created" : null;
+  return holdsRole || holdsLane ? "created" : null;
 };
 
 export const labelOf = (cast: RouterCast, actor: MissionActor): string => {

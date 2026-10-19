@@ -358,7 +358,6 @@ import {
   AnswerAskInput,
   Ask,
   Call,
-  CloseForkInput,
   CreateMissionInput,
   DecideApprovalInput,
   DecideDraftInput,
@@ -369,7 +368,6 @@ import {
   MergeLanesInput,
   MergeSubMissionsInput,
   MissionError,
-  MissionFork,
   MissionInbox,
   MissionInboxInput,
   MissionMutationResult,
@@ -393,9 +391,7 @@ import {
   SetMissionStatusInput,
   SetSubMissionStatusInput,
   SplitLaneInput,
-  StartForkInput,
   Suggestion,
-  UpdateForkInput,
   UpdateMissionInput,
   UpsertLaneInput,
   UpsertRuleInput,
@@ -644,9 +640,6 @@ export const WS_METHODS = {
   missionsSaveDraftNote: "missions.saveDraftNote",
   missionsDecideSuggestion: "missions.decideSuggestion",
   missionsReopenSuggestion: "missions.reopenSuggestion",
-  missionsStartFork: "missions.startFork",
-  missionsCloseFork: "missions.closeFork",
-  missionsUpdateFork: "missions.updateFork",
   missionsAckNote: "missions.ackNote",
   missionsWorkItems: "missions.workItems",
   missionsTimeline: "missions.timeline",
@@ -2135,21 +2128,6 @@ const WsMissionsReopenSuggestionRpc = missionRpc(
   ReopenSuggestionInput,
   Suggestion,
 );
-const WsMissionsStartForkRpc = missionRpc(
-  WS_METHODS.missionsStartFork,
-  StartForkInput,
-  MissionFork,
-);
-const WsMissionsCloseForkRpc = missionRpc(
-  WS_METHODS.missionsCloseFork,
-  CloseForkInput,
-  MissionFork,
-);
-const WsMissionsUpdateForkRpc = missionRpc(
-  WS_METHODS.missionsUpdateFork,
-  UpdateForkInput,
-  MissionFork,
-);
 const WsMissionsAckNoteRpc = missionRpc(WS_METHODS.missionsAckNote, AckNoteInput, Note);
 const WsMissionsWorkItemsRpc = missionRpc(
   WS_METHODS.missionsWorkItems,
@@ -2299,9 +2277,6 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsSaveDraftNoteRpc,
   WsMissionsDecideSuggestionRpc,
   WsMissionsReopenSuggestionRpc,
-  WsMissionsStartForkRpc,
-  WsMissionsCloseForkRpc,
-  WsMissionsUpdateForkRpc,
   WsMissionsAckNoteRpc,
   WsMissionsWorkItemsRpc,
   WsMissionsTimelineRpc,

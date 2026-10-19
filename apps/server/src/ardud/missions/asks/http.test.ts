@@ -116,7 +116,7 @@ const body = async (response: Response) => (await response.json()) as Record<str
 describe("missions desk HTTP", () => {
   it.live("answers only with an iMessage the bridge or mission CLI redeems, once", () => {
     const inbox: Array<InboundMessage> = [];
-    const { deliveries, layer } = harness(inbox);
+    const { signals, layer } = harness(inbox);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
@@ -186,7 +186,8 @@ describe("missions desk HTTP", () => {
       expect(result.replay).toEqual(result.answered);
       expect(result.otherOption).toMatchObject({ ok: false, error: { code: "conflict" } });
       expect(result.missing.status).toBe(404);
-      expect(deliveries.filter((delivery) => delivery.threadId === masterThread).length).toBe(1);
+      // One answer, one signal to the router, however many times it is replayed.
+      expect(signals.filter((signal) => signal.ask.id === ask.id).length).toBe(1);
     }).pipe(Effect.provide(layer));
   });
 

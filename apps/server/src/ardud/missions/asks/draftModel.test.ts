@@ -7,6 +7,7 @@ import {
   ThreadId,
   type Draft,
   type DraftNote,
+  type MissionLink,
   type MissionProvenance,
   type Suggestion,
 } from "@t3tools/contracts";
@@ -22,12 +23,16 @@ import {
 } from "./draftLearning.ts";
 import {
   decideDraft,
+  draftDecisionNotice,
   draftExamples,
+  draftWriter,
   notesFor,
+  recordDraftSent,
   reopenDraft,
   reviseDraft,
   saveDraftNote,
   submitDraft,
+  withdrawDraft,
   type SubmitDraftCommand,
 } from "./draftModel.ts";
 import type { MissionCaller } from "./shared.ts";
@@ -83,7 +88,7 @@ const submit = (overrides: Partial<SubmitDraftCommand> = {}) =>
     channel: "cliq",
     target: { kind: "url", label: "Sami DM", url: "https://cliq.example/sami", ref: null },
     text: "Hi Sami, hope you're well! The fix is merged.",
-    source: { kind: "fork", ref: null },
+    source: { kind: "master", ref: null },
     writerRoleId: writerRole,
     caller: writer,
     notes,
@@ -259,6 +264,107 @@ describe("drafts", () => {
 
     const strangerReopen = reopenDraft(approved, writer.provenance, false, now);
     expect(Result.isFailure(strangerReopen) && strangerReopen.failure.code).toBe("forbidden");
+  });
+
+  it("the master withdraws an owner-routed draft with a note; reopening clears it", () => {
+    const master: MissionProvenance = {
+      _tag: "agent",
+      threadId: ThreadId.make("t-master"),
+      roleId: null,
+    };
+    const draft = pending();
+    expect(draft.approver).toBe("owner");
+    const byWriter = withdrawDraft({
+      draft,
+      provenance: writer.provenance,
+      callerIsMaster: false,
+      note: "Old news",
+      now,
+    });
+    expect(Result.isFailure(byWriter) && byWriter.failure.code).toBe("forbidden");
+
+    const withdrawn = Result.getOrThrow(
+      withdrawDraft({
+        draft,
+        provenance: master,
+        callerIsMaster: true,
+        note: "Sami already knows",
+        now,
+      }),
+    );
+    expect(withdrawn.record).toMatchObject({
+      status: "dropped",
+      withdrawNote: "Sami already knows",
+      decidedBy: master,
+    });
+    expect(withdrawn.events[0]).toMatchObject({
+      kind: "draft.decided",
+      summary: "Withdrawn: Sami already knows: draft for Sami (cliq)",
+      payload: { action: "withdraw", note: "Sami already knows", previousStatus: "pending" },
+    });
+    expect(draftDecisionNotice(withdrawn.record)?.body).toContain("Sami already knows");
+
+    const twice = withdrawDraft({
+      draft: withdrawn.record,
+      provenance: master,
+      callerIsMaster: true,
+      note: "again",
+      now,
+    });
+    expect(Result.isFailure(twice) && twice.failure.code).toBe("conflict");
+
+    const reopened = Result.getOrThrow(reopenDraft(withdrawn.record, master, true, now)).record;
+    expect(reopened.status).toBe("pending");
+    expect(reopened.withdrawNote).toBeNull();
+  });
+
+  it("the writer hears the approved text, posts it and records it sent once", () => {
+    const master: MissionCaller = {
+      provenance: { _tag: "agent", threadId: ThreadId.make("t-master"), roleId: null },
+      actors: [{ _tag: "thread", threadId: ThreadId.make("t-master") }],
+    };
+    const draft = pending();
+    expect(draftWriter(draft)).toEqual({ _tag: "role", roleId: writerRole });
+    expect(draftDecisionNotice(draft)).toBeNull();
+    const send = (on: Draft, caller: MissionCaller, isMaster: boolean, link: MissionLink | null) =>
+      recordDraftSent({ draft: on, caller, callerIsMaster: isMaster, link, now });
+
+    const early = send(draft, writer, false, null);
+    expect(Result.isFailure(early) && early.failure.code).toBe("conflict");
+
+    const approved = approveEdited(draft, "The fix is merged.", now).record;
+    const notice = draftDecisionNotice(approved);
+    expect(notice?.summary).toBe("Approved: draft for Sami (cliq)");
+    expect(notice?.body).toContain("mission_draft_sent");
+    expect(notice?.body.endsWith("\nThe fix is merged.")).toBe(true);
+
+    const byStranger = send(approved, stranger, false, null);
+    expect(Result.isFailure(byStranger) && byStranger.failure.code).toBe("forbidden");
+
+    const link: MissionLink = {
+      kind: "url",
+      label: "Cliq message",
+      url: "https://cliq.example/m/1",
+      ref: null,
+    };
+    const sent = Result.getOrThrow(send(approved, writer, false, link));
+    expect(sent.record).toMatchObject({ status: "sent", sentAt: now, sentLink: link });
+    expect(sent.events[0]).toMatchObject({
+      kind: "draft.sent",
+      summary: "Sent: draft for Sami (cliq) at Cliq message",
+    });
+
+    // The same report again changes nothing; a different post is refused.
+    const again = Result.getOrThrow(send(sent.record, master, true, link));
+    expect(again.events).toEqual([]);
+    const other = send(sent.record, writer, false, { ...link, url: "https://cliq.example/m/2" });
+    expect(Result.isFailure(other) && other.failure.code).toBe("conflict");
+
+    // A system's own draft is reported by that system.
+    const system = { ...approved, requestedBy: "crw" };
+    expect(draftWriter(system)).toBeNull();
+    const bySystem = send(system, master, true, link);
+    expect(Result.isFailure(bySystem) && bySystem.failure.code).toBe("forbidden");
   });
 
   it("examples prefer the same person and use the approved text", () => {

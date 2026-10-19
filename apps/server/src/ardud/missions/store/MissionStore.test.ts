@@ -1,5 +1,4 @@
 import {
-  ForkId,
   MissionId,
   RoleBindingId,
   RoleId,
@@ -211,6 +210,52 @@ it.layer(TestLayer)("MissionStore", (it) => {
     }),
   );
 
+  // --- asks additions ---
+  it.effect("reads an old database that still holds fork events and records", () =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const missionId = MissionId.make("m-old");
+      yield* store.upsert({ _tag: "mission", record: mission("m-old") }, event("m-old"));
+      const sql = yield* SqlClient.SqlClient;
+      const forkEvent = {
+        id: "ev-fork",
+        missionId: "m-old",
+        seq: 2,
+        kind: "fork.opened",
+        actor: { _tag: "owner" },
+        provenance: { _tag: "owner-app", surface: "web", sessionId: null },
+        summary: "Discuss: API lane",
+        subject: { kind: "fork", id: "fork-1" },
+        causedBy: null,
+        payload: {},
+        at,
+      };
+      yield* sql`
+        INSERT INTO ardud_mission_events (mission_id, seq, event_id, kind, at, event_json)
+        VALUES ('m-old', 2, 'ev-fork', 'fork.opened', ${at}, ${JSON.stringify(forkEvent)})
+      `;
+      yield* sql`UPDATE ardud_mission_counters SET value = 2 WHERE scope = 'mission:m-old'`;
+      yield* sql`
+        INSERT INTO ardud_mission_records (kind, id, mission_id, status, updated_at, seq, record_json)
+        VALUES ('fork', 'fork-1', 'm-old', 'open', ${at}, 2,
+          ${'{"_tag":"fork","record":{"id":"fork-1","forkThreadId":"t-fork"}}'})
+      `;
+      yield* store.upsert(
+        { _tag: "mission", record: mission("m-old", { title: "Renamed" }) },
+        event("m-old", "renamed"),
+      );
+
+      const kinds = (yield* store.eventsSince(missionId, 0)).map((item) => item.summary);
+      assert.deepStrictEqual(kinds, ["changed", "renamed"]);
+      const recent = (yield* store.recentEvents(missionId, 10)).map((item) => item.summary);
+      assert.deepStrictEqual(recent, ["renamed", "changed"]);
+      const listed = yield* store.list("mission", { ids: ["m-old"] });
+      assert.equal(listed[0]?.title, "Renamed");
+      assert.deepStrictEqual(yield* store.missionsOfThread(ThreadId.make("t-fork")), []);
+    }),
+  );
+  // --- end asks additions ---
+
   // --- router additions ---
   it.effect("finds every mission a thread is in, by index, past the list cap", () =>
     Effect.gen(function* () {
@@ -241,35 +286,10 @@ it.layer(TestLayer)("MissionStore", (it) => {
           ),
         ],
       });
-      yield* store.commit({
-        event: event("m-forked"),
-        upserts: [
-          { _tag: "mission", record: mission("m-forked") },
-          {
-            _tag: "fork",
-            record: {
-              id: ForkId.make("fork-1"),
-              missionId: MissionId.make("m-forked"),
-              kind: "discuss",
-              masterThreadId: ThreadId.make("t-master"),
-              forkThreadId: thread,
-              origin: null,
-              status: "archived",
-              summaryLine: null,
-              commitsMission: false,
-              createdAt: at,
-              closedAt: at,
-            },
-          },
-        ],
-      });
       yield* store.upsert({ _tag: "mission", record: mission("m-other") }, event("m-other"));
 
       // Any status counts: the router decides what a record grants.
-      assert.deepStrictEqual(yield* store.missionsOfThread(thread), [
-        MissionId.make("m-bound"),
-        MissionId.make("m-forked"),
-      ]);
+      assert.deepStrictEqual(yield* store.missionsOfThread(thread), [MissionId.make("m-bound")]);
       assert.deepStrictEqual(yield* store.missionsOfThread(ThreadId.make("t-crowd-1000")), [
         MissionId.make("m-bound"),
       ]);

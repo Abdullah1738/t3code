@@ -81,7 +81,7 @@ const mcpClient = McpSchema.McpServerClient.of({
 });
 
 const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
-  const { deliveries, layer } = harness(inbound);
+  const { layer } = harness(inbound);
   // What the tools hand the secret service: the card and who answers it.
   const answered: Array<Parameters<SecretRequests.SecretRequests["Service"]["answer"]>> = [];
   const secrets = Layer.mock(SecretRequests.SecretRequests)({
@@ -101,7 +101,6 @@ const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
       } as never),
   });
   return {
-    deliveries,
     answered,
     layer: McpHttpServer.toolkitRegistration(MissionsToolkit, MissionsHandlers.layer).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
@@ -161,7 +160,7 @@ describe("mission MCP tools", () => {
         expect(outcome === null || outcome.isError).toBe(true);
       }
 
-      // A thread with no role, lane or fork in the mission cannot ask.
+      // A thread with no role or lane in the mission cannot ask.
       const stray = yield* call("mission_ask", threadCaller(strayThread), askInput("Stray?"));
       expect(stray.isError).toBe(true);
       expect(stray.text).toContain("forbidden");
@@ -355,7 +354,7 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("M3: the master reopens drafts, suggestions and forks under its own name", () => {
+  it.effect("M3: the master reopens drafts and suggestions under its own name", () => {
     const { layer } = toolsLayer();
     return Effect.gen(function* () {
       yield* seed;
@@ -419,6 +418,58 @@ describe("mission MCP tools", () => {
       ).toEqual({ _tag: "role", roleId: "role-master" });
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect(
+    "the writer records an approved draft sent once; the master withdraws an owner draft",
+    () => {
+      const { layer } = toolsLayer();
+      return Effect.gen(function* () {
+        yield* seed;
+        const master = threadCaller(masterThread);
+        const writer = threadCaller(writerThread);
+        const draftOf = (text: string) =>
+          call("mission_draft", writer, {
+            missionId,
+            audience: "Sam",
+            channel: "linear",
+            target: { kind: "ticket", label: "CRP-9", url: null, ref: "CRP-9" },
+            text,
+          }).pipe(Effect.map((result) => (result.structured.draft as { id: string }).id));
+        const draftId = yield* draftOf("Fixed in the latest deploy.");
+        expect((yield* call("mission_draft_sent", writer, { draftId })).text).toContain(
+          "only an approved draft is sent",
+        );
+        const asks = yield* AsksService.AsksService;
+        yield* asks.decideDraft(
+          { draftId: draftId as never, action: "approve", revision: 0 },
+          ownerApp,
+        );
+        const sent = yield* call("mission_draft_sent", writer, {
+          draftId,
+          link: { kind: "ticket", label: "CRP-9 comment", url: null, ref: "CRP-9" },
+        });
+        expect(sent.structured.draft).toMatchObject({ status: "sent" });
+        const twice = yield* call("mission_draft_sent", writer, {
+          draftId,
+          link: { kind: "ticket", label: "CRP-9 again", url: null, ref: "CRP-9#2" },
+        });
+        expect(twice.text).toContain("already sent");
+
+        const waiting = yield* draftOf("Second note.");
+        expect(
+          (yield* call("mission_draft_withdraw", writer, { draftId: waiting, note: "x" })).isError,
+        ).toBe(true);
+        const withdrawn = yield* call("mission_draft_withdraw", master, {
+          draftId: waiting,
+          note: "Folded into the first comment",
+        });
+        expect(withdrawn.structured.draft).toMatchObject({
+          status: "dropped",
+          withdrawNote: "Folded into the first comment",
+        });
+      }).pipe(Effect.provide(layer));
+    },
+  );
 
   it.effect("lets only the master change the plan, keeping ask holds", () => {
     const { layer } = toolsLayer();

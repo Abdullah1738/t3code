@@ -70,21 +70,17 @@ const seeded = Layer.effectDiscard(
   }),
 );
 
-// The asks desk serves crw's drafts; nothing here forks threads or reads iMessage.
+// The asks desk serves crw's drafts; nothing here posts to rooms or reads iMessage.
 const asksPorts = Layer.mergeAll(
-  Layer.succeed(
-    AsksPorts.AsksThreads,
-    AsksPorts.AsksThreads.of({
-      fork: () => Effect.die("crw never forks a thread"),
-      deliver: () => Effect.void,
-    }),
-  ),
   Layer.succeed(
     Inbound.InboundLookup,
     Inbound.InboundLookup.of({ find: () => Effect.succeed(null) }),
   ),
   AsksPorts.signalsNoop,
-  AsksPorts.roomsPending,
+  Layer.succeed(
+    AsksPorts.AsksRooms,
+    AsksPorts.AsksRooms.of({ post: () => Effect.die("crw never posts to a room") }),
+  ),
   AsksPorts.applierRegistry,
   NodeServices.layer,
 );

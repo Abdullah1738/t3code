@@ -300,6 +300,16 @@ const handlers = {
       asks.reopenDraft(input, provenance).pipe(Effect.map((draft) => ({ draft }))),
     ),
   ),
+  mission_draft_sent: McpToolAccess.actsAsCaller((input) =>
+    withCaller((asks, provenance) =>
+      asks.recordDraftSent(input, provenance).pipe(Effect.map((draft) => ({ draft }))),
+    ),
+  ),
+  mission_draft_withdraw: McpToolAccess.actsAsCaller((input) =>
+    withCaller((asks, provenance) =>
+      asks.withdrawDraft(input, provenance).pipe(Effect.map((draft) => ({ draft }))),
+    ),
+  ),
   mission_suggestion_reopen: McpToolAccess.actsAsCaller((input) =>
     withCaller((asks, provenance) =>
       asks.reopenSuggestion(input, provenance).pipe(Effect.map((suggestion) => ({ suggestion }))),
