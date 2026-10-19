@@ -1690,6 +1690,13 @@ export const MissionEventKind = Schema.Literals([
    */
   "secret-request.closed",
   /**
+   * Payload `{ threadId, turnItemId, closedAs }`, caused by the
+   * `secret-request.closed` it undoes: the card stayed open (the owner answered
+   * first, or the close was refused). The close entry is written first so a
+   * close that lands is never missing from the timeline.
+   */
+  "secret-request.close-failed",
+  /**
    * Payload `{ previousDecision, previousReason }`: the master revised its call
    * on a condition the owner stated in Discuss.
    */

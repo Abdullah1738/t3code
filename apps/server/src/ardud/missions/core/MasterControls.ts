@@ -76,6 +76,26 @@ const make = Effect.gen(function* () {
   const secrets = yield* SecretRequests.SecretRequests;
   const threads = yield* ThreadManagementService.ThreadManagementService;
 
+  const readCard = (threadId: ThreadId, turnItemId: TurnItemId) =>
+    threads
+      .getThreadRecords(threadId, ["turnItems"], {
+        turnItemTypes: ["secret_request"],
+        messageRoles: [],
+      })
+      .pipe(
+        Effect.mapError(
+          () =>
+            new MissionError({
+              code: "invalid",
+              detail: `The card on thread ${threadId} could not be read.`,
+            }),
+        ),
+        Effect.map(({ turnItems }) => {
+          const card = turnItems.find((item) => item.id === turnItemId);
+          return card?.type === "secret_request" ? card : null;
+        }),
+      );
+
   const asAnyMaster: MasterControls["Service"]["asAnyMaster"] = (provenance) =>
     Effect.gen(function* () {
       const [missionId] = yield* missionsMasteredBy(store, provenance);
@@ -123,12 +143,59 @@ const make = Effect.gen(function* () {
           );
         }
       }
-      const answer = { type: input.closeAs } as const;
+      const before = yield* readCard(input.threadId, input.turnItemId);
+      if (before === null) {
+        return yield* new MissionError({
+          code: "not-found",
+          detail: `Thread ${input.threadId} has no secret request ${input.turnItemId}.`,
+        });
+      }
+      if (before.secretStatus !== "pending") {
+        return yield* new MissionError({
+          code: "conflict",
+          detail: `The secret request was already ${before.secretStatus}.`,
+        });
+      }
+      const status = input.closeAs === "decline" ? "declined" : "cancelled";
+      const payload = { threadId: input.threadId, turnItemId: input.turnItemId, closedAs: status };
+      const actor = actorOf(master.caller.provenance);
+      // The timeline entry goes first: the card lives in the thread's own
+      // store, so a close that lands is never missing from the timeline. A
+      // close that doesn't land is undone by a second entry.
+      const closed = yield* store.appendEvent({
+        missionId: input.missionId,
+        kind: "secret-request.closed",
+        actor,
+        provenance: master.caller.provenance,
+        summary:
+          input.closeAs === "decline"
+            ? `Declined a secret request from thread ${input.threadId}.`
+            : `Withdrew a secret request from thread ${input.threadId}.`,
+        subject: null,
+        payload,
+      });
+      const undo = (error: MissionError) =>
+        store
+          .appendEvent({
+            missionId: input.missionId,
+            kind: "secret-request.close-failed",
+            actor,
+            provenance: master.caller.provenance,
+            summary: `The secret request from thread ${input.threadId} stayed open: ${error.detail}`,
+            subject: null,
+            causedBy: closed.id,
+            payload,
+          })
+          .pipe(Effect.andThen(Effect.fail(error)));
       // The owner's decline runs through the same method; the grant only
       // lets this card be declined or withdrawn.
       yield* secrets
         .answer(
-          { threadId: input.threadId, turnItemId: input.turnItemId, answer },
+          {
+            threadId: input.threadId,
+            turnItemId: input.turnItemId,
+            answer: { type: input.closeAs },
+          },
           grantMasterSecretClose({
             threadId: input.threadId,
             turnItemId: input.turnItemId,
@@ -136,44 +203,18 @@ const make = Effect.gen(function* () {
             master: master.caller.provenance,
           }),
         )
-        .pipe(Effect.mapError(fromSecretError));
-      const status = input.closeAs === "decline" ? "declined" : "cancelled";
-      // A close that loses a race to the owner's answer records nothing, so
-      // the card is read back before the timeline says the master closed it.
-      const { turnItems } = yield* threads
-        .getThreadRecords(input.threadId, ["turnItems"], {
-          turnItemTypes: ["secret_request"],
-          messageRoles: [],
-        })
-        .pipe(
-          Effect.mapError(
-            () =>
-              new MissionError({
-                code: "invalid",
-                detail: `The card on thread ${input.threadId} could not be read back.`,
-              }),
-          ),
+        .pipe(Effect.mapError(fromSecretError), Effect.catch(undo));
+      // A close that loses a race to the owner's answer changes nothing.
+      const after = yield* readCard(input.threadId, input.turnItemId);
+      if (after?.secretStatus !== status) {
+        return yield* undo(
+          new MissionError({
+            code: "conflict",
+            detail: "The secret request was answered before your close was recorded.",
+          }),
         );
-      const card = turnItems.find((item) => item.id === input.turnItemId);
-      if (card?.type !== "secret_request" || card.secretStatus !== status) {
-        return yield* new MissionError({
-          code: "conflict",
-          detail: "The secret request was answered before your close was recorded.",
-        });
       }
-      const event = yield* store.appendEvent({
-        missionId: input.missionId,
-        kind: "secret-request.closed",
-        actor: actorOf(master.caller.provenance),
-        provenance: master.caller.provenance,
-        summary:
-          input.closeAs === "decline"
-            ? `Declined a secret request from thread ${input.threadId}.`
-            : `Withdrew a secret request from thread ${input.threadId}.`,
-        subject: null,
-        payload: { threadId: input.threadId, turnItemId: input.turnItemId, closedAs: status },
-      });
-      return { seq: event.seq, status };
+      return { seq: closed.seq, status };
     });
 
   return MasterControls.of({ asAnyMaster, closeSecretRequest });

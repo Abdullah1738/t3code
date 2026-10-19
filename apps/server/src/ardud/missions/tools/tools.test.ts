@@ -87,18 +87,16 @@ const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
   const secrets = Layer.mock(SecretRequests.SecretRequests)({
     answer: (...args) => Effect.sync(() => void answered.push(args)),
   });
-  // The card as the close left it, for the service's read-back.
+  // Each thread's secret card: pending until the close answers it.
   const cards = Layer.mock(ThreadManagementService.ThreadManagementService)({
-    getThreadRecords: (threadId) =>
-      Effect.succeed({
-        turnItems: answered
-          .filter(([input]) => input.threadId === threadId)
-          .map(([input]) => ({
-            id: input.turnItemId,
-            type: "secret_request",
-            secretStatus: input.answer.type === "decline" ? "declined" : "cancelled",
-          })),
-      } as never),
+    getThreadRecords: (threadId) => {
+      const answer = answered.find(([input]) => input.threadId === threadId)?.[0].answer;
+      const secretStatus =
+        answer === undefined ? "pending" : answer.type === "decline" ? "declined" : "cancelled";
+      return Effect.succeed({
+        turnItems: [{ id: "turn-item:secret-request:1", type: "secret_request", secretStatus }],
+      } as never);
+    },
   });
   return {
     deliveries,
