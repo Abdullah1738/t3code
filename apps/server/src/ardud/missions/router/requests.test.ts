@@ -2,6 +2,7 @@ import { OwnerRequestId, RoleId, ThreadId, type MissionProvenance } from "@t3too
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import {
@@ -11,8 +12,10 @@ import {
   laneThread,
   masterThread,
   missionId,
+  otherMissionId,
   ownerApp,
   seed,
+  seedOther,
   writerThread,
 } from "../asks/AsksService.testkit.ts";
 import { makeReads } from "../core/reads.ts";
@@ -427,6 +430,236 @@ describe("owner requests", () => {
         ),
         "not-found",
       );
+      // A key retried with other words is refused, not dropped.
+      assert.strictEqual(
+        yield* failureCode(
+          router.replyRequest(
+            { requestId: first.id, text: "Actually, skip the docs.", key: "b" },
+            ownerApp,
+          ),
+        ),
+        "conflict",
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("one iMessage writes once: one request, one mission", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const router = yield* MissionRouter.MissionRouter;
+      const opened = yield* router.openRequest({ missionId, text: "Status?" }, ownerIMessage);
+      const retried = yield* router.openRequest({ missionId, text: "Status?" }, ownerIMessage);
+      assert.strictEqual(retried.id, opened.id);
+      assert.strictEqual(wakesFor(h.sent, masterThread).length, 1);
+      const other = yield* router.openRequest({ missionId, text: "Docs?" }, ownerApp);
+      yield* router.settled(masterThread);
+
+      const refusals = [
+        // The same message cannot open a request in another mission...
+        router.openRequest({ missionId: otherMissionId, text: "Status?" }, ownerIMessage),
+        // ...or a second request here...
+        router.openRequest({ missionId, text: "Something else" }, ownerIMessage),
+        // ...or be posted as the owner's reply on another request.
+        router.replyRequest({ requestId: other.id, text: "Status?" }, ownerIMessage),
+        router.settleRequest({ requestId: other.id, note: "Status?" }, ownerIMessage),
+      ];
+      for (const refused of refusals) {
+        assert.strictEqual(yield* failureCode(refused), "conflict");
+      }
+      assert.strictEqual(wakesFor(h.sent, masterThread).length, 2);
+      assert.deepStrictEqual(
+        (yield* requestEvents).map((event) => event.kind),
+        ["request.opened", "request.opened"],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("every unread answer counts, however many read ones are newer", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const reads = makeReads(store, () => null);
+      const request = yield* router.openRequest({ missionId, text: "Status?" }, ownerApp);
+      const unread = yield* router.replyRequest({ requestId: request.id, text: "Fine." }, master);
+      assert.isTrue(unread.unreadForOwner);
+      // Answers the owner already read stay "answered" until settled, and pile up.
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "request.seen",
+          actor: { _tag: "owner" },
+          provenance: ownerApp,
+          summary: "older answers the owner read",
+          subject: null,
+        },
+        upserts: Array.from({ length: 205 }, (_, index) => ({
+          _tag: "owner-request" as const,
+          record: {
+            ...unread,
+            id: OwnerRequestId.make(`request-read-${index}`),
+            unreadForOwner: false,
+            updatedAt: "2999-01-01T00:00:00.000Z",
+          },
+        })),
+      });
+      assert.strictEqual((yield* reads.overview(missionId)).requestsAnswered, 1);
+      const listed = (yield* reads.listSnapshot).missions.find((each) => each.id === missionId);
+      assert.strictEqual(listed?.requestsAnswered, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a list carries summaries; one request asked for by id carries bodies", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const text = "How is the API lane doing?";
+      const request = yield* router.openRequest({ missionId, text }, ownerApp);
+      const listed = yield* router.ownerRequests({ missionId }, ownerApp);
+      assert.strictEqual(listed.requests[0]?.messages[0]?.body, null);
+      assert.strictEqual(listed.requests[0]?.messages[0]?.message.summary, text);
+      const one = yield* router.ownerRequests({ missionId, requestId: request.id }, ownerApp);
+      assert.strictEqual(one.requests[0]?.messages[0]?.body, text);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a reply links only records of the request's mission", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest({ missionId, text: "Pick it up?" }, ownerApp);
+      const answer = (
+        links: ReadonlyArray<{
+          kind: "work-item" | "lane" | "ask" | "mission" | "thread";
+          id: string;
+        }>,
+      ) => router.replyRequest({ requestId: request.id, text: "On it.", links }, master);
+      assert.strictEqual(
+        yield* failureCode(answer([{ kind: "lane", id: "lane-other" }])),
+        "invalid",
+      );
+      assert.strictEqual(
+        yield* failureCode(answer([{ kind: "mission", id: otherMissionId }])),
+        "invalid",
+      );
+      assert.strictEqual(
+        yield* failureCode(answer([{ kind: "ask", id: "ask-missing" }])),
+        "not-found",
+      );
+      const linked = yield* answer([
+        { kind: "work-item", id: "wi-held" },
+        { kind: "mission", id: missionId },
+        { kind: "thread", id: "t-somewhere" },
+      ]);
+      assert.deepStrictEqual(
+        linked.links.map((link) => link.id),
+        ["wi-held", missionId, "t-somewhere"],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the timeline never carries the owner's words", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const secret = "Quietly move the launch to Friday";
+      const request = yield* router.openRequest({ missionId, text: secret }, ownerApp);
+      yield* router.replyRequest({ requestId: request.id, text: "Moved." }, master);
+      yield* router.markRead({ roomId: request.roomId, seq: 1_000 }, ownerApp);
+      yield* router.settleRequest({ requestId: request.id }, ownerApp);
+      yield* router.reopenRequest({ requestId: request.id }, ownerApp);
+      const events = yield* requestEvents;
+      assert.deepStrictEqual(
+        events.map((event) => event.kind),
+        [
+          "request.opened",
+          "request.replied",
+          "request.seen",
+          "request.settled",
+          "request.reopened",
+        ],
+      );
+      for (const event of events) {
+        assert.notInclude(event.summary, "launch");
+        assert.notInclude(event.subject?.label ?? "", "launch");
+      }
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a request room stays closed to agents other than the master", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest({ missionId, text: "Status?" }, ownerApp);
+      const writer = agent(writerThread);
+      const page = yield* router.roomPage({ roomId: request.roomId }, master);
+      const messageId = page.messages[0]!.id;
+      const refusedForWriter = [
+        failureCode(router.messageBody({ messageId }, writer)),
+        failureCode(router.markRead({ roomId: request.roomId, seq: 1 }, writer)),
+        failureCode(router.roomTuning({ roomId: request.roomId }, writer)),
+        failureCode(
+          router.subscribe(
+            {
+              roomId: request.roomId,
+              subscriber: { _tag: "thread", threadId: writerThread },
+              mode: "wake",
+            },
+            writer,
+          ),
+        ),
+        failureCode(router.tuneRoom({ roomId: request.roomId, muted: true }, writer)),
+      ];
+      for (const refused of refusedForWriter) {
+        assert.strictEqual(yield* refused, "forbidden");
+      }
+      // Its wake rules are fixed: the owner's words wake the master, nothing else does.
+      assert.strictEqual(
+        yield* failureCode(router.tuneRoom({ roomId: request.roomId, muted: true }, ownerApp)),
+        "invalid",
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.subscribe(
+            {
+              roomId: request.roomId,
+              subscriber: { _tag: "thread", threadId: writerThread },
+              mode: "wake",
+            },
+            master,
+          ),
+        ),
+        "invalid",
+      );
+      assert.strictEqual((yield* router.messageBody({ messageId }, master)).body, "Status?");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a reminder about an owner request carries the conversation", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest(
+        { missionId, text: "Can we fold the release checks into one flow?" },
+        ownerApp,
+      );
+      yield* router.settled(masterThread);
+      yield* TestClock.adjust("31 minutes");
+      assert.strictEqual(yield* router.remind, 1);
+      const reminder = h.sent.find(
+        (each) => each.threadId === masterThread && each.key.startsWith("mission-remind:"),
+      );
+      assert.include(reminder?.text ?? "", `Owner request ${request.id}`);
+      assert.include(reminder?.text ?? "", "fold the release checks into one flow");
     }).pipe(Effect.provide(h.layer));
   });
 });

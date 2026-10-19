@@ -195,9 +195,8 @@ const makeRoutes = Effect.gen(function* () {
           {
             missionId: body.missionId,
             text: body.text,
+            // The verified inbound id keys the post: one iMessage writes once, anywhere.
             ...(body.subMissionId === undefined ? {} : { subMissionId: body.subMissionId }),
-            // The same iMessage opens the same request, however often it is retried.
-            key: `imessage:${body.inboundId}`,
           },
           owner,
         );
@@ -223,10 +222,7 @@ const makeRoutes = Effect.gen(function* () {
           request.createdAt,
           "A reply",
         );
-        const next = yield* router.replyRequest(
-          { requestId, text: body.text, key: `imessage:${body.inboundId}` },
-          owner,
-        );
+        const next = yield* router.replyRequest({ requestId, text: body.text }, owner);
         return json({ ok: true, request: next });
       }),
     ),

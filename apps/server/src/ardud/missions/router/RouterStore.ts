@@ -1,9 +1,9 @@
 import {
+  MissionId,
   MissionMessage,
   ReadPosition,
   Room,
   Subscription,
-  type MissionId,
   type MissionMessageId,
   type MissionMessageKind,
   type RoomId,
@@ -66,6 +66,9 @@ const DDL = [
     ON ardud_mission_router_messages (room_id, seq)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS ardud_mission_router_messages_by_key
     ON ardud_mission_router_messages (mission_id, msg_key) WHERE msg_key IS NOT NULL`,
+  // Owner-request keys carry the iMessage id, which must post once across missions.
+  `CREATE INDEX IF NOT EXISTS ardud_mission_router_messages_by_bare_key
+    ON ardud_mission_router_messages (msg_key) WHERE msg_key IS NOT NULL`,
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_bodies (
     message_id TEXT PRIMARY KEY,
     body TEXT NOT NULL
@@ -316,6 +319,8 @@ export class RouterStore extends Context.Service<
       missionId: MissionId,
       key: string,
     ) => Effect.Effect<StoredMessage | null>;
+    /** Missions holding a message with this key (an iMessage id posts once anywhere). */
+    readonly keyMissions: (key: string) => Effect.Effect<ReadonlyArray<MissionId>>;
     readonly messageById: (id: MissionMessageId) => Effect.Effect<MissionMessage | null>;
     readonly messageBody: (id: MissionMessageId) => Effect.Effect<string | null>;
     /** Newest `limit` messages of a room below `beforeSeq`, returned oldest first. */
@@ -759,6 +764,15 @@ const make = Effect.gen(function* () {
               : { message: decodeMessage(row.json), contentHash: row.contentHash };
           }),
         ),
+      ),
+
+    keyMissions: (key) =>
+      read(
+        sql<{ readonly missionId: string }>`
+          SELECT DISTINCT mission_id AS "missionId"
+          FROM ardud_mission_router_messages
+          WHERE msg_key = ${key}
+        `.pipe(Effect.map((rows) => rows.map((row) => MissionId.make(row.missionId)))),
       ),
 
     messageById: (id) =>

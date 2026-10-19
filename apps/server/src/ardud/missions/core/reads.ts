@@ -155,7 +155,7 @@ export const makeReads = (
     const milestones = groupByMission(yield* store.list("milestone", wide));
     // ardud missions: router (answers the owner has not opened yet)
     const answered = groupByMission(
-      (yield* store.list("owner-request", { ...wide, status: ["answered"] })).filter(
+      (yield* store.listAll("owner-request", ["answered"])).filter(
         (request) => request.unreadForOwner,
       ),
     );
@@ -231,7 +231,8 @@ export const makeReads = (
       const recovery = currentRecovery();
       const recoveryState = recovery === null ? null : yield* recovery.state(missionId);
       // ardud missions: router
-      const answered = yield* store.list("owner-request", { ...scope, status: ["answered"] });
+      // Uncapped: read answers stay "answered" until settled and must not push unread ones out.
+      const answered = yield* store.listAllInMission("owner-request", missionId, ["answered"]);
       return {
         mission: { ...mission.value, health: entry.mission },
         subMissions:

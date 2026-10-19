@@ -17,7 +17,9 @@ import * as NodeCrypto from "node:crypto";
 import {
   isOwnerProvenance,
   MissionError,
+  MissionMessageId,
   OwnerRequestId,
+  RoomId,
   type Mission,
   type MissionActor,
   type MissionEventKind,
@@ -35,7 +37,6 @@ import {
   type ReopenOwnerRequestInput,
   type ReplyOwnerRequestInput,
   type Room,
-  type RoomId,
   type SettleOwnerRequestInput,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -47,8 +48,9 @@ import * as Semaphore from "effect/Semaphore";
 import { silencePhraseIn } from "../asks/askModel.ts";
 import { clipSummary, dedupeRefs } from "../asks/shared.ts";
 import type * as MissionStore from "../store/MissionStore.ts";
-import type { MissionStoreRecord } from "../store/recordIndex.ts";
+import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
 import { labelOf, masterRoleOf, masterThreadsOf, type RouterCast } from "./cast.ts";
+import { postContentHash } from "./hash.ts";
 import {
   afterMasterSpoke,
   afterOwnerSpoke,
@@ -63,11 +65,11 @@ import {
 import type { RouterStore } from "./RouterStore.ts";
 
 /** Requests one list returns, newest activity first. */
-const LIST_MAX = 100;
-/** Messages each request carries in a list. */
-const VIEW_MESSAGES = 12;
-/** Messages a single request carries when asked for by id. */
-const VIEW_ONE = 200;
+const LIST_MAX = 50;
+/** Messages each request carries in a list, summaries only. */
+const VIEW_MESSAGES = 6;
+/** Messages a single request carries, with bodies, when asked for by id. */
+const VIEW_ONE = 100;
 /** Newest messages the master's transcript is built from (plus the first). */
 const CONTEXT_MESSAGES = 40;
 
@@ -117,11 +119,48 @@ type Caller =
 
 type Writer = Exclude<Caller, { readonly _tag: "reader" }>;
 
+const OWNER_CALLER: Caller = { _tag: "owner", actor: { _tag: "owner" } };
+const READER_CALLER: Caller = { _tag: "reader" };
+
+/**
+ * No title: the timeline reaches agents who are not the master (the digest,
+ * desk events), and the title is the owner's own words.
+ */
 const refOf = (request: OwnerRequest): MissionRecordRef => ({
   kind: "owner-request",
   id: request.id,
-  label: request.title,
 });
+
+/**
+ * One key per iMessage across every mission: the same inbound message can
+ * open or answer one request, once. Retries land on what it already wrote.
+ */
+const inboundKeyOf = (provenance: MissionProvenance) =>
+  provenance._tag === "owner-imessage" ? `owner-imessage:${provenance.inboundId}` : null;
+
+/** Mission-scoped store records a reply may link to; each must be in the request's mission. */
+const SCOPED_LINK_KINDS = [
+  "sub-mission",
+  "milestone",
+  "lane",
+  "role",
+  "ask",
+  "call",
+  "note",
+  "rule",
+  "rule-change-request",
+  "suggestion",
+  "draft",
+  "draft-note",
+  "knock",
+  "approval",
+  "work-item",
+  "fork",
+  "owner-request",
+] as const satisfies ReadonlyArray<MissionStoreKind>;
+type ScopedLinkKind = (typeof SCOPED_LINK_KINDS)[number];
+const isScopedLinkKind = (kind: string): kind is ScopedLinkKind =>
+  (SCOPED_LINK_KINDS as ReadonlyArray<string>).includes(kind);
 
 const upsertOf = (record: OwnerRequest): MissionStoreRecord => ({
   _tag: "owner-request",
@@ -150,14 +189,15 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
     // One request write at a time, so status moves read what the last one wrote.
     const requestLock = yield* Semaphore.make(1);
 
-    const callerOf = (cast: RouterCast, provenance: MissionProvenance) =>
+    const callerOf = (
+      cast: RouterCast,
+      provenance: MissionProvenance,
+    ): Effect.Effect<Caller, MissionError> =>
       Effect.gen(function* () {
         if (provenance._tag === "import") {
           return yield* fail("provenance-invalid", "Imports do not touch owner requests.");
         }
-        if (isOwnerProvenance(provenance)) {
-          return { _tag: "owner", actor: { _tag: "owner" } } satisfies Caller as Caller;
-        }
+        if (isOwnerProvenance(provenance)) return OWNER_CALLER;
         if (provenance._tag === "agent") {
           if (!masterThreadsOf(cast).includes(provenance.threadId)) {
             return yield* fail(
@@ -170,16 +210,15 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             master === null
               ? { _tag: "thread", threadId: provenance.threadId }
               : { _tag: "role", roleId: master.id };
-          return {
-            _tag: "master",
-            actor,
-            threadId: provenance.threadId,
-          } satisfies Caller as Caller;
+          return { _tag: "master", actor, threadId: provenance.threadId };
         }
-        return { _tag: "reader" } satisfies Caller as Caller;
+        return READER_CALLER;
       });
 
-    const writerOf = (cast: RouterCast, provenance: MissionProvenance) =>
+    const writerOf = (
+      cast: RouterCast,
+      provenance: MissionProvenance,
+    ): Effect.Effect<Writer, MissionError> =>
       Effect.gen(function* () {
         const caller = yield* callerOf(cast, provenance);
         if (caller._tag === "reader") {
@@ -188,8 +227,75 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             "Owner requests are written by the owner (a paired Robob session or a verified iMessage) or the mission's master.",
           );
         }
-        return caller as Writer;
+        return caller;
       });
+
+    /**
+     * A keyed post lands once: refuse the key when it already wrote in another
+     * mission, or under a different request or text in this one.
+     */
+    const priorPost = (
+      key: string | null,
+      input: PostMessageInput,
+    ): Effect.Effect<"fresh" | "repeat", MissionError> =>
+      Effect.gen(function* () {
+        if (key === null) return "fresh";
+        const elsewhere = (yield* rooms.keyMissions(key)).filter(
+          (missionId) => missionId !== input.missionId,
+        );
+        if (elsewhere.length > 0) {
+          return yield* fail("conflict", "That message from the owner was already used elsewhere.");
+        }
+        const prior = yield* rooms.messageByKey(input.missionId, key);
+        if (prior === null) return "fresh";
+        if (prior.message.roomId !== input.roomId || prior.contentHash !== postContentHash(input)) {
+          return yield* fail(
+            "conflict",
+            "That key already posted something else; a retry must repeat the same request and text.",
+          );
+        }
+        return "repeat";
+      });
+
+    /** Links a reply carries must name records of the request's mission. */
+    const checkLinks = (missionId: MissionId, links: ReadonlyArray<MissionRecordRef>) =>
+      Effect.forEach(
+        links,
+        (link) =>
+          Effect.gen(function* () {
+            const kind = link.kind;
+            if (kind === "mission") {
+              if (link.id !== missionId) {
+                return yield* fail("invalid", `Link ${link.id} is another mission.`);
+              }
+              return;
+            }
+            if (kind === "room") {
+              const room = yield* rooms.room(RoomId.make(link.id));
+              if (room === null) return yield* fail("not-found", `No room ${link.id}.`);
+              if (room.missionId !== missionId) {
+                return yield* fail("invalid", `Room ${link.id} belongs to another mission.`);
+              }
+              return;
+            }
+            if (kind === "message") {
+              const message = yield* rooms.messageById(MissionMessageId.make(link.id));
+              if (message === null) return yield* fail("not-found", `No message ${link.id}.`);
+              if (message.missionId !== missionId) {
+                return yield* fail("invalid", `Message ${link.id} belongs to another mission.`);
+              }
+              return;
+            }
+            if (!isScopedLinkKind(kind)) return;
+            const record = Option.getOrNull(yield* store.get(kind, link.id));
+            if (record === null) return yield* fail("not-found", `No ${kind} ${link.id}.`);
+            // Global rules and draft notes carry no mission and fit any.
+            if (record.missionId !== null && record.missionId !== missionId) {
+              return yield* fail("invalid", `${kind} ${link.id} belongs to another mission.`);
+            }
+          }),
+        { discard: true },
+      );
 
     const missionOf = (missionId: MissionId) =>
       Effect.gen(function* () {
@@ -261,12 +367,12 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         return done.result;
       });
 
-    const viewOf = (request: OwnerRequest, limit: number) =>
+    const viewOf = (request: OwnerRequest, limit: number, withBodies: boolean) =>
       Effect.gen(function* () {
         const page = yield* rooms.roomMessages(request.roomId, null, limit);
         const messages = yield* Effect.forEach(page.messages, (message) =>
           Effect.map(
-            message.hasBody ? rooms.messageBody(message.id) : Effect.succeed(null),
+            withBodies && message.hasBody ? rooms.messageBody(message.id) : Effect.succeed(null),
             (body) => ({ message, body }),
           ),
         );
@@ -291,8 +397,11 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         if (input.requestId !== undefined && records.length === 0) {
           return yield* fail("not-found", `No request ${input.requestId} in ${input.missionId}.`);
         }
-        const limit = input.requestId === undefined ? VIEW_MESSAGES : VIEW_ONE;
-        const requests = yield* Effect.forEach(records, (request) => viewOf(request, limit));
+        // A list carries summaries; one request asked for by id carries its bodies.
+        const one = input.requestId !== undefined;
+        const requests = yield* Effect.forEach(records, (request) =>
+          viewOf(request, one ? VIEW_ONE : VIEW_MESSAGES, one),
+        );
         return { missionId: input.missionId, requests } satisfies OwnerRequests;
       });
 
@@ -327,10 +436,12 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             }
           }
           const to = writer._tag === "owner" ? yield* masterAddress(cast) : [];
+          const inboundKey = inboundKeyOf(provenance);
+          const idKey = input.key ?? inboundKey;
           const requestId =
-            input.key === undefined
+            idKey === null
               ? OwnerRequestId.make(`request-${NodeCrypto.randomUUID()}`)
-              : keyedRequestId(mission.id, input.key);
+              : keyedRequestId(mission.id, idKey);
           const roomId = requestRoomId(mission.id, requestId);
           const title = requestTitleOf(input.text);
           const subMissionId = input.subMissionId ?? null;
@@ -338,15 +449,19 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             writer._tag === "master"
               ? `[Opened by the master for the owner, quoting what he said in ${input.quotedFrom}.]\n\n${input.text}`
               : input.text;
+          const message = messageInput(
+            { missionId: mission.id, roomId },
+            "request",
+            body,
+            to,
+            inboundKey ?? `request:${requestId}:open`,
+          );
+          if ((yield* priorPost(inboundKey, message)) === "repeat") {
+            return { result: yield* need(requestId), speaker: null, deliveries: [] };
+          }
           let written: OwnerRequest | null = null;
           const posted = yield* post({
-            input: messageInput(
-              { missionId: mission.id, roomId },
-              "request",
-              body,
-              to,
-              `request:${requestId}:open`,
-            ),
+            input: message,
             provenance,
             author: writer.actor,
             newRoom: {
@@ -384,7 +499,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               written = request;
               return {
                 kind: "request.opened",
-                summary: `Request opened by ${writer._tag === "owner" ? "the owner" : "the master for the owner"}: ${title}`,
+                summary: `Request opened by ${writer._tag === "owner" ? "the owner" : "the master for the owner"}`,
                 subject: refOf(request),
                 payload: { requestId },
                 upserts: [upsertOf(request)],
@@ -413,13 +528,15 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           ) {
             return yield* fail("invalid", "Only the master sets a request's status or links.");
           }
-          const key = input.key === undefined ? null : `request:${request.id}:${input.key}`;
-          if (key !== null) {
-            // A retried reply lands on the message it already wrote.
-            const prior = yield* rooms.messageByKey(request.missionId, key);
-            if (prior !== null && prior.message.roomId === request.roomId) {
-              return { result: request, speaker: null, deliveries: [] };
-            }
+          const owner = writer._tag === "owner";
+          const key =
+            inboundKeyOf(provenance) ??
+            (input.key === undefined ? null : `request:${request.id}:${input.key}`);
+          const to = owner ? yield* masterAddress(cast) : [];
+          const message = messageInput(request, owner ? "request" : "status", input.text, to, key);
+          // A retried reply lands on the message it already wrote.
+          if ((yield* priorPost(key, message)) === "repeat") {
+            return { result: request, speaker: null, deliveries: [] };
           }
           if (request.status === "settled") {
             return yield* fail(
@@ -427,14 +544,13 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               `Request "${request.title}" is settled; reopen it first.`,
             );
           }
-          if (writer._tag === "master") yield* refuseSilence(input.text);
-          const owner = writer._tag === "owner";
-          const to = owner ? yield* masterAddress(cast) : [];
+          if (!owner) yield* refuseSilence(input.text);
           const status = input.status ?? "answered";
           const links = dedupeRefs(input.links ?? []);
+          yield* checkLinks(request.missionId, links);
           let written: OwnerRequest | null = null;
           const posted = yield* post({
-            input: messageInput(request, owner ? "request" : "status", input.text, to, key),
+            input: message,
             provenance,
             author: writer.actor,
             asRequest: (_message, at) => {
@@ -445,8 +561,8 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               return {
                 kind: "request.replied",
                 summary: owner
-                  ? `Owner replied on request: ${request.title}`
-                  : `Master replied (${status}) on request: ${request.title}`,
+                  ? "Owner replied on a request"
+                  : `Master replied (${status}) on a request`,
                 subject: refOf(next),
                 payload: {
                   requestId: request.id,
@@ -483,7 +599,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           const label = master ? "the master" : "the owner";
           const event = (next: OwnerRequest): RequestCommit => ({
             kind: "request.settled",
-            summary: `Request settled by ${label}: ${request.title}`,
+            summary: `Request settled by ${label}`,
             subject: refOf(next),
             payload: { requestId: request.id },
             upserts: [upsertOf(next)],
@@ -508,9 +624,17 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             return { result: next, speaker: speakerOf(writer), deliveries: [] };
           }
           if (master) yield* refuseSilence(input.note);
+          const note = messageInput(
+            request,
+            master ? "status" : "decision",
+            input.note,
+            [],
+            inboundKeyOf(provenance),
+          );
+          yield* priorPost(note.key ?? null, note);
           let written: OwnerRequest | null = null;
           yield* post({
-            input: messageInput(request, master ? "status" : "decision", input.note, [], null),
+            input: note,
             provenance,
             author: writer.actor,
             asRequest: (_message, at) => {
@@ -540,7 +664,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           const owner = writer._tag === "owner";
           const event = (next: OwnerRequest): RequestCommit => ({
             kind: "request.reopened",
-            summary: `Request reopened by ${owner ? "the owner" : "the master"}: ${request.title}`,
+            summary: `Request reopened by ${owner ? "the owner" : "the master"}`,
             subject: refOf(next),
             payload: { requestId: request.id },
             upserts: [upsertOf(next)],
@@ -568,9 +692,17 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           // The owner reopening is the owner speaking: the master wakes with everything.
           const text = input.note ?? "Reopened by the owner.";
           const to = owner ? yield* masterAddress(cast) : [];
+          const message = messageInput(
+            request,
+            owner ? "request" : "status",
+            text,
+            to,
+            inboundKeyOf(provenance),
+          );
+          yield* priorPost(message.key ?? null, message);
           let written: OwnerRequest | null = null;
           const posted = yield* post({
-            input: messageInput(request, owner ? "request" : "status", text, to, null),
+            input: message,
             provenance,
             author: writer.actor,
             asRequest: (_message, at) => {
@@ -590,15 +722,21 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         }),
       );
 
-    /** The owner read a request room to its end: the master's answer is no longer news. */
-    const seen = (room: Room, seq: number, provenance: MissionProvenance) =>
+    /**
+     * The owner read a request room to its end: the master's answer is no
+     * longer news. The room is read again under the lock, so a reply that
+     * landed after the owner's read stays unread.
+     */
+    const seen = (roomId: RoomId, seq: number, provenance: MissionProvenance) =>
       requestLock.withPermit(
         Effect.gen(function* () {
-          if (!isOwnerProvenance(provenance) || room.kind !== "owner-request") return;
-          const requestId = requestIdOfRoom(room.id);
+          if (!isOwnerProvenance(provenance)) return;
+          const requestId = requestIdOfRoom(roomId);
           if (requestId === null) return;
+          const room = yield* rooms.room(roomId);
+          if (room === null || room.kind !== "owner-request" || seq < room.lastSeq) return;
           const request = Option.getOrNull(yield* store.get("owner-request", requestId));
-          if (request === null || !request.unreadForOwner || seq < room.lastSeq) return;
+          if (request === null || request.roomId !== roomId || !request.unreadForOwner) return;
           const next: OwnerRequest = { ...request, unreadForOwner: false };
           yield* store.commit({
             event: {
@@ -606,7 +744,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               kind: "request.seen",
               actor: { _tag: "owner" },
               provenance,
-              summary: clipSummary(`Owner read the master's answer: ${request.title}`),
+              summary: "Owner read the master's answer",
               subject: refOf(next),
               payload: { requestId },
             },

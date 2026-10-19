@@ -2303,13 +2303,14 @@ export type ReopenOwnerRequestInput = typeof ReopenOwnerRequestInput.Type;
 export const OwnerRequestsInput = Schema.Struct({
   missionId: MissionId,
   status: Schema.optional(OwnerRequestStatus),
-  /** One request with a longer stretch of its conversation. */
+  /** One request with a longer stretch of its conversation, bodies included. */
   requestId: Schema.optional(OwnerRequestId),
 });
 export type OwnerRequestsInput = typeof OwnerRequestsInput.Type;
 
 export const OwnerRequestMessage = Schema.Struct({
   message: MissionMessage,
+  /** Null in a list (read the summary); filled when one request is asked for by id. */
   body: Schema.NullOr(Schema.String),
 });
 export type OwnerRequestMessage = typeof OwnerRequestMessage.Type;

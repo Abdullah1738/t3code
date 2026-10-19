@@ -64,7 +64,7 @@ import {
   type RouterCast,
 } from "./cast.ts";
 import type { SendCheckRequest, SendGuardOutcome, SendGuardRequest } from "./guardHook.ts";
-import { contentHashOf, sha256 } from "./hash.ts";
+import { postContentHash, sha256 } from "./hash.ts";
 import {
   actorKey,
   decideSend,
@@ -670,16 +670,7 @@ const make = Effect.gen(function* () {
         if (room.archived) return yield* fail("conflict", `Room ${room.title} is archived.`);
         const isCorrection = input.isCorrection ?? false;
         const body = input.body ?? null;
-        const contentHash = contentHashOf({
-          roomId: input.roomId,
-          kind: input.kind,
-          summary: input.summary,
-          body,
-          to: input.to ?? [],
-          workItemId: input.workItemId ?? null,
-          links: input.links ?? [],
-          isCorrection,
-        });
+        const contentHash = postContentHash(input);
         const key = input.key ?? null;
         if (key !== null) {
           const prior = yield* rooms.messageByKey(input.missionId, key);
@@ -1022,7 +1013,7 @@ const make = Effect.gen(function* () {
         scope: { _tag: "room", roomId: room.id, upToSeq: seq },
       });
       // The owner reading a request to its end has seen the master's answer.
-      yield* requests.seen(room, seq, provenance);
+      yield* requests.seen(room.id, seq, provenance);
       return stored[0] ?? { roomId: room.id, reader: actorOf(provenance), seq, updatedAt };
     });
 
@@ -1632,19 +1623,24 @@ const make = Effect.gen(function* () {
       }
       const unread = yield* rooms.unreadDeliveries(threadId);
       const titles = new Set<string>();
+      const requestRooms: RoomId[] = [];
       for (const roomId of new Set(unread.map((delivery) => delivery.roomId))) {
-        titles.add((yield* rooms.room(roomId))?.title ?? roomId);
+        const room = yield* rooms.room(roomId);
+        titles.add(room?.title ?? roomId);
+        if (room?.kind === "owner-request") requestRooms.push(room.id);
       }
       const oldest = stale.reduce((a, b) => (b.seq < a.seq ? b : a));
       const newest = unread.reduce((a, b) => (b.seq > a.seq ? b : a), oldest);
       const wakeId = reminderRequestId(newest.missionId, threadId, newest.seq);
+      const line = reminderLine({
+        unread: unread.length,
+        rooms: [...titles],
+        oldest: yield* rooms.messageById(oldest.messageId),
+      });
       yield* threads.send({
         threadId,
-        text: reminderLine({
-          unread: unread.length,
-          rooms: [...titles],
-          oldest: yield* rooms.messageById(oldest.messageId),
-        }),
+        // A reminder about an owner request carries the conversation, like the wake.
+        text: yield* withRequestContexts(line, requestRooms),
         key: wakeId,
         asOwner: false,
       });
