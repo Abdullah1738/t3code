@@ -56,6 +56,7 @@ import * as MissionStore from "../store/MissionStore.ts";
 import {
   actorsOfThread,
   broadcastAudience,
+  heldBy,
   itemWatchers,
   labelOf,
   masterRoleOf,
@@ -975,6 +976,16 @@ const make = Effect.gen(function* () {
       );
       const readSeqOf = (actor: MissionActor) => readSeq.get(actorKey(actor)) ?? 0;
       const cast = yield* loadCast(room.missionId);
+      const receiptsTo = new Map(
+        page.messages.map((message) => [
+          message.id,
+          message.kind === "control" ? receiptRecipients(message, subscriptions) : [],
+        ]),
+      );
+      const { names, members } = yield* whoIsIn(cast, room.id, subscriptions, [
+        ...page.messages.flatMap((message) => [message.author, ...message.to]),
+        ...[...receiptsTo.values()].flat(),
+      ]);
       const messages = page.messages.map((message) =>
         message.kind !== "control"
           ? message
@@ -982,9 +993,9 @@ const make = Effect.gen(function* () {
               ...message,
               receipt: receiptFor(
                 message.seq,
-                receiptRecipients(message, subscriptions).map((actor) => ({
+                (receiptsTo.get(message.id) ?? []).map((actor) => ({
                   actor,
-                  label: labelOf(cast, actor),
+                  label: names[actorKey(actor)] ?? labelOf(cast, actor),
                 })),
                 readSeqOf,
               ),
@@ -1004,7 +1015,50 @@ const make = Effect.gen(function* () {
         subscriptions,
         ownerReadSeq: readSeqOf({ _tag: "owner" }),
         hasOlder: page.hasOlder,
+        names,
+        members,
       } satisfies RoomPage;
+    });
+
+  /**
+   * A room's members (subscribers, writers and addressees, a thread folded
+   * into the lane or role it holds) and a name for every actor on the page.
+   * A thread holding nothing goes by its title; nobody goes by a raw id.
+   */
+  const whoIsIn = (
+    cast: RouterCast,
+    roomId: RoomId,
+    subscriptions: ReadonlyArray<Subscription>,
+    onPage: ReadonlyArray<MissionActor>,
+  ) =>
+    Effect.gen(function* () {
+      const fold = (actor: MissionActor) =>
+        actor._tag === "thread" ? (heldBy(cast, actor.threadId) ?? actor) : actor;
+      const members = new Map<string, MissionActor>();
+      for (const actor of [
+        ...subscriptions.map((subscription) => subscription.subscriber),
+        ...(yield* rooms.roomActors(roomId)),
+      ]) {
+        if (actor._tag === "owner" || actor._tag === "system") continue;
+        members.set(actorKey(fold(actor)), fold(actor));
+      }
+      const names: Record<string, string> = {};
+      for (const actor of [
+        ...members.values(),
+        ...subscriptions.map((subscription) => subscription.subscriber),
+        ...onPage,
+      ]) {
+        const key = actorKey(actor);
+        if (actor._tag === "owner" || names[key] !== undefined) continue;
+        names[key] =
+          actor._tag === "thread" && heldBy(cast, actor.threadId) === null
+            ? yield* threads.facts(actor.threadId).pipe(
+                Effect.map((facts) => facts?.title ?? "a thread"),
+                Effect.orElseSucceed(() => "a thread"),
+              )
+            : labelOf(cast, actor);
+      }
+      return { names, members: [...members.values()] };
     });
 
   const messageBody = (input: MessageBodyInput, provenance: MissionProvenance) =>

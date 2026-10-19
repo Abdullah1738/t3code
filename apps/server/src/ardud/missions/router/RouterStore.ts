@@ -1,4 +1,5 @@
 import {
+  MissionActor,
   MissionId,
   MissionMessage,
   ReadPosition,
@@ -41,6 +42,8 @@ import { actorKey, type MemberKind } from "./model.ts";
  * - `reminders`: deliveries that got their one reminder. Still unread after it
  *   means the master's attention view, never another ring.
  * - `notices`: the route each system notice took, so its retry takes the same.
+ * - `room_actors`: everyone who wrote or was addressed in a room, so the room
+ *   lists its members even when nobody subscribed (a lane woken by name).
  *
  * The guard's authority table is made here too, at boot: `checkSend` reads it
  * (fork lineage) and a read must never be what creates it.
@@ -171,6 +174,19 @@ const DDL = [
     mission_id TEXT,
     at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_room_actors (
+    room_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    PRIMARY KEY (room_id, actor)
+  )`,
+  // Filled as messages land; this fills it once for rooms older than the table.
+  `INSERT OR IGNORE INTO ardud_mission_router_room_actors (room_id, actor)
+    SELECT room_id, json_extract(message_json, '$.author') FROM ardud_mission_router_messages
+    WHERE NOT EXISTS (SELECT 1 FROM ardud_mission_router_room_actors)
+    UNION
+    SELECT m.room_id, t.value
+    FROM ardud_mission_router_messages m, json_each(m.message_json, '$.to') t
+    WHERE NOT EXISTS (SELECT 1 FROM ardud_mission_router_room_actors)`,
 ];
 
 /** The feed-cursor row that marks a feed as having run once. */
@@ -184,6 +200,7 @@ const encodeSubscription = Schema.encodeSync(Schema.fromJsonString(Subscription)
 const decodeSubscription = Schema.decodeUnknownSync(Schema.fromJsonString(Subscription));
 const encodeReadPosition = Schema.encodeSync(Schema.fromJsonString(ReadPosition));
 const decodeReadPosition = Schema.decodeUnknownSync(Schema.fromJsonString(ReadPosition));
+const decodeActor = Schema.decodeUnknownSync(Schema.fromJsonString(MissionActor));
 
 export interface DeliveryRow {
   readonly threadId: ThreadId;
@@ -365,6 +382,8 @@ export class RouterStore extends Context.Service<
     ) => Effect.Effect<
       ReadonlyMap<string, { readonly total: number; readonly unreadForOwner: number }>
     >;
+    /** Everyone who wrote or was addressed in a room, the owner included. */
+    readonly roomActors: (roomId: RoomId) => Effect.Effect<ReadonlyArray<MissionActor>>;
     readonly roomKindsSince: (
       roomId: RoomId,
       sinceIso: string,
@@ -551,6 +570,18 @@ const make = Effect.gen(function* () {
       { discard: true },
     );
 
+  // The message's author and addressees, read back from its stored row so the
+  // boot fill above and this agree on the JSON.
+  const insertRoomActors = (message: MissionMessage) => sql`
+    INSERT OR IGNORE INTO ardud_mission_router_room_actors (room_id, actor)
+    SELECT room_id, json_extract(message_json, '$.author')
+    FROM ardud_mission_router_messages WHERE id = ${message.id}
+    UNION
+    SELECT m.room_id, t.value
+    FROM ardud_mission_router_messages m, json_each(m.message_json, '$.to') t
+    WHERE m.id = ${message.id}
+  `;
+
   const existingIn = (
     kind: RouterRowKind,
     ids: ReadonlyArray<string>,
@@ -632,7 +663,10 @@ const make = Effect.gen(function* () {
                 ON CONFLICT DO NOTHING
               `;
             }
-            if (inserted.length > 0) yield* insertRecipients(entry.message, entry.recipients);
+            if (inserted.length > 0) {
+              yield* insertRecipients(entry.message, entry.recipients);
+              yield* insertRoomActors(entry.message);
+            }
           }
           for (const { subscription, key } of batch.subscriptions) {
             yield* sql`
@@ -697,6 +731,7 @@ const make = Effect.gen(function* () {
             `;
           }
           yield* insertRecipients(message, recipients);
+          yield* insertRoomActors(message);
         }),
       ),
 
@@ -907,6 +942,14 @@ const make = Effect.gen(function* () {
               ),
             ),
           ),
+
+    roomActors: (roomId) =>
+      read(
+        sql<{ readonly json: string }>`
+          SELECT actor AS "json" FROM ardud_mission_router_room_actors
+          WHERE room_id = ${roomId} ORDER BY actor
+        `.pipe(Effect.map((rows) => rows.map((row) => decodeActor(row.json)))),
+      ),
 
     roomKindsSince: (roomId, sinceIso) =>
       read(

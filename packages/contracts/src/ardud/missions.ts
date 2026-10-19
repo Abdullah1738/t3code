@@ -2161,6 +2161,20 @@ export const RoomPage = Schema.Struct({
   ownerReadSeq: NonNegativeInt,
   /** Older messages exist before the first one returned. */
   hasOlder: Schema.Boolean,
+  // --- router additions ---
+  /**
+   * What to call every actor on this page (authors, addressees, subscribers,
+   * members), keyed `role:<id>`, `lane:<id>`, `thread:<id>`, `system:<name>` or
+   * `person:<name>`. Never a raw id; the owner is left to the client.
+   */
+  names: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  /**
+   * Who is in the room: its subscribers and everyone who wrote or was
+   * addressed in it, the owner and system components aside. A thread that
+   * holds a role or lane is listed as that role or lane.
+   */
+  members: Schema.optional(Schema.Array(MissionActor)),
+  // --- end router additions ---
 });
 export type RoomPage = typeof RoomPage.Type;
 

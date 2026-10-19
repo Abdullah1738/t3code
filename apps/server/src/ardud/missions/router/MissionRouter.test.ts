@@ -18,6 +18,7 @@ import {
   agent,
   binding,
   failureCode,
+  lane,
   laneThread,
   masterThread,
   mission,
@@ -1188,6 +1189,33 @@ describe("router round 5", () => {
       const after = (yield* router.rooms(missionId, ownerApp)).find((room) => room.id === control);
       assert.strictEqual(after?.messageCount, 62);
       assert.strictEqual(after?.unreadForOwner, 30);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a room page names everyone on it and lists who is in the room", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      // Nobody subscribed: the master wakes the lane by name, the lane answers.
+      yield* router.post(
+        request("API, rebase please", { to: [{ _tag: "lane", laneId: lane.id }] }),
+        agent(masterThread),
+      );
+      yield* router.post({ ...request("rebased"), kind: "status" }, agent(laneThread));
+      yield* router.post(request("thanks"), ownerApp);
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.deepStrictEqual(page.subscriptions, []);
+      assert.deepStrictEqual(page.members, [
+        { _tag: "lane", laneId: lane.id },
+        { _tag: "role", roleId: RoleId.make("role-master") },
+      ]);
+      assert.deepStrictEqual(page.names, {
+        [`lane:${lane.id}`]: "API",
+        "role:role-master": "role-master",
+        [`thread:${masterThread}`]: "role-master",
+        [`thread:${laneThread}`]: "API",
+      });
     }).pipe(Effect.provide(h.layer));
   });
 });
