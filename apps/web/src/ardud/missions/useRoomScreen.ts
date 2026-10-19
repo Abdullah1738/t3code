@@ -2,8 +2,8 @@ import { useEffect, useReducer } from "react";
 
 import type { MissionId, MissionMessage, RoomId } from "@t3tools/contracts";
 import {
+  formatDayLabel,
   INITIAL_ROOM_UI,
-  pendingRuleOffer,
   postMessageInput,
   roomMembers,
   roomUiReducer,
@@ -17,8 +17,9 @@ import { missionErrorMessage, missionsSource, useRoomPage } from "./missionsStor
 
 /**
  * One open room: live page, older pages, the pinned read marker, status-run
- * folding, the composer and the "save as a rule?" offer. Logic lives in the
- * client-runtime reducer and helpers; this hook wires them to the source.
+ * folding and the composer (a correction can be saved as a rule as it is
+ * sent). Logic lives in the client-runtime reducer and helpers; this hook
+ * wires them to the source.
  */
 export function useRoomScreen(
   missionId: MissionId,
@@ -36,7 +37,9 @@ export function useRoomScreen(
     if (page) dispatch({ type: "page", page });
   }, [page]);
 
-  const view = page && ui.roomId === page.room.id ? roomView(page, ui) : null;
+  // Day rows in the reader's own zone.
+  const view =
+    page && ui.roomId === page.room.id ? roomView(page, ui, (iso) => formatDayLabel(iso)) : null;
   const markRead = view?.markRead ?? null;
 
   // The room is open with its newest message on screen: move the owner's read
@@ -68,18 +71,6 @@ export function useRoomScreen(
     );
   };
 
-  const send = async () => {
-    if (!page) return false;
-    const sent = await submitMissionInput(
-      postMessageInput(page.room, ui.target, ui.text),
-      (input) => missionsSource.postRoomMessage(input),
-      "Couldn't post the message",
-    );
-    if (sent) dispatch({ type: "sent" });
-    return sent;
-  };
-
-  const ruleOffer = page ? pendingRuleOffer(page, ui.offeredRuleIds) : null;
   const saveRule = async (message: MissionMessage) => {
     const input = ruleFromCorrection(missionId, message);
     dispatch({ type: "rule-offered", messageId: message.id });
@@ -92,12 +83,28 @@ export function useRoomScreen(
       toastManager.add({ type: "success", title: "Saved as a rule", description: input.title });
     return saved;
   };
-  const skipRule = (message: MissionMessage) =>
-    dispatch({ type: "rule-offered", messageId: message.id });
 
-  const members = page ? roomMembers(page.subscriptions, masterRoleId) : [];
+  /** Posts the composer; a correction sent with `asRule` becomes a rule too. */
+  const send = async (asRule = false) => {
+    if (!page) return false;
+    const posted: { message: MissionMessage | null } = { message: null };
+    const sent = await submitMissionInput(
+      postMessageInput(page.room, ui.target, ui.text),
+      async (input) => {
+        posted.message = await missionsSource.postRoomMessage(input);
+      },
+      "Couldn't post the message",
+    );
+    if (sent) dispatch({ type: "sent" });
+    if (sent && asRule && posted.message !== null) await saveRule(posted.message);
+    return sent;
+  };
 
-  return { page, ui, view, dispatch, loadOlder, send, ruleOffer, saveRule, skipRule, members };
+  const members = page
+    ? roomMembers(page.subscriptions, masterRoleId, { names: page.names, members: page.members })
+    : [];
+
+  return { page, ui, view, dispatch, loadOlder, send, members };
 }
 
 export type RoomScreen = ReturnType<typeof useRoomScreen>;
