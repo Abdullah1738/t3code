@@ -17,6 +17,7 @@ import { masterFeedLayer } from "./router/masterFeed.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
 import * as MissionStore from "./store/MissionStore.ts";
+import { ViewsLive } from "./views/layer.ts";
 
 /**
  * Missions services. Other tracks add their layer here, one line each, and
@@ -44,6 +45,8 @@ export const ArdudMissionsLive = Layer.mergeAll(
   masterFeedLayer,
   // ardud missions: recovery (needs MissionService from the tracks below)
   RecoveryLive,
+  // ardud missions: views (templates, sections, layouts; needs MissionService)
+  ViewsLive,
 ).pipe(Layer.provideMerge(MissionTracksLive), Layer.provideMerge(MissionStore.layer));
 
 /**
