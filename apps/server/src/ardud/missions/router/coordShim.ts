@@ -404,7 +404,11 @@ const make = Effect.gen(function* () {
           ? yield* rooms.messageBySeq(missionId, Number(ref))
           : ((yield* rooms.messageByKey(missionId, ref))?.message ?? null);
         if (message === null) return yield* refuse("not_found", `no event ${ref}`, 404);
-        const rows = yield* rooms.recipientsOf(missionId, message.seq, keys);
+        // An owner request is never coord's to ack, even with an old ledger row.
+        const rows =
+          (yield* rooms.room(message.roomId))?.kind === "owner-request"
+            ? []
+            : yield* rooms.recipientsOf(missionId, message.seq, keys);
         if (rows.length === 0) {
           return yield* refuse("not_addressed", `event ${ref} was not addressed to ${input.as}`);
         }

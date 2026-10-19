@@ -280,7 +280,10 @@ export class RouterStore extends Context.Service<
       missionId: MissionId,
       seq: number,
     ) => Effect.Effect<MissionMessage | null>;
-    /** Coord inbox: messages with a ledger row for any of `keys`, oldest first. */
+    /**
+     * Coord inbox: messages with a ledger row for any of `keys`, oldest first.
+     * Never an owner request's: those words stay out of coord.
+     */
     readonly recipientInbox: (input: {
       readonly missionId: MissionId;
       readonly keys: ReadonlyArray<string>;
@@ -686,8 +689,10 @@ const make = Effect.gen(function* () {
               JOIN ardud_mission_router_messages m
                 ON m.mission_id = r.mission_id AND m.seq = r.seq
               LEFT JOIN ardud_mission_router_bodies b ON b.message_id = m.id
+              LEFT JOIN ardud_mission_router_rooms room ON room.id = r.room_id
               WHERE r.mission_id = ${missionId} AND r.seq > ${after}
                 AND ${sql.in("r.recipient", keys)}
+                AND (room.kind IS NULL OR room.kind <> 'owner-request')
               GROUP BY r.seq
               ${unackedOnly ? sql`HAVING SUM(CASE WHEN r.acked_at IS NULL THEN 1 ELSE 0 END) > 0` : sql``}
               ORDER BY r.seq

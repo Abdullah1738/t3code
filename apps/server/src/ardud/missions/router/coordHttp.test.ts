@@ -15,6 +15,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import type { HttpServerRequest } from "effect/http";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
@@ -573,6 +574,65 @@ describe("coord forward shim", () => {
       }).pipe(Effect.provide(h.layer));
     },
   );
+
+  it.live("an owner request's words never reach coord, and coord cannot ack them", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seedCrpko;
+      const router = yield* MissionRouter.MissionRouter;
+      const words = "Secret owner words about the release";
+      const request = yield* router.openRequest({ missionId: crpko, text: words }, ownerApp);
+      const [opening] = (yield* router.roomPage({ roomId: request.roomId }, ownerApp)).messages;
+      // A ledger row written before request rooms were kept out of coord.
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO ardud_mission_router_recipients ${sql.insert({
+          mission_id: crpko,
+          seq: opening!.seq,
+          room_id: request.roomId,
+          recipient: actorKey(asRole("master")),
+          status: "pending",
+          acked_at: null,
+        })}
+        ON CONFLICT DO NOTHING
+      `;
+      const result = yield* withShim(async (handle) => {
+        const posted = await call(
+          handle,
+          shimPost({ key: "after-request", kind: "request", to: ["master"], summary: "review?" }),
+        );
+        const inbox = await call(handle, {
+          method: "GET",
+          path: `${COORD_SHIM_PREFIX}/inbox`,
+          query: { mission: "crpko", as: "master", unacked: "0", after: "0", limit: "100" },
+        });
+        const ackOf = (refs: ReadonlyArray<string>) =>
+          call(handle, {
+            method: "POST",
+            path: `${COORD_SHIM_PREFIX}/ack`,
+            body: { mission: "crpko", as: "master", refs },
+          });
+        const ackRequest = await ackOf([String(opening!.seq)]);
+        const ackBoth = await ackOf([String(opening!.seq), String(posted.reply.seq)]);
+        const ackPost = await ackOf([String(posted.reply.seq)]);
+        return { posted, inbox, ackRequest, ackBoth, ackPost };
+      });
+      expect(result.inbox.reply.events.map((event: { seq: number }) => event.seq)).toEqual([
+        result.posted.reply.seq,
+      ]);
+      expect(JSON.stringify(result.inbox.reply)).not.toContain("Secret owner words");
+      for (const refused of [result.ackRequest, result.ackBoth]) {
+        expect(refused.status).toBe(400);
+        expect(refused.reply.error.code).toBe("not_addressed");
+      }
+      expect(result.ackPost.reply).toMatchObject({ ok: true });
+      // The master still has the owner's request to read; coord moved nothing past it.
+      const inbox = yield* router.inbox(T.master);
+      expect(inbox.entries.map((entry) => entry.message.roomId)).toEqual([request.roomId]);
+      const rooms = yield* RouterStore.RouterStore;
+      expect(yield* rooms.readPositions(request.roomId)).toEqual([]);
+    }).pipe(Effect.provide(h.layer));
+  });
 
   it.live("an event key another actor posted is a conflict, not a replay", () => {
     const h = harness();
