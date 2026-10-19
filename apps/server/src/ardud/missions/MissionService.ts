@@ -10,6 +10,10 @@ import {
   type MergeLanesInput,
   type MergeSubMissionsInput,
   type MissionEvent,
+  type MissionTimelineInput,
+  type MissionTimelinePage,
+  type MissionWorkItemsInput,
+  type MissionWorkItemsPage,
   type MissionId,
   type MissionInbox,
   type MissionListItem,
@@ -43,6 +47,7 @@ import * as Stream from "effect/Stream";
 import { makeEffort } from "./core/effort.ts";
 import type { MissionEditor, MissionRecoveryReader } from "./core/ports.ts";
 import { HEALTH_TTL_MS, makeReads } from "./core/reads.ts";
+import { makePages } from "./core/pages.ts";
 import { sameValue } from "./core/rules.ts";
 import { makeWrites } from "./core/writes.ts";
 import * as MissionStore from "./store/MissionStore.ts";
@@ -162,6 +167,14 @@ export class MissionService extends Context.Service<
       afterSeq: number,
       limit?: number,
     ) => Effect.Effect<ReadonlyArray<MissionEvent>, MissionError>;
+    /** A page of a mission's work items, newest change first, by lane and stage. */
+    readonly workItems: (
+      input: MissionWorkItemsInput,
+    ) => Effect.Effect<MissionWorkItemsPage, MissionError>;
+    /** A page of the mission's timeline, newest first, each event with its filter family. */
+    readonly timeline: (
+      input: MissionTimelineInput,
+    ) => Effect.Effect<MissionTimelinePage, MissionError>;
     /** A `list` snapshot, then a fresh `list` whenever a row may have changed. */
     readonly subscribeList: Stream.Stream<MissionStreamItem, MissionError>;
     /** An `overview` and the mission's live lanes, then record deltas in seq order, each batch followed by a fresh overview. */
@@ -374,6 +387,7 @@ const make = Effect.gen(function* () {
     inbox: reads.inbox,
     digest,
     eventsSince: store.eventsSince,
+    ...makePages(store),
     subscribeList,
     subscribe,
     subscribeInbox,

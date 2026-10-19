@@ -183,10 +183,11 @@ export class MissionStore extends Context.Service<
       afterSeq: number,
       limit?: number,
     ) => Effect.Effect<ReadonlyArray<MissionEvent>, MissionError>;
-    /** Newest events first, for feeds. */
+    /** Newest events first, for feeds; with `beforeSeq`, the page older than it. */
     readonly recentEvents: (
       missionId: MissionId,
       limit: number,
+      beforeSeq?: number,
     ) => Effect.Effect<ReadonlyArray<MissionEvent>, MissionError>;
     readonly latestSeq: (missionId: MissionId) => Effect.Effect<number>;
     readonly revision: Effect.Effect<number>;
@@ -502,12 +503,13 @@ const make = Effect.gen(function* () {
       return yield* Effect.forEach(rows, (row) => decodeStoredEvent(missionId, row.eventJson));
     });
 
-  const recentEvents = (missionId: MissionId, limit: number) =>
+  const recentEvents = (missionId: MissionId, limit: number, beforeSeq?: number) =>
     Effect.gen(function* () {
       const bounded = Math.min(Math.max(limit, 1), MAX_EVENTS_PAGE);
+      const older = beforeSeq === undefined ? sql`` : sql`AND seq < ${beforeSeq}`;
       const rows = yield* sql<EventRow>`
         SELECT event_json AS "eventJson" FROM ardud_mission_events
-        WHERE mission_id = ${missionId}
+        WHERE mission_id = ${missionId} ${older}
         ORDER BY seq DESC
         LIMIT ${bounded}
       `.pipe(NodeSqliteClient.readOnly, Effect.orDie);

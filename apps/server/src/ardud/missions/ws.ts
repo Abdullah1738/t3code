@@ -78,6 +78,8 @@ export const makeMissionWsHandlers = (
       missions.subscribe(input.missionId),
     [WS_METHODS.missionsInbox]: (input: MissionInboxInput) =>
       missions.subscribeInbox(input.missionId ?? null),
+    [WS_METHODS.missionsWorkItems]: missions.workItems,
+    [WS_METHODS.missionsTimeline]: missions.timeline,
     [WS_METHODS.missionsCreate]: asOwner(missions.createMission),
     [WS_METHODS.missionsUpdate]: asOwner(missions.updateMission),
     [WS_METHODS.missionsSetStatus]: asOwner(missions.setMissionStatus),

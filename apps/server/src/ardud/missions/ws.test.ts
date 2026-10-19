@@ -49,6 +49,8 @@ const WRITE_METHODS = Object.values(WS_METHODS).filter(
       "missions.subscribeList",
       "missions.subscribe",
       "missions.inbox",
+      "missions.workItems",
+      "missions.timeline",
       // ardud missions: router
       "missions.rooms",
       "missions.roomPage",
