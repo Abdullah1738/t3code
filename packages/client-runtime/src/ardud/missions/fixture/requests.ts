@@ -259,22 +259,52 @@ export function createRequests(ctx: RequestsContext): RequestsSource & {
       });
     },
 
-    settleRequest: ({ requestId }) =>
+    settleRequest: ({ requestId, note }) =>
       update(requestId, (request) => {
         if (request.status === "settled") return "It is already settled.";
         const at = nowIso();
-        return { ...request, status: "settled", settledAt: at, updatedAt: at, unread: false };
+        const text = note?.trim() ?? "";
+        const messages =
+          text === ""
+            ? request.messages
+            : [
+                ...request.messages,
+                { id: localId("request-message"), author: "owner" as const, text, at, refs: [] },
+              ];
+        return {
+          ...request,
+          status: "settled",
+          messages,
+          settledAt: at,
+          updatedAt: at,
+          unread: false,
+        };
       }),
 
-    reopenRequest: ({ requestId }) =>
+    reopenRequest: ({ requestId, note }) =>
       update(requestId, (request) => {
         if (request.status !== "settled") return "It is still open.";
+        const at = nowIso();
+        const text = note?.trim() ?? "";
+        // Reopening with words is the owner speaking again: it waits on the master.
+        if (text !== "") {
+          return {
+            ...request,
+            status: "waiting",
+            messages: [
+              ...request.messages,
+              { id: localId("request-message"), author: "owner", text, at, refs: [] },
+            ],
+            settledAt: null,
+            updatedAt: at,
+          };
+        }
         const last = request.messages.at(-1);
         return {
           ...request,
           status: last?.author === "master" ? "answered" : "waiting",
           settledAt: null,
-          updatedAt: nowIso(),
+          updatedAt: at,
         };
       }),
 

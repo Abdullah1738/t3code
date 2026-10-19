@@ -442,6 +442,8 @@ describe("rpc missions source", () => {
         return record();
       },
       [WS_METHODS.missionsOpenOwnerRequest]: () => record(),
+      [WS_METHODS.missionsSettleOwnerRequest]: () => record(),
+      [WS_METHODS.missionsReopenOwnerRequest]: () => record(),
     });
     const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
     const requests = collect<ReadonlyArray<OwnerRequest>>((listener) =>
@@ -483,6 +485,20 @@ describe("rpc missions source", () => {
       text: "Why?",
       subject: { kind: "ask", id: "ask-1" },
     });
+
+    // The settle note is the owner's closing words; a blank one stays off the wire.
+    await source.settleRequest({ requestId: "request-1", note: "  Ship it Friday  " });
+    await source.settleRequest({ requestId: "request-1", note: "   " });
+    await source.reopenRequest({ requestId: "request-1", note: "One more thing" });
+    await source.reopenRequest({ requestId: "request-1" });
+    expect(asked(WS_METHODS.missionsSettleOwnerRequest).map((call) => call.input)).toEqual([
+      { requestId: "request-1", note: "Ship it Friday" },
+      { requestId: "request-1" },
+    ]);
+    expect(asked(WS_METHODS.missionsReopenOwnerRequest).map((call) => call.input)).toEqual([
+      { requestId: "request-1", note: "One more thing" },
+      { requestId: "request-1" },
+    ]);
   });
 
   it("maps owner actions onto the server's RPCs", async () => {

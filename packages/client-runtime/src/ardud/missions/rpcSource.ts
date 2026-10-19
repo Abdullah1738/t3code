@@ -292,6 +292,12 @@ function holderName(actor: MissionActor): string {
   }
 }
 
+/** A settle or reopen note goes over the wire only when it says something. */
+const noteOf = (note: string | undefined) => {
+  const text = note?.trim() ?? "";
+  return text === "" ? {} : { note: text };
+};
+
 const REQUEST_STATUS: Record<OwnerRequestRecord["status"], OwnerRequestStatus> = {
   "waiting-on-master": "waiting",
   answered: "answered",
@@ -1315,17 +1321,19 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         }),
       );
     },
-    settleRequest: async ({ requestId }) => {
+    settleRequest: async ({ requestId, note }) => {
       touchRequest(
         await transport.request(WS_METHODS.missionsSettleOwnerRequest, {
           requestId: requestId as OwnerRequestId,
+          ...noteOf(note),
         }),
       );
     },
-    reopenRequest: async ({ requestId }) => {
+    reopenRequest: async ({ requestId, note }) => {
       touchRequest(
         await transport.request(WS_METHODS.missionsReopenOwnerRequest, {
           requestId: requestId as OwnerRequestId,
+          ...noteOf(note),
         }),
       );
     },

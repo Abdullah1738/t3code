@@ -93,6 +93,16 @@ describe("owner requests", () => {
     const reopened = read().find((r) => r.id === "request-risk-round")!;
     expect(reopened.status).toBe("answered");
     expect(isRequestUnread(reopened)).toBe(false);
+
+    // Closing words land in the conversation; reopening with words waits on the master.
+    await source.settleRequest({ requestId: created.id, note: " Done, thanks " });
+    const closed = read().find((r) => r.id === created.id)!;
+    expect(closed.status).toBe("settled");
+    expect(closed.messages.at(-1)).toMatchObject({ author: "owner", text: "Done, thanks" });
+    await source.reopenRequest({ requestId: created.id, note: "Actually, wait" });
+    const back = read().find((r) => r.id === created.id)!;
+    expect(back.status).toBe("waiting");
+    expect(back.messages.at(-1)).toMatchObject({ author: "owner", text: "Actually, wait" });
   });
 
   it("keeps one open request per discussed record", async () => {

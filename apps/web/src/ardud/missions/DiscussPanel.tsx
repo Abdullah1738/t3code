@@ -115,7 +115,7 @@ function DiscussionThread(props: { request: OwnerRequest; onClose: () => void; n
       <DiscussionComposer
         reply
         onSend={(text) => replyRequest(request.id, text)}
-        onSettle={() => settleRequest(request.id)}
+        onSettle={(note) => settleRequest(request.id, note)}
         onClose={props.onClose}
       />
     </section>
@@ -126,7 +126,8 @@ function DiscussionComposer(props: {
   /** Replying in an open discussion rather than starting one. */
   reply?: boolean;
   onSend: (text: string) => Promise<boolean>;
-  onSettle?: () => Promise<boolean>;
+  /** Settles with the box's text, when any, as the closing note. */
+  onSettle?: (note: string) => Promise<boolean>;
   onClose: () => void;
 }) {
   const [text, setText] = useState("");
@@ -177,10 +178,10 @@ function DiscussionComposer(props: {
             disabled={busy}
             onClick={() => {
               const settle = props.onSettle;
-              if (settle) void run(settle, true);
+              if (settle) void run(() => settle(text), true);
             }}
           >
-            Settle
+            {text.trim() === "" ? "Settle" : "Settle with note"}
           </Button>
         ) : null}
         <Button type="button" size="sm" variant="ghost-muted" onClick={props.onClose}>

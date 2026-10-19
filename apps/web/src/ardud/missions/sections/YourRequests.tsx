@@ -332,9 +332,9 @@ export function RequestThread(props: {
               size="sm"
               variant="ghost-muted"
               disabled={busy}
-              onClick={() => void run(() => settleRequest(request.id))}
+              onClick={() => void run(() => settleRequest(request.id, text), true)}
             >
-              Settle
+              {text.trim() === "" ? "Settle" : "Settle with note"}
             </Button>
           </>
         )}
