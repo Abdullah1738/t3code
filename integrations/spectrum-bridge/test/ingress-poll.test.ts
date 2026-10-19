@@ -38,11 +38,11 @@ describe("poll vote ingress", () => {
       { id: "poll-vote:poll-guid:5", state: "pending", payload: {
         id: "poll-vote:poll-guid:5", text: 'Voted for "Sushi" in the poll "Lunch?"', attachments: [], isAudioMessage: false,
         poll: { guid: "poll-guid", optionIdentifier: "o-2", optionText: "Sushi", vote: "voted", operationId: "poll:abc" },
-        receivedAt: now } },
+        source: "composed", receivedAt: now } },
       { id: "poll-vote:poll-guid:6", state: "pending", payload: {
         id: "poll-vote:poll-guid:6", text: 'Removed vote for "Sushi" in the poll "Lunch?"', attachments: [], isAudioMessage: false,
         poll: { guid: "poll-guid", optionIdentifier: "o-2", optionText: "Sushi", vote: "unvoted", operationId: "poll:abc" },
-        receivedAt: now } },
+        source: "composed", receivedAt: now } },
     ]);
     expect(store.get<unknown>("photonCursor")).toBe(6);
     expect(store.get<unknown>("chatGuid")).toBe(`any;-;${owner}`);

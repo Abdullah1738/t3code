@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_INCOMING_BYTES, MAX_PREVIEW_BYTES } from "../src/inbound-files.ts";
-import { OpenChamber, type FilePart, type MessageRecord, type PermissionRequest, type QuestionRequest, type RequestOptions, type SessionRecord, type SessionStatus } from "../src/openchamber.ts";
+import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type RequestOptions, type SessionRecord, type SessionStatus } from "../src/openchamber.ts";
 
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
@@ -14,7 +14,7 @@ import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, OWNER_GIVE_UP
 import { Store } from "../src/store.ts";
 import type { SttInput } from "../src/stt.ts";
 
-type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string } };
+type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string }; owner?: OwnerWords };
 // The config root points at a nonexistent directory so router tests never
 // read the machine's real OpenCode config and stay deterministic.
 const options = { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config", quietMs: 0 };
@@ -65,8 +65,8 @@ class Backend extends OpenChamber {
   accept(call: Prompt) {
     this.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
   }
-  override async prompt(id: string, directory: string, messageId: string, text: string, system?: string, files: readonly FilePart[] = [], model?: { providerID: string; modelID: string; variant?: string }) {
-    const call = { id, directory, messageId, text, system, files, model };
+  override async prompt(id: string, directory: string, messageId: string, text: string, system?: string, files: readonly FilePart[] = [], model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords) {
+    const call = { id, directory, messageId, text, system, files, model, ...(owner ? { owner } : {}) };
     this.prompts.push(call);
     if (this.promptBehavior) await this.promptBehavior(call);
     else this.accept(call);
@@ -105,15 +105,19 @@ class Backend extends OpenChamber {
   resets = false;
   resetsContext() { return this.resets; }
   permissionReplySessions: string[] = [];
-  override async permissionReply(sessionId: string, id: string, directory: string, reply: "once" | "reject") {
+  /** The inbound id each reply carried to Robob (undefined when the bridge answered on its own). */
+  replyInbounds: (string | undefined)[] = [];
+  override async permissionReply(sessionId: string, id: string, directory: string, reply: "once" | "reject", inboundId?: string) {
     this.permissionReplySessions.push(sessionId);
+    this.replyInbounds.push(inboundId);
     this.permissionReplies.push([id, directory, reply]);
     if (this.permissionReplyBehavior) return this.permissionReplyBehavior();
     this.permissionRequests = this.permissionRequests.filter(p => p.id !== id);
     return true;
   }
-  override async questionReply(request: QuestionRequest, directory: string, answers: string[][]) {
+  override async questionReply(request: QuestionRequest, directory: string, answers: string[][], inboundId?: string) {
     this.questionReplies.push([request.id, directory, answers]);
+    this.replyInbounds.push(inboundId);
     if (this.questionReplyBehavior) return this.questionReplyBehavior();
     this.questionRequests = this.questionRequests.filter(q => q.id !== request.id);
     return true;
@@ -783,7 +787,7 @@ test("only current permission IDs are approved once, even behind queued conversa
   h.backend.permissionRequests = [permission(), permission("foreign", "other-session")];
   await h.router.tick();
   expect(h.controls()).toHaveLength(1);
-  expect(h.controls()[0]).toMatchObject({ text: "Quick check before I go on: bash\ngit status\nOK to go ahead?", replyTo: "question" });
+  expect(h.controls()[0]).toMatchObject({ text: "Quick check before I go on: bash\ngit status\nReply yes or no.", replyTo: "question" });
   expect(h.controls()[0]!.text).not.toContain("PRIVATE_METADATA");
   h.input("queue", "Another question");
   // The prompt has not been delivered yet, so a plain yes is not an answer.
@@ -837,12 +841,12 @@ test("permissions are asked one at a time and answered by plain yes/no once deli
   expect(prompts()).toHaveLength(1);
   h.store.outboxState(prompts()[0]!.id, "sent", "provider-permission");
   expect(h.router.routerStatus().pending.map(p => [p.id, p.operationState])).toEqual([["perm_1", "sent"], ["perm_2", "pending"]]);
-  h.input("first-answer", "Nope");
+  h.input("first-answer", "no");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats/ses_1", "reject"]]);
   expect(prompts()).toHaveLength(1);
   h.store.outboxState(prompts()[0]!.id, "sent", "provider-permission-2");
-  h.input("second-answer", "Sure!");
+  h.input("second-answer", "Ok!");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats/ses_1", "reject"], ["perm_2", "/Chats/ses_1", "once"]]);
   expect(inbounds(h.store).filter(row => row.id.endsWith("-answer")).map(row => row.state)).toEqual(["done", "done"]);
@@ -1103,7 +1107,7 @@ test("a plain yes approves the delivered permission, then the next yes answers t
   h.backend.permissionRequests = [permission()];
   await h.router.tick();
   const prompts = () => asked(h.store);
-  expect(prompts().map(c => c.text)).toEqual(["Quick check before I go on: bash\ngit status\nOK to go ahead?"]);
+  expect(prompts().map(c => c.text)).toEqual(["Quick check before I go on: bash\ngit status\nReply yes or no."]);
   deliver(h.store);
   h.input("approve", "YES");
   await h.router.tick();
@@ -1168,7 +1172,7 @@ test("a text sent after a prompt was queued but before it reached the phone neve
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats/ses_1", "once"]]);
 });
 
-test.each([["yes please", "once"], ["Yes, go ahead!", "once"], ["ok thanks", "once"], ["nah dont", "reject"], ["no thanks", "reject"]])("approval reply %p means %s", async (reply, decision) => {
+test.each([["yes please", "once"], ["Yes, go!", "once"], ["ok thanks", "once"], ["Ship it.", "once"], ["no", "reject"], ["no thanks", "reject"], ["deny", "reject"]])("approval reply %p means %s", async (reply, decision) => {
   const h = setup();
   h.input("first", "Work");
   await h.router.tick();
@@ -1178,6 +1182,23 @@ test.each([["yes please", "once"], ["Yes, go ahead!", "once"], ["ok thanks", "on
   h.input("answer", reply);
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats/ses_1", decision]]);
+});
+
+// The short consent grammar Robob checks too: a question, a negation, a qualifier or
+// anything extra decides nothing, so the request stays open and the owner gets a nudge.
+test.each(["yes?", "allow?", "is that ok?", "yes but not now", "don't", "nah dont", "go ahead", "sure", "ok？", "yes؟", "¿ok", "ok 🤔", "yes❓", "yes 2"])("approval reply %p decides nothing", async reply => {
+  const h = setup();
+  h.input("first", "Work");
+  await h.router.tick();
+  h.backend.permissionRequests = [permission()];
+  await h.router.tick();
+  deliver(h.store);
+  h.input("answer", reply);
+  await h.router.tick();
+  expect(h.backend.permissionReplies).toEqual([]);
+  expect(h.controls().filter(c => c.replyTo === "answer").map(c => c.text)).toEqual([
+    "Got it, I'll come back to that. I still need a yes or no on the check above before I can keep going.",
+  ]);
 });
 
 test("a bridge secure-form notice is never taken as an answer", async () => {
@@ -2684,7 +2705,7 @@ test("status, redirect controls, and native approvals stay immediate with the de
   h.input("list", "/reminders");
   h.input("snooze", "/snooze R1 5m");
   h.input("cancel", "/cancel R2");
-  h.input("approve", "once");
+  h.input("approve", "ok");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats/ses_1", "once"]]);
   deliver(h.store);
@@ -3311,6 +3332,43 @@ test("without a transcriber, audio is stored like any other file", async () => {
   expect(readdirSync(join(h.root, "ses_1", "attachments"))).toHaveLength(1);
 });
 
+test("a request prompt carries its notice; a typed answer goes to Robob with its inbound id, a poll vote without", async () => {
+  const h = setup();
+  h.input("first", "Ask me", { source: "typed" });
+  await h.router.tick();
+  h.backend.permissionRequests = [permission()];
+  await h.router.tick();
+  const [approval] = asked(h.store);
+  expect(approval!.notice).toEqual({ kind: "runtime-request", session: "ses_1", recordId: "perm_1" });
+  deliver(h.store);
+  h.input("typed-yes", "yes", { source: "typed" });
+  await h.router.tick();
+  expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats/ses_1", "once"]]);
+  h.backend.questionRequests = [question()];
+  await h.router.tick();
+  const poll = asked(h.store).at(-1)!;
+  expect(poll.notice).toEqual({ kind: "runtime-request", session: "ses_1", recordId: "q_1" });
+  h.input("poll-vote:poll-guid:1", "", { source: "composed",
+    poll: { guid: "poll-guid", optionIdentifier: "opt-A", optionText: "A", vote: "voted", operationId: poll.id } });
+  await h.router.tick();
+  expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["A"]]]]);
+  // Only the typed reply speaks for him; the vote is the bridge answering.
+  expect(h.backend.replyInbounds).toEqual(["typed-yes", undefined]);
+});
+
+test("only one typed message reaches Robob as his words; a batch, a voice note or a composed row does not", async () => {
+  const h = setup();
+  h.input("typed-1", "Mission one: ship it", { source: "typed" });
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.owner).toEqual({ inboundId: "typed-1", text: "Mission one: ship it" });
+  h.backend.final();
+  await h.router.tick();
+  h.input("old-row", "no source on this row");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("no source on this row");
+  expect(h.backend.prompts.at(-1)).not.toHaveProperty("owner");
+});
+
 test("a poll vote answers the single-select question it asks; retracted and stale votes are dropped", async () => {
   const h = setup();
   h.input("first", "Ask me");
@@ -3354,12 +3412,12 @@ test("a background subagent that asks after the turn ended is asked over iMessag
   h.backend.permissionRequests = [permission("perm_bg", "ses_child")];
   for (let i = 0; i < 5; i++) await h.router.tick();
   expect(h.store.get("activeTurn")).toMatchObject({ id: "ses_1", background: true, phase: "running" });
-  expect(asked(h.store).map(p => p.text)).toEqual(["Quick check before I go on: bash\ngit status\nOK to go ahead?"]);
+  expect(asked(h.store).map(p => p.text)).toEqual(["Quick check before I go on: bash\ngit status\nReply yes or no."]);
   expect(h.router.routerStatus().pending).toEqual([
     { id: "perm_bg", kind: "permission", state: "pending", operationState: "pending", sessionId: "ses_child", directory: "/Chats/ses_child" },
   ]);
   deliver(h.store);
-  h.input("yes", "go ahead");
+  h.input("yes", "go");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_bg", "/Chats/ses_child", "once"]]);
   expect(h.backend.prompts).toHaveLength(1);
@@ -3430,7 +3488,7 @@ test("a failed answer to a request that then goes away does not hold a request-o
   deliver(h.store);
   // The owner's approval cannot be handed over: its outcome is unknown.
   h.backend.permissionReplyBehavior = async () => { throw new Error("PRIVATE_FAILURE"); };
-  h.input("yes", "go ahead");
+  h.input("yes", "go");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_bg", "/Chats/ses_child", "once"]]);
   expect(h.router.routerStatus().pending).toMatchObject([{ id: "perm_bg", state: "unknown" }]);
@@ -3462,7 +3520,7 @@ test("an answer of unknown outcome to a request that went away expires after the
   await h.router.tick();
   deliver(h.store);
   h.backend.permissionReplyBehavior = async () => { throw new Error("PRIVATE_FAILURE"); };
-  h.input("yes", "go ahead");
+  h.input("yes", "go");
   await h.router.tick();
   h.backend.permissionRequests = [];
   // The root keeps running, so this ordinary turn stays open either way.
@@ -3491,7 +3549,7 @@ test("an answer of unknown outcome to a request that is still open keeps the tur
   await h.router.tick();
   deliver(h.store);
   h.backend.permissionReplyBehavior = async () => { throw new Error("PRIVATE_FAILURE"); };
-  h.input("yes", "go ahead");
+  h.input("yes", "go");
   await h.router.tick();
   // The request stays open: the turn waits well past the grace, then asks again.
   setSystemTime(start + 40_000);
@@ -3515,7 +3573,7 @@ test("a request-opened turn hands over to the root when it resumes", async () =>
   await h.router.tick();
   await h.router.tick();
   deliver(h.store);
-  h.input("yes", "go ahead");
+  h.input("yes", "go");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_bg", "/Chats/ses_child", "once"]]);
   // The answer wakes the root well after the grace: it still reports back.
@@ -3916,12 +3974,12 @@ test("a nested subagent's request is asked too: OpenChamber and Telegram stay qu
   expect(h.backend.reads).toContainEqual(["children", "ses_child", "/Chats/ses_child"]);
   expect(h.backend.reads).not.toContainEqual(["permissions", "ses_idle_grandchild", "/Chats/ses_idle"]);
   expect(h.backend.reads).not.toContainEqual(["permissions", "ses_elsewhere", expect.anything()]);
-  expect(asked(h.store).map(p => p.text)).toEqual(["Quick check before I go on: bash\ngit status\nOK to go ahead?"]);
+  expect(asked(h.store).map(p => p.text)).toEqual(["Quick check before I go on: bash\ngit status\nReply yes or no."]);
   expect(h.router.routerStatus().pending).toEqual([
     { id: "perm_deep", kind: "permission", state: "pending", operationState: "pending", sessionId: "ses_grandchild", directory: "/Chats/ses_grandchild" },
   ]);
   deliver(h.store);
-  h.input("yes", "go ahead");
+  h.input("yes", "go");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_deep", "/Chats/ses_grandchild", "once"]]);
   expect(h.backend.permissionReplySessions).toEqual(["ses_grandchild"]);
@@ -3941,13 +3999,13 @@ test("a subagent's permission request is asked in the conversation and answered 
   expect(h.backend.reads).toContainEqual(["permissions", "ses_child", "/Chats/ses_child"]);
   expect(h.backend.reads).not.toContainEqual(["permissions", "ses_idle_child", "/Chats/ses_idle_child"]);
   const prompts = asked(h.store);
-  expect(prompts.map(p => p.text)).toEqual(["Quick check before I go on: bash\ngit status\nOK to go ahead?"]);
+  expect(prompts.map(p => p.text)).toEqual(["Quick check before I go on: bash\ngit status\nReply yes or no."]);
   expect(h.router.routerStatus().pending).toEqual([
     { id: "perm_child", kind: "permission", state: "pending", operationState: "pending", sessionId: "ses_child", directory: "/Chats/ses_child" },
   ]);
   expect(await h.router.beforeSend(prompts[0]!)).toBe("send");
   deliver(h.store);
-  h.input("yes", "go ahead");
+  h.input("yes", "go");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_child", "/Chats/ses_child", "once"]]);
   expect(h.backend.permissionReplySessions).toEqual(["ses_child"]);

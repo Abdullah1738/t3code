@@ -453,6 +453,12 @@ export type NormalizedInbound = {
   receivedAt?: number;
   batchIds?: string[];
   poll?: InboundPollVote;
+  /**
+   * "typed" only when `text` is the owner's message exactly as he sent it. Poll
+   * votes, voice notes and rows the bridge writes itself (wakes, secrets, resets)
+   * are not; Robob treats a row without "typed" as composed.
+   */
+  source?: "typed" | "composed";
 };
 
 export type InboundPollVote = {
@@ -507,5 +513,6 @@ export function normalizeInbound(event: CatchUpEvent, owner: string, chatGuid: s
     ...(replyTo ? { replyTo } : {}),
     isAudioMessage: message.isAudioMessage,
     attachments,
+    source: message.isAudioMessage ? "composed" : "typed",
   };
 }

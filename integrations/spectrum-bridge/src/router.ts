@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { stripInternalText } from "./formatting.ts";
-import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type PermissionRequest, type QuestionRequest } from "./openchamber.ts";
+import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest } from "./openchamber.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
 import { imessagePreferences } from "./preferred-model.ts";
@@ -45,7 +45,10 @@ type Turn = Route & {
   earlier?: string[];
 };
 /** What an owner-text turn POSTed, kept while its delivery is uncertain so it can be sent again. */
-type ResendBody = { inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string } };
+type ResendBody = {
+  inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string };
+  owner?: OwnerWords;
+};
 type Pending = {
   id: string;
   /** Route session. The request itself may belong to a child (subagent) session. */
@@ -216,10 +219,11 @@ export const refusalTitle = (title: unknown) => typeof title === "string" && REF
 /** A quoted reply needs a real provider message to point at. */
 const replyTarget = (id: string | undefined) => id === undefined || synthetic(id) ? {} : { replyTo: id };
 const CLI = `${process.execPath} ${fileURLToPath(new URL("./cli.ts", import.meta.url))}`;
-const YES_CORE = new Set(["y", "yes", "yeah", "yea", "ya", "yep", "yup", "sure", "ok", "okay", "k", "go", "do", "approve", "approved", "once", "allow", "allowed", "fine", "alright", "good", "👍"]);
-const NO_CORE = new Set(["n", "no", "nope", "nah", "dont", "stop", "reject", "rejected", "deny", "denied", "cancel", "never", "👎"]);
-const FILLER = new Set(["please", "pls", "thanks", "thank", "you", "ahead", "it", "for", "that", "thats", "is", "sounds", "go", "just"]);
-/** A short reply made only of yes (or no) words and filler, such as "yes please" or "nah, stop". */
+// The short consent grammar Robob also checks (missions guard, asks/provenance.ts):
+// only these phrases plus please or thanks, and never a question mark.
+const YES_PHRASES = ["yes", "approve", "approved", "ok", "go", "send it", "ship it"];
+const NO_PHRASES = ["no", "deny", "reject", "decline"];
+const COURTESY_PHRASES = ["please", "thanks", "thank you"];
 export const NO_REPLY = "NO_REPLY";
 
 /**
@@ -234,14 +238,40 @@ export function replyText(text: string): string {
   return visible.split("\n").at(-1)!.trim() === NO_REPLY ? "" : trimmed;
 }
 
-function decide(text: string): "yes" | "no" | undefined {
-  const words = text.toLowerCase().replace(/[’']/g, "").replace(/[^\p{L}\p{N}\p{Extended_Pictographic}]+/gu, " ").trim().split(" ").filter(Boolean);
-  if (!words.length || words.length > 6) return;
-  const yes = words.some(word => YES_CORE.has(word));
-  const no = words.some(word => NO_CORE.has(word));
-  if (yes === no) return;
-  const core = yes ? YES_CORE : NO_CORE;
-  return words.every(word => core.has(word) || FILLER.has(word)) ? (yes ? "yes" : "no") : undefined;
+const consentWords = (text: string) => text.normalize("NFKC").toLowerCase().replace(/['’`]/g, "")
+  .replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(" ").filter(Boolean);
+
+/** Whether the words are only these phrases back to back, with at least one consent phrase. */
+function consentOnly(words: string[], consent: string[]): boolean {
+  const phrases = [...consent, ...COURTESY_PHRASES].map(phrase => ({ words: phrase.split(" "), consent: consent.includes(phrase) }));
+  // reach[i] = 0 unreachable, 1 reachable with courtesy only, 2 reachable with a consent phrase.
+  const reach = new Array<number>(words.length + 1).fill(0);
+  reach[0] = 1;
+  for (let index = 0; index < words.length; index++) {
+    if (!reach[index]) continue;
+    for (const phrase of phrases) {
+      if (!phrase.words.every((word, offset) => words[index + offset] === word)) continue;
+      const next = index + phrase.words.length;
+      reach[next] = Math.max(reach[next]!, phrase.consent ? 2 : reach[index]!);
+    }
+  }
+  return words.length > 0 && reach[words.length] === 2;
+}
+
+/**
+ * A reply that only says yes ("yes", "ok send it", "approve thanks") or only no
+ * ("no", "deny"). A question mark, a question word, a negation, a qualifier or
+ * anything extra decides nothing, so "yes?", "is that ok?" and "don't" don't count.
+ */
+export function decide(text: string): "yes" | "no" | undefined {
+  // A question mark in any script, or anything beyond letters, spaces and
+  // plain punctuation (an emoji, a symbol, a number), decides nothing.
+  if (/[?\uFF1F\u061F\u00BF\u2047-\u2049\u2753\u2754]/u.test(text)) return;
+  if (!/^[\p{L}\p{M}\s.,!]*$/u.test(text.normalize("NFKC"))) return;
+  const words = consentWords(text);
+  if (consentOnly(words, YES_PHRASES)) return "yes";
+  if (consentOnly(words, NO_PHRASES)) return "no";
+  return;
 }
 
 /**
@@ -862,10 +892,15 @@ export class Router {
       this.store.set("pendingApprovals", entries);
       this.store.updateInbound(inboundId, "processing");
     }).immediate();
+    // A typed reply goes with its inbound id so Robob can check it is his; a poll
+    // vote or a legacy command does not, and Robob records the bridge as answering.
+    // A form answered over several replies has no single message that says it all.
+    const typedReply = !vote && input?.source === "typed" && !synthetic(inboundId)
+      && (!("questions" in request) || request.questions.length === 1) ? inboundId : undefined;
     try {
       const result = await bounded("questions" in request
-        ? this.backend.questionReply(request, directory, answers)
-        : this.backend.permissionReply(sessionId, pending.id, directory, decision!));
+        ? this.backend.questionReply(request, directory, answers, typedReply)
+        : this.backend.permissionReply(sessionId, pending.id, directory, decision!, typedReply));
       if (result === false) throw new Error();
       if (!this.current(route)) return;
       this.store.db.transaction(() => {
@@ -1004,7 +1039,7 @@ export class Router {
     let poll: OutboxPoll | undefined;
     if (!("questions" in request)) {
       const resources = request.resources.slice(0, 5).join("\n").slice(0, 1_000);
-      text = `Quick check before I go on: ${request.action.slice(0, 200)}${resources ? `\n${resources}` : ""}\nOK to go ahead?`;
+      text = `Quick check before I go on: ${request.action.slice(0, 200)}${resources ? `\n${resources}` : ""}\nReply yes or no.`;
     } else if (request.unsupported) {
       text = `There's a form waiting for you in ${this.backend.brand?.app ?? "OpenChamber"} that I can't fill in over text: ${request.title.slice(0, 200)}`;
       entry.unsupported = true;
@@ -1031,6 +1066,10 @@ export class Router {
         this.store.enqueue({
           id, kind: "control", text, sessionId: turn.id, generation: turn.generation,
           ...(poll ? { poll } : {}), ...(poll ? {} : replyTarget(turn.inboundId)),
+          // Robob counts his reply for this request only when it is tied to this message.
+          ...(entry.unsupported ? {} : {
+            notice: { kind: "runtime-request" as const, session: entry.requestSessionId ?? turn.id, recordId: entry.id },
+          }),
         });
       }
       this.store.set("pendingApprovals", entries);
@@ -1399,13 +1438,21 @@ export class Router {
     }
     let body = text || (parts.length ? "Please examine the attached file(s)." : "The attached files are available at the quoted paths. Ask what I would like to do with them.");
     if (quote) body = `${quote}\n${body}`;
+    // One message he typed, with nothing of the bridge's mixed into his words, goes to
+    // Robob as his exact text plus its inbound id; anything else is the bridge speaking.
+    const typed = input.text.trim();
+    const owner: OwnerWords | undefined = members.length === 1 && members[0] === row.id && !synthetic(row.id)
+      && input.source === "typed" && input.attachments.length === 0 && typed && body.endsWith(typed)
+      ? { inboundId: row.id, text: typed } : undefined;
     // Commit the final arrival check and acceptance fence together, before POST.
     const submitting = this.store.db.transaction(() => {
       if (interrupted() || !this.current(turn)) return false;
       this.store.set(`batch-phase:${row.id}`, "submitting");
       this.store.set("activeTurn", turn);
       // Owner text is sent again if this POST never shows up (see OWNER_RESEND_MS).
-      this.store.set("resendBody", members.every(synthetic) ? null : { inboundId: row.id, text: body, system, parts, model: preferences.model } satisfies ResendBody);
+      this.store.set("resendBody", members.every(synthetic) ? null : {
+        inboundId: row.id, text: body, system, parts, model: preferences.model, ...(owner ? { owner } : {}),
+      } satisfies ResendBody);
       if (members.every(synthetic)) for (const id of members) {
         const key = this.retryKey(id);
         const retry = this.store.get<SyntheticRetry | null>(key) ?? { attempts: 0, nextAt: 0, prompts: [] };
@@ -1417,7 +1464,7 @@ export class Router {
     }).immediate();
     if (!submitting) return;
     try {
-      await bounded(this.backend.prompt(turn.id, turn.directory, turn.messageId, body, system, parts, preferences.model));
+      await bounded(this.backend.prompt(turn.id, turn.directory, turn.messageId, body, system, parts, preferences.model, owner));
       if (this.current(turn)) this.store.db.transaction(() => {
         this.store.set("activeTurn", { ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
@@ -1621,7 +1668,7 @@ export class Router {
     if (!fenced) return true;
     this.options.log?.("owner-text-resent", String(next.attempt));
     try {
-      await bounded(this.backend.prompt(next.id, next.directory, next.messageId, body.text, body.system, body.parts, body.model));
+      await bounded(this.backend.prompt(next.id, next.directory, next.messageId, body.text, body.system, body.parts, body.model, body.owner));
       if (this.current(next)) this.store.db.transaction(() => {
         this.store.set("activeTurn", { ...next, phase: "running" });
         this.store.set(`seed:${next.id}`, null);
