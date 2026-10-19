@@ -16,7 +16,16 @@ import {
   newestChange,
 } from "./changeLog.ts";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
-import { portfolioView, reorderPortfolioInput } from "./portfolioViewModel.ts";
+import {
+  healthCounts,
+  portfolioBar,
+  portfolioChanges,
+  portfolioFacts,
+  portfolioPools,
+  portfolioSummary,
+  portfolioView,
+  reorderPortfolioInput,
+} from "./portfolioViewModel.ts";
 import { actorNames } from "./roomsViewModel.ts";
 import type { MissionTimelineEvent, PortfolioSnapshot } from "./source.ts";
 import {
@@ -385,6 +394,45 @@ describe("portfolio view model", () => {
     await expect(missions.setPortfolioOrder({ order: [JUNO] })).rejects.toMatchObject({
       code: "invalid",
     });
+    portfolio.close();
+  });
+
+  it("reads the order bar, the page line, the shared pools and the changes", async () => {
+    const missions = source();
+    const portfolio = live<PortfolioSnapshot>((l) => missions.subscribePortfolio(l));
+    const view = portfolioView(portfolio.value);
+    const bar = portfolioBar(view);
+    expect(bar.shares.map((share) => [share.title, share.share, share.paused])).toEqual([
+      ["Crpko engineering", 0.7, false],
+      ["Juno intents", 0.05, true],
+    ]);
+    expect(bar.free).toBeCloseTo(0.25);
+    const text = portfolioSummary(bar)
+      .map((part) => (typeof part === "string" ? part : part.figure))
+      .join("");
+    expect(text).toBe(
+      "Crpko engineering takes 70% of the shared pools. Juno intents is paused. 25% is free.",
+    );
+    expect(portfolioFacts(view.rows[1]!).map((fact) => fact.value)).toEqual([
+      "5%",
+      "Not measured",
+      "15%",
+    ]);
+    const offbox = portfolioPools(view).find((pool) => pool.poolId === "pool-offbox");
+    expect(offbox?.line).toBe("Crpko engineering 92%, Juno intents 8%");
+
+    const input = reorderPortfolioInput(portfolio.value.order, JUNO, CRPKO);
+    if (!input.ok) throw new Error(input.error);
+    await missions.setPortfolioOrder(input.value);
+    const [newest] = portfolioChanges(portfolio.value);
+    expect(newest).toMatchObject({
+      text: "Order: Juno intents, then Crpko engineering",
+      by: "you",
+    });
+    expect(healthCounts([{ health: "amber" }, { health: "green" }, { health: "amber" }])).toEqual([
+      { health: "amber", count: 2, label: "2 at risk" },
+      { health: "green", count: 1, label: "1 on track" },
+    ]);
     portfolio.close();
   });
 });
