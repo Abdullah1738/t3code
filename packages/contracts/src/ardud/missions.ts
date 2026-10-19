@@ -2500,6 +2500,15 @@ export const OwnerRequestsInput = Schema.Struct({
   status: Schema.optional(OwnerRequestStatus),
   /** One request with a longer stretch of its conversation, bodies included. */
   requestId: Schema.optional(OwnerRequestId),
+  /**
+   * true: only discussions on a record; false: only requests about no record
+   * (Your requests). Absent: both.
+   */
+  discussions: Schema.optional(Schema.Boolean),
+  /** Only the discussions on this record. */
+  subject: Schema.optional(MissionRecordRef),
+  /** Only those the master answered and the owner has not read. */
+  unread: Schema.optional(Schema.Boolean),
 });
 export type OwnerRequestsInput = typeof OwnerRequestsInput.Type;
 
@@ -2516,6 +2525,8 @@ export const OwnerRequestView = Schema.Struct({
   messages: Schema.Array(OwnerRequestMessage),
   hasOlder: Schema.Boolean,
   unreadForOwner: Schema.Boolean,
+  /** Messages the owner has not read, at least 1 while `unreadForOwner`; the discussion counter. */
+  unreadMessages: Schema.optional(NonNegativeInt),
 });
 export type OwnerRequestView = typeof OwnerRequestView.Type;
 

@@ -115,6 +115,8 @@ export interface OwnerRequestDeps {
   ) => Effect.Effect<void>;
 }
 
+type RoomCount = { readonly total: number; readonly unreadForOwner: number };
+
 type Caller =
   | { readonly _tag: "owner"; readonly actor: MissionActor }
   | { readonly _tag: "master"; readonly actor: MissionActor; readonly threadId: ThreadId }
@@ -599,7 +601,10 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
     /** The open request about a record, if there is one. */
     const openAbout = (missionId: MissionId, ref: MissionRecordRef) =>
       Effect.map(
-        store.listAllInMission("owner-request", missionId, ["waiting-on-master", "answered"]),
+        store.listOwnerRequests(missionId, {
+          status: ["waiting-on-master", "answered"],
+          subject: ref,
+        }),
         (requests) => requests.find((request) => sameRef(request.subject, ref)) ?? null,
       );
 
@@ -622,7 +627,19 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         return done.result;
       });
 
-    const viewOf = (request: OwnerRequest, limit: number, withBodies: boolean) =>
+    /**
+     * The discussion counter: unread messages, at least 1 while the request
+     * is unread (a settle with no master note still marks it unread).
+     */
+    const unreadMessagesOf = (request: OwnerRequest, counts: ReadonlyMap<string, RoomCount>) =>
+      request.unreadForOwner ? Math.max(1, counts.get(request.roomId)?.unreadForOwner ?? 0) : 0;
+
+    const viewOf = (
+      request: OwnerRequest,
+      limit: number,
+      withBodies: boolean,
+      counts: ReadonlyMap<string, RoomCount>,
+    ) =>
       Effect.gen(function* () {
         const page = yield* rooms.roomMessages(request.roomId, null, limit);
         const messages = yield* Effect.forEach(page.messages, (message) =>
@@ -636,6 +653,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           messages,
           hasOlder: page.hasOlder,
           unreadForOwner: request.unreadForOwner,
+          unreadMessages: unreadMessagesOf(request, counts),
         } satisfies OwnerRequestView;
       });
 
@@ -648,20 +666,26 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         yield* missionOf(input.missionId);
         const caller = yield* callerOf(yield* loadCast(input.missionId), provenance);
         const words = caller._tag !== "reader" || readsRequestWords(provenance, ownerSession);
-        const records = yield* store.list("owner-request", {
-          missionId: input.missionId,
+        const records = yield* store.listOwnerRequests(input.missionId, {
           ...(input.status === undefined ? {} : { status: [input.status] }),
           ...(input.requestId === undefined ? {} : { ids: [input.requestId] }),
+          ...(input.discussions === undefined ? {} : { discussions: input.discussions }),
+          ...(input.subject === undefined ? {} : { subject: input.subject }),
+          ...(input.unread === true ? { unread: true } : {}),
           limit: LIST_MAX,
         });
         if (input.requestId !== undefined && records.length === 0) {
           return yield* fail("not-found", `No request ${input.requestId} in ${input.missionId}.`);
         }
+        const counts = yield* rooms.roomCounts(
+          input.missionId,
+          records.filter((request) => request.unreadForOwner).map((request) => request.roomId),
+        );
         // A list carries summaries; one request asked for by id carries its bodies.
         const one = input.requestId !== undefined;
         const requests = words
           ? yield* Effect.forEach(records, (request) =>
-              viewOf(request, one ? VIEW_ONE : VIEW_MESSAGES, one),
+              viewOf(request, one ? VIEW_ONE : VIEW_MESSAGES, one, counts),
             )
           : records.map((request) =>
               withoutWords({
@@ -669,6 +693,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
                 messages: [],
                 hasOlder: false,
                 unreadForOwner: request.unreadForOwner,
+                unreadMessages: unreadMessagesOf(request, counts),
               }),
             );
         return { missionId: input.missionId, requests } satisfies OwnerRequests;
@@ -791,7 +816,11 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               missionId: mission.id,
               subMissionId,
               kind: "owner-request",
-              title: `Request: ${title}`,
+              // A discussion's room names the record it is on, not his words.
+              title:
+                subject === null
+                  ? `Request: ${title}`
+                  : `Discussion: ${subject.label ?? `${subject.kind} ${subject.id}`}`,
               workItemId: null,
               archived: false,
               lastSeq: 0,

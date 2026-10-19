@@ -4,6 +4,7 @@ import {
   ThreadId,
   type MissionLink,
   type MissionProvenance,
+  type OwnerRequestsInput,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -837,6 +838,60 @@ describe("owner requests, router round 5", () => {
 
 describe("discuss", () => {
   const ask = { kind: "work-item", id: "wi-free" } as const;
+
+  it.effect("a discussion counts on its record, never in his requests", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const reads = makeReads(store, () => null);
+      const views = yield* ViewStore.ViewStore;
+      const counts = Effect.gen(function* () {
+        const overview = (yield* reads.overview(missionId)).requestsAnswered;
+        const listed = (yield* reads.listSnapshot).missions.find((each) => each.id === missionId);
+        return [overview, listed?.requestsAnswered, yield* views.requestsAnswered(missionId)];
+      });
+      const plain = yield* router.openRequest({ missionId, text: "Status on CI?" }, ownerApp);
+      const talk = yield* router.openRequest(
+        { missionId, text: "Why is this item still free?", subject: ask },
+        ownerApp,
+      );
+      // The room names the record, not his words.
+      const page = yield* router.roomPage({ roomId: talk.roomId }, ownerApp);
+      assert.strictEqual(page.room.title, "Discussion: Item wi-free");
+      yield* masterReads(plain.roomId);
+      yield* masterReads(talk.roomId);
+      yield* router.replyRequest({ requestId: plain.id, text: "Green." }, master);
+      yield* router.replyRequest(
+        { requestId: talk.id, text: "Nobody took it.", status: "waiting-on-master" },
+        master,
+      );
+      yield* router.replyRequest({ requestId: talk.id, text: "Lane 2 has it now." }, master);
+      // Only the request about no record counts toward his requests.
+      assert.deepStrictEqual(yield* counts, [1, 1, 1]);
+      const ids = (input: Omit<OwnerRequestsInput, "missionId">) =>
+        Effect.map(router.ownerRequests({ missionId, ...input }, ownerApp), (listed) =>
+          listed.requests.map((view) => view.request.id),
+        );
+      assert.deepStrictEqual(yield* ids({ discussions: false }), [plain.id]);
+      assert.deepStrictEqual(yield* ids({ discussions: true }), [talk.id]);
+      assert.deepStrictEqual(yield* ids({ subject: ask }), [talk.id]);
+      assert.deepStrictEqual(yield* ids({ subject: { kind: "work-item", id: "wi-held" } }), []);
+      assert.strictEqual((yield* ids({ unread: true })).length, 2);
+      assert.strictEqual((yield* ids({})).length, 2);
+      // The counter on the record's discussion symbol: both unread replies.
+      const about = yield* router.ownerRequests({ missionId, subject: ask }, ownerApp);
+      assert.strictEqual(about.requests[0]?.unreadMessages, 2);
+      // Reading it clears the counter and leaves his requests' count alone.
+      const read = yield* router.roomPage({ roomId: talk.roomId }, ownerApp);
+      yield* router.markRead({ roomId: talk.roomId, seq: read.room.lastSeq }, ownerApp);
+      const after = yield* router.ownerRequests({ missionId, subject: ask }, ownerApp);
+      assert.strictEqual(after.requests[0]?.unreadMessages, 0);
+      assert.deepStrictEqual(yield* ids({ unread: true }), [plain.id]);
+      assert.deepStrictEqual(yield* counts, [1, 1, 1]);
+    }).pipe(Effect.provide(Layer.provideMerge(ViewStore.layer, h.layer)));
+  });
 
   it.effect("one open request per record; the master reads the record and the whole talk", () => {
     const h = harness();

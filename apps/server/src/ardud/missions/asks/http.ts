@@ -683,7 +683,8 @@ const makeRoutes = Effect.gen(function* () {
       return json({
         ok: true,
         inbox,
-        requests: answered.filter((request) => request.unreadForOwner),
+        // ardud missions: router (a discussion counts on its record, not here)
+        requests: answered.filter((request) => request.unreadForOwner && request.subject == null),
       });
     }),
   );

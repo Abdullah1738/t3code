@@ -1199,29 +1199,6 @@ const make = Effect.gen(function* () {
       return yield* tuningOf(room);
     });
 
-  /** The latest `member.changed` for a principal: true added, false removed, null never. */
-  const lastMemberChange = (missionId: MissionId, principal: string) =>
-    Effect.gen(function* () {
-      let latest: boolean | null = null;
-      let after = 0;
-      for (;;) {
-        const page = yield* store.eventsSince(missionId, after);
-        if (page.length === 0) return latest;
-        for (const event of page) {
-          if (event.kind !== "member.changed") continue;
-          if (typeof event.payload !== "object" || event.payload === null) continue;
-          const change = event.payload as {
-            readonly principal?: unknown;
-            readonly member?: unknown;
-          };
-          if (change.principal === principal && typeof change.member === "boolean") {
-            latest = change.member;
-          }
-        }
-        after = page.at(-1)!.seq;
-      }
-    });
-
   const setMember = (input: SetMissionMemberInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const cast = yield* loadCast(input.missionId);
@@ -1257,7 +1234,7 @@ const make = Effect.gen(function* () {
         input.member &&
         !owner &&
         (provenance._tag === "import" || selfAdd) &&
-        (yield* lastMemberChange(input.missionId, principal)) === false
+        (yield* store.lastMemberChange(input.missionId, principal)) === false
       ) {
         return yield* fail(
           "forbidden",

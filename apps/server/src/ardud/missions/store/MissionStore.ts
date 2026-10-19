@@ -83,6 +83,15 @@ const DDL = [
     mission_id TEXT PRIMARY KEY,
     looked_at TEXT NOT NULL
   )`,
+  // --- router additions ---
+  // The newest event of a kind without walking the log (membership changes).
+  `CREATE INDEX IF NOT EXISTS ardud_mission_events_by_kind
+    ON ardud_mission_events (mission_id, kind, seq)`,
+  // Unread owner requests are few; the board counts them on every recompute.
+  `CREATE INDEX IF NOT EXISTS ardud_mission_records_unread_requests
+    ON ardud_mission_records (mission_id)
+    WHERE kind = 'owner-request' AND json_extract(record_json, '$.record.unreadForOwner') = 1`,
+  // --- end router additions ---
 ];
 
 const REVISION_SCOPE = "revision";
@@ -150,6 +159,20 @@ export interface MissionListFilter {
   readonly order?: "newest" | "oldest";
   readonly limit?: number;
 }
+
+// --- router additions ---
+export interface OwnerRequestFilter {
+  readonly status?: ReadonlyArray<string>;
+  readonly ids?: ReadonlyArray<string>;
+  /** true: only discussions on a record; false: only requests about no record. */
+  readonly discussions?: boolean;
+  /** Only the discussions on this record. */
+  readonly subject?: Pick<MissionRecordRef, "kind" | "id">;
+  /** Only those the master answered and the owner has not read. */
+  readonly unread?: boolean;
+  readonly limit?: number;
+}
+// --- end router additions ---
 
 const cutSummary = (summary: string): string => {
   const trimmed = summary.trim();
@@ -219,6 +242,24 @@ export class MissionStore extends Context.Service<
      * limit, so a mission missing here cannot claim the thread by its records.
      */
     readonly missionsOfThread: (threadId: ThreadId) => Effect.Effect<ReadonlyArray<MissionId>>;
+    /** Owner requests of a mission filtered in SQL, newest activity first. */
+    readonly listOwnerRequests: (
+      missionId: MissionId,
+      filter: OwnerRequestFilter,
+    ) => Effect.Effect<ReadonlyArray<MissionRecordOf<"owner-request">>, MissionError>;
+    /**
+     * Per mission (one, or all with `null`): requests about no record that
+     * the master answered and the owner has not read. Discussions on a
+     * record count on that record instead. Missions with none are absent.
+     */
+    readonly ownerRequestsUnread: (
+      missionId: MissionId | null,
+    ) => Effect.Effect<ReadonlyMap<string, number>>;
+    /** The newest `member.changed` for a principal: true added, false removed, null never. */
+    readonly lastMemberChange: (
+      missionId: MissionId,
+      principal: string,
+    ) => Effect.Effect<boolean | null>;
     // --- end router additions ---
   }
 >()("t3/ardud/missions/store/MissionStore") {}
@@ -489,6 +530,76 @@ const make = Effect.gen(function* () {
       NodeSqliteClient.readOnly,
       Effect.orDie,
     );
+
+  const UNREAD_REQUEST = sql`json_extract(record_json, '$.record.unreadForOwner') = 1`;
+  const SUBJECT = sql`json_extract(record_json, '$.record.subject')`;
+
+  const listOwnerRequests = (missionId: MissionId, filter: OwnerRequestFilter) =>
+    Effect.gen(function* () {
+      if (filter.ids !== undefined && filter.ids.length === 0) return [];
+      if (filter.status !== undefined && filter.status.length === 0) return [];
+      const limit = Math.min(Math.max(filter.limit ?? DEFAULT_LIST_LIMIT, 1), MAX_LIST_LIMIT);
+      const subject = filter.subject;
+      const clauses = [
+        sql`kind = 'owner-request'`,
+        sql`mission_id = ${missionId}`,
+        ...(filter.status === undefined ? [] : [sql.in("status", filter.status)]),
+        ...(filter.ids === undefined ? [] : [sql.in("id", filter.ids)]),
+        ...(filter.discussions === undefined
+          ? []
+          : [filter.discussions ? sql`${SUBJECT} IS NOT NULL` : sql`${SUBJECT} IS NULL`]),
+        ...(subject === undefined
+          ? []
+          : [
+              sql`json_extract(record_json, '$.record.subject.kind') = ${subject.kind}`,
+              sql`json_extract(record_json, '$.record.subject.id') = ${subject.id}`,
+            ]),
+        ...(filter.unread === true ? [UNREAD_REQUEST] : []),
+      ];
+      const rows = yield* sql<RecordRow & { readonly id: string }>`
+        SELECT id AS "id", record_json AS "recordJson" FROM ardud_mission_records
+        WHERE ${sql.and(clauses)}
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ${limit}
+      `.pipe(NodeSqliteClient.readOnly, Effect.orDie);
+      return yield* Effect.forEach(rows, (row) =>
+        decodeStoredRecord("owner-request", row.id, row.recordJson).pipe(
+          Effect.flatMap((decoded) =>
+            decoded._tag === "owner-request"
+              ? Effect.succeed(decoded.record)
+              : Effect.fail(
+                  invalid(`Stored owner-request ${row.id} holds a ${decoded._tag} record.`),
+                ),
+          ),
+        ),
+      );
+    });
+
+  const ownerRequestsUnread = (missionId: MissionId | null) =>
+    sql<{ readonly missionId: string; readonly n: number }>`
+      SELECT mission_id AS "missionId", COUNT(*) AS "n" FROM ardud_mission_records
+      WHERE kind = 'owner-request' AND ${UNREAD_REQUEST} AND ${SUBJECT} IS NULL
+        ${missionId === null ? sql`` : sql`AND mission_id = ${missionId}`}
+      GROUP BY mission_id
+    `.pipe(
+      Effect.map((rows) => new Map(rows.map((row) => [row.missionId, Number(row.n)] as const))),
+      NodeSqliteClient.readOnly,
+      Effect.orDie,
+    );
+
+  const lastMemberChange = (missionId: MissionId, principal: string) =>
+    sql<{ readonly member: number }>`
+      SELECT json_extract(event_json, '$.payload.member') AS "member" FROM ardud_mission_events
+      WHERE mission_id = ${missionId} AND kind = 'member.changed'
+        AND json_extract(event_json, '$.payload.principal') = ${principal}
+        AND json_type(event_json, '$.payload.member') IN ('true', 'false')
+      ORDER BY seq DESC
+      LIMIT 1
+    `.pipe(
+      Effect.map((rows) => (rows[0] === undefined ? null : Boolean(rows[0].member))),
+      NodeSqliteClient.readOnly,
+      Effect.orDie,
+    );
   // --- end router additions ---
 
   const eventsSince = (missionId: MissionId, afterSeq: number, limit = MAX_EVENTS_PAGE) =>
@@ -544,6 +655,9 @@ const make = Effect.gen(function* () {
     listAllInMission,
     listAll,
     missionsOfThread,
+    listOwnerRequests,
+    ownerRequestsUnread,
+    lastMemberChange,
     // --- end router additions ---
   });
 });
