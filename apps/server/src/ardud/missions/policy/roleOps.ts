@@ -36,6 +36,7 @@ import {
   resolveCaller,
   roleRef,
   roleUpsert,
+  rolesByIds,
   shortId,
   systemCaller,
   type Caller,
@@ -97,6 +98,12 @@ const roleBindings = (deps: PolicyDeps, role: Role) =>
     Effect.map((bindings) => bindings.filter((binding) => binding.roleId === role.id)),
   );
 
+/** An imported holder with no model on record yet keeps what it runs. */
+const keepsImportedModel = (role: Role, binding: RoleBinding) =>
+  binding.reason === "import" &&
+  binding.observedModel === null &&
+  role.pendingModelSelection === null;
+
 export interface AlignResult {
   readonly applied: ReadonlyArray<ThreadId>;
   readonly waiting: ReadonlyArray<ThreadId>;
@@ -128,11 +135,7 @@ export const alignRole = (
       if (!needsAlignment(role, binding)) continue;
       // An imported holder keeps whatever it runs until someone changes the
       // role's model; a mismatch shows as drift, never as a switch.
-      if (
-        binding.reason === "import" &&
-        binding.observedModel === null &&
-        role.pendingModelSelection === null
-      ) {
+      if (keepsImportedModel(role, binding)) {
         changed.push({ ...binding, observedModel: key });
         accepted.push(binding.threadId);
         continue;
@@ -196,19 +199,75 @@ export const alignRole = (
     return { applied, waiting, finished };
   });
 
-/** One sweep over every role with a holder that still has to pick up its model. */
+/**
+ * Records, in one event per mission, that imported holders keep their model.
+ * Called with roles whose only pending work is that acceptance.
+ */
+const acceptImported = (
+  deps: PolicyDeps,
+  missionId: MissionId,
+  holders: ReadonlyArray<{ readonly role: Role; readonly binding: RoleBinding }>,
+) =>
+  Effect.gen(function* () {
+    const accepted = holders.map(({ role, binding }) => ({
+      roleId: role.id,
+      threadId: binding.threadId,
+      model: modelKey(roleTarget(role)),
+    }));
+    const roleCount = new Set(accepted.map((entry) => entry.roleId)).size;
+    yield* deps.store.commit({
+      event: eventDraft(
+        systemCaller(POLICY_PROVENANCE),
+        missionId,
+        "role.model-changed",
+        `${accepted.length} imported holder(s) keep their model across ${roleCount} role(s)`,
+        null,
+        { phase: "imported", accepted },
+      ),
+      upserts: holders.map(({ role, binding }) =>
+        bindingUpsert({ ...binding, observedModel: modelKey(roleTarget(role)) }),
+      ),
+    });
+  });
+
+/**
+ * One sweep over every role with a holder that still has to pick up its model.
+ * Imported holders that only need their model recorded are batched into one
+ * event per mission; a second sweep with nothing changed writes nothing.
+ */
 export const alignAll = (deps: PolicyDeps) =>
   Effect.gen(function* () {
-    const active = yield* deps.store.list("role-binding", { status: ["bound"] });
-    const roleIds = [...new Set(active.map((binding) => binding.roleId as string))];
-    if (roleIds.length === 0) return;
-    const roles = yield* deps.store.list("role", { ids: roleIds });
+    const active = yield* deps.store.listAll("role-binding", ["bound"]);
+    const roles = yield* rolesByIds(
+      deps,
+      active.map((binding) => binding.roleId),
+    );
+    const imported = new Map<MissionId, Array<{ role: Role; binding: RoleBinding }>>();
+    const individual: Array<Role> = [];
     for (const role of roles) {
-      const holders = active.filter((binding) => binding.roleId === role.id);
-      const due =
-        role.pendingModelSelection !== null ||
-        holders.some((binding) => needsAlignment(role, binding));
-      if (!due) continue;
+      const due = active.filter(
+        (binding) => binding.roleId === role.id && needsAlignment(role, binding),
+      );
+      if (role.pendingModelSelection === null && due.length === 0) continue;
+      if (due.length > 0 && due.every((binding) => keepsImportedModel(role, binding))) {
+        const batch = imported.get(role.missionId) ?? [];
+        batch.push(...due.map((binding) => ({ role, binding })));
+        imported.set(role.missionId, batch);
+      } else {
+        individual.push(role);
+      }
+    }
+    for (const [missionId, holders] of imported) {
+      yield* acceptImported(deps, missionId, holders).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("mission policy imported holder alignment failed", {
+            missionId,
+            detail: error.detail,
+          }),
+        ),
+      );
+    }
+    for (const role of individual) {
       yield* alignRole(deps, role).pipe(
         Effect.catch((error) =>
           Effect.logWarning("mission policy role alignment failed", {
