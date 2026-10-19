@@ -3,9 +3,12 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import {
+  discussRequestInput,
   groupRequests,
   isRequestUnread,
   openRequestInput,
+  ownerConditionOf,
+  requestAbout,
   requestPreview,
   requestTitle,
   unreadRequestCount,
@@ -88,5 +91,28 @@ describe("owner requests", () => {
     await source.settleRequest({ requestId: first.id });
     const fresh = await source.openRequest({ missionId: CRPKO, text: "Back again", subject });
     expect(fresh.id).not.toBe(first.id);
+  });
+
+  it("finds the open request about a record and reads a decision made on a condition", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const read = latest(source);
+    const subject = { kind: "draft" as const, id: "draft-1", label: "Reply to Dylan" };
+    expect(discussRequestInput(CRPKO, subject, "  ").ok).toBe(false);
+    const built = discussRequestInput(CRPKO, subject, " Softer opening? ");
+    expect(built).toEqual({
+      ok: true,
+      value: { missionId: CRPKO, text: "Softer opening?", subject },
+    });
+    expect(requestAbout(read(), subject)).toBeNull();
+    const opened = await source.openRequest(built.ok ? built.value : (null as never));
+    expect(requestAbout(read(), { kind: "draft", id: "draft-1" })?.id).toBe(opened.id);
+    expect(requestAbout(read(), { kind: "ask", id: "draft-1" })).toBeNull();
+    await source.settleRequest({ requestId: opened.id });
+    expect(requestAbout(read(), subject)).toBeNull();
+
+    const condition = { requestId: opened.id as never, quote: "fine if it ships after 18:00" };
+    expect(ownerConditionOf({ onOwnerCondition: condition })).toBe(condition);
+    expect(ownerConditionOf({})).toBeNull();
+    expect(ownerConditionOf({ onOwnerCondition: null })).toBeNull();
   });
 });

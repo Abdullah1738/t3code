@@ -16,7 +16,8 @@ import { useMissionForks } from "./missionsStore";
 // Presentation over `useMissionForks`; actions come from missionCommands.
 
 /**
- * Open forks of the master (Discuss threads and the owner's side questions).
+ * Open forks of the master: the owner's side questions, plus any Discuss fork
+ * started before Discuss moved to owner requests.
  * Fork threads are placeholders in the fixture, so there is no thread link yet.
  */
 export function MissionForksList(props: { missionId: MissionId | null; nowMs: number }) {

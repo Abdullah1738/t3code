@@ -460,12 +460,10 @@ describe("rpc missions source", () => {
 
     await source.reactToCall({ callId: "call-1" as never, reaction: "ok" });
     expect(asked(WS_METHODS.missionsStartFork)).toHaveLength(0);
+    // Discuss is an owner request about the call now, never a fork.
     await source.reactToCall({ callId: "call-1" as never, reaction: "discuss" });
-    expect(asked(WS_METHODS.missionsStartFork).at(-1)?.input).toEqual({
-      missionId: CRPKO,
-      kind: "discuss",
-      origin: { kind: "call", id: "call-1" },
-    });
+    expect(asked(WS_METHODS.missionsReactToCall)).toHaveLength(2);
+    expect(asked(WS_METHODS.missionsStartFork)).toHaveLength(0);
 
     const opened = await source.openFork({
       missionId: CRPKO,

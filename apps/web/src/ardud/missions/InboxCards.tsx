@@ -26,7 +26,7 @@ import {
   noteFlags,
   noteKicker,
   fyiView,
-  openForkFor,
+  ownerConditionOf,
   parseDiffLines,
   routeLine,
   SUGGESTION_AUTHOR_LABEL,
@@ -37,7 +37,6 @@ import {
   type InboxEntry,
   type InboxUiEvent,
   type InboxUiState,
-  type MissionForkEntry,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Textarea } from "../../components/ui/textarea";
@@ -54,6 +53,7 @@ import {
 } from "./cards/blocks";
 import { CardFrame, type CardAction, type CardFrameProps } from "./cards/CardFrame";
 import { APPROVER_NAME, PersonChip } from "./cards/chips";
+import { ConditionNote, useCardDiscussion, type CardDiscussion } from "./DiscussPanel";
 import { rerouteRecord } from "./operationCommands";
 import { inboxItemDomId, type InboxActions } from "./useInboxScreen";
 
@@ -98,6 +98,11 @@ function useBusy() {
   return [busy, run] as const;
 }
 
+/** The card's Discuss action, last in the footer (none outside a mission). */
+function withDiscuss(discussion: CardDiscussion): CardAction[] {
+  return discussion.action ? [discussion.action] : [];
+}
+
 /** A short reason field for Rewrite, Drop-with-reason and Move. */
 function ReasonField(props: {
   label: string;
@@ -125,14 +130,17 @@ export function AskCard(
     ask: Ask;
     picked: string | null;
     onPick: (optionId: string | null) => void;
-    forks: ReadonlyArray<MissionForkEntry>;
     masterRoleId: string | null;
     actions: InboxActions;
   },
 ) {
   const { ask } = props;
   const view = askView(ask, props.nowMs, props.masterRoleId);
-  const discussing = openForkFor(props.forks, { kind: "ask", id: ask.id });
+  const discussion = useCardDiscussion(
+    ask.missionId,
+    { kind: "ask", id: ask.id, label: ask.question },
+    props.nowMs,
+  );
   const [text, setText] = useState("");
   const [busy, run] = useBusy();
   const advisorName = view.askedBy === "master" ? "Master" : view.askedBy;
@@ -146,14 +154,7 @@ export function AskCard(
           if (sent) setText("");
         }),
     },
-    {
-      key: "discuss",
-      disabled: busy || discussing !== null,
-      onRun: () =>
-        void run(() => props.actions.discuss(ask, text)).then((sent) => {
-          if (sent) setText("");
-        }),
-    },
+    ...withDiscuss(discussion),
   ];
   return (
     <CardFrame
@@ -181,7 +182,6 @@ export function AskCard(
             label: "Blocks",
             value: ask.blocks.length > 0 ? <RefsBlock refs={ask.blocks} /> : null,
           },
-          { label: "Discussing", value: discussing ? "Open in a fork of the master" : null },
         ]}
       />
       <Textarea
@@ -191,6 +191,7 @@ export function AskCard(
         value={text}
         onChange={(event) => setText(event.target.value)}
       />
+      {discussion.panel}
     </CardFrame>
   );
 }
@@ -230,6 +231,11 @@ export function DraftCard(
   const [rewriteNote, setRewriteNote] = useState("");
   const [busy, run] = useBusy();
   const move = useMove(draft, "draft");
+  const discussion = useCardDiscussion(
+    draft.missionId,
+    { kind: "draft", id: draft.id, label: draftTitle(draft) },
+    props.nowMs,
+  );
   const notes = draftNotesFor(draft, props.notes);
   const edit = textEdit(draft.text, edited);
   const writerRole = draft.writtenBy?.roleId ?? draft.writerRoleId;
@@ -308,18 +314,7 @@ export function DraftCard(
             disabled: busy,
             onRun: () => move.setMoving(true),
           },
-          {
-            key: "discuss",
-            disabled: busy,
-            onRun: () =>
-              void run(() =>
-                props.actions.discussRecord(draft.missionId, {
-                  kind: "draft",
-                  id: draft.id,
-                  label: draftTitle(draft),
-                }),
-              ),
-          },
+          ...withDiscuss(discussion),
         ];
   return (
     <CardFrame
@@ -391,6 +386,7 @@ export function DraftCard(
           onChange={move.setReason}
         />
       ) : null}
+      {discussion.panel}
     </CardFrame>
   );
 }
@@ -405,6 +401,11 @@ export function ApprovalCard(
   const { approval } = props;
   const [busy, run] = useBusy();
   const move = useMove(approval, "approval");
+  const discussion = useCardDiscussion(
+    approval.missionId,
+    { kind: "approval", id: approval.id, label: approval.title },
+    props.nowMs,
+  );
   const decide = (action: "approve" | "reject") =>
     void run(() => props.actions.decideApproval(approval, action));
   const actions: CardAction[] = move.moving
@@ -427,18 +428,7 @@ export function ApprovalCard(
           disabled: busy,
           onRun: () => move.setMoving(true),
         },
-        {
-          key: "discuss",
-          disabled: busy,
-          onRun: () =>
-            void run(() =>
-              props.actions.discussRecord(approval.missionId, {
-                kind: "approval",
-                id: approval.id,
-                label: approval.title,
-              }),
-            ),
-        },
+        ...withDiscuss(discussion),
       ];
   return (
     <CardFrame
@@ -466,15 +456,20 @@ export function ApprovalCard(
           onChange={move.setReason}
         />
       ) : null}
+      {discussion.panel}
     </CardFrame>
   );
 }
 
-/** A decided approval in the history list (stale ones show why they closed). */
+/**
+ * A decided approval in the history list (stale ones show why they closed;
+ * ones the master decided on the owner's condition quote it).
+ */
 export function ClosedApprovalRow(props: { approval: Approval; nowMs: number }) {
   const { approval } = props;
+  const condition = ownerConditionOf(approval);
   return (
-    <li>
+    <li className="flex min-w-0 flex-col gap-2">
       <CardFrame
         kicker={APPROVAL_KICKER[approval.kind]}
         since={approval.decidedAt ?? approval.createdAt}
@@ -485,6 +480,7 @@ export function ClosedApprovalRow(props: { approval: Approval; nowMs: number }) 
           ...(approval.staleReason ? { detail: approval.staleReason } : {}),
         }}
       />
+      {condition ? <ConditionNote condition={condition} /> : null}
     </li>
   );
 }
@@ -503,6 +499,11 @@ export function KnockCard(
   const { knock } = props;
   const [edited, setEdited] = useState(knock.summary);
   const [busy, run] = useBusy();
+  const discussion = useCardDiscussion(
+    knock.missionId,
+    { kind: "knock", id: knock.id, label: knock.summary },
+    props.nowMs,
+  );
   const edit = textEdit(knock.summary, edited);
   const decide = (decision: Parameters<InboxActions["decideKnock"]>[1]) =>
     void run(() => props.actions.decideKnock(knock, decision));
@@ -517,6 +518,7 @@ export function KnockCard(
     },
     ...(props.editing ? [] : [{ key: "edit" as const, onRun: () => props.onEdit(true) }]),
     { key: "dismiss", disabled: busy, onRun: () => decide({ action: "drop" }) },
+    ...withDiscuss(discussion),
   ];
   return (
     <CardFrame
@@ -550,6 +552,7 @@ export function KnockCard(
           }}
         />
       ) : null}
+      {discussion.panel}
     </CardFrame>
   );
 }
@@ -570,6 +573,11 @@ export function SuggestionCard(
   const [edited, setEdited] = useState(() => suggestionAfterText(suggestion));
   const [reason, setReason] = useState("");
   const [busy, run] = useBusy();
+  const discussion = useCardDiscussion(
+    suggestion.missionId,
+    { kind: "suggestion", id: suggestion.id, label: suggestion.title },
+    props.nowMs,
+  );
   const record = props.stats === null ? null : suggestionTrackRecord(props.stats, suggestion);
   const decide = (decision: Parameters<InboxActions["decideSuggestion"]>[1]) =>
     void run(() => props.actions.decideSuggestion(suggestion, decision));
@@ -604,6 +612,7 @@ export function SuggestionCard(
             },
             { key: "edit", disabled: busy, onRun: () => setMode("edit") },
             { key: "dismiss-suggestion", disabled: busy, onRun: () => setMode("dismiss") },
+            ...withDiscuss(discussion),
           ];
   return (
     <CardFrame
@@ -648,6 +657,7 @@ export function SuggestionCard(
       {mode === "dismiss" ? (
         <ReasonField label="Why dismiss" placeholder="Reason" value={reason} onChange={setReason} />
       ) : null}
+      {discussion.panel}
     </CardFrame>
   );
 }
@@ -659,6 +669,11 @@ export function NoteCard(props: CardContext & { note: Note; actions: InboxAction
   const { note } = props;
   const view = fyiView(note);
   const [busy, run] = useBusy();
+  const discussion = useCardDiscussion(
+    note.missionId,
+    { kind: "note", id: note.id, label: note.summary },
+    props.nowMs,
+  );
   return (
     <CardFrame
       {...frame(props, `note:${note.id}`)}
@@ -673,6 +688,7 @@ export function NoteCard(props: CardContext & { note: Note; actions: InboxAction
           disabled: busy,
           onRun: () => void run(() => props.actions.ack(note)),
         },
+        ...withDiscuss(discussion),
       ]}
       approver={null}
     >
@@ -685,6 +701,7 @@ export function NoteCard(props: CardContext & { note: Note; actions: InboxAction
         />
       ) : null}
       <RefsBlock refs={note.evidenceLinks} />
+      {discussion.panel}
     </CardFrame>
   );
 }
@@ -694,7 +711,6 @@ export function NoteCard(props: CardContext & { note: Note; actions: InboxAction
 
 /** What every entry card reads besides its record. */
 export interface EntryCardDeps {
-  readonly forks: ReadonlyArray<MissionForkEntry>;
   readonly draftNotes: ReadonlyArray<DraftNote>;
   /** `null` while suggestion track records are sample data. */
   readonly stats: ReadonlyArray<SuggestionStats> | null;
@@ -740,7 +756,6 @@ export const InboxEntryCard = memo(function InboxEntryCard(props: {
           ask={entry.record}
           picked={props.picked}
           onPick={(optionId) => dispatch({ type: "pick", key: entry.key, optionId })}
-          forks={deps.forks}
           masterRoleId={deps.masterRoleId}
           actions={deps.actions}
         />

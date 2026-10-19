@@ -1,4 +1,4 @@
-import type { MissionId } from "@t3tools/contracts";
+import type { MissionId, MissionRecordRef, OwnerCondition } from "@t3tools/contracts";
 
 import type {
   OpenRequestInput,
@@ -36,6 +36,43 @@ export function openRequestInput(missionId: MissionId, text: string): Result<Ope
   const trimmed = text.trim();
   if (trimmed === "") return err("Write what you want first.");
   return ok({ missionId, text: trimmed });
+}
+
+/**
+ * Discuss on a record: the owner's words open a request about it, or add to
+ * the open one (the router keeps one open request per record).
+ */
+export function discussRequestInput(
+  missionId: MissionId,
+  subject: MissionRecordRef,
+  text: string,
+): Result<OpenRequestInput> {
+  const trimmed = text.trim();
+  if (trimmed === "") return err("Write what you want to discuss first.");
+  return ok({ missionId, text: trimmed, subject });
+}
+
+/** The open request about a record, if the owner is already discussing it. */
+export function requestAbout(
+  requests: ReadonlyArray<OwnerRequest>,
+  subject: Pick<MissionRecordRef, "kind" | "id">,
+): OwnerRequest | null {
+  return (
+    requests.find(
+      (request) =>
+        request.status !== "settled" &&
+        request.subject !== null &&
+        request.subject.kind === subject.kind &&
+        request.subject.id === subject.id,
+    ) ?? null
+  );
+}
+
+/** A record the master decided on a condition the owner stated in a Discuss request. */
+export function ownerConditionOf(record: {
+  readonly onOwnerCondition?: OwnerCondition | null | undefined;
+}): OwnerCondition | null {
+  return record.onOwnerCondition ?? null;
 }
 
 export function replyRequestInput(requestId: string, text: string): Result<ReplyRequestInput> {

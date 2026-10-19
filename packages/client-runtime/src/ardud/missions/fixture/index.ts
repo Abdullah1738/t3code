@@ -392,18 +392,12 @@ export function createFixtureMissionsSource(
       if (!mission) return null;
       const lastLooked = ownerLastLookedAt.get(missionId) ?? null;
       const isCrpko = missionId === data.missions[0]?.id;
-      // A call the owner is discussing stays in the check until its fork closes.
-      const discussing = new Set(
-        forks
-          .filter((entry) => entry.fork.status === "open" && entry.fork.kind === "discuss")
-          .map((entry) => originKey(entry.fork.origin)),
-      );
       const directionCheck = calls
         .filter(
           (c) =>
             c.missionId === missionId &&
-            ((c.ownerReaction === null && (lastLooked === null || c.createdAt > lastLooked)) ||
-              (c.ownerReaction === "discuss" && discussing.has(`call:${c.id}`))),
+            c.ownerReaction === null &&
+            (lastLooked === null || c.createdAt > lastLooked),
         )
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
         .map((c) => ({
@@ -847,14 +841,6 @@ export function createFixtureMissionsSource(
       const target = calls.find((c) => c.id === callId);
       if (!target) return fail("not-found", `Call ${callId} not found.`);
       replace(calls, { ...target, ownerReaction: reaction });
-      if (reaction === "discuss") {
-        openForkRecord({
-          missionId: target.missionId,
-          kind: "discuss",
-          origin: { kind: "call", id: target.id, label: target.title },
-          question: null,
-        });
-      }
       commit();
       return Promise.resolve();
     },

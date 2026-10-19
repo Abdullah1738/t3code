@@ -135,8 +135,8 @@ function PauseButton(props: { missionId: MissionId; title: string; paused: boole
 }
 
 /**
- * "Ask the mission" plus the open discussions (Discuss forks and side
- * questions), so every open fork is one tap from the head.
+ * "Ask the mission" plus the open side-question forks, so every open fork is
+ * one tap from the head. Discuss on a card is an owner request, not a fork.
  */
 function AskTheMission(props: { missionId: MissionId; title: string; nowMs: number }) {
   const forks = useMissionForks(props.missionId);

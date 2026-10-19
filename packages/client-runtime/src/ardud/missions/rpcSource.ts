@@ -1050,14 +1050,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       });
     },
     reactToCall: async (input) => {
-      const call = await transport.request(WS_METHODS.missionsReactToCall, input);
-      // The server records the reaction; the Discuss fork is a second call.
-      if (input.reaction !== "discuss") return;
-      await transport.request(WS_METHODS.missionsStartFork, {
-        missionId: call.missionId,
-        kind: "discuss",
-        origin: { kind: "call", id: call.id },
-      });
+      await transport.request(WS_METHODS.missionsReactToCall, input);
     },
     markMissionSeen: async (input) => {
       await transport.request(WS_METHODS.missionsMarkSeen, input);

@@ -6,13 +6,16 @@ import type { InboxTab, MissionId, MissionListItem, MissionListSnapshot } from "
 import {
   ageView,
   defaultInboxTab,
+  DRAFT_STATUS_LABEL,
   draftOwnerEdit,
+  draftTitle,
   entryRow,
   formatRelative,
   INBOX_ROUTE_FILTER_LABEL,
   INBOX_TAB_LABEL,
   INBOX_TABS,
   inboxTabCounts,
+  ownerConditionOf,
   splitForks,
   staleApprovals,
   totalNeedsYou,
@@ -45,6 +48,7 @@ import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { AgeElement, CountBadge, HealthGlyph, needsYouLabel } from "./cards/chips";
+import { ConditionNote } from "./DiscussPanel";
 import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
 import { MissionForksList } from "./MissionForksList";
@@ -314,7 +318,6 @@ function InboxBody(props: {
   const actions = useMemo(() => inboxActions(screen.dispatch), [screen.dispatch]);
   const deps = useMemo(
     () => ({
-      forks,
       draftNotes,
       stats,
       list: missionList,
@@ -323,7 +326,7 @@ function InboxBody(props: {
       actions,
       size: "pane" as const,
     }),
-    [forks, draftNotes, stats, missionList, masterRoleId, nowMs, actions],
+    [draftNotes, stats, missionList, masterRoleId, nowMs, actions],
   );
   const selected = screen.selected;
   const openForks = splitForks(forks).open.length;
@@ -546,11 +549,16 @@ function InboxExtras(props: {
   openForks: number;
 }) {
   if (props.tab === "decide") {
-    return props.openForks > 0 ? (
-      <MissionSection title="Open discussions">
-        <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
-      </MissionSection>
-    ) : null;
+    return (
+      <>
+        {props.openForks > 0 ? (
+          <MissionSection title="Open discussions">
+            <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
+          </MissionSection>
+        ) : null}
+        <AnsweredOnCondition missionId={props.missionId} />
+      </>
+    );
   }
   if (props.tab !== "approve") return null;
   return (
@@ -561,6 +569,26 @@ function InboxExtras(props: {
         <DraftNotesPanel missionId={props.missionId} />
       </MissionSection>
     </>
+  );
+}
+
+/** Asks the master answered on a condition the owner stated in a Discuss request. */
+function AnsweredOnCondition(props: { missionId: MissionId | null }) {
+  const history = useMissionInboxHistory(props.missionId);
+  const answered = (history?.asks ?? []).flatMap((ask) => {
+    const condition = ask.answer ? ownerConditionOf(ask.answer) : null;
+    return condition ? [{ ask, condition }] : [];
+  });
+  if (answered.length === 0) return null;
+  return (
+    <MissionSection title="Decided today">
+      {answered.map(({ ask, condition }) => (
+        <div key={ask.id} className="flex min-w-0 flex-col gap-1.5">
+          <p className="min-w-0 truncate text-sm font-medium">{ask.question}</p>
+          <ConditionNote condition={condition} />
+        </div>
+      ))}
+    </MissionSection>
   );
 }
 
@@ -575,7 +603,13 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
     ...staleApprovals(history),
     ...history.approvals.filter((approval) => approval.status !== "stale-closed"),
   ];
-  if (editedDrafts.length === 0 && closed.length === 0) return null;
+  const conditionDrafts = history.drafts.flatMap((draft) => {
+    const condition = ownerConditionOf(draft);
+    return condition ? [{ draft, condition }] : [];
+  });
+  if (editedDrafts.length === 0 && closed.length === 0 && conditionDrafts.length === 0) {
+    return null;
+  }
   return (
     <MissionSection title="Decided today">
       {editedDrafts.map(({ draft, edit }) => (
@@ -590,6 +624,17 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
             ) : null}
           </p>
           {edit ? <WordDiff segments={edit.segments} /> : null}
+        </div>
+      ))}
+      {conditionDrafts.map(({ draft, condition }) => (
+        <div key={`condition:${draft.id}`} className="flex min-w-0 flex-col gap-1.5">
+          <p className="flex min-w-0 items-center gap-1.5 text-sm">
+            <span className="min-w-0 truncate font-medium">{draftTitle(draft)}</span>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {DRAFT_STATUS_LABEL[draft.status]}
+            </span>
+          </p>
+          <ConditionNote condition={condition} />
         </div>
       ))}
       {closed.length > 0 ? (

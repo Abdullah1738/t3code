@@ -7,7 +7,6 @@ import type {
   InboxTab,
   Knock,
   MissionId,
-  MissionRecordRef,
   Note,
   Suggestion,
 } from "@t3tools/contracts";
@@ -16,7 +15,6 @@ import {
   decideDraftInput,
   decideKnockInput,
   decideSuggestionInput,
-  discussAskInput,
   groupEntriesByMission,
   inboxEntries,
   inboxKeyAction,
@@ -127,17 +125,6 @@ export function inboxActions(dispatch: (event: InboxUiEvent) => void) {
         (input) => missionsSource.answerAsk(input),
         "Couldn't send the answer",
       ).then(done(`ask:${ask.id}`)),
-    discuss: (ask: Ask, text: string) =>
-      runMissionAction(
-        missionsSource.openFork(discussAskInput(ask, text)),
-        "Couldn't open the discussion",
-      ),
-    /** Discuss on any other card: a fork of the master about that record. */
-    discussRecord: (missionId: MissionId, origin: MissionRecordRef) =>
-      runMissionAction(
-        missionsSource.openFork({ missionId, kind: "discuss", origin }),
-        "Couldn't open the discussion",
-      ),
     decideDraft: (draft: Draft, decision: DraftDecision) =>
       submitMissionInput(
         decideDraftInput(draft, decision),

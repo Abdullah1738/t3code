@@ -166,7 +166,7 @@ function RequestComposer(props: { missionId: MissionId; onOpened: (id: string) =
   );
 }
 
-const STATUS_GLYPH = {
+export const STATUS_GLYPH = {
   waiting: "wait",
   answered: "ok",
   settled: "done",
@@ -282,6 +282,11 @@ export function RequestThread(props: {
           {REQUEST_STATUS_LABEL[request.status]}
         </span>
       </div>
+      {request.subject ? (
+        <div aria-label="About" className="flex min-w-0">
+          <RefChip record={request.subject} />
+        </div>
+      ) : null}
       <ol aria-label="Conversation" className="flex min-w-0 flex-col gap-3">
         {request.messages.map((message) => (
           <RequestMessage key={message.id} message={message} nowMs={props.nowMs} />
@@ -337,7 +342,12 @@ export function RequestThread(props: {
   );
 }
 
-function RequestMessage(props: { message: OwnerRequestMessage; nowMs: number }) {
+/** One message of a request; `compact` clamps it to three lines on a card. */
+export function RequestMessage(props: {
+  message: OwnerRequestMessage;
+  nowMs: number;
+  compact?: boolean;
+}) {
   const { message } = props;
   const age = ageView(message.at, props.nowMs);
   const owner = message.author === "owner";
@@ -351,7 +361,14 @@ function RequestMessage(props: { message: OwnerRequestMessage; nowMs: number }) 
           </span>
         ) : null}
       </div>
-      <p className="text-sm leading-5.5 text-pretty whitespace-pre-line">{message.text}</p>
+      <p
+        className={cn(
+          "text-sm leading-5.5 text-pretty whitespace-pre-line",
+          props.compact && "line-clamp-3",
+        )}
+      >
+        {message.text}
+      </p>
       {message.refs.length > 0 ? (
         <div className="flex min-w-0 flex-wrap gap-1.5">
           {message.refs.map((link) => (

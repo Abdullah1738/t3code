@@ -194,7 +194,13 @@ export function CardFrame(props: CardFrameProps) {
                   {action.label ?? CARD_ACTION_LABEL[action.key]}
                 </Button>
               ))}
-              {discuss ? <DiscussButton onRun={discuss.onRun} disabled={discuss.disabled} /> : null}
+              {discuss ? (
+                <DiscussButton
+                  onRun={discuss.onRun}
+                  disabled={discuss.disabled}
+                  label={discuss.label}
+                />
+              ) : null}
               {props.approver ? (
                 <span className="ms-auto">
                   <ApproverChip approver={props.approver} />
@@ -208,11 +214,16 @@ export function CardFrame(props: CardFrameProps) {
   );
 }
 
-function DiscussButton(props: { onRun: () => void; disabled?: boolean | undefined }) {
+function DiscussButton(props: {
+  onRun: () => void;
+  disabled?: boolean | undefined;
+  /** "Discussing" while a request about the record is open. */
+  label?: string | undefined;
+}) {
   return (
     <Button size="sm" variant="ghost-muted" disabled={props.disabled} onClick={props.onRun}>
       <MessagesSquareIcon aria-hidden />
-      Discuss
+      {props.label ?? CARD_ACTION_LABEL.discuss}
     </Button>
   );
 }

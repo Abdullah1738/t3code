@@ -143,9 +143,16 @@ const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | nul
   return missionsSource.subscribeRequest({ missionId, requestId }, emit);
 });
 
-/** What the owner asked or told the master, newest activity first. */
-export function useOwnerRequests(missionId: MissionId): ReadonlyArray<OwnerRequest> | undefined {
-  const store = requestStores(missionId);
+const NO_REQUESTS = { get: () => undefined, subscribe: () => () => {} };
+
+/**
+ * What the owner asked or told the master, newest activity first. A record
+ * outside any mission (a global suggestion) has no requests.
+ */
+export function useOwnerRequests(
+  missionId: MissionId | null,
+): ReadonlyArray<OwnerRequest> | undefined {
+  const store = missionId === null ? NO_REQUESTS : requestStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
 }
 

@@ -587,7 +587,7 @@ export interface MissionsSource {
   setMissionPaused(input: SetMissionPausedInput): Promise<void>;
   setMissionFocus(input: SetMissionFocusInput): Promise<void>;
   setIntendedEffort(input: SetIntendedEffortInput): Promise<void>;
-  /** "discuss" also opens a Discuss fork on the call. */
+  /** Records the owner's reaction only; Discuss opens an owner request about the call instead. */
   reactToCall(input: ReactToCallInput): Promise<void>;
   /** Moves the "since you last looked" mark to now. */
   markMissionSeen(input: MarkMissionSeenInput): Promise<void>;

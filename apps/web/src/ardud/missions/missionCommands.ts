@@ -10,6 +10,7 @@ import {
   addDraftNoteInput,
   askSectionChangeText,
   askTheMissionInput,
+  discussRequestInput,
   discussSectionText,
   openRequestInput,
   parseShareInput,
@@ -62,19 +63,25 @@ export function reorderSubMissions(missionId: MissionId, order: ReadonlyArray<Su
   );
 }
 
-/** "Fine" accepts the call; "Discuss" also opens a Discuss fork of the master. */
-export function reactToCall(callId: string, reaction: "ok" | "discuss") {
+/** "Fine" accepts the call. Discuss is a request about the call (`discussRecord`). */
+export function reactToCall(callId: string, reaction: "ok") {
   return runMissionAction(
     missionsSource.reactToCall({ callId: callId as CallId, reaction }),
     "Could not record your reaction",
   );
 }
 
-/** Discuss on a record that is not a call: a Discuss fork about that record. */
-export function discussRecord(missionId: MissionId, ref: MissionRecordRef) {
-  return runMissionAction(
-    missionsSource.openFork({ missionId, kind: "discuss", origin: ref }),
-    "Couldn't open the discussion",
+/**
+ * Discuss on any Needs-you card: the owner's words open a request about the
+ * record, or add to the one already open about it. The record keeps waiting.
+ */
+export function discussRecord(missionId: MissionId, subject: MissionRecordRef, text: string) {
+  return submitMissionInput(
+    discussRequestInput(missionId, subject, text),
+    async (input) => {
+      await missionsSource.openRequest(input);
+    },
+    "Couldn't send it to the master",
   );
 }
 

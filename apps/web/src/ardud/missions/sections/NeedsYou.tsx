@@ -24,7 +24,7 @@ import { CardList, CardListItem } from "../cards/CardFrame";
 import { AgeElement, ByMarker, YouGlyph } from "../cards/chips";
 import { entryCardState, InboxEntryCard, type EntryCardDeps } from "../InboxCards";
 import { changeSection } from "../missionCommands";
-import { useDraftNotes, useMasterRoleId, useMissionForks, useMissionList } from "../missionsStore";
+import { useDraftNotes, useMasterRoleId, useMissionList } from "../missionsStore";
 import { inboxActions } from "../useInboxScreen";
 import { FoldButton, SectionCount, SectionShell } from "./SectionShell";
 
@@ -35,7 +35,6 @@ const FIRST_CARDS = 3;
 function useEntryCards(missionId: MissionId, nowMs: number) {
   const [ui, dispatch] = useReducer(inboxUiReducer, INITIAL_INBOX_UI);
   const deps: EntryCardDeps = {
-    forks: useMissionForks(missionId) ?? [],
     draftNotes: useDraftNotes(missionId) ?? [],
     stats: null,
     list: useMissionList(),

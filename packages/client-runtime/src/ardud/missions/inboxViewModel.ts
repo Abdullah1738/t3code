@@ -290,7 +290,7 @@ export function answerAskInput(
 }
 
 // ---------------------------------------------------------------------------
-// Forks (Discuss first, Ask the mission)
+// Forks (side questions). Discuss on a record is an owner request, not a fork.
 
 export const FORK_KIND_LABEL: Record<MissionForkEntry["fork"]["kind"], string> = {
   discuss: "Discuss",
@@ -298,7 +298,7 @@ export const FORK_KIND_LABEL: Record<MissionForkEntry["fork"]["kind"], string> =
   "owner-question": "Your question",
 };
 
-/** The open fork about one record (a call, an ask), if the owner already started one. */
+/** The open fork about one record, if one was started before Discuss moved to requests. */
 export function openForkFor(
   forks: ReadonlyArray<MissionForkEntry>,
   ref: Pick<MissionRecordRef, "kind" | "id">,
@@ -313,23 +313,6 @@ export function openForkFor(
         entry.fork.origin.id === ref.id,
     ) ?? null
   );
-}
-
-/**
- * "Discuss first" on an ask: a fork of the master about that ask instead of
- * an answer. The ask stays open; whatever the owner types opens the fork.
- */
-export function discussAskInput(
-  ask: Pick<Ask, "id" | "missionId" | "question">,
-  note: string,
-): OpenForkInput {
-  const question = note.trim();
-  return {
-    missionId: ask.missionId,
-    kind: "discuss",
-    origin: { kind: "ask", id: ask.id, label: ask.question },
-    ...(question === "" ? {} : { question }),
-  };
 }
 
 /** "Ask the mission": an owner side question answered by a fork of the master. */

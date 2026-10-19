@@ -16,7 +16,6 @@ import {
   formatDayLabel,
   formatRelative,
   isDraftFeedItem,
-  openForkFor,
   orderBlockerGroups,
   ownerWaitingEntries,
   recoveryBanner,
@@ -37,13 +36,9 @@ import { Button } from "../../components/ui/button";
 import { Skeleton } from "../../components/ui/skeleton";
 import { cn } from "../../lib/utils";
 import { AgeElement, ByMarker, PersonChip, RefChip, StateGlyph } from "./cards/chips";
-import { discussRecord, markMissionSeen, reactToCall } from "./missionCommands";
-import {
-  useMissionForks,
-  useMissionInbox,
-  useMissionViews,
-  useOwnerRequests,
-} from "./missionsStore";
+import { useCardDiscussion } from "./DiscussPanel";
+import { markMissionSeen, reactToCall } from "./missionCommands";
+import { useMissionInbox, useMissionViews, useOwnerRequests } from "./missionsStore";
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { PriorityStack } from "./PriorityStack";
 import { NeedsYouSection, PinnedStrip, WithTheMasterSection } from "./sections/NeedsYou";
@@ -318,7 +313,6 @@ const FIRST_FEED_ROWS = 6;
 
 function SinceLastLookedSection(props: SectionProps & { overview: MissionOverviewSnapshot }) {
   const { overview, nowMs } = props;
-  const forks = useMissionForks(overview.mission.id) ?? [];
   const sections = useMemo(
     () => splitFeed(overview.feed, overview.ownerLastLookedAt),
     [overview.feed, overview.ownerLastLookedAt],
@@ -363,7 +357,6 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
               key={refKey(item.ref)}
               item={item}
               missionId={overview.mission.id}
-              discussing={openForkFor(forks, item.ref) !== null}
               nowMs={nowMs}
             />
           ))}
@@ -386,24 +379,17 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
   );
 }
 
-function CallRow(props: {
-  item: DirectionCheckItem;
-  missionId: MissionId;
-  discussing: boolean;
-  nowMs: number;
-}) {
+function CallRow(props: { item: DirectionCheckItem; missionId: MissionId; nowMs: number }) {
   const { item } = props;
   const [busy, setBusy] = useState(false);
   const age = ageView(item.at, props.nowMs);
-  // Only calls take a reaction; structural changes (lanes, roles, rules) are
-  // cleared by Mark seen and discussed through a fork about the record.
+  // Only calls take "Fine"; structural changes (lanes, roles, rules) are
+  // cleared by Mark seen. Discuss is a request about the record either way.
   const isCall = item.ref.kind === "call";
-  const react = (reaction: "ok" | "discuss") => {
+  const discussion = useCardDiscussion(props.missionId, item.ref, props.nowMs);
+  const accept = () => {
     setBusy(true);
-    const done = isCall
-      ? reactToCall(item.ref.id, reaction)
-      : discussRecord(props.missionId, item.ref);
-    void done.then(() => setBusy(false));
+    void reactToCall(item.ref.id, "ok").then(() => setBusy(false));
   };
   return (
     <li className="grid min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2.5 gap-y-1 border-t border-border/60 py-2.5 first:border-t-0 first:pt-0">
@@ -417,21 +403,19 @@ function CallRow(props: {
       {age ? <AgeElement age={age} at={item.at} /> : null}
       <div className="col-start-2 col-end-4 flex items-center gap-1.5">
         {isCall ? (
-          <Button variant="ghost-muted" size="sm" disabled={busy} onClick={() => react("ok")}>
+          <Button variant="ghost-muted" size="sm" disabled={busy} onClick={accept}>
             <CheckIcon aria-hidden />
             Fine
           </Button>
         ) : null}
-        <Button
-          variant="ghost-muted"
-          size="sm"
-          disabled={busy || props.discussing}
-          onClick={() => react("discuss")}
-        >
-          <MessagesSquareIcon aria-hidden />
-          {props.discussing ? "Discussing" : "Discuss"}
-        </Button>
+        {discussion.action ? (
+          <Button variant="ghost-muted" size="sm" onClick={discussion.action.onRun}>
+            <MessagesSquareIcon aria-hidden />
+            {discussion.action.label}
+          </Button>
+        ) : null}
       </div>
+      {discussion.panel ? <div className="col-start-2 col-end-4">{discussion.panel}</div> : null}
     </li>
   );
 }
