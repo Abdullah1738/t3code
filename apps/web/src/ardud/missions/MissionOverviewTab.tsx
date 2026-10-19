@@ -31,7 +31,7 @@ import { Button } from "../../components/ui/button";
 import { Skeleton } from "../../components/ui/skeleton";
 import { cn } from "../../lib/utils";
 import { AgeElement, ByMarker, PersonChip, RefChip, StateGlyph } from "./cards/chips";
-import { markMissionSeen, reactToCall } from "./missionCommands";
+import { discussRecord, markMissionSeen, reactToCall } from "./missionCommands";
 import {
   isSampleFeed,
   useMissionForks,
@@ -325,7 +325,7 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
         ) : null
       }
       aside={
-        sections.fresh.length > 0 ? (
+        sections.fresh.length > 0 || calls.length > 0 ? (
           <Button
             size="xs"
             variant="ghost-muted"
@@ -342,6 +342,7 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
             <CallRow
               key={refKey(item.ref)}
               item={item}
+              missionId={overview.mission.id}
               discussing={openForkFor(forks, item.ref) !== null}
               nowMs={nowMs}
             />
@@ -365,13 +366,24 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
   );
 }
 
-function CallRow(props: { item: DirectionCheckItem; discussing: boolean; nowMs: number }) {
+function CallRow(props: {
+  item: DirectionCheckItem;
+  missionId: MissionId;
+  discussing: boolean;
+  nowMs: number;
+}) {
   const { item } = props;
   const [busy, setBusy] = useState(false);
   const age = ageView(item.at, props.nowMs);
+  // Only calls take a reaction; structural changes (lanes, roles, rules) are
+  // cleared by Mark seen and discussed through a fork about the record.
+  const isCall = item.ref.kind === "call";
   const react = (reaction: "ok" | "discuss") => {
     setBusy(true);
-    void reactToCall(item.ref.id, reaction).then(() => setBusy(false));
+    const done = isCall
+      ? reactToCall(item.ref.id, reaction)
+      : discussRecord(props.missionId, item.ref);
+    void done.then(() => setBusy(false));
   };
   return (
     <li className="grid min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2.5 gap-y-1 border-t border-border/60 py-2.5 first:border-t-0 first:pt-0">
@@ -384,10 +396,12 @@ function CallRow(props: { item: DirectionCheckItem; discussing: boolean; nowMs: 
       </div>
       {age ? <AgeElement age={age} at={item.at} /> : null}
       <div className="col-start-2 col-end-4 flex items-center gap-1.5">
-        <Button variant="ghost-muted" size="sm" disabled={busy} onClick={() => react("ok")}>
-          <CheckIcon aria-hidden />
-          Fine
-        </Button>
+        {isCall ? (
+          <Button variant="ghost-muted" size="sm" disabled={busy} onClick={() => react("ok")}>
+            <CheckIcon aria-hidden />
+            Fine
+          </Button>
+        ) : null}
         <Button
           variant="ghost-muted"
           size="sm"

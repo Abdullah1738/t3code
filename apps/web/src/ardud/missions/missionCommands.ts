@@ -1,4 +1,11 @@
-import type { CallId, DraftNoteId, ForkId, MissionId, SubMissionId } from "@t3tools/contracts";
+import type {
+  CallId,
+  DraftNoteId,
+  ForkId,
+  MissionId,
+  MissionRecordRef,
+  SubMissionId,
+} from "@t3tools/contracts";
 import {
   addDraftNoteInput,
   askSectionChangeInput,
@@ -59,6 +66,14 @@ export function reactToCall(callId: string, reaction: "ok" | "discuss") {
   return runMissionAction(
     missionsSource.reactToCall({ callId: callId as CallId, reaction }),
     "Could not record your reaction",
+  );
+}
+
+/** Discuss on a record that is not a call: a Discuss fork about that record. */
+export function discussRecord(missionId: MissionId, ref: MissionRecordRef) {
+  return runMissionAction(
+    missionsSource.openFork({ missionId, kind: "discuss", origin: ref }),
+    "Couldn't open the discussion",
   );
 }
 
