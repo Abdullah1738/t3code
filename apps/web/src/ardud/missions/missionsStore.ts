@@ -21,8 +21,8 @@ import {
   type ApprovalRoutingTable,
   type MissionForkEntry,
   type MissionInboxSnapshot,
-  type MissionLayout,
   type MissionOverviewSnapshot,
+  type MissionViewsState,
   type OwnerRequest,
   type MissionPoolsSnapshot,
   type MissionReviewSnapshot,
@@ -125,16 +125,16 @@ const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Missio
 const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit) =>
   missionsSource.subscribeRoom(id, emit),
 );
-const layoutStores = createKeyedSnapshotStores<MissionId, MissionLayout>((id, emit) =>
-  missionsSource.subscribeLayout(id, emit),
+const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>((id, emit) =>
+  missionsSource.subscribeViews(id, emit),
 );
 const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
   (id, emit) => missionsSource.subscribeRequests(id, emit),
 );
 
-/** The mission's overview sections, in order, with what was hidden or removed. */
-export function useMissionLayout(missionId: MissionId): MissionLayout | undefined {
-  const store = layoutStores(missionId);
+/** The mission's views record (its layout of sections and tabs) and its change log. */
+export function useMissionViews(missionId: MissionId): MissionViewsState | null | undefined {
+  const store = viewStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
 }
 

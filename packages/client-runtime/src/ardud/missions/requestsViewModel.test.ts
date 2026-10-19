@@ -89,17 +89,4 @@ describe("owner requests", () => {
     const fresh = await source.openRequest({ missionId: CRPKO, text: "Back again", subject });
     expect(fresh.id).not.toBe(first.id);
   });
-
-  it("logs section changes in the fixture layout", async () => {
-    const source = createFixtureMissionsSource({ now });
-    const seen: string[][] = [];
-    source.subscribeLayout(CRPKO, (layout) => {
-      seen.push(layout.changes.map((c) => c.summary));
-    });
-    await source.changeSection({ missionId: CRPKO, key: "needs-you", change: { type: "hide" } });
-    await expect(
-      source.changeSection({ missionId: CRPKO, key: "needs-you", change: { type: "remove" } }),
-    ).rejects.toMatchObject({ code: "invalid" });
-    expect(seen.at(-1)?.[0]).toMatch(/^Hid Needs you; \d+ waiting items? pinned under the head$/);
-  });
 });

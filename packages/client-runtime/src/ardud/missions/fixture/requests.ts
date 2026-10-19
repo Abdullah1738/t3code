@@ -1,15 +1,13 @@
 import { MissionId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-import { requestTitle } from "../requestsViewModel.ts";
-import { applySectionChange, defaultLayout, type MissionLayout } from "../sections.ts";
+import { isRequestUnread, requestTitle } from "../requestsViewModel.ts";
 import type { Listener, MissionsSource, OwnerRequest, Unsubscribe } from "../source.ts";
 import { AT, CRPKO } from "./data.ts";
 import { fail } from "./util.ts";
 
-// Sample owner requests and per-mission section lists. Both are UI-side until
-// the router track ships owner requests and the views track ships the layout
-// record; the RPC source serves them from here and marks them sample.
+// Sample owner requests for the fixture source, shaped like the router's
+// owner-request records once mapped for the UI.
 
 const decodeMissionId = Schema.decodeUnknownSync(MissionId);
 
@@ -143,14 +141,10 @@ export interface RequestsContext {
   readonly watch: <T>(read: () => T, listener: Listener<T>) => Unsubscribe;
   readonly nowIso: () => string;
   readonly localId: (prefix: string) => string;
-  /** Items waiting on the owner, for the hide summary of Needs you. */
-  readonly ownerWaiting: (missionId: string) => number;
 }
 
 export type RequestsSource = Pick<
   MissionsSource,
-  | "subscribeLayout"
-  | "changeSection"
   | "subscribeRequests"
   | "subscribeRequest"
   | "openRequest"
@@ -160,18 +154,12 @@ export type RequestsSource = Pick<
   | "markRequestRead"
 >;
 
-export function createRequests(ctx: RequestsContext): RequestsSource {
+export function createRequests(ctx: RequestsContext): RequestsSource & {
+  /** Answered requests the owner has not read, for the views pin. */
+  readonly unreadFor: (missionId: string) => number;
+} {
   const { memo, commit, watch, nowIso, localId } = ctx;
   let requests = seedRequests();
-  const layouts = new Map<string, MissionLayout>();
-
-  const layoutOf = (missionId: MissionId): MissionLayout => {
-    const known = layouts.get(missionId);
-    if (known) return known;
-    const fresh = defaultLayout(missionId);
-    layouts.set(missionId, fresh);
-    return fresh;
-  };
 
   const missionRequests = (missionId: string) =>
     memo(`requests:${missionId}`, () =>
@@ -194,23 +182,8 @@ export function createRequests(ctx: RequestsContext): RequestsSource {
   }
 
   return {
-    subscribeLayout: (missionId, listener) => watch(() => layoutOf(missionId), listener),
-
-    changeSection({ missionId, key, change }) {
-      const before = layoutOf(missionId);
-      const result = applySectionChange(before, key, change, {
-        id: localId("layout-change"),
-        at: nowIso(),
-        by: "owner",
-        ownerWaiting: ctx.ownerWaiting(missionId),
-      });
-      if (!result.ok) return fail("invalid", result.error);
-      if (result.value !== before) {
-        layouts.set(missionId, result.value);
-        commit();
-      }
-      return Promise.resolve();
-    },
+    unreadFor: (missionId) =>
+      missionRequests(missionId).filter((request) => isRequestUnread(request)).length,
 
     subscribeRequests: (missionId, listener) => watch(() => missionRequests(missionId), listener),
 

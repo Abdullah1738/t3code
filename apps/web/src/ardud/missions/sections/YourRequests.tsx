@@ -9,10 +9,11 @@ import {
   isRequestUnread,
   REQUEST_STATUS_LABEL,
   requestPreview,
-  type MissionLayout,
+  type MissionViewsState,
   type OwnerRequest,
   type OwnerRequestMessage,
-  type SectionEntry,
+  type ResolvedViewLayout,
+  type ViewSectionEntry,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../../components/ui/button";
@@ -41,8 +42,9 @@ import { SectionCount, SectionShell } from "./SectionShell";
 
 export function YourRequestsSection(props: {
   missionId: MissionId;
-  layout: MissionLayout;
-  section: SectionEntry;
+  views: MissionViewsState;
+  layout: ResolvedViewLayout;
+  section: ViewSectionEntry;
   requests: ReadonlyArray<OwnerRequest> | undefined;
   /** The open request, from the URL's `request` param. */
   openId: string | null;
@@ -58,6 +60,7 @@ export function YourRequestsSection(props: {
   return (
     <SectionShell
       missionId={props.missionId}
+      views={props.views}
       layout={props.layout}
       section={props.section}
       meta={<SectionCount count={unread} tone="update" label={`${unread} answered, unread`} />}

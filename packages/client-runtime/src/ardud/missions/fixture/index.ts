@@ -50,6 +50,7 @@ import { createEventLog } from "./eventLog.ts";
 import { createOperations } from "./operations.ts";
 import * as ops from "./opsData.ts";
 import { createRequests } from "./requests.ts";
+import { createViews } from "./views.ts";
 import { RerouteSeed, RoutingTableSeed } from "./schemas.ts";
 import { clampSummary, fail, newestFirst, replace } from "./util.ts";
 
@@ -724,13 +725,15 @@ export function createFixtureMissionsSource(
     postNudge,
   });
 
-  const requests = createRequests({
+  const { unreadFor, ...requests } = createRequests({ memo, commit, watch, nowIso, localId });
+  const views = createViews({
     memo,
     commit,
     watch,
     nowIso,
     localId,
     ownerWaiting: (missionId) => needsYou(missionId, null),
+    requestsUnread: unreadFor,
   });
 
   function findMission(missionId: string) {
@@ -755,6 +758,7 @@ export function createFixtureMissionsSource(
     subscribeRouting: (missionId, listener) => watch(() => routingTable(missionId), listener),
     ...operations.source,
     ...requests,
+    ...views,
 
     loadRoomPage({ roomId, beforeSeq, limit }) {
       const room = rooms.find((r) => r.id === roomId);

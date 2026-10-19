@@ -1,6 +1,8 @@
 import {
   MISSIONS_ASKS_WS_METHODS as ASKS,
   MISSIONS_POLICY_WS_METHODS as POLICY,
+  MISSIONS_VIEWS_WS_METHODS as VIEWS,
+  DEFAULT_STARTER_LAYOUT,
   MissionError,
   WS_METHODS,
   type Lane,
@@ -15,7 +17,13 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import { createRpcMissionsSource, poolUsageOf, type MissionsTransport } from "./rpcSource.ts";
-import type { MissionOverviewSnapshot, MissionRoomEntry, OwnerRequest } from "./source.ts";
+import type {
+  MissionOverviewSnapshot,
+  MissionRoomEntry,
+  MissionViewsState,
+  OwnerRequest,
+} from "./source.ts";
+import { viewSectionRequest } from "./views/layout.ts";
 
 const CRPKO = "crpko-engineering" as MissionId;
 const LIVE = "live-only-mission" as MissionId;
@@ -143,7 +151,6 @@ describe("rpc missions source", () => {
     expect([...source.sampled].sort()).toEqual([
       "portfolio",
       "recovery",
-      "sections",
       "suggestion-stats",
       "timeline",
       "work",
@@ -502,6 +509,89 @@ describe("rpc missions source", () => {
     ).rejects.toMatchObject({
       code: "invalid",
     });
+  });
+
+  it("reads the views record live, logs view events and sends section changes", async () => {
+    const { transport, live, asked } = fakeTransport({
+      [VIEWS.editLayout]: () => ({ ok: true }),
+    });
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const views = collect<MissionViewsState | null>((listener) =>
+      source.subscribeViews(CRPKO, listener),
+    );
+    const snapshot = {
+      missionId: CRPKO,
+      catalogVersion: 1,
+      revision: 3,
+      templates: [],
+      sections: [],
+      layout: {
+        missionId: CRPKO,
+        layout: DEFAULT_STARTER_LAYOUT.layout,
+        version: 4,
+        changedBy: { _tag: "owner" },
+        by: "owner",
+        changedAt: "2026-10-18T09:00:00.000Z",
+        changeNote: null,
+        seededFrom: 1,
+      },
+      starter: DEFAULT_STARTER_LAYOUT,
+      ownerWaiting: 2,
+      requestsUnread: 0,
+      pinnedStrip: false,
+      pinned: { needsYou: false, requests: false },
+      changesToday: 0,
+    };
+    live(VIEWS.subscribe)[0]?.push({ _tag: "snapshot", snapshot });
+    live(WS_METHODS.missionsSubscribe)[0]?.push({
+      _tag: "upsert",
+      record: {
+        _tag: "event",
+        record: {
+          ...event("view.layout-changed", { kind: "view-layout", id: CRPKO }),
+          summary: "The owner hid With the master",
+        },
+      },
+    });
+    live(VIEWS.subscribe)[0]?.push({
+      _tag: "waiting",
+      missionId: CRPKO,
+      ownerWaiting: 5,
+      requestsUnread: 1,
+      pinnedStrip: false,
+      pinned: { needsYou: false, requests: false },
+    });
+    const state = views.last();
+    expect(state?.snapshot.layout.version).toBe(4);
+    expect(state?.snapshot.ownerWaiting).toBe(5);
+    expect(state?.changes.map((change) => [change.by, change.summary])).toEqual([
+      ["owner", "The owner hid With the master"],
+    ]);
+
+    const request = viewSectionRequest(state!.snapshot, "with-the-master", { type: "hide" });
+    await source.changeView(request!);
+    expect(asked(VIEWS.editLayout)[0]?.input).toEqual({
+      missionId: CRPKO,
+      ops: [{ _tag: "hide", key: "with-the-master" }],
+      expectedVersion: 4,
+    });
+  });
+
+  it("shows the starter layout when the server has no views track", () => {
+    const { transport, live } = fakeTransport();
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const views = collect<MissionViewsState | null>((listener) =>
+      source.subscribeViews(LIVE, listener),
+    );
+    live(VIEWS.subscribe)[0]?.fail(new Error("unknown method"));
+    expect(views.last()?.snapshot.layout.layout).toBe(DEFAULT_STARTER_LAYOUT.layout);
+    const gone = collect<MissionViewsState | null>((listener) =>
+      source.subscribeViews("gone" as MissionId, listener),
+    );
+    live(VIEWS.subscribe)
+      .find((stream) => (stream.input as { missionId: string }).missionId === "gone")
+      ?.fail(new MissionError({ code: "not-found", detail: "gone" }));
+    expect(gone.seen).toEqual([null]);
   });
 
   it("keeps master counts at zero and has no all-missions fork list", () => {

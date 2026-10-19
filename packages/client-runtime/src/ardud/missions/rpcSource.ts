@@ -1,7 +1,11 @@
 import {
   MISSIONS_ASKS_WS_METHODS as ASKS,
   MISSIONS_POLICY_WS_METHODS as POLICY,
+  MISSIONS_VIEWS_WS_METHODS as VIEWS,
+  DEFAULT_STARTER_LAYOUT,
   MissionError,
+  VIEW_CATALOG_VERSION,
+  viewPinnedStrip,
   WS_METHODS,
   type ApprovalId,
   type DraftId,
@@ -16,6 +20,7 @@ import {
   type MissionRecord,
   type MissionRecordKind,
   type MissionRecordRef,
+  type MissionViewsSnapshot,
   type OwnerRequest as OwnerRequestRecord,
   type OwnerRequestId,
   type OwnerRequestView,
@@ -41,6 +46,8 @@ import type {
   MissionInboxSnapshot,
   MissionPoolUsage,
   MissionRoomEntry,
+  MissionViewChange,
+  MissionViewsState,
   MissionsSource,
   OwnerRequest,
   OwnerRequestStatus,
@@ -64,7 +71,8 @@ export type MissionsStreamTag =
   | typeof ASKS.subscribeRules
   | typeof ASKS.subscribeForks
   | typeof ASKS.subscribeDraftNotes
-  | typeof ASKS.subscribeRouting;
+  | typeof ASKS.subscribeRouting
+  | typeof VIEWS.subscribe;
 
 export type MissionsRequestTag = Exclude<EnvironmentUnaryRpcTag, MissionsStreamTag>;
 
@@ -110,7 +118,6 @@ export const RPC_SAMPLED_FEEDS: ReadonlySet<SampledFeed> = new Set<SampledFeed>(
   "portfolio",
   "suggestion-stats",
   "recovery",
-  "sections",
 ]);
 
 /** Newest events kept per mission feed, for change attribution and refresh triggers. */
@@ -390,6 +397,47 @@ interface MissionFeedState {
 interface RuleRecords {
   readonly rules: ReadonlyArray<Rule>;
   readonly changeRequests: ReadonlyArray<RuleChangeRequest>;
+}
+
+/** The views record a server without the views track would hold: the starter layout. */
+function starterViews(missionId: MissionId): MissionViewsSnapshot {
+  const waiting = { ownerWaiting: 0, requestsUnread: 0 };
+  const pinned = viewPinnedStrip(DEFAULT_STARTER_LAYOUT.layout, waiting);
+  return {
+    missionId,
+    catalogVersion: VIEW_CATALOG_VERSION,
+    revision: 0,
+    templates: [],
+    sections: [],
+    layout: {
+      missionId,
+      layout: DEFAULT_STARTER_LAYOUT.layout,
+      version: DEFAULT_STARTER_LAYOUT.version,
+      changedBy: DEFAULT_STARTER_LAYOUT.changedBy,
+      by: DEFAULT_STARTER_LAYOUT.by,
+      changedAt: DEFAULT_STARTER_LAYOUT.changedAt,
+      changeNote: null,
+      seededFrom: DEFAULT_STARTER_LAYOUT.version,
+    },
+    starter: DEFAULT_STARTER_LAYOUT,
+    ...waiting,
+    pinnedStrip: pinned.needsYou || pinned.requests,
+    pinned,
+    changesToday: 0,
+  };
+}
+
+/** The layout change log from the mission's `view.*` events, newest first. */
+export function viewChangesOf(events: ReadonlyArray<MissionEvent>): MissionViewChange[] {
+  const changes = events
+    .filter((event) => event.kind.startsWith("view."))
+    .map((event) => ({
+      id: event.id,
+      at: event.at,
+      by: event.actor._tag === "owner" ? ("owner" as const) : ("master" as const),
+      summary: event.summary,
+    }));
+  return [...changes].reverse();
 }
 
 export function createRpcMissionsSource(options: RpcMissionsSourceOptions): MissionsSource {
@@ -1131,9 +1179,65 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     },
     setPortfolioOrder: (input) => fallback.setPortfolioOrder(input),
 
-    // Section lists keep the live mission id: they hold no mission data.
-    subscribeLayout: (missionId, listener) => fallback.subscribeLayout(missionId, listener),
-    changeSection: (input) => fallback.changeSection(input),
+    subscribeViews(missionId, listener) {
+      let snapshot: MissionViewsSnapshot | null | undefined;
+      let events: ReadonlyArray<MissionEvent> = [];
+      const state = memoLast(
+        (current: MissionViewsSnapshot, log: ReadonlyArray<MissionEvent>): MissionViewsState => ({
+          snapshot: current,
+          changes: viewChangesOf(log),
+        }),
+      );
+      const push = () => {
+        if (snapshot === undefined) return;
+        listener(snapshot === null ? null : state(snapshot, events));
+      };
+      const stopViews = transport.stream(
+        VIEWS.subscribe,
+        { missionId },
+        (item) => {
+          if (item._tag === "snapshot") {
+            snapshot = item.snapshot;
+          } else if (snapshot) {
+            snapshot = {
+              ...snapshot,
+              ownerWaiting: item.ownerWaiting,
+              requestsUnread: item.requestsUnread,
+              pinnedStrip: item.pinnedStrip,
+              pinned: item.pinned,
+            };
+          }
+          push();
+        },
+        (error) => {
+          if (snapshot !== undefined) return;
+          // A server without the views track still shows the starter layout.
+          snapshot = isNotFound(error) ? null : starterViews(missionId);
+          push();
+        },
+      );
+      const stopFeed = missionFeed(missionId, (feed) => {
+        events = feed.events;
+        push();
+      });
+      return () => {
+        stopViews();
+        stopFeed();
+      };
+    },
+    changeView: async (request) => {
+      switch (request.method) {
+        case "editLayout":
+          await transport.request(VIEWS.editLayout, request.input);
+          return;
+        case "remove":
+          await transport.request(VIEWS.remove, request.input);
+          return;
+        case "restore":
+          await transport.request(VIEWS.restore, request.input);
+          return;
+      }
+    },
 
     // --- Owner requests ---
 

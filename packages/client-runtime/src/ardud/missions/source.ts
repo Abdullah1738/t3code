@@ -30,6 +30,7 @@ import type {
   MissionRecordRef,
   MissionRoutingTable,
   MissionTier,
+  MissionViewsSnapshot,
   PoolHoldId,
   PoolId,
   PoolsSnapshot,
@@ -61,7 +62,7 @@ import type {
   WorkItem,
 } from "@t3tools/contracts";
 
-import type { ChangeSectionInput, MissionLayout } from "./sections.ts";
+import type { ViewSectionRequest } from "./views/layout.ts";
 
 export type Unsubscribe = () => void;
 export type Listener<T> = (value: T) => void;
@@ -463,6 +464,20 @@ export interface RequestIdInput {
   readonly requestId: string;
 }
 
+/** One logged change to a mission's layout or sections, from its `view.*` events. */
+export interface MissionViewChange {
+  readonly id: string;
+  readonly at: string;
+  readonly by: "owner" | "master";
+  readonly summary: string;
+}
+
+export interface MissionViewsState {
+  readonly snapshot: MissionViewsSnapshot;
+  /** Newest first. */
+  readonly changes: ReadonlyArray<MissionViewChange>;
+}
+
 /**
  * Feeds a source may serve from sample data. Each names the screen section it
  * fills, so the section can say so once.
@@ -473,7 +488,6 @@ export const SAMPLED_FEEDS = [
   "portfolio",
   "suggestion-stats",
   "recovery",
-  "sections",
 ] as const;
 export type SampledFeed = (typeof SAMPLED_FEEDS)[number];
 
@@ -612,10 +626,10 @@ export interface MissionsSource {
   setPoolCapacity(input: SetPoolCapacityInput): Promise<void>;
   setPortfolioOrder(input: SetPortfolioOrderInput): Promise<void>;
 
-  /** The mission overview's section list; sample until the views track lands. */
-  subscribeLayout(missionId: MissionId, listener: Listener<MissionLayout>): Unsubscribe;
-  /** Hide, show, move, remove or restore one section; logged as the owner's change. */
-  changeSection(input: ChangeSectionInput): Promise<void>;
+  /** The mission's views record (layout, sections, pins) and its change log; null when gone. */
+  subscribeViews(missionId: MissionId, listener: Listener<MissionViewsState | null>): Unsubscribe;
+  /** Runs one layout change built by `viewSectionRequest`. */
+  changeView(request: ViewSectionRequest): Promise<void>;
 
   /** The owner's requests to the master, newest activity first. */
   subscribeRequests(

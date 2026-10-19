@@ -1,41 +1,56 @@
 import { useMemo, useState } from "react";
-import { EyeOffIcon, LockIcon, PinIcon, Trash2Icon } from "lucide-react";
+import { EyeOffIcon, PinIcon, Trash2Icon } from "lucide-react";
 
 import type { MissionId } from "@t3tools/contracts";
 import {
   formatRelative,
+  layoutGroups,
   ownerWaitingEntries,
-  SECTION_REGION_LABEL,
-  sectionTitle,
-  type LayoutChange,
-  type MissionLayout,
-  type SectionEntry,
+  resolveMissionLayout,
+  type LayoutGroup,
+  type LayoutRow,
+  type MissionViewChange,
+  type MissionViewsState,
+  type ResolvedViewLayout,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Skeleton } from "../../components/ui/skeleton";
 import { cn } from "../../lib/utils";
-import { APPROVER_NAME, ByMarker, PersonChip } from "./cards/chips";
-import { SampleMark } from "./MissionSection";
-import { isSampleFeed, useMissionInbox, useMissionLayout } from "./missionsStore";
-import { AskMasterForm, FoldButton, SectionMenu } from "./sections/SectionShell";
+import { ByMarker } from "./cards/chips";
+import { useMissionInbox, useMissionViews } from "./missionsStore";
+import {
+  FoldButton,
+  SectionCount,
+  SectionFormRow,
+  SectionMenu,
+  TabMenu,
+  type SectionForm,
+} from "./sections/SectionShell";
 
 /** Changes shown before the fold. */
 const FIRST_CHANGES = 6;
 
-/** Name, Where, Changed, By, menu; phones fold to two lines. */
-const ROW_GRID =
-  "grid min-w-0 items-center gap-x-4 grid-cols-[minmax(0,1fr)_auto_1.75rem] sm:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_5.5rem_7rem_1.75rem]";
-
 /**
- * The mission's layout as one table: every section, where it sits, when it
- * last changed and who changed it. Hidden and removed sections stay in the
- * table with Show or Restore in their menu. On day one every row is built in.
+ * The mission's layout record: board columns and tabs in page order, hidden
+ * and removed entries kept in place with Show or Restore in their menu, then
+ * who changed what.
  */
 export function ViewsTab(props: { missionId: MissionId; nowMs: number }) {
-  const layout = useMissionLayout(props.missionId);
+  const views = useMissionViews(props.missionId);
   const inbox = useMissionInbox(props.missionId);
-  const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox).length : 0), [inbox]);
-  if (!layout) {
+  const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox).length : undefined), [inbox]);
+  const layout = useMemo(
+    () =>
+      views
+        ? resolveMissionLayout(
+            views.snapshot,
+            waiting === undefined ? undefined : { ownerWaiting: waiting },
+          )
+        : null,
+    [views, waiting],
+  );
+  if (views === null) return null;
+  if (!views || !layout) {
     return (
       <div aria-hidden className="flex flex-col gap-3">
         <Skeleton className="h-4 w-2/5" />
@@ -43,168 +58,135 @@ export function ViewsTab(props: { missionId: MissionId; nowMs: number }) {
       </div>
     );
   }
-  const rows = [
-    ...layout.entries.filter((entry) => entry.region === "main"),
-    ...layout.entries.filter((entry) => entry.region === "rail"),
-  ];
+  const groups = layoutGroups(views.snapshot, layout);
   return (
     <div className="flex max-w-190 min-w-0 flex-col gap-10">
-      <section aria-labelledby="views-sections" className="flex min-w-0 flex-col gap-2.5">
-        <div className="flex min-h-7 items-center gap-2.5">
-          <h2 id="views-sections" className="text-sm font-semibold">
-            Sections
-          </h2>
-          {isSampleFeed("sections") ? <SampleMark /> : null}
-        </div>
-        <div role="table" aria-labelledby="views-sections" className="flex min-w-0 flex-col">
-          <div
-            role="row"
-            className={cn(ROW_GRID, "hidden h-7 text-xs text-muted-foreground sm:grid")}
-          >
-            <span role="columnheader">Name</span>
-            <span role="columnheader">Where</span>
-            <span role="columnheader">Changed</span>
-            <span role="columnheader">By</span>
-            <span role="columnheader">
-              <span className="sr-only">Menu</span>
-            </span>
-          </div>
-          {rows.map((section) => (
-            <SectionRow
-              key={section.key}
-              missionId={props.missionId}
-              layout={layout}
-              section={section}
-              pinned={section.kind === "needs-you" && section.hidden ? waiting : 0}
-              nowMs={props.nowMs}
-            />
-          ))}
-        </div>
-      </section>
-      {layout.changes.length > 0 ? (
-        <ChangeLog changes={layout.changes} nowMs={props.nowMs} />
-      ) : null}
+      {groups.map((group) => (
+        <LayoutGroupList
+          key={group.region}
+          missionId={props.missionId}
+          views={views}
+          layout={layout}
+          group={group}
+          pinned={waiting ?? views.snapshot.ownerWaiting}
+        />
+      ))}
+      {views.changes.length > 0 ? <ChangeLog changes={views.changes} nowMs={props.nowMs} /> : null}
     </div>
   );
 }
 
-function SectionRow(props: {
+function LayoutGroupList(props: {
   missionId: MissionId;
-  layout: MissionLayout;
-  section: SectionEntry;
-  /** Items pinned under the head while Needs you is hidden. */
+  views: MissionViewsState;
+  layout: ResolvedViewLayout;
+  group: LayoutGroup;
+  /** Items Needs you pins under the head while hidden. */
   pinned: number;
-  nowMs: number;
 }) {
-  const { section } = props;
-  const [asking, setAsking] = useState(false);
-  const setAside = section.hidden || section.removed;
+  const headingId = `views-${props.group.region}`;
   return (
-    <>
-      <div
-        role="row"
-        className={cn(
-          ROW_GRID,
-          "border-t border-border/60 max-sm:gap-y-0.5 max-sm:py-2.5 sm:min-h-12",
-        )}
-      >
-        <span
-          role="cell"
-          className={cn(
-            "min-w-0 truncate text-sm max-sm:col-start-1 max-sm:row-start-1",
-            setAside ? "text-muted-foreground" : "font-medium",
-          )}
-        >
-          {sectionTitle(section)}
-        </span>
-        <span
-          role="cell"
-          className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground max-sm:col-start-1 max-sm:row-start-2 max-sm:text-xs"
-        >
-          <span className="truncate">{SECTION_REGION_LABEL[section.region]}</span>
-          <SetAsideTag section={section} pinned={props.pinned} />
-        </span>
-        <span
-          role="cell"
-          className="text-xs text-muted-foreground tabular-nums max-sm:col-start-2 max-sm:row-start-2 max-sm:justify-self-end"
-        >
-          {section.changedAt ? (
-            <time dateTime={section.changedAt}>
-              {formatRelative(section.changedAt, props.nowMs)}
-            </time>
-          ) : null}
-        </span>
-        <span
-          role="cell"
-          className="flex min-w-0 max-sm:col-start-2 max-sm:row-start-1 max-sm:justify-self-end"
-        >
-          {section.changedBy ? (
-            <PersonChip
-              kind={section.changedBy === "owner" ? "you" : "master"}
-              name={APPROVER_NAME[section.changedBy]}
-            />
-          ) : (
-            <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-              <LockIcon aria-hidden className="size-3.5" />
-              Built in
-            </span>
-          )}
-        </span>
-        <span
-          role="cell"
-          className="flex justify-end max-sm:col-start-3 max-sm:row-span-2 max-sm:row-start-1"
-        >
-          <SectionMenu
-            missionId={props.missionId}
-            layout={props.layout}
-            section={section}
-            onAsk={() => setAsking(true)}
-          />
-        </span>
+    <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-1">
+      <div className="flex min-h-7 items-center gap-2.5">
+        <h2 id={headingId} className="text-sm font-semibold">
+          {props.group.label}
+        </h2>
+        <SectionCount
+          count={props.group.rows.length}
+          label={`${props.group.rows.length} entries`}
+        />
       </div>
-      {asking ? (
-        <div role="row" className="pb-3">
-          <div role="cell">
-            <AskMasterForm
-              missionId={props.missionId}
-              section={section}
-              onDone={() => setAsking(false)}
-            />
-          </div>
-        </div>
-      ) : null}
-    </>
+      <ul className="flex min-w-0 flex-col">
+        {props.group.rows.map((row) => (
+          <LayoutRowItem
+            key={row.key}
+            missionId={props.missionId}
+            views={props.views}
+            layout={props.layout}
+            row={row}
+            pinned={props.pinned}
+          />
+        ))}
+      </ul>
+    </section>
   );
 }
 
-/** Removed, Hidden, or what Needs you pinned under the head while hidden. */
-function SetAsideTag(props: { section: SectionEntry; pinned: number }) {
-  const { section } = props;
-  if (!section.hidden && !section.removed) return null;
-  const Icon = section.removed ? Trash2Icon : props.pinned > 0 ? PinIcon : EyeOffIcon;
-  const label = section.removed
-    ? "Removed"
-    : props.pinned > 0
-      ? `${props.pinned} pinned`
-      : "Hidden";
+function LayoutRowItem(props: {
+  missionId: MissionId;
+  views: MissionViewsState;
+  layout: ResolvedViewLayout;
+  row: LayoutRow;
+  pinned: number;
+}) {
+  const { row } = props;
+  const [form, setForm] = useState<SectionForm>(null);
+  const removed = row.type === "section" && row.entry.removed;
+  const setAside = row.entry.hidden || removed;
+  const pinned =
+    row.type === "section" && row.entry.kind === "needs-you" && row.entry.hidden ? props.pinned : 0;
   return (
-    <span className="inline-flex shrink-0 items-center gap-1 text-xs">
+    <li className="flex min-w-0 flex-col border-t border-border/60">
+      <div className="grid min-h-11 min-w-0 grid-cols-[minmax(0,1fr)_auto_1.75rem] items-center gap-x-3">
+        <span
+          className={cn(
+            "min-w-0 truncate text-sm",
+            setAside ? "text-muted-foreground" : "font-medium text-foreground",
+          )}
+        >
+          {row.entry.title}
+        </span>
+        <SetAsideTag hidden={row.entry.hidden} removed={removed} pinned={pinned} />
+        {row.type === "section" ? (
+          <SectionMenu
+            views={props.views}
+            layout={props.layout}
+            section={row.entry}
+            onForm={setForm}
+          />
+        ) : (
+          <TabMenu views={props.views} tab={row.entry} onForm={setForm} />
+        )}
+      </div>
+      {form ? (
+        <div className="pb-3">
+          <SectionFormRow
+            form={form}
+            missionId={props.missionId}
+            views={props.views}
+            entryKey={row.key}
+            title={row.entry.title}
+            onDone={() => setForm(null)}
+          />
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+/** Removed, Hidden, or what Needs you pins under the head while hidden. */
+function SetAsideTag(props: { hidden: boolean; removed: boolean; pinned: number }) {
+  if (!props.hidden && !props.removed) return <span />;
+  const Icon = props.removed ? Trash2Icon : props.pinned > 0 ? PinIcon : EyeOffIcon;
+  const label = props.removed ? "Removed" : props.pinned > 0 ? `${props.pinned} pinned` : "Hidden";
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
       <Icon aria-hidden className="size-3" />
       {label}
     </span>
   );
 }
 
-function ChangeLog(props: { changes: ReadonlyArray<LayoutChange>; nowMs: number }) {
+function ChangeLog(props: { changes: ReadonlyArray<MissionViewChange>; nowMs: number }) {
   const [open, setOpen] = useState(false);
   const shown = open ? props.changes : props.changes.slice(0, FIRST_CHANGES);
   return (
-    <section aria-labelledby="views-changes" className="flex min-w-0 flex-col gap-2.5">
+    <section aria-labelledby="views-changes" className="flex min-w-0 flex-col gap-1">
       <div className="flex min-h-7 items-center gap-2.5">
         <h2 id="views-changes" className="text-sm font-semibold">
           Changes
         </h2>
-        <span className="text-xs text-muted-foreground tabular-nums">{props.changes.length}</span>
+        <SectionCount count={props.changes.length} label={`${props.changes.length} changes`} />
       </div>
       <ol className="flex min-w-0 flex-col">
         {shown.map((change) => (

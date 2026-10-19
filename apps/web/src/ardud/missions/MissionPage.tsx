@@ -1,6 +1,8 @@
+import { useMemo } from "react";
 import { Link } from "@tanstack/react-router";
 
 import type { MissionId, RoomId } from "@t3tools/contracts";
+import { pageTabs, resolveMissionLayout } from "@t3tools/client-runtime/ardud/missions";
 
 import { Empty, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
 import { ScrollArea } from "../../components/ui/scroll-area";
@@ -20,7 +22,7 @@ import { LanesTab } from "./LanesTab";
 import { MissionHead } from "./MissionHeader";
 import { MissionOverviewTab } from "./MissionOverviewTab";
 import { MISSION_TAB_LABEL, MISSION_TABS, type MissionTab } from "./missionSearch";
-import { useMissionOverview } from "./missionsStore";
+import { useMissionOverview, useMissionViews } from "./missionsStore";
 import { RolesTab } from "./RolesTab";
 import { RoomsTab } from "./RoomsTab";
 import { RulesTab } from "./RulesTab";
@@ -105,11 +107,22 @@ export function MissionPage(props: {
   );
 }
 
+const ALL_TABS = MISSION_TABS.map((tab) => ({ tab, title: MISSION_TAB_LABEL[tab] }));
+
+/** The layout's tabs in its order and names; every tab until the views record loads. */
 function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
+  const views = useMissionViews(props.missionId);
+  const tabs = useMemo(
+    () =>
+      views
+        ? pageTabs(resolveMissionLayout(views.snapshot), MISSION_TAB_LABEL, props.tab)
+        : ALL_TABS,
+    [views, props.tab],
+  );
   return (
     <nav aria-label="Mission sections" className="overflow-x-auto border-b border-border">
       <ul className="flex min-w-max gap-0.5">
-        {MISSION_TABS.map((tab) => {
+        {tabs.map(({ tab, title }) => {
           const active = tab === props.tab;
           return (
             <li key={tab}>
@@ -125,7 +138,7 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                {MISSION_TAB_LABEL[tab]}
+                {title}
               </Link>
             </li>
           );

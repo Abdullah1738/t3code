@@ -2,7 +2,13 @@ import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { CheckIcon, MessagesSquareIcon } from "lucide-react";
 
-import type { DirectionCheckItem, FeedItem, MissionId, MissionOverview } from "@t3tools/contracts";
+import {
+  VIEW_BUILTIN_SECTION_TITLES,
+  type DirectionCheckItem,
+  type FeedItem,
+  type MissionId,
+  type MissionOverview,
+} from "@t3tools/contracts";
 import {
   ageView,
   criticalPathView,
@@ -13,17 +19,17 @@ import {
   openForkFor,
   orderBlockerGroups,
   ownerWaitingEntries,
-  pinnedStrip,
   recoveryBanner,
   refKey,
   refLabel,
+  resolveMissionLayout,
   splitFeed,
-  visibleSections,
   type MissionInboxSnapshot,
-  type MissionLayout,
   type MissionOverviewSnapshot,
+  type MissionViewsState,
   type OwnerRequest,
-  type SectionEntry,
+  type ResolvedViewLayout,
+  type ViewSectionEntry,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Badge } from "../../components/ui/badge";
@@ -35,7 +41,7 @@ import { discussRecord, markMissionSeen, reactToCall } from "./missionCommands";
 import {
   useMissionForks,
   useMissionInbox,
-  useMissionLayout,
+  useMissionViews,
   useOwnerRequests,
 } from "./missionsStore";
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
@@ -62,52 +68,66 @@ export function MissionOverviewTab(props: {
 }) {
   const { overview, nowMs } = props;
   const missionId = overview.mission.id;
-  const layout = useMissionLayout(missionId);
+  const views = useMissionViews(missionId);
   const inbox = useMissionInbox(missionId);
   const requests = useOwnerRequests(missionId);
-  const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox).length : 0), [inbox]);
+  const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox).length : undefined), [inbox]);
   const unread = useMemo(() => unreadRequests(requests), [requests]);
-  const pins = layout
-    ? pinnedStrip(layout, { ownerWaiting: waiting, requestsUnread: unread.length })
-    : { needsYou: false, requests: false };
-  const mainSections = layout ? visibleSections(layout, "main") : [];
-  const railSections = layout ? visibleSections(layout, "rail") : [];
-  // A request opened from a link still opens when its section is hidden.
-  const requestsShown = [...mainSections, ...railSections].some(
-    (section) => section.kind === "your-requests",
+  // The page's own inbox and request counts drive the pinned strip, so it
+  // matches what the page shows even between views pushes.
+  const layout = useMemo(
+    () =>
+      views
+        ? resolveMissionLayout(views.snapshot, {
+            ...(waiting === undefined ? {} : { ownerWaiting: waiting }),
+            ...(requests === undefined ? {} : { requestsUnread: unread.length }),
+          })
+        : null,
+    [views, waiting, requests, unread.length],
   );
+  // A request opened from a link still opens when its section is hidden.
+  const requestsShown =
+    layout?.main.some((section) => section.kind === "your-requests") === true ||
+    layout?.rail.some((section) => section.kind === "your-requests") === true;
   const looseRequest =
-    layout && !requestsShown
+    views !== undefined && !requestsShown
       ? (requests?.find((request) => request.id === props.openRequestId) ?? null)
       : null;
   const openRequest = useRequestOpener(missionId);
 
-  const context: SectionContext = {
-    overview,
-    nowMs,
-    inbox,
-    requests,
-    highlightSubMissionId: props.highlightSubMissionId,
-    openRequestId: props.openRequestId,
-  };
+  const context: SectionContext | null =
+    views && layout
+      ? {
+          overview,
+          nowMs,
+          inbox,
+          requests,
+          views,
+          layout,
+          highlightSubMissionId: props.highlightSubMissionId,
+          openRequestId: props.openRequestId,
+        }
+      : null;
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
       <RecoveryLine overview={overview} />
       <BottomLine overview={overview} nowMs={nowMs} />
-      {layout && pins.needsYou ? (
+      {context?.layout.pinned.needsYou ? (
         <PinnedStrip
           missionId={missionId}
-          layout={layout}
+          views={context.views}
+          layout={context.layout}
           kind="needs-you"
           inbox={inbox}
           nowMs={nowMs}
         />
       ) : null}
-      {layout && pins.requests ? (
+      {context?.layout.pinned.requests ? (
         <PinnedStrip
           missionId={missionId}
-          layout={layout}
+          views={context.views}
+          layout={context.layout}
           kind="your-requests"
           requests={unread}
           nowMs={nowMs}
@@ -124,34 +144,24 @@ export function MissionOverviewTab(props: {
           />
         </section>
       ) : null}
-      {layout ? (
+      {context ? (
         // The side column comes first on narrow screens, so it does in the DOM too.
         <div className="grid min-w-0 gap-x-10 gap-y-11 lg:grid-cols-[minmax(0,1fr)_340px]">
           <aside
             aria-label="Side column"
             className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(300px,1fr))] content-start gap-x-10 gap-y-11 lg:col-start-2 lg:row-start-1 lg:grid-cols-1"
           >
-            {railSections.map((section) => (
-              <OverviewSection
-                key={section.key}
-                layout={layout}
-                section={section}
-                context={context}
-              />
+            {context.layout.rail.map((section) => (
+              <OverviewSection key={section.key} section={section} context={context} />
             ))}
           </aside>
           <div className="flex min-w-0 flex-col gap-11 lg:col-start-1 lg:row-start-1">
-            {mainSections.map((section) => (
-              <OverviewSection
-                key={section.key}
-                layout={layout}
-                section={section}
-                context={context}
-              />
+            {context.layout.main.map((section) => (
+              <OverviewSection key={section.key} section={section} context={context} />
             ))}
           </div>
         </div>
-      ) : (
+      ) : views === null ? null : (
         <div aria-hidden className="flex flex-col gap-3">
           <Skeleton className="h-4 w-2/5" />
           <Skeleton className="h-4 w-3/5" />
@@ -166,18 +176,22 @@ interface SectionContext {
   readonly nowMs: number;
   readonly inbox: MissionInboxSnapshot | undefined;
   readonly requests: ReadonlyArray<OwnerRequest> | undefined;
+  readonly views: MissionViewsState;
+  readonly layout: ResolvedViewLayout;
   readonly highlightSubMissionId: string | null;
   readonly openRequestId: string | null;
 }
 
-function OverviewSection(props: {
-  layout: MissionLayout;
-  section: SectionEntry;
-  context: SectionContext;
-}) {
-  const { layout, section, context } = props;
+function OverviewSection(props: { section: ViewSectionEntry; context: SectionContext }) {
+  const { section, context } = props;
   const missionId = context.overview.mission.id;
-  const common = { missionId, layout, section, nowMs: context.nowMs };
+  const common = {
+    missionId,
+    views: context.views,
+    layout: context.layout,
+    section,
+    nowMs: context.nowMs,
+  };
   switch (section.kind) {
     case "needs-you":
       return <NeedsYouSection {...common} inbox={context.inbox} />;
@@ -203,13 +217,19 @@ function OverviewSection(props: {
       return <SinceLastLookedSection {...common} overview={context.overview} />;
     case "path-to-milestone":
       return <PathSection {...common} overview={context.overview} />;
+    // The stats row lives in the mission header; custom sections render once
+    // the server answers their queries (views track, later round).
+    case "header-stats":
+    case "custom":
+      return null;
   }
 }
 
 interface SectionProps {
   readonly missionId: MissionId;
-  readonly layout: MissionLayout;
-  readonly section: SectionEntry;
+  readonly views: MissionViewsState;
+  readonly layout: ResolvedViewLayout;
+  readonly section: ViewSectionEntry;
   readonly nowMs: number;
 }
 
@@ -254,6 +274,7 @@ function SubMissionsSection(
   return (
     <SectionShell
       missionId={props.missionId}
+      views={props.views}
       layout={props.layout}
       section={props.section}
       meta={
@@ -313,6 +334,7 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
   return (
     <SectionShell
       missionId={props.missionId}
+      views={props.views}
       layout={props.layout}
       section={props.section}
       meta={
@@ -465,12 +487,16 @@ function PathSection(props: SectionProps & { overview: MissionOverviewSnapshot }
   );
   if (path.steps.length === 0 && holders.length === 0 && milestones.length === 0) return null;
   const target = milestones.find((milestone) => milestone.targetAt !== null)?.targetAt ?? null;
-  const heading = props.section.title ?? (target ? `Path to ${formatDayLabel(target)}` : null);
+  // A renamed section keeps its name; the built-in one names the date.
+  const renamed = props.section.title !== VIEW_BUILTIN_SECTION_TITLES["path-to-milestone"];
+  const heading = !renamed && target ? `Path to ${formatDayLabel(target)}` : undefined;
   return (
     <SectionShell
       missionId={props.missionId}
+      views={props.views}
       layout={props.layout}
-      section={heading ? { ...props.section, title: heading } : props.section}
+      section={props.section}
+      {...(heading ? { title: heading } : {})}
       meta={
         path.steps.length > 0 ? (
           <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground tabular-nums">
