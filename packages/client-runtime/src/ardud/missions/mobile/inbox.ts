@@ -10,7 +10,6 @@ import type {
   DraftChannel,
   InboxTab,
   Knock,
-  MissionActor,
   MissionInbox,
   Note,
   NoteSeverity,
@@ -20,7 +19,7 @@ import type {
   SuggestionTargetKind,
 } from "@t3tools/contracts";
 
-import { formatRelative, refLabel } from "../viewModel.ts";
+import { refLabel } from "../viewModel.ts";
 
 // Inbox logic for the owner's phone: which segment to show, what each card
 // says, and turning a filled-in card into a mutation input. Everything here is
@@ -41,24 +40,6 @@ export function missionErrorMessage(error: unknown): string {
     if (typeof detail === "string" && detail.trim() !== "") return detail;
   }
   return "Something went wrong. Try again.";
-}
-
-/** "you", or the role, lane, thread, component or person the actor names. */
-export function actorLabel(actor: MissionActor): string {
-  switch (actor._tag) {
-    case "owner":
-      return "you";
-    case "role":
-      return actor.roleId;
-    case "lane":
-      return actor.laneId;
-    case "thread":
-      return actor.threadId;
-    case "system":
-      return actor.component;
-    case "person":
-      return actor.name;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,8 +112,6 @@ export interface AskView {
   readonly question: string;
   readonly context: string;
   readonly urgent: boolean;
-  readonly askedBy: string;
-  readonly askedAt: string;
   readonly options: ReadonlyArray<AskOptionView>;
   readonly recommendation: { readonly label: string | null; readonly reason: string } | null;
   /** "Blocks CRP-13215, risk#124", or `null` when nothing waits on the answer. */
@@ -140,15 +119,14 @@ export interface AskView {
   readonly costOfWaiting: string;
 }
 
-export function askView(ask: Ask, nowMs: number): AskView {
+/** Never says who asked: the card is the owner's decision, not a lane's message. */
+export function askView(ask: Ask): AskView {
   const recommendedId = ask.recommendation?.optionId ?? null;
   const recommendedOption = ask.options.find((option) => option.id === recommendedId);
   return {
     question: ask.question,
     context: ask.context,
     urgent: ask.urgency === "p0",
-    askedBy: actorLabel(ask.askedBy),
-    askedAt: formatRelative(ask.createdAt, nowMs),
     options: ask.options.map((option) => ({
       id: option.id,
       label: option.label,
@@ -205,25 +183,17 @@ export const DRAFT_CHANNEL_LABEL: Readonly<Record<DraftChannel, string>> = {
   other: "Other",
 };
 
-const DRAFT_SOURCE_LABEL: Readonly<Record<Draft["source"]["kind"], string>> = {
-  fork: "written by a fork",
-  lane: "written by a lane",
-  master: "written by the master",
-  editor: "written by the editor",
-};
-
-/** "Draft for Pavan on risk#124" */
-export function draftHeadline(draft: Draft): string {
-  return `Draft for ${draft.audience} on ${draft.target.label}`;
+/** A card's facts, one label and value per line. */
+export interface CardFact {
+  readonly label: string;
+  readonly value: string;
 }
 
-/** "GitHub · written by the master · 2h ago" */
-export function draftMeta(draft: Draft, nowMs: number): string {
+export function draftFacts(draft: Draft): ReadonlyArray<CardFact> {
   return [
-    DRAFT_CHANNEL_LABEL[draft.channel],
-    DRAFT_SOURCE_LABEL[draft.source.kind],
-    formatRelative(draft.createdAt, nowMs),
-  ].join(" · ");
+    { label: "Channel", value: DRAFT_CHANNEL_LABEL[draft.channel] },
+    { label: "To", value: draft.audience },
+  ];
 }
 
 export type DraftForm =
@@ -255,22 +225,6 @@ export function draftDecisionInput(draft: Draft, form: DraftForm): FormResult<De
 // ---------------------------------------------------------------------------
 // Approvals (crw merges, deploys, releases)
 
-const APPROVAL_KIND_LABEL: Readonly<Record<Approval["kind"], string>> = {
-  merge: "Merge",
-  deploy: "Deploy",
-  release: "Release",
-  other: "Approval",
-};
-
-/** "Merge · requested by crw · 5m ago" */
-export function approvalMeta(approval: Approval, nowMs: number): string {
-  return [
-    APPROVAL_KIND_LABEL[approval.kind],
-    `requested by ${approval.requestedBy}`,
-    formatRelative(approval.createdAt, nowMs),
-  ].join(" · ");
-}
-
 export function approvalDecisionInput(
   approval: Approval,
   action: "approve" | "reject",
@@ -288,23 +242,14 @@ export function approvalDecisionInput(
 // ---------------------------------------------------------------------------
 // Knocks (outside threads trying to reach the mission)
 
-const KNOCK_PATH_LABEL: Readonly<Record<string, string>> = {
-  "control-api": "the control API",
-  "thread-send": "a thread send",
-  "queued-send": "a queued send",
-  "coord-shim": "the coord shim",
-};
-
 /** `"Batch-fix Crpko tickets" wants to tell the Crpko Engineering master` */
 export function knockHeadline(knock: Knock, missionTitle: string | null): string {
   const master = missionTitle ? `the ${missionTitle} master` : "the master";
   return `"${knock.fromTitle}" wants to tell ${master}`;
 }
 
-/** "Stopped at a thread send · 12m ago" */
-export function knockMeta(knock: Knock, nowMs: number): string {
-  const path = KNOCK_PATH_LABEL[knock.path] ?? knock.path;
-  return `Stopped at ${path} · ${formatRelative(knock.createdAt, nowMs)}`;
+export function knockFacts(knock: Knock): ReadonlyArray<CardFact> {
+  return [{ label: "From", value: knock.fromTitle }];
 }
 
 export type KnockForm =
@@ -347,20 +292,18 @@ export const SUGGESTION_AUTHOR_LABEL: Readonly<Record<SuggestionAuthor, string>>
   "code-check": "Code check",
 };
 
-/** "Scribe · Schedule · cell-triage" */
-export function suggestionMeta(suggestion: Suggestion): string {
+export function suggestionFacts(suggestion: Suggestion): ReadonlyArray<CardFact> {
   return [
-    SUGGESTION_AUTHOR_LABEL[suggestion.author],
-    SUGGESTION_TARGET_LABEL[suggestion.targetKind],
-    ...(suggestion.target ? [refLabel(suggestion.target)] : []),
-  ].join(" · ");
-}
-
-/** Who else may accept it. Owner-only suggestions say so. */
-export function suggestionAcceptorLine(suggestion: Suggestion): string {
-  return suggestion.acceptor === "owner"
-    ? "Only you can accept this."
-    : "The master may accept this if you don't.";
+    { label: "From", value: SUGGESTION_AUTHOR_LABEL[suggestion.author] },
+    ...(suggestion.target
+      ? [
+          {
+            label: SUGGESTION_TARGET_LABEL[suggestion.targetKind],
+            value: refLabel(suggestion.target),
+          },
+        ]
+      : []),
+  ];
 }
 
 /** The proposed value as editable text: strings as they are, anything else as JSON. */
@@ -431,12 +374,9 @@ export const NOTE_SEVERITY_LABEL: Readonly<Record<NoteSeverity, string>> = {
   critical: "Critical",
 };
 
-/** "You should know · High · claimed, not checked · 3h ago" */
-export function noteMeta(note: Note, nowMs: number): string {
+export function noteFacts(note: Note): ReadonlyArray<CardFact> {
   return [
-    NOTE_TYPE_LABEL[note.type],
-    NOTE_SEVERITY_LABEL[note.severity],
-    note.basis === "claimed" ? "claimed, not checked" : "observed",
-    formatRelative(note.createdAt, nowMs),
-  ].join(" · ");
+    { label: "Severity", value: NOTE_SEVERITY_LABEL[note.severity] },
+    ...(note.basis === "claimed" ? [{ label: "Checked", value: "No, claimed" }] : []),
+  ];
 }
