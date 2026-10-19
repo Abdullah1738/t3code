@@ -159,7 +159,14 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       assert.isNotNull(result.ended.endedAt);
       assert.strictEqual(result.binding.reason, "succession");
       assert.strictEqual(result.binding.handoffNote, "brief is half written, see notes/editor.md");
-      assert.deepStrictEqual(result.moves, ports.moves);
+      // The old holder keeps nothing else here, so its own room subscriptions move too.
+      assert.deepStrictEqual(result.moves, [
+        ...ports.moves,
+        { what: "subscriptions", moved: 2, failed: 0, supported: true },
+      ]);
+      assert.deepStrictEqual(ports.subscriptionMoves, [
+        { missionId: CRPKO, from: "thread-editor-1", to: "thread-editor-2" },
+      ]);
       // The successor runs the role's model from its next turn.
       assert.deepStrictEqual(ports.setModelCalls, [
         { threadId: "thread-editor-2", model: modelKey(OPUS_XHIGH) },

@@ -25,7 +25,7 @@ import { actorOf } from "../core/provenance.ts";
 import type * as MissionService from "../MissionService.ts";
 import type * as MissionStore from "../store/MissionStore.ts";
 import type * as PolicyStore from "./PolicyStore.ts";
-import type { PolicySampler, PolicySuccession, PolicyThreads } from "./ports.ts";
+import type { PolicyHandoff, PolicySampler, PolicySuccession, PolicyThreads } from "./ports.ts";
 import {
   LANE_ROLE_KINDS,
   MISSION_ROLE_KINDS,
@@ -43,6 +43,8 @@ export interface PolicyDeps {
   readonly threads: PolicyThreads["Service"];
   readonly succession: PolicySuccession["Service"];
   readonly sampler: PolicySampler["Service"];
+  /** Launches, briefs and moves subscriptions on a handoff; null where not provided. */
+  readonly handoff: PolicyHandoff["Service"] | null;
   /** Serializes read-compute-write on pools and holds. */
   readonly holdLock: Semaphore.Semaphore;
 }

@@ -15,7 +15,13 @@ import * as MissionStore from "../store/MissionStore.ts";
 import { modelKey } from "./models.ts";
 import * as PolicyService from "./PolicyService.ts";
 import * as PolicyStore from "./PolicyStore.ts";
-import { PolicySampler, PolicySuccession, PolicySuggestions, PolicyThreads } from "./ports.ts";
+import {
+  PolicyHandoff,
+  PolicySampler,
+  PolicySuccession,
+  PolicySuggestions,
+  PolicyThreads,
+} from "./ports.ts";
 
 /** Test-only helpers for the policy service: fake thread, succession and suggestion ports. */
 
@@ -49,7 +55,40 @@ export const makePorts = () => {
     { what: "schedules", moved: 1, failed: 0, supported: true },
     { what: "children", moved: 0, failed: 0, supported: false },
   ];
+  const launches: Array<{ from: string; title: string; threadId: string; model: string }> = [];
+  const briefs: Array<{ threadId: string; text: string; key: string }> = [];
+  const subscriptionMoves: Array<{ missionId: string; from: string; to: string }> = [];
   const layer = Layer.mergeAll(
+    Layer.succeed(
+      PolicyHandoff,
+      PolicyHandoff.of({
+        launch: (input) =>
+          Effect.sync(() => {
+            const threadId = ThreadId.make(`thread-launched-${launches.length + 1}`);
+            threads.set(threadId, {
+              exists: true,
+              idle: true,
+              modelSelection: input.modelSelection,
+            });
+            launches.push({
+              from: input.from,
+              title: input.title,
+              threadId,
+              model: modelKey(input.modelSelection),
+            });
+            return threadId;
+          }),
+        brief: (threadId, text, key) =>
+          Effect.sync(() => {
+            briefs.push({ threadId, text, key });
+          }),
+        moveSubscriptions: (missionId, from, to) =>
+          Effect.sync(() => {
+            subscriptionMoves.push({ missionId, from, to });
+            return { what: "subscriptions", moved: 2, failed: 0, supported: true } as const;
+          }),
+      }),
+    ),
     Layer.succeed(
       PolicyThreads,
       PolicyThreads.of({
@@ -86,7 +125,7 @@ export const makePorts = () => {
       }),
     ),
   );
-  return { threads, setModelCalls, proposals, moves, layer };
+  return { threads, setModelCalls, proposals, moves, launches, briefs, subscriptionMoves, layer };
 };
 
 export const testLayer = (

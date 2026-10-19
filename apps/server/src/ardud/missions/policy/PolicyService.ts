@@ -4,6 +4,7 @@ import type {
   CreateRoleInput,
   EditReviewPolicyInput,
   GovernorView,
+  HandOffLaneInput,
   MissionError,
   MissionId,
   MissionMutationResult,
@@ -39,6 +40,7 @@ import * as Context from "effect/Context";
 import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -51,7 +53,13 @@ import type { GovernorDecision } from "./governor.ts";
 import { governorView, makeGovernorMemory, runGovernor, type GovernorMode } from "./governorOps.ts";
 import * as PolicyStore from "./PolicyStore.ts";
 import * as Pools from "./poolOps.ts";
-import { PolicySampler, PolicySuccession, PolicySuggestions, PolicyThreads } from "./ports.ts";
+import {
+  PolicyHandoff,
+  PolicySampler,
+  PolicySuccession,
+  PolicySuggestions,
+  PolicyThreads,
+} from "./ports.ts";
 import * as Reviews from "./reviewOps.ts";
 import * as Roles from "./roleOps.ts";
 import type { PoolSource } from "./sources.ts";
@@ -83,6 +91,8 @@ export class PolicyService extends Context.Service<
     readonly bindRole: Write<BindRoleInput>;
     readonly unbindRole: Write<UnbindRoleInput>;
     readonly succeedRole: Write<SucceedRoleInput, SucceedRoleResult>;
+    /** The lane's lead role to a new thread, launched here unless one is given. */
+    readonly handOffLane: Write<HandOffLaneInput, SucceedRoleResult>;
     // Review policy
     readonly reviewPolicy: (missionId: MissionId) => Fx<ReviewPolicySnapshot>;
     readonly editReviewPolicy: Write<EditReviewPolicyInput>;
@@ -146,6 +156,7 @@ const make = (options: PolicyOptions) =>
       threads: yield* PolicyThreads,
       succession: yield* PolicySuccession,
       sampler: yield* PolicySampler,
+      handoff: Option.getOrNull(yield* Effect.serviceOption(PolicyHandoff)),
       holdLock: yield* Semaphore.make(1),
     };
     const suggestions = yield* PolicySuggestions;
@@ -179,6 +190,7 @@ const make = (options: PolicyOptions) =>
       bindRole: (provenance, input) => Roles.bindRole(deps, provenance, input),
       unbindRole: (provenance, input) => Roles.unbindRole(deps, provenance, input),
       succeedRole: (provenance, input) => Roles.succeedRole(deps, provenance, input),
+      handOffLane: (provenance, input) => Roles.handOffLane(deps, provenance, input),
       reviewPolicy: (missionId) => Reviews.reviewPolicySnapshot(deps, missionId),
       editReviewPolicy: (provenance, input) => Reviews.editReviewPolicy(deps, provenance, input),
       setCriticalityGuide: (provenance, input) =>

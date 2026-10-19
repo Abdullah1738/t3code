@@ -3,6 +3,7 @@ import {
   type BindRoleInput,
   type MissionError,
   type CreateRoleInput,
+  type HandOffLaneInput,
   type MissionId,
   type MissionMutationResult,
   type MissionProvenance,
@@ -14,11 +15,13 @@ import {
   type SetRoleModelInput,
   type SucceedRoleInput,
   type SucceedRoleResult,
+  type SuccessionMove,
   type ThreadId,
   type UnbindRoleInput,
   type UpdateRoleInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 
 import {
@@ -615,8 +618,8 @@ export const succeedRole = (
       observedModel:
         holder.modelSelection !== null && modelKey(holder.modelSelection) === key ? key : null,
     };
-    const moves = yield* deps.succession.move(current.threadId, input.threadId);
-    const moved = moves
+    const portMoves = yield* deps.succession.move(current.threadId, input.threadId);
+    const moved = portMoves
       .filter((move) => move.supported && move.moved > 0)
       .map((move) => `${move.moved} ${move.what}`);
     yield* deps.store.commit({
@@ -631,7 +634,7 @@ export const succeedRole = (
           to: input.threadId,
           endedId: current.id,
           bindingId: next.id,
-          moves,
+          moves: portMoves,
         },
       ),
       upserts: [
@@ -641,8 +644,129 @@ export const succeedRole = (
       ],
     });
     yield* pointLaneAt(deps, role, input.threadId);
+    const subscriptions = yield* moveSubscriptions(
+      deps,
+      role.missionId,
+      current.threadId,
+      input.threadId,
+    );
     yield* alignRole(deps, role, { stored: true, caller });
-    return { ended: succession.ended, binding: next, moves };
+    return { ended: succession.ended, binding: next, moves: [...portMoves, subscriptions] };
+  });
+
+/**
+ * Room subscriptions held by the old thread itself go to the successor, once
+ * the old thread holds nothing else in the mission (a thread that keeps
+ * another role keeps its subscriptions). Needs the new thread to be a member,
+ * so it runs after the succession commits.
+ */
+const moveSubscriptions = (
+  deps: PolicyDeps,
+  missionId: MissionId,
+  from: ThreadId,
+  to: ThreadId,
+): Effect.Effect<SuccessionMove, MissionError> =>
+  Effect.gen(function* () {
+    if (deps.handoff === null) {
+      return { what: "subscriptions", moved: 0, failed: 0, supported: false } as const;
+    }
+    const stays = (yield* activeBindings(deps, missionId)).some(
+      (binding) => binding.threadId === from,
+    );
+    if (stays) return { what: "subscriptions", moved: 0, failed: 0, supported: true } as const;
+    return yield* deps.handoff.moveSubscriptions(missionId, from, to);
+  });
+
+/**
+ * Hands a lane's lead role to a new thread. Without `threadId` it launches one
+ * in the old lead's project and workspace on the role's model, then briefs it
+ * with the note. Everything is checked before the launch, so a refused handoff
+ * never leaves a stray thread. Running work on the old thread is left alone.
+ */
+export const handOffLane = (
+  deps: PolicyDeps,
+  provenance: MissionProvenance,
+  input: HandOffLaneInput,
+): Effect.Effect<SucceedRoleResult, MissionError> =>
+  Effect.gen(function* () {
+    const stored = yield* deps.store.get("lane", input.laneId);
+    if (Option.isNone(stored)) return yield* failWith("not-found", `No lane ${input.laneId}.`);
+    const lane = stored.value;
+    if (lane.status === "retired") {
+      return yield* failWith("invalid", `Lane ${lane.name} is retired.`);
+    }
+    const from = lane.threadId;
+    if (from === null)
+      return yield* failWith("conflict", "This lane has no lead thread to hand off.");
+    const now = yield* nowIso;
+    const { role } = yield* findRole(
+      deps,
+      lane.leadRoleId ?? defaultRoleId(lane.missionId, "lane-lead", lane.id),
+      now,
+    );
+    const caller = yield* resolveCaller(deps, provenance, lane.missionId);
+    yield* requireGovern(caller, "hand a lane off");
+    const holds = (yield* roleBindings(deps, role)).some((binding) => binding.threadId === from);
+    if (!holds) {
+      return yield* failWith(
+        "conflict",
+        `${role.name} is not held by ${from}, the lane's thread; bind the lead first.`,
+      );
+    }
+    if (input.threadId === undefined && deps.handoff === null) {
+      return yield* failWith(
+        "conflict",
+        "This server cannot launch a thread for the handoff; pass threadId.",
+      );
+    }
+    const launched =
+      input.threadId === undefined && deps.handoff !== null
+        ? yield* deps.handoff.launch({
+            from,
+            title: `${lane.name} lead`,
+            modelSelection: roleTarget(role),
+          })
+        : null;
+    const threadId = input.threadId ?? launched;
+    if (threadId === null) return yield* failWith("conflict", "No thread to hand the lane to.");
+    const result = yield* succeedRole(deps, provenance, {
+      roleId: role.id,
+      threadId,
+      fromThreadId: from,
+      handoffNote: input.handoffNote,
+    }).pipe(
+      // A concurrent handoff can win between our checks and the commit. The
+      // thread we launched is idle; say which one so nobody hunts for it.
+      Effect.catch((error) =>
+        launched === null
+          ? Effect.fail(error)
+          : failWith(error.code, `${error.detail} The launched thread ${launched} was left idle.`),
+      ),
+    );
+    if (launched !== null && deps.handoff !== null) {
+      yield* deps.handoff
+        .brief(
+          launched,
+          [
+            `You now lead lane "${lane.name}" in mission ${lane.missionId} as ${role.name}, taking over from thread ${from}.`,
+            "",
+            "Handoff note:",
+            "",
+            input.handoffNote,
+          ].join("\n"),
+          `handoff:${result.binding.id}`,
+        )
+        .pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("mission policy could not brief the new lane lead", {
+              laneId: lane.id,
+              threadId: launched,
+              detail: error.detail,
+            }),
+          ),
+        );
+    }
+    return result;
   });
 
 /** Stores a registry default (so it can carry a lock or a note like any stored role). */

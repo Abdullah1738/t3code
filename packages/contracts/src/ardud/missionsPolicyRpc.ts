@@ -20,6 +20,7 @@ import {
   CreateRoleInput,
   EditReviewPolicyInput,
   GovernorView,
+  HandOffLaneInput,
   MissionError,
   MissionId,
   MissionMutationResult,
@@ -56,6 +57,9 @@ export const MISSIONS_POLICY_WS_METHODS = {
   bindRole: "missions.policy.bindRole",
   unbindRole: "missions.policy.unbindRole",
   succeedRole: "missions.policy.succeedRole",
+  // --- policy additions ---
+  handOffLane: "missions.policy.handOffLane",
+  // --- end policy additions ---
   reviewPolicy: "missions.policy.reviewPolicy",
   editReviewPolicy: "missions.policy.editReviewPolicy",
   setCriticalityGuide: "missions.policy.setCriticalityGuide",
@@ -96,6 +100,9 @@ export const MissionsPolicyRpcs = RpcGroup.make(
   call(M.bindRole, BindRoleInput, MissionMutationResult),
   call(M.unbindRole, UnbindRoleInput, MissionMutationResult),
   call(M.succeedRole, SucceedRoleInput, SucceedRoleResult),
+  // --- policy additions ---
+  call(M.handOffLane, HandOffLaneInput, SucceedRoleResult),
+  // --- end policy additions ---
   call(M.reviewPolicy, MissionScope, ReviewPolicySnapshot),
   call(M.editReviewPolicy, EditReviewPolicyInput, MissionMutationResult),
   call(M.setCriticalityGuide, SetCriticalityGuideInput, MissionMutationResult),
@@ -131,6 +138,9 @@ export const MISSIONS_POLICY_GUARDED_SCOPES = {
   [M.bindRole]: AuthOrchestrationOperateScope,
   [M.unbindRole]: AuthOrchestrationOperateScope,
   [M.succeedRole]: AuthOrchestrationOperateScope,
+  // --- policy additions ---
+  [M.handOffLane]: AuthOrchestrationOperateScope,
+  // --- end policy additions ---
   [M.editReviewPolicy]: AuthOrchestrationOperateScope,
   [M.setCriticalityGuide]: AuthOrchestrationOperateScope,
   [M.recordCriticality]: AuthOrchestrationOperateScope,

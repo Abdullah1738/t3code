@@ -2667,6 +2667,18 @@ export const SucceedRoleInput = Schema.Struct({
 });
 export type SucceedRoleInput = typeof SucceedRoleInput.Type;
 
+/**
+ * Hands a lane's lead role to a fresh thread. Without `threadId` the server
+ * launches one in the old lead's project and workspace and briefs it with the
+ * note; with it, that existing thread takes over.
+ */
+export const HandOffLaneInput = Schema.Struct({
+  laneId: LaneId,
+  handoffNote: TrimmedNonEmptyString,
+  threadId: Schema.optional(ThreadId),
+});
+export type HandOffLaneInput = typeof HandOffLaneInput.Type;
+
 export const EditReviewPolicyInput = Schema.Struct({
   missionId: MissionId,
   stages: Schema.optional(Schema.Array(ReviewStage)),

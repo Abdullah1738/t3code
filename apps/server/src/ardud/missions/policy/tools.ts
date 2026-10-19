@@ -4,6 +4,7 @@ import {
   CreateRoleInput,
   EditReviewPolicyInput,
   GovernorView,
+  HandOffLaneInput,
   MissionId,
   MissionMutationResult,
   OrchestratorMcpFailure,
@@ -161,6 +162,13 @@ const RoleSucceedTool = tool(
   SucceedRoleResult,
 );
 
+const LaneHandoffTool = tool(
+  "mission_lane_handoff",
+  "Hand a lane's lead role to a fresh thread with a handoff note. Without threadId the server launches the new thread in the old lead's project and workspace on the role's model and briefs it with the note. Schedules and the old thread's room subscriptions move; running work on the old thread is left alone.",
+  HandOffLaneInput,
+  SucceedRoleResult,
+);
+
 // --- review policy
 
 const ReviewPolicyEditTool = tool(
@@ -287,6 +295,7 @@ export const PolicyToolkit = Toolkit.make(
   writeTool(RoleBindTool, "Bind a role"),
   writeTool(RoleUnbindTool, "Release a role"),
   writeTool(RoleSucceedTool, "Hand a role over"),
+  writeTool(LaneHandoffTool, "Hand a lane off"),
   writeTool(ReviewPolicyEditTool, "Edit review policy"),
   writeTool(CriticalityGuideTool, "Write the criticality guide"),
   writeTool(CriticalityTool, "Record a criticality verdict"),
