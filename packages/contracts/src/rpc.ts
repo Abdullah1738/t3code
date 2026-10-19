@@ -351,6 +351,10 @@ import { SecretRequestAnswerInput, SecretRequestError } from "./secretRequest.ts
 // ardud missions: core
 import {
   AckNoteInput,
+  MissionTimelineInput,
+  MissionTimelinePage,
+  MissionWorkItemsInput,
+  MissionWorkItemsPage,
   AnswerAskInput,
   Ask,
   Call,
@@ -644,6 +648,8 @@ export const WS_METHODS = {
   missionsCloseFork: "missions.closeFork",
   missionsUpdateFork: "missions.updateFork",
   missionsAckNote: "missions.ackNote",
+  missionsWorkItems: "missions.workItems",
+  missionsTimeline: "missions.timeline",
   // ardud missions: router
   missionsRooms: "missions.rooms",
   missionsRoomPage: "missions.roomPage",
@@ -2145,6 +2151,16 @@ const WsMissionsUpdateForkRpc = missionRpc(
   MissionFork,
 );
 const WsMissionsAckNoteRpc = missionRpc(WS_METHODS.missionsAckNote, AckNoteInput, Note);
+const WsMissionsWorkItemsRpc = missionRpc(
+  WS_METHODS.missionsWorkItems,
+  MissionWorkItemsInput,
+  MissionWorkItemsPage,
+);
+const WsMissionsTimelineRpc = missionRpc(
+  WS_METHODS.missionsTimeline,
+  MissionTimelineInput,
+  MissionTimelinePage,
+);
 // ardud missions: router
 const WsMissionsRoomsRpc = missionRpc(
   WS_METHODS.missionsRooms,
@@ -2287,6 +2303,8 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsCloseForkRpc,
   WsMissionsUpdateForkRpc,
   WsMissionsAckNoteRpc,
+  WsMissionsWorkItemsRpc,
+  WsMissionsTimelineRpc,
   // ardud missions: router
   WsMissionsRoomsRpc,
   WsMissionsRoomPageRpc,

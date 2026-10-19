@@ -225,6 +225,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.missionsSubscribeList]: AuthOrchestrationReadScope,
   [WS_METHODS.missionsSubscribe]: AuthOrchestrationReadScope,
   [WS_METHODS.missionsInbox]: AuthOrchestrationReadScope,
+  [WS_METHODS.missionsWorkItems]: AuthOrchestrationReadScope,
+  [WS_METHODS.missionsTimeline]: AuthOrchestrationReadScope,
   // ardud missions: policy
   ...MISSIONS_POLICY_READ_SCOPES,
   // ardud missions: asks

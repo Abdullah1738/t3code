@@ -263,6 +263,8 @@ const RPC_AGGREGATES = {
   [WS_METHODS.missionsCloseFork]: "missions",
   [WS_METHODS.missionsUpdateFork]: "missions",
   [WS_METHODS.missionsAckNote]: "missions",
+  [WS_METHODS.missionsWorkItems]: "missions",
+  [WS_METHODS.missionsTimeline]: "missions",
   // ardud missions: router
   [WS_METHODS.missionsRooms]: "missions",
   [WS_METHODS.missionsRoomPage]: "missions",

@@ -2928,6 +2928,67 @@ export const RecordTriggerFactsResult = Schema.Struct({
   verdict: Schema.NullOr(CriticalityVerdict),
 });
 export type RecordTriggerFactsResult = typeof RecordTriggerFactsResult.Type;
+
+/**
+ * One page of a mission's work items, most recently changed first. Filter by
+ * lane and by stage; page with `offset` (the count already shown).
+ */
+export const MissionWorkItemsInput = Schema.Struct({
+  missionId: MissionId,
+  laneId: Schema.optional(LaneId),
+  stages: Schema.optional(Schema.Array(WorkStage)),
+  offset: Schema.optional(NonNegativeInt),
+  /** Default 100, at most 500. */
+  limit: Schema.optional(PositiveInt),
+});
+export type MissionWorkItemsInput = typeof MissionWorkItemsInput.Type;
+
+export const MissionWorkItemsPage = Schema.Struct({
+  missionId: MissionId,
+  items: Schema.Array(WorkItem),
+  /** Every item matching the filter, across all pages. */
+  total: NonNegativeInt,
+  hasMore: Schema.Boolean,
+});
+export type MissionWorkItemsPage = typeof MissionWorkItemsPage.Type;
+
+/** The Timeline's filter families, by event-kind prefix. */
+export const MissionTimelineGroup = Schema.Literals([
+  "mission",
+  "sub-mission",
+  "lane",
+  "role",
+  "rule",
+  "review",
+  "pool",
+  "routing",
+  "inbox",
+  "recovery",
+  "other",
+]);
+export type MissionTimelineGroup = typeof MissionTimelineGroup.Type;
+
+/** A page of the mission's timeline, newest first; pass the last seq as `beforeSeq` for older. */
+export const MissionTimelineInput = Schema.Struct({
+  missionId: MissionId,
+  beforeSeq: Schema.optional(PositiveInt),
+  /** Default 100, at most 500. */
+  limit: Schema.optional(PositiveInt),
+});
+export type MissionTimelineInput = typeof MissionTimelineInput.Type;
+
+export const MissionTimelineEntry = Schema.Struct({
+  event: MissionEvent,
+  group: MissionTimelineGroup,
+});
+export type MissionTimelineEntry = typeof MissionTimelineEntry.Type;
+
+export const MissionTimelinePage = Schema.Struct({
+  missionId: MissionId,
+  entries: Schema.Array(MissionTimelineEntry),
+  hasOlder: Schema.Boolean,
+});
+export type MissionTimelinePage = typeof MissionTimelinePage.Type;
 // --- end core additions ---
 
 /** The master records that it relied on a rule, or that work broke it. */
