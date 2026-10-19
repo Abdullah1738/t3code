@@ -17,7 +17,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import type { SqlError } from "effect/sql/SqlError";
 
-import type { MemberKind } from "./model.ts";
+import { actorKey, type MemberKind } from "./model.ts";
 
 /**
  * Router tables. Knocks are core mission records (the owner inbox reads them);
@@ -337,6 +337,15 @@ export class RouterStore extends Context.Service<
       readonly first: MissionMessage | null;
       readonly total: number;
     }>;
+    /**
+     * Per room of a mission: every message, and those after the owner's read
+     * mark that the owner did not write. Rooms with no messages are absent.
+     */
+    readonly roomCounts: (
+      missionId: MissionId,
+    ) => Effect.Effect<
+      ReadonlyMap<string, { readonly total: number; readonly unreadForOwner: number }>
+    >;
     readonly roomKindsSince: (
       roomId: RoomId,
       sinceIso: string,
@@ -825,6 +834,31 @@ const make = Effect.gen(function* () {
             total: Number(counted[0]?.total ?? 0),
           };
         }),
+      ),
+
+    roomCounts: (missionId) =>
+      read(
+        sql<{ readonly roomId: string; readonly total: number; readonly unread: number }>`
+          SELECT m.room_id AS "roomId",
+            COUNT(*) AS "total",
+            SUM(CASE WHEN m.seq > COALESCE(r.seq, 0)
+              AND json_extract(m.message_json, '$.author._tag') != 'owner' THEN 1 ELSE 0 END) AS "unread"
+          FROM ardud_mission_router_messages m
+          LEFT JOIN ardud_mission_router_reads r
+            ON r.room_id = m.room_id AND r.reader_key = ${actorKey({ _tag: "owner" })}
+          WHERE m.mission_id = ${missionId}
+          GROUP BY m.room_id
+        `.pipe(
+          Effect.map(
+            (rows) =>
+              new Map(
+                rows.map((row) => [
+                  row.roomId,
+                  { total: Number(row.total), unreadForOwner: Number(row.unread ?? 0) },
+                ]),
+              ),
+          ),
+        ),
       ),
 
     roomKindsSince: (roomId, sinceIso) =>

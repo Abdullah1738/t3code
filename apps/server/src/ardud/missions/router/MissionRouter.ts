@@ -1169,6 +1169,29 @@ const make = Effect.gen(function* () {
       return yield* tuningOf(room);
     });
 
+  /** The latest `member.changed` for a principal: true added, false removed, null never. */
+  const lastMemberChange = (missionId: MissionId, principal: string) =>
+    Effect.gen(function* () {
+      let latest: boolean | null = null;
+      let after = 0;
+      for (;;) {
+        const page = yield* store.eventsSince(missionId, after);
+        if (page.length === 0) return latest;
+        for (const event of page) {
+          if (event.kind !== "member.changed") continue;
+          if (typeof event.payload !== "object" || event.payload === null) continue;
+          const change = event.payload as {
+            readonly principal?: unknown;
+            readonly member?: unknown;
+          };
+          if (change.principal === principal && typeof change.member === "boolean") {
+            latest = change.member;
+          }
+        }
+        after = page.at(-1)!.seq;
+      }
+    });
+
   const setMember = (input: SetMissionMemberInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const cast = yield* loadCast(input.missionId);
@@ -1194,6 +1217,23 @@ const make = Effect.gen(function* () {
         }
       }
       const { principal, label, kind } = memberRowOf(input.principal);
+      // A removed actor stays out until the owner or master puts it back: the
+      // import and the actor itself cannot undo the removal.
+      const selfAdd =
+        provenance._tag === "agent" &&
+        input.principal._tag === "thread" &&
+        input.principal.threadId === provenance.threadId;
+      if (
+        input.member &&
+        !owner &&
+        (provenance._tag === "import" || selfAdd) &&
+        (yield* lastMemberChange(input.missionId, principal)) === false
+      ) {
+        return yield* fail(
+          "forbidden",
+          `${principal} was removed from this mission; only the owner or the master can add it back.`,
+        );
+      }
       const at = yield* nowIso;
       const result = yield* store.commit({
         event: {
@@ -1746,8 +1786,20 @@ const make = Effect.gen(function* () {
     // Owner request rooms live in the requests section, not the room list.
     rooms: (missionId, provenance) =>
       requireReader(missionId, provenance).pipe(
-        Effect.andThen(rooms.rooms(missionId)),
-        Effect.map((all) => all.filter((room) => room.kind !== "owner-request")),
+        Effect.andThen(Effect.all([rooms.rooms(missionId), rooms.roomCounts(missionId)])),
+        // The counts ride along so a list never has to count from one page.
+        Effect.map(([all, counts]) =>
+          all
+            .filter((room) => room.kind !== "owner-request")
+            .map((room) => {
+              const count = counts.get(room.id);
+              return {
+                ...room,
+                messageCount: count?.total ?? 0,
+                unreadForOwner: count?.unreadForOwner ?? 0,
+              };
+            }),
+        ),
       ),
     roomPage,
     messageBody,
