@@ -342,4 +342,77 @@ describe("AsksService", () => {
       expect(posts).toEqual([{ input, provenance: agent(laneThread) }]);
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect(
+    "tells the writer each decision; it records the send once; the master withdraws",
+    () => {
+      const { posts, layer } = harness();
+      return Effect.gen(function* () {
+        yield* seed;
+        const asks = yield* AsksService.AsksService;
+        const target = { kind: "ticket" as const, label: "CRP-1", url: null, ref: "CRP-1" };
+        const submit = (text: string) =>
+          asks.submitDraft(
+            { missionId, audience: "Sami", channel: "linear", target, text },
+            agent(writerThread),
+          );
+        const draft = yield* submit("The fix is merged.");
+        expect(draft.approver).toBe("owner");
+        yield* asks.decideDraft(
+          { draftId: draft.id, action: "approve", editedText: "Fix merged.", revision: 0 },
+          ownerApp,
+        );
+        expect(posts).toHaveLength(1);
+        expect(posts[0]).toMatchObject({
+          input: {
+            missionId,
+            roomId: `${missionId}:room:control`,
+            kind: "decision",
+            to: [{ _tag: "role", roleId: "role-writer" }],
+            key: `draft:${draft.id}:approved:0`,
+          },
+          provenance: { _tag: "system", component: "asks" },
+        });
+        expect(posts[0]?.input.body?.endsWith("\nFix merged.")).toBe(true);
+
+        expect(
+          yield* failureCode(asks.recordDraftSent({ draftId: draft.id }, agent(laneThread))),
+        ).toBe("forbidden");
+        const link = { kind: "ticket" as const, label: "CRP-1 comment", url: null, ref: "CRP-1" };
+        const sent = yield* asks.recordDraftSent({ draftId: draft.id, link }, agent(writerThread));
+        expect(sent).toMatchObject({ status: "sent", sentLink: link });
+        const again = yield* asks.recordDraftSent({ draftId: draft.id }, agent(writerThread));
+        expect(again.sentAt).toBe(sent.sentAt);
+        expect(
+          yield* failureCode(
+            asks.recordDraftSent(
+              { draftId: draft.id, link: { ...link, label: "elsewhere", ref: "CRP-2" } },
+              agent(writerThread),
+            ),
+          ),
+        ).toBe("conflict");
+
+        // The master takes a waiting owner-routed draft back on its own, with a note.
+        const second = yield* submit("Another update.");
+        expect(
+          yield* failureCode(
+            asks.withdrawDraft({ draftId: second.id, note: "Covered" }, agent(writerThread)),
+          ),
+        ).toBe("forbidden");
+        const withdrawn = yield* asks.withdrawDraft(
+          { draftId: second.id, note: "Covered in the first one" },
+          agent(masterThread),
+        );
+        expect(withdrawn).toMatchObject({
+          status: "dropped",
+          withdrawNote: "Covered in the first one",
+        });
+        expect(posts.at(-1)?.input.summary).toBe("Withdrawn: draft for Sami (linear)");
+        expect(posts.at(-1)?.input.body).toContain("Covered in the first one");
+
+        const kinds = (yield* asks.events(missionId, 0)).map((event) => event.kind);
+        expect(kinds.filter((kind) => kind === "draft.sent")).toHaveLength(1);
+      }).pipe(Effect.provide(layer));
+    },
+  );
 });

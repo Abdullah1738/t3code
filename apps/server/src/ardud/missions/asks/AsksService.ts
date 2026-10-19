@@ -33,6 +33,7 @@ import {
   type OwnerCondition,
   type PostMessageInput,
   type ReactToCallInput,
+  type RecordDraftSentInput,
   type ReopenAskInput,
   type ReopenDraftInput,
   type ReopenSuggestionInput,
@@ -45,6 +46,8 @@ import {
   type MissionMasterInbox,
   type SystemDraftDecision,
   type WithdrawAskInput,
+  type WithdrawDraftInput,
+  RoomId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -77,13 +80,16 @@ import {
   annotationOf,
   closeStaleDraft,
   decideDraft,
+  draftDecisionNotice,
   draftExamples,
   draftRef,
+  draftWriter,
   type DraftAbout,
   type DraftExample,
   notesFor,
   openSystemDraft,
   pullRequestKeyOf,
+  recordDraftSent,
   reopenDraft,
   reportDraftSent,
   reviseDraft,
@@ -92,6 +98,7 @@ import {
   saveDraftNote,
   submitDraft,
   systemDraftDecision,
+  withdrawDraft,
 } from "./draftModel.ts";
 import { heldLane, heldRecords, heldWorkItem, type HeldRecord } from "./holds.ts";
 import * as Inbound from "./inbound.ts";
@@ -258,6 +265,13 @@ export class AsksService extends Context.Service<
       provenance: MissionProvenance,
     ) => Fx<DraftDecisionResult>;
     readonly reopenDraft: (input: ReopenDraftInput, provenance: MissionProvenance) => Fx<Draft>;
+    /** The master takes back a waiting draft, whoever decides it, with a note the owner sees. */
+    readonly withdrawDraft: (input: WithdrawDraftInput, provenance: MissionProvenance) => Fx<Draft>;
+    /** The writer (or master) posted a thread draft's approved text: it is sent, once. */
+    readonly recordDraftSent: (
+      input: RecordDraftSentInput,
+      provenance: MissionProvenance,
+    ) => Fx<Draft>;
     /** Owner or master hands one pending draft to the other approver, with a reason. */
     readonly routeDraft: (input: RouteDraftInput, provenance: MissionProvenance) => Fx<Draft>;
     readonly saveDraftNote: (
@@ -322,6 +336,9 @@ const newestOf = <T extends { readonly createdAt: string }>(items: ReadonlyArray
 
 const fail = (code: MissionError["code"], detail: string) =>
   Effect.fail(new MissionError({ code, detail }));
+
+/** Who speaks when asks itself posts into a room. */
+const ASKS_SYSTEM: MissionProvenance = { _tag: "system", component: "asks" };
 
 /** The line the owner reads in his conversation about an ask once it is answered. */
 const answeredNote = (ask: Ask): string => {
@@ -694,6 +711,44 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  /**
+   * One knock to the thread that wrote a decided draft, in the mission's
+   * control room through the router: the decision, the approved text and any
+   * note. Nobody is told when the writer decided it itself; a failure is
+   * logged and never undoes the decision.
+   */
+  const tellWriter = (draft: Draft) =>
+    Effect.gen(function* () {
+      const writer = draftWriter(draft);
+      const notice = draftDecisionNotice(draft);
+      if (writer === null || notice === null) return;
+      const decider = draft.decidedBy;
+      if (
+        decider !== null &&
+        decider._tag === "agent" &&
+        writer._tag === "role" &&
+        decider.roleId === writer.roleId
+      ) {
+        return;
+      }
+      yield* rooms.post(
+        {
+          missionId: draft.missionId,
+          roomId: RoomId.make(`${draft.missionId}:room:control`),
+          kind: "decision",
+          summary: notice.summary,
+          body: notice.body,
+          to: [writer],
+          key: `draft:${draft.id}:${draft.status}:${draft.revision ?? 0}`,
+        },
+        ASKS_SYSTEM,
+      );
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Draft decision did not reach its writer", { draftId: draft.id, cause }),
+      ),
+    );
+
   const reopenAskCommand = (input: ReopenAskInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const ask = yield* need("ask", input.askId);
@@ -1042,6 +1097,43 @@ const make = Effect.gen(function* () {
         { _tag: "draft", record: reopened.record },
       ]);
       return reopened.record;
+    });
+
+  const withdrawDraftCommand = (input: WithdrawDraftInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const { standing } = yield* standingIn(draft.missionId, provenance);
+      const withdrawn = yield* fromOutcome(
+        withdrawDraft({
+          draft,
+          provenance: standing.caller.provenance,
+          callerIsMaster: standing.isMaster,
+          note: input.note,
+          now: yield* now,
+        }),
+      );
+      yield* persist(draft.missionId, withdrawn.events, [
+        { _tag: "draft", record: withdrawn.record },
+      ]);
+      return withdrawn.record;
+    });
+
+  const recordDraftSentCommand = (input: RecordDraftSentInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const { standing } = yield* standingIn(draft.missionId, provenance);
+      const sent = yield* fromOutcome(
+        recordDraftSent({
+          draft,
+          caller: standing.caller,
+          callerIsMaster: standing.isMaster,
+          link: input.link ?? null,
+          now: yield* now,
+        }),
+      );
+      if (sent.events.length === 0) return sent.record;
+      yield* persist(draft.missionId, sent.events, [{ _tag: "draft", record: sent.record }]);
+      return sent.record;
     });
 
   const routeDraftCommand = (input: RouteDraftInput, provenance: MissionProvenance) =>
@@ -1806,8 +1898,15 @@ const make = Effect.gen(function* () {
             ? Effect.void
             : settleDiscussion(draftRef(result.draft), decidedNote(result.draft)),
         ),
+        Effect.tap((result) => tellWriter(result.draft)),
       ),
     reopenDraft: (input, provenance) => serialized(reopenDraftCommand(input, provenance)),
+    withdrawDraft: (input, provenance) =>
+      serialized(withdrawDraftCommand(input, provenance)).pipe(
+        Effect.tap((draft) => settleDiscussion(draftRef(draft), `Withdrawn: ${input.note}`)),
+        Effect.tap(tellWriter),
+      ),
+    recordDraftSent: (input, provenance) => serialized(recordDraftSentCommand(input, provenance)),
     routeDraft: (input, provenance) => serialized(routeDraftCommand(input, provenance)),
     saveDraftNote: (input, provenance) => serialized(saveDraftNoteCommand(input, provenance)),
     setDraftNoteActive: (input, provenance) =>

@@ -419,6 +419,58 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect(
+    "the writer records an approved draft sent once; the master withdraws an owner draft",
+    () => {
+      const { layer } = toolsLayer();
+      return Effect.gen(function* () {
+        yield* seed;
+        const master = threadCaller(masterThread);
+        const writer = threadCaller(writerThread);
+        const draftOf = (text: string) =>
+          call("mission_draft", writer, {
+            missionId,
+            audience: "Sam",
+            channel: "linear",
+            target: { kind: "ticket", label: "CRP-9", url: null, ref: "CRP-9" },
+            text,
+          }).pipe(Effect.map((result) => (result.structured.draft as { id: string }).id));
+        const draftId = yield* draftOf("Fixed in the latest deploy.");
+        expect((yield* call("mission_draft_sent", writer, { draftId })).text).toContain(
+          "only an approved draft is sent",
+        );
+        const asks = yield* AsksService.AsksService;
+        yield* asks.decideDraft(
+          { draftId: draftId as never, action: "approve", revision: 0 },
+          ownerApp,
+        );
+        const sent = yield* call("mission_draft_sent", writer, {
+          draftId,
+          link: { kind: "ticket", label: "CRP-9 comment", url: null, ref: "CRP-9" },
+        });
+        expect(sent.structured.draft).toMatchObject({ status: "sent" });
+        const twice = yield* call("mission_draft_sent", writer, {
+          draftId,
+          link: { kind: "ticket", label: "CRP-9 again", url: null, ref: "CRP-9#2" },
+        });
+        expect(twice.text).toContain("already sent");
+
+        const waiting = yield* draftOf("Second note.");
+        expect(
+          (yield* call("mission_draft_withdraw", writer, { draftId: waiting, note: "x" })).isError,
+        ).toBe(true);
+        const withdrawn = yield* call("mission_draft_withdraw", master, {
+          draftId: waiting,
+          note: "Folded into the first comment",
+        });
+        expect(withdrawn.structured.draft).toMatchObject({
+          status: "dropped",
+          withdrawNote: "Folded into the first comment",
+        });
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
   it.effect("lets only the master change the plan, keeping ask holds", () => {
     const { layer } = toolsLayer();
     return Effect.gen(function* () {

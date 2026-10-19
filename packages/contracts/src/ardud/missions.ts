@@ -1100,6 +1100,8 @@ export const Draft = Schema.Struct({
   previousText: Schema.optional(Schema.NullOr(Schema.String)),
   /** Owner requests whose condition decided an earlier epoch; they never decide this draft again. */
   spentConditionIds: Schema.optional(Schema.Array(OwnerRequestId)),
+  /** Why the master took it back from the owner; set only on a withdrawn (dropped) draft. */
+  withdrawNote: Schema.optional(Schema.NullOr(Schema.String)),
   // --- end asks additions ---
 });
 export type Draft = typeof Draft.Type;
@@ -3281,6 +3283,23 @@ export const ReportDraftSentInput = Schema.Struct({
   outcome: DraftSendOutcome,
 });
 export type ReportDraftSentInput = typeof ReportDraftSentInput.Type;
+
+/**
+ * The draft's writer (or the mission's master) records that it posted the approved text.
+ * `link` is where it went, when there is one. A sent draft is never sent again.
+ */
+export const RecordDraftSentInput = Schema.Struct({
+  draftId: DraftId,
+  link: Schema.optional(MissionLink),
+});
+export type RecordDraftSentInput = typeof RecordDraftSentInput.Type;
+
+/** The mission's master takes a draft back from whoever was deciding it; the note says why. */
+export const WithdrawDraftInput = Schema.Struct({
+  draftId: DraftId,
+  note: TrimmedNonEmptyString,
+});
+export type WithdrawDraftInput = typeof WithdrawDraftInput.Type;
 
 /** One mission, or every mission when null. */
 export const MissionScopeInput = Schema.Struct({

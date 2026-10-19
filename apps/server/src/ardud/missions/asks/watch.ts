@@ -41,7 +41,7 @@ export const matchesWatch = (event: MissionEvent, kind: WatchKind): boolean => {
     case "draft-opened":
       return event.kind === "draft.opened";
     case "draft-decided":
-      return event.kind === "draft.decided";
+      return event.kind === "draft.decided" && payloadField(event, "action") !== "reopen";
     case "suggestion-opened":
       return event.kind === "suggestion.opened";
     case "milestone-at-risk":
