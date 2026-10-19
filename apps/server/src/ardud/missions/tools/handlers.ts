@@ -10,6 +10,7 @@ import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as AsksService from "../asks/AsksService.ts";
 import { keepWorkItemHolds, laneHoldConflict } from "../asks/holds.ts";
+import * as MasterControls from "../core/MasterControls.ts";
 import * as RuleService from "../core/RuleService.ts";
 import { watchAddCommand, watchCheckCommand } from "../asks/watch.ts";
 import * as MissionService from "../MissionService.ts";
@@ -92,26 +93,29 @@ const asMaster = <A>(
 const openAsks = (asks: AsksService.AsksService["Service"], missionId: MissionId) =>
   asks.asks({ missionId, status: ["open"] });
 
-/** New missions belong to no mission yet: any mission's master may create one. */
+/**
+ * New missions belong to no mission yet: any mission's master may create one.
+ * ardud missions: core - looked up from the complete thread index, never a
+ * capped mission list.
+ */
 const asAnyMaster = <A>(
   run: (
     missions: MissionService.MissionService["Service"],
     provenance: MissionProvenance,
   ) => Effect.Effect<A, MissionError>,
 ) =>
-  withCaller((asks, provenance) =>
+  withCaller((_asks, provenance) =>
     Effect.gen(function* () {
-      for (const mission of yield* asks.missions()) {
-        const standing = yield* asks.standing(mission.id, provenance);
-        if (standing.isMaster) {
-          const missions = yield* MissionService.MissionService;
-          return yield* run(missions, standing.caller.provenance);
-        }
+      const controls = yield* MasterControls.MasterControls;
+      const master = yield* controls.asAnyMaster(provenance);
+      if (master === null) {
+        return yield* new MissionError({
+          code: "forbidden",
+          detail: "Only a mission's master creates missions.",
+        });
       }
-      return yield* new MissionError({
-        code: "forbidden",
-        detail: "Only a mission's master creates missions.",
-      });
+      const missions = yield* MissionService.MissionService;
+      return yield* run(missions, master);
     }),
   );
 
@@ -472,6 +476,15 @@ const handlers = {
   mission_rule_change_resolve: McpToolAccess.actsAsCaller((input) =>
     withRules((rules, provenance) =>
       rules.resolveRuleChange(provenance, input).pipe(Effect.map((request) => ({ request }))),
+    ),
+  ),
+  // ardud missions: core - the master declines or withdraws a member's secret card
+  mission_secret_request_close: McpToolAccess.actsAsCaller((input) =>
+    withCaller((_asks, provenance) =>
+      Effect.gen(function* () {
+        const controls = yield* MasterControls.MasterControls;
+        return yield* controls.closeSecretRequest(provenance, input);
+      }),
     ),
   ),
 } satisfies McpToolAccess.Handlers<typeof MissionsToolkit.tools>;

@@ -1501,6 +1501,11 @@ export const MissionEventKind = Schema.Literals([
   "role.model-changed",
   "role.bound",
   "role.succession",
+  /**
+   * Payload `{ threadId, turnItemId, closedAs }`: the master declined or
+   * withdrew a member's secret request. Never carries a value.
+   */
+  "secret-request.closed",
   // --- policy additions ---
   "role.unbound",
   "role.updated",

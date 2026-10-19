@@ -4,6 +4,7 @@ import {
   EnvironmentId,
   ProviderInstanceId,
   ThreadId,
+  TurnItemId,
   WorkItemId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -14,6 +15,8 @@ import { McpSchema, McpServer } from "effect/ai";
 import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import { liveThreadsLayer } from "../../../mcp/McpToolAccess.testkit.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as SecretRequests from "../../../secrets/SecretRequests.ts";
 import * as AsksService from "../asks/AsksService.ts";
 import {
   askInput,
@@ -27,6 +30,9 @@ import {
   strayThread,
   writerThread,
 } from "../asks/AsksService.testkit.ts";
+import { crowdMissions } from "../core/crowd.testkit.ts";
+import * as MasterControls from "../core/MasterControls.ts";
+import { MasterSecretClose } from "../core/secrets.ts";
 import * as RuleService from "../core/RuleService.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
@@ -70,12 +76,32 @@ const mcpClient = McpSchema.McpServerClient.of({
 
 const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
   const { deliveries, layer } = harness(inbound);
+  // What the tools hand the secret service: the card and who answers it.
+  const answered: Array<Parameters<SecretRequests.SecretRequests["Service"]["answer"]>> = [];
+  const secrets = Layer.mock(SecretRequests.SecretRequests)({
+    answer: (...args) => Effect.sync(() => void answered.push(args)),
+  });
+  // The card as the close left it, for the service's read-back.
+  const cards = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (threadId) =>
+      Effect.succeed({
+        turnItems: answered
+          .filter(([input]) => input.threadId === threadId)
+          .map(([input]) => ({
+            id: input.turnItemId,
+            type: "secret_request",
+            secretStatus: input.answer.type === "decline" ? "declined" : "cancelled",
+          })),
+      } as never),
+  });
   return {
     deliveries,
+    answered,
     layer: McpHttpServer.toolkitRegistration(MissionsToolkit, MissionsHandlers.layer).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
       Layer.provideMerge(liveThreadsLayer),
       Layer.provideMerge(RuleService.layer),
+      Layer.provideMerge(MasterControls.layer.pipe(Layer.provide([secrets, cards]))),
       Layer.provideMerge(layer),
     ),
   };
@@ -696,6 +722,77 @@ describe("mission MCP tools", () => {
         on: ["ask-opened"],
       });
       expect(unknown.isError).toBe(true);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("N10: the master of a mission past the first page of missions creates missions", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* crowdMissions;
+      const created = yield* call("mission_create", threadCaller(masterThread), {
+        slug: "side",
+        title: "Side mission",
+      });
+      expect(created.isError, created.text).toBe(false);
+      const store = yield* MissionStore.MissionStore;
+      const [event] = yield* store.recentEvents((created.structured.ref as { id: never }).id, 1);
+      expect(event?.actor).toEqual({ _tag: "role", roleId: "role-master" });
+      const lane = yield* call("mission_create", threadCaller(laneThread), {
+        slug: "lane-side",
+        title: "Lane side",
+      });
+      expect(lane.isError).toBe(true);
+      expect(lane.text).toContain("forbidden");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("lets the master decline or withdraw a member's secret card, never fill it", () => {
+    const { answered, layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const turnItemId = TurnItemId.make("turn-item:secret-request:1");
+      const close = (caller: ThreadId, args: Record<string, unknown> = {}) =>
+        call("mission_secret_request_close", threadCaller(caller), {
+          missionId,
+          threadId: writerThread,
+          turnItemId,
+          closeAs: "decline",
+          ...args,
+        });
+
+      const declined = yield* close(masterThread);
+      expect(declined.isError, declined.text).toBe(false);
+      expect(declined.structured.status).toBe("declined");
+      const withdrawn = yield* close(masterThread, { threadId: laneThread, closeAs: "withdraw" });
+      expect(withdrawn.structured.status).toBe("cancelled");
+      expect(answered.map(([input]) => [input.threadId, input.answer])).toEqual([
+        [writerThread, { type: "decline" }],
+        [laneThread, { type: "withdraw" }],
+      ]);
+      // Each went through as the master's grant for that card, not as the owner.
+      for (const [input, by] of answered) {
+        expect(by).toBeInstanceOf(MasterSecretClose);
+        expect((by as MasterSecretClose).turnItemId).toBe(input.turnItemId);
+      }
+
+      // No value parameter, and no one else closes a member's card.
+      const save = yield* Effect.exit(close(masterThread, { closeAs: "save", secret: "x" }));
+      const saveOutcome = save._tag === "Success" ? save.value : null;
+      expect(saveOutcome === null || saveOutcome.isError).toBe(true);
+      for (const caller of [laneThread, writerThread, strayThread]) {
+        const refused = yield* close(caller);
+        expect(refused.isError).toBe(true);
+        expect(refused.text).toContain("forbidden");
+      }
+      const client = yield* call("mission_secret_request_close", clientCaller, {
+        missionId,
+        threadId: writerThread,
+        turnItemId,
+        closeAs: "decline",
+      });
+      expect(client.isError).toBe(true);
+      expect(answered).toHaveLength(2);
     }).pipe(Effect.provide(layer));
   });
 });
