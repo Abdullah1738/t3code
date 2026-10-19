@@ -2,18 +2,20 @@
 """Shared saved-card status: remember a declined card across agents.
 
 Every money path (commerce orders, Uber, app checkouts) runs
-`card-status check <last4>` first. A decline recorded in the last 12 hours
+`card-status check <last4>` first. A decline that happened in the last 12 hours
 refuses the card until Abdullah says it is fine again (`card-status ok`).
 Only the last four digits of a card are ever stored.
 
 State: ${CARD_STATUS_FILE:-~/.local/state/card-status.json}, one record per
-last4: {state: declined|ok, reason, source, at (epoch), note[, events]}.
+last4: {state: declined|ok, reason, source, at (epoch), note[, recorded_at, events]}.
+For a decline, `at` is when it happened and `recorded_at` when it was written.
 """
 import argparse
 import contextlib
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 import re
 import sys
@@ -66,6 +68,7 @@ def _text(value, field, *, required=False):
 def _valid_record(record):
     return (type(record) is dict and record.get('state') in STATES
             and type(record.get('at')) in (int, float)
+            and (record.get('recorded_at') is None or type(record['recorded_at']) in (int, float))
             and all(record.get(k) is None or type(record[k]) is str for k in ('reason', 'source', 'note'))
             and (record.get('events') is None or (type(record['events']) is list
                                                   and all(type(e) is str for e in record['events']))))
@@ -122,15 +125,22 @@ def _dubai(at, *, with_date=False):
 def _public(last4, record):
     if not record:
         return {'card_last4': last4, 'state': None, 'reason': None, 'source': None,
-                'at': None, 'at_dubai': None, 'note': None}
+                'at': None, 'at_dubai': None, 'recorded_at': None, 'note': None}
     return {'card_last4': last4, 'state': record['state'], 'reason': record.get('reason'),
             'source': record.get('source'), 'at': record['at'],
             'at_dubai': dt.datetime.fromtimestamp(record['at'], DUBAI).isoformat(),
-            'note': record.get('note')}
+            'recorded_at': record.get('recorded_at'), 'note': record.get('note')}
+
+
+def _recorded_later(record):
+    recorded = record.get('recorded_at')
+    if recorded is None or recorded - record['at'] < 60:
+        return ''
+    return f", recorded {_dubai(recorded, with_date=True)}"
 
 
 def declined_message(last4, record):
-    return (f"card {last4} declined at {_dubai(record['at'])} Dubai "
+    return (f"card {last4} declined at {_dubai(record['at'])} Dubai{_recorded_later(record)} "
             f"({record.get('reason') or 'no reason given'}, {record.get('source') or 'manual'}). "
             f"Ask Abdullah before trying it again; clear with: card-status ok {last4}")
 
@@ -157,25 +167,38 @@ def check(last4, *, now=None):
         result.update(blocked=True, error='CARD_RECENTLY_DECLINED', message=declined_message(last4, record))
     elif record['state'] == 'declined':
         result['message'] = (f"card {last4} last declined at {_dubai(record['at'], with_date=True)} Dubai, "
-                             f'more than 12h ago')
+                             f'more than 12h ago{_recorded_later(record)}')
     else:
         note = f" ({record['note']})" if record.get('note') else ''
         result['message'] = f"card {last4} ok since {_dubai(record['at'], with_date=True)} Dubai{note}"
     return result
 
 
-def record_declined(last4, *, reason, source=None, event=None, not_before=None, now=None):
+def _occurred(occurred_at, recorded):
+    """When the decline happened, never later than now. Unusable input means now."""
+    if type(occurred_at) not in (int, float) or not math.isfinite(occurred_at) or occurred_at <= 0:
+        return recorded
+    return min(math.ceil(occurred_at), recorded)
+
+
+def record_declined(last4, *, reason, source=None, event=None, not_before=None, occurred_at=None, now=None):
     """Record a decline. The same event (order/flow id) is recorded only once.
 
     `not_before` is when the failed attempt started; a card record written
     after it wins, so a late re-read of an old failure never re-blocks a card
     that was cleared since.
+
+    `occurred_at` is when the decline really happened, for a late re-read of an
+    old flow. The record's `at` (and so the 12h block) starts then, clamped to
+    now; a decline older than the current record does not replace it. Without
+    it the decline is taken to have happened now.
     """
     last4 = _last4(last4)
     reason = _text(reason, 'reason', required=True)
     source = _text(source, 'source') or 'manual'
     event = _text(event, 'event')
-    stamp = int(time.time() if now is None else now)
+    recorded = int(time.time() if now is None else now)
+    stamp = recorded if occurred_at is None else _occurred(occurred_at, recorded)
     path = state_path()
     with _locked(path):
         try:
@@ -189,11 +212,13 @@ def record_declined(last4, *, reason, source=None, event=None, not_before=None, 
         events = list(previous.get('events') or [])
         if event is not None and event in events:
             return {**_public(last4, previous), 'recorded': False, 'duplicate_event': event}
-        if previous and not_before is not None and previous['at'] > not_before:
+        if previous and ((not_before is not None and previous['at'] > not_before)
+                         or (occurred_at is not None and previous['at'] > stamp)):
             return {**_public(last4, previous), 'recorded': False, 'superseded': True}
         if event is not None:
             events = (events + [event])[-EVENT_LIMIT:]
-        record = {'state': 'declined', 'reason': reason, 'source': source, 'at': stamp, 'note': None}
+        record = {'state': 'declined', 'reason': reason, 'source': source, 'at': stamp,
+                  'recorded_at': recorded, 'note': None}
         if events:
             record['events'] = events
         data[last4] = record

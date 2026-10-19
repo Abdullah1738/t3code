@@ -796,17 +796,19 @@ def card_preflight(args):
     return status if status['blocked'] else None
 
 
-def note_card_decline(result, *, app, not_before=None):
+def note_card_decline(result, *, app, not_before=None, occurred_at=None):
     """Record a clear card decline so every other money path refuses the card.
 
-    Bookkeeping only: never raises, never changes the payment outcome.
+    `occurred_at` is when an old decline really happened (recovery re-reads);
+    None means it happened just now. Bookkeeping only: never raises, never
+    changes the payment outcome.
     """
     if not isinstance(result,dict) or result.get('reason') not in CARD_DECLINE_REASONS:return None
     flow=result.get('flow_id')
     try:
         recorded=card_status.record_declined(ORDER_CARD_LAST4,reason=result['reason'],
             source=f"commerce {app} {result.get('order') or flow}",event=flow,
-            not_before=not_before)['recorded']
+            not_before=not_before,occurred_at=occurred_at)['recorded']
         current=card_status.check(ORDER_CARD_LAST4)
         return {'card_last4':ORDER_CARD_LAST4,'recorded':recorded,'blocked':current['blocked'],
                 'message':current['message']}
@@ -953,10 +955,14 @@ def main(argv=None):
         elif args.command=='recover-payment':
             result=recover_payment(args.flow_id,max_reads=args.max_reads,recipient=args.recipient)
             if isinstance(result,dict) and result.get('reason') in CARD_DECLINE_REASONS:
-                # A late read of an old flow must not re-block a card cleared since it started.
+                # A late read of an old flow must not re-block a card cleared since it started,
+                # and its 12h block runs from when the decline was observed, not from this read.
                 try:started=journal.flow_created_at(args.flow_id)
                 except Exception:started=None
-                noted=note_card_decline(result,app='talabat',not_before=started)
+                try:occurred=journal.decline_observed_at(args.flow_id)
+                except Exception:occurred=None
+                # No decline row (receipt parked before it was journaled): treat it as now.
+                noted=note_card_decline(result,app='talabat',not_before=started,occurred_at=occurred)
                 if noted:result={**result,'card_status':noted}
         elif args.command=='order-status':
             from commerce_order_status import status

@@ -651,6 +651,22 @@ def flow_created_at(flow_id):
         return row['created_at']
 
 
+def decline_observed_at(flow_id):
+    """When a reported payment error was observed for this flow, or None. Read-only.
+
+    A reported error (a card decline included) is journaled as UNKNOWN on the
+    payment operation. A conclusive status read stops the poller, so the latest
+    such row is at or after the decline a recovery re-reads (never earlier).
+    """
+    with _db() as db:
+        _get(db, flow_id)
+        row = db.execute("SELECT MAX(o.observed_at) AS at FROM observations o JOIN operations p "
+                         "ON p.flow_id=o.flow_id AND p.name=o.operation "
+                         "WHERE o.flow_id=? AND p.kind='payment' AND o.outcome='UNKNOWN'",
+                         (flow_id,)).fetchone()
+        return row['at']
+
+
 def preorder_status(flow_id):
     """Read durable pre-order phase without exposing payment secrets."""
     with _db() as db:

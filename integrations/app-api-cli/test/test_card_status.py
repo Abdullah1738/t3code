@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,6 +136,79 @@ class CardStatusModuleTests(TempState):
         fresh = cs.record_declined('5542', reason=DECLINE, event='fresh', not_before=AT + 150, now=AT + 200)
         self.assertTrue(fresh['recorded'])
 
+    def test_old_decline_re_read_is_recorded_but_does_not_block(self):
+        now = AT + 24 * 3600
+        late = cs.record_declined('5542', reason=DECLINE, event=FLOW, not_before=AT - 60,
+                                  occurred_at=AT, now=now)
+        self.assertTrue(late['recorded'])
+        record = self.stored()['5542']
+        self.assertEqual((record['state'], record['at'], record['recorded_at'], record['events']),
+                         ('declined', AT, now, [FLOW]))
+        result = cs.check('5542', now=now)
+        self.assertFalse(result['blocked'])
+        self.assertEqual(result['message'],
+                         'card 5542 last declined at 2026-10-18 11:11 Dubai, more than 12h ago, '
+                         'recorded 2026-10-19 11:11')
+
+    def test_recent_decline_re_read_blocks_until_12h_after_it_happened(self):
+        occurred = AT - 2 * 3600
+        cs.record_declined('5542', reason=DECLINE, event=FLOW, not_before=occurred - 60,
+                           occurred_at=occurred, now=AT)
+        blocked = cs.check('5542', now=AT)
+        self.assertTrue(blocked['blocked'])
+        self.assertEqual(blocked['error'], 'CARD_RECENTLY_DECLINED')
+        self.assertIn('declined at 09:11 Dubai, recorded 2026-10-18 11:11 (', blocked['message'])
+        self.assertTrue(cs.check('5542', now=occurred + 12 * 3600 - 1)['blocked'])
+        self.assertFalse(cs.check('5542', now=occurred + 12 * 3600)['blocked'])
+
+    def test_decline_time_in_the_future_or_unusable_is_clamped_to_now(self):
+        for bad in (AT + 3600, float('inf'), float('nan'), 0, -5, True, '1792307460'):
+            with self.subTest(occurred_at=bad):
+                self.path.unlink(missing_ok=True)
+                cs.record_declined('5542', reason=DECLINE, occurred_at=bad, now=AT)
+                self.assertEqual(self.stored()['5542']['at'], AT)
+                self.assertTrue(cs.check('5542', now=AT + 12 * 3600 - 1)['blocked'])
+                self.assertFalse(cs.check('5542', now=AT + 12 * 3600)['blocked'])
+
+    def test_live_decline_without_occurred_at_blocks_12h_from_now(self):
+        cs.record_declined('5542', reason=DECLINE, event=FLOW, now=AT)
+        record = self.stored()['5542']
+        self.assertEqual((record['at'], record['recorded_at']), (AT, AT))
+        self.assertTrue(cs.check('5542', now=AT + 12 * 3600 - 1)['blocked'])
+        self.assertFalse(cs.check('5542', now=AT + 12 * 3600)['blocked'])
+
+    def test_ok_after_a_re_read_decline_clears_and_a_later_re_read_stays_clear(self):
+        occurred = AT - 3600
+        cs.record_declined('5542', reason=DECLINE, event=FLOW, not_before=occurred - 60,
+                           occurred_at=occurred, now=AT)
+        self.assertTrue(cs.check('5542', now=AT)['blocked'])
+        cs.record_ok('5542', note='topped up', now=AT + 60)
+        self.assertFalse(cs.check('5542', now=AT + 120)['blocked'])
+        # Another old flow whose decline happened before the clear: still clear.
+        again = cs.record_declined('5542', reason=DECLINE, event='other-old-flow',
+                                   occurred_at=occurred + 30, now=AT + 120)
+        self.assertFalse(again['recorded'])
+        self.assertTrue(again['superseded'])
+        self.assertFalse(cs.check('5542', now=AT + 180)['blocked'])
+
+    def test_re_read_of_an_older_decline_never_shortens_a_newer_block(self):
+        cs.record_declined('5542', reason=DECLINE, event='fresh-flow', now=AT)
+        older = cs.record_declined('5542', reason=DECLINE, event=FLOW,
+                                   occurred_at=AT - 20 * 3600, now=AT + 60)
+        self.assertFalse(older['recorded'])
+        self.assertEqual(self.stored()['5542']['at'], AT)
+        self.assertTrue(cs.check('5542', now=AT + 12 * 3600 - 1)['blocked'])
+
+    def test_records_written_before_recorded_at_existed_still_load(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({'5542': {'state': 'declined', 'reason': DECLINE, 'source': 'uber',
+                                                  'at': AT, 'note': None}}))
+        result = cs.check('5542', now=AT + 60)
+        self.assertTrue(result['blocked'])
+        self.assertIsNone(result['recorded_at'])
+        self.path.write_text(json.dumps({'5542': {'state': 'declined', 'at': AT, 'recorded_at': 'soon'}}))
+        self.assertEqual(cs.check('5542', now=AT + 60)['error'], 'CARD_STATUS_UNREADABLE')
+
     def test_unreadable_state_fails_closed_and_decline_still_records(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text('{not json')
@@ -254,6 +328,9 @@ class CommerceCardRefusalTests(TempState):
         self.assertEqual((record['state'], record['reason'], record['source']),
                          ('declined', DECLINE, 'commerce talabat 3965762974'))
         self.assertEqual(record['events'], [FLOW])
+        # A live decline happened just now: the 12h block starts at this write.
+        self.assertEqual(record['at'], record['recorded_at'])
+        self.assertLess(abs(record['at'] - time.time()), 60)
         with patch.object(cli, 'purchase_talabat', side_effect=AssertionError('second order must not start')):
             code, refused = self.run_cli(self.LANES['talabat'][0])
         self.assertEqual((code, refused['error']), (3, 'CARD_RECENTLY_DECLINED'))
@@ -276,7 +353,8 @@ class CommerceCardRefusalTests(TempState):
         declined = {'ok': False, 'state': 'PAYMENT_ERROR_REPORTED', 'reason': DECLINE, 'flow_id': FLOW,
                     'order': '3965762974', 'financial_retry': False, 'completed': False}
         with patch.object(cli, 'recover_payment', return_value=dict(declined)), \
-                patch.object(cli.journal, 'flow_created_at', return_value=0):
+                patch.object(cli.journal, 'flow_created_at', return_value=0), \
+                patch.object(cli.journal, 'decline_observed_at', return_value=None):
             code, result = self.run_cli(['recover-payment', FLOW])
         self.assertEqual(code, 1)
         self.assertEqual((result['state'], result['reason']), ('PAYMENT_ERROR_REPORTED', DECLINE))
@@ -285,7 +363,8 @@ class CommerceCardRefusalTests(TempState):
         # Abdullah tops up; a later re-read of the same old flow keeps the card clear.
         cs.record_ok('5542', note='topped up')
         with patch.object(cli, 'recover_payment', return_value={**declined, 'flow_id': 'other-old-flow'}), \
-                patch.object(cli.journal, 'flow_created_at', return_value=0):
+                patch.object(cli.journal, 'flow_created_at', return_value=0), \
+                patch.object(cli.journal, 'decline_observed_at', return_value=None):
             code, result = self.run_cli(['recover-payment', 'other-old-flow'])
         self.assertEqual(code, 1)
         self.assertFalse(result['card_status']['recorded'])
