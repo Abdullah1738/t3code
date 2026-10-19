@@ -97,19 +97,19 @@ export interface SourceCounts {
   readonly crwHolds: number;
 }
 
-/** A coord.db actor the import enrols as a coord member of the mission. */
+/**
+ * A coord.db actor the import enrols as a coord member of the mission. Process
+ * actors such as crw have no thread; they are enrolled all the same.
+ */
 export interface CoordEnrolment {
   readonly actor: string;
-  readonly threadId: ThreadId;
+  readonly kind: string;
+  readonly threadId: ThreadId | null;
 }
 
-/**
- * Coord actors the shim accepts for the mission. Only actors coord.db binds to
- * a thread are enrolled; the rest are listed so the report can name them.
- */
+/** Coord actors the shim accepts for the mission: every coord.db actor. */
 export interface EnrolmentImport {
   readonly enrol: ReadonlyArray<CoordEnrolment>;
-  readonly unbound: ReadonlyArray<{ readonly actor: string; readonly kind: string }>;
 }
 
 export interface ImportPlan {
@@ -314,20 +314,21 @@ export const awaitingStaleReason = (
   return null;
 };
 
-/** Every coord.db actor bound to a thread becomes a coord member of the mission. */
-export const enrolmentsOf = (actors: ReadonlyArray<CoordActorRow>): EnrolmentImport => {
-  const byId = [...actors].sort((a, b) => a.id.localeCompare(b.id));
-  return {
-    enrol: byId.flatMap((a) =>
-      a.thread_id == null || a.thread_id.trim() === ""
-        ? []
-        : [{ actor: a.id, threadId: ThreadId.make(a.thread_id) }],
-    ),
-    unbound: byId.flatMap((a) =>
-      a.thread_id == null || a.thread_id.trim() === "" ? [{ actor: a.id, kind: a.kind }] : [],
-    ),
-  };
-};
+/**
+ * Every coord.db actor becomes a coord member of the mission, thread-bound or
+ * not, so process actors (crw) keep messaging once coord runs on the router.
+ * The master removes the ones it does not want; a removal outlives re-imports.
+ */
+export const enrolmentsOf = (actors: ReadonlyArray<CoordActorRow>): EnrolmentImport => ({
+  enrol: [...actors]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((a) => ({
+      actor: a.id,
+      kind: a.kind,
+      threadId:
+        a.thread_id == null || a.thread_id.trim() === "" ? null : ThreadId.make(a.thread_id),
+    })),
+});
 
 export const buildImportPlan = (sources: ImportSources, options: ImportOptions): ImportPlan => {
   const m = MissionId.make(options.missionId);
