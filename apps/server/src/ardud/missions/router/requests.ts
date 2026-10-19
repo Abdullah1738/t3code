@@ -1194,7 +1194,6 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             (body) => ({
               seq: message.seq,
               author: labelOf(cast, message.author),
-              at: message.createdAt,
               text: body ?? message.summary,
             }),
           ),
