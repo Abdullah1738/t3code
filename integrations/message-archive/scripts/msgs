@@ -1,0 +1,5 @@
+#!/bin/zsh -f
+# msgs: search the local message archive (email, iMessage, WhatsApp). See `msgs --help`.
+# Homebrew's python 3.14 has Full Disk Access (needed to read chat.db) and ships zstd.
+here="${0:A:h}"
+exec /opt/homebrew/opt/python@3.14/bin/python3.14 -u "$here/../src/msgs.py" "$@"

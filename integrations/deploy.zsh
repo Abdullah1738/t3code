@@ -7,8 +7,8 @@ set -eu
 name="${1:-}"
 shift || true
 case "$name" in
-  agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard) ;;
-  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard> [--dry-run]"; exit 2 ;;
+  agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive) ;;
+  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"
