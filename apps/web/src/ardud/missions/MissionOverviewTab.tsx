@@ -4,7 +4,6 @@ import { CheckIcon, MessagesSquareIcon } from "lucide-react";
 
 import {
   VIEW_BUILTIN_SECTION_TITLES,
-  type DirectionCheckItem,
   type FeedItem,
   type MissionId,
   type MissionOverview,
@@ -12,6 +11,7 @@ import {
 import {
   ageView,
   criticalPathView,
+  directionCheckRows,
   formatCountdown,
   formatDayLabel,
   formatRelative,
@@ -23,6 +23,7 @@ import {
   refLabel,
   resolveMissionLayout,
   splitFeed,
+  type DirectionCheckRow,
   type MissionInboxSnapshot,
   type MissionOverviewSnapshot,
   type MissionViewsState,
@@ -318,7 +319,10 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
     [overview.feed, overview.ownerLastLookedAt],
   );
   const [open, setOpen] = useState(false);
-  const calls = overview.directionCheck;
+  const calls = useMemo(
+    () => directionCheckRows(overview.directionCheck),
+    [overview.directionCheck],
+  );
   if (overview.feed.length === 0 && calls.length === 0) return null;
   const rows = open
     ? [...sections.fresh, ...sections.earlier]
@@ -352,10 +356,10 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
     >
       {calls.length > 0 ? (
         <ul aria-label="Calls to check" className="flex min-w-0 flex-col">
-          {calls.map((item) => (
+          {calls.map((row) => (
             <CallRow
-              key={refKey(item.ref)}
-              item={item}
+              key={`${refKey(row.item.ref)}-${row.item.at}`}
+              row={row}
               missionId={overview.mission.id}
               nowMs={nowMs}
             />
@@ -379,8 +383,8 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
   );
 }
 
-function CallRow(props: { item: DirectionCheckItem; missionId: MissionId; nowMs: number }) {
-  const { item } = props;
+function CallRow(props: { row: DirectionCheckRow; missionId: MissionId; nowMs: number }) {
+  const { item, count, reason } = props.row;
   const [busy, setBusy] = useState(false);
   const age = ageView(item.at, props.nowMs);
   // Only calls take "Fine"; structural changes (lanes, roles, rules) are
@@ -397,8 +401,16 @@ function CallRow(props: { item: DirectionCheckItem; missionId: MissionId; nowMs:
         <ByMarker by="master" label="The master's call" />
       </span>
       <div className="min-w-0">
-        <p className="text-sm text-pretty">{item.summary}</p>
-        <p className="mt-0.5 text-xs text-pretty text-muted-foreground">{item.reason}</p>
+        <p className="text-sm text-pretty">
+          {item.summary}
+          {count > 1 ? (
+            <span className="ms-1.5 inline-flex rounded-full bg-foreground/6 px-1.5 text-xs tabular-nums text-muted-foreground">
+              {count}
+              <span className="sr-only"> times</span>
+            </span>
+          ) : null}
+        </p>
+        <p className="mt-0.5 text-xs text-pretty text-muted-foreground">{reason}</p>
       </div>
       {age ? <AgeElement age={age} at={item.at} /> : null}
       <div className="col-start-2 col-end-4 flex items-center gap-1.5">
