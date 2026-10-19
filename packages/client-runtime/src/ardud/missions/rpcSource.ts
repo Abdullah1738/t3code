@@ -44,7 +44,6 @@ import { listedRoomUnread, pageUnread } from "./roomsViewModel.ts";
 import type {
   FieldChange,
   Listener,
-  MissionForkEntry,
   MissionInboxSnapshot,
   MissionPoolUsage,
   MissionRoomEntry,
@@ -71,7 +70,6 @@ export type MissionsStreamTag =
   | typeof WS_METHODS.missionsSubscribe
   | typeof WS_METHODS.missionsInbox
   | typeof ASKS.subscribeRules
-  | typeof ASKS.subscribeForks
   | typeof ASKS.subscribeDraftNotes
   | typeof ASKS.subscribeRouting
   | typeof VIEWS.subscribe;
@@ -365,7 +363,7 @@ export function poolUsageOf(view: PoolView): MissionPoolUsage {
   };
 }
 
-/** Records of one feed (rules, forks, draft notes), kept in server order. */
+/** Records of one feed (rules, draft notes), kept in server order. */
 function feedRecords(apply: (records: ReadonlyArray<MissionRecord>) => void) {
   const records = new Map<string, MissionRecord>();
   const keyOf = (kind: string, id: string) => `${kind}:${id}`;
@@ -1053,25 +1051,6 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         ),
       ),
 
-    subscribeForks(missionId, listener) {
-      // The server reads forks per mission; there is no all-missions feed.
-      if (missionId === null) {
-        listener([]);
-        return ignore;
-      }
-      return transport.stream(
-        ASKS.subscribeForks,
-        { missionId },
-        feedRecords((records) =>
-          listener(
-            newestFirst(
-              records.flatMap((record) => (record._tag === "fork" ? [record.record] : [])),
-            ).map((fork): MissionForkEntry => ({ fork, question: fork.question ?? null })),
-          ),
-        ),
-      );
-    },
-
     subscribeRules(missionId, listener) {
       let last: ReadonlyArray<Rule> | null = null;
       return rulesFeed(missionId, (records) => {
@@ -1117,19 +1096,6 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     },
     markMissionSeen: async (input) => {
       await transport.request(WS_METHODS.missionsMarkSeen, input);
-    },
-    openFork: async ({ missionId, kind, origin, question }) => {
-      const asked = question?.trim() ?? "";
-      const fork = await transport.request(WS_METHODS.missionsStartFork, {
-        missionId,
-        kind,
-        origin,
-        ...(asked.length > 0 ? { question: asked } : {}),
-      });
-      return { fork, question: fork.question ?? (asked.length > 0 ? asked : null) };
-    },
-    archiveFork: async ({ forkId }) => {
-      await transport.request(WS_METHODS.missionsUpdateFork, { forkId, action: "archive" });
     },
 
     // --- Inbox ---
