@@ -45,6 +45,8 @@ import * as RuleService from "../../../ardud/missions/core/RuleService.ts";
 import { MissionRouter } from "../../../ardud/missions/router/MissionRouter.ts";
 // ardud missions: recovery
 import * as RecoveryService from "../../../ardud/missions/recovery/RecoveryService.ts";
+// ardud missions: views
+import * as ViewService from "../../../ardud/missions/views/ViewService.ts";
 
 const layerStubServices = Layer.mergeAll(
   Layer.mock(Orchestrator.OrchestratorV2)({}),
@@ -79,6 +81,8 @@ const layerStubServices = Layer.mergeAll(
   Layer.mock(MissionRouter)({}),
   // ardud missions: recovery
   Layer.mock(RecoveryService.RecoveryService)({}),
+  // ardud missions: views
+  Layer.mock(ViewService.ViewService)({}),
 );
 
 const ToolsListPayload = Schema.fromJsonString(

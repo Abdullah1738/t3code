@@ -74,5 +74,8 @@ export * from "./ardud/missionsPolicyRpc.ts";
 export * from "./ardud/missionsAsksRpc.ts";
 // ardud missions: recovery
 export * from "./ardud/missionsRecoveryRpc.ts";
+// ardud missions: views
+export * from "./ardud/missionsViews.ts";
+export * from "./ardud/missionsViewsRpc.ts";
 export * from "./secretRequest.ts";
 export * from "./clientRpcPermissions.ts";

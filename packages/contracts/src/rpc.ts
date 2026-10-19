@@ -432,6 +432,8 @@ import { MissionsPolicyRpcs } from "./ardud/missionsPolicyRpc.ts";
 import { MissionsAsksRpcs } from "./ardud/missionsAsksRpc.ts";
 // ardud missions: recovery
 import { MissionsRecoveryRpcs } from "./ardud/missionsRecoveryRpc.ts";
+// ardud missions: views
+import { MissionsViewsRpcs } from "./ardud/missionsViewsRpc.ts";
 import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
@@ -2310,6 +2312,8 @@ export const WsMissionsPolicyRpcGroup = MissionsPolicyRpcs.middleware(RpcScopeAu
 export const WsMissionsAsksRpcGroup = MissionsAsksRpcs.middleware(RpcScopeAuthorization);
 // ardud missions: recovery
 export const WsMissionsRecoveryRpcGroup = MissionsRecoveryRpcs.middleware(RpcScopeAuthorization);
+// ardud missions: views
+export const WsMissionsViewsRpcGroup = MissionsViewsRpcs.middleware(RpcScopeAuthorization);
 
 /** Every WebSocket RPC not in a domain group merged into `WsRpcGroup` below. */
 export const WsCoreRpcGroup = RpcGroup.make(
@@ -2517,4 +2521,6 @@ export const WsRpcGroup = WsCoreRpcGroup.merge(
   WsMissionsAsksRpcGroup,
   // ardud missions: recovery
   WsMissionsRecoveryRpcGroup,
+  // ardud missions: views
+  WsMissionsViewsRpcGroup,
 );

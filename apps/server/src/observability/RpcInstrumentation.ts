@@ -5,6 +5,8 @@ import {
   MISSIONS_ASKS_AGGREGATES,
   // ardud missions: recovery
   MISSIONS_RECOVERY_AGGREGATES,
+  // ardud missions: views
+  MISSIONS_VIEWS_AGGREGATES,
   ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
   type WsRpcGroup,
@@ -235,6 +237,8 @@ const RPC_AGGREGATES = {
   ...MISSIONS_ASKS_AGGREGATES,
   // ardud missions: recovery
   ...MISSIONS_RECOVERY_AGGREGATES,
+  // ardud missions: views
+  ...MISSIONS_VIEWS_AGGREGATES,
   [WS_METHODS.missionsUpsertSubMission]: "missions",
   [WS_METHODS.missionsMergeSubMissions]: "missions",
   [WS_METHODS.missionsUpsertLane]: "missions",
