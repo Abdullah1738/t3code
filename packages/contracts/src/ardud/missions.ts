@@ -211,6 +211,20 @@ export const MissionRecordRef = Schema.Struct({
 });
 export type MissionRecordRef = typeof MissionRecordRef.Type;
 
+// --- discuss additions (coordinator) ---
+/**
+ * A decision a master made on a condition the owner stated in a Discuss
+ * conversation (an owner request about the record). `quote` is the owner's
+ * exact words; the deciding service checks they are in one of his messages in
+ * that request before it records the decision.
+ */
+export const OwnerCondition = Schema.Struct({
+  requestId: OwnerRequestId,
+  quote: TrimmedNonEmptyString,
+});
+export type OwnerCondition = typeof OwnerCondition.Type;
+// --- end discuss additions ---
+
 /** An outside link: a PR, CI run, Linear ticket, deploy readback, transcript range. */
 export const MissionLink = Schema.Struct({
   kind: Schema.Literals([
@@ -647,6 +661,10 @@ export const AskAnswer = Schema.Struct({
   text: Schema.String,
   provenance: MissionProvenance,
   answeredAt: IsoDateTime,
+  // --- discuss additions (coordinator) ---
+  /** Set when the master answered on a condition the owner stated in Discuss. */
+  onOwnerCondition: Schema.optional(Schema.NullOr(OwnerCondition)),
+  // --- end discuss additions ---
 });
 export type AskAnswer = typeof AskAnswer.Type;
 
@@ -703,6 +721,10 @@ export const Call = Schema.Struct({
   subject: Schema.NullOr(MissionRecordRef),
   ownerReaction: Schema.NullOr(Schema.Literals(["ok", "discuss", "overruled"])),
   createdAt: IsoDateTime,
+  // --- discuss additions (coordinator) ---
+  /** Set when the master revised the call on a condition the owner stated in Discuss. */
+  onOwnerCondition: Schema.optional(Schema.NullOr(OwnerCondition)),
+  // --- end discuss additions ---
 });
 export type Call = typeof Call.Type;
 
@@ -954,6 +976,10 @@ export const Draft = Schema.Struct({
   decidedBy: Schema.NullOr(MissionProvenance),
   decidedAt: Schema.NullOr(IsoDateTime),
   sentAt: Schema.NullOr(IsoDateTime),
+  // --- discuss additions (coordinator) ---
+  /** Set when the master decided the draft on a condition the owner stated in Discuss. */
+  onOwnerCondition: Schema.optional(Schema.NullOr(OwnerCondition)),
+  // --- end discuss additions ---
   createdAt: IsoDateTime,
   // --- asks additions ---
   /** Who decides it; picked by the mission's routing table. Missing means the owner. */
@@ -1046,6 +1072,8 @@ export const Approval = Schema.Struct({
   // --- core additions ---
   /** The note that came with the approve or reject. */
   decisionNote: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Set when the master decided the approval on a condition the owner stated in Discuss (discuss additions). */
+  onOwnerCondition: Schema.optional(Schema.NullOr(OwnerCondition)),
   /** Who decides it, from the mission's approval routing. Missing means owner. */
   approver: Schema.optional(Approver),
   /** Why the master last re-routed it. */
@@ -1507,6 +1535,10 @@ export const OwnerRequest = Schema.Struct({
   settledAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- discuss additions (coordinator) ---
+  /** The record the owner is discussing (Discuss on a card). At most one open request per subject. */
+  subject: Schema.optional(Schema.NullOr(MissionRecordRef)),
+  // --- end discuss additions ---
 });
 export type OwnerRequest = typeof OwnerRequest.Type;
 // --- end router additions ---
