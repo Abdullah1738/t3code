@@ -63,6 +63,10 @@
       "types": "./src/ardud/missions/index.ts",
       "default": "./src/ardud/missions/index.ts"
     },
+    "./ardud/missions/mobile": {
+      "types": "./src/ardud/missions/mobile/index.ts",
+      "default": "./src/ardud/missions/mobile/index.ts"
+    },
     "./connection": {
       "types": "./src/connection/index.ts",
       "default": "./src/connection/index.ts"

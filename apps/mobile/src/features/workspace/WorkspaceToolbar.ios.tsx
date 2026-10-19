@@ -112,6 +112,13 @@ export function WorkspaceToolbar(props: {
             })
           }
         />
+        {/* ardud missions: ui-mobile */}
+        <NativeHeaderToolbar.Button
+          accessibilityLabel="Missions"
+          icon="target"
+          onPress={() => navigation.navigate("Missions")}
+        />
+        {/* end ardud missions: ui-mobile */}
         {NATIVE_LIQUID_GLASS_SUPPORTED ? null : (
           <NativeHeaderToolbar.Button
             accessibilityLabel={
