@@ -4,6 +4,7 @@ import {
   AskId,
   EnvironmentId,
   MissionError,
+  MissionId,
   OwnerRequestId,
   ProviderInstanceId,
   ThreadId,
@@ -44,6 +45,7 @@ import type { InboundMessage } from "../asks/provenance.ts";
 import * as RuleService from "../core/RuleService.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import { fakeRouterThreads, routerOverFakes } from "../router/MissionRouter.testkit.ts";
 import { OwnerConditions } from "../discuss/OwnerConditions.ts";
 import * as MissionsHandlers from "./handlers.ts";
 import { MissionsToolkit } from "./tools.ts";
@@ -101,14 +103,18 @@ const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
       } as never);
     },
   });
+  // ardud missions: core - lane nudges post through the router
+  const threads = fakeRouterThreads();
   return {
     deliveries,
     answered,
+    threads,
     layer: McpHttpServer.toolkitRegistration(MissionsToolkit, MissionsHandlers.layer).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
       Layer.provideMerge(liveThreadsLayer),
       Layer.provideMerge(RuleService.layer),
       Layer.provideMerge(MasterControls.layer.pipe(Layer.provide([secrets, cards]))),
+      Layer.provideMerge(routerOverFakes(threads)),
       Layer.provideMerge(layer),
     ),
   };
@@ -710,6 +716,53 @@ describe("mission MCP tools", () => {
       expect(named.isError, named.text).toBe(false);
       const [event] = yield* store.recentEvents((named.structured.ref as { id: never }).id, 1);
       expect(event?.actor).toEqual({ _tag: "role", roleId: "role-lead-2" });
+    }).pipe(Effect.provide(layer));
+  });
+
+  // ardud missions: core
+  it.effect("the master nudges its own lanes and sets the portfolio order by tool", () => {
+    const { threads, layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const store = yield* MissionStore.MissionStore;
+
+      const nudged = yield* call("mission_lane_nudge", threadCaller(masterThread), {
+        missionId,
+        laneId: "lane-api",
+        note: "Where is the migration?",
+      });
+      expect(nudged.isError, nudged.text).toBe(false);
+      const [event] = yield* store.recentEvents(missionId, 1);
+      expect(event?.kind).toBe("lane.nudged");
+      expect(event?.actor).toEqual({ _tag: "role", roleId: "role-master" });
+      expect(
+        threads.sent.some(
+          (each) => each.threadId === laneThread && each.key.startsWith("mission-wake:"),
+        ),
+      ).toBe(true);
+      const otherLane = yield* call("mission_lane_nudge", threadCaller(masterThread), {
+        missionId,
+        laneId: "lane-other",
+      });
+      expect(otherLane.text).toContain("not-found");
+      const notMaster = yield* call("mission_lane_nudge", threadCaller(laneThread), {
+        missionId,
+        laneId: "lane-api",
+      });
+      expect(notMaster.text).toContain("forbidden");
+
+      const reordered = yield* call("mission_portfolio_reorder", threadCaller(masterThread), {
+        order: [otherMissionId, missionId],
+      });
+      expect(reordered.isError, reordered.text).toBe(false);
+      const [order] = yield* store.recentEvents(MissionId.make("missions-global"), 1);
+      expect(order?.kind).toBe("portfolio.reordered");
+      expect(order?.actor).toEqual({ _tag: "role", roleId: "role-master" });
+      const stranger = yield* call("mission_portfolio_reorder", threadCaller(laneThread), {
+        order: [missionId],
+      });
+      expect(stranger.text).toContain("forbidden");
     }).pipe(Effect.provide(layer));
   });
 

@@ -75,6 +75,11 @@ const DDL = [
     event_json TEXT NOT NULL,
     PRIMARY KEY (mission_id, seq)
   )`,
+  // --- core additions ---
+  // Newest change of a kind across missions (portfolio field changes).
+  `CREATE INDEX IF NOT EXISTS ardud_mission_events_by_kind
+    ON ardud_mission_events (kind, mission_id, seq)`,
+  // --- end core additions ---
   `CREATE TABLE IF NOT EXISTS ardud_mission_counters (
     scope TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -168,6 +173,12 @@ export interface MissionRecordPage<R> {
   /** Every record the filter matches, not just this page. */
   readonly total: number;
 }
+
+/** The newest event of a kind whose `payload.changed` names the field. */
+export interface MissionFieldChange {
+  readonly field: string;
+  readonly event: MissionEvent;
+}
 // --- end core additions ---
 
 const cutSummary = (summary: string): string => {
@@ -245,6 +256,11 @@ export class MissionStore extends Context.Service<
       kind: K,
       filter: MissionPageFilter,
     ) => Effect.Effect<MissionRecordPage<MissionRecordOf<K>>, MissionError>;
+    /** Per mission and field, the newest `kind` event whose `payload.changed` names it. */
+    readonly latestFieldChanges: (
+      kind: MissionEventKind,
+      fields: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyArray<MissionFieldChange>, MissionError>;
     // --- end core additions ---
   }
 >()("t3/ardud/missions/store/MissionStore") {}
@@ -576,6 +592,25 @@ const make = Effect.gen(function* () {
       );
       return { records, total: counted[0]?.total ?? 0 };
     });
+
+  const latestFieldChanges = (kind: MissionEventKind, fields: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      if (fields.length === 0) return [];
+      const rows = yield* sql<EventRow & { readonly missionId: string; readonly field: string }>`
+        SELECT mission_id AS "missionId", field, event_json AS "eventJson" FROM (
+          SELECT e.mission_id, j.value AS field, e.event_json,
+            ROW_NUMBER() OVER (PARTITION BY e.mission_id, j.value ORDER BY e.seq DESC) AS rank
+          FROM ardud_mission_events e, json_each(e.event_json, '$.payload.changed') j
+          WHERE e.kind = ${kind} AND j.value IN ${sql.in(fields)}
+        )
+        WHERE rank = 1
+      `.pipe(NodeSqliteClient.readOnly, Effect.orDie);
+      return yield* Effect.forEach(rows, (row) =>
+        decodeStoredEvent(row.missionId, row.eventJson).pipe(
+          Effect.map((event) => ({ field: row.field, event })),
+        ),
+      );
+    });
   // --- end core additions ---
 
   return MissionStore.of({
@@ -609,6 +644,7 @@ const make = Effect.gen(function* () {
     // --- end router additions ---
     // --- core additions ---
     listPage,
+    latestFieldChanges,
     // --- end core additions ---
   });
 });

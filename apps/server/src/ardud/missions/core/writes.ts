@@ -38,6 +38,7 @@ import type * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import { makeApprovalWrites } from "./approvals.ts";
 import { makeCallWrites } from "./calls.ts";
+import { makePortfolioWrites } from "./portfolio.ts";
 import { ownerConditions } from "./conditions.ts";
 import type { WriteKit } from "./kit.ts";
 import { actorOf } from "./provenance.ts";
@@ -644,6 +645,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
       ...makeStructureWrites(kit),
       ...makeApprovalWrites(kit),
       ...makeCallWrites(kit),
+      ...makePortfolioWrites(kit),
     };
   });
 

@@ -355,6 +355,10 @@ import {
   MissionTimelinePage,
   MissionWorkItemsInput,
   MissionWorkItemsPage,
+  MissionPortfolioInput,
+  NudgeLaneInput,
+  PortfolioSnapshot,
+  SetPortfolioOrderInput,
   AnswerAskInput,
   Ask,
   Call,
@@ -650,6 +654,9 @@ export const WS_METHODS = {
   missionsAckNote: "missions.ackNote",
   missionsWorkItems: "missions.workItems",
   missionsTimeline: "missions.timeline",
+  missionsPortfolio: "missions.portfolio",
+  missionsSetPortfolioOrder: "missions.setPortfolioOrder",
+  missionsNudgeLane: "missions.nudgeLane",
   // ardud missions: router
   missionsRooms: "missions.rooms",
   missionsRoomPage: "missions.roomPage",
@@ -2161,6 +2168,21 @@ const WsMissionsTimelineRpc = missionRpc(
   MissionTimelineInput,
   MissionTimelinePage,
 );
+const WsMissionsPortfolioRpc = missionRpc(
+  WS_METHODS.missionsPortfolio,
+  MissionPortfolioInput,
+  PortfolioSnapshot,
+);
+const WsMissionsSetPortfolioOrderRpc = missionRpc(
+  WS_METHODS.missionsSetPortfolioOrder,
+  SetPortfolioOrderInput,
+  MissionMutationResult,
+);
+const WsMissionsNudgeLaneRpc = missionRpc(
+  WS_METHODS.missionsNudgeLane,
+  NudgeLaneInput,
+  MissionMutationResult,
+);
 // ardud missions: router
 const WsMissionsRoomsRpc = missionRpc(
   WS_METHODS.missionsRooms,
@@ -2305,6 +2327,9 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsAckNoteRpc,
   WsMissionsWorkItemsRpc,
   WsMissionsTimelineRpc,
+  WsMissionsPortfolioRpc,
+  WsMissionsSetPortfolioOrderRpc,
+  WsMissionsNudgeLaneRpc,
   // ardud missions: router
   WsMissionsRoomsRpc,
   WsMissionsRoomPageRpc,
