@@ -23,6 +23,7 @@ import * as Result from "effect/Result";
 
 import {
   POLICY_PROVENANCE,
+  activeBindings,
   attempt,
   bindingUpsert,
   eventDraft,
@@ -67,9 +68,10 @@ export const rolesSnapshot = (
     yield* requireMission(deps, missionId);
     const now = yield* nowIso;
     const roles = yield* missionRoles(deps, missionId, now);
-    const bindings = (yield* deps.store.list("role-binding", { missionId })).toSorted(
-      newestBindingFirst,
-    );
+    // Every current holder, plus the most recent page of ended ones for history.
+    const active = yield* activeBindings(deps, missionId);
+    const ended = yield* deps.store.list("role-binding", { missionId, status: ["ended"] });
+    const bindings = [...active, ...ended].toSorted(newestBindingFirst);
     const byId = new Map(roles.all.map((role) => [role.id as string, role]));
     const drift: Array<RoleDrift> = [];
     for (const binding of bindings) {
@@ -89,10 +91,11 @@ export const rolesSnapshot = (
     };
   });
 
+/** A role's active holders, from a complete read of the mission's bindings. */
 const roleBindings = (deps: PolicyDeps, role: Role) =>
-  deps.store
-    .list("role-binding", { missionId: role.missionId })
-    .pipe(Effect.map((bindings) => bindings.filter((binding) => binding.roleId === role.id)));
+  activeBindings(deps, role.missionId).pipe(
+    Effect.map((bindings) => bindings.filter((binding) => binding.roleId === role.id)),
+  );
 
 export interface AlignResult {
   readonly applied: ReadonlyArray<ThreadId>;

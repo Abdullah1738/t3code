@@ -131,8 +131,31 @@ export const requireMission = (deps: PolicyDeps, missionId: MissionId) =>
     ),
   );
 
+/** Every active binding in a mission. Complete: never one capped page. */
 export const activeBindings = (deps: PolicyDeps, missionId: MissionId) =>
-  deps.store.list("role-binding", { missionId, status: ["bound"] });
+  deps.store.listAllInMission("role-binding", missionId, ["bound"]);
+
+/** Records by id, each read on its own, so no page limit can drop one. */
+export const rolesByIds = (deps: PolicyDeps, ids: ReadonlyArray<RoleId>) =>
+  Effect.forEach([...new Set(ids)], (id) => deps.store.get("role", id)).pipe(
+    Effect.map((found) => found.flatMap((entry) => Option.toArray(entry))),
+  );
+
+/** The roles a thread actively holds in one mission, and that mission's master role id. */
+const threadRoles = (deps: PolicyDeps, missionId: MissionId, threadId: ThreadId) =>
+  Effect.gen(function* () {
+    const bindings = yield* activeBindings(deps, missionId);
+    const roleIds = bindings
+      .filter((binding) => binding.threadId === threadId)
+      .map((binding) => binding.roleId);
+    const roles = roleIds.length === 0 ? [] : yield* rolesByIds(deps, roleIds);
+    const mission = yield* deps.store.get("mission", missionId);
+    const masterRoleId = Option.match(mission, {
+      onNone: () => null,
+      onSome: (record) => record.masterRoleId,
+    });
+    return { roles, masterRoleId };
+  });
 
 /**
  * An agent's role comes from an active binding of its own thread in that
@@ -147,23 +170,13 @@ export const resolveCaller = (
   Effect.gen(function* () {
     const base = baseCaller(provenance);
     if (provenance._tag !== "agent") return base;
-    const bindings = yield* activeBindings(deps, missionId);
-    const roleIds = bindings
-      .filter((binding) => binding.threadId === provenance.threadId)
-      .map((binding) => binding.roleId);
-    if (roleIds.length === 0) return base;
-    const roles = yield* deps.store.list("role", { ids: roleIds });
+    const { roles, masterRoleId } = yield* threadRoles(deps, missionId, provenance.threadId);
     const role =
       roles.find((candidate) => candidate.id === provenance.roleId) ??
       roles.find((candidate) => candidate.kind === "master") ??
       roles[0] ??
       null;
     if (role === null) return base;
-    const mission = yield* deps.store.get("mission", missionId);
-    const masterRoleId = Option.match(mission, {
-      onNone: () => null,
-      onSome: (record) => record.masterRoleId,
-    });
     return {
       ...base,
       role,
@@ -192,20 +205,14 @@ export const governingCaller = (
       const local = yield* resolveCaller(deps, provenance, preferred);
       if (local.isMaster) return local;
     }
-    const bindings = (yield* deps.store.list("role-binding", { status: ["bound"] })).filter(
-      (binding) => binding.threadId === provenance.threadId,
-    );
-    if (bindings.length === 0) return base;
-    const roles = yield* deps.store.list("role", {
-      ids: bindings.map((binding) => binding.roleId),
-    });
-    for (const role of roles) {
-      const mission = yield* deps.store.get("mission", role.missionId);
-      const masterRoleId = Option.match(mission, {
-        onNone: () => null,
-        onSome: (record) => record.masterRoleId,
-      });
-      if (role.kind === "master" || role.id === masterRoleId) {
+    // Every mission the thread touches comes from an index, never a capped page.
+    for (const missionId of yield* deps.store.missionsOfThread(provenance.threadId)) {
+      if (missionId === preferred) continue;
+      const { roles, masterRoleId } = yield* threadRoles(deps, missionId, provenance.threadId);
+      const role = roles.find(
+        (candidate) => candidate.kind === "master" || candidate.id === masterRoleId,
+      );
+      if (role !== undefined) {
         return { ...base, role, isMaster: true, actor: { _tag: "role", roleId: role.id } };
       }
     }
@@ -255,8 +262,9 @@ export const missionRoles = (
   now: string,
 ): Effect.Effect<MissionRoles, MissionError> =>
   Effect.gen(function* () {
-    const stored = yield* deps.store.list("role", { missionId });
-    const lanes = yield* deps.store.list("lane", { missionId });
+    // Complete reads, newest first like the page they replace.
+    const stored = (yield* deps.store.listAllInMission("role", missionId)).toReversed();
+    const lanes = yield* deps.store.listAllInMission("lane", missionId);
     const storedIds = new Set<string>(stored.map((role) => role.id));
     const defaults = [
       ...defaultMissionRoles(missionId, now),
