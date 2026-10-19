@@ -34,8 +34,6 @@ import { RouterStore } from "./RouterStore.ts";
 export const MASTER_FEED_COMPONENT = "master-inbox";
 const FEED_PROVENANCE: MissionProvenance = { _tag: "system", component: MASTER_FEED_COMPONENT };
 const DIGEST_FEED_MAX = 8;
-/** Missed events scanned per mission after downtime; older ones are only counted. */
-export const BACKFILL_SCAN_MAX = 2_000;
 const BACKFILL_PAGE = 500;
 const LIVE_MISSIONS = ["active", "paused", "draining"];
 
@@ -194,28 +192,27 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
   const handle = (event: MissionEvent): Effect.Effect<void> =>
     deliver(event).pipe(Effect.andThen(advance(event.missionId, event.seq)));
 
-  /** The feed-relevant events after `fromSeq` up to `toSeq`, newest `BACKFILL_SCAN_MAX` only. */
+  /** Every feed-relevant event after `fromSeq` up to `toSeq`, however long the downtime. */
   const missedEvents = (missionId: MissionId, fromSeq: number, toSeq: number) =>
     Effect.gen(function* () {
-      const start = Math.max(fromSeq, toSeq - BACKFILL_SCAN_MAX);
-      const events: MissionEvent[] = [];
-      let after = start;
+      const relevant: MissionEvent[] = [];
+      let after = fromSeq;
       while (after < toSeq) {
         const page = yield* store.eventsSince(missionId, after, BACKFILL_PAGE);
         if (page.length === 0) break;
-        for (const event of page) if (event.seq <= toSeq) events.push(event);
+        for (const event of page) {
+          if (event.seq > toSeq) continue;
+          if (event.kind === "editor.updated" || ROUTED_KINDS.has(event.kind)) relevant.push(event);
+        }
         after = page[page.length - 1]!.seq;
       }
-      return { events, unscanned: start - fromSeq };
+      return relevant;
     });
 
   /** What the master missed in one mission, as one notice; null when nothing is still open. */
   const missedNotice = (missionId: MissionId, fromSeq: number, toSeq: number) =>
     Effect.gen(function* () {
-      const { events, unscanned } = yield* missedEvents(missionId, fromSeq, toSeq);
-      const relevant = events.filter(
-        (event) => event.kind === "editor.updated" || ROUTED_KINDS.has(event.kind),
-      );
+      const relevant = yield* missedEvents(missionId, fromSeq, toSeq);
       // The digest is the editor's current view, so only the newest pass matters;
       // an approval or draft routed twice is one item.
       const latestDigest = relevant.findLast((event) => event.kind === "editor.updated");
@@ -242,7 +239,6 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
       const lines = [
         `While the server was down, ${notices.length} item(s) reached this mission for the master:`,
         ...notices.map((notice) => `\n## ${notice.summary}\n${notice.body}`),
-        ...(unscanned > 0 ? [`\n${unscanned} older event(s) were not scanned.`] : []),
       ];
       const missed: Notice = {
         kind: notices.some((notice) => notice.kind === "request") ? "request" : "evidence",
