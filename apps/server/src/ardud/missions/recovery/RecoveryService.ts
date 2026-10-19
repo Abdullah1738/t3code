@@ -40,12 +40,14 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Semaphore from "effect/Semaphore";
 
 import { standingOf, threadOfActor, type MissionCast } from "../asks/standing.ts";
 import { buildCriticalPath } from "../core/snapshots.ts";
 import * as PolicyService from "../policy/PolicyService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import type { SystemNoticeOutcome } from "../router/MissionRouter.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import * as Model from "./model.ts";
 import * as RecoveryDelivery from "./RecoveryDelivery.ts";
@@ -97,6 +99,8 @@ interface Planned {
   readonly holds: ReadonlyArray<RecoveryHeldHold>;
   readonly action: RecoveryAction;
   readonly reason: string;
+  /** Boots in a row that cut this thread's turn, counting this one; 0 outside boots. */
+  readonly bootCuts?: number;
 }
 
 interface CollectInput {
@@ -112,6 +116,8 @@ interface CollectInput {
   /** Child ids a reporter saw lost, counted regardless of the window. */
   readonly named: ReadonlySet<string>;
   readonly extraSeen: ReadonlyArray<SeenEntry>;
+  /** The boot a server-restart incident belongs to; counts boot-after-boot cuts. */
+  readonly bootId: string | null;
 }
 
 const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
@@ -217,10 +223,11 @@ export const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const mission = yield* store.get("mission", missionId);
       if (Option.isNone(mission)) return yield* notFound(`No mission ${missionId}.`);
+      // Complete reads: a capped list could leave out the master's binding.
       const [roles, bindings, lanes] = yield* Effect.all([
-        store.list("role", { missionId }),
-        store.list("role-binding", { missionId, status: ["bound"] }),
-        store.list("lane", { missionId }),
+        store.listAllInMission("role", missionId),
+        store.listAllInMission("role-binding", missionId, ["bound"]),
+        store.listAllInMission("lane", missionId),
       ]);
       return {
         missionId,
@@ -237,13 +244,13 @@ export const make = Effect.gen(function* () {
       const missionId = mission.id;
       const [subMissions, roles, bindings, lanes, milestones, workItems, storeHolds, policyHolds] =
         yield* Effect.all([
-          store.list("sub-mission", { missionId }),
-          store.list("role", { missionId }),
-          store.list("role-binding", { missionId, status: ["bound"] }),
-          store.list("lane", { missionId }),
-          store.list("milestone", { missionId }),
-          store.list("work-item", { missionId }),
-          store.list("pool-hold", { missionId, status: OPEN_HOLDS }),
+          store.listAllInMission("sub-mission", missionId),
+          store.listAllInMission("role", missionId),
+          store.listAllInMission("role-binding", missionId, ["bound"]),
+          store.listAllInMission("lane", missionId),
+          store.listAllInMission("milestone", missionId),
+          store.listAllInMission("work-item", missionId),
+          store.listAllInMission("pool-hold", missionId, OPEN_HOLDS),
           recovery.policyHolds([missionId]),
         ]);
       const masterRole =
@@ -354,38 +361,51 @@ export const make = Effect.gen(function* () {
       return { mission, cast, members: [...members.values()], holdsByThread } satisfies MissionView;
     });
 
+  // Every live mission, uncapped: a capped list drops missions once there are many.
   const loadViews = (now: string) =>
     store
-      .list("mission", { status: LIVE_MISSIONS })
+      .listAll("mission", LIVE_MISSIONS)
       .pipe(
         Effect.flatMap((missions) => Effect.forEach(missions, (mission) => viewOf(mission, now))),
       );
 
+  // The store's thread index names every mission with a record for the
+  // thread (complete, no limit); each candidate is then checked against its
+  // full current cast, so an ended binding or a closed mission does not count.
   const membersOf = (threadIds: ReadonlyArray<ThreadId>) =>
     Effect.gen(function* () {
-      const wanted = new Set<string>(threadIds);
-      const missions = yield* store.list("mission", { status: LIVE_MISSIONS });
-      const byThread = new Map<string, Array<MissionId>>();
-      for (const mission of missions) {
-        const [bindings, lanes] = yield* Effect.all([
-          store.list("role-binding", { missionId: mission.id, status: ["bound"] }),
-          store.list("lane", { missionId: mission.id }),
-        ]);
-        const threads = new Set<string>([
-          ...bindings
-            .filter((binding) => binding.endedAt === null)
-            .map((binding) => binding.threadId),
-          ...lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
-        ]);
-        for (const threadId of threads) {
-          if (!wanted.has(threadId)) continue;
-          byThread.set(threadId, [...(byThread.get(threadId) ?? []), mission.id]);
+      const castThreads = new Map<string, ReadonlySet<string> | null>();
+      const threadsOf = (missionId: MissionId) =>
+        Effect.gen(function* () {
+          const cached = castThreads.get(missionId);
+          if (cached !== undefined) return cached;
+          const mission = yield* store.get("mission", missionId);
+          let threads: ReadonlySet<string> | null = null;
+          if (Option.isSome(mission) && LIVE_MISSIONS.includes(mission.value.status)) {
+            const [bindings, lanes] = yield* Effect.all([
+              store.listAllInMission("role-binding", missionId, ["bound"]),
+              store.listAllInMission("lane", missionId),
+            ]);
+            threads = new Set<string>([
+              ...bindings
+                .filter((binding) => binding.endedAt === null)
+                .map((binding) => binding.threadId),
+              ...lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
+            ]);
+          }
+          castThreads.set(missionId, threads);
+          return threads;
+        });
+      const members: Array<RecoveryMember> = [];
+      for (const threadId of new Set(threadIds)) {
+        const missionIds: Array<MissionId> = [];
+        for (const missionId of yield* store.missionsOfThread(threadId)) {
+          const threads = yield* threadsOf(missionId);
+          if (threads !== null && threads.has(threadId)) missionIds.push(missionId);
         }
+        if (missionIds.length > 0) members.push({ threadId, missionIds });
       }
-      return threadIds.flatMap((threadId): Array<RecoveryMember> => {
-        const missionIds = byThread.get(threadId);
-        return missionIds === undefined ? [] : [{ threadId, missionIds }];
-      });
+      return members;
     });
 
   // --- opening incidents ---
@@ -395,6 +415,7 @@ export const make = Effect.gen(function* () {
     seen: ReadonlyArray<SeenEntry>,
     now: string,
     ownerNote: boolean,
+    chains: ReadonlyArray<RecoveryStore.BootChain> = [],
   ) =>
     Effect.gen(function* () {
       const label = Model.stateLabel(incident.cause, incident.windowEnd, delivery.timeZone);
@@ -407,8 +428,9 @@ export const make = Effect.gen(function* () {
             thread.action === "reconcile-first" ||
             thread.holds.some((hold) => hold.reconcileRequired),
         );
+        const stopped = threads.some(Model.isBootStopped);
         const upserts: Array<MissionStoreRecord> = [];
-        if (ownerNote || reconcile) {
+        if (ownerNote || reconcile || stopped) {
           const note: Note = {
             id: NoteId.make(`recovery-${incident.id}-${missionId}`),
             missionId,
@@ -418,7 +440,7 @@ export const make = Effect.gen(function* () {
             summary,
             sources: [],
             basis: "observed",
-            severity: reconcile ? "high" : "medium",
+            severity: reconcile || stopped ? "high" : "medium",
             confidence: 1,
             author: "code-check",
             citation: "verified",
@@ -450,6 +472,7 @@ export const make = Effect.gen(function* () {
                 action: thread.action,
                 reason: thread.reason,
                 lostChildren: thread.lostChildren.length,
+                ...(thread.bootCuts === undefined ? {} : { bootCuts: thread.bootCuts }),
               })),
             },
           },
@@ -458,7 +481,10 @@ export const make = Effect.gen(function* () {
             ? {
                 alongside: recovery
                   .saveIncident(incident, now)
-                  .pipe(Effect.andThen(recovery.markSeen(seen, incident.id, now))),
+                  .pipe(
+                    Effect.andThen(recovery.markSeen(seen, incident.id, now)),
+                    Effect.andThen(recovery.saveChains(chains, incident.id, now)),
+                  ),
               }
             : {}),
         });
@@ -472,6 +498,12 @@ export const make = Effect.gen(function* () {
     titles: ReadonlyMap<string, RecoveryStore.ThreadRow>,
   ): RecoveryThread => {
     const { member, cut } = planned;
+    const bootCuts = planned.bootCuts ?? 0;
+    // The master still gets its summary; its notice says not to rerun its own turn.
+    const stopped =
+      bootCuts >= Model.MAX_BOOT_CUTS &&
+      member.roleKind !== "master" &&
+      (planned.action === "resume" || planned.action === "reconcile-first");
     return {
       missionId: member.missionId,
       threadId: member.threadId,
@@ -492,11 +524,17 @@ export const make = Effect.gen(function* () {
       holds: planned.holds,
       action: planned.action,
       reason: planned.reason,
-      state: planned.action === "skip" ? "skipped" : "pending",
-      stateReason: planned.action === "skip" ? planned.reason : null,
+      state: planned.action === "skip" ? "skipped" : stopped ? "held" : "pending",
+      stateReason:
+        planned.action === "skip"
+          ? planned.reason
+          : stopped
+            ? Model.bootStopReason(bootCuts)
+            : null,
       instruction: null,
       noticeAt: null,
       decidedBy: null,
+      ...(bootCuts > 0 ? { bootCuts } : {}),
     };
   };
 
@@ -522,6 +560,46 @@ export const make = Effect.gen(function* () {
         if (runSeen.has(`run:${row.runId}`)) continue;
         const previous = cuts.get(row.threadId);
         if (previous === undefined || row.ordinal > previous.ordinal) cuts.set(row.threadId, row);
+      }
+
+      // Boots in a row that cut the same turn: a cut continues the chain when
+      // the previous boot cut it too and no run of the thread completed since.
+      // Each boot counts once, whether a restart report or the boot check saw it.
+      const chainUpdates: Array<RecoveryStore.BootChain> = [];
+      const bootCuts = new Map<string, number>();
+      const bootId = input.cause === "server-restart" ? input.bootId : null;
+      if (bootId !== null) {
+        const prior = yield* recovery.chains(threadIds);
+        // The whole-window boot check ends the chain of a thread this boot did not cut.
+        if (input.runIds === null) {
+          for (const chain of prior.values()) {
+            if (chain.bootId !== bootId && !cuts.has(chain.threadId)) {
+              chainUpdates.push({ ...chain, cuts: 0 });
+            }
+          }
+        }
+        for (const cut of cuts.values()) {
+          const before = prior.get(cut.threadId);
+          if (Model.isOwnerStop(cut)) {
+            if (before !== undefined) chainUpdates.push({ ...before, cuts: 0 });
+            continue;
+          }
+          let count = 1;
+          if (before !== undefined && before.bootId === bootId) {
+            count = before.cuts;
+          } else if (before !== undefined && before.ordinal < cut.ordinal) {
+            const completed = yield* recovery.lastCompleted(cut.threadId, cut.ordinal);
+            if (completed === null || completed < before.ordinal) count = before.cuts + 1;
+          }
+          bootCuts.set(cut.threadId, count);
+          chainUpdates.push({
+            threadId: cut.threadId,
+            runId: cut.runId,
+            ordinal: cut.ordinal,
+            cuts: count,
+            bootId,
+          });
+        }
       }
 
       const children = yield* recovery.children({ threadIds, since: input.window.from });
@@ -591,6 +669,7 @@ export const make = Effect.gen(function* () {
             holds,
             action: plan.action,
             reason: plan.reason,
+            bootCuts: bootCuts.get(member.threadId) ?? 0,
           });
           seen.push(
             ...lost.map((child) => ({ key: `child:${child.id}`, threadId: member.threadId })),
@@ -648,7 +727,11 @@ export const make = Effect.gen(function* () {
       }
 
       if (missionIds.length === 0) {
-        yield* recovery.markSeen(seen, null, now);
+        yield* recovery.atomic(
+          recovery
+            .markSeen(seen, null, now)
+            .pipe(Effect.andThen(recovery.saveChains(chainUpdates, null, now))),
+        );
         return null;
       }
       const latestCut = [...cuts.values()]
@@ -667,7 +750,7 @@ export const make = Effect.gen(function* () {
         threads,
         clearedAt: null,
       };
-      return yield* persistOpened(incident, seen, now, restart);
+      return yield* persistOpened(incident, seen, now, restart, chainUpdates);
     });
 
   const start = Effect.gen(function* () {
@@ -730,6 +813,7 @@ export const make = Effect.gen(function* () {
         runIds: null,
         named: new Set(),
         extraSeen: [{ key, threadId: "" }],
+        bootId: info.bootId,
       });
     }),
   );
@@ -761,6 +845,7 @@ export const make = Effect.gen(function* () {
         runIds: null,
         named: new Set(),
         extraSeen: [],
+        bootId: null,
       });
     }),
   );
@@ -793,40 +878,84 @@ export const make = Effect.gen(function* () {
       });
     });
 
-  /** Sends one thread's notice if it is idle. Never sends to a running thread. */
+  /** One notice per incident, mission and thread, whatever route the router picks. */
+  const noticeKey = (incident: RecoveryIncident, thread: RecoveryThread) =>
+    `${incident.id}:${thread.missionId}:${thread.threadId}`;
+
+  /**
+   * Sends one thread's notice if it is idle, never to a running thread. The
+   * router keeps a retry to one delivery only on the same route, and the route
+   * follows membership at call time, so recovery records each notice itself:
+   * claimed before the router is asked, settled when it answers. A claim left
+   * unsettled (the server stopped mid-send) is held for the owner or master.
+   */
   const deliver = (start: RecoveryIncident, target: RecoveryThread, now: string) =>
     Effect.gen(function* () {
       const readiness = yield* delivery.readiness(target.threadId);
       if (readiness === "busy") return { incident: start, sent: false };
-      if (readiness === "gone") {
-        const next = patchThread(start, target, {
-          state: "skipped",
-          stateReason: "thread archived or deleted",
+      const settle = (patch: Parameters<typeof patchThread>[2]) =>
+        Effect.gen(function* () {
+          const next = patchThread(start, target, patch);
+          yield* recovery.saveIncident(next, now);
+          return { incident: next, sent: false };
         });
-        yield* recovery.saveIncident(next, now);
+      if (readiness === "gone") {
+        return yield* settle({ state: "skipped", stateReason: "thread archived or deleted" });
+      }
+      const key = noticeKey(start, target);
+      const claim = yield* recovery.noticeClaim(key);
+      if (claim?.state === "sending") {
+        const reason =
+          "the last send stopped before it was confirmed; release it or resume it now to send again";
+        const next = patchThread(start, target, { state: "held", stateReason: reason });
+        yield* store.commit({
+          event: {
+            missionId: target.missionId,
+            kind: "recovery.thread-decided",
+            actor: SYSTEM_ACTOR,
+            provenance: SYSTEM,
+            summary: `Recovery notice to ${who(target)} held: ${reason}.`,
+            subject: threadRef(target),
+            payload: {
+              incidentId: start.id,
+              mode: "held-unconfirmed",
+              threadIds: [target.threadId],
+            },
+          },
+          alongside: recovery.saveIncident(next, now),
+        });
         return { incident: next, sent: false };
       }
-      const text = yield* noticeFor(start, target);
-      const failure = yield* delivery
-        .send({
+      let outcome: SystemNoticeOutcome | null = null;
+      if (claim?.state !== "sent") {
+        const text = yield* noticeFor(start, target);
+        yield* recovery.claimNotice({
+          key,
+          incidentId: start.id,
+          missionId: target.missionId,
           threadId: target.threadId,
-          text,
-          key: `${start.id}:${target.missionId}:${target.threadId}`,
-        })
-        .pipe(
-          Effect.as(null),
-          Effect.catchTags({ MissionError: (error) => Effect.succeed(error) }),
-        );
-      if (failure !== null) {
-        const next = patchThread(
-          start,
-          target,
-          failure.code === "not-found"
-            ? { state: "skipped", stateReason: "thread no longer exists" }
-            : { state: "failed", stateReason: failure.detail },
-        );
-        yield* recovery.saveIncident(next, now);
-        return { incident: next, sent: false };
+          at: now,
+        });
+        // A human-approved resend gets a fresh router key: its text may differ.
+        const attempt = claim?.attempt ?? 0;
+        const result = yield* delivery
+          .notify({
+            threadId: target.threadId,
+            text,
+            key: attempt === 0 ? key : `${key}#${attempt}`,
+          })
+          .pipe(Effect.result);
+        if (Result.isFailure(result)) {
+          // The router refused it: nothing went out, so a later round may send it.
+          yield* recovery.unclaimNotice(key, now);
+          return yield* settle(
+            result.failure.code === "not-found"
+              ? { state: "skipped", stateReason: "thread no longer exists" }
+              : { state: "failed", stateReason: result.failure.detail },
+          );
+        }
+        outcome = result.success;
+        yield* recovery.settleNotice(key, outcome, now);
       }
       const next = patchThread(start, target, { state: "sent", stateReason: null, noticeAt: now });
       yield* store.commit({
@@ -837,11 +966,19 @@ export const make = Effect.gen(function* () {
           provenance: SYSTEM,
           summary: `Recovery notice sent to ${who(target)} (${Model.truncate(target.title, 80)}): ${target.action}.`,
           subject: threadRef(target),
-          payload: { incidentId: start.id, action: target.action, position: target.position },
+          payload: {
+            incidentId: start.id,
+            action: target.action,
+            position: target.position,
+            route: outcome === null ? "already-sent" : outcome._tag,
+            ...(outcome?._tag === "posted"
+              ? { roomId: outcome.roomId, messageId: outcome.messageId }
+              : {}),
+          },
         },
         alongside: recovery.saveIncident(next, now),
       });
-      return { incident: next, sent: true };
+      return { incident: next, sent: outcome !== null };
     });
 
   const pumpMission = (start: RecoveryIncident, missionId: MissionId, now: string) =>
@@ -1051,16 +1188,29 @@ export const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const { by, actor, provenance } = yield* authorize(input.missionId, caller);
           const now = yield* nowIso;
-          const open = yield* openIncidentFor(input.missionId);
+          const targeted = input.threadId !== undefined || input.laneId !== undefined;
+          const isTarget = (thread: RecoveryThread) =>
+            (input.threadId !== undefined && thread.threadId === input.threadId) ||
+            (input.laneId !== undefined && thread.laneId === input.laneId);
+          // A thread held in an older incident stays reachable after a newer one opens:
+          // prefer the newest incident where the target still waits, then any naming it.
+          const incidents = (yield* recovery.openIncidents).filter((entry) =>
+            entry.missionIds.includes(input.missionId),
+          );
+          const naming = (waiting: boolean) =>
+            incidents.findLast((entry) =>
+              missionThreads(entry, input.missionId).some(
+                (thread) => isTarget(thread) && (!waiting || Model.isOpen(thread)),
+              ),
+            );
+          const open =
+            (targeted ? (naming(true) ?? naming(false)) : undefined) ?? incidents.at(-1) ?? null;
           if (open === null)
             return yield* notFound(`Mission ${input.missionId} has no open recovery.`);
           const mine = missionThreads(open, input.missionId);
-          const targeted = input.threadId !== undefined || input.laneId !== undefined;
-          const targets = mine.filter(
-            (thread) =>
-              (input.threadId !== undefined && thread.threadId === input.threadId) ||
-              (input.laneId !== undefined && thread.laneId === input.laneId),
-          );
+          const targets = mine.filter(isTarget);
+          // Threads a human sends again; an unconfirmed earlier send is reopened for them.
+          let resent: ReadonlyArray<RecoveryThread> = [];
           if (targeted && targets.length === 0) {
             return yield* notFound(
               `Recovery ${open.id} has no thread ${input.threadId ?? `for lane ${input.laneId}`}.`,
@@ -1111,6 +1261,7 @@ export const make = Effect.gen(function* () {
             }
             case "release": {
               const held = (targeted ? targets : mine).filter((thread) => thread.state === "held");
+              resent = held;
               for (const thread of held) {
                 incident = patchThread(incident, thread, {
                   state: "pending",
@@ -1153,6 +1304,7 @@ export const make = Effect.gen(function* () {
               ordered.forEach((thread, position) => {
                 incident = patchThread(incident, thread, { position });
               });
+              resent = open;
               for (const thread of open) {
                 incident = patchThread(incident, thread, {
                   state: "pending",
@@ -1182,6 +1334,8 @@ export const make = Effect.gen(function* () {
             summary = `${summary} Instruction: ${input.instruction}`;
           }
           const decided = incident;
+          // Sending again after an unconfirmed send is a human's call; this is it.
+          const resend = resent.map((thread) => noticeKey(decided, thread));
           yield* store.commit({
             event: {
               missionId: input.missionId,
@@ -1199,7 +1353,9 @@ export const make = Effect.gen(function* () {
                 instruction: input.instruction ?? null,
               },
             },
-            alongside: recovery.saveIncident(decided, now),
+            alongside: recovery
+              .saveIncident(decided, now)
+              .pipe(Effect.andThen(recovery.reopenNotices(resend, now))),
           });
           if (input.mode === "now") {
             for (const thread of targets) {
@@ -1249,8 +1405,9 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const mission = yield* store.get("mission", missionId);
         const threads = missionThreads(incident, missionId);
+        const stopped = threads.filter(Model.isBootStopped);
         const count = (action: RecoveryAction) =>
-          threads.filter((thread) => thread.action === action).length;
+          threads.filter((thread) => thread.action === action && !stopped.includes(thread)).length;
         return {
           missionId,
           title: Option.isSome(mission) ? mission.value.title : missionId,
@@ -1258,6 +1415,16 @@ export const make = Effect.gen(function* () {
           resume: count("resume"),
           reconcile: count("reconcile-first"),
           noticeOnly: count("notice-only"),
+          ...(stopped.length === 0
+            ? {}
+            : {
+                stopped: stopped.map((thread) => ({
+                  threadId: thread.threadId,
+                  title: thread.title,
+                  bootCuts: thread.bootCuts ?? Model.MAX_BOOT_CUTS,
+                  ...(thread.roleKind === "master" ? { master: true } : {}),
+                })),
+              }),
         } satisfies RecoveryReportMission;
       }),
     );
@@ -1286,7 +1453,10 @@ export const make = Effect.gen(function* () {
         let incident = known[0] === undefined ? null : yield* recovery.incident(known[0]);
         if (incident === null && known.length === 0) {
           const now = yield* nowIso;
+          // A reported server restart is this boot; it counts once with the boot check.
+          const bootId = input.cause === "server-restart" ? (yield* start).bootId : null;
           incident = yield* collect({
+            bootId,
             cause: input.cause,
             id: `rcv-${input.reportId}`,
             source: provenance.component,
@@ -1316,7 +1486,7 @@ export const make = Effect.gen(function* () {
         if ((yield* recovery.seenKeys([key])).size > 0) return null;
         const now = yield* nowIso;
         const seen: Array<SeenEntry> = [{ key, threadId: binding.threadId }];
-        const ended = yield* store.list("role-binding", { missionId, status: ["ended"] });
+        const ended = yield* store.listAllInMission("role-binding", missionId, ["ended"]);
         const previous = ended
           .filter(
             (entry) =>

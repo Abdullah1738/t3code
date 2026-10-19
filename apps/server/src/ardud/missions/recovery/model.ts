@@ -23,6 +23,12 @@ import type {
 export const DEFAULT_SETTINGS = { resumePerMinute: 4, masterLeadSeconds: 60 } as const;
 /** Same thread interrupted this often within an hour stops getting resume turns. */
 export const MAX_RUN_INTERRUPTS_PER_HOUR = 3;
+/**
+ * Boots in a row that cut the same turn (no run of the thread completed in
+ * between) before recovery stops resuming it: a turn that takes the server
+ * down would otherwise be resumed into the next crash.
+ */
+export const MAX_BOOT_CUTS = 3;
 export const NOTICE_PREFIX = "[mission recovery]";
 
 /** One mission member thread as the mission sees it right now. */
@@ -383,6 +389,20 @@ const CAUSE_LABEL: Record<RecoveryCause, string> = {
 export const stateLabel = (cause: RecoveryCause, at: string, timeZone: string) =>
   `Recovered from ${CAUSE_LABEL[cause]} at ${clockLabel(at, timeZone)}`;
 
+/**
+ * A thread recovery would resume, stopped because boots kept cutting the same
+ * turn and not yet released or decided by the owner or master. A lane is held;
+ * the master still gets its summary, told not to rerun its own turn.
+ */
+export const isBootStopped = (thread: RecoveryThread) =>
+  (thread.bootCuts ?? 0) >= MAX_BOOT_CUTS &&
+  (thread.action === "resume" || thread.action === "reconcile-first") &&
+  (thread.roleKind === "master" || thread.state === "held") &&
+  thread.decidedBy === null;
+
+export const bootStopReason = (cuts: number) =>
+  `the same turn was cut by ${cuts} boots in a row; not resumed on its own`;
+
 const OPEN_STATES = new Set(["pending", "held", "failed"]);
 
 export const isOpen = (thread: RecoveryThread) => OPEN_STATES.has(thread.state);
@@ -554,7 +574,19 @@ export const threadNotice = (context: NoticeContext, thread: RecoveryThread) => 
   if (thread.instruction !== null) {
     parts.push(`${instructionLabel(thread.instructionBy ?? null)}: ${thread.instruction}`);
   }
-  if (waits) {
+  const stoppedMaster = thread.roleKind === "master" && isBootStopped(thread);
+  if (stoppedMaster) {
+    parts.push(
+      `This turn was cut by ${thread.bootCuts} boots in a row, so recovery does not resume it: do not rerun what it was running until you know that is not what takes the server down.`,
+    );
+  } else if ((thread.bootCuts ?? 0) >= MAX_BOOT_CUTS && !waits) {
+    parts.push(
+      `This turn was cut by ${thread.bootCuts} boots in a row. Before you run it again, check that what it was running is not what takes the server down.`,
+    );
+  }
+  if (stoppedMaster) {
+    parts.push("Then carry on with the rest of the mission.");
+  } else if (waits) {
     parts.push(`Your work stays as it is (${thread.reason}): do not restart it now.`);
   } else {
     parts.push("Then continue your work.");
@@ -602,7 +634,10 @@ export const masterNotice = (input: MasterSummaryInput) => {
     input.downSeconds === null || input.downSeconds < 60
       ? ""
       : ` (down about ${Math.round(input.downSeconds / 60)} min)`;
-  const queue = input.others.filter((thread) => thread.action !== "skip");
+  const stopped = input.others.filter(isBootStopped);
+  const queue = input.others.filter(
+    (thread) => thread.action !== "skip" && !stopped.includes(thread),
+  );
   const skipped = input.others.filter((thread) => thread.action === "skip");
   const head =
     context.cause === "run-interrupted" && master.cutRunId === null
@@ -622,6 +657,11 @@ export const masterNotice = (input: MasterSummaryInput) => {
   if (skipped.length > 0) {
     lines.push(
       `Skipped: ${skipped.map((thread) => `${threadLabel(thread)} (${thread.reason})`).join("; ")}.`,
+    );
+  }
+  if (stopped.length > 0) {
+    lines.push(
+      `Not resumed on their own, the same turn was cut by ${MAX_BOOT_CUTS} or more boots in a row: ${stopped.map((thread) => `${threadLabel(thread)} (${thread.bootCuts} boots${thread.lastActivity === null ? "" : `, cut while ${thread.lastActivity}`})`).join("; ")}. Check what each was running first; resume one by hand with mission_recovery_resume (mode now or release, with its threadId), or skip it.`,
     );
   }
   const reconcileHolds = [master, ...input.others].flatMap((thread) =>
@@ -649,13 +689,25 @@ export const incidentSummary = (
   settings: MissionRecoverySettings,
 ) => {
   const counts = new Map<RecoveryAction, number>();
-  for (const thread of missionThreads)
+  const stopped = missionThreads.filter(isBootStopped);
+  for (const thread of missionThreads) {
+    if (stopped.includes(thread)) continue;
     counts.set(thread.action, (counts.get(thread.action) ?? 0) + 1);
+  }
   const parts = (["resume", "reconcile-first", "notice-only", "skip"] as const)
     .filter((action) => (counts.get(action) ?? 0) > 0)
     .map((action) => `${counts.get(action)} ${ACTION_TEXT[action].split(",")[0]}`);
+  const lanes = stopped.filter((thread) => thread.roleKind !== "master");
+  const held =
+    lanes.length === 0
+      ? ""
+      : ` Not resumed on their own (same turn cut by ${MAX_BOOT_CUTS}+ boots in a row; resume by hand): ${lanes.map((thread) => `"${truncate(thread.title, 40)}"`).join(", ")}.`;
+  const master =
+    lanes.length === stopped.length
+      ? ""
+      : ` The master's own turn was cut by ${MAX_BOOT_CUTS}+ boots in a row; it was told not to rerun it.`;
   return truncate(
-    `${label}: ${missionThreads.length} thread(s) (${parts.join(", ")}). Master first, then ${settings.resumePerMinute} per minute.`,
+    `${label}: ${missionThreads.length} thread(s)${parts.length === 0 ? "" : ` (${parts.join(", ")})`}.${held}${master} Master first, then ${settings.resumePerMinute} per minute.`,
     400,
   );
 };

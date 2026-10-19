@@ -1829,6 +1829,12 @@ export const RecoveryThread = Schema.Struct({
   decidedBy: Schema.NullOr(MissionActor),
   /** Who gave `instruction` (the owner or the master role); later decisions keep it. */
   instructionBy: Schema.optional(Schema.NullOr(MissionActor)),
+  /**
+   * Boots in a row that cut this thread's same turn. At the limit a lane is held
+   * instead of resumed until the owner or master resumes it; a master still gets
+   * its notice and is told not to rerun its own turn.
+   */
+  bootCuts: Schema.optional(NonNegativeInt),
 });
 export type RecoveryThread = typeof RecoveryThread.Type;
 
@@ -1935,6 +1941,21 @@ export const RecoveryReportMission = Schema.Struct({
   resume: NonNegativeInt,
   reconcile: NonNegativeInt,
   noticeOnly: NonNegativeInt,
+  /**
+   * Threads not resumed because boots kept cutting the same turn; not counted in resume or
+   * reconcile. Lanes wait for the owner or master; a master (master: true) gets its notice and
+   * is told not to rerun its own turn.
+   */
+  stopped: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        threadId: ThreadId,
+        title: Schema.String,
+        bootCuts: NonNegativeInt,
+        master: Schema.optional(Schema.Boolean),
+      }),
+    ),
+  ),
 });
 export type RecoveryReportMission = typeof RecoveryReportMission.Type;
 

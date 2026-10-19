@@ -1,4 +1,4 @@
-// Recovery's own tables (boots, incidents, seen cuts, settings) plus
+// Recovery's own tables (boots, incidents, seen cuts, settings, notices, boot chains) plus
 // read-only reads of Robob's orchestration projections. Fork tables are
 // created idempotently at layer start, never in persistence/Migrations.ts.
 import {
@@ -46,6 +46,31 @@ const DDL = [
     settings_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
+  // One row per notice (incident, mission and thread): claimed before the
+  // router is asked, settled with the notice-sent event. A claim left
+  // unsettled means the outcome is unknown, so nothing re-sends it on its own.
+  // `attempt` counts sends a human asked for after that; each has its own key.
+  `CREATE TABLE IF NOT EXISTS ardud_mission_recovery_notices (
+    notice_key TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    outcome_json TEXT,
+    updated_at TEXT NOT NULL
+  )`,
+  // The latest boot cut per thread, how many boots in a row cut that turn, and
+  // the boot that counted it (a boot counts once, whichever path saw it first).
+  `CREATE TABLE IF NOT EXISTS ardud_mission_recovery_chains (
+    thread_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    cuts INTEGER NOT NULL,
+    boot_id TEXT NOT NULL,
+    incident_id TEXT,
+    updated_at TEXT NOT NULL
+  )`,
 ];
 
 const BOOTS_KEPT = 20;
@@ -58,6 +83,7 @@ const encodeIncident = Schema.encodeEffect(Schema.fromJsonString(RecoveryInciden
 const decodeSettings = Schema.decodeUnknownOption(Schema.fromJsonString(MissionRecoverySettings));
 const encodeSettings = Schema.encodeSync(Schema.fromJsonString(MissionRecoverySettings));
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+const encodeJson = Schema.encodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 const decodeHold = Schema.decodeUnknownOption(Schema.fromJsonString(PoolHold));
 
 /** Turn items that say nothing about what the run was doing. */
@@ -86,6 +112,27 @@ export interface CutRunRow extends CutRun {
   readonly errorMessage: string | null;
   /** Robob's own restart continuation already started a turn for this run. */
   readonly serverContinued: boolean;
+}
+
+/** Where one notice got to. */
+export interface NoticeClaim {
+  /**
+   * `open`: nothing went out, it may be sent. `sending`: the router was asked
+   * and no outcome was recorded. `sent`: delivered.
+   */
+  readonly state: "open" | "sending" | "sent";
+  /** Sends a human asked for after an unconfirmed one; 0 for the first send. */
+  readonly attempt: number;
+}
+
+/** Boots in a row that cut a thread's turn, as of its latest boot cut. */
+export interface BootChain {
+  readonly threadId: string;
+  readonly runId: string;
+  readonly ordinal: number;
+  readonly cuts: number;
+  /** The boot that last counted it. */
+  readonly bootId: string;
 }
 
 export interface ThreadRow {
@@ -170,6 +217,36 @@ export class RecoveryStore extends Context.Service<
 
     readonly settings: (missionId: MissionId) => Effect.Effect<MissionRecoverySettings | null>;
     readonly saveSettings: (settings: MissionRecoverySettings, at: string) => Effect.Effect<void>;
+
+    readonly noticeClaim: (key: string) => Effect.Effect<NoticeClaim | null>;
+    /** Records that the notice is about to go out (before the router is asked). */
+    readonly claimNotice: (input: {
+      readonly key: string;
+      readonly incidentId: string;
+      readonly missionId: string;
+      readonly threadId: string;
+      readonly at: string;
+    }) => Effect.Effect<void>;
+    /** Marks it delivered, as soon as the router says so. */
+    readonly settleNotice: (key: string, outcome: unknown, at: string) => Effect.Effect<void>;
+    /** The router refused it: nothing went out, a later round may send it. */
+    readonly unclaimNotice: (key: string, at: string) => Effect.Effect<void>;
+    /** A human sends again after an unknown outcome: the next attempt gets its own key. */
+    readonly reopenNotices: (keys: ReadonlyArray<string>, at: string) => Effect.Effect<void>;
+    /** Runs recovery's own writes as one transaction. */
+    readonly atomic: <A>(effect: Effect.Effect<A>) => Effect.Effect<A>;
+
+    readonly chains: (
+      threadIds: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyMap<string, BootChain>>;
+    /** Run inside the incident's first commit (or with its seen keys). */
+    readonly saveChains: (
+      chains: ReadonlyArray<BootChain>,
+      incidentId: string | null,
+      at: string,
+    ) => Effect.Effect<void>;
+    /** The highest ordinal of a run of the thread that completed, below `before`. */
+    readonly lastCompleted: (threadId: string, before: number) => Effect.Effect<number | null>;
 
     // Read-only projection reads.
     readonly cutRuns: (input: {
@@ -350,6 +427,136 @@ const make = Effect.gen(function* () {
         settings_json = excluded.settings_json,
         updated_at = excluded.updated_at
     `.pipe(Effect.asVoid, Effect.orDie);
+
+  const noticeClaim = (key: string) =>
+    read(
+      sql<{ readonly state: string; readonly attempt: number }>`
+        SELECT state, attempt FROM ardud_mission_recovery_notices
+        WHERE notice_key = ${key}
+      `,
+    ).pipe(
+      Effect.map((rows): NoticeClaim | null => {
+        const row = rows[0];
+        if (row === undefined) return null;
+        const state = row.state === "sent" || row.state === "open" ? row.state : "sending";
+        return { state, attempt: Number(row.attempt) };
+      }),
+    );
+
+  const claimNotice = (input: {
+    readonly key: string;
+    readonly incidentId: string;
+    readonly missionId: string;
+    readonly threadId: string;
+    readonly at: string;
+  }) =>
+    sql`
+      INSERT INTO ardud_mission_recovery_notices ${sql.insert({
+        notice_key: input.key,
+        incident_id: input.incidentId,
+        mission_id: input.missionId,
+        thread_id: input.threadId,
+        state: "sending",
+        outcome_json: null,
+        updated_at: input.at,
+      })}
+      ON CONFLICT (notice_key) DO UPDATE SET
+        state = 'sending', updated_at = excluded.updated_at
+      WHERE ardud_mission_recovery_notices.state = 'open'
+    `.pipe(Effect.asVoid, Effect.orDie);
+
+  const settleNotice = (key: string, outcome: unknown, at: string) =>
+    sql`
+      UPDATE ardud_mission_recovery_notices
+      SET state = 'sent', outcome_json = ${Option.getOrNull(encodeJson(outcome))}, updated_at = ${at}
+      WHERE notice_key = ${key}
+    `.pipe(Effect.asVoid, Effect.orDie);
+
+  const unclaimNotice = (key: string, at: string) =>
+    sql`
+      UPDATE ardud_mission_recovery_notices SET state = 'open', updated_at = ${at}
+      WHERE notice_key = ${key} AND state = 'sending'
+    `.pipe(Effect.asVoid, Effect.orDie);
+
+  const reopenNotices = (keys: ReadonlyArray<string>, at: string) =>
+    Effect.forEach(
+      chunks(keys),
+      (chunk) => sql`
+        UPDATE ardud_mission_recovery_notices
+        SET state = 'open', attempt = attempt + 1, updated_at = ${at}
+        WHERE notice_key IN ${sql.in(chunk)} AND state = 'sending'
+      `,
+      { discard: true },
+    ).pipe(Effect.orDie);
+
+  const atomic = <A>(effect: Effect.Effect<A>) => sql.withTransaction(effect).pipe(Effect.orDie);
+
+  const chains = (threadIds: ReadonlyArray<string>) =>
+    Effect.forEach(chunks(threadIds), (chunk) =>
+      read(
+        sql<{
+          readonly thread_id: string;
+          readonly run_id: string;
+          readonly ordinal: number;
+          readonly cuts: number;
+          readonly boot_id: string;
+        }>`
+          SELECT thread_id, run_id, ordinal, cuts, boot_id FROM ardud_mission_recovery_chains
+          WHERE thread_id IN ${sql.in(chunk)}
+        `,
+      ),
+    ).pipe(
+      Effect.map(
+        (rows) =>
+          new Map(
+            rows.flat().map((row): [string, BootChain] => [
+              row.thread_id,
+              {
+                threadId: row.thread_id,
+                runId: row.run_id,
+                ordinal: Number(row.ordinal),
+                cuts: Number(row.cuts),
+                bootId: row.boot_id,
+              },
+            ]),
+          ),
+      ),
+    );
+
+  const saveChains = (entries: ReadonlyArray<BootChain>, incidentId: string | null, at: string) =>
+    Effect.forEach(
+      entries,
+      (entry) =>
+        entry.cuts === 0
+          ? sql`DELETE FROM ardud_mission_recovery_chains WHERE thread_id = ${entry.threadId}`
+          : sql`
+              INSERT INTO ardud_mission_recovery_chains ${sql.insert({
+                thread_id: entry.threadId,
+                run_id: entry.runId,
+                ordinal: entry.ordinal,
+                cuts: entry.cuts,
+                boot_id: entry.bootId,
+                incident_id: incidentId,
+                updated_at: at,
+              })}
+              ON CONFLICT (thread_id) DO UPDATE SET
+                run_id = excluded.run_id,
+                ordinal = excluded.ordinal,
+                cuts = excluded.cuts,
+                boot_id = excluded.boot_id,
+                incident_id = excluded.incident_id,
+                updated_at = excluded.updated_at
+            `,
+      { discard: true },
+    ).pipe(Effect.orDie);
+
+  const lastCompleted = (threadId: string, before: number) =>
+    read(
+      sql<{ readonly ordinal: number | null }>`
+        SELECT MAX(ordinal) AS ordinal FROM orchestration_v2_projection_runs
+        WHERE thread_id = ${threadId} AND status = 'completed' AND ordinal < ${before}
+      `,
+    ).pipe(Effect.map((rows) => rows[0]?.ordinal ?? null));
 
   const itemsFor = (runIds: ReadonlyArray<string>) =>
     Effect.forEach(runIds, (runId) =>
@@ -581,6 +788,15 @@ const make = Effect.gen(function* () {
     recentIncidents,
     settings,
     saveSettings,
+    noticeClaim,
+    claimNotice,
+    settleNotice,
+    unclaimNotice,
+    reopenNotices,
+    atomic,
+    chains,
+    saveChains,
+    lastCompleted,
     cutRuns,
     cutRunsById,
     children,
