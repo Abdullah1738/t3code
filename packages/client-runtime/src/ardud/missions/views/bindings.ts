@@ -142,7 +142,7 @@ const coerce = (
 
 /** Who made the record, for the derived `by` path. */
 const authorOf = (record: object): unknown => {
-  for (const key of ["askedBy", "decidedBy", "heldBy", "author", "requestedBy", "fromTitle"]) {
+  for (const key of ["decidedBy", "heldBy", "author", "requestedBy", "fromTitle"]) {
     const value = field(record, key);
     if (value !== null && value !== undefined) return value;
   }
