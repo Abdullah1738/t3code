@@ -1,4 +1,4 @@
-import { MissionMessage, Room, Subscription } from "@t3tools/contracts";
+import { type LaneId, MissionMessage, type RoleId, Room, Subscription } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -281,18 +281,18 @@ describe("message details", () => {
       "lane:crpko:lane:cell-risk": "cell-risk",
     };
     const post = {
-      author: { _tag: "role", roleId: "crpko:lane-lead:crpko:lane:cell-tc" },
-      to: [{ _tag: "lane", laneId: "crpko:lane:cell-risk" }],
+      author: { _tag: "role" as const, roleId: "crpko:lane-lead:crpko:lane:cell-tc" as RoleId },
+      to: [{ _tag: "lane" as const, laneId: "crpko:lane:cell-risk" as LaneId }],
       isCorrection: false,
-    } as const;
+    };
     expect(messageParties(post, MASTER, names)).toEqual({ from: "cell-tc lead", to: "cell-risk" });
     expect(messageAddressLine(post, MASTER, names)).toBe("cell-tc lead → cell-risk");
     expect(messageParties({ ...post, to: [] }, MASTER, names).to).toBeNull();
     // Lanes and roles from the mission name actors where no room page does.
     expect(
       actorNames(
-        [{ id: "crpko:lane:cell-risk", name: "cell-risk" }],
-        [{ id: "crpko:lane-lead:crpko:lane:cell-tc", name: "cell-tc lead" }],
+        [{ id: "crpko:lane:cell-risk" as LaneId, name: "cell-risk" }],
+        [{ id: "crpko:lane-lead:crpko:lane:cell-tc" as RoleId, name: "cell-tc lead" }],
       ),
     ).toEqual(names);
   });
@@ -326,8 +326,8 @@ describe("message details", () => {
     // After a wake the page carries no subscription rows, only who is in the room.
     const members = roomMembers([], MASTER, {
       members: [
-        { _tag: "lane", laneId: "crpko:lane:cell-tc" },
-        { _tag: "role", roleId: MASTER },
+        { _tag: "lane", laneId: "crpko:lane:cell-tc" as LaneId },
+        { _tag: "role", roleId: MASTER as RoleId },
         { _tag: "owner" },
       ],
       names: { "lane:crpko:lane:cell-tc": "cell-tc" },
