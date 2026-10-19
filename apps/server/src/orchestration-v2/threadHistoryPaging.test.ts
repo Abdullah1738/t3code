@@ -260,6 +260,38 @@ describe("threadHistoryPaging", () => {
     );
   });
 
+  // ardud missions: guard - a bearer's prompt is a person's turn too.
+  it.each([
+    {
+      name: "control API",
+      messageId: "ardud-control:send:thread-1:msg",
+      source: "server",
+      rows: 20,
+    },
+    { name: "bearer browser", messageId: "bearer-prompt", source: "web", rows: 20 },
+    { name: "server notice", messageId: "usage-limit-retry", source: "server", rows: 75 },
+  ] as const)("pages a $name prompt stamped system as $rows rows", (bearer) => {
+    const items = Array.from({ length: 50 }, (_, turn) => {
+      const row = makeRow(turn * 2);
+      const prompt = {
+        ...row,
+        item: {
+          ...row.item,
+          type: "user_message",
+          createdBy: "system",
+          creationSource: bearer.source,
+          inputIntent: "turn_start",
+          messageId: MessageId.make(`${bearer.messageId}-${turn}`),
+          text: `Prompt ${turn}`,
+          attachments: [],
+        },
+      } as OrchestrationV2ProjectedTurnItem;
+      return [prompt, makeRow(turn * 2 + 1)];
+    }).flat();
+    const recent = selectRecentTimelineWindow({ items, snapshotSequence: 1 });
+    expect(recent.items).toHaveLength(bearer.rows);
+  });
+
   it("pages agent-only child transcripts instead of dropping their earlier activity", () => {
     const commandRows = Array.from({ length: 90 }, (_, index) => makeRow(index + 1));
     const first = makeRow(0);

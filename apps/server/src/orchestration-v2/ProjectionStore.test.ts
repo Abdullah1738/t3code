@@ -1040,6 +1040,114 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 
+  // ardud missions: guard - a bearer's prompt is a person's turn too.
+  it.effect("windows a thread of bearer prompts by its turns, not server notices", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const nowIso = DateTime.formatIso(now);
+      const windowRows = (name: string, messageId: (turn: number) => string) =>
+        Effect.gen(function* () {
+          const threadId = ThreadId.make(`thread:${name}`);
+          yield* projectionStore.apply({
+            id: EventId.make(`event:${name}:thread`),
+            type: "thread.created",
+            threadId,
+            occurredAt: now,
+            payload: {
+              createdBy: "system",
+              creationSource: "server",
+              id: threadId,
+              projectId: ProjectId.make(`project:${name}`),
+              title: name,
+              providerInstanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: null,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+          });
+          for (let turn = 1; turn <= 30; turn += 1) {
+            const rows = Array.from({ length: 3 }, (_, offset) => {
+              const ordinal = (turn - 1) * 3 + offset + 1;
+              const id = `item:${name}:${ordinal}`;
+              const base = {
+                id,
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal,
+                status: "completed",
+                title: null,
+                startedAt: nowIso,
+                completedAt: nowIso,
+                updatedAt: nowIso,
+              };
+              const item =
+                offset === 0
+                  ? {
+                      ...base,
+                      type: "user_message",
+                      createdBy: "system",
+                      creationSource: "server",
+                      messageId: messageId(turn),
+                      inputIntent: "turn_start",
+                      text: `Turn ${turn}`,
+                      attachments: [],
+                    }
+                  : { ...base, type: "command_execution", input: "c", output: "o", exitCode: 0 };
+              return {
+                turn_item_id: id,
+                thread_id: threadId,
+                run_id: null,
+                node_id: null,
+                provider_thread_id: null,
+                provider_turn_id: null,
+                parent_item_id: null,
+                ordinal,
+                type: item.type,
+                status: "completed",
+                updated_at: nowIso,
+                payload_json: encodeUnknownJsonString(item),
+              };
+            });
+            yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert(rows)}`;
+          }
+          const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+            rowLimit: 77,
+            userTurnLimit: 10,
+          });
+          return snapshot.projection.turnItems.length;
+        });
+      // Ten turns plus two lookahead anchors, as for the owner's own prompts.
+      assert.strictEqual(
+        yield* windowRows("bearer-turns", (turn) => `ardud-control:send:t:msg-${turn}`),
+        12 * 3,
+      );
+      // Server-made prompts are not turns, so the window falls back to its row limit.
+      assert.strictEqual(
+        yield* windowRows("server-notices", (turn) => `usage-limit-retry:${turn}`),
+        77,
+      );
+    }),
+  );
+
   it.effect("caps a SQL window by runs that a notification started", () =>
     Effect.gen(function* () {
       // A thread woken by PR watches: 12 user turns, then 400 runs that a

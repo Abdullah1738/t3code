@@ -82,6 +82,8 @@ import type * as Statement from "effect/sql/Statement";
 
 import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
 import { threadHtmlRenderAttachmentIds } from "../attachmentStore.ts";
+// ardud missions: guard
+import { CONTROL_MESSAGE_PREFIX } from "../ardud/missions/guard/turns.ts";
 import {
   isThreadHistoryUserTurn,
   isConversationHistoryItem,
@@ -2919,6 +2921,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   SELECT ordinal
                   FROM turn_anchors
                   WHERE json_extract(payload_json, '$.createdBy') = 'user'
+                    -- ardud missions: guard - a bearer's prompt is a person's turn too.
+                    OR (
+                      json_extract(payload_json, '$.createdBy') = 'system'
+                      AND (
+                        json_extract(payload_json, '$.messageId') LIKE ${`${CONTROL_MESSAGE_PREFIX}%`}
+                        OR json_extract(payload_json, '$.creationSource') IN ('web', 'mobile')
+                      )
+                    )
                   ORDER BY ordinal DESC
                   LIMIT ${(window.userTurnLimit ?? 0) + 2}
                 ), boundary AS (
@@ -4969,6 +4979,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         { type: "user_message" }
       >["inputIntent"];
       readonly createdBy?: "user" | "agent" | "system";
+      // ardud missions: guard - a bearer's prompt is a person's turn too.
+      readonly creationSource?: string;
       readonly messageId?: MessageId;
     };
     type TimelineIndexRow = {
@@ -4998,10 +5010,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           type: OrchestrationV2TurnItem["type"];
           input_intent: NonNullable<TimelineIndexItem["inputIntent"]> | null;
           created_by: "user" | "agent" | "system" | null;
+          creation_source: string | null;
           message_id: string | null;
         }>`SELECT turn_item_id, run_id, node_id, type,
           CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.inputIntent') END AS input_intent,
           CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.createdBy') END AS created_by,
+          CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.creationSource') END AS creation_source,
           CASE WHEN type IN ('user_message', 'assistant_message') THEN json_extract(payload_json, '$.messageId') END AS message_id
         FROM orchestration_v2_projection_turn_items WHERE thread_id = ${threadId}
         ORDER BY ordinal ASC, turn_item_id ASC`;
@@ -5013,6 +5027,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           type: row.type,
           ...(row.input_intent === null ? {} : { inputIntent: row.input_intent }),
           ...(row.created_by === null ? {} : { createdBy: row.created_by }),
+          ...(row.creation_source === null ? {} : { creationSource: row.creation_source }),
           ...(row.message_id === null ? {} : { messageId: MessageId.make(row.message_id) }),
         }));
         const local: Array<TimelineIndexRow> = items.map((item) => ({
