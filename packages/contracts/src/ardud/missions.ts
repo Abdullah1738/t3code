@@ -132,8 +132,12 @@ export const MissionProvenance = Schema.Union([
   }),
   Schema.TaggedStruct("owner-imessage", {
     chat: TrustedChat,
-    /** Spectrum inbound message id the server verified (exists, trusted chat, contains the text). */
+    /** Spectrum inbound message id the server verified (exists, trusted chat, typed by him). */
     inboundId: TrimmedNonEmptyString,
+    // --- guard additions ---
+    /** His words in that iMessage (clipped); what was recorded is the reader's take on them. */
+    quote: Schema.optional(Schema.String),
+    // --- end guard additions ---
   }),
   Schema.TaggedStruct("agent", {
     threadId: ThreadId,

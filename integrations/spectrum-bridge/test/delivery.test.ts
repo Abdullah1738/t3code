@@ -109,25 +109,6 @@ test("notifications with an old session or no session survive /new and no active
   expect(h.calls.map(call => call.id)).toEqual([stableId("old-session", 0), stableId("no-session", 0)]);
 });
 
-test("each accepted guid of a decision prompt is recorded as a notice for that one request; other sends are not", async () => {
-  setSystemTime(now);
-  const h = setup();
-  const notice = { kind: "runtime-request" as const, session: "thread-1", recordId: "perm-1" };
-  h.enqueue("request:1:permission:abc", { kind: "control", text: "x".repeat(4_000), notice });
-  h.enqueue("reply", { kind: "conversation", text: "Plain reply" });
-  await h.delivery.tick();
-  expect(h.calls.length).toBeGreaterThan(2);
-  const guids = h.store.db.query<{ guid: string; operation_id: string; kind: string; session: string; record_id: string; sent_at: number }, []>(
-    "SELECT * FROM notices ORDER BY sent_at, guid").all();
-  // Every chunk of the prompt points at the request, so a swipe-reply on any of them ties to it.
-  expect(guids.map(row => row.guid).sort()).toEqual(h.calls.slice(0, -1).map((_, index) => `provider-${index + 1}`).sort());
-  expect(new Set(guids.map(row => `${row.operation_id}|${row.kind}|${row.session}|${row.record_id}|${row.sent_at}`)))
-    .toEqual(new Set([`request:1:permission:abc|runtime-request|thread-1|perm-1|${now}`]));
-  expect(h.store.notice(`provider-${h.calls.length}`)).toBeUndefined();
-  expect(h.store.notice("provider-1")).toMatchObject({ ...notice, operationId: "request:1:permission:abc", sentAt: now });
-  setSystemTime();
-});
-
 test("rechecks readiness after the final notification validation", async () => {
   const h = setup();
   h.enqueue();

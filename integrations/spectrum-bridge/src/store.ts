@@ -30,15 +30,7 @@ export type OutboxOperation = {
   subject?: string;
   poll?: OutboxPoll;
   app?: OutboxApp;
-  /**
-   * The owner decision this message asks for. Delivery records each accepted
-   * guid in `notices`, which Robob reads to tie his reply to this one record.
-   */
-  notice?: OwnerNoticeRef;
 };
-
-/** A runtime request (approval or question) the bridge asked the owner about. */
-export type OwnerNoticeRef = { kind: "runtime-request"; session: string; recordId: string };
 
 export type OutboxRecord = OutboxOperation & {
   state: string;
@@ -95,11 +87,6 @@ export class Store {
         CREATE TABLE IF NOT EXISTS blobs (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS session_notices (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS session_notices_state ON session_notices(state);
-        CREATE TABLE IF NOT EXISTS notices (
-          guid TEXT PRIMARY KEY, operation_id TEXT NOT NULL, kind TEXT NOT NULL,
-          session TEXT NOT NULL, record_id TEXT NOT NULL, sent_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS notices_sent_at ON notices(sent_at);
       `);
       // A provider may have accepted these sends before the process stopped.
       this.db.query("UPDATE outbox SET state = 'uncertain' WHERE state = 'sending'").run();
@@ -151,7 +138,6 @@ export class Store {
       poll: op.poll ? { title: op.poll.title, options: [...op.poll.options] } : undefined,
       app: op.app ? { url: op.app.url, caption: op.app.caption, subcaption: op.app.subcaption,
         trailingCaption: op.app.trailingCaption, trailingSubcaption: op.app.trailingSubcaption, summary: op.app.summary } : undefined,
-      notice: op.notice ? { kind: op.notice.kind, session: op.notice.session, recordId: op.notice.recordId } : undefined,
     });
     return this.db.transaction(() => {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
@@ -212,24 +198,5 @@ export class Store {
 
   findOutbox(id: string): OutboxRecord | undefined {
     return this.getOperation(id) ?? this.byProviderId(id);
-  }
-
-  /**
-   * Records that the owner was sent this guid about one decision. Called inside
-   * delivery's acceptance transaction, so a guid exists here only once Photon
-   * accepted it. A guid never moves to another record.
-   */
-  recordNotice(guid: string, operationId: string, notice: OwnerNoticeRef, sentAt: number): void {
-    this.db.query(`INSERT INTO notices (guid, operation_id, kind, session, record_id, sent_at)
-      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(guid) DO NOTHING`)
-      .run(guid, operationId, notice.kind, notice.session, notice.recordId, sentAt);
-  }
-
-  notice(guid: string): (OwnerNoticeRef & { guid: string; operationId: string; sentAt: number }) | undefined {
-    const row = this.db.query<{ guid: string; operationId: string; kind: "runtime-request"; session: string; recordId: string; sentAt: number }, [string]>(
-      `SELECT guid, operation_id AS operationId, kind, session, record_id AS recordId, sent_at AS sentAt
-       FROM notices WHERE guid = ?`,
-    ).get(guid);
-    return row ?? undefined;
   }
 }

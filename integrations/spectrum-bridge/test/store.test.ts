@@ -82,7 +82,6 @@ test("outbox dedupes normalized content and rejects every changed operation fiel
   const changes: Partial<OutboxOperation>[] = [
     { text: "changed" }, { kind: "control" }, { sessionId: "other" },
     { generation: 1 }, { replyTo: "other" }, { generation: undefined },
-    { notice: { kind: "runtime-request", session: "s", recordId: "perm-1" } },
   ];
   for (const change of changes) expect(() => store.enqueue({ ...op, ...change })).toThrow("content mismatch");
   expect(store.pendingOutbox()).toEqual([{ ...op, state: "pending", attempts: 0 }]);

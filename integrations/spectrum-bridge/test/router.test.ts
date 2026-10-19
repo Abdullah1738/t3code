@@ -1184,7 +1184,7 @@ test.each([["yes please", "once"], ["Yes, go!", "once"], ["ok thanks", "once"], 
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats/ses_1", decision]]);
 });
 
-// The short consent grammar Robob checks too: a question, a negation, a qualifier or
+// The short consent grammar: a question, a negation, a qualifier or
 // anything extra decides nothing, so the request stays open and the owner gets a nudge.
 test.each(["yes?", "allow?", "is that ok?", "yes but not now", "don't", "nah dont", "go ahead", "sure", "ok？", "yes؟", "¿ok", "ok 🤔", "yes❓", "yes 2"])("approval reply %p decides nothing", async reply => {
   const h = setup();
@@ -3332,14 +3332,13 @@ test("without a transcriber, audio is stored like any other file", async () => {
   expect(readdirSync(join(h.root, "ses_1", "attachments"))).toHaveLength(1);
 });
 
-test("a request prompt carries its notice; a typed answer goes to Robob with its inbound id, a poll vote without", async () => {
+test("a typed answer to a request goes to Robob with its inbound id, a poll vote without", async () => {
   const h = setup();
   h.input("first", "Ask me", { source: "typed" });
   await h.router.tick();
   h.backend.permissionRequests = [permission()];
   await h.router.tick();
-  const [approval] = asked(h.store);
-  expect(approval!.notice).toEqual({ kind: "runtime-request", session: "ses_1", recordId: "perm_1" });
+  expect(asked(h.store)[0]).not.toHaveProperty("notice");
   deliver(h.store);
   h.input("typed-yes", "yes", { source: "typed" });
   await h.router.tick();
@@ -3347,7 +3346,6 @@ test("a request prompt carries its notice; a typed answer goes to Robob with its
   h.backend.questionRequests = [question()];
   await h.router.tick();
   const poll = asked(h.store).at(-1)!;
-  expect(poll.notice).toEqual({ kind: "runtime-request", session: "ses_1", recordId: "q_1" });
   h.input("poll-vote:poll-guid:1", "", { source: "composed",
     poll: { guid: "poll-guid", optionIdentifier: "opt-A", optionText: "A", vote: "voted", operationId: poll.id } });
   await h.router.tick();
@@ -3358,9 +3356,9 @@ test("a request prompt carries its notice; a typed answer goes to Robob with its
 
 test("only one typed message reaches Robob as his words; a batch, a voice note or a composed row does not", async () => {
   const h = setup();
-  h.input("typed-1", "Mission one: ship it", { source: "typed" });
+  h.input("typed-1", "Ship the release tonight", { source: "typed" });
   await h.router.tick();
-  expect(h.backend.prompts.at(-1)!.owner).toEqual({ inboundId: "typed-1", text: "Mission one: ship it" });
+  expect(h.backend.prompts.at(-1)!.owner).toEqual({ inboundId: "typed-1", text: "Ship the release tonight" });
   h.backend.final();
   await h.router.tick();
   h.input("old-row", "no source on this row");

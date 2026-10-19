@@ -26,7 +26,7 @@ import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import * as Inbound from "./inbound.ts";
 import * as Ports from "./ports.ts";
-import { recordHandle, type InboundMessage } from "./provenance.ts";
+import type { InboundMessage } from "./provenance.ts";
 
 export const at = "2026-10-17T08:00:00.000Z";
 export const missionId = MissionId.make("m-1");
@@ -130,9 +130,6 @@ export interface Delivery {
   readonly text: string;
   readonly asOwner: boolean;
 }
-
-/** The owner's reply addressed to a record: its short handle, then the answer. */
-export const addressed = (recordId: string, text: string) => `${recordHandle(recordId)} ${text}`;
 
 /** A message the owner typed. Push into the harness inbox once the record exists. */
 export const typedInbound = (

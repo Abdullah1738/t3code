@@ -13,6 +13,11 @@ export const WATCH_KINDS = [
   "milestone-at-risk",
   "lane-stalled",
   "swarm-paused",
+  // What his iMessage agent waits on to show him something.
+  "request-replied",
+  "request-answered",
+  "approval-opened",
+  "work-item-done",
 ] as const;
 export type WatchKind = (typeof WATCH_KINDS)[number];
 
@@ -53,13 +58,36 @@ export const matchesWatch = (event: MissionEvent, kind: WatchKind): boolean => {
         event.kind === "mission.paused" ||
         (event.kind === "governor.action" && payloadField(event, "action") === "pause")
       );
+    // The master's replies only; his own replies post the same event.
+    case "request-replied":
+      return event.kind === "request.replied" && event.actor._tag !== "owner";
+    case "request-answered":
+      return (
+        event.kind === "request.replied" &&
+        event.actor._tag !== "owner" &&
+        payloadField(event, "status") === "answered"
+      );
+    case "approval-opened":
+      return event.kind === "approval.opened";
+    case "work-item-done":
+      return (
+        (event.kind === "work-item.updated" || event.kind === "work-item.created") &&
+        payloadField(event, "stage") === "done"
+      );
   }
 };
 
+/** Matching events; with `id`, only those about that record (a request, draft, item...). */
 export const watchMatches = (
   events: ReadonlyArray<MissionEvent>,
   kinds: ReadonlyArray<WatchKind>,
-): MissionEvent[] => events.filter((event) => kinds.some((kind) => matchesWatch(event, kind)));
+  id?: string,
+): MissionEvent[] =>
+  events.filter(
+    (event) =>
+      (id === undefined || event.subject?.id === id) &&
+      kinds.some((kind) => matchesWatch(event, kind)),
+  );
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
@@ -73,6 +101,8 @@ export const watchCheckCommand = (input: {
   readonly cli: string;
   readonly missionId: string;
   readonly kinds: ReadonlyArray<WatchKind>;
+  /** Only events about this record. */
+  readonly id?: string;
 }): string =>
   [
     input.cli,
@@ -80,6 +110,7 @@ export const watchCheckCommand = (input: {
     shellQuote(input.missionId),
     "--on",
     input.kinds.join(","),
+    ...(input.id === undefined ? [] : ["--id", shellQuote(input.id)]),
     "--cursor",
     '"$WATCH_DIR/mission-cursor"',
   ].join(" ");
@@ -89,14 +120,19 @@ export const watchAddCommand = (input: {
   readonly cli: string;
   readonly missionId: string;
   readonly kinds: ReadonlyArray<WatchKind>;
+  readonly id?: string;
   readonly intervalSeconds?: number;
 }): string =>
   [
     "robob-watch add",
     "--id",
-    shellQuote(`mission-${input.missionId}-${input.kinds.join("-")}`),
+    shellQuote(
+      `mission-${input.missionId}-${input.kinds.join("-")}${input.id === undefined ? "" : `-${input.id}`}`,
+    ),
     "--title",
-    shellQuote(`Mission ${input.missionId}: ${input.kinds.join(", ")}`),
+    shellQuote(
+      `Mission ${input.missionId}: ${input.kinds.join(", ")}${input.id === undefined ? "" : ` on ${input.id}`}`,
+    ),
     "--check",
     shellQuote(watchCheckCommand(input)),
     "--mode wake",

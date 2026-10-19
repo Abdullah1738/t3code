@@ -40,6 +40,16 @@ const SESSIONS: Record<string, object> = {
     subject: "cli",
     origin: { _tag: "component", component: "mission-cli" },
   },
+  "Bearer telegram-token": {
+    sessionId: "session-telegram",
+    subject: "telegram",
+    origin: { _tag: "component", component: "telegram-bridge" },
+  },
+  "Bearer crw-token": {
+    sessionId: "session-crw",
+    subject: "crw",
+    origin: { _tag: "component", component: "crw" },
+  },
 };
 
 const fakeAuth = {
@@ -62,10 +72,15 @@ type Handler = (request: Request) => Promise<Response>;
 
 const harness = (inbound: ReadonlyArray<InboundMessage>) => {
   const threads = fakeRouterThreads();
+  /** Every inbound id the desk looked up. */
+  const lookedUp: string[] = [];
   const lookup = Layer.succeed(
     Inbound.InboundLookup,
     Inbound.InboundLookup.of({
-      find: (id) => Effect.succeed(inbound.find((message) => message.id === id) ?? null),
+      find: (id) => {
+        lookedUp.push(id);
+        return Effect.succeed(inbound.find((message) => message.id === id) ?? null);
+      },
     }),
   );
   const layer = routerOverFakes(threads).pipe(
@@ -73,7 +88,7 @@ const harness = (inbound: ReadonlyArray<InboundMessage>) => {
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(lookup),
   );
-  return { threads, layer };
+  return { threads, layer, lookedUp };
 };
 
 const withDesk = <A>(use: (handler: Handler) => Promise<A>) =>
@@ -130,133 +145,199 @@ const said = (
   chat: InboundMessage["chat"] = "owner",
 ): InboundMessage => ({ id, chat, text, receivedAt, typed: true });
 
+const ask = "How far is the API lane?";
+
 describe("owner requests over iMessage", () => {
-  it.live("opens and replies only with a verified inbound message that says the same thing", () => {
+  it.live(
+    "opens, replies and settles only with an inbound the bridge or mission CLI redeems",
+    () => {
+      const inbound: InboundMessage[] = [];
+      const h = harness(inbound);
+      return Effect.gen(function* () {
+        yield* seed;
+        // The bridge saw these just now: the owner's chat and Moni's.
+        const now = yield* Clock.currentTimeMillis;
+        inbound.push(
+          said(now - 1000, "in-1", "how far is the api lane"),
+          said(now, "in-2", "Thanks. Also pick up the flaky test.", "moni"),
+          said(now, "in-3", "ok thats done, close it"),
+          said(now, "wake:1", ask),
+        );
+        yield* withDesk(async (handle) => {
+          const refused = [
+            // No inbound id at all.
+            await call(handle, "POST", "/requests", { missionId, text: ask }, "cli-token"),
+            // An id nobody sent, or one the bridge minted.
+            await call(
+              handle,
+              "POST",
+              "/requests",
+              { missionId, text: ask, inboundId: "in-404" },
+              "cli-token",
+            ),
+            await call(
+              handle,
+              "POST",
+              "/requests",
+              { missionId, text: ask, inboundId: "wake:1" },
+              "cli-token",
+            ),
+            // No token.
+            await call(
+              handle,
+              "POST",
+              "/requests",
+              { missionId, text: ask, inboundId: "in-1" },
+              "nope",
+            ),
+          ];
+          expect(refused.map((each) => each.status)).toEqual([400, 403, 403, 401]);
+
+          const opened = await call(
+            handle,
+            "POST",
+            "/requests",
+            { missionId, text: ask, inboundId: "in-1" },
+            "cli-token",
+          );
+          expect(opened.status).toBe(200);
+          // What the agent passed is its reading; his own words ride along as the quote.
+          expect(opened.reply.request.createdBy).toEqual({
+            _tag: "owner-imessage",
+            chat: "owner",
+            inboundId: "in-1",
+            quote: "how far is the api lane",
+          });
+          // A retry of the same write, from either credential, opens nothing new.
+          const retried = await call(
+            handle,
+            "POST",
+            "/requests",
+            { missionId, text: ask, inboundId: "in-1" },
+            "bridge-token",
+          );
+          expect(retried.reply).toEqual(opened.reply);
+          // The same message cannot open a second, different request.
+          const other = await call(
+            handle,
+            "POST",
+            "/requests",
+            { missionId, text: "Ship the API lane today.", inboundId: "in-1" },
+            "cli-token",
+          );
+          expect(other.status).toBe(409);
+
+          const requestId = opened.reply.request.id as string;
+          const replied = await call(
+            handle,
+            "POST",
+            `/requests/${requestId}/reply`,
+            { text: "Thanks. Also pick up the flaky test.", inboundId: "in-2" },
+            "cli-token",
+          );
+          expect(replied.status).toBe(200);
+          expect(replied.reply.request.status).toBe("waiting-on-master");
+
+          // The bridge, the mission CLI and an owner session read the conversation.
+          for (const token of ["bridge-token", "cli-token", "owner-token"]) {
+            const listed = await call(
+              handle,
+              "GET",
+              `/requests?mission=${missionId}&request=${requestId}`,
+              undefined,
+              token,
+            );
+            expect(listed.status).toBe(200);
+            expect(listed.reply.requests[0].messages.map((each: any) => each.body)).toEqual([
+              ask,
+              "Thanks. Also pick up the flaky test.",
+            ]);
+          }
+          // Any other read token sees that requests exist, not what they say.
+          for (const token of ["control-token", "telegram-token"]) {
+            const bare = await call(
+              handle,
+              "GET",
+              `/requests?mission=${missionId}&request=${requestId}`,
+              undefined,
+              token,
+            );
+            expect(bare.status).toBe(200);
+            expect(bare.reply.requests[0].messages).toEqual([]);
+            expect(JSON.stringify(bare.reply)).not.toContain("flaky test");
+          }
+
+          // He settles it from iMessage; a retry replays and he can reopen it later.
+          const settled = await call(
+            handle,
+            "POST",
+            `/requests/${requestId}/settle`,
+            { inboundId: "in-3" },
+            "cli-token",
+          );
+          expect(settled.status).toBe(200);
+          expect(settled.reply.request.status).toBe("settled");
+          const again = await call(
+            handle,
+            "POST",
+            `/requests/${requestId}/settle`,
+            { inboundId: "in-3" },
+            "bridge-token",
+          );
+          expect(again.reply).toEqual(settled.reply);
+          // Typed before the settle, so it cannot be what reopens it.
+          const early = await call(
+            handle,
+            "POST",
+            `/requests/${requestId}/reopen`,
+            { inboundId: "in-1" },
+            "cli-token",
+          );
+          expect(early.status).toBe(403);
+        });
+        const wakes = h.threads.sent.filter(
+          (each) => each.threadId === masterThread && each.key.startsWith("mission-wake:"),
+        );
+        expect(wakes.length).toBeGreaterThanOrEqual(1);
+        expect(wakes[0]!.text).toContain(ask);
+      }).pipe(Effect.provide(h.layer));
+    },
+  );
+
+  // Sol boundary 4, Q1: a Telegram session opened a request with a real typed
+  // inbound and was recorded as the owner. Now no credential but the iMessage
+  // bridge's and the mission CLI's redeems an inbound, and it is refused
+  // before anything is looked up or written.
+  it.live("refuses every other credential before it looks the inbound up", () => {
     const inbound: InboundMessage[] = [];
     const h = harness(inbound);
     return Effect.gen(function* () {
       yield* seed;
-      // The bridge saw these just now: the owner's chat and Moni's.
       const now = yield* Clock.currentTimeMillis;
-      inbound.push(
-        said(now, "in-1", "How far is the API lane?"),
-        said(now, "in-2", "Thanks. Also pick up the flaky test.", "moni"),
-        said(now, "wake:1", "How far is the API lane?"),
-      );
+      inbound.push(said(now, "in-1", ask));
       yield* withDesk(async (handle) => {
-        const refused = [
-          // No inbound id at all.
-          await call(handle, "POST", "/requests", { missionId, text: "How far is the API lane?" }),
-          // An id nobody sent.
-          await call(handle, "POST", "/requests", {
-            missionId,
-            text: "How far is the API lane?",
-            inboundId: "in-404",
-          }),
-          // A real message, but not what he said.
-          await call(handle, "POST", "/requests", {
-            missionId,
-            text: "Ship the API lane today.",
-            inboundId: "in-1",
-          }),
-          // A synthetic id.
-          await call(handle, "POST", "/requests", {
-            missionId,
-            text: "How far is the API lane?",
-            inboundId: "wake:1",
-          }),
-          // No token.
-          await call(
+        for (const token of ["telegram-token", "crw-token", "control-token", "owner-token"]) {
+          const opened = await call(
             handle,
             "POST",
             "/requests",
-            { missionId, text: "How far is the API lane?", inboundId: "in-1" },
-            "nope",
-          ),
-        ];
-        expect(refused.map((each) => each.status)).toEqual([400, 403, 403, 403, 401]);
-
-        const opened = await call(handle, "POST", "/requests", {
-          missionId,
-          text: "How far is the API lane?",
-          inboundId: "in-1",
-        });
-        expect(opened.status).toBe(200);
-        expect(opened.reply.request.createdBy).toEqual({
-          _tag: "owner-imessage",
-          chat: "owner",
-          inboundId: "in-1",
-        });
-        // The bridge retrying the same message opens nothing new.
-        const retried = await call(handle, "POST", "/requests", {
-          missionId,
-          text: "How far is the API lane?",
-          inboundId: "in-1",
-        });
-        expect(retried.reply.request.id).toBe(opened.reply.request.id);
-
-        const requestId = opened.reply.request.id as string;
-        const mismatch = await call(handle, "POST", `/requests/${requestId}/reply`, {
-          text: "Something else entirely.",
-          inboundId: "in-2",
-        });
-        expect(mismatch.status).toBe(403);
-        const replied = await call(handle, "POST", `/requests/${requestId}/reply`, {
-          text: "Thanks. Also pick up the flaky test.",
-          inboundId: "in-2",
-        });
-        expect(replied.status).toBe(200);
-        expect(replied.reply.request.status).toBe("waiting-on-master");
-
-        // The bridge and an owner session read the conversation.
-        for (const token of ["bridge-token", "owner-token"]) {
-          const listed = await call(
-            handle,
-            "GET",
-            `/requests?mission=${missionId}`,
-            undefined,
+            { missionId, text: ask, inboundId: "in-1" },
             token,
           );
-          expect(listed.status).toBe(200);
-          expect(listed.reply.requests).toHaveLength(1);
-          expect(listed.reply.requests[0].messages).toHaveLength(2);
-          expect(listed.reply.requests[0].request.lastReply).toBe(
-            "Thanks. Also pick up the flaky test.",
-          );
+          expect(opened.status, token).toBe(403);
+          expect(opened.reply.error.code, token).toBe("forbidden");
         }
-        const one = await call(
+        expect(h.lookedUp).toEqual([]);
+        const listed = await call(
           handle,
           "GET",
-          `/requests?mission=${missionId}&request=${requestId}`,
+          `/requests?mission=${missionId}`,
           undefined,
-          "bridge-token",
+          "owner-token",
         );
-        expect(one.reply.requests[0].messages.map((each: any) => each.body)).toEqual([
-          "How far is the API lane?",
-          "Thanks. Also pick up the flaky test.",
-        ]);
-        // Any other read token sees that requests exist, not what they say.
-        for (const token of ["control-token", "cli-token"]) {
-          const bare = await call(
-            handle,
-            "GET",
-            `/requests?mission=${missionId}&request=${requestId}`,
-            undefined,
-            token,
-          );
-          expect(bare.status).toBe(200);
-          expect(bare.reply.requests).toHaveLength(1);
-          expect(bare.reply.requests[0].request.status).toBe("waiting-on-master");
-          expect(bare.reply.requests[0].messages).toEqual([]);
-          expect(bare.reply.requests[0].request.lastReply).toBeNull();
-          expect(JSON.stringify(bare.reply)).not.toContain("flaky test");
-        }
+        expect(listed.reply.requests).toEqual([]);
       });
-      const wakes = h.threads.sent.filter(
-        (each) => each.threadId === masterThread && each.key.startsWith("mission-wake:"),
-      );
-      expect(wakes.length).toBeGreaterThanOrEqual(1);
-      expect(wakes[0]!.text).toContain("How far is the API lane?");
+      expect(h.threads.sent.filter((each) => each.threadId === masterThread)).toEqual([]);
     }).pipe(Effect.provide(h.layer));
   });
 });

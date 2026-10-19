@@ -8,9 +8,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
-  addressed,
   agent,
-  askInput,
   at,
   failureCode,
   governor,
@@ -22,29 +20,14 @@ import {
   ownerApp,
   seed,
   seedOther,
-  typedInbound,
   writerThread,
 } from "./AsksService.testkit.ts";
 import * as Ports from "./ports.ts";
-import type { InboundMessage } from "./provenance.ts";
 
 const T0 = Date.parse(at);
 const MINUTE = 60_000;
-const relay = agent(masterThread);
 const master = agent(masterThread);
 const writer = agent(writerThread);
-/**
- * A harness whose inbox fills as the test goes: `say` files the owner's reply
- * to a record, addressed by its handle as P1 requires.
- */
-const withInbox = () => {
-  const inbox: Array<InboundMessage> = [];
-  const { layer } = harness(inbox);
-  const say = (id: string, recordId: string, text: string, receivedAt: number) => {
-    inbox.push(typedInbound(id, addressed(recordId, text), receivedAt));
-  };
-  return { layer, say };
-};
 const link = (label: string): MissionLink => ({ kind: "url", label, url: null, ref: label });
 const draftFor = (audience: string, text: string) => ({
   missionId,
@@ -55,300 +38,33 @@ const draftFor = (audience: string, text: string) => ({
 });
 
 describe("boundary review regressions", () => {
-  it.effect("H8: an iMessage answer must name the chosen option and nothing against it", () => {
-    const { layer, say } = withInbox();
-    return Effect.gen(function* () {
-      yield* seed;
-      const asks = yield* AsksService.AsksService;
-      const risky = askInput("Deploy now?", {
-        options: [
-          { id: "deploy", label: "Deploy", detail: "" },
-          { id: "hold", label: "Hold", detail: "" },
-        ],
-        recommendation: { optionId: "hold", reason: "Friday." },
-      });
-      const ask = yield* asks.openAsk(risky, master);
-      say("msg-keep", ask.id, "keep it safe", T0 + MINUTE);
-      say("msg-negated", ask.id, "do not deploy", T0 + MINUTE);
-      say("msg-deploy", ask.id, "deploy", T0 + MINUTE);
-
-      // A real owner message that says something else can't stand in for an option.
-      expect(
-        yield* failureCode(
-          asks.answerAsk(
-            { askId: ask.id, optionId: "deploy", text: "", inboundId: "msg-keep" },
-            relay,
-          ),
-        ),
-      ).toBe("provenance-invalid");
-      // Free text doesn't replace option verification either.
-      expect(
-        yield* failureCode(
-          asks.answerAsk(
-            { askId: ask.id, optionId: "deploy", text: "keep it safe", inboundId: "msg-keep" },
-            relay,
-          ),
-        ),
-      ).toBe("provenance-invalid");
-      // A negated reply never matches the option it negates.
-      expect(
-        yield* failureCode(
-          asks.answerAsk(
-            { askId: ask.id, optionId: "deploy", text: "", inboundId: "msg-negated" },
-            relay,
-          ),
-        ),
-      ).toBe("provenance-invalid");
-      // The master relaying without any inbound is not the owner.
-      expect(
-        yield* failureCode(asks.answerAsk({ askId: ask.id, optionId: "deploy", text: "" }, relay)),
-      ).toBe("provenance-required");
-
-      const answered = yield* asks.answerAsk(
-        { askId: ask.id, optionId: "deploy", text: "", inboundId: "msg-deploy" },
-        relay,
-      );
-      expect(answered.ask.answer?.optionId).toBe("deploy");
-      expect(answered.ask.answer?.provenance).toMatchObject({ _tag: "owner-imessage" });
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("H9: an iMessage draft decision must say that decision and the edited text", () => {
-    const { layer, say } = withInbox();
-    return Effect.gen(function* () {
+  // H8, H9 and N9 (iMessage words and epochs) moved with the redemption to the
+  // desk transport; asks/http.test.ts and guard/inboundActions.test.ts cover them.
+  it.effect("H10: an app approval binds to the draft's current revision", () =>
+    Effect.gen(function* () {
       yield* TestClock.setTime(T0);
       yield* seed;
       const asks = yield* AsksService.AsksService;
-      const draft = yield* asks.submitDraft(
-        draftFor("Sami", "Hi Sami, the fix is merged."),
+      const draft = yield* asks.submitDraft(draftFor("Sami", "The fix is merged."), writer);
+      expect(draft.revision).toBe(0);
+      yield* TestClock.setTime(T0 + 2 * 60 * MINUTE);
+      const revised = yield* asks.reviseDraft(
+        { draftId: draft.id, text: "The fix is merged and deployed." },
         writer,
       );
-      say("msg-line", draft.id, "Do not send the line hello world.", T0 + MINUTE);
-      say("msg-dont", draft.id, "do not approve", T0 + MINUTE);
-      say("msg-edit", draft.id, "approve: hello world", T0 + MINUTE);
-
+      expect(revised.revision).toBe(1);
+      // An app decision made against the old revision is refused.
       expect(
         yield* failureCode(
-          asks.decideDraft(
-            {
-              draftId: draft.id,
-              action: "approve",
-              editedText: "hello world",
-              inboundId: "msg-line",
-            },
-            relay,
-          ),
+          asks.decideDraft({ draftId: draft.id, action: "approve", revision: 0 }, ownerApp),
         ),
-      ).toBe("provenance-invalid");
+      ).toBe("conflict");
       expect(
-        yield* failureCode(
-          asks.decideDraft({ draftId: draft.id, action: "approve", inboundId: "msg-dont" }, relay),
-        ),
-      ).toBe("provenance-invalid");
-      expect((yield* asks.drafts({ missionId }))[0]?.status).toBe("pending");
-
-      const approved = yield* asks.decideDraft(
-        { draftId: draft.id, action: "approve", editedText: "hello world", inboundId: "msg-edit" },
-        relay,
-      );
-      expect(approved.draft.status).toBe("approved");
-      expect(approved.draft.approvedText).toBe("hello world");
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect(
-    "H10: approvals bind to the draft's current revision; older evidence is refused",
-    () => {
-      const { layer, say } = withInbox();
-      return Effect.gen(function* () {
-        yield* TestClock.setTime(T0);
-        yield* seed;
-        const asks = yield* AsksService.AsksService;
-        const draft = yield* asks.submitDraft(draftFor("Sami", "The fix is merged."), writer);
-        expect(draft.revision).toBe(0);
-        say("msg-yes", draft.id, "yes", T0 + MINUTE);
-        say("msg-yes-2", draft.id, "ok send it", T0 + 2 * 60 * MINUTE + MINUTE);
-
-        // The writer revises hours after the owner's "yes"; that yes was for other text.
-        yield* TestClock.setTime(T0 + 2 * 60 * MINUTE);
-        const revised = yield* asks.reviseDraft(
-          { draftId: draft.id, text: "The fix is merged and deployed." },
-          writer,
-        );
-        expect(revised.revision).toBe(1);
-        expect(
-          yield* failureCode(
-            asks.decideDraft({ draftId: draft.id, action: "approve", inboundId: "msg-yes" }, relay),
-          ),
-        ).toBe("provenance-invalid");
-        // An app decision made against the old revision is refused too.
-        expect(
-          yield* failureCode(
-            asks.decideDraft({ draftId: draft.id, action: "approve", revision: 0 }, ownerApp),
-          ),
-        ).toBe("conflict");
-
-        yield* TestClock.setTime(T0 + 2 * 60 * MINUTE + 2 * MINUTE);
-        const approved = yield* asks.decideDraft(
-          { draftId: draft.id, action: "approve", inboundId: "msg-yes-2" },
-          relay,
-        );
-        expect(approved.draft.status).toBe("approved");
-
-        // After a reopen, the approving inbound of the earlier epoch no longer counts.
-        yield* TestClock.setTime(T0 + 3 * 60 * MINUTE);
-        const reopened = yield* asks.reopenDraft({ draftId: draft.id }, ownerApp);
-        expect(reopened.revision).toBe(2);
-        expect(
-          yield* failureCode(
-            asks.decideDraft(
-              { draftId: draft.id, action: "approve", inboundId: "msg-yes-2" },
-              relay,
-            ),
-          ),
-        ).toBe("provenance-invalid");
-        expect(
-          (yield* asks.decideDraft({ draftId: draft.id, action: "approve", revision: 2 }, ownerApp))
-            .draft.status,
-        ).toBe("approved");
-
-        // Sol P1: one reply speaks for the one draft it names, even when two
-        // were pending when it arrived.
-        yield* TestClock.setTime(T0);
-        const first = yield* asks.submitDraft(draftFor("Lee", "Lee, it's live."), writer);
-        const second = yield* asks.submitDraft(draftFor("Kim", "Kim, it's live."), writer);
-        say("msg-both", first.id, "approve", T0 + 5 * MINUTE);
-        expect(
-          (yield* asks.decideDraft(
-            { draftId: first.id, action: "approve", inboundId: "msg-both" },
-            relay,
-          )).draft.status,
-        ).toBe("approved");
-        expect(
-          yield* failureCode(
-            asks.decideDraft(
-              { draftId: second.id, action: "approve", inboundId: "msg-both" },
-              relay,
-            ),
-          ),
-        ).toBe("provenance-invalid");
-      }).pipe(Effect.provide(layer));
-    },
+        (yield* asks.decideDraft({ draftId: draft.id, action: "approve", revision: 1 }, ownerApp))
+          .draft.status,
+      ).toBe("approved");
+    }).pipe(Effect.provide(harness().layer)),
   );
-
-  it.effect("N9: a reopened ask takes no iMessage from before the reopen", () => {
-    const { layer, say } = withInbox();
-    return Effect.gen(function* () {
-      yield* TestClock.setTime(T0);
-      yield* seed;
-      const asks = yield* AsksService.AsksService;
-      const ask = yield* asks.openAsk(askInput("Which way?"), master);
-      expect(ask.revision ?? 0).toBe(0);
-      say("msg-offline", ask.id, "offline window", T0 + MINUTE);
-      say("msg-early", ask.id, "offline window", T0 + 90_000);
-      say("msg-online", ask.id, "online", T0 + 3 * MINUTE);
-
-      yield* TestClock.setTime(T0 + MINUTE + 10_000);
-      const answered = yield* asks.answerAsk(
-        { askId: ask.id, optionId: "b", text: "", inboundId: "msg-offline" },
-        relay,
-      );
-      expect(answered.ask.status).toBe("answered");
-
-      // He takes it back a minute later, well inside the usual clock skew.
-      yield* TestClock.setTime(T0 + 2 * MINUTE);
-      const reopened = yield* asks.reopenAsk({ askId: ask.id, reason: "Not sure" }, ownerApp);
-      expect(reopened.revision).toBe(1);
-      expect(reopened.spentInboundIds).toEqual(["msg-offline"]);
-      // The reply that answered the earlier epoch can't answer this one.
-      expect(
-        yield* failureCode(
-          asks.answerAsk(
-            { askId: ask.id, optionId: "b", text: "", inboundId: "msg-offline" },
-            relay,
-          ),
-        ),
-      ).toBe("provenance-invalid");
-      // Nor can any other reply from before the reopen, even seconds before it.
-      expect(
-        yield* failureCode(
-          asks.answerAsk({ askId: ask.id, optionId: "b", text: "", inboundId: "msg-early" }, relay),
-        ),
-      ).toBe("provenance-invalid");
-      const again = yield* asks.answerAsk(
-        { askId: ask.id, optionId: "a", text: "", inboundId: "msg-online" },
-        relay,
-      );
-      expect(again.ask.answer?.optionId).toBe("a");
-
-      // Sol P1: one reply answers the one ask it names, even with two open.
-      yield* TestClock.setTime(T0);
-      const first = yield* asks.openAsk(askInput("Staging?"), master);
-      const second = yield* asks.openAsk(askInput("Production?"), master);
-      say("msg-both", first.id, "offline window", T0 + MINUTE);
-      expect(
-        (yield* asks.answerAsk(
-          { askId: first.id, optionId: "b", text: "", inboundId: "msg-both" },
-          relay,
-        )).ask.status,
-      ).toBe("answered");
-      expect(
-        yield* failureCode(
-          asks.answerAsk(
-            { askId: second.id, optionId: "b", text: "", inboundId: "msg-both" },
-            relay,
-          ),
-        ),
-      ).toBe("provenance-invalid");
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("N9: an ask reopened before asks kept an epoch still takes nothing older", () => {
-    const { layer, say } = withInbox();
-    return Effect.gen(function* () {
-      yield* TestClock.setTime(T0);
-      yield* seed;
-      const asks = yield* AsksService.AsksService;
-      const store = yield* MissionStore.MissionStore;
-      const ask = yield* asks.openAsk(askInput("Which way?"), master);
-      say("msg-early", ask.id, "offline window", T0 + 90_000);
-      say("msg-late", ask.id, "online", T0 + 3 * MINUTE);
-      // Stored by an older build: reopened at T0+2min, with no revision fields.
-      const {
-        revision: _revision,
-        revisedAt: _revisedAt,
-        spentInboundIds: _spent,
-        ...legacy
-      } = ask;
-      yield* store.commit({
-        event: {
-          missionId,
-          kind: "ask.reopened",
-          actor: { _tag: "system", component: "missions" },
-          provenance: ownerApp,
-          summary: "Ask reopened",
-          subject: { kind: "ask", id: ask.id },
-        },
-        upserts: [
-          // T0 + 2 minutes.
-          { _tag: "ask", record: { ...legacy, updatedAt: "2026-10-17T08:02:00.000Z" } },
-        ],
-      });
-
-      yield* TestClock.setTime(T0 + 4 * MINUTE);
-      // Within the old clock skew of the reopen, but before it.
-      expect(
-        yield* failureCode(
-          asks.answerAsk({ askId: ask.id, optionId: "b", text: "", inboundId: "msg-early" }, relay),
-        ),
-      ).toBe("provenance-invalid");
-      const answered = yield* asks.answerAsk(
-        { askId: ask.id, optionId: "a", text: "", inboundId: "msg-late" },
-        relay,
-      );
-      expect(answered.ask.answer?.optionId).toBe("a");
-    }).pipe(Effect.provide(layer));
-  });
 
   it.effect("M3: a master accepts a draft-note suggestion under its own name", () => {
     const { layer } = harness();
