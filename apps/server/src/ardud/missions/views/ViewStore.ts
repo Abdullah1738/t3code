@@ -304,7 +304,8 @@ const make = Effect.gen(function* () {
   const requestsAnswered = (missionId: MissionId) =>
     sql<{ readonly n: number }>`
       SELECT COUNT(*) AS n FROM ardud_mission_records
-      WHERE kind = 'owner-request' AND mission_id = ${missionId} AND status = 'answered'
+      WHERE kind = 'owner-request' AND mission_id = ${missionId}
+        AND json_extract(record_json, '$.record.unreadForOwner') = 1
     `.pipe(Effect.map(count), Effect.orDie);
 
   return ViewStore.of({

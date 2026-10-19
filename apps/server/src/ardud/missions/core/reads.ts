@@ -153,11 +153,9 @@ export const makeReads = (
     const drafts = groupByMission(yield* store.list("draft", { ...wide, status: ["pending"] }));
     const knocks = groupByMission(yield* store.list("knock", { ...wide, status: ["pending"] }));
     const milestones = groupByMission(yield* store.list("milestone", wide));
-    // ardud missions: router (answers the owner has not opened yet)
+    // ardud missions: router (master words the owner has not opened yet, in any status)
     const answered = groupByMission(
-      (yield* store.listAll("owner-request", ["answered"])).filter(
-        (request) => request.unreadForOwner,
-      ),
+      (yield* store.listAll("owner-request")).filter((request) => request.unreadForOwner),
     );
 
     const items = yield* Effect.forEach(
@@ -231,8 +229,8 @@ export const makeReads = (
       const recovery = currentRecovery();
       const recoveryState = recovery === null ? null : yield* recovery.state(missionId);
       // ardud missions: router
-      // Uncapped: read answers stay "answered" until settled and must not push unread ones out.
-      const answered = yield* store.listAllInMission("owner-request", missionId, ["answered"]);
+      // Uncapped, any status: a progress note or a settle note is unread news too.
+      const answered = yield* store.listAllInMission("owner-request", missionId);
       return {
         mission: { ...mission.value, health: entry.mission },
         subMissions:
