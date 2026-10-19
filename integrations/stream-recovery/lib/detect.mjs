@@ -550,6 +550,15 @@ export function buildRestartSummary({ incident, results, missions = [] }) {
       m.noticeOnly ? `${m.noticeOnly} notice only` : null].filter(Boolean);
     lines.push(`Mission "${truncate(m.title, 40)}": ${m.threads} thread(s)${parts.length ? ` (${parts.join(", ")})` : ""}, master first, then paced by mission recovery.`);
   }
+  // Threads whose same turn was cut by several boots in a row wait for a human.
+  // A master still gets its notice, told not to rerun its own turn.
+  const stopped = missions.flatMap((m) => (m.stopped ?? []).map((s) => ({ ...s, mission: m.title })));
+  if (stopped.length) {
+    const names = stopped.slice(0, SUMMARY_NAMES).map((s) => `${truncate(s.title || s.threadId, 40)} (mission "${truncate(s.mission, 30)}", ${s.bootCuts} boots${s.master ? ", master told not to rerun it" : ""})`).join("; ")
+      + (stopped.length > SUMMARY_NAMES ? `; +${stopped.length - SUMMARY_NAMES} more` : "");
+    const lanes = stopped.some((s) => !s.master);
+    lines.push(`Not resumed, same turn cut by boot after boot: ${names}.${lanes ? " Resume by hand from mission recovery, or ask the master." : ""}`);
+  }
   const resumed = results.filter((r) => r.plan.action === "resumed");
   if (resumed.length) lines.push(`Resumed by themselves (no note): ${list(resumed, (r) => `${name(r)}${what(r)}`)}.`);
   const released = results.filter((r) => r.queueOk);

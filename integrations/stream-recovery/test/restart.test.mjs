@@ -778,6 +778,35 @@ test('mission members get no stream-recovery note; the incident goes to mission 
   assert.equal(calls.mission.length, 1);
 });
 
+test('a mission thread cut by boot after boot gets one summary line saying it waits for a human', async () => {
+  const stopped = { threadId: 'kafka', title: 'Kafka consumer', bootCuts: 3 };
+  const { io, calls } = fakeIo({
+    subs: restartBurst(), runs: [run('kafka')], threads,
+    mission: missionReply(['kafka'], [
+      { missionId: 'm-1', title: 'Crpko launch', threads: 2, resume: 0, reconcile: 0, noticeOnly: 1, stopped: [stopped] },
+    ]),
+  });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+  assert.equal(calls.telegram.length, 1);
+  const text = calls.telegram[0].text;
+  assert.match(text, /Mission "Crpko launch": 2 thread\(s\) \(1 notice only\), master first/);
+  assert.match(text, /Not resumed, same turn cut by boot after boot: Kafka consumer \(mission "Crpko launch", 3 boots\)\. Resume by hand from mission recovery, or ask the master\./);
+});
+
+test('a master cut by boot after boot is reported as told, not as waiting for a human', async () => {
+  const stopped = { threadId: 'pbdraft', title: 'Launch master', bootCuts: 3, master: true };
+  const { io, calls } = fakeIo({
+    subs: restartBurst(), runs: [run('pbdraft')], threads,
+    mission: missionReply(['pbdraft'], [
+      { missionId: 'm-1', title: 'Crpko launch', threads: 1, resume: 0, reconcile: 0, noticeOnly: 0, stopped: [stopped] },
+    ]),
+  });
+  await restartScan(scanArgs({ handled: {}, servers: [] }), io);
+  const text = calls.telegram[0].text;
+  assert.match(text, /Not resumed, same turn cut by boot after boot: Launch master \(mission "Crpko launch", 3 boots, master told not to rerun it\)\./);
+  assert.doesNotMatch(text, /Resume by hand/);
+});
+
 test('a busy mission member is left to mission recovery instead of being held back', async () => {
   const busy = { title: 'Arch', activeRunId: 'fresh', status: 'running' };
   const { io, calls } = fakeIo({ runs: [run('arch')], threads: { arch: busy }, mission: missionReply(['arch']) });
