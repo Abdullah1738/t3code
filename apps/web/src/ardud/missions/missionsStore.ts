@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 
 import type {
   DraftNote,
@@ -17,12 +17,12 @@ import {
   createKeyedSnapshotStores,
   createRpcMissionsSource,
   createSnapshotStore,
+  yourRequests,
   type SampledFeed,
   type ApprovalRoutingTable,
-  type MissionForkEntry,
   type MissionInboxSnapshot,
-  type MissionLayout,
   type MissionOverviewSnapshot,
+  type MissionViewsState,
   type OwnerRequest,
   type MissionPoolsSnapshot,
   type MissionReviewSnapshot,
@@ -113,9 +113,6 @@ const draftNoteStores = createKeyedSnapshotStores<MissionId | null, ReadonlyArra
 const statsStore = createSnapshotStore<ReadonlyArray<SuggestionStats>>((emit) =>
   missionsSource.subscribeSuggestionStats(emit),
 );
-const forkStores = createKeyedSnapshotStores<MissionId | null, ReadonlyArray<MissionForkEntry>>(
-  (id, emit) => missionsSource.subscribeForks(id, emit),
-);
 const ruleStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Rule>>((id, emit) =>
   missionsSource.subscribeRules(id, emit),
 );
@@ -125,22 +122,52 @@ const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Missio
 const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit) =>
   missionsSource.subscribeRoom(id, emit),
 );
-const layoutStores = createKeyedSnapshotStores<MissionId, MissionLayout>((id, emit) =>
-  missionsSource.subscribeLayout(id, emit),
+const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>((id, emit) =>
+  missionsSource.subscribeViews(id, emit),
 );
 const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
   (id, emit) => missionsSource.subscribeRequests(id, emit),
 );
 
-/** The mission's overview sections, in order, with what was hidden or removed. */
-export function useMissionLayout(missionId: MissionId): MissionLayout | undefined {
-  const store = layoutStores(missionId);
+/** The mission's views record (its layout of sections and tabs) and its change log. */
+export function useMissionViews(missionId: MissionId): MissionViewsState | null | undefined {
+  const store = viewStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
 }
 
-/** What the owner asked or told the master, newest activity first. */
-export function useOwnerRequests(missionId: MissionId): ReadonlyArray<OwnerRequest> | undefined {
-  const store = requestStores(missionId);
+const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | null>((key, emit) => {
+  const [missionId, requestId] = key.split("\n") as [MissionId, string];
+  return missionsSource.subscribeRequest({ missionId, requestId }, emit);
+});
+
+const NO_REQUESTS = { get: () => undefined, subscribe: () => () => {} };
+
+/**
+ * Every owner request, discussions included, newest activity first. A record
+ * outside any mission (a global suggestion) has no requests.
+ */
+export function useOwnerRequests(
+  missionId: MissionId | null,
+): ReadonlyArray<OwnerRequest> | undefined {
+  const store = missionId === null ? NO_REQUESTS : requestStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/**
+ * Your requests: the owner's own asks. Discussions about a record are left
+ * out; they live on that record's card.
+ */
+export function useYourRequests(missionId: MissionId): ReadonlyArray<OwnerRequest> | undefined {
+  const requests = useOwnerRequests(missionId);
+  return useMemo(() => (requests === undefined ? undefined : yourRequests(requests)), [requests]);
+}
+
+/** One request's whole conversation with full message bodies; null once gone. */
+export function useOwnerRequest(
+  missionId: MissionId,
+  requestId: string,
+): OwnerRequest | null | undefined {
+  const store = requestThreadStores(`${missionId}\n${requestId}`);
   return useSyncExternalStore(store.subscribe, store.get);
 }
 
@@ -248,14 +275,6 @@ export function useDraftNotes(missionId: MissionId | null): ReadonlyArray<DraftN
 
 export function useSuggestionStats(): ReadonlyArray<SuggestionStats> | undefined {
   return useSyncExternalStore(statsStore.subscribe, statsStore.get);
-}
-
-/** Forks of the master, newest first. */
-export function useMissionForks(
-  missionId: MissionId | null,
-): ReadonlyArray<MissionForkEntry> | undefined {
-  const store = forkStores(missionId);
-  return useSyncExternalStore(store.subscribe, store.get);
 }
 
 export function useMissionRules(missionId: MissionId): ReadonlyArray<Rule> | undefined {

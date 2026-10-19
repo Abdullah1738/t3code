@@ -6,14 +6,18 @@ import type { InboxTab, MissionId, MissionListItem, MissionListSnapshot } from "
 import {
   ageView,
   defaultInboxTab,
+  DRAFT_STATUS_LABEL,
   draftOwnerEdit,
+  draftTitle,
   entryRow,
   formatRelative,
   INBOX_ROUTE_FILTER_LABEL,
   INBOX_TAB_LABEL,
   INBOX_TABS,
   inboxTabCounts,
-  splitForks,
+  isRequestUnread,
+  ownerConditionOf,
+  requestAbout,
   staleApprovals,
   totalNeedsYou,
   type InboxEntry,
@@ -44,20 +48,20 @@ import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { AgeElement, CountBadge, HealthGlyph, needsYouLabel } from "./cards/chips";
+import { AgeElement, CountBadge, HealthGlyph, needsYouLabel, UnreadDot } from "./cards/chips";
+import { ConditionNote } from "./DiscussPanel";
 import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
-import { MissionForksList } from "./MissionForksList";
 import { MissionSection } from "./MissionSection";
 import { RoutingPanel } from "./RoutingPanel";
 import {
   isSampleFeed,
   useDraftNotes,
   useMasterRoleId,
-  useMissionForks,
   useMissionInbox,
   useMissionInboxHistory,
   useMissionList,
+  useOwnerRequests,
   useSuggestionStats,
 } from "./missionsStore";
 import { WordDiff } from "./TextDiffView";
@@ -305,7 +309,6 @@ function InboxBody(props: {
 }) {
   const { screen, nowMs } = props;
   const masterRoleId = useMasterRoleId(props.missionId);
-  const forks = useMissionForks(props.missionId) ?? NONE;
   const draftNotes = useDraftNotes(props.missionId) ?? NONE;
   const allStats = useSuggestionStats();
   const missionList = useMissionList();
@@ -314,7 +317,6 @@ function InboxBody(props: {
   const actions = useMemo(() => inboxActions(screen.dispatch), [screen.dispatch]);
   const deps = useMemo(
     () => ({
-      forks,
       draftNotes,
       stats,
       list: missionList,
@@ -323,10 +325,9 @@ function InboxBody(props: {
       actions,
       size: "pane" as const,
     }),
-    [forks, draftNotes, stats, missionList, masterRoleId, nowMs, actions],
+    [draftNotes, stats, missionList, masterRoleId, nowMs, actions],
   );
   const selected = screen.selected;
-  const openForks = splitForks(forks).open.length;
 
   const listView =
     screen.entries.length === 0 ? (
@@ -358,9 +359,7 @@ function InboxBody(props: {
       />
     </div>
   ));
-  const extras = (
-    <InboxExtras missionId={props.missionId} tab={props.tab} nowMs={nowMs} openForks={openForks} />
-  );
+  const extras = <InboxExtras missionId={props.missionId} tab={props.tab} nowMs={nowMs} />;
   const entryKeys = useMemo(() => screen.entries.map((entry) => entry.key), [screen.entries]);
   const paneRef = usePaneFocus(selected?.key ?? null, props.wide, entryKeys);
 
@@ -507,6 +506,12 @@ function InboxRow(props: {
 }) {
   const row = entryRow(props.entry, props.missionList);
   const age = ageView(row.since, props.nowMs);
+  // The master replied in this item's discussion: the item says so, not Your requests.
+  const requests = useOwnerRequests(props.entry.record.missionId);
+  const talk = requests
+    ? requestAbout(requests, { kind: props.entry.kind, id: props.entry.record.id })
+    : null;
+  const replied = talk !== null && isRequestUnread(talk);
   return (
     <li>
       <button
@@ -520,7 +525,10 @@ function InboxRow(props: {
         )}
       >
         <span className="truncate font-medium">{row.title}</span>
-        {age ? <AgeElement age={age} at={row.since} prefix="waiting " /> : <span />}
+        <span className="inline-flex items-center gap-1.5">
+          {replied ? <UnreadDot label="The master replied in the discussion" /> : null}
+          {age ? <AgeElement age={age} at={row.since} prefix="waiting " /> : null}
+        </span>
         <span className="col-span-2 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
           <span className="shrink-0 font-medium">{row.kicker}</span>
           {row.sub ? (
@@ -538,20 +546,9 @@ function InboxRow(props: {
   );
 }
 
-/** What sits under the list for a tab: open discussions, routing, history, draft notes. */
-function InboxExtras(props: {
-  missionId: MissionId | null;
-  tab: InboxTab;
-  nowMs: number;
-  openForks: number;
-}) {
-  if (props.tab === "decide") {
-    return props.openForks > 0 ? (
-      <MissionSection title="Open discussions">
-        <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
-      </MissionSection>
-    ) : null;
-  }
+/** What sits under the list for a tab: decisions on a condition, routing, history, draft notes. */
+function InboxExtras(props: { missionId: MissionId | null; tab: InboxTab; nowMs: number }) {
+  if (props.tab === "decide") return <AnsweredOnCondition missionId={props.missionId} />;
   if (props.tab !== "approve") return null;
   return (
     <>
@@ -561,6 +558,26 @@ function InboxExtras(props: {
         <DraftNotesPanel missionId={props.missionId} />
       </MissionSection>
     </>
+  );
+}
+
+/** Asks the master answered on a condition the owner stated in a Discuss request. */
+function AnsweredOnCondition(props: { missionId: MissionId | null }) {
+  const history = useMissionInboxHistory(props.missionId);
+  const answered = (history?.asks ?? []).flatMap((ask) => {
+    const condition = ask.answer ? ownerConditionOf(ask.answer) : null;
+    return condition ? [{ ask, condition }] : [];
+  });
+  if (answered.length === 0) return null;
+  return (
+    <MissionSection title="Decided today">
+      {answered.map(({ ask, condition }) => (
+        <div key={ask.id} className="flex min-w-0 flex-col gap-1.5">
+          <p className="min-w-0 truncate text-sm font-medium">{ask.question}</p>
+          <ConditionNote condition={condition} />
+        </div>
+      ))}
+    </MissionSection>
   );
 }
 
@@ -575,7 +592,13 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
     ...staleApprovals(history),
     ...history.approvals.filter((approval) => approval.status !== "stale-closed"),
   ];
-  if (editedDrafts.length === 0 && closed.length === 0) return null;
+  const conditionDrafts = history.drafts.flatMap((draft) => {
+    const condition = ownerConditionOf(draft);
+    return condition ? [{ draft, condition }] : [];
+  });
+  if (editedDrafts.length === 0 && closed.length === 0 && conditionDrafts.length === 0) {
+    return null;
+  }
   return (
     <MissionSection title="Decided today">
       {editedDrafts.map(({ draft, edit }) => (
@@ -590,6 +613,17 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
             ) : null}
           </p>
           {edit ? <WordDiff segments={edit.segments} /> : null}
+        </div>
+      ))}
+      {conditionDrafts.map(({ draft, condition }) => (
+        <div key={`condition:${draft.id}`} className="flex min-w-0 flex-col gap-1.5">
+          <p className="flex min-w-0 items-center gap-1.5 text-sm">
+            <span className="min-w-0 truncate font-medium">{draftTitle(draft)}</span>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {DRAFT_STATUS_LABEL[draft.status]}
+            </span>
+          </p>
+          <ConditionNote condition={condition} />
         </div>
       ))}
       {closed.length > 0 ? (

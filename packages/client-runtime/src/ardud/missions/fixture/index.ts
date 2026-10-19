@@ -50,6 +50,7 @@ import { createEventLog } from "./eventLog.ts";
 import { createOperations } from "./operations.ts";
 import * as ops from "./opsData.ts";
 import { createRequests } from "./requests.ts";
+import { createViews } from "./views.ts";
 import { RerouteSeed, RoutingTableSeed } from "./schemas.ts";
 import { clampSummary, fail, newestFirst, replace } from "./util.ts";
 
@@ -391,18 +392,12 @@ export function createFixtureMissionsSource(
       if (!mission) return null;
       const lastLooked = ownerLastLookedAt.get(missionId) ?? null;
       const isCrpko = missionId === data.missions[0]?.id;
-      // A call the owner is discussing stays in the check until its fork closes.
-      const discussing = new Set(
-        forks
-          .filter((entry) => entry.fork.status === "open" && entry.fork.kind === "discuss")
-          .map((entry) => originKey(entry.fork.origin)),
-      );
       const directionCheck = calls
         .filter(
           (c) =>
             c.missionId === missionId &&
-            ((c.ownerReaction === null && (lastLooked === null || c.createdAt > lastLooked)) ||
-              (c.ownerReaction === "discuss" && discussing.has(`call:${c.id}`))),
+            c.ownerReaction === null &&
+            (lastLooked === null || c.createdAt > lastLooked),
         )
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
         .map((c) => ({
@@ -724,13 +719,15 @@ export function createFixtureMissionsSource(
     postNudge,
   });
 
-  const requests = createRequests({
+  const { unreadFor, ...requests } = createRequests({ memo, commit, watch, nowIso, localId });
+  const views = createViews({
     memo,
     commit,
     watch,
     nowIso,
     localId,
     ownerWaiting: (missionId) => needsYou(missionId, null),
+    requestsUnread: unreadFor,
   });
 
   function findMission(missionId: string) {
@@ -755,6 +752,7 @@ export function createFixtureMissionsSource(
     subscribeRouting: (missionId, listener) => watch(() => routingTable(missionId), listener),
     ...operations.source,
     ...requests,
+    ...views,
 
     loadRoomPage({ roomId, beforeSeq, limit }) {
       const room = rooms.find((r) => r.id === roomId);
@@ -843,14 +841,6 @@ export function createFixtureMissionsSource(
       const target = calls.find((c) => c.id === callId);
       if (!target) return fail("not-found", `Call ${callId} not found.`);
       replace(calls, { ...target, ownerReaction: reaction });
-      if (reaction === "discuss") {
-        openForkRecord({
-          missionId: target.missionId,
-          kind: "discuss",
-          origin: { kind: "call", id: target.id, label: target.title },
-          question: null,
-        });
-      }
       commit();
       return Promise.resolve();
     },

@@ -11,7 +11,7 @@ import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
 import { CountBadge, GlyphCount, HealthGlyph, needsYouLabel, UnreadDot } from "./cards/chips";
-import { useMissionList, useOwnerRequests } from "./missionsStore";
+import { useMissionList, useYourRequests } from "./missionsStore";
 import { unreadRequests } from "./sections/YourRequests";
 
 const SIDEBAR_STATE_KEY = "t3code:ardud-missions:sidebar";
@@ -258,7 +258,7 @@ function PortfolioRow(props: { onNavigate: () => void }) {
 
 /** Answered requests the owner has not opened: an update dot and the count. */
 function RequestsAnsweredLink(props: { missionId: MissionId; onNavigate: () => void }) {
-  const requests = useOwnerRequests(props.missionId);
+  const requests = useYourRequests(props.missionId);
   const unread = useMemo(() => unreadRequests(requests), [requests]);
   const first = unread[0];
   if (!first) return null;

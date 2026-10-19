@@ -1,4 +1,11 @@
-import type { MissionActor, MissionEventId, MissionId } from "@t3tools/contracts";
+import {
+  MissionEventKind,
+  type DirectionCheckItem,
+  type Mission,
+  type MissionActor,
+  type MissionEventId,
+  type MissionId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -10,17 +17,25 @@ import {
   newestChange,
 } from "./changeLog.ts";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
-import { portfolioView, reorderPortfolioInput } from "./portfolioViewModel.ts";
+import {
+  portfolioFromMissions,
+  portfolioView,
+  reorderPortfolioInput,
+} from "./portfolioViewModel.ts";
 import type { MissionTimelineEvent, PortfolioSnapshot } from "./source.ts";
 import {
   actorChoices,
   consequences,
+  directionCheckRows,
   EMPTY_TIMELINE_FILTER,
+  eventKicker,
+  eventKindLabel,
   filterTimeline,
   kindChoices,
   kindGroup,
   lineage,
-  successions,
+  TIMELINE_KIND_GROUP_LABEL,
+  timelineDays,
   timelineRows,
   toggleFilter,
 } from "./timelineViewModel.ts";
@@ -94,8 +109,8 @@ describe("timeline view model", () => {
     ]);
     const rows = timelineRows(events, events, MASTER);
     const rule104 = rows.find((row) => row.event.id === "ev-10136");
-    expect(rule104?.consequenceCount).toBe(2);
-    expect(rows.find((row) => row.event.id === "ev-10212")?.causeSummary).toMatch(/rule 104/i);
+    expect(rule104?.lineageSteps).toBeGreaterThanOrEqual(2);
+    expect(rows.find((row) => row.event.id === "ev-10212")?.lineageSteps).toBeGreaterThanOrEqual(1);
 
     const looped = { ...byId(events, "ev-10141"), causedBy: "ev-10142" as MissionEventId };
     const withLoop = events.map((event) => (event.id === looped.id ? looped : event));
@@ -106,24 +121,122 @@ describe("timeline view model", () => {
     timeline.close();
   });
 
-  it("pulls out lane successions and logs a hand-off from the lanes tab", async () => {
+  it("keeps lane successions as a filter and logs a hand-off from the lanes tab", async () => {
     const missions = source();
     const timeline = live<ReadonlyArray<MissionTimelineEvent>>((l) =>
       missions.subscribeTimeline(CRPKO, l),
     );
-    expect(successions(timeline.value, MASTER).map((entry) => entry.who)).toEqual([
-      "cell-risk6",
-      "cell-risk",
-      "cell-risk5",
-    ]);
+    const handoffs = () =>
+      filterTimeline(timeline.value, { groups: ["succession"], actors: [] }).map((event) => ({
+        who: event.subject?.id.replace(/^lane-/, ""),
+        by: event.actor._tag,
+      }));
+    expect(handoffs().map((entry) => entry.who)).toEqual(["cell-risk6", "cell-risk", "cell-risk5"]);
     await missions.handOffLane({
       laneId: "lane-cell-bal" as never,
       note: "655K prompt; #773 r6 is running, resume from the stop step",
     });
-    const latest = successions(timeline.value, MASTER)[0];
-    expect(latest?.who).toBe("cell-bal");
-    expect(latest?.event.actor._tag).toBe("owner");
+    expect(handoffs()[0]).toEqual({ who: "cell-bal", by: "owner" });
     timeline.close();
+  });
+
+  it("puts every event kind in a named group, secret requests with the asks", () => {
+    for (const kind of MissionEventKind.literals) {
+      expect(kindGroup(kind), kind).not.toBe("other");
+    }
+    expect(TIMELINE_KIND_GROUP_LABEL[kindGroup("secret-request.closed")]).toBe(
+      "Asks, drafts and approvals",
+    );
+    expect(kindGroup("view.layout-changed")).toBe("layout");
+    expect(kindGroup("request.replied")).toBe("requests");
+    expect(kindGroup("role.succession")).toBe("succession");
+    expect(eventKicker("role.succession")).toBe("Succession");
+    expect(eventKicker("pool.hold-taken")).toBe("Hold");
+    expect(eventKindLabel("role.model-changed")).toBe("Role model changed");
+  });
+
+  it("folds an import and a repeated boot line into one line each, under day heads", () => {
+    const master: MissionActor = { _tag: "role", roleId: MASTER as never };
+    const importer: MissionActor = { _tag: "system", component: "missions-import" };
+    let seq = 0;
+    const at = (iso: string, kind: MissionTimelineEvent["kind"], summary: string, extra = {}) =>
+      ({
+        id: `ev-${++seq}` as MissionEventId,
+        missionId: CRPKO,
+        seq,
+        kind,
+        actor: master,
+        provenance: { _tag: "system", component: "missions-policy" },
+        summary,
+        subject: null,
+        causedBy: null,
+        payload: null,
+        at: iso,
+        ...extra,
+      }) as MissionTimelineEvent;
+    const imported = (payload: unknown) =>
+      at("2026-10-18T09:00:00.000Z", "import.applied", "Imported records from coord", {
+        actor: importer,
+        provenance: { _tag: "import", source: "coord.db" },
+        payload,
+      });
+    const oldest = [
+      at("2026-10-16T08:00:00.000Z", "rule.created", "Rule 104 added"),
+      imported({ kind: "role", count: 52, asOf: "x" }),
+      imported({ kind: "lane", count: 88, asOf: "x" }),
+      imported({ kind: "room", rooms: 3, subscriptions: 12, asOf: "x" }),
+      ...Array.from({ length: 52 }, () =>
+        at(
+          "2026-10-19T08:00:00.000Z",
+          "role.model-changed",
+          "1 imported holder(s) keep their model",
+        ),
+      ),
+      at("2026-10-19T09:00:00.000Z", "lane.created", "Lane cell-risk opened", {
+        actor: { _tag: "owner" },
+      }),
+    ];
+    const events = oldest.map((_, index) => oldest[oldest.length - 1 - index]!);
+    const rows = timelineRows(events, events, MASTER);
+    expect(rows.map((row) => [row.kicker, row.summary, row.count, row.by])).toEqual([
+      ["Lane", "Lane cell-risk opened", 1, "owner"],
+      ["Role", "1 imported holder(s) keep their model", 52, "master"],
+      ["Import", "Imported 52 roles, 88 lanes, 3 rooms and 12 subscriptions", 3, null],
+      ["Rule", "Rule 104 added", 1, "master"],
+    ]);
+    const days = timelineDays(rows, Date.parse("2026-10-19T12:00:00.000Z"), "UTC");
+    expect(days.map((day) => [day.heading, day.count, day.rows.length])).toEqual([
+      ["Today", 53, 2],
+      ["Yesterday", 3, 1],
+      ["Fri 16 Oct", 1, 1],
+    ]);
+  });
+
+  it("folds repeated structural changes in the direction check, never calls", () => {
+    const item = (kind: "call" | "role", id: string, summary: string, reason: string) =>
+      ({
+        ref: { kind, id },
+        summary,
+        reason,
+        at: "2026-10-19T08:00:00.000Z",
+      }) as DirectionCheckItem;
+    const rows = directionCheckRows([
+      item("call", "call-1", "Keep Opus on risk", "Call: keep Opus"),
+      item("call", "call-2", "Keep Opus on risk", "Call: keep Opus"),
+      ...Array.from({ length: 20 }, (_, index) =>
+        item(
+          "role",
+          `role-${index}`,
+          "1 imported holder(s) keep their model",
+          "role.model-changed",
+        ),
+      ),
+    ]);
+    expect(rows.map((row) => [row.item.ref.id, row.count, row.reason])).toEqual([
+      ["call-1", 1, "Call: keep Opus"],
+      ["call-2", 1, "Call: keep Opus"],
+      ["role-0", 20, "Role model changed"],
+    ]);
   });
 });
 
@@ -196,5 +309,31 @@ describe("portfolio view model", () => {
       code: "invalid",
     });
     portfolio.close();
+  });
+
+  it("orders live missions by tier then weight when the server has no portfolio", () => {
+    const base = {
+      status: "active",
+      masterRoleId: null,
+      guaranteedShare: 0.4,
+      borrowCeiling: 0.8,
+    } as const;
+    const mission = (id: string, tier: "P0" | "P1" | "P2", weight: number) =>
+      ({ ...base, id, title: id, tier, weight }) as unknown as Mission;
+    const snapshot = portfolioFromMissions([
+      { mission: mission("background", "P2", 9), usageShare: null },
+      { mission: mission("light", "P1", 1), usageShare: 0.5 },
+      { mission: mission("heavy", "P1", 5), usageShare: 1.5 },
+      { mission: mission("top", "P0", 1), usageShare: 0 },
+    ]);
+    expect(snapshot.order).toEqual(["top", "heavy", "light", "background"]);
+    expect(snapshot.orderChange).toBeNull();
+    const rows = portfolioView(snapshot).rows;
+    expect(rows.map((row) => row.usedLine)).toEqual([
+      "Using 0%: borrowing 0%",
+      "Using 60%: borrowing 20%",
+      "Using 20%: borrowing 0%",
+      "Not measured yet",
+    ]);
   });
 });

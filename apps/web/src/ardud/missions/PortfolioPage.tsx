@@ -28,6 +28,8 @@ export function PortfolioPage() {
   const snapshot = usePortfolio();
   // Each mission has its own master, so changes here show the master's role id.
   const view = useMemo(() => (snapshot ? portfolioView(snapshot) : null), [snapshot]);
+  // A portfolio built from the missions can't be reordered until the server serves it.
+  const sample = isSampleFeed("portfolio");
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -57,10 +59,7 @@ export function PortfolioPage() {
                     view.orderLine,
                   ]}
                 />
-                <MissionSection
-                  title="Missions, highest priority first"
-                  sample={isSampleFeed("portfolio")}
-                >
+                <MissionSection title="Missions, highest priority first" sample={sample}>
                   <ol className="flex flex-col divide-y divide-border/60">
                     {view.rows.map((row, index) => {
                       const above = view.rows[index - 1]?.mission.missionId;
@@ -104,7 +103,7 @@ export function PortfolioPage() {
                             <Button
                               size="xs"
                               variant="ghost"
-                              disabled={above === undefined}
+                              disabled={sample || above === undefined}
                               onClick={() => {
                                 if (above)
                                   void movePortfolioMission(
@@ -119,7 +118,7 @@ export function PortfolioPage() {
                             <Button
                               size="xs"
                               variant="ghost"
-                              disabled={below === undefined}
+                              disabled={sample || below === undefined}
                               onClick={() => {
                                 if (below)
                                   void movePortfolioMission(

@@ -30,6 +30,7 @@ import type {
   MissionRecordRef,
   MissionRoutingTable,
   MissionTier,
+  MissionViewsSnapshot,
   PoolHoldId,
   PoolId,
   PoolsSnapshot,
@@ -61,7 +62,7 @@ import type {
   WorkItem,
 } from "@t3tools/contracts";
 
-import type { ChangeSectionInput, MissionLayout } from "./sections.ts";
+import type { ViewSectionRequest } from "./views/layout.ts";
 
 export type Unsubscribe = () => void;
 export type Listener<T> = (value: T) => void;
@@ -407,9 +408,9 @@ export interface AddDraftNoteInput {
 }
 
 // --- Owner requests ---
-// UI-side until the router track publishes `OwnerRequest` (record kind
-// owner-request) and its RPCs. The owner asks or tells the master something;
-// the master answers in the same thread and links what it made from it.
+// The UI shape of a router `OwnerRequest` and its conversation. The owner asks
+// or tells the master something; the master answers in the same thread and
+// links what it made from it. Discuss on a record opens one about that record.
 
 export type OwnerRequestStatus = "waiting" | "answered" | "settled";
 
@@ -418,8 +419,8 @@ export interface OwnerRequestMessage {
   readonly author: "owner" | "master";
   readonly text: string;
   readonly at: string;
-  /** Records the master made or touched for this request: work items, asks, forks, rules. */
-  readonly refs: ReadonlyArray<MissionRecordRef>;
+  /** Links posted with this message (pull requests, runs, files). */
+  readonly refs: ReadonlyArray<MissionLink>;
 }
 
 export interface OwnerRequest {
@@ -427,18 +428,31 @@ export interface OwnerRequest {
   readonly missionId: MissionId;
   readonly title: string;
   readonly status: OwnerRequestStatus;
-  /** Oldest first. */
+  /** Oldest first. A list read carries the newest few; `subscribeRequest` has them all. */
   readonly messages: ReadonlyArray<OwnerRequestMessage>;
+  /** Older messages exist before `messages`. */
+  readonly hasOlder: boolean;
+  /** Records the master made or touched for it: work items, asks, forks, rules. */
+  readonly links: ReadonlyArray<MissionRecordRef>;
+  /** The record a Discuss opened it about. */
+  readonly subject: MissionRecordRef | null;
+  /** The master spoke since the owner last read it. */
+  readonly unread: boolean;
   readonly createdAt: string;
   readonly updatedAt: string;
-  /** When the owner last opened it; an answer after this is unread. */
-  readonly readAt: string | null;
   readonly settledAt: string | null;
 }
 
 export interface OpenRequestInput {
   readonly missionId: MissionId;
   readonly text: string;
+  /** Discuss: the record it is about. The server keeps one open request per subject. */
+  readonly subject?: MissionRecordRef;
+}
+
+export interface RequestThreadInput {
+  readonly missionId: MissionId;
+  readonly requestId: string;
 }
 
 export interface ReplyRequestInput {
@@ -448,6 +462,20 @@ export interface ReplyRequestInput {
 
 export interface RequestIdInput {
   readonly requestId: string;
+}
+
+/** One logged change to a mission's layout or sections, from its `view.*` events. */
+export interface MissionViewChange {
+  readonly id: string;
+  readonly at: string;
+  readonly by: "owner" | "master";
+  readonly summary: string;
+}
+
+export interface MissionViewsState {
+  readonly snapshot: MissionViewsSnapshot;
+  /** Newest first. */
+  readonly changes: ReadonlyArray<MissionViewChange>;
 }
 
 /**
@@ -460,8 +488,6 @@ export const SAMPLED_FEEDS = [
   "portfolio",
   "suggestion-stats",
   "recovery",
-  "requests",
-  "sections",
 ] as const;
 export type SampledFeed = (typeof SAMPLED_FEEDS)[number];
 
@@ -561,7 +587,7 @@ export interface MissionsSource {
   setMissionPaused(input: SetMissionPausedInput): Promise<void>;
   setMissionFocus(input: SetMissionFocusInput): Promise<void>;
   setIntendedEffort(input: SetIntendedEffortInput): Promise<void>;
-  /** "discuss" also opens a Discuss fork on the call. */
+  /** Records the owner's reaction only; Discuss opens an owner request about the call instead. */
   reactToCall(input: ReactToCallInput): Promise<void>;
   /** Moves the "since you last looked" mark to now. */
   markMissionSeen(input: MarkMissionSeenInput): Promise<void>;
@@ -600,17 +626,19 @@ export interface MissionsSource {
   setPoolCapacity(input: SetPoolCapacityInput): Promise<void>;
   setPortfolioOrder(input: SetPortfolioOrderInput): Promise<void>;
 
-  /** The mission overview's section list; sample until the views track lands. */
-  subscribeLayout(missionId: MissionId, listener: Listener<MissionLayout>): Unsubscribe;
-  /** Hide, show, move, remove or restore one section; logged as the owner's change. */
-  changeSection(input: ChangeSectionInput): Promise<void>;
+  /** The mission's views record (layout, sections, pins) and its change log; null when gone. */
+  subscribeViews(missionId: MissionId, listener: Listener<MissionViewsState | null>): Unsubscribe;
+  /** Runs one layout change built by `viewSectionRequest`. */
+  changeView(request: ViewSectionRequest): Promise<void>;
 
-  /** The owner's requests to the master, newest activity first. Sample until the router track lands. */
+  /** The owner's requests to the master, newest activity first. */
   subscribeRequests(
     missionId: MissionId,
     listener: Listener<ReadonlyArray<OwnerRequest>>,
   ): Unsubscribe;
-  /** Starts a request from the composer. */
+  /** One request with its whole conversation and full message bodies; null when unknown. */
+  subscribeRequest(input: RequestThreadInput, listener: Listener<OwnerRequest | null>): Unsubscribe;
+  /** Starts a request from the composer, or from Discuss with a subject. */
   openRequest(input: OpenRequestInput): Promise<OwnerRequest>;
   replyRequest(input: ReplyRequestInput): Promise<void>;
   settleRequest(input: RequestIdInput): Promise<void>;

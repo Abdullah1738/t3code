@@ -1,7 +1,11 @@
 import {
   MISSIONS_ASKS_WS_METHODS as ASKS,
   MISSIONS_POLICY_WS_METHODS as POLICY,
+  MISSIONS_VIEWS_WS_METHODS as VIEWS,
+  DEFAULT_STARTER_LAYOUT,
   MissionError,
+  VIEW_CATALOG_VERSION,
+  viewPinnedStrip,
   WS_METHODS,
   type ApprovalId,
   type DraftId,
@@ -15,6 +19,11 @@ import {
   type MissionOverview,
   type MissionRecord,
   type MissionRecordKind,
+  type MissionRecordRef,
+  type MissionViewsSnapshot,
+  type OwnerRequest as OwnerRequestRecord,
+  type OwnerRequestId,
+  type OwnerRequestView,
   type PoolView,
   type PoolsSnapshot,
   type Room,
@@ -30,6 +39,8 @@ import type * as Stream from "effect/Stream";
 import type { EnvironmentRpcSuccess, EnvironmentUnaryRpcTag } from "../../rpc/client.ts";
 import type { WsRpcProtocolClient } from "../../rpc/protocol.ts";
 import { latestFieldChanges } from "./changeLog.ts";
+import { portfolioFromMissions } from "./portfolioViewModel.ts";
+import { listedRoomUnread, pageUnread } from "./roomsViewModel.ts";
 import type {
   FieldChange,
   Listener,
@@ -37,7 +48,11 @@ import type {
   MissionInboxSnapshot,
   MissionPoolUsage,
   MissionRoomEntry,
+  MissionViewChange,
+  MissionViewsState,
   MissionsSource,
+  OwnerRequest,
+  OwnerRequestStatus,
   SampledFeed,
   Unsubscribe,
 } from "./source.ts";
@@ -58,7 +73,8 @@ export type MissionsStreamTag =
   | typeof ASKS.subscribeRules
   | typeof ASKS.subscribeForks
   | typeof ASKS.subscribeDraftNotes
-  | typeof ASKS.subscribeRouting;
+  | typeof ASKS.subscribeRouting
+  | typeof VIEWS.subscribe;
 
 export type MissionsRequestTag = Exclude<EnvironmentUnaryRpcTag, MissionsStreamTag>;
 
@@ -104,8 +120,6 @@ export const RPC_SAMPLED_FEEDS: ReadonlySet<SampledFeed> = new Set<SampledFeed>(
   "portfolio",
   "suggestion-stats",
   "recovery",
-  "requests",
-  "sections",
 ]);
 
 /** Newest events kept per mission feed, for change attribution and refresh triggers. */
@@ -278,6 +292,42 @@ function holderName(actor: MissionActor): string {
   }
 }
 
+const REQUEST_STATUS: Record<OwnerRequestRecord["status"], OwnerRequestStatus> = {
+  "waiting-on-master": "waiting",
+  answered: "answered",
+  settled: "settled",
+};
+
+/**
+ * A router owner request as Your requests reads it. A list read carries the
+ * newest few messages as summaries; a single-request read carries bodies.
+ */
+export function ownerRequestOf(
+  request: OwnerRequestRecord,
+  view?: Pick<OwnerRequestView, "messages" | "hasOlder" | "unreadForOwner">,
+): OwnerRequest {
+  return {
+    id: request.id,
+    missionId: request.missionId,
+    title: request.title,
+    status: REQUEST_STATUS[request.status],
+    messages: (view?.messages ?? []).map(({ message, body }) => ({
+      id: message.id,
+      author: message.author._tag === "owner" ? "owner" : "master",
+      text: body ?? message.summary,
+      at: message.createdAt,
+      refs: message.links,
+    })),
+    hasOlder: view?.hasOlder ?? false,
+    links: request.links,
+    subject: request.subject ?? null,
+    unread: view?.unreadForOwner ?? request.unreadForOwner,
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt,
+    settledAt: request.settledAt,
+  };
+}
+
 /** A policy pool as the header usage line reads it. */
 export function poolUsageOf(view: PoolView): MissionPoolUsage {
   const { pool } = view;
@@ -349,6 +399,47 @@ interface MissionFeedState {
 interface RuleRecords {
   readonly rules: ReadonlyArray<Rule>;
   readonly changeRequests: ReadonlyArray<RuleChangeRequest>;
+}
+
+/** The views record a server without the views track would hold: the starter layout. */
+function starterViews(missionId: MissionId): MissionViewsSnapshot {
+  const waiting = { ownerWaiting: 0, requestsUnread: 0 };
+  const pinned = viewPinnedStrip(DEFAULT_STARTER_LAYOUT.layout, waiting);
+  return {
+    missionId,
+    catalogVersion: VIEW_CATALOG_VERSION,
+    revision: 0,
+    templates: [],
+    sections: [],
+    layout: {
+      missionId,
+      layout: DEFAULT_STARTER_LAYOUT.layout,
+      version: DEFAULT_STARTER_LAYOUT.version,
+      changedBy: DEFAULT_STARTER_LAYOUT.changedBy,
+      by: DEFAULT_STARTER_LAYOUT.by,
+      changedAt: DEFAULT_STARTER_LAYOUT.changedAt,
+      changeNote: null,
+      seededFrom: DEFAULT_STARTER_LAYOUT.version,
+    },
+    starter: DEFAULT_STARTER_LAYOUT,
+    ...waiting,
+    pinnedStrip: pinned.needsYou || pinned.requests,
+    pinned,
+    changesToday: 0,
+  };
+}
+
+/** The layout change log from the mission's `view.*` events, newest first. */
+export function viewChangesOf(events: ReadonlyArray<MissionEvent>): MissionViewChange[] {
+  const changes = events
+    .filter((event) => event.kind.startsWith("view."))
+    .map((event) => ({
+      id: event.id,
+      at: event.at,
+      by: event.actor._tag === "owner" ? ("owner" as const) : ("master" as const),
+      summary: event.summary,
+    }));
+  return [...changes].reverse();
 }
 
 export function createRpcMissionsSource(options: RpcMissionsSourceOptions): MissionsSource {
@@ -495,11 +586,15 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   );
 
   const roomsFeed = sharedFeeds<MissionId, ReadonlyArray<MissionRoomEntry>>((missionId, emit) => {
-    // Unread counts come from each room's newest page; a room is only read
-    // again when it has a newer message or the owner read or posted in it.
+    // Unread counts come from the room list once the router sends them (r5);
+    // until then from each room's newest page plus the gap back to the read
+    // mark. A room is only read again when it has a newer message or the
+    // owner read or posted in it.
     const counted = new Map<RoomId, { readonly lastSeq: number; readonly unread: number }>();
     const stale = new Set<RoomId>();
     const unreadOf = async (room: Room): Promise<number> => {
+      const listed = listedRoomUnread(room);
+      if (listed !== null) return room.archived ? 0 : listed;
       const known = counted.get(room.id);
       if (known !== undefined && known.lastSeq === room.lastSeq && !stale.has(room.id))
         return known.unread;
@@ -512,9 +607,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         roomId: room.id,
         limit: ROOM_PAGE_SIZE,
       });
-      const unread = page.messages.filter(
-        (message) => message.seq > page.ownerReadSeq && message.author._tag !== "owner",
-      ).length;
+      const unread = pageUnread(page);
       counted.set(room.id, { lastSeq: room.lastSeq, unread });
       return unread;
     };
@@ -568,6 +661,60 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       stopTouched();
       stopEvents?.();
     };
+  });
+
+  // Owner requests: the list and each open conversation refetch on request
+  // events. The newest message seq per request is kept for marking it read.
+  const requestReads = new Map<string, { readonly roomId: RoomId; readonly seq: number }>();
+  const readView = (view: OwnerRequestView): OwnerRequest => {
+    const last = view.messages.at(-1);
+    if (last !== undefined) {
+      requestReads.set(view.request.id, { roomId: view.request.roomId, seq: last.message.seq });
+    }
+    return ownerRequestOf(view.request, view);
+  };
+  const requestTouched = (event: MissionEvent, requestId: string) =>
+    event.kind.startsWith("request.") &&
+    event.subject?.kind === "owner-request" &&
+    event.subject.id === requestId;
+  const touchRequest = (request: OwnerRequestRecord) => {
+    bus.emit(`requests:${request.missionId}`);
+    bus.emit(`request:${request.id}`);
+  };
+
+  const requestsFeed = sharedFeeds<MissionId, ReadonlyArray<OwnerRequest>>(
+    (missionId, emit) =>
+      requestFeed({
+        missionId,
+        load: async () =>
+          (await transport.request(WS_METHODS.missionsOwnerRequests, { missionId })).requests.map(
+            readView,
+          ),
+        refreshOn: kindStarts("request."),
+        topics: [`requests:${missionId}`],
+        emit,
+      }).stop,
+  );
+
+  const requestThreadFeed = sharedFeeds<string, OwnerRequest | null>((key, emit) => {
+    const [missionId, requestId] = key.split("\n") as [MissionId, OwnerRequestId];
+    return requestFeed({
+      missionId,
+      load: async () => {
+        const read = await transport.request(WS_METHODS.missionsOwnerRequests, {
+          missionId,
+          requestId,
+        });
+        const view = read.requests.find((each) => each.request.id === requestId);
+        return view === undefined ? null : readView(view);
+      },
+      refreshOn: (event) => requestTouched(event, requestId),
+      topics: [`request:${requestId}`],
+      emit,
+      onError: (error) => {
+        if (isNotFound(error)) emit(null);
+      },
+    }).stop;
   });
 
   const touchRoom = (roomId: RoomId) => {
@@ -813,7 +960,60 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       fallback.subscribeRecovery(sampleId(missionId), listener),
     subscribeTimeline: (missionId, listener) =>
       fallback.subscribeTimeline(sampleId(missionId), listener),
-    subscribePortfolio: (listener) => fallback.subscribePortfolio(listener),
+    // Until core r6 serves the portfolio read, build it from the live missions:
+    // the list names them and each overview carries shares and usage. Order,
+    // pool draws and reorders need the read, so the feed stays marked sample.
+    subscribePortfolio(listener) {
+      const feeds = new Map<
+        MissionId,
+        { state: MissionFeedState | undefined; readonly close: Unsubscribe }
+      >();
+      const send = () => {
+        const states = [...feeds.values()].map((feed) => feed.state);
+        if (states.some((state) => state === undefined || state.overview === undefined)) return;
+        const missions = states.flatMap((state) =>
+          state?.overview
+            ? [{ mission: state.overview.mission, usageShare: state.overview.usageShare }]
+            : [],
+        );
+        const changes = changesFor(
+          states.flatMap((state) => state?.events ?? []),
+          ["mission"],
+        );
+        listener(portfolioFromMissions(missions, changes));
+      };
+      const stopList = transport.stream(WS_METHODS.missionsSubscribeList, {}, (item) => {
+        if (item._tag !== "list") return;
+        const ids = new Set(
+          item.snapshot.missions
+            .filter((mission) => mission.status !== "archived")
+            .map((mission) => mission.id),
+        );
+        for (const [id, feed] of feeds) {
+          if (ids.has(id)) continue;
+          feed.close();
+          feeds.delete(id);
+        }
+        for (const id of ids) {
+          if (feeds.has(id)) continue;
+          const feed: { state: MissionFeedState | undefined; close: Unsubscribe } = {
+            state: undefined,
+            close: () => {},
+          };
+          feeds.set(id, feed);
+          feed.close = missionFeed(id, (state) => {
+            feed.state = state;
+            send();
+          });
+        }
+        send();
+      });
+      return () => {
+        stopList();
+        for (const feed of feeds.values()) feed.close();
+        feeds.clear();
+      };
+    },
     subscribeSuggestionStats: (listener) => fallback.subscribeSuggestionStats(listener),
 
     subscribeInboxHistory(missionId, listener) {
@@ -907,14 +1107,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       });
     },
     reactToCall: async (input) => {
-      const call = await transport.request(WS_METHODS.missionsReactToCall, input);
-      // The server records the reaction; the Discuss fork is a second call.
-      if (input.reaction !== "discuss") return;
-      await transport.request(WS_METHODS.missionsStartFork, {
-        missionId: call.missionId,
-        kind: "discuss",
-        origin: { kind: "call", id: call.id },
-      });
+      await transport.request(WS_METHODS.missionsReactToCall, input);
     },
     markMissionSeen: async (input) => {
       await transport.request(WS_METHODS.missionsMarkSeen, input);
@@ -1034,20 +1227,114 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       await transport.request(POLICY.setPoolCapacity, { poolId, capacity });
       bus.emit("pools");
     },
-    setPortfolioOrder: (input) => fallback.setPortfolioOrder(input),
+    // core r6 adds the owner's setPortfolioOrder; the live missions can't be reordered before it.
+    setPortfolioOrder: () => notOnServer("Reordering missions"),
 
-    // Section lists keep the live mission id: they hold no mission data.
-    subscribeLayout: (missionId, listener) => fallback.subscribeLayout(missionId, listener),
-    changeSection: (input) => fallback.changeSection(input),
-    // Requests are sample threads, so they live under the sample mission.
-    subscribeRequests: (missionId, listener) =>
-      fallback.subscribeRequests(sampleId(missionId), listener),
-    openRequest: (input) =>
-      fallback.openRequest({ ...input, missionId: sampleId(input.missionId) }),
-    replyRequest: (input) => fallback.replyRequest(input),
-    settleRequest: (input) => fallback.settleRequest(input),
-    reopenRequest: (input) => fallback.reopenRequest(input),
-    markRequestRead: (input) => fallback.markRequestRead(input),
+    subscribeViews(missionId, listener) {
+      let snapshot: MissionViewsSnapshot | null | undefined;
+      let events: ReadonlyArray<MissionEvent> = [];
+      const state = memoLast(
+        (current: MissionViewsSnapshot, log: ReadonlyArray<MissionEvent>): MissionViewsState => ({
+          snapshot: current,
+          changes: viewChangesOf(log),
+        }),
+      );
+      const push = () => {
+        if (snapshot === undefined) return;
+        listener(snapshot === null ? null : state(snapshot, events));
+      };
+      const stopViews = transport.stream(
+        VIEWS.subscribe,
+        { missionId },
+        (item) => {
+          if (item._tag === "snapshot") {
+            snapshot = item.snapshot;
+          } else if (snapshot) {
+            snapshot = {
+              ...snapshot,
+              ownerWaiting: item.ownerWaiting,
+              requestsUnread: item.requestsUnread,
+              pinnedStrip: item.pinnedStrip,
+              pinned: item.pinned,
+            };
+          }
+          push();
+        },
+        (error) => {
+          if (snapshot !== undefined) return;
+          // A server without the views track still shows the starter layout.
+          snapshot = isNotFound(error) ? null : starterViews(missionId);
+          push();
+        },
+      );
+      const stopFeed = missionFeed(missionId, (feed) => {
+        events = feed.events;
+        push();
+      });
+      return () => {
+        stopViews();
+        stopFeed();
+      };
+    },
+    changeView: async (request) => {
+      switch (request.method) {
+        case "editLayout":
+          await transport.request(VIEWS.editLayout, request.input);
+          return;
+        case "remove":
+          await transport.request(VIEWS.remove, request.input);
+          return;
+        case "restore":
+          await transport.request(VIEWS.restore, request.input);
+          return;
+      }
+    },
+
+    // --- Owner requests ---
+
+    subscribeRequests: (missionId, listener) => requestsFeed(missionId, listener),
+    subscribeRequest: ({ missionId, requestId }, listener) =>
+      requestThreadFeed(`${missionId}\n${requestId}`, listener),
+    openRequest: async ({ missionId, text, subject }) => {
+      // Router r5 adds `subject` (one open request per record); until then the
+      // server drops it and Discuss opens a plain request.
+      const input: { missionId: MissionId; text: string; subject?: MissionRecordRef } = {
+        missionId,
+        text: text.trim(),
+        ...(subject === undefined ? {} : { subject }),
+      };
+      const request = await transport.request(WS_METHODS.missionsOpenOwnerRequest, input);
+      touchRequest(request);
+      return ownerRequestOf(request);
+    },
+    replyRequest: async ({ requestId, text }) => {
+      touchRequest(
+        await transport.request(WS_METHODS.missionsReplyOwnerRequest, {
+          requestId: requestId as OwnerRequestId,
+          text: text.trim(),
+        }),
+      );
+    },
+    settleRequest: async ({ requestId }) => {
+      touchRequest(
+        await transport.request(WS_METHODS.missionsSettleOwnerRequest, {
+          requestId: requestId as OwnerRequestId,
+        }),
+      );
+    },
+    reopenRequest: async ({ requestId }) => {
+      touchRequest(
+        await transport.request(WS_METHODS.missionsReopenOwnerRequest, {
+          requestId: requestId as OwnerRequestId,
+        }),
+      );
+    },
+    markRequestRead: async ({ requestId }) => {
+      // Reading up to the newest message clears the request's unread mark.
+      const read = requestReads.get(requestId);
+      if (read === undefined) return;
+      await transport.request(WS_METHODS.missionsMarkRead, read);
+    },
   };
 }
 

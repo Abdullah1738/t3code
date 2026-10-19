@@ -14,14 +14,12 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   addDraftNoteInput,
   answerAskInput,
-  askTheMissionInput,
   askView,
   blocksLine,
   decideDraftInput,
   decideKnockInput,
   decideSuggestionInput,
   defaultInboxTab,
-  discussAskInput,
   draftNotesFor,
   draftOwnerEdit,
   fyiView,
@@ -33,12 +31,11 @@ import {
   inboxUiReducer,
   keepSelection,
   moveSelection,
-  openForkFor,
   recommendationLine,
   suggestionTrackRecord,
   waitingLabel,
 } from "./inboxViewModel.ts";
-import type { MissionForkEntry, MissionInboxSnapshot } from "./source.ts";
+import type { MissionInboxSnapshot } from "./source.ts";
 
 const T0 = "2026-10-17T08:00:00.000Z";
 const NOW = Date.parse("2026-10-17T08:33:00.000Z");
@@ -179,11 +176,11 @@ const emptyInbox = (
 };
 
 describe("Decide", () => {
-  it("shows the recommendation as advice and never preselects it", () => {
-    const view = askView(ask(), NOW, MASTER);
-    expect(view.askedBy).toBe("master");
+  it("shows the recommendation as advice, never says who asked and never preselects it", () => {
+    const view = askView(ask(), NOW);
     expect(view.waiting).toBe("waiting 38h");
-    expect(view.recommendation).toBe("Master recommends “Hold” because not needed for Monday.");
+    expect(view.recommendation).toBe("“Hold” is recommended because not needed for Monday.");
+    expect(Object.keys(view)).not.toContain("askedBy");
     expect(view.options.map((option) => [option.shortcut, option.recommended])).toEqual([
       [1, false],
       [2, true],
@@ -198,7 +195,7 @@ describe("Decide", () => {
       "Blocks CRP-13215 only. Everything else keeps running.",
     );
     expect(blocksLine([])).toBe("Blocks nothing. The mission keeps running.");
-    expect(recommendationLine(ask({ recommendation: null }), MASTER)).toBeNull();
+    expect(recommendationLine(ask({ recommendation: null }))).toBeNull();
   });
 
   it("needs an option or text to answer", () => {
@@ -425,44 +422,7 @@ describe("knocks and suggestions", () => {
   });
 });
 
-describe("forks and FYI", () => {
-  it("finds the open fork about a record", () => {
-    const fork = (id: string, status: string, origin: unknown): MissionForkEntry =>
-      ({ fork: { id, status, kind: "discuss", origin }, question: null }) as never;
-    const forks = [
-      fork("closed", "archived", { kind: "call", id: "call-1" }),
-      fork("open", "open", { kind: "call", id: "call-1" }),
-      fork("link", "open", { kind: "url", label: "x", url: null, ref: null }),
-    ];
-    expect(openForkFor(forks, { kind: "call", id: "call-1" })?.fork.id).toBe("open");
-    expect(openForkFor(forks, { kind: "call", id: "call-2" })).toBeNull();
-  });
-
-  it("opens a Discuss fork on an ask without answering it", () => {
-    expect(discussAskInput(ask(), "  ")).toEqual({
-      missionId: "m",
-      kind: "discuss",
-      origin: { kind: "ask", id: "ask-1", label: "Stamp r004 now?" },
-    });
-    expect(discussAskInput(ask(), " why not both? ").question).toBe("why not both?");
-  });
-
-  it("needs a question before asking the mission", () => {
-    expect(askTheMissionInput("m" as never, " ")).toEqual({
-      ok: false,
-      error: "Write the question first.",
-    });
-    expect(askTheMissionInput("m" as never, " Is risk#68 on time? ")).toEqual({
-      ok: true,
-      value: {
-        missionId: "m",
-        kind: "owner-question",
-        origin: null,
-        question: "Is risk#68 on time?",
-      },
-    });
-  });
-
+describe("FYI", () => {
   it("separates observed from claimed and shows the evidence state", () => {
     const note = decodeFyi({
       id: "n",

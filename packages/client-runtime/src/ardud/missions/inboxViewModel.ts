@@ -31,14 +31,9 @@ import type {
 } from "@t3tools/contracts";
 
 import { routedTo, suggestionsFor, type InboxRouteFilter } from "./routingViewModel.ts";
-import type {
-  AddDraftNoteInput,
-  MissionForkEntry,
-  MissionInboxSnapshot,
-  OpenForkInput,
-} from "./source.ts";
+import type { AddDraftNoteInput, MissionInboxSnapshot } from "./source.ts";
 import { diffStats, diffWords, type DiffSegment, type DiffStats } from "./textDiff.ts";
-import { actorLabel, refLabel } from "./viewModel.ts";
+import { refLabel } from "./viewModel.ts";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -211,10 +206,6 @@ export function blocksLine(blocks: ReadonlyArray<MissionRecordRef>): string {
   return `Blocks ${blocks.map(refLabel).join(", ")} only. Everything else keeps running.`;
 }
 
-function capitalize(text: string): string {
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
-
 /** Lowercases a leading word ("Not needed" -> "not needed") but leaves "CRP-1" or "Kafka" alone when unclear. */
 function continueSentence(text: string): string {
   const trimmed = text.trim();
@@ -225,19 +216,19 @@ function continueSentence(text: string): string {
 }
 
 /**
- * The recommendation as advice: "Master recommends “Hold” because …".
- * `null` when the asker gave none. It is never applied without an answer.
+ * The recommendation as advice: "“Hold” is recommended because …". Who asked
+ * is left out on purpose (owner, 19 Oct): the question carries the context.
+ * `null` when there is none. It is never applied without an answer.
  */
-export function recommendationLine(ask: Ask, masterRoleId: string | null): string | null {
+export function recommendationLine(ask: Ask): string | null {
   const recommendation = ask.recommendation;
   if (recommendation === null) return null;
-  const who = capitalize(actorLabel(ask.askedBy, masterRoleId));
   const option = ask.options.find((candidate) => candidate.id === recommendation.optionId);
   const reason = recommendation.reason.trim();
-  if (!option) return reason === "" ? null : `${who} suggests: ${continueSentence(reason)}`;
+  if (!option) return reason === "" ? null : `Suggested: ${continueSentence(reason)}`;
   return reason === ""
-    ? `${who} recommends “${option.label}”.`
-    : `${who} recommends “${option.label}” because ${continueSentence(reason)}`;
+    ? `“${option.label}” is recommended.`
+    : `“${option.label}” is recommended because ${continueSentence(reason)}`;
 }
 
 export interface AskOptionView {
@@ -251,7 +242,6 @@ export interface AskOptionView {
 }
 
 export interface AskView {
-  readonly askedBy: string;
   readonly waiting: string;
   readonly blocks: string;
   readonly recommendation: string | null;
@@ -259,12 +249,11 @@ export interface AskView {
   readonly urgent: boolean;
 }
 
-export function askView(ask: Ask, nowMs: number, masterRoleId: string | null): AskView {
+export function askView(ask: Ask, nowMs: number): AskView {
   return {
-    askedBy: actorLabel(ask.askedBy, masterRoleId),
     waiting: waitingLabel(ask.createdAt, nowMs),
     blocks: blocksLine(ask.blocks),
-    recommendation: recommendationLine(ask, masterRoleId),
+    recommendation: recommendationLine(ask),
     options: ask.options.map((option, index) => ({
       id: option.id,
       label: option.label,
@@ -287,73 +276,6 @@ export function answerAskInput(
   }
   if (answer.optionId === null && text === "") return err("Pick an option or write an answer.");
   return ok({ askId: ask.id, optionId: answer.optionId, text } as AnswerAskInput);
-}
-
-// ---------------------------------------------------------------------------
-// Forks (Discuss first, Ask the mission)
-
-export const FORK_KIND_LABEL: Record<MissionForkEntry["fork"]["kind"], string> = {
-  discuss: "Discuss",
-  "dev-question": "Dev question",
-  "owner-question": "Your question",
-};
-
-/** The open fork about one record (a call, an ask), if the owner already started one. */
-export function openForkFor(
-  forks: ReadonlyArray<MissionForkEntry>,
-  ref: Pick<MissionRecordRef, "kind" | "id">,
-): MissionForkEntry | null {
-  return (
-    forks.find(
-      (entry) =>
-        entry.fork.status === "open" &&
-        entry.fork.origin !== null &&
-        "id" in entry.fork.origin &&
-        entry.fork.origin.kind === ref.kind &&
-        entry.fork.origin.id === ref.id,
-    ) ?? null
-  );
-}
-
-/**
- * "Discuss first" on an ask: a fork of the master about that ask instead of
- * an answer. The ask stays open; whatever the owner types opens the fork.
- */
-export function discussAskInput(
-  ask: Pick<Ask, "id" | "missionId" | "question">,
-  note: string,
-): OpenForkInput {
-  const question = note.trim();
-  return {
-    missionId: ask.missionId,
-    kind: "discuss",
-    origin: { kind: "ask", id: ask.id, label: ask.question },
-    ...(question === "" ? {} : { question }),
-  };
-}
-
-/** "Ask the mission": an owner side question answered by a fork of the master. */
-export function askTheMissionInput(missionId: MissionId, question: string): Result<OpenForkInput> {
-  const trimmed = question.trim();
-  if (trimmed === "") return err("Write the question first.");
-  return ok({ missionId, kind: "owner-question", origin: null, question: trimmed });
-}
-
-export function forkTitle(entry: MissionForkEntry): string {
-  if (entry.question) return entry.question;
-  const origin = entry.fork.origin;
-  if (origin === null) return "Side question";
-  return "id" in origin ? refLabel(origin) : origin.label;
-}
-
-export function splitForks(forks: ReadonlyArray<MissionForkEntry>): {
-  readonly open: ReadonlyArray<MissionForkEntry>;
-  readonly closed: ReadonlyArray<MissionForkEntry>;
-} {
-  return {
-    open: forks.filter((entry) => entry.fork.status === "open"),
-    closed: forks.filter((entry) => entry.fork.status !== "open"),
-  };
 }
 
 // ---------------------------------------------------------------------------

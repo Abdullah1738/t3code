@@ -3,17 +3,39 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import {
+  discussRequestInput,
   groupRequests,
+  isDiscussion,
   isRequestUnread,
   openRequestInput,
+  ownerConditionOf,
+  requestAbout,
   requestPreview,
   requestTitle,
   unreadRequestCount,
+  yourRequests,
 } from "./requestsViewModel.ts";
 import type { MissionsSource, OwnerRequest } from "./source.ts";
 
 const CRPKO = "crpko-engineering" as MissionId;
 const now = () => Date.parse(FIXTURE_NOW) + 60_000;
+
+function request(overrides: Partial<OwnerRequest> & Pick<OwnerRequest, "id">): OwnerRequest {
+  return {
+    missionId: CRPKO,
+    title: overrides.id,
+    status: "answered",
+    messages: [],
+    hasOlder: false,
+    links: [],
+    subject: null,
+    unread: false,
+    createdAt: FIXTURE_NOW,
+    updatedAt: FIXTURE_NOW,
+    settledAt: null,
+    ...overrides,
+  };
+}
 
 function latest(source: MissionsSource) {
   let value: ReadonlyArray<OwnerRequest> = [];
@@ -73,16 +95,55 @@ describe("owner requests", () => {
     expect(isRequestUnread(reopened)).toBe(false);
   });
 
-  it("logs section changes in the fixture layout", async () => {
+  it("keeps one open request per discussed record", async () => {
     const source = createFixtureMissionsSource({ now });
-    const seen: string[][] = [];
-    source.subscribeLayout(CRPKO, (layout) => {
-      seen.push(layout.changes.map((c) => c.summary));
+    const read = latest(source);
+    const subject = { kind: "ask" as const, id: "ask-kafka-capacity-r004", label: "Kafka" };
+    const first = await source.openRequest({ missionId: CRPKO, text: "Why 3 brokers?", subject });
+    const again = await source.openRequest({ missionId: CRPKO, text: "And the cost?", subject });
+    expect(again.id).toBe(first.id);
+    expect(
+      read()
+        .find((r) => r.id === first.id)
+        ?.messages.map((m) => m.text),
+    ).toEqual(["Why 3 brokers?", "And the cost?"]);
+    await source.settleRequest({ requestId: first.id });
+    const fresh = await source.openRequest({ missionId: CRPKO, text: "Back again", subject });
+    expect(fresh.id).not.toBe(first.id);
+  });
+
+  it("keeps discussions out of Your requests and its unread count", () => {
+    const own = request({ id: "own", subject: null, unread: true });
+    const talk = request({
+      id: "talk",
+      subject: { kind: "draft", id: "draft-1", label: "Release note" },
+      unread: true,
     });
-    await source.changeSection({ missionId: CRPKO, key: "needs-you", change: { type: "hide" } });
-    await expect(
-      source.changeSection({ missionId: CRPKO, key: "needs-you", change: { type: "remove" } }),
-    ).rejects.toMatchObject({ code: "invalid" });
-    expect(seen.at(-1)?.[0]).toMatch(/^Hid Needs you; \d+ waiting items? pinned under the head$/);
+    expect(isDiscussion(talk)).toBe(true);
+    expect(yourRequests([own, talk]).map((r) => r.id)).toEqual(["own"]);
+    expect(unreadRequestCount(yourRequests([own, talk]))).toBe(1);
+  });
+
+  it("finds the open request about a record and reads a decision made on a condition", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const read = latest(source);
+    const subject = { kind: "draft" as const, id: "draft-1", label: "Reply to Dylan" };
+    expect(discussRequestInput(CRPKO, subject, "  ").ok).toBe(false);
+    const built = discussRequestInput(CRPKO, subject, " Softer opening? ");
+    expect(built).toEqual({
+      ok: true,
+      value: { missionId: CRPKO, text: "Softer opening?", subject },
+    });
+    expect(requestAbout(read(), subject)).toBeNull();
+    const opened = await source.openRequest(built.ok ? built.value : (null as never));
+    expect(requestAbout(read(), { kind: "draft", id: "draft-1" })?.id).toBe(opened.id);
+    expect(requestAbout(read(), { kind: "ask", id: "draft-1" })).toBeNull();
+    await source.settleRequest({ requestId: opened.id });
+    expect(requestAbout(read(), subject)).toBeNull();
+
+    const condition = { requestId: opened.id as never, quote: "fine if it ships after 18:00" };
+    expect(ownerConditionOf({ onOwnerCondition: condition })).toBe(condition);
+    expect(ownerConditionOf({})).toBeNull();
+    expect(ownerConditionOf({ onOwnerCondition: null })).toBeNull();
   });
 });

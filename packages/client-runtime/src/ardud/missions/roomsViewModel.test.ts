@@ -5,11 +5,13 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   composerState,
   groupRooms,
+  listedRoomUnread,
   mergeMessages,
   messageAddressLine,
   nextReadSeq,
   noiseView,
   olderPageRequest,
+  pageUnread,
   pendingRuleOffer,
   postMessageInput,
   receiptView,
@@ -80,6 +82,30 @@ describe("room list", () => {
     ]);
     expect(groups[0]?.rooms.map((e) => e.room.id)).toEqual(["delivery", "old"]);
     expect(groups[2]?.rooms.map((e) => e.room.id)).toEqual(["control", "arch"]);
+  });
+
+  it("counts unread past the newest page and prefers the list's own count", () => {
+    const owner = { author: { _tag: "owner" } };
+    // A 50-message page of a 400-message room read up to seq 100: the 250
+    // messages between the mark and the page count too, not just the page.
+    const busy = {
+      messages: Array.from({ length: 50 }, (_, index) => message(351 + index, "status")),
+      ownerReadSeq: 100,
+      hasOlder: true,
+    };
+    expect(pageUnread(busy)).toBe(300);
+    expect(
+      pageUnread({
+        messages: [message(4, "status"), message(5, "status", owner), message(6, "status")],
+        ownerReadSeq: 4,
+        hasOlder: true,
+      }),
+    ).toBe(1);
+    expect(pageUnread({ messages: [], ownerReadSeq: 0, hasOlder: false })).toBe(0);
+    expect(listedRoomUnread(room("delivery", "sub-mission"))).toBeNull();
+    expect(
+      listedRoomUnread({ ...room("delivery", "sub-mission"), unreadForOwner: 7 } as Room),
+    ).toBe(7);
   });
 
   it("reads the noise meter", () => {

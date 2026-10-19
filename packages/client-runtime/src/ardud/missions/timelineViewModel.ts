@@ -1,10 +1,12 @@
-import type { MissionActor } from "@t3tools/contracts";
+import type { DirectionCheckItem, MissionActor } from "@t3tools/contracts";
+import { DateTime } from "effect";
 
 import type { MissionTimelineEvent } from "./source.ts";
-import { actorKey, actorLabel } from "./viewModel.ts";
+import { actorKey, actorLabel, formatDayLabel } from "./viewModel.ts";
 
-// Timeline tab: the mission's event log, newest first, filtered by kind and
-// actor, with each event's cause chain and the lane successions pulled out.
+// Timeline tab: the mission's event log, newest first, under day heads,
+// filtered by kind and actor, with each event's cause chain. Repeated lines
+// fold into one. The direction check on the board folds the same way.
 
 /** Kind families for the filter: the part before the dot. */
 export type TimelineKindGroup =
@@ -17,7 +19,12 @@ export type TimelineKindGroup =
   | "pool"
   | "routing"
   | "inbox"
+  | "requests"
+  | "rooms"
+  | "work"
+  | "layout"
   | "recovery"
+  | "succession"
   | "other";
 
 export const TIMELINE_KIND_GROUP_LABEL: Record<TimelineKindGroup, string> = {
@@ -30,36 +37,81 @@ export const TIMELINE_KIND_GROUP_LABEL: Record<TimelineKindGroup, string> = {
   pool: "Pools",
   routing: "Routing",
   inbox: "Asks, drafts and approvals",
+  requests: "Your requests",
+  rooms: "Rooms",
+  work: "Work",
+  layout: "Layout",
   recovery: "Recovery",
+  succession: "Successions",
   other: "Other",
 };
 
-const PREFIX_GROUP: Record<string, TimelineKindGroup> = {
-  mission: "mission",
-  portfolio: "mission",
-  "sub-mission": "sub-mission",
-  milestone: "sub-mission",
-  lane: "lane",
-  role: "role",
-  rule: "rule",
-  "review-policy": "review",
-  criticality: "review",
-  review: "review",
-  pool: "pool",
-  routing: "routing",
-  record: "routing",
-  ask: "inbox",
-  call: "inbox",
-  draft: "inbox",
-  approval: "inbox",
-  suggestion: "inbox",
-  knock: "inbox",
-  fork: "inbox",
-  recovery: "recovery",
+/** Event kind prefix: its filter group and the kicker a row shows instead of the raw kind. */
+const PREFIXES: Record<string, { readonly group: TimelineKindGroup; readonly kicker: string }> = {
+  mission: { group: "mission", kicker: "Mission" },
+  portfolio: { group: "mission", kicker: "Portfolio" },
+  editor: { group: "mission", kicker: "Bottom line" },
+  field: { group: "mission", kicker: "Field" },
+  governor: { group: "mission", kicker: "Governor" },
+  import: { group: "mission", kicker: "Import" },
+  "sub-mission": { group: "sub-mission", kicker: "Sub-mission" },
+  milestone: { group: "sub-mission", kicker: "Milestone" },
+  lane: { group: "lane", kicker: "Lane" },
+  role: { group: "role", kicker: "Role" },
+  rule: { group: "rule", kicker: "Rule" },
+  "review-policy": { group: "review", kicker: "Review policy" },
+  criticality: { group: "review", kicker: "Criticality" },
+  review: { group: "review", kicker: "Review" },
+  pool: { group: "pool", kicker: "Pool" },
+  routing: { group: "routing", kicker: "Routing" },
+  record: { group: "routing", kicker: "Routing" },
+  "approval-routing": { group: "routing", kicker: "Routing" },
+  ask: { group: "inbox", kicker: "Ask" },
+  call: { group: "inbox", kicker: "Call" },
+  draft: { group: "inbox", kicker: "Draft" },
+  "draft-note": { group: "inbox", kicker: "Draft note" },
+  approval: { group: "inbox", kicker: "Approval" },
+  suggestion: { group: "inbox", kicker: "Suggestion" },
+  knock: { group: "inbox", kicker: "Knock" },
+  note: { group: "inbox", kicker: "Note" },
+  "secret-request": { group: "inbox", kicker: "Secret request" },
+  fork: { group: "inbox", kicker: "Question" },
+  request: { group: "requests", kicker: "Request" },
+  room: { group: "rooms", kicker: "Room" },
+  message: { group: "rooms", kicker: "Message" },
+  send: { group: "rooms", kicker: "Send" },
+  member: { group: "rooms", kicker: "Member" },
+  subscription: { group: "rooms", kicker: "Room" },
+  "work-item": { group: "work", kicker: "Work" },
+  view: { group: "layout", kicker: "Layout" },
+  recovery: { group: "recovery", kicker: "Recovery" },
 };
 
+/** Whole kinds whose kicker differs from their prefix's. */
+const KIND_KICKER: Record<string, string> = {
+  "role.succession": "Succession",
+  "pool.hold-taken": "Hold",
+  "pool.hold-released": "Hold",
+  "pool.hold-expired": "Hold",
+  "pool.hold-queued": "Hold",
+  "pool.hold-reconciled": "Hold",
+  "lane.nudged": "Nudge",
+};
+
+const prefixOf = (kind: string) => kind.split(".")[0] ?? "";
+
 export function kindGroup(kind: string): TimelineKindGroup {
-  return PREFIX_GROUP[kind.split(".")[0] ?? ""] ?? "other";
+  // Handoffs get their own filter instead of a section of their own.
+  if (kind === "role.succession") return "succession";
+  return PREFIXES[prefixOf(kind)]?.group ?? "other";
+}
+
+/** The kicker a row shows for its kind: "Lane", "Hold", "Succession". */
+export function eventKicker(kind: string): string {
+  const known = KIND_KICKER[kind] ?? PREFIXES[prefixOf(kind)]?.kicker;
+  if (known) return known;
+  const prefix = prefixOf(kind).replaceAll("-", " ");
+  return prefix.charAt(0).toUpperCase() + prefix.slice(1);
 }
 
 export interface TimelineFilter {
@@ -166,55 +218,207 @@ export function consequences(
     .sort((left, right) => left.seq - right.seq);
 }
 
-export interface SuccessionEntry {
-  readonly event: MissionTimelineEvent;
-  /** The lane or role that changed threads. */
-  readonly who: string;
+/** "Role model changed", "Lane created": a raw event kind as words. */
+export function eventKindLabel(kind: string): string {
+  const action = kind.slice(kind.indexOf(".") + 1).replaceAll("-", " ");
+  return kind.includes(".") ? `${eventKicker(kind)} ${action}` : eventKicker(kind);
 }
 
-/** Lane and role handoffs (`role.succession`), newest first. */
-export function successions(
-  events: ReadonlyArray<MissionTimelineEvent>,
-  masterRoleId: string | null,
-): SuccessionEntry[] {
-  return events
-    .filter((event) => event.kind === "role.succession")
-    .sort((left, right) => right.seq - left.seq)
-    .map((event) => ({
-      event,
-      who:
-        event.subject?.kind === "lane"
-          ? event.subject.id.replace(/^lane-/, "")
-          : event.subject?.kind === "role" && event.subject.id === masterRoleId
-            ? "master"
-            : (event.subject?.label ?? event.subject?.id ?? actorLabel(event.actor, masterRoleId)),
-    }));
-}
-
-export interface TimelineEventRow {
+/** One timeline line: an event, or a run of events that say the same thing. */
+export interface TimelineLine {
+  readonly key: string;
+  /** The newest event of the run; its time, kind, subject and cause chain. */
   readonly event: MissionTimelineEvent;
-  readonly actor: string;
+  readonly kicker: string;
+  readonly summary: string;
   readonly group: TimelineKindGroup;
-  /** Present when the event has a recorded cause in the log. */
-  readonly causeSummary: string | null;
-  readonly consequenceCount: number;
+  /** You or the master; other actors read from `actor`. */
+  readonly by: "owner" | "master" | null;
+  readonly actor: string;
+  /** Events folded into the line; 1 for a plain event. */
+  readonly count: number;
+  /** Events before (causes) and after (direct consequences) this one in its chain. */
+  readonly lineageSteps: number;
 }
 
+export interface TimelineDay {
+  readonly key: string;
+  /** "Today", "Yesterday", "Fri 16 Oct". */
+  readonly heading: string;
+  /** Events on the day, folded runs counted in full. */
+  readonly count: number;
+  readonly rows: ReadonlyArray<TimelineLine>;
+}
+
+const isImport = (event: MissionTimelineEvent) =>
+  event.kind === "import.applied" && event.provenance._tag === "import";
+
+/** Two neighbouring events say the same thing: one import, or the same line repeated. */
+function sameLine(left: MissionTimelineEvent, right: MissionTimelineEvent): boolean {
+  if (isImport(left) && isImport(right)) return true;
+  return (
+    left.kind === right.kind &&
+    left.summary === right.summary &&
+    actorKey(left.actor) === actorKey(right.actor)
+  );
+}
+
+const plural = (count: number, noun: string) =>
+  count === 1
+    ? noun
+    : /[^aeiou]y$/.test(noun)
+      ? `${noun.slice(0, -1)}ies`
+      : /(s|x|ch|sh)$/.test(noun)
+        ? `${noun}es`
+        : `${noun}s`;
+
+/** Record counts an import event carries: core batches, rooms, messages, read marks. */
+function importCounts(event: MissionTimelineEvent): Array<[string, number]> {
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null) return [];
+  const fields = payload as Record<string, unknown>;
+  const counted = (noun: string, value: unknown): Array<[string, number]> =>
+    typeof value === "number" && value > 0 ? [[noun, value]] : [];
+  if (fields.kind === "room") {
+    return [...counted("room", fields.rooms), ...counted("subscription", fields.subscriptions)];
+  }
+  if (typeof fields.kind !== "string") return [];
+  return counted(fields.kind.replaceAll("-", " "), fields.count);
+}
+
+/** "Imported 52 roles, 88 lanes and 3 rooms": one line for a whole import. */
+export function importSummary(events: ReadonlyArray<MissionTimelineEvent>): string | null {
+  const totals = new Map<string, number>();
+  // Oldest first, so the parts read in the order the import wrote them.
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    for (const [noun, count] of importCounts(events[index]!)) {
+      totals.set(noun, (totals.get(noun) ?? 0) + count);
+    }
+  }
+  const parts = [...totals].map(([noun, count]) => `${count} ${plural(count, noun)}`);
+  if (parts.length === 0) return null;
+  const last = parts.pop();
+  return `Imported ${parts.length > 0 ? `${parts.join(", ")} and ${last}` : last}`;
+}
+
+/**
+ * Timeline lines from events (newest first): neighbouring events that say the
+ * same thing fold into one line with a count, so an import or a boot-time
+ * alignment reads as one line instead of fifty.
+ */
 export function timelineRows(
   events: ReadonlyArray<MissionTimelineEvent>,
   all: ReadonlyArray<MissionTimelineEvent>,
   masterRoleId: string | null,
-): TimelineEventRow[] {
-  const byId = new Map(all.map((event) => [event.id as string, event]));
+): TimelineLine[] {
   const caused = new Map<string, number>();
   for (const event of all) {
     if (event.causedBy) caused.set(event.causedBy, (caused.get(event.causedBy) ?? 0) + 1);
   }
-  return events.map((event) => ({
-    event,
-    actor: actorLabel(event.actor, masterRoleId),
-    group: kindGroup(event.kind),
-    causeSummary: event.causedBy ? (byId.get(event.causedBy)?.summary ?? null) : null,
-    consequenceCount: caused.get(event.id) ?? 0,
-  }));
+  const runs: MissionTimelineEvent[][] = [];
+  for (const event of events) {
+    const run = runs.at(-1);
+    const head = run?.[0];
+    if (run && head && sameLine(head, event)) run.push(event);
+    else runs.push([event]);
+  }
+  return runs.map((run) => {
+    const event = run[0]!;
+    const actor = event.actor;
+    const by =
+      actor._tag === "owner"
+        ? "owner"
+        : actor._tag === "role" && actor.roleId === masterRoleId
+          ? "master"
+          : null;
+    const summary = (isImport(event) ? importSummary(run) : null) ?? event.summary;
+    return {
+      key: run.length === 1 ? event.id : `${event.id}+${run.length}`,
+      event,
+      kicker: eventKicker(event.kind),
+      summary,
+      group: kindGroup(event.kind),
+      by,
+      actor: actorLabel(actor, masterRoleId),
+      count: run.length,
+      lineageSteps: lineage(event, all).length - 1 + (caused.get(event.id) ?? 0),
+    } satisfies TimelineLine;
+  });
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** "Today", "Yesterday" or "Fri 16 Oct" for an instant, in the reader's time zone. */
+export function dayHeading(atIso: string, nowMs: number, timeZone?: string): string {
+  const day = formatDayLabel(atIso, timeZone);
+  const label = (ms: number) =>
+    formatDayLabel(DateTime.formatIso(DateTime.makeUnsafe(ms)), timeZone);
+  if (day === label(nowMs)) return "Today";
+  if (day === label(nowMs - DAY_MS)) {
+    return "Yesterday";
+  }
+  return day;
+}
+
+/** Lines grouped under day heads, newest day first. */
+export function timelineDays(
+  rows: ReadonlyArray<TimelineLine>,
+  nowMs: number,
+  timeZone?: string,
+): TimelineDay[] {
+  const days: Array<{ key: string; heading: string; count: number; rows: TimelineLine[] }> = [];
+  for (const row of rows) {
+    const key = formatDayLabel(row.event.at, timeZone);
+    const day = days.at(-1);
+    if (day && day.key === key) {
+      day.rows.push(row);
+      day.count += row.count;
+    } else {
+      days.push({
+        key,
+        heading: dayHeading(row.event.at, nowMs, timeZone),
+        count: row.count,
+        rows: [row],
+      });
+    }
+  }
+  return days;
+}
+
+// --- Since you last looked: the direction check ---
+
+export interface DirectionCheckRow {
+  readonly item: DirectionCheckItem;
+  /** Items folded into this row: the same structural change repeated. */
+  readonly count: number;
+  /** The reason as words; the server sends a raw event kind for structural changes. */
+  readonly reason: string;
+}
+
+const RAW_KIND = /^[a-z][a-z-]*\.[a-z][a-z-]*$/;
+
+/**
+ * Direction-check rows: calls one per row, structural changes that repeat
+ * (same reason and summary) folded into one row with a count.
+ */
+export function directionCheckRows(items: ReadonlyArray<DirectionCheckItem>): DirectionCheckRow[] {
+  const rows: Array<{ item: DirectionCheckItem; count: number; reason: string }> = [];
+  const folded = new Map<string, { count: number }>();
+  for (const item of items) {
+    const reason = RAW_KIND.test(item.reason) ? eventKindLabel(item.reason) : item.reason;
+    if (item.ref.kind === "call") {
+      rows.push({ item, count: 1, reason });
+      continue;
+    }
+    const key = `${item.reason}\n${item.summary}`;
+    const existing = folded.get(key);
+    if (existing) {
+      existing.count += 1;
+      continue;
+    }
+    const row = { item, count: 1, reason };
+    folded.set(key, row);
+    rows.push(row);
+  }
+  return rows;
 }

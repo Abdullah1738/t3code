@@ -1,4 +1,4 @@
-import type { MissionId } from "@t3tools/contracts";
+import type { MissionId, MissionRecordRef, OwnerCondition } from "@t3tools/contracts";
 
 import type {
   OpenRequestInput,
@@ -38,6 +38,43 @@ export function openRequestInput(missionId: MissionId, text: string): Result<Ope
   return ok({ missionId, text: trimmed });
 }
 
+/**
+ * Discuss on a record: the owner's words open a request about it, or add to
+ * the open one (the router keeps one open request per record).
+ */
+export function discussRequestInput(
+  missionId: MissionId,
+  subject: MissionRecordRef,
+  text: string,
+): Result<OpenRequestInput> {
+  const trimmed = text.trim();
+  if (trimmed === "") return err("Write what you want to discuss first.");
+  return ok({ missionId, text: trimmed, subject });
+}
+
+/** The open request about a record, if the owner is already discussing it. */
+export function requestAbout(
+  requests: ReadonlyArray<OwnerRequest>,
+  subject: Pick<MissionRecordRef, "kind" | "id">,
+): OwnerRequest | null {
+  return (
+    requests.find(
+      (request) =>
+        request.status !== "settled" &&
+        request.subject !== null &&
+        request.subject.kind === subject.kind &&
+        request.subject.id === subject.id,
+    ) ?? null
+  );
+}
+
+/** A record the master decided on a condition the owner stated in a Discuss request. */
+export function ownerConditionOf(record: {
+  readonly onOwnerCondition?: OwnerCondition | null | undefined;
+}): OwnerCondition | null {
+  return record.onOwnerCondition ?? null;
+}
+
 export function replyRequestInput(requestId: string, text: string): Result<ReplyRequestInput> {
   const trimmed = text.trim();
   if (trimmed === "") return err("Write a reply first.");
@@ -54,14 +91,22 @@ export function lastMasterReply(
   return null;
 }
 
-/** Answered and not opened since the master's last reply. */
-export function isRequestUnread(
-  request: Pick<OwnerRequest, "status" | "messages" | "readAt">,
-): boolean {
-  if (request.status !== "answered") return false;
-  const reply = lastMasterReply(request);
-  if (!reply) return false;
-  return request.readAt === null || reply.at > request.readAt;
+/** The master spoke since the owner last read it. */
+export function isRequestUnread(request: Pick<OwnerRequest, "status" | "unread">): boolean {
+  return request.status !== "settled" && request.unread;
+}
+
+/**
+ * A Discuss about a record. It lives on that record's card, never in Your
+ * requests (owner, 19 Oct: "Discussions stay on the item").
+ */
+export function isDiscussion(request: Pick<OwnerRequest, "subject">): boolean {
+  return request.subject !== null;
+}
+
+/** What Your requests lists and counts: the owner's own asks, not discussions. */
+export function yourRequests(requests: ReadonlyArray<OwnerRequest>): ReadonlyArray<OwnerRequest> {
+  return requests.filter((request) => !isDiscussion(request));
 }
 
 export function unreadRequestCount(requests: ReadonlyArray<OwnerRequest>): number {

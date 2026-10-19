@@ -1,23 +1,23 @@
 import type {
   CallId,
   DraftNoteId,
-  ForkId,
   MissionId,
   MissionRecordRef,
   SubMissionId,
 } from "@t3tools/contracts";
 import {
   addDraftNoteInput,
-  askSectionChangeInput,
-  askTheMissionInput,
-  discussSectionInput,
+  askSectionChangeText,
+  discussRequestInput,
+  discussSectionText,
   openRequestInput,
   parseShareInput,
   replyRequestInput,
+  viewSectionRequest,
   type DraftNoteScopeChoice,
+  type MissionViewsState,
   type OwnerRequest,
-  type SectionChange,
-  type SectionEntry,
+  type ViewSectionChange,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { requestConfirmDialog } from "../../confirmDialog";
@@ -61,19 +61,25 @@ export function reorderSubMissions(missionId: MissionId, order: ReadonlyArray<Su
   );
 }
 
-/** "Fine" accepts the call; "Discuss" also opens a Discuss fork of the master. */
-export function reactToCall(callId: string, reaction: "ok" | "discuss") {
+/** "Fine" accepts the call. Discuss is a request about the call (`discussRecord`). */
+export function reactToCall(callId: string, reaction: "ok") {
   return runMissionAction(
     missionsSource.reactToCall({ callId: callId as CallId, reaction }),
     "Could not record your reaction",
   );
 }
 
-/** Discuss on a record that is not a call: a Discuss fork about that record. */
-export function discussRecord(missionId: MissionId, ref: MissionRecordRef) {
-  return runMissionAction(
-    missionsSource.openFork({ missionId, kind: "discuss", origin: ref }),
-    "Couldn't open the discussion",
+/**
+ * Discuss on any Needs-you card: the owner's words open a request about the
+ * record, or add to the one already open about it. The record keeps waiting.
+ */
+export function discussRecord(missionId: MissionId, subject: MissionRecordRef, text: string) {
+  return submitMissionInput(
+    discussRequestInput(missionId, subject, text),
+    async (input) => {
+      await missionsSource.openRequest(input);
+    },
+    "Couldn't send it to the master",
   );
 }
 
@@ -110,40 +116,34 @@ export function addDraftNote(
   );
 }
 
-/** "Ask the mission": opens an owner-question fork of the master. */
-export function askTheMission(missionId: MissionId, question: string) {
+// --- Layout (views record) ---
+
+/** One section-menu or Views-tab change, sent as the views RPC it maps to. */
+export function changeSection(views: MissionViewsState, key: string, change: ViewSectionChange) {
+  const request = viewSectionRequest(views.snapshot, key, change);
+  if (request === null) return Promise.resolve(true);
+  return runMissionAction(missionsSource.changeView(request), "Couldn't change the layout");
+}
+
+/**
+ * Discuss or "Ask the master to change" on a section or tab: an owner request
+ * the master answers in Your requests. Layout entries are not mission records,
+ * so the request carries the section's name in its text, not a subject.
+ */
+export function askAboutSection(
+  missionId: MissionId,
+  title: string,
+  kind: "discuss" | "change",
+  text: string,
+) {
+  const body =
+    kind === "discuss" ? discussSectionText(title, text) : askSectionChangeText(title, text);
   return submitMissionInput(
-    askTheMissionInput(missionId, question),
-    (input) => missionsSource.openFork(input),
-    "Couldn't ask the mission",
-  );
-}
-
-export function closeFork(forkId: ForkId) {
-  return runMissionAction(missionsSource.archiveFork({ forkId }), "Couldn't close the discussion");
-}
-
-// --- Overview sections ---
-
-export function changeSection(missionId: MissionId, key: string, change: SectionChange) {
-  return runMissionAction(
-    missionsSource.changeSection({ missionId, key, change }),
-    "Couldn't change the section",
-  );
-}
-
-export function discussSection(missionId: MissionId, section: SectionEntry) {
-  return runMissionAction(
-    missionsSource.openFork(discussSectionInput(missionId, section)),
-    "Couldn't open the discussion",
-  );
-}
-
-export function askSectionChange(missionId: MissionId, section: SectionEntry, text: string) {
-  return submitMissionInput(
-    askSectionChangeInput(missionId, section, text),
-    (input) => missionsSource.openFork(input),
-    "Couldn't ask the master",
+    text.trim() === ""
+      ? { ok: false, error: "Write what you want first." }
+      : openRequestInput(missionId, body),
+    (input) => missionsSource.openRequest(input),
+    kind === "discuss" ? "Couldn't open the discussion" : "Couldn't ask the master",
   );
 }
 

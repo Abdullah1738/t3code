@@ -170,26 +170,18 @@ export interface ChoiceOption {
   readonly id: string;
   readonly label: string;
   readonly detail: string;
-  /** Gets a "<who>'s pick" chip. */
+  /** Gets a "Recommended" mark. Who recommended it is left out (owner, 19 Oct). */
   readonly recommended: boolean;
 }
 
-export interface ChoiceAdvisor {
-  readonly kind: AvatarKind;
-  /** "Master", "Payments". */
-  readonly name: string;
-}
-
-/** One-of buttons. `advice` is the advisor's reason, shown under the options. */
+/** One-of buttons. `advice` is the reason for the recommendation, shown under the options. */
 export function ChoiceBlock(props: {
   options: ReadonlyArray<ChoiceOption>;
   picked: string | null;
   onPick: (optionId: string | null) => void;
-  advisor?: ChoiceAdvisor | null;
   advice?: string | null;
   disabled?: boolean;
 }) {
-  const advisor = props.advisor ?? { kind: "master", name: "Master" };
   if (props.options.length === 0) return null;
   return (
     <div className="flex flex-col gap-2">
@@ -220,7 +212,7 @@ export function ChoiceBlock(props: {
               <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
                 <span className="font-medium text-foreground">{option.label}</span>
                 {option.recommended ? (
-                  <PersonChip kind={advisor.kind} name={`${advisor.name}’s pick`} />
+                  <span className="text-xs text-muted-foreground">Recommended</span>
                 ) : null}
               </span>
               {option.detail ? (
@@ -233,12 +225,7 @@ export function ChoiceBlock(props: {
         })}
       </div>
       {props.advice ? (
-        <p className="grid grid-cols-[16px_minmax(0,1fr)] items-start gap-x-2.5 text-sm leading-5.5 text-muted-foreground">
-          <span className="mt-0.5" role="img" aria-label={`${advisor.name}’s reason`}>
-            <Avatar kind={advisor.kind} name={advisor.name} />
-          </span>
-          <span>{props.advice}</span>
-        </p>
+        <p className="text-sm leading-5.5 text-pretty text-muted-foreground">{props.advice}</p>
       ) : null}
     </div>
   );

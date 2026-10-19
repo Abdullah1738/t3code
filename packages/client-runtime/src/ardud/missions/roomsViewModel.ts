@@ -118,6 +118,31 @@ export function totalUnread(entries: ReadonlyArray<MissionRoomEntry>): number {
   return entries.reduce((sum, entry) => sum + (entry.room.archived ? 0 : entry.unread), 0);
 }
 
+/**
+ * The owner's unread count the room list carries (router r5's optional
+ * `Room.unreadForOwner`); null when the server doesn't send it yet.
+ */
+export function listedRoomUnread(room: Room): number | null {
+  const listed = (room as { readonly unreadForOwner?: unknown }).unreadForOwner;
+  return typeof listed === "number" ? listed : null;
+}
+
+/**
+ * The owner's unread count from a room's newest page. When the page stops short
+ * of the read mark, the messages between the mark and the page count too, so a
+ * busy room is never capped at the page length.
+ */
+export function pageUnread(page: Pick<RoomPage, "messages" | "ownerReadSeq" | "hasOlder">): number {
+  let onPage = 0;
+  let oldest = Number.POSITIVE_INFINITY;
+  for (const message of page.messages) {
+    oldest = Math.min(oldest, message.seq);
+    if (message.seq > page.ownerReadSeq && message.author._tag !== "owner") onPage += 1;
+  }
+  if (!page.hasOlder || !Number.isFinite(oldest)) return onPage;
+  return onPage + Math.max(0, oldest - 1 - page.ownerReadSeq);
+}
+
 /** Room names the way the coordinator says them: "#delivery", "#CRP-12350 · …". */
 export function roomName(room: Pick<Room, "title">): string {
   return room.title.startsWith("#") ? room.title : `#${room.title}`;

@@ -10,13 +10,12 @@ import {
   INITIAL_INBOX_UI,
   masterRoutedEntries,
   ownerWaitingEntries,
-  sectionTitle,
   type InboxEntry,
   type MissionInboxSnapshot,
-  type MissionLayout,
+  type MissionViewsState,
   type OwnerRequest,
-  type SectionEntry,
-  type SectionKind,
+  type ResolvedViewLayout,
+  type ViewSectionEntry,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../../components/ui/button";
@@ -25,7 +24,7 @@ import { CardList, CardListItem } from "../cards/CardFrame";
 import { AgeElement, ByMarker, YouGlyph } from "../cards/chips";
 import { entryCardState, InboxEntryCard, type EntryCardDeps } from "../InboxCards";
 import { changeSection } from "../missionCommands";
-import { useDraftNotes, useMasterRoleId, useMissionForks, useMissionList } from "../missionsStore";
+import { useDraftNotes, useMasterRoleId, useMissionList } from "../missionsStore";
 import { inboxActions } from "../useInboxScreen";
 import { FoldButton, SectionCount, SectionShell } from "./SectionShell";
 
@@ -36,7 +35,6 @@ const FIRST_CARDS = 3;
 function useEntryCards(missionId: MissionId, nowMs: number) {
   const [ui, dispatch] = useReducer(inboxUiReducer, INITIAL_INBOX_UI);
   const deps: EntryCardDeps = {
-    forks: useMissionForks(missionId) ?? [],
     draftNotes: useDraftNotes(missionId) ?? [],
     stats: null,
     list: useMissionList(),
@@ -78,8 +76,9 @@ function EntryCardList(props: {
 /** What waits on the owner in this mission, as cards he can act on in place. */
 export function NeedsYouSection(props: {
   missionId: MissionId;
-  layout: MissionLayout;
-  section: SectionEntry;
+  views: MissionViewsState;
+  layout: ResolvedViewLayout;
+  section: ViewSectionEntry;
   inbox: MissionInboxSnapshot | undefined;
   nowMs: number;
 }) {
@@ -90,6 +89,7 @@ export function NeedsYouSection(props: {
   return (
     <SectionShell
       missionId={props.missionId}
+      views={props.views}
       layout={props.layout}
       section={props.section}
       meta={
@@ -126,8 +126,9 @@ export function NeedsYouSection(props: {
 /** Drafts, approvals and suggestions routed to the master. Hidden when there are none. */
 export function WithTheMasterSection(props: {
   missionId: MissionId;
-  layout: MissionLayout;
-  section: SectionEntry;
+  views: MissionViewsState;
+  layout: ResolvedViewLayout;
+  section: ViewSectionEntry;
   inbox: MissionInboxSnapshot | undefined;
   nowMs: number;
 }) {
@@ -139,6 +140,7 @@ export function WithTheMasterSection(props: {
   return (
     <SectionShell
       missionId={props.missionId}
+      views={props.views}
       layout={props.layout}
       section={props.section}
       meta={<SectionCount count={entries.length} label={`${entries.length} with the master`} />}
@@ -177,13 +179,14 @@ interface PinnedRow {
 /** One strip per hidden section that still holds something for the owner. */
 export function PinnedStrip(props: {
   missionId: MissionId;
-  layout: MissionLayout;
-  kind: Extract<SectionKind, "needs-you" | "your-requests">;
+  views: MissionViewsState;
+  layout: ResolvedViewLayout;
+  kind: "needs-you" | "your-requests";
   inbox?: MissionInboxSnapshot | undefined;
   requests?: ReadonlyArray<OwnerRequest>;
   nowMs: number;
 }) {
-  const section = props.layout.entries.find((entry) => entry.kind === props.kind);
+  const section = props.layout.setAside.find((entry) => entry.kind === props.kind);
   const rows = useMemo((): PinnedRow[] => {
     if (props.kind === "needs-you") {
       return props.inbox
@@ -203,8 +206,9 @@ export function PinnedStrip(props: {
     }));
   }, [props.kind, props.inbox, props.requests]);
   if (!section || rows.length === 0) return null;
-  const title = sectionTitle(section);
-  const by = section.changedBy ?? "owner";
+  const title = section.title;
+  // The layout's last author; a starter layout never hides a section.
+  const by = props.layout.by === "owner" ? "owner" : "master";
   return (
     <section
       aria-label={`${title}, pinned`}
@@ -223,7 +227,7 @@ export function PinnedStrip(props: {
           size="xs"
           variant="ghost-muted"
           className="ms-auto"
-          onClick={() => void changeSection(props.missionId, section.key, { type: "restore" })}
+          onClick={() => void changeSection(props.views, section.key, { type: "restore" })}
         >
           Show section
         </Button>

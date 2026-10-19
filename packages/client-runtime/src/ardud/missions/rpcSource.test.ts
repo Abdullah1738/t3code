@@ -1,6 +1,8 @@
 import {
   MISSIONS_ASKS_WS_METHODS as ASKS,
   MISSIONS_POLICY_WS_METHODS as POLICY,
+  MISSIONS_VIEWS_WS_METHODS as VIEWS,
+  DEFAULT_STARTER_LAYOUT,
   MissionError,
   WS_METHODS,
   type Lane,
@@ -15,7 +17,14 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import { createRpcMissionsSource, poolUsageOf, type MissionsTransport } from "./rpcSource.ts";
-import type { MissionOverviewSnapshot, MissionRoomEntry } from "./source.ts";
+import type {
+  MissionOverviewSnapshot,
+  MissionRoomEntry,
+  MissionViewsState,
+  OwnerRequest,
+  PortfolioSnapshot,
+} from "./source.ts";
+import { viewSectionRequest } from "./views/layout.ts";
 
 const CRPKO = "crpko-engineering" as MissionId;
 const LIVE = "live-only-mission" as MissionId;
@@ -143,8 +152,6 @@ describe("rpc missions source", () => {
     expect([...source.sampled].sort()).toEqual([
       "portfolio",
       "recovery",
-      "requests",
-      "sections",
       "suggestion-stats",
       "timeline",
       "work",
@@ -321,6 +328,163 @@ describe("rpc missions source", () => {
     expect(rooms.last()?.map((entry) => entry.unread)).toEqual([0]);
   });
 
+  it("builds the portfolio from the live missions until the server serves it", async () => {
+    const overview = fixtureOverview();
+    const { transport, live } = fakeTransport();
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const portfolio = collect<PortfolioSnapshot>((listener) => source.subscribePortfolio(listener));
+
+    const [list] = live(WS_METHODS.missionsSubscribeList);
+    list?.push({
+      _tag: "list",
+      snapshot: {
+        revision: 1,
+        missions: [
+          { id: CRPKO, status: "active" },
+          { id: LIVE, status: "archived" },
+        ],
+      },
+    });
+    // Waits for every live mission's overview; archived missions are left out.
+    expect(live(WS_METHODS.missionsSubscribe).map((stream) => stream.input)).toEqual([
+      { missionId: CRPKO },
+    ]);
+    expect(portfolio.seen).toEqual([]);
+
+    live(WS_METHODS.missionsSubscribe)[0]?.push({
+      _tag: "overview",
+      seq: 1,
+      overview: { ...overview, usageShare: 0.5 },
+    });
+    const snapshot = portfolio.last();
+    expect(snapshot?.order).toEqual([CRPKO]);
+    expect(snapshot?.missions[0]).toMatchObject({
+      missionId: CRPKO,
+      title: overview.mission.title,
+      guaranteedShare: overview.mission.guaranteedShare,
+      usedShare: 0.5 * overview.mission.guaranteedShare,
+      pools: [],
+    });
+    await expect(source.setPortfolioOrder({ order: [CRPKO] })).rejects.toBeInstanceOf(MissionError);
+
+    portfolio.close();
+    expect(live(WS_METHODS.missionsSubscribeList)).toHaveLength(0);
+    expect(live(WS_METHODS.missionsSubscribe)).toHaveLength(0);
+  });
+
+  it("takes unread counts from the room list when the router sends them", async () => {
+    const room = { id: ROOM, missionId: CRPKO, lastSeq: 400, archived: false, unreadForOwner: 312 };
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsRooms]: () => [room],
+    });
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const rooms = collect<ReadonlyArray<MissionRoomEntry>>((listener) =>
+      source.subscribeRooms(CRPKO, listener),
+    );
+    await settle();
+    expect(rooms.last()?.map((entry) => entry.unread)).toEqual([312]);
+    expect(asked(WS_METHODS.missionsRoomPage)).toHaveLength(0);
+  });
+
+  it("reads owner requests live, marks them read at the newest seq and refetches after a reply", async () => {
+    const REQUEST_ROOM = `${CRPKO}:room:request:request-1` as RoomId;
+    let unread = true;
+    let replies = 0;
+    const record = () => ({
+      id: "request-1",
+      missionId: CRPKO,
+      subMissionId: null,
+      title: "Park the e2e lane",
+      status: unread ? "answered" : "waiting-on-master",
+      roomId: REQUEST_ROOM,
+      createdBy: { _tag: "owner" },
+      lastOwnerAt: "2026-10-18T09:00:00.000Z",
+      lastMasterAt: "2026-10-18T09:05:00.000Z",
+      links: [{ kind: "work-item", id: "w-1", label: "e2e lane" }],
+      unreadForOwner: unread,
+      settledBy: null,
+      settledAt: null,
+      createdAt: "2026-10-18T09:00:00.000Z",
+      updatedAt: "2026-10-18T09:05:00.000Z",
+      subject: { kind: "ask", id: "ask-1", label: "Kafka capacity" },
+    });
+    const message = (seq: number, author: unknown, summary: string) => ({
+      message: {
+        id: `m-${seq}`,
+        seq,
+        author,
+        summary,
+        links: [],
+        createdAt: `2026-10-18T09:0${seq}:00.000Z`,
+      },
+      body: null,
+    });
+    const view = () => ({
+      request: record(),
+      messages: [
+        message(1, { _tag: "owner" }, "Park the e2e lane"),
+        message(4, { _tag: "role", roleId: "master" }, "Parked."),
+        ...Array.from({ length: replies }, (_, index) =>
+          message(5 + index, { _tag: "owner" }, "Thanks"),
+        ),
+      ],
+      hasOlder: false,
+      unreadForOwner: unread,
+    });
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsOwnerRequests]: () => ({ missionId: CRPKO, requests: [view()] }),
+      [WS_METHODS.missionsMarkRead]: (input: { readonly seq: number }) => {
+        unread = false;
+        return { roomId: REQUEST_ROOM, seq: input.seq };
+      },
+      [WS_METHODS.missionsReplyOwnerRequest]: () => {
+        replies += 1;
+        return record();
+      },
+      [WS_METHODS.missionsOpenOwnerRequest]: () => record(),
+    });
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const requests = collect<ReadonlyArray<OwnerRequest>>((listener) =>
+      source.subscribeRequests(CRPKO, listener),
+    );
+    await settle();
+    expect(requests.last()?.[0]).toMatchObject({
+      id: "request-1",
+      status: "answered",
+      unread: true,
+      links: [{ kind: "work-item", id: "w-1" }],
+      subject: { kind: "ask", id: "ask-1" },
+    });
+    expect(requests.last()?.[0]?.messages.map((m) => [m.author, m.text])).toEqual([
+      ["owner", "Park the e2e lane"],
+      ["master", "Parked."],
+    ]);
+
+    await source.markRequestRead({ requestId: "request-1" });
+    expect(asked(WS_METHODS.missionsMarkRead).map((call) => call.input)).toEqual([
+      { roomId: REQUEST_ROOM, seq: 4 },
+    ]);
+
+    await source.replyRequest({ requestId: "request-1", text: "  Thanks  " });
+    await settle();
+    expect(asked(WS_METHODS.missionsReplyOwnerRequest).map((call) => call.input)).toEqual([
+      { requestId: "request-1", text: "Thanks" },
+    ]);
+    expect(requests.last()?.[0]?.messages).toHaveLength(3);
+    expect(requests.last()?.[0]?.unread).toBe(false);
+
+    await source.openRequest({
+      missionId: CRPKO,
+      text: "Why?",
+      subject: { kind: "ask", id: "ask-1" } as never,
+    });
+    expect(asked(WS_METHODS.missionsOpenOwnerRequest).at(-1)?.input).toEqual({
+      missionId: CRPKO,
+      text: "Why?",
+      subject: { kind: "ask", id: "ask-1" },
+    });
+  });
+
   it("maps owner actions onto the server's RPCs", async () => {
     const fork = { id: "fork-1", missionId: CRPKO, question: null };
     const { transport, asked } = fakeTransport({
@@ -355,12 +519,10 @@ describe("rpc missions source", () => {
 
     await source.reactToCall({ callId: "call-1" as never, reaction: "ok" });
     expect(asked(WS_METHODS.missionsStartFork)).toHaveLength(0);
+    // Discuss is an owner request about the call now, never a fork.
     await source.reactToCall({ callId: "call-1" as never, reaction: "discuss" });
-    expect(asked(WS_METHODS.missionsStartFork).at(-1)?.input).toEqual({
-      missionId: CRPKO,
-      kind: "discuss",
-      origin: { kind: "call", id: "call-1" },
-    });
+    expect(asked(WS_METHODS.missionsReactToCall)).toHaveLength(2);
+    expect(asked(WS_METHODS.missionsStartFork)).toHaveLength(0);
 
     const opened = await source.openFork({
       missionId: CRPKO,
@@ -404,6 +566,89 @@ describe("rpc missions source", () => {
     ).rejects.toMatchObject({
       code: "invalid",
     });
+  });
+
+  it("reads the views record live, logs view events and sends section changes", async () => {
+    const { transport, live, asked } = fakeTransport({
+      [VIEWS.editLayout]: () => ({ ok: true }),
+    });
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const views = collect<MissionViewsState | null>((listener) =>
+      source.subscribeViews(CRPKO, listener),
+    );
+    const snapshot = {
+      missionId: CRPKO,
+      catalogVersion: 1,
+      revision: 3,
+      templates: [],
+      sections: [],
+      layout: {
+        missionId: CRPKO,
+        layout: DEFAULT_STARTER_LAYOUT.layout,
+        version: 4,
+        changedBy: { _tag: "owner" },
+        by: "owner",
+        changedAt: "2026-10-18T09:00:00.000Z",
+        changeNote: null,
+        seededFrom: 1,
+      },
+      starter: DEFAULT_STARTER_LAYOUT,
+      ownerWaiting: 2,
+      requestsUnread: 0,
+      pinnedStrip: false,
+      pinned: { needsYou: false, requests: false },
+      changesToday: 0,
+    };
+    live(VIEWS.subscribe)[0]?.push({ _tag: "snapshot", snapshot });
+    live(WS_METHODS.missionsSubscribe)[0]?.push({
+      _tag: "upsert",
+      record: {
+        _tag: "event",
+        record: {
+          ...event("view.layout-changed", { kind: "view-layout", id: CRPKO }),
+          summary: "The owner hid With the master",
+        },
+      },
+    });
+    live(VIEWS.subscribe)[0]?.push({
+      _tag: "waiting",
+      missionId: CRPKO,
+      ownerWaiting: 5,
+      requestsUnread: 1,
+      pinnedStrip: false,
+      pinned: { needsYou: false, requests: false },
+    });
+    const state = views.last();
+    expect(state?.snapshot.layout.version).toBe(4);
+    expect(state?.snapshot.ownerWaiting).toBe(5);
+    expect(state?.changes.map((change) => [change.by, change.summary])).toEqual([
+      ["owner", "The owner hid With the master"],
+    ]);
+
+    const request = viewSectionRequest(state!.snapshot, "with-the-master", { type: "hide" });
+    await source.changeView(request!);
+    expect(asked(VIEWS.editLayout)[0]?.input).toEqual({
+      missionId: CRPKO,
+      ops: [{ _tag: "hide", key: "with-the-master" }],
+      expectedVersion: 4,
+    });
+  });
+
+  it("shows the starter layout when the server has no views track", () => {
+    const { transport, live } = fakeTransport();
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const views = collect<MissionViewsState | null>((listener) =>
+      source.subscribeViews(LIVE, listener),
+    );
+    live(VIEWS.subscribe)[0]?.fail(new Error("unknown method"));
+    expect(views.last()?.snapshot.layout.layout).toBe(DEFAULT_STARTER_LAYOUT.layout);
+    const gone = collect<MissionViewsState | null>((listener) =>
+      source.subscribeViews("gone" as MissionId, listener),
+    );
+    live(VIEWS.subscribe)
+      .find((stream) => (stream.input as { missionId: string }).missionId === "gone")
+      ?.fail(new MissionError({ code: "not-found", detail: "gone" }));
+    expect(gone.seen).toEqual([null]);
   });
 
   it("keeps master counts at zero and has no all-missions fork list", () => {

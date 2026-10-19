@@ -17,7 +17,6 @@ import { describe, expect, it } from "vite-plus/test";
 
 import type {
   ApprovalRoutingTable,
-  MissionForkEntry,
   MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionRoomEntry,
@@ -257,43 +256,18 @@ describe("fixture missions source", () => {
     expect(inbox.value.counts.fyi).toBe(inbox.value.fyi.length);
   });
 
-  it("a Discuss on a call opens one fork, and Ask the mission opens another", async () => {
+  it("a Discuss on a call is a request about it and keeps the call waiting", async () => {
     const source = createFixtureMissionsSource({ now });
-    const forks = latest<ReadonlyArray<MissionForkEntry>>((l) => source.subscribeForks(CRPKO, l));
-    const callId = "call-10211" as never;
     const overview = latest<MissionOverviewSnapshot | null>((l) =>
       source.subscribeOverview(CRPKO, l),
     );
-    await source.reactToCall({ callId, reaction: "discuss" });
-    const discuss = forks.value.find((entry) => entry.fork.kind === "discuss")!;
-    expect(discuss.fork.status).toBe("open");
-    expect(discuss.fork.origin).toMatchObject({ kind: "call", id: "call-10211" });
-    // The call stays in the direction check while its Discuss fork is open.
-    const inCheck = () => overview.value!.directionCheck.some((item) => item.ref.id === callId);
-    expect(inCheck()).toBe(true);
+    const inCheck = (id: string) => overview.value!.directionCheck.some((i) => i.ref.id === id);
+    const subject = { kind: "call" as const, id: "call-10211", label: "x" };
+    const request = await source.openRequest({ missionId: CRPKO, text: "Why now?", subject });
+    expect(request.subject).toMatchObject({ kind: "call", id: "call-10211" });
+    expect(inCheck("call-10211")).toBe(true);
     await source.reactToCall({ callId: "call-10194" as never, reaction: "ok" });
-    expect(overview.value!.directionCheck.some((item) => item.ref.id === "call-10194")).toBe(false);
-    // Asking again on the same call reuses the open fork.
-    const again = await source.openFork({
-      missionId: CRPKO,
-      kind: "discuss",
-      origin: { kind: "call", id: callId, label: "x" },
-    });
-    expect(again.fork.id).toBe(discuss.fork.id);
-    await expect(
-      source.openFork({ missionId: CRPKO, kind: "owner-question", origin: null, question: "" }),
-    ).rejects.toBeInstanceOf(MissionError);
-    const asked = await source.openFork({
-      missionId: CRPKO,
-      kind: "owner-question",
-      origin: null,
-      question: "Why is risk#68 still the Monday risk?",
-    });
-    expect(forks.value[0]?.fork.id).toBe(asked.fork.id);
-    await source.archiveFork({ forkId: asked.fork.id });
-    expect(forks.value[0]?.fork.status).toBe("archived");
-    await source.archiveFork({ forkId: discuss.fork.id });
-    expect(inCheck()).toBe(false);
+    expect(inCheck("call-10194")).toBe(false);
   });
 
   it("records who last changed the intended share and locks nothing", async () => {
