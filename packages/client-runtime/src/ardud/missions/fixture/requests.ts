@@ -13,7 +13,7 @@ import { fail } from "./util.ts";
 
 const decodeMissionId = Schema.decodeUnknownSync(MissionId);
 
-const ref = <K extends OwnerRequest["messages"][number]["refs"][number]["kind"]>(
+const ref = <K extends OwnerRequest["links"][number]["kind"]>(
   kind: K,
   id: string,
   label: string,
@@ -40,15 +40,18 @@ function seedRequests(): OwnerRequest[] {
           author: "master",
           text: "Parked two idle lanes and opened a resize of the dev cluster. One call needs you: Kafka capacity for r004.",
           at: AT("07:52"),
-          refs: [
-            ref("work-item", "codec-v4", "Dev cluster resize"),
-            ref("ask", "ask-kafka-capacity-r004", "Kafka capacity r004"),
-          ],
+          refs: [],
         },
       ],
+      hasOlder: false,
+      links: [
+        ref("work-item", "codec-v4", "Dev cluster resize"),
+        ref("ask", "ask-kafka-capacity-r004", "Kafka capacity r004"),
+      ],
+      subject: null,
+      unread: true,
       createdAt: AT("06:10"),
       updatedAt: AT("07:52"),
-      readAt: AT("06:10"),
       settledAt: null,
     },
     {
@@ -65,9 +68,12 @@ function seedRequests(): OwnerRequest[] {
           refs: [],
         },
       ],
+      hasOlder: false,
+      links: [],
+      subject: null,
+      unread: false,
       createdAt: AT("08:05"),
       updatedAt: AT("08:05"),
-      readAt: AT("08:05"),
       settledAt: null,
     },
     {
@@ -88,12 +94,15 @@ function seedRequests(): OwnerRequest[] {
           author: "master",
           text: "Round 4 found 19 issues across 5 workers; two broke rule 104, so Sol reviews again before Astra's final pass.",
           at: AT("22:15", 16),
-          refs: [ref("work-item", "risk68-r4", "risk#68 r4"), ref("rule", "rule-104", "Rule 104")],
+          refs: [],
         },
       ],
+      hasOlder: false,
+      links: [ref("work-item", "risk68-r4", "risk#68 r4"), ref("rule", "rule-104", "Rule 104")],
+      subject: null,
+      unread: false,
       createdAt: AT("21:40", 16),
       updatedAt: AT("22:15", 16),
-      readAt: AT("23:02", 16),
       settledAt: null,
     },
     {
@@ -114,12 +123,15 @@ function seedRequests(): OwnerRequest[] {
           author: "master",
           text: "Saved as a rule: reviews queue when fewer than 2 Codex accounts are usable.",
           at: AT("10:04", 15),
-          refs: [ref("rule", "rule-105", "Rule 105")],
+          refs: [],
         },
       ],
+      hasOlder: false,
+      links: [ref("rule", "rule-105", "Rule 105")],
+      subject: null,
+      unread: false,
       createdAt: AT("10:00", 15),
       updatedAt: AT("10:20", 15),
-      readAt: AT("10:20", 15),
       settledAt: AT("10:20", 15),
     },
   ];
@@ -140,6 +152,7 @@ export type RequestsSource = Pick<
   | "subscribeLayout"
   | "changeSection"
   | "subscribeRequests"
+  | "subscribeRequest"
   | "openRequest"
   | "replyRequest"
   | "settleRequest"
@@ -201,10 +214,38 @@ export function createRequests(ctx: RequestsContext): RequestsSource {
 
     subscribeRequests: (missionId, listener) => watch(() => missionRequests(missionId), listener),
 
-    openRequest({ missionId, text }) {
+    subscribeRequest: ({ requestId }, listener) =>
+      watch(() => requests.find((request) => request.id === requestId) ?? null, listener),
+
+    openRequest({ missionId, text, subject }) {
       const body = text.trim();
       if (body === "") return fail("invalid", "Write what you want first.");
       const at = nowIso();
+      // One open request per record: Discuss again continues it.
+      const about = subject
+        ? requests.find(
+            (request) =>
+              request.missionId === missionId &&
+              request.status !== "settled" &&
+              request.subject?.kind === subject.kind &&
+              request.subject.id === subject.id,
+          )
+        : undefined;
+      if (about) {
+        const next: OwnerRequest = {
+          ...about,
+          status: "waiting",
+          messages: [
+            ...about.messages,
+            { id: localId("request-message"), author: "owner", text: body, at, refs: [] },
+          ],
+          unread: false,
+          updatedAt: at,
+        };
+        requests = requests.map((request) => (request.id === about.id ? next : request));
+        commit();
+        return Promise.resolve(next);
+      }
       const id = localId("request");
       const request: OwnerRequest = {
         id,
@@ -212,9 +253,12 @@ export function createRequests(ctx: RequestsContext): RequestsSource {
         title: requestTitle(body),
         status: "waiting",
         messages: [{ id: `${id}-1`, author: "owner", text: body, at, refs: [] }],
+        hasOlder: false,
+        links: [],
+        subject: subject ?? null,
+        unread: false,
         createdAt: at,
         updatedAt: at,
-        readAt: at,
         settledAt: null,
       };
       requests = [...requests, request];
@@ -235,8 +279,8 @@ export function createRequests(ctx: RequestsContext): RequestsSource {
             ...request.messages,
             { id: localId("request-message"), author: "owner", text: body, at, refs: [] },
           ],
+          unread: false,
           updatedAt: at,
-          readAt: at,
         };
       });
     },
@@ -245,7 +289,7 @@ export function createRequests(ctx: RequestsContext): RequestsSource {
       update(requestId, (request) => {
         if (request.status === "settled") return "It is already settled.";
         const at = nowIso();
-        return { ...request, status: "settled", settledAt: at, updatedAt: at, readAt: at };
+        return { ...request, status: "settled", settledAt: at, updatedAt: at, unread: false };
       }),
 
     reopenRequest: ({ requestId }) =>
@@ -263,11 +307,8 @@ export function createRequests(ctx: RequestsContext): RequestsSource {
     markRequestRead({ requestId }) {
       const request = requests.find((r) => r.id === requestId);
       if (!request) return fail("not-found", `Request ${requestId} not found.`);
-      const last = request.messages.at(-1);
-      if (request.readAt !== null && (!last || last.at <= request.readAt)) {
-        return Promise.resolve();
-      }
-      return update(requestId, (current) => ({ ...current, readAt: nowIso() }));
+      if (!request.unread) return Promise.resolve();
+      return update(requestId, (current) => ({ ...current, unread: false }));
     },
   };
 }

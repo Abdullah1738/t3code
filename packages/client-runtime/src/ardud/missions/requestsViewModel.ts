@@ -54,14 +54,9 @@ export function lastMasterReply(
   return null;
 }
 
-/** Answered and not opened since the master's last reply. */
-export function isRequestUnread(
-  request: Pick<OwnerRequest, "status" | "messages" | "readAt">,
-): boolean {
-  if (request.status !== "answered") return false;
-  const reply = lastMasterReply(request);
-  if (!reply) return false;
-  return request.readAt === null || reply.at > request.readAt;
+/** The master spoke since the owner last read it. */
+export function isRequestUnread(request: Pick<OwnerRequest, "status" | "unread">): boolean {
+  return request.status !== "settled" && request.unread;
 }
 
 export function unreadRequestCount(requests: ReadonlyArray<OwnerRequest>): number {

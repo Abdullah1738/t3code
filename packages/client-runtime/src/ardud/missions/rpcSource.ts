@@ -15,6 +15,10 @@ import {
   type MissionOverview,
   type MissionRecord,
   type MissionRecordKind,
+  type MissionRecordRef,
+  type OwnerRequest as OwnerRequestRecord,
+  type OwnerRequestId,
+  type OwnerRequestView,
   type PoolView,
   type PoolsSnapshot,
   type Room,
@@ -38,6 +42,8 @@ import type {
   MissionPoolUsage,
   MissionRoomEntry,
   MissionsSource,
+  OwnerRequest,
+  OwnerRequestStatus,
   SampledFeed,
   Unsubscribe,
 } from "./source.ts";
@@ -104,7 +110,6 @@ export const RPC_SAMPLED_FEEDS: ReadonlySet<SampledFeed> = new Set<SampledFeed>(
   "portfolio",
   "suggestion-stats",
   "recovery",
-  "requests",
   "sections",
 ]);
 
@@ -276,6 +281,42 @@ function holderName(actor: MissionActor): string {
     case "person":
       return actor.name;
   }
+}
+
+const REQUEST_STATUS: Record<OwnerRequestRecord["status"], OwnerRequestStatus> = {
+  "waiting-on-master": "waiting",
+  answered: "answered",
+  settled: "settled",
+};
+
+/**
+ * A router owner request as Your requests reads it. A list read carries the
+ * newest few messages as summaries; a single-request read carries bodies.
+ */
+export function ownerRequestOf(
+  request: OwnerRequestRecord,
+  view?: Pick<OwnerRequestView, "messages" | "hasOlder" | "unreadForOwner">,
+): OwnerRequest {
+  return {
+    id: request.id,
+    missionId: request.missionId,
+    title: request.title,
+    status: REQUEST_STATUS[request.status],
+    messages: (view?.messages ?? []).map(({ message, body }) => ({
+      id: message.id,
+      author: message.author._tag === "owner" ? "owner" : "master",
+      text: body ?? message.summary,
+      at: message.createdAt,
+      refs: message.links,
+    })),
+    hasOlder: view?.hasOlder ?? false,
+    links: request.links,
+    subject: request.subject ?? null,
+    unread: view?.unreadForOwner ?? request.unreadForOwner,
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt,
+    settledAt: request.settledAt,
+  };
 }
 
 /** A policy pool as the header usage line reads it. */
@@ -568,6 +609,60 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       stopTouched();
       stopEvents?.();
     };
+  });
+
+  // Owner requests: the list and each open conversation refetch on request
+  // events. The newest message seq per request is kept for marking it read.
+  const requestReads = new Map<string, { readonly roomId: RoomId; readonly seq: number }>();
+  const readView = (view: OwnerRequestView): OwnerRequest => {
+    const last = view.messages.at(-1);
+    if (last !== undefined) {
+      requestReads.set(view.request.id, { roomId: view.request.roomId, seq: last.message.seq });
+    }
+    return ownerRequestOf(view.request, view);
+  };
+  const requestTouched = (event: MissionEvent, requestId: string) =>
+    event.kind.startsWith("request.") &&
+    event.subject?.kind === "owner-request" &&
+    event.subject.id === requestId;
+  const touchRequest = (request: OwnerRequestRecord) => {
+    bus.emit(`requests:${request.missionId}`);
+    bus.emit(`request:${request.id}`);
+  };
+
+  const requestsFeed = sharedFeeds<MissionId, ReadonlyArray<OwnerRequest>>(
+    (missionId, emit) =>
+      requestFeed({
+        missionId,
+        load: async () =>
+          (await transport.request(WS_METHODS.missionsOwnerRequests, { missionId })).requests.map(
+            readView,
+          ),
+        refreshOn: kindStarts("request."),
+        topics: [`requests:${missionId}`],
+        emit,
+      }).stop,
+  );
+
+  const requestThreadFeed = sharedFeeds<string, OwnerRequest | null>((key, emit) => {
+    const [missionId, requestId] = key.split("\n") as [MissionId, OwnerRequestId];
+    return requestFeed({
+      missionId,
+      load: async () => {
+        const read = await transport.request(WS_METHODS.missionsOwnerRequests, {
+          missionId,
+          requestId,
+        });
+        const view = read.requests.find((each) => each.request.id === requestId);
+        return view === undefined ? null : readView(view);
+      },
+      refreshOn: (event) => requestTouched(event, requestId),
+      topics: [`request:${requestId}`],
+      emit,
+      onError: (error) => {
+        if (isNotFound(error)) emit(null);
+      },
+    }).stop;
   });
 
   const touchRoom = (roomId: RoomId) => {
@@ -1039,15 +1134,52 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     // Section lists keep the live mission id: they hold no mission data.
     subscribeLayout: (missionId, listener) => fallback.subscribeLayout(missionId, listener),
     changeSection: (input) => fallback.changeSection(input),
-    // Requests are sample threads, so they live under the sample mission.
-    subscribeRequests: (missionId, listener) =>
-      fallback.subscribeRequests(sampleId(missionId), listener),
-    openRequest: (input) =>
-      fallback.openRequest({ ...input, missionId: sampleId(input.missionId) }),
-    replyRequest: (input) => fallback.replyRequest(input),
-    settleRequest: (input) => fallback.settleRequest(input),
-    reopenRequest: (input) => fallback.reopenRequest(input),
-    markRequestRead: (input) => fallback.markRequestRead(input),
+
+    // --- Owner requests ---
+
+    subscribeRequests: (missionId, listener) => requestsFeed(missionId, listener),
+    subscribeRequest: ({ missionId, requestId }, listener) =>
+      requestThreadFeed(`${missionId}\n${requestId}`, listener),
+    openRequest: async ({ missionId, text, subject }) => {
+      // Router r5 adds `subject` (one open request per record); until then the
+      // server drops it and Discuss opens a plain request.
+      const input: { missionId: MissionId; text: string; subject?: MissionRecordRef } = {
+        missionId,
+        text: text.trim(),
+        ...(subject === undefined ? {} : { subject }),
+      };
+      const request = await transport.request(WS_METHODS.missionsOpenOwnerRequest, input);
+      touchRequest(request);
+      return ownerRequestOf(request);
+    },
+    replyRequest: async ({ requestId, text }) => {
+      touchRequest(
+        await transport.request(WS_METHODS.missionsReplyOwnerRequest, {
+          requestId: requestId as OwnerRequestId,
+          text: text.trim(),
+        }),
+      );
+    },
+    settleRequest: async ({ requestId }) => {
+      touchRequest(
+        await transport.request(WS_METHODS.missionsSettleOwnerRequest, {
+          requestId: requestId as OwnerRequestId,
+        }),
+      );
+    },
+    reopenRequest: async ({ requestId }) => {
+      touchRequest(
+        await transport.request(WS_METHODS.missionsReopenOwnerRequest, {
+          requestId: requestId as OwnerRequestId,
+        }),
+      );
+    },
+    markRequestRead: async ({ requestId }) => {
+      // Reading up to the newest message clears the request's unread mark.
+      const read = requestReads.get(requestId);
+      if (read === undefined) return;
+      await transport.request(WS_METHODS.missionsMarkRead, read);
+    },
   };
 }
 

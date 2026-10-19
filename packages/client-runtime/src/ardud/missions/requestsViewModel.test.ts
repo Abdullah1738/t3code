@@ -73,6 +73,23 @@ describe("owner requests", () => {
     expect(isRequestUnread(reopened)).toBe(false);
   });
 
+  it("keeps one open request per discussed record", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const read = latest(source);
+    const subject = { kind: "ask" as const, id: "ask-kafka-capacity-r004", label: "Kafka" };
+    const first = await source.openRequest({ missionId: CRPKO, text: "Why 3 brokers?", subject });
+    const again = await source.openRequest({ missionId: CRPKO, text: "And the cost?", subject });
+    expect(again.id).toBe(first.id);
+    expect(
+      read()
+        .find((r) => r.id === first.id)
+        ?.messages.map((m) => m.text),
+    ).toEqual(["Why 3 brokers?", "And the cost?"]);
+    await source.settleRequest({ requestId: first.id });
+    const fresh = await source.openRequest({ missionId: CRPKO, text: "Back again", subject });
+    expect(fresh.id).not.toBe(first.id);
+  });
+
   it("logs section changes in the fixture layout", async () => {
     const source = createFixtureMissionsSource({ now });
     const seen: string[][] = [];

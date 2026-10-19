@@ -18,7 +18,14 @@ import {
 import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
-import { AgeElement, PersonChip, RefChip, StateGlyph, UnreadDot } from "../cards/chips";
+import {
+  AgeElement,
+  AnyLinkChip,
+  PersonChip,
+  RefChip,
+  StateGlyph,
+  UnreadDot,
+} from "../cards/chips";
 import {
   markRequestRead,
   openRequest,
@@ -26,7 +33,7 @@ import {
   replyRequest,
   settleRequest,
 } from "../missionCommands";
-import { isSampleFeed } from "../missionsStore";
+import { useOwnerRequest } from "../missionsStore";
 import { SectionCount, SectionShell } from "./SectionShell";
 
 // What the owner asked or told the master: a composer, one row per request,
@@ -39,7 +46,6 @@ export function YourRequestsSection(props: {
   requests: ReadonlyArray<OwnerRequest> | undefined;
   /** The open request, from the URL's `request` param. */
   openId: string | null;
-  sample: boolean;
   nowMs: number;
 }) {
   const setOpenId = useRequestOpener(props.missionId);
@@ -54,7 +60,6 @@ export function YourRequestsSection(props: {
       missionId={props.missionId}
       layout={props.layout}
       section={props.section}
-      sample={props.sample}
       meta={<SectionCount count={unread} tone="update" label={`${unread} answered, unread`} />}
     >
       {open ? (
@@ -235,7 +240,8 @@ export function RequestThread(props: {
   /** `h2` when the thread stands alone on the board. */
   heading?: "h2" | "h3";
 }) {
-  const { request } = props;
+  // The list carries the newest few messages as summaries; the thread read has them all.
+  const request = useOwnerRequest(props.request.missionId, props.request.id) ?? props.request;
   const Heading = props.heading ?? "h3";
   const unread = isRequestUnread(request);
   useEffect(() => {
@@ -278,6 +284,13 @@ export function RequestThread(props: {
           <RequestMessage key={message.id} message={message} nowMs={props.nowMs} />
         ))}
       </ol>
+      {request.links.length > 0 ? (
+        <div aria-label="What the master made" className="flex min-w-0 flex-wrap gap-1.5">
+          {request.links.map((ref) => (
+            <RefChip key={`${ref.kind}:${ref.id}`} record={ref} />
+          ))}
+        </div>
+      ) : null}
       {settled ? null : (
         <Textarea
           size="sm"
@@ -338,8 +351,8 @@ function RequestMessage(props: { message: OwnerRequestMessage; nowMs: number }) 
       <p className="text-sm leading-5.5 text-pretty whitespace-pre-line">{message.text}</p>
       {message.refs.length > 0 ? (
         <div className="flex min-w-0 flex-wrap gap-1.5">
-          {message.refs.map((ref) => (
-            <RefChip key={`${ref.kind}:${ref.id}`} record={ref} />
+          {message.refs.map((link) => (
+            <AnyLinkChip key={`${link.kind}:${link.ref ?? link.url ?? link.label}`} link={link} />
           ))}
         </div>
       ) : null}
@@ -347,12 +360,9 @@ function RequestMessage(props: { message: OwnerRequestMessage; nowMs: number }) 
   );
 }
 
-/**
- * Answered requests the owner has not opened. Sample requests are never live
- * news, so they stay out of the counts.
- */
+/** Requests the master answered since the owner last read them. */
 export function unreadRequests(requests: ReadonlyArray<OwnerRequest> | undefined) {
-  if (!requests || isSampleFeed("requests")) return [];
+  if (!requests) return [];
   return requests.filter(isRequestUnread);
 }
 

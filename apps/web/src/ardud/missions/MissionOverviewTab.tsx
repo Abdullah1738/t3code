@@ -33,7 +33,6 @@ import { cn } from "../../lib/utils";
 import { AgeElement, ByMarker, PersonChip, RefChip, StateGlyph } from "./cards/chips";
 import { discussRecord, markMissionSeen, reactToCall } from "./missionCommands";
 import {
-  isSampleFeed,
   useMissionForks,
   useMissionInbox,
   useMissionLayout,
@@ -190,7 +189,6 @@ function OverviewSection(props: {
           {...common}
           requests={context.requests}
           openId={context.openRequestId}
-          sample={isSampleFeed("requests")}
         />
       );
     case "sub-missions":

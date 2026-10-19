@@ -15,7 +15,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import { createRpcMissionsSource, poolUsageOf, type MissionsTransport } from "./rpcSource.ts";
-import type { MissionOverviewSnapshot, MissionRoomEntry } from "./source.ts";
+import type { MissionOverviewSnapshot, MissionRoomEntry, OwnerRequest } from "./source.ts";
 
 const CRPKO = "crpko-engineering" as MissionId;
 const LIVE = "live-only-mission" as MissionId;
@@ -143,7 +143,6 @@ describe("rpc missions source", () => {
     expect([...source.sampled].sort()).toEqual([
       "portfolio",
       "recovery",
-      "requests",
       "sections",
       "suggestion-stats",
       "timeline",
@@ -319,6 +318,105 @@ describe("rpc missions source", () => {
     await settle();
     expect(asked(WS_METHODS.missionsRoomPage).length).toBe(pagesBefore + 1);
     expect(rooms.last()?.map((entry) => entry.unread)).toEqual([0]);
+  });
+
+  it("reads owner requests live, marks them read at the newest seq and refetches after a reply", async () => {
+    const REQUEST_ROOM = `${CRPKO}:room:request:request-1` as RoomId;
+    let unread = true;
+    let replies = 0;
+    const record = () => ({
+      id: "request-1",
+      missionId: CRPKO,
+      subMissionId: null,
+      title: "Park the e2e lane",
+      status: unread ? "answered" : "waiting-on-master",
+      roomId: REQUEST_ROOM,
+      createdBy: { _tag: "owner" },
+      lastOwnerAt: "2026-10-18T09:00:00.000Z",
+      lastMasterAt: "2026-10-18T09:05:00.000Z",
+      links: [{ kind: "work-item", id: "w-1", label: "e2e lane" }],
+      unreadForOwner: unread,
+      settledBy: null,
+      settledAt: null,
+      createdAt: "2026-10-18T09:00:00.000Z",
+      updatedAt: "2026-10-18T09:05:00.000Z",
+      subject: { kind: "ask", id: "ask-1", label: "Kafka capacity" },
+    });
+    const message = (seq: number, author: unknown, summary: string) => ({
+      message: {
+        id: `m-${seq}`,
+        seq,
+        author,
+        summary,
+        links: [],
+        createdAt: `2026-10-18T09:0${seq}:00.000Z`,
+      },
+      body: null,
+    });
+    const view = () => ({
+      request: record(),
+      messages: [
+        message(1, { _tag: "owner" }, "Park the e2e lane"),
+        message(4, { _tag: "role", roleId: "master" }, "Parked."),
+        ...Array.from({ length: replies }, (_, index) =>
+          message(5 + index, { _tag: "owner" }, "Thanks"),
+        ),
+      ],
+      hasOlder: false,
+      unreadForOwner: unread,
+    });
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsOwnerRequests]: () => ({ missionId: CRPKO, requests: [view()] }),
+      [WS_METHODS.missionsMarkRead]: (input: { readonly seq: number }) => {
+        unread = false;
+        return { roomId: REQUEST_ROOM, seq: input.seq };
+      },
+      [WS_METHODS.missionsReplyOwnerRequest]: () => {
+        replies += 1;
+        return record();
+      },
+      [WS_METHODS.missionsOpenOwnerRequest]: () => record(),
+    });
+    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const requests = collect<ReadonlyArray<OwnerRequest>>((listener) =>
+      source.subscribeRequests(CRPKO, listener),
+    );
+    await settle();
+    expect(requests.last()?.[0]).toMatchObject({
+      id: "request-1",
+      status: "answered",
+      unread: true,
+      links: [{ kind: "work-item", id: "w-1" }],
+      subject: { kind: "ask", id: "ask-1" },
+    });
+    expect(requests.last()?.[0]?.messages.map((m) => [m.author, m.text])).toEqual([
+      ["owner", "Park the e2e lane"],
+      ["master", "Parked."],
+    ]);
+
+    await source.markRequestRead({ requestId: "request-1" });
+    expect(asked(WS_METHODS.missionsMarkRead).map((call) => call.input)).toEqual([
+      { roomId: REQUEST_ROOM, seq: 4 },
+    ]);
+
+    await source.replyRequest({ requestId: "request-1", text: "  Thanks  " });
+    await settle();
+    expect(asked(WS_METHODS.missionsReplyOwnerRequest).map((call) => call.input)).toEqual([
+      { requestId: "request-1", text: "Thanks" },
+    ]);
+    expect(requests.last()?.[0]?.messages).toHaveLength(3);
+    expect(requests.last()?.[0]?.unread).toBe(false);
+
+    await source.openRequest({
+      missionId: CRPKO,
+      text: "Why?",
+      subject: { kind: "ask", id: "ask-1" } as never,
+    });
+    expect(asked(WS_METHODS.missionsOpenOwnerRequest).at(-1)?.input).toEqual({
+      missionId: CRPKO,
+      text: "Why?",
+      subject: { kind: "ask", id: "ask-1" },
+    });
   });
 
   it("maps owner actions onto the server's RPCs", async () => {

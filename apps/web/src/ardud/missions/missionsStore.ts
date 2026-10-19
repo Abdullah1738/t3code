@@ -138,9 +138,23 @@ export function useMissionLayout(missionId: MissionId): MissionLayout | undefine
   return useSyncExternalStore(store.subscribe, store.get);
 }
 
+const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | null>((key, emit) => {
+  const [missionId, requestId] = key.split("\n") as [MissionId, string];
+  return missionsSource.subscribeRequest({ missionId, requestId }, emit);
+});
+
 /** What the owner asked or told the master, newest activity first. */
 export function useOwnerRequests(missionId: MissionId): ReadonlyArray<OwnerRequest> | undefined {
   const store = requestStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** One request's whole conversation with full message bodies; null once gone. */
+export function useOwnerRequest(
+  missionId: MissionId,
+  requestId: string,
+): OwnerRequest | null | undefined {
+  const store = requestThreadStores(`${missionId}\n${requestId}`);
   return useSyncExternalStore(store.subscribe, store.get);
 }
 
