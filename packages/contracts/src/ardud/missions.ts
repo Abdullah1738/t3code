@@ -3080,7 +3080,7 @@ export type MergeSubMissionsInput = typeof MergeSubMissionsInput.Type;
 
 // --- asks additions ---
 
-/** The asker or the owner takes an open ask back; what it held is released. */
+/** The asker, the mission's master or the owner takes an open ask back; what it held is released. */
 export const WithdrawAskInput = Schema.Struct({
   askId: AskId,
   reason: Schema.String,
