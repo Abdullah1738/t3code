@@ -363,8 +363,10 @@ export function createFixtureMissionsSource(
    * owner, per contract `needsYou`. What waits on the master is not counted.
    */
   function needsYou(missionId: string, subMissionId: string | null): number {
-    const inScope = (record: { readonly id: string; readonly subMissionId?: string | null }) =>
-      subMissionId === null || (record.subMissionId ?? subMissionOf(record)) === subMissionId;
+    const inScope = (record: {
+      readonly id: string;
+      readonly subMissionId?: string | null | undefined;
+    }) => subMissionId === null || (record.subMissionId ?? subMissionOf(record)) === subMissionId;
     return (
       openAsks(missionId).filter(inScope).length +
       pendingDrafts(missionId).filter(toOwner("draft")).filter(inScope).length +
