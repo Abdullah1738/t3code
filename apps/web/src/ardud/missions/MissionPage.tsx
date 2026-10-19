@@ -1,7 +1,6 @@
 import { Link } from "@tanstack/react-router";
 
 import type { MissionId, RoomId } from "@t3tools/contracts";
-import { healthLabel } from "@t3tools/client-runtime/ardud/missions";
 
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
 import { ScrollArea } from "../../components/ui/scroll-area";
@@ -18,7 +17,7 @@ import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { cn } from "../../lib/utils";
 import { LanesTab } from "./LanesTab";
-import { MissionSummary } from "./MissionHeader";
+import { MissionHead } from "./MissionHeader";
 import { MissionOverviewTab } from "./MissionOverviewTab";
 import { MISSION_TAB_LABEL, MISSION_TABS, type MissionTab } from "./missionSearch";
 import { useMissionOverview } from "./missionsStore";
@@ -28,7 +27,6 @@ import { RulesTab } from "./RulesTab";
 import { TimelineTab } from "./TimelineTab";
 import { ViewsTab } from "./ViewsTab";
 import { WorkTab } from "./WorkTab";
-import { HEALTH_DOT_CLASS } from "./missionTone";
 import { useNowMs } from "./useNowMs";
 
 /** A mission's page: header with the owner's controls, then one tab. */
@@ -58,19 +56,7 @@ export function MissionPage(props: {
             </WorkspaceBreadcrumbItem>
             <WorkspaceBreadcrumbSeparator />
             <WorkspaceBreadcrumbItem current>
-              {overview ? (
-                <span
-                  role="img"
-                  aria-label={healthLabel(overview.mission.health)}
-                  className={cn(
-                    "me-2 size-2 shrink-0 rounded-full",
-                    overview.mission.status === "paused"
-                      ? "bg-muted-foreground/25"
-                      : HEALTH_DOT_CLASS[overview.mission.health],
-                  )}
-                />
-              ) : null}
-              <h1 className="truncate">{title}</h1>
+              <WorkspaceBreadcrumbText>{title}</WorkspaceBreadcrumbText>
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
         </WorkspacePageHeader>
@@ -82,7 +68,7 @@ export function MissionPage(props: {
               <MissionNotFound />
             ) : (
               <>
-                <MissionSummary overview={overview} nowMs={nowMs} />
+                <MissionHead overview={overview} nowMs={nowMs} />
                 <MissionTabs missionId={props.missionId} tab={props.tab} />
                 {props.tab === "overview" ? (
                   <MissionOverviewTab
@@ -121,8 +107,8 @@ export function MissionPage(props: {
 
 function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
   return (
-    <nav aria-label="Mission sections" className="-mx-1 overflow-x-auto border-b border-border">
-      <ul className="flex min-w-max gap-1 px-1">
+    <nav aria-label="Mission sections" className="overflow-x-auto border-b border-border">
+      <ul className="flex min-w-max gap-0.5">
         {MISSION_TABS.map((tab) => {
           const active = tab === props.tab;
           return (
@@ -133,10 +119,10 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
                 search={tab === "overview" ? {} : { tab }}
                 aria-current={active ? "page" : undefined}
                 className={cn(
-                  "-mb-px flex h-9 items-center border-b-2 px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                  "relative flex h-9 items-center px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
                   active
-                    ? "border-foreground font-medium text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground",
+                    ? "font-medium text-foreground after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-foreground"
+                    : "text-muted-foreground hover:text-foreground",
                 )}
               >
                 {MISSION_TAB_LABEL[tab]}

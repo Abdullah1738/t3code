@@ -10,8 +10,13 @@ import {
   TicketIcon,
 } from "lucide-react";
 
-import type { Approver, MissionLink, MissionRecordRef } from "@t3tools/contracts";
-import { refLabel, type AgeView } from "@t3tools/client-runtime/ardud/missions";
+import type { Approver, MissionHealth, MissionLink, MissionRecordRef } from "@t3tools/contracts";
+import {
+  badgeCount,
+  healthLabel,
+  refLabel,
+  type AgeView,
+} from "@t3tools/client-runtime/ardud/missions";
 
 import { PullRequestGlyph } from "../../../components/pullRequest/pullRequestIcons";
 import { cn } from "../../../lib/utils";
@@ -187,8 +192,11 @@ const STATE_GLYPH_CLASS: Record<StateGlyphKind, string> = {
   unknown: "text-muted-foreground",
 };
 
-/** 12px state glyph from the sprite: shape and colour both carry the state. */
-export function StateGlyph(props: { kind: StateGlyphKind; label?: string }) {
+/**
+ * 12px state glyph from the sprite: shape and colour both carry the state.
+ * `tone` borrows another kind's colour (a waiting lane counts as a risk).
+ */
+export function StateGlyph(props: { kind: StateGlyphKind; label?: string; tone?: StateGlyphKind }) {
   const a11y = props.label
     ? ({ role: "img", "aria-label": props.label } as const)
     : ({ "aria-hidden": true } as const);
@@ -196,7 +204,7 @@ export function StateGlyph(props: { kind: StateGlyphKind; label?: string }) {
     <svg
       viewBox="0 0 12 12"
       {...a11y}
-      className={cn("size-3 shrink-0", STATE_GLYPH_CLASS[props.kind])}
+      className={cn("size-3 shrink-0", STATE_GLYPH_CLASS[props.tone ?? props.kind])}
     >
       {props.kind === "ok" ? <circle cx="6" cy="6" r="4.5" fill="currentColor" /> : null}
       {props.kind === "done" ? (
@@ -243,6 +251,64 @@ export function StateGlyph(props: { kind: StateGlyphKind; label?: string }) {
         />
       ) : null}
     </svg>
+  );
+}
+
+const HEALTH_GLYPH = {
+  green: "ok",
+  amber: "risk",
+  red: "bad",
+  unknown: "unknown",
+} as const satisfies Record<MissionHealth, StateGlyphKind>;
+
+/** A mission or sub-mission's health glyph; paused shows the park glyph. */
+export function HealthGlyph(props: { health: MissionHealth; paused?: boolean }) {
+  return props.paused ? (
+    <StateGlyph kind="park" label="Paused" />
+  ) : (
+    <StateGlyph kind={HEALTH_GLYPH[props.health]} label={healthLabel(props.health)} />
+  );
+}
+
+/** Health glyph plus its word ("At risk"), both in the state's colour. */
+export function HealthStatus(props: { health: MissionHealth; paused?: boolean }) {
+  const kind = props.paused ? "park" : HEALTH_GLYPH[props.health];
+  return (
+    <span className={cn("inline-flex items-center gap-1", STATE_GLYPH_CLASS[kind])}>
+      <StateGlyph kind={kind} />
+      {props.paused ? "Paused" : healthLabel(props.health)}
+    </span>
+  );
+}
+
+/** Update-tinted count: things waiting on the owner. */
+export function CountBadge(props: { count: number; label: string }) {
+  return (
+    <span className="inline-flex h-4.5 min-w-4.5 shrink-0 items-center justify-center rounded-sm bg-update/14 px-1 text-xs leading-none font-medium text-update-foreground tabular-nums">
+      <span aria-hidden>{badgeCount(props.count)}</span>
+      <span className="sr-only">{props.label}</span>
+    </span>
+  );
+}
+
+/** A state glyph and its count, both in the state's colour ("2 stuck"). */
+export function GlyphCount(props: {
+  kind: StateGlyphKind;
+  tone?: StateGlyphKind;
+  count: number;
+  label: string;
+}) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 tabular-nums",
+        STATE_GLYPH_CLASS[props.tone ?? props.kind],
+      )}
+    >
+      <StateGlyph kind={props.kind} {...(props.tone ? { tone: props.tone } : {})} />
+      <span aria-hidden>{props.count}</span>
+      <span className="sr-only">{props.label}</span>
+    </span>
   );
 }
 

@@ -23,7 +23,6 @@ import type { FieldChange } from "@t3tools/client-runtime/ardud/missions";
 import {
   effortNote,
   formatPercent,
-  healthLabel,
   intendedTotal,
   moveInOrder,
   priorityStack,
@@ -33,7 +32,7 @@ import {
 import { cn } from "../../lib/utils";
 import { reorderSubMissions } from "./missionCommands";
 import { IntendedShareEditor } from "./IntendedShareEditor";
-import { HEALTH_DOT_CLASS } from "./missionTone";
+import { HealthGlyph } from "./cards/chips";
 
 /**
  * Sub-missions in the owner's order. The bar is the master's measured effort
@@ -167,14 +166,7 @@ function PriorityStackItem(props: {
         <span className="w-4 shrink-0 text-end text-xs text-muted-foreground tabular-nums">
           {position}
         </span>
-        <span
-          role="img"
-          aria-label={paused ? "Paused" : healthLabel(sub.health)}
-          className={cn(
-            "size-2 shrink-0 rounded-full",
-            paused ? "bg-muted-foreground/25" : HEALTH_DOT_CLASS[sub.health],
-          )}
-        />
+        <HealthGlyph health={sub.health} paused={paused} />
         <span className={cn("min-w-0 truncate font-medium", paused && "text-muted-foreground")}>
           {sub.title}
         </span>
@@ -186,7 +178,6 @@ function PriorityStackItem(props: {
         {sub.fillIdleCapacity ? (
           <span className="shrink-0 text-2xs text-muted-foreground">fills idle</span>
         ) : null}
-        {paused ? <span className="shrink-0 text-2xs text-muted-foreground">paused</span> : null}
       </div>
       <span
         className={cn(

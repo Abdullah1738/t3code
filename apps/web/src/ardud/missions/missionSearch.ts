@@ -15,7 +15,7 @@ export const MISSION_TABS = [
 export type MissionTab = (typeof MISSION_TABS)[number];
 
 export const MISSION_TAB_LABEL: Record<MissionTab, string> = {
-  overview: "Overview",
+  overview: "Board",
   rooms: "Rooms",
   lanes: "Lanes",
   work: "Work",
