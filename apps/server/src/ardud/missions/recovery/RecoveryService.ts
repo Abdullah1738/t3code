@@ -217,10 +217,11 @@ export const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const mission = yield* store.get("mission", missionId);
       if (Option.isNone(mission)) return yield* notFound(`No mission ${missionId}.`);
+      // Complete reads: a capped list could leave out the master's binding.
       const [roles, bindings, lanes] = yield* Effect.all([
-        store.list("role", { missionId }),
-        store.list("role-binding", { missionId, status: ["bound"] }),
-        store.list("lane", { missionId }),
+        store.listAllInMission("role", missionId),
+        store.listAllInMission("role-binding", missionId, ["bound"]),
+        store.listAllInMission("lane", missionId),
       ]);
       return {
         missionId,
@@ -237,13 +238,13 @@ export const make = Effect.gen(function* () {
       const missionId = mission.id;
       const [subMissions, roles, bindings, lanes, milestones, workItems, storeHolds, policyHolds] =
         yield* Effect.all([
-          store.list("sub-mission", { missionId }),
-          store.list("role", { missionId }),
-          store.list("role-binding", { missionId, status: ["bound"] }),
-          store.list("lane", { missionId }),
-          store.list("milestone", { missionId }),
-          store.list("work-item", { missionId }),
-          store.list("pool-hold", { missionId, status: OPEN_HOLDS }),
+          store.listAllInMission("sub-mission", missionId),
+          store.listAllInMission("role", missionId),
+          store.listAllInMission("role-binding", missionId, ["bound"]),
+          store.listAllInMission("lane", missionId),
+          store.listAllInMission("milestone", missionId),
+          store.listAllInMission("work-item", missionId),
+          store.listAllInMission("pool-hold", missionId, OPEN_HOLDS),
           recovery.policyHolds([missionId]),
         ]);
       const masterRole =
@@ -354,38 +355,51 @@ export const make = Effect.gen(function* () {
       return { mission, cast, members: [...members.values()], holdsByThread } satisfies MissionView;
     });
 
+  // Every live mission, uncapped: a capped list drops missions once there are many.
   const loadViews = (now: string) =>
     store
-      .list("mission", { status: LIVE_MISSIONS })
+      .listAll("mission", LIVE_MISSIONS)
       .pipe(
         Effect.flatMap((missions) => Effect.forEach(missions, (mission) => viewOf(mission, now))),
       );
 
+  // The store's thread index names every mission with a record for the
+  // thread (complete, no limit); each candidate is then checked against its
+  // full current cast, so an ended binding or a closed mission does not count.
   const membersOf = (threadIds: ReadonlyArray<ThreadId>) =>
     Effect.gen(function* () {
-      const wanted = new Set<string>(threadIds);
-      const missions = yield* store.list("mission", { status: LIVE_MISSIONS });
-      const byThread = new Map<string, Array<MissionId>>();
-      for (const mission of missions) {
-        const [bindings, lanes] = yield* Effect.all([
-          store.list("role-binding", { missionId: mission.id, status: ["bound"] }),
-          store.list("lane", { missionId: mission.id }),
-        ]);
-        const threads = new Set<string>([
-          ...bindings
-            .filter((binding) => binding.endedAt === null)
-            .map((binding) => binding.threadId),
-          ...lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
-        ]);
-        for (const threadId of threads) {
-          if (!wanted.has(threadId)) continue;
-          byThread.set(threadId, [...(byThread.get(threadId) ?? []), mission.id]);
+      const castThreads = new Map<string, ReadonlySet<string> | null>();
+      const threadsOf = (missionId: MissionId) =>
+        Effect.gen(function* () {
+          const cached = castThreads.get(missionId);
+          if (cached !== undefined) return cached;
+          const mission = yield* store.get("mission", missionId);
+          let threads: ReadonlySet<string> | null = null;
+          if (Option.isSome(mission) && LIVE_MISSIONS.includes(mission.value.status)) {
+            const [bindings, lanes] = yield* Effect.all([
+              store.listAllInMission("role-binding", missionId, ["bound"]),
+              store.listAllInMission("lane", missionId),
+            ]);
+            threads = new Set<string>([
+              ...bindings
+                .filter((binding) => binding.endedAt === null)
+                .map((binding) => binding.threadId),
+              ...lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
+            ]);
+          }
+          castThreads.set(missionId, threads);
+          return threads;
+        });
+      const members: Array<RecoveryMember> = [];
+      for (const threadId of new Set(threadIds)) {
+        const missionIds: Array<MissionId> = [];
+        for (const missionId of yield* store.missionsOfThread(threadId)) {
+          const threads = yield* threadsOf(missionId);
+          if (threads !== null && threads.has(threadId)) missionIds.push(missionId);
         }
+        if (missionIds.length > 0) members.push({ threadId, missionIds });
       }
-      return threadIds.flatMap((threadId): Array<RecoveryMember> => {
-        const missionIds = byThread.get(threadId);
-        return missionIds === undefined ? [] : [{ threadId, missionIds }];
-      });
+      return members;
     });
 
   // --- opening incidents ---
@@ -1316,7 +1330,7 @@ export const make = Effect.gen(function* () {
         if ((yield* recovery.seenKeys([key])).size > 0) return null;
         const now = yield* nowIso;
         const seen: Array<SeenEntry> = [{ key, threadId: binding.threadId }];
-        const ended = yield* store.list("role-binding", { missionId, status: ["ended"] });
+        const ended = yield* store.listAllInMission("role-binding", missionId, ["ended"]);
         const previous = ended
           .filter(
             (entry) =>

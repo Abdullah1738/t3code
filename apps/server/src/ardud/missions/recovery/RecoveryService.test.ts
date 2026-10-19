@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   MissionError,
+  MissionId,
   PoolHoldId,
   PoolId,
   RoleId,
@@ -15,6 +16,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   agent,
+  binding,
   lane,
   laneThread,
   masterThread,
@@ -725,5 +727,93 @@ it.effect("stream-recovery reports name mission members and land in one incident
     assert.isNull(yield* recovery.scan);
     const status = yield* recovery.status(missionId);
     assert.strictEqual(status.state?.label, "Recovered from OpenCode restart at 09:05");
+  }).pipe(Effect.provide(layer));
+});
+
+// --- recovery r3: complete reads ---
+
+it.effect("recovery finds its mission and members past a thousand newer missions", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    const store = yield* MissionStore.MissionStore;
+    yield* store.commit({
+      event: {
+        missionId: MissionId.make("m-crowd-0"),
+        kind: "mission.created",
+        actor: { _tag: "system", component: "test" },
+        provenance: test,
+        summary: "crowd",
+        subject: null,
+      },
+      upserts: Array.from({ length: 1_001 }, (_, index) => ({
+        _tag: "mission" as const,
+        record: {
+          ...mission,
+          id: MissionId.make(`m-crowd-${index}`),
+          slug: `m-crowd-${index}`,
+          updatedAt: plus(RESTART - 600),
+        },
+      })),
+    });
+    yield* cutRun(laneThread, 1, "vp test run");
+    const recovery = yield* RecoveryService.RecoveryService;
+    assert.deepStrictEqual(yield* recovery.members([laneThread]), [
+      { threadId: laneThread, missionIds: [missionId] },
+    ]);
+    const incident = yield* boot;
+    assert.deepStrictEqual(incident?.missionIds, [missionId]);
+    assert.deepStrictEqual(
+      threadsOf(incident).map((thread) => thread.threadId),
+      [masterThread, laneThread],
+    );
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => sent.threadId),
+      [masterThread],
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("the master stays first and in charge past a thousand newer bindings", () => {
+  const { layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane, webLane]);
+    const store = yield* MissionStore.MissionStore;
+    yield* store.commit({
+      event: {
+        missionId,
+        kind: "role.bound",
+        actor: { _tag: "system", component: "test" },
+        provenance: test,
+        summary: "crowd",
+        subject: null,
+      },
+      upserts: Array.from({ length: 1_001 }, (_, index) => ({
+        _tag: "role-binding" as const,
+        record: {
+          ...binding(`b-crowd-${index}`, "role-writer", ThreadId.make(`t-crowd-${index}`)),
+          boundAt: plus(RESTART - 600),
+        },
+      })),
+    });
+    yield* cutRun(laneThread, 1, "vp test run");
+    yield* cutRun(webThread, 1, "vp test run");
+    const incident = yield* boot;
+    assert.strictEqual(incident?.threads[0]?.threadId, masterThread);
+    const recovery = yield* RecoveryService.RecoveryService;
+    // The oldest member in the crowd still counts as one.
+    assert.deepStrictEqual(yield* recovery.members([ThreadId.make("t-crowd-0")]), [
+      { threadId: ThreadId.make("t-crowd-0"), missionIds: [missionId] },
+    ]);
+    const status = yield* recovery.resume(agent(masterThread), {
+      missionId,
+      mode: "hold",
+      threadId: webThread,
+    });
+    assert.strictEqual(
+      status.incident?.threads.find((thread) => thread.threadId === webThread)?.state,
+      "held",
+    );
   }).pipe(Effect.provide(layer));
 });
