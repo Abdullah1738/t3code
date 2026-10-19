@@ -1262,6 +1262,64 @@ it.effect("a thread in two missions gets each mission's notice", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("a thread in two missions hears each mission's notice in that mission's room", () => {
+  const { layer } = routedHarness();
+  return Effect.gen(function* () {
+    // Mission two is older, so the router's own pick for the lane would be it.
+    const other = MissionId.make("m-0");
+    const otherMaster = ThreadId.make("t-master-0");
+    const store = yield* MissionStore.MissionStore;
+    yield* TestClock.setTime(T0 + RESTART * 1000);
+    yield* store.commit({
+      event: {
+        missionId: other,
+        kind: "mission.created",
+        actor: { _tag: "system", component: "test" },
+        provenance: test,
+        summary: "older mission",
+        subject: null,
+      },
+      upserts: [
+        {
+          _tag: "mission",
+          record: {
+            ...mission,
+            id: other,
+            slug: "m-0",
+            title: "Mission zero",
+            masterRoleId: RoleId.make("role-master-0"),
+          },
+        },
+        { _tag: "role", record: { ...role("role-master-0", "master"), missionId: other } },
+        { _tag: "role-binding", record: binding("b-master-0", "role-master-0", otherMaster) },
+        {
+          _tag: "lane",
+          record: { ...lane, id: LaneId.make("lane-zero"), missionId: other, name: "Zero" },
+        },
+      ],
+    });
+    yield* threadRow(otherMaster, "Master zero");
+    yield* world({ lanes: [lane] });
+    yield* previousBoot(plus(RESTART - 120));
+    yield* cutRun(laneThread, 1, "vp test run");
+    const incident = yield* boot;
+    assert.deepStrictEqual([...(incident?.missionIds ?? [])].toSorted(), [other, missionId]);
+
+    yield* drain;
+    const router = yield* MissionRouter.MissionRouter;
+    const toLane = (room: MissionId) =>
+      Effect.map(
+        router.roomPage({ roomId: MissionRouter.controlRoomId(room) }, ownerApp),
+        (page) =>
+          page.messages.filter((message) =>
+            (message.to ?? []).some((to) => to._tag === "thread" && to.threadId === laneThread),
+          ).length,
+      );
+    assert.strictEqual(yield* toLane(missionId), 1);
+    assert.strictEqual(yield* toLane(other), 1);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("a thread held in an older incident can still be resumed after a newer one", () => {
   const { fake, layer } = harness();
   return Effect.gen(function* () {

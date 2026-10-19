@@ -945,6 +945,7 @@ export const make = Effect.gen(function* () {
         const attempt = claim?.attempt ?? 0;
         const result = yield* delivery
           .notify({
+            missionId: target.missionId,
             threadId: target.threadId,
             text,
             key: attempt === 0 ? key : `${key}#${attempt}`,
