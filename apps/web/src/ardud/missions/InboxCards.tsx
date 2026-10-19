@@ -73,6 +73,10 @@ function frame(
   context: CardContext,
   key: string,
 ): Pick<CardFrameProps, "domId" | "selected" | "onSelect" | "nowMs" | "size"> {
+  // In the reading pane the list row owns the item id and the selection mark.
+  if (context.size === "pane") {
+    return { onSelect: context.onSelect, nowMs: context.nowMs, size: "pane" };
+  }
   return {
     domId: inboxItemDomId(key),
     selected: context.selected,

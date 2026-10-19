@@ -15,7 +15,7 @@ import { CollapsibleSectionHeader } from "../../components/ui/collapsible-sectio
 import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
-import { CountBadge, GlyphCount, HealthGlyph, UnreadDot } from "./cards/chips";
+import { CountBadge, GlyphCount, HealthGlyph, needsYouLabel, UnreadDot } from "./cards/chips";
 import { useMissionList, useOwnerRequests } from "./missionsStore";
 
 const SIDEBAR_STATE_KEY = "t3code:ardud-missions:sidebar";
@@ -294,8 +294,4 @@ function NeedsYouLink(props: { missionId: MissionId; count: number; onNavigate: 
       <CountBadge count={props.count} label={needsYouLabel(props.count)} />
     </Link>
   );
-}
-
-function needsYouLabel(count: number) {
-  return `${count} need${count === 1 ? "s" : ""} you`;
 }

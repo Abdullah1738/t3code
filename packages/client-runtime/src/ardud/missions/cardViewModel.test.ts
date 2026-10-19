@@ -6,10 +6,13 @@ import {
   draftKicker,
   draftTitle,
   entryHeadline,
+  entryRow,
+  groupEntriesByMission,
   masterRoutedEntries,
   noteFlags,
   ownerWaitingEntries,
 } from "./cardViewModel.ts";
+import type { InboxEntry } from "./inboxViewModel.ts";
 
 const MISSION = "crpko-engineering" as MissionId;
 const SUB = "sub-release" as SubMissionId;
@@ -58,6 +61,73 @@ describe("card wording", () => {
       { label: "No evidence", tone: "warning" },
       { label: "Quote differs", tone: "error" },
     ]);
+  });
+});
+
+describe("inbox rows", () => {
+  const OTHER = "juno-ops" as MissionId;
+  const entry = (kind: string, id: string, record: Record<string, unknown>) =>
+    ({
+      kind,
+      key: `${kind}:${id}`,
+      record: { id, createdAt: "2026-10-19T08:00:00.000Z", ...record },
+    }) as unknown as InboxEntry;
+
+  const ask = entry("ask", "a1", {
+    missionId: MISSION,
+    subMissionId: SUB,
+    question: "Ship it?",
+    urgency: "p1",
+  });
+  const draft = entry("draft", "d1", {
+    missionId: MISSION,
+    audience: "Dylan",
+    summary: null,
+    target: { kind: "pull-request", label: " backoffice-core#212 ", url: null, ref: null },
+  });
+  const knock = entry("knock", "k1", { missionId: OTHER, summary: "Need a key", fromTitle: "" });
+  const suggestion = entry("suggestion", "s1", {
+    missionId: null,
+    targetKind: "rule",
+    title: "Tighten the rule",
+    target: { kind: "rule", id: "rule-9" },
+  });
+
+  it("puts the sub-mission or the subject on the second line", () => {
+    expect(entryRow(ask, list)).toMatchObject({
+      key: "ask:a1",
+      kicker: "Decision",
+      title: "Ship it?",
+      sub: { rank: 3, title: "Releases and dev environment" },
+      about: null,
+    });
+    expect(entryRow(draft, list)).toMatchObject({
+      title: "To Dylan",
+      sub: null,
+      about: "backoffice-core#212",
+    });
+    expect(entryRow(knock, list).about).toBeNull();
+    expect(entryRow(suggestion, list).about).toBe("rule-9");
+  });
+
+  it("groups by mission in list order, unknown missions next, unowned last", () => {
+    const groups = groupEntriesByMission([suggestion, knock, ask, draft], {
+      ...list,
+      missions: list.missions.map((mission) => ({
+        ...mission,
+        title: "Crpko engineering",
+        health: "amber",
+        status: "paused",
+      })),
+    } as unknown as MissionListSnapshot);
+    expect(groups.map((group) => [group.missionId, group.entries.map((e) => e.key)])).toEqual([
+      [MISSION, ["ask:a1", "draft:d1"]],
+      [OTHER, ["knock:k1"]],
+      [null, ["suggestion:s1"]],
+    ]);
+    expect(groups[0]).toMatchObject({ title: "Crpko engineering", health: "amber", paused: true });
+    expect(groups[1]).toMatchObject({ title: null, health: null, paused: false });
+    expect(groupEntriesByMission([], list)).toEqual([]);
   });
 });
 

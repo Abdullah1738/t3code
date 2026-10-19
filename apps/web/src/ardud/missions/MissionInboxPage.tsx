@@ -1,19 +1,36 @@
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { ChevronLeftIcon, ListFilterIcon } from "lucide-react";
 
-import type { InboxTab, MissionId } from "@t3tools/contracts";
+import type { InboxTab, MissionId, MissionListItem, MissionListSnapshot } from "@t3tools/contracts";
 import {
+  ageView,
   defaultInboxTab,
   draftOwnerEdit,
+  entryRow,
   formatRelative,
   INBOX_ROUTE_FILTER_LABEL,
   INBOX_TAB_LABEL,
   INBOX_TABS,
   inboxTabCounts,
+  splitForks,
   staleApprovals,
+  totalNeedsYou,
+  type InboxEntry,
+  type InboxEntryGroup,
   type InboxRouteFilter,
 } from "@t3tools/client-runtime/ardud/missions";
 
-import { Kbd } from "../../components/ui/kbd";
+import { Button } from "../../components/ui/button";
+import {
+  Menu,
+  MenuGroup,
+  MenuGroupLabel,
+  MenuPopup,
+  MenuRadioGroup,
+  MenuRadioItem,
+  MenuSeparator,
+  MenuTrigger,
+} from "../../components/ui/menu";
 import { ScrollArea } from "../../components/ui/scroll-area";
 import { SidebarInset } from "../../components/ui/sidebar";
 import {
@@ -22,11 +39,11 @@ import {
   WorkspaceBreadcrumbSeparator,
   WorkspaceBreadcrumbText,
 } from "../../components/WorkspaceBreadcrumb";
-import { WorkspacePageContainer } from "../../components/WorkspacePageContainer";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { CardList, CardListItem } from "./cards/CardFrame";
+import { AgeElement, CountBadge, HealthGlyph, needsYouLabel } from "./cards/chips";
 import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, InboxEntryCard } from "./InboxCards";
 import { MissionForksList } from "./MissionForksList";
@@ -43,12 +60,19 @@ import {
   useSuggestionStats,
 } from "./missionsStore";
 import { WordDiff } from "./TextDiffView";
-import { inboxActions, useInboxScreen } from "./useInboxScreen";
+import { inboxActions, inboxItemDomId, useInboxScreen } from "./useInboxScreen";
 import { useNowMs } from "./useNowMs";
 
+/** List and reading pane side by side from here; one column below. */
+const TWO_COLUMNS_QUERY = "(min-width: 1100px)";
+
+const ACTION_TABS: ReadonlySet<InboxTab> = new Set(["decide", "approve", "knocks"]);
+
+type InboxScreen = ReturnType<typeof useInboxScreen>;
+
 /**
- * The owner inbox: Decide / Approve / Knocks / Suggestions / FYI for one
- * mission or all of them. Selection, keys and decisions run through
+ * The owner inbox: a list of what waits, grouped by mission, and a reading
+ * pane with the selected card. Selection, keys and decisions run through
  * `useInboxScreen` (client-runtime reducer); this file is layout.
  */
 export function MissionInboxPage(props: {
@@ -62,7 +86,10 @@ export function MissionInboxPage(props: {
   const inbox = useMissionInbox(props.missionId);
   // No tab in the URL: the first tab with something in it.
   const tab = props.tab ?? (inbox ? defaultInboxTab(inbox, props.route) : "decide");
-  const screen = useInboxScreen(props.missionId, tab, props.route);
+  const wide = useMediaQuery(TWO_COLUMNS_QUERY);
+  // Two columns always show a card; one column opens one only when asked.
+  const screen = useInboxScreen(props.missionId, tab, props.route, { autoSelectFirst: wide });
+  const needsYou = mission ? mission.needsYou : totalNeedsYou(list?.missions ?? []);
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -73,126 +100,150 @@ export function MissionInboxPage(props: {
           className="relative bg-background"
         >
           <WorkspaceBreadcrumb ariaLabel="Mission inbox" className="overflow-hidden">
-            {mission ? (
-              <>
-                <WorkspaceBreadcrumbItem>
-                  <Link
-                    to="/missions/$missionId"
-                    params={{ missionId: mission.id }}
-                    className="min-w-0 rounded outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                  >
-                    <WorkspaceBreadcrumbText>{mission.title}</WorkspaceBreadcrumbText>
-                  </Link>
-                </WorkspaceBreadcrumbItem>
-                <WorkspaceBreadcrumbSeparator />
-              </>
-            ) : null}
+            <WorkspaceBreadcrumbItem>
+              {mission ? (
+                <Link
+                  to="/missions/$missionId"
+                  params={{ missionId: mission.id }}
+                  className="min-w-0 rounded outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                >
+                  <WorkspaceBreadcrumbText>{mission.title}</WorkspaceBreadcrumbText>
+                </Link>
+              ) : (
+                <WorkspaceBreadcrumbText>Missions</WorkspaceBreadcrumbText>
+              )}
+            </WorkspaceBreadcrumbItem>
+            <WorkspaceBreadcrumbSeparator />
             <WorkspaceBreadcrumbItem current>
-              <h1 className="truncate">Inbox</h1>
+              <WorkspaceBreadcrumbText>Inbox</WorkspaceBreadcrumbText>
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
         </WorkspacePageHeader>
-        <ScrollArea className="min-h-0 flex-1">
-          <WorkspacePageContainer width="readable" className="min-h-full gap-4">
-            <InboxScopeLinks missionId={props.missionId} tab={props.tab} route={props.route} />
-            <InboxRouteLinks
-              missionId={props.missionId}
-              tab={props.tab}
-              route={props.route}
-              masterCount={inbox ? inbox.masterCounts.approve + inbox.masterCounts.suggestions : 0}
-            />
-            <InboxTabs
-              missionId={props.missionId}
-              tab={tab}
-              route={props.route}
-              counts={inbox ? inboxTabCounts(inbox, props.route) : undefined}
-            />
-            {inbox ? (
-              <InboxTabBody
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-3 px-5 pt-6 sm:px-6">
+          <div className="flex min-h-8 items-center gap-2">
+            <h1 className="text-base/6 font-semibold">Inbox</h1>
+            {needsYou > 0 ? <CountBadge count={needsYou} label={needsYouLabel(needsYou)} /> : null}
+            <div className="ms-auto">
+              <InboxFilterMenu
                 missionId={props.missionId}
-                tab={tab}
+                tab={props.tab}
                 route={props.route}
-                screen={screen}
-                nowMs={nowMs}
+                missions={list?.missions ?? []}
+                masterCount={
+                  inbox ? inbox.masterCounts.approve + inbox.masterCounts.suggestions : 0
+                }
               />
-            ) : (
-              <p className="text-sm text-muted-foreground">Loading…</p>
-            )}
-            <KeyboardHint />
-          </WorkspacePageContainer>
-        </ScrollArea>
+            </div>
+          </div>
+          <InboxTabs
+            missionId={props.missionId}
+            tab={tab}
+            route={props.route}
+            counts={inbox ? inboxTabCounts(inbox, props.route) : undefined}
+          />
+        </div>
+        {inbox ? (
+          <InboxBody
+            missionId={props.missionId}
+            tab={tab}
+            route={props.route}
+            screen={screen}
+            nowMs={nowMs}
+            wide={wide}
+          />
+        ) : (
+          <p className="mx-auto w-full max-w-6xl px-5 pt-5 text-sm text-muted-foreground sm:px-6">
+            Loading…
+          </p>
+        )}
       </div>
     </SidebarInset>
   );
 }
 
-/** One mission or all of them. */
-function InboxScopeLinks(props: {
+const ALL_MISSIONS = "*";
+
+/** Which mission, and whose inbox (the owner's or what is routed to the master). */
+function InboxFilterMenu(props: {
   missionId: MissionId | null;
   tab: InboxTab | null;
   route: InboxRouteFilter;
+  missions: ReadonlyArray<MissionListItem>;
+  masterCount: number;
 }) {
-  const list = useMissionList();
-  if (!list || list.missions.length < 2) return null;
-  const tabSearch = {
-    ...(props.tab ? { tab: props.tab } : {}),
-    ...(props.route === "master" ? { route: "master" as const } : {}),
+  const navigate = useNavigate();
+  const showMissions = props.missions.length > 1 || props.missionId !== null;
+  const showRoute = props.masterCount > 0 || props.route === "master";
+  if (!showMissions && !showRoute) return null;
+  const go = (next: { missionId: MissionId | null; route: InboxRouteFilter }) =>
+    void navigate({
+      to: "/missions/inbox",
+      search: {
+        ...(next.missionId ? { mission: next.missionId } : {}),
+        ...(props.tab ? { tab: props.tab } : {}),
+        ...(next.route === "master" ? { route: "master" as const } : {}),
+      },
+    });
+  const pickMission = (value: unknown) => {
+    if (typeof value !== "string") return;
+    const missionId = value === ALL_MISSIONS ? null : (value as MissionId);
+    if (missionId !== props.missionId) go({ missionId, route: props.route });
   };
-  const linkClass = (active: boolean) =>
-    cn(
-      "rounded px-1.5 py-0.5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-      active ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
-    );
+  const pickRoute = (value: unknown) => {
+    if ((value === "owner" || value === "master") && value !== props.route) {
+      go({ missionId: props.missionId, route: value });
+    }
+  };
   return (
-    <nav aria-label="Missions in the inbox" className="flex flex-wrap gap-1 text-sm">
-      <Link to="/missions/inbox" search={tabSearch} className={linkClass(props.missionId === null)}>
-        All missions
-      </Link>
-      {list.missions.map((mission) => (
-        <Link
-          key={mission.id}
-          to="/missions/inbox"
-          search={{ mission: mission.id, ...tabSearch }}
-          className={linkClass(props.missionId === mission.id)}
-        >
-          {mission.title}
-          {mission.needsYou > 0 ? ` (${mission.needsYou})` : ""}
-        </Link>
-      ))}
-    </nav>
+    <Menu>
+      <MenuTrigger render={<Button variant="ghost-muted" size="sm" />}>
+        <ListFilterIcon aria-hidden />
+        <span className="max-sm:sr-only">
+          {props.route === "master" ? INBOX_ROUTE_FILTER_LABEL.master : "Filter"}
+        </span>
+      </MenuTrigger>
+      <MenuPopup align="end" side="bottom">
+        {showMissions ? (
+          <MenuGroup>
+            <MenuGroupLabel>Mission</MenuGroupLabel>
+            <MenuRadioGroup value={props.missionId ?? ALL_MISSIONS} onValueChange={pickMission}>
+              <MenuRadioItem value={ALL_MISSIONS} closeOnClick>
+                All missions
+              </MenuRadioItem>
+              {props.missions.map((mission) => (
+                <MenuRadioItem key={mission.id} value={mission.id} closeOnClick>
+                  <MenuCountLabel label={mission.title} count={mission.needsYou} />
+                </MenuRadioItem>
+              ))}
+            </MenuRadioGroup>
+          </MenuGroup>
+        ) : null}
+        {showMissions && showRoute ? <MenuSeparator /> : null}
+        {showRoute ? (
+          <MenuGroup>
+            <MenuRadioGroup value={props.route} onValueChange={pickRoute}>
+              <MenuRadioItem value="owner" closeOnClick>
+                {INBOX_ROUTE_FILTER_LABEL.owner}
+              </MenuRadioItem>
+              <MenuRadioItem value="master" closeOnClick>
+                <MenuCountLabel label={INBOX_ROUTE_FILTER_LABEL.master} count={props.masterCount} />
+              </MenuRadioItem>
+            </MenuRadioGroup>
+          </MenuGroup>
+        ) : null}
+      </MenuPopup>
+    </Menu>
   );
 }
 
-/** The owner's inbox (default) or what is routed to the master. Both can be decided here. */
-function InboxRouteLinks(props: {
-  missionId: MissionId | null;
-  tab: InboxTab | null;
-  route: InboxRouteFilter;
-  masterCount: number;
-}) {
-  const base = {
-    ...(props.missionId ? { mission: props.missionId } : {}),
-    ...(props.tab ? { tab: props.tab } : {}),
-  };
-  const linkClass = (active: boolean) =>
-    cn(
-      "rounded px-1.5 py-0.5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-      active ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
-    );
+function MenuCountLabel(props: { label: string; count: number }) {
   return (
-    <nav aria-label="Whose inbox" className="flex flex-wrap gap-1 text-sm">
-      <Link to="/missions/inbox" search={base} className={linkClass(props.route === "owner")}>
-        {INBOX_ROUTE_FILTER_LABEL.owner}
-      </Link>
-      <Link
-        to="/missions/inbox"
-        search={{ ...base, route: "master" }}
-        className={linkClass(props.route === "master")}
-      >
-        {INBOX_ROUTE_FILTER_LABEL.master}
-        {props.masterCount > 0 ? ` (${props.masterCount})` : ""}
-      </Link>
-    </nav>
+    <span className="flex min-w-0 items-center gap-3">
+      <span className="min-w-0 flex-1 truncate">{props.label}</span>
+      {props.count > 0 ? (
+        <span className="text-xs text-muted-foreground tabular-nums">{props.count}</span>
+      ) : null}
+    </span>
   );
 }
 
@@ -203,13 +254,13 @@ function InboxTabs(props: {
   counts: Record<InboxTab, number> | undefined;
 }) {
   return (
-    <nav aria-label="Inbox sections" className="border-b border-border/60">
-      <ul className="-mb-px flex gap-1 overflow-x-auto">
+    <nav aria-label="Inbox sections" className="overflow-x-auto border-b border-border">
+      <ul className="flex min-w-max gap-0.5">
         {INBOX_TABS.map((tab) => {
           const active = tab === props.tab;
           const count = props.counts?.[tab] ?? 0;
           return (
-            <li key={tab} className="shrink-0">
+            <li key={tab}>
               <Link
                 to="/missions/inbox"
                 search={{
@@ -219,14 +270,18 @@ function InboxTabs(props: {
                 }}
                 aria-current={active ? "page" : undefined}
                 className={cn(
-                  "flex h-9 items-center gap-1.5 border-b-2 px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                  "relative flex h-9 items-center gap-1.5 px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
                   active
-                    ? "border-foreground font-medium text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground",
+                    ? "font-medium text-foreground after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-foreground"
+                    : "text-muted-foreground hover:text-foreground",
                 )}
               >
                 {INBOX_TAB_LABEL[tab]}
-                <span className="tabular-nums text-muted-foreground">{count}</span>
+                {count > 0 ? (
+                  <span className="text-xs font-normal text-muted-foreground tabular-nums">
+                    {count}
+                  </span>
+                ) : null}
               </Link>
             </li>
           );
@@ -236,67 +291,217 @@ function InboxTabs(props: {
   );
 }
 
-const EMPTY_LINE: Record<InboxTab, string> = {
-  decide: "No open questions. Lanes the master can't decide for would wait here.",
-  approve: "No drafts or approvals waiting.",
-  knocks: "No knocks.",
-  suggestions: "No open suggestions.",
-  fyi: "Nothing new you need to know.",
-};
-
-function InboxTabBody(props: {
+function InboxBody(props: {
   missionId: MissionId | null;
   tab: InboxTab;
   route: InboxRouteFilter;
-  screen: ReturnType<typeof useInboxScreen>;
+  screen: InboxScreen;
   nowMs: number;
+  wide: boolean;
 }) {
   const { screen, nowMs } = props;
   const masterRoleId = useMasterRoleId(props.missionId);
   const forks = useMissionForks(props.missionId) ?? [];
   const draftNotes = useDraftNotes(props.missionId) ?? [];
   const allStats = useSuggestionStats();
-  const list = useMissionList();
+  const missionList = useMissionList();
   // Sample track records would misstate a live author, so they stay hidden.
   const stats = isSampleFeed("suggestion-stats") ? null : (allStats ?? []);
   const deps = {
     forks,
     draftNotes,
     stats,
-    list,
+    list: missionList,
     masterRoleId,
     nowMs,
     actions: inboxActions(screen.dispatch),
+    size: "pane" as const,
   };
+  const selected = screen.selected;
+  const openForks = splitForks(forks).open.length;
 
+  const listView =
+    screen.entries.length === 0 ? (
+      <p className="text-sm text-muted-foreground">
+        {props.route === "owner" && ACTION_TABS.has(props.tab)
+          ? "Nothing needs you"
+          : "Nothing here"}
+      </p>
+    ) : (
+      <InboxList
+        groups={screen.groups}
+        missionList={missionList}
+        nowMs={nowMs}
+        label={INBOX_TAB_LABEL[props.tab]}
+        selectedKey={selected?.key ?? null}
+        onOpen={(key) => screen.dispatch({ type: "select", key })}
+      />
+    );
+  const card = selected ? (
+    <InboxEntryCard
+      key={selected.key}
+      entry={selected}
+      ui={screen.ui}
+      dispatch={screen.dispatch}
+      deps={deps}
+    />
+  ) : null;
+  const extras = (
+    <InboxExtras missionId={props.missionId} tab={props.tab} nowMs={nowMs} openForks={openForks} />
+  );
+
+  if (props.wide) {
+    return (
+      <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 gap-7 px-5 sm:px-6">
+        {/* Rows bleed 12px left so their text lines up with the heading. */}
+        <div className="-ms-3 flex min-h-0 w-86 shrink-0 flex-col">
+          <ScrollArea className="min-h-0 flex-1">
+            <div className="pt-5 pb-12">{listView}</div>
+          </ScrollArea>
+        </div>
+        <section aria-label="Reading pane" className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <ScrollArea className="min-h-0 flex-1">
+            <div className="flex max-w-160 flex-col gap-8 pt-5 pb-12">
+              {card}
+              {extras}
+            </div>
+          </ScrollArea>
+        </section>
+      </div>
+    );
+  }
   return (
-    <div className="flex flex-col gap-4">
-      {screen.entries.length === 0 ? (
-        <p className="text-sm text-muted-foreground">{EMPTY_LINE[props.tab]}</p>
-      ) : (
-        <CardList label={INBOX_TAB_LABEL[props.tab]}>
-          {screen.entries.map((entry) => (
-            <CardListItem key={entry.key}>
-              <InboxEntryCard entry={entry} ui={screen.ui} dispatch={screen.dispatch} deps={deps} />
-            </CardListItem>
-          ))}
-        </CardList>
-      )}
-      {props.tab === "decide" ? (
-        <MissionSection title="Open discussions">
-          <MissionForksList missionId={props.missionId} nowMs={nowMs} />
-        </MissionSection>
-      ) : null}
-      {props.tab === "approve" ? (
-        <>
-          {props.missionId ? <RoutingPanel missionId={props.missionId} /> : null}
-          <ApproveHistory missionId={props.missionId} nowMs={nowMs} />
-          <MissionSection title="Draft notes" caption="How you want drafts to be.">
-            <DraftNotesPanel missionId={props.missionId} />
-          </MissionSection>
-        </>
-      ) : null}
+    <ScrollArea className="min-h-0 flex-1">
+      <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-5 pt-5 pb-12 sm:px-6">
+        {selected ? (
+          <section aria-label="Reading pane" className="flex max-w-160 flex-col gap-3">
+            <div className="-ms-2">
+              <Button
+                variant="ghost-muted"
+                size="sm"
+                onClick={() => screen.dispatch({ type: "select", key: null })}
+              >
+                <ChevronLeftIcon aria-hidden />
+                Inbox
+              </Button>
+            </div>
+            {card}
+          </section>
+        ) : (
+          <>
+            <div className="-mx-3">{listView}</div>
+            {extras}
+          </>
+        )}
+      </div>
+    </ScrollArea>
+  );
+}
+
+/** One list per mission; the mission header only shows when there are several. */
+function InboxList(props: {
+  groups: ReadonlyArray<InboxEntryGroup>;
+  missionList: MissionListSnapshot | undefined;
+  nowMs: number;
+  label: string;
+  selectedKey: string | null;
+  onOpen: (key: string) => void;
+}) {
+  const headed = props.groups.length > 1;
+  return (
+    <div className="flex flex-col gap-4.5">
+      {props.groups.map((group) => {
+        const title = group.title ?? "Other";
+        return (
+          <div key={group.missionId ?? "none"}>
+            {headed ? (
+              <h2 className="flex h-7 items-center gap-1.5 px-3 text-xs text-muted-foreground">
+                {group.health ? <HealthGlyph health={group.health} paused={group.paused} /> : null}
+                <span className="truncate">{title}</span>
+              </h2>
+            ) : null}
+            <ul aria-label={headed ? title : props.label} className="flex flex-col">
+              {group.entries.map((entry) => (
+                <InboxRow
+                  key={entry.key}
+                  entry={entry}
+                  missionList={props.missionList}
+                  nowMs={props.nowMs}
+                  current={entry.key === props.selectedKey}
+                  onOpen={props.onOpen}
+                />
+              ))}
+            </ul>
+          </div>
+        );
+      })}
     </div>
+  );
+}
+
+function InboxRow(props: {
+  entry: InboxEntry;
+  missionList: MissionListSnapshot | undefined;
+  nowMs: number;
+  current: boolean;
+  onOpen: (key: string) => void;
+}) {
+  const row = entryRow(props.entry, props.missionList);
+  const age = ageView(row.since, props.nowMs);
+  return (
+    <li>
+      <button
+        type="button"
+        id={inboxItemDomId(row.key)}
+        aria-current={props.current || undefined}
+        onClick={() => props.onOpen(row.key)}
+        className={cn(
+          "grid w-full grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-2.5 gap-y-0.5 rounded-lg px-3 py-2.5 text-start text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          props.current ? "bg-foreground/7" : "hover:bg-foreground/4",
+        )}
+      >
+        <span className="truncate font-medium">{row.title}</span>
+        {age ? <AgeElement age={age} at={row.since} prefix="waiting " /> : <span />}
+        <span className="col-span-2 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+          <span className="shrink-0 font-medium">{row.kicker}</span>
+          {row.sub ? (
+            <>
+              <span className="sr-only">Sub-mission</span>
+              <span className="shrink-0 font-medium tabular-nums">{row.sub.rank}</span>
+              <span className="truncate">{row.sub.title}</span>
+            </>
+          ) : row.about ? (
+            <span className="truncate">{row.about}</span>
+          ) : null}
+        </span>
+      </button>
+    </li>
+  );
+}
+
+/** What sits under the list for a tab: open discussions, routing, history, draft notes. */
+function InboxExtras(props: {
+  missionId: MissionId | null;
+  tab: InboxTab;
+  nowMs: number;
+  openForks: number;
+}) {
+  if (props.tab === "decide") {
+    return props.openForks > 0 ? (
+      <MissionSection title="Open discussions">
+        <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
+      </MissionSection>
+    ) : null;
+  }
+  if (props.tab !== "approve") return null;
+  return (
+    <>
+      {props.missionId ? <RoutingPanel missionId={props.missionId} /> : null}
+      <ApproveHistory missionId={props.missionId} nowMs={props.nowMs} />
+      <MissionSection title="Draft notes">
+        <DraftNotesPanel missionId={props.missionId} />
+      </MissionSection>
+    </>
   );
 }
 
@@ -316,9 +521,14 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
     <MissionSection title="Decided today">
       {editedDrafts.map(({ draft, edit }) => (
         <div key={draft.id} className="flex flex-col gap-1">
-          <p className="text-xs text-muted-foreground">
-            Your edit to the draft for {draft.audience} ·{" "}
-            {draft.decidedAt ? formatRelative(draft.decidedAt, props.nowMs) : ""}
+          <p className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="shrink-0 font-medium">Your edit</span>
+            <span className="truncate">To {draft.audience}</span>
+            {draft.decidedAt ? (
+              <time dateTime={draft.decidedAt} className="ms-auto shrink-0 tabular-nums">
+                {formatRelative(draft.decidedAt, props.nowMs)}
+              </time>
+            ) : null}
           </p>
           {edit ? <WordDiff segments={edit.segments} /> : null}
         </div>
@@ -331,14 +541,5 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
         </ul>
       ) : null}
     </MissionSection>
-  );
-}
-
-function KeyboardHint() {
-  return (
-    <p className="hidden text-xs text-muted-foreground sm:block">
-      <Kbd>j</Kbd> <Kbd>k</Kbd> move · <Kbd>1</Kbd>–<Kbd>9</Kbd> pick an option · <Kbd>e</Kbd> edit
-      a draft or knock
-    </p>
   );
 }

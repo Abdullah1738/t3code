@@ -23,18 +23,18 @@ export function MissionForksList(props: { missionId: MissionId | null; nowMs: nu
   const forks = useMissionForks(props.missionId);
   if (!forks) return null;
   const { open } = splitForks(forks);
-  if (open.length === 0) {
-    return <p className="text-sm text-muted-foreground">No open discussions.</p>;
-  }
+  if (open.length === 0) return null;
   return (
     <ul className="flex flex-col gap-2">
       {open.map((entry) => (
         <li key={entry.fork.id} className="flex items-start gap-2 text-sm">
           <div className="min-w-0 flex-1">
             <p className="truncate text-foreground">{forkTitle(entry)}</p>
-            <p className="text-xs text-muted-foreground">
-              {FORK_KIND_LABEL[entry.fork.kind]} · opened{" "}
-              {formatRelative(entry.fork.createdAt, props.nowMs)} · thread not connected yet
+            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span className="font-medium">{FORK_KIND_LABEL[entry.fork.kind]}</span>
+              <time dateTime={entry.fork.createdAt} className="tabular-nums">
+                {formatRelative(entry.fork.createdAt, props.nowMs)}
+              </time>
             </p>
           </div>
           <Button size="xs" variant="ghost" onClick={() => void closeFork(entry.fork.id)}>

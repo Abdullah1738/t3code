@@ -281,6 +281,11 @@ export function HealthStatus(props: { health: MissionHealth; paused?: boolean })
   );
 }
 
+/** "1 needs you" / "3 need you": the spoken form of a needs-you count. */
+export function needsYouLabel(count: number) {
+  return `${count} need${count === 1 ? "s" : ""} you`;
+}
+
 /** Update-tinted count: things waiting on the owner. */
 export function CountBadge(props: { count: number; label: string }) {
   return (

@@ -1,6 +1,7 @@
 import type {
   Approval,
   Draft,
+  MissionHealth,
   MissionId,
   MissionListSnapshot,
   Note,
@@ -14,6 +15,7 @@ import {
   type InboxEntry,
 } from "./inboxViewModel.ts";
 import type { MissionInboxSnapshot } from "./source.ts";
+import { refLabel } from "./viewModel.ts";
 
 // Wording for the card frame: kickers, flags and the sub-mission link. Pure,
 // so the views track can reuse it when a template binds the same fields.
@@ -114,6 +116,92 @@ export function entryHeadline(entry: InboxEntry): EntryHeadline {
     case "note":
       return { kicker: noteKicker(entry.record), title: entry.record.summary, since };
   }
+}
+
+export interface EntryRowView extends EntryHeadline {
+  readonly key: string;
+  /** The sub-mission it belongs to, when the record names one. */
+  readonly sub: CardSubMissionView | null;
+  /** What it is about when there is no sub-mission: a PR, a thread, a record. */
+  readonly about: string | null;
+}
+
+/** One inbox list row: headline plus the sub-mission or subject on its second line. */
+export function entryRow(entry: InboxEntry, list: MissionListSnapshot | undefined): EntryRowView {
+  const headline = { key: entry.key, ...entryHeadline(entry) };
+  switch (entry.kind) {
+    case "ask":
+    case "note": {
+      const sub = cardSubMission(list, entry.record.missionId, entry.record.subMissionId);
+      return { ...headline, sub, about: null };
+    }
+    case "draft":
+      return { ...headline, sub: null, about: blankToNull(entry.record.target.label) };
+    case "approval":
+      return { ...headline, sub: null, about: blankToNull(entry.record.links[0]?.label) };
+    case "knock":
+      return { ...headline, sub: null, about: blankToNull(entry.record.fromTitle) };
+    case "suggestion":
+      return {
+        ...headline,
+        sub: null,
+        about: entry.record.target ? blankToNull(refLabel(entry.record.target)) : null,
+      };
+  }
+}
+
+function blankToNull(value: string | null | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed === "" ? null : trimmed;
+}
+
+export interface InboxEntryGroup {
+  /** Null for items that belong to no mission. */
+  readonly missionId: MissionId | null;
+  readonly title: string | null;
+  readonly health: MissionHealth | null;
+  readonly paused: boolean;
+  readonly entries: readonly InboxEntry[];
+}
+
+/**
+ * Inbox entries grouped by mission, in sidebar order. Missions missing from
+ * the list follow in first-seen order; items without a mission come last.
+ * Entries keep their order inside each group.
+ */
+export function groupEntriesByMission(
+  entries: readonly InboxEntry[],
+  list: MissionListSnapshot | undefined,
+): InboxEntryGroup[] {
+  const byMission = new Map<MissionId | null, InboxEntry[]>();
+  for (const entry of entries) {
+    const missionId = entry.record.missionId;
+    const bucket = byMission.get(missionId);
+    if (bucket) bucket.push(entry);
+    else byMission.set(missionId, [entry]);
+  }
+  const groups: InboxEntryGroup[] = [];
+  for (const mission of list?.missions ?? []) {
+    const bucket = byMission.get(mission.id);
+    if (!bucket) continue;
+    byMission.delete(mission.id);
+    groups.push({
+      missionId: mission.id,
+      title: mission.title,
+      health: mission.health,
+      paused: mission.status === "paused",
+      entries: bucket,
+    });
+  }
+  const unowned = byMission.get(null);
+  byMission.delete(null);
+  for (const [missionId, bucket] of byMission) {
+    groups.push({ missionId, title: null, health: null, paused: false, entries: bucket });
+  }
+  if (unowned) {
+    groups.push({ missionId: null, title: null, health: null, paused: false, entries: unowned });
+  }
+  return groups;
 }
 
 /**
