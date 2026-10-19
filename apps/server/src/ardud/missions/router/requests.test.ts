@@ -947,6 +947,45 @@ describe("discuss", () => {
     }).pipe(Effect.provide(Layer.provideMerge(ownerConditionsOverRouter, h.layer)));
   });
 
+  it.effect("a retraction in his newest message withdraws what came before it", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest(
+        { missionId, text: "Merge it if the tests pass.", subject: ask },
+        ownerApp,
+      );
+      const conditions = yield* OwnerConditions;
+      const verify = (quote: string) =>
+        conditions.verify({ subject: ask, condition: { requestId: request.id, quote } });
+      const say = (text: string) => router.replyRequest({ requestId: request.id, text }, ownerApp);
+      yield* verify("Merge it if the tests pass");
+      // Same message, taken back at its end: nothing in it stands.
+      for (const text of [
+        "Merge it if the tests pass. Scrap that.",
+        "Merge it if the tests pass. Never mind",
+        "Merge it if the tests pass. Actually, no.",
+        "Merge it if the tests pass. I take that back!",
+      ]) {
+        yield* say(text);
+        assert.strictEqual(yield* failureCode(verify("Merge it if the tests pass")), "forbidden");
+      }
+      // A message that only retracts stands for nothing, earlier ones included.
+      yield* say("Merge it if the tests pass.");
+      yield* say("Scrap that.");
+      assert.strictEqual(yield* failureCode(verify("Merge it if the tests pass")), "forbidden");
+      assert.strictEqual(yield* failureCode(verify("Scrap that")), "forbidden");
+      // What follows a retraction stands; what came before it does not.
+      yield* say("Merge it now. On second thought, hold it until Monday. Merge it after that.");
+      assert.strictEqual(yield* failureCode(verify("Merge it now")), "forbidden");
+      yield* verify("Merge it after that");
+      // Not every "never mind" or "forget that" takes something back.
+      yield* say("Never mind the docs. Don't forget that. Merge it if the tests pass.");
+      yield* verify("Merge it if the tests pass");
+    }).pipe(Effect.provide(Layer.provideMerge(ownerConditionsOverRouter, h.layer)));
+  });
+
   it.effect("deciding the record settles its open request without waking anyone", () => {
     const h = harness();
     return Effect.gen(function* () {

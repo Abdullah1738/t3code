@@ -260,6 +260,43 @@ const holdsSentences = (said: ReadonlyArray<string>, quote: ReadonlyArray<string
   return false;
 };
 
+/**
+ * Words where he takes back what he said before them: "Scrap that.",
+ * "Never mind,", "No wait,", "Actually, no.", "On second thought". Most need
+ * a stop after them, so "Never mind the docs" and "Don't forget that." are
+ * not one. A stray match only makes `verify` refuse; it never lets a
+ * withdrawn word stand. "Cancel it" and "scrap it" are left out: they are
+ * usually the decision itself.
+ */
+const RETRACTION = new RegExp(
+  String.raw`(?<!\b(?:don['’]?t|do not|didn['’]?t|won['’]?t) )\b(?:(?:scrap|scratch|strike|cancel|forget|ignore|disregard) (?:that|this|all that|all of that|what i (?:just )?said|my last message)|forget it|never ?mind|nvm|(?:i )?take (?:that|it|this) back|no,? wait|wait,? no|actually,? no)(?=\s*(?:[,.;:!…]|$))|\bon second thought\b`,
+  "giu",
+);
+
+/** Where the last retraction in a sentence ends, or null. */
+const retractionEnd = (sentence: string) => {
+  let end: number | null = null;
+  for (const match of sentence.matchAll(RETRACTION)) end = match.index + match[0].length;
+  return end;
+};
+
+/**
+ * The sentences of one message that still stand: none before its last
+ * retraction. The sentence holding it stands whole ("Rebase it... no wait,
+ * leave it") only when words follow it; a message that ends by taking things
+ * back stands for nothing.
+ */
+export const standingSentences = (sentences: ReadonlyArray<string>) => {
+  for (let at = sentences.length - 1; at >= 0; at -= 1) {
+    const sentence = sentences[at] ?? "";
+    const end = retractionEnd(sentence);
+    if (end === null) continue;
+    const rest = sentence.slice(end).replace(/[\s,.;:!…-]+/gu, "");
+    return sentences.slice(rest.length > 0 ? at : at + 1);
+  }
+  return sentences;
+};
+
 /** The owner's own words: his app, or his own iMessage chat (not Moni's). */
 const ownWords = (message: MissionMessage) =>
   message.author._tag === "owner" &&
@@ -1105,8 +1142,9 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
 
     /**
      * Whether `quote` is in the owner's newest message of his own in the
-     * request since it last reopened. A later message of his replaces what he
-     * said before, so a withdrawn condition never stands.
+     * request since it last reopened, after any retraction in it. A later
+     * message of his replaces what he said before, so a withdrawn condition
+     * never stands, and a message that only takes things back stands for nothing.
      */
     const ownerSaid = (request: OwnerRequest, quote: string): Effect.Effect<boolean> =>
       Effect.gen(function* () {
@@ -1123,7 +1161,9 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             if (message.seq <= after) return false;
             if (!ownWords(message)) continue;
             const body = message.hasBody ? yield* rooms.messageBody(message.id) : null;
-            return holdsSentences(sentencesOf(body ?? message.summary), wanted);
+            // His newest message replaces everything before it; within it, a
+            // "scrap that" withdraws what came before, so only what follows stands.
+            return holdsSentences(standingSentences(sentencesOf(body ?? message.summary)), wanted);
           }
           const oldest: MissionMessage | undefined = page.messages[0];
           if (!page.hasOlder || oldest === undefined) return false;
