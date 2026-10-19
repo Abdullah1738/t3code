@@ -206,7 +206,6 @@ export const DRAFT_CHANNEL_LABEL: Readonly<Record<DraftChannel, string>> = {
 };
 
 const DRAFT_SOURCE_LABEL: Readonly<Record<Draft["source"]["kind"], string>> = {
-  fork: "written by a fork",
   lane: "written by a lane",
   master: "written by the master",
   editor: "written by the editor",

@@ -154,9 +154,7 @@ export const makeReads = (
     const knocks = groupByMission(yield* store.list("knock", { ...wide, status: ["pending"] }));
     const milestones = groupByMission(yield* store.list("milestone", wide));
     // ardud missions: router (master words the owner has not opened yet, in any status)
-    const answered = groupByMission(
-      (yield* store.listAll("owner-request")).filter((request) => request.unreadForOwner),
-    );
+    const answered = yield* store.ownerRequestsUnread(null);
 
     const items = yield* Effect.forEach(
       missions.toSorted(
@@ -191,7 +189,7 @@ export const makeReads = (
             subMissionHealth: entry.subMissions,
           });
           // ardud missions: router
-          return { ...item, requestsAnswered: answered.get(mission.id)?.length ?? 0 };
+          return { ...item, requestsAnswered: answered.get(mission.id) ?? 0 };
         }),
     );
     return { revision: yield* store.revision, missions: items };
@@ -229,8 +227,8 @@ export const makeReads = (
       const recovery = currentRecovery();
       const recoveryState = recovery === null ? null : yield* recovery.state(missionId);
       // ardud missions: router
-      // Uncapped, any status: a progress note or a settle note is unread news too.
-      const answered = yield* store.listAllInMission("owner-request", missionId);
+      // Any status: a progress note or a settle note is unread news too.
+      const answered = yield* store.ownerRequestsUnread(missionId);
       return {
         mission: { ...mission.value, health: entry.mission },
         subMissions:
@@ -256,7 +254,7 @@ export const makeReads = (
         // ardud missions: recovery
         recovery: recoveryState,
         // ardud missions: router
-        requestsAnswered: answered.filter((request) => request.unreadForOwner).length,
+        requestsAnswered: answered.get(missionId) ?? 0,
       };
     });
 

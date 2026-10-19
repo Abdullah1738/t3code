@@ -128,7 +128,6 @@ const HOLDABLE_KINDS: ReadonlySet<MissionRecordRef["kind"]> = new Set([
   "sub-mission",
   "milestone",
   "draft",
-  "fork",
   "thread",
   "approval",
   "rule-change-request",

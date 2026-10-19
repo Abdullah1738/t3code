@@ -502,14 +502,11 @@ describe("rpc missions source", () => {
   });
 
   it("maps owner actions onto the server's RPCs", async () => {
-    const fork = { id: "fork-1", missionId: CRPKO, question: null };
     const { transport, asked } = fakeTransport({
       [WS_METHODS.missionsSetStatus]: () => ({ seq: 1 }),
       [WS_METHODS.missionsUpsertLane]: () => ({ seq: 1 }),
       [WS_METHODS.missionsUpsertSubMission]: () => ({ seq: 1 }),
       [WS_METHODS.missionsReactToCall]: () => ({ id: "call-1", missionId: CRPKO }),
-      [WS_METHODS.missionsStartFork]: () => fork,
-      [WS_METHODS.missionsUpdateFork]: () => fork,
       [ASKS.routeDraft]: () => ({}),
       [WS_METHODS.missionsRouteApproval]: () => ({ seq: 1 }),
     });
@@ -534,25 +531,9 @@ describe("rpc missions source", () => {
     ]);
 
     await source.reactToCall({ callId: "call-1" as never, reaction: "ok" });
-    expect(asked(WS_METHODS.missionsStartFork)).toHaveLength(0);
-    // Discuss is an owner request about the call now, never a fork.
+    // Discuss is an owner request about the call, never a fork.
     await source.reactToCall({ callId: "call-1" as never, reaction: "discuss" });
     expect(asked(WS_METHODS.missionsReactToCall)).toHaveLength(2);
-    expect(asked(WS_METHODS.missionsStartFork)).toHaveLength(0);
-
-    const opened = await source.openFork({
-      missionId: CRPKO,
-      kind: "owner-question",
-      origin: null,
-      question: "  Why the rebase?  ",
-    });
-    expect(asked(WS_METHODS.missionsStartFork).at(-1)?.input).toEqual({
-      missionId: CRPKO,
-      kind: "owner-question",
-      origin: null,
-      question: "Why the rebase?",
-    });
-    expect(opened.question).toBe("Why the rebase?");
 
     await source.rerouteRecord({
       kind: "draft",
@@ -667,7 +648,7 @@ describe("rpc missions source", () => {
     expect(gone.seen).toEqual([null]);
   });
 
-  it("keeps master counts at zero and has no all-missions fork list", () => {
+  it("keeps master counts at zero", () => {
     const { transport, live } = fakeTransport();
     const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
     const inbox = collect<{ readonly masterCounts: unknown }>((listener) =>
@@ -684,12 +665,6 @@ describe("rpc missions source", () => {
       fyi: [],
     });
     expect(inbox.last()?.masterCounts).toEqual({ approve: 0, suggestions: 0 });
-
-    const forks = collect<ReadonlyArray<unknown>>((listener) =>
-      source.subscribeForks(null, listener),
-    );
-    expect(forks.seen).toEqual([[]]);
-    expect(live(ASKS.subscribeForks)).toHaveLength(0);
   });
 });
 

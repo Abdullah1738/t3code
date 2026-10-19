@@ -64,6 +64,19 @@ describe("mission watch kinds for his iMessage agent", () => {
     expect(watchMatches(events, ["work-item-done"], "wi-2")).toEqual([]);
   });
 
+  it("wakes a writer on its draft's decision, not on a reopen", () => {
+    const draft = { kind: "draft" as const, id: "d-1" };
+    const drafts = [
+      event(7, "draft.opened", { subject: draft }),
+      event(8, "draft.decided", { subject: draft, payload: { action: "approve" } }),
+      event(9, "draft.decided", { subject: draft, payload: { action: "reopen" } }),
+      event(10, "draft.decided", { subject: draft, payload: { action: "withdraw" } }),
+      event(11, "draft.decided", { subject: { kind: "draft", id: "d-2" }, payload: {} }),
+    ] as ReadonlyArray<MissionEvent>;
+    expect(seqs(watchMatches(drafts, ["draft-decided"], "d-1"))).toEqual([8, 10]);
+    expect(seqs(watchMatches(drafts, ["draft-decided"]))).toEqual([8, 10, 11]);
+  });
+
   it("puts the record id into the watcher it installs", () => {
     const input = { cli: "mission", missionId: "m-1", kinds: ["request-replied"] as const };
     expect(watchCheckCommand({ ...input, id: "req-1" })).toBe(

@@ -9,7 +9,6 @@ import {
   Lane,
   Milestone,
   Mission,
-  MissionFork,
   type MissionInboxHistory,
   type MissionListItem,
   type MissionListSnapshot,
@@ -36,7 +35,6 @@ import { routeApproval, routeDraft, routeMatchKey } from "../routingViewModel.ts
 import type {
   ApprovalRoutingTable,
   Listener,
-  MissionForkEntry,
   MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionPoolUsage,
@@ -77,10 +75,6 @@ const decodeHeld = Schema.decodeUnknownSync(Schema.Array(HeldItemFixture));
 const decodeDraftNotes = Schema.decodeUnknownSync(Schema.Array(DraftNote));
 const decodeDraftNote = Schema.decodeUnknownSync(DraftNote);
 const decodeStats = Schema.decodeUnknownSync(Schema.Array(SuggestionStats));
-const decodeForks = Schema.decodeUnknownSync(
-  Schema.Array(Schema.Struct({ fork: MissionFork, question: Schema.NullOr(Schema.String) })),
-);
-const decodeFork = Schema.decodeUnknownSync(MissionFork);
 const decodeMessages = Schema.decodeUnknownSync(Schema.Array(MissionMessage));
 const decodeMessage = Schema.decodeUnknownSync(MissionMessage);
 const decodeSubscriptions = Schema.decodeUnknownSync(Schema.Array(Subscription));
@@ -128,14 +122,6 @@ function contentKey(value: unknown): string {
   return JSON.stringify(value, (key, entry: unknown) => (key === "revision" ? undefined : entry));
 }
 
-/** Identity of a fork origin: the record it is about, ignoring display labels. */
-function originKey(origin: MissionFork["origin"]): string | null {
-  if (origin === null) return null;
-  return "id" in origin
-    ? `${origin.kind}:${origin.id}`
-    : `${origin.kind}:${origin.ref ?? origin.url ?? origin.label}`;
-}
-
 /**
  * In-memory `MissionsSource` seeded with the real Crpko snapshot in `data.ts`.
  * Owner actions update the fixture state and every open subscription sees the
@@ -164,7 +150,6 @@ export function createFixtureMissionsSource(
   const calls: Call[] = [...decodeCalls(data.calls)];
   const draftNotes: DraftNote[] = [...decodeDraftNotes(data.draftNotes)];
   const stats: SuggestionStats[] = [...decodeStats(data.suggestionStats)];
-  const forks: MissionForkEntry[] = [...decodeForks(data.forks)];
   const rules: Rule[] = [...decodeRules(ops.rules)];
   const poolUsage = new Map<string, ReadonlyArray<MissionPoolUsage>>(
     Object.entries(data.poolUsage),
@@ -551,21 +536,6 @@ export function createFixtureMissionsSource(
     return memo("suggestion-stats", () => [...stats]);
   }
 
-  function missionForks(missionId: string | null): ReadonlyArray<MissionForkEntry> {
-    return memo(`forks:${missionId ?? "*"}`, () =>
-      forks
-        .map((entry, index) => ({ entry, index }))
-        .filter(({ entry }) => missionId === null || entry.fork.missionId === missionId)
-        // Later-opened first when two forks share a timestamp.
-        .sort(
-          (left, right) =>
-            right.entry.fork.createdAt.localeCompare(left.entry.fork.createdAt) ||
-            right.index - left.index,
-        )
-        .map(({ entry }) => entry),
-    );
-  }
-
   function missionRules(missionId: string): ReadonlyArray<Rule> {
     return memo(`rules:${missionId}`, () =>
       rules.filter((r) => r.missionId === null || r.missionId === missionId),
@@ -639,41 +609,6 @@ export function createFixtureMissionsSource(
     return message;
   }
 
-  function openForkRecord(input: {
-    missionId: string;
-    kind: MissionFork["kind"];
-    origin: MissionFork["origin"];
-    question: string | null;
-  }): MissionForkEntry {
-    const key = originKey(input.origin);
-    const existing = forks.find(
-      (entry) =>
-        entry.fork.status === "open" &&
-        entry.fork.missionId === input.missionId &&
-        key !== null &&
-        originKey(entry.fork.origin) === key,
-    );
-    if (existing) return existing;
-    const masterRoleId = findMission(input.missionId)?.masterRoleId ?? "master";
-    const fork = decodeFork({
-      id: localId("fork"),
-      missionId: input.missionId,
-      kind: input.kind,
-      // Placeholder thread ids until the asks track opens real forks.
-      masterThreadId: `fixture-thread-${masterRoleId}`,
-      forkThreadId: localId("fixture-thread-fork"),
-      origin: input.origin,
-      status: "open",
-      summaryLine: null,
-      commitsMission: false,
-      createdAt: nowIso(),
-      closedAt: null,
-    });
-    const entry = { fork, question: input.question };
-    forks.push(entry);
-    return entry;
-  }
-
   function routingTable(missionId: string): ApprovalRoutingTable | null {
     return memo(`routing:${missionId}`, () => {
       const table = routingTables.find((t) => t.missionId === missionId);
@@ -745,7 +680,6 @@ export function createFixtureMissionsSource(
     subscribeDraftNotes: (missionId, listener) =>
       watch(() => missionDraftNotes(missionId), listener),
     subscribeSuggestionStats: (listener) => watch(suggestionStats, listener),
-    subscribeForks: (missionId, listener) => watch(() => missionForks(missionId), listener),
     subscribeRules: (missionId, listener) => watch(() => missionRules(missionId), listener),
     subscribeRooms: (missionId, listener) => watch(() => missionRooms(missionId), listener),
     subscribeRoom: (roomId, listener) => watch(() => roomPage(roomId), listener),
@@ -867,32 +801,6 @@ export function createFixtureMissionsSource(
             : `${subMission.title} planned at ${Math.round(share * 100)}%`,
         payload: { changed: ["intendedEffort"], intendedEffort: share },
       });
-      commit();
-      return Promise.resolve();
-    },
-
-    openFork({ missionId, kind, origin, question }) {
-      if (!findMission(missionId)) return fail("not-found", `Mission ${missionId} not found.`);
-      const text = question?.trim() ?? "";
-      if (kind === "owner-question" && text === "") {
-        return fail("invalid", "Write the question you want to ask.");
-      }
-      const entry = openForkRecord({
-        missionId,
-        kind,
-        origin,
-        question: text === "" ? null : text,
-      });
-      commit();
-      return Promise.resolve(entry);
-    },
-
-    archiveFork({ forkId }) {
-      const index = forks.findIndex((entry) => entry.fork.id === forkId);
-      const entry = forks[index];
-      if (!entry) return fail("not-found", `Fork ${forkId} not found.`);
-      if (entry.fork.status === "archived") return Promise.resolve();
-      forks[index] = { ...entry, fork: { ...entry.fork, status: "archived", closedAt: nowIso() } };
       commit();
       return Promise.resolve();
     },

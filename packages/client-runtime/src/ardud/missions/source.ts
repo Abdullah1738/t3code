@@ -9,7 +9,6 @@ import type {
   DecideSuggestionInput,
   DraftNote,
   DraftNoteScope,
-  ForkId,
   Lane,
   LaneId,
   MarkMissionSeenInput,
@@ -19,7 +18,6 @@ import type {
   MissionEvent,
   MissionEventId,
   MissionEventKind,
-  MissionFork,
   MissionId,
   MissionInbox,
   MissionInboxHistory,
@@ -374,32 +372,6 @@ export interface SetIntendedEffortInput {
   readonly share: number | null;
 }
 
-/**
- * Opens a fork of the master: a Discuss on a call or ask, or an owner
- * side question ("Ask the mission"). `question` is the owner's opening line.
- * Opening a second fork on the same record returns the open one.
- */
-export interface OpenForkInput {
-  readonly missionId: MissionId;
-  readonly kind: MissionFork["kind"];
-  readonly origin: MissionRecordRef | MissionLink | null;
-  readonly question?: string;
-}
-
-/**
- * A fork plus the owner's opening line, which the contract record does not
- * keep. `question` is `null` for a one-tap Discuss with nothing typed yet.
- */
-export interface MissionForkEntry {
-  readonly fork: MissionFork;
-  readonly question: string | null;
-}
-
-/** Owner closes a fork without waiting for its answer. */
-export interface ArchiveForkInput {
-  readonly forkId: ForkId;
-}
-
 export interface AddDraftNoteInput {
   /** `null` applies to drafts in every mission. */
   readonly missionId: MissionId | null;
@@ -432,7 +404,7 @@ export interface OwnerRequest {
   readonly messages: ReadonlyArray<OwnerRequestMessage>;
   /** Older messages exist before `messages`. */
   readonly hasOlder: boolean;
-  /** Records the master made or touched for it: work items, asks, forks, rules. */
+  /** Records the master made or touched for it: work items, asks, rules. */
   readonly links: ReadonlyArray<MissionRecordRef>;
   /** The record a Discuss opened it about. */
   readonly subject: MissionRecordRef | null;
@@ -568,11 +540,6 @@ export interface MissionsSource {
   ): Unsubscribe;
   /** Acceptance record per suggestion author and target kind. */
   subscribeSuggestionStats(listener: Listener<ReadonlyArray<SuggestionStats>>): Unsubscribe;
-  /** Forks of the master, newest first. `null` reads every mission. */
-  subscribeForks(
-    missionId: MissionId | null,
-    listener: Listener<ReadonlyArray<MissionForkEntry>>,
-  ): Unsubscribe;
   /** Mission rules, active and retired (global rules included). */
   subscribeRules(missionId: MissionId, listener: Listener<ReadonlyArray<Rule>>): Unsubscribe;
   subscribeRooms(
@@ -596,8 +563,6 @@ export interface MissionsSource {
   reactToCall(input: ReactToCallInput): Promise<void>;
   /** Moves the "since you last looked" mark to now. */
   markMissionSeen(input: MarkMissionSeenInput): Promise<void>;
-  openFork(input: OpenForkInput): Promise<MissionForkEntry>;
-  archiveFork(input: ArchiveForkInput): Promise<void>;
 
   answerAsk(input: AnswerAskInput): Promise<void>;
   decideDraft(input: DecideDraftInput): Promise<void>;

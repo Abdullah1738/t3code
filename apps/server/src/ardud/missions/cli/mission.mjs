@@ -43,10 +43,10 @@ const HELP = `mission <command> [options]
   watch MISSION --on KINDS [--id ID] [--interval SECONDS]   prints the robob-watch command
   watch-check MISSION --on KINDS [--id ID] --cursor FILE    one tick: prints new matches only
 
-Watch kinds: ask-opened, ask-answered, draft-opened, suggestion-opened,
-fork-closed, milestone-at-risk, lane-stalled, swarm-paused, request-replied,
-request-answered, approval-opened, work-item-done. --id narrows a watch to one
-record (a request, approval or work item).
+Watch kinds: ask-opened, ask-answered, draft-opened, draft-decided,
+suggestion-opened, milestone-at-risk, lane-stalled, swarm-paused,
+request-replied, request-answered, approval-opened, work-item-done. --id narrows
+a watch to one record (a request, approval, work item or draft).
 
 Actions for the owner need --via imessage --inbound ID: the id of the iMessage
 in which he told you to. The server checks it is a message he (or Moni) typed

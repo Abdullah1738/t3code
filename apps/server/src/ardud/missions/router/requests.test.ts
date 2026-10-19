@@ -4,6 +4,7 @@ import {
   ThreadId,
   type MissionLink,
   type MissionProvenance,
+  type OwnerRequestsInput,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -465,7 +466,7 @@ describe("owner requests", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
-  it.effect("one iMessage writes once: one request, one mission", () => {
+  it.effect("one iMessage writes to each request once, and to several requests", () => {
     const h = harness();
     return Effect.gen(function* () {
       yield* seed;
@@ -476,24 +477,80 @@ describe("owner requests", () => {
       assert.strictEqual(retried.id, opened.id);
       assert.strictEqual(wakesFor(h.sent, masterThread).length, 1);
       const other = yield* router.openRequest({ missionId, text: "Docs?" }, ownerApp);
+      const third = yield* router.openRequest({ missionId, text: "Tests?" }, ownerApp);
       yield* router.settled(masterThread);
 
+      // "Go ahead on both": the same message answers two requests, once each.
+      const both = "Go ahead on both.";
+      yield* router.replyRequest({ requestId: other.id, text: both }, ownerIMessage);
+      yield* router.replyRequest({ requestId: third.id, text: both }, ownerIMessage);
+      yield* router.replyRequest({ requestId: other.id, text: both }, ownerIMessage);
+      // It may open a request in another mission too.
+      const elsewhere = yield* router.openRequest(
+        { missionId: otherMissionId, text: "Status?" },
+        ownerIMessage,
+      );
+      assert.notStrictEqual(elsewhere.id, opened.id);
+
       const refusals = [
-        // The same message cannot open a request in another mission...
-        router.openRequest({ missionId: otherMissionId, text: "Status?" }, ownerIMessage),
-        // ...or a second request here...
+        // Not a second request here...
         router.openRequest({ missionId, text: "Something else" }, ownerIMessage),
-        // ...or be posted as the owner's reply on another request.
-        router.replyRequest({ requestId: other.id, text: "Status?" }, ownerIMessage),
-        router.settleRequest({ requestId: other.id, note: "Status?" }, ownerIMessage),
+        // ...nor other words, or a settle, where it already wrote.
+        router.replyRequest({ requestId: other.id, text: "Something else" }, ownerIMessage),
+        router.settleRequest({ requestId: third.id, note: both }, ownerIMessage),
+        router.replyRequest({ requestId: opened.id, text: "Something else" }, ownerIMessage),
       ];
       for (const refused of refusals) {
         assert.strictEqual(yield* failureCode(refused), "conflict");
       }
-      assert.strictEqual(wakesFor(h.sent, masterThread).length, 2);
       assert.deepStrictEqual(
         (yield* requestEvents).map((event) => event.kind),
-        ["request.opened", "request.opened"],
+        [
+          "request.opened",
+          "request.opened",
+          "request.opened",
+          "request.replied",
+          "request.replied",
+        ],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("one iMessage can discuss two records, once each", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const free = { kind: "work-item", id: "wi-free" } as const;
+      const held = { kind: "work-item", id: "wi-held" } as const;
+      // One record already has an open discussion; the message adds to it.
+      const ongoing = yield* router.openRequest(
+        { missionId, text: "Is this blocked?", subject: held },
+        ownerApp,
+      );
+      const text = "Hold both until Monday.";
+      const onFree = yield* router.openRequest({ missionId, text, subject: free }, ownerIMessage);
+      const onHeld = yield* router.openRequest({ missionId, text, subject: held }, ownerIMessage);
+      assert.notStrictEqual(onFree.id, onHeld.id);
+      assert.strictEqual(onHeld.id, ongoing.id);
+      // Retries land on what each already wrote.
+      assert.strictEqual(
+        (yield* router.openRequest({ missionId, text, subject: held }, ownerIMessage)).id,
+        ongoing.id,
+      );
+      assert.strictEqual(
+        (yield* router.openRequest({ missionId, text, subject: free }, ownerIMessage)).id,
+        onFree.id,
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.openRequest({ missionId, text: "Other words.", subject: free }, ownerIMessage),
+        ),
+        "conflict",
+      );
+      assert.deepStrictEqual(
+        (yield* requestEvents).map((event) => event.kind),
+        ["request.opened", "request.opened", "request.replied"],
       );
     }).pipe(Effect.provide(h.layer));
   });
@@ -782,6 +839,60 @@ describe("owner requests, router round 5", () => {
 describe("discuss", () => {
   const ask = { kind: "work-item", id: "wi-free" } as const;
 
+  it.effect("a discussion counts on its record, never in his requests", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const reads = makeReads(store, () => null);
+      const views = yield* ViewStore.ViewStore;
+      const counts = Effect.gen(function* () {
+        const overview = (yield* reads.overview(missionId)).requestsAnswered;
+        const listed = (yield* reads.listSnapshot).missions.find((each) => each.id === missionId);
+        return [overview, listed?.requestsAnswered, yield* views.requestsAnswered(missionId)];
+      });
+      const plain = yield* router.openRequest({ missionId, text: "Status on CI?" }, ownerApp);
+      const talk = yield* router.openRequest(
+        { missionId, text: "Why is this item still free?", subject: ask },
+        ownerApp,
+      );
+      // The room names the record, not his words.
+      const page = yield* router.roomPage({ roomId: talk.roomId }, ownerApp);
+      assert.strictEqual(page.room.title, "Discussion: Item wi-free");
+      yield* masterReads(plain.roomId);
+      yield* masterReads(talk.roomId);
+      yield* router.replyRequest({ requestId: plain.id, text: "Green." }, master);
+      yield* router.replyRequest(
+        { requestId: talk.id, text: "Nobody took it.", status: "waiting-on-master" },
+        master,
+      );
+      yield* router.replyRequest({ requestId: talk.id, text: "Lane 2 has it now." }, master);
+      // Only the request about no record counts toward his requests.
+      assert.deepStrictEqual(yield* counts, [1, 1, 1]);
+      const ids = (input: Omit<OwnerRequestsInput, "missionId">) =>
+        Effect.map(router.ownerRequests({ missionId, ...input }, ownerApp), (listed) =>
+          listed.requests.map((view) => view.request.id),
+        );
+      assert.deepStrictEqual(yield* ids({ discussions: false }), [plain.id]);
+      assert.deepStrictEqual(yield* ids({ discussions: true }), [talk.id]);
+      assert.deepStrictEqual(yield* ids({ subject: ask }), [talk.id]);
+      assert.deepStrictEqual(yield* ids({ subject: { kind: "work-item", id: "wi-held" } }), []);
+      assert.strictEqual((yield* ids({ unread: true })).length, 2);
+      assert.strictEqual((yield* ids({})).length, 2);
+      // The counter on the record's discussion symbol: both unread replies.
+      const about = yield* router.ownerRequests({ missionId, subject: ask }, ownerApp);
+      assert.strictEqual(about.requests[0]?.unreadMessages, 2);
+      // Reading it clears the counter and leaves his requests' count alone.
+      const read = yield* router.roomPage({ roomId: talk.roomId }, ownerApp);
+      yield* router.markRead({ roomId: talk.roomId, seq: read.room.lastSeq }, ownerApp);
+      const after = yield* router.ownerRequests({ missionId, subject: ask }, ownerApp);
+      assert.strictEqual(after.requests[0]?.unreadMessages, 0);
+      assert.deepStrictEqual(yield* ids({ unread: true }), [plain.id]);
+      assert.deepStrictEqual(yield* counts, [1, 1, 1]);
+    }).pipe(Effect.provide(Layer.provideMerge(ViewStore.layer, h.layer)));
+  });
+
   it.effect("one open request per record; the master reads the record and the whole talk", () => {
     const h = harness();
     return Effect.gen(function* () {
@@ -944,6 +1055,45 @@ describe("discuss", () => {
         ),
         "forbidden",
       );
+    }).pipe(Effect.provide(Layer.provideMerge(ownerConditionsOverRouter, h.layer)));
+  });
+
+  it.effect("a retraction in his newest message withdraws what came before it", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest(
+        { missionId, text: "Merge it if the tests pass.", subject: ask },
+        ownerApp,
+      );
+      const conditions = yield* OwnerConditions;
+      const verify = (quote: string) =>
+        conditions.verify({ subject: ask, condition: { requestId: request.id, quote } });
+      const say = (text: string) => router.replyRequest({ requestId: request.id, text }, ownerApp);
+      yield* verify("Merge it if the tests pass");
+      // Same message, taken back at its end: nothing in it stands.
+      for (const text of [
+        "Merge it if the tests pass. Scrap that.",
+        "Merge it if the tests pass. Never mind",
+        "Merge it if the tests pass. Actually, no.",
+        "Merge it if the tests pass. I take that back!",
+      ]) {
+        yield* say(text);
+        assert.strictEqual(yield* failureCode(verify("Merge it if the tests pass")), "forbidden");
+      }
+      // A message that only retracts stands for nothing, earlier ones included.
+      yield* say("Merge it if the tests pass.");
+      yield* say("Scrap that.");
+      assert.strictEqual(yield* failureCode(verify("Merge it if the tests pass")), "forbidden");
+      assert.strictEqual(yield* failureCode(verify("Scrap that")), "forbidden");
+      // What follows a retraction stands; what came before it does not.
+      yield* say("Merge it now. On second thought, hold it until Monday. Merge it after that.");
+      assert.strictEqual(yield* failureCode(verify("Merge it now")), "forbidden");
+      yield* verify("Merge it after that");
+      // Not every "never mind" or "forget that" takes something back.
+      yield* say("Never mind the docs. Don't forget that. Merge it if the tests pass.");
+      yield* verify("Merge it if the tests pass");
     }).pipe(Effect.provide(Layer.provideMerge(ownerConditionsOverRouter, h.layer)));
   });
 

@@ -306,6 +306,7 @@ const make = Effect.gen(function* () {
       SELECT COUNT(*) AS n FROM ardud_mission_records
       WHERE kind = 'owner-request' AND mission_id = ${missionId}
         AND json_extract(record_json, '$.record.unreadForOwner') = 1
+        AND json_extract(record_json, '$.record.subject') IS NULL -- ardud missions: router
     `.pipe(Effect.map(count), Effect.orDie);
 
   return ViewStore.of({

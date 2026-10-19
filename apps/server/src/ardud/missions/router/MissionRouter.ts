@@ -56,6 +56,7 @@ import * as MissionStore from "../store/MissionStore.ts";
 import {
   actorsOfThread,
   broadcastAudience,
+  heldBy,
   itemWatchers,
   labelOf,
   masterRoleOf,
@@ -322,7 +323,8 @@ export class MissionRouter extends Context.Service<
      * A mission member gets it as a control-room request addressed to it,
      * posted as the producer, and its doorbell rings when it is free. Any
      * other thread gets the text queued directly. `key` makes retries land
-     * once on either path. A gone thread fails `not-found`.
+     * once: a retry takes the first attempt's path, whatever the thread's
+     * membership is by then. A gone thread fails `not-found`.
      */
     readonly notify: (notice: SystemNotice) => Effect.Effect<SystemNoticeOutcome, MissionError>;
     /**
@@ -417,7 +419,7 @@ const make = Effect.gen(function* () {
 
   /**
    * Every live mission that could count the thread as a member: missions
-   * whose records name it (role bindings, lanes, forks) and missions holding
+   * whose records name it (role bindings, lanes) and missions holding
    * an explicit member row for it. Both lookups are complete indexed reads
    * keyed by the thread, never a capped list of missions. A record naming a
    * mission that is not there fails the lookup: the thread may well belong to
@@ -974,6 +976,16 @@ const make = Effect.gen(function* () {
       );
       const readSeqOf = (actor: MissionActor) => readSeq.get(actorKey(actor)) ?? 0;
       const cast = yield* loadCast(room.missionId);
+      const receiptsTo = new Map(
+        page.messages.map((message) => [
+          message.id,
+          message.kind === "control" ? receiptRecipients(message, subscriptions) : [],
+        ]),
+      );
+      const { names, members } = yield* whoIsIn(cast, room.id, subscriptions, [
+        ...page.messages.flatMap((message) => [message.author, ...message.to]),
+        ...[...receiptsTo.values()].flat(),
+      ]);
       const messages = page.messages.map((message) =>
         message.kind !== "control"
           ? message
@@ -981,9 +993,9 @@ const make = Effect.gen(function* () {
               ...message,
               receipt: receiptFor(
                 message.seq,
-                receiptRecipients(message, subscriptions).map((actor) => ({
+                (receiptsTo.get(message.id) ?? []).map((actor) => ({
                   actor,
-                  label: labelOf(cast, actor),
+                  label: names[actorKey(actor)] ?? labelOf(cast, actor),
                 })),
                 readSeqOf,
               ),
@@ -1003,7 +1015,50 @@ const make = Effect.gen(function* () {
         subscriptions,
         ownerReadSeq: readSeqOf({ _tag: "owner" }),
         hasOlder: page.hasOlder,
+        names,
+        members,
       } satisfies RoomPage;
+    });
+
+  /**
+   * A room's members (subscribers, writers and addressees, a thread folded
+   * into the lane or role it holds) and a name for every actor on the page.
+   * A thread holding nothing goes by its title; nobody goes by a raw id.
+   */
+  const whoIsIn = (
+    cast: RouterCast,
+    roomId: RoomId,
+    subscriptions: ReadonlyArray<Subscription>,
+    onPage: ReadonlyArray<MissionActor>,
+  ) =>
+    Effect.gen(function* () {
+      const fold = (actor: MissionActor) =>
+        actor._tag === "thread" ? (heldBy(cast, actor.threadId) ?? actor) : actor;
+      const members = new Map<string, MissionActor>();
+      for (const actor of [
+        ...subscriptions.map((subscription) => subscription.subscriber),
+        ...(yield* rooms.roomActors(roomId)),
+      ]) {
+        if (actor._tag === "owner" || actor._tag === "system") continue;
+        members.set(actorKey(fold(actor)), fold(actor));
+      }
+      const names: Record<string, string> = {};
+      for (const actor of [
+        ...members.values(),
+        ...subscriptions.map((subscription) => subscription.subscriber),
+        ...onPage,
+      ]) {
+        const key = actorKey(actor);
+        if (actor._tag === "owner" || names[key] !== undefined) continue;
+        names[key] =
+          actor._tag === "thread" && heldBy(cast, actor.threadId) === null
+            ? yield* threads.facts(actor.threadId).pipe(
+                Effect.map((facts) => facts?.title ?? "a thread"),
+                Effect.orElseSucceed(() => "a thread"),
+              )
+            : labelOf(cast, actor);
+      }
+      return { names, members: [...members.values()] };
     });
 
   const messageBody = (input: MessageBodyInput, provenance: MissionProvenance) =>
@@ -1199,29 +1254,6 @@ const make = Effect.gen(function* () {
       return yield* tuningOf(room);
     });
 
-  /** The latest `member.changed` for a principal: true added, false removed, null never. */
-  const lastMemberChange = (missionId: MissionId, principal: string) =>
-    Effect.gen(function* () {
-      let latest: boolean | null = null;
-      let after = 0;
-      for (;;) {
-        const page = yield* store.eventsSince(missionId, after);
-        if (page.length === 0) return latest;
-        for (const event of page) {
-          if (event.kind !== "member.changed") continue;
-          if (typeof event.payload !== "object" || event.payload === null) continue;
-          const change = event.payload as {
-            readonly principal?: unknown;
-            readonly member?: unknown;
-          };
-          if (change.principal === principal && typeof change.member === "boolean") {
-            latest = change.member;
-          }
-        }
-        after = page.at(-1)!.seq;
-      }
-    });
-
   const setMember = (input: SetMissionMemberInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const cast = yield* loadCast(input.missionId);
@@ -1257,7 +1289,7 @@ const make = Effect.gen(function* () {
         input.member &&
         !owner &&
         (provenance._tag === "import" || selfAdd) &&
-        (yield* lastMemberChange(input.missionId, principal)) === false
+        (yield* store.lastMemberChange(input.missionId, principal)) === false
       ) {
         return yield* fail(
           "forbidden",
@@ -1633,8 +1665,24 @@ const make = Effect.gen(function* () {
       if (isGone(yield* threads.facts(input.threadId))) {
         return yield* fail("not-found", `Thread ${input.threadId} is gone.`);
       }
-      const member = yield* membershipIn(everywhere, input.threadId);
+      // A retry takes the route the first attempt took, even if the thread
+      // joined or left a mission since: the other route would send it twice.
+      const route = yield* rooms.noticeRoute(input.key);
+      const member =
+        route === null
+          ? yield* membershipIn(everywhere, input.threadId)
+          : route.missionId === null
+            ? null
+            : { missionId: route.missionId };
       if (member === null) {
+        if (route === null) {
+          yield* rooms.recordNotice({
+            key: input.key,
+            threadId: input.threadId,
+            missionId: null,
+            at: yield* nowIso,
+          });
+        }
         yield* threads.send({
           threadId: input.threadId,
           text: input.text,
@@ -1658,6 +1706,12 @@ const make = Effect.gen(function* () {
         provenance,
         author: actorOf(provenance),
         authorThread: null,
+        alongside: rooms.recordNotice({
+          key: input.key,
+          threadId: input.threadId,
+          missionId: member.missionId,
+          at: yield* nowIso,
+        }),
       });
       // A retry finds the message already posted and rings nothing, so ring
       // here: a ring that failed last time gets another go. The doorbell only

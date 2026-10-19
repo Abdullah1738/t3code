@@ -4,13 +4,10 @@ import {
   type AckNoteInput,
   type AnswerAskInput,
   type ClientSurface,
-  type CloseForkInput,
   type DecideDraftInput,
   type MissionInboxInput,
   type MissionProvenance,
   type MissionSubscribeInput,
-  type StartForkInput,
-  type UpdateForkInput,
   type WithdrawAskInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -115,15 +112,6 @@ export const makeMissionWsHandlers = (
     [WS_METHODS.missionsSaveDraftNote]: asOwner(flip(asks.saveDraftNote)),
     [WS_METHODS.missionsDecideSuggestion]: asOwner(flip(asks.decideSuggestion)),
     [WS_METHODS.missionsReopenSuggestion]: asOwner(flip(asks.reopenSuggestion)),
-    [WS_METHODS.missionsStartFork]: asOwner(
-      flip((input: StartForkInput, by) => Effect.map(asks.startFork(input, by), (r) => r.fork)),
-    ),
-    [WS_METHODS.missionsCloseFork]: asOwner(
-      flip((input: CloseForkInput, by) => Effect.map(asks.closeFork(input, by), (r) => r.fork)),
-    ),
-    [WS_METHODS.missionsUpdateFork]: asOwner(
-      flip((input: UpdateForkInput, by) => Effect.map(asks.updateFork(input, by), (r) => r.fork)),
-    ),
     [WS_METHODS.missionsAckNote]: asOwner(
       flip((input: AckNoteInput, by) => asks.ackNote(input.noteId, by)),
     ),

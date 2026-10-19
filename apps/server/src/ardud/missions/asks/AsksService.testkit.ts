@@ -8,10 +8,15 @@ import {
   RoleBindingId,
   RoleId,
   ThreadId,
+  MissionMessageId,
   WorkItemId,
+  type Ask,
   type Lane,
   type Mission,
+  type MissionMessage,
   type MissionProvenance,
+  type MissionRecordRef,
+  type PostMessageInput,
   type Role,
   type RoleBinding,
   type RoleKind,
@@ -125,10 +130,16 @@ export const item = (id: string): WorkItem => ({
   updatedAt: at,
 });
 
-export interface Delivery {
-  readonly threadId: ThreadId;
-  readonly text: string;
-  readonly asOwner: boolean;
+/** An answer signal the service handed the router. */
+export interface Signal {
+  readonly ask: Ask;
+  readonly released: ReadonlyArray<MissionRecordRef>;
+}
+
+/** A room post the service handed the router. */
+export interface RoomPost {
+  readonly input: PostMessageInput;
+  readonly provenance: MissionProvenance;
 }
 
 /** A message the owner typed. Push into the harness inbox once the record exists. */
@@ -141,19 +152,38 @@ export const typedInbound = (
 
 /** `inbound` is read on every lookup, so tests may push replies after opening a record. */
 export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
-  const deliveries: Delivery[] = [];
-  const forks: Array<{ readonly sourceThreadId: ThreadId; readonly title: string }> = [];
-  const threads = Layer.succeed(
-    Ports.AsksThreads,
-    Ports.AsksThreads.of({
-      fork: ({ sourceThreadId, title, key }) =>
-        Effect.sync(() => {
-          forks.push({ sourceThreadId, title });
-          return ThreadId.make(`fork-thread-${key}`);
-        }),
-      deliver: ({ threadId, text, asOwner }) =>
-        Effect.sync(() => {
-          deliveries.push({ threadId, text, asOwner });
+  const signals: Signal[] = [];
+  const posts: RoomPost[] = [];
+  const signalsLayer = Layer.succeed(
+    Ports.AsksSignals,
+    Ports.AsksSignals.of({
+      askResolved: ({ ask, released }) => Effect.sync(() => void signals.push({ ask, released })),
+    }),
+  );
+  const rooms = Layer.succeed(
+    Ports.AsksRooms,
+    Ports.AsksRooms.of({
+      post: (input, provenance) =>
+        Effect.sync((): MissionMessage => {
+          posts.push({ input, provenance });
+          return {
+            id: MissionMessageId.make(`msg-${posts.length}`),
+            missionId: input.missionId,
+            roomId: input.roomId,
+            seq: posts.length,
+            kind: input.kind,
+            author: { _tag: "system", component: "test" },
+            provenance,
+            to: input.to ?? [],
+            summary: input.summary,
+            hasBody: input.body !== undefined,
+            key: input.key ?? null,
+            workItemId: input.workItemId ?? null,
+            links: input.links ?? [],
+            receipt: null,
+            isCorrection: false,
+            createdAt: at,
+          };
         }),
     }),
   );
@@ -168,14 +198,14 @@ export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
       Layer.mergeAll(
         MissionStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)),
         lookup,
-        Ports.signalsDeliver.pipe(Layer.provideMerge(threads)),
-        Ports.roomsPending,
+        signalsLayer,
+        rooms,
         Ports.applierRegistry,
         NodeServices.layer,
       ),
     ),
   );
-  return { deliveries, forks, layer };
+  return { signals, posts, layer };
 };
 
 export const seed = Effect.gen(function* () {

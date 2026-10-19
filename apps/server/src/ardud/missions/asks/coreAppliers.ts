@@ -270,18 +270,16 @@ export const makeCoreAppliers = ({
     });
 
   /**
-   * Threads working on a mission: role holders, lanes and open forks. Uncapped
+   * Threads working on a mission: role holders and lanes. Uncapped
    * reads, since a thread missing here refuses a schedule that is the mission's.
    */
   const missionThreads = (missionId: MissionId) =>
     Effect.gen(function* () {
       const bindings = yield* store.listAllInMission("role-binding", missionId, ["bound"]);
       const lanes = yield* store.listAllInMission("lane", missionId);
-      const forks = yield* store.listAllInMission("fork", missionId, ["open"]);
       return new Set<string>([
         ...bindings.map((binding) => binding.threadId),
         ...lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
-        ...forks.map((fork) => fork.forkThreadId),
       ]);
     });
 

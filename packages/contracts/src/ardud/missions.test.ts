@@ -3,11 +3,13 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   Ask,
+  Draft,
   isOwnerProvenance,
   MissionProvenance,
   MissionStreamItem,
   OpenAskInput,
   PoolHold,
+  RuleChangeRequest,
 } from "./missions.ts";
 
 const decodeAsk = Schema.decodeSync(Ask);
@@ -15,6 +17,9 @@ const decodeOpenAsk = Schema.decodeUnknownSync(OpenAskInput);
 const decodeProvenance = Schema.decodeUnknownSync(MissionProvenance);
 const decodeHold = Schema.decodeUnknownSync(PoolHold);
 const decodeStreamItem = Schema.decodeSync(MissionStreamItem);
+const decodeDraft = Schema.decodeUnknownSync(Draft);
+const encodeDraft = Schema.encodeSync(Draft);
+const decodeRuleChange = Schema.decodeUnknownSync(RuleChangeRequest);
 
 describe("missions contracts", () => {
   it("only app-typed and verified iMessage provenance counts as the owner", () => {
@@ -83,6 +88,47 @@ describe("missions contracts", () => {
     expect(decode({ ...base, fence: 3 }).fence).toBe(3);
     expect(() => decode({ ...base, fence: 0 })).toThrow();
   });
+
+  // --- asks additions ---
+  it("old fork drafts and rule requests still read", () => {
+    const draft = decodeDraft({
+      id: "d-1",
+      missionId: "m",
+      audience: "Linear",
+      channel: "linear",
+      target: { kind: "ticket", ref: "CRP-1", label: "CRP-1", url: null },
+      text: "Fixed in #306.",
+      approvedText: null,
+      writerRoleId: null,
+      source: { kind: "fork", ref: { kind: "fork", id: "fork-1" } },
+      appliedNoteIds: [],
+      status: "pending",
+      rewriteNote: null,
+      decidedBy: null,
+      decidedAt: null,
+      sentAt: null,
+      createdAt: "2026-10-17T08:00:00Z",
+    });
+    expect(draft.source.kind).toBe("master");
+    expect(encodeDraft(draft).source.kind).toBe("master");
+
+    const request = decodeRuleChange({
+      id: "rcr-1",
+      ruleId: "rule-1",
+      missionId: null,
+      request: "Looser",
+      provenance: { _tag: "owner-app", surface: "web", sessionId: null },
+      status: "open",
+      proposedQuote: null,
+      proposedScope: null,
+      masterResponse: null,
+      createdAt: "2026-10-17T08:00:00Z",
+      resolvedAt: null,
+      forkId: null,
+    });
+    expect("forkId" in request).toBe(false);
+  });
+  // --- end asks additions ---
 
   it("stream deltas carry records by kind", () => {
     const item = decodeStreamItem({

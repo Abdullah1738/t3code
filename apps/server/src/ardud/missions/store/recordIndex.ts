@@ -268,16 +268,6 @@ export const indexRecord = (entry: MissionStoreRecord): MissionRecordIndex => {
         updatedAt: r.updatedAt,
       };
     }
-    case "fork": {
-      const r = entry.record;
-      return {
-        id: r.id,
-        missionId: r.missionId,
-        subMissionId: null,
-        status: r.status,
-        updatedAt: r.closedAt ?? r.createdAt,
-      };
-    }
     // ardud missions: router
     case "owner-request": {
       const r = entry.record;

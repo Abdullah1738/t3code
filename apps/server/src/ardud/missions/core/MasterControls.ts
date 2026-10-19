@@ -106,7 +106,7 @@ const make = Effect.gen(function* () {
       const memberProvenance = { _tag: "agent", threadId: input.threadId, roleId: null } as const;
       if (!isParticipant(standingOf(cast, memberProvenance))) {
         return yield* forbidden(
-          `Thread ${input.threadId} holds no role, lane or fork in mission ${input.missionId}.`,
+          `Thread ${input.threadId} holds no role or lane in mission ${input.missionId}.`,
         );
       }
       // Enlisting a thread doesn't make it this master's alone: a thread that
