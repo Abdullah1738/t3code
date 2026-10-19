@@ -78,6 +78,7 @@ import {
   useTheme,
 } from "../../hooks/useTheme";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
+import { DEFAULT_THEME_ID } from "../../themePalette"; // ardud missions: desk-theme
 import {
   useScopedSettings,
   useScopedSettingsMixed,
@@ -536,7 +537,7 @@ export function useSettingsRestore(onRestored?: () => void) {
 
   const changedSettingLabels = useMemo(
     () => [
-      ...(theme !== "system" ? ["Theme"] : []),
+      ...(theme !== DEFAULT_THEME_ID ? ["Theme"] : []), // ardud missions: desk-theme
       ...(!followSystem ? ["Follow system"] : []),
       ...(themeHalves !== null ? ["Theme mix"] : []),
       ...(settings.appearanceContrast !== DEFAULT_UNIFIED_SETTINGS.appearanceContrast
@@ -756,7 +757,7 @@ export function useSettingsRestore(onRestored?: () => void) {
     // The mix may have changed while the confirmation dialog was open; both
     // the dirty check and the rollback must see the live value.
     const liveHalves = readThemeHalves();
-    const needsThemeReset = previousTheme !== "system";
+    const needsThemeReset = previousTheme !== DEFAULT_THEME_ID; // ardud missions: desk-theme
     const needsMixReset = liveHalves !== null;
     // Same for the appearance mode: trusting the render-time value would skip
     // the reset and report success while a non-system mode stayed in storage.
@@ -779,7 +780,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       if (previousHalves?.light) setThemeHalf("light", previousHalves.light);
       if (previousHalves?.dark) setThemeHalf("dark", previousHalves.dark);
     };
-    if (needsThemeReset && !setTheme("system")) {
+    if (needsThemeReset && !setTheme(DEFAULT_THEME_ID)) {
+      // ardud missions: desk-theme
       notifyThemeRestoreFailure();
       return;
     }

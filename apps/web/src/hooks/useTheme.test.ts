@@ -204,3 +204,20 @@ describe("theme failure handling", () => {
     }
   });
 });
+
+describe("default theme", () => {
+  it("starts a fresh install on Desk following the system and keeps a picked theme", async () => {
+    const storage = createStorage();
+    vi.stubGlobal("window", { localStorage: storage });
+    const { readAppearanceModePreference, readThemePreference } = await import("./useTheme");
+
+    expect(readThemePreference()).toBe("desk");
+    expect(readAppearanceModePreference(readThemePreference())).toBe("system");
+
+    storage.setItem("t3code:theme", "system");
+    expect(readThemePreference()).toBe("system");
+    storage.setItem("t3code:theme", "ocean");
+    expect(readThemePreference()).toBe("ocean");
+    expect(readAppearanceModePreference("ocean")).toBe("light");
+  });
+});

@@ -7,6 +7,8 @@ const state = vi.hoisted(() => ({
   settings: null as UnifiedSettings | null,
   update: vi.fn(),
   confirm: vi.fn(),
+  theme: "desk",
+  setTheme: vi.fn(() => true),
 }));
 
 vi.mock("react", async (importOriginal) => {
@@ -27,15 +29,15 @@ vi.mock("react/compiler-runtime", async () => {
 vi.mock("../../hooks/useTheme", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../hooks/useTheme")>()),
   useTheme: () => ({
-    theme: "system",
+    theme: state.theme,
     followSystem: true,
     themeHalves: null,
-    setTheme: vi.fn(),
+    setTheme: state.setTheme,
     setFollowSystem: vi.fn(),
     setThemeHalf: vi.fn(),
     clearThemeHalves: vi.fn(),
   }),
-  readThemePreference: () => "system",
+  readThemePreference: () => state.theme,
   readThemeHalves: () => null,
   readAppearanceModePreference: () => "system",
 }));
@@ -58,6 +60,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   state.settings = { ...DEFAULT_UNIFIED_SETTINGS };
   state.confirm.mockResolvedValue(true);
+  state.theme = "desk";
+  state.setTheme.mockReturnValue(true);
 });
 
 describe("restoring V2 settings", () => {
@@ -76,6 +80,19 @@ describe("restoring V2 settings", () => {
     expect(state.confirm.mock.calls[0]?.[0]).toContain(label);
     expect(state.update).toHaveBeenCalledOnce();
     expect(state.update.mock.calls[0]?.[0][key]).toBe(DEFAULT_UNIFIED_SETTINGS[key]);
+  });
+
+  it("restores another theme to Desk and treats Desk as the default", async () => {
+    hooks.beginRender();
+    expect(useSettingsRestore().changedSettingLabels).toEqual([]);
+
+    state.theme = "ocean";
+    hooks.beginRender();
+    const restore = useSettingsRestore();
+    expect(restore.changedSettingLabels).toEqual(["Theme"]);
+    await restore.restoreDefaults();
+
+    expect(state.setTheme).toHaveBeenCalledWith("desk");
   });
 
   it("does not reset settings after cancellation", async () => {

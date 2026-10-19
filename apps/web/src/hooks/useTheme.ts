@@ -13,6 +13,7 @@ import {
   resolveDesktopTheme,
   resolveThemeAppearance,
   resolveThemeHalf,
+  DEFAULT_THEME_ID, // ardud missions: desk-theme
   THEME_PREVIEW_ID,
   THEME_APPEARANCE_MODE_STORAGE_KEY,
   THEME_FOLLOW_SYSTEM_STORAGE_KEY,
@@ -38,7 +39,7 @@ type DesktopThemeBridge = Pick<DesktopBridge, "setTheme">;
 const STORAGE_KEY = "t3code:theme";
 const MEDIA_QUERY = "(prefers-color-scheme: dark)";
 const DEFAULT_THEME_SNAPSHOT: ThemeSnapshot = {
-  theme: "system",
+  theme: DEFAULT_THEME_ID, // ardud missions: desk-theme
   resolvedTheme: "light",
   systemDark: false,
   followSystem: true,
@@ -152,8 +153,14 @@ function getSystemDark() {
   );
 }
 
+// ardud missions: desk-theme
+// The default theme follows the system appearance until the user picks a mode.
+function followsSystemByDefault(theme: Theme): boolean {
+  return theme === "system" || theme === DEFAULT_THEME_ID;
+}
+
 function readStoredFollowSystem(theme: Theme): boolean {
-  if (typeof window === "undefined") return theme === "system";
+  if (typeof window === "undefined") return followsSystemByDefault(theme);
 
   try {
     const raw = window.localStorage.getItem(THEME_FOLLOW_SYSTEM_STORAGE_KEY);
@@ -163,7 +170,7 @@ function readStoredFollowSystem(theme: Theme): boolean {
     // Fall back to the legacy theme value when the separate preference is unavailable.
   }
 
-  return theme === "system";
+  return followsSystemByDefault(theme); // ardud missions: desk-theme
 }
 
 function isThemePreferenceMode(value: string | null): value is ThemePreferenceMode {

@@ -22,6 +22,7 @@ import {
   type ThemeAppearance,
   type ThemeDefinition,
   type ThemeHalves,
+  DESK_THEME, // ardud missions: desk-theme
   T3_CHAT_THEME,
   EMBER_THEME,
   GROVE_THEME,
@@ -767,6 +768,28 @@ export function ThemeLibrary({
       .entries(),
   ];
 
+  // ardud missions: desk-theme
+  // Desk is the default, so its tile leads the library ahead of T3 Code.
+  const renderMaintainerCard = (maintainerTheme: ThemeDefinition) => (
+    <ThemeLibraryCard
+      activeModes={pickedModesFor(maintainerTheme.id)}
+      isActive={false}
+      key={maintainerTheme.id}
+      onDuplicate={() =>
+        openThemeEditor({
+          editingThemeId: null,
+          seedThemeId: maintainerTheme.id,
+          seedName: `${maintainerTheme.label} copy`,
+          initialAppearance,
+        })
+      }
+      onUse={() => persistTheme(maintainerTheme.id)}
+      onUseMode={handlePairPick(maintainerTheme.id)}
+      theme={getThemeCardDefinition(maintainerTheme)}
+    />
+  );
+  // end ardud missions: desk-theme
+
   const renderPairGrid = () => (
     // One shared provider so every tooltip in the grid hands off instantly to
     // the next hovered trigger instead of stacking on top of it. The card
@@ -777,6 +800,7 @@ export function ThemeLibrary({
         className="grid w-full gap-2"
         style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 16rem), 1fr))" }}
       >
+        {renderMaintainerCard(DESK_THEME) /* ardud missions: desk-theme */}
         {STANDARD_THEME_CARDS.map((standardTheme) => (
           <ThemeLibraryCard
             activeModes={pickedModesFor(null)}
@@ -795,27 +819,7 @@ export function ThemeLibrary({
             theme={standardTheme}
           />
         ))}
-        {MAINTAINER_THEMES.map((maintainerTheme) => {
-          const card = getThemeCardDefinition(maintainerTheme);
-          return (
-            <ThemeLibraryCard
-              activeModes={pickedModesFor(maintainerTheme.id)}
-              isActive={false}
-              key={maintainerTheme.id}
-              onDuplicate={() =>
-                openThemeEditor({
-                  editingThemeId: null,
-                  seedThemeId: maintainerTheme.id,
-                  seedName: `${maintainerTheme.label} copy`,
-                  initialAppearance,
-                })
-              }
-              onUse={() => persistTheme(maintainerTheme.id)}
-              onUseMode={handlePairPick(maintainerTheme.id)}
-              theme={card}
-            />
-          );
-        })}
+        {MAINTAINER_THEMES.map(renderMaintainerCard) /* ardud missions: desk-theme */}
         {environmentThemes
           .filter(
             // A saved theme with the same id wins resolution, so its card is

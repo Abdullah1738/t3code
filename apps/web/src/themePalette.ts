@@ -4,6 +4,7 @@ import "culori/css";
 import { converter, parse } from "culori/fn";
 import {
   BUILT_IN_THEMES,
+  DEFAULT_THEME_ID, // ardud missions: desk-theme
   EMBER_THEME,
   GROVE_THEME,
   IRIS_THEME,
@@ -21,6 +22,7 @@ import {
 } from "@t3tools/shared/themePalettes";
 
 export { EMBER_THEME, GROVE_THEME, IRIS_THEME, OCEAN_THEME, T3_CHAT_THEME, THEME_COLOR_ROLES };
+export { DEFAULT_THEME_ID, DESK_THEME } from "@t3tools/shared/themePalettes"; // ardud missions: desk-theme
 export type { ThemeAppearance, ThemeColorRole, ThemeColors, ThemeDefinition, ThemeVariants };
 
 export const T3_CHAT_THEME_ID = "t3-chat" as const;
@@ -221,8 +223,34 @@ function readCustomThemeLibrarySnapshot(): CustomThemeLibrarySnapshot {
   }
   if (!Array.isArray(parsed)) return { status: "unavailable", reason: "malformed" };
 
-  return { status: "ready", storedThemes: parsed, themes: parseStoredThemes(parsed) };
+  const storedThemes = renameClaimedThemeIds(parsed); // ardud missions: desk-theme
+  return { status: "ready", storedThemes, themes: parseStoredThemes(storedThemes) };
 }
+
+// ardud missions: desk-theme
+// A theme saved before Desk shipped may already use its id. Keep it under the
+// first free "desk-N" id instead of letting the built-in hide it.
+const CLAIMED_THEME_IDS: ReadonlySet<string> = new Set(["desk"]);
+
+function storedThemeId(theme: unknown): string | null {
+  return isRecord(theme) && typeof theme.id === "string" ? theme.id : null;
+}
+
+function renameClaimedThemeIds(storedThemes: ReadonlyArray<unknown>): ReadonlyArray<unknown> {
+  const isClaimed = (theme: unknown) => CLAIMED_THEME_IDS.has(storedThemeId(theme) ?? "");
+  if (!storedThemes.some(isClaimed)) return storedThemes;
+  const usedIds = new Set(storedThemes.flatMap((theme) => storedThemeId(theme) ?? []));
+  return storedThemes.map((theme) => {
+    const claimedId = storedThemeId(theme);
+    if (!isRecord(theme) || claimedId === null || !CLAIMED_THEME_IDS.has(claimedId)) return theme;
+    let suffix = 2;
+    while (usedIds.has(`${claimedId}-${suffix}`)) suffix += 1;
+    const id = `${claimedId}-${suffix}`;
+    usedIds.add(id);
+    return { ...theme, id };
+  });
+}
+// end ardud missions: desk-theme
 
 function getCustomThemeLibrarySnapshot(): CustomThemeLibrarySnapshot {
   if (customThemeLibrarySnapshot === null) {
