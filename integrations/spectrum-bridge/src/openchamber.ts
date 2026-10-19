@@ -243,6 +243,9 @@ function validRoot(root: unknown): root is string {
   return typeof root === "string" && root.startsWith("/") && !root.includes("\0");
 }
 
+/** The owner's own typed message inside a prompt: its inbound id and exact text. */
+export type OwnerWords = { inboundId: string; text: string };
+
 /**
  * What the router and the origin backfill need from a backend. OpenChamber
  * implements it here; Robob's control API implements it in robob.ts.
@@ -261,15 +264,21 @@ export interface ChatBackend {
   children(id: string, directory: string): Promise<SessionRecord[]>;
   messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;
   promptAccepted(id: string, directory: string, messageId: string): Promise<boolean>;
+  /**
+   * `owner` is set only when `text` ends with one message the owner typed,
+   * exactly as he sent it; a backend that checks iMessages (Robob) sends those
+   * words alone, with the inbound id, and everything else as guidance.
+   */
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
-    model?: { providerID: string; modelID: string; variant?: string }): Promise<void>;
+    model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords): Promise<void>;
   abort(id: string, directory: string): Promise<boolean>;
   statuses(): Promise<Record<string, SessionStatus>>;
   permissions(sessionId: string, directory: string): Promise<PermissionRequest[]>;
   questions(sessionId: string, directory: string): Promise<QuestionRequest[]>;
-  permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject"): Promise<boolean>;
-  questionReply(request: QuestionRequest, directory: string, answers: string[][]): Promise<boolean>;
-  cancelQuestion(sessionId: string, formId: string, directory: string): Promise<boolean>;
+  /** `inboundId` is the owner's typed reply the answer came from, when there is one. */
+  permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject", inboundId?: string): Promise<boolean>;
+  questionReply(request: QuestionRequest, directory: string, answers: string[][], inboundId?: string): Promise<boolean>;
+  cancelQuestion(sessionId: string, formId: string, directory: string, inboundId?: string): Promise<boolean>;
   isSessionAutoAccepting(sessionId: string, directory: string): Promise<boolean | undefined>;
 }
 

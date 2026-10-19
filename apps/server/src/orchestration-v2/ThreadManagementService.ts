@@ -14,6 +14,7 @@ import {
   OrchestrationV2StopWorkflowError,
   type OrchestrationV2StopWorkflowInput,
   type ModelSelection,
+  type OrchestrationMessageContext,
   type OrchestrationV2Actor,
   type OrchestrationV2Command,
   type OrchestrationV2GetTurnItemResult,
@@ -136,6 +137,8 @@ export interface ThreadManagementSendInput {
   readonly creationSource: OrchestrationV2CreationSource;
   /** ardud: start the message on a fresh provider thread (context reset). */
   readonly contextReset?: boolean;
+  // ardud missions: guard - structured context (the bridge's channel guidance) beside the text.
+  readonly context?: OrchestrationMessageContext;
 }
 
 export interface ThreadManagementSendResult {
@@ -842,6 +845,8 @@ const make = Effect.gen(function* () {
         createdBy: input.createdBy,
         creationSource: input.creationSource,
         ...(input.contextReset === true ? { contextReset: true } : {}),
+        // ardud missions: guard
+        ...(input.context === undefined ? {} : { context: input.context }),
       });
       const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
         messageIds: [input.messageId],

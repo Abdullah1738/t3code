@@ -11,8 +11,11 @@ import * as Result from "effect/Result";
 import { findInImsgHistory, makeInboundLookup } from "./inbound.ts";
 import {
   answerCheck,
+  consentCheck,
   draftDecisionCheck,
+  type InboundBinding,
   optionCollision,
+  recordHandle,
   type ReplyCheck,
   verifyInbound,
   type InboundMessage,
@@ -25,6 +28,7 @@ const owner = (text: string, id = "spc-msg-1"): InboundMessage => ({
   id,
   chat: "owner",
   text,
+  typed: true,
   receivedAt: after,
 });
 
@@ -33,8 +37,12 @@ const OPTIONS = [
   { id: "sqlite", label: "SQLite" },
 ];
 
-const verify = (inbound: InboundMessage | null, check: ReplyCheck, id = "spc-msg-1") =>
-  verifyInbound({ inboundId: id, inbound, check, notBefore: opened, what: "Answer" });
+const verify = (
+  inbound: InboundMessage | null,
+  check: ReplyCheck,
+  id = "spc-msg-1",
+  binding: InboundBinding = { _tag: "tied" },
+) => verifyInbound({ inboundId: id, inbound, binding, check, notBefore: opened, what: "Answer" });
 
 const code = (result: ReturnType<typeof verify>) =>
   Result.isFailure(result) ? result.failure.code : "ok";
@@ -81,6 +89,98 @@ describe("iMessage provenance", () => {
     }
   });
 
+  // Sol P6: a poll vote (or anything else the bridge composed) is never text
+  // the owner typed, whatever it says and whoever asks.
+  it("P6: refuses poll votes and rows the bridge composed", () => {
+    const yes = consentCheck("yes");
+    expect(code(verify(owner("yes", "poll-vote:guid-1:1"), yes, "poll-vote:guid-1:1"))).toBe(
+      "provenance-invalid",
+    );
+    expect(code(verify({ ...owner("yes", "spc-msg-9"), typed: false }, yes, "spc-msg-9"))).toBe(
+      "provenance-invalid",
+    );
+    expect(code(verify(owner("yes"), yes))).toBe("ok");
+  });
+
+  // Sol P3: a yes or no is short and exact. A question, a negation, a
+  // qualifier or anything more decides nothing.
+  it("P3: consent replies use the short exact grammar", () => {
+    const says = (answer: "yes" | "no") => (reply: string) =>
+      code(verify(owner(reply), consentCheck(answer))) === "ok";
+    const yes = says("yes");
+    for (const reply of [
+      "yes",
+      "Yes!",
+      "approve",
+      "approved",
+      "ok",
+      "go",
+      "send it",
+      "Ship it.",
+      "yes please",
+      "ok thanks",
+      "approve, thank you",
+    ]) {
+      expect([reply, yes(reply)]).toEqual([reply, true]);
+    }
+    for (const reply of [
+      "yes?",
+      "allow?",
+      "is that ok?",
+      "is that ok",
+      "yes but not now",
+      "don't",
+      "dont",
+      "ok？",
+      "yes؟",
+      "¿ok",
+      "ok 🤔",
+      "yes❓",
+      "yes 🙄",
+      "yes 2",
+      "please",
+      "thanks",
+      "sure",
+      "yeah",
+      "allow",
+      "yes if the tests pass",
+      "not yet",
+      "ok go ahead and also delete the branch",
+    ]) {
+      expect([reply, yes(reply)]).toEqual([reply, false]);
+    }
+    const no = says("no");
+    for (const reply of ["no", "No.", "deny", "reject", "decline", "no thanks"]) {
+      expect([reply, no(reply)]).toEqual([reply, true]);
+    }
+    for (const reply of ["no?", "don't", "no, yes", "not now", "no but ask me later"]) {
+      expect([reply, no(reply)]).toEqual([reply, false]);
+    }
+    // A draft approval uses the same grammar.
+    const approve = decides({ action: "approve" });
+    expect(approve("ship it")).toBe(true);
+    expect(approve("is that ok?")).toBe(false);
+    expect(approve("lgtm")).toBe(false);
+  });
+
+  // Sol P1: an ask or draft answered by iMessage must name it: the reply
+  // starts with the record's short handle, and the rest is the answer.
+  it("P1: a handle binding needs the record's handle first", () => {
+    const handle = recordHandle("ask-3F9c2b1e-0000");
+    expect(handle).toBe("3f9c");
+    const pg = answerCheck({ options: OPTIONS, optionId: "pg", text: "" });
+    const bound = (reply: string) =>
+      code(verify(owner(reply), pg, "spc-msg-1", { _tag: "handle", handle }));
+    expect(bound("3f9c postgres")).toBe("ok");
+    expect(bound("#3F9C: postgres")).toBe("ok");
+    expect(bound("3f9c - Postgres")).toBe("ok");
+    expect(bound("postgres")).toBe("provenance-invalid");
+    expect(bound("3f9d postgres")).toBe("provenance-invalid");
+    expect(bound("3f9cpostgres")).toBe("provenance-invalid");
+    expect(bound("3f9c")).toBe("provenance-invalid");
+    expect(bound("postgres 3f9c")).toBe("provenance-invalid");
+  });
+
   it("refuses unknown ids, text that does not match, and messages older than the ask", () => {
     const pg = answerCheck({ options: OPTIONS, optionId: "pg", text: "" });
     expect(code(verify(null, pg))).toBe("provenance-invalid");
@@ -98,6 +198,7 @@ describe("iMessage provenance", () => {
     const loose = verifyInbound({
       inboundId: "spc-msg-1",
       inbound: early,
+      binding: { _tag: "tied" },
       check,
       notBefore: opened,
       what: "Approval",
@@ -106,6 +207,7 @@ describe("iMessage provenance", () => {
     const strict = verifyInbound({
       inboundId: "spc-msg-1",
       inbound: early,
+      binding: { _tag: "tied" },
       check,
       notBefore: opened,
       skewMs: 0,
@@ -371,12 +473,34 @@ describe("inbound lookup", () => {
     const insert = db.prepare("INSERT INTO inbound (id, payload, state) VALUES (?, ?, ?)");
     insert.run(
       "spc-msg-1",
-      JSON.stringify({ id: "spc-msg-1", text: "go postgres", receivedAt: after }),
+      JSON.stringify({
+        id: "spc-msg-1",
+        text: "go postgres",
+        source: "typed",
+        replyTo: "guid-notice-1",
+        receivedAt: after,
+      }),
       "done",
     );
     insert.run(
       "wake:1",
       JSON.stringify({ id: "wake:1", text: "go postgres", receivedAt: after }),
+      "done",
+    );
+    // A row from an older bridge (no source) and a composed one read as not typed.
+    insert.run(
+      "spc-msg-old",
+      JSON.stringify({ id: "spc-msg-old", text: "go postgres", receivedAt: after }),
+      "done",
+    );
+    insert.run(
+      "spc-msg-vote",
+      JSON.stringify({
+        id: "spc-msg-vote",
+        text: 'Voted for "Postgres" in the poll "Which db"',
+        source: "composed",
+        receivedAt: after,
+      }),
       "done",
     );
     db.close();
@@ -395,8 +519,12 @@ describe("inbound lookup", () => {
         id: "spc-msg-1",
         chat: "owner",
         text: "go postgres",
+        typed: true,
+        replyTo: "guid-notice-1",
         receivedAt: after,
       });
+      expect((yield* lookup.find("spc-msg-old", opened))?.typed).toBe(false);
+      expect((yield* lookup.find("spc-msg-vote", opened))?.typed).toBe(false);
       expect(yield* lookup.find("wake:1", opened)).toBeNull();
       expect(yield* lookup.find("spc-msg-2", opened)).toBeNull();
     }),

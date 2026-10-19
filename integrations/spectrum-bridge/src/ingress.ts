@@ -23,6 +23,8 @@ function pollVote(store: Store, event: PollEvent, owner: string): { input: Norma
       id: `poll-vote:${event.pollMessageGuid}:${event.sequence}`, text, attachments: [], isAudioMessage: false,
       poll: { guid: event.pollMessageGuid, optionIdentifier: option.optionIdentifier, optionText: option.text,
         vote: delta.type, operationId: poll.operationId },
+      // The bridge wrote this text from the vote; it is never the owner's typed words.
+      source: "composed",
     },
     ...(Number.isFinite(at) ? { occurredAt: at } : {}),
   };

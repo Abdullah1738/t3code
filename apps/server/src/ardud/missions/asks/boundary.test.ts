@@ -8,6 +8,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
+  addressed,
   agent,
   askInput,
   at,
@@ -21,6 +22,7 @@ import {
   ownerApp,
   seed,
   seedOther,
+  typedInbound,
   writerThread,
 } from "./AsksService.testkit.ts";
 import * as Ports from "./ports.ts";
@@ -31,12 +33,18 @@ const MINUTE = 60_000;
 const relay = agent(masterThread);
 const master = agent(masterThread);
 const writer = agent(writerThread);
-const owner = (id: string, text: string, receivedAt: number): InboundMessage => ({
-  id,
-  chat: "owner",
-  text,
-  receivedAt,
-});
+/**
+ * A harness whose inbox fills as the test goes: `say` files the owner's reply
+ * to a record, addressed by its handle as P1 requires.
+ */
+const withInbox = () => {
+  const inbox: Array<InboundMessage> = [];
+  const { layer } = harness(inbox);
+  const say = (id: string, recordId: string, text: string, receivedAt: number) => {
+    inbox.push(typedInbound(id, addressed(recordId, text), receivedAt));
+  };
+  return { layer, say };
+};
 const link = (label: string): MissionLink => ({ kind: "url", label, url: null, ref: label });
 const draftFor = (audience: string, text: string) => ({
   missionId,
@@ -48,11 +56,7 @@ const draftFor = (audience: string, text: string) => ({
 
 describe("boundary review regressions", () => {
   it.effect("H8: an iMessage answer must name the chosen option and nothing against it", () => {
-    const { layer } = harness([
-      owner("msg-keep", "keep it safe", T0 + MINUTE),
-      owner("msg-negated", "do not deploy", T0 + MINUTE),
-      owner("msg-deploy", "deploy", T0 + MINUTE),
-    ]);
+    const { layer, say } = withInbox();
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
@@ -64,6 +68,9 @@ describe("boundary review regressions", () => {
         recommendation: { optionId: "hold", reason: "Friday." },
       });
       const ask = yield* asks.openAsk(risky, master);
+      say("msg-keep", ask.id, "keep it safe", T0 + MINUTE);
+      say("msg-negated", ask.id, "do not deploy", T0 + MINUTE);
+      say("msg-deploy", ask.id, "deploy", T0 + MINUTE);
 
       // A real owner message that says something else can't stand in for an option.
       expect(
@@ -107,11 +114,7 @@ describe("boundary review regressions", () => {
   });
 
   it.effect("H9: an iMessage draft decision must say that decision and the edited text", () => {
-    const { layer } = harness([
-      owner("msg-line", "Do not send the line hello world.", T0 + MINUTE),
-      owner("msg-dont", "do not approve", T0 + MINUTE),
-      owner("msg-edit", "approve: hello world", T0 + MINUTE),
-    ]);
+    const { layer, say } = withInbox();
     return Effect.gen(function* () {
       yield* TestClock.setTime(T0);
       yield* seed;
@@ -120,6 +123,9 @@ describe("boundary review regressions", () => {
         draftFor("Sami", "Hi Sami, the fix is merged."),
         writer,
       );
+      say("msg-line", draft.id, "Do not send the line hello world.", T0 + MINUTE);
+      say("msg-dont", draft.id, "do not approve", T0 + MINUTE);
+      say("msg-edit", draft.id, "approve: hello world", T0 + MINUTE);
 
       expect(
         yield* failureCode(
@@ -153,17 +159,15 @@ describe("boundary review regressions", () => {
   it.effect(
     "H10: approvals bind to the draft's current revision; older evidence is refused",
     () => {
-      const { layer } = harness([
-        owner("msg-yes", "yes", T0 + MINUTE),
-        owner("msg-yes-2", "ok send it", T0 + 2 * 60 * MINUTE + MINUTE),
-        owner("msg-both", "approve", T0 + 5 * MINUTE),
-      ]);
+      const { layer, say } = withInbox();
       return Effect.gen(function* () {
         yield* TestClock.setTime(T0);
         yield* seed;
         const asks = yield* AsksService.AsksService;
         const draft = yield* asks.submitDraft(draftFor("Sami", "The fix is merged."), writer);
         expect(draft.revision).toBe(0);
+        say("msg-yes", draft.id, "yes", T0 + MINUTE);
+        say("msg-yes-2", draft.id, "ok send it", T0 + 2 * 60 * MINUTE + MINUTE);
 
         // The writer revises hours after the owner's "yes"; that yes was for other text.
         yield* TestClock.setTime(T0 + 2 * 60 * MINUTE);
@@ -208,34 +212,41 @@ describe("boundary review regressions", () => {
             .draft.status,
         ).toBe("approved");
 
-        // One inbound may still approve two drafts that both existed when it arrived.
+        // Sol P1: one reply speaks for the one draft it names, even when two
+        // were pending when it arrived.
         yield* TestClock.setTime(T0);
         const first = yield* asks.submitDraft(draftFor("Lee", "Lee, it's live."), writer);
         const second = yield* asks.submitDraft(draftFor("Kim", "Kim, it's live."), writer);
-        for (const each of [first, second]) {
-          const decided = yield* asks.decideDraft(
-            { draftId: each.id, action: "approve", inboundId: "msg-both" },
+        say("msg-both", first.id, "approve", T0 + 5 * MINUTE);
+        expect(
+          (yield* asks.decideDraft(
+            { draftId: first.id, action: "approve", inboundId: "msg-both" },
             relay,
-          );
-          expect(decided.draft.status).toBe("approved");
-        }
+          )).draft.status,
+        ).toBe("approved");
+        expect(
+          yield* failureCode(
+            asks.decideDraft(
+              { draftId: second.id, action: "approve", inboundId: "msg-both" },
+              relay,
+            ),
+          ),
+        ).toBe("provenance-invalid");
       }).pipe(Effect.provide(layer));
     },
   );
 
   it.effect("N9: a reopened ask takes no iMessage from before the reopen", () => {
-    const { layer } = harness([
-      owner("msg-offline", "offline window", T0 + MINUTE),
-      owner("msg-early", "offline window", T0 + 90_000),
-      owner("msg-online", "online", T0 + 3 * MINUTE),
-      owner("msg-both", "offline window", T0 + MINUTE),
-    ]);
+    const { layer, say } = withInbox();
     return Effect.gen(function* () {
       yield* TestClock.setTime(T0);
       yield* seed;
       const asks = yield* AsksService.AsksService;
       const ask = yield* asks.openAsk(askInput("Which way?"), master);
       expect(ask.revision ?? 0).toBe(0);
+      say("msg-offline", ask.id, "offline window", T0 + MINUTE);
+      say("msg-early", ask.id, "offline window", T0 + 90_000);
+      say("msg-online", ask.id, "online", T0 + 3 * MINUTE);
 
       yield* TestClock.setTime(T0 + MINUTE + 10_000);
       const answered = yield* asks.answerAsk(
@@ -270,31 +281,38 @@ describe("boundary review regressions", () => {
       );
       expect(again.ask.answer?.optionId).toBe("a");
 
-      // One reply may still answer two asks that were both open when it arrived.
+      // Sol P1: one reply answers the one ask it names, even with two open.
       yield* TestClock.setTime(T0);
       const first = yield* asks.openAsk(askInput("Staging?"), master);
       const second = yield* asks.openAsk(askInput("Production?"), master);
-      for (const each of [first, second]) {
-        const decided = yield* asks.answerAsk(
-          { askId: each.id, optionId: "b", text: "", inboundId: "msg-both" },
+      say("msg-both", first.id, "offline window", T0 + MINUTE);
+      expect(
+        (yield* asks.answerAsk(
+          { askId: first.id, optionId: "b", text: "", inboundId: "msg-both" },
           relay,
-        );
-        expect(decided.ask.status).toBe("answered");
-      }
+        )).ask.status,
+      ).toBe("answered");
+      expect(
+        yield* failureCode(
+          asks.answerAsk(
+            { askId: second.id, optionId: "b", text: "", inboundId: "msg-both" },
+            relay,
+          ),
+        ),
+      ).toBe("provenance-invalid");
     }).pipe(Effect.provide(layer));
   });
 
   it.effect("N9: an ask reopened before asks kept an epoch still takes nothing older", () => {
-    const { layer } = harness([
-      owner("msg-early", "offline window", T0 + 90_000),
-      owner("msg-late", "online", T0 + 3 * MINUTE),
-    ]);
+    const { layer, say } = withInbox();
     return Effect.gen(function* () {
       yield* TestClock.setTime(T0);
       yield* seed;
       const asks = yield* AsksService.AsksService;
       const store = yield* MissionStore.MissionStore;
       const ask = yield* asks.openAsk(askInput("Which way?"), master);
+      say("msg-early", ask.id, "offline window", T0 + 90_000);
+      say("msg-late", ask.id, "online", T0 + 3 * MINUTE);
       // Stored by an older build: reopened at T0+2min, with no revision fields.
       const {
         revision: _revision,

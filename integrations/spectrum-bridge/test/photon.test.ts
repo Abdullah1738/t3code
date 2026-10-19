@@ -160,7 +160,7 @@ describe("normalizeInbound", () => {
   test("normalizes SDK-decoded text and prefers the canonical reply target", () => {
     const event = received({ replyTargetGuid: "real-parent", replyToGuid: "unrelated", threadOriginatorGuid: "thread-root" });
     expect(normalizeInbound(event, owner, chatGuid)).toEqual({
-      id: "inbound-guid", text: "Hello", replyTo: "real-parent", isAudioMessage: false, attachments: [],
+      id: "inbound-guid", text: "Hello", replyTo: "real-parent", isAudioMessage: false, attachments: [], source: "typed",
     });
     expect(normalizeInbound(received({ replyToGuid: "unrelated" }), owner, chatGuid)?.replyTo).toBeUndefined();
     expect(normalizeInbound(received({ replyTargetGuid: "inbound-guid" }), owner, chatGuid)?.replyTo).toBeUndefined();
@@ -178,7 +178,7 @@ describe("normalizeInbound", () => {
       for (const chatGuids of [[canonicalChatGuid], [chatGuid], [canonicalChatGuid, chatGuid], []]) {
         const event = received({ chatGuids }, { chatGuid: dm });
         expect(normalizeInbound(event, owner, storedGuid)).toEqual({
-          id: "inbound-guid", text: "Hello", isAudioMessage: false, attachments: [],
+          id: "inbound-guid", text: "Hello", isAudioMessage: false, attachments: [], source: "typed",
         });
         expect(event.chatGuid).toBe(dm);
         expect(event.message.chatGuids).toEqual(chatGuids);

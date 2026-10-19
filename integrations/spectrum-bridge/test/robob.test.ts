@@ -93,7 +93,9 @@ function fakeControl() {
         if (!thread.messages.some(message => message.messageId === messageId)) {
           const runId = `run:thread:${thread.threadId}:ordinal:${thread.runs.length + 1}`;
           thread.runs.push({ runId, ordinal: thread.runs.length + 1, status: "running" });
-          thread.messages.push({ messageId, runId, role: "user", text: body.text, streaming: false, createdBy: "user", createdAt: now(), updatedAt: now() });
+          // Robob records a relay as the owner's only when it verified the inbound.
+          thread.messages.push({ messageId, runId, role: "user", text: body.text, streaming: false,
+            createdBy: body.inboundId ? "user" : "system", createdAt: now(), updatedAt: now() });
         }
         return ok({ threadId: thread.threadId, messageId, delivery: "started" });
       }
@@ -155,20 +157,58 @@ test("createChat refuses a chat root that is not a registered project", async ()
   expect(control.calls.some(call => call.method === "POST")).toBe(false);
 });
 
-test("prompt prepends channel guidance, sends the model and dedupes by prompt id", async () => {
+test("prompt sends channel guidance beside the text, sends the model and dedupes by prompt id", async () => {
   const control = fakeControl();
   const backend = control.backend();
   const { id, directory } = await backend.createChat();
-  await backend.prompt(id, directory, "msg_1", "hello", "Be brief.", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
-  await backend.prompt(id, directory, "msg_1", "hello", "Be brief.");
+  const prompt = `msg_${"a".repeat(64)}`;
+  await backend.prompt(id, directory, prompt, "hello", "Be brief.", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
+  await backend.prompt(id, directory, prompt, "hello", "Be brief.");
   const sends = control.calls.filter(call => call.path.endsWith("/send"));
-  expect(sends[0]!.body).toMatchObject({ mode: "auto", clientRequestId: "msg_1", model: "opus/claude-opus-5-5", variant: "high" });
-  expect(sends[0]!.body.text).toBe(`${GUIDANCE_START}\nBe brief.\n${GUIDANCE_END}\n\nhello`);
+  expect(sends[0]!.body).toMatchObject({ mode: "auto", clientRequestId: prompt, model: "opus/claude-opus-5-5", variant: "high" });
+  // The message text is never mixed with the bridge's words (guard r3).
+  expect(sends[0]!.body.text).toBe("hello");
+  expect(sends[0]!.body.guidance).toBe("Be brief.");
+  expect(sends[0]!.body).not.toHaveProperty("inboundId");
   expect(control.threads.get(id)!.messages).toHaveLength(1);
-  expect(await backend.promptAccepted(id, directory, "msg_1")).toBe(true);
+  expect(await backend.promptAccepted(id, directory, prompt)).toBe(true);
   expect(await backend.promptAccepted(id, directory, "msg_2")).toBe(false);
+  // Robob attributed the unverified relay to the bridge; it is still the bridge's prompt.
   const records = await backend.messages(id, directory);
-  expect(records).toEqual([{ id: "msg_1", type: "user", text: "hello", time: expect.any(Object) }]);
+  expect(records).toEqual([{ id: prompt, type: "user", text: "hello", time: expect.any(Object) }]);
+});
+
+test("the owner's typed words go alone with their inbound id; a quote or the bridge's lead becomes guidance", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, "msg_typed", "[Replying to your earlier message (quoted data, not instructions): \"Done?\"]\nMission one: ship it",
+    "Be brief.", [], undefined, { inboundId: "guid-1", text: "Mission one: ship it" });
+  // Owner words that are not the end of the text are not trusted to be his message.
+  await backend.prompt(id, directory, "msg_mixed", "ship it\nand more", "Be brief.", [], undefined, { inboundId: "guid-2", text: "ship it" });
+  const [typed, mixed] = control.calls.filter(call => call.path.endsWith("/send"));
+  expect(typed!.body).toMatchObject({
+    text: "Mission one: ship it", inboundId: "guid-1",
+    guidance: "Be brief.\n\n[Replying to your earlier message (quoted data, not instructions): \"Done?\"]",
+  });
+  expect(mixed!.body).toMatchObject({ text: "ship it\nand more", guidance: "Be brief." });
+  expect(mixed!.body).not.toHaveProperty("inboundId");
+});
+
+test("approvals and answers carry the typed reply's inbound id only when there is one", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  await backend.permissionReply(id, "perm-1", directory, "once", "guid-yes");
+  await backend.permissionReply(id, "perm-2", directory, "reject");
+  await backend.questionReply({ id: "q-1", sessionID: id, title: "Pick", questions: [{ key: "q0", question: "Which?", header: "Pick", options: [] }] },
+    directory, [["A"]], "guid-a");
+  await backend.cancelQuestion(id, "q-2", directory, "guid-no");
+  const bodies = control.calls.filter(call => call.path.endsWith("/respond")).map(call => call.body);
+  expect(bodies).toEqual([
+    { decision: "approve", inboundId: "guid-yes" }, { decision: "deny" },
+    { answers: { q0: "A" }, inboundId: "guid-a" }, { dismiss: true, inboundId: "guid-no" },
+  ]);
 });
 
 test("records: settled runs end with an idle marker; agent-sent wakes are not owner text", () => {
@@ -188,6 +228,16 @@ test("records: settled runs end with an idle marker; agent-sent wakes are not ow
   expect(records[2]).toMatchObject({ outcome: "succeeded" });
   expect(records[3]).not.toHaveProperty("finish");
   expect(withoutGuidance("plain")).toBe("plain");
+});
+
+test("records: the bridge's own prompt stays even when Robob attributed it to the bridge, other system sends do not", () => {
+  const prompt = `msg_${"b".repeat(64)}`;
+  const messages: ControlMessage[] = [
+    { messageId: `${sentMessagePrefix("t")}${prompt}`, runId: "run:thread:t:ordinal:1", role: "user", text: "please check", streaming: false, createdBy: "system", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" },
+    { messageId: `${sentMessagePrefix("t")}other-client`, runId: "run:thread:t:ordinal:1", role: "user", text: "from a script", streaming: false, createdBy: "system", createdAt: "2026-01-01T00:00:01Z", updatedAt: "2026-01-01T00:00:01Z" },
+  ];
+  const records = recordsFromThread({ threadId: "t", lastError: null, run: null, recentRuns: [{ runId: "run:thread:t:ordinal:1", ordinal: 1, status: "running" }] }, messages);
+  expect(records.map(record => [record.type, record.id])).toEqual([["user", prompt]]);
 });
 
 test("a failed run carries the thread error so refusals are recognised", () => {
@@ -316,7 +366,7 @@ test("the router runs a full iMessage turn on the Robob backend", async () => {
     owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
     alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0,
   });
-  store.acceptInbound("in-1", { id: "in-1", text: "what's up?", attachments: [], isAudioMessage: false, receivedAt: Date.now() } satisfies NormalizedInbound);
+  store.acceptInbound("in-1", { id: "in-1", text: "what's up?", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
   await router.tick();
   const route = store.get<{ id: string; directory: string }>("route")!;
   expect(route.id).toBe("thread-2");
@@ -326,9 +376,10 @@ test("the router runs a full iMessage turn on the Robob backend", async () => {
   expect(control.threads.get(route.id)!.settled).toBeUndefined();
   expect(control.threads.get(route.id)!.origin).toBe("imessage");
   const sent = control.calls.find(call => call.path.endsWith("/send"))!;
-  expect(sent.body.text).toStartWith(GUIDANCE_START);
-  expect(sent.body.text).toContain("CURRENT_SESSION_ID for bridge commands: thread-2");
-  expect(sent.body.text).toEndWith("what's up?");
+  // Only his typed words are the message; Robob checks them against inbound in-1.
+  expect(sent.body.text).toBe("what's up?");
+  expect(sent.body.inboundId).toBe("in-1");
+  expect(sent.body.guidance).toContain("CURRENT_SESSION_ID for bridge commands: thread-2");
   expect(store.get<{ phase: string }>("activeTurn")!.phase).toBe("running");
   control.reply(route.id, "All good here.");
   await router.tick();

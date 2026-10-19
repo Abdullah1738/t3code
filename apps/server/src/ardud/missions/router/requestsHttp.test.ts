@@ -104,7 +104,7 @@ const said = (
   id: string,
   text: string,
   chat: InboundMessage["chat"] = "owner",
-): InboundMessage => ({ id, chat, text, receivedAt });
+): InboundMessage => ({ id, chat, text, receivedAt, typed: true });
 
 describe("owner requests over iMessage", () => {
   it.live("opens and replies only with a verified inbound message that says the same thing", () => {

@@ -45,6 +45,7 @@ import type * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTas
 import { isMasterOf } from "../core/master.ts";
 import type * as RuleService from "../core/RuleService.ts";
 import type * as MissionService from "../MissionService.ts";
+import { CurrentPrincipal, provenancePrincipal } from "../guard/principal.ts";
 import type * as MissionStore from "../store/MissionStore.ts";
 import type { SuggestionApply } from "./ports.ts";
 import type { SuggestionApplication } from "./suggestionModel.ts";
@@ -304,6 +305,10 @@ export const makeCoreAppliers = ({
           );
         }
       }
+      // The change runs with the decider's authority, the way the same edit
+      // made directly would: the schedule guard checks it, and the task's
+      // recorded authority becomes the decider rather than staying as it was.
+      const asDecider = Effect.provideService(CurrentPrincipal, provenancePrincipal(provenance));
       const onlyEnabled =
         after.title === undefined && after.prompt === undefined && after.schedule === undefined;
       if (onlyEnabled) {
@@ -312,7 +317,7 @@ export const makeCoreAppliers = ({
         }
         yield* schedules
           .setEnabled({ id: task.id, enabled: after.enabled })
-          .pipe(Effect.mapError(fromSchedules));
+          .pipe(asDecider, Effect.mapError(fromSchedules));
         return `Applied: schedule ${task.title} ${after.enabled ? "enabled" : "paused"}.`;
       }
       const input = yield* decodeScheduleUpsert({
@@ -333,7 +338,7 @@ export const makeCoreAppliers = ({
           (cause) => new MissionError({ code: "invalid", detail: `Schedule: ${cause.message}` }),
         ),
       );
-      yield* schedules.upsert(input).pipe(Effect.mapError(fromSchedules));
+      yield* schedules.upsert(input).pipe(asDecider, Effect.mapError(fromSchedules));
       return `Applied: schedule ${input.title} updated.`;
     });
 

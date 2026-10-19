@@ -19,6 +19,7 @@ import * as Stream from "effect/Stream";
 
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import * as RuleService from "../core/RuleService.ts";
+import { CurrentPrincipal, type GuardPrincipal } from "../guard/principal.ts";
 import * as MissionService from "../MissionService.ts";
 import { HAIKU, modelKey } from "../policy/models.ts";
 import * as PolicyService from "../policy/PolicyService.ts";
@@ -64,15 +65,24 @@ const task = (id: string, threadId: string): ScheduledTask =>
 const testLayer = () => {
   const tasks = [task("on-lane", laneThread), task("elsewhere", "thread-elsewhere")];
   const enabledCalls: Array<{ readonly id: string; readonly enabled: boolean }> = [];
+  // Who the schedule service saw acting: the guard reads this to check and
+  // record the change's authority.
+  const principals: Array<GuardPrincipal | undefined> = [];
   const unused = () => Effect.die("not used in these tests");
   const schedules = Layer.succeed(
     ScheduledTaskService.ScheduledTaskService,
     ScheduledTaskService.ScheduledTaskService.of({
       list: () => Effect.succeed({ tasks }),
       subscribeList: () => Stream.succeed({ tasks }),
-      upsert: unused,
+      upsert: (input) =>
+        Effect.gen(function* () {
+          principals.push(yield* CurrentPrincipal);
+          const found = tasks.find((candidate) => candidate.id === input.id)!;
+          return { task: { ...found, title: input.title } };
+        }),
       setEnabled: (input) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
+          principals.push(yield* CurrentPrincipal);
           enabledCalls.push(input);
           const found = tasks.find((candidate) => candidate.id === input.id)!;
           return { task: { ...found, enabled: input.enabled } };
@@ -92,7 +102,7 @@ const testLayer = () => {
   const layer = Layer.mergeAll(RuleService.layer, policy, schedules).pipe(
     Layer.provideMerge(harness().layer),
   );
-  return { enabledCalls, layer };
+  return { enabledCalls, principals, layer };
 };
 
 /** Proposes as the governor, then decides; returns the suggestion and its decision event. */
@@ -134,7 +144,7 @@ const kinds = (events: ReadonlyArray<MissionEvent>) => events.map((event) => eve
 
 describe("suggestion appliers", () => {
   it.effect("every kind applies through its owning service, caused by the decision", () => {
-    const { enabledCalls, layer } = testLayer();
+    const { enabledCalls, principals, layer } = testLayer();
     return Effect.gen(function* () {
       yield* seed;
       const store = yield* MissionStore.MissionStore;
@@ -271,6 +281,17 @@ describe("suggestion appliers", () => {
       expect(elsewhere.decided.outcome).toContain("Not applied");
       expect(elsewhere.decided.outcome).toContain("does not run on this mission's threads");
       expect(enabledCalls).toHaveLength(1);
+      // The change ran as the master that decided it, not as an unchecked
+      // in-process caller that would leave the task's old authority in place.
+      expect(principals).toEqual([{ _tag: "thread", threadId: masterThread, title: masterThread }]);
+      const retitled = yield* acceptThrough(
+        "schedule",
+        null,
+        { taskId: "on-lane", title: "Check the queue twice" },
+        ownerApp,
+      );
+      expect(retitled.decided.outcome).toBe("Applied: schedule Check the queue twice updated.");
+      expect(principals.at(-1)).toEqual({ _tag: "owner", provenance: ownerApp });
 
       // Draft notes are the owner's and apply inside asks.
       const note = yield* acceptThrough(

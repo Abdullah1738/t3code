@@ -4,7 +4,12 @@
  * watch, a fork) names its caller here from the authenticated transport only,
  * never from the request body.
  */
-import type { ClientSurface, OrchestrationV2Actor, ThreadId } from "@t3tools/contracts";
+import type {
+  ClientSurface,
+  MissionProvenance,
+  OrchestrationV2Actor,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 
 import { ownerAppProvenance } from "../core/provenance.ts";
@@ -42,6 +47,34 @@ export const wsPrincipal = (input: {
   return provenance === null
     ? { _tag: "session", sessionId: input.session.sessionId, subject: input.session.subject }
     : { _tag: "owner", provenance };
+};
+
+/**
+ * The principal a recorded mission decision acts as, for work done on its
+ * behalf later (an accepted suggestion applying a schedule change). The owner
+ * stays the owner, an agent is its thread, and a component or import is a
+ * session the guard judges like any other.
+ */
+export const provenancePrincipal = (provenance: MissionProvenance): GuardPrincipal => {
+  switch (provenance._tag) {
+    case "owner-app":
+    case "owner-imessage":
+      return { _tag: "owner", provenance };
+    case "agent":
+      return { _tag: "thread", threadId: provenance.threadId, title: provenance.threadId };
+    case "system":
+      return {
+        _tag: "session",
+        sessionId: `component:${provenance.component}`,
+        subject: provenance.component,
+      };
+    case "import":
+      return {
+        _tag: "session",
+        sessionId: `import:${provenance.source}`,
+        subject: `import:${provenance.source}`,
+      };
+  }
 };
 
 /** How a write by this principal is stamped on the thread timeline. */

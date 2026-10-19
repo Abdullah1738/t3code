@@ -1,4 +1,4 @@
-import { IMESSAGE_ORIGIN, type ChatBackend, type FilePart, type MessageRecord, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus } from "./openchamber.ts";
+import { IMESSAGE_ORIGIN, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -7,16 +7,12 @@ import { imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 
 /**
- * The control API has no system or synthetic record, so the per-turn channel
- * guidance is prepended to the prompt between these markers. messages() strips
- * it again, so recaps and turn reads only see what the owner wrote.
+ * Per-turn channel guidance goes to Robob beside the message (`guidance`), and
+ * Robob frames it between these markers for the agent. Older messages carry it
+ * inline; messages() strips it, so recaps and turn reads only see his words.
  */
 export const GUIDANCE_START = "[Channel guidance from the iMessage bridge, not typed by the owner]";
 export const GUIDANCE_END = "[End of channel guidance. The owner's message follows.]";
-
-export function withGuidance(system: string, text: string): string {
-  return system.trim() ? `${GUIDANCE_START}\n${system.trim()}\n${GUIDANCE_END}\n\n${text}` : text;
-}
 
 export function withoutGuidance(text: string): string {
   if (!text.startsWith(GUIDANCE_START)) return text;
@@ -39,12 +35,17 @@ function promptId(threadId: string, message: ControlMessage): string {
   try { return decodeURIComponent(message.messageId.slice(prefix.length)); } catch { return message.messageId; }
 }
 
+/** The router's prompt ids (`msg_` plus a sha256), which it sends as `clientRequestId`. */
+const BRIDGE_PROMPT = /^msg_[0-9a-f]{64}$/;
+
 /**
  * Rebuilds OpenCode-2-style session records from Robob runs and messages, the
  * shape the router reads turns from: each run's user prompt, its assistant
  * steps, then an `idle` marker once the run has settled. User messages the
  * agent or server sent to itself (background completion wakes) are left out:
- * to the router a user record means the owner wrote something.
+ * to the router a user record means the owner wrote something. The bridge's
+ * own prompts stay in even when Robob did not record them as the owner's (a
+ * relay it could not verify is attributed to the bridge, not to him).
  */
 export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recentRuns" | "run" | "lastError">, messages: ControlMessage[]): MessageRecord[] {
   const runs = new Map<string, RunSummary>();
@@ -66,8 +67,10 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
     for (const message of group) {
       const created = epoch(message.createdAt);
       if (message.role === "user") {
-        if (message.createdBy !== undefined && message.createdBy !== "user") continue;
-        records.push({ id: promptId(thread.threadId, message), type: "user", text: withoutGuidance(message.text), time: { created } });
+        const id = promptId(thread.threadId, message);
+        const bridgeSent = id !== message.messageId && BRIDGE_PROMPT.test(id);
+        if (message.createdBy !== undefined && message.createdBy !== "user" && !bridgeSent) continue;
+        records.push({ id, type: "user", text: withoutGuidance(message.text), time: { created } });
         continue;
       }
       const done = settled || !message.streaming;
@@ -239,17 +242,27 @@ export class RobobBackend implements ChatBackend {
    * One send per prompt. `clientRequestId` is the router's prompt id, so a
    * retried POST replays instead of sending twice, and the message reads back
    * under that id. The send returns once Robob durably accepted it.
+   *
+   * The message text is only what the owner wrote. Channel guidance (and any
+   * quote of the message he replied to) goes in `guidance`, which Robob gives
+   * the agent framed as not his. With `owner` set the text is his typed words
+   * exactly, and `inboundId` lets Robob check them against this store.
    */
   async prompt(id: string, _directory: string, messageId: string, text: string, system = "", files: readonly FilePart[] = [],
-    model?: { providerID: string; modelID: string; variant?: string }): Promise<void> {
+    model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords): Promise<void> {
     const threadId = await this.resolve(id);
     const attachments = [];
     for (const [index, file] of files.entries()) {
       const { mimeType, bytes } = dataUrl(file.url);
       attachments.push(await this.client.upload({ name: file.filename ?? `attachment-${index + 1}`, mimeType: file.mime || mimeType, bytes }));
     }
+    const words = owner !== undefined && text.endsWith(owner.text) ? owner : undefined;
+    const lead = words ? text.slice(0, text.length - words.text.length).trim() : "";
+    const guidance = [system.trim(), lead].filter(Boolean).join("\n\n");
     await this.client.request("POST", `/threads/${encodeURIComponent(threadId)}/send`, {
-      text: withGuidance(system, text), mode: "auto", clientRequestId: messageId,
+      text: words ? words.text : text, mode: "auto", clientRequestId: messageId,
+      ...(guidance ? { guidance } : {}),
+      ...(words ? { inboundId: words.inboundId } : {}),
       ...(model ? { model: `${model.providerID}/${model.modelID}`, ...(model.variant ? { variant: model.variant } : {}) } : {}),
       ...(attachments.length ? { attachments } : {}),
     }, { timeoutMs: 60_000 });
@@ -284,23 +297,26 @@ export class RobobBackend implements ChatBackend {
     return thread.pendingRequests.filter(request => request.kind === "question").map(request => questionFrom(request, sessionId));
   }
 
-  async permissionReply(sessionId: string, requestId: string, _directory: string, reply: "once" | "reject"): Promise<boolean> {
+  /** With `inboundId`, Robob checks the owner's reply before it counts the answer as his. */
+  async permissionReply(sessionId: string, requestId: string, _directory: string, reply: "once" | "reject", inboundId?: string): Promise<boolean> {
     if (reply !== "once" && reply !== "reject") throw new Error("Invalid permission reply");
-    await this.client.respond(await this.resolve(sessionId), requestId, { decision: reply === "once" ? "approve" : "deny" });
+    await this.client.respond(await this.resolve(sessionId), requestId, {
+      decision: reply === "once" ? "approve" : "deny", ...(inboundId ? { inboundId } : {}),
+    });
     return true;
   }
 
   /** Answers keyed by question id; values are the option labels (or free text where allowed). */
-  async questionReply(request: QuestionRequest, _directory: string, answers: string[][]): Promise<boolean> {
+  async questionReply(request: QuestionRequest, _directory: string, answers: string[][], inboundId?: string): Promise<boolean> {
     if (request.unsupported || answers.length !== request.questions.length) throw new Error("Invalid form answer");
     const body = Object.fromEntries(request.questions.map((question, index) =>
       [question.key, question.multiple === true ? answers[index]! : answers[index]![0]!]));
-    await this.client.respond(await this.resolve(request.sessionID), request.id, { answers: body });
+    await this.client.respond(await this.resolve(request.sessionID), request.id, { answers: body, ...(inboundId ? { inboundId } : {}) });
     return true;
   }
 
-  async cancelQuestion(sessionId: string, requestId: string): Promise<boolean> {
-    await this.client.respond(await this.resolve(sessionId), requestId, { dismiss: true });
+  async cancelQuestion(sessionId: string, requestId: string, _directory?: string, inboundId?: string): Promise<boolean> {
+    await this.client.respond(await this.resolve(sessionId), requestId, { dismiss: true, ...(inboundId ? { inboundId } : {}) });
     return true;
   }
 

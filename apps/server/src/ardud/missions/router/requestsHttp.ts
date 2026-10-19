@@ -149,6 +149,9 @@ const makeRoutes = Effect.gen(function* () {
       const verified = verifyInbound({
         inboundId,
         inbound: message,
+        // The text is the request itself (or his reply to it), checked word for
+        // word, so the message is tied to it by what it says.
+        binding: { _tag: "tied" },
         check: answerCheck({ options: [], optionId: null, text }),
         notBefore,
         what,
