@@ -6,7 +6,6 @@ import * as Option from "effect/Option";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
-  addressed,
   agent,
   askInput,
   at,
@@ -84,7 +83,7 @@ describe("AsksService", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("takes an iMessage answer only with a verified inbound from the owner or Moni", () => {
+  it.effect("takes an iMessage answer only as evidence a transport already redeemed", () => {
     const inbox: Array<InboundMessage> = [];
     const { layer } = harness(inbox);
     const T = Date.parse(at);
@@ -93,59 +92,49 @@ describe("AsksService", () => {
       const asks = yield* AsksService.AsksService;
       const first = yield* asks.openAsk(askInput("Which way?"), agent(masterThread));
       const second = yield* asks.openAsk(askInput("Which way for staging?"), agent(masterThread));
-      const relay = agent(masterThread);
-      inbox.push(
-        typedInbound("spc-msg-1", addressed(first.id, "Go offline window"), T),
-        typedInbound("moni-guid-1", addressed(second.id, "online please"), T, "moni"),
-        typedInbound("wake:abc", addressed(first.id, "offline window"), T),
-        // Sol P1: the right words without the ask's handle, or under another
-        // ask's handle, are not addressed to this ask.
-        typedInbound("spc-msg-bare", "offline window", T),
-        typedInbound("spc-msg-other", addressed(second.id, "offline window"), T),
-      );
-      for (const inboundId of ["spc-msg-bare", "spc-msg-other"]) {
+      inbox.push(typedInbound("spc-msg-1", "offline", T));
+
+      // Sol r4 Q1 at the service boundary: an agent (or any other adapter) naming a
+      // genuine typed iMessage is refused; the service never looks it up itself.
+      for (const caller of [
+        agent(masterThread),
+        { _tag: "system" as const, component: "telegram-bridge" },
+      ]) {
         expect(
           yield* failureCode(
-            asks.answerAsk({ askId: first.id, optionId: "b", text: "", inboundId }, relay),
+            asks.answerAsk(
+              { askId: first.id, optionId: "b", text: "", inboundId: "spc-msg-1" },
+              caller,
+            ),
           ),
-        ).toBe("provenance-invalid");
+        ).toBe("forbidden");
       }
+      expect((yield* asks.ask(first.id)).status).toBe("open");
 
+      const redeemed = {
+        _tag: "owner-imessage" as const,
+        chat: "owner" as const,
+        inboundId: "spc-msg-1",
+        quote: "offline",
+      };
+      // The evidence must be for the inbound id the input names.
       expect(
         yield* failureCode(
           asks.answerAsk(
-            { askId: first.id, optionId: "b", text: "", inboundId: "wake:abc" },
-            relay,
+            { askId: first.id, optionId: "b", text: "", inboundId: "spc-msg-2" },
+            redeemed,
           ),
         ),
       ).toBe("provenance-invalid");
-      expect(
-        yield* failureCode(
-          asks.answerAsk(
-            { askId: first.id, optionId: "a", text: "", inboundId: "spc-msg-1" },
-            relay,
-          ),
-        ),
-      ).toBe("provenance-invalid");
-      expect(
-        yield* failureCode(
-          asks.answerAsk({ askId: first.id, optionId: "b", text: "", inboundId: "missing" }, relay),
-        ),
-      ).toBe("provenance-invalid");
-
       const viaOwner = yield* asks.answerAsk(
         { askId: first.id, optionId: "b", text: "", inboundId: "spc-msg-1" },
-        relay,
+        redeemed,
       );
-      expect(viaOwner.ask.answer?.provenance).toEqual({
-        _tag: "owner-imessage",
-        chat: "owner",
-        inboundId: "spc-msg-1",
-      });
+      expect(viaOwner.ask.answer?.provenance).toEqual(redeemed);
 
       const viaMoni = yield* asks.answerAsk(
         { askId: second.id, optionId: "a", text: "", inboundId: "moni-guid-1" },
-        relay,
+        { _tag: "owner-imessage", chat: "moni", inboundId: "moni-guid-1", quote: "a" },
       );
       expect(viaMoni.ask.answer?.provenance).toMatchObject({
         _tag: "owner-imessage",

@@ -2,7 +2,9 @@
  * Missions desk over the local control API, for the `mission` CLI and
  * robob-watch checks. Same auth and `{ ok, ... }` envelope as
  * `/api/ardud/control`. Callers here are never the owner: answers and draft
- * approvals only pass with an iMessage inbound id the server verifies.
+ * decisions pass only with the inbound id of the iMessage in which he said so,
+ * redeemed once through the shared inbound ledger by the iMessage bridge or
+ * mission CLI credential (any other caller is refused before the lookup).
  *
  * Systems in SYSTEM_DRAFT_COMPONENTS (crw) also open drafts here for one exact
  * code head, stale-close their own, read the decision for that head and report
@@ -34,7 +36,13 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import { parseSince } from "../../control/model.ts";
+import { componentProvenance, isOwnerSession, type OriginSession } from "../core/provenance.ts";
+import { inboundLedger } from "../guard/inboundActions.ts";
+import * as MissionStore from "../store/MissionStore.ts";
+import { askEpochOf, askReopened } from "./askModel.ts";
 import { AsksService } from "./AsksService.ts";
+import { epochOf, revisionOf } from "./draftModel.ts";
+import { canRedeemInbound } from "./provenance.ts";
 import {
   isWatchKind,
   watchAddCommand,
@@ -50,6 +58,18 @@ const MISSION_CLI = "mission";
 
 /** Everything arriving here is a token holder, not the owner typing in Robob. */
 export const CONTROL_PROVENANCE: MissionProvenance = { _tag: "system", component: "control-api" };
+
+/** Who a desk call comes from: its credential's component, else the shared control token. */
+export const deskCaller = (session: OriginSession): MissionProvenance =>
+  componentProvenance(session) ?? CONTROL_PROVENANCE;
+
+/**
+ * Whether a desk caller reads what the owner would see: a paired owner
+ * session, or the credentials his iMessage agent acts through (the bridge and
+ * the mission CLI). Every other token keeps the narrower view.
+ */
+export const ownerView = (session: OriginSession) =>
+  isOwnerSession(session) || canRedeemInbound(deskCaller(session));
 
 /** Systems that open their own drafts over HTTP, in their own name. */
 const SYSTEM_DRAFT_COMPONENTS: ReadonlySet<string> = new Set(["crw"]);
@@ -223,6 +243,8 @@ const WATCH_MAX_EVENTS = 5_000;
 const makeRoutes = Effect.gen(function* () {
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
   const asks = yield* AsksService;
+  const store = yield* MissionStore.MissionStore;
+  const ledger = yield* inboundLedger;
 
   const authenticate = (
     scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
@@ -246,8 +268,13 @@ const makeRoutes = Effect.gen(function* () {
 
   const read = <A, R>(effect: Effect.Effect<A, DeskError | MissionError, R>) =>
     authenticate(AuthOrchestrationReadScope).pipe(Effect.andThen(effect));
-  const write = <A, R>(effect: Effect.Effect<A, DeskError | MissionError, R>) =>
-    authenticate(AuthOrchestrationOperateScope).pipe(Effect.andThen(effect));
+  /** A write that needs to know its caller (iMessage redemption checks it first). */
+  const writeAs = <A, R>(
+    effect: (caller: MissionProvenance) => Effect.Effect<A, DeskError | MissionError, R>,
+  ) =>
+    authenticate(AuthOrchestrationOperateScope).pipe(
+      Effect.flatMap((session) => effect(deskCaller(session))),
+    );
 
   const nowMs = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
 
@@ -305,20 +332,41 @@ const makeRoutes = Effect.gen(function* () {
     }),
   );
 
-  const answer = write(
+  const answer = writeAs((caller) =>
     Effect.gen(function* () {
       const askId = AskId.make(yield* param("askId"));
       const body = yield* decodeBody(decodeAnswerBody);
-      const result = yield* asks.answerAsk(
-        {
-          askId,
-          optionId: body.optionId ?? null,
-          text: body.text ?? "",
-          inboundId: body.inboundId,
-        },
-        CONTROL_PROVENANCE,
+      const input = {
+        askId,
+        optionId: body.optionId ?? null,
+        text: body.text ?? "",
+        inboundId: body.inboundId,
+      };
+      return json(
+        yield* ledger.once(
+          {
+            caller,
+            inboundId: body.inboundId,
+            subject: `ask:${askId}`,
+            action: "answer",
+            payload: { optionId: input.optionId, text: input.text },
+            what: "Answering an ask",
+            notBefore: () =>
+              asks.ask(askId).pipe(
+                Effect.map((ask) => ({
+                  at: askEpochOf(ask),
+                  ...(askReopened(ask) ? { skewMs: 0 } : {}),
+                })),
+              ),
+          },
+          (owner) =>
+            asks
+              .answerAsk(input, owner)
+              .pipe(
+                Effect.map((result) => ({ ok: true, ask: result.ask, released: result.released })),
+              ),
+        ),
       );
-      return json({ ok: true, ask: result.ask, released: result.released });
     }),
   );
 
@@ -333,22 +381,62 @@ const makeRoutes = Effect.gen(function* () {
     }),
   );
 
-  const decide = write(
+  const decide = writeAs((caller) =>
     Effect.gen(function* () {
       const draftId = DraftId.make(yield* param("draftId"));
       const body = yield* decodeBody(decodeDecideBody);
-      const result = yield* asks.decideDraft(
-        {
-          draftId,
-          action: body.action,
-          inboundId: body.inboundId,
-          ...(body.editedText === undefined ? {} : { editedText: body.editedText }),
-          ...(body.rewriteNote === undefined ? {} : { rewriteNote: body.rewriteNote }),
-          ...(body.revision === undefined ? {} : { revision: body.revision }),
-        },
-        CONTROL_PROVENANCE,
+      const input = {
+        draftId,
+        action: body.action,
+        inboundId: body.inboundId,
+        ...(body.editedText === undefined ? {} : { editedText: body.editedText }),
+        ...(body.rewriteNote === undefined ? {} : { rewriteNote: body.rewriteNote }),
+        ...(body.revision === undefined ? {} : { revision: body.revision }),
+      };
+      return json(
+        yield* ledger.once(
+          {
+            caller,
+            inboundId: body.inboundId,
+            subject: `draft:${draftId}`,
+            action: "decide",
+            payload: {
+              action: body.action,
+              editedText: body.editedText ?? null,
+              rewriteNote: body.rewriteNote ?? null,
+              revision: body.revision ?? null,
+            },
+            what: "Deciding a draft",
+            notBefore: () =>
+              store.get("draft", draftId).pipe(
+                Effect.flatMap(
+                  Option.match({
+                    onNone: () =>
+                      Effect.fail(
+                        new MissionError({
+                          code: "not-found",
+                          detail: `Draft ${draftId} not found.`,
+                        }),
+                      ),
+                    onSome: (draft) =>
+                      Effect.succeed({
+                        at: epochOf(draft),
+                        ...(revisionOf(draft) > 0 ? { skewMs: 0 } : {}),
+                      }),
+                  }),
+                ),
+              ),
+          },
+          (owner) =>
+            asks.decideDraft(input, owner).pipe(
+              Effect.map((result) => ({
+                ok: true,
+                draft: result.draft,
+                suggestions: result.suggestions,
+              })),
+            ),
+        ),
       );
-      return json({ ok: true, draft: result.draft, suggestions: result.suggestions });
     }),
   );
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
   ApprovalId,
+  AskId,
   EnvironmentId,
   MissionError,
   OwnerRequestId,
@@ -21,7 +22,6 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import * as SecretRequests from "../../../secrets/SecretRequests.ts";
 import * as AsksService from "../asks/AsksService.ts";
 import {
-  addressed,
   askInput,
   at,
   harness,
@@ -177,60 +177,36 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("records the owner's answer only with a verified iMessage", () => {
+  it.effect("never lets an agent redeem the owner's iMessage to answer an ask", () => {
     const inbox: Array<InboundMessage> = [];
-    const { deliveries, layer } = toolsLayer(inbox);
+    const { layer } = toolsLayer(inbox);
     return Effect.gen(function* () {
       yield* seed;
       const master = threadCaller(masterThread);
       const opened = yield* call("mission_ask", master, askInput("Online or offline?"));
       const askId = (opened.structured.ask as { id: string }).id;
-      inbox.push(
-        typedInbound(
-          "spc-msg-9",
-          addressed(askId, "offline window please"),
-          Date.parse(at) + 60_000,
-        ),
-      );
+      inbox.push(typedInbound("spc-msg-9", "offline window please", Date.parse(at) + 60_000));
 
-      // An agent cannot answer on its own: the inbound id is required and must verify.
+      // Even a genuine typed iMessage id does nothing here: the tool has no inbound
+      // parameter, and the master has no owner condition, so the answer is refused.
       const missing = yield* Effect.exit(call("mission_ask_answer", master, { askId, text: "b" }));
       expect(missing._tag === "Failure" || missing.value.isError).toBe(true);
-      const forged = yield* call("mission_ask_answer", master, {
-        askId,
-        optionId: "b",
-        text: "",
-        inboundId: "wake:forged",
-      });
-      expect(forged.isError).toBe(true);
-      expect(forged.text).toContain("provenance-invalid");
-
-      const answered = yield* call("mission_ask_answer", master, {
-        askId,
-        optionId: "b",
-        text: "",
-        inboundId: "spc-msg-9",
-      });
-      expect(answered.isError).toBe(false);
-      const ask = answered.structured.ask as {
-        status: string;
-        answer: { provenance: { _tag: string; inboundId: string } };
-      };
-      expect(ask.status).toBe("answered");
-      expect(ask.answer.provenance).toEqual({
-        _tag: "owner-imessage",
-        chat: "owner",
-        inboundId: "spc-msg-9",
-      });
-      // The held work item is free again and the asker heard about it.
-      const store = yield* MissionStore.MissionStore;
-      const item = yield* store.get("work-item", WorkItemId.make("wi-held"));
-      expect(Option.getOrThrow(item).blockedBy).toEqual([]);
-      expect(deliveries.some((delivery) => delivery.threadId === masterThread)).toBe(true);
+      const smuggled = yield* Effect.exit(
+        call("mission_ask_answer", master, {
+          askId,
+          optionId: "b",
+          text: "",
+          inboundId: "spc-msg-9",
+        }),
+      );
+      expect(smuggled._tag === "Failure" || smuggled.value.isError).toBe(true);
+      const asks = yield* AsksService.AsksService;
+      const ask = yield* asks.ask(AskId.make(askId));
+      expect(ask.status).toBe("open");
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("drafts carry the owner's notes and need his iMessage to be approved by tool", () => {
+  it.effect("drafts carry the owner's notes and agents cannot approve his drafts by tool", () => {
     const inbox: Array<InboundMessage> = [];
     const { layer } = toolsLayer(inbox);
     return Effect.gen(function* () {
@@ -257,26 +233,22 @@ describe("mission MCP tools", () => {
       expect(submitted.isError).toBe(false);
       const draft = submitted.structured.draft as { id: string; appliedNoteIds: string[] };
       expect(draft.appliedNoteIds.length).toBe(1);
-      inbox.push(
-        typedInbound("spc-msg-2", addressed(draft.id, "ok send it"), Date.parse(at) + 60_000),
-      );
+      inbox.push(typedInbound("spc-msg-2", "ok send it", Date.parse(at) + 60_000));
 
-      // A lane thread approving on its own is refused; the owner's iMessage approves.
-      const refused = yield* call("mission_draft_approve", threadCaller(laneThread), {
-        draftId: draft.id,
-        action: "approve",
-        inboundId: "spc-msg-unknown",
-      });
-      expect(refused.isError).toBe(true);
-      const approved = yield* call("mission_draft_approve", writer, {
-        draftId: draft.id,
-        action: "approve",
-        inboundId: "spc-msg-2",
-      });
-      expect(approved.isError).toBe(false);
-      expect((approved.structured.draft as { status: string; sentAt: unknown }).status).toBe(
-        "approved",
-      );
+      // A lane or writer thread naming the owner's iMessage is refused either way.
+      for (const caller of [threadCaller(laneThread), writer]) {
+        const refused = yield* Effect.exit(
+          call("mission_draft_approve", caller, {
+            draftId: draft.id,
+            action: "approve",
+            revision: 0,
+            inboundId: "spc-msg-2",
+          }),
+        );
+        expect(refused._tag === "Failure" || refused.value.isError).toBe(true);
+      }
+      const still = yield* asks.drafts({ missionId });
+      expect(still.find((row) => row.id === draft.id)?.status).toBe("pending");
     }).pipe(Effect.provide(layer));
   });
 

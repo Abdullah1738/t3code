@@ -13,7 +13,6 @@ import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
-  addressed,
   agent,
   askInput,
   harness,
@@ -36,11 +35,17 @@ const SCOPES = {
   "Bearer crw-read": READ,
   "Bearer crw": OPERATE,
   "Bearer scribe": OPERATE,
+  "Bearer imessage": OPERATE,
+  "Bearer cli": OPERATE,
+  "Bearer telegram": OPERATE,
 };
 const COMPONENT: Partial<Record<keyof typeof SCOPES, string>> = {
   "Bearer crw-read": "crw",
   "Bearer crw": "crw",
   "Bearer scribe": "scribe",
+  "Bearer imessage": "spectrum-bridge",
+  "Bearer cli": "mission-cli",
+  "Bearer telegram": "telegram-bridge",
 };
 
 const fakeAuth = {
@@ -80,7 +85,7 @@ type Handler = (request: Request) => Promise<Response>;
 /** Serves the desk routes over the test's own AsksService instance. */
 const withDesk = <A>(use: (handler: Handler) => Promise<A>) =>
   Effect.gen(function* () {
-    const context = yield* Effect.context<AsksService.AsksService>();
+    const context = yield* Effect.context<AsksService.AsksService | MissionStore.MissionStore>();
     const routes = missionsDeskRouteLayer.pipe(
       Layer.provide(
         Layer.mergeAll(
@@ -106,47 +111,54 @@ const withDesk = <A>(use: (handler: Handler) => Promise<A>) =>
 const body = async (response: Response) => (await response.json()) as Record<string, any>;
 
 describe("missions desk HTTP", () => {
-  it.live("answers only with a verified iMessage and never as the token holder", () => {
+  it.live("answers only with an iMessage the bridge or mission CLI redeems, once", () => {
     const inbox: Array<InboundMessage> = [];
     const { deliveries, layer } = harness(inbox);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
       const ask = yield* asks.openAsk(askInput("Which way?"), agent(masterThread));
-      inbox.push(typedInbound("spc-msg-1", addressed(ask.id, "go online"), LATER));
+      // His words, as he typed them: no handle and no option grammar.
+      inbox.push(typedInbound("spc-msg-1", "lets go with the first one", LATER));
+      const answer = (token: keyof typeof SCOPES, extra: Record<string, unknown>) =>
+        request(`/asks/${ask.id}/answer`, token, { optionId: "a", ...extra });
 
       const result = yield* withDesk(async (handle) => {
         const anonymous = await handle(request(`/status?mission=${missionId}`, null));
         const status = await body(
           await handle(request(`/status?mission=${missionId}`, "Bearer read")),
         );
-        const readOnly = await handle(
-          request(`/asks/${ask.id}/answer`, "Bearer read", {
-            optionId: "a",
-            inboundId: "spc-msg-1",
-          }),
+        const readOnly = await handle(answer("Bearer read", { inboundId: "spc-msg-1" }));
+        const noInbound = await handle(answer("Bearer cli", {}));
+        const forged = await body(await handle(answer("Bearer cli", { inboundId: "wake:x" })));
+        // Sol r4 Q1: other credentials never lift a genuine typed message.
+        const telegram = await body(
+          await handle(answer("Bearer telegram", { inboundId: "spc-msg-1" })),
         );
-        const noInbound = await handle(
-          request(`/asks/${ask.id}/answer`, "Bearer operate", { optionId: "a" }),
+        const control = await body(
+          await handle(answer("Bearer operate", { inboundId: "spc-msg-1" })),
         );
-        const forged = await body(
-          await handle(
-            request(`/asks/${ask.id}/answer`, "Bearer operate", {
-              optionId: "a",
-              inboundId: "wake:x",
-            }),
-          ),
+        const answered = await body(await handle(answer("Bearer cli", { inboundId: "spc-msg-1" })));
+        const replay = await body(
+          await handle(answer("Bearer imessage", { inboundId: "spc-msg-1" })),
         );
-        const answered = await body(
-          await handle(
-            request(`/asks/${ask.id}/answer`, "Bearer operate", {
-              optionId: "a",
-              inboundId: "spc-msg-1",
-            }),
-          ),
+        const otherOption = await body(
+          await handle(answer("Bearer cli", { optionId: "b", inboundId: "spc-msg-1" })),
         );
         const missing = await handle(request("/asks/ask-none", "Bearer read"));
-        return { anonymous, status, readOnly, noInbound, forged, answered, missing };
+        return {
+          anonymous,
+          status,
+          readOnly,
+          noInbound,
+          forged,
+          telegram,
+          control,
+          answered,
+          replay,
+          otherOption,
+          missing,
+        };
       });
 
       expect(result.anonymous.status).toBe(401);
@@ -155,22 +167,27 @@ describe("missions desk HTTP", () => {
       expect(result.readOnly.status).toBe(403);
       expect(result.noInbound.status).toBe(400);
       expect(result.forged).toMatchObject({ ok: false, error: { code: "forbidden" } });
+      expect(result.telegram).toMatchObject({ ok: false, error: { code: "forbidden" } });
+      expect(result.control).toMatchObject({ ok: false, error: { code: "forbidden" } });
       expect(result.answered.ok).toBe(true);
       expect(result.answered.ask.answer.provenance).toEqual({
         _tag: "owner-imessage",
         chat: "owner",
         inboundId: "spc-msg-1",
+        quote: "lets go with the first one",
       });
       expect(result.answered.released.map((ref: { id: string }) => ref.id)).toEqual([
         "wi-held",
         "lane-api",
       ]);
+      expect(result.replay).toEqual(result.answered);
+      expect(result.otherOption).toMatchObject({ ok: false, error: { code: "conflict" } });
       expect(result.missing.status).toBe(404);
-      expect(deliveries.some((delivery) => delivery.threadId === masterThread)).toBe(true);
+      expect(deliveries.filter((delivery) => delivery.threadId === masterThread).length).toBe(1);
     }).pipe(Effect.provide(layer));
   });
 
-  it.live("decides drafts only with the owner's iMessage", () => {
+  it.live("decides drafts only with the owner's redeemed iMessage", () => {
     const inbox: Array<InboundMessage> = [];
     const { layer } = harness(inbox);
     return Effect.gen(function* () {
@@ -186,28 +203,38 @@ describe("missions desk HTTP", () => {
         },
         agent(writerThread),
       );
-      inbox.push(typedInbound("spc-msg-5", addressed(draft.id, "ok send it"), LATER, "moni"));
+      inbox.push(typedInbound("spc-msg-5", "the sara one is fine", LATER, "moni"));
       const result = yield* withDesk(async (handle) => {
         const pending = await body(await handle(request("/drafts?status=pending", "Bearer read")));
         const noInbound = await handle(
-          request(`/drafts/${draft.id}/decide`, "Bearer operate", { action: "approve" }),
+          request(`/drafts/${draft.id}/decide`, "Bearer cli", { action: "approve" }),
         );
-        const approved = await body(
+        const telegram = await body(
           await handle(
-            request(`/drafts/${draft.id}/decide`, "Bearer operate", {
+            request(`/drafts/${draft.id}/decide`, "Bearer telegram", {
               action: "approve",
               inboundId: "spc-msg-5",
             }),
           ),
         );
-        return { pending, noInbound, approved };
+        const approved = await body(
+          await handle(
+            request(`/drafts/${draft.id}/decide`, "Bearer imessage", {
+              action: "approve",
+              inboundId: "spc-msg-5",
+            }),
+          ),
+        );
+        return { pending, noInbound, telegram, approved };
       });
       expect(result.pending.drafts.map((open: { id: string }) => open.id)).toEqual([draft.id]);
       expect(result.noInbound.status).toBe(400);
+      expect(result.telegram).toMatchObject({ ok: false, error: { code: "forbidden" } });
       expect(result.approved.draft.status).toBe("approved");
       expect(result.approved.draft.decidedBy).toMatchObject({
         _tag: "owner-imessage",
         chat: "moni",
+        quote: "the sara one is fine",
       });
     }).pipe(Effect.provide(layer));
   });

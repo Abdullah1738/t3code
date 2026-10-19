@@ -183,12 +183,11 @@ const MissionAskWithdrawTool = Tool.make("mission_ask_withdraw", {
 
 const MissionAskAnswerTool = Tool.make("mission_ask_answer", {
   description:
-    "Record the owner's answer to an ask. Either pass inboundId, the incoming iMessage id from the owner's or Moni's chat, whose message must start with the ask's handle (the first four letters or digits of its id after `ask-`, e.g. `3f9c Postgres`) followed by exactly the answer text (or the chosen option); pass text without the handle, and if the handle is missing ask him to resend with it first. Or, as the mission's master only, pass onOwnerCondition: the owner request about this ask and his exact words stating the condition your answer meets. The answer is then recorded as yours on his condition. Anything else is refused; agents never answer asks on their own.",
+    "Record an answer to an ask on the owner's condition. Only the mission's master may, by passing onOwnerCondition: the owner request about this ask and his exact words stating the condition your answer meets. The answer is then recorded as yours on his condition. The owner answers himself in the app or through his iMessage agent (mission CLI), never through this tool. Anything else is refused; agents never answer asks on their own.",
   parameters: Schema.Struct({
     askId: AskId,
     optionId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     text: Schema.String,
-    inboundId: Schema.optional(TrimmedNonEmptyString),
     onOwnerCondition: Schema.optional(OwnerCondition),
   }),
   success: Schema.Struct({ ask: Schema.Unknown, released: Records }),
@@ -229,16 +228,15 @@ const MissionDraftTool = Tool.make("mission_draft", {
 
 const MissionDraftApproveTool = Tool.make("mission_draft_approve", {
   description:
-    "Decide a draft: approve (optionally with edited text), rewrite with a note, or drop. For the owner's decision that arrived by iMessage pass inboundId (his or Moni's incoming iMessage, which must start with the draft's handle: the first four letters or digits of its id after `draft-`, e.g. `a1b2 ok send it`; an approval says only yes, approve, ok, go, send it or ship it, plus please or thanks). Without inboundId you decide as the mission's master, which works for drafts routed to the master, or for one routed to the owner when you pass onOwnerCondition: the owner request about this draft and his exact words stating the condition your decision meets. Approval records the draft as approved; sending is separate.",
+    "Decide a draft as the mission's master: approve (optionally with edited text), rewrite with a note, or drop. This works for drafts routed to the master, or for one routed to the owner when you pass onOwnerCondition: the owner request about this draft and his exact words stating the condition your decision meets. The owner decides his own drafts in the app or through his iMessage agent (mission CLI), never through this tool. Approval records the draft as approved; sending is separate.",
   parameters: Schema.Struct({
     draftId: DraftId,
     action: Schema.Literals(["approve", "rewrite", "drop"]),
     editedText: Schema.optional(TrimmedNonEmptyString),
     rewriteNote: Schema.optional(TrimmedNonEmptyString),
-    inboundId: Schema.optional(TrimmedNonEmptyString),
     revision: Schema.optional(NonNegativeInt).annotate({
       description:
-        "The draft revision you read (its `revision` field, 0 when missing). Required to approve without an inboundId; a draft revised or reopened since then is refused, so you decide the text it says now.",
+        "The draft revision you read (its `revision` field, 0 when missing). Required to approve; a draft revised or reopened since then is refused, so you decide the text it says now.",
     }),
     onOwnerCondition: Schema.optional(OwnerCondition),
   }),

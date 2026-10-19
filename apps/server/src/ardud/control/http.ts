@@ -58,11 +58,7 @@ import {
   recordControlWrite,
 } from "../missions/guard/control.ts";
 import { GUIDANCE_MAX_CHARS, guidanceContext, guidanceFits } from "../missions/guard/guidance.ts";
-import {
-  type BridgeSessions,
-  isBridgeSession,
-  optionalIMessageOwner,
-} from "../missions/guard/imessage.ts";
+import { isBridgeSession, optionalIMessageOwner } from "../missions/guard/imessage.ts";
 import {
   formatModel,
   lastAssistantText,
@@ -481,23 +477,6 @@ const makeRoutes = Effect.gen(function* () {
       })
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
-  // ardud missions: guard - how the bridge's session ids and requests look here.
-  const bridgeSessions: BridgeSessions = {
-    threadOf: (session) =>
-      session.startsWith("ses_")
-        ? store.threadIdForNativeSession(session).pipe(Effect.orElseSucceed(() => null))
-        : Effect.succeed(session),
-    wasOpen: (threadId, requestId, at) =>
-      readRecords(threadId).pipe(
-        Effect.map((records) => {
-          const request = records.runtimeRequests.find((each) => each.id === requestId);
-          if (request === undefined || request.status === "pending") return true;
-          return request.resolvedAt !== null && DateTime.toEpochMillis(request.resolvedAt) > at;
-        }),
-        Effect.orElseSucceed(() => true),
-      ),
-  };
-
   const readMessages = (threadId: string) =>
     threads
       .getThreadRecords(ThreadId.make(threadId), ["messages"])
@@ -903,13 +882,12 @@ const makeRoutes = Effect.gen(function* () {
       );
     }
     // ardud missions: guard - the owner's word only when the bridge relays a verified iMessage
-    // addressed here. One iMessage is one send: a retry gets the first answer back.
+    // to a thread outside every mission. One iMessage is one send: a retry gets the first answer back.
     const verified = yield* imessageOwner.relay({
       session,
       inboundId: body.inboundId,
       threadId: shell.id,
       commandId: requestedId,
-      sessions: bridgeSessions,
       text: body.text,
       attachments: body.attachments?.length ?? 0,
       mode: body.mode,
@@ -1072,9 +1050,9 @@ const makeRoutes = Effect.gen(function* () {
     }
     // ardud missions: guard - the answer is judged before the request changes
     // state, so a routed or knocked answer leaves it pending. It is the owner's
-    // only when the bridge relays a verified iMessage that says exactly this and
-    // answers this request's notification. One iMessage is one answer: a retry
-    // gets the first answer back, and runs as the first attempt's command.
+    // only when the bridge relays a verified iMessage for a thread outside every
+    // mission. One iMessage is one answer: a retry gets the first answer back,
+    // and runs as the first attempt's command.
     const answer = {
       decision: command.type === "runtime-request.respond" ? command.decision : undefined,
       answers: command.type === "runtime-request.respond" ? command.answers : undefined,
@@ -1085,11 +1063,9 @@ const makeRoutes = Effect.gen(function* () {
       inboundId: body.inboundId,
       threadId,
       commandId,
-      sessions: bridgeSessions,
       requestId,
       open,
       askedAt: request.createdAt,
-      turnItems: records.turnItems,
       ...answer,
     });
     if (verified !== null && verified.result !== null) return json(verified.result);

@@ -68,9 +68,7 @@ import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
 import {
   answerAsk,
-  askEpochOf,
   askRef,
-  askReopened,
   openAsk,
   rejectAskDefaults,
   reopenAsk,
@@ -88,14 +86,12 @@ import {
   draftRef,
   type DraftAbout,
   type DraftExample,
-  epochOf,
   notesFor,
   openSystemDraft,
   pullRequestKeyOf,
   reopenDraft,
   reportDraftSent,
   reviseDraft,
-  revisionOf,
   routeDraft,
   routeDraftApprover,
   saveDraftNote,
@@ -126,19 +122,13 @@ import {
 } from "./inputs.ts";
 import * as Ports from "./ports.ts";
 import {
-  answerCheck,
-  draftDecisionCheck,
-  recordHandle,
-  type ReplyCheck,
-  verifyInbound,
-} from "./provenance.ts";
-import {
   callerActsAs,
   clipSummary,
   dedupeRefs,
   type MissionCaller,
   type MissionEventDraft as ModelEvent,
   type Outcome,
+  refuse,
   sameActor,
 } from "./shared.ts";
 import {
@@ -399,7 +389,6 @@ const replaceById = <R extends { readonly id: string }>(
 
 const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
-  const inbound = yield* Inbound.InboundLookup;
   const threads = yield* Ports.AsksThreads;
   const signals = yield* Ports.AsksSignals;
   const rooms = yield* Ports.AsksRooms;
@@ -488,37 +477,27 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * Owner provenance for a decision: the app session as is, or an iMessage
-   * relayed by an agent with its inbound id, checked against the bridge or
-   * Moni's chat. Anything else stays agent provenance and the model refuses.
+   * Owner provenance for a decision: the app session as is, or an iMessage the
+   * transport already redeemed through the guard's inbound ledger (only the
+   * iMessage bridge and the mission CLI may). An inbound id from anyone else is
+   * refused here, before anything is looked up, so no adapter (MCP tools,
+   * agents, other components) lifts one into the owner's word.
    */
   const ownerVoice = (command: {
     readonly provenance: MissionProvenance;
     readonly inboundId: string | undefined;
-    /** The record answered; his reply must start with its handle (guard r3, P1). */
-    readonly recordId: string;
-    readonly check: ReplyCheck;
-    readonly notBefore: string;
-    readonly skewMs?: number;
     readonly what: string;
-  }) =>
-    Effect.gen(function* () {
-      if (isOwnerProvenance(command.provenance)) return command.provenance;
-      if (command.inboundId === undefined) return command.provenance;
-      const message = yield* inbound.find(command.inboundId, command.notBefore);
-      const verified: MissionProvenance = yield* fromOutcome(
-        verifyInbound({
-          inboundId: command.inboundId,
-          inbound: message,
-          binding: { _tag: "handle", handle: recordHandle(command.recordId) },
-          check: command.check,
-          notBefore: command.notBefore,
-          ...(command.skewMs === undefined ? {} : { skewMs: command.skewMs }),
-          what: command.what,
-        }),
-      );
-      return verified;
-    });
+  }): Fx<MissionProvenance> => {
+    if (isOwnerProvenance(command.provenance) || command.inboundId === undefined) {
+      return Effect.succeed(command.provenance);
+    }
+    return fromOutcome(
+      refuse(
+        "forbidden",
+        `${command.what} by iMessage goes through the iMessage bridge or the mission CLI; this caller cannot redeem inbound ${command.inboundId}.`,
+      ),
+    );
+  };
 
   /** Blocks must name records of this mission (threads are taken as given). */
   const checkBlocks = (missionId: MissionId, blocks: ReadonlyArray<MissionRecordRef>) =>
@@ -673,15 +652,9 @@ const make = Effect.gen(function* () {
   const answerAskCommand = (input: AnswerAskInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const ask = yield* need("ask", input.askId);
-      // The reply must carry the exact answer: the option he picked and nothing turning it around.
       const voice = yield* ownerVoice({
         provenance,
         inboundId: input.inboundId,
-        recordId: ask.id,
-        check: answerCheck({ options: ask.options, optionId: input.optionId, text: input.text }),
-        // After a reopen nothing said before the new epoch counts, not even within clock skew.
-        notBefore: askEpochOf(ask),
-        ...(askReopened(ask) ? { skewMs: 0 } : {}),
         what: "Answering an ask",
       });
       const asks = yield* store.list("ask", { missionId: ask.missionId });
@@ -1063,15 +1036,9 @@ const make = Effect.gen(function* () {
   const decideDraftCommand = (input: DecideDraftInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const draft = yield* need("draft", input.draftId);
-      // The inbound must postdate the draft's current epoch. After a revision or reopen there
-      // is no skew allowance: a reply to the earlier text or decision never counts.
       const voice = yield* ownerVoice({
         provenance,
         inboundId: input.inboundId,
-        recordId: draft.id,
-        check: draftDecisionCheck(input),
-        notBefore: epochOf(draft),
-        ...(revisionOf(draft) > 0 ? { skewMs: 0 } : {}),
         what: "Deciding a draft",
       });
       // A master's decision is recorded under its role, never as the owner.

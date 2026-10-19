@@ -37,65 +37,61 @@ export const isSyntheticInboundId = (id: string): boolean =>
 export const INBOUND_CLOCK_SKEW_MS = 2 * 60_000;
 
 /**
- * How the reply is tied to the one record it answers. The owner's words count
- * only for the place he addressed:
- * - `handle`: his reply starts with the record's short handle (see
- *   `recordHandle`), and the rest is the answer.
- * - `tied`: the caller already tied this exact inbound to the record from
- *   facts the bridge recorded when it sent him the notification (a swipe-reply
- *   to it, or the only one open in his chat), or from his naming the mission.
+ * The components that may redeem an iMessage the owner typed as his word:
+ * the iMessage bridge, and the mission CLI the owner's iMessage agent runs.
+ * Every other caller (Telegram, crw, agents, MCP tools, the shared control
+ * token) is refused before anything is looked up.
  */
-export type InboundBinding =
-  | { readonly _tag: "handle"; readonly handle: string }
-  | { readonly _tag: "tied" };
+export const INBOUND_REDEEMERS: ReadonlyArray<string> = ["spectrum-bridge", "mission-cli"];
 
-/**
- * The short handle the owner types first to address a record by iMessage: the
- * first four letters or digits of its id after the kind prefix
- * (`ask-3f9c...` -> `3f9c`).
- */
-export const recordHandle = (recordId: string): string =>
-  recordId
-    .replace(/^[a-z]+-/i, "")
-    .replace(/[^a-z0-9]/gi, "")
-    .slice(0, 4)
-    .toLowerCase();
+export const canRedeemInbound = (caller: MissionProvenance): boolean =>
+  caller._tag === "system" && INBOUND_REDEEMERS.includes(caller.component);
+
+/** How much of his message is kept as the quote on what it did. */
+export const INBOUND_QUOTE_MAX_CHARS = 2000;
+
+const quoteOf = (text: string) => {
+  const flat = text.normalize("NFC").trim();
+  return flat.length <= INBOUND_QUOTE_MAX_CHARS
+    ? flat
+    : `${flat.slice(0, INBOUND_QUOTE_MAX_CHARS - 1)}\u2026`;
+};
+
+/** Refuses a caller that may not redeem the owner's iMessage, or null. */
+export const redeemerRefusal = <A>(caller: MissionProvenance, what: string): Outcome<A> | null =>
+  canRedeemInbound(caller)
+    ? null
+    : refuse(
+        "forbidden",
+        `${what} by iMessage is only for the iMessage bridge or the mission CLI credential, not ${caller._tag === "system" ? caller.component : caller._tag}.`,
+      );
 
 export interface VerifyInboundCommand {
+  /** Who is redeeming the message; only `INBOUND_REDEEMERS` may. */
+  readonly caller: MissionProvenance;
   readonly inboundId: string;
   /** What the lookup found, or null when no source has that id. */
   readonly inbound: InboundMessage | null;
-  /** How the reply addresses the record. */
-  readonly binding: InboundBinding;
-  /** Says why the reply does not carry the exact answer, or null when it does. */
-  readonly check: ReplyCheck;
-  /** The record (or its current revision) being answered; the message must not predate it. */
+  /** The record (or its current revision) being acted on; the message must not predate it. */
   readonly notBefore: string;
   /** Clock skew allowed before `notBefore`; revision epochs pass 0. */
   readonly skewMs?: number;
   readonly what: string;
 }
 
-/** The reply after its leading handle, or null when it does not start with it. */
-const afterHandle = (raw: string, handle: string): string | null => {
-  if (handle.length === 0) return null;
-  const match = /^\s*#?([\p{L}\p{N}]+)(?=$|[\s:,.;\-\u2013\u2014])[\s:,.;\-\u2013\u2014]*/u.exec(
-    raw,
-  );
-  if (match === null || match[1]?.toLowerCase() !== handle.toLowerCase()) return null;
-  return raw.slice(match[0].length);
-};
+export type OwnerIMessage = Extract<MissionProvenance, { _tag: "owner-imessage" }>;
 
 /**
- * The only way an iMessage becomes owner provenance: a real message the owner
- * (or Moni) typed, received after the record (or its revision) opened,
- * addressed to that record, whose whole reply carries exactly the answer being
- * recorded. Anything less fails closed, and the owner confirms in the app.
+ * The only way an iMessage becomes owner provenance: a redeeming caller, and a
+ * real message the owner (or Moni) typed, received after the record (or its
+ * revision) opened. What the action records is the caller's reading of his
+ * words; his words ride along as the quote, so it can be audited. Anything
+ * less fails closed, and the owner confirms in the app.
  */
-export const verifyInbound = (
-  command: VerifyInboundCommand,
-): Outcome<Extract<MissionProvenance, { _tag: "owner-imessage" }>> => {
+export const verifyInbound = (command: VerifyInboundCommand): Outcome<OwnerIMessage> => {
   const { inboundId, inbound } = command;
+  const notRedeemer = redeemerRefusal<OwnerIMessage>(command.caller, command.what);
+  if (notRedeemer !== null) return notRedeemer;
   if (inboundId.trim().length === 0) {
     return refuse("provenance-required", `${command.what} by iMessage needs the inbound id.`);
   }
@@ -125,135 +121,31 @@ export const verifyInbound = (
       `iMessage ${inboundId} arrived before the ${command.what.toLowerCase()} target (or its latest revision) existed.`,
     );
   }
-  const { binding } = command;
-  const raw = binding._tag === "handle" ? afterHandle(inbound.text, binding.handle) : inbound.text;
-  if (raw === null) {
-    return refuse(
-      "provenance-invalid",
-      `iMessage ${inboundId} does not start with the record's handle, so it is not addressed to it; confirm it in the app or reply "${binding._tag === "handle" ? binding.handle : ""} <answer>".`,
-    );
-  }
-  const words = wordsOf(raw);
-  if (words.length === 0) {
-    return refuse("provenance-invalid", `iMessage ${inboundId} has no text to check.`);
-  }
-  const problem = command.check({ raw, words });
-  if (problem !== null) {
-    return refuse(
-      "provenance-invalid",
-      `iMessage ${inboundId} does not ${problem}; confirm it in the app instead.`,
-    );
-  }
-  return ok({ _tag: "owner-imessage", chat: inbound.chat, inboundId: inbound.id });
+  return ok({
+    _tag: "owner-imessage",
+    chat: inbound.chat,
+    inboundId: inbound.id,
+    quote: quoteOf(inbound.text),
+  });
 };
 
 // ---------------------------------------------------------------------------
-// Reply formats. Decision words are compared as normalized words (lowercase,
-// no punctuation, "don't" -> "dont"); an option label or id is compared as
-// typed up to case, spacing and what closes or wraps it; any text that gets
-// recorded (an edit, a rewrite note, a free-text answer) must match what he
-// typed up to whitespace.
-// Addressed by handle, the reply starts with the record's handle ("3f9c yes",
-// "3f9c: approve: <text>") and the shape below is what follows it.
-// A reply must be exactly one of these shapes:
-//
-//   ask, option:      [go | go with | pick | choose | option | use | take | ok | yes] <label or id> [please | thanks]
-//   ask, free text:   <answer text>                          (his whole reply, as typed)
-//   draft, approve:   approve | ok send it | yes please | ...  (consent words only, see below)
-//   draft, edited:    <consent words>: <edited text>         (or the text on the next line)
-//   draft, rewrite:   rewrite: <rewrite note>                (or the note on the next line)
-//   draft, drop:      drop it | dont send | skip | cancel | no | ...
-//
-// Nothing is matched inside a longer sentence, so "do not deploy" never picks
-// "deploy", "deploy would be a disaster" picks nothing, and "do not send the
-// line hello world" never approves "hello world". A question ("deploy?")
-// decides nothing. Anything else is confirmed in the app.
+// Option collisions. An ask's options must read apart: two options (by label,
+// id, or one's label and the other's id) that one short reply would name
+// together are refused when the ask opens, so whoever reads his answer never
+// has to guess between them.
 
 type Words = ReadonlyArray<string>;
-
-/** An inbound reply: what he typed, and its normalized words. */
-export interface Reply {
-  readonly raw: string;
-  readonly words: Words;
-}
-
-/** A check over a reply: null when the reply carries the exact answer, else what it lacks. */
-export type ReplyCheck = (reply: Reply) => string | null;
 
 const wordsOf = (text: string): Words => {
   const normalized = normalizeText(text);
   return normalized.length === 0 ? [] : normalized.split(" ");
 };
 
-/** Text as he typed it, up to whitespace. */
-const asTyped = (text: string) => text.normalize("NFC").replace(/\s+/g, " ").trim();
-
-/** A question decides nothing, in any script's question mark. */
-const asksSomething = (raw: string) => /[?\uFF1F\u061F\u00BF\u2047-\u2049\u2753\u2754]/u.test(raw);
-
-/** Letters, spaces and plain punctuation only: no emoji, symbols or digits. */
-const plainWords = (raw: string) => /^[\p{L}\p{M}\s.,!]*$/u.test(raw.normalize("NFKC"));
-
-/** "<lead>: <body>" or "<lead>\n<body>", split at the first colon or line break. */
-const splitAtSeparator = (raw: string): { readonly lead: string; readonly body: string } | null => {
-  const match = /[:\uFF1A\n]/.exec(raw);
-  return match === null
-    ? null
-    : { lead: raw.slice(0, match.index), body: raw.slice(match.index + 1) };
-};
-
 const phrases = (list: ReadonlyArray<string>): ReadonlyArray<Words> => list.map(wordsOf);
 
-const startsWith = (words: Words, prefix: Words) =>
-  prefix.length <= words.length && prefix.every((word, index) => words[index] === word);
-
-/** Whether the words are one or more of the phrases back to back, and nothing else. */
-const coveredBy = (words: Words, list: ReadonlyArray<Words>): boolean => {
-  if (words.length === 0) return false;
-  const reach: Array<boolean> = Array.from({ length: words.length + 1 }, () => false);
-  reach[0] = true;
-  for (let index = 0; index < words.length; index++) {
-    if (!reach[index]) continue;
-    const rest = words.slice(index);
-    for (const phrase of list) {
-      if (phrase.length > 0 && startsWith(rest, phrase)) reach[index + phrase.length] = true;
-    }
-  }
-  return reach[words.length] === true;
-};
-
-/** Words that approve a draft by iMessage. */
-export const APPROVE_WORDS = [
-  "approve",
-  "approved",
-  "send",
-  "send it",
-  "yes",
-  "ok",
-  "okay",
-  "go",
-  "go ahead",
-  "lgtm",
-  "ship it",
-];
-/** Words that drop a draft by iMessage. */
-export const DROP_WORDS = [
-  "drop",
-  "drop it",
-  "dont send",
-  "dont send it",
-  "do not send",
-  "do not send it",
-  "skip",
-  "skip it",
-  "kill it",
-  "cancel",
-  "no",
-];
-/** Words that lead a rewrite note. */
-export const REWRITE_WORDS = ["rewrite", "rewrite it", "redo", "redo it", "revise", "change it"];
 /** Words that may lead an option choice. */
-export const SELECT_WORDS = [
+const SELECT = phrases([
   "go",
   "go with",
   "pick",
@@ -264,139 +156,9 @@ export const SELECT_WORDS = [
   "ok",
   "yes",
   "please",
-];
-/** Words that may close a choice without changing it. */
-export const COURTESY_WORDS = ["please", "pls", "thanks", "thank you", "thx", "ty"];
-/** Words that turn a reply around; recorded text never starts with one. */
-const TURNAROUNDS = new Set([
-  "no",
-  "not",
-  "dont",
-  "never",
-  "nope",
-  "nah",
-  "cancel",
-  "instead",
-  "wait",
-  "stop",
-  "neither",
-  "none",
-  "isnt",
-  "wont",
-  "cant",
-  "but",
-  "actually",
 ]);
-
-const APPROVE = phrases(APPROVE_WORDS);
-const DROP = phrases(DROP_WORDS);
-const REWRITE = phrases(REWRITE_WORDS);
-const SELECT = phrases(SELECT_WORDS);
-const COURTESY = phrases(COURTESY_WORDS);
-const EDIT_CONNECTORS = new Set(["with", "as"]);
-
-// ---------------------------------------------------------------------------
-// Consent. Every yes/no an iMessage gives (a runtime approval, a draft
-// approval) is short and exact: one or more consent words, optionally with
-// please or thanks, and nothing else. A question mark anywhere, a question
-// word, a negation, a qualifier or any extra content decides nothing, so
-// "yes?", "allow?", "is that ok?", "yes but not now" and "don't" never count.
-
-/** Words that say yes. */
-export const YES_WORDS = ["yes", "approve", "approved", "ok", "go", "send it", "ship it"];
-/** Words that say no. */
-export const NO_WORDS = ["no", "deny", "reject", "decline"];
-/** Words that may sit beside a yes or a no without changing it. */
-export const CONSENT_COURTESY_WORDS = ["please", "thanks", "thank you"];
-
-const YES = phrases(YES_WORDS);
-const NO = phrases(NO_WORDS);
-const CONSENT_COURTESY = phrases(CONSENT_COURTESY_WORDS);
-
-const consentOnly = (raw: string, words: Words, consent: ReadonlyArray<Words>): boolean =>
-  !asksSomething(raw) &&
-  plainWords(raw) &&
-  coveredBy(words, [...consent, ...CONSENT_COURTESY]) &&
-  !coveredBy(words, CONSENT_COURTESY);
-
-/** A reply that says only yes (or only no), in the short consent grammar. */
-export const consentCheck =
-  (answer: "yes" | "no"): ReplyCheck =>
-  ({ raw, words }) =>
-    consentOnly(raw, words, answer === "yes" ? YES : NO)
-      ? null
-      : answer === "yes"
-        ? 'say only yes ("yes", "approve", "ok", "go", "send it", "ship it")'
-        : 'say only no ("no", "deny", "reject", "decline")';
-
-/**
- * Text after the separator that gets recorded as his (an edit or a rewrite
- * note): it must be what the relay recorded, have words, and not be a bare
- * decision or start by turning the reply around.
- */
-const recordedText = (body: string, recorded: string, what: string): string | null => {
-  if (asTyped(body) !== asTyped(recorded)) return `carry the ${what} exactly as recorded`;
-  const words = wordsOf(body);
-  if (words.length === 0) return `carry a ${what} with words`;
-  if (TURNAROUNDS.has(words[0] ?? ""))
-    return `carry a ${what} that does not start by turning around`;
-  if (coveredBy(words, APPROVE) || coveredBy(words, DROP)) {
-    return `carry a ${what} rather than a bare decision`;
-  }
-  return null;
-};
-
-/**
- * What an iMessage must be to approve, rewrite or drop a draft: the decision
- * words themselves, and for an edit or rewrite the exact text after a colon or
- * line break.
- */
-export const draftDecisionCheck = (input: {
-  readonly action: "approve" | "rewrite" | "drop";
-  readonly editedText?: string | undefined;
-  readonly rewriteNote?: string | undefined;
-}): ReplyCheck => {
-  switch (input.action) {
-    case "approve": {
-      const edited = input.editedText ?? "";
-      if (edited.trim().length === 0) {
-        return ({ raw, words }) =>
-          consentOnly(raw, words, YES) ? null : 'say only an approval ("ok send it", "approve")';
-      }
-      return ({ raw }) => {
-        const parts = splitAtSeparator(raw);
-        if (parts === null) return 'put the edited text after "approve:" or on a new line';
-        const lead = wordsOf(parts.lead);
-        const last = lead.at(-1);
-        const bare = last !== undefined && EDIT_CONNECTORS.has(last) ? lead.slice(0, -1) : lead;
-        if (!consentOnly(parts.lead, bare, YES)) {
-          return 'start with approval words before the edited text ("approve: <text>")';
-        }
-        return recordedText(parts.body, edited, "edited text");
-      };
-    }
-    case "rewrite": {
-      const note = input.rewriteNote ?? "";
-      return ({ raw }) => {
-        if (note.trim().length === 0) return "carry a rewrite note";
-        const parts = splitAtSeparator(raw);
-        if (
-          parts === null ||
-          asksSomething(parts.lead) ||
-          !coveredBy(wordsOf(parts.lead), REWRITE)
-        ) {
-          return 'say "rewrite: <note>"';
-        }
-        return recordedText(parts.body, note, "rewrite note");
-      };
-    }
-    case "drop":
-      return ({ raw, words }) =>
-        !asksSomething(raw) && coveredBy(words, DROP)
-          ? null
-          : 'say only a drop ("drop it", "dont send")';
-  }
-};
+/** Words that may close a choice without changing it. */
+const COURTESY = phrases(["please", "pls", "thanks", "thank you", "thx", "ty"]);
 
 interface AnswerOption {
   readonly id: string;
@@ -569,46 +331,4 @@ export const optionCollision = (options: ReadonlyArray<AnswerOption>): string | 
     }
   }
   return null;
-};
-
-/**
- * What an iMessage must be to answer an ask. With an option, the reply is
- * that option alone (its label or id, after an optional "go"/"pick", before an
- * optional "please"), so it never carries extra words the option could be
- * read against; a reply with more to say is recorded as a free-text answer
- * (no option) or confirmed in the app. A reply that could name more than one
- * option is refused, including one whose lead or courtesy word is itself an
- * option ("yes, no"). Without an option, the reply is the answer text as he
- * typed it.
- */
-export const answerCheck = (input: {
-  readonly options: ReadonlyArray<AnswerOption>;
-  readonly optionId: string | null;
-  readonly text: string;
-}): ReplyCheck => {
-  if (input.optionId === null) {
-    return ({ raw }) => {
-      if (input.text.trim().length === 0) return "carry an answer";
-      return asTyped(raw) === asTyped(input.text)
-        ? null
-        : "say exactly the answer text (pass his whole reply as typed)";
-    };
-  }
-  const optionId = input.optionId;
-  const chosen = input.options.find((option) => option.id === optionId);
-  const forms = formsOf(input.options);
-  return ({ raw }) => {
-    if (chosen === undefined) return `offer option ${optionId}`;
-    if (input.text.trim().length > 0) {
-      return "stop at the option (record his extra words as a free-text answer instead)";
-    }
-    if (asksSomething(raw)) return "make a choice (it asks a question)";
-    const { named, around } = readChoice(forms, tokensOf(raw));
-    const either = new Set([...named, ...around]);
-    if (either.size > 1) return "pick one option unambiguously";
-    if (either.size === 1 && !either.has(optionId)) {
-      return `pick "${chosen.label}" (option ${optionId})`;
-    }
-    return named.has(optionId) ? null : `say only the option ("${chosen.label}")`;
-  };
 };
