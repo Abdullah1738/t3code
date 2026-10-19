@@ -119,7 +119,13 @@ import {
   type SubmitDraftInput,
 } from "./inputs.ts";
 import * as Ports from "./ports.ts";
-import { answerCheck, draftDecisionCheck, type ReplyCheck, verifyInbound } from "./provenance.ts";
+import {
+  answerCheck,
+  draftDecisionCheck,
+  recordHandle,
+  type ReplyCheck,
+  verifyInbound,
+} from "./provenance.ts";
 import {
   clipSummary,
   dedupeRefs,
@@ -446,6 +452,8 @@ const make = Effect.gen(function* () {
   const ownerVoice = (command: {
     readonly provenance: MissionProvenance;
     readonly inboundId: string | undefined;
+    /** The record answered; his reply must start with its handle (guard r3, P1). */
+    readonly recordId: string;
     readonly check: ReplyCheck;
     readonly notBefore: string;
     readonly skewMs?: number;
@@ -459,6 +467,7 @@ const make = Effect.gen(function* () {
         verifyInbound({
           inboundId: command.inboundId,
           inbound: message,
+          binding: { _tag: "handle", handle: recordHandle(command.recordId) },
           check: command.check,
           notBefore: command.notBefore,
           ...(command.skewMs === undefined ? {} : { skewMs: command.skewMs }),
@@ -621,6 +630,7 @@ const make = Effect.gen(function* () {
       const voice = yield* ownerVoice({
         provenance,
         inboundId: input.inboundId,
+        recordId: ask.id,
         check: answerCheck({ options: ask.options, optionId: input.optionId, text: input.text }),
         // After a reopen nothing said before the new epoch counts, not even within clock skew.
         notBefore: askEpochOf(ask),
@@ -943,6 +953,7 @@ const make = Effect.gen(function* () {
       const voice = yield* ownerVoice({
         provenance,
         inboundId: input.inboundId,
+        recordId: draft.id,
         check: draftDecisionCheck(input),
         notBefore: epochOf(draft),
         ...(revisionOf(draft) > 0 ? { skewMs: 0 } : {}),

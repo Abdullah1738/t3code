@@ -180,7 +180,7 @@ const MissionAskWithdrawTool = Tool.make("mission_ask_withdraw", {
 
 const MissionAskAnswerTool = Tool.make("mission_ask_answer", {
   description:
-    "Record the owner's answer that arrived by iMessage. inboundId must be the incoming iMessage id from the owner's or Moni's chat, and that message must contain the answer text (or the chosen option); anything else is refused. Agents can never answer asks themselves.",
+    "Record the owner's answer that arrived by iMessage. inboundId must be the incoming iMessage id from the owner's or Moni's chat, and that message must start with the ask's handle (the first four letters or digits of its id after `ask-`, e.g. `3f9c Postgres`) followed by exactly the answer text (or the chosen option). Pass text without the handle. Anything else is refused: ask him to resend with the handle first. Agents can never answer asks themselves.",
   parameters: Schema.Struct({
     askId: AskId,
     optionId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -224,7 +224,7 @@ const MissionDraftTool = Tool.make("mission_draft", {
 
 const MissionDraftApproveTool = Tool.make("mission_draft_approve", {
   description:
-    "Decide a draft: approve (optionally with edited text), rewrite with a note, or drop. For the owner's decision that arrived by iMessage pass inboundId (his or Moni's incoming iMessage containing it). Without inboundId you decide as the mission's master, which works only for drafts routed to the master. Approval records the draft as approved; sending is separate.",
+    "Decide a draft: approve (optionally with edited text), rewrite with a note, or drop. For the owner's decision that arrived by iMessage pass inboundId (his or Moni's incoming iMessage, which must start with the draft's handle: the first four letters or digits of its id after `draft-`, e.g. `a1b2 ok send it`; an approval says only yes, approve, ok, go, send it or ship it, plus please or thanks). Without inboundId you decide as the mission's master, which works only for drafts routed to the master. Approval records the draft as approved; sending is separate.",
   parameters: Schema.Struct({
     draftId: DraftId,
     action: Schema.Literals(["approve", "rewrite", "drop"]),

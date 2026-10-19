@@ -1,8 +1,9 @@
 /**
  * Shared fixtures for the guard tests. `membershipGuard` installs a send guard
  * that applies the real `decideSend` policy to a fixed mission: `master` is
- * its master, `lane` a thread the master created, `outsider` belongs to no
- * mission and `free` is an ordinary thread outside any mission.
+ * its master, `lane` a thread the master created, `added` a thread added to
+ * it by hand, `outsider` belongs to no mission and `free` is an ordinary
+ * thread outside any mission.
  */
 import {
   KnockId,
@@ -34,11 +35,25 @@ export const master = ThreadId.make("t-master");
 export const lane = ThreadId.make("t-lane");
 export const outsider = ThreadId.make("t-outsider");
 export const free = ThreadId.make("t-free");
+/** A thread added to the mission by hand; only the router knows it is a member. */
+export const added = ThreadId.make("t-added");
+/** A child the master created; only the router knows it is a member. */
+export const child = ThreadId.make("t-child");
 
 const members = new Map<string, Member>([
   [master, { missionId, threadId: master, kind: "master" }],
   [lane, { missionId, threadId: lane, kind: "created" }],
+  [added, { missionId, threadId: added, kind: "attached" }],
+  [child, { missionId, threadId: child, kind: "created" }],
 ]);
+
+const decisionFor = (request: Pick<SendGuardRequest, "targetThreadId" | "from">) =>
+  decideSend({
+    target: members.get(request.targetThreadId) ?? null,
+    sender: request.from._tag === "thread" ? (members.get(request.from.threadId) ?? null) : null,
+    from: request.from,
+    targetThreadId: request.targetThreadId,
+  });
 
 const routed: SendGuardOutcome = {
   _tag: "routed",
@@ -52,24 +67,22 @@ const knocked: SendGuardOutcome = { _tag: "knocked", missionId, knockId: KnockId
 /** Installs the real membership policy for the fixed mission; returns what it was asked. */
 export const membershipGuard = Effect.gen(function* () {
   const seen: Array<SendGuardRequest> = [];
-  yield* installSendGuard((request) => {
-    seen.push(request);
-    const decision = decideSend({
-      target: members.get(request.targetThreadId) ?? null,
-      sender: request.from._tag === "thread" ? (members.get(request.from.threadId) ?? null) : null,
-      from: request.from,
-      targetThreadId: request.targetThreadId,
-    });
-    switch (decision._tag) {
-      case "not-member":
-      case "allow":
-        return Effect.succeed<SendGuardOutcome>({ _tag: "pass" });
-      case "route":
-        return Effect.succeed(routed);
-      case "knock":
-        return Effect.succeed(knocked);
-    }
-  });
+  yield* installSendGuard(
+    (request) => {
+      seen.push(request);
+      const decision = decisionFor(request);
+      switch (decision._tag) {
+        case "not-member":
+        case "allow":
+          return Effect.succeed<SendGuardOutcome>({ _tag: "pass" });
+        case "route":
+          return Effect.succeed(routed);
+        case "knock":
+          return Effect.succeed(knocked);
+      }
+    },
+    (request) => Effect.succeed(decisionFor(request)),
+  );
   return seen;
 });
 
@@ -80,10 +93,15 @@ export const membershipGuard = Effect.gen(function* () {
 // @effect-diagnostics-next-line globalDate:off - the control routes judge answers on the real clock.
 export const askedAt = DateTime.makeUnsafe(Date.now() - 10 * 60_000);
 
+// @effect-diagnostics-next-line globalDate:off - resolved as the tests load, after every typed reply.
+const resolvedNow = DateTime.makeUnsafe(Date.now());
+
 /**
  * Every thread has three pending requests: `request-1` asks "release"
  * (options "Ship it" and "Hold"), `request-2` asks to approve a command, and
- * `request-3` asks "release" and "notes" together.
+ * `request-3` asks "release" and "notes" together. Two more were answered:
+ * `request-4` just now, after every reply the tests type, and `request-5`
+ * two minutes after the requests opened, before any of them.
  */
 export const projectionFor = (threadId: ThreadId): OrchestrationV2ThreadProjection =>
   ({
@@ -110,6 +128,22 @@ export const projectionFor = (threadId: ThreadId): OrchestrationV2ThreadProjecti
         status: "pending",
         responseCapability: { type: "message" },
         createdAt: askedAt,
+      },
+      {
+        id: "request-4",
+        kind: "command",
+        status: "resolved",
+        responseCapability: { type: "live", providerSessionId: "provider-session" },
+        createdAt: askedAt,
+        resolvedAt: resolvedNow,
+      },
+      {
+        id: "request-5",
+        kind: "command",
+        status: "resolved",
+        responseCapability: { type: "live", providerSessionId: "provider-session" },
+        createdAt: askedAt,
+        resolvedAt: DateTime.add(askedAt, { minutes: 2 }),
       },
     ],
     turnItems: [

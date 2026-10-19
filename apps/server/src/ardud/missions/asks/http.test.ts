@@ -13,6 +13,7 @@ import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
+  addressed,
   agent,
   askInput,
   harness,
@@ -20,9 +21,11 @@ import {
   missionId,
   ownerApp,
   seed,
+  typedInbound,
   writerThread,
 } from "./AsksService.testkit.ts";
 import { MISSIONS_DESK_PREFIX, missionsDeskRouteLayer, sinceMillis } from "./http.ts";
+import type { InboundMessage } from "./provenance.ts";
 
 const READ = ["orchestration:read" as const];
 const OPERATE = ["orchestration:read" as const, "orchestration:operate" as const];
@@ -104,13 +107,13 @@ const body = async (response: Response) => (await response.json()) as Record<str
 
 describe("missions desk HTTP", () => {
   it.live("answers only with a verified iMessage and never as the token holder", () => {
-    const { deliveries, layer } = harness([
-      { id: "spc-msg-1", chat: "owner", text: "go online", receivedAt: LATER },
-    ]);
+    const inbox: Array<InboundMessage> = [];
+    const { deliveries, layer } = harness(inbox);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
       const ask = yield* asks.openAsk(askInput("Which way?"), agent(masterThread));
+      inbox.push(typedInbound("spc-msg-1", addressed(ask.id, "go online"), LATER));
 
       const result = yield* withDesk(async (handle) => {
         const anonymous = await handle(request(`/status?mission=${missionId}`, null));
@@ -168,9 +171,8 @@ describe("missions desk HTTP", () => {
   });
 
   it.live("decides drafts only with the owner's iMessage", () => {
-    const { layer } = harness([
-      { id: "spc-msg-5", chat: "moni", text: "ok send it", receivedAt: LATER },
-    ]);
+    const inbox: Array<InboundMessage> = [];
+    const { layer } = harness(inbox);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
@@ -184,6 +186,7 @@ describe("missions desk HTTP", () => {
         },
         agent(writerThread),
       );
+      inbox.push(typedInbound("spc-msg-5", addressed(draft.id, "ok send it"), LATER, "moni"));
       const result = yield* withDesk(async (handle) => {
         const pending = await body(await handle(request("/drafts?status=pending", "Bearer read")));
         const noInbound = await handle(

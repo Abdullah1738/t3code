@@ -43,7 +43,11 @@ export interface InboundSources {
 const unavailable = (detail: string) =>
   new MissionError({ code: "provenance-invalid", detail: `Cannot verify the iMessage: ${detail}` });
 
-/** Owner chat: the bridge only ingests the owner's own chat, so any real row is his. */
+/**
+ * Owner chat: the bridge only ingests the owner's own chat. A row is his typed
+ * words only when the bridge marked it `source: "typed"` (it stored the
+ * message verbatim); poll votes, wakes, nudges and unmarked rows are composed.
+ */
 export const findInBridge = (database: string, id: string): InboundMessage | null => {
   if (!NodeFS.existsSync(database)) return null;
   const db = new NodeSqlite.DatabaseSync(database, { readOnly: true });
@@ -52,12 +56,21 @@ export const findInBridge = (database: string, id: string): InboundMessage | nul
       | { id: string; payload: string }
       | undefined;
     if (row === undefined) return null;
-    const payload = JSON.parse(row.payload) as { text?: unknown; receivedAt?: unknown };
+    const payload = JSON.parse(row.payload) as {
+      text?: unknown;
+      receivedAt?: unknown;
+      source?: unknown;
+      replyTo?: unknown;
+    };
     return {
       id: row.id,
       chat: "owner",
       text: typeof payload.text === "string" ? payload.text : "",
       receivedAt: typeof payload.receivedAt === "number" ? payload.receivedAt : 0,
+      typed: payload.source === "typed",
+      ...(typeof payload.replyTo === "string" && payload.replyTo.length > 0
+        ? { replyTo: payload.replyTo }
+        : {}),
     };
   } finally {
     db.close();
@@ -91,11 +104,13 @@ export const findInImsgHistory = (
     if (row.is_from_me !== false) return null;
     if (Number(row.chat_id) !== moniChatId) return null;
     const receivedAt = typeof row.created_at === "string" ? Date.parse(row.created_at) : Number.NaN;
+    // imsg history lists messages as sent; the bridge composes nothing here.
     return {
       id,
       chat: "moni",
       text: typeof row.text === "string" ? row.text : "",
       receivedAt: Number.isFinite(receivedAt) ? receivedAt : 0,
+      typed: true,
     };
   }
   return null;

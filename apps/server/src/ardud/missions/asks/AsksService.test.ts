@@ -6,6 +6,7 @@ import * as Option from "effect/Option";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
+  addressed,
   agent,
   askInput,
   at,
@@ -19,8 +20,10 @@ import {
   ownerApp,
   seed,
   strayThread,
+  typedInbound,
   writerThread,
 } from "./AsksService.testkit.ts";
+import type { InboundMessage } from "./provenance.ts";
 
 describe("AsksService", () => {
   it.effect("holds only the blocked records and releases them on the owner's answer", () => {
@@ -82,16 +85,31 @@ describe("AsksService", () => {
   });
 
   it.effect("takes an iMessage answer only with a verified inbound from the owner or Moni", () => {
-    const { layer } = harness([
-      { id: "spc-msg-1", chat: "owner", text: "Go offline window", receivedAt: Date.parse(at) },
-      { id: "moni-guid-1", chat: "moni", text: "online please", receivedAt: Date.parse(at) },
-      { id: "wake:abc", chat: "owner", text: "offline window", receivedAt: Date.parse(at) },
-    ]);
+    const inbox: Array<InboundMessage> = [];
+    const { layer } = harness(inbox);
+    const T = Date.parse(at);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
       const first = yield* asks.openAsk(askInput("Which way?"), agent(masterThread));
+      const second = yield* asks.openAsk(askInput("Which way for staging?"), agent(masterThread));
       const relay = agent(masterThread);
+      inbox.push(
+        typedInbound("spc-msg-1", addressed(first.id, "Go offline window"), T),
+        typedInbound("moni-guid-1", addressed(second.id, "online please"), T, "moni"),
+        typedInbound("wake:abc", addressed(first.id, "offline window"), T),
+        // Sol P1: the right words without the ask's handle, or under another
+        // ask's handle, are not addressed to this ask.
+        typedInbound("spc-msg-bare", "offline window", T),
+        typedInbound("spc-msg-other", addressed(second.id, "offline window"), T),
+      );
+      for (const inboundId of ["spc-msg-bare", "spc-msg-other"]) {
+        expect(
+          yield* failureCode(
+            asks.answerAsk({ askId: first.id, optionId: "b", text: "", inboundId }, relay),
+          ),
+        ).toBe("provenance-invalid");
+      }
 
       expect(
         yield* failureCode(
@@ -125,7 +143,6 @@ describe("AsksService", () => {
         inboundId: "spc-msg-1",
       });
 
-      const second = yield* asks.openAsk(askInput("Which way for staging?"), agent(masterThread));
       const viaMoni = yield* asks.answerAsk(
         { askId: second.id, optionId: "a", text: "", inboundId: "moni-guid-1" },
         relay,

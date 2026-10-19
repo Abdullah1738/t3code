@@ -16,6 +16,7 @@ import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import { liveThreadsLayer } from "../../../mcp/McpToolAccess.testkit.ts";
 import * as AsksService from "../asks/AsksService.ts";
 import {
+  addressed,
   askInput,
   at,
   harness,
@@ -25,8 +26,10 @@ import {
   ownerApp,
   seed,
   strayThread,
+  typedInbound,
   writerThread,
 } from "../asks/AsksService.testkit.ts";
+import type { InboundMessage } from "../asks/provenance.ts";
 import * as RuleService from "../core/RuleService.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
@@ -146,19 +149,20 @@ describe("mission MCP tools", () => {
   });
 
   it.effect("records the owner's answer only with a verified iMessage", () => {
-    const { deliveries, layer } = toolsLayer([
-      {
-        id: "spc-msg-9",
-        chat: "owner",
-        text: "offline window please",
-        receivedAt: Date.parse(at) + 60_000,
-      },
-    ]);
+    const inbox: Array<InboundMessage> = [];
+    const { deliveries, layer } = toolsLayer(inbox);
     return Effect.gen(function* () {
       yield* seed;
       const master = threadCaller(masterThread);
       const opened = yield* call("mission_ask", master, askInput("Online or offline?"));
       const askId = (opened.structured.ask as { id: string }).id;
+      inbox.push(
+        typedInbound(
+          "spc-msg-9",
+          addressed(askId, "offline window please"),
+          Date.parse(at) + 60_000,
+        ),
+      );
 
       // An agent cannot answer on its own: the inbound id is required and must verify.
       const missing = yield* Effect.exit(call("mission_ask_answer", master, { askId, text: "b" }));
@@ -198,9 +202,8 @@ describe("mission MCP tools", () => {
   });
 
   it.effect("drafts carry the owner's notes and need his iMessage to be approved by tool", () => {
-    const { layer } = toolsLayer([
-      { id: "spc-msg-2", chat: "owner", text: "ok send it", receivedAt: Date.parse(at) + 60_000 },
-    ]);
+    const inbox: Array<InboundMessage> = [];
+    const { layer } = toolsLayer(inbox);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
@@ -225,6 +228,9 @@ describe("mission MCP tools", () => {
       expect(submitted.isError).toBe(false);
       const draft = submitted.structured.draft as { id: string; appliedNoteIds: string[] };
       expect(draft.appliedNoteIds.length).toBe(1);
+      inbox.push(
+        typedInbound("spc-msg-2", addressed(draft.id, "ok send it"), Date.parse(at) + 60_000),
+      );
 
       // A lane thread approving on its own is refused; the owner's iMessage approves.
       const refused = yield* call("mission_draft_approve", threadCaller(laneThread), {
