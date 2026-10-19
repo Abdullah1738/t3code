@@ -306,7 +306,7 @@ export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => 
   if (condition !== null && (ask.spentConditionIds ?? []).includes(condition.requestId)) {
     return refuse(
       "provenance-invalid",
-      `Owner request ${condition.requestId} answered ask ${ask.id} before it was reopened; it does not answer it again.`,
+      `Owner request ${condition.requestId} answered ask ${ask.id} before it was reopened; it does not answer it again. Ask the owner in a new discussion.`,
     );
   }
   const text = input.text.trim();

@@ -399,7 +399,7 @@ export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision>
   if (condition !== null && (draft.spentConditionIds ?? []).includes(condition.requestId)) {
     return refuse(
       "provenance-invalid",
-      `Owner request ${condition.requestId} decided draft ${draft.id} before it was reopened; it does not decide it again.`,
+      `Owner request ${condition.requestId} decided draft ${draft.id} before it was reopened; it does not decide it again. Ask the owner in a new discussion.`,
     );
   }
   // An approval in the app or by a master binds to the text the decider read;
