@@ -69,21 +69,19 @@ export const makePages = (store: MissionStore.MissionStore["Service"]) => {
   ): Effect.Effect<MissionWorkItemsPage, MissionError> =>
     Effect.gen(function* () {
       yield* requireMission(input.missionId);
-      const all = yield* store.listAllInMission("work-item", input.missionId, input.stages);
-      const matching = all
-        .filter((item) => input.laneId === undefined || item.laneId === input.laneId)
-        .toSorted((left, right) =>
-          left.updatedAt === right.updatedAt
-            ? right.id.localeCompare(left.id)
-            : right.updatedAt.localeCompare(left.updatedAt),
-        );
-      const offset = input.offset ?? 0;
-      const items = matching.slice(offset, offset + pageSize(input.limit));
+      const offset = Math.max(input.offset ?? 0, 0);
+      const page = yield* store.listPage("work-item", {
+        missionId: input.missionId,
+        ...(input.stages === undefined ? {} : { status: input.stages }),
+        ...(input.laneId === undefined ? {} : { laneId: input.laneId }),
+        offset,
+        limit: pageSize(input.limit),
+      });
       return {
         missionId: input.missionId,
-        items,
-        total: matching.length,
-        hasMore: offset + items.length < matching.length,
+        items: page.records,
+        total: page.total,
+        hasMore: offset + page.records.length < page.total,
       };
     });
 
