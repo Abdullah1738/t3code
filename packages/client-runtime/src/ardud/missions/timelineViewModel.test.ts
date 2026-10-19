@@ -17,6 +17,7 @@ import {
 } from "./changeLog.ts";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import { portfolioView, reorderPortfolioInput } from "./portfolioViewModel.ts";
+import { actorNames } from "./roomsViewModel.ts";
 import type { MissionTimelineEvent, PortfolioSnapshot } from "./source.ts";
 import {
   actorChoices,
@@ -27,11 +28,15 @@ import {
   eventKicker,
   eventKindLabel,
   filterTimeline,
+  inTimelineRange,
   kindChoices,
   kindGroup,
   lineage,
+  needsOlderTimeline,
+  restartEvent,
   TIMELINE_KIND_GROUP_LABEL,
   timelineDays,
+  timelineReaches,
   timelineRows,
   toggleFilter,
 } from "./timelineViewModel.ts";
@@ -217,6 +222,71 @@ describe("timeline view model", () => {
       ["Yesterday", 3, 1],
       ["Fri 16 Oct", 1, 1],
     ]);
+  });
+
+  it("names lanes and roles in Who and on each line, and says what caused a line", () => {
+    const lead = "crpko:lane-lead:crpko:lane:cell-tc";
+    const event = (seq: number, actor: MissionActor, extra = {}) =>
+      ({
+        id: `ev-${seq}` as MissionEventId,
+        missionId: CRPKO,
+        seq,
+        kind: "lane.updated",
+        actor,
+        provenance: { _tag: "system", component: "missions-policy" },
+        summary: `Event ${seq}`,
+        subject: null,
+        causedBy: null,
+        payload: null,
+        at: "2026-10-19T08:00:00.000Z",
+        ...extra,
+      }) as MissionTimelineEvent;
+    const cause = { ...event(1, { _tag: "owner" }), summary: "Rule 104 added" };
+    const events = [
+      event(3, { _tag: "role", roleId: lead as never }, { causedBy: "ev-1" }),
+      event(2, { _tag: "role", roleId: lead as never }),
+      cause,
+    ];
+    const names = actorNames([], [{ id: lead as never, name: "cell-tc" }]);
+    expect(actorChoices(events, MASTER, names).map((choice) => choice.label)).toEqual([
+      "you",
+      "cell-tc",
+    ]);
+    const rows = timelineRows(events, events, MASTER, names);
+    expect(rows.map((row) => [row.actor, row.because, row.led])).toEqual([
+      ["cell-tc", "Because rule 104 added", 0],
+      ["cell-tc", null, 0],
+      ["you", null, 1],
+    ]);
+  });
+
+  it("reads Today and 7 days in the reader's zone and pages back only while in range", () => {
+    const at = (iso: string, kind = "lane.updated") => ({ at: iso, kind }) as MissionTimelineEvent;
+    const now = Date.parse("2026-10-19T22:30:00.000Z");
+    // 22:30 UTC is already the 20th in Dubai, so 21:00 UTC is "today" only in UTC.
+    expect(inTimelineRange(at("2026-10-19T19:00:00.000Z"), "today", now, "UTC")).toBe(true);
+    expect(inTimelineRange(at("2026-10-19T19:00:00.000Z"), "today", now, "Asia/Dubai")).toBe(false);
+    expect(inTimelineRange(at("2026-10-13T00:00:00.000Z"), "week", now)).toBe(true);
+    expect(inTimelineRange(at("2026-10-12T00:00:00.000Z"), "week", now)).toBe(false);
+
+    const window = (events: MissionTimelineEvent[], hasOlder: boolean) => ({ events, hasOlder });
+    const recent = [at("2026-10-19T20:00:00.000Z"), at("2026-10-15T20:00:00.000Z")];
+    expect(needsOlderTimeline(window(recent, true), "week", now)).toBe(true);
+    expect(needsOlderTimeline(window(recent, true), "today", now, "UTC")).toBe(false);
+    expect(needsOlderTimeline(window(recent, false), "week", now)).toBe(false);
+    // "All" pages on request, never by itself.
+    expect(needsOlderTimeline(window(recent, true), "all", now)).toBe(false);
+
+    expect(timelineReaches(window(recent, true), "2026-10-15T20:00:00.000Z")).toBe(true);
+    expect(timelineReaches(window(recent, true), "2026-10-04T15:41:48.000Z")).toBe(false);
+    const log = [
+      at("2026-10-04T16:08:06.000Z", "recovery.incident-cleared"),
+      at("2026-10-04T15:45:00.000Z", "recovery.thread-decided"),
+      at("2026-10-04T15:41:48.000Z", "recovery.incident-opened"),
+      at("2026-10-04T15:40:00.000Z", "recovery.incident-cleared"),
+    ];
+    expect(restartEvent(log, "2026-10-04T15:41:48.000Z")?.kind).toBe("recovery.incident-opened");
+    expect(restartEvent(log, "2026-10-05T00:00:00.000Z")).toBeNull();
   });
 
   it("folds repeated structural changes in the direction check, never calls", () => {
