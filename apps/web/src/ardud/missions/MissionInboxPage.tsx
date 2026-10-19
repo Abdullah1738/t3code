@@ -107,11 +107,11 @@ export function MissionInboxPage(props: {
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-(--m-ground) text-(--m-text)">
         <WorkspacePageHeader
           electron={isElectron}
           reserveNativeControls
-          className="relative bg-background"
+          className="relative bg-(--m-ground)"
         >
           <WorkspaceBreadcrumb ariaLabel="Mission inbox" className="overflow-hidden">
             <WorkspaceBreadcrumbItem>
@@ -119,7 +119,7 @@ export function MissionInboxPage(props: {
                 <Link
                   to="/missions/$missionId"
                   params={{ missionId: mission.id }}
-                  className="min-w-0 rounded outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                  className="min-w-0 rounded outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                 >
                   <WorkspaceBreadcrumbText>{mission.title}</WorkspaceBreadcrumbText>
                 </Link>
@@ -166,7 +166,7 @@ export function MissionInboxPage(props: {
             wide={wide}
           />
         ) : (
-          <p className="mx-auto w-full max-w-6xl px-5 pt-5 text-sm text-muted-foreground sm:px-6">
+          <p className="mx-auto w-full max-w-6xl px-5 pt-5 text-sm text-(--m-muted) sm:px-6">
             Loading…
           </p>
         )}
@@ -255,7 +255,7 @@ function MenuCountLabel(props: { label: string; count: number }) {
     <span className="flex min-w-0 items-center gap-3">
       <span className="min-w-0 flex-1 truncate">{props.label}</span>
       {props.count > 0 ? (
-        <span className="text-xs text-muted-foreground tabular-nums">{props.count}</span>
+        <span className="text-xs text-(--m-muted) tabular-nums">{props.count}</span>
       ) : null}
     </span>
   );
@@ -268,7 +268,7 @@ function InboxTabs(props: {
   counts: Record<InboxTab, number> | undefined;
 }) {
   return (
-    <nav aria-label="Inbox sections" className="overflow-x-auto border-b border-border">
+    <nav aria-label="Inbox sections" className="overflow-x-auto border-b border-(--m-rule)">
       <ul className="flex min-w-max gap-0.5">
         {INBOX_TABS.map((tab) => {
           const active = tab === props.tab;
@@ -286,15 +286,13 @@ function InboxTabs(props: {
                 className={cn(
                   "relative flex h-9 items-center gap-1.5 px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
                   active
-                    ? "font-medium text-foreground after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-foreground"
-                    : "text-muted-foreground hover:text-foreground",
+                    ? "font-medium text-(--m-text) after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-(--m-text)"
+                    : "text-(--m-muted) hover:text-(--m-text)",
                 )}
               >
                 {INBOX_TAB_LABEL[tab]}
                 {count > 0 ? (
-                  <span className="text-xs font-normal text-muted-foreground tabular-nums">
-                    {count}
-                  </span>
+                  <span className="text-xs font-normal text-(--m-muted) tabular-nums">{count}</span>
                 ) : null}
               </Link>
             </li>
@@ -337,7 +335,7 @@ function InboxBody(props: {
 
   const listView =
     screen.entries.length === 0 ? (
-      <p className="text-sm text-muted-foreground">
+      <p className="text-sm text-(--m-muted)">
         {props.route === "owner" && ACTION_TABS.has(props.tab)
           ? "Nothing needs you"
           : "Nothing here"}
@@ -479,7 +477,7 @@ function InboxList(props: {
         return (
           <div key={group.missionId ?? "none"}>
             {headed ? (
-              <h2 className="flex h-7 items-center gap-1.5 px-3 text-xs text-muted-foreground">
+              <h2 className="flex h-7 items-center gap-1.5 px-3 text-xs text-(--m-muted)">
                 {group.health ? <HealthGlyph health={group.health} paused={group.paused} /> : null}
                 <span className="truncate">{title}</span>
               </h2>
@@ -527,7 +525,7 @@ function InboxRow(props: {
         onClick={() => props.onOpen(row.key)}
         className={cn(
           "grid w-full grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-2.5 gap-y-0.5 rounded-lg px-3 py-2.5 text-start text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-          props.current ? "bg-foreground/7" : "hover:bg-foreground/4",
+          props.current ? "bg-(--m-active)" : "hover:bg-(--m-surface)",
         )}
       >
         <span className="truncate font-medium">{row.title}</span>
@@ -535,7 +533,7 @@ function InboxRow(props: {
           {talk ? <DiscussionSymbol unread={discussionUnread(talk)} /> : null}
           {age ? <AgeElement age={age} at={row.since} prefix="waiting " /> : null}
         </span>
-        <span className="col-span-2 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+        <span className="col-span-2 flex min-w-0 items-center gap-1.5 text-xs text-(--m-muted)">
           <span className="shrink-0 font-medium">{row.kicker}</span>
           {row.sub ? (
             <>
@@ -609,7 +607,7 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
     <MissionSection title="Decided today">
       {editedDrafts.map(({ draft, edit }) => (
         <div key={draft.id} className="flex flex-col gap-1">
-          <p className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+          <p className="flex min-w-0 items-center gap-1.5 text-xs text-(--m-muted)">
             <span className="shrink-0 font-medium">Your edit</span>
             <span className="truncate">To {draft.audience}</span>
             {draft.decidedAt ? (
@@ -625,7 +623,7 @@ function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
         <div key={`condition:${draft.id}`} className="flex min-w-0 flex-col gap-1.5">
           <p className="flex min-w-0 items-center gap-1.5 text-sm">
             <span className="min-w-0 truncate font-medium">{draftTitle(draft)}</span>
-            <span className="shrink-0 text-xs text-muted-foreground">
+            <span className="shrink-0 text-xs text-(--m-muted)">
               {DRAFT_STATUS_LABEL[draft.status]}
             </span>
           </p>

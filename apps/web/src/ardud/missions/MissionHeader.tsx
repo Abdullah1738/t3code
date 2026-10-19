@@ -61,7 +61,7 @@ export function MissionHead(props: { overview: MissionOverviewSnapshot; nowMs: n
         </div>
       </div>
       {mission.goal ? (
-        <p className="max-w-[72ch] text-sm text-pretty text-muted-foreground">{mission.goal}</p>
+        <p className="max-w-[72ch] text-sm text-pretty text-(--m-muted)">{mission.goal}</p>
       ) : null}
       <FocusBar overview={overview} />
       <MissionStats overview={overview} nowMs={nowMs} />
@@ -94,7 +94,7 @@ function FocusMenu(props: { overview: MissionOverview }) {
           <MenuRadioGroup value={mission.focusSubMissionId ?? ""} onValueChange={setFocus}>
             {rows.map((row) => (
               <MenuRadioItem key={row.subMission.id} value={row.subMission.id} closeOnClick>
-                <span className="w-4 shrink-0 text-xs text-muted-foreground tabular-nums">
+                <span className="w-4 shrink-0 text-xs text-(--m-muted) tabular-nums">
                   {row.position}
                 </span>
                 {row.subMission.title}
@@ -115,9 +115,9 @@ function FocusBar(props: { overview: MissionOverview }) {
   return (
     <div
       role="status"
-      className="mt-3.5 flex max-w-140 min-w-0 items-center gap-2.5 rounded-lg bg-update/14 py-1.5 ps-3 pe-1.5 text-sm"
+      className="mt-3.5 flex max-w-140 min-w-0 items-center gap-2.5 rounded-lg bg-(--m-band) py-1.5 ps-3 pe-1.5 text-sm"
     >
-      <CrosshairIcon aria-hidden className="size-4 shrink-0 text-update-foreground" />
+      <CrosshairIcon aria-hidden className="size-4 shrink-0 text-(--m-accent-text)" />
       <span className="min-w-0 flex-1 truncate font-medium">
         Focused on {focused?.title ?? "a closed sub-mission"}
       </span>
@@ -179,7 +179,7 @@ function MissionStats(props: { overview: MissionOverviewSnapshot; nowMs: number 
       </Stat>
       {countdown ? (
         <Stat term="Time left">
-          <span className={cn(countdown.startsWith("overdue") && "text-error-foreground")}>
+          <span className={cn(countdown.startsWith("overdue") && "text-(--m-negative)")}>
             {countdown}
           </span>
         </Stat>
@@ -230,7 +230,7 @@ function MissionStats(props: { overview: MissionOverviewSnapshot; nowMs: number 
       <NeedsYouStat missionId={mission.id} />
       {overview.usageShare !== null && Number.isFinite(overview.usageShare) ? (
         <Stat term="Guaranteed share used">
-          <span className={cn(overview.usageShare > 1 && "text-warning-foreground")}>
+          <span className={cn(overview.usageShare > 1 && "text-(--m-warning)")}>
             {formatPercent(overview.usageShare)}
           </span>
         </Stat>
@@ -241,8 +241,8 @@ function MissionStats(props: { overview: MissionOverviewSnapshot; nowMs: number 
           <Stat key={view.id} term={view.label}>
             <span
               className={cn(
-                view.tone === "out" && "text-error-foreground",
-                view.tone === "tight" && "text-warning-foreground",
+                view.tone === "out" && "text-(--m-negative)",
+                view.tone === "tight" && "text-(--m-warning)",
               )}
             >
               <span aria-hidden>{view.value}</span>
@@ -268,7 +268,7 @@ function NeedsYouStat(props: { missionId: MissionId }) {
         <Link
           to="/missions/inbox"
           search={{ mission: props.missionId }}
-          className="rounded-sm text-update-foreground outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          className="rounded-sm text-(--m-accent-text) outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         >
           {badgeCount(count)}
           <span className="sr-only"> in the inbox</span>
@@ -285,7 +285,7 @@ function NeedsYouStat(props: { missionId: MissionId }) {
 function Stat(props: { term: string; children: ReactNode }) {
   return (
     <div className="flex min-w-0 flex-col-reverse gap-0.5">
-      <dt className="truncate text-xs text-muted-foreground">{props.term}</dt>
+      <dt className="truncate text-xs text-(--m-muted)">{props.term}</dt>
       <dd className="flex min-w-0 items-center gap-3 text-base leading-6 font-semibold tabular-nums">
         {props.children}
       </dd>
@@ -294,5 +294,5 @@ function Stat(props: { term: string; children: ReactNode }) {
 }
 
 function OfTotal(props: { total: number }) {
-  return <span className="text-xs font-normal text-muted-foreground">of {props.total}</span>;
+  return <span className="text-xs font-normal text-(--m-muted)">of {props.total}</span>;
 }

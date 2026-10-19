@@ -183,11 +183,11 @@ function RequestRow(props: { request: OwnerRequest; nowMs: number; onOpen: () =>
   const unread = isRequestUnread(request);
   const age = ageView(request.updatedAt, props.nowMs);
   return (
-    <li className="min-w-0 border-t border-border/60">
+    <li className="min-w-0 border-t border-(--m-rule)">
       <button
         type="button"
         onClick={props.onOpen}
-        className="grid w-full min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2.5 gap-y-0.5 rounded-sm py-2.5 text-start outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className="grid w-full min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2.5 gap-y-0.5 rounded-sm py-2.5 text-start outline-none hover:bg-(--m-surface) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         <StateGlyph
           kind={STATUS_GLYPH[request.status]}
@@ -196,7 +196,7 @@ function RequestRow(props: { request: OwnerRequest; nowMs: number; onOpen: () =>
         <span
           className={cn(
             "min-w-0 truncate text-sm",
-            unread ? "font-semibold text-foreground" : "font-medium text-foreground",
+            unread ? "font-semibold text-(--m-text)" : "font-medium text-(--m-text)",
           )}
         >
           {request.title}
@@ -205,7 +205,7 @@ function RequestRow(props: { request: OwnerRequest; nowMs: number; onOpen: () =>
           {unread ? <UnreadDot label="New answer" /> : null}
           {age ? <AgeElement age={age} at={request.updatedAt} /> : null}
         </span>
-        <span className="col-start-2 col-end-4 min-w-0 truncate text-xs text-muted-foreground">
+        <span className="col-start-2 col-end-4 min-w-0 truncate text-xs text-(--m-muted)">
           {requestPreview(request)}
         </span>
       </button>
@@ -283,7 +283,7 @@ export function RequestThread(props: {
           <ArrowLeftIcon aria-hidden />
         </Button>
         <Heading className="min-w-0 truncate text-sm font-semibold">{request.title}</Heading>
-        <span className="ms-auto inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+        <span className="ms-auto inline-flex shrink-0 items-center gap-1.5 text-xs text-(--m-muted)">
           <StateGlyph kind={STATUS_GLYPH[request.status]} />
           {REQUEST_STATUS_LABEL[request.status]}
         </span>
@@ -401,7 +401,7 @@ export function RequestsUnreadLink(props: {
       to="/missions/$missionId"
       params={{ missionId: props.missionId }}
       search={{ request: first.id }}
-      className="inline-flex items-center gap-1.5 rounded-sm text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      className="inline-flex items-center gap-1.5 rounded-sm text-xs text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
       <UnreadDot />
       <span className="tabular-nums">{count}</span>

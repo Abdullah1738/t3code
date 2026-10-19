@@ -46,11 +46,11 @@ export function MissionPage(props: {
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-(--m-ground) text-(--m-text)">
         <WorkspacePageHeader
           electron={isElectron}
           reserveNativeControls
-          className="relative bg-background"
+          className="relative bg-(--m-ground)"
         >
           <WorkspaceBreadcrumb ariaLabel="Mission" className="overflow-hidden">
             <WorkspaceBreadcrumbItem>
@@ -120,7 +120,7 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
     [views, props.tab],
   );
   return (
-    <nav aria-label="Mission sections" className="overflow-x-auto border-b border-border">
+    <nav aria-label="Mission sections" className="overflow-x-auto border-b border-(--m-rule)">
       <ul className="flex min-w-max gap-0.5">
         {tabs.map(({ tab, title }) => {
           const active = tab === props.tab;
@@ -134,8 +134,8 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
                 className={cn(
                   "relative flex h-9 items-center px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
                   active
-                    ? "font-medium text-foreground after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-foreground"
-                    : "text-muted-foreground hover:text-foreground",
+                    ? "font-medium text-(--m-text) after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-(--m-text)"
+                    : "text-(--m-muted) hover:text-(--m-text)",
                 )}
               >
                 {title}

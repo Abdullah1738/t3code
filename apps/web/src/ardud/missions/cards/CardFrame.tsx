@@ -1,13 +1,13 @@
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
-import { CheckIcon, MessagesSquareIcon } from "lucide-react";
+import { CheckIcon } from "lucide-react";
 
 import type { Approver, MissionId, SubMissionId } from "@t3tools/contracts";
 import { ageView } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../../components/ui/button";
 import { cn } from "../../../lib/utils";
-import { AgeElement, ApproverChip, Avatar } from "./chips";
+import { AgeElement, ApproverChip, Avatar, Chip } from "./chips";
 
 // The fixed card frame every inbox card and template card renders through:
 // head row (kicker, provenance, sub-mission, age), title, body slot, a footer
@@ -133,15 +133,15 @@ export function CardFrame(props: CardFrameProps) {
       data-state={done ? "done" : undefined}
       onClickCapture={props.onSelect}
       onFocusCapture={props.onSelect}
-      className="group/card relative grid min-w-0 gap-2.5 text-sm"
+      className="group/card relative grid min-w-0 gap-3 text-sm text-(--m-text)"
     >
       {/* Keyboard selection marker; sits in the gutter so nothing shifts. */}
       <span
         aria-hidden
-        className="absolute inset-y-0 -start-3 w-0.5 rounded-full group-data-selected/card:bg-ring"
+        className="absolute inset-y-0 -start-3 w-0.5 rounded-full group-data-selected/card:bg-(--m-accent)"
       />
-      <div className="flex min-h-5 min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-        <span className="font-medium whitespace-nowrap">{props.kicker}</span>
+      <div className="flex min-h-6 min-w-0 items-center gap-2.5 text-xs text-(--m-muted)">
+        <Chip>{props.kicker}</Chip>
         {props.discussion}
         {props.madeBy === "master" ? (
           <span role="img" aria-label="Made by the master">
@@ -157,20 +157,22 @@ export function CardFrame(props: CardFrameProps) {
       </div>
       <h3
         className={cn(
-          "-mt-1.5 text-pretty",
-          props.size === "pane" ? "text-base leading-6" : "text-sm leading-5.5",
-          done ? "font-medium text-muted-foreground" : "font-semibold text-foreground",
+          "text-pretty",
+          props.size === "pane"
+            ? "mt-1.5 max-w-[34ch] text-2xl leading-tight font-normal"
+            : "text-sm leading-5.5 font-semibold",
+          done && "text-(--m-muted)",
         )}
       >
         {props.title}
       </h3>
       {done ? (
-        <div role="status" className="flex min-h-7 min-w-0 items-center gap-2">
-          <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-success-foreground">
+        <div role="status" className="flex min-h-8 min-w-0 items-center gap-2">
+          <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-(--m-accent-text)">
             <CheckIcon aria-hidden className="size-3.5 shrink-0" />
             {done.verb}
             {done.detail ? (
-              <span className="min-w-0 truncate font-normal text-foreground">{done.detail}</span>
+              <span className="min-w-0 truncate font-normal text-(--m-text)">{done.detail}</span>
             ) : null}
           </span>
           {done.chips}
@@ -184,13 +186,12 @@ export function CardFrame(props: CardFrameProps) {
         <>
           {props.children}
           {decisions.length > 0 || discuss || props.approver ? (
-            <div className="flex min-w-0 flex-wrap items-center gap-1.5 pt-0.5">
+            <div className="flex min-w-0 flex-wrap items-center gap-2 pt-1">
               {decisions.map((action) => (
                 <Button
                   key={action.key}
-                  size="sm"
-                  variant={action.primary ? "default" : "ghost-muted"}
-                  className={action.primary ? "min-w-21" : undefined}
+                  variant={action.primary ? "default" : "secondary"}
+                  className={action.primary ? "min-w-26" : undefined}
                   disabled={action.disabled}
                   onClick={action.onRun}
                 >
@@ -224,8 +225,7 @@ function DiscussButton(props: {
   label?: string | undefined;
 }) {
   return (
-    <Button size="sm" variant="ghost-muted" disabled={props.disabled} onClick={props.onRun}>
-      <MessagesSquareIcon aria-hidden />
+    <Button variant="ghost-muted" disabled={props.disabled} onClick={props.onRun}>
       {props.label ?? CARD_ACTION_LABEL.discuss}
     </Button>
   );
@@ -238,7 +238,7 @@ function SubMissionLink(props: { subMission: CardSubMission }) {
       to="/missions/$missionId"
       params={{ missionId: subMission.missionId }}
       search={{ sub: subMission.subMissionId }}
-      className="ms-1 inline-flex min-w-0 items-center gap-1.25 rounded-sm outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      className="inline-flex min-w-0 items-center gap-1.25 rounded-sm outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
       <span className="font-medium tabular-nums">
         <span className="sr-only">Sub-mission </span>
@@ -249,7 +249,7 @@ function SubMissionLink(props: { subMission: CardSubMission }) {
   );
 }
 
-/** Cards in a list: spaced and divided by a soft rule, no boxes. */
+/** Cards in a list: rows on a 1px rule, no boxes. */
 export function CardList(props: { children: ReactNode; label?: string }) {
   return (
     <ul aria-label={props.label} className="flex min-w-0 flex-col">
@@ -260,7 +260,7 @@ export function CardList(props: { children: ReactNode; label?: string }) {
 
 export function CardListItem(props: { children: ReactNode }) {
   return (
-    <li className="min-w-0 border-border/60 not-first:mt-5.5 not-first:border-t not-first:pt-5.5">
+    <li className="min-w-0 py-4 not-first:border-t not-first:border-(--m-rule) first:pt-2.5">
       {props.children}
     </li>
   );

@@ -238,7 +238,7 @@ function RecoveryLine(props: { overview: MissionOverviewSnapshot }) {
       to="/missions/$missionId"
       params={{ missionId: props.overview.mission.id }}
       search={{ tab: "roles" }}
-      className="flex min-w-0 items-center gap-2 rounded-sm text-sm text-foreground outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      className="flex min-w-0 items-center gap-2 rounded-sm text-sm text-(--m-text) outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
       <StateGlyph kind="risk" />
       {line}
@@ -337,7 +337,7 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
       section={props.section}
       meta={
         looked ? (
-          <time dateTime={looked} className="text-xs text-muted-foreground tabular-nums">
+          <time dateTime={looked} className="text-xs text-(--m-muted) tabular-nums">
             {formatRelative(looked, nowMs)}
           </time>
         ) : null
@@ -396,7 +396,7 @@ function CallRow(props: { row: DirectionCheckRow; missionId: MissionId; nowMs: n
     void reactToCall(item.ref.id, "ok").then(() => setBusy(false));
   };
   return (
-    <li className="grid min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2.5 gap-y-1 border-t border-border/60 py-2.5 first:border-t-0 first:pt-0">
+    <li className="grid min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2.5 gap-y-1 border-t border-(--m-rule) py-2.5 first:border-t-0 first:pt-0">
       <span className="pt-1">
         <ByMarker by="master" label="The master's call" />
       </span>
@@ -404,13 +404,13 @@ function CallRow(props: { row: DirectionCheckRow; missionId: MissionId; nowMs: n
         <p className="text-sm text-pretty">
           {item.summary}
           {count > 1 ? (
-            <span className="ms-1.5 inline-flex rounded-full bg-foreground/6 px-1.5 text-xs tabular-nums text-muted-foreground">
+            <span className="ms-1.5 inline-flex rounded-full bg-(--m-chip) px-1.5 text-xs tabular-nums text-(--m-muted)">
               {count}
               <span className="sr-only"> times</span>
             </span>
           ) : null}
         </p>
-        <p className="mt-0.5 text-xs text-pretty text-muted-foreground">{reason}</p>
+        <p className="mt-0.5 text-xs text-pretty text-(--m-muted)">{reason}</p>
       </div>
       <span className="inline-flex items-center gap-2">
         {discussion.symbol}
@@ -439,7 +439,7 @@ function FeedRow(props: { item: FeedItem; missionId: string; nowMs: number }) {
   const { item } = props;
   return (
     <li className="grid min-w-0 grid-cols-[44px_14px_minmax(0,1fr)] items-baseline gap-x-2">
-      <time dateTime={item.at} className="text-xs text-muted-foreground tabular-nums">
+      <time dateTime={item.at} className="text-xs text-(--m-muted) tabular-nums">
         {formatRelative(item.at, props.nowMs)}
       </time>
       <span className="translate-y-0.5">
@@ -453,7 +453,7 @@ function FeedRow(props: { item: FeedItem; missionId: string; nowMs: number }) {
             <Link
               to="/missions/inbox"
               search={{ mission: props.missionId }}
-              className="rounded-sm text-xs whitespace-nowrap text-update-foreground underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              className="rounded-sm text-xs whitespace-nowrap text-(--m-accent-text) underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
             >
               Review draft
             </Link>
@@ -498,9 +498,9 @@ function PathSection(props: SectionProps & { overview: MissionOverviewSnapshot }
       {...(heading ? { title: heading } : {})}
       meta={
         path.steps.length > 0 ? (
-          <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground tabular-nums">
+          <span className="inline-flex items-center gap-1.5 text-xs text-(--m-muted) tabular-nums">
             {path.blockedCount > 0 ? (
-              <span className="inline-flex items-center gap-1 text-error-foreground">
+              <span className="inline-flex items-center gap-1 text-(--m-negative)">
                 <StateGlyph kind="bad" />
                 {path.blockedCount} blocked
               </span>
@@ -511,7 +511,7 @@ function PathSection(props: SectionProps & { overview: MissionOverviewSnapshot }
       }
       aside={
         target ? (
-          <span className="text-xs text-muted-foreground tabular-nums">
+          <span className="text-xs text-(--m-muted) tabular-nums">
             {formatCountdown(target, nowMs)}
           </span>
         ) : null
@@ -548,9 +548,7 @@ function PathSection(props: SectionProps & { overview: MissionOverviewSnapshot }
             <li key={group.holderLabel} className="flex min-w-0 flex-col gap-1">
               <div className="flex items-center gap-2">
                 <PersonChip kind="person" name={group.holderLabel} prefix="Held by " />
-                <span className="text-xs text-muted-foreground tabular-nums">
-                  {group.items.length}
-                </span>
+                <span className="text-xs text-(--m-muted) tabular-nums">{group.items.length}</span>
               </div>
               <div className="flex min-w-0 flex-wrap gap-1.5">
                 {group.items.map((item) => (
@@ -585,13 +583,13 @@ function Milestones(props: { milestones: MissionOverview["milestones"] }) {
             </Badge>
             <span className={cn("min-w-0 truncate text-sm")}>{milestone.title}</span>
             {milestone.targetAt ? (
-              <span className="ms-auto shrink-0 text-xs text-muted-foreground tabular-nums">
+              <span className="ms-auto shrink-0 text-xs text-(--m-muted) tabular-nums">
                 {formatDayLabel(milestone.targetAt)}
               </span>
             ) : null}
           </div>
           {milestone.statusNote ? (
-            <p className="text-xs text-pretty text-muted-foreground">{milestone.statusNote}</p>
+            <p className="text-xs text-pretty text-(--m-muted)">{milestone.statusNote}</p>
           ) : null}
         </li>
       ))}

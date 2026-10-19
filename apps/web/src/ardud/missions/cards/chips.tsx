@@ -1,6 +1,5 @@
 import type { ReactNode, SVGProps } from "react";
 import {
-  ClockIcon,
   FileTextIcon,
   GitCommitHorizontalIcon,
   LinkIcon,
@@ -44,17 +43,18 @@ export function YouGlyph(props: SVGProps<SVGSVGElement>) {
 
 export type AvatarKind = "you" | "master" | "person";
 
-/** 16px round avatar: the owner's diamond, the master's hexagon, or an initial. */
+/** 22px round avatar (16px small): the owner's diamond, the master's hexagon, or an initial. */
 export function Avatar(props: { kind: AvatarKind; name?: string; small?: boolean }) {
   return (
     <span
       aria-hidden
       className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-full text-xs font-semibold",
-        props.small ? "size-3.5" : "size-4",
-        props.kind === "you"
-          ? "bg-update/14 text-update-foreground"
-          : "bg-foreground/10 text-foreground",
+        "inline-flex shrink-0 items-center justify-center rounded-full font-semibold",
+        props.small ? "size-4 text-2xs" : "size-5.5 text-2xs",
+        props.kind === "you" && "bg-(--m-text) text-(--m-ground)",
+        props.kind === "master" &&
+          "bg-(--m-raised) text-(--m-text) ring-1 ring-(--m-text) ring-inset",
+        props.kind === "person" && "bg-(--m-chip) text-(--m-text)",
       )}
     >
       {props.kind === "you" ? (
@@ -68,11 +68,11 @@ export function Avatar(props: { kind: AvatarKind; name?: string; small?: boolean
   );
 }
 
-/** A person chip: avatar plus name. `prefix` is read out but not shown ("Approver: "). */
+/** A person: avatar plus name. `prefix` is read out but not shown ("Approver: "). */
 export function PersonChip(props: { kind: AvatarKind; name: string; prefix?: string }) {
   return (
-    <span className="inline-flex h-5 max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-full bg-foreground/6 ps-0.5 pe-2 text-xs font-medium text-foreground dark:bg-foreground/8">
-      <Avatar kind={props.kind} name={props.name} />
+    <span className="inline-flex max-w-full min-w-0 shrink-0 items-center gap-2 text-xs text-(--m-muted)">
+      <Avatar kind={props.kind} name={props.name} small />
       {props.prefix ? <span className="sr-only">{props.prefix}</span> : null}
       <span className="min-w-0 truncate">{props.name}</span>
     </span>
@@ -104,7 +104,16 @@ const LINK_ICON = {
 } as const;
 
 const CHIP_CLASS =
-  "inline-flex h-5 max-w-full min-w-0 shrink-0 items-center gap-1 rounded-md bg-foreground/6 px-1.5 font-mono text-xs text-foreground dark:bg-foreground/8";
+  "inline-flex h-6 max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-full bg-(--m-raised) px-2.5 text-xs font-medium text-(--m-text)";
+
+/** A plain 24px chip: an item's kind ("Merge", "Question"). */
+export function Chip(props: { children: ReactNode }) {
+  return (
+    <span className={CHIP_CLASS}>
+      <span className="min-w-0 truncate">{props.children}</span>
+    </span>
+  );
+}
 
 /** A link chip: kind glyph plus the link's label; an anchor when it has a URL. */
 export function LinkChip(props: { link: MissionLink }) {
@@ -112,7 +121,7 @@ export function LinkChip(props: { link: MissionLink }) {
   const Icon = LINK_ICON[link.kind];
   const body = (
     <>
-      <Icon aria-hidden className="size-3 shrink-0 text-muted-foreground" />
+      <Icon aria-hidden className="size-3 shrink-0 text-(--m-muted)" />
       <span className="min-w-0 truncate">{link.label}</span>
     </>
   );
@@ -124,7 +133,7 @@ export function LinkChip(props: { link: MissionLink }) {
       rel="noreferrer"
       className={cn(
         CHIP_CLASS,
-        "outline-none hover:bg-foreground/12 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+        "outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
       )}
     >
       {body}
@@ -135,7 +144,7 @@ export function LinkChip(props: { link: MissionLink }) {
 /** A chip for a record inside the mission (an ask, a rule, a work item). */
 export function RefChip(props: { record: MissionRecordRef }) {
   return (
-    <span className={cn(CHIP_CLASS, "font-sans")}>
+    <span className={CHIP_CLASS}>
       <span className="min-w-0 truncate">{refLabel(props.record)}</span>
     </span>
   );
@@ -152,22 +161,16 @@ export function linkKey(link: MissionLink | MissionRecordRef): string {
     : `${link.kind}:${link.url ?? link.ref ?? link.label}`;
 }
 
-/**
- * How long something has waited: clock glyph plus "52m" or "1d 14h". Quiet
- * under an hour, stronger from an hour, strongest past a day.
- */
+/** How long something has waited ("52m", "1d 14h"): muted, ink once past a day. */
 export function AgeElement(props: { age: AgeView; at: string; prefix?: string }) {
   return (
     <time
       dateTime={props.at}
       className={cn(
-        "inline-flex shrink-0 items-center gap-1 text-xs whitespace-nowrap tabular-nums",
-        props.age.tier === "minutes" && "text-muted-foreground",
-        props.age.tier === "hours" && "font-medium text-foreground",
-        props.age.tier === "days" && "font-semibold text-foreground",
+        "inline-flex shrink-0 items-center text-xs whitespace-nowrap tabular-nums",
+        props.age.tier === "days" ? "font-medium text-(--m-text)" : "text-(--m-muted)",
       )}
     >
-      <ClockIcon aria-hidden className="size-3" />
       {props.prefix ? <span className="sr-only">{props.prefix}</span> : null}
       {props.age.label}
     </time>
@@ -191,18 +194,18 @@ export function MetaRow(props: { children: ReactNode }) {
 export type StateGlyphKind = "ok" | "done" | "risk" | "bad" | "wait" | "idle" | "park" | "unknown";
 
 const STATE_GLYPH_CLASS: Record<StateGlyphKind, string> = {
-  ok: "text-success-foreground",
-  done: "text-success-foreground",
-  risk: "text-warning-foreground",
-  bad: "text-error-foreground",
-  wait: "text-muted-foreground",
-  idle: "text-muted-foreground",
-  park: "text-muted-foreground",
-  unknown: "text-muted-foreground",
+  ok: "text-(--m-accent)",
+  done: "text-(--m-text)",
+  risk: "text-(--m-warning)",
+  bad: "text-(--m-negative)",
+  wait: "text-(--m-warning)",
+  idle: "text-(--m-muted)",
+  park: "text-(--m-muted)",
+  unknown: "text-(--m-muted)",
 };
 
 /**
- * 12px state glyph from the sprite: shape and colour both carry the state.
+ * 10px state glyph: shape and colour both carry the state.
  * `tone` borrows another kind's colour (a waiting lane counts as a risk).
  */
 export function StateGlyph(props: { kind: StateGlyphKind; label?: string; tone?: StateGlyphKind }) {
@@ -213,21 +216,10 @@ export function StateGlyph(props: { kind: StateGlyphKind; label?: string; tone?:
     <svg
       viewBox="0 0 12 12"
       {...a11y}
-      className={cn("size-3 shrink-0", STATE_GLYPH_CLASS[props.tone ?? props.kind])}
+      className={cn("size-2.5 shrink-0", STATE_GLYPH_CLASS[props.tone ?? props.kind])}
     >
-      {props.kind === "ok" ? <circle cx="6" cy="6" r="4.5" fill="currentColor" /> : null}
-      {props.kind === "done" ? (
-        <>
-          <circle cx="6" cy="6" r="5.25" fill="currentColor" />
-          <path
-            d="M3.6 6.2 5.3 7.9 8.5 4.4"
-            fill="none"
-            className="stroke-background"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </>
+      {props.kind === "ok" || props.kind === "done" ? (
+        <circle cx="6" cy="6" r="5" fill="currentColor" />
       ) : null}
       {props.kind === "risk" ? <path d="M6 1.2l5.2 9.3H.8z" fill="currentColor" /> : null}
       {props.kind === "bad" ? (
@@ -295,10 +287,10 @@ export function needsYouLabel(count: number) {
   return `${count} need${count === 1 ? "s" : ""} you`;
 }
 
-/** Update-tinted count: things waiting on the owner. */
+/** Filled ink pill: things waiting on the owner. */
 export function CountBadge(props: { count: number; label: string }) {
   return (
-    <span className="inline-flex h-4.5 min-w-4.5 shrink-0 items-center justify-center rounded-sm bg-update/14 px-1 text-xs leading-none font-medium text-update-foreground tabular-nums">
+    <span className="inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-(--m-text) px-1.5 text-xs leading-none font-medium text-(--m-ground) tabular-nums">
       <span aria-hidden>{badgeCount(props.count)}</span>
       <span className="sr-only">{props.label}</span>
     </span>
@@ -326,13 +318,25 @@ export function GlyphCount(props: {
   );
 }
 
-/** Tiny update-coloured dot: something new the owner has not opened. */
+/** 6px teal dot: something new the owner has not opened. */
 export function UnreadDot(props: { label?: string }) {
   return (
     <span
       {...(props.label ? { role: "img", "aria-label": props.label } : { "aria-hidden": true })}
-      className="size-1.5 shrink-0 rounded-full bg-update"
+      className="size-1.5 shrink-0 rounded-full bg-(--m-accent)"
     />
+  );
+}
+
+/** Teal dot plus count: answered requests he has not read yet. */
+export function AnsweredMark(props: { count: number; label: string }) {
+  if (props.count <= 0) return null;
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-(--m-accent-text) tabular-nums">
+      <UnreadDot />
+      <span aria-hidden>{badgeCount(props.count)}</span>
+      <span className="sr-only">{props.label}</span>
+    </span>
   );
 }
 

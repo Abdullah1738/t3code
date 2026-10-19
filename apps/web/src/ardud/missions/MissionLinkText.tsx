@@ -19,14 +19,14 @@ export function MissionLinkList(props: { links: ReadonlyArray<MissionLink | Miss
 /** A link record as an anchor when it has a URL, plain text otherwise. */
 export function MissionLinkText(props: { link: MissionLink | MissionRecordRef }) {
   const link = props.link;
-  if ("id" in link) return <span className="text-foreground">{refLabel(link)}</span>;
-  if (link.url === null) return <span className="text-foreground">{link.label}</span>;
+  if ("id" in link) return <span className="text-(--m-text)">{refLabel(link)}</span>;
+  if (link.url === null) return <span className="text-(--m-text)">{link.label}</span>;
   return (
     <a
       href={link.url}
       target="_blank"
       rel="noreferrer"
-      className="text-foreground underline underline-offset-2 hover:text-primary"
+      className="text-(--m-text) underline underline-offset-2 hover:text-primary"
     >
       {link.label}
     </a>

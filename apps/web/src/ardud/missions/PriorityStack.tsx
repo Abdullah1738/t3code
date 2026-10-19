@@ -101,12 +101,12 @@ export function PriorityStack(props: {
           </ol>
         </SortableContext>
       </DndContext>
-      {note ? <p className="text-xs text-muted-foreground">{note}</p> : null}
+      {note ? <p className="text-xs text-(--m-muted)">{note}</p> : null}
       {planned.total > 0 ? (
         <p
           className={cn(
             "text-xs tabular-nums",
-            planned.balanced ? "text-muted-foreground" : "text-warning-foreground",
+            planned.balanced ? "text-(--m-muted)" : "text-(--m-warning)",
           )}
         >
           {planned.label}
@@ -148,8 +148,8 @@ function PriorityStackItem(props: {
       style={{ transform: CSS.Translate.toString(transform), transition }}
       className={cn(
         "grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 rounded-md py-1.5 pe-1",
-        props.highlighted && "bg-accent/60",
-        isDragging && "relative z-10 bg-background shadow-md",
+        props.highlighted && "bg-(--m-active)",
+        isDragging && "relative z-10 bg-(--m-raised) shadow-md",
       )}
     >
       <button
@@ -158,16 +158,16 @@ function PriorityStackItem(props: {
         {...attributes}
         {...listeners}
         aria-label={`Reorder ${sub.title}, position ${position}`}
-        className="row-span-2 flex size-7 shrink-0 cursor-grab touch-none items-center justify-center rounded text-muted-foreground/70 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing pointer-coarse:size-10"
+        className="row-span-2 flex size-7 shrink-0 cursor-grab touch-none items-center justify-center rounded text-(--m-muted)/70 outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing pointer-coarse:size-10"
       >
         <GripVerticalIcon aria-hidden className="size-3.5" />
       </button>
       <div className="flex min-w-0 items-center gap-2 text-sm">
-        <span className="w-4 shrink-0 text-end text-xs text-muted-foreground tabular-nums">
+        <span className="w-4 shrink-0 text-end text-xs text-(--m-muted) tabular-nums">
           {position}
         </span>
         <HealthGlyph health={sub.health} paused={paused} />
-        <span className={cn("min-w-0 truncate font-medium", paused && "text-muted-foreground")}>
+        <span className={cn("min-w-0 truncate font-medium", paused && "text-(--m-muted)")}>
           {sub.title}
         </span>
         {props.focused ? (
@@ -176,17 +176,17 @@ function PriorityStackItem(props: {
           </span>
         ) : null}
         {sub.fillIdleCapacity ? (
-          <span className="shrink-0 text-xs text-muted-foreground">fills idle</span>
+          <span className="shrink-0 text-xs text-(--m-muted)">fills idle</span>
         ) : null}
       </div>
       <span
         className={cn(
           "text-end text-xs tabular-nums",
           row.drift === "over"
-            ? "text-warning-foreground"
+            ? "text-(--m-warning)"
             : row.drift === "under"
               ? "text-info-foreground"
-              : "text-muted-foreground",
+              : "text-(--m-muted)",
         )}
       >
         {actual === null ? "–" : formatPercent(actual)}
@@ -207,13 +207,13 @@ function EffortBar(props: {
     <div
       role="img"
       aria-label={props.label}
-      className="relative col-span-2 col-start-2 me-1 ms-6 h-1.5 rounded-full bg-muted"
+      className="relative col-span-2 col-start-2 me-1 ms-6 h-1.5 rounded-full bg-(--m-raised)"
     >
       {props.actual !== null ? (
         <div
           className={cn(
             "absolute inset-y-0 start-0 rounded-full",
-            props.drift === "over" ? "bg-warning/70" : "bg-foreground/35",
+            props.drift === "over" ? "bg-(--m-warning)" : "bg-(--m-bar-2)",
           )}
           style={{ width: `${Math.min(props.actual, 1) * 100}%` }}
         />
@@ -221,7 +221,7 @@ function EffortBar(props: {
       {props.intended !== null ? (
         <div
           aria-hidden
-          className="absolute -inset-y-1 w-0.5 -translate-x-1/2 rounded-full bg-foreground"
+          className="absolute -inset-y-1 w-0.5 -translate-x-1/2 rounded-full bg-(--m-text)"
           style={{ left: `${Math.min(props.intended, 1) * 100}%` }}
         />
       ) : null}

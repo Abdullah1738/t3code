@@ -216,7 +216,7 @@ function DiscussionComposer(props: {
 export function ConditionNote(props: { condition: OwnerCondition }) {
   return (
     <div className="flex min-w-0 flex-col gap-1">
-      <span className="text-xs text-muted-foreground">Decided by master on your condition</span>
+      <span className="text-xs text-(--m-muted)">Decided by master on your condition</span>
       <blockquote className="text-sm text-pretty">{`\u201c${props.condition.quote}\u201d`}</blockquote>
     </div>
   );

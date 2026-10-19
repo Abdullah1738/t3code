@@ -271,7 +271,7 @@ function RequestsAnsweredLink(props: { missionId: MissionId; onNavigate: () => v
       search={{ request: first.id }}
       onClick={props.onNavigate}
       aria-label={label}
-      className="flex h-4.5 shrink-0 items-center gap-1 rounded-sm px-1 text-xs font-medium text-update-foreground tabular-nums outline-none hover:bg-update/12 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      className="flex h-4.5 shrink-0 items-center gap-1 rounded-sm px-1 text-xs font-medium text-(--m-accent-text) tabular-nums outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
       <UnreadDot />
       {badgeCount(unread.length)}

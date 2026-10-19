@@ -327,7 +327,7 @@ export function DraftCard(
     >
       <LinksBlock links={[draft.target]}>
         {draft.head ? (
-          <span className="font-mono text-xs text-muted-foreground">
+          <span className="text-xs text-(--m-muted) tabular-nums">
             <span className="sr-only">Head commit </span>
             {draft.head.slice(0, 7)}
           </span>
