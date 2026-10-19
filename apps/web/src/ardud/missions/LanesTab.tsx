@@ -107,7 +107,7 @@ function LaneItem(props: { row: LaneRow; context: LaneContext }) {
       <MutedLines
         lines={[
           row.subMissionTitle,
-          lane.statusReason,
+          lane.statusReason === lane.purpose ? null : lane.statusReason,
           row.role ? `Lead ${row.role.name}${row.model ? ` on ${row.model}` : ""}` : "No lead role",
           row.pendingModel ? `Switches to ${row.pendingModel} on its next turn` : null,
           row.context
