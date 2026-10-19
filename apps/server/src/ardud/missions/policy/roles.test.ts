@@ -44,6 +44,12 @@ describe("role defaults", () => {
     expect(sameModel(lane[1]!.modelSelection, HAIKU)).toBe(true);
   });
 
+  it("no default role is described as a fork", () => {
+    for (const role of defaultMissionRoles(missionId, now)) {
+      expect(role.description.toLowerCase()).not.toContain("fork");
+    }
+  });
+
   it("custom roles need a name and model", () => {
     expect(() => newRole({ missionId, kind: "custom" }, now)).toThrow(/name and a model/);
     const role = newRole(
