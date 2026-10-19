@@ -209,7 +209,10 @@ const handlers = {
           askId: input.askId,
           optionId: input.optionId ?? null,
           text: input.text,
-          inboundId: input.inboundId,
+          ...(input.inboundId === undefined ? {} : { inboundId: input.inboundId }),
+          ...(input.onOwnerCondition === undefined
+            ? {}
+            : { onOwnerCondition: input.onOwnerCondition }),
         },
         provenance,
       ),

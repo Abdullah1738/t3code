@@ -2198,6 +2198,10 @@ export const AnswerAskInput = Schema.Struct({
   text: Schema.String,
   /** iMessage path only: the spectrum inbound id the server must verify. */
   inboundId: Schema.optional(TrimmedNonEmptyString),
+  // --- asks additions ---
+  /** The master answers for the owner: the owner request whose stated condition this meets. */
+  onOwnerCondition: Schema.optional(OwnerCondition),
+  // --- end asks additions ---
 });
 export type AnswerAskInput = typeof AnswerAskInput.Type;
 
@@ -2229,6 +2233,8 @@ export const DecideDraftInput = Schema.Struct({
   // --- asks additions ---
   /** The draft revision the decider saw; a decision for an older revision is refused. */
   revision: Schema.optional(NonNegativeInt),
+  /** The master decides an owner-routed draft: the owner request whose stated condition this meets. */
+  onOwnerCondition: Schema.optional(OwnerCondition),
   // --- end asks additions ---
 });
 export type DecideDraftInput = typeof DecideDraftInput.Type;

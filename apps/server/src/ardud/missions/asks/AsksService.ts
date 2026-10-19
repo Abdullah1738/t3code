@@ -33,6 +33,7 @@ import {
   type MissionRecordRef,
   type Note,
   type OpenSystemDraftInput,
+  type OwnerCondition,
   type PostMessageInput,
   type ReactToCallInput,
   type ReopenAskInput,
@@ -61,12 +62,14 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import { cleanAnnotation } from "../core/approvals.ts";
+import { OwnerConditions } from "../discuss/OwnerConditions.ts";
 import { castOf as readWholeCast, isMasterAnywhere } from "../core/master.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
 import {
   answerAsk,
   askEpochOf,
+  askRef,
   askReopened,
   openAsk,
   rejectAskDefaults,
@@ -82,6 +85,7 @@ import {
   closeStaleDraft,
   decideDraft,
   draftExamples,
+  draftRef,
   type DraftAbout,
   type DraftExample,
   epochOf,
@@ -123,6 +127,7 @@ import {
 import * as Ports from "./ports.ts";
 import { answerCheck, draftDecisionCheck, type ReplyCheck, verifyInbound } from "./provenance.ts";
 import {
+  callerActsAs,
   clipSummary,
   dedupeRefs,
   type MissionCaller,
@@ -353,6 +358,31 @@ const newestOf = <T extends { readonly createdAt: string }>(items: ReadonlyArray
 const fail = (code: MissionError["code"], detail: string) =>
   Effect.fail(new MissionError({ code, detail }));
 
+/** The line the owner reads in his conversation about an ask once it is answered. */
+const answeredNote = (ask: Ask): string => {
+  const answer = ask.answer;
+  const option =
+    answer?.optionId == null ? undefined : ask.options.find((o) => o.id === answer.optionId);
+  const said = [option?.label, answer?.text].filter((part) => part && part.length > 0).join(" - ");
+  const how = answer?.onOwnerCondition == null ? "Answered" : "Answered on your condition";
+  return `${how}: ${said}`;
+};
+
+const DRAFT_DECIDED: Partial<Record<Draft["status"], string>> = {
+  approved: "Draft approved",
+  dropped: "Draft dropped",
+  "rewrite-requested": "Draft sent back for a rewrite",
+};
+
+const decidedNote = (draft: Draft): string =>
+  `${DRAFT_DECIDED[draft.status] ?? `Draft ${draft.status}`}${(draft.onOwnerCondition ?? null) === null ? "" : " on your condition"}.`;
+
+const NO_OWNER_CONDITIONS: OwnerConditions["Service"] = {
+  verify: () =>
+    fail("forbidden", "Owner conditions are not available on this server; the owner decides."),
+  settleFor: () => Effect.void,
+};
+
 const replaceById = <R extends { readonly id: string }>(
   records: ReadonlyArray<R>,
   ...next: ReadonlyArray<R>
@@ -369,6 +399,11 @@ const make = Effect.gen(function* () {
   const rooms = yield* Ports.AsksRooms;
   const appliers = yield* Ports.SuggestionApplierRegistry;
   const crypto = yield* Crypto.Crypto;
+  // ardud missions: asks (discuss) - the router provides it; without it nothing verifies.
+  const conditions = Option.getOrElse(
+    yield* Effect.serviceOption(OwnerConditions),
+    () => NO_OWNER_CONDITIONS,
+  );
   const lock = yield* Semaphore.make(1);
   const serialized = <A, E, R>(effect: Effect.Effect<A, E, R>) => lock.withPermits(1)(effect);
 
@@ -602,7 +637,9 @@ const make = Effect.gen(function* () {
       if (supersedes !== undefined) {
         const previous = asks.find((ask) => ask.id === supersedes);
         if (previous === undefined) return yield* fail("not-found", `No ask ${supersedes}.`);
-        const result = yield* fromOutcome(supersedeAsk({ ask: previous, replacement: command }));
+        const result = yield* fromOutcome(
+          supersedeAsk({ ask: previous, replacement: command, callerIsMaster: standing.isMaster }),
+        );
         opened = result.replacement.record;
         records = [result.superseded.record, opened];
         events = [...result.superseded.events, ...result.replacement.events];
@@ -656,8 +693,62 @@ const make = Effect.gen(function* () {
       const asks = yield* store.list("ask", { missionId: ask.missionId });
       const at = yield* now;
       const resolution = yield* fromOutcome(
-        withdrawAsk({ ask, caller: standing.caller, reason: input.reason, asks, now: at }),
+        withdrawAsk({
+          ask,
+          caller: standing.caller,
+          reason: input.reason,
+          asks,
+          callerIsMaster: standing.isMaster,
+          now: at,
+        }),
       );
+      const after = replaceById(asks, resolution.record);
+      const holds = yield* syncHolds(ask.missionId, ask.blocks, after, at);
+      yield* persist(ask.missionId, resolution.events, [
+        { _tag: "ask", record: resolution.record },
+        ...holds,
+      ]);
+      return {
+        result: { ask: resolution.record, released: resolution.released },
+        // The asker hears about it unless it withdrew the ask itself.
+        tellAsker: !callerActsAs(standing.caller, ask.askedBy),
+      };
+    });
+
+  /**
+   * Discuss: the master answers an ask on a condition the owner stated in his
+   * request about it. There is no owner voice to check; the router verifies the
+   * quote against the owner's own words in that request instead.
+   */
+  const answerAskOnConditionCommand = (
+    input: AnswerAskInput,
+    condition: OwnerCondition,
+    provenance: MissionProvenance,
+  ) =>
+    Effect.gen(function* () {
+      if (input.inboundId !== undefined) {
+        return yield* fail(
+          "invalid",
+          "An answer comes from the owner's message or on his condition, not both.",
+        );
+      }
+      const ask = yield* need("ask", input.askId);
+      const { standing } = yield* standingIn(ask.missionId, provenance);
+      const asks = yield* store.list("ask", { missionId: ask.missionId });
+      const at = yield* now;
+      const resolution = yield* fromOutcome(
+        answerAsk({
+          ask,
+          input,
+          // Recorded under the master's role, never as the owner.
+          provenance: standing.caller.provenance,
+          asks,
+          onOwnerCondition: condition,
+          callerIsMaster: standing.isMaster,
+          now: at,
+        }),
+      );
+      yield* conditions.verify({ subject: askRef(ask), condition });
       const after = replaceById(asks, resolution.record);
       const holds = yield* syncHolds(ask.missionId, ask.blocks, after, at);
       yield* persist(ask.missionId, resolution.events, [
@@ -666,6 +757,17 @@ const make = Effect.gen(function* () {
       ]);
       return { ask: resolution.record, released: resolution.released };
     });
+
+  /** The conversation about a record closes with it; a failure there never undoes the decision. */
+  const settleDiscussion = (subject: MissionRecordRef, note: string) =>
+    conditions.settleFor({ subject, note }).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Mission discussion did not settle", {
+          subject: `${subject.kind}:${subject.id}`,
+          detail: error.detail,
+        }),
+      ),
+    );
 
   const reopenAskCommand = (input: ReopenAskInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
@@ -910,6 +1012,7 @@ const make = Effect.gen(function* () {
           draft,
           text: input.text,
           caller: standing.caller,
+          callerIsMaster: standing.isMaster,
           notes: yield* allDraftNotes(draft.missionId),
           ...(input.view === undefined ? {} : { view: input.view }),
           now: yield* now,
@@ -974,6 +1077,40 @@ const make = Effect.gen(function* () {
       const suggestions =
         decided.edit === null || !isOwnerProvenance(voice) ? [] : yield* learnFrom(draft.missionId);
       return { draft: decided.record, suggestions };
+    });
+
+  /**
+   * Discuss: the master decides an owner-routed draft on a condition the owner
+   * stated in his request about it; the router verifies the quote.
+   */
+  const decideDraftOnConditionCommand = (
+    input: DecideDraftInput,
+    condition: OwnerCondition,
+    provenance: MissionProvenance,
+  ) =>
+    Effect.gen(function* () {
+      if (input.inboundId !== undefined) {
+        return yield* fail(
+          "invalid",
+          "A decision comes from the owner's message or on his condition, not both.",
+        );
+      }
+      const draft = yield* need("draft", input.draftId);
+      const { standing } = yield* standingIn(draft.missionId, provenance);
+      const decided = yield* fromOutcome(
+        decideDraft({
+          draft,
+          input,
+          provenance: standing.caller.provenance,
+          callerIsMaster: standing.isMaster,
+          onOwnerCondition: condition,
+          now: yield* now,
+        }),
+      );
+      yield* conditions.verify({ subject: draftRef(draft), condition });
+      yield* persist(draft.missionId, decided.events, [{ _tag: "draft", record: decided.record }]);
+      // Only the owner's own edits teach the house style.
+      return { draft: decided.record, suggestions: [] };
     });
 
   const reopenDraftCommand = (input: ReopenDraftInput, provenance: MissionProvenance) =>
@@ -1874,21 +2011,37 @@ const make = Effect.gen(function* () {
       standingIn(missionId, provenance).pipe(Effect.map(({ standing }) => standing)),
     openAsk: (raw, provenance) => serialized(openAskCommand(raw, provenance)),
     answerAsk: (input, provenance) =>
-      serialized(answerAskCommand(input, provenance)).pipe(
+      serialized(
+        input.onOwnerCondition === undefined
+          ? answerAskCommand(input, provenance)
+          : answerAskOnConditionCommand(input, input.onOwnerCondition, provenance),
+      ).pipe(
         Effect.tap((result) => signalResolved(result.ask, result.released)),
+        Effect.tap((result) => settleDiscussion(askRef(result.ask), answeredNote(result.ask))),
       ),
     withdrawAsk: (input, provenance) =>
       serialized(withdrawAskCommand(input, provenance)).pipe(
-        Effect.tap((result) =>
-          isOwnerProvenance(provenance) ? signalResolved(result.ask, result.released) : Effect.void,
+        Effect.tap(({ result, tellAsker }) =>
+          tellAsker ? signalResolved(result.ask, result.released) : Effect.void,
         ),
+        Effect.tap(({ result }) =>
+          settleDiscussion(askRef(result.ask), `Ask withdrawn: ${input.reason}`),
+        ),
+        Effect.map(({ result }) => result),
       ),
     reopenAsk: (input, provenance) => serialized(reopenAskCommand(input, provenance)),
     makeCall: (input, provenance) => serialized(makeCallCommand(input, provenance)),
     reactToCall: (input, provenance) => serialized(reactToCallCommand(input, provenance)),
     submitDraft: (input, provenance) => serialized(submitDraftCommand(input, provenance)),
     reviseDraft: (input, provenance) => serialized(reviseDraftCommand(input, provenance)),
-    decideDraft: (input, provenance) => serialized(decideDraftCommand(input, provenance)),
+    decideDraft: (input, provenance) =>
+      serialized(
+        input.onOwnerCondition === undefined
+          ? decideDraftCommand(input, provenance)
+          : decideDraftOnConditionCommand(input, input.onOwnerCondition, provenance),
+      ).pipe(
+        Effect.tap((result) => settleDiscussion(draftRef(result.draft), decidedNote(result.draft))),
+      ),
     reopenDraft: (input, provenance) => serialized(reopenDraftCommand(input, provenance)),
     routeDraft: (input, provenance) => serialized(routeDraftCommand(input, provenance)),
     saveDraftNote: (input, provenance) => serialized(saveDraftNoteCommand(input, provenance)),

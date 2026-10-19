@@ -28,6 +28,7 @@ import {
   type MissionProvenance,
   type MissionRecordRef,
   type OpenSystemDraftInput,
+  type OwnerCondition,
   type RecordView,
   type ReportDraftSentInput,
   type RoleId,
@@ -318,15 +319,23 @@ const nextEpoch = (draft: Draft, now: string): Pick<Draft, "revision" | "revised
   revisedAt: now,
 });
 
-/** Who may act on a draft as its approver: the owner always, the master when routed to it. */
+/**
+ * Who may act on a draft as its approver: the owner always, the master when
+ * routed to it, or when the owner stated a condition about it (verified by the caller).
+ */
 const approverCheck = (
   draft: Draft,
   provenance: MissionProvenance,
   callerIsMaster: boolean,
   verb: string,
+  onOwnerCondition: boolean = false,
 ): Outcome<null> => {
-  if (isOwnerProvenance(provenance)) return ok(null);
-  if (approverOf(draft) === "owner") {
+  if (isOwnerProvenance(provenance)) {
+    return onOwnerCondition
+      ? refuse("invalid", "The owner decides directly; owner conditions are for the master.")
+      : ok(null);
+  }
+  if (approverOf(draft) === "owner" && !onOwnerCondition) {
     return refuse(
       "provenance-required",
       `Draft ${draft.id} is routed to the owner; he ${verb} it.`,
@@ -360,12 +369,24 @@ export interface DecideDraftCommand {
   readonly provenance: MissionProvenance;
   /** The caller is the draft mission's master. */
   readonly callerIsMaster: boolean;
+  /**
+   * Discuss: the master decides on a condition the owner stated about this draft.
+   * The caller has verified it against the owner's request already.
+   */
+  readonly onOwnerCondition?: OwnerCondition;
   readonly now: string;
 }
 
 export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision> => {
   const { draft, input, provenance } = command;
-  const allowed = approverCheck(draft, provenance, command.callerIsMaster, "decides");
+  const condition = command.onOwnerCondition ?? null;
+  const allowed = approverCheck(
+    draft,
+    provenance,
+    command.callerIsMaster,
+    "decides",
+    condition !== null,
+  );
   if (Result.isFailure(allowed)) return Result.fail(allowed.failure);
   if (provenance._tag === "owner-imessage" && provenance.inboundId !== input.inboundId) {
     return refuse("provenance-invalid", "The verified inbound does not match this decision.");
@@ -392,7 +413,13 @@ export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision>
       `Draft ${draft.id} changed since revision ${input.revision} (now ${revisionOf(draft)}); decide what it says now.`,
     );
   }
-  const decided = { decidedBy: provenance, decidedAt: command.now };
+  const decided = {
+    decidedBy: provenance,
+    decidedAt: command.now,
+    ...conditionOf(draft, condition),
+  };
+  const withCondition = (payload: Record<string, unknown>) =>
+    condition === null ? payload : { ...payload, onOwnerCondition: condition };
   switch (input.action) {
     case "approve": {
       const edited = input.editedText?.trim();
@@ -410,10 +437,12 @@ export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision>
         record,
         edit: changed ? { draftId: draft.id, before: draft.text, after: edited } : null,
         events: [
-          decisionEvent(record, provenance, changed ? "Approved with edits" : "Approved", {
-            action: "approve",
-            edited: changed,
-          }),
+          decisionEvent(
+            record,
+            provenance,
+            changed ? "Approved with edits" : "Approved",
+            withCondition({ action: "approve", edited: changed }),
+          ),
         ],
       });
     }
@@ -430,7 +459,12 @@ export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision>
         record,
         edit: null,
         events: [
-          decisionEvent(record, provenance, `Rewrite: ${note}`, { action: "rewrite", note }),
+          decisionEvent(
+            record,
+            provenance,
+            `Rewrite: ${note}`,
+            withCondition({ action: "rewrite", note }),
+          ),
         ],
       });
     }
@@ -439,11 +473,22 @@ export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision>
       return ok({
         record,
         edit: null,
-        events: [decisionEvent(record, provenance, "Dropped", { action: "drop" })],
+        events: [decisionEvent(record, provenance, "Dropped", withCondition({ action: "drop" }))],
       });
     }
   }
 };
+
+/** Sets the owner condition a decision rests on, and clears a stale one. */
+const conditionOf = (
+  draft: Draft,
+  condition: OwnerCondition | null,
+): Pick<Draft, "onOwnerCondition"> =>
+  condition !== null
+    ? { onOwnerCondition: condition }
+    : (draft.onOwnerCondition ?? null) === null
+      ? {}
+      : { onOwnerCondition: null };
 
 const decisionEvent = (
   record: Draft,
@@ -466,10 +511,15 @@ export interface ReviseDraftCommand {
   readonly notes: ReadonlyArray<DraftNote>;
   /** Replaces the draft's view when given. */
   readonly view?: RecordView;
+  /** The caller is the draft mission's master: it may revise any writer's draft. */
+  readonly callerIsMaster?: boolean;
   readonly now: string;
 }
 
-/** The writer answers a rewrite request; the draft goes back to the owner with `previousText` set. */
+/**
+ * The writer (or the mission's master, say after talking it over with the
+ * owner) revises a draft; it goes back to its approver with `previousText` set.
+ */
 export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Draft>> => {
   const { draft, caller } = command;
   if (callerIsOwner(caller)) {
@@ -477,9 +527,10 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
   }
   if (
     draft.writerRoleId !== null &&
-    !callerActsAs(caller, { _tag: "role", roleId: draft.writerRoleId })
+    !callerActsAs(caller, { _tag: "role", roleId: draft.writerRoleId }) &&
+    command.callerIsMaster !== true
   ) {
-    return refuse("forbidden", "Only the draft's writer revises it.");
+    return refuse("forbidden", "Only the draft's writer or the mission's master revises it.");
   }
   const requestedBy = draft.requestedBy ?? null;
   if (
@@ -506,6 +557,7 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
     appliedNoteIds: applied.map((note) => note.id),
     decidedBy: null,
     decidedAt: null,
+    ...conditionOf(draft, null),
     ...nextEpoch(draft, command.now),
     ...(command.view === undefined ? {} : { view: command.view }),
   };
@@ -563,6 +615,7 @@ export const reopenDraft = (
     approvedText: null,
     decidedBy: null,
     decidedAt: null,
+    ...conditionOf(draft, null),
     ...nextEpoch(draft, now),
   };
   return ok({
