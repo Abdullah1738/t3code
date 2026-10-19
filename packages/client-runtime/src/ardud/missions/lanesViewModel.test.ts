@@ -1,4 +1,4 @@
-import type { Lane, MissionId } from "@t3tools/contracts";
+import type { Lane, LaneId, MissionId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
@@ -11,10 +11,11 @@ import {
   contextView,
   formatTokens,
   laneActions,
-  laneGroups,
+  laneBoard,
   laneRows,
   mergeLanesInput,
   mergeTargets,
+  modelFamily,
   modelLabel,
   moveLaneInput,
   nudgeLaneInput,
@@ -66,20 +67,80 @@ describe("lane rows", () => {
     expect(risk6?.model).toBe("opus/cc/claude-haiku-5-5 xhigh");
     expect(risk6?.pendingModel).toBe("opus/claude-opus-5-5 xhigh");
   });
+});
 
-  it("puts problems first and folds idle and parked lanes behind one line", () => {
+describe("lane board", () => {
+  const text = (parts: ReadonlyArray<string | { figure: string }>) =>
+    parts.map((part) => (typeof part === "string" ? part : part.figure)).join("");
+
+  const withRetired = () => {
     const { rows } = fixtureRows();
-    const groups = laneGroups(rows);
-    expect(groups.shown.map((group) => group.status)).toEqual(["stuck", "waiting", "working"]);
-    expect(groups.shown[0]?.rows.map((row) => row.lane.name).sort()).toEqual([
-      "cell-risk6",
-      "cell-triage",
-    ]);
-    expect(groups.quiet.map((group) => group.status)).toEqual(["idle", "parked"]);
-    const quiet = groups.quiet.reduce((sum, group) => sum + group.rows.length, 0);
-    expect(groups.quietLine).toBe(
-      `${quiet} quiet lanes: ${groups.quiet[0]?.rows.length} idle, ${groups.quiet[1]?.rows.length} parked`,
+    const first = rows[0]!;
+    return [
+      ...rows,
+      { ...first, lane: { ...first.lane, id: "lane-old" as LaneId, status: "retired" as const } },
+    ];
+  };
+
+  it("says how many lanes are live and groups by state, longest waits first", () => {
+    const rows = withRetired();
+    const board = laneBoard(rows, "state");
+    const count = (status: string) => rows.filter((row) => row.lane.status === status).length;
+    const live = rows.length - count("parked") - count("retired");
+    expect(text(board.summary)).toBe(
+      `${live} live: ${count("stuck")} stuck, ${count("waiting")} waiting, ${count("working")} working, ${count("idle")} idle. ${count("parked")} parked, ${count("retired")} retired.`,
     );
+    expect(board.panels.map((panel) => panel.title)).toEqual([
+      "Stuck",
+      "Waiting",
+      "Working",
+      "Idle",
+      "Parked and retired",
+    ]);
+    const waiting = board.panels[1]!.rows.map((row) => row.lane.lastActiveAt ?? "");
+    expect(waiting).toEqual([...waiting].sort());
+    const parked = board.panels.at(-1)!;
+    expect(parked.shown).toBe(2);
+    expect(parked.restLabel).toBe(
+      `${count("parked") - 2} more parked, ${count("retired")} retired`,
+    );
+  });
+
+  it("groups by sub-mission in mission order and by who each lane answers to", () => {
+    const rows = withRetired();
+    const bySub = laneBoard(rows, "sub-mission", ["crpko-e2e-harness", "crpko-arch-wave"]);
+    expect(bySub.panels.slice(0, 2).map((panel) => panel.title)).toEqual([
+      "Live e2e and harness",
+      "Architecture wave delivery",
+    ]);
+    expect(bySub.panels.at(-1)?.title).toBe("Retired");
+    expect(bySub.panels.flatMap((panel) => panel.rows)).toHaveLength(rows.length);
+
+    const byLead = laneBoard(rows, "lead");
+    expect(byLead.panels[0]?.title).toBe("Master");
+  });
+
+  it("reads the lead a sub-coordinator gives, the resume note and the model family", () => {
+    const source = createFixtureMissionsSource({ now: () => Date.parse(FIXTURE_NOW) });
+    const lanes = read<ReadonlyArray<Lane>>((l) => source.subscribeLanes(CRPKO, l));
+    const roles = read<MissionRolesSnapshot>((l) => source.subscribeRoles(CRPKO, l));
+    const risk6 = lanes.find((lane) => lane.name === "cell-risk6")!;
+    const lead = roles.roles.find((role) => role.name === "cell-risk")!;
+    const [row] = laneRows([risk6], {
+      roles: roles.roles,
+      bindings: roles.bindings,
+      workItems: [],
+      subMissions: [{ id: risk6.subMissionId!, title: "Risk", coordinatorRoleId: lead.id }],
+    });
+    expect(row?.leadName).toBe("cell-risk");
+
+    const money = fixtureRows().rows.find((entry) => entry.lane.name === "cell-money");
+    expect(money?.resumeNote).toBe(
+      "Rewards lane: CRP-13154 handoff; old thread hit its context limit.",
+    );
+    expect(modelFamily(risk6 && lead.modelSelection)).toBe("Opus");
+    expect(modelFamily({ provider: "x", model: "cc/claude-haiku-5-5" } as never)).toBe("Haiku");
+    expect(modelFamily({ provider: "x", model: "gpt-6-astra" } as never)).toBe("gpt-6-astra");
   });
 });
 

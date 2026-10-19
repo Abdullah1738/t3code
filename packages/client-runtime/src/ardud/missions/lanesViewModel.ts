@@ -19,11 +19,12 @@ import type {
   NudgeLaneInput,
   SetLaneParkedInput,
 } from "./source.ts";
-import { formatPercent, sortLanesProblemsFirst, splitQuietLanes } from "./viewModel.ts";
+import type { SummaryPart } from "./portfolioViewModel.ts";
+import { formatPercent, sortLanesProblemsFirst } from "./viewModel.ts";
 
 // Lanes tab: one row per lane with its lead role, model, context gauge, the
-// item it is on, its last evidence and who led it before. Problems first;
-// idle and parked lanes fold behind a count.
+// item it is on, its last evidence and who led it before, grouped into the
+// Desk board's panels.
 
 type Result<T> =
   | { readonly ok: true; readonly value: T }
@@ -88,13 +89,19 @@ export interface LaneRow {
   readonly currentItem: WorkItem | null;
   /** Earlier lead threads, newest first. */
   readonly successions: ReadonlyArray<RoleBinding>;
+  /** The handoff note the current lead thread started from. */
+  readonly resumeNote: string | null;
+  /** Who the lane answers to: its sub-mission's coordinator, else the master. */
+  readonly leadName: string;
 }
 
 export interface LaneRowSources {
   readonly roles: ReadonlyArray<Role>;
   readonly bindings: ReadonlyArray<RoleBinding>;
   readonly workItems: ReadonlyArray<WorkItem>;
-  readonly subMissions: ReadonlyArray<Pick<SubMission, "id" | "title">>;
+  readonly subMissions: ReadonlyArray<
+    Pick<SubMission, "id" | "title"> & Partial<Pick<SubMission, "coordinatorRoleId">>
+  >;
 }
 
 /** Ended lead bindings of a role, newest first. */
@@ -111,10 +118,23 @@ export function successionHistory(
 export function laneRows(lanes: ReadonlyArray<Lane>, sources: LaneRowSources): LaneRow[] {
   const roles = new Map(sources.roles.map((role) => [role.id as string, role]));
   const items = new Map(sources.workItems.map((item) => [item.id as string, item]));
+  const subs = new Map(sources.subMissions.map((sub) => [sub.id as string, sub]));
   const titles = new Map(sources.subMissions.map((sub) => [sub.id as string, sub.title]));
+  const leadOf = (lane: Lane): string => {
+    const coordinator = lane.subMissionId
+      ? (subs.get(lane.subMissionId)?.coordinatorRoleId ?? null)
+      : null;
+    const role = coordinator ? roles.get(coordinator) : undefined;
+    return role && role.kind !== "master" ? role.name : "Master";
+  };
   return lanes.map((lane) => {
     const role = lane.leadRoleId ? (roles.get(lane.leadRoleId) ?? null) : null;
+    const current = role
+      ? sources.bindings.find((binding) => binding.roleId === role.id && binding.endedAt === null)
+      : undefined;
     return {
+      resumeNote: current?.handoffNote?.trim() || null,
+      leadName: leadOf(lane),
       lane,
       subMissionTitle: lane.subMissionId ? (titles.get(lane.subMissionId) ?? null) : null,
       role,
@@ -136,55 +156,166 @@ export const LANE_STATUS_LABEL: Record<LaneStatus, string> = {
   retired: "Retired",
 };
 
-export interface LaneGroup {
-  readonly status: LaneStatus;
-  readonly label: string;
+// --- Desk board ---
+
+/** "Opus", "Haiku", "Sonnet"; other models keep their own name. */
+export function modelFamily(selection: ModelSelection | null): string | null {
+  if (selection === null) return null;
+  const name = selection.model.split("/").at(-1) ?? selection.model;
+  const family = /opus|sonnet|haiku/i.exec(name)?.[0];
+  return family ? family[0]!.toUpperCase() + family.slice(1).toLowerCase() : name;
+}
+
+export type LaneGrouping = "state" | "sub-mission" | "lead";
+
+export interface LanePanel {
+  readonly key: string;
+  readonly title: string;
   readonly rows: ReadonlyArray<LaneRow>;
+  /** Rows shown before the fold. */
+  readonly shown: number;
+  /** "28 more parked, 9 retired"; null uses the plain "N more". */
+  readonly restLabel: string | null;
 }
 
-export interface LaneGroups {
-  /** Stuck, waiting, working, in that order; empty groups dropped. */
-  readonly shown: ReadonlyArray<LaneGroup>;
-  /** Idle then parked, folded behind `quietLine`. */
-  readonly quiet: ReadonlyArray<LaneGroup>;
-  /** "14 quiet lanes: 9 idle, 5 parked", or null when there are none. */
-  readonly quietLine: string | null;
+export interface LaneBoard {
+  /** "79 live: 7 waiting, 17 working, 25 idle. 30 parked, 9 retired." */
+  readonly summary: ReadonlyArray<SummaryPart>;
+  readonly panels: ReadonlyArray<LanePanel>;
 }
 
-/** Rows arrive sorted, so a status's rows are contiguous; Map keeps first-seen order. */
-function groupByStatus(rows: ReadonlyArray<LaneRow>): LaneGroup[] {
-  const byStatus = new Map<LaneStatus, LaneRow[]>();
-  for (const row of rows) {
-    const group = byStatus.get(row.lane.status);
-    if (group) group.push(row);
-    else byStatus.set(row.lane.status, [row]);
+const activeAt = (row: LaneRow): string => row.lane.lastActiveAt ?? row.lane.updatedAt;
+const longestFirst = (rows: LaneRow[]): LaneRow[] =>
+  rows.sort((left, right) => activeAt(left).localeCompare(activeAt(right)));
+const latestFirst = (rows: LaneRow[]): LaneRow[] =>
+  rows.sort((left, right) => activeAt(right).localeCompare(activeAt(left)));
+
+function laneSummary(rows: ReadonlyArray<LaneRow>): SummaryPart[] {
+  const count = (status: LaneStatus) => rows.filter((row) => row.lane.status === status).length;
+  const live = rows.filter((row) => row.lane.status !== "parked" && row.lane.status !== "retired");
+  const parts: SummaryPart[] = [{ key: "live", figure: String(live.length) }, " live"];
+  const liveParts = (["stuck", "waiting", "working", "idle"] as const).filter((s) => count(s) > 0);
+  liveParts.forEach((status, index) => {
+    parts.push(index === 0 ? ": " : ", ", { key: status, figure: String(count(status)) });
+    parts.push(` ${LANE_STATUS_LABEL[status].toLowerCase()}`);
+  });
+  parts.push(".");
+  const restParts = (["parked", "retired"] as const).filter((s) => count(s) > 0);
+  restParts.forEach((status, index) => {
+    parts.push(index === 0 ? " " : ", ", { key: status, figure: String(count(status)) });
+    parts.push(
+      ` ${LANE_STATUS_LABEL[status].toLowerCase()}${index === restParts.length - 1 ? "." : ""}`,
+    );
+  });
+  return parts;
+}
+
+function byState(rows: ReadonlyArray<LaneRow>): LanePanel[] {
+  const of = (status: LaneStatus) => rows.filter((row) => row.lane.status === status);
+  const parked = latestFirst(of("parked"));
+  const retired = latestFirst(of("retired"));
+  const parkedShown = Math.min(parked.length, 2);
+  const restParts = [
+    parked.length > parkedShown ? `${parked.length - parkedShown} more parked` : null,
+    retired.length > 0 ? `${retired.length} retired` : null,
+  ].filter((part): part is string => part !== null);
+  const panels: LanePanel[] = [
+    {
+      key: "stuck",
+      title: "Stuck",
+      rows: longestFirst(of("stuck")),
+      shown: Infinity,
+      restLabel: null,
+    },
+    {
+      key: "waiting",
+      title: "Waiting",
+      rows: longestFirst(of("waiting")),
+      shown: Infinity,
+      restLabel: null,
+    },
+    {
+      key: "working",
+      title: "Working",
+      rows: latestFirst(of("working")),
+      shown: 10,
+      restLabel: null,
+    },
+    { key: "idle", title: "Idle", rows: latestFirst(of("idle")), shown: 4, restLabel: null },
+    {
+      key: "parked",
+      title: retired.length > 0 ? "Parked and retired" : "Parked",
+      rows: [...parked, ...retired],
+      shown: parkedShown,
+      restLabel: restParts.length > 0 ? restParts.join(", ") : null,
+    },
+  ];
+  return panels.filter((panel) => panel.rows.length > 0);
+}
+
+/** Problems first inside a panel; retired lanes gather in one folded panel at the end. */
+function byKey(
+  rows: ReadonlyArray<LaneRow>,
+  keyOf: (row: LaneRow) => { key: string; title: string },
+  order: (left: LanePanel, right: LanePanel) => number,
+): LanePanel[] {
+  const live = sortLanesProblemsFirst(
+    rows.filter((row) => row.lane.status !== "retired").map((row) => ({ ...row.lane, row })),
+  ).map((entry) => entry.row);
+  const groups = new Map<string, { title: string; rows: LaneRow[] }>();
+  for (const row of live) {
+    const { key, title } = keyOf(row);
+    const group = groups.get(key);
+    if (group) group.rows.push(row);
+    else groups.set(key, { title, rows: [row] });
   }
-  return [...byStatus].map(([status, statusRows]) => ({
-    status,
-    label: LANE_STATUS_LABEL[status],
-    rows: statusRows,
+  const panels = [...groups].map(([key, group]) => ({
+    key,
+    title: group.title,
+    rows: group.rows,
+    shown: 8,
+    restLabel: null,
   }));
+  panels.sort(order);
+  const retired = latestFirst(rows.filter((row) => row.lane.status === "retired"));
+  return retired.length > 0
+    ? [...panels, { key: "retired", title: "Retired", rows: retired, shown: 0, restLabel: null }]
+    : panels;
 }
 
-/** Problems first; within a status, the most recently active first. Retired lanes are left out. */
-export function laneGroups(rows: ReadonlyArray<LaneRow>): LaneGroups {
-  const sorted = sortLanesProblemsFirst(rows.map((row) => ({ ...row.lane, row }))).map(
-    (entry) => entry.row,
-  );
-  const { active, quiet } = splitQuietLanes(
-    sorted.map((row) => ({ status: row.lane.status, row })),
-  );
-  const quietGroups = groupByStatus(quiet.map((entry) => entry.row));
-  const quietLine =
-    quiet.length === 0
-      ? null
-      : `${quiet.length} quiet ${quiet.length === 1 ? "lane" : "lanes"}: ${quietGroups
-          .map((group) => `${group.rows.length} ${group.label.toLowerCase()}`)
-          .join(", ")}`;
+/** The Lanes page: a page line and one panel per group. */
+export function laneBoard(
+  rows: ReadonlyArray<LaneRow>,
+  grouping: LaneGrouping,
+  subMissionOrder: ReadonlyArray<string> = [],
+): LaneBoard {
+  const summary = laneSummary(rows);
+  if (grouping === "state") return { summary, panels: byState(rows) };
+  if (grouping === "lead") {
+    return {
+      summary,
+      panels: byKey(
+        rows,
+        (row) => ({ key: row.leadName, title: row.leadName }),
+        (left, right) =>
+          right.rows.length - left.rows.length || left.title.localeCompare(right.title),
+      ),
+    };
+  }
+  const rank = (key: string) => {
+    const index = subMissionOrder.indexOf(key);
+    return index === -1 ? subMissionOrder.length : index;
+  };
   return {
-    shown: groupByStatus(active.map((entry) => entry.row)),
-    quiet: quietGroups,
-    quietLine,
+    summary,
+    panels: byKey(
+      rows,
+      (row) =>
+        row.lane.subMissionId && row.subMissionTitle
+          ? { key: row.lane.subMissionId, title: row.subMissionTitle }
+          : { key: "", title: "No sub-mission" },
+      (left, right) => rank(left.key) - rank(right.key),
+    ),
   };
 }
 
