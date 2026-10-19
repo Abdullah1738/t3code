@@ -6,18 +6,20 @@ import {
   selectViewTemplate,
   viewActionAllowed,
   viewMatchSubjectOf,
+  ViewFieldValue,
   type Approver,
   type MissionLink,
   type MissionRecordRef,
   type ViewActionKey,
   type ViewBackedRecord,
   type ViewBackingKind,
-  type ViewFieldValue,
   type ViewNode,
   type ViewNodeTag,
   type ViewTemplate,
   type ViewTemplateDefinition,
 } from "@t3tools/contracts";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 import { resolveViewBind, viewValueText, type ViewBindContext } from "./bindings.ts";
 import { decodeViewBody } from "./decode.ts";
@@ -129,14 +131,20 @@ const recordField = (record: object, key: string): unknown =>
 const stringOr = (value: unknown): string | null =>
   typeof value === "string" && value.trim() !== "" ? value : null;
 
-/** Template field values, once records carry `view.fields`. */
+const decodeFieldValue = Schema.decodeUnknownOption(ViewFieldValue);
+
+/** Template field values, once records carry `view.fields`; malformed values are dropped. */
 const viewFieldsOf = (record: object): Readonly<Record<string, ViewFieldValue>> => {
   const view = recordField(record, "view");
   if (typeof view !== "object" || view === null) return {};
   const fields = recordField(view, "fields");
-  return typeof fields === "object" && fields !== null
-    ? (fields as Readonly<Record<string, ViewFieldValue>>)
-    : {};
+  if (typeof fields !== "object" || fields === null) return {};
+  const decoded: Record<string, ViewFieldValue> = {};
+  for (const [key, raw] of Object.entries(fields)) {
+    const value = decodeFieldValue(raw);
+    if (Option.isSome(value)) decoded[key] = value.value;
+  }
+  return decoded;
 };
 
 const draftBlock = (

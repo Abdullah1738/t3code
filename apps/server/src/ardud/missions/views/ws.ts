@@ -22,6 +22,7 @@ import {
   type RestoreViewInput,
   type RestoreViewLayoutInput,
   type ViewHistoryInput,
+  viewPinnedStrip,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
@@ -46,7 +47,7 @@ const waitingItem = (snapshot: MissionViewsSnapshot): MissionViewsFeedItem => ({
 });
 
 const waitingKey = (snapshot: MissionViewsSnapshot) =>
-  `${snapshot.ownerWaiting}:${snapshot.requestsUnread}:${snapshot.pinnedStrip}`;
+  `${snapshot.ownerWaiting}:${snapshot.requestsUnread}:${snapshot.pinned.needsYou}:${snapshot.pinned.requests}`;
 
 /** View changes (and starter changes) resend the snapshot; anything else may move the counts. */
 const touches = (missionId: MissionId) => (item: MissionStreamItem) =>
@@ -55,6 +56,11 @@ const touches = (missionId: MissionId) => (item: MissionStreamItem) =>
   (item.record.record.missionId === missionId ||
     (item.record.record.missionId === GLOBAL_TIMELINE &&
       item.record.record.kind.startsWith("view.starter-layout")));
+
+const isViewChange = (item: MissionStreamItem) =>
+  item._tag === "upsert" &&
+  item.record._tag === "event" &&
+  item.record.record.kind.startsWith("view.");
 
 export const makeViewsWsHandlers = (
   { store, views }: ViewsWsServices,
@@ -73,7 +79,8 @@ export const makeViewsWsHandlers = (
   /**
    * Subscribes before reading the snapshot, so nothing committed in between is
    * lost. A view change resends the whole snapshot; other mission events only
-   * send `waiting` when the owner-waiting counts or the pinned strip changed.
+   * recount what waits on the owner and send `waiting` when the counts or the
+   * pinned strip changed.
    */
   const subscribe = (input: MissionViewsInput): Stream.Stream<MissionViewsFeedItem, MissionError> =>
     Stream.unwrap(
@@ -82,31 +89,29 @@ export const makeViewsWsHandlers = (
         const first = yield* views.snapshot(input.missionId);
         const updates = Stream.fromSubscription(subscription).pipe(
           Stream.filter(touches(input.missionId)),
-          Stream.mapEffect((item) =>
-            Effect.map(views.snapshot(input.missionId), (snapshot) => ({
-              snapshot,
-              viewChange:
-                item._tag === "upsert" &&
-                item.record._tag === "event" &&
-                item.record.record.kind.startsWith("view."),
-            })),
-          ),
-          Stream.mapAccum(
-            () => ({ revision: first.revision, waiting: waitingKey(first) }),
-            (last, next) => {
-              const state = {
-                revision: next.snapshot.revision,
-                waiting: waitingKey(next.snapshot),
-              };
-              if (next.viewChange || state.revision !== last.revision) {
-                const item: MissionViewsFeedItem = { _tag: "snapshot", snapshot: next.snapshot };
-                return [state, [item]] as const;
-              }
-              return [
-                state,
-                state.waiting === last.waiting ? [] : [waitingItem(next.snapshot)],
-              ] as const;
-            },
+          Stream.mapAccumEffect(
+            () => first,
+            (last, item) =>
+              Effect.gen(function* () {
+                if (isViewChange(item)) {
+                  const snapshot = yield* views.snapshot(input.missionId);
+                  const next: MissionViewsFeedItem = { _tag: "snapshot", snapshot };
+                  return [snapshot, [next]] as const;
+                }
+                const counts = yield* views.waiting(input.missionId);
+                const pinned = viewPinnedStrip(last.layout.layout, counts);
+                const snapshot: MissionViewsSnapshot = {
+                  ...last,
+                  ownerWaiting: counts.ownerWaiting,
+                  requestsUnread: counts.requestsUnread,
+                  pinnedStrip: pinned.needsYou || pinned.requests,
+                  pinned,
+                };
+                return [
+                  snapshot,
+                  waitingKey(snapshot) === waitingKey(last) ? [] : [waitingItem(snapshot)],
+                ] as const;
+              }),
           ),
         );
         const head: MissionViewsFeedItem = { _tag: "snapshot", snapshot: first };

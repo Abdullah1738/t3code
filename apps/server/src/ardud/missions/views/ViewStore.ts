@@ -45,10 +45,13 @@ const DDL = [
     value_json TEXT NOT NULL,
     changed_at TEXT NOT NULL,
     counts INTEGER NOT NULL,
+    metered_mission TEXT,
     PRIMARY KEY (scope, id, version)
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_mission_views_versions_mission
     ON ardud_mission_views_versions (mission_id, changed_at)`,
+  `CREATE INDEX IF NOT EXISTS ardud_mission_views_versions_metered
+    ON ardud_mission_views_versions (metered_mission, changed_at)`,
 ];
 
 export type ViewScope = "template" | "section" | "layout" | "starter";
@@ -84,6 +87,12 @@ export interface WriteOptions {
    * revision. Seeds (a mission's first layout, the built-in starter) don't.
    */
   readonly counts: boolean;
+  /**
+   * The mission whose daily change budget this version spends: set for the
+   * master's changes (to its mission, starter edits included), null for the
+   * owner and for seeds.
+   */
+  readonly meteredMission: MissionId | null;
 }
 
 export class ViewStore extends Context.Service<
@@ -109,8 +118,8 @@ export class ViewStore extends Context.Service<
     ) => Effect.Effect<ReadonlyArray<ViewLayout>, MissionError>;
     /** Writes the current row and appends the version. Fails on a version already written. */
     readonly write: (write: ViewWrite, options: WriteOptions) => Effect.Effect<void, MissionError>;
-    /** Counted versions written for the mission since `since` (ISO). */
-    readonly changesSince: (missionId: string, since: string) => Effect.Effect<number>;
+    /** Versions that spent the mission's change budget since `since` (ISO). */
+    readonly changesSince: (missionId: MissionId, since: string) => Effect.Effect<number>;
     /** Counted versions for the mission plus counted starter versions. */
     readonly revision: (missionId: MissionId) => Effect.Effect<number>;
     /**
@@ -257,6 +266,7 @@ const make = Effect.gen(function* () {
           value_json: row.json,
           changed_at: changedAt,
           counts: options.counts ? 1 : 0,
+          metered_mission: options.meteredMission,
         })}
       `.pipe(Effect.orDie);
       yield* sql`
@@ -279,10 +289,10 @@ const make = Effect.gen(function* () {
 
   const count = (rows: ReadonlyArray<{ readonly n: number }>) => Number(rows[0]?.n ?? 0);
 
-  const changesSince = (missionId: string, since: string) =>
+  const changesSince = (missionId: MissionId, since: string) =>
     sql<{ readonly n: number }>`
       SELECT COUNT(*) AS n FROM ardud_mission_views_versions
-      WHERE mission_id = ${missionId} AND counts = 1 AND changed_at >= ${since}
+      WHERE metered_mission = ${missionId} AND changed_at >= ${since}
     `.pipe(Effect.map(count), Effect.orDie);
 
   const revision = (missionId: MissionId) =>

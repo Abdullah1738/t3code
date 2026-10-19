@@ -57,7 +57,8 @@ const isRef = (value: unknown): value is MissionRecordRef =>
   typeof value === "object" &&
   value !== null &&
   typeof (value as { kind?: unknown }).kind === "string" &&
-  typeof (value as { id?: unknown }).id === "string";
+  typeof (value as { id?: unknown }).id === "string" &&
+  ["string", "undefined"].includes(typeof (value as { label?: unknown }).label);
 
 const isOption = (value: unknown): value is AskOption =>
   typeof value === "object" &&
@@ -222,7 +223,9 @@ export function resolveViewBind(bind: string, context: ViewBindContext): ViewVal
         ? null
         : resolvePath(context.scope, context.record, path, context);
     case "field": {
-      const value = context.fields?.[path];
+      const fields = context.fields;
+      if (fields === undefined || !Object.hasOwn(fields, path)) return null;
+      const value = fields[path];
       return value === undefined ? null : fieldValue(value);
     }
     case "row": {

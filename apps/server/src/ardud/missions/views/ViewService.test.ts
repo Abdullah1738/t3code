@@ -215,7 +215,8 @@ describe("ViewService", () => {
           "view.template-restored",
         ]);
         assert.equal(snapshot.revision, 4);
-        assert.equal(snapshot.changesToday, 4);
+        // Only the master's changes spend the daily budget.
+        assert.equal(snapshot.changesToday, 0);
       }),
     ),
   );
@@ -530,6 +531,85 @@ describe("ViewService", () => {
         );
         assert.equal(second.code, "invalid");
         assert.include(second.detail, "limit");
+
+        // A section key can't take a layout key a built-in already holds.
+        yield* views.editLayout(
+          ownerApp,
+          ops({ _tag: "limits", limits: { templates: 24, sections: 4, changesPerDay: 40 } }),
+        );
+        const clash = yield* Effect.flip(
+          views.placeSection(ownerApp, {
+            missionId,
+            definition: {
+              key: "needs-you",
+              title: "Mine",
+              source: { _tag: "refs", refs: [{ kind: "work-item", id: "wi-held" }] },
+              body: [{ _tag: "list", title: "row.title", meta: [], status: null }],
+            },
+          }),
+        );
+        assert.include(clash.detail, "already has an entry keyed needs-you");
+
+        // An update doesn't bring back an entry the layout removed.
+        yield* views.editLayout(ownerApp, ops({ _tag: "remove", key: "release-train" }));
+        yield* views.placeSection(ownerApp, {
+          missionId,
+          sectionId: ViewSectionId.make(placed.ref.id),
+          definition: {
+            key: "release-train",
+            title: "Release train (deploys)",
+            source: { _tag: "refs", refs: [{ kind: "work-item", id: "wi-held" }] },
+            body: [{ _tag: "list", title: "row.title", meta: [], status: null }],
+          },
+        });
+        const after = yield* views.snapshot(missionId);
+        assert.isFalse(after.layout.layout.entries.some((entry) => entry.key === "release-train"));
+      }),
+    ),
+  );
+
+  it.effect("meters only the master's own changes, and limits always go through", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const master = agent(masterThread);
+        yield* views.editLayout(
+          ownerApp,
+          ops({ _tag: "limits", limits: { templates: 24, sections: 8, changesPerDay: 2 } }),
+        );
+        // The owner's edits don't spend the master's budget.
+        for (const key of ["sub-missions", "since-last-looked", "with-the-master"]) {
+          yield* views.editLayout(ownerApp, ops({ _tag: "hide", key }));
+        }
+        yield* views.editLayout(master, ops({ _tag: "show", key: "sub-missions" }));
+        yield* views.editStarter(master, { ops: [{ _tag: "hide", key: "tab-calls" }] });
+        const spent = yield* Effect.flip(
+          views.editLayout(master, ops({ _tag: "show", key: "with-the-master" })),
+        );
+        assert.include(spent.detail, "view change budget used today (2 of 2)");
+        // The master can raise its own budget, then carry on.
+        yield* views.editLayout(
+          master,
+          ops({ _tag: "limits", limits: { templates: 24, sections: 8, changesPerDay: 10 } }),
+        );
+        yield* views.editLayout(master, ops({ _tag: "show", key: "with-the-master" }));
+        assert.equal((yield* views.snapshot(missionId)).changesToday, 4);
+      }),
+    ),
+  );
+
+  it.effect("Needs you in the header doesn't count as shown", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        yield* openAsk("ask-1");
+        yield* views.editLayout(
+          ownerApp,
+          ops({ _tag: "move", key: "needs-you", region: "header", index: 1 }),
+        );
+        assert.isTrue((yield* views.snapshot(missionId)).pinned.needsYou);
       }),
     ),
   );

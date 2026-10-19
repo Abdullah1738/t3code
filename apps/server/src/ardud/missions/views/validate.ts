@@ -468,6 +468,13 @@ export const checkLayout = (
   context: LayoutContext,
 ): Array<ViewIssue> => {
   const issues = new Issues();
+  if (layout.entries.length > VIEW_HARD_LIMITS.layoutEntries) {
+    issues.add(
+      "entries",
+      "limit",
+      `a layout holds at most ${VIEW_HARD_LIMITS.layoutEntries} entries (removed sections still count)`,
+    );
+  }
   const keys = new Set<string>();
   const targets = new Set<string>();
   layout.entries.forEach((entry, index) => {

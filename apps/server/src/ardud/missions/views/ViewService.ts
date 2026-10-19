@@ -54,7 +54,6 @@ import {
   type ViewLayout,
   type ViewLayoutDefinition,
   type ViewLayoutEntry,
-  type ViewLimits,
   type ViewPreview,
   type ViewSection,
   type ViewStarterLayout,
@@ -135,12 +134,15 @@ interface ViewCaller {
   readonly provenance: MissionProvenance;
   readonly actor: MissionActor;
   readonly by: ViewAuthor;
+  /** The mission whose change budget the caller spends: the master's own; null for the owner. */
+  readonly metered: MissionId | null;
 }
 
 const OWNER_CALLER = (provenance: MissionProvenance): ViewCaller => ({
   provenance,
   actor: { _tag: "owner" },
   by: "owner",
+  metered: null,
 });
 
 const who = (caller: ViewCaller) => (caller.by === "owner" ? "The owner" : "The master");
@@ -220,6 +222,7 @@ const make = Effect.gen(function* () {
         provenance: standing.caller.provenance,
         actor: actorOf(standing.caller.provenance),
         by: "master",
+        metered: missionId,
       };
       return caller;
     });
@@ -236,13 +239,26 @@ const make = Effect.gen(function* () {
       );
     });
 
-  /** The owner, or the master of any mission (the starter affects every new mission). */
+  /**
+   * The owner, or the master of any mission (the starter affects every new
+   * mission). A master is found through the calling thread's live bindings,
+   * so the cost doesn't grow with the number of missions.
+   */
   const starterEditor = (provenance: MissionProvenance) =>
     Effect.gen(function* () {
       if (isOwnerProvenance(provenance)) return OWNER_CALLER(provenance);
-      for (const mission of yield* store.list("mission", {})) {
-        const master = yield* masterCaller(mission.id, provenance);
-        if (master !== null) return master;
+      if (provenance._tag === "agent") {
+        const bindings = yield* store.list("role-binding", { status: ["bound"], limit: 5000 });
+        const missionIds = new Set<MissionId>();
+        for (const binding of bindings) {
+          if (binding.threadId !== provenance.threadId) continue;
+          const role = Option.getOrNull(yield* store.get("role", binding.roleId));
+          if (role !== null) missionIds.add(role.missionId);
+        }
+        for (const missionId of missionIds) {
+          const master = yield* masterCaller(missionId, provenance);
+          if (master !== null) return master;
+        }
       }
       return yield* fail(
         "forbidden",
@@ -277,20 +293,29 @@ const make = Effect.gen(function* () {
     { write: { scope: "layout", value: next }, counts },
   ];
 
-  /** The master's daily budget; the owner is never metered. */
-  const spendBudget = (caller: ViewCaller, missionId: MissionId, limits: ViewLimits) =>
-    caller.by !== "master"
-      ? Effect.void
-      : Effect.gen(function* () {
-          const since = DateTime.formatIso(DateTime.subtract(yield* DateTime.now, { days: 1 }));
-          const used = yield* views.changesSince(missionId, since);
-          if (used >= limits.changesPerDay) {
-            return yield* fail(
-              "invalid",
-              `view change budget used today (${used} of ${limits.changesPerDay}); the owner can raise it in the layout limits`,
-            );
-          }
-        });
+  /**
+   * The master's daily budget: the limit set on its own mission's layout,
+   * counting only the master's changes (starter edits included). The owner
+   * is never metered and his edits don't spend it. A change that only sets
+   * limits always goes through, so the master can raise the budget itself up
+   * to the hard ceiling.
+   */
+  const spendBudget = (caller: ViewCaller, limitsOnly = false) =>
+    Effect.gen(function* () {
+      const metered = caller.metered;
+      if (metered === null || limitsOnly) return;
+      const mission = yield* requireMission(metered);
+      const { layout } = yield* currentLayout(mission);
+      const limit = layout.layout.limits.changesPerDay;
+      const since = DateTime.formatIso(DateTime.subtract(yield* DateTime.now, { days: 1 }));
+      const used = yield* views.changesSince(metered, since);
+      if (used >= limit) {
+        return yield* fail(
+          "invalid",
+          `view change budget used today (${used} of ${limit}); raise it with a limits change on the mission layout`,
+        );
+      }
+    });
 
   const missionBytesIssue = (
     templates: ReadonlyArray<ViewTemplate>,
@@ -336,7 +361,11 @@ const make = Effect.gen(function* () {
         },
         alongside: Effect.forEach(
           input.writes,
-          (pending) => views.write(pending.write, { counts: pending.counts }),
+          (pending) =>
+            views.write(pending.write, {
+              counts: pending.counts,
+              meteredMission: pending.counts ? input.caller.metered : null,
+            }),
           { discard: true },
         ),
       })
@@ -500,7 +529,7 @@ const make = Effect.gen(function* () {
         }
         yield* fence(existing?.version ?? 0, input.expectedVersion, "This card template");
         const { layout } = yield* currentLayout(mission);
-        yield* spendBudget(caller, mission.id, layout.layout.limits);
+        yield* spendBudget(caller);
 
         const sections = yield* views.sections(mission.id);
         const siblings = templates.filter((template) => template.id !== existing?.id);
@@ -564,7 +593,7 @@ const make = Effect.gen(function* () {
         yield* fence(existing?.version ?? 0, input.expectedVersion, "This section");
         const current = yield* currentLayout(mission);
         const limits = current.layout.layout.limits;
-        yield* spendBudget(caller, mission.id, limits);
+        yield* spendBudget(caller);
 
         const templates = yield* views.templates(mission.id);
         const siblings = sections.filter((section) => section.id !== existing?.id);
@@ -587,9 +616,23 @@ const make = Effect.gen(function* () {
         const placed = entries.find(
           (entry) => entry.section._tag === "custom" && entry.section.sectionId === id,
         );
+        const clash = entries.find(
+          (entry) =>
+            entry.key === input.definition.key &&
+            !(entry.section._tag === "custom" && entry.section.sectionId === id),
+        );
+        if (placed === undefined && existing === undefined && clash !== undefined) {
+          issues.push({
+            path: "definition.key",
+            code: "duplicate",
+            detail: `the mission layout already has an entry keyed ${clash.key}; pick another key`,
+          });
+        }
         const moves = input.region !== undefined || input.index !== undefined;
         let nextEntries: ReadonlyArray<ViewLayoutEntry> = entries;
-        if (placed === undefined || moves) {
+        // A new section joins the layout; an update only moves it when asked, so
+        // an entry the layout removed stays off the page.
+        if ((placed === undefined && existing === undefined) || moves) {
           const entry: ViewLayoutEntry = placed
             ? { ...placed, region: input.region ?? placed.region }
             : {
@@ -661,7 +704,6 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const mission = yield* requireMission(input.missionId);
         const caller = yield* editorOf(mission.id, provenance);
-        const { layout } = yield* currentLayout(mission);
         const now = yield* nowIso;
         if (input.ref.kind === "view-template") {
           if (input.ref.id.startsWith(BUILTIN_VIEW_TEMPLATE_PREFIX)) {
@@ -683,7 +725,7 @@ const make = Effect.gen(function* () {
             );
           }
           yield* fence(existing.version, input.expectedVersion, "This card template");
-          yield* spendBudget(caller, mission.id, layout.layout.limits);
+          yield* spendBudget(caller);
           const next: ViewTemplate = {
             ...existing,
             ...changeMeta(caller, existing.version + 1, now, input.reason),
@@ -712,7 +754,7 @@ const make = Effect.gen(function* () {
           );
         }
         yield* fence(existing.version, input.expectedVersion, "This section");
-        yield* spendBudget(caller, mission.id, layout.layout.limits);
+        yield* spendBudget(caller);
         const next: ViewSection = {
           ...existing,
           ...changeMeta(caller, existing.version + 1, now, input.reason),
@@ -737,7 +779,7 @@ const make = Effect.gen(function* () {
         const caller = yield* editorOf(mission.id, provenance);
         const { layout } = yield* currentLayout(mission);
         const limits = layout.layout.limits;
-        yield* spendBudget(caller, mission.id, limits);
+        yield* spendBudget(caller);
         const templates = yield* views.templates(mission.id);
         const sections = yield* views.sections(mission.id);
         const now = yield* nowIso;
@@ -750,6 +792,7 @@ const make = Effect.gen(function* () {
           if (existing === undefined) {
             return yield* fail("not-found", `No card template ${input.ref.id} in this mission.`);
           }
+          yield* fence(existing.version, input.expectedVersion, "This card template");
           const source =
             input.toVersion === undefined
               ? existing
@@ -809,6 +852,7 @@ const make = Effect.gen(function* () {
         if (existing === undefined) {
           return yield* fail("not-found", `No section ${input.ref.id} in this mission.`);
         }
+        yield* fence(existing.version, input.expectedVersion, "This section");
         const source =
           input.toVersion === undefined
             ? existing
@@ -880,7 +924,10 @@ const make = Effect.gen(function* () {
         const caller = yield* editorOf(mission.id, provenance);
         const current = yield* currentLayout(mission);
         yield* fence(current.layout.version, input.expectedVersion, "The mission layout");
-        yield* spendBudget(caller, mission.id, current.layout.layout.limits);
+        yield* spendBudget(
+          caller,
+          input.ops.every((op) => op._tag === "limits"),
+        );
         const starter = ViewStore.currentStarter(yield* views.starters);
         const sections = yield* views.sections(mission.id);
         const applied = applyLayoutOps(current.layout.layout, input.ops, {
@@ -922,7 +969,8 @@ const make = Effect.gen(function* () {
         const mission = yield* requireMission(input.missionId);
         const caller = yield* editorOf(mission.id, provenance);
         const current = yield* currentLayout(mission);
-        yield* spendBudget(caller, mission.id, current.layout.layout.limits);
+        yield* fence(current.layout.version, input.expectedVersion, "The mission layout");
+        yield* spendBudget(caller);
         const stored = yield* views.layoutVersions(mission.id);
         const versions = stored.length > 0 ? stored : [current.layout];
         const source = versions.find((version) => version.version === input.toVersion);
@@ -985,6 +1033,7 @@ const make = Effect.gen(function* () {
         const caller = yield* starterEditor(provenance);
         const current = ViewStore.currentStarter(yield* views.starters);
         yield* fence(current.version, input.expectedVersion, "The starter layout");
+        yield* spendBudget(caller);
         const applied = applyLayoutOps(current.layout, input.ops, {
           starter: null,
           sectionTitle: () => undefined,
@@ -1014,6 +1063,8 @@ const make = Effect.gen(function* () {
         const caller = yield* starterEditor(provenance);
         const stored = yield* views.starters;
         const current = ViewStore.currentStarter(stored);
+        yield* fence(current.version, input.expectedVersion, "The starter layout");
+        yield* spendBudget(caller);
         const source = ViewStore.starterHistory(stored).find(
           (version) => version.version === input.toVersion,
         );
@@ -1059,7 +1110,10 @@ const make = Effect.gen(function* () {
         const mission = Option.getOrNull(yield* store.get("mission", missionId));
         if (mission === null || (yield* views.layout(missionId)) !== null) return;
         const seed = seededLayout(mission, yield* views.starters);
-        yield* views.write({ scope: "layout", value: seed }, { counts: false });
+        yield* views.write(
+          { scope: "layout", value: seed },
+          { counts: false, meteredMission: null },
+        );
       }),
     );
 

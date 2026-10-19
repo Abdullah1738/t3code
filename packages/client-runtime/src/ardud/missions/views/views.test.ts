@@ -230,6 +230,41 @@ describe("viewCard", () => {
     expect(card.actions.find((action) => action.key === "send")?.label).toBe("Approve");
   });
 
+  it("drops malformed field values and inherited keys instead of throwing", () => {
+    const fielded = template("fielded", {
+      backing: "ask",
+      match: {},
+      body: [
+        { _tag: "text", bind: "field.constructor", style: "body", maxLines: 2 },
+        {
+          _tag: "facts",
+          rows: [
+            { label: "Ours", bind: "field.our-side" },
+            { label: "Count", bind: "field.count" },
+            { label: "Tags", bind: "field.tags" },
+          ],
+        },
+        { _tag: "refs", bind: "record.blocks" },
+      ],
+      actions: ["answer"],
+    });
+    const record = {
+      ...ask,
+      blocks: [{ kind: "work-item", id: "wi-1", label: 7 }],
+      view: {
+        templateId: null,
+        fields: {
+          "our-side": { _tag: "short", value: "green" },
+          count: { _tag: "number", value: "1" },
+          tags: { _tag: "flags", value: "x" },
+          empty: null,
+        },
+      },
+    } as never;
+    const card = viewCard({ kind: "ask", record }, [fielded], { nowMs: NOW });
+    expect(card.blocks).toEqual([{ kind: "facts", rows: [{ label: "Ours", value: "green" }] }]);
+  });
+
   it("ignores removed templates", () => {
     const removed = template("gone", { backing: "ask", body: [{ _tag: "choice" }] }, "removed");
     expect(viewCard({ kind: "ask", record: ask }, [removed], { nowMs: NOW }).source).toBe(
