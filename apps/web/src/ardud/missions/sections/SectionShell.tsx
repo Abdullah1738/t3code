@@ -5,11 +5,13 @@ import {
   ArrowUpDownIcon,
   ArrowUpIcon,
   EllipsisIcon,
+  EyeIcon,
   EyeOffIcon,
   MessagesSquareIcon,
   PencilLineIcon,
   SendIcon,
   Trash2Icon,
+  Undo2Icon,
 } from "lucide-react";
 
 import type { MissionId } from "@t3tools/contracts";
@@ -83,7 +85,10 @@ export function SectionShell(props: {
   );
 }
 
-/** Hide / Move / Discuss / Ask the master to change / Remove. */
+/**
+ * Hide / Move / Discuss / Ask the master to change / Remove. A hidden section
+ * offers Show instead of Hide and Move; a removed one only Restore and Discuss.
+ */
 export function SectionMenu(props: {
   missionId: MissionId;
   layout: MissionLayout;
@@ -91,7 +96,8 @@ export function SectionMenu(props: {
   onAsk: () => void;
 }) {
   const { missionId, layout, section } = props;
-  const moves = sectionMoves(layout, section.key);
+  const shown = !section.hidden && !section.removed;
+  const moves = shown ? sectionMoves(layout, section.key) : null;
   const title = sectionTitle(section);
   return (
     <Menu>
@@ -103,10 +109,22 @@ export function SectionMenu(props: {
         <EllipsisIcon aria-hidden />
       </MenuTrigger>
       <MenuPopup align="end">
-        <MenuItem onClick={() => void changeSection(missionId, section.key, { type: "hide" })}>
-          <EyeOffIcon aria-hidden />
-          Hide
-        </MenuItem>
+        {section.removed ? (
+          <MenuItem onClick={() => void changeSection(missionId, section.key, { type: "restore" })}>
+            <Undo2Icon aria-hidden />
+            Restore
+          </MenuItem>
+        ) : section.hidden ? (
+          <MenuItem onClick={() => void changeSection(missionId, section.key, { type: "show" })}>
+            <EyeIcon aria-hidden />
+            Show
+          </MenuItem>
+        ) : (
+          <MenuItem onClick={() => void changeSection(missionId, section.key, { type: "hide" })}>
+            <EyeOffIcon aria-hidden />
+            Hide
+          </MenuItem>
+        )}
         {moves ? (
           <MenuSub>
             <MenuSubTrigger>
@@ -161,11 +179,13 @@ export function SectionMenu(props: {
           <MessagesSquareIcon aria-hidden />
           Discuss
         </MenuItem>
-        <MenuItem onClick={props.onAsk}>
-          <PencilLineIcon aria-hidden />
-          Ask the master to change
-        </MenuItem>
-        {canRemoveSection(section) ? (
+        {section.removed ? null : (
+          <MenuItem onClick={props.onAsk}>
+            <PencilLineIcon aria-hidden />
+            Ask the master to change
+          </MenuItem>
+        )}
+        {!section.removed && canRemoveSection(section) ? (
           <>
             <MenuSeparator />
             <MenuItem
