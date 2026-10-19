@@ -32,14 +32,14 @@ const HELP = `mission <command> [options]
   watch MISSION --on KINDS [--interval SECONDS]   prints the robob-watch command
   watch-check MISSION --on KINDS --cursor FILE    one watcher tick: prints new matches only
 
-Watch kinds: ask-opened, ask-answered, draft-opened, suggestion-opened, fork-closed,
+Watch kinds: ask-opened, ask-answered, draft-opened, suggestion-opened,
 milestone-at-risk, lane-stalled, swarm-paused.
 
 Answers, approvals and owner requests are refused unless the inbound id is a
 real iMessage from the owner's or Moni's chat that says the same thing.
 
-Everything else that changes a mission (plan, lanes, approvals, rules, asks,
-forks) goes through the mission_* MCP tools from the calling thread, never this
+Everything else that changes a mission (plan, lanes, approvals, rules, asks)
+goes through the mission_* MCP tools from the calling thread, never this
 CLI: HTTP cannot prove which thread is calling.
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, or ${DEFAULT_TOKEN_FILE}.`;
