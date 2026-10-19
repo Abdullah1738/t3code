@@ -24,6 +24,7 @@ import {
   seed,
   seedOther,
 } from "../asks/AsksService.testkit.ts";
+import * as AsksService from "../asks/AsksService.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { PORTFOLIO_TIMELINE } from "./portfolio.ts";
@@ -184,6 +185,8 @@ describe("portfolio", () => {
         order: [thirdId, missionId, otherMissionId],
       });
       assert.isTrue(byMaster.seq > byOwner.seq);
+      // Same global timeline as rule events, so one feed carries both.
+      assert.strictEqual(PORTFOLIO_TIMELINE, AsksService.GLOBAL_TIMELINE);
       const [event] = yield* store.recentEvents(PORTFOLIO_TIMELINE, 1);
       assert.strictEqual(event?.kind, "portfolio.reordered");
       assert.deepStrictEqual(event?.actor, { _tag: "thread", threadId: masterThread });
