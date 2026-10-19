@@ -26,7 +26,8 @@ const canonical = (link: WatchedLink) => ({
   ...(link.url === undefined ? {} : { url: link.url }),
 });
 
-const keyOf = (threadId: ThreadId, link: WatchedLink) =>
+/** The authority key of a watch on `threadId`'s link. */
+export const watchKey = (threadId: ThreadId, link: WatchedLink) =>
   prWatchKey({ threadId, ...canonical(link) });
 
 /**
@@ -53,10 +54,10 @@ export const authorizeWatch = (
         targetThreadId: threadId,
         from: principal,
         text: `Watch pull request ${threadPullRequestKeyOf(canonical(link))} and wake this thread with its checks, reviews and comments.`,
-        requestKey: `pr-watch:${keyOf(threadId, link)}:${principalKey(principal)}`,
+        requestKey: `pr-watch:${watchKey(threadId, link)}:${principalKey(principal)}`,
       });
     }
-    yield* store.record("pr-watch", keyOf(threadId, link), principal);
+    yield* store.record("pr-watch", watchKey(threadId, link), principal);
   });
 
 /**
@@ -75,7 +76,7 @@ export const admitWatchWake = (
   },
 ): Effect.Effect<boolean> =>
   Effect.gen(function* () {
-    const key = keyOf(input.threadId, input.link);
+    const key = watchKey(input.threadId, input.link);
     const initiator = yield* store.read("pr-watch", key);
     if (initiator?._tag === "owner") return true;
     const from: SendSender = initiator ?? {

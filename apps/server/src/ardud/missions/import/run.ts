@@ -53,6 +53,8 @@ import { buildImportPlan, type ReviewPoolKind } from "./mapping.ts";
 import { applyPlan, diffPlan, readPlanFile } from "./plan.ts";
 import { readSources } from "./readers.ts";
 import { renderReport } from "./report.ts";
+// ardud missions: guard (legacy schedules and watches become the master's)
+import { adoptLegacyAuthority, renderAdoption } from "../guard/adopt.ts";
 
 const { values } = NodeUtil.parseArgs({
   options: {
@@ -183,7 +185,9 @@ const program = Effect.gen(function* () {
             ...Object.fromEntries(planCreated),
           },
         };
-  return renderReport({
+  // ardud missions: guard
+  const adoption = yield* adoptLegacyAuthority(plan.core, { apply: values.apply });
+  const report = renderReport({
     plan,
     diff,
     mode: values.apply ? "apply" : "dry-run",
@@ -200,6 +204,7 @@ const program = Effect.gen(function* () {
     ...(applied === undefined ? {} : { applied }),
     ...(missionPlan === null ? {} : { missionPlan, planState }),
   });
+  return report + renderAdoption(adoption);
 }).pipe(
   Effect.provide(
     PolicyService.layer.pipe(
