@@ -10,12 +10,10 @@ import {
   DraftChannel,
   DraftId,
   DraftStatus,
-  ForkId,
   MergeLanesInput,
   MergeSubMissionsInput,
   MissionId,
   MissionLink,
-  MissionRecordRef,
   MissionMutationResult,
   NonNegativeInt,
   OwnerCondition,
@@ -40,7 +38,6 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
   TurnItemId,
-  UpdateForkInput,
   UpdateMissionInput,
   UpsertLaneInput,
   UpsertMilestoneInput,
@@ -82,7 +79,7 @@ const Records = Schema.Array(Schema.Unknown);
 
 const MissionStatusTool = Tool.make("mission_status", {
   description:
-    "Mission status. Without missionId: the missions on this server and suggestion acceptance stats. With missionId: that mission's desk (open asks and exactly what each holds, pending drafts, open suggestions, open forks, calls awaiting the owner's direction check, lanes).",
+    "Mission status. Without missionId: the missions on this server and suggestion acceptance stats. With missionId: that mission's desk (open asks and exactly what each holds, pending drafts, open suggestions, calls awaiting the owner's direction check, lanes).",
   parameters: Schema.Struct({ missionId: Schema.optional(MissionId) }),
   success: Schema.Struct({
     missions: Records,
@@ -96,7 +93,7 @@ const MissionStatusTool = Tool.make("mission_status", {
 
 const MissionDigestTool = Tool.make("mission_digest", {
   description:
-    "A mission's event log since an ISO time, oldest first (up to 500 events): asks opened and answered, calls, drafts, suggestions, forks and everything other tracks record.",
+    "A mission's event log since an ISO time, oldest first (up to 500 events): asks opened and answered, calls, drafts, suggestions and everything other tracks record.",
   parameters: Schema.Struct({ missionId: MissionId, since: TrimmedNonEmptyString }),
   success: Schema.Struct({ events: Records }),
   failure: OrchestratorMcpFailure,
@@ -310,47 +307,6 @@ const MissionSuggestionDecideTool = Tool.make("mission_suggestion_decide", {
   dependencies,
 });
 
-const MissionForkTool = Tool.make("mission_fork", {
-  description:
-    "Answer a dev's question from the master's context without disturbing the master: forks the master thread at its latest stable point and hands it the question. The fork drafts the reply with mission_draft and ends with mission_fork_close.",
-  parameters: Schema.Struct({
-    missionId: MissionId,
-    question: TrimmedNonEmptyString,
-    origin: Schema.optional(Schema.NullOr(Schema.Union([MissionRecordRef, MissionLink]))),
-  }),
-  success: Schema.Struct({
-    fork: Schema.Unknown,
-    delivered: Schema.Boolean,
-  }),
-  failure: OrchestratorMcpFailure,
-  failureMode: "return",
-  dependencies,
-});
-
-const MissionForkCloseTool = Tool.make("mission_fork_close", {
-  description:
-    "End a fork with one line for the master (what was answered or decided). The mission's master (or the owner) can also mark it as committing the mission; the timeline names who did.",
-  parameters: Schema.Struct({
-    forkId: ForkId,
-    summaryLine: TrimmedNonEmptyString,
-    commitsMission: Schema.optional(Schema.Boolean),
-  }),
-  success: Schema.Struct({ fork: Schema.Unknown, delivered: Schema.Boolean }),
-  failure: OrchestratorMcpFailure,
-  failureMode: "return",
-  dependencies,
-});
-
-const MissionForkUpdateTool = Tool.make("mission_fork_update", {
-  description:
-    "As the mission's master, follow up on a fork: reopen it to keep talking, mark an answered fork as committing the mission, or archive it. Recorded as the master, never as the owner.",
-  parameters: UpdateForkInput,
-  success: Schema.Struct({ fork: Schema.Unknown, delivered: Schema.Boolean }),
-  failure: OrchestratorMcpFailure,
-  failureMode: "return",
-  dependencies,
-});
-
 const MissionDraftReopenTool = Tool.make("mission_draft_reopen", {
   description:
     "As the mission's master, put an approved or dropped draft back to pending, including one the owner decided. It goes back to its approver: a draft routed to the owner still waits for him. Reopening starts a new revision, so earlier approvals no longer count.",
@@ -372,8 +328,7 @@ const MissionSuggestionReopenTool = Tool.make("mission_suggestion_reopen", {
 });
 
 const MissionNoteAckTool = Tool.make("mission_note_ack", {
-  description:
-    "As the mission's master, acknowledge a note (for example a fork that commits the mission).",
+  description: "As the mission's master, acknowledge a note.",
   parameters: Schema.Struct({ noteId: NoteId }),
   success: Schema.Struct({ note: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
@@ -653,9 +608,6 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionSuggestTool, "Suggest a change"),
   writeTool(MissionSuggestionDecideTool, "Decide a master suggestion"),
   writeTool(MissionSuggestionReopenTool, "Reopen a dismissed suggestion"),
-  writeTool(MissionForkTool, "Fork the master for a question"),
-  writeTool(MissionForkCloseTool, "Close a fork"),
-  writeTool(MissionForkUpdateTool, "Reopen, commit or archive a fork"),
   writeTool(MissionNoteAckTool, "Acknowledge a note"),
   writeTool(MissionSubMissionTool, "Create or update a sub-mission"),
   writeTool(MissionMilestoneTool, "Create or update a milestone"),

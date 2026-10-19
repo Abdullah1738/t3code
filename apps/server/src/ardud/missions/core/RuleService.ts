@@ -83,7 +83,6 @@ export class RuleService extends Context.Service<
 
 const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
-  const asks = yield* AsksService.AsksService;
   const lock = yield* Semaphore.make(1);
   const serial = <A>(effect: Fx<A>) => lock.withPermit(effect);
 
@@ -244,25 +243,15 @@ const make = Effect.gen(function* () {
     serial(
       Effect.gen(function* () {
         const rule = yield* loadRule(input.ruleId);
-        let forkId: RuleChangeRequest["forkId"] = null;
+        // Missions has no forks (owner, 19 Oct). Discussing a rule goes through
+        // an owner request about it, never a fork of the master.
         if (input.discuss === true) {
-          if (rule.missionId === null) {
-            return yield* fail(
-              "invalid",
-              "Discuss forks open on a mission's master; this rule is global.",
-            );
-          }
-          const opened = yield* asks.startFork(
-            {
-              missionId: rule.missionId,
-              kind: "discuss",
-              origin: ruleRef(rule),
-              question: `Change rule "${rule.title}": ${input.request}`,
-            },
-            provenance,
+          return yield* fail(
+            "invalid",
+            "Rules are discussed through an owner request about the rule, not a fork.",
           );
-          forkId = opened.fork.id;
         }
+        const forkId: RuleChangeRequest["forkId"] = null;
         const now = yield* nowIso;
         const request: RuleChangeRequest = {
           id: RuleChangeRequestId.make(`${rule.id}:change:${NodeCrypto.randomUUID()}`),
@@ -366,5 +355,4 @@ const make = Effect.gen(function* () {
   });
 });
 
-/** Needs the asks service for Discuss forks. */
 export const layer = Layer.effect(RuleService, make);

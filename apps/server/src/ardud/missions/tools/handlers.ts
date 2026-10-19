@@ -37,7 +37,7 @@ const invalid = (message: string) =>
 
 /**
  * Who is calling, from the MCP invocation context only. A T3 thread is an
- * agent (the service resolves its roles, lanes and forks); a signed-in MCP
+ * agent (the service resolves its roles and lanes); a signed-in MCP
  * client is a system component named after its label.
  */
 export const callerProvenance = (
@@ -294,35 +294,6 @@ const handlers = {
   mission_suggestion_decide: McpToolAccess.actsAsCaller((input) =>
     withCaller((asks, provenance) =>
       asks.decideSuggestion(input, provenance).pipe(Effect.map((suggestion) => ({ suggestion }))),
-    ),
-  ),
-  mission_fork: McpToolAccess.actsAsCaller((input) =>
-    withCaller((asks, provenance) =>
-      asks
-        .startFork(
-          {
-            missionId: input.missionId,
-            kind: "dev-question",
-            origin: input.origin ?? null,
-            question: input.question,
-          },
-          provenance,
-        )
-        .pipe(Effect.map(({ fork, delivered }) => ({ fork, delivered }))),
-    ),
-  ),
-  mission_fork_close: McpToolAccess.actsAsCaller((input) =>
-    withCaller((asks, provenance) =>
-      asks
-        .closeFork(input, provenance)
-        .pipe(Effect.map(({ fork, delivered }) => ({ fork, delivered }))),
-    ),
-  ),
-  mission_fork_update: McpToolAccess.actsAsCaller((input) =>
-    withCaller((asks, provenance) =>
-      asks
-        .updateFork(input, provenance)
-        .pipe(Effect.map(({ fork, delivered }) => ({ fork, delivered }))),
     ),
   ),
   mission_draft_reopen: McpToolAccess.actsAsCaller((input) =>

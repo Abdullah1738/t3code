@@ -445,66 +445,6 @@ describe("mission MCP tools", () => {
       expect(
         events.find((event) => event.summary.startsWith("Reopened suggestion"))?.actor,
       ).toEqual({ _tag: "role", roleId: "role-master" });
-
-      const fork = yield* call("mission_fork", master, {
-        missionId,
-        question: "Why the retry?",
-      });
-      const forkId = (fork.structured.fork as { id: string }).id;
-      yield* call("mission_fork_close", master, {
-        forkId,
-        summaryLine: "Retry stays.",
-        commitsMission: true,
-      });
-      const reopenedFork = yield* call("mission_fork_update", master, { forkId, action: "reopen" });
-      expect(reopenedFork.structured.fork).toMatchObject({ status: "open" });
-      expect((yield* call("mission_fork_update", lane, { forkId, action: "reopen" })).isError).toBe(
-        true,
-      );
-      const closing = (yield* store.recentEvents(missionId, 20)).find(
-        (event) => event.kind === "fork.closed",
-      );
-      expect(closing?.actor).toEqual({ _tag: "role", roleId: "role-master" });
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("forks the master for a dev question and returns one line to it", () => {
-    const { deliveries, layer } = toolsLayer();
-    return Effect.gen(function* () {
-      yield* seed;
-      const lane = threadCaller(laneThread);
-      const forked = yield* call("mission_fork", lane, {
-        missionId,
-        question: "Which region does staging use?",
-      });
-      expect(forked.isError).toBe(false);
-      const fork = forked.structured.fork as {
-        id: string;
-        kind: string;
-        forkThreadId: string;
-        commitsMission: boolean;
-      };
-      expect(fork.kind).toBe("dev-question");
-      expect(fork.commitsMission).toBe(false);
-      expect(deliveries.at(-1)?.threadId).toBe(fork.forkThreadId);
-
-      // The fork thread closes itself with one line for the master; it cannot commit the mission.
-      const forkThread = threadCaller(ThreadId.make(fork.forkThreadId));
-      const committing = yield* Effect.exit(
-        call("mission_fork_close", forkThread, {
-          forkId: fork.id,
-          summaryLine: "Staging is eu-west-1.",
-          commitsMission: true,
-        }),
-      );
-      expect(committing._tag === "Failure" || committing.value.isError).toBe(true);
-      const closed = yield* call("mission_fork_close", forkThread, {
-        forkId: fork.id,
-        summaryLine: "Staging is eu-west-1.",
-      });
-      expect(closed.isError).toBe(false);
-      expect(deliveries.at(-1)?.threadId).toBe(masterThread);
-      expect(deliveries.at(-1)?.text).toContain("Staging is eu-west-1.");
     }).pipe(Effect.provide(layer));
   });
 

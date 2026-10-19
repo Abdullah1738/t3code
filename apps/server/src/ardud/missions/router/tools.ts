@@ -169,7 +169,7 @@ const MissionRequestOpenTool = Tool.make("mission_request_open", {
 
 const MissionRequestReplyTool = Tool.make("mission_request_reply", {
   description:
-    'As the mission\'s master, answer one of the owner\'s requests. status "answered" (the default) when you have answered; "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, forks, rules or suggestions you made from it. No defaults, deadlines or "unless you say otherwise": the owner decides in his own time. Your reply wakes nobody.',
+    'As the mission\'s master, answer one of the owner\'s requests. status "answered" (the default) when you have answered; "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, rules or suggestions you made from it. No defaults, deadlines or "unless you say otherwise": the owner decides in his own time. Your reply wakes nobody.',
   parameters: ReplyOwnerRequestInput,
   success: Schema.Struct({ request: Schema.Unknown }),
   failure: OrchestratorMcpFailure,

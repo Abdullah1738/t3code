@@ -125,13 +125,23 @@ it.effect("anyone asks for a rule change; the owner can discuss it; the master r
     assert.equal(fromLane.status, "open");
     assert.isNull(fromLane.forkId);
 
+    // Missions has no forks: discuss is refused and nothing is forked.
+    assert.equal(
+      yield* failureCode(
+        rules.requestRuleChange(ownerApp, {
+          ruleId: rule.id,
+          request: "Let's talk about when options don't fit.",
+          discuss: true,
+        }),
+      ),
+      "invalid",
+    );
+    assert.equal(forks.length, 0);
     const discussed = yield* rules.requestRuleChange(ownerApp, {
       ruleId: rule.id,
       request: "Let's talk about when options don't fit.",
-      discuss: true,
     });
-    assert.isNotNull(discussed.forkId);
-    assert.equal(forks.length, 1);
+    assert.isNull(discussed.forkId);
 
     // A lane agent cannot resolve; the master can.
     assert.equal(
