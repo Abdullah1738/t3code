@@ -157,14 +157,14 @@ const RoleUnbindTool = tool(
 
 const RoleSucceedTool = tool(
   "mission_role_succeed",
-  "Hand a role from its holder to a thread you already launched, with a handoff note. Schedules bound to the old thread move to the new one. A holder may hand over its own role.",
+  "Hand a role from its holder to a thread you already launched, with a handoff note. Schedules bound to the old thread move to the new one unless that thread also serves another role, lane or mission; the result counts any kept. A holder may hand over its own role.",
   SucceedRoleInput,
   SucceedRoleResult,
 );
 
 const LaneHandoffTool = tool(
   "mission_lane_handoff",
-  "Hand a lane's lead role to a fresh thread with a handoff note. Without threadId the server launches the new thread in the old lead's project and workspace on the role's model and briefs it with the note. Schedules and the old thread's room subscriptions move; running work on the old thread is left alone.",
+  "Hand a lane's lead role to a fresh thread with a handoff note. Without threadId the server launches the new thread in the old lead's project and workspace on the role's model and briefs it with the note. Schedules (unless the old thread serves something else too) and the old thread's room subscriptions move; running work on the old thread is left alone. Retrying a failed handoff reuses the thread it launched.",
   HandOffLaneInput,
   SucceedRoleResult,
 );

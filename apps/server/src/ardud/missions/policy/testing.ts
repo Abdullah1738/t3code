@@ -1,4 +1,5 @@
 import {
+  MissionError,
   MissionId,
   ThreadId,
   type ModelSelection,
@@ -21,6 +22,7 @@ import {
   PolicySuccession,
   PolicySuggestions,
   PolicyThreads,
+  type SuccessionScope,
 } from "./ports.ts";
 
 /** Test-only helpers for the policy service: fake thread, succession and suggestion ports. */
@@ -58,30 +60,46 @@ export const makePorts = () => {
   const launches: Array<{ from: string; title: string; threadId: string; model: string }> = [];
   const briefs: Array<{ threadId: string; text: string; key: string }> = [];
   const subscriptionMoves: Array<{ missionId: string; from: string; to: string }> = [];
+  const successions: Array<{ from: string; to: string; scope: SuccessionScope }> = [];
+  const launched = new Map<string, ThreadId>();
+  // briefFails: briefs fail. launchUnseen: launched threads are not visible yet,
+  // so the succession after the launch fails.
+  const control = { briefFails: false, launchUnseen: false };
   const layer = Layer.mergeAll(
     Layer.succeed(
       PolicyHandoff,
       PolicyHandoff.of({
+        // Like ThreadLaunchService: the same launch id returns the same thread.
+        // Yields first, so concurrent handoffs interleave the way real ones do.
         launch: (input) =>
-          Effect.sync(() => {
-            const threadId = ThreadId.make(`thread-launched-${launches.length + 1}`);
-            threads.set(threadId, {
-              exists: true,
-              idle: true,
-              modelSelection: input.modelSelection,
-            });
-            launches.push({
-              from: input.from,
-              title: input.title,
-              threadId,
-              model: modelKey(input.modelSelection),
-            });
-            return threadId;
-          }),
+          Effect.yieldNow.pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                const known = launched.get(input.launchId);
+                const threadId = known ?? ThreadId.make(`thread-launched-${launches.length + 1}`);
+                threads.set(threadId, {
+                  exists: !control.launchUnseen,
+                  idle: true,
+                  modelSelection: input.modelSelection,
+                });
+                if (known !== undefined) return known;
+                launched.set(input.launchId, threadId);
+                launches.push({
+                  from: input.from,
+                  title: input.title,
+                  threadId,
+                  model: modelKey(input.modelSelection),
+                });
+                return threadId;
+              }),
+            ),
+          ),
         brief: (threadId, text, key) =>
-          Effect.sync(() => {
-            briefs.push({ threadId, text, key });
-          }),
+          control.briefFails
+            ? Effect.fail(new MissionError({ code: "conflict", detail: "brief refused" }))
+            : Effect.sync(() => {
+                briefs.push({ threadId, text, key });
+              }),
         moveSubscriptions: (missionId, from, to) =>
           Effect.sync(() => {
             subscriptionMoves.push({ missionId, from, to });
@@ -107,7 +125,16 @@ export const makePorts = () => {
           }),
       }),
     ),
-    Layer.succeed(PolicySuccession, PolicySuccession.of({ move: () => Effect.succeed(moves) })),
+    Layer.succeed(
+      PolicySuccession,
+      PolicySuccession.of({
+        move: (from, to, scope) =>
+          Effect.sync(() => {
+            successions.push({ from, to, scope });
+            return moves;
+          }),
+      }),
+    ),
     Layer.succeed(
       PolicySuggestions,
       PolicySuggestions.of({
@@ -125,7 +152,18 @@ export const makePorts = () => {
       }),
     ),
   );
-  return { threads, setModelCalls, proposals, moves, launches, briefs, subscriptionMoves, layer };
+  return {
+    threads,
+    setModelCalls,
+    proposals,
+    moves,
+    launches,
+    briefs,
+    subscriptionMoves,
+    successions,
+    control,
+    layer,
+  };
 };
 
 export const testLayer = (

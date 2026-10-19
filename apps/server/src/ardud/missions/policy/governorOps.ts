@@ -50,17 +50,15 @@ export const makeGovernorMemory = (): GovernorMemory => ({
   proposed: new Set(),
 });
 
-const SCAN_LIMIT = 5000;
-
 /** Everything the pure governor reads, from the store and the pools. */
 export const governorInput = (
   deps: PolicyDeps,
   now: string,
 ): Effect.Effect<GovernorInput, MissionError> =>
   Effect.gen(function* () {
-    const missions = yield* deps.store.list("mission", { limit: SCAN_LIMIT });
-    const subMissions = yield* deps.store.list("sub-mission", { limit: SCAN_LIMIT });
-    const lanes = yield* deps.store.list("lane", { limit: SCAN_LIMIT });
+    const missions = yield* deps.store.listAll("mission");
+    const subMissions = yield* deps.store.listAll("sub-mission");
+    const lanes = yield* deps.store.listAll("lane");
     const roles: Array<Role> = [];
     for (const mission of missions) {
       if (mission.status === "archived") continue;
