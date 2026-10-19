@@ -784,9 +784,13 @@ const make = Effect.gen(function* () {
         const deliveries = silent
           ? ([] as ReadonlyArray<ThreadId>)
           : yield* deliveryThreads(cast, message, subscriptions, item, speaker);
-        const ledger = ledgerFor(cast, message, subscriptions, speaker).map((row) =>
-          silent ? { ...row, status: "skipped" as const } : row,
-        );
+        // The owner's request words never reach coord's ledger.
+        const ledger =
+          room.kind === "owner-request"
+            ? []
+            : ledgerFor(cast, message, subscriptions, speaker).map((row) =>
+                silent ? { ...row, status: "skipped" as const } : row,
+              );
         const asked = asRequest?.(message, at);
         yield* store.commit({
           event:
