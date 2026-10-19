@@ -1,15 +1,19 @@
 import {
+  LaneId,
   MissionId,
   MissionMessageId,
+  RoleId,
   RoomId,
   SubscriptionId,
   ThreadId,
+  type MissionActor,
   type MissionMessage,
   type MissionMessageKind,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as RouterStore from "./RouterStore.ts";
@@ -206,6 +210,51 @@ it.layer(TestLayer)("RouterStore", (it) => {
       );
       assert.isTrue(yield* store.removeMember(missionId, "thread:master"));
       assert.strictEqual((yield* store.membersByPrincipal("thread:master")).length, 0);
+    }),
+  );
+
+  it.effect("keeps who wrote or was addressed in a room, and fills older rooms at boot", () =>
+    Effect.gen(function* () {
+      const store = yield* RouterStore.RouterStore;
+      const sql = yield* SqlClient.SqlClient;
+      const room = RoomId.make("room-actors");
+      const lane: MissionActor = { _tag: "lane", laneId: LaneId.make("lane-api") };
+      const master: MissionActor = { _tag: "role", roleId: RoleId.make("role-master") };
+      const posts: ReadonlyArray<readonly [number, MissionActor, ReadonlyArray<MissionActor>]> = [
+        [101, master, [lane]],
+        [102, lane, []],
+      ];
+      for (const [seq, author, to] of posts) {
+        yield* store.insertMessage({
+          message: { ...message(seq), roomId: room, author, to },
+          body: null,
+          contentHash: `hash-${seq}`,
+          deliveries: [],
+        });
+      }
+      const expected = [lane, master];
+      assert.deepStrictEqual(yield* store.roomActors(room), expected);
+      // A database from before the table: the next boot fills it from the messages.
+      yield* sql`DELETE FROM ardud_mission_router_room_actors`;
+      const rebooted = yield* RouterStore.RouterStore.pipe(
+        Effect.provide(Layer.fresh(RouterStore.layer)),
+      );
+      assert.deepStrictEqual(yield* rebooted.roomActors(room), expected);
+    }),
+  );
+
+  it.effect("makes the guard's authority table at boot, before any read", () =>
+    Effect.gen(function* () {
+      yield* RouterStore.RouterStore;
+      const sql = yield* SqlClient.SqlClient;
+      const tables = yield* sql<{ readonly name: string }>`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = 'ardud_mission_guard_authority'
+      `;
+      assert.deepStrictEqual(
+        tables.map((table) => table.name),
+        ["ardud_mission_guard_authority"],
+      );
     }),
   );
 });

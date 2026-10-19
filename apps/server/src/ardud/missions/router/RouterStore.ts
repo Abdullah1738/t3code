@@ -1,4 +1,5 @@
 import {
+  MissionActor,
   MissionId,
   MissionMessage,
   ReadPosition,
@@ -17,6 +18,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import type { SqlError } from "effect/sql/SqlError";
 
+import { ensureAuthorityTable } from "../guard/authority.ts";
 import { actorKey, type MemberKind } from "./model.ts";
 
 /**
@@ -39,6 +41,12 @@ import { actorKey, type MemberKind } from "./model.ts";
  * - `tuning`: per-room mute flag and when the owner or master last tuned it.
  * - `reminders`: deliveries that got their one reminder. Still unread after it
  *   means the master's attention view, never another ring.
+ * - `notices`: the route each system notice took, so its retry takes the same.
+ * - `room_actors`: everyone who wrote or was addressed in a room, so the room
+ *   lists its members even when nobody subscribed (a lane woken by name).
+ *
+ * The guard's authority table is made here too, at boot: `checkSend` reads it
+ * (fork lineage) and a read must never be what creates it.
  */
 const DDL = [
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_rooms (
@@ -66,9 +74,7 @@ const DDL = [
     ON ardud_mission_router_messages (room_id, seq)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS ardud_mission_router_messages_by_key
     ON ardud_mission_router_messages (mission_id, msg_key) WHERE msg_key IS NOT NULL`,
-  // Owner-request keys carry the iMessage id, which must post once across missions.
-  `CREATE INDEX IF NOT EXISTS ardud_mission_router_messages_by_bare_key
-    ON ardud_mission_router_messages (msg_key) WHERE msg_key IS NOT NULL`,
+  `DROP INDEX IF EXISTS ardud_mission_router_messages_by_bare_key`,
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_bodies (
     message_id TEXT PRIMARY KEY,
     body TEXT NOT NULL
@@ -160,6 +166,27 @@ const DDL = [
     updated_at TEXT NOT NULL,
     PRIMARY KEY (component, mission_id)
   )`,
+  // The route each system notice took (see `MissionRouter.notify`), so a retry
+  // takes the same one even if the thread's membership changed in between.
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_notices (
+    notice_key TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    mission_id TEXT,
+    at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS ardud_mission_router_room_actors (
+    room_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    PRIMARY KEY (room_id, actor)
+  )`,
+  // Filled as messages land; this fills it once for rooms older than the table.
+  `INSERT OR IGNORE INTO ardud_mission_router_room_actors (room_id, actor)
+    SELECT room_id, json_extract(message_json, '$.author') FROM ardud_mission_router_messages
+    WHERE NOT EXISTS (SELECT 1 FROM ardud_mission_router_room_actors)
+    UNION
+    SELECT m.room_id, t.value
+    FROM ardud_mission_router_messages m, json_each(m.message_json, '$.to') t
+    WHERE NOT EXISTS (SELECT 1 FROM ardud_mission_router_room_actors)`,
 ];
 
 /** The feed-cursor row that marks a feed as having run once. */
@@ -173,6 +200,7 @@ const encodeSubscription = Schema.encodeSync(Schema.fromJsonString(Subscription)
 const decodeSubscription = Schema.decodeUnknownSync(Schema.fromJsonString(Subscription));
 const encodeReadPosition = Schema.encodeSync(Schema.fromJsonString(ReadPosition));
 const decodeReadPosition = Schema.decodeUnknownSync(Schema.fromJsonString(ReadPosition));
+const decodeActor = Schema.decodeUnknownSync(Schema.fromJsonString(MissionActor));
 
 export interface DeliveryRow {
   readonly threadId: ThreadId;
@@ -322,8 +350,11 @@ export class RouterStore extends Context.Service<
       missionId: MissionId,
       key: string,
     ) => Effect.Effect<StoredMessage | null>;
-    /** Missions holding a message with this key (an iMessage id posts once anywhere). */
-    readonly keyMissions: (key: string) => Effect.Effect<ReadonlyArray<MissionId>>;
+    /** Messages of a mission whose key starts with `prefix`, oldest first. */
+    readonly messagesByKeyPrefix: (
+      missionId: MissionId,
+      prefix: string,
+    ) => Effect.Effect<ReadonlyArray<StoredMessage>>;
     readonly messageById: (id: MissionMessageId) => Effect.Effect<MissionMessage | null>;
     readonly messageBody: (id: MissionMessageId) => Effect.Effect<string | null>;
     /** Newest `limit` messages of a room below `beforeSeq`, returned oldest first. */
@@ -343,12 +374,16 @@ export class RouterStore extends Context.Service<
     /**
      * Per room of a mission: every message, and those after the owner's read
      * mark that the owner did not write. Rooms with no messages are absent.
+     * With `roomIds`, only those rooms.
      */
     readonly roomCounts: (
       missionId: MissionId,
+      roomIds?: ReadonlyArray<string>,
     ) => Effect.Effect<
       ReadonlyMap<string, { readonly total: number; readonly unreadForOwner: number }>
     >;
+    /** Everyone who wrote or was addressed in a room, the owner included. */
+    readonly roomActors: (roomId: RoomId) => Effect.Effect<ReadonlyArray<MissionActor>>;
     readonly roomKindsSince: (
       roomId: RoomId,
       sinceIso: string,
@@ -405,6 +440,21 @@ export class RouterStore extends Context.Service<
       readonly seq: number;
       readonly at: string;
     }) => Effect.Effect<void>;
+    /**
+     * The route a system notice took: the mission whose control room it went
+     * through, or null when it was queued to the thread directly. Absent when
+     * the key never went out.
+     */
+    readonly noticeRoute: (
+      key: string,
+    ) => Effect.Effect<{ readonly missionId: MissionId | null } | null>;
+    /** Records a notice's route; the first one stands. */
+    readonly recordNotice: (input: {
+      readonly key: string;
+      readonly threadId: ThreadId;
+      readonly missionId: MissionId | null;
+      readonly at: string;
+    }) => Effect.Effect<void>;
   }
 >()("t3/ardud/missions/router/RouterStore") {}
 
@@ -452,6 +502,7 @@ const toStatus = (status: string | null): "pending" | "skipped" =>
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* Effect.forEach(DDL, (statement) => sql.unsafe(statement), { discard: true }).pipe(
+    Effect.andThen(ensureAuthorityTable(sql)),
     Effect.orDie,
   );
 
@@ -518,6 +569,18 @@ const make = Effect.gen(function* () {
       `,
       { discard: true },
     );
+
+  // The message's author and addressees, read back from its stored row so the
+  // boot fill above and this agree on the JSON.
+  const insertRoomActors = (message: MissionMessage) => sql`
+    INSERT OR IGNORE INTO ardud_mission_router_room_actors (room_id, actor)
+    SELECT room_id, json_extract(message_json, '$.author')
+    FROM ardud_mission_router_messages WHERE id = ${message.id}
+    UNION
+    SELECT m.room_id, t.value
+    FROM ardud_mission_router_messages m, json_each(m.message_json, '$.to') t
+    WHERE m.id = ${message.id}
+  `;
 
   const existingIn = (
     kind: RouterRowKind,
@@ -600,7 +663,10 @@ const make = Effect.gen(function* () {
                 ON CONFLICT DO NOTHING
               `;
             }
-            if (inserted.length > 0) yield* insertRecipients(entry.message, entry.recipients);
+            if (inserted.length > 0) {
+              yield* insertRecipients(entry.message, entry.recipients);
+              yield* insertRoomActors(entry.message);
+            }
           }
           for (const { subscription, key } of batch.subscriptions) {
             yield* sql`
@@ -665,6 +731,7 @@ const make = Effect.gen(function* () {
             `;
           }
           yield* insertRecipients(message, recipients);
+          yield* insertRoomActors(message);
         }),
       ),
 
@@ -780,13 +847,20 @@ const make = Effect.gen(function* () {
         ),
       ),
 
-    keyMissions: (key) =>
+    messagesByKeyPrefix: (missionId, prefix) =>
       read(
-        sql<{ readonly missionId: string }>`
-          SELECT DISTINCT mission_id AS "missionId"
+        // A range on the (mission_id, msg_key) index; LIKE would need escaping.
+        sql<MessageRow>`
+          SELECT message_json AS "json", content_hash AS "contentHash"
           FROM ardud_mission_router_messages
-          WHERE msg_key = ${key}
-        `.pipe(Effect.map((rows) => rows.map((row) => MissionId.make(row.missionId)))),
+          WHERE mission_id = ${missionId}
+            AND msg_key >= ${prefix} AND msg_key < ${`${prefix}\u{10FFFF}`}
+          ORDER BY seq ASC
+        `.pipe(
+          Effect.map((rows) =>
+            rows.map((row) => ({ message: decodeMessage(row.json), contentHash: row.contentHash })),
+          ),
+        ),
       ),
 
     messageById: (id) =>
@@ -841,9 +915,11 @@ const make = Effect.gen(function* () {
         }),
       ),
 
-    roomCounts: (missionId) =>
-      read(
-        sql<{ readonly roomId: string; readonly total: number; readonly unread: number }>`
+    roomCounts: (missionId, roomIds) =>
+      roomIds !== undefined && roomIds.length === 0
+        ? Effect.succeed(new Map())
+        : read(
+            sql<{ readonly roomId: string; readonly total: number; readonly unread: number }>`
           SELECT m.room_id AS "roomId",
             COUNT(*) AS "total",
             SUM(CASE WHEN m.seq > COALESCE(r.seq, 0)
@@ -852,18 +928,27 @@ const make = Effect.gen(function* () {
           LEFT JOIN ardud_mission_router_reads r
             ON r.room_id = m.room_id AND r.reader_key = ${actorKey({ _tag: "owner" })}
           WHERE m.mission_id = ${missionId}
+            ${roomIds === undefined ? sql`` : sql`AND ${sql.in("m.room_id", roomIds)}`}
           GROUP BY m.room_id
         `.pipe(
-          Effect.map(
-            (rows) =>
-              new Map(
-                rows.map((row) => [
-                  row.roomId,
-                  { total: Number(row.total), unreadForOwner: Number(row.unread ?? 0) },
-                ]),
+              Effect.map(
+                (rows) =>
+                  new Map(
+                    rows.map((row) => [
+                      row.roomId,
+                      { total: Number(row.total), unreadForOwner: Number(row.unread ?? 0) },
+                    ]),
+                  ),
               ),
+            ),
           ),
-        ),
+
+    roomActors: (roomId) =>
+      read(
+        sql<{ readonly json: string }>`
+          SELECT actor AS "json" FROM ardud_mission_router_room_actors
+          WHERE room_id = ${roomId} ORDER BY actor
+        `.pipe(Effect.map((rows) => rows.map((row) => decodeActor(row.json)))),
       ),
 
     roomKindsSince: (roomId, sinceIso) =>
@@ -1224,6 +1309,32 @@ const make = Effect.gen(function* () {
         ON CONFLICT (component, mission_id) DO UPDATE SET
           seq = MAX(seq, excluded.seq),
           updated_at = excluded.updated_at
+      `),
+
+    noticeRoute: (key) =>
+      read(
+        sql<{ readonly missionId: string | null }>`
+          SELECT mission_id AS "missionId" FROM ardud_mission_router_notices
+          WHERE notice_key = ${key}
+        `.pipe(
+          Effect.map((rows) => {
+            const row = rows[0];
+            return row === undefined
+              ? null
+              : { missionId: row.missionId === null ? null : (row.missionId as MissionId) };
+          }),
+        ),
+      ),
+
+    recordNotice: ({ key, threadId, missionId, at }) =>
+      write(sql`
+        INSERT INTO ardud_mission_router_notices ${sql.insert({
+          notice_key: key,
+          thread_id: threadId,
+          mission_id: missionId,
+          at,
+        })}
+        ON CONFLICT (notice_key) DO NOTHING
       `),
   });
 });

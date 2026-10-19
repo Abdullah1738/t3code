@@ -2,13 +2,16 @@
  * The owner's requests over the missions desk, for the iMessage assistant and
  * the `mission` CLI:
  *
- * - `GET  /api/ardud/missions/desk/requests?mission&status&request`
+ * - `GET  /api/ardud/missions/desk/requests?mission&status&request&discussions&about&unread`
  * - `POST /api/ardud/missions/desk/requests`                     `{ missionId, text, subMissionId?, subject?, inboundId }`
  * - `POST /api/ardud/missions/desk/requests/:requestId/reply`    `{ text, inboundId }`
  * - `POST /api/ardud/missions/desk/requests/:requestId/settle`   `{ note?, inboundId }`
  * - `POST /api/ardud/missions/desk/requests/:requestId/reopen`   `{ note?, inboundId }`
  *
  * A `subject` is Discuss: the request is about that record (one open per record).
+ * `discussions=false` lists his requests about no record, `discussions=true`
+ * only discussions, `about=<kind>:<id>` the discussions on one record, and
+ * `unread=true` only those the master answered that he has not read.
  *
  * Writes speak for the owner only with the inbound id of the iMessage in which
  * he asked for it, redeemed once through the shared inbound ledger. Only the
@@ -117,6 +120,26 @@ const decodeNote = Schema.decodeUnknownEffect(NoteBody);
 const decodeMission = Schema.decodeUnknownEffect(MissionId);
 const decodeStatus = Schema.decodeUnknownEffect(OwnerRequestStatus);
 const decodeRequestId = Schema.decodeUnknownEffect(OwnerRequestId);
+const decodeRef = Schema.decodeUnknownEffect(MissionRecordRef);
+
+/** `true`/`false`, or undefined when absent. */
+const flagParam = (raw: string | null, name: string) => {
+  const value = raw?.trim() ?? "";
+  if (value === "") return Effect.succeed(undefined);
+  if (value === "true" || value === "false") return Effect.succeed(value === "true");
+  return Effect.fail(deskError("invalid_request", `${name} is true or false.`));
+};
+
+/** `about=<kind>:<id>`: the discussions on that record. */
+const aboutParam = (raw: string | null) => {
+  const value = raw?.trim() ?? "";
+  if (value === "") return Effect.succeed(undefined);
+  const colon = value.indexOf(":");
+  const ref = colon < 0 ? {} : { kind: value.slice(0, colon), id: value.slice(colon + 1) };
+  return decodeRef(ref).pipe(
+    Effect.mapError(() => deskError("invalid_request", "about is <record kind>:<id>.")),
+  );
+};
 
 const decodeBody = <A>(decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>) =>
   Effect.gen(function* () {
@@ -206,11 +229,17 @@ const makeRoutes = Effect.gen(function* () {
             : yield* decodeRequestId(rawRequest.trim()).pipe(
                 Effect.mapError(() => deskError("invalid_request", "request is a request id.")),
               );
+        const discussions = yield* flagParam(params.get("discussions"), "discussions");
+        const unread = yield* flagParam(params.get("unread"), "unread");
+        const subject = yield* aboutParam(params.get("about"));
         const requests = yield* router.ownerRequests(
           {
             missionId,
             ...(status === undefined ? {} : { status }),
             ...(requestId === undefined ? {} : { requestId }),
+            ...(discussions === undefined ? {} : { discussions }),
+            ...(unread === undefined ? {} : { unread }),
+            ...(subject === undefined ? {} : { subject }),
           },
           reader,
           ownerView(session),

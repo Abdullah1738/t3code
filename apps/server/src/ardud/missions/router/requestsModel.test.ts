@@ -27,7 +27,7 @@ const request: OwnerRequest = {
   updatedAt: at,
 };
 
-const message = (seq: number, text: string) => ({ seq, author: "owner", at, text });
+const message = (seq: number, text: string) => ({ seq, author: "owner", text });
 
 describe("owner request context", () => {
   it("keeps the opening and the newest messages and says what it left out", () => {
@@ -49,6 +49,18 @@ describe("owner request context", () => {
     assert.match(text, /\[\d+ earlier messages elided here/);
     assert.include(text, "work-item wi-1");
     assert.include(text, "Never give it a default or a deadline.");
+  });
+
+  it("bakes in no clock time: the owner reads it in the master's thread, in his own zone", () => {
+    const text = renderRequestContext({
+      request,
+      openedBy: "the owner",
+      messages: [message(1, "Speed up reviews.")],
+      total: 1,
+    });
+    assert.include(text, "#1 owner:\nSpeed up reviews.");
+    assert.notInclude(text, "2026-10-19");
+    assert.notMatch(text, /\d{1,2}:\d{2}/);
   });
 
   it("titles from the first line and round-trips room ids", () => {
