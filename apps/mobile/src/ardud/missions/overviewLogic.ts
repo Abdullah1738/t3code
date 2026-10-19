@@ -50,7 +50,7 @@ export function useOverviewActions(overview: MissionOverview | null | undefined)
     react: (callId, reaction) => {
       if (!overview) return;
       run("Could not record your reaction", () =>
-        missionsSource().reactToCall({ missionId: overview.mission.id, callId, reaction }),
+        missionsSource().reactToCall({ callId, reaction }),
       );
     },
     markSeen: () => {
