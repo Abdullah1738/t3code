@@ -19,7 +19,9 @@ import {
   writerThread,
 } from "../asks/AsksService.testkit.ts";
 import { makeReads } from "../core/reads.ts";
+import { OwnerConditions } from "../discuss/OwnerConditions.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import * as ViewStore from "../views/ViewStore.ts";
 import * as MissionRouter from "./MissionRouter.ts";
 import { fakeRouterThreads, routerOverFakes, type Sent } from "./MissionRouter.testkit.ts";
 
@@ -33,6 +35,17 @@ const harness = () => {
 };
 
 const master = agent(masterThread);
+
+/** The discuss port the way the server wires it, over the test router. */
+const ownerConditionsOverRouter = Layer.effect(
+  OwnerConditions,
+  Effect.map(MissionRouter.MissionRouter, (router) =>
+    OwnerConditions.of({
+      verify: router.verifyOwnerCondition,
+      settleFor: router.settleRequestsFor,
+    }),
+  ),
+);
 const masterRole = { _tag: "role", roleId: RoleId.make("role-master") } as const;
 const ownerIMessage: MissionProvenance = {
   _tag: "owner-imessage",
@@ -660,6 +673,372 @@ describe("owner requests", () => {
       );
       assert.include(reminder?.text ?? "", `Owner request ${request.id}`);
       assert.include(reminder?.text ?? "", "fold the release checks into one flow");
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
+describe("owner requests, router round 5", () => {
+  it.effect("every post keeps the newest message on the request", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const opened = yield* router.openRequest(
+        { missionId, text: "Can the   API lane\nship this week?" },
+        ownerApp,
+      );
+      assert.strictEqual(opened.lastReply, "Can the API lane ship this week?");
+      assert.deepStrictEqual(opened.lastReplyBy, { _tag: "owner" });
+      const answered = yield* router.replyRequest(
+        { requestId: opened.id, text: "x".repeat(400) },
+        master,
+      );
+      assert.strictEqual(answered.lastReply?.length, 280);
+      assert.isTrue(answered.lastReply?.endsWith("…"));
+      assert.deepStrictEqual(answered.lastReplyBy, masterRole);
+      const settled = yield* router.settleRequest(
+        { requestId: opened.id, note: "Shipped Thursday." },
+        master,
+      );
+      assert.strictEqual(settled.lastReply, "Shipped Thursday.");
+      const reopened = yield* router.reopenRequest(
+        { requestId: opened.id, note: "It missed the docs." },
+        ownerApp,
+      );
+      assert.strictEqual(reopened.lastReply, "It missed the docs.");
+      assert.deepStrictEqual(reopened.lastReplyBy, { _tag: "owner" });
+      const [view] = (yield* router.ownerRequests({ missionId }, ownerApp)).requests;
+      assert.strictEqual(view!.request.lastReply, "It missed the docs.");
+      assert.strictEqual(view!.request.lastReplyAt, reopened.updatedAt);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the owner settling with a note wakes the master once; without one, nobody", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const quiet = yield* router.openRequest({ missionId, text: "Rename the lane" }, ownerApp);
+      const noted = yield* router.openRequest({ missionId, text: "Drop the old flag" }, ownerApp);
+      yield* masterReads(quiet.roomId);
+      yield* masterReads(noted.roomId);
+      const before = wakesFor(h.sent, masterThread).length;
+      yield* router.settleRequest({ requestId: quiet.id }, ownerApp);
+      assert.strictEqual(wakesFor(h.sent, masterThread).length, before);
+      yield* router.settleRequest(
+        { requestId: noted.id, note: "Done by hand, keep the flag doc." },
+        ownerApp,
+      );
+      const wakes = wakesFor(h.sent, masterThread);
+      assert.strictEqual(wakes.length, before + 1);
+      assert.include(wakes.at(-1)!.text, "keep the flag doc");
+      // Settling again does nothing and wakes nobody.
+      yield* router.settleRequest({ requestId: noted.id, note: "again" }, ownerApp);
+      assert.strictEqual(wakesFor(h.sent, masterThread).length, before + 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("unread counts follow unreadForOwner in every status, not 'answered'", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const reads = makeReads(store, () => null);
+      const views = yield* ViewStore.ViewStore;
+      const counts = Effect.gen(function* () {
+        const overview = (yield* reads.overview(missionId)).requestsAnswered;
+        const listed = (yield* reads.listSnapshot).missions.find((each) => each.id === missionId);
+        return [overview, listed?.requestsAnswered, yield* views.requestsAnswered(missionId)];
+      });
+      const progress = yield* router.openRequest({ missionId, text: "Status on CI?" }, ownerApp);
+      const closed = yield* router.openRequest({ missionId, text: "Close the spike" }, ownerApp);
+      yield* masterReads(progress.roomId);
+      yield* masterReads(closed.roomId);
+      // A progress note (still waiting on the master) and a settle with a note are news.
+      yield* router.replyRequest(
+        { requestId: progress.id, text: "Half the jobs moved.", status: "waiting-on-master" },
+        master,
+      );
+      yield* router.settleRequest({ requestId: closed.id, note: "Spike closed." }, master);
+      assert.deepStrictEqual(yield* counts, [2, 2, 2]);
+      // Reading one clears it.
+      const page = yield* router.roomPage({ roomId: closed.roomId }, ownerApp);
+      yield* router.markRead({ roomId: closed.roomId, seq: page.room.lastSeq }, ownerApp);
+      assert.deepStrictEqual(yield* counts, [1, 1, 1]);
+    }).pipe(Effect.provide(Layer.provideMerge(ViewStore.layer, h.layer)));
+  });
+});
+
+describe("discuss", () => {
+  const ask = { kind: "work-item", id: "wi-free" } as const;
+
+  it.effect("one open request per record; the master reads the record and the whole talk", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const router = yield* MissionRouter.MissionRouter;
+      // Only the owner, only records of this mission, never another request.
+      assert.strictEqual(
+        yield* failureCode(
+          router.openRequest(
+            { missionId, text: "About this", subject: ask, quotedFrom: "his thread" },
+            master,
+          ),
+        ),
+        "invalid",
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.openRequest(
+            { missionId, text: "Elsewhere", subject: { kind: "lane", id: "lane-other" } },
+            ownerApp,
+          ),
+        ),
+        "not-found",
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.openRequest(
+            { missionId, text: "Nothing", subject: { kind: "work-item", id: "wi-missing" } },
+            ownerApp,
+          ),
+        ),
+        "not-found",
+      );
+      const first = yield* router.openRequest(
+        {
+          missionId,
+          text: "Why is this item still free?",
+          subject: { ...ask, label: "a label the client made up" },
+        },
+        ownerApp,
+      );
+      // The label is the record's own, never the client's.
+      assert.deepStrictEqual(first.subject, { ...ask, label: "Item wi-free" });
+      const [opening] = (yield* router.roomPage({ roomId: first.roomId }, ownerApp)).messages;
+      assert.strictEqual(
+        yield* failureCode(
+          router.openRequest(
+            { missionId, text: "Meta", subject: { kind: "message", id: opening!.id } },
+            ownerApp,
+          ),
+        ),
+        "not-found",
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.openRequest(
+            { missionId, text: "Meta", subject: { kind: "owner-request", id: first.id } },
+            ownerApp,
+          ),
+        ),
+        "invalid",
+      );
+      yield* masterReads(first.roomId);
+      yield* router.replyRequest({ requestId: first.id, text: "Nobody picked it." }, master);
+      // Discuss again adds to the same request and wakes the master with all of it.
+      const again = yield* router.openRequest(
+        { missionId, text: "Then give it to the writer lane.", subject: ask },
+        ownerApp,
+      );
+      assert.strictEqual(again.id, first.id);
+      assert.strictEqual(again.status, "waiting-on-master");
+      assert.strictEqual((yield* router.ownerRequests({ missionId }, ownerApp)).requests.length, 1);
+      const wake = wakesFor(h.sent, masterThread).at(-1)!;
+      assert.include(wake.text, "About: work-item wi-free (Item wi-free). Its status now: pr.");
+      assert.include(wake.text, "Why is this item still free?");
+      assert.include(wake.text, "Nobody picked it.");
+      assert.include(wake.text, "Then give it to the writer lane.");
+      // Settled, a new Discuss starts a new request.
+      yield* router.settleRequest({ requestId: first.id }, ownerApp);
+      const fresh = yield* router.openRequest(
+        { missionId, text: "One more question on it.", subject: ask },
+        ownerApp,
+      );
+      assert.notStrictEqual(fresh.id, first.id);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("verify needs the owner's own words in the request about that record", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest(
+        {
+          missionId,
+          text: "Fine to merge it,\n  as long as the  migration runs first. It's not fine to ship it today!",
+          subject: ask,
+        },
+        ownerApp,
+      );
+      yield* router.replyRequest(
+        { requestId: request.id, text: "Merge it whenever you like." },
+        master,
+      );
+      // Moni's chat speaks as the owner, but her words are not his.
+      yield* router.replyRequest(
+        { requestId: request.id, text: "Ship it today." },
+        { _tag: "owner-imessage", chat: "moni", inboundId: "moni-1" },
+      );
+      const conditions = yield* OwnerConditions;
+      const verify = (quote: string, subject: typeof ask | { kind: "work-item"; id: string }) =>
+        conditions.verify({ subject, condition: { requestId: request.id, quote } });
+      // Whole sentences, whitespace and the closing mark aside.
+      yield* verify("Fine to merge it, as long as the migration runs first", ask);
+      yield* verify(
+        "Fine to merge it, as long as the migration runs first. It's not fine to ship it today!",
+        ask,
+      );
+      // A piece of a sentence can drop a "not".
+      assert.strictEqual(yield* failureCode(verify("fine to ship it today", ask)), "forbidden");
+      assert.strictEqual(
+        yield* failureCode(verify("as long as the migration runs first", ask)),
+        "forbidden",
+      );
+      // The master's words are not the owner's, nor are Moni's.
+      assert.strictEqual(
+        yield* failureCode(verify("Merge it whenever you like", ask)),
+        "forbidden",
+      );
+      assert.strictEqual(yield* failureCode(verify("Ship it today.", ask)), "forbidden");
+      // Not what he said.
+      assert.strictEqual(yield* failureCode(verify("merge it now", ask)), "forbidden");
+      // A question is not a condition; an ellipsis does not end his sentence.
+      yield* router.replyRequest(
+        { requestId: request.id, text: "Merge it now? Rebase it... no wait, leave it." },
+        ownerApp,
+      );
+      assert.strictEqual(yield* failureCode(verify("Merge it now", ask)), "forbidden");
+      assert.strictEqual(yield* failureCode(verify("Merge it now?", ask)), "forbidden");
+      assert.strictEqual(yield* failureCode(verify("Rebase it", ask)), "forbidden");
+      yield* verify("Rebase it... no wait, leave it", ask);
+      // Another record.
+      assert.strictEqual(
+        yield* failureCode(
+          verify("Fine to merge it, as long as the migration runs first", {
+            kind: "work-item",
+            id: "wi-held",
+          }),
+        ),
+        "forbidden",
+      );
+      // No such request.
+      assert.strictEqual(
+        yield* failureCode(
+          conditions.verify({
+            subject: ask,
+            condition: { requestId: OwnerRequestId.make("request-nope"), quote: "Fine" },
+          }),
+        ),
+        "forbidden",
+      );
+    }).pipe(Effect.provide(Layer.provideMerge(ownerConditionsOverRouter, h.layer)));
+  });
+
+  it.effect("deciding the record settles its open request without waking anyone", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const conditions = yield* OwnerConditions;
+      const request = yield* router.openRequest(
+        { missionId, text: "Hold this until the audit.", subject: ask },
+        ownerApp,
+      );
+      yield* masterReads(request.roomId);
+      const sent = h.sent.length;
+      // Nothing about another record settles.
+      yield* conditions.settleFor({ subject: { kind: "work-item", id: "wi-held" }, note: null });
+      assert.strictEqual(
+        (yield* router.ownerRequests({ missionId }, ownerApp)).requests[0]!.request.status,
+        "waiting-on-master",
+      );
+      yield* conditions.settleFor({ subject: ask, note: "Decided after the audit passed." });
+      const [view] = (yield* router.ownerRequests({ missionId }, ownerApp)).requests;
+      assert.strictEqual(view!.request.status, "settled");
+      assert.deepStrictEqual(view!.request.settledBy, { _tag: "system", component: "discuss" });
+      assert.strictEqual(view!.request.lastReply, "Decided after the audit passed.");
+      // The note is news for the owner; nobody is woken.
+      assert.strictEqual(view!.request.unreadForOwner, true);
+      assert.strictEqual(h.sent.length, sent);
+      // Again: nothing open, a no-op.
+      yield* conditions.settleFor({ subject: ask, note: null });
+      const events = yield* requestEvents;
+      assert.strictEqual(events.filter((event) => event.kind === "request.settled").length, 1);
+    }).pipe(Effect.provide(Layer.provideMerge(ownerConditionsOverRouter, h.layer)));
+  });
+
+  it.effect("a retried Discuss lands once, even after that request was settled", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const first = yield* router.openRequest(
+        { missionId, text: "Why is this item still free?", subject: ask },
+        ownerApp,
+      );
+      const discuss = { missionId, text: "Give it to the writer lane.", subject: ask, key: "k-1" };
+      const added = yield* router.openRequest(discuss, ownerApp);
+      assert.strictEqual(added.id, first.id);
+      yield* router.settleRequest({ requestId: first.id }, ownerApp);
+      // The retry finds the message it wrote; no second request with the same words.
+      const retried = yield* router.openRequest(discuss, ownerApp);
+      assert.strictEqual(retried.id, first.id);
+      assert.strictEqual((yield* router.ownerRequests({ missionId }, ownerApp)).requests.length, 1);
+      const opened = (yield* requestEvents).filter((event) => event.kind === "request.opened");
+      assert.strictEqual(opened.length, 1);
+      // The timeline names the record by kind and id, never by its words.
+      assert.deepInclude(opened[0]!.payload, { requestId: first.id, about: ask });
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
+describe("who reads a request's words", () => {
+  const wsClient: MissionProvenance = { _tag: "system", component: "ws-client" };
+  const bridge: MissionProvenance = { _tag: "system", component: "spectrum-bridge" };
+
+  it.effect("the owner, the master and the bridge; other readers see states only", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const text = "Is the migration safe to run?";
+      const request = yield* router.openRequest({ missionId, text }, ownerApp);
+      yield* router.replyRequest({ requestId: request.id, text: "Yes, it is." }, master);
+      for (const reader of [ownerApp, master, bridge]) {
+        const [view] = (yield* router.ownerRequests({ missionId }, reader)).requests;
+        assert.strictEqual(view!.request.title, text);
+        assert.strictEqual(view!.messages.length, 2);
+      }
+      const [stripped] = (yield* router.ownerRequests({ missionId }, wsClient)).requests;
+      assert.strictEqual(stripped!.request.title, "Owner request");
+      assert.strictEqual(stripped!.request.lastReply, null);
+      assert.strictEqual(stripped!.request.lastReplyBy, null);
+      assert.strictEqual(stripped!.request.lastReplyAt, null);
+      assert.strictEqual(stripped!.request.status, "answered");
+      assert.strictEqual(stripped!.unreadForOwner, true);
+      assert.deepStrictEqual(stripped!.messages, []);
+      assert.notInclude(JSON.stringify(stripped), "migration");
+      // An owner-paired desk session reads them too.
+      const desk = { _tag: "system", component: "control-api" } as const;
+      assert.strictEqual(
+        (yield* router.ownerRequests({ missionId }, desk, true)).requests[0]!.messages.length,
+        2,
+      );
+      // The room itself is closed to them the same way.
+      const page = yield* router.roomPage({ roomId: request.roomId }, bridge);
+      assert.strictEqual(page.messages.length, 2);
+      assert.strictEqual(
+        yield* failureCode(router.roomPage({ roomId: request.roomId }, wsClient)),
+        "forbidden",
+      );
+      assert.strictEqual(
+        yield* failureCode(router.messageBody({ messageId: page.messages[0]!.id }, wsClient)),
+        "forbidden",
+      );
     }).pipe(Effect.provide(h.layer));
   });
 });

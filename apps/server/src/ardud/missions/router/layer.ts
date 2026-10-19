@@ -9,6 +9,7 @@ import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import { forkParked } from "../../../serverActivation.ts";
 import { TERMINAL_RUN_STATUSES } from "../../control/model.ts";
+import { OwnerConditions } from "../discuss/OwnerConditions.ts";
 import { asksRoomsLayer, asksSignalsLayer } from "./adapters.ts";
 import * as CoordShim from "./coordShim.ts";
 import { installSendGuard, requireSendGuard } from "./guardHook.ts";
@@ -40,6 +41,20 @@ export const RouterServicesLive = CoordShim.layer.pipe(
 export const RouterAsksPortsLive = Layer.mergeAll(asksRoomsLayer, asksSignalsLayer).pipe(
   Layer.provide(RouterServicesLive),
 );
+
+/**
+ * Discuss: owner conditions checked against, and settled with, the router's
+ * owner requests (same router instance).
+ */
+export const OwnerConditionsLive = Layer.effect(
+  OwnerConditions,
+  Effect.map(MissionRouter.MissionRouter, (router) =>
+    OwnerConditions.of({
+      verify: router.verifyOwnerCondition,
+      settleFor: router.settleRequestsFor,
+    }),
+  ),
+).pipe(Layer.provide(RouterServicesLive));
 
 /**
  * What a finished or paused run means for the doorbell: a run that ended

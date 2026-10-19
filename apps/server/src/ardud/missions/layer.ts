@@ -13,7 +13,7 @@ import { PolicyLive } from "./policy/layer.ts";
 import { recoveryRouteLayer } from "./recovery/http.ts";
 import { RecoveryLive } from "./recovery/layer.ts";
 import { coordShimRouteLayer } from "./router/coordHttp.ts";
-import { RouterAsksPortsLive, RouterLive } from "./router/layer.ts";
+import { OwnerConditionsLive, RouterAsksPortsLive, RouterLive } from "./router/layer.ts";
 import { masterFeedLayer } from "./router/masterFeed.ts";
 import { requestsDeskRouteLayer } from "./router/requestsHttp.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
@@ -33,7 +33,7 @@ const MissionTracksLive = Layer.mergeAll(
   // policy builds the same AsksService layer, so it needs the same router ports
   PolicyLive.pipe(Layer.provide(RouterAsksPortsLive)),
   RouterLive,
-);
+).pipe(Layer.provideMerge(OwnerConditionsLive)); // ardud missions: router (discuss)
 
 /**
  * Services built on the tracks: rules, the scribe registered as editor, and

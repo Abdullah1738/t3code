@@ -20,7 +20,9 @@ import {
   type MissionMessageBody,
   type MissionMutationResult,
   type MissionProvenance,
+  type MissionRecordRef,
   type OpenOwnerRequestInput,
+  type OwnerCondition,
   type OwnerRequest,
   type OwnerRequests,
   type OwnerRequestsInput,
@@ -92,7 +94,7 @@ import {
   reminderLine,
   reminderRequestId,
 } from "./reminders.ts";
-import { makeOwnerRequests, type RequestCommit } from "./requests.ts";
+import { makeOwnerRequests, readsRequestWords, type RequestCommit } from "./requests.ts";
 import { requestIdOfRoom } from "./requestsModel.ts";
 import { RouterStore, type DeliveryRow, type RecipientRow } from "./RouterStore.ts";
 
@@ -352,10 +354,14 @@ export class MissionRouter extends Context.Service<
       input: MissionAttentionInput,
       provenance: MissionProvenance,
     ) => Effect.Effect<MissionAttention, MissionError>;
-    /** Owner or master: the owner's requests with their conversations (see requests.ts). */
+    /**
+     * The owner's requests. Words only for the owner, the master and the
+     * iMessage bridge; `ownerSession` marks an owner-paired desk read.
+     */
     readonly ownerRequests: (
       input: OwnerRequestsInput,
       provenance: MissionProvenance,
+      ownerSession?: boolean,
     ) => Effect.Effect<OwnerRequests, MissionError>;
     /** The owner asks the master, or the master opens one quoting the owner. */
     readonly openRequest: (
@@ -374,6 +380,16 @@ export class MissionRouter extends Context.Service<
       input: ReopenOwnerRequestInput,
       provenance: MissionProvenance,
     ) => Effect.Effect<OwnerRequest, MissionError>;
+    /** Discuss: the owner's condition is in his request about the record. */
+    readonly verifyOwnerCondition: (input: {
+      readonly subject: MissionRecordRef;
+      readonly condition: OwnerCondition;
+    }) => Effect.Effect<void, MissionError>;
+    /** Discuss: the record is decided, so the conversation about it settles. */
+    readonly settleRequestsFor: (input: {
+      readonly subject: MissionRecordRef;
+      readonly note: string | null;
+    }) => Effect.Effect<void, MissionError>;
   }
 >()("t3/ardud/missions/router/MissionRouter") {}
 
@@ -517,6 +533,16 @@ const make = Effect.gen(function* () {
           "forbidden",
           "Owner requests are between the owner and the mission's master.",
         );
+      }
+    });
+
+  /** A request room's words: the owner, the master and the iMessage bridge read them. */
+  const requireWordsReader = (room: Room, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      yield* requireRoomReader(room, provenance);
+      if (room.kind !== "owner-request" || provenance._tag === "agent") return;
+      if (!readsRequestWords(provenance)) {
+        return yield* fail("forbidden", "Only the owner and the master read an owner request.");
       }
     });
 
@@ -934,7 +960,7 @@ const make = Effect.gen(function* () {
   const roomPage = (input: RoomPageInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const room = yield* loadRoom(input.roomId);
-      yield* requireRoomReader(room, provenance);
+      yield* requireWordsReader(room, provenance);
       const limit = Math.min(input.limit ?? PAGE_DEFAULT, PAGE_MAX);
       const page = yield* rooms.roomMessages(room.id, input.beforeSeq ?? null, limit);
       const subscriptions = yield* rooms.subscriptions(room.id);
@@ -980,7 +1006,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const message = yield* rooms.messageById(input.messageId);
       if (message === null) return yield* fail("not-found", `No message ${input.messageId}.`);
-      yield* requireRoomReader(yield* loadRoom(message.roomId), provenance);
+      yield* requireWordsReader(yield* loadRoom(message.roomId), provenance);
       const body = yield* rooms.messageBody(message.id);
       return { messageId: message.id, body: body ?? "" } satisfies MissionMessageBody;
     });
@@ -1826,6 +1852,8 @@ const make = Effect.gen(function* () {
     replyRequest: requests.reply,
     settleRequest: requests.settle,
     reopenRequest: requests.reopen,
+    verifyOwnerCondition: requests.verifyCondition,
+    settleRequestsFor: requests.settleFor,
   });
 });
 
