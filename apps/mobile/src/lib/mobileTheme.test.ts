@@ -19,6 +19,7 @@ import {
   createMobileThemeSelectionPatch,
   createMobileThemeVariables,
   DEFAULT_MOBILE_THEME_ID,
+  STANDARD_MOBILE_THEME_ID,
   flattenThemeColor,
   getMobileThemePreviewColors,
   getMobileThemeVariables,
@@ -88,7 +89,7 @@ describe("mobile themes", () => {
           ? T3_CODE_DARK_THEME_COLORS
           : T3_CODE_LIGHT_THEME_COLORS;
       const variables =
-        themeId === DEFAULT_MOBILE_THEME_ID
+        themeId === STANDARD_MOBILE_THEME_ID
           ? readDefaultMobileThemeVariables(appearance)
           : getMobileThemeVariables(themeId, appearance);
       expect(variables["--color-screen"]).toBe(themeColorToNativeColor(colors.canvas));
@@ -108,7 +109,7 @@ describe("mobile themes", () => {
         themeColorToNativeColor(colors.sidebarForeground),
       );
       expect(variables["--color-primary"]).toBe(themeColorToNativeColor(colors.messageAction));
-      if (themeId !== DEFAULT_MOBILE_THEME_ID) {
+      if (themeId !== STANDARD_MOBILE_THEME_ID) {
         expect(variables["--color-user-bubble"]).toBe(
           themeColorToNativeColor(colors.messageSurface),
         );
@@ -183,7 +184,7 @@ describe("mobile themes", () => {
   it.each(MOBILE_THEME_IDS)("separates %s filled groups from their sheets", (themeId) => {
     for (const appearance of ["light", "dark"] as const) {
       const generated = readGeneratedMobileThemeVariables(
-        themeId === DEFAULT_MOBILE_THEME_ID ? appearance : `${themeId}-${appearance}`,
+        themeId === STANDARD_MOBILE_THEME_ID ? appearance : `${themeId}-${appearance}`,
       );
       expect(generated).toEqual(getMobileThemeVariables(themeId, appearance));
       for (const platform of ["ios", "android"]) {
@@ -275,7 +276,7 @@ describe("mobile themes", () => {
         variables[
           themeId === "t3-chat" && appearance === "dark"
             ? "--color-primary-foreground"
-            : themeId === DEFAULT_MOBILE_THEME_ID || themeId === "t3-chat"
+            : themeId === STANDARD_MOBILE_THEME_ID || themeId === "t3-chat"
               ? "--color-foreground"
               : "--color-primary"
         ],
@@ -342,7 +343,7 @@ describe("mobile themes", () => {
   );
 
   it("uses the same preview roles and standard artwork as desktop", () => {
-    expect(getMobileThemePreviewColors(DEFAULT_MOBILE_THEME_ID, "light")).toEqual({
+    expect(getMobileThemePreviewColors(STANDARD_MOBILE_THEME_ID, "light")).toEqual({
       canvas: "#fcfcfc",
       accent: "#f4f4f5",
       messageAction: "#4f46e5",
@@ -358,8 +359,28 @@ describe("mobile themes", () => {
   it("normalizes persisted theme preferences", () => {
     expect(normalizeMobileThemeId("ocean")).toBe("ocean");
     expect(normalizeMobileThemeId("missing-theme")).toBe(DEFAULT_MOBILE_THEME_ID);
+    expect(normalizeMobileThemeId(STANDARD_MOBILE_THEME_ID)).toBe("t3-code");
     expect(normalizeMobileThemeMode("dark")).toBe("dark");
     expect(normalizeMobileThemeMode("sepia")).toBe("system");
+  });
+
+  it("starts a fresh install on Desk and keeps a theme the user already picked", () => {
+    expect(DEFAULT_MOBILE_THEME_ID).toBe("desk");
+    expect(resolveMobileThemeIds({})).toEqual({ light: "desk", dark: "desk" });
+    expect(resolveMobileThemeIds({ themeId: "t3-code" })).toEqual({
+      light: "t3-code",
+      dark: "t3-code",
+    });
+    expect(resolveMobileThemeIds({ lightThemeId: "t3-code", darkThemeId: "grove" })).toEqual({
+      light: "t3-code",
+      dark: "grove",
+    });
+  });
+
+  it("gives Desk teal actions and a quiet grouped card", () => {
+    expect(getMobileThemeVariables("desk", "light")["--color-primary"]).toBe("#1b6e66");
+    expect(getMobileThemeVariables("desk", "light")["--color-grouped-card"]).toBe("#f7f7f5");
+    expect(getMobileThemeVariables("desk", "dark")["--color-primary"]).toBe("#5bc0b3");
   });
 
   it("migrates one theme choice to both appearances and preserves independent choices", () => {
