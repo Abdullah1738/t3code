@@ -138,8 +138,12 @@ describe("lane actions", () => {
 
   it("builds inputs and refuses empty or pointless ones", () => {
     expect(nudgeLaneInput(lane("cell-tc").id, "  ")).toEqual({
-      ok: false,
-      error: "Say what the lane should look at.",
+      ok: true,
+      value: { laneId: "lane-cell-tc" },
+    });
+    expect(nudgeLaneInput(lane("cell-tc").id, " check CI ")).toEqual({
+      ok: true,
+      value: { laneId: "lane-cell-tc", note: "check CI" },
     });
     expect(setLaneParkedInput(lane("cell-tc"), true, " freeze ")).toEqual({
       missionId: CRPKO,

@@ -3,12 +3,12 @@ import type { MissionRecoveryState, Pool, PoolHold, PoolId, PoolView } from "@t3
 import { changeIndex, lastChangedLine } from "./changeLog.ts";
 import type {
   MissionPoolsSnapshot,
-  RecoveryAction,
+  RecoveryCause,
   RecoveryIncident,
-  RecoveryMember,
+  RecoveryThread,
   SetPoolCapacityInput,
 } from "./source.ts";
-import { actorLabel, formatPercent } from "./viewModel.ts";
+import { actorLabel, formatDayLabel, formatPercent, formatTimeOfDay } from "./viewModel.ts";
 
 // Roles tab, part two: shared pools (unit, capacity, scope, holders, queue,
 // advisory or enforced) and restart recovery incidents.
@@ -129,78 +129,82 @@ export function setPoolCapacityInput(
 // ---------------------------------------------------------------------------
 // Recovery
 
-export const RECOVERY_ACTION_LABEL: Record<RecoveryAction, string> = {
-  resume: "Resume",
-  "notice-only": "Notice only",
-  "reconcile-first": "Reconcile first",
-  skip: "Skip",
-};
-
-const CAUSE_LABEL: Record<RecoveryIncident["cause"], string> = {
-  "server-restart": "Server restart",
+const CAUSE_LABEL: Record<RecoveryCause, string> = {
+  "server-restart": "restart",
   "opencode-restart": "OpenCode restart",
-  "run-interrupted": "Run interrupted",
-  succession: "Succession",
+  "run-interrupted": "interrupted runs",
+  succession: "role handoff",
 };
 
-export interface RecoveryMemberRow {
-  readonly member: RecoveryMember;
-  readonly name: string;
-  readonly actionLabel: string;
-  /** "4 children lost, 4 resumed" style summary. */
-  readonly childrenLine: string;
-  readonly settled: boolean;
+const OPEN_STATES: ReadonlySet<RecoveryThread["state"]> = new Set(["pending", "held", "failed"]);
+
+/** "Recovered from restart at 15:37", the clock in the reader's own zone. */
+export function recoveryLabel(cause: RecoveryCause, atIso: string, timeZone?: string): string {
+  return `Recovered from ${CAUSE_LABEL[cause]} at ${formatTimeOfDay(atIso, timeZone)}`;
+}
+
+export interface RecoveryGroup {
+  readonly label: string;
+  /** Lane or thread names in resume order. */
+  readonly names: ReadonlyArray<string>;
 }
 
 export interface RecoveryView {
   readonly incident: RecoveryIncident;
-  readonly causeLabel: string;
-  /** "9 threads: 4 resumed, 5 decided, 0 waiting". */
-  readonly progressLine: string;
-  readonly pending: ReadonlyArray<RecoveryMemberRow>;
-  readonly settled: ReadonlyArray<RecoveryMemberRow>;
-  /** Resume order: the plan, pending members first in their planned order. */
-  readonly resumeRate: string;
+  /** "Sun 4 Oct". */
+  readonly dayLabel: string;
+  /** "15:35 to 15:37, found 15:41". */
+  readonly downLine: string;
+  /** Waiting first, then what happened to each thread; empty groups left out. */
+  readonly groups: ReadonlyArray<RecoveryGroup>;
 }
 
-function memberName(member: RecoveryMember): string {
-  if (member.laneId) return member.laneId.replace(/^lane-/, "");
-  if (member.roleId) return member.roleId;
-  return member.threadId;
+function threadName(thread: RecoveryThread): string {
+  if (thread.laneName) return thread.laneName;
+  if (thread.roleKind === "master") return "master";
+  return thread.title;
 }
 
-export function recoveryView(incident: RecoveryIncident): RecoveryView {
-  const rows = incident.members.map((member): RecoveryMemberRow => {
-    const lost = member.lostChildren.length;
-    return {
-      member,
-      name: memberName(member),
-      actionLabel: RECOVERY_ACTION_LABEL[member.action],
-      childrenLine:
-        lost === 0 ? "No children lost" : `${lost} ${lost === 1 ? "child" : "children"} lost`,
-      settled: member.state !== "pending",
-    };
-  });
-  const resumed = incident.members.filter((member) => member.state === "resumed").length;
-  const decided = incident.members.filter((member) => member.state === "decided").length;
-  const waiting = incident.members.length - resumed - decided;
+function outcome(thread: RecoveryThread): string {
+  if (OPEN_STATES.has(thread.state)) return "Waiting";
+  if (thread.state === "skipped" || thread.action === "skip") return "Skipped";
+  if (thread.state === "decided") return "Decided";
+  if (thread.action === "reconcile-first") return "Reconciled";
+  if (thread.action === "notice-only") return "Told only";
+  return "Resumed";
+}
+
+const OUTCOME_ORDER = ["Waiting", "Resumed", "Reconciled", "Told only", "Skipped", "Decided"];
+
+export function recoveryView(incident: RecoveryIncident, timeZone?: string): RecoveryView {
+  const groups = new Map<string, string[]>();
+  for (const thread of [...incident.threads].sort((a, b) => a.position - b.position)) {
+    const label = outcome(thread);
+    groups.set(label, [...(groups.get(label) ?? []), threadName(thread)]);
+  }
+  const clock = (atIso: string) => formatTimeOfDay(atIso, timeZone);
   return {
     incident,
-    causeLabel: CAUSE_LABEL[incident.cause],
-    progressLine: `${incident.members.length} threads: ${resumed} resumed, ${decided} decided, ${waiting} waiting`,
-    pending: rows.filter((row) => !row.settled),
-    settled: rows.filter((row) => row.settled),
-    resumeRate: `${incident.resumesPerMinute} resumes a minute`,
+    dayLabel: formatDayLabel(incident.detectedAt, timeZone),
+    downLine: `${clock(incident.windowStart)} to ${clock(incident.windowEnd)}, found ${clock(incident.detectedAt)}`,
+    groups: OUTCOME_ORDER.flatMap((label) => {
+      const names = groups.get(label);
+      return names ? [{ label, names }] : [];
+    }),
   };
 }
 
 /**
  * The overview line while a restart incident still has threads to resume or
  * decide, from the contract's `MissionOverview.recovery`; null once none wait.
+ * The clock is the reader's, not the server's `label`.
  */
-export function recoveryBanner(recovery: MissionRecoveryState | null | undefined) {
+export function recoveryBanner(
+  recovery: MissionRecoveryState | null | undefined,
+  timeZone?: string,
+) {
   if (!recovery || recovery.pending === 0) return null;
   const threads = recovery.pending === 1 ? "thread" : "threads";
   const reconcile = recovery.reconcile > 0 ? `, ${recovery.reconcile} to reconcile first` : "";
-  return `${recovery.label}: ${recovery.pending} of ${recovery.total} ${threads} still to resume or decide${reconcile}`;
+  return `${recoveryLabel(recovery.cause, recovery.at, timeZone)}: ${recovery.pending} of ${recovery.total} ${threads} still to resume or decide${reconcile}`;
 }

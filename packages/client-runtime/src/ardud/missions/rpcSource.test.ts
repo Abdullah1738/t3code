@@ -1,6 +1,7 @@
 import {
   MISSIONS_ASKS_WS_METHODS as ASKS,
   MISSIONS_POLICY_WS_METHODS as POLICY,
+  MISSIONS_RECOVERY_WS_METHODS as RECOVERY,
   MISSIONS_VIEWS_WS_METHODS as VIEWS,
   DEFAULT_STARTER_LAYOUT,
   MissionError,
@@ -16,11 +17,18 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
-import { createRpcMissionsSource, poolUsageOf, type MissionsTransport } from "./rpcSource.ts";
+import {
+  CORE_MISSIONS_METHODS,
+  createRpcMissionsSource,
+  poolUsageOf,
+  type MissionsTransport,
+} from "./rpcSource.ts";
 import type {
   MissionOverviewSnapshot,
   MissionRoomEntry,
+  MissionTimelineWindow,
   MissionViewsState,
+  MissionWorkSnapshot,
   OwnerRequest,
   PortfolioSnapshot,
 } from "./source.ts";
@@ -146,25 +154,129 @@ const pool = (fields: {
   }) as unknown as PoolView;
 
 describe("rpc missions source", () => {
-  it("fills feeds without an RPC from the fixture and says which", () => {
-    const { transport } = fakeTransport();
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
-    expect([...source.sampled].sort()).toEqual([
-      "portfolio",
-      "recovery",
-      "suggestion-stats",
-      "timeline",
-      "work",
+  it("serves every feed live and pages work items to the query's limit", async () => {
+    const all = Array.from({ length: 700 }, (_, index) => ({ id: `work-${index}` }));
+    const { transport, live, asked } = fakeTransport({
+      [WS_METHODS.missionsWorkItems]: (input: {
+        readonly offset: number;
+        readonly limit: number;
+      }) => ({
+        missionId: CRPKO,
+        items: all.slice(input.offset, input.offset + input.limit),
+        total: all.length,
+        hasMore: input.offset + input.limit < all.length,
+      }),
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    expect([...source.sampled]).toEqual([]);
+
+    const work = collect<MissionWorkSnapshot>((listener) =>
+      source.subscribeWork(CRPKO, listener, {
+        laneId: "lane-a" as Lane["id"],
+        stages: ["pr", "review"],
+        limit: 600,
+      }),
+    );
+    await settle();
+    expect(asked(WS_METHODS.missionsWorkItems).map((request) => request.input)).toEqual([
+      { missionId: CRPKO, laneId: "lane-a", stages: ["pr", "review"], offset: 0, limit: 500 },
+      { missionId: CRPKO, laneId: "lane-a", stages: ["pr", "review"], offset: 500, limit: 100 },
     ]);
-    // A mission the fixture does not know reads the fixture's first mission.
-    const work = collect<{ readonly missionId: MissionId }>((listener) =>
-      source.subscribeWork(LIVE, listener),
+    expect(work.last()).toMatchObject({ missionId: CRPKO, total: 700, hasMore: true });
+    expect(work.last()?.items).toHaveLength(600);
+
+    // The same query shares the read; a work event reads it again.
+    const again = collect<MissionWorkSnapshot>((listener) =>
+      source.subscribeWork(CRPKO, listener, {
+        laneId: "lane-a" as Lane["id"],
+        stages: ["pr", "review"],
+        limit: 600,
+      }),
     );
-    expect(work.last()?.missionId).toBe(CRPKO);
-    const own = collect<{ readonly missionId: MissionId }>((listener) =>
-      source.subscribeWork(CRPKO, listener),
+    expect(asked(WS_METHODS.missionsWorkItems)).toHaveLength(2);
+    expect(again.last()?.items).toHaveLength(600);
+    const [stream] = live(WS_METHODS.missionsSubscribe);
+    stream?.push({ _tag: "overview", seq: 1, overview: fixtureOverview() });
+    stream?.push({
+      _tag: "upsert",
+      missionId: CRPKO,
+      seq: 2,
+      record: { _tag: "event", record: event("work-item.updated", { kind: "work", id: "work-1" }) },
+    });
+    await settle();
+    expect(asked(WS_METHODS.missionsWorkItems)).toHaveLength(4);
+    work.close();
+    again.close();
+  });
+
+  it("pages the timeline by seq, keeps the server's group and merges new events", async () => {
+    const entry = (eventSeq: number, group: string) => ({
+      event: { ...event("lane.parked", null), id: `ev-${eventSeq}`, seq: eventSeq },
+      group,
+    });
+    const { transport, live, asked } = fakeTransport({
+      [WS_METHODS.missionsTimeline]: (input: { readonly beforeSeq?: number }) =>
+        input.beforeSeq === undefined
+          ? { missionId: CRPKO, entries: [entry(12, "lane"), entry(11, "lane")], hasOlder: true }
+          : { missionId: CRPKO, entries: [entry(10, "other")], hasOlder: false },
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const window = collect<MissionTimelineWindow>((listener) =>
+      source.subscribeTimelineWindow(CRPKO, listener),
     );
-    expect(own.last()?.missionId).toBe(CRPKO);
+    await settle();
+    expect(window.last()?.events.map((item) => item.seq)).toEqual([12, 11]);
+    expect(window.last()?.hasOlder).toBe(true);
+
+    await source.loadOlderTimeline(CRPKO);
+    expect(asked(WS_METHODS.missionsTimeline).map((request) => request.input)).toEqual([
+      { missionId: CRPKO, limit: 200 },
+      { missionId: CRPKO, limit: 200, beforeSeq: 11 },
+    ]);
+    expect(window.last()?.events.map((item) => [item.seq, item.group])).toEqual([
+      [12, "lane"],
+      [11, "lane"],
+      [10, "other"],
+    ]);
+    expect(window.last()?.hasOlder).toBe(false);
+
+    const [stream] = live(WS_METHODS.missionsSubscribe);
+    stream?.push({ _tag: "overview", seq: 1, overview: fixtureOverview() });
+    stream?.push({
+      _tag: "upsert",
+      missionId: CRPKO,
+      seq: 2,
+      record: { _tag: "event", record: { ...event("rule.applied", null), seq: 13 } },
+    });
+    expect(window.last()?.events.map((item) => item.seq)).toEqual([13, 12, 11, 10]);
+    expect(asked(WS_METHODS.missionsTimeline)).toHaveLength(2);
+    window.close();
+  });
+
+  it("reads recovery incidents and suggestion stats from the server", async () => {
+    const incident = { id: "incident-1", missionIds: [CRPKO], threads: [] };
+    const { transport, live, asked } = fakeTransport({
+      [RECOVERY.incidents]: () => [incident],
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const recovery = collect<ReadonlyArray<unknown>>((listener) =>
+      source.subscribeRecovery(CRPKO, listener),
+    );
+    await settle();
+    expect(asked(RECOVERY.incidents).map((request) => request.input)).toEqual([
+      { missionId: CRPKO },
+    ]);
+    expect(recovery.last()).toEqual([incident]);
+
+    const stats = collect<ReadonlyArray<unknown>>((listener) =>
+      source.subscribeSuggestionStats(listener),
+    );
+    const [statsStream] = live(ASKS.subscribeSuggestionStats);
+    expect(statsStream?.input).toEqual({ missionId: null });
+    statsStream?.push([{ missionId: CRPKO }]);
+    expect(stats.last()).toEqual([{ missionId: CRPKO }]);
+    recovery.close();
+    stats.close();
   });
 
   it("shares one mission stream between overview and lanes and folds lane and event deltas", async () => {
@@ -180,7 +292,7 @@ describe("rpc missions source", () => {
         at: "2026-10-18T09:00:00.000Z",
       }),
     });
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
 
     const overviews = collect<MissionOverviewSnapshot | null>((listener) =>
       source.subscribeOverview(CRPKO, listener),
@@ -242,7 +354,7 @@ describe("rpc missions source", () => {
 
   it("reports a mission the server does not have as missing", () => {
     const { transport, live } = fakeTransport();
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
     const overviews = collect<MissionOverviewSnapshot | null>((listener) =>
       source.subscribeOverview(LIVE, listener),
     );
@@ -260,7 +372,7 @@ describe("rpc missions source", () => {
         return { missionId: CRPKO, roles: [], defaults: [], bindings: [], drift: [] };
       },
     });
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
     const roles = collect<unknown>((listener) => source.subscribeRoles(CRPKO, listener));
     await settle();
     expect(reads).toBe(1);
@@ -313,7 +425,7 @@ describe("rpc missions source", () => {
         return { roomId: ROOM, seq: input.seq };
       },
     });
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
     const rooms = collect<ReadonlyArray<MissionRoomEntry>>((listener) =>
       source.subscribeRooms(CRPKO, listener),
     );
@@ -328,48 +440,42 @@ describe("rpc missions source", () => {
     expect(rooms.last()?.map((entry) => entry.unread)).toEqual([0]);
   });
 
-  it("builds the portfolio from the live missions until the server serves it", async () => {
-    const overview = fixtureOverview();
-    const { transport, live } = fakeTransport();
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
-    const portfolio = collect<PortfolioSnapshot>((listener) => source.subscribePortfolio(listener));
-
-    const [list] = live(WS_METHODS.missionsSubscribeList);
-    list?.push({
-      _tag: "list",
-      snapshot: {
-        revision: 1,
-        missions: [
-          { id: CRPKO, status: "active" },
-          { id: LIVE, status: "archived" },
-        ],
+  it("reads the portfolio from the server and reorders it", async () => {
+    let order = [CRPKO, LIVE];
+    const { transport, live, asked } = fakeTransport({
+      [CORE_MISSIONS_METHODS.portfolio]: () => ({
+        order,
+        missions: [],
+        changes: [],
+        orderChange: null,
+      }),
+      [CORE_MISSIONS_METHODS.setPortfolioOrder]: (input: { readonly order: MissionId[] }) => {
+        order = input.order;
+        return {};
       },
     });
-    // Waits for every live mission's overview; archived missions are left out.
-    expect(live(WS_METHODS.missionsSubscribe).map((stream) => stream.input)).toEqual([
-      { missionId: CRPKO },
-    ]);
-    expect(portfolio.seen).toEqual([]);
+    const source = createRpcMissionsSource({ transport, now });
+    const portfolio = collect<PortfolioSnapshot>((listener) => source.subscribePortfolio(listener));
+    await settle();
+    expect(portfolio.last()?.order).toEqual([CRPKO, LIVE]);
 
-    live(WS_METHODS.missionsSubscribe)[0]?.push({
-      _tag: "overview",
-      seq: 1,
-      overview: { ...overview, usageShare: 0.5 },
+    // A moving mission list reads it again.
+    live(WS_METHODS.missionsSubscribeList)[0]?.push({
+      _tag: "list",
+      snapshot: { revision: 2, missions: [] },
     });
-    const snapshot = portfolio.last();
-    expect(snapshot?.order).toEqual([CRPKO]);
-    expect(snapshot?.missions[0]).toMatchObject({
-      missionId: CRPKO,
-      title: overview.mission.title,
-      guaranteedShare: overview.mission.guaranteedShare,
-      usedShare: 0.5 * overview.mission.guaranteedShare,
-      pools: [],
+    await settle();
+    expect(asked(CORE_MISSIONS_METHODS.portfolio)).toHaveLength(2);
+
+    await source.setPortfolioOrder({ order: [LIVE, CRPKO] });
+    await settle();
+    expect(asked(CORE_MISSIONS_METHODS.setPortfolioOrder).at(-1)?.input).toEqual({
+      order: [LIVE, CRPKO],
     });
-    await expect(source.setPortfolioOrder({ order: [CRPKO] })).rejects.toBeInstanceOf(MissionError);
+    expect(portfolio.last()?.order).toEqual([LIVE, CRPKO]);
 
     portfolio.close();
     expect(live(WS_METHODS.missionsSubscribeList)).toHaveLength(0);
-    expect(live(WS_METHODS.missionsSubscribe)).toHaveLength(0);
   });
 
   it("takes unread counts from the room list when the router sends them", async () => {
@@ -377,7 +483,7 @@ describe("rpc missions source", () => {
     const { transport, asked } = fakeTransport({
       [WS_METHODS.missionsRooms]: () => [room],
     });
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
     const rooms = collect<ReadonlyArray<MissionRoomEntry>>((listener) =>
       source.subscribeRooms(CRPKO, listener),
     );
@@ -445,7 +551,7 @@ describe("rpc missions source", () => {
       [WS_METHODS.missionsSettleOwnerRequest]: () => record(),
       [WS_METHODS.missionsReopenOwnerRequest]: () => record(),
     });
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
     const requests = collect<ReadonlyArray<OwnerRequest>>((listener) =>
       source.subscribeRequests(CRPKO, listener),
     );
@@ -509,8 +615,10 @@ describe("rpc missions source", () => {
       [WS_METHODS.missionsReactToCall]: () => ({ id: "call-1", missionId: CRPKO }),
       [ASKS.routeDraft]: () => ({}),
       [WS_METHODS.missionsRouteApproval]: () => ({ seq: 1 }),
+      [CORE_MISSIONS_METHODS.nudgeLane]: () => ({}),
+      [POLICY.handOffLane]: () => ({}),
     });
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
 
     await source.setMissionPaused({ missionId: CRPKO, paused: true });
     expect(asked(WS_METHODS.missionsSetStatus).at(-1)?.input).toEqual({
@@ -558,10 +666,16 @@ describe("rpc missions source", () => {
       reason: "mine",
     });
 
-    await expect(
-      source.nudgeLane({ laneId: "lane-a" as Lane["id"], note: "go" }),
-    ).rejects.toMatchObject({
-      code: "invalid",
+    await source.nudgeLane({ laneId: "lane-a" as Lane["id"], note: "go" });
+    await source.nudgeLane({ laneId: "lane-a" as Lane["id"] });
+    expect(asked(CORE_MISSIONS_METHODS.nudgeLane).map((request) => request.input)).toEqual([
+      { laneId: "lane-a", note: "go" },
+      { laneId: "lane-a" },
+    ]);
+    await source.handOffLane({ laneId: "lane-a" as Lane["id"], note: "pick up CRP-1" });
+    expect(asked(POLICY.handOffLane).at(-1)?.input).toEqual({
+      laneId: "lane-a",
+      handoffNote: "pick up CRP-1",
     });
   });
 
@@ -569,7 +683,7 @@ describe("rpc missions source", () => {
     const { transport, live, asked } = fakeTransport({
       [VIEWS.editLayout]: () => ({ ok: true }),
     });
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
     const views = collect<MissionViewsState | null>((listener) =>
       source.subscribeViews(CRPKO, listener),
     );
@@ -633,7 +747,7 @@ describe("rpc missions source", () => {
 
   it("shows the starter layout when the server has no views track", () => {
     const { transport, live } = fakeTransport();
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
     const views = collect<MissionViewsState | null>((listener) =>
       source.subscribeViews(LIVE, listener),
     );
@@ -650,7 +764,7 @@ describe("rpc missions source", () => {
 
   it("keeps master counts at zero", () => {
     const { transport, live } = fakeTransport();
-    const source = createRpcMissionsSource({ transport, fallback: fixture(), now });
+    const source = createRpcMissionsSource({ transport, now });
     const inbox = collect<{ readonly masterCounts: unknown }>((listener) =>
       source.subscribeInbox(null, listener),
     );

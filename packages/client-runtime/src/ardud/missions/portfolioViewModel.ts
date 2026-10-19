@@ -1,8 +1,7 @@
-import type { Mission, MissionActor, MissionId, MissionTier } from "@t3tools/contracts";
+import type { MissionActor, MissionId, MissionTier } from "@t3tools/contracts";
 
 import { changeIndex, lastChangedLine } from "./changeLog.ts";
 import type {
-  FieldChange,
   PortfolioMission,
   PortfolioPoolDraw,
   PortfolioSnapshot,
@@ -122,42 +121,6 @@ function orderActorLabel(actor: MissionActor, missions: ReadonlyArray<PortfolioM
   const master =
     actor._tag === "role" ? missions.find((m) => m.masterRoleId === actor.roleId) : undefined;
   return actorLabel(actor, master?.masterRoleId ?? null);
-}
-
-const TIER_RANK: Record<MissionTier, number> = { P0: 0, P1: 1, P2: 2 };
-
-/**
- * A portfolio built from the missions themselves, for servers without the
- * portfolio read (core r6): tier then weight order, usage from each overview,
- * no pool draws and no recorded reorder.
- */
-export function portfolioFromMissions(
-  missions: ReadonlyArray<{ readonly mission: Mission; readonly usageShare: number | null }>,
-  changes: ReadonlyArray<FieldChange> = [],
-): PortfolioSnapshot {
-  const ordered = [...missions].sort(
-    (left, right) =>
-      TIER_RANK[left.mission.tier] - TIER_RANK[right.mission.tier] ||
-      right.mission.weight - left.mission.weight ||
-      left.mission.title.localeCompare(right.mission.title),
-  );
-  return {
-    order: ordered.map(({ mission }) => mission.id),
-    missions: ordered.map(({ mission, usageShare }): PortfolioMission => ({
-      missionId: mission.id,
-      title: mission.title,
-      status: mission.status,
-      tier: mission.tier,
-      masterRoleId: mission.masterRoleId,
-      guaranteedShare: mission.guaranteedShare,
-      borrowCeiling: mission.borrowCeiling,
-      // The overview measures use against the guaranteed share.
-      usedShare: usageShare === null ? null : usageShare * mission.guaranteedShare,
-      pools: [],
-    })),
-    changes,
-    orderChange: null,
-  };
 }
 
 /** Move `missionId` to sit where `overId` is; refuses anything that isn't a full reorder. */

@@ -194,51 +194,53 @@ describe("pools and recovery view model", () => {
     pools.close();
   });
 
-  it("reads the 4 Oct restart and shows the banner only while threads are waiting", () => {
+  it("reads the 4 Oct restart as the Last restart panel, in the reader's zone", () => {
     const missions = source();
     const incidents = live<ReadonlyArray<RecoveryIncident>>((l) =>
       missions.subscribeRecovery(CRPKO, l),
     );
     const incident = incidents.value[0];
     if (!incident) throw new Error("no incident");
-    const view = recoveryView(incident);
-    expect(view.causeLabel).toBe("Server restart");
-    expect(view.progressLine).toBe("9 threads: 4 resumed, 5 decided, 0 waiting");
-    expect(view.settled[0]).toMatchObject({ name: "cell-tc2", childrenLine: "4 children lost" });
-    expect(recoveryBanner(null)).toBeNull();
+    const view = recoveryView(incident, "UTC");
+    expect(view.dayLabel).toBe("Sun 4 Oct");
+    expect(view.downLine).toBe("15:35 to 15:37, found 15:41");
+    expect(view.groups).toEqual([
+      { label: "Resumed", names: ["cell-tc2", "cell-md", "cell-devops2", "cell-bo"] },
+      { label: "Reconciled", names: ["arch"] },
+      { label: "Told only", names: ["cell-risk", "cell-edge"] },
+      { label: "Skipped", names: ["cell-tc", "cell-ws"] },
+    ]);
+    expect(recoveryView(incident, "Asia/Dubai").downLine).toBe("19:35 to 19:37, found 19:41");
 
     const open: RecoveryIncident = {
       ...incident,
-      status: "open",
-      members: incident.members.map((member, index) =>
-        index < 2 ? { ...member, state: "pending", settledAt: null } : member,
+      clearedAt: null,
+      threads: incident.threads.map((thread, index) =>
+        index < 2 ? { ...thread, state: "pending", noticeAt: null } : thread,
       ),
     };
-    expect(
-      recoveryBanner({
-        incidentId: open.id,
-        cause: open.cause,
-        at: open.detectedAt,
-        label: "Recovered from restart at 15:41",
-        total: 9,
-        pending: 2,
-        reconcile: 1,
-      }),
-    ).toBe(
-      "Recovered from restart at 15:41: 2 of 9 threads still to resume or decide, 1 to reconcile first",
-    );
-    expect(
-      recoveryBanner({
-        incidentId: open.id,
-        cause: open.cause,
-        at: open.detectedAt,
-        label: "Recovered from restart at 15:41",
-        total: 9,
-        pending: 0,
-        reconcile: 0,
-      }),
-    ).toBeNull();
-    expect(recoveryView(open).pending.map((row) => row.name)).toEqual(["cell-tc2", "cell-md"]);
+    expect(recoveryView(open, "UTC").groups[0]).toEqual({
+      label: "Waiting",
+      names: ["cell-tc2", "cell-md"],
+    });
     incidents.close();
+  });
+
+  it("writes the restart banner in the reader's zone, not the server's label", () => {
+    const state = {
+      incidentId: "recovery-2026-10-04",
+      cause: "server-restart" as const,
+      at: "2026-10-04T15:37:00.000Z",
+      // The server formats its label in the owner's zone.
+      label: "Recovered from restart at 19:37",
+      total: 9,
+      pending: 2,
+      reconcile: 1,
+    };
+    expect(recoveryBanner(state, "UTC")).toBe(
+      "Recovered from restart at 15:37: 2 of 9 threads still to resume or decide, 1 to reconcile first",
+    );
+    expect(recoveryBanner({ ...state, pending: 0 }, "UTC")).toBeNull();
+    expect(recoveryBanner(null)).toBeNull();
   });
 });

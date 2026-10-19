@@ -1344,32 +1344,49 @@ export const reroutes = [
 /** 4 Oct, to the second. */
 const t = (time: string) => `2026-10-04T${time}.000Z`;
 
+let position = 0;
+
+/** One lane thread the restart cut; settled threads were sent their notice at `noticeAt`. */
 const member = (
   name: string,
   action: string,
-  why: string,
+  reason: string,
   state: string,
-  settledAt: string | null,
+  noticeAt: string | null,
   lostChildren: ReadonlyArray<unknown> = [],
-  holds: ReadonlyArray<string> = [],
+  holds: ReadonlyArray<unknown> = [],
 ) => ({
-  roleId: laneRoleId(name),
-  laneId: `lane-${name}`,
+  missionId: CRPKO,
   threadId: laneDetails[name]?.thread ?? `lane-${name}`,
+  title: name,
+  roleId: laneRoleId(name),
+  roleKind: "lane-lead",
+  laneId: `lane-${name}`,
+  laneName: name,
+  subMissionId: null,
+  position: position++,
   cutRunId: null,
+  lastActivity: null,
   lastActivityAt: t("15:34:00"), // made
+  serverContinued: false,
+  interruptReason: null,
+  handoffFrom: null,
   lostChildren,
   holds,
   action,
-  why,
+  reason,
   state,
-  settledAt,
+  stateReason: null,
+  instruction: null,
+  noticeAt,
+  decidedBy: state === "skipped" ? { _tag: "role", roleId: ROLE_MASTER } : null,
 });
 
-const child = (title: string, sessionId: string | null, lastStatus: string, doing: string) => ({
+const child = (title: string, ref: string | null, lastStatus: string, doing: string) => ({
   title,
-  sessionId,
   kind: "native-subagent",
+  ref,
+  childThreadId: null,
   lastStatus,
   doing,
 });
@@ -1379,11 +1396,14 @@ export const recoveryIncidents = [
   {
     id: "recovery-2026-10-04",
     cause: "server-restart",
+    source: "missions-recovery",
     detectedAt: t("15:41:48"),
-    window: { from: t("15:35:00"), to: t("15:37:00") },
+    windowStart: t("15:35:00"),
+    windowEnd: t("15:37:00"),
+    downSeconds: 120,
     missionIds: [CRPKO],
-    members: [
-      member("cell-tc2", "resume", "Four children cancelled mid-round.", "resumed", t("15:44:19"), [
+    threads: [
+      member("cell-tc2", "resume", "Four children cancelled mid-round.", "sent", t("15:44:19"), [
         child("#148 CRP-12053 r1 fix", null, "cancelled", "r1 fix worker"),
         child("CRP-11575 r1 fix", null, "cancelled", "r1 fix worker"),
         child("#94 CRP-9766 r1 fix", null, "cancelled", "r1 fix worker"),
@@ -1393,7 +1413,7 @@ export const recoveryIncidents = [
         "cell-md",
         "resume",
         "Three children cut off; resumed by session id.",
-        "resumed",
+        "sent",
         t("16:08:06"),
         [
           child("TC#151 r2 Astra", "ses_ef883193", "cancelled", "Astra r2 at e29fa89"),
@@ -1405,7 +1425,7 @@ export const recoveryIncidents = [
         "cell-devops2",
         "resume",
         "Nine cancelled children relaunched fresh.",
-        "resumed",
+        "sent",
         t("15:43:49"),
         [
           child("Astra 11348 r1", null, "cancelled", "Astra r1"),
@@ -1423,7 +1443,7 @@ export const recoveryIncidents = [
         "cell-bo",
         "resume",
         "#259 r1 fix worker resumed in its own session.",
-        "resumed",
+        "sent",
         t("15:57:26"),
         [child("#259 CRP-11428 r1 fix", null, "cancelled", "r1 fix worker at 74859307")],
       ),
@@ -1431,7 +1451,7 @@ export const recoveryIncidents = [
         "cell-tc",
         "skip",
         "TC#150 fix worker had finished its edits; verified and committed e731643d instead.",
-        "decided",
+        "skipped",
         t("15:47:34"),
         [child("TC#150 r1 fix", "ses_ef8f8981", "cancelled", "r1 fix worker, edits complete")],
       ),
@@ -1439,7 +1459,7 @@ export const recoveryIncidents = [
         "cell-ws",
         "skip",
         "Both R6 findings were declined as pedantic; nothing to relaunch.",
-        "decided",
+        "skipped",
         t("15:42:05"),
         [child("devops#561 r6 fix", null, "cancelled", "r6 fix worker")],
       ),
@@ -1447,16 +1467,24 @@ export const recoveryIncidents = [
         "arch",
         "reconcile-first",
         "Holds arch:broker fence 7; check the claim before resuming.",
-        "decided",
+        "sent",
         t("15:45:52"),
         [],
-        ["hold-arch-broker-7"],
+        [
+          {
+            holdId: "hold-arch-broker-7",
+            poolId: "pool-arch-broker",
+            purpose: "arch:broker fence 7",
+            status: "active",
+            leaseExpiresAt: null,
+            reconcileRequired: true,
+          },
+        ],
       ),
-      member("cell-risk", "notice-only", "No children were running.", "decided", t("15:43:49")),
-      member("cell-edge", "notice-only", "No children were running.", "decided", t("15:43:44")),
+      member("cell-risk", "notice-only", "No children were running.", "sent", t("15:43:49")),
+      member("cell-edge", "notice-only", "No children were running.", "sent", t("15:43:44")),
     ],
-    resumesPerMinute: 4, // made
-    status: "cleared",
+    clearedAt: t("16:08:06"),
   },
 ];
 

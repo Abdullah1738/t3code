@@ -1,7 +1,6 @@
 import {
   MissionEventKind,
   type DirectionCheckItem,
-  type Mission,
   type MissionActor,
   type MissionEventId,
   type MissionId,
@@ -17,17 +16,14 @@ import {
   newestChange,
 } from "./changeLog.ts";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
-import {
-  portfolioFromMissions,
-  portfolioView,
-  reorderPortfolioInput,
-} from "./portfolioViewModel.ts";
+import { portfolioView, reorderPortfolioInput } from "./portfolioViewModel.ts";
 import type { MissionTimelineEvent, PortfolioSnapshot } from "./source.ts";
 import {
   actorChoices,
   consequences,
   directionCheckRows,
   EMPTY_TIMELINE_FILTER,
+  eventGroup,
   eventKicker,
   eventKindLabel,
   filterTimeline,
@@ -154,6 +150,16 @@ describe("timeline view model", () => {
     expect(eventKicker("role.succession")).toBe("Succession");
     expect(eventKicker("pool.hold-taken")).toBe("Hold");
     expect(eventKindLabel("role.model-changed")).toBe("Role model changed");
+  });
+
+  it("files a kind this client does not know under the server's group", () => {
+    const base = { kind: "deploy.finished" } as unknown as MissionTimelineEvent;
+    expect(eventGroup(base)).toBe("other");
+    expect(eventGroup({ ...base, group: "pool" })).toBe("pool");
+    // A kind the client knows keeps the client's finer group.
+    expect(eventGroup({ ...base, kind: "work-item.updated", group: "other" })).toBe("work");
+    const choices = kindChoices([{ ...base, group: "pool" }]);
+    expect(choices.map((choice) => choice.value)).toEqual(["pool"]);
   });
 
   it("folds an import and a repeated boot line into one line each, under day heads", () => {
@@ -310,31 +316,5 @@ describe("portfolio view model", () => {
       code: "invalid",
     });
     portfolio.close();
-  });
-
-  it("orders live missions by tier then weight when the server has no portfolio", () => {
-    const base = {
-      status: "active",
-      masterRoleId: null,
-      guaranteedShare: 0.4,
-      borrowCeiling: 0.8,
-    } as const;
-    const mission = (id: string, tier: "P0" | "P1" | "P2", weight: number) =>
-      ({ ...base, id, title: id, tier, weight }) as unknown as Mission;
-    const snapshot = portfolioFromMissions([
-      { mission: mission("background", "P2", 9), usageShare: null },
-      { mission: mission("light", "P1", 1), usageShare: 0.5 },
-      { mission: mission("heavy", "P1", 5), usageShare: 1.5 },
-      { mission: mission("top", "P0", 1), usageShare: 0 },
-    ]);
-    expect(snapshot.order).toEqual(["top", "heavy", "light", "background"]);
-    expect(snapshot.orderChange).toBeNull();
-    const rows = portfolioView(snapshot).rows;
-    expect(rows.map((row) => row.usedLine)).toEqual([
-      "Using 0%: borrowing 0%",
-      "Using 60%: borrowing 20%",
-      "Using 20%: borrowing 0%",
-      "Not measured yet",
-    ]);
   });
 });

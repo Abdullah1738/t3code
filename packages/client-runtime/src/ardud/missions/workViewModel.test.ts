@@ -67,11 +67,12 @@ describe("blocked work", () => {
     expect(groups[0]?.holder).toBe("you");
     expect(groups[0]?.items.map((entry) => entry.item.id)).toEqual(["CRP-13215"]);
     expect(groups[0]?.items[0]?.waitingOn).toMatch(/^Waiting on /);
+    // Items keep the feed's order: most recently changed first.
     const master = groups.find((group) => group.holder === "master");
     expect(master?.items.map((entry) => entry.item.id)).toEqual([
-      "CRP-13328-deploy",
       "kafka-d2",
       "ingestor-dev2",
+      "CRP-13328-deploy",
     ]);
   });
 

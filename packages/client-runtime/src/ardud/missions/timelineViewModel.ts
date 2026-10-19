@@ -105,6 +105,12 @@ export function kindGroup(kind: string): TimelineKindGroup {
   return PREFIXES[prefixOf(kind)]?.group ?? "other";
 }
 
+/** An event's group: the client's own for kinds it knows, else the server's. */
+export function eventGroup(event: MissionTimelineEvent): TimelineKindGroup {
+  const group = kindGroup(event.kind);
+  return group === "other" && event.group !== undefined ? event.group : group;
+}
+
 /** The kicker a row shows for its kind: "Lane", "Hold", "Succession". */
 export function eventKicker(kind: string): string {
   const known = KIND_KICKER[kind] ?? PREFIXES[prefixOf(kind)]?.kicker;
@@ -128,7 +134,7 @@ export function filterTimeline(
 ): MissionTimelineEvent[] {
   return events.filter(
     (event) =>
-      (filter.groups.length === 0 || filter.groups.includes(kindGroup(event.kind))) &&
+      (filter.groups.length === 0 || filter.groups.includes(eventGroup(event))) &&
       (filter.actors.length === 0 || filter.actors.includes(actorKey(event.actor))),
   );
 }
@@ -149,7 +155,7 @@ export function kindChoices(
 ): FilterChoice<TimelineKindGroup>[] {
   const counts = new Map<TimelineKindGroup, number>();
   for (const event of events) {
-    const group = kindGroup(event.kind);
+    const group = eventGroup(event);
     counts.set(group, (counts.get(group) ?? 0) + 1);
   }
   return [...counts]
@@ -336,7 +342,7 @@ export function timelineRows(
       event,
       kicker: eventKicker(event.kind),
       summary,
-      group: kindGroup(event.kind),
+      group: eventGroup(event),
       by,
       actor: actorLabel(actor, masterRoleId),
       count: run.length,

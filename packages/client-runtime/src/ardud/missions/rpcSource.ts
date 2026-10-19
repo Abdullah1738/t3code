@@ -1,6 +1,7 @@
 import {
   MISSIONS_ASKS_WS_METHODS as ASKS,
   MISSIONS_POLICY_WS_METHODS as POLICY,
+  MISSIONS_RECOVERY_WS_METHODS as RECOVERY,
   MISSIONS_VIEWS_WS_METHODS as VIEWS,
   DEFAULT_STARTER_LAYOUT,
   MissionError,
@@ -26,11 +27,14 @@ import {
   type OwnerRequestView,
   type PoolView,
   type PoolsSnapshot,
+  type RecoveryIncident,
   type Room,
   type RoomId,
   type RoomPage,
   type Rule,
   type RuleChangeRequest,
+  type SuggestionStats,
+  type WorkItem,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -39,7 +43,6 @@ import type * as Stream from "effect/Stream";
 import type { EnvironmentRpcSuccess, EnvironmentUnaryRpcTag } from "../../rpc/client.ts";
 import type { WsRpcProtocolClient } from "../../rpc/protocol.ts";
 import { latestFieldChanges } from "./changeLog.ts";
-import { portfolioFromMissions } from "./portfolioViewModel.ts";
 import { listedRoomUnread, pageUnread } from "./roomsViewModel.ts";
 import type {
   FieldChange,
@@ -47,18 +50,22 @@ import type {
   MissionInboxSnapshot,
   MissionPoolUsage,
   MissionRoomEntry,
+  MissionTimelineEvent,
+  MissionTimelineWindow,
   MissionViewChange,
   MissionViewsState,
+  MissionWorkSnapshot,
   MissionsSource,
   OwnerRequest,
   OwnerRequestStatus,
+  PortfolioSnapshot,
   SampledFeed,
   Unsubscribe,
+  WorkQuery,
 } from "./source.ts";
 
-// The missions source over the server's WS RPCs. Everything with an RPC is
-// live; the feeds the server does not serve yet come from the fallback (the
-// fixture) and are listed in `sampled` so their sections can say so.
+// The missions source over the server's WS RPCs. Every feed is live; sample
+// data lives only in the fixture source.
 //
 // The transport is injected so this file stays plain TypeScript: the web
 // client passes the Effect/atom transport from `rpcTransport.ts`, tests pass a
@@ -72,6 +79,7 @@ export type MissionsStreamTag =
   | typeof ASKS.subscribeRules
   | typeof ASKS.subscribeDraftNotes
   | typeof ASKS.subscribeRouting
+  | typeof ASKS.subscribeSuggestionStats
   | typeof VIEWS.subscribe;
 
 export type MissionsRequestTag = Exclude<EnvironmentUnaryRpcTag, MissionsStreamTag>;
@@ -106,19 +114,30 @@ export interface MissionsTransport {
 
 export interface RpcMissionsSourceOptions {
   readonly transport: MissionsTransport;
-  /** Serves the feeds the server has no RPC for yet. */
-  readonly fallback: MissionsSource;
+  /** Unused: every feed is live. Callers that still pass the fixture keep compiling. */
+  readonly fallback?: MissionsSource;
   readonly now?: () => number;
 }
 
-/** Feeds the RPC source fills from the fallback. */
-export const RPC_SAMPLED_FEEDS: ReadonlySet<SampledFeed> = new Set<SampledFeed>([
-  "work",
-  "timeline",
-  "portfolio",
-  "suggestion-stats",
-  "recovery",
-]);
+/** Every feed is live, so nothing reads as sample. */
+export const RPC_SAMPLED_FEEDS: ReadonlySet<SampledFeed> = new Set<SampledFeed>();
+
+/**
+ * Mission RPCs the core track adds with the portfolio and lane nudges. Their
+ * contract schemas land with that branch; until then they are called by name
+ * with the shapes in `source.ts` (`PortfolioSnapshot`, `SetPortfolioOrderInput`,
+ * `NudgeLaneInput`).
+ */
+export const CORE_MISSIONS_METHODS = {
+  portfolio: "missions.portfolio",
+  setPortfolioOrder: "missions.setPortfolioOrder",
+  nudgeLane: "missions.nudgeLane",
+} as const;
+
+/** Work items read per `missions.workItems` page (the server's maximum). */
+const WORK_PAGE_SIZE = 500;
+/** Timeline events read per `missions.timeline` page. */
+const TIMELINE_PAGE_SIZE = 200;
 
 /** Newest events kept per mission feed, for change attribution and refresh triggers. */
 const EVENT_LIMIT = 500;
@@ -252,11 +271,6 @@ const ignore = () => {};
 
 const isMissionError = Schema.is(MissionError);
 const isNotFound = (error: unknown) => isMissionError(error) && error.code === "not-found";
-
-const notOnServer = (what: string) =>
-  Promise.reject(
-    new MissionError({ code: "invalid", detail: `${what} is not on the server yet.` }),
-  );
 
 const changesFor = (
   events: ReadonlyArray<MissionEvent>,
@@ -447,18 +461,11 @@ export function viewChangesOf(events: ReadonlyArray<MissionEvent>): MissionViewC
 }
 
 export function createRpcMissionsSource(options: RpcMissionsSourceOptions): MissionsSource {
-  const { transport, fallback } = options;
+  const { transport } = options;
   const now = options.now ?? Date.now;
   const bus = createBus();
-
-  // Sample feeds read a mission the fixture knows: the same id when it has
-  // one, else its first mission.
-  let sampleIds: ReadonlyArray<MissionId> = [];
-  fallback.subscribeList((snapshot) => {
-    sampleIds = snapshot.missions.map((mission) => mission.id);
-  })();
-  const sampleId = (missionId: MissionId): MissionId =>
-    sampleIds.includes(missionId) ? missionId : (sampleIds[0] ?? missionId);
+  const requestByName = <T>(method: string, input: unknown) =>
+    (transport.request as unknown as (tag: string, input: unknown) => Promise<T>)(method, input);
 
   // One `missions.subscribe` stream per mission, shared by every screen.
   const missionFeed = sharedFeeds<MissionId, MissionFeedState>((missionId, emit) => {
@@ -567,6 +574,120 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         emit,
       }).stop,
   );
+
+  /** Reads `missions.workItems` page by page until the query's limit or the end. */
+  const loadWork = async (missionId: MissionId, query: WorkQuery): Promise<MissionWorkSnapshot> => {
+    const items: WorkItem[] = [];
+    const limit = query.limit ?? Number.POSITIVE_INFINITY;
+    for (;;) {
+      const page = await transport.request(WS_METHODS.missionsWorkItems, {
+        missionId,
+        ...(query.laneId === undefined ? {} : { laneId: query.laneId }),
+        ...(query.stages === undefined ? {} : { stages: [...query.stages] }),
+        offset: items.length,
+        limit: Math.min(WORK_PAGE_SIZE, limit - items.length),
+      });
+      items.push(...page.items);
+      if (!page.hasMore || page.items.length === 0 || items.length >= limit) {
+        return { missionId, items, total: page.total, hasMore: page.hasMore };
+      }
+    }
+  };
+
+  // Keyed by mission and query, so two screens asking the same thing share a read.
+  const workFeed = sharedFeeds<string, MissionWorkSnapshot>((key, emit) => {
+    const [missionId, query] = JSON.parse(key) as [MissionId, WorkQuery];
+    return requestFeed({
+      missionId,
+      load: () => loadWork(missionId, query),
+      refreshOn: kindStarts("work-item."),
+      topics: [],
+      emit,
+    }).stop;
+  });
+
+  // The timeline reads its newest page, takes new events from the mission
+  // stream and loads older pages on request. `loadOlderTimeline` reaches the
+  // open feed through this map.
+  const timelinePagers = new Map<MissionId, () => Promise<void>>();
+  const timelineFeed = sharedFeeds<MissionId, MissionTimelineWindow>((missionId, emit) => {
+    const byId = new Map<string, MissionTimelineEvent>();
+    let loaded = false;
+    let hasOlder = false;
+    let closed = false;
+    let older: Promise<void> | null = null;
+    const send = () => {
+      if (!loaded || closed) return;
+      emit({ events: [...byId.values()].sort((left, right) => right.seq - left.seq), hasOlder });
+    };
+    const readPage = async (beforeSeq?: number) => {
+      const page = await transport.request(WS_METHODS.missionsTimeline, {
+        missionId,
+        limit: TIMELINE_PAGE_SIZE,
+        ...(beforeSeq === undefined ? {} : { beforeSeq }),
+      });
+      if (closed) return;
+      for (const { event, group } of page.entries) byId.set(event.id, { ...event, group });
+      hasOlder = page.hasOlder;
+      loaded = true;
+      send();
+    };
+    readPage().catch(ignore);
+    const stopEvents = onNewEvents(missionId, (event) => {
+      if (byId.has(event.id)) return;
+      byId.set(event.id, event);
+      send();
+    });
+    const loadOlder = () => {
+      if (older) return older;
+      if (!loaded || !hasOlder) return Promise.resolve();
+      const oldest = Math.min(...[...byId.values()].map((event) => event.seq));
+      older = readPage(oldest).finally(() => {
+        older = null;
+      });
+      return older;
+    };
+    timelinePagers.set(missionId, loadOlder);
+    return () => {
+      closed = true;
+      stopEvents();
+      if (timelinePagers.get(missionId) === loadOlder) timelinePagers.delete(missionId);
+    };
+  });
+
+  const recoveryFeed = sharedFeeds<MissionId, ReadonlyArray<RecoveryIncident>>(
+    (missionId, emit) =>
+      requestFeed({
+        missionId,
+        load: () => transport.request(RECOVERY.incidents, { missionId }),
+        refreshOn: kindStarts("recovery."),
+        topics: [],
+        emit,
+      }).stop,
+  );
+
+  const statsFeed = sharedFeeds<null, ReadonlyArray<SuggestionStats>>((_, emit) =>
+    transport.stream(ASKS.subscribeSuggestionStats, { missionId: null }, emit),
+  );
+
+  // Refetched whenever the mission list moves and after the owner reorders.
+  const portfolioFeed = sharedFeeds<null, PortfolioSnapshot>((_, emit) => {
+    const loader = refetching(
+      () => requestByName<PortfolioSnapshot>(CORE_MISSIONS_METHODS.portfolio, {}),
+      emit,
+      ignore,
+    );
+    loader.run();
+    const stopList = transport.stream(WS_METHODS.missionsSubscribeList, {}, (item) => {
+      if (item._tag === "list") loader.run();
+    });
+    const stopTopic = bus.on("portfolio", loader.run);
+    return () => {
+      loader.close();
+      stopList();
+      stopTopic();
+    };
+  });
 
   const inboxFeed = sharedFeeds<MissionId | null, MissionInbox>((missionId, emit) =>
     transport.stream(WS_METHODS.missionsInbox, { missionId }, emit),
@@ -822,7 +943,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       };
     },
 
-    subscribeWork: (missionId, listener) => fallback.subscribeWork(sampleId(missionId), listener),
+    subscribeWork: (missionId, listener, query = {}) =>
+      workFeed(JSON.stringify([missionId, query]), listener),
 
     subscribeRuleBook(missionId, listener) {
       let rules: RuleRecords | undefined;
@@ -960,65 +1082,13 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       };
     },
 
-    subscribeRecovery: (missionId, listener) =>
-      fallback.subscribeRecovery(sampleId(missionId), listener),
+    subscribeRecovery: recoveryFeed,
     subscribeTimeline: (missionId, listener) =>
-      fallback.subscribeTimeline(sampleId(missionId), listener),
-    // Until core r6 serves the portfolio read, build it from the live missions:
-    // the list names them and each overview carries shares and usage. Order,
-    // pool draws and reorders need the read, so the feed stays marked sample.
-    subscribePortfolio(listener) {
-      const feeds = new Map<
-        MissionId,
-        { state: MissionFeedState | undefined; readonly close: Unsubscribe }
-      >();
-      const send = () => {
-        const states = [...feeds.values()].map((feed) => feed.state);
-        if (states.some((state) => state === undefined || state.overview === undefined)) return;
-        const missions = states.flatMap((state) =>
-          state?.overview
-            ? [{ mission: state.overview.mission, usageShare: state.overview.usageShare }]
-            : [],
-        );
-        const changes = changesFor(
-          states.flatMap((state) => state?.events ?? []),
-          ["mission"],
-        );
-        listener(portfolioFromMissions(missions, changes));
-      };
-      const stopList = transport.stream(WS_METHODS.missionsSubscribeList, {}, (item) => {
-        if (item._tag !== "list") return;
-        const ids = new Set(
-          item.snapshot.missions
-            .filter((mission) => mission.status !== "archived")
-            .map((mission) => mission.id),
-        );
-        for (const [id, feed] of feeds) {
-          if (ids.has(id)) continue;
-          feed.close();
-          feeds.delete(id);
-        }
-        for (const id of ids) {
-          if (feeds.has(id)) continue;
-          const feed: { state: MissionFeedState | undefined; close: Unsubscribe } = {
-            state: undefined,
-            close: () => {},
-          };
-          feeds.set(id, feed);
-          feed.close = missionFeed(id, (state) => {
-            feed.state = state;
-            send();
-          });
-        }
-        send();
-      });
-      return () => {
-        stopList();
-        for (const feed of feeds.values()) feed.close();
-        feeds.clear();
-      };
-    },
-    subscribeSuggestionStats: (listener) => fallback.subscribeSuggestionStats(listener),
+      timelineFeed(missionId, (window) => listener(window.events)),
+    subscribeTimelineWindow: timelineFeed,
+    loadOlderTimeline: (missionId) => timelinePagers.get(missionId)?.() ?? Promise.resolve(),
+    subscribePortfolio: (listener) => portfolioFeed(null, listener),
+    subscribeSuggestionStats: (listener) => statsFeed(null, listener),
 
     subscribeInboxHistory(missionId, listener) {
       const loader = refetching(
@@ -1165,8 +1235,16 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
 
     // --- Lanes ---
 
-    nudgeLane: () => notOnServer("Nudging a lane"),
-    handOffLane: () => notOnServer("Handing off a lane"),
+    nudgeLane: async ({ laneId, note }) => {
+      await requestByName(
+        CORE_MISSIONS_METHODS.nudgeLane,
+        note === undefined ? { laneId } : { laneId, note },
+      );
+    },
+    handOffLane: async ({ laneId, note }) => {
+      await transport.request(POLICY.handOffLane, { laneId, handoffNote: note });
+      bus.emit("roles");
+    },
     setLaneParked: async ({ missionId, laneId, parked, reason }) => {
       await transport.request(WS_METHODS.missionsUpsertLane, {
         missionId,
@@ -1199,8 +1277,10 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       await transport.request(POLICY.setPoolCapacity, { poolId, capacity });
       bus.emit("pools");
     },
-    // core r6 adds the owner's setPortfolioOrder; the live missions can't be reordered before it.
-    setPortfolioOrder: () => notOnServer("Reordering missions"),
+    setPortfolioOrder: async ({ order }) => {
+      await requestByName(CORE_MISSIONS_METHODS.setPortfolioOrder, { order });
+      bus.emit("portfolio");
+    },
 
     subscribeViews(missionId, listener) {
       let snapshot: MissionViewsSnapshot | null | undefined;

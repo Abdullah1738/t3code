@@ -27,12 +27,13 @@ import type {
   MissionOverview,
   MissionRecordRef,
   MissionRoutingTable,
+  MissionTimelineGroup,
   MissionTier,
   MissionViewsSnapshot,
-  PoolHoldId,
   PoolId,
   PoolsSnapshot,
   PostMessageInput,
+  RecoveryIncident,
   ReactToCallInput,
   ReorderSubMissionsInput,
   ResolveRuleChangeInput,
@@ -58,6 +59,7 @@ import type {
   SuggestionStats,
   UpsertRuleInput,
   WorkItem,
+  WorkStage,
 } from "@t3tools/contracts";
 
 import type { ViewSectionRequest } from "./views/layout.ts";
@@ -195,14 +197,23 @@ export type ProposedMissionEventKind = (typeof PROPOSED_MISSION_EVENT_KINDS)[num
 
 export type MissionTimelineEvent = Omit<MissionEvent, "kind"> & {
   readonly kind: MissionEventKind | ProposedMissionEventKind;
+  /** The server's timeline group, for kinds this client does not know yet. */
+  readonly group?: MissionTimelineGroup;
 };
+
+/** The loaded part of a mission's timeline, newest first. */
+export interface MissionTimelineWindow {
+  readonly events: ReadonlyArray<MissionTimelineEvent>;
+  /** Older events exist on the server; `loadOlderTimeline` fetches the next page. */
+  readonly hasOlder: boolean;
+}
 
 // --- Lanes and work --------------------------------------------------------
 
 export interface NudgeLaneInput {
   readonly laneId: LaneId;
   /** What the lane should look at; delivered as a room message to the lane lead. */
-  readonly note: string;
+  readonly note?: string;
 }
 
 /** Ends the lane lead's thread and binds a fresh one with this handoff note. */
@@ -224,9 +235,21 @@ export interface MoveLaneInput {
   readonly subMissionId: SubMissionId;
 }
 
+/** Narrows a work feed. Without one the feed reads every item. */
+export interface WorkQuery {
+  readonly laneId?: LaneId;
+  readonly stages?: ReadonlyArray<WorkStage>;
+  /** Most recently changed first; at most this many. */
+  readonly limit?: number;
+}
+
 export interface MissionWorkSnapshot {
   readonly missionId: MissionId;
+  /** Most recently changed first. */
   readonly items: ReadonlyArray<WorkItem>;
+  /** Items matching the query, loaded or not. */
+  readonly total: number;
+  readonly hasMore: boolean;
 }
 
 // --- Rules -----------------------------------------------------------------
@@ -281,46 +304,13 @@ export interface SetPoolCapacityInput extends ContractSetPoolCapacityInput {
   readonly reason: string;
 }
 
-export type RecoveryCause =
-  | "server-restart"
-  | "opencode-restart"
-  | "run-interrupted"
-  | "succession";
-export type RecoveryAction = "resume" | "notice-only" | "reconcile-first" | "skip";
-
-export interface RecoveryLostChild {
-  readonly title: string;
-  readonly sessionId: string | null;
-  readonly kind: "native-subagent" | "delegated-task";
-  readonly lastStatus: string;
-  readonly doing: string;
-}
-
-export interface RecoveryMember {
-  readonly roleId: RoleId | null;
-  readonly laneId: LaneId | null;
-  readonly threadId: string;
-  readonly cutRunId: string | null;
-  readonly lastActivityAt: string | null;
-  readonly lostChildren: ReadonlyArray<RecoveryLostChild>;
-  readonly holds: ReadonlyArray<PoolHoldId>;
-  readonly action: RecoveryAction;
-  readonly why: string;
-  readonly state: "pending" | "resumed" | "decided";
-  readonly settledAt: string | null;
-}
-
-/** One restart, as the recovery track records it. Proposed shape. */
-export interface RecoveryIncident {
-  readonly id: string;
-  readonly cause: RecoveryCause;
-  readonly detectedAt: string;
-  readonly window: { readonly from: string; readonly to: string };
-  readonly missionIds: ReadonlyArray<MissionId>;
-  readonly members: ReadonlyArray<RecoveryMember>;
-  readonly resumesPerMinute: number;
-  readonly status: "open" | "cleared";
-}
+/** Restart recovery reads the server's incident shape as is. */
+export type {
+  RecoveryAction,
+  RecoveryCause,
+  RecoveryIncident,
+  RecoveryThread,
+} from "@t3tools/contracts";
 
 // --- Portfolio -------------------------------------------------------------
 
@@ -457,7 +447,8 @@ export interface MissionViewsState {
 
 /**
  * Feeds a source may serve from sample data. Each names the screen section it
- * fills, so the section can say so once.
+ * fills, so the section can say so once. The RPC source serves all of them
+ * live; only the fixture source is sample data.
  */
 export const SAMPLED_FEEDS = [
   "work",
@@ -484,11 +475,10 @@ export interface LoadRoomPageInput {
  *
  * Two implementations: the WS RPC source (`createRpcMissionsSource`) reads
  * the server, and the fixture source serves sample data for design work
- * (`?missionsFixture=1` on web). The RPC source fills the feeds that have no
- * RPC yet from the fixture and lists them in `sampled`.
+ * (`?missionsFixture=1` on web).
  */
 export interface MissionsSource {
-  /** Feeds served from sample data because the server has no RPC for them yet. */
+  /** Feeds served from sample data. Empty on the RPC source. */
   readonly sampled: ReadonlySet<SampledFeed>;
   subscribeList(listener: Listener<MissionListSnapshot>): Unsubscribe;
   /** `null` means the mission does not exist (or was archived). */
@@ -508,7 +498,11 @@ export interface MissionsSource {
     missionId: MissionId,
     listener: Listener<ApprovalRoutingTable | null>,
   ): Unsubscribe;
-  subscribeWork(missionId: MissionId, listener: Listener<MissionWorkSnapshot>): Unsubscribe;
+  subscribeWork(
+    missionId: MissionId,
+    listener: Listener<MissionWorkSnapshot>,
+    query?: WorkQuery,
+  ): Unsubscribe;
   subscribeRuleBook(missionId: MissionId, listener: Listener<MissionRuleBook>): Unsubscribe;
   subscribeRoles(missionId: MissionId, listener: Listener<MissionRolesSnapshot>): Unsubscribe;
   /** `null` when the mission has no review policy. */
@@ -523,11 +517,18 @@ export interface MissionsSource {
     missionId: MissionId,
     listener: Listener<ReadonlyArray<RecoveryIncident>>,
   ): Unsubscribe;
-  /** The mission's event log, newest first. */
+  /** The loaded part of the mission's event log, newest first. */
   subscribeTimeline(
     missionId: MissionId,
     listener: Listener<ReadonlyArray<MissionTimelineEvent>>,
   ): Unsubscribe;
+  /** Same log with whether older pages exist. */
+  subscribeTimelineWindow(
+    missionId: MissionId,
+    listener: Listener<MissionTimelineWindow>,
+  ): Unsubscribe;
+  /** Loads the next older page into the timeline feeds. Resolves once it is in. */
+  loadOlderTimeline(missionId: MissionId): Promise<void>;
   subscribePortfolio(listener: Listener<PortfolioSnapshot>): Unsubscribe;
   subscribeInboxHistory(
     missionId: MissionId | null,

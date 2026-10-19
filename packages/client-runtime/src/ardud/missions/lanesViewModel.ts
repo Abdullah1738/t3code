@@ -230,9 +230,10 @@ const required = (text: string, message: string): Result<string> => {
   return trimmed ? ok(trimmed) : err(message);
 };
 
+/** A blank note is a plain nudge: the lane lead looks again at what it holds. */
 export function nudgeLaneInput(laneId: LaneId, note: string): Result<NudgeLaneInput> {
-  const checked = required(note, "Say what the lane should look at.");
-  return checked.ok ? ok({ laneId, note: checked.value }) : checked;
+  const text = note.trim();
+  return ok(text.length > 0 ? { laneId, note: text } : { laneId });
 }
 
 export function handOffLaneInput(laneId: LaneId, note: string): Result<HandOffLaneInput> {

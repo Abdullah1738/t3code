@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 
 import type { MissionId, Role } from "@t3tools/contracts";
 import {
@@ -11,7 +11,6 @@ import {
   roleRegistryView,
   type ModelChoice,
   type PoolRow,
-  type RecoveryIncident,
   type RoleRow,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -21,7 +20,6 @@ import { MetaRow } from "./cards/chips";
 import { MutedLines, PickForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import {
-  isSampleFeed,
   useMasterRoleId,
   useMissionList,
   useMissionPools,
@@ -342,57 +340,30 @@ function CapacityForm(props: {
   );
 }
 
+// The newest restart (incidents arrive newest first): when it was down, then
+// who resumed, was reconciled, only told, skipped or is still waiting.
 function RecoverySection(props: { missionId: MissionId }) {
   const incidents = useMissionRecovery(props.missionId);
-  if (!incidents || incidents.length === 0) return null;
+  const latest = incidents?.[0];
+  if (!latest) return null;
+  const view = recoveryView(latest);
   return (
-    <MissionSection title="Restart recovery" sample={isSampleFeed("recovery")}>
-      <ul className="flex flex-col gap-3">
-        {incidents.map((incident) => (
-          <RecoveryItem key={incident.id} incident={incident} />
+    <MissionSection
+      title="Last restart"
+      accessory={<span className="text-xs text-(--m-muted) tabular-nums">{view.dayLabel}</span>}
+    >
+      <dl className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-sm tabular-nums">
+        <dt className="text-(--m-muted)">Down</dt>
+        <dd>{view.downLine}</dd>
+        {view.groups.map((group) => (
+          <Fragment key={group.label}>
+            <dt className={group.label === "Waiting" ? "text-(--m-warning)" : "text-(--m-muted)"}>
+              {group.label}
+            </dt>
+            <dd>{group.names.join(", ")}</dd>
+          </Fragment>
         ))}
-      </ul>
+      </dl>
     </MissionSection>
-  );
-}
-
-function RecoveryItem(props: { incident: RecoveryIncident }) {
-  const view = recoveryView(props.incident);
-  const { incident } = view;
-  const rows = [...view.pending, ...view.settled];
-  return (
-    <li className="flex flex-col gap-1 text-sm">
-      <MetaRow>
-        <span className="font-medium text-foreground">
-          {view.causeLabel}, detected {formatTimeOfDay(incident.detectedAt)} (
-          {formatTimeOfDay(incident.window.from)}–{formatTimeOfDay(incident.window.to)})
-        </span>
-        <span className="text-xs text-muted-foreground">{incident.status}</span>
-      </MetaRow>
-      <MutedLines
-        lines={[view.progressLine, `Resume plan: ${view.resumeRate}, by sub-mission priority`]}
-      />
-      <ol className="flex flex-col gap-1 ps-3">
-        {rows.map((row) => (
-          <li key={`${row.name}-${row.member.threadId}`}>
-            <MetaRow>
-              <span>
-                {row.name}: {row.actionLabel} ({row.member.state})
-              </span>
-              <span className="text-xs text-muted-foreground">{row.childrenLine}</span>
-            </MetaRow>
-            <MutedLines
-              lines={[
-                row.member.why,
-                ...row.member.lostChildren.map(
-                  (child) => `${child.title}: ${child.lastStatus}. ${child.doing}`,
-                ),
-                row.member.holds.length > 0 ? `Holds: ${row.member.holds.join(", ")}` : null,
-              ]}
-            />
-          </li>
-        ))}
-      </ol>
-    </li>
   );
 }
