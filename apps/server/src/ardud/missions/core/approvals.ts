@@ -25,6 +25,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import { settleDiscussion } from "./conditions.ts";
 import type { WriteKit } from "./kit.ts";
 import { isMasterOf } from "./master.ts";
 import { sameValue } from "./rules.ts";
@@ -236,7 +237,7 @@ const approvalRef = (approval: Approval): MissionRecordRef => ({
 });
 
 export const makeApprovalWrites = (kit: WriteKit) => {
-  const { store, serial, loadMission, unchanged, commit } = kit;
+  const { store, conditions, serial, loadMission, unchanged, commit } = kit;
 
   const loadApproval = (approvalId: ApprovalId) =>
     Effect.flatMap(store.get("approval", approvalId), (found) =>
@@ -404,8 +405,26 @@ export const makeApprovalWrites = (kit: WriteKit) => {
           );
         }
         const approver = approverOf(before);
+        const owner = isOwnerProvenance(provenance);
+        const condition = input.onOwnerCondition ?? null;
+        if (condition !== null) {
+          if (owner) {
+            return yield* fail(
+              "invalid",
+              "The owner decides directly; owner conditions are for the master.",
+            );
+          }
+          if (!(yield* isMasterOf(store, before.missionId, provenance))) {
+            return yield* fail(
+              "forbidden",
+              `Only mission ${before.missionId}'s master decides on the owner's condition.`,
+            );
+          }
+          yield* conditions.verify({ subject: approvalRef(before), condition });
+        }
         const allowed =
-          isOwnerProvenance(provenance) ||
+          owner ||
+          condition !== null ||
           (approver === "master" && (yield* isMasterOf(store, before.missionId, provenance)));
         if (!allowed) {
           return yield* fail(
@@ -421,16 +440,36 @@ export const makeApprovalWrites = (kit: WriteKit) => {
           decidedBy: provenance,
           decidedAt: yield* nowIso,
           decisionNote: input.note ?? null,
+          ...(condition === null ? {} : { onOwnerCondition: condition }),
         };
+        const verb = input.action === "approve" ? "Approved" : "Rejected";
         return yield* commit(provenance, {
           missionId: before.missionId,
           kind: "approval.decided",
-          summary: `${input.action === "approve" ? "Approved" : "Rejected"}: ${record.title}`,
+          summary:
+            condition === null
+              ? `${verb}: ${record.title}`
+              : `${verb} on the owner's condition: ${record.title}`,
           ref: approvalRef(record),
           upserts: [{ _tag: "approval", record }],
-          payload: { action: input.action, approver, note: input.note ?? null },
+          payload: {
+            action: input.action,
+            approver,
+            note: input.note ?? null,
+            onOwnerCondition: condition,
+          },
         });
       }),
+    ).pipe(
+      Effect.tap((result) =>
+        settleDiscussion(
+          conditions,
+          result.ref,
+          `${input.action === "approve" ? "Approved" : "Rejected"}${
+            input.onOwnerCondition === undefined ? "" : " on your condition"
+          }${input.note === undefined || input.note.trim() === "" ? "." : `: ${input.note.trim()}`}`,
+        ),
+      ),
     );
 
   const routeApproval = (provenance: MissionProvenance, input: RouteApprovalInput) =>

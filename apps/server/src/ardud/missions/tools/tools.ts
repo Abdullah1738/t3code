@@ -5,6 +5,7 @@ import {
   ApprovalStatus,
   AskId,
   AskStatus,
+  CallId,
   CreateMissionInput,
   DecideSuggestionInput,
   DraftChannel,
@@ -462,12 +463,26 @@ const MissionApprovalsTool = Tool.make("mission_approvals", {
 
 const MissionApprovalDecideTool = missionWriteTool(
   "mission_approval_decide",
-  "As the mission's master, approve or reject a pending approval routed to the master (with an optional note). Approvals routed to the owner are his; re-route one first with mission_approval_route if he agreed. Stale-closed approvals never count, and an approval only covers the head it names.",
+  "As the mission's master, approve or reject a pending approval (with an optional note). You decide approvals routed to the master; one routed to the owner is his unless you pass onOwnerCondition: the open owner request about this approval and his exact words stating the condition your decision meets, whole sentences from his newest message there (not a question). The decision is then recorded as yours on his condition. Stale-closed approvals never count, and an approval only covers the head it names.",
   Schema.Struct({
     missionId: MissionId,
     approvalId: ApprovalId,
     action: Schema.Literals(["approve", "reject"]),
     note: Schema.optional(Schema.String),
+    onOwnerCondition: Schema.optional(OwnerCondition),
+  }),
+);
+
+// ardud missions: core - the master revises a call on the owner's condition
+const MissionCallReviseTool = missionWriteTool(
+  "mission_call_revise",
+  "As the mission's master, revise one of its calls after the owner discussed it: the new decision (and reason, if it changed), with onOwnerCondition: the open owner request about this call and his exact words stating the condition the revision meets, whole sentences from his newest message there (not a question). The call is recorded as revised on his condition and waits for his reaction again. Refused without a condition he stated.",
+  Schema.Struct({
+    missionId: MissionId,
+    callId: CallId,
+    decision: TrimmedNonEmptyString,
+    reason: Schema.optional(Schema.String),
+    onOwnerCondition: OwnerCondition,
   }),
 );
 
@@ -620,7 +635,8 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionLaneSplitTool, "Split a lane"),
   writeTool(MissionLaneMergeTool, "Merge lanes"),
   readTool(MissionApprovalsTool, "Mission approvals"),
-  writeTool(MissionApprovalDecideTool, "Decide an approval routed to the master"),
+  writeTool(MissionApprovalDecideTool, "Decide an approval"),
+  writeTool(MissionCallReviseTool, "Revise a call on the owner's condition"),
   writeTool(MissionApprovalRouteTool, "Route one approval"),
   writeTool(MissionApprovalAnnotateTool, "Annotate an approval"),
   writeTool(MissionApprovalRoutingTool, "Set approval routing"),

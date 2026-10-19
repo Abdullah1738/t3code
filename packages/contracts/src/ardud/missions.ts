@@ -1689,6 +1689,11 @@ export const MissionEventKind = Schema.Literals([
    * withdrew a member's secret request. Never carries a value.
    */
   "secret-request.closed",
+  /**
+   * Payload `{ previousDecision, previousReason }`: the master revised its call
+   * on a condition the owner stated in Discuss.
+   */
+  "call.revised",
   // --- policy additions ---
   "role.unbound",
   "role.updated",
@@ -2296,6 +2301,10 @@ export const DecideApprovalInput = Schema.Struct({
   action: Schema.Literals(["approve", "reject"]),
   note: Schema.optional(Schema.String),
   inboundId: Schema.optional(TrimmedNonEmptyString),
+  // --- core additions ---
+  /** The master deciding on a condition the owner stated in Discuss. */
+  onOwnerCondition: Schema.optional(OwnerCondition),
+  // --- end core additions ---
 });
 export type DecideApprovalInput = typeof DecideApprovalInput.Type;
 
@@ -2998,6 +3007,15 @@ export const MissionTimelinePage = Schema.Struct({
   hasOlder: Schema.Boolean,
 });
 export type MissionTimelinePage = typeof MissionTimelinePage.Type;
+
+/** The master revises its call on a condition the owner stated in Discuss. */
+export const ReviseCallInput = Schema.Struct({
+  callId: CallId,
+  decision: TrimmedNonEmptyString,
+  reason: Schema.optional(Schema.String),
+  onOwnerCondition: OwnerCondition,
+});
+export type ReviseCallInput = typeof ReviseCallInput.Type;
 // --- end core additions ---
 
 /** The master records that it relied on a rule, or that work broke it. */

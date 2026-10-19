@@ -25,6 +25,7 @@ import {
   type MissionSubscribeItem,
   type OpenApprovalInput,
   type ReorderSubMissionsInput,
+  type ReviseCallInput,
   type RouteApprovalInput,
   type SetApprovalRoutingInput,
   type SetMissionFocusInput,
@@ -215,7 +216,10 @@ export class MissionService extends Context.Service<
     /** Systems (crw) open and stale-close approvals in their own component name. */
     readonly openApproval: Write<OpenApprovalInput>;
     readonly closeStaleApproval: Write<CloseStaleApprovalInput>;
-    /** The owner decides any pending approval; the master only those routed to it. */
+    /**
+     * The owner decides any pending approval; the master those routed to it,
+     * or any on a verified owner condition (`onOwnerCondition`).
+     */
     readonly decideApproval: Write<DecideApprovalInput>;
     /** Owner or master: move one pending approval to the other approver, with a reason. */
     readonly routeApproval: Write<RouteApprovalInput>;
@@ -224,6 +228,8 @@ export class MissionService extends Context.Service<
     // ardud missions: asks
     /** Owner or master: set the summary and flag chips on a pending approval. */
     readonly annotateApproval: Write<AnnotateApprovalInput>;
+    /** The master revises its call on a verified owner condition. */
+    readonly reviseCall: Write<ReviseCallInput>;
   }
 >()("t3/ardud/missions/MissionService") {}
 

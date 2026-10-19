@@ -9,12 +9,15 @@ import type {
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 
+import type { OwnerConditions } from "../discuss/OwnerConditions.ts";
 import type * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 
 /** What writes.ts shares with the write modules split out of it. */
 export interface WriteKit {
   readonly store: MissionStore.MissionStore["Service"];
+  /** Discuss: verifies the owner's condition before the master acts on it. */
+  readonly conditions: OwnerConditions["Service"];
   /** One write at a time across every core write. */
   readonly serial: <A>(effect: Effect.Effect<A, MissionError>) => Effect.Effect<A, MissionError>;
   readonly loadMission: (missionId: MissionId) => Effect.Effect<Mission, MissionError>;

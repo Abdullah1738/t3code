@@ -774,6 +774,51 @@ describe("mission MCP tools", () => {
       expect(decided.isError).toBe(false);
       expect(decided.structured.draft).toMatchObject({ status: "approved", onOwnerCondition });
       expect(settled).toEqual(["ask", "draft"]);
+
+      // ardud missions: core - an owner-routed approval and a call, on his condition
+      const missions = yield* MissionService.MissionService;
+      yield* missions.openApproval(
+        { _tag: "system", component: "crw" },
+        {
+          missionId,
+          approvalId: ApprovalId.make("ap-cond"),
+          kind: "merge",
+          title: "Good to merge: ap-cond",
+          detail: "",
+          requestedBy: "crw",
+          links: [],
+        },
+      );
+      const approved = yield* call("mission_approval_decide", master, {
+        missionId,
+        approvalId: "ap-cond",
+        action: "approve",
+        onOwnerCondition,
+      });
+      expect(approved.isError, approved.text).toBe(false);
+      const made = yield* call("mission_call", master, {
+        missionId,
+        title: "Postgres",
+        decision: "Use Postgres.",
+        reason: "Writers.",
+      });
+      const callId = (made.structured.call as { id: string }).id;
+      const revised = yield* call("mission_call_revise", master, {
+        missionId,
+        callId,
+        decision: "Use Postgres with an export.",
+        onOwnerCondition,
+      });
+      expect(revised.isError, revised.text).toBe(false);
+      const store = yield* MissionStore.MissionStore;
+      const approval = Option.getOrThrow(yield* store.get("approval", ApprovalId.make("ap-cond")));
+      expect(approval.onOwnerCondition).toEqual(onOwnerCondition);
+      const revisedCall = Option.getOrThrow(yield* store.get("call", callId as never));
+      expect(revisedCall).toMatchObject({
+        decision: "Use Postgres with an export.",
+        onOwnerCondition,
+      });
+      expect(settled).toEqual(["ask", "draft", "approval", "call"]);
     }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(conditions))));
   });
 });

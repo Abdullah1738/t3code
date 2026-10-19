@@ -413,8 +413,15 @@ const handlers = {
         approvalId: input.approvalId,
         action: input.action,
         ...(input.note === undefined ? {} : { note: input.note }),
+        ...(input.onOwnerCondition === undefined
+          ? {}
+          : { onOwnerCondition: input.onOwnerCondition }),
       }),
     ),
+  ),
+  // ardud missions: core
+  mission_call_revise: McpToolAccess.actsAsCaller(({ missionId, ...input }) =>
+    asMaster(missionId, (missions, _asks, provenance) => missions.reviseCall(provenance, input)),
   ),
   mission_approval_route: McpToolAccess.actsAsCaller((input) =>
     asMaster(input.missionId, (missions, _asks, provenance) =>
