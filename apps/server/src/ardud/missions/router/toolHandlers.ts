@@ -97,6 +97,31 @@ const handlers = {
       router.attention(input, provenance).pipe(Effect.map(({ entries }) => ({ entries }))),
     ),
   ),
+  mission_requests: McpToolAccess.readsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.ownerRequests(input, provenance).pipe(Effect.map(({ requests }) => ({ requests }))),
+    ),
+  ),
+  mission_request_open: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.openRequest(input, provenance).pipe(Effect.map((request) => ({ request }))),
+    ),
+  ),
+  mission_request_reply: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.replyRequest(input, provenance).pipe(Effect.map((request) => ({ request }))),
+    ),
+  ),
+  mission_request_settle: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.settleRequest(input, provenance).pipe(Effect.map((request) => ({ request }))),
+    ),
+  ),
+  mission_request_reopen: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.reopenRequest(input, provenance).pipe(Effect.map((request) => ({ request }))),
+    ),
+  ),
 } satisfies McpToolAccess.Handlers<typeof RouterToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(RouterToolkit, handlers);

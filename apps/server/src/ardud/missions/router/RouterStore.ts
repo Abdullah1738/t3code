@@ -327,6 +327,11 @@ export class RouterStore extends Context.Service<
       readonly messages: ReadonlyArray<MissionMessage>;
       readonly hasOlder: boolean;
     }>;
+    /** A room's first message and how many it holds (owner requests' transcripts). */
+    readonly roomOpening: (roomId: RoomId) => Effect.Effect<{
+      readonly first: MissionMessage | null;
+      readonly total: number;
+    }>;
     readonly roomKindsSince: (
       roomId: RoomId,
       sinceIso: string,
@@ -786,6 +791,25 @@ const make = Effect.gen(function* () {
             .map((row) => decodeMessage(row.json))
             .toReversed();
           return { messages, hasOlder };
+        }),
+      ),
+
+    roomOpening: (roomId) =>
+      read(
+        Effect.gen(function* () {
+          const first = yield* sql<{ readonly json: string }>`
+            SELECT message_json AS "json" FROM ardud_mission_router_messages
+            WHERE room_id = ${roomId}
+            ORDER BY seq ASC
+            LIMIT 1
+          `;
+          const counted = yield* sql<{ readonly total: number }>`
+            SELECT COUNT(*) AS "total" FROM ardud_mission_router_messages WHERE room_id = ${roomId}
+          `;
+          return {
+            first: first[0] === undefined ? null : decodeMessage(first[0].json),
+            total: Number(counted[0]?.total ?? 0),
+          };
         }),
       ),
 

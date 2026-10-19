@@ -20,14 +20,21 @@ import {
   type MissionMessageBody,
   type MissionMutationResult,
   type MissionProvenance,
+  type OpenOwnerRequestInput,
+  type OwnerRequest,
+  type OwnerRequests,
+  type OwnerRequestsInput,
   type PostMessageInput,
   type ReadPosition,
+  type ReopenOwnerRequestInput,
+  type ReplyOwnerRequestInput,
   type Room,
   type RoomPage,
   type RoomPageInput,
   type RoomTuning,
   type RoomTuningInput,
   type SetMissionMemberInput,
+  type SettleOwnerRequestInput,
   type SubscribeRoomInput,
   type Subscription,
   type TuneRoomInput,
@@ -85,6 +92,8 @@ import {
   reminderLine,
   reminderRequestId,
 } from "./reminders.ts";
+import { makeOwnerRequests, type RequestCommit } from "./requests.ts";
+import { requestIdOfRoom } from "./requestsModel.ts";
 import { RouterStore, type DeliveryRow, type RecipientRow } from "./RouterStore.ts";
 
 /** One unread message waiting for a thread, as `mission_inbox` shows it. */
@@ -92,6 +101,8 @@ export interface InboxEntry {
   readonly roomTitle: string;
   readonly message: MissionMessage;
   readonly body: string | null;
+  /** On an owner request's newest entry: the request's whole conversation. */
+  readonly requestContext?: string;
 }
 
 export interface AgentInbox {
@@ -103,6 +114,8 @@ export interface AgentInbox {
 const PAGE_DEFAULT = 50;
 const PAGE_MAX = 200;
 const INBOX_MAX = 30;
+/** Owner requests whose whole conversation one wake carries. */
+const WAKE_REQUESTS_MAX = 3;
 const ATTENTION_MAX = 200;
 const LIVE_MISSIONS: ReadonlySet<string> = new Set(["active", "paused", "draining"]);
 const MEMBER_RANK: Record<MemberKind, number> = { master: 0, created: 1, attached: 2, service: 3 };
@@ -339,6 +352,28 @@ export class MissionRouter extends Context.Service<
       input: MissionAttentionInput,
       provenance: MissionProvenance,
     ) => Effect.Effect<MissionAttention, MissionError>;
+    /** Owner or master: the owner's requests with their conversations (see requests.ts). */
+    readonly ownerRequests: (
+      input: OwnerRequestsInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<OwnerRequests, MissionError>;
+    /** The owner asks the master, or the master opens one quoting the owner. */
+    readonly openRequest: (
+      input: OpenOwnerRequestInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<OwnerRequest, MissionError>;
+    readonly replyRequest: (
+      input: ReplyOwnerRequestInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<OwnerRequest, MissionError>;
+    readonly settleRequest: (
+      input: SettleOwnerRequestInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<OwnerRequest, MissionError>;
+    readonly reopenRequest: (
+      input: ReopenOwnerRequestInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<OwnerRequest, MissionError>;
   }
 >()("t3/ardud/missions/router/MissionRouter") {}
 
@@ -472,6 +507,25 @@ const make = Effect.gen(function* () {
   const isMaster = (cast: RouterCast, provenance: MissionProvenance) =>
     provenance._tag === "agent" && masterThreadsOf(cast).includes(provenance.threadId);
 
+  /** A room's reader; an owner request's room is the owner's and the master's alone. */
+  const requireRoomReader = (room: Room, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      yield* requireReader(room.missionId, provenance);
+      if (room.kind !== "owner-request" || provenance._tag !== "agent") return;
+      if (!isMaster(yield* loadCast(room.missionId), provenance)) {
+        return yield* fail(
+          "forbidden",
+          "Owner requests are between the owner and the mission's master.",
+        );
+      }
+    });
+
+  /** Request rooms have no subscribers or tuning: the owner's words always reach the master. */
+  const refuseRequestRoom = (room: Room) =>
+    room.kind === "owner-request"
+      ? Effect.fail(fail("invalid", "An owner request's room takes no subscriptions or tuning."))
+      : Effect.void;
+
   /**
    * Every actor a message, subscription or forward names must belong to the
    * mission: threads are members, roles and lanes exist in it. Owner, people
@@ -584,13 +638,35 @@ const make = Effect.gen(function* () {
     readonly coord?: CoordEventRef;
     /** Written in the message's transaction; skipped when the key already posted. */
     readonly alongside?: Effect.Effect<void, MissionError>;
+    /** A room that is not a standard one, written with this message (an owner request's). */
+    readonly newRoom?: Room;
+    /** An owner request's event and record, committed instead of `message.posted`. */
+    readonly asRequest?: (message: MissionMessage, at: string) => RequestCommit;
   }
 
   /** Writes one message after the caller's checks. Serialized so seqs stay dense per mission. */
-  const postChecked = ({ input, provenance, author, authorThread, coord, alongside }: PostPlan) =>
+  const postChecked = ({
+    input,
+    provenance,
+    author,
+    authorThread,
+    coord,
+    alongside,
+    newRoom,
+    asRequest,
+  }: PostPlan) =>
     postLock.withPermit(
       Effect.gen(function* () {
-        const room = yield* ensureRoom(input.missionId, input.roomId, provenance);
+        const room =
+          newRoom === undefined
+            ? yield* ensureRoom(input.missionId, input.roomId, provenance)
+            : ((yield* rooms.room(newRoom.id)) ?? newRoom);
+        if (room.kind === "owner-request" && asRequest === undefined) {
+          return yield* fail(
+            "forbidden",
+            "Owner request rooms take messages through the request tools (mission_request_reply).",
+          );
+        }
         if (room.archived) return yield* fail("conflict", `Room ${room.title} is archived.`);
         const isCorrection = input.isCorrection ?? false;
         const body = input.body ?? null;
@@ -694,17 +770,36 @@ const make = Effect.gen(function* () {
         const ledger = ledgerFor(cast, message, subscriptions, speaker).map((row) =>
           silent ? { ...row, status: "skipped" as const } : row,
         );
+        const asked = asRequest?.(message, at);
         yield* store.commit({
-          event: {
-            missionId: input.missionId,
-            kind: "message.posted",
-            actor: author,
-            provenance,
-            summary: clipSummary(`${input.kind} in ${room.title}: ${input.summary}`),
-            subject: { kind: "message", id: message.id, label: `#${seq}` },
-            payload: { roomId: room.id, seq, deliveries: deliveries.length },
-            at,
-          },
+          event:
+            asked === undefined
+              ? {
+                  missionId: input.missionId,
+                  kind: "message.posted",
+                  actor: author,
+                  provenance,
+                  summary: clipSummary(`${input.kind} in ${room.title}: ${input.summary}`),
+                  subject: { kind: "message", id: message.id, label: `#${seq}` },
+                  payload: { roomId: room.id, seq, deliveries: deliveries.length },
+                  at,
+                }
+              : {
+                  missionId: input.missionId,
+                  kind: asked.kind,
+                  actor: author,
+                  provenance,
+                  summary: clipSummary(asked.summary),
+                  subject: asked.subject,
+                  payload: {
+                    ...asked.payload,
+                    roomId: room.id,
+                    seq,
+                    deliveries: deliveries.length,
+                  },
+                  at,
+                },
+          ...(asked === undefined ? {} : { upserts: asked.upserts }),
           alongside: Effect.all(
             [
               rooms.putRoom({ ...room, lastSeq: seq, lastMessageAt: at }),
@@ -803,6 +898,14 @@ const make = Effect.gen(function* () {
       );
     });
 
+  const requests = yield* makeOwnerRequests({
+    store,
+    rooms,
+    loadCast,
+    post: postChecked,
+    afterPost,
+  });
+
   const post = (input: PostMessageInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const mission = Option.getOrNull(yield* store.get("mission", input.missionId));
@@ -840,7 +943,7 @@ const make = Effect.gen(function* () {
   const roomPage = (input: RoomPageInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const room = yield* loadRoom(input.roomId);
-      yield* requireReader(room.missionId, provenance);
+      yield* requireRoomReader(room, provenance);
       const limit = Math.min(input.limit ?? PAGE_DEFAULT, PAGE_MAX);
       const page = yield* rooms.roomMessages(room.id, input.beforeSeq ?? null, limit);
       const subscriptions = yield* rooms.subscriptions(room.id);
@@ -886,7 +989,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const message = yield* rooms.messageById(input.messageId);
       if (message === null) return yield* fail("not-found", `No message ${input.messageId}.`);
-      yield* requireReader(message.missionId, provenance);
+      yield* requireRoomReader(yield* loadRoom(message.roomId), provenance);
       const body = yield* rooms.messageBody(message.id);
       return { messageId: message.id, body: body ?? "" } satisfies MissionMessageBody;
     });
@@ -901,7 +1004,7 @@ const make = Effect.gen(function* () {
   const markRead = (input: MarkReadInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const room = yield* loadRoom(input.roomId);
-      yield* requireReader(room.missionId, provenance);
+      yield* requireRoomReader(room, provenance);
       const cast = yield* loadCast(room.missionId);
       const seq = Math.min(input.seq, room.lastSeq);
       const updatedAt = yield* nowIso;
@@ -918,6 +1021,8 @@ const make = Effect.gen(function* () {
         at: updatedAt,
         scope: { _tag: "room", roomId: room.id, upToSeq: seq },
       });
+      // The owner reading a request to its end has seen the master's answer.
+      yield* requests.seen(room, seq, provenance);
       return stored[0] ?? { roomId: room.id, reader: actorOf(provenance), seq, updatedAt };
     });
 
@@ -926,7 +1031,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const existing = yield* rooms.room(roomId);
       if (existing !== null) {
-        yield* requireReader(existing.missionId, provenance);
+        yield* requireRoomReader(existing, provenance);
         return existing;
       }
       const at = roomId.indexOf(ROOM_MARK);
@@ -939,6 +1044,7 @@ const make = Effect.gen(function* () {
   const subscribe = (input: SubscribeRoomInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const room = yield* openRoom(input.roomId, provenance);
+      yield* refuseRequestRoom(room);
       const cast = yield* loadCast(room.missionId);
       if (
         provenance._tag === "agent" &&
@@ -995,13 +1101,14 @@ const make = Effect.gen(function* () {
   const roomTuning = (input: RoomTuningInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const room = yield* loadRoom(input.roomId);
-      yield* requireReader(room.missionId, provenance);
+      yield* requireRoomReader(room, provenance);
       return yield* tuningOf(room);
     });
 
   const tuneRoom = (input: TuneRoomInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const room = yield* openRoom(input.roomId, provenance);
+      yield* refuseRequestRoom(room);
       const cast = yield* loadCast(room.missionId);
       if (!isOwnerProvenance(provenance) && !isMaster(cast, provenance)) {
         return yield* fail("forbidden", "Only the owner or the mission's master tunes a room.");
@@ -1345,6 +1452,27 @@ const make = Effect.gen(function* () {
   // ---------------------------------------------------------------------------
   // Doorbell
 
+  /**
+   * A wake for an owner request carries the request's whole conversation, so
+   * the master never has to ask the owner to say it again.
+   */
+  const withRequestContexts = (line: string, requestRooms: ReadonlyArray<RoomId>) =>
+    Effect.gen(function* () {
+      if (requestRooms.length === 0) return line;
+      const shown = requestRooms.slice(0, WAKE_REQUESTS_MAX);
+      const contexts: string[] = [];
+      for (const roomId of shown) {
+        const context = yield* requests.contextOf(roomId);
+        if (context !== null) contexts.push(context);
+      }
+      const more = requestRooms.length - shown.length;
+      const tail =
+        more === 0
+          ? []
+          : [`${more} more owner request${more === 1 ? "" : "s"} wait; mission_inbox has them.`];
+      return [line, ...contexts, ...tail].join("\n\n---\n\n");
+    });
+
   const pokeUnlocked = (threadId: ThreadId): Effect.Effect<void, MissionError> =>
     Effect.gen(function* () {
       const unread = yield* rooms.unreadDeliveries(threadId);
@@ -1370,22 +1498,25 @@ const make = Effect.gen(function* () {
       }
       const newest = unread.reduce((a, b) => (b.seq > a.seq ? b : a));
       const titles = new Set<string>();
+      const requestRooms: RoomId[] = [];
       for (const roomId of new Set(unread.map((delivery) => delivery.roomId))) {
         const room = yield* rooms.room(roomId);
         titles.add(room?.title ?? roomId);
+        if (room?.kind === "owner-request") requestRooms.push(room.id);
       }
       const newestMessage = yield* rooms.messageById(newest.messageId);
       const wakeId = wakeRequestId(newest.missionId, threadId, action.upToSeq);
+      const line = wakeLine({
+        unread: action.unread,
+        rooms: [...titles],
+        newest:
+          newestMessage === null
+            ? `#${newest.seq}`
+            : `#${newestMessage.seq} ${newestMessage.kind}: ${newestMessage.summary.slice(0, 120)}`,
+      });
       yield* threads.send({
         threadId,
-        text: wakeLine({
-          unread: action.unread,
-          rooms: [...titles],
-          newest:
-            newestMessage === null
-              ? `#${newest.seq}`
-              : `#${newestMessage.seq} ${newestMessage.kind}: ${newestMessage.summary.slice(0, 120)}`,
-        }),
+        text: yield* withRequestContexts(line, requestRooms),
         key: wakeId,
         asOwner: false,
       });
@@ -1584,12 +1715,27 @@ const make = Effect.gen(function* () {
         const body = message.hasBody ? yield* rooms.messageBody(message.id) : null;
         entries.push({ roomTitle: room?.title ?? delivery.roomId, message, body });
       }
+      // The newest entry of each owner request carries its whole conversation.
+      const newestOfRoom = new Map<RoomId, number>();
+      entries.forEach((entry, index) => {
+        if (requestIdOfRoom(entry.message.roomId) !== null) {
+          newestOfRoom.set(entry.message.roomId, index);
+        }
+      });
+      for (const [roomId, index] of newestOfRoom) {
+        const requestContext = yield* requests.contextOf(roomId);
+        if (requestContext !== null) entries[index] = { ...entries[index]!, requestContext };
+      }
       return { threadId, unread: unread.length, entries } satisfies AgentInbox;
     });
 
   return MissionRouter.of({
+    // Owner request rooms live in the requests section, not the room list.
     rooms: (missionId, provenance) =>
-      requireReader(missionId, provenance).pipe(Effect.andThen(rooms.rooms(missionId))),
+      requireReader(missionId, provenance).pipe(
+        Effect.andThen(rooms.rooms(missionId)),
+        Effect.map((all) => all.filter((room) => room.kind !== "owner-request")),
+      ),
     roomPage,
     messageBody,
     post,
@@ -1610,6 +1756,11 @@ const make = Effect.gen(function* () {
     tuneRoom,
     remind,
     attention,
+    ownerRequests: requests.list,
+    openRequest: requests.open,
+    replyRequest: requests.reply,
+    settleRequest: requests.settle,
+    reopenRequest: requests.reopen,
   });
 });
 

@@ -109,7 +109,8 @@ export const rejectAskDefaults = (raw: unknown): Outcome<void> => {
   return ok(undefined);
 };
 
-const silencePhraseIn = (text: string): string | null => {
+// ardud missions: router (owner requests refuse the same phrases)
+export const silencePhraseIn = (text: string): string | null => {
   const normalized = ` ${normalizeText(text)} `;
   for (const phrase of SILENCE_AS_ANSWER) {
     if (normalized.includes(` ${phrase} `)) return phrase;

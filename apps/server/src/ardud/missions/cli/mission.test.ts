@@ -122,6 +122,28 @@ describe("mission CLI", () => {
     });
   });
 
+  // ardud missions: router (owner requests)
+  it("sends owner requests and replies only with his inbound id", async () => {
+    const { url, seen } = await listen(() => ({ ok: true, request: { id: "request-1" } }));
+    const refused = await run(url, ["request", "open", "m-1", "--text", "How is it going?"]);
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain("--via imessage");
+
+    const via = ["--via", "imessage", "--inbound", "spc-msg-2"];
+    const opened = await run(url, ["request", "open", "m-1", "--text", "How is it going?", ...via]);
+    const replied = await run(url, ["request", "reply", "request-1", "--text", "Ship it", ...via]);
+    expect([opened.code, replied.code]).toEqual([0, 0]);
+    expect(seen.map((entry) => `${entry.method} ${entry.url}`)).toEqual([
+      "POST /api/ardud/missions/desk/requests",
+      "POST /api/ardud/missions/desk/requests/request-1/reply",
+    ]);
+    expect(seen.map((entry) => JSON.parse(entry.body))).toEqual([
+      { missionId: "m-1", text: "How is it going?", inboundId: "spc-msg-2" },
+      { text: "Ship it", inboundId: "spc-msg-2" },
+    ]);
+  });
+  // end ardud missions: router
+
   it("surfaces server refusals", async () => {
     const { url } = await listen(() => ({
       ok: false,

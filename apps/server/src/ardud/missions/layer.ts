@@ -14,6 +14,7 @@ import { RecoveryLive } from "./recovery/layer.ts";
 import { coordShimRouteLayer } from "./router/coordHttp.ts";
 import { RouterAsksPortsLive, RouterLive } from "./router/layer.ts";
 import { masterFeedLayer } from "./router/masterFeed.ts";
+import { requestsDeskRouteLayer } from "./router/requestsHttp.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
 import * as MissionStore from "./store/MissionStore.ts";
@@ -58,4 +59,5 @@ export const ArdudMissionsRoutesLive = Layer.mergeAll(
   policyRouteLayer,
   coordShimRouteLayer,
   recoveryRouteLayer,
+  requestsDeskRouteLayer, // ardud missions: router (owner requests)
 );

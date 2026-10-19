@@ -92,6 +92,8 @@ const LIST_KINDS: ReadonlySet<string> = new Set<MissionStoreKind>([
   "approval",
   "draft",
   "knock",
+  // ardud missions: router
+  "owner-request",
 ]);
 
 /** Records a mission subscriber receives as deltas. No bodies, no inbox items. */
@@ -113,6 +115,8 @@ const OVERVIEW_KINDS: ReadonlySet<string> = new Set([
   "approval",
   "draft",
   "note",
+  // ardud missions: router
+  "owner-request",
 ]);
 
 const INBOX_KINDS: ReadonlySet<string> = new Set<MissionStoreKind>([

@@ -55,6 +55,7 @@ const WRITE_METHODS = Object.values(WS_METHODS).filter(
       "missions.messageBody",
       "missions.roomTuning",
       "missions.attention",
+      "missions.ownerRequests",
     ].includes(method),
 );
 

@@ -4,6 +4,7 @@ import {
   type MessageBodyInput,
   type MissionProvenance,
   type MissionRoomsInput,
+  type OwnerRequestsInput,
   type RoomPageInput,
   type RoomTuningInput,
 } from "@t3tools/contracts";
@@ -54,5 +55,12 @@ export const makeRouterWsHandlers = (
     [WS_METHODS.missionsTuneRoom]: asOwner(router.tuneRoom),
     // The attention view is the owner's and the master's, so it needs the paired session too.
     [WS_METHODS.missionsAttention]: asOwner(router.attention),
+    // The owner's requests to the master: read like rooms, written only by the paired owner.
+    [WS_METHODS.missionsOwnerRequests]: (input: OwnerRequestsInput) =>
+      router.ownerRequests(input, reader),
+    [WS_METHODS.missionsOpenOwnerRequest]: asOwner(router.openRequest),
+    [WS_METHODS.missionsReplyOwnerRequest]: asOwner(router.replyRequest),
+    [WS_METHODS.missionsSettleOwnerRequest]: asOwner(router.settleRequest),
+    [WS_METHODS.missionsReopenOwnerRequest]: asOwner(router.reopenRequest),
   } as const;
 };

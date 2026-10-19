@@ -153,6 +153,12 @@ export const makeReads = (
     const drafts = groupByMission(yield* store.list("draft", { ...wide, status: ["pending"] }));
     const knocks = groupByMission(yield* store.list("knock", { ...wide, status: ["pending"] }));
     const milestones = groupByMission(yield* store.list("milestone", wide));
+    // ardud missions: router (answers the owner has not opened yet)
+    const answered = groupByMission(
+      (yield* store.list("owner-request", { ...wide, status: ["answered"] })).filter(
+        (request) => request.unreadForOwner,
+      ),
+    );
 
     const items = yield* Effect.forEach(
       missions.toSorted(
@@ -170,7 +176,7 @@ export const makeReads = (
             milestones: milestones.get(mission.id) ?? [],
           };
           const entry = yield* healthOf(mission.id, records);
-          return buildListItem({
+          const item = buildListItem({
             mission,
             subMissions: records.subMissions,
             lanes: records.lanes,
@@ -186,6 +192,8 @@ export const makeReads = (
             health: entry.mission,
             subMissionHealth: entry.subMissions,
           });
+          // ardud missions: router
+          return { ...item, requestsAnswered: answered.get(mission.id)?.length ?? 0 };
         }),
     );
     return { revision: yield* store.revision, missions: items };
@@ -222,6 +230,8 @@ export const makeReads = (
       // ardud missions: recovery
       const recovery = currentRecovery();
       const recoveryState = recovery === null ? null : yield* recovery.state(missionId);
+      // ardud missions: router
+      const answered = yield* store.list("owner-request", { ...scope, status: ["answered"] });
       return {
         mission: { ...mission.value, health: entry.mission },
         subMissions:
@@ -246,6 +256,8 @@ export const makeReads = (
         ownerLastLookedAt: since,
         // ardud missions: recovery
         recovery: recoveryState,
+        // ardud missions: router
+        requestsAnswered: answered.filter((request) => request.unreadForOwner).length,
       };
     });
 
