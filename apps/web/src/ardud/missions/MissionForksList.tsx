@@ -69,7 +69,7 @@ export function AskTheMissionForm(props: { missionId: MissionId; onAsked?: () =>
       <Textarea
         size="sm"
         aria-label="Question for the mission"
-        placeholder="A fork of the master answers; the master gets a one-line summary."
+        placeholder="Your question"
         value={question}
         onChange={(event) => setQuestion(event.target.value)}
       />

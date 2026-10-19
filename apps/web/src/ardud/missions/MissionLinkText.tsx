@@ -9,14 +9,15 @@ function linkKey(link: MissionLink | MissionRecordRef): string {
     : `${link.kind}:${link.url ?? link.ref ?? link.label}`;
 }
 
-/** Links separated by dots. */
+/** Links spaced apart on one wrapping line. */
 export function MissionLinkList(props: { links: ReadonlyArray<MissionLink | MissionRecordRef> }) {
-  return props.links.map((link, index) => (
-    <span key={linkKey(link)}>
-      {index > 0 ? " · " : null}
-      <MissionLinkText link={link} />
+  return (
+    <span className="inline-flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
+      {props.links.map((link) => (
+        <MissionLinkText key={linkKey(link)} link={link} />
+      ))}
     </span>
-  ));
+  );
 }
 
 /** A link record as an anchor when it has a URL, plain text otherwise. */

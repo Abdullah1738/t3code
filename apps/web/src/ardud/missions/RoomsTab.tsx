@@ -31,6 +31,7 @@ import {
 import { Textarea } from "../../components/ui/textarea";
 import { Toggle, ToggleGroup } from "../../components/ui/toggle-group";
 import { cn } from "../../lib/utils";
+import { MetaRow } from "./cards/chips";
 import { MissionLinkList } from "./MissionLinkText";
 import { MissionSection } from "./MissionSection";
 import { useMasterRoleId, useMissionRooms } from "./missionsStore";
@@ -50,9 +51,14 @@ export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; n
       <nav aria-label="Rooms" className="flex min-w-0 flex-col gap-3 lg:w-72 lg:shrink-0">
         {groups.map((group) => (
           <div key={group.key} className="flex flex-col gap-1">
-            <h2 className="text-xs font-medium text-muted-foreground">
+            <h2 className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
               {group.label}
-              {group.unread > 0 ? ` · ${group.unread} unread` : ""}
+              {group.unread > 0 ? (
+                <span className="tabular-nums text-foreground">
+                  <span aria-hidden>{group.unread}</span>
+                  <span className="sr-only">{`${group.unread} unread`}</span>
+                </span>
+              ) : null}
             </h2>
             <ul className="flex flex-col gap-1">
               {group.rooms.map(({ room, unread }) => {
@@ -79,8 +85,10 @@ export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; n
                         ) : null}
                       </span>
                       <span className="text-xs text-muted-foreground">
-                        {ROOM_KIND_LABEL[room.kind]}
-                        {noise ? ` · ${noise.line}` : ""}
+                        <MetaRow>
+                          <span>{ROOM_KIND_LABEL[room.kind]}</span>
+                          {noise ? <span>{noise.line}</span> : null}
+                        </MetaRow>
                       </span>
                     </Link>
                   </li>
@@ -99,12 +107,7 @@ export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; n
             masterRoleId={masterRoleId}
             nowMs={props.nowMs}
           />
-        ) : (
-          <p className="text-sm text-muted-foreground">
-            Pick a room. You can read any room and post to it, to one lane, or as a correction to
-            the master.
-          </p>
-        )}
+        ) : null}
       </div>
     </div>
   );
@@ -125,9 +128,13 @@ function OpenRoom(props: {
   return (
     <MissionSection
       title={roomName(page.room)}
-      caption={`${ROOM_KIND_LABEL[page.room.kind]} · ${screen.members.length} members, ${waking} wake on posts${
-        noise ? ` · ${noise.line}` : ""
-      }`}
+      caption={
+        <MetaRow>
+          <span>{ROOM_KIND_LABEL[page.room.kind]}</span>
+          <span>{`${screen.members.length} members, ${waking} wake on posts`}</span>
+          {noise ? <span>{noise.line}</span> : null}
+        </MetaRow>
+      }
     >
       {view ? (
         <RoomTimeline screen={screen} masterRoleId={props.masterRoleId} nowMs={props.nowMs} />
@@ -278,8 +285,10 @@ function MessageRow(props: {
         {receipt ? (
           <span className={receipt.complete ? undefined : "text-warning-foreground"}>
             {receipt.label}
-            {receipt.pending ? ` · ${receipt.pending}` : ""}
           </span>
+        ) : null}
+        {receipt?.pending ? (
+          <span className="text-warning-foreground">{receipt.pending}</span>
         ) : null}
       </div>
       <p className={cn("text-pretty", props.compact ? "text-muted-foreground" : "text-foreground")}>

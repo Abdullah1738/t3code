@@ -11,6 +11,7 @@ import {
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
+import { MetaRow } from "./cards/chips";
 import { MutedLines, PairActionForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import { useMasterRoleId, useMissionRuleBook } from "./missionsStore";
@@ -42,9 +43,19 @@ export function RulesTab(props: {
   };
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <p className="text-sm text-muted-foreground">
-        {view.active.length} active · {view.openChangeRequests} open change requests ·{" "}
-        {view.auditFindings} audit findings · {view.openSuggestions} rule suggestions
+      <p className="text-xs text-muted-foreground tabular-nums">
+        <MetaRow>
+          <span>{`${view.active.length} active`}</span>
+          {view.openChangeRequests > 0 ? (
+            <span>{`${view.openChangeRequests} open change requests`}</span>
+          ) : null}
+          {view.auditFindings > 0 ? (
+            <span className="text-warning-foreground">{`${view.auditFindings} audit findings`}</span>
+          ) : null}
+          {view.openSuggestions > 0 ? (
+            <span>{`${view.openSuggestions} rule suggestions`}</span>
+          ) : null}
+        </MetaRow>
       </p>
       <MissionSection title="Active rules">
         <ul className="flex flex-col divide-y divide-border/60">
@@ -128,7 +139,7 @@ function RuleItem(props: { row: RuleRow; context: RuleContext }) {
       />
       {row.suggestions.map((suggestion) => (
         <p key={suggestion.id} className="text-xs text-muted-foreground">
-          Suggestion: {suggestion.title} ·{" "}
+          Suggestion: {suggestion.title}{" "}
           <Link
             to="/missions/inbox"
             search={{

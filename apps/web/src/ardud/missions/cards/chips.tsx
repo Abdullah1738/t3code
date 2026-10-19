@@ -179,6 +179,15 @@ export function ChipRow(props: { children: ReactNode }) {
   return <div className="flex min-w-0 flex-wrap items-center gap-1.5">{props.children}</div>;
 }
 
+/** Metadata as separate elements spaced apart, never dot-chained. One child per item. */
+export function MetaRow(props: { children: ReactNode }) {
+  return (
+    <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-0.5">
+      {props.children}
+    </span>
+  );
+}
+
 export type StateGlyphKind = "ok" | "done" | "risk" | "bad" | "wait" | "idle" | "park" | "unknown";
 
 const STATE_GLYPH_CLASS: Record<StateGlyphKind, string> = {
