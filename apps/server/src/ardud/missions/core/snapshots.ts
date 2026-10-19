@@ -117,6 +117,138 @@ export interface DirectionCheckInputs {
   readonly since: string | null;
 }
 
+// --- import collapse ----------------------------------------------------------
+//
+// One coord import writes a batch event per record kind, closes stale approvals
+// with import provenance, and policy then records that every imported holder
+// keeps its model. In "Since you last looked" that is one feed line per import,
+// and none of it lands in the direction check: an import changed nothing the
+// owner has to check.
+
+/** Import events further apart than this belong to separate imports. */
+const IMPORT_GAP_MS = 15 * 60 * 1000;
+
+const KIND_WORDS: Readonly<Record<string, readonly [string, string]>> = {
+  mission: ["mission", "missions"],
+  "sub-mission": ["sub-mission", "sub-missions"],
+  role: ["role", "roles"],
+  "role-binding": ["role binding", "role bindings"],
+  lane: ["lane", "lanes"],
+  rule: ["rule", "rules"],
+  "work-item": ["work item", "work items"],
+  approval: ["approval", "approvals"],
+  room: ["room", "rooms"],
+  subscription: ["subscription", "subscriptions"],
+  message: ["message", "messages"],
+  "read-position": ["read position", "read positions"],
+  pool: ["pool", "pools"],
+};
+
+const countOf = (count: number, kind: string): string => {
+  const words = KIND_WORDS[kind] ?? [kind, `${kind}s`];
+  return `${count} ${count === 1 ? words[0] : words[1]}`;
+};
+
+const numberField = (payload: unknown, field: string): number => {
+  const value = payloadField(payload, field);
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+};
+
+const listLength = (payload: unknown, field: string): number => {
+  const value = payloadField(payload, field);
+  return Array.isArray(value) ? value.length : 0;
+};
+
+/**
+ * A policy model event that only records imported holders keeping their
+ * model: nothing was set, nobody waits, so the owner has nothing to check.
+ */
+const isImportFallout = (event: MissionEvent): boolean =>
+  event.kind === "role.model-changed" &&
+  payloadField(event.payload, "phase") === "applied" &&
+  listLength(event.payload, "accepted") > 0 &&
+  listLength(event.payload, "applied") === 0 &&
+  listLength(event.payload, "waiting") === 0;
+
+/** Written by a coord import, or the no-op policy echo of one. */
+export const isImportEvent = (event: MissionEvent): boolean =>
+  event.provenance._tag === "import" || isImportFallout(event);
+
+const importLine = (missionId: string, group: ReadonlyArray<MissionEvent>): FeedItem => {
+  const counts = new Map<string, number>();
+  const add = (kind: string, count: number) => {
+    if (count > 0) counts.set(kind, (counts.get(kind) ?? 0) + count);
+  };
+  let staleClosed = 0;
+  let keptModels = 0;
+  let other = 0;
+  for (const event of group) {
+    if (isImportFallout(event)) {
+      keptModels += 1;
+      continue;
+    }
+    if (event.kind === "import.applied") {
+      const kind = payloadField(event.payload, "kind");
+      if (kind === "room") {
+        add("room", numberField(event.payload, "rooms"));
+        add("subscription", numberField(event.payload, "subscriptions"));
+      } else if (typeof kind === "string") {
+        add(kind, numberField(event.payload, "count"));
+      } else {
+        other += 1;
+      }
+      continue;
+    }
+    if (
+      event.kind === "approval.decided" &&
+      payloadField(event.payload, "status") === "stale-closed"
+    ) {
+      staleClosed += 1;
+      continue;
+    }
+    other += 1;
+  }
+  const parts = [
+    ...[...counts].map(([kind, count]) => countOf(count, kind)),
+    staleClosed > 0 ? `${countOf(staleClosed, "approval")} closed as stale` : null,
+    keptModels === 1 ? "1 role keeps its imported model" : null,
+    keptModels > 1 ? `${keptModels} roles keep their imported model` : null,
+    other > 0 ? `${other} other change${other === 1 ? "" : "s"}` : null,
+  ].filter((part) => part !== null);
+  const newest = group.reduce((latest, event) => (event.at > latest.at ? event : latest));
+  return {
+    kind: "note",
+    summary: cutSummary(
+      parts.length > 0 ? `Imported from coord: ${parts.join(", ")}` : "Imported from coord",
+    ),
+    ref: { kind: "mission", id: missionId, label: "Coord import" },
+    at: newest.at,
+  };
+};
+
+/** One feed line per import among these events (any order). */
+export const collapseImports = (
+  missionId: string,
+  events: ReadonlyArray<MissionEvent>,
+): Array<FeedItem> => {
+  const ordered = events.filter(isImportEvent).toSorted((left, right) => left.seq - right.seq);
+  const groups: Array<Array<MissionEvent>> = [];
+  for (const event of ordered) {
+    const current = groups.at(-1);
+    const last = current?.at(-1);
+    if (
+      current !== undefined &&
+      last !== undefined &&
+      Date.parse(event.at) - Date.parse(last.at) <= IMPORT_GAP_MS
+    ) {
+      current.push(event);
+    } else {
+      groups.push([event]);
+    }
+  }
+  return groups.map((group) => importLine(missionId, group));
+};
+
 export const buildDirectionCheck = (inputs: DirectionCheckInputs): Array<DirectionCheckItem> => {
   const fromCalls = inputs.calls
     .filter((call) => call.ownerReaction === null && after(call.createdAt, inputs.since))
@@ -131,6 +263,7 @@ export const buildDirectionCheck = (inputs: DirectionCheckInputs): Array<Directi
       (event) =>
         STRUCTURAL_EVENTS.has(event.kind) &&
         event.actor._tag !== "owner" &&
+        !isImportEvent(event) &&
         after(event.at, inputs.since),
     )
     .map((event): DirectionCheckItem => ({
@@ -348,14 +481,17 @@ const feedKindOf = (event: MissionEvent): FeedItem["kind"] | null => {
 };
 
 export interface FeedInputs {
+  readonly missionId: string;
   readonly events: ReadonlyArray<MissionEvent>;
   readonly notes: ReadonlyArray<Note>;
   readonly since: string | null;
 }
 
 export const buildFeed = (inputs: FeedInputs): Array<FeedItem> => {
-  const fromEvents = inputs.events.flatMap((event): Array<FeedItem> => {
-    if (!after(event.at, inputs.since)) return [];
+  const recent = inputs.events.filter((event) => after(event.at, inputs.since));
+  const imports = collapseImports(inputs.missionId, recent);
+  const fromEvents = recent.flatMap((event): Array<FeedItem> => {
+    if (isImportEvent(event)) return [];
     const kind = feedKindOf(event);
     return kind === null
       ? []
@@ -369,7 +505,10 @@ export const buildFeed = (inputs: FeedInputs): Array<FeedItem> => {
       ref: { kind: "note", id: note.id },
       at: note.createdAt,
     }));
-  return newestFirst([...fromEvents, ...fromNotes], (item) => item.at).slice(0, FEED_LIMIT);
+  return newestFirst([...imports, ...fromEvents, ...fromNotes], (item) => item.at).slice(
+    0,
+    FEED_LIMIT,
+  );
 };
 
 // --- inbox --------------------------------------------------------------------

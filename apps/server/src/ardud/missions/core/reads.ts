@@ -250,7 +250,7 @@ export const makeReads = (
           lanes,
           roles,
         }),
-        feed: view?.feed ?? buildFeed({ events, notes, since }),
+        feed: view?.feed ?? buildFeed({ missionId, events, notes, since }),
         lanes: countLanes(lanes),
         ownerLastLookedAt: since,
         // ardud missions: recovery
