@@ -1,14 +1,23 @@
-import { OwnerRequestId, RoleId, ThreadId, type MissionProvenance } from "@t3tools/contracts";
+import {
+  OwnerRequestId,
+  RoleId,
+  ThreadId,
+  type MissionLink,
+  type MissionProvenance,
+} from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as AsksService from "../asks/AsksService.ts";
 import {
   agent,
+  askInput,
   failureCode,
   governor,
+  harness as asksHarness,
   laneThread,
   masterThread,
   missionId,
@@ -1039,6 +1048,219 @@ describe("who reads a request's words", () => {
         yield* failureCode(router.messageBody({ messageId: page.messages[0]!.id }, wsClient)),
         "forbidden",
       );
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
+describe("owner conditions, sol boundary 4", () => {
+  const ticket: MissionLink = { kind: "ticket", label: "CRP-1", url: null, ref: "CRP-1" };
+
+  /** The router's conditions under the real asks service, one store between them. */
+  const integrated = () => {
+    const threads = fakeRouterThreads();
+    const asks = asksHarness();
+    // Fresh: the asks harness built one without the router's conditions.
+    const layer = Layer.fresh(AsksService.layer).pipe(
+      Layer.provideMerge(ownerConditionsOverRouter),
+      Layer.provideMerge(routerOverFakes(threads)),
+      Layer.provideMerge(asks.layer),
+    );
+    return { layer };
+  };
+
+  it.effect("a question never answers an ask or decides a draft, however it ends", () => {
+    const h = integrated();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const router = yield* MissionRouter.MissionRouter;
+      const ask = yield* asks.openAsk(askInput("Which migration?"), agent(laneThread));
+      const askRef = { kind: "ask", id: ask.id } as const;
+      const askTalk = yield* router.openRequest(
+        { missionId, text: "Hmm.", subject: askRef },
+        ownerApp,
+      );
+      const answerOn = (quote: string) =>
+        asks.answerAsk(
+          {
+            askId: ask.id,
+            optionId: "a",
+            text: "",
+            onOwnerCondition: { requestId: askTalk.id, quote },
+          },
+          master,
+        );
+      // Each one in turn is his newest message; none of them is a condition.
+      for (const question of [
+        'Should I select Online?"',
+        "Can we merge it now？",
+        "Should I select Online?)",
+        "Should I select Online?' ",
+        "Should I select Online?”",
+        "Should I select Online?»",
+        "¿Should I select Online",
+        "Should I select Online؟",
+        "Should I select Online⸮",
+      ]) {
+        yield* router.replyRequest({ requestId: askTalk.id, text: question }, ownerApp);
+        assert.strictEqual(yield* failureCode(answerOn(question)), "forbidden", question);
+      }
+      assert.strictEqual((yield* asks.ask(ask.id)).status, "open");
+
+      const draft = yield* asks.submitDraft(
+        { missionId, audience: "Sami", channel: "linear", target: ticket, text: "Merged." },
+        agent(writerThread),
+      );
+      const draftRef = { kind: "draft", id: draft.id } as const;
+      const draftTalk = yield* router.openRequest(
+        { missionId, text: "Can we send it now？", subject: draftRef },
+        ownerApp,
+      );
+      const decideOn = (quote: string) =>
+        asks.decideDraft(
+          {
+            draftId: draft.id,
+            action: "approve",
+            revision: 0,
+            onOwnerCondition: { requestId: draftTalk.id, quote },
+          },
+          master,
+        );
+      assert.strictEqual(yield* failureCode(decideOn("Can we send it now？")), "forbidden");
+      yield* router.replyRequest({ requestId: draftTalk.id, text: 'Send it?"' }, ownerApp);
+      assert.strictEqual(yield* failureCode(decideOn('Send it?"')), "forbidden");
+      assert.strictEqual((yield* asks.drafts({ missionId }))[0]!.status, "pending");
+
+      // A plain condition still works for both.
+      yield* router.replyRequest(
+        { requestId: askTalk.id, text: "Use Online if tests pass." },
+        ownerApp,
+      );
+      const answered = yield* answerOn("Use Online if tests pass.");
+      assert.strictEqual(answered.ask.status, "answered");
+      yield* router.replyRequest(
+        { requestId: draftTalk.id, text: "Send it once CI is green." },
+        ownerApp,
+      );
+      const decided = yield* decideOn("Send it once CI is green");
+      assert.strictEqual(decided.draft.status, "approved");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("only his newest words in an open request stand as a condition", () => {
+    const h = integrated();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const router = yield* MissionRouter.MissionRouter;
+      const conditions = yield* OwnerConditions;
+      const ask = yield* asks.openAsk(askInput("Which migration?"), agent(laneThread));
+      const askRef = { kind: "ask", id: ask.id } as const;
+      const talk = yield* router.openRequest(
+        { missionId, text: "Use Online if tests pass.", subject: askRef },
+        ownerApp,
+      );
+      const verify = (quote: string) =>
+        conditions.verify({ subject: askRef, condition: { requestId: talk.id, quote } });
+      // His newest message stands.
+      yield* verify("Use Online if tests pass.");
+      // Sol's steps: he withdraws it; the master quotes the first one anyway.
+      yield* router.replyRequest(
+        {
+          requestId: talk.id,
+          text: "I withdraw that condition. Do not answer this ask until I decide.",
+        },
+        ownerApp,
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          asks.answerAsk(
+            {
+              askId: ask.id,
+              optionId: "a",
+              text: "",
+              onOwnerCondition: { requestId: talk.id, quote: "Use Online if tests pass." },
+            },
+            master,
+          ),
+        ),
+        "forbidden",
+      );
+      assert.strictEqual((yield* asks.ask(ask.id)).status, "open");
+      // The master's reply after his words does not hide them.
+      yield* router.replyRequest(
+        { requestId: talk.id, text: "Understood, holding until you decide." },
+        master,
+      );
+      yield* verify("Do not answer this ask until I decide.");
+
+      // He settles: nothing he said there stands any more.
+      yield* router.replyRequest({ requestId: talk.id, text: "Use Offline." }, ownerApp);
+      yield* verify("Use Offline.");
+      yield* router.settleRequest({ requestId: talk.id }, ownerApp);
+      assert.strictEqual(yield* failureCode(verify("Use Offline.")), "forbidden");
+      // Reopened by the master, his words from before still do not stand.
+      yield* router.reopenRequest({ requestId: talk.id }, master);
+      assert.strictEqual(yield* failureCode(verify("Use Offline.")), "forbidden");
+      // Nor after his own bare reopen.
+      yield* router.settleRequest({ requestId: talk.id }, ownerApp);
+      yield* router.reopenRequest({ requestId: talk.id }, ownerApp);
+      assert.strictEqual(yield* failureCode(verify("Use Offline.")), "forbidden");
+      // His newest words after the reopen do.
+      yield* router.replyRequest({ requestId: talk.id, text: "Use Online after all." }, ownerApp);
+      yield* verify("Use Online after all.");
+      // A reopen with his note: the note is his newest message.
+      yield* router.settleRequest({ requestId: talk.id }, ownerApp);
+      yield* router.reopenRequest(
+        { requestId: talk.id, note: "Go with Offline tonight." },
+        ownerApp,
+      );
+      assert.strictEqual(yield* failureCode(verify("Use Online after all.")), "forbidden");
+      const answered = yield* asks.answerAsk(
+        {
+          askId: ask.id,
+          optionId: "b",
+          text: "",
+          onOwnerCondition: { requestId: talk.id, quote: "Go with Offline tonight." },
+        },
+        master,
+      );
+      assert.strictEqual(answered.ask.status, "answered");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a settled request does not reopen over another open one about its record", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const subject = { kind: "work-item", id: "wi-free" } as const;
+      const first = yield* router.openRequest(
+        { missionId, text: "Why is this free?", subject },
+        ownerApp,
+      );
+      yield* router.settleRequest({ requestId: first.id }, ownerApp);
+      const second = yield* router.openRequest(
+        { missionId, text: "Who has it now?", subject },
+        ownerApp,
+      );
+      assert.notStrictEqual(second.id, first.id);
+      for (const who of [ownerApp, master]) {
+        const refused = yield* Effect.flip(router.reopenRequest({ requestId: first.id }, who));
+        assert.strictEqual(refused.code, "conflict");
+        assert.include(refused.detail, second.id);
+      }
+      const open = (yield* router.ownerRequests({ missionId }, ownerApp)).requests.filter(
+        (view) => view.request.status !== "settled",
+      );
+      assert.deepStrictEqual(
+        open.map((view) => view.request.id),
+        [second.id],
+      );
+      // Once the other one settles, it reopens.
+      yield* router.settleRequest({ requestId: second.id }, ownerApp);
+      const reopened = yield* router.reopenRequest({ requestId: first.id }, ownerApp);
+      assert.strictEqual(reopened.status, "waiting-on-master");
     }).pipe(Effect.provide(h.layer));
   });
 });

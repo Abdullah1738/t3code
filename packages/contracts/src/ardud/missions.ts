@@ -215,8 +215,8 @@ export type MissionRecordRef = typeof MissionRecordRef.Type;
 /**
  * A decision a master made on a condition the owner stated in a Discuss
  * conversation (an owner request about the record). `quote` is the owner's
- * exact words; the deciding service checks they are in one of his messages in
- * that request before it records the decision.
+ * exact words; the deciding service checks they are in his newest message in
+ * that request, while it is open, before it records the decision.
  */
 export const OwnerCondition = Schema.Struct({
   requestId: OwnerRequestId,
@@ -1623,6 +1623,11 @@ export const OwnerRequest = Schema.Struct({
   // --- discuss additions (coordinator) ---
   /** The record the owner is discussing (Discuss on a card). At most one open request per subject. */
   subject: Schema.optional(Schema.NullOr(MissionRecordRef)),
+  /**
+   * The room's last message seq when the request last reopened. Only the
+   * owner's words after it can stand as a condition.
+   */
+  reopenedAfterSeq: Schema.optional(NonNegativeInt),
   // --- end discuss additions ---
   /**
    * Newest message in the request's room, whoever wrote it, flattened to one line

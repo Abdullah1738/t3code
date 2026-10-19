@@ -240,11 +240,20 @@ const sentencesOf = (text: string): ReadonlyArray<string> =>
     .filter((sentence) => sentence.length > 0);
 
 /**
+ * Any question mark anywhere in a sentence makes it a question: `?` before a
+ * closing quote or bracket, `¿` up front, the Arabic, reversed, Armenian and
+ * Ethiopic marks and the interrobang. NFKC folds the fullwidth, small and
+ * vertical forms (and `⁇`, `⁈`, `⁉`) into `?`.
+ */
+const QUESTION_MARK = /[?\u00BF\u061F\u2E2E\u203D\u055E\u1367]/u;
+const isQuestion = (sentence: string) => QUESTION_MARK.test(sentence.normalize("NFKC"));
+
+/**
  * True when `said` holds every sentence of `quote`, in a row. A question is
  * never a condition, so a quote with one never holds.
  */
 const holdsSentences = (said: ReadonlyArray<string>, quote: ReadonlyArray<string>) => {
-  if (quote.some((sentence) => sentence.endsWith("?"))) return false;
+  if (quote.some(isQuestion)) return false;
   for (let start = 0; start + quote.length <= said.length; start += 1) {
     if (quote.every((sentence, at) => said[start + at] === sentence)) return true;
   }
@@ -942,6 +951,15 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             deliveries: [] as ReadonlyArray<ThreadId>,
           };
           if (request.status !== "settled") return none;
+          // One open request per record, as open keeps it.
+          const subject = request.subject ?? null;
+          const ongoing = subject === null ? null : yield* openAbout(request.missionId, subject);
+          if (subject !== null && ongoing !== null && ongoing.id !== request.id) {
+            return yield* fail(
+              "conflict",
+              `Request "${ongoing.title}" (${ongoing.id}) is already open about ${subject.kind} ${subject.id}; continue there.`,
+            );
+          }
           const owner = writer._tag === "owner";
           const event = (next: OwnerRequest): RequestCommit => ({
             kind: "request.reopened",
@@ -952,7 +970,10 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           });
           if (!owner && input.note === undefined) {
             const at = yield* nowIso;
-            const next = reopenedByMaster(request, at, false);
+            const next = {
+              ...reopenedByMaster(request, at, false),
+              reopenedAfterSeq: yield* rooms.lastMessageSeq(request.missionId),
+            };
             const commit = event(next);
             yield* store.commit({
               event: {
@@ -986,9 +1007,15 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             input: message,
             provenance,
             author: writer.actor,
-            asRequest: (_message, at) => {
+            asRequest: (message, at) => {
               const next = withLastReply(
-                owner ? afterOwnerSpoke(request, at) : reopenedByMaster(request, at, true),
+                {
+                  ...(owner ? afterOwnerSpoke(request, at) : reopenedByMaster(request, at, true)),
+                  // Words from before the reopen no longer stand; the owner's own note
+                  // does, the stock "Reopened by the owner." does not.
+                  reopenedAfterSeq:
+                    owner && input.note !== undefined ? message.seq - 1 : message.seq,
+                },
                 text,
                 writer.actor,
                 at,
@@ -1076,21 +1103,27 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         });
       });
 
-    /** Whether the owner wrote `quote` in one of his own messages in the room. */
-    const ownerSaid = (roomId: RoomId, quote: string): Effect.Effect<boolean> =>
+    /**
+     * Whether `quote` is in the owner's newest message of his own in the
+     * request since it last reopened. A later message of his replaces what he
+     * said before, so a withdrawn condition never stands.
+     */
+    const ownerSaid = (request: OwnerRequest, quote: string): Effect.Effect<boolean> =>
       Effect.gen(function* () {
         const wanted = sentencesOf(quote);
         if (wanted.length === 0) return false;
+        const after = request.reopenedAfterSeq ?? 0;
         let before: number | null = null;
         for (;;) {
           const page: {
             readonly messages: ReadonlyArray<MissionMessage>;
             readonly hasOlder: boolean;
-          } = yield* rooms.roomMessages(roomId, before, VERIFY_PAGE);
-          for (const message of page.messages) {
+          } = yield* rooms.roomMessages(request.roomId, before, VERIFY_PAGE);
+          for (const message of page.messages.toReversed()) {
+            if (message.seq <= after) return false;
             if (!ownWords(message)) continue;
             const body = message.hasBody ? yield* rooms.messageBody(message.id) : null;
-            if (holdsSentences(sentencesOf(body ?? message.summary), wanted)) return true;
+            return holdsSentences(sentencesOf(body ?? message.summary), wanted);
           }
           const oldest: MissionMessage | undefined = page.messages[0];
           if (!page.hasOlder || oldest === undefined) return false;
@@ -1116,10 +1149,16 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             `Request ${input.condition.requestId} is not the owner's conversation about ${input.subject.kind} ${input.subject.id}.`,
           );
         }
-        if (!(yield* ownerSaid(request.roomId, input.condition.quote))) {
+        if (request.status === "settled") {
           return yield* fail(
             "forbidden",
-            "The owner did not say that in this request; quote his words exactly.",
+            `Request ${request.id} is settled; what the owner said there no longer stands.`,
+          );
+        }
+        if (!(yield* ownerSaid(request, input.condition.quote))) {
+          return yield* fail(
+            "forbidden",
+            "That is not in the owner's newest message in this request; quote his latest words exactly.",
           );
         }
       });

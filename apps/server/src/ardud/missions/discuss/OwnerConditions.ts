@@ -17,9 +17,10 @@ export class OwnerConditions extends Context.Service<
   OwnerConditions,
   {
     /**
-     * Succeeds only when `condition.requestId` is an owner request about
-     * `subject` and `condition.quote` appears verbatim in one of the owner's own
-     * messages in it. Fails `forbidden` otherwise.
+     * Succeeds only when `condition.requestId` is an open owner request about
+     * `subject` and `condition.quote` is whole sentences, none a question, of
+     * the owner's newest message of his own in it since it last reopened.
+     * Fails `forbidden` otherwise.
      */
     readonly verify: (input: {
       readonly subject: MissionRecordRef;
