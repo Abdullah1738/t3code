@@ -12,6 +12,7 @@ import {
   type MissionLink,
   type MissionProvenance,
   type MissionRecordRef,
+  type RecordView,
   type Suggestion,
   type SuggestionAuthor,
   type SuggestionId,
@@ -46,6 +47,7 @@ export interface SuggestionProposal {
   readonly why: string;
   readonly evidence: ReadonlyArray<SuggestionEvidence>;
   readonly acceptor: SuggestionAcceptor;
+  readonly view?: RecordView;
 }
 
 /** Decided suggestions needed before an author's bar can move. */
@@ -238,6 +240,7 @@ export const proposeSuggestion = (
     decidedBy: null,
     decidedAt: null,
     createdAt: command.now,
+    ...(proposal.view === undefined ? {} : { view: proposal.view }),
   };
   return ok({
     record,

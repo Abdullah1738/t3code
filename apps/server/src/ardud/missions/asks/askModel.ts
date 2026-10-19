@@ -228,6 +228,7 @@ export const openAsk = (command: OpenAskCommand): Outcome<Transition<Ask>> => {
     answer: null,
     createdAt: command.now,
     updatedAt: command.now,
+    ...(input.view === undefined ? {} : { view: input.view }),
   };
   return ok({
     record,

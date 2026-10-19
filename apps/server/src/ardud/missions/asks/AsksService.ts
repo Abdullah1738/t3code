@@ -873,6 +873,7 @@ const make = Effect.gen(function* () {
           route,
           writtenBy: { roleId: drafting?.id ?? null, model: binding?.observedModel ?? null },
           about,
+          ...(input.view === undefined ? {} : { view: input.view }),
           notes,
           existing,
           now: yield* now,
@@ -894,6 +895,7 @@ const make = Effect.gen(function* () {
           text: input.text,
           caller: standing.caller,
           notes: yield* allDraftNotes(draft.missionId),
+          ...(input.view === undefined ? {} : { view: input.view }),
           now: yield* now,
         }),
       );
@@ -1220,6 +1222,7 @@ const make = Effect.gen(function* () {
             why: input.why,
             evidence: input.evidence,
             acceptor,
+            ...(input.view === undefined ? {} : { view: input.view }),
           },
           author,
           caller: standing?.caller ?? bareCaller(provenance),

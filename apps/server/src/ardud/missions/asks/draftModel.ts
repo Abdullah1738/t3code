@@ -28,6 +28,7 @@ import {
   type MissionProvenance,
   type MissionRecordRef,
   type OpenSystemDraftInput,
+  type RecordView,
   type ReportDraftSentInput,
   type RoleId,
   type SubMissionId,
@@ -216,6 +217,7 @@ export interface SubmitDraftCommand {
   readonly writtenBy: NonNullable<Draft["writtenBy"]>;
   /** What it is about; missing means nothing in particular. */
   readonly about?: DraftAbout;
+  readonly view?: RecordView;
   readonly now: string;
 }
 
@@ -278,6 +280,7 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
     revision: 0,
     revisedAt: command.now,
     ...(command.about ?? NOT_ABOUT),
+    ...(command.view === undefined ? {} : { view: command.view }),
   };
   const asks = command.route.approver === "master" ? " (for the master)" : "";
   return ok({
@@ -461,10 +464,12 @@ export interface ReviseDraftCommand {
   readonly text: string;
   readonly caller: MissionCaller;
   readonly notes: ReadonlyArray<DraftNote>;
+  /** Replaces the draft's view when given. */
+  readonly view?: RecordView;
   readonly now: string;
 }
 
-/** The writer answers a rewrite request; the draft goes back to the owner. */
+/** The writer answers a rewrite request; the draft goes back to the owner with `previousText` set. */
 export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Draft>> => {
   const { draft, caller } = command;
   if (callerIsOwner(caller)) {
@@ -496,11 +501,13 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
   const record: Draft = {
     ...draft,
     text,
+    previousText: draft.text,
     status: "pending",
     appliedNoteIds: applied.map((note) => note.id),
     decidedBy: null,
     decidedAt: null,
     ...nextEpoch(draft, command.now),
+    ...(command.view === undefined ? {} : { view: command.view }),
   };
   return ok({
     record,
@@ -807,6 +814,7 @@ export const openSystemDraft = (command: OpenSystemDraftCommand): Outcome<System
     revision: 0,
     revisedAt: command.now,
     ...(command.about ?? NOT_ABOUT),
+    ...(input.view === undefined ? {} : { view: input.view }),
   };
   const asks = command.route.approver === "master" ? " (for the master)" : "";
   return ok({
