@@ -35,7 +35,9 @@ import {
   SetMissionStatusInput,
   SplitLaneInput,
   SubMissionId,
+  ThreadId,
   TrimmedNonEmptyString,
+  TurnItemId,
   UpdateForkInput,
   UpdateMissionInput,
   UpsertLaneInput,
@@ -52,6 +54,7 @@ import * as Schema from "effect/Schema";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as AsksService from "../asks/AsksService.ts";
+import * as MasterControls from "../core/MasterControls.ts";
 import * as RuleService from "../core/RuleService.ts";
 import * as MissionService from "../MissionService.ts";
 import { MakeCallInput, OpenAskRequest, ProposeSuggestionInput } from "../asks/inputs.ts";
@@ -432,11 +435,16 @@ const missionWriteTool = <Name extends string, P extends Schema.Constraint>(
     dependencies: planDependencies,
   });
 
-const MissionCreateTool = missionWriteTool(
-  "mission_create",
-  "As a mission master, create a new mission (slug and title required; tier, weight and shares optional). It starts active with no master.",
-  CreateMissionInput,
-);
+const MissionCreateTool = Tool.make("mission_create", {
+  description:
+    "As a mission master, create a new mission (slug and title required; tier, weight and shares optional). It starts active with no master.",
+  parameters: CreateMissionInput,
+  success: MissionMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  // ardud missions: core - finds the caller's mastered mission from the complete thread index
+  dependencies: [...planDependencies, MasterControls.MasterControls],
+});
 
 const MissionUpdateTool = missionWriteTool(
   "mission_update",
@@ -567,6 +575,25 @@ const MissionRuleChangeResolveTool = Tool.make("mission_rule_change_resolve", {
   dependencies: ruleDependencies,
 });
 
+// ardud missions: core - the master closes a member's secret card; the value stays the owner's.
+const MissionSecretRequestCloseTool = Tool.make("mission_secret_request_close", {
+  description:
+    "As the mission's master, decline a member thread's pending secret request (the agent hears declined) or withdraw it (closed as cancelled). You never supply or see a value: only the owner fills a secret card. It goes on the mission timeline as you.",
+  parameters: Schema.Struct({
+    missionId: MissionId,
+    threadId: ThreadId,
+    turnItemId: TurnItemId,
+    closeAs: Schema.Literals(["decline", "withdraw"]),
+  }),
+  success: Schema.Struct({
+    seq: NonNegativeInt,
+    status: Schema.Literals(["declined", "cancelled"]),
+  }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: [...dependencies, MasterControls.MasterControls],
+});
+
 interface ToolConfig {
   readonly parameters: Schema.Constraint;
   readonly success: Schema.Constraint;
@@ -645,4 +672,5 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionRuleUseTool, "Record a rule applied or broken"),
   writeTool(MissionRuleChangeTool, "Ask for a rule change"),
   writeTool(MissionRuleChangeResolveTool, "Resolve a rule change request"),
+  writeTool(MissionSecretRequestCloseTool, "Decline or withdraw a member's secret request"),
 );

@@ -3,6 +3,7 @@ import * as Layer from "effect/Layer";
 import * as AsksService from "./asks/AsksService.ts";
 import { missionsDeskRouteLayer } from "./asks/http.ts";
 import { asksWiringLayer } from "./asks/wiring.ts";
+import * as MasterControls from "./core/MasterControls.ts";
 import * as RuleService from "./core/RuleService.ts";
 import { editorWiringLayer } from "./editorWiring.ts";
 import { missionsRouteLayer } from "./http.ts";
@@ -40,6 +41,8 @@ const MissionTracksLive = Layer.mergeAll(
  */
 export const ArdudMissionsLive = Layer.mergeAll(
   RuleService.layer,
+  // master-anywhere lookups and secret-card closes (SecretRequests comes from server.ts)
+  MasterControls.layer,
   editorWiringLayer,
   asksWiringLayer.pipe(Layer.provide(RuleService.layer)),
   // the master's inbox feed: editor digests, master-routed approvals and drafts

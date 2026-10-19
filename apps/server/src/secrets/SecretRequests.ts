@@ -32,7 +32,12 @@ import * as Semaphore from "effect/Semaphore";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 // ardud missions: core
 import type { EnvironmentAuthorizationError, MissionProvenance } from "@t3tools/contracts";
-import { requireOwnerSecretAnswer } from "../ardud/missions/core/secrets.ts";
+import {
+  requireSecretAnswerAuthority,
+  secretStatusOf,
+  type MasterSecretClose,
+  type SecretAnswerInput,
+} from "../ardud/missions/core/secrets.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 
@@ -72,11 +77,12 @@ export class SecretRequests extends Context.Service<
      * Answers a pending request in a thread. Saving stores the value under a
      * new ref that the requesting tool reads from the request's status.
      * ardud missions: core - `answeredBy` is the transport-derived caller;
-     * only the paired owner answers a card.
+     * only the paired owner saves a value. A mission master's grant may
+     * decline or withdraw its own member's card, nothing else.
      */
     readonly answer: (
-      input: SecretRequestAnswerInput,
-      answeredBy: MissionProvenance | null,
+      input: SecretRequestAnswerInput | SecretAnswerInput,
+      answeredBy: MissionProvenance | MasterSecretClose | null,
     ) => Effect.Effect<void, SecretRequestError | EnvironmentAuthorizationError>;
     /** The ref minted when this request was saved, for the tool that asked. */
     readonly savedRef: (input: {
@@ -110,7 +116,7 @@ const make = Effect.gen(function* () {
         "secret_request.answer": input.answer.type,
       });
       // ardud missions: core
-      yield* requireOwnerSecretAnswer(answeredBy);
+      yield* requireSecretAnswerAuthority(input, answeredBy);
       const records = yield* threadManagement
         .getThreadRecords(input.threadId, ["runs", "turnItems"], {
           turnItemTypes: ["secret_request"],
@@ -152,7 +158,8 @@ const make = Effect.gen(function* () {
             ),
           );
       }
-      const secretStatus = input.answer.type === "save" ? "saved" : "declined";
+      // ardud missions: core - a master's withdraw closes the card as cancelled
+      const secretStatus = secretStatusOf(input.answer);
       yield* threadManagement
         .dispatch({
           type: "secret_request.record",

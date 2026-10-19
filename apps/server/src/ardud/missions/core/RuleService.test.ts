@@ -14,6 +14,7 @@ import {
   seed,
 } from "../asks/AsksService.testkit.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import { crowdMissions } from "./crowd.testkit.ts";
 import * as RuleService from "./RuleService.ts";
 
 const master = agent(masterThread);
@@ -165,6 +166,34 @@ it.effect("anyone asks for a rule change; the owner can discuss it; the master r
         }),
       ),
       "conflict",
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("N10: the master of a mission past the first page of missions keeps rule control", () => {
+  const { layer } = rulesLayer();
+  return Effect.gen(function* () {
+    yield* seed;
+    yield* crowdMissions;
+    const rules = yield* RuleService.RuleService;
+    const global = yield* rules.upsertRule(master, {
+      missionId: null,
+      title: "Plain words",
+      quote: "Write plainly.",
+    });
+    assert.isNull(global.missionId);
+    const local = yield* rules.upsertRule(master, {
+      missionId,
+      title: "Quiet deploys",
+      quote: "No deploys on Fridays.",
+    });
+    assert.equal(local.missionId, missionId);
+    // A member is still no master, wherever its mission sits.
+    assert.equal(
+      yield* failureCode(
+        rules.upsertRule(laneAgent, { missionId: null, title: "Mine", quote: "Mine." }),
+      ),
+      "forbidden",
     );
   }).pipe(Effect.provide(layer));
 });
