@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  LaneId,
   MissionError,
   MissionId,
   PoolHoldId,
@@ -27,6 +28,7 @@ import {
 } from "../asks/AsksService.testkit.ts";
 import * as MissionService from "../MissionService.ts";
 import * as PolicyService from "../policy/PolicyService.ts";
+import * as MissionRouter from "../router/MissionRouter.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as Model from "./model.ts";
 import * as RecoveryService from "./RecoveryService.ts";
@@ -41,6 +43,7 @@ import {
   itemRow,
   plus,
   previousBoot,
+  routedHarness,
   runRow,
   subMission,
   test,
@@ -815,5 +818,494 @@ it.effect("the master stays first and in charge past a thousand newer bindings",
       status.incident?.threads.find((thread) => thread.threadId === webThread)?.state,
       "held",
     );
+  }).pipe(Effect.provide(layer));
+});
+
+// --- recovery r3: notices through the router ---
+
+it.effect("notices reach members through their control room, once per incident and thread", () => {
+  const { threads, layer } = routedHarness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    const incident = yield* boot;
+    assert.isNotNull(incident);
+    const recovery = yield* RecoveryService.RecoveryService;
+    const router = yield* MissionRouter.MissionRouter;
+    const control = MissionRouter.controlRoomId(missionId);
+    const posts = Effect.map(router.roomPage({ roomId: control }, ownerApp), (page) =>
+      page.messages.map((message) => [message.author, message.to]),
+    );
+    const directSends = () => threads.sent.filter((sent) => sent.key.startsWith("recovery:"));
+
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.deepStrictEqual(yield* posts, [
+      [
+        { _tag: "system", component: "missions-recovery" },
+        [{ _tag: "thread", threadId: masterThread }],
+      ],
+    ]);
+    assert.deepStrictEqual(directSends(), []);
+
+    // The save after the post is lost, and the master's binding ends before
+    // the retry: the router would now send it directly. Recovery knows it went.
+    const recoveryStore = yield* RecoveryStore.RecoveryStore;
+    const saved = yield* recoveryStore.incident(incident?.id ?? "");
+    assert.isNotNull(saved);
+    if (saved === null) return;
+    yield* recoveryStore.saveIncident(
+      {
+        ...saved,
+        threads: saved.threads.map((thread) =>
+          thread.threadId === masterThread
+            ? { ...thread, state: "pending", noticeAt: null }
+            : thread,
+        ),
+      },
+      plus(RESTART + 46),
+    );
+    const store = yield* MissionStore.MissionStore;
+    yield* store.upsert(
+      {
+        _tag: "role-binding",
+        record: {
+          ...binding("b-master", "role-master", masterThread),
+          endedAt: plus(RESTART + 46),
+        },
+      },
+      {
+        missionId,
+        kind: "role.unbound",
+        actor: { _tag: "system", component: "test" },
+        provenance: test,
+        summary: "master leaves",
+        subject: null,
+      },
+    );
+    assert.strictEqual(yield* recovery.tick, 0);
+    assert.deepStrictEqual(directSends(), []);
+    assert.strictEqual((yield* posts).length, 1);
+
+    // The lane hears through the same room after the master's lead.
+    yield* TestClock.adjust("61 seconds");
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.deepStrictEqual(
+      (yield* posts).map(([, to]) => to),
+      [[{ _tag: "thread", threadId: masterThread }], [{ _tag: "thread", threadId: laneThread }]],
+    );
+    const routes = (yield* store.eventsSince(missionId, 0))
+      .filter((event) => event.kind === "recovery.notice-sent")
+      .map((event) => (event.payload as { readonly route?: string } | null)?.route);
+    assert.deepStrictEqual(routes, ["posted", "already-sent", "posted"]);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a notice whose send was never confirmed is held for a human, not sent twice", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    assert.isNotNull(yield* boot);
+    const recovery = yield* RecoveryService.RecoveryService;
+    const laneState = Effect.map(recovery.status(missionId), (status) =>
+      status.incident?.threads.find((thread) => thread.threadId === laneThread),
+    );
+    assert.strictEqual(yield* recovery.tick, 1);
+
+    // The router refuses it once: nothing went out, so the next round tries again.
+    fake.refuse.set(laneThread, new MissionError({ code: "conflict", detail: "Room is busy." }));
+    yield* TestClock.adjust("61 seconds");
+    assert.strictEqual(yield* recovery.tick, 0);
+    assert.strictEqual((yield* laneState)?.state, "failed");
+    fake.refuse.delete(laneThread);
+
+    // This time it goes out and the server stops before the router answers.
+    fake.crash.add(laneThread);
+    yield* TestClock.adjust("1 second");
+    assert.isTrue((yield* Effect.exit(recovery.tick))._tag === "Failure");
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => sent.threadId),
+      [masterThread, laneThread],
+    );
+
+    // Whether it arrived is unknown: the next round holds it instead of guessing.
+    assert.strictEqual(yield* recovery.tick, 0);
+    const held = yield* laneState;
+    assert.strictEqual(held?.state, "held");
+    assert.strictEqual(
+      held?.stateReason,
+      "the last send stopped before it was confirmed; release it or resume it now to send again",
+    );
+    assert.strictEqual(fake.sent.length, 2);
+
+    // The owner sends it again on purpose, once.
+    yield* recovery.resume(ownerApp, { missionId, mode: "now", threadId: laneThread });
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => sent.threadId),
+      [masterThread, laneThread, laneThread],
+    );
+    // A fresh router key: the text may have changed since the lost send.
+    assert.strictEqual(fake.sent[2]?.key, `${fake.sent[1]?.key}#1`);
+    // The hold is on the timeline, then the owner's decision.
+    const events = yield* (yield* MissionStore.MissionStore).recentEvents(missionId, 20);
+    assert.deepStrictEqual(
+      events
+        .filter((event) => event.kind === "recovery.thread-decided")
+        .map((event) => event.actor._tag),
+      ["owner", "system"],
+    );
+    assert.isNull((yield* recovery.status(missionId)).state);
+  }).pipe(Effect.provide(layer));
+});
+
+// --- recovery r3: boot after boot ---
+
+interface BootCut {
+  readonly ordinal: number;
+  readonly command: string;
+  readonly threadId?: ThreadId;
+}
+
+/** The running server beats, stops, and a new one comes up `seconds` after T0. */
+const startAt = (seconds: number, cut: BootCut | null) =>
+  Effect.gen(function* () {
+    yield* (yield* RecoveryService.RecoveryService).beat;
+    yield* TestClock.setTime(T0 + seconds * 1000);
+    if (cut !== null) {
+      yield* cutRun(cut.threadId ?? laneThread, cut.ordinal, cut.command, plus(seconds - 10));
+    }
+    const server = yield* RecoveryService.make;
+    yield* server.beat;
+    return server;
+  });
+
+/** As `startAt`, then the boot check 45s later. */
+const rebootAt = (seconds: number, cut: BootCut | null) =>
+  Effect.gen(function* () {
+    const server = yield* startAt(seconds, cut);
+    yield* TestClock.adjust("45 seconds");
+    return yield* server.detectBoot;
+  });
+
+/** Master first, then the lanes after its lead. */
+const drain = Effect.gen(function* () {
+  const recovery = yield* RecoveryService.RecoveryService;
+  const first = yield* recovery.tick;
+  yield* TestClock.adjust("61 seconds");
+  return first + (yield* recovery.tick);
+});
+
+it.effect("a turn cut by three boots in a row waits for the owner or master", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    const laneOf = (incident: RecoveryIncident | null) =>
+      incident?.threads.find((thread) => thread.threadId === laneThread);
+
+    yield* cutRun(laneThread, 1, "vp run build");
+    const first = yield* boot;
+    assert.strictEqual(laneOf(first)?.bootCuts, 1);
+    assert.strictEqual(yield* drain, 2);
+
+    // The resumed turn takes the server down again, twice.
+    const second = yield* rebootAt(RESTART + 300, { ordinal: 2, command: "vp run build" });
+    assert.strictEqual(laneOf(second)?.bootCuts, 2);
+    assert.strictEqual(laneOf(second)?.state, "pending");
+    assert.strictEqual(yield* drain, 2);
+    const third = yield* rebootAt(RESTART + 600, { ordinal: 3, command: "vp run build" });
+    const stopped = laneOf(third);
+    assert.strictEqual(stopped?.bootCuts, 3);
+    assert.strictEqual(stopped?.action, "resume");
+    assert.strictEqual(stopped?.state, "held");
+    assert.strictEqual(
+      stopped?.stateReason,
+      "the same turn was cut by 3 boots in a row; not resumed on its own",
+    );
+
+    // The master hears about it; the lane does not get resumed.
+    const sentBefore = fake.sent.length;
+    assert.strictEqual(yield* drain, 1);
+    assert.deepStrictEqual(
+      fake.sent.slice(sentBefore).map((sent) => sent.threadId),
+      [masterThread],
+    );
+    const master = fake.sent.at(-1)?.text ?? "";
+    assert.include(
+      master,
+      'Not resumed on their own, the same turn was cut by 3 or more boots in a row: lane "API" ("Lane API", t-lane) (3 boots, cut while running `vp run build`).',
+    );
+    assert.include(master, "mission_recovery_resume (mode now or release, with its threadId)");
+    assert.notInclude(master, "1. lane");
+
+    // One FYI note for the incident, and the restart summary's mission line.
+    const missions = yield* MissionService.MissionService;
+    const fyi = (yield* missions.inbox(missionId)).fyi.filter((note) =>
+      note.summary.includes("Not resumed on their own"),
+    );
+    assert.deepStrictEqual(
+      fyi.map((note) => note.summary),
+      [
+        'Recovered from restart at 09:10: 2 thread(s) (1 notice only). Not resumed on their own (same turn cut by 3+ boots in a row; resume by hand): "Lane API". Master first, then 4 per minute.',
+      ],
+    );
+    const report = yield* recovery.report(test, {
+      reportId: "rs-20261017T091000Z",
+      cause: "server-restart",
+      startAt: plus(RESTART + 580),
+      endAt: plus(RESTART + 600),
+      threads: [{ threadId: laneThread, runIds: [`${laneThread}-run-3`], childIds: [] }],
+    });
+    assert.strictEqual(report.incidentId, third?.id ?? "");
+    assert.deepStrictEqual(report.missions, [
+      {
+        missionId,
+        title: "Mission one",
+        threads: 2,
+        resume: 0,
+        reconcile: 0,
+        noticeOnly: 1,
+        stopped: [{ threadId: laneThread, title: "Lane API", bootCuts: 3 }],
+      },
+    ]);
+
+    // The owner resumes it by hand, with the warning in its notice.
+    yield* recovery.resume(ownerApp, { missionId, mode: "now", threadId: laneThread });
+    assert.strictEqual(fake.sent.at(-1)?.threadId, laneThread);
+    assert.include(
+      fake.sent.at(-1)?.text ?? "",
+      "This turn was cut by 3 boots in a row. Before you run it again, check that what it was running is not what takes the server down.",
+    );
+    assert.isNull((yield* recovery.status(missionId)).state);
+
+    // Once a turn finishes, the next cut starts a new count.
+    yield* runRow({
+      threadId: laneThread,
+      ordinal: 4,
+      status: "completed",
+      completedAt: plus(RESTART + 800),
+    });
+    const fourth = yield* rebootAt(RESTART + 900, { ordinal: 5, command: "vp run lint" });
+    assert.strictEqual(laneOf(fourth)?.bootCuts, 1);
+    assert.strictEqual(laneOf(fourth)?.state, "pending");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a boot that does not cut the turn ends its run of boots", () => {
+  const { layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    const laneOf = (incident: RecoveryIncident | null) =>
+      incident?.threads.find((thread) => thread.threadId === laneThread);
+    yield* cutRun(laneThread, 1, "vp run build");
+    assert.strictEqual(laneOf(yield* boot)?.bootCuts, 1);
+    yield* drain;
+    assert.strictEqual(
+      laneOf(yield* rebootAt(RESTART + 300, { ordinal: 2, command: "vp run build" }))?.bootCuts,
+      2,
+    );
+    yield* drain;
+    // This boot's window still covers the last cut, but it cut nothing itself.
+    assert.isNull(yield* rebootAt(RESTART + 600, null));
+    const next = yield* rebootAt(RESTART + 900, { ordinal: 3, command: "vp run build" });
+    assert.strictEqual(laneOf(next)?.bootCuts, 1);
+    assert.strictEqual(laneOf(next)?.state, "pending");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("one boot counts once, whether reported or found by the boot check", () => {
+  const { layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    const laneOf = (incident: RecoveryIncident | null) =>
+      incident?.threads.find((thread) => thread.threadId === laneThread);
+    yield* cutRun(laneThread, 1, "vp run build");
+    assert.strictEqual(laneOf(yield* boot)?.bootCuts, 1);
+    yield* drain;
+
+    const server = yield* startAt(RESTART + 300, { ordinal: 2, command: "vp run build" });
+    yield* TestClock.adjust("45 seconds");
+    assert.strictEqual(laneOf(yield* server.detectBoot)?.bootCuts, 2);
+    // The restart report names another run of the same thread from this boot.
+    yield* cutRun(laneThread, 3, "vp run build", plus(RESTART + 290));
+    const reported = yield* server.report(test, {
+      reportId: "rs-20261017T090500Z",
+      cause: "server-restart",
+      startAt: plus(RESTART + 280),
+      endAt: plus(RESTART + 300),
+      threads: [{ threadId: laneThread, runIds: [`${laneThread}-run-3`], childIds: [] }],
+    });
+    assert.isNotNull(reported.incidentId);
+    const incident = yield* (yield* RecoveryStore.RecoveryStore).incident(
+      reported.incidentId ?? "",
+    );
+    assert.strictEqual(laneOf(incident)?.bootCuts, 2);
+    assert.strictEqual(laneOf(incident)?.state, "pending");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a master cut by three boots in a row still gets its summary, told not to rerun", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    const masterOf = (incident: RecoveryIncident | null) =>
+      incident?.threads.find((thread) => thread.threadId === masterThread);
+    const cut = (ordinal: number) => ({ ordinal, command: "vp run e2e", threadId: masterThread });
+    yield* cutRun(masterThread, 1, "vp run e2e");
+    assert.strictEqual(masterOf(yield* boot)?.bootCuts, 1);
+    yield* drain;
+    yield* rebootAt(RESTART + 300, cut(2));
+    yield* drain;
+    const third = yield* rebootAt(RESTART + 600, cut(3));
+    assert.strictEqual(masterOf(third)?.bootCuts, 3);
+    assert.strictEqual(masterOf(third)?.state, "pending");
+
+    const sentBefore = fake.sent.length;
+    assert.strictEqual(yield* drain, 1);
+    assert.strictEqual(fake.sent.at(-1)?.threadId, masterThread);
+    assert.strictEqual(fake.sent.length, sentBefore + 1);
+    assert.include(
+      fake.sent.at(-1)?.text ?? "",
+      "This turn was cut by 3 boots in a row, so recovery does not resume it: do not rerun what it was running until you know that is not what takes the server down. Then carry on with the rest of the mission.",
+    );
+    assert.deepStrictEqual(yield* stoppedOf(third), [
+      { threadId: masterThread, title: "Master", bootCuts: 3, master: true },
+    ]);
+    // The owner's note says the master was told, not that someone must resume it.
+    const notes = yield* (yield* MissionStore.MissionStore).list("note", { missionId });
+    const note = notes.find((entry) => entry.id === `recovery-${third?.id}-${missionId}`);
+    assert.include(
+      note?.summary ?? "",
+      "The master's own turn was cut by 3+ boots in a row; it was told not to rerun it.",
+    );
+    assert.notInclude(note?.summary ?? "", "resume by hand");
+  }).pipe(Effect.provide(layer));
+});
+
+/** The restart report's stopped list for an incident's first mission. */
+const stoppedOf = (incident: RecoveryIncident | null) =>
+  Effect.gen(function* () {
+    const service = yield* RecoveryService.RecoveryService;
+    const result = yield* service.report(test, {
+      reportId: `rs-${incident?.id ?? "none"}`,
+      cause: "server-restart",
+      startAt: incident?.windowStart ?? plus(0),
+      endAt: incident?.windowEnd ?? plus(0),
+      threads: (incident?.threads ?? []).flatMap((thread) =>
+        thread.cutRunId === null
+          ? []
+          : [{ threadId: thread.threadId, runIds: [thread.cutRunId], childIds: [] }],
+      ),
+    });
+    return result.missions[0]?.stopped ?? [];
+  });
+
+it.effect("a thread in two missions gets each mission's notice", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    const other = MissionId.make("m-2");
+    const otherMaster = ThreadId.make("t-master-2");
+    const store = yield* MissionStore.MissionStore;
+    yield* store.commit({
+      event: {
+        missionId: other,
+        kind: "mission.created",
+        actor: { _tag: "system", component: "test" },
+        provenance: test,
+        summary: "second mission",
+        subject: null,
+      },
+      upserts: [
+        {
+          _tag: "mission",
+          record: {
+            ...mission,
+            id: other,
+            slug: "m-2",
+            title: "Mission two",
+            masterRoleId: RoleId.make("role-master-2"),
+          },
+        },
+        {
+          _tag: "role",
+          record: { ...role("role-master-2", "master"), missionId: other },
+        },
+        { _tag: "role-binding", record: binding("b-master-2", "role-master-2", otherMaster) },
+        {
+          _tag: "lane",
+          record: { ...lane, id: LaneId.make("lane-two"), missionId: other, name: "Two" },
+        },
+      ],
+    });
+    yield* threadRow(otherMaster, "Master two");
+    yield* cutRun(laneThread, 1, "vp test run");
+    const incident = yield* boot;
+    assert.deepStrictEqual([...(incident?.missionIds ?? [])].toSorted(), [missionId, other]);
+
+    yield* drain;
+    const toLane = fake.sent.filter((sent) => sent.threadId === laneThread);
+    assert.deepStrictEqual(toLane.map((sent) => sent.key).toSorted(), [
+      `${incident?.id}:${missionId}:${laneThread}`,
+      `${incident?.id}:${other}:${laneThread}`,
+    ]);
+    assert.deepStrictEqual(
+      fake.sent
+        .filter((sent) => sent.threadId !== laneThread)
+        .map((sent) => sent.threadId)
+        .toSorted(),
+      [masterThread, otherMaster],
+    );
+    const service = yield* RecoveryService.RecoveryService;
+    assert.isNull((yield* service.status(missionId)).state);
+    assert.isNull((yield* service.status(other)).state);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a thread held in an older incident can still be resumed after a newer one", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane, webLane]);
+    const service = yield* RecoveryService.RecoveryService;
+    yield* cutRun(laneThread, 1, "vp test run");
+    const first = yield* boot;
+    yield* service.resume(ownerApp, { missionId, mode: "hold", threadId: laneThread });
+    yield* drain;
+
+    // A later boot cuts only the web lane; the API lane stays held in the first.
+    const second = yield* rebootAt(RESTART + 300, {
+      ordinal: 1,
+      command: "vp run web",
+      threadId: webThread,
+    });
+    assert.isNotNull(second);
+    assert.notStrictEqual(second?.id, first?.id);
+    assert.isFalse((second?.threads ?? []).some((thread) => thread.threadId === laneThread));
+
+    yield* service.resume(ownerApp, { missionId, mode: "now", threadId: laneThread });
+    assert.strictEqual(fake.sent.at(-1)?.threadId, laneThread);
+    assert.strictEqual(fake.sent.at(-1)?.key, `${first?.id}:${missionId}:${laneThread}`);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("resume reaches the incident where a thread still waits, not a newer one it got", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane, webLane]);
+    const service = yield* RecoveryService.RecoveryService;
+    yield* cutRun(laneThread, 1, "vp test run");
+    const first = yield* boot;
+    yield* service.resume(ownerApp, { missionId, mode: "hold", threadId: laneThread });
+    yield* drain;
+
+    // The next boot cuts the API lane again; it gets that incident's notice.
+    const second = yield* rebootAt(RESTART + 300, { ordinal: 2, command: "vp test run" });
+    yield* drain;
+    const sentThere = second?.id ?? "none";
+    assert.isTrue(fake.sent.some((sent) => sent.key === `${sentThere}:${missionId}:${laneThread}`));
+
+    // Its hold in the first incident is still the owner's to release.
+    yield* service.resume(ownerApp, { missionId, mode: "now", threadId: laneThread });
+    assert.strictEqual(fake.sent.at(-1)?.key, `${first?.id}:${missionId}:${laneThread}`);
   }).pipe(Effect.provide(layer));
 });

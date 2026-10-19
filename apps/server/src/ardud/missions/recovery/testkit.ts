@@ -2,6 +2,7 @@
 // rows in Robob's projection tables.
 import {
   LaneId,
+  type MissionError,
   RoleBindingId,
   SubMissionId,
   ThreadId,
@@ -31,6 +32,7 @@ import * as MissionService from "../MissionService.ts";
 import * as PolicyService from "../policy/PolicyService.ts";
 import * as PolicyStore from "../policy/PolicyStore.ts";
 import { makePorts } from "../policy/testing.ts";
+import { fakeRouterThreads, routerOverFakes } from "../router/MissionRouter.testkit.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import * as RecoveryDelivery from "./RecoveryDelivery.ts";
@@ -108,6 +110,10 @@ export const harness = (
     busy: new Set<string>(),
     gone: new Set<string>(),
     installer: false,
+    /** Threads whose notices the router refuses, with the error it gives. */
+    refuse: new Map<string, MissionError>(),
+    /** Threads whose notice goes out, then the server stops before the router answers. */
+    crash: new Set<string>(),
   };
   const delivery = Layer.succeed(
     RecoveryDelivery.RecoveryDelivery,
@@ -116,9 +122,13 @@ export const harness = (
         Effect.sync(() =>
           fake.gone.has(threadId) ? "gone" : fake.busy.has(threadId) ? "busy" : "idle",
         ),
-      send: (input) =>
-        Effect.sync(() => {
+      notify: (input) =>
+        Effect.gen(function* () {
+          const refusal = fake.refuse.get(input.threadId);
+          if (refusal !== undefined) return yield* refusal;
           fake.sent.push(input);
+          if (fake.crash.delete(input.threadId)) return yield* Effect.die("server stopped");
+          return { _tag: "sent" as const };
         }),
       installerPending: Effect.sync(() => fake.installer),
       timeZone: "UTC",
@@ -138,6 +148,24 @@ export const harness = (
     Layer.provideMerge(Sqlite.layerMemory),
   );
   return { fake, layer };
+};
+
+/** The recovery service over its live delivery: the router, over fake threads. */
+export const routedHarness = () => {
+  const threads = fakeRouterThreads();
+  const layer = RecoveryService.layer.pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(
+        RecoveryStore.layer,
+        RecoveryDelivery.layerWith({ installerPending: Effect.succeed(false), timeZone: "UTC" }),
+      ),
+    ),
+    Layer.provideMerge(routerOverFakes(threads)),
+    Layer.provideMerge(MissionService.layer),
+    Layer.provideMerge(MissionStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
+  );
+  return { threads, layer };
 };
 
 const toJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));

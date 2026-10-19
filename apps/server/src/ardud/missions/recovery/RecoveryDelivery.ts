@@ -3,30 +3,34 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import { CommandId, MessageId, MissionError, type ThreadId } from "@t3tools/contracts";
+import type { MissionError, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
-import { stateFromShell } from "../../control/model.ts";
-import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as MissionRouter from "../router/MissionRouter.ts";
 
-export type RecoveryThreadReadiness = "idle" | "busy" | "gone";
+export type RecoveryThreadReadiness = MissionRouter.ThreadReadiness;
 
 /**
- * How recovery reaches threads. One port so the router's doorbell can take
- * over later; until then a queued direct send, only to idle threads.
+ * How recovery reaches threads: the router's system delivery. A mission
+ * member's notice goes through its control room and doorbell; anyone else
+ * gets a queued direct message.
  */
 export class RecoveryDelivery extends Context.Service<
   RecoveryDelivery,
   {
     readonly readiness: (threadId: ThreadId) => Effect.Effect<RecoveryThreadReadiness>;
-    /** Idempotent per key: a retried send lands once. */
-    readonly send: (input: {
+    /**
+     * Idempotent per key on the route the router picks at call time. Recovery
+     * keeps its own ledger per incident and thread, because a retry after a
+     * membership change takes the other route.
+     */
+    readonly notify: (input: {
       readonly threadId: ThreadId;
       readonly text: string;
       readonly key: string;
-    }) => Effect.Effect<void, MissionError>;
+    }) => Effect.Effect<MissionRouter.SystemNoticeOutcome, MissionError>;
     /** The cutover installer is still holding its own resume messages. */
     readonly installerPending: Effect.Effect<boolean>;
     /** The owner's zone for HH:MM in notices. */
@@ -34,11 +38,8 @@ export class RecoveryDelivery extends Context.Service<
   }
 >()("t3/ardud/missions/recovery/RecoveryDelivery") {}
 
-const failure = (what: string) => (error: unknown) =>
-  new MissionError({
-    code: "conflict",
-    detail: `${what}: ${error instanceof Error ? error.message : String(error)}`,
-  });
+/** The component recovery posts as. */
+export const PRODUCER = "missions-recovery";
 
 const installerFile = () =>
   NodePath.join(
@@ -50,44 +51,23 @@ const installerFile = () =>
 const ownerTimeZone = () =>
   process.env.ARDUD_OWNER_TIME_ZONE ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
 
-export const layer = Layer.effect(
-  RecoveryDelivery,
-  Effect.gen(function* () {
-    const threads = yield* ThreadManagementService.ThreadManagementService;
-    return RecoveryDelivery.of({
-      readiness: (threadId) =>
-        threads.getThreadShell(threadId).pipe(
-          Effect.map((shell): RecoveryThreadReadiness => {
-            if (shell === null || shell.archivedAt !== null || shell.deletedAt !== null)
-              return "gone";
-            return stateFromShell(shell) === "idle" ? "idle" : "busy";
-          }),
-          Effect.orElseSucceed((): RecoveryThreadReadiness => "busy"),
-        ),
-      send: ({ threadId, text, key }) =>
-        Effect.gen(function* () {
-          const shell = yield* threads
-            .getThreadShell(threadId)
-            .pipe(Effect.mapError(failure("Cannot read the thread")));
-          if (shell === null) {
-            return yield* new MissionError({ code: "not-found", detail: `No thread ${threadId}.` });
-          }
-          yield* threads
-            .sendToThread({
-              projectId: shell.projectId,
-              commandId: CommandId.make(`ardud-missions:recovery:${key}`),
-              messageId: MessageId.make(`ardud-missions:recovery:${key}`),
-              threadId,
-              text,
-              attachments: [],
-              mode: "queue",
-              createdBy: "system",
-              creationSource: "server",
-            })
-            .pipe(Effect.mapError(failure("Cannot deliver the recovery notice")));
-        }),
-      installerPending: Effect.sync(() => NodeFS.existsSync(installerFile())),
-      timeZone: ownerTimeZone(),
-    });
-  }),
-);
+/** Delivery over the router; tests supply the installer check and zone. */
+export const layerWith = (options?: {
+  readonly installerPending?: Effect.Effect<boolean>;
+  readonly timeZone?: string;
+}) =>
+  Layer.effect(
+    RecoveryDelivery,
+    Effect.gen(function* () {
+      const router = yield* MissionRouter.MissionRouter;
+      return RecoveryDelivery.of({
+        readiness: router.readiness,
+        notify: (input) => router.notify({ ...input, producer: PRODUCER }),
+        installerPending:
+          options?.installerPending ?? Effect.sync(() => NodeFS.existsSync(installerFile())),
+        timeZone: options?.timeZone ?? ownerTimeZone(),
+      });
+    }),
+  );
+
+export const layer = layerWith();
