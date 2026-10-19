@@ -397,8 +397,12 @@ const missionWriteTool = <Name extends string, P extends Schema.Constraint>(
 
 const MissionCreateTool = Tool.make("mission_create", {
   description:
-    "As a mission master, create a new mission (slug and title required; tier, weight and shares optional). It starts active with no master.",
-  parameters: CreateMissionInput,
+    "As a mission master, create a new mission (slug and title required; tier, weight and shares optional). It starts active with no master. If your thread masters several missions, name the one you act for in actingFor.",
+  // ardud missions: core - a thread mastering several missions names the one it acts for
+  parameters: Schema.Struct({
+    ...CreateMissionInput.fields,
+    actingFor: Schema.optional(MissionId),
+  }),
   success: MissionMutationResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",

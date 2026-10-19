@@ -99,6 +99,7 @@ const openAsks = (asks: AsksService.AsksService["Service"], missionId: MissionId
  * capped mission list.
  */
 const asAnyMaster = <A>(
+  actingFor: MissionId | undefined,
   run: (
     missions: MissionService.MissionService["Service"],
     provenance: MissionProvenance,
@@ -107,7 +108,7 @@ const asAnyMaster = <A>(
   withCaller((_asks, provenance) =>
     Effect.gen(function* () {
       const controls = yield* MasterControls.MasterControls;
-      const master = yield* controls.asAnyMaster(provenance);
+      const master = yield* controls.asAnyMaster(provenance, actingFor);
       if (master === null) {
         return yield* new MissionError({
           code: "forbidden",
@@ -347,8 +348,8 @@ const handlers = {
       }),
     ),
   ),
-  mission_create: McpToolAccess.actsAsCaller((input) =>
-    asAnyMaster((missions, provenance) => missions.createMission(provenance, input)),
+  mission_create: McpToolAccess.actsAsCaller(({ actingFor, ...input }) =>
+    asAnyMaster(actingFor, (missions, provenance) => missions.createMission(provenance, input)),
   ),
   mission_update: McpToolAccess.actsAsCaller((input) =>
     asMaster(input.missionId, (missions, _asks, provenance) =>

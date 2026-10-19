@@ -24,12 +24,15 @@ import * as AsksService from "../asks/AsksService.ts";
 import {
   askInput,
   at,
+  binding,
   harness,
   laneThread,
   masterThread,
   missionId,
+  otherMissionId,
   ownerApp,
   seed,
+  seedOther,
   strayThread,
   typedInbound,
   writerThread,
@@ -663,6 +666,50 @@ describe("mission MCP tools", () => {
       });
       expect(lane.isError).toBe(true);
       expect(lane.text).toContain("forbidden");
+    }).pipe(Effect.provide(layer));
+  });
+
+  // ardud missions: core
+  it.effect("a thread mastering two missions names the one it creates for", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const store = yield* MissionStore.MissionStore;
+      yield* store.commit({
+        event: {
+          missionId: otherMissionId,
+          kind: "role.bound",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "the master thread also masters m-2",
+          subject: null,
+        },
+        upserts: [
+          { _tag: "role-binding", record: binding("b-lead-2b", "role-lead-2", masterThread) },
+        ],
+      });
+      const create = (args: Record<string, unknown>) =>
+        call("mission_create", threadCaller(masterThread), {
+          slug: "side",
+          title: "Side",
+          ...args,
+        });
+
+      const unnamed = yield* create({});
+      expect(unnamed.isError).toBe(true);
+      expect(unnamed.text).toContain("name the one you act for");
+      const notMine = yield* call("mission_create", threadCaller(laneThread), {
+        slug: "side",
+        title: "Side",
+        actingFor: missionId,
+      });
+      expect(notMine.text).toContain("forbidden");
+
+      const named = yield* create({ actingFor: otherMissionId });
+      expect(named.isError, named.text).toBe(false);
+      const [event] = yield* store.recentEvents((named.structured.ref as { id: never }).id, 1);
+      expect(event?.actor).toEqual({ _tag: "role", roleId: "role-lead-2" });
     }).pipe(Effect.provide(layer));
   });
 

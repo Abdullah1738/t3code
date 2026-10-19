@@ -39,10 +39,13 @@ export class MasterControls extends Context.Service<
     /**
      * The caller as the master of some mission (its master role), or null.
      * Found from the store's complete thread index, so a master is never
-     * missed because a capped mission list left its mission out.
+     * missed because a capped mission list left its mission out. A thread
+     * that masters several missions must name the one it acts for
+     * (`actingFor`); naming one it does not master is forbidden.
      */
     readonly asAnyMaster: (
       provenance: MissionProvenance,
+      actingFor?: MissionId,
     ) => Effect.Effect<MissionProvenance | null, MissionError>;
     /**
      * A mission master's hold on its members' secret cards: it may decline one
@@ -96,9 +99,19 @@ const make = Effect.gen(function* () {
         }),
       );
 
-  const asAnyMaster: MasterControls["Service"]["asAnyMaster"] = (provenance) =>
+  const asAnyMaster: MasterControls["Service"]["asAnyMaster"] = (provenance, actingFor) =>
     Effect.gen(function* () {
-      const [missionId] = yield* missionsMasteredBy(store, provenance);
+      const mastered = yield* missionsMasteredBy(store, provenance);
+      if (actingFor !== undefined && !mastered.includes(actingFor)) {
+        return yield* forbidden(`You are not mission ${actingFor}'s master.`);
+      }
+      if (actingFor === undefined && mastered.length > 1) {
+        return yield* new MissionError({
+          code: "invalid",
+          detail: `You master missions ${mastered.join(", ")}; name the one you act for (actingFor).`,
+        });
+      }
+      const missionId = actingFor ?? mastered[0];
       if (missionId === undefined) return null;
       return standingOf(yield* castOf(store, missionId), provenance).caller.provenance;
     });
