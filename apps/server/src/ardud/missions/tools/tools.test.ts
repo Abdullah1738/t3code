@@ -81,7 +81,7 @@ const mcpClient = McpSchema.McpServerClient.of({
 });
 
 const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
-  const { deliveries, layer } = harness(inbound);
+  const { layer } = harness(inbound);
   // What the tools hand the secret service: the card and who answers it.
   const answered: Array<Parameters<SecretRequests.SecretRequests["Service"]["answer"]>> = [];
   const secrets = Layer.mock(SecretRequests.SecretRequests)({
@@ -101,7 +101,6 @@ const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
       } as never),
   });
   return {
-    deliveries,
     answered,
     layer: McpHttpServer.toolkitRegistration(MissionsToolkit, MissionsHandlers.layer).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
@@ -161,7 +160,7 @@ describe("mission MCP tools", () => {
         expect(outcome === null || outcome.isError).toBe(true);
       }
 
-      // A thread with no role, lane or fork in the mission cannot ask.
+      // A thread with no role or lane in the mission cannot ask.
       const stray = yield* call("mission_ask", threadCaller(strayThread), askInput("Stray?"));
       expect(stray.isError).toBe(true);
       expect(stray.text).toContain("forbidden");
@@ -355,7 +354,7 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("M3: the master reopens drafts, suggestions and forks under its own name", () => {
+  it.effect("M3: the master reopens drafts and suggestions under its own name", () => {
     const { layer } = toolsLayer();
     return Effect.gen(function* () {
       yield* seed;

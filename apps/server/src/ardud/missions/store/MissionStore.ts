@@ -63,9 +63,11 @@ const DDL = [
   // Complete thread lookups for membership: which records name a thread.
   `CREATE INDEX IF NOT EXISTS ardud_mission_records_by_thread
     ON ardud_mission_records (json_extract(record_json, '$.record.threadId'), kind)`,
-  `CREATE INDEX IF NOT EXISTS ardud_mission_records_by_fork_thread
-    ON ardud_mission_records (json_extract(record_json, '$.record.forkThreadId'), kind)`,
   // --- end router additions ---
+  // --- asks additions ---
+  // Forks are gone; old databases drop their index.
+  `DROP INDEX IF EXISTS ardud_mission_records_by_fork_thread`,
+  // --- end asks additions ---
   `CREATE TABLE IF NOT EXISTS ardud_mission_events (
     mission_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
@@ -214,9 +216,9 @@ export class MissionStore extends Context.Service<
       status?: ReadonlyArray<string>,
     ) => Effect.Effect<ReadonlyArray<MissionRecordOf<K>>, MissionError>;
     /**
-     * Every mission with a role binding or lane naming the thread, or a fork
-     * that is the thread, in any status. Complete: an indexed lookup with no
-     * limit, so a mission missing here cannot claim the thread by its records.
+     * Every mission with a role binding or lane naming the thread, in any
+     * status. Complete: an indexed lookup with no limit, so a mission missing
+     * here cannot claim the thread by its records.
      */
     readonly missionsOfThread: (threadId: ThreadId) => Effect.Effect<ReadonlyArray<MissionId>>;
     // --- end router additions ---
@@ -473,16 +475,10 @@ const make = Effect.gen(function* () {
 
   const missionsOfThread = (threadId: ThreadId) =>
     sql<{ readonly missionId: MissionId }>`
-      SELECT DISTINCT mission_id AS "missionId" FROM (
-        SELECT mission_id FROM ardud_mission_records
-        WHERE json_extract(record_json, '$.record.threadId') = ${threadId}
-          AND kind IN ('role-binding', 'lane')
-        UNION
-        SELECT mission_id FROM ardud_mission_records
-        WHERE json_extract(record_json, '$.record.forkThreadId') = ${threadId}
-          AND kind = 'fork'
-      )
-      WHERE mission_id IS NOT NULL
+      SELECT DISTINCT mission_id AS "missionId" FROM ardud_mission_records
+      WHERE json_extract(record_json, '$.record.threadId') = ${threadId}
+        AND kind IN ('role-binding', 'lane')
+        AND mission_id IS NOT NULL
       ORDER BY mission_id
     `.pipe(
       Effect.map((rows) => rows.map((row) => row.missionId)),
@@ -491,12 +487,16 @@ const make = Effect.gen(function* () {
     );
   // --- end router additions ---
 
+  // ardud missions: asks. Events of kinds the contract no longer has (forks)
+  // stay in old databases; reads skip them instead of failing the page.
+  const retiredKinds = sql`kind NOT IN ('fork.opened', 'fork.closed')`;
+
   const eventsSince = (missionId: MissionId, afterSeq: number, limit = MAX_EVENTS_PAGE) =>
     Effect.gen(function* () {
       const bounded = Math.min(Math.max(limit, 1), MAX_EVENTS_PAGE);
       const rows = yield* sql<EventRow>`
         SELECT event_json AS "eventJson" FROM ardud_mission_events
-        WHERE mission_id = ${missionId} AND seq > ${afterSeq}
+        WHERE mission_id = ${missionId} AND seq > ${afterSeq} AND ${retiredKinds}
         ORDER BY seq ASC
         LIMIT ${bounded}
       `.pipe(NodeSqliteClient.readOnly, Effect.orDie);
@@ -509,7 +509,7 @@ const make = Effect.gen(function* () {
       const older = beforeSeq === undefined ? sql`` : sql`AND seq < ${beforeSeq}`;
       const rows = yield* sql<EventRow>`
         SELECT event_json AS "eventJson" FROM ardud_mission_events
-        WHERE mission_id = ${missionId} ${older}
+        WHERE mission_id = ${missionId} AND ${retiredKinds} ${older}
         ORDER BY seq DESC
         LIMIT ${bounded}
       `.pipe(NodeSqliteClient.readOnly, Effect.orDie);

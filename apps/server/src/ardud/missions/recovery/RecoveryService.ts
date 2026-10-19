@@ -241,7 +241,6 @@ export const make = Effect.gen(function* () {
         roles,
         bindings,
         lanes,
-        forks: [],
       } satisfies MissionCast;
     });
 
@@ -340,7 +339,7 @@ export const make = Effect.gen(function* () {
         members.set(lane.threadId, memberOf(lane.threadId, role, lane));
       }
 
-      const cast: MissionCast = { missionId, mission, roles, bindings, lanes, forks: [] };
+      const cast: MissionCast = { missionId, mission, roles, bindings, lanes };
       const holds = new Map<string, PoolHold>(storeHolds.map((hold) => [hold.id, hold]));
       for (const hold of policyHolds) if (hold.missionId === missionId) holds.set(hold.id, hold);
       const nowMs = Date.parse(now);

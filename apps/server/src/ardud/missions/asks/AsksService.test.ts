@@ -5,6 +5,7 @@ import * as Option from "effect/Option";
 
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
+import { askResolvedLine } from "./ports.ts";
 import {
   agent,
   askInput,
@@ -26,7 +27,7 @@ import type { InboundMessage } from "./provenance.ts";
 
 describe("AsksService", () => {
   it.effect("holds only the blocked records and releases them on the owner's answer", () => {
-    const { deliveries, layer } = harness();
+    const { signals, layer } = harness();
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
@@ -69,10 +70,10 @@ describe("AsksService", () => {
       const freed = Option.getOrThrow(yield* store.get("lane", "lane-api"));
       expect(freed.status).toBe("idle");
       expect(freed.statusReason).toBeNull();
-      expect(deliveries).toEqual([
-        expect.objectContaining({ threadId: laneThread, asOwner: false }),
-      ]);
-      expect(deliveries[0]?.text).toContain("Offline window");
+      // The router is told once, with what the answer freed.
+      expect(signals.map((signal) => signal.ask.id)).toEqual([ask.id]);
+      const signal = signals[0]!;
+      expect(askResolvedLine(signal.ask, signal.released)).toContain("Offline window");
 
       const events = yield* asks.events(missionId, 0);
       expect(events.map((event) => event.kind)).toEqual([
@@ -324,87 +325,21 @@ describe("AsksService", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("forks the master thread and sends back one line", () => {
-    const { deliveries, forks, layer } = harness();
+  it.effect("posts into rooms through the router as the calling thread", () => {
+    const { posts, layer } = harness();
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
-      const origin = { kind: "lane" as const, id: "lane-api", label: "API lane" };
-      expect(
-        yield* failureCode(
-          asks.startFork({ missionId, kind: "discuss", origin }, agent(laneThread)),
-        ),
-      ).toBe("forbidden");
-      expect(
-        yield* failureCode(
-          asks.startFork(
-            { missionId, kind: "owner-question", origin, question: "Ship today?" },
-            agent(masterThread),
-          ),
-        ),
-      ).toBe("provenance-required");
-
-      const started = yield* asks.startFork(
-        { missionId, kind: "discuss", origin, question: "Should the API lane pause?" },
-        ownerApp,
-      );
-      expect(forks).toEqual([{ sourceThreadId: masterThread, title: "Discuss: API lane" }]);
-      expect(started.fork.commitsMission).toBe(false);
-      expect(deliveries).toEqual([
-        { threadId: started.fork.forkThreadId, text: "Should the API lane pause?", asOwner: true },
-      ]);
-      const again = yield* asks.startFork({ missionId, kind: "discuss", origin }, ownerApp);
-      expect(again.fork.id).toBe(started.fork.id);
-
-      const forkThread = agent(started.fork.forkThreadId);
-      expect(
-        yield* failureCode(
-          asks.closeFork(
-            { forkId: started.fork.id, summaryLine: "Pause it.", commitsMission: true },
-            forkThread,
-          ),
-        ),
-      ).toBe("forbidden");
-      const closed = yield* asks.closeFork(
-        { forkId: started.fork.id, summaryLine: "Pause the API lane until Monday." },
-        forkThread,
-      );
-      expect(closed.fork.status).toBe("answered");
-      expect(closed.fork.commitsMission).toBe(false);
-      expect(deliveries.at(-1)).toEqual({
-        threadId: masterThread,
-        text: "[Discussed: API lane] Pause the API lane until Monday.",
-        asOwner: false,
-      });
-
-      const committed = yield* asks.updateFork(
-        { forkId: started.fork.id, action: "commits-mission" },
-        ownerApp,
-      );
-      expect(committed.fork.commitsMission).toBe(true);
-      expect(committed.note?.type).toBe("decision");
-      expect(deliveries.at(-1)?.text).toContain("This commits the mission");
-
-      const acked = yield* asks.ackNote(committed.note!.id, agent(masterThread));
-      expect(acked.ackedBy).toEqual([{ _tag: "role", roleId: RoleId.make("role-master") }]);
-      expect(yield* failureCode(asks.ackNote(committed.note!.id, agent(laneThread)))).toBe(
-        "forbidden",
-      );
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("refuses room posts until the router is wired", () => {
-    const { layer } = harness();
-    return Effect.gen(function* () {
-      yield* seed;
-      const asks = yield* AsksService.AsksService;
-      const code = yield* failureCode(
-        asks.post(
-          { missionId, roomId: "room-1" as never, kind: "status", summary: "Halfway." },
-          agent(laneThread),
-        ),
-      );
-      expect(code).toBe("conflict");
+      const input = {
+        missionId,
+        roomId: "room-1" as never,
+        kind: "status" as const,
+        summary: "Halfway.",
+      };
+      expect(yield* failureCode(asks.post(input, agent(strayThread)))).toBe("forbidden");
+      const message = yield* asks.post(input, agent(laneThread));
+      expect(message.summary).toBe("Halfway.");
+      expect(posts).toEqual([{ input, provenance: agent(laneThread) }]);
     }).pipe(Effect.provide(layer));
   });
 });

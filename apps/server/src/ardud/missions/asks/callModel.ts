@@ -100,9 +100,8 @@ export interface ReactToCallCommand {
 }
 
 /**
- * The owner's reaction. `discuss` is the caller's cue to open a Discuss fork;
- * `overruled` reaches the master as an owner message. Both are effects the
- * service runs after this record commits.
+ * The owner's reaction. The master reads `discuss` and `overruled` from the
+ * call's timeline event.
  */
 export const reactToCall = (command: ReactToCallCommand): Outcome<Transition<Call>> => {
   const { call, reaction, provenance } = command;

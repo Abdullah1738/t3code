@@ -1,6 +1,6 @@
 /**
  * WebSocket RPCs the app needs on top of the core mission calls: record feeds
- * for rules, forks and draft notes, the routing table, decided-item history,
+ * for rules and draft notes, the routing table, decided-item history,
  * and the owner's draft routing, draft note and annotation writes. Their own group so the asks
  * track implements them in a separate handler set; `rpc.ts` adds the scope
  * middleware and merges the group into `WsRpcGroup`. Reads need
@@ -38,7 +38,6 @@ import {
 
 export const MISSIONS_ASKS_WS_METHODS = {
   subscribeRules: "missions.asks.subscribeRules",
-  subscribeForks: "missions.asks.subscribeForks",
   subscribeDraftNotes: "missions.asks.subscribeDraftNotes",
   subscribeRouting: "missions.asks.subscribeRouting",
   inboxHistory: "missions.asks.inboxHistory",
@@ -71,11 +70,6 @@ const M = MISSIONS_ASKS_WS_METHODS;
 export const MissionsAsksRpcs = RpcGroup.make(
   /** Rules and rule change requests: the mission's plus global (null: global only). */
   feed(M.subscribeRules, MissionFeedInput, MissionFeedItem),
-  /**
-   * One mission's forks (null: every mission's), newest first in the
-   * snapshot; each carries its question.
-   */
-  feed(M.subscribeForks, MissionScopeInput, MissionFeedItem),
   /** Draft notes, active and turned off: the mission's plus global (null: global only). */
   feed(M.subscribeDraftNotes, MissionFeedInput, MissionFeedItem),
   /** The mission's approval routing table, resent when it changes. */
@@ -98,7 +92,6 @@ export const MissionsAsksRpcs = RpcGroup.make(
 /** Reads: any client allowed to read orchestration state. */
 export const MISSIONS_ASKS_READ_SCOPES = {
   [M.subscribeRules]: AuthOrchestrationReadScope,
-  [M.subscribeForks]: AuthOrchestrationReadScope,
   [M.subscribeDraftNotes]: AuthOrchestrationReadScope,
   [M.subscribeRouting]: AuthOrchestrationReadScope,
   [M.inboxHistory]: AuthOrchestrationReadScope,

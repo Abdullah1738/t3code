@@ -41,7 +41,6 @@ const PREFIX_GROUP: Readonly<Record<string, MissionTimelineGroup>> = {
   approval: "inbox",
   suggestion: "inbox",
   knock: "inbox",
-  fork: "inbox",
   "secret-request": "inbox",
   recovery: "recovery",
 };

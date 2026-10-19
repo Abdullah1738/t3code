@@ -1218,7 +1218,6 @@ export const changeRequests = [
     proposedQuote: null,
     proposedScope: null,
     masterResponse: null,
-    forkId: null,
     createdAt: AT("08:28"),
     resolvedAt: null,
   },
@@ -1232,7 +1231,6 @@ export const changeRequests = [
     proposedQuote: null,
     proposedScope: null,
     masterResponse: "Reading updated; the quote stays your words.",
-    forkId: null,
     createdAt: AT("17:25", 14),
     resolvedAt: AT("17:40", 14),
   },
@@ -1251,7 +1249,6 @@ export const changeRequests = [
     proposedScope: null,
     masterResponse:
       "No: rule 99 has no round cap and rule 19 says work until CLEAR. Fix the four P3s in one packet.",
-    forkId: null,
     createdAt: AT("07:59"),
     resolvedAt: AT("08:01"),
   },

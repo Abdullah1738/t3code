@@ -34,8 +34,7 @@ import { sameValue } from "./rules.ts";
 /**
  * Owner rules. The owner and the master write, edit and retire them through
  * the same methods (owner rule, 17 Oct 2026: nothing is owner only). Anyone
- * may ask for a change, optionally in a Discuss fork; the owner or the master
- * resolves it. The master records each time it relied on a rule or work broke
+ * may ask for a change; the owner or the master resolves it. The master records each time it relied on a rule or work broke
  * it. Global rules (no mission) live on the asks global timeline.
  */
 
@@ -243,15 +242,6 @@ const make = Effect.gen(function* () {
     serial(
       Effect.gen(function* () {
         const rule = yield* loadRule(input.ruleId);
-        // Missions has no forks (owner, 19 Oct). Discussing a rule goes through
-        // an owner request about it, never a fork of the master.
-        if (input.discuss === true) {
-          return yield* fail(
-            "invalid",
-            "Rules are discussed through an owner request about the rule, not a fork.",
-          );
-        }
-        const forkId: RuleChangeRequest["forkId"] = null;
         const now = yield* nowIso;
         const request: RuleChangeRequest = {
           id: RuleChangeRequestId.make(`${rule.id}:change:${NodeCrypto.randomUUID()}`),
@@ -263,7 +253,6 @@ const make = Effect.gen(function* () {
           proposedQuote: null,
           proposedScope: null,
           masterResponse: null,
-          forkId,
           createdAt: now,
           resolvedAt: null,
         };
@@ -273,7 +262,7 @@ const make = Effect.gen(function* () {
           summary: `Change asked for rule ${rule.title}: ${input.request}`,
           ref: requestRef(request),
           upserts: [{ _tag: "rule-change-request", record: request }],
-          payload: { ruleId: rule.id, forkId },
+          payload: { ruleId: rule.id },
         });
         return request;
       }),

@@ -83,7 +83,7 @@ const submit = (overrides: Partial<SubmitDraftCommand> = {}) =>
     channel: "cliq",
     target: { kind: "url", label: "Sami DM", url: "https://cliq.example/sami", ref: null },
     text: "Hi Sami, hope you're well! The fix is merged.",
-    source: { kind: "fork", ref: null },
+    source: { kind: "master", ref: null },
     writerRoleId: writerRole,
     caller: writer,
     notes,

@@ -201,7 +201,7 @@ export const renderRequestContext = (input: {
     linked,
     request.status === "settled"
       ? `This request is settled; nothing to answer. mission_request_reopen (requestId ${request.id}) reopens it if there is more to do.`
-      : `Answer with mission_request_reply (requestId ${request.id}): status "answered" when you have answered, or "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, forks, rules or suggestions you made from it. Never give it a default or a deadline. mission_request_settle closes it, mission_request_reopen reopens it.`,
+      : `Answer with mission_request_reply (requestId ${request.id}): status "answered" when you have answered, or "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, rules or suggestions you made from it. Never give it a default or a deadline. mission_request_settle closes it, mission_request_reopen reopens it.`,
   ].join("\n");
 
   const [first, ...rest] = input.messages;
