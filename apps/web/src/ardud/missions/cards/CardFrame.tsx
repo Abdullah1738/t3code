@@ -104,6 +104,8 @@ export interface CardFrameProps {
   readonly since?: string | null;
   readonly nowMs: number;
   readonly title: string;
+  /** The record's discussion symbol and unread count, beside the kicker. */
+  readonly discussion?: ReactNode;
   /** "list" (14px title) or "pane" (16px title, reading pane). */
   readonly size?: "list" | "pane";
   /** Body blocks. Hidden once the card is done. */
@@ -140,6 +142,7 @@ export function CardFrame(props: CardFrameProps) {
       />
       <div className="flex min-h-5 min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
         <span className="font-medium whitespace-nowrap">{props.kicker}</span>
+        {props.discussion}
         {props.madeBy === "master" ? (
           <span role="img" aria-label="Made by the master">
             <Avatar kind="master" small />

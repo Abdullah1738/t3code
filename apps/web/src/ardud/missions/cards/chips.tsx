@@ -336,6 +336,40 @@ export function UnreadDot(props: { label?: string }) {
   );
 }
 
+/**
+ * An item's discussion symbol: a speech mark, plus a teal count of the master's
+ * unread replies. The only place a discussion reply is counted.
+ */
+export function DiscussionSymbol(props: { unread: number }) {
+  return (
+    <span
+      role="img"
+      aria-label={props.unread > 0 ? `Discussion, ${props.unread} unread` : "Discussion"}
+      className="inline-flex shrink-0 items-center gap-1 text-(--m-muted)"
+    >
+      <svg
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinejoin="round"
+        aria-hidden
+        className="size-3.75"
+      >
+        <path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z" />
+      </svg>
+      {props.unread > 0 ? (
+        <span
+          aria-hidden
+          className="h-4 min-w-4 rounded-full bg-(--m-accent) px-1.25 text-center text-2xs leading-4 font-semibold text-(--m-accent-ink) tabular-nums"
+        >
+          {badgeCount(props.unread)}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 /** "by you" / "by master" provenance marker: the author's 14px avatar. */
 export function ByMarker(props: { by: "owner" | "master"; label?: string }) {
   return (

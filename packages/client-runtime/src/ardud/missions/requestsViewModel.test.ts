@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import {
+  discussionUnread,
   discussRequestInput,
   groupRequests,
   isDiscussion,
@@ -12,7 +13,6 @@ import {
   requestAbout,
   requestPreview,
   requestTitle,
-  unreadRequestCount,
   yourRequests,
 } from "./requestsViewModel.ts";
 import type { MissionsSource, OwnerRequest } from "./source.ts";
@@ -64,7 +64,11 @@ describe("owner requests", () => {
       "request-dylan-rebase",
     ]);
     expect(settled.map((r) => r.id)).toEqual(["request-codex-topups"]);
-    expect(unreadRequestCount(read())).toBe(1);
+    expect(
+      read()
+        .filter(isRequestUnread)
+        .map((r) => r.id),
+    ).toEqual(["request-dev-cost"]);
     expect(requestPreview(open[0]!)).toMatch(/^Parked two idle lanes/);
   });
 
@@ -72,7 +76,7 @@ describe("owner requests", () => {
     const source = createFixtureMissionsSource({ now });
     const read = latest(source);
     await source.markRequestRead({ requestId: "request-dev-cost" });
-    expect(unreadRequestCount(read())).toBe(0);
+    expect(read().filter(isRequestUnread)).toEqual([]);
 
     const created = await source.openRequest({ missionId: CRPKO, text: "Park the e2e lane" });
     expect(read().find((r) => r.id === created.id)).toMatchObject({
@@ -131,7 +135,34 @@ describe("owner requests", () => {
     });
     expect(isDiscussion(talk)).toBe(true);
     expect(yourRequests([own, talk]).map((r) => r.id)).toEqual(["own"]);
-    expect(unreadRequestCount(yourRequests([own, talk]))).toBe(1);
+    expect(yourRequests([own, talk]).filter(isRequestUnread)).toHaveLength(1);
+  });
+
+  it("counts a discussion's unread master replies for its record's symbol", () => {
+    const message = (id: string, author: "owner" | "master") => ({
+      id,
+      author,
+      text: id,
+      at: FIXTURE_NOW,
+      refs: [],
+    });
+    const subject = { kind: "draft" as const, id: "draft-1", label: "Release note" };
+    const talk = request({
+      id: "talk",
+      subject,
+      unread: true,
+      messages: [
+        message("a", "master"),
+        message("b", "owner"),
+        message("c", "master"),
+        message("d", "master"),
+      ],
+    });
+    expect(discussionUnread(talk)).toBe(2);
+    expect(discussionUnread({ ...talk, unread: false })).toBe(0);
+    expect(discussionUnread({ ...talk, status: "settled" })).toBe(0);
+    expect(discussionUnread({ ...talk, messages: [message("b", "owner")] })).toBe(1);
+    expect(discussionUnread(null)).toBe(0);
   });
 
   it("finds the open request about a record and reads a decision made on a condition", async () => {

@@ -412,7 +412,10 @@ function CallRow(props: { row: DirectionCheckRow; missionId: MissionId; nowMs: n
         </p>
         <p className="mt-0.5 text-xs text-pretty text-muted-foreground">{reason}</p>
       </div>
-      {age ? <AgeElement age={age} at={item.at} /> : null}
+      <span className="inline-flex items-center gap-2">
+        {discussion.symbol}
+        {age ? <AgeElement age={age} at={item.at} /> : null}
+      </span>
       <div className="col-start-2 col-end-4 flex items-center gap-1.5">
         {isCall ? (
           <Button variant="ghost-muted" size="sm" disabled={busy} onClick={accept}>
