@@ -59,7 +59,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import { cleanAnnotation } from "../core/approvals.ts";
-import { isMasterAnywhere } from "../core/master.ts";
+import { castOf as readWholeCast, isMasterAnywhere } from "../core/master.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreKind, MissionStoreRecord } from "../store/recordIndex.ts";
 import {
@@ -379,16 +379,8 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const castOf = (missionId: MissionId) =>
-    Effect.gen(function* () {
-      const mission = Option.getOrNull(yield* store.get("mission", missionId));
-      const roles = yield* store.list("role", { missionId });
-      const bindings = yield* store.list("role-binding", { missionId, status: ["bound"] });
-      const lanes = yield* store.list("lane", { missionId });
-      const forks = yield* store.list("fork", { missionId, status: ["open"] });
-      const cast: MissionCast = { missionId, mission, roles, bindings, lanes, forks };
-      return cast;
-    });
+  // ardud missions: core - the whole cast, never a capped page of it
+  const castOf = (missionId: MissionId) => readWholeCast(store, missionId);
 
   const standingIn = (missionId: MissionId, provenance: MissionProvenance) =>
     Effect.gen(function* () {

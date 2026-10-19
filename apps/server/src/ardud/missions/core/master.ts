@@ -5,18 +5,26 @@ import * as Option from "effect/Option";
 import { standingOf, type MissionCast } from "../asks/standing.ts";
 import type * as MissionStore from "../store/MissionStore.ts";
 
+const newestFirst = <A>(oldestFirst: ReadonlyArray<A>) => oldestFirst.toReversed();
+
 /**
  * The calling thread's standing, looked up from its role bindings. Writes
  * that only the owner or a master may make check this themselves, so a
- * transport that forgets to doesn't open them up.
+ * transport that forgets to doesn't open them up. Reads the whole cast:
+ * `list` stops at its limit, and authority must never hang on what a page
+ * happened to include.
  */
 export const castOf = (store: MissionStore.MissionStore["Service"], missionId: MissionId) =>
   Effect.gen(function* () {
     const mission = Option.getOrNull(yield* store.get("mission", missionId));
-    const roles = yield* store.list("role", { missionId });
-    const bindings = yield* store.list("role-binding", { missionId, status: ["bound"] });
-    const lanes = yield* store.list("lane", { missionId });
-    const forks = yield* store.list("fork", { missionId, status: ["open"] });
+    // Newest first, as `list` returned them: `roles[0]` and `lanes[0]` keep meaning
+    // the caller's most recent role and lane.
+    const roles = newestFirst(yield* store.listAllInMission("role", missionId));
+    const bindings = newestFirst(
+      yield* store.listAllInMission("role-binding", missionId, ["bound"]),
+    );
+    const lanes = newestFirst(yield* store.listAllInMission("lane", missionId));
+    const forks = newestFirst(yield* store.listAllInMission("fork", missionId, ["open"]));
     const cast: MissionCast = { missionId, mission, roles, bindings, lanes, forks };
     return cast;
   });
@@ -33,6 +41,24 @@ export const isMasterOf = (
         Effect.map((cast) => cast.mission !== null && standingOf(cast, provenance).isMaster),
       );
 
+/**
+ * Every mission whose master role the caller's thread holds right now. Starts
+ * from the store's complete thread index, so a master is found however many
+ * missions exist.
+ */
+export const missionsMasteredBy = (
+  store: MissionStore.MissionStore["Service"],
+  provenance: MissionProvenance,
+) =>
+  Effect.gen(function* () {
+    if (provenance._tag !== "agent") return [];
+    const mastered: Array<MissionId> = [];
+    for (const missionId of yield* store.missionsOfThread(provenance.threadId)) {
+      if (yield* isMasterOf(store, missionId, provenance)) mastered.push(missionId);
+    }
+    return mastered;
+  });
+
 /** True when the caller is the master of any mission. */
 export const isMasterAnywhere = (
   store: MissionStore.MissionStore["Service"],
@@ -40,9 +66,8 @@ export const isMasterAnywhere = (
 ) =>
   Effect.gen(function* () {
     if (provenance._tag !== "agent") return false;
-    const missions = yield* store.list("mission", {});
-    for (const mission of missions) {
-      if (yield* isMasterOf(store, mission.id, provenance)) return true;
+    for (const missionId of yield* store.missionsOfThread(provenance.threadId)) {
+      if (yield* isMasterOf(store, missionId, provenance)) return true;
     }
     return false;
   });
