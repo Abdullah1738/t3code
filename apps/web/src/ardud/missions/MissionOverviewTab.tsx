@@ -18,7 +18,6 @@ import {
   isDraftFeedItem,
   orderBlockerGroups,
   ownerWaitingEntries,
-  recoveryBanner,
   refKey,
   refLabel,
   resolveMissionLayout,
@@ -34,15 +33,20 @@ import {
 
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
-import { Skeleton } from "../../components/ui/skeleton";
 import { cn } from "../../lib/utils";
+import { BoardLead, LanesPanel, RestartNotice } from "./BoardPanels";
 import { AgeElement, ByMarker, PersonChip, RefChip, StateGlyph } from "./cards/chips";
 import { useCardDiscussion } from "./DiscussPanel";
 import { markMissionSeen, reactToCall } from "./missionCommands";
 import { useMissionInbox, useMissionViews, useYourRequests } from "./missionsStore";
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { PriorityStack } from "./PriorityStack";
-import { NeedsYouSection, PinnedStrip, WithTheMasterSection } from "./sections/NeedsYou";
+import {
+  LoadingRows,
+  NeedsYouSection,
+  PinnedStrip,
+  WithTheMasterSection,
+} from "./sections/NeedsYou";
 import { FoldButton, SectionCount, SectionShell } from "./sections/SectionShell";
 import {
   RequestThread,
@@ -105,10 +109,27 @@ export function MissionOverviewTab(props: {
         }
       : null;
 
+  const showFigures =
+    layout === null || layout.header.some((entry) => entry.kind === "header-stats");
+  // The lanes panel sits under Needs you, or at the top of the rail.
+  const rail = context?.layout.rail ?? [];
+  const lanesAt = rail.findIndex((section) => section.kind === "needs-you") + 1;
+  const railSections: Array<ViewSectionEntry | typeof LANES> = [
+    ...rail.slice(0, lanesAt),
+    LANES,
+    ...rail.slice(lanesAt),
+  ];
+
   return (
-    <div className="flex min-w-0 flex-col gap-6">
-      <RecoveryLine overview={overview} />
-      <BottomLine overview={overview} nowMs={nowMs} />
+    <div className="flex min-w-0 flex-col gap-4">
+      <RestartNotice missionId={missionId} recovery={overview.recovery} />
+      <BoardLead
+        overview={overview}
+        inbox={inbox}
+        requests={requests}
+        showFigures={showFigures}
+        nowMs={nowMs}
+      />
       {context?.layout.pinned.needsYou ? (
         <PinnedStrip
           missionId={missionId}
@@ -142,30 +163,39 @@ export function MissionOverviewTab(props: {
       ) : null}
       {context ? (
         // The side column comes first on narrow screens, so it does in the DOM too.
-        <div className="grid min-w-0 gap-x-10 gap-y-11 lg:grid-cols-[minmax(0,1fr)_340px]">
+        <div className="grid min-w-0 gap-4 lg:grid-cols-12">
           <aside
             aria-label="Side column"
-            className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(300px,1fr))] content-start gap-x-10 gap-y-11 lg:col-start-2 lg:row-start-1 lg:grid-cols-1"
+            className="flex min-w-0 flex-col gap-4 lg:col-span-4 lg:col-start-9 lg:row-start-1"
           >
-            {context.layout.rail.map((section) => (
-              <OverviewSection key={section.key} section={section} context={context} />
-            ))}
+            {railSections.map((section) =>
+              section === LANES ? (
+                <LanesPanel
+                  key="lanes"
+                  missionId={missionId}
+                  counts={overview.lanes}
+                  nowMs={nowMs}
+                />
+              ) : (
+                <OverviewSection key={section.key} section={section} context={context} />
+              ),
+            )}
           </aside>
-          <div className="flex min-w-0 flex-col gap-11 lg:col-start-1 lg:row-start-1">
+          <div className="flex min-w-0 flex-col gap-4 lg:col-span-8 lg:col-start-1 lg:row-start-1">
             {context.layout.main.map((section) => (
               <OverviewSection key={section.key} section={section} context={context} />
             ))}
           </div>
         </div>
       ) : views === null ? null : (
-        <div aria-hidden className="flex flex-col gap-3">
-          <Skeleton className="h-4 w-2/5" />
-          <Skeleton className="h-4 w-3/5" />
-        </div>
+        <LoadingRows />
       )}
     </div>
   );
 }
+
+/** Marks where the lanes panel goes in the rail. */
+const LANES = "lanes" as const;
 
 interface SectionContext {
   readonly overview: MissionOverviewSnapshot;
@@ -213,8 +243,8 @@ function OverviewSection(props: { section: ViewSectionEntry; context: SectionCon
       return <SinceLastLookedSection {...common} overview={context.overview} />;
     case "path-to-milestone":
       return <PathSection {...common} overview={context.overview} />;
-    // The stats row lives in the mission header; custom sections render once
-    // the server answers their queries (views track, later round).
+    // The stats row is the board's figures; custom sections render once
+    // the server answers their queries.
     case "header-stats":
     case "custom":
       return null;
@@ -227,36 +257,6 @@ interface SectionProps {
   readonly layout: ResolvedViewLayout;
   readonly section: ViewSectionEntry;
   readonly nowMs: number;
-}
-
-/** Shown while a restart incident still has threads to resume or decide. */
-function RecoveryLine(props: { overview: MissionOverviewSnapshot }) {
-  const line = recoveryBanner(props.overview.recovery);
-  if (!line) return null;
-  return (
-    <Link
-      to="/missions/$missionId"
-      params={{ missionId: props.overview.mission.id }}
-      search={{ tab: "roles" }}
-      className="flex min-w-0 items-center gap-2 rounded-sm text-sm text-(--m-text) outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-    >
-      <StateGlyph kind="risk" />
-      {line}
-    </Link>
-  );
-}
-
-function BottomLine(props: { overview: MissionOverview; nowMs: number }) {
-  const { overview } = props;
-  if (overview.bottomLine.length === 0) return null;
-  const age = overview.bottomLineAt ? ageView(overview.bottomLineAt, props.nowMs) : null;
-  return (
-    <section aria-label="Bottom line" className="flex min-w-0 items-start gap-2.5">
-      <ByMarker by="master" label="The master's bottom line" />
-      <p className="min-w-0 flex-1 text-sm leading-5.5 text-pretty">{overview.bottomLine}</p>
-      {age && overview.bottomLineAt ? <AgeElement age={age} at={overview.bottomLineAt} /> : null}
-    </section>
-  );
 }
 
 // ---------------------------------------------------------------------------
