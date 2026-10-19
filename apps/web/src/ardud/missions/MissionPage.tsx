@@ -1,9 +1,8 @@
 import { Link } from "@tanstack/react-router";
 
 import type { MissionId, RoomId } from "@t3tools/contracts";
-import { healthLabel } from "@t3tools/client-runtime/ardud/missions";
 
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
+import { Empty, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
 import { ScrollArea } from "../../components/ui/scroll-area";
 import { SidebarInset } from "../../components/ui/sidebar";
 import { Skeleton } from "../../components/ui/skeleton";
@@ -18,7 +17,7 @@ import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { cn } from "../../lib/utils";
 import { LanesTab } from "./LanesTab";
-import { MissionSummary } from "./MissionHeader";
+import { MissionHead } from "./MissionHeader";
 import { MissionOverviewTab } from "./MissionOverviewTab";
 import { MISSION_TAB_LABEL, MISSION_TABS, type MissionTab } from "./missionSearch";
 import { useMissionOverview } from "./missionsStore";
@@ -26,8 +25,8 @@ import { RolesTab } from "./RolesTab";
 import { RoomsTab } from "./RoomsTab";
 import { RulesTab } from "./RulesTab";
 import { TimelineTab } from "./TimelineTab";
+import { ViewsTab } from "./ViewsTab";
 import { WorkTab } from "./WorkTab";
-import { HEALTH_DOT_CLASS } from "./missionTone";
 import { useNowMs } from "./useNowMs";
 
 /** A mission's page: header with the owner's controls, then one tab. */
@@ -36,6 +35,8 @@ export function MissionPage(props: {
   tab: MissionTab;
   highlightSubMissionId: string | null;
   roomId: RoomId | null;
+  /** Owner request opened on the overview. */
+  requestId: string | null;
 }) {
   const overview = useMissionOverview(props.missionId);
   const nowMs = useNowMs();
@@ -55,19 +56,7 @@ export function MissionPage(props: {
             </WorkspaceBreadcrumbItem>
             <WorkspaceBreadcrumbSeparator />
             <WorkspaceBreadcrumbItem current>
-              {overview ? (
-                <span
-                  role="img"
-                  aria-label={healthLabel(overview.mission.health)}
-                  className={cn(
-                    "me-2 size-2 shrink-0 rounded-full",
-                    overview.mission.status === "paused"
-                      ? "bg-muted-foreground/25"
-                      : HEALTH_DOT_CLASS[overview.mission.health],
-                  )}
-                />
-              ) : null}
-              <h1 className="truncate">{title}</h1>
+              <WorkspaceBreadcrumbText>{title}</WorkspaceBreadcrumbText>
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
         </WorkspacePageHeader>
@@ -79,13 +68,14 @@ export function MissionPage(props: {
               <MissionNotFound />
             ) : (
               <>
-                <MissionSummary overview={overview} nowMs={nowMs} />
+                <MissionHead overview={overview} nowMs={nowMs} />
                 <MissionTabs missionId={props.missionId} tab={props.tab} />
                 {props.tab === "overview" ? (
                   <MissionOverviewTab
                     overview={overview}
                     nowMs={nowMs}
                     highlightSubMissionId={props.highlightSubMissionId}
+                    openRequestId={props.requestId}
                   />
                 ) : props.tab === "rooms" ? (
                   <RoomsTab missionId={props.missionId} roomId={props.roomId} nowMs={nowMs} />
@@ -101,6 +91,8 @@ export function MissionPage(props: {
                   />
                 ) : props.tab === "roles" ? (
                   <RolesTab missionId={props.missionId} nowMs={nowMs} />
+                ) : props.tab === "views" ? (
+                  <ViewsTab missionId={props.missionId} nowMs={nowMs} />
                 ) : (
                   <TimelineTab missionId={props.missionId} />
                 )}
@@ -115,8 +107,8 @@ export function MissionPage(props: {
 
 function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
   return (
-    <nav aria-label="Mission sections" className="-mx-1 overflow-x-auto border-b border-border">
-      <ul className="flex min-w-max gap-1 px-1">
+    <nav aria-label="Mission sections" className="overflow-x-auto border-b border-border">
+      <ul className="flex min-w-max gap-0.5">
         {MISSION_TABS.map((tab) => {
           const active = tab === props.tab;
           return (
@@ -127,10 +119,10 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
                 search={tab === "overview" ? {} : { tab }}
                 aria-current={active ? "page" : undefined}
                 className={cn(
-                  "-mb-px flex h-9 items-center border-b-2 px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                  "relative flex h-9 items-center px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
                   active
-                    ? "border-foreground font-medium text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground",
+                    ? "font-medium text-foreground after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-foreground"
+                    : "text-muted-foreground hover:text-foreground",
                 )}
               >
                 {MISSION_TAB_LABEL[tab]}
@@ -145,7 +137,8 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
 
 function MissionPageSkeleton() {
   return (
-    <div className="flex flex-col gap-4" aria-busy="true" aria-label="Loading mission">
+    <div className="flex flex-col gap-4" aria-busy="true">
+      <h1 className="sr-only">Loading mission</h1>
       <Skeleton className="h-4 w-2/3" />
       <Skeleton className="h-6 w-1/2" />
       <Skeleton className="h-24 w-full" />
@@ -158,10 +151,9 @@ function MissionNotFound() {
   return (
     <Empty>
       <EmptyHeader>
-        <EmptyTitle>Mission not found</EmptyTitle>
-        <EmptyDescription>
-          It may have been archived. Pick a mission from the sidebar.
-        </EmptyDescription>
+        <EmptyTitle role="heading" aria-level={1}>
+          Mission not found
+        </EmptyTitle>
       </EmptyHeader>
     </Empty>
   );

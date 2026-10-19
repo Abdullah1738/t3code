@@ -26,7 +26,7 @@ export function IntendedShareEditor(props: { row: PriorityStackRow; masterRoleId
 
   const submit = async () => {
     setBusy(true);
-    const sent = await setIntendedShare(sub.id, text);
+    const sent = await setIntendedShare(sub.missionId, sub.id, text);
     setBusy(false);
     if (sent) setOpen(false);
   };

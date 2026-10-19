@@ -2,11 +2,18 @@ import type { ReactNode } from "react";
 
 import { cn } from "../../lib/utils";
 
+/** Quiet marker for a section whose data is fixture sample, not the server's. */
+export function SampleMark() {
+  return <span className="shrink-0 text-xs text-muted-foreground">Sample</span>;
+}
+
 /** One titled block of the mission overview. */
 export function MissionSection(props: {
   title: string;
   caption?: ReactNode;
   accessory?: ReactNode;
+  /** The section reads a feed the server does not serve yet. */
+  sample?: boolean;
   className?: string;
   children: ReactNode;
 }) {
@@ -26,6 +33,7 @@ export function MissionSection(props: {
         {props.caption ? (
           <p className="min-w-0 text-xs text-muted-foreground">{props.caption}</p>
         ) : null}
+        {props.sample ? <SampleMark /> : null}
         {props.accessory ? <div className="ms-auto shrink-0">{props.accessory}</div> : null}
       </div>
       {props.children}

@@ -1,250 +1,303 @@
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
-import {
-  CrosshairIcon,
-  InboxIcon,
-  MessageCircleQuestionIcon,
-  PauseIcon,
-  PlayIcon,
-} from "lucide-react";
+import { CrosshairIcon, MessageCircleQuestionIcon, PauseIcon, PlayIcon } from "lucide-react";
 
 import type { MissionId, MissionOverview, SubMissionId } from "@t3tools/contracts";
 import {
-  foldLaneCounts,
+  badgeCount,
   formatCountdown,
   formatDayLabel,
-  healthLabel,
+  formatPercent,
+  laneTotal,
   nextMilestone,
   poolUsageView,
   priorityStack,
   splitForks,
-  usageView,
-  badgeCount,
   type MissionOverviewSnapshot,
 } from "@t3tools/client-runtime/ardud/missions";
 
-import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import {
   Menu,
   MenuGroup,
   MenuGroupLabel,
-  MenuItem,
   MenuPopup,
   MenuRadioGroup,
   MenuRadioItem,
-  MenuSeparator,
   MenuTrigger,
 } from "../../components/ui/menu";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../components/ui/popover";
 import { cn } from "../../lib/utils";
+import { GlyphCount, HealthStatus } from "./cards/chips";
 import { setMissionFocus, toggleMissionPaused } from "./missionCommands";
 import { AskTheMissionForm, MissionForksList } from "./MissionForksList";
-import { useMissionForks, useMissionList } from "./missionsStore";
-import { HEALTH_BADGE_VARIANT, LANE_DOT_CLASS } from "./missionTone";
+import { useMissionForks, useMissionList, useOwnerRequests } from "./missionsStore";
+import { RequestsUnreadLink, unreadRequests } from "./sections/YourRequests";
 
-/** Goal, milestone countdown, health, usage and the owner's mission controls. */
-export function MissionSummary(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
+/** Title, the owner's controls, goal, focus and the mission's headline numbers. */
+export function MissionHead(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
   const { overview, nowMs } = props;
   const { mission } = overview;
-  const paused = mission.status === "paused";
-  const milestone = useMemo(() => nextMilestone(overview.milestones), [overview.milestones]);
-  const usage = usageView(overview.usageShare);
-  const fold = useMemo(() => foldLaneCounts(overview.lanes), [overview.lanes]);
-
   return (
-    <div className="flex min-w-0 flex-col gap-3">
-      <p className="text-sm text-pretty text-muted-foreground">{mission.goal}</p>
-      <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 text-xs">
-        <Badge variant={paused ? "outline" : HEALTH_BADGE_VARIANT[mission.health]} size="default">
-          {paused ? "Paused" : healthLabel(mission.health)}
-        </Badge>
-        {milestone && milestone.targetAt ? (
-          <span className="flex items-center gap-1.5 text-foreground">
-            <span className="font-medium">{formatDayLabel(milestone.targetAt)}</span>
-            <span className="text-muted-foreground tabular-nums">
-              {formatCountdown(milestone.targetAt, nowMs)}
-            </span>
-            {milestone.atRisk > 0 ? (
-              <span className="text-warning-foreground">{milestone.atRisk} at risk</span>
-            ) : null}
-            <span className="text-muted-foreground tabular-nums">
-              {milestone.done}/{milestone.total} done
-            </span>
-          </span>
-        ) : null}
-        <span
-          className={cn(
-            usage.tone === "borrowing"
-              ? "text-warning-foreground"
-              : usage.tone === "unknown"
-                ? "text-muted-foreground/70"
-                : "text-muted-foreground",
-          )}
+    <section aria-labelledby="mission-title" className="flex min-w-0 flex-col gap-1.5">
+      <div className="flex min-h-8 min-w-0 items-center gap-3">
+        <h1
+          id="mission-title"
+          className="min-w-0 flex-1 text-base leading-6 font-semibold text-balance"
         >
-          {usage.label}
-        </span>
-        {fold.total > 0 ? (
-          <span className="flex items-center gap-1.5 text-muted-foreground">
-            <span className="tabular-nums">{fold.total}</span> lanes
-            {fold.parts.map((part) => (
-              <span key={part.tone} className="flex items-center gap-1">
-                <span
-                  aria-hidden
-                  className={cn("size-1.5 rounded-full", LANE_DOT_CLASS[part.tone])}
-                />
-                <span className="tabular-nums">{part.count}</span> {part.label}
-              </span>
-            ))}
-          </span>
-        ) : null}
+          {mission.title}
+        </h1>
+        <div className="flex shrink-0 items-center gap-1">
+          <FocusMenu overview={overview} />
+          <PauseButton
+            missionId={mission.id}
+            title={mission.title}
+            paused={mission.status === "paused"}
+          />
+          <AskTheMission missionId={mission.id} title={mission.title} nowMs={nowMs} />
+        </div>
       </div>
-      <PoolUsageLine pools={overview.poolUsage} nowMs={nowMs} masterRoleId={mission.masterRoleId} />
-      <div className="flex flex-wrap items-center gap-2">
-        <FocusMenu overview={overview} />
-        <PauseButton missionId={mission.id} title={mission.title} paused={paused} />
-        <InboxButton missionId={mission.id} />
-        <AskTheMission missionId={mission.id} title={mission.title} nowMs={nowMs} />
-      </div>
-    </div>
+      {mission.goal ? (
+        <p className="max-w-[72ch] text-sm text-pretty text-muted-foreground">{mission.goal}</p>
+      ) : null}
+      <FocusBar overview={overview} />
+      <MissionStats overview={overview} nowMs={nowMs} />
+    </section>
   );
 }
 
 function FocusMenu(props: { overview: MissionOverview }) {
   const { mission } = props.overview;
   const rows = useMemo(
-    () => priorityStack(props.overview.subMissions),
+    () =>
+      priorityStack(props.overview.subMissions).filter((row) => row.subMission.status === "active"),
     [props.overview.subMissions],
   );
-  const focusOn = mission.focusSubMissionId !== null;
-  const focused = rows.find((row) => row.subMission.id === mission.focusSubMissionId);
-  const focusTitle = focused?.subMission.title ?? "a closed sub-mission";
-  // Focus has no end time: it stays on until someone ends it here (or the master does).
+  // Focus has no end time: it stays on until someone ends it (the focus bar or the master).
   const setFocus = (value: unknown) => {
     if (typeof value !== "string" || value === mission.focusSubMissionId) return;
     void setMissionFocus(mission.id, value as SubMissionId);
   };
+  if (rows.length === 0) return null;
   return (
     <Menu>
-      <MenuTrigger
-        render={
-          <Button
-            variant={focusOn ? "secondary" : "outline"}
-            size="sm"
-            aria-label={focusOn ? `Focus: ${focusTitle}` : "Focus mode"}
-          />
-        }
-      >
+      <MenuTrigger render={<Button variant="ghost-muted" size="sm" />}>
         <CrosshairIcon aria-hidden />
-        <span className="max-w-48 truncate">{focusOn ? `Focus: ${focusTitle}` : "Focus"}</span>
+        <span className="max-sm:sr-only">Focus</span>
       </MenuTrigger>
-      <MenuPopup align="start" side="bottom">
+      <MenuPopup align="end" side="bottom">
         <MenuGroup>
-          <MenuGroupLabel>Only this sub-mission takes new work</MenuGroupLabel>
+          <MenuGroupLabel>Focus on</MenuGroupLabel>
           <MenuRadioGroup value={mission.focusSubMissionId ?? ""} onValueChange={setFocus}>
-            {rows
-              .filter((row) => row.subMission.status === "active")
-              .map((row) => (
-                <MenuRadioItem key={row.subMission.id} value={row.subMission.id} closeOnClick>
-                  {row.position}. {row.subMission.title}
-                </MenuRadioItem>
-              ))}
+            {rows.map((row) => (
+              <MenuRadioItem key={row.subMission.id} value={row.subMission.id} closeOnClick>
+                <span className="w-4 shrink-0 text-xs text-muted-foreground tabular-nums">
+                  {row.position}
+                </span>
+                {row.subMission.title}
+              </MenuRadioItem>
+            ))}
           </MenuRadioGroup>
         </MenuGroup>
-        {focusOn ? (
-          <>
-            <MenuSeparator />
-            <MenuItem onClick={() => void setMissionFocus(mission.id, null)}>End focus</MenuItem>
-          </>
-        ) : null}
       </MenuPopup>
     </Menu>
   );
 }
 
-function PauseButton(props: {
-  missionId: MissionOverview["mission"]["id"];
-  title: string;
-  paused: boolean;
-}) {
+/** Shown while one sub-mission is the only one taking new work. */
+function FocusBar(props: { overview: MissionOverview }) {
+  const { mission, subMissions } = props.overview;
+  if (mission.focusSubMissionId === null) return null;
+  const focused = subMissions.find((sub) => sub.id === mission.focusSubMissionId);
   return (
-    <Button variant="outline" size="sm" onClick={() => void toggleMissionPaused(props)}>
+    <div
+      role="status"
+      className="mt-3.5 flex max-w-140 min-w-0 items-center gap-2.5 rounded-lg bg-update/14 py-1.5 ps-3 pe-1.5 text-sm"
+    >
+      <CrosshairIcon aria-hidden className="size-4 shrink-0 text-update-foreground" />
+      <span className="min-w-0 flex-1 truncate font-medium">
+        Focused on {focused?.title ?? "a closed sub-mission"}
+      </span>
+      <Button variant="outline" size="sm" onClick={() => void setMissionFocus(mission.id, null)}>
+        End focus
+      </Button>
+    </div>
+  );
+}
+
+function PauseButton(props: { missionId: MissionId; title: string; paused: boolean }) {
+  return (
+    <Button variant="ghost-muted" size="sm" onClick={() => void toggleMissionPaused(props)}>
       {props.paused ? <PlayIcon aria-hidden /> : <PauseIcon aria-hidden />}
-      {props.paused ? "Resume" : "Pause"}
+      <span className="max-sm:sr-only">{props.paused ? "Resume" : "Pause"}</span>
     </Button>
   );
 }
 
 /**
  * "Ask the mission" plus the open discussions (Discuss forks and side
- * questions), so every open fork is one tap from the header.
+ * questions), so every open fork is one tap from the head.
  */
 function AskTheMission(props: { missionId: MissionId; title: string; nowMs: number }) {
   const forks = useMissionForks(props.missionId);
   const openCount = forks ? splitForks(forks).open.length : 0;
   return (
     <Popover>
-      <PopoverTrigger render={<Button variant="default" size="sm" />}>
+      <PopoverTrigger render={<Button variant="outline" size="sm" />}>
         <MessageCircleQuestionIcon aria-hidden />
-        Ask the mission
-        {openCount > 0 ? <span className="tabular-nums">· {openCount} open</span> : null}
+        <span className="max-sm:sr-only">Ask the mission</span>
+        {openCount > 0 ? (
+          <span className="text-xs font-normal text-muted-foreground tabular-nums">
+            {openCount}
+            <span className="sr-only"> open</span>
+          </span>
+        ) : null}
       </PopoverTrigger>
-      <PopoverPopup align="start" side="bottom" className="w-80">
+      <PopoverPopup align="end" side="bottom" className="w-80">
         <PopoverTitle>Ask {props.title}</PopoverTitle>
         <div className="mt-2 flex flex-col gap-3">
           <AskTheMissionForm missionId={props.missionId} />
-          <div className="flex flex-col gap-1">
-            <h3 className="text-xs font-medium text-muted-foreground">Open discussions</h3>
-            <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
-          </div>
+          {openCount > 0 ? (
+            <div className="flex flex-col gap-1">
+              <h3 className="text-xs font-medium text-muted-foreground">Open discussions</h3>
+              <MissionForksList missionId={props.missionId} nowMs={props.nowMs} />
+            </div>
+          ) : null}
         </div>
       </PopoverPopup>
     </Popover>
   );
 }
 
-/** Header entry to this mission's inbox, with what waits on the owner. */
-function InboxButton(props: { missionId: MissionId }) {
-  const list = useMissionList();
-  const count = list?.missions.find((mission) => mission.id === props.missionId)?.needsYou ?? 0;
+/** The head's numbers: one term and one value each, empty ones left out. */
+function MissionStats(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
+  const { overview, nowMs } = props;
+  const { mission } = overview;
+  const milestone = useMemo(() => nextMilestone(overview.milestones), [overview.milestones]);
+  const lanes = overview.lanes;
+  const lanesTotal = laneTotal(lanes);
+  const countdown = milestone?.targetAt ? formatCountdown(milestone.targetAt, nowMs) : "";
   return (
-    <Button
-      variant="outline"
-      size="sm"
-      render={<Link to="/missions/inbox" search={{ mission: props.missionId }} />}
-    >
-      <InboxIcon aria-hidden />
-      Inbox
-      {count > 0 ? <span className="tabular-nums">· {badgeCount(count)}</span> : null}
-    </Button>
+    <dl className="mt-4.5 grid grid-cols-2 gap-x-6 gap-y-4 sm:flex sm:flex-wrap sm:gap-x-12 sm:gap-y-4.5">
+      <Stat term={milestone?.targetAt ? formatDayLabel(milestone.targetAt) : "Health"}>
+        <HealthStatus health={mission.health} paused={mission.status === "paused"} />
+      </Stat>
+      {countdown ? (
+        <Stat term="Time left">
+          <span className={cn(countdown.startsWith("overdue") && "text-error-foreground")}>
+            {countdown}
+          </span>
+        </Stat>
+      ) : null}
+      {milestone && milestone.total > 0 ? (
+        <Stat term="Milestones">
+          {milestone.done > 0 || milestone.atRisk > 0 ? (
+            <>
+              {milestone.done > 0 ? (
+                <GlyphCount kind="done" count={milestone.done} label={`${milestone.done} done,`} />
+              ) : null}
+              {milestone.atRisk > 0 ? (
+                <GlyphCount
+                  kind="risk"
+                  count={milestone.atRisk}
+                  label={`${milestone.atRisk} at risk,`}
+                />
+              ) : null}
+              <OfTotal total={milestone.total} />
+            </>
+          ) : (
+            milestone.total
+          )}
+        </Stat>
+      ) : null}
+      {lanesTotal > 0 ? (
+        <Stat term="Lanes">
+          {lanes.stuck > 0 || lanes.waiting > 0 ? (
+            <>
+              {lanes.stuck > 0 ? (
+                <GlyphCount kind="bad" count={lanes.stuck} label={`${lanes.stuck} stuck,`} />
+              ) : null}
+              {lanes.waiting > 0 ? (
+                <GlyphCount
+                  kind="wait"
+                  tone="risk"
+                  count={lanes.waiting}
+                  label={`${lanes.waiting} waiting,`}
+                />
+              ) : null}
+              <OfTotal total={lanesTotal} />
+            </>
+          ) : (
+            lanesTotal
+          )}
+        </Stat>
+      ) : null}
+      <NeedsYouStat missionId={mission.id} />
+      {overview.usageShare !== null && Number.isFinite(overview.usageShare) ? (
+        <Stat term="Guaranteed share used">
+          <span className={cn(overview.usageShare > 1 && "text-warning-foreground")}>
+            {formatPercent(overview.usageShare)}
+          </span>
+        </Stat>
+      ) : null}
+      {overview.poolUsage.map((pool) => {
+        const view = poolUsageView(pool, nowMs, mission.masterRoleId);
+        return (
+          <Stat key={view.id} term={view.label}>
+            <span
+              className={cn(
+                view.tone === "out" && "text-error-foreground",
+                view.tone === "tight" && "text-warning-foreground",
+              )}
+            >
+              <span aria-hidden>{view.value}</span>
+              <span className="sr-only">{view.detail}</span>
+            </span>
+          </Stat>
+        );
+      })}
+    </dl>
   );
 }
 
-/** One compact line per pool the mission draws on. */
-function PoolUsageLine(props: {
-  pools: MissionOverviewSnapshot["poolUsage"];
-  nowMs: number;
-  masterRoleId: string | null;
-}) {
-  if (props.pools.length === 0) return null;
+/** What waits on the owner here, and answers to their requests not yet read. */
+function NeedsYouStat(props: { missionId: MissionId }) {
+  const list = useMissionList();
+  const requests = useOwnerRequests(props.missionId);
+  const count = list?.missions.find((mission) => mission.id === props.missionId)?.needsYou ?? 0;
+  const answered = unreadRequests(requests).length > 0;
+  if (count === 0 && !answered) return null;
   return (
-    <ul aria-label="Pool usage" className="flex flex-wrap gap-x-3 gap-y-1 text-xs">
-      {props.pools.map((pool) => {
-        const view = poolUsageView(pool, props.nowMs, props.masterRoleId);
-        return (
-          <li
-            key={view.id}
-            className={cn(
-              view.tone === "out" && "text-destructive-foreground",
-              view.tone === "tight" && "text-warning-foreground",
-              (view.tone === "ok" || view.tone === "held") && "text-muted-foreground",
-            )}
-          >
-            {view.label} <span className="tabular-nums">{view.value}</span>
-            <span className="sr-only">. {view.detail}</span>
-          </li>
-        );
-      })}
-    </ul>
+    <Stat term="Needs you">
+      {count > 0 ? (
+        <Link
+          to="/missions/inbox"
+          search={{ mission: props.missionId }}
+          className="rounded-sm text-update-foreground outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          {badgeCount(count)}
+          <span className="sr-only"> in the inbox</span>
+        </Link>
+      ) : null}
+      <span className="font-normal">
+        <RequestsUnreadLink missionId={props.missionId} requests={requests} />
+      </span>
+    </Stat>
   );
+}
+
+/** Value above its term, as in the design's stat row. */
+function Stat(props: { term: string; children: ReactNode }) {
+  return (
+    <div className="flex min-w-0 flex-col-reverse gap-0.5">
+      <dt className="truncate text-xs text-muted-foreground">{props.term}</dt>
+      <dd className="flex min-w-0 items-center gap-3 text-base leading-6 font-semibold tabular-nums">
+        {props.children}
+      </dd>
+    </div>
+  );
+}
+
+function OfTotal(props: { total: number }) {
+  return <span className="text-xs font-normal text-muted-foreground">of {props.total}</span>;
 }

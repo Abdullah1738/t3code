@@ -142,11 +142,13 @@ describe("lane actions", () => {
       error: "Say what the lane should look at.",
     });
     expect(setLaneParkedInput(lane("cell-tc"), true, " freeze ")).toEqual({
+      missionId: CRPKO,
       laneId: "lane-cell-tc",
       parked: true,
       reason: "freeze",
     });
     expect(setLaneParkedInput(lane("cell-ws"), false, "ignored")).toEqual({
+      missionId: CRPKO,
       laneId: "lane-cell-ws",
       parked: false,
     });
@@ -160,7 +162,7 @@ describe("lane actions", () => {
     );
     expect(mergeLanesInput(lane("cell-tc2"), lane("cell-tc"))).toEqual({
       ok: true,
-      value: { laneId: "lane-cell-tc2", intoLaneId: "lane-cell-tc" },
+      value: { missionId: CRPKO, laneId: "lane-cell-tc2", intoLaneId: "lane-cell-tc" },
     });
     const juno = { ...lane("cell-tc"), id: "lane-intents-ops", missionId: "juno-intents" } as Lane;
     expect(mergeLanesInput(lane("cell-tc2"), juno)).toEqual({

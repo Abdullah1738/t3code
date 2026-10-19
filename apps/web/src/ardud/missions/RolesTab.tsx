@@ -17,9 +17,11 @@ import {
 
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
+import { MetaRow } from "./cards/chips";
 import { MutedLines, PickForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import {
+  isSampleFeed,
   useMasterRoleId,
   useMissionList,
   useMissionPools,
@@ -56,7 +58,18 @@ function RoleRegistry(props: { missionId: MissionId; nowMs: number }) {
   return (
     <MissionSection
       title="Roles"
-      caption={`${view.rows.length} roles · ${view.modelMix} · ${view.pendingModelChanges} model changes pending · ${view.driftCount} drifting`}
+      caption={
+        <MetaRow>
+          <span>{`${view.rows.length} roles`}</span>
+          <span>{view.modelMix}</span>
+          {view.pendingModelChanges > 0 ? (
+            <span>{`${view.pendingModelChanges} model changes pending`}</span>
+          ) : null}
+          {view.driftCount > 0 ? (
+            <span className="text-warning-foreground">{`${view.driftCount} drifting`}</span>
+          ) : null}
+        </MetaRow>
+      }
     >
       <ul className="flex flex-col divide-y divide-border/60">
         {view.rows.map((row) => (
@@ -166,7 +179,13 @@ function ReviewPolicySection(props: { missionId: MissionId; nowMs: number }) {
   return (
     <MissionSection
       title="Review policy"
-      caption={`v${view.policy.version} · judged by ${view.judgedBy}${view.changedBy ? ` · ${view.changedBy}` : ""}`}
+      caption={
+        <MetaRow>
+          <span className="tabular-nums">{`v${view.policy.version}`}</span>
+          <span>{`judged by ${view.judgedBy}`}</span>
+          {view.changedBy ? <span>{view.changedBy}</span> : null}
+        </MetaRow>
+      }
     >
       <ul className="flex flex-col gap-1 text-sm">
         {ladders.map((ladder) => (
@@ -262,7 +281,11 @@ function PoolItem(props: { row: PoolRow; nowMs: number }) {
       <div className="flex flex-wrap items-baseline gap-x-2">
         <span className="font-medium text-foreground">{row.pool.name}</span>
         <span className="text-muted-foreground">
-          {row.usageLine} · {row.pressure} · {row.enforcementLabel}
+          <MetaRow>
+            <span className="tabular-nums">{row.usageLine}</span>
+            <span>{row.pressure}</span>
+            <span>{row.enforcementLabel}</span>
+          </MetaRow>
         </span>
       </div>
       <MutedLines
@@ -323,7 +346,7 @@ function RecoverySection(props: { missionId: MissionId }) {
   const incidents = useMissionRecovery(props.missionId);
   if (!incidents || incidents.length === 0) return null;
   return (
-    <MissionSection title="Restart recovery">
+    <MissionSection title="Restart recovery" sample={isSampleFeed("recovery")}>
       <ul className="flex flex-col gap-3">
         {incidents.map((incident) => (
           <RecoveryItem key={incident.id} incident={incident} />
@@ -339,18 +362,25 @@ function RecoveryItem(props: { incident: RecoveryIncident }) {
   const rows = [...view.pending, ...view.settled];
   return (
     <li className="flex flex-col gap-1 text-sm">
-      <span className="font-medium text-foreground">
-        {view.causeLabel}, detected {formatTimeOfDay(incident.detectedAt)} (
-        {formatTimeOfDay(incident.window.from)}–{formatTimeOfDay(incident.window.to)}) ·{" "}
-        {incident.status}
-      </span>
+      <MetaRow>
+        <span className="font-medium text-foreground">
+          {view.causeLabel}, detected {formatTimeOfDay(incident.detectedAt)} (
+          {formatTimeOfDay(incident.window.from)}–{formatTimeOfDay(incident.window.to)})
+        </span>
+        <span className="text-xs text-muted-foreground">{incident.status}</span>
+      </MetaRow>
       <MutedLines
         lines={[view.progressLine, `Resume plan: ${view.resumeRate}, by sub-mission priority`]}
       />
       <ol className="flex flex-col gap-1 ps-3">
         {rows.map((row) => (
           <li key={`${row.name}-${row.member.threadId}`}>
-            {row.name}: {row.actionLabel} ({row.member.state}) · {row.childrenLine}
+            <MetaRow>
+              <span>
+                {row.name}: {row.actionLabel} ({row.member.state})
+              </span>
+              <span className="text-xs text-muted-foreground">{row.childrenLine}</span>
+            </MetaRow>
             <MutedLines
               lines={[
                 row.member.why,

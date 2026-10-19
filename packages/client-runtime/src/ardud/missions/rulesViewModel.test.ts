@@ -10,6 +10,7 @@ import {
   ruleAcks,
   ruleBookView,
   scopeLine,
+  scopeParts,
   setRuleStatusInput,
   useLine,
 } from "./rulesViewModel.ts";
@@ -67,6 +68,10 @@ describe("rule book", () => {
       "Lanes: cell-bo, cell-devops2, cell-fab-devops, cell-fab-svc, cell-fab-tc",
     );
     expect(scopeLine({ subMissionIds: [], roleKinds: [], laneIds: [] })).toBe("Whole mission");
+    expect(scopeParts(rule104.scope)).toEqual([
+      "Lanes: cell-bo, cell-devops2, cell-fab-devops, cell-fab-svc, cell-fab-tc",
+    ]);
+    expect(scopeParts({ subMissionIds: [], roleKinds: [], laneIds: [] })).toEqual([]);
     expect(useLine(ruleById(book, "rule-7"))).toBe("Used 149 times");
     expect(useLine({ appliedCount: 1, brokenCount: 2 })).toBe("Used once, broken twice");
     expect(useLine({ appliedCount: 0, brokenCount: 0 })).toBe("Not used yet");

@@ -16,6 +16,7 @@ import {
   effortNote,
   feedCountsLine,
   foldLaneCounts,
+  ageView,
   formatCountdown,
   formatRelative,
   formatTimeOfDay,
@@ -272,6 +273,15 @@ describe("feed and time", () => {
     expect(formatCountdown("2026-10-17T09:15:00Z", NOW)).toBe("42m");
     expect(formatCountdown("2026-10-17T08:33:20Z", NOW)).toBe("due now");
     expect(formatCountdown("2026-10-17T05:33:00Z", NOW)).toBe("overdue 3h 0m");
+  });
+
+  it("shortens ages and says how loud to show them", () => {
+    expect(ageView("2026-10-17T08:32:30Z", NOW)).toEqual({ label: "now", tier: "minutes" });
+    expect(ageView("2026-10-17T07:41:00Z", NOW)).toEqual({ label: "52m", tier: "minutes" });
+    expect(ageView("2026-10-17T03:00:00Z", NOW)).toEqual({ label: "5h", tier: "hours" });
+    expect(ageView("2026-10-15T18:30:00Z", NOW)).toEqual({ label: "1d 14h", tier: "days" });
+    expect(ageView("2026-10-15T08:33:00Z", NOW)).toEqual({ label: "2d", tier: "days" });
+    expect(ageView("not a time", NOW)).toBeNull();
   });
 
   it("formats relative times", () => {

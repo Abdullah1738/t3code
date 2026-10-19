@@ -1,22 +1,23 @@
-import type { Approval, Draft, DraftChannel, MissionActor } from "@t3tools/contracts";
+import {
+  approverOf,
+  type Approval,
+  type ApprovalRoute,
+  type ApprovalRouteMatch,
+  type Approver,
+  type Draft,
+  type DraftChannel,
+  type MissionId,
+  type MissionLink,
+  type SetApprovalRoutingInput,
+} from "@t3tools/contracts";
 
-import type {
-  ApprovalRouteMatch,
-  ApprovalRoutingTable,
-  Approver,
-  DraftRouteMatch,
-  RouteReason,
-  RouteRule,
-  Routed,
-  RoutedApproval,
-  RoutedDraft,
-  SetApprovalRoutingInput,
-} from "./source.ts";
-import { actorLabel } from "./viewModel.ts";
+import type { ApprovalRoutingTable, RerouteRecordInput } from "./source.ts";
 
-// Approval routing: every draft and approval goes to an approver (owner or
-// master) when it is created. The table is edited by either of them the same
-// way. The owner can always decide anything, whoever it is routed to.
+// Approval routing: every draft and approval gets an approver (owner or
+// master) when it is created, from the mission's routing table. The first
+// matching row wins and no match goes to the owner, the same rule the server
+// applies. The owner and the master edit the table the same way, and the
+// owner can always decide anything, whoever it is routed to.
 
 type Result<T> =
   | { readonly ok: true; readonly value: T }
@@ -26,82 +27,70 @@ const err = <T>(error: string): Result<T> => ({ ok: false, error });
 
 export const APPROVER_LABEL: Record<Approver, string> = { owner: "you", master: "master" };
 
-const sameName = (left: string, right: string) =>
-  left.trim().toLowerCase() === right.trim().toLowerCase();
+const sameText = (left: string, right: string | null) =>
+  right !== null && left.trim().toLowerCase() === right.trim().toLowerCase();
 
-/** "owner/repo" or "repo" from a pull-request link label like `crpko-devops#759`. */
-export function approvalRepository(approval: Pick<Approval, "links">): string | null {
+const GITHUB_PULL = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\//i;
+const PR_KEY = /^([\w.-]+\/[\w.-]+)#\d+$/;
+
+/** `owner/repo` from the first pull-request link: a label like `owner/repo#12`, or a GitHub URL. */
+export function approvalRepository(approval: { readonly links: ReadonlyArray<MissionLink> }) {
   for (const link of approval.links) {
     if (link.kind !== "pull-request") continue;
-    const ref = link.ref ?? link.label;
-    const hash = ref.lastIndexOf("#");
-    const repo = hash > 0 ? ref.slice(0, hash) : ref;
-    return repo.split("/").at(-1) ?? null;
+    const fromLabel = PR_KEY.exec(link.label)?.[1];
+    if (fromLabel !== undefined) return fromLabel;
+    const fromUrl = link.url === null ? undefined : GITHUB_PULL.exec(link.url)?.[1];
+    if (fromUrl !== undefined) return fromUrl;
   }
   return null;
 }
 
-/**
- * The approver for a new draft. A person rule beats a channel rule; within a
- * kind, the first matching rule wins; no match goes to the owner.
- */
+function matches(
+  match: ApprovalRouteMatch,
+  subject:
+    | { readonly kind: "draft"; readonly draft: Pick<Draft, "audience" | "channel"> }
+    | { readonly kind: "approval"; readonly approval: Pick<Approval, "kind" | "links"> },
+): boolean {
+  if (match._tag === "approval") {
+    if (subject.kind !== "approval") return false;
+    if (match.kind !== undefined && match.kind !== subject.approval.kind) return false;
+    return (
+      match.repository === undefined ||
+      sameText(match.repository, approvalRepository(subject.approval))
+    );
+  }
+  if (subject.kind !== "draft") return false;
+  const { draft } = subject;
+  if (match.channel !== undefined && match.channel !== draft.channel) return false;
+  if (match.audience !== undefined && !sameText(match.audience, draft.audience)) return false;
+  return match.person === undefined || sameText(match.person, draft.audience);
+}
+
+export interface RouteHit {
+  readonly approver: Approver;
+  /** The row that matched, `null` when none did and the record went to the owner. */
+  readonly routeId: string | null;
+}
+
+const hit = (row: ApprovalRoute | undefined): RouteHit =>
+  row === undefined
+    ? { approver: "owner", routeId: null }
+    : { approver: row.approver, routeId: row.id };
+
+/** The approver for a new draft: the first matching row, or the owner. */
 export function routeDraft(
-  table: Pick<ApprovalRoutingTable, "draftRules"> | null,
+  table: { readonly routes: ReadonlyArray<ApprovalRoute> } | null,
   draft: Pick<Draft, "audience" | "channel">,
-): Routed {
-  const rules = table?.draftRules ?? [];
-  const person = rules.find(
-    (r) => r.match._tag === "person" && sameName(r.match.name, draft.audience),
-  );
-  const channel = rules.find(
-    (r) => r.match._tag === "channel" && r.match.channel === draft.channel,
-  );
-  const hit = person ?? channel;
-  return hit
-    ? {
-        approver: hit.approver,
-        route: { _tag: "rule", ruleId: hit.id, label: draftMatchLabel(hit.match) },
-      }
-    : { approver: "owner", route: { _tag: "fallback" } };
+): RouteHit {
+  return hit(table?.routes.find((row) => matches(row.match, { kind: "draft", draft })));
 }
 
-/** The approver for a new approval. A repo rule beats a kind rule; no match goes to the owner. */
+/** The approver for a new approval: the first matching row, or the owner. */
 export function routeApproval(
-  table: Pick<ApprovalRoutingTable, "approvalRules"> | null,
+  table: { readonly routes: ReadonlyArray<ApprovalRoute> } | null,
   approval: Pick<Approval, "kind" | "links">,
-): Routed {
-  const rules = table?.approvalRules ?? [];
-  const repository = approvalRepository(approval);
-  const repo =
-    repository === null
-      ? undefined
-      : rules.find((r) => r.match._tag === "repo" && sameName(r.match.repository, repository));
-  const kind = rules.find((r) => r.match._tag === "kind" && r.match.kind === approval.kind);
-  const hit = repo ?? kind;
-  return hit
-    ? {
-        approver: hit.approver,
-        route: { _tag: "rule", ruleId: hit.id, label: approvalMatchLabel(hit.match) },
-      }
-    : { approver: "owner", route: { _tag: "fallback" } };
-}
-
-/** Moves one record to the other inbox. The reason is required and kept on the route. */
-export function reroute<T extends Routed>(
-  record: T,
-  to: Approver,
-  by: MissionActor,
-  reason: string,
-  at: string,
-): Result<T> {
-  const why = reason.trim();
-  if (why === "") return err("Say why it should move.");
-  if (record.approver === to) return err(`It is already routed to ${APPROVER_LABEL[to]}.`);
-  return ok({
-    ...record,
-    approver: to,
-    route: { _tag: "rerouted", from: record.approver, by, reason: why, at },
-  });
+): RouteHit {
+  return hit(table?.routes.find((row) => matches(row.match, { kind: "approval", approval })));
 }
 
 const DRAFT_CHANNEL_NAME: Record<DraftChannel, string> = {
@@ -115,33 +104,27 @@ const DRAFT_CHANNEL_NAME: Record<DraftChannel, string> = {
   other: "other channels",
 };
 
-export function draftMatchLabel(match: DraftRouteMatch): string {
-  return match._tag === "person"
-    ? `drafts to ${match.name}`
-    : `drafts on ${DRAFT_CHANNEL_NAME[match.channel]}`;
-}
-
-export function approvalMatchLabel(match: ApprovalRouteMatch): string {
-  return match._tag === "repo" ? `approvals in ${match.repository}` : `${match.kind} approvals`;
-}
-
-/** One line on why a record sits in its inbox. */
-export function routeLine(routed: Routed, masterRoleId: string | null): string {
-  const to = APPROVER_LABEL[routed.approver];
-  switch (routed.route._tag) {
-    case "rule":
-      return `Routed to ${to}: ${routed.route.label}`;
-    case "fallback":
-      return `Routed to ${to}: no rule matched`;
-    case "rerouted":
-      return `Moved to ${to} by ${actorLabel(routed.route.by, masterRoleId)}: ${routed.route.reason}`;
+/** "drafts to Pavan on Cliq", "merge approvals in owner/repo", "all approvals". */
+export function routeMatchLabel(match: ApprovalRouteMatch): string {
+  if (match._tag === "approval") {
+    const kind = match.kind === undefined ? "approvals" : `${match.kind} approvals`;
+    const scope = match.repository === undefined ? "" : ` in ${match.repository}`;
+    return match.kind === undefined && match.repository === undefined
+      ? "all approvals"
+      : `${kind}${scope}`;
   }
+  const to = match.person ?? match.audience;
+  const parts = [
+    to === undefined ? null : `to ${to}`,
+    match.channel === undefined ? null : `on ${DRAFT_CHANNEL_NAME[match.channel]}`,
+  ].filter((part): part is string => part !== null);
+  return parts.length === 0 ? "all drafts" : `drafts ${parts.join(" ")}`;
 }
 
-export function isRerouted(
-  route: RouteReason,
-): route is Extract<RouteReason, { _tag: "rerouted" }> {
-  return route._tag === "rerouted";
+/** The reason a record was moved to its inbox, when someone moved it. */
+export function routeLine(record: Pick<Draft, "routeNote">): string | null {
+  const note = record.routeNote?.trim();
+  return note ? note : null;
 }
 
 /** Which inbox the owner is looking at. The default shows what is routed to them. */
@@ -156,11 +139,11 @@ export function isInboxRouteFilter(value: unknown): value is InboxRouteFilter {
   return value === "owner" || value === "master";
 }
 
-export function routedTo<T extends { readonly approver: Approver }>(
+export function routedTo<T extends { readonly approver?: Approver | undefined }>(
   records: ReadonlyArray<T>,
   filter: InboxRouteFilter,
 ): T[] {
-  return records.filter((record) => record.approver === filter);
+  return records.filter((record) => approverOf(record) === filter);
 }
 
 /** Suggestions land in their acceptor's inbox; the master may decide any of them. */
@@ -171,131 +154,141 @@ export function suggestionsFor<T extends { readonly acceptor: Approver }>(
   return suggestions.filter((suggestion) => suggestion.acceptor === filter);
 }
 
-/** "Waiting on you" or "Waiting on master; you can still decide it". */
-export function decideLine(routed: Pick<Routed, "approver">): string {
-  return routed.approver === "owner"
+/** "Waiting on you" or "Waiting on master. You can still decide it." */
+export function decideLine(record: { readonly approver?: Approver | undefined }): string {
+  return approverOf(record) === "owner"
     ? "Waiting on you"
     : "Waiting on master. You can still decide it.";
+}
+
+/** Builds a move to the other inbox. The reason is required and kept on the record. */
+export function rerouteRecordInput(
+  kind: RerouteRecordInput["kind"],
+  record: { readonly id: string; readonly approver?: Approver | undefined },
+  to: Approver,
+  reason: string,
+): Result<RerouteRecordInput> {
+  const why = reason.trim();
+  if (why === "") return err("Say why it should move.");
+  if (approverOf(record) === to) return err(`It is already routed to ${APPROVER_LABEL[to]}.`);
+  return ok({ kind, id: record.id, approver: to, reason: why });
 }
 
 // --- Table editing -----------------------------------------------------------
 
 export interface RoutingRow {
   readonly id: string;
-  readonly kind: "draft" | "approval";
   readonly label: string;
   readonly approver: Approver;
 }
 
-/** Table rows in the order they apply: person, channel, repo, kind. */
-export function routingRows(table: ApprovalRoutingTable): RoutingRow[] {
-  const drafts = [...table.draftRules].sort(
-    (left, right) => Number(right.match._tag === "person") - Number(left.match._tag === "person"),
-  );
-  const approvals = [...table.approvalRules].sort(
-    (left, right) => Number(right.match._tag === "repo") - Number(left.match._tag === "repo"),
-  );
-  return [
-    ...drafts.map((rule) => ({
-      id: rule.id,
-      kind: "draft" as const,
-      label: draftMatchLabel(rule.match),
-      approver: rule.approver,
-    })),
-    ...approvals.map((rule) => ({
-      id: rule.id,
-      kind: "approval" as const,
-      label: approvalMatchLabel(rule.match),
-      approver: rule.approver,
-    })),
-  ];
+/** A mission with no table yet: everything goes to the owner until the first row. */
+export function emptyRoutingTable(missionId: MissionId): ApprovalRoutingTable {
+  return { missionId, routes: [], updatedAt: "", changes: [] };
 }
 
-const matchKey = (match: DraftRouteMatch | ApprovalRouteMatch) => {
-  switch (match._tag) {
-    case "channel":
-      return `channel:${match.channel}`;
-    case "person":
-      return `person:${match.name.trim().toLowerCase()}`;
-    case "kind":
-      return `kind:${match.kind}`;
-    case "repo":
-      return `repo:${match.repository.trim().toLowerCase()}`;
+/** Rows in the order they apply; the first match wins. */
+export function routingRows(table: Pick<ApprovalRoutingTable, "routes">): RoutingRow[] {
+  return table.routes.map((row) => ({
+    id: row.id,
+    label: routeMatchLabel(row.match),
+    approver: row.approver,
+  }));
+}
+
+const lower = (value: string | undefined) => value?.trim().toLowerCase() ?? "";
+
+/** One key per thing a row can match, so two rows never fight over it. */
+export function routeMatchKey(match: ApprovalRouteMatch): string {
+  return match._tag === "approval"
+    ? `approval|${match.kind ?? ""}|${lower(match.repository)}`
+    : `draft|${match.channel ?? ""}|${lower(match.audience)}|${lower(match.person)}`;
+}
+
+const isNarrow = (match: ApprovalRouteMatch) =>
+  match._tag === "approval" ? match.repository !== undefined : match.person !== undefined;
+
+function normalizeMatch(match: ApprovalRouteMatch): Result<ApprovalRouteMatch> {
+  if (match._tag === "approval") {
+    if (match.repository === undefined) return ok(match);
+    const repository = match.repository.trim();
+    return repository
+      ? ok({ ...match, repository })
+      : err<ApprovalRouteMatch>("Name the repository.");
   }
-};
-
-function upsertRule<M extends DraftRouteMatch | ApprovalRouteMatch>(
-  rules: ReadonlyArray<RouteRule<M>>,
-  match: M,
-  approver: Approver,
-  newId: () => string,
-): RouteRule<M>[] {
-  const key = matchKey(match);
-  const index = rules.findIndex((rule) => matchKey(rule.match) === key);
-  if (index < 0) return [...rules, { id: newId(), match, approver }];
-  return rules.map((rule, i) => (i === index ? { ...rule, approver } : rule));
+  if (match.person === undefined) return ok(match);
+  const person = match.person.trim();
+  return person ? ok({ ...match, person }) : err<ApprovalRouteMatch>("Name the person.");
 }
 
-/** Builds the edit that sets one draft rule (adds it or changes its approver). */
-export function setDraftRouteInput(
-  table: ApprovalRoutingTable,
-  match: DraftRouteMatch,
-  approver: Approver,
-  newId: () => string,
-): Result<SetApprovalRoutingInput> {
-  if (match._tag === "person" && match.name.trim() === "") return err("Name the person.");
-  const normalized: DraftRouteMatch =
-    match._tag === "person" ? { _tag: "person", name: match.name.trim() } : match;
-  return ok({
-    missionId: table.missionId,
-    expectedVersion: table.version,
-    draftRules: upsertRule(table.draftRules, normalized, approver, newId),
-    approvalRules: table.approvalRules,
-  });
-}
+const routingInput = (
+  table: Pick<ApprovalRoutingTable, "missionId">,
+  routes: ReadonlyArray<ApprovalRoute>,
+): SetApprovalRoutingInput => ({ missionId: table.missionId, routes: [...routes] });
 
-/** Builds the edit that sets one approval rule. */
-export function setApprovalRouteInput(
-  table: ApprovalRoutingTable,
+/**
+ * Sets the approver for one match: changes the row that already matches it, or
+ * adds one. A row for a person or a repository goes first so it beats the
+ * broader rows; any other new row goes last.
+ */
+export function setRouteInput(
+  table: Pick<ApprovalRoutingTable, "missionId" | "routes">,
   match: ApprovalRouteMatch,
   approver: Approver,
   newId: () => string,
 ): Result<SetApprovalRoutingInput> {
-  if (match._tag === "repo" && match.repository.trim() === "") return err("Name the repository.");
-  const normalized: ApprovalRouteMatch =
-    match._tag === "repo" ? { _tag: "repo", repository: match.repository.trim() } : match;
-  return ok({
-    missionId: table.missionId,
-    expectedVersion: table.version,
-    draftRules: table.draftRules,
-    approvalRules: upsertRule(table.approvalRules, normalized, approver, newId),
-  });
-}
-
-/** Builds the edit that removes a rule; records it would have matched fall back to the owner. */
-export function removeRouteInput(
-  table: ApprovalRoutingTable,
-  ruleId: string,
-): Result<SetApprovalRoutingInput> {
-  const draftRules = table.draftRules.filter((rule) => rule.id !== ruleId);
-  const approvalRules = table.approvalRules.filter((rule) => rule.id !== ruleId);
-  if (
-    draftRules.length === table.draftRules.length &&
-    approvalRules.length === table.approvalRules.length
-  ) {
-    return err("That rule is not in the table.");
+  const normalized = normalizeMatch(match);
+  if (!normalized.ok) return normalized;
+  const key = routeMatchKey(normalized.value);
+  const index = table.routes.findIndex((row) => routeMatchKey(row.match) === key);
+  if (index >= 0) {
+    return ok(
+      routingInput(
+        table,
+        table.routes.map((row, i) => (i === index ? { ...row, approver } : row)),
+      ),
+    );
   }
-  return ok({
-    missionId: table.missionId,
-    expectedVersion: table.version,
-    draftRules,
-    approvalRules,
-  });
+  const row: ApprovalRoute = { id: newId(), match: normalized.value, approver };
+  return ok(
+    routingInput(
+      table,
+      isNarrow(normalized.value) ? [row, ...table.routes] : [...table.routes, row],
+    ),
+  );
 }
 
-/** Re-routes a list after a table change would, for a preview only; existing records never move. */
+/** Flips one row to the other approver. */
+export function flipRouteInput(
+  table: Pick<ApprovalRoutingTable, "missionId" | "routes">,
+  routeId: string,
+): Result<SetApprovalRoutingInput> {
+  if (!table.routes.some((row) => row.id === routeId)) return err("That row is not in the table.");
+  return ok(
+    routingInput(
+      table,
+      table.routes.map((row) =>
+        row.id === routeId
+          ? { ...row, approver: row.approver === "owner" ? "master" : "owner" }
+          : row,
+      ),
+    ),
+  );
+}
+
+/** Removes a row; records it would have matched fall back to the next row or the owner. */
+export function removeRouteInput(
+  table: Pick<ApprovalRoutingTable, "missionId" | "routes">,
+  routeId: string,
+): Result<SetApprovalRoutingInput> {
+  const routes = table.routes.filter((row) => row.id !== routeId);
+  if (routes.length === table.routes.length) return err("That row is not in the table.");
+  return ok(routingInput(table, routes));
+}
+
+/** Re-routes a list as a table change would, for a preview only; existing records never move. */
 export function previewRouting(
-  table: Pick<ApprovalRoutingTable, "draftRules" | "approvalRules">,
+  table: { readonly routes: ReadonlyArray<ApprovalRoute> },
   drafts: ReadonlyArray<Pick<Draft, "audience" | "channel">>,
   approvals: ReadonlyArray<Pick<Approval, "kind" | "links">>,
 ): { readonly owner: number; readonly master: number } {
@@ -307,13 +300,13 @@ export function previewRouting(
   return { owner, master: approvers.length - owner };
 }
 
-/** Pending records with their routes, newest first, for the routing screen's preview list. */
+/** Pending records newest first, for the routing screen's preview list. */
 export function pendingRouted(
-  drafts: ReadonlyArray<RoutedDraft>,
-  approvals: ReadonlyArray<RoutedApproval>,
+  drafts: ReadonlyArray<Draft>,
+  approvals: ReadonlyArray<Approval>,
 ): ReadonlyArray<
-  | { readonly kind: "draft"; readonly record: RoutedDraft }
-  | { readonly kind: "approval"; readonly record: RoutedApproval }
+  | { readonly kind: "draft"; readonly record: Draft }
+  | { readonly kind: "approval"; readonly record: Approval }
 > {
   return [
     ...drafts.map((record) => ({ kind: "draft" as const, record })),

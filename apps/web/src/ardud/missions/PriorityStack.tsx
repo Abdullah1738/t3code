@@ -23,7 +23,6 @@ import type { FieldChange } from "@t3tools/client-runtime/ardud/missions";
 import {
   effortNote,
   formatPercent,
-  healthLabel,
   intendedTotal,
   moveInOrder,
   priorityStack,
@@ -33,13 +32,13 @@ import {
 import { cn } from "../../lib/utils";
 import { reorderSubMissions } from "./missionCommands";
 import { IntendedShareEditor } from "./IntendedShareEditor";
-import { HEALTH_DOT_CLASS } from "./missionTone";
-import { MissionSection } from "./MissionSection";
+import { HealthGlyph } from "./cards/chips";
 
 /**
  * Sub-missions in the owner's order. The bar is the master's measured effort
  * over the last 24 hours; the tick is the share the owner intended. Dragging
- * reorders; the master works the queue top-down.
+ * reorders; the master works the queue top-down. Renders the list only; the
+ * overview section around it owns the heading.
  */
 export function PriorityStack(props: {
   mission: Mission;
@@ -76,10 +75,7 @@ export function PriorityStack(props: {
   };
 
   return (
-    <MissionSection
-      title="Priority stack"
-      caption="Bar: master effort, last 24h. Tick: intended share (you or the master can set it)."
-    >
+    <div className="flex min-w-0 flex-col gap-2">
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
@@ -106,15 +102,17 @@ export function PriorityStack(props: {
         </SortableContext>
       </DndContext>
       {note ? <p className="text-xs text-muted-foreground">{note}</p> : null}
-      <p className="text-xs text-muted-foreground">
-        {planned.label}
-        {planned.balanced ? "" : " (intended shares don't add up to 100%)"}
-      </p>
-      <p className="text-xs text-muted-foreground/70">
-        Drag to reorder. Lower sub-missions park first when capacity is short; "fills idle" ones
-        only take what is left.
-      </p>
-    </MissionSection>
+      {planned.total > 0 ? (
+        <p
+          className={cn(
+            "text-xs tabular-nums",
+            planned.balanced ? "text-muted-foreground" : "text-warning-foreground",
+          )}
+        >
+          {planned.label}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -168,26 +166,18 @@ function PriorityStackItem(props: {
         <span className="w-4 shrink-0 text-end text-xs text-muted-foreground tabular-nums">
           {position}
         </span>
-        <span
-          role="img"
-          aria-label={paused ? "Paused" : healthLabel(sub.health)}
-          className={cn(
-            "size-2 shrink-0 rounded-full",
-            paused ? "bg-muted-foreground/25" : HEALTH_DOT_CLASS[sub.health],
-          )}
-        />
+        <HealthGlyph health={sub.health} paused={paused} />
         <span className={cn("min-w-0 truncate font-medium", paused && "text-muted-foreground")}>
           {sub.title}
         </span>
         {props.focused ? (
-          <span className="shrink-0 rounded-sm bg-info/10 px-1 text-2xs text-info-foreground">
+          <span className="shrink-0 rounded-sm bg-info/10 px-1 text-xs text-info-foreground">
             focus
           </span>
         ) : null}
         {sub.fillIdleCapacity ? (
-          <span className="shrink-0 text-2xs text-muted-foreground">fills idle</span>
+          <span className="shrink-0 text-xs text-muted-foreground">fills idle</span>
         ) : null}
-        {paused ? <span className="shrink-0 text-2xs text-muted-foreground">paused</span> : null}
       </div>
       <span
         className={cn(

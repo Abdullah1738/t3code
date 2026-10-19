@@ -4,6 +4,7 @@ import type {
   DraftNote,
   Lane,
   MissionId,
+  MissionInboxHistory,
   MissionListSnapshot,
   RoomId,
   RoomPage,
@@ -11,14 +12,18 @@ import type {
   SuggestionStats,
 } from "@t3tools/contracts";
 import {
+  createAtomMissionsTransport,
   createFixtureMissionsSource,
   createKeyedSnapshotStores,
+  createRpcMissionsSource,
   createSnapshotStore,
+  type SampledFeed,
   type ApprovalRoutingTable,
   type MissionForkEntry,
-  type MissionInboxHistory,
   type MissionInboxSnapshot,
+  type MissionLayout,
   type MissionOverviewSnapshot,
+  type OwnerRequest,
   type MissionPoolsSnapshot,
   type MissionReviewSnapshot,
   type MissionRolesSnapshot,
@@ -31,9 +36,32 @@ import {
   type RecoveryIncident,
 } from "@t3tools/client-runtime/ardud/missions";
 
-// The web client's one missions source. The fixture is built from real Crpko
-// coordinator data; swap this line for the server RPC source when it lands.
-export const missionsSource: MissionsSource = createFixtureMissionsSource({ surface: "web" });
+import { connectionAtomRuntime } from "../../connection/runtime";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
+import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
+
+// The web client's one missions source: the primary server over WS RPC, with
+// fixture data filling the feeds the server does not serve yet (each listed in
+// `missionsSource.sampled`). `?missionsFixture=1` runs on the fixture alone.
+const useFixtureOnly =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).get("missionsFixture") === "1";
+const fixtureSource = createFixtureMissionsSource({ surface: "web" });
+export const missionsSource: MissionsSource = useFixtureOnly
+  ? fixtureSource
+  : createRpcMissionsSource({
+      transport: createAtomMissionsTransport({
+        runtime: connectionAtomRuntime,
+        registry: appAtomRegistry,
+        environmentId: primaryEnvironmentIdAtom,
+      }),
+      fallback: fixtureSource,
+    });
+
+/** True when a section's data comes from the fixture rather than the server. */
+export function isSampleFeed(feed: SampledFeed): boolean {
+  return missionsSource.sampled.has(feed);
+}
 
 // One subscription per screen-level store, shared by every component that
 // reads it. Rows never subscribe on their own.
@@ -97,6 +125,24 @@ const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Missio
 const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit) =>
   missionsSource.subscribeRoom(id, emit),
 );
+const layoutStores = createKeyedSnapshotStores<MissionId, MissionLayout>((id, emit) =>
+  missionsSource.subscribeLayout(id, emit),
+);
+const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
+  (id, emit) => missionsSource.subscribeRequests(id, emit),
+);
+
+/** The mission's overview sections, in order, with what was hidden or removed. */
+export function useMissionLayout(missionId: MissionId): MissionLayout | undefined {
+  const store = layoutStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+/** What the owner asked or told the master, newest activity first. */
+export function useOwnerRequests(missionId: MissionId): ReadonlyArray<OwnerRequest> | undefined {
+  const store = requestStores(missionId);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
 
 /** `undefined` until the source has answered once. */
 export function useMissionList(): MissionListSnapshot | undefined {

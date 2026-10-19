@@ -139,12 +139,17 @@ export function chainHeads(items: ReadonlyArray<WorkItem>): WorkItem[] {
   return items.filter((item) => !dependedOn.has(item.id) && item.dependsOn.length > 0);
 }
 
-/** "merged 79887b3a · deployed · exercised", from the item's recorded facts. */
-export function workFactsLine(item: WorkItem): string | null {
-  const parts = [
+/** The item's recorded facts, one element each: "merged 79887b3a", "deployed: ...". */
+export function workFacts(item: WorkItem): string[] {
+  return [
     item.facts.mergedAtHead ? `merged ${item.facts.mergedAtHead}` : null,
     item.facts.deployedReadback ? `deployed: ${item.facts.deployedReadback}` : null,
     item.facts.exercised ? `exercised: ${item.facts.exercised}` : null,
   ].filter((part): part is string => part !== null);
+}
+
+/** "merged 79887b3a · deployed · exercised", from the item's recorded facts. */
+export function workFactsLine(item: WorkItem): string | null {
+  const parts = workFacts(item);
   return parts.length === 0 ? null : parts.join(" · ");
 }

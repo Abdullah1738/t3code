@@ -1,9 +1,16 @@
 import type { CallId, DraftNoteId, ForkId, MissionId, SubMissionId } from "@t3tools/contracts";
 import {
   addDraftNoteInput,
+  askSectionChangeInput,
   askTheMissionInput,
+  discussSectionInput,
+  openRequestInput,
   parseShareInput,
+  replyRequestInput,
   type DraftNoteScopeChoice,
+  type OwnerRequest,
+  type SectionChange,
+  type SectionEntry,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { requestConfirmDialog } from "../../confirmDialog";
@@ -48,9 +55,9 @@ export function reorderSubMissions(missionId: MissionId, order: ReadonlyArray<Su
 }
 
 /** "Fine" accepts the call; "Discuss" also opens a Discuss fork of the master. */
-export function reactToCall(missionId: MissionId, callId: string, reaction: "ok" | "discuss") {
+export function reactToCall(callId: string, reaction: "ok" | "discuss") {
   return runMissionAction(
-    missionsSource.reactToCall({ missionId, callId: callId as CallId, reaction }),
+    missionsSource.reactToCall({ callId: callId as CallId, reaction }),
     "Could not record your reaction",
   );
 }
@@ -60,10 +67,10 @@ export function markMissionSeen(missionId: MissionId) {
 }
 
 /** Parses "40", "40%" or "0.4"; an empty field clears the share. */
-export function setIntendedShare(subMissionId: SubMissionId, text: string) {
+export function setIntendedShare(missionId: MissionId, subMissionId: SubMissionId, text: string) {
   const parsed = parseShareInput(text);
   return submitMissionInput(
-    parsed.ok ? { ok: true, value: { subMissionId, share: parsed.share } } : parsed,
+    parsed.ok ? { ok: true, value: { missionId, subMissionId, share: parsed.share } } : parsed,
     (input) => missionsSource.setIntendedEffort(input),
     "Couldn't change the share",
   );
@@ -99,4 +106,64 @@ export function askTheMission(missionId: MissionId, question: string) {
 
 export function closeFork(forkId: ForkId) {
   return runMissionAction(missionsSource.archiveFork({ forkId }), "Couldn't close the discussion");
+}
+
+// --- Overview sections ---
+
+export function changeSection(missionId: MissionId, key: string, change: SectionChange) {
+  return runMissionAction(
+    missionsSource.changeSection({ missionId, key, change }),
+    "Couldn't change the section",
+  );
+}
+
+export function discussSection(missionId: MissionId, section: SectionEntry) {
+  return runMissionAction(
+    missionsSource.openFork(discussSectionInput(missionId, section)),
+    "Couldn't open the discussion",
+  );
+}
+
+export function askSectionChange(missionId: MissionId, section: SectionEntry, text: string) {
+  return submitMissionInput(
+    askSectionChangeInput(missionId, section, text),
+    (input) => missionsSource.openFork(input),
+    "Couldn't ask the master",
+  );
+}
+
+// --- Your requests ---
+
+/** Resolves to the new request, or null when it couldn't be sent. */
+export async function openRequest(missionId: MissionId, text: string) {
+  const created: { request: OwnerRequest | null } = { request: null };
+  const sent = await submitMissionInput(
+    openRequestInput(missionId, text),
+    async (input) => {
+      created.request = await missionsSource.openRequest(input);
+    },
+    "Couldn't send it to the master",
+  );
+  return sent ? created.request : null;
+}
+
+export function replyRequest(requestId: string, text: string) {
+  return submitMissionInput(
+    replyRequestInput(requestId, text),
+    (input) => missionsSource.replyRequest(input),
+    "Couldn't send the reply",
+  );
+}
+
+export function settleRequest(requestId: string) {
+  return runMissionAction(missionsSource.settleRequest({ requestId }), "Couldn't settle it");
+}
+
+export function reopenRequest(requestId: string) {
+  return runMissionAction(missionsSource.reopenRequest({ requestId }), "Couldn't reopen it");
+}
+
+/** Quiet: a failed read mark only leaves the unread dot on. */
+export function markRequestRead(requestId: string) {
+  void missionsSource.markRequestRead({ requestId }).catch(() => undefined);
 }

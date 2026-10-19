@@ -111,10 +111,9 @@ function LaneItem(props: { row: LaneRow; context: LaneContext }) {
           row.role ? `Lead ${row.role.name}${row.model ? ` on ${row.model}` : ""}` : "No lead role",
           row.pendingModel ? `Switches to ${row.pendingModel} on its next turn` : null,
           row.context
-            ? `Context ${row.context.label}${row.context.tone === "ok" ? "" : ` (${row.context.tone})`}${
-                row.context.successionLine ? ` · ${row.context.successionLine}` : ""
-              }`
+            ? `Context ${row.context.label}${row.context.tone === "ok" ? "" : ` (${row.context.tone})`}`
             : null,
+          row.context?.successionLine,
           row.currentItem ? `Working on ${row.currentItem.title}` : null,
           lane.lastEvidence
             ? `Last evidence ${formatRelative(lane.lastEvidence.at, context.nowMs)}: ${lane.lastEvidence.summary}`

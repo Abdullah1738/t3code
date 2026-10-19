@@ -1,4 +1,13 @@
-import { Ask, Draft, DraftNote, MissionInbox, Note, Suggestion } from "@t3tools/contracts";
+import {
+  approverOf,
+  type Approver,
+  Ask,
+  Draft,
+  DraftNote,
+  MissionInbox,
+  Note,
+  Suggestion,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -29,7 +38,7 @@ import {
   suggestionTrackRecord,
   waitingLabel,
 } from "./inboxViewModel.ts";
-import type { Approver, MissionForkEntry, MissionInboxSnapshot } from "./source.ts";
+import type { MissionForkEntry, MissionInboxSnapshot } from "./source.ts";
 
 const T0 = "2026-10-17T08:00:00.000Z";
 const NOW = Date.parse("2026-10-17T08:33:00.000Z");
@@ -155,7 +164,6 @@ const emptyInbox = (
   const routed = <T extends { readonly id: string }>(record: T) => ({
     ...record,
     approver: routes[record.id] ?? ("owner" as const),
-    route: { _tag: "fallback" as const },
   });
   const drafts = inbox.drafts.map(routed);
   const approvals = inbox.approvals.map(routed);
@@ -164,7 +172,7 @@ const emptyInbox = (
     drafts,
     approvals,
     masterCounts: {
-      approve: [...drafts, ...approvals].filter((r) => r.approver === "master").length,
+      approve: [...drafts, ...approvals].filter((r) => approverOf(r) === "master").length,
       suggestions: inbox.suggestions.filter((s) => s.acceptor === "master").length,
     },
   };

@@ -1,8 +1,7 @@
-import type { Pool, PoolHold, PoolId } from "@t3tools/contracts";
+import type { MissionRecoveryState, Pool, PoolHold, PoolId, PoolView } from "@t3tools/contracts";
 
 import { changeIndex, lastChangedLine } from "./changeLog.ts";
 import type {
-  MissionPoolView,
   MissionPoolsSnapshot,
   RecoveryAction,
   RecoveryIncident,
@@ -35,14 +34,14 @@ export interface PoolRow {
   readonly usageLine: string;
   readonly scopeLine: string;
   readonly enforcementLabel: string;
-  readonly pressure: MissionPoolView["pressure"];
+  readonly pressure: PoolView["pressure"];
   readonly pressureReason: string;
   readonly holders: ReadonlyArray<PoolHoldRow>;
   readonly queue: ReadonlyArray<PoolHoldRow>;
   readonly capacityChangedBy: string | null;
 }
 
-const PRESSURE_RANK: Record<MissionPoolView["pressure"], number> = {
+const PRESSURE_RANK: Record<PoolView["pressure"], number> = {
   exhausted: 0,
   tight: 1,
   ok: 2,
@@ -106,11 +105,11 @@ export function poolRows(
 }
 
 /** Share of a pool in use, for a gauge. */
-export function poolShare(view: Pick<MissionPoolView, "inUse" | "pool">): number {
+export function poolShare(view: Pick<PoolView, "inUse" | "pool">): number {
   return view.pool.capacity <= 0 ? 1 : Math.min(1, view.inUse / view.pool.capacity);
 }
 
-export function poolShareLabel(view: Pick<MissionPoolView, "inUse" | "pool">): string {
+export function poolShareLabel(view: Pick<PoolView, "inUse" | "pool">): string {
   return formatPercent(poolShare(view));
 }
 
@@ -195,14 +194,13 @@ export function recoveryView(incident: RecoveryIncident): RecoveryView {
   };
 }
 
-/** The overview line while an incident is open; null once every thread resumed or was decided. */
-export function recoveryBanner(
-  incident: RecoveryIncident | null,
-  formatTime: (iso: string) => string,
-) {
-  if (!incident || incident.status === "cleared") return null;
-  const waiting = incident.members.filter((member) => member.state === "pending").length;
-  return `Recovered from restart at ${formatTime(incident.detectedAt)}: ${waiting} ${
-    waiting === 1 ? "thread" : "threads"
-  } still to resume or decide`;
+/**
+ * The overview line while a restart incident still has threads to resume or
+ * decide, from the contract's `MissionOverview.recovery`; null once none wait.
+ */
+export function recoveryBanner(recovery: MissionRecoveryState | null | undefined) {
+  if (!recovery || recovery.pending === 0) return null;
+  const threads = recovery.pending === 1 ? "thread" : "threads";
+  const reconcile = recovery.reconcile > 0 ? `, ${recovery.reconcile} to reconcile first` : "";
+  return `${recovery.label}: ${recovery.pending} of ${recovery.total} ${threads} still to resume or decide${reconcile}`;
 }

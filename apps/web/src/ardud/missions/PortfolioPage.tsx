@@ -14,9 +14,10 @@ import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../../components/W
 import { WorkspacePageContainer } from "../../components/WorkspacePageContainer";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
+import { MetaRow } from "./cards/chips";
 import { MutedLines } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
-import { usePortfolio } from "./missionsStore";
+import { isSampleFeed, usePortfolio } from "./missionsStore";
 import { movePortfolioMission } from "./operationCommands";
 
 // Portfolio, placeholder presentation: every mission with its tier, guaranteed
@@ -56,7 +57,10 @@ export function PortfolioPage() {
                     view.orderLine,
                   ]}
                 />
-                <MissionSection title="Missions, highest priority first">
+                <MissionSection
+                  title="Missions, highest priority first"
+                  sample={isSampleFeed("portfolio")}
+                >
                   <ol className="flex flex-col divide-y divide-border/60">
                     {view.rows.map((row, index) => {
                       const above = view.rows[index - 1]?.mission.missionId;
@@ -78,7 +82,10 @@ export function PortfolioPage() {
                               {row.mission.title}
                             </Link>
                             <span className="text-muted-foreground">
-                              {row.tierLabel} · {row.mission.status}
+                              <MetaRow>
+                                <span>{row.tierLabel}</span>
+                                <span>{row.mission.status}</span>
+                              </MetaRow>
                             </span>
                           </div>
                           <MutedLines

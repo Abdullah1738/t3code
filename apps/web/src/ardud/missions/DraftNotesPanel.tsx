@@ -40,30 +40,26 @@ export function DraftNotesPanel(props: { missionId: MissionId | null }) {
   const groups = groupDraftNotes(notes);
   return (
     <div className="flex flex-col gap-3">
-      {groups.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No draft notes yet.</p>
-      ) : (
-        groups.map((group) => (
-          <div key={group.key} className="flex flex-col gap-1">
-            <h3 className="text-xs font-medium text-muted-foreground">{group.label}</h3>
-            <ul className="flex flex-col gap-1">
-              {group.notes.map((note) => (
-                <li key={note.id} className="flex items-start gap-2 text-sm">
-                  <Switch
-                    size="sm"
-                    aria-label={note.active ? "Turn off" : "Turn on"}
-                    checked={note.active}
-                    onCheckedChange={(active) => void setDraftNoteActive(note.id, active)}
-                  />
-                  <span className={note.active ? "text-foreground" : "text-muted-foreground"}>
-                    {note.text}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))
-      )}
+      {groups.map((group) => (
+        <div key={group.key} className="flex flex-col gap-1">
+          <h3 className="text-xs font-medium text-muted-foreground">{group.label}</h3>
+          <ul className="flex flex-col gap-1">
+            {group.notes.map((note) => (
+              <li key={note.id} className="flex items-start gap-2 text-sm">
+                <Switch
+                  size="sm"
+                  aria-label={note.active ? "Turn off" : "Turn on"}
+                  checked={note.active}
+                  onCheckedChange={(active) => void setDraftNoteActive(note.id, active)}
+                />
+                <span className={note.active ? "text-foreground" : "text-muted-foreground"}>
+                  {note.text}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
       <AddDraftNoteForm missionId={props.missionId} />
     </div>
   );

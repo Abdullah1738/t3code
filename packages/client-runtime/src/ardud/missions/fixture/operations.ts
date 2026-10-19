@@ -7,8 +7,10 @@ import {
   type Lane,
   type Mission,
   type MissionRecordRef,
+  type MissionRecoveryState,
   Pool,
   PoolHold,
+  type PoolView,
   ReviewPolicy,
   ReviewRecord,
   Role,
@@ -24,7 +26,6 @@ import * as Schema from "effect/Schema";
 import { latestFieldChanges } from "../changeLog.ts";
 import type {
   Listener,
-  MissionPoolView,
   MissionPoolsSnapshot,
   MissionReviewSnapshot,
   MissionRolesSnapshot,
@@ -55,6 +56,14 @@ const decodeWorkItems = Schema.decodeUnknownSync(Schema.Array(WorkItem));
 const decodeChangeRequests = Schema.decodeUnknownSync(Schema.Array(RuleChangeRequest));
 const decodeAudit = Schema.decodeUnknownSync(Schema.Array(RuleAuditSeed));
 const decodeIncidents = Schema.decodeUnknownSync(Schema.Array(RecoveryIncidentSeed));
+
+/** The recovery track's wording for the overview line. */
+const RECOVERY_CAUSE_LABEL: Record<RecoveryIncident["cause"], string> = {
+  "server-restart": "restart",
+  "opencode-restart": "OpenCode restart",
+  "run-interrupted": "interrupted runs",
+  succession: "role handoff",
+};
 
 /** Pool pressure turns tight from this share in use, or when anything queues. */
 const POOL_TIGHT_USE = 0.66;
@@ -102,7 +111,7 @@ const ref = (kind: MissionRecordRef["kind"], id: string, label?: string): Missio
   label === undefined ? { kind, id } : { kind, id, label };
 
 /** The pool's holds, live ones first, then the queue in admission order. */
-function poolView(pool: Pool, poolHolds: ReadonlyArray<PoolHold>): MissionPoolView {
+function poolView(pool: Pool, poolHolds: ReadonlyArray<PoolHold>): PoolView {
   const live = poolHolds
     .filter((hold) => hold.status === "active" || hold.status === "reconcile-required")
     .sort((left, right) =>
@@ -125,7 +134,14 @@ function poolView(pool: Pool, poolHolds: ReadonlyArray<PoolHold>): MissionPoolVi
     left <= 0
       ? `All ${pool.capacity} ${pool.unit} in use${queue}`
       : `${Math.round(left * 100) / 100} of ${pool.capacity} ${pool.unit} left${queue}`;
-  return { pool, holds: [...live, ...queued], inUse, pressure, pressureReason };
+  return {
+    pool,
+    holds: [...live, ...queued],
+    inUse,
+    pressure,
+    pressureReason,
+    sourceConfigured: true,
+  };
 }
 
 const poolCovers = (pool: Pool, missionId: string) =>
@@ -137,8 +153,8 @@ const sameModel = (left: unknown, right: unknown) => JSON.stringify(left) === JS
 
 export interface Operations {
   readonly source: OperationsSource;
-  /** The newest incident still open for the mission, for the overview. */
-  readonly openIncident: (missionId: string) => RecoveryIncident | null;
+  /** The overview's line for the newest incident still open, as the recovery track reports it. */
+  readonly openRecovery: (missionId: string) => MissionRecoveryState | null;
 }
 
 export function createOperations(ctx: OperationsContext): Operations {
@@ -219,6 +235,7 @@ export function createOperations(ctx: OperationsContext): Operations {
       return {
         missionId: missionId as MissionRolesSnapshot["missionId"],
         roles: missionRoles,
+        defaults: [],
         bindings: missionBindings,
         drift,
         changes: changesWhere(
@@ -354,10 +371,11 @@ export function createOperations(ctx: OperationsContext): Operations {
     subscribeTimeline: (missionId, listener) => watch(() => timeline(missionId), listener),
     subscribePortfolio: (listener) => watch(portfolio, listener),
 
-    resolveRuleChange({ changeRequestId, action, response }) {
-      const request = changeRequests.find((r) => r.id === changeRequestId);
-      if (!request) return fail("not-found", `Change request ${changeRequestId} not found.`);
+    resolveRuleChange({ requestId, status, response }) {
+      const request = changeRequests.find((r) => r.id === requestId);
+      if (!request) return fail("not-found", `Change request ${requestId} not found.`);
       if (request.status !== "open") return fail("conflict", "This change request is closed.");
+      const action = status === "applied" ? "apply" : "decline";
       const text = response.trim();
       if (action === "decline" && text.length === 0) {
         return fail("invalid", "Say why the change is declined.");
@@ -365,7 +383,7 @@ export function createOperations(ctx: OperationsContext): Operations {
       const at = nowIso();
       replace(changeRequests, {
         ...request,
-        status: action === "apply" ? "applied" : "declined",
+        status,
         masterResponse: text.length > 0 ? text : null,
         resolvedAt: at,
       });
@@ -489,7 +507,7 @@ export function createOperations(ctx: OperationsContext): Operations {
       return Promise.resolve();
     },
 
-    splitLane({ laneId, name, purpose }) {
+    splitLane({ laneId, name, purpose = "" }) {
       const lane = liveLane(laneId);
       if (!lane) return fail("not-found", `Lane ${laneId} not found.`);
       const laneName = name.trim();
@@ -527,7 +545,7 @@ export function createOperations(ctx: OperationsContext): Operations {
         payload: { laneId: split.id },
       });
       commit();
-      return Promise.resolve(split);
+      return Promise.resolve();
     },
 
     mergeLanes({ laneId, intoLaneId }) {
@@ -667,7 +685,21 @@ export function createOperations(ctx: OperationsContext): Operations {
 
   return {
     source,
-    openIncident: (missionId) =>
-      recovery(missionId).find((incident) => incident.status === "open") ?? null,
+    openRecovery: (missionId) => {
+      const incident = recovery(missionId).find((open) => open.status === "open");
+      if (!incident) return null;
+      const pending = incident.members.filter((member) => member.state === "pending");
+      if (pending.length === 0) return null;
+      return {
+        incidentId: incident.id,
+        cause: incident.cause,
+        at: incident.detectedAt,
+        // The server formats the clock in the owner's zone; the fixture reads UTC.
+        label: `Recovered from ${RECOVERY_CAUSE_LABEL[incident.cause]} at ${incident.detectedAt.slice(11, 16)}`,
+        total: incident.members.length,
+        pending: pending.length,
+        reconcile: pending.filter((member) => member.action === "reconcile-first").length,
+      };
+    },
   };
 }

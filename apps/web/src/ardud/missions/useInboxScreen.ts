@@ -7,6 +7,7 @@ import type {
   InboxTab,
   Knock,
   MissionId,
+  MissionRecordRef,
   Note,
   Suggestion,
 } from "@t3tools/contracts";
@@ -16,6 +17,7 @@ import {
   decideKnockInput,
   decideSuggestionInput,
   discussAskInput,
+  groupEntriesByMission,
   inboxEntries,
   inboxKeyAction,
   inboxUiReducer,
@@ -28,7 +30,7 @@ import {
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { runMissionAction, submitMissionInput } from "./missionActions";
-import { missionsSource, useMissionInbox } from "./missionsStore";
+import { missionsSource, useMissionInbox, useMissionList } from "./missionsStore";
 
 /** DOM id of an inbox item, so keyboard moves can scroll it into view. */
 export function inboxItemDomId(key: string): string {
@@ -42,22 +44,29 @@ function isTypingTarget(target: EventTarget | null): boolean {
 }
 
 /**
- * Inbox screen state for one tab: the visible entries, selection, picks and
- * the open editor, plus j/k / 1-9 / e on the window. The logic lives in the
+ * Inbox screen state for one tab: the visible entries grouped by mission,
+ * selection, picks and the open editor, plus j/k / 1-9 / e on the window.
+ * With `autoSelectFirst` (the wide reading-pane layout) the first item counts
+ * as selected until the owner picks another. The logic lives in the
  * client-runtime reducer; this hook only wires it to React and the DOM.
  */
 export function useInboxScreen(
   missionId: MissionId | null,
   tab: InboxTab,
   route: InboxRouteFilter = "owner",
+  options: { autoSelectFirst?: boolean } = {},
 ) {
   const inbox = useMissionInbox(missionId);
-  const entries = useMemo(
-    () => (inbox ? inboxEntries(inbox, tab, route) : []),
-    [inbox, tab, route],
-  );
+  const list = useMissionList();
+  // Entries keep their identity across mission-list updates, so memoized cards hold.
+  const listed = useMemo(() => (inbox ? inboxEntries(inbox, tab, route) : []), [inbox, tab, route]);
+  const groups = useMemo(() => groupEntriesByMission(listed, list), [listed, list]);
+  // Visual order, so j/k walks the list the way it reads.
+  const entries = useMemo(() => groups.flatMap((group) => group.entries), [groups]);
   const [ui, dispatch] = useReducer(inboxUiReducer, INITIAL_INBOX_UI);
-  const selected = entries.find((entry) => entry.key === ui.selectedKey) ?? null;
+  const selected =
+    entries.find((entry) => entry.key === ui.selectedKey) ??
+    (options.autoSelectFirst ? (entries[0] ?? null) : null);
 
   // Another mission filter or tab starts fresh; a decision in the same list
   // keeps the selection on the next item.
@@ -84,18 +93,22 @@ export function useInboxScreen(
       });
       if (action === null) return;
       event.preventDefault();
+      // An implicit first-item selection becomes explicit before the key acts on it.
+      if (selected && selected.key !== ui.selectedKey) {
+        dispatch({ type: "select", key: selected.key });
+      }
       dispatch({ type: "key", action, keys: entries.map((entry) => entry.key) });
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [entries, selected]);
+  }, [entries, selected, ui.selectedKey]);
 
   useEffect(() => {
     if (ui.selectedKey === null) return;
     document.getElementById(inboxItemDomId(ui.selectedKey))?.scrollIntoView({ block: "nearest" });
   }, [ui.selectedKey]);
 
-  return { inbox, entries, ui, selected, dispatch };
+  return { inbox, groups, entries, ui, selected, dispatch };
 }
 
 /**
@@ -117,6 +130,12 @@ export function inboxActions(dispatch: (event: InboxUiEvent) => void) {
     discuss: (ask: Ask, text: string) =>
       runMissionAction(
         missionsSource.openFork(discussAskInput(ask, text)),
+        "Couldn't open the discussion",
+      ),
+    /** Discuss on any other card: a fork of the master about that record. */
+    discussRecord: (missionId: MissionId, origin: MissionRecordRef) =>
+      runMissionAction(
+        missionsSource.openFork({ missionId, kind: "discuss", origin }),
         "Couldn't open the discussion",
       ),
     decideDraft: (draft: Draft, decision: DraftDecision) =>

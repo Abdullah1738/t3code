@@ -14,6 +14,7 @@ function MissionRouteView() {
       tab={search.tab ?? "overview"}
       highlightSubMissionId={search.sub ?? null}
       roomId={(search.room ?? null) as RoomId | null}
+      requestId={search.request ?? null}
     />
   );
 }

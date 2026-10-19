@@ -1,41 +1,36 @@
-import { memo, useCallback, useMemo, useState } from "react";
-import { Link, useLocation, useParams } from "@tanstack/react-router";
-import { ChevronRightIcon, InboxIcon, LayersIcon } from "lucide-react";
+import { memo, useCallback, useMemo } from "react";
+import { Link, useLocation, useParams, useSearch } from "@tanstack/react-router";
+import { InboxIcon, PanelsTopLeftIcon } from "lucide-react";
 import * as Schema from "effect/Schema";
 
-import type { Lane, MissionId, MissionListItem } from "@t3tools/contracts";
-import {
-  badgeCount,
-  foldLaneCounts,
-  healthLabel,
-  sortLanesProblemsFirst,
-  splitQuietLanes,
-  totalNeedsYou,
-  type LaneFold,
-} from "@t3tools/client-runtime/ardud/missions";
+import type { MissionId, MissionListItem } from "@t3tools/contracts";
+import { badgeCount, laneTotal, totalNeedsYou } from "@t3tools/client-runtime/ardud/missions";
 
 import { CollapsibleSectionHeader } from "../../components/ui/collapsible-section-header";
 import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
-import { useMissionLanes, useMissionList } from "./missionsStore";
-import { HEALTH_DOT_CLASS, LANE_DOT_CLASS, LANE_TEXT_CLASS } from "./missionTone";
+import { CountBadge, GlyphCount, HealthGlyph, needsYouLabel, UnreadDot } from "./cards/chips";
+import { useMissionList, useOwnerRequests } from "./missionsStore";
+import { unreadRequests } from "./sections/YourRequests";
 
 const SIDEBAR_STATE_KEY = "t3code:ardud-missions:sidebar";
-const SidebarState = Schema.Struct({
-  collapsed: Schema.Boolean,
-  /** Missions whose sub-missions are showing. */
-  open: Schema.Array(Schema.String),
-});
+const SidebarState = Schema.Struct({ collapsed: Schema.Boolean });
 type SidebarState = typeof SidebarState.Type;
-const INITIAL_STATE: SidebarState = { collapsed: false, open: [] };
+const INITIAL_STATE: SidebarState = { collapsed: false };
 
 const rowClassName =
-  "flex h-8 min-w-0 items-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-10";
+  "flex h-8 min-w-0 items-center gap-2 rounded-md px-2.5 text-sm text-sidebar-foreground outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11";
+const subRowClassName =
+  "flex h-7.5 min-w-0 items-center gap-2 rounded-md px-2 text-sm text-sidebar-foreground outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11";
+
+function rowState(isActive: boolean) {
+  return isActive ? "bg-sidebar-row-active" : "hover:bg-sidebar-row-hover";
+}
 
 /**
- * The Missions group above the thread list. One list subscription feeds every
- * row; lane lists subscribe only while someone has them open.
+ * The Missions group above the thread list: the inbox, all missions, and one
+ * row per mission. The open mission lists its sub-missions and lanes.
  */
 export function MissionsSidebarGroup() {
   const list = useMissionList();
@@ -48,17 +43,6 @@ export function MissionsSidebarGroup() {
   const closeMobileSidebar = useCallback(() => {
     if (isMobile) setOpenMobile(false);
   }, [isMobile, setOpenMobile]);
-
-  const toggleMission = useCallback(
-    (missionId: string) =>
-      setState((current) => ({
-        ...current,
-        open: current.open.includes(missionId)
-          ? current.open.filter((id) => id !== missionId)
-          : [...current.open, missionId],
-      })),
-    [setState],
-  );
 
   const missions = list?.missions ?? [];
   if (missions.length === 0) return null;
@@ -75,7 +59,7 @@ export function MissionsSidebarGroup() {
         </CollapsibleSectionHeader>
       </div>
       {expanded ? (
-        <ul className="flex flex-col gap-0.5">
+        <ul className="flex flex-col gap-px pb-3.5">
           <InboxRow count={totalNeedsYou(missions)} onNavigate={closeMobileSidebar} />
           <PortfolioRow onNavigate={closeMobileSidebar} />
           {missions.map((mission) => (
@@ -83,8 +67,6 @@ export function MissionsSidebarGroup() {
               key={mission.id}
               mission={mission}
               isActive={mission.id === activeMissionId}
-              isOpen={state.open.includes(mission.id)}
-              onToggle={toggleMission}
               onNavigate={closeMobileSidebar}
             />
           ))}
@@ -97,99 +79,142 @@ export function MissionsSidebarGroup() {
 const MissionSidebarRow = memo(function MissionSidebarRow(props: {
   mission: MissionListItem;
   isActive: boolean;
-  isOpen: boolean;
-  onToggle: (missionId: string) => void;
   onNavigate: () => void;
 }) {
-  const { mission, isActive, isOpen, onToggle, onNavigate } = props;
+  const { mission, isActive, onNavigate } = props;
   const paused = mission.status === "paused";
-  const fold = useMemo(() => foldLaneCounts(mission.lanes), [mission.lanes]);
-  const subListId = `mission-${mission.id}-subs`;
-
   return (
     <li>
-      <div
-        className={cn(
-          rowClassName,
-          "group/mission text-sidebar-foreground",
-          isActive ? "bg-sidebar-row-active" : "hover:bg-sidebar-row-hover",
-        )}
-      >
-        <button
-          type="button"
-          aria-expanded={isOpen}
-          aria-controls={subListId}
-          aria-label={`${isOpen ? "Hide" : "Show"} sub-missions of ${mission.title}`}
-          onClick={() => onToggle(mission.id)}
-          className="flex h-full w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-sidebar-muted-foreground/70 outline-none hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        >
-          <ChevronRightIcon
-            aria-hidden
-            className={cn(
-              "size-3.5 transition-transform motion-reduce:transition-none",
-              isOpen && "rotate-90",
-            )}
-          />
-        </button>
+      <div className={cn(rowClassName, "pe-1", rowState(isActive))}>
         <Link
           to="/missions/$missionId"
           params={{ missionId: mission.id }}
           onClick={onNavigate}
           aria-current={isActive ? "page" : undefined}
-          className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md pe-1.5 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         >
-          <HealthDot health={mission.health} paused={paused} />
+          <HealthGlyph health={mission.health} paused={paused} />
           <span className={cn("min-w-0 truncate", paused && "text-sidebar-muted-foreground")}>
             {mission.title}
           </span>
-          {paused ? (
-            <span className="shrink-0 text-2xs font-normal text-sidebar-muted-foreground/70">
-              paused
-            </span>
-          ) : null}
         </Link>
+        <RequestsAnsweredLink missionId={mission.id} onNavigate={onNavigate} />
         <NeedsYouLink missionId={mission.id} count={mission.needsYou} onNavigate={onNavigate} />
       </div>
-      {isOpen ? (
-        <div id={subListId} className="ms-3.5 border-s border-sidebar-border ps-1.5">
-          <ol aria-label={`${mission.title} sub-missions`} className="flex flex-col">
-            {mission.subMissions.map((sub) => (
-              <li key={sub.id}>
-                <Link
-                  to="/missions/$missionId"
-                  params={{ missionId: mission.id }}
-                  search={{ sub: sub.id }}
-                  onClick={onNavigate}
-                  className={cn(
-                    rowClassName,
-                    "h-7 gap-2 px-1.5 text-xs text-sidebar-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground pointer-coarse:h-9",
-                  )}
-                >
-                  <span className="w-3 shrink-0 text-end text-2xs text-sidebar-muted-foreground/60 tabular-nums">
-                    {sub.order + 1}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate">{sub.title}</span>
-                  {sub.status === "paused" ? (
-                    <span className="shrink-0 text-2xs text-sidebar-muted-foreground/70">
-                      paused
-                    </span>
-                  ) : null}
-                  {sub.needsYou > 0 ? (
-                    <span className="shrink-0 text-2xs font-medium text-warning-foreground tabular-nums">
-                      {badgeCount(sub.needsYou)}
-                    </span>
-                  ) : null}
-                  <HealthDot health={sub.health} paused={sub.status === "paused"} />
-                </Link>
-              </li>
-            ))}
-          </ol>
-          {fold.total > 0 ? <LaneFoldRow missionId={mission.id} fold={fold} /> : null}
-        </div>
-      ) : null}
+      {isActive ? <MissionSubRows mission={mission} onNavigate={onNavigate} /> : null}
     </li>
   );
 });
+
+/** Sub-missions on one rank/glyph/title grid, then the lanes row. */
+function MissionSubRows(props: { mission: MissionListItem; onNavigate: () => void }) {
+  const { mission, onNavigate } = props;
+  const activeSub = useSearch({
+    strict: false,
+    select: (search) => (typeof search.sub === "string" ? search.sub : null),
+  });
+  const lanes = laneTotal(mission.lanes);
+  if (mission.subMissions.length === 0 && lanes === 0) return null;
+  return (
+    <ul
+      aria-label={`${mission.title} sub-missions`}
+      className="mb-1 ms-3.5 flex flex-col border-s border-sidebar-border py-0.5 ps-2.5"
+    >
+      {mission.subMissions.map((sub) => {
+        const subPaused = sub.status === "paused";
+        const isActive = sub.id === activeSub;
+        return (
+          <li key={sub.id}>
+            <Link
+              to="/missions/$missionId"
+              params={{ missionId: mission.id }}
+              search={{ sub: sub.id }}
+              onClick={onNavigate}
+              aria-current={isActive ? "true" : undefined}
+              className={cn(subRowClassName, rowState(isActive))}
+            >
+              <span className="w-3 shrink-0 text-end text-xs text-sidebar-muted-foreground tabular-nums">
+                {sub.order + 1}
+              </span>
+              <HealthGlyph health={sub.health} paused={subPaused} />
+              <span
+                className={cn(
+                  "min-w-0 flex-1 truncate",
+                  subPaused && "text-sidebar-muted-foreground",
+                )}
+              >
+                {sub.title}
+              </span>
+              {sub.needsYou > 0 ? (
+                <CountBadge count={sub.needsYou} label={needsYouLabel(sub.needsYou)} />
+              ) : null}
+            </Link>
+          </li>
+        );
+      })}
+      {lanes > 0 ? (
+        <LanesRow
+          missionId={mission.id}
+          total={lanes}
+          stuck={mission.lanes.stuck}
+          waiting={mission.lanes.waiting}
+          onNavigate={onNavigate}
+        />
+      ) : null}
+    </ul>
+  );
+}
+
+/** "37 lanes" with stuck and waiting counts; opens the mission's lanes. */
+function LanesRow(props: {
+  missionId: MissionId;
+  total: number;
+  stuck: number;
+  waiting: number;
+  onNavigate: () => void;
+}) {
+  const isActive = useSearch({
+    strict: false,
+    select: (search) => search.tab === "lanes",
+  });
+  const noun = props.total === 1 ? "lane" : "lanes";
+  const problems = [
+    props.stuck > 0 ? `${props.stuck} stuck` : null,
+    props.waiting > 0 ? `${props.waiting} waiting` : null,
+  ].filter((part) => part !== null);
+  const label = `${props.total} ${noun}${problems.length > 0 ? `: ${problems.join(", ")}` : ""}`;
+  return (
+    <li>
+      <Link
+        to="/missions/$missionId"
+        params={{ missionId: props.missionId }}
+        search={{ tab: "lanes" }}
+        onClick={props.onNavigate}
+        aria-label={label}
+        aria-current={isActive ? "true" : undefined}
+        className={cn(subRowClassName, rowState(isActive))}
+      >
+        <span aria-hidden className="w-3 shrink-0" />
+        <span className="min-w-0 flex-1 truncate text-sidebar-muted-foreground">
+          <span className="tabular-nums">{props.total}</span> {noun}
+        </span>
+        <span aria-hidden className="flex shrink-0 items-center gap-2.5 text-xs font-medium">
+          {props.stuck > 0 ? (
+            <GlyphCount kind="bad" count={props.stuck} label={`${props.stuck} stuck`} />
+          ) : null}
+          {props.waiting > 0 ? (
+            <GlyphCount
+              kind="wait"
+              tone="risk"
+              count={props.waiting}
+              label={`${props.waiting} waiting`}
+            />
+          ) : null}
+        </span>
+      </Link>
+    </li>
+  );
+}
 
 /** Top row of the group: the all-missions inbox and everything waiting on the owner. */
 function InboxRow(props: { count: number; onNavigate: () => void }) {
@@ -200,18 +225,12 @@ function InboxRow(props: { count: number; onNavigate: () => void }) {
         to="/missions/inbox"
         onClick={props.onNavigate}
         aria-current={isActive ? "page" : undefined}
-        className={cn(
-          rowClassName,
-          "gap-2 ps-2 pe-1 text-sm font-medium text-sidebar-foreground",
-          isActive ? "bg-sidebar-row-active" : "hover:bg-sidebar-row-hover",
-        )}
+        className={cn(rowClassName, "pe-1", rowState(isActive))}
       >
-        <InboxIcon aria-hidden className="size-3.5 shrink-0 text-sidebar-muted-foreground" />
+        <InboxIcon aria-hidden className="size-4 shrink-0 text-sidebar-muted-foreground" />
         <span className="min-w-0 flex-1 truncate">Inbox</span>
         {props.count > 0 ? (
-          <span className="shrink-0 text-2xs font-medium text-warning-foreground tabular-nums">
-            {badgeCount(props.count)}
-          </span>
+          <CountBadge count={props.count} label={needsYouLabel(props.count)} />
         ) : null}
       </Link>
     </li>
@@ -228,135 +247,47 @@ function PortfolioRow(props: { onNavigate: () => void }) {
         to="/missions/portfolio"
         onClick={props.onNavigate}
         aria-current={isActive ? "page" : undefined}
-        className={cn(
-          rowClassName,
-          "gap-2 ps-2 pe-1 text-sm font-medium text-sidebar-foreground",
-          isActive ? "bg-sidebar-row-active" : "hover:bg-sidebar-row-hover",
-        )}
+        className={cn(rowClassName, rowState(isActive))}
       >
-        <LayersIcon aria-hidden className="size-3.5 shrink-0 text-sidebar-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate">Portfolio</span>
+        <PanelsTopLeftIcon aria-hidden className="size-4 shrink-0 text-sidebar-muted-foreground" />
+        <span className="min-w-0 flex-1 truncate">All missions</span>
       </Link>
     </li>
   );
 }
 
+/** Answered requests the owner has not opened: an update dot and the count. */
+function RequestsAnsweredLink(props: { missionId: MissionId; onNavigate: () => void }) {
+  const requests = useOwnerRequests(props.missionId);
+  const unread = useMemo(() => unreadRequests(requests), [requests]);
+  const first = unread[0];
+  if (!first) return null;
+  const label = `${unread.length} ${unread.length === 1 ? "request" : "requests"} answered`;
+  return (
+    <Link
+      to="/missions/$missionId"
+      params={{ missionId: props.missionId }}
+      search={{ request: first.id }}
+      onClick={props.onNavigate}
+      aria-label={label}
+      className="flex h-4.5 shrink-0 items-center gap-1 rounded-sm px-1 text-xs font-medium text-update-foreground tabular-nums outline-none hover:bg-update/12 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+    >
+      <UnreadDot />
+      {badgeCount(unread.length)}
+    </Link>
+  );
+}
+
 function NeedsYouLink(props: { missionId: MissionId; count: number; onNavigate: () => void }) {
   if (props.count === 0) return null;
-  const label = `${props.count} ${props.count === 1 ? "item needs" : "items need"} you`;
   return (
     <Link
       to="/missions/inbox"
       search={{ mission: props.missionId }}
       onClick={props.onNavigate}
-      aria-label={label}
-      className="me-1 flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-warning/12 px-1.5 text-2xs font-medium text-warning-foreground tabular-nums outline-none hover:bg-warning/20 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring dark:bg-warning/16"
+      className="shrink-0 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
-      {badgeCount(props.count)}
+      <CountBadge count={props.count} label={needsYouLabel(props.count)} />
     </Link>
-  );
-}
-
-function HealthDot(props: { health: MissionListItem["health"]; paused: boolean }) {
-  const label = props.paused ? "Paused" : healthLabel(props.health);
-  return (
-    <span
-      role="img"
-      aria-label={label}
-      className={cn(
-        "size-2 shrink-0 rounded-full",
-        props.paused ? "bg-muted-foreground/25" : HEALTH_DOT_CLASS[props.health],
-      )}
-    />
-  );
-}
-
-/** "37 lanes: 21 working, 2 stuck, 14 idle", expanding to the lanes on demand. */
-function LaneFoldRow(props: { missionId: MissionId; fold: LaneFold }) {
-  const [open, setOpen] = useState(false);
-  const listId = `mission-${props.missionId}-lanes`;
-  return (
-    <div>
-      <button
-        type="button"
-        aria-expanded={open}
-        aria-controls={listId}
-        aria-label={`${props.fold.line}. ${open ? "Hide" : "Show"} lanes`}
-        onClick={() => setOpen((value) => !value)}
-        className={cn(
-          rowClassName,
-          "h-7 w-full cursor-pointer gap-1 px-1.5 text-start text-2xs text-sidebar-muted-foreground hover:bg-sidebar-row-hover pointer-coarse:h-9",
-        )}
-      >
-        <span className="w-3 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">
-          <span className="tabular-nums">{props.fold.total}</span>{" "}
-          {props.fold.total === 1 ? "lane" : "lanes"}
-          {props.fold.parts.map((part, index) => (
-            <span key={part.tone} className={LANE_TEXT_CLASS[part.tone]}>
-              {index === 0 ? ": " : ", "}
-              <span className="tabular-nums">{part.count}</span> {part.label}
-            </span>
-          ))}
-        </span>
-        <ChevronRightIcon
-          aria-hidden
-          className={cn(
-            "size-3 shrink-0 transition-transform motion-reduce:transition-none",
-            open && "rotate-90",
-          )}
-        />
-      </button>
-      {open ? <LaneList id={listId} missionId={props.missionId} /> : null}
-    </div>
-  );
-}
-
-function LaneList(props: { id: string; missionId: MissionId }) {
-  const lanes = useMissionLanes(props.missionId);
-  const { active, quiet } = useMemo(() => {
-    const split = splitQuietLanes(lanes ?? []);
-    return { active: sortLanesProblemsFirst(split.active), quiet: split.quiet };
-  }, [lanes]);
-  if (lanes === undefined) return null;
-  return (
-    <div id={props.id} className="flex flex-col pb-1">
-      <ul aria-label="Active lanes" className="flex flex-col">
-        {active.map((lane) => (
-          <LaneRow key={lane.id} lane={lane} />
-        ))}
-      </ul>
-      {quiet.length > 0 ? (
-        <p className="px-1.5 py-1 ps-6.5 text-2xs leading-4 text-sidebar-muted-foreground/60">
-          {quiet.length} quiet: {quiet.map((lane) => lane.name).join(", ")}
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
-function LaneRow(props: { lane: Lane }) {
-  const { lane } = props;
-  return (
-    <li className="flex h-6 min-w-0 items-center gap-2 px-1.5 text-2xs text-sidebar-muted-foreground">
-      <span className="flex w-3 shrink-0 justify-end">
-        <span
-          aria-hidden
-          className={cn("size-1.5 shrink-0 rounded-full", LANE_DOT_CLASS[lane.status])}
-        />
-      </span>
-      <span className="shrink-0 font-medium text-sidebar-foreground/85">{lane.name}</span>
-      <span className="sr-only">{lane.status}</span>
-      {lane.status === "stuck" || lane.status === "waiting" ? (
-        <span
-          className={cn(
-            "min-w-0 truncate",
-            lane.status === "stuck" ? "text-destructive-foreground" : "text-warning-foreground",
-          )}
-        >
-          {lane.statusReason ?? lane.status}
-        </span>
-      ) : null}
-    </li>
   );
 }
