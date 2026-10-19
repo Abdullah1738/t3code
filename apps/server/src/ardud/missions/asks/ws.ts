@@ -137,7 +137,10 @@ export const makeAsksWsHandlers = (
       }),
     );
 
-  /** Forks have no global ones: null means every mission's forks. */
+  /**
+   * Forks have no global ones: null means every mission's forks. That
+   * snapshot is the store's newest list (capped at its default limit).
+   */
   const subscribeForks = (input: MissionScopeInput) =>
     feed(
       new Set<MissionStoreKind>(["fork"]),
@@ -199,8 +202,9 @@ export const makeAsksWsHandlers = (
     );
 
   /**
-   * A value recomputed whenever a record of `kinds` in scope commits, sent
-   * first and then only when its content (ignoring `revision`) changed.
+   * A value recomputed once per commit that touched a record of `kinds` in
+   * scope, sent first and then only when its content (ignoring a top-level
+   * `revision`) changed.
    */
   const resent = <A>(
     kinds: ReadonlySet<MissionStoreKind>,
@@ -212,13 +216,24 @@ export const makeAsksWsHandlers = (
         const subscription = yield* store.subscribe;
         const first = yield* read;
         const contentOf = (value: A) =>
-          JSON.stringify(value, (key, field) => (key === "revision" ? undefined : field));
+          JSON.stringify(
+            typeof value === "object" && value !== null && !Array.isArray(value)
+              ? { ...value, revision: undefined }
+              : value,
+          );
+        const touches = (item: MissionStreamItem) =>
+          item._tag === "upsert"
+            ? kinds.has(item.record._tag as MissionStoreKind) &&
+              (missionId === null || item.missionId === missionId)
+            : item._tag === "remove" && kinds.has(item.ref.kind as MissionStoreKind);
         const updates = Stream.fromSubscription(subscription).pipe(
-          Stream.filter((item) =>
-            item._tag === "upsert"
-              ? kinds.has(item.record._tag as MissionStoreKind) &&
-                (missionId === null || item.missionId === missionId)
-              : item._tag === "remove" && kinds.has(item.ref.kind as MissionStoreKind),
+          // A commit publishes its records and then its event: re-read once, on the event.
+          Stream.mapAccum(
+            () => false,
+            (dirty, item) =>
+              item._tag === "upsert" && item.record._tag === "event"
+                ? ([false, dirty ? [item] : []] as const)
+                : ([dirty || touches(item), []] as const),
           ),
           Stream.mapEffect(() => read),
           Stream.mapAccum(

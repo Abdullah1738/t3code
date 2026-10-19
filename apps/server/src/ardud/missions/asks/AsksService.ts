@@ -634,6 +634,7 @@ const make = Effect.gen(function* () {
       let records: Ask[];
       let events: ModelEvent[];
       let opened: Ask;
+      let superseded: Ask | null = null;
       if (supersedes !== undefined) {
         const previous = asks.find((ask) => ask.id === supersedes);
         if (previous === undefined) return yield* fail("not-found", `No ask ${supersedes}.`);
@@ -641,6 +642,7 @@ const make = Effect.gen(function* () {
           supersedeAsk({ ask: previous, replacement: command, callerIsMaster: standing.isMaster }),
         );
         opened = result.replacement.record;
+        superseded = result.superseded.record;
         records = [result.superseded.record, opened];
         events = [...result.superseded.events, ...result.replacement.events];
       } else {
@@ -656,7 +658,7 @@ const make = Effect.gen(function* () {
         ...records.map((record) => ({ _tag: "ask" as const, record })),
         ...holds,
       ]);
-      return opened;
+      return { opened, superseded };
     });
 
   const answerAskCommand = (input: AnswerAskInput, provenance: MissionProvenance) =>
@@ -2009,7 +2011,16 @@ const make = Effect.gen(function* () {
     notes: (missionId) => store.list("note", { missionId }),
     standing: (missionId, provenance) =>
       standingIn(missionId, provenance).pipe(Effect.map(({ standing }) => standing)),
-    openAsk: (raw, provenance) => serialized(openAskCommand(raw, provenance)),
+    openAsk: (raw, provenance) =>
+      serialized(openAskCommand(raw, provenance)).pipe(
+        // A discussion about the old ask ends with it; the owner sees the revised one.
+        Effect.tap(({ opened, superseded }) =>
+          superseded === null
+            ? Effect.void
+            : settleDiscussion(askRef(superseded), `Revised as ask ${opened.id}.`),
+        ),
+        Effect.map(({ opened }) => opened),
+      ),
     answerAsk: (input, provenance) =>
       serialized(
         input.onOwnerCondition === undefined
@@ -2040,7 +2051,12 @@ const make = Effect.gen(function* () {
           ? decideDraftCommand(input, provenance)
           : decideDraftOnConditionCommand(input, input.onOwnerCondition, provenance),
       ).pipe(
-        Effect.tap((result) => settleDiscussion(draftRef(result.draft), decidedNote(result.draft))),
+        // A rewrite sends the draft back for another round; the discussion stays open.
+        Effect.tap((result) =>
+          result.draft.status === "rewrite-requested"
+            ? Effect.void
+            : settleDiscussion(draftRef(result.draft), decidedNote(result.draft)),
+        ),
       ),
     reopenDraft: (input, provenance) => serialized(reopenDraftCommand(input, provenance)),
     routeDraft: (input, provenance) => serialized(routeDraftCommand(input, provenance)),

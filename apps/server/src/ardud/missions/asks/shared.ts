@@ -5,6 +5,7 @@ import {
   type MissionEventKind,
   type MissionProvenance,
   type MissionRecordRef,
+  type OwnerRequestId,
 } from "@t3tools/contracts";
 import * as Result from "effect/Result";
 
@@ -113,6 +114,13 @@ export const callerIsOwner = (caller: MissionCaller): boolean =>
 export const callerActsAs = (caller: MissionCaller, actor: MissionActor): boolean =>
   (actor._tag === "owner" && callerIsOwner(caller)) ||
   caller.actors.some((held) => sameActor(held, actor));
+
+/** Adds an owner request to a record's spent ones (decided an earlier epoch). */
+export const spendCondition = (
+  spent: ReadonlyArray<OwnerRequestId> | undefined,
+  requestId: OwnerRequestId,
+): ReadonlyArray<OwnerRequestId> =>
+  (spent ?? []).includes(requestId) ? (spent ?? []) : [...(spent ?? []), requestId];
 
 /** Lowercase, fold Unicode, drop punctuation and repeated spaces (for matching, never storage). */
 export const normalizeText = (text: string): string =>

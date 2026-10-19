@@ -47,6 +47,7 @@ import {
   normalizeText,
   ok,
   refuse,
+  spendCondition,
   type MissionCaller,
   type Outcome,
   type Transition,
@@ -395,6 +396,12 @@ export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision>
   if (draft.status !== "pending") {
     return refuse("conflict", `Draft ${draft.id} is ${draft.status}.`);
   }
+  if (condition !== null && (draft.spentConditionIds ?? []).includes(condition.requestId)) {
+    return refuse(
+      "provenance-invalid",
+      `Owner request ${condition.requestId} decided draft ${draft.id} before it was reopened; it does not decide it again.`,
+    );
+  }
   // An approval in the app or by a master binds to the text the decider read;
   // an iMessage approval binds through the revision epoch instead.
   if (
@@ -609,6 +616,9 @@ export const reopenDraft = (
       `Draft ${draft.id} is ${draft.status}; only approved or dropped reopen.`,
     );
   }
+  // The owner request a decision rested on is spent: reopening takes that
+  // decision back, so the same condition cannot decide the draft again.
+  const spent = draft.onOwnerCondition ?? null;
   const record: Draft = {
     ...draft,
     status: "pending",
@@ -616,6 +626,9 @@ export const reopenDraft = (
     decidedBy: null,
     decidedAt: null,
     ...conditionOf(draft, null),
+    ...(spent === null
+      ? {}
+      : { spentConditionIds: spendCondition(draft.spentConditionIds, spent.requestId) }),
     ...nextEpoch(draft, now),
   };
   return ok({

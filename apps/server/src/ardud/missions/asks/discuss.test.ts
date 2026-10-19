@@ -70,7 +70,7 @@ const withConditions = (subjects: Array<MissionRecordRef>) => {
 describe("discuss: asks", () => {
   it.effect("the master answers an ask only on the owner's verified condition", () => {
     const subjects: Array<MissionRecordRef> = [];
-    const { verified, settled, layer } = withConditions(subjects);
+    const { verified, settled, deliveries, layer } = withConditions(subjects);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
@@ -124,6 +124,41 @@ describe("discuss: asks", () => {
       );
       expect(event?.actor).toEqual({ _tag: "role", roleId: "role-master" });
       expect(event?.payload).toMatchObject({ onOwnerCondition: condition });
+      // The lane that asked hears whose answer it was.
+      expect(deliveries.find((delivery) => delivery.threadId === laneThread)?.text).toContain(
+        "answered by the master on the owner's condition",
+      );
+
+      // The owner takes the answer back: that condition is spent for this ask.
+      const reopened = yield* asks.reopenAsk({ askId: ask.id, reason: "Not that one" }, ownerApp);
+      expect(reopened.spentConditionIds).toEqual([condition.requestId]);
+      expect(
+        yield* failureCode(
+          asks.answerAsk(
+            { askId: ask.id, optionId: "a", text: "", onOwnerCondition: condition },
+            master,
+          ),
+        ),
+      ).toBe("provenance-invalid");
+      expect((yield* asks.ask(ask.id)).status).toBe("open");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("without the router a condition is refused and the ask stays open", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const ask = yield* asks.openAsk(askInput("Which migration?"), laneAgent);
+      expect(
+        yield* failureCode(
+          asks.answerAsk(
+            { askId: ask.id, optionId: "a", text: "", onOwnerCondition: condition },
+            master,
+          ),
+        ),
+      ).toBe("forbidden");
+      expect((yield* asks.ask(ask.id)).status).toBe("open");
     }).pipe(Effect.provide(layer));
   });
 
@@ -140,6 +175,10 @@ describe("discuss: asks", () => {
       );
       expect(revised.askedBy).toEqual(ask.askedBy);
       expect((yield* asks.ask(ask.id)).status).toBe("superseded");
+      // A discussion about the old ask ends; the owner sees the revised one.
+      expect(settled).toEqual([
+        { subject: `ask:${ask.id}`, note: `Revised as ask ${revised.id}.` },
+      ]);
       // Another role in the mission (neither asker nor master) cannot withdraw it.
       expect(
         yield* failureCode(
@@ -152,12 +191,10 @@ describe("discuss: asks", () => {
         master,
       );
       expect(withdrawn.ask.status).toBe("withdrawn");
-      expect(settled).toEqual([
-        {
-          subject: `ask:${revised.id}`,
-          note: "Ask withdrawn: The owner settled it in chat",
-        },
-      ]);
+      expect(settled.at(-1)).toEqual({
+        subject: `ask:${revised.id}`,
+        note: "Ask withdrawn: The owner settled it in chat",
+      });
       // The lane that asked is told; it did not withdraw the ask itself.
       expect(deliveries.map((delivery) => delivery.threadId)).toContain(laneThread);
     }).pipe(Effect.provide(layer));
@@ -224,10 +261,33 @@ describe("discuss: drafts", () => {
           { subject: `draft:${draft.id}`, note: "Draft approved on your condition." },
         ]);
 
-        // Reopening puts it back in front of the owner and clears the condition.
+        // Reopening puts it back in front of the owner, clears the condition
+        // and spends it: the same condition cannot decide the draft again.
         const reopened = yield* asks.reopenDraft({ draftId: draft.id }, ownerApp);
         expect(reopened.onOwnerCondition).toBeNull();
+        expect(reopened.spentConditionIds).toEqual([condition.requestId]);
+        expect(
+          yield* failureCode(
+            asks.decideDraft(
+              {
+                draftId: draft.id,
+                action: "approve",
+                revision: reopened.revision ?? 0,
+                onOwnerCondition: condition,
+              },
+              master,
+            ),
+          ),
+        ).toBe("provenance-invalid");
+        // A rewrite sends it back for another round; the conversation stays open.
+        const settledBefore = settled.length;
+        yield* asks.decideDraft(
+          { draftId: draft.id, action: "rewrite", rewriteNote: "Shorter" },
+          ownerApp,
+        );
+        expect(settled).toHaveLength(settledBefore);
         // The owner's own decision still settles the conversation.
+        yield* asks.reviseDraft({ draftId: draft.id, text: "Merged." }, writer);
         yield* asks.decideDraft({ draftId: draft.id, action: "drop" }, ownerApp);
         expect(settled.at(-1)).toEqual({ subject: `draft:${draft.id}`, note: "Draft dropped." });
       }).pipe(Effect.provide(layer));

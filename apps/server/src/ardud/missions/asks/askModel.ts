@@ -30,6 +30,7 @@ import {
   ok,
   recordKey,
   refuse,
+  spendCondition,
   type MissionCaller,
   type Outcome,
   type Transition,
@@ -302,6 +303,12 @@ export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => 
       `iMessage ${provenance.inboundId} answered ask ${ask.id} before it was reopened; it does not answer it again.`,
     );
   }
+  if (condition !== null && (ask.spentConditionIds ?? []).includes(condition.requestId)) {
+    return refuse(
+      "provenance-invalid",
+      `Owner request ${condition.requestId} answered ask ${ask.id} before it was reopened; it does not answer it again.`,
+    );
+  }
   const text = input.text.trim();
   if (input.optionId !== null && optionLabel(ask, input.optionId) === null) {
     return refuse("invalid", `Option ${input.optionId} is not one of the ask's options.`);
@@ -502,8 +509,8 @@ const spentInbounds = (ask: Pick<Ask, "spentInboundIds">): ReadonlyArray<string>
 
 /**
  * The owner takes an answer back; the ask holds its records again. A new
- * epoch starts, and the iMessage that gave the old answer is spent for this
- * ask, so relaying it again cannot answer the reopened ask.
+ * epoch starts, and the iMessage or owner condition that gave the old answer
+ * is spent for this ask, so relaying it again cannot answer the reopened ask.
  */
 export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> => {
   const { ask, provenance } = command;
@@ -516,6 +523,7 @@ export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> =
     evidence?._tag === "owner-imessage" && !spentInbounds(ask).includes(evidence.inboundId)
       ? [...spentInbounds(ask), evidence.inboundId]
       : spentInbounds(ask);
+  const condition = ask.answer?.onOwnerCondition ?? null;
   const record: Ask = {
     ...ask,
     status: "open",
@@ -524,6 +532,9 @@ export const reopenAsk = (command: ReopenAskCommand): Outcome<Transition<Ask>> =
     revision: askRevisionOf(ask) + 1,
     revisedAt: command.now,
     spentInboundIds: spent,
+    ...(condition === null
+      ? {}
+      : { spentConditionIds: spendCondition(ask.spentConditionIds, condition.requestId) }),
   };
   return ok({
     record,

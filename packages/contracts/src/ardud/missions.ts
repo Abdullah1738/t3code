@@ -743,6 +743,8 @@ export const Ask = Schema.Struct({
   spentInboundIds: Schema.optional(Schema.Array(Schema.String)),
   /** Generative views: the card template that draws it and its field values. */
   view: Schema.optional(RecordView),
+  /** Owner requests whose condition answered an earlier epoch; they never answer this ask again. */
+  spentConditionIds: Schema.optional(Schema.Array(OwnerRequestId)),
   // --- end asks additions ---
 });
 export type Ask = typeof Ask.Type;
@@ -1071,6 +1073,8 @@ export const Draft = Schema.Struct({
   view: Schema.optional(RecordView),
   /** The text this one replaced when it was last revised. */
   previousText: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Owner requests whose condition decided an earlier epoch; they never decide this draft again. */
+  spentConditionIds: Schema.optional(Schema.Array(OwnerRequestId)),
   // --- end asks additions ---
 });
 export type Draft = typeof Draft.Type;

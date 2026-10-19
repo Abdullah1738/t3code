@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
+  ApprovalId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CLIENT_GUARDED_RPC_SCOPES,
@@ -156,8 +157,24 @@ describe("asks WS RPCs", () => {
         const master = agent(masterThread);
         yield* missions.setApprovalRouting(master, {
           missionId,
-          routes: [{ id: "email", match: { _tag: "draft", channel: "email" }, approver: "master" }],
+          routes: [
+            { id: "email", match: { _tag: "draft", channel: "email" }, approver: "master" },
+            { id: "merges", match: { _tag: "approval", kind: "merge" }, approver: "master" },
+          ],
         });
+        const approvalId = ApprovalId.make("m-1:approval:crw:acme/api#8");
+        yield* missions.openApproval(
+          { _tag: "system", component: "crw" },
+          {
+            missionId,
+            approvalId,
+            kind: "merge",
+            title: "Good to merge: acme/api#8",
+            detail: "Decide in the review thread.",
+            requestedBy: "crw",
+            links: [],
+          },
+        );
         const draft = (channel: "email" | "linear", text: string) =>
           asks.submitDraft(
             { missionId, audience: "Sami", channel, target: ticket, text },
@@ -198,31 +215,55 @@ describe("asks WS RPCs", () => {
         );
         expect(elsewhere?.counts).toEqual({ approve: 0, suggestions: 0 });
 
-        const stats = yield* firstItem(cli[M.subscribeSuggestionStats]({ missionId }));
-        expect(stats).toEqual([
-          {
-            missionId,
-            author: "governor",
-            targetKind: "pool",
-            shown: 1,
-            accepted: 0,
-            dismissed: 0,
-            applied: 0,
-            bar: "normal",
-          },
-        ]);
+        const row = {
+          missionId,
+          author: "governor",
+          targetKind: "pool",
+          shown: 1,
+          accepted: 0,
+          dismissed: 0,
+          applied: 0,
+          bar: "normal",
+        };
+        // The record follows decisions: one update per change.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const pull = yield* Stream.toPull(cli[M.subscribeSuggestionStats]({ missionId }));
+            const [first] = yield* pull;
+            expect(first).toEqual([row]);
+            yield* asks.decideSuggestion(
+              { suggestionId: pool.id, action: "dismiss", dismissReason: "Not now" },
+              master,
+            );
+            const [next] = yield* pull;
+            expect(next).toEqual([{ ...row, dismissed: 1 }]);
+          }),
+        );
 
         // The master's queue holds what is routed to it, and follows decisions.
+        yield* asks.proposeSuggestion(
+          {
+            missionId,
+            targetKind: "pool",
+            title: "Raise the pool again",
+            after: { size: 4 },
+            diffText: "size -> 4",
+            why: "Lanes still queue.",
+            evidence: [{ kind: "lane", id: "lane-api" }],
+          },
+          governor,
+        );
         yield* Effect.scoped(
           Effect.gen(function* () {
             const pull = yield* Stream.toPull(cli[M.subscribeMasterInbox]({ missionId: null }));
             const [first] = yield* pull;
-            expect(first?.counts).toEqual({ approve: 1, suggestions: 1 });
+            expect(first?.counts).toEqual({ approve: 2, suggestions: 1 });
             expect(first?.drafts.map((record) => record.id)).toEqual([email.id]);
-            expect(first?.suggestions.map((record) => record.id)).toEqual([pool.id]);
+            expect(first?.approvals.map((record) => record.id)).toEqual([approvalId]);
             yield* asks.decideDraft({ draftId: email.id, action: "approve", revision: 0 }, master);
             const [next] = yield* pull;
-            expect(next?.counts).toEqual({ approve: 0, suggestions: 1 });
+            expect(next?.counts).toEqual({ approve: 1, suggestions: 1 });
+            expect(next?.drafts).toEqual([]);
           }),
         );
       }).pipe(Effect.provide(RuleService.layer.pipe(Layer.provideMerge(layer))));
