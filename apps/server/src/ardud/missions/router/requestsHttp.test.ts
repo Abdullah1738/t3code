@@ -20,16 +20,40 @@ import * as MissionRouter from "./MissionRouter.ts";
 import { fakeRouterThreads, routerOverFakes } from "./MissionRouter.testkit.ts";
 import { requestsRoutes } from "./requestsHttp.ts";
 
+const SCOPES = ["orchestration:read" as const, "orchestration:operate" as const];
+
+/** Tokens by who they were minted for; the origin is what the desk trusts. */
+const SESSIONS: Record<string, object> = {
+  "Bearer control-token": { sessionId: "session-control", subject: "control" },
+  "Bearer bridge-token": {
+    sessionId: "session-bridge",
+    subject: "bridge",
+    origin: { _tag: "component", component: "spectrum-bridge" },
+  },
+  "Bearer owner-token": {
+    sessionId: "session-owner",
+    subject: "owner",
+    origin: { _tag: "owner", source: "desktop" },
+  },
+  "Bearer cli-token": {
+    sessionId: "session-cli",
+    subject: "cli",
+    origin: { _tag: "component", component: "mission-cli" },
+  },
+};
+
 const fakeAuth = {
-  authenticateHttpRequest: (request: HttpServerRequest.HttpServerRequest) =>
-    request.headers.authorization === "Bearer control-token"
-      ? Effect.succeed({
-          sessionId: AuthSessionId.make("session-control"),
-          subject: "control",
+  authenticateHttpRequest: (request: HttpServerRequest.HttpServerRequest) => {
+    const session = SESSIONS[request.headers.authorization ?? ""];
+    return session === undefined
+      ? Effect.fail(new EnvironmentAuth.ServerAuthInvalidCredentialError({ diagnostic: "none" }))
+      : Effect.succeed({
+          ...session,
+          sessionId: AuthSessionId.make((session as { sessionId: string }).sessionId),
           method: "bearer-access-token" as const,
-          scopes: ["orchestration:read" as const, "orchestration:operate" as const],
-        })
-      : Effect.fail(new EnvironmentAuth.ServerAuthInvalidCredentialError({ diagnostic: "none" })),
+          scopes: SCOPES,
+        });
+  },
 } as unknown as EnvironmentAuth.EnvironmentAuth["Service"];
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -184,10 +208,49 @@ describe("owner requests over iMessage", () => {
         expect(replied.status).toBe(200);
         expect(replied.reply.request.status).toBe("waiting-on-master");
 
-        const listed = await call(handle, "GET", `/requests?mission=${missionId}`);
-        expect(listed.status).toBe(200);
-        expect(listed.reply.requests).toHaveLength(1);
-        expect(listed.reply.requests[0].messages).toHaveLength(2);
+        // The bridge and an owner session read the conversation.
+        for (const token of ["bridge-token", "owner-token"]) {
+          const listed = await call(
+            handle,
+            "GET",
+            `/requests?mission=${missionId}`,
+            undefined,
+            token,
+          );
+          expect(listed.status).toBe(200);
+          expect(listed.reply.requests).toHaveLength(1);
+          expect(listed.reply.requests[0].messages).toHaveLength(2);
+          expect(listed.reply.requests[0].request.lastReply).toBe(
+            "Thanks. Also pick up the flaky test.",
+          );
+        }
+        const one = await call(
+          handle,
+          "GET",
+          `/requests?mission=${missionId}&request=${requestId}`,
+          undefined,
+          "bridge-token",
+        );
+        expect(one.reply.requests[0].messages.map((each: any) => each.body)).toEqual([
+          "How far is the API lane?",
+          "Thanks. Also pick up the flaky test.",
+        ]);
+        // Any other read token sees that requests exist, not what they say.
+        for (const token of ["control-token", "cli-token"]) {
+          const bare = await call(
+            handle,
+            "GET",
+            `/requests?mission=${missionId}&request=${requestId}`,
+            undefined,
+            token,
+          );
+          expect(bare.status).toBe(200);
+          expect(bare.reply.requests).toHaveLength(1);
+          expect(bare.reply.requests[0].request.status).toBe("waiting-on-master");
+          expect(bare.reply.requests[0].messages).toEqual([]);
+          expect(bare.reply.requests[0].request.lastReply).toBeNull();
+          expect(JSON.stringify(bare.reply)).not.toContain("flaky test");
+        }
       });
       const wakes = h.threads.sent.filter(
         (each) => each.threadId === masterThread && each.key.startsWith("mission-wake:"),

@@ -2,13 +2,17 @@
  * The owner's requests over the missions desk, for the iMessage assistant and
  * the `mission` CLI:
  *
- * - `GET  /api/ardud/missions/desk/requests?mission&status`
+ * - `GET  /api/ardud/missions/desk/requests?mission&status&request`
  * - `POST /api/ardud/missions/desk/requests`                     `{ missionId, text, subMissionId?, inboundId }`
  * - `POST /api/ardud/missions/desk/requests/:requestId/reply`    `{ text, inboundId }`
  *
  * Writes speak for the owner only with a verified inbound id: a real iMessage
  * from the owner's or Moni's chat that says exactly the text sent (the same
  * check asks use). The credential's own identity never stands in for him.
+ *
+ * Reads carry the conversations (bodies with `request=<id>`) only for an owner
+ * session or the iMessage bridge's credential; other read tokens get the list
+ * without anyone's words.
  */
 import {
   AuthOrchestrationOperateScope,
@@ -34,6 +38,7 @@ import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import { CONTROL_PROVENANCE, MISSIONS_DESK_PREFIX } from "../asks/http.ts";
 import * as Inbound from "../asks/inbound.ts";
 import { answerCheck, verifyInbound } from "../asks/provenance.ts";
+import { componentProvenance, isOwnerSession } from "../core/provenance.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { MissionRouter } from "./MissionRouter.ts";
 
@@ -140,6 +145,7 @@ const makeRoutes = Effect.gen(function* () {
       if (!session.scopes.includes(scope)) {
         return yield* deskError("forbidden", `This token lacks the ${scope} scope.`);
       }
+      return session;
     });
 
   /** The owner's voice from an iMessage he sent, checked against the text we were given. */
@@ -161,8 +167,12 @@ const makeRoutes = Effect.gen(function* () {
     });
 
   const list = authenticate(AuthOrchestrationReadScope).pipe(
-    Effect.andThen(
+    Effect.andThen((session) =>
       Effect.gen(function* () {
+        // The router decides who reads the words: an owner-paired session and
+        // the iMessage bridge do; the master reads them through its own
+        // tools. Any other read token sees that requests exist, not what they say.
+        const reader = componentProvenance(session) ?? CONTROL_PROVENANCE;
         const params = yield* searchParams;
         const missionId = yield* decodeMission(params.get("mission") ?? "").pipe(
           Effect.mapError(() => deskError("invalid_request", "mission is required.")),
@@ -176,9 +186,21 @@ const makeRoutes = Effect.gen(function* () {
                   deskError("invalid_request", "status is waiting-on-master, answered or settled."),
                 ),
               );
+        const rawRequest = params.get("request");
+        const requestId =
+          rawRequest === null || rawRequest.trim() === ""
+            ? undefined
+            : yield* decodeRequestId(rawRequest.trim()).pipe(
+                Effect.mapError(() => deskError("invalid_request", "request is a request id.")),
+              );
         const requests = yield* router.ownerRequests(
-          { missionId, ...(status === undefined ? {} : { status }) },
-          CONTROL_PROVENANCE,
+          {
+            missionId,
+            ...(status === undefined ? {} : { status }),
+            ...(requestId === undefined ? {} : { requestId }),
+          },
+          reader,
+          isOwnerSession(session),
         );
         return json({ ok: true, ...requests });
       }),

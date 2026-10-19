@@ -188,32 +188,37 @@ export const VIEW_ACTIONS: { readonly [K in ViewActionKey]: ViewActionSpec } = {
     owner: "missions.postMessage",
     master: "mission_post",
   },
+  // --- router additions ---
+  // Discuss is a conversation with the master, never a fork: it opens (or adds
+  // to) the owner request whose `subject` is the card's record.
   discuss: {
     label: "Discuss",
-    kinds: ALL_KINDS,
-    owner: "missions.startFork",
-    master: "mission_fork",
+    // A request is never about a request.
+    kinds: ALL_KINDS.filter((kind) => kind !== "owner-request"),
+    owner: "missions.openOwnerRequest",
+    master: null,
   },
   open: { label: "Open", kinds: ALL_KINDS, owner: null, master: null },
-  // Owner requests: method names follow router round 4 and are confirmed there.
+  // Owner requests: the WS methods and MCP tools router serves.
   reply: {
     label: "Reply",
     kinds: ["owner-request"],
-    owner: "missions.requests.reply",
+    owner: "missions.replyOwnerRequest",
     master: "mission_request_reply",
   },
   settle: {
     label: "Settle",
     kinds: ["owner-request"],
-    owner: "missions.requests.settle",
+    owner: "missions.settleOwnerRequest",
     master: "mission_request_settle",
   },
   reopen: {
     label: "Reopen",
     kinds: ["owner-request"],
-    owner: "missions.requests.reopen",
-    master: "mission_request_settle",
+    owner: "missions.reopenOwnerRequest",
+    master: "mission_request_reopen",
   },
+  // --- end router additions ---
 };
 
 export const viewActionAllowed = (action: ViewActionKey, kind: ViewBackingKind): boolean =>
@@ -814,8 +819,8 @@ export const VIEW_PATHS: { readonly [K in ViewPathScope]: PathTable } = {
     status: "enum",
     createdAt: "time",
   },
-  // Router round 4 record. `lastReply` is the master's latest message on the
-  // request (asked of router to keep on the record).
+  // Router round 4 record. `lastReply` is the newest message on the request,
+  // whoever wrote it, one line (router round 5 keeps it on every post).
   "owner-request": {
     title: "text",
     status: "enum",

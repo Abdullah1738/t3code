@@ -1093,3 +1093,67 @@ describe("system delivery", () => {
   });
 });
 // --- end router additions ---
+
+describe("router round 5", () => {
+  it.effect("a removed actor stays out: the import and the actor cannot add it back", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const coordActor = { _tag: "coord", actor: "coord-reviewer" } as const;
+      const legacy = { _tag: "thread", threadId: strayThread } as const;
+      const importing: MissionProvenance = { _tag: "import", source: "coord.db" };
+      // The import enrols a coord actor; the owner removes it; a re-import cannot undo that.
+      yield* router.setMember({ missionId, principal: coordActor, member: true }, importing);
+      yield* router.setMember({ missionId, principal: coordActor, member: false }, ownerApp);
+      assert.strictEqual(
+        yield* failureCode(
+          router.setMember({ missionId, principal: coordActor, member: true }, importing),
+        ),
+        "forbidden",
+      );
+      // The owner detaches the master's own thread; the master cannot re-add itself.
+      const self = { _tag: "thread", threadId: masterThread } as const;
+      yield* router.setMember({ missionId, principal: self, member: true }, ownerApp);
+      yield* router.setMember({ missionId, principal: self, member: false }, ownerApp);
+      assert.strictEqual(
+        yield* failureCode(
+          router.setMember({ missionId, principal: self, member: true }, agent(masterThread)),
+        ),
+        "forbidden",
+      );
+      // The master still re-adds a thread it detached; the owner re-adds anyone.
+      yield* router.setMember({ missionId, principal: legacy, member: true }, agent(masterThread));
+      yield* router.setMember({ missionId, principal: legacy, member: false }, agent(masterThread));
+      yield* router.setMember({ missionId, principal: legacy, member: true }, agent(masterThread));
+      yield* router.setMember({ missionId, principal: coordActor, member: true }, ownerApp);
+      yield* router.setMember({ missionId, principal: self, member: true }, ownerApp);
+      const changed = (yield* (yield* MissionStore.MissionStore).eventsSince(missionId, 0)).filter(
+        (event) => event.kind === "member.changed",
+      );
+      assert.strictEqual(changed.length, 9);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the room list counts every message and what the owner has not read", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      // More than one room page (50) of messages from the master, and two from the owner.
+      for (let index = 0; index < 60; index += 1) {
+        yield* router.post({ ...request(`status ${index}`), kind: "status" }, agent(masterThread));
+      }
+      yield* router.post(request("owner one"), ownerApp);
+      yield* router.post(request("owner two"), ownerApp);
+      const listed = (yield* router.rooms(missionId, ownerApp)).find((room) => room.id === control);
+      assert.strictEqual(listed?.messageCount, 62);
+      assert.strictEqual(listed?.unreadForOwner, 60);
+      // Reading up to the 30th message leaves the rest unread.
+      yield* router.markRead({ roomId: control, seq: 30 }, ownerApp);
+      const after = (yield* router.rooms(missionId, ownerApp)).find((room) => room.id === control);
+      assert.strictEqual(after?.messageCount, 62);
+      assert.strictEqual(after?.unreadForOwner, 30);
+    }).pipe(Effect.provide(h.layer));
+  });
+});

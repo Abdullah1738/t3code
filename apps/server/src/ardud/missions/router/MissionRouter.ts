@@ -20,7 +20,9 @@ import {
   type MissionMessageBody,
   type MissionMutationResult,
   type MissionProvenance,
+  type MissionRecordRef,
   type OpenOwnerRequestInput,
+  type OwnerCondition,
   type OwnerRequest,
   type OwnerRequests,
   type OwnerRequestsInput,
@@ -92,7 +94,7 @@ import {
   reminderLine,
   reminderRequestId,
 } from "./reminders.ts";
-import { makeOwnerRequests, type RequestCommit } from "./requests.ts";
+import { makeOwnerRequests, readsRequestWords, type RequestCommit } from "./requests.ts";
 import { requestIdOfRoom } from "./requestsModel.ts";
 import { RouterStore, type DeliveryRow, type RecipientRow } from "./RouterStore.ts";
 
@@ -352,10 +354,14 @@ export class MissionRouter extends Context.Service<
       input: MissionAttentionInput,
       provenance: MissionProvenance,
     ) => Effect.Effect<MissionAttention, MissionError>;
-    /** Owner or master: the owner's requests with their conversations (see requests.ts). */
+    /**
+     * The owner's requests. Words only for the owner, the master and the
+     * iMessage bridge; `ownerSession` marks an owner-paired desk read.
+     */
     readonly ownerRequests: (
       input: OwnerRequestsInput,
       provenance: MissionProvenance,
+      ownerSession?: boolean,
     ) => Effect.Effect<OwnerRequests, MissionError>;
     /** The owner asks the master, or the master opens one quoting the owner. */
     readonly openRequest: (
@@ -374,6 +380,16 @@ export class MissionRouter extends Context.Service<
       input: ReopenOwnerRequestInput,
       provenance: MissionProvenance,
     ) => Effect.Effect<OwnerRequest, MissionError>;
+    /** Discuss: the owner's condition is in his request about the record. */
+    readonly verifyOwnerCondition: (input: {
+      readonly subject: MissionRecordRef;
+      readonly condition: OwnerCondition;
+    }) => Effect.Effect<void, MissionError>;
+    /** Discuss: the record is decided, so the conversation about it settles. */
+    readonly settleRequestsFor: (input: {
+      readonly subject: MissionRecordRef;
+      readonly note: string | null;
+    }) => Effect.Effect<void, MissionError>;
   }
 >()("t3/ardud/missions/router/MissionRouter") {}
 
@@ -517,6 +533,16 @@ const make = Effect.gen(function* () {
           "forbidden",
           "Owner requests are between the owner and the mission's master.",
         );
+      }
+    });
+
+  /** A request room's words: the owner, the master and the iMessage bridge read them. */
+  const requireWordsReader = (room: Room, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      yield* requireRoomReader(room, provenance);
+      if (room.kind !== "owner-request" || provenance._tag === "agent") return;
+      if (!readsRequestWords(provenance)) {
+        return yield* fail("forbidden", "Only the owner and the master read an owner request.");
       }
     });
 
@@ -934,7 +960,7 @@ const make = Effect.gen(function* () {
   const roomPage = (input: RoomPageInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const room = yield* loadRoom(input.roomId);
-      yield* requireRoomReader(room, provenance);
+      yield* requireWordsReader(room, provenance);
       const limit = Math.min(input.limit ?? PAGE_DEFAULT, PAGE_MAX);
       const page = yield* rooms.roomMessages(room.id, input.beforeSeq ?? null, limit);
       const subscriptions = yield* rooms.subscriptions(room.id);
@@ -980,7 +1006,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const message = yield* rooms.messageById(input.messageId);
       if (message === null) return yield* fail("not-found", `No message ${input.messageId}.`);
-      yield* requireRoomReader(yield* loadRoom(message.roomId), provenance);
+      yield* requireWordsReader(yield* loadRoom(message.roomId), provenance);
       const body = yield* rooms.messageBody(message.id);
       return { messageId: message.id, body: body ?? "" } satisfies MissionMessageBody;
     });
@@ -1169,6 +1195,29 @@ const make = Effect.gen(function* () {
       return yield* tuningOf(room);
     });
 
+  /** The latest `member.changed` for a principal: true added, false removed, null never. */
+  const lastMemberChange = (missionId: MissionId, principal: string) =>
+    Effect.gen(function* () {
+      let latest: boolean | null = null;
+      let after = 0;
+      for (;;) {
+        const page = yield* store.eventsSince(missionId, after);
+        if (page.length === 0) return latest;
+        for (const event of page) {
+          if (event.kind !== "member.changed") continue;
+          if (typeof event.payload !== "object" || event.payload === null) continue;
+          const change = event.payload as {
+            readonly principal?: unknown;
+            readonly member?: unknown;
+          };
+          if (change.principal === principal && typeof change.member === "boolean") {
+            latest = change.member;
+          }
+        }
+        after = page.at(-1)!.seq;
+      }
+    });
+
   const setMember = (input: SetMissionMemberInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const cast = yield* loadCast(input.missionId);
@@ -1194,6 +1243,23 @@ const make = Effect.gen(function* () {
         }
       }
       const { principal, label, kind } = memberRowOf(input.principal);
+      // A removed actor stays out until the owner or master puts it back: the
+      // import and the actor itself cannot undo the removal.
+      const selfAdd =
+        provenance._tag === "agent" &&
+        input.principal._tag === "thread" &&
+        input.principal.threadId === provenance.threadId;
+      if (
+        input.member &&
+        !owner &&
+        (provenance._tag === "import" || selfAdd) &&
+        (yield* lastMemberChange(input.missionId, principal)) === false
+      ) {
+        return yield* fail(
+          "forbidden",
+          `${principal} was removed from this mission; only the owner or the master can add it back.`,
+        );
+      }
       const at = yield* nowIso;
       const result = yield* store.commit({
         event: {
@@ -1746,8 +1812,20 @@ const make = Effect.gen(function* () {
     // Owner request rooms live in the requests section, not the room list.
     rooms: (missionId, provenance) =>
       requireReader(missionId, provenance).pipe(
-        Effect.andThen(rooms.rooms(missionId)),
-        Effect.map((all) => all.filter((room) => room.kind !== "owner-request")),
+        Effect.andThen(Effect.all([rooms.rooms(missionId), rooms.roomCounts(missionId)])),
+        // The counts ride along so a list never has to count from one page.
+        Effect.map(([all, counts]) =>
+          all
+            .filter((room) => room.kind !== "owner-request")
+            .map((room) => {
+              const count = counts.get(room.id);
+              return {
+                ...room,
+                messageCount: count?.total ?? 0,
+                unreadForOwner: count?.unreadForOwner ?? 0,
+              };
+            }),
+        ),
       ),
     roomPage,
     messageBody,
@@ -1774,6 +1852,8 @@ const make = Effect.gen(function* () {
     replyRequest: requests.reply,
     settleRequest: requests.settle,
     reopenRequest: requests.reopen,
+    verifyOwnerCondition: requests.verifyCondition,
+    settleRequestsFor: requests.settleFor,
   });
 });
 

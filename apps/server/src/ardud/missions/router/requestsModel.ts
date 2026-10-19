@@ -51,6 +51,22 @@ export const requestTitleOf = (text: string): string => {
   return flat.length <= TITLE_MAX ? flat : `${flat.slice(0, TITLE_MAX - 1).trimEnd()}…`;
 };
 
+/** Characters of the newest message kept on the request for cards and lists. */
+export const LAST_REPLY_MAX = 280;
+
+/** The request with its newest message noted, flattened to one short line. */
+export const withLastReply = (
+  request: OwnerRequest,
+  text: string,
+  author: MissionActor,
+  at: string,
+): OwnerRequest => {
+  const flat = text.replace(/\s+/g, " ").trim();
+  const short =
+    flat.length <= LAST_REPLY_MAX ? flat : `${flat.slice(0, LAST_REPLY_MAX - 1).trimEnd()}…`;
+  return { ...request, lastReply: short, lastReplyBy: author, lastReplyAt: at };
+};
+
 // ---------------------------------------------------------------------------
 // Status moves
 
@@ -148,12 +164,31 @@ export const renderRequestContext = (input: {
   readonly messages: ReadonlyArray<TranscriptMessage>;
   readonly total: number;
   readonly budget?: number;
+  /** Discuss: the record the request is about and its current status line. */
+  readonly subject?: { readonly ref: MissionRecordRef; readonly status: string } | null;
 }): string => {
   const { request } = input;
   const budget = input.budget ?? REQUEST_CONTEXT_BUDGET;
+  const subject = input.subject ?? null;
+  // A discussion lives on its record's card, not in the owner's requests.
+  const about =
+    subject === null
+      ? []
+      : [
+          `About: ${refLine(subject.ref)}. Its status now: ${subject.status}.`,
+          "The owner opened this discussion from that record. It stays on the record's card, not in his requests, and your replies show there.",
+          ...(request.status === "settled"
+            ? []
+            : [
+                "Reply here, update or withdraw the record, or decide it on a condition the owner stated here (quote it verbatim).",
+              ]),
+        ];
   const header = [
-    `Owner request ${request.id}: "${request.title}"`,
+    subject === null
+      ? `Owner request ${request.id}: "${request.title}"`
+      : `Owner discussion ${request.id} on ${refLine(subject.ref)}: "${request.title}"`,
     `Status: ${request.status}. Opened ${request.createdAt} by ${input.openedBy}.`,
+    ...about,
     "The whole conversation follows, oldest first. Do not ask the owner to repeat any of it.",
     "",
   ].join("\n");
@@ -164,7 +199,9 @@ export const renderRequestContext = (input: {
   const footer = [
     "",
     linked,
-    `Answer with mission_request_reply (requestId ${request.id}): status "answered" when you have answered, or "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, forks, rules or suggestions you made from it. Never give it a default or a deadline. mission_request_settle closes it.`,
+    request.status === "settled"
+      ? `This request is settled; nothing to answer. mission_request_reopen (requestId ${request.id}) reopens it if there is more to do.`
+      : `Answer with mission_request_reply (requestId ${request.id}): status "answered" when you have answered, or "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, forks, rules or suggestions you made from it. Never give it a default or a deadline. mission_request_settle closes it, mission_request_reopen reopens it.`,
   ].join("\n");
 
   const [first, ...rest] = input.messages;

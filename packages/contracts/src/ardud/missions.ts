@@ -526,6 +526,12 @@ export const Room = Schema.Struct({
   lastMessageAt: Schema.NullOr(IsoDateTime),
   noise: Schema.NullOr(RoomNoise),
   createdAt: IsoDateTime,
+  // --- router additions ---
+  /** All messages in the room. Filled by the room list, not stored. */
+  messageCount: Schema.optional(NonNegativeInt),
+  /** Messages after the owner's read mark that the owner did not write. Filled by the room list. */
+  unreadForOwner: Schema.optional(NonNegativeInt),
+  // --- end router additions ---
 });
 export type Room = typeof Room.Type;
 
@@ -1608,6 +1614,13 @@ export const OwnerRequest = Schema.Struct({
   /** The record the owner is discussing (Discuss on a card). At most one open request per subject. */
   subject: Schema.optional(Schema.NullOr(MissionRecordRef)),
   // --- end discuss additions ---
+  /**
+   * Newest message in the request's room, whoever wrote it, flattened to one line
+   * of at most 280 characters. Set on every post, with its author and time.
+   */
+  lastReply: Schema.optional(Schema.NullOr(Schema.String.check(Schema.isMaxLength(280)))),
+  lastReplyBy: Schema.optional(Schema.NullOr(MissionActor)),
+  lastReplyAt: Schema.optional(Schema.NullOr(IsoDateTime)),
 });
 export type OwnerRequest = typeof OwnerRequest.Type;
 // --- end router additions ---
@@ -2431,6 +2444,12 @@ export const OpenOwnerRequestInput = Schema.Struct({
   quotedFrom: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(200))),
   /** Idempotency key: the same key opens the same request once. */
   key: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * Owner only: the record being discussed (Discuss on a card). It must belong to
+   * the mission. While a request about it is open, opening again adds the text to
+   * that request instead of starting another one.
+   */
+  subject: Schema.optional(MissionRecordRef),
 });
 export type OpenOwnerRequestInput = typeof OpenOwnerRequestInput.Type;
 
