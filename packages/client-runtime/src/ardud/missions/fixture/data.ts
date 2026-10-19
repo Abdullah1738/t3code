@@ -1473,26 +1473,6 @@ export const ownerReadSeq: Record<string, number> = {
 /** Roles on the Crpko roster; any other sender is a lane named after itself. */
 export const roleSenders: Record<string, string> = { master: ROLE_MASTER };
 
-export const forks = [
-  // Fixture-made: an earlier owner side question, answered and archived.
-  {
-    fork: {
-      id: "fork-ingestor-owner",
-      missionId: CRPKO,
-      kind: "owner-question",
-      masterThreadId: "fixture-thread-crpko-master",
-      forkThreadId: "fixture-thread-fork-ingestor",
-      origin: { kind: "note", id: "note-ingestor-rollback", label: "Ingestor rollback" },
-      status: "archived",
-      summaryLine: "Owner asked whether the rollback lost data; fork confirmed readback was clean.",
-      commitsMission: false,
-      createdAt: AT("07:02"),
-      closedAt: AT("07:09"),
-    },
-    question: "Did the ingestor rollback lose any rows?",
-  },
-];
-
 export const ownerLastLookedAt: Record<string, string | null> = {
   [CRPKO]: OWNER_LAST_LOOKED_AT,
   [JUNO]: AT("19:30", 14),

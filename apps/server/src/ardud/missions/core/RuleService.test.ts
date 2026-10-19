@@ -21,8 +21,8 @@ const master = agent(masterThread);
 const laneAgent = agent(laneThread);
 
 const rulesLayer = () => {
-  const { layer, forks } = harness();
-  return { forks, layer: RuleService.layer.pipe(Layer.provideMerge(layer)) };
+  const { layer } = harness();
+  return { layer: RuleService.layer.pipe(Layer.provideMerge(layer)) };
 };
 
 it.effect(
@@ -107,8 +107,8 @@ it.effect(
   },
 );
 
-it.effect("anyone asks for a rule change; the owner can discuss it; the master resolves it", () => {
-  const { layer, forks } = rulesLayer();
+it.effect("anyone asks for a rule change; the master resolves it", () => {
+  const { layer } = rulesLayer();
   return Effect.gen(function* () {
     yield* seed;
     const rules = yield* RuleService.RuleService;
@@ -123,25 +123,10 @@ it.effect("anyone asks for a rule change; the owner can discuss it; the master r
       request: "Allow open questions without options.",
     });
     assert.equal(fromLane.status, "open");
-    assert.isNull(fromLane.forkId);
-
-    // Missions has no forks: discuss is refused and nothing is forked.
-    assert.equal(
-      yield* failureCode(
-        rules.requestRuleChange(ownerApp, {
-          ruleId: rule.id,
-          request: "Let's talk about when options don't fit.",
-          discuss: true,
-        }),
-      ),
-      "invalid",
-    );
-    assert.equal(forks.length, 0);
     const discussed = yield* rules.requestRuleChange(ownerApp, {
       ruleId: rule.id,
       request: "Let's talk about when options don't fit.",
     });
-    assert.isNull(discussed.forkId);
 
     // A lane agent cannot resolve; the master can.
     assert.equal(

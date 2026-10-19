@@ -24,8 +24,7 @@ export const castOf = (store: MissionStore.MissionStore["Service"], missionId: M
       yield* store.listAllInMission("role-binding", missionId, ["bound"]),
     );
     const lanes = newestFirst(yield* store.listAllInMission("lane", missionId));
-    const forks = newestFirst(yield* store.listAllInMission("fork", missionId, ["open"]));
-    const cast: MissionCast = { missionId, mission, roles, bindings, lanes, forks };
+    const cast: MissionCast = { missionId, mission, roles, bindings, lanes };
     return cast;
   });
 

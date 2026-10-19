@@ -3,7 +3,6 @@ import {
   CallId,
   DraftId,
   DraftNoteId,
-  ForkId,
   approverOf,
   isOwnerProvenance,
   MissionError,
@@ -14,7 +13,6 @@ import {
   type AnswerAskInput,
   type Ask,
   type Call,
-  type CloseForkInput,
   type CloseStaleDraftInput,
   type ReportDraftSentInput,
   type DecideDraftInput,
@@ -26,7 +24,6 @@ import {
   type Mission,
   type MissionActor,
   type MissionEvent,
-  type MissionFork,
   type MissionLink,
   type MissionMessage,
   type MissionProvenance,
@@ -36,20 +33,21 @@ import {
   type OwnerCondition,
   type PostMessageInput,
   type ReactToCallInput,
+  type RecordDraftSentInput,
   type ReopenAskInput,
   type ReopenDraftInput,
   type ReopenSuggestionInput,
   type RouteDraftInput,
   type SaveDraftNoteInput,
   type SetDraftNoteActiveInput,
-  type StartForkInput,
   type Suggestion,
   type SuggestionAuthor,
   type SuggestionStats,
   type MissionMasterInbox,
   type SystemDraftDecision,
-  type UpdateForkInput,
   type WithdrawAskInput,
+  type WithdrawDraftInput,
+  RoomId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -82,13 +80,16 @@ import {
   annotationOf,
   closeStaleDraft,
   decideDraft,
+  draftDecisionNotice,
   draftExamples,
   draftRef,
+  draftWriter,
   type DraftAbout,
   type DraftExample,
   notesFor,
   openSystemDraft,
   pullRequestKeyOf,
+  recordDraftSent,
   reopenDraft,
   reportDraftSent,
   reviseDraft,
@@ -97,19 +98,8 @@ import {
   saveDraftNote,
   submitDraft,
   systemDraftDecision,
+  withdrawDraft,
 } from "./draftModel.ts";
-import {
-  archiveFork,
-  checkStartFork,
-  closeFork,
-  forkRef,
-  forkTitle,
-  markForkCommits,
-  openFork,
-  openForkFor,
-  reopenFork,
-  type MasterDelivery,
-} from "./forkModel.ts";
 import { heldLane, heldRecords, heldWorkItem, type HeldRecord } from "./holds.ts";
 import * as Inbound from "./inbound.ts";
 import {
@@ -135,7 +125,6 @@ import {
   defaultAsker,
   isParticipant,
   standingOf,
-  threadOfActor,
   type MissionCast,
   type Standing,
 } from "./standing.ts";
@@ -153,7 +142,7 @@ import {
 /**
  * The asks track over core's mission store: owner asks and their holds,
  * the master's calls and the owner's reactions, drafts with notes and edit
- * learning, suggestions from every author, and forks off the master thread.
+ * learning, and suggestions from every author.
  *
  * Provenance always comes from the transport (the calling thread, the
  * owner's app session, a verified iMessage). Inputs never carry identity.
@@ -193,13 +182,6 @@ export interface DraftGuide {
   readonly examples: ReadonlyArray<DraftExample>;
 }
 
-export interface ForkResult {
-  readonly fork: MissionFork;
-  /** The question or summary line reached its thread. */
-  readonly delivered: boolean;
-  readonly note: Note | null;
-}
-
 export interface MissionDesk {
   readonly mission: Mission;
   readonly openAsks: ReadonlyArray<Ask>;
@@ -207,7 +189,6 @@ export interface MissionDesk {
   readonly held: ReadonlyArray<HeldRecord>;
   readonly pendingDrafts: ReadonlyArray<Draft>;
   readonly openSuggestions: ReadonlyArray<Suggestion>;
-  readonly openForks: ReadonlyArray<MissionFork>;
   readonly directionCheck: ReadonlyArray<DirectionCheckItem>;
   readonly lanes: ReadonlyArray<Pick<Lane, "id" | "name" | "status" | "statusReason">>;
   readonly latestSeq: number;
@@ -259,9 +240,8 @@ export class AsksService extends Context.Service<
     ) => Fx<ReadonlyArray<SuggestionStats>>;
     /** What waits on the master instead of the owner (null: every mission). */
     readonly masterInbox: (missionId: MissionId | null) => Fx<MissionMasterInbox>;
-    readonly forks: (filter: ListFilter) => Fx<ReadonlyArray<MissionFork>>;
     readonly notes: (missionId: MissionId) => Fx<ReadonlyArray<Note>>;
-    /** Who the caller is in a mission: its roles, lanes, open forks and whether it is the master. */
+    /** Who the caller is in a mission: its roles, lanes and whether it is the master. */
     readonly standing: (missionId: MissionId, provenance: MissionProvenance) => Fx<Standing>;
     // Asks
     readonly openAsk: (raw: unknown, provenance: MissionProvenance) => Fx<Ask>;
@@ -285,6 +265,13 @@ export class AsksService extends Context.Service<
       provenance: MissionProvenance,
     ) => Fx<DraftDecisionResult>;
     readonly reopenDraft: (input: ReopenDraftInput, provenance: MissionProvenance) => Fx<Draft>;
+    /** The master takes back a waiting draft, whoever decides it, with a note the owner sees. */
+    readonly withdrawDraft: (input: WithdrawDraftInput, provenance: MissionProvenance) => Fx<Draft>;
+    /** The writer (or master) posted a thread draft's approved text: it is sent, once. */
+    readonly recordDraftSent: (
+      input: RecordDraftSentInput,
+      provenance: MissionProvenance,
+    ) => Fx<Draft>;
     /** Owner or master hands one pending draft to the other approver, with a reason. */
     readonly routeDraft: (input: RouteDraftInput, provenance: MissionProvenance) => Fx<Draft>;
     readonly saveDraftNote: (
@@ -332,10 +319,6 @@ export class AsksService extends Context.Service<
     ) => Fx<Suggestion>;
     /** Startup: applies accepted suggestions the last process left without an outcome. */
     readonly applyPendingSuggestions: Fx<ReadonlyArray<Suggestion>>;
-    // Forks
-    readonly startFork: (input: StartForkInput, provenance: MissionProvenance) => Fx<ForkResult>;
-    readonly closeFork: (input: CloseForkInput, provenance: MissionProvenance) => Fx<ForkResult>;
-    readonly updateFork: (input: UpdateForkInput, provenance: MissionProvenance) => Fx<ForkResult>;
     // Notes and rooms
     readonly ackNote: (noteId: NoteId, provenance: MissionProvenance) => Fx<Note>;
     readonly post: (input: PostMessageInput, provenance: MissionProvenance) => Fx<MissionMessage>;
@@ -353,6 +336,9 @@ const newestOf = <T extends { readonly createdAt: string }>(items: ReadonlyArray
 
 const fail = (code: MissionError["code"], detail: string) =>
   Effect.fail(new MissionError({ code, detail }));
+
+/** Who speaks when asks itself posts into a room. */
+const ASKS_SYSTEM: MissionProvenance = { _tag: "system", component: "asks" };
 
 /** The line the owner reads in his conversation about an ask once it is answered. */
 const answeredNote = (ask: Ask): string => {
@@ -389,7 +375,6 @@ const replaceById = <R extends { readonly id: string }>(
 
 const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
-  const threads = yield* Ports.AsksThreads;
   const signals = yield* Ports.AsksSignals;
   const rooms = yield* Ports.AsksRooms;
   const appliers = yield* Ports.SuggestionApplierRegistry;
@@ -510,7 +495,6 @@ const make = Effect.gen(function* () {
           case "sub-mission":
           case "milestone":
           case "draft":
-          case "fork":
           case "approval":
           case "rule-change-request":
             return need(ref.kind, ref.id).pipe(
@@ -553,31 +537,7 @@ const make = Effect.gen(function* () {
     });
 
   const signalResolved = (ask: Ask, released: ReadonlyArray<MissionRecordRef>) =>
-    Effect.gen(function* () {
-      const cast = yield* castOf(ask.missionId);
-      yield* signals.askResolved({
-        ask,
-        askerThreadId: threadOfActor(cast, ask.askedBy),
-        released,
-      });
-    });
-
-  const deliver = (
-    delivery: {
-      readonly threadId: MasterDelivery["threadId"];
-      readonly text: string;
-      readonly asOwner: boolean;
-    },
-    key: string,
-  ) =>
-    threads.deliver({ ...delivery, key }).pipe(
-      Effect.as(true),
-      Effect.catch((error) =>
-        Effect.logWarning("Mission delivery failed", { key, detail: error.detail }).pipe(
-          Effect.as(false),
-        ),
-      ),
-    );
+    signals.askResolved({ ask, released });
 
   const allDraftNotes = (missionId: MissionId | null) =>
     Effect.gen(function* () {
@@ -586,10 +546,7 @@ const make = Effect.gen(function* () {
       return [...global, ...scoped];
     });
 
-  const listWith = <K extends "ask" | "draft" | "suggestion" | "fork">(
-    kind: K,
-    filter: ListFilter,
-  ) =>
+  const listWith = <K extends "ask" | "draft" | "suggestion">(kind: K, filter: ListFilter) =>
     store.list(kind, {
       ...(filter.missionId === undefined ? {} : { missionId: filter.missionId }),
       ...(filter.status === undefined ? {} : { status: filter.status }),
@@ -754,6 +711,44 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  /**
+   * One knock to the thread that wrote a decided draft, in the mission's
+   * control room through the router: the decision, the approved text and any
+   * note. Nobody is told when the writer decided it itself; a failure is
+   * logged and never undoes the decision.
+   */
+  const tellWriter = (draft: Draft) =>
+    Effect.gen(function* () {
+      const writer = draftWriter(draft);
+      const notice = draftDecisionNotice(draft);
+      if (writer === null || notice === null) return;
+      const decider = draft.decidedBy;
+      if (
+        decider !== null &&
+        decider._tag === "agent" &&
+        writer._tag === "role" &&
+        decider.roleId === writer.roleId
+      ) {
+        return;
+      }
+      yield* rooms.post(
+        {
+          missionId: draft.missionId,
+          roomId: RoomId.make(`${draft.missionId}:room:control`),
+          kind: "decision",
+          summary: notice.summary,
+          body: notice.body,
+          to: [writer],
+          key: `draft:${draft.id}:${draft.status}:${draft.revision ?? 0}`,
+        },
+        ASKS_SYSTEM,
+      );
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Draft decision did not reach its writer", { draftId: draft.id, cause }),
+      ),
+    );
+
   const reopenAskCommand = (input: ReopenAskInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const ask = yield* need("ask", input.askId);
@@ -823,8 +818,6 @@ const make = Effect.gen(function* () {
   // Drafts
 
   const draftSource = (standing: Standing): Draft["source"] => {
-    const fork = standing.forks[0];
-    if (fork !== undefined) return { kind: "fork", ref: forkRef(fork) };
     const lane = standing.lanes[0];
     if (lane !== undefined)
       return { kind: "lane", ref: { kind: "lane", id: lane.id, label: lane.name } };
@@ -838,11 +831,11 @@ const make = Effect.gen(function* () {
    */
   /**
    * The lanes a lane-bound caller may name a draft after, or null when it may
-   * name any: the owner, the master, its forks and mission-wide roles.
+   * name any: the owner, the master and mission-wide roles.
    */
   const ownLanes = (cast: MissionCast, standing: Standing): ReadonlySet<string> | null => {
     if (standing.caller.provenance._tag !== "agent" || standing.isMaster) return null;
-    if (standing.forks.length > 0 || standing.roles.some((role) => role.laneId === null)) {
+    if (standing.roles.some((role) => role.laneId === null)) {
       return null;
     }
     const laneIds = new Set<string>(standing.lanes.map((lane) => lane.id));
@@ -928,7 +921,7 @@ const make = Effect.gen(function* () {
       if (provenance._tag === "agent" && !isParticipant(standing)) {
         return yield* fail(
           "forbidden",
-          `This thread holds no role, lane or fork in mission ${input.missionId}.`,
+          `This thread holds no role or lane in mission ${input.missionId}.`,
         );
       }
       const writer = standing.roles.find((role) => role.kind === "writer") ?? null;
@@ -1104,6 +1097,43 @@ const make = Effect.gen(function* () {
         { _tag: "draft", record: reopened.record },
       ]);
       return reopened.record;
+    });
+
+  const withdrawDraftCommand = (input: WithdrawDraftInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const { standing } = yield* standingIn(draft.missionId, provenance);
+      const withdrawn = yield* fromOutcome(
+        withdrawDraft({
+          draft,
+          provenance: standing.caller.provenance,
+          callerIsMaster: standing.isMaster,
+          note: input.note,
+          now: yield* now,
+        }),
+      );
+      yield* persist(draft.missionId, withdrawn.events, [
+        { _tag: "draft", record: withdrawn.record },
+      ]);
+      return withdrawn.record;
+    });
+
+  const recordDraftSentCommand = (input: RecordDraftSentInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const draft = yield* need("draft", input.draftId);
+      const { standing } = yield* standingIn(draft.missionId, provenance);
+      const sent = yield* fromOutcome(
+        recordDraftSent({
+          draft,
+          caller: standing.caller,
+          callerIsMaster: standing.isMaster,
+          link: input.link ?? null,
+          now: yield* now,
+        }),
+      );
+      if (sent.events.length === 0) return sent.record;
+      yield* persist(draft.missionId, sent.events, [{ _tag: "draft", record: sent.record }]);
+      return sent.record;
     });
 
   const routeDraftCommand = (input: RouteDraftInput, provenance: MissionProvenance) =>
@@ -1672,171 +1702,6 @@ const make = Effect.gen(function* () {
     });
 
   // -------------------------------------------------------------------------
-  // Forks
-
-  const forkOpening = (
-    fork: MissionFork,
-    question: string | undefined,
-    provenance: MissionProvenance,
-  ): {
-    readonly text: string;
-    readonly asOwner: boolean;
-  } | null => {
-    const asked = question?.trim() ?? "";
-    switch (fork.kind) {
-      case "dev-question":
-        return {
-          asOwner: false,
-          text: [
-            `[Mission dev question] ${asked.length > 0 ? asked : forkTitle(fork.kind, fork.origin)}`,
-            "Answer from the mission's context without changing the mission.",
-            "Put any reply to the dev through mission_draft (the owner approves it), then end with",
-            `mission_fork_close for fork ${fork.id} and one line for the master.`,
-          ].join("\n"),
-        };
-      case "owner-question":
-      case "discuss":
-        // Only the owner's own words reach the fork as the owner.
-        return asked.length > 0 ? { asOwner: isOwnerProvenance(provenance), text: asked } : null;
-    }
-  };
-
-  const startForkCommand = (input: StartForkInput, provenance: MissionProvenance) =>
-    Effect.gen(function* () {
-      const { cast, standing } = yield* standingIn(input.missionId, provenance);
-      const origin = input.origin;
-      const open = openForkFor(cast.forks, input.missionId, input.kind, origin);
-      if (open !== undefined) return { fork: open, delivered: false, note: null };
-      if (provenance._tag === "agent" && !isParticipant(standing)) {
-        return yield* fail(
-          "forbidden",
-          `This thread holds no role, lane or fork in mission ${input.missionId}.`,
-        );
-      }
-      const masterThreadId = yield* fromOutcome(
-        checkStartFork({
-          missionId: input.missionId,
-          kind: input.kind,
-          origin,
-          caller: standing.caller,
-          masterThreadId: standing.masterThreadId,
-          callerIsMaster: standing.isMaster,
-        }),
-      );
-      const id = ForkId.make(yield* newId("fork"));
-      const forkThreadId = yield* threads.fork({
-        sourceThreadId: masterThreadId,
-        title: forkTitle(input.kind, origin, input.question),
-        key: id,
-      });
-      const opened = yield* fromOutcome(
-        openFork({
-          missionId: input.missionId,
-          kind: input.kind,
-          origin,
-          caller: standing.caller,
-          masterThreadId,
-          callerIsMaster: standing.isMaster,
-          id,
-          forkThreadId,
-          question: input.question,
-          now: yield* now,
-        }),
-      );
-      yield* persist(input.missionId, opened.events, [{ _tag: "fork", record: opened.record }]);
-      const opening = forkOpening(opened.record, input.question, provenance);
-      const delivered =
-        opening === null
-          ? false
-          : yield* deliver({ threadId: forkThreadId, ...opening }, `fork:${id}:opening`);
-      return { fork: opened.record, delivered, note: null };
-    });
-
-  const finishFork = (
-    fork: MissionFork,
-    closing: {
-      readonly record: MissionFork;
-      readonly events: ReadonlyArray<ModelEvent>;
-      readonly delivery: MasterDelivery;
-      readonly note: Note | null;
-    },
-    key: string,
-  ) =>
-    Effect.gen(function* () {
-      yield* persist(fork.missionId, closing.events, [
-        { _tag: "fork", record: closing.record },
-        ...(closing.note === null ? [] : [{ _tag: "note" as const, record: closing.note }]),
-      ]);
-      const delivered = yield* deliver(closing.delivery, key);
-      return { fork: closing.record, delivered, note: closing.note };
-    });
-
-  const closeForkCommand = (input: CloseForkInput, provenance: MissionProvenance) =>
-    Effect.gen(function* () {
-      const fork = yield* need("fork", input.forkId);
-      const { standing } = yield* standingIn(fork.missionId, provenance);
-      const at = yield* now;
-      const closing = yield* fromOutcome(
-        closeFork({
-          fork,
-          summaryLine: input.summaryLine,
-          commitsMission: input.commitsMission ?? false,
-          caller: standing.caller,
-          noteId: NoteId.make(yield* newId("note")),
-          now: at,
-        }),
-      );
-      return yield* finishFork(fork, closing, `fork:${fork.id}:closed:${at}`);
-    });
-
-  const updateForkCommand = (input: UpdateForkInput, provenance: MissionProvenance) =>
-    Effect.gen(function* () {
-      const fork = yield* need("fork", input.forkId);
-      const at = yield* now;
-      const { standing } = yield* standingIn(fork.missionId, provenance);
-      switch (input.action) {
-        case "commits-mission": {
-          const closing = yield* fromOutcome(
-            markForkCommits({
-              fork,
-              provenance: standing.caller.provenance,
-              callerIsMaster: standing.isMaster,
-              noteId: NoteId.make(yield* newId("note")),
-              now: at,
-            }),
-          );
-          return yield* finishFork(fork, closing, `fork:${fork.id}:commits:${at}`);
-        }
-        case "archive": {
-          const mayArchive =
-            isOwnerProvenance(provenance) ||
-            standing.isMaster ||
-            (provenance._tag === "agent" && provenance.threadId === fork.forkThreadId);
-          if (!mayArchive) {
-            return yield* fail(
-              "forbidden",
-              "The owner, the master or the fork itself archives a fork.",
-            );
-          }
-          const archived = yield* fromOutcome(archiveFork(fork, provenance));
-          yield* persist(fork.missionId, archived.events, [
-            { _tag: "fork", record: archived.record },
-          ]);
-          return { fork: archived.record, delivered: false, note: null };
-        }
-        case "reopen": {
-          const reopened = yield* fromOutcome(
-            reopenFork(fork, standing.caller.provenance, standing.isMaster),
-          );
-          yield* persist(fork.missionId, reopened.events, [
-            { _tag: "fork", record: reopened.record },
-          ]);
-          return { fork: reopened.record, delivered: false, note: null };
-        }
-      }
-    });
-
-  // -------------------------------------------------------------------------
   // Notes and rooms
 
   const ackNoteCommand = (noteId: NoteId, provenance: MissionProvenance) =>
@@ -1879,7 +1744,7 @@ const make = Effect.gen(function* () {
       if (provenance._tag === "agent" && !isParticipant(standing)) {
         return yield* fail(
           "forbidden",
-          `This thread holds no role, lane or fork in mission ${input.missionId}.`,
+          `This thread holds no role or lane in mission ${input.missionId}.`,
         );
       }
       return yield* rooms.post(input, standing.caller.provenance);
@@ -1903,7 +1768,6 @@ const make = Effect.gen(function* () {
           status: ["pending", "rewrite-requested"],
         }),
         openSuggestions: yield* store.list("suggestion", { missionId, status: ["open"] }),
-        openForks: yield* store.list("fork", { missionId, status: ["open"] }),
         directionCheck: directionCheck(calls, yield* store.ownerLastLookedAt(missionId)),
         lanes: lanes.map(({ id, name, status, statusReason }) => ({
           id,
@@ -1985,7 +1849,6 @@ const make = Effect.gen(function* () {
         .listAll("suggestion")
         .pipe(Effect.map((suggestions) => missionSuggestionStats(suggestions, missionId))),
     masterInbox,
-    forks: (filter) => listWith("fork", filter),
     notes: (missionId) => store.list("note", { missionId }),
     standing: (missionId, provenance) =>
       standingIn(missionId, provenance).pipe(Effect.map(({ standing }) => standing)),
@@ -2035,8 +1898,15 @@ const make = Effect.gen(function* () {
             ? Effect.void
             : settleDiscussion(draftRef(result.draft), decidedNote(result.draft)),
         ),
+        Effect.tap((result) => tellWriter(result.draft)),
       ),
     reopenDraft: (input, provenance) => serialized(reopenDraftCommand(input, provenance)),
+    withdrawDraft: (input, provenance) =>
+      serialized(withdrawDraftCommand(input, provenance)).pipe(
+        Effect.tap((draft) => settleDiscussion(draftRef(draft), `Withdrawn: ${input.note}`)),
+        Effect.tap(tellWriter),
+      ),
+    recordDraftSent: (input, provenance) => serialized(recordDraftSentCommand(input, provenance)),
     routeDraft: (input, provenance) => serialized(routeDraftCommand(input, provenance)),
     saveDraftNote: (input, provenance) => serialized(saveDraftNoteCommand(input, provenance)),
     setDraftNoteActive: (input, provenance) =>
@@ -2052,9 +1922,6 @@ const make = Effect.gen(function* () {
     decideSuggestion: decideSuggestionCommand,
     reopenSuggestion: (input, provenance) => serialized(reopenSuggestionCommand(input, provenance)),
     applyPendingSuggestions: Effect.uninterruptible(applyPendingSuggestionsCommand),
-    startFork: (input, provenance) => serialized(startForkCommand(input, provenance)),
-    closeFork: (input, provenance) => serialized(closeForkCommand(input, provenance)),
-    updateFork: (input, provenance) => serialized(updateForkCommand(input, provenance)),
     ackNote: (noteId, provenance) => serialized(ackNoteCommand(noteId, provenance)),
     post: postCommand,
   });
@@ -2064,15 +1931,10 @@ export const layer = Layer.effect(AsksService, make);
 
 /**
  * The service with this server's ports: iMessage lookups against the bridge
- * and Moni's chat, forks and deliveries through thread management, and typed
- * seams for rooms and answer signals (router's doorbell). Suggestion appliers register into the registry from
- * the tracks that own them (see wiring.ts).
+ * and Moni's chat. Rooms and answer signals come from the router
+ * (missions/layer.ts); suggestion appliers register into the registry from the
+ * tracks that own them (see wiring.ts).
  */
 export const layerLive = layer.pipe(
-  Layer.provideMerge(
-    // ardud missions: router (AsksRooms and AsksSignals come from the router in missions/layer.ts)
-    Layer.mergeAll(Inbound.layer, Ports.applierRegistry).pipe(
-      Layer.provideMerge(Ports.threadsLayer),
-    ),
-  ),
+  Layer.provideMerge(Layer.mergeAll(Inbound.layer, Ports.applierRegistry)),
 );

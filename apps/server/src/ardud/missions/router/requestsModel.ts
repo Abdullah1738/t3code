@@ -129,10 +129,13 @@ export const reopenedByMaster = (
 // ---------------------------------------------------------------------------
 // The master's transcript
 
+/**
+ * One message of the transcript. No clock time: the owner reads this text in
+ * the master's thread, and a baked time would show in the server's zone.
+ */
 export interface TranscriptMessage {
   readonly seq: number;
   readonly author: string;
-  readonly at: string;
   readonly text: string;
 }
 
@@ -142,7 +145,7 @@ const clipText = (text: string) =>
     : `${text.slice(0, MESSAGE_CONTEXT_MAX)}\n[cut: ${text.length - MESSAGE_CONTEXT_MAX} more characters; mission_requests has the whole message]`;
 
 const blockOf = (message: TranscriptMessage) =>
-  `#${message.seq} ${message.author} at ${message.at}:\n${clipText(message.text)}\n`;
+  `#${message.seq} ${message.author}:\n${clipText(message.text)}\n`;
 
 const refLine = (ref: MissionRecordRef) =>
   ref.label === undefined || ref.label.length === 0
@@ -187,7 +190,7 @@ export const renderRequestContext = (input: {
     subject === null
       ? `Owner request ${request.id}: "${request.title}"`
       : `Owner discussion ${request.id} on ${refLine(subject.ref)}: "${request.title}"`,
-    `Status: ${request.status}. Opened ${request.createdAt} by ${input.openedBy}.`,
+    `Status: ${request.status}. Opened by ${input.openedBy}.`,
     ...about,
     "The whole conversation follows, oldest first. Do not ask the owner to repeat any of it.",
     "",
@@ -201,7 +204,7 @@ export const renderRequestContext = (input: {
     linked,
     request.status === "settled"
       ? `This request is settled; nothing to answer. mission_request_reopen (requestId ${request.id}) reopens it if there is more to do.`
-      : `Answer with mission_request_reply (requestId ${request.id}): status "answered" when you have answered, or "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, forks, rules or suggestions you made from it. Never give it a default or a deadline. mission_request_settle closes it, mission_request_reopen reopens it.`,
+      : `Answer with mission_request_reply (requestId ${request.id}): status "answered" when you have answered, or "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, rules or suggestions you made from it. Never give it a default or a deadline. mission_request_settle closes it, mission_request_reopen reopens it.`,
   ].join("\n");
 
   const [first, ...rest] = input.messages;

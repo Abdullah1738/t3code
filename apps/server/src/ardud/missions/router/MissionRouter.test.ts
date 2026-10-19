@@ -18,6 +18,7 @@ import {
   agent,
   binding,
   failureCode,
+  lane,
   laneThread,
   masterThread,
   mission,
@@ -1091,6 +1092,40 @@ describe("system delivery", () => {
       assert.strictEqual(page.messages.length, 1);
     }).pipe(Effect.provide(h.layer));
   });
+
+  it.effect("a retried notice takes its first route, whatever the membership is by then", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const stray = { _tag: "thread", threadId: strayThread } as const;
+      const direct = {
+        threadId: strayThread,
+        text: "Resume.",
+        key: "incident-3:none:t-stray",
+        producer: "stream-recovery",
+      };
+      // Queued directly; the thread joins; the retry is queued under the same key, not posted.
+      assert.deepStrictEqual(yield* router.notify(direct), { _tag: "sent" });
+      yield* router.setMember({ missionId, principal: stray, member: true }, ownerApp);
+      assert.deepStrictEqual(yield* router.notify(direct), { _tag: "sent" });
+      const keys = h.sent.filter((sent) => sent.text === "Resume.").map((sent) => sent.key);
+      assert.deepStrictEqual(keys, [
+        "recovery:incident-3:none:t-stray",
+        "recovery:incident-3:none:t-stray",
+      ]);
+      // Posted while a member; the thread leaves; the retry lands on the same post.
+      const posted = { ...direct, text: "Pick up.", key: "incident-4:m-1:t-stray" };
+      const first = yield* router.notify(posted);
+      assert.strictEqual(first._tag, "posted");
+      yield* router.setMember({ missionId, principal: stray, member: false }, ownerApp);
+      assert.deepStrictEqual(yield* router.notify(posted), first);
+      assert.deepStrictEqual(
+        h.sent.filter((sent) => sent.text === "Pick up."),
+        [],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
 });
 // --- end router additions ---
 
@@ -1154,6 +1189,33 @@ describe("router round 5", () => {
       const after = (yield* router.rooms(missionId, ownerApp)).find((room) => room.id === control);
       assert.strictEqual(after?.messageCount, 62);
       assert.strictEqual(after?.unreadForOwner, 30);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a room page names everyone on it and lists who is in the room", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      // Nobody subscribed: the master wakes the lane by name, the lane answers.
+      yield* router.post(
+        request("API, rebase please", { to: [{ _tag: "lane", laneId: lane.id }] }),
+        agent(masterThread),
+      );
+      yield* router.post({ ...request("rebased"), kind: "status" }, agent(laneThread));
+      yield* router.post(request("thanks"), ownerApp);
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.deepStrictEqual(page.subscriptions, []);
+      assert.deepStrictEqual(page.members, [
+        { _tag: "lane", laneId: lane.id },
+        { _tag: "role", roleId: RoleId.make("role-master") },
+      ]);
+      assert.deepStrictEqual(page.names, {
+        [`lane:${lane.id}`]: "API",
+        "role:role-master": "role-master",
+        [`thread:${masterThread}`]: "role-master",
+        [`thread:${laneThread}`]: "API",
+      });
     }).pipe(Effect.provide(h.layer));
   });
 });

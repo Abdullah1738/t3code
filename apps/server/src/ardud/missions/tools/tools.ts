@@ -20,6 +20,7 @@ import {
   NoteId,
   OrchestratorMcpFailure,
   PostMessageInput,
+  RecordDraftSentInput,
   RecordRuleUseInput,
   RecordView,
   ReopenDraftInput,
@@ -45,6 +46,7 @@ import {
   UpsertRuleInput,
   UpsertWorkItemInput,
   WithdrawAskInput,
+  WithdrawDraftInput,
   WorkItemId,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
@@ -228,7 +230,7 @@ const MissionDraftTool = Tool.make("mission_draft", {
 
 const MissionDraftApproveTool = Tool.make("mission_draft_approve", {
   description:
-    "Decide a draft as the mission's master: approve (optionally with edited text), rewrite with a note, or drop. This works for drafts routed to the master, or for one routed to the owner when you pass onOwnerCondition: the open owner request about this draft and his exact words stating the condition your decision meets, whole sentences from his newest message there (not a question). The owner decides his own drafts in the app or through his iMessage agent (mission CLI), never through this tool. Approval records the draft as approved; sending is separate.",
+    "Decide a draft as the mission's master: approve (optionally with edited text), rewrite with a note, or drop. This works for drafts routed to the master, or for one routed to the owner when you pass onOwnerCondition: the open owner request about this draft and his exact words stating the condition your decision meets, whole sentences from his newest message there (not a question). The owner decides his own drafts in the app or through his iMessage agent (mission CLI), never through this tool. The writer hears every decision; after an approval it posts exactly the approved text and records it with mission_draft_sent.",
   parameters: Schema.Struct({
     draftId: DraftId,
     action: Schema.Literals(["approve", "rewrite", "drop"]),
@@ -309,6 +311,26 @@ const MissionDraftReopenTool = Tool.make("mission_draft_reopen", {
   description:
     "As the mission's master, put an approved or dropped draft back to pending, including one the owner decided. It goes back to its approver: a draft routed to the owner still waits for him. Reopening starts a new revision, so earlier approvals no longer count.",
   parameters: ReopenDraftInput,
+  success: Schema.Struct({ draft: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionDraftSentTool = Tool.make("mission_draft_sent", {
+  description:
+    "After posting an approved draft's exact text, record it sent: you as its writer, or the mission's master. Pass link when the post has one (the comment or message URL). Refused unless the draft is approved; a sent draft is never sent again, so don't post it twice.",
+  parameters: RecordDraftSentInput,
+  success: Schema.Struct({ draft: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionDraftWithdrawTool = Tool.make("mission_draft_withdraw", {
+  description:
+    "As the mission's master, take back a draft still waiting on a decision, including one routed to the owner (no owner condition needed). It ends dropped; the note says why, the owner sees it and the writer hears it. mission_draft_reopen brings it back.",
+  parameters: WithdrawDraftInput,
   success: Schema.Struct({ draft: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
   failureMode: "return",
@@ -599,6 +621,8 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionDraftTool, "Submit a draft"),
   writeTool(MissionDraftApproveTool, "Decide a draft"),
   writeTool(MissionDraftReopenTool, "Reopen a draft"),
+  writeTool(MissionDraftSentTool, "Record a draft sent"),
+  writeTool(MissionDraftWithdrawTool, "Withdraw a draft"),
   writeTool(MissionDraftRouteTool, "Route one draft"),
   writeTool(MissionDraftAnnotateTool, "Annotate a draft"),
   writeTool(MissionDraftNoteTool, "Save, edit or turn off a draft note"),

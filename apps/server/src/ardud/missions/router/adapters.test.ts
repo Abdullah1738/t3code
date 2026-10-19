@@ -160,9 +160,9 @@ it.effect(
       const signals = yield* AsksSignals;
       const store = yield* RouterStore.RouterStore;
       const released = [{ kind: "work-item", id: WorkItemId.make("wi-held") }] as const;
-      yield* signals.askResolved({ ask: answered, askerThreadId: writerThread, released });
+      yield* signals.askResolved({ ask: answered, released });
       // A replay of the same resolution is the same message, not a second wake.
-      yield* signals.askResolved({ ask: answered, askerThreadId: writerThread, released });
+      yield* signals.askResolved({ ask: answered, released });
 
       const page = yield* store.roomMessages(controlRoomId(seededMission), null, 10);
       assert.strictEqual(page.messages.length, 1);
