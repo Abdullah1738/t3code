@@ -464,6 +464,11 @@ export interface RequestIdInput {
   readonly requestId: string;
 }
 
+/** Settle or reopen; a note is the owner's closing (or reopening) words to the master. */
+export interface RequestNoteInput extends RequestIdInput {
+  readonly note?: string | undefined;
+}
+
 /** One logged change to a mission's layout or sections, from its `view.*` events. */
 export interface MissionViewChange {
   readonly id: string;
@@ -641,8 +646,8 @@ export interface MissionsSource {
   /** Starts a request from the composer, or from Discuss with a subject. */
   openRequest(input: OpenRequestInput): Promise<OwnerRequest>;
   replyRequest(input: ReplyRequestInput): Promise<void>;
-  settleRequest(input: RequestIdInput): Promise<void>;
-  reopenRequest(input: RequestIdInput): Promise<void>;
+  settleRequest(input: RequestNoteInput): Promise<void>;
+  reopenRequest(input: RequestNoteInput): Promise<void>;
   /** The owner opened the request; clears its unread dot. */
   markRequestRead(input: RequestIdInput): Promise<void>;
 }

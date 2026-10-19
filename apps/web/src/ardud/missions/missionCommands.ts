@@ -170,12 +170,13 @@ export function replyRequest(requestId: string, text: string) {
   );
 }
 
-export function settleRequest(requestId: string) {
-  return runMissionAction(missionsSource.settleRequest({ requestId }), "Couldn't settle it");
+/** A non-empty note is the owner's closing words: the master wakes once with them. */
+export function settleRequest(requestId: string, note?: string) {
+  return runMissionAction(missionsSource.settleRequest({ requestId, note }), "Couldn't settle it");
 }
 
-export function reopenRequest(requestId: string) {
-  return runMissionAction(missionsSource.reopenRequest({ requestId }), "Couldn't reopen it");
+export function reopenRequest(requestId: string, note?: string) {
+  return runMissionAction(missionsSource.reopenRequest({ requestId, note }), "Couldn't reopen it");
 }
 
 /** Quiet: a failed read mark only leaves the unread dot on. */
