@@ -10,6 +10,7 @@ import {
   appearanceFontStack,
   cssFontFamilies,
   resolveDefaultFamilyLabel,
+  resolveDefaultSansLabel,
   resolveTerminalFontPreference,
   resolveTerminalFontSizePreference,
 } from "./appearanceFonts";
@@ -55,6 +56,14 @@ describe("resolveDefaultFamilyLabel", () => {
   it("skips generic keywords and returns null for a stack of only generics", () => {
     expect(resolveDefaultFamilyLabel("system-ui, sans-serif")).toBeNull();
     expect(resolveDefaultFamilyLabel("ui-monospace, monospace")).toBeNull();
+  });
+});
+
+describe("resolveDefaultSansLabel", () => {
+  it("names Instrument Sans while Desk owns the interface font", () => {
+    expect(resolveDefaultSansLabel("desk", "SF Pro")).toBe("Instrument Sans (Desk)");
+    expect(resolveDefaultSansLabel("ocean", "SF Pro")).toBe("SF Pro");
+    expect(resolveDefaultSansLabel(null, "SF Pro")).toBe("SF Pro");
   });
 });
 

@@ -890,12 +890,18 @@ export function ThemeLibrary({
 
   return (
     <div className="space-y-3">
-      <h3 className="px-3 text-sm font-normal text-foreground/70 sm:px-4">
+      <h3
+        data-settings-section-title="" // ardud missions: desk-theme
+        className="px-3 text-sm font-normal text-foreground/70 sm:px-4"
+      >
         {searchableSetting("color-scheme").title}
       </h3>
       {renderModeTiles()}
       <div className="flex min-h-8 flex-wrap items-center justify-between gap-3 px-3 pt-2 sm:px-4">
-        <h3 className="text-sm font-normal text-foreground/70">
+        <h3
+          data-settings-section-title="" // ardud missions: desk-theme
+          className="text-sm font-normal text-foreground/70"
+        >
           {searchableSetting("theme").title}
         </h3>
         <div className="flex flex-wrap items-center justify-end gap-2">

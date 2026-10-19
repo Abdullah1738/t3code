@@ -78,7 +78,8 @@ import {
   useTheme,
 } from "../../hooks/useTheme";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
-import { DEFAULT_THEME_ID } from "../../themePalette"; // ardud missions: desk-theme
+// ardud missions: desk-theme
+import { DEFAULT_THEME_ID, getThemeDefinition, resolveThemeHalf } from "../../themePalette";
 import {
   useScopedSettings,
   useScopedSettingsMixed,
@@ -123,6 +124,7 @@ import {
   isFontFamilyAvailable,
   isMonospaceFamily,
   resolveDefaultFamilyLabel,
+  resolveDefaultSansLabel, // ardud missions: desk-theme
   resolveTerminalFontPreference,
   resolveTerminalFontSizePreference,
   TYPOGRAPHY_ADVANCED_STORAGE_KEY,
@@ -1530,15 +1532,23 @@ export function AppearanceSettingsPanel() {
 
 function useFontDefaultFamilies() {
   const settings = useScopedSettings();
+  // ardud missions: desk-theme
+  const { theme, themeHalves, resolvedTheme } = useTheme();
+  const activeThemeId =
+    getThemeDefinition(resolveThemeHalf(theme, themeHalves, resolvedTheme))?.id ?? null;
+  // end ardud missions: desk-theme
   // An unset preference shows the font it resolves to on this machine; the
   // default stacks are the platform's own faces, so the name is probed, not
   // hardcoded.
   const defaults = useMemo(
     () => ({
-      sans: resolveDefaultFamilyLabel(DEFAULT_SANS_FONT_STACK) ?? "System default",
+      sans: resolveDefaultSansLabel(
+        activeThemeId,
+        resolveDefaultFamilyLabel(DEFAULT_SANS_FONT_STACK) ?? "System default",
+      ), // ardud missions: desk-theme
       code: resolveDefaultFamilyLabel(DEFAULT_CODE_FONT_STACK) ?? "System monospace",
     }),
-    [],
+    [activeThemeId],
   );
   return {
     sans: defaults.sans,
@@ -2130,7 +2140,10 @@ function LegacyFeaturesSection() {
     <section id="legacy-features" ref={targetRef} tabIndex={-1} className="space-y-2.5">
       <Collapsible open={open} onOpenChange={setOpen}>
         <CollapsibleTrigger className="group flex min-h-8 w-full items-center gap-2 px-3 sm:px-4">
-          <h2 className="text-sm font-normal text-foreground/70 transition-colors group-hover:text-foreground">
+          <h2
+            data-settings-section-title="" // ardud missions: desk-theme
+            className="text-sm font-normal text-foreground/70 transition-colors group-hover:text-foreground"
+          >
             Legacy features
           </h2>
           <ChevronRightIcon className="size-4 text-muted-foreground transition-transform duration-200 group-data-panel-open:rotate-90" />

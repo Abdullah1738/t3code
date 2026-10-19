@@ -105,7 +105,8 @@ export function WorkLogButton({
 }: RowContent & Omit<ComponentProps<"button">, "className" | "style" | "children">) {
   const className = useRowClassName(true);
   return (
-    <button {...buttonProps} type="button" className={className}>
+    // ardud missions: desk-theme (data-work-log-row)
+    <button {...buttonProps} type="button" data-work-log-row="" className={className}>
       <WorkLogLine icon={icon} label={label} trailing={trailing} wrapLabel={wrapLabel} />
     </button>
   );
@@ -122,7 +123,8 @@ export function WorkLogRow({
 }: RowContent & Omit<ComponentProps<"div">, "className" | "style">) {
   const className = useRowClassName(rowProps.onClick !== undefined);
   return (
-    <div {...rowProps} className={className}>
+    // ardud missions: desk-theme (data-work-log-row)
+    <div {...rowProps} data-work-log-row="" className={className}>
       <WorkLogLine icon={icon} label={label} trailing={trailing} wrapLabel={wrapLabel} />
       {children}
     </div>

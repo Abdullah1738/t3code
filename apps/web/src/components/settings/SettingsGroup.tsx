@@ -15,6 +15,7 @@ export function SettingsGroup({
   return (
     <div
       {...props}
+      data-settings-group={variant} // ardud missions: desk-theme
       className={cn(
         "relative overflow-visible text-foreground",
         variant === "grouped"

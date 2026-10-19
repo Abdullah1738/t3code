@@ -1,5 +1,16 @@
 @import "tailwindcss";
 
+/* ardud missions: desk-theme */
+/* Instrument Sans (OFL 1.1, see ./assets/fonts/OFL.txt), self-hosted for the Desk theme. */
+@font-face {
+  font-family: "Instrument Sans";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("./assets/fonts/InstrumentSans.woff2") format("woff2");
+}
+/* end ardud missions: desk-theme */
+
 @custom-variant dark (&:is(.dark, .dark *));
 @custom-variant light (&:not(.dark, .dark *));
 /* Window Controls Overlay: active when Electron exposes native titlebar control geometry. */
@@ -99,6 +110,11 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
    * tooltip, and toolbar controls cannot quietly drift apart.
    */
   --control-radius: 0.5rem;
+  /* ardud missions: desk-theme */
+  --button-radius: var(--control-radius);
+  --sidebar-row-height: 2.25rem;
+  --sidebar-row-radius: calc(var(--radius) - 2px);
+  /* end ardud missions: desk-theme */
   --sidebar-content-inset: 0.5rem;
   --sidebar-control-gap: 0.5rem;
   --sidebar-icon-color: color-mix(
@@ -278,7 +294,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
-  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-2xl: var(--panel-radius, calc(var(--radius) + 8px)); /* ardud missions: desk-theme */
   --radius-3xl: calc(var(--radius) + 12px);
   @keyframes skeleton {
     /* The single loading-bar breath used by every skeleton: one opacity pulse
@@ -2367,3 +2383,118 @@ code {
     }
   }
 }
+
+/* ardud missions: desk-theme */
+/* Desk: the theme owns its type, shape and opacity until the user picks their
+   own (an Interface font or glass opacity written inline on <html> wins). */
+:root[data-theme-id="desk"] {
+  --font-sans:
+    "Instrument Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --button-radius: 9999px;
+  --panel-radius: 22px;
+  --sidebar-row-height: 2rem;
+  --sidebar-row-radius: var(--radius);
+  --surface-grain: none;
+}
+
+:root[data-theme-id="desk"]:not([style*="--glass-opacity"]) {
+  --glass-opacity: 100%;
+  --glass-blur: 0px;
+}
+
+/* Panels sit on the ground as a tone step: no edge lines at rest. */
+html[data-theme-id="desk"] [data-app-sidebar] {
+  border-color: transparent;
+
+  @variant dark {
+    border-color: transparent;
+  }
+}
+
+html[data-theme-id="desk"] [data-sidebar-search] {
+  border-radius: var(--button-radius);
+  background-color: var(--sidebar-control-surface);
+
+  &:hover,
+  &:focus-within {
+    background-color: var(--sidebar-row-active);
+  }
+}
+
+html[data-theme-id="desk"] [data-thread-title] {
+  font-weight: 400;
+}
+
+html[data-theme-id="desk"] [aria-current="page"] [data-thread-title] {
+  font-weight: 500;
+}
+
+html[data-theme-id="desk"] [data-unread] [data-thread-title] {
+  font-weight: 600;
+}
+
+html[data-theme-id="desk"] [data-chat-header] {
+  box-shadow: inset 0 -1px var(--border);
+}
+
+html[data-theme-id="desk"] [data-message-role="assistant"] .chat-markdown {
+  color: var(--foreground);
+}
+
+html[data-theme-id="desk"] [data-tool-group-scroll] [data-work-log-row] {
+  border-radius: 0;
+  box-shadow: inset 0 1px var(--border);
+}
+
+html[data-theme-id="desk"] [data-slot="composer-shell"] {
+  --chat-composer-outline: transparent;
+
+  &:focus-within {
+    --chat-composer-outline: var(--input);
+  }
+}
+
+html[data-theme-id="desk"] [data-slot="composer-host"] {
+  box-shadow: none;
+}
+
+html[data-theme-id="desk"] [data-settings-group="grouped"] {
+  border-color: transparent;
+  border-radius: var(--panel-radius);
+  background-color: var(--card);
+  box-shadow: none;
+}
+
+html[data-theme-id="desk"] [data-settings-section-title] {
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+html[data-theme-id="desk"] [data-slot="badge"] {
+  border-radius: var(--button-radius);
+}
+
+/* Floating surfaces keep their shadow, on the raised tone. */
+html[data-theme-id="desk"] .dialog-glass {
+  background: color-mix(in srgb, var(--popover) var(--glass-opacity), transparent);
+}
+
+html[data-theme-id="desk"] :is(.dropdown-glass, [data-slot$="-popup"]).rounded-lg {
+  border-radius: 14px;
+
+  &::before {
+    border-radius: 13px;
+  }
+}
+
+html[data-theme-id="desk"]
+  :is(
+    [data-slot="menu-item"],
+    [data-slot="menu-checkbox-item"],
+    [data-slot="menu-radio-item"],
+    [data-slot="select-item"],
+    [data-slot="combobox-item"]
+  ) {
+  border-radius: var(--radius);
+}
+/* end ardud missions: desk-theme */
