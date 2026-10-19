@@ -9,6 +9,7 @@ import {
   isBlocked,
   openDependencies,
   workEdges,
+  workFacts,
   workFactsLine,
   workPipeline,
 } from "./workViewModel.ts";
@@ -78,5 +79,7 @@ describe("blocked work", () => {
     const byId = byIdOf(fixtureItems());
     expect(workFactsLine(byId.get("CRP-13298")!)).toMatch(/^merged /);
     expect(workFactsLine(byId.get("CRP-13361")!)).toBeNull();
+    expect(workFacts(byId.get("CRP-13298")!)[0]).toMatch(/^merged /);
+    expect(workFacts(byId.get("CRP-13361")!)).toEqual([]);
   });
 });

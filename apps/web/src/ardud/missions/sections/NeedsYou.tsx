@@ -23,7 +23,7 @@ import { Button } from "../../../components/ui/button";
 import { Skeleton } from "../../../components/ui/skeleton";
 import { CardList, CardListItem } from "../cards/CardFrame";
 import { AgeElement, ByMarker, YouGlyph } from "../cards/chips";
-import { InboxEntryCard, type EntryCardDeps } from "../InboxCards";
+import { entryCardState, InboxEntryCard, type EntryCardDeps } from "../InboxCards";
 import { changeSection } from "../missionCommands";
 import { useDraftNotes, useMasterRoleId, useMissionForks, useMissionList } from "../missionsStore";
 import { inboxActions } from "../useInboxScreen";
@@ -63,7 +63,7 @@ function EntryCardList(props: {
           <CardListItem key={entry.key}>
             <InboxEntryCard
               entry={entry}
-              ui={cards.ui}
+              {...entryCardState(cards.ui, entry.key)}
               dispatch={cards.dispatch}
               deps={cards.deps}
             />

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Link } from "@tanstack/react-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { ArrowLeftIcon, SendIcon } from "lucide-react";
 
 import type { MissionId } from "@t3tools/contracts";
@@ -26,6 +26,7 @@ import {
   replyRequest,
   settleRequest,
 } from "../missionCommands";
+import { isSampleFeed } from "../missionsStore";
 import { SectionCount, SectionShell } from "./SectionShell";
 
 // What the owner asked or told the master: a composer, one row per request,
@@ -36,21 +37,18 @@ export function YourRequestsSection(props: {
   layout: MissionLayout;
   section: SectionEntry;
   requests: ReadonlyArray<OwnerRequest> | undefined;
-  /** Request opened from the URL (pinned strip, sidebar). */
+  /** The open request, from the URL's `request` param. */
   openId: string | null;
   sample: boolean;
   nowMs: number;
 }) {
-  // The URL's request wins whenever it changes; a row click overrides it until then.
-  const [picked, setPicked] = useState({ fromUrl: props.openId, id: props.openId });
-  const openId = picked.fromUrl === props.openId ? picked.id : props.openId;
-  const setOpenId = (id: string | null) => setPicked({ fromUrl: props.openId, id });
+  const setOpenId = useRequestOpener(props.missionId);
   const groups = useMemo(() => groupRequests(props.requests ?? []), [props.requests]);
   const unread = useMemo(
     () => (props.requests ?? []).filter(isRequestUnread).length,
     [props.requests],
   );
-  const open = props.requests?.find((request) => request.id === openId) ?? null;
+  const open = props.requests?.find((request) => request.id === props.openId) ?? null;
   return (
     <SectionShell
       missionId={props.missionId}
@@ -60,7 +58,12 @@ export function YourRequestsSection(props: {
       meta={<SectionCount count={unread} tone="update" label={`${unread} answered, unread`} />}
     >
       {open ? (
-        <RequestThread request={open} nowMs={props.nowMs} onBack={() => setOpenId(null)} />
+        <RequestThread
+          key={open.id}
+          request={open}
+          nowMs={props.nowMs}
+          onBack={() => setOpenId(null)}
+        />
       ) : (
         <>
           <RequestComposer missionId={props.missionId} onOpened={setOpenId} />
@@ -87,14 +90,40 @@ export function YourRequestsSection(props: {
   );
 }
 
+/**
+ * Opens a request by putting it in the URL, so every request link (sidebar,
+ * header, pinned strip) and the section's own rows share one open state.
+ */
+export function useRequestOpener(missionId: MissionId) {
+  const navigate = useNavigate();
+  return useCallback(
+    (requestId: string | null) => {
+      void navigate({
+        to: "/missions/$missionId",
+        params: { missionId },
+        // Keeps the highlighted sub-mission; the request param lives on the board only.
+        search: (prev) => {
+          const { request: _closed, tab: _tab, ...rest } = prev;
+          return requestId ? { ...rest, request: requestId } : rest;
+        },
+        resetScroll: false,
+      });
+    },
+    [missionId, navigate],
+  );
+}
+
 function RequestComposer(props: { missionId: MissionId; onOpened: (id: string) => void }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const send = async () => {
     setBusy(true);
-    const sent = await openRequest(props.missionId, text);
+    const created = await openRequest(props.missionId, text);
     setBusy(false);
-    if (sent) setText("");
+    if (created) {
+      setText("");
+      props.onOpened(created.id);
+    }
   };
   return (
     <form
@@ -199,12 +228,25 @@ function SettledFold(props: {
 }
 
 /** The request's conversation with Reply and Settle (Reopen once settled). */
-function RequestThread(props: { request: OwnerRequest; nowMs: number; onBack: () => void }) {
+export function RequestThread(props: {
+  request: OwnerRequest;
+  nowMs: number;
+  onBack: () => void;
+  /** `h2` when the thread stands alone on the board. */
+  heading?: "h2" | "h3";
+}) {
   const { request } = props;
+  const Heading = props.heading ?? "h3";
   const unread = isRequestUnread(request);
   useEffect(() => {
     if (unread) markRequestRead(request.id);
   }, [unread, request.id]);
+  // Request links (sidebar, header) can open a thread below the fold on phones.
+  // Keyed by request id at every call site, so this runs once per opened thread.
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    root.current?.scrollIntoView({ block: "nearest" });
+  }, []);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const settled = request.status === "settled";
@@ -215,7 +257,7 @@ function RequestThread(props: { request: OwnerRequest; nowMs: number; onBack: ()
     if (sent && clear) setText("");
   };
   return (
-    <div className="flex min-w-0 flex-col gap-3">
+    <div ref={root} className="flex min-w-0 scroll-mt-4 flex-col gap-3">
       <div className="flex min-w-0 items-center gap-2">
         <Button
           size="icon-xs"
@@ -225,7 +267,7 @@ function RequestThread(props: { request: OwnerRequest; nowMs: number; onBack: ()
         >
           <ArrowLeftIcon aria-hidden />
         </Button>
-        <h3 className="min-w-0 truncate text-sm font-semibold">{request.title}</h3>
+        <Heading className="min-w-0 truncate text-sm font-semibold">{request.title}</Heading>
         <span className="ms-auto inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
           <StateGlyph kind={STATUS_GLYPH[request.status]} />
           {REQUEST_STATUS_LABEL[request.status]}
@@ -305,14 +347,24 @@ function RequestMessage(props: { message: OwnerRequestMessage; nowMs: number }) 
   );
 }
 
-/** Answered requests the owner has not opened, for the header and sidebar counts. */
+/**
+ * Answered requests the owner has not opened. Sample requests are never live
+ * news, so they stay out of the counts.
+ */
+export function unreadRequests(requests: ReadonlyArray<OwnerRequest> | undefined) {
+  if (!requests || isSampleFeed("requests")) return [];
+  return requests.filter(isRequestUnread);
+}
+
+/** Answered requests the owner has not opened, for the header count. */
 export function RequestsUnreadLink(props: {
   missionId: MissionId;
   requests: ReadonlyArray<OwnerRequest> | undefined;
 }) {
-  const first = props.requests?.find(isRequestUnread) ?? null;
-  const count = props.requests?.filter(isRequestUnread).length ?? 0;
-  if (!first || count === 0) return null;
+  const unread = unreadRequests(props.requests);
+  const first = unread[0];
+  const count = unread.length;
+  if (!first) return null;
   return (
     <Link
       to="/missions/$missionId"

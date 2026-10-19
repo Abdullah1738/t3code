@@ -43,7 +43,7 @@ export function parseMissionSearch(raw: Record<string, unknown>): MissionSearch 
   const tab = MISSION_TABS.find((candidate) => candidate === raw.tab);
   const sub = nonEmpty(raw.sub);
   const room = tab === "rooms" ? nonEmpty(raw.room) : undefined;
-  const request = tab === undefined ? nonEmpty(raw.request) : undefined;
+  const request = tab === undefined || tab === "overview" ? nonEmpty(raw.request) : undefined;
   return {
     ...(tab !== undefined && tab !== "overview" ? { tab } : {}),
     ...(sub !== undefined ? { sub } : {}),

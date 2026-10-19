@@ -8,7 +8,6 @@ import {
   formatCountdown,
   formatDayLabel,
   formatPercent,
-  isRequestUnread,
   laneTotal,
   nextMilestone,
   poolUsageView,
@@ -33,7 +32,7 @@ import { GlyphCount, HealthStatus } from "./cards/chips";
 import { setMissionFocus, toggleMissionPaused } from "./missionCommands";
 import { AskTheMissionForm, MissionForksList } from "./MissionForksList";
 import { useMissionForks, useMissionList, useOwnerRequests } from "./missionsStore";
-import { RequestsUnreadLink } from "./sections/YourRequests";
+import { RequestsUnreadLink, unreadRequests } from "./sections/YourRequests";
 
 /** Title, the owner's controls, goal, focus and the mission's headline numbers. */
 export function MissionHead(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
@@ -266,7 +265,7 @@ function NeedsYouStat(props: { missionId: MissionId }) {
   const list = useMissionList();
   const requests = useOwnerRequests(props.missionId);
   const count = list?.missions.find((mission) => mission.id === props.missionId)?.needsYou ?? 0;
-  const answered = requests?.some(isRequestUnread) ?? false;
+  const answered = unreadRequests(requests).length > 0;
   if (count === 0 && !answered) return null;
   return (
     <Stat term="Needs you">

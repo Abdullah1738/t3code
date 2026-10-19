@@ -58,10 +58,9 @@ export function useInboxScreen(
 ) {
   const inbox = useMissionInbox(missionId);
   const list = useMissionList();
-  const groups = useMemo(
-    () => groupEntriesByMission(inbox ? inboxEntries(inbox, tab, route) : [], list),
-    [inbox, tab, route, list],
-  );
+  // Entries keep their identity across mission-list updates, so memoized cards hold.
+  const listed = useMemo(() => (inbox ? inboxEntries(inbox, tab, route) : []), [inbox, tab, route]);
+  const groups = useMemo(() => groupEntriesByMission(listed, list), [listed, list]);
   // Visual order, so j/k walks the list the way it reads.
   const entries = useMemo(() => groups.flatMap((group) => group.entries), [groups]);
   const [ui, dispatch] = useReducer(inboxUiReducer, INITIAL_INBOX_UI);

@@ -10,7 +10,6 @@ import {
   formatDayLabel,
   formatRelative,
   isDraftFeedItem,
-  isRequestUnread,
   openForkFor,
   orderBlockerGroups,
   ownerWaitingEntries,
@@ -44,7 +43,12 @@ import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { PriorityStack } from "./PriorityStack";
 import { NeedsYouSection, PinnedStrip, WithTheMasterSection } from "./sections/NeedsYou";
 import { FoldButton, SectionCount, SectionShell } from "./sections/SectionShell";
-import { YourRequestsSection } from "./sections/YourRequests";
+import {
+  RequestThread,
+  unreadRequests,
+  useRequestOpener,
+  YourRequestsSection,
+} from "./sections/YourRequests";
 
 /**
  * The mission board: sections from the mission's layout, main column and side
@@ -63,10 +67,21 @@ export function MissionOverviewTab(props: {
   const inbox = useMissionInbox(missionId);
   const requests = useOwnerRequests(missionId);
   const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox).length : 0), [inbox]);
-  const unreadRequests = useMemo(() => (requests ?? []).filter(isRequestUnread), [requests]);
+  const unread = useMemo(() => unreadRequests(requests), [requests]);
   const pins = layout
-    ? pinnedStrip(layout, { ownerWaiting: waiting, requestsUnread: unreadRequests.length })
+    ? pinnedStrip(layout, { ownerWaiting: waiting, requestsUnread: unread.length })
     : { needsYou: false, requests: false };
+  const mainSections = layout ? visibleSections(layout, "main") : [];
+  const railSections = layout ? visibleSections(layout, "rail") : [];
+  // A request opened from a link still opens when its section is hidden.
+  const requestsShown = [...mainSections, ...railSections].some(
+    (section) => section.kind === "your-requests",
+  );
+  const looseRequest =
+    layout && !requestsShown
+      ? (requests?.find((request) => request.id === props.openRequestId) ?? null)
+      : null;
+  const openRequest = useRequestOpener(missionId);
 
   const context: SectionContext = {
     overview,
@@ -95,27 +110,29 @@ export function MissionOverviewTab(props: {
           missionId={missionId}
           layout={layout}
           kind="your-requests"
-          requests={unreadRequests}
+          requests={unread}
           nowMs={nowMs}
         />
       ) : null}
+      {looseRequest ? (
+        <section aria-label="Your request" className="flex max-w-160 min-w-0 flex-col">
+          <RequestThread
+            key={looseRequest.id}
+            request={looseRequest}
+            nowMs={nowMs}
+            onBack={() => openRequest(null)}
+            heading="h2"
+          />
+        </section>
+      ) : null}
       {layout ? (
+        // The side column comes first on narrow screens, so it does in the DOM too.
         <div className="grid min-w-0 gap-x-10 gap-y-11 lg:grid-cols-[minmax(0,1fr)_340px]">
-          <div className="order-2 flex min-w-0 flex-col gap-11 lg:order-1">
-            {visibleSections(layout, "main").map((section) => (
-              <OverviewSection
-                key={section.key}
-                layout={layout}
-                section={section}
-                context={context}
-              />
-            ))}
-          </div>
           <aside
             aria-label="Side column"
-            className="order-1 grid min-w-0 grid-cols-[repeat(auto-fit,minmax(300px,1fr))] content-start gap-x-10 gap-y-11 lg:order-2 lg:grid-cols-1"
+            className="grid min-w-0 grid-cols-[repeat(auto-fit,minmax(300px,1fr))] content-start gap-x-10 gap-y-11 lg:col-start-2 lg:row-start-1 lg:grid-cols-1"
           >
-            {visibleSections(layout, "rail").map((section) => (
+            {railSections.map((section) => (
               <OverviewSection
                 key={section.key}
                 layout={layout}
@@ -124,6 +141,16 @@ export function MissionOverviewTab(props: {
               />
             ))}
           </aside>
+          <div className="flex min-w-0 flex-col gap-11 lg:col-start-1 lg:row-start-1">
+            {mainSections.map((section) => (
+              <OverviewSection
+                key={section.key}
+                layout={layout}
+                section={section}
+                context={context}
+              />
+            ))}
+          </div>
         </div>
       ) : (
         <div aria-hidden className="flex flex-col gap-3">

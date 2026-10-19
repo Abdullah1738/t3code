@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 
 import {
   approverOf,
@@ -646,12 +646,7 @@ export function SuggestionCard(
         ]}
       />
       {mode === "dismiss" ? (
-        <ReasonField
-          label="Why dismiss"
-          placeholder="Why not? The author learns from this."
-          value={reason}
-          onChange={setReason}
-        />
+        <ReasonField label="Why dismiss" placeholder="Reason" value={reason} onChange={setReason} />
       ) : null}
     </CardFrame>
   );
@@ -710,22 +705,32 @@ export interface EntryCardDeps {
   readonly size?: CardFrameProps["size"];
 }
 
+/** One entry's slice of the inbox UI state, so a card only re-renders when its own state changes. */
+export function entryCardState(ui: InboxUiState, key: string) {
+  return {
+    selected: ui.selectedKey === key,
+    editing: ui.editingKey === key,
+    picked: ui.picked[key] ?? null,
+  };
+}
+
 /** Renders an inbox entry with its card, wired to a selection/edit/pick reducer. */
-export function InboxEntryCard(props: {
+export const InboxEntryCard = memo(function InboxEntryCard(props: {
   entry: InboxEntry;
-  ui: InboxUiState;
+  selected: boolean;
+  editing: boolean;
+  picked: string | null;
   dispatch: (event: InboxUiEvent) => void;
   deps: EntryCardDeps;
 }) {
-  const { entry, ui, dispatch, deps } = props;
+  const { entry, editing, dispatch, deps } = props;
   const context: CardContext = {
-    selected: ui.selectedKey === entry.key,
+    selected: props.selected,
     onSelect: () => dispatch({ type: "select", key: entry.key }),
     nowMs: deps.nowMs,
     list: deps.list,
     ...(deps.size ? { size: deps.size } : {}),
   };
-  const editing = ui.editingKey === entry.key;
   const onEdit = (open: boolean) => dispatch({ type: "edit", key: open ? entry.key : null });
   switch (entry.kind) {
     case "ask":
@@ -733,7 +738,7 @@ export function InboxEntryCard(props: {
         <AskCard
           {...context}
           ask={entry.record}
-          picked={ui.picked[entry.key] ?? null}
+          picked={props.picked}
           onPick={(optionId) => dispatch({ type: "pick", key: entry.key, optionId })}
           forks={deps.forks}
           masterRoleId={deps.masterRoleId}
@@ -783,4 +788,4 @@ export function InboxEntryCard(props: {
     case "note":
       return <NoteCard {...context} note={entry.record} actions={deps.actions} />;
   }
-}
+});

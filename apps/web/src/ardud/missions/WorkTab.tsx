@@ -5,7 +5,7 @@ import {
   blockedWork,
   formatRelative,
   workEdges,
-  workFactsLine,
+  workFacts,
   workPipeline,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -72,7 +72,7 @@ export function WorkTab(props: { missionId: WorkItem["missionId"]; nowMs: number
                           item.pullRequest
                             ? `${item.pullRequest.repository}#${item.pullRequest.number}`
                             : null,
-                          workFactsLine(item),
+                          ...workFacts(item),
                           `Updated ${formatRelative(item.updatedAt, props.nowMs)}`,
                         ]}
                       />

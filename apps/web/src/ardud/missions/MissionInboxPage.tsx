@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useRef } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { ChevronLeftIcon, ListFilterIcon } from "lucide-react";
 
@@ -45,7 +46,7 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { AgeElement, CountBadge, HealthGlyph, needsYouLabel } from "./cards/chips";
 import { DraftNotesPanel } from "./DraftNotesPanel";
-import { ClosedApprovalRow, InboxEntryCard } from "./InboxCards";
+import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
 import { MissionForksList } from "./MissionForksList";
 import { MissionSection } from "./MissionSection";
 import { RoutingPanel } from "./RoutingPanel";
@@ -69,6 +70,9 @@ const TWO_COLUMNS_QUERY = "(min-width: 1100px)";
 const ACTION_TABS: ReadonlySet<InboxTab> = new Set(["decide", "approve", "knocks"]);
 
 type InboxScreen = ReturnType<typeof useInboxScreen>;
+
+/** Stable empty list, so memoized cards don't re-render while a feed loads. */
+const NONE: ReadonlyArray<never> = [];
 
 /**
  * The owner inbox: a list of what waits, grouped by mission, and a reading
@@ -301,22 +305,26 @@ function InboxBody(props: {
 }) {
   const { screen, nowMs } = props;
   const masterRoleId = useMasterRoleId(props.missionId);
-  const forks = useMissionForks(props.missionId) ?? [];
-  const draftNotes = useDraftNotes(props.missionId) ?? [];
+  const forks = useMissionForks(props.missionId) ?? NONE;
+  const draftNotes = useDraftNotes(props.missionId) ?? NONE;
   const allStats = useSuggestionStats();
   const missionList = useMissionList();
   // Sample track records would misstate a live author, so they stay hidden.
-  const stats = isSampleFeed("suggestion-stats") ? null : (allStats ?? []);
-  const deps = {
-    forks,
-    draftNotes,
-    stats,
-    list: missionList,
-    masterRoleId,
-    nowMs,
-    actions: inboxActions(screen.dispatch),
-    size: "pane" as const,
-  };
+  const stats = isSampleFeed("suggestion-stats") ? null : (allStats ?? NONE);
+  const actions = useMemo(() => inboxActions(screen.dispatch), [screen.dispatch]);
+  const deps = useMemo(
+    () => ({
+      forks,
+      draftNotes,
+      stats,
+      list: missionList,
+      masterRoleId,
+      nowMs,
+      actions,
+      size: "pane" as const,
+    }),
+    [forks, draftNotes, stats, missionList, masterRoleId, nowMs, actions],
+  );
   const selected = screen.selected;
   const openForks = splitForks(forks).open.length;
 
@@ -337,18 +345,24 @@ function InboxBody(props: {
         onOpen={(key) => screen.dispatch({ type: "select", key })}
       />
     );
-  const card = selected ? (
-    <InboxEntryCard
-      key={selected.key}
-      entry={selected}
-      ui={screen.ui}
-      dispatch={screen.dispatch}
-      deps={deps}
-    />
-  ) : null;
+  // Every card stays mounted and only the selected one shows, so a half-typed
+  // answer survives switching items (not resizing across the breakpoint, which
+  // swaps layouts). Cards are memoized on their own state.
+  const cards = screen.entries.map((entry) => (
+    <div key={entry.key} hidden={entry.key !== selected?.key}>
+      <InboxEntryCard
+        entry={entry}
+        {...entryCardState(screen.ui, entry.key)}
+        dispatch={screen.dispatch}
+        deps={deps}
+      />
+    </div>
+  ));
   const extras = (
     <InboxExtras missionId={props.missionId} tab={props.tab} nowMs={nowMs} openForks={openForks} />
   );
+  const entryKeys = useMemo(() => screen.entries.map((entry) => entry.key), [screen.entries]);
+  const paneRef = usePaneFocus(selected?.key ?? null, props.wide, entryKeys);
 
   if (props.wide) {
     return (
@@ -359,10 +373,15 @@ function InboxBody(props: {
             <div className="pt-5 pb-12">{listView}</div>
           </ScrollArea>
         </div>
-        <section aria-label="Reading pane" className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <section
+          ref={paneRef}
+          tabIndex={-1}
+          aria-label="Reading pane"
+          className="flex min-h-0 min-w-0 flex-1 flex-col outline-none"
+        >
           <ScrollArea className="min-h-0 flex-1">
             <div className="flex max-w-160 flex-col gap-8 pt-5 pb-12">
-              {card}
+              {cards}
               {extras}
             </div>
           </ScrollArea>
@@ -373,29 +392,69 @@ function InboxBody(props: {
   return (
     <ScrollArea className="min-h-0 flex-1">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-5 pt-5 pb-12 sm:px-6">
-        {selected ? (
-          <section aria-label="Reading pane" className="flex max-w-160 flex-col gap-3">
-            <div className="-ms-2">
-              <Button
-                variant="ghost-muted"
-                size="sm"
-                onClick={() => screen.dispatch({ type: "select", key: null })}
-              >
-                <ChevronLeftIcon aria-hidden />
-                Inbox
-              </Button>
-            </div>
-            {card}
-          </section>
-        ) : (
-          <>
-            <div className="-mx-3">{listView}</div>
-            {extras}
-          </>
-        )}
+        <section
+          ref={paneRef}
+          tabIndex={-1}
+          aria-label="Reading pane"
+          hidden={selected === null}
+          className="flex max-w-160 flex-col gap-3 outline-none"
+        >
+          <div className="-ms-2">
+            <Button
+              variant="ghost-muted"
+              size="sm"
+              onClick={() => screen.dispatch({ type: "select", key: null })}
+            >
+              <ChevronLeftIcon aria-hidden />
+              Inbox
+            </Button>
+          </div>
+          {cards}
+        </section>
+        <div hidden={selected !== null} className="flex flex-col gap-8">
+          <div className="-mx-3">{listView}</div>
+          {extras}
+        </div>
       </div>
     </ScrollArea>
   );
+}
+
+const SCROLL_VIEWPORT = '[data-slot="scroll-area-viewport"]';
+
+/**
+ * A newly opened item starts at the top of the pane. In one column, opening
+ * moves focus into the pane and Back returns it to the item's row.
+ */
+function usePaneFocus(selectedKey: string | null, wide: boolean, entryKeys: ReadonlyArray<string>) {
+  const paneRef = useRef<HTMLElement>(null);
+  const shown = useRef({ key: selectedKey, wide });
+  useEffect(() => {
+    const previous = shown.current;
+    if (previous.key === selectedKey && previous.wide === wide) return;
+    shown.current = { key: selectedKey, wide };
+    // Crossing the breakpoint changes the implicit selection; nothing to move.
+    if (previous.wide !== wide) return;
+    const pane = paneRef.current;
+    if (selectedKey) {
+      // Wide: the pane owns its scroll area. One column: the page scrolls.
+      const viewport = wide ? pane?.querySelector(SCROLL_VIEWPORT) : pane?.closest(SCROLL_VIEWPORT);
+      viewport?.scrollTo({ top: 0 });
+      // Opening from the list, or a decided card unmounting with focus inside it.
+      const decided = previous.key !== null && !entryKeys.includes(previous.key);
+      const focusLost = document.activeElement === null || document.activeElement === document.body;
+      if ((!wide && previous.key === null) || (decided && focusLost)) {
+        pane?.focus({ preventScroll: true });
+      }
+      return;
+    }
+    if (!wide && previous.key) {
+      const row = document.getElementById(inboxItemDomId(previous.key));
+      row?.focus({ preventScroll: true });
+      row?.scrollIntoView({ block: "nearest" });
+    }
+  }, [selectedKey, wide, entryKeys]);
+  return paneRef;
 }
 
 /** One list per mission; the mission header only shows when there are several. */

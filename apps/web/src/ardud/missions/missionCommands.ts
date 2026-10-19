@@ -8,6 +8,7 @@ import {
   parseShareInput,
   replyRequestInput,
   type DraftNoteScopeChoice,
+  type OwnerRequest,
   type SectionChange,
   type SectionEntry,
 } from "@t3tools/client-runtime/ardud/missions";
@@ -133,12 +134,17 @@ export function askSectionChange(missionId: MissionId, section: SectionEntry, te
 
 // --- Your requests ---
 
-export function openRequest(missionId: MissionId, text: string) {
-  return submitMissionInput(
+/** Resolves to the new request, or null when it couldn't be sent. */
+export async function openRequest(missionId: MissionId, text: string) {
+  const created: { request: OwnerRequest | null } = { request: null };
+  const sent = await submitMissionInput(
     openRequestInput(missionId, text),
-    (input) => missionsSource.openRequest(input),
+    async (input) => {
+      created.request = await missionsSource.openRequest(input);
+    },
     "Couldn't send it to the master",
   );
+  return sent ? created.request : null;
 }
 
 export function replyRequest(requestId: string, text: string) {

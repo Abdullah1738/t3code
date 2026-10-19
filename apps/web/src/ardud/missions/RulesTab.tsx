@@ -125,7 +125,7 @@ function RuleItem(props: { row: RuleRow; context: RuleContext }) {
       <MutedLines
         lines={[
           rule.masterReading ? `Master's reading: ${rule.masterReading}` : null,
-          `Scope: ${row.scope}`,
+          ...(row.scopeParts.length > 0 ? row.scopeParts : ["Whole mission"]),
           `Activation: ${row.activation}`,
           row.acks.line
             ? `${row.acks.line}${row.acks.missing.length > 0 ? `; waiting on ${row.acks.missing.join(", ")}` : ""}`

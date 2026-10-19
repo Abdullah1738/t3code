@@ -87,7 +87,13 @@ export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; n
                       <span className="text-xs text-muted-foreground">
                         <MetaRow>
                           <span>{ROOM_KIND_LABEL[room.kind]}</span>
-                          {noise ? <span>{noise.line}</span> : null}
+                          {noise ? (
+                            <>
+                              <span className="tabular-nums">{noise.rate}</span>
+                              <span>{noise.actionable}</span>
+                              <span>{noise.wastedWakes}</span>
+                            </>
+                          ) : null}
                         </MetaRow>
                       </span>
                     </Link>
@@ -132,7 +138,13 @@ function OpenRoom(props: {
         <MetaRow>
           <span>{ROOM_KIND_LABEL[page.room.kind]}</span>
           <span>{`${screen.members.length} members, ${waking} wake on posts`}</span>
-          {noise ? <span>{noise.line}</span> : null}
+          {noise ? (
+            <>
+              <span className="tabular-nums">{noise.rate}</span>
+              <span>{noise.actionable}</span>
+              <span>{noise.wastedWakes}</span>
+            </>
+          ) : null}
         </MetaRow>
       }
     >
@@ -382,11 +394,7 @@ function RoomComposer(props: { screen: RoomScreen }) {
       <Textarea
         size="sm"
         aria-label="Message"
-        placeholder={
-          target.kind === "correction"
-            ? "Correct the master. It arrives as your instruction."
-            : "Message the room…"
-        }
+        placeholder={target.kind === "correction" ? "Correction" : "Message the room…"}
         value={text}
         onChange={(event) => screen.dispatch({ type: "text", text: event.target.value })}
       />

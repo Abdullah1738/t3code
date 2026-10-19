@@ -1,13 +1,9 @@
 import type { MissionLink, MissionRecordRef } from "@t3tools/contracts";
 import { refLabel } from "@t3tools/client-runtime/ardud/missions";
 
-// Pure presentation.
+import { linkKey } from "./cards/chips";
 
-function linkKey(link: MissionLink | MissionRecordRef): string {
-  return "id" in link
-    ? `${link.kind}:${link.id}`
-    : `${link.kind}:${link.url ?? link.ref ?? link.label}`;
-}
+// Pure presentation.
 
 /** Links spaced apart on one wrapping line. */
 export function MissionLinkList(props: { links: ReadonlyArray<MissionLink | MissionRecordRef> }) {

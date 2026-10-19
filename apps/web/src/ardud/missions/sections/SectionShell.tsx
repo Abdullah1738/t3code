@@ -249,14 +249,14 @@ export function SectionCount(props: { count: number; tone?: "update" | "muted"; 
   if (props.count === 0) return null;
   return (
     <span
-      aria-label={props.label}
       className={
         props.tone === "update"
           ? "inline-flex h-4.5 min-w-4.5 items-center justify-center rounded-full bg-update/14 px-1.5 text-xs font-medium text-update-foreground tabular-nums"
           : "text-xs text-muted-foreground tabular-nums"
       }
     >
-      {props.count}
+      <span aria-hidden>{props.count}</span>
+      <span className="sr-only">{props.label}</span>
     </span>
   );
 }

@@ -56,19 +56,27 @@ export function ruleAcks(rule: Rule): RuleAckView {
   };
 }
 
-/** "Whole mission", or "Lanes: cell-bo, cell-fab-svc · Sub-missions: Releases". */
-export function scopeLine(
+/** One element per scoped kind ("Sub-missions: Releases", "Lanes: cell-bo"); empty for the whole mission. */
+export function scopeParts(
   scope: RuleScope,
   subMissions: ReadonlyArray<Pick<SubMission, "id" | "title">> = [],
-): string {
+): string[] {
   const titles = new Map(subMissions.map((sub) => [sub.id as string, sub.title]));
-  const parts = [
+  return [
     scope.subMissionIds.length > 0
       ? `Sub-missions: ${scope.subMissionIds.map((id) => titles.get(id) ?? id).join(", ")}`
       : null,
     scope.roleKinds.length > 0 ? `Roles: ${scope.roleKinds.join(", ")}` : null,
     scope.laneIds.length > 0 ? `Lanes: ${scope.laneIds.map(laneName).join(", ")}` : null,
   ].filter((part): part is string => part !== null);
+}
+
+/** "Whole mission", or "Lanes: cell-bo, cell-fab-svc · Sub-missions: Releases". */
+export function scopeLine(
+  scope: RuleScope,
+  subMissions: ReadonlyArray<Pick<SubMission, "id" | "title">> = [],
+): string {
+  const parts = scopeParts(scope, subMissions);
   return parts.length === 0 ? "Whole mission" : parts.join(" · ");
 }
 
@@ -92,6 +100,8 @@ export interface RuleRow {
   readonly rule: Rule;
   readonly acks: RuleAckView;
   readonly scope: string;
+  /** The scope as separate elements; empty for the whole mission. */
+  readonly scopeParts: ReadonlyArray<string>;
   readonly activation: string;
   readonly use: string;
   readonly changeRequests: {
@@ -143,6 +153,7 @@ export function ruleBookView(
       rule,
       acks: ruleAcks(rule),
       scope: scopeLine(rule.scope, subMissions),
+      scopeParts: scopeParts(rule.scope, subMissions),
       activation: activationLine(rule),
       use: useLine(rule),
       changeRequests: {

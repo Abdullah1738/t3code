@@ -4,12 +4,7 @@ import { InboxIcon, PanelsTopLeftIcon } from "lucide-react";
 import * as Schema from "effect/Schema";
 
 import type { MissionId, MissionListItem } from "@t3tools/contracts";
-import {
-  badgeCount,
-  isRequestUnread,
-  laneTotal,
-  totalNeedsYou,
-} from "@t3tools/client-runtime/ardud/missions";
+import { badgeCount, laneTotal, totalNeedsYou } from "@t3tools/client-runtime/ardud/missions";
 
 import { CollapsibleSectionHeader } from "../../components/ui/collapsible-section-header";
 import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
@@ -17,6 +12,7 @@ import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
 import { CountBadge, GlyphCount, HealthGlyph, needsYouLabel, UnreadDot } from "./cards/chips";
 import { useMissionList, useOwnerRequests } from "./missionsStore";
+import { unreadRequests } from "./sections/YourRequests";
 
 const SIDEBAR_STATE_KEY = "t3code:ardud-missions:sidebar";
 const SidebarState = Schema.Struct({ collapsed: Schema.Boolean });
@@ -195,7 +191,7 @@ function LanesRow(props: {
         search={{ tab: "lanes" }}
         onClick={props.onNavigate}
         aria-label={label}
-        aria-current={isActive ? "page" : undefined}
+        aria-current={isActive ? "true" : undefined}
         className={cn(subRowClassName, rowState(isActive))}
       >
         <span aria-hidden className="w-3 shrink-0" />
@@ -263,7 +259,7 @@ function PortfolioRow(props: { onNavigate: () => void }) {
 /** Answered requests the owner has not opened: an update dot and the count. */
 function RequestsAnsweredLink(props: { missionId: MissionId; onNavigate: () => void }) {
   const requests = useOwnerRequests(props.missionId);
-  const unread = useMemo(() => (requests ?? []).filter(isRequestUnread), [requests]);
+  const unread = useMemo(() => unreadRequests(requests), [requests]);
   const first = unread[0];
   if (!first) return null;
   const label = `${unread.length} ${unread.length === 1 ? "request" : "requests"} answered`;

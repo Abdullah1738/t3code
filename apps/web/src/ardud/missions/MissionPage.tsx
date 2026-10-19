@@ -2,7 +2,7 @@ import { Link } from "@tanstack/react-router";
 
 import type { MissionId, RoomId } from "@t3tools/contracts";
 
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
+import { Empty, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
 import { ScrollArea } from "../../components/ui/scroll-area";
 import { SidebarInset } from "../../components/ui/sidebar";
 import { Skeleton } from "../../components/ui/skeleton";
@@ -137,7 +137,8 @@ function MissionTabs(props: { missionId: MissionId; tab: MissionTab }) {
 
 function MissionPageSkeleton() {
   return (
-    <div className="flex flex-col gap-4" aria-busy="true" aria-label="Loading mission">
+    <div className="flex flex-col gap-4" aria-busy="true">
+      <h1 className="sr-only">Loading mission</h1>
       <Skeleton className="h-4 w-2/3" />
       <Skeleton className="h-6 w-1/2" />
       <Skeleton className="h-24 w-full" />
@@ -150,10 +151,9 @@ function MissionNotFound() {
   return (
     <Empty>
       <EmptyHeader>
-        <EmptyTitle>Mission not found</EmptyTitle>
-        <EmptyDescription>
-          It may have been archived. Pick a mission from the sidebar.
-        </EmptyDescription>
+        <EmptyTitle role="heading" aria-level={1}>
+          Mission not found
+        </EmptyTitle>
       </EmptyHeader>
     </Empty>
   );

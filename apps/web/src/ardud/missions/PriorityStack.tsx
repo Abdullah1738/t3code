@@ -171,12 +171,12 @@ function PriorityStackItem(props: {
           {sub.title}
         </span>
         {props.focused ? (
-          <span className="shrink-0 rounded-sm bg-info/10 px-1 text-2xs text-info-foreground">
+          <span className="shrink-0 rounded-sm bg-info/10 px-1 text-xs text-info-foreground">
             focus
           </span>
         ) : null}
         {sub.fillIdleCapacity ? (
-          <span className="shrink-0 text-2xs text-muted-foreground">fills idle</span>
+          <span className="shrink-0 text-xs text-muted-foreground">fills idle</span>
         ) : null}
       </div>
       <span
