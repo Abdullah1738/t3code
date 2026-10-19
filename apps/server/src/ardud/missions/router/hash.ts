@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - content hashes and stable ids only need sha256.
 import * as NodeCrypto from "node:crypto";
 
-import type { MissionActor, MissionLink } from "@t3tools/contracts";
+import type { MissionActor, MissionLink, PostMessageInput } from "@t3tools/contracts";
 
 export const sha256 = (text: string): string =>
   NodeCrypto.createHash("sha256").update(text).digest("hex");
@@ -33,3 +33,16 @@ export const contentHashOf = (input: {
       input.isCorrection,
     ]),
   );
+
+/** The content hash of a post as its poster sent it. */
+export const postContentHash = (input: PostMessageInput): string =>
+  contentHashOf({
+    roomId: input.roomId,
+    kind: input.kind,
+    summary: input.summary,
+    body: input.body ?? null,
+    to: input.to ?? [],
+    workItemId: input.workItemId ?? null,
+    links: input.links ?? [],
+    isCorrection: input.isCorrection ?? false,
+  });

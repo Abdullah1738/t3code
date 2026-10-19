@@ -4,7 +4,7 @@
  * forking someone else's thread is a send into it, and the fork's creator is
  * recorded apart from its lineage (see `forkCreator`).
  */
-import type { OrchestrationV2DomainEvent, ThreadId } from "@t3tools/contracts";
+import { MissionError, type OrchestrationV2DomainEvent, type ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import type * as SqlClient from "effect/sql/SqlClient";
@@ -44,14 +44,32 @@ export const guardFork = (
   });
 
 /**
- * Who created a fork, or `null` when nothing was recorded (a fork made before
- * the guard, or by an in-process caller). Membership should count a fork as
- * created by the master only when this is the owner or the master.
+ * Who created a fork, or `null` when a successful read found nothing recorded
+ * (a fork made before the guard, or by an in-process caller). Membership
+ * should count a fork as created by the master only when this is the owner or
+ * the master. A record that cannot be read or decoded fails, so the send
+ * guard refuses instead of treating the thread as an outsider.
  */
 export const forkCreator = (
   store: AuthorityStore,
   threadId: ThreadId,
-): Effect.Effect<GuardPrincipal | null> => store.read("fork", threadId);
+): Effect.Effect<GuardPrincipal | null, MissionError> =>
+  store.lookup("fork", threadId).pipe(
+    Effect.tapError((error) =>
+      Effect.logWarning("missions guard: could not read a fork's creator", {
+        threadId,
+        reason: error.message,
+      }),
+    ),
+    // Callers see that the record is unreadable; the database error stays in the log.
+    Effect.mapError(
+      () =>
+        new MissionError({
+          code: "conflict",
+          detail: `Cannot read who created thread ${threadId}, so mission membership is unknown.`,
+        }),
+    ),
+  );
 
 /**
  * Subagent mirrors and delegated children are created by the thread that

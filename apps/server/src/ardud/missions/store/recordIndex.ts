@@ -278,5 +278,16 @@ export const indexRecord = (entry: MissionStoreRecord): MissionRecordIndex => {
         updatedAt: r.closedAt ?? r.createdAt,
       };
     }
+    // ardud missions: router
+    case "owner-request": {
+      const r = entry.record;
+      return {
+        id: r.id,
+        missionId: r.missionId,
+        subMissionId: r.subMissionId,
+        status: r.status,
+        updatedAt: r.updatedAt,
+      };
+    }
   }
 };

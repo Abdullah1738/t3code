@@ -89,6 +89,10 @@ export const ForkId = missionEntityId("MissionForkId");
 export type ForkId = typeof ForkId.Type;
 export const MissionEventId = missionEntityId("MissionEventId");
 export type MissionEventId = typeof MissionEventId.Type;
+// --- router additions ---
+export const OwnerRequestId = missionEntityId("OwnerRequestId");
+export type OwnerRequestId = typeof OwnerRequestId.Type;
+// --- end router additions ---
 
 // ---------------------------------------------------------------------------
 // Shared pieces
@@ -188,6 +192,9 @@ export const MissionRecordKind = Schema.Literals([
   "approval",
   "fork",
   "thread",
+  // --- router additions ---
+  "owner-request",
+  // --- end router additions ---
 ]);
 export type MissionRecordKind = typeof MissionRecordKind.Type;
 
@@ -435,6 +442,10 @@ export const RoomKind = Schema.Literals([
   "arch",
   "lane",
   "custom",
+  // --- router additions ---
+  /** One room per owner request: the owner and the master, nobody else. */
+  "owner-request",
+  // --- end router additions ---
 ]);
 export type RoomKind = typeof RoomKind.Type;
 
@@ -1461,6 +1472,39 @@ export const MissionFork = Schema.Struct({
 });
 export type MissionFork = typeof MissionFork.Type;
 
+// --- router additions ---
+// Owner requests: the owner asks the master something (progress, a flow to
+// tighten, a suggestion, something to pick up) and the master answers in the
+// request's own room. Unlike a fork, a request is meant to change the master.
+
+export const OwnerRequestStatus = Schema.Literals(["waiting-on-master", "answered", "settled"]);
+export type OwnerRequestStatus = typeof OwnerRequestStatus.Type;
+
+export const OwnerRequest = Schema.Struct({
+  id: OwnerRequestId,
+  missionId: MissionId,
+  subMissionId: Schema.NullOr(SubMissionId),
+  /** First line of the opening message. */
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(120)),
+  status: OwnerRequestStatus,
+  /** The request's conversation (room kind `owner-request`). */
+  roomId: RoomId,
+  /** Who opened it: the owner, or the master quoting the owner. */
+  createdBy: MissionProvenance,
+  lastOwnerAt: Schema.NullOr(IsoDateTime),
+  lastMasterAt: Schema.NullOr(IsoDateTime),
+  /** What the master made from it: work items, asks, forks, rules, suggestions. */
+  links: Schema.Array(MissionRecordRef),
+  /** The master spoke since the owner last opened the request. */
+  unreadForOwner: Schema.Boolean,
+  settledBy: Schema.NullOr(MissionActor),
+  settledAt: Schema.NullOr(IsoDateTime),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type OwnerRequest = typeof OwnerRequest.Type;
+// --- end router additions ---
+
 // ---------------------------------------------------------------------------
 // Timeline
 
@@ -1535,6 +1579,12 @@ export const MissionEventKind = Schema.Literals([
   "send.guarded",
   "member.changed",
   "room.tuned",
+  "request.opened",
+  "request.replied",
+  "request.settled",
+  "request.reopened",
+  /** The owner opened the master's answer. */
+  "request.seen",
   "pool.created",
   "pool.updated",
   "pool.hold-taken",
@@ -1628,6 +1678,10 @@ export const MissionListItem = Schema.Struct({
     }),
   ),
   updatedAt: IsoDateTime,
+  // --- router additions ---
+  /** Owner requests the master answered that the owner has not opened yet. */
+  requestsAnswered: Schema.optional(NonNegativeInt),
+  // --- end router additions ---
 });
 export type MissionListItem = typeof MissionListItem.Type;
 
@@ -1889,6 +1943,10 @@ export const MissionOverview = Schema.Struct({
   /** Set while threads are still being resumed after a restart or interruption. */
   recovery: Schema.optional(Schema.NullOr(MissionRecoveryState)),
   // --- end recovery additions ---
+  // --- router additions ---
+  /** Owner requests the master answered that the owner has not opened yet. */
+  requestsAnswered: Schema.optional(NonNegativeInt),
+  // --- end router additions ---
 });
 export type MissionOverview = typeof MissionOverview.Type;
 
@@ -1953,6 +2011,9 @@ export const MissionRecord = Schema.Union([
   Schema.TaggedStruct("review", { record: ReviewRecord }),
   Schema.TaggedStruct("work-item", { record: WorkItem }),
   Schema.TaggedStruct("fork", { record: MissionFork }),
+  // --- router additions ---
+  Schema.TaggedStruct("owner-request", { record: OwnerRequest }),
+  // --- end router additions ---
   Schema.TaggedStruct("event", { record: MissionEvent }),
 ]);
 export type MissionRecord = typeof MissionRecord.Type;
@@ -2199,6 +2260,76 @@ export const MissionAttention = Schema.Struct({
   entries: Schema.Array(AttentionEntry),
 });
 export type MissionAttention = typeof MissionAttention.Type;
+
+/** What the owner or master writes into a request. */
+export const OwnerRequestText = TrimmedNonEmptyString.check(Schema.isMaxLength(20_000));
+export type OwnerRequestText = typeof OwnerRequestText.Type;
+
+export const OpenOwnerRequestInput = Schema.Struct({
+  missionId: MissionId,
+  /** The first line becomes the title. */
+  text: OwnerRequestText,
+  subMissionId: Schema.optional(SubMissionId),
+  /** Master only: where the owner asked it (his own thread, iMessage). */
+  quotedFrom: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(200))),
+  /** Idempotency key: the same key opens the same request once. */
+  key: Schema.optional(TrimmedNonEmptyString),
+});
+export type OpenOwnerRequestInput = typeof OpenOwnerRequestInput.Type;
+
+export const ReplyOwnerRequestInput = Schema.Struct({
+  requestId: OwnerRequestId,
+  text: OwnerRequestText,
+  /** Master only: what it made from the request. */
+  links: Schema.optional(Schema.Array(MissionRecordRef)),
+  /** Master only: `waiting-on-master` while it is still working. Defaults to `answered`. */
+  status: Schema.optional(Schema.Literals(["answered", "waiting-on-master"])),
+  key: Schema.optional(TrimmedNonEmptyString),
+});
+export type ReplyOwnerRequestInput = typeof ReplyOwnerRequestInput.Type;
+
+export const SettleOwnerRequestInput = Schema.Struct({
+  requestId: OwnerRequestId,
+  note: Schema.optional(OwnerRequestText),
+});
+export type SettleOwnerRequestInput = typeof SettleOwnerRequestInput.Type;
+
+export const ReopenOwnerRequestInput = Schema.Struct({
+  requestId: OwnerRequestId,
+  note: Schema.optional(OwnerRequestText),
+});
+export type ReopenOwnerRequestInput = typeof ReopenOwnerRequestInput.Type;
+
+export const OwnerRequestsInput = Schema.Struct({
+  missionId: MissionId,
+  status: Schema.optional(OwnerRequestStatus),
+  /** One request with a longer stretch of its conversation, bodies included. */
+  requestId: Schema.optional(OwnerRequestId),
+});
+export type OwnerRequestsInput = typeof OwnerRequestsInput.Type;
+
+export const OwnerRequestMessage = Schema.Struct({
+  message: MissionMessage,
+  /** Null in a list (read the summary); filled when one request is asked for by id. */
+  body: Schema.NullOr(Schema.String),
+});
+export type OwnerRequestMessage = typeof OwnerRequestMessage.Type;
+
+export const OwnerRequestView = Schema.Struct({
+  request: OwnerRequest,
+  /** The newest messages, oldest first. */
+  messages: Schema.Array(OwnerRequestMessage),
+  hasOlder: Schema.Boolean,
+  unreadForOwner: Schema.Boolean,
+});
+export type OwnerRequestView = typeof OwnerRequestView.Type;
+
+export const OwnerRequests = Schema.Struct({
+  missionId: MissionId,
+  /** Newest activity first. */
+  requests: Schema.Array(OwnerRequestView),
+});
+export type OwnerRequests = typeof OwnerRequests.Type;
 
 // --- core additions ---
 

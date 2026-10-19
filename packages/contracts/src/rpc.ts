@@ -418,6 +418,13 @@ import {
   RoomTuning,
   RoomTuningInput,
   TuneRoomInput,
+  OpenOwnerRequestInput,
+  OwnerRequest,
+  OwnerRequests,
+  OwnerRequestsInput,
+  ReopenOwnerRequestInput,
+  ReplyOwnerRequestInput,
+  SettleOwnerRequestInput,
 } from "./ardud/missions.ts";
 // ardud missions: policy
 import { MissionsPolicyRpcs } from "./ardud/missionsPolicyRpc.ts";
@@ -647,6 +654,11 @@ export const WS_METHODS = {
   missionsRoomTuning: "missions.roomTuning",
   missionsTuneRoom: "missions.tuneRoom",
   missionsAttention: "missions.attention",
+  missionsOwnerRequests: "missions.ownerRequests",
+  missionsOpenOwnerRequest: "missions.openOwnerRequest",
+  missionsReplyOwnerRequest: "missions.replyOwnerRequest",
+  missionsSettleOwnerRequest: "missions.settleOwnerRequest",
+  missionsReopenOwnerRequest: "missions.reopenOwnerRequest",
   // Slots, policy: missionsSetRoleModel, missionsSetPoolCapacity,
   // missionsUpdateReviewPolicy.
 
@@ -2175,6 +2187,31 @@ const WsMissionsAttentionRpc = missionRpc(
   MissionAttentionInput,
   MissionAttention,
 );
+const WsMissionsOwnerRequestsRpc = missionRpc(
+  WS_METHODS.missionsOwnerRequests,
+  OwnerRequestsInput,
+  OwnerRequests,
+);
+const WsMissionsOpenOwnerRequestRpc = missionRpc(
+  WS_METHODS.missionsOpenOwnerRequest,
+  OpenOwnerRequestInput,
+  OwnerRequest,
+);
+const WsMissionsReplyOwnerRequestRpc = missionRpc(
+  WS_METHODS.missionsReplyOwnerRequest,
+  ReplyOwnerRequestInput,
+  OwnerRequest,
+);
+const WsMissionsSettleOwnerRequestRpc = missionRpc(
+  WS_METHODS.missionsSettleOwnerRequest,
+  SettleOwnerRequestInput,
+  OwnerRequest,
+);
+const WsMissionsReopenOwnerRequestRpc = missionRpc(
+  WS_METHODS.missionsReopenOwnerRequest,
+  ReopenOwnerRequestInput,
+  OwnerRequest,
+);
 
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
@@ -2260,6 +2297,11 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsRoomTuningRpc,
   WsMissionsTuneRoomRpc,
   WsMissionsAttentionRpc,
+  WsMissionsOwnerRequestsRpc,
+  WsMissionsOpenOwnerRequestRpc,
+  WsMissionsReplyOwnerRequestRpc,
+  WsMissionsSettleOwnerRequestRpc,
+  WsMissionsReopenOwnerRequestRpc,
 ).middleware(RpcScopeAuthorization);
 
 // ardud missions: policy

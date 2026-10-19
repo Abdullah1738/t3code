@@ -255,4 +255,37 @@ describe("router MCP tools", () => {
       expect((yield* call("mission_attention", laneThread, { missionId })).isError).toBe(true);
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect("only the master works owner requests through its tools", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest({ missionId, text: "Status?" }, ownerApp);
+      for (const [name, args] of [
+        ["mission_requests", { missionId }],
+        ["mission_request_reply", { requestId: request.id, text: "Fine." }],
+        ["mission_request_settle", { requestId: request.id }],
+        ["mission_request_open", { missionId, text: "Status?", quotedFrom: "iMessage" }],
+      ] as const) {
+        expect((yield* call(name, laneThread, args)).isError).toBe(true);
+      }
+      const listed = yield* call("mission_requests", masterThread, { missionId });
+      expect((listed.structured.requests as ReadonlyArray<unknown>).length).toBe(1);
+      const replied = yield* call("mission_request_reply", masterThread, {
+        requestId: request.id,
+        text: "Fine.",
+        status: "answered",
+      });
+      expect(replied.structured).toMatchObject({ request: { status: "answered" } });
+      const settled = yield* call("mission_request_settle", masterThread, {
+        requestId: request.id,
+      });
+      expect(settled.structured).toMatchObject({ request: { status: "settled" } });
+      const reopened = yield* call("mission_request_reopen", masterThread, {
+        requestId: request.id,
+      });
+      expect(reopened.structured).toMatchObject({ request: { status: "waiting-on-master" } });
+    }).pipe(Effect.provide(layer));
+  });
 });

@@ -1,9 +1,9 @@
 import {
+  MissionId,
   MissionMessage,
   ReadPosition,
   Room,
   Subscription,
-  type MissionId,
   type MissionMessageId,
   type MissionMessageKind,
   type RoomId,
@@ -66,6 +66,9 @@ const DDL = [
     ON ardud_mission_router_messages (room_id, seq)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS ardud_mission_router_messages_by_key
     ON ardud_mission_router_messages (mission_id, msg_key) WHERE msg_key IS NOT NULL`,
+  // Owner-request keys carry the iMessage id, which must post once across missions.
+  `CREATE INDEX IF NOT EXISTS ardud_mission_router_messages_by_bare_key
+    ON ardud_mission_router_messages (msg_key) WHERE msg_key IS NOT NULL`,
   `CREATE TABLE IF NOT EXISTS ardud_mission_router_bodies (
     message_id TEXT PRIMARY KEY,
     body TEXT NOT NULL
@@ -316,6 +319,8 @@ export class RouterStore extends Context.Service<
       missionId: MissionId,
       key: string,
     ) => Effect.Effect<StoredMessage | null>;
+    /** Missions holding a message with this key (an iMessage id posts once anywhere). */
+    readonly keyMissions: (key: string) => Effect.Effect<ReadonlyArray<MissionId>>;
     readonly messageById: (id: MissionMessageId) => Effect.Effect<MissionMessage | null>;
     readonly messageBody: (id: MissionMessageId) => Effect.Effect<string | null>;
     /** Newest `limit` messages of a room below `beforeSeq`, returned oldest first. */
@@ -326,6 +331,11 @@ export class RouterStore extends Context.Service<
     ) => Effect.Effect<{
       readonly messages: ReadonlyArray<MissionMessage>;
       readonly hasOlder: boolean;
+    }>;
+    /** A room's first message and how many it holds (owner requests' transcripts). */
+    readonly roomOpening: (roomId: RoomId) => Effect.Effect<{
+      readonly first: MissionMessage | null;
+      readonly total: number;
     }>;
     readonly roomKindsSince: (
       roomId: RoomId,
@@ -756,6 +766,15 @@ const make = Effect.gen(function* () {
         ),
       ),
 
+    keyMissions: (key) =>
+      read(
+        sql<{ readonly missionId: string }>`
+          SELECT DISTINCT mission_id AS "missionId"
+          FROM ardud_mission_router_messages
+          WHERE msg_key = ${key}
+        `.pipe(Effect.map((rows) => rows.map((row) => MissionId.make(row.missionId)))),
+      ),
+
     messageById: (id) =>
       read(
         sql<{ readonly json: string }>`
@@ -786,6 +805,25 @@ const make = Effect.gen(function* () {
             .map((row) => decodeMessage(row.json))
             .toReversed();
           return { messages, hasOlder };
+        }),
+      ),
+
+    roomOpening: (roomId) =>
+      read(
+        Effect.gen(function* () {
+          const first = yield* sql<{ readonly json: string }>`
+            SELECT message_json AS "json" FROM ardud_mission_router_messages
+            WHERE room_id = ${roomId}
+            ORDER BY seq ASC
+            LIMIT 1
+          `;
+          const counted = yield* sql<{ readonly total: number }>`
+            SELECT COUNT(*) AS "total" FROM ardud_mission_router_messages WHERE room_id = ${roomId}
+          `;
+          return {
+            first: first[0] === undefined ? null : decodeMessage(first[0].json),
+            total: Number(counted[0]?.total ?? 0),
+          };
         }),
       ),
 

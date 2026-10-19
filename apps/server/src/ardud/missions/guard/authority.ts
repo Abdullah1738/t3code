@@ -5,9 +5,11 @@
  * the authenticated principal here and reads it back when the thing fires.
  *
  * Reads fail closed: a missing or unreadable record is `null`, which the guard
- * treats as "not self, not owner".
+ * treats as "not self, not owner". `lookup` is for decisions where an
+ * unreadable record must refuse rather than count as missing.
  */
 import { MissionProvenance, ThreadId } from "@t3tools/contracts";
+import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -39,6 +41,13 @@ const PrincipalJson = Schema.fromJsonString(
 const encodePrincipal = Schema.encodeSync(PrincipalJson);
 const decodePrincipal = Schema.decodeUnknownOption(PrincipalJson);
 
+/** The authority table could not be read, or its row does not decode. */
+export class AuthorityUnreadable extends Data.TaggedError("AuthorityUnreadable")<{
+  readonly kind: AuthorityKind;
+  readonly subjectId: string;
+  readonly message: string;
+}> {}
+
 export interface AuthorityStore {
   /** Best effort: a failed write is logged, and the later read fails closed. */
   readonly record: (
@@ -47,6 +56,14 @@ export interface AuthorityStore {
     principal: GuardPrincipal,
   ) => Effect.Effect<void>;
   readonly read: (kind: AuthorityKind, subjectId: string) => Effect.Effect<GuardPrincipal | null>;
+  /**
+   * `null` only when a successful read found no record. A failed read or a
+   * principal that does not decode is an error, never a silent `null`.
+   */
+  readonly lookup: (
+    kind: AuthorityKind,
+    subjectId: string,
+  ) => Effect.Effect<GuardPrincipal | null, AuthorityUnreadable>;
   readonly forget: (kind: AuthorityKind, subjectId: string) => Effect.Effect<void>;
   /**
    * Sets the authority as part of the caller's write: a principal replaces the
@@ -73,6 +90,30 @@ export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
     yield* sql.unsafe(DDL);
     if (Option.isNone(yield* Effect.serviceOption(sql.transactionService))) ready.add(sql);
   });
+  const lookup = (kind: AuthorityKind, subjectId: string) =>
+    Effect.gen(function* () {
+      yield* ensure;
+      const rows = yield* sql<{ readonly json: string }>`
+        SELECT principal_json AS "json" FROM ardud_mission_guard_authority
+        WHERE kind = ${kind} AND subject_id = ${subjectId}
+      `;
+      const row = rows[0];
+      if (row === undefined) return null;
+      const principal = decodePrincipal(row.json);
+      if (Option.isNone(principal)) {
+        return yield* new AuthorityUnreadable({
+          kind,
+          subjectId,
+          message: "The recorded principal does not decode.",
+        });
+      }
+      return principal.value;
+    }).pipe(
+      Effect.catchTags({
+        SqlError: (error) =>
+          Effect.fail(new AuthorityUnreadable({ kind, subjectId, message: error.message })),
+      }),
+    );
   return {
     record: (kind, subjectId, principal) =>
       Effect.gen(function* () {
@@ -95,15 +136,7 @@ export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
         ),
       ),
     read: (kind, subjectId) =>
-      Effect.gen(function* () {
-        yield* ensure;
-        const rows = yield* sql<{ readonly json: string }>`
-          SELECT principal_json AS "json" FROM ardud_mission_guard_authority
-          WHERE kind = ${kind} AND subject_id = ${subjectId}
-        `;
-        const row = rows[0];
-        return row === undefined ? null : Option.getOrNull(decodePrincipal(row.json));
-      }).pipe(
+      lookup(kind, subjectId).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("missions guard: could not read authority", {
             kind,
@@ -112,6 +145,7 @@ export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
           }).pipe(Effect.as(null)),
         ),
       ),
+    lookup,
     forget: (kind, subjectId) =>
       Effect.gen(function* () {
         yield* ensure;
@@ -148,10 +182,17 @@ export const authorityStore = (sql: SqlClient.SqlClient): AuthorityStore => {
   };
 };
 
-/** Nothing recorded and nothing remembered: every read is `null`. */
+/**
+ * Nothing recorded and nothing remembered: every read is `null`. `lookup`
+ * fails, because without a database no read can prove a record is absent.
+ */
 const noAuthority: AuthorityStore = {
   record: () => Effect.void,
   read: () => Effect.succeed(null),
+  lookup: (kind, subjectId) =>
+    Effect.fail(
+      new AuthorityUnreadable({ kind, subjectId, message: "There is no app database to read." }),
+    ),
   forget: () => Effect.void,
   bind: () => Effect.void,
 };

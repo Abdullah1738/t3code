@@ -51,6 +51,8 @@ const ROOM_GROUP_OF: Record<RoomKind, RoomGroupKey> = {
   release: "standing",
   arch: "standing",
   custom: "standing",
+  // ardud missions: router (request rooms are not listed; they live under "Your requests")
+  "owner-request": "standing",
 };
 
 const STANDING_ORDER: Record<RoomKind, number> = {
@@ -61,6 +63,8 @@ const STANDING_ORDER: Record<RoomKind, number> = {
   "sub-mission": 4,
   lane: 5,
   "work-item": 6,
+  // ardud missions: router
+  "owner-request": 7,
 };
 
 export const ROOM_KIND_LABEL: Record<RoomKind, string> = {
@@ -71,6 +75,8 @@ export const ROOM_KIND_LABEL: Record<RoomKind, string> = {
   arch: "Arch",
   lane: "Lane",
   custom: "Room",
+  // ardud missions: router
+  "owner-request": "Request",
 };
 
 export interface RoomGroup {

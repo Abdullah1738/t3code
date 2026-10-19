@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // mission: shell access to Robob missions over the control API
 // (/api/ardud/missions/desk). Prints JSON unless --text. Read-only except
-// answers and draft decisions, which need the owner's iMessage inbound id.
+// answers, draft decisions and owner requests, which need the owner's
+// iMessage inbound id.
 // Every other write goes through the mission_* MCP tools: HTTP cannot prove
 // which thread is calling.
 import * as NodeFS from "node:fs";
@@ -24,6 +25,9 @@ const HELP = `mission <command> [options]
   draft approve DRAFT [--edit TEXT] --via imessage --inbound ID
   draft rewrite DRAFT --note TEXT --via imessage --inbound ID
   draft drop DRAFT --via imessage --inbound ID
+  requests MISSION [--status waiting-on-master|answered|settled]
+  request open MISSION --text T --via imessage --inbound ID
+  request reply REQUEST --text T --via imessage --inbound ID
   events MISSION [--after SEQ] [--limit N]
   watch MISSION --on KINDS [--interval SECONDS]   prints the robob-watch command
   watch-check MISSION --on KINDS --cursor FILE    one watcher tick: prints new matches only
@@ -31,8 +35,8 @@ const HELP = `mission <command> [options]
 Watch kinds: ask-opened, ask-answered, draft-opened, suggestion-opened, fork-closed,
 milestone-at-risk, lane-stalled, swarm-paused.
 
-Answers and approvals are refused unless the inbound id is a real iMessage
-from the owner's or Moni's chat that says the same thing.
+Answers, approvals and owner requests are refused unless the inbound id is a
+real iMessage from the owner's or Moni's chat that says the same thing.
 
 Everything else that changes a mission (plan, lanes, approvals, rules, asks,
 forks) goes through the mission_* MCP tools from the calling thread, never this
@@ -205,6 +209,35 @@ async function main() {
         }),
       );
     }
+    // ardud missions: router (owner requests)
+    case "requests":
+      return print(
+        await request(
+          "GET",
+          `/requests${query({ mission: need(args[0] ?? flags.mission, "MISSION"), status: flags.status })}`,
+        ),
+      );
+    case "request": {
+      const [action, target] = args;
+      if (action !== "open" && action !== "reply") {
+        return fail(`unknown request action ${action ?? ""}\n\n${HELP}`);
+      }
+      const text = need(flags.text, "--text (his words, exactly as he sent them)");
+      const inboundId = ownerInbound();
+      if (action === "open") {
+        return print(
+          await request("POST", "/requests", {
+            missionId: need(target ?? flags.mission, "MISSION"),
+            text,
+            inboundId,
+          }),
+        );
+      }
+      return print(
+        await request("POST", `/requests/${id(target, "REQUEST")}/reply`, { text, inboundId }),
+      );
+    }
+    // end ardud missions: router
     case "events":
       return print(
         await request(

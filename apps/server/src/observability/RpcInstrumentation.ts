@@ -271,6 +271,11 @@ const RPC_AGGREGATES = {
   [WS_METHODS.missionsRoomTuning]: "missions",
   [WS_METHODS.missionsTuneRoom]: "missions",
   [WS_METHODS.missionsAttention]: "missions",
+  [WS_METHODS.missionsOwnerRequests]: "missions",
+  [WS_METHODS.missionsOpenOwnerRequest]: "missions",
+  [WS_METHODS.missionsReplyOwnerRequest]: "missions",
+  [WS_METHODS.missionsSettleOwnerRequest]: "missions",
+  [WS_METHODS.missionsReopenOwnerRequest]: "missions",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

@@ -3,10 +3,15 @@ import {
   MarkReadInput,
   MissionAttentionInput,
   MissionId,
+  OpenOwnerRequestInput,
   OrchestratorMcpFailure,
+  OwnerRequestsInput,
+  ReopenOwnerRequestInput,
+  ReplyOwnerRequestInput,
   RoomPageInput,
   RoomTuningInput,
   SetMissionMemberInput,
+  SettleOwnerRequestInput,
   SubscribeRoomInput,
   TuneRoomInput,
 } from "@t3tools/contracts";
@@ -140,6 +145,58 @@ const MissionAttentionTool = Tool.make("mission_attention", {
   dependencies,
 });
 
+// The owner's requests: one conversation each between the owner and the master.
+
+const MissionRequestsTool = Tool.make("mission_requests", {
+  description:
+    "As the mission's master, the owner's requests to you, newest activity first, each with its status (waiting-on-master, answered, settled), its links and its latest messages. Pass requestId for one request with its whole conversation.",
+  parameters: OwnerRequestsInput,
+  success: Schema.Struct({ requests: Records }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionRequestOpenTool = Tool.make("mission_request_open", {
+  description:
+    "As the mission's master, put something the owner asked you elsewhere (his own thread, iMessage) on the mission's requests, in his words. quotedFrom says where he asked it. It does not wake you; answer it with mission_request_reply.",
+  parameters: OpenOwnerRequestInput,
+  success: Schema.Struct({ request: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionRequestReplyTool = Tool.make("mission_request_reply", {
+  description:
+    'As the mission\'s master, answer one of the owner\'s requests. status "answered" (the default) when you have answered; "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, forks, rules or suggestions you made from it. No defaults, deadlines or "unless you say otherwise": the owner decides in his own time. Your reply wakes nobody.',
+  parameters: ReplyOwnerRequestInput,
+  success: Schema.Struct({ request: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionRequestSettleTool = Tool.make("mission_request_settle", {
+  description:
+    "As the mission's master, settle one of the owner's requests once it is done, with an optional note for him. Logged with you as the actor; the owner can reopen it.",
+  parameters: SettleOwnerRequestInput,
+  success: Schema.Struct({ request: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
+const MissionRequestReopenTool = Tool.make("mission_request_reopen", {
+  description:
+    "As the mission's master, reopen a settled request (back to waiting-on-master), with an optional note for the owner.",
+  parameters: ReopenOwnerRequestInput,
+  success: Schema.Struct({ request: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+
 interface ToolConfig {
   readonly parameters: Schema.Constraint;
   readonly success: Schema.Constraint;
@@ -173,4 +230,9 @@ export const RouterToolkit = Toolkit.make(
   annotated(MissionRoomTuningTool, "Mission room wake rules", true),
   annotated(MissionTuneRoomTool, "Tune a mission room", false),
   annotated(MissionAttentionTool, "Mission attention", true),
+  annotated(MissionRequestsTool, "Owner requests", true),
+  annotated(MissionRequestOpenTool, "Open an owner request", false),
+  annotated(MissionRequestReplyTool, "Reply to an owner request", false),
+  annotated(MissionRequestSettleTool, "Settle an owner request", false),
+  annotated(MissionRequestReopenTool, "Reopen an owner request", false),
 );
