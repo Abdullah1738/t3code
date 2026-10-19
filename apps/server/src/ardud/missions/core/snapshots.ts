@@ -142,6 +142,18 @@ const KIND_WORDS: Readonly<Record<string, readonly [string, string]>> = {
   message: ["message", "messages"],
   "read-position": ["read position", "read positions"],
   pool: ["pool", "pools"],
+  milestone: ["milestone", "milestones"],
+  "lane-placement": ["lane placement", "lane placements"],
+  "coord-member": ["coord member", "coord members"],
+};
+
+/** Per-record import events, counted by what they placed or created. */
+const IMPORT_RECORD_KINDS: Readonly<Record<string, string>> = {
+  "sub-mission.created": "sub-mission",
+  "milestone.created": "milestone",
+  "pool.created": "pool",
+  "lane.moved": "lane-placement",
+  "member.changed": "coord-member",
 };
 
 const countOf = (count: number, kind: string): string => {
@@ -162,13 +174,33 @@ const listLength = (payload: unknown, field: string): number => {
 /**
  * A policy model event that only records imported holders keeping their
  * model: nothing was set, nobody waits, so the owner has nothing to check.
+ * Either the batched per-mission "imported" record or an older per-role
+ * "applied" echo with only acceptances.
  */
-const isImportFallout = (event: MissionEvent): boolean =>
-  event.kind === "role.model-changed" &&
-  payloadField(event.payload, "phase") === "applied" &&
-  listLength(event.payload, "accepted") > 0 &&
-  listLength(event.payload, "applied") === 0 &&
-  listLength(event.payload, "waiting") === 0;
+const isImportFallout = (event: MissionEvent): boolean => {
+  if (event.kind !== "role.model-changed" || listLength(event.payload, "accepted") === 0) {
+    return false;
+  }
+  const phase = payloadField(event.payload, "phase");
+  return (
+    phase === "imported" ||
+    (phase === "applied" &&
+      listLength(event.payload, "applied") === 0 &&
+      listLength(event.payload, "waiting") === 0)
+  );
+};
+
+/** Role ids a fallout event covers: the batched list, else its subject. */
+const falloutRoles = (event: MissionEvent): Array<string> => {
+  if (payloadField(event.payload, "phase") === "imported") {
+    const accepted = payloadField(event.payload, "accepted");
+    return (Array.isArray(accepted) ? accepted : []).flatMap((entry) => {
+      const roleId = payloadField(entry, "roleId");
+      return typeof roleId === "string" ? [roleId] : [];
+    });
+  }
+  return [event.subject?.id ?? event.id];
+};
 
 /** Written by a coord import, or the no-op policy echo of one. */
 export const isImportEvent = (event: MissionEvent): boolean =>
@@ -180,11 +212,11 @@ const importLine = (missionId: string, group: ReadonlyArray<MissionEvent>): Feed
     if (count > 0) counts.set(kind, (counts.get(kind) ?? 0) + count);
   };
   let staleClosed = 0;
-  let keptModels = 0;
+  const keptRoles = new Set<string>();
   let other = 0;
   for (const event of group) {
     if (isImportFallout(event)) {
-      keptModels += 1;
+      for (const roleId of falloutRoles(event)) keptRoles.add(roleId);
       continue;
     }
     if (event.kind === "import.applied") {
@@ -206,13 +238,18 @@ const importLine = (missionId: string, group: ReadonlyArray<MissionEvent>): Feed
       staleClosed += 1;
       continue;
     }
+    const recordKind = IMPORT_RECORD_KINDS[event.kind];
+    if (recordKind !== undefined) {
+      add(recordKind, 1);
+      continue;
+    }
     other += 1;
   }
   const parts = [
     ...[...counts].map(([kind, count]) => countOf(count, kind)),
     staleClosed > 0 ? `${countOf(staleClosed, "approval")} closed as stale` : null,
-    keptModels === 1 ? "1 role keeps its imported model" : null,
-    keptModels > 1 ? `${keptModels} roles keep their imported model` : null,
+    keptRoles.size === 1 ? "1 role keeps its imported model" : null,
+    keptRoles.size > 1 ? `${keptRoles.size} roles keep their imported model` : null,
     other > 0 ? `${other} other change${other === 1 ? "" : "s"}` : null,
   ].filter((part) => part !== null);
   const newest = group.reduce((latest, event) => (event.at > latest.at ? event : latest));

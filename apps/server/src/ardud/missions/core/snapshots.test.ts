@@ -179,6 +179,50 @@ describe("since you last looked after a coord import", () => {
     );
   });
 
+  it("folds the batched imported-holders record into the import line", () => {
+    const accepted = [0, 0, 1, 2].map((n) => ({
+      roleId: `role-${n}`,
+      threadId: `t-${n}`,
+      model: "gpt-6",
+    }));
+    const events = [
+      batch("lane", 3, 1),
+      event(
+        "role.model-changed",
+        policy,
+        "4 imported holder(s) keep their model across 3 role(s)",
+        { phase: "imported", accepted },
+        importAt(2),
+      ),
+    ];
+    const feed = buildFeed({ missionId, events, notes: [], since: null });
+    assert.deepStrictEqual(
+      feed.map((item) => [item.kind, item.summary]),
+      [["note", "Imported from coord: 3 lanes, 3 roles keep their imported model"]],
+    );
+    assert.deepStrictEqual(buildDirectionCheck({ missionId, calls: [], events, since: null }), []);
+  });
+
+  it("counts plan records and placements instead of other changes", () => {
+    const placed = (kind: MissionEventKind, n: number) =>
+      Array.from({ length: n }, () => event(kind, coord, `${kind}`, null, importAt(1)));
+    const events = [
+      batch("lane", 3, 1),
+      ...placed("sub-mission.created", 2),
+      ...placed("milestone.created", 1),
+      ...placed("lane.moved", 3),
+      ...placed("member.changed", 2),
+      ...placed("work-item.updated", 1),
+    ];
+    const feed = buildFeed({ missionId, events, notes: [], since: null });
+    assert.deepStrictEqual(
+      feed.map((item) => item.summary),
+      [
+        "Imported from coord: 3 lanes, 2 sub-missions, 1 milestone, 3 lane placements, 2 coord members, 1 other change",
+      ],
+    );
+  });
+
   it("leaves out imports before the owner last looked", () => {
     const events = [batch("lane", 3, 1), batch("rule", 2, 2)];
     assert.deepStrictEqual(buildFeed({ missionId, events, notes: [], since: importAt(5) }), []);
