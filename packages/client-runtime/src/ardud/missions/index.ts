@@ -14,3 +14,4 @@ export * from "./timelineViewModel.ts";
 export * from "./portfolioViewModel.ts";
 export * from "./textDiff.ts";
 export { createFixtureMissionsSource, type FixtureMissionsSourceOptions } from "./fixture/index.ts";
+export * from "./views/index.ts";
