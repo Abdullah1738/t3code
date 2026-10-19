@@ -220,6 +220,34 @@ describe("master inbox feed", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("a long downtime still reaches the master: no missed event is too old", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      yield* (yield* feedOf(null)).backfill;
+      // Down: an approval for the master, then a long stretch of other events.
+      yield* openApproval(approval("7", "master"));
+      for (let index = 0; index < 2_100; index += 1) {
+        yield* store.appendEvent({
+          missionId,
+          kind: "mission.updated",
+          actor: { _tag: "system", component: "editor" },
+          provenance: editor,
+          summary: `noise ${index}`,
+          subject: null,
+        });
+      }
+      yield* (yield* feedOf(null)).backfill;
+      const messages = yield* controlMessages;
+      assert.strictEqual(messages.length, 1);
+      const rooms = yield* RouterStore.RouterStore;
+      const body = (yield* rooms.messageBody(messages[0]!.id)) ?? "";
+      assert.include(body, "acme/api#7");
+      assert.notInclude(body, "not scanned");
+    }).pipe(Effect.provide(h.layer));
+  });
+
   it.effect("a cursor that cannot be written neither stops the feed nor repeats a delivery", () => {
     const h = harness();
     return Effect.gen(function* () {

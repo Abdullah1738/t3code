@@ -118,6 +118,7 @@ describe("membership fails closed on unreadable records (router r4, Sol r3 P4/P5
       yield* seed;
       const sql = yield* SqlClient.SqlClient;
       // A table the reader cannot select from: every lookup is an SQL error.
+      yield* sql`DROP TABLE ardud_mission_guard_authority`;
       yield* sql`CREATE TABLE ardud_mission_guard_authority (kind TEXT NOT NULL, subject_id TEXT NOT NULL)`;
       assert.strictEqual(yield* failureCode(strangerTo(child)), "conflict");
       assert.strictEqual(yield* failureCode(strangerTo(legacy)), "conflict");

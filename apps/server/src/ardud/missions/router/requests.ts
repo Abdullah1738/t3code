@@ -115,6 +115,8 @@ export interface OwnerRequestDeps {
   ) => Effect.Effect<void>;
 }
 
+type RoomCount = { readonly total: number; readonly unreadForOwner: number };
+
 type Caller =
   | { readonly _tag: "owner"; readonly actor: MissionActor }
   | { readonly _tag: "master"; readonly actor: MissionActor; readonly threadId: ThreadId }
@@ -163,11 +165,15 @@ const refOf = (request: OwnerRequest): MissionRecordRef => ({
 });
 
 /**
- * One key per iMessage across every mission: the same inbound message can
- * open or answer one request, once. Retries land on what it already wrote.
+ * One key per iMessage and request: the same inbound message can write to
+ * several requests ("approve both"), once each. Retries land on what it
+ * already wrote there.
  */
-const inboundKeyOf = (provenance: MissionProvenance) =>
-  provenance._tag === "owner-imessage" ? `owner-imessage:${provenance.inboundId}` : null;
+const inboundKeyOf = (provenance: MissionProvenance, requestId: OwnerRequestId) =>
+  provenance._tag === "owner-imessage"
+    ? `${inboundPrefixOf(provenance.inboundId)}${requestId}`
+    : null;
+const inboundPrefixOf = (inboundId: string) => `owner-imessage:${inboundId}:`;
 
 /** Mission-scoped store records a reply may link to; each must be in the request's mission. */
 const SCOPED_LINK_KINDS = [
@@ -258,6 +264,43 @@ const holdsSentences = (said: ReadonlyArray<string>, quote: ReadonlyArray<string
     if (quote.every((sentence, at) => said[start + at] === sentence)) return true;
   }
   return false;
+};
+
+/**
+ * Words where he takes back what he said before them: "Scrap that.",
+ * "Never mind,", "No wait,", "Actually, no.", "On second thought". Most need
+ * a stop after them, so "Never mind the docs" and "Don't forget that." are
+ * not one. A stray match only makes `verify` refuse; it never lets a
+ * withdrawn word stand. "Cancel it" and "scrap it" are left out: they are
+ * usually the decision itself.
+ */
+const RETRACTION = new RegExp(
+  String.raw`(?<!\b(?:don['’]?t|do not|didn['’]?t|won['’]?t) )\b(?:(?:scrap|scratch|strike|cancel|forget|ignore|disregard) (?:that|this|all that|all of that|what i (?:just )?said|my last message)|forget it|never ?mind|nvm|(?:i )?take (?:that|it|this) back|no,? wait|wait,? no|actually,? no)(?=\s*(?:[,.;:!…]|$))|\bon second thought\b`,
+  "giu",
+);
+
+/** Where the last retraction in a sentence ends, or null. */
+const retractionEnd = (sentence: string) => {
+  let end: number | null = null;
+  for (const match of sentence.matchAll(RETRACTION)) end = match.index + match[0].length;
+  return end;
+};
+
+/**
+ * The sentences of one message that still stand: none before its last
+ * retraction. The sentence holding it stands whole ("Rebase it... no wait,
+ * leave it") only when words follow it; a message that ends by taking things
+ * back stands for nothing.
+ */
+export const standingSentences = (sentences: ReadonlyArray<string>) => {
+  for (let at = sentences.length - 1; at >= 0; at -= 1) {
+    const sentence = sentences[at] ?? "";
+    const end = retractionEnd(sentence);
+    if (end === null) continue;
+    const rest = sentence.slice(end).replace(/[\s,.;:!…-]+/gu, "");
+    return sentences.slice(rest.length > 0 ? at : at + 1);
+  }
+  return sentences;
 };
 
 /** The owner's own words: his app, or his own iMessage chat (not Moni's). */
@@ -354,8 +397,8 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
       });
 
     /**
-     * A keyed post lands once: refuse the key when it already wrote in another
-     * mission, or under a different request or text in this one.
+     * A keyed post lands once: refuse the key when it already wrote a
+     * different text or into another room.
      */
     const priorPost = (
       key: string | null,
@@ -363,12 +406,6 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
     ): Effect.Effect<"fresh" | "repeat", MissionError> =>
       Effect.gen(function* () {
         if (key === null) return "fresh";
-        const elsewhere = (yield* rooms.keyMissions(key)).filter(
-          (missionId) => missionId !== input.missionId,
-        );
-        if (elsewhere.length > 0) {
-          return yield* fail("conflict", "That message from the owner was already used elsewhere.");
-        }
         const prior = yield* rooms.messageByKey(input.missionId, key);
         if (prior === null) return "fresh";
         if (prior.message.roomId !== input.roomId || prior.contentHash !== postContentHash(input)) {
@@ -533,10 +570,41 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         };
       });
 
+    /**
+     * What an open about `subject` already wrote, when it is a retry: the
+     * message under its own key, or for an iMessage, the one it added to a
+     * request about the same record (it may have written to others too).
+     */
+    const appendedBefore = (
+      missionId: MissionId,
+      inboundId: string | null,
+      openKey: string,
+      subject: MissionRecordRef,
+    ) =>
+      Effect.gen(function* () {
+        const priors =
+          inboundId === null
+            ? [yield* rooms.messageByKey(missionId, openKey)].filter((prior) => prior !== null)
+            : yield* rooms.messagesByKeyPrefix(missionId, inboundPrefixOf(inboundId));
+        for (const prior of priors) {
+          const priorId = requestIdOfRoom(prior.message.roomId);
+          if (priorId === null) continue;
+          const request = yield* need(priorId);
+          // A plain key is one action: reused about another record, it conflicts.
+          if (inboundId === null || sameRef(request.subject, subject)) {
+            return { request, contentHash: prior.contentHash };
+          }
+        }
+        return null;
+      });
+
     /** The open request about a record, if there is one. */
     const openAbout = (missionId: MissionId, ref: MissionRecordRef) =>
       Effect.map(
-        store.listAllInMission("owner-request", missionId, ["waiting-on-master", "answered"]),
+        store.listOwnerRequests(missionId, {
+          status: ["waiting-on-master", "answered"],
+          subject: ref,
+        }),
         (requests) => requests.find((request) => sameRef(request.subject, ref)) ?? null,
       );
 
@@ -559,7 +627,19 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         return done.result;
       });
 
-    const viewOf = (request: OwnerRequest, limit: number, withBodies: boolean) =>
+    /**
+     * The discussion counter: unread messages, at least 1 while the request
+     * is unread (a settle with no master note still marks it unread).
+     */
+    const unreadMessagesOf = (request: OwnerRequest, counts: ReadonlyMap<string, RoomCount>) =>
+      request.unreadForOwner ? Math.max(1, counts.get(request.roomId)?.unreadForOwner ?? 0) : 0;
+
+    const viewOf = (
+      request: OwnerRequest,
+      limit: number,
+      withBodies: boolean,
+      counts: ReadonlyMap<string, RoomCount>,
+    ) =>
       Effect.gen(function* () {
         const page = yield* rooms.roomMessages(request.roomId, null, limit);
         const messages = yield* Effect.forEach(page.messages, (message) =>
@@ -573,6 +653,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           messages,
           hasOlder: page.hasOlder,
           unreadForOwner: request.unreadForOwner,
+          unreadMessages: unreadMessagesOf(request, counts),
         } satisfies OwnerRequestView;
       });
 
@@ -585,20 +666,26 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         yield* missionOf(input.missionId);
         const caller = yield* callerOf(yield* loadCast(input.missionId), provenance);
         const words = caller._tag !== "reader" || readsRequestWords(provenance, ownerSession);
-        const records = yield* store.list("owner-request", {
-          missionId: input.missionId,
+        const records = yield* store.listOwnerRequests(input.missionId, {
           ...(input.status === undefined ? {} : { status: [input.status] }),
           ...(input.requestId === undefined ? {} : { ids: [input.requestId] }),
+          ...(input.discussions === undefined ? {} : { discussions: input.discussions }),
+          ...(input.subject === undefined ? {} : { subject: input.subject }),
+          ...(input.unread === true ? { unread: true } : {}),
           limit: LIST_MAX,
         });
         if (input.requestId !== undefined && records.length === 0) {
           return yield* fail("not-found", `No request ${input.requestId} in ${input.missionId}.`);
         }
+        const counts = yield* rooms.roomCounts(
+          input.missionId,
+          records.filter((request) => request.unreadForOwner).map((request) => request.roomId),
+        );
         // A list carries summaries; one request asked for by id carries its bodies.
         const one = input.requestId !== undefined;
         const requests = words
           ? yield* Effect.forEach(records, (request) =>
-              viewOf(request, one ? VIEW_ONE : VIEW_MESSAGES, one),
+              viewOf(request, one ? VIEW_ONE : VIEW_MESSAGES, one, counts),
             )
           : records.map((request) =>
               withoutWords({
@@ -606,6 +693,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
                 messages: [],
                 hasOlder: false,
                 unreadForOwner: request.unreadForOwner,
+                unreadMessages: unreadMessagesOf(request, counts),
               }),
             );
         return { missionId: input.missionId, requests } satisfies OwnerRequests;
@@ -647,34 +735,47 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           const subject =
             input.subject === undefined ? null : yield* subjectOf(mission.id, input.subject);
           const to = writer._tag === "owner" ? yield* masterAddress(cast) : [];
-          const inboundKey = inboundKeyOf(provenance);
-          const idKey = input.key ?? inboundKey;
+          const inboundId = provenance._tag === "owner-imessage" ? provenance.inboundId : null;
+          // One iMessage can discuss several records: each is its own request.
+          const idKey =
+            input.key ??
+            (inboundId === null
+              ? null
+              : `owner-imessage:${inboundId}${subject === null ? "" : `:${subject.kind}:${subject.id}`}`);
           const requestId =
             idKey === null
               ? OwnerRequestId.make(`request-${NodeCrypto.randomUUID()}`)
               : keyedRequestId(mission.id, idKey);
+          const inboundKey = inboundKeyOf(provenance, requestId);
           // One open conversation per record: Discuss again adds to it. The
           // added message keeps this open's own key, so a retry finds it even
           // after that request was settled.
-          const appendKey = idKey === null ? null : (inboundKey ?? `request:${requestId}:open`);
-          if (subject !== null && appendKey !== null) {
-            const prior = yield* rooms.messageByKey(mission.id, appendKey);
-            const priorRequest = prior === null ? null : requestIdOfRoom(prior.message.roomId);
-            if (prior !== null && priorRequest !== null) {
-              const earlier = yield* need(priorRequest);
+          const appendKey = (target: OwnerRequestId) =>
+            idKey === null
+              ? null
+              : (inboundKeyOf(provenance, target) ?? `request:${requestId}:open`);
+          if (subject !== null && idKey !== null) {
+            const prior = yield* appendedBefore(
+              mission.id,
+              inboundId,
+              `request:${requestId}:open`,
+              subject,
+            );
+            if (prior !== null) {
+              const earlier = prior.request;
               const same = postContentHash(
                 messageInput(
-                  { missionId: mission.id, roomId: prior.message.roomId },
+                  { missionId: mission.id, roomId: earlier.roomId },
                   "request",
                   input.text,
                   to,
-                  appendKey,
+                  appendKey(earlier.id),
                 ),
               );
               if (prior.contentHash !== same || !sameRef(earlier.subject, subject)) {
                 return yield* fail(
                   "conflict",
-                  `Key ${input.key ?? appendKey} already said something else in ${priorRequest}.`,
+                  `Key ${input.key ?? appendKey(earlier.id)} already said something else in ${earlier.id}.`,
                 );
               }
               return { result: earlier, speaker: null, deliveries: [] };
@@ -685,7 +786,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             return yield* replyLocked(
               { requestId: ongoing.id, text: input.text },
               provenance,
-              appendKey,
+              appendKey(ongoing.id),
             );
           }
           const roomId = requestRoomId(mission.id, requestId);
@@ -715,7 +816,11 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               missionId: mission.id,
               subMissionId,
               kind: "owner-request",
-              title: `Request: ${title}`,
+              // A discussion's room names the record it is on, not his words.
+              title:
+                subject === null
+                  ? `Request: ${title}`
+                  : `Discussion: ${subject.label ?? `${subject.kind} ${subject.id}`}`,
               workItemId: null,
               archived: false,
               lastSeq: 0,
@@ -790,7 +895,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         const owner = writer._tag === "owner";
         const key =
           messageKey ??
-          inboundKeyOf(provenance) ??
+          inboundKeyOf(provenance, request.id) ??
           (input.key === undefined ? null : `request:${request.id}:${input.key}`);
         const to = owner ? yield* masterAddress(cast) : [];
         const message = messageInput(request, owner ? "request" : "status", input.text, to, key);
@@ -909,7 +1014,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           owner ? "decision" : "status",
           noteText,
           to,
-          inboundKeyOf(provenance),
+          inboundKeyOf(provenance, request.id),
         );
         if ((yield* priorPost(note.key ?? null, note)) === "repeat") return none;
         let written: OwnerRequest | null = null;
@@ -999,7 +1104,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             owner ? "request" : "status",
             text,
             to,
-            inboundKeyOf(provenance),
+            inboundKeyOf(provenance, request.id),
           );
           yield* priorPost(message.key ?? null, message);
           let written: OwnerRequest | null = null;
@@ -1089,7 +1194,6 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             (body) => ({
               seq: message.seq,
               author: labelOf(cast, message.author),
-              at: message.createdAt,
               text: body ?? message.summary,
             }),
           ),
@@ -1105,8 +1209,9 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
 
     /**
      * Whether `quote` is in the owner's newest message of his own in the
-     * request since it last reopened. A later message of his replaces what he
-     * said before, so a withdrawn condition never stands.
+     * request since it last reopened, after any retraction in it. A later
+     * message of his replaces what he said before, so a withdrawn condition
+     * never stands, and a message that only takes things back stands for nothing.
      */
     const ownerSaid = (request: OwnerRequest, quote: string): Effect.Effect<boolean> =>
       Effect.gen(function* () {
@@ -1123,7 +1228,9 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             if (message.seq <= after) return false;
             if (!ownWords(message)) continue;
             const body = message.hasBody ? yield* rooms.messageBody(message.id) : null;
-            return holdsSentences(sentencesOf(body ?? message.summary), wanted);
+            // His newest message replaces everything before it; within it, a
+            // "scrap that" withdraws what came before, so only what follows stands.
+            return holdsSentences(standingSentences(sentencesOf(body ?? message.summary)), wanted);
           }
           const oldest: MissionMessage | undefined = page.messages[0];
           if (!page.hasOlder || oldest === undefined) return false;

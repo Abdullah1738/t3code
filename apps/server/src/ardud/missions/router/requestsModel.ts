@@ -129,10 +129,13 @@ export const reopenedByMaster = (
 // ---------------------------------------------------------------------------
 // The master's transcript
 
+/**
+ * One message of the transcript. No clock time: the owner reads this text in
+ * the master's thread, and a baked time would show in the server's zone.
+ */
 export interface TranscriptMessage {
   readonly seq: number;
   readonly author: string;
-  readonly at: string;
   readonly text: string;
 }
 
@@ -142,7 +145,7 @@ const clipText = (text: string) =>
     : `${text.slice(0, MESSAGE_CONTEXT_MAX)}\n[cut: ${text.length - MESSAGE_CONTEXT_MAX} more characters; mission_requests has the whole message]`;
 
 const blockOf = (message: TranscriptMessage) =>
-  `#${message.seq} ${message.author} at ${message.at}:\n${clipText(message.text)}\n`;
+  `#${message.seq} ${message.author}:\n${clipText(message.text)}\n`;
 
 const refLine = (ref: MissionRecordRef) =>
   ref.label === undefined || ref.label.length === 0
@@ -187,7 +190,7 @@ export const renderRequestContext = (input: {
     subject === null
       ? `Owner request ${request.id}: "${request.title}"`
       : `Owner discussion ${request.id} on ${refLine(subject.ref)}: "${request.title}"`,
-    `Status: ${request.status}. Opened ${request.createdAt} by ${input.openedBy}.`,
+    `Status: ${request.status}. Opened by ${input.openedBy}.`,
     ...about,
     "The whole conversation follows, oldest first. Do not ask the owner to repeat any of it.",
     "",

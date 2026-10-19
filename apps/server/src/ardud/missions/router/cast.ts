@@ -111,6 +111,12 @@ export const recordMembership = (cast: RouterCast, threadId: ThreadId): MemberKi
   return holdsRole || holdsLane || holdsFork ? "created" : null;
 };
 
+/** The lane, else the role, a thread holds in this mission: what to call it. */
+export const heldBy = (cast: RouterCast, threadId: ThreadId): MissionActor | null => {
+  const [, ...held] = actorsOfThread(cast, threadId);
+  return held.find((actor) => actor._tag === "lane") ?? held[0] ?? null;
+};
+
 export const labelOf = (cast: RouterCast, actor: MissionActor): string => {
   switch (actor._tag) {
     case "owner":
@@ -119,8 +125,10 @@ export const labelOf = (cast: RouterCast, actor: MissionActor): string => {
       return cast.roles.find((role) => role.id === actor.roleId)?.name ?? actor.roleId;
     case "lane":
       return cast.lanes.find((lane) => lane.id === actor.laneId)?.name ?? actor.laneId;
-    case "thread":
-      return `thread ${actor.threadId}`;
+    case "thread": {
+      const held = heldBy(cast, actor.threadId);
+      return held === null ? `thread ${actor.threadId}` : labelOf(cast, held);
+    }
     case "system":
       return actor.component;
     case "person":

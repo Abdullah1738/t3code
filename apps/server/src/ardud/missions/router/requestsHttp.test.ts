@@ -266,6 +266,25 @@ describe("owner requests over iMessage", () => {
             expect(bare.reply.requests[0].messages).toEqual([]);
             expect(JSON.stringify(bare.reply)).not.toContain("flaky test");
           }
+          // His requests about no record, discussions, one record's discussions.
+          const filtered = async (query: string) => {
+            const listed = await call(
+              handle,
+              "GET",
+              `/requests?mission=${missionId}&${query}`,
+              undefined,
+              "cli-token",
+            );
+            return listed.status === 200
+              ? listed.reply.requests.map((each: any) => each.request.id)
+              : listed.status;
+          };
+          expect(await filtered("discussions=false")).toEqual([requestId]);
+          expect(await filtered("discussions=true")).toEqual([]);
+          expect(await filtered("about=work-item:wi-free")).toEqual([]);
+          expect(await filtered("unread=true")).toEqual([]);
+          expect(await filtered("discussions=maybe")).toBe(400);
+          expect(await filtered("about=wi-free")).toBe(400);
 
           // He settles it from iMessage; a retry replays and he can reopen it later.
           const settled = await call(
