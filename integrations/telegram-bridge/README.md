@@ -64,11 +64,12 @@ under `~/.config/telegram-bridge/`.
 ## Robob backend
 
 `src/robob.ts` implements the same `AlertBackend` interface on Robob's control
-API. Switch and token lookup match the iMessage bridge: `BRIDGE_BACKEND=robob`
-or `"backend": "robob"` in config.json (default `openchamber`), then
-`T3_CONTROL_URL`/`T3_CONTROL_TOKEN`, then the first chmod 600 file found of
-`T3_CONTROL_TOKEN_FILE`, `~/.robob/components/telegram-bridge.json` (its own
-component credential) and the old shared `~/.robob/ardud-control.json`.
+API. Switch it on with `BRIDGE_BACKEND=robob` or `"backend": "robob"` in
+config.json (default `openchamber`). The token comes from
+`T3_CONTROL_URL`/`T3_CONTROL_TOKEN`, else the chmod 600 file named by
+`T3_CONTROL_TOKEN_FILE` (which must exist), else
+`~/.robob/components/telegram-bridge.json` (its own component credential),
+else the old shared `~/.robob/ardud-control.json`.
 
 - Events: one `GET /events` stream, resumed with `Last-Event-ID` across
   reconnects, decoded into the same notification events as before

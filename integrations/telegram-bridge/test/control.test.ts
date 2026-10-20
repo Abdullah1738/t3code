@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { COMPONENT_TOKEN_FILE, discoverControlConfig } from "../src/control.ts";
+import { discoverControlConfig } from "../src/control.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -18,14 +18,23 @@ const tokenFile = (name: string, token: string, mode = 0o600) => {
   return file;
 };
 
-test("control config reads the bridge's own component credential by default", () => {
-  expect(COMPONENT_TOKEN_FILE.endsWith(join(".robob", "components", "telegram-bridge.json"))).toBe(true);
+test("control config reads the bridge's own credential before the shared file", () => {
+  const home = mkdtempSync(join(tmpdir(), "telegram-control-"));
+  dirs.push(home);
+  const write = (path: string, token: string) => {
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(path, JSON.stringify({ url: "http://127.0.0.1:14033", token }), { mode: 0o600 });
+  };
+  write(join(home, ".robob", "ardud-control.json"), "shared");
+  expect(discoverControlConfig({ home, env: {} }).token).toBe("shared");
+  write(join(home, ".robob", "components", "telegram-bridge.json"), "own");
+  expect(discoverControlConfig({ home, env: {} }).token).toBe("own");
 });
 
-test("control config skips a missing token file and uses the next one", () => {
-  const next = tokenFile("next.json", "next");
-  expect(discoverControlConfig({ tokenFile: join(tmpdir(), "missing-telegram.json"), env: { T3_CONTROL_TOKEN_FILE: next } }))
-    .toEqual({ url: "http://127.0.0.1:14033", token: "next" });
+test("control config refuses a named token file that does not exist", () => {
+  const home = mkdtempSync(join(tmpdir(), "telegram-control-"));
+  dirs.push(home);
+  expect(() => discoverControlConfig({ env: { T3_CONTROL_TOKEN_FILE: join(home, "missing.json") }, home })).toThrow("ENOENT");
 });
 
 test("control config refuses a token file others can read", () => {

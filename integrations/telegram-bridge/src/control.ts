@@ -1,14 +1,13 @@
 // Client for Robob's local control API (/api/ardud/control/*), plus the
 // mapping from its thread and request shapes onto the bridge vocabulary.
-// spectrum-bridge and telegram-bridge each carry a copy of this file, since
-// each package is deployed on its own. Only the component credential differs.
+// spectrum-bridge carries its own variant of this file, since each package is
+// deployed on its own; they differ in which control credential they read.
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionRequest, QuestionRequest } from "./openchamber.ts";
 
-export const COMPONENT_TOKEN_FILE = join(homedir(), ".robob", "components", "telegram-bridge.json");
-export const SHARED_TOKEN_FILE = join(homedir(), ".robob", "ardud-control.json");
+const COMPONENT = "telegram-bridge";
 const PREFIX = "/api/ardud/control";
 const LOOPBACK = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]+)?\/?$/i;
 
@@ -106,27 +105,31 @@ export interface ControlConfigOptions {
   token?: string;
   tokenFile?: string;
   env?: Record<string, string | undefined>;
+  home?: string;
 }
 
 /**
- * Explicit options, then T3_CONTROL_URL / T3_CONTROL_TOKEN, then the first token
- * file that exists out of `tokenFile`, T3_CONTROL_TOKEN_FILE, this bridge's own
- * component credential and the shared ~/.robob/ardud-control.json. Token files
- * must be chmod 600. Same order as the control API's own client.mjs.
+ * Explicit options, then T3_CONTROL_URL / T3_CONTROL_TOKEN, then a token file.
+ * A file named by `tokenFile` or T3_CONTROL_TOKEN_FILE must exist, so a typo
+ * never acts as another component. Otherwise this bridge's own component
+ * credential, then the shared ~/.robob/ardud-control.json, whichever exists
+ * first. Token files must be chmod 600. Same order as the control API's own
+ * client.mjs.
  */
 export function discoverControlConfig(options: ControlConfigOptions = {}): { url: string; token: string } {
   const env = options.env ?? process.env;
   let url = options.url ?? env.T3_CONTROL_URL;
   let token = options.token ?? env.T3_CONTROL_TOKEN;
-  const files = [options.tokenFile, env.T3_CONTROL_TOKEN_FILE, COMPONENT_TOKEN_FILE, SHARED_TOKEN_FILE];
+  const named = options.tokenFile ?? env.T3_CONTROL_TOKEN_FILE;
+  const robob = join(options.home ?? homedir(), ".robob");
+  const files = named ? [named] : [join(robob, "components", `${COMPONENT}.json`), join(robob, "ardud-control.json")];
   for (const file of url && token ? [] : files) {
-    if (!file) continue;
     let stored: { url?: unknown; token?: unknown };
     try {
       if (statSync(file).mode & 0o077) throw new Error("Robob control token file must be chmod 600");
       stored = JSON.parse(readFileSync(file, "utf8"));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && !named) continue;
       throw error;
     }
     url ??= typeof stored?.url === "string" ? stored.url : undefined;
