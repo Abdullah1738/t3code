@@ -20,7 +20,6 @@ import {
   roomListLine,
   roomMembers,
   roomMembersLine,
-  roomsSummary,
   roomStats,
   roomTimeline,
   statusRunLine,
@@ -160,14 +159,7 @@ describe("room figures", () => {
     expect(roomListLine(room("quiet", "custom"), now, "UTC")).toBeNull();
   });
 
-  it("sums the list's message counts and leaves out what the server does not send", () => {
-    expect(
-      roomsSummary([
-        { room: { ...busy, messageCount: 12_000 } as Room, unread: 160 },
-        { room: { ...room("arch", "arch"), messageCount: 783 } as Room, unread: 2 },
-      ]),
-    ).toEqual({ messages: 12_783, rooms: 2, unread: 162 });
-    expect(roomsSummary([{ room: busy, unread: 0 }]).messages).toBeNull();
+  it("reads a room's figures and leaves out what the server does not send", () => {
     expect(roomStats(busy.noise, 12_000)).toEqual([
       { label: "Messages", value: "12,000" },
       { label: "Per hour", value: "52.6" },

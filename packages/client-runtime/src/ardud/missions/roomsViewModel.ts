@@ -217,25 +217,6 @@ export function roomStats(
   return stats;
 }
 
-export interface RoomsSummary {
-  /** All messages across the listed rooms; null when the list carries no counts. */
-  readonly messages: number | null;
-  readonly rooms: number;
-  readonly unread: number;
-}
-
-export function roomsSummary(entries: ReadonlyArray<MissionRoomEntry>): RoomsSummary {
-  const listed = entries.filter((entry) => !entry.room.archived);
-  const counts = listed.map((entry) => entry.room.messageCount);
-  return {
-    messages: counts.some((count) => count !== undefined)
-      ? counts.reduce<number>((sum, count) => sum + (count ?? 0), 0)
-      : null,
-    rooms: listed.length,
-    unread: totalUnread(listed),
-  };
-}
-
 export type NoiseTone = "calm" | "busy" | "noisy";
 
 export interface NoiseView {

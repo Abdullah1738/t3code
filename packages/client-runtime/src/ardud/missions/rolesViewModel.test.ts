@@ -12,7 +12,6 @@ import {
   roleHistory,
   roleModelChoices,
   roleRegistryView,
-  rolesSummary,
   roleThreadLine,
   setCriticalityGuideInput,
   setRoleModelInput,
@@ -161,8 +160,6 @@ describe("roles view model", () => {
   });
 });
 
-const SUMMARY =
-  "40 roles: the master, 1 final reviewer, 1 reviewer and 37 lane leads. 22 on Haiku, 16 on Opus, 1 on gpt-6-astra, 1 on gpt-6.1-sol.";
 const REVIEWERS: Array<[string, string]> = [
   ["Sol review", "Sol reviewer"],
   ["Astra final at exact head", "Astra final"],
@@ -170,15 +167,12 @@ const REVIEWERS: Array<[string, string]> = [
 ];
 
 describe("roles page", () => {
-  const text = (parts: ReadonlyArray<string | { figure: string }>) =>
-    parts.map((part) => (typeof part === "string" ? part : part.figure)).join("");
-
-  it("sums up the roles by kind and model family, and reads each thread by its short code", () => {
+  it("reads each role's model family and each thread by its short code", () => {
     const missions = source();
     const roles = live<MissionRolesSnapshot>((l) => missions.subscribeRoles(CRPKO, l));
     const view = roleRegistryView(roles.value, MASTER);
 
-    expect(text(rolesSummary(view))).toBe(SUMMARY);
+    expect(view.rows).toHaveLength(40);
     const master = view.rows[0];
     if (!master) throw new Error("no master");
     expect(master.family).toBe("Opus");

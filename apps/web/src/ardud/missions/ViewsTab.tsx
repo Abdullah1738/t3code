@@ -26,7 +26,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../../components/ui/menu
 import { Skeleton } from "../../components/ui/skeleton";
 import { cn } from "../../lib/utils";
 import { ByMarker } from "./cards/chips";
-import { DESK_ROW, Figure, FoldRow, PageLine, PanelCount } from "./deskParts";
+import { DESK_ROW, FoldRow, PanelCount, TabActions } from "./deskParts";
 import { runMissionAction } from "./missionActions";
 import { missionsSource, useMissionInbox, useMissionList, useMissionViews } from "./missionsStore";
 import { OfflineLine } from "./sections/FeedError";
@@ -77,14 +77,12 @@ export function ViewsTab(props: { missionId: MissionId; nowMs: number }) {
     rows: group.rows.filter((row) => !setAside(row)),
   }));
   const aside = groups.flatMap((group) => group.rows.filter(setAside));
-  const sectionCount = layout.stacked.length;
   const pinned = waiting ?? views.snapshot.ownerWaiting;
   return (
     <div className="flex min-w-0 flex-col gap-5">
-      <PageLine actions={<CopyFrom missionId={props.missionId} />}>
-        <Figure>{sectionCount}</Figure> {sectionCount === 1 ? "section" : "sections"} on the board,{" "}
-        <Figure>{views.changes.length}</Figure> {views.changes.length === 1 ? "change" : "changes"}.
-      </PageLine>
+      <TabActions>
+        <CopyFrom missionId={props.missionId} />
+      </TabActions>
       <div className="grid min-w-0 items-start gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <div className="flex min-w-0 flex-col gap-4">
           <section aria-labelledby="views-board" className={PANEL}>

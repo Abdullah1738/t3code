@@ -27,7 +27,7 @@ import {
 import { Button } from "../../components/ui/button";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { DESK_ROW, DeskChip, FeedErrors, Figure, FoldRow, PageLine, TabLoading } from "./deskParts";
+import { DESK_ROW, DeskChip, FeedErrors, FoldRow, TabActions, TabLoading } from "./deskParts";
 import { submitMissionInput } from "./missionActions";
 import { PairActionForm, TextActionForm } from "./MissionForms";
 import {
@@ -103,20 +103,11 @@ export function RulesTab(props: {
   return (
     <div className="flex min-w-0 flex-col gap-5">
       <FeedErrors what="the rules" feeds={feeds} nowMs={props.nowMs} />
-      <PageLine
-        actions={
-          <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
-            New rule
-          </Button>
-        }
-      >
-        <Figure>{view.active.length}</Figure> active
-        {view.retired.length > 0 ? (
-          <>
-            , <Figure>{view.retired.length}</Figure> retired
-          </>
-        ) : null}
-      </PageLine>
+      <TabActions>
+        <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
+          New rule
+        </Button>
+      </TabActions>
       {adding ? (
         <div className="flex flex-col gap-2 rounded-3xl bg-(--m-surface) p-4 sm:p-5">
           <h2 className="text-sm font-semibold">New rule</h2>

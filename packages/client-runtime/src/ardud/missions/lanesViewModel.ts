@@ -21,7 +21,6 @@ import type {
   NudgeLaneInput,
   SetLaneParkedInput,
 } from "./source.ts";
-import type { SummaryPart } from "./portfolioViewModel.ts";
 import { formatPercent, sortLanesProblemsFirst } from "./viewModel.ts";
 
 // Lanes tab: one row per lane with its lead role, model, context gauge, the
@@ -181,8 +180,6 @@ export interface LanePanel {
 }
 
 export interface LaneBoard {
-  /** "79 live: 7 waiting, 17 working, 25 idle. 30 parked, 9 retired." */
-  readonly summary: ReadonlyArray<SummaryPart>;
   readonly panels: ReadonlyArray<LanePanel>;
 }
 
@@ -191,26 +188,6 @@ const longestFirst = (rows: LaneRow[]): LaneRow[] =>
   rows.sort((left, right) => activeAt(left).localeCompare(activeAt(right)));
 const latestFirst = (rows: LaneRow[]): LaneRow[] =>
   rows.sort((left, right) => activeAt(right).localeCompare(activeAt(left)));
-
-function laneSummary(rows: ReadonlyArray<LaneRow>): SummaryPart[] {
-  const count = (status: LaneStatus) => rows.filter((row) => row.lane.status === status).length;
-  const live = rows.filter((row) => row.lane.status !== "parked" && row.lane.status !== "retired");
-  const parts: SummaryPart[] = [{ key: "live", figure: String(live.length) }, " live"];
-  const liveParts = (["stuck", "waiting", "working", "idle"] as const).filter((s) => count(s) > 0);
-  liveParts.forEach((status, index) => {
-    parts.push(index === 0 ? ": " : ", ", { key: status, figure: String(count(status)) });
-    parts.push(` ${LANE_STATUS_LABEL[status].toLowerCase()}`);
-  });
-  parts.push(".");
-  const restParts = (["parked", "retired"] as const).filter((s) => count(s) > 0);
-  restParts.forEach((status, index) => {
-    parts.push(index === 0 ? " " : ", ", { key: status, figure: String(count(status)) });
-    parts.push(
-      ` ${LANE_STATUS_LABEL[status].toLowerCase()}${index === restParts.length - 1 ? "." : ""}`,
-    );
-  });
-  return parts;
-}
 
 function byState(rows: ReadonlyArray<LaneRow>): LanePanel[] {
   const of = (status: LaneStatus) => rows.filter((row) => row.lane.status === status);
@@ -285,17 +262,15 @@ function byKey(
     : panels;
 }
 
-/** The Lanes page: a page line and one panel per group. */
+/** The Lanes page: one panel per group. */
 export function laneBoard(
   rows: ReadonlyArray<LaneRow>,
   grouping: LaneGrouping,
   subMissionOrder: ReadonlyArray<string> = [],
 ): LaneBoard {
-  const summary = laneSummary(rows);
-  if (grouping === "state") return { summary, panels: byState(rows) };
+  if (grouping === "state") return { panels: byState(rows) };
   if (grouping === "lead") {
     return {
-      summary,
       panels: byKey(
         rows,
         (row) => ({ key: row.leadName, title: row.leadName }),
@@ -309,7 +284,6 @@ export function laneBoard(
     return index === -1 ? subMissionOrder.length : index;
   };
   return {
-    summary,
     panels: byKey(
       rows,
       (row) =>

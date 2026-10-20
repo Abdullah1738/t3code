@@ -7,7 +7,6 @@ import {
   consequences,
   EMPTY_TIMELINE_FILTER,
   filterTimeline,
-  formatDayLabel,
   formatTimeOfDay,
   inTimelineRange,
   kindChoices,
@@ -29,7 +28,7 @@ import {
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
 import { revertChange } from "./deskCommands";
-import { FeedErrors, Figure, FoldRow, PageLine, Segmented, TabLoading } from "./deskParts";
+import { FeedErrors, FoldRow, Segmented, TabActions, TabLoading } from "./deskParts";
 import { RevertButton } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import {
@@ -126,43 +125,35 @@ export function TimelineTab(props: { missionId: MissionId }) {
 
   if (!log || !view)
     return <TabLoading label="Loading timeline…" what="the timeline" feeds={feeds} nowMs={nowMs} />;
-  const oldest = log.events.at(-1);
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <FeedErrors what="the timeline" feeds={feeds} nowMs={nowMs} />
-      <PageLine
-        actions={
-          <>
-            <Segmented
-              label="Range"
-              value={range}
-              options={RANGES}
-              onChange={(value) => {
-                setRange(value);
-                setJumpTo(null);
-              }}
-            />
-            {restart ? (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={jumpTo !== null && !reached}
-                onClick={() => {
-                  setRange("all");
-                  setFilter(EMPTY_TIMELINE_FILTER);
-                  setJumpTo(restart.detectedAt);
-                }}
-              >
-                Jump to the restart
-              </Button>
-            ) : null}
-          </>
-        }
-      >
-        <Figure>{log.events.length}</Figure> events
-        {oldest ? ` since ${formatDayLabel(oldest.at)}` : null}
-      </PageLine>
+      <TabActions>
+        <Segmented
+          label="Range"
+          value={range}
+          options={RANGES}
+          onChange={(value) => {
+            setRange(value);
+            setJumpTo(null);
+          }}
+        />
+        {restart ? (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={jumpTo !== null && !reached}
+            onClick={() => {
+              setRange("all");
+              setFilter(EMPTY_TIMELINE_FILTER);
+              setJumpTo(restart.detectedAt);
+            }}
+          >
+            Jump to the restart
+          </Button>
+        ) : null}
+      </TabActions>
 
       <div className="grid min-w-0 items-start gap-4 lg:grid-cols-[220px_minmax(0,1fr)]">
         <div className="flex min-w-0 flex-col gap-3 lg:sticky lg:top-6 lg:gap-5.5">

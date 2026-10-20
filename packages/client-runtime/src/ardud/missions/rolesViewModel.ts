@@ -18,7 +18,6 @@ import type {
 
 import { changeIndex, lastChangedLine } from "./changeLog.ts";
 import { modelFamily, modelLabel } from "./lanesViewModel.ts";
-import type { SummaryPart } from "./portfolioViewModel.ts";
 import type { MissionReviewSnapshot, MissionRolesSnapshot } from "./source.ts";
 import { actorLabel, formatDayLabel, formatTimeOfDay } from "./viewModel.ts";
 
@@ -397,55 +396,6 @@ export function pullRequestReviews(
 export function threadCode(threadId: string): string {
   const last = threadId.split(":").at(-1) ?? threadId;
   return /^[0-9a-f]{8}-/i.test(last) ? last.slice(0, 8) : last;
-}
-
-const KIND_NOUN: Record<RoleKind, readonly [string, string]> = {
-  master: ["master", "masters"],
-  "sub-coordinator": ["sub-coordinator", "sub-coordinators"],
-  "lane-lead": ["lane lead", "lane leads"],
-  "lane-worker": ["lane worker", "lane workers"],
-  reviewer: ["reviewer", "reviewers"],
-  "final-reviewer": ["final reviewer", "final reviewers"],
-  writer: ["writer", "writers"],
-  scribe: ["scribe", "scribes"],
-  editor: ["editor", "editors"],
-  verifier: ["verifier", "verifiers"],
-  answerer: ["answerer", "answerers"],
-  custom: ["custom role", "custom roles"],
-};
-
-function joinAnd(parts: ReadonlyArray<string>): string {
-  if (parts.length <= 1) return parts[0] ?? "";
-  return `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
-}
-
-/** "52 roles: the master, 2 custom roles and 49 lane leads. 29 on Opus, 23 on Haiku." */
-export function rolesSummary(view: RoleRegistryView): SummaryPart[] {
-  const kinds = new Map<RoleKind, number>();
-  const families = new Map<string, number>();
-  for (const row of view.rows) {
-    kinds.set(row.role.kind, (kinds.get(row.role.kind) ?? 0) + 1);
-    families.set(row.family, (families.get(row.family) ?? 0) + 1);
-  }
-  const kindParts = [...kinds]
-    .sort((left, right) => ROLE_KIND_RANK[left[0]] - ROLE_KIND_RANK[right[0]])
-    .map(([kind, count]) => {
-      const [one, many] = KIND_NOUN[kind];
-      if (kind === "master" && count === 1) return "the master";
-      return `${count} ${count === 1 ? one : many}`;
-    });
-  const parts: SummaryPart[] = [
-    { key: "roles", figure: String(view.rows.length) },
-    ` ${view.rows.length === 1 ? "role" : "roles"}: ${joinAnd(kindParts)}.`,
-  ];
-  const mix = [...families].sort(
-    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
-  );
-  mix.forEach(([family, count], index) => {
-    parts.push(index === 0 ? " " : ", ", { key: `family:${family}`, figure: String(count) });
-    parts.push(` on ${family}${index === mix.length - 1 ? "." : ""}`);
-  });
-  return parts;
 }
 
 /**

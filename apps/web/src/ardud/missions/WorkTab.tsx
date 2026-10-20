@@ -20,10 +20,9 @@ import {
   DESK_ROW,
   DeskChip,
   FeedErrors,
-  Figure,
   FoldRow,
-  PageLine,
   Segmented,
+  TabActions,
   TabLoading,
 } from "./deskParts";
 import { MissionSection } from "./MissionSection";
@@ -72,30 +71,9 @@ export function WorkTab(props: { missionId: MissionId; nowMs: number }) {
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <FeedErrors what="the work" feeds={feeds} nowMs={props.nowMs} />
-      <PageLine
-        actions={
-          <Segmented label="Group by" value={grouping} options={GROUPINGS} onChange={setGrouping} />
-        }
-      >
-        <Figure>{board.open}</Figure> open
-        {board.withYou.length > 0 ? (
-          <>
-            , <Figure>{board.withYou.length}</Figure> with you
-          </>
-        ) : null}
-        {board.blocked.length > 0 ? (
-          <>
-            , <Figure>{board.blocked.length}</Figure> blocked
-          </>
-        ) : null}
-        .
-        {board.register.length > 0 ? (
-          <>
-            {" "}
-            <Figure>{board.register.length}</Figure> in the deferred register.
-          </>
-        ) : null}
-      </PageLine>
+      <TabActions>
+        <Segmented label="Group by" value={grouping} options={GROUPINGS} onChange={setGrouping} />
+      </TabActions>
 
       <ol className="grid grid-cols-4 gap-1 sm:grid-cols-7" aria-label="Open work by stage">
         {board.stages.map((stage) => (

@@ -21,7 +21,6 @@ import {
   roomFigures,
   roomListLine,
   roomMembersLine,
-  roomsSummary,
   statusRunLine,
   type ActorNames,
   type ComposerTarget,
@@ -39,15 +38,7 @@ import {
 import { Textarea } from "../../components/ui/textarea";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import {
-  DESK_ROW,
-  DeskChip,
-  FeedErrors,
-  Figure,
-  PageLine,
-  Segmented,
-  TabLoading,
-} from "./deskParts";
+import { DESK_ROW, DeskChip, FeedErrors, Segmented, TabLoading } from "./deskParts";
 import { nudgePending } from "./deskCommands";
 import { MissionLinkList } from "./MissionLinkText";
 import {
@@ -76,26 +67,12 @@ export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; n
   if (!rooms)
     return <TabLoading label="Loading rooms…" what="the rooms" feeds={feeds} nowMs={props.nowMs} />;
   const groups = groupRooms(rooms);
-  const summary = roomsSummary(rooms);
   // On a wide screen a room is always open: the first one until the owner picks.
   const openId = props.roomId ?? (wide ? (groups[0]?.rooms[0]?.room.id ?? null) : null);
   const openEntry = rooms.find((entry) => entry.room.id === openId) ?? null;
   return (
     <div className="flex min-w-0 flex-col gap-5">
       <FeedErrors what="the rooms" feeds={feeds} nowMs={props.nowMs} />
-      <PageLine>
-        {summary.messages !== null ? (
-          <>
-            <Figure>{COUNT.format(summary.messages)}</Figure> messages in{" "}
-          </>
-        ) : null}
-        <Figure>{summary.rooms}</Figure> {summary.rooms === 1 ? "room" : "rooms"}
-        {summary.unread > 0 ? (
-          <>
-            , <Figure>{COUNT.format(summary.unread)}</Figure> unread
-          </>
-        ) : null}
-      </PageLine>
       <div className="grid min-w-0 items-start gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
         <nav
           aria-label="Rooms"

@@ -10,7 +10,6 @@ import {
   roleHistory,
   roleModelChoices,
   roleRegistryView,
-  rolesSummary,
   roleThreadLine,
   routingRows,
   whenLabel,
@@ -25,7 +24,7 @@ import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { DESK_ROW, DeskChip, FeedErrors, Figure, FoldRow, PageLine, TabLoading } from "./deskParts";
+import { DESK_ROW, DeskChip, FeedErrors, FoldRow, TabActions, TabLoading } from "./deskParts";
 import { createRole } from "./deskCommands";
 import { PickForm, PickTextForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
@@ -64,17 +63,11 @@ export function RolesTab(props: { missionId: MissionId; nowMs: number }) {
   return (
     <div className="flex min-w-0 flex-col gap-5">
       <FeedErrors what="the roles" feeds={feeds} nowMs={props.nowMs} />
-      <PageLine
-        actions={
-          <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
-            New role
-          </Button>
-        }
-      >
-        {rolesSummary(view).map((part) =>
-          typeof part === "string" ? part : <Figure key={part.key}>{part.figure}</Figure>,
-        )}
-      </PageLine>
+      <TabActions>
+        <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
+          New role
+        </Button>
+      </TabActions>
       {adding ? (
         <div className="flex flex-col gap-2 rounded-3xl bg-(--m-surface) p-4 sm:p-5">
           <h2 className="text-sm font-semibold">New role</h2>

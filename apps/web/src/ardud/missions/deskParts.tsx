@@ -9,7 +9,7 @@ import { useMissionsOffline } from "./useMissionsConnection";
 // the segmented switch, the pill chip and the "N more" row. Colours come from
 // the Missions tokens in missions.css.
 
-/** The tab's one summary line, figures in ink, actions at the end. */
+/** A page's one summary line, figures in ink, actions at the end. */
 export function PageLine(props: { children: ReactNode; actions?: ReactNode }) {
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-x-6 gap-y-3">
@@ -18,6 +18,13 @@ export function PageLine(props: { children: ReactNode; actions?: ReactNode }) {
         <div className="flex flex-wrap items-center gap-2 sm:ms-auto">{props.actions}</div>
       ) : null}
     </div>
+  );
+}
+
+/** A mission tab's controls, right-aligned above its content. */
+export function TabActions(props: { children: ReactNode }) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">{props.children}</div>
   );
 }
 

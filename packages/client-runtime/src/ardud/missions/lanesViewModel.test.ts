@@ -71,9 +71,6 @@ describe("lane rows", () => {
 });
 
 describe("lane board", () => {
-  const text = (parts: ReadonlyArray<string | { figure: string }>) =>
-    parts.map((part) => (typeof part === "string" ? part : part.figure)).join("");
-
   const withRetired = () => {
     const { rows } = fixtureRows();
     const first = rows[0]!;
@@ -83,14 +80,10 @@ describe("lane board", () => {
     ];
   };
 
-  it("says how many lanes are live and groups by state, longest waits first", () => {
+  it("groups lanes by state, longest waits first", () => {
     const rows = withRetired();
     const board = laneBoard(rows, "state");
     const count = (status: string) => rows.filter((row) => row.lane.status === status).length;
-    const live = rows.length - count("parked") - count("retired");
-    expect(text(board.summary)).toBe(
-      `${live} live: ${count("stuck")} stuck, ${count("waiting")} waiting, ${count("working")} working, ${count("idle")} idle. ${count("parked")} parked, ${count("retired")} retired.`,
-    );
     expect(board.panels.map((panel) => panel.title)).toEqual([
       "Stuck",
       "Waiting",

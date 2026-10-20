@@ -20,15 +20,7 @@ import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { StateGlyph, type StateGlyphKind } from "./cards/chips";
-import {
-  DESK_ROW,
-  FeedErrors,
-  Figure,
-  FoldRow,
-  PageLine,
-  Segmented,
-  TabLoading,
-} from "./deskParts";
+import { DESK_ROW, FeedErrors, FoldRow, Segmented, TabActions, TabLoading } from "./deskParts";
 import { PairActionForm, PickForm, TextActionForm } from "./MissionForms";
 import { createLane } from "./deskCommands";
 import { MissionSection } from "./MissionSection";
@@ -94,25 +86,12 @@ export function LanesTab(props: { overview: MissionOverviewSnapshot; nowMs: numb
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <FeedErrors what="the lanes" feeds={feeds} nowMs={props.nowMs} />
-      <PageLine
-        actions={
-          <>
-            <Segmented
-              label="Group by"
-              value={grouping}
-              options={GROUPINGS}
-              onChange={setGrouping}
-            />
-            <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
-              New lane
-            </Button>
-          </>
-        }
-      >
-        {board.summary.map((part) =>
-          typeof part === "string" ? part : <Figure key={part.key}>{part.figure}</Figure>,
-        )}
-      </PageLine>
+      <TabActions>
+        <Segmented label="Group by" value={grouping} options={GROUPINGS} onChange={setGrouping} />
+        <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
+          New lane
+        </Button>
+      </TabActions>
       {adding ? (
         <div className="flex flex-col gap-2 rounded-3xl bg-(--m-surface) p-4 sm:p-5">
           <h2 className="text-sm font-semibold">New lane</h2>
