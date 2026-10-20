@@ -43,6 +43,7 @@ HOME = {'name': HOME_NAME, 'latitude': HOME_LAT, 'longitude': HOME_LNG, 'area_id
         'source': 'saved_home_pin_from_noon_account', 'saved_address_verified': False}
 SEARCH = '/search/api/v3/vendor'
 MENU = re.compile(r'^/menubff/v4/branches/[1-9][0-9]*/menu$')
+CHOICES = re.compile(r'^/menubff/v3/branches/[1-9][0-9]*/menu/[1-9][0-9]*/choices$')
 BRANCH = re.compile(r'^/grocery/v2/TB_AE/branches/[1-9][0-9]*$')
 PRODUCTS = re.compile(r'^/grocery/v1/bff/ae/vendors/[a-f0-9-]{36}/products/search$')
 WEB_SEARCH = 'https://www.talabat.com/nextSearchApi/v3/vendor'
@@ -60,7 +61,8 @@ def allowed(method, url):
         return (method == 'POST' and url == WEB_SEARCH) or (method == 'GET' and bool(WEB_LISTING.match(url)))
     return (u.hostname == 'api.talabat.com' and
             ((method == 'POST' and (u.path == SEARCH or bool(PRODUCTS.fullmatch(u.path)))) or
-             (method == 'GET' and (bool(MENU.fullmatch(u.path)) or bool(BRANCH.fullmatch(u.path))))))
+             (method == 'GET' and (bool(MENU.fullmatch(u.path)) or bool(CHOICES.fullmatch(u.path))
+                                   or bool(BRANCH.fullmatch(u.path))))))
 
 
 def _open(req, timeout):

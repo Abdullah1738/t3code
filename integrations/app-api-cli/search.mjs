@@ -26,7 +26,8 @@ Talabat: native Android catalog (guest context); Dia Personal web fallback.
   shop-search doctor
   noon-search orders [--minutes] --json
   noon-search track ORDER_ID --json
-  talabat-search orders | track ORDER_ID  (requires authenticated order capture)
+  talabat-search orders [--with-addresses --limit 3] | order ORDER_ID | track ORDER_ID
+  talabat-search order-items ORDER_ID [--json]  (ordered lines + choices/notes, resolved to menu description and published macros)
   shop-search match APP SECTION "milk" "eggs" [--open]
 
 Options: --limit 1..100 (menu default 1000), --page N (1-based), --timeout 5..60
@@ -164,9 +165,18 @@ const started = performance.now();
 const rawArgs = process.argv.slice(2);
 let json = rawArgs.includes('--json');
 try {
+  if (rawArgs[0] === 'talabat' && rawArgs[1] === 'order') rawArgs[1] = 'track';
   if (['noon', 'talabat'].includes(rawArgs[0]) && ['orders', 'track'].includes(rawArgs[1])) {
     const child = spawn(`${homedir()}/.local/share/uv/tools/mitmproxy/bin/python`,
       [fileURLToPath(new URL('./native_orders.py', import.meta.url)), ...rawArgs], { stdio: 'inherit' });
+    child.on('error', () => process.exit(1));
+    child.on('exit', code => process.exit(code ?? 1));
+    await new Promise(resolve => child.on('close', resolve));
+    process.exit(1);
+  }
+  if (rawArgs[0] === 'talabat' && rawArgs[1] === 'order-items') {
+    const child = spawn(`${homedir()}/.local/share/uv/tools/mitmproxy/bin/python`,
+      [fileURLToPath(new URL('./talabat_order_items.py', import.meta.url)), ...rawArgs.slice(2)], { stdio: 'inherit' });
     child.on('error', () => process.exit(1));
     child.on('exit', code => process.exit(code ?? 1));
     await new Promise(resolve => child.on('close', resolve));

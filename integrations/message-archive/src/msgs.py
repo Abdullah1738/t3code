@@ -1,7 +1,7 @@
 """msgs: one search over the local email mirror, iMessage and WhatsApp.
 
   msgs QUERY                      ranked search (see `msgs help-query`)
-  msgs search QUERY [-n N] [--date] [--json] [--junk] [--all-copies]
+  msgs search QUERY [-n N|--limit N] [--since X] [--until X] [--from X] [--in X] [--date] [--json] [--junk] [--all-copies]
   msgs show ID [--raw] [--html]   full message (email from the local .eml), chat lines around it
   msgs thread ID [-n N]           whole email thread or N chat lines either side
   msgs status [--json]            counts and last sync per source
@@ -12,6 +12,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import signal
 import stat
 import sys
@@ -64,9 +65,36 @@ def row_json(r):
     return d
 
 
+def _when_term(flag, v, since):
+    if since and re.fullmatch(r"\d{1,5}[hdwmy]", v, re.I):
+        return f"newer_than:{v}"
+    try:
+        search._date(v)
+    except search.QueryError:
+        if since:
+            sys.exit(f"msgs: {flag} expects YYYY-MM-DD or an age like 7d, 24h, 2w, 3m, 1y")
+        if re.fullmatch(r"\d{1,5}[hdwmy]", v, re.I):
+            return f"older_than:{v}"
+        sys.exit(f"msgs: {flag} expects YYYY-MM-DD or an age like 7d, 24h, 2w, 3m, 1y")
+    return f"{'after' if since else 'before'}:{v}"
+
+
+def _search_query(args):
+    parts = [" ".join(args.query)]
+    if args.since:
+        parts.append(_when_term("--since", args.since, True))
+    if args.until:
+        parts.append(_when_term("--until", args.until, False))
+    if args.from_:
+        parts.append('from:"%s"' % args.from_.replace('"', ""))
+    if args.in_:
+        parts.append('in:"%s"' % args.in_.replace('"', ""))
+    return " ".join(p for p in parts if p)
+
+
 def cmd_search(args):
     db = store.connect(readonly=True)
-    q = " ".join(args.query)
+    q = _search_query(args)
     t = time.time()
     try:
         rows = search.run(db, q, limit=args.n, sort="date" if args.date else "rank",
@@ -315,7 +343,11 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("search")
     s.add_argument("query", nargs="+")
-    s.add_argument("-n", type=int, default=20)
+    s.add_argument("-n", "--limit", "--max", dest="n", type=int, default=20)
+    s.add_argument("--since", "--after", dest="since", metavar="X", help="YYYY-MM-DD or age like 7d, 24h, 2w")
+    s.add_argument("--until", "--before", dest="until", metavar="X", help="YYYY-MM-DD or age like 7d, 24h, 2w")
+    s.add_argument("--from", dest="from_", metavar="X", help="sender filter (same as from:X)")
+    s.add_argument("--in", "--source", dest="in_", metavar="X", help="email, imessage, whatsapp or chats")
     s.add_argument("--date", action="store_true", help="newest first instead of best match")
     s.add_argument("--json", action="store_true")
     s.add_argument("--junk", action="store_true", help="include spam/junk")

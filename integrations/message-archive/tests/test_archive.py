@@ -489,6 +489,72 @@ class MailSyncTest(unittest.TestCase):
             gmail_sync.Api = old
 
 
+class SearchFlagsTest(unittest.TestCase):
+    def setUp(self):
+        import msgs
+        self.msgs = msgs
+        self.calls = []
+        self.old_run = search.run
+        self.old_connect = store.connect
+        search.run = lambda db, q, **kw: self.calls.append((q, kw)) or []
+        store.connect = lambda readonly=False: None
+
+    def tearDown(self):
+        search.run = self.old_run
+        store.connect = self.old_connect
+
+    def run_cli(self, *argv):
+        self.msgs.main(["search", *argv])
+        return self.calls[-1]
+
+    def test_limit_alias_sets_n(self):
+        q, kw = self.run_cli("OpenTable", "--limit", "5")
+        self.assertEqual(q, "OpenTable")
+        self.assertEqual(kw["limit"], 5)
+
+    def test_max_alias_and_short_flag(self):
+        self.assertEqual(self.run_cli("x", "--max", "7")[1]["limit"], 7)
+        self.assertEqual(self.run_cli("x", "-n", "3")[1]["limit"], 3)
+
+    def test_since_date_becomes_after(self):
+        q, _ = self.run_cli("OpenTable", "--since", "2026-10-20")
+        self.assertEqual(q, "OpenTable after:2026-10-20")
+
+    def test_since_after_alias(self):
+        q, _ = self.run_cli("OpenTable", "--after", "2026-10-20")
+        self.assertEqual(q, "OpenTable after:2026-10-20")
+
+    def test_since_age_becomes_newer_than(self):
+        q, _ = self.run_cli("OpenTable", "--since", "7d")
+        self.assertEqual(q, "OpenTable newer_than:7d")
+        q, _ = self.run_cli("OpenTable", "--since", "24h")
+        self.assertEqual(q, "OpenTable newer_than:24h")
+        q, _ = self.run_cli("OpenTable", "--since", "2w")
+        self.assertEqual(q, "OpenTable newer_than:2w")
+
+    def test_until_date_becomes_before(self):
+        q, _ = self.run_cli("OpenTable", "--until", "2026-10-21")
+        self.assertEqual(q, "OpenTable before:2026-10-21")
+
+    def test_until_before_alias(self):
+        q, _ = self.run_cli("OpenTable", "--before", "2026-10-21")
+        self.assertEqual(q, "OpenTable before:2026-10-21")
+
+    def test_bad_since_exits(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("OpenTable", "--since", "yesterday")
+        self.assertEqual(self.calls, [])
+
+    def test_from_and_in_flags(self):
+        q, _ = self.run_cli("order", "--from", "Talabat", "--in", "imessage")
+        self.assertEqual(q, 'order from:"Talabat" in:"imessage"')
+
+    def test_plain_query_unchanged(self):
+        q, kw = self.run_cli("hello", "world")
+        self.assertEqual(q, "hello world")
+        self.assertEqual(kw["limit"], 20)
+
+
 class GuardTest(unittest.TestCase):
     def test_unmounted_volume_refuses(self):
         import common

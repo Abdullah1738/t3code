@@ -120,7 +120,7 @@ within its 15-minute cap. Detection time is not an assertion of physical arrival
 ## Remaining limits
 
 No verified picked-up or cancelled enum yet. No absolute ETA timezone,
-rider contact details or account-benefit/address assertions. New SDUI layouts,
+rider contact details or account-benefit assertions. New SDUI layouts,
 hidden/ambiguous cells or unknown visibility controls produce null details rather
 than guessed visibility. Order history is bounded, not a snapshot transaction.
 No phone/browser use, purchases, cancellation, logout/revoke or deployment is
@@ -129,3 +129,62 @@ part of this implementation.
 Implementation: `talabat_http_orders.py`, `talabat_http_list.py`, `talabat_auth.py`.
 Tests: `test/test_talabat_http_orders.py`, `test/test_talabat_http_list.py`,
 `test/test_talabat_auth.py`.
+
+## Order items and published macros (2026-10-20)
+
+`talabat-search order-items ORDER_ID [--json] [--timeout 30]` (module
+`talabat_order_items.py`) is read-only: no cart, order, payment or watcher call.
+
+- Order lines come from the same exact-order tracking read (profile check, one
+  bounded renewal, order-ID echo). Only the layout-referenced
+  `tlb_app_bff_passthrough` child with template_id `order_details` is used: `shop_id`
+  (= menu branch id), and per `order_item` `name`, `quantity`, `choices` (the server's
+  comma-joined option label), `special_request` when `has_special_request` is true,
+  plus the order-level `special_requests_descriptor`. Mart/grocery lines may have an
+  empty name; they are reported `unnamed_order_line`, never guessed.
+- Each line is matched by normalized name on the guest native menu (menubff v4).
+  Identical cross-listed rows are one item; same-name rows with different text are
+  `ambiguous_name` with candidates. Customizable items with choices read the v3
+  choices sheet (allowlisted GET only) and the label is split on `, ` and greedily
+  rejoined to exact option names (nested options included; "Iced Latte Large"
+  resolves by option-name suffix).
+- kcal/protein/carbs/fat are parsed only from published text (item description,
+  item name, option name), first value per field. Formats covered: `Cal: 495 P: 30
+  F: 19 C: 56`, `(Cal:97 P:1g F:2g C:18g)`, `[556 cal – P 48g, C 14g, F 35g]`,
+  `54P/16C/18F`, `Protein 53g | Carbs 110g`, `- 958 Kcal`. Portion multipliers
+  (`2x*`) and weights (`30g`) are not macros. Totals multiply by quantity, add
+  choices that publish values and list every missing field in `totals.missing`
+  (`complete:false`); nothing is estimated.
+- Verified live 2026-10-20 on Under500 order 3969819746: pizza Cal 495 P30 F19 C56,
+  strips Cal 256 P42 F2 C14, Hot Honey Sauce Cal 97 P1 F2 C18 (matches the app).
+
+Keychain hang (fixed 2026-10-20): items are ACL-bound to the managed capture
+interpreter (`~/.local/share/uv/tools/mitmproxy/bin/python`). Reading them from
+`/usr/bin/python3` or Homebrew python raised an invisible authorization prompt and
+blocked forever inside SecKeychainFindGenericPassword, before any HTTP deadline
+applied. `capture/keychain.py` now disables Keychain user interaction, so such
+reads fail at once with status -25293/-25308. Always run these modules with the
+managed interpreter (the launchers do); `APP_API_KEYCHAIN_INTERACTIVE=1` restores
+prompting only for a deliberate, attended ACL grant.
+
+## Delivery address checks
+
+`talabat-search order ORDER_ID --json` aliases `track`. Both expose the exact
+tracking screen's layout-referenced `delivery_address` component (`address_text`,
+`title`, `header`) as `delivery_address`, plus `is_home` and `home_match_reason`.
+`order-items` includes the same projection. `orders --with-addresses --limit 3
+--timeout 25 --json` enriches history using bounded exact-order reads; ordinary
+history rows leave the address unknown. The saved search pin is never evidence
+of an order destination. The component omits saved-address ID and coordinates,
+so these remain null; joining a current saved address to historical text would
+not prove an order's original pin. Home needs the building and exact flat 2104;
+partial, hidden or ambiguous address components remain unknown.
+
+`talabat_address_watch.py` checks new history IDs for `robob-watch`. Completed
+orders at bootstrap are baselined; active orders stay pending. Home checks are
+stored silently; a non-home result wakes once. Unknown addresses retry and alert
+once after five minutes. Account failures have one shared five-minute alert and
+back off to five-minute retries. The state and replayable outbox live in
+`WATCH_DIR`; `.run-ok` acknowledges the runner's durable event queue. No orders,
+addresses or payments are changed. `--dry-run ORDER_ID` reads and shows the
+decision without changing watcher state or sending an alert.

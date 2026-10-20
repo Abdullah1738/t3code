@@ -110,20 +110,60 @@ replicate() { # live-path replica-name
 for db in memory.db opencode_raw.db; do
   [ -f "$DATA/$db" ] && replicate "$DATA/$db" "$db"
 done
-# Replicas of retired databases (facts, vectors, notes) drop out of new snapshots.
-rm -f "$STAGE"/consolidation.db* "$STAGE"/fact_vectors.db* "$STAGE"/agent_notes.db* 2>/dev/null
-# Robob's state DB holds the session board, schedules and the OpenCode import
-# map, which nothing else backs up. Optional: skipped until Robob is installed.
-# sqlite3_rsync, not .backup: the CLI's .backup restarts whenever Robob writes
-# between its 100-page steps, so on the busy multi-GB DB it ran for hours.
+# Under launchd only the Homebrew binaries (sqlite3, python3, rsync, restic)
+# may touch files on the SSD; /bin/bash redirections, rm, mv, cp and grep get
+# "Operation not permitted". So all file work in $STAGE goes through them.
+# Replicas of retired databases (facts, vectors, notes) and the old full Robob
+# state replica are deleted, and excluded from the snapshot in case that fails.
+RETIRED=("consolidation.db*" "fact_vectors.db*" "agent_notes.db*" "robob-state.sqlite*")
+out=$(/opt/homebrew/bin/python3 - "$STAGE" "${RETIRED[@]}" <<'PY' 2>&1
+import glob, os, sys
+for pat in sys.argv[2:]:
+    for p in glob.glob(os.path.join(sys.argv[1], pat)):
+        os.remove(p)
+        print("removed", os.path.basename(p))
+PY
+) || log "retired replicas not removed: $(printf '%s' "$out" | tail -1)"
+[ -n "$out" ] && log "$(printf '%s' "$out" | tr '\n' ' ')"
+# Robob state: only the small tables nothing else backs up (schedules, projects,
+# session board, OpenCode import map, thread origins, thread/subagent index).
+# The full DB is ~70 GB of event log and message projections rebuilt from the
+# OpenCode/Muse sessions that memory.db and opencode_raw.db already hold; it
+# added 2-4 GB to restic every run. .dump reads in one transaction (~2 s).
+# Restore: sqlite3 new.sqlite < robob-state.sql. Skipped until Robob is installed.
 ROBOB_DB="${ROBOB_STATE_DB:-$HOME/.robob/userdata/statev2.sqlite}"
-[ -f "$ROBOB_DB" ] && replicate "$ROBOB_DB" robob-state.sqlite
+ROBOB_TABLES="scheduled_tasks projection_projects ardud_board_rows ardud_board_meta
+  ardud_opencode_import ardud_opencode_import_state ardud_thread_origin
+  orchestration_v2_projection_threads orchestration_v2_projection_provider_threads
+  orchestration_v2_projection_provider_session_bindings
+  orchestration_v2_projection_subagents effect_sql_migrations"
+if [ -f "$ROBOB_DB" ]; then
+  out=$("$SQLITE" -readonly -bail "$ROBOB_DB" ".output '$STAGE/robob-state.sql.tmp'" \
+    ".dump $(echo $ROBOB_TABLES)" 2>&1) || fail replica "robob-state.sql: $out"
+  [ -z "$out" ] || fail replica "robob-state.sql: $out"
+  # Check, then move into place. A table Robob renamed or dropped is skipped by
+  # .dump; it's logged as missing, not a failure.
+  out=$(/opt/homebrew/bin/python3 - "$STAGE" $ROBOB_TABLES <<'PY' 2>&1
+import os, re, sys
+stage, tables = sys.argv[1], sys.argv[2:]
+tmp, dst = os.path.join(stage, "robob-state.sql.tmp"), os.path.join(stage, "robob-state.sql")
+text = open(tmp, encoding="utf-8", errors="replace").read()
+made = set(re.findall(r'^CREATE TABLE (?:IF NOT EXISTS )?"?(\w+)"?', text, re.M))
+if not made:
+    sys.exit("no tables dumped")
+os.replace(tmp, dst)
+missing = [t for t in tables if t not in made]
+print(f"{len(made)} tables, {os.path.getsize(dst)} bytes" + (", missing: " + " ".join(missing) if missing else ""))
+PY
+) || fail replica "robob-state.sql: $(printf '%s' "$out" | tail -1)"
+  log "robob-state.sql: $out"
+fi
 # sqlite3_rsync verifies page hashes itself and replicate() already checked
 # each replica against the live high-water mark taken before its sync; here we
 # only confirm each replica opens and has a schema (quick_check on the 70 GB
 # memory.db takes too long). Don't compare against live again: rows inserted
 # after the sync can carry old timestamps (reprojection), so that races.
-for db in memory.db opencode_raw.db robob-state.sqlite; do
+for db in memory.db opencode_raw.db; do
   [ -f "$STAGE/$db" ] || continue
   q=$("$SQLITE" -readonly "$STAGE/$db" "SELECT count(*) > 0 FROM sqlite_master;" 2>&1 | head -1)
   [ "$q" = "1" ] || fail verify "$db replica unreadable: $q"
@@ -147,12 +187,14 @@ if [ -d "$MUSE_SESSIONS" ]; then
     "$MUSE_SESSIONS/" "$STAGE/files/muse-sessions/" >>"$LOG" 2>&1 || mrc=$?
   [ "$mrc" = 0 ] || [ "$mrc" = 24 ] || fail files "rsync muse sessions rc=$mrc"
 fi
-cp -p "$HOME/Library/LaunchAgents/"com.abdullah.memory-*.plist \
+/opt/homebrew/bin/rsync -a "$HOME/Library/LaunchAgents/"com.abdullah.memory-*.plist \
   "$HOME/Library/LaunchAgents/com.abdullah.recall.plist" "$STAGE/files/" 2>/dev/null
 
 # 2. snapshot
+excl=(--exclude "$STAGE/robob-state.sql.tmp")
+for p in "${RETIRED[@]}"; do excl+=(--exclude "$STAGE/$p"); done
 out=$(nice -n 10 "$RESTIC" backup --host ardud-mac --tag memory-live --json --quiet \
-  --pack-size 64 "$STAGE" 2>&1)
+  --pack-size 64 "${excl[@]}" "$STAGE" 2>&1)
 rc=$?
 summary=$(printf '%s\n' "$out" | grep '"message_type":"summary"' | tail -1)
 [ $rc -eq 0 ] && [ -n "$summary" ] || fail restic "rc=$rc $(printf '%s' "$out" | tail -c 600)"
