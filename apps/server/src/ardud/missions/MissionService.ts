@@ -24,11 +24,14 @@ import {
   type MissionStreamItem,
   type MissionSubscribeItem,
   type OpenApprovalInput,
+  type PortfolioSnapshot,
   type ReorderSubMissionsInput,
+  type ReviseCallInput,
   type RouteApprovalInput,
   type SetApprovalRoutingInput,
   type SetMissionFocusInput,
   type SetMissionStatusInput,
+  type SetPortfolioOrderInput,
   type SetSubMissionStatusInput,
   type SplitLaneInput,
   type UpdateMissionInput,
@@ -48,6 +51,7 @@ import { makeEffort } from "./core/effort.ts";
 import type { MissionEditor, MissionRecoveryReader } from "./core/ports.ts";
 import { HEALTH_TTL_MS, makeReads } from "./core/reads.ts";
 import { makePages } from "./core/pages.ts";
+import { makePortfolio, type PortfolioUsage } from "./core/portfolio.ts";
 import { sameValue } from "./core/rules.ts";
 import { makeWrites } from "./core/writes.ts";
 import * as MissionStore from "./store/MissionStore.ts";
@@ -99,6 +103,8 @@ const LIST_KINDS: ReadonlySet<string> = new Set<MissionStoreKind>([
   "knock",
   // ardud missions: router
   "owner-request",
+  // ardud missions: core - a reorder refreshes every client's portfolio
+  "portfolio",
 ]);
 
 /** Records a mission subscriber receives as deltas. No bodies, no inbox items. */
@@ -188,7 +194,7 @@ export class MissionService extends Context.Service<
     /** The scribe's editor; replaces core's own bottom line, feed and FYI ranking. */
     readonly registerEditor: (editor: MissionEditor) => Effect.Effect<void>;
     // ardud missions: recovery
-    /** The recovery track's overview badge ("Recovered from restart at HH:MM"). */
+    /** The recovery track's overview badge (its cause and instant). */
     readonly registerRecovery: (reader: MissionRecoveryReader) => Effect.Effect<void>;
 
     readonly createMission: Write<CreateMissionInput>;
@@ -215,7 +221,10 @@ export class MissionService extends Context.Service<
     /** Systems (crw) open and stale-close approvals in their own component name. */
     readonly openApproval: Write<OpenApprovalInput>;
     readonly closeStaleApproval: Write<CloseStaleApprovalInput>;
-    /** The owner decides any pending approval; the master only those routed to it. */
+    /**
+     * The owner decides any pending approval; the master those routed to it,
+     * or any on a verified owner condition (`onOwnerCondition`).
+     */
     readonly decideApproval: Write<DecideApprovalInput>;
     /** Owner or master: move one pending approval to the other approver, with a reason. */
     readonly routeApproval: Write<RouteApprovalInput>;
@@ -224,6 +233,16 @@ export class MissionService extends Context.Service<
     // ardud missions: asks
     /** Owner or master: set the summary and flag chips on a pending approval. */
     readonly annotateApproval: Write<AnnotateApprovalInput>;
+    /** The master revises its call on a verified owner condition. */
+    readonly reviseCall: Write<ReviseCallInput>;
+    // --- core additions ---
+    /** Every listed mission in portfolio order, with pool use when policy measured it. */
+    readonly portfolio: (
+      usage: PortfolioUsage | null,
+    ) => Effect.Effect<PortfolioSnapshot, MissionError>;
+    /** Owner or any master: one portfolio order across missions. */
+    readonly setPortfolioOrder: Write<SetPortfolioOrderInput>;
+    // --- end core additions ---
   }
 >()("t3/ardud/missions/MissionService") {}
 
@@ -256,6 +275,10 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  /** A portfolio reorder changes no list row, but clients refetch the portfolio on `list`. */
+  const reordered = (trigger: ReadonlyArray<MissionStreamItem> | "tick") =>
+    trigger !== "tick" && trigger.some((item) => itemKind(item) === "portfolio");
+
   const subscribeList: Stream.Stream<MissionStreamItem, MissionError> = Stream.unwrap(
     Effect.gen(function* () {
       const triggers = yield* batches((item) => LIST_KINDS.has(itemKind(item) ?? ""));
@@ -263,9 +286,9 @@ const make = Effect.gen(function* () {
       const updates = triggers.pipe(
         Stream.mapAccumEffect(
           () => first,
-          (last, _trigger) =>
+          (last, trigger) =>
             Effect.map(reads.listSnapshot, (next) =>
-              sameValue(next.missions, last.missions)
+              sameValue(next.missions, last.missions) && !reordered(trigger)
                 ? ([last, []] as const)
                 : ([next, [{ _tag: "list" as const, snapshot: next }]] as const),
             ),
@@ -388,6 +411,7 @@ const make = Effect.gen(function* () {
     digest,
     eventsSince: store.eventsSince,
     ...makePages(store),
+    ...makePortfolio(store),
     subscribeList,
     subscribe,
     subscribeInbox,

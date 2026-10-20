@@ -1,13 +1,15 @@
-import { MissionMessage, Room, Subscription } from "@t3tools/contracts";
+import { type LaneId, MissionMessage, type RoleId, Room, Subscription } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  actorNames,
   composerState,
   groupRooms,
   listedRoomUnread,
   mergeMessages,
   messageAddressLine,
+  messageParties,
   nextReadSeq,
   noiseView,
   olderPageRequest,
@@ -15,8 +17,13 @@ import {
   pendingRuleOffer,
   postMessageInput,
   receiptView,
+  roomListLine,
   roomMembers,
+  roomMembersLine,
+  roomsSummary,
+  roomStats,
   roomTimeline,
+  statusRunLine,
   ruleFromCorrection,
   wakesFor,
   INITIAL_ROOM_UI,
@@ -126,6 +133,49 @@ describe("room list", () => {
   });
 });
 
+describe("room figures", () => {
+  const busy = {
+    ...room("delivery", "control", "2026-10-19T04:52:00.000Z"),
+    noise: { messagesPerHour: 52.61, actionableShare: 0.53, wastedWakes: 9 },
+  };
+
+  it("lists a room with its rate and last post, in the reader's zone", () => {
+    const now = Date.parse("2026-10-19T09:00:00.000Z");
+    expect(roomListLine(busy, now, "UTC")).toBe("52.6 an hour, last 04:52");
+    expect(roomListLine(busy, now, "Asia/Dubai")).toBe("52.6 an hour, last 08:52");
+    expect(roomListLine(busy, Date.parse("2026-10-21T09:00:00.000Z"), "UTC")).toBe(
+      "52.6 an hour, last Mon 19 Oct",
+    );
+    expect(roomListLine(room("quiet", "custom"), now, "UTC")).toBeNull();
+  });
+
+  it("sums the list's message counts and leaves out what the server does not send", () => {
+    expect(
+      roomsSummary([
+        { room: { ...busy, messageCount: 12_000 } as Room, unread: 160 },
+        { room: { ...room("arch", "arch"), messageCount: 783 } as Room, unread: 2 },
+      ]),
+    ).toEqual({ messages: 12_783, rooms: 2, unread: 162 });
+    expect(roomsSummary([{ room: busy, unread: 0 }]).messages).toBeNull();
+    expect(roomStats(busy.noise, 12_000)).toEqual([
+      { label: "Messages", value: "12,000" },
+      { label: "Per hour", value: "52.6" },
+      { label: "Actionable", value: "53%" },
+    ]);
+    expect(roomStats(null, null)).toEqual([]);
+  });
+
+  it("folds a status run into one line with its span", () => {
+    const run = [
+      { createdAt: "2026-10-19T04:28:00.000Z" },
+      { createdAt: "2026-10-19T04:31:00.000Z" },
+      { createdAt: "2026-10-19T04:34:00.000Z" },
+    ];
+    expect(statusRunLine(run, "UTC")).toBe("3 status updates, 04:28 to 04:34");
+    expect(statusRunLine(run.slice(0, 1), "UTC")).toBe("1 status update at 04:28");
+  });
+});
+
 describe("timeline", () => {
   it("folds status runs, keeps single status inline and places the read marker", () => {
     const rows = roomTimeline(
@@ -203,12 +253,12 @@ describe("timeline", () => {
 describe("message details", () => {
   it("shows broadcast receipts and who has not read yet", () => {
     expect(receiptView({ reached: 21, total: 21, pending: [] })).toEqual({
-      label: "reached 21 of 21",
+      label: "Reached 21 of 21",
       complete: true,
       pending: null,
     });
     expect(receiptView({ reached: 7, total: 10, pending: ["cell-bal", "cell-fab-tc"] })).toEqual({
-      label: "reached 7 of 10",
+      label: "Reached 7 of 10",
       complete: false,
       pending: "waiting on cell-bal, cell-fab-tc",
     });
@@ -223,6 +273,28 @@ describe("message details", () => {
     expect(
       messageAddressLine({ author: { _tag: "owner" }, to: [], isCorrection: true }, MASTER),
     ).toBe("you → master (correction)");
+  });
+
+  it("shows lane and role names, never their ids", () => {
+    const names = {
+      "role:crpko:lane-lead:crpko:lane:cell-tc": "cell-tc lead",
+      "lane:crpko:lane:cell-risk": "cell-risk",
+    };
+    const post = {
+      author: { _tag: "role" as const, roleId: "crpko:lane-lead:crpko:lane:cell-tc" as RoleId },
+      to: [{ _tag: "lane" as const, laneId: "crpko:lane:cell-risk" as LaneId }],
+      isCorrection: false,
+    };
+    expect(messageParties(post, MASTER, names)).toEqual({ from: "cell-tc lead", to: "cell-risk" });
+    expect(messageAddressLine(post, MASTER, names)).toBe("cell-tc lead → cell-risk");
+    expect(messageParties({ ...post, to: [] }, MASTER, names).to).toBeNull();
+    // Lanes and roles from the mission name actors where no room page does.
+    expect(
+      actorNames(
+        [{ id: "crpko:lane:cell-risk" as LaneId, name: "cell-risk" }],
+        [{ id: "crpko:lane-lead:crpko:lane:cell-tc" as RoleId, name: "cell-tc lead" }],
+      ),
+    ).toEqual(names);
   });
 
   it("lists waking members first and says who a post would wake", () => {
@@ -247,6 +319,22 @@ describe("message details", () => {
     expect(members.map((m) => m.label)).toEqual(["cell-bal", "cell-tc", "observe"]);
     expect(wakesFor(members, "status")).toEqual([]);
     expect(wakesFor(members, "request").map((m) => m.label)).toEqual(["cell-tc"]);
+    expect(roomMembersLine(members)).toBe("3 members, 2 woken by posts");
+  });
+
+  it("counts everyone a wake brought in, not only subscribers", () => {
+    // After a wake the page carries no subscription rows, only who is in the room.
+    const members = roomMembers([], MASTER, {
+      members: [
+        { _tag: "lane", laneId: "crpko:lane:cell-tc" as LaneId },
+        { _tag: "role", roleId: MASTER as RoleId },
+        { _tag: "owner" },
+      ],
+      names: { "lane:crpko:lane:cell-tc": "cell-tc" },
+    });
+    expect(members.map((m) => m.label)).toEqual(["cell-tc", "master"]);
+    expect(roomMembersLine(members)).toBe("2 members");
+    expect(roomMembersLine([])).toBeNull();
   });
 });
 

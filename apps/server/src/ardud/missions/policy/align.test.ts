@@ -97,4 +97,52 @@ it.layer(testLayer(ports.layer))("policy boot alignment", (it) => {
       assert.isTrue(ports.setModelCalls.some((call) => call.threadId === `${IMPORTED[1]}-t0`));
     }),
   );
+
+  it.effect("names accepted holders the same way whether a role was imported or applied", () =>
+    Effect.gen(function* () {
+      const policy = yield* PolicyService.PolicyService;
+      const store = yield* MissionStore.MissionStore;
+      const missionId = MissionId.make("imp-mixed");
+      const roleId = `${missionId}:writer`;
+      const writer = { ...role(roleId, "writer"), missionId };
+      ports.threads.set(`${missionId}-new`, {
+        exists: true,
+        idle: true,
+        modelSelection: SOL_XHIGH,
+      });
+      yield* store.commit({
+        event: { ...importEvent, missionId },
+        upserts: [
+          { _tag: "mission", record: { ...mission, id: missionId, slug: missionId } },
+          { _tag: "role", record: writer },
+          {
+            _tag: "role-binding",
+            record: {
+              ...binding(`${roleId}@old`, roleId, ThreadId.make(`${missionId}-old`)),
+              reason: "import",
+            },
+          },
+          {
+            _tag: "role-binding",
+            record: binding(`${roleId}@new`, roleId, ThreadId.make(`${missionId}-new`)),
+          },
+        ],
+      });
+      yield* policy.sweep;
+      const events = (yield* store.eventsSince(missionId, 0, 500)).filter(
+        (event) => event.kind === "role.model-changed",
+      );
+      assert.strictEqual(events.length, 1);
+      assert.deepInclude(events[0]!.payload, {
+        phase: "applied",
+        accepted: [
+          {
+            roleId,
+            threadId: `${missionId}-old`,
+            model: modelKey(writer.modelSelection),
+          },
+        ],
+      });
+    }),
+  );
 });

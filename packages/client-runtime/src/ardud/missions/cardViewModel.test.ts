@@ -8,11 +8,13 @@ import {
   entryHeadline,
   entryRow,
   groupEntriesByMission,
+  inboxLead,
   masterRoutedEntries,
   noteFlags,
   ownerWaitingEntries,
 } from "./cardViewModel.ts";
 import type { InboxEntry } from "./inboxViewModel.ts";
+import { formatDayLabel } from "./viewModel.ts";
 
 const MISSION = "crpko-engineering" as MissionId;
 const SUB = "sub-release" as SubMissionId;
@@ -153,5 +155,24 @@ describe("waiting entries", () => {
     expect(
       masterRoutedEntries(inbox).every((entry) => !waiting.some((w) => w.key === entry.key)),
     ).toBe(true);
+  });
+});
+
+describe("inbox lead", () => {
+  const entry = (id: string, createdAt: string) =>
+    ({ kind: "knock", key: `knock:${id}`, record: { id, createdAt } }) as unknown as InboxEntry;
+
+  it("counts the holds and dates the oldest in the device zone", () => {
+    const oldest = "2026-10-07T08:52:00.000Z";
+    const day = formatDayLabel(oldest);
+    expect(inboxLead([entry("a", oldest), entry("b", "2026-10-11T19:26:00.000Z")])).toEqual({
+      strong: "2 holds",
+      after: ` wait on you, the oldest since ${day}.`,
+    });
+    expect(inboxLead([entry("a", oldest)])).toEqual({
+      strong: "1 hold",
+      after: ` waits on you, since ${day}.`,
+    });
+    expect(inboxLead([])).toBeNull();
   });
 });

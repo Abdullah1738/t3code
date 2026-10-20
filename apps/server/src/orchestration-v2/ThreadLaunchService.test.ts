@@ -699,6 +699,44 @@ it.effect.each([" /COMPACT ", "/logout"])(
     }),
 );
 
+// ardud missions: guard - a bearer's prompt is a person's turn too.
+it.effect.each([
+  { name: "control", messageId: "ardud-control:send:t:msg-1", source: "server", titled: true },
+  { name: "browser", messageId: "bearer-browser-message", source: "web", titled: true },
+  { name: "server", messageId: "usage-limit-retry", source: "server", titled: false },
+] as const)("a $name system prompt after /compact titles the thread: $titled", (bearer) =>
+  Effect.gen(function* () {
+    const harness = makeHarness();
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const launched = yield* launches.launch({
+        ...launchInput({
+          command: `bearer-title-${bearer.name}`,
+          thread: `bearer-title-${bearer.name}-thread`,
+          message: "/compact",
+        }),
+        generateTitle: true,
+      });
+      const commandId = CommandId.make(`bearer-title-${bearer.name}-conversation`);
+      yield* threads.dispatch({
+        type: "message.dispatch",
+        commandId,
+        threadId: launched.threadId,
+        messageId: MessageId.make(bearer.messageId),
+        createdBy: "system",
+        creationSource: bearer.source,
+        text: "Fix the failing parser",
+        attachments: [],
+        dispatchMode: { type: "defer_start" },
+      });
+      const regeneration = (yield* threads.getThreadProjection(launched.threadId)).thread
+        .titleRegeneration;
+      assert.equal(regeneration?.requestId === commandId, bearer.titled);
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
 it.effect("keeps native maintenance commands out of steering and restart messages", () =>
   Effect.gen(function* () {
     const harness = makeHarness();

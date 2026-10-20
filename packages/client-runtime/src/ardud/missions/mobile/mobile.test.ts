@@ -88,7 +88,9 @@ describe("asks", () => {
       ok: false,
       error: "Pick an option or write an answer.",
     });
-    const view = askView(ask, NOW);
+    const view = askView(ask);
+    expect(view).not.toHaveProperty("askedBy");
+    expect(view).not.toHaveProperty("askedAt");
     expect(view.options.filter((option) => option.recommended).map((option) => option.id)).toEqual([
       "hold",
     ]);

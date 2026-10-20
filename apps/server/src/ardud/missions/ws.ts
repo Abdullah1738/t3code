@@ -8,15 +8,22 @@ import {
   type MissionInboxInput,
   type MissionProvenance,
   type MissionSubscribeInput,
+  type NudgeLaneInput,
+  type SetPortfolioOrderInput,
   type WithdrawAskInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 
 import type { SessionOrigin } from "../auth/SessionOrigins.ts";
 import * as AsksService from "./asks/AsksService.ts";
+import { nudgeLane } from "./core/nudge.ts";
+import type { PortfolioUsage } from "./core/portfolio.ts";
 import { OWNER_SESSION_REQUIRED, ownerAppProvenance } from "./core/provenance.ts";
 import * as RuleService from "./core/RuleService.ts";
 import * as MissionService from "./MissionService.ts";
+import { PolicyService } from "./policy/PolicyService.ts";
+import * as MissionStore from "./store/MissionStore.ts";
 // ardud missions: router
 import { MissionRouter } from "./router/MissionRouter.ts";
 import { makeRouterWsHandlers } from "./router/ws.ts";
@@ -39,6 +46,10 @@ export interface MissionWsServices {
   readonly missions: MissionService.MissionService["Service"];
   readonly asks: AsksService.AsksService["Service"];
   readonly rules: RuleService.RuleService["Service"];
+  readonly store: MissionStore.MissionStore["Service"];
+  readonly router: MissionRouter["Service"];
+  /** Pool use for the portfolio, from the policy service; null where none runs. */
+  readonly usage: Effect.Effect<PortfolioUsage | null>;
 }
 
 /**
@@ -48,7 +59,7 @@ export interface MissionWsServices {
  * MCP tools call, with owner provenance.
  */
 export const makeMissionWsHandlers = (
-  { missions, asks, rules }: MissionWsServices,
+  { missions, asks, rules, store, router, usage }: MissionWsServices,
   connection: MissionWsConnection,
 ) => {
   const provenance = ownerAppProvenance(connection);
@@ -115,8 +126,40 @@ export const makeMissionWsHandlers = (
     [WS_METHODS.missionsAckNote]: asOwner(
       flip((input: AckNoteInput, by) => asks.ackNote(input.noteId, by)),
     ),
+    [WS_METHODS.missionsPortfolio]: (_input: unknown) =>
+      Effect.flatMap(usage, (measured) => missions.portfolio(measured)),
+    [WS_METHODS.missionsSetPortfolioOrder]: asOwner((by, input: SetPortfolioOrderInput) =>
+      missions.setPortfolioOrder(by, input),
+    ),
+    [WS_METHODS.missionsNudgeLane]: asOwner((by, input: NudgeLaneInput) =>
+      nudgeLane({ store, router }, by, input),
+    ),
   } as const;
 };
+
+/**
+ * Pool use for the portfolio. A policy read failure leaves use unknown (null)
+ * rather than failing the whole portfolio.
+ */
+export const measuredUsage = (
+  policy: Option.Option<PolicyService["Service"]>,
+): Effect.Effect<PortfolioUsage | null> =>
+  Option.match(policy, {
+    onNone: () => Effect.succeed(null),
+    onSome: (service) =>
+      Effect.all({ snapshot: service.pools({}), governor: service.governor }).pipe(
+        Effect.map(({ snapshot, governor }) => ({
+          pools: snapshot.pools,
+          shares: governor.shares,
+        })),
+        Effect.catch((error) =>
+          Effect.as(
+            Effect.logWarning("Portfolio pool use unavailable", { detail: error.detail }),
+            null,
+          ),
+        ),
+      ),
+  });
 
 /** The handlers for one WS connection, with the missions services from context. */
 export const missionWsHandlers = (connection: MissionWsConnection) =>
@@ -126,8 +169,14 @@ export const missionWsHandlers = (connection: MissionWsConnection) =>
     const rules = yield* RuleService.RuleService;
     // ardud missions: router - rooms, messages and knocks
     const router = yield* MissionRouter;
+    const store = yield* MissionStore.MissionStore;
+    // Policy is a sibling layer of the missions services; read it when present.
+    const policy = yield* Effect.serviceOption(PolicyService);
     return {
-      ...makeMissionWsHandlers({ missions, asks, rules }, connection),
+      ...makeMissionWsHandlers(
+        { missions, asks, rules, store, router, usage: measuredUsage(policy) },
+        connection,
+      ),
       ...makeRouterWsHandlers(router, connection),
     };
   });

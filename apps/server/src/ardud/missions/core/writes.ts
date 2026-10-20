@@ -37,6 +37,9 @@ import * as Semaphore from "effect/Semaphore";
 import type * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import { makeApprovalWrites } from "./approvals.ts";
+import { makeCallWrites } from "./calls.ts";
+import { makePortfolioWrites } from "./portfolio.ts";
+import { ownerConditions } from "./conditions.ts";
 import type { WriteKit } from "./kit.ts";
 import { actorOf } from "./provenance.ts";
 import { changedFields, requireOwner } from "./rules.ts";
@@ -95,6 +98,7 @@ const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
   Effect.gen(function* () {
     const writeLock = yield* Semaphore.make(1);
+    const conditions = yield* ownerConditions;
     const serial = <A>(effect: Effect.Effect<A, MissionError>) => writeLock.withPermit(effect);
 
     const need = <A>(
@@ -599,6 +603,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
             pullRequest: patch.pullRequest ?? null,
             links: patch.links ?? [],
             facts: patch.facts ?? { mergedAtHead: null, deployedReadback: null, exercised: null },
+            ...(patch.view === undefined ? {} : { view: patch.view }),
             createdAt: now,
             updatedAt: now,
           };
@@ -623,7 +628,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
         return yield* unchanged(mission.id, missionRef(mission));
       });
 
-    const kit: WriteKit = { store, serial, loadMission, unchanged, commit };
+    const kit: WriteKit = { store, conditions, serial, loadMission, unchanged, commit };
 
     return {
       createMission,
@@ -639,6 +644,8 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
       markSeen,
       ...makeStructureWrites(kit),
       ...makeApprovalWrites(kit),
+      ...makeCallWrites(kit),
+      ...makePortfolioWrites(kit),
     };
   });
 

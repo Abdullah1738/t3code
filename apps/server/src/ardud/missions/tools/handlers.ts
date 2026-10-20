@@ -11,9 +11,12 @@ import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as AsksService from "../asks/AsksService.ts";
 import { keepWorkItemHolds, laneHoldConflict } from "../asks/holds.ts";
 import * as MasterControls from "../core/MasterControls.ts";
+import { nudgeLane } from "../core/nudge.ts";
 import * as RuleService from "../core/RuleService.ts";
 import { watchAddCommand, watchCheckCommand } from "../asks/watch.ts";
 import * as MissionService from "../MissionService.ts";
+import { MissionRouter } from "../router/MissionRouter.ts";
+import * as MissionStore from "../store/MissionStore.ts";
 import { MissionsToolkit } from "./tools.ts";
 
 /** The `mission` CLI as robob-watch checks call it (on PATH once installed). */
@@ -99,6 +102,8 @@ const openAsks = (asks: AsksService.AsksService["Service"], missionId: MissionId
  * capped mission list.
  */
 const asAnyMaster = <A>(
+  actingFor: MissionId | undefined,
+  refusal: string,
   run: (
     missions: MissionService.MissionService["Service"],
     provenance: MissionProvenance,
@@ -107,12 +112,9 @@ const asAnyMaster = <A>(
   withCaller((_asks, provenance) =>
     Effect.gen(function* () {
       const controls = yield* MasterControls.MasterControls;
-      const master = yield* controls.asAnyMaster(provenance);
+      const master = yield* controls.asAnyMaster(provenance, actingFor);
       if (master === null) {
-        return yield* new MissionError({
-          code: "forbidden",
-          detail: "Only a mission's master creates missions.",
-        });
+        return yield* new MissionError({ code: "forbidden", detail: refusal });
       }
       const missions = yield* MissionService.MissionService;
       return yield* run(missions, master);
@@ -357,8 +359,10 @@ const handlers = {
       }),
     ),
   ),
-  mission_create: McpToolAccess.actsAsCaller((input) =>
-    asAnyMaster((missions, provenance) => missions.createMission(provenance, input)),
+  mission_create: McpToolAccess.actsAsCaller(({ actingFor, ...input }) =>
+    asAnyMaster(actingFor, "Only a mission's master creates missions.", (missions, provenance) =>
+      missions.createMission(provenance, input),
+    ),
   ),
   mission_update: McpToolAccess.actsAsCaller((input) =>
     asMaster(input.missionId, (missions, _asks, provenance) =>
@@ -423,8 +427,37 @@ const handlers = {
         approvalId: input.approvalId,
         action: input.action,
         ...(input.note === undefined ? {} : { note: input.note }),
+        ...(input.onOwnerCondition === undefined
+          ? {}
+          : { onOwnerCondition: input.onOwnerCondition }),
       }),
     ),
+  ),
+  // ardud missions: core
+  mission_call_revise: McpToolAccess.actsAsCaller(({ missionId, ...input }) =>
+    asMaster(missionId, (missions, _asks, provenance) => missions.reviseCall(provenance, input)),
+  ),
+  // ardud missions: core - portfolio order and lane nudges
+  mission_portfolio_reorder: McpToolAccess.actsAsCaller(({ actingFor, order }) =>
+    asAnyMaster(
+      actingFor,
+      "Only the owner or a mission's master sets the portfolio order.",
+      (missions, provenance) => missions.setPortfolioOrder(provenance, { order }),
+    ),
+  ),
+  mission_lane_nudge: McpToolAccess.actsAsCaller(({ missionId, laneId, note }) =>
+    Effect.gen(function* () {
+      const store = yield* MissionStore.MissionStore;
+      const router = yield* MissionRouter;
+      return yield* asMaster(missionId, (_missions, _asks, provenance) =>
+        nudgeLane(
+          { store, router },
+          provenance,
+          { laneId, ...(note === undefined ? {} : { note }) },
+          missionId,
+        ),
+      );
+    }),
   ),
   mission_approval_route: McpToolAccess.actsAsCaller((input) =>
     asMaster(input.missionId, (missions, _asks, provenance) =>

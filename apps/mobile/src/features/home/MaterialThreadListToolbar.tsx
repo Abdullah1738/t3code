@@ -130,13 +130,6 @@ export function MaterialThreadListToolbar(props: {
                 icon="magnifyingglass"
                 onPress={openSearch}
               />
-              {/* ardud missions: ui-mobile */}
-              <AndroidHeaderIconButton
-                accessibilityLabel="Missions"
-                icon="target"
-                onPress={() => navigation.navigate("Missions")}
-              />
-              {/* end ardud missions: ui-mobile */}
               <AndroidHeaderIconButton
                 accessibilityLabel="Open settings"
                 icon="gearshape"

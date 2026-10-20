@@ -63,7 +63,7 @@ function RoutingRuleItem(props: {
   return (
     <li className="flex flex-col gap-0.5">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-foreground">
+        <span className="text-(--m-text)">
           {row.label} go to {APPROVER_LABEL[row.approver]}
         </span>
         <Button size="xs" variant="ghost" onClick={() => void flipRoute(table, row.id)}>

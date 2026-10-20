@@ -5,11 +5,13 @@ import {
   ApprovalStatus,
   AskId,
   AskStatus,
+  CallId,
   CreateMissionInput,
   DecideSuggestionInput,
   DraftChannel,
   DraftId,
   DraftStatus,
+  LaneId,
   MergeLanesInput,
   MergeSubMissionsInput,
   MissionId,
@@ -58,6 +60,9 @@ import * as AsksService from "../asks/AsksService.ts";
 import * as MasterControls from "../core/MasterControls.ts";
 import * as RuleService from "../core/RuleService.ts";
 import * as MissionService from "../MissionService.ts";
+// ardud missions: core - nudges post through the router
+import { MissionRouter } from "../router/MissionRouter.ts";
+import * as MissionStore from "../store/MissionStore.ts";
 import { MakeCallInput, OpenAskRequest, ProposeSuggestionInput } from "../asks/inputs.ts";
 import { WATCH_KINDS } from "../asks/watch.ts";
 
@@ -418,8 +423,12 @@ const missionWriteTool = <Name extends string, P extends Schema.Constraint>(
 
 const MissionCreateTool = Tool.make("mission_create", {
   description:
-    "As a mission master, create a new mission (slug and title required; tier, weight and shares optional). It starts active with no master.",
-  parameters: CreateMissionInput,
+    "As a mission master, create a new mission (slug and title required; tier, weight and shares optional). It starts active with no master. If your thread masters several missions, name the one you act for in actingFor.",
+  // ardud missions: core - a thread mastering several missions names the one it acts for
+  parameters: Schema.Struct({
+    ...CreateMissionInput.fields,
+    actingFor: Schema.optional(MissionId),
+  }),
   success: MissionMutationResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
@@ -484,12 +493,54 @@ const MissionApprovalsTool = Tool.make("mission_approvals", {
 
 const MissionApprovalDecideTool = missionWriteTool(
   "mission_approval_decide",
-  "As the mission's master, approve or reject a pending approval routed to the master (with an optional note). Approvals routed to the owner are his; re-route one first with mission_approval_route if he agreed. Stale-closed approvals never count, and an approval only covers the head it names.",
+  "As the mission's master, approve or reject a pending approval (with an optional note). You decide approvals routed to the master; one routed to the owner is his unless you pass onOwnerCondition: the open owner request about this approval and his exact words stating the condition your decision meets, whole sentences from his newest message there (not a question). The decision is then recorded as yours on his condition. Stale-closed approvals never count, and an approval only covers the head it names.",
   Schema.Struct({
     missionId: MissionId,
     approvalId: ApprovalId,
     action: Schema.Literals(["approve", "reject"]),
     note: Schema.optional(Schema.String),
+    onOwnerCondition: Schema.optional(OwnerCondition),
+  }),
+);
+
+// ardud missions: core - portfolio order and lane nudges
+const MissionPortfolioReorderTool = Tool.make("mission_portfolio_reorder", {
+  description:
+    "As a mission master, set the order of missions across the portfolio, highest first (mission ids; missions you leave out follow by tier, weight and title). The owner and every master share one order, and the timeline records who set it. If your thread masters several missions, name the one you act for in actingFor.",
+  parameters: Schema.Struct({
+    order: Schema.Array(MissionId),
+    actingFor: Schema.optional(MissionId),
+  }),
+  success: MissionMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: [...planDependencies, MasterControls.MasterControls],
+});
+
+const MissionLaneNudgeTool = Tool.make("mission_lane_nudge", {
+  description:
+    "As the mission's master, wake one of its lanes: posts a request to the mission's control room addressed to the lane, which reaches the lane's thread, and logs the nudge. The note is optional; without one the lane is asked where it is and what is next.",
+  parameters: Schema.Struct({
+    missionId: MissionId,
+    laneId: LaneId,
+    note: Schema.optional(Schema.String),
+  }),
+  success: MissionMutationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: [...planDependencies, MissionStore.MissionStore, MissionRouter],
+});
+
+// ardud missions: core - the master revises a call on the owner's condition
+const MissionCallReviseTool = missionWriteTool(
+  "mission_call_revise",
+  "As the mission's master, revise one of its calls after the owner discussed it: the new decision (and reason, if it changed), with onOwnerCondition: the open owner request about this call and his exact words stating the condition the revision meets, whole sentences from his newest message there (not a question). The call is recorded as revised on his condition and waits for his reaction again. Refused without a condition he stated.",
+  Schema.Struct({
+    missionId: MissionId,
+    callId: CallId,
+    decision: TrimmedNonEmptyString,
+    reason: Schema.optional(Schema.String),
+    onOwnerCondition: OwnerCondition,
   }),
 );
 
@@ -644,7 +695,10 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionLaneSplitTool, "Split a lane"),
   writeTool(MissionLaneMergeTool, "Merge lanes"),
   readTool(MissionApprovalsTool, "Mission approvals"),
-  writeTool(MissionApprovalDecideTool, "Decide an approval routed to the master"),
+  writeTool(MissionApprovalDecideTool, "Decide an approval"),
+  writeTool(MissionCallReviseTool, "Revise a call on the owner's condition"),
+  writeTool(MissionPortfolioReorderTool, "Set the portfolio order"),
+  writeTool(MissionLaneNudgeTool, "Nudge a lane"),
   writeTool(MissionApprovalRouteTool, "Route one approval"),
   writeTool(MissionApprovalAnnotateTool, "Annotate an approval"),
   writeTool(MissionApprovalRoutingTool, "Set approval routing"),

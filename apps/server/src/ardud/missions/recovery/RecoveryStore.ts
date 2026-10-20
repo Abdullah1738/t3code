@@ -35,6 +35,27 @@ const DDL = [
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_mission_recovery_incidents_by_time
     ON ardud_mission_recovery_incidents (detected_at)`,
+  // Which missions each incident touched, so a mission's incident list reads
+  // its own rows instead of every incident's JSON. Written with the incident.
+  `CREATE TABLE IF NOT EXISTS ardud_mission_recovery_incident_missions (
+    incident_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    PRIMARY KEY (incident_id, mission_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS ardud_mission_recovery_incident_missions_by_mission
+    ON ardud_mission_recovery_incident_missions (mission_id, detected_at)`,
+  // Incidents saved before the index existed.
+  `INSERT OR IGNORE INTO ardud_mission_recovery_incident_missions (incident_id, mission_id, detected_at)
+    SELECT incident.incident_id, touched.value, incident.detected_at
+    FROM (
+      SELECT incident_id, incident_json, detected_at FROM ardud_mission_recovery_incidents AS saved
+      WHERE json_valid(saved.incident_json) AND NOT EXISTS (
+        SELECT 1 FROM ardud_mission_recovery_incident_missions AS indexed
+        WHERE indexed.incident_id = saved.incident_id
+      )
+    ) AS incident,
+      json_each(incident.incident_json, '$.missionIds') AS touched`,
   `CREATE TABLE IF NOT EXISTS ardud_mission_recovery_seen (
     seen_key TEXT PRIMARY KEY,
     incident_id TEXT,
@@ -375,6 +396,20 @@ const make = Effect.gen(function* () {
           incident_json = excluded.incident_json,
           updated_at = excluded.updated_at
       `;
+      yield* sql`
+        DELETE FROM ardud_mission_recovery_incident_missions WHERE incident_id = ${incident.id}
+      `;
+      yield* Effect.forEach(
+        [...new Set(incident.missionIds)],
+        (missionId) => sql`
+          INSERT INTO ardud_mission_recovery_incident_missions ${sql.insert({
+            incident_id: incident.id,
+            mission_id: missionId,
+            detected_at: incident.detectedAt,
+          })}
+        `,
+        { discard: true },
+      );
     }).pipe(Effect.orDie);
 
   const decodeRows = (rows: ReadonlyArray<{ readonly incident_json: string }>) =>
@@ -411,11 +446,11 @@ const make = Effect.gen(function* () {
   const incidentsOf = (missionId: MissionId) =>
     read(
       sql<{ readonly incident_json: string }>`
-        SELECT incident_json FROM ardud_mission_recovery_incidents
-        WHERE EXISTS (
-          SELECT 1 FROM json_each(incident_json, '$.missionIds') WHERE value = ${missionId}
-        )
-        ORDER BY detected_at DESC LIMIT ${MISSION_INCIDENTS}
+        SELECT incident.incident_json FROM ardud_mission_recovery_incident_missions AS touched
+        JOIN ardud_mission_recovery_incidents AS incident
+          ON incident.incident_id = touched.incident_id
+        WHERE touched.mission_id = ${missionId}
+        ORDER BY touched.detected_at DESC LIMIT ${MISSION_INCIDENTS}
       `,
     ).pipe(Effect.flatMap(decodeRows));
 

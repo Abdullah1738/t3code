@@ -11,6 +11,7 @@ import {
   Pool,
   PoolHold,
   type PoolView,
+  RecoveryIncident,
   ReviewPolicy,
   ReviewRecord,
   Role,
@@ -31,16 +32,17 @@ import type {
   MissionRolesSnapshot,
   MissionRuleBook,
   MissionTimelineEvent,
+  MissionTimelineWindow,
   MissionWorkSnapshot,
   MissionsSource,
   PortfolioSnapshot,
-  RecoveryIncident,
   Unsubscribe,
+  WorkQuery,
 } from "../source.ts";
 import * as data from "./data.ts";
 import type { EventLog } from "./eventLog.ts";
 import * as ops from "./opsData.ts";
-import { RecoveryIncidentSeed, RuleAuditSeed } from "./schemas.ts";
+import { RuleAuditSeed } from "./schemas.ts";
 import { fail, newestFirst, replace } from "./util.ts";
 
 const decodeRoles = Schema.decodeUnknownSync(Schema.Array(Role));
@@ -55,15 +57,7 @@ const decodeHolds = Schema.decodeUnknownSync(Schema.Array(PoolHold));
 const decodeWorkItems = Schema.decodeUnknownSync(Schema.Array(WorkItem));
 const decodeChangeRequests = Schema.decodeUnknownSync(Schema.Array(RuleChangeRequest));
 const decodeAudit = Schema.decodeUnknownSync(Schema.Array(RuleAuditSeed));
-const decodeIncidents = Schema.decodeUnknownSync(Schema.Array(RecoveryIncidentSeed));
-
-/** The recovery track's wording for the overview line. */
-const RECOVERY_CAUSE_LABEL: Record<RecoveryIncident["cause"], string> = {
-  "server-restart": "restart",
-  "opencode-restart": "OpenCode restart",
-  "run-interrupted": "interrupted runs",
-  succession: "role handoff",
-};
+const decodeIncidents = Schema.decodeUnknownSync(Schema.Array(RecoveryIncident));
 
 /** Pool pressure turns tight from this share in use, or when anything queues. */
 const POOL_TIGHT_USE = 0.66;
@@ -93,6 +87,8 @@ export type OperationsSource = Pick<
   | "subscribePools"
   | "subscribeRecovery"
   | "subscribeTimeline"
+  | "subscribeTimelineWindow"
+  | "loadOlderTimeline"
   | "subscribePortfolio"
   | "resolveRuleChange"
   | "nudgeLane"
@@ -179,11 +175,28 @@ export function createOperations(ctx: OperationsContext): Operations {
   const missionOf = (missionId: string) => missions.find((m) => m.id === missionId);
   const findLane = (laneId: string) => lanes.find((l) => l.id === laneId);
 
-  function work(missionId: string): MissionWorkSnapshot {
-    return memo(`work:${missionId}`, () => ({
-      missionId: missionId as MissionWorkSnapshot["missionId"],
-      items: workItems.filter((item) => item.missionId === missionId),
-    }));
+  /** Same order and filters as `missions.workItems`: most recently changed first. */
+  function work(missionId: string, query: WorkQuery = {}): MissionWorkSnapshot {
+    return memo(`work:${missionId}:${JSON.stringify(query)}`, () => {
+      const matching = workItems
+        .filter(
+          (item) =>
+            item.missionId === missionId &&
+            (query.laneId === undefined || item.laneId === query.laneId) &&
+            (query.stages === undefined || query.stages.includes(item.stage)),
+        )
+        .sort(
+          (left, right) =>
+            right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id),
+        );
+      const items = query.limit === undefined ? matching : matching.slice(0, query.limit);
+      return {
+        missionId: missionId as MissionWorkSnapshot["missionId"],
+        items,
+        total: matching.length,
+        hasMore: items.length < matching.length,
+      };
+    });
   }
 
   function ruleBook(missionId: string): MissionRuleBook {
@@ -306,6 +319,14 @@ export function createOperations(ctx: OperationsContext): Operations {
     );
   }
 
+  /** The fixture keeps its whole log in memory, so there is never an older page. */
+  function timelineWindow(missionId: string): MissionTimelineWindow {
+    return memo(`timeline-window:${missionId}`, () => ({
+      events: timeline(missionId),
+      hasOlder: false,
+    }));
+  }
+
   function portfolio(): PortfolioSnapshot {
     return memo("portfolio", () => {
       const live = missions.filter((m) => m.status !== "archived");
@@ -361,7 +382,7 @@ export function createOperations(ctx: OperationsContext): Operations {
   }
 
   const source: OperationsSource = {
-    subscribeWork: (missionId, listener) => watch(() => work(missionId), listener),
+    subscribeWork: (missionId, listener, query) => watch(() => work(missionId, query), listener),
     subscribeRuleBook: (missionId, listener) => watch(() => ruleBook(missionId), listener),
     subscribeRoles: (missionId, listener) => watch(() => rolesSnapshot(missionId), listener),
     subscribeReviewPolicy: (missionId, listener) =>
@@ -369,6 +390,9 @@ export function createOperations(ctx: OperationsContext): Operations {
     subscribePools: (missionId, listener) => watch(() => poolsSnapshot(missionId), listener),
     subscribeRecovery: (missionId, listener) => watch(() => recovery(missionId), listener),
     subscribeTimeline: (missionId, listener) => watch(() => timeline(missionId), listener),
+    subscribeTimelineWindow: (missionId, listener) =>
+      watch(() => timelineWindow(missionId), listener),
+    loadOlderTimeline: () => Promise.resolve(),
     subscribePortfolio: (listener) => watch(portfolio, listener),
 
     resolveRuleChange({ requestId, status, response }) {
@@ -406,14 +430,13 @@ export function createOperations(ctx: OperationsContext): Operations {
       const lane = liveLane(laneId);
       if (!lane) return fail("not-found", `Lane ${laneId} not found.`);
       if (lane.status === "parked") return fail("conflict", "Resume the lane before nudging it.");
-      const text = note.trim();
-      if (text.length === 0) return fail("invalid", "Say what the lane should look at.");
-      ctx.postNudge(lane, text);
+      const text = note?.trim() ?? "";
+      ctx.postNudge(lane, text.length > 0 ? text : "Nudge");
       log.record({
         missionId: lane.missionId,
         kind: "lane.nudged",
         subject: ref("lane", lane.id, lane.name),
-        summary: `Nudged ${lane.name}: ${text}`,
+        summary: text.length > 0 ? `Nudged ${lane.name}: ${text}` : `Nudged ${lane.name}`,
       });
       commit();
       return Promise.resolve();
@@ -686,19 +709,25 @@ export function createOperations(ctx: OperationsContext): Operations {
   return {
     source,
     openRecovery: (missionId) => {
-      const incident = recovery(missionId).find((open) => open.status === "open");
+      const incident = recovery(missionId).find((open) => open.clearedAt === null);
       if (!incident) return null;
-      const pending = incident.members.filter((member) => member.state === "pending");
+      const pending = incident.threads.filter((thread) =>
+        ["pending", "held", "failed"].includes(thread.state),
+      );
       if (pending.length === 0) return null;
       return {
         incidentId: incident.id,
         cause: incident.cause,
-        at: incident.detectedAt,
-        // The server formats the clock in the owner's zone; the fixture reads UTC.
-        label: `Recovered from ${RECOVERY_CAUSE_LABEL[incident.cause]} at ${incident.detectedAt.slice(11, 16)}`,
-        total: incident.members.length,
+        at: incident.windowEnd,
+        // Clients build the line from `cause` and `at` in the reader's zone.
+        label: `Recovered from ${incident.cause}`,
+        total: incident.threads.length,
         pending: pending.length,
-        reconcile: pending.filter((member) => member.action === "reconcile-first").length,
+        reconcile: pending.filter(
+          (thread) =>
+            thread.action === "reconcile-first" ||
+            thread.holds.some((hold) => hold.reconcileRequired),
+        ).length,
       };
     },
   };

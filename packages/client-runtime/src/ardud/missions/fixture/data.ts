@@ -15,7 +15,8 @@
 import type { MissionPoolUsage } from "../source.ts";
 import { controlReceipts, messageRows, roomMembers } from "./roomMessages.ts";
 
-export const AT = (time: string, day = 17) => `2026-10-${day}T${time}:00.000Z`;
+export const AT = (time: string, day = 17) =>
+  `2026-10-${String(day).padStart(2, "0")}T${time}:00.000Z`;
 
 export const FIXTURE_NOW = AT("08:33");
 export const OWNER_LAST_LOOKED_AT = AT("05:06");

@@ -159,6 +159,7 @@ export function AskCard(
     <CardFrame
       {...frame(props, `ask:${ask.id}`)}
       kicker={view.urgent ? "Urgent decision" : "Decision"}
+      discussion={discussion.symbol}
       subMission={cardSubMission(props.list, ask.missionId, ask.subMissionId)}
       since={ask.createdAt}
       title={ask.question}
@@ -318,6 +319,7 @@ export function DraftCard(
     <CardFrame
       {...frame(props, `draft:${draft.id}`)}
       kicker={draftKicker(draft)}
+      discussion={discussion.symbol}
       since={draft.createdAt}
       title={draftTitle(draft)}
       actions={actions}
@@ -325,7 +327,7 @@ export function DraftCard(
     >
       <LinksBlock links={[draft.target]}>
         {draft.head ? (
-          <span className="font-mono text-xs text-muted-foreground">
+          <span className="text-xs text-(--m-muted) tabular-nums">
             <span className="sr-only">Head commit </span>
             {draft.head.slice(0, 7)}
           </span>
@@ -432,6 +434,7 @@ export function ApprovalCard(
     <CardFrame
       {...frame(props, `approval:${approval.id}`)}
       kicker={APPROVAL_KICKER[approval.kind]}
+      discussion={discussion.symbol}
       since={approval.createdAt}
       title={approval.title}
       actions={actions}
@@ -522,6 +525,7 @@ export function KnockCard(
     <CardFrame
       {...frame(props, `knock:${knock.id}`)}
       kicker="Knock"
+      discussion={discussion.symbol}
       since={knock.createdAt}
       title={knock.summary}
       actions={actions}
@@ -616,6 +620,7 @@ export function SuggestionCard(
     <CardFrame
       {...frame(props, `suggestion:${suggestion.id}`)}
       kicker={SUGGESTION_TARGET_LABEL[suggestion.targetKind]}
+      discussion={discussion.symbol}
       since={suggestion.createdAt}
       title={suggestion.title}
       actions={actions}
@@ -676,6 +681,7 @@ export function NoteCard(props: CardContext & { note: Note; actions: InboxAction
     <CardFrame
       {...frame(props, `note:${note.id}`)}
       kicker={noteKicker(note)}
+      discussion={discussion.symbol}
       subMission={cardSubMission(props.list, note.missionId, note.subMissionId)}
       since={note.createdAt}
       title={note.summary}

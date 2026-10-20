@@ -569,4 +569,40 @@ it.layer(TestLayer)("MissionService", (it) => {
       assert.equal(missing.code, "not-found");
     }),
   );
+
+  // ardud missions: core - the owner's device formats every time in its own zone
+  it.effect("text the owner reads carries instants, never a baked clock time", () =>
+    Effect.gen(function* () {
+      const service = yield* MissionService.MissionService;
+      const missionId = yield* createMission("m-clock");
+      const sub = yield* addSubMission(master, missionId, "A");
+      yield* service.upsertLane(master, { missionId, name: "api", subMissionId: sub });
+      yield* service.upsertWorkItem(master, {
+        missionId,
+        workItemId: WorkItemId.make("wi-clock"),
+        subMissionId: sub,
+        title: "Ship it",
+        kind: "ticket",
+      });
+      yield* service.updateMission(master, { missionId, tier: "P0" });
+      yield* service.setMissionStatus(owner, { missionId, status: "paused" });
+      yield* service.setMissionStatus(owner, { missionId, status: "active" });
+      yield* service.setPortfolioOrder(owner, { order: [missionId] });
+
+      const instants = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?/g;
+      const clock = /\b\d{1,2}:\d{2}\b/;
+      const texts = [
+        ...(yield* service.eventsSince(missionId, 0)).map((event) => event.summary),
+        ...(yield* service.eventsSince(MissionId.make("missions-global"), 0)).map((e) => e.summary),
+        JSON.stringify(yield* service.overview(missionId)),
+        JSON.stringify(yield* service.inbox(missionId)),
+        JSON.stringify(yield* service.digest(missionId, { _tag: "recent" })),
+        JSON.stringify(yield* service.portfolio(null)),
+      ];
+      assert.isAtLeast(texts.length, 10);
+      for (const text of texts) {
+        assert.notMatch(text.replace(instants, "<instant>"), clock, text);
+      }
+    }),
+  );
 });

@@ -17,6 +17,8 @@ import {
   createKeyedSnapshotStores,
   createRpcMissionsSource,
   createSnapshotStore,
+  masterInboxFeed,
+  withMasterInboxFeed,
   yourRequests,
   type SampledFeed,
   type ApprovalRoutingTable,
@@ -47,16 +49,21 @@ const useFixtureOnly =
   typeof window !== "undefined" &&
   new URLSearchParams(window.location.search).get("missionsFixture") === "1";
 const fixtureSource = createFixtureMissionsSource({ surface: "web" });
-export const missionsSource: MissionsSource = useFixtureOnly
-  ? fixtureSource
-  : createRpcMissionsSource({
-      transport: createAtomMissionsTransport({
-        runtime: connectionAtomRuntime,
-        registry: appAtomRegistry,
-        environmentId: primaryEnvironmentIdAtom,
-      }),
-      fallback: fixtureSource,
-    });
+export const missionsSource: MissionsSource = useFixtureOnly ? fixtureSource : createLiveSource();
+
+function createLiveSource(): MissionsSource {
+  const transport = createAtomMissionsTransport({
+    runtime: connectionAtomRuntime,
+    registry: appAtomRegistry,
+    environmentId: primaryEnvironmentIdAtom,
+  });
+  // The server's inbox carries only what is routed to the owner; the master's
+  // queue joins it here so the inbox's master view and counts are live.
+  return withMasterInboxFeed(
+    createRpcMissionsSource({ transport, fallback: fixtureSource }),
+    masterInboxFeed(transport),
+  );
+}
 
 /** True when a section's data comes from the fixture rather than the server. */
 export function isSampleFeed(feed: SampledFeed): boolean {

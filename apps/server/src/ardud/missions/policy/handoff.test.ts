@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Result from "effect/Result";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import {
@@ -154,6 +155,61 @@ it.layer(testLayer(ports.layer))("lane handoff", (it) => {
         );
         assert.deepStrictEqual(ports.launches, []);
       }),
+  );
+
+  it.effect("two handoffs of one lane at once leave no launched thread idle", () =>
+    Effect.gen(function* () {
+      const { policy, store, laneId, roleId } = yield* leadLane("race");
+      reset();
+      const outcomes = yield* Effect.all(
+        [1, 2].map((n) =>
+          Effect.result(policy.handOffLane(OWNER, { laneId, handoffNote: `handoff ${n}` })),
+        ),
+        { concurrency: "unbounded" },
+      );
+      assert.isTrue(outcomes.every(Result.isSuccess));
+      // The second handoff waited and handed over from the first one's lead.
+      const holders = (yield* store.listAllInMission("role-binding", CRPKO))
+        .filter((binding) => binding.roleId === roleId)
+        .map((binding) => binding.threadId);
+      for (const launched of ports.launches) assert.include(holders, launched.threadId);
+      assert.deepStrictEqual(
+        ports.launches.map((launched) => launched.from),
+        [LEAD, ports.launches[0]!.threadId],
+      );
+      const lane = Option.getOrThrow(yield* store.get("lane", laneId));
+      assert.strictEqual(lane.threadId, ports.launches[1]!.threadId);
+    }),
+  );
+
+  it.effect("a retried handoff reuses the thread the failed one launched", () =>
+    Effect.gen(function* () {
+      const { policy, laneId } = yield* leadLane("retry");
+      reset();
+      ports.control.launchUnseen = true;
+      const failed = yield* Effect.flip(policy.handOffLane(OWNER, { laneId, handoffNote: "x" }));
+      ports.control.launchUnseen = false;
+      const launched = ports.launches[0]!.threadId;
+      assert.include(failed.detail, `${launched} is idle; retrying this handoff reuses it`);
+      const result = yield* policy.handOffLane(OWNER, { laneId, handoffNote: "x" });
+      assert.strictEqual(result.binding.threadId, launched);
+      assert.strictEqual(ports.launches.length, 1);
+    }),
+  );
+
+  it.effect("a brief that fails is in the result, after the handoff landed", () =>
+    Effect.gen(function* () {
+      const { policy, store, laneId } = yield* leadLane("unbriefed");
+      reset();
+      ports.control.briefFails = true;
+      const result = yield* policy
+        .handOffLane(OWNER, { laneId, handoffNote: "x" })
+        .pipe(Effect.ensuring(Effect.sync(() => (ports.control.briefFails = false))));
+      const launched = ports.launches[0]!.threadId;
+      assert.strictEqual(result.binding.threadId, launched);
+      assert.include(result.briefFailure ?? "", `${launched} was not briefed: brief refused`);
+      assert.strictEqual(Option.getOrThrow(yield* store.get("lane", laneId)).threadId, launched);
+    }),
   );
 });
 

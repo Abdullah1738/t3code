@@ -1,10 +1,17 @@
-import type { MissionId, MissionListSnapshot, OwnerRequestId, RoomId } from "@t3tools/contracts";
+import type {
+  MissionId,
+  MissionInboxHistory,
+  MissionListSnapshot,
+  MissionRecordRef,
+  OwnerRequestId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
+import { masterRoutedEntries } from "../cardViewModel.ts";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "../fixture/index.ts";
-import type { MissionInboxSnapshot } from "../source.ts";
+import type { MissionInboxSnapshot, OwnerRequest } from "../source.ts";
 import {
-  discussionsNeedingYou,
+  decidedRows,
   entriesForMission,
   entrySubject,
   filteredEntries,
@@ -13,7 +20,6 @@ import {
   inboxRow,
   resolveInboxFilter,
 } from "./inboxList.ts";
-import type { RequestThread } from "./requests.ts";
 
 const CRPKO = "crpko-engineering" as MissionId;
 const NOW = Date.parse(FIXTURE_NOW) + 60_000;
@@ -35,19 +41,23 @@ function load() {
   return { inbox, list };
 }
 
-function thread(subject: RequestThread["subject"], unread: boolean): RequestThread {
+function thread(subject: MissionRecordRef | null, unread: boolean): OwnerRequest {
   return {
-    id: `request-${subject?.id ?? "own"}` as OwnerRequestId,
+    id: `request-${subject?.id ?? "own"}`,
     missionId: CRPKO,
-    roomId: "room-request" as RoomId,
     title: "About it",
     status: "answered",
+    messages: [
+      { id: "m1", author: "owner", text: "Why?", at: FIXTURE_NOW, refs: [] },
+      { id: "m2", author: "master", text: "Because.", at: FIXTURE_NOW, refs: [] },
+    ],
+    hasOlder: false,
+    links: [],
     subject,
     unread,
-    messages: [],
-    hasOlder: false,
     createdAt: FIXTURE_NOW,
     updatedAt: FIXTURE_NOW,
+    settledAt: null,
   };
 }
 
@@ -80,23 +90,62 @@ describe("phone inbox list", () => {
     const entry = all[0]!;
     expect(findEntry(inbox, entry.key)?.key).toBe(entry.key);
     expect(findEntry(inbox, "ask:missing")).toBeNull();
+    // Items routed to the master open from the board too.
+    const routed = masterRoutedEntries(inbox)[0]!;
+    expect(findEntry(inbox, routed.key)?.key).toBe(routed.key);
     expect(entriesForMission(all, CRPKO).every((item) => item.record.missionId === CRPKO)).toBe(
       true,
     );
     expect(entriesForMission(all, null)).toHaveLength(all.length);
   });
 
-  it("marks rows with an unread discussion and counts answered ones that left the inbox", () => {
+  it("puts a discussion's unread count on the item's row only", () => {
     const { inbox, list } = load();
     const waiting = filteredEntries(inbox, "all");
     const entry = waiting[0]!;
     const about = entrySubject(entry);
     expect(about).toMatchObject({ kind: entry.kind, id: entry.record.id });
-    const onItem = thread(about, true);
-    expect(inboxRow(entry, list, NOW, [onItem]).unreadDiscussion).toBe(true);
-    expect(inboxRow(entry, list, NOW, [thread(about, false)]).unreadDiscussion).toBe(false);
-    const gone = thread({ kind: "ask", id: "ask-decided-already" } as never, true);
-    const own = thread(null, true);
-    expect(discussionsNeedingYou(waiting, [onItem, gone, own])).toBe(1);
+    expect(inboxRow(entry, list, NOW).discussion).toBeNull();
+    expect(inboxRow(entry, list, NOW, [thread(about, true)]).discussion).toEqual({ unread: 1 });
+    expect(inboxRow(entry, list, NOW, [thread(about, false)]).discussion).toEqual({ unread: 0 });
+    // The owner's own requests and other items' discussions leave the row alone.
+    const other = thread({ kind: "ask", id: "ask-decided-already" }, true);
+    expect(inboxRow(entry, list, NOW, [thread(null, true), other]).discussion).toBeNull();
+  });
+
+  it("lists what was decided today newest first with the owner's condition", () => {
+    const source = createFixtureMissionsSource({ now: () => NOW });
+    const history = first<MissionInboxHistory>((listener) =>
+      source.subscribeInboxHistory(CRPKO, listener),
+    );
+    const approval = history.approvals[0];
+    if (!approval) throw new Error("fixture has no decided approval");
+    const conditioned = {
+      ...history,
+      approvals: [
+        {
+          ...approval,
+          decidedAt: "2026-10-17T08:34:00.000Z",
+          onOwnerCondition: {
+            requestId: "request-1" as OwnerRequestId,
+            quote: "Only after the canary is green.",
+          },
+        },
+      ],
+    };
+    const rows = decidedRows(conditioned, NOW);
+    expect(rows[0]).toMatchObject({
+      key: `approval:${approval.id}`,
+      age: "now",
+      condition: "Only after the canary is green.",
+    });
+    const all = decidedRows(history, NOW);
+    expect(all.length).toBe(
+      history.asks.length +
+        history.drafts.length +
+        history.approvals.length +
+        history.knocks.length +
+        history.suggestions.length,
+    );
   });
 });

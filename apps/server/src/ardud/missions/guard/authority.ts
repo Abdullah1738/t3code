@@ -38,7 +38,8 @@ const PrincipalJson = Schema.fromJsonString(
     Schema.TaggedStruct("mcp-client", { sessionId: Schema.String, label: Schema.String }),
   ]),
 );
-const encodePrincipal = Schema.encodeSync(PrincipalJson);
+/** A principal as the authority table stores it. */
+export const encodePrincipal = Schema.encodeSync(PrincipalJson);
 const decodePrincipal = Schema.decodeUnknownOption(PrincipalJson);
 
 /** The authority table could not be read, or its row does not decode. */

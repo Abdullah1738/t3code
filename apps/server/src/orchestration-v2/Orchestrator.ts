@@ -135,6 +135,8 @@ import {
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import { contextResetTurnItem } from "../ardud/context-reset/divider.ts";
+// ardud missions: guard
+import { countsAsUserTurn } from "../ardud/missions/guard/turns.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 import {
@@ -4746,7 +4748,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (yield* projectionStore
             .getMessageCount(command.threadId)
             .pipe(mapDispatchError(command))) === 0) ||
-          (command.createdBy === "user" && onlyMaintenanceHistory))
+          // ardud missions: guard - a bearer's prompt is a person's turn too.
+          (countsAsUserTurn(command) && onlyMaintenanceHistory))
       ) {
         const now = yield* DateTime.now;
         const thread: OrchestrationV2AppThread = {

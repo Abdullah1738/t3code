@@ -279,5 +279,16 @@ export const indexRecord = (entry: MissionStoreRecord): MissionRecordIndex => {
         updatedAt: r.updatedAt,
       };
     }
+    // ardud missions: core - one order across missions, owned by none
+    case "portfolio": {
+      const r = entry.record;
+      return {
+        id: r.id,
+        missionId: null,
+        subMissionId: null,
+        status: null,
+        updatedAt: r.updatedAt,
+      };
+    }
   }
 };

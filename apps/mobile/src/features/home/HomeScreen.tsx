@@ -81,6 +81,9 @@ import { SwipeableScrollGateProvider, useSwipeableScrollGate } from "./thread-sw
 import { useMaterialFabScroll } from "./MaterialFabScrollContext";
 import { useWorkspaceTabs } from "../workspace/WorkspaceTabsContext";
 import { ThreadListFilters } from "./ThreadListFilters";
+// ardud missions: mobile
+import { MissionsThreadGroup } from "../../ardud/missions/MissionsThreadGroup";
+// end ardud missions: mobile
 
 /* ─── Types ──────────────────────────────────────────────────────────── */
 
@@ -1004,6 +1007,9 @@ export function HomeScreen(props: HomeScreenProps) {
           onProjectChange={props.onProjectChange}
         />
       ) : null}
+      {/* ardud missions: mobile */}
+      {hasSearchQuery ? null : <MissionsThreadGroup />}
+      {/* end ardud missions: mobile */}
     </>
   );
 

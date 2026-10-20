@@ -5,6 +5,7 @@
 
 import type {
   BroadcastReceipt,
+  Lane,
   MissionActor,
   MissionId,
   MissionMessage,
@@ -14,12 +15,14 @@ import type {
   RoomKind,
   RoomNoise,
   RoomPage,
+  Role,
   Subscription,
   UpsertRuleInput,
 } from "@t3tools/contracts";
+import { DateTime } from "effect";
 
 import type { LoadRoomPageInput, MissionRoomEntry } from "./source.ts";
-import { actorKey, actorLabel } from "./viewModel.ts";
+import { actorKey, actorLabel, formatDayLabel, formatTimeOfDay } from "./viewModel.ts";
 
 type Result<T> =
   | { readonly ok: true; readonly value: T }
@@ -40,7 +43,7 @@ export type RoomGroupKey = "sub-mission" | "work-item" | "standing";
 export const ROOM_GROUP_LABEL: Record<RoomGroupKey, string> = {
   "sub-mission": "Sub-missions",
   "work-item": "Work items",
-  standing: "Control, release and arch",
+  standing: "Standing rooms",
 };
 
 const ROOM_GROUP_OF: Record<RoomKind, RoomGroupKey> = {
@@ -146,6 +149,85 @@ export function pageUnread(page: Pick<RoomPage, "messages" | "ownerReadSeq" | "h
 /** Room names the way the coordinator says them: "#delivery", "#CRP-12350 · …". */
 export function roomName(room: Pick<Room, "title">): string {
   return room.title.startsWith("#") ? room.title : `#${room.title}`;
+}
+
+const STANDING_KINDS: ReadonlySet<RoomKind> = new Set(["control", "release", "arch"]);
+
+/** The chip over an open room: "Standing room", "Sub-mission room". */
+export function roomChipLabel(kind: RoomKind): string {
+  if (STANDING_KINDS.has(kind)) return "Standing room";
+  if (kind === "custom") return "Room";
+  return `${ROOM_KIND_LABEL[kind]} room`;
+}
+
+const COUNT = new Intl.NumberFormat("en-US");
+
+function perHourLabel(perHour: number): string {
+  const rounded = perHour >= 100 ? Math.round(perHour) : Math.round(perHour * 10) / 10;
+  return `${COUNT.format(rounded)} an hour`;
+}
+
+/** Clock time today, else the day, in the reader's zone. */
+export function whenLabel(atIso: string, nowMs: number, timeZone?: string): string {
+  const today = formatDayLabel(DateTime.formatIso(DateTime.makeUnsafe(nowMs)), timeZone);
+  const day = formatDayLabel(atIso, timeZone);
+  return day === today ? formatTimeOfDay(atIso, timeZone) : day;
+}
+
+/** Second line of a room in the list: "52.6 an hour, last 04:52". */
+export function roomListLine(
+  room: Pick<Room, "noise" | "lastMessageAt">,
+  nowMs: number,
+  timeZone?: string,
+): string | null {
+  const parts: string[] = [];
+  if (room.noise && room.noise.messagesPerHour > 0) {
+    parts.push(perHourLabel(room.noise.messagesPerHour));
+  }
+  if (room.lastMessageAt) parts.push(`last ${whenLabel(room.lastMessageAt, nowMs, timeZone)}`);
+  return parts.length === 0 ? null : parts.join(", ");
+}
+
+export interface RoomStat {
+  readonly label: string;
+  readonly value: string;
+}
+
+/** The open room's figures; unknown ones are left out. */
+export function roomStats(
+  noise: RoomNoise | null,
+  messageCount: number | null,
+): ReadonlyArray<RoomStat> {
+  const stats: RoomStat[] = [];
+  if (messageCount !== null) stats.push({ label: "Messages", value: COUNT.format(messageCount) });
+  if (noise) {
+    const rate = noise.messagesPerHour;
+    stats.push({
+      label: "Per hour",
+      value: COUNT.format(rate >= 100 ? Math.round(rate) : Math.round(rate * 10) / 10),
+    });
+    stats.push({ label: "Actionable", value: `${Math.round(noise.actionableShare * 100)}%` });
+  }
+  return stats;
+}
+
+export interface RoomsSummary {
+  /** All messages across the listed rooms; null when the list carries no counts. */
+  readonly messages: number | null;
+  readonly rooms: number;
+  readonly unread: number;
+}
+
+export function roomsSummary(entries: ReadonlyArray<MissionRoomEntry>): RoomsSummary {
+  const listed = entries.filter((entry) => !entry.room.archived);
+  const counts = listed.map((entry) => entry.room.messageCount);
+  return {
+    messages: counts.some((count) => count !== undefined)
+      ? counts.reduce<number>((sum, count) => sum + (count ?? 0), 0)
+      : null,
+    rooms: listed.length,
+    unread: totalUnread(listed),
+  };
 }
 
 export type NoiseTone = "calm" | "busy" | "noisy";
@@ -291,9 +373,18 @@ export function roomTimeline(
   return rows;
 }
 
-/** "Scribe folded 14 status posts. Nobody was woken by them." */
-export function statusRunLine(count: number): string {
-  return `${count} status ${count === 1 ? "post" : "posts"} folded. Status wakes nobody.`;
+/** A folded run of status posts: "3 status updates, 04:28 to 04:34", in the reader's zone. */
+export function statusRunLine(
+  messages: ReadonlyArray<Pick<MissionMessage, "createdAt">>,
+  timeZone?: string,
+): string {
+  const count = `${messages.length} status ${messages.length === 1 ? "update" : "updates"}`;
+  const first = messages[0];
+  const last = messages[messages.length - 1];
+  if (!first || !last) return count;
+  const from = formatTimeOfDay(first.createdAt, timeZone);
+  const to = formatTimeOfDay(last.createdAt, timeZone);
+  return from === to ? `${count} at ${from}` : `${count}, ${from} to ${to}`;
 }
 
 /** The read position to store once the owner has seen up to `seenSeq`; `null` if it would not move forward. */
@@ -309,7 +400,7 @@ export function newestSeq(messages: ReadonlyArray<MissionMessage>): number | nul
 // Message details
 
 export interface ReceiptView {
-  /** "reached 21 of 21" */
+  /** "Reached 21 of 21" */
   readonly label: string;
   readonly complete: boolean;
   /** "waiting on cell-bal, cell-fab-tc" or null when everyone has it. */
@@ -320,9 +411,60 @@ export function receiptView(receipt: BroadcastReceipt | null): ReceiptView | nul
   if (receipt === null) return null;
   const complete = receipt.pending.length === 0 && receipt.reached >= receipt.total;
   return {
-    label: `reached ${receipt.reached} of ${receipt.total}`,
+    label: `Reached ${receipt.reached} of ${receipt.total}`,
     complete,
     pending: receipt.pending.length === 0 ? null : `waiting on ${receipt.pending.join(", ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Names
+
+/** Display names keyed by `actorKey`, as a room page's `names` carries them. */
+export type ActorNames = Readonly<Record<string, string>>;
+
+/**
+ * Names for the mission's lanes and roles, so a screen without a room page
+ * (the timeline) never shows a raw id either.
+ */
+export function actorNames(
+  lanes: ReadonlyArray<Pick<Lane, "id" | "name">>,
+  roles: ReadonlyArray<Pick<Role, "id" | "name">>,
+): ActorNames {
+  const names: Record<string, string> = {};
+  for (const role of roles) names[`role:${role.id}`] = role.name;
+  for (const lane of lanes) names[`lane:${lane.id}`] = lane.name;
+  return names;
+}
+
+/** "you", "master", else the name the server gave, else the short id. */
+export function actorName(
+  actor: MissionActor,
+  masterRoleId: string | null,
+  names?: ActorNames,
+): string {
+  if (actor._tag === "owner") return "you";
+  if (actor._tag === "role" && actor.roleId === masterRoleId) return "master";
+  return names?.[actorKey(actor)] ?? actorLabel(actor, masterRoleId);
+}
+
+export interface MessageParties {
+  readonly from: string;
+  /** Who it went to; null when it went to the whole room. */
+  readonly to: string | null;
+}
+
+export function messageParties(
+  message: Pick<MissionMessage, "author" | "to" | "isCorrection">,
+  masterRoleId: string | null,
+  names?: ActorNames,
+): MessageParties {
+  const from = actorName(message.author, masterRoleId, names);
+  if (message.isCorrection) return { from, to: "master" };
+  if (message.to.length === 0) return { from, to: null };
+  return {
+    from,
+    to: message.to.map((actor) => actorName(actor, masterRoleId, names)).join(", "),
   };
 }
 
@@ -330,11 +472,11 @@ export function receiptView(receipt: BroadcastReceipt | null): ReceiptView | nul
 export function messageAddressLine(
   message: Pick<MissionMessage, "author" | "to" | "isCorrection">,
   masterRoleId: string | null,
+  names?: ActorNames,
 ): string {
-  const from = actorLabel(message.author, masterRoleId);
-  if (message.isCorrection) return `${from} → master (correction)`;
-  if (message.to.length === 0) return from;
-  return `${from} → ${message.to.map((actor) => actorLabel(actor, masterRoleId)).join(", ")}`;
+  const parties = messageParties(message, masterRoleId, names);
+  if (message.isCorrection) return `${parties.from} → master (correction)`;
+  return parties.to === null ? parties.from : `${parties.from} → ${parties.to}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,25 +490,55 @@ export interface RoomMember {
   readonly wakeOn: ReadonlyArray<MissionMessageKind>;
 }
 
+export interface RoomMembersExtra {
+  readonly names?: ActorNames | undefined;
+  /** Everyone in the room per the server (writers and addressees too); read-only unless subscribed. */
+  readonly members?: ReadonlyArray<MissionActor> | undefined;
+}
+
 /** Members other than the owner, waking ones first, A-Z. */
 export function roomMembers(
   subscriptions: ReadonlyArray<Subscription>,
   masterRoleId: string | null,
+  extra: RoomMembersExtra = {},
 ): RoomMember[] {
   const modeRank: Record<Subscription["mode"], number> = { wake: 0, read: 1, mute: 2 };
-  return subscriptions
-    .filter((subscription) => subscription.subscriber._tag !== "owner")
-    .map((subscription) => ({
-      key: actorKey(subscription.subscriber),
+  const byKey = new Map<string, RoomMember>();
+  for (const subscription of subscriptions) {
+    if (subscription.subscriber._tag === "owner") continue;
+    const key = actorKey(subscription.subscriber);
+    byKey.set(key, {
+      key,
       actor: subscription.subscriber,
-      label: actorLabel(subscription.subscriber, masterRoleId),
+      label: actorName(subscription.subscriber, masterRoleId, extra.names),
       mode: subscription.mode,
       wakeOn: subscription.wakeOn,
-    }))
-    .sort(
-      (left, right) =>
-        modeRank[left.mode] - modeRank[right.mode] || left.label.localeCompare(right.label),
-    );
+    });
+  }
+  for (const actor of extra.members ?? []) {
+    if (actor._tag === "owner" || actor._tag === "system") continue;
+    const key = actorKey(actor);
+    if (byKey.has(key)) continue;
+    byKey.set(key, {
+      key,
+      actor,
+      label: actorName(actor, masterRoleId, extra.names),
+      mode: "read",
+      wakeOn: [],
+    });
+  }
+  return [...byKey.values()].sort(
+    (left, right) =>
+      modeRank[left.mode] - modeRank[right.mode] || left.label.localeCompare(right.label),
+  );
+}
+
+/** "49 members, 34 woken by posts"; null for an empty room. */
+export function roomMembersLine(members: ReadonlyArray<RoomMember>): string | null {
+  if (members.length === 0) return null;
+  const count = `${members.length} ${members.length === 1 ? "member" : "members"}`;
+  const woken = members.filter((member) => member.mode === "wake").length;
+  return woken === 0 ? count : `${count}, ${woken} woken by posts`;
 }
 
 /** Who a post of this kind would wake if sent to the whole room. */
@@ -388,7 +560,7 @@ export type ComposerTarget =
 export const COMPOSER_TARGET_LABEL: Record<ComposerTarget["kind"], string> = {
   room: "Room",
   lane: "One lane",
-  correction: "Correct master",
+  correction: "Master correction",
 };
 
 /**

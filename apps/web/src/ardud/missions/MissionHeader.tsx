@@ -1,17 +1,14 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { CrosshairIcon, MessageCircleQuestionIcon, PauseIcon, PlayIcon } from "lucide-react";
 
 import type { MissionId, MissionOverview, SubMissionId } from "@t3tools/contracts";
 import {
-  badgeCount,
-  formatCountdown,
-  formatDayLabel,
-  formatPercent,
+  formatTimeOfDay,
   laneTotal,
-  nextMilestone,
-  poolUsageView,
+  pageTabs,
   priorityStack,
+  resolveMissionLayout,
   type MissionOverviewSnapshot,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -27,45 +24,111 @@ import {
 } from "../../components/ui/menu";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../../components/ui/popover";
 import { cn } from "../../lib/utils";
-import { GlyphCount, HealthStatus } from "./cards/chips";
+import { Chip, StateGlyph } from "./cards/chips";
 import { setMissionFocus, toggleMissionPaused } from "./missionCommands";
-import { useMissionList, useYourRequests } from "./missionsStore";
-import {
-  RequestComposer,
-  RequestsUnreadLink,
-  unreadRequests,
-  useRequestOpener,
-} from "./sections/YourRequests";
+import { MISSION_TAB_LABEL, MISSION_TABS, type MissionTab } from "./missionSearch";
+import { useMissionRooms, useMissionViews } from "./missionsStore";
+import { RequestComposer, useRequestOpener } from "./sections/YourRequests";
+import { useMissionsConnection } from "./useMissionsConnection";
 
-/** Title, the owner's controls, goal, focus and the mission's headline numbers. */
-export function MissionHead(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
-  const { overview, nowMs } = props;
+/**
+ * The mission toolbar: tabs on the left; the connection, focus, pause and
+ * Ask the master on the right. The focus bar shows under it while a
+ * sub-mission has the focus.
+ */
+export function MissionToolbar(props: { overview: MissionOverviewSnapshot; tab: MissionTab }) {
+  const { overview } = props;
   const { mission } = overview;
+  const paused = mission.status === "paused";
   return (
-    <section aria-labelledby="mission-title" className="flex min-w-0 flex-col gap-1.5">
-      <div className="flex min-h-8 min-w-0 items-center gap-3">
-        <h1
-          id="mission-title"
-          className="min-w-0 flex-1 text-base leading-6 font-semibold text-balance"
-        >
-          {mission.title}
-        </h1>
-        <div className="flex shrink-0 items-center gap-1">
+    <div className="flex min-w-0 flex-col gap-3">
+      {/* The board's greeting is its h1; other tabs name the mission for readers. */}
+      {props.tab === "overview" ? null : <h1 className="sr-only">{mission.title}</h1>}
+      <div className="flex min-w-0 items-center justify-between gap-6">
+        <MissionTabs overview={overview} tab={props.tab} />
+        <div className="flex shrink-0 items-center gap-1.5">
+          <ConnectionChip />
           <FocusMenu overview={overview} />
-          <PauseButton
-            missionId={mission.id}
-            title={mission.title}
-            paused={mission.status === "paused"}
-          />
+          {paused ? <Chip>Paused</Chip> : null}
+          <PauseButton missionId={mission.id} title={mission.title} paused={paused} />
           <AskTheMaster missionId={mission.id} />
         </div>
       </div>
-      {mission.goal ? (
-        <p className="max-w-[72ch] text-sm text-pretty text-muted-foreground">{mission.goal}</p>
-      ) : null}
       <FocusBar overview={overview} />
-      <MissionStats overview={overview} nowMs={nowMs} />
-    </section>
+    </div>
+  );
+}
+
+const ALL_TABS = MISSION_TABS.map((tab) => ({ tab, title: MISSION_TAB_LABEL[tab] }));
+
+/** The layout's tabs in its order and names, with counts where the page knows them. */
+function MissionTabs(props: { overview: MissionOverviewSnapshot; tab: MissionTab }) {
+  const missionId = props.overview.mission.id;
+  const views = useMissionViews(missionId);
+  const rooms = useMissionRooms(missionId);
+  const tabs = useMemo(
+    () =>
+      views
+        ? pageTabs(resolveMissionLayout(views.snapshot), MISSION_TAB_LABEL, props.tab)
+        : ALL_TABS,
+    [views, props.tab],
+  );
+  const counts: Partial<Record<MissionTab, number>> = {
+    ...(rooms ? { rooms: rooms.length } : {}),
+    lanes: laneTotal(props.overview.lanes),
+  };
+  return (
+    <nav
+      aria-label="Mission sections"
+      className="min-w-0 flex-1 overflow-x-auto [scrollbar-width:none]"
+    >
+      <ul className="flex min-w-max gap-5.5">
+        {tabs.map(({ tab, title }) => {
+          const active = tab === props.tab;
+          const count = counts[tab];
+          return (
+            <li key={tab}>
+              <Link
+                to="/missions/$missionId"
+                params={{ missionId }}
+                search={tab === "overview" ? {} : { tab }}
+                aria-current={active ? "page" : undefined}
+                className={cn(
+                  "flex h-9.5 items-center gap-1.5 border-b-2 text-sm whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
+                  active
+                    ? "border-(--m-text) font-medium text-(--m-text)"
+                    : "border-transparent text-(--m-muted) hover:text-(--m-text)",
+                )}
+              >
+                {title}
+                {count !== undefined && count > 0 ? (
+                  <span className="text-xs font-normal text-(--m-muted) tabular-nums">{count}</span>
+                ) : null}
+              </Link>
+            </li>
+          );
+        })}
+      </ul>
+    </nav>
+  );
+}
+
+/** "Reconnecting" with the last update time while the server is out of reach. */
+function ConnectionChip() {
+  const connection = useMissionsConnection();
+  if (connection.label === null) return null;
+  return (
+    <span role="status" className="flex items-center gap-2.5">
+      <span className="inline-flex h-8 items-center gap-2 rounded-full bg-(--m-surface) px-3.5 text-sm font-medium whitespace-nowrap">
+        <StateGlyph kind="wait" />
+        {connection.label}
+      </span>
+      {connection.lastUpdateAt !== null ? (
+        <span className="text-xs whitespace-nowrap text-(--m-muted) max-sm:sr-only">
+          Last update {formatTimeOfDay(new Date(connection.lastUpdateAt).toISOString())}
+        </span>
+      ) : null}
+    </span>
   );
 }
 
@@ -94,7 +157,7 @@ function FocusMenu(props: { overview: MissionOverview }) {
           <MenuRadioGroup value={mission.focusSubMissionId ?? ""} onValueChange={setFocus}>
             {rows.map((row) => (
               <MenuRadioItem key={row.subMission.id} value={row.subMission.id} closeOnClick>
-                <span className="w-4 shrink-0 text-xs text-muted-foreground tabular-nums">
+                <span className="w-4 shrink-0 text-xs text-(--m-muted) tabular-nums">
                   {row.position}
                 </span>
                 {row.subMission.title}
@@ -115,9 +178,9 @@ function FocusBar(props: { overview: MissionOverview }) {
   return (
     <div
       role="status"
-      className="mt-3.5 flex max-w-140 min-w-0 items-center gap-2.5 rounded-lg bg-update/14 py-1.5 ps-3 pe-1.5 text-sm"
+      className="mt-3.5 flex max-w-140 min-w-0 items-center gap-2.5 rounded-lg bg-(--m-band) py-1.5 ps-3 pe-1.5 text-sm"
     >
-      <CrosshairIcon aria-hidden className="size-4 shrink-0 text-update-foreground" />
+      <CrosshairIcon aria-hidden className="size-4 shrink-0 text-(--m-accent-text)" />
       <span className="min-w-0 flex-1 truncate font-medium">
         Focused on {focused?.title ?? "a closed sub-mission"}
       </span>
@@ -130,7 +193,11 @@ function FocusBar(props: { overview: MissionOverview }) {
 
 function PauseButton(props: { missionId: MissionId; title: string; paused: boolean }) {
   return (
-    <Button variant="ghost-muted" size="sm" onClick={() => void toggleMissionPaused(props)}>
+    <Button
+      variant={props.paused ? "default" : "ghost-muted"}
+      size="sm"
+      onClick={() => void toggleMissionPaused(props)}
+    >
       {props.paused ? <PlayIcon aria-hidden /> : <PauseIcon aria-hidden />}
       <span className="max-sm:sr-only">{props.paused ? "Resume" : "Pause"}</span>
     </Button>
@@ -143,7 +210,7 @@ function AskTheMaster(props: { missionId: MissionId }) {
   const openRequest = useRequestOpener(props.missionId);
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger render={<Button variant="outline" size="sm" />}>
+      <PopoverTrigger render={<Button variant="secondary" size="sm" />}>
         <MessageCircleQuestionIcon aria-hidden />
         <span className="max-sm:sr-only">Ask the master</span>
       </PopoverTrigger>
@@ -162,137 +229,4 @@ function AskTheMaster(props: { missionId: MissionId }) {
       </PopoverPopup>
     </Popover>
   );
-}
-
-/** The head's numbers: one term and one value each, empty ones left out. */
-function MissionStats(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
-  const { overview, nowMs } = props;
-  const { mission } = overview;
-  const milestone = useMemo(() => nextMilestone(overview.milestones), [overview.milestones]);
-  const lanes = overview.lanes;
-  const lanesTotal = laneTotal(lanes);
-  const countdown = milestone?.targetAt ? formatCountdown(milestone.targetAt, nowMs) : "";
-  return (
-    <dl className="mt-4.5 grid grid-cols-2 gap-x-6 gap-y-4 sm:flex sm:flex-wrap sm:gap-x-12 sm:gap-y-4.5">
-      <Stat term={milestone?.targetAt ? formatDayLabel(milestone.targetAt) : "Health"}>
-        <HealthStatus health={mission.health} paused={mission.status === "paused"} />
-      </Stat>
-      {countdown ? (
-        <Stat term="Time left">
-          <span className={cn(countdown.startsWith("overdue") && "text-error-foreground")}>
-            {countdown}
-          </span>
-        </Stat>
-      ) : null}
-      {milestone && milestone.total > 0 ? (
-        <Stat term="Milestones">
-          {milestone.done > 0 || milestone.atRisk > 0 ? (
-            <>
-              {milestone.done > 0 ? (
-                <GlyphCount kind="done" count={milestone.done} label={`${milestone.done} done,`} />
-              ) : null}
-              {milestone.atRisk > 0 ? (
-                <GlyphCount
-                  kind="risk"
-                  count={milestone.atRisk}
-                  label={`${milestone.atRisk} at risk,`}
-                />
-              ) : null}
-              <OfTotal total={milestone.total} />
-            </>
-          ) : (
-            milestone.total
-          )}
-        </Stat>
-      ) : null}
-      {lanesTotal > 0 ? (
-        <Stat term="Lanes">
-          {lanes.stuck > 0 || lanes.waiting > 0 ? (
-            <>
-              {lanes.stuck > 0 ? (
-                <GlyphCount kind="bad" count={lanes.stuck} label={`${lanes.stuck} stuck,`} />
-              ) : null}
-              {lanes.waiting > 0 ? (
-                <GlyphCount
-                  kind="wait"
-                  tone="risk"
-                  count={lanes.waiting}
-                  label={`${lanes.waiting} waiting,`}
-                />
-              ) : null}
-              <OfTotal total={lanesTotal} />
-            </>
-          ) : (
-            lanesTotal
-          )}
-        </Stat>
-      ) : null}
-      <NeedsYouStat missionId={mission.id} />
-      {overview.usageShare !== null && Number.isFinite(overview.usageShare) ? (
-        <Stat term="Guaranteed share used">
-          <span className={cn(overview.usageShare > 1 && "text-warning-foreground")}>
-            {formatPercent(overview.usageShare)}
-          </span>
-        </Stat>
-      ) : null}
-      {overview.poolUsage.map((pool) => {
-        const view = poolUsageView(pool, nowMs, mission.masterRoleId);
-        return (
-          <Stat key={view.id} term={view.label}>
-            <span
-              className={cn(
-                view.tone === "out" && "text-error-foreground",
-                view.tone === "tight" && "text-warning-foreground",
-              )}
-            >
-              <span aria-hidden>{view.value}</span>
-              <span className="sr-only">{view.detail}</span>
-            </span>
-          </Stat>
-        );
-      })}
-    </dl>
-  );
-}
-
-/** What waits on the owner here, and answers to their requests not yet read. */
-function NeedsYouStat(props: { missionId: MissionId }) {
-  const list = useMissionList();
-  const requests = useYourRequests(props.missionId);
-  const count = list?.missions.find((mission) => mission.id === props.missionId)?.needsYou ?? 0;
-  const answered = unreadRequests(requests).length > 0;
-  if (count === 0 && !answered) return null;
-  return (
-    <Stat term="Needs you">
-      {count > 0 ? (
-        <Link
-          to="/missions/inbox"
-          search={{ mission: props.missionId }}
-          className="rounded-sm text-update-foreground outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        >
-          {badgeCount(count)}
-          <span className="sr-only"> in the inbox</span>
-        </Link>
-      ) : null}
-      <span className="font-normal">
-        <RequestsUnreadLink missionId={props.missionId} requests={requests} />
-      </span>
-    </Stat>
-  );
-}
-
-/** Value above its term, as in the design's stat row. */
-function Stat(props: { term: string; children: ReactNode }) {
-  return (
-    <div className="flex min-w-0 flex-col-reverse gap-0.5">
-      <dt className="truncate text-xs text-muted-foreground">{props.term}</dt>
-      <dd className="flex min-w-0 items-center gap-3 text-base leading-6 font-semibold tabular-nums">
-        {props.children}
-      </dd>
-    </div>
-  );
-}
-
-function OfTotal(props: { total: number }) {
-  return <span className="text-xs font-normal text-muted-foreground">of {props.total}</span>;
 }

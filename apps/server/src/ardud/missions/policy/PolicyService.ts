@@ -23,6 +23,7 @@ import type {
   ReviewPlan,
   ReviewPlanRequest,
   ReviewPolicySnapshot,
+  RoleId,
   RolesSnapshot,
   SetCriticalityGuideInput,
   SetPoolCapacityInput,
@@ -48,7 +49,7 @@ import * as Semaphore from "effect/Semaphore";
 import { forkParked } from "../../../serverActivation.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
-import type { PolicyDeps } from "./context.ts";
+import { keyedLocks, type PolicyDeps } from "./context.ts";
 import type { GovernorDecision } from "./governor.ts";
 import { governorView, makeGovernorMemory, runGovernor, type GovernorMode } from "./governorOps.ts";
 import * as PolicyStore from "./PolicyStore.ts";
@@ -158,6 +159,7 @@ const make = (options: PolicyOptions) =>
       sampler: yield* PolicySampler,
       handoff: Option.getOrNull(yield* Effect.serviceOption(PolicyHandoff)),
       holdLock: yield* Semaphore.make(1),
+      roleLock: keyedLocks<RoleId>(),
     };
     const suggestions = yield* PolicySuggestions;
     const memory = makeGovernorMemory();

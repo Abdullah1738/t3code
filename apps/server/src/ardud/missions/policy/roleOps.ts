@@ -58,6 +58,7 @@ import {
   roleTarget,
   succeed,
 } from "./roles.ts";
+import { successionScope } from "./succession.ts";
 
 const newestBindingFirst = (left: RoleBinding, right: RoleBinding) =>
   right.boundAt.localeCompare(left.boundAt) || right.id.localeCompare(left.id);
@@ -133,14 +134,15 @@ export const alignRole = (
     const applied: Array<ThreadId> = [];
     const confirmed: Array<ThreadId> = [];
     const waiting: Array<ThreadId> = [];
-    const accepted: Array<ThreadId> = [];
+    // Same shape as an import's acceptance, so readers parse one payload.
+    const accepted: Array<{ roleId: RoleId; threadId: ThreadId; model: string }> = [];
     for (const binding of active) {
       if (!needsAlignment(role, binding)) continue;
       // An imported holder keeps whatever it runs until someone changes the
       // role's model; a mismatch shows as drift, never as a switch.
       if (keepsImportedModel(role, binding)) {
         changed.push({ ...binding, observedModel: key });
-        accepted.push(binding.threadId);
+        accepted.push({ roleId: role.id, threadId: binding.threadId, model: key });
         continue;
       }
       const step = holderStep(target, yield* deps.threads.view(binding.threadId));
@@ -586,6 +588,14 @@ export const succeedRole = (
   provenance: MissionProvenance,
   input: SucceedRoleInput,
 ): Effect.Effect<SucceedRoleResult, MissionError> =>
+  deps.roleLock(input.roleId).withPermit(succeedHeld(deps, provenance, input));
+
+/** `succeedRole` for a caller that already holds the role's lock. */
+const succeedHeld = (
+  deps: PolicyDeps,
+  provenance: MissionProvenance,
+  input: SucceedRoleInput,
+): Effect.Effect<SucceedRoleResult, MissionError> =>
   Effect.gen(function* () {
     const now = yield* nowIso;
     const found = yield* findRole(deps, input.roleId, now);
@@ -618,16 +628,23 @@ export const succeedRole = (
       observedModel:
         holder.modelSelection !== null && modelKey(holder.modelSelection) === key ? key : null,
     };
-    const portMoves = yield* deps.succession.move(current.threadId, input.threadId);
+    const portMoves = yield* deps.succession.move(
+      current.threadId,
+      input.threadId,
+      yield* successionScope(deps, { role, ended: current, caller }),
+    );
     const moved = portMoves
       .filter((move) => move.supported && move.moved > 0)
       .map((move) => `${move.moved} ${move.what}`);
+    const kept = portMoves
+      .filter((move) => (move.kept ?? 0) > 0)
+      .map((move) => `${move.kept} ${move.what}`);
     yield* deps.store.commit({
       event: eventDraft(
         caller,
         role.missionId,
         "role.succession",
-        `${role.name} handed from ${current.threadId} to ${input.threadId}${moved.length > 0 ? `; moved ${moved.join(", ")}` : ""}`,
+        `${role.name} handed from ${current.threadId} to ${input.threadId}${moved.length > 0 ? `; moved ${moved.join(", ")}` : ""}${kept.length > 0 ? `; kept ${kept.join(", ")} on the old thread` : ""}`,
         roleRef(role),
         {
           from: current.threadId,
@@ -689,9 +706,26 @@ export const handOffLane = (
   input: HandOffLaneInput,
 ): Effect.Effect<SucceedRoleResult, MissionError> =>
   Effect.gen(function* () {
-    const stored = yield* deps.store.get("lane", input.laneId);
-    if (Option.isNone(stored)) return yield* failWith("not-found", `No lane ${input.laneId}.`);
-    const lane = stored.value;
+    const lane = yield* findLane(deps, input.laneId);
+    const roleId = lane.leadRoleId ?? defaultRoleId(lane.missionId, "lane-lead", lane.id);
+    // One handoff of a lane at a time: the second sees the first one's lead.
+    return yield* deps.roleLock(roleId).withPermit(handOffHeld(deps, provenance, input));
+  });
+
+const findLane = (deps: PolicyDeps, laneId: HandOffLaneInput["laneId"]) =>
+  Effect.gen(function* () {
+    const stored = yield* deps.store.get("lane", laneId);
+    if (Option.isNone(stored)) return yield* failWith("not-found", `No lane ${laneId}.`);
+    return stored.value;
+  });
+
+const handOffHeld = (
+  deps: PolicyDeps,
+  provenance: MissionProvenance,
+  input: HandOffLaneInput,
+): Effect.Effect<SucceedRoleResult, MissionError> =>
+  Effect.gen(function* () {
+    const lane = yield* findLane(deps, input.laneId);
     if (lane.status === "retired") {
       return yield* failWith("invalid", `Lane ${lane.name} is retired.`);
     }
@@ -706,8 +740,10 @@ export const handOffLane = (
     );
     const caller = yield* resolveCaller(deps, provenance, lane.missionId);
     yield* requireGovern(caller, "hand a lane off");
-    const holds = (yield* roleBindings(deps, role)).some((binding) => binding.threadId === from);
-    if (!holds) {
+    const held = (yield* roleBindings(deps, role)).find(
+      (binding) => binding.threadId === from && binding.endedAt === null,
+    );
+    if (held === undefined) {
       return yield* failWith(
         "conflict",
         `${role.name} is not held by ${from}, the lane's thread; bind the lead first.`,
@@ -725,26 +761,30 @@ export const handOffLane = (
             from,
             title: `${lane.name} lead`,
             modelSelection: roleTarget(role),
+            // Same lane, same outgoing binding: a retry gets the same thread back.
+            launchId: `${lane.id}:${held.id}`,
           })
         : null;
     const threadId = input.threadId ?? launched;
     if (threadId === null) return yield* failWith("conflict", "No thread to hand the lane to.");
-    const result = yield* succeedRole(deps, provenance, {
+    const result = yield* succeedHeld(deps, provenance, {
       roleId: role.id,
       threadId,
       fromThreadId: from,
       handoffNote: input.handoffNote,
     }).pipe(
-      // A concurrent handoff can win between our checks and the commit. The
-      // thread we launched is idle; say which one so nobody hunts for it.
+      // Say which thread was launched so nobody hunts for it.
       Effect.catch((error) =>
         launched === null
           ? Effect.fail(error)
-          : failWith(error.code, `${error.detail} The launched thread ${launched} was left idle.`),
+          : failWith(
+              error.code,
+              `${error.detail} The launched thread ${launched} is idle; retrying this handoff reuses it.`,
+            ),
       ),
     );
     if (launched !== null && deps.handoff !== null) {
-      yield* deps.handoff
+      const briefed = yield* deps.handoff
         .brief(
           launched,
           [
@@ -756,15 +796,18 @@ export const handOffLane = (
           ].join("\n"),
           `handoff:${result.binding.id}`,
         )
-        .pipe(
-          Effect.catch((error) =>
-            Effect.logWarning("mission policy could not brief the new lane lead", {
-              laneId: lane.id,
-              threadId: launched,
-              detail: error.detail,
-            }),
-          ),
-        );
+        .pipe(Effect.result);
+      if (Result.isFailure(briefed)) {
+        yield* Effect.logWarning("mission policy could not brief the new lane lead", {
+          laneId: lane.id,
+          threadId: launched,
+          detail: briefed.failure.detail,
+        });
+        return {
+          ...result,
+          briefFailure: `The handoff landed, but ${launched} was not briefed: ${briefed.failure.detail} Send it the handoff note yourself.`,
+        };
+      }
     }
     return result;
   });
