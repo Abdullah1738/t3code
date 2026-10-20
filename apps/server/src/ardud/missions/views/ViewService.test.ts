@@ -14,14 +14,12 @@ import {
   type ViewTemplateDefinition,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
   agent,
   at,
   failureCode,
-  harness,
   masterThread,
   missionId,
   otherMasterThread,
@@ -32,12 +30,8 @@ import {
 } from "../asks/AsksService.testkit.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
-import { ViewsLive } from "./layer.ts";
 import { ViewService } from "./ViewService.ts";
-
-/** A fresh database per test: each one seeds mission m-1. */
-const fresh = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(Effect.provide(ViewsLive.pipe(Layer.provideMerge(harness().layer))));
+import { fresh } from "./views.testkit.ts";
 
 const crwMerge: ViewTemplateDefinition = {
   key: "crw-merge",
@@ -116,7 +110,7 @@ describe("ViewService", () => {
         const bad = {
           ...crwMerge,
           body: [
-            { _tag: "gallery", bind: "record.assets" },
+            { _tag: "audio", bind: "record.assets" },
             { _tag: "text", bind: "record.nope", style: "body", maxLines: 2 },
             { _tag: "flags", bind: "record.title" },
             { _tag: "choice" },

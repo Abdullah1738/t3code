@@ -6,6 +6,9 @@
 import {
   MISSIONS_VIEWS_WS_METHODS as M,
   MissionError,
+  type AddMissionAssetInput,
+  type ApplyViewBundleInput,
+  type RemoveMissionAssetInput,
   type DefineViewTemplateInput,
   type EditStarterLayoutInput,
   type EditViewLayoutInput,
@@ -30,6 +33,7 @@ import * as Stream from "effect/Stream";
 import { OWNER_SESSION_REQUIRED, ownerAppProvenance } from "../core/provenance.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionWsConnection } from "../ws.ts";
+import { queriedKinds, sectionData } from "./sectionRows.ts";
 import { GLOBAL_TIMELINE, ViewService } from "./ViewService.ts";
 
 export interface ViewsWsServices {
@@ -49,18 +53,36 @@ const waitingItem = (snapshot: MissionViewsSnapshot): MissionViewsFeedItem => ({
 const waitingKey = (snapshot: MissionViewsSnapshot) =>
   `${snapshot.ownerWaiting}:${snapshot.requestsUnread}:${snapshot.pinned.needsYou}:${snapshot.pinned.requests}`;
 
-/** View changes (and starter changes) resend the snapshot; anything else may move the counts. */
+/**
+ * The mission's records and events, plus starter changes. Records arrive
+ * before the event of the same commit, so the event knows which kinds moved.
+ */
 const touches = (missionId: MissionId) => (item: MissionStreamItem) =>
-  item._tag === "upsert" &&
-  item.record._tag === "event" &&
-  (item.record.record.missionId === missionId ||
-    (item.record.record.missionId === GLOBAL_TIMELINE &&
-      item.record.record.kind.startsWith("view.starter-layout")));
+  item._tag === "remove"
+    ? item.missionId === missionId
+    : item._tag === "upsert" &&
+      (item.missionId === missionId ||
+        (item.record._tag === "event" &&
+          item.record.record.missionId === GLOBAL_TIMELINE &&
+          item.record.record.kind.startsWith("view.starter-layout")));
 
 const isViewChange = (item: MissionStreamItem) =>
   item._tag === "upsert" &&
   item.record._tag === "event" &&
   item.record.record.kind.startsWith("view.");
+
+/** The record kind a non-event item changed, or null. */
+const changedKind = (item: MissionStreamItem): string | null => {
+  if (item._tag === "remove") return item.ref.kind;
+  if (item._tag === "upsert" && item.record._tag !== "event") return item.record._tag;
+  return null;
+};
+
+interface FeedState {
+  readonly snapshot: MissionViewsSnapshot;
+  /** Kinds changed since the last event. */
+  readonly changed: ReadonlySet<string>;
+}
 
 export const makeViewsWsHandlers = (
   { store, views }: ViewsWsServices,
@@ -78,9 +100,10 @@ export const makeViewsWsHandlers = (
 
   /**
    * Subscribes before reading the snapshot, so nothing committed in between is
-   * lost. A view change resends the whole snapshot; other mission events only
-   * recount what waits on the owner and send `waiting` when the counts or the
-   * pinned strip changed.
+   * lost. A view change resends the whole snapshot. Another event recomputes
+   * section rows when it changed a kind a section queries, resending the
+   * snapshot when the rows moved; otherwise it only recounts what waits on the
+   * owner and sends `waiting` when the counts or the pinned strip changed.
    */
   const subscribe = (input: MissionViewsInput): Stream.Stream<MissionViewsFeedItem, MissionError> =>
     Stream.unwrap(
@@ -90,14 +113,28 @@ export const makeViewsWsHandlers = (
         const updates = Stream.fromSubscription(subscription).pipe(
           Stream.filter(touches(input.missionId)),
           Stream.mapAccumEffect(
-            () => first,
-            (last, item) =>
+            (): FeedState => ({ snapshot: first, changed: new Set() }),
+            (state, item) =>
               Effect.gen(function* () {
+                const last = state.snapshot;
+                const kind = changedKind(item);
+                if (kind !== null) {
+                  const next: FeedState = {
+                    snapshot: last,
+                    changed: new Set([...state.changed, kind]),
+                  };
+                  return [next, []] as const;
+                }
                 if (isViewChange(item)) {
                   const snapshot = yield* views.snapshot(input.missionId);
                   const next: MissionViewsFeedItem = { _tag: "snapshot", snapshot };
-                  return [snapshot, [next]] as const;
+                  return [{ snapshot, changed: new Set<string>() }, [next]] as const;
                 }
+                const queried = queriedKinds(last.sections);
+                const rowsMayMove = [...state.changed].some((changed) => queried.has(changed));
+                const rows = rowsMayMove
+                  ? yield* sectionData(store, input.missionId, last.sections)
+                  : (last.sectionData ?? []);
                 const counts = yield* views.waiting(input.missionId);
                 const pinned = viewPinnedStrip(last.layout.layout, counts);
                 const snapshot: MissionViewsSnapshot = {
@@ -106,9 +143,14 @@ export const makeViewsWsHandlers = (
                   requestsUnread: counts.requestsUnread,
                   pinnedStrip: pinned.needsYou || pinned.requests,
                   pinned,
+                  sectionData: rows,
                 };
+                const next: FeedState = { snapshot, changed: new Set() };
+                if (JSON.stringify(rows) !== JSON.stringify(last.sectionData ?? [])) {
+                  return [next, [{ _tag: "snapshot", snapshot } as MissionViewsFeedItem]] as const;
+                }
                 return [
-                  snapshot,
+                  next,
                   waitingKey(snapshot) === waitingKey(last) ? [] : [waitingItem(snapshot)],
                 ] as const;
               }),
@@ -144,6 +186,15 @@ export const makeViewsWsHandlers = (
     ),
     [M.restoreStarter]: asOwner((provenance, input: RestoreStarterLayoutInput) =>
       views.restoreStarter(provenance, input),
+    ),
+    [M.applyBundle]: asOwner((provenance, input: ApplyViewBundleInput) =>
+      views.applyBundle(provenance, input),
+    ),
+    [M.addAsset]: asOwner((provenance, input: AddMissionAssetInput) =>
+      views.addAsset(provenance, input),
+    ),
+    [M.removeAsset]: asOwner((provenance, input: RemoveMissionAssetInput) =>
+      views.removeAsset(provenance, input),
     ),
   } as const;
 };

@@ -324,6 +324,7 @@ export const answerAsk = (command: AnswerAskCommand): Outcome<AskResolution> => 
       provenance,
       answeredAt: command.now,
       ...(condition === null ? {} : { onOwnerCondition: condition }),
+      ...(input.feedback === undefined ? {} : { feedback: input.feedback }), // ardud missions: views
     },
     updatedAt: command.now,
   };

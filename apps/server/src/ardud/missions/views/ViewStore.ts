@@ -1,5 +1,6 @@
 import {
   DEFAULT_STARTER_LAYOUT,
+  MissionAsset,
   MissionError,
   ViewLayout,
   ViewSection,
@@ -54,7 +55,7 @@ const DDL = [
     ON ardud_mission_views_versions (metered_mission, changed_at)`,
 ];
 
-export type ViewScope = "template" | "section" | "layout" | "starter";
+export type ViewScope = "template" | "section" | "layout" | "starter" | "asset";
 
 /** The starter layout's row id and mission. */
 export const STARTER_ID = "starter";
@@ -74,12 +75,16 @@ const encodeTemplate = Schema.encodeEffect(templateCodec);
 const encodeSection = Schema.encodeEffect(sectionCodec);
 const encodeLayout = Schema.encodeEffect(layoutCodec);
 const encodeStarter = Schema.encodeEffect(starterCodec);
+const assetCodec = Schema.fromJsonString(MissionAsset);
+const decodeAsset = Schema.decodeUnknownEffect(assetCodec);
+const encodeAsset = Schema.encodeEffect(assetCodec);
 
 export type ViewWrite =
   | { readonly scope: "template"; readonly value: ViewTemplate }
   | { readonly scope: "section"; readonly value: ViewSection }
   | { readonly scope: "layout"; readonly value: ViewLayout }
-  | { readonly scope: "starter"; readonly value: ViewStarterLayout };
+  | { readonly scope: "starter"; readonly value: ViewStarterLayout }
+  | { readonly scope: "asset"; readonly value: MissionAsset };
 
 export interface WriteOptions {
   /**
@@ -116,6 +121,10 @@ export class ViewStore extends Context.Service<
     readonly layoutVersions: (
       missionId: MissionId,
     ) => Effect.Effect<ReadonlyArray<ViewLayout>, MissionError>;
+    /** Every asset record of the mission, any status. */
+    readonly assets: (
+      missionId: MissionId,
+    ) => Effect.Effect<ReadonlyArray<MissionAsset>, MissionError>;
     /** Writes the current row and appends the version. Fails on a version already written. */
     readonly write: (write: ViewWrite, options: WriteOptions) => Effect.Effect<void, MissionError>;
     /** Versions that spent the mission's change budget since `since` (ISO). */
@@ -225,6 +234,15 @@ const make = Effect.gen(function* () {
             json,
           })),
         );
+      case "asset":
+        return encodeAsset(write.value).pipe(
+          Effect.map((json) => ({
+            id: write.value.id as string,
+            missionId: write.value.missionId as string,
+            status: write.value.status as string,
+            json,
+          })),
+        );
     }
   };
 
@@ -325,6 +343,10 @@ const make = Effect.gen(function* () {
     layoutVersions: (missionId) =>
       Effect.flatMap(versionRows("layout", missionId), (rows) =>
         decodeAll(rows, decodeLayout, "mission layout"),
+      ),
+    assets: (missionId) =>
+      Effect.flatMap(currentRows("asset", missionId), (rows) =>
+        decodeAll(rows, decodeAsset, "mission asset"),
       ),
     write,
     changesSince,

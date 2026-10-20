@@ -168,7 +168,11 @@ export const applyLayoutOps = (
           issues.push({ path, code: "shape", detail: "reset applies to mission layouts" });
           return;
         }
-        entries = [...context.starter.entries];
+        // The mission's own sections stay on the board.
+        entries = [
+          ...context.starter.entries,
+          ...entries.filter((entry) => entry.section._tag === "custom"),
+        ];
         limits = context.starter.limits;
         changes.push("reset to the starter layout");
         return;

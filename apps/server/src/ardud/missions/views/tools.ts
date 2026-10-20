@@ -1,4 +1,7 @@
 import {
+  AddMissionAssetInput,
+  ApplyViewBundleInput,
+  RemoveMissionAssetInput,
   DefineViewTemplateInput,
   EditStarterLayoutInput,
   EditViewLayoutInput,
@@ -120,8 +123,29 @@ const LayoutRestoreTool = tool(
 
 const StarterTool = tool(
   "mission_view_starter",
-  "Owner or any mission's master. Change the recommended starter layout new missions start from (built-in sections and tabs only). Takes effect for missions created afterwards, with no restart; existing missions keep their layout.",
+  "Owner or any mission's master. Change the recommended starter layout new missions start from (built-in sections and tabs only). Takes effect for missions created afterwards, with no restart; existing missions keep their layout. To offer the new starter to an existing mission, a master calls mission_suggest with targetKind layout, target {kind: view-layout, id: <missionId>} and after: <starter version>; accepting resets that mission's layout to the starter and keeps its own sections.",
   EditStarterLayoutInput,
+  MissionMutationResult,
+);
+
+const ApplyTool = tool(
+  "mission_views_apply",
+  "Owner or the mission's master. Define card templates and place sections in one change: all of them or none. copyFrom takes another mission's active templates and sections by key (all of them when no keys are named; sections tied to its own sub-missions, lanes or records are skipped). Counts as one change against the daily budget.",
+  ApplyViewBundleInput,
+  MissionMutationResult,
+);
+
+const AssetAddTool = tool(
+  "mission_asset_add",
+  "Owner or any agent with a role or lane in the mission. Copy an image (PNG, JPEG, WebP or GIF, up to 10 MiB) into the mission so a card can show it: an attachment of your own thread, or an absolute file path on the server. ref.id of the result is the asset id to put in an assets field, e.g. the screens field of a ui-review ask (templateId builtin:ui-review). The copy stays until the mission is archived.",
+  AddMissionAssetInput,
+  MissionMutationResult,
+);
+
+const AssetRemoveTool = tool(
+  "mission_asset_remove",
+  "Owner, the mission's master, or the agent that added it. Remove a mission image; cards that bind it stop showing it.",
+  RemoveMissionAssetInput,
   MissionMutationResult,
 );
 
@@ -164,6 +188,9 @@ export const ViewsToolkit = Toolkit.make(
   annotated(LayoutRestoreTool, "Restore the mission layout", false),
   annotated(StarterTool, "Change the starter layout", false),
   annotated(StarterRestoreTool, "Restore the starter layout", false),
+  annotated(ApplyTool, "Apply a views bundle", false),
+  annotated(AssetAddTool, "Add a mission image", false),
+  annotated(AssetRemoveTool, "Remove a mission image", false),
 );
 
 const REFUSALS: ReadonlySet<MissionError["code"]> = new Set([
@@ -226,6 +253,15 @@ const handlers = {
   ),
   mission_view_starter_restore: McpToolAccess.actsAsCaller((input) =>
     withViews((views, scope) => views.restoreStarter(callerProvenance(scope), input)),
+  ),
+  mission_views_apply: McpToolAccess.actsAsCaller((input) =>
+    withViews((views, scope) => views.applyBundle(callerProvenance(scope), input)),
+  ),
+  mission_asset_add: McpToolAccess.actsAsCaller((input) =>
+    withViews((views, scope) => views.addAsset(callerProvenance(scope), input)),
+  ),
+  mission_asset_remove: McpToolAccess.actsAsCaller((input) =>
+    withViews((views, scope) => views.removeAsset(callerProvenance(scope), input)),
   ),
 } satisfies McpToolAccess.Handlers<typeof ViewsToolkit.tools>;
 

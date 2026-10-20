@@ -26,6 +26,11 @@ import {
   selectViewTemplate,
   viewMatchSubjectOf,
   viewPinnedStrip,
+  VIEW_ASSET_LIMITS,
+  type AddMissionAssetInput,
+  type ApplyViewBundleInput,
+  type MissionAsset,
+  type RemoveMissionAssetInput,
   type DefineViewTemplateInput,
   type EditStarterLayoutInput,
   type EditViewLayoutInput,
@@ -67,12 +72,15 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
+import * as ServerConfig from "../../../config.ts";
 import { standingOf } from "../asks/standing.ts";
 import { castOf } from "../core/master.ts";
 import { actorOf } from "../core/provenance.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import { assetFilePath, deleteAssetFile, readAssetSource, writeAssetFile } from "./assets.ts";
 import { applyLayoutOps, insertInRegion } from "./layoutOps.ts";
+import { sectionData } from "./sectionRows.ts";
 import { byteSize, checkLayout, checkSection, checkTemplate } from "./validate.ts";
 import * as ViewStore from "./ViewStore.ts";
 
@@ -111,6 +119,12 @@ export class ViewService extends Context.Service<
     readonly restoreStarter: Write<RestoreStarterLayoutInput>;
     /** Stores a new mission's layout from the starter in force; no-op when it has one. */
     readonly seedLayout: (missionId: MissionId) => Effect.Effect<void, MissionError>;
+    /** Templates and sections (own or copied from another mission) in one change. */
+    readonly applyBundle: Write<ApplyViewBundleInput>;
+    readonly addAsset: Write<AddMissionAssetInput>;
+    readonly removeAsset: Write<RemoveMissionAssetInput>;
+    /** An archived mission's images go: records expire and the copies are deleted. */
+    readonly expireAssets: (missionId: MissionId) => Effect.Effect<void, MissionError>;
   }
 >()("t3/ardud/missions/views/ViewService") {}
 
@@ -145,7 +159,23 @@ const OWNER_CALLER = (provenance: MissionProvenance): ViewCaller => ({
   metered: null,
 });
 
-const who = (caller: ViewCaller) => (caller.by === "owner" ? "The owner" : "The master");
+const WHO: Record<ViewAuthor, string> = {
+  owner: "The owner",
+  master: "The master",
+  agent: "An agent",
+  system: "The system",
+};
+const who = (caller: ViewCaller) => WHO[caller.by];
+
+const SYSTEM_CALLER: ViewCaller = {
+  provenance: { _tag: "system", component: "missions-views" },
+  actor: SEED_ACTOR,
+  by: "system",
+  metered: null,
+};
+
+const prefixed = (prefix: string, issues: ReadonlyArray<ViewIssue>): Array<ViewIssue> =>
+  issues.map((issue) => ({ ...issue, path: `${prefix}.${issue.path}` }));
 
 interface PendingWrite {
   readonly write: ViewStore.ViewWrite;
@@ -201,6 +231,7 @@ const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
   const missions = yield* MissionService.MissionService;
   const views = yield* ViewStore.ViewStore;
+  const { attachmentsDir } = yield* ServerConfig.ServerConfig;
   const lock = yield* Semaphore.make(1);
   const serial = <A, E>(effect: Effect.Effect<A, E>) => lock.withPermit(effect);
 
@@ -422,6 +453,8 @@ const make = Effect.gen(function* () {
         pinnedStrip: pinned.needsYou || pinned.requests,
         pinned,
         changesToday: yield* views.changesSince(mission.id, since),
+        sectionData: yield* sectionData(store, mission.id, sections),
+        assets: (yield* views.assets(mission.id)).filter((asset) => asset.status === "active"),
       };
       return result;
     });
@@ -1117,6 +1150,464 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  // --- bundles ---
+
+  /** Another mission's active templates and sections, by key. */
+  const copiesFrom = (
+    into: MissionId,
+    from: NonNullable<ApplyViewBundleInput["copyFrom"]>,
+    issues: Array<ViewIssue>,
+  ) =>
+    Effect.gen(function* () {
+      if (from.missionId === into) {
+        return yield* fail("invalid", "copyFrom names this mission; copy from another one");
+      }
+      const source = yield* requireMission(from.missionId);
+      const templates = (yield* views.templates(source.id)).filter((t) => t.status === "active");
+      const sections = (yield* views.sections(source.id)).filter((s) => s.status === "active");
+      const pick = <T>(
+        items: ReadonlyArray<T>,
+        keys: ReadonlyArray<string> | undefined,
+        keyOf: (item: T) => string,
+        what: string,
+      ) =>
+        keys === undefined
+          ? items
+          : keys.flatMap((key) => {
+              const found = items.find((item) => keyOf(item) === key);
+              if (found === undefined) {
+                issues.push({
+                  path: `copyFrom.${what}Keys`,
+                  code: "field",
+                  detail: `${source.title} has no active ${what} keyed ${key}`,
+                });
+              }
+              return found === undefined ? [] : [found];
+            });
+      // Sections that name the source's own records, sub-missions or lanes mean
+      // nothing here: skipped when copying everything, refused when named.
+      const portable = (section: ViewSection) => {
+        const definition = section.definition;
+        if (definition.source._tag === "refs") return false;
+        const where = definition.source.query.where;
+        return (
+          (definition.subMissionId ?? null) === null &&
+          where?.subMissionId === undefined &&
+          where?.laneId === undefined
+        );
+      };
+      const pickedSections = pick(
+        from.sectionKeys === undefined ? sections.filter(portable) : sections,
+        from.sectionKeys,
+        (section) => section.definition.key,
+        "section",
+      );
+      for (const section of pickedSections) {
+        if (!portable(section)) {
+          issues.push({
+            path: "copyFrom.sectionKeys",
+            code: "field",
+            detail: `section ${section.definition.key} points at ${source.title}'s own records`,
+          });
+        }
+      }
+      const local = (template: ViewTemplate) =>
+        template.definition.match?.subMissionId !== undefined;
+      const pickedTemplates = pick(
+        from.templateKeys === undefined ? templates.filter((t) => !local(t)) : templates,
+        from.templateKeys,
+        (template) => template.definition.key,
+        "template",
+      );
+      for (const template of pickedTemplates) {
+        if (local(template)) {
+          issues.push({
+            path: "copyFrom.templateKeys",
+            code: "field",
+            detail: `template ${template.definition.key} matches ${source.title}'s own sub-missions`,
+          });
+        }
+      }
+      return {
+        title: source.title,
+        templates: pickedTemplates.map((template) => ({ definition: template.definition })),
+        sections: pickedSections.map((section) => ({ definition: section.definition })),
+      };
+    });
+
+  const applyBundle: Write<ApplyViewBundleInput> = (provenance, input) =>
+    serial(
+      Effect.gen(function* () {
+        const mission = yield* requireMission(input.missionId);
+        const caller = yield* editorOf(mission.id, provenance);
+        const issues: Array<ViewIssue> = [];
+        const copied =
+          input.copyFrom === undefined
+            ? null
+            : yield* copiesFrom(mission.id, input.copyFrom, issues);
+        const wantedTemplates = [...(copied?.templates ?? []), ...input.templates];
+        const wantedSections = [...(copied?.sections ?? []), ...input.sections];
+        if (wantedTemplates.length === 0 && wantedSections.length === 0) {
+          return yield* fail("invalid", "a bundle needs at least one template or section");
+        }
+        const current = yield* currentLayout(mission);
+        const limits = current.layout.layout.limits;
+        yield* spendBudget(caller);
+        const now = yield* nowIso;
+        const templates = yield* views.templates(mission.id);
+        const sections = yield* views.sections(mission.id);
+
+        let nextTemplates: Array<ViewTemplate> = [...templates];
+        const templateChanges: Array<{ before: ViewTemplate | null; after: ViewTemplate }> = [];
+        wantedTemplates.forEach((item, index) => {
+          const at = `templates[${index}]`;
+          const templateId = "templateId" in item ? item.templateId : undefined;
+          if (templateId?.startsWith(BUILTIN_VIEW_TEMPLATE_PREFIX) === true) {
+            issues.push({ path: at, code: "guard", detail: "built-in templates can't be edited" });
+            return;
+          }
+          const existing =
+            templateId !== undefined
+              ? templates.find((template) => template.id === templateId)
+              : templates.find((template) => template.definition.key === item.definition.key);
+          if (existing?.status === "removed") {
+            issues.push({
+              path: at,
+              code: "guard",
+              detail: `${existing.definition.name} is removed; restore it first`,
+            });
+            return;
+          }
+          const siblings = nextTemplates.filter((template) => template.id !== existing?.id);
+          issues.push(...prefixed(at, checkTemplate(item.definition, { siblings }).issues));
+          const after: ViewTemplate = {
+            id: existing?.id ?? templateId ?? ViewTemplateId.make(newId("view-template")),
+            missionId: mission.id,
+            definition: item.definition,
+            ...changeMeta(caller, (existing?.version ?? 0) + 1, now, input.changeNote),
+            catalogVersion: VIEW_CATALOG_VERSION,
+            status: "active",
+            createdAt: existing?.createdAt ?? now,
+            createdBy: existing?.createdBy ?? caller.by,
+          };
+          nextTemplates = [...siblings, after];
+          templateChanges.push({ before: existing ?? null, after });
+        });
+
+        let nextSections: Array<ViewSection> = [...sections];
+        let entries = current.layout.layout.entries;
+        const sectionChanges: Array<{ before: ViewSection | null; after: ViewSection }> = [];
+        wantedSections.forEach((item, index) => {
+          const at = `sections[${index}]`;
+          const sectionId = "sectionId" in item ? item.sectionId : undefined;
+          const region = "region" in item ? item.region : undefined;
+          const existing =
+            sectionId !== undefined
+              ? sections.find((section) => section.id === sectionId)
+              : sections.find((section) => section.definition.key === item.definition.key);
+          if (existing?.status === "removed") {
+            issues.push({
+              path: at,
+              code: "guard",
+              detail: `${existing.definition.title} is removed; restore it first`,
+            });
+            return;
+          }
+          const siblings = nextSections.filter((section) => section.id !== existing?.id);
+          issues.push(...prefixed(at, checkSection(item.definition, { siblings }).issues));
+          const id = existing?.id ?? sectionId ?? ViewSectionId.make(newId("view-section"));
+          const placed = entries.find(
+            (entry) => entry.section._tag === "custom" && entry.section.sectionId === id,
+          );
+          if (placed === undefined && existing === undefined) {
+            if (entries.some((entry) => entry.key === item.definition.key)) {
+              issues.push({
+                path: `${at}.definition.key`,
+                code: "duplicate",
+                detail: `the mission layout already has an entry keyed ${item.definition.key}`,
+              });
+            }
+            entries = insertInRegion(
+              entries,
+              {
+                key: item.definition.key,
+                section: { _tag: "custom", sectionId: id },
+                region: region ?? "main",
+                hidden: false,
+                title: null,
+              },
+              undefined,
+            );
+          } else if (placed !== undefined && region !== undefined && placed.region !== region) {
+            entries = insertInRegion(
+              entries.filter((entry) => entry !== placed),
+              { ...placed, region },
+              undefined,
+            );
+          }
+          const after: ViewSection = {
+            id,
+            missionId: mission.id,
+            definition: item.definition,
+            ...changeMeta(caller, (existing?.version ?? 0) + 1, now, input.changeNote),
+            catalogVersion: VIEW_CATALOG_VERSION,
+            status: "active",
+            createdAt: existing?.createdAt ?? now,
+            createdBy: existing?.createdBy ?? caller.by,
+          };
+          nextSections = [...siblings, after];
+          sectionChanges.push({ before: existing ?? null, after });
+        });
+
+        const activeTemplates = nextTemplates.filter((template) => template.status === "active");
+        const activeSections = nextSections.filter((section) => section.status === "active");
+        if (activeTemplates.length > limits.templates) {
+          issues.push({
+            path: "templates",
+            code: "limit",
+            detail: `this mission would have ${activeTemplates.length} of ${limits.templates} card templates`,
+          });
+        }
+        if (activeSections.length > limits.sections) {
+          issues.push({
+            path: "sections",
+            code: "limit",
+            detail: `this mission would have ${activeSections.length} of ${limits.sections} sections`,
+          });
+        }
+        const bytes = missionBytesIssue(activeTemplates, activeSections, null, 0);
+        if (bytes !== null) issues.push(bytes);
+        const nextLayout: ViewLayoutDefinition = { entries, limits };
+        const moved = entries !== current.layout.layout.entries;
+        if (moved) {
+          issues.push(
+            ...checkLayout(nextLayout, {
+              sectionIds: new Set(nextSections.map((section) => section.id)),
+            }),
+          );
+        }
+        if (issues.length > 0) return yield* refuse(issues);
+
+        // One change against the budget, however many records it writes.
+        const writes: Array<PendingWrite> = [
+          ...templateChanges.map((change) => ({
+            write: { scope: "template" as const, value: change.after },
+            counts: false,
+          })),
+          ...sectionChanges.map((change) => ({
+            write: { scope: "section" as const, value: change.after },
+            counts: false,
+          })),
+        ];
+        if (moved) {
+          writes.push(
+            ...layoutWrites(
+              current,
+              {
+                ...current.layout,
+                layout: nextLayout,
+                ...changeMeta(caller, current.layout.version + 1, now, input.changeNote),
+              },
+              false,
+            ),
+          );
+        }
+        writes[0] = { ...writes[0]!, counts: true };
+        const parts = [
+          ...(templateChanges.length === 0
+            ? []
+            : [
+                `${templateChanges.length} card template${templateChanges.length === 1 ? "" : "s"}`,
+              ]),
+          ...(sectionChanges.length === 0
+            ? []
+            : [`${sectionChanges.length} section${sectionChanges.length === 1 ? "" : "s"}`]),
+        ];
+        const from = copied === null ? "" : ` from ${copied.title}`;
+        return yield* commit({
+          missionId: mission.id,
+          kind: "view.bundle-applied",
+          caller,
+          summary: `${who(caller)} applied ${parts.join(" and ")}${from}`,
+          subject: layoutRef(mission.id),
+          payload: {
+            templates: templateChanges,
+            sections: sectionChanges,
+            copyFrom: input.copyFrom ?? null,
+          },
+          writes,
+        });
+      }),
+    );
+
+  // --- assets ---
+
+  /** The owner, the master, or an agent holding a role or lane in the mission. */
+  const memberCaller = (missionId: MissionId, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      if (isOwnerProvenance(provenance)) return OWNER_CALLER(provenance);
+      if (provenance._tag !== "agent") return null;
+      const cast = yield* castOf(store, missionId);
+      if (cast.mission === null) return null;
+      const standing = standingOf(cast, provenance);
+      if (!standing.isMaster && standing.roles.length === 0 && standing.lanes.length === 0) {
+        return null;
+      }
+      const caller: ViewCaller = {
+        provenance: standing.caller.provenance,
+        actor: actorOf(standing.caller.provenance),
+        by: standing.isMaster ? "master" : "agent",
+        metered: null,
+      };
+      return caller;
+    });
+
+  const sameActor = (left: MissionActor, right: MissionActor) =>
+    JSON.stringify(left) === JSON.stringify(right);
+
+  const assetRef = (asset: Pick<MissionAsset, "id" | "name">): MissionRecordRef => ({
+    kind: "view-asset",
+    id: asset.id,
+    label: asset.name,
+  });
+
+  const addAsset: Write<AddMissionAssetInput> = (provenance, input) =>
+    serial(
+      Effect.gen(function* () {
+        const mission = yield* requireMission(input.missionId);
+        if (mission.status === "archived") {
+          return yield* fail("invalid", "This mission is archived.");
+        }
+        const caller = yield* memberCaller(mission.id, provenance);
+        if (caller === null) {
+          return yield* fail(
+            "forbidden",
+            "Only the owner and the mission's agents can add images.",
+          );
+        }
+        const read = yield* readAssetSource({
+          attachmentsDir,
+          source: input.source,
+          provenance,
+          name: input.name,
+        });
+        const stored = (yield* views.assets(mission.id)).filter(
+          (asset) => asset.status === "active",
+        );
+        const used = stored.reduce((sum, asset) => sum + asset.sizeBytes, 0);
+        if (used + read.bytes.byteLength > VIEW_ASSET_LIMITS.missionBytes) {
+          return yield* fail("invalid", "This mission's images would pass its 2 GiB limit.");
+        }
+        const now = yield* nowIso;
+        const asset: MissionAsset = {
+          id: `mission-${NodeCrypto.randomUUID()}`,
+          missionId: mission.id,
+          subject: input.subject ?? null,
+          kind: "image",
+          mimeType: read.mimeType,
+          sizeBytes: read.bytes.byteLength,
+          width: read.width,
+          height: read.height,
+          name: read.name,
+          sha256: read.sha256,
+          addedBy: caller.actor,
+          status: "active",
+          version: 1,
+          createdAt: now,
+          changedAt: now,
+        };
+        const path = assetFilePath(attachmentsDir, asset);
+        yield* writeAssetFile(path, read.bytes);
+        return yield* commit({
+          missionId: mission.id,
+          kind: "view.asset-added",
+          caller,
+          summary: `${who(caller)} added image ${asset.name}`,
+          subject: assetRef(asset),
+          payload: {
+            assetId: asset.id,
+            kind: asset.kind,
+            sizeBytes: asset.sizeBytes,
+            subject: asset.subject,
+          },
+          writes: [{ write: { scope: "asset", value: asset }, counts: false }],
+        }).pipe(Effect.onError(() => deleteAssetFile(path)));
+      }),
+    );
+
+  const removeAsset: Write<RemoveMissionAssetInput> = (provenance, input) =>
+    serial(
+      Effect.gen(function* () {
+        const mission = yield* requireMission(input.missionId);
+        const asset = (yield* views.assets(mission.id)).find((a) => a.id === input.assetId);
+        if (asset === undefined || asset.status !== "active") {
+          return yield* fail("not-found", `No image ${input.assetId} in this mission.`);
+        }
+        const member = yield* memberCaller(mission.id, provenance);
+        if (member === null || (member.by === "agent" && !sameActor(member.actor, asset.addedBy))) {
+          return yield* fail(
+            "forbidden",
+            "Only the owner, the master or whoever added it can remove an image.",
+          );
+        }
+        const now = yield* nowIso;
+        const removed: MissionAsset = {
+          ...asset,
+          status: "removed",
+          version: asset.version + 1,
+          changedAt: now,
+        };
+        const note = input.reason === undefined ? "" : `: ${input.reason}`;
+        const result = yield* commit({
+          missionId: mission.id,
+          kind: "view.asset-removed",
+          caller: member,
+          summary: `${who(member)} removed image ${asset.name}${note}`,
+          subject: assetRef(asset),
+          payload: { assetId: asset.id, kind: asset.kind, sizeBytes: asset.sizeBytes },
+          writes: [{ write: { scope: "asset", value: removed }, counts: false }],
+        });
+        yield* deleteAssetFile(assetFilePath(attachmentsDir, asset));
+        return result;
+      }),
+    );
+
+  const expireAssets = (missionId: MissionId) =>
+    serial(
+      Effect.gen(function* () {
+        const active = (yield* views.assets(missionId)).filter(
+          (asset) => asset.status === "active",
+        );
+        if (active.length === 0) return;
+        const now = yield* nowIso;
+        yield* commit({
+          missionId,
+          kind: "view.assets-expired",
+          caller: SYSTEM_CALLER,
+          summary: `${active.length} image${active.length === 1 ? "" : "s"} expired with the mission`,
+          subject: { kind: "mission", id: missionId },
+          payload: { assetIds: active.map((asset) => asset.id) },
+          writes: active.map((asset) => ({
+            write: {
+              scope: "asset" as const,
+              value: {
+                ...asset,
+                status: "expired" as const,
+                version: asset.version + 1,
+                changedAt: now,
+              },
+            },
+            counts: false,
+          })),
+        });
+        yield* Effect.forEach(
+          active,
+          (asset) => deleteAssetFile(assetFilePath(attachmentsDir, asset)),
+          { discard: true },
+        );
+      }),
+    );
+
   return ViewService.of({
     snapshot,
     catalog: Effect.succeed(VIEW_CATALOG),
@@ -1133,6 +1624,10 @@ const make = Effect.gen(function* () {
     editStarter,
     restoreStarter,
     seedLayout,
+    applyBundle,
+    addAsset,
+    removeAsset,
+    expireAssets,
   });
 });
 
