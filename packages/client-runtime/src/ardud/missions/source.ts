@@ -36,6 +36,7 @@ import type {
   PoolsSnapshot,
   PostMessageInput,
   RecoveryIncident,
+  RecoverySettingsInput,
   ReactToCallInput,
   ReorderSubMissionsInput,
   ResolveRuleChangeInput,
@@ -53,6 +54,7 @@ import type {
   SetCriticalityGuideInput,
   SetDraftNoteActiveInput,
   SetMissionFocusInput,
+  SetMissionStatusInput,
   SetPoolCapacityInput as ContractSetPoolCapacityInput,
   SetRoleModelInput,
   SplitLaneInput,
@@ -60,7 +62,10 @@ import type {
   Suggestion,
   SuggestionStats,
   TuneRoomInput,
+  UpdateMissionInput,
+  UpdateRoleInput,
   UpdateRoomInput,
+  UpsertLaneInput,
   UpsertRuleInput,
   WorkItem,
   WorkStage,
@@ -136,6 +141,10 @@ export interface FieldChange {
   readonly actor: MissionActor;
   readonly eventId: MissionEventId;
   readonly at: string;
+  // --- finish-b ---
+  /** The value the change replaced, when the event kept it. */
+  readonly previous?: string | number | undefined;
+  // --- end finish-b ---
 }
 
 /**
@@ -227,6 +236,22 @@ export interface NewLaneInput {
   readonly name: string;
   readonly subMissionId?: SubMissionId;
 }
+
+/**
+ * Puts back the value a change replaced, through the same write RPC that
+ * made the change. The server records it as a new change.
+ */
+export type RevertAction =
+  | { readonly _tag: "mission"; readonly input: UpdateMissionInput }
+  | { readonly _tag: "status"; readonly input: SetMissionStatusInput }
+  | { readonly _tag: "focus"; readonly input: SetMissionFocusInput }
+  | { readonly _tag: "order"; readonly input: SetPortfolioOrderInput }
+  | { readonly _tag: "lane"; readonly input: UpsertLaneInput }
+  | { readonly _tag: "role"; readonly input: UpdateRoleInput }
+  | { readonly _tag: "role-model"; readonly input: SetRoleModelInput }
+  | { readonly _tag: "pool-capacity"; readonly input: ContractSetPoolCapacityInput }
+  | { readonly _tag: "recovery"; readonly input: RecoverySettingsInput }
+  | { readonly _tag: "room"; readonly input: UpdateRoomInput };
 // --- end finish-b ---
 
 /** Ends the lane lead's thread and binds a fresh one with this handoff note. */
@@ -362,7 +387,13 @@ export interface PortfolioSnapshot {
   /** Latest change per mission field (`tier`, `guaranteedShare`, `borrowCeiling`). */
   readonly changes: ReadonlyArray<FieldChange>;
   /** Who set the current order, from the newest `portfolio.reordered` event. */
-  readonly orderChange: { readonly actor: MissionActor; readonly at: string } | null;
+  readonly orderChange: {
+    readonly actor: MissionActor;
+    readonly at: string;
+    // --- finish-b ---
+    readonly previousOrder?: ReadonlyArray<MissionId> | undefined;
+    // --- end finish-b ---
+  } | null;
 }
 
 export interface SetPortfolioOrderInput {
@@ -626,6 +657,8 @@ export interface MissionsSource {
   tuneRoom(input: TuneRoomInput): Promise<void>;
   /** Rename, move to another sub-mission, remove (archive) or restore a room. */
   updateRoom(input: UpdateRoomInput): Promise<void>;
+  /** Puts a change's previous value back through the write that made it. */
+  revertChange(action: RevertAction): Promise<void>;
   // --- end finish-b ---
 
   /** The mission's views record (layout, sections, pins) and its change log; null when gone. */

@@ -1316,6 +1316,48 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       await transport.request(WS_METHODS.missionsUpdateRoom, input);
       touchRoom(input.roomId);
     },
+    revertChange: async (action) => {
+      switch (action._tag) {
+        case "mission":
+          await transport.request(WS_METHODS.missionsUpdate, action.input);
+          bus.emit("portfolio");
+          return;
+        case "status":
+          await transport.request(WS_METHODS.missionsSetStatus, action.input);
+          return;
+        case "focus":
+          await transport.request(WS_METHODS.missionsSetFocus, action.input);
+          return;
+        case "order":
+          await transport.request(WS_METHODS.missionsSetPortfolioOrder, {
+            order: action.input.order,
+          });
+          bus.emit("portfolio");
+          return;
+        case "lane":
+          await transport.request(WS_METHODS.missionsUpsertLane, action.input);
+          return;
+        case "role":
+          await transport.request(POLICY.updateRole, action.input);
+          bus.emit("roles");
+          return;
+        case "role-model":
+          await transport.request(POLICY.setRoleModel, action.input);
+          bus.emit("roles");
+          return;
+        case "pool-capacity":
+          await transport.request(POLICY.setPoolCapacity, action.input);
+          bus.emit("pools");
+          return;
+        case "recovery":
+          await transport.request(RECOVERY.settings, action.input);
+          return;
+        case "room":
+          await transport.request(WS_METHODS.missionsUpdateRoom, action.input);
+          touchRoom(action.input.roomId);
+          return;
+      }
+    },
     // --- end finish-b ---
 
     subscribeViews(missionId, listener) {

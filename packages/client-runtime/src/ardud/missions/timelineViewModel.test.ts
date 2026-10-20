@@ -43,6 +43,7 @@ import {
   lineage,
   needsOlderTimeline,
   restartEvent,
+  revertAction,
   TIMELINE_KIND_GROUP_LABEL,
   timelineDays,
   timelineReaches,
@@ -436,3 +437,159 @@ describe("portfolio view model", () => {
     portfolio.close();
   });
 });
+
+// --- finish-b ---
+describe("revert", () => {
+  const master: MissionActor = { _tag: "role", roleId: MASTER as never };
+  let seq = 0;
+  const event = (
+    kind: MissionTimelineEvent["kind"],
+    subject: MissionTimelineEvent["subject"],
+    payload: unknown,
+  ) =>
+    ({
+      id: `rv-${++seq}` as MissionEventId,
+      missionId: CRPKO,
+      seq,
+      kind,
+      actor: master,
+      provenance: { _tag: "system", component: "missions-core" },
+      summary: kind,
+      subject,
+      causedBy: null,
+      payload,
+      at: `2026-10-19T10:00:${String(seq).padStart(2, "0")}.000Z`,
+    }) as MissionTimelineEvent;
+  const mission = { kind: "mission" as const, id: CRPKO, label: "Crpko engineering" };
+  const lane = { kind: "lane" as const, id: "lane-cell-bal", label: "cell-bal" };
+
+  it("puts back the previous value through the write that made the change", () => {
+    expect(
+      revertAction(
+        event("mission.updated", mission, {
+          changed: ["tier"],
+          status: "active",
+          focusSubMissionId: null,
+          before: { tier: "P2" },
+        }),
+      ),
+    ).toEqual({ _tag: "mission", input: { missionId: CRPKO, tier: "P2" } });
+    expect(
+      revertAction(
+        event("mission.paused", mission, {
+          changed: ["status"],
+          status: "paused",
+          before: { status: "active" },
+        }),
+      ),
+    ).toEqual({ _tag: "status", input: { missionId: CRPKO, status: "active" } });
+    expect(
+      revertAction(
+        event("lane.moved", lane, {
+          changed: ["subMissionId"],
+          status: "idle",
+          subMissionId: "sub-b",
+          before: { subMissionId: "sub-a" },
+        }),
+      ),
+    ).toEqual({
+      _tag: "lane",
+      input: { missionId: CRPKO, laneId: "lane-cell-bal", subMissionId: "sub-a" },
+    });
+    expect(
+      revertAction(
+        event("portfolio.reordered", null, { order: [JUNO, CRPKO], previousOrder: [CRPKO, JUNO] }),
+      ),
+    ).toEqual({ _tag: "order", input: { order: [CRPKO, JUNO] } });
+    expect(
+      revertAction(
+        event(
+          "pool.updated",
+          { kind: "pool", id: "pool-claude" },
+          { poolId: "pool-claude", field: "capacity", from: 40, to: 60, reason: null },
+        ),
+      ),
+    ).toEqual({
+      _tag: "pool-capacity",
+      input: { poolId: "pool-claude", capacity: 40, reason: "Reverted" },
+    });
+    expect(
+      revertAction(
+        event(
+          "role.updated",
+          { kind: "role", id: "crpko-writer" },
+          { fields: ["name"], before: { name: "Writer" }, after: { name: "Scribe" } },
+        ),
+      ),
+    ).toEqual({ _tag: "role", input: { roleId: "crpko-writer", name: "Writer" } });
+    expect(
+      revertAction(
+        event(
+          "room.archived",
+          { kind: "room", id: "crpko:room:arch" },
+          {
+            fields: ["archived"],
+            before: { title: "#arch", subMissionId: null, archived: false },
+            after: { title: "#arch", subMissionId: null, archived: true },
+          },
+        ),
+      ),
+    ).toEqual({ _tag: "room", input: { roomId: "crpko:room:arch", archived: false } });
+  });
+
+  it("offers no Revert without a previous value, and only on the newest change", () => {
+    // Older events carry no `before`; a call revision has no write to put back.
+    expect(
+      revertAction(event("mission.updated", mission, { changed: ["tier"], status: "active" })),
+    ).toBeNull();
+    expect(
+      revertAction(event("call.revised", null, { previousDecision: "x", previousReason: "y" })),
+    ).toBeNull();
+    expect(
+      revertAction(event("portfolio.reordered", null, { order: [CRPKO], previousOrder: [] })),
+    ).toBeNull();
+
+    const first = event("mission.updated", mission, {
+      changed: ["tier"],
+      status: "active",
+      before: { tier: "P1" },
+    });
+    const second = event("mission.updated", mission, {
+      changed: ["tier"],
+      status: "active",
+      before: { tier: "P2" },
+    });
+    const share = event("mission.updated", mission, {
+      changed: ["guaranteedShare"],
+      status: "active",
+      before: { guaranteedShare: 0.2 },
+    });
+    const events = [share, second, first].map((e, index) => ({ ...e, summary: `change ${index}` }));
+    const rows = timelineRows(events, events, MASTER);
+    expect(rows.map((row) => row.revert?._tag ?? null)).toEqual(["mission", "mission", null]);
+  });
+
+  it("reverts a lane move and the mission order in the sample data, recorded as new changes", async () => {
+    const missions = source();
+    const timeline = live<ReadonlyArray<MissionTimelineEvent>>((l) =>
+      missions.subscribeTimeline(CRPKO, l),
+    );
+    const portfolio = live<PortfolioSnapshot>((l) => missions.subscribePortfolio(l));
+    const before = portfolio.value.order;
+    const input = reorderPortfolioInput(before, JUNO, CRPKO);
+    if (!input.ok) throw new Error(input.error);
+    await missions.setPortfolioOrder(input.value);
+    const [orderRow] = portfolioChanges(portfolio.value);
+    expect(orderRow?.revert).toEqual({ _tag: "order", input: { order: before } });
+    await missions.revertChange(orderRow!.revert!);
+    expect(portfolio.value.order).toEqual(before);
+
+    const [newest] = timelineRows(timeline.value, timeline.value, MASTER);
+    expect(newest?.event.kind).toBe("portfolio.reordered");
+    // The revert is itself a change; reverting it again restores the dragged order.
+    expect(newest?.revert).toEqual({ _tag: "order", input: { order: input.value.order } });
+    timeline.close();
+    portfolio.close();
+  });
+});
+// --- end finish-b ---

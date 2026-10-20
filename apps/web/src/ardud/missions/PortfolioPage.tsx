@@ -55,8 +55,8 @@ import { DESK_ROW, Figure, PageLine } from "./deskParts";
 import { toggleMissionPaused } from "./missionCommands";
 import { MissionSection } from "./MissionSection";
 import { useMissionList, useMissionOverview, usePortfolio } from "./missionsStore";
-import { createMission, reorderPortfolio } from "./deskCommands";
-import { TextActionForm } from "./MissionForms";
+import { createMission, reorderPortfolio, revertChange } from "./deskCommands";
+import { RevertButton, TextActionForm } from "./MissionForms";
 import { movePortfolioMission } from "./operationCommands";
 import { useNowMs } from "./useNowMs";
 
@@ -218,7 +218,15 @@ function Portfolio(props: {
                       {clock(change.at, props.nowMs)}
                     </span>
                     <span className="min-w-0">{change.text}</span>
-                    <span className="col-start-2 text-xs text-(--m-muted)">by {change.by}</span>
+                    <span className="col-start-2 flex items-center gap-2 text-xs text-(--m-muted)">
+                      by {change.by}
+                      {change.revert ? (
+                        <RevertButton
+                          label={`Revert ${change.text}`}
+                          onRevert={() => revertChange(change.revert!)}
+                        />
+                      ) : null}
+                    </span>
                   </li>
                 ))}
               </ul>

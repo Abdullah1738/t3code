@@ -28,7 +28,9 @@ import {
 
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
+import { revertChange } from "./deskCommands";
 import { Figure, FoldRow, PageLine, Segmented } from "./deskParts";
+import { RevertButton } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import {
   useMasterRoleId,
@@ -293,6 +295,14 @@ function EventRow(props: {
           ) : null}
         </p>
         <p className="mt-0.75 max-w-prose text-sm text-pretty">{row.summary}</p>
+        {row.revert ? (
+          <div className="mt-1 self-start">
+            <RevertButton
+              label={`Revert: ${row.summary}`}
+              onRevert={() => revertChange(row.revert!)}
+            />
+          </div>
+        ) : null}
         {row.because ? (
           <p className="mt-1 max-w-prose text-xs text-(--m-muted)">{row.because}</p>
         ) : null}

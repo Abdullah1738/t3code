@@ -216,3 +216,23 @@ export function PickTextForm(props: {
     </form>
   );
 }
+
+/** Revert on a change line: one press, disabled while it runs. */
+export function RevertButton(props: { onRevert: () => Promise<boolean>; label?: string }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <Button
+      type="button"
+      size="xs"
+      variant="ghost-muted"
+      disabled={busy}
+      aria-label={props.label}
+      onClick={() => {
+        setBusy(true);
+        void props.onRevert().finally(() => setBusy(false));
+      }}
+    >
+      Revert
+    </Button>
+  );
+}

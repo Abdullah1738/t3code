@@ -704,7 +704,7 @@ export function createFixtureMissionsSource(
     return missions.find((m) => m.id === missionId);
   }
 
-  return {
+  const source: MissionsSource = {
     // Every feed here is sample data; nothing is marked because nothing is live.
     sampled: new Set(),
     subscribeList: (listener) => watch(listSnapshot, listener),
@@ -852,6 +852,42 @@ export function createFixtureMissionsSource(
       commit();
       return Promise.resolve();
     },
+    revertChange(action) {
+      // Sample data reverts what its own writes can do; the rest is server-only.
+      switch (action._tag) {
+        case "status":
+          if (action.input.status !== "active" && action.input.status !== "paused") break;
+          return source.setMissionPaused({
+            missionId: action.input.missionId,
+            paused: action.input.status === "paused",
+          });
+        case "focus":
+          return source.setMissionFocus(action.input);
+        case "order":
+          return source.setPortfolioOrder(action.input);
+        case "lane": {
+          const { missionId, laneId, subMissionId, status } = action.input;
+          if (!laneId) break;
+          if (subMissionId) return source.moveLane({ missionId, laneId, subMissionId });
+          if (status === "parked" || status === "idle") {
+            return source.setLaneParked({ missionId, laneId, parked: status === "parked" });
+          }
+          break;
+        }
+        case "role-model":
+          return source.setRoleModel(action.input);
+        case "pool-capacity":
+          return source.setPoolCapacity({
+            ...action.input,
+            reason: action.input.reason ?? "Reverted",
+          });
+        case "room":
+          return source.updateRoom(action.input);
+        default:
+          break;
+      }
+      return fail("invalid", "Sample data can't revert this change.");
+    },
     // --- end finish-b ---
 
     reorderSubMissions(input) {
@@ -899,7 +935,11 @@ export function createFixtureMissionsSource(
         kind: paused ? "mission.paused" : "mission.resumed",
         subject: { kind: "mission", id: missionId, label: mission.title },
         summary: `${paused ? "Paused" : "Resumed"} ${mission.title}`,
-        payload: { changed: ["status"], status: paused ? "paused" : "active" },
+        payload: {
+          changed: ["status"],
+          status: paused ? "paused" : "active",
+          before: { status: mission.status },
+        },
       });
       commit();
       return Promise.resolve();
@@ -925,7 +965,11 @@ export function createFixtureMissionsSource(
         kind: "mission.updated",
         subject: { kind: "mission", id: missionId, label: mission.title },
         summary: focus ? `Focus on ${focus.title}` : "Ended focus",
-        payload: { changed: ["focusSubMissionId"], focusSubMissionId: subMissionId },
+        payload: {
+          changed: ["focusSubMissionId"],
+          focusSubMissionId: subMissionId,
+          before: { focusSubMissionId: mission.focusSubMissionId },
+        },
       });
       commit();
       return Promise.resolve();
@@ -1394,6 +1438,7 @@ export function createFixtureMissionsSource(
       return Promise.resolve();
     },
   };
+  return source;
 }
 
 export { FIXTURE_NOW } from "./data.ts";

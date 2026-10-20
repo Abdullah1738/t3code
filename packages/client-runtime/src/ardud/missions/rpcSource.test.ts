@@ -8,6 +8,7 @@ import {
   WS_METHODS,
   type Lane,
   type MissionEvent,
+  type LaneId,
   type MissionId,
   type MissionOverview,
   type PoolView,
@@ -757,6 +758,55 @@ describe("rpc missions source", () => {
     expect(asked(WS_METHODS.missionsTuneRoom).at(-1)?.input).toEqual({ roomId, rules });
     await source.updateRoom({ roomId, archived: true });
     expect(asked(WS_METHODS.missionsUpdateRoom).at(-1)?.input).toEqual({ roomId, archived: true });
+  });
+
+  it("sends each Revert through the write RPC that made the change", async () => {
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsUpdate]: () => ({}),
+      [WS_METHODS.missionsSetStatus]: () => ({}),
+      [WS_METHODS.missionsSetPortfolioOrder]: () => ({}),
+      [WS_METHODS.missionsUpsertLane]: () => ({}),
+      [POLICY.updateRole]: () => ({}),
+      [POLICY.setPoolCapacity]: () => ({}),
+      [RECOVERY.settings]: () => ({}),
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    await source.revertChange({ _tag: "mission", input: { missionId: CRPKO, tier: "P2" } });
+    expect(asked(WS_METHODS.missionsUpdate).at(-1)?.input).toEqual({
+      missionId: CRPKO,
+      tier: "P2",
+    });
+    await source.revertChange({ _tag: "status", input: { missionId: CRPKO, status: "active" } });
+    expect(asked(WS_METHODS.missionsSetStatus).at(-1)?.input).toEqual({
+      missionId: CRPKO,
+      status: "active",
+    });
+    await source.revertChange({ _tag: "order", input: { order: [CRPKO] } });
+    expect(asked(WS_METHODS.missionsSetPortfolioOrder).at(-1)?.input).toEqual({ order: [CRPKO] });
+    const lane = { missionId: CRPKO, laneId: "lane-tc" as LaneId, subMissionId: null };
+    await source.revertChange({ _tag: "lane", input: lane });
+    expect(asked(WS_METHODS.missionsUpsertLane).at(-1)?.input).toEqual(lane);
+    await source.revertChange({
+      _tag: "role",
+      input: { roleId: "crpko:writer" as never, name: "Writer" },
+    });
+    expect(asked(POLICY.updateRole).at(-1)?.input).toEqual({
+      roleId: "crpko:writer",
+      name: "Writer",
+    });
+    await source.revertChange({
+      _tag: "pool-capacity",
+      input: { poolId: "pool-claude" as never, capacity: 40, reason: "Reverted" },
+    });
+    expect(asked(POLICY.setPoolCapacity).at(-1)?.input).toMatchObject({ capacity: 40 });
+    await source.revertChange({
+      _tag: "recovery",
+      input: { missionId: CRPKO, resumePerMinute: 3 },
+    });
+    expect(asked(RECOVERY.settings).at(-1)?.input).toEqual({
+      missionId: CRPKO,
+      resumePerMinute: 3,
+    });
   });
 
   it("reads the views record live, logs view events and sends section changes", async () => {

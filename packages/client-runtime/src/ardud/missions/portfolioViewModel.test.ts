@@ -2,7 +2,8 @@ import type { MissionId, MissionListSnapshot } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
-import { newMissionInput, orderBarDrop } from "./portfolioViewModel.ts";
+import { newMissionInput, orderBarDrop, portfolioChanges } from "./portfolioViewModel.ts";
+import type { PortfolioSnapshot } from "./source.ts";
 
 describe("new mission", () => {
   it("slugs the name, skips taken slugs and lists the new mission", async () => {
@@ -38,5 +39,50 @@ describe("order bar drop", () => {
     expect(orderBarDrop(order, "juno", "juno")).toBeNull();
     expect(orderBarDrop(order, "juno", null)).toBeNull();
     expect(orderBarDrop(order, "free", "juno")).toBeNull();
+  });
+});
+
+describe("portfolio changes revert", () => {
+  it("offers Revert on a tier or share change that kept its previous value", () => {
+    const missionId = "crpko-engineering" as MissionId;
+    const snapshot = {
+      order: [missionId],
+      missions: [
+        {
+          missionId,
+          title: "Crpko engineering",
+          status: "active",
+          tier: "P0",
+          masterRoleId: "crpko-master",
+          guaranteedShare: 0.3,
+          borrowCeiling: 0.5,
+          usedShare: null,
+          pools: [],
+        },
+      ],
+      changes: [
+        {
+          ref: { kind: "mission", id: missionId },
+          field: "tier",
+          actor: { _tag: "owner" },
+          eventId: "ev-2",
+          at: "2026-10-19T10:00:02.000Z",
+          previous: "P2",
+        },
+        {
+          ref: { kind: "mission", id: missionId },
+          field: "guaranteedShare",
+          actor: { _tag: "owner" },
+          eventId: "ev-1",
+          at: "2026-10-19T10:00:01.000Z",
+        },
+      ],
+      orderChange: { actor: { _tag: "owner" }, at: "2026-10-19T09:00:00.000Z", previousOrder: [] },
+    } as unknown as PortfolioSnapshot;
+    expect(portfolioChanges(snapshot).map((row) => [row.key, row.revert])).toEqual([
+      [`${missionId}:tier`, { _tag: "mission", input: { missionId, tier: "P2" } }],
+      [`${missionId}:guaranteedShare`, null],
+      ["order", null],
+    ]);
   });
 });

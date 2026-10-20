@@ -19,6 +19,7 @@ import {
   renameRoomInput,
   restoreRoomInput,
   wakeToggleInput,
+  type RevertAction,
   type SetPortfolioOrderInput,
   type WakeColumn,
 } from "@t3tools/client-runtime/ardud/missions";
@@ -123,3 +124,7 @@ export async function nudgePending(message: MissionMessage, laneIds: ReadonlyArr
   );
   return sent.every(Boolean);
 }
+
+/** Puts a change's previous value back; the server records it as a new change. */
+export const revertChange = (action: RevertAction) =>
+  runMissionAction(missionsSource.revertChange(action), "Couldn't revert the change");

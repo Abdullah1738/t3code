@@ -6,6 +6,7 @@ import {
   CriticalityVerdict,
   type Lane,
   type Mission,
+  type MissionId,
   type MissionRecordRef,
   type MissionRecoveryState,
   Pool,
@@ -175,6 +176,23 @@ export function createOperations(ctx: OperationsContext): Operations {
   /** Latest change per field over the events that match. */
   const changesWhere = (keep: (event: MissionTimelineEvent) => boolean) =>
     latestFieldChanges(log.all().filter(keep));
+
+  // --- finish-b ---
+  const previousOrderOf = (payload: unknown) => {
+    const order = (payload as { previousOrder?: unknown } | null)?.previousOrder;
+    return Array.isArray(order) ? (order as MissionId[]) : undefined;
+  };
+  const previousValueOf = (
+    events: ReadonlyArray<MissionTimelineEvent>,
+    eventId: string,
+    field: string,
+  ) => {
+    const event = events.find((e) => e.id === eventId);
+    const before = (event?.payload as { before?: Record<string, unknown> } | null)?.before;
+    const value = before?.[field];
+    return typeof value === "string" || typeof value === "number" ? value : undefined;
+  };
+  // --- end finish-b ---
 
   const missionOf = (missionId: string) => missions.find((m) => m.id === missionId);
   const findLane = (laneId: string) => lanes.find((l) => l.id === laneId);
@@ -377,8 +395,21 @@ export function createOperations(ctx: OperationsContext): Operations {
         }),
         changes: changesWhere(
           (event) => event.subject?.kind === "mission" && missionIds.has(event.subject.id),
-        ).filter((change) => ["tier", "guaranteedShare", "borrowCeiling"].includes(change.field)),
-        orderChange: lastReorder ? { actor: lastReorder.actor, at: lastReorder.at } : null,
+        )
+          .filter((change) => ["tier", "guaranteedShare", "borrowCeiling"].includes(change.field))
+          // --- finish-b ---
+          .map((change) => {
+            const previous = previousValueOf(log.all(), change.eventId, change.field);
+            return previous === undefined ? change : { ...change, previous };
+          }),
+        orderChange: lastReorder
+          ? {
+              actor: lastReorder.actor,
+              at: lastReorder.at,
+              // --- finish-b ---
+              previousOrder: previousOrderOf(lastReorder.payload),
+            }
+          : null,
       };
     });
   }
@@ -510,7 +541,11 @@ export function createOperations(ctx: OperationsContext): Operations {
         kind: parked ? "lane.parked" : "lane.resumed",
         subject: ref("lane", lane.id, lane.name),
         summary: parked ? `Parked ${lane.name}${why ? `: ${why}` : ""}` : `Resumed ${lane.name}`,
-        payload: { changed: ["status"], status: parked ? "parked" : "idle" },
+        payload: {
+          changed: ["status"],
+          status: parked ? "parked" : "idle",
+          before: { status: lane.status },
+        },
       });
       commit();
       return Promise.resolve();
@@ -532,7 +567,11 @@ export function createOperations(ctx: OperationsContext): Operations {
         kind: "lane.moved",
         subject: ref("lane", lane.id, lane.name),
         summary: `Moved ${lane.name} to ${target.title}`,
-        payload: { changed: ["subMissionId"], subMissionId: target.id },
+        payload: {
+          changed: ["subMissionId"],
+          subMissionId: target.id,
+          before: { subMissionId: lane.subMissionId },
+        },
       });
       commit();
       return Promise.resolve();
@@ -622,7 +661,12 @@ export function createOperations(ctx: OperationsContext): Operations {
         summary: pending
           ? `${role.name} moves to ${modelSelection.model} next turn: ${why}`
           : `${role.name} stays on ${role.modelSelection.model}: ${why}`,
-        payload: { changed: ["pendingModelSelection"], model: modelSelection.model },
+        payload: {
+          changed: ["pendingModelSelection"],
+          model: modelSelection.model,
+          phase: "requested",
+          previousSelection: role.pendingModelSelection ?? role.modelSelection,
+        },
       });
       commit();
       return Promise.resolve();
@@ -681,7 +725,13 @@ export function createOperations(ctx: OperationsContext): Operations {
           kind: "pool.updated",
           subject: ref("pool", pool.id, pool.name),
           summary: `${pool.name}: capacity ${pool.capacity} -> ${capacity} ${pool.unit}. ${why}`,
-          payload: { changed: ["capacity"], capacity },
+          payload: {
+            changed: ["capacity"],
+            capacity,
+            poolId: pool.id,
+            field: "capacity",
+            from: pool.capacity,
+          },
         });
       }
       commit();
@@ -696,7 +746,8 @@ export function createOperations(ctx: OperationsContext): Operations {
         new Set(next).size === next.length &&
         next.every((id) => live.includes(id));
       if (!valid) return fail("invalid", "The order must list every live mission once.");
-      if (next.every((id, index) => portfolio().order[index] === id)) return Promise.resolve();
+      const previousOrder = portfolio().order;
+      if (next.every((id, index) => previousOrder[index] === id)) return Promise.resolve();
       portfolioOrder = next;
       const summary = `Mission order: ${next.map((id) => missionOf(id)?.title ?? id).join(", ")}`;
       // Every mission's timeline shows the reorder, since it moves them all.
@@ -706,7 +757,7 @@ export function createOperations(ctx: OperationsContext): Operations {
           kind: "portfolio.reordered",
           subject: null,
           summary,
-          payload: { order: next },
+          payload: { order: next, previousOrder },
         });
       }
       commit();
