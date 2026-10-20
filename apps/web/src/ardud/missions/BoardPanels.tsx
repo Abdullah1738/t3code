@@ -160,7 +160,7 @@ function DayPanel(props: { line: DayLine | undefined; lookedAt: string | null })
         <h2 id="mission-day-line" className="text-sm font-semibold">
           Today in the rooms
         </h2>
-        <span className="text-xs text-(--m-muted) tabular-nums">since {dayHourLabel(0)}</span>
+        <span className="text-sm text-(--m-muted) tabular-nums">since {dayHourLabel(0)}</span>
       </div>
       {line === undefined ? (
         <LoadingRows />
@@ -420,7 +420,7 @@ export function LanesPanel(props: { missionId: MissionId; counts: LaneCounts; no
         <h2 id="mission-section-lanes" className="text-sm font-semibold">
           Lanes
         </h2>
-        <span className="text-xs text-(--m-muted) tabular-nums">{total} live</span>
+        <span className="text-sm text-(--m-muted) tabular-nums">{total} live</span>
         <Button
           size="sm"
           variant="ghost-muted"
