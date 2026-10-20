@@ -22,3 +22,4 @@ export { createFixtureMissionsSource, type FixtureMissionsSourceOptions } from "
 export * from "./views/index.ts";
 export * from "./rpcSource.ts";
 export { createAtomMissionsTransport } from "./rpcTransport.ts";
+export * from "./missionThreads.ts";

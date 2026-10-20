@@ -1939,6 +1939,13 @@ export const MissionListItem = Schema.Struct({
   /** Owner requests the master answered that the owner has not opened yet. */
   requestsAnswered: Schema.optional(NonNegativeInt),
   // --- end router additions ---
+  // --- ui-web additions ---
+  /**
+   * Threads that belong to the mission (its role holders and live lanes).
+   * Clients keep them out of the ordinary thread list; the mission opens them.
+   */
+  threadIds: Schema.optional(Schema.Array(ThreadId)),
+  // --- end ui-web additions ---
 });
 export type MissionListItem = typeof MissionListItem.Type;
 

@@ -208,6 +208,11 @@ describe("owner requests", () => {
       assert.strictEqual((yield* reads.overview(missionId)).requestsAnswered, 1);
       const listed = (yield* reads.listSnapshot).missions.find((each) => each.id === missionId);
       assert.strictEqual(listed?.requestsAnswered, 1);
+      // Role holders and live lanes belong to the mission, not the thread list.
+      assert.includeMembers(
+        [...(listed?.threadIds ?? [])],
+        [masterThread, writerThread, laneThread],
+      );
 
       // Opening the request to its end clears it.
       const page = yield* router.roomPage({ roomId: request.roomId }, ownerApp);

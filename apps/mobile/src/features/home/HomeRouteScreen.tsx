@@ -32,6 +32,10 @@ import { usePendingTaskListActions } from "./usePendingTaskListActions";
 import { useThreadListActions } from "./useThreadListActions";
 import { getConnectionAwareBrandHeaderOptions } from "./WorkspaceConnectionTitle";
 import { useWorkspaceTabs } from "../workspace/WorkspaceTabsContext";
+// ardud missions: ui-web
+import { missionThreadIds, withoutMissionThreads } from "@t3tools/client-runtime/ardud/missions";
+import { useMissionList } from "../../ardud/missions/missionsStore";
+// end ardud missions: ui-web
 
 export function HomeRouteScreen() {
   const { width: windowWidth } = useWindowDimensions();
@@ -45,10 +49,13 @@ export function HomeRouteScreen() {
   // Streaming turns rewrite thread shells many times a second. While a Thread
   // covers Home, rebuilding this list is invisible work.
   const visible = useHomeRouteVisible();
-  const threads = useAtomValueWhileVisible(
-    environmentThreadShells.navigationThreadShellsAtom,
-    visible,
+  // ardud missions: ui-web (a mission's threads open from the mission, not the list)
+  const missionThreads = missionThreadIds(useMissionList());
+  const threads = withoutMissionThreads(
+    useAtomValueWhileVisible(environmentThreadShells.navigationThreadShellsAtom, visible),
+    missionThreads,
   );
+  // end ardud missions: ui-web
   const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
   const { savedConnectionsById } = useSavedRemoteConnections();
   const navigation = useNavigation();
