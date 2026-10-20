@@ -518,10 +518,14 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const notes = yield* recentNotes(missionId);
       const editor = yield* editorStateOf(missionId);
-      return rankFyi(notes, {
-        limit,
-        ...(editor === null ? {} : { editorOrder: editor.state.fyiOrder }),
-      });
+      // The editor decides what reaches the owner. Padding the list with every
+      // open note buried his few real items under lane housekeeping.
+      return editor === null
+        ? rankFyi(
+            notes.filter((note) => note.type === "owner-must-know"),
+            { limit },
+          )
+        : rankFyi(notes, { limit, editorOrder: editor.state.fyiOrder, picksOnly: true });
     });
 
   const stats = (missionId: string, sinceIso: string | null) =>

@@ -125,18 +125,26 @@ export const fyiScore = (
   (note.basis === "observed" ? 2 : 0);
 
 /**
- * The FYI list: current, citation-verified, not acked by the owner, ranked by
- * score then recency, capped. `editorOrder` (note ids the editor picked, in
- * order) wins over the score when given.
+ * The FYI list: current, citation-verified, not acked, ranked by score then
+ * recency, capped. `editorOrder` (note ids the editor picked, in order) wins
+ * over the score when given; `picksOnly` keeps just those picks.
  */
 export const rankFyi = <N extends Note>(
   notes: ReadonlyArray<N>,
-  options: { readonly limit: number; readonly editorOrder?: ReadonlyArray<string> },
+  options: {
+    readonly limit: number;
+    readonly editorOrder?: ReadonlyArray<string>;
+    readonly picksOnly?: boolean;
+  },
 ): ReadonlyArray<N> => {
-  const eligible = currentNotes(notes).filter(
-    (note) => note.citation === "verified" && !note.ackedBy.some((actor) => actor._tag === "owner"),
-  );
   const editorRank = new Map((options.editorOrder ?? []).map((id, index) => [id, index]));
+  // Only the owner and the master ack notes, and either ack means it was handled.
+  const eligible = currentNotes(notes).filter(
+    (note) =>
+      note.citation === "verified" &&
+      note.ackedBy.length === 0 &&
+      (options.picksOnly !== true || editorRank.has(note.id)),
+  );
   const sorted = [...eligible].toSorted((a, b) => {
     const ra = editorRank.get(a.id);
     const rb = editorRank.get(b.id);

@@ -12,8 +12,11 @@ Write, as JSON:
 - "bottomLine": at most 80 words, plain English, for a person who has not followed the threads.
   Lead with what matters most right now (what is blocked on the owner, what shipped, what is at risk).
   No ids, no jargon he would have to look up. Use only facts from the input.
-- "fyiOrder": the note ids worth the owner's attention, most important first (at most limits.fyi).
-  Leave out routine notes. owner-must-know and evidence "mismatch" notes usually belong near the top.
+- "fyiOrder": the note ids the owner would act on or be surprised not to know, most important first
+  (at most limits.fyi). That is money, security, production, a promise made to someone outside, a missed
+  owner rule, or a decision only he can make. Nothing else reaches him, so leave out lane housekeeping:
+  blockers a lane or the master already handled, budget forecasts, PR stacking, questions already
+  answered. An empty list is fine. owner-must-know and evidence "mismatch" notes usually belong near the top.
 - "feed": "since you last looked" lines, at most limits.feed: {"kind": "shipped|decided|blocked|note|milestone",
   "summary": one plain line, "ref": "kind:id" of an item in the input (a note, shipped, decided, blocked,
   milestone or waitingOnOwner entry)}.

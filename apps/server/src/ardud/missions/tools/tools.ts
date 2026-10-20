@@ -354,7 +354,8 @@ const MissionSuggestionReopenTool = Tool.make("mission_suggestion_reopen", {
 });
 
 const MissionNoteAckTool = Tool.make("mission_note_ack", {
-  description: "As the mission's master, acknowledge a note.",
+  description:
+    "As the mission's master, mark a note handled. It leaves the owner's FYI list; the ack stays on the note and the timeline.",
   parameters: Schema.Struct({ noteId: NoteId }),
   success: Schema.Struct({ note: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
