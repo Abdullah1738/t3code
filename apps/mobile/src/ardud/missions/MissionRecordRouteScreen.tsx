@@ -20,7 +20,7 @@ import { EmptyLine } from "./parts";
 import { RequestReader } from "./RequestReader";
 import { RoomReader } from "./RoomReader";
 import { missionRecordState, type MissionRecordParams } from "./routeParams";
-import { useNowMs } from "./useMissionsLogic";
+import { useHeaderInset, useNowMs } from "./useMissionsLogic";
 
 /** A pushed record on a phone: an inbox item, one of your requests, or a room. */
 export function MissionRecordRouteScreen({
@@ -82,8 +82,9 @@ function Shell(props: {
   readonly onBack: () => void;
   readonly children: ReactNode;
 }) {
+  const headerInset = useHeaderInset();
   return (
-    <View collapsable={false} className="flex-1 bg-screen">
+    <View collapsable={false} className="flex-1 bg-screen" style={{ paddingTop: headerInset }}>
       <AppBar title={props.title} sidebar={false} onBack={props.onBack} />
       <KeyboardAvoidingView automaticOffset behavior="height" className="flex-1">
         {props.children}

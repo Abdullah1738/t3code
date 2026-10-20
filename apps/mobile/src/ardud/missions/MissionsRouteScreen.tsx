@@ -29,7 +29,7 @@ import {
 } from "./routeParams";
 import { RoomsPane } from "./RoomsPane";
 import { MissionRows } from "./rows";
-import { useNowMs } from "./useMissionsLogic";
+import { useHeaderInset, useNowMs } from "./useMissionsLogic";
 
 // Desk pages split into list + reading pane from tablet widths up.
 const SPLIT_WIDTH = 700;
@@ -41,6 +41,7 @@ const SPLIT_WIDTH = 700;
 export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRouteParams | undefined>) {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
+  const headerInset = useHeaderInset();
   const keyboardVisible = useKeyboardState((state) => state.isVisible);
   const nowMs = useNowMs();
   const environmentId = useMissionsEnvironmentId();
@@ -160,7 +161,7 @@ export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRoutePa
 
   const inMission = state.tab === "missions" && mission !== null;
   return (
-    <View collapsable={false} className="flex-1 bg-screen">
+    <View collapsable={false} className="flex-1 bg-screen" style={{ paddingTop: headerInset }}>
       <AppBar
         title={title}
         sidebar={false}

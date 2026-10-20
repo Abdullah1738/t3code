@@ -1,7 +1,20 @@
 import { useFocusEffect } from "@react-navigation/native";
 import { missionErrorMessage } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { useCallback, useRef, useState } from "react";
-import { Alert, AppState } from "react-native";
+import { Alert, AppState, Platform } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { useNativeColumnLayoutMetrics } from "../../native/native-layout-metrics";
+
+/**
+ * The iOS v5 column extends behind the solid header, so plain scroll views
+ * start under it. UIKit reports zero here once it has inset the body itself.
+ */
+export function useHeaderInset(): number {
+  const insets = useSafeAreaInsets();
+  const columnMetrics = useNativeColumnLayoutMetrics();
+  return Platform.OS === "ios" ? (columnMetrics?.safeArea.top ?? insets.top) : 0;
+}
 
 /**
  * Wall clock for relative labels ("3h ago"). Ticks once a minute while the
