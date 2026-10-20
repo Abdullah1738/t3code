@@ -59,6 +59,8 @@ import type {
   SubMissionId,
   Suggestion,
   SuggestionStats,
+  TuneRoomInput,
+  UpdateRoomInput,
   UpsertRuleInput,
   WorkItem,
   WorkStage,
@@ -615,6 +617,10 @@ export interface MissionsSource {
   createMission(input: CreateMissionInput): Promise<MissionId>;
   createLane(input: NewLaneInput): Promise<void>;
   createRole(input: CreateRoleInput): Promise<void>;
+  /** Who each message kind wakes in a room (owner or master). */
+  tuneRoom(input: TuneRoomInput): Promise<void>;
+  /** Rename, move to another sub-mission, remove (archive) or restore a room. */
+  updateRoom(input: UpdateRoomInput): Promise<void>;
   // --- end finish-b ---
 
   /** The mission's views record (layout, sections, pins) and its change log; null when gone. */

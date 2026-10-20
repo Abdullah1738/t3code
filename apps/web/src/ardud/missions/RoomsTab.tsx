@@ -1,7 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 
-import type { MissionId, MissionMessage, MissionMessageKind, RoomId } from "@t3tools/contracts";
+import type {
+  LaneId,
+  MissionId,
+  MissionMessage,
+  MissionMessageKind,
+  RoomId,
+} from "@t3tools/contracts";
 import {
   COMPOSER_TARGET_LABEL,
   composerState,
@@ -9,12 +15,13 @@ import {
   groupRooms,
   MESSAGE_KIND_LABEL,
   messageParties,
+  receiptNudgeLanes,
   receiptView,
   roomChipLabel,
+  roomFigures,
   roomListLine,
   roomMembersLine,
   roomsSummary,
-  roomStats,
   statusRunLine,
   type ActorNames,
   type ComposerTarget,
@@ -33,8 +40,10 @@ import { Textarea } from "../../components/ui/textarea";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { DESK_ROW, DeskChip, Figure, PageLine, Segmented } from "./deskParts";
+import { nudgePending } from "./deskCommands";
 import { MissionLinkList } from "./MissionLinkText";
 import { useMasterRoleId, useMissionRooms } from "./missionsStore";
+import { RemovedRooms, RoomActions, RoomPanelView, type RoomPanel } from "./RoomTools";
 import { useRoomScreen, type RoomScreen } from "./useRoomScreen";
 
 // Rooms tab, Desk layout: the room list next to the open room. On a phone the
@@ -128,6 +137,7 @@ export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; n
               </ul>
             </div>
           ))}
+          <RemovedRooms rooms={rooms} />
         </nav>
         {openId !== null ? (
           <div className="flex min-w-0 flex-col gap-3">
@@ -160,11 +170,12 @@ function OpenRoom(props: {
   messageCount: number | null;
 }) {
   const screen = useRoomScreen(props.missionId, props.roomId, props.masterRoleId);
+  const [panel, setPanel] = useState<RoomPanel>(null);
   const { page, view } = screen;
   if (page === undefined) return <p className="text-sm text-(--m-muted)">Loading…</p>;
   if (page === null) return <p className="text-sm text-(--m-muted)">Room not found.</p>;
   const membersLine = roomMembersLine(screen.members);
-  const stats = roomStats(page.room.noise, props.messageCount);
+  const stats = roomFigures(page.room.noise, props.messageCount);
   return (
     <section
       aria-labelledby="open-room-title"
@@ -175,6 +186,12 @@ function OpenRoom(props: {
         {membersLine ? (
           <span className="text-xs text-(--m-muted) tabular-nums">{membersLine}</span>
         ) : null}
+        <RoomActions
+          missionId={props.missionId}
+          room={page.room}
+          panel={panel}
+          onPanel={setPanel}
+        />
       </div>
       <h2 id="open-room-title" className="mt-2.5 text-2xl font-normal text-pretty">
         {roomTitle(page.room.title)}
@@ -189,6 +206,14 @@ function OpenRoom(props: {
           ))}
         </dl>
       ) : null}
+      <RoomPanelView
+        missionId={props.missionId}
+        room={page.room}
+        subscriptions={page.subscriptions}
+        masterRoleId={props.masterRoleId}
+        panel={panel}
+        onClose={() => setPanel(null)}
+      />
       {view ? (
         <RoomStream screen={screen} masterRoleId={props.masterRoleId} names={page.names} />
       ) : null}
@@ -324,6 +349,7 @@ function MessageRow(props: {
 }) {
   const { message } = props;
   const receipt = receiptView(message.receipt);
+  const nudgeLanes = receiptNudgeLanes(message.receipt);
   const parties = messageParties(message, props.masterRoleId, props.names);
   return (
     <li
@@ -355,6 +381,7 @@ function MessageRow(props: {
               ) : null}
             </span>
           ) : null}
+          {nudgeLanes.length > 0 ? <NudgeButton message={message} laneIds={nudgeLanes} /> : null}
         </div>
         <p className="text-pretty">{message.summary}</p>
         {message.links.length > 0 ? (
@@ -364,6 +391,24 @@ function MessageRow(props: {
         ) : null}
       </div>
     </li>
+  );
+}
+
+/** Nudges the lanes a control post has not reached; once per open room. */
+function NudgeButton(props: { message: MissionMessage; laneIds: ReadonlyArray<LaneId> }) {
+  const [state, setState] = useState<"idle" | "busy" | "sent">("idle");
+  return (
+    <Button
+      size="xs"
+      variant="ghost-muted"
+      disabled={state !== "idle"}
+      onClick={async () => {
+        setState("busy");
+        setState((await nudgePending(props.message, props.laneIds)) ? "sent" : "idle");
+      }}
+    >
+      {state === "sent" ? "Nudged" : "Nudge"}
+    </Button>
   );
 }
 

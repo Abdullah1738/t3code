@@ -1,9 +1,26 @@
-import type { MissionId, RoleKind, SubMissionId } from "@t3tools/contracts";
+import type {
+  LaneId,
+  MissionId,
+  MissionMessage,
+  MissionMessageKind,
+  RoleKind,
+  Room,
+  SubMissionId,
+  Subscription,
+} from "@t3tools/contracts";
 import {
+  moveRoomInput,
   newLaneInput,
   newMissionInput,
   newRoleInput,
+  nudgeLaneInput,
+  receiptNudgeNote,
+  removeRoomInput,
+  renameRoomInput,
+  restoreRoomInput,
+  wakeToggleInput,
   type SetPortfolioOrderInput,
+  type WakeColumn,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { missionsSource } from "./missionsStore";
@@ -49,3 +66,60 @@ export const createRole = (missionId: MissionId, kind: RoleKind, name: string) =
 /** Sends an order the order bar already checked (orderBarDrop). */
 export const reorderPortfolio = (input: SetPortfolioOrderInput) =>
   runMissionAction(missionsSource.setPortfolioOrder(input), "Couldn't change the order");
+
+export const renameRoom = (room: Room, title: string) =>
+  submitMissionInput(
+    renameRoomInput(room, title),
+    (input) => missionsSource.updateRoom(input),
+    "Couldn't rename the room",
+  );
+
+export const moveRoom = (room: Room, subMissionId: SubMissionId | null) =>
+  submitMissionInput(
+    moveRoomInput(room, subMissionId),
+    (input) => missionsSource.updateRoom(input),
+    "Couldn't move the room",
+  );
+
+export const removeRoom = (room: Room) =>
+  submitMissionInput(
+    removeRoomInput(room),
+    (input) => missionsSource.updateRoom(input),
+    "Couldn't remove the room",
+  );
+
+export const restoreRoom = (room: Room) =>
+  submitMissionInput(
+    restoreRoomInput(room),
+    (input) => missionsSource.updateRoom(input),
+    "Couldn't restore the room",
+  );
+
+export const setRoomWake = (
+  room: Room,
+  subscriptions: ReadonlyArray<Subscription>,
+  masterRoleId: string | null,
+  column: WakeColumn,
+  kind: MissionMessageKind,
+  on: boolean,
+) =>
+  submitMissionInput(
+    wakeToggleInput(room.id, subscriptions, masterRoleId, column, kind, on),
+    (input) => missionsSource.tuneRoom(input),
+    "Couldn't change who the room wakes",
+  );
+
+/** Nudges every lane a control post has not reached, pointing at the post. */
+export async function nudgePending(message: MissionMessage, laneIds: ReadonlyArray<LaneId>) {
+  const note = receiptNudgeNote(message);
+  const sent = await Promise.all(
+    laneIds.map((laneId) =>
+      submitMissionInput(
+        nudgeLaneInput(laneId, note),
+        (input) => missionsSource.nudgeLane(input),
+        "Couldn't nudge the lane",
+      ),
+    ),
+  );
+  return sent.every(Boolean);
+}

@@ -722,6 +722,22 @@ describe("rpc missions source", () => {
     expect(asked(POLICY.createRole).at(-1)?.input).toEqual({ missionId: CRPKO, kind: "scribe" });
   });
 
+  it("tunes and changes rooms through the router's write RPCs", async () => {
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsTuneRoom]: () => ({}),
+      [WS_METHODS.missionsUpdateRoom]: () => ({}),
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const roomId = "crpko:room:arch" as RoomId;
+    const rules = [
+      { subscriber: { _tag: "lane", laneId: "lane-tc" }, mode: "wake", wakeOn: ["decision"] },
+    ];
+    await source.tuneRoom({ roomId, rules } as never);
+    expect(asked(WS_METHODS.missionsTuneRoom).at(-1)?.input).toEqual({ roomId, rules });
+    await source.updateRoom({ roomId, archived: true });
+    expect(asked(WS_METHODS.missionsUpdateRoom).at(-1)?.input).toEqual({ roomId, archived: true });
+  });
+
   it("reads the views record live, logs view events and sends section changes", async () => {
     const { transport, live, asked } = fakeTransport({
       [VIEWS.editLayout]: () => ({ ok: true }),

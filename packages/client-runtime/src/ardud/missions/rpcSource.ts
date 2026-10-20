@@ -1307,6 +1307,14 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       await transport.request(POLICY.createRole, input);
       bus.emit("roles");
     },
+    tuneRoom: async (input) => {
+      await transport.request(WS_METHODS.missionsTuneRoom, input);
+      touchRoom(input.roomId);
+    },
+    updateRoom: async (input) => {
+      await transport.request(WS_METHODS.missionsUpdateRoom, input);
+      touchRoom(input.roomId);
+    },
     // --- end finish-b ---
 
     subscribeViews(missionId, listener) {

@@ -27,6 +27,17 @@ import {
   ruleFromCorrection,
   wakesFor,
   INITIAL_ROOM_UI,
+  // --- finish-b ---
+  moveRoomInput,
+  receiptNudgeLanes,
+  removedRooms,
+  removeRoomInput,
+  renameRoomInput,
+  restoreRoomInput,
+  roomFigures,
+  wakeTable,
+  wakeToggleInput,
+  // --- end finish-b ---
   roomUiReducer,
   roomView,
 } from "./roomsViewModel.ts";
@@ -475,3 +486,200 @@ describe("open room state", () => {
     expect(state).toMatchObject({ text: "", target: { kind: "room" } });
   });
 });
+
+// --- finish-b ---
+describe("room tools", () => {
+  const sub = (subscriber: Record<string, string>, mode: string, wakeOn: string[]) =>
+    decodeSubscription({
+      id: `sub-${Object.values(subscriber).join("-")}`,
+      roomId: "r",
+      subscriber,
+      mode,
+      wakeOn,
+      createdAt: "2026-10-02T00:00:00.000Z",
+    });
+  const master = sub({ _tag: "role", roleId: MASTER }, "wake", [
+    "request",
+    "blocker",
+    "control",
+    "evidence",
+  ]);
+  const tc = sub({ _tag: "lane", laneId: "lane-cell-tc" }, "wake", [
+    "request",
+    "blocker",
+    "control",
+  ]);
+  const bal = sub({ _tag: "lane", laneId: "lane-cell-bal" }, "read", []);
+  const muted = sub({ _tag: "lane", laneId: "lane-quiet" }, "mute", []);
+  const owner = sub({ _tag: "owner" }, "read", []);
+  const noise = {
+    messagesPerHour: 3,
+    actionableShare: 0.5,
+    wastedWakes: 0,
+    kinds24h: { request: 4, status: 9, control: 1 },
+  };
+
+  it("adds the last 24 hours after the message count", () => {
+    expect(roomFigures(noise, 120).map((stat) => [stat.label, stat.value])).toEqual([
+      ["Messages", "120"],
+      ["Last 24h", "14"],
+      ["Per hour", "3"],
+      ["Actionable", "50%"],
+    ]);
+    const { kinds24h: _, ...older } = noise;
+    expect(roomFigures(older, 120).map((stat) => stat.label)).toEqual([
+      "Messages",
+      "Per hour",
+      "Actionable",
+    ]);
+  });
+
+  it("says who each kind wakes, lanes and master apart", () => {
+    const rows = wakeTable([owner, master, tc, bal, muted], MASTER, noise);
+    const row = (kind: string) => rows.find((r) => r.kind === kind)!;
+    expect(rows.map((r) => r.kind)).toEqual([
+      "request",
+      "blocker",
+      "decision",
+      "evidence",
+      "control",
+      "status",
+    ]);
+    expect(row("request")).toMatchObject({
+      lastDay: 4,
+      master: { on: true },
+      lanes: { on: false },
+    });
+    expect(row("evidence")).toMatchObject({
+      lastDay: 0,
+      master: { on: true },
+      lanes: { on: false },
+    });
+    expect(row("control")).toMatchObject({
+      lanes: { on: true, fixed: true },
+      master: { on: true, fixed: true },
+    });
+    expect(row("status")).toMatchObject({
+      lanes: { on: false, fixed: true },
+      master: { on: false },
+    });
+    // Only waking lanes left: request wakes every lane.
+    expect(wakeTable([tc], MASTER, null)[0]).toMatchObject({
+      lastDay: null,
+      lanes: { on: true, empty: false },
+      master: { on: false, empty: false },
+    });
+    expect(wakeTable([tc], null, null)[0]!.master.empty).toBe(true);
+  });
+
+  it("turns a kind on or off for a whole column", () => {
+    const on = wakeToggleInput(
+      "r" as never,
+      [owner, master, tc, bal, muted],
+      MASTER,
+      "lanes",
+      "decision",
+      true,
+    );
+    expect(on).toEqual({
+      ok: true,
+      value: {
+        roomId: "r",
+        rules: [
+          {
+            subscriber: tc.subscriber,
+            mode: "wake",
+            wakeOn: ["request", "blocker", "control", "decision"],
+          },
+          { subscriber: bal.subscriber, mode: "wake", wakeOn: ["decision"] },
+        ],
+      },
+    });
+    const off = wakeToggleInput("r" as never, [master, tc], MASTER, "master", "request", false);
+    expect(off).toEqual({
+      ok: true,
+      value: {
+        roomId: "r",
+        rules: [
+          {
+            subscriber: master.subscriber,
+            mode: "wake",
+            wakeOn: ["blocker", "control", "evidence"],
+          },
+        ],
+      },
+    });
+    // A master outside the room is subscribed by switching it on.
+    expect(wakeToggleInput("r" as never, [tc], MASTER, "master", "blocker", true)).toEqual({
+      ok: true,
+      value: {
+        roomId: "r",
+        rules: [{ subscriber: master.subscriber, mode: "wake", wakeOn: ["blocker"] }],
+      },
+    });
+    expect(wakeToggleInput("r" as never, [tc], MASTER, "lanes", "status", true).ok).toBe(false);
+    expect(wakeToggleInput("r" as never, [tc], MASTER, "lanes", "control", false).ok).toBe(false);
+    expect(wakeToggleInput("r" as never, [master], MASTER, "lanes", "request", true).ok).toBe(
+      false,
+    );
+  });
+
+  it("renames, moves, removes and restores rooms", () => {
+    const delivery = { ...room("delivery", "sub-mission"), subMissionId: "sub-a" as never };
+    expect(renameRoomInput(delivery, "  #wave  ")).toEqual({
+      ok: true,
+      value: { roomId: "delivery", title: "wave" },
+    });
+    expect(renameRoomInput(delivery, "#delivery").ok).toBe(false);
+    expect(renameRoomInput(delivery, " ").ok).toBe(false);
+    expect(moveRoomInput(delivery, null)).toEqual({
+      ok: true,
+      value: { roomId: "delivery", subMissionId: null },
+    });
+    expect(moveRoomInput(delivery, "sub-a" as never).ok).toBe(false);
+    expect(removeRoomInput(delivery)).toEqual({
+      ok: true,
+      value: { roomId: "delivery", archived: true },
+    });
+    expect(removeRoomInput(room("control", "control")).ok).toBe(false);
+    const gone = { ...delivery, archived: true };
+    expect(removeRoomInput(gone).ok).toBe(false);
+    expect(restoreRoomInput(gone)).toEqual({
+      ok: true,
+      value: { roomId: "delivery", archived: false },
+    });
+    expect(restoreRoomInput(delivery).ok).toBe(false);
+    const older = { ...room("old", "custom", "2026-10-01T00:00:00.000Z"), archived: true };
+    const newer = { ...room("new", "custom", "2026-10-03T00:00:00.000Z"), archived: true };
+    expect(
+      removedRooms([
+        { room: delivery, unread: 0 },
+        { room: older, unread: 0 },
+        { room: newer, unread: 0 },
+      ]).map((r) => r.id),
+    ).toEqual(["new", "old"]);
+    expect(
+      groupRooms([
+        { room: delivery, unread: 0 },
+        { room: newer, unread: 0 },
+      ]).flatMap((g) => g.rooms.map((e) => e.room.id)),
+    ).toEqual(["delivery"]);
+  });
+
+  it("nudges only the lanes a control post has not reached", () => {
+    expect(
+      receiptNudgeLanes({
+        reached: 7,
+        total: 10,
+        pending: ["cell-bal", "writer"],
+        pendingActors: [
+          { _tag: "lane", laneId: "lane-cell-bal" as LaneId },
+          { _tag: "role", roleId: "writer" as RoleId },
+        ],
+      }),
+    ).toEqual(["lane-cell-bal"]);
+    expect(receiptNudgeLanes({ reached: 1, total: 2, pending: ["x"] })).toEqual([]);
+    expect(receiptNudgeLanes(null)).toEqual([]);
+  });
+});
+// --- end finish-b ---

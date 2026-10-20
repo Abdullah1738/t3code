@@ -154,7 +154,7 @@ export function createFixtureMissionsSource(
   const poolUsage = new Map<string, ReadonlyArray<MissionPoolUsage>>(
     Object.entries(data.poolUsage),
   );
-  const subscriptions = decodeSubscriptions(data.roomSubscriptions);
+  const subscriptions: Subscription[] = [...decodeSubscriptions(data.roomSubscriptions)];
   // Messages per room, oldest first. Seqs are monotonic per mission.
   const messagesByRoom = new Map<string, MissionMessage[]>();
   for (const message of decodeMessages(data.messages)) {
@@ -470,9 +470,10 @@ export function createFixtureMissionsSource(
 
   function missionRooms(missionId: string): ReadonlyArray<MissionRoomEntry> {
     return memo(`rooms:${missionId}`, () =>
+      // Removed rooms stay in the list, like the server's; pages filter them.
       rooms
-        .filter((room) => room.missionId === missionId && !room.archived)
-        .map((room) => ({ room, unread: unreadIn(room.id) })),
+        .filter((room) => room.missionId === missionId)
+        .map((room) => ({ room, unread: room.archived ? 0 : unreadIn(room.id) })),
     );
   }
 
@@ -494,8 +495,15 @@ export function createFixtureMissionsSource(
     for (const lane of lanes) {
       if (members.has(`lane:${lane.id}`)) names[`lane:${lane.id}`] = lane.name;
     }
+    // Per-kind counts over the last 24 hours, as the router sends them.
+    const since = now() - 24 * 60 * 60 * 1000;
+    const kinds24h: Record<string, number> = {};
+    for (const message of all) {
+      if (Date.parse(message.createdAt) >= since)
+        kinds24h[message.kind] = (kinds24h[message.kind] ?? 0) + 1;
+    }
     return {
-      room,
+      room: room.noise ? { ...room, noise: { ...room.noise, kinds24h } } : room,
       messages: page,
       subscriptions: subscriptions.filter((sub) => sub.roomId === room.id),
       ownerReadSeq: ownerReadSeq.get(room.id) ?? 0,
@@ -756,6 +764,93 @@ export function createFixtureMissionsSource(
       });
       commit();
       return Promise.resolve(mission.id);
+    },
+    tuneRoom(input) {
+      const room = rooms.find((r) => r.id === input.roomId);
+      if (!room) return fail("not-found", `Room ${input.roomId} not found.`);
+      const rules = input.rules ?? [];
+      if (rules.length === 0) return fail("invalid", "Give at least one rule.");
+      if (rules.some((rule) => rule.subscriber._tag === "owner")) {
+        return fail("invalid", "The owner is not a room subscriber.");
+      }
+      const at = nowIso();
+      for (const rule of rules) {
+        const key = actorKey(rule.subscriber);
+        const index = subscriptions.findIndex(
+          (sub) => sub.roomId === room.id && actorKey(sub.subscriber) === key,
+        );
+        const prior = index >= 0 ? subscriptions[index] : undefined;
+        const next: Subscription = {
+          id: (prior?.id ?? `${room.id}:sub:${key}`) as Subscription["id"],
+          roomId: room.id,
+          subscriber: rule.subscriber,
+          mode: rule.mode,
+          wakeOn: [
+            ...(rule.wakeOn ?? (rule.mode === "wake" ? ["request", "blocker", "control"] : [])),
+          ],
+          createdAt: prior?.createdAt ?? at,
+        };
+        if (index >= 0) subscriptions[index] = next;
+        else subscriptions.push(next);
+      }
+      log.record({
+        missionId: room.missionId,
+        kind: "room.tuned",
+        subject: { kind: "room", id: room.id, label: room.title },
+        summary: `${room.title} tuned`,
+        payload: { rules },
+      });
+      commit();
+      return Promise.resolve();
+    },
+    updateRoom(input) {
+      const room = rooms.find((r) => r.id === input.roomId);
+      if (!room) return fail("not-found", `Room ${input.roomId} not found.`);
+      if (input.archived === true && room.kind === "control") {
+        return fail("conflict", "The control room can't be removed.");
+      }
+      if (input.subMissionId) {
+        const sub = subMissions.find((s) => s.id === input.subMissionId);
+        if (!sub || sub.missionId !== room.missionId) {
+          return fail("not-found", `Sub-mission ${input.subMissionId} not found.`);
+        }
+      }
+      const next: Room = {
+        ...room,
+        title: input.title?.trim() || room.title,
+        subMissionId: input.subMissionId === undefined ? room.subMissionId : input.subMissionId,
+        archived: input.archived ?? room.archived,
+      };
+      const fields = (["title", "subMissionId", "archived"] as const).filter(
+        (field) => next[field] !== room[field],
+      );
+      if (fields.length === 0) return fail("invalid", "Nothing to change.");
+      replace(rooms, next);
+      const kind = fields.includes("archived")
+        ? next.archived
+          ? "room.archived"
+          : "room.restored"
+        : "room.updated";
+      log.record({
+        missionId: room.missionId,
+        kind,
+        subject: { kind: "room", id: room.id, label: next.title },
+        summary:
+          kind === "room.archived"
+            ? `${room.title} removed`
+            : kind === "room.restored"
+              ? `${room.title} restored`
+              : fields.includes("title")
+                ? `${room.title} renamed to ${next.title}`
+                : `${room.title} moved`,
+        payload: {
+          fields,
+          before: { title: room.title, subMissionId: room.subMissionId, archived: room.archived },
+          after: { title: next.title, subMissionId: next.subMissionId, archived: next.archived },
+        },
+      });
+      commit();
+      return Promise.resolve();
     },
     // --- end finish-b ---
 
