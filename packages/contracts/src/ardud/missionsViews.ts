@@ -26,6 +26,7 @@ import {
   type Knock,
   LaneId,
   MissionActor,
+  MissionAssetId,
   MissionId,
   MissionRecordRef,
   MissionSummaryText,
@@ -254,6 +255,34 @@ export const ViewListNode = Schema.TaggedStruct("list", {
   meta: Schema.Array(ViewBind).check(Schema.isMaxLength(3)),
   status: Schema.NullOr(ViewBind),
 });
+// --- views additions ---
+/** How a table cell draws its value. */
+export const ViewTableCellKind = Schema.Literals([
+  "text",
+  "status",
+  "age",
+  "person",
+  "link",
+  "count",
+]);
+export type ViewTableCellKind = typeof ViewTableCellKind.Type;
+export const ViewTableColumn = Schema.Struct({
+  label: ViewKicker,
+  bind: ViewBind,
+  as: ViewTableCellKind,
+});
+/** One row per section row, up to five columns. Sections only; phones stack each row. */
+export const ViewTableNode = Schema.TaggedStruct("table", {
+  columns: Schema.Array(ViewTableColumn).check(Schema.isMinLength(1), Schema.isMaxLength(5)),
+});
+/** A bar of value out of max, both numbers. */
+export const ViewMeterNode = Schema.TaggedStruct("meter", { value: ViewBind, max: ViewBind });
+/** Images from an `assets` field; `per-asset` lets the owner mark each one (ask cards). */
+export const ViewGalleryNode = Schema.TaggedStruct("gallery", {
+  bind: ViewBind,
+  review: Schema.Literals(["none", "per-asset"]),
+});
+// --- end views additions ---
 
 export const ViewLeafNode = Schema.Union([
   ViewTextNode,
@@ -265,6 +294,11 @@ export const ViewLeafNode = Schema.Union([
   ViewDraftNode,
   ViewChoiceNode,
   ViewListNode,
+  // --- views additions ---
+  ViewTableNode,
+  ViewMeterNode,
+  ViewGalleryNode,
+  // --- end views additions ---
 ]);
 export type ViewLeafNode = typeof ViewLeafNode.Type;
 
@@ -298,6 +332,11 @@ export const VIEW_NODE_TAGS: ReadonlyArray<ViewNodeTag> = [
   "choice",
   "list",
   "group",
+  // --- views additions ---
+  "table",
+  "meter",
+  "gallery",
+  // --- end views additions ---
 ];
 
 /** Bodies on the wire: decode each node alone and drop what fails. */
@@ -314,6 +353,9 @@ export const ViewFieldType = Schema.Literals([
   "flags",
   "links",
   "refs",
+  // --- views additions ---
+  "assets",
+  // --- end views additions ---
 ]);
 export type ViewFieldType = typeof ViewFieldType.Type;
 export const ViewFieldSpec = Schema.Struct({
@@ -726,6 +768,9 @@ export const ViewValueKind = Schema.Literals([
   "options",
   "pr",
   "facts",
+  // --- views additions ---
+  "assets",
+  // --- end views additions ---
 ]);
 export type ViewValueKind = typeof ViewValueKind.Type;
 
@@ -774,6 +819,9 @@ export const VIEW_PATHS: { readonly [K in ViewPathScope]: PathTable } = {
     staleReason: "text",
     status: "enum",
     createdAt: "time",
+    // --- views additions ---
+    withdrawNote: "text",
+    // --- end views additions ---
   },
   "work-item": {
     title: "text",
@@ -874,6 +922,16 @@ export const VIEW_BIND_ACCEPTS = {
   listTitle: ["text", "enum", "link", "pr"],
   listMeta: SCALAR,
   listStatus: ["enum"],
+  // --- views additions ---
+  meter: ["number"],
+  gallery: ["assets"],
+  cellText: SCALAR,
+  cellStatus: ["enum"],
+  cellAge: ["time"],
+  cellPerson: ["actor", "text", "enum"],
+  cellLink: ["link", "links", "pr"],
+  cellCount: ["number", "refs", "flags", "links", "assets"],
+  // --- end views additions ---
 } as const satisfies Record<string, ReadonlyArray<ViewValueKind>>;
 export type ViewBindSlot = keyof typeof VIEW_BIND_ACCEPTS;
 
@@ -885,7 +943,22 @@ export const VIEW_FIELD_VALUE_KIND: { readonly [K in ViewFieldType]: ViewValueKi
   flags: "flags",
   links: "links",
   refs: "refs",
+  // --- views additions ---
+  assets: "assets",
+  // --- end views additions ---
 };
+
+// --- views additions ---
+/** The bind slot of each table cell kind. */
+export const VIEW_TABLE_CELL_SLOT = {
+  text: "cellText",
+  status: "cellStatus",
+  age: "cellAge",
+  person: "cellPerson",
+  link: "cellLink",
+  count: "cellCount",
+} as const satisfies Record<ViewTableCellKind, ViewBindSlot>;
+// --- end views additions ---
 
 // ---------------------------------------------------------------------------
 // Built-in templates: today's cards, as data. A stored template overrides.
@@ -956,6 +1029,7 @@ const BUILTIN_DEFINITIONS: { readonly [K in ViewBackingKind]: ViewTemplateDefini
         ["Asked by", "record.requestedBy"],
         ["Revision", "record.revision"],
       ),
+      text("record.withdrawNote", "meta", 2),
     ],
     actions: ["send", "rewrite", "drop", "comment", "discuss"],
     primary: "send",
@@ -1047,6 +1121,64 @@ export const builtinViewTemplate = (kind: ViewBackingKind): ViewBuiltinTemplate 
   id: builtinViewTemplateId(kind),
   definition: BUILTIN_DEFINITIONS[kind],
 });
+
+// --- views additions ---
+/**
+ * Stock templates every mission has besides the per-kind built-ins. A release
+ * approval matches `release`; an ask names `builtin:ui-review` to show its
+ * screens for per-image review. A stored template with the same key replaces one.
+ */
+export const STOCK_VIEW_TEMPLATES: ReadonlyArray<ViewBuiltinTemplate> = [
+  {
+    id: `${BUILTIN_VIEW_TEMPLATE_PREFIX}release`,
+    definition: {
+      key: "release",
+      name: "Release",
+      backing: "approval",
+      kicker: "Release",
+      title: "record.title",
+      fields: [
+        { key: "version", label: "Version", type: "short", required: false, editable: false },
+        { key: "env", label: "Environment", type: "short", required: false, editable: false },
+        { key: "changes", label: "Changes", type: "text", required: false, editable: false },
+        { key: "prs", label: "PRs", type: "links", required: false, editable: false },
+      ],
+      body: [
+        facts(["Version", "field.version"], ["Environment", "field.env"]),
+        text("field.changes", "body", 6),
+        { _tag: "links", bind: "field.prs" },
+        { _tag: "flags", bind: "record.flags" },
+        { _tag: "links", bind: "record.links" },
+      ],
+      actions: ["approve", "reject", "discuss"],
+      primary: "approve",
+      match: { approvalKind: ["release"] },
+    },
+  },
+  {
+    id: `${BUILTIN_VIEW_TEMPLATE_PREFIX}ui-review`,
+    definition: {
+      key: "ui-review",
+      name: "UI review",
+      backing: "ask",
+      kicker: "UI review",
+      title: "record.question",
+      fields: [
+        { key: "screens", label: "Screens", type: "assets", required: true, editable: false },
+        { key: "where", label: "Where", type: "links", required: false, editable: false },
+      ],
+      body: [
+        text("record.context", "body", 3),
+        { _tag: "gallery", bind: "field.screens", review: "per-asset" },
+        { _tag: "choice" },
+        { _tag: "links", bind: "field.where" },
+      ],
+      actions: ["answer", "discuss"],
+      primary: "answer",
+    },
+  },
+];
+// --- end views additions ---
 
 // ---------------------------------------------------------------------------
 // Template selection: explicit id > most specific match > built-in.
@@ -1165,10 +1297,19 @@ export const selectViewTemplate = (
   const usable = templates.filter(
     (template) => template.status === "active" && template.definition.backing === subject.kind,
   );
+  // --- views additions ---
+  const keyed = (key: string) => usable.find((template) => template.definition.key === key);
+  const stock = STOCK_VIEW_TEMPLATES.filter(
+    (entry) =>
+      entry.definition.backing === subject.kind && keyed(entry.definition.key) === undefined,
+  );
+  const named = STOCK_VIEW_TEMPLATES.find((entry) => entry.id === subject.templateId);
+  // --- end views additions ---
   const explicit =
     subject.templateId === null || subject.templateId === undefined
       ? undefined
-      : usable.find((template) => template.id === subject.templateId);
+      : (usable.find((template) => template.id === subject.templateId) ??
+        (named === undefined ? undefined : keyed(named.definition.key)));
   if (explicit !== undefined) {
     return {
       source: "explicit",
@@ -1177,9 +1318,12 @@ export const selectViewTemplate = (
       template: explicit,
     };
   }
-  let best: ViewTemplate | undefined;
+  if (named !== undefined && stock.includes(named)) {
+    return { source: "explicit", id: named.id, definition: named.definition, template: null };
+  }
+  let best: ViewTemplate | ViewBuiltinTemplate | undefined;
   let bestScore = -1;
-  for (const template of usable) {
+  for (const template of [...usable, ...stock]) {
     const match = template.definition.match;
     if (match === null || match === undefined || !viewMatchFits(match, subject)) continue;
     const score = viewMatchSpecificity(match);
@@ -1189,7 +1333,12 @@ export const selectViewTemplate = (
     }
   }
   if (best !== undefined) {
-    return { source: "match", id: best.id, definition: best.definition, template: best };
+    return {
+      source: "match",
+      id: best.id,
+      definition: best.definition,
+      template: "missionId" in best ? best : null,
+    };
   }
   const builtin = builtinViewTemplate(subject.kind);
   return { source: "builtin", id: builtin.id, definition: builtin.definition, template: null };
@@ -1274,6 +1423,99 @@ export const RestoreStarterLayoutInput = Schema.Struct({
   changeNote: Schema.optionalKey(MissionSummaryText),
 });
 export type RestoreStarterLayoutInput = typeof RestoreStarterLayoutInput.Type;
+
+// --- views additions ---
+/** Templates and sections written together, or nothing. Copies come from another mission. */
+export const ApplyViewBundleInput = Schema.Struct({
+  missionId: MissionId,
+  templates: Schema.Array(
+    Schema.Struct({
+      templateId: Schema.optionalKey(ViewTemplateId),
+      definition: ViewTemplateDefinition,
+    }),
+  ).check(Schema.isMaxLength(12)),
+  sections: Schema.Array(
+    Schema.Struct({
+      sectionId: Schema.optionalKey(ViewSectionId),
+      definition: ViewSectionDefinition,
+      region: Schema.optionalKey(ViewRegion),
+    }),
+  ).check(Schema.isMaxLength(12)),
+  /** Active templates and sections of another mission, by key (all when keys are absent). */
+  copyFrom: Schema.optionalKey(
+    Schema.Struct({
+      missionId: MissionId,
+      templateKeys: Schema.optionalKey(Schema.Array(ViewKey).check(Schema.isMaxLength(12))),
+      sectionKeys: Schema.optionalKey(Schema.Array(ViewKey).check(Schema.isMaxLength(12))),
+    }),
+  ),
+  changeNote: Schema.optionalKey(MissionSummaryText),
+});
+export type ApplyViewBundleInput = typeof ApplyViewBundleInput.Type;
+
+export const MissionAssetStatus = Schema.Literals(["active", "removed", "expired"]);
+/** An image copied into the mission. Bytes live with attachments under the same id. */
+export const MissionAsset = Schema.Struct({
+  id: MissionAssetId,
+  missionId: MissionId,
+  /** The item it was attached for, when one was named. */
+  subject: Schema.NullOr(MissionRecordRef),
+  kind: Schema.Literal("image"),
+  mimeType: Schema.Literals(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+  sizeBytes: NonNegativeInt,
+  width: Schema.NullOr(PositiveInt),
+  height: Schema.NullOr(PositiveInt),
+  name: Schema.String.check(Schema.isMaxLength(120)),
+  sha256: Schema.String,
+  addedBy: MissionActor,
+  status: MissionAssetStatus,
+  version: PositiveInt,
+  createdAt: IsoDateTime,
+  changedAt: IsoDateTime,
+});
+export type MissionAsset = typeof MissionAsset.Type;
+
+/** An image from the caller's own thread attachments, or a file path on the server. */
+export const MissionAssetSource = Schema.Union([
+  Schema.TaggedStruct("attachment", { attachmentId: TrimmedNonEmptyString }),
+  Schema.TaggedStruct("file", { path: TrimmedNonEmptyString }),
+]);
+export type MissionAssetSource = typeof MissionAssetSource.Type;
+
+/** `ref.id` of the result is the asset id to put in an `assets` field. */
+export const AddMissionAssetInput = Schema.Struct({
+  missionId: MissionId,
+  source: MissionAssetSource,
+  subject: Schema.optionalKey(MissionRecordRef),
+  name: Schema.optionalKey(ViewLabel),
+});
+export type AddMissionAssetInput = typeof AddMissionAssetInput.Type;
+
+export const RemoveMissionAssetInput = Schema.Struct({
+  missionId: MissionId,
+  assetId: MissionAssetId,
+  reason: Schema.optionalKey(MissionSummaryText),
+});
+export type RemoveMissionAssetInput = typeof RemoveMissionAssetInput.Type;
+
+export const VIEW_ASSET_LIMITS = {
+  imageBytes: 10 * 1024 * 1024,
+  missionBytes: 2 * 1024 * 1024 * 1024,
+} as const;
+
+/** A section's rows, computed on the server and cut to the paths its body binds. */
+export const ViewSectionRow = Schema.Struct({
+  ref: MissionRecordRef,
+  value: Schema.Record(Schema.String, Schema.Unknown),
+});
+export type ViewSectionRow = typeof ViewSectionRow.Type;
+export const ViewSectionData = Schema.Struct({
+  sectionId: ViewSectionId,
+  rows: Schema.Array(ViewSectionRow).check(Schema.isMaxLength(20)),
+  total: NonNegativeInt,
+});
+export type ViewSectionData = typeof ViewSectionData.Type;
+// --- end views additions ---
 
 export const ViewHistoryTarget = Schema.Union([
   Schema.TaggedStruct("template", { id: ViewTemplateId }),
@@ -1377,6 +1619,12 @@ export const MissionViewsSnapshot = Schema.Struct({
    * against `layout.layout.limits.changesPerDay`. The owner is never metered.
    */
   changesToday: NonNegativeInt,
+  // --- views additions ---
+  /** Rows of the mission's active query sections. */
+  sectionData: Schema.optional(Schema.Array(ViewSectionData)),
+  /** The mission's active images. */
+  assets: Schema.optional(Schema.Array(MissionAsset)),
+  // --- end views additions ---
 });
 export type MissionViewsSnapshot = typeof MissionViewsSnapshot.Type;
 
@@ -1429,6 +1677,24 @@ const NODE_SIGNATURES: ReadonlyArray<{ tag: ViewNodeTag; signature: string; wher
     signature: "{direction: column|row, children: 1..6 nodes}",
     where: "templates, sections",
   },
+  // --- views additions ---
+  {
+    tag: "table",
+    signature:
+      "{columns: 1..5 of {label: ≤24 chars, bind: row bind, as: text|status|age|person|link|count}}",
+    where: "sections",
+  },
+  {
+    tag: "meter",
+    signature: "{value: number bind, max: number bind}",
+    where: "templates, sections",
+  },
+  {
+    tag: "gallery",
+    signature: "{bind: assets field, review: none|per-asset}",
+    where: "templates (per-asset on ask templates)",
+  },
+  // --- end views additions ---
 ];
 
 export const VIEW_CATALOG: ViewCatalog = {
@@ -1444,5 +1710,5 @@ export const VIEW_CATALOG: ViewCatalog = {
   })),
   hardLimits: VIEW_HARD_LIMITS,
   ceilings: VIEW_LIMIT_CEILINGS,
-  builtins: BUILTIN_VIEW_TEMPLATES,
+  builtins: [...BUILTIN_VIEW_TEMPLATES, ...STOCK_VIEW_TEMPLATES],
 };

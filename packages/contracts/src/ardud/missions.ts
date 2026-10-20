@@ -204,6 +204,7 @@ export const MissionRecordKind = Schema.Literals([
   "view-section",
   "view-layout",
   "view-starter-layout",
+  "view-asset",
   // --- end views additions ---
 ]);
 export type MissionRecordKind = typeof MissionRecordKind.Type;
@@ -261,6 +262,13 @@ export type ViewTemplateId = typeof ViewTemplateId.Type;
 export const ViewKey = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/));
 export type ViewKey = typeof ViewKey.Type;
 export const ViewKicker = TrimmedNonEmptyString.check(Schema.isMaxLength(24));
+// --- views additions ---
+/** A mission image (`mission-<uuid>`), served as an attachment of that id. */
+export const MissionAssetId = Schema.String.check(
+  Schema.isPattern(/^mission-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+);
+export type MissionAssetId = typeof MissionAssetId.Type;
+// --- end views additions ---
 export const ViewFieldValue = Schema.Union([
   Schema.TaggedStruct("short", { value: Schema.String.check(Schema.isMaxLength(200)) }),
   Schema.TaggedStruct("text", { value: Schema.String.check(Schema.isMaxLength(4000)) }),
@@ -271,6 +279,11 @@ export const ViewFieldValue = Schema.Union([
   Schema.TaggedStruct("refs", {
     value: Schema.Array(MissionRecordRef).check(Schema.isMaxLength(20)),
   }),
+  // --- views additions ---
+  Schema.TaggedStruct("assets", {
+    value: Schema.Array(MissionAssetId).check(Schema.isMaxLength(12)),
+  }),
+  // --- end views additions ---
 ]);
 export type ViewFieldValue = typeof ViewFieldValue.Type;
 export const ViewFields = Schema.Record(ViewKey, ViewFieldValue);
@@ -705,6 +718,23 @@ export type AskOption = typeof AskOption.Type;
 export const AskStatus = Schema.Literals(["open", "answered", "withdrawn", "superseded"]);
 export type AskStatus = typeof AskStatus.Type;
 
+// --- views additions ---
+/** The owner's review of one image: a verdict, a note, and where on it (0..1). */
+export const AssetFeedback = Schema.Struct({
+  assetId: MissionAssetId,
+  verdict: Schema.NullOr(Schema.Literals(["ok", "change"])),
+  note: Schema.String.check(Schema.isMaxLength(2000)),
+  pin: Schema.NullOr(
+    Schema.Struct({
+      x: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+      y: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+    }),
+  ),
+});
+export type AssetFeedback = typeof AssetFeedback.Type;
+export const AssetFeedbackList = Schema.Array(AssetFeedback).check(Schema.isMaxLength(40));
+// --- end views additions ---
+
 export const AskAnswer = Schema.Struct({
   optionId: Schema.NullOr(TrimmedNonEmptyString),
   text: Schema.String,
@@ -714,6 +744,10 @@ export const AskAnswer = Schema.Struct({
   /** Set when the master answered on a condition the owner stated in Discuss. */
   onOwnerCondition: Schema.optional(Schema.NullOr(OwnerCondition)),
   // --- end discuss additions ---
+  // --- views additions ---
+  /** Per-image review sent with the answer (a gallery with per-asset review). */
+  feedback: Schema.optional(AssetFeedbackList),
+  // --- end views additions ---
 });
 export type AskAnswer = typeof AskAnswer.Type;
 
@@ -929,6 +963,10 @@ export const SuggestionTargetKind = Schema.Literals([
   "lane",
   "schedule",
   "draft-note",
+  // --- views additions ---
+  /** A mission's layout; `after` is the starter version to take. */
+  "layout",
+  // --- end views additions ---
 ]);
 export type SuggestionTargetKind = typeof SuggestionTargetKind.Type;
 
@@ -1768,6 +1806,10 @@ export const MissionEventKind = Schema.Literals([
   "view.layout-restored",
   "view.starter-layout-changed",
   "view.starter-layout-restored",
+  "view.bundle-applied",
+  "view.asset-added",
+  "view.asset-removed",
+  "view.assets-expired",
   // --- end views additions ---
   "field.locked",
   "field.unlocked",
@@ -2241,6 +2283,9 @@ export const AnswerAskInput = Schema.Struct({
   /** The master answers for the owner: the owner request whose stated condition this meets. */
   onOwnerCondition: Schema.optional(OwnerCondition),
   // --- end asks additions ---
+  // --- views additions ---
+  feedback: Schema.optional(AssetFeedbackList),
+  // --- end views additions ---
 });
 export type AnswerAskInput = typeof AnswerAskInput.Type;
 

@@ -79,6 +79,7 @@ export const SUGGESTION_OWNERS: Readonly<Record<SuggestionTargetKind, string>> =
   lane: "core",
   schedule: "core",
   "draft-note": "asks",
+  layout: "views",
 };
 
 /** Applies an accepted suggestion and returns the outcome line. */

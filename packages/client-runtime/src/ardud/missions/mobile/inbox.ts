@@ -335,6 +335,7 @@ export const SUGGESTION_TARGET_LABEL: Readonly<Record<SuggestionTargetKind, stri
   lane: "Lane",
   schedule: "Schedule",
   "draft-note": "Draft note",
+  layout: "Layout",
 };
 
 export const SUGGESTION_AUTHOR_LABEL: Readonly<Record<SuggestionAuthor, string>> = {

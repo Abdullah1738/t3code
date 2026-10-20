@@ -17,6 +17,8 @@ import {
 } from "../auth.ts";
 import { MissionError, MissionId, MissionMutationResult } from "./missions.ts";
 import {
+  AddMissionAssetInput,
+  ApplyViewBundleInput,
   DefineViewTemplateInput,
   EditStarterLayoutInput,
   EditViewLayoutInput,
@@ -24,6 +26,7 @@ import {
   MissionViewsSnapshot,
   PlaceViewSectionInput,
   PreviewViewInput,
+  RemoveMissionAssetInput,
   RemoveViewInput,
   RestoreStarterLayoutInput,
   RestoreViewInput,
@@ -49,6 +52,9 @@ export const MISSIONS_VIEWS_WS_METHODS = {
   restoreLayout: "missions.views.restoreLayout",
   editStarter: "missions.views.editStarter",
   restoreStarter: "missions.views.restoreStarter",
+  applyBundle: "missions.views.applyBundle",
+  addAsset: "missions.views.addAsset",
+  removeAsset: "missions.views.removeAsset",
 } as const;
 
 const M = MISSIONS_VIEWS_WS_METHODS;
@@ -97,6 +103,9 @@ export const MissionsViewsRpcs = RpcGroup.make(
   call(M.restoreLayout, RestoreViewLayoutInput, MissionMutationResult),
   call(M.editStarter, EditStarterLayoutInput, MissionMutationResult),
   call(M.restoreStarter, RestoreStarterLayoutInput, MissionMutationResult),
+  call(M.applyBundle, ApplyViewBundleInput, MissionMutationResult),
+  call(M.addAsset, AddMissionAssetInput, MissionMutationResult),
+  call(M.removeAsset, RemoveMissionAssetInput, MissionMutationResult),
 );
 
 export const MISSIONS_VIEWS_READ_SCOPES = {
@@ -116,6 +125,9 @@ export const MISSIONS_VIEWS_GUARDED_SCOPES = {
   [M.restoreLayout]: AuthOrchestrationOperateScope,
   [M.editStarter]: AuthOrchestrationOperateScope,
   [M.restoreStarter]: AuthOrchestrationOperateScope,
+  [M.applyBundle]: AuthOrchestrationOperateScope,
+  [M.addAsset]: AuthOrchestrationOperateScope,
+  [M.removeAsset]: AuthOrchestrationOperateScope,
 } as const;
 
 export const MISSIONS_VIEWS_AGGREGATES = Object.fromEntries(
