@@ -15,7 +15,8 @@ from pathlib import Path
 
 from .common import HOME, db, kv_get, kv_set, log
 
-CTL_CFG = HOME / ".robob/ardud-control.json"
+# offbox's own component credential first, the old shared file last.
+CTL_CFGS = (HOME / ".robob/components/offbox.json", HOME / ".robob/ardud-control.json")
 OC_URL = "http://127.0.0.1:49374"
 OC_PW = HOME / ".config/opencode-service/password"
 BUN = str(HOME / ".bun/bin/bun")
@@ -24,8 +25,9 @@ TG_CLI = str(HOME / ".local/share/telegram-bridge/src/cli.ts")
 
 def ctl(method: str, path: str, body: dict | None = None, timeout: int = 10):
     """Robob control API. Returns (http_status, json); status 0 = unreachable."""
+    cfg_file = next((p for p in CTL_CFGS if p.exists()), CTL_CFGS[0])
     try:
-        cfg = json.loads(CTL_CFG.read_text())
+        cfg = json.loads(cfg_file.read_text())
     except Exception as e:  # noqa: BLE001
         return 0, {"error": f"control config unreadable: {e}"}
     url = cfg["url"].rstrip("/") + "/api/ardud/control" + path

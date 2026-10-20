@@ -48,7 +48,9 @@ def request(method, url, auth, body=None):
 
 
 def ctl(method, path, body=None):
-    cfg = read_json(HOME / ".robob/ardud-control.json", {})
+    # offbox's own component credential first, the old shared file last.
+    paths = (HOME / ".robob/components/offbox.json", HOME / ".robob/ardud-control.json")
+    cfg = read_json(next((p for p in paths if p.exists()), paths[0]), {})
     if not isinstance(cfg, dict) or not cfg.get("url") or not cfg.get("token"):
         return 0, {}
     return request(method, cfg["url"].rstrip("/") + "/api/ardud/control" + path,
