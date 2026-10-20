@@ -42,8 +42,7 @@ import {
   useMissionRooms,
   useMissionTimeline,
 } from "./missionsStore";
-import { LoadingRows } from "./sections/NeedsYou";
-import { FoldButton } from "./sections/SectionShell";
+import { FoldButton, LoadingRows } from "./sections/SectionShell";
 import { useMissionsConnection } from "./useMissionsConnection";
 
 const LINK_FOCUS =

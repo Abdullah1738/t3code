@@ -41,13 +41,8 @@ import { markMissionSeen, reactToCall } from "./missionCommands";
 import { useMissionInbox, useMissionViews, useYourRequests } from "./missionsStore";
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { PriorityStack } from "./PriorityStack";
-import {
-  LoadingRows,
-  NeedsYouSection,
-  PinnedStrip,
-  WithTheMasterSection,
-} from "./sections/NeedsYou";
-import { FoldButton, SectionCount, SectionShell } from "./sections/SectionShell";
+import { NeedsYouSection, PinnedStrip, WithTheMasterSection } from "./sections/NeedsYou";
+import { FoldButton, LoadingRows, SectionCount, SectionShell } from "./sections/SectionShell";
 import {
   RequestThread,
   unreadRequests,

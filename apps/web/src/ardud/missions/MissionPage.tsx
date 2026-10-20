@@ -23,7 +23,7 @@ import { RulesTab } from "./RulesTab";
 import { TimelineTab } from "./TimelineTab";
 import { ViewsTab } from "./ViewsTab";
 import { WorkTab } from "./WorkTab";
-import { LoadingRows } from "./sections/NeedsYou";
+import { LoadingRows } from "./sections/SectionShell";
 import { useNowMs } from "./useNowMs";
 
 /** A mission's page: header with the owner's controls, then one tab. */

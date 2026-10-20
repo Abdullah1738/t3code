@@ -55,7 +55,7 @@ import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
 import { MissionSection } from "./MissionSection";
 import { RoutingPanel } from "./RoutingPanel";
-import { LoadingRows } from "./sections/NeedsYou";
+import { LoadingRows } from "./sections/SectionShell";
 import {
   isSampleFeed,
   useDraftNotes,

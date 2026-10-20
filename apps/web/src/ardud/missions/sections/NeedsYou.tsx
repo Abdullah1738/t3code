@@ -24,7 +24,7 @@ import { entryCardState, InboxEntryCard, type EntryCardDeps } from "../InboxCard
 import { changeSection } from "../missionCommands";
 import { useDraftNotes, useMasterRoleId, useMissionList } from "../missionsStore";
 import { inboxActions } from "../useInboxScreen";
-import { FoldButton, SectionCount, SectionShell } from "./SectionShell";
+import { FoldButton, LoadingRows, SectionCount, SectionShell } from "./SectionShell";
 
 /** Cards shown before the "Show N more" fold. */
 const FIRST_CARDS = 3;
@@ -150,23 +150,6 @@ export function WithTheMasterSection(props: {
         label="With the master"
       />
     </SectionShell>
-  );
-}
-
-/** Flat grey bars in the final layout while the section loads; no shimmer. */
-export function LoadingRows() {
-  return (
-    <div aria-hidden className="flex flex-col">
-      {[0.6, 0.8, 0.5].map((width) => (
-        <div
-          key={width}
-          className="grid grid-cols-[minmax(0,1fr)_56px] gap-4 py-3.5 not-first:border-t not-first:border-(--m-rule)"
-        >
-          <span className="h-3 rounded-md bg-(--m-active)" style={{ width: `${width * 100}%` }} />
-          <span className="h-3 rounded-md bg-(--m-active)" />
-        </div>
-      ))}
-    </div>
   );
 }
 

@@ -388,23 +388,49 @@ export function SectionCount(props: {
   if (props.tone === "update") return <AnsweredMark count={props.count} label={props.label} />;
   if (props.count === 0 && !props.zero) return null;
   return (
-    <span className="text-xs text-(--m-muted) tabular-nums">
+    <span className="text-sm text-(--m-muted) tabular-nums">
       <span aria-hidden>{props.count}</span>
       <span className="sr-only">{props.label}</span>
     </span>
   );
 }
 
-/** "N more" under a list: a quiet full-width row. */
-export function FoldButton(props: { hidden: number; onShow: () => void }) {
+/**
+ * "N more" under a list: a quiet full-width row. A `label` with `expanded`
+ * makes it a toggle ("Settled 3").
+ */
+export function FoldButton(props: {
+  hidden: number;
+  onShow: () => void;
+  label?: string;
+  expanded?: boolean;
+}) {
   if (props.hidden <= 0) return null;
   return (
     <button
       type="button"
       onClick={props.onShow}
+      aria-expanded={props.expanded}
       className="flex h-9 items-center self-stretch rounded-lg text-start text-sm text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
-      {props.hidden} more
+      {props.label ?? `${props.hidden} more`}
     </button>
+  );
+}
+
+/** Flat grey bars in the final layout while the section loads; no shimmer. */
+export function LoadingRows() {
+  return (
+    <div aria-hidden className="flex flex-col">
+      {[0.6, 0.8, 0.5].map((width) => (
+        <div
+          key={width}
+          className="grid grid-cols-[minmax(0,1fr)_56px] gap-4 py-3.5 not-first:border-t not-first:border-(--m-rule)"
+        >
+          <span className="h-3 rounded-md bg-(--m-active)" style={{ width: `${width * 100}%` }} />
+          <span className="h-3 rounded-md bg-(--m-active)" />
+        </div>
+      ))}
+    </div>
   );
 }

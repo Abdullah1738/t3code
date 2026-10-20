@@ -11,7 +11,7 @@ import type {
 // Wording and grouping for the owner's requests to the master.
 
 export const REQUEST_STATUS_LABEL: Record<OwnerRequestStatus, string> = {
-  waiting: "Waiting on master",
+  waiting: "Waiting on the master",
   answered: "Answered",
   settled: "Settled",
 };
