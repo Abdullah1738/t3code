@@ -1,6 +1,6 @@
 // I/O for catalog-guard: Robob's provider cache (read-only), the OpenCode
 // service's model list, Robob's server.refreshProviders RPC, the state file.
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -8,12 +8,11 @@ const HOME = process.env.HOME || homedir();
 export const PATHS = {
   cache: process.env.CATALOG_GUARD_CACHE || join(HOME, '.robob/caches/opencode.json'),
   // catalog-guard has no component name of its own; it runs as one of the
-  // local watchers. The shared file is the last resort while it exists.
-  control: [
-    process.env.T3_CONTROL_TOKEN_FILE,
-    join(HOME, '.robob/components/watchers.json'),
-    join(HOME, '.robob/ardud-control.json'),
-  ].filter(Boolean),
+  // local watchers. A T3_CONTROL_TOKEN_FILE must exist; otherwise the shared
+  // file is the last resort while it exists.
+  control: process.env.T3_CONTROL_TOKEN_FILE
+    ? [process.env.T3_CONTROL_TOKEN_FILE]
+    : [join(HOME, '.robob/components/watchers.json'), join(HOME, '.robob/ardud-control.json')],
   ocPassword: join(HOME, '.config/opencode-service/password'),
   state: process.env.CATALOG_GUARD_STATE || join(HOME, '.local/share/catalog-guard/data/state.json'),
 };
@@ -58,7 +57,13 @@ export async function serviceSlugs({ directory = PROBE_DIRECTORY, timeoutMs = 20
 }
 
 function control() {
-  const file = PATHS.control.find((path) => existsSync(path));
+  const fromEnv = process.env.T3_CONTROL_URL && process.env.T3_CONTROL_TOKEN;
+  const file = fromEnv
+    ? undefined
+    : PATHS.control.length === 1
+      ? PATHS.control[0]
+      : PATHS.control.find((path) => existsSync(path));
+  if (file && statSync(file).mode & 0o077) throw new Error(`${file} must be chmod 600`);
   const cfg = (file && readJson(file)) ?? {};
   return {
     url: (process.env.T3_CONTROL_URL || cfg.url || 'http://127.0.0.1:3773').replace(/\/$/, ''),
