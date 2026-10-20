@@ -28,6 +28,14 @@ test('the stream-recovery credential file wins over the shared control file', ()
   );
 });
 
+test('reads its own component credential without any env, before the shared file', () => {
+  const dir = home();
+  mkdirSync(join(dir, '.robob/components'));
+  write(join(dir, '.robob/ardud-control.json'), { url: 'http://127.0.0.1:3773', token: 'shared' });
+  write(join(dir, '.robob/components/stream-recovery.json'), { url: 'http://127.0.0.1:3773', token: 'component' });
+  assert.deepEqual(controlConfig({}, dir), { url: 'http://127.0.0.1:3773', token: 'component' });
+});
+
 test('falls back to the shared control file until a credential is issued', () => {
   const dir = home();
   write(join(dir, '.robob/ardud-control.json'), { url: 'http://127.0.0.1:3773', token: 'shared' });

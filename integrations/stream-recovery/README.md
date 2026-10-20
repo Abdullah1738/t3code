@@ -94,8 +94,9 @@ also looks for those:
   once to `POST /api/ardud/missions/recovery/incident` (`reportId` = incident
   id, cut run ids and cancelled child ids per thread). Robob takes that report
   only from stream-recovery's own credential: `t3 ardud component-token issue
-  stream-recovery`, saved as `{ "url", "token" }` (chmod 600) and named by
-  `T3_CONTROL_TOKEN_FILE` in the LaunchAgent env. The reply lists which
+  stream-recovery`, saved as `{ "url", "token" }` (chmod 600) in
+  `~/.robob/components/stream-recovery.json`, or wherever
+  `T3_CONTROL_TOKEN_FILE` points. The reply lists which
   threads are mission members. Those get no note here
   and no busy hold-back (mission recovery sends its own notice, master first,
   paced), but their held queue is still released. The summary adds one line per

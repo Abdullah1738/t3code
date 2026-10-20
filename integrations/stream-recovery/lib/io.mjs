@@ -226,13 +226,15 @@ export function threadMessageIdsSince(db, threadId, sinceIso) {
 
 // ---------- Robob control API ----------
 
-// Robob's address and credential. The component credential comes first
-// (T3_CONTROL_TOKEN_FILE, from `t3 ardud component-token issue stream-recovery`),
-// then the shared ~/.robob/ardud-control.json. Mission recovery takes restart
-// reports only from the stream-recovery credential. Token files must be chmod 600.
+// Robob's address and credential: T3_CONTROL_TOKEN_FILE, then the component
+// credential ~/.robob/components/stream-recovery.json (from `t3 ardud
+// component-token issue stream-recovery`), then the shared
+// ~/.robob/ardud-control.json. Mission recovery takes restart reports only from
+// the stream-recovery credential. Token files must be chmod 600.
 export function controlConfig(env = process.env, home = HOME) {
+  const own = join(home, ".robob/components/stream-recovery.json");
   const shared = join(home, ".robob/ardud-control.json");
-  const files = [env.T3_CONTROL_TOKEN_FILE, shared].filter(Boolean);
+  const files = [env.T3_CONTROL_TOKEN_FILE, own, shared].filter(Boolean);
   let file = {};
   for (const path of env.T3_CONTROL_TOKEN && env.T3_CONTROL_URL ? [] : files) {
     let mode;
