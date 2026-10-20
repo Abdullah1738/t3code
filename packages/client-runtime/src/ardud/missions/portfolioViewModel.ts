@@ -354,4 +354,15 @@ export function newMissionInput(
   for (let n = 2; takenSlugs.includes(slug); n += 1) slug = `${base}-${n}`;
   return ok({ slug, title: name });
 }
+
+/** The order after dropping `activeId` on `overId` in the order bar; null when nothing moves. */
+export function orderBarDrop(
+  order: ReadonlyArray<MissionId>,
+  activeId: string,
+  overId: string | null,
+): SetPortfolioOrderInput | null {
+  if (overId === null || activeId === overId) return null;
+  const built = reorderPortfolioInput(order, activeId as MissionId, overId as MissionId);
+  return built.ok ? built.value : null;
+}
 // --- end finish-b ---

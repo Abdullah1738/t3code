@@ -3,10 +3,11 @@ import {
   newLaneInput,
   newMissionInput,
   newRoleInput,
+  type SetPortfolioOrderInput,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { missionsSource } from "./missionsStore";
-import { submitMissionInput } from "./missionActions";
+import { runMissionAction, submitMissionInput } from "./missionActions";
 
 // Desk page actions added in finish round B. Input checks live in the
 // client-runtime view models; these only send and report failures.
@@ -44,3 +45,7 @@ export const createRole = (missionId: MissionId, kind: RoleKind, name: string) =
     (input) => missionsSource.createRole(input),
     "Couldn't add the role",
   );
+
+/** Sends an order the order bar already checked (orderBarDrop). */
+export const reorderPortfolio = (input: SetPortfolioOrderInput) =>
+  runMissionAction(missionsSource.setPortfolioOrder(input), "Couldn't change the order");

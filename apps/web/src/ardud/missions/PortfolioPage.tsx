@@ -1,5 +1,22 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
+import {
+  closestCenter,
+  DndContext,
+  type DragEndEvent,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import { restrictToHorizontalAxis, restrictToParentElement } from "@dnd-kit/modifiers";
+import {
+  horizontalListSortingStrategy,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
 import type { MissionListItem } from "@t3tools/contracts";
 import {
@@ -10,6 +27,7 @@ import {
   laneTotal,
   portfolioBar,
   missionSlug,
+  orderBarDrop,
   portfolioChanges,
   portfolioFacts,
   portfolioPools,
@@ -18,7 +36,6 @@ import {
   type PortfolioBar,
   type PortfolioRow,
   type PortfolioSnapshot,
-  type PortfolioView,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
@@ -38,7 +55,7 @@ import { DESK_ROW, Figure, PageLine } from "./deskParts";
 import { toggleMissionPaused } from "./missionCommands";
 import { MissionSection } from "./MissionSection";
 import { useMissionList, useMissionOverview, usePortfolio } from "./missionsStore";
-import { createMission } from "./deskCommands";
+import { createMission, reorderPortfolio } from "./deskCommands";
 import { TextActionForm } from "./MissionForms";
 import { movePortfolioMission } from "./operationCommands";
 import { useNowMs } from "./useNowMs";
@@ -51,7 +68,6 @@ export function PortfolioPage() {
   const snapshot = usePortfolio();
   const list = useMissionList();
   const nowMs = useNowMs();
-  const view = useMemo(() => (snapshot ? portfolioView(snapshot) : null), [snapshot]);
   const listed = useMemo(
     () => new Map((list?.missions ?? []).map((mission) => [mission.id as string, mission])),
     [list],
@@ -76,10 +92,10 @@ export function PortfolioPage() {
             <h1 className="text-2xl leading-tight font-medium tracking-tight sm:text-3xl">
               All missions
             </h1>
-            {!snapshot || !view ? (
+            {!snapshot ? (
               <p className="text-sm text-(--m-muted)">Loading…</p>
             ) : (
-              <Portfolio snapshot={snapshot} view={view} listed={listed} nowMs={nowMs} />
+              <Portfolio snapshot={snapshot} listed={listed} nowMs={nowMs} />
             )}
           </WorkspacePageContainer>
         </ScrollArea>
@@ -90,11 +106,17 @@ export function PortfolioPage() {
 
 function Portfolio(props: {
   snapshot: PortfolioSnapshot;
-  view: PortfolioView;
   listed: ReadonlyMap<string, MissionListItem>;
   nowMs: number;
 }) {
-  const { view } = props;
+  // A dropped order shows at once and gives way to the next snapshot.
+  const [dropped, setDropped] = useState<{
+    base: PortfolioSnapshot["order"];
+    order: PortfolioSnapshot["order"];
+  } | null>(null);
+  const order =
+    dropped && dropped.base === props.snapshot.order ? dropped.order : props.snapshot.order;
+  const view = useMemo(() => portfolioView({ ...props.snapshot, order }), [props.snapshot, order]);
   const bar = portfolioBar(view);
   const pools = portfolioPools(view);
   const changes = portfolioChanges(props.snapshot);
@@ -131,7 +153,18 @@ function Portfolio(props: {
           />
         </div>
       ) : null}
-      <OrderBar bar={bar} />
+      <OrderBar
+        bar={bar}
+        onDrop={(activeId, overId) => {
+          const next = orderBarDrop(order, activeId, overId);
+          if (next === null) return;
+          const base = props.snapshot.order;
+          setDropped({ base, order: next.order });
+          void reorderPortfolio(next).then((ok) => {
+            if (!ok) setDropped(null);
+          });
+        }}
+      />
       <div className="grid items-start gap-4 lg:grid-cols-12">
         <ol className="flex min-w-0 flex-col gap-4 lg:col-span-8">
           {view.rows.map((row, index) => (
@@ -139,7 +172,7 @@ function Portfolio(props: {
               <MissionCard
                 row={row}
                 listed={props.listed.get(row.mission.missionId)}
-                order={props.snapshot.order}
+                order={order}
                 above={view.rows[index - 1]?.mission.missionId}
                 below={view.rows[index + 1]?.mission.missionId}
               />
@@ -204,45 +237,108 @@ const BAR_TONE = [
   "bg-(--m-bar-4) text-(--m-text)",
 ];
 
-/** Guaranteed shares in priority order, then the free part; a paused mission sits quiet. */
-function OrderBar(props: { bar: PortfolioBar }) {
-  const parts = [
-    ...props.bar.shares.map((share, index) => ({
-      key: share.missionId as string,
-      label: share.title,
-      share: share.share,
-      tone: share.paused ? "bg-(--m-bar-4) text-(--m-muted)" : BAR_TONE[index % BAR_TONE.length],
-    })),
-    ...(props.bar.free > 0
-      ? [
-          {
-            key: "free",
-            label: "Free",
-            share: props.bar.free,
-            tone: "bg-(--m-surface) text-(--m-muted)",
-          },
-        ]
-      : []),
-  ];
+/**
+ * Guaranteed shares in priority order, then the free part; a paused mission
+ * sits quiet. Each share drags (pointer, or Space and arrow keys) to reorder.
+ */
+function OrderBar(props: {
+  bar: PortfolioBar;
+  onDrop: (activeId: string, overId: string | null) => void;
+}) {
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const shares = props.bar.shares;
+  const titleOf = (id: string | number) =>
+    shares.find((share) => share.missionId === id)?.title ?? String(id);
+  const handleDragEnd = (event: DragEndEvent) =>
+    props.onDrop(String(event.active.id), event.over ? String(event.over.id) : null);
   return (
-    <div
-      role="img"
-      aria-label={parts.map((part) => `${part.label} ${percent(part.share)}`).join(", ")}
-      className="flex h-10 gap-0.75 overflow-hidden rounded-xl"
-    >
-      {parts.map((part) => (
-        <span
-          key={part.key}
-          style={{ flex: `${part.share} 1 0` }}
-          className={cn(
-            "flex min-w-1 items-center truncate px-3 text-xs font-medium tabular-nums",
-            part.tone,
-          )}
+    <div className="flex h-10 gap-0.75 overflow-hidden rounded-xl">
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        modifiers={[restrictToHorizontalAxis, restrictToParentElement]}
+        onDragEnd={handleDragEnd}
+        accessibility={{
+          announcements: {
+            onDragStart: ({ active }) => `Picked up ${titleOf(active.id)}.`,
+            onDragOver: ({ active, over }) =>
+              over ? `${titleOf(active.id)} is over ${titleOf(over.id)}.` : undefined,
+            onDragEnd: ({ active, over }) =>
+              over ? `${titleOf(active.id)} moved to ${titleOf(over.id)}'s place.` : undefined,
+            onDragCancel: ({ active }) => `${titleOf(active.id)} stays where it was.`,
+          },
+        }}
+      >
+        <SortableContext
+          items={shares.map((share) => share.missionId)}
+          strategy={horizontalListSortingStrategy}
         >
-          {part.share >= 0.12 ? `${part.label} ${percent(part.share)}` : null}
+          <ol aria-label="Priority order" className="contents">
+            {shares.map((share, index) => (
+              <OrderBarShare
+                key={share.missionId}
+                id={share.missionId}
+                label={share.title}
+                share={share.share}
+                position={index + 1}
+                tone={
+                  share.paused
+                    ? "bg-(--m-bar-4) text-(--m-muted)"
+                    : (BAR_TONE[index % BAR_TONE.length] ?? "")
+                }
+              />
+            ))}
+          </ol>
+        </SortableContext>
+      </DndContext>
+      {props.bar.free > 0 ? (
+        <span
+          style={{ flex: `${props.bar.free} 1 0` }}
+          className="flex min-w-1 items-center truncate bg-(--m-surface) px-3 text-xs font-medium text-(--m-muted) tabular-nums"
+        >
+          {props.bar.free >= 0.12 ? `Free ${percent(props.bar.free)}` : null}
         </span>
-      ))}
+      ) : null}
     </div>
+  );
+}
+
+function OrderBarShare(props: {
+  id: string;
+  label: string;
+  share: number;
+  position: number;
+  tone: string;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: props.id,
+  });
+  return (
+    <li
+      ref={setNodeRef}
+      style={{
+        flex: `${props.share} 1 0`,
+        transform: CSS.Translate.toString(transform),
+        transition,
+      }}
+      className={cn("flex min-w-1", isDragging && "relative z-10")}
+    >
+      <button
+        type="button"
+        {...attributes}
+        {...listeners}
+        aria-label={`${props.label} ${percent(props.share)}, position ${props.position}. Drag to reorder.`}
+        className={cn(
+          "flex min-w-0 flex-1 cursor-grab touch-pan-y items-center truncate px-3 text-xs font-medium tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset active:cursor-grabbing",
+          props.tone,
+        )}
+      >
+        {props.share >= 0.12 ? `${props.label} ${percent(props.share)}` : null}
+      </button>
+    </li>
   );
 }
 
