@@ -1,6 +1,5 @@
 import { useMemo, useReducer, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { EyeOffIcon, PinIcon } from "lucide-react";
 
 import type { MissionId } from "@t3tools/contracts";
 import {
@@ -19,14 +18,13 @@ import {
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../../components/ui/button";
-import { Skeleton } from "../../../components/ui/skeleton";
 import { CardList, CardListItem } from "../cards/CardFrame";
-import { AgeElement, ByMarker, YouGlyph } from "../cards/chips";
+import { AgeElement } from "../cards/chips";
 import { entryCardState, InboxEntryCard, type EntryCardDeps } from "../InboxCards";
 import { changeSection } from "../missionCommands";
 import { useDraftNotes, useMasterRoleId, useMissionList } from "../missionsStore";
 import { inboxActions } from "../useInboxScreen";
-import { FoldButton, SectionCount, SectionShell } from "./SectionShell";
+import { FoldButton, LoadingRows, SectionCount, SectionShell } from "./SectionShell";
 
 /** Cards shown before the "Show N more" fold. */
 const FIRST_CARDS = 3;
@@ -94,12 +92,12 @@ export function NeedsYouSection(props: {
       section={props.section}
       meta={
         entries ? (
-          <SectionCount count={entries.length} tone="update" label={`${entries.length} waiting`} />
+          <SectionCount count={entries.length} zero label={`${entries.length} waiting`} />
         ) : null
       }
       aside={
         <Button
-          size="xs"
+          size="sm"
           variant="ghost-muted"
           render={<Link to="/missions/inbox" search={{ mission: props.missionId }} />}
         >
@@ -110,7 +108,7 @@ export function NeedsYouSection(props: {
       {entries === null ? (
         <LoadingRows />
       ) : entries.length === 0 ? (
-        <p className="text-sm text-muted-foreground">Nothing needs you.</p>
+        <p className="pt-3.5 pb-1 text-sm">Nothing needs you.</p>
       ) : (
         <EntryCardList
           missionId={props.missionId}
@@ -155,21 +153,11 @@ export function WithTheMasterSection(props: {
   );
 }
 
-function LoadingRows() {
-  return (
-    <div aria-hidden className="flex flex-col gap-3">
-      <Skeleton className="h-4 w-3/5" />
-      <Skeleton className="h-4 w-4/5" />
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Pinned strip: what a hidden section would have shown, kept under the head
 
 interface PinnedRow {
   readonly key: string;
-  readonly kicker: string;
   readonly title: string;
   readonly since: string;
   /** Opens the request on the overview; inbox items open the inbox. */
@@ -199,7 +187,6 @@ export function PinnedStrip(props: {
     }
     return (props.requests ?? []).map((request) => ({
       key: request.id,
-      kicker: "Answered",
       title: request.title,
       since: request.updatedAt,
       requestId: request.id,
@@ -207,40 +194,20 @@ export function PinnedStrip(props: {
   }, [props.kind, props.inbox, props.requests]);
   if (!section || rows.length === 0) return null;
   const title = section.title;
-  // The layout's last author; a starter layout never hides a section.
-  const by = props.layout.by === "owner" ? "owner" : "master";
   return (
     <section
       aria-label={`${title}, pinned`}
-      className="grid min-w-0 gap-2 rounded-lg bg-update/8 px-3 pt-2.5 pb-3"
+      className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 rounded-xl bg-(--m-surface) py-2.5 ps-4.5 pe-2.5"
     >
-      <div className="flex min-h-7 min-w-0 items-center gap-2">
-        <PinIcon aria-hidden className="size-3.5 shrink-0 text-update-foreground" />
-        <h2 className="truncate text-sm font-semibold">{title}</h2>
-        <SectionCount count={rows.length} tone="update" label={`${rows.length} pinned`} />
-        <EyeOffIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-        <ByMarker
-          by={by}
-          label={by === "owner" ? "Section hidden by you" : "Section hidden by the master"}
-        />
-        <Button
-          size="xs"
-          variant="ghost-muted"
-          className="ms-auto"
-          onClick={() => void changeSection(props.views, section.key, { type: "restore" })}
-        >
-          Show section
-        </Button>
-      </div>
-      <ul className="grid min-w-0 grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-x-7 gap-y-1.5">
+      <h2 className="flex shrink-0 items-center gap-2 text-sm font-semibold">
+        {title}
+        <SectionCount count={rows.length} label={`${rows.length} pinned`} />
+      </h2>
+      <ul className="flex min-w-0 flex-1 flex-wrap gap-2">
         {rows.map((row) => {
           const age = ageView(row.since, props.nowMs);
           return (
-            <li
-              key={row.key}
-              className="grid min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-2"
-            >
-              <YouGlyph className="size-2.5 text-update-foreground" />
+            <li key={row.key} className="min-w-0">
               {row.requestId ? (
                 <Link
                   to="/missions/$missionId"
@@ -248,7 +215,8 @@ export function PinnedStrip(props: {
                   search={{ request: row.requestId }}
                   className={PINNED_LINK_CLASS}
                 >
-                  <PinnedLabel row={row} />
+                  <span className="min-w-0 truncate">{row.title}</span>
+                  {age ? <AgeElement age={age} at={row.since} /> : null}
                 </Link>
               ) : (
                 <Link
@@ -256,26 +224,25 @@ export function PinnedStrip(props: {
                   search={{ mission: props.missionId }}
                   className={PINNED_LINK_CLASS}
                 >
-                  <PinnedLabel row={row} />
+                  <span className="min-w-0 truncate">{row.title}</span>
+                  {age ? <AgeElement age={age} at={row.since} /> : null}
                 </Link>
               )}
-              {age ? <AgeElement age={age} at={row.since} /> : null}
             </li>
           );
         })}
       </ul>
+      <Button
+        size="sm"
+        variant="secondary"
+        className="ms-auto"
+        onClick={() => void changeSection(props.views, section.key, { type: "restore" })}
+      >
+        Show section
+      </Button>
     </section>
   );
 }
 
 const PINNED_LINK_CLASS =
-  "flex min-w-0 items-baseline gap-1.5 rounded-sm text-sm outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring";
-
-function PinnedLabel(props: { row: PinnedRow }) {
-  return (
-    <>
-      <span className="shrink-0 text-xs font-medium text-muted-foreground">{props.row.kicker}</span>
-      <span className="min-w-0 truncate">{props.row.title}</span>
-    </>
-  );
-}
+  "flex h-8 max-w-80 min-w-0 items-center gap-2.5 rounded-full bg-(--m-raised) px-3.5 text-sm outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring";

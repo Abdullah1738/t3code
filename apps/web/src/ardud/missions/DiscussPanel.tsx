@@ -4,6 +4,7 @@ import { SendIcon } from "lucide-react";
 import type { MissionId, MissionRecordRef, OwnerCondition } from "@t3tools/contracts";
 import {
   ageView,
+  discussionUnread,
   isRequestUnread,
   requestAbout,
   requestPreview,
@@ -13,10 +14,10 @@ import {
 import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
 import type { CardAction } from "./cards/CardFrame";
-import { AgeElement, StateGlyph, UnreadDot } from "./cards/chips";
+import { AgeElement, Avatar, DiscussionSymbol } from "./cards/chips";
 import { discussRecord, markRequestRead, replyRequest, settleRequest } from "./missionCommands";
 import { useOwnerRequest, useOwnerRequests } from "./missionsStore";
-import { RequestMessage, STATUS_GLYPH } from "./sections/YourRequests";
+import { RequestMessage } from "./sections/YourRequests";
 
 // Discuss on a card: an owner request about the record, kept on the record
 // (owner, 19 Oct: "Discussions stay on the item"). Closed, the card shows the
@@ -28,6 +29,8 @@ export interface CardDiscussion {
   readonly action: CardAction | null;
   /** The discussion on the card, or null when there is nothing to show. */
   readonly panel: ReactNode;
+  /** The discussion symbol with its unread count, once a discussion exists. */
+  readonly symbol: ReactNode;
 }
 
 /**
@@ -42,7 +45,7 @@ export function useCardDiscussion(
   const requests = useOwnerRequests(missionId);
   const request = requests ? requestAbout(requests, subject) : null;
   const [open, setOpen] = useState(false);
-  if (missionId === null) return { action: null, panel: null };
+  if (missionId === null) return { action: null, panel: null, symbol: null };
   const action: CardAction = {
     key: "discuss",
     label: request ? "Discussing" : "Discuss",
@@ -68,31 +71,40 @@ export function useCardDiscussion(
       />
     );
   }
-  return { action, panel };
+  const symbol = request ? <DiscussionSymbol unread={discussionUnread(request)} /> : null;
+  return { action, panel, symbol };
 }
 
-const PANEL_CLASS = "flex min-w-0 flex-col gap-2.5 rounded-lg bg-muted/50 px-3 py-2.5";
+const PANEL_CLASS =
+  "flex max-w-[72ch] min-w-0 flex-col gap-2.5 rounded-xl bg-(--m-raised) px-3.5 py-3";
 
-/** Closed: the latest line, its age and an unread mark; opens the conversation. */
+/** Closed: a raised strip with the latest reply; opens the conversation. */
 function DiscussionLine(props: { request: OwnerRequest; onOpen: () => void; nowMs: number }) {
   const { request } = props;
-  const unread = isRequestUnread(request);
   const last = request.messages.at(-1);
   const age = last ? ageView(last.at, props.nowMs) : null;
+  const count = request.messages.length;
   return (
     <button
       type="button"
-      aria-label={`Open the discussion${unread ? ", the master replied" : ""}`}
+      aria-label="Open the discussion"
       onClick={props.onOpen}
-      className="grid min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-lg bg-muted/50 px-3 py-2 text-start outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      className="grid max-w-[72ch] min-w-0 grid-cols-[22px_minmax(0,1fr)_auto] items-center gap-x-2.5 gap-y-0.5 rounded-xl bg-(--m-raised) px-3.5 py-3 text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
-      <StateGlyph kind={STATUS_GLYPH[request.status]} />
-      <span className={unread ? "truncate text-sm font-medium" : "truncate text-sm"}>
-        {requestPreview(request)}
+      <span className="row-span-2 self-start">
+        <Avatar kind="master" />
       </span>
-      <span className="inline-flex shrink-0 items-center gap-1.5">
-        {unread ? <UnreadDot label="The master replied" /> : null}
+      <span className="flex min-w-0 items-baseline gap-2 text-xs text-(--m-muted)">
+        <span className="text-sm font-semibold text-(--m-text)">Discussion</span>
+        <span className="tabular-nums">
+          {count}
+          {request.hasOlder ? "+" : ""} {count === 1 && !request.hasOlder ? "message" : "messages"}
+        </span>
         {age && last ? <AgeElement age={age} at={last.at} /> : null}
+      </span>
+      <span className="text-sm font-medium text-(--m-accent-text)">Open</span>
+      <span className="col-span-2 line-clamp-2 text-sm text-pretty text-(--m-text)">
+        {requestPreview(request)}
       </span>
     </button>
   );
@@ -200,12 +212,17 @@ function DiscussionComposer(props: {
   );
 }
 
-/** "Decided by master on your condition", with the owner's words it rests on. */
+/** The owner's own words a master decision rests on, quoted beside the owner's avatar. */
 export function ConditionNote(props: { condition: OwnerCondition }) {
   return (
-    <div className="flex min-w-0 flex-col gap-1">
-      <span className="text-xs text-muted-foreground">Decided by master on your condition</span>
-      <blockquote className="text-sm text-pretty">{`\u201c${props.condition.quote}\u201d`}</blockquote>
+    <div className="flex min-w-0 items-start gap-2">
+      <span className="pt-px">
+        <Avatar kind="you" />
+      </span>
+      <blockquote
+        aria-label="Your condition"
+        className="min-w-0 text-sm text-pretty"
+      >{`\u201c${props.condition.quote}\u201d`}</blockquote>
     </div>
   );
 }

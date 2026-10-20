@@ -28,7 +28,7 @@ export function WordDiff(props: { segments: ReadonlyArray<DiffSegment>; classNam
             {item.text}
           </del>
         ) : (
-          <ins key={key} className="bg-success/16 text-success-foreground no-underline">
+          <ins key={key} className="bg-(--m-band) text-(--m-accent-text) no-underline">
             {item.text}
           </ins>
         ),
@@ -40,12 +40,12 @@ export function WordDiff(props: { segments: ReadonlyArray<DiffSegment>; classNam
 /** A "+"/"-" line diff, as suggestions carry it. */
 export function LineDiff(props: { lines: ReadonlyArray<DiffLine> }) {
   return (
-    <pre className="overflow-x-auto rounded-md bg-muted/40 p-2 text-xs">
+    <pre className="overflow-x-auto rounded-xl bg-(--m-raised) p-2 text-xs">
       {keyed(props.lines).map(({ key, item }) => (
         <div
           key={key}
           className={cn(
-            item.kind === "added" && "text-success-foreground",
+            item.kind === "added" && "text-(--m-accent-text)",
             item.kind === "removed" && "text-destructive-foreground",
           )}
         >

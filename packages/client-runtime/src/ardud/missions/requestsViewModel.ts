@@ -11,7 +11,7 @@ import type {
 // Wording and grouping for the owner's requests to the master.
 
 export const REQUEST_STATUS_LABEL: Record<OwnerRequestStatus, string> = {
-  waiting: "Waiting on master",
+  waiting: "Waiting on the master",
   answered: "Answered",
   settled: "Settled",
 };
@@ -109,8 +109,22 @@ export function yourRequests(requests: ReadonlyArray<OwnerRequest>): ReadonlyArr
   return requests.filter((request) => !isDiscussion(request));
 }
 
-export function unreadRequestCount(requests: ReadonlyArray<OwnerRequest>): number {
-  return requests.filter(isRequestUnread).length;
+/**
+ * Unread master replies on a record's discussion: what the counter on that
+ * record's discussion symbol shows. Never part of Needs you, inbox or Your
+ * requests counts. Counts the master's messages after the owner's last one;
+ * an unread discussion whose loaded page holds none still shows one.
+ */
+export function discussionUnread(
+  request: Pick<OwnerRequest, "status" | "unread" | "messages"> | null | undefined,
+): number {
+  if (!request || !isRequestUnread(request)) return 0;
+  let count = 0;
+  for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+    if (request.messages[index]?.author !== "master") break;
+    count += 1;
+  }
+  return Math.max(count, 1);
 }
 
 export interface RequestGroups {
