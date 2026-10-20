@@ -91,7 +91,7 @@ export function PortfolioPage() {
           </WorkspaceBreadcrumb>
         </WorkspacePageHeader>
         <ScrollArea className="min-h-0 flex-1">
-          <WorkspacePageContainer width="wide" className="min-h-full gap-5">
+          <WorkspacePageContainer width="wide" className="min-h-full max-w-none gap-5 lg:px-10">
             <h1 className="text-2xl leading-tight font-medium tracking-tight sm:text-3xl">
               All missions
             </h1>
