@@ -1095,7 +1095,6 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
         Dialog.alert("The draft is too long", "Shorten the draft before adding this quote.");
         return;
       }
-      draftMessageRef.current = inserted.text;
       setComposerDraftText(draftKey, inserted.text);
       const caret = { start: inserted.caret, end: inserted.caret };
       rememberComposerDraftSelection(draftKey, inserted.text, caret);

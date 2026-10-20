@@ -7,7 +7,7 @@ import { View } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { ScreenHeader } from "../../components/ScreenHeader";
+import { AppBar } from "../../components/ui/AppBar";
 import { ItemReader } from "./ItemReader";
 import { useMissionInbox, useMissionOverview, useRoomPage } from "./missionsStore";
 import { EmptyLine } from "./parts";
@@ -78,7 +78,7 @@ function Shell(props: {
 }) {
   return (
     <View collapsable={false} className="flex-1 bg-screen">
-      <ScreenHeader title={props.title} sidebar={false} onBack={props.onBack} />
+      <AppBar title={props.title} sidebar={false} onBack={props.onBack} />
       <KeyboardAvoidingView automaticOffset behavior="height" className="flex-1">
         {props.children}
       </KeyboardAvoidingView>

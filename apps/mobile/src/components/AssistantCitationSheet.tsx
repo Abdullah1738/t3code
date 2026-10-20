@@ -3,8 +3,8 @@ import { useRef, useState } from "react";
 import { Platform, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { AppSheet } from "./AppSheet";
-import { AppText as Text, AppTextInput as TextInput } from "./AppText";
+import { Sheet } from "./ui/Sheet";
+import { AppText as Text, AppTextInput as TextInput } from "./ui/AppText";
 
 /** A quoted assistant reply in the draft. Closing the sheet keeps the comment as typed. */
 export function AssistantCitationSheet(props: {
@@ -21,7 +21,7 @@ export function AssistantCitationSheet(props: {
   const [comment, setComment] = useState(props.initialComment ?? props.citation.comment ?? "");
   const removedRef = useRef(false);
   return (
-    <AppSheet
+    <Sheet
       title="Assistant quote"
       onClose={() => {
         if (!removedRef.current) props.onClose(comment);
@@ -76,6 +76,6 @@ export function AssistantCitationSheet(props: {
           </Pressable>
         ) : null}
       </ScrollView>
-    </AppSheet>
+    </Sheet>
   );
 }

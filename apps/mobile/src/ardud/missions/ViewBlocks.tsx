@@ -25,7 +25,7 @@ import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { Modal, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { AppText as Text } from "../../components/AppText";
+import { AppText as Text } from "../../components/ui/AppText";
 import { assetImageSource } from "../../lib/assetImageSource";
 import { cn } from "../../lib/cn";
 import { useAssetUrl } from "../../state/assets";

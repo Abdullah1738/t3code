@@ -4,7 +4,7 @@ import { roomRows } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { Fragment, useState } from "react";
 import { ScrollView, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
+import { AppText as Text } from "../../components/ui/AppText";
 import { useMissionRooms } from "./missionsStore";
 import { EmptyLine, Group, Meta, Row, Separator, Title } from "./parts";
 import { RoomReader } from "./RoomReader";

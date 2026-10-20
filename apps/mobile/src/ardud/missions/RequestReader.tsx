@@ -2,7 +2,7 @@ import type { MissionId } from "@t3tools/contracts";
 import { refLabel, REQUEST_STATUS_LABEL } from "@t3tools/client-runtime/ardud/missions";
 import { ScrollView, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
+import { AppText as Text } from "../../components/ui/AppText";
 import { Conversation } from "./Discussion";
 import { ActionBar, ActionButton, Chip, EmptyLine, TextField } from "./parts";
 import { useRequestThread } from "./recordLogic";

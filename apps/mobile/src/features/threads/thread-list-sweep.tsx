@@ -15,8 +15,8 @@ import {
 import { Pressable, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 
-import { SymbolView } from "../../components/AppSymbol";
-import { AppText as Text } from "../../components/AppText";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText as Text } from "../../components/ui/AppText";
 import { ControlPillMenuPressGate } from "../../components/ControlPillMenuPressGate";
 import { RowHoverContext } from "../../components/ui/RowPressable";
 import { cn } from "../../lib/cn";
