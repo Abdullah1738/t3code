@@ -144,11 +144,13 @@ export function inboxSections(
   }));
 }
 
-/** Any inbox item by its row key, whichever tab it sits in. */
+/** Any inbox item by its row key, whichever tab and whoever it is routed to. */
 export function findEntry(inbox: MissionInboxSnapshot, key: string): InboxEntry | null {
-  for (const tab of INBOX_TABS) {
-    const found = inboxEntries(inbox, tab).find((entry) => entry.key === key);
-    if (found) return found;
+  for (const route of ["owner", "master"] as const) {
+    for (const tab of INBOX_TABS) {
+      const found = inboxEntries(inbox, tab, route).find((entry) => entry.key === key);
+      if (found) return found;
+    }
   }
   return null;
 }

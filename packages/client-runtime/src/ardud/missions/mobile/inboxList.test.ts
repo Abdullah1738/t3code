@@ -7,6 +7,7 @@ import type {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
+import { masterRoutedEntries } from "../cardViewModel.ts";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "../fixture/index.ts";
 import type { MissionInboxSnapshot, OwnerRequest } from "../source.ts";
 import {
@@ -89,6 +90,9 @@ describe("phone inbox list", () => {
     const entry = all[0]!;
     expect(findEntry(inbox, entry.key)?.key).toBe(entry.key);
     expect(findEntry(inbox, "ask:missing")).toBeNull();
+    // Items routed to the master open from the board too.
+    const routed = masterRoutedEntries(inbox)[0]!;
+    expect(findEntry(inbox, routed.key)?.key).toBe(routed.key);
     expect(entriesForMission(all, CRPKO).every((item) => item.record.missionId === CRPKO)).toBe(
       true,
     );
