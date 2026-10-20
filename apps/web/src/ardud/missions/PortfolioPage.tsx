@@ -6,6 +6,7 @@ import {
   formatDayLabel,
   formatTimeOfDay,
   healthCounts,
+  healthLabel,
   laneTotal,
   portfolioBar,
   portfolioChanges,
@@ -31,7 +32,7 @@ import { WorkspacePageContainer } from "../../components/WorkspacePageContainer"
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { cn } from "../../lib/utils";
-import { HealthGlyph, HealthStatus, needsYouLabel } from "./cards/chips";
+import { HealthGlyph, needsYouLabel } from "./cards/chips";
 import { DESK_ROW, Figure, PageLine } from "./deskParts";
 import { toggleMissionPaused } from "./missionCommands";
 import { MissionSection } from "./MissionSection";
@@ -240,8 +241,9 @@ function MissionCard(props: {
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
         {listed ? (
-          <span className="inline-flex h-6 items-center rounded-full bg-(--m-raised) px-2.5 font-medium">
-            <HealthStatus health={listed.health} paused={paused} />
+          <span className="inline-flex h-6 items-center gap-1.5 rounded-full bg-(--m-raised) px-2.5 font-medium">
+            <HealthGlyph health={listed.health} paused={paused} />
+            {paused ? "Paused" : healthLabel(listed.health)}
           </span>
         ) : null}
         <span className="text-(--m-muted)">{mission.tier}</span>
