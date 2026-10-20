@@ -34,7 +34,11 @@ const PrincipalJson = Schema.fromJsonString(
   Schema.Union([
     Schema.TaggedStruct("owner", { provenance: MissionProvenance }),
     Schema.TaggedStruct("thread", { threadId: ThreadId, title: Schema.String }),
-    Schema.TaggedStruct("session", { sessionId: Schema.String, subject: Schema.String }),
+    Schema.TaggedStruct("session", {
+      sessionId: Schema.String,
+      subject: Schema.String,
+      label: Schema.optionalKey(Schema.String),
+    }),
     Schema.TaggedStruct("mcp-client", { sessionId: Schema.String, label: Schema.String }),
   ]),
 );

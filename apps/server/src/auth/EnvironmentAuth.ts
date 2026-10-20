@@ -110,6 +110,9 @@ export interface AuthenticatedSession {
   // ardud missions: core
   /** Who minted the grant this session came from. Absent: neither the owner nor a component. */
   readonly origin?: SessionOrigins.SessionOrigin;
+  // ardud missions: router
+  /** The label the client paired with. Display only: never an authority input. */
+  readonly clientLabel?: string;
 }
 
 const serverAuthInternalErrorContext = {
@@ -826,6 +829,8 @@ export const make = Effect.gen(function* () {
         scopes: session.scopes,
         ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
         ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
+        // ardud missions: router
+        ...(session.client.label ? { clientLabel: session.client.label } : {}),
       })),
       // ardud missions: core
       Effect.flatMap(withOrigin),
@@ -1396,6 +1401,8 @@ export const make = Effect.gen(function* () {
               method: session.method,
               scopes: session.scopes,
               ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
+              // ardud missions: router
+              ...(session.client.label ? { clientLabel: session.client.label } : {}),
             })),
             // ardud missions: core
             Effect.flatMap(withOrigin),

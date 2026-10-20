@@ -32,6 +32,7 @@ export const CurrentPrincipal = Context.Reference<GuardPrincipal | undefined>(
 /** The authenticated session, typed as core's owner check reads it. */
 export type WsSession = Parameters<typeof ownerAppProvenance>[0]["session"] & {
   readonly subject: string;
+  readonly clientLabel?: string;
 };
 
 /**
@@ -45,7 +46,12 @@ export const wsPrincipal = (input: {
 }): GuardPrincipal => {
   const provenance = ownerAppProvenance(input);
   return provenance === null
-    ? { _tag: "session", sessionId: input.session.sessionId, subject: input.session.subject }
+    ? {
+        _tag: "session",
+        sessionId: input.session.sessionId,
+        subject: input.session.subject,
+        ...(input.session.clientLabel ? { label: input.session.clientLabel } : {}),
+      }
     : { _tag: "owner", provenance };
 };
 
@@ -67,12 +73,14 @@ export const provenancePrincipal = (provenance: MissionProvenance): GuardPrincip
         _tag: "session",
         sessionId: `component:${provenance.component}`,
         subject: provenance.component,
+        label: `component ${provenance.component}`,
       };
     case "import":
       return {
         _tag: "session",
         sessionId: `import:${provenance.source}`,
         subject: `import:${provenance.source}`,
+        label: `import ${provenance.source}`,
       };
   }
 };

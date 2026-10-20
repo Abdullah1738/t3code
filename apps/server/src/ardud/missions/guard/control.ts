@@ -17,6 +17,7 @@ import { requestAnswerText } from "./requests.ts";
 interface ControlSession {
   readonly sessionId: string;
   readonly subject: string;
+  readonly clientLabel?: string;
 }
 
 /** What the control API writes as. Named component identities come from core. */
@@ -35,7 +36,12 @@ export const controlPrincipal = (
   owner?: MissionProvenance | null,
 ): GuardPrincipal =>
   owner == null
-    ? { _tag: "session", sessionId: session.sessionId, subject: session.subject }
+    ? {
+        _tag: "session",
+        sessionId: session.sessionId,
+        subject: session.subject,
+        ...(session.clientLabel ? { label: session.clientLabel } : {}),
+      }
     : { _tag: "owner", provenance: owner };
 
 /**

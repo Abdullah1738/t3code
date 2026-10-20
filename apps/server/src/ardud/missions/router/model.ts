@@ -72,7 +72,13 @@ export type SendSender =
   /** An agent thread (MCP caller). */
   | { readonly _tag: "thread"; readonly threadId: ThreadId; readonly title: string }
   /** A control-API bearer session. Shared tokens make this anonymous unless registered. */
-  | { readonly _tag: "session"; readonly sessionId: string; readonly subject: string }
+  | {
+      readonly _tag: "session";
+      readonly sessionId: string;
+      readonly subject: string;
+      /** The client's own name from pairing. Display only: never grants anything. */
+      readonly label?: string;
+    }
   /** An OAuth MCP client outside Robob. */
   | { readonly _tag: "mcp-client"; readonly sessionId: string; readonly label: string }
   /**
@@ -182,7 +188,7 @@ export const senderLabel = (from: SendSender): string => {
     case "thread":
       return from.title.length > 0 ? from.title : from.threadId;
     case "session":
-      return `control API session (${from.subject})`;
+      return from.label ?? "a paired device";
     case "mcp-client":
       return `MCP client ${from.label}`;
     case "schedule":

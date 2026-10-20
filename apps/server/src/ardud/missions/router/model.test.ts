@@ -16,6 +16,7 @@ import {
   noiseFor,
   receiptFor,
   receiptRecipients,
+  senderLabel,
   wakeRequestId,
   wakeTargets,
   type Member,
@@ -146,6 +147,12 @@ describe("decideSend", () => {
         targetThreadId: master,
       })._tag,
     ).toBe("route");
+  });
+
+  it("names a session by its paired label, never its subject", () => {
+    const base = { _tag: "session", sessionId: "s1", subject: "cli-issued-session" } as const;
+    expect(senderLabel({ ...base, label: "Robob iPhone" })).toBe("Robob iPhone");
+    expect(senderLabel(base)).toBe("a paired device");
   });
 
   it("allows owner-made schedules and knocks MCP clients", () => {
