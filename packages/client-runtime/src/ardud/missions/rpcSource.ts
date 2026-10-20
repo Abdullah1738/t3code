@@ -124,18 +124,6 @@ export interface RpcMissionsSourceOptions {
 /** Every feed is live, so nothing reads as sample. */
 export const RPC_SAMPLED_FEEDS: ReadonlySet<SampledFeed> = new Set<SampledFeed>();
 
-/**
- * Mission RPCs the core track adds with the portfolio and lane nudges. Their
- * contract schemas land with that branch; until then they are called by name
- * with the shapes in `source.ts` (`PortfolioSnapshot`, `SetPortfolioOrderInput`,
- * `NudgeLaneInput`).
- */
-export const CORE_MISSIONS_METHODS = {
-  portfolio: "missions.portfolio",
-  setPortfolioOrder: "missions.setPortfolioOrder",
-  nudgeLane: "missions.nudgeLane",
-} as const;
-
 /** Work items read per `missions.workItems` page (the server's maximum). */
 const WORK_PAGE_SIZE = 500;
 /** Timeline events read per `missions.timeline` page. */
@@ -467,8 +455,6 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   const { transport } = options;
   const now = options.now ?? Date.now;
   const bus = createBus();
-  const requestByName = <T>(method: string, input: unknown) =>
-    (transport.request as unknown as (tag: string, input: unknown) => Promise<T>)(method, input);
 
   // One `missions.subscribe` stream per mission, shared by every screen.
   const missionFeed = sharedFeeds<MissionId, MissionFeedState>((missionId, emit) => {
@@ -676,7 +662,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   // Refetched whenever the mission list moves and after the owner reorders.
   const portfolioFeed = sharedFeeds<null, PortfolioSnapshot>((_, emit) => {
     const loader = refetching(
-      () => requestByName<PortfolioSnapshot>(CORE_MISSIONS_METHODS.portfolio, {}),
+      () => transport.request(WS_METHODS.missionsPortfolio, {}),
       emit,
       ignore,
     );
@@ -1258,8 +1244,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     // --- Lanes ---
 
     nudgeLane: async ({ laneId, note }) => {
-      await requestByName(
-        CORE_MISSIONS_METHODS.nudgeLane,
+      await transport.request(
+        WS_METHODS.missionsNudgeLane,
         note === undefined ? { laneId } : { laneId, note },
       );
     },
@@ -1300,7 +1286,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       bus.emit("pools");
     },
     setPortfolioOrder: async ({ order }) => {
-      await requestByName(CORE_MISSIONS_METHODS.setPortfolioOrder, { order });
+      await transport.request(WS_METHODS.missionsSetPortfolioOrder, { order });
       bus.emit("portfolio");
     },
 

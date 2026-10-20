@@ -17,12 +17,7 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
-import {
-  CORE_MISSIONS_METHODS,
-  createRpcMissionsSource,
-  poolUsageOf,
-  type MissionsTransport,
-} from "./rpcSource.ts";
+import { createRpcMissionsSource, poolUsageOf, type MissionsTransport } from "./rpcSource.ts";
 import type {
   MissionInboxSnapshot,
   MissionOverviewSnapshot,
@@ -444,13 +439,13 @@ describe("rpc missions source", () => {
   it("reads the portfolio from the server and reorders it", async () => {
     let order = [CRPKO, LIVE];
     const { transport, live, asked } = fakeTransport({
-      [CORE_MISSIONS_METHODS.portfolio]: () => ({
+      [WS_METHODS.missionsPortfolio]: () => ({
         order,
         missions: [],
         changes: [],
         orderChange: null,
       }),
-      [CORE_MISSIONS_METHODS.setPortfolioOrder]: (input: { readonly order: MissionId[] }) => {
+      [WS_METHODS.missionsSetPortfolioOrder]: (input: { readonly order: MissionId[] }) => {
         order = input.order;
         return {};
       },
@@ -466,11 +461,11 @@ describe("rpc missions source", () => {
       snapshot: { revision: 2, missions: [] },
     });
     await settle();
-    expect(asked(CORE_MISSIONS_METHODS.portfolio)).toHaveLength(2);
+    expect(asked(WS_METHODS.missionsPortfolio)).toHaveLength(2);
 
     await source.setPortfolioOrder({ order: [LIVE, CRPKO] });
     await settle();
-    expect(asked(CORE_MISSIONS_METHODS.setPortfolioOrder).at(-1)?.input).toEqual({
+    expect(asked(WS_METHODS.missionsSetPortfolioOrder).at(-1)?.input).toEqual({
       order: [LIVE, CRPKO],
     });
     expect(portfolio.last()?.order).toEqual([LIVE, CRPKO]);
@@ -618,7 +613,7 @@ describe("rpc missions source", () => {
       [WS_METHODS.missionsReactToCall]: () => ({ id: "call-1", missionId: CRPKO }),
       [ASKS.routeDraft]: () => ({}),
       [WS_METHODS.missionsRouteApproval]: () => ({ seq: 1 }),
-      [CORE_MISSIONS_METHODS.nudgeLane]: () => ({}),
+      [WS_METHODS.missionsNudgeLane]: () => ({}),
       [POLICY.handOffLane]: () => ({}),
     });
     const source = createRpcMissionsSource({ transport, now });
@@ -671,7 +666,7 @@ describe("rpc missions source", () => {
 
     await source.nudgeLane({ laneId: "lane-a" as Lane["id"], note: "go" });
     await source.nudgeLane({ laneId: "lane-a" as Lane["id"] });
-    expect(asked(CORE_MISSIONS_METHODS.nudgeLane).map((request) => request.input)).toEqual([
+    expect(asked(WS_METHODS.missionsNudgeLane).map((request) => request.input)).toEqual([
       { laneId: "lane-a", note: "go" },
       { laneId: "lane-a" },
     ]);
