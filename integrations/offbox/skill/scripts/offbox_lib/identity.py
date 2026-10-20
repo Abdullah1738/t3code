@@ -27,6 +27,8 @@ def ctl(method: str, path: str, body: dict | None = None, timeout: int = 10):
     """Robob control API. Returns (http_status, json); status 0 = unreachable."""
     cfg_file = next((p for p in CTL_CFGS if p.exists()), CTL_CFGS[0])
     try:
+        if cfg_file.stat().st_mode & 0o077:
+            raise PermissionError(f"{cfg_file} must be chmod 600")
         cfg = json.loads(cfg_file.read_text())
     except Exception as e:  # noqa: BLE001
         return 0, {"error": f"control config unreadable: {e}"}

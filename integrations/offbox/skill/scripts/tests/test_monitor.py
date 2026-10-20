@@ -210,6 +210,26 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn("fake-real-docker", result.stdout)
 
+    def test_control_credential_prefers_own_file_and_refuses_loose_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".robob/components").mkdir(parents=True)
+            shared = home / ".robob/ardud-control.json"
+            own = home / ".robob/components/offbox.json"
+            for path, token in ((shared, "shared"), (own, "own")):
+                path.write_text(json.dumps({"url": "http://127.0.0.1:1/", "token": token}))
+                path.chmod(0o600)
+            with patch.object(support, "HOME", home), \
+                    patch.object(support, "request", return_value=(200, {})) as request:
+                self.assertEqual(support.ctl("GET", "/health"), (200, {}))
+                self.assertEqual(request.call_args.args[1:3],
+                                 ("http://127.0.0.1:1/api/ardud/control/health", "Bearer own"))
+                own.chmod(0o644)
+                self.assertEqual(support.ctl("GET", "/health"), (0, {}))
+                own.unlink()
+                support.ctl("GET", "/health")
+                self.assertEqual(request.call_args.args[2], "Bearer shared")
+
 
 if __name__ == "__main__":
     unittest.main()
