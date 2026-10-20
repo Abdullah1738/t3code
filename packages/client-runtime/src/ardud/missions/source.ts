@@ -574,9 +574,27 @@ export interface MissionsSource {
     missionId: MissionId,
     listener: Listener<MissionWorkSnapshot>,
     query?: WorkQuery,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
   ): Unsubscribe;
-  subscribeRuleBook(missionId: MissionId, listener: Listener<MissionRuleBook>): Unsubscribe;
-  subscribeRoles(missionId: MissionId, listener: Listener<MissionRolesSnapshot>): Unsubscribe;
+  subscribeRuleBook(
+    missionId: MissionId,
+    listener: Listener<MissionRuleBook>,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
+  ): Unsubscribe;
+  subscribeRoles(
+    missionId: MissionId,
+    listener: Listener<MissionRolesSnapshot>,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
+  ): Unsubscribe;
   /** `null` when the mission has no review policy. */
   subscribeReviewPolicy(
     missionId: MissionId,
@@ -625,6 +643,10 @@ export interface MissionsSource {
   subscribeRooms(
     missionId: MissionId,
     listener: Listener<ReadonlyArray<MissionRoomEntry>>,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
   ): Unsubscribe;
   /**
    * The newest page of a room, kept current as messages arrive. It reaches
@@ -632,7 +654,14 @@ export interface MissionsSource {
    * read marker is on screen. Older pages come from `loadRoomPage`. `null`
    * means the room does not exist.
    */
-  subscribeRoom(roomId: RoomId, listener: Listener<RoomPage | null>): Unsubscribe;
+  subscribeRoom(
+    roomId: RoomId,
+    listener: Listener<RoomPage | null>,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
+  ): Unsubscribe;
   loadRoomPage(input: LoadRoomPageInput): Promise<RoomPage>;
 
   reorderSubMissions(input: ReorderSubMissionsInput): Promise<void>;

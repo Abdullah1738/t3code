@@ -12,6 +12,8 @@ import { type ComponentRef, useRef } from "react";
 import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
+import { FeedError } from "./FeedError";
+import { useRoomPageFeed } from "./missionsStore";
 import { useRoomScreen } from "./recordLogic";
 import {
   ActionBar,
@@ -40,10 +42,16 @@ export function RoomReader(props: {
   readonly bottomInset: number;
 }) {
   const room = useRoomScreen(props.roomId, props.masterRoleId);
+  const feed = useRoomPageFeed(props.roomId);
   const scroll = useRef<ComponentRef<typeof ScrollView>>(null);
   const placed = useRef<string | null>(null);
 
-  if (room.found === undefined) return <EmptyLine label="Loading" />;
+  if (room.found === undefined)
+    return feed.failure ? (
+      <FeedError what="the room" feed={feed} nowMs={props.nowMs} />
+    ) : (
+      <EmptyLine label="Loading" />
+    );
   if (room.found === false || room.view === null) return <EmptyLine label="This room is gone." />;
 
   const view = room.view;
@@ -68,6 +76,7 @@ export function RoomReader(props: {
           if (!hasMarker) scrollOnce(null);
         }}
       >
+        <FeedError what="the room" feed={feed} nowMs={props.nowMs} />
         {view.hasOlder ? (
           <View className="items-center py-2">
             <LinkButton

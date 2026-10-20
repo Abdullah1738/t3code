@@ -280,6 +280,52 @@ describe("rpc missions source", () => {
     again.close();
   });
 
+  // --- finish-b ---
+  it("fails the rooms, room, work, rules and roles feeds so their pages can offer Retry", async () => {
+    const offline = () => {
+      throw new MissionError({ code: "invalid", detail: "No server is connected." });
+    };
+    const { transport, live } = fakeTransport({
+      [WS_METHODS.missionsRooms]: offline,
+      [WS_METHODS.missionsRoomPage]: offline,
+      [WS_METHODS.missionsWorkItems]: offline,
+      [POLICY.roles]: offline,
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const failed: string[] = [];
+    const noop = () => {};
+    const closes = [
+      source.subscribeRooms(CRPKO, noop, () => failed.push("rooms")),
+      source.subscribeRoom(ROOM, noop, () => failed.push("room")),
+      source.subscribeWork(CRPKO, noop, {}, () => failed.push("work")),
+      source.subscribeRoles(CRPKO, noop, () => failed.push("roles")),
+      source.subscribeRuleBook(CRPKO, noop, () => failed.push("rules")),
+    ];
+    await settle();
+    for (const stream of live(ASKS.subscribeRules)) stream.fail(new Error("closed"));
+    await settle();
+    expect([...failed].sort()).toEqual(["roles", "room", "rooms", "rules", "work"]);
+    for (const close of closes) close();
+  });
+
+  it("still reads a missing room as gone, not failed", async () => {
+    const { transport } = fakeTransport({
+      [WS_METHODS.missionsRoomPage]: () => {
+        throw new MissionError({ code: "not-found", detail: "No such room." });
+      },
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const errors: unknown[] = [];
+    const page = collect<unknown>((listener) =>
+      source.subscribeRoom(ROOM, listener, (error) => errors.push(error)),
+    );
+    await settle();
+    expect(page.last()).toBeNull();
+    expect(errors).toEqual([]);
+    page.close();
+  });
+  // --- end finish-b ---
+
   it("reads recovery incidents and suggestion stats from the server", async () => {
     const incident = { id: "incident-1", missionIds: [CRPKO], threads: [] };
     const { transport, live, asked } = fakeTransport({

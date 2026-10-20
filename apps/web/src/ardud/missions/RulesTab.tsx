@@ -27,7 +27,7 @@ import {
 import { Button } from "../../components/ui/button";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { DESK_ROW, DeskChip, Figure, FoldRow, PageLine } from "./deskParts";
+import { DESK_ROW, DeskChip, FeedErrors, Figure, FoldRow, PageLine, TabLoading } from "./deskParts";
 import { submitMissionInput } from "./missionActions";
 import { PairActionForm, TextActionForm } from "./MissionForms";
 import {
@@ -36,6 +36,7 @@ import {
   useMissionLanes,
   useMissionRoles,
   useMissionRuleBook,
+  useMissionRuleBookFeed,
 } from "./missionsStore";
 import { addRule, editRule, resolveRuleChange, toggleRuleRetired } from "./operationCommands";
 import { AskMasterForm } from "./sections/SectionShell";
@@ -64,6 +65,7 @@ export function RulesTab(props: {
   nowMs: number;
 }) {
   const book = useMissionRuleBook(props.missionId);
+  const feeds = [useMissionRuleBookFeed(props.missionId)];
   const masterRoleId = useMasterRoleId(props.missionId);
   const lanes = useMissionLanes(props.missionId);
   const roles = useMissionRoles(props.missionId);
@@ -81,7 +83,8 @@ export function RulesTab(props: {
   const [adding, setAdding] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [showRetired, setShowRetired] = useState(false);
-  if (!book || !view) return <p className="text-sm text-(--m-muted)">Loading rules…</p>;
+  if (!book || !view)
+    return <TabLoading label="Loading rules…" what="the rules" feeds={feeds} nowMs={props.nowMs} />;
 
   const context: RulesContext = {
     missionId: props.missionId,
@@ -99,6 +102,7 @@ export function RulesTab(props: {
 
   return (
     <div className="flex min-w-0 flex-col gap-5">
+      <FeedErrors what="the rules" feeds={feeds} nowMs={props.nowMs} />
       <PageLine
         actions={
           <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>

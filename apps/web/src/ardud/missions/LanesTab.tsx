@@ -20,11 +20,25 @@ import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { StateGlyph, type StateGlyphKind } from "./cards/chips";
-import { DESK_ROW, Figure, FoldRow, PageLine, Segmented } from "./deskParts";
+import {
+  DESK_ROW,
+  FeedErrors,
+  Figure,
+  FoldRow,
+  PageLine,
+  Segmented,
+  TabLoading,
+} from "./deskParts";
 import { PairActionForm, PickForm, TextActionForm } from "./MissionForms";
 import { createLane } from "./deskCommands";
 import { MissionSection } from "./MissionSection";
-import { useMissionLanes, useMissionRoles, useMissionWork } from "./missionsStore";
+import {
+  useMissionLanes,
+  useMissionRoles,
+  useMissionRolesFeed,
+  useMissionWork,
+  useMissionWorkFeed,
+} from "./missionsStore";
 import {
   handOffLane,
   mergeLanes,
@@ -58,6 +72,7 @@ export function LanesTab(props: { overview: MissionOverviewSnapshot; nowMs: numb
   const lanes = useMissionLanes(missionId);
   const roles = useMissionRoles(missionId);
   const work = useMissionWork(missionId);
+  const feeds = [useMissionRolesFeed(missionId), useMissionWorkFeed(missionId)];
   const subMissions = props.overview.subMissions;
   const [grouping, setGrouping] = useState<LaneGrouping>("state");
   const [adding, setAdding] = useState(false);
@@ -73,10 +88,12 @@ export function LanesTab(props: { overview: MissionOverviewSnapshot; nowMs: numb
     return laneBoard(rows, grouping, order);
   }, [lanes, roles, work, subMissions, grouping]);
 
-  if (!board || !lanes) return <p className="text-sm text-(--m-muted)">Loading lanes…</p>;
+  if (!board || !lanes)
+    return <TabLoading label="Loading lanes…" what="the lanes" feeds={feeds} nowMs={props.nowMs} />;
   const context = { lanes, subMissions, nowMs: props.nowMs };
   return (
     <div className="flex min-w-0 flex-col gap-4">
+      <FeedErrors what="the lanes" feeds={feeds} nowMs={props.nowMs} />
       <PageLine
         actions={
           <>

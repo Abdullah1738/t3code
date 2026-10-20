@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 
 import { cn } from "../../lib/utils";
+import type { FeedState } from "./missionsStore";
+import { FeedError } from "./sections/FeedError";
 
 // Small Desk pieces the mission tabs share: the page line with its figures,
 // the segmented switch, the pill chip and the "N more" row. Colours come from
@@ -94,3 +96,27 @@ export const DESK_ROW = "border-t border-(--m-rule) first:border-t-0";
 export function PanelCount(props: { count: number }) {
   return <span className="text-xs text-(--m-muted) tabular-nums">{props.count}</span>;
 }
+
+// --- finish-b ---
+/** The Desk error line for the first of a tab's feeds whose read failed, or nothing. */
+export function FeedErrors(props: {
+  what: string;
+  feeds: ReadonlyArray<FeedState>;
+  nowMs: number;
+}) {
+  const failed = props.feeds.find((feed) => feed.failure !== undefined);
+  return failed ? <FeedError what={props.what} feed={failed} nowMs={props.nowMs} /> : null;
+}
+
+/** The tab's loading line until its data comes in, or its error line once a read failed. */
+export function TabLoading(props: {
+  label: string;
+  what: string;
+  feeds: ReadonlyArray<FeedState>;
+  nowMs: number;
+}) {
+  if (props.feeds.some((feed) => feed.failure !== undefined))
+    return <FeedErrors what={props.what} feeds={props.feeds} nowMs={props.nowMs} />;
+  return <p className="text-sm text-(--m-muted)">{props.label}</p>;
+}
+// --- end finish-b ---

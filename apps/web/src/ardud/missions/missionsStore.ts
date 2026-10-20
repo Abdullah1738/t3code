@@ -79,14 +79,14 @@ const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInboxSnap
 const routingStores = createKeyedSnapshotStores<MissionId, ApprovalRoutingTable | null>(
   (id, emit) => missionsSource.subscribeRouting(id, emit),
 );
-const workStores = createKeyedSnapshotStores<MissionId, MissionWorkSnapshot>((id, emit) =>
-  missionsSource.subscribeWork(id, emit),
+const workStores = createKeyedSnapshotStores<MissionId, MissionWorkSnapshot>((id, emit, fail) =>
+  missionsSource.subscribeWork(id, emit, {}, fail),
 );
-const ruleBookStores = createKeyedSnapshotStores<MissionId, MissionRuleBook>((id, emit) =>
-  missionsSource.subscribeRuleBook(id, emit),
+const ruleBookStores = createKeyedSnapshotStores<MissionId, MissionRuleBook>((id, emit, fail) =>
+  missionsSource.subscribeRuleBook(id, emit, fail),
 );
-const roleStores = createKeyedSnapshotStores<MissionId, MissionRolesSnapshot>((id, emit) =>
-  missionsSource.subscribeRoles(id, emit),
+const roleStores = createKeyedSnapshotStores<MissionId, MissionRolesSnapshot>((id, emit, fail) =>
+  missionsSource.subscribeRoles(id, emit, fail),
 );
 const reviewStores = createKeyedSnapshotStores<MissionId, MissionReviewSnapshot | null>(
   (id, emit) => missionsSource.subscribeReviewPolicy(id, emit),
@@ -116,10 +116,10 @@ const ruleStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Rule>>((id
   missionsSource.subscribeRules(id, emit),
 );
 const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<MissionRoomEntry>>(
-  (id, emit) => missionsSource.subscribeRooms(id, emit),
+  (id, emit, fail) => missionsSource.subscribeRooms(id, emit, fail),
 );
-const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit) =>
-  missionsSource.subscribeRoom(id, emit),
+const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit, fail) =>
+  missionsSource.subscribeRoom(id, emit, fail),
 );
 const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>((id, emit) =>
   missionsSource.subscribeViews(id, emit),
@@ -152,7 +152,7 @@ export interface FeedState {
   readonly retry: () => void;
 }
 
-function useFeedState(store: SnapshotStore<unknown>): FeedState {
+export function useFeedState(store: SnapshotStore<unknown>): FeedState {
   const failure = useSyncExternalStore(store.subscribe, store.failure);
   return useMemo(() => ({ failure, retry: store.retry }), [failure, store]);
 }
@@ -171,6 +171,28 @@ export function useOwnerRequestsFeed(missionId: MissionId | null): FeedState {
 export function useMissionTimelineFeed(missionId: MissionId): FeedState {
   return useFeedState(timelineStores(missionId));
 }
+
+// --- finish-b --- read failures of the Desk tabs' feeds; each pairs with its data hook.
+export function useMissionWorkFeed(missionId: MissionId): FeedState {
+  return useFeedState(workStores(missionId));
+}
+
+export function useMissionRuleBookFeed(missionId: MissionId): FeedState {
+  return useFeedState(ruleBookStores(missionId));
+}
+
+export function useMissionRolesFeed(missionId: MissionId): FeedState {
+  return useFeedState(roleStores(missionId));
+}
+
+export function useMissionRoomsFeed(missionId: MissionId): FeedState {
+  return useFeedState(roomListStores(missionId));
+}
+
+export function useRoomPageFeed(roomId: RoomId | null): FeedState {
+  return useFeedState(roomStores(roomId ?? NO_ROOM));
+}
+// --- end finish-b ---
 
 /**
  * Every owner request, discussions included, newest activity first. A record

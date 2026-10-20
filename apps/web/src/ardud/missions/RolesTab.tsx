@@ -25,7 +25,7 @@ import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { DESK_ROW, DeskChip, Figure, FoldRow, PageLine } from "./deskParts";
+import { DESK_ROW, DeskChip, FeedErrors, Figure, FoldRow, PageLine, TabLoading } from "./deskParts";
 import { createRole } from "./deskCommands";
 import { PickForm, PickTextForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
@@ -37,6 +37,7 @@ import {
   useMissionRecovery,
   useMissionReviewPolicy,
   useMissionRoles,
+  useMissionRolesFeed,
 } from "./missionsStore";
 import { setCriticalityGuide, setPoolCapacity, setRoleModel } from "./operationCommands";
 
@@ -51,15 +52,18 @@ const VERDICTS_SHOWN = 5;
 
 export function RolesTab(props: { missionId: MissionId; nowMs: number }) {
   const roles = useMissionRoles(props.missionId);
+  const feeds = [useMissionRolesFeed(props.missionId)];
   const masterRoleId = useMasterRoleId(props.missionId);
   const view = useMemo(
     () => (roles ? roleRegistryView(roles, masterRoleId) : null),
     [roles, masterRoleId],
   );
   const [adding, setAdding] = useState(false);
-  if (!roles || !view) return <p className="text-sm text-(--m-muted)">Loading roles…</p>;
+  if (!roles || !view)
+    return <TabLoading label="Loading roles…" what="the roles" feeds={feeds} nowMs={props.nowMs} />;
   return (
     <div className="flex min-w-0 flex-col gap-5">
+      <FeedErrors what="the roles" feeds={feeds} nowMs={props.nowMs} />
       <PageLine
         actions={
           <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>

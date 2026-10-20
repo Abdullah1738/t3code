@@ -39,10 +39,23 @@ import {
 import { Textarea } from "../../components/ui/textarea";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { DESK_ROW, DeskChip, Figure, PageLine, Segmented } from "./deskParts";
+import {
+  DESK_ROW,
+  DeskChip,
+  FeedErrors,
+  Figure,
+  PageLine,
+  Segmented,
+  TabLoading,
+} from "./deskParts";
 import { nudgePending } from "./deskCommands";
 import { MissionLinkList } from "./MissionLinkText";
-import { useMasterRoleId, useMissionRooms } from "./missionsStore";
+import {
+  useMasterRoleId,
+  useMissionRooms,
+  useMissionRoomsFeed,
+  useRoomPageFeed,
+} from "./missionsStore";
 import { RemovedRooms, RoomActions, RoomPanelView, type RoomPanel } from "./RoomTools";
 import { useRoomScreen, type RoomScreen } from "./useRoomScreen";
 
@@ -57,9 +70,11 @@ const roomTitle = (title: string) => title.replace(/^#/, "");
 
 export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; nowMs: number }) {
   const rooms = useMissionRooms(props.missionId);
+  const feeds = [useMissionRoomsFeed(props.missionId)];
   const masterRoleId = useMasterRoleId(props.missionId);
   const wide = useMediaQuery({ min: "lg" });
-  if (!rooms) return <p className="text-sm text-(--m-muted)">Loading rooms…</p>;
+  if (!rooms)
+    return <TabLoading label="Loading rooms…" what="the rooms" feeds={feeds} nowMs={props.nowMs} />;
   const groups = groupRooms(rooms);
   const summary = roomsSummary(rooms);
   // On a wide screen a room is always open: the first one until the owner picks.
@@ -67,6 +82,7 @@ export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; n
   const openEntry = rooms.find((entry) => entry.room.id === openId) ?? null;
   return (
     <div className="flex min-w-0 flex-col gap-5">
+      <FeedErrors what="the rooms" feeds={feeds} nowMs={props.nowMs} />
       <PageLine>
         {summary.messages !== null ? (
           <>
@@ -155,6 +171,7 @@ export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; n
               roomId={openId}
               masterRoleId={masterRoleId}
               messageCount={openEntry?.room.messageCount ?? null}
+              nowMs={props.nowMs}
             />
           </div>
         ) : null}
@@ -168,11 +185,14 @@ function OpenRoom(props: {
   roomId: RoomId;
   masterRoleId: string | null;
   messageCount: number | null;
+  nowMs: number;
 }) {
   const screen = useRoomScreen(props.missionId, props.roomId, props.masterRoleId);
+  const feeds = [useRoomPageFeed(props.roomId)];
   const [panel, setPanel] = useState<RoomPanel>(null);
   const { page, view } = screen;
-  if (page === undefined) return <p className="text-sm text-(--m-muted)">Loading…</p>;
+  if (page === undefined)
+    return <TabLoading label="Loading…" what="the room" feeds={feeds} nowMs={props.nowMs} />;
   if (page === null) return <p className="text-sm text-(--m-muted)">Room not found.</p>;
   const membersLine = roomMembersLine(screen.members);
   const stats = roomFigures(page.room.noise, props.messageCount);
@@ -196,6 +216,7 @@ function OpenRoom(props: {
       <h2 id="open-room-title" className="mt-2.5 text-2xl font-normal text-pretty">
         {roomTitle(page.room.title)}
       </h2>
+      <FeedErrors what="the room" feeds={feeds} nowMs={props.nowMs} />
       {stats.length > 0 ? (
         <dl className="mt-4.5 grid max-w-160 grid-cols-2 gap-3 sm:grid-cols-4">
           {stats.map((stat) => (

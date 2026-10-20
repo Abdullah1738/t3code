@@ -16,10 +16,19 @@ import {
 
 import { cn } from "../../lib/utils";
 import { StateGlyph } from "./cards/chips";
-import { DESK_ROW, DeskChip, Figure, FoldRow, PageLine, Segmented } from "./deskParts";
+import {
+  DESK_ROW,
+  DeskChip,
+  FeedErrors,
+  Figure,
+  FoldRow,
+  PageLine,
+  Segmented,
+  TabLoading,
+} from "./deskParts";
 import { MissionSection } from "./MissionSection";
 import { useMasterRoleId, useMissionOverview, useMissionReviewPolicy } from "./missionsStore";
-import { useWorkFeed } from "./useMissionFeeds";
+import { useWorkFeed, useWorkFeedState } from "./useMissionFeeds";
 
 // Work tab: open work by holder (or stage), the stage strip, chains, the last
 // finished items and the deferred register. Grouping lives in workViewModel.
@@ -38,6 +47,10 @@ const GROUPINGS = [
 export function WorkTab(props: { missionId: MissionId; nowMs: number }) {
   const open = useWorkFeed(props.missionId, OPEN_QUERY);
   const done = useWorkFeed(props.missionId, DONE_QUERY);
+  const feeds = [
+    useWorkFeedState(props.missionId, OPEN_QUERY),
+    useWorkFeedState(props.missionId, DONE_QUERY),
+  ];
   const overview = useMissionOverview(props.missionId);
   const masterRoleId = useMasterRoleId(props.missionId);
   const reviewPolicy = useMissionReviewPolicy(props.missionId);
@@ -53,10 +66,12 @@ export function WorkTab(props: { missionId: MissionId; nowMs: number }) {
     );
     return workBoard(open.items, masterRoleId, titles);
   }, [open, overview, masterRoleId]);
-  if (!board) return <p className="text-sm text-(--m-muted)">Loading work…</p>;
+  if (!board)
+    return <TabLoading label="Loading work…" what="the work" feeds={feeds} nowMs={props.nowMs} />;
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
+      <FeedErrors what="the work" feeds={feeds} nowMs={props.nowMs} />
       <PageLine
         actions={
           <Segmented label="Group by" value={grouping} options={GROUPINGS} onChange={setGrouping} />

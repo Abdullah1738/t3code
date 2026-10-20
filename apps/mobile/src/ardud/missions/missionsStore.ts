@@ -85,10 +85,10 @@ const laneStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Lane>>((id
   missionsSource().subscribeLanes(id, emit),
 );
 const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<MissionRoomEntry>>(
-  (id, emit) => missionsSource().subscribeRooms(id, emit),
+  (id, emit, fail) => missionsSource().subscribeRooms(id, emit, fail),
 );
-const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit) =>
-  missionsSource().subscribeRoom(id, emit),
+const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit, fail) =>
+  missionsSource().subscribeRoom(id, emit, fail),
 );
 const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
   (id, emit, fail) => missionsSource().subscribeRequests(id, emit, fail),
@@ -164,6 +164,18 @@ export function useMissionRooms(
   const store = missionId === null ? NONE : roomListStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
 }
+
+// --- finish-b ---
+/** Whether the room list read failed; pairs with `useMissionRooms`. */
+export function useMissionRoomsFeed(missionId: MissionId | null): FeedState {
+  return useFeedState(missionId === null ? NONE : roomListStores(missionId));
+}
+
+/** Whether the room's page read failed; pairs with `useRoomPage`. */
+export function useRoomPageFeed(roomId: RoomId): FeedState {
+  return useFeedState(roomStores(roomId));
+}
+// --- end finish-b ---
 
 /** The newest page of one room; older pages load through the source. */
 export function useRoomPage(roomId: RoomId): RoomPage | null | undefined {
