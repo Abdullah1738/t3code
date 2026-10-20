@@ -37,6 +37,24 @@ describe("discoverConfig", () => {
     NodeFS.chmodSync(file, 0o644);
     expect(() => discoverConfig({ tokenFile: file })).toThrow(/chmod 600/);
   });
+
+  it("skips token files that do not exist and uses the next one", () => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "ctl-"));
+    const file = NodePath.join(dir, "next.json");
+    NodeFS.writeFileSync(file, JSON.stringify({ url: "http://127.0.0.1:2", token: "next" }), {
+      mode: 0o600,
+    });
+    const previous = process.env.T3_CONTROL_TOKEN_FILE;
+    process.env.T3_CONTROL_TOKEN_FILE = file;
+    try {
+      expect(
+        discoverConfig({ tokenFile: NodePath.join(dir, "missing.json"), component: "x" }),
+      ).toEqual({ url: "http://127.0.0.1:2", token: "next" });
+    } finally {
+      if (previous === undefined) delete process.env.T3_CONTROL_TOKEN_FILE;
+      else process.env.T3_CONTROL_TOKEN_FILE = previous;
+    }
+  });
 });
 
 describe("ControlClient", () => {

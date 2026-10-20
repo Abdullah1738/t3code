@@ -5,7 +5,12 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-export const DEFAULT_TOKEN_FILE = NodePath.join(NodeOS.homedir(), ".robob", "ardud-control.json");
+const ROBOB_HOME = NodePath.join(NodeOS.homedir(), ".robob");
+/** The old shared credential, read last while it still exists. */
+export const SHARED_TOKEN_FILE = NodePath.join(ROBOB_HOME, "ardud-control.json");
+/** @param {string} component */
+export const componentTokenFile = (component) =>
+  NodePath.join(ROBOB_HOME, "components", `${component}.json`);
 const PREFIX = "/api/ardud/control";
 
 /**
@@ -39,35 +44,44 @@ export class ControlApiError extends Error {
 
 /**
  * Finds the base URL and token: explicit options, then T3_CONTROL_URL /
- * T3_CONTROL_TOKEN, then the token file (T3_CONTROL_TOKEN_FILE or
- * ~/.robob/ardud-control.json, which must not be readable by group or others).
- * @param {{ url?: string, token?: string, tokenFile?: string }} [options]
+ * T3_CONTROL_TOKEN, then the first token file that exists out of
+ * `tokenFile`, T3_CONTROL_TOKEN_FILE, the component's own credential
+ * (~/.robob/components/<component>.json) and the shared
+ * ~/.robob/ardud-control.json. Token files must not be readable by group or
+ * others.
+ * @param {{ url?: string, token?: string, tokenFile?: string, component?: string }} [options]
  */
 export function discoverConfig(options = {}) {
   let url = options.url ?? process.env.T3_CONTROL_URL;
   let token = options.token ?? process.env.T3_CONTROL_TOKEN;
-  if (!url || !token) {
-    const file = options.tokenFile ?? process.env.T3_CONTROL_TOKEN_FILE ?? DEFAULT_TOKEN_FILE;
+  const files = [
+    options.tokenFile,
+    process.env.T3_CONTROL_TOKEN_FILE,
+    options.component ? componentTokenFile(options.component) : undefined,
+    SHARED_TOKEN_FILE,
+  ].filter(Boolean);
+  for (const file of url && token ? [] : files) {
     let stored;
     try {
       const mode = NodeFS.statSync(file).mode & 0o077;
       if (mode !== 0) throw new Error(`${file} must be chmod 600`);
       stored = JSON.parse(NodeFS.readFileSync(file, "utf8"));
     } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+      if (error?.code === "ENOENT") continue;
+      throw error;
     }
     url ??= stored?.url;
     token ??= stored?.token;
+    break;
   }
-  if (!url)
-    throw new Error("No control URL: set T3_CONTROL_URL or write ~/.robob/ardud-control.json");
-  if (!token)
-    throw new Error("No control token: set T3_CONTROL_TOKEN or write ~/.robob/ardud-control.json");
+  const where = `set T3_CONTROL_URL / T3_CONTROL_TOKEN or write one of ${files.join(", ")}`;
+  if (!url) throw new Error(`No control URL: ${where}`);
+  if (!token) throw new Error(`No control token: ${where}`);
   return { url: url.replace(/\/+$/, ""), token };
 }
 
 export class ControlClient {
-  /** @param {{ url?: string, token?: string, tokenFile?: string, timeoutMs?: number }} [options] */
+  /** @param {{ url?: string, token?: string, tokenFile?: string, component?: string, timeoutMs?: number }} [options] */
   constructor(options = {}) {
     const { url, token } = discoverConfig(options);
     this.url = url;

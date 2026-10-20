@@ -9,7 +9,12 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 
-import { ControlApiError, DEFAULT_TOKEN_FILE, discoverConfig } from "../../control/client.mjs";
+import {
+  ControlApiError,
+  SHARED_TOKEN_FILE,
+  componentTokenFile,
+  discoverConfig,
+} from "../../control/client.mjs";
 
 const PREFIX = "/api/ardud/missions/desk";
 
@@ -59,8 +64,10 @@ through the mission_* MCP tools from the calling thread, never this CLI: HTTP
 cannot prove which thread is calling.
 
 Connection: T3_CONTROL_URL plus MISSION_TOKEN (the mission-cli component
-credential) or T3_CONTROL_TOKEN, or ${DEFAULT_TOKEN_FILE}. Only the
-mission-cli credential reads his full view and acts for him.`;
+credential) or T3_CONTROL_TOKEN, else the first file found of
+T3_CONTROL_TOKEN_FILE, ${componentTokenFile("mission-cli")} and
+${SHARED_TOKEN_FILE}. Only the mission-cli credential reads his full view
+and acts for him.`;
 
 const { values: flags, positionals } = NodeUtil.parseArgs({
   allowPositionals: true,
@@ -111,6 +118,7 @@ async function request(method, path, body) {
   const { url, token } = discoverConfig({
     url: flags.url,
     token: flags.token ?? process.env.MISSION_TOKEN,
+    component: "mission-cli",
   });
   const response = await fetch(`${url}${PREFIX}${path}`, {
     method,

@@ -4,11 +4,13 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 
-import { ControlClient, DEFAULT_TOKEN_FILE } from "./client.mjs";
+import { ControlClient, SHARED_TOKEN_FILE, componentTokenFile } from "./client.mjs";
+
+const TOKEN_FILE = componentTokenFile("t3ctl");
 
 const HELP = `t3ctl <command> [options]
 
-  login --url URL --token TOKEN        save to ~/.robob/ardud-control.json (chmod 600)
+  login --url URL --token TOKEN        save to ~/.robob/components/t3ctl.json (chmod 600)
   health                               check the connection and token
   requests [--origin O]                pending approvals and questions everywhere
   projects                             list projects
@@ -28,7 +30,8 @@ const HELP = `t3ctl <command> [options]
   set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive] [--settle|--unsettle]
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
 
-Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, or ${DEFAULT_TOKEN_FILE}.`;
+Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the first file found of
+T3_CONTROL_TOKEN_FILE, ${TOKEN_FILE} and ${SHARED_TOKEN_FILE}.`;
 
 const { values: flags, positionals } = NodeUtil.parseArgs({
   allowPositionals: true,
@@ -90,15 +93,15 @@ async function main() {
   if (command === "login") {
     const url = need(flags.url, "--url");
     const token = need(flags.token ?? process.env.T3_CONTROL_TOKEN, "--token");
-    NodeFS.mkdirSync(NodePath.dirname(DEFAULT_TOKEN_FILE), { recursive: true, mode: 0o700 });
-    NodeFS.writeFileSync(DEFAULT_TOKEN_FILE, `${JSON.stringify({ url, token }, null, 2)}\n`, {
+    NodeFS.mkdirSync(NodePath.dirname(TOKEN_FILE), { recursive: true, mode: 0o700 });
+    NodeFS.writeFileSync(TOKEN_FILE, `${JSON.stringify({ url, token }, null, 2)}\n`, {
       mode: 0o600,
     });
-    NodeFS.chmodSync(DEFAULT_TOKEN_FILE, 0o600);
-    console.log(`saved ${DEFAULT_TOKEN_FILE}`);
+    NodeFS.chmodSync(TOKEN_FILE, 0o600);
+    console.log(`saved ${TOKEN_FILE}`);
     return;
   }
-  const client = new ControlClient({ url: flags.url, token: flags.token });
+  const client = new ControlClient({ url: flags.url, token: flags.token, component: "t3ctl" });
   switch (command) {
     case "health":
       return print(await client.health());
