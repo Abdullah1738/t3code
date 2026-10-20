@@ -11,6 +11,9 @@ import {
   type ApprovalId,
   type DraftId,
   type DraftNote,
+  // --- finish-a ---
+  type InboxMark,
+  // --- end finish-a ---
   type Lane,
   type MissionActor,
   type MissionEvent,
@@ -82,6 +85,9 @@ export type MissionsStreamTag =
   | typeof ASKS.subscribeRouting
   | typeof ASKS.subscribeSuggestionStats
   | typeof ASKS.subscribeMasterInbox
+  // --- finish-a ---
+  | typeof ASKS.subscribeInboxMarks
+  // --- end finish-a ---
   | typeof VIEWS.subscribe;
 
 export type MissionsRequestTag = Exclude<EnvironmentUnaryRpcTag, MissionsStreamTag>;
@@ -149,38 +155,58 @@ const ROOM_PAGE_MAX = 200;
 
 // --- Small building blocks ---
 
+// --- finish-a ---
 /**
  * One upstream subscription per key, shared by every reader, replaying the
- * latest value to late readers and closing with the last one.
+ * latest value to late readers and closing with the last one. A failure
+ * reaches every reader's `onError` and drops the upstream, so the next
+ * subscription opens it fresh (that is how Retry works).
  */
-function sharedFeeds<K, T>(open: (key: K, emit: (value: T) => void) => Unsubscribe) {
+function sharedFeeds<K, T>(
+  open: (key: K, emit: (value: T) => void, fail: (error: unknown) => void) => Unsubscribe,
+) {
   interface Entry {
     has: boolean;
     value: T | undefined;
-    readonly listeners: Set<Listener<T>>;
+    readonly listeners: Map<Listener<T>, Listener<unknown>>;
     close: Unsubscribe;
+    failed: boolean;
   }
   const entries = new Map<K, Entry>();
-  return (key: K, listener: Listener<T>): Unsubscribe => {
+  return (key: K, listener: Listener<T>, onError: Listener<unknown> = ignore): Unsubscribe => {
     let entry = entries.get(key);
     if (entry === undefined) {
       const created: Entry = {
         has: false,
         value: undefined,
-        listeners: new Set(),
+        listeners: new Map(),
         close: () => {},
+        failed: false,
       };
       entries.set(key, created);
-      created.listeners.add(listener);
-      created.close = open(key, (value) => {
-        created.has = true;
-        created.value = value;
-        // Copied: a listener may unsubscribe or subscribe while this runs.
-        for (const each of Array.from(created.listeners)) each(value);
-      });
+      created.listeners.set(listener, onError);
+      const close = open(
+        key,
+        (value) => {
+          if (created.failed) return;
+          created.has = true;
+          created.value = value;
+          // Copied: a listener may unsubscribe or subscribe while this runs.
+          for (const each of Array.from(created.listeners.keys())) each(value);
+        },
+        (error) => {
+          if (created.failed) return;
+          created.failed = true;
+          if (entries.get(key) === created) entries.delete(key);
+          created.close();
+          for (const each of Array.from(created.listeners.values())) each(error);
+        },
+      );
+      if (created.failed) close();
+      else created.close = close;
       entry = created;
     } else {
-      entry.listeners.add(listener);
+      entry.listeners.set(listener, onError);
       if (entry.has) listener(entry.value as T);
     }
     const own = entry;
@@ -192,6 +218,7 @@ function sharedFeeds<K, T>(open: (key: K, emit: (value: T) => void) => Unsubscri
     };
   };
 }
+// --- end finish-a ---
 
 /** Re-runs a request on demand; overlapping asks collapse into one more run. */
 function refetching<T>(
@@ -692,15 +719,24 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     };
   });
 
-  const inboxFeed = sharedFeeds<MissionId | null, MissionInbox>((missionId, emit) =>
-    transport.stream(WS_METHODS.missionsInbox, { missionId }, emit),
+  // --- finish-a ---
+  const inboxFeed = sharedFeeds<MissionId | null, MissionInbox>((missionId, emit, fail) =>
+    transport.stream(WS_METHODS.missionsInbox, { missionId }, emit, fail),
   );
 
   // What waits on the master: drafts, approvals and suggestions routed to it,
   // with complete counts. Joined into every inbox snapshot.
-  const masterQueueFeed = sharedFeeds<MissionId | null, MissionMasterInbox>((missionId, emit) =>
-    transport.stream(ASKS.subscribeMasterInbox, { missionId }, emit),
+  const masterQueueFeed = sharedFeeds<MissionId | null, MissionMasterInbox>(
+    (missionId, emit, fail) =>
+      transport.stream(ASKS.subscribeMasterInbox, { missionId }, emit, fail),
   );
+
+  // The owner's comments and snoozes. Joined into every inbox snapshot.
+  const marksFeed = sharedFeeds<MissionId | null, ReadonlyArray<InboxMark>>(
+    (missionId, emit, fail) =>
+      transport.stream(ASKS.subscribeInboxMarks, { missionId }, (value) => emit(value.marks), fail),
+  );
+  // --- end finish-a ---
 
   const rulesFeed = sharedFeeds<MissionId, RuleRecords>((missionId, emit) =>
     transport.stream(
@@ -816,8 +852,9 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     bus.emit(`request:${request.id}`);
   };
 
+  // --- finish-a ---
   const requestsFeed = sharedFeeds<MissionId, ReadonlyArray<OwnerRequest>>(
-    (missionId, emit) =>
+    (missionId, emit, fail) =>
       requestFeed({
         missionId,
         load: async () =>
@@ -827,8 +864,10 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         refreshOn: kindStarts("request."),
         topics: [`requests:${missionId}`],
         emit,
+        onError: fail,
       }).stop,
   );
+  // --- end finish-a ---
 
   const requestThreadFeed = sharedFeeds<string, OwnerRequest | null>((key, emit) => {
     const [missionId, requestId] = key.split("\n") as [MissionId, OwnerRequestId];
@@ -905,27 +944,60 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       });
     },
 
+    // --- finish-a ---
     // The server's inbox carries only what is routed to the owner; the master's
-    // queue joins it so the master view and its counts are live.
-    subscribeInbox(missionId, listener) {
+    // queue and the owner's comments and snoozes join it. Any one of the three
+    // failing fails the whole snapshot once and closes the rest.
+    subscribeInbox(missionId, listener, onError) {
       let inbox: MissionInbox | undefined;
       let master: MissionMasterInbox | undefined;
+      let marks: ReadonlyArray<InboxMark> | undefined;
+      let failed = false;
       const send = () => {
-        if (inbox !== undefined) listener(withMasterInbox(inbox, master));
+        if (failed || inbox === undefined) return;
+        const joined = withMasterInbox(inbox, master);
+        listener(marks === undefined ? joined : { ...joined, marks });
       };
-      const stopInbox = inboxFeed(missionId, (value) => {
-        inbox = value;
-        send();
-      });
-      const stopMaster = masterQueueFeed(missionId, (value) => {
-        master = value;
-        send();
-      });
-      return () => {
-        stopInbox();
-        stopMaster();
+      const stops: Array<Unsubscribe> = [];
+      const stopAll = () => {
+        for (const stop of stops.splice(0)) stop();
       };
+      const fail = (error: unknown) => {
+        if (failed) return;
+        failed = true;
+        stopAll();
+        onError?.(error);
+      };
+      stops.push(
+        inboxFeed(
+          missionId,
+          (value) => {
+            inbox = value;
+            send();
+          },
+          fail,
+        ),
+        masterQueueFeed(
+          missionId,
+          (value) => {
+            master = value;
+            send();
+          },
+          fail,
+        ),
+        marksFeed(
+          missionId,
+          (value) => {
+            marks = value;
+            send();
+          },
+          fail,
+        ),
+      );
+      if (failed) stopAll();
+      return stopAll;
     },
+    // --- end finish-a ---
 
     subscribeRouting(missionId, listener) {
       let table: Parameters<typeof withChanges>[0] | undefined;
@@ -1215,6 +1287,17 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     ackNote: async (input) => {
       await transport.request(WS_METHODS.missionsAckNote, input);
     },
+    // --- finish-a ---
+    commentInboxItem: async (input) => {
+      await transport.request(ASKS.commentInboxItem, input);
+    },
+    snoozeInboxItem: async (input) => {
+      await transport.request(ASKS.snoozeInboxItem, input);
+    },
+    unsnoozeInboxItem: async (input) => {
+      await transport.request(ASKS.unsnoozeInboxItem, input);
+    },
+    // --- end finish-a ---
 
     // --- Rooms and rules ---
 
@@ -1366,7 +1449,9 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
 
     // --- Owner requests ---
 
-    subscribeRequests: (missionId, listener) => requestsFeed(missionId, listener),
+    // --- finish-a ---
+    subscribeRequests: (missionId, listener, onError) => requestsFeed(missionId, listener, onError),
+    // --- end finish-a ---
     subscribeRequest: ({ missionId, requestId }, listener) =>
       requestThreadFeed(`${missionId}\n${requestId}`, listener),
     openRequest: async ({ missionId, text, subject }) => {

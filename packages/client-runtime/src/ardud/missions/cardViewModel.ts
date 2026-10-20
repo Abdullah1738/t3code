@@ -1,6 +1,8 @@
+// @effect-diagnostics globalDate:off - Snoozed holds come back on the reader's clock.
 import type {
   Approval,
   Draft,
+  LaneCounts,
   MissionHealth,
   MissionId,
   MissionListSnapshot,
@@ -15,7 +17,7 @@ import {
   type InboxEntry,
 } from "./inboxViewModel.ts";
 import type { MissionInboxSnapshot } from "./source.ts";
-import { formatDayLabel, refLabel } from "./viewModel.ts";
+import { formatDayLabel, laneTotal, refLabel } from "./viewModel.ts";
 
 // Wording for the card frame: kickers, flags and the sub-mission link. Pure,
 // so the views track can reuse it when a template binds the same fields.
@@ -209,12 +211,30 @@ export function groupEntriesByMission(
  * drafts and approvals routed to the owner, knocks. Its length is the
  * mission's needs-you count.
  */
-export function ownerWaitingEntries(inbox: MissionInboxSnapshot): InboxEntry[] {
+export function ownerWaitingEntries(
+  inbox: MissionInboxSnapshot,
+  nowMs: number = Date.now(),
+): InboxEntry[] {
   return [
-    ...inboxEntries(inbox, "decide"),
-    ...inboxEntries(inbox, "approve"),
-    ...inboxEntries(inbox, "knocks"),
+    ...inboxEntries(inbox, "decide", "owner", nowMs),
+    ...inboxEntries(inbox, "approve", "owner", nowMs),
+    ...inboxEntries(inbox, "knocks", "owner", nowMs),
   ].sort((left, right) => left.record.createdAt.localeCompare(right.record.createdAt));
+}
+
+export const PLAN_KICKER = "Approve the plan";
+
+/**
+ * Day one: before the first plan is approved the mission has no lanes, and
+ * the master's plan (filed as an ask or an approval) is what waits on the
+ * owner. The board points at it. Null once any lane exists or no such hold waits.
+ */
+export function dayOnePlan(
+  lanes: LaneCounts,
+  waiting: ReadonlyArray<InboxEntry>,
+): InboxEntry | null {
+  if (laneTotal(lanes) > 0) return null;
+  return waiting.find((entry) => entry.kind === "ask" || entry.kind === "approval") ?? null;
 }
 
 /**

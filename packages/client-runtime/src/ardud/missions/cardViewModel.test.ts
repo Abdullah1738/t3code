@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   cardSubMission,
+  dayOnePlan,
   draftKicker,
   draftTitle,
   entryHeadline,
@@ -174,5 +175,48 @@ describe("inbox lead", () => {
       after: ` waits on you, since ${day}.`,
     });
     expect(inboxLead([])).toBeNull();
+  });
+});
+
+describe("day one", () => {
+  const entry = (kind: InboxEntry["kind"], id: string) =>
+    ({
+      kind,
+      key: `${kind}:${id}`,
+      record: { id, createdAt: "2026-10-17T08:30:00.000Z" },
+    }) as unknown as InboxEntry;
+  const noLanes = { working: 0, stuck: 0, waiting: 0, idle: 0, parked: 0 };
+
+  it("points at the master's plan while the mission has no lanes", () => {
+    const plan = entry("approval", "plan");
+    expect(dayOnePlan(noLanes, [entry("knock", "k"), plan])).toBe(plan);
+    expect(dayOnePlan(noLanes, [entry("ask", "first")])?.key).toBe("ask:first");
+    expect(dayOnePlan(noLanes, [entry("knock", "k")])).toBeNull();
+    expect(dayOnePlan({ ...noLanes, idle: 1 }, [plan])).toBeNull();
+  });
+});
+
+describe("snoozed holds", () => {
+  it("leave Needs you while snoozed and come back after", async () => {
+    const { createFixtureMissionsSource } = await import("./fixture/index.ts");
+    const source = createFixtureMissionsSource({
+      now: () => Date.parse("2026-10-17T08:33:00.000Z"),
+    });
+    let inbox: Parameters<typeof ownerWaitingEntries>[0] | undefined;
+    const stop = source.subscribeInbox(MISSION, (value) => {
+      inbox = value;
+    });
+    const first = inbox ? ownerWaitingEntries(inbox)[0] : undefined;
+    if (!inbox || !first) throw new Error("nothing waiting");
+    const before = ownerWaitingEntries(inbox).length;
+    await source.snoozeInboxItem({
+      subject: { kind: first.kind, id: first.record.id },
+      until: null,
+    });
+    expect(ownerWaitingEntries(inbox).length).toBe(before - 1);
+    expect(ownerWaitingEntries(inbox).some((entry) => entry.key === first.key)).toBe(false);
+    await source.unsnoozeInboxItem({ subject: { kind: first.kind, id: first.record.id } });
+    expect(ownerWaitingEntries(inbox).length).toBe(before);
+    stop();
   });
 });
