@@ -15,6 +15,7 @@ import {
   SubscribeRoomInput,
   TuneRoomInput,
   UpdateRoomInput,
+  CreateRoomInput, // ardud missions: router
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
@@ -148,6 +149,18 @@ const MissionUpdateRoomTool = Tool.make("mission_update_room", {
 });
 // --- end finish-b ---
 
+// --- router: createRoom ---
+const MissionCreateRoomTool = Tool.make("mission_create_room", {
+  description:
+    "As the mission's master, open a new room. Its id is `<missionId>:room:<slug>`, so a coord channel with that name (for example delivery or observe) posts into it. Asking again for a slug that exists returns that room.",
+  parameters: CreateRoomInput,
+  success: Schema.Struct({ room: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+// --- end router: createRoom ---
+
 const MissionAttentionTool = Tool.make("mission_attention", {
   description:
     "As the mission's master, messages members left unread after their one reminder. The router does not ring for them again; chase or reassign them yourself.",
@@ -243,6 +256,7 @@ export const RouterToolkit = Toolkit.make(
   annotated(MissionRoomTuningTool, "Mission room wake rules", true),
   annotated(MissionTuneRoomTool, "Tune a mission room", false),
   annotated(MissionUpdateRoomTool, "Change a mission room", false),
+  annotated(MissionCreateRoomTool, "Open a mission room", false), // ardud missions: router
   annotated(MissionAttentionTool, "Mission attention", true),
   annotated(MissionRequestsTool, "Owner requests", true),
   annotated(MissionRequestOpenTool, "Open an owner request", false),

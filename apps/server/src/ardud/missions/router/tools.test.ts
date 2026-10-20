@@ -256,6 +256,34 @@ describe("router MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("the master opens a room a coord channel can post into", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const args = { missionId, slug: "delivery", title: "Delivery" };
+      expect((yield* call("mission_create_room", laneThread, args)).isError).toBe(true);
+      const opened = yield* call("mission_create_room", masterThread, args);
+      expect(opened.structured).toMatchObject({
+        room: { id: `${missionId}:room:delivery`, kind: "custom", title: "Delivery" },
+      });
+      const again = yield* call("mission_create_room", masterThread, {
+        ...args,
+        title: "Something else",
+      });
+      expect(again.structured).toMatchObject({ room: { title: "Delivery" } });
+      const release = yield* call("mission_create_room", masterThread, {
+        missionId,
+        slug: "release",
+        title: "Ignored",
+      });
+      expect(release.structured).toMatchObject({ room: { kind: "release", title: "Release" } });
+      const badSlug = yield* Effect.exit(
+        call("mission_create_room", masterThread, { missionId, slug: "request:x", title: "x" }),
+      );
+      expect(badSlug._tag).toBe("Failure");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("only the master works owner requests through its tools", () => {
     const { layer } = toolsLayer();
     return Effect.gen(function* () {
