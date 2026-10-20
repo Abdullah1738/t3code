@@ -21,8 +21,8 @@ export type GuardPrincipal = Exclude<SendSender, { readonly _tag: "schedule" }>;
 /**
  * The principal behind the current request. Transports provide it around the
  * service calls they make (WS scheduled task RPCs, MCP schedule tools, the
- * schedule import route). Unset means an in-process caller, such as master
- * succession moving schedules, which the guard trusts.
+ * schedule import route). Unset means a trusted in-process caller; role
+ * succession sets it to whoever decided the handoff.
  */
 export const CurrentPrincipal = Context.Reference<GuardPrincipal | undefined>(
   "t3/ardud/missions/guard/CurrentPrincipal",

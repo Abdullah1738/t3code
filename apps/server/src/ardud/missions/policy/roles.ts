@@ -100,7 +100,7 @@ export const ROLE_DEFAULTS: Record<Exclude<RoleKind, "custom">, RoleDefault> = {
   },
   answerer: {
     name: "Answerer",
-    description: "Fork of the master that answers owner questions without interrupting it.",
+    description: "Answers the owner's questions in its own thread so the master keeps working.",
     modelSelection: OPUS_XHIGH,
     writesPublicText: true,
   },

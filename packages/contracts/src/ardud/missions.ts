@@ -1508,6 +1508,12 @@ export const SuccessionMove = Schema.Struct({
   moved: NonNegativeInt,
   failed: NonNegativeInt,
   supported: Schema.Boolean,
+  // --- policy additions ---
+  /** Left on the old thread because they are not this role's to move. */
+  kept: Schema.optional(NonNegativeInt),
+  /** Why something was kept, in a sentence. */
+  detail: Schema.optional(Schema.String),
+  // --- end policy additions ---
 });
 export type SuccessionMove = typeof SuccessionMove.Type;
 
@@ -1515,6 +1521,10 @@ export const SucceedRoleResult = Schema.Struct({
   ended: RoleBinding,
   binding: RoleBinding,
   moves: Schema.Array(SuccessionMove),
+  // --- policy additions ---
+  /** Set when the handoff landed but the new holder's brief did not send. */
+  briefFailure: Schema.optional(Schema.String),
+  // --- end policy additions ---
 });
 export type SucceedRoleResult = typeof SucceedRoleResult.Type;
 

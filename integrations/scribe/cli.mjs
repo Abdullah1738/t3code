@@ -7,10 +7,15 @@
 //   scribe editor --mission ID [--input FILE] [--out FILE]
 //                                                   one Opus editor pass (bottom line, FYI, feed, suggestions);
 //                                                   --out or --input keeps the reply in a file and stores nothing
-//   scribe report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--out FILE]
-//                                                   build a report from mission data; export it (scratch by default)
+//   scribe report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--out FILE] [--live]
+//                                                   build a report from mission data; export it (scratch by default;
+//                                                   the live Crpko status files only with --live)
+//   scribe watch --mission ID [--sweep-minutes 15] [--slices N]
+//                                                   a run pass whenever a lane's run settles, plus a sweep;
+//                                                   runs until stopped
 //
-// Never runs on a timer by itself; a mission schedule or a person starts it.
+// Nothing here starts itself; the cutover's LaunchAgents or a person do
+// (tmp/memory/cutover/scribe-schedules.json in the Robob checkout).
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -19,7 +24,7 @@ import { chat, EDITOR_MODEL, SCRIBE_MODEL } from './lib/model.mjs';
 import { eventsAfter, firstEventSince, openDb, threadInfo } from './lib/source.mjs';
 import { runLane } from './lib/run.mjs';
 import { localSink } from './lib/local.mjs';
-import { serverClient, serverSink } from './lib/server.mjs';
+import { controlConfig, serverClient, serverSink } from './lib/server.mjs';
 
 const SCRATCH = process.env.SCRIBE_OUT || join(process.env.TMPDIR || tmpdir(), 'opencode', 'missions-scribe');
 
@@ -83,8 +88,7 @@ async function dryRun(opts) {
   return { ...summary, out };
 }
 
-async function run(opts) {
-  const client = serverClient();
+async function run(opts, client = serverClient()) {
   const db = openDb();
   const lanes = await client.lanes(opts.mission);
   const results = [];
@@ -132,7 +136,11 @@ async function report(opts) {
   if (!opts.mission || !['update', 'daily'].includes(opts.kind)) {
     throw new Error('report needs --mission and --kind update|daily');
   }
-  const { exportDaily, exportUpdate } = await import('./lib/export.mjs');
+  const { assertWritable, exportDaily, exportUpdate } = await import('./lib/export.mjs');
+  const out = opts.out || join(SCRATCH, opts.kind === 'daily' ? 'DAILY.md' : 'OWNER-UPDATES.md');
+  const live = Boolean(opts.live);
+  // Before the server builds (and with --save keeps) a report the file would refuse.
+  assertWritable(out, { kind: opts.kind, live });
   const client = serverClient();
   const built = await client.report({
     missionId: opts.mission,
@@ -141,12 +149,43 @@ async function report(opts) {
     to: opts.to,
     save: Boolean(opts.save),
   });
-  const out = opts.out || join(SCRATCH, opts.kind === 'daily' ? 'DAILY.md' : 'OWNER-UPDATES.md');
   const written =
     opts.kind === 'update'
-      ? exportUpdate(out, built.text, { title: opts.title || opts.mission })
-      : exportDaily(out, built.text);
+      ? exportUpdate(out, built.text, { title: opts.title || opts.mission, live })
+      : exportDaily(out, built.text, { live });
   return { ...written, coversFrom: built.coversFrom, coversTo: built.coversTo, open: built.open.length };
+}
+
+async function watch(opts) {
+  if (!opts.mission) throw new Error('watch needs --mission');
+  const { watchMission } = await import('./lib/watch.mjs');
+  const config = controlConfig();
+  const client = serverClient(config);
+  const stop = new AbortController();
+  for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => stop.abort());
+  await watchMission({
+    connect: (after, signal) =>
+      fetch(`${config.url}/api/ardud/control/events?types=thread.status`, {
+        headers: {
+          authorization: `Bearer ${config.token}`,
+          accept: 'text/event-stream',
+          ...(after === undefined ? {} : { 'last-event-id': after }),
+        },
+        signal,
+      }),
+    lanes: () => client.lanes(opts.mission),
+    pass: async (reason) => {
+      const { lanes } = await run(opts, client);
+      const notes = lanes.reduce((sum, lane) => sum + (lane.notes ?? 0), 0);
+      const failed = lanes.filter((lane) => lane.error !== undefined).length;
+      log(`pass (${reason}): ${lanes.length} lane(s), ${notes} note(s)${failed ? `, ${failed} failed` : ''}`);
+      return lanes.map((lane) => lane.threadId);
+    },
+    signal: stop.signal,
+    log,
+    sweepMs: Number(opts['sweep-minutes'] || 15) * 60_000,
+  });
+  return { stopped: true };
 }
 
 const write = (path, text) => {
@@ -154,13 +193,13 @@ const write = (path, text) => {
   writeFileSync(path, text);
 };
 
-const COMMANDS = { 'dry-run': dryRun, run, editor, report };
+const COMMANDS = { 'dry-run': dryRun, run: (opts) => run(opts), editor, report, watch };
 
 const { cmd, opts } = parseArgs(process.argv.slice(2));
 const handler = COMMANDS[cmd];
 if (!handler) {
   process.stdout.write(
-    'usage: scribe run|dry-run|editor|report (see the header of cli.mjs or README.md)\n',
+    'usage: scribe run|dry-run|editor|report|watch (see the header of cli.mjs or README.md)\n',
   );
   process.exit(cmd === 'help' ? 0 : 2);
 }

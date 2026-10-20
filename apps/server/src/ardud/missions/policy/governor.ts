@@ -306,7 +306,9 @@ function belowGuaranteeSuggestion(input: GovernorInput, pressure: PoolPressure):
           (shares.find((share) => share.missionId === left.mission.id)?.weighted ?? 0) ||
         subMissionOrder(right.lane, input.subMissions) -
           subMissionOrder(left.lane, input.subMissions) ||
-        sunkWork(left.lane) - sunkWork(right.lane),
+        sunkWork(left.lane) - sunkWork(right.lane) ||
+        // Ties go by id, so the pick never depends on the order the store read them.
+        left.lane.id.localeCompare(right.lane.id),
     )[0]?.lane;
   if (!lane) return null;
   return suggestion(

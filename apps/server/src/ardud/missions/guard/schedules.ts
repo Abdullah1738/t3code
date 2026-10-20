@@ -6,7 +6,7 @@
  * becomes the task's recorded authority, which is who the runs speak as.
  *
  * The caller comes from `CurrentPrincipal`, set by the transport. Unset is an
- * in-process caller (master succession moving schedules), which passes.
+ * in-process caller, which passes.
  */
 import {
   ScheduledTaskError,
@@ -14,6 +14,7 @@ import {
   type ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import type * as SqlClient from "effect/sql/SqlClient";
 import { isSqlError } from "effect/sql/SqlError";
@@ -59,6 +60,17 @@ export const authorizeScheduleChange = (input: {
   });
 
 /**
+ * Set by role succession around the saves that move the old holder's
+ * schedules to its successor. The decider still has to pass the guard for both
+ * threads, but does not become the authority: a schedule the old holder set for
+ * itself now speaks as the successor, and one the owner or master set keeps
+ * speaking as them.
+ */
+export const SuccessionRetarget = Context.Reference<
+  { readonly from: ThreadId; readonly to: ThreadId } | undefined
+>("t3/ardud/missions/guard/SuccessionRetarget", { defaultValue: () => undefined });
+
+/**
  * What a save does to the task's recorded authority: the principal to bind,
  * `null` to clear it, or `undefined` to leave it. `withScheduleAuthority`
  * reads and binds it in the same transaction as the save, so a failed write
@@ -66,11 +78,12 @@ export const authorizeScheduleChange = (input: {
  *
  * A caller that passed the guard becomes the authority. An in-process create
  * has none, so a row left by an earlier task with the same id is cleared. An
- * in-process retarget (master succession) carries a thread's own schedule over
- * to the thread it moved to. Any other in-process save leaves the record
- * alone, so the runs keep speaking as whoever last authorized the task through
- * a transport; an in-process caller acting for someone runs as them by
- * providing `CurrentPrincipal`.
+ * in-process retarget, or the move a role succession makes (see
+ * `SuccessionRetarget`), carries a thread's own schedule over to the thread it
+ * moved to. Any other in-process save leaves the record alone, so the runs
+ * keep speaking as whoever last authorized the task through a transport; an
+ * in-process caller acting for someone runs as them by providing
+ * `CurrentPrincipal`.
  */
 export const scheduleAuthorityChange = (
   store: AuthorityStore,
@@ -83,7 +96,13 @@ export const scheduleAuthorityChange = (
   },
 ): Effect.Effect<GuardPrincipal | null | undefined> =>
   Effect.gen(function* () {
-    if (input.principal !== undefined) return input.principal;
+    const retarget = yield* SuccessionRetarget;
+    const succession =
+      retarget !== undefined &&
+      !input.created &&
+      retarget.from === input.previousThreadId &&
+      retarget.to === input.threadId;
+    if (input.principal !== undefined && !succession) return input.principal;
     if (input.created) return null;
     if (
       input.previousThreadId === null ||

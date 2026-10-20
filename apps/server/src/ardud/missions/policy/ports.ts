@@ -28,6 +28,10 @@ import * as ProcessRunner from "../../../processRunner.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { stateFromShell } from "../../control/model.ts";
 import * as AsksService from "../asks/AsksService.ts";
+import { optionalAuthorityStore } from "../guard/authority.ts";
+import { CurrentPrincipal, type GuardPrincipal } from "../guard/principal.ts";
+import { SuccessionRetarget } from "../guard/schedules.ts";
+import { checkSend } from "../router/guardHook.ts";
 import * as MissionRouter from "../router/MissionRouter.ts";
 import type { HolderThread } from "./roles.ts";
 import {
@@ -57,11 +61,25 @@ export class PolicyThreads extends Context.Service<
   }
 >()("t3/ardud/missions/policy/ports/PolicyThreads") {}
 
+/** Whose move a succession is and which of the old thread's schedules are the role's. */
+export interface SuccessionScope {
+  /** Who decided the handoff; undefined for the policy's own components and imports. */
+  readonly decider: GuardPrincipal | undefined;
+  /** Set when the old thread serves something else too, so none of its schedules move. */
+  readonly shared: string | null;
+  /** The mission's current threads: a schedule one of them set may move with the role. */
+  readonly members: ReadonlySet<ThreadId>;
+}
+
 /** Moves what a role holder owns to its successor thread. */
 export class PolicySuccession extends Context.Service<
   PolicySuccession,
   {
-    readonly move: (from: ThreadId, to: ThreadId) => Effect.Effect<ReadonlyArray<SuccessionMove>>;
+    readonly move: (
+      from: ThreadId,
+      to: ThreadId,
+      scope: SuccessionScope,
+    ) => Effect.Effect<ReadonlyArray<SuccessionMove>>;
   }
 >()("t3/ardud/missions/policy/ports/PolicySuccession") {}
 
@@ -74,11 +92,15 @@ export class PolicySuccession extends Context.Service<
 export class PolicyHandoff extends Context.Service<
   PolicyHandoff,
   {
-    /** Launches an idle thread in the project and workspace `from` works in. */
+    /**
+     * Launches an idle thread in the project and workspace `from` works in. A
+     * second launch with the same `launchId` returns the thread the first made.
+     */
     readonly launch: (input: {
       readonly from: ThreadId;
       readonly title: string;
       readonly modelSelection: ModelSelection;
+      readonly launchId: string;
     }) => Effect.Effect<ThreadId, MissionError>;
     /** Queues `text` as a system message to the thread; it runs at the next idle turn. */
     readonly brief: (
@@ -177,16 +199,63 @@ export const threadsLayer = Layer.effect(PolicyThreads, makeThreads);
 
 const decodeScheduleUpsert = Schema.decodeUnknownEffect(ScheduledTaskUpsertInput);
 
+/**
+ * Why the decider may not move schedules between the two threads, or null.
+ * Checked without side effects first, so a refused move posts no knock and
+ * leaves every schedule where it was.
+ */
+const deciderRefusal = (decider: GuardPrincipal | undefined, threads: ReadonlyArray<ThreadId>) =>
+  Effect.gen(function* () {
+    if (decider === undefined || decider._tag === "owner") return null;
+    for (const targetThreadId of threads) {
+      const decision = yield* checkSend({ path: "schedule-edit", targetThreadId, from: decider });
+      if (decision._tag !== "allow" && decision._tag !== "not-member") {
+        return `Schedules on the old thread stay there: whoever handed the role over may not edit schedules on ${targetThreadId}.`;
+      }
+    }
+    return null;
+  }).pipe(
+    Effect.catch((error) =>
+      Effect.succeed(`Schedules on the old thread stay there: ${error.detail}`),
+    ),
+  );
+
 const makeSuccession = Effect.gen(function* () {
   const schedules = yield* ScheduledTaskService.ScheduledTaskService;
+  const authority = yield* optionalAuthorityStore;
 
-  const moveSchedules = (from: ThreadId, to: ThreadId) =>
+  const moveSchedules = (from: ThreadId, to: ThreadId, scope: SuccessionScope) =>
     Effect.gen(function* () {
       const { tasks } = yield* schedules.list();
+      const bound = tasks.filter((task) => task.threadId === from);
+      const none = { what: "schedules", moved: 0, failed: 0, supported: true } as const;
+      if (bound.length === 0) return none satisfies SuccessionMove;
+      if (scope.shared !== null) {
+        return { ...none, kept: bound.length, detail: scope.shared } satisfies SuccessionMove;
+      }
+      const refusal = yield* deciderRefusal(scope.decider, [from, to]);
+      if (refusal !== null) {
+        return { ...none, kept: bound.length, detail: refusal } satisfies SuccessionMove;
+      }
       let moved = 0;
       let failed = 0;
-      for (const task of tasks) {
-        if (task.threadId !== from) continue;
+      let kept = 0;
+      for (const task of bound) {
+        const recorded = yield* Effect.result(authority.lookup("scheduled-task", task.id));
+        if (Result.isFailure(recorded)) {
+          failed += 1;
+          continue;
+        }
+        // Set by a thread outside the mission for its own reasons: not the role's.
+        const setBy = recorded.success;
+        if (
+          setBy?._tag === "thread" &&
+          setBy.threadId !== from &&
+          !scope.members.has(setBy.threadId)
+        ) {
+          kept += 1;
+          continue;
+        }
         const saved = yield* decodeScheduleUpsert({
           id: task.id,
           requireExisting: true,
@@ -201,7 +270,16 @@ const makeSuccession = Effect.gen(function* () {
           runtimeMode: task.runtimeMode,
           interactionMode: task.interactionMode,
         }).pipe(
-          Effect.flatMap((input) => schedules.upsert(input)),
+          // Saved as the decider, so the guard checks both threads for them; the
+          // retarget keeps the decider from becoming who the schedule speaks as.
+          Effect.flatMap((input) =>
+            schedules
+              .upsert(input)
+              .pipe(
+                Effect.provideService(CurrentPrincipal, scope.decider),
+                Effect.provideService(SuccessionRetarget, { from, to }),
+              ),
+          ),
           Effect.as(true),
           Effect.catch((error) =>
             Effect.logWarning("mission policy could not move a schedule", {
@@ -213,15 +291,26 @@ const makeSuccession = Effect.gen(function* () {
         if (saved) moved += 1;
         else failed += 1;
       }
-      return { what: "schedules", moved, failed, supported: true } satisfies SuccessionMove;
+      return {
+        what: "schedules",
+        moved,
+        failed,
+        supported: true,
+        ...(kept === 0
+          ? {}
+          : {
+              kept,
+              detail: `${kept} schedule(s) set by threads outside this mission stay on ${from}.`,
+            }),
+      } satisfies SuccessionMove;
     }).pipe(
       Effect.catch(() =>
         Effect.succeed<SuccessionMove>({ what: "schedules", moved: 0, failed: 1, supported: true }),
       ),
     );
 
-  const move = (from: ThreadId, to: ThreadId) =>
-    moveSchedules(from, to).pipe(
+  const move = (from: ThreadId, to: ThreadId, scope: SuccessionScope) =>
+    moveSchedules(from, to, scope).pipe(
       Effect.map((schedulesMove): ReadonlyArray<SuccessionMove> => [
         schedulesMove,
         // Subscriptions move after the succession commits (PolicyHandoff). Children
@@ -322,7 +411,7 @@ const makeHandoff = Effect.gen(function* () {
         const shell = yield* shellOf(input.from);
         const launched = yield* launcher
           .launch({
-            commandId: CommandId.make(`mission-policy:handoff:${NodeCrypto.randomUUID()}`),
+            commandId: CommandId.make(`mission-policy:handoff:${input.launchId}`),
             projectId: shell.projectId,
             title: input.title,
             modelSelection: input.modelSelection,

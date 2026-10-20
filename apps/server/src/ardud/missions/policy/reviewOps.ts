@@ -35,6 +35,7 @@ import {
   requireGovern,
   requireMission,
   resolveCaller,
+  recordsByIds,
   shortId,
   systemCaller,
   type Caller,
@@ -207,13 +208,13 @@ export const materializePolicy = (deps: PolicyDeps, missionId: MissionId) =>
 const verdictsFor = (deps: PolicyDeps, missionId: MissionId, pullRequest: PullRequestKey) =>
   Effect.gen(function* () {
     const ids = yield* deps.policyStore.reviewIds("criticality-verdict", missionId, pullRequest);
-    return ids.length === 0 ? [] : yield* deps.store.list("criticality-verdict", { ids });
+    return yield* recordsByIds(deps.store, "criticality-verdict", ids);
   });
 
 const recordsFor = (deps: PolicyDeps, missionId: MissionId, pullRequest: PullRequestKey) =>
   Effect.gen(function* () {
     const ids = yield* deps.policyStore.reviewIds("review", missionId, pullRequest);
-    return ids.length === 0 ? [] : yield* deps.store.list("review", { ids });
+    return yield* recordsByIds(deps.store, "review", ids);
   });
 
 /**

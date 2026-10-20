@@ -19,11 +19,12 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import type * as Semaphore from "effect/Semaphore";
+import * as Semaphore from "effect/Semaphore";
 
 import { actorOf } from "../core/provenance.ts";
 import type * as MissionService from "../MissionService.ts";
 import type * as MissionStore from "../store/MissionStore.ts";
+import type { MissionRecordOf, MissionStoreKind } from "../store/recordIndex.ts";
 import type * as PolicyStore from "./PolicyStore.ts";
 import type { PolicyHandoff, PolicySampler, PolicySuccession, PolicyThreads } from "./ports.ts";
 import {
@@ -47,7 +48,21 @@ export interface PolicyDeps {
   readonly handoff: PolicyHandoff["Service"] | null;
   /** Serializes read-compute-write on pools and holds. */
   readonly holdLock: Semaphore.Semaphore;
+  /** One per role: a role's successions and lane handoffs run one at a time. */
+  readonly roleLock: (roleId: RoleId) => Semaphore.Semaphore;
 }
+
+/** A lock per key, made on first use. */
+export const keyedLocks = <K>() => {
+  const locks = new Map<K, Semaphore.Semaphore>();
+  return (key: K): Semaphore.Semaphore => {
+    const known = locks.get(key);
+    if (known !== undefined) return known;
+    const lock = Semaphore.makeUnsafe(1);
+    locks.set(key, lock);
+    return lock;
+  };
+};
 
 const isMissionError = Schema.is(MissionError);
 
@@ -137,11 +152,29 @@ export const requireMission = (deps: PolicyDeps, missionId: MissionId) =>
 export const activeBindings = (deps: PolicyDeps, missionId: MissionId) =>
   deps.store.listAllInMission("role-binding", missionId, ["bound"]);
 
-/** Records by id, each read on its own, so no page limit can drop one. */
+const IDS_PER_READ = 400;
+
+/**
+ * Records by id, a few hundred per read. Each read asks for as many rows as it
+ * names ids, so no page limit can drop one.
+ */
+export const recordsByIds = <K extends MissionStoreKind>(
+  store: PolicyDeps["store"],
+  kind: K,
+  ids: ReadonlyArray<string>,
+): Effect.Effect<ReadonlyArray<MissionRecordOf<K>>, MissionError> => {
+  const unique = [...new Set(ids)];
+  const chunks: Array<Array<string>> = [];
+  for (let start = 0; start < unique.length; start += IDS_PER_READ) {
+    chunks.push(unique.slice(start, start + IDS_PER_READ));
+  }
+  return Effect.forEach(chunks, (chunk) =>
+    store.list(kind, { ids: chunk, limit: chunk.length }),
+  ).pipe(Effect.map((pages) => pages.flat()));
+};
+
 export const rolesByIds = (deps: PolicyDeps, ids: ReadonlyArray<RoleId>) =>
-  Effect.forEach([...new Set(ids)], (id) => deps.store.get("role", id)).pipe(
-    Effect.map((found) => found.flatMap((entry) => Option.toArray(entry))),
-  );
+  recordsByIds(deps.store, "role", ids);
 
 /** The roles a thread actively holds in one mission, and that mission's master role id. */
 const threadRoles = (deps: PolicyDeps, missionId: MissionId, threadId: ThreadId) =>
