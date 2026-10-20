@@ -106,10 +106,16 @@ const LINK_ICON = {
 const CHIP_CLASS =
   "inline-flex h-6 max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-full bg-(--m-raised) px-2.5 text-xs font-medium text-(--m-text)";
 
-/** A plain 24px chip: an item's kind ("Merge", "Question"). */
-export function Chip(props: { children: ReactNode }) {
+/** A plain 24px chip: an item's kind ("Merge", "Question"); `tone` colours its text. */
+export function Chip(props: { children: ReactNode; tone?: "accent" | "negative" }) {
   return (
-    <span className={CHIP_CLASS}>
+    <span
+      className={cn(
+        CHIP_CLASS,
+        props.tone === "accent" && "text-(--m-accent-text)",
+        props.tone === "negative" && "text-(--m-negative)",
+      )}
+    >
       <span className="min-w-0 truncate">{props.children}</span>
     </span>
   );

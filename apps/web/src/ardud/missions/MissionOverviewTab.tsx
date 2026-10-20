@@ -10,11 +10,11 @@ import {
 } from "@t3tools/contracts";
 import {
   ageView,
+  clockOrDay,
   criticalPathView,
   directionCheckRows,
   formatCountdown,
   formatDayLabel,
-  formatRelative,
   isDraftFeedItem,
   orderBlockerGroups,
   ownerWaitingEntries,
@@ -35,7 +35,7 @@ import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
 import { BoardLead, LanesPanel, RestartNotice } from "./BoardPanels";
-import { AgeElement, ByMarker, PersonChip, RefChip, StateGlyph } from "./cards/chips";
+import { AgeElement, ByMarker, Chip, PersonChip, RefChip, StateGlyph } from "./cards/chips";
 import { useCardDiscussion } from "./DiscussPanel";
 import { markMissionSeen, reactToCall } from "./missionCommands";
 import { useMissionInbox, useMissionViews, useYourRequests } from "./missionsStore";
@@ -288,20 +288,17 @@ function SubMissionsSection(
 // ---------------------------------------------------------------------------
 // Since you last looked: the master's calls to check, then the feed
 
-const FEED_GLYPH = {
-  shipped: "done",
-  decided: "ok",
-  blocked: "bad",
-  milestone: "risk",
-  note: "idle",
-} as const;
-
 const FEED_KIND_LABEL: Record<FeedItem["kind"], string> = {
-  shipped: "Shipped",
-  decided: "Decided",
-  blocked: "Blocked",
-  milestone: "Milestone",
-  note: "Note",
+  shipped: "shipped",
+  decided: "decision",
+  blocked: "blocker",
+  milestone: "milestone",
+  note: "note",
+};
+
+const FEED_KIND_TONE: Partial<Record<FeedItem["kind"], "accent" | "negative">> = {
+  decided: "accent",
+  blocked: "negative",
 };
 
 /** Feed rows shown before the fold. */
@@ -332,15 +329,15 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
       section={props.section}
       meta={
         looked ? (
-          <time dateTime={looked} className="text-xs text-(--m-muted) tabular-nums">
-            {formatRelative(looked, nowMs)}
+          <time dateTime={looked} className="text-sm text-(--m-muted) tabular-nums">
+            {clockOrDay(looked, nowMs)}
           </time>
         ) : null
       }
       aside={
         sections.fresh.length > 0 || calls.length > 0 ? (
           <Button
-            size="xs"
+            size="sm"
             variant="ghost-muted"
             onClick={() => void markMissionSeen(overview.mission.id)}
           >
@@ -362,7 +359,7 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
         </ul>
       ) : null}
       {rows.length > 0 ? (
-        <ul aria-label="Feed" className="flex min-w-0 flex-col gap-1.5">
+        <ul aria-label="Feed" className="mt-1 flex min-w-0 flex-col">
           {rows.map((item) => (
             <FeedRow
               key={`${item.at}-${item.ref ? refKey(item.ref) : item.summary}`}
@@ -433,28 +430,25 @@ function CallRow(props: { row: DirectionCheckRow; missionId: MissionId; nowMs: n
 function FeedRow(props: { item: FeedItem; missionId: string; nowMs: number }) {
   const { item } = props;
   return (
-    <li className="grid min-w-0 grid-cols-[44px_14px_minmax(0,1fr)] items-baseline gap-x-2">
+    <li className="grid min-w-0 grid-cols-[44px_minmax(0,1fr)_auto] items-baseline gap-x-3 gap-y-px py-2.25 not-first:border-t not-first:border-(--m-rule)">
       <time dateTime={item.at} className="text-xs text-(--m-muted) tabular-nums">
-        {formatRelative(item.at, props.nowMs)}
+        {clockOrDay(item.at, props.nowMs)}
       </time>
-      <span className="translate-y-0.5">
-        <StateGlyph kind={FEED_GLYPH[item.kind]} label={FEED_KIND_LABEL[item.kind]} />
+      <span className="min-w-0 text-sm max-sm:line-clamp-2 sm:truncate">{item.summary}</span>
+      <span className="row-span-2 self-center">
+        <Chip {...(FEED_KIND_TONE[item.kind] ? { tone: FEED_KIND_TONE[item.kind] } : {})}>
+          {FEED_KIND_LABEL[item.kind]}
+        </Chip>
       </span>
-      <span className="min-w-0 text-sm text-pretty">
-        {item.summary}
-        {isDraftFeedItem(item) ? (
-          <>
-            {" "}
-            <Link
-              to="/missions/inbox"
-              search={{ mission: props.missionId }}
-              className="rounded-sm text-xs whitespace-nowrap text-(--m-accent-text) underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-            >
-              Review draft
-            </Link>
-          </>
-        ) : null}
-      </span>
+      {isDraftFeedItem(item) ? (
+        <Link
+          to="/missions/inbox"
+          search={{ mission: props.missionId }}
+          className="col-start-2 justify-self-start rounded-sm text-xs text-(--m-accent-text) underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          Review draft
+        </Link>
+      ) : null}
     </li>
   );
 }

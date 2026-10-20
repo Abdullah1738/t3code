@@ -12,6 +12,7 @@ import {
   boardFacts,
   boardFigures,
   boardGreeting,
+  clockOrDay,
   dayBinHeight,
   dayLine,
   laneBars,
@@ -234,6 +235,11 @@ describe("day line", () => {
 
   it("starts the day at local midnight", () => {
     expect(startOfLocalDay(NOW)).toBe(local(0).getTime());
+  });
+
+  it("names a moment today by its clock time and an earlier one by its day", () => {
+    expect(clockOrDay(iso(4, 20), NOW)).toBe("04:20");
+    expect(clockOrDay(iso(23, 5, 18), NOW)).toBe("Sun 18 Oct");
   });
 });
 

@@ -137,12 +137,15 @@ function sinceStart(ownerLastLookedAt: string | null, nowMs: number): number {
   return ownerLastLookedAt === null ? startOfLocalDay(nowMs) : Date.parse(ownerLastLookedAt);
 }
 
+/** "04:20" for a moment today, "Sun 18 Oct" for an earlier day. */
+export function clockOrDay(atIso: string, nowMs: number): string {
+  return Date.parse(atIso) >= startOfLocalDay(nowMs)
+    ? formatTimeOfDay(atIso)
+    : formatDayLabel(atIso);
+}
+
 function sinceLabel(ownerLastLookedAt: string | null, nowMs: number): string {
-  if (ownerLastLookedAt === null) return "Today";
-  const lookedMs = Date.parse(ownerLastLookedAt);
-  return lookedMs >= startOfLocalDay(nowMs)
-    ? `Since ${formatTimeOfDay(ownerLastLookedAt)}`
-    : `Since ${formatDayLabel(ownerLastLookedAt)}`;
+  return ownerLastLookedAt === null ? "Today" : `Since ${clockOrDay(ownerLastLookedAt, nowMs)}`;
 }
 
 const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
