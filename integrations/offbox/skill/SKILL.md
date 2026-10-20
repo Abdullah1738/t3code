@@ -1,0 +1,217 @@
+---
+name: remote-compute
+description: Use for any heavy test suite, dependency install, build or Docker/compose/testcontainers work - it runs on a boat.dev VM via `offbox run -- <cmd>`, not on Abdullah's Mac.
+---
+
+# remote-compute: heavy work runs on boat via offbox
+
+Abdullah's Mac (M4 Max) sits at load 100+ when agents run test suites, installs and Docker stacks locally. Since
+2026-10-13 that work runs on boat.dev VMs (EU, x86_64 Ubuntu 24.04, Docker included) through `offbox`. A gate
+(worker C's plugin + Docker shim) denies heavy commands that don't go through offbox. Owner decisions and the
+interface contract: `/Users/ardud/.robob/scratch/2026-10-13-we-often-run-simulations-tests-24789d2f/plan.md`.
+
+## The one rule
+
+Prefix heavy commands with `offbox run --`, from the same directory you'd run them in:
+
+```bash
+offbox run -- go test ./...
+offbox run -- npm ci
+offbox run -- npx jest
+offbox run -- 'docker compose up -d && ./scripts/health.sh'      # one string = run by bash
+offbox run --size xlarge -- make test-integration
+```
+
+offbox finds the repo root (`git rev-parse --show-toplevel`, else cwd), rsyncs it to your box (only changed files;
+gitignored files, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent), `cd`s into the same relative
+dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
+
+**Light Go checks run on the Mac (local-first, 2026-10-19).** Waking a box for a 5 s check was most of the bill, so
+`offbox run` itself runs these locally (niced, max 4 at once) and prints `offbox: light command: running on this Mac`:
+single-package `go test -run X` (`-count` <= 3), `go vet`/`go build -o /dev/null` of 1-3 packages (6 per run at
+most), `gofmt -l`, `go version|env|list`, alone or in `--step`s / `bash -c` with read-only pipe filters (`grep`,
+`head`, `tail`, `sort`, `sed -n`, ...) and `tee /tmp/x`. Packages must be `./relative` paths inside the repo, and
+neither they nor any module package they import may have OS/arch-specific files or build tags (`_linux.go`,
+`//go:build linux`): the Mac would build different code. Tests that read `.env` need `--include .env`; tests in a
+module that uses testcontainers go to the box. Go flags and env are an allowlist (`-run -v -race -count -timeout
+-tags -short`, `GOFLAGS=-mod=readonly`, `GOTOOLCHAIN=goX.Y`); `-exec`, `-toolexec`, `-gcflags`, `-coverprofile`,
+`-bench`, `-C` and friends send the run to the box. Anything else (python, node, uv, make, git, scripts, docker,
+`cd`, subshells, loops, heredocs, repo-file redirects, `/proc`, reading `/tmp` left by an earlier box run) still goes
+to the box, as do runs with `--bg`, `--no-sync`, `--pull`, `--base`, `--fresh`, `--template`, a Mac whose CPUs are
+over 80% busy (load averages alone mislead on macOS: ~30 with 60% idle is normal here), or a
+repo that used Docker on the box in the last 2 h; so do go.mod files with local-path `replace`s and nested modules,
+and a `go.work` above the repo is ignored (`GOWORK=off`) because it never reaches the box. Local runs use the box's
+Go version (`GOTOOLCHAIN`), a small allowlisted environment (no AWS profile, tokens or service URLs), a dead
+`FDB_CLUSTER_FILE`/`DOCKER_HOST`, and a macOS sandbox: writes only to a private run dir (your `/tmp/x` paths are
+mapped into it, fresh each run) and the Go caches, never to the repo; no reads of `~` or secret files (`.env`, keys)
+unless `--include`d; no unix sockets, local UDP or local service ports. When the run ends, everything it started is
+killed. A failed local check is rerun on the box by itself when the output says `Operation not permitted` or the
+tested package writes files (`os.WriteFile`, `os.Create`, ...). Other code that hides a blocked write, or
+third-party modules with Mac-only behaviour, can still differ: if a local failure looks wrong or Mac-specific, rerun
+with `offbox run --remote -- ...`, which always uses the box and never falls back to the Mac.
+`OFFBOX_LOCAL_FIRST=0` only turns local-first off.
+
+Heavy = `go test` (multi-package or no `-run`), `pytest` on a dir or with `-n`, `jest`/`vitest` (whole suite),
+`npm ci`/`npm install`/`pnpm install`/`yarn install`, `docker run/build/compose up`, testcontainers, `gradlew`,
+`cargo build/test`, `make test`, `forge test`/anvil. In review/worktree clones (`/tmp`, `$TMPDIR`, `coord-wt`,
+`crw` work dirs) also `go build`/`go vet` of `./...` or 4+ packages, project-wide `tsc`, `eslint .` and
+`npm run typecheck|lint`.
+In a repo whose go.mod has testcontainers, `go test -run X ./pkg` stays local only if that package (and what it
+imports from the module) never mentions testcontainers. The harness template's FDB image is prebuilt for the default
+compose project (`platform`).
+
+**Stays local** (don't wrap): `xcodebuild`, `adb`/`ph`, mitmproxy, Dia, `terraform` (AWS creds), `git`, and
+narrow single tests: `go test -run TestX ./pkg`, `jest path/file.test.ts`, `pytest path::test`. Wrap a narrow
+test only when it needs Docker or Linux (testcontainers, e.g. rewards' Postgres conftest; a container an earlier
+box step started). Small scripts over local files (`python3 -c`, `node -e`, parsing a log you have here) belong
+on the Mac, not on a box.
+
+If something must run on the Mac (needs local devices, AWS creds, the local Docker daemon on purpose), log an
+exemption first; the gate and monitor respect it:
+
+```bash
+offbox local --reason "xcode UI test needs the local simulator stack" --ttl 1h
+offbox local --list ; offbox local --clear
+```
+
+## Your box (lease)
+
+- Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
+  then an existing stopped box; legacy boxes are adopted without deleting their disks. Each box runs one command
+  at a time, including sync and artifact pulls. Background runs reserve their slot until completion. Checkout
+  directories remain separate per local repo path. Dependencies are warm on whichever box you receive.
+- A busy pool queues for **up to 600 seconds** (progress line every 60 s), then returns **92** (nothing ran; retry).
+  Give the tool call a timeout above the wait, or use a background shell. `OFFBOX_POOL_SIZE` (1–8) and
+  `OFFBOX_POOL_WAIT_SECONDS` (0–1200) configure this. Sizes are minimums on pooled boxes; a larger warm box is reused.
+- Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if the box ran Docker in the last 2 h
+  or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
+  cooldown (stopped = free, disk kept). A resume takes ~6-10 s. The next run resumes it with everything
+  you installed (`node_modules`, Go module cache, files in ~, Docker named volumes). Docker images are kept too:
+  boat drops image layers on stop, so offbox archives them into ~ before every stop and reloads them at boot
+  (a few seconds to ~20 s for big stacks; runs wait for it automatically).
+- Warm runs avoid a sandbox start; queueing and synchronization can add latency.
+- Deps you install on the box stay there: run `offbox run -- npm ci` once, then `offbox run -- npx jest` many
+  times. Local `node_modules` is never synced (macOS binaries would be wrong anyway).
+- Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`.
+  Templates: `crpko-go` (Go 1.26 + FDB client + warm module cache, large), `crpko-node` (Node 24 + warm npm cache,
+  large), `crpko-harness` (xlarge, Docker images for the harness stack pre-pulled), `generic` (default).
+  Auto-pick: crpko-devops / go.mod → crpko-go; package.json → crpko-node; compose file or testcontainers → crpko-harness.
+- crpko-devops's template includes Vector 0.50.0 and `/usr/bin/ruby`; it has no package-lock.json, so run tests directly or use `npm install`, not `npm ci`.
+- Sizes: `small` 2 vCPU/4 GB, `default` 4/8, `large` 8/16, `xlarge` 16/32. Growing an idle pooled box requires
+  a start allowance (stop + resume). Use xlarge only for big Docker stacks. Don't pass `--size` for ordinary runs:
+  the template/base size is right. A pooled box grown for one xlarge run goes back to its natural size (template
+  or base size, at least large; generic stays default) the next time it resumes. While starts are plentiful an
+  oversized running box is skipped for a stopped one so it can stop on its short timer, except the box you used
+  last. A live box is never stopped just to shrink it, and a shrink boat refuses resumes at the old size.
+
+## Options
+
+| Flag | Use |
+|---|---|
+| `--size S` / `--template T` | machine size / template for a new lease |
+| `--env VAR` (or `VAR=val`) | forward a variable. Only CI=1 plus a safe allowlist (TZ, LANG, GOFLAGS, NODE_OPTIONS, ...) is sent by default. AWS_*, tokens and keys are **never** forwarded unless you name them. |
+| `--pull PATH` | copy an artifact back after the run (coverage.out, junit.xml, `test-results/`), relative to your cwd |
+| `--git` | export a portable `.git` with the selected checkout's exact HEAD and ancestor history |
+| `--include PATH` | sync a path the filters skip (e.g. a committed `testdata/server.key`) |
+| `--no-sync` | run without syncing (box already has what you need) |
+| `--bg` | start and return a run id at once; then `offbox logs <id> --follow` / `offbox wait <id>` (exits with its code, does `--pull`) |
+| `--base N` / `--fresh` | new lease from saved base N / ignoring bases and templates |
+| `--no-fallback` | return 90/91 instead of falling back to a local run (does not stop local-first) |
+| `--remote` | always use the box, even for a light Go check that would run on the Mac; never falls back to the Mac |
+| `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
+
+Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
+For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
+
+`--git` works with normal checkouts and linked worktrees, including detached HEADs. It exports only HEAD's
+reachable history and branch/remote/tag refs whose commits are ancestors of HEAD; divergent refs and other
+worktrees' private histories are omitted. Shallow history stays shallow; locally available alternate objects
+are packed into the export. It does not copy Git config/credentials, hooks, reflogs, stashes, other worktree
+metadata or the local index. The remote index starts at HEAD; dirty/untracked working files use the usual
+sync filters, so staged changes appear as unstaged remotely. A committed HEAD and locally available objects
+are required (no automatic fetch). Committed content in the exported history remains available to Git,
+including paths excluded from the working-file sync. The local Git state is read-only. Submodule git-dirs
+are not materialized. Each `--git` sync rebuilds and replaces the remote metadata; `--no-sync` retains it.
+
+UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on the Mac via an SSH tunnel
+(`--local 13000` to pick the local port). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
+
+## Save state for later (do this!)
+
+Stopped boxes are free forever, so save generously:
+
+- After an expensive setup (`npm ci`, `go mod download`, harness images pulled, a seeded database), run
+  `offbox save --default --note "npm ci done at <sha>"`. New threads on this repo then start from that state and
+  only rsync the delta. `save` briefly stops your lease to capture it (the next run resumes it), costs one machine
+  start (~15-25 s), then $0. Names: `offbox save --name pg-seeded`; use one
+  later with `offbox run --base pg-seeded -- ...` (only for a new lease).
+- `offbox bases` lists saved bases; `offbox base rm <name>` removes one. Bases are never auto-deleted.
+- `offbox keep --days 30` pins your current lease so the reaper never deletes it (it still stops when idle).
+- Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
+
+## Housekeeping
+
+- `offbox list [--all]`, `offbox release` (stop your lease now), `offbox release --delete` (throw the disk away),
+  `offbox whoami`, `offbox status`.
+- Before ending a long task you don't need to do anything: idle boxes stop themselves. Release explicitly if you
+  are done with a big (xlarge) box.
+
+## Costs and the cap
+
+$100/month plan. default $0.036/h, large $0.072/h, xlarge $0.20/h; stopped boxes, auto snapshots and saved bases
+are free. `offbox spend` reads the account meter once and shows billing-period spend. Abdullah gets a Telegram
+at every $100. At $500 the cap trips: new leases are refused and all boxes stop. Heavy work returns 91.
+
+Create, fork and resume each consume a start. Offbox reserves starts atomically against rolling **25/minute,
+180/hour, 760/day** budgets; `OFFBOX_STARTS_PER_MINUTE`, `OFFBOX_STARTS_PER_HOUR`, `OFFBOX_STARTS_PER_DAY` can lower
+these limits. `offbox status` shows usage and the next local allowance. Existing running boxes remain usable.
+Boat 429s fail immediately and set a shared cooldown from Retry-After (or a conservative default); one start-limit
+Telegram is attempted at most every six hours. Account activity outside offbox may consume additional starts.
+
+## Fallback and exit codes
+
+- Remote command's own exit code is returned as is, and offbox's last stderr line is `offbox: remote exit N`. That is
+  the status of the string's *last* command: `...; echo EXIT=$?` or `... | tail` reads 0 on failure (17 Oct risk2).
+  Use `set -o pipefail` and end with `exit $rc`, not a trailing echo; offbox flags a masked 0 on that line.
+  A local-first run prints `offbox: local exit N` instead; same exit-code rules.
+- (nightly 2026-10-19) **Several checks in one run: use `--step`**, one per command, instead of chaining
+  `a | tee x | tail; b; grep ...`. 18 Oct: 4+ Crpko lanes read `remote exit 1` from a trailing grep on clean runs,
+  or a blank PIPESTATUS gate.
+  `offbox run --step 'go vet ./...' --step 'go test -count=1 ./pkg/...'`
+  Each step runs in its own subshell with pipefail and does not stop the next. You get `offbox step N rc=X: ...`
+  per step, then `offbox steps: K ok, M failed (step N rc=X)`, then `offbox: remote exit <first nonzero rc>`.
+  `--step` plus a trailing `-- cmd` is a usage error (2). Exit 1 whose last pipeline stage is grep gets a hint line:
+  that is "no match", not a failed test.
+- **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
+  (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
+  apply. A plain 97 without that line is your command's own exit code.
+- **92** = every pool box stayed busy for the whole queue wait. Nothing ran, not an infra failure: just retry.
+- **90** = boat/infra failure or exhausted start budget; **91** = spend cap. Heavy commands
+  and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded
+  capacity waiting. Known-small direct commands and targeted tests may still fall back under the 2-job local
+  semaphore with `taskpolicy -b` and a loud warning, unless `--no-fallback` is set.
+- No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
+  A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
+  for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the
+  repo and run that.
+- Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
+
+## Troubleshooting
+
+- Go `unsafeTraceExpWriter redeclared`: stale overlay sources; the run preamble removes `runtime/traceexp.go` for Go 1.25+ and replaces mixed Go 1.26+ trees from the exact official release; template installs replace GOROOT, never overlay it.
+- Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. Healthy runs only scan the inventory, not compile it.
+- Go `package unsafe is not in std` or nested `/usr/local/go/go`: a half-swapped GOROOT; the next run repairs it under a box-local lock, verifies the replacement, and removes stale repair directories only after verification.
+- `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
+- Tests can't find a file: it's gitignored or matched a secret filter (`.env*`, `*.pem`, `*.key`, ...). Use
+  `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
+- Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
+- Hung or weird box: `offbox release --delete`, then rerun (fresh lease from base/template).
+- Old output of a run: `offbox logs <run-id>` (works after the box stopped, from boat's 90-day command history).
+- Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:
+  `~/.config/opencode/skills/remote-compute/scripts/offbox.py` + `offbox_lib/`. Template recipes: `templates/`.
+  Rebuild one: `offbox template build crpko-go` (keeps the old one until the new one is ready).
+- **Changing offbox**: the source is the Robob fork, `/Volumes/ExternalSSD/t3code-fork/integrations/offbox/`
+  (this skill is `skill/`, plus the gate plugin, `boat` wrapper and monitor plist). Never edit the live copy.
+  Edit there, run its tests (README), commit, `git push origin HEAD:main`, then `integrations/offbox/install.zsh`.
+  Always push: install refuses unpushed changes, and `install.zsh --check` shows drift.
+- Raw boat access: `~/.local/bin/boat` (CLI, signed in). API key is in Keychain `boat-api`/`ardud`; never print it.

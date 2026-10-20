@@ -1,0 +1,69 @@
+#!/bin/zsh
+# Agent-only Docker guard. All policy checks share the monitor's stdlib helpers.
+emulate -L zsh
+setopt NO_UNSET
+typeset shim=${0:A} blockers=${0:A:h} real='' candidate dir
+for dir in "${path[@]}" /opt/homebrew/bin /usr/local/bin; do
+  [[ -n "$dir" ]] || dir=.
+  [[ "${dir:A}" == "$blockers" ]] && continue
+  candidate="$dir/docker"
+  if [[ -x "$candidate" && "${candidate:A}" != "$shim" ]]; then
+    real="$candidate"
+    break
+  fi
+done
+
+if [[ -n "${OPENCODE_SESSION_ID:-}" ]]; then
+  /opt/homebrew/bin/python3 - "$blockers:h" "$@" <<'PY'
+import os
+import shlex
+import sys
+sys.path.insert(0, sys.argv[1])
+from classify import classify, spec
+from monitor_support import STATE, live_exemption, mode, read_json
+
+def offbox_usable():
+    # Same fail-open rule as the plugin: no offbox or spend cap reached -> don't block.
+    if not os.access(os.path.expanduser("~/.local/bin/offbox"), os.X_OK):
+        return False
+    return read_json(STATE / "cap.json", {}).get("capped") is not True
+
+if mode() == "enforce" and offbox_usable():
+    args = sys.argv[2:]
+    # Reuse the rule set's option arities, but only guard the requested verbs.
+    value_flags = {flag for rule in spec()["rules"] if rule["id"].startswith("docker-")
+                   for flag in rule.get("value_flags", [])}
+    verbs, index = [], 0
+    while index < len(args) and len(verbs) < 2:
+        arg = args[index]
+        if arg.startswith("-"):
+            index += 2 if arg in value_flags else 1
+        else:
+            verbs.append(arg)
+            index += 1
+    guarded = (bool(verbs) and verbs[0] in ("run", "build", "create", "start")
+               or verbs == ["compose", "up"] or verbs == ["buildx", "build"])
+    command = shlex.join(["docker", *args])
+    verdict = classify(command, os.getcwd())
+    if guarded and verdict.get("heavy") and not live_exemption(os.environ["OPENCODE_SESSION_ID"]):
+        print("offbox gate: this command was NOT run on the Mac (owner rule 2026-10-13, remote-compute skill).", file=sys.stderr)
+        print(f"Why: {verdict['why']} [rule {verdict['rule']}].", file=sys.stderr)
+        print("Run it on a boat.dev box instead (same repo dir, output streams back, same exit code):", file=sys.stderr)
+        print("  " + verdict["rewrite"], file=sys.stderr)
+        print("Narrow single tests stay local (go test -run X ./pkg, jest path/file.test.ts, pytest path::test).", file=sys.stderr)
+        print('Only if it truly must run here (e.g. needs local creds/devices): offbox local --reason "<why>" [--ttl 2h], then rerun.', file=sys.stderr)
+        sys.exit(3)
+PY
+  typeset result=$?
+  (( result == 3 )) && exit 3
+  # A failed policy helper must not silently bypass enforcement.
+  if (( result != 0 )); then
+    print -u2 -- 'offbox gate: Docker policy check failed; load remote-compute and use offbox run -- docker ...'
+    exit 3
+  fi
+fi
+if [[ -z "$real" ]]; then
+  print -u2 -- 'offbox gate: real docker executable not found on PATH.'
+  exit 127
+fi
+exec "$real" "$@"

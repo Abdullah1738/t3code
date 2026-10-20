@@ -17,6 +17,7 @@ code here, test here, then sync it over.
 | `scribe` | `~/.local/share/scribe` | none yet (mission lane notes; run by hand) |
 | `catalog-guard` | `~/.local/share/catalog-guard` | `com.ardud.catalog-guard` (repairs a partial OpenCode model catalog, every 150s) |
 | `message-archive` | `~/.local/share/message-archive` | `com.ardud.message-archive` (local mail mirror + `msgs` search over email, iMessage, WhatsApp) |
+| `offbox` | `~/.config/opencode/skills/remote-compute` + gate plugin, `~/.local/bin/{offbox,boat}` | `com.ardud.offbox-monitor` (boat.dev offload gate, monitor and reaper; deploy via `offbox/install.zsh`) |
 
 Never add credentials, SQLite state, logs, `data/`, virtualenvs, watcher
 state (`robob-watch/watchers`, `archive`) or `.bak` files here. Runtime state

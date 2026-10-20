@@ -8,7 +8,8 @@ name="${1:-}"
 shift || true
 case "$name" in
   agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|scribe|catalog-guard|message-archive) ;;
-  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|scribe|catalog-guard|message-archive> [--dry-run]"; exit 2 ;;
+  offbox) exec "${0:A:h}/offbox/install.zsh" "$@" ;;  # several live targets, see offbox/README.md
+  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|scribe|catalog-guard|message-archive|offbox> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"
