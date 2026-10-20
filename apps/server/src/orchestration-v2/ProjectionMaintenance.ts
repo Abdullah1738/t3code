@@ -1,4 +1,5 @@
 import { ThreadId } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -66,13 +67,6 @@ export const layer: Layer.Layer<
     const eventStore = yield* EventStore.EventStoreV2;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
 
-    /**
-     * EventSink commits the event, its projection updates, and projection metadata in one SQL
-     * transaction. Startup verification therefore checks that transaction boundary and that every
-     * stored projection can be decoded. It intentionally does not replay domain events through a
-     * second projector: doing so creates another implementation of projection semantics that must
-     * evolve in lockstep with ProjectionStore.
-     */
     const verify = Effect.gen(function* () {
       const expectedThreadRows = yield* sql<{ readonly thread_id: string }>`
         SELECT DISTINCT stream_id AS thread_id
@@ -202,8 +196,6 @@ export const layer: Layer.Layer<
           Effect.mapError((cause) => new ProjectionMaintenanceError({ operation, cause })),
         );
 
-    // Thread-state events whose payload is the complete thread: only the
-    // newest per thread can influence a replay or an afterSequence catch-up.
     // thread.created stays out — verify derives the expected thread set from
     // it, and it anchors replay ordering. thread.deleted stays out too: clients
     // and waitForThread switch on the event type, not just the payload.
@@ -235,8 +227,7 @@ export const layer: Layer.Layer<
     const supersedableThreadEventTypes = new Set(SUPERSEDABLE_THREAD_EVENT_TYPES);
     const readStateThreadEventTypes = new Set(READ_STATE_THREAD_EVENT_TYPES);
     // Keep subagent.updated and turn-item.updated rows: slimmed payloads reference their prompts.
-    // Discovery runs on the shared synchronous connection; json_extract over
-    // large payloads made 500-row pages block the event loop for ~90ms.
+    // Small pages bound work on the reader worker and synchronous fallback.
     const COMPACTION_PAGE_SIZE = 50;
 
     /**
@@ -308,7 +299,7 @@ export const layer: Layer.Layer<
           WHERE event.sequence <= ${throughSequence}
           ORDER BY event.sequence DESC
           LIMIT ${COMPACTION_PAGE_SIZE}
-        `;
+        `.pipe(NodeSqliteClient.readOnly);
         const obsolete: number[] = [];
         for (const row of rows) {
           if (row.imported_legacy_thread === 1) {
@@ -351,8 +342,7 @@ export const layer: Layer.Layer<
             }
           }
         }
-        // Both discovery and deletion use the synchronous connection. Yield even
-        // when this page has nothing to delete so startup and requests can progress.
+        // Yield even without deletions for clients using the synchronous fallback.
         yield* Effect.yieldNow;
         if (obsolete.length > 0) {
           yield* sql`DELETE FROM orchestration_events WHERE sequence IN ${sql.in(obsolete)}`;
@@ -363,8 +353,6 @@ export const layer: Layer.Layer<
         if (rows.length < COMPACTION_PAGE_SIZE) break;
       }
 
-      // Legacy receipts are removable only after their thread's v1 import finishes.
-      // Page by rowid before checking eligibility, as with event discovery above.
       while (throughReceiptRowId > 0) {
         const rows = yield* sql<{
           readonly row_id: number;
@@ -387,7 +375,7 @@ export const layer: Layer.Layer<
           WHERE receipt.rowid <= ${throughReceiptRowId}
           ORDER BY receipt.rowid DESC
           LIMIT ${COMPACTION_PAGE_SIZE}
-        `;
+        `.pipe(NodeSqliteClient.readOnly);
         const obsolete = rows
           .filter((row) => row.imported_legacy_thread === 1)
           .map((row) => row.command_id);

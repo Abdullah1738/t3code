@@ -1,9 +1,10 @@
+import * as Dialog from "./ui/Dialog";
 import { ComposerContextId, PROVIDER_SEND_TURN_MAX_INPUT_CHARS } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
+import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { useNavigation } from "@react-navigation/native";
-import { useEffect, useImperativeHandle, useMemo, useRef, useState, type Ref } from "react";
-import { Alert } from "react-native";
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
 import type { EnvironmentId } from "@t3tools/contracts";
 import {
   collectAssistantCitations,
@@ -33,7 +34,7 @@ import { importComposerContextClipboard } from "../lib/composerContextClipboard"
 import { mobilePreferencesAtom } from "../state/preferences";
 import { AssistantCitationSheet } from "./AssistantCitationSheet";
 import { ComposerContextSheet } from "./ComposerContextSheet";
-import { AppText as Text } from "./AppText";
+import { AppText as Text } from "./ui/AppText";
 import {
   composerDocumentAttachment,
   composerMentionPath,
@@ -53,23 +54,18 @@ export interface ComposerEditorHandle extends NativeComposerEditorHandle {
 export type ComposerEditorProps = Omit<NativeComposerEditorProps, "ref"> & {
   readonly ref?: Ref<ComposerEditorHandle>;
   readonly draftKey?: string | null;
+  readonly hidden?: boolean;
   readonly environmentId?: EnvironmentId;
   readonly onOpenMention?: (path: string) => void;
-  /** Documents open in the file screen; pictures, video and PDF keep their native viewers. */
   readonly onOpenAttachment?: (attachment: ComposerDocumentAttachment) => void;
-  /**
-   * A resting composer is a target to type in, not a document to navigate. Its chips go inert
-   * so a draft full of them can still be tapped anywhere to start writing; the caller focuses
-   * the editor instead. Chips become live again once the composer is open.
-   */
   readonly chipsInert?: boolean;
-  /** Called instead of opening a chip while `chipsInert` is set. */
   readonly onInertChipPress?: () => void;
 };
 
 export function ComposerEditor({
   ref,
   draftKey,
+  hidden,
   environmentId,
   onOpenMention,
   onOpenAttachment,
@@ -82,7 +78,7 @@ export function ComposerEditor({
   const preferredEnterBehavior = AsyncResult.isSuccess(preferencesResult)
     ? preferencesResult.value.composerEnterBehavior
     : undefined;
-  const contextHistory = useMemo(() => createComposerDraftContextHistory(), [draftKey]);
+  const contextHistory = createComposerDraftContextHistory();
   useEffect(() => () => contextHistory.dispose(), [contextHistory]);
   const changeText = (text: string) => {
     const restored = contextHistory.restore(
@@ -133,7 +129,7 @@ export function ComposerEditor({
     importRef.current = controller;
     setImporting(true);
     setComposerContextImporting(draftKey, true);
-    try {
+    const settled = await settlePromise(async () => {
       const retained = getComposerDraftAfterSelection(draftKey, insertion);
       const result = await importComposerContextClipboard(
         clipboard,
@@ -146,52 +142,47 @@ export function ComposerEditor({
         return;
       }
       if (!insertComposerDraftContext(draftKey, result, insertion)) {
-        Alert.alert(
+        Dialog.alert(
           "Could not paste context",
           "Remove some attachments or context items from the draft, then paste again.",
         );
         return;
       }
       if (result.failures.length > 0)
-        Alert.alert(
+        Dialog.alert(
           "Some attachments could not be copied",
           "Reconnect to the source environment and copy them again. References without their files are marked unavailable.",
         );
-    } catch (error) {
-      if (!controller.signal.aborted)
-        Alert.alert(
-          "Could not paste context",
-          error instanceof Error ? error.message : "Try copying again.",
-        );
-    } finally {
-      setComposerContextImporting(draftKey, false);
-      importRef.current = null;
-      setImporting(false);
+    });
+    setComposerContextImporting(draftKey, false);
+    importRef.current = null;
+    setImporting(false);
+    if (AsyncResult.isFailure(settled) && !controller.signal.aborted) {
+      const error = squashAtomCommandFailure(settled);
+      Dialog.alert(
+        "Could not paste context",
+        error instanceof Error ? error.message : "Try copying again.",
+      );
     }
   };
-  const clipboardFragment = useMemo(
-    () =>
-      environmentId && draft.context
-        ? encodeComposerContextFragment({
-            version: 1,
-            source: { environmentId },
-            records: draft.context.records.map((record) => {
-              if (!("attachmentId" in record)) return record;
-              const attachment = draft.attachments.find(
-                (entry) => entry.id === record.attachmentId,
-              );
-              return {
-                ...record,
-                attachmentId:
-                  attachment?.uploadEnvironmentId === environmentId
-                    ? (attachment.uploadedAttachmentId ?? record.attachmentId)
-                    : record.attachmentId,
-              };
-            }),
-          })
-        : "",
-    [environmentId, draft.context, draft.attachments],
-  );
+  const clipboardFragment =
+    environmentId && draft.context
+      ? encodeComposerContextFragment({
+          version: 1,
+          source: { environmentId },
+          records: draft.context.records.map((record) => {
+            if (!("attachmentId" in record)) return record;
+            const attachment = draft.attachments.find((entry) => entry.id === record.attachmentId);
+            return {
+              ...record,
+              attachmentId:
+                attachment?.uploadEnvironmentId === environmentId
+                  ? (attachment.uploadedAttachmentId ?? record.attachmentId)
+                  : record.attachmentId,
+            };
+          }),
+        })
+      : "";
   const navigation = useNavigation();
   const selectedReference = selected
     ? collectComposerContextReferences(selected.source)[0]
@@ -219,7 +210,9 @@ export function ComposerEditor({
   };
   return (
     <>
+      {/* Reset revision history with the recreated iOS view without aborting context imports. */}
       <NativeComposerEditor
+        key={hidden ? "hidden" : "visible"}
         {...props}
         ref={nativeRef}
         enterBehavior={props.enterBehavior ?? preferredEnterBehavior}
@@ -278,7 +271,7 @@ export function ComposerEditor({
               PROVIDER_SEND_TURN_MAX_INPUT_CHARS
             ) {
               const chip = selected;
-              Alert.alert("The draft is too long", "Shorten the draft or the comment.", [
+              Dialog.alert("The draft is too long", "Shorten the draft or the comment.", [
                 { text: "OK", onPress: () => setSelected({ ...chip, comment }) },
               ]);
               return;

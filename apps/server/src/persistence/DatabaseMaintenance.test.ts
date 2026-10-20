@@ -16,6 +16,60 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))(
   "DatabaseMaintenance",
   (it) => {
+    it.effect("reports an unreadable database as an inspection failure", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const maintenance = yield* DatabaseMaintenance.DatabaseMaintenance;
+        const dbPath = path.join(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-inspect-" }),
+          "statev2.sqlite",
+        );
+        yield* fs.writeFileString(dbPath, "not a database");
+        const failure = yield* Effect.flip(maintenance.inspect(dbPath));
+        assert.equal(failure._tag, "DatabaseInspectError");
+      }).pipe(Effect.scoped),
+    );
+
+    it.effect("reports and deletes only the database from before 0.1.0", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const maintenance = yield* DatabaseMaintenance.DatabaseMaintenance;
+        const userdata = yield* fs.makeTempDirectoryScoped({ prefix: "t3-legacy-" });
+        const dbPath = path.join(userdata, "statev2.sqlite");
+        const legacy = path.join(userdata, "state.sqlite");
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TABLE retained_data (value TEXT)`;
+        }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
+        assert.isNull((yield* maintenance.inspect(dbPath)).legacyDatabaseBytes);
+
+        const openLegacy = NodeSqliteClient.layer({ filename: legacy });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA journal_mode = WAL`;
+          yield* sql`CREATE TABLE v1_data (value TEXT)`;
+        }).pipe(Effect.provide(openLegacy));
+        assert.isAbove((yield* maintenance.inspect(dbPath)).legacyDatabaseBytes ?? 0, 0);
+
+        // A version before 0.1.0 still running against it keeps it.
+        const refused = yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`SELECT value FROM v1_data`;
+          return yield* Effect.flip(maintenance.removeLegacyDatabase(dbPath));
+        }).pipe(Effect.provide(openLegacy));
+        assert.equal(refused._tag, "DatabaseInUseError");
+        assert.isTrue(yield* fs.exists(legacy));
+
+        yield* maintenance.removeLegacyDatabase(dbPath);
+        assert.isFalse(yield* fs.exists(legacy));
+        assert.isFalse(yield* fs.exists(`${legacy}-wal`));
+        assert.isTrue(yield* fs.exists(dbPath));
+        assert.isNull((yield* maintenance.inspect(dbPath)).legacyDatabaseBytes);
+      }).pipe(Effect.scoped),
+    );
+
     it.effect("compacts an existing database offline only once its server has stopped", () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -54,7 +108,7 @@ it.layer(DatabaseMaintenance.layer.pipe(Layer.provideMerge(NodeServices.layer)))
           yield* sql`SELECT value FROM retained_data`;
           return yield* maintenance.compact(dbPath).pipe(Effect.flip);
         }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
-        assert.equal(refused.reason, "running");
+        assert.equal(refused._tag, "DatabaseInUseError");
         assert.equal((yield* fs.stat(dbPath)).size, sizeBefore);
 
         const result = yield* maintenance.compact(dbPath);

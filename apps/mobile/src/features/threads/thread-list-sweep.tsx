@@ -18,7 +18,7 @@ import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
 import { ControlPillMenuPressGate } from "../../components/ControlPillMenuPressGate";
-import { RowHoverContext } from "../../components/RowPressable";
+import { RowHoverContext } from "../../components/ui/RowPressable";
 import { cn } from "../../lib/cn";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { readEnvironmentScope } from "../../state/session";
