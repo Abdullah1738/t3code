@@ -17,6 +17,7 @@ import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { ASTRA_XHIGH, HAIKU, OPUS_XHIGH, SOL_XHIGH, modelKey } from "./models.ts";
 import * as PolicyService from "./PolicyService.ts";
+import { defaultRoleId } from "./roles.ts";
 import { CRPKO, JUNO, OWNER, SYSTEM, agent, makePorts, testLayer } from "./testing.ts";
 
 const ports = makePorts();
@@ -510,6 +511,55 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
         yield* record(caller);
       }
       assert.strictEqual(yield* reviewerState, "done-at-head");
+    }),
+  );
+
+  it.effect("the master lets lane leads record a stage, named for the stage's model", () =>
+    Effect.gen(function* () {
+      const { missions, policy } = yield* setup;
+      const fab = yield* missions.upsertLane(OWNER, { missionId: CRPKO, name: "fab risk" });
+      ports.threads.set("thread-fab", { exists: true, idle: true, modelSelection: OPUS_XHIGH });
+      yield* policy.bindRole(MASTER, {
+        roleId: defaultRoleId(CRPKO, "lane-lead", LaneId.make(fab.ref.id)),
+        threadId: ThreadId.make("thread-fab"),
+      });
+      const lead = agent("thread-fab");
+      const record = policy.recordReview(lead, {
+        missionId: CRPKO,
+        pullRequest: { repository: "crpko/fab", number: 7 },
+        stageId: ReviewStageId.make("reviewer"),
+        headSha: "f1",
+        verdict: "clear",
+      });
+
+      const refused = yield* Effect.flip(record);
+      assert.strictEqual(refused.code, "forbidden");
+
+      const { stages } = (yield* policy.reviewPolicy(CRPKO)).policy;
+      yield* policy.editReviewPolicy(MASTER, {
+        missionId: CRPKO,
+        stages: stages.map((stage) =>
+          stage.id === "reviewer" ? { ...stage, recordedBy: ["lane-lead"] } : stage,
+        ),
+      });
+      yield* record;
+      const recorded = (yield* policy.reviewPolicy(CRPKO)).reviews?.find(
+        (review) => review.pullRequest.repository === "crpko/fab",
+      );
+      // The lead relays the reviewer's run, so the record names the reviewer's model, not Opus.
+      assert.strictEqual(recorded?.model, modelKey(SOL_XHIGH));
+
+      // Other stages stay closed to it.
+      const final = yield* Effect.flip(
+        policy.recordReview(lead, {
+          missionId: CRPKO,
+          pullRequest: { repository: "crpko/fab", number: 7 },
+          stageId: ReviewStageId.make("final"),
+          headSha: "f1",
+          verdict: "clear",
+        }),
+      );
+      assert.strictEqual(final.code, "forbidden");
     }),
   );
 
