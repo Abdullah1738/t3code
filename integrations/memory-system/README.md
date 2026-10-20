@@ -72,8 +72,9 @@ Nothing under `data/`, `logs/` or `.venv/` belongs in git.
 - `robob`: OpenCode endpoints on the OpenCode service directly
   (`OPENCODE_SERVICE_URL`, default `http://127.0.0.1:49374`, basic auth `opencode`
   with `OPENCODE_SERVER_PASSWORD` or `~/.config/opencode-service/password`), the
-  Robob control API (`T3_CONTROL_URL`/`T3_CONTROL_TOKEN` or
-  `~/.robob/ardud-control.json`), and Robob's state DB read-only
+  Robob control API (`T3_CONTROL_URL`/`T3_CONTROL_TOKEN`, else
+  `T3_CONTROL_TOKEN_FILE`, else `~/.robob/components/memory.json`, else the shared
+  `~/.robob/ardud-control.json` while it exists), and Robob's state DB read-only
   (`ROBOB_STATE_DB`, default `~/.robob/userdata/statev2.sqlite`) for the board
   backlog. The reaper deletes nothing while the Robob board can't be read, and
   archives the Robob thread of each deleted root session.

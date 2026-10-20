@@ -141,6 +141,19 @@ class BackendSelection(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     backend.control_config()
 
+    def test_control_config_prefers_memory_credential(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".robob/components"))
+            for rel, tok in ((".robob/ardud-control.json", "shared"), (".robob/components/memory.json", "own")):
+                p = os.path.join(d, rel)
+                with open(p, "w") as fh:
+                    json.dump({"url": "http://127.0.0.1:3", "token": tok}, fh)
+                os.chmod(p, 0o600)
+            with clean_env(), mock.patch.object(backend, "HOME", d):
+                self.assertEqual(backend.control_config(), ("http://127.0.0.1:3", "own"))
+                os.remove(os.path.join(d, ".robob/components/memory.json"))
+                self.assertEqual(backend.control_config(), ("http://127.0.0.1:3", "shared"))
+
 
 class RobobState(unittest.TestCase):
     def setUp(self):

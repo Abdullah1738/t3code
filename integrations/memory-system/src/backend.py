@@ -9,7 +9,8 @@ MEMORY_BACKEND picks the backend (default openchamber until the Robob cutover):
                user "opencode", password from OPENCODE_SERVER_PASSWORD or
                OPENCODE_PASSWORD_FILE, default ~/.config/opencode-service/password),
                plus the Robob control API (T3_CONTROL_URL/T3_CONTROL_TOKEN, or
-               T3_CONTROL_TOKEN_FILE, default ~/.robob/ardud-control.json) and the
+               T3_CONTROL_TOKEN_FILE, else ~/.robob/components/memory.json, else the
+               shared ~/.robob/ardud-control.json while it exists) and the
                Robob state DB read-only (ROBOB_STATE_DB, default
                ~/.robob/userdata/statev2.sqlite).
 
@@ -94,7 +95,11 @@ def control_config():
     url = os.environ.get("T3_CONTROL_URL")
     token = os.environ.get("T3_CONTROL_TOKEN")
     if not url or not token:
-        path = os.environ.get("T3_CONTROL_TOKEN_FILE") or os.path.join(HOME, ".robob/ardud-control.json")
+        # The memory component credential first, the old shared file while it exists.
+        path = os.environ.get("T3_CONTROL_TOKEN_FILE") or next(
+            (p for p in (os.path.join(HOME, ".robob/components/memory.json"),
+                         os.path.join(HOME, ".robob/ardud-control.json")) if os.path.exists(p)),
+            os.path.join(HOME, ".robob/components/memory.json"))
         stored = {}
         try:
             if os.stat(path).st_mode & 0o077:
@@ -106,9 +111,9 @@ def control_config():
         url = url or stored.get("url")
         token = token or stored.get("token")
     if not url:
-        raise RuntimeError("no Robob control URL: set T3_CONTROL_URL or write ~/.robob/ardud-control.json")
+        raise RuntimeError(f"no Robob control URL: set T3_CONTROL_URL or write {path}")
     if not token:
-        raise RuntimeError("no Robob control token: set T3_CONTROL_TOKEN or write ~/.robob/ardud-control.json")
+        raise RuntimeError(f"no Robob control token: set T3_CONTROL_TOKEN or write {path}")
     return url.rstrip("/"), token
 
 
