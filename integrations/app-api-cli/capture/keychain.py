@@ -1,9 +1,19 @@
-"""macOS Keychain via Security.framework; no secret command-line arguments."""
+"""macOS Keychain via Security.framework; no secret command-line arguments.
+
+Items are ACL-bound to the managed capture interpreter. Any other interpreter
+would block forever on an invisible authorization prompt, so interaction is
+disabled and such reads fail fast (-25293/-25308). APP_API_KEYCHAIN_INTERACTIVE=1
+restores prompting for a deliberate, attended ACL grant.
+"""
 import ctypes as C
 import json
+import os
 
 S = C.CDLL('/System/Library/Frameworks/Security.framework/Security')
 F = C.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+S.SecKeychainSetUserInteractionAllowed.argtypes = [C.c_bool]
+S.SecKeychainSetUserInteractionAllowed.restype = C.c_int32
+S.SecKeychainSetUserInteractionAllowed(os.environ.get('APP_API_KEYCHAIN_INTERACTIVE') == '1')
 S.SecKeychainFindGenericPassword.argtypes = [C.c_void_p, C.c_uint32, C.c_char_p, C.c_uint32, C.c_char_p, C.POINTER(C.c_uint32), C.POINTER(C.c_void_p), C.POINTER(C.c_void_p)]
 S.SecKeychainFindGenericPassword.restype = C.c_int32
 S.SecKeychainAddGenericPassword.argtypes = [C.c_void_p, C.c_uint32, C.c_char_p, C.c_uint32, C.c_char_p, C.c_uint32, C.c_void_p, C.POINTER(C.c_void_p)]

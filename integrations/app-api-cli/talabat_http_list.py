@@ -67,10 +67,11 @@ def project_order(row):
         raise http.TalabatError('ORDER_LIST_SCHEMA_CHANGED')
     return {'order': str(order), 'status': STAGES.get(raw, 'unknown'), 'raw_status': raw,
             'branch_name': _text(row.get('branch_name')), 'chain_name': _text(row.get('chain_name')),
-            'source': 'native_order_list_api', 'eta': None, 'rider': None}
+            'source': 'native_order_list_api', 'eta': None, 'rider': None,
+            'delivery_address': None, 'is_home': None, 'home_match_reason': 'detail_read_required'}
 
 
-def list_orders(page=0, pages=1, limit=20, timeout=20):
+def list_orders(page=0, pages=1, limit=20, timeout=20, with_addresses=False):
     """Read at most five 75-row pages; disclose all pagination/output bounds.
 
     One automatic refresh grant on expiry/401, never OTP. The complete profile
@@ -86,7 +87,19 @@ def list_orders(page=0, pages=1, limit=20, timeout=20):
             or not math.isfinite(timeout) or not 0 < timeout <= 120):
         raise http.TalabatError('INVALID_TIMEOUT')
     deadline = time.monotonic() + timeout
-    return http.read_with_renewal(lambda saved, end: _list_orders(saved, end, page, pages, limit), deadline)
+    def operation(saved, end):
+        result = _list_orders(saved, end, page, pages, limit)
+        if with_addresses:
+            for row in result['orders']:
+                try:
+                    detail = http.project(http.request(http.TRACKING + row['order'], saved, end), row['order'])
+                    row.update({key: detail[key] for key in ('delivery_address', 'is_home', 'home_match_reason')})
+                except http.TalabatError as exc:
+                    if str(exc) in ('AUTH_EXPIRED_RENEWAL_REQUIRED', 'AUTH_FORBIDDEN', 'ACCOUNT_IDENTITY_MISMATCH'):
+                        raise
+                    row['delivery_address_error'] = str(exc)
+        return result
+    return http.read_with_renewal(operation, deadline)
 
 
 def _list_orders(saved, deadline, page, pages, limit, *, stop_at=None):
@@ -138,6 +151,7 @@ def main(argv=None):
     parser.add_argument('--pages', type=int, default=1, help='1 to 5 pages')
     parser.add_argument('--limit', type=int, default=20, help='1 to 375 projected rows')
     parser.add_argument('--timeout', type=float, default=20)
+    parser.add_argument('--with-addresses', action='store_true', help='read exact-order addresses within the same timeout')
     args = parser.parse_args(argv)
     try:
         print(json.dumps(list_orders(**vars(args))))

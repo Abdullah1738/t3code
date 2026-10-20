@@ -132,12 +132,13 @@ def marketplace_list(data):
     return out
 
 
-def orders(app, service='all', page=1, timeout=10, pages=1, limit=20):
+def orders(app, service='all', page=1, timeout=10, pages=1, limit=20, with_addresses=False):
     if app == 'talabat':
         from talabat_http_list import list_orders
         from talabat_http_orders import TalabatError
         try:
-            return list_orders(page=page - 1, pages=pages, limit=limit, timeout=timeout)
+            return list_orders(page=page - 1, pages=pages, limit=limit, timeout=timeout,
+                               **({'with_addresses': True} if with_addresses else {}))
         except TalabatError as exc:
             raise OrderError(str(exc)) from None
     if app != 'noon':
@@ -262,6 +263,7 @@ def main(argv=None):
     parser.add_argument('--page', type=int, default=1)
     parser.add_argument('--pages', type=int, default=1, help='Talabat HTTP listing: bounded page count (1..5)')
     parser.add_argument('--limit', type=int, default=20, help='Talabat HTTP listing: maximum rows (1..375)')
+    parser.add_argument('--with-addresses', action='store_true', help='Talabat listing: include exact delivery addresses')
     parser.add_argument('--timeout', type=float)
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--ui', action='store_true', help='Talabat only: opt-in original-phone UI read; takes the UI lock')
@@ -275,6 +277,8 @@ def main(argv=None):
         parser.error('pages must be 1..5 and limit 1..375')
     if (args.pages != 1 or args.limit != 20) and (args.app != 'talabat' or args.command != 'orders' or args.ui):
         parser.error('--pages/--limit apply only to Talabat HTTP orders')
+    if args.with_addresses and (args.app != 'talabat' or args.command != 'orders' or args.ui):
+        parser.error('--with-addresses applies only to Talabat HTTP orders')
     if args.command == 'track' and not args.order:
         parser.error('track requires an order ID')
     if args.ui:
@@ -296,7 +300,7 @@ def main(argv=None):
     try:
         result = (track(args.app, args.order, args.timeout) if args.command == 'track' else
                   orders(args.app, 'minutes' if args.minutes else args.service, args.page, args.timeout,
-                         args.pages, args.limit))
+                         args.pages, args.limit, args.with_addresses))
     except OrderError as exc:
         result = {'ok': False, 'app': args.app, 'order': args.order, 'status': 'unknown',
                   'error': str(exc), 'eta': None, 'rider': None}

@@ -284,6 +284,8 @@ def project(data, order):
         raise TalabatError('SCHEMA_CHANGED')
     stage = STAGES.get(raw, 'unknown')
     details = visible_details(data, order, stage)
+    from talabat_delivery_address import project as project_address
+    address = project_address(data, order)
     stage_source = 'common_tracking_event_attributes.delivery_status'
     if stage == 'out for delivery' and details['status_text'] == 'Your order is nearby':
         stage = 'nearby'
@@ -294,7 +296,7 @@ def project(data, order):
             'order_id_verified': True, 'order_account_verified': False,
             'order_list_present': None, 'purchase_confirmed': False,
             'payment_capture_verified': None,
-            'eta': None, **details,
+            'eta': None, **details, **address,
             'checked_at': dt.datetime.now(dt.timezone.utc).isoformat(),
             'coverage': 'exact_record_pending_confirmation_preparing_out_for_delivery_nearby_delivered; payment_capture_unverified; display_eta_only_no_absolute_timezone; instantiated_rider_name_only'}
     if raw in ('order_confirming', 'order_confirmingdelayed'):
