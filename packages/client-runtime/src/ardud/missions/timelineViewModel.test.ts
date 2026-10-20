@@ -1,7 +1,6 @@
 import {
   MissionEventKind,
   type DirectionCheckItem,
-  type Mission,
   type MissionActor,
   type MissionEventId,
   type MissionId,
@@ -18,24 +17,35 @@ import {
 } from "./changeLog.ts";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import {
-  portfolioFromMissions,
+  healthCounts,
+  portfolioBar,
+  portfolioChanges,
+  portfolioFacts,
+  portfolioPools,
+  portfolioSummary,
   portfolioView,
   reorderPortfolioInput,
 } from "./portfolioViewModel.ts";
+import { actorNames } from "./roomsViewModel.ts";
 import type { MissionTimelineEvent, PortfolioSnapshot } from "./source.ts";
 import {
   actorChoices,
   consequences,
   directionCheckRows,
   EMPTY_TIMELINE_FILTER,
+  eventGroup,
   eventKicker,
   eventKindLabel,
   filterTimeline,
+  inTimelineRange,
   kindChoices,
   kindGroup,
   lineage,
+  needsOlderTimeline,
+  restartEvent,
   TIMELINE_KIND_GROUP_LABEL,
   timelineDays,
+  timelineReaches,
   timelineRows,
   toggleFilter,
 } from "./timelineViewModel.ts";
@@ -156,6 +166,16 @@ describe("timeline view model", () => {
     expect(eventKindLabel("role.model-changed")).toBe("Role model changed");
   });
 
+  it("files a kind this client does not know under the server's group", () => {
+    const base = { kind: "deploy.finished" } as unknown as MissionTimelineEvent;
+    expect(eventGroup(base)).toBe("other");
+    expect(eventGroup({ ...base, group: "pool" })).toBe("pool");
+    // A kind the client knows keeps the client's finer group.
+    expect(eventGroup({ ...base, kind: "work-item.updated", group: "other" })).toBe("work");
+    const choices = kindChoices([{ ...base, group: "pool" }]);
+    expect(choices.map((choice) => choice.value)).toEqual(["pool"]);
+  });
+
   it("folds an import and a repeated boot line into one line each, under day heads", () => {
     const master: MissionActor = { _tag: "role", roleId: MASTER as never };
     const importer: MissionActor = { _tag: "system", component: "missions-import" };
@@ -211,6 +231,71 @@ describe("timeline view model", () => {
       ["Yesterday", 3, 1],
       ["Fri 16 Oct", 1, 1],
     ]);
+  });
+
+  it("names lanes and roles in Who and on each line, and says what caused a line", () => {
+    const lead = "crpko:lane-lead:crpko:lane:cell-tc";
+    const event = (seq: number, actor: MissionActor, extra = {}) =>
+      ({
+        id: `ev-${seq}` as MissionEventId,
+        missionId: CRPKO,
+        seq,
+        kind: "lane.updated",
+        actor,
+        provenance: { _tag: "system", component: "missions-policy" },
+        summary: `Event ${seq}`,
+        subject: null,
+        causedBy: null,
+        payload: null,
+        at: "2026-10-19T08:00:00.000Z",
+        ...extra,
+      }) as MissionTimelineEvent;
+    const cause = { ...event(1, { _tag: "owner" }), summary: "Rule 104 added" };
+    const events = [
+      event(3, { _tag: "role", roleId: lead as never }, { causedBy: "ev-1" }),
+      event(2, { _tag: "role", roleId: lead as never }),
+      cause,
+    ];
+    const names = actorNames([], [{ id: lead as never, name: "cell-tc" }]);
+    expect(actorChoices(events, MASTER, names).map((choice) => choice.label)).toEqual([
+      "you",
+      "cell-tc",
+    ]);
+    const rows = timelineRows(events, events, MASTER, names);
+    expect(rows.map((row) => [row.actor, row.because, row.led])).toEqual([
+      ["cell-tc", "Because rule 104 added", 0],
+      ["cell-tc", null, 0],
+      ["you", null, 1],
+    ]);
+  });
+
+  it("reads Today and 7 days in the reader's zone and pages back only while in range", () => {
+    const at = (iso: string, kind = "lane.updated") => ({ at: iso, kind }) as MissionTimelineEvent;
+    const now = Date.parse("2026-10-19T22:30:00.000Z");
+    // 22:30 UTC is already the 20th in Dubai, so 21:00 UTC is "today" only in UTC.
+    expect(inTimelineRange(at("2026-10-19T19:00:00.000Z"), "today", now, "UTC")).toBe(true);
+    expect(inTimelineRange(at("2026-10-19T19:00:00.000Z"), "today", now, "Asia/Dubai")).toBe(false);
+    expect(inTimelineRange(at("2026-10-13T00:00:00.000Z"), "week", now)).toBe(true);
+    expect(inTimelineRange(at("2026-10-12T00:00:00.000Z"), "week", now)).toBe(false);
+
+    const window = (events: MissionTimelineEvent[], hasOlder: boolean) => ({ events, hasOlder });
+    const recent = [at("2026-10-19T20:00:00.000Z"), at("2026-10-15T20:00:00.000Z")];
+    expect(needsOlderTimeline(window(recent, true), "week", now)).toBe(true);
+    expect(needsOlderTimeline(window(recent, true), "today", now, "UTC")).toBe(false);
+    expect(needsOlderTimeline(window(recent, false), "week", now)).toBe(false);
+    // "All" pages on request, never by itself.
+    expect(needsOlderTimeline(window(recent, true), "all", now)).toBe(false);
+
+    expect(timelineReaches(window(recent, true), "2026-10-15T20:00:00.000Z")).toBe(true);
+    expect(timelineReaches(window(recent, true), "2026-10-04T15:41:48.000Z")).toBe(false);
+    const log = [
+      at("2026-10-04T16:08:06.000Z", "recovery.incident-cleared"),
+      at("2026-10-04T15:45:00.000Z", "recovery.thread-decided"),
+      at("2026-10-04T15:41:48.000Z", "recovery.incident-opened"),
+      at("2026-10-04T15:40:00.000Z", "recovery.incident-cleared"),
+    ];
+    expect(restartEvent(log, "2026-10-04T15:41:48.000Z")?.kind).toBe("recovery.incident-opened");
+    expect(restartEvent(log, "2026-10-05T00:00:00.000Z")).toBeNull();
   });
 
   it("folds repeated structural changes in the direction check, never calls", () => {
@@ -312,29 +397,42 @@ describe("portfolio view model", () => {
     portfolio.close();
   });
 
-  it("orders live missions by tier then weight when the server has no portfolio", () => {
-    const base = {
-      status: "active",
-      masterRoleId: null,
-      guaranteedShare: 0.4,
-      borrowCeiling: 0.8,
-    } as const;
-    const mission = (id: string, tier: "P0" | "P1" | "P2", weight: number) =>
-      ({ ...base, id, title: id, tier, weight }) as unknown as Mission;
-    const snapshot = portfolioFromMissions([
-      { mission: mission("background", "P2", 9), usageShare: null },
-      { mission: mission("light", "P1", 1), usageShare: 0.5 },
-      { mission: mission("heavy", "P1", 5), usageShare: 1.5 },
-      { mission: mission("top", "P0", 1), usageShare: 0 },
+  it("reads the order bar, the page line, the shared pools and the changes", async () => {
+    const missions = source();
+    const portfolio = live<PortfolioSnapshot>((l) => missions.subscribePortfolio(l));
+    const view = portfolioView(portfolio.value);
+    const bar = portfolioBar(view);
+    expect(bar.shares.map((share) => [share.title, share.share, share.paused])).toEqual([
+      ["Crpko engineering", 0.7, false],
+      ["Juno intents", 0.05, true],
     ]);
-    expect(snapshot.order).toEqual(["top", "heavy", "light", "background"]);
-    expect(snapshot.orderChange).toBeNull();
-    const rows = portfolioView(snapshot).rows;
-    expect(rows.map((row) => row.usedLine)).toEqual([
-      "Using 0%: borrowing 0%",
-      "Using 60%: borrowing 20%",
-      "Using 20%: borrowing 0%",
-      "Not measured yet",
+    expect(bar.free).toBeCloseTo(0.25);
+    const text = portfolioSummary(bar)
+      .map((part) => (typeof part === "string" ? part : part.figure))
+      .join("");
+    expect(text).toBe(
+      "Crpko engineering takes 70% of the shared pools. Juno intents is paused. 25% is free.",
+    );
+    expect(portfolioFacts(view.rows[1]!).map((fact) => fact.value)).toEqual([
+      "5%",
+      "Not measured",
+      "15%",
     ]);
+    const offbox = portfolioPools(view).find((pool) => pool.poolId === "pool-offbox");
+    expect(offbox?.line).toBe("Crpko engineering 92%, Juno intents 8%");
+
+    const input = reorderPortfolioInput(portfolio.value.order, JUNO, CRPKO);
+    if (!input.ok) throw new Error(input.error);
+    await missions.setPortfolioOrder(input.value);
+    const [newest] = portfolioChanges(portfolio.value);
+    expect(newest).toMatchObject({
+      text: "Order: Juno intents, then Crpko engineering",
+      by: "you",
+    });
+    expect(healthCounts([{ health: "amber" }, { health: "green" }, { health: "amber" }])).toEqual([
+      { health: "amber", count: 2, label: "2 at risk" },
+      { health: "green", count: 1, label: "1 on track" },
+    ]);
+    portfolio.close();
   });
 });

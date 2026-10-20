@@ -42,7 +42,7 @@ import type {
   MissionsSource,
   Unsubscribe,
 } from "../source.ts";
-import { groupBlockers, laneCountsOf, type HeldItem } from "../viewModel.ts";
+import { actorKey, groupBlockers, laneCountsOf, type HeldItem } from "../viewModel.ts";
 import * as data from "./data.ts";
 import { createEventLog } from "./eventLog.ts";
 import { createOperations } from "./operations.ts";
@@ -167,8 +167,14 @@ export function createFixtureMissionsSource(
   const ownerReadSeq = new Map<string, number>(Object.entries(data.ownerReadSeq));
   // Room records derive lastSeq/lastMessageAt from their messages.
   const roomRecord = (def: (typeof data.roomDefs)[number]) => {
-    const last = messagesByRoom.get(def.id)?.at(-1);
-    return { ...def, lastSeq: last?.seq ?? 0, lastMessageAt: last?.createdAt ?? null };
+    const list = messagesByRoom.get(def.id) ?? [];
+    const last = list.at(-1);
+    return {
+      ...def,
+      lastSeq: last?.seq ?? 0,
+      lastMessageAt: last?.createdAt ?? null,
+      messageCount: list.length,
+    };
   };
   const rooms: Room[] = [...decodeRooms(data.roomDefs.map(roomRecord))];
   let nextLocalId = 1;
@@ -476,12 +482,26 @@ export function createFixtureMissionsSource(
     const older = all.filter((m) => m.seq < beforeSeq);
     const take = Math.max(0, Math.min(limit, ROOM_PAGE_MAX));
     const page = older.slice(Math.max(0, older.length - take));
+    // Like the server: everyone who wrote or was addressed is in the room, with
+    // the names the page shows for them.
+    const members = new Map<string, MissionActor>();
+    for (const message of all) {
+      for (const actor of [message.author, ...message.to]) {
+        if (actor._tag === "lane" || actor._tag === "role") members.set(actorKey(actor), actor);
+      }
+    }
+    const names: Record<string, string> = {};
+    for (const lane of lanes) {
+      if (members.has(`lane:${lane.id}`)) names[`lane:${lane.id}`] = lane.name;
+    }
     return {
       room,
       messages: page,
       subscriptions: subscriptions.filter((sub) => sub.roomId === room.id),
       ownerReadSeq: ownerReadSeq.get(room.id) ?? 0,
       hasOlder: page.length < older.length,
+      names,
+      members: [...members.values()],
     };
   }
 
@@ -566,7 +586,14 @@ export function createFixtureMissionsSource(
     messagesByRoom.set(message.roomId, list);
     const index = rooms.findIndex((r) => r.id === message.roomId);
     const room = rooms[index];
-    if (room) rooms[index] = { ...room, lastSeq: message.seq, lastMessageAt: message.createdAt };
+    if (room) {
+      rooms[index] = {
+        ...room,
+        lastSeq: message.seq,
+        lastMessageAt: message.createdAt,
+        messageCount: list.length,
+      };
+    }
   }
 
   /** The room an owner answer lands in: the ask's sub-mission room, else control. */
@@ -1083,13 +1110,15 @@ export function createFixtureMissionsSource(
       if (input.ruleId && !existing) return fail("not-found", `Rule ${input.ruleId} not found.`);
       const scope = input.scope ?? { subMissionIds: [], roleKinds: [], laneIds: [] };
       const edited = existing
-        ? (["title", "quote", "scope", "activation", "status"] as const).filter((field) => {
-            const next =
-              field === "title" || field === "quote"
-                ? input[field]
-                : (input[field] ?? existing[field]);
-            return JSON.stringify(existing[field]) !== JSON.stringify(next);
-          })
+        ? (["title", "quote", "scope", "activation", "status", "masterReading"] as const).filter(
+            (field) => {
+              const next =
+                field === "title" || field === "quote"
+                  ? input[field]
+                  : (input[field] ?? existing[field]);
+              return JSON.stringify(existing[field]) !== JSON.stringify(next);
+            },
+          )
         : [];
       if (existing && edited.length === 0) return Promise.resolve(existing);
       // Acks are per version: only a change to what lanes follow asks them to ack again.
@@ -1105,6 +1134,7 @@ export function createFixtureMissionsSource(
             scope: input.scope ?? existing.scope,
             activation: input.activation ?? existing.activation,
             status: input.status ?? existing.status,
+            masterReading: input.masterReading ?? existing.masterReading,
             version: reAck ? existing.version + 1 : existing.version,
             updatedAt: at,
           })
@@ -1116,7 +1146,7 @@ export function createFixtureMissionsSource(
             quote: input.quote,
             quotedAt: at,
             provenance: ownerProvenance(),
-            masterReading: "",
+            masterReading: input.masterReading ?? "",
             scope,
             activation: input.activation ?? "",
             status: input.status ?? "active",

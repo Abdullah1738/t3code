@@ -1,8 +1,9 @@
 import type { DirectionCheckItem, MissionActor } from "@t3tools/contracts";
 import { DateTime } from "effect";
 
-import type { MissionTimelineEvent } from "./source.ts";
-import { actorKey, actorLabel, formatDayLabel } from "./viewModel.ts";
+import { type ActorNames, actorName } from "./roomsViewModel.ts";
+import type { MissionTimelineEvent, MissionTimelineWindow } from "./source.ts";
+import { actorKey, formatDayLabel } from "./viewModel.ts";
 
 // Timeline tab: the mission's event log, newest first, under day heads,
 // filtered by kind and actor, with each event's cause chain. Repeated lines
@@ -105,6 +106,12 @@ export function kindGroup(kind: string): TimelineKindGroup {
   return PREFIXES[prefixOf(kind)]?.group ?? "other";
 }
 
+/** An event's group: the client's own for kinds it knows, else the server's. */
+export function eventGroup(event: MissionTimelineEvent): TimelineKindGroup {
+  const group = kindGroup(event.kind);
+  return group === "other" && event.group !== undefined ? event.group : group;
+}
+
 /** The kicker a row shows for its kind: "Lane", "Hold", "Succession". */
 export function eventKicker(kind: string): string {
   const known = KIND_KICKER[kind] ?? PREFIXES[prefixOf(kind)]?.kicker;
@@ -128,7 +135,7 @@ export function filterTimeline(
 ): MissionTimelineEvent[] {
   return events.filter(
     (event) =>
-      (filter.groups.length === 0 || filter.groups.includes(kindGroup(event.kind))) &&
+      (filter.groups.length === 0 || filter.groups.includes(eventGroup(event))) &&
       (filter.actors.length === 0 || filter.actors.includes(actorKey(event.actor))),
   );
 }
@@ -143,24 +150,28 @@ export interface FilterChoice<T> {
   readonly count: number;
 }
 
-/** Kind groups present in the log, with counts, in label order. */
+/** Kind groups present in the log, with counts, the busiest first. */
 export function kindChoices(
   events: ReadonlyArray<MissionTimelineEvent>,
 ): FilterChoice<TimelineKindGroup>[] {
   const counts = new Map<TimelineKindGroup, number>();
   for (const event of events) {
-    const group = kindGroup(event.kind);
+    const group = eventGroup(event);
     counts.set(group, (counts.get(group) ?? 0) + 1);
   }
   return [...counts]
     .map(([value, count]) => ({ value, label: TIMELINE_KIND_GROUP_LABEL[value], count }))
-    .sort((left, right) => left.label.localeCompare(right.label));
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
 }
 
-/** Actors present in the log, you and the master first, then by how often they appear. */
+/**
+ * Actors present in the log, you and the master first, then by how often they
+ * appear. Lanes and roles read by name when `names` has them.
+ */
 export function actorChoices(
   events: ReadonlyArray<MissionTimelineEvent>,
   masterRoleId: string | null,
+  names?: ActorNames,
 ): FilterChoice<string>[] {
   const seen = new Map<string, { actor: MissionActor; count: number }>();
   for (const event of events) {
@@ -172,17 +183,19 @@ export function actorChoices(
   const rank = (actor: MissionActor) =>
     actor._tag === "owner" ? 0 : actor._tag === "role" && actor.roleId === masterRoleId ? 1 : 2;
   return [...seen]
-    .sort(
-      ([, left], [, right]) =>
-        rank(left.actor) - rank(right.actor) ||
-        right.count - left.count ||
-        actorLabel(left.actor, masterRoleId).localeCompare(actorLabel(right.actor, masterRoleId)),
-    )
     .map(([value, entry]) => ({
       value,
-      label: actorLabel(entry.actor, masterRoleId),
+      actor: entry.actor,
+      label: actorName(entry.actor, masterRoleId, names),
       count: entry.count,
-    }));
+    }))
+    .sort(
+      (left, right) =>
+        rank(left.actor) - rank(right.actor) ||
+        right.count - left.count ||
+        left.label.localeCompare(right.label),
+    )
+    .map(({ value, label, count }) => ({ value, label, count }));
 }
 
 /**
@@ -238,6 +251,10 @@ export interface TimelineLine {
   readonly count: number;
   /** Events before (causes) and after (direct consequences) this one in its chain. */
   readonly lineageSteps: number;
+  /** "Because rule 104 added": the direct cause, when it is in the log. */
+  readonly because: string | null;
+  /** Events this one caused directly. */
+  readonly led: number;
 }
 
 export interface TimelineDay {
@@ -309,9 +326,12 @@ export function timelineRows(
   events: ReadonlyArray<MissionTimelineEvent>,
   all: ReadonlyArray<MissionTimelineEvent>,
   masterRoleId: string | null,
+  names?: ActorNames,
 ): TimelineLine[] {
   const caused = new Map<string, number>();
+  const byId = new Map<string, MissionTimelineEvent>();
   for (const event of all) {
+    byId.set(event.id, event);
     if (event.causedBy) caused.set(event.causedBy, (caused.get(event.causedBy) ?? 0) + 1);
   }
   const runs: MissionTimelineEvent[][] = [];
@@ -331,19 +351,26 @@ export function timelineRows(
           ? "master"
           : null;
     const summary = (isImport(event) ? importSummary(run) : null) ?? event.summary;
+    const cause = event.causedBy ? byId.get(event.causedBy) : undefined;
     return {
       key: run.length === 1 ? event.id : `${event.id}+${run.length}`,
       event,
       kicker: eventKicker(event.kind),
       summary,
-      group: kindGroup(event.kind),
+      group: eventGroup(event),
       by,
-      actor: actorLabel(actor, masterRoleId),
+      actor: actorName(actor, masterRoleId, names),
       count: run.length,
       lineageSteps: lineage(event, all).length - 1 + (caused.get(event.id) ?? 0),
+      because: cause ? `Because ${sentenceTail(cause.summary)}` : null,
+      led: caused.get(event.id) ?? 0,
     } satisfies TimelineLine;
   });
 }
+
+/** A summary set mid-sentence: "Rule 104 added" reads "rule 104 added"; "PR #12" stays. */
+const sentenceTail = (text: string) =>
+  /^[A-Z][a-z]/.test(text) ? text.charAt(0).toLowerCase() + text.slice(1) : text;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -382,6 +409,57 @@ export function timelineDays(
     }
   }
   return days;
+}
+
+/** How far back the timeline reads: today, the last 7 days, or everything loaded. */
+export type TimelineRange = "today" | "week" | "all";
+
+export function inTimelineRange(
+  event: Pick<MissionTimelineEvent, "at">,
+  range: TimelineRange,
+  nowMs: number,
+  timeZone?: string,
+): boolean {
+  if (range === "all") return true;
+  if (range === "week") return Date.parse(event.at) >= nowMs - 7 * DAY_MS;
+  const today = formatDayLabel(DateTime.formatIso(DateTime.makeUnsafe(nowMs)), timeZone);
+  return formatDayLabel(event.at, timeZone) === today;
+}
+
+/**
+ * Whether the range may reach past the loaded pages: the server has older
+ * events and the oldest loaded one still falls inside the range. "All" pages
+ * on request instead, so it never loads the whole log by itself.
+ */
+export function needsOlderTimeline(
+  window: MissionTimelineWindow,
+  range: TimelineRange,
+  nowMs: number,
+  timeZone?: string,
+): boolean {
+  if (!window.hasOlder || range === "all") return false;
+  const oldest = window.events.at(-1);
+  return oldest === undefined || inTimelineRange(oldest, range, nowMs, timeZone);
+}
+
+/** Whether the loaded pages reach back to an instant, or the log has nothing older. */
+export function timelineReaches(window: MissionTimelineWindow, atIso: string): boolean {
+  if (!window.hasOlder) return true;
+  const oldest = window.events.at(-1);
+  return oldest !== undefined && Date.parse(oldest.at) <= Date.parse(atIso);
+}
+
+/** The restart line to jump to: the oldest recovery event at or after the restart was found. */
+export function restartEvent(
+  events: ReadonlyArray<MissionTimelineEvent>,
+  detectedAt: string,
+): MissionTimelineEvent | null {
+  const from = Date.parse(detectedAt);
+  let found: MissionTimelineEvent | null = null;
+  for (const event of events) {
+    if (eventGroup(event) === "recovery" && Date.parse(event.at) >= from) found = event;
+  }
+  return found;
 }
 
 // --- Since you last looked: the direction check ---

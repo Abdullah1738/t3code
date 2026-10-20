@@ -1,26 +1,27 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 
-import type { MissionId, MissionMessage, RoomId } from "@t3tools/contracts";
+import type { MissionId, MissionMessage, MissionMessageKind, RoomId } from "@t3tools/contracts";
 import {
   COMPOSER_TARGET_LABEL,
   composerState,
-  formatRelative,
+  formatTimeOfDay,
   groupRooms,
   MESSAGE_KIND_LABEL,
-  MESSAGE_MAX_CHARS,
-  messageAddressLine,
-  noiseView,
+  messageParties,
   receiptView,
-  ROOM_KIND_LABEL,
-  roomName,
+  roomChipLabel,
+  roomListLine,
+  roomMembersLine,
+  roomsSummary,
+  roomStats,
   statusRunLine,
-  wakesFor,
+  type ActorNames,
   type ComposerTarget,
 } from "@t3tools/client-runtime/ardud/missions";
 
-import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
+import { Checkbox } from "../../components/ui/checkbox";
 import {
   Select,
   SelectItem,
@@ -29,90 +30,123 @@ import {
   SelectValue,
 } from "../../components/ui/select";
 import { Textarea } from "../../components/ui/textarea";
-import { Toggle, ToggleGroup } from "../../components/ui/toggle-group";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { MetaRow } from "./cards/chips";
+import { DESK_ROW, DeskChip, Figure, PageLine, Segmented } from "./deskParts";
 import { MissionLinkList } from "./MissionLinkText";
-import { MissionSection } from "./MissionSection";
 import { useMasterRoleId, useMissionRooms } from "./missionsStore";
 import { useRoomScreen, type RoomScreen } from "./useRoomScreen";
 
-// Rooms tab (design v3 §5). Layout only: grouping, noise, timeline folding,
-// read marker, composer rules and the rule offer all come from client-runtime
-// (roomsViewModel) through `useRoomScreen`. Restyle freely.
+// Rooms tab, Desk layout: the room list next to the open room. On a phone the
+// list comes first and a room opens on its own with a way back. Grouping,
+// names, folding, the read marker and composer rules come from client-runtime
+// (roomsViewModel) through `useRoomScreen`.
+
+const COUNT = new Intl.NumberFormat("en-US");
+
+const roomTitle = (title: string) => title.replace(/^#/, "");
 
 export function RoomsTab(props: { missionId: MissionId; roomId: RoomId | null; nowMs: number }) {
   const rooms = useMissionRooms(props.missionId);
   const masterRoleId = useMasterRoleId(props.missionId);
-  if (!rooms) return <p className="text-sm text-muted-foreground">Loading rooms…</p>;
+  const wide = useMediaQuery({ min: "lg" });
+  if (!rooms) return <p className="text-sm text-(--m-muted)">Loading rooms…</p>;
   const groups = groupRooms(rooms);
+  const summary = roomsSummary(rooms);
+  // On a wide screen a room is always open: the first one until the owner picks.
+  const openId = props.roomId ?? (wide ? (groups[0]?.rooms[0]?.room.id ?? null) : null);
+  const openEntry = rooms.find((entry) => entry.room.id === openId) ?? null;
   return (
-    <div className="flex min-w-0 flex-col gap-4 lg:flex-row lg:items-start">
-      <nav aria-label="Rooms" className="flex min-w-0 flex-col gap-3 lg:w-72 lg:shrink-0">
-        {groups.map((group) => (
-          <div key={group.key} className="flex flex-col gap-1">
-            <h2 className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
-              {group.label}
-              {group.unread > 0 ? (
-                <span className="tabular-nums text-foreground">
-                  <span aria-hidden>{group.unread}</span>
-                  <span className="sr-only">{`${group.unread} unread`}</span>
-                </span>
-              ) : null}
-            </h2>
-            <ul className="flex flex-col gap-1">
-              {group.rooms.map(({ room, unread }) => {
-                const noise = noiseView(room.noise);
-                const active = room.id === props.roomId;
-                return (
-                  <li key={room.id}>
-                    <Link
-                      to="/missions/$missionId"
-                      params={{ missionId: props.missionId }}
-                      search={{ tab: "rooms", room: room.id }}
-                      aria-current={active ? "page" : undefined}
-                      className={cn(
-                        "flex flex-col rounded-md px-2 py-1.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-                        active ? "bg-accent" : "hover:bg-accent/50",
-                      )}
-                    >
-                      <span className="flex items-center gap-2">
-                        <span className="min-w-0 flex-1 truncate font-medium">
-                          {roomName(room)}
+    <div className="flex min-w-0 flex-col gap-5">
+      <PageLine>
+        {summary.messages !== null ? (
+          <>
+            <Figure>{COUNT.format(summary.messages)}</Figure> messages in{" "}
+          </>
+        ) : null}
+        <Figure>{summary.rooms}</Figure> {summary.rooms === 1 ? "room" : "rooms"}
+        {summary.unread > 0 ? (
+          <>
+            , <Figure>{COUNT.format(summary.unread)}</Figure> unread
+          </>
+        ) : null}
+      </PageLine>
+      <div className="grid min-w-0 items-start gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+        <nav
+          aria-label="Rooms"
+          className={cn("flex min-w-0 flex-col gap-1", props.roomId !== null && "max-lg:hidden")}
+        >
+          {groups.map((group) => (
+            <div key={group.key} className="flex flex-col">
+              <h2 className="flex items-center justify-between px-3 pt-3.5 pb-1.5 text-xs text-(--m-muted)">
+                {group.label}
+                {group.unread > 0 ? (
+                  <span className="tabular-nums">{`${COUNT.format(group.unread)} unread`}</span>
+                ) : null}
+              </h2>
+              <ul className="flex flex-col">
+                {group.rooms.map(({ room, unread }) => {
+                  const line = roomListLine(room, props.nowMs);
+                  const active = room.id === openId;
+                  return (
+                    <li key={room.id}>
+                      <Link
+                        to="/missions/$missionId"
+                        params={{ missionId: props.missionId }}
+                        search={{ tab: "rooms", room: room.id }}
+                        aria-current={active ? "page" : undefined}
+                        className={cn(
+                          "grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-0.5 rounded-xl px-3 py-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset",
+                          active ? "bg-(--m-active)" : "hover:bg-(--m-surface)",
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            "min-w-0 truncate text-(--m-text)",
+                            unread > 0 ? "font-semibold" : "font-medium",
+                          )}
+                        >
+                          {roomTitle(room.title)}
                         </span>
                         {unread > 0 ? (
-                          <span className="tabular-nums text-xs text-foreground">{unread}</span>
+                          <span className="text-xs font-semibold text-(--m-accent-text) tabular-nums">
+                            <span aria-hidden>{COUNT.format(unread)}</span>
+                            <span className="sr-only">{`${unread} unread`}</span>
+                          </span>
+                        ) : (
+                          <span />
+                        )}
+                        {line ? (
+                          <span className="col-span-2 min-w-0 truncate text-xs text-(--m-muted) tabular-nums">
+                            {line}
+                          </span>
                         ) : null}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        <MetaRow>
-                          <span>{ROOM_KIND_LABEL[room.kind]}</span>
-                          {noise ? (
-                            <>
-                              <span className="tabular-nums">{noise.rate}</span>
-                              <span>{noise.actionable}</span>
-                              <span>{noise.wastedWakes}</span>
-                            </>
-                          ) : null}
-                        </MetaRow>
-                      </span>
-                    </Link>
-                  </li>
-                );
-              })}
-            </ul>
+                      </Link>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ))}
+        </nav>
+        {openId !== null ? (
+          <div className="flex min-w-0 flex-col gap-3">
+            <Link
+              to="/missions/$missionId"
+              params={{ missionId: props.missionId }}
+              search={{ tab: "rooms" }}
+              className="self-start rounded-full text-sm text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset lg:hidden"
+            >
+              All rooms
+            </Link>
+            <OpenRoom
+              key={openId}
+              missionId={props.missionId}
+              roomId={openId}
+              masterRoleId={masterRoleId}
+              messageCount={openEntry?.room.messageCount ?? null}
+            />
           </div>
-        ))}
-      </nav>
-      <div className="min-w-0 flex-1">
-        {props.roomId ? (
-          <OpenRoom
-            key={props.roomId}
-            missionId={props.missionId}
-            roomId={props.roomId}
-            masterRoleId={masterRoleId}
-            nowMs={props.nowMs}
-          />
         ) : null}
       </div>
     </div>
@@ -123,41 +157,51 @@ function OpenRoom(props: {
   missionId: MissionId;
   roomId: RoomId;
   masterRoleId: string | null;
-  nowMs: number;
+  messageCount: number | null;
 }) {
   const screen = useRoomScreen(props.missionId, props.roomId, props.masterRoleId);
   const { page, view } = screen;
-  if (page === undefined) return <p className="text-sm text-muted-foreground">Loading…</p>;
-  if (page === null) return <p className="text-sm text-muted-foreground">Room not found.</p>;
-  const noise = noiseView(page.room.noise);
-  const waking = screen.members.filter((member) => member.mode === "wake").length;
+  if (page === undefined) return <p className="text-sm text-(--m-muted)">Loading…</p>;
+  if (page === null) return <p className="text-sm text-(--m-muted)">Room not found.</p>;
+  const membersLine = roomMembersLine(screen.members);
+  const stats = roomStats(page.room.noise, props.messageCount);
   return (
-    <MissionSection
-      title={roomName(page.room)}
-      caption={
-        <MetaRow>
-          <span>{ROOM_KIND_LABEL[page.room.kind]}</span>
-          <span>{`${screen.members.length} members, ${waking} wake on posts`}</span>
-          {noise ? (
-            <>
-              <span className="tabular-nums">{noise.rate}</span>
-              <span>{noise.actionable}</span>
-              <span>{noise.wastedWakes}</span>
-            </>
-          ) : null}
-        </MetaRow>
-      }
+    <section
+      aria-labelledby="open-room-title"
+      className="flex min-w-0 flex-col rounded-3xl bg-(--m-surface) px-4.5 pt-5 pb-5 text-(--m-text) sm:px-7 sm:pt-6 sm:pb-7"
     >
-      {view ? (
-        <RoomTimeline screen={screen} masterRoleId={props.masterRoleId} nowMs={props.nowMs} />
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+        <DeskChip>{roomChipLabel(page.room.kind)}</DeskChip>
+        {membersLine ? (
+          <span className="text-xs text-(--m-muted) tabular-nums">{membersLine}</span>
+        ) : null}
+      </div>
+      <h2 id="open-room-title" className="mt-2.5 text-2xl font-normal text-pretty">
+        {roomTitle(page.room.title)}
+      </h2>
+      {stats.length > 0 ? (
+        <dl className="mt-4.5 grid max-w-160 grid-cols-2 gap-3 sm:grid-cols-4">
+          {stats.map((stat) => (
+            <div key={stat.label} className="flex flex-col">
+              <dt className="text-xs text-(--m-muted)">{stat.label}</dt>
+              <dd className="text-xl tabular-nums">{stat.value}</dd>
+            </div>
+          ))}
+        </dl>
       ) : null}
-      <RuleOffer screen={screen} />
-      <RoomComposer screen={screen} />
-    </MissionSection>
+      {view ? (
+        <RoomStream screen={screen} masterRoleId={props.masterRoleId} names={page.names} />
+      ) : null}
+      <RoomComposer screen={screen} roomTitle={roomTitle(page.room.title)} />
+    </section>
   );
 }
 
-function RoomTimeline(props: { screen: RoomScreen; masterRoleId: string | null; nowMs: number }) {
+function RoomStream(props: {
+  screen: RoomScreen;
+  masterRoleId: string | null;
+  names: ActorNames | undefined;
+}) {
   const { screen } = props;
   const view = screen.view;
   const scroller = useRef<HTMLDivElement>(null);
@@ -166,7 +210,7 @@ function RoomTimeline(props: { screen: RoomScreen; masterRoleId: string | null; 
   const lastSeq = view?.messages[view.messages.length - 1]?.seq ?? null;
   const anchor = useRef<{ firstSeq: number | null; height: number } | null>(null);
 
-  // Open at the read marker (or the newest message); keep the reading
+  // Open at the "new" divider (or the newest message); keep the reading
   // position when an older page is prepended; follow new messages at the bottom.
   useLayoutEffect(() => {
     const element = scroller.current;
@@ -197,70 +241,70 @@ function RoomTimeline(props: { screen: RoomScreen; masterRoleId: string | null; 
   }, [canLoadOlder, loadOlder]);
 
   if (!view) return null;
+  const row = (message: MissionMessage) => (
+    <MessageRow
+      key={message.id}
+      message={message}
+      masterRoleId={props.masterRoleId}
+      names={props.names}
+    />
+  );
   return (
-    <div ref={scroller} className="flex max-h-[65vh] min-h-48 flex-col overflow-y-auto">
-      <div ref={top} className="py-1 text-center text-xs text-muted-foreground">
-        {screen.ui.loadingOlder
-          ? "Loading older messages…"
-          : view.hasOlder
-            ? "Scroll up for older messages"
-            : "Start of the room"}
+    <div
+      ref={scroller}
+      className="mt-4.5 flex max-h-[65vh] min-h-48 max-w-[76ch] flex-col overflow-y-auto"
+    >
+      <div ref={top} className="min-h-px">
+        {screen.ui.loadingOlder ? (
+          <p className="h-9 text-sm text-(--m-muted)">Loading…</p>
+        ) : canLoadOlder ? (
+          <button
+            type="button"
+            onClick={loadOlder}
+            className="flex h-9 w-full items-center text-start text-sm text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset"
+          >
+            Show earlier
+          </button>
+        ) : null}
       </div>
-      <ol className="flex flex-col gap-2">
-        {view.rows.map((row) => {
-          switch (row.kind) {
+      <ol className="flex flex-col">
+        {view.rows.map((item) => {
+          switch (item.kind) {
             case "day":
               return (
-                <li key={row.key} className="py-1 text-center text-xs text-muted-foreground">
-                  {row.day}
+                <li key={item.key} className="pt-4 pb-1.5 text-xs text-(--m-muted)">
+                  {item.day}
                 </li>
               );
             case "read-marker":
               return (
                 <li
-                  key={row.key}
+                  key={item.key}
                   data-read-marker
-                  className="border-t border-destructive/60 pt-0.5 text-xs text-destructive-foreground"
+                  className="flex items-center gap-2.5 py-1.5 text-xs font-semibold text-(--m-accent-text) tabular-nums after:h-px after:flex-1 after:bg-(--m-accent)/45"
                 >
-                  {row.unread} new since you last read
+                  {`${COUNT.format(item.unread)} new`}
                 </li>
               );
             case "status-run":
               return (
-                <li key={row.key} className="flex flex-col gap-1">
+                <li key={item.key} className={cn("flex flex-col", DESK_ROW)}>
                   <button
                     type="button"
-                    aria-expanded={row.expanded}
-                    onClick={() => screen.dispatch({ type: "toggle-run", key: row.key })}
-                    className="self-start rounded text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    aria-expanded={item.expanded}
+                    onClick={() => screen.dispatch({ type: "toggle-run", key: item.key })}
+                    className="grid grid-cols-[44px_minmax(0,1fr)] gap-x-3 py-2.5 text-start text-sm text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset"
                   >
-                    {statusRunLine(row.messages.length)} {row.expanded ? "Collapse" : "Expand"}
+                    <span />
+                    <span className="tabular-nums">{statusRunLine(item.messages)}</span>
                   </button>
-                  {row.expanded ? (
-                    <ol className="flex flex-col gap-1">
-                      {row.messages.map((message) => (
-                        <MessageRow
-                          key={message.id}
-                          message={message}
-                          masterRoleId={props.masterRoleId}
-                          nowMs={props.nowMs}
-                          compact
-                        />
-                      ))}
-                    </ol>
+                  {item.expanded ? (
+                    <ol className="flex flex-col">{item.messages.map(row)}</ol>
                   ) : null}
                 </li>
               );
             case "message":
-              return (
-                <MessageRow
-                  key={row.key}
-                  message={row.message}
-                  masterRoleId={props.masterRoleId}
-                  nowMs={props.nowMs}
-                  compact={row.message.kind === "status"}
-                />
-              );
+              return row(item.message);
           }
         })}
       </ol>
@@ -268,75 +312,74 @@ function RoomTimeline(props: { screen: RoomScreen; masterRoleId: string | null; 
   );
 }
 
-const KIND_BADGE = {
-  request: "info",
-  decision: "success",
-  status: "outline",
-  evidence: "secondary",
-  blocker: "error",
-  control: "warning",
-} as const;
+const KIND_TONE: Partial<Record<MissionMessageKind, string>> = {
+  decision: "text-(--m-accent-text)",
+  blocker: "text-(--m-negative)",
+};
 
 function MessageRow(props: {
   message: MissionMessage;
   masterRoleId: string | null;
-  nowMs: number;
-  compact?: boolean;
+  names: ActorNames | undefined;
 }) {
   const { message } = props;
   const receipt = receiptView(message.receipt);
+  const parties = messageParties(message, props.masterRoleId, props.names);
   return (
-    <li className={cn("flex min-w-0 flex-col gap-0.5 text-sm", props.compact && "text-xs")}>
-      <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
-        <Badge variant={KIND_BADGE[message.kind]} size="sm">
-          {MESSAGE_KIND_LABEL[message.kind]}
-        </Badge>
-        <span>{messageAddressLine(message, props.masterRoleId)}</span>
-        <span className="tabular-nums">#{message.seq}</span>
-        <span>{formatRelative(message.createdAt, props.nowMs)}</span>
-        {receipt ? (
-          <span className={receipt.complete ? undefined : "text-warning-foreground"}>
-            {receipt.label}
+    <li
+      className={cn(
+        "grid min-w-0 grid-cols-[44px_minmax(0,1fr)] gap-x-3 py-2.5 text-sm max-sm:grid-cols-[38px_minmax(0,1fr)]",
+        DESK_ROW,
+      )}
+    >
+      <time dateTime={message.createdAt} className="pt-0.5 text-xs text-(--m-muted) tabular-nums">
+        {formatTimeOfDay(message.createdAt)}
+      </time>
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <b className="font-semibold">{parties.from}</b>
+          {parties.to ? <span className="text-xs text-(--m-muted)">to {parties.to}</span> : null}
+          <span
+            className={cn(
+              "inline-flex h-5 items-center rounded-full bg-(--m-chip) px-2 text-xs",
+              KIND_TONE[message.kind] ?? "text-(--m-muted)",
+            )}
+          >
+            {MESSAGE_KIND_LABEL[message.kind].toLowerCase()}
           </span>
-        ) : null}
-        {receipt?.pending ? (
-          <span className="text-warning-foreground">{receipt.pending}</span>
+          {receipt ? (
+            <span className="text-xs text-(--m-muted) tabular-nums">
+              {receipt.label}
+              {receipt.pending ? (
+                <span className="text-(--m-warning)">{`, ${receipt.pending}`}</span>
+              ) : null}
+            </span>
+          ) : null}
+        </div>
+        <p className="text-pretty">{message.summary}</p>
+        {message.links.length > 0 ? (
+          <p className="text-xs text-(--m-muted)">
+            <MissionLinkList links={message.links} />
+          </p>
         ) : null}
       </div>
-      <p className={cn("text-pretty", props.compact ? "text-muted-foreground" : "text-foreground")}>
-        {message.summary}
-      </p>
-      {message.links.length > 0 ? (
-        <p className="text-xs text-muted-foreground">
-          <MissionLinkList links={message.links} />
-        </p>
-      ) : null}
     </li>
   );
 }
 
-function RuleOffer(props: { screen: RoomScreen }) {
-  const offer = props.screen.ruleOffer;
-  if (offer === null) return null;
-  return (
-    <div className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 p-2 text-sm">
-      <span className="min-w-0 flex-1">Scribe: turn your correction into a standing rule?</span>
-      <Button size="xs" onClick={() => void props.screen.saveRule(offer)}>
-        Save as a rule
-      </Button>
-      <Button size="xs" variant="ghost" onClick={() => props.screen.skipRule(offer)}>
-        Not now
-      </Button>
-    </div>
-  );
-}
+/** Characters left shows only near the limit. */
+const NEAR_LIMIT = 40;
 
-function RoomComposer(props: { screen: RoomScreen }) {
+function RoomComposer(props: { screen: RoomScreen; roomTitle: string }) {
   const { screen } = props;
   const { target, text } = screen.ui;
+  const [asRule, setAsRule] = useState(false);
   const state = composerState(text);
   const lanes = screen.members;
   const laneKey = target.kind === "lane" ? lanesKeyOf(lanes, target) : null;
+  const kinds = (Object.keys(COMPOSER_TARGET_LABEL) as ComposerTarget["kind"][]).filter(
+    (kind) => kind !== "lane" || lanes.length > 0,
+  );
   const setKind = (kind: ComposerTarget["kind"]) => {
     if (kind === "lane") {
       const first = lanes[0];
@@ -345,31 +388,34 @@ function RoomComposer(props: { screen: RoomScreen }) {
     }
     screen.dispatch({ type: "target", target: { kind } });
   };
-  const wakes =
-    target.kind === "room" ? wakesFor(lanes, "control").map((member) => member.label) : null;
   return (
     <form
-      className="flex flex-col gap-2 border-t border-border/60 pt-3"
+      className="mt-4.5 flex max-w-[76ch] flex-col gap-2 rounded-3xl bg-(--m-raised) py-3 ps-4.5 pe-3.5 text-sm text-(--m-text)"
       onSubmit={(event) => {
         event.preventDefault();
-        void screen.send();
+        const saveAsRule = target.kind === "correction" && asRule;
+        void screen.send(saveAsRule).then((sent) => {
+          if (sent) setAsRule(false);
+        });
       }}
     >
+      <Textarea
+        unstyled
+        aria-label="Message"
+        placeholder={
+          target.kind === "correction" ? "Correct the master" : `Post to ${props.roomTitle}`
+        }
+        value={text}
+        onChange={(event) => screen.dispatch({ type: "text", text: event.target.value })}
+        className="w-full"
+      />
       <div className="flex flex-wrap items-center gap-2">
-        <ToggleGroup
-          aria-label="Who the message is for"
-          value={[target.kind]}
-          onValueChange={(next) => {
-            const kind = next[0] as ComposerTarget["kind"] | undefined;
-            if (kind) setKind(kind);
-          }}
-        >
-          {(Object.keys(COMPOSER_TARGET_LABEL) as ComposerTarget["kind"][]).map((kind) => (
-            <Toggle key={kind} value={kind} disabled={kind === "lane" && lanes.length === 0}>
-              {COMPOSER_TARGET_LABEL[kind]}
-            </Toggle>
-          ))}
-        </ToggleGroup>
+        <Segmented
+          label="Who the post is for"
+          value={target.kind}
+          options={kinds.map((kind) => ({ value: kind, label: COMPOSER_TARGET_LABEL[kind] }))}
+          onChange={setKind}
+        />
         {target.kind === "lane" ? (
           <Select
             value={laneKey ?? ""}
@@ -390,22 +436,27 @@ function RoomComposer(props: { screen: RoomScreen }) {
             </SelectPopup>
           </Select>
         ) : null}
-      </div>
-      <Textarea
-        size="sm"
-        aria-label="Message"
-        placeholder={target.kind === "correction" ? "Correction" : "Message the room…"}
-        value={text}
-        onChange={(event) => screen.dispatch({ type: "text", text: event.target.value })}
-      />
-      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-        <span className={cn("tabular-nums", state.overLimit && "text-destructive-foreground")}>
-          {state.remaining} of {MESSAGE_MAX_CHARS} left
+        {target.kind === "correction" ? (
+          <label className="flex items-center gap-2 text-sm text-(--m-muted)">
+            <Checkbox checked={asRule} onCheckedChange={(checked) => setAsRule(checked)} />
+            Save as a rule
+          </label>
+        ) : null}
+        <span className="ms-auto flex items-center gap-3">
+          {state.remaining < NEAR_LIMIT ? (
+            <span
+              className={cn(
+                "text-xs tabular-nums",
+                state.overLimit ? "text-(--m-negative)" : "text-(--m-muted)",
+              )}
+            >
+              {state.remaining}
+            </span>
+          ) : null}
+          <Button type="submit" size="sm" disabled={!state.canSend}>
+            Send
+          </Button>
         </span>
-        {wakes && wakes.length > 0 ? <span>Wakes {wakes.join(", ")}</span> : null}
-        <Button type="submit" size="sm" className="ms-auto" disabled={!state.canSend}>
-          Send
-        </Button>
       </div>
     </form>
   );
