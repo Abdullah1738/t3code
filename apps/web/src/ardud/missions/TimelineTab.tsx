@@ -263,6 +263,7 @@ function EventRow(props: {
   onToggle: () => void;
 }) {
   const { row } = props;
+  const { revert } = row;
   const steps = row.lineageSteps;
   return (
     <li
@@ -295,12 +296,9 @@ function EventRow(props: {
           ) : null}
         </p>
         <p className="mt-0.75 max-w-prose text-sm text-pretty">{row.summary}</p>
-        {row.revert ? (
+        {revert ? (
           <div className="mt-1 self-start">
-            <RevertButton
-              label={`Revert: ${row.summary}`}
-              onRevert={() => revertChange(row.revert!)}
-            />
+            <RevertButton label={`Revert: ${row.summary}`} onRevert={() => revertChange(revert)} />
           </div>
         ) : null}
         {row.because ? (
