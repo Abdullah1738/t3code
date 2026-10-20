@@ -536,6 +536,7 @@ describe("rpc missions source", () => {
       ],
       hasOlder: false,
       unreadForOwner: unread,
+      unreadMessages: unread ? 1 : 0,
     });
     const { transport, asked } = fakeTransport({
       [WS_METHODS.missionsOwnerRequests]: () => ({ missionId: CRPKO, requests: [view()] }),
@@ -560,6 +561,7 @@ describe("rpc missions source", () => {
       id: "request-1",
       status: "answered",
       unread: true,
+      unreadMessages: 1,
       links: [{ kind: "work-item", id: "w-1" }],
       subject: { kind: "ask", id: "ask-1" },
     });

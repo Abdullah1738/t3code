@@ -400,6 +400,8 @@ export interface OwnerRequest {
   readonly subject: MissionRecordRef | null;
   /** The master spoke since the owner last read it. */
   readonly unread: boolean;
+  /** How many messages the owner has not read, when the server counts them. */
+  readonly unreadMessages?: number;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly settledAt: string | null;

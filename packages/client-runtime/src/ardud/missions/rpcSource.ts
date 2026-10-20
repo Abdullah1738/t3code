@@ -322,9 +322,10 @@ const REQUEST_STATUS: Record<OwnerRequestRecord["status"], OwnerRequestStatus> =
  */
 export function ownerRequestOf(
   request: OwnerRequestRecord,
-  view?: Pick<OwnerRequestView, "messages" | "hasOlder" | "unreadForOwner">,
+  view?: Pick<OwnerRequestView, "messages" | "hasOlder" | "unreadForOwner" | "unreadMessages">,
 ): OwnerRequest {
   return {
+    ...(view?.unreadMessages === undefined ? {} : { unreadMessages: view.unreadMessages }),
     id: request.id,
     missionId: request.missionId,
     title: request.title,
