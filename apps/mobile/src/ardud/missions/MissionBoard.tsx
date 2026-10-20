@@ -1,9 +1,11 @@
 import type { CallId, MissionId, MissionListSnapshot, ThreadId } from "@t3tools/contracts";
 import {
+  dayOnePlan,
   groupRequests,
   masterRoutedEntries,
   ownerConditionOf,
   ownerWaitingEntries,
+  PLAN_KICKER,
   type InboxEntry,
   type MissionOverviewSnapshot,
 } from "@t3tools/client-runtime/ardud/missions";
@@ -12,6 +14,7 @@ import {
   entrySubject,
   laneSections,
   sinceView,
+  snoozedFor,
   towardView,
   type LaneSection,
   type SinceRow,
@@ -21,8 +24,15 @@ import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
 import { DiscussionPanel } from "./Discussion";
+import { FeedError } from "./FeedError";
 import { EntryRow } from "./InboxPane";
-import { useMissionInbox, useMissionLanes, useYourRequests } from "./missionsStore";
+import {
+  useMissionInbox,
+  useMissionInboxFeed,
+  useMissionLanes,
+  useOwnerRequestsFeed,
+  useYourRequests,
+} from "./missionsStore";
 import { useOverviewActions } from "./overviewLogic";
 import {
   ActionButton,
@@ -109,7 +119,14 @@ function BoardPage(props: PageProps) {
   const requests = useYourRequests(missionId) ?? [];
   const lanes = useMissionLanes(missionId);
   const actions = useOverviewActions(props.overview);
-  const waiting = inbox ? ownerWaitingEntries(inbox) : [];
+  const inboxFeed = useMissionInboxFeed(missionId);
+  const requestsFeed = useOwnerRequestsFeed(missionId);
+  const [snoozedOpen, setSnoozedOpen] = useState(false);
+  const holds = inbox ? ownerWaitingEntries(inbox, props.nowMs) : [];
+  // Day one: the master's plan, filed as an ask or approval, leads Needs you.
+  const plan = dayOnePlan(props.overview.lanes, holds);
+  const waiting = plan ? [plan, ...holds.filter((entry) => entry !== plan)] : holds;
+  const snoozed = inbox ? snoozedFor(inbox, "all", props.nowMs) : [];
   const withMaster = inbox ? masterRoutedEntries(inbox) : [];
   const { open } = groupRequests(requests);
   const problems = laneSections(lanes ?? [], props.nowMs).filter(
@@ -132,8 +149,11 @@ function BoardPage(props: PageProps) {
           ) : null
         }
       />
+      <FeedError what="what needs you" feed={inboxFeed} nowMs={props.nowMs} />
       {waiting.length === 0 ? (
-        <EmptyLine label="Nothing needs you." />
+        inboxFeed.failure ? null : (
+          <EmptyLine label="Nothing needs you." />
+        )
       ) : (
         <EntryCards
           entries={waiting.slice(0, BOARD_LIMIT)}
@@ -141,16 +161,42 @@ function BoardPage(props: PageProps) {
           list={props.list}
           nowMs={props.nowMs}
           onOpen={props.onOpenItem}
+          planKey={plan?.key ?? null}
         />
       )}
+      {snoozed.length > 0 ? (
+        <>
+          <SectionHead
+            title={`Snoozed ${snoozed.length}`}
+            trailing={
+              <LinkButton
+                label={snoozedOpen ? "Hide" : "Show"}
+                onPress={() => setSnoozedOpen(!snoozedOpen)}
+              />
+            }
+          />
+          {snoozedOpen ? (
+            <EntryCards
+              entries={snoozed}
+              missionId={missionId}
+              list={props.list}
+              nowMs={props.nowMs}
+              onOpen={props.onOpenItem}
+            />
+          ) : null}
+        </>
+      ) : null}
 
       <SectionHead
         className="pt-3"
         title="Your requests"
         trailing={<LinkButton label="Ask" onPress={() => props.onPage("requests")} />}
       />
+      <FeedError what="your requests" feed={requestsFeed} nowMs={props.nowMs} />
       {open.length === 0 ? (
-        <EmptyLine label="Nothing open." />
+        requestsFeed.failure ? null : (
+          <EmptyLine label="Nothing open." />
+        )
       ) : (
         <RequestRows
           requests={open.slice(0, BOARD_LIMIT)}
@@ -278,6 +324,7 @@ function EntryCards(props: {
   readonly list: MissionListSnapshot | undefined;
   readonly nowMs: number;
   readonly onOpen: (entry: InboxEntry) => void;
+  readonly planKey?: string | null;
 }) {
   return (
     <Group>
@@ -293,6 +340,7 @@ function EntryCards(props: {
               nowMs={props.nowMs}
               selected={false}
               onOpen={() => props.onOpen(entry)}
+              {...(entry.key === props.planKey ? { tag: PLAN_KICKER } : {})}
             />
             <View className="gap-2 px-3.5 pb-3">
               {condition ? <ConditionQuote quote={condition.quote} /> : null}
@@ -372,6 +420,7 @@ function SinceRows(props: {
 function RequestsPage(props: PageProps) {
   const missionId = props.overview.mission.id;
   const requests = useYourRequests(missionId);
+  const requestsFeed = useOwnerRequestsFeed(missionId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showSettled, setShowSettled] = useState(false);
   const open = (requestId: string) =>
@@ -401,8 +450,11 @@ function RequestsPage(props: PageProps) {
           />
         </View>
       </View>
+      <FeedError what="your requests" feed={requestsFeed} nowMs={props.nowMs} />
       {requests === undefined ? (
-        <EmptyLine label="Loading" />
+        requestsFeed.failure ? null : (
+          <EmptyLine label="Loading" />
+        )
       ) : groups.open.length === 0 ? (
         <EmptyLine label="Nothing open." />
       ) : (

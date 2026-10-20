@@ -1,6 +1,6 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
 import type { MissionId, RoomId } from "@t3tools/contracts";
-import { roomName } from "@t3tools/client-runtime/ardud/missions";
+import { markOf, roomName } from "@t3tools/client-runtime/ardud/missions";
 import { findEntry } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { type ReactNode, useEffect, useRef } from "react";
 import { View } from "react-native";
@@ -9,7 +9,13 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { ScreenHeader } from "../../components/ScreenHeader";
 import { ItemReader } from "./ItemReader";
-import { useMissionInbox, useMissionOverview, useRoomPage } from "./missionsStore";
+import { FeedError } from "./FeedError";
+import {
+  useMissionInbox,
+  useMissionInboxFeed,
+  useMissionOverview,
+  useRoomPage,
+} from "./missionsStore";
 import { EmptyLine } from "./parts";
 import { RequestReader } from "./RequestReader";
 import { RoomReader } from "./RoomReader";
@@ -95,7 +101,8 @@ function ItemScreen(props: {
   readonly onGone: () => void;
 }) {
   const inbox = useMissionInbox(props.missionId);
-  const entry = inbox ? findEntry(inbox, props.itemKey) : undefined;
+  const feed = useMissionInboxFeed(props.missionId);
+  const entry = inbox ? findEntry(inbox, props.itemKey, props.nowMs) : undefined;
   const seen = useRef(false);
   const { onGone } = props;
   useEffect(() => {
@@ -103,7 +110,13 @@ function ItemScreen(props: {
     else if (entry === null && seen.current) onGone();
   }, [entry, onGone]);
 
-  if (entry === undefined) return <EmptyLine label="Loading" />;
+  if (entry === undefined) {
+    return feed.failure ? (
+      <FeedError what="the item" feed={feed} nowMs={props.nowMs} />
+    ) : (
+      <EmptyLine label="Loading" />
+    );
+  }
   if (entry === null) return <EmptyLine label="Already decided." />;
   return (
     <ItemReader
@@ -111,6 +124,7 @@ function ItemScreen(props: {
       missionId={entry.record.missionId ?? props.missionId}
       nowMs={props.nowMs}
       bottomInset={props.bottomInset}
+      mark={markOf(inbox, entry.key)}
     />
   );
 }
