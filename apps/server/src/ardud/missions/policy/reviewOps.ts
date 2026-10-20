@@ -18,7 +18,8 @@ import {
   type ReviewPolicy,
   type ReviewPolicySnapshot,
   type ReviewRecord,
-  type RoleId,
+  type ReviewStage,
+  type Role,
   type SetCriticalityGuideInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -41,6 +42,7 @@ import {
   type Caller,
   type PolicyDeps,
 } from "./context.ts";
+import { modelKey } from "./models.ts";
 import { callerModelKey } from "./roleOps.ts";
 import {
   defaultReviewPolicy,
@@ -300,26 +302,33 @@ export const REVIEW_RECORDERS: ReadonlySet<string> = new Set(["crw"]);
 
 /**
  * Who may record a stage's review: the owner, the master, the policy's own
- * components, a review runner (crw), or a thread bound to the stage's role.
+ * components, a review runner (crw), a thread bound to the stage's role, or a
+ * thread holding a role of a kind the master listed in `recordedBy`.
  * A record moves the merge gate, so nobody else does.
  */
-const mayRecordStage = (
+const stageRecorder = (
   deps: PolicyDeps,
   caller: Caller,
   missionId: MissionId,
-  roleId: RoleId,
-): Effect.Effect<boolean, MissionError> => {
+  stage: ReviewStage,
+  roles: ReadonlyArray<Role>,
+): Effect.Effect<"holder" | "delegate" | null, MissionError> => {
   const { provenance } = caller;
-  if (caller.byOwner || caller.isMaster || caller.trusted) return Effect.succeed(true);
+  if (caller.byOwner || caller.isMaster || caller.trusted) return Effect.succeed("holder");
   if (provenance._tag === "system")
-    return Effect.succeed(REVIEW_RECORDERS.has(provenance.component));
-  if (provenance._tag !== "agent") return Effect.succeed(false);
+    return Effect.succeed(REVIEW_RECORDERS.has(provenance.component) ? "holder" : null);
+  if (provenance._tag !== "agent") return Effect.succeed(null);
+  const delegated = new Set<string>(stage.recordedBy ?? []);
   return activeBindings(deps, missionId).pipe(
-    Effect.map((bindings) =>
-      bindings.some(
-        (binding) => binding.threadId === provenance.threadId && binding.roleId === roleId,
-      ),
-    ),
+    Effect.map((bindings) => {
+      const held = bindings.filter((binding) => binding.threadId === provenance.threadId);
+      if (held.some((binding) => binding.roleId === stage.roleId)) return "holder";
+      if (delegated.size === 0) return null;
+      const heldIds = new Set<string>(held.map((binding) => binding.roleId));
+      return roles.some((role) => heldIds.has(role.id) && delegated.has(role.kind))
+        ? "delegate"
+        : null;
+    }),
   );
 };
 
@@ -339,14 +348,15 @@ export const recordReview = (
     const { policy } = yield* loadPolicy(deps, input.missionId);
     const stage = policy.stages.find((candidate) => candidate.id === input.stageId);
     if (!stage) return yield* failWith("invalid", `Unknown review stage ${input.stageId}.`);
+    const roles = yield* missionRoles(deps, input.missionId, now);
     // ardud missions: core
-    if (!(yield* mayRecordStage(deps, caller, input.missionId, stage.roleId))) {
+    const recorder = yield* stageRecorder(deps, caller, input.missionId, stage, roles.all);
+    if (recorder === null) {
       return yield* failWith(
         "forbidden",
-        `Only the owner, the master, crw or a thread holding ${stage.roleId} records ${stage.label}.`,
+        `Only the owner, the master, crw or a thread holding ${stage.roleId} records ${stage.label}. The master can let other role kinds record it (recordedBy on the stage).`,
       );
     }
-    const roles = yield* missionRoles(deps, input.missionId, now);
     const role = roles.all.find((candidate) => candidate.id === stage.roleId);
     if (!role) {
       return yield* failWith(
@@ -354,7 +364,12 @@ export const recordReview = (
         `Stage ${stage.id} points at unknown role ${stage.roleId}.`,
       );
     }
-    const model = input.model ?? (yield* callerModelKey(deps, caller, role));
+    // A delegate relays the stage role's run, so its own thread's model would misname the reviewer.
+    const model =
+      input.model ??
+      (recorder === "delegate"
+        ? modelKey(role.modelSelection)
+        : yield* callerModelKey(deps, caller, role));
     const earlier = yield* deps.policyStore.reviewIds("review", input.missionId, input.pullRequest);
     const record: ReviewRecord = {
       // The running count keeps same-millisecond records in the order they were made.

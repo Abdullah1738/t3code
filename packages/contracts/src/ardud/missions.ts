@@ -1376,6 +1376,12 @@ export const ReviewStage = Schema.Struct({
   label: TrimmedNonEmptyString,
   /** Stages point at roles, never at model ids. */
   roleId: RoleId,
+  // --- policy additions ---
+  /**
+   * Role kinds that may also record this stage for the role, e.g. lane leads
+   * relaying a review run they dispatched. Set by the master.
+   */
+  recordedBy: Schema.optional(Schema.Array(RoleKind)),
 });
 export type ReviewStage = typeof ReviewStage.Type;
 

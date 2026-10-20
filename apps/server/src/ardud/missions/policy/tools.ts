@@ -173,7 +173,7 @@ const LaneHandoffTool = tool(
 
 const ReviewPolicyEditTool = tool(
   "mission_review_policy_edit",
-  "Edit a mission's review stages, ladders, common rules or who judges criticality (master, or lane leads). Every stage points at a role, never a model.",
+  "Edit a mission's review stages, ladders, common rules or who judges criticality (master, or lane leads). Every stage points at a role, never a model. A stage's optional recordedBy lists role kinds (for example lane-lead) that may record its result too, besides the role's holders, crw, the master and the owner.",
   EditReviewPolicyInput,
   MissionMutationResult,
 );
