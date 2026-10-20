@@ -75,6 +75,8 @@ const PREFIXES: Record<string, { readonly group: TimelineKindGroup; readonly kic
   suggestion: { group: "inbox", kicker: "Suggestion" },
   knock: { group: "inbox", kicker: "Knock" },
   note: { group: "inbox", kicker: "Note" },
+  // ardud missions: finish-a
+  inbox: { group: "inbox", kicker: "Inbox" },
   "secret-request": { group: "inbox", kicker: "Secret request" },
   request: { group: "requests", kicker: "Request" },
   room: { group: "rooms", kicker: "Room" },

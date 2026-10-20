@@ -62,8 +62,17 @@ describe("asks WS RPCs", () => {
       M.inboxHistory,
       M.subscribeSuggestionStats,
       M.subscribeMasterInbox,
+      M.subscribeInboxMarks,
     ];
-    const writes = [M.routeDraft, M.setDraftNoteActive, M.annotateDraft, M.annotateApproval];
+    const writes = [
+      M.routeDraft,
+      M.setDraftNoteActive,
+      M.annotateDraft,
+      M.annotateApproval,
+      M.commentInboxItem,
+      M.snoozeInboxItem,
+      M.unsnoozeInboxItem,
+    ];
     for (const method of reads) {
       expect(RPC_REQUIRED_SCOPES[method]).toBe(AuthOrchestrationReadScope);
     }

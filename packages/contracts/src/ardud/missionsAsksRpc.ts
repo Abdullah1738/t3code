@@ -20,6 +20,8 @@ import {
   AnnotateApprovalInput,
   AnnotateDraftInput,
   Approval,
+  CommentInboxItemInput,
+  InboxMark,
   Draft,
   DraftNote,
   MissionError,
@@ -28,12 +30,15 @@ import {
   MissionId,
   MissionInboxHistory,
   MissionInboxHistoryInput,
+  MissionInboxMarks,
   MissionMasterInbox,
   MissionRoutingTable,
   MissionScopeInput,
   RouteDraftInput,
   SetDraftNoteActiveInput,
+  SnoozeInboxItemInput,
   SuggestionStats,
+  UnsnoozeInboxItemInput,
 } from "./missions.ts";
 
 export const MISSIONS_ASKS_WS_METHODS = {
@@ -47,6 +52,12 @@ export const MISSIONS_ASKS_WS_METHODS = {
   annotateApproval: "missions.asks.annotateApproval",
   subscribeSuggestionStats: "missions.asks.subscribeSuggestionStats",
   subscribeMasterInbox: "missions.asks.subscribeMasterInbox",
+  // --- finish-a additions ---
+  subscribeInboxMarks: "missions.asks.subscribeInboxMarks",
+  commentInboxItem: "missions.asks.commentInboxItem",
+  snoozeInboxItem: "missions.asks.snoozeInboxItem",
+  unsnoozeInboxItem: "missions.asks.unsnoozeInboxItem",
+  // --- end finish-a additions ---
 } as const;
 
 type AsksMethod = (typeof MISSIONS_ASKS_WS_METHODS)[keyof typeof MISSIONS_ASKS_WS_METHODS];
@@ -87,6 +98,14 @@ export const MissionsAsksRpcs = RpcGroup.make(
   feed(M.subscribeSuggestionStats, MissionScopeInput, Schema.Array(SuggestionStats)),
   /** What waits on the master (one mission, or every mission when null); resent when it changes. */
   feed(M.subscribeMasterInbox, MissionScopeInput, MissionMasterInbox),
+  // --- finish-a additions ---
+  /** The owner's comments and holding snoozes on inbox items; resent when they change. */
+  feed(M.subscribeInboxMarks, MissionScopeInput, MissionInboxMarks),
+  /** A note on an inbox item that decides nothing. */
+  call(M.commentInboxItem, CommentInboxItemInput, InboxMark),
+  call(M.snoozeInboxItem, SnoozeInboxItemInput, InboxMark),
+  call(M.unsnoozeInboxItem, UnsnoozeInboxItemInput, InboxMark),
+  // --- end finish-a additions ---
 );
 
 /** Reads: any client allowed to read orchestration state. */
@@ -97,6 +116,9 @@ export const MISSIONS_ASKS_READ_SCOPES = {
   [M.inboxHistory]: AuthOrchestrationReadScope,
   [M.subscribeSuggestionStats]: AuthOrchestrationReadScope,
   [M.subscribeMasterInbox]: AuthOrchestrationReadScope,
+  // --- finish-a additions ---
+  [M.subscribeInboxMarks]: AuthOrchestrationReadScope,
+  // --- end finish-a additions ---
 } as const;
 
 /** Writes: guarded on the client too (see `CLIENT_GUARDED_RPC_SCOPES`). */
@@ -105,6 +127,11 @@ export const MISSIONS_ASKS_GUARDED_SCOPES = {
   [M.setDraftNoteActive]: AuthOrchestrationOperateScope,
   [M.annotateDraft]: AuthOrchestrationOperateScope,
   [M.annotateApproval]: AuthOrchestrationOperateScope,
+  // --- finish-a additions ---
+  [M.commentInboxItem]: AuthOrchestrationOperateScope,
+  [M.snoozeInboxItem]: AuthOrchestrationOperateScope,
+  [M.unsnoozeInboxItem]: AuthOrchestrationOperateScope,
+  // --- end finish-a additions ---
 } as const;
 
 /** Trace aggregate label for every asks RPC. */
