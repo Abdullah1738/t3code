@@ -2665,6 +2665,21 @@ export const UpdateRoomInput = Schema.Struct({
 export type UpdateRoomInput = typeof UpdateRoomInput.Type;
 // --- end finish-b additions ---
 
+// --- router additions ---
+/**
+ * Owner or the mission's master: open a room the mission doesn't have yet.
+ * The room's id is `<missionId>:room:<slug>`, so a coord channel named `slug`
+ * posts into it. Asking again for a slug that exists returns that room.
+ */
+export const CreateRoomInput = Schema.Struct({
+  missionId: MissionId,
+  slug: Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,39}$/)),
+  title: TrimmedNonEmptyString,
+  subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
+});
+export type CreateRoomInput = typeof CreateRoomInput.Type;
+// --- end router additions ---
+
 // --- fix-p3 additions ---
 /**
  * Room messages from `dayStart` (the device's midnight) in 5-minute bins, and

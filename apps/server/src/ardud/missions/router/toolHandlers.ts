@@ -98,6 +98,12 @@ const handlers = {
       router.updateRoom(input, provenance).pipe(Effect.map((room) => ({ room }))),
     ),
   ),
+  // ardud missions: router
+  mission_create_room: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.createRoom(input, provenance).pipe(Effect.map((room) => ({ room }))),
+    ),
+  ),
   mission_attention: McpToolAccess.readsAsCaller((input) =>
     asCaller((router, _threadId, provenance) =>
       router.attention(input, provenance).pipe(Effect.map(({ entries }) => ({ entries }))),

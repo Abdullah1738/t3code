@@ -44,6 +44,7 @@ import {
   type TuneRoomInput,
   type UpdateRoomInput,
   type WorkItem,
+  type CreateRoomInput, // ardud missions: router
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -356,6 +357,13 @@ export class MissionRouter extends Context.Service<
       provenance: MissionProvenance,
     ) => Effect.Effect<Room, MissionError>;
     // --- end finish-b ---
+    // --- router: createRoom ---
+    /** Owner or master: open a room under `<missionId>:room:<slug>`, or return the one already there. */
+    readonly createRoom: (
+      input: CreateRoomInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<Room, MissionError>;
+    // --- end router: createRoom ---
     /**
      * One reminder for each idle thread holding deliveries unread for over 30
      * minutes, at most one per thread per 30 minutes; a delivery is reminded
@@ -1333,6 +1341,60 @@ const make = Effect.gen(function* () {
     });
   // --- end finish-b ---
 
+  // --- router: createRoom ---
+  const createRoom = (input: CreateRoomInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const cast = yield* loadCast(input.missionId);
+      if (cast.mission === null) return yield* fail("not-found", `No mission ${input.missionId}.`);
+      if (!isOwnerProvenance(provenance) && !isMaster(cast, provenance)) {
+        return yield* fail("forbidden", "Only the owner or the mission's master opens a room.");
+      }
+      const roomId = RoomId.make(`${input.missionId}${ROOM_MARK}${input.slug}`);
+      const subMissionId = input.subMissionId ?? null;
+      if (subMissionId !== null) {
+        const sub = Option.getOrNull(yield* store.get("sub-mission", subMissionId));
+        if (sub === null || sub.missionId !== input.missionId) {
+          return yield* fail("not-found", `No sub-mission ${subMissionId} in ${input.missionId}.`);
+        }
+      }
+      return yield* postLock.withPermit(
+        Effect.gen(function* () {
+          const existing = yield* rooms.room(roomId);
+          if (existing !== null) return existing;
+          // Control, release and arch keep their standard kind and title.
+          if (standardRoom(input.missionId, roomId) !== null) {
+            return yield* ensureRoom(input.missionId, roomId, provenance);
+          }
+          const room: Room = {
+            id: roomId,
+            missionId: input.missionId,
+            subMissionId,
+            kind: "custom",
+            title: input.title,
+            workItemId: null,
+            archived: false,
+            lastSeq: 0,
+            lastMessageAt: null,
+            noise: null,
+            createdAt: yield* nowIso,
+          };
+          yield* store.commit({
+            event: {
+              missionId: input.missionId,
+              kind: "room.created",
+              actor: actorOf(provenance),
+              provenance,
+              summary: clipSummary(`Room ${input.title} opened`),
+              subject: { kind: "room", id: roomId, label: input.title },
+            },
+            alongside: rooms.putRoom(room),
+          });
+          return room;
+        }),
+      );
+    });
+  // --- end router: createRoom ---
+
   const setMember = (input: SetMissionMemberInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const cast = yield* loadCast(input.missionId);
@@ -1983,6 +2045,7 @@ const make = Effect.gen(function* () {
     roomTuning,
     tuneRoom,
     updateRoom,
+    createRoom, // ardud missions: router
     remind,
     attention,
     ownerRequests: requests.list,
