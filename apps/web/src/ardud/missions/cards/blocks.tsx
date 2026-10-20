@@ -56,7 +56,7 @@ export function TextBlock(props: { text: string; tone?: "body" | "meta"; maxLine
     <p
       className={cn(
         "text-sm leading-5.5 text-pretty whitespace-pre-line",
-        props.tone === "meta" ? "text-muted-foreground" : "text-foreground",
+        props.tone === "meta" ? "text-(--m-muted)" : "text-(--m-text)",
         props.maxLines ? CLAMP[props.maxLines] : null,
       )}
     >
@@ -67,7 +67,7 @@ export function TextBlock(props: { text: string; tone?: "body" | "meta"; maxLine
 
 /** A fixed short label (60 characters at most). */
 export function LabelBlock(props: { text: string }) {
-  return <p className="text-xs font-medium text-muted-foreground">{props.text}</p>;
+  return <p className="text-xs font-medium text-(--m-muted)">{props.text}</p>;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,8 +87,8 @@ export function FactsBlock(props: { rows: ReadonlyArray<FactRow> }) {
     <dl className="grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3.5 gap-y-1 text-sm leading-5.5">
       {rows.map((row) => (
         <div key={row.label} className="contents">
-          <dt className="text-xs leading-5.5 text-muted-foreground">{row.label}</dt>
-          <dd className="min-w-0 text-foreground">{row.value}</dd>
+          <dt className="text-xs leading-5.5 text-(--m-muted)">{row.label}</dt>
+          <dd className="min-w-0 text-(--m-text)">{row.value}</dd>
         </div>
       ))}
     </dl>
@@ -196,27 +196,25 @@ export function ChoiceBlock(props: {
               disabled={props.disabled}
               onClick={() => props.onPick(pressed ? null : option.id)}
               className={cn(
-                "grid grid-cols-[16px_minmax(0,1fr)] items-start gap-x-2.5 gap-y-0.5 rounded-lg border bg-card px-3 py-2.5 text-start text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-64",
-                pressed
-                  ? "border-primary bg-primary/6 ring-1 ring-primary ring-inset"
-                  : "border-input hover:bg-accent/50",
+                "grid grid-cols-[16px_minmax(0,1fr)] items-start gap-x-2.5 gap-y-0.5 rounded-xl bg-(--m-raised) px-3.5 py-3 text-start text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-64",
+                pressed ? "ring-2 ring-(--m-accent) ring-inset" : "hover:bg-(--m-active)",
               )}
             >
               <span
                 aria-hidden
                 className={cn(
                   "mt-1 size-3.5 rounded-full",
-                  pressed ? "border-4 border-primary" : "border border-input",
+                  pressed ? "border-4 border-(--m-accent)" : "border border-(--m-control)",
                 )}
               />
               <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-                <span className="font-medium text-foreground">{option.label}</span>
+                <span className="font-medium text-(--m-text)">{option.label}</span>
                 {option.recommended ? (
-                  <span className="text-xs text-muted-foreground">Recommended</span>
+                  <span className="text-xs text-(--m-muted)">Recommended</span>
                 ) : null}
               </span>
               {option.detail ? (
-                <span className="col-start-2 text-xs leading-4.5 text-muted-foreground">
+                <span className="col-start-2 text-xs leading-4.5 text-(--m-muted)">
                   {option.detail}
                 </span>
               ) : null}
@@ -225,7 +223,7 @@ export function ChoiceBlock(props: {
         })}
       </div>
       {props.advice ? (
-        <p className="text-sm leading-5.5 text-pretty text-muted-foreground">{props.advice}</p>
+        <p className="text-sm leading-5.5 text-pretty text-(--m-muted)">{props.advice}</p>
       ) : null}
     </div>
   );
@@ -281,10 +279,10 @@ export function DraftBlock(props: {
     <div
       className={cn(
         "flex min-w-0 flex-col gap-1.5 rounded-lg px-3 pt-2.5 pb-3",
-        edit?.editing ? "bg-card ring-1 ring-input ring-inset" : "bg-foreground/4",
+        edit?.editing ? "bg-(--m-ground) ring-1 ring-(--m-control) ring-inset" : "bg-(--m-raised)",
       )}
     >
-      <div className="flex min-h-6 min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+      <div className="flex min-h-6 min-w-0 items-center gap-1.5 text-xs text-(--m-muted)">
         {Icon && props.channel !== null ? (
           <span role="img" aria-label={DRAFT_CHANNEL_LABEL[props.channel]}>
             <Icon aria-hidden className="size-3.5" />
@@ -301,7 +299,7 @@ export function DraftBlock(props: {
         {props.link ? <LinkChip link={props.link} /> : null}
         {edit === null ? null : changed ? (
           <span className="ms-auto flex items-center gap-1">
-            <span className="inline-flex items-center gap-1.5 font-medium text-update-foreground">
+            <span className="inline-flex items-center gap-1.5 font-medium text-(--m-accent-text)">
               <Avatar kind="you" small />
               Edited
             </span>
@@ -358,18 +356,18 @@ function withOffsetKeys<T extends { readonly kind: string; readonly text: string
 /** Inline word diff: removed words struck in red, added words in the update colour. */
 export function WordDiffText(props: { segments: ReadonlyArray<DiffSegment> }) {
   return (
-    <p className="text-sm leading-5.5 whitespace-pre-wrap text-foreground">
+    <p className="text-sm leading-5.5 whitespace-pre-wrap text-(--m-text)">
       {withOffsetKeys(props.segments).map(({ key, item: segment }) => {
         if (segment.kind === "same") return <span key={key}>{segment.text}</span>;
         if (segment.kind === "removed") {
           return (
-            <del key={key} className="rounded-sm bg-error/9 text-error-foreground line-through">
+            <del key={key} className="rounded-sm bg-error/9 text-(--m-negative) line-through">
               {segment.text}
             </del>
           );
         }
         return (
-          <ins key={key} className="rounded-sm bg-update/12 text-update-foreground no-underline">
+          <ins key={key} className="rounded-sm bg-(--m-band) text-(--m-accent-text) no-underline">
             {segment.text}
           </ins>
         );
@@ -381,16 +379,16 @@ export function WordDiffText(props: { segments: ReadonlyArray<DiffSegment> }) {
 /** A "+"/"-" line diff, as suggestions carry it. */
 export function LineDiffBlock(props: { lines: ReadonlyArray<DiffLine> }) {
   return (
-    <div className="flex min-w-0 flex-col overflow-x-auto rounded-lg bg-foreground/4 px-3 py-2 font-mono text-xs leading-5">
+    <div className="flex min-w-0 flex-col overflow-x-auto rounded-xl bg-(--m-raised) px-3 py-2 font-mono text-xs leading-5">
       {withOffsetKeys(props.lines).map(({ key, item: line }) => {
         return (
           <span
             key={key}
             className={cn(
               "whitespace-pre-wrap",
-              line.kind === "added" && "text-update-foreground",
-              line.kind === "removed" && "text-error-foreground line-through",
-              line.kind === "context" && "text-muted-foreground",
+              line.kind === "added" && "text-(--m-accent-text)",
+              line.kind === "removed" && "text-(--m-negative) line-through",
+              line.kind === "context" && "text-(--m-muted)",
             )}
           >
             {line.kind === "added" ? "+ " : line.kind === "removed" ? "- " : "  "}

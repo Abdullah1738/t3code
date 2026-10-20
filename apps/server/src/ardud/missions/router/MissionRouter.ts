@@ -419,7 +419,7 @@ const make = Effect.gen(function* () {
 
   /**
    * Every live mission that could count the thread as a member: missions
-   * whose records name it (role bindings, lanes, forks) and missions holding
+   * whose records name it (role bindings, lanes) and missions holding
    * an explicit member row for it. Both lookups are complete indexed reads
    * keyed by the thread, never a capped list of missions. A record naming a
    * mission that is not there fails the lookup: the thread may well belong to

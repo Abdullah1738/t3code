@@ -102,7 +102,7 @@ export function MutedLines(props: { lines: ReadonlyArray<string | null | undefin
   const lines = props.lines.filter((line): line is string => Boolean(line));
   if (lines.length === 0) return null;
   return (
-    <ul className="flex flex-col gap-0.5 text-xs text-muted-foreground">
+    <ul className="flex flex-col gap-0.5 text-xs text-(--m-muted)">
       {lines.map((line) => (
         <li key={line}>{line}</li>
       ))}
@@ -120,7 +120,7 @@ export function PickForm(props: {
   const [value, setValue] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   if (props.options.length === 0) {
-    return <p className="text-xs text-muted-foreground">Nothing to pick.</p>;
+    return <p className="text-xs text-(--m-muted)">Nothing to pick.</p>;
   }
   const picked = props.options.find((option) => option.value === value) ?? null;
   return (

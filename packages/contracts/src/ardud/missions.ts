@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
   IsoDateTime,
@@ -85,8 +86,6 @@ export const ReviewRecordId = missionEntityId("ReviewRecordId");
 export type ReviewRecordId = typeof ReviewRecordId.Type;
 export const ApprovalId = missionEntityId("ApprovalId");
 export type ApprovalId = typeof ApprovalId.Type;
-export const ForkId = missionEntityId("MissionForkId");
-export type ForkId = typeof ForkId.Type;
 export const MissionEventId = missionEntityId("MissionEventId");
 export type MissionEventId = typeof MissionEventId.Type;
 // --- router additions ---
@@ -194,6 +193,7 @@ export const MissionRecordKind = Schema.Literals([
   "review",
   "work-item",
   "approval",
+  /** Legacy: old records may still point at a fork; nothing opens one now. */
   "fork",
   "thread",
   // --- router additions ---
@@ -910,8 +910,6 @@ export const RuleChangeRequest = Schema.Struct({
   proposedQuote: Schema.NullOr(Schema.String),
   proposedScope: Schema.NullOr(RuleScope),
   masterResponse: Schema.NullOr(Schema.String),
-  /** Discuss fork opened for this request, if any. */
-  forkId: Schema.NullOr(ForkId),
   createdAt: IsoDateTime,
   resolvedAt: Schema.NullOr(IsoDateTime),
 });
@@ -1020,6 +1018,23 @@ export const DraftStatus = Schema.Literals([
 ]);
 export type DraftStatus = typeof DraftStatus.Type;
 
+// --- asks additions ---
+const DraftSourceKindLiteral = Schema.Literals(["lane", "master", "editor"]);
+/** Old drafts may say they came from a fork; they read as the master's. */
+const LegacyForkSource = Schema.Literal("fork").pipe(
+  Schema.decodeTo(
+    DraftSourceKindLiteral,
+    SchemaTransformation.transform({
+      decode: (): DraftSourceKind => "master",
+      encode: () => "fork" as const,
+    }),
+  ),
+);
+/** Where a draft came from: a lane, the master, or an editor thread. */
+export const DraftSourceKind = Schema.Union([DraftSourceKindLiteral, LegacyForkSource]);
+export type DraftSourceKind = typeof DraftSourceKindLiteral.Type;
+// --- end asks additions ---
+
 /** Every outward text is a draft until the owner approves it. */
 export const Draft = Schema.Struct({
   id: DraftId,
@@ -1033,7 +1048,7 @@ export const Draft = Schema.Struct({
   approvedText: Schema.NullOr(Schema.String),
   writerRoleId: Schema.NullOr(RoleId),
   source: Schema.Struct({
-    kind: Schema.Literals(["fork", "lane", "master", "editor"]),
+    kind: DraftSourceKind,
     ref: Schema.NullOr(MissionRecordRef),
   }),
   /** Draft notes the writer applied. */
@@ -1085,6 +1100,8 @@ export const Draft = Schema.Struct({
   previousText: Schema.optional(Schema.NullOr(Schema.String)),
   /** Owner requests whose condition decided an earlier epoch; they never decide this draft again. */
   spentConditionIds: Schema.optional(Schema.Array(OwnerRequestId)),
+  /** Why the master took it back from the owner; set only on a withdrawn (dropped) draft. */
+  withdrawNote: Schema.optional(Schema.NullOr(Schema.String)),
   // --- end asks additions ---
 });
 export type Draft = typeof Draft.Type;
@@ -1570,35 +1587,10 @@ export const WorkItem = Schema.Struct({
 });
 export type WorkItem = typeof WorkItem.Type;
 
-// ---------------------------------------------------------------------------
-// Forks (Discuss, dev questions, owner side questions)
-
-export const MissionFork = Schema.Struct({
-  id: ForkId,
-  missionId: MissionId,
-  kind: Schema.Literals(["discuss", "dev-question", "owner-question"]),
-  masterThreadId: ThreadId,
-  forkThreadId: ThreadId,
-  /** Card or inbound it started from (a call, rule, lane, a Cliq message). */
-  origin: Schema.NullOr(Schema.Union([MissionRecordRef, MissionLink])),
-  status: Schema.Literals(["open", "answered", "archived"]),
-  /** The line the master receives when it ends. */
-  summaryLine: Schema.NullOr(Schema.String),
-  /** The answer commits the mission to something; the line becomes a note the master acks. */
-  commitsMission: Schema.Boolean,
-  createdAt: IsoDateTime,
-  closedAt: Schema.NullOr(IsoDateTime),
-  // --- asks additions ---
-  /** The question the fork was opened with, when one was given. */
-  question: Schema.optional(Schema.NullOr(Schema.String)),
-  // --- end asks additions ---
-});
-export type MissionFork = typeof MissionFork.Type;
-
 // --- router additions ---
 // Owner requests: the owner asks the master something (progress, a flow to
 // tighten, a suggestion, something to pick up) and the master answers in the
-// request's own room. Unlike a fork, a request is meant to change the master.
+// request's own room. A request is meant to change the master.
 
 export const OwnerRequestStatus = Schema.Literals(["waiting-on-master", "answered", "settled"]);
 export type OwnerRequestStatus = typeof OwnerRequestStatus.Type;
@@ -1616,7 +1608,7 @@ export const OwnerRequest = Schema.Struct({
   createdBy: MissionProvenance,
   lastOwnerAt: Schema.NullOr(IsoDateTime),
   lastMasterAt: Schema.NullOr(IsoDateTime),
-  /** What the master made from it: work items, asks, forks, rules, suggestions. */
+  /** What the master made from it: work items, asks, rules, suggestions. */
   links: Schema.Array(MissionRecordRef),
   /** The master spoke since the owner last opened the request. */
   unreadForOwner: Schema.Boolean,
@@ -1742,8 +1734,6 @@ export const MissionEventKind = Schema.Literals([
   "review.recorded",
   "approval.opened",
   "approval.decided",
-  "fork.opened",
-  "fork.closed",
   // --- asks additions ---
   "ask.superseded",
   "ask.reopened",
@@ -2204,7 +2194,6 @@ export const MissionRecord = Schema.Union([
   Schema.TaggedStruct("criticality-verdict", { record: CriticalityVerdict }),
   Schema.TaggedStruct("review", { record: ReviewRecord }),
   Schema.TaggedStruct("work-item", { record: WorkItem }),
-  Schema.TaggedStruct("fork", { record: MissionFork }),
   // --- router additions ---
   Schema.TaggedStruct("owner-request", { record: OwnerRequest }),
   // --- end router additions ---
@@ -2742,8 +2731,6 @@ export type LockFieldInput = typeof LockFieldInput.Type;
 export const RequestRuleChangeInput = Schema.Struct({
   ruleId: RuleId,
   request: TrimmedNonEmptyString,
-  /** Open a Discuss fork of the master on this request. */
-  discuss: Schema.optional(Schema.Boolean),
 });
 export type RequestRuleChangeInput = typeof RequestRuleChangeInput.Type;
 
@@ -3118,7 +3105,7 @@ export type MergeSubMissionsInput = typeof MergeSubMissionsInput.Type;
 
 // --- asks additions ---
 
-/** The asker or the owner takes an open ask back; what it held is released. */
+/** The asker, the mission's master or the owner takes an open ask back; what it held is released. */
 export const WithdrawAskInput = Schema.Struct({
   askId: AskId,
   reason: Schema.String,
@@ -3161,33 +3148,6 @@ export const ReopenSuggestionInput = Schema.Struct({
   suggestionId: SuggestionId,
 });
 export type ReopenSuggestionInput = typeof ReopenSuggestionInput.Type;
-
-/**
- * Fork the master's thread at its latest stable point: Discuss on a card, or
- * a side question answered from the master's context without disturbing it.
- */
-export const StartForkInput = Schema.Struct({
-  missionId: MissionId,
-  kind: Schema.Literals(["discuss", "dev-question", "owner-question"]),
-  origin: Schema.NullOr(Schema.Union([MissionRecordRef, MissionLink])),
-  question: Schema.optional(TrimmedNonEmptyString),
-});
-export type StartForkInput = typeof StartForkInput.Type;
-
-/** A fork ends with one line for the master; only the owner can say it commits the mission. */
-export const CloseForkInput = Schema.Struct({
-  forkId: ForkId,
-  summaryLine: TrimmedNonEmptyString,
-  commitsMission: Schema.optional(Schema.Boolean),
-});
-export type CloseForkInput = typeof CloseForkInput.Type;
-
-/** Fork follow-ups for the owner or the master: mark an answered fork as committing, archive it, or reopen it. */
-export const UpdateForkInput = Schema.Struct({
-  forkId: ForkId,
-  action: Schema.Literals(["commits-mission", "archive", "reopen"]),
-});
-export type UpdateForkInput = typeof UpdateForkInput.Type;
 
 /** Owner or master: send one pending draft to the other approver; the reason is logged. */
 export const RouteDraftInput = Schema.Struct({
@@ -3348,6 +3308,23 @@ export const ReportDraftSentInput = Schema.Struct({
   outcome: DraftSendOutcome,
 });
 export type ReportDraftSentInput = typeof ReportDraftSentInput.Type;
+
+/**
+ * The draft's writer (or the mission's master) records that it posted the approved text.
+ * `link` is where it went, when there is one. A sent draft is never sent again.
+ */
+export const RecordDraftSentInput = Schema.Struct({
+  draftId: DraftId,
+  link: Schema.optional(MissionLink),
+});
+export type RecordDraftSentInput = typeof RecordDraftSentInput.Type;
+
+/** The mission's master takes a draft back from whoever was deciding it; the note says why. */
+export const WithdrawDraftInput = Schema.Struct({
+  draftId: DraftId,
+  note: TrimmedNonEmptyString,
+});
+export type WithdrawDraftInput = typeof WithdrawDraftInput.Type;
 
 /** One mission, or every mission when null. */
 export const MissionScopeInput = Schema.Struct({

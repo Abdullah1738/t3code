@@ -8,8 +8,9 @@ export const WATCH_KINDS = [
   "ask-opened",
   "ask-answered",
   "draft-opened",
+  // The writer waits on its draft's decision: approved, sent back, dropped or withdrawn.
+  "draft-decided",
   "suggestion-opened",
-  "fork-closed",
   "milestone-at-risk",
   "lane-stalled",
   "swarm-paused",
@@ -39,10 +40,10 @@ export const matchesWatch = (event: MissionEvent, kind: WatchKind): boolean => {
       return event.kind === "ask.answered";
     case "draft-opened":
       return event.kind === "draft.opened";
+    case "draft-decided":
+      return event.kind === "draft.decided" && payloadField(event, "action") !== "reopen";
     case "suggestion-opened":
       return event.kind === "suggestion.opened";
-    case "fork-closed":
-      return event.kind === "fork.closed" && payloadField(event, "archived") !== true;
     case "milestone-at-risk":
       return (
         event.kind === "milestone.updated" &&

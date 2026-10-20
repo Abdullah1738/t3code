@@ -1,7 +1,7 @@
 /**
- * WS handlers for `MissionsAsksRpcs`: record feeds for rules, forks and draft
- * notes, the routing table, decided-item history, and the owner's draft
- * routing, draft note toggles and approval/draft annotations.
+ * WS handlers for `MissionsAsksRpcs`: record feeds for rules and draft notes,
+ * the routing table, decided-item history, and the owner's draft routing,
+ * draft note toggles and approval/draft annotations.
  *
  * Reads need only the read scope (any client may watch). Writes are owner
  * actions on a paired Robob client session (`ownerAppProvenance`) and call
@@ -135,23 +135,6 @@ export const makeAsksWsHandlers = (
           ...tagged("rule-change-request")([...own, ...global]),
         ];
       }),
-    );
-
-  /**
-   * Forks have no global ones: null means every mission's forks. That
-   * snapshot is the store's newest list (capped at its default limit).
-   */
-  const subscribeForks = (input: MissionScopeInput) =>
-    feed(
-      new Set<MissionStoreKind>(["fork"]),
-      input.missionId === null ? () => true : inScope(input.missionId, false),
-      Effect.map(
-        store.list("fork", {
-          ...(input.missionId === null ? {} : { missionId: input.missionId }),
-          order: "newest",
-        }),
-        tagged("fork"),
-      ),
     );
 
   const subscribeDraftNotes = (input: MissionFeedInput) =>
@@ -307,7 +290,6 @@ export const makeAsksWsHandlers = (
   const M = MISSIONS_ASKS_WS_METHODS;
   return {
     [M.subscribeRules]: subscribeRules,
-    [M.subscribeForks]: subscribeForks,
     [M.subscribeDraftNotes]: subscribeDraftNotes,
     [M.subscribeRouting]: subscribeRouting,
     [M.inboxHistory]: inboxHistory,

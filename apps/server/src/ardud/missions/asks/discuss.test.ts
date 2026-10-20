@@ -13,6 +13,7 @@ import * as Layer from "effect/Layer";
 import { OwnerConditions } from "../discuss/OwnerConditions.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
+import { askResolvedLine } from "./ports.ts";
 import {
   agent,
   askInput,
@@ -63,14 +64,14 @@ const fakeConditions = (subjects: Array<MissionRecordRef>) => {
 
 const withConditions = (subjects: Array<MissionRecordRef>) => {
   const fake = fakeConditions(subjects);
-  const { layer, deliveries } = harness();
-  return { ...fake, deliveries, layer: layer.pipe(Layer.provideMerge(fake.layer)) };
+  const { layer, signals, posts } = harness();
+  return { ...fake, signals, posts, layer: layer.pipe(Layer.provideMerge(fake.layer)) };
 };
 
 describe("discuss: asks", () => {
   it.effect("the master answers an ask only on the owner's verified condition", () => {
     const subjects: Array<MissionRecordRef> = [];
-    const { verified, settled, deliveries, layer } = withConditions(subjects);
+    const { verified, settled, signals, layer } = withConditions(subjects);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
@@ -125,7 +126,9 @@ describe("discuss: asks", () => {
       expect(event?.actor).toEqual({ _tag: "role", roleId: "role-master" });
       expect(event?.payload).toMatchObject({ onOwnerCondition: condition });
       // The lane that asked hears whose answer it was.
-      expect(deliveries.find((delivery) => delivery.threadId === laneThread)?.text).toContain(
+      const told = signals.find((signal) => signal.ask.id === ask.id)!;
+      expect(told.ask.askedBy).toEqual({ _tag: "lane", laneId: "lane-api" });
+      expect(askResolvedLine(told.ask, told.released)).toContain(
         "answered by the master on the owner's condition",
       );
 
@@ -163,7 +166,7 @@ describe("discuss: asks", () => {
   });
 
   it.effect("the master revises and withdraws a lane's ask; the lane keeps it and hears", () => {
-    const { settled, deliveries, layer } = withConditions([]);
+    const { settled, signals, layer } = withConditions([]);
     return Effect.gen(function* () {
       yield* seed;
       const asks = yield* AsksService.AsksService;
@@ -196,7 +199,11 @@ describe("discuss: asks", () => {
         note: "Ask withdrawn: The owner settled it in chat",
       });
       // The lane that asked is told; it did not withdraw the ask itself.
-      expect(deliveries.map((delivery) => delivery.threadId)).toContain(laneThread);
+      expect(
+        signals.some(
+          (signal) => signal.ask.status === "withdrawn" && signal.ask.askedBy._tag === "lane",
+        ),
+      ).toBe(true);
     }).pipe(Effect.provide(layer));
   });
 });

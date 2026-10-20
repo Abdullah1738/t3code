@@ -42,7 +42,7 @@ export function DraftNotesPanel(props: { missionId: MissionId | null }) {
     <div className="flex flex-col gap-3">
       {groups.map((group) => (
         <div key={group.key} className="flex flex-col gap-1">
-          <h3 className="text-xs font-medium text-muted-foreground">{group.label}</h3>
+          <h3 className="text-xs font-medium text-(--m-muted)">{group.label}</h3>
           <ul className="flex flex-col gap-1">
             {group.notes.map((note) => (
               <li key={note.id} className="flex items-start gap-2 text-sm">
@@ -52,7 +52,7 @@ export function DraftNotesPanel(props: { missionId: MissionId | null }) {
                   checked={note.active}
                   onCheckedChange={(active) => void setDraftNoteActive(note.id, active)}
                 />
-                <span className={note.active ? "text-foreground" : "text-muted-foreground"}>
+                <span className={note.active ? "text-(--m-text)" : "text-(--m-muted)"}>
                   {note.text}
                 </span>
               </li>

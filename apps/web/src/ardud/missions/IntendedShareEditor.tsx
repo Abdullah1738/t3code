@@ -46,7 +46,7 @@ export function IntendedShareEditor(props: { row: PriorityStackRow; masterRoleId
         }, ${changedLine}`}
       >
         {row.intended === null ? "set share" : formatPercent(row.intended)}
-        <span className="text-muted-foreground">{changedLine}</span>
+        <span className="text-(--m-muted)">{changedLine}</span>
       </PopoverTrigger>
       <PopoverPopup align="end" side="bottom" className="w-64">
         <PopoverTitle>Intended share for {sub.title}</PopoverTitle>
@@ -66,9 +66,6 @@ export function IntendedShareEditor(props: { row: PriorityStackRow; masterRoleId
             value={text}
             onChange={(event) => setText(event.target.value)}
           />
-          <p className="text-xs text-muted-foreground">
-            The master can change it too. Leave it empty to clear the share.
-          </p>
           <div className="flex justify-end">
             <Button type="submit" size="sm" disabled={busy}>
               Save

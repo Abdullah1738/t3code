@@ -39,11 +39,12 @@ import {
   MenuTrigger,
 } from "../../../components/ui/menu";
 import { Textarea } from "../../../components/ui/textarea";
+import { AnsweredMark } from "../cards/chips";
 import { askAboutSection, changeSection } from "../missionCommands";
-import { SampleMark } from "../MissionSection";
+import { PANEL_CLASS, SampleMark } from "../MissionSection";
 
-// The frame every overview section shares: one header row (title, a count or
-// meta element, an aside action, the section menu) and the body. No box.
+// The frame every overview section shares: a panel with one header row
+// (title, a count or meta element, an aside action, the section menu) and the body.
 
 /** What a section menu opens inline under its row. */
 export type SectionForm = "rename" | "discuss" | "change" | null;
@@ -66,9 +67,9 @@ export function SectionShell(props: {
   const headingId = `mission-section-${props.section.key}`;
   const [form, setForm] = useState<SectionForm>(null);
   return (
-    <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-2.5">
-      <div className="flex min-h-7 min-w-0 items-center gap-2.5">
-        <h2 id={headingId} className="truncate text-sm font-semibold text-foreground">
+    <section aria-labelledby={headingId} className={PANEL_CLASS}>
+      <div className="flex min-h-8 min-w-0 items-center gap-2.5">
+        <h2 id={headingId} className="truncate text-sm font-semibold">
           {title}
         </h2>
         {props.meta}
@@ -374,29 +375,62 @@ export function AskMasterForm(props: {
   );
 }
 
-/** Small count next to a section title; the update tint marks things that wait on the owner. */
-export function SectionCount(props: { count: number; tone?: "update" | "muted"; label: string }) {
-  if (props.count === 0) return null;
+/**
+ * Count next to a section title: muted, or the teal answered mark for replies
+ * the owner has not read. `zero` keeps a 0 visible (Needs you when empty).
+ */
+export function SectionCount(props: {
+  count: number;
+  tone?: "update" | "muted";
+  label: string;
+  zero?: boolean;
+}) {
+  if (props.tone === "update") return <AnsweredMark count={props.count} label={props.label} />;
+  if (props.count === 0 && !props.zero) return null;
   return (
-    <span
-      className={
-        props.tone === "update"
-          ? "inline-flex h-4.5 min-w-4.5 items-center justify-center rounded-full bg-update/14 px-1.5 text-xs font-medium text-update-foreground tabular-nums"
-          : "text-xs text-muted-foreground tabular-nums"
-      }
-    >
+    <span className="text-sm text-(--m-muted) tabular-nums">
       <span aria-hidden>{props.count}</span>
       <span className="sr-only">{props.label}</span>
     </span>
   );
 }
 
-/** "Show N more" under a list, aligned with its left edge. */
-export function FoldButton(props: { hidden: number; onShow: () => void }) {
+/**
+ * "N more" under a list: a quiet full-width row. A `label` with `expanded`
+ * makes it a toggle ("Settled 3").
+ */
+export function FoldButton(props: {
+  hidden: number;
+  onShow: () => void;
+  label?: string;
+  expanded?: boolean;
+}) {
   if (props.hidden <= 0) return null;
   return (
-    <Button size="xs" variant="ghost-muted" className="self-start" onClick={props.onShow}>
-      Show {props.hidden} more
-    </Button>
+    <button
+      type="button"
+      onClick={props.onShow}
+      aria-expanded={props.expanded}
+      className="flex h-9 items-center self-stretch rounded-lg text-start text-sm text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+    >
+      {props.label ?? `${props.hidden} more`}
+    </button>
+  );
+}
+
+/** Flat grey bars in the final layout while the section loads; no shimmer. */
+export function LoadingRows() {
+  return (
+    <div aria-hidden className="flex flex-col">
+      {[0.6, 0.8, 0.5].map((width) => (
+        <div
+          key={width}
+          className="grid grid-cols-[minmax(0,1fr)_56px] gap-4 py-3.5 not-first:border-t not-first:border-(--m-rule)"
+        >
+          <span className="h-3 rounded-md bg-(--m-active)" style={{ width: `${width * 100}%` }} />
+          <span className="h-3 rounded-md bg-(--m-active)" />
+        </div>
+      ))}
+    </div>
   );
 }

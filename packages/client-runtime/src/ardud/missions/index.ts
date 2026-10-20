@@ -16,6 +16,8 @@ export * from "./portfolioViewModel.ts";
 export * from "./textDiff.ts";
 export * from "./requestsViewModel.ts";
 export * from "./layoutViewModel.ts";
+export * from "./masterInbox.ts";
+export * from "./boardViewModel.ts";
 export { createFixtureMissionsSource, type FixtureMissionsSourceOptions } from "./fixture/index.ts";
 export * from "./views/index.ts";
 export * from "./rpcSource.ts";

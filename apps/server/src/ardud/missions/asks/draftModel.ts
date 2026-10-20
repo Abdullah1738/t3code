@@ -3,8 +3,9 @@
  * WhatsApp, email) is a draft until the owner approves it. Owner direction:
  * "save notes on how I want drafts to be", so writers load matching notes and
  * past approved examples every time, and the owner's edits teach new notes
- * (see draftLearning.ts). Sending is a later step; approving records
- * `approved` and stops.
+ * (see draftLearning.ts). Approving records `approved`; the writer is told,
+ * posts exactly the approved text and records it sent (a system like crw
+ * reports its own sends). A sent draft is never sent again.
  *
  * Routing: the mission's routing table picks the approver (owner or master)
  * when a draft opens; owner or master can re-route a waiting draft with a
@@ -14,6 +15,7 @@
 import {
   approverOf,
   isOwnerProvenance,
+  LaneId,
   type ApprovalRoute,
   type Approver,
   type DecideDraftInput,
@@ -23,6 +25,7 @@ import {
   type DraftNote,
   type DraftNoteId,
   type DraftNoteScope,
+  type MissionActor,
   type MissionId,
   type MissionLink,
   type MissionProvenance,
@@ -629,6 +632,7 @@ export const reopenDraft = (
     ...(spent === null
       ? {}
       : { spentConditionIds: spendCondition(draft.spentConditionIds, spent.requestId) }),
+    ...((draft.withdrawNote ?? null) === null ? {} : { withdrawNote: null }),
     ...nextEpoch(draft, now),
   };
   return ok({
@@ -643,6 +647,95 @@ export const reopenDraft = (
       }),
     ],
   });
+};
+
+/**
+ * The mission's master takes back a draft still waiting on a decision, whoever
+ * it is routed to (owner: "the master can withdraw it on its own"). It ends
+ * dropped with the master's note; reopening clears the note.
+ */
+export const withdrawDraft = (command: {
+  readonly draft: Draft;
+  readonly provenance: MissionProvenance;
+  readonly callerIsMaster: boolean;
+  readonly note: string;
+  readonly now: string;
+}): Outcome<Transition<Draft>> => {
+  const { draft, provenance } = command;
+  if (!command.callerIsMaster) {
+    return refuse("forbidden", `Only the mission's master withdraws draft ${draft.id}.`);
+  }
+  if (!awaitingOwner(draft)) {
+    return refuse(
+      "conflict",
+      `Draft ${draft.id} is ${draft.status}; only a draft waiting on a decision is withdrawn.`,
+    );
+  }
+  const record: Draft = {
+    ...draft,
+    status: "dropped",
+    decidedBy: provenance,
+    decidedAt: command.now,
+    withdrawNote: command.note,
+  };
+  return ok({
+    record,
+    events: [
+      decisionEvent(record, provenance, `Withdrawn: ${command.note}`, {
+        action: "withdraw",
+        note: command.note,
+        previousStatus: draft.status,
+      }),
+    ],
+  });
+};
+
+/**
+ * Who wrote a thread's draft and hears its decision: the writer role, else the
+ * role that drafted it, else its lane. Null for a system's draft (crw reads its
+ * own decisions) and for drafts with no thread behind them.
+ */
+export const draftWriter = (draft: Draft): MissionActor | null => {
+  if ((draft.requestedBy ?? null) !== null) return null;
+  const roleId = draft.writerRoleId ?? draft.writtenBy?.roleId ?? null;
+  if (roleId !== null) return { _tag: "role", roleId };
+  if (draft.source.kind === "lane" && draft.source.ref !== null) {
+    return { _tag: "lane", laneId: LaneId.make(draft.source.ref.id) };
+  }
+  return null;
+};
+
+/** What the writer is told once its draft is decided; null while nothing was decided. */
+export const draftDecisionNotice = (
+  draft: Draft,
+): { readonly summary: string; readonly body: string } | null => {
+  const what = `draft for ${draft.audience} (${draft.channel})`;
+  const ref = `Draft ${draft.id}`;
+  switch (draft.status) {
+    case "approved":
+      return {
+        summary: clipSummary(`Approved: ${what}`),
+        body: [
+          `${ref} is approved${draft.approvedText === null ? "" : " with edits"}. Post exactly this text once, then record it with mission_draft_sent (with the link when there is one):`,
+          "",
+          draft.approvedText ?? draft.text,
+        ].join("\n"),
+      };
+    case "rewrite-requested":
+      return {
+        summary: clipSummary(`Rewrite requested: ${what}`),
+        body: `${ref} needs a rewrite: ${draft.rewriteNote ?? ""}\nSend the new text with mission_draft and this draftId. Don't post anything yet.`,
+      };
+    case "dropped":
+      return (draft.withdrawNote ?? null) === null
+        ? { summary: clipSummary(`Dropped: ${what}`), body: `${ref} was dropped. Don't post it.` }
+        : {
+            summary: clipSummary(`Withdrawn: ${what}`),
+            body: `The master withdrew ${ref}: ${draft.withdrawNote}\nDon't post it.`,
+          };
+    default:
+      return null;
+  }
 };
 
 export interface RouteDraftCommand {
@@ -1025,33 +1118,101 @@ export const reportDraftSent = (command: {
         `Draft ${draft.id} is ${draft.status}; only an approved draft is sent.`,
       );
   }
-  const record: Draft =
-    outcome._tag === "sent"
-      ? { ...draft, status: "sent", sentAt: command.now, sentLink: outcome.link, sendError: null }
-      : { ...draft, status: "send-failed", sendError: outcome.reason };
+  if (outcome._tag === "sent") return ok(markSent(draft, provenance, outcome.link, command.now));
+  const record: Draft = { ...draft, status: "send-failed", sendError: outcome.reason };
   return ok({
     record,
     events: [
       {
-        kind: outcome._tag === "sent" ? "draft.sent" : "draft.send-failed",
+        kind: "draft.send-failed",
         actor: actorOf(provenance),
         provenance,
         summary: clipSummary(
-          outcome._tag === "sent"
-            ? `Sent: draft for ${draft.audience} (${draft.channel}) at ${outcome.link.label}`
-            : `Send failed: draft for ${draft.audience} (${draft.channel}) (${outcome.reason})`,
+          `Send failed: draft for ${draft.audience} (${draft.channel}) (${outcome.reason})`,
         ),
         subject: draftRef(record),
         payload: {
-          revision: input.revision,
+          revision: revisionOf(draft),
           head: draft.head ?? null,
-          link: outcome._tag === "sent" ? outcome.link : null,
-          reason: outcome._tag === "send-failed" ? outcome.reason : null,
+          link: null,
+          reason: outcome.reason,
           previousStatus: draft.status,
         },
       },
     ],
   });
+};
+
+const markSent = (
+  draft: Draft,
+  provenance: MissionProvenance,
+  link: MissionLink | null,
+  now: string,
+): Transition<Draft> => {
+  const record: Draft = { ...draft, status: "sent", sentAt: now, sentLink: link, sendError: null };
+  const where = link === null ? "" : ` at ${link.label}`;
+  return {
+    record,
+    events: [
+      {
+        kind: "draft.sent",
+        actor: actorOf(provenance),
+        provenance,
+        summary: clipSummary(`Sent: draft for ${draft.audience} (${draft.channel})${where}`),
+        subject: draftRef(record),
+        payload: {
+          revision: revisionOf(draft),
+          head: draft.head ?? null,
+          link,
+          reason: null,
+          previousStatus: draft.status,
+        },
+      },
+    ],
+  };
+};
+
+/**
+ * A thread's draft: its writer (or the mission's master) posted the approved
+ * text and records it sent. Only an approved draft takes it; the same report
+ * again is a no-op and a sent draft is never sent again. A system's drafts are
+ * reported by that system (reportDraftSent).
+ */
+export const recordDraftSent = (command: {
+  readonly draft: Draft;
+  readonly caller: MissionCaller;
+  readonly callerIsMaster: boolean;
+  readonly link: MissionLink | null;
+  readonly now: string;
+}): Outcome<Transition<Draft>> => {
+  const { draft, caller, link } = command;
+  if ((draft.requestedBy ?? null) !== null) {
+    return refuse(
+      "forbidden",
+      `Draft ${draft.id} was opened by ${draft.requestedBy}; it reports its own send.`,
+    );
+  }
+  const writer = draftWriter(draft);
+  const isWriter = writer !== null && callerActsAs(caller, writer);
+  if (!isWriter && !command.callerIsMaster) {
+    return refuse(
+      "forbidden",
+      `Only the draft's writer or the mission's master records draft ${draft.id} sent.`,
+    );
+  }
+  if (draft.status === "sent") {
+    const sentLink = draft.sentLink ?? null;
+    return link === null || (sentLink !== null && sameTarget(sentLink, link))
+      ? ok({ record: draft, events: [] })
+      : refuse("conflict", `Draft ${draft.id} was already sent; it stays sent.`);
+  }
+  if (draft.status !== "approved") {
+    return refuse(
+      "conflict",
+      `Draft ${draft.id} is ${draft.status}; only an approved draft is sent.`,
+    );
+  }
+  return ok(markSent(draft, caller.provenance, link, command.now));
 };
 
 /** Edit pairs the owner approved: the raw material for edit learning. */

@@ -265,6 +265,23 @@ describe("viewCard", () => {
     expect(card.blocks).toEqual([{ kind: "facts", rows: [{ label: "Ours", value: "green" }] }]);
   });
 
+  it("never shows who asked an ask", () => {
+    const asker = template("asker", {
+      backing: "ask",
+      match: {},
+      body: [
+        { _tag: "facts", rows: [{ label: "Asked by", bind: "record.askedBy" }] },
+        { _tag: "facts", rows: [{ label: "By", bind: "by" }] },
+        { _tag: "facts", rows: [{ label: "Question", bind: "record.question" }] },
+      ],
+      actions: ["answer"],
+    });
+    const card = viewCard({ kind: "ask", record: ask }, [asker], { nowMs: NOW });
+    expect(card.blocks).toEqual([
+      { kind: "facts", rows: [{ label: "Question", value: "Stamp r004 now?" }] },
+    ]);
+  });
+
   it("ignores removed templates", () => {
     const removed = template("gone", { backing: "ask", body: [{ _tag: "choice" }] }, "removed");
     expect(viewCard({ kind: "ask", record: ask }, [removed], { nowMs: NOW }).source).toBe(

@@ -7,9 +7,6 @@
  * conversation (see `contextOf`), so the owner never restates context. The
  * master's replies wake nobody. Every write is one commit: the request
  * record, its timeline event, and the message travel together.
- *
- * Forks are different: a fork is a side question that must not change the
- * master. A request is meant to.
  */
 // @effect-diagnostics nodeBuiltinImport:off - request ids use node:crypto, like the session board.
 import * as NodeCrypto from "node:crypto";
@@ -192,7 +189,6 @@ const SCOPED_LINK_KINDS = [
   "knock",
   "approval",
   "work-item",
-  "fork",
   "owner-request",
 ] as const satisfies ReadonlyArray<MissionStoreKind>;
 type ScopedLinkKind = (typeof SCOPED_LINK_KINDS)[number];

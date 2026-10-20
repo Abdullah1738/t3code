@@ -744,7 +744,6 @@ export const VIEW_PATHS: { readonly [K in ViewPathScope]: PathTable } = {
     urgency: "enum",
     costOfWaiting: "text",
     blocks: "refs",
-    askedBy: "actor",
     status: "enum",
     createdAt: "time",
   },
