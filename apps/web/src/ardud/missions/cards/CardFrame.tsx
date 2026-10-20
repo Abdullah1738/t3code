@@ -118,13 +118,21 @@ export interface CardFrameProps {
   readonly done?: CardDone | null;
   /** Discuss on the done row, when the card can still be talked about. */
   readonly onDiscuss?: (() => void) | null;
+  /** After the age in the head row: the item's Snooze control. */
+  readonly end?: ReactNode;
+  /** The owner's comments on the item, under its body. */
+  readonly comments?: ReactNode;
 }
 
 export function CardFrame(props: CardFrameProps) {
   const age = props.since ? ageView(props.since, props.nowMs) : null;
   const done = props.done ?? null;
   const actions = props.actions ?? [];
-  const decisions = actions.filter((action) => action.key !== "discuss");
+  // Comment and Discuss decide nothing, so they sit after the decisions.
+  const decisions = actions.filter(
+    (action) => action.key !== "discuss" && action.key !== "comment",
+  );
+  const comment = actions.find((action) => action.key === "comment") ?? null;
   const discuss = actions.find((action) => action.key === "discuss") ?? null;
   const pane = props.size === "pane";
   // The reading card sits right under the page's h1; list cards under a section's h2.
@@ -156,9 +164,12 @@ export function CardFrame(props: CardFrameProps) {
           </span>
         ) : null}
         {props.subMission ? <SubMissionLink subMission={props.subMission} /> : null}
-        {age && props.since ? (
-          <span className="ms-auto">
-            <AgeElement age={age} at={props.since} prefix={done ? "" : "waiting "} />
+        {(age && props.since) || props.end ? (
+          <span className="ms-auto inline-flex min-w-0 items-center gap-2">
+            {age && props.since ? (
+              <AgeElement age={age} at={props.since} prefix={done ? "" : "waiting "} />
+            ) : null}
+            {done ? null : props.end}
           </span>
         ) : null}
       </div>
@@ -192,7 +203,8 @@ export function CardFrame(props: CardFrameProps) {
       ) : (
         <>
           {props.children}
-          {decisions.length > 0 || discuss || props.approver ? (
+          {props.comments}
+          {decisions.length > 0 || comment || discuss || props.approver ? (
             <div
               role="group"
               aria-label="Decide"
@@ -214,6 +226,11 @@ export function CardFrame(props: CardFrameProps) {
                   {action.label ?? CARD_ACTION_LABEL[action.key]}
                 </Button>
               ))}
+              {comment ? (
+                <Button variant="ghost-muted" disabled={comment.disabled} onClick={comment.onRun}>
+                  {comment.label ?? CARD_ACTION_LABEL.comment}
+                </Button>
+              ) : null}
               {discuss ? (
                 <DiscussButton
                   onRun={discuss.onRun}

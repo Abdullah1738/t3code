@@ -607,6 +607,7 @@ describe("Comments and snoozes", () => {
       "draft:draft-1",
     ]);
     expect(snoozedEntries(snoozed, NOW).map((e) => e.key)).toEqual(["ask:ask-1"]);
+    expect(snoozedEntries(snoozed, NOW, ["approve"])).toEqual([]);
   });
 
   it("brings an item back when its time passes on the device clock", () => {

@@ -241,17 +241,23 @@ function snoozedTabCounts(
 }
 
 /**
- * What the owner snoozed out of their inbox, soonest back first (open-ended
- * snoozes last). Only items still waiting are listed; a decided item drops out.
+ * What the owner snoozed out of their inbox (or out of `tabs`), soonest back
+ * first, open-ended snoozes last. Only items still waiting are listed; a
+ * decided item drops out.
  */
-export function snoozedEntries(inbox: MissionInboxSnapshot, nowMs: number): InboxEntry[] {
+export function snoozedEntries(
+  inbox: MissionInboxSnapshot,
+  nowMs: number,
+  tabs: ReadonlyArray<InboxTab> = INBOX_TABS,
+): InboxEntry[] {
   const snoozed = snoozedKeys(inbox.marks, nowMs);
   if (snoozed.size === 0) return [];
   const backAt = (entry: InboxEntry) => {
     const until = markOf(inbox, entry.key)?.snooze?.until;
     return until ? Date.parse(until) : Number.POSITIVE_INFINITY;
   };
-  return INBOX_TABS.flatMap((tab) => tabEntries(inbox, tab, "owner"))
+  return tabs
+    .flatMap((tab) => tabEntries(inbox, tab, "owner"))
     .filter((entry) => snoozed.has(entry.key))
     .sort((left, right) => backAt(left) - backAt(right));
 }

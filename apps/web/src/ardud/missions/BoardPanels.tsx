@@ -65,7 +65,10 @@ export function BoardLead(props: {
   const rooms = useMissionRooms(missionId);
   const review = useMissionReviewPolicy(missionId);
   const connection = useMissionsConnection();
-  const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox) : undefined), [inbox]);
+  const waiting = useMemo(
+    () => (inbox ? ownerWaitingEntries(inbox, nowMs) : undefined),
+    [inbox, nowMs],
+  );
   const looked = overview.ownerLastLookedAt;
   const facts = useMemo(
     () =>

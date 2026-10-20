@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { ChevronLeftIcon, ListFilterIcon } from "lucide-react";
 
@@ -56,12 +56,14 @@ import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
 import { MissionSection } from "./MissionSection";
 import { RoutingPanel } from "./RoutingPanel";
-import { LoadingRows } from "./sections/SectionShell";
+import { FeedError } from "./sections/FeedError";
+import { FoldButton, LoadingRows } from "./sections/SectionShell";
 import {
   isSampleFeed,
   useDraftNotes,
   useMasterRoleId,
   useMissionInbox,
+  useMissionInboxFeed,
   useMissionInboxHistory,
   useMissionList,
   useOwnerRequests,
@@ -95,12 +97,16 @@ export function MissionInboxPage(props: {
   const nowMs = useNowMs();
   const mission = list?.missions.find((item) => item.id === props.missionId) ?? null;
   const inbox = useMissionInbox(props.missionId);
+  const feed = useMissionInboxFeed(props.missionId);
   // No tab in the URL: the first tab with something in it.
   const tab = props.tab ?? (inbox ? defaultInboxTab(inbox, props.route) : "decide");
   const wide = useMediaQuery(TWO_COLUMNS_QUERY);
   // Two columns always show a card; one column opens one only when asked.
   const screen = useInboxScreen(props.missionId, tab, props.route, { autoSelectFirst: wide });
-  const lead = useMemo(() => (inbox ? inboxLead(ownerWaitingEntries(inbox)) : null), [inbox]);
+  const lead = useMemo(
+    () => (inbox ? inboxLead(ownerWaitingEntries(inbox, nowMs)) : null),
+    [inbox, nowMs],
+  );
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -159,8 +165,11 @@ export function MissionInboxPage(props: {
             missionId={props.missionId}
             tab={tab}
             route={props.route}
-            counts={inbox ? inboxTabCounts(inbox, props.route) : undefined}
+            counts={inbox ? inboxTabCounts(inbox, props.route, nowMs) : undefined}
           />
+          <div className="max-w-90 empty:hidden">
+            <FeedError what="the inbox" feed={feed} nowMs={nowMs} />
+          </div>
         </div>
         {inbox ? (
           <InboxBody
@@ -171,7 +180,7 @@ export function MissionInboxPage(props: {
             nowMs={nowMs}
             wide={wide}
           />
-        ) : (
+        ) : feed.failure ? null : (
           <div className="mx-auto w-full max-w-6xl px-5 pt-3 sm:px-6" aria-busy="true">
             <div className="w-full max-w-90">
               <LoadingRows />
@@ -336,35 +345,47 @@ function InboxBody(props: {
       nowMs,
       actions,
       size: "pane" as const,
+      marks: screen.inbox?.marks,
     }),
-    [draftNotes, stats, missionList, masterRoleId, nowMs, actions],
+    [draftNotes, stats, missionList, masterRoleId, nowMs, actions, screen.inbox?.marks],
   );
   const selected = screen.selected;
 
   const entryKeys = useMemo(() => screen.entries.map((entry) => entry.key), [screen.entries]);
   const { paneRef, emptyRef } = usePaneFocus(selected?.key ?? null, props.wide, entryKeys);
-  const listView =
-    screen.entries.length === 0 ? (
-      // Takes focus when the last item is decided, so focus never drops to the page.
-      <p ref={emptyRef} tabIndex={-1} className="px-3 py-2 text-sm outline-none">
-        {props.route === "owner" && ACTION_TABS.has(props.tab)
-          ? "Nothing needs you."
-          : "Nothing here."}
-      </p>
-    ) : (
-      <InboxList
-        groups={screen.groups}
+  const onOpen = (key: string) => screen.dispatch({ type: "select", key });
+  const listView = (
+    <>
+      {screen.entries.length === 0 ? (
+        // Takes focus when the last item is decided, so focus never drops to the page.
+        <p ref={emptyRef} tabIndex={-1} className="px-3 py-2 text-sm outline-none">
+          {props.route === "owner" && ACTION_TABS.has(props.tab)
+            ? "Nothing needs you."
+            : "Nothing here."}
+        </p>
+      ) : (
+        <InboxList
+          groups={screen.groups}
+          missionList={missionList}
+          nowMs={nowMs}
+          label={INBOX_TAB_LABEL[props.tab]}
+          selectedKey={selected?.key ?? null}
+          onOpen={onOpen}
+        />
+      )}
+      <SnoozedGroup
+        entries={screen.snoozed}
         missionList={missionList}
         nowMs={nowMs}
-        label={INBOX_TAB_LABEL[props.tab]}
         selectedKey={selected?.key ?? null}
-        onOpen={(key) => screen.dispatch({ type: "select", key })}
+        onOpen={onOpen}
       />
-    );
+    </>
+  );
   // Every card stays mounted and only the selected one shows, so a half-typed
   // answer survives switching items (not resizing across the breakpoint, which
   // swaps layouts). Cards are memoized on their own state.
-  const cards = screen.entries.map((entry) => (
+  const cards = [...screen.entries, ...screen.snoozed].map((entry) => (
     <div key={entry.key} hidden={entry.key !== selected?.key}>
       <InboxEntryCard
         entry={entry}
@@ -476,6 +497,42 @@ function usePaneFocus(selectedKey: string | null, wide: boolean, entryKeys: Read
 }
 
 /** One list per mission; the mission header only shows when there are several. */
+/** What the owner snoozed out of this tab, folded under the list; each row opens its card. */
+function SnoozedGroup(props: {
+  entries: ReadonlyArray<InboxEntry>;
+  missionList: MissionListSnapshot | undefined;
+  nowMs: number;
+  selectedKey: string | null;
+  onOpen: (key: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  if (props.entries.length === 0) return null;
+  return (
+    <div className="mt-3 flex flex-col px-3">
+      <FoldButton
+        hidden={props.entries.length}
+        expanded={open}
+        label={`Snoozed ${props.entries.length}`}
+        onShow={() => setOpen(!open)}
+      />
+      {open ? (
+        <ul aria-label="Snoozed" className="-mx-3 flex flex-col">
+          {props.entries.map((entry) => (
+            <InboxRow
+              key={entry.key}
+              entry={entry}
+              missionList={props.missionList}
+              nowMs={props.nowMs}
+              current={entry.key === props.selectedKey}
+              onOpen={props.onOpen}
+            />
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 function InboxList(props: {
   groups: ReadonlyArray<InboxEntryGroup>;
   missionList: MissionListSnapshot | undefined;
