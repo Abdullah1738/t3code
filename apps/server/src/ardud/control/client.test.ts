@@ -4,7 +4,7 @@ import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import { afterEach, describe, expect, it } from "@effect/vitest";
+import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
 
 // @ts-expect-error plain ESM module without declarations
 import { ControlApiError, ControlClient, discoverConfig } from "./client.mjs";
@@ -25,6 +25,27 @@ const listen = (handler: Parameters<typeof NodeHttp.createServer>[1]) =>
   });
 
 describe("discoverConfig", () => {
+  const saved = {
+    url: process.env.T3_CONTROL_URL,
+    token: process.env.T3_CONTROL_TOKEN,
+    file: process.env.T3_CONTROL_TOKEN_FILE,
+  };
+  beforeEach(() => {
+    delete process.env.T3_CONTROL_URL;
+    delete process.env.T3_CONTROL_TOKEN;
+    delete process.env.T3_CONTROL_TOKEN_FILE;
+  });
+  afterEach(() => {
+    for (const [key, value] of [
+      ["T3_CONTROL_URL", saved.url],
+      ["T3_CONTROL_TOKEN", saved.token],
+      ["T3_CONTROL_TOKEN_FILE", saved.file],
+    ] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
   it("reads a chmod 600 token file and rejects a readable one", () => {
     const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "ctl-"));
     const file = NodePath.join(dir, "ardud-control.json");
@@ -38,22 +59,25 @@ describe("discoverConfig", () => {
     expect(() => discoverConfig({ tokenFile: file })).toThrow(/chmod 600/);
   });
 
-  it("skips token files that do not exist and uses the next one", () => {
+  it("refuses a named token file that does not exist", () => {
     const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "ctl-"));
-    const file = NodePath.join(dir, "next.json");
-    NodeFS.writeFileSync(file, JSON.stringify({ url: "http://127.0.0.1:2", token: "next" }), {
-      mode: 0o600,
-    });
-    const previous = process.env.T3_CONTROL_TOKEN_FILE;
-    process.env.T3_CONTROL_TOKEN_FILE = file;
-    try {
-      expect(
-        discoverConfig({ tokenFile: NodePath.join(dir, "missing.json"), component: "x" }),
-      ).toEqual({ url: "http://127.0.0.1:2", token: "next" });
-    } finally {
-      if (previous === undefined) delete process.env.T3_CONTROL_TOKEN_FILE;
-      else process.env.T3_CONTROL_TOKEN_FILE = previous;
-    }
+    expect(() =>
+      discoverConfig({ tokenFile: NodePath.join(dir, "missing.json"), component: "x", home: dir }),
+    ).toThrow(/ENOENT/);
+  });
+
+  it("reads the component's own credential before the shared file", () => {
+    const home = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "ctl-"));
+    const write = (file: string, token: string) => {
+      NodeFS.mkdirSync(NodePath.dirname(file), { recursive: true });
+      NodeFS.writeFileSync(file, JSON.stringify({ url: "http://127.0.0.1:2", token }), {
+        mode: 0o600,
+      });
+    };
+    write(NodePath.join(home, ".robob", "ardud-control.json"), "shared");
+    expect(discoverConfig({ component: "x", home }).token).toBe("shared");
+    write(NodePath.join(home, ".robob", "components", "x.json"), "own");
+    expect(discoverConfig({ component: "x", home }).token).toBe("own");
   });
 });
 

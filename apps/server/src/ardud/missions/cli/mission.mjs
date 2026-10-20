@@ -64,8 +64,8 @@ through the mission_* MCP tools from the calling thread, never this CLI: HTTP
 cannot prove which thread is calling.
 
 Connection: T3_CONTROL_URL plus MISSION_TOKEN (the mission-cli component
-credential) or T3_CONTROL_TOKEN, else the first file found of
-T3_CONTROL_TOKEN_FILE, ${componentTokenFile("mission-cli")} and
+credential) or T3_CONTROL_TOKEN, else the file named by T3_CONTROL_TOKEN_FILE,
+else the first found of ${componentTokenFile("mission-cli")} and
 ${SHARED_TOKEN_FILE}. Only the mission-cli credential reads his full view
 and acts for him.`;
 

@@ -30,8 +30,9 @@ const HELP = `t3ctl <command> [options]
   set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive] [--settle|--unsettle]
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
 
-Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the first file found of
-T3_CONTROL_TOKEN_FILE, ${TOKEN_FILE} and ${SHARED_TOKEN_FILE}.`;
+Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
+T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
+${SHARED_TOKEN_FILE}.`;
 
 const { values: flags, positionals } = NodeUtil.parseArgs({
   allowPositionals: true,

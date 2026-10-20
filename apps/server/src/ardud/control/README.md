@@ -28,10 +28,11 @@ This issues a bearer session with the administrative scopes (the CLI has no
 narrower option). `t3 auth session list` / `revoke` manage it. Default TTL is 30 days.
 
 Clients find the server and token in this order: explicit options, then
-`T3_CONTROL_URL` and `T3_CONTROL_TOKEN`, then the first JSON file that exists
-out of `T3_CONTROL_TOKEN_FILE`, the tool's own component credential
-(`~/.robob/components/<name>.json`: `t3ctl` for t3ctl, `mission-cli` for
-mission) and the old shared `~/.robob/ardud-control.json`. Each holds
+`T3_CONTROL_URL` and `T3_CONTROL_TOKEN`, then the file named by
+`T3_CONTROL_TOKEN_FILE` (it must exist), else the first that exists of the
+tool's own component credential (`~/.robob/components/<name>.json`: `t3ctl`
+for t3ctl, `mission-cli` for mission) and the old shared
+`~/.robob/ardud-control.json`. Each holds
 `{"url":"http://127.0.0.1:<port>","token":"..."}` and must be chmod 600, or
 the client refuses it. `t3 ardud component-token issue <name>` issues the
 token for a component file; `t3ctl login --url URL --token TOKEN` writes
@@ -226,7 +227,7 @@ or send. `client.upload({ name, mimeType, bytes })` does all of this.
 
 ```js
 import { ControlClient } from "<fork>/apps/server/src/ardud/control/client.mjs";
-const t3 = new ControlClient();
+const t3 = new ControlClient({ component: "t3ctl" }); // reads ~/.robob/components/t3ctl.json
 const { threadId } = await t3.createThread({ prompt: "reply PONG", origin: "imessage" });
 const done = await t3.wait(threadId);
 console.log(done.lastAssistant?.text);
