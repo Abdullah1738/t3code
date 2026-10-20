@@ -44,6 +44,7 @@ import { setCriticalityGuide, setPoolCapacity, setRoleModel } from "./operationC
 
 const ROLES_SHOWN = 8;
 const HISTORY_SHOWN = 3;
+const VERDICTS_SHOWN = 5;
 
 export function RolesTab(props: { missionId: MissionId; nowMs: number }) {
   const roles = useMissionRoles(props.missionId);
@@ -380,15 +381,18 @@ function ReviewPolicySection(props: { missionId: MissionId; roles: ReadonlyArray
 function VerdictsSection(props: { missionId: MissionId; nowMs: number }) {
   const snapshot = useMissionReviewPolicy(props.missionId);
   const masterRoleId = useMasterRoleId(props.missionId);
+  const [all, setAll] = useState(false);
+  // Newest first, as the server sends them.
   const verdicts = useMemo(
-    () => (snapshot ? reviewPolicyView(snapshot, masterRoleId).verdicts.toReversed() : []),
+    () => (snapshot ? reviewPolicyView(snapshot, masterRoleId).verdicts : []),
     [snapshot, masterRoleId],
   );
   if (verdicts.length === 0) return null;
+  const shown = all ? verdicts : verdicts.slice(0, VERDICTS_SHOWN);
   return (
     <MissionSection title="Criticality calls" caption={String(verdicts.length)}>
       <ul className="flex flex-col text-sm">
-        {verdicts.map((row) => (
+        {shown.map((row) => (
           <li
             key={row.verdict.id}
             className={cn(DESK_ROW, "grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-0.5 py-2.5")}
@@ -407,6 +411,7 @@ function VerdictsSection(props: { missionId: MissionId; nowMs: number }) {
           </li>
         ))}
       </ul>
+      {all ? null : <FoldRow hidden={verdicts.length - shown.length} onShow={() => setAll(true)} />}
     </MissionSection>
   );
 }

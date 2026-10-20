@@ -21,6 +21,7 @@ import { createRpcMissionsSource, poolUsageOf, type MissionsTransport } from "./
 import type {
   MissionInboxSnapshot,
   MissionOverviewSnapshot,
+  MissionReviewSnapshot,
   MissionRoomEntry,
   MissionTimelineWindow,
   MissionViewsState,
@@ -396,6 +397,26 @@ describe("rpc missions source", () => {
     await settle();
     expect(reads).toBe(2);
     expect(roles.seen.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("passes the server's criticality verdicts and review rounds through", async () => {
+    const verdict = { id: "verdict-1", critical: true, reason: "touches custody" };
+    const review = { id: "review-1", verdict: "findings", findings: 3 };
+    const { transport } = fakeTransport({
+      [POLICY.reviewPolicy]: () => ({
+        policy: { missionId: CRPKO },
+        stored: true,
+        verdicts: [verdict],
+        reviews: [review],
+      }),
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const seen = collect<MissionReviewSnapshot | null>((listener) =>
+      source.subscribeReviewPolicy(CRPKO, listener),
+    );
+    await settle();
+    expect(seen.last()?.verdicts).toEqual([verdict]);
+    expect(seen.last()?.reviews).toEqual([review]);
   });
 
   it("counts unread room messages from others and recounts after the owner reads", async () => {

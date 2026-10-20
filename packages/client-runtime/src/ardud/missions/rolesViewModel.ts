@@ -3,6 +3,7 @@ import type {
   CriticalityVerdict,
   MissionId,
   ModelSelection,
+  PullRequestKey,
   ReviewLadder,
   ReviewPolicy,
   ReviewRecord,
@@ -312,6 +313,44 @@ export function reviewPolicyView(
       const label = stageLabel.get(review.stageId) ?? review.stageId;
       return { review, stageLabel: label, line: reviewLine(review, label) };
     }),
+  };
+}
+
+export interface PullRequestReviews {
+  /** The PR's current call: the newest verdict recorded for it. */
+  readonly verdict: VerdictRow | null;
+  /** Its review rounds, first to last, each with a chip label ("Sol review r2: 3 findings"). */
+  readonly rounds: ReadonlyArray<ReviewRow & { readonly chip: string }>;
+}
+
+function roundChip(row: ReviewRow, round: number): string {
+  const { review } = row;
+  const outcome =
+    review.verdict === "findings"
+      ? `${review.findings} ${review.findings === 1 ? "finding" : "findings"}`
+      : review.verdict;
+  return `${row.stageLabel} r${round}: ${outcome}`;
+}
+
+/** One PR's criticality call and review rounds, for a work row that expands. */
+export function pullRequestReviews(
+  view: ReviewPolicyView,
+  pullRequest: PullRequestKey,
+): PullRequestReviews {
+  const same = (key: PullRequestKey) =>
+    key.repository === pullRequest.repository && key.number === pullRequest.number;
+  const perStage = new Map<string, number>();
+  const rounds = [...view.reviews]
+    .reverse()
+    .filter((row) => same(row.review.pullRequest))
+    .map((row) => {
+      const round = (perStage.get(row.review.stageId) ?? 0) + 1;
+      perStage.set(row.review.stageId, round);
+      return { ...row, chip: roundChip(row, round) };
+    });
+  return {
+    verdict: view.verdicts.find((row) => same(row.verdict.pullRequest)) ?? null,
+    rounds,
   };
 }
 

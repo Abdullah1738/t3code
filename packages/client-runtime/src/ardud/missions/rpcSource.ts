@@ -1034,9 +1034,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         (current: MissionsReviewPolicy, log: ReadonlyArray<MissionEvent>) => ({
           missionId,
           policy: current.policy,
-          // Verdicts and reviews have no list RPC yet.
-          verdicts: [],
-          reviews: [],
+          verdicts: current.verdicts ?? [],
+          reviews: current.reviews ?? [],
           changes: changesFor(log, ["review-policy"]),
         }),
       );

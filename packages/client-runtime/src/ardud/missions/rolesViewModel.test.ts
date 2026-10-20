@@ -5,6 +5,7 @@ import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import { poolRows, recoveryBanner, recoveryView, setPoolCapacityInput } from "./poolsViewModel.ts";
 import {
   pendingModelLine,
+  pullRequestReviews,
   reviewerRows,
   reviewPolicyView,
   roleHistory,
@@ -223,6 +224,20 @@ describe("roles page", () => {
       "Rule-7 exact-head merge",
     ]);
     expect(view.verdicts.at(-1)?.ref).toBe("risk-liquidation-latest#68");
+    const risk = pullRequestReviews(view, {
+      repository: "risk-liquidation-latest",
+      number: 68,
+    } as never);
+    expect(risk.verdict?.verdict.critical).toBe(true);
+    expect(risk.rounds.length).toBeGreaterThan(0);
+    expect(risk.rounds[0]?.chip).toMatch(/ r1: /);
+    expect(risk.rounds.map((row) => row.review.createdAt)).toEqual(
+      risk.rounds.map((row) => row.review.createdAt).toSorted(),
+    );
+    expect(pullRequestReviews(view, { repository: "x/y", number: 1 } as never)).toEqual({
+      verdict: null,
+      rounds: [],
+    });
     expect(
       reviewerRows(review.value.policy, roles.value.roles).map((row) => [row.stage, row.name]),
     ).toEqual(REVIEWERS);
