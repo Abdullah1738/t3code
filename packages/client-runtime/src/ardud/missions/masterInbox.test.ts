@@ -3,7 +3,8 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { inboxEntries, inboxTabCounts } from "./inboxViewModel.ts";
-import { withMasterInbox } from "./masterInbox.ts";
+import { withMasterInbox, withMasterInboxFeed, type MasterInboxFeed } from "./masterInbox.ts";
+import type { Listener, MissionInboxSnapshot, MissionsSource } from "./source.ts";
 
 const T0 = "2026-10-17T08:00:00.000Z";
 
@@ -66,5 +67,32 @@ describe("withMasterInbox", () => {
     const joined = withMasterInbox(ownerInbox, undefined);
     expect(joined.masterCounts).toEqual({ approve: 0, suggestions: 0 });
     expect(joined.approvals).toBe(ownerInbox.approvals);
+  });
+
+  it("joins the master's feed into the source's inbox snapshots", () => {
+    let sendInbox: Listener<MissionInboxSnapshot> = () => {};
+    let sendMaster: Parameters<MasterInboxFeed>[1] = () => {};
+    let stopped = 0;
+    const source = {
+      subscribeInbox: (_missionId: unknown, listener: Listener<MissionInboxSnapshot>) => {
+        sendInbox = listener;
+        return () => (stopped += 1);
+      },
+    } as unknown as MissionsSource;
+    const feed: MasterInboxFeed = (_missionId, listener) => {
+      sendMaster = listener;
+      return () => (stopped += 1);
+    };
+    const seen: MissionInboxSnapshot[] = [];
+    const stop = withMasterInboxFeed(source, feed).subscribeInbox(null, (value) =>
+      seen.push(value),
+    );
+    sendMaster(masterQueue);
+    expect(seen).toHaveLength(0);
+    sendInbox({ ...ownerInbox, masterCounts: { approve: 0, suggestions: 0 } });
+    expect(seen.at(-1)?.masterCounts).toEqual({ approve: 3, suggestions: 0 });
+    expect(inboxEntries(seen.at(-1)!, "approve", "master")).toHaveLength(1);
+    stop();
+    expect(stopped).toBe(2);
   });
 });
