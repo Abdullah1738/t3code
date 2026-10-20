@@ -220,23 +220,43 @@ export function refKey(ref: Pick<MissionRecordRef, "kind" | "id">): string {
   return `${ref.kind}:${ref.id}`;
 }
 
+/** An import wrote it: the importer itself, or a record replayed from a source file. */
+export function isImportActor(actor: MissionActor): boolean {
+  return (
+    actor._tag === "system" &&
+    (actor.component === "coord-import" || actor.component.startsWith("import:"))
+  );
+}
+
+// ardud missions: fix-p3 - ids are namespaced ("crpko:lane:cell-tc",
+// "crpko:lane-lead:crpko:lane:cell-tc"); without a name, the last part reads best.
+const lastPart = (id: string) => id.split(":").at(-1) || id;
+
+function systemLabel(component: string): string {
+  if (component === "coord-import" || component.startsWith("import:")) return "Import";
+  if (component.startsWith("schedule:")) return "Schedule";
+  if (component.startsWith("control-api:")) return "Control API";
+  if (component.startsWith("mcp-client:")) return component.slice("mcp-client:".length);
+  return component;
+}
+
 /**
- * Short display name for an actor. The mission's master role reads as
- * "master" and lanes drop their `lane-` prefix, matching how the coordinator
- * names them in rooms.
+ * Short display name for an actor when no name is known. The mission's master
+ * role reads as "master", lanes drop their `lane-` prefix, matching how the
+ * coordinator names them in rooms, and imports read as "Import".
  */
 export function actorLabel(actor: MissionActor, masterRoleId: string | null = null): string {
   switch (actor._tag) {
     case "owner":
       return "you";
     case "role":
-      return actor.roleId === masterRoleId ? "master" : actor.roleId;
+      return actor.roleId === masterRoleId ? "master" : lastPart(actor.roleId);
     case "lane":
-      return actor.laneId.replace(/^lane-/, "");
+      return lastPart(actor.laneId).replace(/^lane-/, "");
     case "thread":
       return "a thread";
     case "system":
-      return actor.component;
+      return systemLabel(actor.component);
     case "person":
       return actor.name;
   }

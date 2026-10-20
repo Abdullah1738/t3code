@@ -192,6 +192,22 @@ describe("roles page", () => {
     roles.close();
   });
 
+  it("shows a holder whose thread is gone as the role with a quiet thread missing, never the id", () => {
+    const missions = source();
+    const roles = live<MissionRolesSnapshot>((l) => missions.subscribeRoles(CRPKO, l));
+    const holder = roleRegistryView(roles.value, MASTER).rows[0]?.holders[0];
+    if (!holder) throw new Error("no master holder");
+    const master = roleRegistryView({ ...roles.value, missingThreads: [holder.threadId] }, MASTER)
+      .rows[0];
+    if (!master) throw new Error("no master");
+    expect(master.threadMissing).toBe(true);
+    expect(master.role.name).not.toContain("9d5f1360");
+    expect(roleThreadLine(master)).toBe("Thread missing");
+    expect(roleHistory(master, "UTC")[0]).toMatchObject({ code: "Thread missing", missing: true });
+    expect(roleHistory(master, "UTC")[1]).toMatchObject({ code: "ses_0882e368", missing: false });
+    roles.close();
+  });
+
   it("lists the master's threads newest first with the note each one handed on", () => {
     const missions = source();
     const roles = live<MissionRolesSnapshot>((l) => missions.subscribeRoles(CRPKO, l));

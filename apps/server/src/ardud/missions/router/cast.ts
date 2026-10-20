@@ -122,14 +122,19 @@ export const labelOf = (cast: RouterCast, actor: MissionActor): string => {
       return cast.lanes.find((lane) => lane.id === actor.laneId)?.name ?? actor.laneId;
     case "thread": {
       const held = heldBy(cast, actor.threadId);
-      return held === null ? `thread ${actor.threadId}` : labelOf(cast, held);
+      // ardud missions: fix-p3 - never a raw thread id in a room line
+      return held === null ? "a thread" : labelOf(cast, held);
     }
     case "system":
-      return actor.component;
+      return systemLabel(actor.component);
     case "person":
       return actor.name;
   }
 };
+
+/** Import actors ("coord-import", "import:coord.db") read as one plain name. */
+export const systemLabel = (component: string): string =>
+  component === "coord-import" || component.startsWith("import:") ? "Import" : component;
 
 /**
  * Who hears evidence about a work item: its lane (and the lane's lead role)

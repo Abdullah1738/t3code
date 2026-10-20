@@ -85,6 +85,9 @@ export interface RoleRow {
   readonly family: string;
   /** The family it moves to at its next idle turn, or null. */
   readonly pendingFamily: string | null;
+  // ardud missions: fix-p3
+  /** The current holder's thread no longer exists here. */
+  readonly threadMissing: boolean;
 }
 
 export interface RoleRegistryView {
@@ -111,6 +114,7 @@ export function roleRegistryView(
   masterRoleId: string | null,
 ): RoleRegistryView {
   const lookup = changeIndex(snapshot.changes);
+  const missing = new Set<string>(snapshot.missingThreads ?? []);
   const rows = [...snapshot.roles]
     .sort(
       (left, right) =>
@@ -122,12 +126,13 @@ export function roleRegistryView(
       const ref = { kind: "role" as const, id: role.id };
       const modelChange =
         lookup(ref, "pendingModelSelection") ?? lookup(ref, "modelSelection") ?? null;
+      const holders = bindings.filter((binding) => binding.endedAt === null);
       return {
         role,
         kindLabel: ROLE_KIND_LABEL[role.kind],
         model: modelLabel(role.modelSelection) ?? role.modelSelection.model,
         pendingLine: pendingModelLine(role),
-        holders: bindings.filter((binding) => binding.endedAt === null),
+        holders,
         past: bindings.filter((binding) => binding.endedAt !== null),
         drift: snapshot.drift
           .filter((entry) => entry.roleId === role.id)
@@ -135,6 +140,7 @@ export function roleRegistryView(
         modelChangedBy: lastChangedLine(modelChange, masterRoleId),
         family: modelFamily(role.modelSelection) ?? role.modelSelection.model,
         pendingFamily: modelFamily(role.pendingModelSelection),
+        threadMissing: holders[0] !== undefined && missing.has(holders[0].threadId),
       };
     });
   const mix = new Map<string, number>();
@@ -442,16 +448,23 @@ export function rolesSummary(view: RoleRegistryView): SummaryPart[] {
   return parts;
 }
 
-/** The thread column: the pending model move, the holder's code, or "No holder". */
+/**
+ * The thread column: the pending model move, the holder's code, "Thread
+ * missing" when the holder's thread is gone, or "No holder".
+ */
 export function roleThreadLine(row: RoleRow): string {
   if (row.pendingFamily) return `Moves to ${row.pendingFamily} at the next idle turn`;
   const holder = row.holders[0];
-  return holder ? threadCode(holder.threadId) : "No holder";
+  if (!holder) return "No holder";
+  return row.threadMissing ? "Thread missing" : threadCode(holder.threadId);
 }
 
 export interface RoleHistoryRow {
   readonly key: string;
+  /** The thread's short code, or "Thread missing" for a current holder that is gone. */
   readonly code: string;
+  // ardud missions: fix-p3
+  readonly missing: boolean;
   /** "Current, since Wed 14 Oct 21:25", "Handed off: MASTER-STATE.md is current". */
   readonly note: string;
   /** When the thread let go, in the reader's zone; null for the current holder. */
@@ -475,9 +488,11 @@ export function roleHistory(row: RoleRow, timeZone?: string): RoleHistoryRow[] {
           : binding.reason === "initial"
             ? "First thread"
             : "Ended";
+    const missing = row.threadMissing && binding.id === row.holders[0]?.id;
     return {
       key: binding.id,
-      code: threadCode(binding.threadId),
+      code: missing ? "Thread missing" : threadCode(binding.threadId),
+      missing,
       note,
       at: binding.endedAt === null ? null : formatDayLabel(binding.endedAt, timeZone),
     };

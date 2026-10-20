@@ -17,7 +17,12 @@ import { DateTime, Option, Schema } from "effect";
 import { changedFields } from "./changeLog.ts";
 import { type ActorNames, actorName } from "./roomsViewModel.ts";
 import type { MissionTimelineEvent, MissionTimelineWindow, RevertAction } from "./source.ts";
-import { actorKey, formatDayLabel } from "./viewModel.ts";
+import { actorKey, formatDayLabel, isImportActor } from "./viewModel.ts";
+
+// ardud missions: fix-p3 - every import actor ("coord-import", "import:coord.db")
+// is one "Import" choice in the Who facet.
+const IMPORT_KEY = "import";
+const whoKey = (actor: MissionActor) => (isImportActor(actor) ? IMPORT_KEY : actorKey(actor));
 
 // Timeline tab: the mission's event log, newest first, under day heads,
 // filtered by kind and actor, with each event's cause chain. Repeated lines
@@ -139,7 +144,7 @@ export function eventKicker(kind: string): string {
 export interface TimelineFilter {
   /** Empty = every kind. */
   readonly groups: ReadonlyArray<TimelineKindGroup>;
-  /** `actorKey` values; empty = everyone. */
+  /** `actorKey` values (imports share "import"); empty = everyone. */
   readonly actors: ReadonlyArray<string>;
 }
 
@@ -152,7 +157,7 @@ export function filterTimeline(
   return events.filter(
     (event) =>
       (filter.groups.length === 0 || filter.groups.includes(eventGroup(event))) &&
-      (filter.actors.length === 0 || filter.actors.includes(actorKey(event.actor))),
+      (filter.actors.length === 0 || filter.actors.includes(whoKey(event.actor))),
   );
 }
 
@@ -191,7 +196,7 @@ export function actorChoices(
 ): FilterChoice<string>[] {
   const seen = new Map<string, { actor: MissionActor; count: number }>();
   for (const event of events) {
-    const key = actorKey(event.actor);
+    const key = whoKey(event.actor);
     const entry = seen.get(key);
     if (entry) entry.count += 1;
     else seen.set(key, { actor: event.actor, count: 1 });

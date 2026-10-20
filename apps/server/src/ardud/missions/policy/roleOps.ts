@@ -79,11 +79,14 @@ export const rolesSnapshot = (
     const bindings = [...active, ...ended].toSorted(newestBindingFirst);
     const byId = new Map(roles.all.map((role) => [role.id as string, role]));
     const drift: Array<RoleDrift> = [];
+    // ardud missions: fix-p3 - holders whose thread is gone read as "thread missing"
+    const missingThreads: Array<ThreadId> = [];
     for (const binding of bindings) {
       if (binding.endedAt !== null) continue;
+      const holder = yield* deps.threads.view(binding.threadId);
+      if (!holder.exists) missingThreads.push(binding.threadId);
       const role = byId.get(binding.roleId);
       if (!role) continue;
-      const holder = yield* deps.threads.view(binding.threadId);
       const found = detectDrift(role, binding, holder.exists ? holder.modelSelection : null);
       if (found) drift.push(found);
     }
@@ -93,6 +96,7 @@ export const rolesSnapshot = (
       defaults: roles.defaults.map((role) => role.id),
       bindings,
       drift,
+      missingThreads,
     };
   });
 

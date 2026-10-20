@@ -1508,6 +1508,10 @@ export const RolesSnapshot = Schema.Struct({
   /** Every binding, newest first, so ended ones show the succession history. */
   bindings: Schema.Array(RoleBinding),
   drift: Schema.Array(RoleDrift),
+  // --- fix-p3 additions ---
+  /** Current holders whose thread no longer exists on this server (deleted, or imported from elsewhere). */
+  missingThreads: Schema.optional(Schema.Array(ThreadId)),
+  // --- end fix-p3 additions ---
 });
 export type RolesSnapshot = typeof RolesSnapshot.Type;
 

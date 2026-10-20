@@ -173,7 +173,9 @@ function RoleItem(props: {
         <span
           className={cn(
             "col-span-2 min-w-0 truncate text-xs sm:col-span-1 sm:text-sm",
-            row.holders.length > 0 && !row.pendingFamily ? "tabular-nums" : "text-(--m-muted)",
+            row.holders.length > 0 && !row.pendingFamily && !row.threadMissing
+              ? "tabular-nums"
+              : "text-(--m-muted)",
           )}
         >
           {roleThreadLine(row)}
@@ -230,7 +232,11 @@ function RoleDetail(props: { row: RoleRow; choices: ReadonlyArray<ModelChoice> }
                   "grid grid-cols-[minmax(0,8.5rem)_minmax(0,1fr)_auto] gap-x-3 py-1.5 text-xs",
                 )}
               >
-                <span className="truncate tabular-nums">{entry.code}</span>
+                <span
+                  className={cn("truncate", entry.missing ? "text-(--m-muted)" : "tabular-nums")}
+                >
+                  {entry.code}
+                </span>
                 <span className="min-w-0 text-(--m-muted)">{entry.note}</span>
                 <span className="text-(--m-muted) tabular-nums">{entry.at}</span>
               </li>
@@ -246,7 +252,7 @@ function RoleDetail(props: { row: RoleRow; choices: ReadonlyArray<ModelChoice> }
         </div>
       ) : null}
       <div className="flex flex-wrap gap-2">
-        {environmentId && holder ? (
+        {environmentId && holder && !row.threadMissing ? (
           <Button
             size="sm"
             variant="outline"

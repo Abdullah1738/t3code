@@ -412,10 +412,13 @@ export const buildBlockers = (inputs: BlockerInputs): Array<BlockerGroup> => {
         return roleNames.get(actor.roleId) ?? actor.roleId;
       case "lane":
         return laneNames.get(actor.laneId) ?? actor.laneId;
+      // ardud missions: fix-p3 - names, never raw thread or import ids
       case "thread":
-        return `Thread ${actor.threadId}`;
+        return "A thread";
       case "system":
-        return actor.component;
+        return actor.component === "coord-import" || actor.component.startsWith("import:")
+          ? "Import"
+          : actor.component;
       case "person":
         return actor.name;
     }

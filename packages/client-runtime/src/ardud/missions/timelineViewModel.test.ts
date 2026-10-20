@@ -270,6 +270,45 @@ describe("timeline view model", () => {
     ]);
   });
 
+  it("reads every import actor as one Import choice and never shows a raw role or lane id", () => {
+    const event = (seq: number, actor: MissionActor) =>
+      ({
+        id: `ev-${seq}` as MissionEventId,
+        missionId: CRPKO,
+        seq,
+        kind: "lane.updated",
+        actor,
+        provenance: { _tag: "system", component: "missions-policy" },
+        summary: `Event ${seq}`,
+        subject: null,
+        causedBy: null,
+        payload: null,
+        at: "2026-10-19T08:00:00.000Z",
+      }) as MissionTimelineEvent;
+    const events = [
+      event(4, { _tag: "system", component: "import:coord.db" }),
+      event(3, { _tag: "system", component: "coord-import" }),
+      event(2, { _tag: "role", roleId: "crpko:lane-lead:crpko:lane:cell-tc" as never }),
+      event(1, { _tag: "lane", laneId: "crpko:lane:cell-bo" as never }),
+    ];
+    const choices = actorChoices(events, MASTER);
+    expect(choices.map((choice) => [choice.label, choice.count])).toEqual([
+      ["Import", 2],
+      ["cell-bo", 1],
+      ["cell-tc", 1],
+    ]);
+    const imports = choices.find((choice) => choice.label === "Import")!.value;
+    expect(
+      filterTimeline(events, { groups: [], actors: [imports] }).map((entry) => entry.seq),
+    ).toEqual([4, 3]);
+    expect(timelineRows(events, events, MASTER).map((row) => row.actor)).toEqual([
+      "Import",
+      "Import",
+      "cell-tc",
+      "cell-bo",
+    ]);
+  });
+
   it("reads Today and 7 days in the reader's zone and pages back only while in range", () => {
     const at = (iso: string, kind = "lane.updated") => ({ at: iso, kind }) as MissionTimelineEvent;
     const now = Date.parse("2026-10-19T22:30:00.000Z");

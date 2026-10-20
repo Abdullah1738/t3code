@@ -74,6 +74,17 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
     }),
   );
 
+  it.effect("lists a holder whose thread is gone as missing, so the page never shows its id", () =>
+    Effect.gen(function* () {
+      const { policy } = yield* setup;
+      assert.deepStrictEqual((yield* policy.roles(CRPKO)).missingThreads, []);
+      ports.threads.delete("thread-master");
+      const gone = yield* policy.roles(CRPKO);
+      ports.threads.set("thread-master", { exists: true, idle: true, modelSelection: OPUS_XHIGH });
+      assert.deepStrictEqual(gone.missingThreads, [ThreadId.make("thread-master")]);
+    }),
+  );
+
   it.effect("applies a model change at each holder's next turn, never mid-turn", () =>
     Effect.gen(function* () {
       const { policy } = yield* setup;
