@@ -41,7 +41,9 @@ Plain Node (v22.5+, `node:sqlite`), no dependencies.
   LaunchAgent (`coord pump` every 60 s).
 
 State: `~/.local/share/coord/data/coord.db` (override with `COORD_DB`). Control API url/token come
-from `T3_CONTROL_URL` / `T3_CONTROL_TOKEN` or `~/.robob/ardud-control.json` (chmod 600).
+from `T3_CONTROL_URL` / `T3_CONTROL_TOKEN`, else coord's own credential file (`COORD_CONTROL_TOKEN_FILE`, default
+`~/.robob/components/coord.json`, chmod 600). While that default file is missing, the shared
+`~/.robob/ardud-control.json` still works. `T3_CONTROL_TOKEN_FILE` is crw's setting and coord ignores it.
 
 Defaults (env overrides): reconcile by `COORD_RECONCILERS` (`master,release`), manual admits by
 `COORD_ADMITTERS` (`master,release`), approval sources `COORD_APPROVAL_SOURCES` (`web,mobile`),
@@ -235,7 +237,7 @@ In robob mode:
 - No local fallback: if Robob can't be reached the call fails with `messaging_unavailable` and nothing
   is written. A post can be retried under the same key.
 - Location and token come from the same place as the pump's (`T3_CONTROL_URL`/`T3_CONTROL_TOKEN`, then
-  `~/.robob/ardud-control.json`). The shim contract is at the top of `lib/forward.mjs`.
+  `~/.robob/components/coord.json`). Robob only takes forwarded calls from the coord credential. The shim contract is at the top of `lib/forward.mjs`.
 
 Switching back to `coord` resumes coord.db messaging and the pump. Messages posted while forwarded stay in
 Robob and are not copied back.

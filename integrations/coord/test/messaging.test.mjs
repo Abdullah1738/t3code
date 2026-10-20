@@ -177,7 +177,7 @@ test('robob mode: Robob down refuses with messaging_unavailable and writes nothi
 
 test('CLI: messaging switch, then post/inbox/ack go to Robob through the control config', async () => {
   C.close();
-  const env = { ...process.env, COORD_DB: db, T3_CONTROL_URL: robob.cfg.url, T3_CONTROL_TOKEN: robob.cfg.token, T3_CONTROL_TOKEN_FILE: '/nonexistent' };
+  const env = { ...process.env, COORD_DB: db, T3_CONTROL_URL: robob.cfg.url, T3_CONTROL_TOKEN: robob.cfg.token, COORD_CONTROL_TOKEN_FILE: '/nonexistent' };
   const cli = async (...args) => {
     try { return JSON.parse((await run(process.execPath, [CLI, ...args], { env })).stdout); } catch (e) { return JSON.parse(e.stdout); }
   };
