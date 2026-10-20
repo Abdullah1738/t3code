@@ -7,7 +7,13 @@ import { dirname, join } from 'node:path';
 const HOME = process.env.HOME || homedir();
 export const PATHS = {
   cache: process.env.CATALOG_GUARD_CACHE || join(HOME, '.robob/caches/opencode.json'),
-  control: join(HOME, '.robob/ardud-control.json'),
+  // catalog-guard has no component name of its own; it runs as one of the
+  // local watchers. The shared file is the last resort while it exists.
+  control: [
+    process.env.T3_CONTROL_TOKEN_FILE,
+    join(HOME, '.robob/components/watchers.json'),
+    join(HOME, '.robob/ardud-control.json'),
+  ].filter(Boolean),
   ocPassword: join(HOME, '.config/opencode-service/password'),
   state: process.env.CATALOG_GUARD_STATE || join(HOME, '.local/share/catalog-guard/data/state.json'),
 };
@@ -52,7 +58,8 @@ export async function serviceSlugs({ directory = PROBE_DIRECTORY, timeoutMs = 20
 }
 
 function control() {
-  const cfg = readJson(PATHS.control) ?? {};
+  const file = PATHS.control.find((path) => existsSync(path));
+  const cfg = (file && readJson(file)) ?? {};
   return {
     url: (process.env.T3_CONTROL_URL || cfg.url || 'http://127.0.0.1:3773').replace(/\/$/, ''),
     token: process.env.T3_CONTROL_TOKEN || cfg.token,
