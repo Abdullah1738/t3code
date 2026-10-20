@@ -112,8 +112,8 @@ import {
   emptyMark,
   isMasterRouted,
   itemLabel,
+  liveSnooze,
   markIdOf,
-  snoozeHolds,
   stampOf,
 } from "./inboxMarks.ts";
 import * as Inbound from "./inbound.ts";
@@ -2018,17 +2018,6 @@ const make = Effect.gen(function* () {
       return record;
     });
 
-  /** Newest word in any discussion on the item, or null. */
-  const discussedAt = (missionId: MissionId, subject: InboxItemRef) =>
-    Effect.map(store.listOwnerRequests(missionId, { subject }), (requests) =>
-      requests.reduce<string | null>((newest, request) => {
-        for (const at of [request.lastOwnerAt, request.lastMasterAt, request.lastReplyAt]) {
-          if (at !== null && at !== undefined && (newest === null || at > newest)) newest = at;
-        }
-        return newest;
-      }, null),
-    );
-
   const inboxMarks = (missionId: MissionId | null): Fx<MissionInboxMarks> =>
     Effect.gen(function* () {
       const stored =
@@ -2038,13 +2027,7 @@ const make = Effect.gen(function* () {
       const at = yield* now;
       const marks: Array<InboxMark> = [];
       for (const mark of stored) {
-        let snooze = mark.snooze;
-        if (snooze !== null) {
-          const record = Option.getOrNull(yield* store.get(mark.subject.kind, mark.subject.id));
-          const discussed =
-            mark.missionId === null ? null : yield* discussedAt(mark.missionId, mark.subject);
-          if (!snoozeHolds(snooze, { record, discussedAt: discussed, now: at })) snooze = null;
-        }
+        const { snooze } = yield* liveSnooze(store, mark, at);
         if (snooze === null && mark.comments.length === 0) continue;
         marks.push(snooze === mark.snooze ? mark : { ...mark, snooze });
       }

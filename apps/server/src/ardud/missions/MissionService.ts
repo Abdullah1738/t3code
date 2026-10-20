@@ -105,6 +105,8 @@ const LIST_KINDS: ReadonlySet<string> = new Set<MissionStoreKind>([
   "owner-request",
   // ardud missions: core - a reorder refreshes every client's portfolio
   "portfolio",
+  // ardud missions: fix-p3 - a snooze or unsnooze changes needs-you counts
+  "inbox-mark",
 ]);
 
 /** Records a mission subscriber receives as deltas. No bodies, no inbox items. */

@@ -9,6 +9,7 @@ import {
   type MissionListSnapshot,
   type MissionOverview,
   type Ask,
+  type InboxItemKind,
   type SubMission,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -16,6 +17,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import { markIdOf, snoozedNow } from "../asks/inboxMarks.ts";
 import type * as MissionStore from "../store/MissionStore.ts";
 import { countLanes, judgeHealth } from "./health.ts";
 import type { MissionEffort } from "./effort.ts";
@@ -155,6 +157,10 @@ export const makeReads = (
     const milestones = groupByMission(yield* store.list("milestone", wide));
     // ardud missions: router (master words the owner has not opened yet, in any status)
     const answered = yield* store.ownerRequestsUnread(null);
+    // ardud missions: fix-p3 (a snoozed item stops counting until its snooze ends)
+    const snoozed = yield* snoozedNow(store, null, DateTime.formatIso(yield* DateTime.now));
+    const awake = (kind: InboxItemKind) => (record: { readonly id: string }) =>
+      !snoozed.has(markIdOf({ kind, id: record.id }));
 
     const items = yield* Effect.forEach(
       missions.toSorted(
@@ -176,15 +182,15 @@ export const makeReads = (
             mission,
             subMissions: records.subMissions,
             lanes: records.lanes,
-            openAsks: records.openAsks,
+            openAsks: records.openAsks.filter(awake("ask")),
             pendingApprovals: (approvals.get(mission.id) ?? []).filter(
-              (approval) => approverOf(approval) === "owner",
+              (approval) => approverOf(approval) === "owner" && awake("approval")(approval),
             ).length,
             // ardud missions: asks (drafts route like approvals)
             pendingDrafts: (drafts.get(mission.id) ?? []).filter(
-              (draft) => approverOf(draft) === "owner",
+              (draft) => approverOf(draft) === "owner" && awake("draft")(draft),
             ).length,
-            pendingKnocks: knocks.get(mission.id)?.length ?? 0,
+            pendingKnocks: (knocks.get(mission.id) ?? []).filter(awake("knock")).length,
             health: entry.mission,
             subMissionHealth: entry.subMissions,
           });

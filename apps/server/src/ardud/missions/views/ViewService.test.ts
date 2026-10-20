@@ -13,6 +13,7 @@ import {
   type ViewLayoutOp,
   type ViewTemplateDefinition,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -28,6 +29,7 @@ import {
   seedOther,
   writerThread,
 } from "../asks/AsksService.testkit.ts";
+import * as AsksService from "../asks/AsksService.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { ViewService } from "./ViewService.ts";
@@ -427,6 +429,28 @@ describe("ViewService", () => {
           assert.equal(layout.version, 5);
         }),
       ),
+  );
+
+  it.effect("a snoozed item stops waiting on the owner until its snooze ends", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(at));
+        yield* seed;
+        const views = yield* ViewService;
+        const asks = yield* AsksService.AsksService;
+        yield* openAsk("ask-1");
+        yield* openAsk("ask-2");
+        assert.equal((yield* views.snapshot(missionId)).ownerWaiting, 2);
+
+        const hour = Date.parse(at) + 60 * 60_000;
+        const until = DateTime.formatIso(DateTime.makeUnsafe(hour));
+        yield* asks.snoozeInboxItem({ subject: { kind: "ask", id: "ask-1" }, until }, ownerApp);
+        assert.equal((yield* views.snapshot(missionId)).ownerWaiting, 1);
+
+        yield* TestClock.setTime(hour + 1);
+        assert.equal((yield* views.snapshot(missionId)).ownerWaiting, 2);
+      }),
+    ),
   );
 
   it.effect("the master changes anything the owner can; others are refused", () =>

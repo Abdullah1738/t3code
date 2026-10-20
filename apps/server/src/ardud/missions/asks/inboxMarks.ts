@@ -14,9 +14,14 @@ import type {
   InboxMark,
   InboxSnooze,
   MissionId,
+  MissionError,
   Suggestion,
 } from "@t3tools/contracts";
 import { approverOf } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+
+import type * as MissionStore from "../store/MissionStore.ts";
 
 export const markIdOf = (ref: InboxItemRef): string => `${ref.kind}:${ref.id}`;
 
@@ -57,6 +62,82 @@ export const snoozeHolds = (snooze: InboxSnooze, state: SnoozeState): boolean =>
   stampOf(state.record) === snooze.stamp &&
   (state.discussedAt === null || state.discussedAt <= snooze.at) &&
   (snooze.until === null || snooze.until > state.now);
+
+type Store = MissionStore.MissionStore["Service"];
+
+/** Newest word in any discussion on the item, or null. */
+export const discussedAt = (store: Store, missionId: MissionId, subject: InboxItemRef) =>
+  Effect.map(store.listOwnerRequests(missionId, { subject }), (requests) =>
+    requests.reduce<string | null>((newest, request) => {
+      for (const at of [request.lastOwnerAt, request.lastMasterAt, request.lastReplyAt]) {
+        if (at !== null && at !== undefined && (newest === null || at > newest)) newest = at;
+      }
+      return newest;
+    }, null),
+  );
+
+/** The mark's snooze and the item now, the snooze null once it stops holding. */
+export const liveSnooze = (
+  store: Store,
+  mark: InboxMark,
+  now: string,
+): Effect.Effect<{ readonly snooze: InboxSnooze | null; readonly record: unknown }, MissionError> =>
+  Effect.gen(function* () {
+    const snooze = mark.snooze;
+    if (snooze === null) return { snooze, record: null };
+    const record = Option.getOrNull(yield* store.get(mark.subject.kind, mark.subject.id));
+    const discussed =
+      mark.missionId === null ? null : yield* discussedAt(store, mark.missionId, mark.subject);
+    return {
+      snooze: snoozeHolds(snooze, { record, discussedAt: discussed, now }) ? snooze : null,
+      record,
+    };
+  });
+
+/**
+ * Items snoozed right now, by mark id (`kind:id`), so counts of what waits on
+ * the owner leave them out until the snooze ends.
+ */
+export const snoozedNow = (
+  store: Store,
+  missionId: MissionId | null,
+  now: string,
+): Effect.Effect<ReadonlyMap<string, SnoozedItem>, MissionError> =>
+  Effect.gen(function* () {
+    const stored =
+      missionId === null
+        ? yield* store.listAll("inbox-mark")
+        : yield* store.listAllInMission("inbox-mark", missionId);
+    const held = new Map<string, SnoozedItem>();
+    for (const mark of stored) {
+      const live = yield* liveSnooze(store, mark, now);
+      if (live.snooze !== null) held.set(mark.id, { kind: mark.subject.kind, record: live.record });
+    }
+    return held;
+  });
+
+export interface SnoozedItem {
+  readonly kind: InboxItemKind;
+  readonly record: unknown;
+}
+
+/** Whether the item, as it stands, sits in the owner's inbox waiting on him. */
+export const waitsOnOwner = (kind: InboxItemKind, record: unknown): boolean => {
+  const status = (record as { readonly status?: unknown }).status;
+  switch (kind) {
+    case "ask":
+      return status === "open";
+    case "draft":
+    case "approval":
+      return status === "pending" && !isMasterRouted(kind, record);
+    case "knock":
+      return status === "pending";
+    case "suggestion":
+      return status === "open" && !isMasterRouted(kind, record);
+    default:
+      return false;
+  }
+};
 
 /** Items the master decides: a comment on one knocks the master once. */
 export const isMasterRouted = (kind: InboxItemKind, record: unknown): boolean => {

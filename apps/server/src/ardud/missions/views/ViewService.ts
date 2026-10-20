@@ -73,6 +73,7 @@ import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../../../config.ts";
+import { snoozedNow, waitsOnOwner } from "../asks/inboxMarks.ts";
 import { standingOf } from "../asks/standing.ts";
 import { castOf } from "../core/master.ts";
 import { actorOf } from "../core/provenance.ts";
@@ -409,8 +410,11 @@ const make = Effect.gen(function* () {
       const inbox = yield* missions.inbox(missionId);
       const { decide, approve, knocks, suggestions } = inbox.counts;
       const requestsUnread = yield* views.requestsAnswered(missionId);
+      // ardud missions: fix-p3 (snoozed items wait again only when the snooze ends)
+      const snoozed = yield* snoozedNow(store, missionId, yield* nowIso);
+      const asleep = [...snoozed.values()].filter((item) => waitsOnOwner(item.kind, item.record));
       const counts: ViewWaiting = {
-        ownerWaiting: decide + approve + knocks + suggestions,
+        ownerWaiting: Math.max(0, decide + approve + knocks + suggestions - asleep.length),
         requestsUnread,
       };
       return counts;

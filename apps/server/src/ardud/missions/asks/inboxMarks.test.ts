@@ -226,4 +226,30 @@ describe("inbox comments and snoozes", () => {
       );
     }).pipe(Effect.provide(RuleService.layer.pipe(Layer.provideMerge(layer))));
   });
+
+  it.effect("a snoozed item leaves the needs-you count until its snooze ends", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(T0);
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const missions = yield* MissionService.MissionService;
+      const needsYou = Effect.map(
+        missions.listSnapshot,
+        (list) => list.missions.find((item) => item.id === missionId)?.needsYou,
+      );
+      const ask = yield* asks.openAsk(askInput("Snooze me?"), master);
+      yield* asks.openAsk(askInput("Leave me?"), master);
+      const before = yield* needsYou;
+
+      yield* asks.snoozeInboxItem(
+        { subject: { kind: "ask", id: ask.id }, until: iso(T0 + 60 * MINUTE) },
+        ownerApp,
+      );
+      expect(yield* needsYou).toBe((before ?? 0) - 1);
+
+      yield* TestClock.setTime(T0 + 61 * MINUTE);
+      expect(yield* needsYou).toBe(before);
+    }).pipe(Effect.provide(layer));
+  });
 });

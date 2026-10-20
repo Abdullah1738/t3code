@@ -219,7 +219,10 @@ export function createFixtureMissionsSource(
     [...marks.values()].flatMap((mark) => {
       if (missionId !== null && mark.missionId !== missionId) return [];
       const record = inboxRecord(mark.subject);
-      const holds = mark.snooze !== null && JSON.stringify(record) === mark.snooze.stamp;
+      const holds =
+        mark.snooze !== null &&
+        JSON.stringify(record) === mark.snooze.stamp &&
+        (mark.snooze.until === null || Date.parse(mark.snooze.until) > now());
       const kept = holds ? mark : { ...mark, snooze: null };
       return kept.comments.length > 0 || kept.snooze !== null ? [kept] : [];
     });
@@ -357,11 +360,17 @@ export function createFixtureMissionsSource(
       readonly id: string;
       readonly subMissionId?: string | null | undefined;
     }) => subMissionId === null || (record.subMissionId ?? subMissionOf(record)) === subMissionId;
+    // A snoozed item waits again only once its snooze ends.
+    const snoozed = new Set(
+      liveMarks(missionId).flatMap((mark) => (mark.snooze === null ? [] : [mark.id])),
+    );
+    const awake = (kind: InboxItemRef["kind"]) => (record: { readonly id: string }) =>
+      !snoozed.has(`${kind}:${record.id}`);
     return (
-      openAsks(missionId).filter(inScope).length +
-      pendingDrafts(missionId).filter(toOwner).filter(inScope).length +
-      pendingApprovals(missionId).filter(toOwner).filter(inScope).length +
-      pendingKnocks(missionId).filter(inScope).length
+      openAsks(missionId).filter(inScope).filter(awake("ask")).length +
+      pendingDrafts(missionId).filter(toOwner).filter(inScope).filter(awake("draft")).length +
+      pendingApprovals(missionId).filter(toOwner).filter(inScope).filter(awake("approval")).length +
+      pendingKnocks(missionId).filter(inScope).filter(awake("knock")).length
     );
   }
 
