@@ -66,9 +66,6 @@ export function IntendedShareEditor(props: { row: PriorityStackRow; masterRoleId
             value={text}
             onChange={(event) => setText(event.target.value)}
           />
-          <p className="text-xs text-(--m-muted)">
-            The master can change it too. Leave it empty to clear the share.
-          </p>
           <div className="flex justify-end">
             <Button type="submit" size="sm" disabled={busy}>
               Save

@@ -21,7 +21,6 @@ import { GripVerticalIcon } from "lucide-react";
 import type { Mission, SubMission, SubMissionId } from "@t3tools/contracts";
 import type { FieldChange } from "@t3tools/client-runtime/ardud/missions";
 import {
-  effortNote,
   formatPercent,
   intendedTotal,
   moveInOrder,
@@ -59,7 +58,6 @@ export function PriorityStack(props: {
     () => new Map(rows.map((row) => [row.subMission.id, row] as const)),
     [rows],
   );
-  const note = useMemo(() => effortNote(rows, masterRoleId), [rows, masterRoleId]);
   const planned = useMemo(() => intendedTotal(rows), [rows]);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -101,7 +99,6 @@ export function PriorityStack(props: {
           </ol>
         </SortableContext>
       </DndContext>
-      {note ? <p className="text-xs text-(--m-muted)">{note}</p> : null}
       {planned.total > 0 ? (
         <p
           className={cn(

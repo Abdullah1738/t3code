@@ -165,7 +165,7 @@ function DayPanel(props: { line: DayLine | undefined; lookedAt: string | null })
       {line === undefined ? (
         <LoadingRows />
       ) : line.rows.length === 0 ? (
-        <p className="pt-2 pb-1 text-sm text-(--m-muted)">No messages yet today.</p>
+        <p className="pt-3.5 pb-1 text-sm">No messages yet today.</p>
       ) : (
         <div className="mt-1 rounded-xl bg-(--m-raised) px-3.5 pt-3.5 pb-3 sm:px-4.5 sm:pt-4">
           <p className="mb-3 flex flex-wrap gap-x-5.5 gap-y-1.5 text-sm text-(--m-muted)">

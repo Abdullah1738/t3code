@@ -108,7 +108,7 @@ export function NeedsYouSection(props: {
       {entries === null ? (
         <LoadingRows />
       ) : entries.length === 0 ? (
-        <p className="text-sm text-(--m-muted)">Nothing needs you.</p>
+        <p className="pt-3.5 pb-1 text-sm">Nothing needs you.</p>
       ) : (
         <EntryCardList
           missionId={props.missionId}

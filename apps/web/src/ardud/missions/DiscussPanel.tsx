@@ -212,12 +212,17 @@ function DiscussionComposer(props: {
   );
 }
 
-/** "Decided by master on your condition", with the owner's words it rests on. */
+/** The owner's own words a master decision rests on, quoted beside the owner's avatar. */
 export function ConditionNote(props: { condition: OwnerCondition }) {
   return (
-    <div className="flex min-w-0 flex-col gap-1">
-      <span className="text-xs text-(--m-muted)">Decided by master on your condition</span>
-      <blockquote className="text-sm text-pretty">{`\u201c${props.condition.quote}\u201d`}</blockquote>
+    <div className="flex min-w-0 items-start gap-2">
+      <span className="pt-px">
+        <Avatar kind="you" />
+      </span>
+      <blockquote
+        aria-label="Your condition"
+        className="min-w-0 text-sm text-pretty"
+      >{`\u201c${props.condition.quote}\u201d`}</blockquote>
     </div>
   );
 }
