@@ -43,6 +43,7 @@ const PREFIX_GROUP: Readonly<Record<string, MissionTimelineGroup>> = {
   knock: "inbox",
   "secret-request": "inbox",
   recovery: "recovery",
+  guard: "lane",
 };
 
 /** The Timeline family of an event kind, by its prefix (`lane.created` is a lane event). */

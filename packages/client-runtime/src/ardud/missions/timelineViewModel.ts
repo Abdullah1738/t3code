@@ -106,6 +106,8 @@ const PREFIXES: Record<string, { readonly group: TimelineKindGroup; readonly kic
   "work-item": { group: "work", kicker: "Work" },
   view: { group: "layout", kicker: "Layout" },
   recovery: { group: "recovery", kicker: "Recovery" },
+  // ardud missions: ship-fix
+  guard: { group: "lane", kicker: "Schedules" },
 };
 
 /** Whole kinds whose kicker differs from their prefix's. */
