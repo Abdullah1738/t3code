@@ -4,11 +4,13 @@ import { Link } from "@tanstack/react-router";
 import type { MissionId } from "@t3tools/contracts";
 import {
   ageView,
+  dayOnePlan,
   entryHeadline,
   inboxUiReducer,
   INITIAL_INBOX_UI,
   masterRoutedEntries,
   ownerWaitingEntries,
+  snoozedEntries,
   type InboxEntry,
   type MissionInboxSnapshot,
   type MissionViewsState,
@@ -22,15 +24,30 @@ import { CardList, CardListItem } from "../cards/CardFrame";
 import { AgeElement } from "../cards/chips";
 import { entryCardState, InboxEntryCard, type EntryCardDeps } from "../InboxCards";
 import { changeSection } from "../missionCommands";
-import { useDraftNotes, useMasterRoleId, useMissionList } from "../missionsStore";
+import {
+  useDraftNotes,
+  useMasterRoleId,
+  useMissionInboxFeed,
+  useMissionList,
+  useMissionOverview,
+} from "../missionsStore";
 import { inboxActions } from "../useInboxScreen";
+import { FeedError } from "./FeedError";
 import { FoldButton, LoadingRows, SectionCount, SectionShell } from "./SectionShell";
 
 /** Cards shown before the "Show N more" fold. */
 const FIRST_CARDS = 3;
 
+/** Snoozing only moves what waits on the owner; Needs you shows these tabs. */
+const OWNER_WAITING_TABS = ["decide", "approve", "knocks"] as const;
+
 /** Cards for entries outside the inbox page, with their own selection and editors. */
-function useEntryCards(missionId: MissionId, nowMs: number) {
+function useEntryCards(
+  missionId: MissionId,
+  nowMs: number,
+  inbox: MissionInboxSnapshot | undefined,
+  planKey: string | null,
+) {
   const [ui, dispatch] = useReducer(inboxUiReducer, INITIAL_INBOX_UI);
   const deps: EntryCardDeps = {
     draftNotes: useDraftNotes(missionId) ?? [],
@@ -39,6 +56,8 @@ function useEntryCards(missionId: MissionId, nowMs: number) {
     masterRoleId: useMasterRoleId(missionId),
     nowMs,
     actions: inboxActions(dispatch),
+    marks: inbox?.marks,
+    planKey,
   };
   return { ui, dispatch, deps };
 }
@@ -48,8 +67,10 @@ function EntryCardList(props: {
   entries: ReadonlyArray<InboxEntry>;
   nowMs: number;
   label: string;
+  inbox: MissionInboxSnapshot | undefined;
+  planKey?: string | null;
 }) {
-  const cards = useEntryCards(props.missionId, props.nowMs);
+  const cards = useEntryCards(props.missionId, props.nowMs, props.inbox, props.planKey ?? null);
   const [open, setOpen] = useState(false);
   const shown = open ? props.entries : props.entries.slice(0, FIRST_CARDS);
   return (
@@ -71,7 +92,11 @@ function EntryCardList(props: {
   );
 }
 
-/** What waits on the owner in this mission, as cards he can act on in place. */
+/**
+ * What waits on the owner in this mission, as cards he can act on in place.
+ * On day one (no lanes yet) the master's plan leads. Snoozed items sit folded
+ * under the cards with Unsnooze.
+ */
 export function NeedsYouSection(props: {
   missionId: MissionId;
   views: MissionViewsState;
@@ -80,9 +105,18 @@ export function NeedsYouSection(props: {
   inbox: MissionInboxSnapshot | undefined;
   nowMs: number;
 }) {
+  const { inbox, nowMs } = props;
+  const feed = useMissionInboxFeed(props.missionId);
+  const lanes = useMissionOverview(props.missionId)?.lanes;
+  const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox, nowMs) : null), [inbox, nowMs]);
+  const plan = waiting && lanes ? dayOnePlan(lanes, waiting) : null;
   const entries = useMemo(
-    () => (props.inbox ? ownerWaitingEntries(props.inbox) : null),
-    [props.inbox],
+    () => (waiting && plan ? [plan, ...waiting.filter((entry) => entry !== plan)] : waiting),
+    [waiting, plan],
+  );
+  const snoozed = useMemo(
+    () => (inbox ? snoozedEntries(inbox, nowMs, OWNER_WAITING_TABS) : []),
+    [inbox, nowMs],
   );
   return (
     <SectionShell
@@ -105,19 +139,55 @@ export function NeedsYouSection(props: {
         </Button>
       }
     >
+      <FeedError what="what needs you" feed={feed} nowMs={nowMs} />
       {entries === null ? (
-        <LoadingRows />
+        feed.failure ? null : (
+          <LoadingRows />
+        )
       ) : entries.length === 0 ? (
         <p className="pt-3.5 pb-1 text-sm">Nothing needs you.</p>
       ) : (
         <EntryCardList
           missionId={props.missionId}
           entries={entries}
-          nowMs={props.nowMs}
+          nowMs={nowMs}
           label="Waiting on you"
+          inbox={inbox}
+          planKey={plan?.key ?? null}
         />
       )}
+      <SnoozedCards missionId={props.missionId} entries={snoozed} nowMs={nowMs} inbox={inbox} />
     </SectionShell>
+  );
+}
+
+/** The owner's snoozed holds, folded; open, each card shows its snooze and Unsnooze. */
+function SnoozedCards(props: {
+  missionId: MissionId;
+  entries: ReadonlyArray<InboxEntry>;
+  nowMs: number;
+  inbox: MissionInboxSnapshot | undefined;
+}) {
+  const [open, setOpen] = useState(false);
+  if (props.entries.length === 0) return null;
+  return (
+    <div className="flex flex-col pt-2">
+      <FoldButton
+        hidden={props.entries.length}
+        expanded={open}
+        label={`Snoozed ${props.entries.length}`}
+        onShow={() => setOpen(!open)}
+      />
+      {open ? (
+        <EntryCardList
+          missionId={props.missionId}
+          entries={props.entries}
+          nowMs={props.nowMs}
+          label="Snoozed"
+          inbox={props.inbox}
+        />
+      ) : null}
+    </div>
   );
 }
 
@@ -148,6 +218,7 @@ export function WithTheMasterSection(props: {
         entries={entries}
         nowMs={props.nowMs}
         label="With the master"
+        inbox={props.inbox}
       />
     </SectionShell>
   );
@@ -178,7 +249,7 @@ export function PinnedStrip(props: {
   const rows = useMemo((): PinnedRow[] => {
     if (props.kind === "needs-you") {
       return props.inbox
-        ? ownerWaitingEntries(props.inbox).map((entry) => ({
+        ? ownerWaitingEntries(props.inbox, props.nowMs).map((entry) => ({
             key: entry.key,
             ...entryHeadline(entry),
             requestId: null,
@@ -191,7 +262,7 @@ export function PinnedStrip(props: {
       since: request.updatedAt,
       requestId: request.id,
     }));
-  }, [props.kind, props.inbox, props.requests]);
+  }, [props.kind, props.inbox, props.requests, props.nowMs]);
   if (!section || rows.length === 0) return null;
   const title = section.title;
   return (

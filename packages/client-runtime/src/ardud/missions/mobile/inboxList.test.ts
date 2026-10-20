@@ -19,6 +19,7 @@ import {
   inboxChips,
   inboxRow,
   resolveInboxFilter,
+  snoozedFor,
 } from "./inboxList.ts";
 
 const CRPKO = "crpko-engineering" as MissionId;
@@ -97,6 +98,26 @@ describe("phone inbox list", () => {
       true,
     );
     expect(entriesForMission(all, null)).toHaveLength(all.length);
+  });
+
+  it("moves a snoozed item out of the list and the chips but still opens it", async () => {
+    const source = createFixtureMissionsSource({ now: () => NOW });
+    const before = first<MissionInboxSnapshot>((listener) => source.subscribeInbox(null, listener));
+    const entry = filteredEntries(before, "all", NOW)[0]!;
+    const tab = inboxChips(before, NOW).find((chip) => chip.value !== "all")!;
+    await source.snoozeInboxItem({
+      subject: { kind: entry.kind, id: entry.record.id },
+      until: null,
+    });
+    const inbox = first<MissionInboxSnapshot>((listener) => source.subscribeInbox(null, listener));
+    expect(filteredEntries(inbox, "all", NOW).map((item) => item.key)).not.toContain(entry.key);
+    expect(inboxChips(inbox, NOW)[0]!.count).toBe(inboxChips(before, NOW)[0]!.count - 1);
+    expect(snoozedFor(inbox, "all", NOW).map((item) => item.key)).toEqual([entry.key]);
+    expect(snoozedFor(inbox, "suggestions", NOW)).toEqual([]);
+    expect(findEntry(inbox, entry.key, NOW)?.key).toBe(entry.key);
+    expect(resolveInboxFilter(tab.value, inbox, NOW)).toBe(
+      inboxChips(inbox, NOW).some((chip) => chip.value === tab.value) ? tab.value : "all",
+    );
   });
 
   it("puts a discussion's unread count on the item's row only", () => {

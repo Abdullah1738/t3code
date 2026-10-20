@@ -7,6 +7,7 @@ import {
   type Ask,
   type Draft,
   type DraftNote,
+  type InboxMark,
   type Knock,
   type MissionListSnapshot,
   type Note,
@@ -28,6 +29,7 @@ import {
   fyiView,
   ownerConditionOf,
   parseDiffLines,
+  PLAN_KICKER,
   routeLine,
   SUGGESTION_AUTHOR_LABEL,
   SUGGESTION_TARGET_LABEL,
@@ -53,6 +55,7 @@ import {
 } from "./cards/blocks";
 import { CardFrame, type CardAction, type CardFrameProps } from "./cards/CardFrame";
 import { APPROVER_NAME, PersonChip } from "./cards/chips";
+import { useItemMarks, type ItemMarks } from "./cards/ItemMarks";
 import { useTemplatedCard } from "./cards/TemplatedCard";
 import { ConditionNote, useCardDiscussion, type CardDiscussion } from "./DiscussPanel";
 import { rerouteRecord } from "./operationCommands";
@@ -68,15 +71,20 @@ interface CardContext {
   readonly nowMs: number;
   readonly list: MissionListSnapshot | undefined;
   readonly size?: CardFrameProps["size"];
+  /** The owner's comments and snooze on the item. */
+  readonly marks?: ItemMarks;
+  /** Overrides the kind chip: the day-one plan reads "Approve the plan". */
+  readonly kicker?: string;
 }
 
 function frame(
   context: CardContext,
   key: string,
-): Pick<CardFrameProps, "domId" | "selected" | "onSelect" | "nowMs" | "size"> {
+): Pick<CardFrameProps, "domId" | "selected" | "onSelect" | "nowMs" | "size" | "end" | "comments"> {
+  const marks = context.marks ? { end: context.marks.end, comments: context.marks.panel } : {};
   // In the reading pane the list row owns the item id and the selection mark.
   if (context.size === "pane") {
-    return { onSelect: context.onSelect, nowMs: context.nowMs, size: "pane" };
+    return { onSelect: context.onSelect, nowMs: context.nowMs, size: "pane", ...marks };
   }
   return {
     domId: inboxItemDomId(key),
@@ -84,6 +92,7 @@ function frame(
     onSelect: context.onSelect,
     nowMs: context.nowMs,
     ...(context.size ? { size: context.size } : {}),
+    ...marks,
   };
 }
 
@@ -99,9 +108,12 @@ function useBusy() {
   return [busy, run] as const;
 }
 
-/** The card's Discuss action, last in the footer (none outside a mission). */
-function withDiscuss(discussion: CardDiscussion): CardAction[] {
-  return discussion.action ? [discussion.action] : [];
+/** Comment, then the card's Discuss action, last in the footer (none outside a mission). */
+function withDiscuss(discussion: CardDiscussion, context: CardContext): CardAction[] {
+  return [
+    ...(context.marks ? [context.marks.comment] : []),
+    ...(discussion.action ? [discussion.action] : []),
+  ];
 }
 
 /** A short reason field for Rewrite, Drop-with-reason and Move. */
@@ -165,12 +177,12 @@ export function AskCard(
           },
         ),
     },
-    ...withDiscuss(discussion),
+    ...withDiscuss(discussion, props),
   ];
   return (
     <CardFrame
       {...frame(props, `ask:${ask.id}`)}
-      kicker={templated?.kicker ?? (view.urgent ? "Urgent decision" : "Decision")}
+      kicker={props.kicker ?? templated?.kicker ?? (view.urgent ? "Urgent decision" : "Decision")}
       discussion={discussion.symbol}
       subMission={cardSubMission(props.list, ask.missionId, ask.subMissionId)}
       since={ask.createdAt}
@@ -331,7 +343,7 @@ export function DraftCard(
             disabled: busy,
             onRun: () => move.setMoving(true),
           },
-          ...withDiscuss(discussion),
+          ...withDiscuss(discussion, props),
         ];
   return (
     <CardFrame
@@ -452,12 +464,12 @@ export function ApprovalCard(
           disabled: busy,
           onRun: () => move.setMoving(true),
         },
-        ...withDiscuss(discussion),
+        ...withDiscuss(discussion, props),
       ];
   return (
     <CardFrame
       {...frame(props, `approval:${approval.id}`)}
-      kicker={templated?.kicker ?? APPROVAL_KICKER[approval.kind]}
+      kicker={props.kicker ?? templated?.kicker ?? APPROVAL_KICKER[approval.kind]}
       discussion={discussion.symbol}
       since={approval.createdAt}
       title={approval.title}
@@ -549,7 +561,7 @@ export function KnockCard(
     },
     ...(props.editing ? [] : [{ key: "edit" as const, onRun: () => props.onEdit(true) }]),
     { key: "dismiss", disabled: busy, onRun: () => decide({ action: "drop" }) },
-    ...withDiscuss(discussion),
+    ...withDiscuss(discussion, props),
   ];
   return (
     <CardFrame
@@ -644,7 +656,7 @@ export function SuggestionCard(
             },
             { key: "edit", disabled: busy, onRun: () => setMode("edit") },
             { key: "dismiss-suggestion", disabled: busy, onRun: () => setMode("dismiss") },
-            ...withDiscuss(discussion),
+            ...withDiscuss(discussion, props),
           ];
   return (
     <CardFrame
@@ -722,7 +734,7 @@ export function NoteCard(props: CardContext & { note: Note; actions: InboxAction
           disabled: busy,
           onRun: () => void run(() => props.actions.ack(note)),
         },
-        ...withDiscuss(discussion),
+        ...withDiscuss(discussion, props),
       ]}
       approver={null}
     >
@@ -753,6 +765,10 @@ export interface EntryCardDeps {
   readonly nowMs: number;
   readonly actions: InboxActions;
   readonly size?: CardFrameProps["size"];
+  /** The owner's comments and snoozes, by item key. */
+  readonly marks?: ReadonlyArray<InboxMark> | undefined;
+  /** The day-one plan's item key; its card reads "Approve the plan". */
+  readonly planKey?: string | null;
 }
 
 /** One entry's slice of the inbox UI state, so a card only re-renders when its own state changes. */
@@ -774,12 +790,20 @@ export const InboxEntryCard = memo(function InboxEntryCard(props: {
   deps: EntryCardDeps;
 }) {
   const { entry, editing, dispatch, deps } = props;
+  const marks = useItemMarks(
+    entry,
+    deps.marks?.find((mark) => mark.id === entry.key),
+    deps.nowMs,
+    deps.actions,
+  );
   const context: CardContext = {
     selected: props.selected,
     onSelect: () => dispatch({ type: "select", key: entry.key }),
     nowMs: deps.nowMs,
     list: deps.list,
     ...(deps.size ? { size: deps.size } : {}),
+    marks,
+    ...(deps.planKey === entry.key ? { kicker: PLAN_KICKER } : {}),
   };
   const onEdit = (open: boolean) => dispatch({ type: "edit", key: open ? entry.key : null });
   switch (entry.kind) {

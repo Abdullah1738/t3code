@@ -13,14 +13,17 @@ import type {
 } from "@t3tools/contracts";
 import {
   answerAskInput,
+  commentInput,
   decideDraftInput,
   decideKnockInput,
   decideSuggestionInput,
   groupEntriesByMission,
   inboxEntries,
+  inboxItemRef,
   inboxKeyAction,
   inboxUiReducer,
   INITIAL_INBOX_UI,
+  snoozedEntries,
   type DraftDecision,
   type InboxRouteFilter,
   type InboxEntry,
@@ -30,6 +33,7 @@ import {
 
 import { runMissionAction, submitMissionInput, type BuiltInput } from "./missionActions";
 import { missionsSource, useMissionInbox, useMissionList } from "./missionsStore";
+import { useNowMs } from "./useNowMs";
 
 /** DOM id of an inbox item, so keyboard moves can scroll it into view. */
 export function inboxItemDomId(key: string): string {
@@ -46,7 +50,8 @@ function isTypingTarget(target: EventTarget | null): boolean {
  * Inbox screen state for one tab: the visible entries grouped by mission,
  * selection, picks and the open editor, plus j/k / 1-9 / e on the window.
  * With `autoSelectFirst` (the wide reading-pane layout) the first item counts
- * as selected until the owner picks another. The logic lives in the
+ * as selected until the owner picks another. Items the owner snoozed out of
+ * this tab come back as `snoozed`, still openable. The logic lives in the
  * client-runtime reducer; this hook only wires it to React and the DOM.
  */
 export function useInboxScreen(
@@ -57,29 +62,41 @@ export function useInboxScreen(
 ) {
   const inbox = useMissionInbox(missionId);
   const list = useMissionList();
+  // Snoozes end on the minute clock, so the lists follow it.
+  const nowMs = useNowMs();
   // Entries keep their identity across mission-list updates, so memoized cards hold.
-  const listed = useMemo(() => (inbox ? inboxEntries(inbox, tab, route) : []), [inbox, tab, route]);
+  const listed = useMemo(
+    () => (inbox ? inboxEntries(inbox, tab, route, nowMs) : []),
+    [inbox, tab, route, nowMs],
+  );
+  // The master's view never hides a snoozed item, so it has no Snoozed group.
+  const snoozed = useMemo(
+    () => (inbox && route === "owner" ? snoozedEntries(inbox, nowMs, [tab]) : []),
+    [inbox, tab, route, nowMs],
+  );
   const groups = useMemo(() => groupEntriesByMission(listed, list), [listed, list]);
   // Visual order, so j/k walks the list the way it reads.
   const entries = useMemo(() => groups.flatMap((group) => group.entries), [groups]);
   const [ui, dispatch] = useReducer(inboxUiReducer, INITIAL_INBOX_UI);
   const selected =
     entries.find((entry) => entry.key === ui.selectedKey) ??
+    snoozed.find((entry) => entry.key === ui.selectedKey) ??
     (options.autoSelectFirst ? (entries[0] ?? null) : null);
 
   // Another mission filter or tab starts fresh; a decision in the same list
   // keeps the selection on the next item.
   const scope = `${missionId ?? "*"}|${tab}|${route}`;
   const previous = useRef<{ scope: string; keys: ReadonlyArray<string> }>({ scope, keys: [] });
+  // A snoozed item stays open where it was, now with Unsnooze.
   useEffect(() => {
-    const nextKeys = entries.map((entry) => entry.key);
+    const nextKeys = [...entries, ...snoozed].map((entry) => entry.key);
     if (previous.current.scope !== scope) {
       dispatch({ type: "scope-changed" });
     } else {
       dispatch({ type: "entries-changed", previousKeys: previous.current.keys, nextKeys });
     }
     previous.current = { scope, keys: nextKeys };
-  }, [entries, scope]);
+  }, [entries, snoozed, scope]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -107,7 +124,7 @@ export function useInboxScreen(
     document.getElementById(inboxItemDomId(ui.selectedKey))?.scrollIntoView({ block: "nearest" });
   }, [ui.selectedKey]);
 
-  return { inbox, groups, entries, ui, selected, dispatch };
+  return { inbox, groups, entries, snoozed, ui, selected, dispatch };
 }
 
 /** An answer with what the card adds to it (per-image review marks). */
@@ -168,6 +185,23 @@ export function inboxActions(dispatch: (event: InboxUiEvent) => void) {
     ack: (note: Note) =>
       runMissionAction(missionsSource.ackNote({ noteId: note.id }), "Couldn't mark it seen").then(
         done(`note:${note.id}`),
+      ),
+    // Comment and snooze decide nothing, so the item stays as it was.
+    comment: (entry: InboxEntry, text: string) =>
+      submitMissionInput(
+        commentInput(entry, text),
+        (input) => missionsSource.commentInboxItem(input),
+        "Couldn't add the comment",
+      ),
+    snooze: (entry: InboxEntry, until: string | null) =>
+      runMissionAction(
+        missionsSource.snoozeInboxItem({ subject: inboxItemRef(entry), until }),
+        "Couldn't snooze it",
+      ),
+    unsnooze: (entry: InboxEntry) =>
+      runMissionAction(
+        missionsSource.unsnoozeInboxItem({ subject: inboxItemRef(entry) }),
+        "Couldn't unsnooze it",
       ),
   };
 }

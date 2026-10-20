@@ -71,6 +71,15 @@ import type {
   WorkStage,
 } from "@t3tools/contracts";
 
+// --- finish-a ---
+import type {
+  CommentInboxItemInput,
+  InboxMark,
+  SnoozeInboxItemInput,
+  UnsnoozeInboxItemInput,
+} from "@t3tools/contracts";
+// --- end finish-a ---
+
 import type { ViewSectionRequest } from "./views/layout.ts";
 
 export type Unsubscribe = () => void;
@@ -177,6 +186,14 @@ export interface ApprovalRoutingTable extends MissionRoutingTable {
  */
 export interface MissionInboxSnapshot extends MissionInbox {
   readonly masterCounts: { readonly approve: number; readonly suggestions: number };
+  // --- finish-a ---
+  /**
+   * The owner's comments and snoozes on inbox items, keyed by `InboxEntry.key`.
+   * A snooze listed here still holds on the server; its `until` is checked
+   * against the device clock by `isSnoozed`.
+   */
+  readonly marks?: ReadonlyArray<InboxMark>;
+  // --- end finish-a ---
 }
 
 /** Moves one pending draft or approval to the other inbox. Logged with the reason. */
@@ -543,6 +560,10 @@ export interface MissionsSource {
   subscribeInbox(
     missionId: MissionId | null,
     listener: Listener<MissionInboxSnapshot>,
+    // --- finish-a ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-a ---
   ): Unsubscribe;
   /** `null` means the mission has no routing table yet (everything goes to the owner). */
   subscribeRouting(
@@ -572,11 +593,18 @@ export interface MissionsSource {
   subscribeTimeline(
     missionId: MissionId,
     listener: Listener<ReadonlyArray<MissionTimelineEvent>>,
+    // --- finish-a ---
+    /** The first page failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-a ---
   ): Unsubscribe;
   /** Same log with whether older pages exist. */
   subscribeTimelineWindow(
     missionId: MissionId,
     listener: Listener<MissionTimelineWindow>,
+    // --- finish-a ---
+    onError?: Listener<unknown>,
+    // --- end finish-a ---
   ): Unsubscribe;
   /** Loads the next older page into the timeline feeds. Resolves once it is in. */
   loadOlderTimeline(missionId: MissionId): Promise<void>;
@@ -624,6 +652,13 @@ export interface MissionsSource {
   addDraftNote(input: AddDraftNoteInput): Promise<DraftNote>;
   setDraftNoteActive(input: SetDraftNoteActiveInput): Promise<void>;
   ackNote(input: AckNoteInput): Promise<void>;
+  // --- finish-a ---
+  /** A note on an inbox item that decides nothing. */
+  commentInboxItem(input: CommentInboxItemInput): Promise<void>;
+  /** Hides the item from the owner until `until` or until the item changes. */
+  snoozeInboxItem(input: SnoozeInboxItemInput): Promise<void>;
+  unsnoozeInboxItem(input: UnsnoozeInboxItemInput): Promise<void>;
+  // --- end finish-a ---
 
   postRoomMessage(input: PostMessageInput): Promise<MissionMessage>;
   /** Moves the owner's read position; it only ever moves forward. */
@@ -670,6 +705,9 @@ export interface MissionsSource {
   subscribeRequests(
     missionId: MissionId,
     listener: Listener<ReadonlyArray<OwnerRequest>>,
+    // --- finish-a ---
+    onError?: Listener<unknown>,
+    // --- end finish-a ---
   ): Unsubscribe;
   /** One request with its whole conversation and full message bodies; null when unknown. */
   subscribeRequest(input: RequestThreadInput, listener: Listener<OwnerRequest | null>): Unsubscribe;

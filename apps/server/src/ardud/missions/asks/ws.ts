@@ -26,6 +26,11 @@ import {
   type RouteDraftInput,
   type SetDraftNoteActiveInput,
   type SuggestionStats,
+  // ardud missions: finish-a
+  type CommentInboxItemInput,
+  type MissionInboxMarks,
+  type SnoozeInboxItemInput,
+  type UnsnoozeInboxItemInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -249,6 +254,25 @@ export const makeAsksWsHandlers = (
       asks.masterInbox(input.missionId),
     );
 
+  // ardud missions: finish-a - re-read when a mark or anything it watches changes
+  const subscribeInboxMarks = (
+    input: MissionScopeInput,
+  ): Stream.Stream<MissionInboxMarks, MissionError> =>
+    resent(
+      new Set<MissionStoreKind>([
+        "inbox-mark",
+        "ask",
+        "draft",
+        "approval",
+        "knock",
+        "suggestion",
+        "note",
+        "owner-request",
+      ]),
+      input.missionId,
+      asks.inboxMarks(input.missionId),
+    );
+
   const inboxHistory = (input: MissionInboxHistoryInput) =>
     Effect.gen(function* () {
       const days = Math.min(input.days ?? HISTORY_DAYS, HISTORY_MAX_DAYS);
@@ -301,6 +325,17 @@ export const makeAsksWsHandlers = (
     [M.annotateApproval]: asOwner(annotateApproval),
     [M.subscribeSuggestionStats]: subscribeSuggestionStats,
     [M.subscribeMasterInbox]: subscribeMasterInbox,
+    // ardud missions: finish-a
+    [M.subscribeInboxMarks]: subscribeInboxMarks,
+    [M.commentInboxItem]: asOwner((input: CommentInboxItemInput, by) =>
+      asks.commentInboxItem(input, by),
+    ),
+    [M.snoozeInboxItem]: asOwner((input: SnoozeInboxItemInput, by) =>
+      asks.snoozeInboxItem(input, by),
+    ),
+    [M.unsnoozeInboxItem]: asOwner((input: UnsnoozeInboxItemInput, by) =>
+      asks.unsnoozeInboxItem(input, by),
+    ),
   } as const;
 };
 

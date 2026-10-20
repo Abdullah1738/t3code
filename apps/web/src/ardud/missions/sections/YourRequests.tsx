@@ -37,7 +37,8 @@ import {
   replyRequest,
   settleRequest,
 } from "../missionCommands";
-import { useOwnerRequest } from "../missionsStore";
+import { useOwnerRequest, useOwnerRequestsFeed } from "../missionsStore";
+import { FeedError } from "./FeedError";
 import { FoldButton, LoadingRows, SectionShell } from "./SectionShell";
 
 // What the owner asked or told the master: a compose line, one row per request,
@@ -54,6 +55,7 @@ export function YourRequestsSection(props: {
   nowMs: number;
 }) {
   const setOpenId = useRequestOpener(props.missionId);
+  const feed = useOwnerRequestsFeed(props.missionId);
   const groups = useMemo(() => groupRequests(props.requests ?? []), [props.requests]);
   const unread = useMemo(
     () => (props.requests ?? []).filter(isRequestUnread).length,
@@ -86,8 +88,11 @@ export function YourRequestsSection(props: {
       ) : (
         <>
           <ComposeLine missionId={props.missionId} onOpened={setOpenId} />
+          <FeedError what="your requests" feed={feed} nowMs={props.nowMs} />
           {props.requests === undefined ? (
-            <LoadingRows />
+            feed.failure ? null : (
+              <LoadingRows />
+            )
           ) : props.requests.length === 0 ? (
             <p className="pt-1.5 pb-1 text-sm">Nothing asked yet.</p>
           ) : (

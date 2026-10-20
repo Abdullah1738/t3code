@@ -252,6 +252,34 @@ describe("rpc missions source", () => {
     window.close();
   });
 
+  it("fails the timeline when its first page fails and reads it again on the next subscribe", async () => {
+    let fail = true;
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsTimeline]: () => {
+        if (fail) throw new MissionError({ code: "invalid", detail: "No server is connected." });
+        return { missionId: CRPKO, entries: [], hasOlder: false };
+      },
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const errors: unknown[] = [];
+    const first = collect<ReadonlyArray<unknown>>((listener) =>
+      source.subscribeTimeline(CRPKO, listener, (error) => errors.push(error)),
+    );
+    await settle();
+    expect(errors).toHaveLength(1);
+    expect(first.seen).toEqual([]);
+    first.close();
+
+    fail = false;
+    const again = collect<ReadonlyArray<unknown>>((listener) =>
+      source.subscribeTimeline(CRPKO, listener),
+    );
+    await settle();
+    expect(asked(WS_METHODS.missionsTimeline)).toHaveLength(2);
+    expect(again.last()).toEqual([]);
+    again.close();
+  });
+
   it("reads recovery incidents and suggestion stats from the server", async () => {
     const incident = { id: "incident-1", missionIds: [CRPKO], threads: [] };
     const { transport, live, asked } = fakeTransport({
@@ -940,6 +968,94 @@ describe("rpc missions source", () => {
 
     inbox.close();
     expect(live(ASKS.subscribeMasterInbox)).toHaveLength(0);
+  });
+
+  it("joins the owner's marks and reports a failed read once, then opens fresh", () => {
+    const { transport, live } = fakeTransport();
+    const source = createRpcMissionsSource({ transport, now });
+    const errors: unknown[] = [];
+    const seen: MissionInboxSnapshot[] = [];
+    const stop = source.subscribeInbox(
+      CRPKO,
+      (value) => seen.push(value),
+      (error) => errors.push(error),
+    );
+    const empty = {
+      revision: 1,
+      counts: { decide: 0, approve: 0, knocks: 0, suggestions: 0, fyi: 0 },
+      asks: [],
+      drafts: [],
+      approvals: [],
+      knocks: [],
+      suggestions: [],
+      fyi: [],
+    };
+    live(WS_METHODS.missionsInbox)[0]?.push(empty);
+    const mark = {
+      id: "ask:a-1",
+      missionId: CRPKO,
+      subject: { kind: "ask", id: "a-1" },
+      comments: [],
+      snooze: { at: FIXTURE_NOW, until: null, stamp: "s" },
+      updatedAt: FIXTURE_NOW,
+    };
+    live(ASKS.subscribeInboxMarks)[0]?.push({ marks: [mark] });
+    expect(seen.at(-1)?.marks).toEqual([mark]);
+
+    const failure = new MissionError({ code: "forbidden", detail: "No." });
+    live(ASKS.subscribeInboxMarks)[0]?.fail(failure);
+    expect(errors).toEqual([failure]);
+    // Every upstream of the snapshot closed with the failure.
+    expect(live(WS_METHODS.missionsInbox)).toHaveLength(0);
+    expect(live(ASKS.subscribeMasterInbox)).toHaveLength(0);
+    stop();
+
+    // Subscribing again (Retry) opens every feed fresh.
+    const again = source.subscribeInbox(CRPKO, () => {});
+    expect(live(ASKS.subscribeInboxMarks)).toHaveLength(1);
+    expect(live(WS_METHODS.missionsInbox)).toHaveLength(1);
+    again();
+  });
+
+  it("sends comments and snoozes to the asks RPCs", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const record = (tag: string) => (input: unknown) => {
+      calls.push([tag, input]);
+      return {};
+    };
+    const { transport } = fakeTransport({
+      [ASKS.commentInboxItem]: record("comment"),
+      [ASKS.snoozeInboxItem]: record("snooze"),
+      [ASKS.unsnoozeInboxItem]: record("unsnooze"),
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const subject = { kind: "ask", id: "a-1" } as const;
+    await source.commentInboxItem({ subject, body: "Leaning hold" });
+    await source.snoozeInboxItem({ subject, until: null });
+    await source.unsnoozeInboxItem({ subject });
+    expect(calls).toEqual([
+      ["comment", { subject, body: "Leaning hold" }],
+      ["snooze", { subject, until: null }],
+      ["unsnooze", { subject }],
+    ]);
+  });
+
+  it("reports a failed requests read", async () => {
+    const { transport } = fakeTransport({
+      [WS_METHODS.missionsOwnerRequests]: () => {
+        throw new MissionError({ code: "forbidden", detail: "No." });
+      },
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const errors: unknown[] = [];
+    const stop = source.subscribeRequests(
+      CRPKO,
+      () => {},
+      (error) => errors.push(error),
+    );
+    await settle();
+    expect(errors).toHaveLength(1);
+    stop();
   });
 });
 

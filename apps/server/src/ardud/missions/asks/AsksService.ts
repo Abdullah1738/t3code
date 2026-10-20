@@ -45,6 +45,13 @@ import {
   type SuggestionStats,
   type MissionMasterInbox,
   type SystemDraftDecision,
+  // ardud missions: finish-a
+  type CommentInboxItemInput,
+  type InboxItemRef,
+  type InboxMark,
+  type MissionInboxMarks,
+  type SnoozeInboxItemInput,
+  type UnsnoozeInboxItemInput,
   type WithdrawAskInput,
   type WithdrawDraftInput,
   RoomId,
@@ -101,6 +108,14 @@ import {
   withdrawDraft,
 } from "./draftModel.ts";
 import { heldLane, heldRecords, heldWorkItem, type HeldRecord } from "./holds.ts";
+import {
+  emptyMark,
+  isMasterRouted,
+  itemLabel,
+  markIdOf,
+  snoozeHolds,
+  stampOf,
+} from "./inboxMarks.ts";
 import * as Inbound from "./inbound.ts";
 import {
   OpenAskRequest,
@@ -192,6 +207,8 @@ export interface MissionDesk {
   readonly directionCheck: ReadonlyArray<DirectionCheckItem>;
   readonly lanes: ReadonlyArray<Pick<Lane, "id" | "name" | "status" | "statusReason">>;
   readonly latestSeq: number;
+  /** ardud missions: finish-a - the owner's comments and holding snoozes on inbox items. */
+  readonly marks: ReadonlyArray<InboxMark>;
 }
 
 export interface ListFilter {
@@ -240,6 +257,8 @@ export class AsksService extends Context.Service<
     ) => Fx<ReadonlyArray<SuggestionStats>>;
     /** What waits on the master instead of the owner (null: every mission). */
     readonly masterInbox: (missionId: MissionId | null) => Fx<MissionMasterInbox>;
+    /** ardud missions: finish-a - comments and holding snoozes (null: every mission). */
+    readonly inboxMarks: (missionId: MissionId | null) => Fx<MissionInboxMarks>;
     readonly notes: (missionId: MissionId) => Fx<ReadonlyArray<Note>>;
     /** Who the caller is in a mission: its roles, lanes and whether it is the master. */
     readonly standing: (missionId: MissionId, provenance: MissionProvenance) => Fx<Standing>;
@@ -322,6 +341,19 @@ export class AsksService extends Context.Service<
     // Notes and rooms
     readonly ackNote: (noteId: NoteId, provenance: MissionProvenance) => Fx<Note>;
     readonly post: (input: PostMessageInput, provenance: MissionProvenance) => Fx<MissionMessage>;
+    // ardud missions: finish-a - the owner's own marks on inbox items; none decides anything
+    readonly commentInboxItem: (
+      input: CommentInboxItemInput,
+      provenance: MissionProvenance,
+    ) => Fx<InboxMark>;
+    readonly snoozeInboxItem: (
+      input: SnoozeInboxItemInput,
+      provenance: MissionProvenance,
+    ) => Fx<InboxMark>;
+    readonly unsnoozeInboxItem: (
+      input: UnsnoozeInboxItemInput,
+      provenance: MissionProvenance,
+    ) => Fx<InboxMark>;
   }
 >()("t3/ardud/missions/asks/AsksService") {}
 
@@ -1776,6 +1808,7 @@ const make = Effect.gen(function* () {
           statusReason,
         })),
         latestSeq: yield* store.latestSeq(missionId),
+        marks: (yield* inboxMarks(missionId)).marks,
       };
       return result;
     });
@@ -1827,6 +1860,195 @@ const make = Effect.gen(function* () {
         approvals: newestOf(approvals),
         suggestions: newestOf(suggestions),
       };
+    });
+
+  // -------------------------------------------------------------------------
+  // ardud missions: finish-a - comments and snoozes on inbox items
+
+  const markedItem = (subject: InboxItemRef, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      if (!isOwnerProvenance(provenance)) {
+        return yield* fail("forbidden", "Only the owner comments on or snoozes inbox items.");
+      }
+      const record = yield* need(subject.kind, subject.id);
+      const missionId: MissionId | null = record.missionId;
+      const label = clipSummary(itemLabel(subject.kind, record));
+      const existing = yield* store.get("inbox-mark", markIdOf(subject));
+      return { record, missionId, label, existing };
+    });
+
+  const markEvent = (
+    kind: "inbox.commented" | "inbox.snoozed" | "inbox.unsnoozed",
+    subject: InboxItemRef,
+    label: string,
+    summary: string,
+    provenance: MissionProvenance,
+    payload: unknown,
+  ): ModelEvent => ({
+    kind,
+    actor: { _tag: "owner" },
+    provenance,
+    summary: clipSummary(summary),
+    subject: { kind: subject.kind, id: subject.id, label },
+    payload,
+  });
+
+  const commentInboxItemCommand = (input: CommentInboxItemInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const item = yield* markedItem(input.subject, provenance);
+      const at = yield* now;
+      const mark = Option.getOrElse(item.existing, () =>
+        emptyMark(input.subject, item.missionId, at),
+      );
+      const comment = { id: yield* newId("comment"), body: input.body, at };
+      const record: InboxMark = { ...mark, comments: [...mark.comments, comment], updatedAt: at };
+      yield* persist(
+        item.missionId,
+        [
+          markEvent(
+            "inbox.commented",
+            input.subject,
+            item.label,
+            `Comment: ${input.body}`,
+            provenance,
+            { commentId: comment.id },
+          ),
+        ],
+        [{ _tag: "inbox-mark", record }],
+      );
+      return { record, item, comment };
+    });
+
+  /**
+   * One knock to the master when the commented item is the master's to decide;
+   * anything else wakes nobody. A failure is logged and keeps the comment.
+   */
+  const tellMasterOfComment = (
+    subject: InboxItemRef,
+    item: {
+      readonly record: unknown;
+      readonly missionId: MissionId | null;
+      readonly label: string;
+    },
+    comment: { readonly id: string; readonly body: string },
+  ) =>
+    Effect.gen(function* () {
+      const missionId = item.missionId;
+      if (missionId === null || !isMasterRouted(subject.kind, item.record)) return;
+      const cast = yield* castOf(missionId);
+      const masterRoleId =
+        cast.mission?.masterRoleId ?? cast.roles.find((role) => role.kind === "master")?.id ?? null;
+      if (masterRoleId === null) return;
+      yield* rooms.post(
+        {
+          missionId,
+          roomId: RoomId.make(`${missionId}:room:control`),
+          kind: "request",
+          summary: clipSummary(`The owner commented on ${subject.kind} ${item.label}`),
+          body: comment.body,
+          to: [{ _tag: "role", roleId: masterRoleId }],
+          key: `comment:${markIdOf(subject)}:${comment.id}`,
+        },
+        ASKS_SYSTEM,
+      );
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Inbox comment did not reach the master", {
+          subject: markIdOf(subject),
+          cause,
+        }),
+      ),
+    );
+
+  const snoozeInboxItemCommand = (input: SnoozeInboxItemInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const item = yield* markedItem(input.subject, provenance);
+      const at = yield* now;
+      if (input.until !== null && !(input.until > at)) {
+        return yield* fail("invalid", "Snooze until a time still ahead.");
+      }
+      const mark = Option.getOrElse(item.existing, () =>
+        emptyMark(input.subject, item.missionId, at),
+      );
+      const record: InboxMark = {
+        ...mark,
+        snooze: { at, until: input.until, stamp: stampOf(item.record) },
+        updatedAt: at,
+      };
+      yield* persist(
+        item.missionId,
+        [
+          markEvent(
+            "inbox.snoozed",
+            input.subject,
+            item.label,
+            `Snoozed: ${item.label}`,
+            provenance,
+            { until: input.until },
+          ),
+        ],
+        [{ _tag: "inbox-mark", record }],
+      );
+      return record;
+    });
+
+  const unsnoozeInboxItemCommand = (input: UnsnoozeInboxItemInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const item = yield* markedItem(input.subject, provenance);
+      const mark = Option.getOrNull(item.existing);
+      if (mark === null || mark.snooze === null) {
+        return yield* fail("conflict", `${markIdOf(input.subject)} is not snoozed.`);
+      }
+      const at = yield* now;
+      const record: InboxMark = { ...mark, snooze: null, updatedAt: at };
+      yield* persist(
+        item.missionId,
+        [
+          markEvent(
+            "inbox.unsnoozed",
+            input.subject,
+            item.label,
+            `Unsnoozed: ${item.label}`,
+            provenance,
+            null,
+          ),
+        ],
+        [{ _tag: "inbox-mark", record }],
+      );
+      return record;
+    });
+
+  /** Newest word in any discussion on the item, or null. */
+  const discussedAt = (missionId: MissionId, subject: InboxItemRef) =>
+    Effect.map(store.listOwnerRequests(missionId, { subject }), (requests) =>
+      requests.reduce<string | null>((newest, request) => {
+        for (const at of [request.lastOwnerAt, request.lastMasterAt, request.lastReplyAt]) {
+          if (at !== null && at !== undefined && (newest === null || at > newest)) newest = at;
+        }
+        return newest;
+      }, null),
+    );
+
+  const inboxMarks = (missionId: MissionId | null): Fx<MissionInboxMarks> =>
+    Effect.gen(function* () {
+      const stored =
+        missionId === null
+          ? yield* store.listAll("inbox-mark")
+          : yield* store.listAllInMission("inbox-mark", missionId);
+      const at = yield* now;
+      const marks: Array<InboxMark> = [];
+      for (const mark of stored) {
+        let snooze = mark.snooze;
+        if (snooze !== null) {
+          const record = Option.getOrNull(yield* store.get(mark.subject.kind, mark.subject.id));
+          const discussed =
+            mark.missionId === null ? null : yield* discussedAt(mark.missionId, mark.subject);
+          if (!snoozeHolds(snooze, { record, discussedAt: discussed, now: at })) snooze = null;
+        }
+        if (snooze === null && mark.comments.length === 0) continue;
+        marks.push(snooze === mark.snooze ? mark : { ...mark, snooze });
+      }
+      return { marks };
     });
 
   return AsksService.of({
@@ -1924,6 +2146,16 @@ const make = Effect.gen(function* () {
     applyPendingSuggestions: Effect.uninterruptible(applyPendingSuggestionsCommand),
     ackNote: (noteId, provenance) => serialized(ackNoteCommand(noteId, provenance)),
     post: postCommand,
+    // ardud missions: finish-a
+    inboxMarks,
+    commentInboxItem: (input, provenance) =>
+      serialized(commentInboxItemCommand(input, provenance)).pipe(
+        Effect.tap(({ item, comment }) => tellMasterOfComment(input.subject, item, comment)),
+        Effect.map(({ record }) => record),
+      ),
+    snoozeInboxItem: (input, provenance) => serialized(snoozeInboxItemCommand(input, provenance)),
+    unsnoozeInboxItem: (input, provenance) =>
+      serialized(unsnoozeInboxItemCommand(input, provenance)),
   });
 });
 

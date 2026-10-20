@@ -14,6 +14,10 @@ import {
   type MissionListSnapshot,
   MissionMessage,
   FeedItem,
+  // --- finish-a ---
+  type InboxItemRef,
+  type InboxMark,
+  // --- end finish-a ---
   MissionActor,
   MissionRecordRef,
   type MissionProvenance,
@@ -188,6 +192,52 @@ export function createFixtureMissionsSource(
   }));
   const ownerLastLookedAt = new Map<string, string | null>(Object.entries(data.ownerLastLookedAt));
   const routingTables: ApprovalRoutingTableRecord[] = [...decodeRoutingTables([ops.routing])];
+
+  // --- finish-a ---
+  // The owner's comments and snoozes, one mark per inbox item. A snooze keeps
+  // the item's JSON as its stamp; any change to the item drops it.
+  const marks = new Map<string, InboxMark>();
+  const inboxRecord = (
+    subject: InboxItemRef,
+  ): { readonly missionId: string | null } | undefined => {
+    const lists = {
+      ask: asks,
+      draft: drafts,
+      approval: approvals,
+      knock: knocks,
+      suggestion: suggestions,
+      note: notes,
+    };
+    return (
+      lists[subject.kind] as ReadonlyArray<{
+        readonly id: string;
+        readonly missionId: string | null;
+      }>
+    ).find((record) => record.id === subject.id);
+  };
+  const liveMarks = (missionId: string | null): ReadonlyArray<InboxMark> =>
+    [...marks.values()].flatMap((mark) => {
+      if (missionId !== null && mark.missionId !== missionId) return [];
+      const record = inboxRecord(mark.subject);
+      const holds = mark.snooze !== null && JSON.stringify(record) === mark.snooze.stamp;
+      const kept = holds ? mark : { ...mark, snooze: null };
+      return kept.comments.length > 0 || kept.snooze !== null ? [kept] : [];
+    });
+  const markFor = (subject: InboxItemRef, at: string): InboxMark => {
+    const id = `${subject.kind}:${subject.id}`;
+    const record = inboxRecord(subject);
+    return (
+      marks.get(id) ?? {
+        id,
+        missionId: (record?.missionId ?? null) as InboxMark["missionId"],
+        subject,
+        comments: [],
+        snooze: null,
+        updatedAt: at,
+      }
+    );
+  };
+  // --- end finish-a ---
 
   let revision = 1;
   const listeners = new Set<() => void>();
@@ -455,6 +505,9 @@ export function createFixtureMissionsSource(
         knocks: inboxKnocks,
         suggestions: inboxSuggestions,
         fyi: inboxFyi,
+        // --- finish-a ---
+        marks: liveMarks(missionId),
+        // --- end finish-a ---
       };
     });
   }
@@ -1239,6 +1292,40 @@ export function createFixtureMissionsSource(
       commit();
       return Promise.resolve();
     },
+
+    // --- finish-a ---
+    commentInboxItem({ subject, body }) {
+      if (!inboxRecord(subject)) return fail("not-found", "That item is gone.");
+      const text = body.trim();
+      if (text === "") return fail("invalid", "Write a comment first.");
+      const at = nowIso();
+      const mark = markFor(subject, at);
+      const comment = { id: localId("comment"), body: text, at };
+      marks.set(mark.id, { ...mark, comments: [...mark.comments, comment], updatedAt: at });
+      commit();
+      return Promise.resolve();
+    },
+    snoozeInboxItem({ subject, until }) {
+      const record = inboxRecord(subject);
+      if (!record) return fail("not-found", "That item is gone.");
+      if (until !== null && Date.parse(until) <= now()) {
+        return fail("invalid", "Pick a time ahead.");
+      }
+      const at = nowIso();
+      const mark = markFor(subject, at);
+      const snooze = { at, until, stamp: JSON.stringify(record) };
+      marks.set(mark.id, { ...mark, snooze, updatedAt: at });
+      commit();
+      return Promise.resolve();
+    },
+    unsnoozeInboxItem({ subject }) {
+      const mark = marks.get(`${subject.kind}:${subject.id}`);
+      if (!mark || mark.snooze === null) return fail("conflict", "Not snoozed.");
+      marks.set(mark.id, { ...mark, snooze: null, updatedAt: nowIso() });
+      commit();
+      return Promise.resolve();
+    },
+    // --- end finish-a ---
 
     postRoomMessage(input) {
       const room = rooms.find((r) => r.id === input.roomId && r.missionId === input.missionId);

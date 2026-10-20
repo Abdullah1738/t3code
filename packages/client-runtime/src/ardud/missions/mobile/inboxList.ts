@@ -1,3 +1,4 @@
+// @effect-diagnostics globalDate:off - Snoozed items come back on the reader's clock.
 import type {
   InboxTab,
   MissionId,
@@ -18,6 +19,8 @@ import {
   APPROVAL_STATUS_LABEL,
   DRAFT_STATUS_LABEL,
   inboxEntries,
+  inboxTabCounts,
+  snoozedEntries,
   type InboxEntry,
 } from "../inboxViewModel.ts";
 import { ownerConditionOf } from "../requestsViewModel.ts";
@@ -39,15 +42,16 @@ export interface InboxChip {
   readonly count: number;
 }
 
-/** "All" plus every tab that has something in it. */
-export function inboxChips(inbox: MissionInboxSnapshot): InboxChip[] {
-  const waiting = ownerWaitingEntries(inbox).length;
+/** "All" plus every tab that has something in it. Snoozed items count nowhere. */
+export function inboxChips(inbox: MissionInboxSnapshot, nowMs = Date.now()): InboxChip[] {
+  const waiting = ownerWaitingEntries(inbox, nowMs).length;
+  const counts = inboxTabCounts(inbox, "owner", nowMs);
   return [
     { value: "all", label: "All", count: waiting },
-    ...INBOX_TABS.filter((tab) => inbox.counts[tab] > 0).map((tab) => ({
+    ...INBOX_TABS.filter((tab) => counts[tab] > 0).map((tab) => ({
       value: tab,
       label: INBOX_TAB_LABEL[tab],
-      count: inbox.counts[tab],
+      count: counts[tab],
     })),
   ];
 }
@@ -56,17 +60,35 @@ export function inboxChips(inbox: MissionInboxSnapshot): InboxChip[] {
 export function resolveInboxFilter(
   requested: string | null | undefined,
   inbox: MissionInboxSnapshot,
+  nowMs = Date.now(),
 ): InboxFilter {
   if (requested && (INBOX_TABS as ReadonlyArray<string>).includes(requested)) {
     const tab = requested as InboxTab;
-    if (inbox.counts[tab] > 0) return tab;
+    if (inboxTabCounts(inbox, "owner", nowMs)[tab] > 0) return tab;
   }
   return "all";
 }
 
 /** "all" is what waits on the owner: decisions, approvals and knocks. */
-export function filteredEntries(inbox: MissionInboxSnapshot, filter: InboxFilter): InboxEntry[] {
-  return filter === "all" ? ownerWaitingEntries(inbox) : inboxEntries(inbox, filter);
+export function filteredEntries(
+  inbox: MissionInboxSnapshot,
+  filter: InboxFilter,
+  nowMs = Date.now(),
+): InboxEntry[] {
+  return filter === "all"
+    ? ownerWaitingEntries(inbox, nowMs)
+    : inboxEntries(inbox, filter, "owner", nowMs);
+}
+
+const WAITING_TABS: ReadonlyArray<InboxTab> = ["decide", "approve", "knocks"];
+
+/** What the owner snoozed under this filter, soonest back first. */
+export function snoozedFor(
+  inbox: MissionInboxSnapshot,
+  filter: InboxFilter,
+  nowMs = Date.now(),
+): InboxEntry[] {
+  return snoozedEntries(inbox, nowMs, filter === "all" ? WAITING_TABS : [filter]);
 }
 
 export function entriesForMission(
@@ -144,15 +166,19 @@ export function inboxSections(
   }));
 }
 
-/** Any inbox item by its row key, whichever tab and whoever it is routed to. */
-export function findEntry(inbox: MissionInboxSnapshot, key: string): InboxEntry | null {
+/** Any inbox item by its row key, whichever tab, whoever it is routed to, snoozed or not. */
+export function findEntry(
+  inbox: MissionInboxSnapshot,
+  key: string,
+  nowMs = Date.now(),
+): InboxEntry | null {
   for (const route of ["owner", "master"] as const) {
     for (const tab of INBOX_TABS) {
-      const found = inboxEntries(inbox, tab, route).find((entry) => entry.key === key);
+      const found = inboxEntries(inbox, tab, route, nowMs).find((entry) => entry.key === key);
       if (found) return found;
     }
   }
-  return null;
+  return snoozedEntries(inbox, nowMs).find((entry) => entry.key === key) ?? null;
 }
 
 // ---------------------------------------------------------------------------

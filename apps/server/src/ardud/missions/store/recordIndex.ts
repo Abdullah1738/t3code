@@ -290,5 +290,16 @@ export const indexRecord = (entry: MissionStoreRecord): MissionRecordIndex => {
         updatedAt: r.updatedAt,
       };
     }
+    // ardud missions: finish-a - the owner's comments and snooze beside an inbox item
+    case "inbox-mark": {
+      const r = entry.record;
+      return {
+        id: r.id,
+        missionId: r.missionId,
+        subMissionId: null,
+        status: r.snooze === null ? null : "snoozed",
+        updatedAt: r.updatedAt,
+      };
+    }
   }
 };

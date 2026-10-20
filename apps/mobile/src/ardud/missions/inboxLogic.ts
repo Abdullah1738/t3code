@@ -5,11 +5,22 @@ import {
   type Approver,
   type Ask,
   type Draft,
+  type InboxComment,
+  type InboxItemRef,
+  type InboxMark,
   type Knock,
   type Note,
   type Suggestion,
 } from "@t3tools/contracts";
-import { rerouteRecordInput } from "@t3tools/client-runtime/ardud/missions";
+import {
+  commentInput,
+  inboxItemRef,
+  rerouteRecordInput,
+  snoozeChoices,
+  snoozeLabel,
+  type InboxEntry,
+  type SnoozeChoice,
+} from "@t3tools/client-runtime/ardud/missions";
 import {
   type AskAnswerForm,
   type AskView,
@@ -339,3 +350,68 @@ export function useSuggestionCard(suggestion: Suggestion): SuggestionCardState {
     cancel: () => setMode("idle"),
   };
 }
+
+// --- finish-a ---
+export interface ItemMarksState {
+  readonly comments: ReadonlyArray<InboxComment>;
+  /** "Until it changes", "Until 15:00"; null while the item is not snoozed. */
+  readonly snoozedLabel: string | null;
+  readonly choices: ReadonlyArray<SnoozeChoice>;
+  readonly composing: boolean;
+  readonly text: string;
+  readonly pending: boolean;
+  readonly setComposing: (composing: boolean) => void;
+  readonly setText: (text: string) => void;
+  readonly comment: () => void;
+  readonly snooze: (until: string | null) => void;
+  readonly unsnooze: () => void;
+}
+
+/**
+ * The owner's own marks on an item: comments that decide nothing, and a
+ * snooze that hides it from Needs you until its time or its next change.
+ */
+export function useItemMarks(
+  entry: InboxEntry,
+  mark: InboxMark | undefined,
+  nowMs: number,
+): ItemMarksState {
+  const action = useMissionAction();
+  const [composing, setComposing] = useState(false);
+  const [text, setText] = useState("");
+  const subject = inboxItemRef(entry);
+  return {
+    comments: mark?.comments ?? [],
+    snoozedLabel: snoozeLabel(mark, nowMs),
+    choices: snoozeChoices(nowMs),
+    composing,
+    text,
+    pending: action.pending,
+    setComposing,
+    setText,
+    comment: () => {
+      const built = commentInput(entry, text);
+      const result: FormResult<{ subject: InboxItemRef; body: string }> = built.ok
+        ? { ok: true, input: built.value }
+        : { ok: false, error: built.error };
+      void submitForm(action.run, "Could not add the comment", result, (input) =>
+        missionsSource().commentInboxItem(input),
+      ).then((sent) => {
+        if (!sent) return;
+        setText("");
+        setComposing(false);
+      });
+    },
+    snooze: (until) => {
+      void action.run("Could not snooze it", () =>
+        missionsSource().snoozeInboxItem({ subject, until }),
+      );
+    },
+    unsnooze: () => {
+      void action.run("Could not unsnooze it", () =>
+        missionsSource().unsnoozeInboxItem({ subject }),
+      );
+    },
+  };
+}
+// --- end finish-a ---
