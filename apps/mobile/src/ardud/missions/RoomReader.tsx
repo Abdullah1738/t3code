@@ -2,6 +2,8 @@ import type { MissionMessage, RoomId } from "@t3tools/contracts";
 import {
   COMPOSER_TARGET_LABEL,
   MESSAGE_KIND_LABEL,
+  receiptNudgeLanes,
+  receiptView,
   type ComposerTarget,
   type TimelineRow,
 } from "@t3tools/client-runtime/ardud/missions";
@@ -82,6 +84,8 @@ export function RoomReader(props: {
             row={row}
             nowMs={props.nowMs}
             nameOf={room.nameOf}
+            nudged={room.nudged}
+            onNudge={room.pending ? null : room.nudge}
             onToggleRun={room.expandRun}
             onMarkerLayout={(y) => scrollOnce(y)}
           />
@@ -159,6 +163,8 @@ function TimelineLine(props: {
   readonly row: TimelineRow;
   readonly nowMs: number;
   readonly nameOf: (actor: MissionMessage["author"]) => string;
+  readonly nudged: ReadonlySet<string>;
+  readonly onNudge: ((message: MissionMessage) => void) | null;
   readonly onToggleRun: (key: string) => void;
   readonly onMarkerLayout: (y: number) => void;
 }) {
@@ -186,6 +192,8 @@ function TimelineLine(props: {
               message={message}
               nowMs={props.nowMs}
               nameOf={props.nameOf}
+              nudged={props.nudged}
+              onNudge={props.onNudge}
             />
           ))}
           <LinkButton label="Fold status" onPress={() => props.onToggleRun(row.key)} />
@@ -199,7 +207,15 @@ function TimelineLine(props: {
         </View>
       );
     case "message":
-      return <MessageLine message={row.message} nowMs={props.nowMs} nameOf={props.nameOf} />;
+      return (
+        <MessageLine
+          message={row.message}
+          nowMs={props.nowMs}
+          nameOf={props.nameOf}
+          nudged={props.nudged}
+          onNudge={props.onNudge}
+        />
+      );
   }
 }
 
@@ -207,8 +223,13 @@ function MessageLine(props: {
   readonly message: MissionMessage;
   readonly nowMs: number;
   readonly nameOf: (actor: MissionMessage["author"]) => string;
+  readonly nudged: ReadonlySet<string>;
+  readonly onNudge: ((message: MissionMessage) => void) | null;
 }) {
   const { message } = props;
+  const receipt = receiptView(message.receipt);
+  const canNudge = receiptNudgeLanes(message.receipt).length > 0;
+  const nudged = props.nudged.has(message.id);
   const chip = message.isCorrection
     ? "Correction"
     : CHIP_KINDS.has(message.kind)
@@ -224,6 +245,21 @@ function MessageLine(props: {
         <Meta>{clockLabel(message.createdAt, props.nowMs)}</Meta>
       </View>
       <Body>{message.summary}</Body>
+      {receipt ? (
+        <View className="flex-row items-center gap-3">
+          <Meta className="flex-1">
+            {receipt.pending ? `${receipt.label}, ${receipt.pending}` : receipt.label}
+          </Meta>
+          {canNudge ? (
+            <LinkButton
+              label={nudged ? "Nudged" : "Nudge"}
+              accessibilityLabel={nudged ? "Nudged" : "Nudge the lanes still waiting"}
+              disabled={nudged || props.onNudge === null}
+              onPress={() => props.onNudge?.(message)}
+            />
+          ) : null}
+        </View>
+      ) : null}
     </View>
   );
 }
