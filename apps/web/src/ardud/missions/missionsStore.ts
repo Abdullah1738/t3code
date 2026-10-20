@@ -17,9 +17,8 @@ import {
   createKeyedSnapshotStores,
   createRpcMissionsSource,
   createSnapshotStore,
-  masterInboxFeed,
-  withMasterInboxFeed,
   yourRequests,
+  type FeedFailure,
   type SampledFeed,
   type ApprovalRoutingTable,
   type MissionInboxSnapshot,
@@ -36,34 +35,27 @@ import {
   type MissionWorkSnapshot,
   type PortfolioSnapshot,
   type RecoveryIncident,
+  type SnapshotStore,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
 
-// The web client's one missions source: the primary server over WS RPC, with
-// fixture data filling the feeds the server does not serve yet (each listed in
-// `missionsSource.sampled`). `?missionsFixture=1` runs on the fixture alone.
+// The web client's one missions source: the primary server over WS RPC.
+// `?missionsFixture=1` runs on the fixture alone; nothing else falls back to it.
 const useFixtureOnly =
   typeof window !== "undefined" &&
   new URLSearchParams(window.location.search).get("missionsFixture") === "1";
-const fixtureSource = createFixtureMissionsSource({ surface: "web" });
-export const missionsSource: MissionsSource = useFixtureOnly ? fixtureSource : createLiveSource();
-
-function createLiveSource(): MissionsSource {
-  const transport = createAtomMissionsTransport({
-    runtime: connectionAtomRuntime,
-    registry: appAtomRegistry,
-    environmentId: primaryEnvironmentIdAtom,
-  });
-  // The server's inbox carries only what is routed to the owner; the master's
-  // queue joins it here so the inbox's master view and counts are live.
-  return withMasterInboxFeed(
-    createRpcMissionsSource({ transport, fallback: fixtureSource }),
-    masterInboxFeed(transport),
-  );
-}
+export const missionsSource: MissionsSource = useFixtureOnly
+  ? createFixtureMissionsSource({ surface: "web" })
+  : createRpcMissionsSource({
+      transport: createAtomMissionsTransport({
+        runtime: connectionAtomRuntime,
+        registry: appAtomRegistry,
+        environmentId: primaryEnvironmentIdAtom,
+      }),
+    });
 
 /** True when a section's data comes from the fixture rather than the server. */
 export function isSampleFeed(feed: SampledFeed): boolean {
@@ -81,8 +73,8 @@ const overviewStores = createKeyedSnapshotStores<MissionId, MissionOverviewSnaps
 const laneStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Lane>>((id, emit) =>
   missionsSource.subscribeLanes(id, emit),
 );
-const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInboxSnapshot>((id, emit) =>
-  missionsSource.subscribeInbox(id, emit),
+const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInboxSnapshot>(
+  (id, emit, fail) => missionsSource.subscribeInbox(id, emit, fail),
 );
 const routingStores = createKeyedSnapshotStores<MissionId, ApprovalRoutingTable | null>(
   (id, emit) => missionsSource.subscribeRouting(id, emit),
@@ -133,7 +125,7 @@ const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null
   missionsSource.subscribeViews(id, emit),
 );
 const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
-  (id, emit) => missionsSource.subscribeRequests(id, emit),
+  (id, emit, fail) => missionsSource.subscribeRequests(id, emit, fail),
 );
 
 /** The mission's views record (its layout of sections and tabs) and its change log. */
@@ -147,7 +139,33 @@ const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | nul
   return missionsSource.subscribeRequest({ missionId, requestId }, emit);
 });
 
-const NO_REQUESTS = { get: () => undefined, subscribe: () => () => {} };
+const NO_REQUESTS: SnapshotStore<ReadonlyArray<OwnerRequest>> = {
+  get: () => undefined,
+  subscribe: () => () => {},
+  failure: () => undefined,
+  retry: () => {},
+};
+
+/** A feed's read failure (and how to retry it); `failure` is unset while it reads fine. */
+export interface FeedState {
+  readonly failure: FeedFailure | undefined;
+  readonly retry: () => void;
+}
+
+function useFeedState(store: SnapshotStore<unknown>): FeedState {
+  const failure = useSyncExternalStore(store.subscribe, store.failure);
+  return useMemo(() => ({ failure, retry: store.retry }), [failure, store]);
+}
+
+/** Whether the inbox read failed; pairs with `useMissionInbox`. */
+export function useMissionInboxFeed(missionId: MissionId | null): FeedState {
+  return useFeedState(inboxStores(missionId));
+}
+
+/** Whether the owner requests read failed; pairs with `useOwnerRequests`. */
+export function useOwnerRequestsFeed(missionId: MissionId | null): FeedState {
+  return useFeedState(missionId === null ? NO_REQUESTS : requestStores(missionId));
+}
 
 /**
  * Every owner request, discussions included, newest activity first. A record

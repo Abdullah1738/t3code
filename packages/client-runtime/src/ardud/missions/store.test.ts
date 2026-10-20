@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { createSnapshotStore } from "./store.ts";
+import { createSnapshotStore, feedFailureLines } from "./store.ts";
 
 describe("snapshot store", () => {
   it("keeps the failure with when it last loaded, and Retry opens the feed again", () => {
@@ -54,5 +54,29 @@ describe("snapshot store", () => {
     expect(closed).toBe(1);
     stop();
     expect(closed).toBe(1);
+  });
+
+  it("says what failed and when it last loaded, with the day once it is not today", () => {
+    const now = Date.parse("2026-10-20T10:00:00Z");
+    expect(feedFailureLines("the inbox", { lastLoadedAt: null }, now, "UTC")).toEqual({
+      title: "Couldn't load the inbox.",
+      detail: null,
+    });
+    expect(
+      feedFailureLines(
+        "the inbox",
+        { lastLoadedAt: Date.parse("2026-10-20T04:53:00Z") },
+        now,
+        "UTC",
+      ).detail,
+    ).toBe("Last loaded at 04:53.");
+    expect(
+      feedFailureLines(
+        "the inbox",
+        { lastLoadedAt: Date.parse("2026-10-19T22:10:00Z") },
+        now,
+        "UTC",
+      ).detail,
+    ).toBe("Last loaded at Mon 19 Oct 22:10.");
   });
 });

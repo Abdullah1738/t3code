@@ -15,11 +15,13 @@ import {
   createRpcMissionsSource,
   createSnapshotStore,
   yourRequests,
+  type FeedFailure,
   type MissionInboxSnapshot,
   type MissionOverviewSnapshot,
   type MissionRoomEntry,
   type MissionsSource,
   type OwnerRequest,
+  type SnapshotStore,
 } from "@t3tools/client-runtime/ardud/missions";
 import { enabledEnvironmentIds } from "@t3tools/client-runtime/state/connections";
 import { Atom } from "effect/reactivity";
@@ -48,23 +50,20 @@ let source: MissionsSource | null = null;
 
 /**
  * The phone's one missions source: the paired server over the environment
- * connection, with fixture data only for the feeds the server does not serve
- * (`sampled`). `EXPO_PUBLIC_MISSIONS_FIXTURE=1` runs on the fixture alone.
+ * connection. `EXPO_PUBLIC_MISSIONS_FIXTURE=1` runs on the fixture alone.
  * Built on first use so app start stays cheap.
  */
 export function missionsSource(): MissionsSource {
   if (source) return source;
-  const fixture = createFixtureMissionsSource({ surface: "mobile" });
   source =
     process.env.EXPO_PUBLIC_MISSIONS_FIXTURE === "1"
-      ? fixture
+      ? createFixtureMissionsSource({ surface: "mobile" })
       : createRpcMissionsSource({
           transport: createAtomMissionsTransport({
             runtime: connectionAtomRuntime,
             registry: appAtomRegistry,
             environmentId: missionsEnvironmentIdAtom,
           }),
-          fallback: fixture,
         });
   return source;
 }
@@ -76,8 +75,8 @@ const listStore = createSnapshotStore<MissionListSnapshot>((emit) =>
 const overviewStores = createKeyedSnapshotStores<MissionId, MissionOverviewSnapshot | null>(
   (id, emit) => missionsSource().subscribeOverview(id, emit),
 );
-const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInboxSnapshot>((id, emit) =>
-  missionsSource().subscribeInbox(id, emit),
+const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInboxSnapshot>(
+  (id, emit, fail) => missionsSource().subscribeInbox(id, emit, fail),
 );
 const historyStores = createKeyedSnapshotStores<MissionId | null, MissionInboxHistory>((id, emit) =>
   missionsSource().subscribeInboxHistory(id, emit),
@@ -92,14 +91,40 @@ const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit)
   missionsSource().subscribeRoom(id, emit),
 );
 const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
-  (id, emit) => missionsSource().subscribeRequests(id, emit),
+  (id, emit, fail) => missionsSource().subscribeRequests(id, emit, fail),
 );
 const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | null>((key, emit) => {
   const [missionId, requestId] = key.split("\n") as [MissionId, string];
   return missionsSource().subscribeRequest({ missionId, requestId }, emit);
 });
 
-const NONE = { get: () => undefined, subscribe: () => () => {} };
+const NONE: SnapshotStore<never> = {
+  get: () => undefined,
+  subscribe: () => () => {},
+  failure: () => undefined,
+  retry: () => {},
+};
+
+/** A feed's read failure and how to retry it; `failure` is unset while it reads fine. */
+export interface FeedState {
+  readonly failure: FeedFailure | undefined;
+  readonly retry: () => void;
+}
+
+function useFeedState(store: SnapshotStore<unknown>): FeedState {
+  const failure = useSyncExternalStore(store.subscribe, store.failure);
+  return useMemo(() => ({ failure, retry: store.retry }), [failure, store]);
+}
+
+/** Whether the inbox read failed; pairs with `useMissionInbox`. */
+export function useMissionInboxFeed(missionId: MissionId | null): FeedState {
+  return useFeedState(inboxStores(missionId));
+}
+
+/** Whether the owner requests read failed; pairs with `useOwnerRequests`. */
+export function useOwnerRequestsFeed(missionId: MissionId | null): FeedState {
+  return useFeedState(missionId === null ? NONE : requestStores(missionId));
+}
 
 /** Undefined until the source answers. */
 export function useMissionList(): MissionListSnapshot | undefined {

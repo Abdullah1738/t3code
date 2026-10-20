@@ -1,4 +1,6 @@
+// @effect-diagnostics globalDate:off - Load times render on the reader's clock and zone.
 import type { Listener, Unsubscribe } from "./source.ts";
+import { formatDayLabel, formatTimeOfDay } from "./viewModel.ts";
 
 /**
  * Latest-value cache over one source subscription, shaped for React's
@@ -19,6 +21,26 @@ export interface FeedFailure {
   readonly error: unknown;
   /** When the last value arrived (epoch ms); null when nothing ever loaded. */
   readonly lastLoadedAt: number | null;
+}
+
+/**
+ * The Desk error line for a block whose read failed: "Couldn't load the
+ * inbox." then when it last loaded, in the reader's zone (the day too when it
+ * was not today). `detail` is null when nothing ever loaded.
+ */
+export function feedFailureLines(
+  what: string,
+  failure: Pick<FeedFailure, "lastLoadedAt">,
+  nowMs: number,
+  timeZone?: string,
+): { readonly title: string; readonly detail: string | null } {
+  const title = `Couldn't load ${what}.`;
+  if (failure.lastLoadedAt === null) return { title, detail: null };
+  const at = new Date(failure.lastLoadedAt).toISOString();
+  const day = formatDayLabel(at, timeZone);
+  const today = formatDayLabel(new Date(nowMs).toISOString(), timeZone);
+  const time = formatTimeOfDay(at, timeZone);
+  return { title, detail: `Last loaded at ${day === today ? time : `${day} ${time}`}.` };
 }
 
 export type SnapshotOpen<T> = (emit: Listener<T>, fail: Listener<unknown>) => Unsubscribe;
