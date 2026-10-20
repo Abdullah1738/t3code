@@ -203,7 +203,7 @@ function LaneItem(props: {
         </span>
         <span className="flex min-w-0 flex-col">
           <span className="truncate font-medium">{lane.name}</span>
-          {lane.purpose ? (
+          {lane.purpose && lane.purpose !== message ? (
             <span className="truncate text-xs text-(--m-muted)">{lane.purpose}</span>
           ) : null}
         </span>
