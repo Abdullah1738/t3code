@@ -47,6 +47,15 @@ export const changedFields = (before: object, after: object): ReadonlyArray<stri
   return [...keys].filter((key) => !BOOKKEEPING_FIELDS.has(key) && !sameValue(a[key], b[key]));
 };
 
+// finish-b: the values a change replaced, kept on the event so a revert can re-apply them.
+export const previousValues = (
+  before: object,
+  changed: ReadonlyArray<string>,
+): Record<string, unknown> =>
+  Object.fromEntries(
+    changed.map((field) => [field, (before as Record<string, unknown>)[field] ?? null]),
+  );
+
 /** Rejects anything but owner provenance. For acts that are the owner's by definition. */
 export const requireOwner = (provenance: MissionProvenance, action: string): MissionError | null =>
   isOwnerProvenance(provenance)

@@ -2230,6 +2230,10 @@ export const MissionPortfolio = Schema.Struct({
   order: Schema.Array(MissionId),
   changedBy: MissionActor,
   updatedAt: IsoDateTime,
+  // --- finish-b additions ---
+  /** The order this one replaced, so a revert can put it back. */
+  previousOrder: Schema.optional(Schema.Array(MissionId)),
+  // --- end finish-b additions ---
 });
 export type MissionPortfolio = typeof MissionPortfolio.Type;
 // --- end core additions ---
@@ -3140,6 +3144,10 @@ export const PortfolioFieldChange = Schema.Struct({
   actor: MissionActor,
   eventId: MissionEventId,
   at: IsoDateTime,
+  // --- finish-b additions ---
+  /** The value the change replaced, when the event kept it. */
+  previous: Schema.optional(Schema.Union([Schema.String, Schema.Number])),
+  // --- end finish-b additions ---
 });
 export type PortfolioFieldChange = typeof PortfolioFieldChange.Type;
 
@@ -3150,7 +3158,15 @@ export const PortfolioSnapshot = Schema.Struct({
   /** Latest change per mission field: tier, guaranteedShare, borrowCeiling. */
   changes: Schema.Array(PortfolioFieldChange),
   /** Who last reordered, and when; null until anyone has. */
-  orderChange: Schema.NullOr(Schema.Struct({ actor: MissionActor, at: IsoDateTime })),
+  orderChange: Schema.NullOr(
+    Schema.Struct({
+      actor: MissionActor,
+      at: IsoDateTime,
+      // --- finish-b additions ---
+      previousOrder: Schema.optional(Schema.Array(MissionId)),
+      // --- end finish-b additions ---
+    }),
+  ),
 });
 export type PortfolioSnapshot = typeof PortfolioSnapshot.Type;
 

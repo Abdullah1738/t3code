@@ -42,7 +42,7 @@ import { makePortfolioWrites } from "./portfolio.ts";
 import { ownerConditions } from "./conditions.ts";
 import type { WriteKit } from "./kit.ts";
 import { actorOf } from "./provenance.ts";
-import { changedFields, requireOwner } from "./rules.ts";
+import { changedFields, previousValues, requireOwner } from "./rules.ts";
 import { makeStructureWrites } from "./structure.ts";
 
 /**
@@ -228,7 +228,13 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
           summary: `Mission "${record.title}": ${kind === "mission.updated" ? `${changed.join(", ")} changed` : kind.slice("mission.".length)}`,
           ref: missionRef(record),
           upserts: [{ _tag: "mission", record }],
-          payload: { changed, status: record.status, focusSubMissionId: record.focusSubMissionId },
+          payload: {
+            changed,
+            status: record.status,
+            focusSubMissionId: record.focusSubMissionId,
+            // finish-b: the previous values, so a client can revert the change.
+            before: previousValues(before, changed),
+          },
         });
       });
 
@@ -515,7 +521,12 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
                   : `Lane "${record.name}" ${kind.slice("lane.".length)}`,
               ref: laneRef(record),
               upserts: [{ _tag: "lane", record }],
-              payload: { changed, status: record.status, subMissionId: record.subMissionId },
+              payload: {
+                changed,
+                status: record.status,
+                subMissionId: record.subMissionId,
+                before: previousValues(before, changed),
+              },
             });
           }
 

@@ -286,6 +286,13 @@ it.layer(TestLayer)("MissionService", (it) => {
           "mission.unarchived",
         ],
       );
+      // A lane move keeps where the lane was, so a client can move it back.
+      assert.deepStrictEqual(events.find((event) => event.kind === "lane.moved")?.payload, {
+        changed: ["subMissionId"],
+        status: "idle",
+        subMissionId: b,
+        before: { subMissionId: a },
+      });
       for (const event of events.filter((event) => event.kind !== "sub-mission.reordered")) {
         assert.deepStrictEqual(event.provenance, master);
         assert.deepStrictEqual(event.actor, { _tag: "thread", threadId: master.threadId });

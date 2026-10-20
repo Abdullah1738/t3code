@@ -45,6 +45,15 @@ const fail = (code: MissionError["code"], detail: string) =>
 
 const clampShare = (value: number) => Math.min(1, Math.max(0, value));
 
+/** The value a mission.updated event replaced for a field, when it kept one (finish-b). */
+const previousValue = (payload: unknown, field: string): string | number | undefined => {
+  if (typeof payload !== "object" || payload === null || !("before" in payload)) return undefined;
+  const before = payload.before;
+  if (typeof before !== "object" || before === null) return undefined;
+  const value = (before as Record<string, unknown>)[field];
+  return typeof value === "string" || typeof value === "number" ? value : undefined;
+};
+
 const byDefaultOrder = (left: Mission, right: Mission) =>
   TIER_RANK[left.tier] - TIER_RANK[right.tier] ||
   right.weight - left.weight ||
@@ -96,13 +105,17 @@ export const makePortfolio = (store: MissionStore.MissionStore["Service"]) => {
       const listed = new Set<string>(missions.map((mission) => mission.id));
       const changes = (yield* store.latestFieldChanges("mission.updated", CHANGED_FIELDS))
         .filter(({ event }) => listed.has(event.missionId))
-        .map(({ field, event }): PortfolioFieldChange => ({
-          ref: event.subject ?? { kind: "mission", id: event.missionId },
-          field,
-          actor: event.actor,
-          eventId: event.id,
-          at: event.at,
-        }));
+        .map(({ field, event }): PortfolioFieldChange => {
+          const previous = previousValue(event.payload, field);
+          return {
+            ref: event.subject ?? { kind: "mission", id: event.missionId },
+            field,
+            actor: event.actor,
+            eventId: event.id,
+            at: event.at,
+            ...(previous === undefined ? {} : { previous }),
+          };
+        });
       const shares = new Map(usage?.shares.map((share) => [share.missionId, share.dominant]));
       return {
         order: portfolioOrder(missions, record?.order ?? []),
@@ -118,7 +131,16 @@ export const makePortfolio = (store: MissionStore.MissionStore["Service"]) => {
           pools: usage === null ? [] : drawsOf(mission.id, usage.pools),
         })),
         changes,
-        orderChange: record === null ? null : { actor: record.changedBy, at: record.updatedAt },
+        orderChange:
+          record === null
+            ? null
+            : {
+                actor: record.changedBy,
+                at: record.updatedAt,
+                ...(record.previousOrder === undefined
+                  ? {}
+                  : { previousOrder: record.previousOrder }),
+              },
       };
     });
 
@@ -159,6 +181,7 @@ export const makePortfolioWrites = (kit: WriteKit) => {
           order: input.order,
           changedBy: actorOf(provenance),
           updatedAt: DateTime.formatIso(yield* DateTime.now),
+          previousOrder,
         };
         return yield* commit(provenance, {
           missionId: PORTFOLIO_TIMELINE,

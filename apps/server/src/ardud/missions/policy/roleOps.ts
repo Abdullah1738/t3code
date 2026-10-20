@@ -374,6 +374,8 @@ export const setRoleModel = (
           from: modelKey(found.role.modelSelection),
           to: modelLabel(role),
           reason: reason || null,
+          // finish-b: the selection this replaced, so a client can revert it.
+          previousSelection: found.role.pendingModelSelection ?? found.role.modelSelection,
         },
       ),
       upserts: [roleUpsert(role)],
