@@ -517,6 +517,10 @@ export const RoomNoise = Schema.Struct({
   actionableShare: Share,
   /** Wakes whose recipient acked without acting, last 24h. */
   wastedWakes: NonNegativeInt,
+  // --- finish-b additions ---
+  /** Messages per kind in the last 24h. */
+  kinds24h: Schema.optional(Schema.Record(Schema.String, NonNegativeInt)),
+  // --- end finish-b additions ---
 });
 export type RoomNoise = typeof RoomNoise.Type;
 
@@ -558,6 +562,10 @@ export const BroadcastReceipt = Schema.Struct({
   total: NonNegativeInt,
   /** Recipients not reached yet, by label. */
   pending: Schema.Array(Schema.String),
+  // --- finish-b additions ---
+  /** The same recipients as `pending`, as actors, so a client can nudge them. */
+  pendingActors: Schema.optional(Schema.Array(MissionActor)),
+  // --- end finish-b additions ---
 });
 export type BroadcastReceipt = typeof BroadcastReceipt.Type;
 
@@ -1750,6 +1758,10 @@ export const MissionEventKind = Schema.Literals([
   "send.guarded",
   "member.changed",
   "room.tuned",
+  // --- finish-b additions ---
+  "room.updated",
+  "room.restored",
+  // --- end finish-b additions ---
   "request.opened",
   "request.replied",
   "request.settled",
@@ -2485,6 +2497,21 @@ export const RoomTuning = Schema.Struct({
   updatedAt: Schema.NullOr(IsoDateTime),
 });
 export type RoomTuning = typeof RoomTuning.Type;
+
+// --- finish-b additions ---
+/**
+ * Owner or the mission's master: rename a room, move it to another sub-mission
+ * (null for none), or remove and restore it. Removing archives the room; the
+ * control room can't be removed.
+ */
+export const UpdateRoomInput = Schema.Struct({
+  roomId: RoomId,
+  title: Schema.optional(TrimmedNonEmptyString),
+  subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
+  archived: Schema.optional(Schema.Boolean),
+});
+export type UpdateRoomInput = typeof UpdateRoomInput.Type;
+// --- end finish-b additions ---
 
 /** The deliveries of one mission that were reminded once and are still unread. */
 export const MissionAttentionInput = Schema.Struct({

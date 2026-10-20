@@ -14,6 +14,7 @@ import {
   SettleOwnerRequestInput,
   SubscribeRoomInput,
   TuneRoomInput,
+  UpdateRoomInput,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
@@ -135,6 +136,18 @@ const MissionTuneRoomTool = Tool.make("mission_tune_room", {
   dependencies,
 });
 
+// --- finish-b ---
+const MissionUpdateRoomTool = Tool.make("mission_update_room", {
+  description:
+    "As the mission's master, rename a room, move it to another sub-mission (subMissionId null for none), or remove it (archived true) and restore it, as one logged change. The control room can't be removed.",
+  parameters: UpdateRoomInput,
+  success: Schema.Struct({ room: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+// --- end finish-b ---
+
 const MissionAttentionTool = Tool.make("mission_attention", {
   description:
     "As the mission's master, messages members left unread after their one reminder. The router does not ring for them again; chase or reassign them yourself.",
@@ -229,6 +242,7 @@ export const RouterToolkit = Toolkit.make(
   annotated(MissionSetMemberTool, "Set a mission member", false),
   annotated(MissionRoomTuningTool, "Mission room wake rules", true),
   annotated(MissionTuneRoomTool, "Tune a mission room", false),
+  annotated(MissionUpdateRoomTool, "Change a mission room", false),
   annotated(MissionAttentionTool, "Mission attention", true),
   annotated(MissionRequestsTool, "Owner requests", true),
   annotated(MissionRequestOpenTool, "Open an owner request", false),

@@ -422,6 +422,7 @@ import {
   RoomTuning,
   RoomTuningInput,
   TuneRoomInput,
+  UpdateRoomInput,
   OpenOwnerRequestInput,
   OwnerRequest,
   OwnerRequests,
@@ -667,6 +668,8 @@ export const WS_METHODS = {
   missionsReplyOwnerRequest: "missions.replyOwnerRequest",
   missionsSettleOwnerRequest: "missions.settleOwnerRequest",
   missionsReopenOwnerRequest: "missions.reopenOwnerRequest",
+  // ardud missions: finish-b
+  missionsUpdateRoom: "missions.updateRoom",
   // Slots, policy: missionsSetRoleModel, missionsSetPoolCapacity,
   // missionsUpdateReviewPolicy.
 
@@ -2200,6 +2203,8 @@ const WsMissionsRoomTuningRpc = missionRpc(
   RoomTuning,
 );
 const WsMissionsTuneRoomRpc = missionRpc(WS_METHODS.missionsTuneRoom, TuneRoomInput, RoomTuning);
+// ardud missions: finish-b
+const WsMissionsUpdateRoomRpc = missionRpc(WS_METHODS.missionsUpdateRoom, UpdateRoomInput, Room);
 const WsMissionsAttentionRpc = missionRpc(
   WS_METHODS.missionsAttention,
   MissionAttentionInput,
@@ -2316,6 +2321,8 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsDecideKnockRpc,
   WsMissionsRoomTuningRpc,
   WsMissionsTuneRoomRpc,
+  // ardud missions: finish-b
+  WsMissionsUpdateRoomRpc,
   WsMissionsAttentionRpc,
   WsMissionsOwnerRequestsRpc,
   WsMissionsOpenOwnerRequestRpc,

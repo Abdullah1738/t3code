@@ -299,6 +299,8 @@ export const receiptFor = (
     reached: recipients.length - pending.length,
     total: recipients.length,
     pending: pending.map((entry) => entry.label),
+    // --- finish-b ---
+    pendingActors: pending.map((entry) => entry.actor),
   };
 };
 
@@ -394,5 +396,12 @@ export const noiseFor = (input: {
     messagesPerHour: Math.round((total / (windowMs / 3_600_000)) * 100) / 100,
     actionableShare: total === 0 ? 0 : Math.round((actionable / total) * 1000) / 1000,
     wastedWakes: input.wastedWakes,
+    // --- finish-b ---
+    kinds24h: Object.fromEntries(
+      [...new Set(input.kinds)].map((kind) => [
+        kind,
+        input.kinds.filter((each) => each === kind).length,
+      ]),
+    ),
   };
 };

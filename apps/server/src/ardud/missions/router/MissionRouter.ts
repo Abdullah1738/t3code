@@ -40,6 +40,7 @@ import {
   type SubscribeRoomInput,
   type Subscription,
   type TuneRoomInput,
+  type UpdateRoomInput,
   type WorkItem,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -345,6 +346,13 @@ export class MissionRouter extends Context.Service<
       input: TuneRoomInput,
       provenance: MissionProvenance,
     ) => Effect.Effect<RoomTuning, MissionError>;
+    // --- finish-b ---
+    /** Owner or master: rename a room, move it to another sub-mission, or remove and restore it. */
+    readonly updateRoom: (
+      input: UpdateRoomInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<Room, MissionError>;
+    // --- end finish-b ---
     /**
      * One reminder for each idle thread holding deliveries unread for over 30
      * minutes, at most one per thread per 30 minutes; a delivery is reminded
@@ -1254,6 +1262,67 @@ const make = Effect.gen(function* () {
       return yield* tuningOf(room);
     });
 
+  // --- finish-b ---
+  const updateRoom = (input: UpdateRoomInput, provenance: MissionProvenance) =>
+    Effect.gen(function* () {
+      const room = yield* openRoom(input.roomId, provenance);
+      yield* refuseRequestRoom(room);
+      const cast = yield* loadCast(room.missionId);
+      if (!isOwnerProvenance(provenance) && !isMaster(cast, provenance)) {
+        return yield* fail("forbidden", "Only the owner or the mission's master changes a room.");
+      }
+      if (input.archived === true && room.id === controlRoomId(room.missionId)) {
+        return yield* fail("conflict", "The control room carries nudges and broadcasts; it stays.");
+      }
+      if (input.subMissionId !== undefined && input.subMissionId !== null) {
+        const sub = Option.getOrNull(yield* store.get("sub-mission", input.subMissionId));
+        if (sub === null || sub.missionId !== room.missionId) {
+          return yield* fail(
+            "not-found",
+            `No sub-mission ${input.subMissionId} in ${room.missionId}.`,
+          );
+        }
+      }
+      const next: Room = {
+        ...room,
+        title: input.title ?? room.title,
+        subMissionId: input.subMissionId === undefined ? room.subMissionId : input.subMissionId,
+        archived: input.archived ?? room.archived,
+      };
+      const fields = (["title", "subMissionId"] as const).filter(
+        (field) => next[field] !== room[field],
+      );
+      const archiving = next.archived !== room.archived;
+      if (fields.length === 0 && !archiving) {
+        return yield* fail("invalid", `Room ${room.title} already looks like that.`);
+      }
+      const kind = archiving ? (next.archived ? "room.archived" : "room.restored") : "room.updated";
+      const summary = archiving
+        ? `${room.title} ${next.archived ? "removed" : "restored"}`
+        : next.title !== room.title
+          ? `${room.title} renamed to ${next.title}`
+          : `${next.title} moved`;
+      yield* store.commit({
+        event: {
+          missionId: room.missionId,
+          kind,
+          actor: actorOf(provenance),
+          provenance,
+          summary: clipSummary(summary),
+          subject: { kind: "room", id: room.id, label: next.title },
+          payload: {
+            fields: archiving ? ["archived", ...fields] : fields,
+            before: { title: room.title, subMissionId: room.subMissionId, archived: room.archived },
+            after: { title: next.title, subMissionId: next.subMissionId, archived: next.archived },
+          },
+          at: yield* nowIso,
+        },
+        alongside: rooms.putRoom(next),
+      });
+      return next;
+    });
+  // --- end finish-b ---
+
   const setMember = (input: SetMissionMemberInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       const cast = yield* loadCast(input.missionId);
@@ -1903,6 +1972,7 @@ const make = Effect.gen(function* () {
     relay,
     roomTuning,
     tuneRoom,
+    updateRoom,
     remind,
     attention,
     ownerRequests: requests.list,
