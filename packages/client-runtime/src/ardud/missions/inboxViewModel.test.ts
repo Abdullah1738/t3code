@@ -1,9 +1,11 @@
+// @effect-diagnostics globalDate:off - Tests build times on the local calendar.
 import {
   approverOf,
   type Approver,
   Ask,
   Draft,
   DraftNote,
+  type InboxMark,
   MissionInbox,
   Note,
   Suggestion,
@@ -16,6 +18,8 @@ import {
   answerAskInput,
   askView,
   blocksLine,
+  commentInput,
+  commentsOf,
   decideDraftInput,
   decideKnockInput,
   decideSuggestionInput,
@@ -29,9 +33,15 @@ import {
   inboxKeyAction,
   inboxTabCounts,
   inboxUiReducer,
+  isSnoozed,
   keepSelection,
+  markOf,
   moveSelection,
   recommendationLine,
+  snoozeChoices,
+  snoozedEntries,
+  snoozeLabel,
+  snoozeUntilFromLocal,
   suggestionTrackRecord,
   waitingLabel,
 } from "./inboxViewModel.ts";
@@ -555,5 +565,89 @@ describe("inbox screen state", () => {
     state = inboxUiReducer(state, { type: "done", key: "ask:a" });
     expect(state.picked).toEqual({});
     expect(state.selectedKey).toBe("ask:a");
+  });
+});
+
+describe("Comments and snoozes", () => {
+  const mark = (
+    kind: InboxMark["subject"]["kind"],
+    id: string,
+    snooze: InboxMark["snooze"],
+    comments: InboxMark["comments"] = [],
+  ): InboxMark => ({
+    id: `${kind}:${id}`,
+    missionId: "m" as InboxMark["missionId"],
+    subject: { kind, id },
+    comments,
+    snooze,
+    updatedAt: T0,
+  });
+  const until = (iso: string | null) => ({ at: T0, until: iso, stamp: "x" });
+  const inbox = (marks: ReadonlyArray<InboxMark>) => ({
+    ...emptyInbox(
+      {
+        counts: { decide: 2, approve: 1, knocks: 0, suggestions: 0, fyi: 0 },
+        asks: [ask(), ask({ id: "ask-2", createdAt: T0 })],
+        drafts: [draft({ id: "draft-1" })],
+      },
+      { "draft-1": "master" },
+    ),
+    marks,
+  });
+
+  it("moves a snoozed item out of the owner's inbox and its count, never the master's", () => {
+    const snoozed = inbox([
+      mark("ask", "ask-1", until(null)),
+      mark("draft", "draft-1", until(null)),
+    ]);
+    expect(inboxEntries(snoozed, "decide", "owner", NOW).map((e) => e.key)).toEqual(["ask:ask-2"]);
+    expect(inboxTabCounts(snoozed, "owner", NOW).decide).toBe(1);
+    // The master's view keeps the snoozed draft.
+    expect(inboxEntries(snoozed, "approve", "master", NOW).map((e) => e.key)).toEqual([
+      "draft:draft-1",
+    ]);
+    expect(snoozedEntries(snoozed, NOW).map((e) => e.key)).toEqual(["ask:ask-1"]);
+    expect(snoozedEntries(snoozed, NOW, ["approve"])).toEqual([]);
+  });
+
+  it("brings an item back when its time passes on the device clock", () => {
+    const later = new Date(NOW + 3_600_000).toISOString();
+    const snoozed = inbox([mark("ask", "ask-1", until(later))]);
+    expect(isSnoozed(markOf(snoozed, "ask:ask-1"), NOW)).toBe(true);
+    expect(inboxEntries(snoozed, "decide", "owner", NOW)).toHaveLength(1);
+    expect(inboxEntries(snoozed, "decide", "owner", NOW + 3_600_000)).toHaveLength(2);
+    expect(snoozedEntries(snoozed, NOW + 3_600_000)).toEqual([]);
+    // A comment alone hides nothing.
+    const commented = inbox([
+      mark("ask", "ask-1", null, [{ id: "c-1", body: "Leaning hold", at: T0 }]),
+    ]);
+    expect(inboxEntries(commented, "decide", "owner", NOW)).toHaveLength(2);
+    expect(commentsOf(commented, "ask:ask-1").map((c) => c.body)).toEqual(["Leaning hold"]);
+  });
+
+  it("labels the snooze and offers choices in the device zone", () => {
+    expect(snoozeLabel(mark("ask", "a", until(null)), NOW)).toBe("Until it changes");
+    expect(snoozeLabel(mark("ask", "a", null), NOW)).toBeNull();
+    const choices = snoozeChoices(NOW);
+    expect(choices.map((choice) => choice.key)).toEqual(["change", "hour", "tomorrow", "monday"]);
+    expect(choices[0]?.until).toBeNull();
+    expect(Date.parse(choices[1]?.until ?? "")).toBe(NOW + 3_600_000);
+    const tomorrow = new Date(choices[2]?.until ?? "");
+    expect([tomorrow.getHours(), tomorrow.getMinutes()]).toEqual([9, 0]);
+    const monday = new Date(choices[3]?.until ?? "");
+    expect(monday.getDay()).toBe(1);
+    expect(monday.getTime()).toBeGreaterThan(NOW);
+    expect(snoozeUntilFromLocal("2020-01-01T09:00", NOW)).toBeNull();
+    const local = snoozeUntilFromLocal("2030-01-02T09:30", NOW);
+    expect(local && new Date(local).getHours()).toBe(9);
+  });
+
+  it("checks a comment before it is sent", () => {
+    const entry = { kind: "ask" as const, record: ask() };
+    expect(commentInput(entry, "  ")).toEqual({ ok: false, error: "Write a comment first." });
+    expect(commentInput(entry, " Leaning hold ")).toEqual({
+      ok: true,
+      value: { subject: { kind: "ask", id: "ask-1" }, body: "Leaning hold" },
+    });
   });
 });

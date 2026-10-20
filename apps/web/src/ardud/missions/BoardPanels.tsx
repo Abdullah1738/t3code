@@ -41,7 +41,10 @@ import {
   useMissionReviewPolicy,
   useMissionRooms,
   useMissionTimeline,
+  useMissionTimelineFeed,
+  type FeedState,
 } from "./missionsStore";
+import { FeedError } from "./sections/FeedError";
 import { FoldButton, LoadingRows } from "./sections/SectionShell";
 import { useMissionsConnection } from "./useMissionsConnection";
 
@@ -62,10 +65,15 @@ export function BoardLead(props: {
   const { overview, inbox, nowMs } = props;
   const missionId = overview.mission.id;
   const events = useMissionTimeline(missionId);
+  const timelineFeed = useMissionTimelineFeed(missionId);
+  const timelineFailed = events === undefined && timelineFeed.failure !== undefined;
   const rooms = useMissionRooms(missionId);
   const review = useMissionReviewPolicy(missionId);
   const connection = useMissionsConnection();
-  const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox) : undefined), [inbox]);
+  const waiting = useMemo(
+    () => (inbox ? ownerWaitingEntries(inbox, nowMs) : undefined),
+    [inbox, nowMs],
+  );
   const looked = overview.ownerLastLookedAt;
   const facts = useMemo(
     () =>
@@ -106,7 +114,7 @@ export function BoardLead(props: {
   const loading: Record<BoardFigure["key"], boolean> = {
     requests: props.requests === undefined,
     lanes: false,
-    since: events === undefined,
+    since: events === undefined && !timelineFailed,
     reviews: review === undefined,
   };
   // A mission without a review policy has no reviews to count.
@@ -129,7 +137,7 @@ export function BoardLead(props: {
           ))}
         </p>
       </div>
-      <DayPanel line={line} lookedAt={looked} />
+      <DayPanel line={line} lookedAt={looked} feed={timelineFeed} nowMs={nowMs} />
       {props.showFigures
         ? shown.map((figure) => (
             <FigurePanel
@@ -137,6 +145,7 @@ export function BoardLead(props: {
               missionId={missionId}
               figure={figure}
               loading={loading[figure.key]}
+              failed={figure.key === "since" && timelineFailed}
               wide={shown.length === 3}
               stale={connection.lastUpdateAt}
             />
@@ -149,7 +158,12 @@ export function BoardLead(props: {
 // ---------------------------------------------------------------------------
 // Day line: one strip per room, 5-minute columns since local midnight
 
-function DayPanel(props: { line: DayLine | undefined; lookedAt: string | null }) {
+function DayPanel(props: {
+  line: DayLine | undefined;
+  lookedAt: string | null;
+  feed: FeedState;
+  nowMs: number;
+}) {
   const { line } = props;
   return (
     <section
@@ -162,8 +176,11 @@ function DayPanel(props: { line: DayLine | undefined; lookedAt: string | null })
         </h2>
         <span className="text-sm text-(--m-muted) tabular-nums">since {dayHourLabel(0)}</span>
       </div>
+      <FeedError what="today's messages" feed={props.feed} nowMs={props.nowMs} />
       {line === undefined ? (
-        <LoadingRows />
+        props.feed.failure ? null : (
+          <LoadingRows />
+        )
       ) : line.rows.length === 0 ? (
         <p className="pt-3.5 pb-1 text-sm">No messages yet today.</p>
       ) : (
@@ -299,6 +316,8 @@ function FigurePanel(props: {
   missionId: MissionId;
   figure: BoardFigure;
   loading: boolean;
+  /** Its read failed; the panel that owns the read shows Retry. */
+  failed?: boolean;
   wide: boolean;
   /** When the data last updated, while the connection is down. */
   stale: number | null;
@@ -312,7 +331,9 @@ function FigurePanel(props: {
   const body = (
     <>
       <span className="text-sm text-(--m-muted)">{figure.label}</span>
-      {props.loading ? (
+      {props.failed ? (
+        <span className="mt-2 text-sm font-medium text-(--m-negative) sm:mt-3">Couldn't load</span>
+      ) : props.loading ? (
         <>
           <span aria-hidden className="mt-3.5 h-6.5 w-3/5 rounded-lg bg-(--m-active)" />
           <span aria-hidden className="mt-2 h-2.5 w-4/5 rounded-md bg-(--m-active)" />

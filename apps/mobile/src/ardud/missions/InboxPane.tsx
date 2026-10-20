@@ -1,5 +1,5 @@
 import type { MissionId, MissionListSnapshot } from "@t3tools/contracts";
-import type { InboxEntry } from "@t3tools/client-runtime/ardud/missions";
+import { markOf, type InboxEntry } from "@t3tools/client-runtime/ardud/missions";
 import {
   decidedRows,
   filteredEntries,
@@ -7,13 +7,20 @@ import {
   inboxRow,
   INBOX_EMPTY_LABEL,
   resolveInboxFilter,
+  snoozedFor,
   type InboxFilter,
 } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { Fragment, useState } from "react";
 import { ScrollView, View } from "react-native";
 
+import { FeedError } from "./FeedError";
 import { ItemReader } from "./ItemReader";
-import { useMissionInbox, useMissionInboxHistory, useOwnerRequests } from "./missionsStore";
+import {
+  useMissionInbox,
+  useMissionInboxFeed,
+  useMissionInboxHistory,
+  useOwnerRequests,
+} from "./missionsStore";
 import {
   ChoiceRow,
   ConditionQuote,
@@ -29,8 +36,9 @@ import {
 import { InboxRowLine } from "./rows";
 
 /**
- * The inbox: kind chips, what waits on the owner oldest first, and what was
- * decided today, folded. On a wide screen the open item reads beside the list.
+ * The inbox: kind chips, what waits on the owner oldest first, what the
+ * owner snoozed and what was decided today, both folded. On a wide screen the
+ * open item reads beside the list.
  */
 export function InboxPane(props: {
   readonly missionId: MissionId | null;
@@ -43,14 +51,39 @@ export function InboxPane(props: {
   readonly bottomInset: number;
 }) {
   const inbox = useMissionInbox(props.missionId);
+  const feed = useMissionInboxFeed(props.missionId);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  if (!inbox) return <EmptyLine label="Loading" />;
+  const [snoozedOpen, setSnoozedOpen] = useState(false);
+  if (!inbox) {
+    return feed.failure ? (
+      <FeedError what="the inbox" feed={feed} nowMs={props.nowMs} />
+    ) : (
+      <EmptyLine label="Loading" />
+    );
+  }
 
-  const filter = resolveInboxFilter(props.filter, inbox);
-  const entries = filteredEntries(inbox, filter);
+  const filter = resolveInboxFilter(props.filter, inbox, props.nowMs);
+  const entries = filteredEntries(inbox, filter, props.nowMs);
+  const snoozed = snoozedFor(inbox, filter, props.nowMs);
   const selected = props.wide
-    ? (entries.find((entry) => entry.key === selectedKey) ?? entries[0] ?? null)
+    ? ([...entries, ...snoozed].find((entry) => entry.key === selectedKey) ?? entries[0] ?? null)
     : null;
+  const rows = (items: ReadonlyArray<InboxEntry>) => (
+    <Group>
+      {items.map((entry, index) => (
+        <Fragment key={entry.key}>
+          {index > 0 ? <Separator /> : null}
+          <EntryRow
+            entry={entry}
+            list={props.list}
+            nowMs={props.nowMs}
+            selected={selected?.key === entry.key}
+            onOpen={() => (props.wide ? setSelectedKey(entry.key) : props.onOpen(entry))}
+          />
+        </Fragment>
+      ))}
+    </Group>
+  );
 
   const list = (
     <ScrollView
@@ -58,9 +91,10 @@ export function InboxPane(props: {
       contentContainerClassName="gap-3 px-4 pb-8 pt-3"
       keyboardShouldPersistTaps="handled"
     >
+      <FeedError what="the inbox" feed={feed} nowMs={props.nowMs} />
       <ChoiceRow
         accessibilityLabel="Inbox"
-        options={inboxChips(inbox)}
+        options={inboxChips(inbox, props.nowMs)}
         selected={filter}
         onSelect={props.onFilter}
       />
@@ -68,21 +102,22 @@ export function InboxPane(props: {
       {entries.length === 0 ? (
         <EmptyLine label={filter === "all" ? "Nothing waits on you." : INBOX_EMPTY_LABEL[filter]} />
       ) : (
-        <Group>
-          {entries.map((entry, index) => (
-            <Fragment key={entry.key}>
-              {index > 0 ? <Separator /> : null}
-              <EntryRow
-                entry={entry}
-                list={props.list}
-                nowMs={props.nowMs}
-                selected={selected?.key === entry.key}
-                onOpen={() => (props.wide ? setSelectedKey(entry.key) : props.onOpen(entry))}
-              />
-            </Fragment>
-          ))}
-        </Group>
+        rows(entries)
       )}
+      {snoozed.length > 0 ? (
+        <View className="gap-2 pt-3">
+          <SectionHead
+            title={`Snoozed ${snoozed.length}`}
+            trailing={
+              <LinkButton
+                label={snoozedOpen ? "Hide" : "Show"}
+                onPress={() => setSnoozedOpen(!snoozedOpen)}
+              />
+            }
+          />
+          {snoozedOpen ? rows(snoozed) : null}
+        </View>
+      ) : null}
       <DecidedToday missionId={props.missionId} nowMs={props.nowMs} />
     </ScrollView>
   );
@@ -99,6 +134,7 @@ export function InboxPane(props: {
             missionId={selected.record.missionId ?? props.missionId}
             nowMs={props.nowMs}
             bottomInset={props.bottomInset}
+            mark={markOf(inbox, selected.key)}
           />
         ) : (
           <EmptyLine label="Nothing open." />
@@ -116,10 +152,18 @@ export function EntryRow(props: {
   readonly nowMs: number;
   readonly selected: boolean;
   readonly onOpen: () => void;
+  /** A kind tag for the board's day one ("Approve the plan"). */
+  readonly tag?: string; // ardud missions: finish-a
 }) {
   const requests = useOwnerRequests(props.entry.record.missionId ?? null);
   const row = inboxRow(props.entry, props.list, props.nowMs, requests ?? []);
-  return <InboxRowLine row={row} selected={props.selected} onOpen={props.onOpen} />;
+  return (
+    <InboxRowLine
+      row={props.tag ? { ...row, tag: props.tag } : row}
+      selected={props.selected}
+      onOpen={props.onOpen}
+    />
+  );
 }
 
 function DecidedToday(props: { readonly missionId: MissionId | null; readonly nowMs: number }) {

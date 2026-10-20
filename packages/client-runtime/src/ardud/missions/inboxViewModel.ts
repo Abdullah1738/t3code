@@ -1,3 +1,4 @@
+// @effect-diagnostics globalDate:off - Snoozes end on the reader's clock and local calendar.
 // Pure helpers for the owner inbox (Decide / Approve / Knocks / Suggestions /
 // FYI). Shared by web and mobile; no React, no I/O.
 //
@@ -17,6 +18,9 @@ import type {
   DraftChannel,
   DraftNote,
   DraftNoteScope,
+  InboxComment,
+  InboxItemRef,
+  InboxMark,
   InboxTab,
   Knock,
   MissionId,
@@ -33,7 +37,7 @@ import type {
 import { routedTo, suggestionsFor, type InboxRouteFilter } from "./routingViewModel.ts";
 import type { AddDraftNoteInput, MissionInboxSnapshot } from "./source.ts";
 import { diffStats, diffWords, type DiffSegment, type DiffStats } from "./textDiff.ts";
-import { refLabel } from "./viewModel.ts";
+import { formatDayLabel, formatTimeOfDay, refLabel } from "./viewModel.ts";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -73,10 +77,23 @@ export function isInboxTab(value: unknown): value is InboxTab {
  * and Suggestions; asks, knocks and FYI are always the owner's.
  */
 export function inboxTabCounts(
-  inbox: Pick<MissionInboxSnapshot, "counts" | "masterCounts">,
+  inbox: Pick<MissionInboxSnapshot, "counts" | "masterCounts"> &
+    Partial<Pick<MissionInboxSnapshot, "marks">>,
   route: InboxRouteFilter = "owner",
+  nowMs: number = Date.now(),
 ): Record<InboxTab, number> {
-  if (route === "owner") return inbox.counts;
+  if (route === "owner") {
+    const snoozed = snoozedTabCounts(inbox.marks, nowMs);
+    if (snoozed === null) return inbox.counts;
+    const less = (tab: InboxTab) => Math.max(0, inbox.counts[tab] - snoozed[tab]);
+    return {
+      decide: less("decide"),
+      approve: less("approve"),
+      knocks: less("knocks"),
+      suggestions: less("suggestions"),
+      fyi: less("fyi"),
+    };
+  }
   return {
     decide: 0,
     approve: inbox.masterCounts.approve,
@@ -110,12 +127,25 @@ export type InboxEntry =
  * The items one tab lists, in display order. Approve mixes drafts and crw
  * approvals newest first; FYI keeps the source's ranking. `route` picks the
  * owner's inbox (default) or what is routed to the master; the owner can
- * read and decide both.
+ * read and decide both. The owner's inbox leaves out what the owner snoozed
+ * (`snoozedEntries` lists those); the master's never does.
  */
 export function inboxEntries(
   inbox: MissionInboxSnapshot,
   tab: InboxTab,
   route: InboxRouteFilter = "owner",
+  nowMs: number = Date.now(),
+): InboxEntry[] {
+  const all = tabEntries(inbox, tab, route);
+  if (route !== "owner") return all;
+  const snoozed = snoozedKeys(inbox.marks, nowMs);
+  return snoozed.size === 0 ? all : all.filter((entry) => !snoozed.has(entry.key));
+}
+
+function tabEntries(
+  inbox: MissionInboxSnapshot,
+  tab: InboxTab,
+  route: InboxRouteFilter,
 ): InboxEntry[] {
   const owners = route === "owner";
   switch (tab) {
@@ -151,6 +181,158 @@ export function inboxEntries(
         ? inbox.fyi.map((record) => ({ kind: "note", key: `note:${record.id}`, record }))
         : [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// Comments and snoozes
+
+const TAB_OF_KIND: Record<InboxItemRef["kind"], InboxTab> = {
+  ask: "decide",
+  draft: "approve",
+  approval: "approve",
+  knock: "knocks",
+  suggestion: "suggestions",
+  note: "fyi",
+};
+
+/** The owner's comments and snooze on one entry (`InboxEntry.key` is the mark id). */
+export function markOf(
+  inbox: Pick<MissionInboxSnapshot, "marks"> | undefined,
+  key: string,
+): InboxMark | undefined {
+  return inbox?.marks?.find((mark) => mark.id === key);
+}
+
+export function commentsOf(
+  inbox: Pick<MissionInboxSnapshot, "marks"> | undefined,
+  key: string,
+): ReadonlyArray<InboxComment> {
+  return markOf(inbox, key)?.comments ?? [];
+}
+
+/**
+ * Whether the owner's snooze still hides the item. The server already drops a
+ * snooze the item outgrew; the time is checked here against the device clock
+ * so an item comes back the moment its time passes.
+ */
+export function isSnoozed(mark: InboxMark | undefined, nowMs: number): boolean {
+  const snooze = mark?.snooze;
+  if (!snooze) return false;
+  return snooze.until === null || Date.parse(snooze.until) > nowMs;
+}
+
+function snoozedKeys(marks: ReadonlyArray<InboxMark> | undefined, nowMs: number): Set<string> {
+  const keys = new Set<string>();
+  for (const mark of marks ?? []) if (isSnoozed(mark, nowMs)) keys.add(mark.id);
+  return keys;
+}
+
+function snoozedTabCounts(
+  marks: ReadonlyArray<InboxMark> | undefined,
+  nowMs: number,
+): Record<InboxTab, number> | null {
+  let counts: Record<InboxTab, number> | null = null;
+  for (const mark of marks ?? []) {
+    if (!isSnoozed(mark, nowMs)) continue;
+    counts ??= { decide: 0, approve: 0, knocks: 0, suggestions: 0, fyi: 0 };
+    counts[TAB_OF_KIND[mark.subject.kind]] += 1;
+  }
+  return counts;
+}
+
+/**
+ * What the owner snoozed out of their inbox (or out of `tabs`), soonest back
+ * first, open-ended snoozes last. Only items still waiting are listed; a
+ * decided item drops out.
+ */
+export function snoozedEntries(
+  inbox: MissionInboxSnapshot,
+  nowMs: number,
+  tabs: ReadonlyArray<InboxTab> = INBOX_TABS,
+): InboxEntry[] {
+  const snoozed = snoozedKeys(inbox.marks, nowMs);
+  if (snoozed.size === 0) return [];
+  const backAt = (entry: InboxEntry) => {
+    const until = markOf(inbox, entry.key)?.snooze?.until;
+    return until ? Date.parse(until) : Number.POSITIVE_INFINITY;
+  };
+  return tabs
+    .flatMap((tab) => tabEntries(inbox, tab, "owner"))
+    .filter((entry) => snoozed.has(entry.key))
+    .sort((left, right) => backAt(left) - backAt(right));
+}
+
+export function inboxItemRef(entry: Pick<InboxEntry, "kind" | "record">): InboxItemRef {
+  return { kind: entry.kind, id: entry.record.id };
+}
+
+/** "Until it changes", "Until 15:00" today, "Until Tue 20 Oct 09:00" later; device zone. */
+export function snoozeLabel(mark: InboxMark | undefined, nowMs: number): string | null {
+  const snooze = mark?.snooze;
+  if (!snooze || !isSnoozed(mark, nowMs)) return null;
+  if (snooze.until === null) return "Until it changes";
+  const time = formatTimeOfDay(snooze.until);
+  const day = formatDayLabel(snooze.until);
+  return day === formatDayLabel(new Date(nowMs).toISOString())
+    ? `Until ${time}`
+    : `Until ${day} ${time}`;
+}
+
+export interface SnoozeChoice {
+  readonly key: string;
+  readonly label: string;
+  /** The instant it ends; null snoozes until the item changes. */
+  readonly until: string | null;
+}
+
+/**
+ * The snooze picker's choices, worked out in the device's zone and stored as
+ * instants: until it changes, an hour, tomorrow morning, next Monday morning.
+ */
+export function snoozeChoices(nowMs: number): ReadonlyArray<SnoozeChoice> {
+  const morning = (daysAhead: number) => {
+    const day = new Date(nowMs);
+    day.setDate(day.getDate() + daysAhead);
+    day.setHours(9, 0, 0, 0);
+    return day.toISOString();
+  };
+  const weekday = new Date(nowMs).getDay();
+  const toMonday = ((8 - weekday) % 7) + (weekday === 1 ? 7 : 0);
+  return [
+    { key: "change", label: "Until it changes", until: null },
+    { key: "hour", label: "1 hour", until: new Date(nowMs + HOUR_MS).toISOString() },
+    { key: "tomorrow", label: "Tomorrow 09:00", until: morning(1) },
+    { key: "monday", label: "Monday 09:00", until: morning(toMonday) },
+  ];
+}
+
+/**
+ * A device-zone `datetime-local` value ("2026-10-21T09:30") as an instant.
+ * Null when empty, unreadable or not in the future.
+ */
+export function snoozeUntilFromLocal(value: string, nowMs: number): string | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value.trim());
+  if (!match) return null;
+  const [, year, month, day, hour, minute] = match.map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  const at = new Date(year, month - 1, day, hour, minute).getTime();
+  return Number.isFinite(at) && at > nowMs ? new Date(at).toISOString() : null;
+}
+
+export function commentInput(
+  entry: Pick<InboxEntry, "kind" | "record">,
+  text: string,
+): Result<{ readonly subject: InboxItemRef; readonly body: string }> {
+  const body = text.trim();
+  if (body === "") return err("Write a comment first.");
+  if (body.length > 4000) return err("Keep the comment under 4000 characters.");
+  return ok({ subject: inboxItemRef(entry), body });
 }
 
 /** j/k movement. Starts at the first item when nothing is selected; clamps at the ends. */

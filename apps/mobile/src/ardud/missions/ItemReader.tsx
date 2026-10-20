@@ -1,4 +1,13 @@
-import type { Approval, Ask, Draft, Knock, MissionId, Note, Suggestion } from "@t3tools/contracts";
+import type {
+  Approval,
+  Ask,
+  Draft,
+  InboxMark,
+  Knock,
+  MissionId,
+  Note,
+  Suggestion,
+} from "@t3tools/contracts";
 import {
   ageView,
   entryHeadline,
@@ -25,6 +34,7 @@ import {
   useApprovalCard,
   useAskCard,
   useDraftCard,
+  useItemMarks,
   useKnockCard,
   useMoveRecord,
   useNoteCard,
@@ -32,6 +42,7 @@ import {
   type AskCardState,
   type MoveState,
 } from "./inboxLogic";
+import { CommentsBlock, SnoozeControl } from "./ItemMarks";
 import {
   ActionBar,
   ActionButton,
@@ -54,6 +65,8 @@ interface FrameProps {
   readonly missionId: MissionId | null;
   readonly nowMs: number;
   readonly bottomInset: number;
+  /** The owner's comments and snooze on the item. */
+  readonly mark: InboxMark | undefined; // ardud missions: finish-a
 }
 
 export function ItemReader(props: FrameProps) {
@@ -84,6 +97,7 @@ function Frame(
 ) {
   const headline = entryHeadline(props.entry);
   const age = ageView(headline.since, props.nowMs)?.label ?? null;
+  const marks = useItemMarks(props.entry, props.mark, props.nowMs);
   return (
     <View className="flex-1">
       <ScrollView
@@ -94,12 +108,14 @@ function Frame(
         <View className="flex-row items-center gap-2">
           <Chip label={props.kicker ?? headline.kicker} />
           {age ? <Meta>{age}</Meta> : null}
+          <SnoozeControl marks={marks} />
         </View>
         <Text selectable className="text-2xl leading-8 text-foreground">
           {headline.title}
         </Text>
         {props.condition ? <ConditionQuote quote={props.condition} /> : null}
         {props.children}
+        <CommentsBlock marks={marks} nowMs={props.nowMs} />
         <View className="h-px bg-border" />
         <DiscussionPanel
           missionId={props.missionId}

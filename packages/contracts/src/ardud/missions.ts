@@ -209,6 +209,9 @@ export const MissionRecordKind = Schema.Literals([
   // --- core additions ---
   "portfolio",
   // --- end core additions ---
+  // --- finish-a additions ---
+  "inbox-mark",
+  // --- end finish-a additions ---
 ]);
 export type MissionRecordKind = typeof MissionRecordKind.Type;
 
@@ -1820,6 +1823,11 @@ export const MissionEventKind = Schema.Literals([
   "approval.annotated",
   "draft.send-failed",
   // --- end asks additions ---
+  // --- finish-a additions ---
+  "inbox.commented",
+  "inbox.snoozed",
+  "inbox.unsnoozed",
+  // --- end finish-a additions ---
   // --- recovery additions ---
   "recovery.incident-opened",
   "recovery.notice-sent",
@@ -2259,6 +2267,77 @@ export const MissionPortfolio = Schema.Struct({
 export type MissionPortfolio = typeof MissionPortfolio.Type;
 // --- end core additions ---
 
+// --- finish-a additions ---
+/** Inbox items the owner can comment on and snooze. */
+export const InboxItemKind = Schema.Literals([
+  "ask",
+  "draft",
+  "approval",
+  "knock",
+  "suggestion",
+  "note",
+]);
+export type InboxItemKind = typeof InboxItemKind.Type;
+
+export const InboxItemRef = Schema.Struct({
+  kind: InboxItemKind,
+  id: TrimmedNonEmptyString,
+});
+export type InboxItemRef = typeof InboxItemRef.Type;
+
+export const InboxComment = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(4000)),
+  at: IsoDateTime,
+});
+export type InboxComment = typeof InboxComment.Type;
+
+export const InboxSnooze = Schema.Struct({
+  at: IsoDateTime,
+  /** Null: until the item changes. */
+  until: Schema.NullOr(IsoDateTime),
+  /** The item as it stood when snoozed; any change brings it back. */
+  stamp: TrimmedNonEmptyString,
+});
+export type InboxSnooze = typeof InboxSnooze.Type;
+
+/**
+ * The owner's comments and snooze on one inbox item, kept beside the item so
+ * no other writer races it. Id is `${kind}:${id}`. Reads drop a snooze the
+ * item outgrew, so `snooze` here is the one still holding.
+ */
+export const InboxMark = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  missionId: Schema.NullOr(MissionId),
+  subject: InboxItemRef,
+  comments: Schema.Array(InboxComment),
+  snooze: Schema.NullOr(InboxSnooze),
+  updatedAt: IsoDateTime,
+});
+export type InboxMark = typeof InboxMark.Type;
+
+export const CommentInboxItemInput = Schema.Struct({
+  subject: InboxItemRef,
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(4000)),
+});
+export type CommentInboxItemInput = typeof CommentInboxItemInput.Type;
+
+export const SnoozeInboxItemInput = Schema.Struct({
+  subject: InboxItemRef,
+  until: Schema.NullOr(IsoDateTime),
+});
+export type SnoozeInboxItemInput = typeof SnoozeInboxItemInput.Type;
+
+export const UnsnoozeInboxItemInput = Schema.Struct({ subject: InboxItemRef });
+export type UnsnoozeInboxItemInput = typeof UnsnoozeInboxItemInput.Type;
+
+/** Marks in scope with a comment or a snooze still holding. */
+export const MissionInboxMarks = Schema.Struct({
+  marks: Schema.Array(InboxMark),
+});
+export type MissionInboxMarks = typeof MissionInboxMarks.Type;
+// --- end finish-a additions ---
+
 /** Changes pushed after a snapshot. Clients apply them in `seq` order. */
 export const MissionRecord = Schema.Union([
   Schema.TaggedStruct("mission", { record: Mission }),
@@ -2291,6 +2370,9 @@ export const MissionRecord = Schema.Union([
   // --- core additions ---
   Schema.TaggedStruct("portfolio", { record: MissionPortfolio }),
   // --- end core additions ---
+  // --- finish-a additions ---
+  Schema.TaggedStruct("inbox-mark", { record: InboxMark }),
+  // --- end finish-a additions ---
   Schema.TaggedStruct("event", { record: MissionEvent }),
 ]);
 export type MissionRecord = typeof MissionRecord.Type;
