@@ -47,6 +47,9 @@ import type {
   Room,
   RoomId,
   RoomPage,
+  // ardud missions: fix-p3
+  MissionRoomActivity,
+  MissionRoomActivityInput,
   Rule,
   RuleChangeRequest,
   RuleId,
@@ -648,6 +651,14 @@ export interface MissionsSource {
     onError?: Listener<unknown>,
     // --- end finish-b ---
   ): Unsubscribe;
+  // --- fix-p3 ---
+  /** Today's room messages in bins and a tally since a time, kept current. */
+  subscribeRoomActivity(
+    input: MissionRoomActivityInput,
+    listener: Listener<MissionRoomActivity>,
+    onError?: Listener<unknown>,
+  ): Unsubscribe;
+  // --- end fix-p3 ---
   /**
    * The newest page of a room, kept current as messages arrive. It reaches
    * back to just before the owner's first unread message (within a cap) so the

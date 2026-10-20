@@ -3,6 +3,7 @@ import {
   WS_METHODS,
   type MessageBodyInput,
   type MissionProvenance,
+  type MissionRoomActivityInput,
   type MissionRoomsInput,
   type OwnerRequestsInput,
   type RoomPageInput,
@@ -64,5 +65,8 @@ export const makeRouterWsHandlers = (
     [WS_METHODS.missionsReplyOwnerRequest]: asOwner(router.replyRequest),
     [WS_METHODS.missionsSettleOwnerRequest]: asOwner(router.settleRequest),
     [WS_METHODS.missionsReopenOwnerRequest]: asOwner(router.reopenRequest),
+    // --- fix-p3 ---
+    [WS_METHODS.missionsRoomActivity]: (input: MissionRoomActivityInput) =>
+      router.roomActivity(input, reader),
   } as const;
 };

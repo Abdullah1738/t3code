@@ -2,18 +2,21 @@
 import type {
   Lane,
   LaneCounts,
-  MissionMessageKind,
+  MissionRoomActivity,
+  PoolView,
   ReviewRecord,
-  RoleId,
+  RoomActivityRow,
 } from "@t3tools/contracts";
 
 import type { InboxEntry } from "./inboxViewModel.ts";
 import { isRequestUnread } from "./requestsViewModel.ts";
-import type { MissionTimelineEvent, OwnerRequest } from "./source.ts";
+import type { OwnerRequest } from "./source.ts";
 import { ageView, formatDayLabel, formatTimeOfDay, laneTotal } from "./viewModel.ts";
 
 // The board's lead: greeting, facts, figures and the day line. Every time is
-// the reading device's own zone; "today" starts at its local midnight.
+// the reading device's own zone; "today" starts at its local midnight. Message
+// counts come from the router's room activity read, which covers imported
+// rooms too (their messages have no timeline events).
 
 const MINUTE_MS = 60_000;
 
@@ -30,12 +33,22 @@ function countWords(count: number, one: string, many: string): string {
   return `${COUNT_WORDS[count] ?? String(count)} ${count === 1 ? one : many}`;
 }
 
-/** "Morning. Crpko has three holds waiting on you." */
-export function boardGreeting(title: string, waiting: number, nowMs: number): string {
+/**
+ * "Morning, Abdullah. Crpko has three holds waiting on you." The owner's first
+ * name when the server knows it; just "Morning." otherwise.
+ */
+export function boardGreeting(
+  title: string,
+  waiting: number,
+  nowMs: number,
+  ownerName: string | null = null,
+): string {
   const hour = new Date(nowMs).getHours();
   const word = hour < 12 ? "Morning" : hour < 18 ? "Afternoon" : "Evening";
-  if (waiting === 0) return `${word}. Nothing in ${title} waits on you.`;
-  return `${word}. ${title} has ${countWords(waiting, "hold", "holds")} waiting on you.`;
+  const firstName = ownerName?.trim().split(/\s+/)[0] ?? "";
+  const hello = firstName === "" ? `${word}.` : `${word}, ${firstName}.`;
+  if (waiting === 0) return `${hello} Nothing in ${title} waits on you.`;
+  return `${hello} ${title} has ${countWords(waiting, "hold", "holds")} waiting on you.`;
 }
 
 /** One fact on the greeting line; `strong` is set in ink. */
@@ -46,37 +59,18 @@ export interface BoardFact {
   readonly after: string;
 }
 
-/** A room message's kind, read from a `message.posted` event; null for anything else. */
-export function messageKindOf(event: MissionTimelineEvent): MissionMessageKind | null {
-  if (event.kind !== "message.posted") return null;
-  const match = /^(request|decision|status|evidence|blocker|control) in /.exec(event.summary);
-  return match ? (match[1] as MissionMessageKind) : null;
-}
-
-function roomIdOf(event: MissionTimelineEvent): string | null {
-  const payload = event.payload as { readonly roomId?: unknown } | null;
-  return typeof payload?.roomId === "string" ? payload.roomId : null;
-}
-
-function isMaster(event: MissionTimelineEvent, masterRoleId: RoleId | null): boolean {
-  return (
-    masterRoleId !== null && event.actor._tag === "role" && event.actor.roleId === masterRoleId
-  );
-}
-
-/** Who held up work since the owner looked: distinct authors of blocker messages. */
-function blockerAuthorsSince(events: ReadonlyArray<MissionTimelineEvent>, sinceMs: number) {
-  const authors = new Set<string>();
-  for (const event of events) {
-    if (Date.parse(event.at) < sinceMs || messageKindOf(event) !== "blocker") continue;
-    authors.add(JSON.stringify(event.actor));
-  }
-  return authors.size;
+/** The room activity read for the board: today from local midnight, tallies since the look. */
+export function boardActivityInput(ownerLastLookedAt: string | null, nowMs: number) {
+  return {
+    dayStart: new Date(startOfLocalDay(nowMs)).toISOString(),
+    since: ownerLastLookedAt,
+  };
 }
 
 export interface BoardFactsInput {
   readonly waiting: ReadonlyArray<InboxEntry>;
-  readonly events: ReadonlyArray<MissionTimelineEvent>;
+  /** Room tallies since the owner last looked; undefined while they load. */
+  readonly activity: MissionRoomActivity | undefined;
   readonly ownerLastLookedAt: string | null;
   readonly nowMs: number;
 }
@@ -96,8 +90,8 @@ export function boardFacts(input: BoardFactsInput): BoardFact[] {
   if (age && age.tier !== "minutes") {
     facts.push({ key: "oldest", before: "The oldest has waited ", strong: age.label, after: "" });
   }
-  if (input.ownerLastLookedAt !== null) {
-    const authors = blockerAuthorsSince(input.events, Date.parse(input.ownerLastLookedAt));
+  if (input.ownerLastLookedAt !== null && input.activity !== undefined) {
+    const authors = input.activity.since.blockerAuthors;
     if (authors > 0) {
       facts.push({
         key: "blockers",
@@ -125,16 +119,23 @@ export interface BoardFiguresInput {
   /** Your requests only (no discussions). */
   readonly requests: ReadonlyArray<OwnerRequest>;
   readonly lanes: LaneCounts;
-  readonly events: ReadonlyArray<MissionTimelineEvent>;
+  /** Room tallies since the owner last looked; undefined while they load. */
+  readonly activity: MissionRoomActivity | undefined;
   readonly reviews: ReadonlyArray<ReviewRecord>;
-  readonly masterRoleId: RoleId | null;
+  /** The mission's pools; a review budget there gives the day's cap. */
+  readonly pools: ReadonlyArray<PoolView> | undefined;
   readonly ownerLastLookedAt: string | null;
   readonly nowMs: number;
 }
 
-/** When "since you last looked" starts: the look itself, or local midnight before the first look. */
-function sinceStart(ownerLastLookedAt: string | null, nowMs: number): number {
-  return ownerLastLookedAt === null ? startOfLocalDay(nowMs) : Date.parse(ownerLastLookedAt);
+/** The daily review budget (a budget pool counted in reviews), when the mission has one. */
+export function reviewBudget(pools: ReadonlyArray<PoolView> | undefined): PoolView | null {
+  return (
+    pools?.find(
+      (view) =>
+        view.pool.kind === "budget" && view.pool.unit === "review" && view.pool.capacity > 0,
+    ) ?? null
+  );
 }
 
 /** "04:20" for a moment today, "Sun 18 Oct" for an earlier day. */
@@ -155,19 +156,16 @@ export function boardFigures(input: BoardFiguresInput): BoardFigure[] {
   const answered = input.requests.filter(isRequestUnread).length;
   const waitingOnMaster = input.requests.filter((request) => request.status === "waiting").length;
 
-  const fromMs = sinceStart(input.ownerLastLookedAt, input.nowMs);
-  let messages = 0;
-  let masterDecisions = 0;
-  for (const event of input.events) {
-    const kind = messageKindOf(event);
-    if (kind === null || Date.parse(event.at) < fromMs) continue;
-    messages += 1;
-    if (kind === "decision" && isMaster(event, input.masterRoleId)) masterDecisions += 1;
-  }
+  const messages = input.activity?.since.messages ?? 0;
+  const masterDecisions = input.activity?.since.masterDecisions ?? 0;
 
   const dayStart = startOfLocalDay(input.nowMs);
   const reviewsToday = input.reviews.filter((review) => Date.parse(review.createdAt) >= dayStart);
   const blockedReviews = reviewsToday.filter((review) => review.verdict === "blocked").length;
+  // The budget counts what the review service sent in its own day; fall back
+  // to today's recorded verdicts when the mission has no review budget.
+  const budget = reviewBudget(input.pools);
+  const reviewsDone = budget === null ? reviewsToday.length : Math.round(budget.inUse);
 
   return [
     {
@@ -200,8 +198,8 @@ export function boardFigures(input: BoardFiguresInput): BoardFigure[] {
     {
       key: "reviews",
       label: "Reviews today",
-      value: String(reviewsToday.length),
-      unit: null,
+      value: String(reviewsDone),
+      unit: budget === null ? null : `of ${Math.round(budget.pool.capacity)}`,
       note: blockedReviews > 0 ? { text: `${blockedReviews} blocked`, alert: true } : null,
     },
   ];
@@ -232,17 +230,26 @@ export interface DayRow {
 export interface DayLine {
   /** Minutes from local midnight to now (at least an hour, so the axis has room). */
   readonly minutes: number;
-  /** Minute the owner last looked, 0 when that was before today, null before the first look. */
-  readonly lookedMinute: number | null;
   readonly rows: ReadonlyArray<DayRow>;
   readonly totals: {
     readonly messages: number;
     readonly masterDecisions: number;
     readonly blockers: number;
   };
-  /** Hour marks for the axis, as minutes from midnight. */
+  /**
+   * Whether the day reads as a strip of 5-minute columns. A handful of
+   * messages makes a strip of lone ticks, so a quiet day shows only each
+   * room's count.
+   */
+  readonly strip: boolean;
+  /** Hour marks for the axis, as minutes from midnight; none crowd the strip's right edge. */
   readonly hours: ReadonlyArray<number>;
 }
+
+/** Messages a day needs before its rooms draw as a strip. */
+export const DAY_STRIP_FROM = 10;
+/** Axis marks stop short of the strip's end, where a centred label would hang off it. */
+const AXIS_LAST_SHARE = 0.88;
 
 /** Column height in px: 5 for one message, up to 24 at eleven or more. */
 export function dayBinHeight(count: number): number {
@@ -254,66 +261,41 @@ export function dayBinHeight(count: number): number {
 }
 
 export interface DayLineInput {
-  readonly events: ReadonlyArray<MissionTimelineEvent>;
+  /** Today's room activity from local midnight, binned by the server. */
+  readonly rows: ReadonlyArray<RoomActivityRow>;
   readonly roomTitles: ReadonlyMap<string, string>;
-  readonly masterRoleId: RoleId | null;
-  readonly ownerLastLookedAt: string | null;
   readonly nowMs: number;
 }
 
 /** Today's room messages, one row per room, busiest first. */
 export function dayLine(input: DayLineInput): DayLine {
-  const startMs = startOfLocalDay(input.nowMs);
-  const minutes = Math.max(60, Math.ceil((input.nowMs - startMs) / MINUTE_MS));
-  const rows = new Map<string, { total: number; bins: Map<number, DayBin> }>();
+  const minutes = Math.max(60, Math.ceil((input.nowMs - startOfLocalDay(input.nowMs)) / MINUTE_MS));
   const totals = { messages: 0, masterDecisions: 0, blockers: 0 };
-
-  for (const event of input.events) {
-    const kind = messageKindOf(event);
-    const roomId = roomIdOf(event);
-    const atMs = Date.parse(event.at);
-    if (kind === null || roomId === null || atMs < startMs || atMs > input.nowMs) continue;
-    const blocker = kind === "blocker";
-    const master = !blocker && kind === "decision" && isMaster(event, input.masterRoleId);
-    totals.messages += 1;
-    if (blocker) totals.blockers += 1;
-    if (master) totals.masterDecisions += 1;
-
-    const row = rows.get(roomId) ?? { total: 0, bins: new Map<number, DayBin>() };
-    rows.set(roomId, row);
-    row.total += 1;
-    const index = Math.floor((atMs - startMs) / (DAY_BIN_MINUTES * MINUTE_MS));
-    const bin = row.bins.get(index) ?? { index, blockers: 0, master: 0, other: 0 };
-    row.bins.set(index, {
-      index,
-      blockers: bin.blockers + (blocker ? 1 : 0),
-      master: bin.master + (master ? 1 : 0),
-      other: bin.other + (blocker || master ? 0 : 1),
-    });
-  }
-
-  let lookedMinute: number | null = null;
-  if (input.ownerLastLookedAt !== null) {
-    const lookedMs = Date.parse(input.ownerLastLookedAt);
-    lookedMinute = lookedMs < startMs ? 0 : Math.min(minutes, (lookedMs - startMs) / MINUTE_MS);
+  for (const row of input.rows) {
+    totals.messages += row.total;
+    for (const bin of row.bins) {
+      totals.blockers += bin.blockers;
+      totals.masterDecisions += bin.master;
+    }
   }
 
   const hours: number[] = [];
-  for (let mark = 0; mark < minutes; mark += 6 * 60) hours.push(mark);
+  for (let mark = 0; mark <= minutes * AXIS_LAST_SHARE; mark += 6 * 60) hours.push(mark);
 
   return {
     minutes,
-    lookedMinute,
     totals,
+    strip: totals.messages >= DAY_STRIP_FROM,
     hours,
-    rows: [...rows]
-      .map(([roomId, row]) => ({
-        roomId,
-        name: input.roomTitles.get(roomId) ?? "Room",
+    rows: input.rows
+      .filter((row) => row.total > 0)
+      .map((row) => ({
+        roomId: row.roomId,
+        name: input.roomTitles.get(row.roomId) ?? "Room",
         total: row.total,
-        bins: [...row.bins.values()].sort((left, right) => left.index - right.index),
+        bins: row.bins,
       }))
-      .sort((left, right) => right.total - left.total || left.name.localeCompare(right.name)),
+      .toSorted((left, right) => right.total - left.total || left.name.localeCompare(right.name)),
   };
 }
 

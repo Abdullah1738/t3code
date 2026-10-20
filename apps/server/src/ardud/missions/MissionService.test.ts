@@ -35,6 +35,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as Sqlite from "../../persistence/Sqlite.ts";
+import { MissionOwnerName } from "./core/ownerName.ts";
 import * as MissionService from "./MissionService.ts";
 import * as MissionStore from "./store/MissionStore.ts";
 
@@ -613,3 +614,19 @@ it.layer(TestLayer)("MissionService", (it) => {
     }),
   );
 });
+
+it.effect(
+  "the overview carries the server account's name for the greeting, null when unknown",
+  () =>
+    Effect.gen(function* () {
+      const named = TestLayer.pipe(
+        Layer.provide(Layer.succeed(MissionOwnerName, { name: "Abdullah Dudhwala" })),
+      );
+      const read = Effect.gen(function* () {
+        const missionId = yield* createMission("m-owner-name");
+        return (yield* (yield* MissionService.MissionService).overview(missionId)).ownerName;
+      });
+      assert.equal(yield* read.pipe(Effect.provide(named)), "Abdullah Dudhwala");
+      assert.isNull(yield* read.pipe(Effect.provide(TestLayer)));
+    }),
+);

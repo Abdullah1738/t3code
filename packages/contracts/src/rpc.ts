@@ -425,6 +425,9 @@ import {
   RoomTuningInput,
   TuneRoomInput,
   UpdateRoomInput,
+  // ardud missions: fix-p3
+  MissionRoomActivity,
+  MissionRoomActivityInput,
   OpenOwnerRequestInput,
   OwnerRequest,
   OwnerRequests,
@@ -660,6 +663,8 @@ export const WS_METHODS = {
   missionsReopenOwnerRequest: "missions.reopenOwnerRequest",
   // ardud missions: finish-b
   missionsUpdateRoom: "missions.updateRoom",
+  // ardud missions: fix-p3
+  missionsRoomActivity: "missions.roomActivity",
   // Slots, policy: missionsSetRoleModel, missionsSetPoolCapacity,
   // missionsUpdateReviewPolicy.
 
@@ -2188,6 +2193,12 @@ const WsMissionsRoomTuningRpc = missionRpc(
 const WsMissionsTuneRoomRpc = missionRpc(WS_METHODS.missionsTuneRoom, TuneRoomInput, RoomTuning);
 // ardud missions: finish-b
 const WsMissionsUpdateRoomRpc = missionRpc(WS_METHODS.missionsUpdateRoom, UpdateRoomInput, Room);
+// ardud missions: fix-p3
+const WsMissionsRoomActivityRpc = missionRpc(
+  WS_METHODS.missionsRoomActivity,
+  MissionRoomActivityInput,
+  MissionRoomActivity,
+);
 const WsMissionsAttentionRpc = missionRpc(
   WS_METHODS.missionsAttention,
   MissionAttentionInput,
@@ -2307,6 +2318,8 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsReplyOwnerRequestRpc,
   WsMissionsSettleOwnerRequestRpc,
   WsMissionsReopenOwnerRequestRpc,
+  // ardud missions: fix-p3
+  WsMissionsRoomActivityRpc,
 ).middleware(RpcScopeAuthorization);
 
 // ardud missions: policy

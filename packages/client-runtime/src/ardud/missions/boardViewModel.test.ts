@@ -1,14 +1,16 @@
 // @effect-diagnostics globalDate:off - Tests build times on the local calendar.
 import type {
-  MissionActor,
-  MissionEventId,
   MissionId,
+  MissionRoomActivity,
+  PoolView,
   ReviewRecord,
-  RoleId,
+  RoomActivityRow,
+  RoomId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  boardActivityInput,
   boardFacts,
   boardFigures,
   boardGreeting,
@@ -16,45 +18,35 @@ import {
   dayBinHeight,
   dayLine,
   laneBars,
-  messageKindOf,
+  reviewBudget,
   startOfLocalDay,
   stuckLanes,
 } from "./boardViewModel.ts";
 import type { InboxEntry } from "./inboxViewModel.ts";
-import type { MissionTimelineEvent, OwnerRequest } from "./source.ts";
+import type { OwnerRequest } from "./source.ts";
 
 // Every time here is local, so the tests hold in any zone the runner uses.
 const local = (hour: number, minute = 0, day = 19) => new Date(2026, 9, day, hour, minute);
 const iso = (hour: number, minute = 0, day = 19) => local(hour, minute, day).toISOString();
 const NOW = local(10).getTime();
 const MISSION = "crpko" as MissionId;
-const MASTER = "role-master" as RoleId;
 
-const master: MissionActor = { _tag: "role", roleId: MASTER };
-const lane = (laneId: string): MissionActor => ({ _tag: "lane", laneId }) as MissionActor;
+const activity = (
+  since: Partial<MissionRoomActivity["since"]>,
+  rows: ReadonlyArray<RoomActivityRow> = [],
+): MissionRoomActivity => ({
+  rows,
+  since: { messages: 0, masterDecisions: 0, blockerAuthors: 0, ...since },
+});
 
-let seq = 0;
-function posted(
-  kind: string,
-  at: string,
-  actor: MissionActor,
-  roomId = "room-delivery",
-): MissionTimelineEvent {
-  seq += 1;
-  return {
-    id: `ev-${seq}` as MissionEventId,
-    missionId: MISSION,
-    seq,
-    kind: "message.posted",
-    actor,
-    provenance: { _tag: "system", component: "missions-router" },
-    summary: `${kind} in Delivery: something`,
-    subject: null,
-    causedBy: null,
-    payload: { roomId, seq, deliveries: 1 },
-    at,
-  } as MissionTimelineEvent;
-}
+const row = (roomId: string, bins: RoomActivityRow["bins"]): RoomActivityRow => ({
+  roomId: roomId as RoomId,
+  total: bins.reduce((sum, bin) => sum + bin.blockers + bin.master + bin.other, 0),
+  bins,
+});
+
+const budgetPool = (capacity: number, inUse: number, unit = "review") =>
+  ({ pool: { kind: "budget", unit, capacity }, inUse }) as unknown as PoolView;
 
 function request(overrides: Partial<OwnerRequest>): OwnerRequest {
   return {
@@ -89,27 +81,37 @@ describe("board lead", () => {
     expect(boardGreeting("Crpko", 0, NOW)).toBe("Morning. Nothing in Crpko waits on you.");
   });
 
-  it("reads message kinds from posted events only", () => {
-    expect(messageKindOf(posted("blocker", iso(9), lane("a")))).toBe("blocker");
-    expect(messageKindOf({ ...posted("decision", iso(9), master), kind: "lane.moved" })).toBeNull();
+  it("greets the owner by first name when the server knows it", () => {
+    expect(boardGreeting("Crpko", 3, NOW, "Abdullah Dudhwala")).toBe(
+      "Morning, Abdullah. Crpko has three holds waiting on you.",
+    );
+    expect(boardGreeting("Crpko", 0, NOW, "  ")).toBe("Morning. Nothing in Crpko waits on you.");
+  });
+
+  it("reads today from local midnight and tallies from the look", () => {
+    expect(boardActivityInput(iso(8, 30), NOW)).toEqual({
+      dayStart: local(0).toISOString(),
+      since: iso(8, 30),
+    });
+    expect(boardActivityInput(null, NOW).since).toBeNull();
   });
 
   it("states the day, the oldest wait and who posted blockers since the look", () => {
     const waiting = [{ record: { createdAt: iso(8, 0, 8) } }] as unknown as InboxEntry[];
-    const events = [
-      posted("blocker", iso(9), lane("a")),
-      posted("blocker", iso(9, 30), lane("a")),
-      posted("blocker", iso(9, 40), lane("b")),
-      posted("blocker", iso(7), lane("c")),
-      posted("status", iso(9, 50), lane("d")),
-    ];
-    const facts = boardFacts({ waiting, events, ownerLastLookedAt: iso(8), nowMs: NOW });
+    const facts = boardFacts({
+      waiting,
+      activity: activity({ messages: 5, blockerAuthors: 2 }),
+      ownerLastLookedAt: iso(8),
+      nowMs: NOW,
+    });
     expect(facts.map((fact) => fact.before + fact.strong + fact.after)).toEqual([
       "Mon 19 Oct",
       "The oldest has waited 11d 2h",
       "2 lanes posted blockers since you looked",
     ]);
-    expect(boardFacts({ waiting: [], events, ownerLastLookedAt: null, nowMs: NOW })).toHaveLength(
+    const before = { waiting: [], ownerLastLookedAt: null, nowMs: NOW };
+    expect(boardFacts({ ...before, activity: activity({ blockerAuthors: 2 }) })).toHaveLength(1);
+    expect(boardFacts({ ...before, ownerLastLookedAt: iso(8), activity: undefined })).toHaveLength(
       1,
     );
   });
@@ -123,18 +125,13 @@ describe("board lead", () => {
         request({ id: "d", status: "settled", unread: true }),
       ],
       lanes: { working: 17, stuck: 6, waiting: 30, idle: 20, parked: 6 },
-      events: [
-        posted("decision", iso(9), master),
-        posted("decision", iso(9, 5), lane("a")),
-        posted("status", iso(9, 10), lane("a")),
-        posted("decision", iso(7), master),
-      ],
+      activity: activity({ messages: 3, masterDecisions: 1 }),
       reviews: [
         review(iso(9), "clear"),
         review(iso(8), "blocked"),
         review(iso(23, 0, 18), "clear"),
       ],
-      masterRoleId: MASTER,
+      pools: [],
       ownerLastLookedAt: iso(8, 30),
       nowMs: NOW,
     });
@@ -170,63 +167,86 @@ describe("board lead", () => {
     ]);
   });
 
-  it("counts from local midnight before the first look, and names an older look by its day", () => {
+  it("labels the since figure by the look: today before the first, its day when older", () => {
     const base = {
       requests: [],
       lanes: { working: 0, stuck: 0, waiting: 0, idle: 0, parked: 0 },
-      events: [posted("status", iso(1), lane("a")), posted("status", iso(23, 0, 18), lane("a"))],
       reviews: [],
-      masterRoleId: MASTER,
+      pools: undefined,
       nowMs: NOW,
     };
-    const today = boardFigures({ ...base, ownerLastLookedAt: null })[2];
+    const today = boardFigures({
+      ...base,
+      activity: activity({ messages: 1 }),
+      ownerLastLookedAt: null,
+    })[2];
     expect([today?.label, today?.value, today?.unit]).toEqual(["Today", "1", "message"]);
-    const older = boardFigures({ ...base, ownerLastLookedAt: iso(22, 0, 18) })[2];
-    expect([older?.label, older?.value]).toEqual(["Since Sun 18 Oct", "2"]);
+    const older = boardFigures({
+      ...base,
+      activity: activity({ messages: 189 }),
+      ownerLastLookedAt: iso(22, 0, 18),
+    })[2];
+    expect([older?.label, older?.value]).toEqual(["Since Sun 18 Oct", "189"]);
+  });
+
+  it("counts reviews against the daily review budget when the mission has one", () => {
+    const base = {
+      requests: [],
+      lanes: { working: 0, stuck: 0, waiting: 0, idle: 0, parked: 0 },
+      activity: undefined,
+      reviews: [review(iso(9), "clear")],
+      ownerLastLookedAt: null,
+      nowMs: NOW,
+    };
+    const capped = boardFigures({ ...base, pools: [budgetPool(8, 3)] })[3];
+    expect([capped?.value, capped?.unit]).toEqual(["3", "of 8"]);
+    const plain = boardFigures({ ...base, pools: [budgetPool(100, 40, "USD")] })[3];
+    expect([plain?.value, plain?.unit]).toEqual(["1", null]);
+    expect(reviewBudget([budgetPool(0, 0)])).toBeNull();
   });
 });
 
 describe("day line", () => {
-  it("bins today's room messages in 5-minute columns and stacks blockers, master decisions, the rest", () => {
+  it("names today's rooms busiest first and totals their blockers and master decisions", () => {
     const titles = new Map([
       ["room-delivery", "delivery"],
       ["room-review", "review"],
     ]);
     const line = dayLine({
-      events: [
-        posted("blocker", iso(9, 1), lane("a")),
-        posted("decision", iso(9, 2), master),
-        posted("status", iso(9, 4), lane("a")),
-        posted("decision", iso(9, 6), lane("b")),
-        posted("status", iso(8), lane("a"), "room-review"),
-        posted("status", iso(23, 0, 18), lane("a")),
-        { ...posted("status", iso(9), lane("a")), kind: "lane.moved" },
+      rows: [
+        row("room-review", [{ index: 96, blockers: 0, master: 0, other: 1 }]),
+        row("room-delivery", [
+          { index: 108, blockers: 1, master: 1, other: 7 },
+          { index: 109, blockers: 0, master: 0, other: 3 },
+        ]),
+        row("room-quiet", []),
       ],
       roomTitles: titles,
-      masterRoleId: MASTER,
-      ownerLastLookedAt: iso(8, 30),
       nowMs: NOW,
     });
     expect(line.minutes).toBe(600);
-    expect(line.lookedMinute).toBe(510);
-    expect(line.hours).toEqual([0, 360]);
-    expect(line.totals).toEqual({ messages: 5, masterDecisions: 1, blockers: 1 });
-    expect(line.rows.map((row) => [row.name, row.total])).toEqual([
-      ["delivery", 4],
+    expect(line.totals).toEqual({ messages: 13, masterDecisions: 1, blockers: 1 });
+    expect(line.strip).toBe(true);
+    expect(line.rows.map((entry) => [entry.name, entry.total])).toEqual([
+      ["delivery", 12],
       ["review", 1],
     ]);
-    expect(line.rows[0]?.bins).toEqual([
-      { index: 108, blockers: 1, master: 1, other: 1 },
-      { index: 109, blockers: 0, master: 0, other: 1 },
-    ]);
+    expect(line.rows[0]?.bins[0]).toEqual({ index: 108, blockers: 1, master: 1, other: 7 });
   });
 
-  it("puts a look from before today at the start of the axis", () => {
-    const input = { events: [], roomTitles: new Map(), masterRoleId: null, nowMs: NOW };
-    const line = dayLine({ ...input, ownerLastLookedAt: iso(22, 0, 18) });
-    expect(line.lookedMinute).toBe(0);
-    expect(line.rows).toEqual([]);
-    expect(dayLine({ ...input, ownerLastLookedAt: null }).lookedMinute).toBeNull();
+  it("drops the strip on a quiet day and keeps hour marks off the strip's end", () => {
+    const quiet = dayLine({
+      rows: [row("room-toy", [{ index: 100, blockers: 0, master: 0, other: 2 }])],
+      roomTitles: new Map([["room-toy", "toy"]]),
+      nowMs: NOW,
+    });
+    expect(quiet.strip).toBe(false);
+    expect(quiet.rows.map((entry) => [entry.name, entry.total])).toEqual([["toy", 2]]);
+    // At 10:00 the 06:00 mark sits at 60%; at 06:20 it would hang off the end.
+    expect(quiet.hours).toEqual([0, 360]);
+    expect(
+      dayLine({ rows: [], roomTitles: new Map(), nowMs: local(6, 20).getTime() }).hours,
+    ).toEqual([0]);
   });
 
   it("grows a column from 5px for one message to 24px at eleven", () => {

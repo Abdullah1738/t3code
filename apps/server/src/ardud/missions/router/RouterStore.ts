@@ -72,6 +72,9 @@ const DDL = [
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_mission_router_messages_by_room
     ON ardud_mission_router_messages (room_id, seq)`,
+  // fix-p3: the board reads a mission's messages by time.
+  `CREATE INDEX IF NOT EXISTS ardud_mission_router_messages_by_time
+    ON ardud_mission_router_messages (mission_id, created_at)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS ardud_mission_router_messages_by_key
     ON ardud_mission_router_messages (mission_id, msg_key) WHERE msg_key IS NOT NULL`,
   `DROP INDEX IF EXISTS ardud_mission_router_messages_by_bare_key`,
@@ -232,6 +235,21 @@ export interface StoredMessage {
   readonly contentHash: string;
 }
 
+// --- fix-p3 ---
+export interface ActivityMessage {
+  readonly roomId: RoomId;
+  readonly kind: MissionMessageKind;
+  readonly author: MissionActor;
+  readonly createdAt: string;
+}
+
+export interface ActivityTally {
+  readonly kind: MissionMessageKind;
+  readonly author: MissionActor;
+  readonly count: number;
+}
+// --- end fix-p3 ---
+
 export interface TuningRow {
   readonly roomId: RoomId;
   readonly missionId: MissionId;
@@ -388,6 +406,18 @@ export class RouterStore extends Context.Service<
       roomId: RoomId,
       sinceIso: string,
     ) => Effect.Effect<ReadonlyArray<MissionMessageKind>>;
+    // --- fix-p3 ---
+    /** Messages of a mission from `fromIso` on, owner request rooms left out. */
+    readonly messagesSince: (
+      missionId: MissionId,
+      fromIso: string,
+    ) => Effect.Effect<ReadonlyArray<ActivityMessage>>;
+    /** The same messages counted per kind and author, for long spans. */
+    readonly messageTallySince: (
+      missionId: MissionId,
+      fromIso: string,
+    ) => Effect.Effect<ReadonlyArray<ActivityTally>>;
+    // --- end fix-p3 ---
     readonly upsertSubscription: (subscription: Subscription, key: string) => Effect.Effect<void>;
     readonly subscriptions: (roomId: RoomId) => Effect.Effect<ReadonlyArray<Subscription>>;
     /** Read positions only move forward. Returns the stored position. */
@@ -958,6 +988,60 @@ const make = Effect.gen(function* () {
           WHERE room_id = ${roomId} AND created_at >= ${sinceIso}
         `.pipe(Effect.map((rows) => rows.map((row) => row.kind))),
       ),
+
+    // --- fix-p3 ---
+    messagesSince: (missionId, fromIso) =>
+      read(
+        sql<{
+          readonly roomId: RoomId;
+          readonly kind: MissionMessageKind;
+          readonly author: string;
+          readonly createdAt: string;
+        }>`
+          SELECT m.room_id AS "roomId", m.kind AS "kind",
+            json_extract(m.message_json, '$.author') AS "author", m.created_at AS "createdAt"
+          FROM ardud_mission_router_messages m
+          JOIN ardud_mission_router_rooms r ON r.id = m.room_id
+          WHERE m.mission_id = ${missionId} AND m.created_at >= ${fromIso}
+            AND r.kind != 'owner-request'
+          ORDER BY m.created_at
+        `.pipe(
+          Effect.map((rows) =>
+            rows.map((row) => ({
+              roomId: row.roomId,
+              kind: row.kind,
+              author: decodeActor(row.author),
+              createdAt: row.createdAt,
+            })),
+          ),
+        ),
+      ),
+
+    messageTallySince: (missionId, fromIso) =>
+      read(
+        sql<{
+          readonly kind: MissionMessageKind;
+          readonly author: string;
+          readonly count: number;
+        }>`
+          SELECT m.kind AS "kind", json_extract(m.message_json, '$.author') AS "author",
+            COUNT(*) AS "count"
+          FROM ardud_mission_router_messages m
+          JOIN ardud_mission_router_rooms r ON r.id = m.room_id
+          WHERE m.mission_id = ${missionId} AND m.created_at >= ${fromIso}
+            AND r.kind != 'owner-request'
+          GROUP BY m.kind, json_extract(m.message_json, '$.author')
+        `.pipe(
+          Effect.map((rows) =>
+            rows.map((row) => ({
+              kind: row.kind,
+              author: decodeActor(row.author),
+              count: Number(row.count),
+            })),
+          ),
+        ),
+      ),
+    // --- end fix-p3 ---
 
     upsertSubscription: (subscription, key) =>
       write(sql`

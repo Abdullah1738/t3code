@@ -4,6 +4,7 @@ import * as AsksService from "./asks/AsksService.ts";
 import { missionsDeskRouteLayer } from "./asks/http.ts";
 import { asksWiringLayer } from "./asks/wiring.ts";
 import * as MasterControls from "./core/MasterControls.ts";
+import { MissionOwnerNameLive } from "./core/ownerName.ts";
 import * as RuleService from "./core/RuleService.ts";
 import { editorWiringLayer } from "./editorWiring.ts";
 import { missionsRouteLayer } from "./http.ts";
@@ -26,7 +27,7 @@ import { ViewsLive } from "./views/layer.ts";
  * read and write through `MissionStore` (see store/MissionStore.ts).
  */
 const MissionTracksLive = Layer.mergeAll(
-  MissionService.layer,
+  MissionService.layer.pipe(Layer.provide(MissionOwnerNameLive)), // ardud missions: fix-p3
   // tracks: add one line per track layer below
   ScribeLive,
   AsksService.layerLive.pipe(Layer.provide(RouterAsksPortsLive)),

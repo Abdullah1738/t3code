@@ -21,6 +21,10 @@ import {
   MissionActor,
   MissionRecordRef,
   type MissionProvenance,
+  // --- fix-p3 ---
+  type MissionRoomActivity,
+  type MissionRoomActivityInput,
+  // --- end fix-p3 ---
   Note,
   type OwnerSurface,
   Room,
@@ -539,6 +543,58 @@ export function createFixtureMissionsSource(
     );
   }
 
+  // --- fix-p3 ---
+  /** The server's room activity read over the fixture's room messages. */
+  function roomActivity(input: MissionRoomActivityInput): MissionRoomActivity {
+    return memo(`activity:${JSON.stringify(input)}`, () => {
+      const start = Date.parse(input.dayStart);
+      const from = Date.parse(input.since ?? input.dayStart);
+      const masterRoleId = findMission(input.missionId)?.masterRoleId ?? null;
+      const byMaster = (author: MissionActor) =>
+        author._tag === "role" && author.roleId === masterRoleId;
+      const rows: Array<MissionRoomActivity["rows"][number]> = [];
+      let messages = 0;
+      let masterDecisions = 0;
+      const blockerAuthors = new Set<string>();
+      for (const room of rooms) {
+        if (room.missionId !== input.missionId || room.kind === "owner-request") continue;
+        const bins = new Map<
+          number,
+          { index: number; blockers: number; master: number; other: number }
+        >();
+        let total = 0;
+        for (const message of messagesByRoom.get(room.id) ?? []) {
+          const at = Date.parse(message.createdAt);
+          if (at >= from) {
+            messages += 1;
+            if (message.kind === "decision" && byMaster(message.author)) masterDecisions += 1;
+            if (message.kind === "blocker") blockerAuthors.add(JSON.stringify(message.author));
+          }
+          if (at < start) continue;
+          total += 1;
+          const index = Math.floor((at - start) / (5 * 60_000));
+          const bin = bins.get(index) ?? { index, blockers: 0, master: 0, other: 0 };
+          if (message.kind === "blocker") bin.blockers += 1;
+          else if (message.kind === "decision" && byMaster(message.author)) bin.master += 1;
+          else bin.other += 1;
+          bins.set(index, bin);
+        }
+        if (total > 0) {
+          rows.push({
+            roomId: room.id,
+            total,
+            bins: [...bins.values()].toSorted((a, b) => a.index - b.index),
+          });
+        }
+      }
+      return {
+        rows: rows.toSorted((a, b) => b.total - a.total || a.roomId.localeCompare(b.roomId)),
+        since: { messages, masterDecisions, blockerAuthors: blockerAuthors.size },
+      };
+    });
+  }
+  // --- end fix-p3 ---
+
   /** Messages strictly older than `beforeSeq`, newest `limit` of them. */
   function pageOf(room: Room, beforeSeq: number, limit: number): RoomPage {
     const all = messagesByRoom.get(room.id) ?? [];
@@ -779,6 +835,8 @@ export function createFixtureMissionsSource(
     subscribeSuggestionStats: (listener) => watch(suggestionStats, listener),
     subscribeRules: (missionId, listener) => watch(() => missionRules(missionId), listener),
     subscribeRooms: (missionId, listener) => watch(() => missionRooms(missionId), listener),
+    // --- fix-p3 ---
+    subscribeRoomActivity: (input, listener) => watch(() => roomActivity(input), listener),
     subscribeRoom: (roomId, listener) => watch(() => roomPage(roomId), listener),
     subscribeRouting: (missionId, listener) => watch(() => routingTable(missionId), listener),
     ...operations.source,

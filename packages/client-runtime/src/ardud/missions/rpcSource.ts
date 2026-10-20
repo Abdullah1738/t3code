@@ -25,6 +25,10 @@ import {
   type MissionRecord,
   type MissionRecordKind,
   type MissionRecordRef,
+  // --- fix-p3 ---
+  type MissionRoomActivity,
+  type MissionRoomActivityInput,
+  // --- end fix-p3 ---
   type MissionViewsSnapshot,
   type OwnerRequest as OwnerRequestRecord,
   type OwnerRequestId,
@@ -805,6 +809,27 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     },
   );
 
+  // --- fix-p3 ---
+  // Keyed by [missionId, dayStart, since]: a new look or a new day is a new read.
+  const roomActivityFeed = sharedFeeds<string, MissionRoomActivity>((key, emit, fail) => {
+    const [missionId, dayStart, since] = JSON.parse(key) as [MissionId, string, string | null];
+    const input = { missionId, dayStart, since } as MissionRoomActivityInput;
+    const feed = requestFeed({
+      missionId,
+      load: () => transport.request(WS_METHODS.missionsRoomActivity, input),
+      refreshOn: (event) => event.kind === "message.posted" || event.kind.startsWith("room."),
+      topics: [],
+      emit,
+      onError: fail,
+    });
+    const stopTouched = bus.on("rooms", () => feed.refresh());
+    return () => {
+      stopTouched();
+      feed.stop();
+    };
+  });
+  // --- end fix-p3 ---
+
   const roomPageFeed = sharedFeeds<RoomId, RoomPage | null>((roomId, emit, fail) => {
     let closed = false;
     let stopEvents: Unsubscribe | null = null;
@@ -1236,6 +1261,13 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     },
 
     subscribeRooms: (missionId, listener, onError) => roomsFeed(missionId, listener, onError),
+    // --- fix-p3 ---
+    subscribeRoomActivity: (input, listener, onError) =>
+      roomActivityFeed(
+        JSON.stringify([input.missionId, input.dayStart, input.since]),
+        listener,
+        onError,
+      ),
     subscribeRoom: (roomId, listener, onError) => roomPageFeed(roomId, listener, onError),
 
     loadRoomPage: (input) =>

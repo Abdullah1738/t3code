@@ -21,6 +21,8 @@ import {
   type MissionMutationResult,
   type MissionProvenance,
   type MissionRecordRef,
+  type MissionRoomActivity,
+  type MissionRoomActivityInput,
   type OpenOwnerRequestInput,
   type OwnerCondition,
   type OwnerRequest,
@@ -67,6 +69,7 @@ import {
   threadsOfActor,
   type RouterCast,
 } from "./cast.ts";
+import { roomActivity } from "./activity.ts";
 import type { SendCheckRequest, SendGuardOutcome, SendGuardRequest } from "./guardHook.ts";
 import { postContentHash, sha256 } from "./hash.ts";
 import {
@@ -390,6 +393,13 @@ export class MissionRouter extends Context.Service<
       input: ReopenOwnerRequestInput,
       provenance: MissionProvenance,
     ) => Effect.Effect<OwnerRequest, MissionError>;
+    // --- fix-p3 ---
+    /** The board's day line and since-tally, counted from room messages. */
+    readonly roomActivity: (
+      input: MissionRoomActivityInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<MissionRoomActivity, MissionError>;
+    // --- end fix-p3 ---
     /** Discuss: the owner's condition is in his request about the record. */
     readonly verifyOwnerCondition: (input: {
       readonly subject: MissionRecordRef;
@@ -1980,6 +1990,26 @@ const make = Effect.gen(function* () {
     replyRequest: requests.reply,
     settleRequest: requests.settle,
     reopenRequest: requests.reopen,
+    // --- fix-p3 ---
+    roomActivity: (input, provenance) =>
+      requireReader(input.missionId, provenance).pipe(
+        Effect.andThen(() =>
+          Effect.all([
+            loadCast(input.missionId),
+            rooms.messagesSince(input.missionId, input.dayStart),
+            rooms.messageTallySince(input.missionId, input.since ?? input.dayStart),
+          ]),
+        ),
+        Effect.map(([cast, day, tally]) =>
+          roomActivity({
+            dayStart: input.dayStart,
+            day,
+            tally,
+            master: { roleId: masterRoleOf(cast)?.id ?? null, threadIds: masterThreadsOf(cast) },
+          }),
+        ),
+      ),
+    // --- end fix-p3 ---
     verifyOwnerCondition: requests.verifyCondition,
     settleRequestsFor: requests.settleFor,
   });

@@ -48,6 +48,7 @@ import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { makeEffort } from "./core/effort.ts";
+import { MissionOwnerName } from "./core/ownerName.ts";
 import type { MissionEditor, MissionRecoveryReader } from "./core/ports.ts";
 import { HEALTH_TTL_MS, makeReads } from "./core/reads.ts";
 import { makePages } from "./core/pages.ts";
@@ -254,11 +255,14 @@ const make = Effect.gen(function* () {
   const effort = yield* makeEffort;
   // ardud missions: recovery
   let recovery: MissionRecoveryReader | null = null;
+  // ardud missions: fix-p3
+  const owner = yield* MissionOwnerName;
   const reads = makeReads(
     store,
     () => editor,
     effort,
     () => recovery,
+    owner.name,
   );
   const writes = yield* makeWrites(store);
 

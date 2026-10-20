@@ -2219,6 +2219,10 @@ export const MissionOverview = Schema.Struct({
   /** Owner requests the master answered that the owner has not opened yet. */
   requestsAnswered: Schema.optional(NonNegativeInt),
   // --- end router additions ---
+  // --- fix-p3 additions ---
+  /** The server account's full name, for the board greeting; null when unknown. */
+  ownerName: Schema.optional(Schema.NullOr(Schema.String)),
+  // --- end fix-p3 additions ---
 });
 export type MissionOverview = typeof MissionOverview.Type;
 
@@ -2648,6 +2652,47 @@ export const UpdateRoomInput = Schema.Struct({
 });
 export type UpdateRoomInput = typeof UpdateRoomInput.Type;
 // --- end finish-b additions ---
+
+// --- fix-p3 additions ---
+/**
+ * Room messages from `dayStart` (the device's midnight) in 5-minute bins, and
+ * a tally from `since` (null for `dayStart`). Counted from the router's room
+ * messages, so imported history counts too. Owner request rooms are left out.
+ */
+export const MissionRoomActivityInput = Schema.Struct({
+  missionId: MissionId,
+  dayStart: IsoDateTime,
+  since: Schema.NullOr(IsoDateTime),
+});
+export type MissionRoomActivityInput = typeof MissionRoomActivityInput.Type;
+
+/** `master` counts decisions by the mission's master role or threads. */
+export const RoomActivityBin = Schema.Struct({
+  index: NonNegativeInt,
+  blockers: NonNegativeInt,
+  master: NonNegativeInt,
+  other: NonNegativeInt,
+});
+export type RoomActivityBin = typeof RoomActivityBin.Type;
+
+export const RoomActivityRow = Schema.Struct({
+  roomId: RoomId,
+  total: NonNegativeInt,
+  bins: Schema.Array(RoomActivityBin),
+});
+export type RoomActivityRow = typeof RoomActivityRow.Type;
+
+export const MissionRoomActivity = Schema.Struct({
+  rows: Schema.Array(RoomActivityRow),
+  since: Schema.Struct({
+    messages: NonNegativeInt,
+    masterDecisions: NonNegativeInt,
+    /** Distinct authors of blocker messages. */
+    blockerAuthors: NonNegativeInt,
+  }),
+});
+export type MissionRoomActivity = typeof MissionRoomActivity.Type;
+// --- end fix-p3 additions ---
 
 /** The deliveries of one mission that were reminded once and are still unread. */
 export const MissionAttentionInput = Schema.Struct({

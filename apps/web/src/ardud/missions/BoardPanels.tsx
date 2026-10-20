@@ -9,6 +9,7 @@ import type {
   RecoveryCause,
 } from "@t3tools/contracts";
 import {
+  boardActivityInput,
   boardFacts,
   boardFigures,
   boardGreeting,
@@ -38,10 +39,11 @@ import { cn } from "../../lib/utils";
 import { PANEL_CLASS } from "./MissionSection";
 import {
   useMissionLanes,
+  useMissionPools,
   useMissionReviewPolicy,
+  useMissionRoomActivity,
+  useMissionRoomActivityFeed,
   useMissionRooms,
-  useMissionTimeline,
-  useMissionTimelineFeed,
   type FeedState,
 } from "./missionsStore";
 import { FeedError } from "./sections/FeedError";
@@ -64,57 +66,55 @@ export function BoardLead(props: {
 }) {
   const { overview, inbox, nowMs } = props;
   const missionId = overview.mission.id;
-  const events = useMissionTimeline(missionId);
-  const timelineFeed = useMissionTimelineFeed(missionId);
-  const timelineFailed = events === undefined && timelineFeed.failure !== undefined;
+  const looked = overview.ownerLastLookedAt;
+  const { dayStart, since } = boardActivityInput(looked, nowMs);
+  const activityInput = useMemo(
+    () => ({ missionId, dayStart, since }),
+    [missionId, dayStart, since],
+  );
+  const activity = useMissionRoomActivity(activityInput);
+  const activityFeed = useMissionRoomActivityFeed(activityInput);
+  const activityFailed = activity === undefined && activityFeed.failure !== undefined;
   const rooms = useMissionRooms(missionId);
   const review = useMissionReviewPolicy(missionId);
+  const pools = useMissionPools(missionId);
   const connection = useMissionsConnection();
   const waiting = useMemo(
     () => (inbox ? ownerWaitingEntries(inbox, nowMs) : undefined),
     [inbox, nowMs],
   );
-  const looked = overview.ownerLastLookedAt;
   const facts = useMemo(
-    () =>
-      boardFacts({
-        waiting: waiting ?? [],
-        events: events ?? [],
-        ownerLastLookedAt: looked,
-        nowMs,
-      }),
-    [waiting, events, looked, nowMs],
+    () => boardFacts({ waiting: waiting ?? [], activity, ownerLastLookedAt: looked, nowMs }),
+    [waiting, activity, looked, nowMs],
   );
   const line = useMemo(
     () =>
-      events
+      activity
         ? dayLine({
-            events,
+            rows: activity.rows,
             roomTitles: new Map((rooms ?? []).map((entry) => [entry.room.id, entry.room.title])),
-            masterRoleId: overview.mission.masterRoleId,
-            ownerLastLookedAt: looked,
             nowMs,
           })
         : undefined,
-    [events, rooms, overview.mission.masterRoleId, looked, nowMs],
+    [activity, rooms, nowMs],
   );
   const figures = useMemo(
     () =>
       boardFigures({
         requests: props.requests ?? [],
         lanes: overview.lanes,
-        events: events ?? [],
+        activity,
         reviews: review?.reviews ?? [],
-        masterRoleId: overview.mission.masterRoleId,
+        pools: pools?.pools,
         ownerLastLookedAt: looked,
         nowMs,
       }),
-    [props.requests, overview.lanes, events, review, overview.mission.masterRoleId, looked, nowMs],
+    [props.requests, overview.lanes, activity, review, pools, looked, nowMs],
   );
   const loading: Record<BoardFigure["key"], boolean> = {
     requests: props.requests === undefined,
     lanes: false,
-    since: events === undefined && !timelineFailed,
+    since: activity === undefined && !activityFailed,
     reviews: review === undefined,
   };
   // A mission without a review policy has no reviews to count.
@@ -125,7 +125,12 @@ export function BoardLead(props: {
         <h1 className="max-w-[24ch] text-2xl leading-tight font-medium tracking-tight text-balance lg:text-3xl">
           {waiting === undefined
             ? overview.mission.title
-            : boardGreeting(overview.mission.title, waiting.length, nowMs)}
+            : boardGreeting(
+                overview.mission.title,
+                waiting.length,
+                nowMs,
+                overview.ownerName ?? null,
+              )}
         </h1>
         <p className="mt-3.5 flex flex-wrap gap-x-5.5 gap-y-1.5 text-sm text-(--m-muted)">
           {facts.map((fact) => (
@@ -137,7 +142,7 @@ export function BoardLead(props: {
           ))}
         </p>
       </div>
-      <DayPanel line={line} lookedAt={looked} feed={timelineFeed} nowMs={nowMs} />
+      <DayPanel line={line} feed={activityFeed} nowMs={nowMs} />
       {props.showFigures
         ? shown.map((figure) => (
             <FigurePanel
@@ -145,7 +150,7 @@ export function BoardLead(props: {
               missionId={missionId}
               figure={figure}
               loading={loading[figure.key]}
-              failed={figure.key === "since" && timelineFailed}
+              failed={figure.key === "since" && activityFailed}
               wide={shown.length === 3}
               stale={connection.lastUpdateAt}
             />
@@ -156,14 +161,10 @@ export function BoardLead(props: {
 }
 
 // ---------------------------------------------------------------------------
-// Day line: one strip per room, 5-minute columns since local midnight
+// Day line: one strip per room, 5-minute columns since local midnight; a quiet
+// day lists each room's count instead.
 
-function DayPanel(props: {
-  line: DayLine | undefined;
-  lookedAt: string | null;
-  feed: FeedState;
-  nowMs: number;
-}) {
+function DayPanel(props: { line: DayLine | undefined; feed: FeedState; nowMs: number }) {
   const { line } = props;
   return (
     <section
@@ -199,43 +200,51 @@ function DayPanel(props: {
               {line.totals.blockers === 1 ? "blocker" : "blockers"}
             </span>
           </p>
-          <ul className="flex flex-col">
-            {line.rows.map((row) => (
-              <li key={row.roomId} className={cn(DAY_ROW_CLASS, "h-7.5")}>
-                <span className="truncate text-sm">{row.name}</span>
-                <span className="text-end text-xs text-(--m-muted) tabular-nums">{row.total}</span>
-                <svg
-                  viewBox={`0 0 ${line.minutes} ${DAY_BIN_MAX_HEIGHT}`}
-                  preserveAspectRatio="none"
-                  role="img"
-                  aria-label={`${row.name}: ${row.total} ${row.total === 1 ? "message" : "messages"} today`}
-                  className="block h-6 w-full"
-                >
-                  {line.lookedMinute !== null ? (
-                    <rect
-                      x={line.lookedMinute}
-                      y={0}
-                      width={line.minutes - line.lookedMinute}
-                      height={DAY_BIN_MAX_HEIGHT}
-                      className="fill-(--m-band)"
-                    />
-                  ) : null}
-                  {row.bins.map((bin) => (
-                    <DayBinRects key={bin.index} bin={bin} />
-                  ))}
-                </svg>
-              </li>
-            ))}
-          </ul>
-          <DayAxis line={line} lookedAt={props.lookedAt} />
+          {line.strip ? (
+            <>
+              <ul className="flex flex-col">
+                {line.rows.map((row) => (
+                  <li key={row.roomId} className={cn(DAY_ROW_CLASS, "h-7.5")}>
+                    <span className="truncate text-sm">{row.name}</span>
+                    <svg
+                      viewBox={`0 0 ${line.minutes} ${DAY_BIN_MAX_HEIGHT}`}
+                      preserveAspectRatio="none"
+                      role="img"
+                      aria-label={`${row.name}: ${messageCount(row.total)} today`}
+                      className="block h-6 w-full"
+                    >
+                      {row.bins.map((bin) => (
+                        <DayBinRects key={bin.index} bin={bin} />
+                      ))}
+                    </svg>
+                  </li>
+                ))}
+              </ul>
+              <DayAxis line={line} />
+            </>
+          ) : (
+            <ul className="flex flex-col">
+              {line.rows.map((row) => (
+                <li key={row.roomId} className="flex h-7.5 min-w-0 items-center gap-3">
+                  <span className="min-w-0 flex-1 truncate text-sm">{row.name}</span>
+                  <span className="text-sm text-(--m-muted) tabular-nums">
+                    {messageCount(row.total)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
     </section>
   );
 }
 
+const messageCount = (count: number) => `${count} ${count === 1 ? "message" : "messages"}`;
+
+/** Room name, then the strip; the axis below uses the same columns so its marks sit under them. */
 const DAY_ROW_CLASS =
-  "grid min-w-0 grid-cols-[58px_28px_minmax(0,1fr)] items-center gap-x-2 sm:grid-cols-[70px_36px_minmax(0,1fr)] sm:gap-x-3";
+  "grid min-w-0 grid-cols-[72px_minmax(0,1fr)] items-center gap-x-2.5 sm:grid-cols-[96px_minmax(0,1fr)] sm:gap-x-3";
 
 /** One 5-minute column stacked from the bottom: blockers, master decisions, the rest. */
 function DayBinRects(props: { bin: DayBin }) {
@@ -267,24 +276,13 @@ function DayBinRects(props: { bin: DayBin }) {
   });
 }
 
-/** Hour marks under the strips, and the time he last looked in accent. */
-function DayAxis(props: { line: DayLine; lookedAt: string | null }) {
+/** Hour marks under the strips: midnight at the strip's start, the rest centred on their column. */
+function DayAxis(props: { line: DayLine }) {
   const { line } = props;
-  const looked =
-    line.lookedMinute !== null && line.lookedMinute > 0 && props.lookedAt
-      ? line.lookedMinute / line.minutes
-      : null;
-  // Marks too close to the looked label or the right edge would overlap it.
-  const hours = line.hours.filter(
-    (minute) =>
-      minute === 0 ||
-      (minute / line.minutes <= 0.9 &&
-        (looked === null || Math.abs(minute / line.minutes - looked) > 0.12)),
-  );
   return (
     <div aria-hidden className={cn(DAY_ROW_CLASS, "mt-1.5")}>
-      <span className="relative col-start-3 h-4.5 text-xs whitespace-nowrap text-(--m-muted) tabular-nums">
-        {hours.map((minute) => (
+      <span className="relative col-start-2 h-4.5 text-xs whitespace-nowrap text-(--m-muted) tabular-nums">
+        {line.hours.map((minute) => (
           <span
             key={minute}
             className={cn("absolute top-0", minute > 0 && "-translate-x-1/2")}
@@ -293,17 +291,6 @@ function DayAxis(props: { line: DayLine; lookedAt: string | null }) {
             {dayHourLabel(minute)}
           </span>
         ))}
-        {looked !== null && props.lookedAt ? (
-          <span
-            className={cn(
-              "absolute top-0 font-medium text-(--m-accent-text)",
-              looked > 0.85 && "-translate-x-full",
-            )}
-            style={{ left: `${looked * 100}%` }}
-          >
-            {formatTimeOfDay(props.lookedAt)}
-          </span>
-        ) : null}
       </span>
     </div>
   );

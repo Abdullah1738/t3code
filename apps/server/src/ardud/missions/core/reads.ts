@@ -95,6 +95,8 @@ export const makeReads = (
   effort: MissionEffort | null = null,
   // ardud missions: recovery
   currentRecovery: () => MissionRecoveryReader | null = () => null,
+  // ardud missions: fix-p3 (the board greets the owner by name)
+  ownerName: string | null = null,
 ) => {
   const healthCache = new Map<string, HealthEntry>();
 
@@ -261,6 +263,8 @@ export const makeReads = (
         recovery: recoveryState,
         // ardud missions: router
         requestsAnswered: answered.get(missionId) ?? 0,
+        // ardud missions: fix-p3
+        ownerName,
       };
     });
 

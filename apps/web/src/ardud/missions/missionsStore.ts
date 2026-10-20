@@ -6,6 +6,8 @@ import type {
   MissionId,
   MissionInboxHistory,
   MissionListSnapshot,
+  MissionRoomActivity,
+  MissionRoomActivityInput,
   RoomId,
   RoomPage,
   Rule,
@@ -193,6 +195,31 @@ export function useRoomPageFeed(roomId: RoomId | null): FeedState {
   return useFeedState(roomStores(roomId ?? NO_ROOM));
 }
 // --- end finish-b ---
+
+// --- fix-p3 --- room messages counted by the router, imported rooms included.
+const roomActivityStores = createKeyedSnapshotStores<string, MissionRoomActivity>(
+  (key, emit, fail) =>
+    missionsSource.subscribeRoomActivity(JSON.parse(key) as MissionRoomActivityInput, emit, fail),
+);
+
+function roomActivityStore(input: MissionRoomActivityInput) {
+  return roomActivityStores(
+    JSON.stringify({ missionId: input.missionId, dayStart: input.dayStart, since: input.since }),
+  );
+}
+
+/** Today's room activity and the tallies since `since`; undefined while it loads. */
+export function useMissionRoomActivity(
+  input: MissionRoomActivityInput,
+): MissionRoomActivity | undefined {
+  const store = roomActivityStore(input);
+  return useSyncExternalStore(store.subscribe, store.get);
+}
+
+export function useMissionRoomActivityFeed(input: MissionRoomActivityInput): FeedState {
+  return useFeedState(roomActivityStore(input));
+}
+// --- end fix-p3 ---
 
 /**
  * Every owner request, discussions included, newest activity first. A record

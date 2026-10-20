@@ -1,6 +1,7 @@
 import {
   KnockId,
   MissionId,
+  MissionMessageId,
   RoleId,
   RoomId,
   SubMissionId,
@@ -10,6 +11,7 @@ import {
   type SubMission,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -35,6 +37,7 @@ import * as MissionStore from "../store/MissionStore.ts";
 import { answerText } from "./answers.ts";
 import type { SendGuardRequest } from "./guardHook.ts";
 import * as MissionRouter from "./MissionRouter.ts";
+import * as RouterStore from "./RouterStore.ts";
 import type { SendSender } from "./model.ts";
 import { fakeRouterThreads, routerOverFakes, type Sent } from "./MissionRouter.testkit.ts";
 
@@ -1317,6 +1320,68 @@ describe("router round 5", () => {
       const after = (yield* router.rooms(missionId, ownerApp)).find((room) => room.id === control);
       assert.strictEqual(after?.messageCount, 62);
       assert.strictEqual(after?.unreadForOwner, 30);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("room activity counts room messages by 5-minute bin and since a time", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const dayStart = DateTime.formatIso(DateTime.makeUnsafe(0));
+      yield* router.post({ ...request("status"), kind: "status" }, agent(laneThread));
+      yield* TestClock.adjust("7 minutes");
+      yield* router.post({ ...request("ship it"), kind: "decision" }, agent(masterThread));
+      yield* router.post({ ...request("CI red"), kind: "blocker" }, agent(laneThread));
+      yield* router.post({ ...request("still red"), kind: "blocker" }, agent(laneThread));
+      const day = yield* router.roomActivity({ missionId, dayStart, since: null }, ownerApp);
+      assert.deepStrictEqual(day.rows, [
+        {
+          roomId: control,
+          total: 4,
+          bins: [
+            { index: 0, blockers: 0, master: 0, other: 1 },
+            { index: 1, blockers: 2, master: 1, other: 0 },
+          ],
+        },
+      ]);
+      assert.deepStrictEqual(day.since, { messages: 4, masterDecisions: 1, blockerAuthors: 1 });
+      const later = yield* router.roomActivity(
+        { missionId, dayStart, since: DateTime.formatIso(DateTime.makeUnsafe(5 * 60_000)) },
+        ownerApp,
+      );
+      assert.deepStrictEqual(later.since, { messages: 3, masterDecisions: 1, blockerAuthors: 1 });
+
+      // An imported message is written straight to the router store, with no
+      // timeline event; the board's count must still see it.
+      const store = yield* RouterStore.RouterStore;
+      const seq = (yield* store.lastMessageSeq(missionId)) + 1;
+      yield* store.insertMessage({
+        message: {
+          id: MissionMessageId.make("imported-1"),
+          missionId,
+          roomId: control,
+          seq,
+          kind: "status",
+          author: { _tag: "person", name: "coord" },
+          provenance: { _tag: "import", source: "coord.db" },
+          to: [],
+          summary: "imported",
+          hasBody: false,
+          key: null,
+          workItemId: null,
+          links: [],
+          receipt: null,
+          isCorrection: false,
+          createdAt: DateTime.formatIso(DateTime.makeUnsafe(8 * 60_000)),
+        },
+        body: null,
+        contentHash: "imported-1",
+        deliveries: [],
+      });
+      const withImport = yield* router.roomActivity({ missionId, dayStart, since: null }, ownerApp);
+      assert.strictEqual(withImport.rows[0]?.total, 5);
+      assert.strictEqual(withImport.since.messages, 5);
     }).pipe(Effect.provide(h.layer));
   });
 
