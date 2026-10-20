@@ -64,6 +64,8 @@ const WRITE_METHODS = Object.values(WS_METHODS).filter(
       "missions.roomTuning",
       "missions.attention",
       "missions.ownerRequests",
+      // ardud missions: fix-p3
+      "missions.roomActivity",
     ].includes(method),
 );
 

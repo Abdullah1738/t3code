@@ -96,7 +96,8 @@ export const rolesSnapshot = (
       defaults: roles.defaults.map((role) => role.id),
       bindings,
       drift,
-      missingThreads,
+      // Left off when empty so crw's pinned answer shape stays the same.
+      ...(missingThreads.length > 0 ? { missingThreads } : {}),
     };
   });
 
