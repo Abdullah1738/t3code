@@ -121,7 +121,7 @@ describe("decodeViewBody", () => {
     const decoded = decodeViewBody(
       [
         { _tag: "text", bind: "record.summary", style: "body", maxLines: 2 },
-        { _tag: "gallery", bind: "record.assets" },
+        { _tag: "audio", bind: "record.assets" },
         { _tag: "text", bind: "record.summary", style: "loud", maxLines: 2 },
         { _tag: "choice" },
         {
