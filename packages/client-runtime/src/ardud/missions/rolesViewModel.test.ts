@@ -5,11 +5,16 @@ import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import { poolRows, recoveryBanner, recoveryView, setPoolCapacityInput } from "./poolsViewModel.ts";
 import {
   pendingModelLine,
+  reviewerRows,
   reviewPolicyView,
+  roleHistory,
   roleModelChoices,
   roleRegistryView,
+  rolesSummary,
+  roleThreadLine,
   setCriticalityGuideInput,
   setRoleModelInput,
+  threadCode,
 } from "./rolesViewModel.ts";
 import type {
   MissionPoolsSnapshot,
@@ -151,6 +156,95 @@ describe("roles view model", () => {
     expect(after.changedBy).toBe("last changed by you");
     expect(after.triggers).toEqual(view.triggers);
     review.close();
+  });
+});
+
+const SUMMARY =
+  "40 roles: the master, 1 final reviewer, 1 reviewer and 37 lane leads. 22 on Haiku, 16 on Opus, 1 on gpt-6-astra, 1 on gpt-6.1-sol.";
+const REVIEWERS: Array<[string, string]> = [
+  ["Sol review", "Sol reviewer"],
+  ["Astra final at exact head", "Astra final"],
+  ["Rule-7 exact-head merge", "Crpko master"],
+];
+
+describe("roles page", () => {
+  const text = (parts: ReadonlyArray<string | { figure: string }>) =>
+    parts.map((part) => (typeof part === "string" ? part : part.figure)).join("");
+
+  it("sums up the roles by kind and model family, and reads each thread by its short code", () => {
+    const missions = source();
+    const roles = live<MissionRolesSnapshot>((l) => missions.subscribeRoles(CRPKO, l));
+    const view = roleRegistryView(roles.value, MASTER);
+
+    expect(text(rolesSummary(view))).toBe(SUMMARY);
+    const master = view.rows[0];
+    if (!master) throw new Error("no master");
+    expect(master.family).toBe("Opus");
+    expect(roleThreadLine(master)).toBe("9d5f1360");
+    const risk6 = view.rows.find((row) => row.role.id === "crpko-cell-risk6");
+    if (!risk6) throw new Error("no cell-risk6");
+    expect([risk6.family, risk6.pendingFamily]).toEqual(["Haiku", "Opus"]);
+    expect(roleThreadLine(risk6)).toBe("Moves to Opus at the next idle turn");
+    expect(threadCode("mcp:271cfc0f")).toBe("271cfc0f");
+    expect(threadCode("ses_0882e368")).toBe("ses_0882e368");
+    roles.close();
+  });
+
+  it("lists the master's threads newest first with the note each one handed on", () => {
+    const missions = source();
+    const roles = live<MissionRolesSnapshot>((l) => missions.subscribeRoles(CRPKO, l));
+    const master = roleRegistryView(roles.value, MASTER).rows[0];
+    if (!master) throw new Error("no master");
+    const history = roleHistory(master, "UTC");
+    expect(history).toHaveLength(9);
+    expect(history[0]).toMatchObject({ code: "9d5f1360", at: null });
+    expect(history[0]?.note).toBe("Current, since Wed 14 Oct 21:25");
+    expect(history[1]).toMatchObject({
+      code: "ses_0882e368",
+      note: "Handed off: Context handoff: MASTER-STATE.md is current.",
+      at: "Wed 14 Oct",
+    });
+    expect(history.at(-1)?.note).toBe("Handed off: Context handoff: MASTER-STATE.md is current.");
+    expect(roleHistory(master, "Asia/Dubai")[0]?.note).toBe("Current, since Thu 15 Oct 01:25");
+    roles.close();
+  });
+
+  it("names who runs each review stage and keeps each ladder's stages apart", () => {
+    const missions = source();
+    const roles = live<MissionRolesSnapshot>((l) => missions.subscribeRoles(CRPKO, l));
+    const review = live<MissionReviewSnapshot | null>((l) =>
+      missions.subscribeReviewPolicy(CRPKO, l),
+    );
+    if (!review.value) throw new Error("no policy");
+    const view = reviewPolicyView(review.value, MASTER);
+    expect(view.critical[0]?.stages).toEqual([
+      "Sol review",
+      "Astra final at exact head",
+      "Rule-7 exact-head merge",
+    ]);
+    expect(view.verdicts.at(-1)?.ref).toBe("risk-liquidation-latest#68");
+    expect(
+      reviewerRows(review.value.policy, roles.value.roles).map((row) => [row.stage, row.name]),
+    ).toEqual(REVIEWERS);
+    roles.close();
+    review.close();
+  });
+
+  it("shows each pool as an amount, a share and its rule", () => {
+    const missions = source();
+    const pools = live<MissionPoolsSnapshot>((l) => missions.subscribePools(CRPKO, l));
+    const byId = new Map(poolRows(pools.value, MASTER).map((row) => [row.pool.id as string, row]));
+    expect(byId.get("pool-offbox")).toMatchObject({
+      amountLine: "$61.69 of $500",
+      ruleLine: "A month, enforced",
+    });
+    expect(byId.get("pool-claude")).toMatchObject({
+      amountLine: "10 of 30",
+      ruleLine: "5h window, advisory",
+    });
+    expect(byId.get("pool-dev-env")?.ruleLine).toBe("Enforced");
+    expect(byId.get("pool-arch-broker")?.share).toBe(1);
+    pools.close();
   });
 });
 

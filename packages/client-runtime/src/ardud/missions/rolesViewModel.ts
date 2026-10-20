@@ -15,9 +15,10 @@ import type {
 } from "@t3tools/contracts";
 
 import { changeIndex, lastChangedLine } from "./changeLog.ts";
-import { modelLabel } from "./lanesViewModel.ts";
+import { modelFamily, modelLabel } from "./lanesViewModel.ts";
+import type { SummaryPart } from "./portfolioViewModel.ts";
 import type { MissionReviewSnapshot, MissionRolesSnapshot } from "./source.ts";
-import { actorLabel } from "./viewModel.ts";
+import { actorLabel, formatDayLabel, formatTimeOfDay } from "./viewModel.ts";
 
 // Roles tab, part one: the role registry (model, pending model change,
 // public-text writers, who holds each role) and the review policy (stages,
@@ -78,6 +79,10 @@ export interface RoleRow {
   readonly past: ReadonlyArray<RoleBinding>;
   readonly drift: ReadonlyArray<RoleDriftView>;
   readonly modelChangedBy: string | null;
+  /** "Opus", "Haiku": the model family, for a narrow column. */
+  readonly family: string;
+  /** The family it moves to at its next idle turn, or null. */
+  readonly pendingFamily: string | null;
 }
 
 export interface RoleRegistryView {
@@ -126,6 +131,8 @@ export function roleRegistryView(
           .filter((entry) => entry.roleId === role.id)
           .map(({ threadId, expected, observed }) => ({ threadId, expected, observed })),
         modelChangedBy: lastChangedLine(modelChange, masterRoleId),
+        family: modelFamily(role.modelSelection) ?? role.modelSelection.model,
+        pendingFamily: modelFamily(role.pendingModelSelection),
       };
     });
   const mix = new Map<string, number>();
@@ -195,6 +202,8 @@ export interface LadderView {
   readonly ladder: ReviewLadder;
   /** "Sol review → Astra final → rule-7 merge". */
   readonly stagesLine: string;
+  /** The same stages, one label each, for a flow of chips. */
+  readonly stages: ReadonlyArray<string>;
   readonly appliesLine: string;
 }
 
@@ -216,6 +225,8 @@ export interface VerdictRow {
   readonly verdict: CriticalityVerdict;
   /** "risk-liquidation-latest#68 critical (hard trigger)". */
   readonly line: string;
+  /** "risk-liquidation-latest#68": the repository's own name and the number. */
+  readonly ref: string;
   readonly by: string;
 }
 
@@ -266,6 +277,7 @@ export function reviewPolicyView(
   const ladder = (entry: ReviewLadder): LadderView => ({
     ladder: entry,
     stagesLine: entry.stageIds.map((id) => stageLabel.get(id) ?? id).join(" → "),
+    stages: entry.stageIds.map((id) => stageLabel.get(id) ?? id),
     appliesLine:
       entry.condition?.trim() ||
       (entry.appliesTo === "critical"
@@ -293,6 +305,7 @@ export function reviewPolicyView(
     verdicts: snapshot.verdicts.map((verdict) => ({
       verdict,
       line: verdictLine(verdict),
+      ref: `${verdict.pullRequest.repository.split("/").at(-1)}#${verdict.pullRequest.number}`,
       by: actorLabel(verdict.decidedBy, masterRoleId),
     })),
     reviews: snapshot.reviews.map((review) => {
@@ -300,6 +313,130 @@ export function reviewPolicyView(
       return { review, stageLabel: label, line: reviewLine(review, label) };
     }),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Desk page
+
+/** "ardud-control:thread:9d5f1360-…" reads as "9d5f1360", "mcp:271cfc0f" as "271cfc0f". */
+export function threadCode(threadId: string): string {
+  const last = threadId.split(":").at(-1) ?? threadId;
+  return /^[0-9a-f]{8}-/i.test(last) ? last.slice(0, 8) : last;
+}
+
+const KIND_NOUN: Record<RoleKind, readonly [string, string]> = {
+  master: ["master", "masters"],
+  "sub-coordinator": ["sub-coordinator", "sub-coordinators"],
+  "lane-lead": ["lane lead", "lane leads"],
+  "lane-worker": ["lane worker", "lane workers"],
+  reviewer: ["reviewer", "reviewers"],
+  "final-reviewer": ["final reviewer", "final reviewers"],
+  writer: ["writer", "writers"],
+  scribe: ["scribe", "scribes"],
+  editor: ["editor", "editors"],
+  verifier: ["verifier", "verifiers"],
+  answerer: ["answerer", "answerers"],
+  custom: ["custom role", "custom roles"],
+};
+
+function joinAnd(parts: ReadonlyArray<string>): string {
+  if (parts.length <= 1) return parts[0] ?? "";
+  return `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
+}
+
+/** "52 roles: the master, 2 custom roles and 49 lane leads. 29 on Opus, 23 on Haiku." */
+export function rolesSummary(view: RoleRegistryView): SummaryPart[] {
+  const kinds = new Map<RoleKind, number>();
+  const families = new Map<string, number>();
+  for (const row of view.rows) {
+    kinds.set(row.role.kind, (kinds.get(row.role.kind) ?? 0) + 1);
+    families.set(row.family, (families.get(row.family) ?? 0) + 1);
+  }
+  const kindParts = [...kinds]
+    .sort((left, right) => ROLE_KIND_RANK[left[0]] - ROLE_KIND_RANK[right[0]])
+    .map(([kind, count]) => {
+      const [one, many] = KIND_NOUN[kind];
+      if (kind === "master" && count === 1) return "the master";
+      return `${count} ${count === 1 ? one : many}`;
+    });
+  const parts: SummaryPart[] = [
+    { key: "roles", figure: String(view.rows.length) },
+    ` ${view.rows.length === 1 ? "role" : "roles"}: ${joinAnd(kindParts)}.`,
+  ];
+  const mix = [...families].sort(
+    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+  );
+  mix.forEach(([family, count], index) => {
+    parts.push(index === 0 ? " " : ", ", { key: `family:${family}`, figure: String(count) });
+    parts.push(` on ${family}${index === mix.length - 1 ? "." : ""}`);
+  });
+  return parts;
+}
+
+/** The thread column: the pending model move, the holder's code, or "No holder". */
+export function roleThreadLine(row: RoleRow): string {
+  if (row.pendingFamily) return `Moves to ${row.pendingFamily} at the next idle turn`;
+  const holder = row.holders[0];
+  return holder ? threadCode(holder.threadId) : "No holder";
+}
+
+export interface RoleHistoryRow {
+  readonly key: string;
+  readonly code: string;
+  /** "Current, since Wed 14 Oct 21:25", "Handed off: MASTER-STATE.md is current". */
+  readonly note: string;
+  /** When the thread let go, in the reader's zone; null for the current holder. */
+  readonly at: string | null;
+}
+
+/** Every thread that held the role, newest first, with the note each one handed on. */
+export function roleHistory(row: RoleRow, timeZone?: string): RoleHistoryRow[] {
+  const stamp = (at: string) => `${formatDayLabel(at, timeZone)} ${formatTimeOfDay(at, timeZone)}`;
+  const bindings = [...row.holders, ...row.past].sort((left, right) =>
+    right.boundAt.localeCompare(left.boundAt),
+  );
+  return bindings.map((binding, index) => {
+    const successor = index > 0 ? bindings[index - 1] : undefined;
+    const handedOn = successor?.handoffNote?.trim();
+    const note =
+      binding.endedAt === null
+        ? `Current, since ${stamp(binding.boundAt)}`
+        : handedOn
+          ? `Handed off: ${handedOn}`
+          : binding.reason === "initial"
+            ? "First thread"
+            : "Ended";
+    return {
+      key: binding.id,
+      code: threadCode(binding.threadId),
+      note,
+      at: binding.endedAt === null ? null : formatDayLabel(binding.endedAt, timeZone),
+    };
+  });
+}
+
+export interface ReviewerRow {
+  readonly stageId: string;
+  readonly stage: string;
+  readonly name: string;
+  readonly family: string | null;
+}
+
+/** Who runs each review stage: the stage's role and the model family it runs. */
+export function reviewerRows(
+  policy: Pick<ReviewPolicy, "stages">,
+  roles: ReadonlyArray<Role>,
+): ReviewerRow[] {
+  const byId = new Map(roles.map((role) => [role.id as string, role]));
+  return policy.stages.map((stage) => {
+    const role = byId.get(stage.roleId);
+    return {
+      stageId: stage.id,
+      stage: stage.label,
+      name: role?.name ?? "No role",
+      family: role ? modelFamily(role.modelSelection) : null,
+    };
+  });
 }
 
 export function setCriticalityGuideInput(

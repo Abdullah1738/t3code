@@ -39,6 +39,31 @@ export interface PoolRow {
   readonly holders: ReadonlyArray<PoolHoldRow>;
   readonly queue: ReadonlyArray<PoolHoldRow>;
   readonly capacityChangedBy: string | null;
+  /** "10 of 30", "$61.69 of $500": the figure the Desk shows on the right. */
+  readonly amountLine: string;
+  /** Share in use, 0 to 1, for the bar. */
+  readonly share: number;
+  /** "Advisory", "A month, enforced", "5h window, advisory". */
+  readonly ruleLine: string;
+}
+
+const WINDOW_LABEL: Readonly<Record<string, string>> = {
+  month: "A month",
+  day: "A day",
+  week: "A week",
+};
+
+function poolAmountLine(pool: Pick<Pool, "unit" | "capacity">, inUse: number): string {
+  if (pool.unit === "USD") return `$${formatAmount(inUse)} of $${formatAmount(pool.capacity)}`;
+  return `${formatAmount(inUse)} of ${formatAmount(pool.capacity)}`;
+}
+
+function poolRuleLine(pool: Pick<Pool, "enforcement" | "usage">): string {
+  const enforced = pool.enforcement === "enforced";
+  const window = pool.usage.window?.trim();
+  if (!window) return enforced ? "Enforced" : "Advisory";
+  const label = WINDOW_LABEL[window] ?? `${window} window`;
+  return `${label}, ${enforced ? "enforced" : "advisory"}`;
 }
 
 const PRESSURE_RANK: Record<PoolView["pressure"], number> = {
@@ -100,6 +125,9 @@ export function poolRows(
           lookup({ kind: "pool", id: view.pool.id }, "capacity"),
           masterRoleId,
         ),
+        amountLine: poolAmountLine(view.pool, view.inUse),
+        share: poolShare(view),
+        ruleLine: poolRuleLine(view.pool),
       };
     });
 }
