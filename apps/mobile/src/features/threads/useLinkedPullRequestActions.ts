@@ -12,7 +12,7 @@ import {
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
 import { planThreadPullRequestMutation } from "@t3tools/client-runtime/thread-pull-request-compatibility";
-import { AuthOrchestrationOperateScope, type ThreadPullRequestLink } from "@t3tools/contracts";
+import type { ThreadPullRequestLink } from "@t3tools/contracts";
 import * as Clipboard from "expo-clipboard";
 import { useCallback, useMemo } from "react";
 
@@ -20,7 +20,6 @@ import * as Dialog from "../../components/ui/Dialog";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import type { MenuProps } from "../../components/ui/Menu.types";
 import type { EnvironmentRuntimeState } from "../../state/remote-runtime-types";
-import { useEnvironmentScope } from "../../state/session";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 
@@ -33,12 +32,10 @@ export function useLinkedPullRequestActions(input: {
 }) {
   const { thread, project, runtime } = input;
   const capabilities = runtime?.serverConfig?.environment.capabilities;
-  const canOperate = useEnvironmentScope(
-    thread?.environmentId ?? null,
-    AuthOrchestrationOperateScope,
-  );
-  const canEdit = canOperate && capabilities?.threadPullRequests === true;
-  const canWatch = canOperate && capabilities?.threadPullRequestWatch === true;
+  // ardud missions: declined - phones don't link, unlink or watch pull requests
+  // (upstream #20394). The sheets keep copy and open-in-browser.
+  const canEdit = false;
+  const canWatch = false;
   const canStartWatch =
     canWatch &&
     thread !== null &&
