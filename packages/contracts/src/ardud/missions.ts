@@ -1879,6 +1879,8 @@ export const MissionEventKind = Schema.Literals([
   "field.unlocked",
   "governor.action",
   "import.applied",
+  // A thread enrolled after import: its legacy schedules and watches now run as the master's.
+  "guard.adopted",
 ]);
 export type MissionEventKind = typeof MissionEventKind.Type;
 

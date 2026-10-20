@@ -7,6 +7,7 @@ import * as MasterControls from "./core/MasterControls.ts";
 import { MissionOwnerNameLive } from "./core/ownerName.ts";
 import * as RuleService from "./core/RuleService.ts";
 import { editorWiringLayer } from "./editorWiring.ts";
+import { enrolAdoptionLayer } from "./guard/enrolAdoption.ts";
 import { missionsRouteLayer } from "./http.ts";
 import * as MissionService from "./MissionService.ts";
 import { policyRouteLayer } from "./policy/http.ts";
@@ -52,6 +53,8 @@ export const ArdudMissionsLive = Layer.mergeAll(
   RecoveryLive,
   // ardud missions: views (templates, sections, layouts; needs MissionService)
   ViewsLive,
+  // the master adopts a newly enrolled thread's legacy schedules and watches
+  enrolAdoptionLayer,
 ).pipe(Layer.provideMerge(MissionTracksLive), Layer.provideMerge(MissionStore.layer));
 
 /**

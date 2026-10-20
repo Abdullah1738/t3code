@@ -3,7 +3,9 @@
  * recorded who set them up have no authority row, so each of their runs
  * knocks. At import the mission's master adopts the ones bound to mission
  * threads (coordinator call): from then on they run as the master's, and the
- * import report lists every one. A recorded authority is never replaced.
+ * import report lists every one. A thread enrolled later is adopted the same
+ * way when it joins (see enrolAdoption.ts). A recorded authority is never
+ * replaced.
  */
 import type { Lane, Role, RoleBinding, ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -73,7 +75,8 @@ const ThreadLinks = Schema.fromJsonString(
 );
 const decodeLinks = Schema.decodeUnknownOption(ThreadLinks);
 
-const castThreads = (cast: AdoptionCast) => {
+/** The cast's master thread (null when no thread holds the master role) and its threads. */
+export const castThreads = (cast: AdoptionCast) => {
   const active = cast.bindings.filter((binding) => binding.endedAt === null);
   const masterRoles = new Set(
     cast.roles.filter((role) => role.kind === "master").map((role) => role.id),
@@ -90,14 +93,18 @@ const castThreads = (cast: AdoptionCast) => {
  * Finds the mission threads' schedules and watches nobody is recorded as
  * having set up, and with `apply` records the master as their authority. A
  * dry run writes nothing. Tables the target does not have yet hold nothing.
+ * `threads` narrows the search to threads just enrolled in the mission.
  */
 export const adoptLegacyAuthority = (
   cast: AdoptionCast,
-  options: { readonly apply: boolean },
+  options: { readonly apply: boolean; readonly threads?: ReadonlyArray<ThreadId> },
 ): Effect.Effect<LegacyAdoption, SqlError.SqlError, SqlClient.SqlClient> =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    const { master, members } = castThreads(cast);
+    const { master, members: castMembers } = castThreads(cast);
+    const members: ReadonlyArray<string> = options.threads
+      ? [...new Set(options.threads)].toSorted()
+      : castMembers;
     const tables = new Set(
       (yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ${sql.in([
