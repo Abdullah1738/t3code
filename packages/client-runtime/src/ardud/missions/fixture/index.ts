@@ -1110,13 +1110,15 @@ export function createFixtureMissionsSource(
       if (input.ruleId && !existing) return fail("not-found", `Rule ${input.ruleId} not found.`);
       const scope = input.scope ?? { subMissionIds: [], roleKinds: [], laneIds: [] };
       const edited = existing
-        ? (["title", "quote", "scope", "activation", "status"] as const).filter((field) => {
-            const next =
-              field === "title" || field === "quote"
-                ? input[field]
-                : (input[field] ?? existing[field]);
-            return JSON.stringify(existing[field]) !== JSON.stringify(next);
-          })
+        ? (["title", "quote", "scope", "activation", "status", "masterReading"] as const).filter(
+            (field) => {
+              const next =
+                field === "title" || field === "quote"
+                  ? input[field]
+                  : (input[field] ?? existing[field]);
+              return JSON.stringify(existing[field]) !== JSON.stringify(next);
+            },
+          )
         : [];
       if (existing && edited.length === 0) return Promise.resolve(existing);
       // Acks are per version: only a change to what lanes follow asks them to ack again.
@@ -1132,6 +1134,7 @@ export function createFixtureMissionsSource(
             scope: input.scope ?? existing.scope,
             activation: input.activation ?? existing.activation,
             status: input.status ?? existing.status,
+            masterReading: input.masterReading ?? existing.masterReading,
             version: reAck ? existing.version + 1 : existing.version,
             updatedAt: at,
           })
@@ -1143,7 +1146,7 @@ export function createFixtureMissionsSource(
             quote: input.quote,
             quotedAt: at,
             provenance: ownerProvenance(),
-            masterReading: "",
+            masterReading: input.masterReading ?? "",
             scope,
             activation: input.activation ?? "",
             status: input.status ?? "active",

@@ -168,7 +168,7 @@ function perHourLabel(perHour: number): string {
 }
 
 /** Clock time today, else the day, in the reader's zone. */
-function whenLabel(atIso: string, nowMs: number, timeZone?: string): string {
+export function whenLabel(atIso: string, nowMs: number, timeZone?: string): string {
   const today = formatDayLabel(DateTime.formatIso(DateTime.makeUnsafe(nowMs)), timeZone);
   const day = formatDayLabel(atIso, timeZone);
   return day === today ? formatTimeOfDay(atIso, timeZone) : day;
