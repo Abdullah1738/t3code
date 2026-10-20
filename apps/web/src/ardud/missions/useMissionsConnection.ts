@@ -1,13 +1,7 @@
+import { connectionLabel, feedOfflineLines } from "@t3tools/client-runtime/ardud/missions";
 import { useEffect, useSyncExternalStore } from "react";
 
 import { usePrimaryEnvironment } from "../../state/environments";
-
-const LABEL = {
-  connecting: "Connecting",
-  reconnecting: "Reconnecting",
-  offline: "Offline",
-  error: "Offline",
-} as const;
 
 // When the live connection last dropped, shared so every Missions surface
 // shows the same "Last update" time. Null while connected or before the
@@ -35,7 +29,7 @@ function subscribe(listener: () => void) {
  */
 export function useMissionsConnection(): { label: string | null; lastUpdateAt: number | null } {
   const phase = usePrimaryEnvironment()?.connection.phase ?? null;
-  const label = phase !== null && phase in LABEL ? LABEL[phase as keyof typeof LABEL] : null;
+  const label = connectionLabel(phase);
   const lastUpdateAt = useSyncExternalStore(subscribe, () => droppedAt);
   useEffect(() => {
     if (phase === "connected") {
@@ -46,4 +40,12 @@ export function useMissionsConnection(): { label: string | null; lastUpdateAt: n
     }
   }, [phase, label]);
   return { label, lastUpdateAt: label === null ? null : lastUpdateAt };
+}
+
+/**
+ * The offline line for a block with nothing loaded yet, or null while the
+ * server is connected or the first connection is still being made.
+ */
+export function useMissionsOffline(): { title: string; detail: string } | null {
+  return feedOfflineLines(usePrimaryEnvironment()?.connection.phase ?? null);
 }

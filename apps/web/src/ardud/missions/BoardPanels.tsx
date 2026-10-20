@@ -48,7 +48,7 @@ import {
 } from "./missionsStore";
 import { FeedError } from "./sections/FeedError";
 import { FoldButton, LoadingRows } from "./sections/SectionShell";
-import { useMissionsConnection } from "./useMissionsConnection";
+import { useMissionsConnection, useMissionsOffline } from "./useMissionsConnection";
 
 const LINK_FOCUS =
   "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring";
@@ -79,6 +79,7 @@ export function BoardLead(props: {
   const review = useMissionReviewPolicy(missionId);
   const pools = useMissionPools(missionId);
   const connection = useMissionsConnection();
+  const offline = useMissionsOffline();
   const waiting = useMemo(
     () => (inbox ? ownerWaitingEntries(inbox, nowMs) : undefined),
     [inbox, nowMs],
@@ -153,6 +154,7 @@ export function BoardLead(props: {
               failed={figure.key === "since" && activityFailed}
               wide={shown.length === 3}
               stale={connection.lastUpdateAt}
+              offline={offline?.title ?? null}
             />
           ))
         : null}
@@ -308,6 +310,8 @@ function FigurePanel(props: {
   wide: boolean;
   /** When the data last updated, while the connection is down. */
   stale: number | null;
+  /** The connection word while offline, shown in place of the loading bars. */
+  offline: string | null;
 }) {
   const { figure, stale } = props;
   const className = cn(
@@ -320,6 +324,9 @@ function FigurePanel(props: {
       <span className="text-sm text-(--m-muted)">{figure.label}</span>
       {props.failed ? (
         <span className="mt-2 text-sm font-medium text-(--m-negative) sm:mt-3">Couldn't load</span>
+      ) : props.loading && props.offline !== null ? (
+        // ardud missions: fix-p3 - nothing loaded and offline: say so
+        <span className="mt-2 text-sm font-medium text-(--m-muted) sm:mt-3">{props.offline}</span>
       ) : props.loading ? (
         <>
           <span aria-hidden className="mt-3.5 h-6.5 w-3/5 rounded-lg bg-(--m-active)" />

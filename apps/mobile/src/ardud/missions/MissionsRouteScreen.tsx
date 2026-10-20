@@ -18,6 +18,7 @@ import { InboxPane } from "./InboxPane";
 import { MissionBoard } from "./MissionBoard";
 import { useMissionList, useMissionOverview, useMissionsEnvironmentId } from "./missionsStore";
 import { useOverviewActions } from "./overviewLogic";
+import { LoadingLine } from "./FeedError";
 import { CountPill, EmptyLine } from "./parts";
 import {
   MISSIONS_TABS,
@@ -96,7 +97,7 @@ export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRoutePa
   const missionPicker = (
     <ScrollView className="flex-1" contentContainerClassName="gap-3 px-4 pb-8 pt-3">
       {list === undefined ? (
-        <EmptyLine label="Loading" />
+        <LoadingLine />
       ) : rows.length === 0 ? (
         <EmptyLine label="No missions yet." />
       ) : (
@@ -135,7 +136,7 @@ export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRoutePa
   } else if (state.missionId === null) {
     body = missionPicker;
   } else if (overview === undefined) {
-    body = <EmptyLine label="Loading" />;
+    body = <LoadingLine />;
   } else if (overview === null) {
     body = <EmptyLine label="This mission is gone." />;
   } else {

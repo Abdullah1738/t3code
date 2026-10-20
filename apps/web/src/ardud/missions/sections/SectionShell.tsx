@@ -42,6 +42,8 @@ import { Textarea } from "../../../components/ui/textarea";
 import { AnsweredMark } from "../cards/chips";
 import { askAboutSection, changeSection } from "../missionCommands";
 import { PANEL_CLASS, SampleMark } from "../MissionSection";
+import { useMissionsOffline } from "../useMissionsConnection";
+import { OfflineLine } from "./FeedError";
 
 // The frame every overview section shares: a panel with one header row
 // (title, a count or meta element, an aside action, the section menu) and the body.
@@ -418,8 +420,14 @@ export function FoldButton(props: {
   );
 }
 
-/** Flat grey bars in the final layout while the section loads; no shimmer. */
+/**
+ * Flat grey bars in the final layout while the section loads; no shimmer.
+ * Offline, the offline line instead, so nothing loads forever.
+ */
 export function LoadingRows() {
+  // ardud missions: fix-p3
+  const offline = useMissionsOffline();
+  if (offline !== null) return <OfflineLine />;
   return (
     <div aria-hidden className="flex flex-col">
       {[0.6, 0.8, 0.5].map((width) => (

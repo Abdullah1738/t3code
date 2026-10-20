@@ -2,7 +2,8 @@ import type { ReactNode } from "react";
 
 import { cn } from "../../lib/utils";
 import type { FeedState } from "./missionsStore";
-import { FeedError } from "./sections/FeedError";
+import { FeedError, OfflineLine } from "./sections/FeedError";
+import { useMissionsOffline } from "./useMissionsConnection";
 
 // Small Desk pieces the mission tabs share: the page line with its figures,
 // the segmented switch, the pill chip and the "N more" row. Colours come from
@@ -115,8 +116,11 @@ export function TabLoading(props: {
   feeds: ReadonlyArray<FeedState>;
   nowMs: number;
 }) {
+  const offline = useMissionsOffline();
   if (props.feeds.some((feed) => feed.failure !== undefined))
     return <FeedErrors what={props.what} feeds={props.feeds} nowMs={props.nowMs} />;
+  // ardud missions: fix-p3 - offline, a feed with nothing loaded says so
+  if (offline !== null) return <OfflineLine />;
   return <p className="text-sm text-(--m-muted)">{props.label}</p>;
 }
 // --- end finish-b ---

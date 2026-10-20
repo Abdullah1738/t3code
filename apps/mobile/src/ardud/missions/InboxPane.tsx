@@ -13,7 +13,7 @@ import {
 import { Fragment, useState } from "react";
 import { ScrollView, View } from "react-native";
 
-import { FeedError } from "./FeedError";
+import { FeedError, LoadingLine } from "./FeedError";
 import { ItemReader } from "./ItemReader";
 import {
   useMissionInbox,
@@ -58,7 +58,7 @@ export function InboxPane(props: {
     return feed.failure ? (
       <FeedError what="the inbox" feed={feed} nowMs={props.nowMs} />
     ) : (
-      <EmptyLine label="Loading" />
+      <LoadingLine />
     );
   }
 

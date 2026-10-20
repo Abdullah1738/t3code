@@ -4,6 +4,7 @@ import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Conversation } from "./Discussion";
+import { LoadingLine } from "./FeedError";
 import { ActionBar, ActionButton, Chip, EmptyLine, TextField } from "./parts";
 import { useRequestThread } from "./recordLogic";
 
@@ -19,7 +20,7 @@ export function RequestReader(props: {
 }) {
   const thread = useRequestThread(props.missionId, props.requestId);
   const { request } = thread;
-  if (request === undefined) return <EmptyLine label="Loading" />;
+  if (request === undefined) return <LoadingLine />;
   if (request === null) return <EmptyLine label="This request is gone." />;
   const settled = request.status === "settled";
   const hasText = thread.text.trim().length > 0;

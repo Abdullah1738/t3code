@@ -29,7 +29,9 @@ import { ByMarker } from "./cards/chips";
 import { DESK_ROW, Figure, FoldRow, PageLine, PanelCount } from "./deskParts";
 import { runMissionAction } from "./missionActions";
 import { missionsSource, useMissionInbox, useMissionList, useMissionViews } from "./missionsStore";
+import { OfflineLine } from "./sections/FeedError";
 import { SectionFormRow, SectionMenu, TabMenu, type SectionForm } from "./sections/SectionShell";
+import { useMissionsOffline } from "./useMissionsConnection";
 
 // Views tab, Desk layout: the board's entries as tiles by region, what is set
 // aside, then the starter, the change log and the card kit on the side.
@@ -46,6 +48,7 @@ const send = (request: ViewSectionRequest | null, failure: string) =>
 export function ViewsTab(props: { missionId: MissionId; nowMs: number }) {
   const views = useMissionViews(props.missionId);
   const inbox = useMissionInbox(props.missionId);
+  const offline = useMissionsOffline();
   const waiting = useMemo(() => (inbox ? ownerWaitingEntries(inbox).length : undefined), [inbox]);
   const layout = useMemo(
     () =>
@@ -59,6 +62,8 @@ export function ViewsTab(props: { missionId: MissionId; nowMs: number }) {
   );
   if (views === null) return null;
   if (!views || !layout) {
+    // ardud missions: fix-p3 - offline, say so instead of loading forever
+    if (offline !== null) return <OfflineLine />;
     return (
       <div aria-hidden className="flex flex-col gap-3">
         <Skeleton className="h-4 w-2/5" />

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { createSnapshotStore, feedFailureLines } from "./store.ts";
+import {
+  connectionLabel,
+  createSnapshotStore,
+  feedFailureLines,
+  feedOfflineLines,
+} from "./store.ts";
 
 describe("snapshot store", () => {
   it("keeps the failure with when it last loaded, and Retry opens the feed again", () => {
@@ -78,5 +83,19 @@ describe("snapshot store", () => {
         "UTC",
       ).detail,
     ).toBe("Last loaded at Mon 19 Oct 22:10.");
+  });
+
+  it("says a feed with nothing loaded waits for the server instead of loading forever", () => {
+    expect(feedOfflineLines("offline")).toEqual({
+      title: "Offline",
+      detail: "Loads when the server is back.",
+    });
+    expect(feedOfflineLines("reconnecting")?.title).toBe("Reconnecting");
+    expect(feedOfflineLines("error")?.title).toBe("Offline");
+    expect(feedOfflineLines("connecting")).toBeNull();
+    expect(feedOfflineLines("connected")).toBeNull();
+    expect(feedOfflineLines(null)).toBeNull();
+    expect(connectionLabel("connecting")).toBe("Connecting");
+    expect(connectionLabel("unsupported")).toBe("Offline");
   });
 });

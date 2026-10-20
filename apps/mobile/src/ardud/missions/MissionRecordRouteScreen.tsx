@@ -9,7 +9,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppBar } from "../../components/ui/AppBar";
 import { ItemReader } from "./ItemReader";
-import { FeedError } from "./FeedError";
+import { FeedError, LoadingLine } from "./FeedError";
 import {
   useMissionInbox,
   useMissionInboxFeed,
@@ -114,7 +114,7 @@ function ItemScreen(props: {
     return feed.failure ? (
       <FeedError what="the item" feed={feed} nowMs={props.nowMs} />
     ) : (
-      <EmptyLine label="Loading" />
+      <LoadingLine />
     );
   }
   if (entry === null) return <EmptyLine label="Already decided." />;

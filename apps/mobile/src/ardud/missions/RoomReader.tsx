@@ -12,7 +12,7 @@ import { type ComponentRef, useRef } from "react";
 import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
-import { FeedError } from "./FeedError";
+import { FeedError, LoadingLine } from "./FeedError";
 import { useRoomPageFeed } from "./missionsStore";
 import { useRoomScreen } from "./recordLogic";
 import {
@@ -50,7 +50,7 @@ export function RoomReader(props: {
     return feed.failure ? (
       <FeedError what="the room" feed={feed} nowMs={props.nowMs} />
     ) : (
-      <EmptyLine label="Loading" />
+      <LoadingLine />
     );
   if (room.found === false || room.view === null) return <EmptyLine label="This room is gone." />;
 

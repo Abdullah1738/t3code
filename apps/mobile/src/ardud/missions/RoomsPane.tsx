@@ -5,7 +5,7 @@ import { Fragment, useState } from "react";
 import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
-import { FeedError } from "./FeedError";
+import { FeedError, LoadingLine } from "./FeedError";
 import { useMissionRooms, useMissionRoomsFeed } from "./missionsStore";
 import { EmptyLine, Group, Meta, Row, Separator, Title } from "./parts";
 import { RoomReader } from "./RoomReader";
@@ -33,7 +33,7 @@ export function RoomsPane(props: {
       <FeedError what="the rooms" feed={feed} nowMs={props.nowMs} />
       {rooms === undefined ? (
         feed.failure ? null : (
-          <EmptyLine label="Loading" />
+          <LoadingLine />
         )
       ) : rows.length === 0 ? (
         <EmptyLine label="No rooms yet." />

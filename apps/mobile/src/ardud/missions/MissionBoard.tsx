@@ -24,7 +24,7 @@ import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { DiscussionPanel } from "./Discussion";
-import { FeedError } from "./FeedError";
+import { FeedError, LoadingLine } from "./FeedError";
 import { EntryRow } from "./InboxPane";
 import {
   useMissionInbox,
@@ -453,7 +453,7 @@ function RequestsPage(props: PageProps) {
       <FeedError what="your requests" feed={requestsFeed} nowMs={props.nowMs} />
       {requests === undefined ? (
         requestsFeed.failure ? null : (
-          <EmptyLine label="Loading" />
+          <LoadingLine />
         )
       ) : groups.open.length === 0 ? (
         <EmptyLine label="Nothing open." />
@@ -524,7 +524,7 @@ function LanesPage(props: PageProps) {
     <Page>
       {props.tabs}
       {lanes === undefined ? (
-        <EmptyLine label="Loading" />
+        <LoadingLine />
       ) : sections.length === 0 ? (
         <EmptyLine label="No lanes yet." />
       ) : (

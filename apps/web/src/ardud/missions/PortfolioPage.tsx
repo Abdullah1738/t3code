@@ -59,6 +59,8 @@ import { createMission, reorderPortfolio, revertChange } from "./deskCommands";
 import { RevertButton, TextActionForm } from "./MissionForms";
 import { movePortfolioMission } from "./operationCommands";
 import { useNowMs } from "./useNowMs";
+import { OfflineLine } from "./sections/FeedError";
+import { useMissionsOffline } from "./useMissionsConnection";
 
 // All missions: the order bar of guaranteed shares, one card per mission in
 // priority order, and the shared pools and recent changes beside them. The
@@ -67,6 +69,7 @@ import { useNowMs } from "./useNowMs";
 export function PortfolioPage() {
   const snapshot = usePortfolio();
   const list = useMissionList();
+  const offline = useMissionsOffline();
   const nowMs = useNowMs();
   const listed = useMemo(
     () => new Map((list?.missions ?? []).map((mission) => [mission.id as string, mission])),
@@ -93,7 +96,12 @@ export function PortfolioPage() {
               All missions
             </h1>
             {!snapshot ? (
-              <p className="text-sm text-(--m-muted)">Loading…</p>
+              // ardud missions: fix-p3 - offline, say so instead of loading forever
+              offline !== null ? (
+                <OfflineLine />
+              ) : (
+                <p className="text-sm text-(--m-muted)">Loading…</p>
+              )
             ) : (
               <Portfolio snapshot={snapshot} listed={listed} nowMs={nowMs} />
             )}

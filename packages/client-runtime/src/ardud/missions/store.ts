@@ -1,4 +1,5 @@
 // @effect-diagnostics globalDate:off - Load times render on the reader's clock and zone.
+import type { EnvironmentConnectionPhase } from "../../connection/presentation.ts";
 import type { Listener, Unsubscribe } from "./source.ts";
 import { formatDayLabel, formatTimeOfDay } from "./viewModel.ts";
 
@@ -41,6 +42,38 @@ export function feedFailureLines(
   const today = formatDayLabel(new Date(nowMs).toISOString(), timeZone);
   const time = formatTimeOfDay(at, timeZone);
   return { title, detail: `Last loaded at ${day === today ? time : `${day} ${time}`}.` };
+}
+
+/**
+ * The connection chip's word for a phase: null while connected (or before the
+ * first connection attempt has a phase at all).
+ */
+export function connectionLabel(phase: EnvironmentConnectionPhase | null): string | null {
+  switch (phase) {
+    case null:
+    case "connected":
+      return null;
+    case "connecting":
+      return "Connecting";
+    case "reconnecting":
+      return "Reconnecting";
+    default:
+      return "Offline";
+  }
+}
+
+/**
+ * The Desk offline line for a block that has nothing loaded yet: says why it
+ * is empty instead of loading forever. Null while the first connection is
+ * still being made or the server is connected; a failed read shows the error
+ * line instead.
+ */
+export function feedOfflineLines(
+  phase: EnvironmentConnectionPhase | null,
+): { readonly title: string; readonly detail: string } | null {
+  const title = connectionLabel(phase);
+  if (title === null || phase === "connecting") return null;
+  return { title, detail: "Loads when the server is back." };
 }
 
 export type SnapshotOpen<T> = (emit: Listener<T>, fail: Listener<unknown>) => Unsubscribe;
