@@ -55,7 +55,7 @@ export function TextBlock(props: { text: string; tone?: "body" | "meta"; maxLine
   return (
     <p
       className={cn(
-        "text-sm leading-5.5 text-pretty whitespace-pre-line",
+        "text-sm leading-5.5 text-pretty whitespace-pre-line wrap-anywhere",
         props.tone === "meta" ? "text-(--m-muted)" : "text-(--m-text)",
         props.maxLines ? CLAMP[props.maxLines] : null,
       )}
@@ -356,7 +356,7 @@ function withOffsetKeys<T extends { readonly kind: string; readonly text: string
 /** Inline word diff: removed words struck in red, added words in the update colour. */
 export function WordDiffText(props: { segments: ReadonlyArray<DiffSegment> }) {
   return (
-    <p className="text-sm leading-5.5 whitespace-pre-wrap text-(--m-text)">
+    <p className="text-sm leading-5.5 whitespace-pre-wrap wrap-anywhere text-(--m-text)">
       {withOffsetKeys(props.segments).map(({ key, item: segment }) => {
         if (segment.kind === "same") return <span key={key}>{segment.text}</span>;
         if (segment.kind === "removed") {

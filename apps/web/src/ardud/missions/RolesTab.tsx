@@ -28,6 +28,7 @@ import { DESK_ROW, DeskChip, FeedErrors, FoldRow, TabActions, TabLoading } from 
 import { createRole } from "./deskCommands";
 import { PickForm, PickTextForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
+import { RoutingPanel } from "./RoutingPanel";
 import {
   useApprovalRouting,
   useMasterRoleId,
@@ -447,20 +448,16 @@ function VerdictsSection(props: { missionId: MissionId; nowMs: number }) {
 
 function RoutingSection(props: { missionId: MissionId }) {
   const table = useApprovalRouting(props.missionId);
+  const [editing, setEditing] = useState(false);
   if (table === undefined) return null;
+  if (editing) return <RoutingPanel missionId={props.missionId} onDone={() => setEditing(false)} />;
   const rows = table ? routingRows(table) : [];
   const approver = (value: "owner" | "master") => (value === "owner" ? "You" : "Master");
   return (
     <MissionSection
       title="Routing"
       accessory={
-        <Button
-          size="xs"
-          variant="ghost-muted"
-          render={
-            <Link to="/missions/inbox" search={{ mission: props.missionId, tab: "approve" }} />
-          }
-        >
+        <Button size="xs" variant="ghost-muted" onClick={() => setEditing(true)}>
           Edit
         </Button>
       }
