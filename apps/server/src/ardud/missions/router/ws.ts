@@ -53,6 +53,8 @@ export const makeRouterWsHandlers = (
     [WS_METHODS.missionsDecideKnock]: asOwner(router.decideKnock),
     [WS_METHODS.missionsRoomTuning]: (input: RoomTuningInput) => router.roomTuning(input, reader),
     [WS_METHODS.missionsTuneRoom]: asOwner(router.tuneRoom),
+    // --- finish-b ---
+    [WS_METHODS.missionsUpdateRoom]: asOwner(router.updateRoom),
     // The attention view is the owner's and the master's, so it needs the paired session too.
     [WS_METHODS.missionsAttention]: asOwner(router.attention),
     // The owner's requests to the master: read like rooms, written only by the paired owner.

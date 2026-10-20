@@ -49,6 +49,7 @@ import type { WsRpcProtocolClient } from "../../rpc/protocol.ts";
 import { latestFieldChanges } from "./changeLog.ts";
 import { withMasterInbox } from "./masterInbox.ts";
 import { listedRoomUnread, pageUnread } from "./roomsViewModel.ts";
+import { ruleAudit } from "./rulesViewModel.ts";
 import type {
   FieldChange,
   Listener,
@@ -129,18 +130,6 @@ export interface RpcMissionsSourceOptions {
 
 /** Every feed is live, so nothing reads as sample. */
 export const RPC_SAMPLED_FEEDS: ReadonlySet<SampledFeed> = new Set<SampledFeed>();
-
-/**
- * Mission RPCs the core track adds with the portfolio and lane nudges. Their
- * contract schemas land with that branch; until then they are called by name
- * with the shapes in `source.ts` (`PortfolioSnapshot`, `SetPortfolioOrderInput`,
- * `NudgeLaneInput`).
- */
-export const CORE_MISSIONS_METHODS = {
-  portfolio: "missions.portfolio",
-  setPortfolioOrder: "missions.setPortfolioOrder",
-  nudgeLane: "missions.nudgeLane",
-} as const;
 
 /** Work items read per `missions.workItems` page (the server's maximum). */
 const WORK_PAGE_SIZE = 500;
@@ -494,8 +483,6 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   const { transport } = options;
   const now = options.now ?? Date.now;
   const bus = createBus();
-  const requestByName = <T>(method: string, input: unknown) =>
-    (transport.request as unknown as (tag: string, input: unknown) => Promise<T>)(method, input);
 
   // One `missions.subscribe` stream per mission, shared by every screen.
   const missionFeed = sharedFeeds<MissionId, MissionFeedState>((missionId, emit) => {
@@ -625,7 +612,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   };
 
   // Keyed by mission and query, so two screens asking the same thing share a read.
-  const workFeed = sharedFeeds<string, MissionWorkSnapshot>((key, emit) => {
+  const workFeed = sharedFeeds<string, MissionWorkSnapshot>((key, emit, fail) => {
     const [missionId, query] = JSON.parse(key) as [MissionId, WorkQuery];
     return requestFeed({
       missionId,
@@ -633,6 +620,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       refreshOn: kindStarts("work-item."),
       topics: [],
       emit,
+      // --- finish-b ---
+      onError: fail,
     }).stop;
   });
 
@@ -709,7 +698,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   // Refetched whenever the mission list moves and after the owner reorders.
   const portfolioFeed = sharedFeeds<null, PortfolioSnapshot>((_, emit) => {
     const loader = refetching(
-      () => requestByName<PortfolioSnapshot>(CORE_MISSIONS_METHODS.portfolio, {}),
+      () => transport.request(WS_METHODS.missionsPortfolio, {}),
       emit,
       ignore,
     );
@@ -744,7 +733,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   );
   // --- end finish-a ---
 
-  const rulesFeed = sharedFeeds<MissionId, RuleRecords>((missionId, emit) =>
+  const rulesFeed = sharedFeeds<MissionId, RuleRecords>((missionId, emit, fail) =>
     transport.stream(
       ASKS.subscribeRules,
       { missionId },
@@ -758,59 +747,65 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
           ),
         }),
       ),
+      // --- finish-b ---
+      fail,
     ),
   );
 
-  const roomsFeed = sharedFeeds<MissionId, ReadonlyArray<MissionRoomEntry>>((missionId, emit) => {
-    // Unread counts come from the room list once the router sends them (r5);
-    // until then from each room's newest page plus the gap back to the read
-    // mark. A room is only read again when it has a newer message or the
-    // owner read or posted in it.
-    const counted = new Map<RoomId, { readonly lastSeq: number; readonly unread: number }>();
-    const stale = new Set<RoomId>();
-    const unreadOf = async (room: Room): Promise<number> => {
-      const listed = listedRoomUnread(room);
-      if (listed !== null) return room.archived ? 0 : listed;
-      const known = counted.get(room.id);
-      if (known !== undefined && known.lastSeq === room.lastSeq && !stale.has(room.id))
-        return known.unread;
-      stale.delete(room.id);
-      if (room.archived || room.lastSeq === 0) {
-        counted.set(room.id, { lastSeq: room.lastSeq, unread: 0 });
-        return 0;
-      }
-      const page = await transport.request(WS_METHODS.missionsRoomPage, {
-        roomId: room.id,
-        limit: ROOM_PAGE_SIZE,
+  const roomsFeed = sharedFeeds<MissionId, ReadonlyArray<MissionRoomEntry>>(
+    (missionId, emit, fail) => {
+      // Unread counts come from the room list once the router sends them (r5);
+      // until then from each room's newest page plus the gap back to the read
+      // mark. A room is only read again when it has a newer message or the
+      // owner read or posted in it.
+      const counted = new Map<RoomId, { readonly lastSeq: number; readonly unread: number }>();
+      const stale = new Set<RoomId>();
+      const unreadOf = async (room: Room): Promise<number> => {
+        const listed = listedRoomUnread(room);
+        if (listed !== null) return room.archived ? 0 : listed;
+        const known = counted.get(room.id);
+        if (known !== undefined && known.lastSeq === room.lastSeq && !stale.has(room.id))
+          return known.unread;
+        stale.delete(room.id);
+        if (room.archived || room.lastSeq === 0) {
+          counted.set(room.id, { lastSeq: room.lastSeq, unread: 0 });
+          return 0;
+        }
+        const page = await transport.request(WS_METHODS.missionsRoomPage, {
+          roomId: room.id,
+          limit: ROOM_PAGE_SIZE,
+        });
+        const unread = pageUnread(page);
+        counted.set(room.id, { lastSeq: room.lastSeq, unread });
+        return unread;
+      };
+      const feed = requestFeed({
+        missionId,
+        load: async () => {
+          const rooms = await transport.request(WS_METHODS.missionsRooms, { missionId });
+          return Promise.all(rooms.map(async (room) => ({ room, unread: await unreadOf(room) })));
+        },
+        refreshOn: (event) =>
+          event.kind === "message.posted" ||
+          event.kind.startsWith("room.") ||
+          event.kind.startsWith("knock."),
+        topics: [],
+        emit,
+        // --- finish-b ---
+        onError: fail,
       });
-      const unread = pageUnread(page);
-      counted.set(room.id, { lastSeq: room.lastSeq, unread });
-      return unread;
-    };
-    const feed = requestFeed({
-      missionId,
-      load: async () => {
-        const rooms = await transport.request(WS_METHODS.missionsRooms, { missionId });
-        return Promise.all(rooms.map(async (room) => ({ room, unread: await unreadOf(room) })));
-      },
-      refreshOn: (event) =>
-        event.kind === "message.posted" ||
-        event.kind.startsWith("room.") ||
-        event.kind.startsWith("knock."),
-      topics: [],
-      emit,
-    });
-    const stopTouched = bus.on("rooms", (roomId) => {
-      if (roomId !== undefined) stale.add(roomId as RoomId);
-      feed.refresh();
-    });
-    return () => {
-      stopTouched();
-      feed.stop();
-    };
-  });
+      const stopTouched = bus.on("rooms", (roomId) => {
+        if (roomId !== undefined) stale.add(roomId as RoomId);
+        feed.refresh();
+      });
+      return () => {
+        stopTouched();
+        feed.stop();
+      };
+    },
+  );
 
-  const roomPageFeed = sharedFeeds<RoomId, RoomPage | null>((roomId, emit) => {
+  const roomPageFeed = sharedFeeds<RoomId, RoomPage | null>((roomId, emit, fail) => {
     let closed = false;
     let stopEvents: Unsubscribe | null = null;
     const loader = refetching(
@@ -826,7 +821,9 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         });
       },
       (error) => {
+        // --- finish-b --- a gone room reads as null; anything else fails the feed.
         if (isNotFound(error)) emit(null);
+        else fail(error);
       },
     );
     loader.run();
@@ -1043,10 +1040,10 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       };
     },
 
-    subscribeWork: (missionId, listener, query = {}) =>
-      workFeed(JSON.stringify([missionId, query]), listener),
+    subscribeWork: (missionId, listener, query = {}, onError) =>
+      workFeed(JSON.stringify([missionId, query]), listener, onError),
 
-    subscribeRuleBook(missionId, listener) {
+    subscribeRuleBook(missionId, listener, onError) {
       let rules: RuleRecords | undefined;
       let inbox: MissionInbox | undefined;
       let events: ReadonlyArray<MissionEvent> = [];
@@ -1059,8 +1056,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
           missionId,
           rules: records.rules,
           changeRequests: records.changeRequests,
-          // The conflict and stale audit has no RPC yet.
-          audit: [],
+          // --- finish-b --- read off the live rule records.
+          audit: ruleAudit(records.rules),
           suggestions: (current?.suggestions ?? []).filter(
             (suggestion) => suggestion.targetKind === "rule",
           ),
@@ -1071,10 +1068,15 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         if (rules !== undefined) listener(book(rules, inbox, events));
       };
       const stops = [
-        rulesFeed(missionId, (value) => {
-          rules = value;
-          push();
-        }),
+        rulesFeed(
+          missionId,
+          (value) => {
+            rules = value;
+            push();
+          },
+          // --- finish-b ---
+          onError,
+        ),
         inboxFeed(missionId, (value) => {
           inbox = value;
           push();
@@ -1089,7 +1091,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       };
     },
 
-    subscribeRoles(missionId, listener) {
+    subscribeRoles(missionId, listener, onError) {
       let events: ReadonlyArray<MissionEvent> = [];
       let roles: MissionsRoles | undefined;
       const snapshot = memoLast((current: MissionsRoles, log: ReadonlyArray<MissionEvent>) => ({
@@ -1108,6 +1110,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
           roles = value;
           push();
         },
+        // --- finish-b ---
+        ...(onError ? { onError } : {}),
       });
       const stopFeed = missionFeed(missionId, (state) => {
         events = state.events;
@@ -1126,9 +1130,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         (current: MissionsReviewPolicy, log: ReadonlyArray<MissionEvent>) => ({
           missionId,
           policy: current.policy,
-          // Verdicts and reviews have no list RPC yet.
-          verdicts: [],
-          reviews: [],
+          verdicts: current.verdicts ?? [],
+          reviews: current.reviews ?? [],
           changes: changesFor(log, ["review-policy"]),
         }),
       );
@@ -1232,8 +1235,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       });
     },
 
-    subscribeRooms: (missionId, listener) => roomsFeed(missionId, listener),
-    subscribeRoom: (roomId, listener) => roomPageFeed(roomId, listener),
+    subscribeRooms: (missionId, listener, onError) => roomsFeed(missionId, listener, onError),
+    subscribeRoom: (roomId, listener, onError) => roomPageFeed(roomId, listener, onError),
 
     loadRoomPage: (input) =>
       transport.request(WS_METHODS.missionsRoomPage, {
@@ -1349,8 +1352,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     // --- Lanes ---
 
     nudgeLane: async ({ laneId, note }) => {
-      await requestByName(
-        CORE_MISSIONS_METHODS.nudgeLane,
+      await transport.request(
+        WS_METHODS.missionsNudgeLane,
         note === undefined ? { laneId } : { laneId, note },
       );
     },
@@ -1391,9 +1394,79 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       bus.emit("pools");
     },
     setPortfolioOrder: async ({ order }) => {
-      await requestByName(CORE_MISSIONS_METHODS.setPortfolioOrder, { order });
+      await transport.request(WS_METHODS.missionsSetPortfolioOrder, { order });
       bus.emit("portfolio");
     },
+
+    // --- finish-b ---
+    createMission: async (input) => {
+      const result = await transport.request(WS_METHODS.missionsCreate, input);
+      bus.emit("portfolio");
+      // The ref of a created mission is the mission itself.
+      return result.ref.id as MissionId;
+    },
+    createLane: async ({ missionId, name, subMissionId }) => {
+      await transport.request(WS_METHODS.missionsUpsertLane, {
+        missionId,
+        name,
+        ...(subMissionId ? { subMissionId } : {}),
+      });
+    },
+    createRole: async (input) => {
+      await transport.request(POLICY.createRole, input);
+      bus.emit("roles");
+    },
+    tuneRoom: async (input) => {
+      await transport.request(WS_METHODS.missionsTuneRoom, input);
+      touchRoom(input.roomId);
+    },
+    updateRoom: async (input) => {
+      await transport.request(WS_METHODS.missionsUpdateRoom, input);
+      touchRoom(input.roomId);
+    },
+    revertChange: async (action) => {
+      switch (action._tag) {
+        case "mission":
+          await transport.request(WS_METHODS.missionsUpdate, action.input);
+          bus.emit("portfolio");
+          return;
+        case "status":
+          await transport.request(WS_METHODS.missionsSetStatus, action.input);
+          return;
+        case "focus":
+          await transport.request(WS_METHODS.missionsSetFocus, action.input);
+          return;
+        case "order":
+          await transport.request(WS_METHODS.missionsSetPortfolioOrder, {
+            order: action.input.order,
+          });
+          bus.emit("portfolio");
+          return;
+        case "lane":
+          await transport.request(WS_METHODS.missionsUpsertLane, action.input);
+          return;
+        case "role":
+          await transport.request(POLICY.updateRole, action.input);
+          bus.emit("roles");
+          return;
+        case "role-model":
+          await transport.request(POLICY.setRoleModel, action.input);
+          bus.emit("roles");
+          return;
+        case "pool-capacity":
+          await transport.request(POLICY.setPoolCapacity, action.input);
+          bus.emit("pools");
+          return;
+        case "recovery":
+          await transport.request(RECOVERY.settings, action.input);
+          return;
+        case "room":
+          await transport.request(WS_METHODS.missionsUpdateRoom, action.input);
+          touchRoom(action.input.roomId);
+          return;
+      }
+    },
+    // --- end finish-b ---
 
     subscribeViews(missionId, listener) {
       let snapshot: MissionViewsSnapshot | null | undefined;

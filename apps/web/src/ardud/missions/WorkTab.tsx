@@ -4,18 +4,31 @@ import type { MissionId, WorkItem } from "@t3tools/contracts";
 import {
   ageView,
   OPEN_WORK_STAGES,
+  pullRequestReviews,
+  reviewPolicyView,
   workBoard,
   workFacts,
+  type PullRequestReviews,
+  type ReviewPolicyView,
   type WorkQuery,
   type WorkRow,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { cn } from "../../lib/utils";
 import { StateGlyph } from "./cards/chips";
-import { DESK_ROW, DeskChip, Figure, FoldRow, PageLine, Segmented } from "./deskParts";
+import {
+  DESK_ROW,
+  DeskChip,
+  FeedErrors,
+  Figure,
+  FoldRow,
+  PageLine,
+  Segmented,
+  TabLoading,
+} from "./deskParts";
 import { MissionSection } from "./MissionSection";
-import { useMasterRoleId, useMissionOverview } from "./missionsStore";
-import { useWorkFeed } from "./useMissionFeeds";
+import { useMasterRoleId, useMissionOverview, useMissionReviewPolicy } from "./missionsStore";
+import { useWorkFeed, useWorkFeedState } from "./useMissionFeeds";
 
 // Work tab: open work by holder (or stage), the stage strip, chains, the last
 // finished items and the deferred register. Grouping lives in workViewModel.
@@ -34,8 +47,17 @@ const GROUPINGS = [
 export function WorkTab(props: { missionId: MissionId; nowMs: number }) {
   const open = useWorkFeed(props.missionId, OPEN_QUERY);
   const done = useWorkFeed(props.missionId, DONE_QUERY);
+  const feeds = [
+    useWorkFeedState(props.missionId, OPEN_QUERY),
+    useWorkFeedState(props.missionId, DONE_QUERY),
+  ];
   const overview = useMissionOverview(props.missionId);
   const masterRoleId = useMasterRoleId(props.missionId);
+  const reviewPolicy = useMissionReviewPolicy(props.missionId);
+  const reviews = useMemo(
+    () => (reviewPolicy ? reviewPolicyView(reviewPolicy, masterRoleId) : null),
+    [reviewPolicy, masterRoleId],
+  );
   const [grouping, setGrouping] = useState<Grouping>("holder");
   const board = useMemo(() => {
     if (!open) return null;
@@ -44,10 +66,12 @@ export function WorkTab(props: { missionId: MissionId; nowMs: number }) {
     );
     return workBoard(open.items, masterRoleId, titles);
   }, [open, overview, masterRoleId]);
-  if (!board) return <p className="text-sm text-(--m-muted)">Loading work…</p>;
+  if (!board)
+    return <TabLoading label="Loading work…" what="the work" feeds={feeds} nowMs={props.nowMs} />;
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
+      <FeedErrors what="the work" feeds={feeds} nowMs={props.nowMs} />
       <PageLine
         actions={
           <Segmented label="Group by" value={grouping} options={GROUPINGS} onChange={setGrouping} />
@@ -91,12 +115,23 @@ export function WorkTab(props: { missionId: MissionId; nowMs: number }) {
         <div className="flex min-w-0 flex-col gap-4 lg:col-span-8 [&>*:last-child]:grow">
           {grouping === "holder" ? (
             <>
-              <RowPanel title="With you" rows={board.withYou} nowMs={props.nowMs} />
-              <RowPanel title="Blocked" rows={board.blocked} nowMs={props.nowMs} />
+              <RowPanel
+                title="With you"
+                rows={board.withYou}
+                nowMs={props.nowMs}
+                reviews={reviews}
+              />
+              <RowPanel
+                title="Blocked"
+                rows={board.blocked}
+                nowMs={props.nowMs}
+                reviews={reviews}
+              />
               <RowPanel
                 title="Moving"
                 rows={board.moving}
                 nowMs={props.nowMs}
+                reviews={reviews}
                 shown={MOVING_SHOWN}
               />
             </>
@@ -107,6 +142,7 @@ export function WorkTab(props: { missionId: MissionId; nowMs: number }) {
                 title={group.label}
                 rows={group.rows}
                 nowMs={props.nowMs}
+                reviews={reviews}
                 shown={MOVING_SHOWN}
                 hideStage
               />
@@ -160,6 +196,7 @@ function RowPanel(props: {
   title: string;
   rows: ReadonlyArray<WorkRow>;
   nowMs: number;
+  reviews: ReviewPolicyView | null;
   shown?: number;
   hideStage?: boolean;
 }) {
@@ -175,6 +212,7 @@ function RowPanel(props: {
             key={row.item.id}
             row={row}
             nowMs={props.nowMs}
+            reviews={props.reviews}
             hideStage={props.hideStage === true}
           />
         ))}
@@ -186,9 +224,18 @@ function RowPanel(props: {
   );
 }
 
-function WorkRowItem(props: { row: WorkRow; nowMs: number; hideStage: boolean }) {
+function WorkRowItem(props: {
+  row: WorkRow;
+  nowMs: number;
+  hideStage: boolean;
+  reviews: ReviewPolicyView | null;
+}) {
   const { row } = props;
+  const [open, setOpen] = useState(false);
   const age = ageView(row.item.updatedAt, props.nowMs);
+  const pullRequest = row.item.pullRequest;
+  const reviews =
+    open && pullRequest && props.reviews ? pullRequestReviews(props.reviews, pullRequest) : null;
   return (
     <li
       className={cn(
@@ -202,7 +249,18 @@ function WorkRowItem(props: { row: WorkRow; nowMs: number; hideStage: boolean })
           label={row.glyph === "risk" ? "With you" : row.glyph === "bad" ? "Blocked" : "Moving"}
         />
       </span>
-      <span className="min-w-0 truncate font-medium">{row.item.title}</span>
+      {pullRequest ? (
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+          className="min-w-0 truncate rounded-sm text-start font-medium outline-none hover:underline focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset"
+        >
+          {row.item.title}
+        </button>
+      ) : (
+        <span className="min-w-0 truncate font-medium">{row.item.title}</span>
+      )}
       <span className="flex items-center justify-end gap-3.5 whitespace-nowrap">
         {props.hideStage ? null : (
           <span className="hidden w-21 text-(--m-muted) sm:inline">{row.stageLabel}</span>
@@ -222,7 +280,43 @@ function WorkRowItem(props: { row: WorkRow; nowMs: number; hideStage: boolean })
           {row.reason}
         </span>
       ) : null}
+      {reviews ? <PullRequestRounds reviews={reviews} /> : null}
     </li>
+  );
+}
+
+/** A PR row opened: its review rounds as chips, then its criticality call. */
+function PullRequestRounds(props: { reviews: PullRequestReviews }) {
+  const { verdict, rounds } = props.reviews;
+  if (!verdict && rounds.length === 0) {
+    return (
+      <span className="col-start-2 col-end-4 pt-1 text-xs text-(--m-muted)">No rounds yet</span>
+    );
+  }
+  return (
+    <div className="col-start-2 col-end-4 flex min-w-0 flex-col gap-1.5 pt-1.5">
+      {rounds.length > 0 ? (
+        <ul className="flex min-w-0 flex-wrap gap-1.5" aria-label="Review rounds">
+          {rounds.map((round) => (
+            <li key={round.review.id}>
+              <DeskChip className={round.review.verdict === "blocked" ? "text-(--m-negative)" : ""}>
+                {round.chip}
+              </DeskChip>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {verdict ? (
+        <span className="min-w-0 text-xs text-(--m-muted)">
+          <span
+            className={verdict.verdict.critical ? "font-medium text-(--m-negative)" : undefined}
+          >
+            {verdict.verdict.critical ? "Critical" : "Not critical"}
+          </span>
+          {` ${verdict.verdict.reason}`}
+        </span>
+      ) : null}
+    </div>
   );
 }
 

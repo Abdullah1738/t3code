@@ -2,6 +2,8 @@ import type {
   AckNoteInput,
   AnswerAskInput,
   Approver,
+  CreateMissionInput,
+  CreateRoleInput,
   CriticalityVerdict,
   DecideApprovalInput,
   DecideDraftInput,
@@ -34,6 +36,7 @@ import type {
   PoolsSnapshot,
   PostMessageInput,
   RecoveryIncident,
+  RecoverySettingsInput,
   ReactToCallInput,
   ReorderSubMissionsInput,
   ResolveRuleChangeInput,
@@ -51,12 +54,18 @@ import type {
   SetCriticalityGuideInput,
   SetDraftNoteActiveInput,
   SetMissionFocusInput,
+  SetMissionStatusInput,
   SetPoolCapacityInput as ContractSetPoolCapacityInput,
   SetRoleModelInput,
   SplitLaneInput,
   SubMissionId,
   Suggestion,
   SuggestionStats,
+  TuneRoomInput,
+  UpdateMissionInput,
+  UpdateRoleInput,
+  UpdateRoomInput,
+  UpsertLaneInput,
   UpsertRuleInput,
   WorkItem,
   WorkStage,
@@ -141,6 +150,10 @@ export interface FieldChange {
   readonly actor: MissionActor;
   readonly eventId: MissionEventId;
   readonly at: string;
+  // --- finish-b ---
+  /** The value the change replaced, when the event kept it. */
+  readonly previous?: string | number | undefined;
+  // --- end finish-b ---
 }
 
 /**
@@ -233,6 +246,31 @@ export interface NudgeLaneInput {
   readonly note?: string;
 }
 
+// --- finish-b ---
+/** A new lane: the server's upsert with no lane id. */
+export interface NewLaneInput {
+  readonly missionId: MissionId;
+  readonly name: string;
+  readonly subMissionId?: SubMissionId;
+}
+
+/**
+ * Puts back the value a change replaced, through the same write RPC that
+ * made the change. The server records it as a new change.
+ */
+export type RevertAction =
+  | { readonly _tag: "mission"; readonly input: UpdateMissionInput }
+  | { readonly _tag: "status"; readonly input: SetMissionStatusInput }
+  | { readonly _tag: "focus"; readonly input: SetMissionFocusInput }
+  | { readonly _tag: "order"; readonly input: SetPortfolioOrderInput }
+  | { readonly _tag: "lane"; readonly input: UpsertLaneInput }
+  | { readonly _tag: "role"; readonly input: UpdateRoleInput }
+  | { readonly _tag: "role-model"; readonly input: SetRoleModelInput }
+  | { readonly _tag: "pool-capacity"; readonly input: ContractSetPoolCapacityInput }
+  | { readonly _tag: "recovery"; readonly input: RecoverySettingsInput }
+  | { readonly _tag: "room"; readonly input: UpdateRoomInput };
+// --- end finish-b ---
+
 /** Ends the lane lead's thread and binds a fresh one with this handoff note. */
 export interface HandOffLaneInput {
   readonly laneId: LaneId;
@@ -271,10 +309,15 @@ export interface MissionWorkSnapshot {
 
 // --- Rules -----------------------------------------------------------------
 
-/** Conflict and staleness findings over the rule book (scribe or master audit). */
+/**
+ * Findings over the rule book. Conflict and stale come from a scribe or master
+ * audit; broken, reading and acks are read off the live rule records
+ * (`ruleAudit` in rulesViewModel).
+ */
 export interface RuleAuditFinding {
   readonly id: string;
-  readonly kind: "conflict" | "stale";
+  // --- finish-b --- broken, reading and acks are computed from the rules.
+  readonly kind: "conflict" | "stale" | "broken" | "reading" | "acks";
   readonly ruleIds: ReadonlyArray<RuleId>;
   readonly note: string;
   readonly foundBy: MissionActor;
@@ -361,7 +404,13 @@ export interface PortfolioSnapshot {
   /** Latest change per mission field (`tier`, `guaranteedShare`, `borrowCeiling`). */
   readonly changes: ReadonlyArray<FieldChange>;
   /** Who set the current order, from the newest `portfolio.reordered` event. */
-  readonly orderChange: { readonly actor: MissionActor; readonly at: string } | null;
+  readonly orderChange: {
+    readonly actor: MissionActor;
+    readonly at: string;
+    // --- finish-b ---
+    readonly previousOrder?: ReadonlyArray<MissionId> | undefined;
+    // --- end finish-b ---
+  } | null;
 }
 
 export interface SetPortfolioOrderInput {
@@ -525,9 +574,27 @@ export interface MissionsSource {
     missionId: MissionId,
     listener: Listener<MissionWorkSnapshot>,
     query?: WorkQuery,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
   ): Unsubscribe;
-  subscribeRuleBook(missionId: MissionId, listener: Listener<MissionRuleBook>): Unsubscribe;
-  subscribeRoles(missionId: MissionId, listener: Listener<MissionRolesSnapshot>): Unsubscribe;
+  subscribeRuleBook(
+    missionId: MissionId,
+    listener: Listener<MissionRuleBook>,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
+  ): Unsubscribe;
+  subscribeRoles(
+    missionId: MissionId,
+    listener: Listener<MissionRolesSnapshot>,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
+  ): Unsubscribe;
   /** `null` when the mission has no review policy. */
   subscribeReviewPolicy(
     missionId: MissionId,
@@ -576,6 +643,10 @@ export interface MissionsSource {
   subscribeRooms(
     missionId: MissionId,
     listener: Listener<ReadonlyArray<MissionRoomEntry>>,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
   ): Unsubscribe;
   /**
    * The newest page of a room, kept current as messages arrive. It reaches
@@ -583,7 +654,14 @@ export interface MissionsSource {
    * read marker is on screen. Older pages come from `loadRoomPage`. `null`
    * means the room does not exist.
    */
-  subscribeRoom(roomId: RoomId, listener: Listener<RoomPage | null>): Unsubscribe;
+  subscribeRoom(
+    roomId: RoomId,
+    listener: Listener<RoomPage | null>,
+    // --- finish-b ---
+    /** A read failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-b ---
+  ): Unsubscribe;
   loadRoomPage(input: LoadRoomPageInput): Promise<RoomPage>;
 
   reorderSubMissions(input: ReorderSubMissionsInput): Promise<void>;
@@ -633,6 +711,19 @@ export interface MissionsSource {
   setCriticalityGuide(input: SetCriticalityGuideInput): Promise<void>;
   setPoolCapacity(input: SetPoolCapacityInput): Promise<void>;
   setPortfolioOrder(input: SetPortfolioOrderInput): Promise<void>;
+
+  // --- finish-b ---
+  /** Creates a mission and resolves with its id. */
+  createMission(input: CreateMissionInput): Promise<MissionId>;
+  createLane(input: NewLaneInput): Promise<void>;
+  createRole(input: CreateRoleInput): Promise<void>;
+  /** Who each message kind wakes in a room (owner or master). */
+  tuneRoom(input: TuneRoomInput): Promise<void>;
+  /** Rename, move to another sub-mission, remove (archive) or restore a room. */
+  updateRoom(input: UpdateRoomInput): Promise<void>;
+  /** Puts a change's previous value back through the write that made it. */
+  revertChange(action: RevertAction): Promise<void>;
+  // --- end finish-b ---
 
   /** The mission's views record (layout, sections, pins) and its change log; null when gone. */
   subscribeViews(missionId: MissionId, listener: Listener<MissionViewsState | null>): Unsubscribe;

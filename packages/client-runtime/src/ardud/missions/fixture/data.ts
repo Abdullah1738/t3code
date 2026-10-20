@@ -1506,7 +1506,14 @@ export const messages = messageRows.map(([seq, roomId, kind, sender, workItem, t
       workItem !== null && /^CRP-\d+$/.test(workItem)
         ? [{ kind: "ticket", label: workItem, url: null, ref: workItem }]
         : [],
-    receipt: receipt ? { reached: receipt[0], total: receipt[1], pending: receipt[2] } : null,
+    receipt: receipt
+      ? {
+          reached: receipt[0],
+          total: receipt[1],
+          pending: receipt[2],
+          pendingActors: receipt[2].map(senderActor),
+        }
+      : null,
     isCorrection: false,
     createdAt: `2026-10-17T${time}.000Z`,
   };

@@ -276,6 +276,8 @@ const RPC_AGGREGATES = {
   [WS_METHODS.missionsDecideKnock]: "missions",
   [WS_METHODS.missionsRoomTuning]: "missions",
   [WS_METHODS.missionsTuneRoom]: "missions",
+  // ardud missions: finish-b
+  [WS_METHODS.missionsUpdateRoom]: "missions",
   [WS_METHODS.missionsAttention]: "missions",
   [WS_METHODS.missionsOwnerRequests]: "missions",
   [WS_METHODS.missionsOpenOwnerRequest]: "missions",

@@ -5,7 +5,7 @@ import type { MissionId, Rule, RuleChangeRequest, SubMission } from "@t3tools/co
 import {
   actorName,
   actorNames,
-  auditTitle,
+  auditCards,
   CHANGE_REQUEST_STATUS_LABEL,
   editReadingInput,
   formatDayLabel,
@@ -27,7 +27,7 @@ import {
 import { Button } from "../../components/ui/button";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import { DESK_ROW, DeskChip, Figure, FoldRow, PageLine } from "./deskParts";
+import { DESK_ROW, DeskChip, FeedErrors, Figure, FoldRow, PageLine, TabLoading } from "./deskParts";
 import { submitMissionInput } from "./missionActions";
 import { PairActionForm, TextActionForm } from "./MissionForms";
 import {
@@ -36,6 +36,7 @@ import {
   useMissionLanes,
   useMissionRoles,
   useMissionRuleBook,
+  useMissionRuleBookFeed,
 } from "./missionsStore";
 import { addRule, editRule, resolveRuleChange, toggleRuleRetired } from "./operationCommands";
 import { AskMasterForm } from "./sections/SectionShell";
@@ -64,6 +65,7 @@ export function RulesTab(props: {
   nowMs: number;
 }) {
   const book = useMissionRuleBook(props.missionId);
+  const feeds = [useMissionRuleBookFeed(props.missionId)];
   const masterRoleId = useMasterRoleId(props.missionId);
   const lanes = useMissionLanes(props.missionId);
   const roles = useMissionRoles(props.missionId);
@@ -81,7 +83,8 @@ export function RulesTab(props: {
   const [adding, setAdding] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [showRetired, setShowRetired] = useState(false);
-  if (!book || !view) return <p className="text-sm text-(--m-muted)">Loading rules…</p>;
+  if (!book || !view)
+    return <TabLoading label="Loading rules…" what="the rules" feeds={feeds} nowMs={props.nowMs} />;
 
   const context: RulesContext = {
     missionId: props.missionId,
@@ -95,9 +98,11 @@ export function RulesTab(props: {
   const openId = picked ?? (wide ? (list[0]?.row.rule.id ?? null) : null);
   const open = rows.find((row) => row.rule.id === openId) ?? null;
   const shown = showAll ? list : list.slice(0, LIST_SHOWN);
+  const cards = auditCards(book.audit, book.rules);
 
   return (
     <div className="flex min-w-0 flex-col gap-5">
+      <FeedErrors what="the rules" feeds={feeds} nowMs={props.nowMs} />
       <PageLine
         actions={
           <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
@@ -127,25 +132,29 @@ export function RulesTab(props: {
           />
         </div>
       ) : null}
-      {book.audit.length > 0 ? (
+      {cards.length > 0 ? (
         <ul className="grid gap-3 sm:grid-cols-2">
-          {book.audit.map((finding) => (
+          {cards.map((card) => (
             <li
-              key={finding.id}
+              key={card.key}
               className="flex items-center gap-3 rounded-2xl bg-(--m-surface) px-5 py-4"
             >
               <div className="flex min-w-0 flex-col gap-0.5">
-                <p className="text-sm font-semibold">{auditTitle(finding, book.rules)}</p>
-                <p className="text-xs text-(--m-muted)">
-                  {`Audit by ${actorName(finding.foundBy, masterRoleId, names)}, ${whenLabel(finding.at, props.nowMs)}`}
-                </p>
+                <p className="text-sm font-semibold">{card.title}</p>
+                {card.finding ? (
+                  <p className="text-xs text-(--m-muted)">
+                    {`Audit by ${actorName(card.finding.foundBy, masterRoleId, names)}, ${whenLabel(card.finding.at, props.nowMs)}`}
+                  </p>
+                ) : card.line ? (
+                  <p className="text-xs text-(--m-muted)">{card.line}</p>
+                ) : null}
               </div>
-              {finding.ruleIds[0] ? (
+              {card.ruleId ? (
                 <Button
                   size="sm"
                   variant="outline"
                   className="ms-auto"
-                  onClick={() => setPicked(finding.ruleIds[0] ?? null)}
+                  onClick={() => setPicked(card.ruleId)}
                 >
                   Review
                 </Button>

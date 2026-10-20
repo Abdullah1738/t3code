@@ -533,6 +533,10 @@ export const RoomNoise = Schema.Struct({
   actionableShare: Share,
   /** Wakes whose recipient acked without acting, last 24h. */
   wastedWakes: NonNegativeInt,
+  // --- finish-b additions ---
+  /** Messages per kind in the last 24h. */
+  kinds24h: Schema.optional(Schema.Record(Schema.String, NonNegativeInt)),
+  // --- end finish-b additions ---
 });
 export type RoomNoise = typeof RoomNoise.Type;
 
@@ -574,6 +578,10 @@ export const BroadcastReceipt = Schema.Struct({
   total: NonNegativeInt,
   /** Recipients not reached yet, by label. */
   pending: Schema.Array(Schema.String),
+  // --- finish-b additions ---
+  /** The same recipients as `pending`, as actors, so a client can nudge them. */
+  pendingActors: Schema.optional(Schema.Array(MissionActor)),
+  // --- end finish-b additions ---
 });
 export type BroadcastReceipt = typeof BroadcastReceipt.Type;
 
@@ -923,6 +931,10 @@ export const Rule = Schema.Struct({
   lockedFields: LockedFields,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- finish-b additions ---
+  /** The rule version the master's reading was written for. Missing on older records. */
+  readingVersion: Schema.optional(PositiveInt),
+  // --- end finish-b additions ---
 });
 export type Rule = typeof Rule.Type;
 
@@ -1791,6 +1803,11 @@ export const MissionEventKind = Schema.Literals([
   "send.guarded",
   "member.changed",
   "room.tuned",
+  // --- finish-b additions ---
+  "room.updated",
+  "room.restored",
+  "rule.acked",
+  // --- end finish-b additions ---
   "request.opened",
   "request.replied",
   "request.settled",
@@ -2263,6 +2280,10 @@ export const MissionPortfolio = Schema.Struct({
   order: Schema.Array(MissionId),
   changedBy: MissionActor,
   updatedAt: IsoDateTime,
+  // --- finish-b additions ---
+  /** The order this one replaced, so a revert can put it back. */
+  previousOrder: Schema.optional(Schema.Array(MissionId)),
+  // --- end finish-b additions ---
 });
 export type MissionPortfolio = typeof MissionPortfolio.Type;
 // --- end core additions ---
@@ -2612,6 +2633,21 @@ export const RoomTuning = Schema.Struct({
   updatedAt: Schema.NullOr(IsoDateTime),
 });
 export type RoomTuning = typeof RoomTuning.Type;
+
+// --- finish-b additions ---
+/**
+ * Owner or the mission's master: rename a room, move it to another sub-mission
+ * (null for none), or remove and restore it. Removing archives the room; the
+ * control room can't be removed.
+ */
+export const UpdateRoomInput = Schema.Struct({
+  roomId: RoomId,
+  title: Schema.optional(TrimmedNonEmptyString),
+  subMissionId: Schema.optional(Schema.NullOr(SubMissionId)),
+  archived: Schema.optional(Schema.Boolean),
+});
+export type UpdateRoomInput = typeof UpdateRoomInput.Type;
+// --- end finish-b additions ---
 
 /** The deliveries of one mission that were reminded once and are still unread. */
 export const MissionAttentionInput = Schema.Struct({
@@ -3235,6 +3271,10 @@ export const PortfolioFieldChange = Schema.Struct({
   actor: MissionActor,
   eventId: MissionEventId,
   at: IsoDateTime,
+  // --- finish-b additions ---
+  /** The value the change replaced, when the event kept it. */
+  previous: Schema.optional(Schema.Union([Schema.String, Schema.Number])),
+  // --- end finish-b additions ---
 });
 export type PortfolioFieldChange = typeof PortfolioFieldChange.Type;
 
@@ -3245,7 +3285,15 @@ export const PortfolioSnapshot = Schema.Struct({
   /** Latest change per mission field: tier, guaranteedShare, borrowCeiling. */
   changes: Schema.Array(PortfolioFieldChange),
   /** Who last reordered, and when; null until anyone has. */
-  orderChange: Schema.NullOr(Schema.Struct({ actor: MissionActor, at: IsoDateTime })),
+  orderChange: Schema.NullOr(
+    Schema.Struct({
+      actor: MissionActor,
+      at: IsoDateTime,
+      // --- finish-b additions ---
+      previousOrder: Schema.optional(Schema.Array(MissionId)),
+      // --- end finish-b additions ---
+    }),
+  ),
 });
 export type PortfolioSnapshot = typeof PortfolioSnapshot.Type;
 
@@ -3273,6 +3321,14 @@ export const RecordRuleUseInput = Schema.Struct({
   note: Schema.optional(Schema.String),
 });
 export type RecordRuleUseInput = typeof RecordRuleUseInput.Type;
+
+// --- finish-b additions ---
+/** A lane acknowledges the rule's current version. */
+export const AckRuleInput = Schema.Struct({
+  ruleId: RuleId,
+});
+export type AckRuleInput = typeof AckRuleInput.Type;
+// --- end finish-b additions ---
 
 /** Close a rule-change request: applied, declined, or withdrawn by its asker. */
 export const ResolveRuleChangeInput = Schema.Struct({

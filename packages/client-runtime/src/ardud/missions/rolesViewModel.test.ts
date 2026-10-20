@@ -4,7 +4,9 @@ import { describe, expect, it } from "vite-plus/test";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import { poolRows, recoveryBanner, recoveryView, setPoolCapacityInput } from "./poolsViewModel.ts";
 import {
+  newRoleInput,
   pendingModelLine,
+  pullRequestReviews,
   reviewerRows,
   reviewPolicyView,
   roleHistory,
@@ -223,6 +225,20 @@ describe("roles page", () => {
       "Rule-7 exact-head merge",
     ]);
     expect(view.verdicts.at(-1)?.ref).toBe("risk-liquidation-latest#68");
+    const risk = pullRequestReviews(view, {
+      repository: "risk-liquidation-latest",
+      number: 68,
+    } as never);
+    expect(risk.verdict?.verdict.critical).toBe(true);
+    expect(risk.rounds.length).toBeGreaterThan(0);
+    expect(risk.rounds[0]?.chip).toMatch(/ r1: /);
+    expect(risk.rounds.map((row) => row.review.createdAt)).toEqual(
+      risk.rounds.map((row) => row.review.createdAt).toSorted(),
+    );
+    expect(pullRequestReviews(view, { repository: "x/y", number: 1 } as never)).toEqual({
+      verdict: null,
+      rounds: [],
+    });
     expect(
       reviewerRows(review.value.policy, roles.value.roles).map((row) => [row.stage, row.name]),
     ).toEqual(REVIEWERS);
@@ -336,5 +352,30 @@ describe("pools and recovery view model", () => {
     );
     expect(recoveryBanner({ ...state, pending: 0 }, "UTC")).toBeNull();
     expect(recoveryBanner(null)).toBeNull();
+  });
+});
+
+describe("new role", () => {
+  it("builds the create input and adds the role to the registry", async () => {
+    expect(newRoleInput(CRPKO, "master", "")).toEqual({ ok: false, error: "Pick a role kind." });
+    expect(newRoleInput(CRPKO, "lane-lead", "")).toEqual({ ok: false, error: "Pick a role kind." });
+    expect(newRoleInput(CRPKO, "scribe", "  ")).toEqual({
+      ok: true,
+      value: { missionId: CRPKO, kind: "scribe" },
+    });
+    const built = newRoleInput(CRPKO, "verifier", " Second verifier ");
+    expect(built).toEqual({
+      ok: true,
+      value: { missionId: CRPKO, kind: "verifier", name: "Second verifier" },
+    });
+    if (!built.ok) return;
+
+    const fixture = source();
+    const roles = live<MissionRolesSnapshot>((l) => fixture.subscribeRoles(CRPKO, l));
+    const before = roles.value.roles.length;
+    await fixture.createRole(built.value);
+    expect(roles.value.roles).toHaveLength(before + 1);
+    expect(roles.value.roles.at(-1)).toMatchObject({ kind: "verifier", name: "Second verifier" });
+    roles.close();
   });
 });

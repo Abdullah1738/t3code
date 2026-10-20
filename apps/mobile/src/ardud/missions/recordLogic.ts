@@ -15,6 +15,8 @@ import {
   type OwnerRequest,
   pendingRuleOffer,
   postMessageInput,
+  receiptNudgeLanes,
+  receiptNudgeNote,
   replyRequestInput,
   roomMembers,
   roomUiReducer,
@@ -232,6 +234,12 @@ export interface RoomScreenState {
   readonly ruleOffer: MissionMessage | null;
   readonly saveRule: (message: MissionMessage) => void;
   readonly skipRule: (message: MissionMessage) => void;
+  // --- finish-b ---
+  /** Control posts already nudged from this screen. */
+  readonly nudged: ReadonlySet<string>;
+  /** Nudges every lane a control post's receipt still waits on. */
+  readonly nudge: (message: MissionMessage) => void;
+  // --- end finish-b ---
 }
 
 /**
@@ -242,6 +250,7 @@ export function useRoomScreen(roomId: RoomId, masterRoleId: string | null): Room
   const page = useRoomPage(roomId);
   const [ui, dispatch] = useReducer(roomUiReducer, INITIAL_ROOM_UI);
   const { pending, run } = useMissionAction();
+  const [nudged, setNudged] = useState<ReadonlySet<string>>(() => new Set());
 
   useEffect(() => {
     dispatch({ type: "open", roomId });
@@ -331,5 +340,18 @@ export function useRoomScreen(roomId: RoomId, masterRoleId: string | null): Room
         );
     },
     skipRule: (message) => dispatch({ type: "rule-offered", messageId: message.id }),
+    // --- finish-b ---
+    nudged,
+    nudge: (message) => {
+      const laneIds = receiptNudgeLanes(message.receipt);
+      if (laneIds.length === 0) return;
+      const note = receiptNudgeNote(message);
+      void run("Could not nudge", async () => {
+        await Promise.all(laneIds.map((laneId) => missionsSource().nudgeLane({ laneId, note })));
+      }).then((sent) => {
+        if (sent) setNudged((current) => new Set([...current, message.id]));
+      });
+    },
+    // --- end finish-b ---
   };
 }

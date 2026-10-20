@@ -5,7 +5,8 @@ import { Fragment, useState } from "react";
 import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
-import { useMissionRooms } from "./missionsStore";
+import { FeedError } from "./FeedError";
+import { useMissionRooms, useMissionRoomsFeed } from "./missionsStore";
 import { EmptyLine, Group, Meta, Row, Separator, Title } from "./parts";
 import { RoomReader } from "./RoomReader";
 
@@ -22,14 +23,18 @@ export function RoomsPane(props: {
   readonly onOpenRoom: (roomId: RoomId) => void;
 }) {
   const rooms = useMissionRooms(props.missionId);
+  const feed = useMissionRoomsFeed(props.missionId);
   const [selectedId, setSelectedId] = useState<RoomId | null>(null);
   const rows = rooms ? roomRows(rooms, props.overview?.subMissions ?? []) : [];
   const selected = props.wide ? (selectedId ?? rows[0]?.id ?? null) : null;
 
   const list = (
     <ScrollView className="flex-1" contentContainerClassName="gap-3 px-4 pb-8 pt-3">
+      <FeedError what="the rooms" feed={feed} nowMs={props.nowMs} />
       {rooms === undefined ? (
-        <EmptyLine label="Loading" />
+        feed.failure ? null : (
+          <EmptyLine label="Loading" />
+        )
       ) : rows.length === 0 ? (
         <EmptyLine label="No rooms yet." />
       ) : (

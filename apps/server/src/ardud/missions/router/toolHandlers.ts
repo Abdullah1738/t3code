@@ -92,6 +92,12 @@ const handlers = {
       router.tuneRoom(input, provenance).pipe(Effect.map((tuning) => ({ tuning }))),
     ),
   ),
+  // --- finish-b ---
+  mission_update_room: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) =>
+      router.updateRoom(input, provenance).pipe(Effect.map((room) => ({ room }))),
+    ),
+  ),
   mission_attention: McpToolAccess.readsAsCaller((input) =>
     asCaller((router, _threadId, provenance) =>
       router.attention(input, provenance).pipe(Effect.map(({ entries }) => ({ entries }))),

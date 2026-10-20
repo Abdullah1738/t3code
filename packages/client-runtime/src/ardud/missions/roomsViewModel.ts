@@ -6,6 +6,7 @@
 import type {
   BroadcastReceipt,
   Lane,
+  LaneId,
   MissionActor,
   MissionId,
   MissionMessage,
@@ -15,8 +16,13 @@ import type {
   RoomKind,
   RoomNoise,
   RoomPage,
+  RoomWakeRule,
   Role,
+  RoleId,
+  SubMissionId,
   Subscription,
+  TuneRoomInput,
+  UpdateRoomInput,
   UpsertRuleInput,
 } from "@t3tools/contracts";
 import { DateTime } from "effect";
@@ -761,3 +767,200 @@ export function roomView(
     markRead: nextReadSeq(page.ownerReadSeq, newestSeq(page.messages)),
   };
 }
+
+// --- finish-b ---
+// Room tools: the "Last 24h" figure, who each kind wakes, rename / move /
+// remove, and nudging lanes a control post has not reached.
+
+/** Messages in the last 24 hours; null when the server sent no per-kind counts. */
+export function lastDayCount(noise: RoomNoise | null): number | null {
+  if (!noise?.kinds24h) return null;
+  return Object.values(noise.kinds24h).reduce((sum, count) => sum + count, 0);
+}
+
+/** The open room's figures with "Last 24h" after "Messages". */
+export function roomFigures(
+  noise: RoomNoise | null,
+  messageCount: number | null,
+): ReadonlyArray<RoomStat> {
+  const stats = [...roomStats(noise, messageCount)];
+  const lastDay = lastDayCount(noise);
+  if (lastDay !== null) {
+    const at = stats.findIndex((stat) => stat.label === "Messages") + 1;
+    stats.splice(at, 0, { label: "Last 24h", value: COUNT.format(lastDay) });
+  }
+  return stats;
+}
+
+/** Kinds in the wake table, in the order the owner reads them. */
+export const WAKE_KINDS: ReadonlyArray<MissionMessageKind> = [
+  "request",
+  "blocker",
+  "decision",
+  "evidence",
+  "control",
+  "status",
+];
+
+export type WakeColumn = "lanes" | "master";
+
+export interface WakeCell {
+  readonly on: boolean;
+  /** Fixed by the router: control reaches everyone listening, status wakes no one. */
+  readonly fixed: boolean;
+  /** Nobody in this column is in the room (or the mission has no master). */
+  readonly empty: boolean;
+}
+
+export interface WakeRow {
+  readonly kind: MissionMessageKind;
+  readonly label: string;
+  /** Posts of this kind in the last 24 hours; null when unknown. */
+  readonly lastDay: number | null;
+  readonly lanes: WakeCell;
+  readonly master: WakeCell;
+}
+
+const isMasterSub = (subscription: Subscription, masterRoleId: string | null) =>
+  masterRoleId !== null &&
+  subscription.subscriber._tag === "role" &&
+  subscription.subscriber.roleId === masterRoleId;
+
+/** Everyone listening in a column: subscribed, not muted, never the owner. */
+function columnSubs(
+  subscriptions: ReadonlyArray<Subscription>,
+  masterRoleId: string | null,
+  column: WakeColumn,
+): Subscription[] {
+  return subscriptions.filter(
+    (subscription) =>
+      subscription.subscriber._tag !== "owner" &&
+      subscription.mode !== "mute" &&
+      (column === "master") === isMasterSub(subscription, masterRoleId),
+  );
+}
+
+const wakesOn = (subscription: Subscription, kind: MissionMessageKind) =>
+  subscription.mode === "wake" && subscription.wakeOn.includes(kind);
+
+function wakeCell(
+  subs: ReadonlyArray<Subscription>,
+  kind: MissionMessageKind,
+  noColumn: boolean,
+): WakeCell {
+  const empty = noColumn || subs.length === 0;
+  if (kind === "status") return { on: false, fixed: true, empty };
+  if (kind === "control") return { on: !empty, fixed: true, empty };
+  return { on: !empty && subs.every((sub) => wakesOn(sub, kind)), fixed: false, empty };
+}
+
+/** "Who each kind wakes": one row per kind, the lanes and the master as columns. */
+export function wakeTable(
+  subscriptions: ReadonlyArray<Subscription>,
+  masterRoleId: string | null,
+  noise: RoomNoise | null,
+): ReadonlyArray<WakeRow> {
+  const lanes = columnSubs(subscriptions, masterRoleId, "lanes");
+  const master = columnSubs(subscriptions, masterRoleId, "master");
+  return WAKE_KINDS.map((kind) => ({
+    kind,
+    label: MESSAGE_KIND_LABEL[kind],
+    lastDay: noise?.kinds24h ? (noise.kinds24h[kind] ?? 0) : null,
+    lanes: wakeCell(lanes, kind, false),
+    // A master outside the room can still be switched on: that subscribes it.
+    master: { ...wakeCell(master, kind, masterRoleId === null), empty: masterRoleId === null },
+  }));
+}
+
+/** Turns one kind on or off for a whole column, as the router's tune input. */
+export function wakeToggleInput(
+  roomId: Room["id"],
+  subscriptions: ReadonlyArray<Subscription>,
+  masterRoleId: string | null,
+  column: WakeColumn,
+  kind: MissionMessageKind,
+  on: boolean,
+): Result<TuneRoomInput> {
+  if (kind === "status" || kind === "control") {
+    return err(
+      kind === "status" ? "Status posts never wake anyone." : "Control posts reach everyone.",
+    );
+  }
+  const subs = columnSubs(subscriptions, masterRoleId, column);
+  const rules: RoomWakeRule[] = subs.map((sub) => ({
+    subscriber: sub.subscriber,
+    mode: on ? "wake" : sub.mode,
+    wakeOn: on
+      ? [...new Set([...sub.wakeOn, kind])]
+      : sub.wakeOn.filter((wakeKind) => wakeKind !== kind),
+  }));
+  if (rules.length === 0 && column === "master" && masterRoleId !== null && on) {
+    rules.push({
+      subscriber: { _tag: "role", roleId: masterRoleId as RoleId },
+      mode: "wake",
+      wakeOn: [kind],
+    });
+  }
+  if (rules.length === 0) return err("Nobody here to wake.");
+  return ok({ roomId, rules });
+}
+
+/** Rooms the owner can remove; control carries nudges and broadcasts, so it stays. */
+export function canRemoveRoom(room: Pick<Room, "kind">): boolean {
+  return room.kind !== "control" && room.kind !== "owner-request";
+}
+
+export function renameRoomInput(
+  room: Pick<Room, "id" | "title">,
+  title: string,
+): Result<UpdateRoomInput> {
+  const next = title.trim().replace(/^#+/, "").trim();
+  if (next === "") return err("Name the room.");
+  if (next === room.title.replace(/^#+/, "")) return err("That is already its name.");
+  return ok({ roomId: room.id, title: next });
+}
+
+/** Moves a room under another sub-mission, or out of every one with null. */
+export function moveRoomInput(
+  room: Pick<Room, "id" | "subMissionId">,
+  subMissionId: SubMissionId | null,
+): Result<UpdateRoomInput> {
+  if (subMissionId === room.subMissionId) return err("The room is already there.");
+  return ok({ roomId: room.id, subMissionId });
+}
+
+export function removeRoomInput(
+  room: Pick<Room, "id" | "kind" | "archived">,
+): Result<UpdateRoomInput> {
+  if (!canRemoveRoom(room)) return err("The control room can't be removed.");
+  if (room.archived) return err("The room is already removed.");
+  return ok({ roomId: room.id, archived: true });
+}
+
+export function restoreRoomInput(room: Pick<Room, "id" | "archived">): Result<UpdateRoomInput> {
+  if (!room.archived) return err("The room is not removed.");
+  return ok({ roomId: room.id, archived: false });
+}
+
+/** Removed rooms, newest activity first, for the Restore list. */
+export function removedRooms(entries: ReadonlyArray<MissionRoomEntry>): ReadonlyArray<Room> {
+  return entries
+    .filter((entry) => entry.room.archived && entry.room.kind !== "owner-request")
+    .map((entry) => entry.room)
+    .sort((left, right) => (right.lastMessageAt ?? "").localeCompare(left.lastMessageAt ?? ""));
+}
+
+/** Lanes a control post has not reached yet: the receipt's Nudge sends to these. */
+export function receiptNudgeLanes(receipt: BroadcastReceipt | null): ReadonlyArray<LaneId> {
+  return (receipt?.pendingActors ?? []).flatMap((actor) =>
+    actor._tag === "lane" ? [actor.laneId] : [],
+  );
+}
+
+/** The nudge note: points the lane at the post it missed. */
+export function receiptNudgeNote(message: Pick<MissionMessage, "summary">): string {
+  const summary =
+    message.summary.length > 120 ? `${message.summary.slice(0, 119)}…` : message.summary;
+  return `Read the control post: ${summary}`;
+}
+// --- end finish-b ---

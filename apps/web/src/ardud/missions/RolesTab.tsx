@@ -1,7 +1,7 @@
 import { Fragment, useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 
-import type { MissionId, Role, ThreadId } from "@t3tools/contracts";
+import type { MissionId, Role, RoleKind, ThreadId } from "@t3tools/contracts";
 import {
   poolRows,
   recoveryView,
@@ -17,14 +17,17 @@ import {
   type ModelChoice,
   type PoolRow,
   type RoleRow,
+  NEW_ROLE_KINDS,
+  ROLE_KIND_LABEL,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { DESK_ROW, DeskChip, Figure, FoldRow, PageLine } from "./deskParts";
-import { PickForm, TextActionForm } from "./MissionForms";
+import { DESK_ROW, DeskChip, FeedErrors, Figure, FoldRow, PageLine, TabLoading } from "./deskParts";
+import { createRole } from "./deskCommands";
+import { PickForm, PickTextForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import {
   useApprovalRouting,
@@ -34,6 +37,7 @@ import {
   useMissionRecovery,
   useMissionReviewPolicy,
   useMissionRoles,
+  useMissionRolesFeed,
 } from "./missionsStore";
 import { setCriticalityGuide, setPoolCapacity, setRoleModel } from "./operationCommands";
 
@@ -44,22 +48,49 @@ import { setCriticalityGuide, setPoolCapacity, setRoleModel } from "./operationC
 
 const ROLES_SHOWN = 8;
 const HISTORY_SHOWN = 3;
+const VERDICTS_SHOWN = 5;
 
 export function RolesTab(props: { missionId: MissionId; nowMs: number }) {
   const roles = useMissionRoles(props.missionId);
+  const feeds = [useMissionRolesFeed(props.missionId)];
   const masterRoleId = useMasterRoleId(props.missionId);
   const view = useMemo(
     () => (roles ? roleRegistryView(roles, masterRoleId) : null),
     [roles, masterRoleId],
   );
-  if (!roles || !view) return <p className="text-sm text-(--m-muted)">Loading roles…</p>;
+  const [adding, setAdding] = useState(false);
+  if (!roles || !view)
+    return <TabLoading label="Loading roles…" what="the roles" feeds={feeds} nowMs={props.nowMs} />;
   return (
     <div className="flex min-w-0 flex-col gap-5">
-      <PageLine>
+      <FeedErrors what="the roles" feeds={feeds} nowMs={props.nowMs} />
+      <PageLine
+        actions={
+          <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
+            New role
+          </Button>
+        }
+      >
         {rolesSummary(view).map((part) =>
           typeof part === "string" ? part : <Figure key={part.key}>{part.figure}</Figure>,
         )}
       </PageLine>
+      {adding ? (
+        <div className="flex flex-col gap-2 rounded-3xl bg-(--m-surface) p-4 sm:p-5">
+          <h2 className="text-sm font-semibold">New role</h2>
+          <PickTextForm
+            pickLabel="Kind"
+            options={NEW_ROLE_KINDS.map((kind) => ({ value: kind, label: ROLE_KIND_LABEL[kind] }))}
+            textLabel="Name (optional)"
+            submitLabel="Add role"
+            onSubmit={async (kind, name) => {
+              const done = await createRole(props.missionId, kind as RoleKind, name);
+              if (done) setAdding(false);
+              return done;
+            }}
+          />
+        </div>
+      ) : null}
       <div className="grid min-w-0 gap-4 lg:grid-cols-12">
         <div className="flex min-w-0 flex-col gap-4 lg:col-span-8 [&>*:last-child]:grow">
           <RoleRegistry rows={view.rows} roles={roles.roles} nowMs={props.nowMs} />
@@ -380,15 +411,18 @@ function ReviewPolicySection(props: { missionId: MissionId; roles: ReadonlyArray
 function VerdictsSection(props: { missionId: MissionId; nowMs: number }) {
   const snapshot = useMissionReviewPolicy(props.missionId);
   const masterRoleId = useMasterRoleId(props.missionId);
+  const [all, setAll] = useState(false);
+  // Newest first, as the server sends them.
   const verdicts = useMemo(
-    () => (snapshot ? reviewPolicyView(snapshot, masterRoleId).verdicts.toReversed() : []),
+    () => (snapshot ? reviewPolicyView(snapshot, masterRoleId).verdicts : []),
     [snapshot, masterRoleId],
   );
   if (verdicts.length === 0) return null;
+  const shown = all ? verdicts : verdicts.slice(0, VERDICTS_SHOWN);
   return (
     <MissionSection title="Criticality calls" caption={String(verdicts.length)}>
       <ul className="flex flex-col text-sm">
-        {verdicts.map((row) => (
+        {shown.map((row) => (
           <li
             key={row.verdict.id}
             className={cn(DESK_ROW, "grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-0.5 py-2.5")}
@@ -407,6 +441,7 @@ function VerdictsSection(props: { missionId: MissionId; nowMs: number }) {
           </li>
         ))}
       </ul>
+      {all ? null : <FoldRow hidden={verdicts.length - shown.length} onShow={() => setAll(true)} />}
     </MissionSection>
   );
 }

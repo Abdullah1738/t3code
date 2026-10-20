@@ -6,6 +6,7 @@ import {
   CriticalityVerdict,
   type Lane,
   type Mission,
+  type MissionId,
   type MissionRecordRef,
   type MissionRecoveryState,
   Pool,
@@ -25,6 +26,8 @@ import {
 import * as Schema from "effect/Schema";
 
 import { latestFieldChanges } from "../changeLog.ts";
+import { ROLE_KIND_LABEL } from "../rolesViewModel.ts";
+import { ruleAudit } from "../rulesViewModel.ts";
 import type {
   Listener,
   MissionPoolsSnapshot,
@@ -101,6 +104,8 @@ export type OperationsSource = Pick<
   | "setCriticalityGuide"
   | "setPoolCapacity"
   | "setPortfolioOrder"
+  | "createLane"
+  | "createRole"
 >;
 
 const ref = (kind: MissionRecordRef["kind"], id: string, label?: string): MissionRecordRef =>
@@ -172,6 +177,23 @@ export function createOperations(ctx: OperationsContext): Operations {
   const changesWhere = (keep: (event: MissionTimelineEvent) => boolean) =>
     latestFieldChanges(log.all().filter(keep));
 
+  // --- finish-b ---
+  const previousOrderOf = (payload: unknown) => {
+    const order = (payload as { previousOrder?: unknown } | null)?.previousOrder;
+    return Array.isArray(order) ? (order as MissionId[]) : undefined;
+  };
+  const previousValueOf = (
+    events: ReadonlyArray<MissionTimelineEvent>,
+    eventId: string,
+    field: string,
+  ) => {
+    const event = events.find((e) => e.id === eventId);
+    const before = (event?.payload as { before?: Record<string, unknown> } | null)?.before;
+    const value = before?.[field];
+    return typeof value === "string" || typeof value === "number" ? value : undefined;
+  };
+  // --- end finish-b ---
+
   const missionOf = (missionId: string) => missions.find((m) => m.id === missionId);
   const findLane = (laneId: string) => lanes.find((l) => l.id === laneId);
 
@@ -207,7 +229,11 @@ export function createOperations(ctx: OperationsContext): Operations {
         missionId: missionId as MissionRuleBook["missionId"],
         rules,
         changeRequests: newestFirst(changeRequests.filter((request) => ids.has(request.ruleId))),
-        audit: audit.filter((finding) => finding.ruleIds.some((id) => ids.has(id))),
+        audit: [
+          ...audit.filter((finding) => finding.ruleIds.some((id) => ids.has(id))),
+          // --- finish-b ---
+          ...ruleAudit(rules),
+        ],
         suggestions: ctx.suggestions.filter(
           (s) =>
             s.status === "open" &&
@@ -369,8 +395,21 @@ export function createOperations(ctx: OperationsContext): Operations {
         }),
         changes: changesWhere(
           (event) => event.subject?.kind === "mission" && missionIds.has(event.subject.id),
-        ).filter((change) => ["tier", "guaranteedShare", "borrowCeiling"].includes(change.field)),
-        orderChange: lastReorder ? { actor: lastReorder.actor, at: lastReorder.at } : null,
+        )
+          .filter((change) => ["tier", "guaranteedShare", "borrowCeiling"].includes(change.field))
+          // --- finish-b ---
+          .map((change) => {
+            const previous = previousValueOf(log.all(), change.eventId, change.field);
+            return previous === undefined ? change : { ...change, previous };
+          }),
+        orderChange: lastReorder
+          ? {
+              actor: lastReorder.actor,
+              at: lastReorder.at,
+              // --- finish-b ---
+              previousOrder: previousOrderOf(lastReorder.payload),
+            }
+          : null,
       };
     });
   }
@@ -502,7 +541,11 @@ export function createOperations(ctx: OperationsContext): Operations {
         kind: parked ? "lane.parked" : "lane.resumed",
         subject: ref("lane", lane.id, lane.name),
         summary: parked ? `Parked ${lane.name}${why ? `: ${why}` : ""}` : `Resumed ${lane.name}`,
-        payload: { changed: ["status"], status: parked ? "parked" : "idle" },
+        payload: {
+          changed: ["status"],
+          status: parked ? "parked" : "idle",
+          before: { status: lane.status },
+        },
       });
       commit();
       return Promise.resolve();
@@ -524,7 +567,11 @@ export function createOperations(ctx: OperationsContext): Operations {
         kind: "lane.moved",
         subject: ref("lane", lane.id, lane.name),
         summary: `Moved ${lane.name} to ${target.title}`,
-        payload: { changed: ["subMissionId"], subMissionId: target.id },
+        payload: {
+          changed: ["subMissionId"],
+          subMissionId: target.id,
+          before: { subMissionId: lane.subMissionId },
+        },
       });
       commit();
       return Promise.resolve();
@@ -614,7 +661,12 @@ export function createOperations(ctx: OperationsContext): Operations {
         summary: pending
           ? `${role.name} moves to ${modelSelection.model} next turn: ${why}`
           : `${role.name} stays on ${role.modelSelection.model}: ${why}`,
-        payload: { changed: ["pendingModelSelection"], model: modelSelection.model },
+        payload: {
+          changed: ["pendingModelSelection"],
+          model: modelSelection.model,
+          phase: "requested",
+          previousSelection: role.pendingModelSelection ?? role.modelSelection,
+        },
       });
       commit();
       return Promise.resolve();
@@ -673,7 +725,13 @@ export function createOperations(ctx: OperationsContext): Operations {
           kind: "pool.updated",
           subject: ref("pool", pool.id, pool.name),
           summary: `${pool.name}: capacity ${pool.capacity} -> ${capacity} ${pool.unit}. ${why}`,
-          payload: { changed: ["capacity"], capacity },
+          payload: {
+            changed: ["capacity"],
+            capacity,
+            poolId: pool.id,
+            field: "capacity",
+            from: pool.capacity,
+          },
         });
       }
       commit();
@@ -688,7 +746,8 @@ export function createOperations(ctx: OperationsContext): Operations {
         new Set(next).size === next.length &&
         next.every((id) => live.includes(id));
       if (!valid) return fail("invalid", "The order must list every live mission once.");
-      if (next.every((id, index) => portfolio().order[index] === id)) return Promise.resolve();
+      const previousOrder = portfolio().order;
+      if (next.every((id, index) => previousOrder[index] === id)) return Promise.resolve();
       portfolioOrder = next;
       const summary = `Mission order: ${next.map((id) => missionOf(id)?.title ?? id).join(", ")}`;
       // Every mission's timeline shows the reorder, since it moves them all.
@@ -698,12 +757,84 @@ export function createOperations(ctx: OperationsContext): Operations {
           kind: "portfolio.reordered",
           subject: null,
           summary,
-          payload: { order: next },
+          payload: { order: next, previousOrder },
         });
       }
       commit();
       return Promise.resolve();
     },
+
+    // --- finish-b ---
+    createLane({ missionId, name, subMissionId }) {
+      if (!missionOf(missionId)) return fail("not-found", `Mission ${missionId} not found.`);
+      const title = name.trim();
+      if (title.length === 0) return fail("invalid", "A new lane needs a name.");
+      const at = nowIso();
+      const lane: Lane = {
+        id: localId("lane") as Lane["id"],
+        missionId,
+        subMissionId: subMissionId ?? null,
+        name: title,
+        purpose: "",
+        status: "idle",
+        statusReason: null,
+        leadRoleId: null,
+        threadId: null,
+        currentItemId: null,
+        lastEvidence: null,
+        context: null,
+        lastActiveAt: null,
+        createdAt: at,
+        updatedAt: at,
+      };
+      lanes.push(lane);
+      log.record({
+        missionId,
+        kind: "lane.created",
+        subject: ref("lane", lane.id, lane.name),
+        summary: `Added lane ${lane.name}`,
+      });
+      commit();
+      return Promise.resolve();
+    },
+
+    createRole({ missionId, kind, name, description, laneId, modelSelection }) {
+      const mission = missionOf(missionId);
+      if (!mission) return fail("not-found", `Mission ${missionId} not found.`);
+      const model =
+        modelSelection ??
+        roles.find((r) => r.id === mission.masterRoleId)?.modelSelection ??
+        roles.find((r) => r.missionId === missionId)?.modelSelection;
+      if (kind === "custom" && (!name?.trim() || !modelSelection)) {
+        return fail("invalid", "custom roles need a name and a model");
+      }
+      if (!model) return fail("invalid", "Pick a model for the role.");
+      const at = nowIso();
+      const role: Role = {
+        id: localId("role") as Role["id"],
+        missionId,
+        kind,
+        name: name?.trim() || ROLE_KIND_LABEL[kind],
+        description: description ?? "",
+        modelSelection: model,
+        pendingModelSelection: null,
+        laneId: laneId ?? null,
+        writesPublicText: kind !== "reviewer" && kind !== "final-reviewer",
+        lockedFields: [],
+        createdAt: at,
+        updatedAt: at,
+      };
+      roles.push(role);
+      log.record({
+        missionId,
+        kind: "role.created",
+        subject: ref("role", role.id, role.name),
+        summary: `Added ${role.name}`,
+      });
+      commit();
+      return Promise.resolve();
+    },
+    // --- end finish-b ---
   };
 
   return {

@@ -254,7 +254,7 @@ describe("receipts", () => {
     const receipt = receiptFor(10, recipients, (actor) =>
       actor._tag === "role" ? (reads[`role:${actor.roleId}`] ?? 0) : 0,
     );
-    expect(receipt).toEqual({ reached: 2, total: 3, pending: ["b"] });
+    expect(receipt).toEqual({ reached: 2, total: 3, pending: ["b"], pendingActors: [role("b")] });
   });
 
   it("has no receipt for non-controls", () => {
@@ -314,6 +314,11 @@ describe("noiseFor", () => {
         kinds: ["status", "status", "blocker", "request", "status"],
         wastedWakes: 2,
       }),
-    ).toEqual({ messagesPerHour: 0.5, actionableShare: 0.4, wastedWakes: 2 });
+    ).toEqual({
+      messagesPerHour: 0.5,
+      actionableShare: 0.4,
+      wastedWakes: 2,
+      kinds24h: { status: 3, blocker: 1, request: 1 },
+    });
   });
 });

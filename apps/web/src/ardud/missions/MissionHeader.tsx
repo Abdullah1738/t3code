@@ -74,7 +74,8 @@ function MissionTabs(props: { overview: MissionOverviewSnapshot; tab: MissionTab
     [views, props.tab],
   );
   const counts: Partial<Record<MissionTab, number>> = {
-    ...(rooms ? { rooms: rooms.length } : {}),
+    // Removed rooms stay in the feed for Restore; the tab counts the open ones.
+    ...(rooms ? { rooms: rooms.filter((entry) => !entry.room.archived).length } : {}),
     lanes: laneTotal(props.overview.lanes),
   };
   return (

@@ -3,9 +3,11 @@ import {
   MissionId,
   RoleId,
   RoomId,
+  SubMissionId,
   ThreadId,
   type MissionProvenance,
   type PostMessageInput,
+  type SubMission,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -710,19 +712,18 @@ describe("rooms", () => {
         { ...request("freeze merges"), kind: "control" },
         agent(masterThread),
       );
-      assert.deepStrictEqual(posted.receipt, {
-        reached: 0,
-        total: 2,
-        pending: ["API", "role-writer"],
-      });
+      assert.deepStrictEqual(posted.receipt?.pending, ["API", "role-writer"]);
+      assert.deepStrictEqual([posted.receipt?.reached, posted.receipt?.total], [0, 2]);
       assert.strictEqual(wakesFor(h.sent, laneThread).length, 1);
       assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
       yield* router.markRead({ roomId: control, seq: posted.seq }, agent(writerThread));
       const page = yield* router.roomPage({ roomId: control }, ownerApp);
-      assert.deepStrictEqual(page.messages[0]?.receipt, { reached: 1, total: 2, pending: ["API"] });
+      assert.deepStrictEqual(page.messages[0]?.receipt?.pending, ["API"]);
+      assert.strictEqual(page.messages[0]?.receipt?.reached, 1);
       yield* router.markRead({ roomId: control, seq: posted.seq }, agent(laneThread));
       const done = yield* router.roomPage({ roomId: control }, ownerApp);
-      assert.deepStrictEqual(done.messages[0]?.receipt, { reached: 2, total: 2, pending: [] });
+      assert.deepStrictEqual(done.messages[0]?.receipt?.pending, []);
+      assert.strictEqual(done.messages[0]?.receipt?.reached, 2);
     }).pipe(Effect.provide(h.layer));
   });
 
@@ -926,6 +927,133 @@ describe("room tuning", () => {
     }).pipe(Effect.provide(h.layer));
   });
 });
+
+// --- finish-b ---
+describe("room changes", () => {
+  const release = RoomId.make(`${missionId}:room:release`);
+  const sub: SubMission = {
+    id: SubMissionId.make("sub-api"),
+    missionId,
+    title: "API",
+    intent: "",
+    order: 0,
+    fillIdleCapacity: false,
+    status: "active",
+    coordinatorRoleId: null,
+    intendedEffort: null,
+    actualEffort: null,
+    health: "unknown",
+    lockedFields: [],
+    createdAt: "2026-10-20T00:00:00.000Z",
+    updatedAt: "2026-10-20T00:00:00.000Z",
+  };
+  const seedSub = Effect.gen(function* () {
+    yield* (yield* MissionStore.MissionStore).commit({
+      event: {
+        missionId,
+        kind: "sub-mission.created",
+        actor: { _tag: "system", component: "test" },
+        provenance: { _tag: "system", component: "test" },
+        summary: "sub",
+        subject: null,
+      },
+      upserts: [{ _tag: "sub-mission", record: sub }],
+    });
+  });
+
+  it.effect("renames, moves, removes and restores a room as logged changes", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedSub;
+      const router = yield* MissionRouter.MissionRouter;
+      const renamed = yield* router.updateRoom({ roomId: release, title: "Ship" }, ownerApp);
+      assert.strictEqual(renamed.title, "Ship");
+      const moved = yield* router.updateRoom(
+        { roomId: release, subMissionId: sub.id },
+        agent(masterThread),
+      );
+      assert.strictEqual(moved.subMissionId, sub.id);
+      const removed = yield* router.updateRoom({ roomId: release, archived: true }, ownerApp);
+      assert.strictEqual(removed.archived, true);
+      assert.strictEqual(
+        yield* failureCode(router.post({ ...request("still here?"), roomId: release }, ownerApp)),
+        "conflict",
+      );
+      yield* router.updateRoom({ roomId: release, archived: false }, ownerApp);
+      const rooms = yield* router.rooms(missionId, ownerApp);
+      const back = rooms.find((room) => room.id === release);
+      assert.deepStrictEqual(
+        [back?.title, back?.subMissionId, back?.archived],
+        ["Ship", sub.id, false],
+      );
+      const events = yield* (yield* MissionStore.MissionStore).eventsSince(missionId, 0);
+      assert.deepStrictEqual(
+        events
+          .filter((event) => event.subject?.id === release && event.kind !== "room.created")
+          .map((event) => [event.kind, (event.payload as { fields: string[] }).fields]),
+        [
+          ["room.updated", ["title"]],
+          ["room.updated", ["subMissionId"]],
+          ["room.archived", ["archived"]],
+          ["room.restored", ["archived"]],
+        ],
+      );
+      assert.deepStrictEqual(
+        (events.find((event) => event.kind === "room.updated")?.payload as { before: unknown })
+          .before,
+        { title: "Release", subMissionId: null, archived: false },
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("only the owner or the master changes a room, and the control room stays", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      assert.strictEqual(
+        yield* failureCode(
+          router.updateRoom({ roomId: release, title: "Mine" }, agent(laneThread)),
+        ),
+        "forbidden",
+      );
+      assert.strictEqual(
+        yield* failureCode(router.updateRoom({ roomId: control, archived: true }, ownerApp)),
+        "conflict",
+      );
+      assert.strictEqual(
+        yield* failureCode(
+          router.updateRoom({ roomId: release, subMissionId: SubMissionId.make("nope") }, ownerApp),
+        ),
+        "not-found",
+      );
+      assert.strictEqual(
+        yield* failureCode(router.updateRoom({ roomId: release, title: "Release" }, ownerApp)),
+        "invalid",
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the room page counts each kind of the last day and names pending actors", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* router.post({ ...request("freeze merges"), kind: "control" }, agent(masterThread));
+      yield* router.post(request("anyone?"), agent(laneThread));
+      yield* router.post(request("and again"), agent(laneThread));
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.deepStrictEqual(page.room.noise?.kinds24h, { control: 1, request: 2 });
+      const receipt = page.messages.find((message) => message.kind === "control")?.receipt;
+      assert.deepStrictEqual(receipt?.pendingActors, [
+        { _tag: "lane", laneId: lane.id },
+        { _tag: "role", roleId: RoleId.make("role-writer") },
+      ]);
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+// --- end finish-b ---
 
 describe("reminders", () => {
   const remindersFor = (sent: ReadonlyArray<Sent>, threadId: ThreadId) =>

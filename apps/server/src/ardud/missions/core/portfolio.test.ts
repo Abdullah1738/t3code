@@ -157,6 +157,17 @@ describe("portfolio", () => {
       assert.deepStrictEqual(changesOf("guaranteedShare")[0]?.actor, { _tag: "owner" });
       assert.strictEqual(changesOf("borrowCeiling").length, 0);
       assert.isFalse(measured.changes.some((change) => change.ref.id === otherMissionId));
+      // Each change keeps the value it replaced, so the page can revert it.
+      assert.strictEqual(changesOf("tier")[0]?.previous, "P2");
+      assert.strictEqual(changesOf("guaranteedShare")[0]?.previous, 0.2);
+      const [updated] = yield* (yield* MissionStore.MissionStore).recentEvents(missionId, 1);
+      assert.strictEqual(updated?.kind, "mission.updated");
+      assert.deepStrictEqual(updated?.payload, {
+        changed: ["tier"],
+        status: "active",
+        focusSubMissionId: null,
+        before: { tier: "P2" },
+      });
     }).pipe(Effect.provide(layer));
   });
 
@@ -179,6 +190,7 @@ describe("portfolio", () => {
         "unordered missions follow in default order",
       );
       assert.deepStrictEqual(afterOwner.orderChange?.actor, { _tag: "owner" });
+      assert.deepStrictEqual(afterOwner.orderChange?.previousOrder, []);
 
       // A master of any mission may reorder too.
       const byMaster = yield* missions.setPortfolioOrder(master, {
@@ -198,6 +210,10 @@ describe("portfolio", () => {
         thirdId,
         missionId,
         otherMissionId,
+      ]);
+      assert.deepStrictEqual((yield* missions.portfolio(null)).orderChange?.previousOrder, [
+        otherMissionId,
+        missionId,
       ]);
 
       // Same order again writes nothing.

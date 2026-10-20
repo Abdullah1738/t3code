@@ -7,6 +7,7 @@ import {
   agent,
   failureCode,
   harness,
+  lane,
   laneThread,
   masterThread,
   missionId,
@@ -106,6 +107,67 @@ it.effect(
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect("a lane acks a rule's current version and must ack again after a rewording", () => {
+  const { layer } = rulesLayer();
+  return Effect.gen(function* () {
+    yield* seed;
+    const rules = yield* RuleService.RuleService;
+    const store = yield* MissionStore.MissionStore;
+    const written = yield* rules.upsertRule(master, {
+      missionId,
+      title: "Quiet deploys",
+      quote: "No deploys on Fridays.",
+      masterReading: "Hold Friday merges until Monday.",
+    });
+    assert.equal(written.readingVersion, 1);
+    const start = yield* store.latestSeq(missionId);
+
+    const acked = yield* rules.ackRule(laneAgent, { ruleId: written.id });
+    assert.deepStrictEqual(
+      acked.acks.map((ack) => [ack.actor, ack.version]),
+      [[{ _tag: "lane", laneId: lane.id }, 1]],
+    );
+    // Acking the same version again changes nothing.
+    assert.deepStrictEqual(yield* rules.ackRule(laneAgent, { ruleId: written.id }), acked);
+    // Only a lane acks: not the master, not the owner.
+    assert.equal(yield* failureCode(rules.ackRule(master, { ruleId: written.id })), "forbidden");
+    assert.equal(yield* failureCode(rules.ackRule(ownerApp, { ruleId: written.id })), "forbidden");
+
+    // Rewording leaves the old ack and the old reading on version 1.
+    const reworded = yield* rules.upsertRule(ownerApp, {
+      ruleId: written.id,
+      missionId,
+      title: "Quiet deploys",
+      quote: "No deploys on Fridays or holidays.",
+    });
+    assert.equal(reworded.version, 2);
+    assert.equal(reworded.readingVersion, 1);
+    assert.equal(reworded.acks[0]?.version, 1);
+
+    // The lane acks again: its ack moves to version 2, still one per lane.
+    const again = yield* rules.ackRule(laneAgent, { ruleId: written.id });
+    assert.deepStrictEqual(
+      again.acks.map((ack) => ack.version),
+      [2],
+    );
+    // The master confirms its reading for the new wording.
+    const read = yield* rules.upsertRule(master, {
+      ruleId: written.id,
+      missionId,
+      title: "Quiet deploys",
+      quote: "No deploys on Fridays or holidays.",
+      masterReading: "Hold Friday merges until Monday.",
+    });
+    assert.equal(read.readingVersion, 2);
+
+    const events = yield* store.eventsSince(missionId, start);
+    assert.deepStrictEqual(
+      events.map((event) => event.kind),
+      ["rule.acked", "rule.updated", "rule.acked", "rule.updated"],
+    );
+  }).pipe(Effect.provide(layer));
+});
 
 it.effect("anyone asks for a rule change; the master resolves it", () => {
   const { layer } = rulesLayer();

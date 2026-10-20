@@ -4,6 +4,7 @@ import type {
   LaneId,
   LaneStatus,
   MergeLanesInput,
+  MissionId,
   ModelSelection,
   Role,
   RoleBinding,
@@ -16,6 +17,7 @@ import type {
 import type {
   HandOffLaneInput,
   MoveLaneInput,
+  NewLaneInput,
   NudgeLaneInput,
   SetLaneParkedInput,
 } from "./source.ts";
@@ -366,6 +368,22 @@ export function nudgeLaneInput(laneId: LaneId, note: string): Result<NudgeLaneIn
   const text = note.trim();
   return ok(text.length > 0 ? { laneId, note: text } : { laneId });
 }
+
+// --- finish-b ---
+export function newLaneInput(
+  missionId: MissionId,
+  name: string,
+  subMissionId?: SubMissionId | null,
+): Result<NewLaneInput> {
+  const checked = required(name, "Name the lane.");
+  if (!checked.ok) return checked;
+  return ok(
+    subMissionId
+      ? { missionId, name: checked.value, subMissionId }
+      : { missionId, name: checked.value },
+  );
+}
+// --- end finish-b ---
 
 export function handOffLaneInput(laneId: LaneId, note: string): Result<HandOffLaneInput> {
   const checked = required(note, "Write the handoff note for the fresh thread.");

@@ -159,3 +159,80 @@ export function PickForm(props: {
     </div>
   );
 }
+
+/** A choice from a short list plus an optional text field, then a submit button. */
+export function PickTextForm(props: {
+  pickLabel: string;
+  options: ReadonlyArray<{ value: string; label: string }>;
+  textLabel: string;
+  submitLabel: string;
+  onSubmit: (value: string, text: string) => Promise<boolean>;
+}) {
+  const [value, setValue] = useState<string | null>(null);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const picked = props.options.find((option) => option.value === value) ?? null;
+  return (
+    <form
+      className="flex flex-wrap items-center gap-2"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        if (value === null) return;
+        setBusy(true);
+        const done = await props.onSubmit(value, text);
+        setBusy(false);
+        if (done) setText("");
+      }}
+    >
+      <Select
+        value={value}
+        onValueChange={(next) => {
+          if (next === null) return;
+          setValue(next as string);
+        }}
+      >
+        <SelectTrigger aria-label={props.pickLabel} size="sm" className="w-56">
+          <SelectValue>{picked?.label ?? props.pickLabel}</SelectValue>
+        </SelectTrigger>
+        <SelectPopup>
+          {props.options.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectPopup>
+      </Select>
+      <Input
+        size="sm"
+        aria-label={props.textLabel}
+        placeholder={props.textLabel}
+        className="min-w-48 flex-1"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+      />
+      <Button type="submit" size="sm" variant="outline" disabled={busy || value === null}>
+        {props.submitLabel}
+      </Button>
+    </form>
+  );
+}
+
+/** Revert on a change line: one press, disabled while it runs. */
+export function RevertButton(props: { onRevert: () => Promise<boolean>; label?: string }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <Button
+      type="button"
+      size="xs"
+      variant="ghost-muted"
+      disabled={busy}
+      aria-label={props.label}
+      onClick={() => {
+        setBusy(true);
+        void props.onRevert().finally(() => setBusy(false));
+      }}
+    >
+      Revert
+    </Button>
+  );
+}

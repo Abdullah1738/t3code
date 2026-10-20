@@ -18,6 +18,7 @@ import {
   modelFamily,
   modelLabel,
   moveLaneInput,
+  newLaneInput,
   nudgeLaneInput,
   setLaneParkedInput,
   splitLaneInput,
@@ -234,5 +235,25 @@ describe("lane actions", () => {
       ok: false,
       error: "Lanes merge only within one mission.",
     });
+  });
+});
+
+describe("new lane", () => {
+  it("needs a name and adds the lane to the mission", async () => {
+    expect(newLaneInput(CRPKO, "  ")).toEqual({ ok: false, error: "Name the lane." });
+    const built = newLaneInput(CRPKO, " Settlement ");
+    expect(built).toEqual({ ok: true, value: { missionId: CRPKO, name: "Settlement" } });
+    if (!built.ok) return;
+
+    const source = createFixtureMissionsSource({ now: () => Date.parse(FIXTURE_NOW) });
+    let lanes: ReadonlyArray<Lane> = [];
+    const close = source.subscribeLanes(CRPKO, (next) => {
+      lanes = next;
+    });
+    const before = lanes.length;
+    await source.createLane(built.value);
+    expect(lanes).toHaveLength(before + 1);
+    expect(lanes.at(-1)).toMatchObject({ name: "Settlement", status: "idle", subMissionId: null });
+    close();
   });
 });

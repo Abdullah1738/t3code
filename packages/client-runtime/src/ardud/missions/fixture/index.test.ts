@@ -1,6 +1,7 @@
 import {
   approverOf,
   type DraftNote,
+  type LaneId,
   type MissionId,
   type MissionInboxHistory,
   type MissionListSnapshot,
@@ -515,4 +516,42 @@ describe("fixture missions source", () => {
       }),
     ).rejects.toBeInstanceOf(MissionError);
   });
+  // --- finish-b ---
+  it("renames, moves, removes and restores a room and tunes who it wakes", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const rooms = latest<ReadonlyArray<MissionRoomEntry>>((l) => source.subscribeRooms(CRPKO, l));
+    const delivery = latest<RoomPage | null>((l) =>
+      source.subscribeRoom("room-delivery" as RoomId, l),
+    );
+    const room = () => rooms.value.find((entry) => entry.room.id === "room-delivery")!.room;
+    // Per-kind counts over the last 24 hours ride on the page's noise.
+    expect(Object.keys(delivery.value!.room.noise?.kinds24h ?? {}).length).toBeGreaterThan(0);
+
+    await source.updateRoom({ roomId: room().id, title: "wave" });
+    expect(room().title).toBe("wave");
+    await source.updateRoom({ roomId: room().id, subMissionId: null });
+    expect(room().subMissionId).toBeNull();
+    await source.updateRoom({ roomId: room().id, archived: true });
+    expect(room().archived).toBe(true);
+    expect(rooms.value.find((entry) => entry.room.id === "room-delivery")!.unread).toBe(0);
+    await source.updateRoom({ roomId: room().id, archived: false });
+    expect(room().archived).toBe(false);
+    await expect(source.updateRoom({ roomId: CONTROL, archived: true })).rejects.toBeInstanceOf(
+      MissionError,
+    );
+    await expect(source.updateRoom({ roomId: room().id, title: "wave" })).rejects.toBeInstanceOf(
+      MissionError,
+    );
+
+    const lane = { _tag: "lane" as const, laneId: "lane-cell-tc" as LaneId };
+    await source.tuneRoom({
+      roomId: room().id,
+      rules: [{ subscriber: lane, mode: "wake", wakeOn: ["decision"] }],
+    });
+    const tuned = delivery.value!.subscriptions.find(
+      (sub) => sub.subscriber._tag === "lane" && sub.subscriber.laneId === lane.laneId,
+    );
+    expect(tuned).toMatchObject({ mode: "wake", wakeOn: ["decision"] });
+  });
+  // --- end finish-b ---
 });

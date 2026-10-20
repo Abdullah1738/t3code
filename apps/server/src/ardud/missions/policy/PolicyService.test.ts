@@ -108,6 +108,13 @@ it.layer(testLayer(ports.layer))("PolicyService", (it) => {
       const changes = (yield* events(CRPKO)).filter((e) => e.kind === "role.model-changed");
       const phases = changes.map((e) => (e.payload as { phase: string }).phase);
       assert.deepStrictEqual(phases, ["requested", "applied"]);
+      // The request keeps the selection it replaced, so a client can revert it.
+      const requested = changes[0]!.payload as { previousSelection: unknown };
+      assert.isDefined(requested.previousSelection);
+      assert.notStrictEqual(
+        modelKey(requested.previousSelection as typeof OPUS_XHIGH),
+        modelKey(OPUS_XHIGH),
+      );
       assert.deepStrictEqual(changes[0]!.actor, {
         _tag: "role",
         roleId: RoleId.make("crpko:master"),

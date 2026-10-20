@@ -1,10 +1,19 @@
-import type { MissionActor, MissionHealth, MissionId, MissionTier } from "@t3tools/contracts";
+import {
+  UpdateMissionInput,
+  type CreateMissionInput,
+  type MissionActor,
+  type MissionHealth,
+  type MissionId,
+  type MissionTier,
+} from "@t3tools/contracts";
+import { Option, Schema } from "effect";
 
 import { changeIndex, lastChangedLine } from "./changeLog.ts";
 import type {
   PortfolioMission,
   PortfolioPoolDraw,
   PortfolioSnapshot,
+  RevertAction,
   SetPortfolioOrderInput,
 } from "./source.ts";
 import { actorLabel, formatPercent, healthLabel, moveInOrder } from "./viewModel.ts";
@@ -247,7 +256,13 @@ export interface PortfolioChangeRow {
   readonly text: string;
   /** "you", "master", ... */
   readonly by: string;
+  // --- finish-b ---
+  /** Puts the previous value back, when the change kept it. */
+  readonly revert: RevertAction | null;
+  // --- end finish-b ---
 }
+
+const decodeUpdateMission = Schema.decodeUnknownOption(UpdateMissionInput);
 
 const PORTFOLIO_FIELD_LABEL: Record<string, string> = {
   tier: "tier",
@@ -269,6 +284,9 @@ export function portfolioChanges(
           at: snapshot.orderChange.at,
           text: `Order: ${titles.length > 1 ? `${titles.slice(0, -1).join(", ")}, then ${titles[titles.length - 1]}` : (titles[0] ?? "")}`,
           by: orderActorLabel(snapshot.orderChange.actor, snapshot.missions),
+          revert: snapshot.orderChange.previousOrder?.length
+            ? { _tag: "order", input: { order: snapshot.orderChange.previousOrder } }
+            : null,
         },
       ]
     : [];
@@ -282,6 +300,19 @@ export function portfolioChanges(
         at: change.at,
         text: `${mission.title} ${field}`,
         by: actorLabel(change.actor, mission.masterRoleId),
+        revert:
+          change.previous === undefined
+            ? null
+            : Option.match(
+                decodeUpdateMission({
+                  missionId: mission.missionId,
+                  [change.field]: change.previous,
+                }),
+                {
+                  onNone: () => null,
+                  onSome: (input): RevertAction => ({ _tag: "mission", input }),
+                },
+              ),
       },
     ];
   });
@@ -321,3 +352,42 @@ export function reorderPortfolioInput(
   }
   return ok({ order: moveInOrder(order, missionId, overId) });
 }
+
+// --- finish-b ---
+
+/** The name in lowercase words joined by dashes: "Café Launch: Q4!" is "cafe-launch-q4". */
+export function missionSlug(title: string): string {
+  return (
+    title
+      .trim()
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "mission"
+  );
+}
+
+/** A new mission from its name; a taken slug gets the next free number. */
+export function newMissionInput(
+  title: string,
+  takenSlugs: ReadonlyArray<string> = [],
+): Result<CreateMissionInput> {
+  const name = title.trim();
+  if (!name) return err("Name the mission.");
+  const base = missionSlug(name);
+  let slug = base;
+  for (let n = 2; takenSlugs.includes(slug); n += 1) slug = `${base}-${n}`;
+  return ok({ slug, title: name });
+}
+
+/** The order after dropping `activeId` on `overId` in the order bar; null when nothing moves. */
+export function orderBarDrop(
+  order: ReadonlyArray<MissionId>,
+  activeId: string,
+  overId: string | null,
+): SetPortfolioOrderInput | null {
+  if (overId === null || activeId === overId) return null;
+  const built = reorderPortfolioInput(order, activeId as MissionId, overId as MissionId);
+  return built.ok ? built.value : null;
+}
+// --- end finish-b ---

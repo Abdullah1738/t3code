@@ -158,7 +158,7 @@ export function createFixtureMissionsSource(
   const poolUsage = new Map<string, ReadonlyArray<MissionPoolUsage>>(
     Object.entries(data.poolUsage),
   );
-  const subscriptions = decodeSubscriptions(data.roomSubscriptions);
+  const subscriptions: Subscription[] = [...decodeSubscriptions(data.roomSubscriptions)];
   // Messages per room, oldest first. Seqs are monotonic per mission.
   const messagesByRoom = new Map<string, MissionMessage[]>();
   for (const message of decodeMessages(data.messages)) {
@@ -523,9 +523,10 @@ export function createFixtureMissionsSource(
 
   function missionRooms(missionId: string): ReadonlyArray<MissionRoomEntry> {
     return memo(`rooms:${missionId}`, () =>
+      // Removed rooms stay in the list, like the server's; pages filter them.
       rooms
-        .filter((room) => room.missionId === missionId && !room.archived)
-        .map((room) => ({ room, unread: unreadIn(room.id) })),
+        .filter((room) => room.missionId === missionId)
+        .map((room) => ({ room, unread: room.archived ? 0 : unreadIn(room.id) })),
     );
   }
 
@@ -547,8 +548,15 @@ export function createFixtureMissionsSource(
     for (const lane of lanes) {
       if (members.has(`lane:${lane.id}`)) names[`lane:${lane.id}`] = lane.name;
     }
+    // Per-kind counts over the last 24 hours, as the router sends them.
+    const since = now() - 24 * 60 * 60 * 1000;
+    const kinds24h: Record<string, number> = {};
+    for (const message of all) {
+      if (Date.parse(message.createdAt) >= since)
+        kinds24h[message.kind] = (kinds24h[message.kind] ?? 0) + 1;
+    }
     return {
-      room,
+      room: room.noise ? { ...room, noise: { ...room.noise, kinds24h } } : room,
       messages: page,
       subscriptions: subscriptions.filter((sub) => sub.roomId === room.id),
       ownerReadSeq: ownerReadSeq.get(room.id) ?? 0,
@@ -749,7 +757,7 @@ export function createFixtureMissionsSource(
     return missions.find((m) => m.id === missionId);
   }
 
-  return {
+  const source: MissionsSource = {
     // Every feed here is sample data; nothing is marked because nothing is live.
     sampled: new Set(),
     subscribeList: (listener) => watch(listSnapshot, listener),
@@ -773,6 +781,167 @@ export function createFixtureMissionsSource(
       if (!room) return fail("not-found", `Room ${roomId} not found.`);
       return Promise.resolve(pageOf(room, beforeSeq, limit));
     },
+
+    // --- finish-b ---
+    createMission(input) {
+      const title = input.title.trim();
+      if (title.length === 0) return fail("invalid", "Name the mission.");
+      if (missions.some((m) => m.slug === input.slug)) {
+        return fail("conflict", `A mission with slug ${input.slug} exists.`);
+      }
+      const at = nowIso();
+      const mission: Mission = {
+        id: (input.missionId ?? localId("mission")) as Mission["id"],
+        slug: input.slug,
+        title,
+        goal: input.goal ?? "",
+        status: "active",
+        tier: input.tier ?? "P1",
+        weight: input.weight ?? 1,
+        guaranteedShare: input.guaranteedShare ?? 0,
+        borrowCeiling: input.borrowCeiling ?? 1,
+        projectId: input.projectId ?? null,
+        masterRoleId: null,
+        focusSubMissionId: null,
+        health: "unknown",
+        lockedFields: [],
+        createdAt: at,
+        updatedAt: at,
+      };
+      missions.push(mission);
+      log.record({
+        missionId: mission.id,
+        kind: "mission.created",
+        subject: { kind: "mission", id: mission.id, label: title },
+        summary: `Created ${title}`,
+      });
+      commit();
+      return Promise.resolve(mission.id);
+    },
+    tuneRoom(input) {
+      const room = rooms.find((r) => r.id === input.roomId);
+      if (!room) return fail("not-found", `Room ${input.roomId} not found.`);
+      const rules = input.rules ?? [];
+      if (rules.length === 0) return fail("invalid", "Give at least one rule.");
+      if (rules.some((rule) => rule.subscriber._tag === "owner")) {
+        return fail("invalid", "The owner is not a room subscriber.");
+      }
+      const at = nowIso();
+      for (const rule of rules) {
+        const key = actorKey(rule.subscriber);
+        const index = subscriptions.findIndex(
+          (sub) => sub.roomId === room.id && actorKey(sub.subscriber) === key,
+        );
+        const prior = index >= 0 ? subscriptions[index] : undefined;
+        const next: Subscription = {
+          id: (prior?.id ?? `${room.id}:sub:${key}`) as Subscription["id"],
+          roomId: room.id,
+          subscriber: rule.subscriber,
+          mode: rule.mode,
+          wakeOn: [
+            ...(rule.wakeOn ?? (rule.mode === "wake" ? ["request", "blocker", "control"] : [])),
+          ],
+          createdAt: prior?.createdAt ?? at,
+        };
+        if (index >= 0) subscriptions[index] = next;
+        else subscriptions.push(next);
+      }
+      log.record({
+        missionId: room.missionId,
+        kind: "room.tuned",
+        subject: { kind: "room", id: room.id, label: room.title },
+        summary: `${room.title} tuned`,
+        payload: { rules },
+      });
+      commit();
+      return Promise.resolve();
+    },
+    updateRoom(input) {
+      const room = rooms.find((r) => r.id === input.roomId);
+      if (!room) return fail("not-found", `Room ${input.roomId} not found.`);
+      if (input.archived === true && room.kind === "control") {
+        return fail("conflict", "The control room can't be removed.");
+      }
+      if (input.subMissionId) {
+        const sub = subMissions.find((s) => s.id === input.subMissionId);
+        if (!sub || sub.missionId !== room.missionId) {
+          return fail("not-found", `Sub-mission ${input.subMissionId} not found.`);
+        }
+      }
+      const next: Room = {
+        ...room,
+        title: input.title?.trim() || room.title,
+        subMissionId: input.subMissionId === undefined ? room.subMissionId : input.subMissionId,
+        archived: input.archived ?? room.archived,
+      };
+      const fields = (["title", "subMissionId", "archived"] as const).filter(
+        (field) => next[field] !== room[field],
+      );
+      if (fields.length === 0) return fail("invalid", "Nothing to change.");
+      replace(rooms, next);
+      const kind = fields.includes("archived")
+        ? next.archived
+          ? "room.archived"
+          : "room.restored"
+        : "room.updated";
+      log.record({
+        missionId: room.missionId,
+        kind,
+        subject: { kind: "room", id: room.id, label: next.title },
+        summary:
+          kind === "room.archived"
+            ? `${room.title} removed`
+            : kind === "room.restored"
+              ? `${room.title} restored`
+              : fields.includes("title")
+                ? `${room.title} renamed to ${next.title}`
+                : `${room.title} moved`,
+        payload: {
+          fields,
+          before: { title: room.title, subMissionId: room.subMissionId, archived: room.archived },
+          after: { title: next.title, subMissionId: next.subMissionId, archived: next.archived },
+        },
+      });
+      commit();
+      return Promise.resolve();
+    },
+    revertChange(action) {
+      // Sample data reverts what its own writes can do; the rest is server-only.
+      switch (action._tag) {
+        case "status":
+          if (action.input.status !== "active" && action.input.status !== "paused") break;
+          return source.setMissionPaused({
+            missionId: action.input.missionId,
+            paused: action.input.status === "paused",
+          });
+        case "focus":
+          return source.setMissionFocus(action.input);
+        case "order":
+          return source.setPortfolioOrder(action.input);
+        case "lane": {
+          const { missionId, laneId, subMissionId, status } = action.input;
+          if (!laneId) break;
+          if (subMissionId) return source.moveLane({ missionId, laneId, subMissionId });
+          if (status === "parked" || status === "idle") {
+            return source.setLaneParked({ missionId, laneId, parked: status === "parked" });
+          }
+          break;
+        }
+        case "role-model":
+          return source.setRoleModel(action.input);
+        case "pool-capacity":
+          return source.setPoolCapacity({
+            ...action.input,
+            reason: action.input.reason ?? "Reverted",
+          });
+        case "room":
+          return source.updateRoom(action.input);
+        default:
+          break;
+      }
+      return fail("invalid", "Sample data can't revert this change.");
+    },
+    // --- end finish-b ---
 
     reorderSubMissions(input) {
       const mission = findMission(input.missionId);
@@ -819,7 +988,11 @@ export function createFixtureMissionsSource(
         kind: paused ? "mission.paused" : "mission.resumed",
         subject: { kind: "mission", id: missionId, label: mission.title },
         summary: `${paused ? "Paused" : "Resumed"} ${mission.title}`,
-        payload: { changed: ["status"], status: paused ? "paused" : "active" },
+        payload: {
+          changed: ["status"],
+          status: paused ? "paused" : "active",
+          before: { status: mission.status },
+        },
       });
       commit();
       return Promise.resolve();
@@ -845,7 +1018,11 @@ export function createFixtureMissionsSource(
         kind: "mission.updated",
         subject: { kind: "mission", id: missionId, label: mission.title },
         summary: focus ? `Focus on ${focus.title}` : "Ended focus",
-        payload: { changed: ["focusSubMissionId"], focusSubMissionId: subMissionId },
+        payload: {
+          changed: ["focusSubMissionId"],
+          focusSubMissionId: subMissionId,
+          before: { focusSubMissionId: mission.focusSubMissionId },
+        },
       });
       commit();
       return Promise.resolve();
@@ -1207,14 +1384,28 @@ export function createFixtureMissionsSource(
             },
           )
         : [];
-      if (existing && edited.length === 0) return Promise.resolve(existing);
+      // --- finish-b --- an unchanged reading saved on a reworded rule confirms it.
+      const readingGiven = (input.masterReading ?? "").trim() !== "";
+      const confirmsReading =
+        existing !== undefined &&
+        readingGiven &&
+        existing.readingVersion !== undefined &&
+        existing.readingVersion < existing.version;
+      if (existing && edited.length === 0 && !confirmsReading) return Promise.resolve(existing);
       // Acks are per version: only a change to what lanes follow asks them to ack again.
       const reAck = edited.some(
         (field) => field === "quote" || field === "scope" || field === "activation",
       );
+      const version = existing ? (reAck ? existing.version + 1 : existing.version) : 1;
+      const readingVersion = readingGiven
+        ? version
+        : existing && reAck
+          ? (existing.readingVersion ?? existing.version)
+          : existing?.readingVersion;
       const rule = existing
         ? decodeRule({
             ...existing,
+            ...(readingVersion === undefined ? {} : { readingVersion }),
             title: input.title,
             quote: input.quote,
             quotedAt: existing.quote === input.quote ? existing.quotedAt : at,
@@ -1222,7 +1413,7 @@ export function createFixtureMissionsSource(
             activation: input.activation ?? existing.activation,
             status: input.status ?? existing.status,
             masterReading: input.masterReading ?? existing.masterReading,
-            version: reAck ? existing.version + 1 : existing.version,
+            version,
             updatedAt: at,
           })
         : decodeRule({
@@ -1234,6 +1425,7 @@ export function createFixtureMissionsSource(
             quotedAt: at,
             provenance: ownerProvenance(),
             masterReading: input.masterReading ?? "",
+            ...(readingVersion === undefined ? {} : { readingVersion }),
             scope,
             activation: input.activation ?? "",
             status: input.status ?? "active",
@@ -1333,6 +1525,7 @@ export function createFixtureMissionsSource(
       return Promise.resolve();
     },
   };
+  return source;
 }
 
 export { FIXTURE_NOW } from "./data.ts";

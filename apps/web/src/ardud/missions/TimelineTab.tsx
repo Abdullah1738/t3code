@@ -28,7 +28,9 @@ import {
 
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
-import { Figure, FoldRow, PageLine, Segmented } from "./deskParts";
+import { revertChange } from "./deskCommands";
+import { FeedErrors, Figure, FoldRow, PageLine, Segmented, TabLoading } from "./deskParts";
+import { RevertButton } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import {
   useMasterRoleId,
@@ -36,7 +38,7 @@ import {
   useMissionRecovery,
   useMissionRoles,
 } from "./missionsStore";
-import { loadOlderTimeline, useTimelineWindow } from "./useMissionFeeds";
+import { loadOlderTimeline, useTimelineWindow, useTimelineWindowFeed } from "./useMissionFeeds";
 import { useNowMs } from "./useNowMs";
 
 // Timeline tab: the mission's log under day heads, with a Kind and a Who
@@ -57,6 +59,7 @@ const capitalised = (text: string) => text.charAt(0).toUpperCase() + text.slice(
 export function TimelineTab(props: { missionId: MissionId }) {
   const { missionId } = props;
   const log = useTimelineWindow(missionId);
+  const feeds = [useTimelineWindowFeed(missionId)];
   const masterRoleId = useMasterRoleId(missionId);
   const lanes = useMissionLanes(missionId);
   const roles = useMissionRoles(missionId);
@@ -121,11 +124,13 @@ export function TimelineTab(props: { missionId: MissionId }) {
       ?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [focusRow]);
 
-  if (!log || !view) return <p className="text-sm text-(--m-muted)">Loading timeline…</p>;
+  if (!log || !view)
+    return <TabLoading label="Loading timeline…" what="the timeline" feeds={feeds} nowMs={nowMs} />;
   const oldest = log.events.at(-1);
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
+      <FeedErrors what="the timeline" feeds={feeds} nowMs={nowMs} />
       <PageLine
         actions={
           <>
@@ -261,6 +266,7 @@ function EventRow(props: {
   onToggle: () => void;
 }) {
   const { row } = props;
+  const { revert } = row;
   const steps = row.lineageSteps;
   return (
     <li
@@ -293,6 +299,11 @@ function EventRow(props: {
           ) : null}
         </p>
         <p className="mt-0.75 max-w-prose text-sm text-pretty">{row.summary}</p>
+        {revert ? (
+          <div className="mt-1 self-start">
+            <RevertButton label={`Revert: ${row.summary}`} onRevert={() => revertChange(revert)} />
+          </div>
+        ) : null}
         {row.because ? (
           <p className="mt-1 max-w-prose text-xs text-(--m-muted)">{row.because}</p>
         ) : null}

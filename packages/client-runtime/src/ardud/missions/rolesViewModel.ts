@@ -1,8 +1,10 @@
 import type {
+  CreateRoleInput,
   CriticalityTrigger,
   CriticalityVerdict,
   MissionId,
   ModelSelection,
+  PullRequestKey,
   ReviewLadder,
   ReviewPolicy,
   ReviewRecord,
@@ -195,6 +197,35 @@ export function setRoleModelInput(
   return ok({ roleId: role.id as RoleId, modelSelection, reason: trimmed });
 }
 
+// --- finish-b ---
+
+/**
+ * Kinds the owner adds by hand. The master is one per mission and lane roles
+ * come with their lane; custom roles need a model picked elsewhere.
+ */
+export const NEW_ROLE_KINDS: ReadonlyArray<RoleKind> = [
+  "sub-coordinator",
+  "reviewer",
+  "final-reviewer",
+  "writer",
+  "editor",
+  "scribe",
+  "verifier",
+  "answerer",
+];
+
+/** A blank name keeps the kind's default name. */
+export function newRoleInput(
+  missionId: MissionId,
+  kind: RoleKind,
+  name: string,
+): Result<CreateRoleInput> {
+  if (!NEW_ROLE_KINDS.includes(kind)) return err("Pick a role kind.");
+  const trimmed = name.trim();
+  return ok(trimmed ? { missionId, kind, name: trimmed } : { missionId, kind });
+}
+// --- end finish-b ---
+
 // ---------------------------------------------------------------------------
 // Review policy
 
@@ -312,6 +343,44 @@ export function reviewPolicyView(
       const label = stageLabel.get(review.stageId) ?? review.stageId;
       return { review, stageLabel: label, line: reviewLine(review, label) };
     }),
+  };
+}
+
+export interface PullRequestReviews {
+  /** The PR's current call: the newest verdict recorded for it. */
+  readonly verdict: VerdictRow | null;
+  /** Its review rounds, first to last, each with a chip label ("Sol review r2: 3 findings"). */
+  readonly rounds: ReadonlyArray<ReviewRow & { readonly chip: string }>;
+}
+
+function roundChip(row: ReviewRow, round: number): string {
+  const { review } = row;
+  const outcome =
+    review.verdict === "findings"
+      ? `${review.findings} ${review.findings === 1 ? "finding" : "findings"}`
+      : review.verdict;
+  return `${row.stageLabel} r${round}: ${outcome}`;
+}
+
+/** One PR's criticality call and review rounds, for a work row that expands. */
+export function pullRequestReviews(
+  view: ReviewPolicyView,
+  pullRequest: PullRequestKey,
+): PullRequestReviews {
+  const same = (key: PullRequestKey) =>
+    key.repository === pullRequest.repository && key.number === pullRequest.number;
+  const perStage = new Map<string, number>();
+  const rounds = [...view.reviews]
+    .reverse()
+    .filter((row) => same(row.review.pullRequest))
+    .map((row) => {
+      const round = (perStage.get(row.review.stageId) ?? 0) + 1;
+      perStage.set(row.review.stageId, round);
+      return { ...row, chip: roundChip(row, round) };
+    });
+  return {
+    verdict: view.verdicts.find((row) => same(row.verdict.pullRequest)) ?? null,
+    rounds,
   };
 }
 

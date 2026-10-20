@@ -1,8 +1,22 @@
-import type { DirectionCheckItem, MissionActor } from "@t3tools/contracts";
-import { DateTime } from "effect";
+import {
+  RecoverySettingsInput,
+  SetMissionFocusInput,
+  SetMissionStatusInput,
+  SetPoolCapacityInput,
+  SetPortfolioOrderInput,
+  SetRoleModelInput,
+  UpdateMissionInput,
+  UpdateRoleInput,
+  UpdateRoomInput,
+  UpsertLaneInput,
+  type DirectionCheckItem,
+  type MissionActor,
+} from "@t3tools/contracts";
+import { DateTime, Option, Schema } from "effect";
 
+import { changedFields } from "./changeLog.ts";
 import { type ActorNames, actorName } from "./roomsViewModel.ts";
-import type { MissionTimelineEvent, MissionTimelineWindow } from "./source.ts";
+import type { MissionTimelineEvent, MissionTimelineWindow, RevertAction } from "./source.ts";
 import { actorKey, formatDayLabel } from "./viewModel.ts";
 
 // Timeline tab: the mission's event log, newest first, under day heads,
@@ -257,6 +271,10 @@ export interface TimelineLine {
   readonly because: string | null;
   /** Events this one caused directly. */
   readonly led: number;
+  // --- finish-b ---
+  /** Puts the previous value back; only on the newest change to what it changed. */
+  readonly revert: RevertAction | null;
+  // --- end finish-b ---
 }
 
 export interface TimelineDay {
@@ -336,6 +354,7 @@ export function timelineRows(
     byId.set(event.id, event);
     if (event.causedBy) caused.set(event.causedBy, (caused.get(event.causedBy) ?? 0) + 1);
   }
+  const newest = newestChanges(all);
   const runs: MissionTimelineEvent[][] = [];
   for (const event of events) {
     const run = runs.at(-1);
@@ -366,6 +385,7 @@ export function timelineRows(
       lineageSteps: lineage(event, all).length - 1 + (caused.get(event.id) ?? 0),
       because: cause ? `Because ${sentenceTail(cause.summary)}` : null,
       led: caused.get(event.id) ?? 0,
+      revert: run.length === 1 ? revertIfNewest(event, newest) : null,
     } satisfies TimelineLine;
   });
 }
@@ -501,3 +521,218 @@ export function directionCheckRows(items: ReadonlyArray<DirectionCheckItem>): Di
   }
   return rows;
 }
+
+// --- finish-b ---
+// Revert: a change whose event kept the value it replaced can be put back
+// through the same write RPC. The server records that as a new change, so
+// only the newest change to a field offers it.
+
+const record = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+const pick = (source: Record<string, unknown>, fields: ReadonlyArray<string>) =>
+  Object.fromEntries(fields.filter((field) => field in source).map((f) => [f, source[f]]));
+
+const decoded = <A>(
+  schema: Schema.Decoder<A>,
+  value: unknown,
+  wrap: (input: A) => RevertAction,
+): RevertAction | null =>
+  Option.match(Schema.decodeUnknownOption(schema)(value), {
+    onNone: () => null,
+    onSome: wrap,
+  });
+
+const MISSION_FIELDS = [
+  "title",
+  "goal",
+  "tier",
+  "weight",
+  "guaranteedShare",
+  "borrowCeiling",
+  "projectId",
+  "masterRoleId",
+];
+const LANE_FIELDS = [
+  "subMissionId",
+  "name",
+  "purpose",
+  "status",
+  "statusReason",
+  "leadRoleId",
+  "threadId",
+  "currentItemId",
+];
+const REVERT_REASON = "Reverted";
+
+/** The write that puts back what this event changed, or null when it kept no previous value. */
+export function revertAction(event: MissionTimelineEvent): RevertAction | null {
+  const payload = record(event.payload);
+  if (!payload) return null;
+  const before = record(payload.before);
+  const subjectId = event.subject?.id;
+  const changed = changedFields(event.payload);
+  const only = (allowed: ReadonlyArray<string>) =>
+    changed.length > 0 && changed.every((field) => allowed.includes(field));
+
+  if (event.kind.startsWith("mission.") && before && subjectId) {
+    if (only(["status"])) {
+      return decoded(
+        SetMissionStatusInput,
+        { missionId: subjectId, status: before.status },
+        (input) => ({
+          _tag: "status",
+          input,
+        }),
+      );
+    }
+    if (only(["focusSubMissionId"])) {
+      return decoded(
+        SetMissionFocusInput,
+        { missionId: subjectId, subMissionId: before.focusSubMissionId ?? null },
+        (input) => ({ _tag: "focus", input }),
+      );
+    }
+    if (only(MISSION_FIELDS)) {
+      return decoded(
+        UpdateMissionInput,
+        { missionId: subjectId, ...pick(before, changed) },
+        (input) => ({
+          _tag: "mission",
+          input,
+        }),
+      );
+    }
+    return null;
+  }
+  if (
+    event.kind.startsWith("lane.") &&
+    event.kind !== "lane.retired" &&
+    before &&
+    subjectId &&
+    only(LANE_FIELDS)
+  ) {
+    return decoded(
+      UpsertLaneInput,
+      { missionId: event.missionId, laneId: subjectId, ...pick(before, changed) },
+      (input) => ({ _tag: "lane", input }),
+    );
+  }
+  switch (event.kind) {
+    case "portfolio.reordered": {
+      const order = payload.previousOrder;
+      if (!Array.isArray(order) || order.length === 0) return null;
+      return decoded(SetPortfolioOrderInput, { order }, (input) => ({ _tag: "order", input }));
+    }
+    case "role.updated": {
+      const fields = Array.isArray(payload.fields) ? (payload.fields as string[]) : [];
+      if (!before || !subjectId || fields.length === 0) return null;
+      return decoded(UpdateRoleInput, { roleId: subjectId, ...pick(before, fields) }, (input) => ({
+        _tag: "role",
+        input,
+      }));
+    }
+    case "role.model-changed": {
+      if (payload.phase !== "requested" || !subjectId || !payload.previousSelection) return null;
+      return decoded(
+        SetRoleModelInput,
+        { roleId: subjectId, modelSelection: payload.previousSelection, reason: REVERT_REASON },
+        (input) => ({ _tag: "role-model", input }),
+      );
+    }
+    case "pool.updated": {
+      if (payload.field !== "capacity" || typeof payload.from !== "number") return null;
+      return decoded(
+        SetPoolCapacityInput,
+        { poolId: payload.poolId, capacity: payload.from, reason: REVERT_REASON },
+        (input) => ({ _tag: "pool-capacity", input }),
+      );
+    }
+    case "recovery.settings-changed": {
+      if (!before) return null;
+      return decoded(
+        RecoverySettingsInput,
+        pick(before, ["missionId", "resumePerMinute", "masterLeadSeconds"]),
+        (input) => ({ _tag: "recovery", input }),
+      );
+    }
+    case "room.updated":
+    case "room.archived":
+    case "room.restored": {
+      const fields = Array.isArray(payload.fields) ? (payload.fields as string[]) : [];
+      if (!before || !subjectId || fields.length === 0) return null;
+      return decoded(UpdateRoomInput, { roomId: subjectId, ...pick(before, fields) }, (input) => ({
+        _tag: "room",
+        input,
+      }));
+    }
+    default:
+      return null;
+  }
+}
+
+/** What a revert would write over: one key per record field. */
+function revertKeys(action: RevertAction): string[] {
+  const keys = (prefix: string, input: object, skip: ReadonlyArray<string>) =>
+    Object.keys(input)
+      .filter((field) => !skip.includes(field))
+      .map((field) => `${prefix}:${field}`);
+  switch (action._tag) {
+    case "mission":
+      return keys(`mission:${action.input.missionId}`, action.input, ["missionId"]);
+    case "status":
+      return [`mission:${action.input.missionId}:status`];
+    case "focus":
+      return [`mission:${action.input.missionId}:focusSubMissionId`];
+    case "order":
+      return ["portfolio:order"];
+    case "lane":
+      return keys(`lane:${action.input.laneId}`, action.input, ["missionId", "laneId"]);
+    case "role":
+      return keys(`role:${action.input.roleId}`, action.input, ["roleId"]);
+    case "role-model":
+      return [`role:${action.input.roleId}:model`];
+    case "pool-capacity":
+      return [`pool:${action.input.poolId}:capacity`];
+    case "recovery":
+      return keys(`recovery:${action.input.missionId}`, action.input, ["missionId"]);
+    case "room":
+      return keys(`room:${action.input.roomId}`, action.input, ["roomId"]);
+  }
+}
+
+/** Keys an event changed, revertable or not, so a later plain change hides an older Revert. */
+function changeKeys(event: MissionTimelineEvent): string[] {
+  const action = revertAction(event);
+  if (action) return revertKeys(action);
+  if (!event.subject) return [];
+  const ref = event.subject;
+  return changedFields(event.payload).map((field) => `${ref.kind}:${ref.id}:${field}`);
+}
+
+const later = (a: MissionTimelineEvent, b: MissionTimelineEvent) =>
+  a.at === b.at ? a.seq > b.seq : a.at > b.at;
+
+/** The newest event per change key among the loaded events. */
+function newestChanges(all: ReadonlyArray<MissionTimelineEvent>) {
+  const newest = new Map<string, MissionTimelineEvent>();
+  for (const event of all) {
+    for (const key of changeKeys(event)) {
+      const seen = newest.get(key);
+      if (!seen || later(event, seen)) newest.set(key, event);
+    }
+  }
+  return newest;
+}
+
+function revertIfNewest(
+  event: MissionTimelineEvent,
+  newest: ReadonlyMap<string, MissionTimelineEvent>,
+): RevertAction | null {
+  const action = revertAction(event);
+  if (!action) return null;
+  return revertKeys(action).every((key) => newest.get(key)?.id === event.id) ? action : null;
+}
+// --- end finish-b ---
