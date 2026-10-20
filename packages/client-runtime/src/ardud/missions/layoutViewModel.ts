@@ -6,6 +6,7 @@ import {
   type ViewPageRegion,
   type ViewSectionChange,
   type ViewSectionEntry,
+  type ViewSectionRequest,
   type ViewTabEntry,
   type ViewWaitingCounts,
 } from "./views/layout.ts";
@@ -146,6 +147,111 @@ export function layoutGroups(
       ? [{ region, label: VIEW_REGION_LABEL[region], rows: list }]
       : [];
   });
+}
+
+// ardud missions: fix-p3 - Views tab drag and drop
+const REGIONS_OF: Record<"tab" | "builtin" | "custom", ReadonlySet<ViewRegion>> = {
+  tab: new Set(["tabs"]),
+  builtin: new Set(["header", "main", "rail", "sub-mission"]),
+  custom: new Set(["main", "rail", "sub-mission"]),
+};
+
+/** Whether a dragged entry may land in `region`: tabs stay tabs, custom sections stay off the header. */
+export const fitsViewRegion = (row: LayoutRow, region: ViewRegion): boolean =>
+  REGIONS_OF[row.type === "tab" ? "tab" : row.entry.kind === "custom" ? "custom" : "builtin"].has(
+    region,
+  );
+
+export interface ViewDropTarget {
+  readonly region: ViewRegion;
+  /** The entry it lands before; null for the region's end. */
+  readonly before: string | null;
+}
+
+/**
+ * Where a dragged entry lands. Over an entry of its own region it takes that
+ * entry's place; over an entry elsewhere it goes just before it; over a
+ * region's free space it goes last.
+ */
+export function viewDropTarget(
+  groups: ReadonlyArray<LayoutGroup>,
+  key: string,
+  over: { readonly region: ViewRegion; readonly key: string | null },
+): ViewDropTarget {
+  const rows = groups.find((group) => group.region === over.region)?.rows ?? [];
+  const from = rows.findIndex((row) => row.key === key);
+  if (over.key === null || from === -1) return { region: over.region, before: over.key };
+  const to = rows.findIndex((row) => row.key === over.key);
+  const order = rows.filter((row) => row.key !== key);
+  // Dragging down puts it after the entry it is over, up puts it before.
+  const next = to > from ? order[order.findIndex((row) => row.key === over.key) + 1] : rows[to];
+  return { region: over.region, before: next?.key ?? null };
+}
+
+/**
+ * The groups a drag can land in: every region that takes the dragged entry,
+ * empty ones included, so a region emptied by a drag can be filled again.
+ */
+export function viewDropGroups(
+  groups: ReadonlyArray<LayoutGroup>,
+  row: LayoutRow | null,
+): ReadonlyArray<LayoutGroup> {
+  return REGION_ORDER.flatMap((region) => {
+    const group = groups.find((candidate) => candidate.region === region);
+    if (group !== undefined && group.rows.length > 0) return [group];
+    return row !== null && fitsViewRegion(row, region)
+      ? [{ region, label: VIEW_REGION_LABEL[region], rows: [] }]
+      : [];
+  });
+}
+
+/** The groups with one entry moved, for showing a drop before the server confirms it. */
+export function dropLayoutGroups(
+  groups: ReadonlyArray<LayoutGroup>,
+  key: string,
+  target: ViewDropTarget,
+): ReadonlyArray<LayoutGroup> {
+  const moved = groups.flatMap((group) => group.rows).find((row) => row.key === key);
+  if (moved === undefined) return groups;
+  return viewDropGroups(groups, moved).map((group) => {
+    const rows = group.rows.filter((row) => row.key !== key);
+    if (group.region !== target.region) return { ...group, rows };
+    const at = target.before === null ? -1 : rows.findIndex((row) => row.key === target.before);
+    return { ...group, rows: at === -1 ? [...rows, moved] : rows.toSpliced(at, 0, moved) };
+  });
+}
+
+/**
+ * The layout move for an entry dropped into `region` just before the entry
+ * `before` (null drops it at the region's end). Null when the drop changes
+ * nothing or the region does not take the entry.
+ */
+export function viewDropRequest(
+  snapshot: Pick<MissionViewsSnapshot, "missionId" | "layout">,
+  key: string,
+  region: ViewRegion,
+  before: string | null,
+): ViewSectionRequest | null {
+  const entries = snapshot.layout.layout.entries;
+  const entry = entries.find((candidate) => candidate.key === key);
+  if (entry === undefined || !REGIONS_OF[entry.section._tag].has(region)) return null;
+  const peers = entries.filter((other) => other.region === region && other.key !== key);
+  const at = before === null ? -1 : peers.findIndex((other) => other.key === before);
+  const index = at === -1 ? peers.length : at;
+  if (entry.region === region) {
+    const current = entries
+      .filter((other) => other.region === region)
+      .findIndex((other) => other.key === key);
+    if (current === index) return null;
+  }
+  return {
+    method: "editLayout",
+    input: {
+      missionId: snapshot.missionId,
+      ops: [{ _tag: "move", key, region, index }],
+      expectedVersion: snapshot.layout.version,
+    },
+  };
 }
 
 /** What Discuss on a section sends the master as an owner request. */

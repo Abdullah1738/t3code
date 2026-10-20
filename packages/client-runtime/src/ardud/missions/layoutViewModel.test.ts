@@ -1,4 +1,4 @@
-import type { MissionId } from "@t3tools/contracts";
+import type { MissionId, ViewRegion } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
@@ -6,6 +6,8 @@ import {
   layoutGroups,
   pageTabs,
   resolveMissionLayout,
+  viewDropRequest,
+  viewDropTarget,
   viewSectionMoves,
 } from "./layoutViewModel.ts";
 import type { MissionViewsState } from "./source.ts";
@@ -96,6 +98,78 @@ describe("mission layout", () => {
       "Tabs",
     ]);
     expect(groups.at(-1)?.rows).toHaveLength(11);
+  });
+
+  it("turns a drop into one layout move, within a region and across", async () => {
+    const source = createFixtureMissionsSource({ now });
+    let state: MissionViewsState | null = null;
+    source.subscribeViews(CRPKO, (next) => {
+      state = next;
+    });
+    const snapshot = () => {
+      if (state === null) throw new Error("no views state");
+      return (state as MissionViewsState).snapshot;
+    };
+    const drop = async (key: string, region: ViewRegion, before: string | null) => {
+      const request = viewDropRequest(snapshot(), key, region, before);
+      if (request === null) throw new Error(`no move for ${key}`);
+      await source.changeView(request);
+    };
+
+    expect(viewDropRequest(snapshot(), "since-last-looked", "main", "your-requests")).toEqual({
+      method: "editLayout",
+      input: {
+        missionId: CRPKO,
+        ops: [{ _tag: "move", key: "since-last-looked", region: "main", index: 0 }],
+        expectedVersion: snapshot().layout.version,
+      },
+    });
+    await drop("since-last-looked", "main", "your-requests");
+    expect(keys(resolveMissionLayout(snapshot()).main)).toEqual([
+      "since-last-looked",
+      "your-requests",
+      "sub-missions",
+    ]);
+
+    await drop("your-requests", "main", null);
+    expect(keys(resolveMissionLayout(snapshot()).main)).toEqual([
+      "since-last-looked",
+      "sub-missions",
+      "your-requests",
+    ]);
+
+    await drop("needs-you", "main", "sub-missions");
+    expect(keys(resolveMissionLayout(snapshot()).main)).toEqual([
+      "since-last-looked",
+      "needs-you",
+      "sub-missions",
+      "your-requests",
+    ]);
+    expect(keys(resolveMissionLayout(snapshot()).rail)).toEqual([
+      "path-to-milestone",
+      "with-the-master",
+    ]);
+
+    // Dragged down onto a tile it lands after it; up, before it; elsewhere, before it.
+    const groups = layoutGroups(snapshot(), resolveMissionLayout(snapshot()));
+    const over = (key: string) => ({ region: "main" as const, key });
+    expect(viewDropTarget(groups, "since-last-looked", over("needs-you"))).toEqual({
+      region: "main",
+      before: "sub-missions",
+    });
+    expect(viewDropTarget(groups, "your-requests", over("needs-you"))).toEqual({
+      region: "main",
+      before: "needs-you",
+    });
+    expect(viewDropTarget(groups, "path-to-milestone", over("needs-you"))).toEqual({
+      region: "main",
+      before: "needs-you",
+    });
+
+    // Dropping where it already sits, or a tab among sections, sends nothing.
+    expect(viewDropRequest(snapshot(), "needs-you", "main", "sub-missions")).toBeNull();
+    expect(viewDropRequest(snapshot(), "tab-rooms", "main", null)).toBeNull();
+    expect(viewDropRequest(snapshot(), "needs-you", "tabs", null)).toBeNull();
   });
 
   it("builds the tab row from the layout, keeping the open tab and Views reachable", async () => {

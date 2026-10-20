@@ -1,10 +1,32 @@
 import { useMemo, useState } from "react";
-import { CopyIcon, EllipsisIcon, Trash2Icon, Undo2Icon } from "lucide-react";
-
-import type { MissionId } from "@t3tools/contracts";
 import {
+  DndContext,
+  type DragEndEvent,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  rectSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { CopyIcon, EllipsisIcon, GripVerticalIcon, Trash2Icon, Undo2Icon } from "lucide-react";
+
+import type { MissionId, ViewRegion } from "@t3tools/contracts";
+import {
+  dropLayoutGroups,
+  fitsViewRegion,
   formatRelative,
   layoutGroups,
+  viewDropGroups,
+  viewDropRequest,
+  viewDropTarget,
   ownerWaitingEntries,
   resolveMissionLayout,
   viewCardKit,
@@ -89,18 +111,7 @@ export function ViewsTab(props: { missionId: MissionId; nowMs: number }) {
             <h2 id="views-board" className="text-sm font-semibold">
               Board
             </h2>
-            {shown.map((group) =>
-              group.rows.length > 0 ? (
-                <RegionTiles
-                  key={group.region}
-                  missionId={props.missionId}
-                  views={views}
-                  layout={layout}
-                  group={group}
-                  pinned={pinned}
-                />
-              ) : null,
-            )}
+            <BoardTiles missionId={props.missionId} views={views} layout={layout} groups={shown} />
           </section>
           {aside.length > 0 ? (
             <section aria-labelledby="views-hidden" className={PANEL}>
@@ -140,27 +151,107 @@ export function ViewsTab(props: { missionId: MissionId; nowMs: number }) {
 const setAside = (row: LayoutRow) =>
   row.entry.hidden || (row.type === "section" && row.entry.removed);
 
+// ardud missions: fix-p3 - tiles move by drag and drop (pointer or keyboard);
+// the tile menu's Move stays as the fallback.
+const regionDropId = (region: ViewRegion) => `region:${region}`;
+
+interface DropData {
+  readonly region: ViewRegion;
+  readonly key: string | null;
+}
+
+function BoardTiles(props: {
+  missionId: MissionId;
+  views: MissionViewsState;
+  layout: ResolvedViewLayout;
+  groups: ReadonlyArray<LayoutGroup>;
+}) {
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [pending, setPending] = useState<ReadonlyArray<LayoutGroup> | null>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const groups = pending ?? props.groups;
+  const rows = groups.flatMap((group) => group.rows);
+  const active = rows.find((row) => row.key === dragging) ?? null;
+  const shown = viewDropGroups(groups, active);
+
+  const onDragEnd = (event: DragEndEvent) => {
+    setDragging(null);
+    const over = event.over?.data.current as DropData | undefined;
+    const key = String(event.active.id);
+    if (over === undefined || over.key === key) return;
+    const target = viewDropTarget(groups, key, over);
+    const request = viewDropRequest(props.views.snapshot, key, target.region, target.before);
+    if (request === null) return;
+    setPending(dropLayoutGroups(groups, key, target));
+    void send(request, "Couldn't move it").then(() => setPending(null));
+  };
+
+  return (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragStart={(event) => setDragging(String(event.active.id))}
+      onDragCancel={() => setDragging(null)}
+      onDragEnd={onDragEnd}
+    >
+      {shown.map((group) => (
+        <RegionTiles
+          key={group.region}
+          missionId={props.missionId}
+          views={props.views}
+          layout={props.layout}
+          group={group}
+          disabled={active !== null && !fitsViewRegion(active, group.region)}
+        />
+      ))}
+    </DndContext>
+  );
+}
+
 function RegionTiles(props: {
   missionId: MissionId;
   views: MissionViewsState;
   layout: ResolvedViewLayout;
   group: LayoutGroup;
-  pinned: number;
+  disabled: boolean;
 }) {
+  const { region } = props.group;
+  const { setNodeRef, isOver } = useDroppable({
+    id: regionDropId(region),
+    data: { region, key: null } satisfies DropData,
+    // A filled region takes drops on its tiles; only an empty one is a target itself.
+    disabled: props.disabled || props.group.rows.length > 0,
+  });
   return (
     <div className="flex min-w-0 flex-col gap-2">
       <h3 className="text-xs text-(--m-muted)">{props.group.label}</h3>
-      <ul className="grid min-w-0 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-        {props.group.rows.map((row) => (
-          <EntryTile
-            key={row.key}
-            missionId={props.missionId}
-            views={props.views}
-            layout={props.layout}
-            row={row}
-          />
-        ))}
-      </ul>
+      <SortableContext
+        items={props.group.rows.map((row) => row.key)}
+        strategy={rectSortingStrategy}
+      >
+        <ul
+          ref={setNodeRef}
+          className={cn(
+            "grid min-h-11 min-w-0 gap-2 rounded-2xl sm:grid-cols-2 xl:grid-cols-3",
+            isOver && "bg-(--m-active)",
+          )}
+        >
+          {props.group.rows.map((row) => (
+            <EntryTile
+              key={row.key}
+              missionId={props.missionId}
+              views={props.views}
+              layout={props.layout}
+              row={row}
+              region={region}
+              disabled={props.disabled}
+            />
+          ))}
+        </ul>
+      </SortableContext>
     </div>
   );
 }
@@ -188,18 +279,46 @@ function EntryTile(props: {
   views: MissionViewsState;
   layout: ResolvedViewLayout;
   row: LayoutRow;
+  region: ViewRegion;
+  disabled: boolean;
 }) {
   const { row } = props;
   const [form, setForm] = useState<SectionForm>(null);
   const by = row.type === "section" ? row.entry.by : null;
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    setActivatorNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
+    id: row.key,
+    data: { region: props.region, key: row.key } satisfies DropData,
+    disabled: { draggable: false, droppable: props.disabled },
+  });
   return (
     <li
+      ref={setNodeRef}
+      style={{ transform: CSS.Translate.toString(transform), transition }}
       className={cn(
-        "flex min-w-0 flex-col gap-2 rounded-2xl bg-(--m-raised) py-2.5 ps-3.5 pe-2",
+        "flex min-w-0 flex-col gap-2 rounded-2xl bg-(--m-raised) py-2.5 ps-1.5 pe-2",
         form !== null && "sm:col-span-full",
+        isDragging && "relative z-10 shadow-md",
       )}
     >
-      <div className="flex min-h-7 min-w-0 items-center gap-2">
+      <div className="flex min-h-7 min-w-0 items-center gap-1.5">
+        <button
+          type="button"
+          ref={setActivatorNodeRef}
+          {...attributes}
+          {...listeners}
+          aria-label={`Move ${row.entry.title}`}
+          className="flex size-7 shrink-0 cursor-grab touch-none items-center justify-center rounded text-(--m-muted)/70 outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing pointer-coarse:size-10"
+        >
+          <GripVerticalIcon aria-hidden className="size-3.5" />
+        </button>
         <span className="min-w-0 truncate text-sm font-medium">{row.entry.title}</span>
         {by === "owner" || by === "master" ? <ByMarker by={by} /> : null}
         <span className="ms-auto">
