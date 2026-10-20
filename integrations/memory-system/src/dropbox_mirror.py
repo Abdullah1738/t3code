@@ -99,6 +99,20 @@ def local_files(root):
     return out
 
 
+def wait_delete(api, job, limit=1800):
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        r = api.call("files/delete_batch/check", {"async_job_id": job})
+        tag = (r or {}).get(".tag")
+        if tag == "complete":
+            bad = [e for e in r.get("entries", []) if e.get(".tag") == "failure"]
+            return f"{len(bad)} deletes failed" if bad else None
+        if tag != "in_progress":
+            return f"delete_batch {tag}"
+        time.sleep(5)
+    return "delete_batch still running"
+
+
 def upload(src, dst):
     for attempt in range(4):
         r = subprocess.run([DBX, "put", "--if-exists", "overwrite", "-w", "4",
@@ -163,9 +177,14 @@ def main():
         # delete in batches via API (dbxcli rm per file is slow for many packs)
         for i in range(0, len(extras), 500):
             batch = [{"path": rem[k]["path"]} for k in extras[i:i + 500]]
-            api.call("files/delete_batch", {"entries": batch})
+            r = api.call("files/delete_batch", {"entries": batch})
+            # delete_batch is async; a 500-file job can take minutes, and
+            # listing before it finishes reports the pending files as extras
+            if r and r.get(".tag") == "async_job_id":
+                err = wait_delete(api, r["async_job_id"])
+                if err:
+                    errors.append({"error": err})
             deleted += len(batch)
-        time.sleep(5)
         rem = api.list_files(root)
         extras = [k for k in rem if k not in loc]
     if a.delete and extras:

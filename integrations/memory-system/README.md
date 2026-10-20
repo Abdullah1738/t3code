@@ -59,7 +59,10 @@ Nothing under `data/`, `logs/` or `.venv/` belongs in git.
   Reference copy: `scripts/com.abdullah.recall.plist`.
 - `com.abdullah.memory-health` - health check every 15 min (capture, recall,
   backups, disk), Telegram on failure
-- `com.abdullah.memory-backup` - restic every 4 h, mirrored to Dropbox
+- `com.abdullah.memory-backup` - restic every 4 h, mirrored to Dropbox.
+  Snapshots hold replicas of memory.db and opencode_raw.db, plus
+  `robob-state.sql`, a `.dump` of Robob's small state tables (schedules,
+  projects, board, import map, thread index). The full Robob DB is not backed up.
 - `com.abdullah.session-reaper` (30 min) and `com.abdullah.location-reaper` (5 min)
 
 ## Backend (OpenChamber or Robob)
