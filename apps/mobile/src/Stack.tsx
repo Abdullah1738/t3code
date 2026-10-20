@@ -124,7 +124,7 @@ import { SettingsProjectOverviewRouteScreen } from "./features/settings/Settings
 import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
 // ardud missions: ui-mobile
-import { MissionOverviewRouteScreen } from "./ardud/missions/MissionOverviewRouteScreen";
+import { MissionRecordRouteScreen } from "./ardud/missions/MissionRecordRouteScreen";
 import { MissionsRouteScreen } from "./ardud/missions/MissionsRouteScreen";
 // end ardud missions: ui-mobile
 import { SettingsAboutRouteScreen } from "./features/settings/SettingsAboutRouteScreen";
@@ -799,12 +799,12 @@ const RootStackConfig = createWorkspaceStackNavigator({
     Missions: createNativeStackScreen({
       screen: MissionsRouteScreen,
       linking: "missions",
-      options: { ...GLASS_HEADER_OPTIONS, title: "Missions" },
+      options: { ...SOLID_HEADER_OPTIONS, title: "Missions" },
     }),
-    MissionOverview: createNativeStackScreen({
-      screen: MissionOverviewRouteScreen,
-      linking: "missions/:missionId",
-      options: { ...GLASS_HEADER_OPTIONS, title: "Mission" },
+    MissionRecord: createNativeStackScreen({
+      screen: MissionRecordRouteScreen,
+      linking: "missions/:kind/:id",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Missions" },
     }),
     // end ardud missions: ui-mobile
     ThreadTerminal: createNativeStackScreen({

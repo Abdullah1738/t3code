@@ -1,4 +1,14 @@
-import type { Approval, Ask, Draft, Knock, Suggestion } from "@t3tools/contracts";
+import {
+  approverOf,
+  type Approval,
+  type Approver,
+  type Ask,
+  type Draft,
+  type Knock,
+  type Note,
+  type Suggestion,
+} from "@t3tools/contracts";
+import { rerouteRecordInput } from "@t3tools/client-runtime/ardud/missions";
 import {
   type AskAnswerForm,
   type AskView,
@@ -51,11 +61,11 @@ export interface AskCardState {
 }
 
 /** An ask starts with nothing picked. The recommendation is advice only. */
-export function useAskCard(ask: Ask, nowMs: number): AskCardState {
+export function useAskCard(ask: Ask): AskCardState {
   const [form, setForm] = useState<AskAnswerForm>(EMPTY_ASK_ANSWER);
   const action = useMissionAction();
   return {
-    view: askView(ask, nowMs),
+    view: askView(ask),
     pickedOptionId: form.optionId,
     text: form.text,
     canSubmit: askAnswerInput(ask, form).ok && !action.pending,
@@ -208,6 +218,67 @@ export function useKnockCard(knock: Knock): KnockCardState {
         onConfirm: () => decide("Could not drop the knock", { action: "drop" }),
       }),
     cancel: () => setMode("idle"),
+  };
+}
+
+export interface NoteCardState {
+  readonly pending: boolean;
+  readonly ack: () => void;
+}
+
+/** "Got it" on an FYI note. */
+export function useNoteCard(note: Note): NoteCardState {
+  const action = useMissionAction();
+  return {
+    pending: action.pending,
+    ack: () => {
+      void action.run("Could not mark it read", () =>
+        missionsSource().ackNote({ noteId: note.id }),
+      );
+    },
+  };
+}
+
+export interface MoveState {
+  /** Where the record would go: the other inbox. */
+  readonly to: Approver;
+  readonly label: string;
+  readonly open: boolean;
+  readonly reason: string;
+  readonly pending: boolean;
+  readonly setReason: (reason: string) => void;
+  readonly start: () => void;
+  readonly send: () => void;
+  readonly cancel: () => void;
+}
+
+/** Moves a draft or an approval to the other inbox; the reason is required. */
+export function useMoveRecord(
+  kind: "draft" | "approval",
+  record: { readonly id: string; readonly approver?: Approver | undefined },
+): MoveState {
+  const to: Approver = approverOf(record) === "owner" ? "master" : "owner";
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const action = useMissionAction();
+  return {
+    to,
+    label: to === "master" ? "Move to master" : "Move to you",
+    open,
+    reason,
+    pending: action.pending,
+    setReason,
+    start: () => setOpen(true),
+    send: () => {
+      const result = rerouteRecordInput(kind, record, to, reason);
+      void submitForm(
+        action.run,
+        "Could not move it",
+        result.ok ? { ok: true, input: result.value } : result,
+        (input) => missionsSource().rerouteRecord(input),
+      );
+    },
+    cancel: () => setOpen(false),
   };
 }
 
