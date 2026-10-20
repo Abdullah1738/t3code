@@ -129,11 +129,15 @@ describe("drafts, knocks and suggestions", () => {
   it("treats an unchanged edit as a plain approval", () => {
     const draft = inboxOf(fixture()).drafts[0]!;
     expect(draftDecisionInput(draft, { action: "approve", editedText: ` ${draft.text} ` })).toEqual(
-      { ok: true, input: { draftId: draft.id, action: "approve" } },
+      { ok: true, input: { draftId: draft.id, action: "approve", revision: 0 } },
     );
     expect(draftDecisionInput(draft, { action: "approve", editedText: "Shorter." })).toEqual({
       ok: true,
-      input: { draftId: draft.id, action: "approve", editedText: "Shorter." },
+      input: { draftId: draft.id, action: "approve", editedText: "Shorter.", revision: 0 },
+    });
+    expect(draftDecisionInput({ ...draft, revision: 3 }, { action: "approve" })).toEqual({
+      ok: true,
+      input: { draftId: draft.id, action: "approve", revision: 3 },
     });
     expect(draftDecisionInput(draft, { action: "approve", editedText: "  " }).ok).toBe(false);
     expect(draftDecisionInput(draft, { action: "rewrite", note: "" }).ok).toBe(false);

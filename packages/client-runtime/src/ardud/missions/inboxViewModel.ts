@@ -625,19 +625,21 @@ export type DraftDecision =
   | { readonly action: "drop" };
 
 export function decideDraftInput(
-  draft: Pick<Draft, "id" | "text">,
+  draft: Pick<Draft, "id" | "text" | "revision">,
   decision: DraftDecision,
 ): Result<DecideDraftInput> {
+  // The server binds an approval to the revision the owner read and refuses one without it.
+  const revision = draft.revision ?? 0;
   switch (decision.action) {
     case "approve":
-      return ok({ draftId: draft.id, action: "approve" });
+      return ok({ draftId: draft.id, action: "approve", revision });
     case "edit-approve": {
       const editedText = decision.editedText.trim();
       if (editedText === "") return err("The edited draft is empty.");
       // An unchanged edit is a plain approve; no diff to learn from.
       return editedText === draft.text.trim()
-        ? ok({ draftId: draft.id, action: "approve" })
-        : ok({ draftId: draft.id, action: "approve", editedText });
+        ? ok({ draftId: draft.id, action: "approve", revision })
+        : ok({ draftId: draft.id, action: "approve", editedText, revision });
     }
     case "rewrite": {
       const rewriteNote = decision.note.trim();

@@ -203,14 +203,19 @@ export type DraftForm =
 
 export function draftDecisionInput(draft: Draft, form: DraftForm): FormResult<DecideDraftInput> {
   if (draft.status !== "pending") return fail("This draft is already decided.");
+  // The server binds an approval to the revision the owner read and refuses one without it.
+  const revision = draft.revision ?? 0;
   switch (form.action) {
     case "approve": {
-      if (form.editedText === undefined) return ok({ draftId: draft.id, action: "approve" });
+      if (form.editedText === undefined) {
+        return ok({ draftId: draft.id, action: "approve", revision });
+      }
       const edited = form.editedText.trim();
       if (edited === "") return fail("The draft can't be empty.");
       // An untouched edit is a plain approval, so the record does not claim an edit.
-      if (edited === draft.text.trim()) return ok({ draftId: draft.id, action: "approve" });
-      return ok({ draftId: draft.id, action: "approve", editedText: edited });
+      if (edited === draft.text.trim())
+        return ok({ draftId: draft.id, action: "approve", revision });
+      return ok({ draftId: draft.id, action: "approve", editedText: edited, revision });
     }
     case "rewrite": {
       const note = form.note.trim();

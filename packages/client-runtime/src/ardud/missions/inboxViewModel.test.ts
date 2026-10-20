@@ -307,12 +307,24 @@ describe("drafts and draft notes", () => {
     expect(decideDraftInput(pending, { action: "rewrite", note: "" }).ok).toBe(false);
     expect(
       decideDraftInput(pending, { action: "edit-approve", editedText: `${pending.text}  ` }),
-    ).toEqual({ ok: true, value: { draftId: "draft-1", action: "approve" } });
+    ).toEqual({ ok: true, value: { draftId: "draft-1", action: "approve", revision: 0 } });
     expect(
       decideDraftInput(pending, { action: "edit-approve", editedText: "Please rebase #124." }),
     ).toEqual({
       ok: true,
-      value: { draftId: "draft-1", action: "approve", editedText: "Please rebase #124." },
+      value: {
+        draftId: "draft-1",
+        action: "approve",
+        editedText: "Please rebase #124.",
+        revision: 0,
+      },
+    });
+  });
+
+  it("approves the revision the owner read", () => {
+    expect(decideDraftInput(draft({ revision: 2 }), { action: "approve" })).toEqual({
+      ok: true,
+      value: { draftId: "draft-1", action: "approve", revision: 2 },
     });
   });
 
