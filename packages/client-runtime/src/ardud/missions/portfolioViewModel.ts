@@ -1,4 +1,10 @@
-import type { MissionActor, MissionHealth, MissionId, MissionTier } from "@t3tools/contracts";
+import type {
+  CreateMissionInput,
+  MissionActor,
+  MissionHealth,
+  MissionId,
+  MissionTier,
+} from "@t3tools/contracts";
 
 import { changeIndex, lastChangedLine } from "./changeLog.ts";
 import type {
@@ -321,3 +327,31 @@ export function reorderPortfolioInput(
   }
   return ok({ order: moveInOrder(order, missionId, overId) });
 }
+
+// --- finish-b ---
+
+/** The name in lowercase words joined by dashes: "Café Launch: Q4!" is "cafe-launch-q4". */
+export function missionSlug(title: string): string {
+  return (
+    title
+      .trim()
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "mission"
+  );
+}
+
+/** A new mission from its name; a taken slug gets the next free number. */
+export function newMissionInput(
+  title: string,
+  takenSlugs: ReadonlyArray<string> = [],
+): Result<CreateMissionInput> {
+  const name = title.trim();
+  if (!name) return err("Name the mission.");
+  const base = missionSlug(name);
+  let slug = base;
+  for (let n = 2; takenSlugs.includes(slug); n += 1) slug = `${base}-${n}`;
+  return ok({ slug, title: name });
+}
+// --- end finish-b ---

@@ -721,6 +721,44 @@ export function createFixtureMissionsSource(
       return Promise.resolve(pageOf(room, beforeSeq, limit));
     },
 
+    // --- finish-b ---
+    createMission(input) {
+      const title = input.title.trim();
+      if (title.length === 0) return fail("invalid", "Name the mission.");
+      if (missions.some((m) => m.slug === input.slug)) {
+        return fail("conflict", `A mission with slug ${input.slug} exists.`);
+      }
+      const at = nowIso();
+      const mission: Mission = {
+        id: (input.missionId ?? localId("mission")) as Mission["id"],
+        slug: input.slug,
+        title,
+        goal: input.goal ?? "",
+        status: "active",
+        tier: input.tier ?? "P1",
+        weight: input.weight ?? 1,
+        guaranteedShare: input.guaranteedShare ?? 0,
+        borrowCeiling: input.borrowCeiling ?? 1,
+        projectId: input.projectId ?? null,
+        masterRoleId: null,
+        focusSubMissionId: null,
+        health: "unknown",
+        lockedFields: [],
+        createdAt: at,
+        updatedAt: at,
+      };
+      missions.push(mission);
+      log.record({
+        missionId: mission.id,
+        kind: "mission.created",
+        subject: { kind: "mission", id: mission.id, label: title },
+        summary: `Created ${title}`,
+      });
+      commit();
+      return Promise.resolve(mission.id);
+    },
+    // --- end finish-b ---
+
     reorderSubMissions(input) {
       const mission = findMission(input.missionId);
       if (!mission) return fail("not-found", `Mission ${input.missionId} not found.`);

@@ -698,6 +698,30 @@ describe("rpc missions source", () => {
     });
   });
 
+  it("creates missions, lanes and roles through the server's write RPCs", async () => {
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsCreate]: () => ({ seq: 1, ref: { kind: "mission", id: "gold" } }),
+      [WS_METHODS.missionsUpsertLane]: () => ({ seq: 2, ref: { kind: "lane", id: "lane-new" } }),
+      [POLICY.createRole]: () => ({ seq: 3, ref: { kind: "role", id: "crpko:scribe" } }),
+    });
+    const source = createRpcMissionsSource({ transport, now });
+
+    await expect(source.createMission({ slug: "gold", title: "Gold" } as never)).resolves.toBe(
+      "gold",
+    );
+    expect(asked(WS_METHODS.missionsCreate).at(-1)?.input).toEqual({ slug: "gold", title: "Gold" });
+
+    await source.createLane({ missionId: CRPKO, name: "Settlement" });
+    // No lane id: the upsert creates the lane.
+    expect(asked(WS_METHODS.missionsUpsertLane).at(-1)?.input).toEqual({
+      missionId: CRPKO,
+      name: "Settlement",
+    });
+
+    await source.createRole({ missionId: CRPKO, kind: "scribe" });
+    expect(asked(POLICY.createRole).at(-1)?.input).toEqual({ missionId: CRPKO, kind: "scribe" });
+  });
+
   it("reads the views record live, logs view events and sends section changes", async () => {
     const { transport, live, asked } = fakeTransport({
       [VIEWS.editLayout]: () => ({ ok: true }),

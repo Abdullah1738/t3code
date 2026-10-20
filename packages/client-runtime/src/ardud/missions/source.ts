@@ -2,6 +2,8 @@ import type {
   AckNoteInput,
   AnswerAskInput,
   Approver,
+  CreateMissionInput,
+  CreateRoleInput,
   CriticalityVerdict,
   DecideApprovalInput,
   DecideDraftInput,
@@ -215,6 +217,15 @@ export interface NudgeLaneInput {
   /** What the lane should look at; delivered as a room message to the lane lead. */
   readonly note?: string;
 }
+
+// --- finish-b ---
+/** A new lane: the server's upsert with no lane id. */
+export interface NewLaneInput {
+  readonly missionId: MissionId;
+  readonly name: string;
+  readonly subMissionId?: SubMissionId;
+}
+// --- end finish-b ---
 
 /** Ends the lane lead's thread and binds a fresh one with this handoff note. */
 export interface HandOffLaneInput {
@@ -598,6 +609,13 @@ export interface MissionsSource {
   setCriticalityGuide(input: SetCriticalityGuideInput): Promise<void>;
   setPoolCapacity(input: SetPoolCapacityInput): Promise<void>;
   setPortfolioOrder(input: SetPortfolioOrderInput): Promise<void>;
+
+  // --- finish-b ---
+  /** Creates a mission and resolves with its id. */
+  createMission(input: CreateMissionInput): Promise<MissionId>;
+  createLane(input: NewLaneInput): Promise<void>;
+  createRole(input: CreateRoleInput): Promise<void>;
+  // --- end finish-b ---
 
   /** The mission's views record (layout, sections, pins) and its change log; null when gone. */
   subscribeViews(missionId: MissionId, listener: Listener<MissionViewsState | null>): Unsubscribe;

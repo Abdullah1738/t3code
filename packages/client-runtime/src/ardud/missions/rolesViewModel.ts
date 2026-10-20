@@ -1,4 +1,5 @@
 import type {
+  CreateRoleInput,
   CriticalityTrigger,
   CriticalityVerdict,
   MissionId,
@@ -195,6 +196,35 @@ export function setRoleModelInput(
   }
   return ok({ roleId: role.id as RoleId, modelSelection, reason: trimmed });
 }
+
+// --- finish-b ---
+
+/**
+ * Kinds the owner adds by hand. The master is one per mission and lane roles
+ * come with their lane; custom roles need a model picked elsewhere.
+ */
+export const NEW_ROLE_KINDS: ReadonlyArray<RoleKind> = [
+  "sub-coordinator",
+  "reviewer",
+  "final-reviewer",
+  "writer",
+  "editor",
+  "scribe",
+  "verifier",
+  "answerer",
+];
+
+/** A blank name keeps the kind's default name. */
+export function newRoleInput(
+  missionId: MissionId,
+  kind: RoleKind,
+  name: string,
+): Result<CreateRoleInput> {
+  if (!NEW_ROLE_KINDS.includes(kind)) return err("Pick a role kind.");
+  const trimmed = name.trim();
+  return ok(trimmed ? { missionId, kind, name: trimmed } : { missionId, kind });
+}
+// --- end finish-b ---
 
 // ---------------------------------------------------------------------------
 // Review policy

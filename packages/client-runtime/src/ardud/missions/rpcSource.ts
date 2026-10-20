@@ -1289,6 +1289,26 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       bus.emit("portfolio");
     },
 
+    // --- finish-b ---
+    createMission: async (input) => {
+      const result = await transport.request(WS_METHODS.missionsCreate, input);
+      bus.emit("portfolio");
+      // The ref of a created mission is the mission itself.
+      return result.ref.id as MissionId;
+    },
+    createLane: async ({ missionId, name, subMissionId }) => {
+      await transport.request(WS_METHODS.missionsUpsertLane, {
+        missionId,
+        name,
+        ...(subMissionId ? { subMissionId } : {}),
+      });
+    },
+    createRole: async (input) => {
+      await transport.request(POLICY.createRole, input);
+      bus.emit("roles");
+    },
+    // --- end finish-b ---
+
     subscribeViews(missionId, listener) {
       let snapshot: MissionViewsSnapshot | null | undefined;
       let events: ReadonlyArray<MissionEvent> = [];

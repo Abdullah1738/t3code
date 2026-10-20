@@ -25,6 +25,7 @@ import {
 import * as Schema from "effect/Schema";
 
 import { latestFieldChanges } from "../changeLog.ts";
+import { ROLE_KIND_LABEL } from "../rolesViewModel.ts";
 import type {
   Listener,
   MissionPoolsSnapshot,
@@ -101,6 +102,8 @@ export type OperationsSource = Pick<
   | "setCriticalityGuide"
   | "setPoolCapacity"
   | "setPortfolioOrder"
+  | "createLane"
+  | "createRole"
 >;
 
 const ref = (kind: MissionRecordRef["kind"], id: string, label?: string): MissionRecordRef =>
@@ -704,6 +707,78 @@ export function createOperations(ctx: OperationsContext): Operations {
       commit();
       return Promise.resolve();
     },
+
+    // --- finish-b ---
+    createLane({ missionId, name, subMissionId }) {
+      if (!missionOf(missionId)) return fail("not-found", `Mission ${missionId} not found.`);
+      const title = name.trim();
+      if (title.length === 0) return fail("invalid", "A new lane needs a name.");
+      const at = nowIso();
+      const lane: Lane = {
+        id: localId("lane") as Lane["id"],
+        missionId,
+        subMissionId: subMissionId ?? null,
+        name: title,
+        purpose: "",
+        status: "idle",
+        statusReason: null,
+        leadRoleId: null,
+        threadId: null,
+        currentItemId: null,
+        lastEvidence: null,
+        context: null,
+        lastActiveAt: null,
+        createdAt: at,
+        updatedAt: at,
+      };
+      lanes.push(lane);
+      log.record({
+        missionId,
+        kind: "lane.created",
+        subject: ref("lane", lane.id, lane.name),
+        summary: `Added lane ${lane.name}`,
+      });
+      commit();
+      return Promise.resolve();
+    },
+
+    createRole({ missionId, kind, name, description, laneId, modelSelection }) {
+      const mission = missionOf(missionId);
+      if (!mission) return fail("not-found", `Mission ${missionId} not found.`);
+      const model =
+        modelSelection ??
+        roles.find((r) => r.id === mission.masterRoleId)?.modelSelection ??
+        roles.find((r) => r.missionId === missionId)?.modelSelection;
+      if (kind === "custom" && (!name?.trim() || !modelSelection)) {
+        return fail("invalid", "custom roles need a name and a model");
+      }
+      if (!model) return fail("invalid", "Pick a model for the role.");
+      const at = nowIso();
+      const role: Role = {
+        id: localId("role") as Role["id"],
+        missionId,
+        kind,
+        name: name?.trim() || ROLE_KIND_LABEL[kind],
+        description: description ?? "",
+        modelSelection: model,
+        pendingModelSelection: null,
+        laneId: laneId ?? null,
+        writesPublicText: kind !== "reviewer" && kind !== "final-reviewer",
+        lockedFields: [],
+        createdAt: at,
+        updatedAt: at,
+      };
+      roles.push(role);
+      log.record({
+        missionId,
+        kind: "role.created",
+        subject: ref("role", role.id, role.name),
+        summary: `Added ${role.name}`,
+      });
+      commit();
+      return Promise.resolve();
+    },
+    // --- end finish-b ---
   };
 
   return {

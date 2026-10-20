@@ -1,7 +1,7 @@
 import { Fragment, useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 
-import type { MissionId, Role, ThreadId } from "@t3tools/contracts";
+import type { MissionId, Role, RoleKind, ThreadId } from "@t3tools/contracts";
 import {
   poolRows,
   recoveryView,
@@ -17,6 +17,8 @@ import {
   type ModelChoice,
   type PoolRow,
   type RoleRow,
+  NEW_ROLE_KINDS,
+  ROLE_KIND_LABEL,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
@@ -24,7 +26,8 @@ import { Input } from "../../components/ui/input";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { DESK_ROW, DeskChip, Figure, FoldRow, PageLine } from "./deskParts";
-import { PickForm, TextActionForm } from "./MissionForms";
+import { createRole } from "./deskCommands";
+import { PickForm, PickTextForm, TextActionForm } from "./MissionForms";
 import { MissionSection } from "./MissionSection";
 import {
   useApprovalRouting,
@@ -53,14 +56,37 @@ export function RolesTab(props: { missionId: MissionId; nowMs: number }) {
     () => (roles ? roleRegistryView(roles, masterRoleId) : null),
     [roles, masterRoleId],
   );
+  const [adding, setAdding] = useState(false);
   if (!roles || !view) return <p className="text-sm text-(--m-muted)">Loading roles…</p>;
   return (
     <div className="flex min-w-0 flex-col gap-5">
-      <PageLine>
+      <PageLine
+        actions={
+          <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
+            New role
+          </Button>
+        }
+      >
         {rolesSummary(view).map((part) =>
           typeof part === "string" ? part : <Figure key={part.key}>{part.figure}</Figure>,
         )}
       </PageLine>
+      {adding ? (
+        <div className="flex flex-col gap-2 rounded-3xl bg-(--m-surface) p-4 sm:p-5">
+          <h2 className="text-sm font-semibold">New role</h2>
+          <PickTextForm
+            pickLabel="Kind"
+            options={NEW_ROLE_KINDS.map((kind) => ({ value: kind, label: ROLE_KIND_LABEL[kind] }))}
+            textLabel="Name (optional)"
+            submitLabel="Add role"
+            onSubmit={async (kind, name) => {
+              const done = await createRole(props.missionId, kind as RoleKind, name);
+              if (done) setAdding(false);
+              return done;
+            }}
+          />
+        </div>
+      ) : null}
       <div className="grid min-w-0 gap-4 lg:grid-cols-12">
         <div className="flex min-w-0 flex-col gap-4 lg:col-span-8 [&>*:last-child]:grow">
           <RoleRegistry rows={view.rows} roles={roles.roles} nowMs={props.nowMs} />

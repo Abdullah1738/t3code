@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { Link } from "@tanstack/react-router";
+import { useMemo, useState } from "react";
+import { Link, useNavigate } from "@tanstack/react-router";
 
 import type { MissionListItem } from "@t3tools/contracts";
 import {
@@ -9,6 +9,7 @@ import {
   healthLabel,
   laneTotal,
   portfolioBar,
+  missionSlug,
   portfolioChanges,
   portfolioFacts,
   portfolioPools,
@@ -37,6 +38,8 @@ import { DESK_ROW, Figure, PageLine } from "./deskParts";
 import { toggleMissionPaused } from "./missionCommands";
 import { MissionSection } from "./MissionSection";
 import { useMissionList, useMissionOverview, usePortfolio } from "./missionsStore";
+import { createMission } from "./deskCommands";
+import { TextActionForm } from "./MissionForms";
 import { movePortfolioMission } from "./operationCommands";
 import { useNowMs } from "./useNowMs";
 
@@ -95,13 +98,39 @@ function Portfolio(props: {
   const bar = portfolioBar(view);
   const pools = portfolioPools(view);
   const changes = portfolioChanges(props.snapshot);
+  const [adding, setAdding] = useState(false);
+  const navigate = useNavigate();
   return (
     <>
-      <PageLine>
+      <PageLine
+        actions={
+          <Button size="sm" variant="outline" onClick={() => setAdding((on) => !on)}>
+            New mission
+          </Button>
+        }
+      >
         {portfolioSummary(bar).map((part) =>
           typeof part === "string" ? part : <Figure key={part.key}>{part.figure}</Figure>,
         )}
       </PageLine>
+      {adding ? (
+        <div className="flex flex-col gap-2 rounded-3xl bg-(--m-surface) p-4 sm:p-5">
+          <h2 className="text-sm font-semibold">New mission</h2>
+          <TextActionForm
+            label="Mission name"
+            submitLabel="Create"
+            onSubmit={async (title) => {
+              // Slugs aren't on the client; missions made here slug their title.
+              const taken = props.snapshot.missions.map((mission) => missionSlug(mission.title));
+              const missionId = await createMission(title, taken);
+              if (missionId === null) return false;
+              setAdding(false);
+              void navigate({ to: "/missions/$missionId", params: { missionId } });
+              return true;
+            }}
+          />
+        </div>
+      ) : null}
       <OrderBar bar={bar} />
       <div className="grid items-start gap-4 lg:grid-cols-12">
         <ol className="flex min-w-0 flex-col gap-4 lg:col-span-8">
