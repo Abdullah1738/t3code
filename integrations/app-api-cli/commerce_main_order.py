@@ -594,7 +594,7 @@ class MainOrderFlow:
     def register_tracker(self, label, *, recipient='owner'):
         name = f"order-noon-{self.order.lower()}"
         command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order,
-                   *order_watch_receipt.command_args(recipient),
+                   *order_watch_receipt.command_args(recipient, order_watch_receipt.reserved_minor(journal, self.flow_id)),
                    '--placed-at', dt.datetime.now(dt.timezone(dt.timedelta(hours=4))).isoformat(),
                    '--label', label]
         env = {k: v for k, v in os.environ.items()

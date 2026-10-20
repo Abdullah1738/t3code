@@ -651,6 +651,22 @@ def flow_created_at(flow_id):
         return row['created_at']
 
 
+def decline_observed_at(flow_id):
+    """When a reported payment error was observed for this flow, or None. Read-only.
+
+    A reported error (a card decline included) is journaled as UNKNOWN on the
+    payment operation. A conclusive status read stops the poller, so the latest
+    such row is at or after the decline a recovery re-reads (never earlier).
+    """
+    with _db() as db:
+        _get(db, flow_id)
+        row = db.execute("SELECT MAX(o.observed_at) AS at FROM observations o JOIN operations p "
+                         "ON p.flow_id=o.flow_id AND p.name=o.operation "
+                         "WHERE o.flow_id=? AND p.kind='payment' AND o.outcome='UNKNOWN'",
+                         (flow_id,)).fetchone()
+        return row['at']
+
+
 def preorder_status(flow_id):
     """Read durable pre-order phase without exposing payment secrets."""
     with _db() as db:
@@ -698,6 +714,51 @@ def cart_owner(app, account_hash, cart_hash):
         row = db.execute('SELECT flow_id FROM carts WHERE app=? AND account_hash=? AND cart_hash=?',
                          (app, account_hash, cart_hash)).fetchone()
         return row['flow_id'] if row is not None else None
+
+
+def minutes_cleanup_source(flow_id):
+    """Proof for cart-only cleanup of a closed Minutes preparation, never payment.
+
+    The last session response hash binds the *entire* current projection. A
+    later local mutating flow invalidates ownership, even if its items match.
+    """
+    with _db() as db:
+        flow = _get(db, flow_id)
+        ops = list(db.execute('SELECT * FROM operations WHERE flow_id=? ORDER BY created_at,rowid', (flow_id,)))
+        if (flow['app'] != 'noon' or flow['vertical'] != 'minutes' or flow['state'] != 'RELEASED'
+                or flow['reserved_minor'] != 0 or any(flow[k] is not None for k in
+                    ('order_id', 'review_hash', 'place_cart_hash'))
+                or not any(x['name'] == 'sync' and x['kind'] == 'cart' for x in ops)
+                or any(x['kind'] not in ('cart', 'instructions', 'selection')
+                       or x['state'] != 'OBSERVED' for x in ops)):
+            fail('MINUTES_CLEAR_CLOSED_CART_ONLY_FLOW_REQUIRED')
+        if db.execute("SELECT 1 FROM flows f JOIN operations p ON p.flow_id=f.id "
+                      "WHERE f.app='noon' AND f.account_hash=? AND f.id!=? "
+                      "AND p.created_at>? AND (f.vertical!='minutes' OR "
+                      "(p.name!='session_get' AND p.name NOT LIKE 'session_readback_%'))",
+                      (flow['account_hash'], flow_id, ops[-1]['created_at'])).fetchone():
+            fail('MINUTES_CLEAR_CART_OWNERSHIP_SUPERSEDED')
+        op = ops[-1]
+        if not (op['name'] in ('sync', 'instructions', 'payment', 'session_get')
+                or op['name'].startswith('session_readback_')):
+            fail('MINUTES_CLEAR_SESSION_EVIDENCE_REQUIRED')
+        evidence = list(db.execute('SELECT outcome,evidence_hash FROM observations '
+                                   'WHERE flow_id=? AND operation=? ORDER BY sequence', (flow_id, op['name'])))
+        if not evidence or any(x['outcome'] != 'RESPONSE_RECEIVED' for x in evidence):
+            fail('MINUTES_CLEAR_SESSION_EVIDENCE_REQUIRED')
+        return {'account_hash': flow['account_hash'], 'scope_hash': flow['scope_hash'],
+                'operation': op['name'], 'request_hash': op['request_hash'],
+                'evidence_hash': evidence[-1]['evidence_hash']}
+
+
+def claim_minutes_cleanup(source_flow_id, cleanup_flow_id, *, evidence_hash):
+    """Account claim precedes the empty sync. Source ownership is rechecked at send."""
+    proof = minutes_cleanup_source(source_flow_id)
+    if proof['evidence_hash'] != evidence_hash:
+        fail('MINUTES_CLEAR_CART_READBACK_MISMATCH')
+    return open_flow(flow_id=cleanup_flow_id, app='noon', vertical='minutes',
+                     account_hash=proof['account_hash'],
+                     scope_hash=digest({'cleanup_of': source_flow_id, 'evidence_hash': evidence_hash}))
 
 
 def adopt_stable_cart(new_flow_id, old_flow_id, cart_hash, *, evidence_hash):

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.lock
+cursor.json
+state.json
+settings.json
+prefs.md
+noise.json
+runs.jsonl
+batches/
+diagnostics/
+.run-ok
+log

@@ -3,9 +3,9 @@ import type { HealthTone } from "@t3tools/client-runtime/ardud/missions/mobile";
 import type { ReactNode } from "react";
 import { Linking, Pressable, ScrollView, View } from "react-native";
 
-import { SymbolView } from "../../components/AppSymbol";
-import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ControlPill } from "../../components/ControlPill";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
+import { ControlPill } from "../../components/ui/ControlPill";
 import { cn } from "../../lib/cn";
 
 // Desk building blocks for the phone and iPad Missions screens. Colour only

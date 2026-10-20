@@ -11,8 +11,8 @@ import { Pressable, ScrollView, View } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { AppText as Text } from "../../components/AppText";
-import { ScreenHeader } from "../../components/ScreenHeader";
+import { AppText as Text } from "../../components/ui/AppText";
+import { AppBar } from "../../components/ui/AppBar";
 import { cn } from "../../lib/cn";
 import { InboxPane } from "./InboxPane";
 import { MissionBoard } from "./MissionBoard";
@@ -160,7 +160,7 @@ export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRoutePa
   const inMission = state.tab === "missions" && mission !== null;
   return (
     <View collapsable={false} className="flex-1 bg-screen">
-      <ScreenHeader
+      <AppBar
         title={title}
         sidebar={false}
         onBack={() => navigation.goBack()}

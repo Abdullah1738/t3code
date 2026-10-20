@@ -27,7 +27,6 @@ const projectId = ProjectId.make("project-1");
 /** ardud missions: core - the paired owner's session, the only one that answers a card. */
 const owner = { _tag: "owner-app", surface: "web", sessionId: "s-owner" } as const;
 
-/** Runs `body` against the service with an in-memory store and a thread holding one request. */
 const withService = <A, E>(
   body: (input: {
     readonly service: SecretRequests.SecretRequests["Service"];
@@ -38,9 +37,7 @@ const withService = <A, E>(
     readonly threadId?: ThreadId;
     readonly runStatus?: string;
     readonly removeFails?: boolean;
-    /** The agent's wait closes the card just before the answer's record lands. */
     readonly closedFirst?: boolean;
-    /** How many record dispatches fail before one succeeds. */
     readonly failedRecords?: number;
   } = {},
 ) =>
@@ -56,7 +53,6 @@ const withService = <A, E>(
       Layer.succeed(
         ServerSecretStore.ServerSecretStore,
         ServerSecretStore.ServerSecretStore.of({
-          // Yields like a real file read, so concurrent callers can interleave.
           get: (name) => Effect.yieldNow.pipe(Effect.as(Option.fromNullishOr(stored.get(name)))),
           set: (name, value) => Effect.sync(() => void stored.set(name, value)),
           create: (name, value) =>
@@ -118,7 +114,6 @@ const withService = <A, E>(
           }
           return Effect.sync(() => {
             dispatched.push(command);
-            // Like the orchestrator, a card that is no longer pending keeps its answer.
             if (options.closedFirst && command.type === "secret_request.record") {
               secretStatus = "cancelled";
             } else if (command.type === "secret_request.record" && secretStatus === "pending") {
@@ -135,7 +130,6 @@ const withService = <A, E>(
     }).pipe(Effect.provide(SecretRequests.layer.pipe(Layer.provide(layerDependencies))));
   });
 
-/** The secret values in the store, leaving out the server's own salt. */
 const valuesOf = (stored: Map<string, Uint8Array>) =>
   Array.from(stored.entries())
     .filter(([name]) => name !== "secret-request-salt")
@@ -161,7 +155,6 @@ it.effect("a saved answer becomes a one-use ref, and the thread only learns it w
 
       const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
       assert.equal(yield* service.consume({ ref, projectId }), "ghp_secret");
-      // Used once: the value is gone from the store and the ref fails.
       assert.isFalse(valuesOf(stored).some((value) => value.includes("ghp_secret")));
       const again = yield* service.consume({ ref, projectId }).pipe(Effect.flip);
       assert.include(again.message, "already used");
@@ -272,7 +265,6 @@ it.effect("a ref only works in the project it was entered for", () =>
         .consume({ ref, projectId: ProjectId.make("project-other") })
         .pipe(Effect.flip);
       assert.include(elsewhere.message, "does not exist");
-      // A failed attempt from another project does not burn the ref.
       assert.equal(yield* service.consume({ ref, projectId }), "ghp_secret");
     }),
   ),
@@ -427,7 +419,6 @@ it.effect("drops values nobody used once they expire, and keeps the rest", () =>
     yield* store.set(fresh, encode(now));
     yield* store.set("unrelated", new Uint8Array([1]));
 
-    // Building the service runs the first sweep.
     yield* Effect.gen(function* () {
       yield* SecretRequests.SecretRequests;
     }).pipe(

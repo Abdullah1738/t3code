@@ -2,8 +2,8 @@ import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { useState } from "react";
 import { Pressable, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
-import { ControlPillMenu } from "../../components/ControlPill";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Menu } from "../../components/ui/Menu";
 import { CustomSnoozeSheet } from "../../features/threads/CustomSnoozeSheet";
 import type { ItemMarksState } from "./inboxLogic";
 import { ActionButton, Bubble, LinkButton, Meta, SectionHead, TextField } from "./parts";
@@ -27,7 +27,7 @@ export function SnoozeControl(props: { readonly marks: ItemMarksState }) {
   }
   return (
     <View className="ml-auto">
-      <ControlPillMenu
+      <Menu
         actions={[
           ...marks.choices.map((choice) => ({ id: choice.key, title: choice.label })),
           { id: PICK_TIME, title: "Pick a time" },
@@ -50,7 +50,7 @@ export function SnoozeControl(props: { readonly marks: ItemMarksState }) {
         >
           <Text className="text-[13px] font-t3-semibold text-primary-text">Snooze</Text>
         </Pressable>
-      </ControlPillMenu>
+      </Menu>
       {picking ? (
         <CustomSnoozeSheet
           onClose={() => setPicking(false)}

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ardud.catalog-guard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ardud/.nvm/versions/node/v26.2.0/bin/node</string>
+    <string>/Users/ardud/.local/share/catalog-guard/cli.mjs</string>
+    <string>check</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/ardud/.local/share/catalog-guard</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/ardud</string>
+    <key>PATH</key>
+    <string>/Users/ardud/.nvm/versions/node/v26.2.0/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>150</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/ardud/Library/Logs/catalog-guard.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ardud/Library/Logs/catalog-guard.log</string>
+</dict>
+</plist>

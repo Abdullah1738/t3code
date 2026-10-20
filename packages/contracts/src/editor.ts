@@ -10,18 +10,7 @@ type EditorDefinition = {
   readonly commands: readonly [string, ...string[]] | null;
   readonly baseArgs?: readonly string[];
   readonly launchStyle: EditorLaunchStyle;
-  /**
-   * URL scheme for editors that support VS Code's remote deep links
-   * (`<scheme>://vscode-remote/ssh-remote+<host><path>`). Only set for VS Code
-   * and forks that ship the Remote-SSH machinery, plus Zed, which uses its own
-   * `zed://ssh/<host><path>` shape.
-   */
   readonly remoteScheme?: string;
-  /**
-   * JetBrains product code (`IU`, `PY`, ...). JetBrains IDEs open remote
-   * projects through the Toolbox App's `jetbrains://gateway/ssh/...` link,
-   * which uses the code to choose the IDE backend.
-   */
   readonly jetbrainsProductCode?: string;
 };
 
@@ -179,7 +168,6 @@ export type LaunchEditorInput = typeof LaunchEditorInput.Type;
 const remoteSchemeOf = (editor: EditorDefinition): string | undefined =>
   editor.remoteScheme ?? (editor.jetbrainsProductCode === undefined ? undefined : "jetbrains");
 
-/** Editors that can open a remote workspace via an SSH deep link. */
 export const REMOTE_CAPABLE_EDITOR_IDS: ReadonlyArray<EditorId> = EDITORS.flatMap((editor) =>
   remoteSchemeOf(editor) !== undefined ? [editor.id] : [],
 );
@@ -189,18 +177,12 @@ export const remoteSchemeForEditor = (id: EditorId): string | undefined => {
   return editor === undefined ? undefined : remoteSchemeOf(editor);
 };
 
-/**
- * Builds a `<scheme>://vscode-remote/ssh-remote+<host><path>` deep link (Zed
- * takes `zed://ssh/<host><path>`, JetBrains IDEs a Toolbox App
- * `jetbrains://gateway/ssh/environment?...` link) that opens `absolutePath` on
- * `host` in the local editor over SSH. Returns undefined for editors without
- * remote deep-link support.
- */
 export const buildRemoteOpenUrl = (input: {
   readonly editor: EditorId;
   readonly host: string;
+  readonly username?: string;
   readonly absolutePath: string;
-  readonly pathKind: "file" | "folder";
+  readonly isFile?: boolean;
 }): string | undefined => {
   const scheme = remoteSchemeForEditor(input.editor);
   if (scheme === undefined) {
@@ -208,14 +190,15 @@ export const buildRemoteOpenUrl = (input: {
   }
   const editor = EDITORS.find((candidate) => candidate.id === input.editor);
   if (editor !== undefined && "jetbrainsProductCode" in editor) {
-    // Like the VS Code link, no user or port: the SSH config entry for `host`
-    // supplies them. A bare product code lets Toolbox pick the backend build.
     const params = new URLSearchParams({
       h: input.host,
       launchIde: "true",
       ideHint: editor.jetbrainsProductCode,
       projectHint: input.absolutePath.replaceAll("\\", "/"),
     });
+    if (input.username !== undefined) {
+      params.set("u", input.username);
+    }
     return `${scheme}://gateway/ssh/environment?${params.toString()}`;
   }
   // Windows server paths (`C:\...`) appear as `/C:/...` in vscode-remote URIs.
@@ -229,47 +212,26 @@ export const buildRemoteOpenUrl = (input: {
     // POSIX path that happens to start with `/C:` is left alone.
     const zedPath = /^[Cc]:[\\/]/.test(input.absolutePath) ? rootedPath.slice(3) : rootedPath;
     const encodedZedPath = zedPath.split("/").map(encodeURIComponent).join("/");
-    return `${scheme}://ssh/${encodedHost}${encodedZedPath}`;
+    // Zed reads this segment as ssh URL userinfo, so the `@` stays literal.
+    const zedDestination =
+      input.username === undefined
+        ? encodedHost
+        : `${encodeURIComponent(input.username)}@${encodedHost}`;
+    return `${scheme}://ssh/${zedDestination}${encodedZedPath}`;
   }
-  // A :line suffix makes VS Code's remote URL handler open a file instead of a folder.
-  // VS Code decodes the path and then drops every numeric `:` segment as a line or
-  // column, so a file like `notes:12` would open a different path. Open the
-  // file's folder for those instead.
-  const opensAsFile = input.pathKind === "file" && survivesVsCodeLineParsing(rootedPath);
-  const targetPath =
-    opensAsFile || input.pathKind === "folder" ? rootedPath : parentPath(rootedPath);
-  const encodedPath = targetPath.split("/").map(encodeURIComponent).join("/");
-  // A folder ending in `:<digits>` would also read as a file with a line, and a
-  // trailing slash stops that match.
-  const suffix = opensAsFile ? ":1" : /:\d+$/.test(targetPath) ? "/" : "";
-  return `${scheme}://vscode-remote/ssh-remote+${encodedHost}${encodedPath}${suffix}`;
+  const encodedPath = rootedPath.split("/").map(encodeURIComponent).join("/");
+  const destination = input.username === undefined ? input.host : `${input.username}@${input.host}`;
+  // VS Code opens a bare vscode-remote path as a folder; a trailing position makes it open the file.
+  return `${scheme}://vscode-remote/ssh-remote+${encodeURIComponent(destination)}${encodedPath}${input.isFile ? ":1:1" : ""}`;
 };
 
-// Mirrors VS Code's parseLineAndColumnAware: any `:` segment that reads as a
-// number (including an empty one) is taken as a line or column, not path.
-const survivesVsCodeLineParsing = (path: string): boolean =>
-  path
-    .split(":")
-    .slice(1)
-    .every((segment) => Number.isNaN(Number(segment)));
-
-const parentPath = (path: string): string => {
-  const index = path.lastIndexOf("/");
-  return index <= 0 ? "/" : path.slice(0, index);
-};
-
-/**
- * SSH hostnames an environment advertises for remote open links. Reachability
- * is client-side; the server only advertises names that resolve to itself and
- * gates them on a local sshd listen check. Ordered most-reachable first
- * (tailnet MagicDNS name, then mDNS `<hostname>.local`).
- */
 export const RemoteOpenTargetKind = Schema.Literals(["tailscale", "mdns"]);
 export type RemoteOpenTargetKind = typeof RemoteOpenTargetKind.Type;
 
 export const RemoteOpenTarget = Schema.Struct({
   kind: RemoteOpenTargetKind,
   host: TrimmedNonEmptyString,
+  username: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type RemoteOpenTarget = typeof RemoteOpenTarget.Type;
 
@@ -307,7 +269,6 @@ export class ExternalLauncherCommandNotFoundError extends Schema.TaggedError<Ext
   }
 }
 
-/** The target path cannot reach the editor intact, so it was not started. */
 export class ExternalLauncherUnsupportedTargetError extends Schema.TaggedError<ExternalLauncherUnsupportedTargetError>()(
   "ExternalLauncherUnsupportedTargetError",
   {

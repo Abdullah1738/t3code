@@ -208,7 +208,6 @@ const registerSwitchedOffEnvironment = Effect.gen(function* () {
       connectionId: PAIRED_PROFILE.connectionId,
       label: "Old label",
     }),
-    // Keep the endpoint unchanged: registration alone must retain the stale reason.
     profile: new BearerConnectionProfile({ ...PAIRED_PROFILE, label: "Old label" }),
     credential: new BearerConnectionCredential({ token: "old-token" }),
   });
@@ -370,7 +369,10 @@ describe("connection onboarding", () => {
       );
       yield* registry.setCompatibility(PAIRED_ENVIRONMENT_ID, UNSUPPORTED_ERROR);
       const before = yield* SubscriptionRef.get(registry.entries);
-      expect(before.get(PAIRED_ENVIRONMENT_ID)?.enabled).toBe(false);
+      expect(before.get(PAIRED_ENVIRONMENT_ID)).toMatchObject({
+        enabled: true,
+        unsupportedReason: UNSUPPORTED_ERROR.message,
+      });
 
       const environmentId = yield* onboarding.registerPairing(PAIRING_INPUT);
 
@@ -642,6 +644,8 @@ describe("connection onboarding", () => {
           connectionId: 'ssh:environment-ssh:["devbox","devbox.example.test","developer",22]',
           target,
         },
+        // Saved so the first connect reuses this pairing instead of adding another.
+        credential: { token: "bearer-token" },
       });
     }),
   );

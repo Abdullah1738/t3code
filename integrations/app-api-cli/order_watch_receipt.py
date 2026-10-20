@@ -12,10 +12,22 @@ RECIPIENTS = ('owner', 'moni')
 NOTICE_FAILED_EXIT = 3
 
 
-def command_args(recipient):
+def command_args(recipient, total_minor=None):
     if recipient not in RECIPIENTS:
         raise ValueError('ORDER_RECIPIENT_INVALID')
-    return ['--for', recipient]
+    args = ['--for', recipient]
+    if type(total_minor) is int and total_minor > 0:
+        args += ['--total', f'AED {total_minor / 100:.2f}']
+    return args
+
+
+def reserved_minor(journal, flow_id):
+    """Paid total from the journal, or None; a lookup never blocks registration."""
+    try:
+        value = journal.inspect(flow_id).get('reserved_minor')
+    except Exception:
+        return None
+    return value if type(value) is int else None
 
 
 def parse(stdout, returncode, recipient, tracker_id):

@@ -10,6 +10,19 @@ from commerce_flow import FlowGate
 from talabat_place_contract import PlaceObservation
 from talabat_http_checkout import AsyncPaymentContext, PaymentResult
 
+_card_state=tempfile.TemporaryDirectory()
+_card_env=patch.dict('os.environ',{'CARD_STATUS_FILE':str(Path(_card_state.name)/'card-status.json')})
+
+
+def setUpModule():
+    # The live card-status record must never decide these tests.
+    _card_env.start()
+
+
+def tearDownModule():
+    _card_env.stop()
+    _card_state.cleanup()
+
 
 class RecoveryTests(unittest.TestCase):
     def test_capabilities_are_explicit_and_auth_failure_sets_exit_status(self):

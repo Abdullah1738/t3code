@@ -30,15 +30,47 @@ const makeScope = (options: {
   issuedAt: 1,
 });
 
+interface SubagentFixture {
+  readonly id?: string;
+  readonly status: string;
+  readonly origin?: "provider_native" | "app_owned";
+  readonly title?: string | null;
+  readonly nativeId?: string | null;
+  readonly childThreadId?: string | null;
+}
+
+interface RosterFixture {
+  readonly taskId: string;
+  readonly kind?: string;
+  readonly description?: string;
+  readonly childThreadId?: string;
+}
+
 interface HarnessOptions {
   readonly subagentStatus?: string;
+  readonly subagents?: ReadonlyArray<SubagentFixture>;
   readonly pendingBackgroundTasks?: number;
+  readonly roster?: ReadonlyArray<RosterFixture>;
   readonly archived?: boolean;
   readonly detachDies?: boolean;
+  readonly interruptFails?: boolean;
 }
+
+const subagentRecord = (fixture: SubagentFixture, index: number) => ({
+  id: fixture.id ?? `node:subagent-${index}`,
+  status: fixture.status,
+  origin: fixture.origin ?? "provider_native",
+  title: fixture.title === undefined ? `Subagent ${index}` : fixture.title,
+  nativeTaskRef:
+    fixture.nativeId === null
+      ? null
+      : { driver: "opencode", nativeId: fixture.nativeId ?? `toolu_${index}`, strength: "strong" },
+  childThreadId: fixture.childThreadId ?? null,
+});
 
 const makeHarness = (options: HarnessOptions = {}) => {
   const calls: Array<string> = [];
+  const commandIds: Array<string> = [];
   const sent: Array<ThreadManagementService.ThreadManagementSendInput> = [];
   const getThreadRecords = vi.fn(() =>
     Effect.succeed({
@@ -49,14 +81,20 @@ const makeHarness = (options: HarnessOptions = {}) => {
         deletedAt: null,
         activeProviderThreadId: "provider-thread-active",
       },
-      subagents: options.subagentStatus === undefined ? [] : [{ status: options.subagentStatus }],
+      subagents: [
+        ...(options.subagentStatus === undefined ? [] : [{ status: options.subagentStatus }]),
+        ...(options.subagents ?? []),
+      ].map(subagentRecord),
       providerThreads: [
         {
           id: "provider-thread-active",
-          pendingBackgroundTasks: Array.from(
-            { length: options.pendingBackgroundTasks ?? 0 },
-            (_, index) => ({ id: `task-${index}` }),
-          ),
+          pendingBackgroundTasks: [
+            ...Array.from({ length: options.pendingBackgroundTasks ?? 0 }, (_, index) => ({
+              taskId: `task-${index}`,
+              kind: "command",
+            })),
+            ...(options.roster ?? []).map((task) => ({ kind: "subagent", ...task })),
+          ],
         },
       ],
     }),
@@ -72,23 +110,40 @@ const makeHarness = (options: HarnessOptions = {}) => {
       ? Effect.die(new Error("detach failed"))
       : Effect.succeed({});
   });
+  const stopDelegatedTasks = vi.fn((input: { readonly commandId: string }) => {
+    calls.push("stopDelegatedTasks");
+    commandIds.push(input.commandId);
+    return Effect.void;
+  });
+  const interruptThread = vi.fn((input: { readonly commandId: string }) => {
+    calls.push("interruptThread");
+    commandIds.push(input.commandId);
+    return options.interruptFails === true
+      ? Effect.fail({ _tag: "InterruptFailed", message: "interrupt failed" } as const)
+      : Effect.succeed({ type: "no_active_run" });
+  });
   const layer = ContextResetService.layer.pipe(
     Layer.provide(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadRecords,
         sendToThread,
         dispatch,
+        stopDelegatedTasks,
+        interruptThread,
       } as unknown as Partial<ThreadManagementService.ThreadManagementService["Service"]>),
     ),
     Layer.provide(NodeServices.layer),
   );
-  return { calls, sent, layer };
+  return { calls, commandIds, sent, layer };
 };
 
-const reset = (scope: McpInvocationContext.McpInvocationScope) =>
+const reset = (
+  scope: McpInvocationContext.McpInvocationScope,
+  options: { readonly cancelBackgroundWork?: boolean } = {},
+) =>
   Effect.gen(function* () {
     const service = yield* ContextResetService.ContextResetService;
-    return yield* service.reset(scope, { note: "resume note" });
+    return yield* service.reset(scope, { note: "resume note", ...options });
   });
 
 describe("ContextResetService", () => {
@@ -135,7 +190,141 @@ describe("ContextResetService", () => {
       const error = yield* Effect.flip(reset(makeScope({})));
       expect(error.code).toBe("invalid_request");
       expect(error.message).toContain("2 running background tasks");
+      expect(error.message).toContain("cancelBackgroundWork: true");
       expect(harness.calls).toEqual([]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("names the running work in the refusal and counts a subagent once", () => {
+    const harness = makeHarness({
+      subagents: [
+        {
+          status: "running",
+          title: "CRP-13347 facts + packet",
+          nativeId: "toolu_live",
+          childThreadId: "thread:child-live",
+        },
+      ],
+      roster: [
+        {
+          taskId: "toolu_live",
+          description: "CRP-13347 facts + packet",
+          childThreadId: "thread:child-live",
+        },
+      ],
+    });
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(reset(makeScope({})));
+      expect(error.message).toContain("1 running background task:");
+      expect(error.message).toContain('subagent "CRP-13347 facts + packet" (toolu_live)');
+      expect(error.message).toContain("cancelBackgroundWork: true");
+      expect(harness.calls).toEqual([]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("ignores roster entries whose subagent already finished", () => {
+    const harness = makeHarness({
+      subagents: [
+        { status: "interrupted", nativeId: "call_old", childThreadId: "thread:child-old" },
+        { status: "completed", nativeId: "nested_done", childThreadId: "thread:child-nested" },
+      ],
+      roster: [
+        { taskId: "call_old", childThreadId: "thread:child-old" },
+        { taskId: "ses_parent:call_nested", childThreadId: "thread:child-nested" },
+      ],
+    });
+    return Effect.gen(function* () {
+      yield* reset(makeScope({}));
+      expect(harness.calls).toEqual(["send", "provider-session.detach"]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("still counts roster work it has no subagent for", () => {
+    const harness = makeHarness({
+      roster: [{ taskId: "bash-1", kind: "command", description: "offbox run make test" }],
+    });
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(reset(makeScope({})));
+      expect(error.message).toContain('command "offbox run make test" (bash-1)');
+      expect(harness.calls).toEqual([]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("with cancelBackgroundWork, stops the work, lists it in the note, then resets", () => {
+    const harness = makeHarness({
+      subagents: [
+        { status: "running", title: "Review PR 296", nativeId: "toolu_a" },
+        {
+          id: "node:delegated",
+          status: "running",
+          origin: "app_owned",
+          title: "Sol review r6",
+          nativeId: null,
+          childThreadId: "thread:delegated",
+        },
+      ],
+      roster: [{ taskId: "bash-1", kind: "command", description: "offbox run make test" }],
+    });
+    return Effect.gen(function* () {
+      const result = yield* reset(makeScope({}), { cancelBackgroundWork: true });
+      expect(harness.calls).toEqual([
+        "send",
+        "stopDelegatedTasks",
+        "interruptThread",
+        "provider-session.detach",
+      ]);
+      const text = harness.sent[0]?.text ?? "";
+      expect(text.startsWith("resume note")).toBe(true);
+      expect(text).toContain("stopped the background work below");
+      expect(text).toContain('- subagent "Review PR 296" (toolu_a)');
+      expect(text).toContain('- delegated task "Sol review r6" (node:delegated)');
+      expect(text).toContain('- command "offbox run make test" (bash-1)');
+      expect(harness.commandIds.every((id) => id.includes("context-reset-stop"))).toBe(true);
+      expect(result.note).toContain("Context reset scheduled");
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect(
+    "with cancelBackgroundWork, only stops delegated tasks when that is all there is",
+    () => {
+      const harness = makeHarness({
+        subagents: [
+          {
+            status: "running",
+            origin: "app_owned",
+            nativeId: null,
+            childThreadId: "thread:delegated",
+          },
+        ],
+      });
+      return Effect.gen(function* () {
+        yield* reset(makeScope({}), { cancelBackgroundWork: true });
+        expect(harness.calls).toEqual(["send", "stopDelegatedTasks", "provider-session.detach"]);
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
+  it.effect(
+    "with cancelBackgroundWork and nothing running, resets without stopping anything",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        yield* reset(makeScope({}), { cancelBackgroundWork: true });
+        expect(harness.calls).toEqual(["send", "provider-session.detach"]);
+        expect(harness.sent[0]?.text).toBe("resume note");
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
+  it.effect("still resets when stopping the background work fails, and says so", () => {
+    const harness = makeHarness({
+      subagents: [{ status: "running", nativeId: "toolu_a" }],
+      interruptFails: true,
+    });
+    return Effect.gen(function* () {
+      const result = yield* reset(makeScope({}), { cancelBackgroundWork: true });
+      expect(harness.calls).toEqual(["send", "interruptThread", "provider-session.detach"]);
+      expect(result.note).toContain("could not be stopped");
     }).pipe(Effect.provide(harness.layer));
   });
 

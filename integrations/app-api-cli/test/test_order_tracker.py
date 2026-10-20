@@ -24,6 +24,13 @@ class TrackerTest(unittest.TestCase):
             self.assertNotEqual(t.classify(text), 'delivered')
         self.assertEqual(t.classify('Your order has been delivered'), 'delivered')
 
+    def test_poll_interval_backs_off_while_eta_is_far(self):
+        now = time.time()
+        self.assertEqual(t.poll_interval(t.stamp(now + 7 * 3600), now), 900)
+        self.assertEqual(t.poll_interval(t.stamp(now + 2 * 3600), now), 300)
+        self.assertEqual(t.poll_interval(t.stamp(now + 1800), now), 60)
+        self.assertEqual(t.poll_interval(None, now), 60)
+
     def test_notification_identity_and_age(self):
         cfg = self.cfg()
         def dump(text, timestamp=None):
@@ -253,6 +260,35 @@ class TrackerTest(unittest.TestCase):
             result = t.fetch(dict(self.cfg(), app='noon', order='N123'), {}, time.time())
         self.assertEqual(result['status'], 'out for delivery')
         self.assertEqual(result['partial_evidence'][0]['item_id'], 'N123-1')
+
+    def test_moni_gets_no_progress_wakes_but_owner_does(self):
+        at = time.time()
+        for recipient, expected in (('moni', []), ('owner', [{'kind': 'stage_change', 'status': 'nearby'}])):
+            with self.subTest(recipient=recipient):
+                cfg = dict(self.cfg(), **{'for': recipient, 'eta': None})
+                state = {'primed': True, 'status': 'out for delivery'}
+                events = t.transition({'status': 'nearby', 'errors': []}, state, cfg, at)
+                self.assertEqual(events, expected)
+                self.assertEqual(state['status'], 'nearby')
+
+    def test_moni_arrival_still_wakes_on_delivered(self):
+        cfg = dict(self.cfg(), **{'for': 'moni'})
+        state = {'primed': True, 'status': 'nearby'}
+        self.assertEqual(t.transition({'status': 'delivered', 'errors': []}, state, cfg, time.time()),
+                         [{'kind': 'stage_change', 'status': 'delivered'}])
+
+    def test_moni_eta_elapsed_does_not_wake(self):
+        cfg = dict(self.cfg(), **{'for': 'moni'})
+        state = {'primed': True, 'status': 'preparing'}
+        self.assertEqual(t.transition(self.result('preparing'), state, cfg, time.time()), [])
+        self.assertTrue(state['delay_sent'])
+
+    def test_moni_progress_candidate_is_not_a_wake(self):
+        cfg = dict(self.cfg(), **{'for': 'moni'})
+        state = {'primed': True, 'delay_sent': True}
+        result = self.result()
+        result['candidate'] = {'stage': 'nearby', 'evidence': 'App says nearby'}
+        self.assertEqual(t.transition(result, state, cfg, time.time()), [])
 
     def test_shipment_to_item_arrival_is_not_duplicate(self):
         state = {'primed': True, 'delay_sent': True}

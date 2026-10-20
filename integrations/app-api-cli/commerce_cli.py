@@ -8,6 +8,7 @@ import subprocess
 import datetime as dt
 from pathlib import Path
 
+import card_status
 import commerce_journal as journal
 import commerce_receipts as receipts
 from commerce_auth_status import CommerceAuth
@@ -21,6 +22,10 @@ RECONCILE_NOT_REORDER=('An order ID may already exist and payment may have been 
                        'order. Run "commerce recover-payment {flow}" and "commerce order-status {flow}".')
 RECOVERY_NOT_REORDER=('Still unconfirmed. Do not place another order. Check "commerce order-status {flow}" '
                       'and "commerce reconcile-order {flow}"; rerun recover-payment later.')
+# Every paying lane is pinned to this saved card (reviews refuse any other).
+ORDER_CARD_LAST4='5542'
+# Only outcomes that clearly mean the card itself was refused.
+CARD_DECLINE_REASONS=frozenset({'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY'})
 
 
 def register_tracking(flow, label, recipient='owner', *, paid=True):
@@ -34,7 +39,7 @@ def register_tracking(flow, label, recipient='owner', *, paid=True):
     if not order:journal.fail('EXACT_ORDER_ID_UNAVAILABLE')
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app',state['app'],'--order',order,
-             *order_watch_receipt.command_args(recipient),
+             *order_watch_receipt.command_args(recipient,state.get('reserved_minor')),
              '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),'--label',label,
              *([] if paid else ['--hold-placed-text'])]
     try:
@@ -97,6 +102,8 @@ def purchase_talabat(args):
         order=journal.inspect(flow.flow_id)['order_id']
         if order:
             result['order']=order  # Recovery identity, never a placement claim.
+        noted=note_card_decline(result,app='talabat')
+        if noted:result['card_status']=noted
         if result['state']=='PAYMENT_REPORTED_SUCCESS':
             # A failed verification read must not hide the reported payment and
             # order identity behind a bare error code; that invites a re-order.
@@ -684,7 +691,7 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
                     # text held while payment was unconfirmed; never twice.
                     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
                     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app','talabat','--order',order,
-                             *order_watch_receipt.command_args(who),
+                             *order_watch_receipt.command_args(who,order_watch_receipt.reserved_minor(journal,flow_id)),
                              '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),
                              '--label','talabat recovered paid order']
                     try:
@@ -771,6 +778,46 @@ def require_moni_go(args):
     return moni_go.verify(getattr(args,'moni_go',None) or '')
 
 
+def card_preflight(args):
+    """Refuse a paying run, before any network call, on a card seen declined.
+
+    No override flag: clearing is `card-status ok <last4>` once Abdullah says so.
+    Prepare-only never pays, and a supermall resume with an existing order only
+    finishes tracking for a paid order, so neither is checked.
+    """
+    placing=args.command=='test-talabat-shops' or args.command=='order'
+    if not placing or getattr(args,'prepare_only',False):return None
+    if args.command=='order' and args.order_command=='supermall' and args.resume_flow:
+        try:
+            if journal.inspect(args.resume_flow)['order_id']:return None
+        except Exception:
+            pass
+    status=card_status.check(ORDER_CARD_LAST4)
+    return status if status['blocked'] else None
+
+
+def note_card_decline(result, *, app, not_before=None, occurred_at=None):
+    """Record a clear card decline so every other money path refuses the card.
+
+    `occurred_at` is when an old decline really happened (recovery re-reads);
+    None means it happened just now. Bookkeeping only: never raises, never
+    changes the payment outcome.
+    """
+    if not isinstance(result,dict) or result.get('reason') not in CARD_DECLINE_REASONS:return None
+    flow=result.get('flow_id')
+    try:
+        recorded=card_status.record_declined(ORDER_CARD_LAST4,reason=result['reason'],
+            source=f"commerce {app} {result.get('order') or flow}",event=flow,
+            not_before=not_before,occurred_at=occurred_at)['recorded']
+        current=card_status.check(ORDER_CARD_LAST4)
+        return {'card_last4':ORDER_CARD_LAST4,'recorded':recorded,'blocked':current['blocked'],
+                'message':current['message']}
+    except Exception as exc:
+        return {'card_last4':ORDER_CARD_LAST4,'recorded':False,'error':type(exc).__name__,
+                'message':(f'Recording the decline failed; run: card-status declined {ORDER_CARD_LAST4} '
+                           f'--reason {result["reason"]} --source "commerce {app}"')}
+
+
 def recipient_argument(parser):
     parser.add_argument('--for',dest='recipient',choices=order_watch_receipt.RECIPIENTS,default='owner',
         help='who ordered; moni = order-watch texts her the placement (once per order) and routes arrival texts to her. '
@@ -795,6 +842,13 @@ def main(argv=None):
     commands=parser.add_subparsers(dest='command',required=True)
     commands.add_parser('capabilities')
     commands.add_parser('restaurant-cart-contract')
+    options=commands.add_parser('item-options',help='Read Minutes option groups; no cart changes')
+    options.add_argument('vertical',choices=('minutes',))
+    options.add_argument('--sku',required=True)
+    options.add_argument('--query',help='Product-name search hint; result must match --sku exactly')
+    clear=commands.add_parser('clear-cart',help='Clear an unchanged cart owned by a closed, cart-only Minutes flow')
+    clear.add_argument('vertical',choices=('minutes',))
+    clear.add_argument('--flow',dest='flow_id',required=True)
     for name in ('menu','choices'):
         discovery=commands.add_parser(name,help='Read Talabat menu items or item choices; never changes a cart')
         discovery.add_argument('app',choices=('talabat',))
@@ -870,8 +924,20 @@ def main(argv=None):
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
     try:
+        declined=card_preflight(args)
+        if declined:
+            print(json.dumps({'ok':False,'error':declined['error'],'card_last4':declined['card_last4'],
+                              'message':declined['message'],'financial_send':False,'financial_retry':False}))
+            return card_status.EXIT_BLOCKED
         moni_go=require_moni_go(args)
         if args.command=='capabilities':result=capabilities()
+        elif args.command=='item-options':
+            from noon_minutes_options import read_options
+            result={'ok':True,'financial_send':False,'cart_mutation_sent':False,
+                    **read_options(args.sku,query=args.query)}
+        elif args.command=='clear-cart':
+            from commerce_minutes_cleanup import clear_cart
+            result=clear_cart(args.flow_id)
         elif args.command in ('menu','choices'):result=talabat_discovery(args)
         elif args.command=='restaurant-cart-contract':
             from talabat_restaurant_cart import contract
@@ -888,6 +954,16 @@ def main(argv=None):
         elif args.command=='inspect':result=journal.inspect(args.flow_id)
         elif args.command=='recover-payment':
             result=recover_payment(args.flow_id,max_reads=args.max_reads,recipient=args.recipient)
+            if isinstance(result,dict) and result.get('reason') in CARD_DECLINE_REASONS:
+                # A late read of an old flow must not re-block a card cleared since it started,
+                # and its 12h block runs from when the decline was observed, not from this read.
+                try:started=journal.flow_created_at(args.flow_id)
+                except Exception:started=None
+                try:occurred=journal.decline_observed_at(args.flow_id)
+                except Exception:occurred=None
+                # No decline row (receipt parked before it was journaled): treat it as now.
+                noted=note_card_decline(result,app='talabat',not_before=started,occurred_at=occurred)
+                if noted:result={**result,'card_status':noted}
         elif args.command=='order-status':
             from commerce_order_status import status
             result=status(args.flow_id)
@@ -920,6 +996,11 @@ def main(argv=None):
         print(json.dumps(result))
         return 1 if result.get('ok') is False else 0
     except Exception as exc:
+        from noon_minutes_options import OptionsError
+        if isinstance(exc,OptionsError):
+            print(json.dumps({'ok':False,'error':exc.code,'details':exc.details,
+                              'financial_send':False,'financial_retry':False}))
+            return 1
         code=str(exc)
         preparation=re.fullmatch(r'PREPARATION_FAILED:(quote_(?:initial|initial_quiet|selected|selected_quiet|final_quiet)):([A-Z][A-Z0-9_]{1,99})',code)
         if isinstance(exc,talabat.orders.TalabatError) and preparation:

@@ -11,7 +11,7 @@ import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { type ComponentRef, useRef } from "react";
 import { ScrollView, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
+import { AppText as Text } from "../../components/ui/AppText";
 import { FeedError } from "./FeedError";
 import { useRoomPageFeed } from "./missionsStore";
 import { useRoomScreen } from "./recordLogic";

@@ -1,7 +1,7 @@
 import { feedFailureLines } from "@t3tools/client-runtime/ardud/missions";
 import { View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
+import { AppText as Text } from "../../components/ui/AppText";
 import type { FeedState } from "./missionsStore";
 import { LinkButton, Meta, StateGlyph } from "./parts";
 
