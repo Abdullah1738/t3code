@@ -286,27 +286,6 @@ export function CountBadge(props: { count: number; label: string }) {
   );
 }
 
-/** A state glyph and its count, both in the state's colour ("2 stuck"). */
-export function GlyphCount(props: {
-  kind: StateGlyphKind;
-  tone?: StateGlyphKind;
-  count: number;
-  label: string;
-}) {
-  return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1 tabular-nums",
-        STATE_GLYPH_CLASS[props.tone ?? props.kind],
-      )}
-    >
-      <StateGlyph kind={props.kind} {...(props.tone ? { tone: props.tone } : {})} />
-      <span aria-hidden>{props.count}</span>
-      <span className="sr-only">{props.label}</span>
-    </span>
-  );
-}
-
 /** 6px teal dot: something new the owner has not opened. */
 export function UnreadDot(props: { label?: string }) {
   return (
