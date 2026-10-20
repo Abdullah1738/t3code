@@ -1,28 +1,19 @@
 import {
   VIEW_HARD_LIMITS,
-  type MissionRecordRef,
-  type ViewNode,
+  type MissionAsset,
+  type MissionViewsSnapshot,
   type ViewNodeTag,
-  type ViewPathScope,
   type ViewSection,
+  type ViewSectionData,
 } from "@t3tools/contracts";
 
 import { refLabel } from "../viewModel.ts";
-import { resolveViewBind, viewValueText, type ViewBindContext } from "./bindings.ts";
-import { viewBlock, type ViewBlock, type ViewListRow } from "./cards.ts";
+import { type ViewBindContext } from "./bindings.ts";
+import { viewBlock, type ViewBlock, type ViewRowContext } from "./cards.ts";
 import { decodeViewBody } from "./decode.ts";
 
 // A custom section is a title and a short body over rows: a query the server
-// answers, or a fixed list of refs. Rows for query sections come from the
-// caller (the server computes them in a later round); refs sections carry
-// their rows.
-
-export interface ViewSectionRow {
-  /** `refs` rows read title, kind and status only. */
-  readonly scope: ViewPathScope | "refs";
-  readonly value: object;
-  readonly ref: MissionRecordRef | null;
-}
+// answers (its rows ride on the views snapshot), or a fixed list of refs.
 
 export interface ViewSectionView {
   readonly id: string;
@@ -39,71 +30,75 @@ const SECTION_NODES: ReadonlySet<ViewNodeTag> = new Set([
   "label",
   "facts",
   "list",
+  "table",
+  "meter",
   "group",
 ]);
 
 export const viewSectionAllows = (tag: ViewNodeTag): boolean => SECTION_NODES.has(tag);
 
-/** A refs section's rows, straight from its definition. */
-export function viewRefRows(section: ViewSection): ReadonlyArray<ViewSectionRow> {
-  const source = section.definition.source;
-  if (source._tag !== "refs") return [];
-  return source.refs.map((ref) => ({
-    scope: "refs",
-    value: { ...ref, title: refLabel(ref) },
-    ref,
-  }));
+/** The rows the server computed for a query section, from the snapshot. */
+export function viewSectionData(
+  snapshot: Pick<MissionViewsSnapshot, "sectionData">,
+  sectionId: string,
+): ViewSectionData | null {
+  return snapshot.sectionData?.find((data) => data.sectionId === sectionId) ?? null;
 }
-
-const rowKey = (row: ViewSectionRow, index: number): string =>
-  row.ref === null ? String(index) : `${row.ref.kind}:${row.ref.id}`;
 
 export interface ViewSectionOptions {
   readonly nowMs: number;
   readonly masterRoleId?: string | null;
-  /** Rows for query sections; refs sections fall back to their own refs. */
-  readonly rows?: ReadonlyArray<ViewSectionRow>;
-  /** Rows the query matched before its limit; defaults to the row count. */
-  readonly total?: number;
+  /** A query section's rows; without them it shows nothing. Refs sections carry their own. */
+  readonly data?: ViewSectionData | null;
+  readonly assets?: ReadonlyArray<MissionAsset>;
 }
 
+type RawRow = {
+  readonly key: string;
+  readonly ref: ViewRowContext["ref"];
+  readonly row: NonNullable<ViewBindContext["row"]>;
+};
+
+const rowsOf = (section: ViewSection, data: ViewSectionData | null): ReadonlyArray<RawRow> => {
+  const source = section.definition.source;
+  if (source._tag === "refs") {
+    return source.refs.map((ref) => ({
+      key: `${ref.kind}:${ref.id}`,
+      ref,
+      row: { scope: "refs", value: { ...ref, title: refLabel(ref) } },
+    }));
+  }
+  const kind = source.query.kind;
+  return (data?.rows ?? []).slice(0, 20).map((row) => ({
+    key: `${row.ref.kind}:${row.ref.id}`,
+    ref: row.ref,
+    row: { scope: kind, value: row.value },
+  }));
+};
+
 export function viewSection(section: ViewSection, options: ViewSectionOptions): ViewSectionView {
-  const rows = options.rows ?? viewRefRows(section);
+  const data = options.data ?? null;
+  const raw = rowsOf(section, data);
+  const total =
+    section.definition.source._tag === "query" ? (data?.total ?? raw.length) : raw.length;
   const context: ViewBindContext = {
     scope: null,
     record: null,
-    section: { count: rows.length, total: options.total ?? rows.length },
+    section: { count: raw.length, total },
     nowMs: options.nowMs,
     masterRoleId: options.masterRoleId ?? null,
   };
-  const listRows = (node: Extract<ViewNode, { _tag: "list" }>): ReadonlyArray<ViewListRow> =>
-    rows.slice(0, 20).flatMap((row, index) => {
-      const rowContext: ViewBindContext = {
-        ...context,
-        row: { scope: row.scope, value: row.value },
-      };
-      const title = viewValueText(resolveViewBind(node.title, rowContext));
-      if (title === null) return [];
-      return [
-        {
-          key: rowKey(row, index),
-          title,
-          meta: node.meta.flatMap((bind) => {
-            const value = viewValueText(resolveViewBind(bind, rowContext));
-            return value === null ? [] : [value];
-          }),
-          status:
-            node.status === null ? null : viewValueText(resolveViewBind(node.status, rowContext)),
-          ref: row.ref,
-        },
-      ];
-    });
+  const rows = raw.map((row): ViewRowContext => ({
+    key: row.key,
+    ref: row.ref,
+    context: { ...context, row: row.row },
+  }));
   const decoded = decodeViewBody(section.definition.body, {
     maxTop: VIEW_HARD_LIMITS.sectionBody,
     allows: viewSectionAllows,
   });
   const blocks = decoded.nodes.flatMap((node) => {
-    const block = viewBlock(node, context, null, listRows);
+    const block = viewBlock(node, context, null, { rows, assets: options.assets ?? [] });
     return block === null ? [] : [block];
   });
   return {

@@ -12,6 +12,7 @@ import {
   VIEW_PATHS,
   VIEW_REF_ROW_PATHS,
   VIEW_SECTION_PATHS,
+  VIEW_TABLE_CELL_SLOT,
   ViewNode,
   viewActionAllowed,
   viewMatchesOverlap,
@@ -98,6 +99,8 @@ const checkBind = (
 interface NodeRules {
   readonly allowed: (tag: ViewNodeTag) => string | null;
   readonly binder: Binder;
+  /** Ask cards collect a verdict per image. */
+  readonly reviews?: boolean;
 }
 
 interface Walk {
@@ -145,6 +148,27 @@ const walkNode = (
       node.children.forEach((child, index) =>
         walkNode(issues, rules, walk, child, `${path}.children[${index}]`, depth + 1),
       );
+      return;
+    case "table":
+      node.columns.forEach((column, index) =>
+        checkBind(
+          issues,
+          rules.binder,
+          column.bind,
+          VIEW_TABLE_CELL_SLOT[column.as],
+          `${path}.columns[${index}].bind`,
+        ),
+      );
+      return;
+    case "meter":
+      checkBind(issues, rules.binder, node.value, "meter", `${path}.value`);
+      checkBind(issues, rules.binder, node.max, "meter", `${path}.max`);
+      return;
+    case "gallery":
+      checkBind(issues, rules.binder, node.bind, "gallery", `${path}.bind`);
+      if (node.review === "per-asset" && rules.reviews !== true) {
+        issues.add(`${path}.review`, "node-not-allowed", "per-asset review needs an ask card");
+      }
       return;
     case "label":
     case "draft":
@@ -245,7 +269,7 @@ const templateBinder =
 const templateNodeRule =
   (backing: ViewBackingKind) =>
   (tag: ViewNodeTag): string | null => {
-    if (tag === "list") return "list blocks belong in sections";
+    if (tag === "list" || tag === "table") return `${tag} blocks belong in sections`;
     if (tag === "draft" && backing !== "draft") return "draft blocks need a draft-backed card";
     if (tag === "choice" && backing !== "ask") return "choice blocks need an ask-backed card";
     return null;
@@ -283,7 +307,11 @@ export const checkTemplate = (
 
   const nodes = checkBody(
     issues,
-    { allowed: templateNodeRule(definition.backing), binder },
+    {
+      allowed: templateNodeRule(definition.backing),
+      binder,
+      reviews: definition.backing === "ask",
+    },
     definition.body,
     VIEW_HARD_LIMITS.templateBody,
   );
@@ -369,6 +397,21 @@ const SECTION_NODES: ReadonlySet<ViewNodeTag> = new Set([
   "facts",
   "list",
   "group",
+  "table",
+  "meter",
+]);
+
+/** Slots read per row (list and table cells); the rest bind row.count / row.total. */
+const ROW_SLOTS: ReadonlySet<ViewBindSlot> = new Set([
+  "listTitle",
+  "listMeta",
+  "listStatus",
+  "cellText",
+  "cellStatus",
+  "cellAge",
+  "cellPerson",
+  "cellLink",
+  "cellCount",
 ]);
 
 /** Query filters each record kind can take. */
@@ -395,7 +438,7 @@ const sectionBinder =
   (bind, slot) => {
     const { scope, path } = splitBind(bind);
     if (scope !== "row") return { code: "bad-binding", detail: "sections bind row paths only" };
-    const inList = slot === "listTitle" || slot === "listMeta" || slot === "listStatus";
+    const inList = ROW_SLOTS.has(slot);
     const kind = inList
       ? (lookup(rowPaths, path) ?? lookup(VIEW_DERIVED_PATHS, path))
       : lookup(VIEW_SECTION_PATHS, path);

@@ -50,6 +50,7 @@ import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { AgeElement, DiscussionSymbol, HealthGlyph } from "./cards/chips";
+import { WithdrawnDrafts } from "./cards/WithdrawnDrafts";
 import { ConditionNote } from "./DiscussPanel";
 import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
@@ -579,6 +580,7 @@ function InboxExtras(props: { missionId: MissionId | null; tab: InboxTab; nowMs:
     <>
       {props.missionId ? <RoutingPanel missionId={props.missionId} /> : null}
       <ApproveHistory missionId={props.missionId} nowMs={props.nowMs} />
+      <WithdrawnDrafts missionId={props.missionId} nowMs={props.nowMs} />
       <MissionSection title="Draft notes">
         <DraftNotesPanel missionId={props.missionId} />
       </MissionSection>

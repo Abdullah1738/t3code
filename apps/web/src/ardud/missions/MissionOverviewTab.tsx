@@ -42,6 +42,7 @@ import { useMissionInbox, useMissionViews, useYourRequests } from "./missionsSto
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { PriorityStack } from "./PriorityStack";
 import { NeedsYouSection, PinnedStrip, WithTheMasterSection } from "./sections/NeedsYou";
+import { CustomSection } from "./sections/CustomSection";
 import { FoldButton, LoadingRows, SectionCount, SectionShell } from "./sections/SectionShell";
 import {
   RequestThread,
@@ -238,10 +239,10 @@ function OverviewSection(props: { section: ViewSectionEntry; context: SectionCon
       return <SinceLastLookedSection {...common} overview={context.overview} />;
     case "path-to-milestone":
       return <PathSection {...common} overview={context.overview} />;
-    // The stats row is the board's figures; custom sections render once
-    // the server answers their queries.
-    case "header-stats":
     case "custom":
+      return <CustomSection {...common} />;
+    // The stats row is the board's figures.
+    case "header-stats":
       return null;
   }
 }

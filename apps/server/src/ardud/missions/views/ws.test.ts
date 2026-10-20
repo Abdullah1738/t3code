@@ -11,13 +11,12 @@ import {
   type MissionViewsFeedItem,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 
 import { RPC_REQUIRED_SCOPES } from "../../../auth/RpcAuthorization.ts";
-import { failureCode, harness, missionId, seed } from "../asks/AsksService.testkit.ts";
+import { failureCode, missionId, seed } from "../asks/AsksService.testkit.ts";
 import * as MissionStore from "../store/MissionStore.ts";
-import { ViewsLive } from "./layer.ts";
+import { fresh } from "./views.testkit.ts";
 import { viewsWsHandlers } from "./ws.ts";
 
 const M = MISSIONS_VIEWS_WS_METHODS;
@@ -27,9 +26,6 @@ const paired = {
   origin: { _tag: "owner" as const, source: "cli" as const },
 };
 const cliIssued = { sessionId: "session-cli", subject: "cli-issued-session" };
-
-const fresh = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(Effect.provide(ViewsLive.pipe(Layer.provideMerge(harness().layer))));
 
 const take = <A, E>(stream: Stream.Stream<A, E>, count: number) =>
   Effect.scoped(

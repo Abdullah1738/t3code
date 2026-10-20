@@ -706,6 +706,7 @@ export const SUGGESTION_TARGET_LABEL: Record<SuggestionTargetKind, string> = {
   lane: "Lane",
   schedule: "Schedule",
   "draft-note": "Draft note",
+  layout: "Layout",
 };
 
 export interface AcceptanceView {

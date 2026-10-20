@@ -59,6 +59,7 @@ export const ACCEPTOR: Record<SuggestionTargetKind, "owner" | "master"> = {
   "sub-mission-order": "master",
   role: "master",
   lane: "master",
+  layout: "owner",
 };
 
 /** The record kind a suggestion may point at, per target kind. */
@@ -73,6 +74,7 @@ const TARGET_RECORD: Record<SuggestionTargetKind, MissionRecordKind | null> = {
   "sub-mission-order": "mission",
   lane: "lane",
   "draft-note": "draft-note",
+  layout: "view-layout",
 };
 
 const TARGET_KINDS = new Set(Object.keys(ACCEPTOR));

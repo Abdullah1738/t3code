@@ -15,7 +15,7 @@ import {
   suggestionFacts,
   type CardFact,
 } from "@t3tools/client-runtime/ardud/missions/mobile";
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { Pressable, ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
@@ -29,6 +29,7 @@ import {
   useMoveRecord,
   useNoteCard,
   useSuggestionCard,
+  type AskCardState,
   type MoveState,
 } from "./inboxLogic";
 import {
@@ -42,6 +43,7 @@ import {
   Meta,
   TextField,
 } from "./parts";
+import { useTemplatedItem } from "./ViewBlocks";
 
 // The reading card for one inbox item with its decide bar pinned below. The
 // same component fills the pushed item screen on phones and the reading pane
@@ -77,6 +79,7 @@ function Frame(
     readonly children: ReactNode;
     readonly actions: ReactNode;
     readonly condition?: string | null;
+    readonly kicker?: string | null; // ardud missions: views (a template's kicker)
   },
 ) {
   const headline = entryHeadline(props.entry);
@@ -89,7 +92,7 @@ function Frame(
         contentContainerClassName="gap-4 px-4 pb-8 pt-4"
       >
         <View className="flex-row items-center gap-2">
-          <Chip label={headline.kicker} />
+          <Chip label={props.kicker ?? headline.kicker} />
           {age ? <Meta>{age}</Meta> : null}
         </View>
         <Text selectable className="text-2xl leading-8 text-foreground">
@@ -144,7 +147,9 @@ function MoveActions(props: { readonly move: MoveState }) {
 // ---------------------------------------------------------------------------
 
 function AskItem(props: FrameProps & { readonly ask: Ask }) {
-  const card = useAskCard(props.ask);
+  const backed = useMemo(() => ({ kind: "ask" as const, record: props.ask }), [props.ask]);
+  const templated = useTemplatedItem(props.missionId, backed, props.nowMs);
+  const card = useAskCard(props.ask, templated ?? undefined);
   const { view } = card;
   const facts: CardFact[] = [{ label: "If you wait", value: view.costOfWaiting }];
   if (props.ask.blocks.length > 0) {
@@ -153,6 +158,7 @@ function AskItem(props: FrameProps & { readonly ask: Ask }) {
   return (
     <Frame
       {...props}
+      kicker={templated?.kicker}
       actions={
         <ActionButton
           primary
@@ -162,8 +168,32 @@ function AskItem(props: FrameProps & { readonly ask: Ask }) {
         />
       }
     >
+      {templated ? (
+        templated.render({
+          picked: card.pickedOptionId,
+          onPick: card.pickOption,
+          disabled: card.pending,
+        })
+      ) : (
+        <AskBody card={card} facts={facts} />
+      )}
+      <TextField
+        value={card.text}
+        onChangeText={card.setText}
+        placeholder={view.options.length > 0 ? "Or answer in your own words" : "Your answer"}
+        minHeight="few"
+      />
+    </Frame>
+  );
+}
+
+function AskBody(props: { readonly card: AskCardState; readonly facts: ReadonlyArray<CardFact> }) {
+  const { card } = props;
+  const { view } = card;
+  return (
+    <>
       {view.context ? <Body>{view.context}</Body> : null}
-      <Facts facts={facts} />
+      <Facts facts={props.facts} />
       {view.options.length > 0 ? (
         <View accessibilityRole="radiogroup" className="gap-2">
           {view.options.map((option) => {
@@ -200,13 +230,7 @@ function AskItem(props: FrameProps & { readonly ask: Ask }) {
         </View>
       ) : null}
       {view.recommendation ? <Meta>{view.recommendation.reason}</Meta> : null}
-      <TextField
-        value={card.text}
-        onChangeText={card.setText}
-        placeholder={view.options.length > 0 ? "Or answer in your own words" : "Your answer"}
-        minHeight="few"
-      />
-    </Frame>
+    </>
   );
 }
 
@@ -265,6 +289,7 @@ function DraftItem(props: FrameProps & { readonly draft: Draft }) {
       ) : (
         <Body>{props.draft.text}</Body>
       )}
+      {props.draft.withdrawNote ? <Meta>{props.draft.withdrawNote}</Meta> : null}
       {card.mode === "rewriting" ? (
         <TextField
           autoFocus
@@ -283,9 +308,15 @@ function ApprovalItem(props: FrameProps & { readonly approval: Approval }) {
   const move = useMoveRecord("approval", props.approval);
   const moved = routeLine(props.approval);
   const text = props.approval.summary?.trim() || props.approval.detail;
+  const backed = useMemo(
+    () => ({ kind: "approval" as const, record: props.approval }),
+    [props.approval],
+  );
+  const templated = useTemplatedItem(props.missionId, backed, props.nowMs);
   return (
     <Frame
       {...props}
+      kicker={templated?.kicker}
       condition={ownerConditionOf(props.approval)?.quote ?? null}
       actions={
         move.open ? (
@@ -299,8 +330,14 @@ function ApprovalItem(props: FrameProps & { readonly approval: Approval }) {
         )
       }
     >
-      <LinkChips links={props.approval.links} />
-      {text ? <Body>{text}</Body> : null}
+      {templated ? (
+        templated.render()
+      ) : (
+        <>
+          <LinkChips links={props.approval.links} />
+          {text ? <Body>{text}</Body> : null}
+        </>
+      )}
       {moved ? <Facts facts={[{ label: "Moved because", value: moved }]} /> : null}
       {move.open ? (
         <MoveField move={move} />

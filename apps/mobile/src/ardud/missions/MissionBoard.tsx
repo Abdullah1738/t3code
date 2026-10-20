@@ -44,6 +44,7 @@ import { useRequestComposer } from "./recordLogic";
 import { RequestReader } from "./RequestReader";
 import { MISSION_PAGES, type MissionPage } from "./routeParams";
 import { RequestRows } from "./rows";
+import { CustomSections } from "./ViewBlocks";
 
 const BOARD_LIMIT = 3;
 const SINCE_LIMIT = 8;
@@ -225,6 +226,8 @@ function BoardPage(props: PageProps) {
           </Group>
         </>
       ) : null}
+
+      <CustomSections missionId={missionId} nowMs={props.nowMs} />
 
       {withMaster.length > 0 ? (
         <>
