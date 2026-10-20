@@ -25,9 +25,11 @@ import {
   type RestoreViewInput,
   type RestoreViewLayoutInput,
   type ViewHistoryInput,
+  ViewSectionData,
   viewPinnedStrip,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { OWNER_SESSION_REQUIRED, ownerAppProvenance } from "../core/provenance.ts";
@@ -35,6 +37,8 @@ import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionWsConnection } from "../ws.ts";
 import { queriedKinds, sectionData } from "./sectionRows.ts";
 import { GLOBAL_TIMELINE, ViewService } from "./ViewService.ts";
+
+const sameSectionRows = Schema.toEquivalence(Schema.Array(ViewSectionData));
 
 export interface ViewsWsServices {
   readonly store: MissionStore.MissionStore["Service"];
@@ -146,7 +150,7 @@ export const makeViewsWsHandlers = (
                   sectionData: rows,
                 };
                 const next: FeedState = { snapshot, changed: new Set() };
-                if (JSON.stringify(rows) !== JSON.stringify(last.sectionData ?? [])) {
+                if (!sameSectionRows(rows, last.sectionData ?? [])) {
                   return [next, [{ _tag: "snapshot", snapshot } as MissionViewsFeedItem]] as const;
                 }
                 return [
