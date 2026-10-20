@@ -640,7 +640,9 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
   // stream and loads older pages on request. `loadOlderTimeline` reaches the
   // open feed through this map.
   const timelinePagers = new Map<MissionId, () => Promise<void>>();
-  const timelineFeed = sharedFeeds<MissionId, MissionTimelineWindow>((missionId, emit) => {
+  // --- finish-a --- (a failed first page fails the feed; see the catch below)
+  const timelineFeed = sharedFeeds<MissionId, MissionTimelineWindow>((missionId, emit, fail) => {
+    // --- end finish-a ---
     const byId = new Map<string, MissionTimelineEvent>();
     let loaded = false;
     let hasOlder = false;
@@ -662,7 +664,11 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       loaded = true;
       send();
     };
-    readPage().catch(ignore);
+    // --- finish-a ---
+    readPage().catch((error: unknown) => {
+      if (!closed) fail(error);
+    });
+    // --- end finish-a ---
     const stopEvents = onNewEvents(missionId, (event) => {
       if (byId.has(event.id)) return;
       byId.set(event.id, event);
@@ -1177,8 +1183,10 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     },
 
     subscribeRecovery: recoveryFeed,
-    subscribeTimeline: (missionId, listener) =>
-      timelineFeed(missionId, (window) => listener(window.events)),
+    // --- finish-a ---
+    subscribeTimeline: (missionId, listener, onError) =>
+      timelineFeed(missionId, (window) => listener(window.events), onError),
+    // --- end finish-a ---
     subscribeTimelineWindow: timelineFeed,
     loadOlderTimeline: (missionId) => timelinePagers.get(missionId)?.() ?? Promise.resolve(),
     subscribePortfolio: (listener) => portfolioFeed(null, listener),

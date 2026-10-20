@@ -496,7 +496,6 @@ function usePaneFocus(selectedKey: string | null, wide: boolean, entryKeys: Read
   return { paneRef, emptyRef };
 }
 
-/** One list per mission; the mission header only shows when there are several. */
 /** What the owner snoozed out of this tab, folded under the list; each row opens its card. */
 function SnoozedGroup(props: {
   entries: ReadonlyArray<InboxEntry>;
@@ -533,6 +532,7 @@ function SnoozedGroup(props: {
   );
 }
 
+/** One list per mission; the mission header only shows when there are several. */
 function InboxList(props: {
   groups: ReadonlyArray<InboxEntryGroup>;
   missionList: MissionListSnapshot | undefined;

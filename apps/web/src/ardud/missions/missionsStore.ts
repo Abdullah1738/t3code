@@ -98,7 +98,7 @@ const recoveryStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Recove
   (id, emit) => missionsSource.subscribeRecovery(id, emit),
 );
 const timelineStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<MissionTimelineEvent>>(
-  (id, emit) => missionsSource.subscribeTimeline(id, emit),
+  (id, emit, fail) => missionsSource.subscribeTimeline(id, emit, fail),
 );
 const portfolioStore = createSnapshotStore<PortfolioSnapshot>((emit) =>
   missionsSource.subscribePortfolio(emit),
@@ -165,6 +165,11 @@ export function useMissionInboxFeed(missionId: MissionId | null): FeedState {
 /** Whether the owner requests read failed; pairs with `useOwnerRequests`. */
 export function useOwnerRequestsFeed(missionId: MissionId | null): FeedState {
   return useFeedState(missionId === null ? NO_REQUESTS : requestStores(missionId));
+}
+
+/** Whether the mission's event log failed to load; pairs with `useMissionTimeline`. */
+export function useMissionTimelineFeed(missionId: MissionId): FeedState {
+  return useFeedState(timelineStores(missionId));
 }
 
 /**

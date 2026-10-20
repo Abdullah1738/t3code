@@ -254,6 +254,34 @@ describe("rpc missions source", () => {
     window.close();
   });
 
+  it("fails the timeline when its first page fails and reads it again on the next subscribe", async () => {
+    let fail = true;
+    const { transport, asked } = fakeTransport({
+      [WS_METHODS.missionsTimeline]: () => {
+        if (fail) throw new MissionError({ code: "invalid", detail: "No server is connected." });
+        return { missionId: CRPKO, entries: [], hasOlder: false };
+      },
+    });
+    const source = createRpcMissionsSource({ transport, now });
+    const errors: unknown[] = [];
+    const first = collect<ReadonlyArray<unknown>>((listener) =>
+      source.subscribeTimeline(CRPKO, listener, (error) => errors.push(error)),
+    );
+    await settle();
+    expect(errors).toHaveLength(1);
+    expect(first.seen).toEqual([]);
+    first.close();
+
+    fail = false;
+    const again = collect<ReadonlyArray<unknown>>((listener) =>
+      source.subscribeTimeline(CRPKO, listener),
+    );
+    await settle();
+    expect(asked(WS_METHODS.missionsTimeline)).toHaveLength(2);
+    expect(again.last()).toEqual([]);
+    again.close();
+  });
+
   it("reads recovery incidents and suggestion stats from the server", async () => {
     const incident = { id: "incident-1", missionIds: [CRPKO], threads: [] };
     const { transport, live, asked } = fakeTransport({

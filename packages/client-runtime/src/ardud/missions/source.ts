@@ -544,11 +544,18 @@ export interface MissionsSource {
   subscribeTimeline(
     missionId: MissionId,
     listener: Listener<ReadonlyArray<MissionTimelineEvent>>,
+    // --- finish-a ---
+    /** The first page failed; the feed stays closed until it is subscribed again. */
+    onError?: Listener<unknown>,
+    // --- end finish-a ---
   ): Unsubscribe;
   /** Same log with whether older pages exist. */
   subscribeTimelineWindow(
     missionId: MissionId,
     listener: Listener<MissionTimelineWindow>,
+    // --- finish-a ---
+    onError?: Listener<unknown>,
+    // --- end finish-a ---
   ): Unsubscribe;
   /** Loads the next older page into the timeline feeds. Resolves once it is in. */
   loadOlderTimeline(missionId: MissionId): Promise<void>;
