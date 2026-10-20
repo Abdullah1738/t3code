@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ardud.offbox-monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ardud/.config/opencode/skills/remote-compute/scripts/monitor.py</string>
+    <string>loop</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/ardud/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/ardud</string>
+  <key>StandardOutPath</key>
+  <string>/Users/ardud/.local/share/offbox/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ardud/.local/share/offbox/launchd.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,34 @@
+#!/bin/zsh
+# boat.dev CLI wrapper (offbox project, 2026-10-13).
+# Real binary: ~/.ascii/bin/boat (Rust, self-updating; reinstall: curl -fsSL https://boat.dev/install | sh,
+# or the download URL in /Users/ardud/.robob/scratch/2026-10-13-we-often-run-simulations-tests-24789d2f/boat-account.md).
+# Auth: scoped API key in Keychain (boat-api/ardud). The CLI keeps its token in
+# ~/Library/Application Support/ascii/boat/config.json (0600); if that token is missing we
+# sign in again from Keychain via --key-stdin so the key never touches argv, output or logs.
+# Never let an agent shell fall into the interactive browser login (it waits 6 minutes).
+unset BUN_INSPECT
+
+BOAT_BIN="${BOAT_BIN:-$HOME/.ascii/bin/boat}"
+BOAT_CFG="$HOME/Library/Application Support/ascii/boat/config.json"
+
+if [[ ! -x "$BOAT_BIN" ]]; then
+  print -u2 "boat: $BOAT_BIN missing; reinstall: curl -fsSL 'https://boat.dev/api/boat/cli/download?platform=darwin-arm64&channel=prod' -o $BOAT_BIN && chmod +x $BOAT_BIN"
+  exit 90
+fi
+
+case "$1" in
+  login|logout|onboard|help|-h|--help|-V|--version|completions) ;;
+  *)
+    if ! grep -q '"token": *"boat_' "$BOAT_CFG" 2>/dev/null; then
+      if security find-generic-password -s boat-api -a ardud -w 2>/dev/null \
+          | "$BOAT_BIN" login --key-stdin --json --no-update >/dev/null 2>&1; then
+        :
+      else
+        print -u2 "boat: not signed in and Keychain item boat-api/ardud did not work. See boat-account.md."
+        exit 90
+      fi
+    fi
+    ;;
+esac
+
+exec "$BOAT_BIN" "$@"
