@@ -1,13 +1,14 @@
 // Client for Robob's local control API (/api/ardud/control/*), plus the
 // mapping from its thread and request shapes onto the bridge vocabulary.
-// spectrum-bridge and telegram-bridge each carry an identical copy of this
-// file, since each package is deployed on its own.
+// spectrum-bridge and telegram-bridge each carry a copy of this file, since
+// each package is deployed on its own. Only the component credential differs.
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionRequest, QuestionRequest } from "./openchamber.ts";
 
-export const DEFAULT_TOKEN_FILE = join(homedir(), ".robob", "ardud-control.json");
+export const COMPONENT_TOKEN_FILE = join(homedir(), ".robob", "components", "telegram-bridge.json");
+export const SHARED_TOKEN_FILE = join(homedir(), ".robob", "ardud-control.json");
 const PREFIX = "/api/ardud/control";
 const LOOPBACK = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]+)?\/?$/i;
 
@@ -108,25 +109,29 @@ export interface ControlConfigOptions {
 }
 
 /**
- * Explicit options, then T3_CONTROL_URL / T3_CONTROL_TOKEN, then the token file
- * (T3_CONTROL_TOKEN_FILE or ~/.robob/ardud-control.json), which must be chmod 600.
- * Same order as the control API's own client.mjs.
+ * Explicit options, then T3_CONTROL_URL / T3_CONTROL_TOKEN, then the first token
+ * file that exists out of `tokenFile`, T3_CONTROL_TOKEN_FILE, this bridge's own
+ * component credential and the shared ~/.robob/ardud-control.json. Token files
+ * must be chmod 600. Same order as the control API's own client.mjs.
  */
 export function discoverControlConfig(options: ControlConfigOptions = {}): { url: string; token: string } {
   const env = options.env ?? process.env;
   let url = options.url ?? env.T3_CONTROL_URL;
   let token = options.token ?? env.T3_CONTROL_TOKEN;
-  if (!url || !token) {
-    const file = options.tokenFile ?? env.T3_CONTROL_TOKEN_FILE ?? DEFAULT_TOKEN_FILE;
-    let stored: { url?: unknown; token?: unknown } | undefined;
+  const files = [options.tokenFile, env.T3_CONTROL_TOKEN_FILE, COMPONENT_TOKEN_FILE, SHARED_TOKEN_FILE];
+  for (const file of url && token ? [] : files) {
+    if (!file) continue;
+    let stored: { url?: unknown; token?: unknown };
     try {
       if (statSync(file).mode & 0o077) throw new Error("Robob control token file must be chmod 600");
       stored = JSON.parse(readFileSync(file, "utf8"));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
     }
     url ??= typeof stored?.url === "string" ? stored.url : undefined;
     token ??= typeof stored?.token === "string" ? stored.token : undefined;
+    break;
   }
   if (!url || !LOOPBACK.test(url)) throw new Error("Robob control URL must be an HTTP origin on 127.0.0.1 or localhost");
   if (!token || /[\s\x00-\x1f\x7f]/.test(token)) throw new Error("Robob control token unavailable");
