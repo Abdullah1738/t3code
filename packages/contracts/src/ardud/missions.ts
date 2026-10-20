@@ -894,6 +894,10 @@ export const Rule = Schema.Struct({
   lockedFields: LockedFields,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
+  // --- finish-b additions ---
+  /** The rule version the master's reading was written for. Missing on older records. */
+  readingVersion: Schema.optional(PositiveInt),
+  // --- end finish-b additions ---
 });
 export type Rule = typeof Rule.Type;
 
@@ -1761,6 +1765,7 @@ export const MissionEventKind = Schema.Literals([
   // --- finish-b additions ---
   "room.updated",
   "room.restored",
+  "rule.acked",
   // --- end finish-b additions ---
   "request.opened",
   "request.replied",
@@ -3173,6 +3178,14 @@ export const RecordRuleUseInput = Schema.Struct({
   note: Schema.optional(Schema.String),
 });
 export type RecordRuleUseInput = typeof RecordRuleUseInput.Type;
+
+// --- finish-b additions ---
+/** A lane acknowledges the rule's current version. */
+export const AckRuleInput = Schema.Struct({
+  ruleId: RuleId,
+});
+export type AckRuleInput = typeof AckRuleInput.Type;
+// --- end finish-b additions ---
 
 /** Close a rule-change request: applied, declined, or withdrawn by its asker. */
 export const ResolveRuleChangeInput = Schema.Struct({

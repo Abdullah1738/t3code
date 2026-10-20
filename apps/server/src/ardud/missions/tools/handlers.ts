@@ -492,6 +492,11 @@ const handlers = {
       rules.recordRuleUse(provenance, input).pipe(Effect.map((rule) => ({ rule }))),
     ),
   ),
+  mission_rule_ack: McpToolAccess.actsAsCaller((input) =>
+    withRules((rules, provenance) =>
+      rules.ackRule(provenance, input).pipe(Effect.map((rule) => ({ rule }))),
+    ),
+  ),
   mission_rule_change: McpToolAccess.actsAsCaller((input) =>
     withRules((rules, provenance) =>
       rules.requestRuleChange(provenance, input).pipe(Effect.map((request) => ({ request }))),

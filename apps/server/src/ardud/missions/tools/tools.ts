@@ -1,4 +1,5 @@
 import {
+  AckRuleInput,
   AnnotateApprovalInput,
   AnnotateDraftInput,
   ApprovalId,
@@ -584,6 +585,18 @@ const MissionRuleUseTool = Tool.make("mission_rule_use", {
   dependencies: ruleDependencies,
 });
 
+// --- finish-b ---
+const MissionRuleAckTool = Tool.make("mission_rule_ack", {
+  description:
+    "As a lane, acknowledge that you have read the rule's current wording. A reworded rule needs a new ack.",
+  parameters: AckRuleInput,
+  success: Schema.Struct({ rule: Schema.Unknown }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: ruleDependencies,
+});
+// --- end finish-b ---
+
 const MissionRuleChangeTool = Tool.make("mission_rule_change", {
   description:
     "Ask for a change to a rule, in words. Anyone in the mission may ask; the owner or the master resolves it with mission_rule_change_resolve.",
@@ -704,6 +717,7 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionApprovalRoutingTool, "Set approval routing"),
   writeTool(MissionRuleTool, "Write, edit or retire a rule"),
   writeTool(MissionRuleUseTool, "Record a rule applied or broken"),
+  writeTool(MissionRuleAckTool, "Acknowledge a rule"),
   writeTool(MissionRuleChangeTool, "Ask for a rule change"),
   writeTool(MissionRuleChangeResolveTool, "Resolve a rule change request"),
   writeTool(MissionSecretRequestCloseTool, "Decline or withdraw a member's secret request"),

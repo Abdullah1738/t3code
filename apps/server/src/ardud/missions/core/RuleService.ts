@@ -2,7 +2,9 @@
 import * as NodeCrypto from "node:crypto";
 
 import {
+  type AckRuleInput,
   isOwnerProvenance,
+  type LaneId,
   MissionError,
   MissionId,
   RuleChangeRequestId,
@@ -27,7 +29,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as AsksService from "../asks/AsksService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
-import { isMasterAnywhere, isMasterOf } from "./master.ts";
+import { castOf, isMasterAnywhere, isMasterOf } from "./master.ts";
 import { actorOf } from "./provenance.ts";
 import { sameValue } from "./rules.ts";
 
@@ -77,6 +79,10 @@ export class RuleService extends Context.Service<
       input: ResolveRuleChangeInput,
     ) => Fx<RuleChangeRequest>;
     readonly recordRuleUse: (provenance: MissionProvenance, input: RecordRuleUseInput) => Fx<Rule>;
+    // --- finish-b ---
+    /** The calling lane acknowledges the rule's current version. */
+    readonly ackRule: (provenance: MissionProvenance, input: AckRuleInput) => Fx<Rule>;
+    // --- end finish-b ---
   }
 >()("t3/ardud/missions/core/RuleService") {}
 
@@ -180,6 +186,7 @@ const make = Effect.gen(function* () {
             quotedAt: now,
             provenance,
             masterReading: input.masterReading ?? "",
+            ...(input.masterReading ? { readingVersion: 1 } : {}),
             scope: input.scope ?? NO_SCOPE,
             activation: input.activation ?? "",
             status: input.status ?? "active",
@@ -210,6 +217,16 @@ const make = Effect.gen(function* () {
           );
         }
         const reworded = before.quote !== input.quote;
+        const version = reworded ? before.version + 1 : before.version;
+        // A reading given with this write is current, even unchanged (the master
+        // confirming it still holds). Otherwise it stays on the version it was
+        // written for, so the rule audit can call it stale.
+        const readingVersion =
+          input.masterReading !== undefined && input.masterReading !== ""
+            ? version
+            : reworded
+              ? (before.readingVersion ?? before.version)
+              : before.readingVersion;
         const next: Rule = {
           ...before,
           title: input.title,
@@ -221,7 +238,8 @@ const make = Effect.gen(function* () {
           scope: input.scope ?? before.scope,
           activation: input.activation ?? before.activation,
           status: input.status ?? before.status,
-          version: reworded ? before.version + 1 : before.version,
+          version,
+          ...(readingVersion === undefined ? {} : { readingVersion }),
           updatedAt: now,
         };
         if (sameValue({ ...next, updatedAt: before.updatedAt }, before)) return before;
@@ -334,6 +352,64 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  // --- finish-b ---
+  /** The lanes the calling thread runs in the rule's mission, or in any of its missions for a global rule. */
+  const callerLanes = (provenance: MissionProvenance, missionId: MissionId | null) =>
+    Effect.gen(function* () {
+      if (provenance._tag !== "agent") return [] as ReadonlyArray<LaneId>;
+      const missions =
+        missionId === null ? yield* store.missionsOfThread(provenance.threadId) : [missionId];
+      const lanes: Array<LaneId> = [];
+      for (const id of missions) {
+        const cast = yield* castOf(store, id);
+        for (const lane of cast.lanes) {
+          if (lane.threadId === provenance.threadId && lane.status !== "retired") {
+            lanes.push(lane.id);
+          }
+        }
+      }
+      return lanes;
+    });
+
+  const ackRule = (provenance: MissionProvenance, input: AckRuleInput) =>
+    serial(
+      Effect.gen(function* () {
+        const before = yield* loadRule(input.ruleId);
+        if (before.status !== "active") {
+          return yield* fail("conflict", `Rule ${before.id} is retired.`);
+        }
+        const lanes = yield* callerLanes(provenance, before.missionId);
+        const laneId = lanes[0];
+        if (laneId === undefined) {
+          return yield* fail("forbidden", "Only a lane acknowledges a rule.");
+        }
+        const isLane = (ack: Rule["acks"][number]) =>
+          ack.actor._tag === "lane" && ack.actor.laneId === laneId;
+        if (before.acks.some((ack) => isLane(ack) && ack.version === before.version)) {
+          return before;
+        }
+        const now = yield* nowIso;
+        const next: Rule = {
+          ...before,
+          acks: [
+            ...before.acks.filter((ack) => !isLane(ack)),
+            { actor: { _tag: "lane", laneId }, version: before.version, at: now },
+          ],
+          updatedAt: now,
+        };
+        yield* commit(provenance, {
+          missionId: next.missionId,
+          kind: "rule.acked",
+          summary: `Acked rule ${next.title}`,
+          ref: ruleRef(next),
+          upserts: [{ _tag: "rule", record: next }],
+          payload: { laneId, version: next.version },
+        });
+        return next;
+      }),
+    );
+  // --- end finish-b ---
+
   return RuleService.of({
     rules,
     changeRequests,
@@ -341,6 +417,7 @@ const make = Effect.gen(function* () {
     requestRuleChange,
     resolveRuleChange,
     recordRuleUse,
+    ackRule,
   });
 });
 
