@@ -281,6 +281,8 @@ import {
 import { SidebarContent, SidebarGroup, useSidebar } from "./ui/sidebar";
 // ardud missions: ui-web
 import { MissionsSidebarGroup } from "../ardud/missions/MissionsSidebarGroup";
+import { useMissionList } from "../ardud/missions/missionsStore";
+import { missionThreadIds, withoutMissionThreads } from "@t3tools/client-runtime/ardud/missions";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { SidebarHeaderIconButton, SidebarThreadHeader } from "./sidebar/SidebarThreadHeader";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from "./ui/menu";
@@ -457,7 +459,9 @@ function useSidebarThreads(input: {
 }) {
   const { projectScopeKey, scopedProjectKeys, serverConfigs, optimisticDrop, routeThreadRef } =
     input;
-  const threads = useThreadShells();
+  // ardud missions: ui-web (a mission's threads open from the mission, not the list)
+  const missionThreads = missionThreadIds(useMissionList());
+  const threads = withoutMissionThreads(useThreadShells(), missionThreads);
   const routeRowThreadKey =
     routeThreadRef === null
       ? null

@@ -136,7 +136,7 @@ export function MissionInboxPage(props: {
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
         </WorkspacePageHeader>
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-3.5 px-5 pt-6 sm:px-6 sm:pt-7.5">
+        <div className="mx-auto flex w-full max-w-none flex-col gap-3.5 px-5 pt-6 sm:px-6 sm:pt-7.5">
           <div className="flex min-h-8 items-start gap-2">
             <div className="min-w-0 flex-1">
               <h1 className="text-xl leading-tight font-normal tracking-tight sm:text-2xl">
@@ -181,7 +181,7 @@ export function MissionInboxPage(props: {
             wide={wide}
           />
         ) : feed.failure ? null : (
-          <div className="mx-auto w-full max-w-6xl px-5 pt-3 sm:px-6" aria-busy="true">
+          <div className="mx-auto w-full max-w-none px-5 pt-3 sm:px-6" aria-busy="true">
             <div className="w-full max-w-90">
               <LoadingRows />
             </div>
@@ -399,7 +399,7 @@ function InboxBody(props: {
 
   if (props.wide) {
     return (
-      <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 gap-7 px-5 sm:px-6">
+      <div className="mx-auto flex min-h-0 w-full max-w-none flex-1 gap-7 px-5 sm:px-6">
         {/* Rows bleed 12px left so their text lines up with the heading. */}
         <div className="-ms-3 flex min-h-0 w-96 shrink-0 flex-col">
           <ScrollArea className="min-h-0 flex-1">
@@ -413,7 +413,7 @@ function InboxBody(props: {
           className="flex min-h-0 min-w-0 flex-1 flex-col outline-none"
         >
           <ScrollArea className="min-h-0 flex-1">
-            <div className="flex max-w-180 flex-col gap-8 pt-4 pb-12">
+            <div className="flex max-w-240 flex-col gap-8 pt-4 pb-12">
               {cards}
               {extras}
             </div>
@@ -424,13 +424,13 @@ function InboxBody(props: {
   }
   return (
     <ScrollArea className="min-h-0 flex-1">
-      <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-5 pt-5 pb-12 sm:px-6">
+      <div className="mx-auto flex w-full max-w-none flex-col gap-8 px-5 pt-5 pb-12 sm:px-6">
         <section
           ref={paneRef}
           tabIndex={-1}
           aria-label="Reading pane"
           hidden={selected === null}
-          className="flex max-w-180 flex-col gap-3 outline-none"
+          className="flex max-w-240 flex-col gap-3 outline-none"
         >
           <div className="-ms-2">
             <Button

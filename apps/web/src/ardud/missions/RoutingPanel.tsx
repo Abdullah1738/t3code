@@ -25,7 +25,7 @@ import { flipRoute, removeRoute, setRoute } from "./operationCommands";
 
 const other = (approver: Approver): Approver => (approver === "owner" ? "master" : "owner");
 
-export function RoutingPanel(props: { missionId: MissionId }) {
+export function RoutingPanel(props: { missionId: MissionId; onDone?: () => void }) {
   const table = useApprovalRouting(props.missionId);
   const masterRoleId = useMasterRoleId(props.missionId);
   if (table === undefined) return null;
@@ -36,6 +36,13 @@ export function RoutingPanel(props: { missionId: MissionId }) {
     <MissionSection
       title="Routing"
       caption={lastChangedLine(lookup(ref, "rules"), masterRoleId) ?? undefined}
+      accessory={
+        props.onDone ? (
+          <Button size="xs" variant="ghost-muted" onClick={props.onDone}>
+            Done
+          </Button>
+        ) : undefined
+      }
     >
       {current.routes.length > 0 ? (
         <ul className="flex flex-col gap-1 text-sm">

@@ -57,7 +57,6 @@ import { RequestRows } from "./rows";
 import { CustomSections } from "./ViewBlocks";
 
 const BOARD_LIMIT = 3;
-const SINCE_LIMIT = 8;
 
 export interface MissionBoardProps {
   readonly overview: MissionOverviewSnapshot;
@@ -363,9 +362,8 @@ function SinceRows(props: {
   readonly nowMs: number;
   readonly onFine: (callId: string) => void;
 }) {
-  const [all, setAll] = useState(false);
   if (props.rows.length === 0) return <EmptyLine label="Nothing new." />;
-  const shown = all ? props.rows : props.rows.slice(0, SINCE_LIMIT);
+  const shown = props.rows;
   return (
     <>
       <Group>
@@ -404,12 +402,6 @@ function SinceRows(props: {
           </Fragment>
         ))}
       </Group>
-      {props.rows.length > SINCE_LIMIT && !all ? (
-        <LinkButton
-          label={`${props.rows.length - SINCE_LIMIT} more`}
-          onPress={() => setAll(true)}
-        />
-      ) : null}
     </>
   );
 }

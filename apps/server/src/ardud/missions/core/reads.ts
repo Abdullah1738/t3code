@@ -196,8 +196,16 @@ export const makeReads = (
             health: entry.mission,
             subMissionHealth: entry.subMissions,
           });
+          // ardud missions: ui-web (the clients' thread lists leave these to the mission)
+          const bindings = yield* store.listAllInMission("role-binding", mission.id, ["bound"]);
+          const threadIds = [
+            ...new Set([
+              ...bindings.map((binding) => binding.threadId),
+              ...records.lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
+            ]),
+          ];
           // ardud missions: router
-          return { ...item, requestsAnswered: answered.get(mission.id) ?? 0 };
+          return { ...item, requestsAnswered: answered.get(mission.id) ?? 0, threadIds };
         }),
     );
     return { revision: yield* store.revision, missions: items };

@@ -162,7 +162,7 @@ export function MissionOverviewTab(props: {
         <div className="grid min-w-0 gap-4 lg:grid-cols-12">
           <aside
             aria-label="Side column"
-            className="flex min-w-0 flex-col gap-4 lg:col-span-4 lg:col-start-9 lg:row-start-1"
+            className="flex min-w-0 flex-col gap-4 lg:col-span-5 lg:col-start-8 lg:row-start-1 2xl:col-span-6 2xl:col-start-7"
           >
             {railSections.map((section) =>
               section === LANES ? (
@@ -177,7 +177,7 @@ export function MissionOverviewTab(props: {
               ),
             )}
           </aside>
-          <div className="flex min-w-0 flex-col gap-4 lg:col-span-8 lg:col-start-1 lg:row-start-1">
+          <div className="flex min-w-0 flex-col gap-4 lg:col-span-7 lg:col-start-1 lg:row-start-1 2xl:col-span-6">
             {context.layout.main.map((section) => (
               <OverviewSection key={section.key} section={section} context={context} />
             ))}
@@ -302,9 +302,6 @@ const FEED_KIND_TONE: Partial<Record<FeedItem["kind"], "accent" | "negative">> =
   blocked: "negative",
 };
 
-/** Feed rows shown before the fold. */
-const FIRST_FEED_ROWS = 6;
-
 function SinceLastLookedSection(props: SectionProps & { overview: MissionOverviewSnapshot }) {
   const { overview, nowMs } = props;
   const sections = useMemo(
@@ -317,9 +314,8 @@ function SinceLastLookedSection(props: SectionProps & { overview: MissionOvervie
     [overview.directionCheck],
   );
   if (overview.feed.length === 0 && calls.length === 0) return null;
-  const rows = open
-    ? [...sections.fresh, ...sections.earlier]
-    : sections.fresh.slice(0, FIRST_FEED_ROWS);
+  // Every new row shows in full; only rows he has already seen sit behind the fold.
+  const rows = open ? [...sections.fresh, ...sections.earlier] : sections.fresh;
   const hidden = sections.fresh.length + sections.earlier.length - rows.length;
   const looked = overview.ownerLastLookedAt;
   return (
@@ -435,8 +431,8 @@ function FeedRow(props: { item: FeedItem; missionId: string; nowMs: number }) {
       <time dateTime={item.at} className="text-xs text-(--m-muted) tabular-nums">
         {clockOrDay(item.at, props.nowMs)}
       </time>
-      <span className="min-w-0 text-sm max-sm:line-clamp-2 sm:truncate">{item.summary}</span>
-      <span className="row-span-2 self-center">
+      <span className="min-w-0 text-sm text-pretty wrap-anywhere">{item.summary}</span>
+      <span className="row-span-2 self-start">
         <Chip {...(FEED_KIND_TONE[item.kind] ? { tone: FEED_KIND_TONE[item.kind] } : {})}>
           {FEED_KIND_LABEL[item.kind]}
         </Chip>

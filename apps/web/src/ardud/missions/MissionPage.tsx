@@ -58,7 +58,7 @@ export function MissionPage(props: {
           </WorkspaceBreadcrumb>
         </WorkspacePageHeader>
         <ScrollArea className="min-h-0 flex-1">
-          <WorkspacePageContainer width="wide" className="min-h-full gap-5">
+          <WorkspacePageContainer width="wide" className="min-h-full max-w-none gap-5 lg:px-10">
             {overview === undefined ? (
               <MissionPageSkeleton />
             ) : overview === null ? (
