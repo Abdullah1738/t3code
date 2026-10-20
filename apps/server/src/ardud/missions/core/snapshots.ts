@@ -562,14 +562,14 @@ const SEVERITY_RANK: Record<Note["severity"], number> = {
 
 /**
  * Notes the owner should see: owner-must-know or high severity, cited, not yet
- * acknowledged by the owner. Owner-must-know first, then severity, then newest.
+ * acknowledged by the owner or handled by the master. Owner-must-know first, then severity, then newest.
  */
 export const rankFyi = (notes: ReadonlyArray<Note>): Array<Note> =>
   notes
     .filter(
       (note) =>
         note.citation !== "failed" &&
-        !note.ackedBy.some((actor) => actor._tag === "owner") &&
+        note.ackedBy.length === 0 &&
         (note.type === "owner-must-know" || SEVERITY_RANK[note.severity] >= SEVERITY_RANK.high),
     )
     .toSorted((left, right) => {

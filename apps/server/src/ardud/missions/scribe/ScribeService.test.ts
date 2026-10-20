@@ -189,9 +189,9 @@ it.layer(TestLayer)("scribe service", (it) => {
         "assumption",
         "claim-of-done",
       ]);
+      // Before any editor pass only owner-must-know notes reach the owner.
       const fyi = yield* service.fyi(MISSION_ID, 10);
-      assert.equal(fyi[0]?.type, "claim-of-done");
-      assert.equal(fyi.length, 2);
+      assert.equal(fyi.length, 0);
     }),
   );
 

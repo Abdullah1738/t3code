@@ -1,4 +1,4 @@
-import type { Note } from "@t3tools/contracts";
+import { RoleId, type Note } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
 import {
@@ -103,5 +103,23 @@ describe("FYI ranking", () => {
       "b",
       "a",
     ]);
+  });
+
+  it("shows only the editor's picks when asked, and drops what the master handled", () => {
+    const notes = [
+      note("a", { severity: "critical" }),
+      note("b"),
+      note("c"),
+      note("handled", {
+        severity: "critical",
+        ackedBy: [{ _tag: "role", roleId: RoleId.make("m1:master") }],
+      }),
+    ];
+    expect(
+      rankFyi(notes, { limit: 10, editorOrder: ["c", "handled", "b"], picksOnly: true }).map(
+        (n) => n.id,
+      ),
+    ).toEqual(["c", "b"]);
+    expect(rankFyi(notes, { limit: 10, editorOrder: [], picksOnly: true })).toEqual([]);
   });
 });
