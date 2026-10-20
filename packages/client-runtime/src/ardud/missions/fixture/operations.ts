@@ -26,6 +26,7 @@ import * as Schema from "effect/Schema";
 
 import { latestFieldChanges } from "../changeLog.ts";
 import { ROLE_KIND_LABEL } from "../rolesViewModel.ts";
+import { ruleAudit } from "../rulesViewModel.ts";
 import type {
   Listener,
   MissionPoolsSnapshot,
@@ -210,7 +211,11 @@ export function createOperations(ctx: OperationsContext): Operations {
         missionId: missionId as MissionRuleBook["missionId"],
         rules,
         changeRequests: newestFirst(changeRequests.filter((request) => ids.has(request.ruleId))),
-        audit: audit.filter((finding) => finding.ruleIds.some((id) => ids.has(id))),
+        audit: [
+          ...audit.filter((finding) => finding.ruleIds.some((id) => ids.has(id))),
+          // --- finish-b ---
+          ...ruleAudit(rules),
+        ],
         suggestions: ctx.suggestions.filter(
           (s) =>
             s.status === "open" &&

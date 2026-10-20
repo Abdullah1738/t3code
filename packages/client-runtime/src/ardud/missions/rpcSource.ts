@@ -46,6 +46,7 @@ import type { WsRpcProtocolClient } from "../../rpc/protocol.ts";
 import { latestFieldChanges } from "./changeLog.ts";
 import { withMasterInbox } from "./masterInbox.ts";
 import { listedRoomUnread, pageUnread } from "./roomsViewModel.ts";
+import { ruleAudit } from "./rulesViewModel.ts";
 import type {
   FieldChange,
   Listener,
@@ -967,8 +968,8 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
           missionId,
           rules: records.rules,
           changeRequests: records.changeRequests,
-          // The conflict and stale audit has no RPC yet.
-          audit: [],
+          // --- finish-b --- read off the live rule records.
+          audit: ruleAudit(records.rules),
           suggestions: (current?.suggestions ?? []).filter(
             (suggestion) => suggestion.targetKind === "rule",
           ),

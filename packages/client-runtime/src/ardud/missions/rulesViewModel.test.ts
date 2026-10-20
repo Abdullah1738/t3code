@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
 import { actorNames } from "./roomsViewModel.ts";
 import {
+  auditCards,
   auditLine,
   auditTitle,
   editReadingInput,
@@ -13,6 +14,7 @@ import {
   resolveRuleChangeInput,
   ruleAckList,
   ruleAcks,
+  ruleAudit,
   ruleBookView,
   ruleFacts,
   ruleList,
@@ -236,6 +238,88 @@ describe("rules page", () => {
       (entry) => entry.rule.id === "rule-104",
     );
     expect(row?.changedBy.masterReading).toBe("last changed by you");
+    open.close();
+  });
+});
+
+describe("rule audit", () => {
+  it("reads broken rules, old readings and old acks off the live records", () => {
+    const { book, close } = openBook();
+    close();
+    const rule98 = ruleById(book, "rule-98");
+    const rule99 = ruleById(book, "rule-99");
+    const rule104 = ruleById(book, "rule-104");
+    const lane = (laneId: string) => ({ _tag: "lane", laneId }) as Rule["acks"][number]["actor"];
+    const rules: Rule[] = [
+      { ...rule98, brokenCount: 3, appliedCount: 3 },
+      { ...rule99, version: 2, readingVersion: 1 },
+      {
+        ...rule104,
+        version: 2,
+        acks: [
+          { actor: lane("lane-cell-bo"), version: 1, at: rule104.updatedAt },
+          { actor: lane("lane-cell-fab-tc"), version: 1, at: rule104.updatedAt },
+          { actor: lane("lane-cell-fab-tc"), version: 2, at: rule104.updatedAt },
+        ],
+      },
+      // Retired rules and readings with no version (imported) are left alone.
+      { ...rule98, id: "rule-x" as Rule["id"], status: "retired", brokenCount: 9 },
+      { ...rule99, id: "rule-y" as Rule["id"], version: 3 },
+    ];
+    const findings = ruleAudit(rules);
+    expect(findings.map((finding) => [finding.kind, finding.ruleIds])).toEqual([
+      ["broken", ["rule-98"]],
+      ["reading", ["rule-99"]],
+      ["acks", ["rule-104"]],
+    ]);
+    expect(findings[0]?.note).toBe("Broken 3 times, relied on 3 times.");
+    expect(findings[2]?.note).toBe("1 lane acked an older version.");
+    expect(ruleAudit([{ ...rule98, brokenCount: 2, appliedCount: 3 }])).toEqual([]);
+  });
+
+  it("groups computed findings into one card per kind next to the scribe's cards", () => {
+    const { book, close } = openBook();
+    close();
+    const rules = book.rules.map((rule) =>
+      rule.id === "rule-98" || rule.id === "rule-99"
+        ? { ...rule, brokenCount: 1, appliedCount: 0 }
+        : rule,
+    );
+    const cards = auditCards([...book.audit, ...ruleAudit(rules)], rules);
+    expect(cards.map((card) => card.title)).toEqual([
+      "Rule 10 stale against rule 98",
+      "Rule 19 conflicts with rule 89",
+      "2 rules broken as often as relied on",
+    ]);
+    expect(cards[2]).toMatchObject({ line: "Rules 98, 99", ruleId: "rule-98", finding: null });
+    const row = ruleBookView({ ...book, rules, audit: ruleAudit(rules) }, MASTER).active.find(
+      (entry) => entry.rule.id === "rule-99",
+    );
+    expect(row?.audit[0]?.note).toBe("Broken once, never relied on.");
+  });
+
+  it("flags a reading after a rewording, and saving the reading again confirms it", async () => {
+    const open = openBook();
+    const rule = ruleById(open.book, "rule-99");
+    const reading = editReadingInput(rule, rule.masterReading + " Fix packets only.");
+    if (!reading.ok) throw new Error(reading.error);
+    await open.source.upsertRule(reading.value);
+    const read = ruleById(open.book, "rule-99");
+    expect(read.readingVersion).toBe(read.version);
+    const reworded = editRuleInput(read, { quote: `${read.quote} Always.` });
+    if (!reworded.ok) throw new Error(reworded.error);
+    await open.source.upsertRule(reworded.value);
+    const after = ruleById(open.book, "rule-99");
+    expect(after.version).toBe(read.version + 1);
+    expect(
+      open.book.audit.filter((finding) => finding.ruleIds.includes("rule-99" as Rule["id"])),
+    ).toMatchObject([{ kind: "reading" }]);
+    const confirm = editReadingInput(after, after.masterReading);
+    expect(confirm.ok).toBe(true);
+    if (!confirm.ok) return;
+    await open.source.upsertRule(confirm.value);
+    expect(ruleById(open.book, "rule-99").readingVersion).toBe(after.version);
+    expect(open.book.audit.some((finding) => finding.kind === "reading")).toBe(false);
     open.close();
   });
 });

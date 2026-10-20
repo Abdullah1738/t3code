@@ -23,6 +23,7 @@ import type {
   MissionOverviewSnapshot,
   MissionReviewSnapshot,
   MissionRoomEntry,
+  MissionRuleBook,
   MissionTimelineWindow,
   MissionViewsState,
   MissionWorkSnapshot,
@@ -274,6 +275,26 @@ describe("rpc missions source", () => {
     expect(stats.last()).toEqual([{ missionId: CRPKO }]);
     recovery.close();
     stats.close();
+  });
+
+  it("reads the rule audit off the rule records the server streams", () => {
+    const { transport, live } = fakeTransport();
+    const source = createRpcMissionsSource({ transport, now });
+    const fixtureBook = collect<MissionRuleBook>((listener) =>
+      fixture().subscribeRuleBook(CRPKO, listener),
+    );
+    const rule = fixtureBook.last()?.rules.find((entry) => entry.id === "rule-98");
+    fixtureBook.close();
+    if (rule === undefined) throw new Error("fixture has no rule 98");
+    const book = collect<MissionRuleBook>((listener) => source.subscribeRuleBook(CRPKO, listener));
+    live(ASKS.subscribeRules)[0]?.push({
+      _tag: "snapshot",
+      records: [{ _tag: "rule", record: { ...rule, brokenCount: 2, appliedCount: 1 } }],
+    });
+    expect(book.last()?.audit).toMatchObject([
+      { kind: "broken", ruleIds: ["rule-98"], note: "Broken 2 times, relied on once." },
+    ]);
+    book.close();
   });
 
   it("shares one mission stream between overview and lanes and folds lane and event deltas", async () => {

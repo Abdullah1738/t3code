@@ -1253,14 +1253,28 @@ export function createFixtureMissionsSource(
             },
           )
         : [];
-      if (existing && edited.length === 0) return Promise.resolve(existing);
+      // --- finish-b --- an unchanged reading saved on a reworded rule confirms it.
+      const readingGiven = (input.masterReading ?? "").trim() !== "";
+      const confirmsReading =
+        existing !== undefined &&
+        readingGiven &&
+        existing.readingVersion !== undefined &&
+        existing.readingVersion < existing.version;
+      if (existing && edited.length === 0 && !confirmsReading) return Promise.resolve(existing);
       // Acks are per version: only a change to what lanes follow asks them to ack again.
       const reAck = edited.some(
         (field) => field === "quote" || field === "scope" || field === "activation",
       );
+      const version = existing ? (reAck ? existing.version + 1 : existing.version) : 1;
+      const readingVersion = readingGiven
+        ? version
+        : existing && reAck
+          ? (existing.readingVersion ?? existing.version)
+          : existing?.readingVersion;
       const rule = existing
         ? decodeRule({
             ...existing,
+            ...(readingVersion === undefined ? {} : { readingVersion }),
             title: input.title,
             quote: input.quote,
             quotedAt: existing.quote === input.quote ? existing.quotedAt : at,
@@ -1268,7 +1282,7 @@ export function createFixtureMissionsSource(
             activation: input.activation ?? existing.activation,
             status: input.status ?? existing.status,
             masterReading: input.masterReading ?? existing.masterReading,
-            version: reAck ? existing.version + 1 : existing.version,
+            version,
             updatedAt: at,
           })
         : decodeRule({
@@ -1280,6 +1294,7 @@ export function createFixtureMissionsSource(
             quotedAt: at,
             provenance: ownerProvenance(),
             masterReading: input.masterReading ?? "",
+            ...(readingVersion === undefined ? {} : { readingVersion }),
             scope,
             activation: input.activation ?? "",
             status: input.status ?? "active",

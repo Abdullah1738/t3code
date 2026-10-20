@@ -5,6 +5,7 @@ import type {
   Rule,
   RuleChangeRequest,
   RuleChangeRequestId,
+  RuleId,
   RuleScope,
   SubMission,
   Suggestion,
@@ -195,6 +196,9 @@ export const CHANGE_REQUEST_STATUS_LABEL: Record<RuleChangeRequest["status"], st
 export const AUDIT_KIND_LABEL: Record<RuleAuditFinding["kind"], string> = {
   conflict: "Conflict",
   stale: "Stale",
+  broken: "Broken",
+  reading: "Old reading",
+  acks: "Old acks",
 };
 
 /** "Conflict with rule 89: ..." for a finding seen from one of its rules. */
@@ -252,10 +256,17 @@ export function newRuleInput(
   return ok({ missionId, title: title.trim(), quote: quote.trim() });
 }
 
-/** Rewrite how the master reads the rule. The owner's quote stays as it is. */
+/**
+ * Rewrite how the master reads the rule. The owner's quote stays as it is.
+ * Saving an unchanged reading confirms it for a reworded rule.
+ */
 export function editReadingInput(rule: Rule, reading: string): Result<UpsertRuleInput> {
   const masterReading = reading.trim();
-  if (masterReading === rule.masterReading.trim()) return err("The reading is unchanged.");
+  // --- finish-b ---
+  const stale = rule.readingVersion !== undefined && rule.readingVersion < rule.version;
+  if (masterReading === rule.masterReading.trim() && !stale) {
+    return err("The reading is unchanged.");
+  }
   return ok({
     ruleId: rule.id,
     missionId: rule.missionId,
@@ -344,6 +355,7 @@ export function ruleProblem(
   rules: ReadonlyArray<Pick<Rule, "id" | "number" | "title">>,
 ): string | null {
   const finding = row.audit[0];
+  if (finding && COMPUTED_AUDIT_KINDS.has(finding.kind)) return finding.note;
   if (finding) {
     const others = otherRules(finding, row.rule.id, rules);
     const verb = finding.kind === "conflict" ? "Conflicts with" : "Stale against";
@@ -519,3 +531,130 @@ export function ruleUses(
       broken: event.kind === "rule.broken",
     }));
 }
+
+// --- finish-b ---
+
+const COMPUTED_AUDIT_KINDS: ReadonlySet<RuleAuditFinding["kind"]> = new Set([
+  "broken",
+  "reading",
+  "acks",
+]);
+
+const AUDIT_ACTOR = { _tag: "system", component: "audit" } as const;
+
+const times = (count: number) => (count === 1 ? "once" : `${count} times`);
+
+/**
+ * What the live rule records say needs a look, for active rules only:
+ * broken at least as often as relied on, reworded since the master's reading,
+ * or acked by a lane on an older version and not yet on this one.
+ */
+export function ruleAudit(rules: ReadonlyArray<Rule>): RuleAuditFinding[] {
+  const findings: RuleAuditFinding[] = [];
+  for (const rule of rules) {
+    if (rule.status !== "active") continue;
+    const at = rule.updatedAt;
+    if (rule.brokenCount > 0 && rule.brokenCount >= rule.appliedCount) {
+      findings.push({
+        id: `broken:${rule.id}`,
+        kind: "broken",
+        ruleIds: [rule.id],
+        note:
+          rule.appliedCount === 0
+            ? `Broken ${times(rule.brokenCount)}, never relied on.`
+            : `Broken ${times(rule.brokenCount)}, relied on ${times(rule.appliedCount)}.`,
+        foundBy: AUDIT_ACTOR,
+        at: rule.lastReliedAt ?? at,
+      });
+    }
+    if (
+      rule.masterReading.trim() !== "" &&
+      rule.readingVersion !== undefined &&
+      rule.readingVersion < rule.version
+    ) {
+      findings.push({
+        id: `reading:${rule.id}`,
+        kind: "reading",
+        ruleIds: [rule.id],
+        note: "Reworded since the master's reading.",
+        foundBy: AUDIT_ACTOR,
+        at,
+      });
+    }
+    const current = new Set<string>();
+    const old = new Set<string>();
+    for (const ack of rule.acks) {
+      if (ack.actor._tag !== "lane") continue;
+      (ack.version === rule.version ? current : old).add(ack.actor.laneId);
+    }
+    const behind = [...old].filter((laneId) => !current.has(laneId));
+    if (behind.length > 0) {
+      findings.push({
+        id: `acks:${rule.id}`,
+        kind: "acks",
+        ruleIds: [rule.id],
+        note: `${behind.length === 1 ? "1 lane" : `${behind.length} lanes`} acked an older version.`,
+        foundBy: AUDIT_ACTOR,
+        at,
+      });
+    }
+  }
+  return findings;
+}
+
+export interface AuditCard {
+  readonly key: string;
+  /** "Rule 10 stale against rule 98", "3 rules acked on an older version". */
+  readonly title: string;
+  /** "Rules 10, 98, 104" for a grouped card; null for a scribe or master finding. */
+  readonly line: string | null;
+  /** The scribe or master finding behind a single card, for its "Audit by" line. */
+  readonly finding: RuleAuditFinding | null;
+  /** The rule Review opens. */
+  readonly ruleId: RuleId | null;
+}
+
+const GROUP_TITLE: Record<"broken" | "reading" | "acks", string> = {
+  broken: "broken as often as relied on",
+  reading: "reworded since the master's reading",
+  acks: "acked on an older version",
+};
+
+/** Audit cards: one per scribe or master finding, one per computed kind. */
+export function auditCards(
+  audit: ReadonlyArray<RuleAuditFinding>,
+  rules: ReadonlyArray<Pick<Rule, "id" | "number" | "title">>,
+): AuditCard[] {
+  const name = (id: RuleId) => {
+    const rule = rules.find((candidate) => candidate.id === id);
+    return rule?.number ? String(rule.number) : (rule?.title ?? id);
+  };
+  const cards: AuditCard[] = audit
+    .filter((finding) => !COMPUTED_AUDIT_KINDS.has(finding.kind))
+    .map((finding) => ({
+      key: finding.id,
+      title: auditTitle(finding, rules),
+      line: null,
+      finding,
+      ruleId: finding.ruleIds[0] ?? null,
+    }));
+  for (const kind of ["broken", "reading", "acks"] as const) {
+    const ruleIds = audit
+      .filter((finding) => finding.kind === kind)
+      .flatMap((finding) => finding.ruleIds);
+    const first = ruleIds[0];
+    if (first === undefined) continue;
+    cards.push({
+      key: kind,
+      title:
+        ruleIds.length === 1
+          ? `Rule ${name(first)} ${GROUP_TITLE[kind]}`
+          : `${ruleIds.length} rules ${GROUP_TITLE[kind]}`,
+      line: ruleIds.length === 1 ? null : `Rules ${ruleIds.map(name).join(", ")}`,
+      finding: null,
+      ruleId: first,
+    });
+  }
+  return cards;
+}
+// --- end finish-b ---

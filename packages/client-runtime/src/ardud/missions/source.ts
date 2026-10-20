@@ -267,10 +267,15 @@ export interface MissionWorkSnapshot {
 
 // --- Rules -----------------------------------------------------------------
 
-/** Conflict and staleness findings over the rule book (scribe or master audit). */
+/**
+ * Findings over the rule book. Conflict and stale come from a scribe or master
+ * audit; broken, reading and acks are read off the live rule records
+ * (`ruleAudit` in rulesViewModel).
+ */
 export interface RuleAuditFinding {
   readonly id: string;
-  readonly kind: "conflict" | "stale";
+  // --- finish-b --- broken, reading and acks are computed from the rules.
+  readonly kind: "conflict" | "stale" | "broken" | "reading" | "acks";
   readonly ruleIds: ReadonlyArray<RuleId>;
   readonly note: string;
   readonly foundBy: MissionActor;
