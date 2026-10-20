@@ -8,16 +8,15 @@ import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import { liveThreadsLayer } from "../../../mcp/McpToolAccess.testkit.ts";
 import {
-  harness,
   masterThread,
   missionId,
   seed,
   strayThread,
   writerThread,
 } from "../asks/AsksService.testkit.ts";
-import { ViewsLive } from "./layer.ts";
 import * as ViewTools from "./tools.ts";
 import { ViewService } from "./ViewService.ts";
+import { viewsLayer } from "./views.testkit.ts";
 
 const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
   environmentId: EnvironmentId.make("environment"),
@@ -82,7 +81,7 @@ const fresh = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       McpHttpServer.toolkitRegistration(ViewTools.ViewsToolkit, ViewTools.layer).pipe(
         Layer.provideMerge(McpServer.McpServer.layer),
         Layer.provideMerge(liveThreadsLayer),
-        Layer.provideMerge(ViewsLive.pipe(Layer.provideMerge(harness().layer))),
+        Layer.provideMerge(viewsLayer()),
       ),
     ),
   );
@@ -154,7 +153,7 @@ describe("views MCP tools", () => {
         // Invalid definitions come back as issues; preview stores nothing.
         const bad = yield* call("mission_view_template", master, {
           missionId,
-          definition: { ...crwMerge, key: "bad", body: [{ _tag: "gallery" }] },
+          definition: { ...crwMerge, key: "bad", body: [{ _tag: "audio" }] },
         });
         expect(bad.isError).toBe(true);
         expect(bad.text).toContain("unknown-node");
@@ -164,6 +163,41 @@ describe("views MCP tools", () => {
         });
         expect(preview.isError).toBe(false);
         expect((yield* views.snapshot(missionId)).templates.length).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect("the master applies a bundle; any member attaches its own images", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const master = threadCaller(masterThread);
+        const applied = yield* call("mission_views_apply", master, {
+          missionId,
+          templates: [{ definition: { ...crwMerge, key: "bundled" } }],
+          sections: [],
+          changeNote: "Bundle.",
+        });
+        expect(applied.isError).toBe(false);
+        const views = yield* ViewService;
+        expect((yield* views.snapshot(missionId)).templates[0]?.definition.key).toBe("bundled");
+
+        // A writer can attach, but not from a path it made up or another thread's upload.
+        const writer = threadCaller(writerThread);
+        const missing = yield* call("mission_asset_add", writer, {
+          missionId,
+          source: {
+            _tag: "attachment",
+            attachmentId: "t_master-00000000-0000-4000-8000-000000000000",
+          },
+        });
+        expect(missing.isError).toBe(true);
+        const stray = yield* call("mission_asset_add", threadCaller(strayThread), {
+          missionId,
+          source: { _tag: "file", path: "/tmp/x.png" },
+        });
+        expect(stray.isError).toBe(true);
+        expect(stray.text).toContain("Only the owner and the mission's agents");
       }),
     ),
   );

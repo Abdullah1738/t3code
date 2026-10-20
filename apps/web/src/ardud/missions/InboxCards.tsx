@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 
 import {
   approverOf,
@@ -53,6 +53,7 @@ import {
 } from "./cards/blocks";
 import { CardFrame, type CardAction, type CardFrameProps } from "./cards/CardFrame";
 import { APPROVER_NAME, PersonChip } from "./cards/chips";
+import { useTemplatedCard } from "./cards/TemplatedCard";
 import { ConditionNote, useCardDiscussion, type CardDiscussion } from "./DiscussPanel";
 import { rerouteRecord } from "./operationCommands";
 import { inboxItemDomId, type InboxActions } from "./useInboxScreen";
@@ -143,22 +144,33 @@ export function AskCard(
   );
   const [text, setText] = useState("");
   const [busy, run] = useBusy();
+  const choice = { picked: props.picked, onPick: props.onPick, disabled: busy };
+  const backed = useMemo(() => ({ kind: "ask" as const, record: ask }), [ask]);
+  const templated = useTemplatedCard(ask.missionId, backed, {
+    nowMs: props.nowMs,
+    masterRoleId: props.masterRoleId,
+    choice,
+  });
   const actions: CardAction[] = [
     {
       key: "answer",
       primary: true,
       disabled: busy || (props.picked === null && text.trim() === ""),
       onRun: () =>
-        void run(() => props.actions.answer(ask, props.picked, text)).then((sent) => {
-          if (sent) setText("");
-        }),
+        void run(() => props.actions.answer(ask, props.picked, text, templated?.attach)).then(
+          (sent) => {
+            if (!sent) return;
+            setText("");
+            templated?.clear();
+          },
+        ),
     },
     ...withDiscuss(discussion),
   ];
   return (
     <CardFrame
       {...frame(props, `ask:${ask.id}`)}
-      kicker={view.urgent ? "Urgent decision" : "Decision"}
+      kicker={templated?.kicker ?? (view.urgent ? "Urgent decision" : "Decision")}
       discussion={discussion.symbol}
       subMission={cardSubMission(props.list, ask.missionId, ask.subMissionId)}
       since={ask.createdAt}
@@ -166,23 +178,29 @@ export function AskCard(
       actions={actions}
       approver="owner"
     >
-      <TextBlock text={ask.context} tone="meta" maxLines={4} />
-      <ChoiceBlock
-        options={view.options}
-        picked={props.picked}
-        onPick={props.onPick}
-        advice={ask.recommendation?.reason.trim() || null}
-        disabled={busy}
-      />
-      <FactsBlock
-        rows={[
-          { label: "If you wait", value: ask.costOfWaiting },
-          {
-            label: "Blocks",
-            value: ask.blocks.length > 0 ? <RefsBlock refs={ask.blocks} /> : null,
-          },
-        ]}
-      />
+      {templated ? (
+        templated.body
+      ) : (
+        <>
+          <TextBlock text={ask.context} tone="meta" maxLines={4} />
+          <ChoiceBlock
+            options={view.options}
+            picked={props.picked}
+            onPick={props.onPick}
+            advice={ask.recommendation?.reason.trim() || null}
+            disabled={busy}
+          />
+          <FactsBlock
+            rows={[
+              { label: "If you wait", value: ask.costOfWaiting },
+              {
+                label: "Blocks",
+                value: ask.blocks.length > 0 ? <RefsBlock refs={ask.blocks} /> : null,
+              },
+            ]}
+          />
+        </>
+      )}
       <Textarea
         size="sm"
         aria-label="Your answer"
@@ -370,6 +388,7 @@ export function DraftCard(
           },
         ]}
       />
+      <TextBlock text={draft.withdrawNote ?? ""} tone="meta" maxLines={2} />
       {rewriting ? (
         <ReasonField
           label="What should change"
@@ -406,6 +425,11 @@ export function ApprovalCard(
     { kind: "approval", id: approval.id, label: approval.title },
     props.nowMs,
   );
+  const backed = useMemo(() => ({ kind: "approval" as const, record: approval }), [approval]);
+  const templated = useTemplatedCard(approval.missionId, backed, {
+    nowMs: props.nowMs,
+    masterRoleId: props.masterRoleId,
+  });
   const decide = (action: "approve" | "reject") =>
     void run(() => props.actions.decideApproval(approval, action));
   const actions: CardAction[] = move.moving
@@ -433,16 +457,22 @@ export function ApprovalCard(
   return (
     <CardFrame
       {...frame(props, `approval:${approval.id}`)}
-      kicker={APPROVAL_KICKER[approval.kind]}
+      kicker={templated?.kicker ?? APPROVAL_KICKER[approval.kind]}
       discussion={discussion.symbol}
       since={approval.createdAt}
       title={approval.title}
       actions={actions}
       approver={approverOf(approval)}
     >
-      <LinksBlock links={approval.links} />
-      <FlagsBlock flags={approval.flags ?? []} />
-      <TextBlock text={approval.summary ?? approval.detail} tone="meta" maxLines={4} />
+      {templated ? (
+        templated.body
+      ) : (
+        <>
+          <LinksBlock links={approval.links} />
+          <FlagsBlock flags={approval.flags ?? []} />
+          <TextBlock text={approval.summary ?? approval.detail} tone="meta" maxLines={4} />
+        </>
+      )}
       <FactsBlock
         rows={[
           { label: "Requested by", value: approval.requestedBy },

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useReducer, useRef } from "react";
 
 import type {
+  AnswerAskInput,
   Approval,
   Ask,
   Draft,
@@ -27,7 +28,7 @@ import {
   type SuggestionDecision,
 } from "@t3tools/client-runtime/ardud/missions";
 
-import { runMissionAction, submitMissionInput } from "./missionActions";
+import { runMissionAction, submitMissionInput, type BuiltInput } from "./missionActions";
 import { missionsSource, useMissionInbox, useMissionList } from "./missionsStore";
 
 /** DOM id of an inbox item, so keyboard moves can scroll it into view. */
@@ -109,6 +110,12 @@ export function useInboxScreen(
   return { inbox, groups, entries, ui, selected, dispatch };
 }
 
+/** An answer with what the card adds to it (per-image review marks). */
+const withAttached = (
+  built: BuiltInput<AnswerAskInput>,
+  attach: (input: AnswerAskInput) => AnswerAskInput,
+): BuiltInput<AnswerAskInput> => (built.ok ? { ok: true, value: attach(built.value) } : built);
+
 /**
  * Owner decisions from the inbox. Each resolves `true` when the source took
  * it, and marks the item done so its pick and editor are forgotten.
@@ -119,9 +126,14 @@ export function inboxActions(dispatch: (event: InboxUiEvent) => void) {
     return sent;
   };
   return {
-    answer: (ask: Ask, optionId: string | null, text: string) =>
+    answer: (
+      ask: Ask,
+      optionId: string | null,
+      text: string,
+      attach: (input: AnswerAskInput) => AnswerAskInput = (input) => input,
+    ) =>
       submitMissionInput(
-        answerAskInput(ask, { optionId, text }),
+        withAttached(answerAskInput(ask, { optionId, text }), attach),
         (input) => missionsSource.answerAsk(input),
         "Couldn't send the answer",
       ).then(done(`ask:${ask.id}`)),

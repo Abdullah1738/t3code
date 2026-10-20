@@ -19,11 +19,13 @@ import { actorLabel, formatRelative } from "../viewModel.ts";
 // and its block is left out.
 
 export type ViewValue =
-  | { readonly kind: "text"; readonly text: string }
+  /** `number` is set when the value is a number (counts, meters). */
+  | { readonly kind: "text"; readonly text: string; readonly number?: number }
   | { readonly kind: "flags"; readonly flags: ReadonlyArray<string> }
   | { readonly kind: "links"; readonly links: ReadonlyArray<MissionLink> }
   | { readonly kind: "refs"; readonly refs: ReadonlyArray<MissionRecordRef> }
-  | { readonly kind: "options"; readonly options: ReadonlyArray<AskOption> };
+  | { readonly kind: "options"; readonly options: ReadonlyArray<AskOption> }
+  | { readonly kind: "assets"; readonly assetIds: ReadonlyArray<string> };
 
 export interface ViewBindContext {
   /** What `record.<path>` reads; its paths follow the scope's table. */
@@ -80,6 +82,12 @@ const numberText = (value: number, path: string): string => {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 };
 
+const numberValue = (value: number, path: string): ViewValue => ({
+  kind: "text",
+  text: numberText(value, path),
+  number: value,
+});
+
 /** Text for object-shaped `text` paths (recommendation, writtenBy, deferral). */
 const objectText = (value: object): string | null => {
   for (const key of ["reason", "what", "model", "roleId", "label", "title"]) {
@@ -99,10 +107,10 @@ const coerce = (
   switch (kind) {
     case "text":
       if (typeof raw === "string") return text(raw);
-      if (typeof raw === "number") return text(numberText(raw, path));
+      if (typeof raw === "number") return numberValue(raw, path);
       return typeof raw === "object" ? text(objectText(raw)) : null;
     case "number":
-      return typeof raw === "number" ? text(numberText(raw, path)) : null;
+      return typeof raw === "number" ? numberValue(raw, path) : null;
     case "time":
       return typeof raw === "string" ? text(formatRelative(raw, context.nowMs)) : null;
     case "actor":
@@ -130,6 +138,10 @@ const coerce = (
       return Array.isArray(raw) ? { kind: "refs", refs: raw.filter(isRef) } : null;
     case "options":
       return Array.isArray(raw) ? { kind: "options", options: raw.filter(isOption) } : null;
+    case "assets":
+      return Array.isArray(raw)
+        ? { kind: "assets", assetIds: raw.filter((id): id is string => typeof id === "string") }
+        : null;
     case "facts": {
       if (typeof raw !== "object") return null;
       const parts = Object.entries(raw).flatMap(([key, value]) =>
@@ -201,13 +213,15 @@ const fieldValue = (value: ViewFieldValue): ViewValue | null => {
     case "choice":
       return text(value.value);
     case "number":
-      return text(numberText(value.value, ""));
+      return numberValue(value.value, "");
     case "flags":
       return { kind: "flags", flags: value.value };
     case "links":
       return { kind: "links", links: value.value };
     case "refs":
       return { kind: "refs", refs: value.value };
+    case "assets":
+      return { kind: "assets", assetIds: value.value };
   }
 };
 
@@ -231,7 +245,7 @@ export function resolveViewBind(bind: string, context: ViewBindContext): ViewVal
     case "row": {
       if (context.row) return resolvePath(context.row.scope, context.row.value, path, context);
       if (context.section && lookup(VIEW_SECTION_PATHS, path) !== undefined) {
-        return text(String(path === "count" ? context.section.count : context.section.total));
+        return numberValue(path === "count" ? context.section.count : context.section.total, path);
       }
       return null;
     }
@@ -258,5 +272,28 @@ export function viewValueText(value: ViewValue | null): string | null {
       return value.options.length === 0
         ? null
         : value.options.map((option) => option.label).join(", ");
+    case "assets":
+      return value.assetIds.length === 0
+        ? null
+        : `${value.assetIds.length} ${value.assetIds.length === 1 ? "image" : "images"}`;
+  }
+}
+
+/** A value as a number: the number itself, or how many items a list holds. */
+export function viewValueCount(value: ViewValue | null): number | null {
+  if (value === null) return null;
+  switch (value.kind) {
+    case "text":
+      return value.number ?? null;
+    case "flags":
+      return value.flags.length;
+    case "links":
+      return value.links.length;
+    case "refs":
+      return value.refs.length;
+    case "options":
+      return value.options.length;
+    case "assets":
+      return value.assetIds.length;
   }
 }

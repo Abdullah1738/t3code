@@ -1,5 +1,6 @@
 import {
   approverOf,
+  type AnswerAskInput,
   type Approval,
   type Approver,
   type Ask,
@@ -61,7 +62,14 @@ export interface AskCardState {
 }
 
 /** An ask starts with nothing picked. The recommendation is advice only. */
-export function useAskCard(ask: Ask): AskCardState {
+export function useAskCard(
+  ask: Ask,
+  // ardud missions: views (image review marks ride along with the answer)
+  review?: {
+    readonly attach: (input: AnswerAskInput) => AnswerAskInput;
+    readonly clear: () => void;
+  },
+): AskCardState {
   const [form, setForm] = useState<AskAnswerForm>(EMPTY_ASK_ANSWER);
   const action = useMissionAction();
   return {
@@ -77,8 +85,10 @@ export function useAskCard(ask: Ask): AskCardState {
         action.run,
         "Could not send your answer",
         askAnswerInput(ask, form),
-        (input) => missionsSource().answerAsk(input),
-      );
+        (input) => missionsSource().answerAsk(review ? review.attach(input) : input),
+      ).then((sent) => {
+        if (sent) review?.clear();
+      });
     },
   };
 }

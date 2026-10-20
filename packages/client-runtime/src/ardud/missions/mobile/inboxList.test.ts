@@ -139,6 +139,16 @@ describe("phone inbox list", () => {
       age: "now",
       condition: "Only after the canary is green.",
     });
+    const draft = history.drafts[0];
+    if (!draft) throw new Error("fixture has no decided draft");
+    const withdrawn = decidedRows(
+      {
+        ...history,
+        drafts: [{ ...draft, status: "dropped", withdrawNote: "Superseded by the hotfix." }],
+      },
+      NOW,
+    ).find((row) => row.key === `draft:${draft.id}`);
+    expect(withdrawn?.outcome).toBe("Withdrawn: Superseded by the hotfix.");
     const all = decidedRows(history, NOW);
     expect(all.length).toBe(
       history.asks.length +

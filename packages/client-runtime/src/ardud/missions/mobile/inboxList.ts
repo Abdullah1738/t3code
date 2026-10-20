@@ -194,7 +194,10 @@ export function decidedRows(
     ...history.drafts.map((draft) => ({
       key: `draft:${draft.id}`,
       title: draftTitle(draft),
-      outcome: DRAFT_STATUS_LABEL[draft.status],
+      // ardud missions: views (a withdrawn draft says why)
+      outcome: draft.withdrawNote
+        ? `Withdrawn: ${draft.withdrawNote}`
+        : DRAFT_STATUS_LABEL[draft.status],
       at: draft.decidedAt ?? draft.createdAt,
       age: age(draft.decidedAt, draft.createdAt),
       condition: ownerConditionOf(draft)?.quote ?? null,
