@@ -5,6 +5,7 @@ import {
   BUILTIN_VIEW_TEMPLATES,
   DEFAULT_STARTER_LAYOUT,
   selectViewTemplate,
+  STOCK_VIEW_TEMPLATES,
   ViewBind,
   ViewNode,
   ViewStarterLayout,
@@ -77,6 +78,26 @@ describe("mission views catalog", () => {
     expect(isBind("record.links[0].url")).toBe(false);
   });
 
+  it("decodes table, meter and gallery nodes within their limits", () => {
+    const column = { label: "PR", bind: "row.pullRequest", as: "link" };
+    expect(decodeNode({ _tag: "table", columns: [column] })._tag).toBe("Success");
+    expect(
+      decodeNode({ _tag: "table", columns: Array.from({ length: 6 }, () => column) })._tag,
+    ).toBe("Failure");
+    expect(decodeNode({ _tag: "table", columns: [{ ...column, as: "chart" }] })._tag).toBe(
+      "Failure",
+    );
+    expect(decodeNode({ _tag: "meter", value: "row.count", max: "row.total" })._tag).toBe(
+      "Success",
+    );
+    expect(decodeNode({ _tag: "gallery", bind: "field.screens", review: "per-asset" })._tag).toBe(
+      "Success",
+    );
+    expect(decodeNode({ _tag: "gallery", bind: "field.screens", review: "pins" })._tag).toBe(
+      "Failure",
+    );
+  });
+
   it("keeps action labels and kinds in one table", () => {
     expect(VIEW_ACTIONS.send.label).toBe("Approve");
     expect(viewActionAllowed("answer", "approval")).toBe(false);
@@ -119,6 +140,29 @@ describe("template selection", () => {
       selectViewTemplate({ kind: "approval", templateId: "old", approvalKind: "deploy" }, [removed])
         .source,
     ).toBe("builtin");
+  });
+
+  it("draws release approvals and named UI reviews from the stock templates", () => {
+    for (const stock of STOCK_VIEW_TEMPLATES) {
+      expect(decodeDefinition(stock.definition)._tag).toBe("Success");
+      for (const node of stock.definition.body) expect(decodeNode(node)._tag).toBe("Success");
+    }
+    const release = selectViewTemplate({ kind: "approval", approvalKind: "release" }, []);
+    expect([release.source, release.id]).toEqual(["match", "builtin:release"]);
+    expect(selectViewTemplate({ kind: "approval", approvalKind: "deploy" }, []).id).toBe(
+      "builtin:approval",
+    );
+    const review = selectViewTemplate({ kind: "ask", templateId: "builtin:ui-review" }, []);
+    expect([review.source, review.definition.key]).toEqual(["explicit", "ui-review"]);
+    // A stored template with the stock key replaces it, for matches and names alike.
+    const own = template("own-release", { key: "release", match: { approvalKind: ["release"] } });
+    expect(selectViewTemplate({ kind: "approval", approvalKind: "release" }, [own]).id).toBe(
+      "own-release",
+    );
+    const ownReview = template("own-review", { key: "ui-review", backing: "ask", actions: [] });
+    expect(
+      selectViewTemplate({ kind: "ask", templateId: "builtin:ui-review" }, [ownReview]).id,
+    ).toBe("own-review");
   });
 
   it("detects overlapping matches", () => {

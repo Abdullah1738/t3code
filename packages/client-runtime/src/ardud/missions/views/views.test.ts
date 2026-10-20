@@ -21,8 +21,12 @@ import {
   resolveViewLayout,
   resolveViewSnapshotLayout,
   viewCard,
+  viewCardKit,
+  viewCopyRequest,
   viewSection,
   viewSectionRequest,
+  viewStarterRequest,
+  viewTemplateRequest,
 } from "./index.ts";
 
 const T0 = "2026-10-19T08:00:00.000Z";
@@ -121,7 +125,7 @@ describe("decodeViewBody", () => {
     const decoded = decodeViewBody(
       [
         { _tag: "text", bind: "record.summary", style: "body", maxLines: 2 },
-        { _tag: "gallery", bind: "record.assets" },
+        { _tag: "audio", bind: "record.assets" },
         { _tag: "text", bind: "record.summary", style: "loud", maxLines: 2 },
         { _tag: "choice" },
         {
@@ -488,6 +492,51 @@ describe("viewSectionRequest", () => {
       method: "restore",
       input: { missionId, ref: { kind: "view-section", id: "sec-1" } },
     });
+  });
+
+  it("takes a newer starter, copies views and removes custom cards", () => {
+    const base = snapshot(DEFAULT_STARTER_LAYOUT.layout.entries);
+    const starter = { ...DEFAULT_STARTER_LAYOUT, version: 1 };
+    expect(viewStarterRequest({ ...base, starter })).toBeNull();
+    expect(viewStarterRequest({ ...base, starter: { ...starter, version: 3 } })).toEqual({
+      method: "editLayout",
+      input: {
+        missionId,
+        ops: [{ _tag: "reset" }],
+        expectedVersion: 4,
+        changeNote: "Took the starter layout v3.",
+      },
+    });
+    const other = MissionId.make("m-2");
+    expect(viewCopyRequest(missionId, other)).toEqual({
+      method: "applyBundle",
+      input: { missionId, templates: [], sections: [], copyFrom: { missionId: other } },
+    });
+
+    const release = template("tpl-release", {
+      backing: "approval",
+      key: "release",
+      name: "Our release",
+    });
+    const old = template("tpl-old", { backing: "ask", key: "old", name: "Old card" }, "removed");
+    const templates = { missionId, templates: [release, old] } as const;
+    expect(viewTemplateRequest(templates, "tpl-release", "remove")).toEqual({
+      method: "remove",
+      input: { missionId, ref: { kind: "view-template", id: "tpl-release" }, expectedVersion: 1 },
+    });
+    expect(viewTemplateRequest(templates, "tpl-release", "restore")).toBeNull();
+    expect(viewTemplateRequest(templates, "tpl-old", "restore")).toEqual({
+      method: "restore",
+      input: { missionId, ref: { kind: "view-template", id: "tpl-old" } },
+    });
+    // A custom template with the stock key takes the stock card's place in the kit.
+    const kit = viewCardKit(templates);
+    expect(kit.builtIn).toContain("UI review");
+    expect(kit.builtIn).not.toContain("Release");
+    expect(kit.custom.map((item) => [item.name, item.removed])).toEqual([
+      ["Our release", false],
+      ["Old card", true],
+    ]);
   });
 
   it("resolves the layout a snapshot carries", () => {

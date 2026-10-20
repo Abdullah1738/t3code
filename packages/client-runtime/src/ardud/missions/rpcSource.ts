@@ -1361,6 +1361,10 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
         case "restore":
           await transport.request(VIEWS.restore, request.input);
           return;
+        // ardud missions: views
+        case "applyBundle":
+          await transport.request(VIEWS.applyBundle, request.input);
+          return;
       }
     },
 

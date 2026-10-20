@@ -1,8 +1,11 @@
 import {
+  BUILTIN_VIEW_TEMPLATES,
   DEFAULT_STARTER_LAYOUT,
+  STOCK_VIEW_TEMPLATES,
   VIEW_BUILTIN_SECTION_TITLES,
   VIEW_TAB_TITLES,
   viewPinnedStrip,
+  type ApplyViewBundleInput,
   type EditViewLayoutInput,
   type MissionId,
   type MissionViewsSnapshot,
@@ -239,7 +242,8 @@ export type ViewSectionChange =
 export type ViewSectionRequest =
   | { readonly method: "editLayout"; readonly input: EditViewLayoutInput }
   | { readonly method: "remove"; readonly input: RemoveViewInput }
-  | { readonly method: "restore"; readonly input: RestoreViewInput };
+  | { readonly method: "restore"; readonly input: RestoreViewInput }
+  | { readonly method: "applyBundle"; readonly input: ApplyViewBundleInput };
 
 /** Entry index within `region` for the `index`-th visible section there. */
 function regionIndex(
@@ -349,4 +353,90 @@ export function viewStarterIsNewer(
   snapshot: Pick<MissionViewsSnapshot, "layout" | "starter">,
 ): boolean {
   return snapshot.starter.version > snapshot.layout.seededFrom;
+}
+
+/** Takes the newer starter layout; the mission's own sections stay where they are. */
+export function viewStarterRequest(
+  snapshot: Pick<MissionViewsSnapshot, "missionId" | "layout" | "starter">,
+): ViewSectionRequest | null {
+  if (!viewStarterIsNewer(snapshot)) return null;
+  return {
+    method: "editLayout",
+    input: {
+      missionId: snapshot.missionId,
+      ops: [{ _tag: "reset" }],
+      expectedVersion: snapshot.layout.version,
+      changeNote: `Took the starter layout v${snapshot.starter.version}.`,
+    },
+  };
+}
+
+/** Copies another mission's card templates and portable sections in one change. */
+export function viewCopyRequest(missionId: MissionId, from: MissionId): ViewSectionRequest {
+  return {
+    method: "applyBundle",
+    input: { missionId, templates: [], sections: [], copyFrom: { missionId: from } },
+  };
+}
+
+/** Removes a custom card template, or brings a removed one back. */
+export function viewTemplateRequest(
+  snapshot: Pick<MissionViewsSnapshot, "missionId" | "templates">,
+  templateId: string,
+  change: "remove" | "restore",
+): ViewSectionRequest | null {
+  const template = snapshot.templates.find((item) => item.id === templateId);
+  if (template === undefined) return null;
+  const ref = { kind: "view-template", id: template.id } as const;
+  if (change === "remove") {
+    return template.status === "removed"
+      ? null
+      : {
+          method: "remove",
+          input: { missionId: snapshot.missionId, ref, expectedVersion: template.version },
+        };
+  }
+  return template.status === "removed"
+    ? { method: "restore", input: { missionId: snapshot.missionId, ref } }
+    : null;
+}
+
+export interface ViewKitTemplate {
+  readonly id: string;
+  readonly name: string;
+  readonly by: ViewAuthor;
+  readonly removed: boolean;
+  readonly changedAt: string;
+}
+
+export interface ViewCardKit {
+  /** Built-in and stock card names still in use; a custom template with a stock key replaces it. */
+  readonly builtIn: ReadonlyArray<string>;
+  /** The mission's own templates, active first, newest change first. */
+  readonly custom: ReadonlyArray<ViewKitTemplate>;
+}
+
+export function viewCardKit(snapshot: Pick<MissionViewsSnapshot, "templates">): ViewCardKit {
+  const taken = new Set(
+    snapshot.templates
+      .filter((template) => template.status === "active")
+      .map((template) => template.definition.key),
+  );
+  const stock = STOCK_VIEW_TEMPLATES.filter((template) => !taken.has(template.definition.key));
+  // Hermes has no `toSorted`; `map` already returned a fresh array.
+  const custom = snapshot.templates
+    .map((template) => ({
+      id: template.id,
+      name: template.definition.name,
+      by: template.by,
+      removed: template.status === "removed",
+      changedAt: template.changedAt,
+    }))
+    .sort(
+      (a, b) => Number(a.removed) - Number(b.removed) || b.changedAt.localeCompare(a.changedAt),
+    );
+  return {
+    builtIn: [...BUILTIN_VIEW_TEMPLATES, ...stock].map((template) => template.definition.name),
+    custom,
+  };
 }

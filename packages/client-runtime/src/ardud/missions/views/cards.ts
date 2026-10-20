@@ -8,6 +8,7 @@ import {
   viewMatchSubjectOf,
   ViewFieldValue,
   type Approver,
+  type MissionAsset,
   type MissionLink,
   type MissionRecordRef,
   type ViewActionKey,
@@ -15,13 +16,20 @@ import {
   type ViewBackingKind,
   type ViewNode,
   type ViewNodeTag,
+  type ViewTableCellKind,
   type ViewTemplate,
   type ViewTemplateDefinition,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-import { resolveViewBind, viewValueText, type ViewBindContext } from "./bindings.ts";
+import {
+  resolveViewBind,
+  viewValueCount,
+  viewValueText,
+  type ViewBindContext,
+  type ViewValue,
+} from "./bindings.ts";
 import { decodeViewBody } from "./decode.ts";
 
 // A card is a fixed frame (kicker, by-master marker, title, age, approver,
@@ -64,6 +72,18 @@ export type ViewBlock =
       readonly rows: ReadonlyArray<ViewListRow>;
     }
   | {
+      readonly kind: "table";
+      readonly columns: ReadonlyArray<{ readonly label: string; readonly as: ViewTableCellKind }>;
+      readonly rows: ReadonlyArray<ViewTableRow>;
+    }
+  | { readonly kind: "meter"; readonly value: number; readonly max: number }
+  | {
+      readonly kind: "gallery";
+      /** The owner marks each image ok or to change, with a note and a pin. */
+      readonly review: boolean;
+      readonly assets: ReadonlyArray<ViewGalleryAsset>;
+    }
+  | {
       readonly kind: "group";
       readonly direction: "column" | "row";
       readonly children: ReadonlyArray<ViewBlock>;
@@ -83,6 +103,33 @@ export interface ViewListRow {
   readonly status: string | null;
   /** What tapping the row opens. */
   readonly ref: MissionRecordRef | null;
+}
+
+export interface ViewTableCell {
+  readonly text: string | null;
+  /** Set on `link` cells that resolve to a link. */
+  readonly link: MissionLink | null;
+}
+
+export interface ViewTableRow {
+  readonly key: string;
+  readonly cells: ReadonlyArray<ViewTableCell>;
+  readonly ref: MissionRecordRef | null;
+}
+
+export interface ViewGalleryAsset {
+  /** Served as an `attachment` asset resource under this id. */
+  readonly id: string;
+  readonly name: string;
+  readonly width: number | null;
+  readonly height: number | null;
+}
+
+/** One section row, resolved: what list and table blocks iterate. */
+export interface ViewRowContext {
+  readonly key: string;
+  readonly ref: MissionRecordRef | null;
+  readonly context: ViewBindContext;
 }
 
 export interface ViewCardAction {
@@ -113,13 +160,15 @@ export interface ViewCardView {
 export interface ViewCardOptions {
   readonly nowMs: number;
   readonly masterRoleId?: string | null;
+  /** The mission's active images; gallery blocks show only these. */
+  readonly assets?: ReadonlyArray<MissionAsset>;
 }
 
-/** Node kinds a card of this kind renders. Lists belong to sections. */
+/** Node kinds a card of this kind renders. Lists and tables belong to sections. */
 export const viewCardAllows =
   (kind: ViewBackingKind) =>
   (tag: ViewNodeTag): boolean => {
-    if (tag === "list") return false;
+    if (tag === "list" || tag === "table") return false;
     if (tag === "draft") return kind === "draft";
     if (tag === "choice") return kind === "ask";
     return true;
@@ -183,12 +232,70 @@ const choiceBlock = (backed: ViewBackedRecord): ViewBlock | null => {
   };
 };
 
+const tableCell = (value: ViewValue | null, as: ViewTableCellKind): ViewTableCell => {
+  if (as === "count") {
+    const count = viewValueCount(value);
+    return { text: count === null ? null : String(count), link: null };
+  }
+  if (as === "link" && value?.kind === "links") {
+    const link = value.links[0] ?? null;
+    return { text: link?.label ?? null, link };
+  }
+  return { text: viewValueText(value), link: null };
+};
+
+const listRow = (
+  node: Extract<ViewNode, { _tag: "list" }>,
+  row: ViewRowContext,
+): ViewListRow | null => {
+  const title = viewValueText(resolveViewBind(node.title, row.context));
+  if (title === null) return null;
+  return {
+    key: row.key,
+    title,
+    meta: node.meta.flatMap((bind) => {
+      const value = viewValueText(resolveViewBind(bind, row.context));
+      return value === null ? [] : [value];
+    }),
+    status: node.status === null ? null : viewValueText(resolveViewBind(node.status, row.context)),
+    ref: row.ref,
+  };
+};
+
+const galleryBlock = (
+  node: Extract<ViewNode, { _tag: "gallery" }>,
+  context: ViewBindContext,
+  backed: ViewBackedRecord | null,
+  assets: ReadonlyArray<MissionAsset> | undefined,
+): ViewBlock | null => {
+  const value = resolveViewBind(node.bind, context);
+  if (value?.kind !== "assets") return null;
+  const known = new Map((assets ?? []).map((asset) => [asset.id as string, asset]));
+  const shown = value.assetIds.flatMap((id): ViewGalleryAsset[] => {
+    const asset = known.get(id);
+    // Removed and expired images, and ones this client hasn't loaded, are left out.
+    if (asset === undefined) return [];
+    return [{ id, name: asset.name, width: asset.width, height: asset.height }];
+  });
+  if (shown.length === 0) return null;
+  // Per-image marks are an answer, so only open asks take them.
+  const review =
+    node.review === "per-asset" && backed?.kind === "ask" && backed.record.status === "open";
+  return { kind: "gallery", review, assets: shown };
+};
+
+/** What a body resolves against besides its own record: section rows and mission images. */
+export interface ViewBlockSources {
+  readonly rows?: ReadonlyArray<ViewRowContext>;
+  readonly assets?: ReadonlyArray<MissionAsset>;
+}
+
 /** Resolves one decoded node to a block; null when it has nothing to show. */
 export function viewBlock(
   node: ViewNode,
   context: ViewBindContext,
   backed: ViewBackedRecord | null,
-  listRows?: (node: Extract<ViewNode, { _tag: "list" }>) => ReadonlyArray<ViewListRow>,
+  sources: ViewBlockSources = {},
 ): ViewBlock | null {
   switch (node._tag) {
     case "text": {
@@ -226,12 +333,40 @@ export function viewBlock(
     case "choice":
       return backed === null ? null : choiceBlock(backed);
     case "list": {
-      const rows = listRows?.(node) ?? [];
+      const rows = (sources.rows ?? []).flatMap((row) => {
+        const resolved = listRow(node, row);
+        return resolved === null ? [] : [resolved];
+      });
       return rows.length === 0 ? null : { kind: "list", rows };
     }
+    case "table": {
+      const rows = (sources.rows ?? []).map((row) => ({
+        key: row.key,
+        ref: row.ref,
+        cells: node.columns.map((column) =>
+          tableCell(resolveViewBind(column.bind, row.context), column.as),
+        ),
+      }));
+      // Rows whose every cell is empty say nothing.
+      const shown = rows.filter((row) => row.cells.some((cell) => cell.text !== null));
+      if (shown.length === 0) return null;
+      return {
+        kind: "table",
+        columns: node.columns.map((column) => ({ label: column.label, as: column.as })),
+        rows: shown,
+      };
+    }
+    case "meter": {
+      const value = viewValueCount(resolveViewBind(node.value, context));
+      const max = viewValueCount(resolveViewBind(node.max, context));
+      if (value === null || max === null || max <= 0) return null;
+      return { kind: "meter", value: Math.min(Math.max(value, 0), max), max };
+    }
+    case "gallery":
+      return galleryBlock(node, context, backed, sources.assets);
     case "group": {
       const children = node.children.flatMap((child) => {
-        const block = viewBlock(child, context, backed, listRows);
+        const block = viewBlock(child, context, backed, sources);
         return block === null ? [] : [block];
       });
       return children.length === 0 ? null : { kind: "group", direction: node.direction, children };
@@ -318,7 +453,7 @@ export function viewCard(
     decoded = { nodes: fallback.nodes, dropped: decoded.dropped };
   }
   const blocks = decoded.nodes.flatMap((node) => {
-    const block = viewBlock(node, context, backed);
+    const block = viewBlock(node, context, backed, { assets: options.assets ?? [] });
     return block === null ? [] : [block];
   });
 
