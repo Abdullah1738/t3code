@@ -126,6 +126,9 @@ export function CardFrame(props: CardFrameProps) {
   const actions = props.actions ?? [];
   const decisions = actions.filter((action) => action.key !== "discuss");
   const discuss = actions.find((action) => action.key === "discuss") ?? null;
+  const pane = props.size === "pane";
+  // The reading card sits right under the page's h1; list cards under a section's h2.
+  const Title = pane ? "h2" : "h3";
   return (
     <article
       id={props.domId}
@@ -133,7 +136,11 @@ export function CardFrame(props: CardFrameProps) {
       data-state={done ? "done" : undefined}
       onClickCapture={props.onSelect}
       onFocusCapture={props.onSelect}
-      className="group/card relative grid min-w-0 gap-3 text-sm text-(--m-text)"
+      className={cn(
+        "group/card relative grid min-w-0 gap-3 text-sm text-(--m-text)",
+        // The reading card: one surface, its decisions on a bar pinned to its foot.
+        pane && "rounded-3xl bg-(--m-surface) px-4.5 pt-4.5 pb-5.5 sm:px-8 sm:pt-6.5 sm:pb-8",
+      )}
     >
       {/* Keyboard selection marker; sits in the gutter so nothing shifts. */}
       <span
@@ -155,17 +162,17 @@ export function CardFrame(props: CardFrameProps) {
           </span>
         ) : null}
       </div>
-      <h3
+      <Title
         className={cn(
           "text-pretty",
-          props.size === "pane"
-            ? "mt-1.5 max-w-[34ch] text-2xl leading-tight font-normal"
+          pane
+            ? "mt-1.5 max-w-[34ch] text-xl leading-tight font-normal sm:text-2xl"
             : "text-sm leading-5.5 font-semibold",
           done && "text-(--m-muted)",
         )}
       >
         {props.title}
-      </h3>
+      </Title>
       {done ? (
         <div role="status" className="flex min-h-8 min-w-0 items-center gap-2">
           <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-(--m-accent-text)">
@@ -186,7 +193,16 @@ export function CardFrame(props: CardFrameProps) {
         <>
           {props.children}
           {decisions.length > 0 || discuss || props.approver ? (
-            <div className="flex min-w-0 flex-wrap items-center gap-2 pt-1">
+            <div
+              role="group"
+              aria-label="Decide"
+              className={cn(
+                "flex min-w-0 flex-wrap items-center gap-2",
+                pane
+                  ? "sticky bottom-0 -mx-4.5 mt-2.5 -mb-5.5 rounded-b-3xl border-t border-(--m-rule) bg-(--m-surface) px-4.5 pt-3 pb-4 sm:-mx-8 sm:-mb-8 sm:px-8 sm:pt-3.5 sm:pb-4.5"
+                  : "pt-1",
+              )}
+            >
               {decisions.map((action) => (
                 <Button
                   key={action.key}

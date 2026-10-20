@@ -14,12 +14,13 @@ import {
   INBOX_ROUTE_FILTER_LABEL,
   INBOX_TAB_LABEL,
   INBOX_TABS,
+  inboxLead,
   inboxTabCounts,
   discussionUnread,
   ownerConditionOf,
+  ownerWaitingEntries,
   requestAbout,
   staleApprovals,
-  totalNeedsYou,
   type InboxEntry,
   type InboxEntryGroup,
   type InboxRouteFilter,
@@ -48,18 +49,13 @@ import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
-import {
-  AgeElement,
-  CountBadge,
-  DiscussionSymbol,
-  HealthGlyph,
-  needsYouLabel,
-} from "./cards/chips";
+import { AgeElement, DiscussionSymbol, HealthGlyph } from "./cards/chips";
 import { ConditionNote } from "./DiscussPanel";
 import { DraftNotesPanel } from "./DraftNotesPanel";
 import { ClosedApprovalRow, entryCardState, InboxEntryCard } from "./InboxCards";
 import { MissionSection } from "./MissionSection";
 import { RoutingPanel } from "./RoutingPanel";
+import { LoadingRows } from "./sections/NeedsYou";
 import {
   isSampleFeed,
   useDraftNotes,
@@ -103,7 +99,7 @@ export function MissionInboxPage(props: {
   const wide = useMediaQuery(TWO_COLUMNS_QUERY);
   // Two columns always show a card; one column opens one only when asked.
   const screen = useInboxScreen(props.missionId, tab, props.route, { autoSelectFirst: wide });
-  const needsYou = mission ? mission.needsYou : totalNeedsYou(list?.missions ?? []);
+  const lead = useMemo(() => (inbox ? inboxLead(ownerWaitingEntries(inbox)) : null), [inbox]);
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -133,11 +129,20 @@ export function MissionInboxPage(props: {
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
         </WorkspacePageHeader>
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-3 px-5 pt-6 sm:px-6">
-          <div className="flex min-h-8 items-center gap-2">
-            <h1 className="text-base/6 font-semibold">Inbox</h1>
-            {needsYou > 0 ? <CountBadge count={needsYou} label={needsYouLabel(needsYou)} /> : null}
-            <div className="ms-auto">
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-3.5 px-5 pt-6 sm:px-6 sm:pt-7.5">
+          <div className="flex min-h-8 items-start gap-2">
+            <div className="min-w-0 flex-1">
+              <h1 className="text-xl leading-tight font-normal tracking-tight sm:text-2xl">
+                Inbox
+              </h1>
+              {lead ? (
+                <p className="mt-1.5 text-sm text-(--m-muted)">
+                  <b className="font-medium text-(--m-text)">{lead.strong}</b>
+                  {lead.after}
+                </p>
+              ) : null}
+            </div>
+            <div className="shrink-0">
               <InboxFilterMenu
                 missionId={props.missionId}
                 tab={props.tab}
@@ -166,9 +171,11 @@ export function MissionInboxPage(props: {
             wide={wide}
           />
         ) : (
-          <p className="mx-auto w-full max-w-6xl px-5 pt-5 text-sm text-(--m-muted) sm:px-6">
-            Loading…
-          </p>
+          <div className="mx-auto w-full max-w-6xl px-5 pt-3 sm:px-6" aria-busy="true">
+            <div className="w-full max-w-90">
+              <LoadingRows />
+            </div>
+          </div>
         )}
       </div>
     </SidebarInset>
@@ -268,8 +275,8 @@ function InboxTabs(props: {
   counts: Record<InboxTab, number> | undefined;
 }) {
   return (
-    <nav aria-label="Inbox sections" className="overflow-x-auto border-b border-(--m-rule)">
-      <ul className="flex min-w-max gap-0.5">
+    <nav aria-label="Inbox sections" className="overflow-x-auto [scrollbar-width:none]">
+      <ul className="flex min-w-max gap-4.5">
         {INBOX_TABS.map((tab) => {
           const active = tab === props.tab;
           const count = props.counts?.[tab] ?? 0;
@@ -284,10 +291,10 @@ function InboxTabs(props: {
                 }}
                 aria-current={active ? "page" : undefined}
                 className={cn(
-                  "relative flex h-9 items-center gap-1.5 px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
+                  "flex h-9 items-center gap-1.5 border-b-2 text-sm whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:h-11",
                   active
-                    ? "font-medium text-(--m-text) after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-(--m-text)"
-                    : "text-(--m-muted) hover:text-(--m-text)",
+                    ? "border-(--m-text) font-medium text-(--m-text)"
+                    : "border-transparent text-(--m-muted) hover:text-(--m-text)",
                 )}
               >
                 {INBOX_TAB_LABEL[tab]}
@@ -333,12 +340,15 @@ function InboxBody(props: {
   );
   const selected = screen.selected;
 
+  const entryKeys = useMemo(() => screen.entries.map((entry) => entry.key), [screen.entries]);
+  const { paneRef, emptyRef } = usePaneFocus(selected?.key ?? null, props.wide, entryKeys);
   const listView =
     screen.entries.length === 0 ? (
-      <p className="text-sm text-(--m-muted)">
+      // Takes focus when the last item is decided, so focus never drops to the page.
+      <p ref={emptyRef} tabIndex={-1} className="px-3 py-2 text-sm outline-none">
         {props.route === "owner" && ACTION_TABS.has(props.tab)
-          ? "Nothing needs you"
-          : "Nothing here"}
+          ? "Nothing needs you."
+          : "Nothing here."}
       </p>
     ) : (
       <InboxList
@@ -364,14 +374,12 @@ function InboxBody(props: {
     </div>
   ));
   const extras = <InboxExtras missionId={props.missionId} tab={props.tab} nowMs={nowMs} />;
-  const entryKeys = useMemo(() => screen.entries.map((entry) => entry.key), [screen.entries]);
-  const paneRef = usePaneFocus(selected?.key ?? null, props.wide, entryKeys);
 
   if (props.wide) {
     return (
       <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 gap-7 px-5 sm:px-6">
         {/* Rows bleed 12px left so their text lines up with the heading. */}
-        <div className="-ms-3 flex min-h-0 w-86 shrink-0 flex-col">
+        <div className="-ms-3 flex min-h-0 w-96 shrink-0 flex-col">
           <ScrollArea className="min-h-0 flex-1">
             <div className="pt-5 pb-12">{listView}</div>
           </ScrollArea>
@@ -383,7 +391,7 @@ function InboxBody(props: {
           className="flex min-h-0 min-w-0 flex-1 flex-col outline-none"
         >
           <ScrollArea className="min-h-0 flex-1">
-            <div className="flex max-w-160 flex-col gap-8 pt-5 pb-12">
+            <div className="flex max-w-180 flex-col gap-8 pt-4 pb-12">
               {cards}
               {extras}
             </div>
@@ -400,7 +408,7 @@ function InboxBody(props: {
           tabIndex={-1}
           aria-label="Reading pane"
           hidden={selected === null}
-          className="flex max-w-160 flex-col gap-3 outline-none"
+          className="flex max-w-180 flex-col gap-3 outline-none"
         >
           <div className="-ms-2">
             <Button
@@ -427,10 +435,12 @@ const SCROLL_VIEWPORT = '[data-slot="scroll-area-viewport"]';
 
 /**
  * A newly opened item starts at the top of the pane. In one column, opening
- * moves focus into the pane and Back returns it to the item's row.
+ * moves focus into the pane and Back returns it to the item's row. Deciding
+ * the last item moves focus to the empty list's line.
  */
 function usePaneFocus(selectedKey: string | null, wide: boolean, entryKeys: ReadonlyArray<string>) {
   const paneRef = useRef<HTMLElement>(null);
+  const emptyRef = useRef<HTMLParagraphElement>(null);
   const shown = useRef({ key: selectedKey, wide });
   useEffect(() => {
     const previous = shown.current;
@@ -451,13 +461,17 @@ function usePaneFocus(selectedKey: string | null, wide: boolean, entryKeys: Read
       }
       return;
     }
+    if (previous.key && entryKeys.length === 0) {
+      emptyRef.current?.focus({ preventScroll: true });
+      return;
+    }
     if (!wide && previous.key) {
       const row = document.getElementById(inboxItemDomId(previous.key));
       row?.focus({ preventScroll: true });
       row?.scrollIntoView({ block: "nearest" });
     }
   }, [selectedKey, wide, entryKeys]);
-  return paneRef;
+  return { paneRef, emptyRef };
 }
 
 /** One list per mission; the mission header only shows when there are several. */
@@ -477,7 +491,7 @@ function InboxList(props: {
         return (
           <div key={group.missionId ?? "none"}>
             {headed ? (
-              <h2 className="flex h-7 items-center gap-1.5 px-3 text-xs text-(--m-muted)">
+              <h2 className="flex items-center gap-1.5 px-3 pt-5 pb-1.5 text-xs text-(--m-muted)">
                 {group.health ? <HealthGlyph health={group.health} paused={group.paused} /> : null}
                 <span className="truncate">{title}</span>
               </h2>
@@ -524,17 +538,19 @@ function InboxRow(props: {
         aria-current={props.current || undefined}
         onClick={() => props.onOpen(row.key)}
         className={cn(
-          "grid w-full grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-2.5 gap-y-0.5 rounded-lg px-3 py-2.5 text-start text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          "grid min-h-18 w-full grid-cols-[minmax(0,1fr)_auto] content-center items-baseline gap-x-3 gap-y-0.5 rounded-xl px-3 py-3.25 text-start text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
           props.current ? "bg-(--m-active)" : "hover:bg-(--m-surface)",
         )}
       >
-        <span className="truncate font-medium">{row.title}</span>
-        <span className="inline-flex items-center gap-1.5">
-          {talk ? <DiscussionSymbol unread={discussionUnread(talk)} /> : null}
-          {age ? <AgeElement age={age} at={row.since} prefix="waiting " /> : null}
-        </span>
-        <span className="col-span-2 flex min-w-0 items-center gap-1.5 text-xs text-(--m-muted)">
-          <span className="shrink-0 font-medium">{row.kicker}</span>
+        <span className="truncate font-semibold">{row.title}</span>
+        {age ? <AgeElement age={age} at={row.since} prefix="waiting " /> : <span />}
+        <span
+          className={cn(
+            "flex min-w-0 items-center gap-1.5 text-(--m-muted)",
+            talk ? "col-start-1" : "col-span-2",
+          )}
+        >
+          <span className="shrink-0">{row.kicker}</span>
           {row.sub ? (
             <>
               <span className="sr-only">Sub-mission</span>
@@ -545,6 +561,11 @@ function InboxRow(props: {
             <span className="truncate">{row.about}</span>
           ) : null}
         </span>
+        {talk ? (
+          <span className="justify-self-end self-center">
+            <DiscussionSymbol unread={discussionUnread(talk)} />
+          </span>
+        ) : null}
       </button>
     </li>
   );

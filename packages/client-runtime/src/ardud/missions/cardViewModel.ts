@@ -15,7 +15,7 @@ import {
   type InboxEntry,
 } from "./inboxViewModel.ts";
 import type { MissionInboxSnapshot } from "./source.ts";
-import { refLabel } from "./viewModel.ts";
+import { formatDayLabel, refLabel } from "./viewModel.ts";
 
 // Wording for the card frame: kickers, flags and the sub-mission link. Pure,
 // so the views track can reuse it when a template binds the same fields.
@@ -215,6 +215,21 @@ export function ownerWaitingEntries(inbox: MissionInboxSnapshot): InboxEntry[] {
     ...inboxEntries(inbox, "approve"),
     ...inboxEntries(inbox, "knocks"),
   ].sort((left, right) => left.record.createdAt.localeCompare(right.record.createdAt));
+}
+
+/**
+ * The inbox heading's line, from `ownerWaitingEntries` (oldest first):
+ * "3 holds wait on you, the oldest since Wed 7 Oct." Null when nothing waits.
+ */
+export function inboxLead(
+  waiting: ReadonlyArray<InboxEntry>,
+): { readonly strong: string; readonly after: string } | null {
+  const oldest = waiting[0];
+  if (!oldest) return null;
+  const since = formatDayLabel(oldest.record.createdAt);
+  return waiting.length === 1
+    ? { strong: "1 hold", after: ` waits on you, since ${since}.` }
+    : { strong: `${waiting.length} holds`, after: ` wait on you, the oldest since ${since}.` };
 }
 
 /** Items routed to the master that the owner can still decide: drafts, approvals, suggestions. */
