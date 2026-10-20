@@ -1,6 +1,7 @@
 import { LaneId, MissionId, WorkItemId, type MissionEventKind } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import { harness, item, lane, missionId, seed } from "../asks/AsksService.testkit.ts";
 import { MissionService } from "../MissionService.ts";
@@ -78,6 +79,35 @@ describe("mission pages", () => {
         missions.workItems({ missionId: MissionId.make("m-none") }),
       );
       assert.strictEqual(missing.code, "not-found");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("a work-item page reads only its own rows from SQL", () =>
+    Effect.gen(function* () {
+      yield* seed;
+      for (let index = 0; index < 30; index += 1) {
+        const minute = String(index).padStart(2, "0");
+        yield* putItem(`wi-bulk-${minute}`, `2026-10-18T12:${minute}:00.000Z`);
+      }
+      // An old row the first page never reaches: decoding it would fail.
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        UPDATE ardud_mission_records
+        SET record_json = ${JSON.stringify({ _tag: "work-item", record: { laneId: lane.id } })}
+        WHERE kind = 'work-item' AND id = 'wi-bulk-00'
+      `;
+      const missions = yield* MissionService;
+
+      const page = yield* missions.workItems({ missionId, laneId: lane.id, limit: 3 });
+      assert.deepStrictEqual(
+        page.items.map((entry) => entry.id),
+        ["wi-bulk-29", "wi-bulk-28", "wi-bulk-27"].map((id) => WorkItemId.make(id)),
+      );
+      assert.strictEqual(page.total, 32);
+      assert.isTrue(page.hasMore);
+
+      const tail = yield* Effect.flip(missions.workItems({ missionId, offset: 29, limit: 3 }));
+      assert.strictEqual(tail.code, "invalid");
     }).pipe(Effect.provide(layer)),
   );
 

@@ -205,6 +205,9 @@ export const MissionRecordKind = Schema.Literals([
   "view-layout",
   "view-starter-layout",
   // --- end views additions ---
+  // --- core additions ---
+  "portfolio",
+  // --- end core additions ---
 ]);
 export type MissionRecordKind = typeof MissionRecordKind.Type;
 
@@ -1681,6 +1684,28 @@ export const MissionEventKind = Schema.Literals([
    * withdrew a member's secret request. Never carries a value.
    */
   "secret-request.closed",
+  /**
+   * Payload `{ threadId, turnItemId, closedAs }`, caused by the
+   * `secret-request.closed` it undoes: the card stayed open (the owner answered
+   * first, or the close was refused). The close entry is written first so a
+   * close that lands is never missing from the timeline.
+   */
+  "secret-request.close-failed",
+  /**
+   * Payload `{ previousDecision, previousReason }`: the master revised its call
+   * on a condition the owner stated in Discuss.
+   */
+  "call.revised",
+  /**
+   * On the global timeline. Payload `{ order, previousOrder }`; the actor is
+   * whoever reordered (the owner or a master).
+   */
+  "portfolio.reordered",
+  /**
+   * Payload `{ laneId, roomId, messageId, note }`: the owner or the master
+   * nudged a lane with one control-room message addressed to it.
+   */
+  "lane.nudged",
   // --- policy additions ---
   "role.unbound",
   "role.updated",
@@ -2168,6 +2193,20 @@ export const RoomPage = Schema.Struct({
 });
 export type RoomPage = typeof RoomPage.Type;
 
+// --- core additions ---
+/**
+ * The one portfolio order across missions, highest first. Missions it does not
+ * name follow in the default order (tier, then weight, then title).
+ */
+export const MissionPortfolio = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  order: Schema.Array(MissionId),
+  changedBy: MissionActor,
+  updatedAt: IsoDateTime,
+});
+export type MissionPortfolio = typeof MissionPortfolio.Type;
+// --- end core additions ---
+
 /** Changes pushed after a snapshot. Clients apply them in `seq` order. */
 export const MissionRecord = Schema.Union([
   Schema.TaggedStruct("mission", { record: Mission }),
@@ -2197,6 +2236,9 @@ export const MissionRecord = Schema.Union([
   // --- router additions ---
   Schema.TaggedStruct("owner-request", { record: OwnerRequest }),
   // --- end router additions ---
+  // --- core additions ---
+  Schema.TaggedStruct("portfolio", { record: MissionPortfolio }),
+  // --- end core additions ---
   Schema.TaggedStruct("event", { record: MissionEvent }),
 ]);
 export type MissionRecord = typeof MissionRecord.Type;
@@ -2299,6 +2341,10 @@ export const DecideApprovalInput = Schema.Struct({
   action: Schema.Literals(["approve", "reject"]),
   note: Schema.optional(Schema.String),
   inboundId: Schema.optional(TrimmedNonEmptyString),
+  // --- core additions ---
+  /** The master deciding on a condition the owner stated in Discuss. */
+  onOwnerCondition: Schema.optional(OwnerCondition),
+  // --- end core additions ---
 });
 export type DecideApprovalInput = typeof DecideApprovalInput.Type;
 
@@ -3010,6 +3056,77 @@ export const MissionTimelinePage = Schema.Struct({
   hasOlder: Schema.Boolean,
 });
 export type MissionTimelinePage = typeof MissionTimelinePage.Type;
+
+/** The master revises its call on a condition the owner stated in Discuss. */
+export const ReviseCallInput = Schema.Struct({
+  callId: CallId,
+  decision: TrimmedNonEmptyString,
+  reason: Schema.optional(Schema.String),
+  onOwnerCondition: OwnerCondition,
+});
+export type ReviseCallInput = typeof ReviseCallInput.Type;
+
+/** One pool a mission draws on now: its share of the pool's capacity in use. */
+export const PortfolioPoolDraw = Schema.Struct({
+  poolId: PoolId,
+  label: TrimmedNonEmptyString,
+  unit: TrimmedNonEmptyString,
+  share: Share,
+  /** The pool's own run-out instant, when its backend reports one. */
+  runOutAt: Schema.NullOr(IsoDateTime),
+});
+export type PortfolioPoolDraw = typeof PortfolioPoolDraw.Type;
+
+export const PortfolioMission = Schema.Struct({
+  missionId: MissionId,
+  title: TrimmedNonEmptyString,
+  status: MissionStatus,
+  tier: MissionTier,
+  masterRoleId: Schema.NullOr(RoleId),
+  guaranteedShare: Share,
+  borrowCeiling: Share,
+  /** Its largest share of any shared pool now; null when nothing is measured. */
+  usedShare: Schema.NullOr(Share),
+  pools: Schema.Array(PortfolioPoolDraw),
+});
+export type PortfolioMission = typeof PortfolioMission.Type;
+
+/** The newest change to one mission field, from the event that made it. */
+export const PortfolioFieldChange = Schema.Struct({
+  ref: MissionRecordRef,
+  field: TrimmedNonEmptyString,
+  actor: MissionActor,
+  eventId: MissionEventId,
+  at: IsoDateTime,
+});
+export type PortfolioFieldChange = typeof PortfolioFieldChange.Type;
+
+export const PortfolioSnapshot = Schema.Struct({
+  /** Every listed mission, highest first. */
+  order: Schema.Array(MissionId),
+  missions: Schema.Array(PortfolioMission),
+  /** Latest change per mission field: tier, guaranteedShare, borrowCeiling. */
+  changes: Schema.Array(PortfolioFieldChange),
+  /** Who last reordered, and when; null until anyone has. */
+  orderChange: Schema.NullOr(Schema.Struct({ actor: MissionActor, at: IsoDateTime })),
+});
+export type PortfolioSnapshot = typeof PortfolioSnapshot.Type;
+
+export const MissionPortfolioInput = Schema.Struct({});
+export type MissionPortfolioInput = typeof MissionPortfolioInput.Type;
+
+/** The owner or any master sets the order, highest first. */
+export const SetPortfolioOrderInput = Schema.Struct({
+  order: Schema.Array(MissionId),
+});
+export type SetPortfolioOrderInput = typeof SetPortfolioOrderInput.Type;
+
+/** One control-room message to the lane, addressed to it, and a `lane.nudged` entry. */
+export const NudgeLaneInput = Schema.Struct({
+  laneId: LaneId,
+  note: Schema.optional(Schema.String),
+});
+export type NudgeLaneInput = typeof NudgeLaneInput.Type;
 // --- end core additions ---
 
 /** The master records that it relied on a rule, or that work broke it. */

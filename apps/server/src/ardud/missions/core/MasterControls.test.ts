@@ -50,24 +50,28 @@ const fixture = () => {
   // Cards the owner saves between the service's pending check and its record:
   // the later record changes nothing, as in the orchestrator.
   const ownerWinsRace = new Set<string>();
+  // Thread reads that fail once a close went through (a crash after the close).
+  const unreadableAfterClose = { on: false };
   const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     getThreadRecords: (threadId) =>
-      Effect.succeed({
-        thread: { projectId: ProjectId.make("project-1") },
-        runs: [{ id: "run-1", status: "running" }],
-        turnItems: [...cards]
-          .filter(([, owner]) => owner === threadId)
-          .map(([id]) => ({
-            id,
-            threadId,
-            runId: "run-1",
-            nodeId: "node-root",
-            type: "secret_request",
-            label: "GitHub token",
-            reason: "Used as GH_TOKEN.",
-            secretStatus: status.get(id),
-          })),
-      } as never),
+      unreadableAfterClose.on && dispatched.length > 0
+        ? Effect.fail(new Error("thread store unavailable") as never)
+        : Effect.succeed({
+            thread: { projectId: ProjectId.make("project-1") },
+            runs: [{ id: "run-1", status: "running" }],
+            turnItems: [...cards]
+              .filter(([, owner]) => owner === threadId)
+              .map(([id]) => ({
+                id,
+                threadId,
+                runId: "run-1",
+                nodeId: "node-root",
+                type: "secret_request",
+                label: "GitHub token",
+                reason: "Used as GH_TOKEN.",
+                secretStatus: status.get(id),
+              })),
+          } as never),
     dispatch: (command) =>
       Effect.sync(() => {
         dispatched.push(command);
@@ -90,7 +94,7 @@ const fixture = () => {
     Layer.provideMerge(threads),
     Layer.provideMerge(harness().layer),
   );
-  return { dispatched, status, open, ownerWinsRace, layer };
+  return { dispatched, status, open, ownerWinsRace, unreadableAfterClose, layer };
 };
 
 const master = agent(masterThread);
@@ -320,7 +324,7 @@ it.effect("a thread that also works in a mission the caller doesn't master keeps
 });
 
 it.effect(
-  "a close that loses the race to the owner's save is a conflict, not a timeline entry",
+  "a close that loses the race to the owner's save is a conflict, and the timeline says so",
   () => {
     const { open, ownerWinsRace, status, layer } = fixture();
     return Effect.gen(function* () {
@@ -342,7 +346,49 @@ it.effect(
         "conflict",
       );
       assert.strictEqual(status.get(card(1)), "saved");
-      assert.strictEqual(yield* store.latestSeq(missionId), start);
+      const [closed, undone] = yield* store.eventsSince(missionId, start);
+      assert.strictEqual(closed?.kind, "secret-request.closed");
+      assert.strictEqual(undone?.kind, "secret-request.close-failed");
+      assert.strictEqual(undone?.causedBy, closed?.id);
+      assert.deepStrictEqual(undone?.payload, {
+        threadId: writerThread,
+        turnItemId: card(1),
+        closedAs: "declined",
+      });
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect("the close is on the timeline before the card closes, so it is never lost", () => {
+  const { open, status, unreadableAfterClose, layer } = fixture();
+  return Effect.gen(function* () {
+    yield* seed;
+    const controls = yield* MasterControls.MasterControls;
+    const store = yield* MissionStore.MissionStore;
+    open(writerThread, card(1));
+    open(writerThread, card(2));
+    const start = yield* store.latestSeq(missionId);
+
+    // A card that is already closed or missing writes nothing.
+    status.set(card(2), "declined");
+    const close = (turnItemId: TurnItemId) =>
+      controls.closeSecretRequest(master, {
+        missionId,
+        threadId: writerThread,
+        turnItemId,
+        closeAs: "decline",
+      });
+    assert.strictEqual(yield* failureCode(close(card(2))), "conflict");
+    assert.strictEqual(yield* failureCode(close(card(9))), "not-found");
+    assert.strictEqual(yield* store.latestSeq(missionId), start);
+
+    // The card closes, then the thread store goes away before the read back.
+    unreadableAfterClose.on = true;
+    assert.strictEqual(yield* failureCode(close(card(1))), "invalid");
+    assert.strictEqual(status.get(card(1)), "declined");
+    assert.deepStrictEqual(
+      (yield* store.eventsSince(missionId, start)).map((event) => event.kind),
+      ["secret-request.closed"],
+    );
+  }).pipe(Effect.provide(layer));
+});

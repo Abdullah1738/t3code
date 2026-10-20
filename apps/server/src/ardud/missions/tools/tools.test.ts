@@ -4,6 +4,7 @@ import {
   AskId,
   EnvironmentId,
   MissionError,
+  MissionId,
   OwnerRequestId,
   ProviderInstanceId,
   ThreadId,
@@ -24,12 +25,15 @@ import * as AsksService from "../asks/AsksService.ts";
 import {
   askInput,
   at,
+  binding,
   harness,
   laneThread,
   masterThread,
   missionId,
+  otherMissionId,
   ownerApp,
   seed,
+  seedOther,
   strayThread,
   typedInbound,
   writerThread,
@@ -41,6 +45,7 @@ import type { InboundMessage } from "../asks/provenance.ts";
 import * as RuleService from "../core/RuleService.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import { fakeRouterThreads, routerOverFakes } from "../router/MissionRouter.testkit.ts";
 import { OwnerConditions } from "../discuss/OwnerConditions.ts";
 import * as MissionsHandlers from "./handlers.ts";
 import { MissionsToolkit } from "./tools.ts";
@@ -87,26 +92,28 @@ const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
   const secrets = Layer.mock(SecretRequests.SecretRequests)({
     answer: (...args) => Effect.sync(() => void answered.push(args)),
   });
-  // The card as the close left it, for the service's read-back.
+  // Each thread's secret card: pending until the close answers it.
   const cards = Layer.mock(ThreadManagementService.ThreadManagementService)({
-    getThreadRecords: (threadId) =>
-      Effect.succeed({
-        turnItems: answered
-          .filter(([input]) => input.threadId === threadId)
-          .map(([input]) => ({
-            id: input.turnItemId,
-            type: "secret_request",
-            secretStatus: input.answer.type === "decline" ? "declined" : "cancelled",
-          })),
-      } as never),
+    getThreadRecords: (threadId) => {
+      const answer = answered.find(([input]) => input.threadId === threadId)?.[0].answer;
+      const secretStatus =
+        answer === undefined ? "pending" : answer.type === "decline" ? "declined" : "cancelled";
+      return Effect.succeed({
+        turnItems: [{ id: "turn-item:secret-request:1", type: "secret_request", secretStatus }],
+      } as never);
+    },
   });
+  // ardud missions: core - lane nudges post through the router
+  const threads = fakeRouterThreads();
   return {
     answered,
+    threads,
     layer: McpHttpServer.toolkitRegistration(MissionsToolkit, MissionsHandlers.layer).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
       Layer.provideMerge(liveThreadsLayer),
       Layer.provideMerge(RuleService.layer),
       Layer.provideMerge(MasterControls.layer.pipe(Layer.provide([secrets, cards]))),
+      Layer.provideMerge(routerOverFakes(threads)),
       Layer.provideMerge(layer),
     ),
   };
@@ -719,6 +726,97 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  // ardud missions: core
+  it.effect("a thread mastering two missions names the one it creates for", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const store = yield* MissionStore.MissionStore;
+      yield* store.commit({
+        event: {
+          missionId: otherMissionId,
+          kind: "role.bound",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "the master thread also masters m-2",
+          subject: null,
+        },
+        upserts: [
+          { _tag: "role-binding", record: binding("b-lead-2b", "role-lead-2", masterThread) },
+        ],
+      });
+      const create = (args: Record<string, unknown>) =>
+        call("mission_create", threadCaller(masterThread), {
+          slug: "side",
+          title: "Side",
+          ...args,
+        });
+
+      const unnamed = yield* create({});
+      expect(unnamed.isError).toBe(true);
+      expect(unnamed.text).toContain("name the one you act for");
+      const notMine = yield* call("mission_create", threadCaller(laneThread), {
+        slug: "side",
+        title: "Side",
+        actingFor: missionId,
+      });
+      expect(notMine.text).toContain("forbidden");
+
+      const named = yield* create({ actingFor: otherMissionId });
+      expect(named.isError, named.text).toBe(false);
+      const [event] = yield* store.recentEvents((named.structured.ref as { id: never }).id, 1);
+      expect(event?.actor).toEqual({ _tag: "role", roleId: "role-lead-2" });
+    }).pipe(Effect.provide(layer));
+  });
+
+  // ardud missions: core
+  it.effect("the master nudges its own lanes and sets the portfolio order by tool", () => {
+    const { threads, layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const store = yield* MissionStore.MissionStore;
+
+      const nudged = yield* call("mission_lane_nudge", threadCaller(masterThread), {
+        missionId,
+        laneId: "lane-api",
+        note: "Where is the migration?",
+      });
+      expect(nudged.isError, nudged.text).toBe(false);
+      const [event] = yield* store.recentEvents(missionId, 1);
+      expect(event?.kind).toBe("lane.nudged");
+      expect(event?.actor).toEqual({ _tag: "role", roleId: "role-master" });
+      expect(
+        threads.sent.some(
+          (each) => each.threadId === laneThread && each.key.startsWith("mission-wake:"),
+        ),
+      ).toBe(true);
+      const otherLane = yield* call("mission_lane_nudge", threadCaller(masterThread), {
+        missionId,
+        laneId: "lane-other",
+      });
+      expect(otherLane.text).toContain("not-found");
+      const notMaster = yield* call("mission_lane_nudge", threadCaller(laneThread), {
+        missionId,
+        laneId: "lane-api",
+      });
+      expect(notMaster.text).toContain("forbidden");
+
+      const reordered = yield* call("mission_portfolio_reorder", threadCaller(masterThread), {
+        order: [otherMissionId, missionId],
+      });
+      expect(reordered.isError, reordered.text).toBe(false);
+      const [order] = yield* store.recentEvents(MissionId.make("missions-global"), 1);
+      expect(order?.kind).toBe("portfolio.reordered");
+      expect(order?.actor).toEqual({ _tag: "role", roleId: "role-master" });
+      const stranger = yield* call("mission_portfolio_reorder", threadCaller(laneThread), {
+        order: [missionId],
+      });
+      expect(stranger.text).toContain("forbidden");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("lets the master decline or withdraw a member's secret card, never fill it", () => {
     const { answered, layer } = toolsLayer();
     return Effect.gen(function* () {
@@ -825,6 +923,51 @@ describe("mission MCP tools", () => {
       expect(decided.isError).toBe(false);
       expect(decided.structured.draft).toMatchObject({ status: "approved", onOwnerCondition });
       expect(settled).toEqual(["ask", "draft"]);
+
+      // ardud missions: core - an owner-routed approval and a call, on his condition
+      const missions = yield* MissionService.MissionService;
+      yield* missions.openApproval(
+        { _tag: "system", component: "crw" },
+        {
+          missionId,
+          approvalId: ApprovalId.make("ap-cond"),
+          kind: "merge",
+          title: "Good to merge: ap-cond",
+          detail: "",
+          requestedBy: "crw",
+          links: [],
+        },
+      );
+      const approved = yield* call("mission_approval_decide", master, {
+        missionId,
+        approvalId: "ap-cond",
+        action: "approve",
+        onOwnerCondition,
+      });
+      expect(approved.isError, approved.text).toBe(false);
+      const made = yield* call("mission_call", master, {
+        missionId,
+        title: "Postgres",
+        decision: "Use Postgres.",
+        reason: "Writers.",
+      });
+      const callId = (made.structured.call as { id: string }).id;
+      const revised = yield* call("mission_call_revise", master, {
+        missionId,
+        callId,
+        decision: "Use Postgres with an export.",
+        onOwnerCondition,
+      });
+      expect(revised.isError, revised.text).toBe(false);
+      const store = yield* MissionStore.MissionStore;
+      const approval = Option.getOrThrow(yield* store.get("approval", ApprovalId.make("ap-cond")));
+      expect(approval.onOwnerCondition).toEqual(onOwnerCondition);
+      const revisedCall = Option.getOrThrow(yield* store.get("call", callId as never));
+      expect(revisedCall).toMatchObject({
+        decision: "Use Postgres with an export.",
+        onOwnerCondition,
+      });
+      expect(settled).toEqual(["ask", "draft", "approval", "call"]);
     }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(conditions))));
   });
 });

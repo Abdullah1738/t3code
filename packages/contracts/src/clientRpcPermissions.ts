@@ -92,6 +92,8 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.missionsDecideSuggestion]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsReopenSuggestion]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsAckNote]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsSetPortfolioOrder]: AuthOrchestrationOperateScope,
+  [WS_METHODS.missionsNudgeLane]: AuthOrchestrationOperateScope,
   // ardud missions: router
   [WS_METHODS.missionsPostMessage]: AuthOrchestrationOperateScope,
   [WS_METHODS.missionsMarkRead]: AuthOrchestrationOperateScope,

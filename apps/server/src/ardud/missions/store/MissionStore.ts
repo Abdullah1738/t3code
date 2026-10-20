@@ -77,6 +77,11 @@ const DDL = [
     event_json TEXT NOT NULL,
     PRIMARY KEY (mission_id, seq)
   )`,
+  // --- core additions ---
+  // Newest change of a kind across missions (portfolio field changes).
+  `CREATE INDEX IF NOT EXISTS ardud_mission_events_by_kind
+    ON ardud_mission_events (kind, mission_id, seq)`,
+  // --- end core additions ---
   `CREATE TABLE IF NOT EXISTS ardud_mission_counters (
     scope TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -176,6 +181,31 @@ export interface OwnerRequestFilter {
 }
 // --- end router additions ---
 
+// --- core additions ---
+/** One page of a mission's records, newest change first. */
+export interface MissionPageFilter {
+  readonly missionId: MissionId;
+  /** Matches the query status column (see recordIndex.ts). */
+  readonly status?: ReadonlyArray<string>;
+  /** Records whose `laneId` is this lane. */
+  readonly laneId?: string;
+  readonly offset: number;
+  readonly limit: number;
+}
+
+export interface MissionRecordPage<R> {
+  readonly records: ReadonlyArray<R>;
+  /** Every record the filter matches, not just this page. */
+  readonly total: number;
+}
+
+/** The newest event of a kind whose `payload.changed` names the field. */
+export interface MissionFieldChange {
+  readonly field: string;
+  readonly event: MissionEvent;
+}
+// --- end core additions ---
+
 const cutSummary = (summary: string): string => {
   const trimmed = summary.trim();
   if (trimmed.length === 0) return "(no summary)";
@@ -263,6 +293,18 @@ export class MissionStore extends Context.Service<
       principal: string,
     ) => Effect.Effect<boolean | null>;
     // --- end router additions ---
+    // --- core additions ---
+    /** One page and the matching total, both counted and sliced in SQL. */
+    readonly listPage: <K extends MissionStoreKind>(
+      kind: K,
+      filter: MissionPageFilter,
+    ) => Effect.Effect<MissionRecordPage<MissionRecordOf<K>>, MissionError>;
+    /** Per mission and field, the newest `kind` event whose `payload.changed` names it. */
+    readonly latestFieldChanges: (
+      kind: MissionEventKind,
+      fields: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyArray<MissionFieldChange>, MissionError>;
+    // --- end core additions ---
   }
 >()("t3/ardud/missions/store/MissionStore") {}
 
@@ -627,6 +669,61 @@ const make = Effect.gen(function* () {
       return yield* Effect.forEach(rows, (row) => decodeStoredEvent(missionId, row.eventJson));
     });
 
+  // --- core additions ---
+  const listPage = <K extends MissionStoreKind>(kind: K, filter: MissionPageFilter) =>
+    Effect.gen(function* () {
+      if (filter.status !== undefined && filter.status.length === 0) {
+        return { records: [], total: 0 };
+      }
+      const where = sql.and([
+        sql`kind = ${kind}`,
+        sql`mission_id = ${filter.missionId}`,
+        ...(filter.status === undefined ? [] : [sql.in("status", filter.status)]),
+        ...(filter.laneId === undefined
+          ? []
+          : [sql`json_extract(record_json, '$.record.laneId') = ${filter.laneId}`]),
+      ]);
+      const counted = yield* sql<{ readonly total: number }>`
+        SELECT COUNT(*) AS "total" FROM ardud_mission_records WHERE ${where}
+      `.pipe(NodeSqliteClient.readOnly, Effect.orDie);
+      const rows = yield* sql<RecordRow & { readonly id: string }>`
+        SELECT id AS "id", record_json AS "recordJson" FROM ardud_mission_records
+        WHERE ${where}
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ${Math.max(filter.limit, 1)} OFFSET ${Math.max(filter.offset, 0)}
+      `.pipe(NodeSqliteClient.readOnly, Effect.orDie);
+      const records = yield* Effect.forEach(rows, (row) =>
+        decodeStoredRecord(kind, row.id, row.recordJson).pipe(
+          Effect.flatMap((decoded) =>
+            decoded._tag === kind
+              ? Effect.succeed(decoded.record as MissionRecordOf<K>)
+              : Effect.fail(invalid(`Stored ${kind} ${row.id} holds a ${decoded._tag} record.`)),
+          ),
+        ),
+      );
+      return { records, total: counted[0]?.total ?? 0 };
+    });
+
+  const latestFieldChanges = (kind: MissionEventKind, fields: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      if (fields.length === 0) return [];
+      const rows = yield* sql<EventRow & { readonly missionId: string; readonly field: string }>`
+        SELECT mission_id AS "missionId", field, event_json AS "eventJson" FROM (
+          SELECT e.mission_id, j.value AS field, e.event_json,
+            ROW_NUMBER() OVER (PARTITION BY e.mission_id, j.value ORDER BY e.seq DESC) AS rank
+          FROM ardud_mission_events e, json_each(e.event_json, '$.payload.changed') j
+          WHERE e.kind = ${kind} AND j.value IN ${sql.in(fields)}
+        )
+        WHERE rank = 1
+      `.pipe(NodeSqliteClient.readOnly, Effect.orDie);
+      return yield* Effect.forEach(rows, (row) =>
+        decodeStoredEvent(row.missionId, row.eventJson).pipe(
+          Effect.map((event) => ({ field: row.field, event })),
+        ),
+      );
+    });
+  // --- end core additions ---
+
   return MissionStore.of({
     commit,
     upsert: (record, event) => commit({ event, upserts: [record] }),
@@ -659,6 +756,10 @@ const make = Effect.gen(function* () {
     ownerRequestsUnread,
     lastMemberChange,
     // --- end router additions ---
+    // --- core additions ---
+    listPage,
+    latestFieldChanges,
+    // --- end core additions ---
   });
 });
 
