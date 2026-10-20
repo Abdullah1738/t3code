@@ -44,6 +44,10 @@ class MinutesMultiBasketTests(unittest.TestCase):
     """items= alias, conflict detection, multi-line prepare_only with real
     quiet codes, merchant qtyMax enforcement and consumed-skip re-prepare."""
 
+    def setUp(self):
+        p=patch.object(cmin.options,'read_options',return_value={'groups':[]})
+        p.start();self.addCleanup(p.stop)
+
     def make_auth(self):
         class Auth:
             def _snap(self):

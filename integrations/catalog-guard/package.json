@@ -1,0 +1,11 @@
+{
+  "name": "catalog-guard",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "catalog-guard": "cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

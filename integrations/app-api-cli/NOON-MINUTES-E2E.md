@@ -21,6 +21,7 @@ contract fixture lives in `test/fixture_minutes_payment_chain.json`.
 
 ```
 commerce checkout-check minutes                      # cart + active orders preflight
+commerce item-options minutes --sku SKU --query "product name"
 noon-search --minutes "grenade white chocolate"      # pick the exact SKU
 commerce order minutes --sku SKU --quantity 1 \
     --cvv-from-keychain --label "minutes <item> x1 (CLI E2E test)"
@@ -46,10 +47,23 @@ argument, file, journal entry or log line.
    (`EXISTING_MINUTES_CART_MUST_NOT_BE_REPLACED`). Quiet instructions
    (`dont_ring_the_bell`, `leave_it_at_my_door` + the standard driver note)
    come from the observed preference codes only.
+   Required catalog option groups are checked before cart preparation. Pass
+   selected codes in each items-file row's `modifiers` array; `catalog_query`
+   is an optional product-name search hint. Discovery uses the read-only
+   native catalog search, requires an exact SKU hit and fails closed when that
+   bounded search cannot resolve the item. Missing required groups are returned
+   by name with their option codes and min/max selections; defaults are never
+   silently selected. A sync that drops any requested line fails immediately.
 3. **Review.** `project_session` + `review_snapshot` pin SKUs, quantities,
    fee arithmetic (subtotal + fees == total), the unique saved MASTERCARD
    …5542 card (re-read from `/_svc/customer-v1/customer/paymentcards`), AED,
-   no wallet/EMI/deals. The caller enforces purchase authorization and spending;
+    no wallet/EMI/deals. Explicit provider-added `isFreebie` lines may be additional
+    only with price zero, all other prices zero/null and an unrequested SKU.
+    These are reported in `review.provider_added_freebies` and remain in the
+    full review hash, including the pre-place check. All unexplained/nonzero
+    additions still fail. Provider gifts have `qtyMax=0` because users cannot add
+    them; merchant quantity caps apply to requested lines.
+    The caller enforces purchase authorization and spending;
    there is no local order/campaign policy cap.
 4. **Place.** `POST /_svc/instant/order/place` with body `{"total": <major units>}`
    (captured: `{"total":17.25}`) → `{order_nr, success, error_modal}`.
@@ -99,6 +113,20 @@ status-only wait after a crash (rebuilds the intent from order/get; no
 mutation is possible on that path).
 
 ## Releasing a fenced never-paid flow
+
+For a closed **cart-only** preparation, `commerce clear-cart minutes --flow UUID`
+can remove the unchanged cart. First use `abandon-flow` to close eligible
+preparation. Cleanup requires an observed sync, zero reservation, no order or
+financial operations, no active local flow or merchant order, and the entire
+current session projection matching the last response evidence hash. A later
+cart writer invalidates ownership. The clear is one journalled empty sync plus
+an independent empty-cart readback; an ambiguous send is fenced. This does not
+cancel an order or prove a refund. Never use it concurrently with app checkout:
+the provider does not expose an atomic cart revision for conditional sync.
+
+The 17 Oct freebie, option-group and cleanup changes are fixture-verified.
+Catalog option fields come from the recorded SHOT search response; customized
+sync is transport/fixture-verified, not a new live paid-order claim.
 
 A crashed run leaves a FENCED flow owning the account (deliberate anti-spin
 fence). When the exact merchant state later proves the order dead, the fence

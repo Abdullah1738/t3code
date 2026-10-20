@@ -5,6 +5,8 @@
   wa-db read JID [--limit N]      last N messages (default 40), "(dd-mm-yy HH:MM:SS) Me|Name: text", oldest first
   wa-db new JID [--from NAME]     whatsapp-new-message backend (message-id cursor in $WATCH_DIR), see that helper
   wa-db find QUERY                "<jid> | name | push name" contact search
+  wa-db check NUMBER...           "+N | on WhatsApp (known locally) | <jid> | name" or "+N | unknown locally"
+                                  (contacts + LID map only, no network; exit 2 on a bad number)
   wa-db chats [N]                 recent chats
   wa-db health                    exit 0 if the sync daemon is live (lock held + heartbeat/DB fresh), else 1 + reason
 
@@ -188,6 +190,58 @@ def cmd_find(args):
             if alt not in seen:
                 seen.add(alt)
                 print(f"{alt} | {name} | {push}")
+
+
+def phone_number(arg):
+    """Digits of a phone number in international form (what WhatsApp keys accounts by). Raises ValueError."""
+    s = arg.strip()
+    if s.endswith("@s.whatsapp.net"):
+        s = s[: -len("@s.whatsapp.net")]
+    elif "@" in s:
+        raise ValueError("pass a phone number or a phone JID (...@s.whatsapp.net)")
+    if not re.fullmatch(r"\+?[0-9 ().-]+", s):
+        raise ValueError("use digits, spaces, ()-. and one leading +")
+    d = re.sub(r"[^0-9]", "", s)
+    if not s.startswith("+") and d.startswith("00"):
+        d = d[2:]
+    if d.startswith("0"):
+        raise ValueError("needs the country code, e.g. +971...")
+    if not 7 <= len(d) <= 15:
+        raise ValueError("must be 7-15 digits including the country code")
+    return d
+
+
+def cmd_check(args):
+    """Is each number on WhatsApp, from the local store only: a phone-JID contact row or a LID mapping means
+    WhatsApp told this account about that number. Misses print "unknown locally" (wa check then asks live)."""
+    if not args:
+        die("usage: wa-db check NUMBER...", 2)
+    nums = []
+    for a in args:
+        try:
+            n = phone_number(a)
+        except ValueError as e:
+            die(f"wa check: bad number {a!r}: {e}", 2)
+        if n not in nums:
+            nums.append(n)
+    con = connect()
+    mapped = set()
+    if os.path.exists(SESSION_DB):
+        try:
+            s = connect(SESSION_DB)
+            mapped = {r[0] for r in s.execute(f"select pn from whatsmeow_lid_map where pn in ({','.join('?' * len(nums))})", nums)}
+            s.close()
+        except sqlite3.Error:
+            pass
+    for n in nums:
+        jid = n + "@s.whatsapp.net"
+        # Phone-JID rows only: on LID rows the phone column holds a truncated LID, not a phone number.
+        known = n in mapped or con.execute("select 1 from contacts where jid=?", (jid,)).fetchone()
+        if known:
+            name = " ".join((name_of(con, jid) or "").replace("|", "/").split())
+            print(f"+{n} | on WhatsApp (known locally) | {jid}" + (f" | {name}" if name else ""))
+        else:
+            print(f"+{n} | unknown locally")
 
 
 def cmd_chats(args):
@@ -378,7 +432,8 @@ def main():
     if len(sys.argv) < 2:
         die(__doc__, 2)
     cmd, args = sys.argv[1], sys.argv[2:]
-    fn = {"read": cmd_read, "resolve": cmd_resolve, "find": cmd_find, "chats": cmd_chats, "health": cmd_health, "new": cmd_new}.get(cmd)
+    fn = {"read": cmd_read, "resolve": cmd_resolve, "find": cmd_find, "check": cmd_check, "chats": cmd_chats, "health": cmd_health,
+          "new": cmd_new}.get(cmd)
     if not fn:
         die(__doc__, 2)
     try:

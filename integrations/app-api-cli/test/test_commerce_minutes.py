@@ -13,6 +13,10 @@ from test.test_noon_minutes_checkout import Harness, HEADERS, fixture
 
 
 class MinutesIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        p=patch.object(c.options,'read_options',return_value={'groups':[]})
+        p.start();self.addCleanup(p.stop)
+
     def test_auth_journal_cookie_order_and_restart_duplicate_fence(self):
         events=[]
         class Auth:
@@ -235,6 +239,10 @@ class PaymentAwaitTests(unittest.TestCase):
 
 
 class ResumeActiveTests(unittest.TestCase):
+    def setUp(self):
+        p=patch.object(c.options,'read_options',return_value={'groups':[]})
+        p.start();self.addCleanup(p.stop)
+
     def auth(self):
         snapshot_holder=[]
         class Auth:

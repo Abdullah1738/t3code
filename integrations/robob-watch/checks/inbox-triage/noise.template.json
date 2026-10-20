@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {"source": "email", "field": "sender", "contains": "newsletter@", "reason": "newsletter sender"},
+    {"source": "email", "field": "sender", "contains": "newsletters@", "reason": "newsletter sender"},
+    {"source": "email", "field": "sender", "contains": "marketing@", "reason": "marketing sender"},
+    {"source": "email", "field": "sender", "contains": "promotions@", "reason": "promotion sender"},
+    {"source": "imessage", "field": "sender", "regex": "^AD[-#]", "reason": "advertising SMS sender"}
+  ]
+}
