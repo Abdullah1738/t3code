@@ -588,6 +588,10 @@ describe("scheduled task runs", () => {
             Layer.provideMerge(
               ScheduledTaskService.layer,
               Layer.mergeAll(
+                Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+                  namedProjectsRoot: "/projects",
+                  isScratchProject: () => Effect.succeed(false),
+                }),
                 Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
                 recordingThreads(delivered),
                 Layer.mock(SecretRequests.SecretRequests)({}),

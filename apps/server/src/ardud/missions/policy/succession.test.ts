@@ -13,6 +13,7 @@ import type * as Scope from "effect/Scope";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
+import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import * as Scheduler from "../../../scheduling/Scheduler.ts";
@@ -72,6 +73,10 @@ const harness = Effect.gen(function* () {
     Layer.provideMerge(
       ScheduledTaskService.layer,
       Layer.mergeAll(
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+          namedProjectsRoot: "/projects",
+          isScratchProject: () => Effect.succeed(false),
+        }),
         Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
         recordingThreads(delivered),
         Layer.mock(SecretRequests.SecretRequests)({}),

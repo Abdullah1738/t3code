@@ -88,6 +88,7 @@ const testLayer = () => {
           return { task: { ...found, enabled: input.enabled } };
         }),
       delete: unused,
+      deleteForThread: unused,
       runNow: unused,
       rotateWebhookToken: unused,
       listWebhookDeliveries: unused,
