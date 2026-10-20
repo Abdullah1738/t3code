@@ -17,6 +17,7 @@ import {
   type MissionFeedItem,
   type MissionId,
   type MissionInbox,
+  type MissionMasterInbox,
   type MissionOverview,
   type MissionRecord,
   type MissionRecordKind,
@@ -43,11 +44,11 @@ import type * as Stream from "effect/Stream";
 import type { EnvironmentRpcSuccess, EnvironmentUnaryRpcTag } from "../../rpc/client.ts";
 import type { WsRpcProtocolClient } from "../../rpc/protocol.ts";
 import { latestFieldChanges } from "./changeLog.ts";
+import { withMasterInbox } from "./masterInbox.ts";
 import { listedRoomUnread, pageUnread } from "./roomsViewModel.ts";
 import type {
   FieldChange,
   Listener,
-  MissionInboxSnapshot,
   MissionPoolUsage,
   MissionRoomEntry,
   MissionTimelineEvent,
@@ -80,6 +81,7 @@ export type MissionsStreamTag =
   | typeof ASKS.subscribeDraftNotes
   | typeof ASKS.subscribeRouting
   | typeof ASKS.subscribeSuggestionStats
+  | typeof ASKS.subscribeMasterInbox
   | typeof VIEWS.subscribe;
 
 export type MissionsRequestTag = Exclude<EnvironmentUnaryRpcTag, MissionsStreamTag>;
@@ -694,6 +696,12 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     transport.stream(WS_METHODS.missionsInbox, { missionId }, emit),
   );
 
+  // What waits on the master: drafts, approvals and suggestions routed to it,
+  // with complete counts. Joined into every inbox snapshot.
+  const masterQueueFeed = sharedFeeds<MissionId | null, MissionMasterInbox>((missionId, emit) =>
+    transport.stream(ASKS.subscribeMasterInbox, { missionId }, emit),
+  );
+
   const rulesFeed = sharedFeeds<MissionId, RuleRecords>((missionId, emit) =>
     transport.stream(
       ASKS.subscribeRules,
@@ -897,13 +905,26 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       });
     },
 
+    // The server's inbox carries only what is routed to the owner; the master's
+    // queue joins it so the master view and its counts are live.
     subscribeInbox(missionId, listener) {
-      const snapshot = memoLast((inbox: MissionInbox): MissionInboxSnapshot => ({
-        ...inbox,
-        // The server's inbox carries only what is routed to the owner.
-        masterCounts: { approve: 0, suggestions: 0 },
-      }));
-      return inboxFeed(missionId, (inbox) => listener(snapshot(inbox)));
+      let inbox: MissionInbox | undefined;
+      let master: MissionMasterInbox | undefined;
+      const send = () => {
+        if (inbox !== undefined) listener(withMasterInbox(inbox, master));
+      };
+      const stopInbox = inboxFeed(missionId, (value) => {
+        inbox = value;
+        send();
+      });
+      const stopMaster = masterQueueFeed(missionId, (value) => {
+        master = value;
+        send();
+      });
+      return () => {
+        stopInbox();
+        stopMaster();
+      };
     },
 
     subscribeRouting(missionId, listener) {

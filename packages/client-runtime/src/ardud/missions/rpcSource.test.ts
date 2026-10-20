@@ -24,6 +24,7 @@ import {
   type MissionsTransport,
 } from "./rpcSource.ts";
 import type {
+  MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionRoomEntry,
   MissionTimelineWindow,
@@ -764,23 +765,54 @@ describe("rpc missions source", () => {
     expect(gone.seen).toEqual([null]);
   });
 
-  it("keeps master counts at zero", () => {
+  it("joins the master's queue into the inbox, with its counts", () => {
     const { transport, live } = fakeTransport();
     const source = createRpcMissionsSource({ transport, now });
-    const inbox = collect<{ readonly masterCounts: unknown }>((listener) =>
+    const inbox = collect<MissionInboxSnapshot>((listener) =>
       source.subscribeInbox(null, listener),
     );
+    const approval = (id: string, approver: "owner" | "master") => ({
+      id,
+      missionId: CRPKO,
+      kind: "merge",
+      title: `Merge ${id}`,
+      detail: "",
+      requestedBy: "crw",
+      links: [],
+      status: "pending",
+      staleReason: null,
+      decidedBy: null,
+      decidedAt: null,
+      createdAt: FIXTURE_NOW,
+      approver,
+    });
     live(WS_METHODS.missionsInbox)[0]?.push({
       revision: 1,
-      counts: { decide: 0, approve: 0, knocks: 0, suggestions: 0, fyi: 0 },
+      counts: { decide: 0, approve: 1, knocks: 0, suggestions: 0, fyi: 0 },
       asks: [],
       drafts: [],
-      approvals: [],
+      approvals: [approval("a-owner", "owner")],
       knocks: [],
       suggestions: [],
       fyi: [],
     });
+    // Until the master's queue arrives its counts read zero.
     expect(inbox.last()?.masterCounts).toEqual({ approve: 0, suggestions: 0 });
+
+    const queue = live(ASKS.subscribeMasterInbox);
+    expect(queue.map((stream) => stream.input)).toEqual([{ missionId: null }]);
+    queue[0]?.push({
+      revision: 1,
+      counts: { approve: 3, suggestions: 2 },
+      drafts: [],
+      approvals: [approval("a-master", "master")],
+      suggestions: [],
+    });
+    expect(inbox.last()?.masterCounts).toEqual({ approve: 3, suggestions: 2 });
+    expect(inbox.last()?.approvals.map((entry) => entry.id)).toEqual(["a-owner", "a-master"]);
+
+    inbox.close();
+    expect(live(ASKS.subscribeMasterInbox)).toHaveLength(0);
   });
 });
 
