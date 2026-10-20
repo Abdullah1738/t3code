@@ -234,14 +234,16 @@ export function threadMessageIdsSince(db, threadId, sinceIso) {
 export function controlConfig(env = process.env, home = HOME) {
   const own = join(home, ".robob/components/stream-recovery.json");
   const shared = join(home, ".robob/ardud-control.json");
-  const files = [env.T3_CONTROL_TOKEN_FILE, own, shared].filter(Boolean);
+  // A named file must exist; only the defaults are skipped when missing.
+  const named = env.T3_CONTROL_TOKEN_FILE;
+  const files = named ? [named] : [own, shared];
   let file = {};
   for (const path of env.T3_CONTROL_TOKEN && env.T3_CONTROL_URL ? [] : files) {
     let mode;
     try {
       mode = statSync(path).mode;
     } catch (e) {
-      if (e.code === "ENOENT") continue;
+      if (e.code === "ENOENT" && !named) continue;
       throw e;
     }
     if (mode & 0o077) throw new Error(`${path} must be chmod 600`);

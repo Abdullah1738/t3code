@@ -40,10 +40,7 @@ test('falls back to the shared control file until a credential is issued', () =>
   const dir = home();
   write(join(dir, '.robob/ardud-control.json'), { url: 'http://127.0.0.1:3773', token: 'shared' });
   assert.deepEqual(controlConfig({}, dir), { url: 'http://127.0.0.1:3773', token: 'shared' });
-  assert.deepEqual(
-    controlConfig({ T3_CONTROL_TOKEN_FILE: join(dir, 'missing.json') }, dir),
-    { url: 'http://127.0.0.1:3773', token: 'shared' },
-  );
+  assert.throws(() => controlConfig({ T3_CONTROL_TOKEN_FILE: join(dir, 'missing.json') }, dir), /ENOENT/);
 });
 
 test('refuses token files others can read and fails without any token', () => {
