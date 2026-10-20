@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -87,5 +87,29 @@ test('the live check ignores case, and the daily export refuses live and foreign
     assert.equal(readFileSync(foreign, 'utf8'), 'my own notes\n');
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('with live, the report jobs write the status files and keep their rules', () => {
+  const root = mkdtempSync(join(tmpdir(), 'scribe-live-'));
+  try {
+    const status = join(root, 'crpko-devops', 'tmp', 'coordinator-study-20261002', 'status');
+    const updates = join(status, 'OWNER-UPDATES.md');
+    const daily = join(status, 'DAILY.md');
+    assert.equal(isLiveReport(updates), true);
+    assert.throws(() => exportUpdate(updates, section), /it takes --live/);
+    mkdirSync(status, { recursive: true });
+    const story = '<!-- STORY-START -->\nthe story\n<!-- STORY-END -->';
+    writeFileSync(updates, `# Crpko\n\n${story}\n\n${MARKER}\n\n### 2026-10-20 04:00 UTC\nold\n`);
+    assert.equal(exportUpdate(updates, section, { live: true }).inserted, true);
+    const text = readFileSync(updates, 'utf8');
+    assert.ok(text.includes(story));
+    assert.ok(text.indexOf(section.split('\n')[0]) < text.indexOf('### 2026-10-20 04:00 UTC'));
+    exportDaily(daily, '# day\n', { live: true });
+    assert.ok(readFileSync(daily, 'utf8').includes('# day'));
+    writeFileSync(daily, 'kept by hand\n');
+    assert.throws(() => exportDaily(daily, '# day\n', { live: true }), /not written by scribe/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

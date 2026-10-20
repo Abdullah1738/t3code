@@ -34,7 +34,8 @@ matched|mismatch|missing`). That code lives in
 node cli.mjs run [--mission ID] [--slices 10]       # every mission lane, via the server
 node cli.mjs dry-run --thread THREAD_ID [--from EVENT | --since ISO] [--slices 3] [--out DIR]
 node cli.mjs editor --mission ID [--out FILE]      # one Opus editor pass, by hand
-node cli.mjs report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--out FILE]
+node cli.mjs report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--live] [--out FILE]
+node cli.mjs watch --mission ID [--sweep-minutes 15]  # a pass whenever a lane's run settles
 ```
 
 `dry-run` never touches the server: cursors and notes go to `DIR/state.json`,
@@ -47,14 +48,22 @@ it so the next report of that kind starts where it ended and closes out what it
 left open. `--kind update` exports in the `OWNER-UPDATES.md` format: the new
 section goes below the `UPDATES-INSERT-BELOW` marker of the target file
 (created when missing), the story block is left alone, and a section already in
-the file is not written twice. The default target is scratch, and the live
-Crpko status files are refused.
+the file is not written twice. The default target is scratch. The live Crpko
+status files take `--live`, which only the report jobs pass.
 
 Environment: `SCRIBE_DB`, `SCRIBE_ROUTER_URL`, `SCRIBE_MODEL`,
 `SCRIBE_EDITOR_MODEL`, `SCRIBE_OUT`, `SCRIBE_CONTROL_FILE` (defaults to
 `~/.robob/ardud-control.json`), `T3_CONTROL_URL`, `T3_CONTROL_TOKEN`.
 
-There is no LaunchAgent and no schedule yet. Run it by hand.
+`watch` follows the control API's run events and runs one `run` pass when a
+lane's run settles, plus a sweep every 15 minutes for lanes running long. Passes
+never overlap; settles during a pass fold into one more pass. It reconnects on
+its own and resumes from the last event it saw.
+
+Nothing here starts itself. At cutover four LaunchAgents run it: `watch`, the
+editor hourly, the 4h update and the daily summary. Their definitions live in
+the Robob checkout at `tmp/memory/cutover/scribe-schedules.json`. Deploy with
+`integrations/deploy.zsh scribe`.
 
 ## Tests
 
