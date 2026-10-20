@@ -205,3 +205,18 @@ export function useOwnerRequest(
   const store = requestThreadStores(`${missionId}\n${requestId}`);
   return useSyncExternalStore(store.subscribe, store.get);
 }
+
+/**
+ * A request's whole conversation, read only while `requestId` is set. List
+ * reads clip each message to a summary, so an open discussion reads this.
+ */
+export function useFullOwnerRequest(
+  missionId: MissionId | null,
+  requestId: string | null,
+): OwnerRequest | null | undefined {
+  const store =
+    missionId === null || requestId === null
+      ? NONE
+      : requestThreadStores(`${missionId}\n${requestId}`);
+  return useSyncExternalStore(store.subscribe, store.get);
+}

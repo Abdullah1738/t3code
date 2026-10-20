@@ -34,7 +34,13 @@ import {
 import { useEffect, useMemo, useReducer, useState } from "react";
 import { Alert } from "react-native";
 
-import { missionsSource, useOwnerRequest, useOwnerRequests, useRoomPage } from "./missionsStore";
+import {
+  missionsSource,
+  useFullOwnerRequest,
+  useOwnerRequest,
+  useOwnerRequests,
+  useRoomPage,
+} from "./missionsStore";
 import { useMissionAction } from "./useMissionsLogic";
 
 // State and actions for the record screens: a discussion on an inbox item,
@@ -100,7 +106,10 @@ export function useDiscussion(
   subject: MissionRecordRef,
   open: boolean,
 ): DiscussionState {
-  const { request, unread } = useDiscussionMark(missionId, subject);
+  const mark = useDiscussionMark(missionId, subject);
+  const full = useFullOwnerRequest(missionId, open ? (mark.request?.id ?? null) : null);
+  const request = full ?? mark.request;
+  const { unread } = mark;
   const [text, setText] = useState("");
   const { pending, run } = useMissionAction();
 
