@@ -46,6 +46,8 @@ const LIVE_LANES = ["working", "stuck", "waiting", "idle", "parked"];
 const UNFINISHED_STAGES = ["ticket", "pr", "review", "merge", "deploy", "readback", "exercised"];
 const WIDE_LIMIT = 5000;
 const OVERVIEW_LIMIT = 200;
+// ardud missions: crw-threads - settled PR threads pile up; the overview carries the latest
+const CLOSED_THREADS_SHOWN = 20;
 const INBOX_LOAD_LIMIT = 500;
 
 interface HealthEntry {
@@ -140,6 +142,20 @@ export const makeReads = (
       health: entry.subMissions.get(subMission.id) ?? subMission.health,
     }));
 
+  // ardud missions: crw-threads - every open one (bounded by open PRs) and the latest settled
+  // ones. Older settled threads go back to the ordinary list rather than pile up in every push.
+  const shownAttachments = Effect.fn("MissionReads.shownAttachments")(function* (
+    missionId: MissionId,
+  ) {
+    const open = yield* store.listAllInMission("thread-attachment", missionId, ["open"]);
+    const closed = yield* store.list("thread-attachment", {
+      missionId,
+      status: ["closed"],
+      limit: CLOSED_THREADS_SHOWN,
+    });
+    return [...open.toReversed(), ...closed];
+  });
+
   const listSnapshot: Effect.Effect<MissionListSnapshot, MissionError> = Effect.gen(function* () {
     const missions = yield* store.list("mission", {
       status: LISTED_MISSIONS,
@@ -198,10 +214,13 @@ export const makeReads = (
           });
           // ardud missions: ui-web (the clients' thread lists leave these to the mission)
           const bindings = yield* store.listAllInMission("role-binding", mission.id, ["bound"]);
+          // ardud missions: crw-threads - exactly the ones the mission shows, so none is out of both
+          const attached = yield* shownAttachments(mission.id);
           const threadIds = [
             ...new Set([
               ...bindings.map((binding) => binding.threadId),
               ...records.lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
+              ...attached.map((attachment) => attachment.threadId),
             ]),
           ];
           // ardud missions: routing (only the master's questions reach the owner;
@@ -261,6 +280,8 @@ export const makeReads = (
       // ardud missions: router
       // Any status: a progress note or a settle note is unread news too.
       const answered = yield* store.ownerRequestsUnread(missionId);
+      // ardud missions: crw-threads
+      const attachedThreads = yield* shownAttachments(missionId);
       return {
         mission: { ...mission.value, health: entry.mission },
         subMissions:
@@ -289,6 +310,8 @@ export const makeReads = (
         requestsAnswered: answered.get(missionId) ?? 0,
         // ardud missions: fix-p3
         ownerName,
+        // ardud missions: crw-threads
+        attachedThreads,
       };
     });
 

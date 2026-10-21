@@ -1,6 +1,7 @@
 import {
   ApprovalId,
   ApprovalStatus,
+  AttachThreadInput,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CloseStaleApprovalInput,
@@ -30,7 +31,8 @@ import * as MissionService from "./MissionService.ts";
  * writes that depend on the caller (the master's) are refused here and point
  * at the MCP tool, which knows the calling thread. HTTP keeps reads and
  * `system` writes by named components, each with its own credential: crw
- * opens and stale-closes its approvals in its own name. Other tracks mount their own routes under this
+ * opens and stale-closes its approvals and attaches its review threads in its
+ * own name. Other tracks mount their own routes under this
  * prefix and register them in `layer.ts`.
  */
 export const MISSIONS_ROUTE_PREFIX = "/api/ardud/missions";
@@ -101,8 +103,10 @@ const decodeApprovalIds = Schema.decodeUnknownEffect(Schema.Array(ApprovalId));
 const decodeApprovalStatuses = Schema.decodeUnknownEffect(Schema.Array(ApprovalStatus));
 const decodeOpenApproval = Schema.decodeUnknownEffect(OpenApprovalInput);
 const decodeCloseStaleApproval = Schema.decodeUnknownEffect(CloseStaleApprovalInput);
+// ardud missions: crw-threads
+const decodeAttachThread = Schema.decodeUnknownEffect(AttachThreadInput);
 
-/** Components that may open and stale-close approvals over HTTP, in their own name. */
+/** Components that may open and stale-close approvals, and attach threads, over HTTP in their own name. */
 const APPROVAL_COMPONENTS: ReadonlySet<string> = new Set(["crw"]);
 
 /** Plan writes that only the calling thread may make, and the MCP tool to use instead. */
@@ -194,13 +198,18 @@ const makeRoutes = Effect.gen(function* () {
    * token that is not a component credential, the shared control token
    * included, does not open or close approvals.
    */
-  const approvalComponent = (session: EnvironmentAuth.AuthenticatedSession, named: string) =>
+  const approvalComponent = (
+    session: EnvironmentAuth.AuthenticatedSession,
+    named: string,
+    // ardud missions: crw-threads
+    what = "Approvals",
+  ) =>
     Effect.gen(function* () {
       const component = session.origin?._tag === "component" ? session.origin.component : null;
       if (component === null) {
         return yield* fail(
           "forbidden",
-          `Approvals over HTTP need ${named}'s own component credential (t3 ardud component-token issue ${named}).`,
+          `${what} over HTTP need ${named}'s own component credential (t3 ardud component-token issue ${named}).`,
         );
       }
       if (component !== named) {
@@ -212,7 +221,7 @@ const makeRoutes = Effect.gen(function* () {
       if (!APPROVAL_COMPONENTS.has(named)) {
         return yield* fail(
           "forbidden",
-          `Only ${[...APPROVAL_COMPONENTS].join(", ")} open approvals over HTTP.`,
+          `Only ${[...APPROVAL_COMPONENTS].join(", ")} write ${what.toLowerCase()} over HTTP.`,
         );
       }
       return systemProvenance(named);
@@ -335,6 +344,15 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, ...result });
   });
 
+  // ardud missions: crw-threads
+  const attachThread = Effect.gen(function* () {
+    const session = yield* authenticate(AuthOrchestrationOperateScope);
+    const input = yield* decodeBody(decodeAttachThread);
+    const provenance = yield* approvalComponent(session, input.attachedBy, "Thread attachments");
+    const result = yield* missions.attachThread(provenance, input);
+    return json({ ok: true, ...result });
+  });
+
   const p = MISSIONS_ROUTE_PREFIX;
   return [
     HttpRouter.route("GET", `${p}/status`, handle(status)),
@@ -343,6 +361,8 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("GET", `${p}/approvals`, handle(approvals)),
     HttpRouter.route("POST", `${p}/approvals/open`, handle(openApproval)),
     HttpRouter.route("POST", `${p}/approvals/stale`, handle(closeStaleApproval)),
+    // ardud missions: crw-threads
+    HttpRouter.route("POST", `${p}/threads/attach`, handle(attachThread)),
     ...THREAD_WRITES.map(({ path, tool }) =>
       HttpRouter.route("POST", `${p}${path}`, handle(refuseThreadWrite(tool))),
     ),

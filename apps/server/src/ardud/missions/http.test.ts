@@ -292,6 +292,42 @@ describe("missions routes", () => {
     }
   });
 
+  it("crw attaches the review threads it runs; nobody else can", async () => {
+    const { handler, dispose } = makeHandler();
+    try {
+      const attach = (attachedBy: string, state?: string) => ({
+        missionId,
+        threadId: "thread-review-361",
+        attachedBy,
+        title: "CRPKO backoffice-core#361 | Awaiting Decision",
+        pullRequest: { repository: "crpko/backoffice-core", number: 361 },
+        ...(state ? { state } : {}),
+      });
+      const post = (body: unknown, token: string) =>
+        handler(request("/threads/attach", { token, body }));
+      expect((await post(attach("crw"), "Bearer scribe")).status).toBe(403);
+      expect((await post(attach("scribe"), "Bearer scribe")).status).toBe(403);
+      expect((await post(attach("crw"), "Bearer operator")).status).toBe(403);
+      const first = await post(attach("crw"), "Bearer crw");
+      expect(first.status).toBe(200);
+      const { seq } = (await first.json()) as { seq: number };
+      const again = await post(attach("crw"), "Bearer crw");
+      expect(await again.json()).toMatchObject({ ok: true, seq });
+      expect((await post(attach("crw", "closed"), "Bearer crw")).status).toBe(200);
+
+      const digest = await handler(
+        request(`/digest?mission=${missionId}&since=1`, { token: "Bearer reader" }),
+      );
+      const events = (await digest.json()) as { events: Array<{ kind: string }> };
+      expect(events.events.map((event) => event.kind)).toEqual([
+        "thread.attached",
+        "thread.closed",
+      ]);
+    } finally {
+      await dispose();
+    }
+  });
+
   it("maps missing records and bad queries to HTTP errors", async () => {
     const { handler, dispose } = makeHandler();
     try {

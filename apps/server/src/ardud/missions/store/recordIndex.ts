@@ -301,5 +301,16 @@ export const indexRecord = (entry: MissionStoreRecord): MissionRecordIndex => {
         updatedAt: r.updatedAt,
       };
     }
+    // ardud missions: crw-threads - a component's thread kept inside the mission
+    case "thread-attachment": {
+      const r = entry.record;
+      return {
+        id: r.threadId,
+        missionId: r.missionId,
+        subMissionId: null,
+        status: r.state,
+        updatedAt: r.updatedAt,
+      };
+    }
   }
 };

@@ -219,6 +219,9 @@ export const MissionRecordKind = Schema.Literals([
   // --- finish-a additions ---
   "inbox-mark",
   // --- end finish-a additions ---
+  // --- crw-threads additions ---
+  "thread-attachment",
+  // --- end crw-threads additions ---
 ]);
 export type MissionRecordKind = typeof MissionRecordKind.Type;
 
@@ -1466,6 +1469,41 @@ export const ReviewRecord = Schema.Struct({
 });
 export type ReviewRecord = typeof ReviewRecord.Type;
 
+// --- crw-threads additions ---
+/** Open: work is live. Closed: its PR settled, kept for history. Detached: back in the ordinary list. */
+export const ThreadAttachmentState = Schema.Literals(["open", "closed", "detached"]);
+export type ThreadAttachmentState = typeof ThreadAttachmentState.Type;
+
+/**
+ * A thread a system component (crw) runs for the mission, such as a PR's
+ * review thread. While open or closed it belongs to the mission, so clients
+ * keep it out of the ordinary thread list. It is not a role or a lane and
+ * carries no authority. Keyed by thread: a thread sits in one mission.
+ */
+export const ThreadAttachment = Schema.Struct({
+  threadId: ThreadId,
+  missionId: MissionId,
+  attachedBy: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  pullRequest: Schema.NullOr(PullRequestKey),
+  state: ThreadAttachmentState,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type ThreadAttachment = typeof ThreadAttachment.Type;
+
+/** A component attaches a thread it owns, or moves it on. Same state again is a no-op. */
+export const AttachThreadInput = Schema.Struct({
+  missionId: MissionId,
+  threadId: ThreadId,
+  attachedBy: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(200)),
+  pullRequest: Schema.optional(Schema.NullOr(PullRequestKey)),
+  state: Schema.optional(ThreadAttachmentState),
+});
+export type AttachThreadInput = typeof AttachThreadInput.Type;
+// --- end crw-threads additions ---
+
 /** The one answer to "what does PR X need next?" for crw, lanes and the merge gate. */
 export const ReviewPlan = Schema.Struct({
   missionId: MissionId,
@@ -1862,6 +1900,11 @@ export const MissionEventKind = Schema.Literals([
   "inbox.snoozed",
   "inbox.unsnoozed",
   // --- end finish-a additions ---
+  // --- crw-threads additions ---
+  "thread.attached",
+  "thread.closed",
+  "thread.detached",
+  // --- end crw-threads additions ---
   // --- recovery additions ---
   "recovery.incident-opened",
   "recovery.notice-sent",
@@ -2261,6 +2304,14 @@ export const MissionOverview = Schema.Struct({
   /** The server account's full name, for the board greeting; null when unknown. */
   ownerName: Schema.optional(Schema.NullOr(Schema.String)),
   // --- end fix-p3 additions ---
+  // --- crw-threads additions ---
+  /**
+   * Threads a component runs for the mission (crw reviews): every open one and
+   * the latest settled ones, newest first. The list's `threadIds` carry the
+   * same set, so an older settled thread goes back to the ordinary list.
+   */
+  attachedThreads: Schema.optional(Schema.Array(ThreadAttachment)),
+  // --- end crw-threads additions ---
 });
 export type MissionOverview = typeof MissionOverview.Type;
 
@@ -2436,6 +2487,9 @@ export const MissionRecord = Schema.Union([
   // --- finish-a additions ---
   Schema.TaggedStruct("inbox-mark", { record: InboxMark }),
   // --- end finish-a additions ---
+  // --- crw-threads additions ---
+  Schema.TaggedStruct("thread-attachment", { record: ThreadAttachment }),
+  // --- end crw-threads additions ---
   Schema.TaggedStruct("event", { record: MissionEvent }),
 ]);
 export type MissionRecord = typeof MissionRecord.Type;

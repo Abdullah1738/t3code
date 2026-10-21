@@ -37,6 +37,7 @@ import * as Semaphore from "effect/Semaphore";
 import type * as MissionStore from "../store/MissionStore.ts";
 import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import { makeApprovalWrites } from "./approvals.ts";
+import { makeAttachmentWrites } from "./attachments.ts";
 import { makeCallWrites } from "./calls.ts";
 import { makePortfolioWrites } from "./portfolio.ts";
 import { ownerConditions } from "./conditions.ts";
@@ -657,6 +658,8 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
       ...makeApprovalWrites(kit),
       ...makeCallWrites(kit),
       ...makePortfolioWrites(kit),
+      // ardud missions: crw-threads
+      ...makeAttachmentWrites(kit),
     };
   });
 

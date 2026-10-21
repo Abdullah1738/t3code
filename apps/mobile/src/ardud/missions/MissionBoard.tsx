@@ -1,5 +1,6 @@
 import type { CallId, MissionId, MissionListSnapshot, ThreadId } from "@t3tools/contracts";
 import {
+  attachedThreadGroups,
   dayOnePlan,
   groupRequests,
   masterRoutedEntries,
@@ -535,7 +536,42 @@ function LanesPage(props: PageProps) {
       ) : (
         <LaneGroups sections={sections} onOpenThread={props.onOpenThread} />
       )}
+      {/* ardud missions: crw-threads */}
+      <ReviewThreads {...props} />
     </Page>
+  );
+}
+
+const CLOSED_SHOWN = 5;
+
+/** Threads crw runs for the mission's PRs; they live here, not in the thread list. */
+function ReviewThreads(props: PageProps) {
+  const groups = attachedThreadGroups(props.overview.attachedThreads);
+  const [all, setAll] = useState(false);
+  if (groups.open.length === 0 && groups.closed.length === 0) return null;
+  const rows = [...groups.open, ...(all ? groups.closed : groups.closed.slice(0, CLOSED_SHOWN))];
+  const hidden = groups.open.length + groups.closed.length - rows.length;
+  return (
+    <View className="gap-2">
+      <SectionHead
+        title={`Reviews ${groups.open.length}`}
+        trailing={
+          hidden > 0 ? <LinkButton label={`${hidden} more`} onPress={() => setAll(true)} /> : null
+        }
+      />
+      <Group>
+        {rows.map((row, index) => (
+          <Fragment key={row.threadId}>
+            {index > 0 ? <Separator /> : null}
+            <Row accessibilityLabel={row.title} onPress={() => props.onOpenThread(row.threadId)}>
+              <Text className="min-w-0 flex-1 text-[15px] font-t3-medium" numberOfLines={1}>
+                {row.title}
+              </Text>
+            </Row>
+          </Fragment>
+        ))}
+      </Group>
+    </View>
   );
 }
 

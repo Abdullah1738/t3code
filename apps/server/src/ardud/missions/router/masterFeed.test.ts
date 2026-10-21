@@ -165,6 +165,74 @@ describe("master inbox feed", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("the owner's note on a decision reaches the master; a bare decision does not", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      const feed = yield* feedOf(null);
+      const decide = (record: Approval, provenance: MissionProvenance, note: string | null) =>
+        Effect.gen(function* () {
+          const decided: Approval = { ...record, status: "approved", decisionNote: note };
+          const result = yield* store.commit({
+            event: {
+              missionId,
+              kind: "approval.decided",
+              actor: { _tag: "owner" },
+              provenance,
+              summary: `Approved: ${record.title}`,
+              subject: { kind: "approval", id: record.id },
+              payload: { action: "approve", approver: "owner", note },
+            },
+            upserts: [{ _tag: "approval", record: decided }],
+          });
+          return result.event;
+        });
+      const owner: MissionProvenance = { _tag: "owner-app", surface: "web", sessionId: "s-1" };
+      const plain = approval("11", "owner");
+      const noted = {
+        ...approval("12", "owner"),
+        links: [
+          {
+            kind: "pull-request" as const,
+            label: "acme/api#12",
+            url: "https://github.com/acme/api/pull/12",
+            ref: null,
+          },
+        ],
+      };
+      yield* openApproval(plain);
+      yield* openApproval(noted);
+      yield* feed.handle(yield* decide(plain, owner, null));
+      yield* feed.handle(yield* decide(plain, owner, "  "));
+      yield* feed.handle(yield* decide(plain, agent(masterThread), "master's own note"));
+      const moni: MissionProvenance = { _tag: "owner-imessage", chat: "moni", inboundId: "in-1" };
+      yield* feed.handle(yield* decide(plain, moni, "Moni's note"));
+      assert.strictEqual((yield* controlMessages).length, 0);
+
+      yield* feed.handle(yield* decide(noted, owner, "Share what the PR does next time."));
+      const messages = yield* controlMessages;
+      assert.strictEqual(messages.length, 1);
+      assert.strictEqual(messages[0]!.kind, "decision");
+      assert.include(messages[0]!.summary, "acme/api#12");
+      assert.deepStrictEqual(messages[0]!.to, [masterRole]);
+      const rooms = yield* RouterStore.RouterStore;
+      const body = (yield* rooms.messageBody(messages[0]!.id)) ?? "";
+      assert.include(body, "Share what the PR does next time.");
+      assert.include(body, "https://github.com/acme/api/pull/12");
+      assert.deepStrictEqual(wakesFor(h.threads.sent), [masterThread]);
+
+      // Decided while the server was down: the restart still carries the note.
+      const missed = approval("13", "owner");
+      yield* openApproval(missed);
+      yield* decide(missed, owner, "Smaller PRs please.");
+      yield* (yield* feedOf(null)).backfill;
+      const after = yield* controlMessages;
+      assert.strictEqual(after.length, 2);
+      assert.include((yield* rooms.messageBody(after[1]!.id)) ?? "", "Smaller PRs please.");
+    }).pipe(Effect.provide(h.layer));
+  });
+
   it.effect("the master routing an approval to itself is filed, not a wake", () => {
     const h = harness();
     return Effect.gen(function* () {
