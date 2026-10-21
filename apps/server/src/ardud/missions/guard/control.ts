@@ -2,47 +2,51 @@
  * The control API (HTTP bearer tokens: the CLI, bridges, coord) is not the
  * owner. Its writes are stamped `system`, the authenticated session is kept
  * beside them, and an answer to a pending request is judged like any other
- * send before the request changes state. The one exception is the iMessage
+ * send before the request changes state. The exceptions are the iMessage
  * bridge relaying an inbound that verifies as the owner's or Moni's
- * (`imessage.ts`): that write is his.
+ * (`imessage.ts`), and the Telegram bridge answering a pending request: it
+ * takes updates from his own chat only, so that answer is his.
  */
 import type { MissionProvenance, ThreadId } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 
 import { guardSender, type SendGuardFailed, type SendRefused } from "../router/guardPaths.ts";
 import type { AuthorityKind, AuthorityStore } from "./authority.ts";
-import type { GuardPrincipal } from "./principal.ts";
+import { sessionPrincipal, type GuardPrincipal, type WsSession } from "./principal.ts";
 import { requestAnswerText } from "./requests.ts";
 
-interface ControlSession {
-  readonly sessionId: string;
-  readonly subject: string;
-  readonly clientLabel?: string;
-}
+type ControlSession = WsSession;
+
+/** The component credential the Telegram bridge runs as (`auth/components.ts`). */
+const TELEGRAM_BRIDGE = "telegram-bridge";
+
+/**
+ * The owner, when the Telegram bridge answers a pending request. The bridge
+ * only accepts updates from his bound chat, and only Robob issues its
+ * credential, so the answer is his, typed on his phone. `sessionId` keeps
+ * which credential carried it.
+ */
+export const telegramAnswerOwner = (session: ControlSession): MissionProvenance | null =>
+  session.origin?._tag === "component" && session.origin.component === TELEGRAM_BRIDGE
+    ? { _tag: "owner-app", surface: "mobile", sessionId: session.sessionId }
+    : null;
 
 /** What the control API writes as. Named component identities come from core. */
 export const CONTROL_ACTOR = "system" as const;
 
-/** How a control write is stamped: `user` only for a verified iMessage of his. */
+/** How a control write is stamped: `user` only for words of his a bridge carried. */
 export const controlActor = (owner: MissionProvenance | null): "user" | typeof CONTROL_ACTOR =>
   owner === null ? CONTROL_ACTOR : "user";
 
 /**
- * Who a control write is from: the session, or the owner when the iMessage
- * bridge relayed a verified inbound of his (see `imessage.ts`).
+ * Who a control write is from: the session, or the owner when a bridge
+ * carried words of his (see `imessage.ts`, `telegramAnswerOwner`).
  */
 export const controlPrincipal = (
   session: ControlSession,
   owner?: MissionProvenance | null,
 ): GuardPrincipal =>
-  owner == null
-    ? {
-        _tag: "session",
-        sessionId: session.sessionId,
-        subject: session.subject,
-        ...(session.clientLabel ? { label: session.clientLabel } : {}),
-      }
-    : { _tag: "owner", provenance: owner };
+  owner == null ? sessionPrincipal(session) : { _tag: "owner", provenance: owner };
 
 /**
  * An answer from a control session reaches the agent as provider input or as

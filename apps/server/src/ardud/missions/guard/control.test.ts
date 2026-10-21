@@ -264,10 +264,12 @@ const ownerVia = (
   _tag: "owner",
   provenance: { _tag: "owner-imessage", chat, inboundId, quote },
 });
+/** Named, but it relays whoever texted, so its own word never delivers straight. */
 const bridgeSession: GuardPrincipal = {
   _tag: "session",
   sessionId: bridge.sessionId,
   subject: bridge.subject,
+  label: "spectrum-bridge",
 };
 const SHIP = "Ship the release tonight.";
 
@@ -492,22 +494,73 @@ describe("iMessage bridge provenance (imessage r1, 19 Oct)", () => {
       ),
   );
 
-  it.effect("Telegram's credential never answers or writes to the master", () =>
-    runAs(telegram, new Map([typed("in-yes", "yes")]), ({ seen, delivered, post }) =>
+  // routing r21: the bridge only takes updates from his own chat, so an answer
+  // it carries is his; anything else it writes is still the bridge.
+  it.effect("Telegram answers as him, but its own word never reaches the master", () =>
+    runAs(telegram, new Map(), ({ seen, delivered, post }) =>
       Effect.gen(function* () {
         const answered = yield* post(`/threads/${master}/requests/request-2/respond`, {
           decision: "approve",
-          inboundId: "in-yes",
         });
-        assert.strictEqual(answered.status, 403);
-        expect(answered.body).toMatchObject({ guard: { _tag: "knocked" } });
-        const sent = yield* post(`/threads/${master}/send`, { text: "yes", inboundId: "in-yes" });
+        assert.strictEqual(answered.status, 200);
+        const sent = yield* post(`/threads/${master}/send`, { text: "yes" });
         assert.strictEqual(sent.status, 403);
+        expect(sent.body).toMatchObject({ guard: { _tag: "knocked" } });
         expect(seen.map((request) => request.from)).toEqual([
-          { _tag: "session", sessionId: telegram.sessionId, subject: telegram.subject },
-          { _tag: "session", sessionId: telegram.sessionId, subject: telegram.subject },
+          {
+            _tag: "owner",
+            provenance: { _tag: "owner-app", surface: "mobile", sessionId: telegram.sessionId },
+          },
+          {
+            _tag: "session",
+            sessionId: telegram.sessionId,
+            subject: telegram.subject,
+            label: "telegram-bridge",
+            component: "telegram-bridge",
+          },
         ]);
-        assert.deepStrictEqual(yield* Ref.get(delivered.dispatches), []);
+        expect(yield* Ref.get(delivered.dispatches)).toMatchObject([
+          { type: "runtime-request.respond", createdBy: "user" },
+        ]);
+      }),
+    ),
+  );
+});
+
+describe("component credentials (routing r21)", () => {
+  const watchers = component("watchers");
+
+  it.effect("a Robob component reaches a lane straight, and still knocks on the master", () =>
+    runAs(watchers, new Map(), ({ seen, delivered, post }) =>
+      Effect.gen(function* () {
+        const pulse = yield* post(`/threads/${lane}/send`, { text: "pulse" });
+        assert.strictEqual(pulse.status, 200);
+        const toMaster = yield* post(`/threads/${master}/send`, { text: "pulse" });
+        assert.strictEqual(toMaster.status, 403);
+        expect(toMaster.body).toMatchObject({ guard: { _tag: "knocked" } });
+        expect(seen.at(-1)?.from).toEqual({
+          _tag: "session",
+          sessionId: watchers.sessionId,
+          subject: watchers.subject,
+          label: "watchers",
+          component: "watchers",
+        });
+        expect(yield* Queue.take(delivered.sends)).toMatchObject({
+          threadId: lane,
+          createdBy: "system",
+        });
+        assert.strictEqual(yield* Queue.size(delivered.sends), 0);
+      }),
+    ),
+  );
+
+  it.effect("a token Robob did not issue to a component still knocks on a lane", () =>
+    runAs(session, new Map(), ({ delivered, post }) =>
+      Effect.gen(function* () {
+        const sent = yield* post(`/threads/${lane}/send`, { text: "pulse" });
+        assert.strictEqual(sent.status, 403);
+        expect(sent.body).toMatchObject({ guard: { _tag: "knocked" } });
+        assert.strictEqual(yield* Queue.size(delivered.sends), 0);
       }),
     ),
   );

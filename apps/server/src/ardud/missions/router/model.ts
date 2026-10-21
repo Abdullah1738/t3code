@@ -78,6 +78,12 @@ export type SendSender =
       readonly subject: string;
       /** The client's own name from pairing. Display only: never grants anything. */
       readonly label?: string;
+      /**
+       * The Robob component the credential was issued to, read from its stored
+       * origin claim (never the body). Set only for components whose sends are
+       * their own: see `sessionPrincipal`.
+       */
+      readonly component?: string;
     }
   /** An OAuth MCP client outside Robob. */
   | { readonly _tag: "mcp-client"; readonly sessionId: string; readonly label: string }
@@ -104,7 +110,9 @@ export type GuardReason =
   | "other-mission"
   | "anonymous"
   | "agent-schedule"
-  | "unrecorded-schedule";
+  | "unrecorded-schedule"
+  /** One of Robob's own components (a watcher, t3ctl, crw): delivered and logged. */
+  | "component";
 
 export type GuardDecision =
   /** Target is not in any mission: the guard has no say. */
@@ -131,9 +139,10 @@ export interface GuardFacts {
 
 /**
  * Membership decides who may reach a member thread. Owner typing passes.
- * The master reaches its own members directly. Other members and member
- * services are routed through rooms. Schedules the owner made pass; a
- * thread's schedule passes only into that same thread, and a schedule with no
+ * The master reaches its own members directly. Robob's own components reach
+ * every member but the master directly. Other members and member services
+ * are routed through rooms. Schedules the owner made pass; a thread's
+ * schedule passes only into that same thread, and a schedule with no
  * recorded creator is never treated as self. Everything else knocks.
  */
 export const decideSend = (facts: GuardFacts): GuardDecision => {
@@ -166,6 +175,8 @@ export const decideSend = (facts: GuardFacts): GuardDecision => {
       };
     }
     case "session":
+      // Nothing but the owner reaches the master unasked.
+      if (from.component !== undefined && target.kind !== "master") return allow("component");
       if (sameMission && sender.kind === "service") {
         return {
           _tag: "route",
@@ -188,7 +199,7 @@ export const senderLabel = (from: SendSender): string => {
     case "thread":
       return from.title.length > 0 ? from.title : from.threadId;
     case "session":
-      return from.label ?? "a paired device";
+      return from.label ?? from.component ?? "an unnamed session";
     case "mcp-client":
       return `MCP client ${from.label}`;
     case "schedule":

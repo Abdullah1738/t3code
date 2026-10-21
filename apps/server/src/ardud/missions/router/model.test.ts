@@ -152,7 +152,34 @@ describe("decideSend", () => {
   it("names a session by its paired label, never its subject", () => {
     const base = { _tag: "session", sessionId: "s1", subject: "cli-issued-session" } as const;
     expect(senderLabel({ ...base, label: "Robob iPhone" })).toBe("Robob iPhone");
-    expect(senderLabel(base)).toBe("a paired device");
+    expect(senderLabel(base)).toBe("an unnamed session");
+  });
+
+  // routing r21: watchers knocked the owner 41 times overnight.
+  it("delivers a Robob component straight to any member but the master", () => {
+    const watchers: SendSender = {
+      _tag: "session",
+      sessionId: "s2",
+      subject: "component:watchers",
+      component: "watchers",
+    };
+    expect(senderLabel(watchers)).toBe("watchers");
+    expect(
+      decideSend({
+        target: member(lane, "created"),
+        sender: null,
+        from: watchers,
+        targetThreadId: lane,
+      }),
+    ).toEqual({ _tag: "allow", missionId: mission, reason: "component" });
+    expect(
+      decideSend({
+        target: member(master, "master"),
+        sender: null,
+        from: watchers,
+        targetThreadId: master,
+      }),
+    ).toEqual({ _tag: "knock", missionId: mission, reason: "anonymous" });
   });
 
   it("allows owner-made schedules and knocks MCP clients", () => {

@@ -12,7 +12,8 @@
  * One iMessage is one action per place: the first write records it with its
  * command, and a retry of that same action returns the recorded result
  * instead of acting again (`inboundActions.ts`). Every other credential
- * (Telegram's included) stays a system session.
+ * stays a system session, except the Telegram bridge answering a pending
+ * request from his own chat (`telegramAnswerOwner` in `control.ts`).
  */
 import type { MissionId, MissionProvenance, ProviderApprovalDecision } from "@t3tools/contracts";
 import { ThreadId } from "@t3tools/contracts";
