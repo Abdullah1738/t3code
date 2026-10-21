@@ -7,27 +7,32 @@ description: Use for any login, sign-up, account, cookie or browser task for som
 
 One offbox lease per person. Her logins, cookies, browser profile, secrets, files,
 and anything built or run for her live on her box under `~/person/`. The Mac holds
-only a tiny state file (tunnel and SOCKS pids, local ports) under
-`~/.local/share/offbox-person/state/`.
+only small state files (tunnel and SOCKS pids, local ports, backup status) under
+`~/.local/share/offbox-person/state/` and the encrypted backup repo (see Backups).
 
 ## When to use
 
 - Any login, sign-up, account, OTP or cookie work for Moni (or any non-owner person).
 - Any code, script, project or file work done for her. It runs on her box, not the Mac.
-- Preference notes about her (what she likes, habits, routines) are NOT box data. They
-  go in the life wiki on the Mac as usual (`life-wiki` skill).
+- Notes and documents about her (preferences, routines, health notes, ID papers, insurance,
+  form profiles) are NOT box data. They go in the life wiki on the Mac (`life-wiki` skill,
+  IDs under `documents/moni/`). Owner rule 2026-10-21. Box data is her logins, cookies,
+  accounts, mail access, working files and any database or tool built for her.
 
 ## Rules
 
 - Never use Dia, the owner's Keychain, or the owner's browser profiles for her accounts.
 - Never create or run her working data on the Mac. Build and run it with `offbox-person run`.
-- Never copy her data (profile, cookies, secrets, files, outputs) to the Mac, the wiki,
-  or the owner's repos. Only results she asked for go back to chat.
+- Never copy her box data (profile, cookies, secrets, files, outputs) to the Mac, the wiki,
+  or the owner's repos. Only results she asked for go back to chat. The encrypted Dropbox
+  backup below is the one exception.
+- Abdullah has full access to her box (owner, 2026-10-21): use it for him whenever he asks,
+  no need to check with her first.
 - Don't put credentials in chat. Store them with `offbox-person secret set`, read them with
   `offbox-person secret get` only inside the box where they're needed.
 - Stop the box when the task is done: `offbox-person down <person>`. Keep it warm only while a
   task needs it.
-- `~/.local/share/offbox-person/<person>/config.json` is the only Mac-side file and is optional:
+- `~/.local/share/offbox-person/<person>/config.json` is the only Mac-side setting and is optional:
   `{"home": false}` (use the box's own EU IP), `{"proxy": "..."}` (another proxy), `{"locale": "..."}`
   (browser language, default `en-US`). Change it only when the owner says so.
 
@@ -44,6 +49,7 @@ offbox-person secret get|rm <person> <name>
 offbox-person secret list <person>
 offbox-person save <person>                        # closes browser, saves a default base, pins it; box stops
 offbox-person down <person>                        # close browser, tunnels and home route, release the lease
+offbox-person backup <person> [--force]            # back up the latest snapshot to Dropbox now
 offbox-person list
 ```
 
@@ -85,3 +91,57 @@ Screenshots are transient: `down` deletes `$TMPDIR/offbox-person/<person>/`. Don
   --remote`. A failed box call never re-runs on the Mac.
 - `down` and `save` close the browser first so her cookies are flushed to disk, then stop the
   tunnels and the SOCKS server by the pids in the state file.
+
+## On her box (Moni)
+
+- Wiki: read-only clone of the life wiki at `~/person/wiki` (GitHub deploy key
+  `moni-box-wiki-readonly`, private key `~/person/secrets/wiki_deploy`). Refresh it before
+  reading: `offbox-person run moni -- 'cd ~/person/wiki && git pull -q'`. It can't push; edit the
+  wiki on the Mac.
+- Her Gmail lives only on her box (moved off the Mac 2026-10-21): himalaya account `moni`
+  (default), `~/person/bin/{himalaya,ortie}`, OAuth token in `~/person/secrets/ortie-moni.json`
+  (ortie refreshes it itself). The owner may read her mail any time through the box:
+  `offbox-person run moni -- 'himalaya envelope list -m INBOX -s 20 --json'`,
+  `offbox-person run moni -- 'himalaya message read -m INBOX <id>'`. Same himalaya syntax as
+  the `agent-mail` skill. Send only with the owner's or her OK on the exact draft.
+- Her working files: `~/person/files/` (for example `moni-spending-2026-09/`, her bank statement work).
+
+## Backups (Dropbox)
+
+`offbox-person-backup <person>|--all` backs up her box home from its latest boat snapshot:
+- Skips when the content snapshot id is the one last backed up (`--force` overrides).
+- Pulls the home minus reinstallable runtimes and caches (`.cloakbrowser`, `.cua-driver`, caches,
+  `person/venv`, `person/bin`, `person/wiki`) into `~/.local/share/offbox-person/stage/<person>`
+  (excluded from Time Machine, wiped at the start and end of every run, even on TERM).
+- Writes a restic snapshot into `~/.local/share/offbox-person/restic/<person>` (password in Keychain
+  `restic-offbox-person`/`ardud`; it is the only copy of the key, Dropbox holds only ciphertext),
+  deletes the pull, then mirrors the repo to Dropbox `/Backups/offbox-person/<person>/restic` with
+  `--delete` (every file hash-checked).
+- Fails (never silently passes) if a listed file other than browser caches, locks or telemetry is
+  missing from the pull. Every boat/offbox/restic/Dropbox call has a timeout.
+- Never replaces Dropbox history: if the Mac repo is missing but a backup was made before, or Dropbox
+  already holds a repo, it stops and asks for a restore instead of starting a new repo; it won't
+  mirror over a Dropbox repo with a different `config`.
+- `down` and `save` start it in the background once the box has stopped (it waits for a running
+  backup instead of skipping). LaunchAgent `com.abdullah.offbox-person-backup` (installed by
+  `integrations/offbox-person/install.zsh`) runs `--all` at login and every 6 h.
+- Status: `~/.local/share/offbox-person/state/<person>-backup.json` (`ok`, `stage`,
+  `last_success_ts`, `last_boat_snapshot`, `last_restic_snapshot`), log
+  `<person>-backup-YYYYMM.log` (counts only, never her file names). A failure or a lock stuck over
+  6 h sends one Telegram per stage per day. Keeps 8 last, 14 daily, 8 weekly, 24 monthly, 5 yearly;
+  `restic check --read-data-subset=10%` every 30 days.
+
+Restore:
+
+```bash
+export RESTIC_REPOSITORY=~/.local/share/offbox-person/restic/moni
+export RESTIC_PASSWORD_COMMAND="security find-generic-password -s restic-offbox-person -a ardud -w"
+restic snapshots --tag person-moni
+restic restore latest --target "$TMPDIR/moni-restore" --include '*/person/files'   # or the whole snapshot
+```
+
+Copy the restored files back to her box (tar over `offbox ssh` from `~/.local/share/offbox-person/moni`
+with `OFFBOX_THREAD=person:moni OFFBOX_POOL_SIZE=1`) and delete the restored copy from the Mac right
+away. If the Mac repo is gone, download `/Backups/offbox-person/<person>/restic` from Dropbox to the repo
+path first (`dbxcli ls -R` then `dbxcli get` file by file; a folder `get` fails). The Keychain password
+is needed either way. Tested 21 Oct: a repo downloaded from Dropbox restored her files byte for byte.

@@ -45,6 +45,8 @@ class OffboxPersonTest(unittest.TestCase):
             "OFFBOX_PERSON_ROOT": str(self.root),
             "OFFBOX_PERSON_OFFBOX": str(FAKES / "offbox"),
             "OFFBOX_PERSON_AGENT_BROWSER": str(FAKES / "agent-browser"),
+            "OFFBOX_PERSON_BACKUP": str(FAKES / "offbox-person-backup"),
+            "FAKE_BACKUP_LOG": str(self.tmp / "backup.log"),
             "FAKE_LOG": str(self.calls),
             "FAKE_BOXHOME": str(self.boxhome),
             "FAKE_AB_LOG": str(self.ab_log),
@@ -211,6 +213,17 @@ class OffboxPersonTest(unittest.TestCase):
 
     def test_person_slug_is_validated(self):
         self.assertNotEqual(self.tool("up", "Bad!", check=False).returncode, 0)
+
+    def test_down_and_save_start_a_background_backup(self):
+        self.tool("up", "moni")
+        self.tool("down", "moni")
+        self.tool("save", "moni")
+        log = self.tmp / "backup.log"
+        for _ in range(50):
+            if log.exists() and len(log.read_text().splitlines()) >= 2:
+                break
+            time.sleep(0.1)
+        self.assertEqual(log.read_text().splitlines(), ["moni --after-stop", "moni --after-stop"])
 
 
 if __name__ == "__main__":

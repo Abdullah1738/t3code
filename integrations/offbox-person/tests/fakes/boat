@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Fake boat for offbox-person-backup tests. The box's latest snapshot is the directory FAKE_SNAPSHOT_DIR (its home)
+with id FAKE_SNAPSHOT_ID. FAKE_BOAT_HANG=<subcommand> makes that call hang (a pull
+hangs after writing its files), FAKE_BOAT_DROP (comma list of home-relative
+paths) leaves files out of a pull, FAKE_TREE_TRUNCATED=1 reports a truncated listing."""
+
+import json
+import os
+import shutil
+import signal
+import sys
+import time
+from pathlib import Path
+
+# Like the real (Go) boat CLI: SIGALRM doesn't kill it, so the script's watchdog must.
+signal.signal(signal.SIGALRM, signal.SIG_IGN)
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_BOAT_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\n")
+
+home = Path(os.environ["FAKE_SNAPSHOT_DIR"])
+snap = os.environ.get("FAKE_SNAPSHOT_ID", "snap-1")
+sub = " ".join(args[:2]) if args[:1] == ["snapshot"] else args[0]
+hang = os.environ.get("FAKE_BOAT_HANG") == sub
+if hang and sub != "snapshot pull":
+    time.sleep(600)
+
+if sub == "info":
+    print(json.dumps({"sandbox": {"id": args[1], "state": "stopped", "lastSnapshotStatus": "completed"}}))
+elif sub == "snapshot tree":
+    entries = [{"kind": "file", "path": "__system__/etc/hostname", "size": 4}]
+    for p in sorted(home.rglob("*")):
+        entries.append({"kind": "dir" if p.is_dir() else "file", "path": str(p.relative_to(home)),
+                        "size": 0 if p.is_dir() else p.stat().st_size})
+    print(json.dumps({"snapshotId": snap, "sandboxId": args[2], "treeAvailable": True,
+                      "truncated": os.environ.get("FAKE_TREE_TRUNCATED") == "1", "entries": entries}))
+elif sub == "snapshot pull":
+    out = Path(args[args.index("-o") + 1])
+    drop = {d for d in os.environ.get("FAKE_BOAT_DROP", "").split(",") if d}
+    paths = [args[i + 1] for i, a in enumerate(args) if a == "--path"]
+    dest_home = out / "home_user"
+    dest_home.mkdir(parents=True, exist_ok=True)
+    for want in paths:
+        rel = os.path.relpath(want, "/home/user")
+        src = home if rel == "." else home / rel
+        for p in [src] if src.is_file() else src.rglob("*"):
+            r = str(p.relative_to(home))
+            if p.is_file() and r not in drop:
+                (dest_home / r).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, dest_home / r)
+    if hang:  # a pull that stalls after writing her files
+        time.sleep(600)
+    print(json.dumps({"homeDir": str(dest_home), "outputDir": str(out), "snapshotId": args[2]}))
+else:
+    sys.exit(f"fake boat: unsupported {args}")

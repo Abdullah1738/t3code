@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.abdullah.offbox-person-backup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/ardud/.local/bin/offbox-person-backup</string>
+		<string>--all</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/ardud/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/ardud</string>
+	<key>StartInterval</key>
+	<integer>21600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/ardud/.local/share/offbox-person/state/backup-launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/ardud/.local/share/offbox-person/state/backup-launchd.log</string>
+</dict>
+</plist>

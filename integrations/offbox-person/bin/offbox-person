@@ -8,6 +8,7 @@ OFFBOX_PERSON_HOME=${0:A:h:h}
 ROOT=${OFFBOX_PERSON_ROOT:-$HOME/.local/share/offbox-person}
 OFFBOX=${OFFBOX_PERSON_OFFBOX:-offbox}
 AGENT_BROWSER=${OFFBOX_PERSON_AGENT_BROWSER:-agent-browser}
+BACKUP=${OFFBOX_PERSON_BACKUP:-$OFFBOX_PERSON_HOME/bin/offbox-person-backup}
 CDP_REMOTE=9242
 HOME_REMOTE=1055
 
@@ -26,6 +27,7 @@ usage:
   offbox-person secret set|get|rm <person> <name>    set reads the value from stdin
   offbox-person secret list <person>
   offbox-person save <person>                        save a default base and pin it (stops the box)
+  offbox-person backup <person> [--force]            back up the box's latest snapshot to Dropbox now
   offbox-person list
 EOF
   exit 2
@@ -203,6 +205,7 @@ cmd_down() {
   stop_local "$p"
   rm -rf -- "$(shot_dir "$p")"
   off "$p" release --mine >&2 || note "offbox release reported a problem (check: offbox list)"
+  backup_bg "$p"
   note "$p: down"
 }
 
@@ -278,6 +281,20 @@ cmd_save() {
   stop_local "$p"
   off "$p" save --name person --default --note "person box $p" >&2
   off "$p" keep --days 3650 >&2
+  backup_bg "$p"
+}
+
+# Back up the snapshot the stop just took, without making the caller wait for the pull and upload.
+backup_bg() {
+  mkdir -p -- "$ROOT/state"
+  nohup "$BACKUP" "$1" --after-stop >>"$ROOT/state/$1-backup-bg.log" 2>&1 </dev/null &!
+  note "$1: Dropbox backup started in the background (status: $ROOT/state/$1-backup.json)"
+}
+
+cmd_backup() {
+  local p=$1; shift
+  check_person "$p"
+  exec "$BACKUP" "$p" "$@"
 }
 
 cmd_list() {
@@ -302,6 +319,7 @@ case $cmd in
   run)     [[ $# -ge 1 ]] || usage; p=$1; shift; [[ ${1:-} == -- ]] && shift; cmd_run "$p" "$@" ;;
   secret)  [[ $# -ge 2 ]] || usage; cmd_secret "$@" ;;
   save)    [[ $# -eq 1 ]] || usage; cmd_save "$1" ;;
+  backup)  [[ $# -ge 1 && $# -le 2 ]] || usage; [[ $# -eq 1 || $2 == --force ]] || usage; cmd_backup "$@" ;;
   list)    cmd_list ;;
   *)       usage ;;
 esac

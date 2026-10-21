@@ -1,0 +1,403 @@
+#!/bin/bash
+# offbox-person-backup <person>|--all [--force] [--after-stop]
+#
+# Backs up a person's box home to Dropbox so a lost lease never loses her data:
+#   1. pick her lease (or her saved base once no lease is left) and its latest boat snapshot
+#   2. skip when that snapshot id is the one the last successful backup used (--force overrides)
+#   3. pull her home from the snapshot, minus runtimes and caches that box/setup.sh reinstalls
+#   4. restic snapshot into an encrypted repo on this Mac (password in Keychain `restic-offbox-person`)
+#   5. delete the plaintext pull, then mirror the repo to Dropbox with the memory system's
+#      dropbox_mirror.py (every file verified by Dropbox content_hash)
+# --after-stop first waits for the box to stop, so `offbox-person down|save` back up the stop snapshot.
+# Status: $ROOT/state/<person>-backup.json. A failure sends one Telegram alert per stage per day.
+# Every external call has a deadline and runs in the background, so a TERM reaches the cleanup trap at once.
+set -u
+umask 077
+
+ROOT="${OFFBOX_PERSON_ROOT:-$HOME/.local/share/offbox-person}"
+OFFBOX="${OFFBOX_PERSON_OFFBOX:-$HOME/.local/bin/offbox}"
+BOAT="${OFFBOX_PERSON_BOAT:-$HOME/.local/bin/boat}"
+RESTIC="${OFFBOX_PERSON_RESTIC:-/opt/homebrew/bin/restic}"
+PY="${OFFBOX_PERSON_PY:-/opt/homebrew/bin/python3}"
+[ -x "$PY" ] || PY=python3
+MIRROR="${OFFBOX_PERSON_MIRROR:-$HOME/.local/share/memory-system/src/dropbox_mirror.py}"
+NOTIFY="${OFFBOX_PERSON_NOTIFY:-$HOME/.bun/bin/bun $HOME/.local/share/telegram-bridge/src/cli.ts}"
+CAFFEINATE="${OFFBOX_PERSON_CAFFEINATE-/usr/bin/caffeinate}"
+TMUTIL="${OFFBOX_PERSON_TMUTIL-tmutil}"
+DROPBOX_ROOT="${OFFBOX_PERSON_DROPBOX_ROOT:-/Backups/offbox-person}"
+CALL_TIMEOUT="${OFFBOX_PERSON_CALL_TIMEOUT:-300}"
+PULL_TIMEOUT="${OFFBOX_PERSON_PULL_TIMEOUT:-3600}"
+LONG_TIMEOUT="${OFFBOX_PERSON_LONG_TIMEOUT:-3600}"
+STOP_WAIT="${OFFBOX_PERSON_STOP_WAIT:-900}"
+LOCK_WAIT="${OFFBOX_PERSON_LOCK_WAIT:-7200}"
+POLL="${OFFBOX_PERSON_POLL:-10}"
+export RESTIC_PASSWORD_COMMAND="${OFFBOX_PERSON_RESTIC_PASSWORD_COMMAND:-security find-generic-password -s restic-offbox-person -a ardud -w}"
+export RESTIC_CACHE_DIR="$ROOT/.restic-cache"
+BOX_HOME=/home/user
+# Reinstalled by box/setup.sh or plain caches: about 1.3 GB of the home that holds none of her data.
+# person/wiki is a read-only clone of the life wiki, which has its own GitHub and Dropbox copies.
+SKIP=".cloakbrowser .cua-driver .ascii .xcache .cache .npm .nvm go .base-image-manifest.json person/venv person/bin person/wiki"
+# Listed files boat may leave out of a pull because they changed or vanished while the snapshot ran.
+# Only these may be missing; any other missing file fails the backup.
+VOLATILE='(^|/)(Cache|Code Cache|GPUCache|ShaderCache|GrShaderCache|GraphiteDawnCache|DawnGraphiteCache|DawnWebGPUCache|Crashpad|telemetry)/|(^|/)(Singleton[^/]*|LOCK|lockfile|[^/]*\.lock)$'
+
+usage() {
+  echo "usage: offbox-person-backup <person>|--all [--force] [--after-stop]" >&2
+  exit 2
+}
+
+PERSON= ALL=0 FORCE=0 AFTER_STOP=0
+for a in "$@"; do
+  case $a in
+    --all) ALL=1 ;;
+    --force) FORCE=1 ;;
+    --after-stop) AFTER_STOP=1 ;;
+    -*) usage ;;
+    *) [ -z "$PERSON" ] || usage; PERSON=$a ;;
+  esac
+done
+
+# Keeps the Mac awake for as long as this process lives.
+[ -n "$CAFFEINATE" ] && [ -x "$CAFFEINATE" ] && "$CAFFEINATE" -i -w $$ >/dev/null 2>&1 </dev/null &
+
+# WATCHDOG SECS CMD...: runs CMD, kills it (TERM, then KILL) after SECS or when the watchdog gets TERM.
+# A bare `alarm; exec` is not enough: Go programs (restic, boat) catch SIGALRM and keep running.
+WATCHDOG='
+  my $secs = shift;
+  my $pid = fork() // die "fork: $!\n";
+  if (!$pid) { exec { $ARGV[0] } @ARGV; print STDERR "exec $ARGV[0]: $!\n"; exit 127 }
+  my $end = sub { kill "TERM", $pid; for (1..50) { last if waitpid($pid, 1) > 0; select undef, undef, undef, 0.1 }
+                  kill "KILL", $pid; waitpid($pid, 0); exit $_[0] };
+  $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { $end->(143) };
+  $SIG{ALRM} = sub { print STDERR "timeout after ${secs}s: $ARGV[0]\n"; $end->(124) };
+  alarm $secs;
+  waitpid($pid, 0);
+  exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+'
+
+CHILD=
+stop_child() {
+  if [ -n "$CHILD" ]; then
+    kill -TERM "$CHILD" 2>/dev/null
+    wait "$CHILD" 2>/dev/null
+    CHILD=
+  fi
+}
+
+# --all runs each person in its own process, so one person's failure can't stop the others.
+if [ "$ALL" = 1 ]; then
+  [ -z "$PERSON" ] || usage
+  trap 'stop_child; exit 1' INT TERM HUP
+  rc=0
+  for d in "$ROOT"/*/; do
+    [ -d "$d" ] || continue
+    p=$(basename "$d")
+    case $p in state|stage|restic) continue ;; esac
+    [[ $p =~ ^[a-z][a-z0-9-]{0,31}$ ]] || continue
+    if [ "$FORCE" = 1 ]; then "$0" "$p" --force & else "$0" "$p" & fi
+    CHILD=$!
+    wait "$CHILD" || rc=1
+    CHILD=
+  done
+  exit $rc
+fi
+
+[ -n "$PERSON" ] || usage
+[[ $PERSON =~ ^[a-z][a-z0-9-]{0,31}$ ]] || { echo "person must be a lowercase slug, got '$PERSON'" >&2; exit 2; }
+P=$PERSON
+
+STATE_DIR="$ROOT/state"
+STATUS="$STATE_DIR/$P-backup.json"
+LOG="$STATE_DIR/$P-backup-$(date +%Y%m).log"
+LOCK="$STATE_DIR/$P-backup.lock"
+TMP="$LOCK"   # the run's scratch files live in its lock dir and go with it
+PRUNE_STAMP="$STATE_DIR/$P-backup-prune.stamp"
+CHECK_STAMP="$STATE_DIR/$P-backup-check.stamp"
+# A fixed path: restic then finds the previous snapshot as parent and only reads files that changed.
+STAGE="$ROOT/stage/$P"
+export RESTIC_REPOSITORY="$ROOT/restic/$P"
+DEST="$DROPBOX_ROOT/$P/restic"
+mkdir -p "$STATE_DIR" "$ROOT/stage" "$ROOT/restic"
+# Keep the plaintext pulls out of Time Machine. tmutil takes ~10 s, so only once per stage dir.
+TM_MARK="$STATE_DIR/stage-tm-excluded"
+if [ -n "$TMUTIL" ] && [ ! -f "$TM_MARK" ] && command -v "$TMUTIL" >/dev/null; then
+  "$TMUTIL" addexclusion "$ROOT/stage" >/dev/null 2>&1 && touch "$TM_MARK"
+fi
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+alert() { # stage text
+  perl -e "$WATCHDOG" 60 env -u BUN_INSPECT $NOTIFY notify \
+    --source "offbox-person backup" --severity attention --text "Dropbox backup of $P's box: $2" \
+    --key "offbox-person-backup:$P:$1:$(date +%F)" >/dev/null 2>&1 </dev/null
+}
+
+age_of() { echo $(( $(date +%s) - $(stat -f %m "$1" 2>/dev/null || date +%s) )); }
+
+# One run per person. A post-stop backup waits for a running one rather than dropping its snapshot.
+waited=0
+while ! mkdir "$LOCK" 2>/dev/null; do
+  holder=$(cat "$LOCK/pid" 2>/dev/null)
+  if [ -f "$LOCK/pid" ]; then age=$(age_of "$LOCK/pid"); else age=$(age_of "$LOCK"); fi
+  if { [ -n "$holder" ] && ps -p "$holder" -o command= 2>/dev/null | grep -q offbox-person-backup; } \
+     || { [ -z "$holder" ] && [ "$age" -lt 60 ]; }; then
+    if [ "$AFTER_STOP" = 1 ] && [ "$waited" -lt "$LOCK_WAIT" ]; then
+      sleep "$POLL"; waited=$((waited + POLL)); continue
+    fi
+    [ "$age" -gt 21600 ] && alert stuck "backup ${holder:-?} has held the lock for $((age / 3600))h"
+    log "skip: backup ${holder:-?} still running"
+    exit 0
+  fi
+  log "removing stale lock (holder ${holder:-?} gone)"
+  rm -rf "$LOCK"
+done
+echo $$ > "$LOCK/pid"
+# The pull is her data in plaintext; it must not outlive this run, whatever way the run ends.
+trap 'stop_child; rm -rf "$STAGE" "$LOCK"' EXIT
+trap 'exit 1' INT TERM HUP
+rm -rf "$STAGE"   # left by a run that was killed outright
+START=$(date +%s)
+BOX= SNAP= RSNAP=
+
+# call SECS OUT CMD...: stdout to OUT, stderr to the log, killed after SECS.
+call() {
+  local secs=$1 out=$2
+  shift 2
+  perl -e "$WATCHDOG" "$secs" "$@" >"$out" 2>>"$LOG" </dev/null &
+  CHILD=$!
+  wait "$CHILD"
+  local rc=$?
+  CHILD=
+  return $rc
+}
+
+write_status() { # ok stage message dropbox
+  "$PY" - "$STATUS" "$1" "$2" "$3" "$4" "$BOX" "$SNAP" "$RSNAP" "$START" <<'PY'
+import json, os, sys, time
+path, ok, stage, msg, dropbox, box, snap, rsnap, start = sys.argv[1:10]
+prev = {}
+try:
+    prev = json.load(open(path))
+except Exception:
+    pass
+now = int(time.time())
+good = ok == "1"
+st = {"ts": now, "ok": good, "stage": stage, "message": msg[-800:], "box": box or None,
+      "boat_snapshot": snap or None, "restic_snapshot": rsnap or None, "dropbox": dropbox or None,
+      "duration_s": now - int(start),
+      "last_success_ts": now if good else prev.get("last_success_ts"),
+      "last_boat_snapshot": snap if good and snap else prev.get("last_boat_snapshot"),
+      "last_restic_snapshot": rsnap if good and rsnap else prev.get("last_restic_snapshot")}
+json.dump(st, open(path + ".tmp", "w"), indent=1)
+os.replace(path + ".tmp", path)
+PY
+}
+
+fail() {
+  log "FAIL [$1] $2"
+  write_status 0 "$1" "$2" ""
+  alert "$1" "failed at $1: ${2:0:200}"
+  exit 1
+}
+
+prev_field() {
+  "$PY" -c 'import json, sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")
+except Exception: print("")' "$STATUS" "$1"
+}
+
+# Exit 3 when Dropbox holds a repo this run must not touch: any repo before an init (the local one was lost),
+# or a different repo before a --delete mirror. Reads only Dropbox metadata, with the mirror's own credentials.
+DBX_GUARD='
+import importlib.util, sys
+mirror, dest, repo, mode = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("dropbox_mirror", mirror)
+dm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dm)
+meta = dm.Api().call("files/get_metadata", {"path": dest + "/config"})
+if meta is None:
+    sys.exit(0)
+if mode == "init" or meta.get("content_hash") != dm.dbx_hash(repo + "/config"):
+    sys.exit(3)
+'
+
+stamp_due() { [ ! -f "$1" ] || [ "$(age_of "$1")" -gt "$2" ]; }
+
+MAINT=0
+maintain() {
+  if stamp_due "$PRUNE_STAMP" 86400; then
+    call "$LONG_TIMEOUT" "$TMP/forget.out" nice -n 10 "$RESTIC" forget --host offbox-person --tag "person-$P" \
+      --keep-last 8 --keep-daily 14 --keep-weekly 8 --keep-monthly 24 --keep-yearly 5 --prune
+    local frc=$?
+    log "prune rc=$frc $(tail -2 "$TMP/forget.out" | tr '\n' ' ')"
+    if [ $frc -eq 0 ]; then touch "$PRUNE_STAMP"; MAINT=1; else alert prune "restic prune failed (rc=$frc)"; fi
+  fi
+  if stamp_due "$CHECK_STAMP" $((30 * 86400)); then
+    call "$LONG_TIMEOUT" "$TMP/check.out" nice -n 10 "$RESTIC" check --read-data-subset=10% \
+      || fail check "restic check failed (rc=$?)"
+    touch "$CHECK_STAMP"
+    log "restic check ok"
+  fi
+}
+
+mirror() {
+  call "$CALL_TIMEOUT" "$TMP/guard.out" "$PY" -c "$DBX_GUARD" "$MIRROR" "$DEST" "$RESTIC_REPOSITORY" mirror
+  case $? in
+    0) ;;
+    3) fail dropbox "$DEST holds a different restic repo; not overwriting it" ;;
+    *) fail dropbox "could not read $DEST metadata" ;;
+  esac
+  call "$LONG_TIMEOUT" "$TMP/mirror.out" "$PY" "$MIRROR" "$RESTIC_REPOSITORY" "$DEST" --delete
+  local mrc=$?
+  MOUT=$(tail -1 "$TMP/mirror.out")
+  log "dropbox mirror rc=$mrc $MOUT"
+  [ $mrc -eq 0 ] || fail dropbox "mirror rc=$mrc $(tail -c 400 "$TMP/mirror.out")"
+}
+
+log "backup start (after-stop=$AFTER_STOP force=$FORCE)"
+
+# 1. her box: the newest lease that isn't deleted, else the box behind her default saved base
+call "$CALL_TIMEOUT" "$TMP/leases.json" "$OFFBOX" list --all --json || fail box "offbox list failed"
+call "$CALL_TIMEOUT" "$TMP/bases.json" "$OFFBOX" bases --json || fail box "offbox bases failed"
+BOX=$("$PY" - "$P" "$ROOT/$P" "$TMP/leases.json" "$TMP/bases.json" <<'PY'
+import json, sys
+p, root, lf, bf = sys.argv[1:5]
+def load(path):
+    text = open(path).read().strip()
+    return json.loads(text) if text else []
+leases = [r for r in load(lf)
+          if r.get("repo_key") == p and r.get("repo_root") == root and r.get("box_id")
+          and r.get("state") != "deleted"]
+leases.sort(key=lambda r: r.get("last_used_at") or 0, reverse=True)
+if leases:
+    print(leases[0]["box_id"])
+    sys.exit(0)
+for b in load(bf):
+    if b.get("name") == f"{p}:person" and b.get("box_id"):
+        print(b["box_id"])
+        sys.exit(0)
+sys.exit(1)
+PY
+) || fail box "no lease or saved base for $P"
+
+# 2. after down/save: wait until boat has stopped the box, which takes its final snapshot first
+if [ "$AFTER_STOP" = 1 ]; then
+  waited=0
+  while :; do
+    st=
+    call "$CALL_TIMEOUT" "$TMP/info.json" "$BOAT" info "$BOX" --json \
+      && st=$("$PY" -c 'import json, sys
+s = json.load(open(sys.argv[1]))["sandbox"]
+print(s.get("state"), s.get("lastSnapshotStatus"))' "$TMP/info.json" 2>>"$LOG")
+    case $st in
+      "stopped completed"|"archived completed") break ;;
+    esac
+    if [ "$waited" -ge "$STOP_WAIT" ]; then
+      log "box still '$st' after ${waited}s; using its latest snapshot"; break
+    fi
+    sleep "$POLL"; waited=$((waited + POLL))
+  done
+fi
+
+# 3. latest content snapshot and the parts of the home to pull. `snapshot latest` can return a no-op snapshot
+# (new id, no tree) every few minutes; `tree` names the snapshot that holds the files.
+call "$CALL_TIMEOUT" "$TMP/tree.json" "$BOAT" snapshot tree "$BOX" --json || fail snapshot "boat snapshot tree $BOX failed"
+plan=$("$PY" - "$SKIP" "$TMP/tree.json" "$TMP/want" <<'PY'
+import json, sys
+skip = set(sys.argv[1].split())
+t = json.load(open(sys.argv[2]))
+if not t.get("treeAvailable", True) or not t.get("snapshotId"):
+    sys.exit(1)
+if t.get("truncated"):
+    # No full listing: pull the whole home (restic excludes the skip list) and skip the file check.
+    print(t["snapshotId"], -1)
+    sys.exit(0)
+tops, want = set(), []
+for e in t.get("entries", []):
+    parts = e["path"].strip("/").split("/")
+    if not parts[0] or parts[0].startswith("__"):  # __system__, __dockervol__: not under the home
+        continue
+    top = "/".join(parts[:2]) if parts[0] == "person" else parts[0]
+    if top == "person" or top in skip:
+        continue
+    tops.add(top)
+    if e.get("kind") == "file":
+        want.append(e["path"].strip("/"))
+with open(sys.argv[3], "w") as f:
+    f.write("".join(w + "\n" for w in sorted(want)))  # code-point order, same as LC_ALL=C sort
+print(t["snapshotId"], len(want))
+for top in sorted(tops):
+    print(top)
+PY
+) || fail snapshot "snapshot tree of $BOX unusable"
+SNAP=$(printf '%s\n' "$plan" | head -1 | cut -d' ' -f1)
+EXPECT=$(printf '%s\n' "$plan" | head -1 | cut -d' ' -f2)
+
+if [ "$FORCE" = 0 ] && [ "$SNAP" = "$(prev_field last_boat_snapshot)" ]; then
+  log "skip: snapshot ${SNAP:0:8} already backed up"
+  RSNAP=$(prev_field last_restic_snapshot)
+  maintain
+  [ "$MAINT" = 1 ] && mirror
+  write_status 1 unchanged "snapshot already backed up" ""
+  exit 0
+fi
+
+# 4. the repo. A missing local repo after earlier backups means it was lost: a fresh one mirrored with
+# --delete would wipe the Dropbox history, so stop and let a human restore it from Dropbox.
+if [ ! -f "$RESTIC_REPOSITORY/config" ]; then
+  [ -z "$(prev_field last_restic_snapshot)" ] \
+    || fail repo "local restic repo is gone; restore it from Dropbox $DEST before the next backup"
+  call "$CALL_TIMEOUT" "$TMP/guard.out" "$PY" -c "$DBX_GUARD" "$MIRROR" "$DEST" "$RESTIC_REPOSITORY" init
+  case $? in
+    0) ;;
+    3) fail repo "Dropbox $DEST already holds a repo; restore it to $RESTIC_REPOSITORY instead of starting a new one" ;;
+    *) fail dropbox "could not read $DEST metadata" ;;
+  esac
+  call "$CALL_TIMEOUT" "$TMP/init.out" "$RESTIC" init || fail repo "restic init failed"
+  log "initialised repo $RESTIC_REPOSITORY"
+fi
+
+# 5. pull (plaintext, private stage dir)
+paths=()
+while IFS= read -r top; do
+  [ -n "$top" ] || continue
+  paths+=(--path "$BOX_HOME/$top")
+done < <(printf '%s\n' "$plan" | tail -n +2)
+[ ${#paths[@]} -gt 0 ] || paths=(--path "$BOX_HOME")
+mkdir -p "$STAGE"
+call "$PULL_TIMEOUT" "$TMP/pull.json" "$BOAT" snapshot pull "$SNAP" -o "$STAGE" --json "${paths[@]}" \
+  || fail pull "boat snapshot pull ${SNAP:0:8} failed or took over ${PULL_TIMEOUT}s"
+SRC=$("$PY" -c 'import json, sys
+print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])["homeDir"])' "$TMP/pull.json" 2>>"$LOG")
+case $SRC in
+  "$STAGE"/*) [ -d "$SRC" ] || fail pull "pull of ${SNAP:0:8} produced no home dir" ;;
+  *) fail pull "pull of ${SNAP:0:8} reported a home dir outside the stage" ;;
+esac
+got=$(find "$SRC" -type f | wc -l | tr -d ' ')
+if [ "$EXPECT" != -1 ]; then
+  (cd "$SRC" && find . -type f | sed 's|^\./||' | LC_ALL=C sort) > "$TMP/got"
+  LC_ALL=C comm -13 "$TMP/got" "$TMP/want" > "$TMP/missing"
+  real=$(grep -Evc "$VOLATILE" "$TMP/missing")
+  volatile=$(grep -Ec "$VOLATILE" "$TMP/missing")
+  [ "$volatile" -eq 0 ] || log "pull left out $volatile cache/lock files the snapshot lists (ignored)"
+  [ "$real" -eq 0 ] || fail pull "$real listed files missing from the pull of ${SNAP:0:8}"
+fi
+log "pulled snapshot ${SNAP:0:8} from $BOX: $got files ($(du -sh "$SRC" | cut -f1))"
+
+# 6. restic
+excludes=()
+for s in $SKIP; do excludes+=(--exclude "$SRC/$s"); done
+call "$LONG_TIMEOUT" "$TMP/backup.out" nice -n 10 "$RESTIC" backup --host offbox-person --tag "person-$P" \
+  --tag "boat-${SNAP:0:8}" --skip-if-unchanged --json --quiet "${excludes[@]}" "$SRC"
+rc=$?
+summary=$(grep '"message_type":"summary"' "$TMP/backup.out" | tail -1)
+[ $rc -eq 0 ] && [ -n "$summary" ] || fail restic "restic backup rc=$rc"
+RSNAP=$(printf '%s' "$summary" | "$PY" -c 'import json, sys; print(json.load(sys.stdin).get("snapshot_id", "")[:8])')
+log "restic snapshot ${RSNAP:-unchanged}"
+rm -rf "$STAGE"
+
+maintain
+
+# 7. Dropbox
+mirror
+write_status 1 done "ok ($got files)" "$MOUT"
+log "backup done ($(( $(date +%s) - START ))s)"
