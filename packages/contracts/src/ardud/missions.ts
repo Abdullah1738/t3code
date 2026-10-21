@@ -2288,7 +2288,8 @@ export const MissionOverview = Schema.Struct({
   // --- crw-threads additions ---
   /**
    * Threads a component runs for the mission (crw reviews): every open one and
-   * the latest settled ones, newest first. The list's `threadIds` carry all.
+   * the latest settled ones, newest first. The list's `threadIds` carry the
+   * same set, so an older settled thread goes back to the ordinary list.
    */
   attachedThreads: Schema.optional(Schema.Array(ThreadAttachment)),
   // --- end crw-threads additions ---

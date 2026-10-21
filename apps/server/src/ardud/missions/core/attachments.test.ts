@@ -59,9 +59,11 @@ describe("thread attachments", () => {
         [[reviewThread, "open"]],
       );
 
-      // Every tick resends it: nothing new is committed.
+      // Every tick resends it, and a renamed PR alone is not news: nothing new is committed.
       const again = yield* missions.attachThread(crw, attach());
       assert.equal(again.seq, first.seq);
+      const renamed = yield* missions.attachThread(crw, attach({ title: "Renamed upstream" }));
+      assert.equal(renamed.seq, first.seq);
 
       // The PR merged: the thread stays in the mission, out of the ordinary list.
       yield* missions.attachThread(
@@ -114,6 +116,44 @@ describe("thread attachments", () => {
       yield* missions.attachThread(crw, attach({ state: "detached" }));
       yield* missions.attachThread(crw, elsewhere);
       assert.notInclude(yield* listedThreads, reviewThread);
+
+      // A thread that acts for a mission is never hidden as a review.
+      for (const acting of [masterThread, laneThread]) {
+        assert.equal(
+          yield* failureCode(missions.attachThread(crw, attach({ threadId: acting }))),
+          "conflict",
+        );
+      }
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect(
+    "old settled threads go back to the thread list together with the Reviews group",
+    () => {
+      const { layer } = harness();
+      return Effect.gen(function* () {
+        yield* seed;
+        const missions = yield* MissionService.MissionService;
+        const threads = Array.from({ length: 22 }, (_, index) => ThreadId.make(`t-pr-${index}`));
+        for (const [index, threadId] of threads.entries()) {
+          const pullRequest = { repository: "Equicom-Crypto/edge-api", number: index + 1 };
+          yield* missions.attachThread(crw, attach({ threadId, pullRequest }));
+          if (index > 0) {
+            yield* missions.attachThread(crw, attach({ threadId, pullRequest, state: "closed" }));
+          }
+        }
+        const shown = (yield* missions.overview(missionId)).attachedThreads ?? [];
+        const listed = yield* listedThreads;
+        // The open one plus the latest 20 settled ones; the oldest settled one is back in the list.
+        assert.equal(shown.length, 21);
+        assert.deepStrictEqual(shown[0]?.threadId, threads[0]);
+        assert.notInclude(listed, threads[1]);
+        assert.notInclude(
+          shown.map((thread) => thread.threadId),
+          threads[1],
+        );
+        for (const thread of shown) assert.include(listed, thread.threadId);
+      }).pipe(Effect.provide(layer));
+    },
+  );
 });

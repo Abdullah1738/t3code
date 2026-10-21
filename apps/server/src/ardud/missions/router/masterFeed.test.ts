@@ -206,6 +206,8 @@ describe("master inbox feed", () => {
       yield* feed.handle(yield* decide(plain, owner, null));
       yield* feed.handle(yield* decide(plain, owner, "  "));
       yield* feed.handle(yield* decide(plain, agent(masterThread), "master's own note"));
+      const moni: MissionProvenance = { _tag: "owner-imessage", chat: "moni", inboundId: "in-1" };
+      yield* feed.handle(yield* decide(plain, moni, "Moni's note"));
       assert.strictEqual((yield* controlMessages).length, 0);
 
       yield* feed.handle(yield* decide(noted, owner, "Share what the PR does next time."));

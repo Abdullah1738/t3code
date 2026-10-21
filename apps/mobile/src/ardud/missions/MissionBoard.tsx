@@ -1,6 +1,5 @@
 import type { CallId, MissionId, MissionListSnapshot, ThreadId } from "@t3tools/contracts";
 import {
-  ageView,
   attachedThreadGroups,
   dayOnePlan,
   groupRequests,
@@ -555,7 +554,6 @@ function ReviewThreads(props: PageProps) {
               <Text className="min-w-0 flex-1 text-[15px] font-t3-medium" numberOfLines={1}>
                 {row.title}
               </Text>
-              <Meta className="pt-0.5">{ageView(row.updatedAt, props.nowMs)?.label}</Meta>
             </Row>
           </Fragment>
         ))}

@@ -66,13 +66,21 @@ export const makeAttachmentWrites = (kit: WriteKit) => {
             `Thread ${input.threadId} belongs to mission ${before.missionId}; detach it there first.`,
           );
         }
+        // A role holder or lane acts for a mission; hiding it as someone's review would bury it.
+        const acting = state === "open" ? yield* store.missionsOfThread(input.threadId) : [];
+        if (acting.length > 0) {
+          return yield* fail(
+            "conflict",
+            `Thread ${input.threadId} acts for mission ${acting.join(", ")}; it is not attachable.`,
+          );
+        }
         const pullRequest =
           input.pullRequest === undefined ? (before?.pullRequest ?? null) : input.pullRequest;
+        // A renamed PR alone is not news; the title catches up on the next state change.
         if (
           before !== null &&
           before.missionId === mission.id &&
           before.state === state &&
-          before.title === input.title &&
           samePullRequest(before.pullRequest, pullRequest)
         ) {
           return yield* unchanged(mission.id, attachmentRef(before));

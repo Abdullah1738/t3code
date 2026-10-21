@@ -12,7 +12,6 @@
  */
 import {
   approverOf,
-  isOwnerProvenance,
   type MissionEvent,
   type MissionId,
   type MissionMessageKind,
@@ -47,9 +46,15 @@ const ROUTED_KINDS = new Set([
 ]);
 
 // ardud missions: crw-threads
-/** The owner's note on a decision is direction for next time; nothing else carries it to the master. */
+/**
+ * The owner's note on a decision is direction for next time; nothing else carries it to the master.
+ * His app or his own iMessage chat only: a decision from Moni's chat is not his direction.
+ */
 const ownerNote = (event: MissionEvent): string | null => {
-  if (event.kind !== "approval.decided" || !isOwnerProvenance(event.provenance)) return null;
+  const own =
+    event.provenance._tag === "owner-app" ||
+    (event.provenance._tag === "owner-imessage" && event.provenance.chat === "owner");
+  if (event.kind !== "approval.decided" || !own) return null;
   const note =
     typeof event.payload === "object" && event.payload !== null && "note" in event.payload
       ? event.payload.note

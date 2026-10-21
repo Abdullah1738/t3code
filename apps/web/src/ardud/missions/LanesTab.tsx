@@ -117,7 +117,7 @@ export function LanesTab(props: { overview: MissionOverviewSnapshot; nowMs: numb
         />
       ))}
       {/* ardud missions: crw-threads */}
-      <ReviewsSection overview={props.overview} nowMs={props.nowMs} />
+      <ReviewsSection overview={props.overview} />
     </div>
   );
 }
@@ -125,7 +125,7 @@ export function LanesTab(props: { overview: MissionOverviewSnapshot; nowMs: numb
 const CLOSED_SHOWN = 5;
 
 /** Threads crw runs for the mission's PRs; they live here, not in the thread list. */
-function ReviewsSection(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
+function ReviewsSection(props: { overview: MissionOverviewSnapshot }) {
   const groups = attachedThreadGroups(props.overview.attachedThreads);
   const [all, setAll] = useState(false);
   if (groups.open.length === 0 && groups.closed.length === 0) return null;
@@ -134,7 +134,7 @@ function ReviewsSection(props: { overview: MissionOverviewSnapshot; nowMs: numbe
     <MissionSection title="Reviews" caption={groups.open.length}>
       <ul className="flex flex-col">
         {[...groups.open, ...closed].map((row) => (
-          <ReviewThreadItem key={row.threadId} row={row} nowMs={props.nowMs} />
+          <ReviewThreadItem key={row.threadId} row={row} />
         ))}
       </ul>
       {all ? null : (
@@ -144,17 +144,10 @@ function ReviewsSection(props: { overview: MissionOverviewSnapshot; nowMs: numbe
   );
 }
 
-function ReviewThreadItem(props: { row: AttachedThreadRow; nowMs: number }) {
+function ReviewThreadItem(props: { row: AttachedThreadRow }) {
   const environmentId = usePrimaryEnvironmentId();
   const { row } = props;
-  const body = (
-    <>
-      <span className="truncate font-medium">{row.title}</span>
-      <span className="text-xs text-(--m-muted) tabular-nums">
-        {ageView(row.updatedAt, props.nowMs)?.label}
-      </span>
-    </>
-  );
+  const body = <span className="truncate font-medium">{row.title}</span>;
   const rowClass =
     "flex min-w-0 items-baseline justify-between gap-3.5 rounded-xl px-1 py-2.75 text-sm";
   return (
