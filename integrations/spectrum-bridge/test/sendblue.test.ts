@@ -112,6 +112,49 @@ test("sendApp posts the Spectrum identity and rejects groups", async () => {
   expect(fake.calls.length).toBe(1);
 });
 
+test("sendApp addresses the configured card app and drops appStoreId when it has none", async () => {
+  const fake = fakeFetch(() => json(202, { message_handle: "card2" }));
+  const client = new Sendblue({
+    keyId: "key-id", secret: "secret", number: LINE, fetch: fake.fetch,
+    cardApp: { appName: "Robob", extensionBundleId: "com.abdullah.robob.cards.MessagesExtension", teamId: "HVG39427R3" },
+  });
+
+  await client.sendApp("dm:+15550001", { url: "https://example.com/s/2", caption: "Flight" });
+  const appCard = fake.calls[0]!.body!.app_card as Record<string, unknown>;
+  expect(appCard).toEqual({
+    appName: "Robob",
+    extensionBundleId: "com.abdullah.robob.cards.MessagesExtension",
+    teamId: "HVG39427R3",
+    url: "https://example.com/s/2",
+    layout: { caption: "Flight" },
+  });
+});
+
+test("sendApp keeps times and dates out of every text field the bubble can show", async () => {
+  const fake = fakeFetch(() => json(202, { message_handle: "card3" }));
+  const client = makeClient(fake.fetch);
+
+  await client.sendApp("dm:+15550001", {
+    url: "https://example.com/s/3",
+    caption: "EK 203 departs at 14:35",
+    subcaption: "Oct 24 · Gate B12",
+    trailingCaption: "Tomorrow",
+    summary: "Boarding pass for 2026-10-24",
+    fallbackText: "Your flight today",
+  });
+  expect((fake.calls[0]!.body!.app_card as Record<string, unknown>)).toMatchObject({
+    fallbackText: "Your flight",
+    layout: { caption: "EK 203 departs", subcaption: "Gate B12", summary: "Boarding pass" },
+  });
+  expect((fake.calls[0]!.body!.app_card as { layout: Record<string, unknown> }).layout.trailingCaption).toBeUndefined();
+
+  await client.sendApp("dm:+15550001", { url: "https://example.com/s/4", caption: "9:30 pm" });
+  expect((fake.calls[1]!.body!.app_card as { layout: Record<string, unknown> }).layout).toEqual({ caption: "Open card" });
+  await expect(client.sendApp("dm:+15550001", { url: "https://example.com/s/5", caption: " ", summary: "x" }))
+    .rejects.toMatchObject({ code: "invalid_app_card" });
+  expect(fake.calls.length).toBe(2);
+});
+
 test("react, typing, read and requestLocation hit their endpoints and no-op for groups", async () => {
   const fake = fakeFetch(() => json(200, {}));
   const client = makeClient(fake.fetch);

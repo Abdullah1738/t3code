@@ -44,7 +44,7 @@ export function sendblueLine(config: Config, env: Record<string, string | undefi
   const secret = env.SENDBLUE_API_SECRET ?? "";
   const number = config.sendblueNumber ?? "";
   if (!keyId || !secret || !/^\+[1-9]\d{6,14}$/.test(number)) throw new Error("Sendblue credentials or line number missing");
-  return new Sendblue({ keyId, secret, number });
+  return new Sendblue({ keyId, secret, number, ...(config.cardApp ? { cardApp: config.cardApp } : {}) });
 }
 
 /**

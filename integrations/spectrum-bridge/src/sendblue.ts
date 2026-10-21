@@ -3,7 +3,9 @@
  * are read defensively (unknown + narrowing) because Sendblue's responses carry
  * many optional, string-or-null fields and we only need a handful of them.
  */
+import { cardSafeText } from "./card-text.ts";
 import type { SendblueOptions } from "./chats.ts";
+import { SPECTRUM_CARD_APP, type CardApp } from "./config.ts";
 import { chatKey, LineError, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
 
 const BASE = "https://api.sendblue.com";
@@ -11,15 +13,12 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const PAGE_SIZE = 100;
 const EVENT_DEDUPE_LIMIT = 512;
 
-// Must match the Photon bridge's MINI_APP (photon.ts) so Sendblue cards look the same as the Photon ones.
-const APP_IDENTITY = {
-  appName: "Spectrum",
-  appStoreId: 6777616651,
-  extensionBundleId: "codes.photon.Spectrum.MessagesExtension",
-  teamId: "P8XT6232SL",
-} as const;
+// Used when a caption is nothing but a time or date; the page still has the details.
+const BLANK_CAPTION = "Open card";
 
 export type SendblueClientOptions = SendblueOptions & {
+  /** Messages extension the cards open in; defaults to Photon's Spectrum app. */
+  cardApp?: CardApp;
   /** Test seam: shrink the SSE reconnect backoff and stall watchdog. */
   timing?: { backoffMinMs?: number; backoffMaxMs?: number; stallMs?: number };
 };
@@ -170,6 +169,7 @@ export class Sendblue implements Line {
   readonly #backoffMinMs: number;
   readonly #backoffMaxMs: number;
   readonly #stallMs: number;
+  readonly #cardApp: CardApp;
 
   constructor(options: SendblueClientOptions) {
     this.number = options.number;
@@ -179,6 +179,7 @@ export class Sendblue implements Line {
     this.#backoffMinMs = options.timing?.backoffMinMs ?? 1_000;
     this.#backoffMaxMs = options.timing?.backoffMaxMs ?? 30_000;
     this.#stallMs = options.timing?.stallMs ?? 45_000;
+    this.#cardApp = options.cardApp ?? SPECTRUM_CARD_APP;
   }
 
   #headers(): Record<string, string> {
@@ -382,21 +383,29 @@ export class Sendblue implements Line {
   async sendApp(chat: ChatKey, card: LineAppCard): Promise<{ handle: string }> {
     // Sendblue's App Card docs define only one-to-one iMessage sends; no fallback to SMS.
     if (chatKey.isGroup(chat)) throw new LineError("App cards are one-to-one only", "unsupported", false, false);
-    const fields: Array<[string, string | undefined]> = [
+    // Every text field can become the bubble's body, so each one is kept free of times and dates.
+    const text: Array<[string, string | undefined]> = [
       ["caption", card.caption],
       ["subcaption", card.subcaption],
       ["trailingCaption", card.trailingCaption],
       ["trailingSubcaption", card.trailingSubcaption],
-      ["imageUrl", card.imageUrl],
       ["summary", card.summary],
     ];
     const layout: Json = {};
-    for (const [key, value] of fields) if (value) layout[key] = value;
-    if (!str(layout.caption) && !str(layout.subcaption) && !str(layout.trailingCaption) && !str(layout.trailingSubcaption)) {
-      throw new LineError("App card needs at least one caption", "invalid_app_card", false, false);
+    const given = text.some(([key, value]) => key !== "summary" && value?.trim());
+    for (const [key, value] of text) {
+      const clean = value ? cardSafeText(value) : "";
+      if (clean) layout[key] = clean;
     }
-    const appCard: Json = { ...APP_IDENTITY, url: card.url, layout };
-    if (card.fallbackText) appCard.fallbackText = card.fallbackText;
+    if (card.imageUrl) layout.imageUrl = card.imageUrl;
+    const captioned = str(layout.caption) || str(layout.subcaption) || str(layout.trailingCaption) || str(layout.trailingSubcaption);
+    if (!captioned) {
+      if (!given) throw new LineError("App card needs at least one caption", "invalid_app_card", false, false);
+      layout.caption = BLANK_CAPTION;
+    }
+    const appCard: Json = { ...this.#cardApp, url: card.url, layout };
+    const fallbackText = card.fallbackText ? cardSafeText(card.fallbackText) : "";
+    if (fallbackText) appCard.fallbackText = fallbackText;
     const response = await this.#call("POST", "/api/send-message", {
       json: { number: chatKey.target(chat), from_number: this.number, app_card: appCard },
       send: true,
