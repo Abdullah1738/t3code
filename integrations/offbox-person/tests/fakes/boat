@@ -2,7 +2,8 @@
 """Fake boat for offbox-person-backup tests. The box's latest snapshot is the directory FAKE_SNAPSHOT_DIR (its home)
 with id FAKE_SNAPSHOT_ID. FAKE_BOAT_HANG=<subcommand> makes that call hang (a pull
 hangs after writing its files), FAKE_BOAT_DROP (comma list of home-relative
-paths) leaves files out of a pull, FAKE_TREE_TRUNCATED=1 reports a truncated listing."""
+paths) leaves files out of a pull, FAKE_TREE_TRUNCATED=1 reports a truncated listing,
+FAKE_BOAT_PULL_FAILS=N makes the first N pulls fail the way boat does (error JSON on stdout)."""
 
 import json
 import os
@@ -36,6 +37,10 @@ elif sub == "snapshot tree":
     print(json.dumps({"snapshotId": snap, "sandboxId": args[2], "treeAvailable": True,
                       "truncated": os.environ.get("FAKE_TREE_TRUNCATED") == "1", "entries": entries}))
 elif sub == "snapshot pull":
+    log = Path(os.environ["FAKE_BOAT_LOG"]).read_text().splitlines()
+    if sum(json.loads(line)[:2] == ["snapshot", "pull"] for line in log) <= int(os.environ.get("FAKE_BOAT_PULL_FAILS", "0")):
+        print(json.dumps({"error": f"snapshot {args[2]} is not ready yet"}))
+        sys.exit(1)
     out = Path(args[args.index("-o") + 1])
     drop = {d for d in os.environ.get("FAKE_BOAT_DROP", "").split(",") if d}
     paths = [args[i + 1] for i, a in enumerate(args) if a == "--path"]

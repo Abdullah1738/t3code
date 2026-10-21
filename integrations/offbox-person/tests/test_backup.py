@@ -199,6 +199,21 @@ class BackupTest(unittest.TestCase):
         self.assertEqual((r.returncode, self.status()["stage"]), (1, "pull"))
         self.assert_no_plaintext()
 
+    def test_a_failed_pull_is_retried_from_a_fresh_listing(self):
+        self.backup(FAKE_BOAT_PULL_FAILS="1")
+        self.assertEqual(len(self.pulls()), 2)
+        self.assertEqual(len([c for c in self.boat_calls() if c[:2] == ["snapshot", "tree"]]), 2)
+        self.assertIn("not ready yet", self.log())
+        self.assertTrue(self.status()["ok"])
+        self.assert_no_plaintext()
+
+    def test_a_pull_that_keeps_failing_alerts_once_and_leaves_no_plaintext(self):
+        r = self.backup("moni", check=False, FAKE_BOAT_PULL_FAILS="9")
+        self.assertEqual((r.returncode, self.status()["stage"]), (1, "pull"))
+        self.assertEqual(len(self.pulls()), 3)
+        self.assertEqual(self.notify_log.read_text().count("failed at pull"), 1)
+        self.assert_no_plaintext()
+
     def test_a_hung_listing_times_out_with_an_alert(self):
         r = self.backup("moni", check=False, FAKE_BOAT_HANG="snapshot tree", OFFBOX_PERSON_CALL_TIMEOUT="2")
         self.assertEqual((r.returncode, self.status()["stage"]), (1, "snapshot"))

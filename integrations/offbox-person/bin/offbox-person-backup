@@ -301,8 +301,9 @@ fi
 
 # 3. latest content snapshot and the parts of the home to pull. `snapshot latest` can return a no-op snapshot
 # (new id, no tree) every few minutes; `tree` names the snapshot that holds the files.
-call "$CALL_TIMEOUT" "$TMP/tree.json" "$BOAT" snapshot tree "$BOX" --json || fail snapshot "boat snapshot tree $BOX failed"
-plan=$("$PY" - "$SKIP" "$TMP/tree.json" "$TMP/want" <<'PY'
+plan_tree() {
+  call "$CALL_TIMEOUT" "$TMP/tree.json" "$BOAT" snapshot tree "$BOX" --json || fail snapshot "boat snapshot tree $BOX failed"
+  plan=$("$PY" - "$SKIP" "$TMP/tree.json" "$TMP/want" <<'PY'
 import json, sys
 skip = set(sys.argv[1].split())
 t = json.load(open(sys.argv[2]))
@@ -329,9 +330,11 @@ print(t["snapshotId"], len(want))
 for top in sorted(tops):
     print(top)
 PY
-) || fail snapshot "snapshot tree of $BOX unusable"
-SNAP=$(printf '%s\n' "$plan" | head -1 | cut -d' ' -f1)
-EXPECT=$(printf '%s\n' "$plan" | head -1 | cut -d' ' -f2)
+  ) || fail snapshot "snapshot tree of $BOX unusable"
+  SNAP=$(printf '%s\n' "$plan" | head -1 | cut -d' ' -f1)
+  EXPECT=$(printf '%s\n' "$plan" | head -1 | cut -d' ' -f2)
+}
+plan_tree
 
 if [ "$FORCE" = 0 ] && [ "$SNAP" = "$(prev_field last_boat_snapshot)" ]; then
   log "skip: snapshot ${SNAP:0:8} already backed up"
@@ -357,16 +360,28 @@ if [ ! -f "$RESTIC_REPOSITORY/config" ]; then
   log "initialised repo $RESTIC_REPOSITORY"
 fi
 
-# 5. pull (plaintext, private stage dir)
-paths=()
-while IFS= read -r top; do
-  [ -n "$top" ] || continue
-  paths+=(--path "$BOX_HOME/$top")
-done < <(printf '%s\n' "$plan" | tail -n +2)
-[ ${#paths[@]} -gt 0 ] || paths=(--path "$BOX_HOME")
-mkdir -p "$STAGE"
-call "$PULL_TIMEOUT" "$TMP/pull.json" "$BOAT" snapshot pull "$SNAP" -o "$STAGE" --json "${paths[@]}" \
-  || fail pull "boat snapshot pull ${SNAP:0:8} failed or took over ${PULL_TIMEOUT}s"
+# 5. pull (plaintext, private stage dir). A pull can fail for a moment while boat writes the box's next
+# snapshot, so a failed pull re-reads the tree and tries again, up to three times.
+pulled=0
+for attempt in 1 2 3; do
+  paths=()
+  while IFS= read -r top; do
+    [ -n "$top" ] || continue
+    paths+=(--path "$BOX_HOME/$top")
+  done < <(printf '%s\n' "$plan" | tail -n +2)
+  [ ${#paths[@]} -gt 0 ] || paths=(--path "$BOX_HOME")
+  rm -rf "$STAGE"; mkdir -p "$STAGE"
+  if call "$PULL_TIMEOUT" "$TMP/pull.json" "$BOAT" snapshot pull "$SNAP" -o "$STAGE" --json "${paths[@]}"; then
+    pulled=1; break
+  fi
+  # boat prints its error on stdout with --json; keep a short excerpt, long tokens masked.
+  log "pull of ${SNAP:0:8} failed (attempt $attempt): $(tail -c 300 "$TMP/pull.json" 2>/dev/null \
+    | tr -d '\n' | sed -E -e 's#/home/user/[^ "]*#<path>#g' -e 's/[A-Za-z0-9+\/=_-]{24,}/<id>/g')"
+  [ "$attempt" = 3 ] && break
+  sleep "$POLL"
+  plan_tree
+done
+[ "$pulled" = 1 ] || fail pull "boat snapshot pull ${SNAP:0:8} failed 3 times or took over ${PULL_TIMEOUT}s"
 SRC=$("$PY" -c 'import json, sys
 print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])["homeDir"])' "$TMP/pull.json" 2>>"$LOG")
 case $SRC in
