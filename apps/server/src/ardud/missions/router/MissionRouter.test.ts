@@ -1412,3 +1412,159 @@ describe("router round 5", () => {
     }).pipe(Effect.provide(h.layer));
   });
 });
+
+// --- routing additions ---
+describe("lead questions (routing r21)", () => {
+  const leadThread = ThreadId.make("t-lead");
+  const coordThread = ThreadId.make("t-coord");
+  const question = [
+    {
+      id: "q",
+      header: "Release",
+      question: "Ship the GST fix tonight?",
+      options: [
+        { label: "Ship it", description: "" },
+        { label: "Hold", description: "" },
+      ],
+    },
+  ];
+  const commitUpserts = (upserts: NonNullable<MissionStore.MissionCommit["upserts"]>) =>
+    Effect.gen(function* () {
+      yield* (yield* MissionStore.MissionStore).commit({
+        event: {
+          missionId,
+          kind: "lane.updated",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "leads",
+          subject: null,
+        },
+        upserts,
+      });
+    });
+  const sub: SubMission = {
+    id: SubMissionId.make("sub-gst"),
+    missionId,
+    title: "GST",
+    intent: "",
+    order: 0,
+    fillIdleCapacity: false,
+    status: "active",
+    coordinatorRoleId: RoleId.make("role-coord"),
+    intendedEffort: null,
+    actualEffort: null,
+    health: "unknown",
+    lockedFields: [],
+    createdAt: "2026-10-21T00:00:00.000Z",
+    updatedAt: "2026-10-21T00:00:00.000Z",
+  };
+  /** The API lane gets a lead, and sits in a sub-mission with a coordinator. */
+  const seedLeads = Effect.gen(function* () {
+    yield* seed;
+    yield* commitUpserts([
+      { _tag: "role", record: role("role-lead", "lane-lead", lane.id) },
+      { _tag: "role", record: role("role-coord", "sub-coordinator") },
+      { _tag: "role-binding", record: binding("b-lead", "role-lead", leadThread) },
+      { _tag: "role-binding", record: binding("b-coord", "role-coord", coordThread) },
+      { _tag: "sub-mission", record: sub },
+      {
+        _tag: "lane",
+        record: { ...lane, subMissionId: sub.id, leadRoleId: RoleId.make("role-lead") },
+      },
+    ]);
+  });
+
+  it.effect("a lane's question goes to its lead once, who answers it directly", () => {
+    const h = harness();
+    h.questions.set(`${laneThread}:q-1`, question);
+    return Effect.gen(function* () {
+      yield* seedLeads;
+      const router = yield* MissionRouter.MissionRouter;
+      const told = yield* router.questionRaised({ threadId: laneThread, requestId: "q-1" });
+      assert.deepStrictEqual(told, [leadThread]);
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.strictEqual(page.messages.length, 1);
+      const notice = page.messages[0]!;
+      assert.deepStrictEqual(notice.author, { _tag: "system", component: "lane-questions" });
+      assert.deepStrictEqual(notice.to, [{ _tag: "thread", threadId: leadThread }]);
+      const { body } = yield* router.messageBody({ messageId: notice.id }, ownerApp);
+      assert.include(body, "API is waiting on a question you lead:");
+      assert.include(body, "- Release: Ship the GST fix tonight?");
+      assert.include(body, "Options: Ship it / Hold");
+      assert.include(body, `threadId ${laneThread} and requestId q-1`);
+      assert.include(body, "mission_ask");
+      assert.strictEqual(wakesFor(h.sent, leadThread).length, 1);
+      assert.deepStrictEqual(wakesFor(h.sent, masterThread), []);
+      // The same question raised again tells nobody twice.
+      yield* router.questionRaised({ threadId: laneThread, requestId: "q-1" });
+      assert.strictEqual(
+        (yield* router.roomPage({ roomId: control }, ownerApp)).messages.length,
+        1,
+      );
+      assert.strictEqual(wakesFor(h.sent, leadThread).length, 1);
+      // The lead's answer reaches the lane; its ordinary sends still go through the room.
+      const answer = yield* router.guard(
+        guardRequest(fromThread(leadThread), laneThread, "request-respond"),
+      );
+      assert.deepStrictEqual(answer, { _tag: "pass" });
+      const chat = yield* router.guard(guardRequest(fromThread(leadThread), laneThread));
+      assert.strictEqual(chat._tag, "routed");
+      // Another member answering the lane's question is not its lead.
+      const writer = yield* router.guard(
+        guardRequest(fromThread(writerThread), laneThread, "request-respond"),
+      );
+      assert.strictEqual(writer._tag, "routed");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("with no live lead the question climbs to the coordinator, then the master", () => {
+    const h = harness();
+    h.questions.set(`${laneThread}:q-1`, question);
+    h.questions.set(`${laneThread}:q-2`, question);
+    h.gone.add(leadThread);
+    return Effect.gen(function* () {
+      yield* seedLeads;
+      const router = yield* MissionRouter.MissionRouter;
+      assert.deepStrictEqual(
+        yield* router.questionRaised({ threadId: laneThread, requestId: "q-1" }),
+        [coordThread],
+      );
+      h.gone.add(coordThread);
+      assert.deepStrictEqual(
+        yield* router.questionRaised({ threadId: laneThread, requestId: "q-2" }),
+        [masterThread],
+      );
+      // A role with no lane asks the master.
+      h.questions.set(`${writerThread}:q-3`, question);
+      assert.deepStrictEqual(
+        yield* router.questionRaised({ threadId: writerThread, requestId: "q-3" }),
+        [masterThread],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the master's, a stranger's and an answered question go nowhere", () => {
+    const h = harness();
+    h.questions.set(`${masterThread}:q-1`, question);
+    h.questions.set(`${strayThread}:q-1`, question);
+    return Effect.gen(function* () {
+      yield* seedLeads;
+      const router = yield* MissionRouter.MissionRouter;
+      assert.deepStrictEqual(
+        yield* router.questionRaised({ threadId: masterThread, requestId: "q-1" }),
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* router.questionRaised({ threadId: strayThread, requestId: "q-1" }),
+        [],
+      );
+      // Answered before the router read it.
+      assert.deepStrictEqual(
+        yield* router.questionRaised({ threadId: laneThread, requestId: "q-9" }),
+        [],
+      );
+      assert.deepStrictEqual(h.sent, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+// --- end routing additions ---

@@ -112,7 +112,9 @@ export type GuardReason =
   | "agent-schedule"
   | "unrecorded-schedule"
   /** One of Robob's own components (a watcher, t3ctl, crw): delivered and logged. */
-  | "component";
+  | "component"
+  /** The target's lead answering the target's pending question. */
+  | "lead";
 
 export type GuardDecision =
   /** Target is not in any mission: the guard has no say. */
@@ -135,15 +137,21 @@ export interface GuardFacts {
   readonly sender: Member | null;
   readonly from: SendSender;
   readonly targetThreadId: ThreadId;
+  /**
+   * The sender thread is one of the target's leads (see `leadTiersOf`) and
+   * this is its answer to the target's pending question.
+   */
+  readonly leads?: boolean;
 }
 
 /**
  * Membership decides who may reach a member thread. Owner typing passes.
- * The master reaches its own members directly. Robob's own components reach
- * every member but the master directly. Other members and member services
- * are routed through rooms. Schedules the owner made pass; a thread's
- * schedule passes only into that same thread, and a schedule with no
- * recorded creator is never treated as self. Everything else knocks.
+ * The master reaches its own members directly, and so does a lead answering
+ * the question its lane asked it. Robob's own components reach every member
+ * but the master directly. Other members and member services are routed
+ * through rooms. Schedules the owner made pass; a thread's schedule passes
+ * only into that same thread, and a schedule with no recorded creator is
+ * never treated as self. Everything else knocks.
  */
 export const decideSend = (facts: GuardFacts): GuardDecision => {
   const { target, sender, from } = facts;
@@ -167,6 +175,7 @@ export const decideSend = (facts: GuardFacts): GuardDecision => {
       if (from.threadId === facts.targetThreadId) return allow("self");
       if (!sameMission) return knock(sender === null ? "outsider" : "other-mission");
       if (sender.kind === "master") return allow("master");
+      if (facts.leads === true) return allow("lead");
       return {
         _tag: "route",
         missionId,

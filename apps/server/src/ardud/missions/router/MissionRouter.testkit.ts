@@ -1,4 +1,8 @@
-import { MissionError, type ThreadId } from "@t3tools/contracts";
+import {
+  MissionError,
+  type OrchestrationV2UserInputQuestion,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -33,6 +37,8 @@ export const fakeRouterThreads = () => {
   const archived = new Set<ThreadId>();
   /** Threads whose sends fail (the thread store refuses the message). */
   const refuseSend = new Set<ThreadId>();
+  /** Pending questions by `threadId:requestId`. */
+  const questions = new Map<string, ReadonlyArray<OrchestrationV2UserInputQuestion>>();
   const layer = Layer.succeed(
     RouterThreads,
     RouterThreads.of({
@@ -62,9 +68,22 @@ export const fakeRouterThreads = () => {
           : Effect.sync(() => {
               sent.push(input);
             }),
+      question: ({ threadId, requestId }) =>
+        Effect.sync(() => questions.get(`${threadId}:${requestId}`) ?? null),
     }),
   );
-  return { sent, activity, parents, creators, unreadable, gone, archived, refuseSend, layer };
+  return {
+    sent,
+    activity,
+    parents,
+    creators,
+    unreadable,
+    gone,
+    archived,
+    refuseSend,
+    questions,
+    layer,
+  };
 };
 
 /** The router over its tables and the fake threads; needs MissionStore and SQL. */

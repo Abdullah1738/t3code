@@ -51,6 +51,7 @@ const projectedThreads = Layer.effect(
         ),
       creator: (threadId) => forkCreator(authority, threadId),
       send: () => Effect.void,
+      question: () => Effect.succeed(null),
     });
   }),
 );

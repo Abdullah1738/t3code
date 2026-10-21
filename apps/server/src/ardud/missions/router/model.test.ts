@@ -182,6 +182,29 @@ describe("decideSend", () => {
     ).toEqual({ _tag: "knock", missionId: mission, reason: "anonymous" });
   });
 
+  it("lets a lead answer its lane's question, and nobody else skips the room", () => {
+    const lead = ThreadId.make("thread-lead");
+    const facts = {
+      target: member(lane, "created"),
+      sender: member(lead, "created"),
+      from: fromThread(lead),
+      targetThreadId: lane,
+    };
+    expect(decideSend({ ...facts, leads: true })).toEqual({
+      _tag: "allow",
+      missionId: mission,
+      reason: "lead",
+    });
+    expect(decideSend(facts)._tag).toBe("route");
+    expect(
+      decideSend({
+        ...facts,
+        sender: member(lead, "created", otherMission),
+        leads: true,
+      })._tag,
+    ).toBe("knock");
+  });
+
   it("allows owner-made schedules and knocks MCP clients", () => {
     expect(
       decideSend({

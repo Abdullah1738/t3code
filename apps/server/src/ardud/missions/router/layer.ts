@@ -59,10 +59,27 @@ export const OwnerConditionsLive = Layer.effect(
 /**
  * What a finished or paused run means for the doorbell: a run that ended
  * clears the thread's outstanding wake and may ring for what arrived since;
- * a run that is waiting on input can take a ring now.
+ * a run that is waiting on input can take a ring now. A question a role or
+ * lane thread asks is passed to its lead.
  */
 const onDomainEvent =
   (router: MissionRouter.MissionRouter["Service"]) => (event: OrchestrationV2DomainEvent) => {
+    // ardud missions: routing - a role or lane thread's question goes to its lead.
+    if (
+      event.type === "runtime-request.updated" &&
+      event.payload.kind === "user_input" &&
+      event.payload.status === "pending"
+    ) {
+      return router.questionRaised({ threadId: event.threadId, requestId: event.payload.id }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("missions router could not tell a lead about a question", {
+            threadId: event.threadId,
+            requestId: event.payload.id,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      );
+    }
     if (event.type !== "run.updated") return Effect.void;
     const status = event.payload.status;
     const work = TERMINAL_RUN_STATUSES.has(status)

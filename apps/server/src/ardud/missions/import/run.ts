@@ -144,6 +144,7 @@ const offlinePorts = Layer.mergeAll(
         Effect.fail(
           new MissionError({ code: "invalid", detail: "The offline import sends no messages." }),
         ),
+      question: () => Effect.succeed(null),
     }),
   ),
 );

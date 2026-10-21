@@ -63,6 +63,7 @@ import {
   heldBy,
   itemWatchers,
   labelOf,
+  leadTiersOf,
   masterRoleOf,
   masterThreadsOf,
   readCast,
@@ -71,6 +72,7 @@ import {
   type RouterCast,
 } from "./cast.ts";
 import { roomActivity } from "./activity.ts";
+import { LEAD_QUESTION_PRODUCER, leadQuestionKey, leadQuestionText } from "./leadQuestions.ts";
 import type { SendCheckRequest, SendGuardOutcome, SendGuardRequest } from "./guardHook.ts";
 import { postContentHash, sha256 } from "./hash.ts";
 import {
@@ -332,6 +334,18 @@ export class MissionRouter extends Context.Service<
      * membership is by then. A gone thread fails `not-found`.
      */
     readonly notify: (notice: SystemNotice) => Effect.Effect<SystemNoticeOutcome, MissionError>;
+    // --- routing additions ---
+    /**
+     * A role or lane thread asked a question: tells its nearest live leads
+     * (see `leadTiersOf`) through `notify`, once per lead. Returns the leads
+     * told; empty when the thread has no lead (the master, a thread outside
+     * every mission) or the question is no longer pending.
+     */
+    readonly questionRaised: (input: {
+      readonly threadId: ThreadId;
+      readonly requestId: string;
+    }) => Effect.Effect<ReadonlyArray<ThreadId>, MissionError>;
+    // --- end routing additions ---
     /**
      * Posts for a trusted server component that resolved the speaker itself
      * (the coord shim). Same rules as `post` after that: dense seqs, key
@@ -1582,7 +1596,21 @@ const make = Effect.gen(function* () {
             ? null
             : { missionId: row.missionId, threadId: request.targetThreadId, kind: row.kind };
       }
-      const decision = decideSend({ target, sender, from, targetThreadId: request.targetThreadId });
+      // ardud missions: routing - a lead answers its lane's question directly.
+      const leads =
+        from._tag === "thread" &&
+        request.path === "request-respond" &&
+        sender?.missionId === target.missionId &&
+        leadTiersOf(yield* loadCast(target.missionId), request.targetThreadId).some((tier) =>
+          tier.includes(from.threadId),
+        );
+      const decision = decideSend({
+        target,
+        sender,
+        from,
+        targetThreadId: request.targetThreadId,
+        leads,
+      });
       return { decision, target };
     });
 
@@ -1877,6 +1905,44 @@ const make = Effect.gen(function* () {
     });
   // --- end router additions ---
 
+  // --- routing additions ---
+  const questionRaised = Effect.fn("MissionRouter.questionRaised")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly requestId: string;
+  }) {
+    for (const cast of yield* candidateCasts(input.threadId)) {
+      const tiers = leadTiersOf(cast, input.threadId);
+      if (tiers.length === 0) continue;
+      const questions = yield* threads.question(input);
+      if (questions === null) return [];
+      for (const tier of tiers) {
+        const live: ThreadId[] = [];
+        for (const lead of tier) {
+          if ((yield* readiness(lead)) !== "gone") live.push(lead);
+        }
+        if (live.length === 0) continue;
+        const text = leadQuestionText({
+          asker: labelOf(cast, { _tag: "thread", threadId: input.threadId }),
+          threadId: input.threadId,
+          requestId: input.requestId,
+          questions,
+        });
+        for (const lead of live) {
+          yield* notify({
+            threadId: lead,
+            text,
+            key: leadQuestionKey(input.threadId, input.requestId, lead),
+            producer: LEAD_QUESTION_PRODUCER,
+          });
+        }
+        return live;
+      }
+      return [];
+    }
+    return [];
+  });
+  // --- end routing additions ---
+
   /** One thread's reminder, under the bell lock. True when it was sent. */
   const remindThread = (
     threadId: ThreadId,
@@ -2041,6 +2107,7 @@ const make = Effect.gen(function* () {
     settled,
     readiness,
     notify,
+    questionRaised,
     relay,
     roomTuning,
     tuneRoom,

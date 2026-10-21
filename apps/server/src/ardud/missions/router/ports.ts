@@ -1,4 +1,10 @@
-import { CommandId, MessageId, MissionError, type ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  MessageId,
+  MissionError,
+  type OrchestrationV2UserInputQuestion,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -45,6 +51,16 @@ export class RouterThreads extends Context.Service<
       readonly key: string;
       readonly asOwner: boolean;
     }) => Effect.Effect<void, MissionError>;
+    // --- routing additions ---
+    /**
+     * A question the thread is waiting on: its questions (empty when the
+     * question item is not recorded yet), or null once it is answered or gone.
+     */
+    readonly question: (input: {
+      readonly threadId: ThreadId;
+      readonly requestId: string;
+    }) => Effect.Effect<ReadonlyArray<OrchestrationV2UserInputQuestion> | null, MissionError>;
+    // --- end routing additions ---
   }
 >()("t3/ardud/missions/router/ports/RouterThreads") {}
 
@@ -104,6 +120,34 @@ export const threadsLayer = Layer.effect(
             })
             .pipe(Effect.mapError(threadFailure("Cannot send to the thread")));
         }),
+      question: Effect.fn("RouterThreads.question")(function* ({
+        threadId,
+        requestId,
+      }: {
+        readonly threadId: ThreadId;
+        readonly requestId: string;
+      }) {
+        const shell = yield* shellOf(threadId);
+        if (shell === null) return null;
+        const records = yield* threads
+          .getProjectThreadRecords(
+            { projectId: shell.projectId, threadId },
+            ["runtimeRequests", "turnItems"],
+            { turnItemTypes: ["user_input_request"] },
+          )
+          .pipe(Effect.mapError(threadFailure("Cannot read the thread's question")));
+        const pending = records.runtimeRequests.some(
+          (request) =>
+            request.id === requestId &&
+            request.kind === "user_input" &&
+            request.status === "pending",
+        );
+        const item = records.turnItems.find(
+          (each) => each.type === "user_input_request" && each.requestId === requestId,
+        );
+        if (!pending) return null;
+        return item?.type === "user_input_request" ? item.questions : [];
+      }),
     });
   }),
 );
