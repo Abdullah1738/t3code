@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""SOCKS5 relay that lets a person's offbox browser leave through this Mac's home connection.
+
+It listens on 127.0.0.1 only and her box reaches it through an `offbox ports --reverse` tunnel. Pages on her box
+are untrusted, so every destination is resolved here and refused unless every resolved address is public: no
+loopback, home LAN, CGNAT/tailnet, link-local or multicast. The checked address is the one dialled, so a DNS
+answer can't change between the check and the connect. CONNECT only; no auth because only loopback reaches it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import ipaddress
+import os
+import socket
+import struct
+import sys
+
+# is_global already excludes RFC1918, loopback, link-local, CGNAT and the other special ranges; these are
+# spelled out so the policy doesn't depend on one Python version's idea of "global".
+BLOCKED = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
+    "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")]
+
+OK, FAILURE, NOT_ALLOWED, HOST_UNREACHABLE, REFUSED, BAD_COMMAND, BAD_ADDRESS = 0, 1, 2, 4, 5, 7, 8
+HANDSHAKE_S = 30
+CONNECT_S = 15
+
+
+def blocked(addr: str) -> bool:
+    ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return not ip.is_global or ip.is_multicast or any(ip in n for n in BLOCKED if n.version == ip.version)
+
+
+def reply(writer: asyncio.StreamWriter, code: int) -> None:
+    writer.write(bytes([5, code, 0, 1, 0, 0, 0, 0, 0, 0]))
+
+
+async def read_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> tuple[str, int] | None:
+    ver, n = await reader.readexactly(2)
+    methods = await reader.readexactly(n)
+    if ver != 5 or 0 not in methods:
+        writer.write(b"\x05\xff")
+        return None
+    writer.write(b"\x05\x00")
+    _, cmd, _, atyp = await reader.readexactly(4)
+    if atyp == 1:
+        host = socket.inet_ntop(socket.AF_INET, await reader.readexactly(4))
+    elif atyp == 4:
+        host = socket.inet_ntop(socket.AF_INET6, await reader.readexactly(16))
+    elif atyp == 3:
+        raw = await reader.readexactly((await reader.readexactly(1))[0])
+        try:
+            host = raw.decode("ascii")
+        except UnicodeDecodeError:
+            reply(writer, BAD_ADDRESS)
+            return None
+    else:
+        reply(writer, BAD_ADDRESS)
+        return None
+    (port,) = struct.unpack("!H", await reader.readexactly(2))
+    if cmd != 1:
+        reply(writer, BAD_COMMAND)
+        return None
+    return host, port
+
+
+async def dial(host: str, port: int) -> tuple[int, tuple[asyncio.StreamReader, asyncio.StreamWriter] | None]:
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return HOST_UNREACHABLE, None
+    addrs = list(dict.fromkeys(info[4][0] for info in infos))
+    bad = [a for a in addrs if blocked(a)]
+    if not addrs or bad:
+        print(f"offbox-person-socks: refused non-public destination {', '.join(bad)}", file=sys.stderr, flush=True)
+        return NOT_ALLOWED, None
+    for addr in addrs:
+        try:
+            return OK, await asyncio.wait_for(asyncio.open_connection(addr, port), CONNECT_S)
+        except (OSError, asyncio.TimeoutError):
+            continue
+    return REFUSED, None
+
+
+async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+    try:
+        while data := await src.read(65536):
+            dst.write(data)
+            await dst.drain()
+        if dst.can_write_eof():
+            dst.write_eof()
+    except (ConnectionError, OSError):
+        pass
+
+
+async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    upstream = None
+    try:
+        req = await asyncio.wait_for(read_request(reader, writer), HANDSHAKE_S)
+        if req is None:
+            return
+        code, upstream = await dial(*req)
+        reply(writer, code)
+        await writer.drain()
+        if upstream is None:
+            return
+        await asyncio.gather(pipe(reader, upstream[1]), pipe(upstream[0], writer))
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
+        pass
+    finally:
+        for w in (writer, upstream[1] if upstream else None):
+            if w is not None:
+                w.close()
+
+
+async def serve(port: int, port_file: str | None) -> None:
+    server = await asyncio.start_server(handle, "127.0.0.1", port)
+    bound = server.sockets[0].getsockname()[1]
+    if port_file:
+        # Written only once the socket listens, so the caller never races a half-started server.
+        tmp = f"{port_file}.tmp"
+        with open(tmp, "w") as f:
+            f.write(f"{bound}\n")
+        os.replace(tmp, port_file)
+    print(f"offbox-person-socks: listening on 127.0.0.1:{bound}", file=sys.stderr, flush=True)
+    async with server:
+        await server.serve_forever()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--port", type=int, default=0, help="0 picks a free port")
+    ap.add_argument("--port-file", help="write the bound port here once listening")
+    a = ap.parse_args()
+    try:
+        asyncio.run(serve(a.port, a.port_file))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

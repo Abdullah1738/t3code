@@ -299,7 +299,8 @@ def put_file(box_id: str, remote_path: str, content: bytes, mode: str = "600") -
                 f"{shlex.quote(remote_path)}", input=content, check=True)
 
 
-def tunnel(box_id: str, remote_port: int, local_port: int) -> subprocess.Popen:
+def tunnel(box_id: str, remote_port: int, local_port: int, reverse: bool = False) -> subprocess.Popen:
+    fwd = (["-R", f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}"] if reverse
+           else ["-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}"])
     return subprocess.Popen(ssh_base(box_id) + ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "ControlMaster=no",
-                                                "-o", "ControlPath=none",
-                                                "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}", box_id])
+                                                "-o", "ControlPath=none", *fwd, box_id])
