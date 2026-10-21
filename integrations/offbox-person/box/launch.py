@@ -1,6 +1,6 @@
-"""Long-lived CloakBrowser for one authbox person. Started detached under xvfb-run; CDP on 127.0.0.1:9242.
+"""Long-lived CloakBrowser for one offbox-person person. Started detached under xvfb-run; CDP on 127.0.0.1:9242.
 
-The profile dir is the only place her logins and cookies persist. `~/authbox/config.json` may hold a
+The profile dir is the only place her logins and cookies persist. `~/person/config.json` may hold a
 {"proxy": "..."} setting that the owner chooses; it is absent by default.
 """
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 from cloakbrowser import launch_persistent_context
 
-home = Path.home() / "authbox"
+home = Path.home() / "person"
 cfg_path = home / "config.json"
 cfg = json.loads(cfg_path.read_text() or "{}") if cfg_path.exists() else {}
 

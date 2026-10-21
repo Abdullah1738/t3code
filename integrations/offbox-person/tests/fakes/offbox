@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake offbox for authbox tests. Logs every call, runs `ssh` commands against a local fake box home,
+"""Fake offbox for offbox-person tests. Logs every call, runs `ssh` commands against a local fake box home,
 and serves a fake CDP endpoint for `ports`. `run`/`release`/`save`/`keep` do nothing."""
 
 import json

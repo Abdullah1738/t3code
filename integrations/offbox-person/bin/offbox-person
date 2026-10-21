@@ -1,29 +1,29 @@
 #!/usr/bin/env zsh
-# authbox: one offbox lease per person for logins, sign-ups and cookies that must never touch
+# person: one offbox lease per person for logins, sign-ups and cookies that must never touch
 # the owner's Mac or data. Only a tiny state file lives on the Mac. The browser profile, files,
-# secrets and anything built or run for the person live on her box under ~/authbox.
+# secrets and anything built or run for the person live on her box under ~/person.
 set -eu
 
-AUTHBOX_HOME=${0:A:h:h}
-ROOT=${AUTHBOX_ROOT:-$HOME/.local/share/authbox}
-OFFBOX=${AUTHBOX_OFFBOX:-offbox}
-AGENT_BROWSER=${AUTHBOX_AGENT_BROWSER:-agent-browser}
+OFFBOX_PERSON_HOME=${0:A:h:h}
+ROOT=${OFFBOX_PERSON_ROOT:-$HOME/.local/share/offbox-person}
+OFFBOX=${OFFBOX_PERSON_OFFBOX:-offbox}
+AGENT_BROWSER=${OFFBOX_PERSON_AGENT_BROWSER:-agent-browser}
 CDP_REMOTE=9242
 
-die()  { print -u2 -- "authbox: $*"; exit 1; }
-note() { print -u2 -- "authbox: $*"; }
+die()  { print -u2 -- "person: $*"; exit 1; }
+note() { print -u2 -- "person: $*"; }
 
 usage() {
   cat >&2 <<'EOF'
 usage:
-  authbox up <person>                          start/ensure box, CDP launcher and tunnel; prints local CDP port
-  authbox down <person>                        close tunnel, release the lease
-  authbox browser <person> -- <agent-browser args>
-  authbox run <person> -- <cmd...>             runs in ~/authbox/work on the box
-  authbox secret set|get|rm <person> <name>    set reads the value from stdin
-  authbox secret list <person>
-  authbox save <person>                        save a default base and pin it
-  authbox list
+  offbox-person up <person>                          start/ensure box, CDP launcher and tunnel; prints local CDP port
+  offbox-person down <person>                        close tunnel, release the lease
+  offbox-person browser <person> -- <agent-browser args>
+  offbox-person run <person> -- <cmd...>             runs in ~/person/work on the box
+  offbox-person secret set|get|rm <person> <name>    set reads the value from stdin
+  offbox-person secret list <person>
+  offbox-person save <person>                        save a default base and pin it
+  offbox-person list
 EOF
   exit 2
 }
@@ -54,7 +54,7 @@ tunnel_alive() { [[ -n $TUNNEL_PID ]] && kill -0 "$TUNNEL_PID" 2>/dev/null; }
 off() {
   local p=$1; shift
   mkdir -p -- "$(person_dir "$p")"
-  (cd -- "$(person_dir "$p")" && OFFBOX_THREAD="authbox:$p" "$OFFBOX" "$@")
+  (cd -- "$(person_dir "$p")" && OFFBOX_THREAD="person:$p" "$OFFBOX" "$@")
 }
 
 # --no-fallback and --remote: a failed box call must never re-run on this Mac, where her data
@@ -83,18 +83,18 @@ cmd_up() {
 
   note "$p: preparing box"
   local setup_b64
-  setup_b64=$(base64 < "$AUTHBOX_HOME/box/setup.sh" | tr -d '\n')
+  setup_b64=$(base64 < "$OFFBOX_PERSON_HOME/box/setup.sh" | tr -d '\n')
   box_run "$p" "printf %s '$setup_b64' | base64 -d | bash" >&2 \
     || die "box setup failed for $p"
 
-  box_ssh "$p" 'mkdir -p ~/authbox && cat > ~/authbox/launch.py' < "$AUTHBOX_HOME/box/launch.py" >&2
+  box_ssh "$p" 'mkdir -p ~/person && cat > ~/person/launch.py' < "$OFFBOX_PERSON_HOME/box/launch.py" >&2
   local cfg="$(person_dir "$p")/config.json"
   { if [[ -f $cfg ]]; then cat -- "$cfg"; else print -- '{}'; fi; } \
-    | box_ssh "$p" 'cat > ~/authbox/config.json && chmod 600 ~/authbox/config.json' >&2
+    | box_ssh "$p" 'cat > ~/person/config.json && chmod 600 ~/person/config.json' >&2
 
   # The launcher survives the end of this offbox run: setsid + nohup + all fds redirected.
-  local start='mkdir -p ~/authbox/work; if ! curl -fsS http://127.0.0.1:9242/json/version >/dev/null 2>&1; then setsid nohup xvfb-run -a ~/authbox/venv/bin/python ~/authbox/launch.py >>~/authbox/launcher.log 2>&1 </dev/null & fi; for i in $(seq 1 60); do curl -fsS http://127.0.0.1:9242/json/version >/dev/null 2>&1 && exit 0; sleep 2; done; tail -20 ~/authbox/launcher.log >&2; exit 1'
-  box_run "$p" "$start" >&2 || die "CDP launcher did not come up on the box (~/authbox/launcher.log there)"
+  local start='mkdir -p ~/person/work; if ! curl -fsS http://127.0.0.1:9242/json/version >/dev/null 2>&1; then setsid nohup xvfb-run -a ~/person/venv/bin/python ~/person/launch.py >>~/person/launcher.log 2>&1 </dev/null & fi; for i in $(seq 1 60); do curl -fsS http://127.0.0.1:9242/json/version >/dev/null 2>&1 && exit 0; sleep 2; done; tail -20 ~/person/launcher.log >&2; exit 1'
+  box_run "$p" "$start" >&2 || die "CDP launcher did not come up on the box (~/person/launcher.log there)"
 
   if ! tunnel_alive || [[ -z $LOCAL_PORT ]]; then
     LOCAL_PORT=$(free_port)
@@ -102,7 +102,7 @@ cmd_up() {
     note "$p: tunnel 127.0.0.1:$LOCAL_PORT -> box:$CDP_REMOTE"
     cd -- "$(person_dir "$p")"
     # A live `offbox ports` process touches the lease and holds the auto-stop TTL, so this is what keeps the box up.
-    OFFBOX_THREAD="authbox:$p" nohup "$OFFBOX" ports "$CDP_REMOTE" --local "$LOCAL_PORT" >>"$tlog" 2>&1 </dev/null &
+    OFFBOX_THREAD="person:$p" nohup "$OFFBOX" ports "$CDP_REMOTE" --local "$LOCAL_PORT" >>"$tlog" 2>&1 </dev/null &
     TUNNEL_PID=$!
     save_state "$p" "$TUNNEL_PID" "$LOCAL_PORT"
   fi
@@ -129,7 +129,7 @@ cmd_browser() {
   check_person "$p"
   local port
   port=$(cmd_up "$p" 2>/dev/null) || die "could not bring up $p's box"
-  exec "$AGENT_BROWSER" --session "authbox-$p" --cdp "$port" --input-mode human "$@"
+  exec "$AGENT_BROWSER" --session "person-$p" --cdp "$port" --input-mode human "$@"
 }
 
 cmd_run() {
@@ -137,13 +137,13 @@ cmd_run() {
   check_person "$p"
   (( $# )) || usage
   cmd_up "$p" >/dev/null
-  box_run "$p" "mkdir -p ~/authbox/work && cd ~/authbox/work && $*"
+  box_run "$p" "mkdir -p ~/person/work && cd ~/person/work && $*"
 }
 
 cmd_secret() {
   local action=$1 p=$2 name=${3:-}
   check_person "$p"
-  local dir='~/authbox/secrets'
+  local dir='~/person/secrets'
   if [[ $action != list ]]; then
     [[ $name =~ '^[A-Za-z0-9._-]{1,64}$' ]] || die "secret name must match [A-Za-z0-9._-]{1,64}"
   fi
@@ -166,7 +166,7 @@ cmd_save() {
   local p=$1
   check_person "$p"
   cmd_up "$p" >/dev/null
-  off "$p" save --name authbox --default --note "authbox $p" >&2
+  off "$p" save --name person --default --note "person box $p" >&2
   off "$p" keep --days 3650 >&2
 }
 
