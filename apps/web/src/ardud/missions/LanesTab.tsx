@@ -4,6 +4,7 @@ import { Link } from "@tanstack/react-router";
 import type { Lane, SubMission, SubMissionId, ThreadId } from "@t3tools/contracts";
 import {
   ageView,
+  attachedThreadGroups,
   laneActions,
   laneBoard,
   laneRows,
@@ -12,6 +13,7 @@ import {
   type LaneActionId,
   type LaneGrouping,
   type LanePanel,
+  type AttachedThreadRow,
   type LaneRow,
   type MissionOverviewSnapshot,
 } from "@t3tools/client-runtime/ardud/missions";
@@ -114,7 +116,64 @@ export function LanesTab(props: { overview: MissionOverviewSnapshot; nowMs: numb
           showState={grouping !== "state"}
         />
       ))}
+      {/* ardud missions: crw-threads */}
+      <ReviewsSection overview={props.overview} nowMs={props.nowMs} />
     </div>
+  );
+}
+
+const CLOSED_SHOWN = 5;
+
+/** Threads crw runs for the mission's PRs; they live here, not in the thread list. */
+function ReviewsSection(props: { overview: MissionOverviewSnapshot; nowMs: number }) {
+  const groups = attachedThreadGroups(props.overview.attachedThreads);
+  const [all, setAll] = useState(false);
+  if (groups.open.length === 0 && groups.closed.length === 0) return null;
+  const closed = all ? groups.closed : groups.closed.slice(0, CLOSED_SHOWN);
+  return (
+    <MissionSection title="Reviews" caption={groups.open.length}>
+      <ul className="flex flex-col">
+        {[...groups.open, ...closed].map((row) => (
+          <ReviewThreadItem key={row.threadId} row={row} nowMs={props.nowMs} />
+        ))}
+      </ul>
+      {all ? null : (
+        <FoldRow hidden={groups.closed.length - closed.length} onShow={() => setAll(true)} />
+      )}
+    </MissionSection>
+  );
+}
+
+function ReviewThreadItem(props: { row: AttachedThreadRow; nowMs: number }) {
+  const environmentId = usePrimaryEnvironmentId();
+  const { row } = props;
+  const body = (
+    <>
+      <span className="truncate font-medium">{row.title}</span>
+      <span className="text-xs text-(--m-muted) tabular-nums">
+        {ageView(row.updatedAt, props.nowMs)?.label}
+      </span>
+    </>
+  );
+  const rowClass =
+    "flex min-w-0 items-baseline justify-between gap-3.5 rounded-xl px-1 py-2.75 text-sm";
+  return (
+    <li className={DESK_ROW}>
+      {environmentId ? (
+        <Link
+          to="/$environmentId/$threadId"
+          params={{ environmentId, threadId: row.threadId }}
+          className={cn(
+            rowClass,
+            "outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset",
+          )}
+        >
+          {body}
+        </Link>
+      ) : (
+        <span className={rowClass}>{body}</span>
+      )}
+    </li>
   );
 }
 
