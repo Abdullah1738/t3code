@@ -42,6 +42,16 @@ under `~/.config/spectrum-bridge/`.
   `@mentions`, URLs and code spans are left untouched. A message or card left
   empty is cancelled and logged as `outbound-skipped`/`emptyAfterSanitize`
   instead of sending an empty bubble.
+- A send the provider fails transiently is retried under the same idempotency
+  id, backing off from 10 seconds to every 5 minutes, for up to 24 hours from
+  its first attempt. A text reply that fails once is resent without its thread
+  target (SMS refuses threaded replies) under its own id, and stays unthreaded.
+  When sends keep failing for 10 minutes, one Telegram alert goes out through
+  the telegram bridge, and one more when they work again. Images and app cards
+  iMessage refuses, or still can't send after 10 minutes, are sent to Telegram
+  instead (the card's HTML file when it is published here, otherwise its link)
+  and their row moves to state `fallback`. Secure form links never leave
+  iMessage.
 - Questions (OpenCode forms) and approvals raised in the active chat, or by
   any running subagent below it at any depth, are sent into the conversation.
   This is the only place they are asked: OpenChamber and the telegram bridge

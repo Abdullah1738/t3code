@@ -17,6 +17,7 @@ import { Router } from "./router.ts";
 import { sweepSecrets } from "./secrets.ts";
 import { Store } from "./store.ts";
 import { transcribe } from "./stt.ts";
+import { socketPost, telegramOutlet } from "./telegram-fallback.ts";
 import { createAttachmentRecovery } from "./local-attachments.ts";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -185,9 +186,16 @@ async function main(): Promise<void> {
       ...(appsUrl ? { appsUrl } : {}),
       appsRoot: config.appsRoot,
     }) });
+  // Outage alerts and the Telegram copy of stuck images and cards go through the telegram bridge.
+  const outlet = telegramOutlet({
+    post: socketPost(telegramBridgeSocket), appsRoot: config.appsRoot,
+    appsUrl: () => store.get<{ port: number; url: string } | null>("appsPublished")?.url,
+    blob: sha256 => store.getBlob(sha256),
+  });
   const delivery = new Delivery(store, photon, { projectScope, chatGuid: () => chatGuid,
     beforeSend: async item => router?.beforeSend(item) ?? "send",
-    enabled: () => ready() && !controlsPending && !stopping, log });
+    enabled: () => ready() && !controlsPending && !stopping, log,
+    ...(config.enabled ? outlet : {}) });
   delivery.recover();
 
   async function receive(): Promise<void> {
