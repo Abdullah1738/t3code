@@ -1,7 +1,9 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import type { BatchStats, ScribeCandidate } from "./batch.ts";
@@ -111,6 +113,21 @@ export interface ReportRecord {
   readonly text: string;
   readonly createdAt: string;
 }
+
+/** A saved report without its text: the opening lines and the length stand in. */
+export interface ReportSummary {
+  readonly reportId: string;
+  readonly kind: ReportKind;
+  readonly coversFrom: string;
+  readonly coversTo: string;
+  readonly createdAt: string;
+  /** Characters in the whole text. */
+  readonly size: number;
+  /** The first `REPORT_HEAD_CHARS` characters, enough for the heading. */
+  readonly head: string;
+}
+
+export const REPORT_HEAD_CHARS = 400;
 
 /** What `ingest` writes beside core's records, in the same transaction. */
 export interface BatchWrite {
@@ -245,6 +262,23 @@ export class ScribeStore extends Context.Service<
       toIso: string,
     ) => Effect.Effect<ReadonlyArray<ReportRecord>, ScribeStoreError>;
     readonly saveReport: (report: ReportRecord) => Effect.Effect<void, ScribeStoreError>;
+    /** Newest first by the end of the window, without the text; `total` counts every match. */
+    readonly listReports: (
+      missionId: string,
+      kinds: ReadonlyArray<ReportKind>,
+      limit: number,
+    ) => Effect.Effect<
+      { readonly rows: ReadonlyArray<ReportSummary>; readonly total: number },
+      ScribeStoreError
+    >;
+    /** One report's text, cut to `maxChars`; null when the mission has no such report. */
+    readonly reportText: (
+      missionId: string,
+      reportId: string,
+      maxChars: number,
+    ) => Effect.Effect<{ readonly text: string; readonly size: number } | null, ScribeStoreError>;
+    /** Mission ids, published after each saved report. */
+    readonly reportSaves: Effect.Effect<PubSub.Subscription<string>, never, Scope.Scope>;
     /** Settled turn items of one thread in an inclusive ordinal range (read-only). */
     readonly transcript: (
       threadId: string,
@@ -271,6 +305,7 @@ const make = Effect.gen(function* () {
   yield* Effect.forEach(DDL, (statement) => sql.unsafe(statement), { discard: true }).pipe(
     Effect.mapError(fail("create tables")),
   );
+  const saves = yield* PubSub.unbounded<string>();
 
   const cursor = (missionId: string, threadId: string) =>
     sql<CursorRow>`
@@ -432,7 +467,59 @@ const make = Effect.gen(function* () {
         created_at: report.createdAt,
       })}
       ON CONFLICT (report_id) DO NOTHING
-    `.pipe(Effect.asVoid, Effect.mapError(fail("save report")));
+    `.pipe(
+      Effect.asVoid,
+      Effect.mapError(fail("save report")),
+      Effect.tap(() => PubSub.publish(saves, report.missionId)),
+    );
+
+  const listReports = Effect.fn("ScribeStore.listReports")(
+    function* (missionId: string, kinds: ReadonlyArray<ReportKind>, limit: number) {
+      if (kinds.length === 0) return { rows: [], total: 0 };
+      const where = sql.and([sql`mission_id = ${missionId}`, sql.in("kind", kinds)]);
+      const rows = yield* sql<{
+        readonly report_id: string;
+        readonly kind: string;
+        readonly covers_from: string;
+        readonly covers_to: string;
+        readonly created_at: string;
+        readonly size: number;
+        readonly head: string;
+      }>`
+        SELECT report_id, kind, covers_from, covers_to, created_at,
+          length(text) AS size, substr(text, 1, ${REPORT_HEAD_CHARS}) AS head
+        FROM ardud_mission_scribe_report
+        WHERE ${where}
+        ORDER BY covers_to DESC, created_at DESC LIMIT ${limit}
+      `;
+      const counted = yield* sql<{ readonly total: number }>`
+        SELECT count(*) AS total FROM ardud_mission_scribe_report WHERE ${where}
+      `;
+      return {
+        rows: rows.map((row): ReportSummary => ({
+          reportId: row.report_id,
+          kind: row.kind === "daily" ? "daily" : "update",
+          coversFrom: row.covers_from,
+          coversTo: row.covers_to,
+          createdAt: row.created_at,
+          size: Number(row.size),
+          head: row.head,
+        })),
+        total: Number(counted[0]?.total ?? 0),
+      };
+    },
+    Effect.mapError(fail("list reports")),
+  );
+
+  const reportText = (missionId: string, reportId: string, maxChars: number) =>
+    sql<{ readonly text: string; readonly size: number }>`
+      SELECT substr(text, 1, ${maxChars}) AS text, length(text) AS size
+      FROM ardud_mission_scribe_report
+      WHERE mission_id = ${missionId} AND report_id = ${reportId}
+    `.pipe(
+      Effect.map((rows) => (rows[0] ? { text: rows[0].text, size: Number(rows[0].size) } : null)),
+      Effect.mapError(fail("read report text")),
+    );
 
   const transcript = (threadId: string, fromEvent: number, toEvent: number) =>
     sql<ItemRow>`
@@ -486,6 +573,9 @@ const make = Effect.gen(function* () {
     lastReport,
     reportsBetween,
     saveReport,
+    listReports,
+    reportText,
+    reportSaves: PubSub.subscribe(saves),
     transcript,
     pullRequests,
     startCursor,

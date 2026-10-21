@@ -81,7 +81,8 @@ export const viewsWiringLayer = Layer.effectDiscard(
 
 /**
  * The views track: service, own tables and the wiring. Needs MissionService,
- * MissionStore, the suggestion applier registry and ServerConfig.
+ * MissionStore, ScribeStore (report sections), the suggestion applier
+ * registry and ServerConfig.
  */
 export const ViewsLive = viewsWiringLayer.pipe(
   Layer.provideMerge(ViewService.layer),

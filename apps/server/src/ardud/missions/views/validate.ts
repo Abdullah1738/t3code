@@ -10,6 +10,8 @@ import {
   VIEW_HARD_LIMITS,
   VIEW_NODE_TAGS,
   VIEW_PATHS,
+  VIEW_QUERY_FILTERS,
+  VIEW_QUERY_SORTS,
   VIEW_REF_ROW_PATHS,
   VIEW_SECTION_PATHS,
   VIEW_TABLE_CELL_SLOT,
@@ -169,6 +171,18 @@ const walkNode = (
       if (node.review === "per-asset" && rules.reviews !== true) {
         issues.add(`${path}.review`, "node-not-allowed", "per-asset review needs an ask card");
       }
+      return;
+    case "collapsible":
+      if (node.title === null && node.label === undefined) {
+        issues.add(`${path}.title`, "shape", "a collapsible needs a title binding or a label");
+      }
+      if (node.title !== null) {
+        checkBind(issues, rules.binder, node.title, "collapsibleTitle", `${path}.title`);
+      }
+      node.meta.forEach((bind, index) =>
+        checkBind(issues, rules.binder, bind, "collapsibleMeta", `${path}.meta[${index}]`),
+      );
+      checkBind(issues, rules.binder, node.body, "collapsibleBody", `${path}.body`);
       return;
     case "label":
     case "draft":
@@ -399,9 +413,10 @@ const SECTION_NODES: ReadonlySet<ViewNodeTag> = new Set([
   "group",
   "table",
   "meter",
+  "collapsible",
 ]);
 
-/** Slots read per row (list and table cells); the rest bind row.count / row.total. */
+/** Slots read per row (list rows, table cells, collapsibles); the rest bind row.count / row.total. */
 const ROW_SLOTS: ReadonlySet<ViewBindSlot> = new Set([
   "listTitle",
   "listMeta",
@@ -412,26 +427,13 @@ const ROW_SLOTS: ReadonlySet<ViewBindSlot> = new Set([
   "cellPerson",
   "cellLink",
   "cellCount",
+  "collapsibleTitle",
+  "collapsibleMeta",
+  "collapsibleBody",
 ]);
 
-/** Query filters each record kind can take. */
-const WHERE_KINDS = {
-  subMissionId: ["work-item", "note", "approval", "draft", "ask", "milestone", "call"],
-  laneId: ["work-item", "note"],
-  status: ["approval", "draft", "ask", "milestone", "sub-mission"],
-  stage: ["work-item"],
-  workKind: ["work-item"],
-  noteType: ["note"],
-  approvalKind: ["approval"],
-  channel: ["draft"],
-  flag: ["approval", "draft"],
-  requestedBy: ["approval", "draft"],
-} as const satisfies Record<string, ReadonlyArray<ViewQueryKind>>;
-
-const SORT_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = {
-  rank: ["sub-mission"],
-  due: ["milestone"],
-};
+const WHERE_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = VIEW_QUERY_FILTERS;
+const SORT_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = VIEW_QUERY_SORTS;
 
 const sectionBinder =
   (rowPaths: PathTable): Binder =>
@@ -466,8 +468,8 @@ export const checkSection = (
     rowPaths = VIEW_PATHS[query.kind];
     for (const [filter, kinds] of Object.entries(WHERE_KINDS)) {
       if (
-        query.where?.[filter as keyof typeof WHERE_KINDS] !== undefined &&
-        !(kinds as ReadonlyArray<string>).includes(query.kind)
+        query.where?.[filter as keyof typeof VIEW_QUERY_FILTERS] !== undefined &&
+        !kinds.includes(query.kind)
       ) {
         issues.add(`source.query.where.${filter}`, "field", `${query.kind} rows have no ${filter}`);
       }

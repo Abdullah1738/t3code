@@ -4,11 +4,13 @@ import * as Layer from "effect/Layer";
 
 import * as ServerConfig from "../../../config.ts";
 import { harness } from "../asks/AsksService.testkit.ts";
+import * as ScribeStore from "../scribe/ScribeStore.ts";
 import { ViewsLive } from "./layer.ts";
 
 /** The views track over a fresh database and a throwaway T3 home per test. */
 export const viewsLayer = () =>
   ViewsLive.pipe(
+    Layer.provideMerge(ScribeStore.layer),
     Layer.provideMerge(harness().layer),
     Layer.provideMerge(
       ServerConfig.layerTest(process.cwd(), { prefix: "t3-views-" }).pipe(

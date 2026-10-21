@@ -60,7 +60,7 @@ const tool = <Name extends string, P extends Schema.Constraint, S extends Schema
 
 const ViewsTool = tool(
   "mission_views",
-  "A mission's card templates, sections and layout (every section entry: built-in, tab or custom, with region, order, hidden and title), the starter layout new missions start from, items waiting on the owner and whether the pinned strip shows. catalog:true adds the node catalog: node signatures, bindable paths per record kind, the action table, limits and the built-in templates.",
+  "A mission's card templates, sections and layout (every section entry: built-in, tab or custom, with region, order, hidden and title), the starter layout new missions start from, items waiting on the owner and whether the pinned strip shows. catalog:true adds the node catalog: node signatures, bindable paths per record kind (report rows included), which query filters and sorts each kind takes, the action table, limits and the built-in templates.",
   Schema.Struct({ missionId: MissionId, catalog: Schema.optionalKey(Schema.Boolean) }),
   Schema.Struct({ views: MissionViewsSnapshot, catalog: Schema.NullOr(ViewCatalog) }),
 );
@@ -88,7 +88,7 @@ const TemplateTool = tool(
 
 const SectionTool = tool(
   "mission_view_section",
-  "Owner or master. Place a section (query or pinned refs, rows rendered by list nodes) or update one by sectionId or key. A new section joins the mission layout in region (default main) at index; passing region or index on an update moves it.",
+  'Owner or master. Place a section (query or pinned refs, rows rendered by list, table or collapsible nodes) or update one by sectionId or key. A new section joins the mission layout in region (default main) at index; passing region or index on an update moves it. Query kind "report" lists the scribe\'s saved reports newest first (where.reportKind: daily|update); rows bind row.title, row.period, row.size, row.kind, row.coversTo, and row.text only in a collapsible body, which loads the full report when opened. Example, latest daily report folded: {key:"daily-report", title:"Daily report", source:{_tag:"query", query:{kind:"report", where:{reportKind:["daily"]}, sort:"created-desc", limit:1}}, body:[{_tag:"collapsible", title:"row.title", meta:["row.period","row.size"], body:"row.text", format:"markdown", open:"none"}]}.',
   PlaceViewSectionInput,
   MissionMutationResult,
 );

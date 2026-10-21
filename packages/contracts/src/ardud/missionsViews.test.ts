@@ -8,6 +8,7 @@ import {
   STOCK_VIEW_TEMPLATES,
   ViewBind,
   ViewNode,
+  ViewSectionDefinition,
   ViewStarterLayout,
   ViewTemplate,
   ViewTemplateDefinition,
@@ -15,10 +16,13 @@ import {
   viewPinnedStrip,
   viewMatchesOverlap,
   VIEW_ACTIONS,
+  VIEW_CATALOG,
+  VIEW_PATHS,
   viewActionAllowed,
 } from "./missionsViews.ts";
 
 const decodeNode = Schema.decodeUnknownExit(ViewNode);
+const decodeSection = Schema.decodeUnknownExit(ViewSectionDefinition);
 const decodeDefinition = Schema.decodeUnknownExit(ViewTemplateDefinition);
 const decodeStarter = Schema.decodeUnknownExit(ViewStarterLayout);
 const decodeTemplate = Schema.decodeUnknownSync(ViewTemplate);
@@ -102,6 +106,35 @@ describe("mission views catalog", () => {
     expect(VIEW_ACTIONS.send.label).toBe("Approve");
     expect(viewActionAllowed("answer", "approval")).toBe(false);
     expect(viewActionAllowed("discuss", "knock")).toBe(true);
+  });
+
+  it("decodes collapsible nodes and report sections", () => {
+    const folded = {
+      _tag: "collapsible",
+      title: "row.title",
+      meta: ["row.period", "row.size"],
+      body: "row.text",
+      format: "markdown",
+      open: "none",
+    };
+    expect(decodeNode(folded)._tag).toBe("Success");
+    expect(decodeNode({ ...folded, title: null, label: "Notes" })._tag).toBe("Success");
+    expect(decodeNode({ ...folded, format: "html" })._tag).toBe("Failure");
+    expect(decodeNode({ ...folded, meta: ["row.a", "row.b", "row.c", "row.d"] })._tag).toBe(
+      "Failure",
+    );
+    const section = (where: unknown) =>
+      decodeSection({
+        key: "updates",
+        title: "Updates",
+        source: { _tag: "query", query: { kind: "report", where, sort: "created-desc", limit: 8 } },
+        body: [folded],
+      })._tag;
+    expect(section({ reportKind: ["update"] })).toBe("Success");
+    expect(section({ reportKind: ["weekly"] })).toBe("Failure");
+    expect(VIEW_PATHS.report.text).toBe("longtext");
+    expect(VIEW_CATALOG.queries?.filters.reportKind).toEqual(["report"]);
+    expect(VIEW_CATALOG.nodes.map((node) => node.tag)).toContain("collapsible");
   });
 });
 
