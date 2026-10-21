@@ -106,7 +106,7 @@ class AccountOrderConfirmationTest(unittest.TestCase):
 
 
 class PurchaseReportingTest(unittest.TestCase):
-    def purchase(self, payment, listed=True, track_error=None):
+    def purchase(self, payment, listed=True, track_error=None, order='123'):
         flow = Mock()
         flow.flow_id = 'synthetic-flow'
         flow.prepare.return_value = {'payable_minor': 25790}
@@ -122,12 +122,23 @@ class PurchaseReportingTest(unittest.TestCase):
         with patch.object(cli, 'input_items', return_value=[{'item_id': '10000000-0000-4000-8000-000000000002', 'quantity': 1}]), \
                 patch.object(cli.talabat.shared, 'verticals_key', return_value='0123456789abcdef'), \
                 patch('commerce_talabat.TalabatFlow', return_value=flow), \
-                patch.object(cli.journal, 'inspect', return_value={'order_id': '123'}), \
+                patch.object(cli.journal, 'inspect', return_value={'order_id': order}), \
                 patch.object(cli.journal, 'complete') as complete, \
                 patch.object(cli, 'register_tracking', return_value={'registered': True}) as register, \
                 contextlib.redirect_stdout(io.StringIO()):
             result = cli.purchase_talabat(args)
         return result, complete, register
+
+    def test_orderless_place_does_not_suggest_unavailable_payment_polling(self):
+        result, complete, register = self.purchase('SUBMISSION_UNKNOWN', order=None)
+        self.assertFalse(result['ok'])
+        self.assertFalse(result['purchase_confirmed'])
+        self.assertEqual(result['error'], 'TALABAT_PLACE_NOT_CONFIRMED')
+        self.assertIn('talabat-search orders', result['next_action'])
+        self.assertNotIn('recover-payment', result['next_action'])
+        self.assertIn('Do not place another order', result['next_action'])
+        complete.assert_not_called()
+        register.assert_not_called()
 
     def test_declined_or_unknown_payment_is_explicit_nonzero_failure(self):
         for state in ('PAYMENT_ERROR_REPORTED', 'PAYMENT_UNKNOWN', 'PAYMENT_PENDING'):

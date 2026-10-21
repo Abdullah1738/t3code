@@ -301,7 +301,7 @@ class ResponseTests(unittest.TestCase):
     def test_duplicate_error_never_confirms_or_retries(self):
         body = {'duplicateOrderError':{'description':'private',
                 'actions':[{'name':'Retry', 'actionType':'private-action'}]}}
-        safe = self.assert_stopped(p.parse_response(400, body), 'SUBMISSION_UNKNOWN')
+        safe = self.assert_stopped(p.parse_response(400, body), 'REJECTED_DUPLICATE')
         self.assertEqual(safe['reason'], 'DUPLICATE_ORDER_ERROR_NO_RETRY')
         self.assertFalse(safe['order_id_received'])
 

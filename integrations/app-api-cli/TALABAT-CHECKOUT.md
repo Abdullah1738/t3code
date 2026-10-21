@@ -1,5 +1,22 @@
 # Talabat checkout — contract research and historical observations
 
+## Duplicate-guard update (21 October 2026)
+
+The current CLI classifies a definitive orderless HTTP400 duplicate refusal as
+`REJECTED_DUPLICATE`. Restaurant flows can close it with authenticated complete
+history and exact cart/item evidence, retaining all consumed sends. Manual read
+reconciliation: `commerce reconcile-order FLOW --close-duplicate`. A known later
+app purchase may be excluded only by exact order ID plus explicit independent
+placement evidence. See `COMMERCE-HTTP.md` for the full contract.
+
+The native request already has `allowDuplicateOrder`; default remains false.
+`--allow-duplicate-of ORDER_ID` enables it on a new explicitly authorized flow
+only after same-account/branch and different base-item verification. Earlier
+hard-coded-false statements below describe the historical contract. The server's
+duplicate key and window are not known. A new cart with an iced latte was rejected
+after a hot latte at the same branch, so different cart/item IDs do not suffice.
+The override has not been exercised in a paid live checkout.
+
 ## Current implementation (14 October 2026)
 
 The disabled-adapter and test-scope statements in the dated research below are

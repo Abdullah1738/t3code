@@ -266,12 +266,13 @@ class OwnerAttestationTests(unittest.TestCase):
         before = journal.inspect(self.flow)
         with sqlite3.connect(self.root / 'journal.sqlite') as db:
             db.execute('DROP TABLE owner_attestations')
+            db.execute('DROP TABLE duplicate_closures')
             db.execute('DROP INDEX active_account')
             db.execute(journal.SCHEMA_V1['active_account'])
             db.execute('PRAGMA user_version=1')
         self.assertEqual(journal.inspect(self.flow), before)
         with sqlite3.connect(self.root / 'journal.sqlite') as db:
-            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 3)
         with self.provider():
             self.close()
         self.assertEqual(journal.inspect(self.flow)['state'], 'OWNER_ATTESTED_UNCHARGED')

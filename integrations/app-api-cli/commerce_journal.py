@@ -71,6 +71,15 @@ SCHEMA = {**SCHEMA,
         attested_by TEXT NOT NULL, evidence TEXT NOT NULL, attested_at REAL NOT NULL,
         provider_evidence TEXT NOT NULL, evidence_hash TEXT NOT NULL)''',
 }
+SCHEMA_V2 = SCHEMA.copy()
+REJECTED_DUPLICATE = 'REJECTED_DUPLICATE'
+SCHEMA = {**SCHEMA,
+    'active_account': '''CREATE UNIQUE INDEX active_account
+        ON flows(app, account_hash) WHERE state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') ''',
+    'duplicate_closures': '''CREATE TABLE duplicate_closures (
+        flow_id TEXT PRIMARY KEY, closed_at REAL NOT NULL,
+        evidence TEXT NOT NULL, evidence_hash TEXT NOT NULL)''',
+}
 
 
 def _schema_matches(objects, expected):
@@ -150,14 +159,20 @@ def _db():
         if not objects and version == 0 and before.st_size == 0:
             for statement in SCHEMA.values():
                 db.execute(statement)
-            db.execute('PRAGMA user_version=2')
+            db.execute('PRAGMA user_version=3')
         elif version == 1 and any(_schema_matches(objects, expected) for expected in
                 (SCHEMA_V1, {**SCHEMA_V1, 'active_account': LEGACY_ACTIVE_ACCOUNT})):
             db.execute('DROP INDEX active_account')
             db.execute(SCHEMA['active_account'])
             db.execute(SCHEMA['owner_attestations'])
-            db.execute('PRAGMA user_version=2')
-        elif version != 2 or not _schema_matches(objects, SCHEMA):
+            db.execute(SCHEMA['duplicate_closures'])
+            db.execute('PRAGMA user_version=3')
+        elif version == 2 and _schema_matches(objects, SCHEMA_V2):
+            db.execute('DROP INDEX active_account')
+            db.execute(SCHEMA['active_account'])
+            db.execute(SCHEMA['duplicate_closures'])
+            db.execute('PRAGMA user_version=3')
+        elif version != 3 or not _schema_matches(objects, SCHEMA):
             fail('JOURNAL_SCHEMA_UNSUPPORTED')
         yield db
         db.execute('COMMIT')
@@ -316,6 +331,8 @@ def observe(flow_id, operation, *, outcome, evidence_hash, order_id=None):
             fail('JOURNAL_FLOW_RELEASED')
         if flow['state'] == OWNER_ATTESTED_UNCHARGED:
             fail('JOURNAL_FLOW_OWNER_ATTESTED_UNCHARGED')
+        if flow['state'] == REJECTED_DUPLICATE:
+            fail('JOURNAL_FLOW_REJECTED_DUPLICATE')
         if outcome == 'PREPARATION_FAILED':
             fail('JOURNAL_USE_PREPARATION_RELEASE')
         op = db.execute('SELECT * FROM operations WHERE flow_id=? AND name=?', (flow_id, operation)).fetchone()
@@ -545,6 +562,42 @@ def payment_reported(flow_id):
                                "AND outcome='PAYMENT_REPORTED_SUCCESS'", (flow_id,)).fetchone())
 
 
+def place_observed_at(flow_id):
+    with _db() as db:
+        _get(db, flow_id)
+        rows = list(db.execute('SELECT observed_at FROM observations WHERE flow_id=? AND operation=?',
+                               (flow_id, 'place')))
+        if len(rows) != 1:fail('DUPLICATE_PLACE_OBSERVATION_REQUIRED')
+        return rows[0][0]
+
+
+def close_rejected_duplicate(flow_id, *, evidence, expected_local):
+    """Trusted receipt/history review; keep consumed sends and reservation forever."""
+    evidence_hash = digest(evidence)
+    if (type(evidence) is not dict or evidence.get('history_complete') is not True
+            or evidence.get('matching_orders') != []):
+        fail('DUPLICATE_HISTORY_EVIDENCE_REQUIRED')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        ops = [dict(x) for x in db.execute('SELECT name,kind,state FROM operations WHERE flow_id=? ORDER BY created_at', (flow_id,))]
+        if (flow['app'] != 'talabat' or flow['state'] != 'FENCED' or flow['order_id'] is not None
+                or flow['reserved_minor'] != expected_local['reserved_minor']
+                or ops != expected_local['operations'] or sum(x['kind']=='place' for x in ops) != 1
+                or any(x['state'] != 'OBSERVED' or x['kind'] in ('payment','preauthorize','prepay') for x in ops)):
+            fail('DUPLICATE_LOCAL_EVIDENCE_CHANGED')
+        if db.execute("SELECT 1 FROM observations WHERE flow_id=? AND (order_id IS NOT NULL OR outcome IN "
+                      "('PAYMENT_REPORTED_SUCCESS','EXACT_ORDER_CONFIRMED','PREORDER_PAYMENT_CONFIRMED'))", (flow_id,)).fetchone():
+            fail('DUPLICATE_FINANCIAL_EVIDENCE_CONFLICT')
+        now = time.time()
+        db.execute('INSERT INTO duplicate_closures VALUES (?,?,?,?)',
+                   (flow_id, now, json.dumps(evidence, sort_keys=True), evidence_hash))
+        db.execute('UPDATE flows SET state=? WHERE id=?', (REJECTED_DUPLICATE, flow_id))
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,observed_at) VALUES (?,?,?,?,?)',
+                   (flow_id, 'place', REJECTED_DUPLICATE, evidence_hash, now))
+    return {'state':REJECTED_DUPLICATE, 'account_fence_lifted':True, 'evidence_hash':evidence_hash,
+            'retry_allowed':False, 'reservation_minor_retained':expected_local['reserved_minor']}
+
+
 def validate_owner_attestation(*, evidence, attested_by):
     if (attested_by != 'owner' or type(evidence) is not str or not evidence.strip()
             or len(evidence) > 4096 or any(ord(c) < 32 and c not in '\n\t' or ord(c) == 127 for c in evidence)):
@@ -613,6 +666,10 @@ def inspect(flow_id):
         if attestation is not None:
             result['owner_attestation'] = dict(attestation)
             result['owner_attestation']['provider_evidence'] = json.loads(attestation['provider_evidence'])
+        closure = db.execute('SELECT * FROM duplicate_closures WHERE flow_id=?', (flow_id,)).fetchone()
+        if closure is not None:
+            result['duplicate_closure'] = dict(closure)
+            result['duplicate_closure']['evidence'] = json.loads(closure['evidence'])
     return result
 
 
@@ -832,7 +889,7 @@ def require_account_available(app, account_hash, *, flow_id=None):
     if flow_id is not None:_flow(flow_id)
     with _db() as db:
         active=db.execute("SELECT id,state FROM flows WHERE app=? AND account_hash=? "
-                          "AND state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED')",
+                          "AND state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE')",
                           (app,account_hash)).fetchone()
         if active is not None and (active['id']!=flow_id or active['state']!='ACTIVE'):
             fail('JOURNAL_ACCOUNT_RECONCILIATION_REQUIRED')

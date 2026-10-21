@@ -65,7 +65,17 @@ def project_order(row):
     raw = row.get('status')
     if not isinstance(raw, str) or not re.fullmatch(r'[A-Za-z_ -]{1,64}', raw):
         raise http.TalabatError('ORDER_LIST_SCHEMA_CHANGED')
+    # Native delivery_date is timezone-qualified. Keep its native meaning: it is
+    # not an authoritative place timestamp and must not be used as one.
+    native_date = row.get('delivery_date')
+    dated = None
+    if type(native_date) is str and re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4} [A-Za-z0-9+:-]+', native_date):
+        try:dated = dt.datetime.strptime(native_date.rsplit(' ', 1)[0], '%Y-%m-%d %H:%M:%S %z').isoformat()
+        except ValueError:pass
+    branch = row.get('branch_id')
     return {'order': str(order), 'status': STAGES.get(raw, 'unknown'), 'raw_status': raw,
+            'branch_id':branch if type(branch) is int and branch > 0 else None,
+            'native_delivery_date':dated,
             'branch_name': _text(row.get('branch_name')), 'chain_name': _text(row.get('chain_name')),
             'source': 'native_order_list_api', 'eta': None, 'rider': None,
             'delivery_address': None, 'is_home': None, 'home_match_reason': 'detail_read_required'}

@@ -31,6 +31,7 @@ PREPARATION = {'create_cart', 'quote_initial', 'quote_selected',
 PLACE_PAIRS = {
     ('SUBMISSION_UNKNOWN', 'RESPONSE_MISSING_OR_MALFORMED'),
     ('SUBMISSION_UNKNOWN', 'DUPLICATE_ORDER_ERROR_NO_RETRY'),
+    ('REJECTED_DUPLICATE', 'DUPLICATE_ORDER_ERROR_NO_RETRY'),
     ('SUBMISSION_UNKNOWN', 'GENERIC_ERROR_NO_RETRY'),
     ('SUBMISSION_UNKNOWN', 'HTTP_STATUS_UNSUPPORTED_NO_RETRY'),
     ('SUBMISSION_UNKNOWN', 'PLACED_ORDER_IDENTITY_INVALID'),
@@ -127,6 +128,7 @@ class Receipt:
     adopted: tuple = ()
     # Allowlisted quote failure projection only, never a raw account response.
     diagnostic: dict | None = None
+    manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -186,13 +188,17 @@ def _wire(r):
                 payable_minor=r.payable_minor, review_sha256=r.review_sha256,
                 order_id=r.order_id, transaction_id=r.transaction_id, balance_amount=r.balance_amount,
                 payment_id=r.payment_id, metadata=r.metadata, context=_context_wire(r.context),
-                next_index=r.next_index, adopted=list(r.adopted), diagnostic=r.diagnostic)
+                next_index=r.next_index, adopted=list(r.adopted), diagnostic=r.diagnostic,
+                manifest_sha256=r.manifest_sha256)
 
 
 def _validate(b, r):
     _require(type(r) is Receipt)
     _require(type(r.operation) is str and type(r.state) is str)
     _require(r.reason is None or type(r.reason) is str)
+    if r.manifest_sha256 is not None:
+        _require(b.app=='talabat' and b.vertical=='restaurants' and r.operation=='create_cart'
+                 and r.state=='SUCCEEDED' and _hash(r.manifest_sha256), 'RECEIPT_MANIFEST_INVALID')
     if r.diagnostic is not None:
         _require(b.app == 'talabat' and r.operation in PREPARATION - {'create_cart'}
                  and r.state == 'PREPARATION_FAILED' and quote_diagnostics.valid(r.diagnostic)
@@ -253,6 +259,8 @@ def _validate(b, r):
     if r.operation == 'place':
         _require((r.state, r.reason) in PLACE_PAIRS and all(x is None for x in
                      (r.payment_id, r.metadata, r.context, r.next_index)))
+        if r.state == 'REJECTED_DUPLICATE':
+            _require(r.http_status == 400 and r.order_id is None and r.transaction_id is None)
         return
     _require(r.operation in {'payment', 'payment_status'} and (r.state, r.reason) in PAYMENT_PAIRS
              and r.order_id is not None and r.transaction_id is not None and r.balance_amount is None)
@@ -289,6 +297,7 @@ def _callback(b, record):
             keys = {'operation', 'state', 'reason', 'http_status'}
         elif operation == 'create_cart':
             keys = {'operation', 'state', 'http_status', 'cart_id', 'cart_binding'}
+            if 'manifest_sha256' in record:keys.add('manifest_sha256')
         else:
             keys = {'operation', 'state', 'http_status', 'cart_binding', 'currency', 'payable_minor', 'review_sha256'}
         _require(set(record) == keys, 'RECEIPT_CALLBACK_FIELDS_INVALID')
@@ -530,6 +539,7 @@ def _scan(fd):
         # Back-compat: receipts published before the adoption field exist.
         value.setdefault('adopted', [])
         value.setdefault('diagnostic', None)
+        value.setdefault('manifest_sha256', None)
         value['adopted'] = tuple(value['adopted'])
         _require(set(value) == set(_wire(Receipt('', ''))), 'RECEIPT_CORRUPT')
         if value['context'] is not None:

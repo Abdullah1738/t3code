@@ -631,7 +631,8 @@ def parse_quote(data, cart, home, body, selection, *, now=None):
                  time.monotonic() if now is None else now, instructions)
 
 
-def place_body(quote):
+def place_body(quote, *, allow_duplicate=False):
+    if type(allow_duplicate) is not bool:fail('DUPLICATE_OVERRIDE_INVALID')
     if type(quote) is not Quote or quote.selection is None:
         fail('SELECTED_CARD_QUOTE_REQUIRED')
     prepared = json.loads(quote.body)
@@ -640,7 +641,7 @@ def place_body(quote):
     event = json.loads(quote.selection.event)
     body = {k: prepared[k] for k in ('countryCode', 'paymentMethod', 'addTPayMethod', 'binNumber',
             'isMigrated', 'branchId', 'verticalId', 'selectedAddressId', 'addressV2', 'cardFingerPrint')}
-    body.update(allowDuplicateOrder=False, riderTipAmount=None, isCustomRiderTip=None,
+    body.update(allowDuplicateOrder=allow_duplicate, riderTipAmount=None, isCustomRiderTip=None,
                 saveRiderTipForLater=False, proSubscribeChecked=False, cardTokenId=event['card']['cardId'],
                 proPlanId=None, priorityLevel='', quickCheckout=False, flow=None,
                 deliveryInstructions=list(quote.instruction_ids), saveDeliveryInstructionsForLater=False)
@@ -1148,6 +1149,7 @@ class Checkout:
         except (KeyError, TypeError):
             fail('RESTAURANT_BRANCH_SCHEMA_INVALID')
         index = menu_choices.parse_menu(data)
+        self._menu_index = index
         for item in items:
             entry = index.get(item.item_id)
             if entry is None:
@@ -1206,8 +1208,10 @@ class Checkout:
                     branch_id=store.branch_id,items=items,choice_catalog=self._choice_catalog)
         except Exception:
             self._unknown_preparation('create_cart', result.status)
-        self._received({'operation': 'create_cart', 'state': 'SUCCEEDED', 'http_status': result.status,
-                        'cart_id': parsed.cart_id, 'cart_binding': hashlib.sha256(parsed.cart_id.encode()).hexdigest()})
+        receipt = {'operation': 'create_cart', 'state': 'SUCCEEDED', 'http_status': result.status,
+                   'cart_id': parsed.cart_id, 'cart_binding': hashlib.sha256(parsed.cart_id.encode()).hexdigest()}
+        if store.vertical=='restaurants':receipt['manifest_sha256']=restaurant.manifest_digest(store.branch_id,items)
+        self._received(receipt)
         self.cart = parsed
         self.restaurant_cart = restaurant_cart
         self._verticals_key = verticals_key
@@ -1288,7 +1292,7 @@ class Checkout:
         self.quote = parsed
         return self.quote
 
-    def submit_place(self, *, approved_amount_minor, approved_quote_digest):
+    def submit_place(self, *, approved_amount_minor, approved_quote_digest, allow_duplicate=False):
         if 'place' in self.consumed:
             fail('OPERATION_ALREADY_CONSUMED_NO_RETRY')
         quote = self.quote
@@ -1303,7 +1307,7 @@ class Checkout:
         # line id), i.e. cart_id+1) was verified live 2026-10-11 against a
         # real CalculEat quote; parse_quote re-verifies the correspondence on
         # every quote, so no blanket refusal is needed here anymore.
-        body = place_body(quote)
+        body = place_body(quote, allow_duplicate=allow_duplicate)
         self.read_owned_cart(allowed_food_totals=(quote.amount_minor,))
         result = self._mutate('place', '/ccx/v1/checkout/' + urllib.parse.quote(quote.cart.cart_id, safe='') + '/placeOrder', body)
         self.placed = place_contract.parse_response(result.status, result.data)

@@ -22,7 +22,7 @@ from talabat_http_orders import TalabatError
 ROOT = Path.home() / '.local/state/app-api-cli/talabat-submit'
 BINDINGS = frozenset(('account', 'cart', 'home', 'card', 'items', 'charges', 'instructions', 'request'))
 STATES = frozenset(('RESPONSE_RECEIVED', 'PAYMENT_PENDING', 'CHALLENGE_REQUIRED', 'ORDER_ID_OBSERVED',
-                    'EXACT_ORDER_VERIFIED', 'SUBMISSION_UNKNOWN'))
+                    'EXACT_ORDER_VERIFIED', 'SUBMISSION_UNKNOWN', 'REJECTED_DUPLICATE'))
 
 
 def _fail(code):
