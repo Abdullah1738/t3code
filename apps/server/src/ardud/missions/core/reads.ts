@@ -46,6 +46,8 @@ const LIVE_LANES = ["working", "stuck", "waiting", "idle", "parked"];
 const UNFINISHED_STAGES = ["ticket", "pr", "review", "merge", "deploy", "readback", "exercised"];
 const WIDE_LIMIT = 5000;
 const OVERVIEW_LIMIT = 200;
+// ardud missions: crw-threads - settled PR threads pile up; the overview carries the latest
+const CLOSED_THREADS_SHOWN = 50;
 const INBOX_LOAD_LIMIT = 500;
 
 interface HealthEntry {
@@ -198,10 +200,16 @@ export const makeReads = (
           });
           // ardud missions: ui-web (the clients' thread lists leave these to the mission)
           const bindings = yield* store.listAllInMission("role-binding", mission.id, ["bound"]);
+          // ardud missions: crw-threads - settled ones too, or they would fall back into the list
+          const attached = yield* store.listAllInMission("thread-attachment", mission.id, [
+            "open",
+            "closed",
+          ]);
           const threadIds = [
             ...new Set([
               ...bindings.map((binding) => binding.threadId),
               ...records.lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
+              ...attached.map((attachment) => attachment.threadId),
             ]),
           ];
           // ardud missions: router
@@ -245,6 +253,14 @@ export const makeReads = (
       // ardud missions: router
       // Any status: a progress note or a settle note is unread news too.
       const answered = yield* store.ownerRequestsUnread(missionId);
+      // ardud missions: crw-threads - every open one, and only the latest settled ones
+      const openThreads = yield* store.list("thread-attachment", { ...scope, status: ["open"] });
+      const closedThreads = yield* store.list("thread-attachment", {
+        missionId,
+        status: ["closed"],
+        limit: CLOSED_THREADS_SHOWN,
+      });
+      const attachedThreads = [...openThreads, ...closedThreads];
       return {
         mission: { ...mission.value, health: entry.mission },
         subMissions:
@@ -273,6 +289,8 @@ export const makeReads = (
         requestsAnswered: answered.get(missionId) ?? 0,
         // ardud missions: fix-p3
         ownerName,
+        // ardud missions: crw-threads
+        attachedThreads,
       };
     });
 

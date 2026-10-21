@@ -3,6 +3,7 @@ import {
   type AnnotateApprovalInput,
   type Approval,
   type ApprovalStatus,
+  type AttachThreadInput,
   type CloseStaleApprovalInput,
   type CreateMissionInput,
   type DecideApprovalInput,
@@ -108,6 +109,8 @@ const LIST_KINDS: ReadonlySet<string> = new Set<MissionStoreKind>([
   "portfolio",
   // ardud missions: fix-p3 - a snooze or unsnooze changes needs-you counts
   "inbox-mark",
+  // ardud missions: crw-threads - attached threads leave the clients' thread lists
+  "thread-attachment",
 ]);
 
 /** Records a mission subscriber receives as deltas. No bodies, no inbox items. */
@@ -131,6 +134,8 @@ const OVERVIEW_KINDS: ReadonlySet<string> = new Set([
   "note",
   // ardud missions: router
   "owner-request",
+  // ardud missions: crw-threads
+  "thread-attachment",
 ]);
 
 const INBOX_KINDS: ReadonlySet<string> = new Set<MissionStoreKind>([
@@ -224,6 +229,9 @@ export class MissionService extends Context.Service<
     /** Systems (crw) open and stale-close approvals in their own component name. */
     readonly openApproval: Write<OpenApprovalInput>;
     readonly closeStaleApproval: Write<CloseStaleApprovalInput>;
+    // ardud missions: crw-threads
+    /** A component (crw) keeps a thread it runs inside the mission, or moves it on. */
+    readonly attachThread: Write<AttachThreadInput>;
     /**
      * The owner decides any pending approval; the master those routed to it,
      * or any on a verified owner condition (`onOwnerCondition`).

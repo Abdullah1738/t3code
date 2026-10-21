@@ -12,8 +12,8 @@
         "missionId": "crpko",
         "approvalId": "crpko:approval:crw:Equicom-Crypto/edge-api#901@aaaaaaaaaaaa",
         "kind": "merge",
-        "title": "Good to merge: Equicom-Crypto/edge-api#901 Fix the thing",
-        "detail": "looks right\n\nDecide here, or reply Approved in the review thread (head aaaaaaaaaaaa).",
+        "title": "Merge and deploy (Good to merge): Equicom-Crypto/edge-api#901 Fix the thing",
+        "detail": "looks right\n\nApproving covers the merge and the deploy to dev. We pick the deploy time, fix what comes up and get fresh checks after our own pushes without coming back to you. Decide here, or reply Approved in the review thread (head aaaaaaaaaaaa).",
         "requestedBy": "crw",
         "links": [
           {
@@ -186,6 +186,21 @@
         "reason": "head moved to cccccccccccc"
       },
       "expect": { "status": 200, "keys": ["ok", "draft"] }
+    },
+    {
+      "name": "attach review thread",
+      "method": "POST",
+      "path": "/threads/attach",
+      "body": {
+        "missionId": "crpko",
+        "threadId": "thread-missions",
+        "attachedBy": "crw",
+        "title": "edge-api#901 review: Fix the thing",
+        "pullRequest": { "repository": "Equicom-Crypto/edge-api", "number": 901 },
+        "state": "open"
+      },
+      "expect": { "status": 200, "keys": ["ok", "seq", "ref"] },
+      "repeat": { "status": 200 }
     }
   ]
 }
