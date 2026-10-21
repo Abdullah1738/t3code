@@ -42,14 +42,23 @@ export interface IMessageThreadInput {
   readonly id: string;
   readonly path: string | null | undefined;
   readonly title: string;
+  readonly createdAt: string;
   readonly updatedAt: string;
   readonly running: boolean;
+  /**
+   * Subagent and fork threads share their parent's iMessage folder, but their
+   * messages are agent prompts, not the chat, so they never join a chat.
+   */
+  readonly child: boolean;
 }
 
 export interface IMessageChatSummary {
   readonly slug: string;
+  /** Oldest first, the order the conversation happened in. */
   readonly threadIds: ReadonlyArray<string>;
   readonly latestThreadId: string;
+  /** The bridge titles each non-owner thread with the chat's name. */
+  readonly latestTitle: string;
   readonly latestActivityAt: string;
   readonly running: boolean;
 }
@@ -63,6 +72,7 @@ export function groupIMessageThreads(
 ): ReadonlyArray<IMessageChatSummary> {
   const byChat = new Map<string, IMessageThreadInput[]>();
   for (const thread of threads) {
+    if (thread.child) continue;
     const chat = imessageChatOfPath(thread.path);
     if (chat === null) continue;
     const slug = chat.slug;
@@ -73,17 +83,29 @@ export function groupIMessageThreads(
 
   const chats: IMessageChatSummary[] = [];
   for (const [slug, list] of byChat) {
-    const sorted = [...list].sort((a, b) => compareTimes(b.updatedAt, a.updatedAt));
-    const latest = sorted[0]!;
+    const sorted = sortIMessageThreadsByCreation(list);
+    const latest = sorted[sorted.length - 1]!;
+    const latestActivityAt = sorted.reduce(
+      (newest, thread) => (compareTimes(thread.updatedAt, newest) > 0 ? thread.updatedAt : newest),
+      latest.updatedAt,
+    );
     chats.push({
       slug,
       threadIds: sorted.map((thread) => thread.id),
       latestThreadId: latest.id,
-      latestActivityAt: latest.updatedAt,
+      latestTitle: latest.title,
+      latestActivityAt,
       running: sorted.some((thread) => thread.running),
     });
   }
   return chats.sort((a, b) => compareTimes(b.latestActivityAt, a.latestActivityAt));
+}
+
+/** A chat reads oldest to newest by when each session began, not by its last edit. */
+export function sortIMessageThreadsByCreation<T extends { readonly createdAt: string }>(
+  threads: ReadonlyArray<T>,
+): T[] {
+  return [...threads].sort((a, b) => compareTimes(a.createdAt, b.createdAt));
 }
 
 function compareTimes(a: string, b: string): number {

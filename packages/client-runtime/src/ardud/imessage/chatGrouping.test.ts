@@ -1,11 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "vite-plus/test";
 
 import {
   groupIMessageThreads,
   imessageChatOfPath,
   OWNER_CHAT_SLUG,
   sortIMessageChats,
-} from "./chatGrouping";
+  sortIMessageThreadsByCreation,
+} from "./chatGrouping.ts";
 
 const ROOT = "/Users/ardud/.robob/imessage";
 
@@ -37,20 +38,45 @@ describe("imessageChatOfPath", () => {
 });
 
 describe("groupIMessageThreads", () => {
-  const thread = (id: string, path: string, updatedAt: string, running = false) => ({
+  const thread = (
+    id: string,
+    path: string,
+    createdAt: string,
+    updatedAt: string,
+    options: { running?: boolean; child?: boolean } = {},
+  ) => ({
     id,
     path,
     title: id,
+    createdAt,
     updatedAt,
-    running,
+    running: options.running ?? false,
+    child: options.child ?? false,
   });
 
-  it("groups threads per chat with the latest activity and running flag", () => {
+  it("groups threads per chat in creation order with the latest activity and running flag", () => {
     const groups = groupIMessageThreads([
-      thread("owner-old", `${ROOT}/2026-10-19/session-1`, "2026-10-19T10:00:00Z"),
-      thread("owner-new", `${ROOT}/2026-10-20/session-2`, "2026-10-20T09:00:00Z", true),
-      thread("moni", `${ROOT}/chats/moni/2026-10-21/session-3`, "2026-10-21T08:00:00Z"),
-      thread("code", "/Users/ardud/code/app", "2026-10-22T08:00:00Z"),
+      // The older session was touched last; creation order still decides the transcript.
+      thread(
+        "owner-old",
+        `${ROOT}/2026-10-19/session-1`,
+        "2026-10-19T06:00:00Z",
+        "2026-10-20T11:00:00Z",
+      ),
+      thread(
+        "owner-new",
+        `${ROOT}/2026-10-20/session-2`,
+        "2026-10-20T06:00:00Z",
+        "2026-10-20T09:00:00Z",
+        { running: true },
+      ),
+      thread(
+        "moni",
+        `${ROOT}/chats/moni/2026-10-21/session-3`,
+        "2026-10-21T07:00:00Z",
+        "2026-10-21T08:00:00Z",
+      ),
+      thread("code", "/Users/ardud/code/app", "2026-10-22T08:00:00Z", "2026-10-22T08:00:00Z"),
     ]);
 
     expect(groups).toEqual([
@@ -58,21 +84,65 @@ describe("groupIMessageThreads", () => {
         slug: "moni",
         threadIds: ["moni"],
         latestThreadId: "moni",
+        latestTitle: "moni",
         latestActivityAt: "2026-10-21T08:00:00Z",
         running: false,
       },
       {
         slug: OWNER_CHAT_SLUG,
-        threadIds: ["owner-new", "owner-old"],
+        threadIds: ["owner-old", "owner-new"],
         latestThreadId: "owner-new",
-        latestActivityAt: "2026-10-20T09:00:00Z",
+        latestTitle: "owner-new",
+        latestActivityAt: "2026-10-20T11:00:00Z",
         running: true,
       },
     ]);
   });
 
+  it("leaves subagent threads that share a chat folder out of the chat", () => {
+    const groups = groupIMessageThreads([
+      thread(
+        "root",
+        `${ROOT}/2026-10-21/session-1`,
+        "2026-10-21T06:00:00Z",
+        "2026-10-21T06:30:00Z",
+      ),
+      thread(
+        "subagent",
+        `${ROOT}/2026-10-21/session-1`,
+        "2026-10-21T07:00:00Z",
+        "2026-10-21T09:00:00Z",
+        { running: true, child: true },
+      ),
+    ]);
+
+    expect(groups).toEqual([
+      {
+        slug: OWNER_CHAT_SLUG,
+        threadIds: ["root"],
+        latestThreadId: "root",
+        latestTitle: "root",
+        latestActivityAt: "2026-10-21T06:30:00Z",
+        running: false,
+      },
+    ]);
+  });
+
   it("returns an empty list when there are no iMessage threads", () => {
-    expect(groupIMessageThreads([thread("x", "/tmp/x", "2026-10-20T00:00:00Z")])).toEqual([]);
+    expect(
+      groupIMessageThreads([thread("x", "/tmp/x", "2026-10-20T00:00:00Z", "2026-10-20T00:00:00Z")]),
+    ).toEqual([]);
+  });
+});
+
+describe("sortIMessageThreadsByCreation", () => {
+  it("orders oldest first regardless of input order", () => {
+    const sorted = sortIMessageThreadsByCreation([
+      { id: "b", createdAt: "2026-10-21T06:00:00Z" },
+      { id: "a", createdAt: "2026-10-20T06:00:00Z" },
+      { id: "c", createdAt: "2026-10-22T06:00:00Z" },
+    ]);
+    expect(sorted.map((thread) => thread.id)).toEqual(["a", "b", "c"]);
   });
 });
 
