@@ -56,6 +56,10 @@ const makeServer = () => {
     queued: [] as Array<ReadonlyArray<string>>,
     modelReads: 0,
     onDrained: undefined as (() => void) | undefined,
+    /** Every request fails, as from a server that is still starting. */
+    down: false,
+    /** Off for a server that never opens an event stream. */
+    events: true,
   };
   const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const encoder = new TextEncoder();
@@ -67,6 +71,9 @@ const makeServer = () => {
   const http = HttpClient.make((request) =>
     Effect.sync(() => {
       const path = new URL(request.url).pathname;
+      if (state.down || (path === "/api/event" && !state.events)) {
+        return HttpClientResponse.fromWeb(request, new Response("", { status: 503 }));
+      }
       switch (path) {
         case "/api/info":
           return json(request, { version: "2.0.22", pid: 1, urls: [], paths: { tmp: "/tmp" } });
@@ -230,6 +237,23 @@ describe("OpenCode 2 catalog settling in the driver", () => {
       // One comparison read, and no health check behind it.
       assert.strictEqual(server.state.modelReads - before, 1);
       assert.strictEqual((yield* instance.snapshot.getSnapshot).checkedAt, settled.checkedAt);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+
+  it.live("a server that was down at boot is picked up without a refresh", () =>
+    Effect.gen(function* () {
+      const server = makeServer();
+      server.state.down = true;
+      // No catalog notices either, so only the retry can bring it back.
+      server.state.events = false;
+      const instance = yield* create(server.http);
+      yield* eventually(instance.snapshot.getSnapshot, (s) => s.status === "error");
+      server.state.down = false;
+      const snapshot = yield* eventually(
+        instance.snapshot.getSnapshot,
+        (s) => s.status === "ready",
+      );
+      assert.deepStrictEqual(slugsOf(snapshot), FULL.toSorted());
     }).pipe(Effect.scoped, Effect.provide(layer)),
   );
 });

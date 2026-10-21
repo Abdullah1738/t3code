@@ -34,6 +34,7 @@ import {
   readSettledOpenCode2Models,
   subscribeOpenCode2CatalogFrames,
 } from "./ardud/catalogSettle.ts";
+import { makeOpenCodeProbeRetry } from "./ardud/probeRetry.ts";
 import {
   checkOpenCodeProviderStatus,
   loadOpenCode2Workspace,
@@ -364,6 +365,7 @@ export const OpenCodeDriver: ProviderDriver<
       ),
     );
 
+    const probeRetry = yield* makeOpenCodeProbeRetry();
     const checkProvider = Effect.all(
       {
         provider: checkOpenCodeProviderStatus(
@@ -382,6 +384,7 @@ export const OpenCodeDriver: ProviderDriver<
     ).pipe(
       Effect.map(({ provider, usageLimits }) => ({ ...provider, usageLimits })),
       Effect.map(stampIdentity),
+      Effect.tap(probeRetry.observe),
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, pathService),
       Effect.provideService(HttpClient.HttpClient, httpClient),
@@ -482,6 +485,7 @@ export const OpenCodeDriver: ProviderDriver<
           }),
       ),
     );
+    yield* probeRetry.start(snapshot);
 
     // Health checks do not run on an interval, so a configured 2.x server's
     // later catalog changes re-read the models, and refresh when they moved.
