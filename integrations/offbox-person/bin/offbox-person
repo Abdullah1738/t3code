@@ -186,6 +186,9 @@ stop_local() {
   stop_pid "$HOME_PID"
   stop_pid "$SOCKS_PID"
   rm -f -- "$(state_file "$p")" "$ROOT/state/$p-socks.port"
+  # agent-browser keeps a per-session daemon on the Mac that would outlive the box, holding a dead CDP socket.
+  # The tunnels are already gone, so this close cannot reach (or resume) her remote browser.
+  "$AGENT_BROWSER" --session "person-$p" close >/dev/null 2>&1 || true
 }
 
 cmd_down() {

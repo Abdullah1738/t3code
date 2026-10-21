@@ -3,5 +3,5 @@ import json
 import os
 import sys
 
-with open(os.environ["FAKE_AB_LOG"], "w") as f:
-    f.write(json.dumps(sys.argv[1:]))
+with open(os.environ["FAKE_AB_LOG"], "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")

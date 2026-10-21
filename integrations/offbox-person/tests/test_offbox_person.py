@@ -68,6 +68,11 @@ class OffboxPersonTest(unittest.TestCase):
             return []
         return [json.loads(line) for line in self.calls.read_text().splitlines() if line]
 
+    def ab_calls(self):
+        if not self.ab_log.exists():
+            return []
+        return [json.loads(line) for line in self.ab_log.read_text().splitlines() if line]
+
     def state(self, person="moni"):
         env = {}
         f = self.root / "state" / f"{person}.env"
@@ -159,9 +164,8 @@ class OffboxPersonTest(unittest.TestCase):
         self.tool("up", "moni")
         port = self.state()["LOCAL_PORT"]
         self.tool("browser", "moni", "--", "snapshot", "-i")
-        args = json.loads(self.ab_log.read_text())
-        self.assertEqual(args, ["--session", "person-moni", "--cdp", port,
-                                "--input-mode", "human", "snapshot", "-i"])
+        self.assertEqual(self.ab_calls()[-1], ["--session", "person-moni", "--cdp", port,
+                                               "--input-mode", "human", "snapshot", "-i"])
 
     def test_secret_round_trip_through_box(self):
         self.tool("secret", "set", "moni", "token", input_text="s3cret")
@@ -192,6 +196,7 @@ class OffboxPersonTest(unittest.TestCase):
         self.assertTrue(any(c["args"][0] == "release" for c in self.offbox_calls()))
         stop = [c for c in self.offbox_calls() if c["args"][0] == "ssh" and "stop-browser" in c["args"][-1]]
         self.assertEqual(len(stop), 1)
+        self.assertIn(["--session", "person-moni", "close"], self.ab_calls())
 
     def test_save_closes_browser_and_local_processes_before_snapshot(self):
         self.tool("up", "moni")
