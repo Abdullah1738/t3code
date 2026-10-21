@@ -1,11 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contactName, findEvidence, namesLine, verifyArchiveEvidence } from "../src/guest-evidence.ts";
 import { GuestDesk } from "../src/guest-desk.ts";
-import { freeWindows, GuestResponder, guestSystemPrompt, parseDecision, safeReply, slotFits } from "../src/guest-responder.ts";
+import { calendarTime, freeWindows, GuestResponder, guestSystemPrompt, parseDecision, safeReply, slotFits } from "../src/guest-responder.ts";
 import { GuestBook, parseExpiry, unknownSenderWake, type GuestGrant } from "../src/guests.ts";
 import type { LineInbound } from "../src/line.ts";
 import { handleInbound, type IngressDeps } from "../src/sb-ingress.ts";
@@ -244,6 +244,13 @@ describe("scoped responder", () => {
     expect(busy.sent[0]!.text).toContain("doesn't work");
   });
 
+  test("an owner note on a normal reply still wakes the owner", async () => {
+    const h = harness({ complete: async () => JSON.stringify({ reply: "I can only help book a meeting.", action: "propose", ownerNote: "They asked for his address." }) });
+    await h.handle(grant(), [message({ text: "where does he live?" })]);
+    expect(h.sent[0]!.text).toBe("I can only help book a meeting.");
+    expect(h.wakes[0]!.text).toContain("They asked for his address.");
+  });
+
   test("no meeting action means no calendar and a book is refused", async () => {
     const h = harness({ complete: async () => JSON.stringify({ reply: "Booked!", action: "book", slot: { start: "2026-10-22T10:00:00Z", end: "2026-10-22T10:30:00Z" } }) });
     await h.handle(grant({ actions: [], purpose: "send Abdullah the contract" }), [message()]);
@@ -282,6 +289,6 @@ describe("scoped responder", () => {
     expect(parseDecision('{"reply":"x","action":"rm -rf"}')).toBeUndefined();
     expect(guestSystemPrompt(grant(), "unavailable", NOW, "Asia/Dubai")).toContain("can't be read");
     expect(unknownSenderWake({ address: STRANGER, held: [], evidence: "unavailable", lineNumber: LINE })).toContain("could not search");
-    expect(existsSync("/")).toBe(true);
+    expect(calendarTime(Date.parse("2026-10-22T10:00:00.123Z"))).toBe("2026-10-22T10:00:00Z");
   });
 });

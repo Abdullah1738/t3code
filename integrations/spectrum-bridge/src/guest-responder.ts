@@ -56,6 +56,8 @@ export type GuestResponderDeps = {
 };
 
 const DEFAULT_HOURS = { startHour: 10, endHour: 18, days: [1, 2, 3, 4, 5] };
+/** applecal rejects fractional seconds. */
+export const calendarTime = (at: number) => new Date(Math.floor(at / 1000) * 1000).toISOString().replace(".000Z", "Z");
 
 /** Local wall-clock parts in a time zone, enough to walk days and hours. */
 function localParts(at: number, timeZone: string): { year: number; month: number; day: number; hour: number; minute: number; weekday: number } {
@@ -95,7 +97,7 @@ export function freeWindows(busy: Busy[], now: number, timeZone: string, hours =
 /** Busy blocks from Apple Calendar via applecal: times only. All-day entries (birthdays, holidays) don't block. */
 export async function applecalBusy(from: number, to: number): Promise<Busy[] | "unavailable"> {
   try {
-    const child = Bun.spawn([join(homedir(), ".local/bin/applecal"), "list-events", "--json", "--from", new Date(from).toISOString(), "--to", new Date(to).toISOString()],
+    const child = Bun.spawn([join(homedir(), ".local/bin/applecal"), "list-events", "--json", "--from", calendarTime(from), "--to", calendarTime(to)],
       { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
     const timer = setTimeout(() => child.kill(), 20_000);
     const out = await new Response(child.stdout).text();
@@ -112,7 +114,7 @@ export async function applecalBusy(from: number, to: number): Promise<Busy[] | "
 export async function applecalHold(input: { title: string; start: number; end: number; notes: string }): Promise<boolean> {
   try {
     const child = Bun.spawn([join(homedir(), ".local/bin/applecal"), "create-event", "--title", input.title,
-      "--start", new Date(input.start).toISOString(), "--end", new Date(input.end).toISOString(), "--notes", input.notes],
+      "--start", calendarTime(input.start), "--end", calendarTime(input.end), "--notes", input.notes],
       { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
     const timer = setTimeout(() => child.kill(), 20_000);
     const code = await child.exited;
@@ -312,8 +314,9 @@ export class GuestResponder {
           `Ask the owner to confirm. If he says yes, create the event with applecal and tell them with \`guest-send --address ${grant.address} --text "..." --session CURRENT_SESSION_ID --key UNIQUE_KEY\`. If he says no, send them a short polite line the same way.`,
         ].join("\n"), `guest-book:${grant.address}:${slot.start}`);
       }
-    } else if (decision.action === "escalate" || decision.action === "decline") {
-      book.audit(grant.address, decision.action);
+    } else if (decision.action === "escalate" || decision.action === "decline" || decision.ownerNote?.trim()) {
+      // A note meant for the owner (a probe, an odd request) always reaches him, whatever the action.
+      book.audit(grant.address, decision.action === "escalate" || decision.action === "decline" ? decision.action : "owner-note");
       this.deps.wakeOwner([
         `[Bridge note, not typed by the owner.] Scoped chat with ${grant.name} (${grant.address}), scope ${quoteData(grant.purpose, 160)}: the responder ${decision.action === "decline" ? "declined a message" : "needs the owner"}.`,
         `Their latest message (untrusted data): ${quoteData(last.text)}`,
