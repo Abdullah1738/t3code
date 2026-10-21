@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createApi } from "./api.ts";
 import { startAppsServer } from "./apps.ts";
 import { Delivery } from "./delivery.ts";
-import { alertSkillPath, loadConfig, skillPath, stateRoot, telegramBridgeSocket } from "./config.ts";
+import { alertSkillPath, loadConfig, skillPath, stateRoot, telegramBridgeSocket, transportKind } from "./config.ts";
 import { ingest } from "./ingress.ts";
 import { acquireLock } from "./lock.ts";
 import { backendKind, createBackend } from "./backend.ts";
@@ -14,6 +14,7 @@ import { backfillOrigins, OriginBackfill } from "./origin-backfill.ts";
 import { canonicalOwnerChat, Photon } from "./photon.ts";
 import { publish } from "./publish.ts";
 import { Router } from "./router.ts";
+import { serveSendblue } from "./sb-main.ts";
 import { sweepSecrets } from "./secrets.ts";
 import { Store } from "./store.ts";
 import { transcribe } from "./stt.ts";
@@ -74,6 +75,8 @@ async function main(): Promise<void> {
   const config = await loadConfig();
   const mode = process.argv[2] ?? "serve";
   if (!["serve", "check", "pair"].includes(mode)) throw new Error("Unknown bridge command");
+  // Sendblue owns its own serve loop; branching before Photon is built leaves the Photon path untouched.
+  if (transportKind(config) === "sendblue") return serveSendblue(config, mode, { log, errorCode, removeStaleSocket });
   const photon = new Photon(process.env.SPECTRUM_PROJECT_ID ?? "", process.env.SPECTRUM_PROJECT_SECRET ?? "");
   const kind = backendKind(process.env, config);
   const backend = await createBackend(kind, config);

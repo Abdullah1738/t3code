@@ -126,7 +126,9 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
 export function createApi({ store, photon, router, chatGuid, enabled, health, secrets }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
     const guid = chatGuid();
-    return typeof guid === "string" && guid.trim() === guid && /^(?:any|iMessage);-;[^;\s\x00-\x1f\x7f]+$/.test(guid) ? guid : undefined;
+    // Photon chat guids, or Sendblue chat keys (dm:<address> | group:<id>).
+    return typeof guid === "string" && guid.trim() === guid
+      && /^(?:(?:any|iMessage);-;|dm:|group:)[^;\s\x00-\x1f\x7f]+$/.test(guid) ? guid : undefined;
   };
   return async request => {
     try {

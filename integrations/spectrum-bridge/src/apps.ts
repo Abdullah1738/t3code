@@ -50,13 +50,24 @@ export async function resolveAppFile(root: string, pathname: string): Promise<st
 
 export const SECRET_PREFIX = "/_secret/";
 
-export function createAppsHandler(root: string, secrets?: SecretDeps): (request: Request) => Promise<Response> {
-  const secretHandler = secrets ? createSecretHandler(secrets) : undefined;
+/** One chat's secret store, or (Sendblue mode) a lookup of the chat that issued a token. */
+export type AppsSecrets = SecretDeps | ((token: string) => SecretDeps | undefined);
+
+export function createAppsHandler(root: string, secrets?: AppsSecrets): (request: Request) => Promise<Response> {
+  const handlers = new WeakMap<SecretDeps, ReturnType<typeof createSecretHandler>>();
+  const handlerFor = (token: string) => {
+    const deps = typeof secrets === "function" ? secrets(token) : secrets;
+    if (!deps) return undefined;
+    let handler = handlers.get(deps);
+    if (!handler) { handler = createSecretHandler(deps); handlers.set(deps, handler); }
+    return handler;
+  };
   return async request => {
     const pathname = new URL(request.url).pathname;
     // The reserved prefix never falls through to static files, even without the secrets dependency.
     if (pathname === "/_secret" || pathname.startsWith(SECRET_PREFIX)) {
       const token = pathname.slice(SECRET_PREFIX.length);
+      const secretHandler = validToken(token) ? handlerFor(token) : undefined;
       if (!secretHandler || !validToken(token)) {
         void request.body?.cancel().catch(() => {});
         return new Response(renderSecretMessage("Not found", "This form is no longer available."), { status: 404, headers: SECRET_PAGE_HEADERS });
@@ -76,7 +87,7 @@ export function createAppsHandler(root: string, secrets?: SecretDeps): (request:
 }
 
 /** Loopback-only static server for owner-built mini apps; public exposure is the tailnet proxy's job. */
-export function startAppsServer(root: string, port: number, secrets?: SecretDeps): { port: number; stop(): Promise<void> } {
+export function startAppsServer(root: string, port: number, secrets?: AppsSecrets): { port: number; stop(): Promise<void> } {
   const server = Bun.serve({ hostname: "127.0.0.1", port, maxRequestBodySize: 64 * 1024, fetch: createAppsHandler(root, secrets) });
   return { port: server.port ?? port, stop: () => server.stop(true) };
 }

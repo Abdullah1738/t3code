@@ -110,7 +110,16 @@ export interface RobobBackendOptions extends ControlConfigOptions {
    */
   model?: () => Promise<PreferredModel | undefined>;
   client?: ControlClient;
+  /**
+   * Folder under `chatRoot` for this chat's threads (Sendblue non-owner chats use `chats/<slug>`).
+   * The project-root check stays on `chatRoot` so every chat joins the one iMessage project.
+   */
+  subdir?: string;
+  /** Title for new threads, e.g. the person's or group's name. */
+  title?: string;
 }
+
+const CHATS_DIR = "chats";
 
 /** The iMessage router's backend on Robob's control API. Accepts thread ids and OpenCode `ses_` ids alike. */
 export class RobobBackend implements ChatBackend {
@@ -123,6 +132,7 @@ export class RobobBackend implements ChatBackend {
   constructor(private readonly options: RobobBackendOptions) {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
     this.chatRoot = options.chatRoot.replace(/\/+$/, "");
+    if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
   }
@@ -160,15 +170,30 @@ export class RobobBackend implements ChatBackend {
     if (!await this.chatRootRegistered()) throw new Error("iMessage chat root is not a Robob project");
     const now = new Date();
     const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
-    const directory = `${this.chatRoot}/${date}/session-${crypto.randomUUID()}`;
+    const directory = `${this.chatFolder()}/${date}/session-${crypto.randomUUID()}`;
     const model = await (this.options.model ?? (async () => (await imessagePreferences()).model))().catch(() => undefined);
     const created = await this.client.request<{ threadId: string; directory: string | null }>("POST", "/threads", {
       directory, origin: IMESSAGE_ORIGIN, runtimeMode: "full-access",
-      title: title ?? `iMessage ${date} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
+      title: title ?? this.options.title ?? `iMessage ${date} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
       ...(model ? { model: `${model.providerID}/${model.modelID}`, ...(model.variant ? { variant: model.variant } : {}) } : {}),
     });
     if (typeof created.threadId !== "string" || !created.threadId) throw new Error("Invalid Robob thread response");
     return { id: created.threadId, directory: created.directory ?? directory };
+  }
+
+  /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
+  forChat(subdir: string, title: string): RobobBackend {
+    return new RobobBackend({ ...this.options, client: this.client, subdir, title });
+  }
+
+  private chatFolder(): string {
+    return this.options.subdir ? `${this.chatRoot}/${this.options.subdir}` : this.chatRoot;
+  }
+
+  private ownsFolder(path: string | null): boolean {
+    const chats = `${this.chatRoot}/${CHATS_DIR}/`;
+    if (!this.options.subdir) return !path?.startsWith(chats);
+    return path?.startsWith(`${this.chatFolder()}/`) === true;
   }
 
   async markImessageOrigin(id: string): Promise<"marked" | "already" | "missing"> {
@@ -191,6 +216,8 @@ export class RobobBackend implements ChatBackend {
     let settled = 0;
     for (const thread of threads) {
       if (thread.threadId === keep || thread.parentThreadId || thread.settled || thread.archived || BUSY.has(thread.state) || thread.pendingRequest) continue;
+      // Each Sendblue chat retires only its own threads; another person's live chat is not stale.
+      if (!this.ownsFolder(thread.worktreePath)) continue;
       try {
         const result = await this.client.request<{ thread?: { settled?: boolean } } | undefined>("PATCH", `/threads/${encodeURIComponent(thread.threadId)}`, { settled: true });
         // An older server ignores the field and answers 200, so only count what it reports as settled.
