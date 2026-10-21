@@ -27,7 +27,10 @@ export type ViewValue =
   | { readonly kind: "links"; readonly links: ReadonlyArray<MissionLink> }
   | { readonly kind: "refs"; readonly refs: ReadonlyArray<MissionRecordRef> }
   | { readonly kind: "options"; readonly options: ReadonlyArray<AskOption> }
-  | { readonly kind: "assets"; readonly assetIds: ReadonlyArray<string> };
+  | { readonly kind: "assets"; readonly assetIds: ReadonlyArray<string> }
+  // --- blocks additions ---
+  | { readonly kind: "series"; readonly points: ReadonlyArray<number> };
+// --- end blocks additions ---
 
 export interface ViewBindContext {
   /** What `record.<path>` reads; its paths follow the scope's table. */
@@ -160,6 +163,17 @@ const coerce = (
       );
       return text(parts.join(" · "));
     }
+    // --- blocks additions ---
+    case "series":
+      return Array.isArray(raw)
+        ? {
+            kind: "series",
+            points: raw.filter(
+              (point): point is number => typeof point === "number" && Number.isFinite(point),
+            ),
+          }
+        : null;
+    // --- end blocks additions ---
   }
 };
 
@@ -302,6 +316,12 @@ export function viewValueText(value: ViewValue | null): string | null {
       return value.assetIds.length === 0
         ? null
         : `${value.assetIds.length} ${value.assetIds.length === 1 ? "image" : "images"}`;
+    // --- blocks additions ---
+    case "series": {
+      const last = value.points.at(-1);
+      return last === undefined ? null : numberText(last, "");
+    }
+    // --- end blocks additions ---
   }
 }
 
@@ -321,5 +341,9 @@ export function viewValueCount(value: ViewValue | null): number | null {
       return value.options.length;
     case "assets":
       return value.assetIds.length;
+    // --- blocks additions ---
+    case "series":
+      return value.points.at(-1) ?? null;
+    // --- end blocks additions ---
   }
 }

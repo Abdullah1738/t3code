@@ -37,6 +37,13 @@ const SECTION_NODES: ReadonlySet<ViewNodeTag> = new Set([
   "collapsible",
   "markdown",
   // --- end views additions ---
+  // --- blocks additions ---
+  "stat",
+  "chart",
+  "timeline",
+  "callout",
+  "code",
+  // --- end blocks additions ---
 ]);
 
 export const viewSectionAllows = (tag: ViewNodeTag): boolean => SECTION_NODES.has(tag);

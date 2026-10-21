@@ -98,8 +98,21 @@ interface Place {
   readonly folded: boolean;
 }
 
+// --- blocks additions ---
+// Checked ahead of row paths, so a source field named count can't turn the tile into one per row.
+const isSectionWide = (bind: string) => bind === "row.count" || bind === "row.total";
+// --- end blocks additions ---
+
 // One row per collapsible: lists, tables and further collapsibles inside would need rows of rows.
-const NOT_FOLDED: ReadonlySet<ViewNodeTag> = new Set(["list", "table", "collapsible"]);
+const NOT_FOLDED: ReadonlySet<ViewNodeTag> = new Set([
+  "list",
+  "table",
+  "collapsible",
+  // --- blocks additions ---
+  "chart",
+  "timeline",
+  // --- end blocks additions ---
+]);
 
 const checkBind = (
   issues: Issues,
@@ -200,6 +213,42 @@ const walkNode = (issues: Issues, rules: NodeRules, walk: Walk, node: ViewNode, 
       walkChildren(node.children, true);
       return;
     }
+    // --- blocks additions ---
+    case "stat":
+      bind(node.value, "statValue", ".value");
+      if (!place.folded && isSectionWide(node.value)) {
+        if (node.delta !== undefined || node.tone !== undefined) {
+          issues.add(
+            path,
+            "shape",
+            "a stat of row.count or row.total is one tile for the section; it takes no delta or tone",
+          );
+        }
+        return;
+      }
+      if (node.delta !== undefined) bind(node.delta, "statDelta", ".delta");
+      if (node.tone !== undefined) bind(node.tone, "statTone", ".tone");
+      return;
+    case "chart":
+      if (node.x !== undefined) bind(node.x, "chartX", ".x");
+      bind(node.y, "chartY", ".y");
+      return;
+    case "timeline":
+      bind(node.at, "timelineAt", ".at");
+      bind(node.title, "timelineTitle", ".title");
+      node.meta.forEach((value, index) => bind(value, "timelineMeta", `.meta[${index}]`));
+      if (node.tone !== undefined) bind(node.tone, "timelineTone", ".tone");
+      return;
+    case "callout":
+      if (node.text === null && node.label === undefined) {
+        issues.add(`${path}.text`, "shape", "a callout needs a text binding or a label");
+      }
+      if (node.text !== null) bind(node.text, "callout", ".text");
+      return;
+    case "code":
+      bind(node.bind, "code", ".bind");
+      return;
+    // --- end blocks additions ---
     case "label":
     case "draft":
     case "choice":
@@ -296,10 +345,20 @@ const templateBinder =
     return { code: "bad-binding", detail: "row bindings belong in sections" };
   };
 
+/** Blocks that iterate section rows; a card has none. */
+const ROWS_ONLY: ReadonlySet<ViewNodeTag> = new Set([
+  "list",
+  "table",
+  // --- blocks additions ---
+  "chart",
+  "timeline",
+  // --- end blocks additions ---
+]);
+
 const templateNodeRule =
   (backing: ViewBackingKind) =>
   (tag: ViewNodeTag): string | null => {
-    if (tag === "list" || tag === "table") return `${tag} blocks belong in sections`;
+    if (ROWS_ONLY.has(tag)) return `${tag} blocks belong in sections`;
     if (tag === "draft" && backing !== "draft") return "draft blocks need a draft-backed card";
     if (tag === "choice" && backing !== "ask") return "choice blocks need an ask-backed card";
     return null;
@@ -427,6 +486,13 @@ const SECTION_NODES: ReadonlySet<ViewNodeTag> = new Set([
   "meter",
   "collapsible",
   "markdown",
+  // --- blocks additions ---
+  "stat",
+  "chart",
+  "timeline",
+  "callout",
+  "code",
+  // --- end blocks additions ---
 ]);
 
 /** Slots read per row (list rows, table cells); anything inside a collapsible reads its row too. */
@@ -440,6 +506,18 @@ const ROW_SLOTS: ReadonlySet<ViewBindSlot> = new Set([
   "cellPerson",
   "cellLink",
   "cellCount",
+  // --- blocks additions ---
+  "statValue",
+  "statDelta",
+  "statTone",
+  "chartX",
+  "chartY",
+  "timelineAt",
+  "timelineTitle",
+  "timelineMeta",
+  "timelineTone",
+  "callout",
+  // --- end blocks additions ---
 ]);
 
 const WHERE_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = VIEW_QUERY_FILTERS;
@@ -450,6 +528,11 @@ const sectionBinder =
   (bind, slot, perRow) => {
     const { scope, path } = splitBind(bind);
     if (scope !== "row") return { code: "bad-binding", detail: "sections bind row paths only" };
+    // --- blocks additions ---
+    if (!perRow && slot === "statValue" && isSectionWide(bind)) {
+      return { kind: "number" };
+    }
+    // --- end blocks additions ---
     const inList = perRow || ROW_SLOTS.has(slot);
     const kind = inList
       ? (lookup(rowPaths, path) ?? lookup(VIEW_DERIVED_PATHS, path))

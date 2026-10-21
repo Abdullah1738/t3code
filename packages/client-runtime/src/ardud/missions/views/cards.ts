@@ -1,6 +1,7 @@
 import {
   VIEW_ACTIONS,
   VIEW_HARD_LIMITS,
+  VIEW_TONE_VALUES,
   approverOf,
   builtinViewTemplate,
   selectViewTemplate,
@@ -20,6 +21,7 @@ import {
   type ViewTableCellKind,
   type ViewTemplate,
   type ViewTemplateDefinition,
+  type ViewTone,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -104,8 +106,57 @@ export type ViewBlock =
       /** `first` starts the first item open. */
       readonly open: "none" | "first";
       readonly items: ReadonlyArray<ViewCollapsibleItem>;
+    }
+  // --- end views additions ---
+  // --- blocks additions ---
+  | { readonly kind: "stat"; readonly label: string; readonly tiles: ReadonlyArray<ViewStatTile> }
+  | {
+      readonly kind: "chart";
+      readonly type: "line" | "bar";
+      readonly charts: ReadonlyArray<ViewChart>;
+    }
+  | { readonly kind: "timeline"; readonly entries: ReadonlyArray<ViewTimelineEntry> }
+  | { readonly kind: "callout"; readonly tone: ViewTone; readonly texts: ReadonlyArray<string> }
+  | {
+      readonly kind: "code";
+      readonly label: string | null;
+      /** Null while the text waits on `source`. */
+      readonly text: string | null;
+      readonly source: ViewLongTextInput | null;
     };
-// --- end views additions ---
+
+export interface ViewStatTile {
+  readonly key: string;
+  /** Compact past 999: 1.4k, 2.1M. */
+  readonly value: string;
+  readonly prefix: string | null;
+  readonly suffix: string | null;
+  /** Signed when the delta is a number. */
+  readonly delta: string | null;
+  readonly tone: ViewTone | null;
+}
+
+export interface ViewChartPoint {
+  readonly label: string | null;
+  readonly value: number;
+}
+
+export interface ViewChart {
+  readonly key: string;
+  /** Names a per-row series chart; null for a chart across rows. */
+  readonly title: string | null;
+  readonly points: ReadonlyArray<ViewChartPoint>;
+}
+
+export interface ViewTimelineEntry {
+  readonly key: string;
+  readonly at: string | null;
+  readonly title: string;
+  readonly meta: ReadonlyArray<string>;
+  readonly tone: ViewTone | null;
+  readonly ref: MissionRecordRef | null;
+}
+// --- end blocks additions ---
 
 // --- views additions ---
 /** One folded item: a section row, or the card itself. Children render only when open. */
@@ -192,11 +243,21 @@ export interface ViewCardOptions {
   readonly assets?: ReadonlyArray<MissionAsset>;
 }
 
-/** Node kinds a card of this kind renders. Lists and tables belong to sections. */
+/** Blocks that iterate section rows; cards have none. */
+const ROWS_ONLY: ReadonlySet<ViewNodeTag> = new Set([
+  "list",
+  "table",
+  // --- blocks additions ---
+  "chart",
+  "timeline",
+  // --- end blocks additions ---
+]);
+
+/** Node kinds a card of this kind renders. Lists, tables, charts and timelines belong to sections. */
 export const viewCardAllows =
   (kind: ViewBackingKind) =>
   (tag: ViewNodeTag): boolean => {
-    if (tag === "list" || tag === "table") return false;
+    if (ROWS_ONLY.has(tag)) return false;
     if (tag === "draft") return kind === "draft";
     if (tag === "choice") return kind === "ask";
     return true;
@@ -342,6 +403,205 @@ const collapsibleItem = (
 };
 // --- end views additions ---
 
+// --- blocks additions ---
+const PREFIX_UNITS: ReadonlySet<string> = new Set(["$", "€", "£", "¥"]);
+const COMPACT_STEPS = [
+  { size: 1e3, suffix: "k" },
+  { size: 1e6, suffix: "M" },
+  { size: 1e9, suffix: "B" },
+] as const;
+
+/** 1400 reads 1.4k; below a thousand the value's own text stands (it knows percentages). */
+const compactNumber = (value: number): string | null => {
+  const abs = Math.abs(value);
+  if (abs < 1000) return null;
+  for (const step of COMPACT_STEPS) {
+    const scaled = abs / step.size;
+    const digits = scaled >= 100 ? 0 : 1;
+    const rounded = Number(scaled.toFixed(digits));
+    if (rounded < 1000 || step.suffix === "B") {
+      return `${value < 0 ? "-" : ""}${String(rounded)}${step.suffix}`;
+    }
+  }
+  return null;
+};
+
+const statNumber = (value: ViewValue | null): string | null => {
+  if (value?.kind === "text" && value.number !== undefined) {
+    return compactNumber(value.number) ?? value.text;
+  }
+  return viewValueText(value);
+};
+
+const toneOf = (bind: string | undefined, context: ViewBindContext): ViewTone | null => {
+  if (bind === undefined) return null;
+  // Enum text reads "at risk"; the tone table keeps the raw "at-risk".
+  const text = viewValueText(resolveViewBind(bind, context))
+    ?.trim()
+    .toLowerCase()
+    .replaceAll(" ", "-");
+  if (text === undefined) return null;
+  for (const [tone, values] of Object.entries(VIEW_TONE_VALUES)) {
+    if (values.includes(text)) return tone as ViewTone;
+  }
+  return null;
+};
+
+const statTile = (
+  node: Extract<ViewNode, { _tag: "stat" }>,
+  key: string,
+  context: ViewBindContext,
+): ViewStatTile | null => {
+  const value = statNumber(resolveViewBind(node.value, context));
+  if (value === null) return null;
+  const unit = node.unit ?? null;
+  const prefix = unit !== null && PREFIX_UNITS.has(unit) ? unit : null;
+  let delta: string | null = null;
+  if (node.delta !== undefined) {
+    const raw = resolveViewBind(node.delta, context);
+    const number = raw?.kind === "text" ? raw.number : undefined;
+    const text = statNumber(raw);
+    delta = number !== undefined && number > 0 && text !== null ? `+${text}` : text;
+  }
+  return {
+    key,
+    value,
+    prefix,
+    suffix: prefix === null ? unit : null,
+    delta,
+    tone: toneOf(node.tone, context),
+  };
+};
+
+const statBlock = (
+  node: Extract<ViewNode, { _tag: "stat" }>,
+  context: ViewBindContext,
+  rows: ReadonlyArray<ViewRowContext> | undefined,
+): ViewBlock | null => {
+  // row.count and row.total read the section, so they make one tile for all of it.
+  const perRow = rows !== undefined && node.value !== "row.count" && node.value !== "row.total";
+  const tiles = (perRow ? rows : [{ key: "one", context }]).flatMap((row) => {
+    const tile = statTile(node, row.key, row.context);
+    return tile === null ? [] : [tile];
+  });
+  return tiles.length === 0 ? null : { kind: "stat", label: node.label, tiles };
+};
+
+const lastPoints = <A>(points: ReadonlyArray<A>): ReadonlyArray<A> =>
+  points.slice(Math.max(0, points.length - VIEW_HARD_LIMITS.chartPoints));
+
+const chartBlock = (
+  node: Extract<ViewNode, { _tag: "chart" }>,
+  rows: ReadonlyArray<ViewRowContext>,
+): ViewBlock | null => {
+  const across: Array<ViewChartPoint> = [];
+  const perRow: Array<ViewChart> = [];
+  for (const row of rows) {
+    const y = resolveViewBind(node.y, row.context);
+    const label = node.x === undefined ? null : viewValueText(resolveViewBind(node.x, row.context));
+    if (y?.kind === "series") {
+      const points = lastPoints(y.points).map((value) => ({ label: null, value }));
+      if (points.length > 0) perRow.push({ key: row.key, title: label, points });
+      continue;
+    }
+    const value = viewValueCount(y);
+    if (value !== null && Number.isFinite(value)) across.push({ label, value });
+  }
+  const charts: Array<ViewChart> =
+    across.length === 0
+      ? perRow
+      : [{ key: "rows", title: null, points: lastPoints(across) }, ...perRow];
+  return charts.length === 0 ? null : { kind: "chart", type: node.type, charts };
+};
+
+const timelineBlock = (
+  node: Extract<ViewNode, { _tag: "timeline" }>,
+  rows: ReadonlyArray<ViewRowContext>,
+): ViewBlock | null => {
+  const entries = rows.flatMap((row): ViewTimelineEntry[] => {
+    const title = viewValueText(resolveViewBind(node.title, row.context));
+    if (title === null) return [];
+    return [
+      {
+        key: row.key,
+        at: viewValueText(resolveViewBind(node.at, row.context)),
+        title,
+        meta: node.meta.flatMap((bind) => {
+          const value = viewValueText(resolveViewBind(bind, row.context));
+          return value === null ? [] : [value];
+        }),
+        tone: toneOf(node.tone, row.context),
+        ref: row.ref,
+      },
+    ];
+  });
+  return entries.length === 0 ? null : { kind: "timeline", entries };
+};
+
+const calloutBlock = (
+  node: Extract<ViewNode, { _tag: "callout" }>,
+  context: ViewBindContext,
+  rows: ReadonlyArray<ViewRowContext> | undefined,
+): ViewBlock | null => {
+  const bind = node.text;
+  const texts =
+    bind === null
+      ? []
+      : (rows ?? [{ context }]).flatMap((row) => {
+          const value = viewValueText(resolveViewBind(bind, row.context));
+          return value === null ? [] : [value];
+        });
+  const shown = texts.length > 0 ? texts : node.label === undefined ? [] : [node.label];
+  return shown.length === 0 ? null : { kind: "callout", tone: node.tone, texts: shown };
+};
+
+export interface ViewChartScale {
+  readonly min: number;
+  readonly max: number;
+  readonly ticks: ReadonlyArray<{ readonly value: number; readonly label: string }>;
+}
+
+const chartLabel = (value: number): string =>
+  compactNumber(value) ?? String(Number(value.toFixed(2)));
+
+/** Round y ticks that always include zero, so bars stand on a real baseline. */
+export function viewChartScale(points: ReadonlyArray<ViewChartPoint>): ViewChartScale {
+  const values = points.map((point) => point.value);
+  const low = Math.min(0, ...values);
+  const high = Math.max(0, ...values);
+  const span = high - low || 1;
+  const rough = span / 3;
+  const magnitude = 10 ** Math.floor(Math.log10(rough));
+  const step = ([1, 2, 2.5, 5, 10].find((m) => m * magnitude >= rough) ?? 10) * magnitude;
+  const min = Math.floor(low / step) * step;
+  const max = Math.max(Math.ceil(high / step) * step, min + step);
+  const ticks: Array<{ value: number; label: string }> = [];
+  for (let value = min; value <= max + step / 2; value += step) {
+    const clean = Number(value.toPrecision(12));
+    ticks.push({ value: clean, label: chartLabel(clean) });
+  }
+  return { min, max, ticks };
+}
+
+/** Up to `count` evenly spaced x labels, first and last included; a phone fits about four. */
+export function viewChartLabels(
+  points: ReadonlyArray<ViewChartPoint>,
+  count = 4,
+): ReadonlyArray<{ readonly index: number; readonly label: string }> {
+  if (points.length === 0) return [];
+  const slots = Math.min(count, points.length);
+  const indexes = new Set(
+    Array.from({ length: slots }, (_, slot) =>
+      slots === 1 ? 0 : Math.round((slot * (points.length - 1)) / (slots - 1)),
+    ),
+  );
+  return [...indexes].flatMap((index) => {
+    const label = points[index]?.label ?? null;
+    return label === null ? [] : [{ index, label }];
+  });
+}
+// --- end blocks additions ---
+
 /** What a body resolves against besides its own record: section rows and mission images. */
 export interface ViewBlockSources {
   readonly rows?: ReadonlyArray<ViewRowContext>;
@@ -449,6 +709,23 @@ export function viewBlock(
       return shown.length === 0 ? null : { kind: "collapsible", open: node.open, items: shown };
     }
     // --- end views additions ---
+    // --- blocks additions ---
+    case "stat":
+      return statBlock(node, context, sources.rows);
+    case "chart":
+      return chartBlock(node, sources.rows ?? []);
+    case "timeline":
+      return timelineBlock(node, sources.rows ?? []);
+    case "callout":
+      return calloutBlock(node, context, sources.rows);
+    case "code": {
+      const label = node.label ?? null;
+      const source = viewLongTextSource(node.bind, context);
+      if (source !== null) return { kind: "code", label, text: null, source };
+      const text = viewValueText(resolveViewBind(node.bind, context));
+      return text === null ? null : { kind: "code", label, text, source: null };
+    }
+    // --- end blocks additions ---
   }
 }
 

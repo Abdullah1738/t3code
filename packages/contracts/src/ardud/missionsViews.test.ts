@@ -149,6 +149,37 @@ describe("mission views catalog", () => {
       expect.arrayContaining(["collapsible", "markdown"]),
     );
   });
+
+  it("decodes stat, chart, timeline, callout and code nodes within their limits", () => {
+    const stat = { _tag: "stat", value: "row.count", label: "Open PRs" };
+    expect(decodeNode(stat)._tag).toBe("Success");
+    expect(decodeNode({ ...stat, delta: "row.delta", tone: "row.health", unit: "$" })._tag).toBe(
+      "Success",
+    );
+    expect(decodeNode({ ...stat, label: "A label that runs past the kicker size" })._tag).toBe(
+      "Failure",
+    );
+    expect(decodeNode({ ...stat, unit: "too-long-unit" })._tag).toBe("Failure");
+    expect(decodeNode({ _tag: "chart", type: "bar", y: "row.count" })._tag).toBe("Success");
+    expect(decodeNode({ _tag: "chart", type: "line", x: "row.day", y: "row.burn" })._tag).toBe(
+      "Success",
+    );
+    expect(decodeNode({ _tag: "chart", type: "pie", y: "row.count" })._tag).toBe("Failure");
+    const timeline = { _tag: "timeline", at: "row.at", title: "row.title", meta: ["row.by"] };
+    expect(decodeNode(timeline)._tag).toBe("Success");
+    expect(decodeNode({ ...timeline, meta: ["row.a", "row.b", "row.c"] })._tag).toBe("Failure");
+    expect(
+      decodeNode({ _tag: "callout", tone: "warn", text: null, label: "Budget at 4x" })._tag,
+    ).toBe("Success");
+    expect(decodeNode({ _tag: "callout", tone: "loud", text: "row.note" })._tag).toBe("Failure");
+    expect(decodeNode({ _tag: "code", bind: "row.log", label: "Tail" })._tag).toBe("Success");
+    expect(decodeNode({ _tag: "code", label: "Tail" })._tag).toBe("Failure");
+    expect(VIEW_CATALOG.hardLimits.chartPoints).toBe(60);
+    expect(VIEW_CATALOG.tones?.good).toContain("passed");
+    expect(VIEW_CATALOG.nodes.map((node) => node.tag)).toEqual(
+      expect.arrayContaining(["stat", "chart", "timeline", "callout", "code"]),
+    );
+  });
 });
 
 describe("template selection", () => {

@@ -39,7 +39,15 @@ const tagOf = (raw: unknown): unknown =>
   typeof raw === "object" && raw !== null ? (raw as { readonly _tag?: unknown })._tag : undefined;
 
 /** Lists, tables and nested collapsibles iterate rows; a collapsible is already one row. */
-const FOLDED_OUT: ReadonlySet<ViewNodeTag> = new Set(["list", "table", "collapsible"]);
+const FOLDED_OUT: ReadonlySet<ViewNodeTag> = new Set([
+  "list",
+  "table",
+  "collapsible",
+  // --- blocks additions ---
+  "chart",
+  "timeline",
+  // --- end blocks additions ---
+]);
 
 const decodeAt = (
   raw: unknown,
