@@ -63,6 +63,10 @@
       "types": "./src/ardud/missions/index.ts",
       "default": "./src/ardud/missions/index.ts"
     },
+    "./ardud/imessage": {
+      "types": "./src/ardud/imessage/index.ts",
+      "default": "./src/ardud/imessage/index.ts"
+    },
     "./ardud/missions/mobile": {
       "types": "./src/ardud/missions/mobile/index.ts",
       "default": "./src/ardud/missions/mobile/index.ts"

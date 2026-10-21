@@ -1,0 +1,27 @@
+/*
+ * iMessage section tokens, prefixed `--im-`. The bubbles copy Apple's Messages
+ * colours rather than a theme role, so a sent bubble stays recognisably blue
+ * under every app theme. Use them from Tailwind as `bg-(--im-in)` and so on.
+ */
+:root {
+  --im-in: #e9e9eb;
+  --im-in-ink: #111113;
+  --im-out: #0071e3;
+  --im-raised: #f4f4f5;
+  --im-dot: #007aff;
+  --im-link: var(--primary);
+  /* The app's muted grey falls just under 4.5:1 on the raised details card. */
+  --im-muted: color-mix(in oklab, var(--muted-foreground) 85%, var(--foreground));
+  /* Messages sets bubbles at 15px and the agent details a step smaller, between our 12 and 14. */
+  --im-bubble-text: 0.9375rem;
+  --im-bubble-radius: 18px;
+  --im-detail-text: 0.8125rem;
+}
+
+:root.dark {
+  --im-in: #26262a;
+  --im-in-ink: #f5f5f5;
+  --im-raised: #1c1c1e;
+  --im-dot: #0a84ff;
+  --im-link: #8db4ff;
+}
