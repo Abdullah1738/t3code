@@ -22,6 +22,10 @@ import { Router } from "./router.ts";
 import { ChatRegistry, createSbApi, type ChatCore } from "./runtime.ts";
 import { runIngress } from "./sb-ingress.ts";
 import { sbTransport } from "./sb-transport.ts";
+import { GuestDesk } from "./guest-desk.ts";
+import { flightyDb } from "./guest-flight.ts";
+import { DEFAULT_GUEST_EFFORT, DEFAULT_GUEST_MODEL, GuestResponder, openRouterComplete } from "./guest-responder.ts";
+import { GuestBook } from "./guests.ts";
 import { getSecretRequest, sweepSecrets } from "./secrets.ts";
 import { Sendblue } from "./sendblue.ts";
 import { Store } from "./store.ts";
@@ -200,8 +204,29 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   registry.restore();
   const chats = registry;
 
+  // Scoped third parties: grants in guests.json, audit in guests-audit.jsonl (guests.ts).
+  const guestBook = new GuestBook(stateRoot);
+  const wakeOwner = (text: string, key: string) => { chats.wake(chats.owner, text, key); };
+  /** A plain bridge line into the owner's chat, no agent turn. */
+  const tellOwner = (text: string, key: string) => {
+    try { chats.owner.store.enqueue({ id: `guest-note:${hash(key)}`, kind: "conversation", text }); } catch { log("guest-note-failed"); }
+  };
+  const shareContact = (address: string) => line.shareContact(address);
+  const flights = flightyDb();
+  const guestResponder = new GuestResponder({
+    line: observed, store: ownerStore, book: guestBook, wakeOwner, tellOwner, timezone: config.timezone, log, flights,
+    complete: openRouterComplete(config.guestModel ?? DEFAULT_GUEST_MODEL, config.guestEffort ?? DEFAULT_GUEST_EFFORT),
+    shareContact: async address => { await shareContact(address); },
+  });
+  const guestDesk = new GuestDesk({
+    book: guestBook, responder: guestResponder, ownerStore, owner: config.owner, lineNumber: line.number,
+    providerDeps: { timezone: config.timezone, flights },
+    sendText: (chat, text) => observed.sendText(chat, text), shareContact, wakeOwner, tellOwner, log,
+    note: async (address, text) => { await post("/notify", { source: "iMessage bridge", severity: "info", text, dedupeKey: `sb-guest:${address}` }); },
+  });
+
   api = createSbApi({
-    registry: chats, line, accessPath: accessFile, enabled: ready, reloadAccess: refreshAccess,
+    registry: chats, line, accessPath: accessFile, enabled: ready, reloadAccess: refreshAccess, guests: guestDesk,
     health: () => {
       const backendOk = Date.now() - health.backendLastOk < 60_000;
       // The event stream heartbeats below the Line API, so a quiet line is not a dead one; backfill success is the signal.
@@ -223,18 +248,23 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const abort = new AbortController();
   const ingress = runIngress({
     line: observed, owner: config.owner, ownerStore, access: async () => access,
-    sink: chats.sink(note, () => config.enabled), log,
+    sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message)), log,
   }, abort.signal);
 
   async function tick(): Promise<void> {
     let backendCheckedAt = 0;
     let secretsSweptAt = 0;
     let routeCheckedAt = 0;
+    let flightsCheckedAt = 0;
     while (!stopping) {
       await refreshAccess();
       if (Date.now() - secretsSweptAt >= 30_000) {
         secretsSweptAt = Date.now();
         for (const chat of chats.all()) await sweepSecrets(chat.secretDeps).catch(() => log("secret-sweep-failed"));
+      }
+      if (ready() && Date.now() - flightsCheckedAt >= 60_000) {
+        flightsCheckedAt = Date.now();
+        await guestResponder.flightTick().catch(() => log("guest-flight-tick-failed"));
       }
       if (ready() && Date.now() - routeCheckedAt >= 30_000) {
         routeCheckedAt = Date.now();

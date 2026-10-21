@@ -21,6 +21,10 @@ def remote_cmd(a):
 
 
 sub = args[0] if args else ""
+# `list --all --json` / `bases --json` print the file named by FAKE_LIST_JSON / FAKE_BASES_JSON.
+if sub in ("list", "bases") and os.environ.get(f"FAKE_{sub.upper()}_JSON"):
+    print(open(os.environ[f"FAKE_{sub.upper()}_JSON"]).read())
+    sys.exit(0)
 if sub == "ssh":
     cmd = remote_cmd(args)
     if "bash ~/person/session.sh" in cmd:

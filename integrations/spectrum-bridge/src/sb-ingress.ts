@@ -24,6 +24,12 @@ export type IngressSink = {
   setTyping: (chat: ChatKey, from: string, on: boolean, at: number) => void;
   /** Telegram note for an unknown sender; deduped by the caller's key. */
   note: (address: string, text: string) => Promise<void>;
+  /**
+   * Unknown 1:1 sender (scoped third parties, guests.ts): answered by the scoped responder when
+   * they hold a live grant, otherwise held and raised in the owner's chat. Returns whether it
+   * took the message. Unset: the old Telegram note.
+   */
+  guest?: (message: LineInbound) => Promise<boolean>;
 };
 
 export type IngressDeps = {
@@ -43,6 +49,7 @@ export async function handleInbound(deps: IngressDeps, message: LineInbound): Pr
   const access = await deps.access();
   const decision = decide(access, deps.owner, message.chat, message.from, message.participants);
   if (!decision.allowed) {
+    if (decision.reason === "unknown-dm" && deps.sink.guest) return deps.sink.guest(message);
     await noteOnce(deps, decision.address, message);
     return false;
   }

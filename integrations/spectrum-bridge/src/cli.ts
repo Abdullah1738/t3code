@@ -24,7 +24,8 @@ class RawOutput {
 }
 
 const COMMANDS_HELP = "Expected health, send, send-file, poll, app, react, wake, secret-request, secret, publish, or unpublish."
-  + " Sendblue mode adds location-request, location, ask-owner, chats, allow, and allow-group."
+  + " Sendblue mode adds location-request, location, ask-owner, chats, allow, allow-group,"
+  + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
   + " Alerts and reminders moved to the telegram bridge CLI.";
 const LOCAL_COMMANDS = ["publish", "unpublish"];
 
@@ -62,13 +63,18 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
   "allow-group": ["id", "name", "session"],
+  "guest-allow": ["address", "name", "purpose", "provider", "action", "fact", "expires", "evidence", "session"],
+  "guest-revoke": ["address", "session"],
+  guests: ["session"],
+  "guest-send": ["address", "text", "session", "key"],
+  "share-contact": ["address", "chat", "session"],
   app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key"],
   "secret-request": ["purpose", "field", "card", "session", "key"],
   secret: ["token", "field", "forget"],
   publish: ["port", "app"],
   unpublish: ["port"],
 };
-const REPEATABLE = ["option", "field"];
+const REPEATABLE = ["option", "field", "action", "provider", "fact", "evidence"];
 const BOOLEAN_OPTIONS = ["forget", "card", "admin"];
 
 function parseOptions(args: string[]) {
@@ -278,6 +284,50 @@ export function parseCommand(args: string[]): Command {
       const sessionId = optionalSession(values.session);
       return { method: "POST", path: "/allow-group",
         body: { id, ...(name === undefined ? {} : { name }), ...(sessionId === undefined ? {} : { sessionId }) } };
+    }
+    case "guest-allow": {
+      const address = label(required(values.address, "--address"), "--address", 200)!;
+      const name = label(required(values.name, "--name"), "--name", 100)!;
+      const purpose = label(required(values.purpose, "--purpose"), "--purpose", 300)!;
+      const evidence = lists.evidence ?? [];
+      if (!evidence.length || evidence.length > 4) throw new CliError("--evidence is required (up to 4)");
+      for (const ref of evidence) label(required(ref, "--evidence"), "--evidence", 220);
+      // --action is the first version's name for --provider.
+      const providers = [...lists.provider ?? [], ...lists.action ?? []];
+      if (providers.length > 6) throw new CliError("At most 6 --provider values");
+      for (const spec of providers) if (!/^(meeting|create-hold|flight-status|flight-updates)(:[A-Za-z0-9]{2}\d{1,4}(@\d{4}-\d{2}-\d{2})?)?$/.test(spec)) {
+        throw new CliError("--provider must be meeting, create-hold, flight-status[:EK57] or flight-updates[:EK57]");
+      }
+      const facts = lists.fact ?? [];
+      if (facts.length > 8) throw new CliError("At most 8 --fact values");
+      for (const fact of facts) if (!/^[^=]{1,40}=.{1,300}$/s.test(fact)) throw new CliError("--fact must look like \"gate code=4821\"");
+      const expires = label(values.expires, "--expires", 10);
+      return { method: "POST", path: "/guest-allow", body: {
+        address, name, purpose, evidence, providers, facts, sessionId: sessionOnly(values.session)!, ...(expires === undefined ? {} : { expires }),
+      } };
+    }
+    case "guest-revoke": {
+      const address = label(required(values.address, "--address"), "--address", 200)!;
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/guest-revoke", body: { address, ...(sessionId === undefined ? {} : { sessionId }) } };
+    }
+    case "guests": {
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/guests", body: sessionId === undefined ? {} : { sessionId } };
+    }
+    case "guest-send": {
+      const address = label(required(values.address, "--address"), "--address", 200)!;
+      const text = required(values.text, "--text");
+      if (text.length > 2_000) throw new CliError("--text must be at most 2000 characters");
+      return { method: "POST", path: "/guest-send", body: { address, text, ...session() } };
+    }
+    case "share-contact": {
+      if ((values.address === undefined) === (values.chat === undefined)) throw new CliError("share-contact needs exactly one of --address or --chat");
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/share-contact", body: {
+        ...(values.address === undefined ? { chat: chatSlug(values.chat!) } : { address: label(values.address, "--address", 200)! }),
+        ...(sessionId === undefined ? {} : { sessionId }),
+      } };
     }
     case "poll": {
       const title = label(required(values.title, "--title"), "--title", 200)!;
