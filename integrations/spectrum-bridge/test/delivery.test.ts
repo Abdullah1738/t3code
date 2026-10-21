@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Delivery, classifySendFailure } from "../src/delivery.ts";
+import { Delivery, MAX_ATTEMPTS, classifySendFailure } from "../src/delivery.ts";
 import { Photon, TransportError, type SendResult } from "../src/photon.ts";
 import { Store, type OutboxOperation } from "../src/store.ts";
 
@@ -17,6 +17,9 @@ const day = 24 * 60 * 60 * 1_000;
 type Input = Parameters<Photon["sendText"]>[0];
 const stableId = (id: string, chunk: number, scope = projectScope) =>
   `bridge-${createHash("sha256").update(`${scope}:${id}:${chunk}`).digest("hex")}`;
+
+const unthreadedId = (id: string, chunk: number) =>
+  `bridge-${createHash("sha256").update(`${projectScope}:${id}:${chunk}:unthreaded`).digest("hex")}`;
 
 function setup(path = ":memory:") {
   const store = new Store(path);
@@ -253,10 +256,12 @@ test("chunks at 3500 codepoints, checkpoints and aliases survive reopen, and ret
     return { providerId: resumed.calls.length === 1 ? "second-guid" : "third-guid" };
   });
   await resumed.delivery.tick();
-  expect(resumed.calls[0]).toEqual(rejected!);
-  expect(resumed.calls.map(call => call.id)).toEqual([stableId("chunked", 1), stableId("chunked", 2)]);
+  // A failed reply goes again without its thread target, under its own id, from then on.
+  const { replyTo: _parent, ...unthreaded } = rejected!;
+  expect(resumed.calls[0]).toEqual({ ...unthreaded, id: unthreadedId("chunked", 1) });
+  expect(resumed.calls.map(call => call.id)).toEqual([unthreadedId("chunked", 1), unthreadedId("chunked", 2)]);
   expect(h.calls[0]!.text + resumed.calls.map(call => call.text).join("")).toBe(text);
-  expect(resumed.calls.every(call => call.replyTo === "inbound-parent" && call.chatGuid === chatGuid)).toBe(true);
+  expect(resumed.calls.every(call => call.replyTo === undefined && call.chatGuid === chatGuid)).toBe(true);
   expect(resumed.store.get<number>("firstAttempt:chunked")).toBe(now);
   expect(resumed.store.getOperation("chunked")).toMatchObject({ state: "sent", attempts: 2, providerId: "first-guid" });
   for (const [index, providerId] of ["first-guid", "second-guid", "third-guid"].entries()) {
@@ -337,33 +342,52 @@ test("a duplicate first chunk without a GUID uses the first known GUID as the op
   expect(h.store.getOperation("op")?.providerId).toBe("known-guid");
 });
 
-test.each([1, 2, 4, 13, 14])("gRPC status %i retries at most five times despite retryable=false", async grpcCode => {
+test.each([1, 2, 4, 13, 14])("gRPC status %i keeps retrying the same ID with backoff growing to five minutes until the day ends", async grpcCode => {
   setSystemTime(now);
   const h = setup();
   h.enqueue();
   const failure = new grpc.IMessageError("PRIVATE_ERROR", { code: "internalError", grpcCode, retryable: false });
   expect(classifySendFailure(failure)).toEqual({ retryable: true, uncertain: true, code: "internalError" });
   h.transport.sendText.mockRejectedValue(failure);
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 8; attempt++) {
     const before = Date.now();
     await h.delivery.tick();
-    expect(h.store.getOperation("op")).toMatchObject({ state: attempt === 5 ? "uncertain" : "pending", attempts: attempt });
+    expect(h.store.getOperation("op")).toMatchObject({ state: "pending", attempts: attempt });
     expect(h.store.get<number>("firstAttempt:op")).toBe(now);
-    if (attempt < 5) {
-      const retryAt = h.store.get<number>("retry:op")!;
-      expect(retryAt).toBe(before + 5_000 * 2 ** attempt);
-      setSystemTime(retryAt - 1);
-      await h.delivery.tick();
-      expect(h.transport.sendText).toHaveBeenCalledTimes(attempt);
-      setSystemTime(retryAt);
-    }
+    const retryAt = h.store.get<number>("retry:op")!;
+    expect(retryAt).toBe(before + Math.min(300_000, 5_000 * 2 ** attempt));
+    setSystemTime(retryAt - 1);
+    await h.delivery.tick();
+    expect(h.transport.sendText).toHaveBeenCalledTimes(attempt);
+    setSystemTime(retryAt);
   }
+  // The last retry that still fits in the window, then nothing more.
+  setSystemTime(now + day - 300_000);
+  await h.delivery.tick();
+  expect(h.store.getOperation("op")).toMatchObject({ state: "uncertain", attempts: 9 });
+  setSystemTime(now + day);
   h.delivery.recover();
   await h.delivery.tick();
-  expect(h.transport.sendText).toHaveBeenCalledTimes(5);
+  expect(h.transport.sendText).toHaveBeenCalledTimes(9);
   expect(h.transport.sendText.mock.calls.every(([input]) => input.id === stableId("op", 0))).toBe(true);
-  expect(h.log.mock.calls).toEqual(Array.from({ length: 5 }, () => ["outbound-failed", "internalError"]));
+  expect(h.log.mock.calls).toEqual(Array.from({ length: 9 }, () => ["outbound-failed", "internalError"]));
   expect(h.delivery.status()).toEqual({ lastError: "internalError" });
+});
+
+test("the attempt cap still ends a runaway retry loop inside the window", async () => {
+  setSystemTime(now);
+  const h = setup();
+  h.enqueue();
+  h.transport.sendText.mockRejectedValue(new Error("unknown"));
+  await h.delivery.tick();
+  h.store.db.query("UPDATE outbox SET attempts = ? WHERE id = 'op'").run(MAX_ATTEMPTS - 1);
+  setSystemTime(h.store.get<number>("retry:op")!);
+  await h.delivery.tick();
+  expect(h.store.getOperation("op")).toMatchObject({ state: "uncertain", attempts: MAX_ATTEMPTS });
+  h.delivery.recover();
+  setSystemTime(now + 3_600_000);
+  await h.delivery.tick();
+  expect(h.transport.sendText).toHaveBeenCalledTimes(2);
 });
 
 test.each([
@@ -376,9 +400,12 @@ test.each([
   h.transport.sendText.mockRejectedValue(failure);
   for (let attempt = 0; attempt < 5; attempt++) {
     await h.delivery.tick();
+    expect(h.store.getOperation("op")?.state).toBe("pending");
     setSystemTime(h.store.get<number>("retry:op")!);
   }
-  expect(h.store.getOperation("op")).toMatchObject({ state: "failed", attempts: 5 });
+  setSystemTime(now + day - 60_000);
+  await h.delivery.tick();
+  expect(h.store.getOperation("op")).toMatchObject({ state: "failed", attempts: 6 });
   expect(h.store.get("chunk:op:0")).toBeUndefined();
 });
 
@@ -531,13 +558,13 @@ test("a changed destination never retries a stable key with different chat conte
   expect(h.delivery.status()).toEqual({ lastError: "chatChanged" });
 });
 
-test("interrupted sends recover only with a known first attempt strictly within 24 hours and attempts below five", async () => {
+test("interrupted sends recover only with a known first attempt strictly within 24 hours and attempts below the cap", async () => {
   setSystemTime(now);
   const path = databasePath();
   const h = setup(path);
   for (const [id, firstAttempt, attempts] of [
     ["recent", now - day + 1, 4], ["boundary", now - day, 1], ["expired", now - day - 1, 1],
-    ["missing", undefined, 1], ["future", now + 1, 1], ["exhausted", now - 1, 5],
+    ["missing", undefined, 1], ["future", now + 1, 1], ["exhausted", now - 1, 1],
     ["invalid", "not-a-date", 1], ["null", null, 1],
   ] as const) {
     h.enqueue(id);
@@ -547,6 +574,7 @@ test("interrupted sends recover only with a known first attempt strictly within 
       h.store.outboxState(id, "sending");
     }
   }
+  h.store.db.query("UPDATE outbox SET attempts = ? WHERE id = 'exhausted'").run(MAX_ATTEMPTS);
   h.store.close();
   const recovered = setup(path);
   for (const id of ["recent", "boundary", "expired", "missing", "future", "exhausted", "invalid", "null"]) {
@@ -758,16 +786,17 @@ test.each(["route", "cancelled", "chat", "expired"])("%s change during upload fe
   expect(h.transport.sendAttachment).not.toHaveBeenCalled();
 });
 
-test("upload failures retry the same final stage up to five times without message ambiguity or repeated captions", async () => {
+test("upload failures retry the same final stage until the day ends without message ambiguity or repeated captions", async () => {
   setSystemTime(now);
   const h = setupAttachment();
   h.enqueue("file", { attachment: h.attachment });
   h.transport.uploadAttachment.mockRejectedValue(Object.assign(new Error("PRIVATE_SOURCE_PATH"), { code: "PRIVATE_SECRET" }));
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    if (attempt === 6) setSystemTime(now + day - 60_000);
     await h.delivery.tick();
-    expect(h.store.getOperation("file")).toMatchObject({ state: attempt < 5 ? "pending" : "failed", attempts: attempt });
+    expect(h.store.getOperation("file")).toMatchObject({ state: attempt < 6 ? "pending" : "failed", attempts: attempt });
     expect(h.store.get<boolean>("sendAmbiguous:file")).toBe(false);
-    if (attempt < 5) {
+    if (attempt < 6) {
       const retryAt = h.store.get<number>("retry:file")!;
       setSystemTime(retryAt - 1);
       await h.delivery.tick();
@@ -778,12 +807,12 @@ test("upload failures retry the same final stage up to five times without messag
   h.delivery.recover();
   await h.delivery.tick();
   expect(h.transport.sendText).toHaveBeenCalledTimes(1);
-  expect(h.transport.uploadAttachment).toHaveBeenCalledTimes(5);
+  expect(h.transport.uploadAttachment).toHaveBeenCalledTimes(6);
   expect(h.transport.uploadAttachment.mock.calls.every(([input]) => input.id === stableId("file", 1))).toBe(true);
   expect(h.transport.sendAttachment).not.toHaveBeenCalled();
   expect(h.store.get("upload:file")).toBeUndefined();
   expect(h.store.get("chunk:file:1")).toBeUndefined();
-  expect(h.log.mock.calls).toEqual(Array.from({ length: 5 }, () => ["outbound-failed", "unknownSendFailure"]));
+  expect(h.log.mock.calls).toEqual(Array.from({ length: 6 }, () => ["outbound-failed", "unknownSendFailure"]));
 });
 
 test("a lost upload response can reupload, and later send rejection is not made ambiguous by the upload", async () => {
@@ -854,7 +883,7 @@ test("crash after attachment dispatch reuses the persisted upload and stable ID,
   expect(resumed.store.getOperation("file")).toMatchObject({ state: "sent", attempts: 2 });
 });
 
-test.each(["unknown", "grpc", "unaccepted"])("attachment send failure (%s) retries retain the upload GUID and stop at five attempts", async mode => {
+test.each(["unknown", "grpc", "unaccepted"])("attachment send failure (%s) retries retain the upload GUID and stop when the day ends", async mode => {
   setSystemTime(now);
   const h = setupAttachment();
   h.enqueue("file", { text: "", attachment: h.attachment });
@@ -862,21 +891,23 @@ test.each(["unknown", "grpc", "unaccepted"])("attachment send failure (%s) retri
     ? new TransportError("tokenNetwork", true)
     : new grpc.IMessageError("PRIVATE_SEND_FAILURE", { code: "internalError", grpcCode: 13, retryable: false });
   h.transport.sendAttachment.mockRejectedValue(failure);
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    if (attempt === 6) setSystemTime(now + day - 60_000);
     await h.delivery.tick();
     expect(h.store.getOperation("file")).toMatchObject({
-      state: attempt < 5 ? "pending" : mode === "unaccepted" ? "failed" : "uncertain", attempts: attempt,
+      state: attempt < 6 ? "pending" : mode === "unaccepted" ? "failed" : "uncertain", attempts: attempt,
     });
-    if (attempt < 5) setSystemTime(h.store.get<number>("retry:file")!);
+    if (attempt < 6) setSystemTime(h.store.get<number>("retry:file")!);
   }
+  setSystemTime(now + day);
   h.delivery.recover();
   await h.delivery.tick();
   expect(h.transport.uploadAttachment).toHaveBeenCalledTimes(1);
-  expect(h.transport.sendAttachment.mock.calls).toEqual(Array.from({ length: 5 }, () => [{
+  expect(h.transport.sendAttachment.mock.calls).toEqual(Array.from({ length: 6 }, () => [{
     id: stableId("file", 0), chatGuid, attachmentGuid: "upload-guid",
   }]));
   expect(h.store.get("chunk:file:0")).toBeUndefined();
-  expect(h.log.mock.calls).toEqual(Array.from({ length: 5 }, () => ["outbound-failed", classifySendFailure(failure).code]));
+  expect(h.log.mock.calls).toEqual(Array.from({ length: 6 }, () => ["outbound-failed", classifySendFailure(failure).code]));
 });
 
 test("an upstream missing attachment after an ambiguous send never triggers reupload or clears uncertainty", async () => {

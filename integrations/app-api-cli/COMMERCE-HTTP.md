@@ -77,6 +77,65 @@ For Talabat, `recover-payment` restores the exact received transaction and nativ
 polling cursor. For Minutes, it reads the exact persisted order, including a
 terminal failed result. It never reconstructs a checkout or resends place/payment.
 Payment success is distinct from exact order confirmation and delivery tracking.
+If a Talabat place response returned no order ID, `order-status`, `recover-payment`
+and `reconcile-order` expose its retained HTTP status and reason (including duplicate
+order rejection) without polling payment or changing the fence. Read the account
+history with `talabat-search orders --json`; a missing order and a rejected place
+are not bank no-charge proof. There is no payment cursor to recover in this case.
+
+### Duplicate rejection and explicit new-flow override
+
+An unambiguous HTTP400 `duplicateOrderError` with no placed-order payload is
+`REJECTED_DUPLICATE`, not a payment-pending or unknown submission. No payment is
+sent. After a 30-second visibility interval the restaurant flow automatically
+tries a read-only closure: exact owned cart/intent, fresh profile-bound complete
+history, exact details for recent same-branch orders, then a second unchanged
+complete history. Unknown, truncated, changing or conflicting evidence keeps the
+account fenced. Retry the **reads**, never the place request:
+
+```sh
+commerce reconcile-order FLOW_UUID --close-duplicate
+```
+
+Successful closure records terminal journal state `REJECTED_DUPLICATE` and lifts
+the account block. Every receipt, consumed send, cart identity and reservation
+remains retained. The rejected purchase still reports `ok:false`; the closure
+command reports whether reconciliation succeeded. Neither means an order was
+placed or that a bank capture/hold was audited. Generic 4xx errors cannot use this
+path. `release-flow` delegates orderless Talabat cases to the same checks.
+Older receipts used `SUBMISSION_UNKNOWN` for both genuine and malformed duplicate
+responses and lost that distinction. They never auto-close or get relabelled.
+An explicit `--legacy-rejection-evidence "verified original rejection evidence"`
+attestation is required with `--close-duplicate`; it is retained in the closure
+audit, alongside the same fresh history/cart checks. Do not supply it from the
+duplicate reason alone. New cart receipts retain a canonical manifest digest so
+row aggregation, row order and choice ordering do not prevent reconciliation.
+
+A matching order blocks closure. If the caller independently placed that order
+later in the app, provide its exact ID with `--separate-order ORDER_ID`, a
+timezone-qualified `--separate-order-after ISO_TIME` after the rejection, and
+`--evidence "actual independent-placement evidence"`. This explicit attestation
+is audited alongside fresh exact account/order/items/date checks. It excludes
+only that order, never assigns it to the rejected flow or touches it. Do not infer
+independent placement from a history timestamp alone.
+
+For a separately authorized, genuinely different restaurant purchase, a **new**
+flow may use `--allow-duplicate-of ORDER_ID`. The referenced order must appear in
+fresh complete same-account history at the same branch. Its exact items must map
+uniquely to the live menu, and the set of base menu-item IDs must differ. Quantity,
+notes or modifiers alone do not enable the override. The reference is part of the
+intent hash and is checked again before place; it sets the native
+`allowDuplicateOrder:true` field only for this explicit request. It never resumes
+or resends a consumed place request, nor bypasses an unresolved account fence.
+
+The native flag exists in the recovered request contract. The server's exact
+duplicate key and time window remain undocumented. The October 21 rejection
+occurred for a new food cart and a different base item (hot versus iced latte) at
+the same branch, so item-ID/cart-ID inequality alone is not enough to avoid it.
+No paid live test of the override is claimed.
+
+### Confirmation and payment readback
+
 Talabat order/recovery returns `ok:false` (exit 1) and `purchase_confirmed:false`
 until the exact transaction reports success **and** the same authenticated
 account's order list contains the returned ID. Tracker registration for a pending

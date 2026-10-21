@@ -152,15 +152,20 @@ def _free_port(start: int) -> int:
     raise OffboxError("no free local port", code=2)
 
 
-def ports(me: dict, remote: int, local: int | None, box_id: str | None) -> int:
+def ports(me: dict, remote: int, local: int | None, box_id: str | None, reverse: bool = False) -> int:
     box = resolve_box(me, box_id)
     s = api.get(box)
     if not s or s.get("state") not in api.LIVE_STATES:
         raise OffboxError(f"{box} is not running; run something first", code=2)
     ssh_sync.setup(box)
-    lp = local or _free_port(remote)
-    say(f"tunnel http://127.0.0.1:{lp} -> {box}:127.0.0.1:{remote}  (Ctrl-C to close; keeps the lease warm)")
-    p = ssh_sync.tunnel(box, remote, lp)
+    if reverse:
+        # The Mac-side service already listens, so its port is never guessed.
+        lp = local or remote
+        say(f"reverse tunnel {box}:127.0.0.1:{remote} -> this Mac 127.0.0.1:{lp}  (Ctrl-C to close; keeps the lease warm)")
+    else:
+        lp = local or _free_port(remote)
+        say(f"tunnel http://127.0.0.1:{lp} -> {box}:127.0.0.1:{remote}  (Ctrl-C to close; keeps the lease warm)")
+    p = ssh_sync.tunnel(box, remote, lp, reverse)
     try:
         while p.poll() is None:
             time.sleep(60)

@@ -15,7 +15,7 @@ HELP = """offbox: run heavy work (tests, installs, docker) on a boat.dev VM inst
   offbox logs <run> [--follow] | wait <run>     for --bg runs
   offbox save [--name N] [--default] [--note ..] | bases | base rm N | keep [--days N]
   offbox local --reason ".." [--ttl 2h] | --list | --clear
-  offbox list [--all] | release [<id>|--mine] [--delete] | ssh [<id>] [-- cmd] | ports <port> [--local N]
+  offbox list [--all] | release [<id>|--mine] [--delete] | ssh [<id>] [-- cmd] | ports <port> [--local N] [--reverse]
   offbox spend [--json] [--check] | reap [--dry-run] | status | whoami | template build <name> | template list
 Light Go checks (single-package go test -run, go vet of 1-3 packages, gofmt -l) run on this Mac in a sandbox;
 --remote forces the box.
@@ -73,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     po.add_argument("remote_port", type=int)
     po.add_argument("--local", type=int)
     po.add_argument("--box")
+    po.add_argument("--reverse", action="store_true",
+                    help="expose the Mac's 127.0.0.1:<--local> on the box at 127.0.0.1:<port> instead")
     sp.add_parser("whoami")
     sp.add_parser("status")
 
@@ -208,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 cmd = cmd[1:]
             return misc.ssh_shell(me, box, cmd)
         elif a.sub == "ports":
-            return misc.ports(me, a.remote_port, a.local, a.box)
+            return misc.ports(me, a.remote_port, a.local, a.box, a.reverse)
         elif a.sub == "whoami":
             print(json.dumps(me, indent=1))
         elif a.sub == "status":

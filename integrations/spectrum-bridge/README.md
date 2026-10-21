@@ -42,6 +42,22 @@ under `~/.config/spectrum-bridge/`.
   `@mentions`, URLs and code spans are left untouched. A message or card left
   empty is cancelled and logged as `outbound-skipped`/`emptyAfterSanitize`
   instead of sending an empty bubble.
+- A send the provider fails transiently is retried under the same idempotency
+  id, backing off from 10 seconds to every 5 minutes, for up to 24 hours from
+  its first attempt. A text reply that fails once is resent without its thread
+  target (SMS refuses threaded replies) under its own id, and stays unthreaded.
+  When sends keep failing for 10 minutes, one Telegram alert goes out through
+  the telegram bridge, and one more when they work again. Images and app cards
+  iMessage refuses, or still can't send after 10 minutes, are sent to Telegram
+  instead (the card's HTML file when it is published here, otherwise its link)
+  and their row moves to state `fallback`. Secure form links never leave
+  iMessage.
+- Sendblue app cards open in the iMessage app named by `cardApp` in
+  config.json (`appName`, `extensionBundleId`, `teamId`, optional
+  `appStoreId`), defaulting to Photon's Spectrum app. Photon mode always uses
+  Spectrum. Card text loses times, dates and day words such as "today"
+  because iMessage turns a card whose text holds one into a plain text bubble;
+  put those details in the page.
 - Questions (OpenCode forms) and approvals raised in the active chat, or by
   any running subagent below it at any depth, are sent into the conversation.
   This is the only place they are asked: OpenChamber and the telegram bridge
@@ -94,6 +110,16 @@ under `~/.config/spectrum-bridge/`.
   runs `tailscale serve` for a free HTTPS port in 18400-18499 (or reuses an
   existing mapping) and prints the URL; `unpublish --port N` removes one. Only
   ports in that range are ever created or removed.
+- Public links for people off the tailnet: `share --app SLUG [--days N]`
+  (default 7, max 30) serves only that app's folder from its own loopback
+  server through a Cloudflare quick tunnel (`cloudflared`, no account) and
+  prints the `trycloudflare.com` URL. The bridge owns the tunnels: at most 10
+  live, stopped at expiry, killed with the bridge, and re-created with a new
+  URL when the bridge starts again (`share-restarted` log). `unshare --app SLUG`
+  ends one; `shares` lists them. `share` and `publish --app` return
+  `metadataWarnings` for a missing `<title>`, `og:title`, `og:description` or
+  `og:image`, and served pages get relative `og:image`/`og:url` made absolute
+  so link previews load.
 - Secure forms: `secret-request --session S --key K --purpose P --field name:Label[:type]`
   sends a one-time app card (15 minutes) for credentials. Submitted values are
   stored in `~/.config/spectrum-bridge/secrets/` (0600, never in the chat,
@@ -141,6 +167,46 @@ under `~/.config/spectrum-bridge/`.
 - `batched` is a terminal inbound state: a non-leader member of a batch whose
   text travelled inside the leader's prompt. The batch outcome is on the
   leader row; the aggregate is kept in kv `batch:<leaderId>`.
+
+## Scoped third parties (Sendblue mode, 2026-10-21)
+
+Owner rule: someone the owner told to text the line may be answered, but only
+for that one purpose, and the owner's own words are the only approval.
+
+- An unknown 1:1 sender is never answered by an agent. `guest-desk.ts` holds
+  the message (owner store `guest-held:<address>`) and wakes the owner's chat
+  once per sender per 6 hours, at most 6 such wakes an hour (beyond that a
+  Telegram note). The wake quotes their text as data, says whether they are in
+  Contacts (`guest-evidence.ts` reads the AddressBook read-only) and lists
+  evidence: the owner's own outgoing messages (`from_me = 1`) in that person's
+  1:1 iMessage/WhatsApp chat or email to them, last 30 days, that name the line
+  number or "Robob" (message-archive `index.db`, read-only). Groups keep the
+  old Telegram note.
+- `guest-allow` (owner chat session only, never a bare shell or another chat)
+  stores a grant in `~/.config/spectrum-bridge/guests.json`: purpose, actions
+  (`meeting`, `create-hold`), expiry (default 7 d, max 30 d) and the evidence.
+  The bridge checks the evidence itself: `msgs:<id>` must be the owner's
+  outgoing message to that exact address that names the line, or
+  `owner:<inbound id>` must be something he typed in his chat. `create-hold`
+  also needs calendar wording in his message. A new grant replaces the old one;
+  scope never merges. Held messages are released to the responder, and the
+  owner gets a plain notice of the scope.
+- Granted senders are answered by `guest-responder.ts`, not by an agent: one
+  OpenRouter call (`guestModel`, default `anthropic/claude-sonnet-5.5`) with no
+  tools. The bridge works out free windows from `applecal` (start/end only,
+  all-day entries ignored, 10:00-18:00 Mon-Fri, 15 min buffers, 14 days) and
+  puts only those in the prompt. Nothing else about the owner is in it. The
+  model returns JSON (`reply`, `action`, `slot`, `ownerNote`); code checks it:
+  replies with links, emails or phone numbers are replaced and escalated, a
+  `book` slot must fit a free window (max 2 h). Without `create-hold` a booking
+  wakes the owner to confirm; with it the bridge writes a tentative hold and
+  tells him. `escalate`/`decline` wake the owner. Each inbound gets at most one
+  reply (marked before sending), 25 replies a day per guest, and Robob's
+  name and photo are shared after the first reply.
+- `guest-send` relays the owner's decision to someone who has texted the line;
+  `guest-revoke`, `guests` and `share-contact --chat|--address` (Name & Photo
+  Sharing) are owner-only. Every step goes to `guests-audit.jsonl` (0600, no
+  message bodies).
 
 ## Robob backend
 

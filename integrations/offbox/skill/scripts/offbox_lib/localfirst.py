@@ -1048,7 +1048,7 @@ class Rerun(Exception):
 def run(a, me, steps: list[str]) -> int | None:
     """Run locally and return the exit code, or None when it could not start here (caller goes remote). Raises
     Rerun when the sandbox blocked the run. Once the command has started this never returns None."""
-    from .runs import report_exit, step_results, steps_block
+    from .runs import command_block, report_exit, step_results, steps_block
     slot, rundir, lf, con = None, None, None, None
     try:
         try:
@@ -1065,6 +1065,8 @@ def run(a, me, steps: list[str]) -> int | None:
             # The command's /tmp/x files live in the run's private dir: no stale files from earlier runs, no
             # clashes between parallel runs, nothing left behind.
             cmd = TMP_REF.sub(rundir + "/t/", shown)
+            if not steps:
+                cmd = command_block(cmd)
             env = local_env(a, rid, os.path.join(rundir, "tmp"), me["repo_root"])
             prof = profile(os.path.realpath(me["repo_root"]), rundir, env, list(a.include or []))
             chk = subprocess.run([SANDBOX, "-p", prof, "/usr/bin/true"], capture_output=True, timeout=30)

@@ -14,6 +14,14 @@ describe("parseCommand", () => {
     expect(parseCommand(["health"])).toEqual({ method: "GET", path: "/health" });
   });
 
+  test("location commands take an optional --chat slug", () => {
+    expect(parseCommand(["location", "--session", "ses_1"])).toEqual({ method: "POST", path: "/location", body: { sessionId: "ses_1" } });
+    expect(parseCommand(["location", "--session", "ses_1", "--chat", "moni"]).body).toEqual({ sessionId: "ses_1", chat: "moni" });
+    expect(parseCommand(["location-request", "--session", "ses_1", "--key", "k", "--chat", "moni"]).body)
+      .toEqual({ sessionId: "ses_1", dedupeKey: "k", chat: "moni" });
+    expect(() => parseCommand(["location", "--session", "ses_1", "--chat", "Not A Slug"])).toThrow("Invalid chat slug");
+  });
+
   test("parses send-file purely as a local reference with a required session, optional caption and MIME", () => {
     expect(parseCommand(sendFile)).toEqual({ method: "POST", path: "/files",
       body: { file: "/nonexistent/report.pdf", dedupeKey: "file-1", text: "", sessionId: "session-1" } });
@@ -347,5 +355,17 @@ describe("CLI entry point (no live socket)", () => {
     expect(exitCode).toBe(1);
     expect(stdout).toBe("");
     expect(stderr).toBe(`${JSON.stringify({ error })}\n`);
+  });
+});
+
+describe("guest-allow", () => {
+  test("takes providers, facts and several evidence refs; --action is the old name for --provider", () => {
+    const body = parseCommand(["guest-allow", "--address", "+447700900123", "--name", "Ali", "--purpose", "pick me up",
+      "--provider", "flight-updates:EK57", "--action", "meeting", "--fact", "meeting point=Door 4", "--evidence", "msgs:21", "--evidence", "owner:o-1", "--session", "ses_1"]).body;
+    expect(body).toEqual({ address: "+447700900123", name: "Ali", purpose: "pick me up", providers: ["flight-updates:EK57", "meeting"],
+      facts: ["meeting point=Door 4"], evidence: ["msgs:21", "owner:o-1"], sessionId: "ses_1" });
+    expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--provider", "shell", "--evidence", "msgs:1", "--session", "ses_1"])).toThrow();
+    expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--fact", "nokey", "--evidence", "msgs:1", "--session", "ses_1"])).toThrow();
+    expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--session", "ses_1"])).toThrow();
   });
 });

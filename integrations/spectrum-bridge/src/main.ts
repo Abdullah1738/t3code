@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createApi } from "./api.ts";
 import { startAppsServer } from "./apps.ts";
 import { Delivery } from "./delivery.ts";
-import { alertSkillPath, loadConfig, skillPath, stateRoot, telegramBridgeSocket } from "./config.ts";
+import { alertSkillPath, loadConfig, skillPath, stateRoot, telegramBridgeSocket, transportKind } from "./config.ts";
 import { ingest } from "./ingress.ts";
 import { acquireLock } from "./lock.ts";
 import { backendKind, createBackend } from "./backend.ts";
@@ -14,9 +14,12 @@ import { backfillOrigins, OriginBackfill } from "./origin-backfill.ts";
 import { canonicalOwnerChat, Photon } from "./photon.ts";
 import { publish } from "./publish.ts";
 import { Router } from "./router.ts";
+import { serveSendblue } from "./sb-main.ts";
 import { sweepSecrets } from "./secrets.ts";
+import { cloudflaredTunnel, Shares } from "./share.ts";
 import { Store } from "./store.ts";
 import { transcribe } from "./stt.ts";
+import { socketPost, telegramOutlet } from "./telegram-fallback.ts";
 import { createAttachmentRecovery } from "./local-attachments.ts";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -73,6 +76,8 @@ async function main(): Promise<void> {
   const config = await loadConfig();
   const mode = process.argv[2] ?? "serve";
   if (!["serve", "check", "pair"].includes(mode)) throw new Error("Unknown bridge command");
+  // Sendblue owns its own serve loop; branching before Photon is built leaves the Photon path untouched.
+  if (transportKind(config) === "sendblue") return serveSendblue(config, mode, { log, errorCode, removeStaleSocket });
   const photon = new Photon(process.env.SPECTRUM_PROJECT_ID ?? "", process.env.SPECTRUM_PROJECT_SECRET ?? "");
   const kind = backendKind(process.env, config);
   const backend = await createBackend(kind, config);
@@ -173,7 +178,10 @@ async function main(): Promise<void> {
       return appsUrl;
     } finally { clearTimeout(timer); }
   };
-  api = createApi({ store, photon, router: () => router, chatGuid: () => chatGuid,
+  const shares = new Shares({ store, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log });
+  process.once("exit", () => shares.killAll());
+  void shares.restore().catch(() => log("share-sweep-failed"));
+  api = createApi({ store, photon, router: () => router, chatGuid: () => chatGuid, shares,
     ...(apps ? { secrets: { stateRoot, publishApps } } : {}),
     enabled: ready, health: () => ({
       status: Date.now() - health.photonLastOk < 60_000 && Date.now() - health.backendLastOk < 60_000 ? "healthy" : "degraded",
@@ -185,9 +193,16 @@ async function main(): Promise<void> {
       ...(appsUrl ? { appsUrl } : {}),
       appsRoot: config.appsRoot,
     }) });
+  // Outage alerts and the Telegram copy of stuck images and cards go through the telegram bridge.
+  const outlet = telegramOutlet({
+    post: socketPost(telegramBridgeSocket), appsRoot: config.appsRoot,
+    appsUrl: () => store.get<{ port: number; url: string } | null>("appsPublished")?.url,
+    blob: sha256 => store.getBlob(sha256),
+  });
   const delivery = new Delivery(store, photon, { projectScope, chatGuid: () => chatGuid,
     beforeSend: async item => router?.beforeSend(item) ?? "send",
-    enabled: () => ready() && !controlsPending && !stopping, log });
+    enabled: () => ready() && !controlsPending && !stopping, log,
+    ...(config.enabled ? outlet : {}) });
   delivery.recover();
 
   async function receive(): Promise<void> {
@@ -230,7 +245,12 @@ async function main(): Promise<void> {
     let backendCheckedAt = 0;
     let secretsSweptAt = 0;
     let routeCheckedAt = 0;
+    let sharesSweptAt = Date.now();
     while (!stopping) {
+      if (Date.now() - sharesSweptAt >= 30_000) {
+        sharesSweptAt = Date.now();
+        void shares.sweep().catch(() => log("share-sweep-failed"));
+      }
       // Runs even when messaging is not ready: submitted values must still expire on time.
       if (Date.now() - secretsSweptAt >= 30_000) {
         secretsSweptAt = Date.now();
@@ -265,6 +285,7 @@ async function main(): Promise<void> {
     clearInterval(timer);
     await server.stop(true);
     await apps?.stop().catch(() => {});
+    await shares.stopAll().catch(() => {});
     if (chatGuid) await photon.typing(chatGuid, false).catch(() => {});
     await photon.close();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.

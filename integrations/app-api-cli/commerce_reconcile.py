@@ -123,6 +123,9 @@ def reconcile(flow_id, *, auth=None):
     binding=journal.binding(flow_id);local=journal.inspect(flow_id)
     store=receipts.load(**binding).snapshot()
     order=local['order_id']
+    from commerce_order_status import talabat_place_failure
+    failure=talabat_place_failure(binding,local,store)
+    if failure is not None:return failure
     placed=[x for x in store.receipts if x.operation=='place' and x.order_id==order]
     if not order or len(placed)!=1:journal.fail('EXACT_PLACE_RECEIPT_REQUIRED')
     auth=auth or CommerceAuth();evidence=[]

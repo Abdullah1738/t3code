@@ -10,5 +10,7 @@ credentials="$config/credentials.env"
 set -a
 source "$credentials"
 set +a
-[[ -n "${SPECTRUM_PROJECT_ID:-}" && -n "${SPECTRUM_PROJECT_SECRET:-}" ]] || exit 1
+# Photon needs its project pair; Sendblue mode needs its key pair instead (config.json picks the transport).
+[[ -n "${SPECTRUM_PROJECT_ID:-}" && -n "${SPECTRUM_PROJECT_SECRET:-}" ]] \
+  || [[ -n "${SENDBLUE_API_KEY_ID:-}" && -n "${SENDBLUE_API_SECRET:-}" ]] || exit 1
 exec "$HOME/.bun/bin/bun" "$HOME/.local/share/spectrum-bridge/src/main.ts" "$@"

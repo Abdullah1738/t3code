@@ -1,0 +1,12 @@
+{
+  "name": "robob-cards",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "robob-cards-build": "bin/robob-cards-build",
+    "robob-cards-enroll": "bin/robob-cards-enroll"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

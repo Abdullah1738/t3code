@@ -151,6 +151,17 @@ def _manifest(items, item_notes=()):
     return [lines[key] for key in order]
 
 
+def manifest_digest(branch, items):
+    """Canonical basket binding independent of row splitting and wire ordering."""
+    import hashlib
+    import json
+    rows = [(item_id, quantity, note, sorted((cid, q, sorted(subs)) for cid, q, subs in choices))
+            for item_id, quantity, note, choices in _manifest(items)]
+    rows.sort(key=lambda row: json.dumps(row, sort_keys=True))
+    return hashlib.sha256(json.dumps({'branch':branch,'items':rows},sort_keys=True,
+                                    separators=(',',':'),allow_nan=False).encode()).hexdigest()
+
+
 def choices_echo(row):
     """Structurally validate one cart echo row's choices fields.
 

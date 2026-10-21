@@ -150,6 +150,12 @@ def parse_response(status, body):
     if body.get('smsVerificationError') is not None or mobile:
         return stopped('CHALLENGE_REQUIRED', 'MOBILE_VERIFICATION_REQUIRED')
     if body.get('duplicateOrderError') is not None:
+        if (type(status) is int and status == 400
+                and type(body['duplicateOrderError']) is dict
+                and body.get('placedOrder') is None and generic is None
+                and not set(body) - {'duplicateOrderError', 'placedOrder', 'genericError',
+                                     'smsVerificationError', 'tracking', 'trackingInfo'}):
+            return stopped('REJECTED_DUPLICATE', 'DUPLICATE_ORDER_ERROR_NO_RETRY')
         return stopped('SUBMISSION_UNKNOWN', 'DUPLICATE_ORDER_ERROR_NO_RETRY')
     if generic is not None:
         return stopped('SUBMISSION_UNKNOWN', 'GENERIC_ERROR_NO_RETRY')
@@ -175,6 +181,7 @@ def project_response(observation):
     if type(observation) is not PlaceObservation or (observation.state, observation.reason) not in {
             ('SUBMISSION_UNKNOWN', 'RESPONSE_MISSING_OR_MALFORMED'),
             ('SUBMISSION_UNKNOWN', 'DUPLICATE_ORDER_ERROR_NO_RETRY'),
+            ('REJECTED_DUPLICATE', 'DUPLICATE_ORDER_ERROR_NO_RETRY'),
             ('SUBMISSION_UNKNOWN', 'GENERIC_ERROR_NO_RETRY'),
             ('SUBMISSION_UNKNOWN', 'HTTP_STATUS_UNSUPPORTED_NO_RETRY'),
             ('SUBMISSION_UNKNOWN', 'PLACED_ORDER_IDENTITY_INVALID'),

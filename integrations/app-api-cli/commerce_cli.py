@@ -77,11 +77,13 @@ def purchase_talabat(args):
                 branch=args.branch,items=items,verticals_key=verticals_key)
             print(json.dumps({'flow_id':args.resume_flow,'phase':'settled',
                 'cart_id':settled['cart_id'],'adopted_from':settled['adopted_from']}),flush=True)
-        flow=TalabatFlow(vertical=args.vertical,branch=args.branch,items=items,flow_id=args.resume_flow)
+        flow=TalabatFlow(vertical=args.vertical,branch=args.branch,items=items,flow_id=args.resume_flow,
+                         allow_duplicate_of=getattr(args,'allow_duplicate_of',None))
         print(json.dumps({'flow_id':flow.flow_id,'phase':'resumed'}),flush=True)
         review=flow.resume_cart(verticals_key=verticals_key)
     else:
-        flow=TalabatFlow(vertical=args.vertical,branch=args.branch,items=items)
+        flow=TalabatFlow(vertical=args.vertical,branch=args.branch,items=items,
+                         allow_duplicate_of=getattr(args,'allow_duplicate_of',None))
         print(json.dumps({'flow_id':flow.flow_id,'phase':'created'}),flush=True)
         review=flow.prepare(verticals_key=verticals_key)
     print(json.dumps({'flow_id':flow.flow_id,'review':review}),flush=True)
@@ -121,9 +123,15 @@ def purchase_talabat(args):
                 result['verification_error']=(code if type(code) is str and re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code)
                                               else 'ORDER_VERIFICATION_READ_FAILED')
         else:
-            result['error']='TALABAT_PAYMENT_NOT_CONFIRMED'
+            result['error']='TALABAT_PAYMENT_NOT_CONFIRMED' if order else 'TALABAT_PLACE_NOT_CONFIRMED'
         if not confirmed:
-            result['next_action']=RECONCILE_NOT_REORDER.format(flow=flow.flow_id)
+            from commerce_order_status import TALABAT_ORDERLESS_NEXT_ACTION
+            result['next_action']=(RECONCILE_NOT_REORDER.format(flow=flow.flow_id) if order
+                                   else TALABAT_ORDERLESS_NEXT_ACTION)
+        if result['state']=='REJECTED_DUPLICATE':
+            from commerce_talabat_duplicate import NEXT_ACTION
+            result.update(error='TALABAT_REJECTED_DUPLICATE',delivery_status=None,
+                          next_action=NEXT_ACTION.replace('FLOW',flow.flow_id))
     finally:
         # A returned order must be tracked even when payment validation or its
         # receipt raises. This never repeats place or submits a payment fallback.
@@ -529,23 +537,8 @@ def release_flow(args):
         if any(x['kind'] in ('payment',) for x in local['operations']):
             journal.fail('RELEASE_PAYMENT_CONSUMED')
         if not local['order_id']:
-            # Orderless refusal: the server answered the place with an error and
-            # no order id. Evidence review = the refused place receipt itself
-            # (4xx, empty order/transaction identity) plus the journal shape.
-            import commerce_receipts as receipts
-            snap = receipts.load(**binding).snapshot()
-            refused = [r for r in snap.receipts if r.operation == 'place'
-                       and 400 <= (r.http_status or 0) <= 499
-                       and not r.order_id and not r.transaction_id]
-            if len(refused) != 1:
-                journal.fail('RELEASE_TALABAT_ORDERLESS_EVIDENCE_INVALID')
-            evidence={'place_http_status':refused[0].http_status,
-                      'place_state':refused[0].state,'order_id':None}
-            result=journal.release_orderless(args.flow_id,
-                evidence_hash=journal.digest({'flow_id':args.flow_id,'evidence':evidence}))
-            return {'ok':True,'flow_id':args.flow_id,**result,
-                    'order':None,'evidence':evidence,
-                    'reservation_minor_retained':local['reserved_minor'],'financial_retry':False}
+            from commerce_talabat_duplicate import close_duplicate
+            return close_duplicate(args.flow_id)
         # Live readback proving the merchant order never paid: the zombie sits in
         # order_confirmingdelayed with no amounts, unchanged for days, and the
         # journal itself never observed a payment send.
@@ -650,7 +643,11 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
     if journal.inspect(flow_id)['state']==journal.OWNER_ATTESTED_UNCHARGED:
         journal.fail('JOURNAL_FLOW_OWNER_ATTESTED_UNCHARGED')
     store=receipts.load(**binding)
-    cursor=store.snapshot().talabat_readback()
+    snapshot=store.snapshot()
+    from commerce_order_status import talabat_place_failure
+    failure=talabat_place_failure(binding,journal.inspect(flow_id),snapshot)
+    if failure is not None:return failure
+    cursor=snapshot.talabat_readback()
 
     def finish_recovered(state, reason, next_index):
         """Close a conclusive paid flow read-only: reconcile fence, exact-order
@@ -835,6 +832,8 @@ def talabat_arguments(parser):
     parser.add_argument('--item-note',default='',metavar='TEXT',
         help='restaurant note for the single-item flag; basket files carry per-line notes')
     parser.add_argument('--label',default='Talabat order')
+    parser.add_argument('--allow-duplicate-of',metavar='ORDER_ID',
+        help='explicit new-flow duplicate-guard override; requires same-account order and different base items')
 
 
 def main(argv=None):
@@ -863,6 +862,14 @@ def main(argv=None):
     exact.add_argument('vertical');exact.add_argument('order')
     status=commands.add_parser('order-status');status.add_argument('flow_id')
     disposition=commands.add_parser('reconcile-order');disposition.add_argument('flow_id')
+    disposition.add_argument('--close-duplicate',action='store_true',
+        help='close a definitive duplicate refusal after fresh complete order-history checks; never resends')
+    disposition.add_argument('--separate-order',metavar='ORDER_ID',
+        help='exact independently placed matching order; needs --separate-order-after and --evidence')
+    disposition.add_argument('--separate-order-after',metavar='ISO_TIME',
+        help='caller-attested independent-placement lower time bound with timezone')
+    disposition.add_argument('--legacy-rejection-evidence',metavar='TEXT',
+        help='explicit evidence of definitive rejection for a legacy lossy SUBMISSION_UNKNOWN receipt')
     disposition.add_argument('--owner-attest-no-charge',action='store_true',
         help='terminal Talabat close using explicit owner evidence plus fresh exact provider checks; never retries')
     disposition.add_argument('--evidence',metavar='TEXT',
@@ -969,7 +976,16 @@ def main(argv=None):
             result=status(args.flow_id)
         elif args.command=='reconcile-order':
             from commerce_reconcile import reconcile, owner_attest_no_charge
-            if args.owner_attest_no_charge:
+            if args.close_duplicate:
+                if args.owner_attest_no_charge or args.attested_by is not None:
+                    journal.fail('DUPLICATE_CLOSURE_FLAGS_CONFLICT')
+                from commerce_talabat_duplicate import close_duplicate
+                result=close_duplicate(args.flow_id,separate_order=args.separate_order,
+                    separate_after=args.separate_order_after,separate_evidence=args.evidence,
+                    legacy_rejection_evidence=args.legacy_rejection_evidence)
+            elif args.separate_order is not None or args.separate_order_after is not None or args.legacy_rejection_evidence is not None:
+                journal.fail('DUPLICATE_CLOSURE_FLAG_REQUIRED')
+            elif args.owner_attest_no_charge:
                 result=owner_attest_no_charge(args.flow_id,evidence=args.evidence,attested_by=args.attested_by)
             elif args.evidence is not None or args.attested_by is not None:
                 journal.fail('OWNER_ATTESTATION_FLAG_REQUIRED')

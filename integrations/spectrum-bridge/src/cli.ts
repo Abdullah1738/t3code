@@ -4,12 +4,12 @@ import { request } from "node:http";
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, resolve, win32 } from "node:path";
 import { parseArgs } from "node:util";
-import { resolveAppFile } from "./apps.ts";
+import { metadataWarnings, resolveAppFile, validAppSlug } from "./apps.ts";
 import { loadAppsConfig } from "./config.ts";
 import { type Exec, publish, PUBLISH_MAX, PUBLISH_MIN, PublishError, unpublish } from "./publish.ts";
 import { CARD_FIELDS, parseFieldSpec, SECRET_FIELD_TYPES, type SecretField, validFieldName, validToken } from "./secrets.ts";
 
-type Body = Record<string, string | string[] | SecretField[]>;
+type Body = Record<string, string | number | boolean | string[] | SecretField[]>;
 type Command = { method: "GET" | "POST"; path: string; body?: Body };
 /** Tailnet publishing runs in the CLI process itself; it never goes through the bridge socket. */
 export type LocalCommand =
@@ -24,6 +24,9 @@ class RawOutput {
 }
 
 const COMMANDS_HELP = "Expected health, send, send-file, poll, app, react, wake, secret-request, secret, publish, or unpublish."
+  + " Sendblue mode adds location-request, location, ask-owner, chats, allow, allow-group,"
+  + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
+  + " Public links: share, unshare, and shares."
   + " Alerts and reminders moved to the telegram bridge CLI.";
 const LOCAL_COMMANDS = ["publish", "unpublish"];
 
@@ -52,17 +55,31 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   health: [],
   "send-file": ["file", "key", "text", "session", "mime"],
   react: ["target", "kind"],
-  send: ["text", "session", "key", "effect", "subject"],
+  send: ["text", "session", "key", "effect", "subject", "to"],
   poll: ["title", "option", "session", "key"],
-  wake: ["text", "source", "key"],
+  wake: ["text", "source", "key", "chat", "session"],
+  "location-request": ["session", "key", "chat"],
+  location: ["session", "chat"],
+  "ask-owner": ["text", "session", "key"],
+  chats: ["session"],
+  allow: ["address", "name", "admin", "session"],
+  "allow-group": ["id", "name", "session"],
+  "guest-allow": ["address", "name", "purpose", "provider", "action", "fact", "expires", "evidence", "session"],
+  "guest-revoke": ["address", "session"],
+  guests: ["session"],
+  "guest-send": ["address", "text", "session", "key"],
+  "share-contact": ["address", "chat", "session"],
   app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key"],
   "secret-request": ["purpose", "field", "card", "session", "key"],
   secret: ["token", "field", "forget"],
   publish: ["port", "app"],
   unpublish: ["port"],
+  share: ["app", "days"],
+  unshare: ["app"],
+  shares: [],
 };
-const REPEATABLE = ["option", "field"];
-const BOOLEAN_OPTIONS = ["forget", "card"];
+const REPEATABLE = ["option", "field", "action", "provider", "fact", "evidence"];
+const BOOLEAN_OPTIONS = ["forget", "card", "admin"];
 
 function parseOptions(args: string[]) {
   const command = args[0];
@@ -112,7 +129,7 @@ function portOption(value: string | undefined, label: string): number {
   return port;
 }
 
-export const validAppSlug = (value: unknown): value is string => typeof value === "string" && /^[a-z0-9-]{1,64}$/.test(value);
+export { validAppSlug };
 
 export const isLocalCommand = (args: string[]): boolean => LOCAL_COMMANDS.includes(args[0] ?? "");
 
@@ -144,7 +161,7 @@ export async function runLocalCommand(command: LocalCommand, options: { exec?: E
     const index = await resolveAppFile(appsRoot, `/${command.app}/index.html`);
     if (!index) throw new CliError(`No app at ${appsRoot}/${command.app}/index.html`);
     const { url, port, created } = await publish(appsPort, deps);
-    return { url: `${url}/${command.app}/`, port, created };
+    return { url: `${url}/${command.app}/`, port, created, metadataWarnings: metadataWarnings(await Bun.file(index).text()) };
   } catch (error) {
     if (error instanceof CliError) throw error;
     throw new CliError(error instanceof PublishError ? error.message : "Tailnet publish failed");
@@ -166,6 +183,18 @@ export function parseCommand(args: string[]): Command {
     if (!value.trim() || value.length > max || control.test(value)) {
       throw new CliError(`${name} must be 1 to ${max} characters on one line`);
     }
+    return value;
+  }
+  function optionalSession(value: string | undefined): string | undefined {
+    if (value === undefined) return;
+    if (!value.trim() || value.length > 200 || /\s/.test(value) || control.test(value)) throw new CliError("Invalid --session");
+    return value;
+  }
+  function sessionOnly(value: string | undefined): string | undefined {
+    return optionalSession(required(value, "--session"));
+  }
+  function chatSlug(value: string): string {
+    if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(value)) throw new CliError("Invalid chat slug; list them with chats");
     return value;
   }
 
@@ -192,14 +221,20 @@ export function parseCommand(args: string[]): Command {
     }
     case "react": {
       const kind = required(values.kind, "--kind");
-      if (!["like", "love", "dislike", "laugh", "emphasize", "question"].includes(kind)) {
-        throw new CliError("--kind must be like, love, dislike, laugh, emphasize, or question");
+      // Sendblue mode also takes one emoji; the bridge checks it, since only it knows the transport.
+      const tapback = ["like", "love", "dislike", "laugh", "emphasize", "question"].includes(kind);
+      if (!tapback && (/^[\x00-\x7f]+$/.test(kind) || kind.length > 32 || /\s/.test(kind) || control.test(kind))) {
+        throw new CliError("--kind must be like, love, dislike, laugh, emphasize, question, or one emoji");
       }
       return { method: "POST", path: "/react", body: { target: required(values.target, "--target"), kind } };
     }
     case "send": {
       const text = required(values.text, "--text");
       if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (values.to !== undefined) {
+        if (values.effect !== undefined || values.subject !== undefined) throw new CliError("--to does not take --effect or --subject");
+        return { method: "POST", path: "/send", body: { text, to: chatSlug(values.to), ...session() } };
+      }
       const body: Record<string, string> = { text, ...session() };
       if (values.effect !== undefined) {
         if (!(EFFECT_NAMES as readonly string[]).includes(values.effect)) {
@@ -214,10 +249,89 @@ export function parseCommand(args: string[]): Command {
     case "wake": {
       const text = required(values.text, "--text");
       if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (values.chat !== undefined) {
+        const source = label(values.source, "--source", 100);
+        return { method: "POST", path: "/wake",
+          body: { text, chat: chatSlug(values.chat), ...session(), ...(source === undefined ? {} : { source }) } };
+      }
+      if (values.session !== undefined) throw new CliError("Invalid command arguments");
       const source = label(required(values.source, "--source"), "--source", 100)!;
       const dedupeKey = required(values.key, "--key");
       if (dedupeKey.length > 200) throw new CliError("--key must be at most 200 characters");
       return { method: "POST", path: "/wake", body: { text, source, dedupeKey } };
+    }
+    case "location-request":
+      return { method: "POST", path: "/location-request",
+        body: { ...session(), ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
+    case "location":
+      return { method: "POST", path: "/location",
+        body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
+    case "ask-owner": {
+      const text = required(values.text, "--text");
+      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      return { method: "POST", path: "/ask-owner", body: { text, ...session() } };
+    }
+    case "chats": {
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/chats", body: sessionId === undefined ? {} : { sessionId } };
+    }
+    case "allow": {
+      const address = label(required(values.address, "--address"), "--address", 200)!;
+      const name = label(required(values.name, "--name"), "--name", 100)!;
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/allow",
+        body: { address, name, admin: flags.admin === true, ...(sessionId === undefined ? {} : { sessionId }) } };
+    }
+    case "allow-group": {
+      const id = label(required(values.id, "--id"), "--id", 200)!;
+      const name = label(values.name, "--name", 100);
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/allow-group",
+        body: { id, ...(name === undefined ? {} : { name }), ...(sessionId === undefined ? {} : { sessionId }) } };
+    }
+    case "guest-allow": {
+      const address = label(required(values.address, "--address"), "--address", 200)!;
+      const name = label(required(values.name, "--name"), "--name", 100)!;
+      const purpose = label(required(values.purpose, "--purpose"), "--purpose", 300)!;
+      const evidence = lists.evidence ?? [];
+      if (!evidence.length || evidence.length > 4) throw new CliError("--evidence is required (up to 4)");
+      for (const ref of evidence) label(required(ref, "--evidence"), "--evidence", 220);
+      // --action is the first version's name for --provider.
+      const providers = [...lists.provider ?? [], ...lists.action ?? []];
+      if (providers.length > 6) throw new CliError("At most 6 --provider values");
+      for (const spec of providers) if (!/^(meeting|create-hold|flight-status|flight-updates)(:[A-Za-z0-9]{2}\d{1,4}(@\d{4}-\d{2}-\d{2})?)?$/.test(spec)) {
+        throw new CliError("--provider must be meeting, create-hold, flight-status[:EK57] or flight-updates[:EK57]");
+      }
+      const facts = lists.fact ?? [];
+      if (facts.length > 8) throw new CliError("At most 8 --fact values");
+      for (const fact of facts) if (!/^[^=]{1,40}=.{1,300}$/s.test(fact)) throw new CliError("--fact must look like \"gate code=4821\"");
+      const expires = label(values.expires, "--expires", 10);
+      return { method: "POST", path: "/guest-allow", body: {
+        address, name, purpose, evidence, providers, facts, sessionId: sessionOnly(values.session)!, ...(expires === undefined ? {} : { expires }),
+      } };
+    }
+    case "guest-revoke": {
+      const address = label(required(values.address, "--address"), "--address", 200)!;
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/guest-revoke", body: { address, ...(sessionId === undefined ? {} : { sessionId }) } };
+    }
+    case "guests": {
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/guests", body: sessionId === undefined ? {} : { sessionId } };
+    }
+    case "guest-send": {
+      const address = label(required(values.address, "--address"), "--address", 200)!;
+      const text = required(values.text, "--text");
+      if (text.length > 2_000) throw new CliError("--text must be at most 2000 characters");
+      return { method: "POST", path: "/guest-send", body: { address, text, ...session() } };
+    }
+    case "share-contact": {
+      if ((values.address === undefined) === (values.chat === undefined)) throw new CliError("share-contact needs exactly one of --address or --chat");
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/share-contact", body: {
+        ...(values.address === undefined ? { chat: chatSlug(values.chat!) } : { address: label(values.address, "--address", 200)! }),
+        ...(sessionId === undefined ? {} : { sessionId }),
+      } };
     }
     case "poll": {
       const title = label(required(values.title, "--title"), "--title", 200)!;
@@ -252,6 +366,21 @@ export function parseCommand(args: string[]): Command {
       if (new Set(fields.map(field => field.name)).size !== fields.length) throw new CliError("--field names must be distinct");
       return { method: "POST", path: "/secret-request", body: { purpose, fields, ...session() } };
     }
+    case "share": {
+      const app = required(values.app, "--app");
+      if (!validAppSlug(app)) throw new CliError("--app must be 1-64 characters of a-z, 0-9, or -");
+      if (values.days !== undefined && !/^\d{1,2}$/.test(values.days)) throw new CliError("--days must be 1 to 30");
+      const days = values.days === undefined ? undefined : Number(values.days);
+      if (days !== undefined && (days < 1 || days > 30)) throw new CliError("--days must be 1 to 30");
+      return { method: "POST", path: "/share", body: days === undefined ? { app } : { app, days } };
+    }
+    case "unshare": {
+      const app = required(values.app, "--app");
+      if (!validAppSlug(app)) throw new CliError("--app must be 1-64 characters of a-z, 0-9, or -");
+      return { method: "POST", path: "/unshare", body: { app } };
+    }
+    case "shares":
+      return { method: "POST", path: "/shares", body: {} };
     case "secret": {
       const token = required(values.token, "--token");
       if (!validToken(token)) throw new CliError("Invalid --token");
@@ -342,7 +471,8 @@ async function sendCommand(command: Command): Promise<unknown> {
   // Queued sends echo only an acknowledgement; never surface their response bodies.
   const queued = ["/files", "/send", "/poll", "/app", "/wake"].includes(command.path);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
+  // Opening a quick tunnel waits for Cloudflare's edge, which can take a while.
+  const timer = setTimeout(() => controller.abort(), command.path === "/share" ? 60_000 : 15_000);
   try {
     return await new Promise<unknown>((resolve, reject) => {
       const fail = () => reject(new CliError(controller.signal.aborted ? "Bridge request timed out" : "Bridge request failed"));

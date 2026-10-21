@@ -61,7 +61,14 @@ export interface SessionRecord {
 }
 
 /** `GET /api/session/active` lists running sessions only; an absent id is idle. */
-export type SessionStatus = { type: "busy" };
+export type SessionStatus = {
+  type: "busy";
+  /**
+   * Top-level session a subagent belongs to, or null for a top-level session.
+   * Absent when the backend cannot tell; callers then treat it as possibly related.
+   */
+  root?: string | null;
+};
 
 /** OpenCode 2 `Permission.Request` (packages/schema/src/permission.ts). */
 export interface PermissionRequest {
@@ -247,6 +254,12 @@ function validRoot(root: unknown): root is string {
 export type OwnerWords = { inboundId: string; text: string };
 
 /**
+ * How a steer landed. `started`/`queued` mean the run ended first and the text
+ * became (or waits for) a run of its own; `refused` means nothing was sent.
+ */
+export type SteerDelivery = "steered" | "started" | "queued" | "refused";
+
+/**
  * What the router and the origin backfill need from a backend. OpenChamber
  * implements it here; Robob's control API implements it in robob.ts.
  */
@@ -271,8 +284,18 @@ export interface ChatBackend {
    */
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
     model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords): Promise<void>;
+  /**
+   * Adds text to the session's running turn, never queueing behind it. Backends
+   * without it (OpenChamber) keep follow-ups as their own turns.
+   */
+  steer?(id: string, directory: string, messageId: string, text: string, guidance?: string): Promise<SteerDelivery>;
   abort(id: string, directory: string): Promise<boolean>;
   statuses(): Promise<Record<string, SessionStatus>>;
+  /**
+   * Whether one session is busy. Optional because `statuses()` already answers it;
+   * backends whose full list is slow (Robob) implement this cheap single lookup.
+   */
+  sessionBusy?(id: string, directory: string): Promise<boolean>;
   permissions(sessionId: string, directory: string): Promise<PermissionRequest[]>;
   questions(sessionId: string, directory: string): Promise<QuestionRequest[]>;
   /** `inboundId` is the owner's typed reply the answer came from, when there is one. */

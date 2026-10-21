@@ -90,6 +90,12 @@ function fakeControl() {
       if (thread && parts[2] === "interrupt") return ok({ interrupted: true });
       if (thread && parts[2] === "send") {
         const messageId = `${sentMessagePrefix(thread.threadId)}${encodeURIComponent(body.clientRequestId)}`;
+        const running = thread.runs.find(run => run.status === "running");
+        if (body.mode === "steer" && !thread.messages.some(message => message.messageId === messageId)) {
+          if (!running) return Response.json({ ok: false, error: { code: "conflict", message: "no steerable run" } }, { status: 409 });
+          thread.messages.push({ messageId, runId: running.runId, role: "user", text: body.text, streaming: false, createdBy: "system", createdAt: now(), updatedAt: now() });
+          return ok({ threadId: thread.threadId, messageId, delivery: "steered" });
+        }
         if (!thread.messages.some(message => message.messageId === messageId)) {
           const runId = `run:thread:${thread.threadId}:ordinal:${thread.runs.length + 1}`;
           thread.runs.push({ runId, ordinal: thread.runs.length + 1, status: "running" });
@@ -176,6 +182,20 @@ test("prompt sends channel guidance beside the text, sends the model and dedupes
   // Robob attributed the unverified relay to the bridge; it is still the bridge's prompt.
   const records = await backend.messages(id, directory);
   expect(records).toEqual([{ id: prompt, type: "user", text: "hello", time: expect.any(Object) }]);
+});
+
+test("steer sends mode steer into the running run and reports a refusal when nothing is running", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  expect(await backend.steer(id, directory, `msg_${"b".repeat(64)}`, "early", "Note.")).toBe("refused");
+  await backend.prompt(id, directory, `msg_${"a".repeat(64)}`, "hello", "Be brief.");
+  const steer = `msg_${"c".repeat(64)}`;
+  expect(await backend.steer(id, directory, steer, "also this", "Came in mid-turn.")).toBe("steered");
+  const sends = control.calls.filter(call => call.path.endsWith("/send"));
+  expect(sends.at(-1)!.body).toEqual({ text: "also this", mode: "steer", clientRequestId: steer, guidance: "Came in mid-turn." });
+  expect(control.threads.get(id)!.runs).toHaveLength(1);
+  expect(await backend.promptAccepted(id, directory, steer)).toBe(true);
 });
 
 test("the owner's typed words go alone with their inbound id; a quote or the bridge's lead becomes guidance", async () => {
@@ -292,9 +312,11 @@ test("statuses list busy threads; waiting (background drain) does not block the 
   const backend = control.backend();
   const { id, directory } = await backend.createChat();
   await backend.prompt(id, directory, "msg_1", "hi");
-  expect(await backend.statuses()).toEqual({ [id]: { type: "busy" } });
+  expect(await backend.statuses()).toEqual({ [id]: { type: "busy", root: null } });
+  expect(await backend.sessionBusy(id)).toBe(true);
   control.reply(id, "done", "waiting");
   expect(await backend.statuses()).toEqual({});
+  expect(await backend.sessionBusy(id)).toBe(false);
 });
 
 test("retireOthers settles idle iMessage chats except the kept one", async () => {
@@ -313,6 +335,25 @@ test("retireOthers settles idle iMessage chats except the kept one", async () =>
   expect(control.threads.get("other")!.settled).toBeUndefined();
   expect(control.threads.get("child")!.settled).toBeUndefined();
   expect(await backend.retireOthers(keep.id)).toBe(0);
+});
+
+test("a per-chat backend makes titled threads under chats/<slug> and retires only its own", async () => {
+  const control = fakeControl();
+  const root = control.backend();
+  const moni = root.forChat("chats/moni", "Moni");
+  const ownerOld = await root.createChat();
+  const moniOld = await moni.createChat();
+  const moniKeep = await moni.createChat();
+  expect(moniKeep.directory).toMatch(/^\/chats\/chats\/moni\/\d{4}-\d{2}-\d{2}\/session-[0-9a-f-]{36}$/);
+  expect(control.threads.get(moniKeep.id)!.title).toBe("Moni");
+  expect(await moni.retireOthers(moniKeep.id)).toBe(1);
+  expect(control.threads.get(moniOld.id)!.settled).toBe(true);
+  expect(control.threads.get(ownerOld.id)!.settled).toBeUndefined();
+  const ownerKeep = await root.createChat();
+  expect(await root.retireOthers(ownerKeep.id)).toBe(1);
+  expect(control.threads.get(ownerOld.id)!.settled).toBe(true);
+  expect(control.threads.get(moniKeep.id)!.settled).toBeUndefined();
+  expect(() => root.forChat("../escape", "x")).toThrow("Invalid iMessage chat folder");
 });
 
 test("retireOthers counts nothing when the server ignores settled", async () => {

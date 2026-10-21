@@ -24,6 +24,53 @@ export interface Config {
   backend?: string;
   /** Registered Robob project root for iMessage chat folders. */
   robobChatRoot?: string;
+  /** "photon" (default, the rollback) or "sendblue". */
+  transport?: "photon" | "sendblue";
+  /** Our Sendblue line number, required when transport is "sendblue". */
+  sendblueNumber?: string;
+  /** OpenRouter model for the tool-less scoped third-party responder (guest-responder.ts). */
+  guestModel?: string;
+  /** OpenRouter reasoning effort for that model (default medium). */
+  guestEffort?: "minimal" | "low" | "medium" | "high";
+  /** iMessage app that renders Sendblue app cards; loadConfig fills in the Spectrum identity. */
+  cardApp?: CardApp;
+}
+
+/** The Messages extension a card is addressed to. Recipients need that app installed to open it. */
+export type CardApp = {
+  appName: string;
+  extensionBundleId: string;
+  teamId: string;
+  appStoreId?: number;
+};
+
+/** Photon's Spectrum app, kept as the default so cards look the same until config names our own. */
+export const SPECTRUM_CARD_APP: CardApp = Object.freeze({
+  appName: "Spectrum",
+  appStoreId: 6777616651,
+  extensionBundleId: "codes.photon.Spectrum.MessagesExtension",
+  teamId: "P8XT6232SL",
+});
+
+/** Validates the optional `cardApp` block against Sendblue's app_card limits. */
+export function cardAppConfig(raw: unknown): CardApp {
+  if (raw === undefined) return SPECTRUM_CARD_APP;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("Invalid bridge configuration");
+  const { appName, extensionBundleId, teamId, appStoreId, ...rest } = raw as Record<string, unknown>;
+  if (Object.keys(rest).length > 0
+    || typeof appName !== "string" || !appName.trim() || appName.length > 100
+    || typeof extensionBundleId !== "string" || !/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(extensionBundleId)
+    || typeof teamId !== "string" || !/^[A-Z0-9]{10}$/.test(teamId)
+    || (appStoreId !== undefined && (!Number.isSafeInteger(appStoreId) || (appStoreId as number) < 1))) {
+    throw new Error("Invalid bridge configuration");
+  }
+  return { appName, extensionBundleId, teamId, ...(appStoreId === undefined ? {} : { appStoreId: appStoreId as number }) };
+}
+
+export function transportKind(config: { transport?: unknown }): "photon" | "sendblue" {
+  if (config.transport === undefined || config.transport === "photon") return "photon";
+  if (config.transport === "sendblue") return "sendblue";
+  throw new Error("Invalid bridge configuration");
 }
 
 /** Fills and validates the optional mini-app server fields. */
@@ -61,7 +108,7 @@ export async function loadConfig(): Promise<Config> {
   if (!/^\+[1-9]\d{6,14}$/.test(config.owner) || typeof config.enabled !== "boolean"
     || typeof config.timezone !== "string") throw new Error("Invalid bridge configuration");
   new Intl.DateTimeFormat("en-US", { timeZone: config.timezone });
-  return { ...config, ...appsConfig(config) };
+  return { ...config, ...appsConfig(config), cardApp: cardAppConfig(config.cardApp) };
 }
 
 export async function backendConnection(): Promise<{ baseUrl: string; headers: Record<string, string> }> {

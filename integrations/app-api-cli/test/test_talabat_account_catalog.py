@@ -50,7 +50,7 @@ class AccountCatalogTests(unittest.TestCase):
         self.assertEqual(Path(importlib.util.find_spec('talabat_checkout').origin).parent,
                          SOURCE)
         self.assertEqual(Path(importlib.util.find_spec('catalog_schema').origin).parent,
-                         CATALOG)
+                         SOURCE)
 
     def test_home_is_unique_owned_and_not_first(self):
         data = address_data()

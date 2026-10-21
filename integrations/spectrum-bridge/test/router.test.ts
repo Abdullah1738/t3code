@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_INCOMING_BYTES, MAX_PREVIEW_BYTES } from "../src/inbound-files.ts";
-import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type RequestOptions, type SessionRecord, type SessionStatus } from "../src/openchamber.ts";
+import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type RequestOptions, type SessionRecord, type SessionStatus, type SteerDelivery } from "../src/openchamber.ts";
 
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
@@ -314,6 +314,95 @@ test("creates only for a question, reuses a chat serially, and emits only final 
   expect(h.hints).toContainEqual(["read", options.chatGuid]);
   expect(h.backend.reads).toContainEqual(["permissions", "ses_1", "/Chats/ses_1"]);
   expect(h.backend.reads).toContainEqual(["questions", "ses_1", "/Chats/ses_1"]);
+});
+
+type Steer = { id: string; messageId: string; text: string; guidance?: string };
+/** Gives the fake backend Robob's steer; `behavior` stands in for the server's answer. */
+function steering(backend: Backend, behavior?: (call: Steer) => Promise<SteerDelivery>) {
+  const steers: Steer[] = [];
+  Object.assign(backend, {
+    async steer(id: string, _directory: string, messageId: string, text: string, guidance?: string) {
+      const call = { id, messageId, text, guidance };
+      steers.push(call);
+      if (behavior) return behavior(call);
+      if (!backend.records.some(m => m.id === messageId)) backend.records.push({ id: messageId, type: "user", text, time: { created: Date.now() } });
+      return "steered";
+    },
+  });
+  return steers;
+}
+
+test("a text sent mid-turn is steered into the running turn, never re-sent, and the turn still replies", async () => {
+  const h = setup();
+  const steers = steering(h.backend);
+  h.input("in_1", "First question");
+  await h.router.tick();
+  h.input("in_2", "Also check the weather");
+  await h.router.tick();
+  expect(steers).toEqual([{ id: "ses_1", messageId: messageId("in_2"), text: "Also check the weather", guidance: expect.stringContaining("\"in_2\"") }]);
+  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["in_1"]);
+  expect(h.store.get<{ steered?: string[] }>("activeTurn")!.steered).toEqual([messageId("in_2")]);
+  const final = h.backend.final("Both answered");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["First question"]);
+  expect(steers).toHaveLength(1);
+  expect(h.conversations().map(op => [op.id, op.text, op.replyTo])).toEqual([[`reply:1:${final.id}`, "Both answered", "in_1"]]);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.pendingInbound()).toEqual([]);
+});
+
+test("a steer that lands after the run ended is delivered once and both answers go out", async () => {
+  const h = setup();
+  const steers = steering(h.backend, async () => "queued");
+  h.input("in_1", "First question");
+  await h.router.tick();
+  h.input("in_2", "One more thing");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  const first = h.backend.final("First answer");
+  await h.router.tick();
+  // The queued text has not shown up yet, so the turn is not over.
+  expect(h.conversations()).toEqual([]);
+  h.backend.records.push({ id: messageId("in_2"), type: "user", text: "One more thing", time: { created: Date.now() } });
+  const second = h.backend.final("Second answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${first.id}`, "First answer"], [`reply:1:${second.id}`, "Second answer"]]);
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["First question"]);
+  expect(steers).toHaveLength(1);
+  expect(h.store.pendingInbound()).toEqual([]);
+});
+
+test("a steer the server refuses goes out once as its own turn after the current one", async () => {
+  const h = setup();
+  const steers = steering(h.backend, async () => "refused");
+  h.input("in_1", "First question");
+  await h.router.tick();
+  h.input("in_2", "Follow-up");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  expect(h.store.pendingInbound().find(row => row.id === "in_2")?.state).toBe("pending");
+  h.backend.final("First answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => [p.text, p.messageId])).toEqual([["First question", messageId("in_1")], ["Follow-up", messageId("in_2")]]);
+  expect(steers).toHaveLength(1);
+});
+
+test("commands and watcher wakes mid-turn are never steered", async () => {
+  const h = setup();
+  const steers = steering(h.backend);
+  h.input("in_1", "First question");
+  await h.router.tick();
+  h.input("wake:w1", "watcher fired");
+  h.input("status", "/status");
+  await h.router.tick();
+  await h.router.tick();
+  expect(steers).toEqual([]);
+  expect(h.store.pendingInbound().map(row => row.id)).toEqual(["in_1", "wake:w1"]);
 });
 
 test("new command leaves naming to OpenCode on the next real question", async () => {
@@ -3981,6 +4070,19 @@ test("a nested subagent's request is asked too: OpenChamber and Telegram stay qu
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_deep", "/Chats/ses_grandchild", "once"]]);
   expect(h.backend.permissionReplySessions).toEqual(["ses_grandchild"]);
+});
+
+test("busy sessions the backend places in another conversation never trigger a subagent walk", async () => {
+  const h = setup();
+  h.input("first", "Hi");
+  await h.router.tick();
+  h.backend.states.ses_other = { type: "busy", root: null };
+  h.backend.states.ses_other_child = { type: "busy", root: "ses_other" };
+  await h.router.tick();
+  expect(h.backend.reads.filter(([kind]) => kind === "children")).toEqual([]);
+  h.backend.states.ses_child = { type: "busy", root: "ses_1" };
+  await h.router.tick();
+  expect(h.backend.reads).toContainEqual(["children", "ses_1", "/Chats/ses_1"]);
 });
 
 test("a subagent's permission request is asked in the conversation and answered on the child session", async () => {

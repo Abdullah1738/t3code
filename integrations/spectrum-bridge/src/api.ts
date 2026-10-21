@@ -5,6 +5,7 @@ import type { Router } from "./router.ts";
 import { forgetSecret, newToken, putSecretRequest, readSecret, SECRET_REQUEST_TTL_MS, SecretError, validFieldName, validFields,
   validToken } from "./secrets.ts";
 import { sessionMatches } from "./session.ts";
+import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import type { OutboxOperation, Store } from "./store.ts";
 
 type Options = {
@@ -21,6 +22,8 @@ type Options = {
     publishApps: () => Promise<string>;
     now?: () => number;
   };
+  /** Public Cloudflare links for the apps; absent in per-chat APIs that the Sendblue socket fronts. */
+  shares?: Shares;
 };
 
 type SavedSecretRequest = { spec: string; result: { token: string; url: string; expiresAt: number } };
@@ -123,10 +126,12 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
 }
 
 /** Fetch-compatible handler only; socket ownership and listening belong to main. */
-export function createApi({ store, photon, router, chatGuid, enabled, health, secrets }: Options): (request: Request) => Promise<Response> {
+export function createApi({ store, photon, router, chatGuid, enabled, health, secrets, shares }: Options): (request: Request) => Promise<Response> {
   const pairedChat = () => {
     const guid = chatGuid();
-    return typeof guid === "string" && guid.trim() === guid && /^(?:any|iMessage);-;[^;\s\x00-\x1f\x7f]+$/.test(guid) ? guid : undefined;
+    // Photon chat guids, or Sendblue chat keys (dm:<address> | group:<id>).
+    return typeof guid === "string" && guid.trim() === guid
+      && /^(?:(?:any|iMessage);-;|dm:|group:)[^;\s\x00-\x1f\x7f]+$/.test(guid) ? guid : undefined;
   };
   return async request => {
     try {
@@ -161,8 +166,14 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         throw new ApiError(404);
       }
       if (request.method !== "POST" || !["/files", "/react", "/send", "/poll", "/app", "/wake", "/secret-request", "/secret-read",
-        "/secret-forget"].includes(path)) throw new ApiError(404);
+        "/secret-forget", ...SHARE_ROUTES].includes(path)) throw new ApiError(404);
       const body = await readBody(request, path === "/files" ? MAX_FILE_BODY : path === "/send" || path === "/wake" ? MAX_SEND_BODY : MAX_BODY);
+
+      if (SHARE_ROUTES.includes(path)) {
+        if (!shares) throw new ApiError(404);
+        const outcome = await shareRoute(shares, path, body);
+        return json(outcome.body, outcome.status);
+      }
 
       // Reading or discarding already-submitted values is local-only and never readiness-gated.
       if (path === "/secret-read" || path === "/secret-forget") {

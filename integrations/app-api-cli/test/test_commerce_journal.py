@@ -484,6 +484,7 @@ class ReleaseTest(unittest.TestCase):
         self.fence_it()
         with sqlite3.connect(self.root/'journal.sqlite') as db:
             db.execute('DROP TABLE owner_attestations')
+            db.execute('DROP TABLE duplicate_closures')
             db.execute('PRAGMA user_version=1')
             db.execute('DROP INDEX active_account')
             db.execute("CREATE UNIQUE INDEX active_account "
@@ -732,7 +733,9 @@ class RecoverUnknownRepollTest(unittest.TestCase):
                 return True
 
             def snapshot(self):
-                return SimpleNamespace(talabat_readback=lambda: cursor)
+                return SimpleNamespace(receipts=[SimpleNamespace(operation='payment', order_id='123',
+                                                                 context=cursor.context)],
+                                       talabat_readback=lambda: cursor)
 
         class Auth:
             def fresh_before_mutation(self, app, vertical):

@@ -11,7 +11,7 @@ import commerce_journal as journal
 import talabat_http_checkout as h
 
 
-def intent_scope(vertical, branch, items):
+def intent_scope(vertical, branch, items, allow_duplicate_of=None):
     # Preserve old empty-note/empty-choice flow hashes; any nonempty note or
     # choice set changes the intent. Raw requested rows form the intent.
     scope = {'branch':branch,'vertical':vertical,
@@ -23,11 +23,14 @@ def intent_scope(vertical, branch, items):
     choices = [(x.item_id,x.quantity,tuple(x.choices)) for x in items if x.choices]
     if choices:
         scope['item_choices'] = choices
+    if allow_duplicate_of is not None:
+        scope['allow_duplicate_of'] = allow_duplicate_of
     return journal.digest(scope)
 
 
 class TalabatFlow:
-    def __init__(self, *, vertical, branch, items, receipt_factory=None, auth=None, timeout=120, flow_id=None):
+    def __init__(self, *, vertical, branch, items, receipt_factory=None, auth=None, timeout=120, flow_id=None,
+                 allow_duplicate_of=None):
         if vertical not in ('shops', 'mart', 'restaurants'):
             journal.fail('INVALID_COMMERCE_VERTICAL')
         # Branch 798285 fence removed 2026-10-10: the ghost order 3947177570 was
@@ -37,13 +40,16 @@ class TalabatFlow:
         # remain fully active.
         self.auth = auth or CommerceAuth()
         self.vertical, self.branch, self.items = vertical, branch, items
+        self.allow_duplicate_of = allow_duplicate_of
+        if allow_duplicate_of is not None and vertical != 'restaurants':
+            journal.fail('DUPLICATE_OVERRIDE_RESTAURANTS_ONLY')
         self.flow_id = flow_id or str(uuid.uuid4())
         saved = self._fresh()
         self.account_hash = account_hash(saved)
         journal.require_account_available('talabat',self.account_hash,flow_id=flow_id)
         self.approved = None
         self.store = None
-        scope = intent_scope(vertical, branch, items)
+        scope = intent_scope(vertical, branch, items, allow_duplicate_of)
         self.scope_hash = scope
         if receipt_factory is None:
             import commerce_receipts
@@ -71,6 +77,7 @@ class TalabatFlow:
             # flags and catalog-backed choices, before any cart POST.
             self.store = self.checkout.verify_restaurant_items(branch, items)
             self.items = h._items(self.store, items)
+            if self.allow_duplicate_of is not None:self.verify_duplicate_override(saved)
         else:
             self.store = self.checkout.resolve_grocery(branch, vertical)
             self.items = h._items(self.store, items)
@@ -114,6 +121,12 @@ class TalabatFlow:
         if hasattr(self,'account_hash') and account_hash(saved) != self.account_hash:
             journal.fail('ACCOUNT_CHANGED')
         return saved
+
+    def verify_duplicate_override(self, saved):
+        from commerce_talabat_duplicate import verify_override
+        self.duplicate_override = verify_override(saved, order=self.allow_duplicate_of,
+            branch=self.branch, items=self.items, menu=self.checkout._menu_index,
+            deadline=h.auth.new_deadline(30))
 
     def review_current(self):
         c=self.checkout
@@ -173,7 +186,7 @@ class TalabatFlow:
                 if op == 'place':
                     if time.monotonic()-quote.observed_at >= 120:
                         return False
-                    body = h.place_body(quote); path += '/placeOrder'
+                    body = h.place_body(quote,allow_duplicate=self.allow_duplicate_of is not None); path += '/placeOrder'
                 else:
                     body = h.payment_body(c.placed,quote); path='/pay/v1/payments'
                     if record.get('payment_order_id') != c.placed.order_id:
@@ -211,10 +224,21 @@ class TalabatFlow:
     def purchase(self):
         if self.approved is None:
             journal.fail('EXACT_REVIEW_REQUIRED')
+        if self.allow_duplicate_of is not None:
+            self.verify_duplicate_override(self._fresh())
         placed = self.checkout.submit_place(approved_amount_minor=self.approved['payable_minor'],
-            approved_quote_digest=self.approved['quote_digest'])
+            approved_quote_digest=self.approved['quote_digest'],allow_duplicate=self.allow_duplicate_of is not None)
         if placed.state != 'PAYMENT_PENDING':
-            return {'state':placed.state,'reason':placed.reason,'flow_id':self.flow_id}
+            result = {'state':placed.state,'reason':placed.reason,'flow_id':self.flow_id}
+            if placed.state == 'REJECTED_DUPLICATE':
+                from commerce_talabat_duplicate import close_duplicate
+                try:
+                    result['duplicate_closure'] = close_duplicate(self.flow_id,auth=self.auth,wait_for_history=True)
+                    result['account_fence_lifted'] = True
+                except Exception as exc:
+                    from commerce_reconcile import _safe_read_error
+                    result.update(account_fence_lifted=False,closure_error=_safe_read_error(exc))
+            return result
         result = self.checkout.submit_payment()
         if self.checkout.payment_poller is not None:
             result = self.checkout.poll_payment()

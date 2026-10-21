@@ -1,4 +1,4 @@
-import { IMESSAGE_ORIGIN, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus } from "./openchamber.ts";
+import { IMESSAGE_ORIGIN, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -110,7 +110,16 @@ export interface RobobBackendOptions extends ControlConfigOptions {
    */
   model?: () => Promise<PreferredModel | undefined>;
   client?: ControlClient;
+  /**
+   * Folder under `chatRoot` for this chat's threads (Sendblue non-owner chats use `chats/<slug>`).
+   * The project-root check stays on `chatRoot` so every chat joins the one iMessage project.
+   */
+  subdir?: string;
+  /** Title for new threads, e.g. the person's or group's name. */
+  title?: string;
 }
+
+const CHATS_DIR = "chats";
 
 /** The iMessage router's backend on Robob's control API. Accepts thread ids and OpenCode `ses_` ids alike. */
 export class RobobBackend implements ChatBackend {
@@ -123,6 +132,7 @@ export class RobobBackend implements ChatBackend {
   constructor(private readonly options: RobobBackendOptions) {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
     this.chatRoot = options.chatRoot.replace(/\/+$/, "");
+    if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
   }
@@ -160,15 +170,30 @@ export class RobobBackend implements ChatBackend {
     if (!await this.chatRootRegistered()) throw new Error("iMessage chat root is not a Robob project");
     const now = new Date();
     const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
-    const directory = `${this.chatRoot}/${date}/session-${crypto.randomUUID()}`;
+    const directory = `${this.chatFolder()}/${date}/session-${crypto.randomUUID()}`;
     const model = await (this.options.model ?? (async () => (await imessagePreferences()).model))().catch(() => undefined);
     const created = await this.client.request<{ threadId: string; directory: string | null }>("POST", "/threads", {
       directory, origin: IMESSAGE_ORIGIN, runtimeMode: "full-access",
-      title: title ?? `iMessage ${date} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
+      title: title ?? this.options.title ?? `iMessage ${date} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
       ...(model ? { model: `${model.providerID}/${model.modelID}`, ...(model.variant ? { variant: model.variant } : {}) } : {}),
     });
     if (typeof created.threadId !== "string" || !created.threadId) throw new Error("Invalid Robob thread response");
     return { id: created.threadId, directory: created.directory ?? directory };
+  }
+
+  /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
+  forChat(subdir: string, title: string): RobobBackend {
+    return new RobobBackend({ ...this.options, client: this.client, subdir, title });
+  }
+
+  private chatFolder(): string {
+    return this.options.subdir ? `${this.chatRoot}/${this.options.subdir}` : this.chatRoot;
+  }
+
+  private ownsFolder(path: string | null): boolean {
+    const chats = `${this.chatRoot}/${CHATS_DIR}/`;
+    if (!this.options.subdir) return !path?.startsWith(chats);
+    return path?.startsWith(`${this.chatFolder()}/`) === true;
   }
 
   async markImessageOrigin(id: string): Promise<"marked" | "already" | "missing"> {
@@ -191,6 +216,8 @@ export class RobobBackend implements ChatBackend {
     let settled = 0;
     for (const thread of threads) {
       if (thread.threadId === keep || thread.parentThreadId || thread.settled || thread.archived || BUSY.has(thread.state) || thread.pendingRequest) continue;
+      // Each Sendblue chat retires only its own threads; another person's live chat is not stale.
+      if (!this.ownsFolder(thread.worktreePath)) continue;
       try {
         const result = await this.client.request<{ thread?: { settled?: boolean } } | undefined>("PATCH", `/threads/${encodeURIComponent(thread.threadId)}`, { settled: true });
         // An older server ignores the field and answers 200, so only count what it reports as settled.
@@ -268,6 +295,23 @@ export class RobobBackend implements ChatBackend {
     }, { timeoutMs: 60_000 });
   }
 
+  /**
+   * `mode: "steer"` never queues: with no steerable run Robob answers 409 and
+   * dispatches nothing. A retried POST replays under the same `clientRequestId`.
+   */
+  async steer(id: string, _directory: string, messageId: string, text: string, guidance = ""): Promise<SteerDelivery> {
+    const threadId = await this.resolve(id);
+    try {
+      const { delivery } = await this.client.request<{ delivery?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, {
+        text, mode: "steer", clientRequestId: messageId, ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
+      }, { timeoutMs: 60_000 });
+      return delivery === "started" || delivery === "queued" ? delivery : "steered";
+    } catch (error) {
+      if (error instanceof ControlError && error.status === 409) return "refused";
+      throw error;
+    }
+  }
+
   async abort(id: string, _directory?: string): Promise<boolean> {
     const threadId = await this.resolve(id);
     const result = await this.client.request<{ interrupted?: unknown }>("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, {});
@@ -277,14 +321,23 @@ export class RobobBackend implements ChatBackend {
   /** Busy threads, keyed by thread id and, for imported threads, by their `ses_` id too. */
   async statuses(): Promise<Record<string, SessionStatus>> {
     const { threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
+    const alias = new Map([...this.native].map(([session, threadId]) => [threadId, session]));
     const statuses: Record<string, SessionStatus> = {};
     for (const thread of threads) {
       if (!BUSY.has(thread.state)) continue;
-      statuses[thread.threadId] = { type: "busy" };
-      if (thread.nativeSessionId) statuses[thread.nativeSessionId] = { type: "busy" };
+      // Routes may be stored under an imported `ses_` id, so name the root the way the router knows it.
+      const root = thread.parentThreadId === null ? null : alias.get(thread.rootThreadId) ?? thread.rootThreadId;
+      const busy: SessionStatus = { type: "busy", root };
+      statuses[thread.threadId] = busy;
+      if (thread.nativeSessionId) statuses[thread.nativeSessionId] = busy;
     }
-    for (const [session, threadId] of this.native) if (statuses[threadId]) statuses[session] = { type: "busy" };
+    for (const [session, threadId] of this.native) if (statuses[threadId]) statuses[session] = statuses[threadId];
     return statuses;
+  }
+
+  /** One thread's detail answers in well under a second; the thread list behind `statuses()` takes several. */
+  async sessionBusy(id: string): Promise<boolean> {
+    return BUSY.has((await this.detail(id)).state);
   }
 
   async permissions(sessionId: string, _directory?: string): Promise<PermissionRequest[]> {
