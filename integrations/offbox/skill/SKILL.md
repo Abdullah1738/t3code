@@ -134,7 +134,8 @@ including paths excluded from the working-file sync. The local Git state is read
 are not materialized. Each `--git` sync rebuilds and replaces the remote metadata; `--no-sync` retains it.
 
 UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on the Mac via an SSH tunnel
-(`--local 13000` to pick the local port). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
+(`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
+`127.0.0.1:8080` shows up on the box at `127.0.0.1:1055` (e.g. a Mac-side proxy). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
 
 ## Save state for later (do this!)
 
