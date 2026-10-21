@@ -167,8 +167,70 @@ SETUP_FAILED_MARKER = "offbox-setup-failed"
 STEP_RESULT = re.compile(r"offbox step (\d+) rc=(-?\d+): ")
 
 
+PIPELINE_STATUS = r'''__offbox_pipeline_status() {
+  # $1 accumulates the rightmost failure; the remaining args are PIPESTATUS.
+  # Positional args avoid collisions with callers' readonly shell variables.
+  while (( $# > 2 )); do
+    if (( $2 != 0 && $2 != 141 )); then
+      set -- "$2" "${@:3}"
+    else
+      set -- "$1" "${@:3}"
+    fi
+  done
+  if (( $2 != 0 )); then return "$2"; fi
+  return "$1"
+}'''
+
+
+def standalone_pipeline(cmd: str) -> bool:
+    """Conservatively recognize a single pipeline, not a shell list/control flow.
+
+    Normalize SIGPIPE only here: changing a compound script's exit afterward
+    could report success even though && or errexit skipped subsequent checks.
+    Reject list operators even inside parentheses: shlex removes quotes, so
+    quoted parentheses must never hide real control flow. Uncertain syntax
+    keeps plain pipefail.
+    """
+    if any(mark in cmd for mark in ("<<", "`", "#", "\n")) or cmd.rstrip().endswith("\\"):
+        return False
+    try:
+        lx = shlex.shlex(cmd.strip(), posix=True, punctuation_chars=True)
+        lx.whitespace = " \t\r"
+        tokens = list(lx)
+    except ValueError:
+        return False
+    depth, pipes, previous = 0, 0, ""
+    for token in tokens:
+        if token in {"if", "then", "else", "elif", "fi", "while", "until", "for", "do", "done",
+                     "case", "esac", "select", "function", "{", "}", "!", "time", "coproc"}:
+            return False
+        # shlex groups punctuation, e.g. `);` and `)|`; inspect each operator.
+        parts = re.findall(r"&&|\|\||\|&|[<>]&|&>>?|[();&|<>]", token) if re.fullmatch(r"[();&|<>]+", token) else [token]
+        for part in parts:
+            if part in (";", "&", "&&", "||"):
+                return False
+            if part == "(":
+                depth += 1
+            elif part == ")":
+                depth -= 1
+                if depth < 0:
+                    return False
+            elif depth == 0:
+                if part in ("|", "|&"):
+                    pipes += 1
+            previous = part
+    return depth == 0 and pipes > 0 and previous not in ("|", "|&")
+
+
+def command_block(cmd: str) -> str:
+    """Protect ordinary command pipelines; --step retains its own pipefail semantics."""
+    if standalone_pipeline(cmd):
+        return 'set -o pipefail\n' + PIPELINE_STATUS + '\n' + cmd + '\n__offbox_pipeline_status 0 "${PIPESTATUS[@]}"'
+    return "set -o pipefail\n" + cmd
+
+
 def masked_status_hint(cmd: str) -> str:
-    """Why a 0 may not mean the tests passed: offbox returns the status of the string's LAST command."""
+    """Explain explicit status masking by a caller's final echo/true."""
     try:
         lx = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lx.whitespace = " \t\r"
@@ -188,8 +250,6 @@ def masked_status_hint(cmd: str) -> str:
     if sep not in (None, "&&") and last[0] in ("echo", "printf", "true", ":"):
         return (f" (status of the final `{' '.join(last)[:60]}`, not of the commands before it; "
                 "save rc=$? and end with `exit $rc`)")
-    if any(t in ("|", "|&") for t in last) and "pipefail" not in toks:
-        return " (status of the last pipe stage only; add `set -o pipefail`)"
     return ""
 
 
@@ -255,7 +315,7 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
     if step_res is not None:
         say(steps_summary(step_res, planned))
     if code == 1 and last_stage_is_grep(cmd):
-        say("exit 1 came from the trailing grep (no match), not necessarily your tests. Use --step for each command.")
+        say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
     if code is None:
         say("remote exit unknown (process lost); offbox exits 90")
     else:
@@ -283,7 +343,8 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
                   steps: list[str] | None = None) -> str:
-    cmd = steps_block(steps) if steps else argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv)
+    cmd = steps_block(steps) if steps else command_block(
+        argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',

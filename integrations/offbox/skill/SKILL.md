@@ -171,9 +171,11 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 
 ## Fallback and exit codes
 
-- Remote command's own exit code is returned as is, and offbox's last stderr line is `offbox: remote exit N`. That is
-  the status of the string's *last* command: `...; echo EXIT=$?` or `... | tail` reads 0 on failure (17 Oct risk2).
-  Use `set -o pipefail` and end with `exit $rc`, not a trailing echo; offbox flags a masked 0 on that line.
+- Remote command's own exit code is returned as is, and offbox's last stderr line is `offbox: remote exit N`.
+  Command strings automatically use bash pipefail, so a failed check piped through `tee` or `tail` returns nonzero.
+  A simple single-line pipeline such as `yes | head -1` succeeds when only non-last stages exit with SIGPIPE (141);
+  compound scripts and uncertain shell syntax keep strict pipefail so skipped checks cannot look successful.
+  An explicit trailing `; echo EXIT=$?` or `|| true` can still mask failure; offbox flags that choice on the exit line.
   A local-first run prints `offbox: local exit N` instead; same exit-code rules.
 - (nightly 2026-10-19) **Several checks in one run: use `--step`**, one per command, instead of chaining
   `a | tee x | tail; b; grep ...`. 18 Oct: 4+ Crpko lanes read `remote exit 1` from a trailing grep on clean runs,
@@ -182,7 +184,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   Each step runs in its own subshell with pipefail and does not stop the next. You get `offbox step N rc=X: ...`
   per step, then `offbox steps: K ok, M failed (step N rc=X)`, then `offbox: remote exit <first nonzero rc>`.
   `--step` plus a trailing `-- cmd` is a usage error (2). Exit 1 whose last pipeline stage is grep gets a hint line:
-  that is "no match", not a failed test.
+  it may mean "no match" or an earlier stage failed.
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.

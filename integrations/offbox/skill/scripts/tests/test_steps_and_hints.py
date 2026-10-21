@@ -83,8 +83,8 @@ class SummaryAndHintTests(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             runs.report_exit('go test ./... 2>&1 | tee /tmp/l | tail -40; grep -c FAIL /tmp/l', 1)
         lines = err.getvalue().strip().splitlines()
-        self.assertEqual(lines[0], 'offbox: exit 1 came from the trailing grep (no match), not necessarily your tests. '
-                                   'Use --step for each command.')
+        self.assertEqual(lines[0], 'offbox: exit 1 may be from the trailing grep (no match) or an earlier stage. '
+                                    'Use --step for each command.')
         self.assertEqual(lines[-1], 'offbox: remote exit 1')
 
     def test_report_exit_prints_step_summary_before_exit_line(self):
