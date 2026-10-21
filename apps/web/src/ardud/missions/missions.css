@@ -27,6 +27,10 @@
   --m-bar-2: color-mix(in oklab, var(--foreground) 52%, var(--background));
   --m-bar-3: color-mix(in oklab, var(--foreground) 28%, var(--background));
   --m-bar-4: color-mix(in oklab, var(--foreground) 15%, var(--background));
+  /* --- blocks additions --- */
+  --m-positive: var(--success-foreground);
+  --m-info: var(--info-foreground);
+  /* --- end blocks additions --- */
 }
 
 html[data-theme-id="desk"] {
@@ -50,6 +54,10 @@ html[data-theme-id="desk"] {
   --m-bar-2: #8c8c88;
   --m-bar-3: #bdbdb8;
   --m-bar-4: #dcdcd7;
+  /* --- blocks additions --- */
+  --m-positive: #1d7044;
+  --m-info: #1f58b8;
+  /* --- end blocks additions --- */
 }
 
 html[data-theme-id="desk"].dark {
@@ -73,4 +81,8 @@ html[data-theme-id="desk"].dark {
   --m-bar-2: #9a9a94;
   --m-bar-3: #64645e;
   --m-bar-4: #42423e;
+  /* --- blocks additions --- */
+  --m-positive: #63c98f;
+  --m-info: #82abf2;
+  /* --- end blocks additions --- */
 }

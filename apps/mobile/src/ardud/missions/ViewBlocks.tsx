@@ -20,12 +20,26 @@ import {
   type ViewGalleryAsset,
   type ViewListRow,
   type ViewTableRow,
+  // --- blocks additions ---
+  viewChartLabels,
+  viewChartScale,
+  type ViewChart,
+  type ViewChartPoint,
+  type ViewStatTile,
+  type ViewTimelineEntry,
+  // --- end blocks additions ---
 } from "@t3tools/client-runtime/ardud/missions";
 import { missionErrorMessage } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { Image } from "expo-image";
-import { Fragment, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Modal, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+// --- blocks additions ---
+import { VIEW_HARD_LIMITS, type ViewTone } from "@t3tools/contracts";
+import * as Clipboard from "expo-clipboard";
+import Svg, { Line, Polyline, Rect } from "react-native-svg";
+import { useResolveClassNames } from "uniwind";
+// --- end blocks additions ---
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { SymbolView } from "../../components/ui/AppSymbol";
@@ -167,6 +181,22 @@ function Block(props: BlockProps & { readonly block: ViewBlock }) {
     case "collapsible":
       return <CollapsibleRows block={block} choice={props.choice} review={props.review} />;
     // --- end views additions ---
+    // --- blocks additions ---
+    case "stat":
+      return <StatTiles label={block.label} tiles={block.tiles} />;
+    case "chart":
+      return <Charts type={block.type} charts={block.charts} />;
+    case "timeline":
+      return <Timeline entries={block.entries} />;
+    case "callout":
+      return <Callouts tone={block.tone} texts={block.texts} />;
+    case "code":
+      return block.source === null ? (
+        <CodeText text={block.text ?? ""} label={block.label} />
+      ) : (
+        <LongCode source={block.source} label={block.label} />
+      );
+    // --- end blocks additions ---
   }
 }
 
@@ -283,6 +313,336 @@ function LongMarkdown(props: {
   );
 }
 // --- end views additions ---
+
+// --- blocks additions ---
+const TONE_TEXT: Record<ViewTone, string> = {
+  good: "text-adaptive-emerald-700-300",
+  warn: "text-adaptive-amber-700-300",
+  bad: "text-adaptive-rose-700-300",
+  info: "text-adaptive-sky-700-300",
+};
+
+const TONE_DOT: Record<ViewTone, string> = {
+  good: "bg-adaptive-emerald-600-400",
+  warn: "bg-adaptive-amber-700-400",
+  bad: "bg-adaptive-rose-600-400",
+  info: "bg-adaptive-sky-600-400",
+};
+
+const TONE_NOTE: Record<ViewTone, string> = {
+  good: "bg-adaptive-emerald-500-a12-a16",
+  warn: "bg-adaptive-amber-500-a12-a16",
+  bad: "bg-adaptive-rose-500-a12-a16",
+  info: "bg-adaptive-sky-500-a12-a16",
+};
+
+function StatTiles(props: { readonly label: string; readonly tiles: ReadonlyArray<ViewStatTile> }) {
+  return (
+    <View className="gap-1">
+      <Meta>{props.label}</Meta>
+      <View className="flex-row flex-wrap items-baseline gap-x-6 gap-y-2">
+        {props.tiles.map((tile) => (
+          <View key={tile.key} className="flex-row items-baseline gap-1.5">
+            <Text
+              className={cn(
+                "text-2xl font-t3-semibold tabular-nums",
+                tile.delta === null && tile.tone !== null
+                  ? TONE_TEXT[tile.tone]
+                  : "text-foreground",
+              )}
+            >
+              {tile.prefix}
+              {tile.value}
+            </Text>
+            {tile.suffix ? (
+              <Text className="text-sm text-foreground-muted">{tile.suffix}</Text>
+            ) : null}
+            {tile.delta ? (
+              <Text
+                className={cn(
+                  "text-xs tabular-nums",
+                  tile.tone ? TONE_TEXT[tile.tone] : "text-foreground-muted",
+                )}
+              >
+                {tile.delta}
+              </Text>
+            ) : null}
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+function Charts(props: {
+  readonly type: "line" | "bar";
+  readonly charts: ReadonlyArray<ViewChart>;
+}) {
+  return (
+    <View className="gap-4">
+      {props.charts.map((chart) => (
+        <View key={chart.key} className="gap-1.5">
+          {chart.title ? <Meta numberOfLines={1}>{chart.title}</Meta> : null}
+          <ChartPlot type={props.type} title={chart.title} points={chart.points} />
+        </View>
+      ))}
+    </View>
+  );
+}
+
+const PLOT_HEIGHT = 144;
+const X_LABEL_WIDTH = 72;
+
+/** Where a point's centre sits across the plot, 0..1. */
+const chartX = (type: "line" | "bar", index: number, count: number) =>
+  type === "bar" ? (index + 0.5) / count : count === 1 ? 0.5 : index / (count - 1);
+
+function ChartPlot(props: {
+  readonly type: "line" | "bar";
+  readonly title: string | null;
+  readonly points: ReadonlyArray<ViewChartPoint>;
+}) {
+  // SVG takes colours as props, not classes.
+  const { color: accent } = useResolveClassNames("text-primary");
+  const { color: rule } = useResolveClassNames("text-border");
+  const { color: baseline } = useResolveClassNames("text-icon-muted");
+  // SVG wants pixels; the plot's width is only known once it lays out.
+  const [width, setWidth] = useState(0);
+  const { points } = props;
+  const scale = viewChartScale(points);
+  const y = (value: number) =>
+    PLOT_HEIGHT - ((value - scale.min) / (scale.max - scale.min)) * PLOT_HEIGHT;
+  const zero = y(0);
+  const band = width / points.length;
+  const last = points.at(-1);
+  // One point has no slope; it reads as a level line across the plot.
+  const line =
+    points.length === 1
+      ? `0,${y(points[0]!.value)} ${width},${y(points[0]!.value)}`
+      : points
+          .map(
+            (point, index) => `${chartX("line", index, points.length) * width},${y(point.value)}`,
+          )
+          .join(" ");
+  const labels = viewChartLabels(points);
+  return (
+    <View className="flex-row gap-2">
+      <View style={{ height: PLOT_HEIGHT }} className="w-9">
+        {scale.ticks.map((tick) => (
+          <Text
+            key={tick.value}
+            numberOfLines={1}
+            className="absolute right-0 text-[11px] leading-[14px] tabular-nums text-foreground-muted"
+            style={{ top: y(tick.value) - 7 }}
+          >
+            {tick.label}
+          </Text>
+        ))}
+      </View>
+      <View className="min-w-0 flex-1 gap-1.5">
+        <View
+          accessible
+          accessibilityRole="image"
+          accessibilityLabel={`${props.title ?? "Chart"}: ${points.length} points${last ? `, last ${last.label ? `${last.label} ` : ""}${last.value.toLocaleString()}` : ""}`}
+          style={{ height: PLOT_HEIGHT }}
+          onLayout={(event) => setWidth(event.nativeEvent.layout.width)}
+        >
+          {width > 0 ? (
+            <Svg width={width} height={PLOT_HEIGHT}>
+              {scale.ticks.map((tick) => (
+                <Line
+                  key={tick.value}
+                  x1={0}
+                  x2={width}
+                  y1={y(tick.value)}
+                  y2={y(tick.value)}
+                  stroke={tick.value === 0 ? baseline : rule}
+                  strokeWidth={1}
+                />
+              ))}
+              {props.type === "bar" ? (
+                points.map((point, index) => (
+                  <Rect
+                    // Points have no ids; their order is the rows'.
+                    // eslint-disable-next-line react/no-array-index-key
+                    key={index}
+                    x={index * band + band * 0.2}
+                    width={band * 0.6}
+                    y={Math.min(y(point.value), zero)}
+                    height={Math.abs(zero - y(point.value))}
+                    fill={accent}
+                  />
+                ))
+              ) : (
+                <Polyline
+                  points={line}
+                  fill="none"
+                  stroke={accent}
+                  strokeWidth={2}
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                />
+              )}
+            </Svg>
+          ) : null}
+        </View>
+        <View className="h-4">
+          {width > 0
+            ? labels.map((tick, slot) => {
+                const first = slot === 0;
+                const final = slot === labels.length - 1 && !first;
+                const centre = chartX(props.type, tick.index, points.length) * width;
+                return (
+                  <Text
+                    key={tick.index}
+                    numberOfLines={1}
+                    className={cn(
+                      "absolute top-0 text-[11px] tabular-nums text-foreground-muted",
+                      first ? "text-left" : final ? "text-right" : "text-center",
+                    )}
+                    style={
+                      first
+                        ? { left: 0, maxWidth: X_LABEL_WIDTH }
+                        : final
+                          ? { right: 0, maxWidth: X_LABEL_WIDTH }
+                          : { left: centre - X_LABEL_WIDTH / 2, width: X_LABEL_WIDTH }
+                    }
+                  >
+                    {tick.label}
+                  </Text>
+                );
+              })
+            : null}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+function Timeline(props: { readonly entries: ReadonlyArray<ViewTimelineEntry> }) {
+  return (
+    <View className="ml-1 border-l border-border">
+      {props.entries.map((entry, index) => (
+        <View
+          key={entry.key}
+          className={cn("gap-0.5 pl-4", index < props.entries.length - 1 ? "pb-3" : undefined)}
+        >
+          <View
+            className={cn(
+              "absolute top-1.5 size-2 rounded-full",
+              entry.tone ? TONE_DOT[entry.tone] : "bg-foreground-muted",
+            )}
+            style={{ left: -4.5 }}
+          />
+          <View className="flex-row items-baseline gap-3">
+            <Text
+              numberOfLines={2}
+              className="min-w-0 flex-1 text-sm font-t3-semibold text-foreground"
+            >
+              {entry.title}
+            </Text>
+            {entry.at ? <Meta className="tabular-nums">{entry.at}</Meta> : null}
+          </View>
+          {entry.meta.length > 0 ? <Meta numberOfLines={1}>{entry.meta.join(" · ")}</Meta> : null}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function Callouts(props: { readonly tone: ViewTone; readonly texts: ReadonlyArray<string> }) {
+  return (
+    <View className="gap-2">
+      {props.texts.map((text, index) => (
+        <View
+          // Notes have no ids; their order is the rows'.
+          // eslint-disable-next-line react/no-array-index-key
+          key={index}
+          className={cn("rounded-xl px-3 py-2", TONE_NOTE[props.tone])}
+        >
+          <Text selectable className={cn("text-sm leading-5", TONE_TEXT[props.tone])}>
+            {text}
+          </Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function CodeText(props: {
+  readonly text: string;
+  readonly label: string | null;
+  readonly note?: string | undefined;
+}) {
+  const [unfolded, setUnfolded] = useState(false);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 1_200);
+    return () => clearTimeout(timer);
+  }, [copied]);
+  if (props.text.trim() === "") return null;
+  const codeLines = props.text.split("\n");
+  const fold = VIEW_HARD_LIMITS.codeFoldLines;
+  const folded = !unfolded && codeLines.length > fold;
+  const copy = () =>
+    void Clipboard.setStringAsync(props.text).then(
+      () => setCopied(true),
+      () => undefined,
+    );
+  return (
+    <View className="gap-1.5">
+      <View className="flex-row items-center gap-2">
+        <Meta numberOfLines={1} className="min-w-0 flex-1">
+          {props.label ?? ""}
+        </Meta>
+        <LinkButton label={copied ? "Copied" : "Copy"} onPress={copy} />
+      </View>
+      <ScrollView horizontal className="rounded-xl bg-subtle" contentContainerClassName="px-3 py-2">
+        <Text selectable className="font-mono text-xs leading-5 text-foreground">
+          {folded ? codeLines.slice(0, fold).join("\n") : props.text}
+        </Text>
+      </ScrollView>
+      {codeLines.length > fold ? (
+        <View className="items-start">
+          <LinkButton
+            label={folded ? `Show all ${codeLines.length.toLocaleString()} lines` : "Show less"}
+            onPress={() => setUnfolded(!unfolded)}
+          />
+        </View>
+      ) : null}
+      {props.note ? <Meta>{props.note}</Meta> : null}
+    </View>
+  );
+}
+
+function LongCode(props: { readonly source: ViewLongTextInput; readonly label: string | null }) {
+  const state = useViewLongText(props.source);
+  if (state === undefined || state.status === "loading") {
+    return <View accessibilityLabel="Loading" className="h-24 rounded-xl bg-secondary" />;
+  }
+  if (state.status === "failed") {
+    return (
+      <View className="flex-row items-center gap-3">
+        <Meta className="min-w-0 flex-1">{missionErrorMessage(state.error)}</Meta>
+        <LinkButton label="Retry" onPress={() => retryViewLongText(props.source)} />
+      </View>
+    );
+  }
+  const { value } = state;
+  return (
+    <CodeText
+      text={value.text}
+      label={props.label}
+      note={
+        value.truncated
+          ? `Cut at ${value.text.length.toLocaleString()} of ${value.size.toLocaleString()} characters.`
+          : undefined
+      }
+    />
+  );
+}
+// --- end blocks additions ---
 
 function ChoiceList(props: {
   readonly options: ReadonlyArray<ViewChoiceOption>;
