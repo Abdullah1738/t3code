@@ -24,6 +24,16 @@ export interface Config {
   backend?: string;
   /** Registered Robob project root for iMessage chat folders. */
   robobChatRoot?: string;
+  /** "photon" (default, the rollback) or "sendblue". */
+  transport?: "photon" | "sendblue";
+  /** Our Sendblue line number, required when transport is "sendblue". */
+  sendblueNumber?: string;
+}
+
+export function transportKind(config: { transport?: unknown }): "photon" | "sendblue" {
+  if (config.transport === undefined || config.transport === "photon") return "photon";
+  if (config.transport === "sendblue") return "sendblue";
+  throw new Error("Invalid bridge configuration");
 }
 
 /** Fills and validates the optional mini-app server fields. */
