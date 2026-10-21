@@ -7,6 +7,7 @@ import {
   type FeedItem,
   type MissionId,
   type MissionOverview,
+  type MissionRecordRef,
 } from "@t3tools/contracts";
 import {
   ageView,
@@ -16,11 +17,13 @@ import {
   formatCountdown,
   formatDayLabel,
   isDraftFeedItem,
+  masterRoutedEntries,
   orderBlockerGroups,
   ownerWaitingEntries,
   refKey,
   refLabel,
   resolveMissionLayout,
+  snoozedEntries,
   splitFeed,
   type DirectionCheckRow,
   type MissionInboxSnapshot,
@@ -36,12 +39,17 @@ import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/utils";
 import { BoardLead, LanesPanel, RestartNotice } from "./BoardPanels";
 import { AgeElement, ByMarker, Chip, PersonChip, RefChip, StateGlyph } from "./cards/chips";
-import { useCardDiscussion } from "./DiscussPanel";
+import { OpenDiscussions, useCardDiscussion } from "./DiscussPanel";
 import { markMissionSeen, reactToCall } from "./missionCommands";
 import { useMissionInbox, useMissionViews, useYourRequests } from "./missionsStore";
 import { MILESTONE_BADGE_VARIANT, MILESTONE_LABEL } from "./missionTone";
 import { PriorityStack } from "./PriorityStack";
-import { NeedsYouSection, PinnedStrip, WithTheMasterSection } from "./sections/NeedsYou";
+import {
+  NeedsYouSection,
+  OWNER_WAITING_TABS,
+  PinnedStrip,
+  WithTheMasterSection,
+} from "./sections/NeedsYou";
 import { CustomSection } from "./sections/CustomSection";
 import { FoldButton, LoadingRows, SectionCount, SectionShell } from "./sections/SectionShell";
 import {
@@ -90,6 +98,7 @@ export function MissionOverviewTab(props: {
       ? (requests?.find((request) => request.id === props.openRequestId) ?? null)
       : null;
   const openRequest = useRequestOpener(missionId);
+  const shown = layout ? discussedOnBoard(layout, inbox, overview, nowMs) : [];
 
   const context: SectionContext | null =
     views && layout
@@ -178,6 +187,7 @@ export function MissionOverviewTab(props: {
             )}
           </aside>
           <div className="flex min-w-0 flex-col gap-4 lg:col-span-7 lg:col-start-1 lg:row-start-1 2xl:col-span-6">
+            {inbox ? <OpenDiscussions missionId={missionId} shown={shown} nowMs={nowMs} /> : null}
             {context.layout.main.map((section) => (
               <OverviewSection key={section.key} section={section} context={context} />
             ))}
@@ -192,6 +202,31 @@ export function MissionOverviewTab(props: {
 
 /** Marks where the lanes panel goes in the rail. */
 const LANES = "lanes" as const;
+
+/**
+ * Records whose card on this board carries its discussion, folded or not.
+ * Feed rows carry none, so a feed item still counts as loose.
+ */
+function discussedOnBoard(
+  layout: ResolvedViewLayout,
+  inbox: MissionInboxSnapshot | undefined,
+  overview: MissionOverviewSnapshot,
+  nowMs: number,
+): Array<Pick<MissionRecordRef, "kind" | "id">> {
+  const visible = new Set([...layout.main, ...layout.rail].map((section) => section.kind));
+  const entries = [
+    ...(inbox && visible.has("needs-you")
+      ? [...ownerWaitingEntries(inbox, nowMs), ...snoozedEntries(inbox, nowMs, OWNER_WAITING_TABS)]
+      : []),
+    ...(inbox && visible.has("with-the-master") ? masterRoutedEntries(inbox) : []),
+  ];
+  return [
+    ...entries.map((entry) => ({ kind: entry.kind, id: entry.record.id })),
+    ...(visible.has("since-last-looked")
+      ? directionCheckRows(overview.directionCheck).map((row) => row.item.ref)
+      : []),
+  ];
+}
 
 interface SectionContext {
   readonly overview: MissionOverviewSnapshot;

@@ -6,6 +6,8 @@ import {
   ageView,
   discussionUnread,
   isRequestUnread,
+  looseDiscussions,
+  refLabel,
   requestAbout,
   requestPreview,
   type OwnerRequest,
@@ -16,7 +18,9 @@ import { Textarea } from "../../components/ui/textarea";
 import type { CardAction } from "./cards/CardFrame";
 import { AgeElement, Avatar, DiscussionSymbol } from "./cards/chips";
 import { discussRecord, markRequestRead, replyRequest, settleRequest } from "./missionCommands";
+import { PANEL_CLASS as SECTION_PANEL_CLASS } from "./MissionSection";
 import { useOwnerRequest, useOwnerRequests } from "./missionsStore";
+import { SectionCount } from "./sections/SectionShell";
 import { RequestMessage } from "./sections/YourRequests";
 
 // Discuss on a card: an owner request about the record, kept on the record
@@ -209,6 +213,55 @@ function DiscussionComposer(props: {
     <section aria-label="Discuss with the master" className={PANEL_CLASS}>
       {form}
     </section>
+  );
+}
+
+/**
+ * Open discussions whose record has no card on the board (acked, superseded,
+ * aged out, or in a hidden section). Not a layout section, so it cannot be
+ * hidden; it empties as the owner or the master settles each one.
+ */
+export function OpenDiscussions(props: {
+  missionId: MissionId;
+  shown: ReadonlyArray<Pick<MissionRecordRef, "kind" | "id">>;
+  nowMs: number;
+}) {
+  const requests = useOwnerRequests(props.missionId);
+  const loose = requests ? looseDiscussions(requests, props.shown) : [];
+  if (loose.length === 0) return null;
+  return (
+    <section aria-labelledby="open-discussions" className={SECTION_PANEL_CLASS}>
+      <h2 id="open-discussions" className="flex min-h-8 items-center gap-2.5 text-sm font-semibold">
+        Open discussions
+        <SectionCount count={loose.length} label={`${loose.length} open`} />
+      </h2>
+      <ul className="flex min-w-0 flex-col gap-4">
+        {loose.map((request) => (
+          <LooseDiscussion key={request.id} request={request} nowMs={props.nowMs} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function LooseDiscussion(props: {
+  request: OwnerRequest & { readonly subject: MissionRecordRef };
+  nowMs: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const { request } = props;
+  return (
+    <li className="flex min-w-0 flex-col gap-2">
+      <p className="flex min-w-0 items-center gap-2 text-sm font-medium text-pretty">
+        <span className="min-w-0 line-clamp-2">{refLabel(request.subject)}</span>
+        <DiscussionSymbol unread={discussionUnread(request)} />
+      </p>
+      {open ? (
+        <DiscussionThread request={request} onClose={() => setOpen(false)} nowMs={props.nowMs} />
+      ) : (
+        <DiscussionLine request={request} onOpen={() => setOpen(true)} nowMs={props.nowMs} />
+      )}
+    </li>
   );
 }
 
