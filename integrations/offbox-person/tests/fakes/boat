@@ -3,7 +3,9 @@
 with id FAKE_SNAPSHOT_ID. FAKE_BOAT_HANG=<subcommand> makes that call hang (a pull
 hangs after writing its files), FAKE_BOAT_DROP (comma list of home-relative
 paths) leaves files out of a pull, FAKE_TREE_TRUNCATED=1 reports a truncated listing,
-FAKE_BOAT_PULL_FAILS=N makes the first N pulls fail the way boat does (error JSON on stdout)."""
+FAKE_BOAT_PULL_FAILS=N makes the first N pulls fail the way boat does (error JSON on stdout, plus
+FAKE_BOAT_PULL_ERROR on stderr), FAKE_BOAT_EXTRA (JSON {path: text}) adds files only the box has (names a
+case-insensitive Mac can't hold side by side), FAKE_BOAT_CHMOD ("path=octal,...") sets modes in the pull."""
 
 import json
 import os
@@ -23,6 +25,7 @@ with open(os.environ["FAKE_BOAT_LOG"], "a") as f:
 home = Path(os.environ["FAKE_SNAPSHOT_DIR"])
 snap = os.environ.get("FAKE_SNAPSHOT_ID", "snap-1")
 sub = " ".join(args[:2]) if args[:1] == ["snapshot"] else args[0]
+extra = json.loads(os.environ.get("FAKE_BOAT_EXTRA") or "{}")
 hang = os.environ.get("FAKE_BOAT_HANG") == sub
 if hang and sub != "snapshot pull":
     time.sleep(600)
@@ -30,7 +33,9 @@ if hang and sub != "snapshot pull":
 if sub == "info":
     print(json.dumps({"sandbox": {"id": args[1], "state": "stopped", "lastSnapshotStatus": "completed"}}))
 elif sub == "snapshot tree":
-    entries = [{"kind": "file", "path": "__system__/etc/hostname", "size": 4}]
+    entries = [{"kind": "file", "path": "__system__/etc/hostname", "size": 4},
+               {"kind": "symlink", "path": "person/profile/SingletonLock"}]
+    entries += [{"kind": "file", "path": k, "size": len(v)} for k, v in extra.items()]
     for p in sorted(home.rglob("*")):
         entries.append({"kind": "dir" if p.is_dir() else "file", "path": str(p.relative_to(home)),
                         "size": 0 if p.is_dir() else p.stat().st_size})
@@ -40,6 +45,7 @@ elif sub == "snapshot pull":
     log = Path(os.environ["FAKE_BOAT_LOG"]).read_text().splitlines()
     if sum(json.loads(line)[:2] == ["snapshot", "pull"] for line in log) <= int(os.environ.get("FAKE_BOAT_PULL_FAILS", "0")):
         print(json.dumps({"error": f"snapshot {args[2]} is not ready yet"}))
+        print(os.environ.get("FAKE_BOAT_PULL_ERROR", ""), file=sys.stderr)
         sys.exit(1)
     out = Path(args[args.index("-o") + 1])
     drop = {d for d in os.environ.get("FAKE_BOAT_DROP", "").split(",") if d}
@@ -54,6 +60,13 @@ elif sub == "snapshot pull":
             if p.is_file() and r not in drop:
                 (dest_home / r).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(p, dest_home / r)
+    for rel, text in extra.items():
+        if any(w == "/home/user" or ("/home/user/" + rel).startswith(w + "/") for w in paths):
+            (dest_home / rel).parent.mkdir(parents=True, exist_ok=True)
+            (dest_home / rel).write_text(text)
+    for item in filter(None, os.environ.get("FAKE_BOAT_CHMOD", "").split(",")):
+        rel, mode = item.split("=")
+        os.chmod(dest_home / rel, int(mode, 8))
     if hang:  # a pull that stalls after writing her files
         time.sleep(600)
     print(json.dumps({"homeDir": str(dest_home), "outputDir": str(out), "snapshotId": args[2]}))

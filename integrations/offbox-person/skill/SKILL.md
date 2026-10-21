@@ -111,27 +111,35 @@ Screenshots are transient: `down` deletes `$TMPDIR/offbox-person/<person>/`. Don
 `offbox-person-backup <person>|--all` backs up her box home from its latest boat snapshot:
 - Skips when the content snapshot id is the one last backed up (`--force` overrides).
 - Pulls the home minus reinstallable runtimes and caches (`.cloakbrowser`, `.cua-driver`, caches,
-  `person/venv`, `person/bin`, `person/wiki`) into `~/.local/share/offbox-person/stage/<person>`
-  (excluded from Time Machine, wiped at the start and end of every run, even on TERM).
+  `go/pkg`, `person/venv`, `person/wiki`) onto a fresh encrypted, case-sensitive disk image mounted at
+  `~/.local/share/offbox-person/stage/<person>`. Its key exists only in the running script; the image is
+  detached and deleted at the end of every run (also on failure or TERM), and a run killed outright
+  leaves only ciphertext that the next run deletes. `person/bin` (her himalaya and ortie) is backed up
+  because `box/setup.sh` doesn't reinstall it.
 - Writes a restic snapshot into `~/.local/share/offbox-person/restic/<person>` (password in Keychain
-  `restic-offbox-person`/`ardud`; it is the only copy of the key, Dropbox holds only ciphertext),
-  deletes the pull, then mirrors the repo to Dropbox `/Backups/offbox-person/<person>/restic` with
-  `--delete` (every file hash-checked).
-- Fails (never silently passes) if a listed file other than browser caches, locks or telemetry is
-  missing from the pull. Every boat/offbox/restic/Dropbox call has a timeout.
+  `restic-offbox-person`/`ardud`; it is the only copy of the key, Dropbox holds only ciphertext), then
+  mirrors the repo to Dropbox `/Backups/offbox-person/<person>/restic` (every file hash-checked). It runs
+  `restic check` first and never mirrors a damaged repo. Dropbox files are deleted only after the daily
+  prune (`--delete` on the next mirror); otherwise the mirror only adds.
+- Fails (never silently passes) if a listed file other than browser-profile caches/locks or Go
+  telemetry is missing from the pull. Every boat/offbox/restic/Dropbox call has a timeout that kills the
+  whole process group. A failed pull is retried twice from a fresh listing.
 - Never replaces Dropbox history: if the Mac repo is missing but a backup was made before, or Dropbox
   already holds a repo, it stops and asks for a restore instead of starting a new repo; it won't
   mirror over a Dropbox repo with a different `config`.
-- `down` and `save` start it in the background once the box has stopped (it waits for a running
-  backup instead of skipping). LaunchAgent `com.abdullah.offbox-person-backup` (installed by
+- `down` and `save` start it in the background, in its own process group, once the box has stopped (it
+  waits for a running backup instead of skipping). One run per person (flock on
+  `state/<person>-backup.lock`). LaunchAgent `com.abdullah.offbox-person-backup` (installed by
   `integrations/offbox-person/install.zsh`) runs `--all` at login and every 6 h. It runs a copy at
   `~/.local/share/offbox-person/bin/` because launchd may not read the external drive, so re-run
   `install.zsh` after changing the script.
 - Status: `~/.local/share/offbox-person/state/<person>-backup.json` (`ok`, `stage`,
   `last_success_ts`, `last_boat_snapshot`, `last_restic_snapshot`), log
-  `<person>-backup-YYYYMM.log` (counts only, never her file names). A failure or a lock stuck over
-  6 h sends one Telegram per stage per day. Keeps 8 last, 14 daily, 8 weekly, 24 monthly, 5 yearly;
-  `restic check --read-data-subset=10%` every 30 days.
+  `<person>-backup-YYYYMM.log` (counts only; tool error lines that name a path are dropped). The state
+  dir is mode 700. A failure or a lock stuck over 6 h sends one Telegram per stage per day. Keeps 8
+  last, 14 daily, 8 weekly, 24 monthly, 5 yearly; `restic check --read-data-subset=10%` every 30 days.
+- Tests: `python3 tests/test_backup.py` (real restic, fake boat/offbox/Dropbox, about 4 min) and
+  `python3 tests/test_offbox_person.py`.
 
 Restore:
 

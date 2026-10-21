@@ -24,6 +24,9 @@ class Api:
 
 
 def main():
+    if os.environ.get("FAKE_MIRROR_LOG"):
+        with open(os.environ["FAKE_MIRROR_LOG"], "a") as f:
+            f.write(json.dumps(sys.argv[1:]) + "\n")
     local, remote = Path(sys.argv[1]), DROPBOX / sys.argv[2].lstrip("/")
     files = {str(p.relative_to(local)) for p in local.rglob("*") if p.is_file()}
     for f in files:

@@ -289,7 +289,9 @@ cmd_save() {
 # Back up the snapshot the stop just took, without making the caller wait for the pull and upload.
 backup_bg() {
   mkdir -p -- "$ROOT/state"
-  nohup "$BACKUP" "$1" --after-stop >>"$ROOT/state/$1-backup-bg.log" 2>&1 </dev/null &!
+  # Its own process group, so a harness that kills the caller's group doesn't stop the backup halfway.
+  nohup perl -e 'setpgrp(0, 0); exec @ARGV or die "exec $ARGV[0]: $!\n"' "$BACKUP" "$1" --after-stop \
+    >>"$ROOT/state/$1-backup-bg.log" 2>&1 </dev/null &!
   note "$1: Dropbox backup started in the background (status: $ROOT/state/$1-backup.json)"
 }
 

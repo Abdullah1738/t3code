@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """offbox-person-backup tests: fake offbox, boat, Dropbox mirror and Telegram; real restic on a temp repo."""
 
+import fcntl
 import json
 import os
 import shutil
@@ -39,6 +40,9 @@ class BackupTest(unittest.TestCase):
             ".cloakbrowser/chrome": "big binary",
             "person/wiki/README.md": "wiki clone",
             "person/venv/bin/python": "venv",
+            "person/bin/himalaya": "her mail client",
+            "go/src/app/main.go": "package main\n",
+            "go/pkg/mod/cache/x.zip": "module cache",
         }.items():
             p = self.home / rel
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +56,7 @@ class BackupTest(unittest.TestCase):
             {"box_id": "bx_other", "repo_key": "other", "repo_root": "/x", "state": "running", "last_used_at": 200},
         ]))
         self.boat_log = self.tmp / "boat.log"
+        self.mirror_log = self.tmp / "mirror.log"
         self.notify_log = self.tmp / "notify.log"
         self.env = {
             **os.environ,
@@ -74,6 +79,7 @@ class BackupTest(unittest.TestCase):
             "FAKE_SNAPSHOT_ID": "snap-1",
             "FAKE_DROPBOX": str(self.dropbox),
             "FAKE_NOTIFY_LOG": str(self.notify_log),
+            "FAKE_MIRROR_LOG": str(self.mirror_log),
         }
         (self.tmp / "bases.json").write_text("[]")
 
@@ -106,12 +112,31 @@ class BackupTest(unittest.TestCase):
 
     def backed_up_files(self):
         out = self.restic("ls", "latest", "--json")
-        stage = str(self.root / "stage" / "moni" / "home_user") + "/"
+        stage = str(self.stage() / "pull" / "home_user") + "/"
         return {e["path"].split(stage, 1)[1] for e in map(json.loads, out.splitlines())
                 if e.get("type") == "file" and stage in e.get("path", "")}
 
+    def stage(self):
+        return (self.root / "stage").resolve() / "moni"
+
+    def mirror_calls(self):
+        return [json.loads(line) for line in self.mirror_log.read_text().splitlines()] if self.mirror_log.exists() else []
+
+    def dropbox_files(self):
+        return {str(p.relative_to(self.dropbox)): p.read_bytes() for p in self.dropbox.rglob("*") if p.is_file()}
+
+    def lock_is_free(self):
+        with open(self.root / "state" / "moni-backup.lock", "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+
     def assert_no_plaintext(self):
         self.assertEqual(list((self.root / "stage").iterdir()), [], "plaintext pull left on the Mac")
+        mounts = subprocess.run(["/sbin/mount"], capture_output=True, text=True).stdout
+        self.assertNotIn(f" on {self.stage()} (", mounts, "stage image still attached")
 
     def test_backs_up_her_data_without_reinstallable_parts_and_mirrors_it(self):
         self.backup()
@@ -121,10 +146,11 @@ class BackupTest(unittest.TestCase):
         self.assertEqual(self.backed_up_files(), {
             "person/profile/Default/Cookies", "person/profile/Default/GPUCache/data_1",
             "person/files/statement.csv", "person/secrets/token.json", "person/session.sh",
-            ".config/himalaya/config.toml", ".bashrc"})
+            ".config/himalaya/config.toml", ".bashrc", "person/bin/himalaya", "go/src/app/main.go"})
         pulled = {c[i + 1] for c in self.pulls() for i, a in enumerate(c) if a == "--path"}
-        self.assertNotIn("/home/user/.cloakbrowser", pulled)
-        self.assertNotIn("/home/user/person/wiki", pulled)
+        for skipped in (".cloakbrowser", "person/wiki", "person/venv", "go", "go/pkg"):
+            self.assertNotIn("/home/user/" + skipped, pulled)
+        self.assertIn("/home/user/go/src", pulled)
         self.assertTrue((self.dropbox / "Backups/offbox-person/moni/restic/config").is_file())
         self.assert_no_plaintext()
         self.assertFalse(self.notify_log.exists())
@@ -167,7 +193,8 @@ class BackupTest(unittest.TestCase):
         self.assertEqual([c[i + 1] for c in self.pulls() for i, a in enumerate(c) if a == "--path"], ["/home/user"])
         files = self.backed_up_files()
         self.assertIn("person/profile/Default/Cookies", files)
-        self.assertFalse({f for f in files if f.startswith((".cloakbrowser", "person/wiki", "person/venv"))})
+        self.assertFalse({f for f in files if f.startswith((".cloakbrowser", "person/wiki", "person/venv", "go/pkg"))})
+        self.assertIn("go/src/app/main.go", files)
 
     def test_lost_local_repo_is_never_replaced_over_the_dropbox_copy(self):
         self.backup()
@@ -222,7 +249,7 @@ class BackupTest(unittest.TestCase):
     def test_term_during_pull_removes_the_plaintext_at_once(self):
         proc = subprocess.Popen([str(TOOL), "moni"], env={**self.env, "FAKE_BOAT_HANG": "snapshot pull"},
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        cookies = self.root / "stage/moni/home_user/person/profile/Default/Cookies"
+        cookies = self.stage() / "pull/home_user/person/profile/Default/Cookies"
         deadline = time.time() + 60
         while not cookies.exists() and time.time() < deadline:
             time.sleep(0.2)
@@ -232,7 +259,7 @@ class BackupTest(unittest.TestCase):
         proc.wait(timeout=20)
         self.assertLess(time.time() - t, 10)
         self.assert_no_plaintext()
-        self.assertFalse((self.root / "state" / "moni-backup.lock").exists())
+        self.assertTrue(self.lock_is_free())
 
     def test_all_backs_up_every_person_dir(self):
         (self.root / "bin").mkdir()  # install.zsh puts the LaunchAgent's copy of the script here
@@ -243,10 +270,13 @@ class BackupTest(unittest.TestCase):
 
     def test_a_live_lock_skips_and_after_stop_waits_for_it(self):
         lock = self.root / "state" / "moni-backup.lock"
-        lock.mkdir(parents=True)
-        holder = subprocess.Popen(["/bin/sh", "-c", "exec -a offbox-person-backup sleep 30"])
+        lock.parent.mkdir(parents=True)
+        holder = subprocess.Popen([sys.executable, "-c", (
+            "import fcntl, sys, time\n"
+            "f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(60)"),
+            str(lock)], stdout=subprocess.PIPE, text=True)
         try:
-            (lock / "pid").write_text(str(holder.pid))
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
             self.backup()
             self.assertEqual(self.pulls(), [])
             self.assertIn("still running", self.log())
@@ -260,6 +290,54 @@ class BackupTest(unittest.TestCase):
             self.assertEqual(len(self.pulls()), 1)
         finally:
             holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+    def test_names_differing_only_in_case_are_both_kept(self):
+        self.backup(FAKE_BOAT_EXTRA=json.dumps({"person/files/README": "upper", "person/files/Readme": "mixed"}))
+        self.assertLessEqual({"person/files/README", "person/files/Readme"}, self.backed_up_files())
+        self.assert_no_plaintext()
+
+    def test_read_only_folders_are_backed_up_and_removed(self):
+        self.backup(FAKE_BOAT_CHMOD="person/secrets/token.json=400,person/files=555")
+        self.assertLessEqual({"person/files/statement.csv", "person/secrets/token.json"}, self.backed_up_files())
+        self.assert_no_plaintext()
+
+    def test_a_missing_project_lock_file_is_not_ignored(self):
+        (self.home / "person/work/app").mkdir(parents=True)
+        (self.home / "person/work/app/yarn.lock").write_text("lock")
+        r = self.backup("moni", check=False, FAKE_BOAT_DROP="person/work/app/yarn.lock")
+        self.assertEqual((r.returncode, self.status()["stage"]), (1, "pull"))
+
+    def test_a_damaged_local_repo_is_not_mirrored_over_dropbox(self):
+        self.backup()
+        before = self.dropbox_files()
+        shutil.rmtree(self.root / "restic" / "moni" / "data")
+        (self.home / "person/files/new.txt").write_text("new")
+        r = self.backup("moni", check=False, FAKE_SNAPSHOT_ID="snap-2")
+        self.assertEqual((r.returncode, self.status()["stage"]), (1, "check"))
+        self.assertEqual(self.dropbox_files(), before)
+        self.assertIn("failed at check", self.notify_log.read_text())
+        self.assert_no_plaintext()
+
+    def test_dropbox_files_are_deleted_only_after_a_prune(self):
+        self.backup()
+        self.backup(FAKE_SNAPSHOT_ID="snap-2")
+        self.backup(FAKE_SNAPSHOT_ID="snap-2")  # unchanged, nothing pruned: no mirror at all
+        stamp = self.root / "state" / "moni-backup-prune.stamp"
+        old = time.time() - 2 * 86400
+        os.utime(stamp, (old, old))
+        self.backup(FAKE_SNAPSHOT_ID="snap-2")  # unchanged, but the daily prune ran
+        self.assertEqual(["--delete" in c for c in self.mirror_calls()], [True, False, True])
+
+    def test_tool_errors_naming_her_files_stay_out_of_the_log(self):
+        err = ("open /home/user/person/files/Bank Statement.pdf: permission denied\n"
+               "error reading `person/files/statement.csv`\nperson/files/Tax Return 2025.pdf: changed")
+        self.backup(FAKE_BOAT_PULL_FAILS="1", FAKE_BOAT_PULL_ERROR=err)
+        log = self.log()
+        for name in ("Bank Statement", "statement.csv", "Tax Return"):
+            self.assertNotIn(name, log)
+        self.assertIn("lines naming paths hidden", log)
 
 
 if __name__ == "__main__":
