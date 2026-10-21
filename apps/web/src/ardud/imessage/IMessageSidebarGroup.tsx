@@ -19,7 +19,8 @@ import { SidebarGroup, useSidebar } from "../../components/ui/sidebar";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { useThreadShells } from "../../state/entities";
 import { cn } from "../../lib/utils";
-import { UnreadDot } from "../missions/cards/chips";
+
+import "./imessage.css";
 
 const SIDEBAR_STATE_KEY = "t3code:ardud-imessage:sidebar";
 const SidebarState = Schema.Struct({ collapsed: Schema.Boolean });
@@ -142,7 +143,7 @@ const IMessageChatRow = memo(function IMessageChatRow(props: {
         aria-current={isActive ? "page" : undefined}
         className={cn(rowClassName, "pe-2", rowState(isActive))}
       >
-        {unread ? <UnreadDot label={`${label} has new replies`} /> : null}
+        <IMessageAvatar label={label} />
         <span className={cn("min-w-0 flex-1 truncate", chat.running && "font-medium")}>
           {label}
         </span>
@@ -150,7 +151,30 @@ const IMessageChatRow = memo(function IMessageChatRow(props: {
         {chat.running ? (
           <span className="shrink-0 text-xs text-sidebar-muted-foreground">working</span>
         ) : null}
+        {unread ? (
+          <span
+            role="img"
+            aria-label={`${label} has new replies`}
+            className="size-[7px] shrink-0 rounded-full bg-(--im-dot)"
+          />
+        ) : null}
       </Link>
     </li>
   );
 });
+
+/** The chat's initial in a circle, the way Messages shows a contact without a photo. */
+export function IMessageAvatar(props: { label: string; size?: "row" | "large" }) {
+  const initial = Array.from(props.label.trim())[0]?.toUpperCase() ?? "?";
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "flex shrink-0 items-center justify-center rounded-full bg-(--im-raised) font-semibold text-muted-foreground",
+        props.size === "large" ? "size-14 text-xl" : "size-[22px] text-2xs",
+      )}
+    >
+      {initial}
+    </span>
+  );
+}

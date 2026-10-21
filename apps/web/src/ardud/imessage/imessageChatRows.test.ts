@@ -1,9 +1,16 @@
 import { imessageDayKey } from "@t3tools/client-runtime/ardud/imessage";
+import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
 import type { TimelineEntry, WorkLogEntry } from "../../session-logic";
 import type { ChatMessage } from "../../types";
-import { buildIMessageChatRows, type IMessageChatRowOptions } from "./imessageChatRows";
+import {
+  buildIMessageChatRows,
+  formatIMessageDuration,
+  imessageAgentSummary,
+  type IMessageChatRow,
+  type IMessageChatRowOptions,
+} from "./imessageChatRows";
 
 const morning = new Date(2026, 9, 20, 9, 0).toISOString();
 const noon = new Date(2026, 9, 20, 12, 0).toISOString();
@@ -50,7 +57,8 @@ function work(id: string, runId: string, createdAt = morning): TimelineEntry {
   return { id, kind: "work", createdAt, entry };
 }
 
-const kinds = (rows: ReturnType<typeof buildIMessageChatRows>) => rows.map((row) => row.kind);
+const kinds = (rows: ReadonlyArray<IMessageChatRow>) => rows.map((row) => row.kind);
+const stepsOf = (row: IMessageChatRow | undefined) => (row?.kind === "agent" ? row.steps : []);
 
 describe("buildIMessageChatRows", () => {
   it("shows typed text as a bubble and only the turn's final assistant message as the reply", () => {
@@ -65,17 +73,18 @@ describe("buildIMessageChatRows", () => {
       ownerChat,
     );
 
-    expect(kinds(rows)).toEqual(["divider", "incoming", "agent", "reply"]);
-    expect(rows[1]).toMatchObject({ text: "Add these to food db", sender: null });
-    expect(rows[2]).toMatchObject({ outcome: "replied", startedAt: morning, endedAt: noon });
-    const agent = rows[2];
-    expect(agent?.kind === "agent" ? agent.steps.map((step) => step.label) : []).toEqual([
-      "Channel guidance",
-      "ran w1",
-      "ran w2",
-      "Text not sent",
+    expect(kinds(rows)).toEqual(["divider", "time", "incoming", "agent", "reply"]);
+    expect(rows[1]).toMatchObject({ createdAt: morning });
+    expect(rows[2]).toMatchObject({ text: "Add these to food db", sender: null });
+    expect(rows[3]).toMatchObject({ outcome: "replied", startedAt: morning, endedAt: noon });
+    expect(stepsOf(rows[3]).map((step) => [step.label, step.text])).toEqual([
+      ["Channel guidance", "iMessage bridge rules, 19 characters"],
+      ["Tool", "ran w1"],
+      ["Tool", "ran w2"],
+      ["Text not sent", "Reading the labels first."],
     ]);
-    expect(rows[3]).toMatchObject({ kind: "reply", text: "Saved all three." });
+    expect(stepsOf(rows[3])[0]?.detail).toBe("Keep replies short.");
+    expect(rows[4]).toMatchObject({ kind: "reply", text: "Saved all three." });
   });
 
   it("never turns NO_REPLY into a bubble", () => {
@@ -89,9 +98,17 @@ describe("buildIMessageChatRows", () => {
       ownerChat,
     );
 
-    expect(kinds(rows)).toEqual(["divider", "incoming", "agent", "incoming", "agent"]);
-    expect(rows[2]).toMatchObject({ outcome: "no-reply", steps: [] });
-    expect(rows[4]).toMatchObject({ outcome: "no-reply" });
+    expect(kinds(rows)).toEqual([
+      "divider",
+      "time",
+      "incoming",
+      "agent",
+      "time",
+      "incoming",
+      "agent",
+    ]);
+    expect(rows[3]).toMatchObject({ outcome: "no-reply", steps: [] });
+    expect(rows[6]).toMatchObject({ outcome: "no-reply" });
   });
 
   it("shows a watcher event as an event line and folds its frame into the agent details", () => {
@@ -102,10 +119,13 @@ describe("buildIMessageChatRows", () => {
       { ...ownerChat, previousDayKey: imessageDayKey(morning) },
     );
 
-    expect(kinds(rows)).toEqual(["event", "agent"]);
-    expect(rows[0]).toMatchObject({ source: "inbox-triage", title: "Apple charge alert" });
-    const agent = rows[1];
-    expect(agent?.kind === "agent" ? agent.steps[0]?.detail : null).toBe(watcher);
+    expect(kinds(rows)).toEqual(["time", "event", "agent"]);
+    expect(rows[1]).toMatchObject({ source: "inbox-triage", title: "Apple charge alert" });
+    expect(stepsOf(rows[2])[0]).toMatchObject({
+      label: "Watcher event",
+      text: "inbox-triage · Apple charge alert",
+      detail: watcher,
+    });
   });
 
   it("hides bridge requests and agent prompts from the conversation", () => {
@@ -124,11 +144,9 @@ describe("buildIMessageChatRows", () => {
       { ...ownerChat, previousDayKey: imessageDayKey(morning) },
     );
 
-    expect(kinds(rows)).toEqual(["agent", "agent", "reply"]);
-    const labels = rows.flatMap((row) =>
-      row.kind === "agent" ? row.steps.map((step) => step.label) : [],
-    );
-    expect(labels).toEqual(["Bridge request", "Prompt from an agent"]);
+    expect(kinds(rows)).toEqual(["time", "agent", "time", "agent", "reply"]);
+    const labels = rows.flatMap((row) => stepsOf(row).map((step) => step.label));
+    expect(labels).toEqual(["Bridge request", "Agent prompt"]);
   });
 
   it("keeps a run that a finished subagent started as its own turn", () => {
@@ -154,8 +172,8 @@ describe("buildIMessageChatRows", () => {
       ownerChat,
     );
 
-    expect(kinds(rows)).toEqual(["divider", "incoming", "reply", "agent", "reply"]);
-    expect(rows[4]).toMatchObject({ text: "Ordered." });
+    expect(kinds(rows)).toEqual(["divider", "time", "incoming", "reply", "time", "agent", "reply"]);
+    expect(rows[6]).toMatchObject({ text: "Ordered." });
   });
 
   it("holds back the reply while the run is still working", () => {
@@ -164,8 +182,8 @@ describe("buildIMessageChatRows", () => {
       { ...ownerChat, activeRunId: "r1" },
     );
 
-    expect(kinds(rows)).toEqual(["divider", "incoming", "agent"]);
-    expect(rows[2]).toMatchObject({ outcome: "working" });
+    expect(kinds(rows)).toEqual(["divider", "time", "incoming", "agent"]);
+    expect(rows[3]).toMatchObject({ outcome: "working" });
   });
 
   it("adds a divider only when the day changes from the thread above", () => {
@@ -173,7 +191,7 @@ describe("buildIMessageChatRows", () => {
       [message("in", "user", "Hi", "r1"), message("out", "assistant", "Hey", "r1")],
       { ...ownerChat, previousDayKey: imessageDayKey(morning) },
     );
-    expect(kinds(sameDay)).toEqual(["incoming", "reply"]);
+    expect(kinds(sameDay)).toEqual(["time", "incoming", "reply"]);
 
     const rows = buildIMessageChatRows(
       [
@@ -184,10 +202,18 @@ describe("buildIMessageChatRows", () => {
       ],
       { ...ownerChat, previousDayKey: imessageDayKey(morning) },
     );
-    expect(kinds(rows)).toEqual(["incoming", "reply", "divider", "incoming", "reply"]);
+    expect(kinds(rows)).toEqual([
+      "time",
+      "incoming",
+      "reply",
+      "divider",
+      "time",
+      "incoming",
+      "reply",
+    ]);
   });
 
-  it("puts each member's name above their bubble in a group, once per run of lines", () => {
+  it("puts each member's name above their bubble, once per run of lines in a turn", () => {
     const rows = buildIMessageChatRows(
       [
         message("in", "user", "Moni: When come pls\nSara: Same here\nSara: Any news?", "r1"),
@@ -201,6 +227,104 @@ describe("buildIMessageChatRows", () => {
       ["Moni", "When come pls", true],
       ["Sara", "Same here", true],
       ["Sara", "Any news?", false],
+    ]);
+  });
+
+  it("names the sender again at the start of each turn", () => {
+    const rows = buildIMessageChatRows(
+      [
+        message("a", "user", "Moni: Hi", "r1"),
+        message("a-out", "assistant", "Hey", "r1"),
+        message("b", "user", "Moni: Still there?", "r2"),
+        message("b-out", "assistant", "NO_REPLY", "r2"),
+      ],
+      { ...ownerChat, namedSenders: true },
+    );
+
+    const bubbles = rows.filter((row) => row.kind === "incoming");
+    expect(bubbles.map((row) => row.senderChanged)).toEqual([true, true]);
+  });
+
+  it("shows commands with their run time", () => {
+    const started = DateTime.makeUnsafe("2026-10-20T09:00:00Z");
+    const completed = DateTime.makeUnsafe("2026-10-20T09:00:02Z");
+    const command = {
+      id: "cmd",
+      kind: "work",
+      createdAt: morning,
+      entry: {
+        id: "cmd",
+        createdAt: morning,
+        runId: "r1",
+        label: "Ran command",
+        command: "wa read thomas | tail -8",
+        tone: "tool",
+        structuredPayload: { startedAt: started, completedAt: completed },
+      } as unknown as WorkLogEntry,
+    } satisfies TimelineEntry;
+    const rows = buildIMessageChatRows(
+      [
+        message("in", "user", "Did Thomas reply?", "r1"),
+        command,
+        message("out", "assistant", "Yes.", "r1"),
+      ],
+      ownerChat,
+    );
+
+    expect(stepsOf(rows[3])).toEqual([
+      {
+        id: "cmd",
+        label: "Ran",
+        text: "wa read thomas | tail -8",
+        detail: null,
+        code: true,
+        seconds: 2,
+        error: false,
+      },
+    ]);
+  });
+});
+
+describe("imessageAgentSummary", () => {
+  const step = {
+    id: "s",
+    label: "Ran",
+    text: "ls",
+    detail: null,
+    code: true,
+    seconds: 1,
+    error: false,
+  };
+
+  it("reads like the chip: outcome, step count, then time taken", () => {
+    expect(
+      imessageAgentSummary({
+        steps: [step, step, step],
+        outcome: "replied",
+        startedAt: "2026-10-20T09:00:00.000Z",
+        endedAt: "2026-10-20T09:01:22.000Z",
+      }),
+    ).toBe("Agent · 3 steps · 1m 22s");
+    expect(
+      imessageAgentSummary({
+        steps: [],
+        outcome: "no-reply",
+        startedAt: "2026-10-20T09:00:00.000Z",
+        endedAt: "2026-10-20T09:00:00.000Z",
+      }),
+    ).toBe("No reply");
+  });
+});
+
+describe("formatIMessageDuration", () => {
+  it("keeps seconds under an hour and drops them past it", () => {
+    expect([0.2, 9, 60, 82, 3600, 3725].map(formatIMessageDuration)).toEqual([
+      "<1s",
+      "9s",
+      "1m",
+      "1m 22s",
+      "1h",
+      "1h 2m",
     ]);
   });
 });

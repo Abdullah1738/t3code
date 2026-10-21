@@ -1,5 +1,6 @@
 import { memo, useState } from "react";
 import { Link } from "@tanstack/react-router";
+import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon } from "lucide-react";
 
 import {
   groupIMessageThreads,
@@ -14,12 +15,6 @@ import {
 } from "@t3tools/client-runtime/state/models";
 
 import { deriveTimelineEntriesFromVisibleTurnItems } from "../../session-logic";
-import {
-  WorkLogBlock,
-  WorkLogButton,
-  WorkLogDetails,
-  WorkLogList,
-} from "../../components/chat/WorkLog";
 import { Button } from "../../components/ui/button";
 import { SidebarInset } from "../../components/ui/sidebar";
 import {
@@ -31,9 +26,11 @@ import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { useThreadShells, useThreadVisibleTurnItems } from "../../state/entities";
 import { cn } from "../../lib/utils";
-import { iMessageThreadInput, imessageChatLabel } from "./IMessageSidebarGroup";
+import { IMessageAvatar, iMessageThreadInput, imessageChatLabel } from "./IMessageSidebarGroup";
 import {
   buildIMessageChatRows,
+  formatIMessageDuration,
+  imessageAgentSummary,
   type IMessageAgentStep,
   type IMessageChatRow,
 } from "./imessageChatRows";
@@ -70,9 +67,10 @@ export function IMessageChatPage(props: { chatSlug: string }) {
           </WorkspaceBreadcrumb>
         </WorkspacePageHeader>
         {chatThreads.length === 0 ? (
-          <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col items-center justify-center gap-1 px-5 text-center">
-            <h1 className="text-lg font-medium text-foreground">{label}</h1>
-            <p className="text-sm text-muted-foreground">No messages yet.</p>
+          <div className="flex flex-1 flex-col items-center gap-2.5 px-4 pt-9 pb-10 text-center">
+            <h1 className="sr-only">{label}</h1>
+            <IMessageAvatar label={label} size="large" />
+            <p className="text-(length:--im-bubble-text) text-muted-foreground">No messages yet.</p>
           </div>
         ) : (
           // Remount per chat so the window and scroll position start fresh.
@@ -97,16 +95,16 @@ function ChatTranscript(props: {
   const [earlierDays, setEarlierDays] = useState(0);
   const start = imessageThreadWindowStart(props.threads, openedAt, earlierDays);
   const visible = props.threads.slice(start);
-  const kind = imessageChatKind(props.chatSlug);
+  const namedSenders = imessageChatKind(props.chatSlug) !== "owner";
 
   return (
     // column-reverse opens at the bottom and keeps the reader's place when earlier
     // threads are added above, without measuring anything.
     <div className="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto overscroll-y-contain scrollbar-gutter-both">
-      <div className="mx-auto flex w-full max-w-2xl flex-col gap-1 px-4 pt-4 pb-8">
+      <div className="mx-auto flex w-full max-w-[620px] flex-col px-6 pt-3 pb-6 max-sm:px-3.5 max-sm:pt-1 max-sm:pb-4">
         <h1 className="sr-only">{props.label}</h1>
         {start > 0 ? (
-          <div className="flex justify-center pb-2">
+          <div className="flex justify-center pt-2 pb-1">
             <Button variant="outline" size="sm" onClick={() => setEarlierDays((days) => days + 1)}>
               Show earlier
             </Button>
@@ -117,9 +115,7 @@ function ChatTranscript(props: {
             key={thread.id}
             thread={thread}
             previousDayKey={index === 0 ? null : imessageDayKey(visible[index - 1]!.updatedAt)}
-            namedSenders={kind !== "owner"}
-            showSenders={kind === "group"}
-            chatLabel={props.label}
+            namedSenders={namedSenders}
           />
         ))}
       </div>
@@ -132,8 +128,6 @@ const ChatThreadRows = memo(function ChatThreadRows(props: {
   thread: EnvironmentThreadShell;
   previousDayKey: string | null;
   namedSenders: boolean;
-  showSenders: boolean;
-  chatLabel: string;
 }) {
   const { thread } = props;
   const visibleTurnItems = useThreadVisibleTurnItems({
@@ -150,45 +144,53 @@ const ChatThreadRows = memo(function ChatThreadRows(props: {
   return (
     <>
       {rows.map((row) => (
-        <ChatRow
-          key={row.id}
-          row={row}
-          thread={thread}
-          showSender={(sender) =>
-            sender !== null && (props.showSenders || sender !== props.chatLabel)
-          }
-        />
+        <ChatRow key={row.id} row={row} thread={thread} />
       ))}
     </>
   );
 });
 
-function ChatRow(props: {
-  row: IMessageChatRow;
-  thread: EnvironmentThreadShell;
-  showSender: (sender: string | null) => boolean;
-}) {
+function ChatRow(props: { row: IMessageChatRow; thread: EnvironmentThreadShell }) {
   const { row } = props;
   switch (row.kind) {
     case "divider":
-      return <DayDivider createdAt={row.createdAt} />;
+      return (
+        <p className="mt-3.5 mb-1.5 text-center text-xs font-medium text-muted-foreground">
+          {new Date(row.createdAt).toLocaleDateString(undefined, {
+            weekday: "long",
+            day: "numeric",
+            month: "long",
+          })}
+        </p>
+      );
+    case "time":
+      return (
+        <time
+          dateTime={row.createdAt}
+          className="mt-3.5 mb-1.5 text-center text-2xs text-muted-foreground"
+        >
+          {new Date(row.createdAt).toLocaleTimeString(undefined, {
+            hour: "numeric",
+            minute: "2-digit",
+          })}
+        </time>
+      );
     case "incoming":
       return (
         <Bubble
           side="incoming"
           text={row.voice && row.text.length === 0 ? "Voice message, not transcribed" : row.text}
-          at={row.createdAt}
-          sender={row.senderChanged && props.showSender(row.sender) ? row.sender : null}
+          sender={row.senderChanged ? row.sender : null}
           quote={row.quote}
-          voice={row.voice}
+          voice={row.voice && row.text.length > 0}
         />
       );
     case "reply":
-      return <Bubble side="reply" text={row.text} at={row.createdAt} />;
+      return <Bubble side="reply" text={row.text} />;
     case "event":
       return (
-        <p className="mx-auto my-1.5 max-w-full truncate px-6 text-center text-xs text-muted-foreground">
-          <span className="font-medium text-foreground">{row.source}</span>
+        <p className="my-1.5 max-w-[85%] self-center text-center text-xs leading-snug wrap-anywhere text-muted-foreground">
+          <span className="font-semibold text-foreground">{row.source}</span>
           {row.title.length > 0 ? ` · ${row.title}` : null}
         </p>
       );
@@ -197,131 +199,124 @@ function ChatRow(props: {
   }
 }
 
-function DayDivider(props: { createdAt: string }) {
-  const label = new Date(props.createdAt).toLocaleDateString(undefined, {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-  });
-  return <div className="my-4 text-center text-xs font-medium text-muted-foreground">{label}</div>;
-}
-
-/**
- * Standard iMessage look: incoming gray on the left, sent blue on the right. Colours
- * come from the app's own tokens so light and dark follow the theme.
- */
+/** Messages' own look: grey incoming bubbles on the left, blue sent ones on the right. */
 function Bubble(props: {
   side: "incoming" | "reply";
   text: string;
-  at: string;
   sender?: string | null;
   quote?: string | null;
   voice?: boolean;
 }) {
   const isReply = props.side === "reply";
-  const time = new Date(props.at).toLocaleTimeString(undefined, {
-    hour: "numeric",
-    minute: "2-digit",
-  });
   return (
-    <div className={cn("flex w-full flex-col gap-0.5", isReply ? "items-end" : "items-start")}>
+    <div
+      className={cn(
+        "mt-[3px] flex max-w-[78%] flex-col",
+        isReply ? "items-end self-end" : "items-start self-start",
+      )}
+    >
       {props.sender ? (
-        <span className="px-3.5 pt-1 text-xs text-muted-foreground">{props.sender}</span>
+        <span className="ms-[13px] mt-1.5 mb-0.5 text-xs text-muted-foreground">
+          {props.sender}
+        </span>
       ) : null}
       {props.quote ? (
-        <p className="line-clamp-2 max-w-[70%] px-3.5 text-xs text-muted-foreground">
-          {props.quote}
-        </p>
+        <p className="ms-[13px] mb-0.5 line-clamp-2 text-xs text-muted-foreground">{props.quote}</p>
       ) : null}
       <div
         className={cn(
-          "max-w-[78%] rounded-3xl px-3.5 py-2 text-base leading-snug whitespace-pre-wrap break-words",
-          isReply ? "bg-primary text-primary-foreground" : "bg-muted text-foreground",
+          "max-w-full rounded-(--im-bubble-radius) px-3.25 py-2 text-(length:--im-bubble-text) leading-snug whitespace-pre-wrap wrap-anywhere max-sm:text-base",
+          isReply ? "bg-(--im-out) text-white" : "bg-(--im-in) text-(--im-in-ink)",
         )}
       >
         {props.text}
       </div>
-      <time dateTime={props.at} className="px-2 text-2xs text-muted-foreground">
-        {props.voice ? `Voice · ${time}` : time}
-      </time>
+      {props.voice ? (
+        <span className="ms-[13px] mt-0.5 text-2xs text-muted-foreground">Voice message</span>
+      ) : null}
     </div>
   );
 }
 
-const OUTCOME_LABEL = { replied: "Agent", "no-reply": "No reply", working: "Working" } as const;
-
-/** One agent turn: a collapsed summary line that expands to every step and hidden frame. */
+/** The chip above a reply; it opens the turn's steps in place, between chip and reply. */
 function AgentRow(props: {
   row: Extract<IMessageChatRow, { kind: "agent" }>;
   thread: EnvironmentThreadShell;
 }) {
   const { row, thread } = props;
   const [open, setOpen] = useState(false);
-  const seconds = Math.max(
-    0,
-    Math.round((new Date(row.endedAt).getTime() - new Date(row.startedAt).getTime()) / 1000),
-  );
-  const steps = row.steps.length;
-  const summary = [
-    OUTCOME_LABEL[row.outcome],
-    steps > 0 ? `${steps} ${steps === 1 ? "step" : "steps"}` : null,
-    seconds > 0 ? formatDuration(seconds) : null,
-  ]
-    .filter((part) => part !== null)
-    .join(" · ");
+  const Chevron = open ? ChevronDownIcon : ChevronRightIcon;
   return (
-    <div className="w-full">
-      <WorkLogBlock layout="standalone">
-        <WorkLogButton label={summary} aria-expanded={open} onClick={() => setOpen((v) => !v)} />
-        {open ? (
-          <WorkLogDetails>
-            <WorkLogList>
+    <>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className={cn(
+          "mt-1 inline-flex items-center gap-1 self-end rounded-md px-1.5 pt-1 pb-0.5 text-xs outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+          open ? "text-foreground" : "text-muted-foreground",
+        )}
+      >
+        {imessageAgentSummary(row)}
+        <Chevron aria-hidden className="size-3.5" />
+      </button>
+      {open ? (
+        <div className="mt-1 mb-1.5 w-[78%] self-end rounded-xl bg-(--im-raised) px-4 py-3.5 max-sm:w-[92%]">
+          {row.steps.length > 0 ? (
+            <ul className="flex flex-col gap-2">
               {row.steps.map((step) => (
                 <AgentStep key={step.id} step={step} />
               ))}
-            </WorkLogList>
-            <Link
-              to="/$environmentId/$threadId"
-              params={{ environmentId: thread.environmentId, threadId: thread.id }}
-              className="self-start text-xs text-muted-foreground underline-offset-2 hover:underline"
-            >
-              Open thread
-            </Link>
-          </WorkLogDetails>
-        ) : null}
-      </WorkLogBlock>
-    </div>
+            </ul>
+          ) : null}
+          <Link
+            to="/$environmentId/$threadId"
+            params={{ environmentId: thread.environmentId, threadId: thread.id }}
+            className={cn(
+              "inline-flex items-center gap-1.5 text-(length:--im-detail-text) text-(--im-link) underline-offset-2 hover:underline",
+              row.steps.length > 0 && "mt-3",
+            )}
+          >
+            <ExternalLinkIcon aria-hidden className="size-3.5" />
+            Open thread
+          </Link>
+        </div>
+      ) : null}
+    </>
   );
 }
 
 function AgentStep(props: { step: IMessageAgentStep }) {
   const { step } = props;
   const [open, setOpen] = useState(false);
-  if (step.detail === null) {
-    return (
-      <p className={cn("py-0.5 text-sm", step.error ? "text-destructive" : "text-secondary-label")}>
-        {step.label}
-      </p>
-    );
-  }
+  const text = step.code ? (
+    <code className="font-mono text-xs wrap-anywhere">{step.text}</code>
+  ) : (
+    step.text
+  );
   return (
-    <>
-      <WorkLogButton
-        label={<span className={cn(step.error && "text-destructive")}>{step.label}</span>}
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-      />
-      {open ? (
-        <p className="ms-0.5 mb-2 text-xs whitespace-pre-wrap break-words text-muted-foreground select-text">
+    <li className="grid grid-cols-[112px_minmax(0,1fr)_auto] items-baseline gap-x-2.5 text-(length:--im-detail-text) leading-snug">
+      <span className={step.error ? "text-destructive" : "text-(--im-muted)"}>{step.label}</span>
+      {step.detail === null ? (
+        <span className="text-foreground wrap-anywhere">{text}</span>
+      ) : (
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+          className="rounded-sm text-start text-foreground outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+        >
+          <span className={cn("wrap-anywhere", !open && "line-clamp-2")}>{text}</span>
+        </button>
+      )}
+      <span className="text-xs text-(--im-muted) tabular-nums">
+        {step.seconds === null ? null : formatIMessageDuration(step.seconds)}
+      </span>
+      {open && step.detail !== null ? (
+        <p className="col-start-2 col-end-4 mt-1.5 max-h-72 overflow-y-auto text-xs whitespace-pre-wrap wrap-anywhere text-(--im-muted) select-text">
           {step.detail}
         </p>
       ) : null}
-    </>
+    </li>
   );
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.round(seconds / 60);
-  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
