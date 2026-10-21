@@ -247,6 +247,12 @@ function validRoot(root: unknown): root is string {
 export type OwnerWords = { inboundId: string; text: string };
 
 /**
+ * How a steer landed. `started`/`queued` mean the run ended first and the text
+ * became (or waits for) a run of its own; `refused` means nothing was sent.
+ */
+export type SteerDelivery = "steered" | "started" | "queued" | "refused";
+
+/**
  * What the router and the origin backfill need from a backend. OpenChamber
  * implements it here; Robob's control API implements it in robob.ts.
  */
@@ -271,6 +277,11 @@ export interface ChatBackend {
    */
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
     model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords): Promise<void>;
+  /**
+   * Adds text to the session's running turn, never queueing behind it. Backends
+   * without it (OpenChamber) keep follow-ups as their own turns.
+   */
+  steer?(id: string, directory: string, messageId: string, text: string, guidance?: string): Promise<SteerDelivery>;
   abort(id: string, directory: string): Promise<boolean>;
   statuses(): Promise<Record<string, SessionStatus>>;
   permissions(sessionId: string, directory: string): Promise<PermissionRequest[]>;

@@ -90,6 +90,12 @@ function fakeControl() {
       if (thread && parts[2] === "interrupt") return ok({ interrupted: true });
       if (thread && parts[2] === "send") {
         const messageId = `${sentMessagePrefix(thread.threadId)}${encodeURIComponent(body.clientRequestId)}`;
+        const running = thread.runs.find(run => run.status === "running");
+        if (body.mode === "steer" && !thread.messages.some(message => message.messageId === messageId)) {
+          if (!running) return Response.json({ ok: false, error: { code: "conflict", message: "no steerable run" } }, { status: 409 });
+          thread.messages.push({ messageId, runId: running.runId, role: "user", text: body.text, streaming: false, createdBy: "system", createdAt: now(), updatedAt: now() });
+          return ok({ threadId: thread.threadId, messageId, delivery: "steered" });
+        }
         if (!thread.messages.some(message => message.messageId === messageId)) {
           const runId = `run:thread:${thread.threadId}:ordinal:${thread.runs.length + 1}`;
           thread.runs.push({ runId, ordinal: thread.runs.length + 1, status: "running" });
@@ -176,6 +182,20 @@ test("prompt sends channel guidance beside the text, sends the model and dedupes
   // Robob attributed the unverified relay to the bridge; it is still the bridge's prompt.
   const records = await backend.messages(id, directory);
   expect(records).toEqual([{ id: prompt, type: "user", text: "hello", time: expect.any(Object) }]);
+});
+
+test("steer sends mode steer into the running run and reports a refusal when nothing is running", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  expect(await backend.steer(id, directory, `msg_${"b".repeat(64)}`, "early", "Note.")).toBe("refused");
+  await backend.prompt(id, directory, `msg_${"a".repeat(64)}`, "hello", "Be brief.");
+  const steer = `msg_${"c".repeat(64)}`;
+  expect(await backend.steer(id, directory, steer, "also this", "Came in mid-turn.")).toBe("steered");
+  const sends = control.calls.filter(call => call.path.endsWith("/send"));
+  expect(sends.at(-1)!.body).toEqual({ text: "also this", mode: "steer", clientRequestId: steer, guidance: "Came in mid-turn." });
+  expect(control.threads.get(id)!.runs).toHaveLength(1);
+  expect(await backend.promptAccepted(id, directory, steer)).toBe(true);
 });
 
 test("the owner's typed words go alone with their inbound id; a quote or the bridge's lead becomes guidance", async () => {

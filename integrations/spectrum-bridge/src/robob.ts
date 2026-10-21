@@ -1,4 +1,4 @@
-import { IMESSAGE_ORIGIN, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus } from "./openchamber.ts";
+import { IMESSAGE_ORIGIN, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -293,6 +293,23 @@ export class RobobBackend implements ChatBackend {
       ...(model ? { model: `${model.providerID}/${model.modelID}`, ...(model.variant ? { variant: model.variant } : {}) } : {}),
       ...(attachments.length ? { attachments } : {}),
     }, { timeoutMs: 60_000 });
+  }
+
+  /**
+   * `mode: "steer"` never queues: with no steerable run Robob answers 409 and
+   * dispatches nothing. A retried POST replays under the same `clientRequestId`.
+   */
+  async steer(id: string, _directory: string, messageId: string, text: string, guidance = ""): Promise<SteerDelivery> {
+    const threadId = await this.resolve(id);
+    try {
+      const { delivery } = await this.client.request<{ delivery?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, {
+        text, mode: "steer", clientRequestId: messageId, ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
+      }, { timeoutMs: 60_000 });
+      return delivery === "started" || delivery === "queued" ? delivery : "steered";
+    } catch (error) {
+      if (error instanceof ControlError && error.status === 409) return "refused";
+      throw error;
+    }
   }
 
   async abort(id: string, _directory?: string): Promise<boolean> {

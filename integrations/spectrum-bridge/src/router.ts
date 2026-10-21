@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { stripInternalText } from "./formatting.ts";
-import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest } from "./openchamber.ts";
+import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
@@ -44,6 +44,10 @@ type Turn = Route & {
   attemptAt?: number;
   /** Record ids of earlier attempts. Any one of them may still land late. */
   earlier?: string[];
+  /** Prompt ids of follow-up texts steered into this turn; its reply waits for the run after the last one. */
+  steered?: string[];
+  /** When the last steer was sent, bounding how long a steer that never shows up holds the reply. */
+  steeredAt?: number;
 };
 /** What an owner-text turn POSTed, kept while its delivery is uncertain so it can be sent again. */
 type ResendBody = {
@@ -170,6 +174,8 @@ const SENDBLUE_QUIET_MS = 2_000;
 const SENDBLUE_TYPING_REFRESH_MS = 20_000;
 /** Sendblue mode: a typing sender holds the batch back, but never past this from its oldest member. */
 const SENDBLUE_TYPING_CAP_MS = 90_000;
+/** After a refused steer the run is ending; give it this long to settle before steering again. */
+const STEER_RETRY_MS = 3_000;
 /**
  * A turn that ends in an error is often only a hiccup: the agent retries and
  * finishes the work on its own moments later. Hold the "something went wrong"
@@ -194,6 +200,13 @@ function undeliveredNote(attachment: NormalizedInbound["attachments"][number], d
 }
 /** Rows the bridge injects itself (secure-form notices, watcher wakes, reset nudges): never owner text, never a provider message. */
 const synthetic = (id: string) => id.startsWith("secret:") || id.startsWith("wake:") || id.startsWith("reset:");
+/** A person's plain typed text, the only kind of row steered into a running turn. */
+const steerText = (row: { id: string; payload: unknown }) => {
+  const input = row.payload as Detachable;
+  return !synthetic(row.id) && !input.detached && !input.attachments.length && !!input.text.trim() && !input.text.trimStart().startsWith("/");
+};
+/** How long a steer that was sent but never shows up in the session holds the turn's reply. */
+const STEER_SETTLE_MS = 60_000;
 /** A log-safe code for a failed typing call: the transport's code, a timeout, or nothing specific. */
 function typingFailure(error: unknown): string {
   if (error instanceof TransportError && /^[A-Za-z0-9_:.-]{1,60}$/.test(error.code)) return error.code;
@@ -369,6 +382,7 @@ export class Router {
   private watchedAt = 0;
   /** Sendblue mode: queued rows already marked read, so each is marked once rather than every tick. */
   private readIds = new Set<string>();
+  private steerRefusedAt = 0;
 
   constructor(
     private readonly store: Store,
@@ -579,7 +593,8 @@ export class Router {
       for (const row of rows) {
         const input = row.payload as NormalizedInbound;
         if (row.state === "processing") {
-          if (!this.owns(row.id)) {
+          // A steer cut short is retried under its prompt id below, never dropped.
+          if (!this.owns(row.id) && !this.steering(row.id)) {
             this.acknowledge(row.id, "Something interrupted that one before I could get to it. Mind sending it again?", "unknown");
           }
         } else {
@@ -588,11 +603,13 @@ export class Router {
         preceding.add(row.id);
       }
       await this.poll();
+      for (const row of this.store.pendingInbound()) if (row.state === "processing" && this.steering(row.id)) await this.steer(row);
       await this.watch();
       await this.nudgeDue();
       this.flushNotice();
       const next = this.sealBatch(preceding);
-      if (next) await this.submit(next, preceding);
+      if (next && this.steering(next.id)) await this.steer(next);
+      else if (next) await this.submit(next, preceding);
       // Transport hints are best effort and never part of prompt acceptance.
       if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
       completed = true;
@@ -632,15 +649,19 @@ export class Router {
       // A failed or retired turn never blocks the conversation.
       const turn = this.store.get<Turn | null>("activeTurn");
       const busy = turn && turn.phase !== "failed" && this.current(turn);
+      // Typed follow-ups join the running turn instead of waiting for it to end.
+      const steer = !!busy && this.steerable(turn);
       // An arrival during control handling/polling may extend this batch or cancel it with /new.
-      if (busy || rows.some(row => row.state === "pending" && !handled.has(row.id))) return;
+      if ((busy && !steer) || rows.some(row => row.state === "pending" && !handled.has(row.id))) return;
       // Commands are never conversation, even if one was left queued. A synthetic
       // row waiting out a retry backoff does not hold up anything behind it.
       // A reset nudge goes first, so texts sent right after /new reach the fresh context.
-      const leader = rows.find(row => row.state === "pending" && resetRow(row.id))
+      // Steering skips bridge rows (they wait for their own turn) but never reorders what people sent.
+      const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id))
+        : rows.find(row => row.state === "pending" && resetRow(row.id))
         ?? rows.find(row => row.state === "pending" && !this.backingOff(row.id, now)
           && !/^\/(?!(?:notification|context)(?:\s|$))/.test((row.payload as NormalizedInbound).text.trimStart()));
-      if (!leader) return;
+      if (!leader || (steer && !steerText(leader))) return;
       const input = leader.payload as NormalizedInbound;
       const ordinary = !input.text.trimStart().startsWith("/");
       const members = [leader];
@@ -653,7 +674,8 @@ export class Router {
           const next = JSON.parse(row.payload) as NormalizedInbound;
           // Watcher events travel alone, so owner text is never read as part of one (or the reverse).
           if (row.state !== "pending" || next.text.trimStart().startsWith("/") || next.replyTo !== input.replyTo
-            || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)) break;
+            || row.id.startsWith("wake:") !== leader.id.startsWith("wake:") || resetRow(row.id) || this.backingOff(row.id, now)
+            || (steer && !steerText({ id: row.id, payload: next }))) break;
           members.push({ ...row, payload: next });
         }
       }
@@ -664,7 +686,9 @@ export class Router {
       // Watcher wakes and reset nudges are machine events with nothing more coming, so they skip the typing grace.
       const machine = leader.id.startsWith("wake:") || resetRow(leader.id);
       const context = this.options.context;
-      if (!machine && now - latestReceivedAt < (this.options.quietMs ?? (context ? SENDBLUE_QUIET_MS : 15_000))) return;
+      const quiet = this.options.quietMs ?? (context ? SENDBLUE_QUIET_MS : 15_000);
+      // Someone is already waiting on the running turn, so a follow-up only gets the short wait.
+      if (!machine && now - latestReceivedAt < (steer ? Math.min(quiet, SENDBLUE_QUIET_MS) : quiet)) return;
       // Sendblue: someone still typing extends the wait, capped so a long typer cannot hold a batch forever.
       if (!machine && context && context.typing()) {
         const oldest = Math.min(...inputs.map(item => item.receivedAt ?? now));
@@ -681,10 +705,114 @@ export class Router {
         attachments: [...attachments.values()], isAudioMessage: inputs.some(item => item.isAudioMessage),
       };
       this.store.set(`batch:${leader.id}`, batch);
-      this.store.set(`batch-phase:${leader.id}`, "preparing");
+      this.store.set(`batch-phase:${leader.id}`, steer ? "steering" : "preparing");
       for (const row of members) this.store.updateInbound(row.id, row.id === leader.id ? "processing" : "batched");
       return { ...leader, state: "processing" };
     }).immediate();
+  }
+
+  /**
+   * Only an owner-or-person text turn in the foreground takes follow-ups; watcher,
+   * reset and background turns, and a turn waiting on an answer, keep today's queue.
+   */
+  private steerable(turn: Turn): boolean {
+    return this.backend.steer !== undefined && turn.phase === "running" && !turn.background && turn.origin === undefined
+      && turn.inboundId !== undefined && !synthetic(turn.inboundId) && this.current(turn)
+      && Date.now() - this.steerRefusedAt >= STEER_RETRY_MS
+      && !this.pending().some(p => p.state !== "expired" && p.state !== "answered");
+  }
+
+  private steering(id: string): boolean {
+    return this.store.get(`batch-phase:${id}`) === "steering";
+  }
+
+  /** Marks a steered batch consumed: its text is now part of the running turn. */
+  private consumeSteer(id: string): void {
+    this.store.db.transaction(() => {
+      if (this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state !== "processing") return;
+      for (const member of this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id]) this.store.updateInbound(member, "done");
+      this.store.set(`batch:${id}`, null);
+      this.store.set(`batch-phase:${id}`, null);
+    }).immediate();
+  }
+
+  /**
+   * Puts a steering batch back in the queue, to be steered again or sent as its
+   * own turn under the same prompt id. `forget` only when nothing was sent.
+   */
+  private releaseSteer(id: string, forget: boolean): void {
+    this.store.db.transaction(() => {
+      const ids = this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id];
+      const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?");
+      for (const member of ids) if (["processing", "batched"].includes(state.get(member)?.state ?? "")) this.store.updateInbound(member, "pending");
+      this.store.set(`batch:${id}`, null);
+      this.store.set(`batch-phase:${id}`, null);
+      const turn = this.store.get<Turn | null>("activeTurn");
+      const messageId = `msg_${hash(id)}`;
+      if (forget && turn?.steered?.includes(messageId)) this.store.set("activeTurn", { ...turn, steered: turn.steered.filter(item => item !== messageId) });
+    }).immediate();
+  }
+
+  private async steer(row: InboundRecord): Promise<void> {
+    if (this.store.get(`batch-phase:${row.id}`) !== "steering"
+      || this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state !== "processing") return;
+    const turn = this.store.get<Turn | null>("activeTurn");
+    // Same id a turn of its own would use, so a later send of this batch replays rather than repeats.
+    const messageId = `msg_${hash(row.id)}`;
+    if (!turn || !this.steerable(turn)) {
+      // An earlier try with no answer may have landed after all.
+      const tried = !!turn?.steered?.includes(messageId);
+      const accepted = tried ? await bounded(this.backend.promptAccepted(turn!.id, turn!.directory, messageId)).catch(() => undefined) : false;
+      if (accepted === undefined) return;
+      if (accepted) this.consumeSteer(row.id);
+      else this.releaseSteer(row.id, tried);
+      return;
+    }
+    const input = this.store.get<NormalizedInbound>(`batch:${row.id}`) ?? row.payload as NormalizedInbound;
+    this.store.db.transaction(() => {
+      const live = this.store.get<Turn | null>("activeTurn");
+      if (live && live.messageId === turn.messageId && this.current(live) && !live.steered?.includes(messageId)) {
+        this.store.set("activeTurn", { ...live, steered: [...live.steered ?? [], messageId], steeredAt: Date.now() });
+      }
+    }).immediate();
+    const context = this.options.context;
+    const eyes = context !== undefined && context.chat.kind !== "owner";
+    if (eyes && !this.store.get<boolean>(`eyes:${row.id}`)) {
+      this.store.set(`eyes:${row.id}`, true);
+      await bounded(context.react(input.id, "👀")).catch(() => this.options.log?.("eyes-reaction-failed"));
+      if (this.typingActive) await this.updateTyping(true, true);
+    }
+    let quote = "";
+    const reference = input.replyTo ? this.store.byProviderId(input.replyTo) : undefined;
+    if (reference?.text.trim()) quote = replyQuote("your earlier message", reference.text);
+    else if (input.replyTo) {
+      const target = await this.replyTargetText(input.replyTo, input.batchIds ?? [row.id]);
+      if (target) quote = replyQuote(target.fromOwner ? "the owner's own earlier message" : "your earlier message", target.text);
+    }
+    const body = quote ? `${quote}\n${input.text.trim()}` : input.text.trim();
+    const guidance = `[Bridge note, not typed by anyone.] This message came in while you were working. Take it into account in what you are doing now; your final reply still goes to the chat. Current incoming message ID: ${JSON.stringify(input.id)}. Source incoming message IDs (in order, available as reaction targets): ${JSON.stringify(input.batchIds ?? [row.id])}.${eyes ? " The 👀 reaction to it is already sent." : ""}`;
+    let delivery: SteerDelivery;
+    try {
+      delivery = await bounded(this.backend.steer!(turn.id, turn.directory, messageId, body, guidance));
+    } catch {
+      // Uncertain: the next tick sends again under the same id, which replays if this one landed.
+      this.options.log?.("steer-uncertain");
+      return;
+    }
+    if (delivery === "refused") {
+      // A replayed send can be refused after its first try landed; only then is the text already in.
+      const accepted = await bounded(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch(() => undefined);
+      if (accepted === undefined) return;
+      if (accepted) this.consumeSteer(row.id);
+      else {
+        this.steerRefusedAt = Date.now();
+        this.releaseSteer(row.id, true);
+      }
+      this.options.log?.(accepted ? "steered" : "steer-refused");
+      return;
+    }
+    this.consumeSteer(row.id);
+    this.options.log?.("steered", delivery);
   }
 
   private unsealBatch(id: string): boolean {
@@ -1910,11 +2038,24 @@ export class Router {
       // execution settles (succeeded, failed or interrupted).
       const start = messages.findIndex(m => m.id === turn!.messageId && (turn!.background || m.type === "user"));
       const after = start < 0 ? [] : messages.slice(start + 1);
-      const end = after.findIndex(m => m.type === "idle");
+      // A steered text that landed after the run ended starts a run of its own; the turn waits for that one too.
+      let steered = -1;
+      after.forEach((m, index) => { if (m.type === "user" && turn!.steered?.includes(m.id)) steered = index; });
+      const missing = (turn.steered ?? []).some(id => !after.some(m => m.id === id))
+        && Date.now() - (turn.steeredAt ?? 0) < STEER_SETTLE_MS;
+      const found = after.slice(steered + 1).findIndex(m => m.type === "idle");
+      const end = missing || found < 0 ? -1 : steered + 1 + found;
       const idle = end < 0 ? undefined : after[end] as Extract<MessageRecord, { type: "idle" }>;
       const replies = (end < 0 ? after : after.slice(0, end))
         .filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = replies.at(-1);
+      // The last word of each earlier run still goes out, ahead of the final one.
+      const earlier: Extract<MessageRecord, { type: "assistant" }>[] = [];
+      let last: MessageRecord | undefined;
+      for (const m of end < 0 ? [] : after.slice(0, end)) {
+        if (m.type === "idle" && last?.type === "assistant" && last.id !== final?.id) earlier.push(last);
+        if (m.type === "assistant" || m.type === "idle") last = m;
+      }
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
@@ -1965,6 +2106,13 @@ export class Router {
       const usage = [...replies].reverse().map(m => (m as { tokens?: { input?: number; cache?: { read?: number; write?: number } } }).tokens)
         .find(tokens => typeof tokens?.input === "number");
       this.store.db.transaction(() => {
+        for (const reply of earlier) {
+          const words = replyText(assistantText(reply));
+          if (words) this.store.enqueue({
+            id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text: words, sessionId: turn!.id, generation: turn!.generation,
+            ...replyTarget(turn!.inboundId),
+          });
+        }
         if (text) this.store.enqueue({
           id: `reply:${turn!.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
           ...replyTarget(turn!.inboundId),

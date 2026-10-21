@@ -289,6 +289,34 @@ test("the 👀 tapback clears the bubble, so typing is re-armed right after it",
   expect(h.hints).toEqual(["read", "start", "react:👀", "start", "prompt"]);
 });
 
+test("a follow-up from Moni mid-turn is steered with its own 👀, typing stays on, and one reply closes the turn", async () => {
+  setSystemTime(Date.parse("2026-10-21T12:00:00Z"));
+  const moni = context("dm");
+  const h = live(moni);
+  const steers: { messageId: string; text: string; guidance?: string }[] = [];
+  Object.assign(h.backend, {
+    async steer(_id: string, _directory: string, messageId: string, text: string, guidance?: string) {
+      h.hints.push("steer");
+      steers.push({ messageId, text, guidance });
+      h.backend.records.push({ id: messageId, type: "user", text, time: { created: Date.now() } } as MessageRecord);
+      return "steered";
+    },
+  });
+  h.input("m1", "book a car", "+971585933213");
+  await h.router.tick();
+  h.input("m2", "to the mall", "+971585933213");
+  await h.router.tick();
+  expect(h.hints).toEqual(["read", "start", "react:👀", "start", "prompt", "read", "react:👀", "start", "steer"]);
+  expect(moni.reacted).toEqual([["m1", "👀"], ["m2", "👀"]]);
+  expect(steers).toEqual([{ messageId: expect.stringMatching(/^msg_/), text: "Moni: to the mall", guidance: expect.stringContaining("already sent") }]);
+  expect(steers[0]!.guidance).toContain("[\"m2\"]");
+  h.backend.final("Booked to the mall");
+  await h.router.tick();
+  expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([["Booked to the mall", "m1"]]);
+  expect(h.store.pendingInbound()).toEqual([]);
+  expect(h.hints.at(-1)).toBe("stop");
+});
+
 test("groups and bridge wakes never show typing", async () => {
   setSystemTime(Date.parse("2026-10-21T12:00:00Z"));
   const g = live(context("group"));
