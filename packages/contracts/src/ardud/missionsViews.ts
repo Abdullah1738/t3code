@@ -282,21 +282,21 @@ export const ViewGalleryNode = Schema.TaggedStruct("gallery", {
   bind: ViewBind,
   review: Schema.Literals(["none", "per-asset"]),
 });
-/**
- * Long text folded under a one-line header; tapping it opens the body. In a
- * section there is one per row. A `longtext` body (a report's text) never
- * rides in the snapshot: the client loads it on open.
- */
-export const ViewCollapsibleNode = Schema.TaggedStruct("collapsible", {
-  /** The header; null shows `label`. */
+/** Markdown text. A `longtext` value only binds inside a collapsible, which loads it on open. */
+export const ViewMarkdownNode = Schema.TaggedStruct("markdown", {
+  bind: ViewBind,
+  maxLines: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 40 }))),
+});
+/** A collapsible's header; its children decode on their own like a group's. */
+export const ViewCollapsibleHead = Schema.Struct({
+  /** Null shows `label`. */
   title: Schema.NullOr(ViewBind),
   label: Schema.optionalKey(ViewKicker),
   meta: Schema.Array(ViewBind).check(Schema.isMaxLength(3)),
-  body: ViewBind,
-  format: Schema.Literals(["markdown", "plain"]),
   /** `first` opens the first item on load. */
   open: Schema.Literals(["none", "first"]),
 });
+export type ViewCollapsibleHead = typeof ViewCollapsibleHead.Type;
 // --- end views additions ---
 
 export const ViewLeafNode = Schema.Union([
@@ -313,7 +313,7 @@ export const ViewLeafNode = Schema.Union([
   ViewTableNode,
   ViewMeterNode,
   ViewGalleryNode,
-  ViewCollapsibleNode,
+  ViewMarkdownNode,
   // --- end views additions ---
 ]);
 export type ViewLeafNode = typeof ViewLeafNode.Type;
@@ -324,18 +324,48 @@ export interface ViewGroupNode {
   readonly direction: "column" | "row";
   readonly children: ReadonlyArray<ViewNode>;
 }
-export type ViewNode = ViewLeafNode | ViewGroupNode;
+// --- views additions ---
+/**
+ * A header that opens to show its children. In a section there is one per
+ * row and the children bind that row; a `longtext` value inside never rides
+ * in the snapshot, the client loads it on open.
+ */
+export interface ViewCollapsibleNode extends ViewCollapsibleHead {
+  readonly _tag: "collapsible";
+  readonly children: ReadonlyArray<ViewNode>;
+}
+// --- end views additions ---
+export type ViewNode =
+  | ViewLeafNode
+  | ViewGroupNode
+  // --- views additions ---
+  | ViewCollapsibleNode;
+// --- end views additions ---
 export type ViewNodeTag = ViewNode["_tag"];
 
+const ViewChildren = Schema.Array(Schema.suspend((): Schema.Codec<ViewNode> => ViewNode)).check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(6),
+);
 export const ViewGroupNode: Schema.Codec<ViewGroupNode> = Schema.Struct({
   _tag: Schema.tag("group"),
   direction: Schema.Literals(["column", "row"]),
-  children: Schema.Array(Schema.suspend((): Schema.Codec<ViewNode> => ViewNode)).check(
-    Schema.isMinLength(1),
-    Schema.isMaxLength(6),
-  ),
+  children: ViewChildren,
 });
-export const ViewNode: Schema.Codec<ViewNode> = Schema.Union([ViewLeafNode, ViewGroupNode]);
+// --- views additions ---
+export const ViewCollapsibleNode: Schema.Codec<ViewCollapsibleNode> = Schema.Struct({
+  _tag: Schema.tag("collapsible"),
+  ...ViewCollapsibleHead.fields,
+  children: ViewChildren,
+});
+// --- end views additions ---
+export const ViewNode: Schema.Codec<ViewNode> = Schema.Union([
+  ViewLeafNode,
+  ViewGroupNode,
+  // --- views additions ---
+  ViewCollapsibleNode,
+  // --- end views additions ---
+]);
 
 export const VIEW_NODE_TAGS: ReadonlyArray<ViewNodeTag> = [
   "text",
@@ -353,6 +383,7 @@ export const VIEW_NODE_TAGS: ReadonlyArray<ViewNodeTag> = [
   "meter",
   "gallery",
   "collapsible",
+  "markdown",
   // --- end views additions ---
 ];
 
@@ -823,7 +854,7 @@ export const ViewValueKind = Schema.Literals([
   "facts",
   // --- views additions ---
   "assets",
-  /** Too long for the snapshot; only a collapsible body binds it, and it loads on open. */
+  /** Too long for the snapshot; only a markdown block inside a collapsible binds it, loaded on open. */
   "longtext",
   // --- end views additions ---
 ]);
@@ -1002,7 +1033,7 @@ export const VIEW_BIND_ACCEPTS = {
   cellCount: ["number", "refs", "flags", "links", "assets"],
   collapsibleTitle: ["text", "enum", "link", "pr"],
   collapsibleMeta: SCALAR,
-  collapsibleBody: ["text", "longtext"],
+  markdown: ["text", "longtext"],
   // --- end views additions ---
 } as const satisfies Record<string, ReadonlyArray<ViewValueKind>>;
 export type ViewBindSlot = keyof typeof VIEW_BIND_ACCEPTS;
@@ -1796,8 +1827,14 @@ const NODE_SIGNATURES: ReadonlyArray<{ tag: ViewNodeTag; signature: string; wher
   {
     tag: "collapsible",
     signature:
-      "{title: text bind|null, label?: ≤24 chars, meta: ≤3 binds, body: text|longtext bind, format: markdown|plain, open: none|first}",
-    where: "templates, sections (one per row; longtext loads on open)",
+      "{title: text bind|null, label?: ≤24 chars, meta: ≤3 binds, open: none|first, children: 1..6 nodes}",
+    where:
+      "templates, sections (one per row; its children bind that row; no list, table or collapsible inside)",
+  },
+  {
+    tag: "markdown",
+    signature: "{bind: text|longtext, maxLines?: 1..40}",
+    where: "templates, sections (longtext only inside a collapsible; it loads when that opens)",
   },
   // --- end views additions ---
 ];

@@ -75,9 +75,8 @@ const folded = {
   _tag: "collapsible",
   title: "row.title",
   meta: ["row.period", "row.size"],
-  body: "row.text",
-  format: "markdown",
-  open: "none",
+  open: "first",
+  children: [{ _tag: "markdown", bind: "row.text" }],
 } as const;
 
 const reportSection = (
@@ -176,7 +175,12 @@ describe("report sections", () => {
               ...base,
               body: [
                 { _tag: "list", title: "row.text", meta: [], status: null },
-                { ...folded, body: "row.period", title: null },
+                { ...folded, title: null },
+                { _tag: "markdown", bind: "row.text" },
+                {
+                  ...folded,
+                  children: [{ _tag: "list", title: "row.title", meta: [], status: null }],
+                },
               ],
             },
           },
@@ -184,7 +188,12 @@ describe("report sections", () => {
         assert.isFalse(preview.ok);
         assert.deepEqual(
           preview.issues.map((issue) => `${issue.path} ${issue.code}`),
-          ["body[0].title binding-kind", "body[1].title shape"],
+          [
+            "body[0].title binding-kind",
+            "body[1].title shape",
+            "body[2].bind bad-binding",
+            "body[3].children[0] node-not-allowed",
+          ],
         );
         const misplaced = yield* views.preview({
           missionId,

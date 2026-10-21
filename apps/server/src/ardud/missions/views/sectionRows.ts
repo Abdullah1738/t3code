@@ -38,6 +38,7 @@ const nodeBinds = (node: ViewNode): ReadonlyArray<string> => {
     case "links":
     case "refs":
     case "gallery":
+    case "markdown":
       return [node.bind];
     case "facts":
       return node.rows.map((row) => row.bind);
@@ -48,7 +49,11 @@ const nodeBinds = (node: ViewNode): ReadonlyArray<string> => {
     case "meter":
       return [node.value, node.max];
     case "collapsible":
-      return [...(node.title === null ? [] : [node.title]), ...node.meta, node.body];
+      return [
+        ...(node.title === null ? [] : [node.title]),
+        ...node.meta,
+        ...node.children.flatMap(nodeBinds),
+      ];
     case "group":
       return node.children.flatMap(nodeBinds);
     case "label":

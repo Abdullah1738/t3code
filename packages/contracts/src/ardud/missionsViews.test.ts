@@ -108,21 +108,32 @@ describe("mission views catalog", () => {
     expect(viewActionAllowed("discuss", "knock")).toBe(true);
   });
 
-  it("decodes collapsible nodes and report sections", () => {
+  it("decodes collapsible containers, markdown and report sections", () => {
+    const markdown = { _tag: "markdown", bind: "row.text" };
     const folded = {
       _tag: "collapsible",
       title: "row.title",
       meta: ["row.period", "row.size"],
-      body: "row.text",
-      format: "markdown",
-      open: "none",
+      open: "first",
+      children: [markdown],
     };
     expect(decodeNode(folded)._tag).toBe("Success");
     expect(decodeNode({ ...folded, title: null, label: "Notes" })._tag).toBe("Success");
-    expect(decodeNode({ ...folded, format: "html" })._tag).toBe("Failure");
+    expect(
+      decodeNode({
+        ...folded,
+        children: [{ _tag: "group", direction: "row", children: [markdown] }],
+      })._tag,
+    ).toBe("Success");
+    expect(decodeNode({ ...folded, children: [] })._tag).toBe("Failure");
+    expect(
+      decodeNode({ ...folded, children: Array.from({ length: 7 }, () => markdown) })._tag,
+    ).toBe("Failure");
+    expect(decodeNode({ ...folded, open: "all" })._tag).toBe("Failure");
     expect(decodeNode({ ...folded, meta: ["row.a", "row.b", "row.c", "row.d"] })._tag).toBe(
       "Failure",
     );
+    expect(decodeNode({ ...markdown, maxLines: 41 })._tag).toBe("Failure");
     const section = (where: unknown) =>
       decodeSection({
         key: "updates",
@@ -134,7 +145,9 @@ describe("mission views catalog", () => {
     expect(section({ reportKind: ["weekly"] })).toBe("Failure");
     expect(VIEW_PATHS.report.text).toBe("longtext");
     expect(VIEW_CATALOG.queries?.filters.reportKind).toEqual(["report"]);
-    expect(VIEW_CATALOG.nodes.map((node) => node.tag)).toContain("collapsible");
+    expect(VIEW_CATALOG.nodes.map((node) => node.tag)).toEqual(
+      expect.arrayContaining(["collapsible", "markdown"]),
+    );
   });
 });
 
