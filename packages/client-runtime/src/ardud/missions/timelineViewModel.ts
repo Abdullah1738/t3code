@@ -104,6 +104,7 @@ const PREFIXES: Record<string, { readonly group: TimelineKindGroup; readonly kic
   member: { group: "rooms", kicker: "Member" },
   subscription: { group: "rooms", kicker: "Room" },
   "work-item": { group: "work", kicker: "Work" },
+  thread: { group: "work", kicker: "Thread" },
   view: { group: "layout", kicker: "Layout" },
   recovery: { group: "recovery", kicker: "Recovery" },
   // ardud missions: ship-fix
