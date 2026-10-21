@@ -1158,6 +1158,57 @@ describe("discuss", () => {
       assert.deepInclude(opened[0]!.payload, { requestId: first.id, about: ask });
     }).pipe(Effect.provide(h.layer));
   });
+
+  it.effect("an open discussion stays listed past the cap until someone settles it", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const talk = yield* router.openRequest(
+        { missionId, text: "Why is this item still free?", subject: ask },
+        ownerApp,
+      );
+      yield* masterReads(talk.roomId);
+      yield* router.replyRequest({ requestId: talk.id, text: "Nobody took it." }, master);
+      const old = yield* router.openRequest({ missionId, text: "Old question" }, ownerApp);
+      yield* router.settleRequest({ requestId: old.id }, ownerApp);
+      const fiftyNewer = Effect.forEach(
+        Array.from({ length: 50 }, (_, index) => index),
+        (index) =>
+          Effect.gen(function* () {
+            yield* TestClock.adjust("1 second");
+            const done = yield* router.openRequest(
+              { missionId, text: `Question ${index}` },
+              ownerApp,
+            );
+            yield* router.settleRequest({ requestId: done.id }, ownerApp);
+          }),
+        { discard: true },
+      );
+      yield* fiftyNewer;
+      const listed = (input: Omit<OwnerRequestsInput, "missionId"> = {}) =>
+        Effect.map(router.ownerRequests({ missionId, ...input }, ownerApp), (each) =>
+          each.requests.map((view) => view.request.id),
+        );
+      // Fifty newer requests: the settled one falls off, the answered talk stays, oldest last.
+      const all = yield* listed();
+      assert.strictEqual(all.length, 51);
+      assert.strictEqual(all.at(-1), talk.id);
+      assert.notInclude(all, old.id);
+      assert.include(yield* listed({ status: "answered" }), talk.id);
+      assert.notInclude(yield* listed({ status: "settled" }), old.id);
+      // Read, it is still open, so it still outlives newer talk.
+      const page = yield* router.roomPage({ roomId: talk.roomId }, ownerApp);
+      yield* router.markRead({ roomId: talk.roomId, seq: page.room.lastSeq }, ownerApp);
+      yield* fiftyNewer;
+      assert.include(yield* listed(), talk.id);
+      // Settled, by either side, it ages out like any other.
+      yield* router.settleRequest({ requestId: talk.id, note: "Lane 2 has it." }, master);
+      yield* fiftyNewer;
+      assert.notInclude(yield* listed(), talk.id);
+      assert.include(yield* listed({ subject: ask }), talk.id);
+    }).pipe(Effect.provide(h.layer));
+  });
 });
 
 describe("who reads a request's words", () => {

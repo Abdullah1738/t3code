@@ -30,6 +30,7 @@ import {
   type OwnerRequest,
   type OwnerRequests,
   type OwnerRequestsInput,
+  type OwnerRequestStatus,
   type OwnerRequestView,
   type PostMessageInput,
   type ReopenOwnerRequestInput,
@@ -66,6 +67,24 @@ import type { RouterStore } from "./RouterStore.ts";
 
 /** Requests one list returns, newest activity first. */
 const LIST_MAX = 50;
+/**
+ * Open requests a list keeps past LIST_MAX: a discussion stays on the board
+ * until someone settles it, however much newer talk there is.
+ */
+const OPEN_MAX = 200;
+const OPEN_STATUSES: ReadonlyArray<OwnerRequestStatus> = ["waiting-on-master", "answered"];
+
+/** The newest requests plus every open one older than them, in the store's order. */
+const withOpen = (
+  newest: ReadonlyArray<OwnerRequest>,
+  open: ReadonlyArray<OwnerRequest>,
+): ReadonlyArray<OwnerRequest> => {
+  const byId = new Map(newest.map((request) => [request.id, request]));
+  for (const request of open) byId.set(request.id, request);
+  return [...byId.values()].toSorted((a, b) =>
+    a.updatedAt === b.updatedAt ? b.id.localeCompare(a.id) : b.updatedAt.localeCompare(a.updatedAt),
+  );
+};
 /** Messages each request carries in a list, summaries only. */
 const VIEW_MESSAGES = 6;
 /** Messages a single request carries, with bodies, when asked for by id. */
@@ -662,14 +681,30 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         yield* missionOf(input.missionId);
         const caller = yield* callerOf(yield* loadCast(input.missionId), provenance);
         const words = caller._tag !== "reader" || readsRequestWords(provenance, ownerSession);
-        const records = yield* store.listOwnerRequests(input.missionId, {
+        const filter = {
           ...(input.status === undefined ? {} : { status: [input.status] }),
           ...(input.requestId === undefined ? {} : { ids: [input.requestId] }),
           ...(input.discussions === undefined ? {} : { discussions: input.discussions }),
           ...(input.subject === undefined ? {} : { subject: input.subject }),
           ...(input.unread === true ? { unread: true } : {}),
+        };
+        const newest = yield* store.listOwnerRequests(input.missionId, {
+          ...filter,
           limit: LIST_MAX,
         });
+        const records =
+          newest.length < LIST_MAX
+            ? newest
+            : withOpen(
+                newest,
+                yield* store.listOwnerRequests(input.missionId, {
+                  ...filter,
+                  status: (filter.status ?? OPEN_STATUSES).filter((status) =>
+                    OPEN_STATUSES.includes(status),
+                  ),
+                  limit: OPEN_MAX,
+                }),
+              );
         if (input.requestId !== undefined && records.length === 0) {
           return yield* fail("not-found", `No request ${input.requestId} in ${input.missionId}.`);
         }
