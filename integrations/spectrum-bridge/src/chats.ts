@@ -38,7 +38,7 @@ export type ChatContext = {
   chat: ChatInfo;
   /** Name and role for a sender address seen in this chat. Unknown addresses are guests. */
   roleOf: (address: string) => { name: string; role: Role };
-  /** True while someone in this chat is typing (a typing-on event in the last 30 s with no later typing-off or message). */
+  /** True while someone in this chat is typing (a typing-on event in the last 8 s with no later typing-off or message). */
   typing: () => boolean;
   /** Tapback name or one emoji on an inbound message handle. Best effort. */
   react: (handle: string, reaction: string) => Promise<void>;

@@ -4072,6 +4072,19 @@ test("a nested subagent's request is asked too: OpenChamber and Telegram stay qu
   expect(h.backend.permissionReplySessions).toEqual(["ses_grandchild"]);
 });
 
+test("busy sessions the backend places in another conversation never trigger a subagent walk", async () => {
+  const h = setup();
+  h.input("first", "Hi");
+  await h.router.tick();
+  h.backend.states.ses_other = { type: "busy", root: null };
+  h.backend.states.ses_other_child = { type: "busy", root: "ses_other" };
+  await h.router.tick();
+  expect(h.backend.reads.filter(([kind]) => kind === "children")).toEqual([]);
+  h.backend.states.ses_child = { type: "busy", root: "ses_1" };
+  await h.router.tick();
+  expect(h.backend.reads).toContainEqual(["children", "ses_1", "/Chats/ses_1"]);
+});
+
 test("a subagent's permission request is asked in the conversation and answered on the child session", async () => {
   const h = setup();
   h.input("first", "Run the audit in the background");

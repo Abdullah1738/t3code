@@ -281,6 +281,35 @@ test("typing starts when a batch is taken, before the prompt, refreshes every 20
   setSystemTime(start);
 });
 
+test("a slow thread list never sits between a text and its prompt or a finished run and its reply", async () => {
+  setSystemTime(Date.parse("2026-10-21T12:00:00Z"));
+  const h = live(context("owner"));
+  let lists = 0;
+  let release!: (statuses: Record<string, never>) => void;
+  const list = new Promise<Record<string, never>>(resolve => { release = resolve; });
+  Object.assign(h.backend, {
+    statuses: () => { lists++; return list; },
+    sessionBusy: async () => h.backend.records.length > 0 && h.backend.records.at(-1)!.type !== "idle",
+  });
+  h.input("a", "hi", "dm:+15555550123");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  h.backend.final("Hello");
+  await h.router.tick();
+  expect(h.store.pendingOutbox().map(item => item.text)).toEqual(["Hello"]);
+  // The second turn goes through the busy check on the existing conversation.
+  h.input("b", "again", "dm:+15555550123");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(lists).toBe(1);
+  expect(h.logs.filter(([event]) => !event.startsWith("typing"))).toEqual([
+    ["batch-sealed", "owner a"], ["prompt-accepted", "owner a"], ["run-completed-seen", "owner a"], ["reply-enqueued", "owner a"],
+    ["batch-sealed", "owner b"], ["prompt-accepted", "owner b"],
+  ]);
+  release({});
+  await list;
+});
+
 test("the 👀 tapback clears the bubble, so typing is re-armed right after it", async () => {
   setSystemTime(Date.parse("2026-10-21T12:00:00Z"));
   const h = live(context("dm"));

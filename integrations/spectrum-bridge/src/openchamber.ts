@@ -61,7 +61,14 @@ export interface SessionRecord {
 }
 
 /** `GET /api/session/active` lists running sessions only; an absent id is idle. */
-export type SessionStatus = { type: "busy" };
+export type SessionStatus = {
+  type: "busy";
+  /**
+   * Top-level session a subagent belongs to, or null for a top-level session.
+   * Absent when the backend cannot tell; callers then treat it as possibly related.
+   */
+  root?: string | null;
+};
 
 /** OpenCode 2 `Permission.Request` (packages/schema/src/permission.ts). */
 export interface PermissionRequest {
@@ -284,6 +291,11 @@ export interface ChatBackend {
   steer?(id: string, directory: string, messageId: string, text: string, guidance?: string): Promise<SteerDelivery>;
   abort(id: string, directory: string): Promise<boolean>;
   statuses(): Promise<Record<string, SessionStatus>>;
+  /**
+   * Whether one session is busy. Optional because `statuses()` already answers it;
+   * backends whose full list is slow (Robob) implement this cheap single lookup.
+   */
+  sessionBusy?(id: string, directory: string): Promise<boolean>;
   permissions(sessionId: string, directory: string): Promise<PermissionRequest[]>;
   questions(sessionId: string, directory: string): Promise<QuestionRequest[]>;
   /** `inboundId` is the owner's typed reply the answer came from, when there is one. */

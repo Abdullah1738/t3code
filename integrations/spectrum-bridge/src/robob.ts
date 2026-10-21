@@ -321,14 +321,23 @@ export class RobobBackend implements ChatBackend {
   /** Busy threads, keyed by thread id and, for imported threads, by their `ses_` id too. */
   async statuses(): Promise<Record<string, SessionStatus>> {
     const { threads } = await this.client.listThreads({ active: true, includeSubagents: true, limit: 500 });
+    const alias = new Map([...this.native].map(([session, threadId]) => [threadId, session]));
     const statuses: Record<string, SessionStatus> = {};
     for (const thread of threads) {
       if (!BUSY.has(thread.state)) continue;
-      statuses[thread.threadId] = { type: "busy" };
-      if (thread.nativeSessionId) statuses[thread.nativeSessionId] = { type: "busy" };
+      // Routes may be stored under an imported `ses_` id, so name the root the way the router knows it.
+      const root = thread.parentThreadId === null ? null : alias.get(thread.rootThreadId) ?? thread.rootThreadId;
+      const busy: SessionStatus = { type: "busy", root };
+      statuses[thread.threadId] = busy;
+      if (thread.nativeSessionId) statuses[thread.nativeSessionId] = busy;
     }
-    for (const [session, threadId] of this.native) if (statuses[threadId]) statuses[session] = { type: "busy" };
+    for (const [session, threadId] of this.native) if (statuses[threadId]) statuses[session] = statuses[threadId];
     return statuses;
+  }
+
+  /** One thread's detail answers in well under a second; the thread list behind `statuses()` takes several. */
+  async sessionBusy(id: string): Promise<boolean> {
+    return BUSY.has((await this.detail(id)).state);
   }
 
   async permissions(sessionId: string, _directory?: string): Promise<PermissionRequest[]> {

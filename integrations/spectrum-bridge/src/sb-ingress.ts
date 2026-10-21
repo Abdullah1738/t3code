@@ -11,8 +11,11 @@ import type { Store } from "./store.ts";
 
 /** Backfill overlaps the last event by this much so a message stamped during a reconnect is not missed. */
 export const CURSOR_OVERLAP_MS = 2 * 60_000;
-/** A typing-on older than this no longer counts as typing. */
-export const TYPING_WINDOW_MS = 30_000;
+/**
+ * A typing-on older than this no longer counts as typing. Sendblue does not
+ * reliably send typing-off, and a stale typing-on holds the next batch.
+ */
+export const TYPING_WINDOW_MS = 8_000;
 
 export type IngressSink = {
   /** Store for an accepted chat. Creates the runtime lazily. */

@@ -312,9 +312,11 @@ test("statuses list busy threads; waiting (background drain) does not block the 
   const backend = control.backend();
   const { id, directory } = await backend.createChat();
   await backend.prompt(id, directory, "msg_1", "hi");
-  expect(await backend.statuses()).toEqual({ [id]: { type: "busy" } });
+  expect(await backend.statuses()).toEqual({ [id]: { type: "busy", root: null } });
+  expect(await backend.sessionBusy(id)).toBe(true);
   control.reply(id, "done", "waiting");
   expect(await backend.statuses()).toEqual({});
+  expect(await backend.sessionBusy(id)).toBe(false);
 });
 
 test("retireOthers settles idle iMessage chats except the kept one", async () => {

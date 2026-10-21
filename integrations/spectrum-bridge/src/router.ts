@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { stripInternalText } from "./formatting.ts";
-import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SteerDelivery } from "./openchamber.ts";
+import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionStatus, type SteerDelivery } from "./openchamber.ts";
 import type { ChatContext } from "./chats.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
@@ -176,6 +176,8 @@ const SENDBLUE_TYPING_REFRESH_MS = 20_000;
 const SENDBLUE_TYPING_CAP_MS = 90_000;
 /** After a refused steer the run is ending; give it this long to settle before steering again. */
 const STEER_RETRY_MS = 3_000;
+/** Sendblue: how stale the machine-wide busy list may get; only subagent and rotation checks read it. */
+const STATUS_LIST_MS = 10_000;
 /**
  * A turn that ends in an error is often only a hiccup: the agent retries and
  * finishes the work on its own moments later. Hold the "something went wrong"
@@ -383,6 +385,11 @@ export class Router {
   /** Sendblue mode: queued rows already marked read, so each is marked once rather than every tick. */
   private readIds = new Set<string>();
   private steerRefusedAt = 0;
+  /** Sendblue: the machine-wide busy list, refreshed off the hot path because Robob takes seconds to list threads. */
+  private listed?: { at: number; statuses: Record<string, SessionStatus> };
+  private listing?: Promise<void>;
+  /** Idle marker already logged as seen, so each completed run is logged once. */
+  private seenIdle?: string;
 
   constructor(
     private readonly store: Store,
@@ -607,9 +614,7 @@ export class Router {
       await this.watch();
       await this.nudgeDue();
       this.flushNotice();
-      const next = this.sealBatch(preceding);
-      if (next && this.steering(next.id)) await this.steer(next);
-      else if (next) await this.submit(next, preceding);
+      await this.dispatch(preceding);
       // Transport hints are best effort and never part of prompt acceptance.
       if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
       completed = true;
@@ -845,6 +850,40 @@ export class Router {
     if (!unread) return;
     await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
     if (this.typingActive) this.typingAt = 0;
+  }
+
+  private async dispatch(handled: Set<string>): Promise<void> {
+    const next = this.sealBatch(handled);
+    if (!next) return;
+    this.stage("batch-sealed", next.id);
+    if (this.steering(next.id)) await this.steer(next);
+    else await this.submit(next, handled);
+  }
+
+  /**
+   * Busy sessions for a route's checks. Sendblue asks about the route itself
+   * (one quick lookup) and takes everyone else from a list refreshed in the
+   * background, so a slow thread list never sits between a text and its prompt
+   * or between a finished run and its reply.
+   */
+  private async statusesFor(route: Pick<Route, "id" | "directory">): Promise<Record<string, SessionStatus>> {
+    const busy = this.backend.sessionBusy;
+    if (!this.options.context || !busy) return bounded(this.backend.statuses());
+    if (!this.listing && (!this.listed || Date.now() - this.listed.at >= STATUS_LIST_MS)) {
+      this.listing = bounded(this.backend.statuses(), 30_000)
+        .then(statuses => { this.listed = { at: Date.now(), statuses }; }, () => {})
+        .finally(() => { this.listing = undefined; });
+    }
+    const own = await bounded(busy.call(this.backend, route.id, route.directory));
+    const statuses = { ...this.listed?.statuses };
+    delete statuses[route.id];
+    if (own) statuses[route.id] = { type: "busy", root: null };
+    return statuses;
+  }
+
+  /** One line per reply stage so slow hops show up in the log. Ids only, never text. */
+  private stage(event: string, id: string): void {
+    this.options.log?.(event, `${this.options.context?.chat.slug ?? "imessage"} ${id}`);
   }
 
   /** Sendblue: typing is for people waiting on an answer in a 1:1 chat, never for bridge rows. */
@@ -1424,7 +1463,7 @@ export class Router {
     if (route && input.attachments.some(attachment => attachment.totalBytes > MAX_BLOB_BYTES)) {
       const id = route.id;
       let busy = false;
-      try { busy = (await bounded(this.backend.statuses()))[id] !== undefined; } catch { /* Checked again after downloads. */ }
+      try { busy = (await this.statusesFor(route))[id] !== undefined; } catch { /* Checked again after downloads. */ }
       if (interrupted()) return;
       if (busy) { this.unsealBatch(row.id); return; }
     }
@@ -1538,7 +1577,7 @@ export class Router {
     let busy = false;
     if (activeRoute) {
       try {
-        const statuses = await bounded(this.backend.statuses());
+        const statuses = await this.statusesFor(activeRoute);
         busy = statuses[activeRoute.id] !== undefined;
         if (!busy) activeRoute = await this.rotate(activeRoute, statuses);
       } catch { /* Unknown status: keep the current conversation. */ }
@@ -1710,6 +1749,7 @@ export class Router {
     if (!submitting) return;
     try {
       await bounded(this.backend.prompt(turn.id, turn.directory, turn.messageId, body, system, parts, preferences.model, owner));
+      this.stage("prompt-accepted", row.id);
       if (this.current(turn)) this.store.db.transaction(() => {
         this.store.set("activeTurn", { ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
@@ -1747,7 +1787,7 @@ export class Router {
       return;
     }
     if (Date.now() - settledAt < (this.options.resetIdleMs ?? RESET_IDLE)) return;
-    const statuses = await bounded(this.backend.statuses()).catch(() => undefined);
+    const statuses = await this.statusesFor(route).catch(() => undefined);
     if (!statuses || statuses[route.id] !== undefined) return;
     const nudged = this.store.db.transaction(() => {
       if (!this.current(route) || this.store.pendingInbound().length) return false;
@@ -1770,7 +1810,7 @@ export class Router {
    * (see nudgeDue), so for them only a thread that's 8 hours old, or a provider
    * refusal, moves to a new one.
    */
-  private async rotate(route: Route, statuses: Record<string, unknown>): Promise<Route> {
+  private async rotate(route: Route, statuses: Record<string, SessionStatus>): Promise<Route> {
     const mark = this.store.get<Refused | null>("refusedRoute");
     const refused = mark?.sessionId === route.id && mark.generation === route.generation;
     if (route.createdAt === undefined && !refused) {
@@ -1788,6 +1828,8 @@ export class Router {
     const sending = this.store.db.query<{ payload: string }, []>("SELECT payload FROM outbox WHERE state = 'sending'").all()
       .some(row => (JSON.parse(row.payload) as { sessionId?: string }).sessionId === route.id);
     if (sending || this.store.pendingOutbox().some(item => item.sessionId === route.id)) return route;
+    // Until the background list has landed, running subagents are unknown; rotate on a later turn.
+    if (this.options.context && this.backend.sessionBusy && !this.listed) return route;
     const others = Object.keys(statuses).filter(id => id !== route.id);
     if (others.length) {
       const children = await bounded(this.backend.children(route.id, route.directory));
@@ -1933,14 +1975,17 @@ export class Router {
    * so is every ancestor waiting on it, so the walk only descends through
    * running sessions.
    */
-  private async requests(turn: Turn, statuses: Record<string, unknown>): Promise<{ request: PermissionRequest | QuestionRequest; directory?: string }[]> {
+  private async requests(turn: Turn, statuses: Record<string, SessionStatus>): Promise<{ request: PermissionRequest | QuestionRequest; directory?: string }[]> {
     const own = await Promise.all([
       bounded(this.backend.permissions(turn.id, turn.directory)), bounded(this.backend.questions(turn.id, turn.directory)),
     ]);
     if (!own[0] || !own[1]) throw new Error("Unavailable requests");
     const found: { request: PermissionRequest | QuestionRequest; directory?: string }[] = [...own[0], ...own[1]]
       .filter(request => request.sessionID === turn.id).map(request => ({ request }));
-    const running = new Set(Object.keys(statuses).filter(id => id !== turn.id));
+    // Busy sessions in another conversation's family cannot be ours; skipping them
+    // avoids a slow child listing on every poll while anything else on the machine runs.
+    const running = new Set(Object.keys(statuses).filter(id => id !== turn.id
+      && (statuses[id]!.root === undefined || statuses[id]!.root === turn.id)));
     const seen = new Set([turn.id]);
     let parents = [{ id: turn.id, directory: turn.directory }];
     for (let depth = 0; parents.length && running.size && depth < MAX_SUBAGENT_DEPTH; depth++) {
@@ -1970,7 +2015,7 @@ export class Router {
     // Work has no deadline: a turn runs for as long as the agent needs.
     const elapsed = Date.now() - turn.startedAt;
     try {
-      const statuses = await bounded(this.backend.statuses());
+      const statuses = await this.statusesFor(turn);
       const [messages, requests] = await Promise.all([
         bounded(this.backend.messages(turn.id, turn.directory, turn.background
           ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 })),
@@ -2056,6 +2101,10 @@ export class Router {
         if (m.type === "idle" && last?.type === "assistant" && last.id !== final?.id) earlier.push(last);
         if (m.type === "assistant" || m.type === "idle") last = m;
       }
+      if (idle && idle.id !== this.seenIdle) {
+        this.seenIdle = idle.id;
+        this.stage("run-completed-seen", turn.inboundId ?? turn.messageId);
+      }
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
@@ -2125,6 +2174,7 @@ export class Router {
         this.store.set("pendingApprovals", null);
         this.store.set("settledAt", Date.now());
       }).immediate();
+      if (text || earlier.length) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
     } catch {
       // Transient backend trouble: polling simply retries on the next tick.
     }
@@ -2155,7 +2205,7 @@ export class Router {
         return;
       }
       const [statuses, messages] = await Promise.all([
-        bounded(this.backend.statuses()), bounded(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 })),
+        this.statusesFor(route), bounded(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 })),
       ]);
       const next = this.store.get<Turn | null>("activeTurn");
       if (!this.current(route) || (next && next.phase !== "failed" && this.current(next))) return;

@@ -149,6 +149,25 @@ describe("chat registry", () => {
     expect(notes).toHaveLength(1);
   });
 
+  test("a typing-on with no typing-off stops holding the chat after 8 s", () => {
+    const { line, ownerStore, stateRoot } = setup();
+    let now = 0;
+    const chats = new ChatRegistry<Parts>({
+      line, owner, ownerStore, stateRoot, access: () => access, now: () => now,
+      build: chat => {
+        if (chat.store !== ownerStore) stores.push(chat.store);
+        return { forwarded: [], api: async () => Response.json({}) };
+      },
+    });
+    chats.restore();
+    const chat = chats.open(chatKey.dm(moni));
+    chat.typing.set(moni, 0);
+    now = 7_000;
+    expect(chat.context.typing()).toBe(true);
+    now = 8_500;
+    expect(chat.context.typing()).toBe(false);
+  });
+
   test("an id-only stream event pulls the full message from the message list", async () => {
     const { registry, ownerStore, line } = setup();
     const chats = registry();
