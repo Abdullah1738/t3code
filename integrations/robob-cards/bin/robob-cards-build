@@ -1,0 +1,57 @@
+#!/bin/zsh
+# Builds the Robob Cards app (container + Messages extension) for real iPhones,
+# signed with the team's wildcard development profile, and optionally publishes
+# it to the tailnet OTA page. Phones outside the tailnet use robob-cards-enroll,
+# which re-signs this same build for ad hoc distribution.
+set -euo pipefail
+
+usage() {
+  print -u2 "usage: robob-cards-build [--ota]"
+  exit 2
+}
+
+ota=0
+for arg in "$@"; do
+  case $arg in
+    --ota) ota=1 ;;
+    -h|--help) usage ;;
+    *) usage ;;
+  esac
+done
+
+here=${0:A:h}
+ios=${here:h}/ios
+state=${ROBOB_CARDS_HOME:-$HOME/.local/share/robob-cards}
+derived=$state/build/derived
+out=$state/build/RobobCards.app
+publish=$HOME/.config/opencode/skills/software-development/ios-ota-tailscale/scripts/ota-publish.sh
+
+mkdir -p $state/build
+cd $ios
+/opt/homebrew/bin/xcodegen generate --quiet
+
+xcodebuild \
+  -project RobobCards.xcodeproj \
+  -scheme RobobCards \
+  -configuration Release \
+  -sdk iphoneos \
+  -destination 'generic/platform=iOS' \
+  -derivedDataPath $derived \
+  build >$state/build/xcodebuild.log 2>&1 || {
+    tail -40 $state/build/xcodebuild.log >&2
+    print -u2 "robob-cards-build: xcodebuild failed, full log in $state/build/xcodebuild.log"
+    exit 1
+  }
+
+built=$derived/Build/Products/Release-iphoneos/RobobCards.app
+rm -rf $out
+ditto $built $out
+
+ext=$out/PlugIns/RobobCardsMessages.appex
+[[ -f $ext/embedded.mobileprovision ]] || { print -u2 "robob-cards-build: the Messages extension is missing its profile"; exit 1; }
+codesign --verify --deep --strict $out
+print "built $out"
+
+if (( ota )); then
+  $publish $out robob-cards
+fi
