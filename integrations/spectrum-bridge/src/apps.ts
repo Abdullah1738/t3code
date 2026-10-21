@@ -16,6 +16,8 @@ const TYPES: Record<string, string> = {
 const headers = { "Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff" };
 const notFound = () => new Response("Not found", { status: 404, headers: { ...headers, "Content-Type": "text/plain; charset=utf-8" } });
 
+export const validAppSlug = (value: unknown): value is string => typeof value === "string" && /^[a-z0-9-]{1,64}$/.test(value);
+
 export function contentType(path: string): string {
   return TYPES[extname(path).toLowerCase()] ?? "application/octet-stream";
 }
@@ -48,6 +50,61 @@ export async function resolveAppFile(root: string, pathname: string): Promise<st
   }
 }
 
+// Link-preview fetchers ignore relative URLs in these tags.
+const ABSOLUTE_META = new Set(["og:image", "og:image:url", "og:image:secure_url", "og:url", "twitter:image", "twitter:image:src"]);
+type Element = { getAttribute(name: string): string | null };
+const metaKey = (element: Element) => (element.getAttribute("property") ?? element.getAttribute("name") ?? "").trim().toLowerCase();
+
+/** The https origin the visitor used: tailscale serve and Cloudflare both forward the public host. */
+export function publicOrigin(request: Request): string | undefined {
+  const host = (request.headers.get("x-forwarded-host")?.split(",")[0] ?? request.headers.get("host") ?? "").trim().toLowerCase();
+  return /^[a-z0-9.-]+(?::\d{1,5})?$/.test(host) ? `https://${host}` : undefined;
+}
+
+/** Rewrites relative og:image / og:url / twitter:image values against the page's public URL. */
+export function absoluteMeta(html: string, pageUrl: string): string {
+  return new HTMLRewriter().on("meta", {
+    element(element) {
+      if (!ABSOLUTE_META.has(metaKey(element))) return;
+      const content = element.getAttribute("content")?.trim();
+      if (!content || /^https?:\/\//i.test(content)) return;
+      try { element.setAttribute("content", new URL(content, pageUrl).href); } catch { /* left as written */ }
+    },
+  }).transform(html);
+}
+
+/** What a page lacks for a rich link preview, so the agent can fix it before sending the link. */
+export function metadataWarnings(html: string): string[] {
+  const seen = new Set<string>();
+  let title = "";
+  new HTMLRewriter()
+    .on("meta", { element(element) { if (element.getAttribute("content")?.trim()) seen.add(metaKey(element)); } })
+    .on("title", { text(chunk) { title += chunk.text; } })
+    .transform(html);
+  const missing = title.trim() ? [] : ["missing <title>"];
+  for (const key of ["og:title", "og:description", "og:image"]) if (!seen.has(key)) missing.push(`missing ${key}`);
+  return missing;
+}
+
+/** Serves one resolved file; HTML gets absolute preview URLs for the host it was requested through. */
+export async function fileResponse(request: Request, file: string): Promise<Response> {
+  const type = contentType(file);
+  const origin = publicOrigin(request);
+  if (type.startsWith("text/html") && origin) {
+    let path = new URL(request.url).pathname;
+    // A directory served without its trailing slash still resolves relative paths inside it.
+    if (file.endsWith("/index.html") && !path.endsWith("/") && !path.endsWith(".html")) path += "/";
+    const html = absoluteMeta(await Bun.file(file).text(), origin + path);
+    return new Response(request.method === "HEAD" ? null : html, {
+      headers: { ...headers, "Content-Type": type, "Content-Length": String(Buffer.byteLength(html)) },
+    });
+  }
+  const body = Bun.file(file);
+  return new Response(request.method === "HEAD" ? null : body, {
+    headers: { ...headers, "Content-Type": type, "Content-Length": String(body.size) },
+  });
+}
+
 export const SECRET_PREFIX = "/_secret/";
 
 /** One chat's secret store, or (Sendblue mode) a lookup of the chat that issued a token. */
@@ -78,11 +135,23 @@ export function createAppsHandler(root: string, secrets?: AppsSecrets): (request
       return new Response("Method not allowed", { status: 405, headers: { ...headers, Allow: "GET, HEAD" } });
     }
     const file = await resolveAppFile(root, pathname);
-    if (!file) return notFound();
-    const body = Bun.file(file);
-    return new Response(request.method === "HEAD" ? null : body, {
-      headers: { ...headers, "Content-Type": contentType(file), "Content-Length": String(body.size) },
-    });
+    return file ? fileResponse(request, file) : notFound();
+  };
+}
+
+/**
+ * Public share of one app: only files under that app's directory, never the secret forms,
+ * other apps, dotfiles or listings. `root` is already resolved, so a later symlink swap cannot widen it.
+ */
+export function createShareHandler(root: string): (request: Request) => Promise<Response> {
+  return async request => {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return new Response("Method not allowed", { status: 405, headers: { ...headers, Allow: "GET, HEAD" } });
+    }
+    const pathname = new URL(request.url).pathname;
+    if (pathname === "/_secret" || pathname.startsWith(SECRET_PREFIX)) return notFound();
+    const file = await resolveAppFile(root, pathname);
+    return file ? fileResponse(request, file) : notFound();
   };
 }
 

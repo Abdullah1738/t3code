@@ -57,6 +57,18 @@ describe("secret-request and secret commands", () => {
   });
 });
 
+test("share, unshare and shares go to the bridge with validated slugs and days", () => {
+  expect(isLocalCommand(["share"])).toBe(false);
+  expect(parseCommand(["share", "--app", "trip-plan"])).toEqual({ method: "POST", path: "/share", body: { app: "trip-plan" } });
+  expect(parseCommand(["share", "--app", "trip-plan", "--days", "30"])).toEqual({ method: "POST", path: "/share", body: { app: "trip-plan", days: 30 } });
+  expect(parseCommand(["unshare", "--app", "trip-plan"])).toEqual({ method: "POST", path: "/unshare", body: { app: "trip-plan" } });
+  expect(parseCommand(["shares"])).toEqual({ method: "POST", path: "/shares", body: {} });
+  expect(() => parseCommand(["share"])).toThrow("--app is required");
+  for (const app of ["Upper", "../x", "a_b"]) expect(() => parseCommand(["share", "--app", app])).toThrow("--app must be");
+  for (const days of ["0", "31", "1.5", "100", "x"]) expect(() => parseCommand(["share", "--app", "a", "--days", days])).toThrow("--days must be 1 to 30");
+  expect(() => parseCommand(["unshare", "--app", "a", "--days", "2"])).toThrow();
+});
+
 describe("publish and unpublish commands", () => {
   test("parse locally and validate ports and slugs", () => {
     expect(isLocalCommand(["publish"])).toBe(true);
@@ -95,7 +107,8 @@ describe("publish and unpublish commands", () => {
       };
       const apps = async () => ({ appsRoot: root, appsPort: 18791 });
       expect(await runLocalCommand({ command: "publish", app: "tracker" }, { exec, apps }))
-        .toEqual({ url: "https://mac.ts.net:18400/tracker/", port: 18400, created: true });
+        .toEqual({ url: "https://mac.ts.net:18400/tracker/", port: 18400, created: true,
+          metadataWarnings: ["missing <title>", "missing og:title", "missing og:description", "missing og:image"] });
       await expect(runLocalCommand({ command: "publish", app: "missing" }, { exec, apps })).rejects.toThrow("No app at");
       expect(await runLocalCommand({ command: "publish", localPort: 18791 }, { exec, apps }))
         .toEqual({ url: "https://mac.ts.net:18400", port: 18400, created: false });

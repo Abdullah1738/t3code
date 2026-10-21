@@ -27,6 +27,7 @@ import { flightyDb } from "./guest-flight.ts";
 import { DEFAULT_GUEST_EFFORT, DEFAULT_GUEST_MODEL, GuestResponder, openRouterComplete } from "./guest-responder.ts";
 import { GuestBook } from "./guests.ts";
 import { getSecretRequest, sweepSecrets } from "./secrets.ts";
+import { cloudflaredTunnel, Shares } from "./share.ts";
 import { Sendblue } from "./sendblue.ts";
 import { Store } from "./store.ts";
 import { transcribe } from "./stt.ts";
@@ -166,6 +167,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       return appsUrl;
     } finally { clearTimeout(timer); }
   };
+  const shares = new Shares({ store: ownerStore, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log });
+  process.once("exit", () => shares.killAll());
+  void shares.restore().catch(() => log("share-sweep-failed"));
   const post = socketPost(telegramBridgeSocket);
   const outlet = telegramOutlet({
     post, appsRoot: config.appsRoot,
@@ -226,7 +230,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   });
 
   api = createSbApi({
-    registry: chats, line, accessPath: accessFile, enabled: ready, reloadAccess: refreshAccess, guests: guestDesk,
+    registry: chats, line, accessPath: accessFile, enabled: ready, reloadAccess: refreshAccess, guests: guestDesk, shares,
     health: () => {
       const backendOk = Date.now() - health.backendLastOk < 60_000;
       // The event stream heartbeats below the Line API, so a quiet line is not a dead one; backfill success is the signal.
@@ -256,8 +260,13 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     let secretsSweptAt = 0;
     let routeCheckedAt = 0;
     let flightsCheckedAt = 0;
+    let sharesSweptAt = Date.now();
     while (!stopping) {
       await refreshAccess();
+      if (Date.now() - sharesSweptAt >= 30_000) {
+        sharesSweptAt = Date.now();
+        void shares.sweep().catch(() => log("share-sweep-failed"));
+      }
       if (Date.now() - secretsSweptAt >= 30_000) {
         secretsSweptAt = Date.now();
         for (const chat of chats.all()) await sweepSecrets(chat.secretDeps).catch(() => log("secret-sweep-failed"));
@@ -302,6 +311,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     clearInterval(timer);
     await server.stop(true);
     await apps?.stop().catch(() => {});
+    await shares.stopAll().catch(() => {});
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
     process.exit(0);
   };

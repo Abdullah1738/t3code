@@ -2,6 +2,7 @@ import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { createApi } from "../src/api.ts";
 import type { Photon } from "../src/photon.ts";
+import { Shares } from "../src/share.ts";
 import { Store } from "../src/store.ts";
 
 const stores: Store[] = [];
@@ -170,4 +171,20 @@ test("reactions never target bridge-injected rows", async () => {
   const h = setup();
   expect((await h.post("/wake", { text: "event", source: "watch", dedupeKey: "k" })).status).toBe(202);
   expect((await h.post("/react", { target: `wake:${hash("k")}`, kind: "like" })).status).toBe(403);
+});
+
+test("the Photon API serves share routes only when the bridge owns tunnels, even while messaging is down", async () => {
+  const h = setup();
+  expect((await h.post("/shares", {})).status).toBe(404);
+  const store = new Store(":memory:");
+  stores.push(store);
+  const shares = new Shares({ store, appsRoot: "/nonexistent-apps-root", startTunnel: async () => { throw new Error("unused"); } });
+  const api = createApi({ store, photon: { async react() {} }, router: () => undefined, chatGuid: () => undefined, enabled: () => false,
+    health: () => ({}), shares });
+  const response = await api(new Request("http://bridge/shares", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ shares: [] });
+  const missing = await api(new Request("http://bridge/share", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ app: "trip" }) }));
+  expect(missing.status).toBe(404);
 });

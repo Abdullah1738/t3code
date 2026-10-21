@@ -16,6 +16,7 @@ import { publish } from "./publish.ts";
 import { Router } from "./router.ts";
 import { serveSendblue } from "./sb-main.ts";
 import { sweepSecrets } from "./secrets.ts";
+import { cloudflaredTunnel, Shares } from "./share.ts";
 import { Store } from "./store.ts";
 import { transcribe } from "./stt.ts";
 import { socketPost, telegramOutlet } from "./telegram-fallback.ts";
@@ -177,7 +178,10 @@ async function main(): Promise<void> {
       return appsUrl;
     } finally { clearTimeout(timer); }
   };
-  api = createApi({ store, photon, router: () => router, chatGuid: () => chatGuid,
+  const shares = new Shares({ store, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log });
+  process.once("exit", () => shares.killAll());
+  void shares.restore().catch(() => log("share-sweep-failed"));
+  api = createApi({ store, photon, router: () => router, chatGuid: () => chatGuid, shares,
     ...(apps ? { secrets: { stateRoot, publishApps } } : {}),
     enabled: ready, health: () => ({
       status: Date.now() - health.photonLastOk < 60_000 && Date.now() - health.backendLastOk < 60_000 ? "healthy" : "degraded",
@@ -241,7 +245,12 @@ async function main(): Promise<void> {
     let backendCheckedAt = 0;
     let secretsSweptAt = 0;
     let routeCheckedAt = 0;
+    let sharesSweptAt = Date.now();
     while (!stopping) {
+      if (Date.now() - sharesSweptAt >= 30_000) {
+        sharesSweptAt = Date.now();
+        void shares.sweep().catch(() => log("share-sweep-failed"));
+      }
       // Runs even when messaging is not ready: submitted values must still expire on time.
       if (Date.now() - secretsSweptAt >= 30_000) {
         secretsSweptAt = Date.now();
@@ -276,6 +285,7 @@ async function main(): Promise<void> {
     clearInterval(timer);
     await server.stop(true);
     await apps?.stop().catch(() => {});
+    await shares.stopAll().catch(() => {});
     if (chatGuid) await photon.typing(chatGuid, false).catch(() => {});
     await photon.close();
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.

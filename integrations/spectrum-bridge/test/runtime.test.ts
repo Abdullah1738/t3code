@@ -6,6 +6,7 @@ import type { Access } from "../src/chats.ts";
 import { chatKey, type Line, type LineInbound } from "../src/line.ts";
 import { ChatRegistry, createSbApi, type ChatCore } from "../src/runtime.ts";
 import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
+import { Shares } from "../src/share.ts";
 import { Store } from "../src/store.ts";
 
 const owner = "+15555550123";
@@ -219,6 +220,29 @@ describe("Sendblue socket API", () => {
     expect(await post("/app", { url: "https://x", sessionId: "ses_owner" })).toEqual({ status: 200, body: { chat: "owner", path: "/app" } });
     expect((await post("/files", { sessionId: "ses_gone" })).status).toBe(409);
     expect((await post("/wake", { text: "w", source: "watch", dedupeKey: "k" })).body).toEqual({ chat: "owner", path: "/wake" });
+  });
+
+  test("share routes work from any chat and say when sharing is off", async () => {
+    const { post } = api();
+    expect(await post("/shares", { sessionId: "ses_moni" })).toEqual({ status: 503, body: { error: "Sharing is unavailable" } });
+    const env = setup();
+    const registry = env.registry();
+    const appsRoot = join(env.stateRoot, "apps");
+    await Bun.write(join(appsRoot, "trip", "index.html"), "<h1>t</h1>");
+    const shares = new Shares({ store: registry.owner.store, appsRoot,
+      startTunnel: async () => ({ url: "https://x.trycloudflare.com", pid: 0, alive: () => true, stop: async () => {}, kill: () => {} }) });
+    const handler = createSbApi({ registry, line: env.line, accessPath: join(env.stateRoot, "access.json"), enabled: () => true,
+      health: () => ({}), shares });
+    const call = async (path: string, body: unknown) => {
+      const response = await handler(new Request(`http://bridge${path}`, { method: "POST", body: JSON.stringify(body) }));
+      return { status: response.status, body: await response.json() };
+    };
+    try {
+      expect(await call("/share", { app: "trip" })).toMatchObject({ status: 201, body: { url: "https://x.trycloudflare.com", created: true } });
+      expect((await call("/shares", {})).body).toMatchObject({ shares: [{ app: "trip", live: true }] });
+      expect(await call("/unshare", { app: "trip" })).toEqual({ status: 200, body: { app: "trip", removed: true } });
+      expect((await call("/share", [])).status).toBe(400);
+    } finally { await shares.stopAll(); }
   });
 
   test("health reports the transport, line and chat count", async () => {

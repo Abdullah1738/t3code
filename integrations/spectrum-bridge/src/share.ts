@@ -1,0 +1,280 @@
+/**
+ * Public links for people off the tailnet: each shared app gets its own loopback server
+ * (that app's directory only) behind a Cloudflare quick tunnel. The bridge owns the tunnel
+ * processes; a quick tunnel's URL dies with its process, so a restart means a new URL.
+ */
+import { spawnSync } from "node:child_process";
+import { dirname, isAbsolute } from "node:path";
+import { createShareHandler, metadataWarnings, resolveAppFile, validAppSlug } from "./apps.ts";
+import type { Store } from "./store.ts";
+
+export const DEFAULT_CLOUDFLARED_BIN = "/opt/homebrew/bin/cloudflared";
+export const DEFAULT_SHARE_DAYS = 7;
+export const MAX_SHARE_DAYS = 30;
+export const MAX_LIVE_SHARES = 10;
+const DAY_MS = 24 * 60 * 60_000;
+const KEY_PREFIX = "share:";
+
+export type ShareRecord = { url: string; port: number; startedAt: number; expiresAt: number; pid?: number };
+export type Tunnel = { url: string; pid: number; alive(): boolean; stop(): Promise<void>; kill(): void };
+export type StartTunnel = (localPort: number) => Promise<Tunnel>;
+export type ShareResult = { url: string; created: boolean; expiresAt: number; metadataWarnings: string[] };
+
+export class ShareError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
+const TUNNEL_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
+// The URL is printed a moment before the edge accepts traffic; a preview fetched in between fails.
+const REGISTERED = /Registered tunnel connection/;
+
+export const parseTunnelUrl = (text: string): string | undefined => text.match(TUNNEL_URL)?.[0];
+
+/** Starts `cloudflared tunnel --url` and resolves once it has a URL and a live edge connection. */
+export function cloudflaredTunnel(bin = process.env.CLOUDFLARED_BIN ?? DEFAULT_CLOUDFLARED_BIN, timeoutMs = 30_000): StartTunnel {
+  return async port => {
+    // Checked per call so a bad override fails one share, not the bridge start.
+    if (!isAbsolute(bin) || bin.includes("\0")) throw new ShareError(500, "CLOUDFLARED_BIN must be an absolute path");
+    let child;
+    try {
+      child = Bun.spawn([bin, "tunnel", "--no-autoupdate", "--metrics", "127.0.0.1:0", "--grace-period", "1s",
+        "--url", `http://127.0.0.1:${port}`], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+    } catch {
+      throw new ShareError(502, "cloudflared is unavailable");
+    }
+    let exited = false;
+    const done = child.exited.then(() => { exited = true; });
+    const kill = () => { if (!exited) child.kill("SIGKILL"); };
+    const tunnel = (url: string): Tunnel => ({
+      url, pid: child.pid, alive: () => !exited, kill,
+      async stop() {
+        if (exited) return;
+        child.kill("SIGTERM");
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([done, new Promise(resolve => { timer = setTimeout(resolve, 2_000); })]);
+        clearTimeout(timer);
+        kill();
+      },
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await new Promise<Tunnel>((resolve, reject) => {
+        timer = setTimeout(() => reject(new ShareError(504, "cloudflared did not open a tunnel in time")), timeoutMs);
+        void (async () => {
+          const decoder = new TextDecoder();
+          let text = "";
+          let url: string | undefined;
+          let settled = false;
+          // Keep draining after the URL, or cloudflared blocks on a full stderr pipe.
+          for await (const chunk of child.stderr) {
+            if (settled) continue;
+            text = (text + decoder.decode(chunk, { stream: true })).slice(-16_384);
+            url ??= parseTunnelUrl(text);
+            if (url && REGISTERED.test(text)) { settled = true; resolve(tunnel(url)); }
+          }
+          if (!settled) reject(new ShareError(502, "cloudflared exited before the tunnel was ready"));
+        })().catch(() => reject(new ShareError(502, "cloudflared output could not be read")));
+      });
+    } catch (error) {
+      kill();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
+type Live = { server: ReturnType<typeof Bun.serve>; tunnel: Tunnel };
+type Log = (event: string, code?: string) => void;
+
+export type SharesOptions = {
+  /** The owner store: shares are bridge-wide, not per chat. */
+  store: Store;
+  appsRoot: string;
+  startTunnel: StartTunnel;
+  log?: Log;
+  now?: () => number;
+};
+
+export class Shares {
+  private readonly live = new Map<string, Live>();
+  private queue: Promise<unknown> = Promise.resolve();
+  private sweeping = false;
+  private readonly now: () => number;
+  private readonly log: Log;
+
+  constructor(private readonly options: SharesOptions) {
+    this.now = options.now ?? Date.now;
+    this.log = options.log ?? (() => {});
+  }
+
+  /** Returns a public URL for the app, reusing its live tunnel; a longer --days extends it. */
+  share(slug: string, days = DEFAULT_SHARE_DAYS): Promise<ShareResult> {
+    return this.serialized(async () => {
+      if (!validAppSlug(slug)) throw new ShareError(400, "--app must be 1-64 characters of a-z, 0-9, or -");
+      if (!Number.isInteger(days) || days < 1 || days > MAX_SHARE_DAYS) throw new ShareError(400, `--days must be 1 to ${MAX_SHARE_DAYS}`);
+      const index = await this.index(slug);
+      if (!index) throw new ShareError(404, `No app at ${this.options.appsRoot}/${slug}/index.html`);
+      const warnings = metadataWarnings(await Bun.file(index).text());
+      const expiresAt = this.now() + days * DAY_MS;
+      const record = this.record(slug);
+      if (record && this.live.get(slug)?.tunnel.alive()) {
+        record.expiresAt = Math.max(record.expiresAt, expiresAt);
+        this.save(slug, record);
+        return { url: record.url, created: false, expiresAt: record.expiresAt, metadataWarnings: warnings };
+      }
+      await this.close(slug);
+      const others = this.records().filter(([other, saved]) => other !== slug && saved.expiresAt > this.now());
+      if (others.length >= MAX_LIVE_SHARES) throw new ShareError(409, `At most ${MAX_LIVE_SHARES} live shares; unshare one first`);
+      const started = await this.start(slug, dirname(index));
+      this.save(slug, { ...started, startedAt: this.now(), expiresAt });
+      return { url: started.url, created: true, expiresAt, metadataWarnings: warnings };
+    });
+  }
+
+  unshare(slug: string): Promise<{ app: string; removed: boolean }> {
+    return this.serialized(async () => {
+      if (!validAppSlug(slug)) throw new ShareError(400, "--app must be 1-64 characters of a-z, 0-9, or -");
+      const removed = this.record(slug) !== undefined || this.live.has(slug);
+      await this.close(slug);
+      this.forget(slug);
+      return { app: slug, removed };
+    });
+  }
+
+  list(): { app: string; url: string; startedAt: number; expiresAt: number; live: boolean }[] {
+    return this.records().map(([app, record]) => ({
+      app, url: record.url, startedAt: record.startedAt, expiresAt: record.expiresAt, live: this.live.get(app)?.tunnel.alive() ?? false,
+    }));
+  }
+
+  /** Bridge start: kills tunnels a crashed bridge left behind, then brings unexpired shares back. */
+  async restore(): Promise<void> {
+    for (const [, record] of this.records()) if (record.pid) reapOrphan(record.pid, record.port);
+    await this.sweep();
+  }
+
+  /** Stops expired shares and re-creates any whose tunnel died. Overlapping calls are skipped. */
+  async sweep(): Promise<void> {
+    if (this.sweeping) return;
+    this.sweeping = true;
+    try {
+      await this.serialized(async () => {
+        for (const [slug, record] of this.records()) {
+          if (record.expiresAt <= this.now()) {
+            await this.close(slug);
+            this.forget(slug);
+            this.log("share-expired", slug);
+            continue;
+          }
+          if (this.live.get(slug)?.tunnel.alive()) continue;
+          await this.close(slug);
+          const index = await this.index(slug);
+          if (!index) {
+            this.forget(slug);
+            this.log("share-dropped", slug);
+            continue;
+          }
+          try {
+            const started = await this.start(slug, dirname(index));
+            this.save(slug, { ...record, ...started });
+            this.log("share-restarted", `${slug} ${record.url} ${started.url}`);
+          } catch {
+            this.log("share-restart-failed", slug);
+          }
+        }
+      });
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  /** Bridge stop: tunnels end with the bridge, records stay so the next start re-creates them. */
+  async stopAll(): Promise<void> {
+    await Promise.all([...this.live.keys()].map(slug => this.close(slug)));
+  }
+
+  /** Synchronous last resort for process exit, where async cleanup never runs. */
+  killAll(): void {
+    for (const { tunnel } of this.live.values()) tunnel.kill();
+  }
+
+  private async start(slug: string, root: string): Promise<{ url: string; port: number; pid: number }> {
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 1024, fetch: createShareHandler(root) });
+    const port = server.port!;
+    try {
+      const tunnel = await this.options.startTunnel(port);
+      this.live.set(slug, { server, tunnel });
+      return { url: tunnel.url, port, pid: tunnel.pid };
+    } catch (error) {
+      await server.stop(true);
+      throw error instanceof ShareError ? error : new ShareError(502, "Tunnel could not be started");
+    }
+  }
+
+  private async close(slug: string): Promise<void> {
+    const live = this.live.get(slug);
+    if (!live) return;
+    this.live.delete(slug);
+    await live.tunnel.stop().catch(() => live.tunnel.kill());
+    await live.server.stop(true);
+  }
+
+  private index(slug: string): Promise<string | undefined> {
+    return resolveAppFile(this.options.appsRoot, `/${slug}/index.html`);
+  }
+
+  private records(): [string, ShareRecord][] {
+    return this.options.store.db.query<{ key: string; value: string }, []>(
+      `SELECT key, value FROM kv WHERE key LIKE '${KEY_PREFIX}%' ORDER BY key`,
+    ).all().map(row => [row.key.slice(KEY_PREFIX.length), JSON.parse(row.value) as ShareRecord]);
+  }
+
+  private record(slug: string): ShareRecord | undefined {
+    return this.options.store.get<ShareRecord>(KEY_PREFIX + slug);
+  }
+
+  private save(slug: string, record: ShareRecord): void {
+    this.options.store.set(KEY_PREFIX + slug, record);
+  }
+
+  private forget(slug: string): void {
+    this.options.store.db.query("DELETE FROM kv WHERE key = ?").run(KEY_PREFIX + slug);
+  }
+
+  private serialized<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(task, task);
+    this.queue = next.catch(() => {});
+    return next;
+  }
+}
+
+/** Kills a tunnel only if that PID is still the cloudflared this bridge started for that port. */
+function reapOrphan(pid: number, port: number): void {
+  if (!Number.isInteger(pid) || pid <= 1) return;
+  const ps = spawnSync("/bin/ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+  const command = ps.status === 0 ? ps.stdout : "";
+  if (!command.includes("cloudflared") || !new RegExp(`--url http://127\\.0\\.0\\.1:${port}(?:\\s|$)`).test(command)) return;
+  try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+}
+
+export const SHARE_ROUTES = ["/share", "/unshare", "/shares"];
+
+/** Socket routes shared by the Photon and Sendblue APIs; callers pass a parsed JSON object body. */
+export async function shareRoute(shares: Shares, path: string, body: Record<string, unknown>): Promise<{ status: number; body: unknown }> {
+  const allowed = path === "/share" ? ["app", "days"] : path === "/unshare" ? ["app"] : [];
+  if (Object.keys(body).some(key => !allowed.includes(key))) return { status: 400, body: { error: "Invalid request" } };
+  try {
+    if (path === "/shares") return { status: 200, body: { shares: shares.list() } };
+    const app = body.app;
+    if (typeof app !== "string") return { status: 400, body: { error: "Invalid request" } };
+    if (path === "/unshare") return { status: 200, body: await shares.unshare(app) };
+    const days = body.days === undefined ? DEFAULT_SHARE_DAYS : body.days;
+    if (typeof days !== "number") return { status: 400, body: { error: "Invalid request" } };
+    const result = await shares.share(app, days);
+    return { status: result.created ? 201 : 200, body: result };
+  } catch (error) {
+    if (error instanceof ShareError) return { status: error.status, body: { error: error.message } };
+    return { status: 502, body: { error: "Share failed" } };
+  }
+}
