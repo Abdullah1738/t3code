@@ -1260,6 +1260,74 @@ describe("system delivery", () => {
 });
 // --- end router additions ---
 
+describe("after a restart", () => {
+  it.effect("a queued notice goes straight onto a member's thread, not into its room", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      h.activity.set(writerThread, "running");
+      const notice = {
+        threadId: writerThread,
+        text: "Your last turn was cut off by a restart.",
+        key: "incident-5:m-1:t-writer",
+        producer: "missions-recovery",
+        queue: true,
+      };
+      assert.deepStrictEqual(yield* router.notify(notice), { _tag: "sent" });
+      assert.deepStrictEqual(h.sent, [
+        {
+          threadId: writerThread,
+          text: notice.text,
+          key: "recovery:incident-5:m-1:t-writer",
+          asOwner: false,
+        },
+      ]);
+      // Nothing was posted: the control room was never even opened.
+      const noRoom = failureCode(router.roomPage({ roomId: control }, ownerApp));
+      assert.strictEqual(yield* noRoom, "not-found");
+      // A retry without the flag keeps the first route.
+      h.activity.set(writerThread, "idle");
+      assert.deepStrictEqual(yield* router.notify({ ...notice, queue: false }), { _tag: "sent" });
+      assert.strictEqual(yield* noRoom, "not-found");
+      assert.deepStrictEqual(
+        h.sent.map((sent) => sent.key),
+        ["recovery:incident-5:m-1:t-writer", "recovery:incident-5:m-1:t-writer"],
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("holds wakes and reminders until released, then rings what waited, once", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      yield* router.holdDoorbells;
+      yield* router.post(request("first", { to: toWriter }), agent(laneThread));
+      yield* router.settled(writerThread);
+      assert.deepStrictEqual(wakesFor(h.sent, writerThread), []);
+      yield* TestClock.adjust("31 minutes");
+      assert.strictEqual(yield* router.remind, 0);
+      assert.deepStrictEqual(h.sent, []);
+
+      yield* router.releaseDoorbells;
+      const wakes = wakesFor(h.sent, writerThread);
+      assert.strictEqual(wakes.length, 1);
+      assert.strictEqual(wakes[0]!.key, `mission-wake:${missionId}:${writerThread}:1`);
+      yield* router.releaseDoorbells;
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 1);
+      // Reminders run again too.
+      assert.strictEqual(yield* router.remind, 1);
+
+      // Released for good: a second hold does nothing.
+      yield* router.holdDoorbells;
+      yield* router.post(request("second", { to: toWriter }), agent(laneThread));
+      yield* router.settled(writerThread);
+      assert.strictEqual(wakesFor(h.sent, writerThread).length, 2);
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
 describe("router round 5", () => {
   it.effect("a removed actor stays out: the import and the actor cannot add it back", () => {
     const h = harness();

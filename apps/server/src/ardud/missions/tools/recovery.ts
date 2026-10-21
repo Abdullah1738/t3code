@@ -42,7 +42,7 @@ const RecoveryStatusTool = Tool.make("mission_recovery_status", {
 
 const RecoveryResumeTool = Tool.make("mission_recovery_resume", {
   description:
-    "Master only. Steer the open recovery: mode now (send this thread's or lane's notice next, right away if idle), hold (keep it unsent), release (let held threads go; all of them without a target), skip (it needs no resume), order (resume in the given thread order). instruction adds a line to a notice not yet sent.",
+    "Master only. Steer the open recovery: mode now (send this thread's or lane's notice next, right away: queued behind the running turn if busy), hold (keep it unsent), release (let held threads go; all of them without a target), skip (it needs no resume), order (resume in the given thread order). instruction adds a line to a notice not yet sent.",
   parameters: RecoveryResumeInput,
   success: MissionRecoveryStatus,
   failure: OrchestratorMcpFailure,

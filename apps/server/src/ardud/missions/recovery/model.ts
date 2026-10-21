@@ -625,6 +625,8 @@ export interface MasterSummaryInput {
   readonly master: RecoveryThread;
   readonly others: ReadonlyArray<RecoveryThread>;
   readonly settings: MissionRecoverySettings;
+  /** HH:MM lanes start at when the note is queued behind the master's turn. */
+  readonly lanesStartAt?: string | null;
 }
 
 /** The master's notice: its own losses plus every lane's planned action, in resume order. */
@@ -648,7 +650,7 @@ export const masterNotice = (input: MasterSummaryInput) => {
   ];
   if (queue.length > 0) {
     lines.push(
-      `Resume plan, in order (${settings.resumePerMinute} per minute, lanes start ${settings.masterLeadSeconds}s after this note):`,
+      `Resume plan, in order (${settings.resumePerMinute} per minute, lanes start ${input.lanesStartAt ? `at ${input.lanesStartAt}` : `${settings.masterLeadSeconds}s after this note`}):`,
     );
     queue.forEach((thread, index) => lines.push(`${index + 1}. ${lineFor(thread)}`));
   } else {

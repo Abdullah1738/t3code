@@ -197,6 +197,11 @@ export interface SystemNotice {
   readonly key: string;
   /** The producing component, e.g. `stream-recovery`; the post's author. */
   readonly producer: string;
+  /**
+   * Queue the text straight onto the thread, member or not, so it lands after
+   * the running turn instead of waiting in a room for a doorbell.
+   */
+  readonly queue?: boolean;
 }
 
 export type SystemNoticeOutcome =
@@ -327,9 +332,10 @@ export class MissionRouter extends Context.Service<
      * Delivers a system producer's notice (recovery's continuation notices).
      * A mission member gets it as a control-room request addressed to it,
      * posted as the producer, and its doorbell rings when it is free. Any
-     * other thread gets the text queued directly. `key` makes retries land
-     * once: a retry takes the first attempt's path, whatever the thread's
-     * membership is by then. A gone thread fails `not-found`.
+     * other thread, or any notice sent with `queue`, gets the text queued
+     * directly. `key` makes retries land once: a retry takes the first
+     * attempt's path, whatever the thread's membership is by then. A gone
+     * thread fails `not-found`.
      */
     readonly notify: (notice: SystemNotice) => Effect.Effect<SystemNoticeOutcome, MissionError>;
     /**
@@ -370,6 +376,14 @@ export class MissionRouter extends Context.Service<
      * once. Returns how many threads were reminded.
      */
     readonly remind: Effect.Effect<number>;
+    /**
+     * Holds wakes and reminders after a restart, so recovery can scan before
+     * router traffic starts lanes. Pokes are remembered and replayed on
+     * release. Only the first call holds; later calls do nothing.
+     */
+    readonly holdDoorbells: Effect.Effect<void>;
+    /** Ends the boot hold and pokes every thread that asked meanwhile. Idempotent. */
+    readonly releaseDoorbells: Effect.Effect<void>;
     /** Owner or master: deliveries still unread after their one reminder. */
     readonly attention: (
       input: MissionAttentionInput,
@@ -427,6 +441,9 @@ const make = Effect.gen(function* () {
   const threads = yield* RouterThreads;
   const postLock = yield* Semaphore.make(1);
   const bellLock = yield* Semaphore.make(1);
+  // Boot hold (recovery): see holdDoorbells. Read and released under bellLock.
+  let bootHold: "open" | "holding" | "released" = "open";
+  const heldPokes = new Set<ThreadId>();
 
   const loadCast = (missionId: MissionId): Effect.Effect<RouterCast, MissionError> =>
     readCast(store, missionId);
@@ -1726,6 +1743,10 @@ const make = Effect.gen(function* () {
 
   const pokeUnlocked = (threadId: ThreadId): Effect.Effect<void, MissionError> =>
     Effect.gen(function* () {
+      if (bootHold === "holding") {
+        heldPokes.add(threadId);
+        return;
+      }
       const unread = yield* rooms.unreadDeliveries(threadId);
       if (unread.length === 0) return;
       let bell = yield* rooms.doorbell(threadId);
@@ -1809,12 +1830,16 @@ const make = Effect.gen(function* () {
       // A retry takes the route the first attempt took, even if the thread
       // joined or left a mission since: the other route would send it twice.
       const route = yield* rooms.noticeRoute(input.key);
+      // A queued notice skips the room: its doorbell only rings once the
+      // thread is idle, which a busy thread may not be for hours.
       const member =
-        route === null
-          ? yield* membershipIn(everywhere, input.threadId)
-          : route.missionId === null
+        route !== null
+          ? route.missionId === null
             ? null
-            : { missionId: route.missionId };
+            : { missionId: route.missionId }
+          : input.queue === true
+            ? null
+            : yield* membershipIn(everywhere, input.threadId);
       if (member === null) {
         if (route === null) {
           yield* rooms.recordNotice({
@@ -1875,6 +1900,34 @@ const make = Effect.gen(function* () {
         seq: message.seq,
       } satisfies SystemNoticeOutcome;
     });
+
+  const holdDoorbells = Effect.sync(() => {
+    if (bootHold === "open") bootHold = "holding";
+  });
+
+  const releaseDoorbells = Effect.gen(function* () {
+    const { was, held } = yield* bellLock.withPermit(
+      Effect.sync(() => {
+        const was = bootHold;
+        bootHold = "released";
+        const held = [...heldPokes];
+        heldPokes.clear();
+        return { was, held };
+      }),
+    );
+    if (was !== "holding") return;
+    yield* Effect.logInfo("missions router: boot hold released", { held: held.length });
+    yield* Effect.forEach(
+      held,
+      (threadId) =>
+        poke(threadId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("missions router: doorbell failed", { threadId, cause }),
+          ),
+        ),
+      { discard: true },
+    );
+  });
   // --- end router additions ---
 
   /** One thread's reminder, under the bell lock. True when it was sent. */
@@ -1884,6 +1937,7 @@ const make = Effect.gen(function* () {
     gapCutoff: string,
   ): Effect.Effect<boolean, MissionError> =>
     Effect.gen(function* () {
+      if (bootHold === "holding") return false;
       if (!reminderDue(yield* rooms.lastReminderAt(threadId), gapCutoff)) return false;
       const facts = yield* threads.facts(threadId);
       if (facts?.activity !== "idle") return false;
@@ -2047,6 +2101,8 @@ const make = Effect.gen(function* () {
     updateRoom,
     createRoom, // ardud missions: router
     remind,
+    holdDoorbells, // ardud missions: recovery
+    releaseDoorbells, // ardud missions: recovery
     attention,
     ownerRequests: requests.list,
     openRequest: requests.open,

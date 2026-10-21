@@ -44,8 +44,13 @@ export const RecoveryLoops = Layer.effectDiscard(
   Effect.gen(function* () {
     const missions = yield* MissionService.MissionService;
     const recovery = yield* RecoveryService.RecoveryService;
+    const delivery = yield* RecoveryDelivery.RecoveryDelivery;
     yield* missions.registerRecovery({ state: recovery.state });
-    if (!(yield* enabled.pipe(Effect.orElseSucceed(() => true)))) return;
+    if (!(yield* enabled.pipe(Effect.orElseSucceed(() => true)))) {
+      // Nothing to wait for: let the router's held wakes go now.
+      yield* delivery.bootPassDone;
+      return;
+    }
 
     // Robob's own restart continuation leaves member threads to recovery,
     // which wakes them in order with what was lost.
@@ -62,11 +67,21 @@ export const RecoveryLoops = Layer.effectDiscard(
       logged("scan"),
       Effect.repeat(Schedule.spaced(SCAN_EVERY)),
     );
+    // The router holds wakes and reminders until this pass is done, so the
+    // incident is recorded with each cut run's state (not "already continued")
+    // and the master's note is out before router traffic restarts the lanes.
+    // A lane woken after this hears its own notice when that turn ends.
+    // Failed steps are logged, so release runs either way; on shutdown it
+    // does not, so no held wake fires into a stopping server.
+    const bootPass = recovery.beat.pipe(
+      logged("heartbeat"),
+      Effect.andThen(Effect.sleep(BOOT_DELAY)),
+      Effect.andThen(recovery.detectBoot.pipe(logged("boot check"))),
+      Effect.andThen(recovery.tick.pipe(logged("notice round"))),
+      Effect.andThen(delivery.bootPassDone),
+    );
     yield* forkParked(
-      recovery.beat.pipe(
-        logged("heartbeat"),
-        Effect.andThen(Effect.sleep(BOOT_DELAY)),
-        Effect.andThen(recovery.detectBoot.pipe(logged("boot check"))),
+      bootPass.pipe(
         Effect.andThen(Effect.all([ticks, scans], { concurrency: "unbounded", discard: true })),
       ),
     );
