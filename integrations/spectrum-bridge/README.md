@@ -52,6 +52,12 @@ under `~/.config/spectrum-bridge/`.
   instead (the card's HTML file when it is published here, otherwise its link)
   and their row moves to state `fallback`. Secure form links never leave
   iMessage.
+- Sendblue app cards open in the iMessage app named by `cardApp` in
+  config.json (`appName`, `extensionBundleId`, `teamId`, optional
+  `appStoreId`), defaulting to Photon's Spectrum app. Photon mode always uses
+  Spectrum. Card text loses times, dates and day words such as "today"
+  because iMessage turns a card whose text holds one into a plain text bubble;
+  put those details in the page.
 - Questions (OpenCode forms) and approvals raised in the active chat, or by
   any running subagent below it at any depth, are sent into the conversation.
   This is the only place they are asked: OpenChamber and the telegram bridge
