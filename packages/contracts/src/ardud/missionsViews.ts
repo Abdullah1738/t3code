@@ -540,11 +540,144 @@ export const ViewQuery = Schema.Struct({
 });
 export type ViewQuery = typeof ViewQuery.Type;
 
+// --- sources additions ---
+/** A script on the host that feeds rows to sections. */
+export const ViewDataSourceId = viewEntityId("ViewDataSourceId");
+export type ViewDataSourceId = typeof ViewDataSourceId.Type;
+
+export const ViewSourceRuntime = Schema.Literals(["bash", "node", "python3"]);
+export type ViewSourceRuntime = typeof ViewSourceRuntime.Type;
+
+/** What a declared row field holds. `actor` is a plain name; links are https only. */
+export const ViewSourceFieldKind = Schema.Literals([
+  "text",
+  "enum",
+  "number",
+  "time",
+  "link",
+  "links",
+  "actor",
+  "longtext",
+]);
+export type ViewSourceFieldKind = typeof ViewSourceFieldKind.Type;
+
+export const ViewSourceFieldName = Schema.String.check(
+  Schema.isPattern(/^[a-zA-Z][a-zA-Z0-9-]{0,39}$/),
+);
+
+export const VIEW_SOURCE_LIMITS = {
+  sourcesPerMission: 12,
+  codeChars: 20_000,
+  fields: 16,
+  rows: 500,
+  outputBytes: 2_000_000,
+  textChars: 2_000,
+  longTextChars: 20_000,
+  links: 10,
+  maxTimeoutSeconds: 60,
+  minRefreshMinutes: 5,
+  maxRefreshMinutes: 1440,
+  concurrentRuns: 2,
+  whereFields: 4,
+} as const;
+
+/** Every row carries an implicit text `id`, so `id` is not declared here. */
+export const ViewSourceFields = Schema.Record(ViewSourceFieldName, ViewSourceFieldKind).check(
+  Schema.isMinProperties(1),
+  Schema.isMaxProperties(VIEW_SOURCE_LIMITS.fields),
+);
+export type ViewSourceFields = typeof ViewSourceFields.Type;
+
+export const ViewSourceCode = Schema.String.check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(VIEW_SOURCE_LIMITS.codeChars),
+);
+export const ViewSourceRefreshMinutes = Schema.Int.check(
+  Schema.isBetween({
+    minimum: VIEW_SOURCE_LIMITS.minRefreshMinutes,
+    maximum: VIEW_SOURCE_LIMITS.maxRefreshMinutes,
+  }),
+);
+export const ViewSourceTimeoutSeconds = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: VIEW_SOURCE_LIMITS.maxTimeoutSeconds }),
+);
+
+export const ViewSourceDefinition = Schema.Struct({
+  title: ViewLabel,
+  runtime: ViewSourceRuntime,
+  code: ViewSourceCode,
+  fields: ViewSourceFields,
+  refreshMinutes: ViewSourceRefreshMinutes,
+  timeoutSeconds: ViewSourceTimeoutSeconds,
+  enabled: Schema.Boolean,
+});
+export type ViewSourceDefinition = typeof ViewSourceDefinition.Type;
+
+export const ViewDataSource = Schema.Struct({
+  id: ViewDataSourceId,
+  missionId: MissionId,
+  definition: ViewSourceDefinition,
+  ...ViewMeta.fields,
+});
+export type ViewDataSource = typeof ViewDataSource.Type;
+
+/** A source without its code, for snapshots; the code reads through history. */
+export const ViewSourceListing = Schema.Struct({
+  id: ViewDataSourceId,
+  missionId: MissionId,
+  title: ViewLabel,
+  runtime: ViewSourceRuntime,
+  fields: ViewSourceFields,
+  refreshMinutes: ViewSourceRefreshMinutes,
+  timeoutSeconds: ViewSourceTimeoutSeconds,
+  enabled: Schema.Boolean,
+  ...ViewMeta.fields,
+});
+export type ViewSourceListing = typeof ViewSourceListing.Type;
+
+/** The cached state of one source: the last good rows stay when a later run fails. */
+export const ViewSourceRun = Schema.Struct({
+  sourceId: ViewDataSourceId,
+  /** When the cached rows were produced; null before the first good run. */
+  okAt: Schema.NullOr(IsoDateTime),
+  rows: NonNegativeInt,
+  ranAt: Schema.NullOr(IsoDateTime),
+  durationMs: Schema.NullOr(NonNegativeInt),
+  /** The latest run's first stderr line or output problem, when it failed. */
+  error: Schema.NullOr(Schema.String),
+  running: Schema.Boolean,
+});
+export type ViewSourceRun = typeof ViewSourceRun.Type;
+
+/** Equals on scalar fields; a list matches any of its values. */
+export const ViewSourceWhereValue = Schema.Union([
+  Schema.String,
+  Schema.Finite,
+  Schema.Array(Schema.String).check(Schema.isMinLength(1), Schema.isMaxLength(20)),
+]);
+export const ViewSourceSort = Schema.Struct({
+  field: ViewSourceFieldName,
+  dir: Schema.Literals(["asc", "desc"]),
+});
+// --- end sources additions ---
+
 export const ViewSource = Schema.Union([
   Schema.TaggedStruct("query", { query: ViewQuery }),
   Schema.TaggedStruct("refs", {
     refs: Schema.Array(MissionRecordRef).check(Schema.isMinLength(1), Schema.isMaxLength(20)),
   }),
+  // --- sources additions ---
+  Schema.TaggedStruct("source", {
+    sourceId: ViewDataSourceId,
+    where: Schema.optionalKey(
+      Schema.Record(ViewSourceFieldName, ViewSourceWhereValue).check(
+        Schema.isMaxProperties(VIEW_SOURCE_LIMITS.whereFields),
+      ),
+    ),
+    sort: Schema.optionalKey(ViewSourceSort),
+    limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 20 })),
+  }),
+  // --- end sources additions ---
 ]);
 export type ViewSource = typeof ViewSource.Type;
 
@@ -1638,11 +1771,74 @@ export const ViewLongText = Schema.Struct({
 export type ViewLongText = typeof ViewLongText.Type;
 // --- end views additions ---
 
+// --- sources additions ---
+/**
+ * Creates a source when `sourceId` is absent (title, runtime, code and fields
+ * required), otherwise patches the named keys.
+ */
+export const SetViewSourceInput = Schema.Struct({
+  missionId: MissionId,
+  sourceId: Schema.optionalKey(ViewDataSourceId),
+  title: Schema.optionalKey(ViewLabel),
+  runtime: Schema.optionalKey(ViewSourceRuntime),
+  code: Schema.optionalKey(ViewSourceCode),
+  fields: Schema.optionalKey(ViewSourceFields),
+  refreshMinutes: Schema.optionalKey(ViewSourceRefreshMinutes),
+  timeoutSeconds: Schema.optionalKey(ViewSourceTimeoutSeconds),
+  enabled: Schema.optionalKey(Schema.Boolean),
+  expectedVersion: Schema.optionalKey(PositiveInt),
+  changeNote: Schema.optionalKey(MissionSummaryText),
+});
+export type SetViewSourceInput = typeof SetViewSourceInput.Type;
+
+export const RunViewSourceInput = Schema.Struct({
+  missionId: MissionId,
+  sourceId: ViewDataSourceId,
+});
+export type RunViewSourceInput = typeof RunViewSourceInput.Type;
+
+export const RemoveViewSourceInput = Schema.Struct({
+  missionId: MissionId,
+  sourceId: ViewDataSourceId,
+  expectedVersion: Schema.optionalKey(PositiveInt),
+  reason: Schema.optionalKey(MissionSummaryText),
+});
+export type RemoveViewSourceInput = typeof RemoveViewSourceInput.Type;
+
+/** Brings a removed source back, or rolls an active one back to `toVersion`. */
+export const RestoreViewSourceInput = Schema.Struct({
+  missionId: MissionId,
+  sourceId: ViewDataSourceId,
+  toVersion: Schema.optionalKey(PositiveInt),
+  expectedVersion: Schema.optionalKey(PositiveInt),
+  changeNote: Schema.optionalKey(MissionSummaryText),
+});
+export type RestoreViewSourceInput = typeof RestoreViewSourceInput.Type;
+
+export const ViewSourceRunResult = Schema.Struct({
+  sourceId: ViewDataSourceId,
+  ok: Schema.Boolean,
+  ranAt: IsoDateTime,
+  durationMs: NonNegativeInt,
+  /** Rows the run produced; the cache keeps the previous rows when `ok` is false. */
+  total: NonNegativeInt,
+  /** The first 20 parsed rows. */
+  rows: Schema.Array(Schema.Record(Schema.String, Schema.Unknown)).check(Schema.isMaxLength(20)),
+  /** Output problems, at most 20. */
+  errors: Schema.Array(Schema.String).check(Schema.isMaxLength(20)),
+  stderr: Schema.String,
+});
+export type ViewSourceRunResult = typeof ViewSourceRunResult.Type;
+// --- end sources additions ---
+
 export const ViewHistoryTarget = Schema.Union([
   Schema.TaggedStruct("template", { id: ViewTemplateId }),
   Schema.TaggedStruct("section", { id: ViewSectionId }),
   Schema.TaggedStruct("layout", {}),
   Schema.TaggedStruct("starter", {}),
+  // --- sources additions ---
+  Schema.TaggedStruct("source", { id: ViewDataSourceId }),
+  // --- end sources additions ---
 ]);
 export type ViewHistoryTarget = typeof ViewHistoryTarget.Type;
 
@@ -1746,6 +1942,11 @@ export const MissionViewsSnapshot = Schema.Struct({
   /** The mission's active images. */
   assets: Schema.optional(Schema.Array(MissionAsset)),
   // --- end views additions ---
+  // --- sources additions ---
+  /** Every source, removed ones included so their sections can say "source off". */
+  sources: Schema.optional(Schema.Array(ViewSourceListing)),
+  sourceRuns: Schema.optional(Schema.Array(ViewSourceRun)),
+  // --- end sources additions ---
 });
 export type MissionViewsSnapshot = typeof MissionViewsSnapshot.Type;
 
@@ -1777,6 +1978,25 @@ export const ViewCatalog = Schema.Struct({
     }),
   ),
   // --- end views additions ---
+  // --- sources additions ---
+  sources: Schema.optional(
+    Schema.Struct({
+      runtimes: Schema.Array(ViewSourceRuntime),
+      fieldKinds: Schema.Array(ViewSourceFieldKind),
+      limits: Schema.Record(Schema.String, Schema.Number),
+      rules: Schema.Array(Schema.String),
+      examples: Schema.Array(
+        Schema.Struct({
+          title: Schema.String,
+          /** `mission_view_source_set` input without `missionId`. */
+          source: Schema.Unknown,
+          /** `mission_view_section` definition reading it. */
+          section: Schema.Unknown,
+        }),
+      ),
+    }),
+  ),
+  // --- end sources additions ---
 });
 export type ViewCatalog = typeof ViewCatalog.Type;
 
@@ -1854,4 +2074,112 @@ export const VIEW_CATALOG: ViewCatalog = {
   ceilings: VIEW_LIMIT_CEILINGS,
   builtins: [...BUILTIN_VIEW_TEMPLATES, ...STOCK_VIEW_TEMPLATES],
   queries: { filters: VIEW_QUERY_FILTERS, sorts: VIEW_QUERY_SORTS },
+  // --- sources additions ---
+  sources: {
+    runtimes: ViewSourceRuntime.literals,
+    fieldKinds: ViewSourceFieldKind.literals,
+    limits: VIEW_SOURCE_LIMITS,
+    rules: [
+      "Sources are read-only. Never write to GitHub, Linear, Cliq or anything else, never send messages, never print secrets or tokens.",
+      'Print one JSON object to stdout: {"rows":[{"id":"...", <declared fields>}]}. At most 500 rows and 2 MB.',
+      "Every row needs a unique string id. Undeclared keys are dropped and long strings are cut.",
+      "Kinds: text/enum/longtext strings, number, time (ISO), actor (a plain name), link (an https url or {url, label?}), links (a list of those). null is fine.",
+      "A wrong kind, a non-https link, a bad time or a non-zero exit fails the run; the section keeps the last good rows and says it couldn't refresh.",
+      "Runs as the owner with the login PATH (gh, linctl, curl, jq), stdin closed, in a scratch directory, niced, within timeoutSeconds (max 60).",
+      "Runs only when older than refreshMinutes and someone has the mission open, or on mission_view_source_run. Owner or master only.",
+      'Sections read it with source {_tag:"source", sourceId, where?: {field: value}, sort?: {field, dir}, limit} and bind row.<field> or row.id.',
+    ],
+    examples: [
+      {
+        title: "Linear issues (linctl)",
+        source: {
+          title: "Open Linear issues",
+          runtime: "bash",
+          code: [
+            "linctl issue list --team CRP --limit 50 --sort updated --json \\",
+            "  | jq '{rows: [.[] | {id: .identifier, title, state: .state.name,",
+            "      assignee: .assignee.name, priority: .priorityLabel,",
+            "      issue: {url, label: .identifier}, updated: .updatedAt}]}'",
+          ].join("\n"),
+          fields: {
+            title: "text",
+            state: "enum",
+            assignee: "actor",
+            priority: "enum",
+            issue: "link",
+            updated: "time",
+          },
+          refreshMinutes: 15,
+          timeoutSeconds: 30,
+        },
+        section: {
+          key: "linear",
+          title: "Linear",
+          source: {
+            _tag: "source",
+            sourceId: "<id from mission_view_source_set>",
+            sort: { field: "updated", dir: "desc" },
+            limit: 10,
+          },
+          body: [
+            {
+              _tag: "table",
+              columns: [
+                { label: "Issue", bind: "row.issue", as: "link" },
+                { label: "Title", bind: "row.title", as: "text" },
+                { label: "State", bind: "row.state", as: "status" },
+                { label: "Who", bind: "row.assignee", as: "person" },
+                { label: "Updated", bind: "row.updated", as: "age" },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        title: "GitHub pull requests (gh)",
+        source: {
+          title: "Open PRs",
+          runtime: "bash",
+          code: [
+            "gh pr list --repo OWNER/REPO --state open --limit 30 \\",
+            "  --json number,title,author,url,updatedAt,isDraft,reviewDecision \\",
+            "  | jq '{rows: [.[] | {id: (.number | tostring), title, author: .author.login,",
+            '      pr: {url, label: ("#" + (.number | tostring))},',
+            '      review: ((.reviewDecision // "none") | ascii_downcase),',
+            '      draft: (if .isDraft then "draft" else "ready" end), updated: .updatedAt}]}\'',
+          ].join("\n"),
+          fields: {
+            title: "text",
+            author: "actor",
+            pr: "link",
+            review: "enum",
+            draft: "enum",
+            updated: "time",
+          },
+          refreshMinutes: 10,
+          timeoutSeconds: 30,
+        },
+        section: {
+          key: "open-prs",
+          title: "Open PRs",
+          source: {
+            _tag: "source",
+            sourceId: "<id from mission_view_source_set>",
+            where: { draft: "ready" },
+            sort: { field: "updated", dir: "desc" },
+            limit: 8,
+          },
+          body: [
+            {
+              _tag: "list",
+              title: "row.title",
+              meta: ["row.pr", "row.author", "row.updated"],
+              status: "row.review",
+            },
+          ],
+        },
+      },
+    ],
+  },
+  // --- end sources additions ---
 };

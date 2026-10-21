@@ -208,6 +208,11 @@ export const MissionRecordKind = Schema.Literals([
   /** A scribe report row in a report section; not a store record. */
   "report",
   // --- end views additions ---
+  // --- sources additions ---
+  "view-source",
+  /** A row a view source script returned; not a store record. */
+  "source-row",
+  // --- end sources additions ---
   // --- core additions ---
   "portfolio",
   // --- end core additions ---
@@ -1883,6 +1888,11 @@ export const MissionEventKind = Schema.Literals([
   "view.asset-removed",
   "view.assets-expired",
   // --- end views additions ---
+  // --- sources additions ---
+  "view.source-set",
+  "view.source-removed",
+  "view.source-restored",
+  // --- end sources additions ---
   "field.locked",
   "field.unlocked",
   "governor.action",
