@@ -1,6 +1,7 @@
 /**
  * What reaches the master besides messages addressed to it: one digest per
- * editor pass, and the approvals and drafts routed to the master. Each one
+ * editor pass, the approvals and drafts routed to the master, and the notes
+ * the owner leaves when deciding an approval. Each one
  * is a message in the mission's control room addressed to the master role,
  * so it rings the doorbell like every other delivery. Keys come from the
  * event id, so a replayed event posts nothing new.
@@ -11,6 +12,7 @@
  */
 import {
   approverOf,
+  isOwnerProvenance,
   type MissionEvent,
   type MissionId,
   type MissionMessageKind,
@@ -43,6 +45,20 @@ const ROUTED_KINDS = new Set([
   "draft.opened",
   "draft.routed",
 ]);
+
+// ardud missions: crw-threads
+/** The owner's note on a decision is direction for next time; nothing else carries it to the master. */
+const ownerNote = (event: MissionEvent): string | null => {
+  if (event.kind !== "approval.decided" || !isOwnerProvenance(event.provenance)) return null;
+  const note =
+    typeof event.payload === "object" && event.payload !== null && "note" in event.payload
+      ? event.payload.note
+      : null;
+  return typeof note === "string" && note.trim().length > 0 ? note.trim() : null;
+};
+
+const feedRelevant = (event: MissionEvent) =>
+  event.kind === "editor.updated" || ROUTED_KINDS.has(event.kind) || ownerNote(event) !== null;
 
 interface Notice {
   readonly kind: MissionMessageKind;
@@ -121,6 +137,28 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
         return notice;
       }
       if (ROUTED_KINDS.has(event.kind)) return yield* routedNotice(event);
+      // ardud missions: crw-threads
+      const note = ownerNote(event);
+      if (note !== null) {
+        const approval =
+          event.subject?.kind === "approval"
+            ? Option.getOrNull(yield* store.get("approval", event.subject.id))
+            : null;
+        const links = (approval?.links ?? []).flatMap((link) =>
+          link.url === null ? [] : [`${link.label}: ${link.url}`],
+        );
+        const notice: Notice = {
+          kind: "decision",
+          summary: `Owner's note: ${event.summary}`,
+          body: [
+            `The owner decided ${approval?.title ?? event.subject?.label ?? "an approval"} and left this note:`,
+            note,
+            ...links,
+            "Take it as direction for this kind of work, not only this item.",
+          ].join("\n"),
+        };
+        return notice;
+      }
       return null;
     });
 
@@ -157,7 +195,7 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
 
   const deliver = (event: MissionEvent): Effect.Effect<void> =>
     Effect.gen(function* () {
-      if (event.kind !== "editor.updated" && !ROUTED_KINDS.has(event.kind)) return;
+      if (!feedRelevant(event)) return;
       const notice = yield* noticeFor(event);
       if (notice === null) return;
       const cast = yield* readCast(store, event.missionId);
@@ -202,7 +240,7 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
         if (page.length === 0) break;
         for (const event of page) {
           if (event.seq > toSeq) continue;
-          if (event.kind === "editor.updated" || ROUTED_KINDS.has(event.kind)) relevant.push(event);
+          if (feedRelevant(event)) relevant.push(event);
         }
         after = page[page.length - 1]!.seq;
       }
