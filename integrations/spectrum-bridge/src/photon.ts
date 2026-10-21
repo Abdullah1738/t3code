@@ -459,6 +459,10 @@ export type NormalizedInbound = {
    * are not; Robob treats a row without "typed" as composed.
    */
   source?: "typed" | "composed";
+  /** Sendblue mode: sender address (groups have several). */
+  sender?: string;
+  /** Sendblue mode: a shared location (message_type "location"). */
+  location?: { latitude: number; longitude: number; accuracy?: number; at?: number };
 };
 
 export type InboundPollVote = {
