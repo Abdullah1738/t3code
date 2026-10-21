@@ -35,6 +35,8 @@ EOF
 
 check_person() {
   [[ $1 =~ '^[a-z][a-z0-9-]{0,31}$' ]] || die "person must be a lowercase slug, got '$1'"
+  # These dirs under the state root hold offbox-person's own files, not a person.
+  [[ $1 != (bin|state|stage|restic) ]] || die "'$1' is reserved for offbox-person's own files"
 }
 
 person_dir() { print -- "$ROOT/$1"; }

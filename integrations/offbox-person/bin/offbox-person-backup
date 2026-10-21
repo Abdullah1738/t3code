@@ -92,7 +92,7 @@ if [ "$ALL" = 1 ]; then
   for d in "$ROOT"/*/; do
     [ -d "$d" ] || continue
     p=$(basename "$d")
-    case $p in state|stage|restic) continue ;; esac
+    case $p in bin|state|stage|restic) continue ;; esac
     [[ $p =~ ^[a-z][a-z0-9-]{0,31}$ ]] || continue
     if [ "$FORCE" = 1 ]; then "$0" "$p" --force & else "$0" "$p" & fi
     CHILD=$!
@@ -104,6 +104,7 @@ fi
 
 [ -n "$PERSON" ] || usage
 [[ $PERSON =~ ^[a-z][a-z0-9-]{0,31}$ ]] || { echo "person must be a lowercase slug, got '$PERSON'" >&2; exit 2; }
+case $PERSON in bin|state|stage|restic) echo "'$PERSON' is reserved for offbox-person's own files" >&2; exit 2 ;; esac
 P=$PERSON
 
 STATE_DIR="$ROOT/state"

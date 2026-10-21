@@ -220,9 +220,11 @@ class BackupTest(unittest.TestCase):
         self.assertFalse((self.root / "state" / "moni-backup.lock").exists())
 
     def test_all_backs_up_every_person_dir(self):
+        (self.root / "bin").mkdir()  # install.zsh puts the LaunchAgent's copy of the script here
         r = self.backup("--all")
         self.assertEqual(r.returncode, 0)
         self.assertTrue(self.status()["ok"])
+        self.assertFalse((self.root / "state" / "bin-backup.json").exists())
 
     def test_a_live_lock_skips_and_after_stop_waits_for_it(self):
         lock = self.root / "state" / "moni-backup.lock"
