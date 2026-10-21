@@ -1,10 +1,27 @@
 import type { MissionId, MissionRecordRef } from "@t3tools/contracts";
-import type { OwnerRequestMessage } from "@t3tools/client-runtime/ardud/missions";
+import {
+  looseDiscussions,
+  refLabel,
+  requestPreview,
+  type OwnerRequestMessage,
+} from "@t3tools/client-runtime/ardud/missions";
 import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { View } from "react-native";
 
-import { ActionButton, Bubble, DiscussionMark, LinkButton, SectionHead, TextField } from "./parts";
+import { useOwnerRequests } from "./missionsStore";
+import {
+  ActionButton,
+  Bubble,
+  DiscussionMark,
+  Group,
+  LinkButton,
+  Meta,
+  SectionHead,
+  Separator,
+  TextField,
+  Title,
+} from "./parts";
 import { useDiscussion } from "./recordLogic";
 
 /** A request's messages, oldest first: the owner's on the right. */
@@ -74,5 +91,40 @@ export function DiscussionPanel(props: {
         {props.open ? null : <ActionButton label="Close" onPress={() => setExpanded(false)} />}
       </View>
     </View>
+  );
+}
+
+/**
+ * Open discussions whose record has no card on the board (acked, superseded,
+ * aged out of the feed). It empties as the owner or the master settles each one.
+ */
+export function OpenDiscussions(props: {
+  readonly missionId: MissionId;
+  readonly shown: ReadonlyArray<Pick<MissionRecordRef, "kind" | "id">>;
+  readonly nowMs: number;
+}) {
+  const requests = useOwnerRequests(props.missionId);
+  const loose = requests ? looseDiscussions(requests, props.shown) : [];
+  if (loose.length === 0) return null;
+  return (
+    <>
+      <SectionHead className="pt-3" title={`Open discussions ${loose.length}`} />
+      <Group>
+        {loose.map((request, index) => (
+          <Fragment key={request.id}>
+            {index > 0 ? <Separator /> : null}
+            <View className="gap-2 px-3.5 py-3">
+              <Title>{refLabel(request.subject)}</Title>
+              <Meta numberOfLines={2}>{requestPreview(request)}</Meta>
+              <DiscussionPanel
+                missionId={props.missionId}
+                subject={request.subject}
+                nowMs={props.nowMs}
+              />
+            </View>
+          </Fragment>
+        ))}
+      </Group>
+    </>
   );
 }

@@ -8,6 +8,7 @@ import {
   groupRequests,
   isDiscussion,
   isRequestUnread,
+  looseDiscussions,
   openRequestInput,
   ownerConditionOf,
   requestAbout,
@@ -186,5 +187,45 @@ describe("owner requests", () => {
     expect(ownerConditionOf({ onOwnerCondition: condition })).toBe(condition);
     expect(ownerConditionOf({})).toBeNull();
     expect(ownerConditionOf({ onOwnerCondition: null })).toBeNull();
+  });
+
+  it("keeps an open discussion surfaced when its record has no card on screen", () => {
+    // Shapes of the two live discussions from 20 Oct: one on a note the owner
+    // acked, one on a note that aged out of Since you last looked.
+    const acked = request({
+      id: "request-d613679c",
+      subject: { kind: "note", id: "note-169d4966336968db", label: "Codex review spend…" },
+      unread: true,
+      updatedAt: "2026-10-20T22:28:59.149Z",
+    });
+    const agedOut = request({
+      id: "request-d505b6a1",
+      subject: { kind: "note", id: "note-283a7b04c68aa286", label: "Claude budget forecast…" },
+      updatedAt: "2026-10-20T22:49:24.937Z",
+    });
+    const settled = request({
+      id: "settled-talk",
+      status: "settled",
+      unread: true,
+      subject: { kind: "ask", id: "ask-1", label: "Old ask" },
+    });
+    const own = request({ id: "own-ask", status: "waiting" });
+    const requests = [own, settled, agedOut, acked];
+
+    expect(looseDiscussions(requests, []).map((item) => item.id)).toEqual([
+      "request-d613679c",
+      "request-d505b6a1",
+    ]);
+    expect(
+      looseDiscussions(requests, [{ kind: "note", id: "note-283a7b04c68aa286" }]).map(
+        (item) => item.id,
+      ),
+    ).toEqual(["request-d613679c"]);
+    expect(
+      looseDiscussions(requests, [{ kind: "ask", id: "note-169d4966336968db" }]).map(
+        (item) => item.id,
+      ),
+    ).toEqual(["request-d613679c", "request-d505b6a1"]);
+    expect(looseDiscussions([{ ...acked, status: "settled" }], [])).toEqual([]);
   });
 });

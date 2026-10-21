@@ -39,7 +39,7 @@ import { FoldButton, LoadingRows, SectionCount, SectionShell } from "./SectionSh
 const FIRST_CARDS = 3;
 
 /** Snoozing only moves what waits on the owner; Needs you shows these tabs. */
-const OWNER_WAITING_TABS = ["decide", "approve", "knocks"] as const;
+export const OWNER_WAITING_TABS = ["decide", "approve", "knocks"] as const;
 
 /** Cards for entries outside the inbox page, with their own selection and editors. */
 function useEntryCards(
