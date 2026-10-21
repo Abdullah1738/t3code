@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Access } from "../src/chats.ts";
 import { chatKey, type Line, type LineInbound } from "../src/line.ts";
 import { ChatRegistry, createSbApi, type ChatCore } from "../src/runtime.ts";
-import { handleInbound, type IngressDeps } from "../src/sb-ingress.ts";
+import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
 import { Store } from "../src/store.ts";
 
 const owner = "+15555550123";
@@ -147,6 +147,23 @@ describe("chat registry", () => {
     expect(await handleInbound(deps, message({ handle: "x-1", chat: chatKey.dm("+447000000009"), from: "+447000000009" }))).toBe(false);
     expect(chats.get(chatKey.dm("+447000000009"))).toBeUndefined();
     expect(notes).toHaveLength(1);
+  });
+
+  test("an id-only stream event pulls the full message from the message list", async () => {
+    const { registry, ownerStore, line } = setup();
+    const chats = registry();
+    const full = message({ handle: "h-live", text: "from the list" });
+    let listed = 0;
+    line.backfill = async () => { listed += 1; return listed === 1 ? [] : [full]; };
+    const controller = new AbortController();
+    line.events = async function* () {
+      // Sendblue's live stream carries only the message id for a received message.
+      yield { type: "message", id: "e1", message: { ...message({ handle: "h-live" }), from: "", text: "" } };
+      controller.abort();
+    };
+    const deps: IngressDeps = { line, owner, ownerStore, access: async () => access, now: () => 5_000, sink: chats.sink(async () => {}) };
+    await runIngress(deps, controller.signal);
+    expect(chats.owner.store.pendingInbound().map(row => [row.id, (row.payload as { text: string }).text])).toEqual([["h-live", "from the list"]]);
   });
 
   test("a disabled bridge accepts nothing", async () => {

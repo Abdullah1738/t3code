@@ -36,7 +36,7 @@ export type IngressDeps = {
 /** Handles one inbound message. Returns whether it was newly accepted. */
 export async function handleInbound(deps: IngressDeps, message: LineInbound): Promise<boolean> {
   // Sendblue reports our own sends on the same stream; they are never input.
-  if (message.from === deps.line.number) return false;
+  if (!message.from || message.from === deps.line.number) return false;
   const access = await deps.access();
   const decision = decide(access, deps.owner, message.chat, message.from, message.participants);
   if (!decision.allowed) {
@@ -76,6 +76,11 @@ export async function runIngress(deps: IngressDeps, signal: AbortSignal): Promis
       for await (const event of deps.line.events(signal)) {
         if (signal.aborted) break;
         if (event.type === "message") {
+          // The live stream sends only ids for a received message; the full row comes from the message list.
+          if (!event.message.from) {
+            await backfill(deps, now).catch(() => deps.log?.("ingress-backfill-failed"));
+            continue;
+          }
           await handleInbound(deps, event.message).catch(() => deps.log?.("ingress-message-failed"));
           advanceCursor(deps.ownerStore, event.message.sentAt);
         } else if (event.type === "typing") {

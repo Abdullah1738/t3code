@@ -56,7 +56,7 @@ export function toInbound(message: Json): LineInbound {
   const replyTo = isObject(message.reply_to) ? str(message.reply_to.message_handle) : undefined;
   const location = isObject(message.location) ? toLocation(message.location) : undefined;
   return {
-    handle: str(message.message_handle) ?? "",
+    handle: str(message.message_handle) ?? str(message.message_id) ?? "",
     chat: chatOf(message, true),
     from: str(message.from_number) ?? "",
     text: str(message.content) ?? "",
@@ -291,7 +291,7 @@ export class Sendblue implements Line {
         return {
           type: "status",
           id,
-          handle: str(data.message_handle) ?? "",
+          handle: str(data.message_handle) ?? str(data.message_id) ?? "",
           status: str(data.status) ?? "",
           errorCode: errorCodeOf(data),
           errorMessage: str(data.error_reason) ?? str(data.error_message),
