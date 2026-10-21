@@ -2,7 +2,10 @@ import { memo } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
 
-import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
+import {
+  threadRuntimeIsActive,
+  type EnvironmentThreadShell,
+} from "@t3tools/client-runtime/state/models";
 import {
   groupIMessageThreads,
   imessageChatKind,
@@ -30,18 +33,28 @@ function rowState(isActive: boolean) {
   return isActive ? "bg-sidebar-row-active font-medium" : "hover:bg-sidebar-row-hover";
 }
 
-/** Shared with the thread list filter: an iMessage thread is any thread whose path sits in the iMessage workspace. */
+/** An iMessage thread is any thread whose path sits in the iMessage workspace. */
 export const iMessageThreadInput = (thread: EnvironmentThreadShell) => ({
   id: thread.id,
   path: thread.worktreePath,
   title: thread.title,
+  createdAt: thread.createdAt,
   updatedAt: thread.updatedAt,
-  running: thread.runtime?.status === "running",
+  running: threadRuntimeIsActive(thread.runtime),
+  child: thread.lineage.relationshipToParent !== null,
 });
 
-/** The owner's chat is "Owner"; other chats show their slug as a name. */
-export function imessageChatLabel(slug: string): string {
-  if (imessageChatKind(slug) === "owner") return "Owner";
+// Owner threads are titled by session time; any other title is the chat's name.
+const SESSION_TITLE = /^iMessage \d{4}-\d{2}-\d{2}/;
+
+/**
+ * The owner's chat is "Abdullah". Other chats use the name the bridge titles their
+ * threads with, falling back to the slug written as a name.
+ */
+export function imessageChatLabel(slug: string, threadTitle?: string): string {
+  if (imessageChatKind(slug) === "owner") return "Abdullah";
+  const title = threadTitle?.trim();
+  if (title && !SESSION_TITLE.test(title)) return title;
   return slug
     .replace(/^group-/, "")
     .replace(/-[a-z0-9]{6}$/, "")
@@ -63,7 +76,12 @@ export function IMessageSidebarGroup() {
   );
   const unreadSlugs = new Set(
     chats
-      .filter((chat) => chat.threadIds.some((id) => hasUnseenCompletion(byId.get(id)!)))
+      .filter((chat) =>
+        chat.threadIds.some((id) => {
+          const thread = byId.get(id);
+          return thread !== undefined && hasUnseenCompletion(thread);
+        }),
+      )
       .map((chat) => chat.slug),
   );
 
@@ -114,7 +132,7 @@ const IMessageChatRow = memo(function IMessageChatRow(props: {
   onNavigate: () => void;
 }) {
   const { chat, isActive, unread, onNavigate } = props;
-  const label = imessageChatLabel(chat.slug);
+  const label = imessageChatLabel(chat.slug, chat.latestTitle);
   return (
     <li>
       <Link
@@ -128,6 +146,7 @@ const IMessageChatRow = memo(function IMessageChatRow(props: {
         <span className={cn("min-w-0 flex-1 truncate", chat.running && "font-medium")}>
           {label}
         </span>
+        {/* Static text on purpose: a pulsing indicator would repaint every frame. */}
         {chat.running ? (
           <span className="shrink-0 text-xs text-sidebar-muted-foreground">working</span>
         ) : null}
