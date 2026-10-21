@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -28,7 +29,11 @@ if __name__ == '__main__':
 
 ROOT = Path.home() / '.local/state/order-tracker'
 WATCHERS = Path.home() / '.local/share/robob-watch/watchers'
-MONI_CHAT_ID = '45'
+# Moni's texts go to her Robob thread on the assistant line, never Abdullah's own iMessage.
+BUN = '/Users/ardud/.bun/bin/bun'
+BRIDGE_CLI = '/Users/ardud/.local/share/spectrum-bridge/src/cli.ts'
+BRIDGE_DB = Path.home() / '.config/spectrum-bridge/state.sqlite'
+ROUTE_ID = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.-]{0,199}')
 NOTICE_FAILED_EXIT = 3
 DUBAI = dt.timezone(dt.timedelta(hours=4))
 STORE_NAMES = {'noon': 'noon', 'talabat': 'Talabat', 'careem': 'Careem', 'amazon': 'Amazon'}
@@ -164,10 +169,28 @@ def placement_text(cfg, result=None, store_name=None, now=None):
     return text + (f' ETA {eta}.' if eta else '')
 
 
+def bridge_route():
+    """The owner's live session on the assistant line, or None when it can't be read."""
+    db = Path(os.environ.get('SPECTRUM_BRIDGE_DB') or BRIDGE_DB)
+    try:
+        con = sqlite3.connect(f'{db.absolute().as_uri()}?mode=ro', uri=True, timeout=5)
+        try:
+            row = con.execute("select json_extract(value, '$.id') from kv where key = 'route'").fetchone()
+        finally:
+            con.close()
+    except (OSError, ValueError, RuntimeError, sqlite3.Error):
+        return None
+    route = row[0] if row else None
+    return route if isinstance(route, str) and ROUTE_ID.fullmatch(route) else None
+
+
 def notify_placement(path, args, result):
     """At most one placement text per order; state lives in the order config.
 
-    Locked and re-read so concurrent `add` calls for one order send once.
+    Locked and re-read so concurrent `add` calls for one order send once. The
+    text goes to Moni's Robob thread through the bridge, keyed per order; the
+    bridge never sends one key twice, so an unclear earlier send is retried
+    with the same key.
     """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with path.with_suffix('.notice.lock').open('a') as lock:
@@ -184,25 +207,46 @@ def notify_placement(path, args, result):
             cfg['placed_notice'] = {**notice, 'status': 'skipped', 'reason': 'caller_notified', 'at': stamp()}
             write(path, cfg)
             return 'skipped'
-        if notice.get('status') in ('attempting', 'ambiguous'):
-            # The earlier send may have gone out; never resend blind.
+        key = f'order-placed:{path.stem}'
+        retry = notice.get('status') in ('attempting', 'ambiguous')
+        if retry and (notice.get('channel') != 'bridge' or notice.get('key') != key):
+            # An earlier imsg-era send may have gone out and has no bridge key; never resend blind.
             return 'failed:ambiguous_check_imsg_history'
         if args.hold_placed_text:
             # Payment not confirmed yet: keep it pending for the paid re-add.
             return 'held:payment_unconfirmed'
-        text = args.placed_text or placement_text(cfg, result, args.store)
-        cfg['placed_notice'] = {'status': 'attempting', 'at': stamp(), 'text': text}
+        route = bridge_route()
+        if route is None:
+            return 'failed:bridge_no_route'
+        text = notice.get('text') if retry and notice.get('text') else (
+            args.placed_text or placement_text(cfg, result, args.store))
+        cfg['placed_notice'] = {**(notice if retry else {}), 'status': 'attempting', 'at': stamp(),
+                                'text': text, 'channel': 'bridge', 'key': key}
         write(path, cfg)
+        ack = {}
         try:
-            p = subprocess.run(['imsg', 'send', '--chat-id', MONI_CHAT_ID, '--text', text],
+            # --text=VALUE: the CLI's parser rejects a separate value that starts with "-".
+            p = subprocess.run([BUN, BRIDGE_CLI, 'send', '--to', 'moni', '--session', route, '--key', key, f'--text={text}'],
                                capture_output=True, text=True, timeout=20, env=store.clean_env())
-            # A nonzero exit can still follow a delivered message, so it is not retried.
-            outcome, status = ('sent', 'sent') if p.returncode == 0 else ('ambiguous', f'failed:imsg_exit_{p.returncode}')
+            if p.returncode == 0:
+                try:
+                    ack = json.loads(p.stdout or '')
+                except json.JSONDecodeError:
+                    ack = None
+                if isinstance(ack, dict) and isinstance(ack.get('id'), str) and isinstance(ack.get('created'), bool):
+                    outcome, status = 'sent', 'sent'
+                else:
+                    ack, (outcome, status) = {}, ('ambiguous', 'failed:bridge_bad_ack')
+            else:
+                # A failed request may still have been queued; the same key makes a retry safe.
+                outcome, status = 'ambiguous', f'failed:bridge_exit_{p.returncode}'
         except subprocess.TimeoutExpired:
-            outcome, status = 'ambiguous', 'failed:imsg_timeout'
+            outcome, status = 'ambiguous', 'failed:bridge_timeout'
         except OSError:
-            outcome, status = 'failed', 'failed:imsg_unavailable'
+            outcome, status = 'failed', 'failed:bridge_unavailable'
         cfg['placed_notice'].update(status=outcome, finished_at=stamp())
+        if outcome == 'sent':
+            cfg['placed_notice'].update(bridge_id=ack['id'], created=ack['created'])
         write(path, cfg)
         return status
 
@@ -908,7 +952,10 @@ def main(argv=None):
             write(path, cfg)
             store.reconcile(cfg)
             target = ('Reply in the owner iMessage session; ordinary wake reply reaches Abdullah.' if cfg['for'] == 'owner' else
-                      'Send only to Moni: imsg send --to +971585933213 --text TEXT. If may_have_completed or ambiguous, check imsg history --chat-id 45 before retrying. End owner turn NO_REPLY. '
+                      'Send only to Moni, in her Robob thread: `unset BUN_INSPECT; /Users/ardud/.bun/bin/bun '
+                      '/Users/ardud/.local/share/spectrum-bridge/src/cli.ts send --to moni --session <CURRENT_SESSION_ID> '
+                      f'--key {wid}-<event> --text="..."`. Never via imsg, never in the owner chat. '
+                      'A failed send may be retried with the same key (the bridge never sends a key twice). End owner turn NO_REPLY. '
                       'Her placement confirmation is handled at registration; never resend it.')
             context = (f'Owner requested automatic delivery updates to whoever ordered. {cfg["for"]} ordered {cfg["label"] or app}, order {args.order}. '
                        f'{target} Recipient wants arrival-only texts: delivered/at-door only, no nearby or progress texts. '
@@ -923,7 +970,7 @@ def main(argv=None):
             command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check', '--app', app, '--order', args.order])
             # add writes watcher.json, then primes one real check (robob-watch
             # caps it at 60s); that check's state supplies the ETA for Moni's
-            # text. add 80s + imsg 20s stays under the lanes' 125s budget, and a
+            # text. add 80s + bridge send 20s stays under the lanes' 125s budget, and a
             # slow or failed prime is retried on schedule once the watcher exists.
             try:
                 print(run(['robob-watch', 'add', '--id', wid, '--title', f'{app} {args.order} delivery ({cfg["for"]})',

@@ -2,10 +2,29 @@ import contextlib
 import datetime as dt
 import io
 import json
+import sqlite3
 import unittest
 import os as _os, tempfile as _tempfile
 # The live card-status record must never decide these tests.
 _os.environ['CARD_STATUS_FILE']=_os.path.join(_tempfile.mkdtemp(prefix='card-status-test-'),'card-status.json')
+# Nor may her live Robob thread: an empty bridge chat DB unless a test fills one.
+_BRIDGE_DIR = _tempfile.mkdtemp(prefix='moni-bridge-test-')
+
+
+def bridge_db(*rows, name='state.sqlite'):
+    path = _os.path.join(_BRIDGE_DIR, name)
+    if _os.path.exists(path):
+        _os.unlink(path)
+    con = sqlite3.connect(path)
+    con.execute('CREATE TABLE inbound (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL)')
+    for row_id, payload, state in rows:
+        con.execute('insert into inbound values (?, ?, ?)', (row_id, payload if isinstance(payload, str) else json.dumps(payload), state))
+    con.commit()
+    con.close()
+    return path
+
+
+_os.environ['MONI_BRIDGE_DB'] = bridge_db()
 from unittest.mock import Mock, patch
 
 import commerce_cli as c
@@ -227,6 +246,117 @@ def runner_at(minutes_ago):
     return msg('', minutes_ago)['created_at']
 
 
+def said(row_id, text, minutes_ago, *, sender='+971585933213', state='done'):
+    at = int((NOW - dt.timedelta(minutes=minutes_ago)).timestamp() * 1000)
+    return (row_id, {'id': row_id, 'text': text, 'isAudioMessage': False, 'attachments': [],
+                     'receivedAt': at, 'source': 'typed', 'sender': sender}, state)
+
+
+class BridgeSourceTests(unittest.TestCase):
+    def verify(self, go, *bridge_rows, chat=()):
+        path = bridge_db(*bridge_rows, name='case.sqlite')
+        return moni_go.verify(go, now=NOW, runner=history(*chat), bridge=lambda: moni_go.read_bridge(path))
+
+    def test_go_found_only_in_her_robob_thread(self):
+        got = self.verify('yes order it', said('AB-1', 'yes order it pls', 4, state='batched'))
+        self.assertEqual(got, {'message_id': 'bridge:AB-1', 'at': runner_at(4).replace('Z', '+00:00'),
+                               'text': 'yes order it pls'})
+
+    def test_go_in_bridge_then_cancel_in_chat_45_refuses(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO') as err:
+            self.verify('yes order it', said('AB-1', 'yes order it', 6), chat=[msg('pls leave it', 3, mid=900)])
+        self.assertEqual((err.exception.go['message_id'], err.exception.cancelled_by['message_id']), ('bridge:AB-1', 900))
+
+    def test_go_in_chat_45_then_cancel_in_bridge_refuses(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO') as err:
+            self.verify('yes order it', said('AB-2', 'nvm', 2, state='processing'), chat=[msg('yes order it', 6, mid=900)])
+        self.assertEqual(err.exception.cancelled_by['message_id'], 'bridge:AB-2')
+
+    def test_cancel_before_the_go_across_sources_does_not_count(self):
+        got = self.verify('yes order it', said('AB-1', 'nvm', 9), chat=[msg('yes order it', 4, mid=900)])
+        self.assertEqual(got['message_id'], 900)
+
+    def test_other_senders_and_machine_rows_do_not_count(self):
+        rows = (said('AB-1', 'yes order it', 4, sender='+971500000000'),
+                ('wake:1', {'id': 'wake:1', 'text': 'yes order it', 'receivedAt': 1, 'attachments': [], 'isAudioMessage': False}, 'done'))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('yes order it', *rows)
+
+    def test_a_tapback_never_starts_an_order_but_can_call_it_off(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('yes order it', said('AB-1', 'Loved \u201cyes order it?\u201d', 3))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it', said('AB-1', 'yes order it', 6), said('AB-2', 'Liked "ok I will cancel it"', 3))
+
+    def test_missing_or_broken_bridge_db_is_unverifiable(self):
+        missing = _os.path.join(_BRIDGE_DIR, 'nope', 'state.sqlite')
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            moni_go.verify('yes order it', now=NOW, runner=history(msg('yes order it', 3)),
+                           bridge=lambda: moni_go.read_bridge(missing))
+        self.assertFalse(_os.path.exists(missing))
+        for bad in ('not json', '[1]'):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+                self.verify('yes order it', ('AB-9', bad, 'done'), chat=[msg('yes order it', 3)])
+
+    def test_a_bridge_row_without_a_readable_time_is_unverifiable(self):
+        for at in (None, 'soon', True):
+            row = said('AB-2', 'nvm', 2)
+            row[1]['receivedAt'] = at
+            with self.subTest(at=at), self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+                self.verify('yes order it', said('AB-1', 'yes order it', 4), row)
+
+    def test_a_cancel_from_her_other_address_counts_but_never_starts_an_order(self):
+        email = 'moni@example.com'
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it', said('AB-1', 'yes order it', 6), said('AB-2', 'nvm', 3, sender=email))
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('yes order it', said('AB-1', 'yes order it', 6, sender=email))
+
+    def test_a_voice_note_after_the_go_is_unverifiable(self):
+        voice = said('AB-2', '', 3)
+        voice[1]['isAudioMessage'] = True
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_UNVERIFIABLE'):
+            self.verify('yes order it', said('AB-1', 'yes order it', 6), voice)
+        before = said('AB-0', '', 9)
+        before[1]['isAudioMessage'] = True
+        self.assertEqual(self.verify('yes order it', before, said('AB-1', 'yes order it', 6))['message_id'], 'bridge:AB-1')
+
+    def test_a_cancel_at_the_same_second_as_the_go_wins_across_sources(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it', said('AB-1', 'nvm', 4), chat=[msg('yes order it', 4, mid=900)])
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('yes order it', said('AB-1', 'yes order it', 4), chat=[msg('nvm', 4, mid=900)])
+
+    def test_a_chat_45_cancel_before_a_bridge_go_refuses(self):
+        # Bridge times are when it stored her message, which can lag her send by any amount,
+        # so a chat 45 cancel anywhere before a bridge go in the window counts.
+        for minutes in (10, 25, 44):
+            with self.subTest(minutes=minutes), self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+                self.verify('yes order it', said('AB-1', 'yes order it', 4), chat=[msg('nvm', minutes, mid=900)])
+        # Outside the window it doesn't count.
+        self.assertEqual(self.verify('yes order it', said('AB-1', 'yes order it', 4),
+                                     chat=[msg('nvm', 60, mid=900)])['message_id'], 'bridge:AB-1')
+
+    def test_a_later_chat_45_go_cannot_hide_a_cancel_before_a_bridge_go(self):
+        # Chat 45 alone: "ok psl", "nvm", "ok psl" refuses, since a short go can't restart it.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('ok psl', said('AB-1', 'ok psl', 30), chat=[msg('nvm', 35, mid=900), msg('ok psl', 28, mid=901)])
+        # Two bridge gos: the later one can't move the check off the first.
+        with self.assertRaisesRegex(RuntimeError, 'MONI_CANCELLED_AFTER_GO'):
+            self.verify('ok psl', said('AB-1', 'ok psl', 30), said('AB-2', 'ok psl', 5), chat=[msg('nvm', 35, mid=900)])
+
+    def test_old_bridge_messages_are_outside_the_window(self):
+        with self.assertRaisesRegex(RuntimeError, 'MONI_GO_NOT_FOUND'):
+            self.verify('yes order it', said('AB-1', 'yes order it', 60))
+
+    def test_reads_the_env_db_read_only(self):
+        path = bridge_db(said('AB-1', 'yes order it', 3), name='env.sqlite')
+        before = _os.stat(path).st_mtime_ns
+        with patch.dict(_os.environ, {'MONI_BRIDGE_DB': path}):
+            self.assertEqual(moni_go.verify('yes order it', now=NOW, runner=history())['message_id'], 'bridge:AB-1')
+        self.assertEqual(_os.stat(path).st_mtime_ns, before)
+
+
 class CheckCommandTests(unittest.TestCase):
     def run_check(self, runner, go='yes order it'):
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -257,6 +387,18 @@ class CheckCommandTests(unittest.TestCase):
         runner.assert_called_once()
         self.assertEqual(runner.call_args.args[0][:2], ['imsg', 'history'])
 
+    def test_check_reads_her_robob_thread_too(self):
+        path = bridge_db(said('AB-1', 'yes order it', 5), said('AB-2', 'forget it', 2), name='check.sqlite')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = moni_go.main(['check', '--go', 'yes order it'], runner=history(), now=NOW,
+                                bridge=lambda: moni_go.read_bridge(path))
+        out = json.loads(out.getvalue())
+        self.assertEqual((code, out['error'], out['cancelled_by']['message_id']), (4, 'MONI_CANCELLED_AFTER_GO', 'bridge:AB-2'))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = moni_go.main(['check', '--go', 'yes order it'], runner=history(msg('yes order it', 3)), now=NOW,
+                                bridge=lambda: None)
+        self.assertEqual((code, json.loads(out.getvalue())['error']), (2, 'MONI_GO_UNVERIFIABLE'))
+
 
 class CliGateTests(unittest.TestCase):
     def run_cli(self, argv):
@@ -270,6 +412,16 @@ class CliGateTests(unittest.TestCase):
             code, out = self.run_cli(['order', 'talabat', '--branch', '1', '--item', '2', '--for', 'moni'])
         self.assertEqual(code, 1)
         self.assertEqual(out['error'], 'MONI_GO_REQUIRED')
+        purchase.assert_not_called()
+
+    def test_moni_order_is_refused_when_her_robob_thread_is_unreadable(self):
+        missing = _os.path.join(_BRIDGE_DIR, 'gone', 'state.sqlite')
+        with patch.object(c, 'purchase_talabat') as purchase, \
+                patch.dict(_os.environ, {'MONI_BRIDGE_DB': missing}), \
+                patch.object(moni_go, 'read_history', return_value=[msg('yes order it', 3)]):
+            code, out = self.run_cli(['order', 'talabat', '--branch', '1', '--item', '2', '--for', 'moni',
+                                      '--moni-go', 'yes order it'])
+        self.assertEqual((code, out['error'], out['financial_retry']), (1, 'MONI_GO_UNVERIFIABLE', False))
         purchase.assert_not_called()
 
     def test_moni_order_with_unmatched_go_is_refused(self):
