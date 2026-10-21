@@ -151,13 +151,55 @@ describe("transport shim", () => {
     expect(line.sent[0]!.text).toBe("Pick\n1. Yes\n2. No");
   });
 
-  test("typing false is not sent, typing true is", async () => {
-    const calls: boolean[] = [];
-    const line = fakeLine({ typing: async () => { calls.push(true); } });
+  test("typing starts with a 60 s bubble and stops explicitly", async () => {
+    const calls: unknown[] = [];
+    const line = fakeLine({ typing: async (chat, options) => { calls.push([chat, options]); } });
     const transport = sbTransport(line, chatKey.dm(owner), store());
-    await transport.typing("x", false);
     await transport.typing("x", true);
-    expect(calls).toEqual([true]);
+    await transport.typing("x", false);
+    expect(calls).toEqual([
+      [chatKey.dm(owner), { state: "start", maxDurationMs: 60_000 }],
+      [chatKey.dm(owner), { state: "stop" }],
+    ]);
+  });
+
+  test("a message we send re-arms typing while it is on, and only then", async () => {
+    const calls: string[] = [];
+    const line = fakeLine({ typing: async (_chat, options) => { calls.push(options?.state ?? "legacy"); } });
+    const transport = sbTransport(line, chatKey.dm(owner), store());
+    await transport.sendText({ id: "a", chatGuid: "x", text: "before" });
+    await transport.typing("x", true);
+    await transport.sendText({ id: "b", chatGuid: "x", text: "progress" });
+    await transport.sendApp({ id: "c", chatGuid: "x", url: "https://example.com", caption: "Card" });
+    // A duplicate never went out, so the bubble is still showing.
+    await transport.sendText({ id: "b", chatGuid: "x", text: "progress" });
+    await transport.typing("x", false);
+    await transport.sendText({ id: "d", chatGuid: "x", text: "final" });
+    expect(calls).toEqual(["start", "start", "start", "stop"]);
+  });
+
+  test("a slow re-arm never lands after the stop", async () => {
+    const calls: string[] = [];
+    let release = () => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let first = true;
+    const line = fakeLine({ typing: async (_chat, options) => {
+      if (first) { first = false; await gate; }
+      calls.push(options?.state ?? "legacy");
+    } });
+    const transport = sbTransport(line, chatKey.dm(owner), store());
+    const started = transport.typing("x", true);
+    await transport.sendText({ id: "a", chatGuid: "x", text: "progress" });
+    const stopped = transport.typing("x", false);
+    release();
+    await Promise.all([started, stopped]);
+    expect(calls).toEqual(["start", "start", "stop"]);
+  });
+
+  test("typing failures surface as transport errors with the line code", async () => {
+    const line = fakeLine({ typing: async () => { throw new LineError("x", "http_503:worker_unavailable", true, false); } });
+    const transport = sbTransport(line, chatKey.dm(owner), store());
+    await expect(transport.typing("x", true)).rejects.toMatchObject({ code: "http_503:worker_unavailable" });
   });
 });
 

@@ -20,22 +20,27 @@ export type SbApiDeps = {
 
 export type SbApiResult = { status: number; body: unknown };
 
-export async function locationRequest(deps: SbApiDeps, sessionId: string): Promise<SbApiResult> {
-  const chat = deps.chatForSession(sessionId);
+/** target: another chat the owner's agent picked with --chat; otherwise the calling chat. */
+export async function locationRequest(deps: SbApiDeps, sessionId: string, target?: ChatInfo): Promise<SbApiResult> {
+  const chat = target ?? deps.chatForSession(sessionId);
   if (!chat) return { status: 409, body: { error: "No chat for this session" } };
-  if (chat.kind !== "dm") return { status: 400, body: { error: "Location requests are for 1:1 chats" } };
+  if (chat.kind === "group") return { status: 400, body: { error: "Location requests are for 1:1 chats" } };
   await deps.line.requestLocation(chat.key);
   return { status: 202, body: { requested: true } };
 }
 
-/** Latest shared location for the chat's person, or "none". */
-export async function location(deps: SbApiDeps, sessionId: string): Promise<SbApiResult> {
-  const chat = deps.chatForSession(sessionId);
+/** Latest shared location for the chat's person, or "none" with Sendblue's sharing state when it says why. */
+export async function location(deps: SbApiDeps, sessionId: string, target?: ChatInfo): Promise<SbApiResult> {
+  const chat = target ?? deps.chatForSession(sessionId);
   if (!chat) return { status: 409, body: { error: "No chat for this session" } };
-  if (chat.kind !== "dm") return { status: 400, body: { error: "Locations are for 1:1 chats" } };
-  const address = chatKey.target(chat.key);
-  const fix = await deps.line.location(address);
-  return { status: 200, body: fix ? { latitude: fix.latitude, longitude: fix.longitude, accuracy: fix.accuracy, at: fix.at } : { location: "none" } };
+  if (chat.kind === "group") return { status: 400, body: { error: "Locations are for 1:1 chats" } };
+  const fix = await deps.line.location(chatKey.target(chat.key));
+  if (!fix) return { status: 200, body: { location: "none" } };
+  if ("state" in fix) {
+    const note = fix.state === "not_shared" ? "They are not sharing their location with this number." : "They share their location, but no fix has arrived yet.";
+    return { status: 200, body: { location: "none", state: fix.state, note } };
+  }
+  return { status: 200, body: { latitude: fix.latitude, longitude: fix.longitude, accuracy: fix.accuracy, at: fix.at } };
 }
 
 /** Guests asking the owner something: the question lands in the owner chat as a wake, prefixed with the source chat. */

@@ -9,6 +9,8 @@ import { TransportError, type NormalizedInbound } from "./photon.ts";
 import type { Store } from "./store.ts";
 
 const RESEND_LOOKBACK_MS = 60_000;
+/** A start outlives a crashed bridge by at most this long; the router refreshes well inside it. */
+export const TYPING_MAX_MS = 60_000;
 
 export function classifyLineFailure(error: unknown): TransportError {
   if (error instanceof LineError) return new TransportError(error.code, error.retryable, error.uncertain);
@@ -23,11 +25,23 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
   };
   const sentKey = (id: string) => `sent:${id}`;
   const attemptKey = (id: string) => `sent-attempt:${id}`;
+  // One queue keeps a re-arm after a send from landing after the turn's stop.
+  let typingOn = false;
+  let typingQueue: Promise<unknown> = Promise.resolve();
+  const typingCall = (active: boolean): Promise<void> => {
+    const run = typingQueue.then(() => line.typing(chat, active
+      ? { state: "start", maxDurationMs: TYPING_MAX_MS }
+      : { state: "stop" }));
+    typingQueue = run.catch(() => {});
+    return wrap(() => run);
+  };
+  // Our own message clears the bubble on the recipient's phone, so put it back while the turn runs.
+  const rearm = () => { if (typingOn) void typingCall(true).catch(() => {}); };
 
   return {
-    /** Sendblue's typing bubble expires on its own; a false is not sent. */
     async typing(_chatGuid: string, active: boolean): Promise<void> {
-      if (active) await wrap(() => line.typing(chat));
+      typingOn = active;
+      await typingCall(active);
     },
     async read(_chatGuid: string): Promise<void> {
       await wrap(() => line.read(chat));
@@ -61,6 +75,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       store.set(attemptKey(input.id), attemptStart);
       const sent = await wrap(() => line.sendText(chat, input.text, input.replyTo ? { replyTo: input.replyTo } : undefined));
       store.set(sentKey(input.id), { handle: sent.handle });
+      rearm();
       return { providerId: sent.handle };
     },
     async uploadAttachment(input: { id: string; data: Uint8Array; name: string; mimeType: string }): Promise<{ guid: string }> {
@@ -73,6 +88,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
         mediaUrl: input.attachmentGuid, ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       }));
       store.set(sentKey(input.id), { handle: sent.handle });
+      rearm();
       return { providerId: sent.handle };
     },
     async sendApp(input: { id: string; chatGuid: string } & LineAppCard): Promise<{ providerId?: string; duplicate?: boolean }> {
@@ -81,6 +97,7 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
       const { id: _id, chatGuid: _chat, ...card } = input;
       const sent = await wrap(() => line.sendApp(chat, card));
       store.set(sentKey(input.id), { handle: sent.handle });
+      rearm();
       return { providerId: sent.handle };
     },
     /** Polls are unsupported on Sendblue; the title and numbered options go out as plain text. */

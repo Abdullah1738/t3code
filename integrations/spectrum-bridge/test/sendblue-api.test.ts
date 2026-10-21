@@ -44,6 +44,32 @@ describe("location routes", () => {
   test("an unknown session is a 409", async () => {
     expect((await location(deps(), "ses-nobody")).status).toBe(409);
   });
+
+  test("the owner's own chat can request and read its location; groups cannot", async () => {
+    const asked: string[] = [];
+    const d = deps({ line: {
+      requestLocation: async (chat: string) => { asked.push(chat); },
+      location: async (address: string) => { asked.push(address); return { latitude: 1, longitude: 2 }; },
+    } as unknown as Line });
+    expect((await locationRequest(d, "ses-owner")).status).toBe(202);
+    expect((await location(d, "ses-owner")).body).toMatchObject({ latitude: 1, longitude: 2 });
+    expect((await location(d, "ses-family")).status).toBe(400);
+    expect(asked).toEqual([chatKey.dm("+15555550123"), "+15555550123"]);
+  });
+
+  test("an explicit target chat wins over the calling chat", async () => {
+    const d = deps();
+    expect((await locationRequest(d, "ses-owner", moni)).status).toBe(202);
+    expect(d.requested).toEqual([moni.key]);
+    expect((await locationRequest(d, "ses-owner", family)).status).toBe(400);
+  });
+
+  test("no fix reports whether the person shares at all", async () => {
+    const d = deps({ line: { location: async () => ({ state: "not_shared" }) } as unknown as Line });
+    expect((await location(d, "ses-moni")).body).toMatchObject({ location: "none", state: "not_shared" });
+    const e = deps({ line: { location: async () => undefined } as unknown as Line });
+    expect((await location(e, "ses-moni")).body).toEqual({ location: "none" });
+  });
 });
 
 describe("ask-owner", () => {

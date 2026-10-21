@@ -136,7 +136,11 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   if (chat.kind !== "owner") lines.push("Permissions: the owner is the only person who approves special requests. Admins (Moni) can ask for the same things the owner can, through the same assistant and memory; keep her existing rules in ~/Documents/assistant/moni-prefs.md. Moni isn't technical: work out what she actually wants and choose the right way yourself (for example the wa CLI, not logging into WhatsApp Web) instead of following her steps literally. If she is rude to you, stop replying to her until she apologizes. Logins, sign-ups or account actions for her own accounts, her files and anything you build or track for her run only on her own offbox through the offbox-person skill, never on this Mac, Dia, the owner's Keychain, card-vault or the owner's accounts. Notes and facts about her (preferences, routines, health, documents) go in the life wiki as usual. Guests can ask questions and chat. Anything special (orders, bookings, payments, messages to others, account or file actions, anything that spends money, anything about the owner's or Moni's private data) needs the owner's approval: run `bun <cli> ask-owner --session CURRENT_SESSION_ID --key UNIQUE_KEY --text \"<who wants what>\"`, tell them you've asked, and act only after a wake that says the owner approved.");
   if (chat.kind === "group") lines.push("This is a group: respond to the people here, but be less permissive than in a direct chat. Reply only when addressed or clearly useful, otherwise reply exactly NO_REPLY.");
   lines.push("Reactions: you don't have to respond to everything. A tapback (`react --kind like` or an emoji) plus NO_REPLY is a complete answer when words add nothing.");
-  lines.push("Location: for rides or nearby results for the person in this chat, ask with `location-request --session CURRENT_SESSION_ID --key UNIQUE_KEY`; their share arrives as a [Shared location] message, or read the latest with `location --session CURRENT_SESSION_ID`. Prefer this over Find My for non-owner chats; for the owner, try this before Find My.");
+  if (chat.kind === "group") lines.push("Location: not available in groups; ask the person to message this number directly.");
+  else {
+    const other = chat.kind === "owner" ? " (add `--chat moni` for Moni's)" : "";
+    lines.push(`Location, only for pickups, "where am I/is she", nearby results, ETAs and live location: run \`location --session CURRENT_SESSION_ID\`${other} for the latest share. If nothing is shared, run \`location-request --session CURRENT_SESSION_ID --key UNIQUE_KEY\`${other ? " (same `--chat`)" : ""}, say you've asked, and wait for the [Shared location] message. Never use Find My.`);
+  }
   lines.push("Files: images attach natively; other files (voice notes, PDFs, docs) are saved at the quoted paths. If you can't read them directly, work on them with tools (transcribe, extract text, convert).");
   lines.push("Polls are not available on this line; ask in text. App cards still work (`app`).");
   if (chat.kind === "owner") lines.push("Other chats: `chats --session CURRENT_SESSION_ID` lists them; `send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` messages one; `wake --chat <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` passes the owner's decision to that chat's assistant. `allow --address A --name N [--admin]` and `allow-group --id G [--name N]` add people or groups when the owner asks.");
@@ -162,6 +166,8 @@ const MAX_SUBAGENT_DEPTH = 32;
 const REQUEST_TURN_GRACE = 15_000;
 /** Sendblue mode: quiet time after the latest member before a batch is answered. */
 const SENDBLUE_QUIET_MS = 2_000;
+/** Sendblue mode: how often our typing bubble is renewed while a turn runs; each start lasts 60 s. */
+const SENDBLUE_TYPING_REFRESH_MS = 20_000;
 /** Sendblue mode: a typing sender holds the batch back, but never past this from its oldest member. */
 const SENDBLUE_TYPING_CAP_MS = 90_000;
 /**
@@ -188,6 +194,11 @@ function undeliveredNote(attachment: NormalizedInbound["attachments"][number], d
 }
 /** Rows the bridge injects itself (secure-form notices, watcher wakes, reset nudges): never owner text, never a provider message. */
 const synthetic = (id: string) => id.startsWith("secret:") || id.startsWith("wake:") || id.startsWith("reset:");
+/** A log-safe code for a failed typing call: the transport's code, a timeout, or nothing specific. */
+function typingFailure(error: unknown): string {
+  if (error instanceof TransportError && /^[A-Za-z0-9_:.-]{1,60}$/.test(error.code)) return error.code;
+  return error instanceof Error && error.message === "Router request timed out" ? "timeout" : "operationFailed";
+}
 /** A nudge asking the agent to reset its own context. Always sent alone, and dropped silently if it can't be. */
 const resetRow = (id: string) => id.startsWith("reset:");
 /**
@@ -356,6 +367,8 @@ export class Router {
   private typingActive = false;
   private typingAt = 0;
   private watchedAt = 0;
+  /** Sendblue mode: queued rows already marked read, so each is marked once rather than every tick. */
+  private readIds = new Set<string>();
 
   constructor(
     private readonly store: Store,
@@ -559,6 +572,8 @@ export class Router {
         if (row.state === "processing") this.unsealBatch(row.id);
       }
       const rows = this.store.pendingInbound();
+      const sendblue = this.options.context !== undefined;
+      if (sendblue) await this.markRead(rows);
       const preceding = new Set<string>();
       // Do not wait for a conversational turn before consuming controls and answers.
       for (const row of rows) {
@@ -579,15 +594,18 @@ export class Router {
       const next = this.sealBatch(preceding);
       if (next) await this.submit(next, preceding);
       // Transport hints are best effort and never part of prompt acceptance.
-      if (rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
+      if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
       completed = true;
     } finally {
       let active = false;
       try {
         const turn = this.store.get<Turn | null>("activeTurn");
+        const sendblue = this.options.context !== undefined;
+        // Sendblue shows typing from the moment a batch is taken, so a prompt still being accepted counts.
+        const working = sendblue ? turn?.phase !== undefined && turn.phase !== "failed" : turn?.phase === "running";
         // A reset nudge is bookkeeping, not an answer the owner is waiting on.
-        active = completed && turn?.phase === "running" && !turn.background && this.current(turn)
-          && !(turn.inboundId && resetRow(turn.inboundId))
+        active = completed && working && !!turn && !turn.background && this.current(turn)
+          && !(turn.inboundId && (sendblue ? !this.typingFor(turn.inboundId) : resetRow(turn.inboundId)))
           && !this.pending().some(p => p.state !== "expired" && p.state !== "answered");
       } finally {
         await this.updateTyping(active);
@@ -685,12 +703,42 @@ export class Router {
     }).immediate();
   }
 
-  private async updateTyping(active: boolean): Promise<void> {
+  /**
+   * Sendblue: Photon's markRead was a cheap local hint, but here each one is an API call that
+   * can also clear our typing bubble, so every queued row is marked once and typing is re-armed.
+   */
+  private async markRead(rows: readonly InboundRecord[]): Promise<void> {
+    if (!rows.length) {
+      this.readIds.clear();
+      return;
+    }
+    const unread = rows.some(row => !synthetic(row.id) && !this.readIds.has(row.id));
+    for (const row of rows) this.readIds.add(row.id);
+    if (!unread) return;
+    await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
+    if (this.typingActive) this.typingAt = 0;
+  }
+
+  /** Sendblue: typing is for people waiting on an answer in a 1:1 chat, never for bridge rows. */
+  private typingFor(inboundId: string): boolean {
+    return this.options.context !== undefined && this.options.context.chat.kind !== "group" && !synthetic(inboundId);
+  }
+
+  private async updateTyping(active: boolean, force = false): Promise<void> {
+    const sendblue = this.options.context !== undefined;
     const now = Date.now();
-    if (active === this.typingActive && (!active || now - this.typingAt < 8_000)) return;
+    const refresh = sendblue ? SENDBLUE_TYPING_REFRESH_MS : 8_000;
+    if (!force && active === this.typingActive && (!active || now - this.typingAt < refresh)) return;
+    const changed = active !== this.typingActive;
     this.typingActive = active;
     this.typingAt = now;
-    try { await bounded(this.transport.typing(this.options.chatGuid, active)); } catch { /* Best effort. */ }
+    try {
+      await bounded(this.transport.typing(this.options.chatGuid, active));
+      if (sendblue && changed) this.options.log?.(active ? "typing-started" : "typing-stopped");
+    } catch (error) {
+      // Best effort, but a silent failure here is what hid the missing bubble once.
+      if (sendblue) this.options.log?.(active ? "typing-start-failed" : "typing-stop-failed", typingFailure(error));
+    }
   }
 
   private async control(row: InboundRecord, input: NormalizedInbound, preceding: Set<string>): Promise<void> {
@@ -1192,6 +1240,7 @@ export class Router {
         || this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state !== "processing";
     };
     if (interrupted()) return;
+    if (this.typingFor(row.id)) await this.updateTyping(true);
     let text = input.text.trim();
     const explicit = /^\/(notification|context)\s+(\S+)\s+([\s\S]+)$/.exec(text);
     let reference: OutboxRecord | TelegramReference | undefined
@@ -1487,6 +1536,8 @@ export class Router {
     if (eyes && !this.store.get<boolean>(`eyes:${row.id}`)) {
       this.store.set(`eyes:${row.id}`, true);
       await bounded(context.react(input.id, "👀")).catch(() => this.options.log?.("eyes-reaction-failed"));
+      // A tapback is an outbound message too, and it ends the bubble on the recipient's phone.
+      if (this.typingActive) await this.updateTyping(true, true);
     }
     const preferences = await imessagePreferences(this.options.openCodeConfigRoot);
     const guidance = preferences.prompt ?? imessageGuidance({ appsRoot: this.options.appsRoot });

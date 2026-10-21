@@ -201,7 +201,45 @@ test("location returns the shared fix only when the contact is sharing", async (
   const fix = await client.location("+15550001");
   expect(fix).toMatchObject({ latitude: 25, longitude: 55, accuracy: 10 });
   expect(fake.calls[0]!.url.searchParams.get("from_number")).toBe(LINE);
-  expect(await client.location("+15550002")).toBeUndefined();
+  expect(await client.location("+15550002")).toEqual({ state: "not_shared" });
+});
+
+test("location says when sharing is on but no real fix has arrived", async () => {
+  const fake = fakeFetch((call) => call.url.pathname.endsWith("/%2B15550001")
+    ? json(200, { state: "shared_no_fix_yet" })
+    // Sendblue drops lat/lon for a 0,0 placeholder fix.
+    : call.url.pathname.endsWith("/%2B15550002") ? json(200, { state: "shared_with_fix", location: { accuracy: 0 } })
+    : json(404, { error: "not found" }));
+  const client = makeClient(fake.fetch);
+  expect(await client.location("+15550001")).toEqual({ state: "shared_no_fix_yet" });
+  expect(await client.location("+15550002")).toEqual({ state: "shared_no_fix_yet" });
+  expect(await client.location("+15550003")).toBeUndefined();
+});
+
+test("typing sends start/stop and a duration, and falls back to a legacy start on old worker firmware", async () => {
+  let firmware = "v2";
+  const fake = fakeFetch((call) => firmware === "old" && call.body && typeof call.body === "object" && Object.keys(call.body).length > 2
+    ? json(503, { error: "Worker firmware does not yet support typing-v2" })
+    : json(200, { status: "SENT" }));
+  const client = makeClient(fake.fetch);
+
+  await client.typing("dm:+15550001", { state: "start", maxDurationMs: 60_000 });
+  await client.typing("dm:+15550001", { state: "stop" });
+  expect(fake.calls.map(call => call.body)).toEqual([
+    { number: "+15550001", from_number: LINE, state: "start", max_duration_ms: 60_000 },
+    { number: "+15550001", from_number: LINE, state: "stop" },
+  ]);
+
+  firmware = "old";
+  await client.typing("dm:+15550001", { state: "start", maxDurationMs: 60_000 });
+  expect(fake.calls.slice(2).map(call => call.body)).toEqual([
+    { number: "+15550001", from_number: LINE, state: "start", max_duration_ms: 60_000 },
+    { number: "+15550001", from_number: LINE },
+  ]);
+  // A stop has no legacy form; the bubble times out on its own.
+  await expect(client.typing("dm:+15550001", { state: "stop" })).rejects.toMatchObject({ code: expect.stringMatching(/^http_503/) });
+  await client.typing("group:grp9", { state: "start", maxDurationMs: 60_000 });
+  expect(fake.calls).toHaveLength(5);
 });
 
 test("backfill pages through updated messages and keeps inbound rows for our line", async () => {

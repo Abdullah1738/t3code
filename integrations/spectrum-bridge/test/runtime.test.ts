@@ -278,6 +278,20 @@ describe("Sendblue socket API", () => {
     expect((await post("/location", { sessionId: "ses_gone" })).status).toBe(409);
   });
 
+  test("the owner chat asks for its own location or, with --chat, someone else's", async () => {
+    const { post, line } = api();
+    expect((await post("/location-request", { dedupeKey: "o1", sessionId: "ses_owner" })).status).toBe(202);
+    expect((await post("/location-request", { dedupeKey: "o2", sessionId: "ses_owner", chat: "moni" })).status).toBe(202);
+    expect((await post("/location-request", { dedupeKey: "o2", sessionId: "ses_owner", chat: "moni" })).status).toBe(200);
+    expect(line.locationRequests).toEqual([chatKey.dm(owner), chatKey.dm(moni)]);
+    expect((await post("/location", { sessionId: "ses_owner", chat: "moni" })).body).toEqual({ location: "none" });
+    expect((await post("/location", { sessionId: "ses_owner", chat: "nobody" })).status).toBe(404);
+    // Only the owner's agent may look up another chat.
+    expect((await post("/location", { sessionId: "ses_moni", chat: "owner" })).status).toBe(403);
+    expect((await post("/location-request", { dedupeKey: "m9", sessionId: "ses_moni", chat: "owner" })).status).toBe(403);
+    expect(line.locationRequests).toHaveLength(2);
+  });
+
   test("a bridge that is not ready refuses sends but still lists chats", async () => {
     const { post } = api(false);
     expect((await post("/send", { text: "x", to: "moni", dedupeKey: "k", sessionId: "ses_owner" })).status).toBe(503);

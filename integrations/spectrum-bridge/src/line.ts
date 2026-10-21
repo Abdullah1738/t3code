@@ -16,6 +16,12 @@ export type LineLocation = {
   at?: number;
 };
 
+/** The person is not sharing with the line, or shares but has no fix yet. */
+export type LineNoFix = { state: "not_shared" | "shared_no_fix_yet" };
+
+/** maxDurationMs: how long a start lasts unless refreshed or stopped (Sendblue: 1..300000). */
+export type TypingOptions = { state?: "start" | "stop"; maxDurationMs?: number };
+
 export type LineInbound = {
   /** Sendblue message_handle. */
   handle: string;
@@ -78,14 +84,14 @@ export interface Line {
   sendApp(chat: ChatKey, card: LineAppCard): Promise<{ handle: string }>;
   /** Tapback name (love, like, dislike, laugh, emphasize, question) or a single emoji. Inbound messages only. */
   react(handle: string, reaction: string): Promise<void>;
-  /** Shows our typing bubble. 1:1 only; a no-op for groups. */
-  typing(chat: ChatKey): Promise<void>;
+  /** Shows (default) or clears our typing bubble. 1:1 only; a no-op for groups. */
+  typing(chat: ChatKey, options?: TypingOptions): Promise<void>;
   /** Marks the chat read. 1:1 only; a no-op for groups. */
   read(chat: ChatKey): Promise<void>;
   /** Sends a Find My location request card. */
   requestLocation(chat: ChatKey): Promise<void>;
-  /** Latest shared location for a person, if they share it with the line. */
-  location(address: string): Promise<LineLocation | undefined>;
+  /** Latest shared location for a person; a LineNoFix says why there is none, undefined if unknown. */
+  location(address: string): Promise<LineLocation | LineNoFix | undefined>;
   download(url: string, maxBytes: number, timeoutMs: number): Promise<LineFile>;
 }
 

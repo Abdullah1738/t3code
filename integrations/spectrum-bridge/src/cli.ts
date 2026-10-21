@@ -56,8 +56,8 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   send: ["text", "session", "key", "effect", "subject", "to"],
   poll: ["title", "option", "session", "key"],
   wake: ["text", "source", "key", "chat", "session"],
-  "location-request": ["session", "key"],
-  location: ["session"],
+  "location-request": ["session", "key", "chat"],
+  location: ["session", "chat"],
   "ask-owner": ["text", "session", "key"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
@@ -251,9 +251,11 @@ export function parseCommand(args: string[]): Command {
       return { method: "POST", path: "/wake", body: { text, source, dedupeKey } };
     }
     case "location-request":
-      return { method: "POST", path: "/location-request", body: session() };
+      return { method: "POST", path: "/location-request",
+        body: { ...session(), ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
     case "location":
-      return { method: "POST", path: "/location", body: { sessionId: sessionOnly(values.session)! } };
+      return { method: "POST", path: "/location",
+        body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
     case "ask-owner": {
       const text = required(values.text, "--text");
       if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");

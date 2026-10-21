@@ -4,7 +4,7 @@
  * many optional, string-or-null fields and we only need a handful of them.
  */
 import type { SendblueOptions } from "./chats.ts";
-import { chatKey, LineError, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineOutbound, type SendOptions } from "./line.ts";
+import { chatKey, LineError, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
 
 const BASE = "https://api.sendblue.com";
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -408,9 +408,22 @@ export class Sendblue implements Line {
     await this.#call("POST", "/api/send-reaction", { json: { from_number: this.number, message_handle: handle, reaction }, send: true });
   }
 
-  async typing(chat: ChatKey): Promise<void> {
+  async typing(chat: ChatKey, options: TypingOptions = {}): Promise<void> {
     if (chatKey.isGroup(chat)) return;
-    await this.#call("POST", "/api/send-typing-indicator", { json: { number: chatKey.target(chat), from_number: this.number } });
+    const base = { number: chatKey.target(chat), from_number: this.number };
+    const v2 = options.state !== undefined || options.maxDurationMs !== undefined;
+    const json = {
+      ...base,
+      ...(options.state ? { state: options.state } : {}),
+      ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs }),
+    };
+    try {
+      await this.#call("POST", "/api/send-typing-indicator", { json });
+    } catch (error) {
+      // Workers without typing-v2 firmware 503 on state/duration; the legacy start always works.
+      if (!v2 || options.state === "stop" || !(error instanceof LineError) || !error.code.startsWith("http_503")) throw error;
+      await this.#call("POST", "/api/send-typing-indicator", { json: base });
+    }
   }
 
   async read(chat: ChatKey): Promise<void> {
@@ -423,10 +436,14 @@ export class Sendblue implements Line {
     await this.#call("POST", "/api/request-location", { json: { number: chatKey.target(chat), from_number: this.number }, send: true });
   }
 
-  async location(address: string): Promise<LineLocation | undefined> {
+  async location(address: string): Promise<LineLocation | LineNoFix | undefined> {
     const response = await this.#call("GET", `/api/location/${encodeURIComponent(address)}`, { query: { from_number: this.number }, allow404: true });
-    if (!isObject(response) || response.state !== "shared_with_fix" || !isObject(response.location)) return undefined;
-    return toLocation(response.location);
+    if (!isObject(response)) return undefined;
+    if (response.state === "not_shared") return { state: "not_shared" };
+    if (response.state !== "shared_with_fix" && response.state !== "shared_no_fix_yet") return undefined;
+    // A placeholder 0,0 fix arrives without coordinates; that is still "no fix yet".
+    const fix = isObject(response.location) ? toLocation(response.location) : undefined;
+    return fix ?? { state: "shared_no_fix_yet" };
   }
 
   async download(url: string, maxBytes: number, timeoutMs: number): Promise<LineFile> {

@@ -72,7 +72,7 @@ function observedLine(line: Line, seen: { synchronized: boolean; lastEventAt: nu
     getMessage: handle => line.getMessage(handle),
     sendApp: (chat, card) => line.sendApp(chat, card),
     react: (handle, reaction) => line.react(handle, reaction),
-    typing: chat => line.typing(chat),
+    typing: (chat, options) => line.typing(chat, options),
     read: chat => line.read(chat),
     requestLocation: chat => line.requestLocation(chat),
     location: address => line.location(address),

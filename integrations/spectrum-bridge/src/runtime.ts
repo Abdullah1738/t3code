@@ -276,6 +276,15 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         if (caller.info.kind !== "owner") throw new HttpError(403, "Only the owner's chat can do this");
       };
       const live = () => { if (!options.enabled()) throw new HttpError(503, "Bridge is not ready"); };
+      /** `--chat <slug>`: only the owner's agent may ask after someone else's location. */
+      const locationTarget = (chat: unknown): ChatInfo | undefined => {
+        if (chat === undefined) return undefined;
+        if (!text(chat, 100)) throw new HttpError(400, "Invalid request");
+        ownerOnly(false);
+        const target = registry.bySlugName(chat);
+        if (!target) throw new HttpError(404, "Unknown chat");
+        return target.info;
+      };
       const deps = (from?: ChatInfo): SbApiDeps => ({
         line: options.line,
         chatForSession: id => registry.forSession(id)?.info,
@@ -324,19 +333,20 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           return reply(200, { id: `reaction:${hash(target + kind)}` });
         }
         case "/location-request": {
-          only(body, ["sessionId", "dedupeKey"]);
+          only(body, ["sessionId", "dedupeKey", "chat"]);
           live();
           if (!sessionId || !text(body.dedupeKey, 200)) throw new HttpError(400, "Invalid request");
+          const target = locationTarget(body.chat);
           const key = `sb-location-request:${hash(body.dedupeKey)}`;
           if (registry.owner.store.get(key)) return reply(200, { requested: true, created: false });
-          const outcome = await locationRequest(deps(), sessionId);
+          const outcome = await locationRequest(deps(), sessionId, target);
           if (outcome.status === 202) registry.owner.store.set(key, true);
           return result(outcome);
         }
         case "/location": {
-          only(body, ["sessionId"]);
+          only(body, ["sessionId", "chat"]);
           if (!sessionId) throw new HttpError(400, "Invalid request");
-          return result(await location(deps(), sessionId));
+          return result(await location(deps(), sessionId, locationTarget(body.chat)));
         }
         case "/ask-owner": {
           only(body, ["text", "sessionId", "dedupeKey"]);

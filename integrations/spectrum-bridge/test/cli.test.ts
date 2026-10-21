@@ -14,6 +14,14 @@ describe("parseCommand", () => {
     expect(parseCommand(["health"])).toEqual({ method: "GET", path: "/health" });
   });
 
+  test("location commands take an optional --chat slug", () => {
+    expect(parseCommand(["location", "--session", "ses_1"])).toEqual({ method: "POST", path: "/location", body: { sessionId: "ses_1" } });
+    expect(parseCommand(["location", "--session", "ses_1", "--chat", "moni"]).body).toEqual({ sessionId: "ses_1", chat: "moni" });
+    expect(parseCommand(["location-request", "--session", "ses_1", "--key", "k", "--chat", "moni"]).body)
+      .toEqual({ sessionId: "ses_1", dedupeKey: "k", chat: "moni" });
+    expect(() => parseCommand(["location", "--session", "ses_1", "--chat", "Not A Slug"])).toThrow("Invalid chat slug");
+  });
+
   test("parses send-file purely as a local reference with a required session, optional caption and MIME", () => {
     expect(parseCommand(sendFile)).toEqual({ method: "POST", path: "/files",
       body: { file: "/nonexistent/report.pdf", dedupeKey: "file-1", text: "", sessionId: "session-1" } });
