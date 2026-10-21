@@ -524,6 +524,17 @@ const make = Effect.gen(function* () {
           const result: ViewHistory = { target, entries: newestFirst(entries) };
           return result;
         }
+        case "source": {
+          const versions = (yield* views.sourceVersions(target.id)).filter(
+            (version) => version.missionId === input.missionId,
+          );
+          if (versions.length === 0) {
+            return yield* fail("not-found", `No view source ${target.id} in this mission.`);
+          }
+          const entries = versions.map((v) => historyEntry(v, v.status, v.definition));
+          const result: ViewHistory = { target, entries: newestFirst(entries) };
+          return result;
+        }
       }
     });
 
@@ -1210,7 +1221,7 @@ const make = Effect.gen(function* () {
       // nothing here: skipped when copying everything, refused when named.
       const portable = (section: ViewSection) => {
         const definition = section.definition;
-        if (definition.source._tag === "refs") return false;
+        if (definition.source._tag !== "query") return false;
         const where = definition.source.query.where;
         return (
           (definition.subMissionId ?? null) === null &&

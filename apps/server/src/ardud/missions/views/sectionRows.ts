@@ -31,7 +31,7 @@ const DERIVED_SOURCES: Record<string, ReadonlyArray<string>> = {
   approver: ["approver", "acceptor", "status"],
 };
 
-const nodeBinds = (node: ViewNode): ReadonlyArray<string> => {
+export const nodeBinds = (node: ViewNode): ReadonlyArray<string> => {
   switch (node._tag) {
     case "text":
     case "flags":

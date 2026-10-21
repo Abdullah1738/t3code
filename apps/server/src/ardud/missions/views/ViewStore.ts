@@ -6,6 +6,7 @@ import {
   ViewSection,
   ViewStarterLayout,
   ViewTemplate,
+  ViewDataSource,
   type MissionId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -55,7 +56,7 @@ const DDL = [
     ON ardud_mission_views_versions (metered_mission, changed_at)`,
 ];
 
-export type ViewScope = "template" | "section" | "layout" | "starter" | "asset";
+export type ViewScope = "template" | "section" | "layout" | "starter" | "asset" | "source";
 
 /** The starter layout's row id and mission. */
 export const STARTER_ID = "starter";
@@ -78,13 +79,17 @@ const encodeStarter = Schema.encodeEffect(starterCodec);
 const assetCodec = Schema.fromJsonString(MissionAsset);
 const decodeAsset = Schema.decodeUnknownEffect(assetCodec);
 const encodeAsset = Schema.encodeEffect(assetCodec);
+const sourceCodec = Schema.fromJsonString(ViewDataSource);
+const decodeSource = Schema.decodeUnknownEffect(sourceCodec);
+const encodeSource = Schema.encodeEffect(sourceCodec);
 
 export type ViewWrite =
   | { readonly scope: "template"; readonly value: ViewTemplate }
   | { readonly scope: "section"; readonly value: ViewSection }
   | { readonly scope: "layout"; readonly value: ViewLayout }
   | { readonly scope: "starter"; readonly value: ViewStarterLayout }
-  | { readonly scope: "asset"; readonly value: MissionAsset };
+  | { readonly scope: "asset"; readonly value: MissionAsset }
+  | { readonly scope: "source"; readonly value: ViewDataSource };
 
 export interface WriteOptions {
   /**
@@ -125,6 +130,13 @@ export class ViewStore extends Context.Service<
     readonly assets: (
       missionId: MissionId,
     ) => Effect.Effect<ReadonlyArray<MissionAsset>, MissionError>;
+    /** Every source of the mission, removed ones included. */
+    readonly sources: (
+      missionId: MissionId,
+    ) => Effect.Effect<ReadonlyArray<ViewDataSource>, MissionError>;
+    readonly sourceVersions: (
+      id: string,
+    ) => Effect.Effect<ReadonlyArray<ViewDataSource>, MissionError>;
     /** Writes the current row and appends the version. Fails on a version already written. */
     readonly write: (write: ViewWrite, options: WriteOptions) => Effect.Effect<void, MissionError>;
     /** Versions that spent the mission's change budget since `since` (ISO). */
@@ -243,6 +255,15 @@ const make = Effect.gen(function* () {
             json,
           })),
         );
+      case "source":
+        return encodeSource(write.value).pipe(
+          Effect.map((json) => ({
+            id: write.value.id as string,
+            missionId: write.value.missionId as string,
+            status: write.value.status as string,
+            json,
+          })),
+        );
     }
   };
 
@@ -347,6 +368,14 @@ const make = Effect.gen(function* () {
     assets: (missionId) =>
       Effect.flatMap(currentRows("asset", missionId), (rows) =>
         decodeAll(rows, decodeAsset, "mission asset"),
+      ),
+    sources: (missionId) =>
+      Effect.flatMap(currentRows("source", missionId), (rows) =>
+        decodeAll(rows, decodeSource, "view source"),
+      ),
+    sourceVersions: (id) =>
+      Effect.flatMap(versionRows("source", id), (rows) =>
+        decodeAll(rows, decodeSource, "view source"),
       ),
     write,
     changesSince,

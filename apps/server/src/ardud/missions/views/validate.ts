@@ -21,6 +21,8 @@ import {
   viewMatchSpecificity,
   type ViewBackingKind,
   type ViewBindSlot,
+  type ViewDataSource,
+  type ViewSourceFields,
   type ViewIssue,
   type ViewIssueCode,
   type ViewLayoutDefinition,
@@ -446,13 +448,13 @@ const WHERE_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = VIEW
 const SORT_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = VIEW_QUERY_SORTS;
 
 const sectionBinder =
-  (rowPaths: PathTable): Binder =>
+  (rowPaths: PathTable, derived = true): Binder =>
   (bind, slot, perRow) => {
     const { scope, path } = splitBind(bind);
     if (scope !== "row") return { code: "bad-binding", detail: "sections bind row paths only" };
     const inList = perRow || ROW_SLOTS.has(slot);
     const kind = inList
-      ? (lookup(rowPaths, path) ?? lookup(VIEW_DERIVED_PATHS, path))
+      ? (lookup(rowPaths, path) ?? (derived ? lookup(VIEW_DERIVED_PATHS, path) : undefined))
       : lookup(VIEW_SECTION_PATHS, path);
     if (kind !== undefined) return { kind };
     return {
@@ -466,7 +468,49 @@ const sectionBinder =
 export interface SectionContext {
   /** Every other section of the mission, any status. */
   readonly siblings: ReadonlyArray<ViewSection>;
+  /** The mission's sources, any status; a removed one still binds (its section says "source off"). */
+  readonly sources?: ReadonlyArray<ViewDataSource>;
 }
+
+/** Row paths of a source: its declared fields plus the implicit `id`. */
+export const sourceRowPaths = (fields: ViewSourceFields): PathTable => ({ id: "text", ...fields });
+
+const UNFILTERED_KINDS: ReadonlySet<ViewValueKind> = new Set(["links", "longtext"]);
+
+const checkSourceShape = (
+  issues: Issues,
+  source: Extract<ViewSectionDefinition["source"], { readonly _tag: "source" }>,
+  sources: ReadonlyArray<ViewDataSource>,
+): PathTable | null => {
+  const found = sources.find((candidate) => candidate.id === source.sourceId);
+  if (found === undefined) {
+    issues.add("source.sourceId", "field", `this mission has no source ${source.sourceId}`);
+    return null;
+  }
+  const paths = sourceRowPaths(found.definition.fields);
+  for (const [field, value] of Object.entries(source.where ?? {})) {
+    const kind = lookup(paths, field);
+    if (kind === undefined) {
+      issues.add(
+        `source.where.${field}`,
+        "field",
+        `${found.definition.title} rows have no ${field}`,
+      );
+    } else if (UNFILTERED_KINDS.has(kind)) {
+      issues.add(`source.where.${field}`, "field", `${kind} fields can't be filtered`);
+    } else if (typeof value === "number" && kind !== "number") {
+      issues.add(`source.where.${field}`, "field", `${field} is ${kind}, not a number`);
+    }
+  }
+  if (source.sort !== undefined && lookup(paths, source.sort.field) === undefined) {
+    issues.add(
+      "source.sort.field",
+      "field",
+      `${found.definition.title} rows have no ${source.sort.field}`,
+    );
+  }
+  return paths;
+};
 
 export const checkSection = (
   definition: ViewSectionDefinition,
@@ -475,6 +519,11 @@ export const checkSection = (
   const issues = new Issues();
   const source = definition.source;
   let rowPaths: PathTable = VIEW_REF_ROW_PATHS;
+  let derived = true;
+  if (source._tag === "source") {
+    rowPaths = checkSourceShape(issues, source, context.sources ?? []) ?? { id: "text" };
+    derived = false;
+  }
   if (source._tag === "query") {
     const query = source.query;
     rowPaths = VIEW_PATHS[query.kind];
@@ -495,7 +544,7 @@ export const checkSection = (
     issues,
     {
       allowed: (tag) => (SECTION_NODES.has(tag) ? null : `${tag} blocks belong on cards`),
-      binder: sectionBinder(rowPaths),
+      binder: sectionBinder(rowPaths, derived),
     },
     definition.body,
     VIEW_HARD_LIMITS.sectionBody,
