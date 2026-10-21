@@ -28,6 +28,8 @@ import {
   type ViewLongTextInput,
   ViewSectionData,
   viewPinnedStrip,
+  type RunViewSourceInput,
+  type SetViewSourceInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -85,7 +87,8 @@ const changedKind = (item: MissionStreamItem): string | null => {
 
 type FeedTick =
   | { readonly _tag: "item"; readonly item: MissionStreamItem }
-  | { readonly _tag: "report-saved" };
+  | { readonly _tag: "report-saved" }
+  | { readonly _tag: "source-ran" };
 
 interface FeedState {
   readonly snapshot: MissionViewsSnapshot;
@@ -119,6 +122,7 @@ export const makeViewsWsHandlers = (
       Effect.gen(function* () {
         const subscription = yield* store.subscribe;
         const reports = yield* views.reportSaves;
+        const sourceRuns = yield* views.sourceChanges;
         const first = yield* views.snapshot(input.missionId);
         // A saved report is not a store commit, so it arrives as its own tick.
         const reportSaved = Stream.fromSubscription(reports).pipe(
@@ -129,12 +133,25 @@ export const makeViewsWsHandlers = (
           Stream.filter(touches(input.missionId)),
           Stream.map((item): FeedTick => ({ _tag: "item", item })),
         );
-        const updates = Stream.merge(commits, reportSaved).pipe(
+        const sourceRan = Stream.fromSubscription(sourceRuns).pipe(
+          Stream.filter((missionId) => missionId === input.missionId),
+          Stream.map((): FeedTick => ({ _tag: "source-ran" })),
+        );
+        const updates = Stream.mergeAll([commits, reportSaved, sourceRan], {
+          concurrency: "unbounded",
+        }).pipe(
           Stream.mapAccumEffect(
             (): FeedState => ({ snapshot: first, changed: new Set() }),
             (state, tick) =>
               Effect.gen(function* () {
                 const last = state.snapshot;
+                if (tick._tag === "source-ran") {
+                  const snapshot = yield* views.snapshot(input.missionId);
+                  return [
+                    { snapshot, changed: state.changed },
+                    [{ _tag: "snapshot", snapshot } as MissionViewsFeedItem],
+                  ] as const;
+                }
                 if (tick._tag === "report-saved") {
                   if (!queriedKinds(last.sections).has("report")) return [state, []] as const;
                   const rows = yield* views.sectionData(input.missionId, last.sections);
@@ -197,6 +214,12 @@ export const makeViewsWsHandlers = (
     [M.history]: (input: ViewHistoryInput) => views.history(input),
     [M.preview]: (input: PreviewViewInput) => views.preview(input),
     [M.longText]: (input: ViewLongTextInput) => views.longText(input),
+    [M.setSource]: asOwner((provenance, input: SetViewSourceInput) =>
+      views.setSource(provenance, input),
+    ),
+    [M.runSource]: asOwner((provenance, input: RunViewSourceInput) =>
+      views.runSource(provenance, input),
+    ),
     [M.defineTemplate]: asOwner((provenance, input: DefineViewTemplateInput) =>
       views.defineTemplate(provenance, input),
     ),

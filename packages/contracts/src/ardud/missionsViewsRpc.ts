@@ -31,6 +31,8 @@ import {
   RestoreStarterLayoutInput,
   RestoreViewInput,
   RestoreViewLayoutInput,
+  RunViewSourceInput,
+  SetViewSourceInput,
   ViewCatalog,
   ViewHistory,
   ViewHistoryInput,
@@ -38,6 +40,7 @@ import {
   ViewLongTextInput,
   ViewPinned,
   ViewPreview,
+  ViewSourceRunResult,
 } from "./missionsViews.ts";
 
 export const MISSIONS_VIEWS_WS_METHODS = {
@@ -60,6 +63,10 @@ export const MISSIONS_VIEWS_WS_METHODS = {
   // --- views additions ---
   longText: "missions.views.longText",
   // --- end views additions ---
+  // --- sources additions ---
+  setSource: "missions.views.setSource",
+  runSource: "missions.views.runSource",
+  // --- end sources additions ---
 } as const;
 
 const M = MISSIONS_VIEWS_WS_METHODS;
@@ -112,6 +119,10 @@ export const MissionsViewsRpcs = RpcGroup.make(
   call(M.addAsset, AddMissionAssetInput, MissionMutationResult),
   call(M.removeAsset, RemoveMissionAssetInput, MissionMutationResult),
   call(M.longText, ViewLongTextInput, ViewLongText),
+  // --- sources additions ---
+  call(M.setSource, SetViewSourceInput, MissionMutationResult),
+  call(M.runSource, RunViewSourceInput, ViewSourceRunResult),
+  // --- end sources additions ---
 );
 
 export const MISSIONS_VIEWS_READ_SCOPES = {
@@ -135,6 +146,10 @@ export const MISSIONS_VIEWS_GUARDED_SCOPES = {
   [M.applyBundle]: AuthOrchestrationOperateScope,
   [M.addAsset]: AuthOrchestrationOperateScope,
   [M.removeAsset]: AuthOrchestrationOperateScope,
+  // --- sources additions ---
+  [M.setSource]: AuthOrchestrationOperateScope,
+  [M.runSource]: AuthOrchestrationOperateScope,
+  // --- end sources additions ---
 } as const;
 
 export const MISSIONS_VIEWS_AGGREGATES = Object.fromEntries(

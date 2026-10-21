@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   DndContext,
   type DragEndEvent,
@@ -16,9 +16,17 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { CopyIcon, EllipsisIcon, GripVerticalIcon, Trash2Icon, Undo2Icon } from "lucide-react";
+import {
+  ChevronRightIcon,
+  CopyIcon,
+  EllipsisIcon,
+  GripVerticalIcon,
+  RefreshCwIcon,
+  Trash2Icon,
+  Undo2Icon,
+} from "lucide-react";
 
-import type { MissionId, ViewRegion } from "@t3tools/contracts";
+import type { MissionId, ViewDataSourceId, ViewRegion } from "@t3tools/contracts";
 import {
   dropLayoutGroups,
   fitsViewRegion,
@@ -31,6 +39,11 @@ import {
   resolveMissionLayout,
   viewCardKit,
   viewCopyRequest,
+  viewSourceCode,
+  viewSourceHistoryInput,
+  viewSourceItems,
+  viewSourceRunInput,
+  viewSourceToggleInput,
   viewStarterIsNewer,
   viewStarterRequest,
   viewTemplateRequest,
@@ -41,6 +54,7 @@ import {
   type ResolvedViewLayout,
   type ViewKitTemplate,
   type ViewSectionRequest,
+  type ViewSourceItem,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
@@ -56,7 +70,8 @@ import { SectionFormRow, SectionMenu, TabMenu, type SectionForm } from "./sectio
 import { useMissionsOffline } from "./useMissionsConnection";
 
 // Views tab, Desk layout: the board's entries as tiles by region, what is set
-// aside, then the starter, the change log and the card kit on the side.
+// aside and the script sources, then the starter, the change log and the card
+// kit on the side.
 
 /** Changes shown before the fold. */
 const FIRST_CHANGES = 6;
@@ -135,6 +150,7 @@ export function ViewsTab(props: { missionId: MissionId; nowMs: number }) {
               </ul>
             </section>
           ) : null}
+          <SourcesPanel views={views} nowMs={props.nowMs} />
         </div>
         <div className="flex min-w-0 flex-col gap-4">
           <StarterPanel views={views} />
@@ -501,6 +517,145 @@ function KitRow(props: { views: MissionViewsState; template: ViewKitTemplate; no
         </MenuPopup>
       </Menu>
     </li>
+  );
+}
+
+function SourcesPanel(props: { views: MissionViewsState; nowMs: number }) {
+  const items = viewSourceItems(props.views.snapshot);
+  if (items.length === 0) return null;
+  return (
+    <section aria-labelledby="views-sources" className={PANEL}>
+      <div className="flex items-center gap-2">
+        <h2 id="views-sources" className="text-sm font-semibold">
+          Sources
+        </h2>
+        <PanelCount count={items.length} />
+      </div>
+      <ul className="flex min-w-0 flex-col">
+        {items.map((item) => (
+          <SourceRow key={item.id} item={item} nowMs={props.nowMs} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+const SOURCE_STATUS = { off: "Off", running: "Running", failed: "Failed" } as const;
+
+function SourceRow(props: { item: ViewSourceItem; nowMs: number }) {
+  const { item } = props;
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const act = (action: Promise<unknown>, failure: string) => {
+    setBusy(true);
+    void runMissionAction(action, failure).finally(() => setBusy(false));
+  };
+  const codeId = `views-source-${item.id}`;
+  return (
+    <li className={cn("flex min-w-0 flex-col", DESK_ROW)}>
+      <div className="flex min-h-10 min-w-0 items-center gap-2 py-1.5">
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-controls={open ? codeId : undefined}
+          onClick={() => setOpen(!open)}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-lg text-start text-sm outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset"
+        >
+          <ChevronRightIcon
+            aria-hidden
+            className={cn("size-3.5 shrink-0 text-(--m-muted)", open && "rotate-90")}
+          />
+          <span className={cn("min-w-0 truncate", !item.enabled && "text-(--m-muted)")}>
+            {item.title}
+          </span>
+        </button>
+        {item.status ? (
+          <span
+            className={cn(
+              "shrink-0 text-xs",
+              item.status === "failed" ? "font-medium text-(--m-negative)" : "text-(--m-muted)",
+            )}
+          >
+            {SOURCE_STATUS[item.status]}
+          </span>
+        ) : null}
+        <span className="shrink-0 text-xs text-(--m-muted) tabular-nums">
+          {[
+            item.rows === null ? null : `${item.rows} ${item.rows === 1 ? "row" : "rows"}`,
+            item.ranAt === null ? null : formatRelative(item.ranAt, props.nowMs),
+          ]
+            .filter((part) => part !== null)
+            .join(" · ")}
+        </span>
+        <Button
+          size="icon-xs"
+          variant="ghost-muted"
+          aria-label={`Refresh ${item.title}`}
+          disabled={busy || !item.canRun}
+          onClick={() =>
+            act(
+              missionsSource.runViewSource(viewSourceRunInput(item)),
+              "Couldn't refresh the source",
+            )
+          }
+        >
+          <RefreshCwIcon aria-hidden />
+        </Button>
+        <Button
+          size="xs"
+          variant="ghost-muted"
+          disabled={busy}
+          onClick={() =>
+            act(
+              missionsSource.setViewSource(viewSourceToggleInput(item)),
+              item.enabled ? "Couldn't turn the source off" : "Couldn't turn the source on",
+            )
+          }
+        >
+          {item.enabled ? "Disable" : "Enable"}
+        </Button>
+      </div>
+      {open ? (
+        <div id={codeId} className="flex min-w-0 flex-col gap-2 pb-3 ps-5.5">
+          {item.status === "failed" && item.error ? (
+            <p className="text-xs break-words text-(--m-negative)">{item.error}</p>
+          ) : null}
+          <SourceCode missionId={item.missionId} sourceId={item.id} version={item.version} />
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+/** The listing leaves the script out, so it loads from history when the row opens. */
+function SourceCode(props: { missionId: MissionId; sourceId: ViewDataSourceId; version: number }) {
+  const { missionId, sourceId, version } = props;
+  const [code, setCode] = useState<{ version: number; text: string | null }>();
+  useEffect(() => {
+    let live = true;
+    missionsSource.loadViewHistory(viewSourceHistoryInput({ missionId, id: sourceId })).then(
+      (history) => {
+        if (live) setCode({ version, text: viewSourceCode(history, version) });
+      },
+      () => {
+        if (live) setCode({ version, text: null });
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [missionId, sourceId, version]);
+  if (code?.version !== version) return <Skeleton className="h-4 w-2/5" />;
+  if (code.text === null) {
+    return <p className="text-xs text-(--m-muted)">Couldn't load the code</p>;
+  }
+  return (
+    <pre
+      aria-label="Source code"
+      className="max-h-80 overflow-auto rounded-xl bg-(--m-raised) px-3 py-2 font-mono text-xs leading-5"
+    >
+      {code.text}
+    </pre>
   );
 }
 

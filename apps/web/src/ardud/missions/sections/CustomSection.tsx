@@ -4,6 +4,7 @@ import type { MissionId } from "@t3tools/contracts";
 import {
   viewSection,
   viewSectionData,
+  viewSectionSource,
   type MissionViewsState,
   type ResolvedViewLayout,
   type ViewSectionEntry,
@@ -12,8 +13,9 @@ import {
 import { ViewBlocks } from "../cards/ViewBlocks";
 import { SectionCount, SectionShell } from "./SectionShell";
 
-// A section the master placed: its rows come from the server's query (or
-// its pinned records), drawn with its own blocks. Empty sections hide.
+// A section the master placed: its rows come from the server's query or
+// script source (or its pinned records), drawn with its own blocks. Empty
+// sections hide; a source that is off or failing keeps one quiet line.
 
 export function CustomSection(props: {
   missionId: MissionId;
@@ -31,6 +33,7 @@ export function CustomSection(props: {
         : viewSection(record, {
             nowMs: props.nowMs,
             data: viewSectionData(snapshot, record.id),
+            source: viewSectionSource(snapshot, record),
             assets: snapshot.assets ?? [],
           }),
     [record, snapshot, props.nowMs],
@@ -49,6 +52,7 @@ export function CustomSection(props: {
         ) : null
       }
     >
+      {view.notice ? <p className="text-xs text-(--m-muted)">{view.notice}</p> : null}
       <ViewBlocks blocks={view.blocks} />
     </SectionShell>
   );

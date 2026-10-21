@@ -5,10 +5,12 @@ import {
   BUILTIN_VIEW_TEMPLATES,
   DEFAULT_STARTER_LAYOUT,
   selectViewTemplate,
+  SetViewSourceInput,
   STOCK_VIEW_TEMPLATES,
   ViewBind,
   ViewNode,
   ViewSectionDefinition,
+  ViewSourceDefinition,
   ViewStarterLayout,
   ViewTemplate,
   ViewTemplateDefinition,
@@ -26,6 +28,8 @@ const decodeSection = Schema.decodeUnknownExit(ViewSectionDefinition);
 const decodeDefinition = Schema.decodeUnknownExit(ViewTemplateDefinition);
 const decodeStarter = Schema.decodeUnknownExit(ViewStarterLayout);
 const decodeTemplate = Schema.decodeUnknownSync(ViewTemplate);
+const decodeSourceDefinition = Schema.decodeUnknownExit(ViewSourceDefinition);
+const decodeSetSource = Schema.decodeUnknownExit(SetViewSourceInput);
 const isBind = Schema.is(ViewBind);
 
 const template = (id: string, definition: Partial<ViewTemplateDefinition>, status = "active") =>
@@ -148,6 +152,50 @@ describe("mission views catalog", () => {
     expect(VIEW_CATALOG.nodes.map((node) => node.tag)).toEqual(
       expect.arrayContaining(["collapsible", "markdown"]),
     );
+  });
+
+  it("decodes view sources, source sections and the catalog examples", () => {
+    const definition = {
+      title: "Open PRs",
+      runtime: "bash",
+      code: "gh pr list --json number",
+      fields: { title: "text", updated: "time" },
+      refreshMinutes: 15,
+      timeoutSeconds: 30,
+      enabled: true,
+    };
+    expect(decodeSourceDefinition(definition)._tag).toBe("Success");
+    expect(decodeSourceDefinition({ ...definition, timeoutSeconds: 61 })._tag).toBe("Failure");
+    expect(decodeSourceDefinition({ ...definition, refreshMinutes: 4 })._tag).toBe("Failure");
+    expect(decodeSourceDefinition({ ...definition, runtime: "ruby" })._tag).toBe("Failure");
+    expect(decodeSourceDefinition({ ...definition, fields: {} })._tag).toBe("Failure");
+    expect(decodeSourceDefinition({ ...definition, fields: { title: "series" } })._tag).toBe(
+      "Failure",
+    );
+    expect(decodeSourceDefinition({ ...definition, code: "x".repeat(20_001) })._tag).toBe(
+      "Failure",
+    );
+    const tooMany = Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`f${i}`, "text"]));
+    expect(decodeSourceDefinition({ ...definition, fields: tooMany })._tag).toBe("Failure");
+    const section = (source: unknown) =>
+      decodeSection({ key: "prs", title: "PRs", source, body: [] })._tag;
+    expect(
+      section({
+        _tag: "source",
+        sourceId: "vsrc-1",
+        where: { state: ["open", "draft"] },
+        sort: { field: "updated", dir: "desc" },
+        limit: 10,
+      }),
+    ).toBe("Success");
+    expect(section({ _tag: "source", sourceId: "vsrc-1", limit: 21 })).toBe("Failure");
+    for (const example of VIEW_CATALOG.sources?.examples ?? []) {
+      expect(decodeSetSource({ missionId: "m-1", ...(example.source as object) })._tag).toBe(
+        "Success",
+      );
+      expect(decodeSection(example.section)._tag).toBe("Success");
+    }
+    expect(VIEW_CATALOG.sources?.examples).toHaveLength(2);
   });
 });
 

@@ -35,11 +35,15 @@ export interface ViewBindContext {
   readonly record: object | null;
   /** Values for `field.<key>`, from the record's `view.fields`. */
   readonly fields?: Readonly<Record<string, ViewFieldValue>>;
-  /** What `row.<path>` reads inside a section list; `ref` is the row's record. */
+  /**
+   * What `row.<path>` reads inside a section list; `ref` is the row's record.
+   * Script-backed rows carry their source's declared field kinds in `paths`.
+   */
   readonly row?: {
-    readonly scope: ViewPathScope | "refs";
+    readonly scope: ViewPathScope | "refs" | "source";
     readonly value: object;
     readonly ref?: MissionRecordRef | null;
+    readonly paths?: Readonly<Record<string, ViewValueKind>>;
   } | null;
   /** Section-level `row.count` / `row.total`. */
   readonly section?: { readonly count: number; readonly total: number };
@@ -254,7 +258,12 @@ export function resolveViewBind(bind: string, context: ViewBindContext): ViewVal
       return value === undefined ? null : fieldValue(value);
     }
     case "row": {
-      if (context.row) return resolvePath(context.row.scope, context.row.value, path, context);
+      const row = context.row;
+      if (row?.scope === "source") {
+        const kind = row.paths === undefined ? undefined : lookup(row.paths, path);
+        return kind === undefined ? null : coerce(field(row.value, path), kind, path, context);
+      }
+      if (row) return resolvePath(row.scope, row.value, path, context);
       if (context.section && lookup(VIEW_SECTION_PATHS, path) !== undefined) {
         return numberValue(path === "count" ? context.section.count : context.section.total, path);
       }
@@ -271,7 +280,13 @@ export function viewLongTextSource(
   context: ViewBindContext,
 ): ViewLongTextInput | null {
   const row = context.row;
-  if (!bind.startsWith("row.") || !row?.ref || row.scope === "refs" || !context.missionId) {
+  if (
+    !bind.startsWith("row.") ||
+    !row?.ref ||
+    row.scope === "refs" ||
+    row.scope === "source" ||
+    !context.missionId
+  ) {
     return null;
   }
   const path = bind.slice("row.".length);

@@ -12,6 +12,7 @@ import {
   viewCard,
   viewSection,
   viewSectionData,
+  viewSectionSource,
   withAssetFeedback,
   type AssetMark,
   type AssetReview,
@@ -617,6 +618,7 @@ export function CustomSections(props: { readonly missionId: MissionId; readonly 
       const view = viewSection(entry.section, {
         nowMs: props.nowMs,
         data,
+        source: viewSectionSource(snapshot, entry.section),
         assets: snapshot.assets ?? [],
       });
       const shown = data?.rows.length ?? 0;
@@ -635,6 +637,7 @@ export function CustomSections(props: { readonly missionId: MissionId; readonly 
           />
           <Group>
             <View className="gap-3 px-3.5 py-3">
+              {section.view.notice ? <Meta>{section.view.notice}</Meta> : null}
               <ViewBlocks blocks={section.view.blocks} />
             </View>
           </Group>
