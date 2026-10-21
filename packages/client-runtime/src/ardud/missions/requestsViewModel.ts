@@ -7,6 +7,7 @@ import type {
   OwnerRequestStatus,
   ReplyRequestInput,
 } from "./source.ts";
+import { refKey } from "./viewModel.ts";
 
 // Wording and grouping for the owner's requests to the master.
 
@@ -150,4 +151,28 @@ export function requestPreview(request: Pick<OwnerRequest, "messages">): string 
   const reply = lastMasterReply(request);
   const source = reply ?? request.messages[0];
   return source?.text.split("\n")[0]?.trim() ?? "";
+}
+
+/**
+ * Open discussions whose record has no card on this screen: it was acked,
+ * superseded, aged out of the feed, or its section is hidden. They still need
+ * a surface until someone settles them. Unread first, then newest.
+ */
+export function looseDiscussions(
+  requests: ReadonlyArray<OwnerRequest>,
+  shown: ReadonlyArray<Pick<MissionRecordRef, "kind" | "id">>,
+): ReadonlyArray<OwnerRequest & { readonly subject: MissionRecordRef }> {
+  const onScreen = new Set(shown.map(refKey));
+  return requests
+    .filter(
+      (request): request is OwnerRequest & { readonly subject: MissionRecordRef } =>
+        request.status !== "settled" &&
+        request.subject !== null &&
+        !onScreen.has(refKey(request.subject)),
+    )
+    .sort(
+      (left, right) =>
+        Number(isRequestUnread(right)) - Number(isRequestUnread(left)) ||
+        right.updatedAt.localeCompare(left.updatedAt),
+    );
 }
