@@ -85,7 +85,15 @@ import type {
 
 import type { ViewSectionRequest } from "./views/layout.ts";
 // --- views additions ---
-import type { ViewLongText, ViewLongTextInput } from "@t3tools/contracts";
+import type {
+  RunViewSourceInput,
+  SetViewSourceInput,
+  ViewHistory,
+  ViewHistoryInput,
+  ViewLongText,
+  ViewLongTextInput,
+  ViewSourceRunResult,
+} from "@t3tools/contracts";
 // --- end views additions ---
 
 export type Unsubscribe = () => void;
@@ -746,6 +754,12 @@ export interface MissionsSource {
   // --- views additions ---
   /** A row value too long for the views snapshot (a report's text), fetched when it opens. */
   loadLongText(input: ViewLongTextInput): Promise<ViewLongText>;
+  /** Patch a script source; the owner's Disable/Enable sends `enabled`. */
+  setViewSource(input: SetViewSourceInput): Promise<void>;
+  /** Run a script source now. */
+  runViewSource(input: RunViewSourceInput): Promise<ViewSourceRunResult>;
+  /** Past versions of a view object; a source's entries carry its code. */
+  loadViewHistory(input: ViewHistoryInput): Promise<ViewHistory>;
   // --- end views additions ---
 
   /** The owner's requests to the master, newest activity first. */

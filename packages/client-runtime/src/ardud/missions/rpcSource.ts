@@ -1565,6 +1565,11 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     },
     // --- views additions ---
     loadLongText: (input) => transport.request(VIEWS.longText, input),
+    setViewSource: async (input) => {
+      await transport.request(VIEWS.setSource, input);
+    },
+    runViewSource: (input) => transport.request(VIEWS.runSource, input),
+    loadViewHistory: (input) => transport.request(VIEWS.history, input),
     // --- end views additions ---
 
     // --- Owner requests ---

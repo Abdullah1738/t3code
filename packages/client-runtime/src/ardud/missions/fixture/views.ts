@@ -33,7 +33,15 @@ export interface ViewsContext {
   readonly requestsUnread: (missionId: string) => number;
 }
 
-export type ViewsSource = Pick<MissionsSource, "subscribeViews" | "changeView" | "loadLongText">;
+export type ViewsSource = Pick<
+  MissionsSource,
+  | "subscribeViews"
+  | "changeView"
+  | "loadLongText"
+  | "setViewSource"
+  | "runViewSource"
+  | "loadViewHistory"
+>;
 
 const titleOf = (entry: ViewLayoutEntry): string => {
   if (entry.title !== null) return entry.title;
@@ -204,5 +212,8 @@ export function createViews(ctx: ViewsContext): ViewsSource {
     },
 
     loadLongText: () => fail("not-found", "Sample missions have no reports."),
+    setViewSource: () => fail("not-found", "Sample missions have no sources."),
+    runViewSource: () => fail("not-found", "Sample missions have no sources."),
+    loadViewHistory: () => fail("not-found", "Sample missions have no view history."),
   };
 }
