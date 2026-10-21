@@ -2,7 +2,7 @@
 // whose background children were lost (server restart, OpenCode restart,
 // interrupted runs, role handoffs), plans what each one does next, and sends
 // one notice per thread: the master first, then lanes in sub-mission order at a
-// paced rate, only to idle threads.
+// paced rate. A busy thread gets its notice queued behind the running turn.
 import {
   isOwnerProvenance,
   MissionError,
@@ -65,9 +65,14 @@ const BOOT_SLACK_MS = 10 * MINUTE;
 const SCAN_LOOKBACK_MS = 60 * MINUTE;
 /** A run must have ended this long ago before the scan judges it. */
 const SCAN_SETTLE_MS = 5 * MINUTE;
-/** Lanes start without the master's note if the master stays busy this long. */
+/**
+ * A busy master gets its note queued behind its turn, so lanes wait this long
+ * from detection (or the usual lead, if later) to give it time to read and steer.
+ */
 const MASTER_WAIT_MS = 10 * MINUTE;
-/** Threads still busy after this get skipped so the incident can close. */
+/** stateReason of a notice queued behind a running turn. */
+const QUEUED_REASON = "queued behind its running turn";
+/** Threads still undelivered after this (failing sends) get skipped so the incident can close. */
 const GIVE_UP_MS = 12 * 60 * MINUTE;
 const HANDOFF_LOOKBACK_MS = 30 * MINUTE;
 
@@ -857,47 +862,75 @@ export const make = Effect.gen(function* () {
 
   // --- sending notices ---
 
-  const noticeFor = (incident: RecoveryIncident, thread: RecoveryThread) =>
-    Effect.gen(function* () {
-      const at = Model.clockLabel(
-        incident.cause === "run-interrupted"
-          ? (thread.lastActivityAt ?? incident.windowEnd)
-          : incident.windowEnd,
-        delivery.timeZone,
-      );
-      const context = { cause: incident.cause, at };
-      if (incident.cause === "succession" || thread.roleKind !== "master") {
-        return Model.threadNotice(context, thread);
-      }
-      const mission = yield* store.get("mission", thread.missionId);
-      const settings = yield* settingsOf(thread.missionId);
-      return Model.masterNotice({
-        context,
-        missionTitle: Option.isSome(mission) ? mission.value.title : thread.missionId,
-        downSeconds: incident.downSeconds,
-        master: thread,
-        others: missionThreads(incident, thread.missionId).filter(
-          (other) => other.threadId !== thread.threadId,
-        ),
-        settings,
-      });
+  const noticeFor = Effect.fn("RecoveryService.noticeFor")(function* (
+    incident: RecoveryIncident,
+    thread: RecoveryThread,
+    queue: boolean,
+    now: string,
+  ) {
+    const at = Model.clockLabel(
+      incident.cause === "run-interrupted"
+        ? (thread.lastActivityAt ?? incident.windowEnd)
+        : incident.windowEnd,
+      delivery.timeZone,
+    );
+    const context = { cause: incident.cause, at };
+    if (incident.cause === "succession" || thread.roleKind !== "master") {
+      return Model.threadNotice(context, thread);
+    }
+    const mission = yield* store.get("mission", thread.missionId);
+    const settings = yield* settingsOf(thread.missionId);
+    return Model.masterNotice({
+      context,
+      missionTitle: Option.isSome(mission) ? mission.value.title : thread.missionId,
+      downSeconds: incident.downSeconds,
+      master: thread,
+      others: missionThreads(incident, thread.missionId).filter(
+        (other) => other.threadId !== thread.threadId,
+      ),
+      settings,
+      lanesStartAt: queue
+        ? Model.clockLabel(
+            iso(lanesStartAfter(incident, true, Date.parse(now), settings)),
+            delivery.timeZone,
+          )
+        : null,
     });
+  });
+
+  /**
+   * When lanes may start after the master's note: its lead, or, for a note
+   * queued behind a busy master's turn, no earlier than MASTER_WAIT_MS after
+   * detection, so the master can still read the plan and steer.
+   */
+  const lanesStartAfter = (
+    incident: RecoveryIncident,
+    queued: boolean,
+    noticeAtMs: number,
+    settings: MissionRecoverySettings,
+  ) => {
+    const lead = noticeAtMs + settings.masterLeadSeconds * 1000;
+    return queued ? Math.max(lead, Date.parse(incident.detectedAt) + MASTER_WAIT_MS) : lead;
+  };
 
   /** One notice per incident, mission and thread, whatever route the router picks. */
   const noticeKey = (incident: RecoveryIncident, thread: RecoveryThread) =>
     `${incident.id}:${thread.missionId}:${thread.threadId}`;
 
   /**
-   * Sends one thread's notice if it is idle, never to a running thread. The
-   * router keeps a retry to one delivery only on the same route, and the route
-   * follows membership at call time, so recovery records each notice itself:
-   * claimed before the router is asked, settled when it answers. A claim left
-   * unsettled (the server stopped mid-send) is held for the owner or master.
+   * Sends one thread's notice. An idle thread gets it through its doorbell; a
+   * running one gets it queued, so it lands after the current turn (lanes a
+   * boot wake already restarted would otherwise never hear about their lost
+   * children). The router keeps a retry to one delivery only on the same route,
+   * and the route follows membership and readiness at call time, so recovery
+   * records each notice itself: claimed before the router is asked, settled
+   * when it answers. A claim left unsettled (the server stopped mid-send) is
+   * held for the owner or master.
    */
   const deliver = (start: RecoveryIncident, target: RecoveryThread, now: string) =>
     Effect.gen(function* () {
       const readiness = yield* delivery.readiness(target.threadId);
-      if (readiness === "busy") return { incident: start, sent: false };
+      const queue = readiness === "busy";
       const settle = (patch: Parameters<typeof patchThread>[2]) =>
         Effect.gen(function* () {
           const next = patchThread(start, target, patch);
@@ -933,7 +966,7 @@ export const make = Effect.gen(function* () {
       }
       let outcome: SystemNoticeOutcome | null = null;
       if (claim?.state !== "sent") {
-        const text = yield* noticeFor(start, target);
+        const text = yield* noticeFor(start, target, queue, now);
         yield* recovery.claimNotice({
           key,
           incidentId: start.id,
@@ -949,6 +982,7 @@ export const make = Effect.gen(function* () {
             threadId: target.threadId,
             text,
             key: attempt === 0 ? key : `${key}#${attempt}`,
+            queue,
           })
           .pipe(Effect.result);
         if (Result.isFailure(result)) {
@@ -963,20 +997,30 @@ export const make = Effect.gen(function* () {
         outcome = result.success;
         yield* recovery.settleNotice(key, outcome, now);
       }
-      const next = patchThread(start, target, { state: "sent", stateReason: null, noticeAt: now });
+      // A retry follows the first attempt's route, which may have been the room.
+      const queued = queue && outcome?._tag === "sent";
+      const next = patchThread(start, target, {
+        state: "sent",
+        stateReason: queued ? QUEUED_REASON : null,
+        noticeAt: now,
+      });
+      const title = Model.truncate(target.title, 80);
       yield* store.commit({
         event: {
           missionId: target.missionId,
           kind: "recovery.notice-sent",
           actor: SYSTEM_ACTOR,
           provenance: SYSTEM,
-          summary: `Recovery notice sent to ${who(target)} (${Model.truncate(target.title, 80)}): ${target.action}.`,
+          summary: queued
+            ? `Recovery notice queued for ${who(target)} (${title}) behind its running turn: ${target.action}.`
+            : `Recovery notice sent to ${who(target)} (${title}): ${target.action}.`,
           subject: threadRef(target),
           payload: {
             incidentId: start.id,
             action: target.action,
             position: target.position,
             route: outcome === null ? "already-sent" : outcome._tag,
+            queued,
             ...(outcome?._tag === "posted"
               ? { roomId: outcome.roomId, messageId: outcome.messageId }
               : {}),
@@ -996,7 +1040,7 @@ export const make = Effect.gen(function* () {
         for (const thread of missionThreads(incident, missionId).filter(sendable)) {
           incident = patchThread(incident, thread, {
             state: "skipped",
-            stateReason: "never idle within 12 hours",
+            stateReason: "not delivered within 12 hours",
           });
         }
         if (incident !== start) yield* recovery.saveIncident(incident, now);
@@ -1023,7 +1067,12 @@ export const make = Effect.gen(function* () {
         masterNow === undefined
           ? 0
           : masterNow.noticeAt !== null
-            ? Date.parse(masterNow.noticeAt) + settings.masterLeadSeconds * 1000
+            ? lanesStartAfter(
+                incident,
+                masterNow.stateReason === QUEUED_REASON,
+                Date.parse(masterNow.noticeAt),
+                settings,
+              )
             : sendable(masterNow)
               ? Date.parse(incident.detectedAt) + MASTER_WAIT_MS
               : 0;

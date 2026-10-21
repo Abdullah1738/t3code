@@ -20,7 +20,8 @@ export type RecoveryThreadReadiness = MissionRouter.ThreadReadiness;
  * that mission's control room, with its doorbell; recovery names the mission,
  * so a thread in two missions hears each one's notice in that mission's room.
  * A thread no longer in that mission goes through the router's system
- * delivery (another mission's room, or a queued direct message).
+ * delivery (another mission's room, or a queued direct message). A busy
+ * thread always gets the queued direct message.
  */
 export class RecoveryDelivery extends Context.Service<
   RecoveryDelivery,
@@ -29,20 +30,28 @@ export class RecoveryDelivery extends Context.Service<
     /**
      * Idempotent per key on the route taken at call time. Recovery keeps its
      * own ledger per incident and thread, because a retry after a membership
-     * change takes the other route.
+     * change takes the other route. `queue` sends a busy thread's notice as a
+     * queued message that lands after its running turn.
      */
-    readonly notify: (input: {
-      readonly missionId: MissionId;
-      readonly threadId: ThreadId;
-      readonly text: string;
-      readonly key: string;
-    }) => Effect.Effect<MissionRouter.SystemNoticeOutcome, MissionError>;
+    readonly notify: (
+      input: NoticeInput,
+    ) => Effect.Effect<MissionRouter.SystemNoticeOutcome, MissionError>;
     /** The cutover installer is still holding its own resume messages. */
     readonly installerPending: Effect.Effect<boolean>;
+    /** Recovery's boot pass is done: the router's held wakes and reminders may go. */
+    readonly bootPassDone: Effect.Effect<void>;
     /** The owner's zone for HH:MM in notices. */
     readonly timeZone: string;
   }
 >()("t3/ardud/missions/recovery/RecoveryDelivery") {}
+
+export interface NoticeInput {
+  readonly missionId: MissionId;
+  readonly threadId: ThreadId;
+  readonly text: string;
+  readonly key: string;
+  readonly queue: boolean;
+}
 
 /** The component recovery posts as. */
 export const PRODUCER = "missions-recovery";
@@ -68,71 +77,77 @@ export const layerWith = (options?: {
     RecoveryDelivery,
     Effect.gen(function* () {
       const router = yield* MissionRouter.MissionRouter;
-      const notify = (input: {
-        readonly missionId: MissionId;
-        readonly threadId: ThreadId;
-        readonly text: string;
-        readonly key: string;
-      }) =>
-        Effect.gen(function* () {
-          const roomId = MissionRouter.controlRoomId(input.missionId);
-          // Same post and key the router's own notice would make in this room.
-          const posted = yield* router
-            .relay({
-              input: {
-                missionId: input.missionId,
-                roomId,
-                kind: "request",
-                summary: clipSummary(input.text),
-                body: input.text,
-                to: [{ _tag: "thread", threadId: input.threadId }],
-                key: `recovery:${sha256(input.key).slice(0, 32)}`,
-              },
-              provenance: PROVENANCE,
-              author: actorOf(PROVENANCE),
-              authorThread: null,
-            })
-            .pipe(
-              // Not a member of that mission any more, or the mission is gone:
-              // the router routes it by membership instead.
-              Effect.catchIf(
-                (error) => error.code === "forbidden" || error.code === "not-found",
-                () => Effect.succeed(null),
-              ),
-            );
-          if (posted === null) {
-            return yield* router.notify({
-              threadId: input.threadId,
-              text: input.text,
-              key: input.key,
-              producer: PRODUCER,
-            });
-          }
-          // A retry finds the post already made and rings nothing, so ring:
-          // the doorbell only rings for deliveries still unread.
-          if (!posted.fresh) {
-            yield* router.poke(input.threadId).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("missions recovery: doorbell failed", {
-                  threadId: input.threadId,
-                  cause,
-                }),
-              ),
-            );
-          }
-          return {
-            _tag: "posted",
-            missionId: input.missionId,
-            roomId,
-            messageId: posted.message.id,
-            seq: posted.message.seq,
-          } satisfies MissionRouter.SystemNoticeOutcome;
-        });
+      const notify = Effect.fn("RecoveryDelivery.notify")(function* (input: NoticeInput) {
+        // A busy thread's doorbell would only ring after its turn ends,
+        // which can be hours: queue the text onto the thread instead.
+        if (input.queue) {
+          return yield* router.notify({
+            threadId: input.threadId,
+            text: input.text,
+            key: input.key,
+            producer: PRODUCER,
+            queue: true,
+          });
+        }
+        const roomId = MissionRouter.controlRoomId(input.missionId);
+        // Same post and key the router's own notice would make in this room.
+        const posted = yield* router
+          .relay({
+            input: {
+              missionId: input.missionId,
+              roomId,
+              kind: "request",
+              summary: clipSummary(input.text),
+              body: input.text,
+              to: [{ _tag: "thread", threadId: input.threadId }],
+              key: `recovery:${sha256(input.key).slice(0, 32)}`,
+            },
+            provenance: PROVENANCE,
+            author: actorOf(PROVENANCE),
+            authorThread: null,
+          })
+          .pipe(
+            // Not a member of that mission any more, or the mission is gone:
+            // the router routes it by membership instead.
+            Effect.catchIf(
+              (error) => error.code === "forbidden" || error.code === "not-found",
+              () => Effect.succeed(null),
+            ),
+          );
+        if (posted === null) {
+          return yield* router.notify({
+            threadId: input.threadId,
+            text: input.text,
+            key: input.key,
+            producer: PRODUCER,
+          });
+        }
+        // A retry finds the post already made and rings nothing, so ring:
+        // the doorbell only rings for deliveries still unread.
+        if (!posted.fresh) {
+          yield* router.poke(input.threadId).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("missions recovery: doorbell failed", {
+                threadId: input.threadId,
+                cause,
+              }),
+            ),
+          );
+        }
+        return {
+          _tag: "posted",
+          missionId: input.missionId,
+          roomId,
+          messageId: posted.message.id,
+          seq: posted.message.seq,
+        } satisfies MissionRouter.SystemNoticeOutcome;
+      });
       return RecoveryDelivery.of({
         readiness: router.readiness,
         notify,
         installerPending:
           options?.installerPending ?? Effect.sync(() => NodeFS.existsSync(installerFile())),
+        bootPassDone: router.releaseDoorbells,
         timeZone: options?.timeZone ?? ownerTimeZone(),
       });
     }),

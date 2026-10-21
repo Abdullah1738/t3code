@@ -92,6 +92,8 @@ export interface Sent {
   readonly threadId: string;
   readonly text: string;
   readonly key: string;
+  /** Queued behind a running turn instead of rung. */
+  readonly queue: boolean;
 }
 
 /**
@@ -114,6 +116,8 @@ export const harness = (
     refuse: new Map<string, MissionError>(),
     /** Threads whose notice goes out, then the server stops before the router answers. */
     crash: new Set<string>(),
+    /** Times recovery said its boot pass was done. */
+    bootPasses: 0,
   };
   const delivery = Layer.succeed(
     RecoveryDelivery.RecoveryDelivery,
@@ -131,6 +135,9 @@ export const harness = (
           return { _tag: "sent" as const };
         }),
       installerPending: Effect.sync(() => fake.installer),
+      bootPassDone: Effect.sync(() => {
+        fake.bootPasses += 1;
+      }),
       timeZone: "UTC",
     }),
   );

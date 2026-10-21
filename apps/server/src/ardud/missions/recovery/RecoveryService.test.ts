@@ -465,51 +465,110 @@ it.effect("a failing hold expiry never costs the boot incident or later scans", 
   }).pipe(Effect.provide(layer));
 });
 
-it.effect("resumes follow sub-mission order at the mission's pace and skip busy threads", () => {
-  const { fake, layer } = harness();
-  const laneIn = (name: string, sub: string): Lane => ({
-    ...webLane,
-    id: webLane.id.replace("web", name) as Lane["id"],
-    name,
-    subMissionId: subMission(sub, 0).id,
-    threadId: ThreadId.make(`t-${name}`),
-  });
-  const lanes = [
-    laneIn("a1", "sm-a"),
-    laneIn("a2", "sm-a"),
-    laneIn("b1", "sm-b"),
-    laneIn("b2", "sm-b"),
-  ];
-  return Effect.gen(function* () {
-    yield* restartWorld(lanes, {
-      extra: [
-        { _tag: "sub-mission", record: subMission("sm-a", 1) },
-        { _tag: "sub-mission", record: subMission("sm-b", 0) },
-      ],
+it.effect(
+  "resumes follow sub-mission order at the mission's pace and queue for busy threads",
+  () => {
+    const { fake, layer } = harness();
+    const laneIn = (name: string, sub: string): Lane => ({
+      ...webLane,
+      id: webLane.id.replace("web", name) as Lane["id"],
+      name,
+      subMissionId: subMission(sub, 0).id,
+      threadId: ThreadId.make(`t-${name}`),
     });
-    for (const entry of lanes) yield* cutRun(entry.threadId ?? "", 1, "vp test run");
-    const recovery = yield* RecoveryService.RecoveryService;
-    yield* recovery.setSettings(ownerApp, { missionId, resumePerMinute: 2, masterLeadSeconds: 0 });
-    const incident = yield* boot;
-    assert.deepStrictEqual(
-      threadsOf(incident).map((thread) => thread.threadId),
-      [masterThread, "t-b1", "t-b2", "t-a1", "t-a2"],
-    );
+    const lanes = [
+      laneIn("a1", "sm-a"),
+      laneIn("a2", "sm-a"),
+      laneIn("b1", "sm-b"),
+      laneIn("b2", "sm-b"),
+    ];
+    return Effect.gen(function* () {
+      yield* restartWorld(lanes, {
+        extra: [
+          { _tag: "sub-mission", record: subMission("sm-a", 1) },
+          { _tag: "sub-mission", record: subMission("sm-b", 0) },
+        ],
+      });
+      for (const entry of lanes) yield* cutRun(entry.threadId ?? "", 1, "vp test run");
+      const recovery = yield* RecoveryService.RecoveryService;
+      yield* recovery.setSettings(ownerApp, {
+        missionId,
+        resumePerMinute: 2,
+        masterLeadSeconds: 0,
+      });
+      const incident = yield* boot;
+      assert.deepStrictEqual(
+        threadsOf(incident).map((thread) => thread.threadId),
+        [masterThread, "t-b1", "t-b2", "t-a1", "t-a2"],
+      );
 
-    fake.busy.add("t-b2");
-    assert.strictEqual(yield* recovery.tick, 3);
+      // A busy thread keeps its place: its notice is queued behind the running turn.
+      fake.busy.add("t-b2");
+      assert.strictEqual(yield* recovery.tick, 3);
+      assert.deepStrictEqual(
+        fake.sent.map((sent) => [sent.threadId, sent.queue]),
+        [
+          [masterThread, false],
+          ["t-b1", false],
+          ["t-b2", true],
+        ],
+      );
+      yield* TestClock.adjust("30 seconds");
+      assert.strictEqual(yield* recovery.tick, 0);
+      yield* TestClock.adjust("31 seconds");
+      assert.strictEqual(yield* recovery.tick, 2);
+      assert.deepStrictEqual(
+        fake.sent.map((sent) => sent.threadId),
+        [masterThread, "t-b1", "t-b2", "t-a1", "t-a2"],
+      );
+
+      // Still busy later: the queued notice is not sent again.
+      yield* TestClock.adjust("2 minutes");
+      assert.strictEqual(yield* recovery.tick, 0);
+      assert.strictEqual(fake.sent.filter((sent) => sent.threadId === "t-b2").length, 1);
+      const [after] = yield* recovery.incidents(missionId);
+      const queued = after?.threads.find((thread) => thread.threadId === "t-b2");
+      assert.strictEqual(queued?.state, "sent");
+      assert.strictEqual(queued?.stateReason, "queued behind its running turn");
+      const store = yield* MissionStore.MissionStore;
+      const queuedEvents = (yield* store.eventsSince(missionId, 0)).filter(
+        (event) =>
+          event.kind === "recovery.notice-sent" &&
+          (event.payload as { readonly queued?: boolean } | null)?.queued === true,
+      );
+      assert.deepStrictEqual(
+        queuedEvents.map((event) => event.summary.split(" (")[0]),
+        ['Recovery notice queued for lane "b2"'],
+      );
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("a busy master's queued note still gets its lead before lanes start", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    yield* boot;
+    const recovery = yield* RecoveryService.RecoveryService;
+    fake.busy.add(masterThread);
+    assert.strictEqual(yield* recovery.tick, 1);
     assert.deepStrictEqual(
-      fake.sent.map((sent) => sent.threadId),
-      [masterThread, "t-b1", "t-a1"],
+      fake.sent.map((sent) => [sent.threadId, sent.queue]),
+      [[masterThread, true]],
     );
-    fake.busy.delete("t-b2");
-    yield* TestClock.adjust("30 seconds");
+    // Detected at 09:00:45: lanes wait ten minutes for the master to read it.
+    assert.include(fake.sent[0]?.text ?? "", "4 per minute, lanes start at 09:10):");
+    yield* TestClock.adjust("9 minutes");
     assert.strictEqual(yield* recovery.tick, 0);
-    yield* TestClock.adjust("31 seconds");
-    assert.strictEqual(yield* recovery.tick, 2);
+    yield* TestClock.adjust("1 minute");
+    assert.strictEqual(yield* recovery.tick, 1);
     assert.deepStrictEqual(
-      fake.sent.map((sent) => sent.threadId),
-      [masterThread, "t-b1", "t-a1", "t-b2", "t-a2"],
+      fake.sent.map((sent) => [sent.threadId, sent.queue]),
+      [
+        [masterThread, true],
+        [laneThread, false],
+      ],
     );
   }).pipe(Effect.provide(layer));
 });
@@ -897,6 +956,52 @@ it.effect("notices reach members through their control room, once per incident a
       .filter((event) => event.kind === "recovery.notice-sent")
       .map((event) => (event.payload as { readonly route?: string } | null)?.route);
     assert.deepStrictEqual(routes, ["posted", "already-sent", "posted"]);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a member busy since boot gets its notice queued behind the turn, once", () => {
+  const { threads, layer } = routedHarness();
+  return Effect.gen(function* () {
+    yield* restartWorld([lane]);
+    yield* cutRun(laneThread, 1, "vp test run");
+    const incident = yield* boot;
+    assert.isNotNull(incident);
+    // A router wake restarted the lane before recovery's first pass.
+    threads.activity.set(laneThread, "running");
+    const recovery = yield* RecoveryService.RecoveryService;
+    const router = yield* MissionRouter.MissionRouter;
+    const posts = Effect.map(
+      router.roomPage({ roomId: MissionRouter.controlRoomId(missionId) }, ownerApp),
+      (page) => page.messages.map((message) => message.to),
+    );
+    const toLane = () => threads.sent.filter((sent) => sent.threadId === laneThread);
+
+    assert.strictEqual(yield* recovery.tick, 1);
+    yield* TestClock.adjust("61 seconds");
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.deepStrictEqual(
+      toLane().map((sent) => sent.key),
+      [`recovery:${incident?.id}:${missionId}:${laneThread}`],
+    );
+    assert.isTrue(toLane()[0]?.text.includes("[mission recovery]"));
+    assert.deepStrictEqual(yield* posts, [[{ _tag: "thread", threadId: masterThread }]]);
+
+    // The turn ends and later rounds find nothing left to send.
+    threads.activity.set(laneThread, "idle");
+    yield* TestClock.adjust("2 minutes");
+    assert.strictEqual(yield* recovery.tick, 0);
+    assert.strictEqual(toLane().length, 1);
+    const store = yield* MissionStore.MissionStore;
+    const sent = (yield* store.eventsSince(missionId, 0))
+      .filter((event) => event.kind === "recovery.notice-sent")
+      .map((event) => {
+        const payload = event.payload as { readonly route?: string; readonly queued?: boolean };
+        return [payload.route, payload.queued];
+      });
+    assert.deepStrictEqual(sent, [
+      ["posted", false],
+      ["sent", true],
+    ]);
   }).pipe(Effect.provide(layer));
 });
 

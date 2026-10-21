@@ -114,14 +114,24 @@ const onDomainEvent =
   };
 
 /**
+ * Longest the boot hold lasts when recovery never releases it (off, or its
+ * boot pass failed). Recovery's own pass starts 45 seconds after activation.
+ */
+const BOOT_HOLD_CAP = "3 minutes";
+
+/**
  * Installs the send guard for every transport into a thread, follows run
  * updates so doorbells ring when threads go idle, and sweeps for reminders.
+ * Wakes and reminders wait for recovery's boot pass (or the cap), so recovery
+ * sees each cut run as it was left and the master's note goes out first.
  */
 export const RouterLive = Layer.effectDiscard(
   Effect.gen(function* () {
     const router = yield* MissionRouter.MissionRouter;
     const engine = yield* Orchestrator.OrchestratorV2;
     yield* installSendGuard(router.guard, router.checkSend);
+    yield* router.holdDoorbells;
+    yield* forkParked(Effect.sleep(BOOT_HOLD_CAP).pipe(Effect.andThen(router.releaseDoorbells)));
     yield* forkParked(
       Stream.runForEach(engine.streamDomainEvents, onDomainEvent(router)).pipe(
         Effect.catchCause((cause) =>
