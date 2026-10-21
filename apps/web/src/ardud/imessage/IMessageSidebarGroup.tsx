@@ -58,7 +58,9 @@ export function imessageChatLabel(slug: string): string {
 export function IMessageSidebarGroup() {
   const threads = useThreadShells();
   const chats = sortIMessageChats(groupIMessageThreads(threads.map(iMessageThreadInput)));
-  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  const byId = new Map<string, EnvironmentThreadShell>(
+    threads.map((thread) => [thread.id, thread] as const),
+  );
   const unreadSlugs = new Set(
     chats
       .filter((chat) => chat.threadIds.some((id) => hasUnseenCompletion(byId.get(id)!)))
