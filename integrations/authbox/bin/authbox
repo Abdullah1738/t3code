@@ -1,0 +1,195 @@
+#!/usr/bin/env zsh
+# authbox: one offbox lease per person for logins, sign-ups and cookies that must never touch
+# the owner's Mac or data. Only a tiny state file lives on the Mac. The browser profile, files,
+# secrets and anything built or run for the person live on her box under ~/authbox.
+set -eu
+
+AUTHBOX_HOME=${0:A:h:h}
+ROOT=${AUTHBOX_ROOT:-$HOME/.local/share/authbox}
+OFFBOX=${AUTHBOX_OFFBOX:-offbox}
+AGENT_BROWSER=${AUTHBOX_AGENT_BROWSER:-agent-browser}
+CDP_REMOTE=9242
+
+die()  { print -u2 -- "authbox: $*"; exit 1; }
+note() { print -u2 -- "authbox: $*"; }
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  authbox up <person>                          start/ensure box, CDP launcher and tunnel; prints local CDP port
+  authbox down <person>                        close tunnel, release the lease
+  authbox browser <person> -- <agent-browser args>
+  authbox run <person> -- <cmd...>             runs in ~/authbox/work on the box
+  authbox secret set|get|rm <person> <name>    set reads the value from stdin
+  authbox secret list <person>
+  authbox save <person>                        save a default base and pin it
+  authbox list
+EOF
+  exit 2
+}
+
+check_person() {
+  [[ $1 =~ '^[a-z][a-z0-9-]{0,31}$' ]] || die "person must be a lowercase slug, got '$1'"
+}
+
+person_dir() { print -- "$ROOT/$1"; }
+state_file() { print -- "$ROOT/state/$1.env"; }
+
+load_state() {
+  TUNNEL_PID=
+  LOCAL_PORT=
+  [[ -f $(state_file "$1") ]] && source "$(state_file "$1")"
+  return 0
+}
+
+save_state() {
+  mkdir -p -- "$ROOT/state"
+  printf 'TUNNEL_PID=%s\nLOCAL_PORT=%s\n' "$2" "$3" > "$(state_file "$1")"
+}
+
+tunnel_alive() { [[ -n $TUNNEL_PID ]] && kill -0 "$TUNNEL_PID" 2>/dev/null; }
+
+# Every offbox call runs from the person's dir with a fixed owner thread: the repo key becomes
+# the person slug and the lease belongs to the person, not to whichever thread asked.
+off() {
+  local p=$1; shift
+  mkdir -p -- "$(person_dir "$p")"
+  (cd -- "$(person_dir "$p")" && OFFBOX_THREAD="authbox:$p" "$OFFBOX" "$@")
+}
+
+# --no-fallback and --remote: a failed box call must never re-run on this Mac, where her data
+# must not be created or executed.
+box_run() { local p=$1; shift; off "$p" run --no-sync --no-fallback --remote -- "$*"; }
+box_ssh() { local p=$1; shift; off "$p" ssh -- "$*"; }
+
+free_port() {
+  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+
+wait_cdp() {
+  local port=$1 i
+  for i in {1..40}; do
+    curl -fsS "http://127.0.0.1:$port/json/version" >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+cmd_up() {
+  local p=$1
+  check_person "$p"
+  mkdir -p -- "$(person_dir "$p")" "$ROOT/state"
+  load_state "$p"
+
+  note "$p: preparing box"
+  local setup_b64
+  setup_b64=$(base64 < "$AUTHBOX_HOME/box/setup.sh" | tr -d '\n')
+  box_run "$p" "printf %s '$setup_b64' | base64 -d | bash" >&2 \
+    || die "box setup failed for $p"
+
+  box_ssh "$p" 'mkdir -p ~/authbox && cat > ~/authbox/launch.py' < "$AUTHBOX_HOME/box/launch.py" >&2
+  local cfg="$(person_dir "$p")/config.json"
+  { if [[ -f $cfg ]]; then cat -- "$cfg"; else print -- '{}'; fi; } \
+    | box_ssh "$p" 'cat > ~/authbox/config.json && chmod 600 ~/authbox/config.json' >&2
+
+  # The launcher survives the end of this offbox run: setsid + nohup + all fds redirected.
+  local start='mkdir -p ~/authbox/work; if ! curl -fsS http://127.0.0.1:9242/json/version >/dev/null 2>&1; then setsid nohup xvfb-run -a ~/authbox/venv/bin/python ~/authbox/launch.py >>~/authbox/launcher.log 2>&1 </dev/null & fi; for i in $(seq 1 60); do curl -fsS http://127.0.0.1:9242/json/version >/dev/null 2>&1 && exit 0; sleep 2; done; tail -20 ~/authbox/launcher.log >&2; exit 1'
+  box_run "$p" "$start" >&2 || die "CDP launcher did not come up on the box (~/authbox/launcher.log there)"
+
+  if ! tunnel_alive || [[ -z $LOCAL_PORT ]]; then
+    LOCAL_PORT=$(free_port)
+    local tlog="$ROOT/state/$p-tunnel.log"
+    note "$p: tunnel 127.0.0.1:$LOCAL_PORT -> box:$CDP_REMOTE"
+    cd -- "$(person_dir "$p")"
+    # A live `offbox ports` process touches the lease and holds the auto-stop TTL, so this is what keeps the box up.
+    OFFBOX_THREAD="authbox:$p" nohup "$OFFBOX" ports "$CDP_REMOTE" --local "$LOCAL_PORT" >>"$tlog" 2>&1 </dev/null &
+    TUNNEL_PID=$!
+    save_state "$p" "$TUNNEL_PID" "$LOCAL_PORT"
+  fi
+  wait_cdp "$LOCAL_PORT" || die "CDP at 127.0.0.1:$LOCAL_PORT did not answer (tunnel log: $ROOT/state/$p-tunnel.log)"
+  print -- "$LOCAL_PORT"
+}
+
+cmd_down() {
+  local p=$1
+  check_person "$p"
+  load_state "$p"
+  if [[ -n $TUNNEL_PID ]]; then
+    # offbox ports only closes its `ssh -N` child on Ctrl-C; kill the child we own first so it doesn't outlive us.
+    pkill -P "$TUNNEL_PID" 2>/dev/null || true
+    kill "$TUNNEL_PID" 2>/dev/null || true
+  fi
+  rm -f -- "$(state_file "$p")"
+  off "$p" release --mine >&2 || note "offbox release reported a problem (check: offbox list)"
+  note "$p: down"
+}
+
+cmd_browser() {
+  local p=$1; shift
+  check_person "$p"
+  local port
+  port=$(cmd_up "$p" 2>/dev/null) || die "could not bring up $p's box"
+  exec "$AGENT_BROWSER" --session "authbox-$p" --cdp "$port" --input-mode human "$@"
+}
+
+cmd_run() {
+  local p=$1; shift
+  check_person "$p"
+  (( $# )) || usage
+  cmd_up "$p" >/dev/null
+  box_run "$p" "mkdir -p ~/authbox/work && cd ~/authbox/work && $*"
+}
+
+cmd_secret() {
+  local action=$1 p=$2 name=${3:-}
+  check_person "$p"
+  local dir='~/authbox/secrets'
+  if [[ $action != list ]]; then
+    [[ $name =~ '^[A-Za-z0-9._-]{1,64}$' ]] || die "secret name must match [A-Za-z0-9._-]{1,64}"
+  fi
+  case $action in
+    set)
+      local value
+      value=$(cat)
+      [[ -n $value ]] || die "no secret value on stdin"
+      cmd_up "$p" >/dev/null
+      print -rn -- "$value" | box_ssh "$p" "umask 077; mkdir -p $dir && cat > $dir/$name && chmod 600 $dir/$name"
+      ;;
+    get)  cmd_up "$p" >/dev/null; box_ssh "$p" "cat $dir/$name" ;;
+    rm)   cmd_up "$p" >/dev/null; box_ssh "$p" "rm -f $dir/$name" ;;
+    list) cmd_up "$p" >/dev/null; box_ssh "$p" "ls -1 $dir 2>/dev/null || true" ;;
+    *)    usage ;;
+  esac
+}
+
+cmd_save() {
+  local p=$1
+  check_person "$p"
+  cmd_up "$p" >/dev/null
+  off "$p" save --name authbox --default --note "authbox $p" >&2
+  off "$p" keep --days 3650 >&2
+}
+
+cmd_list() {
+  local f p alive
+  for f in "$ROOT"/state/*.env(N); do
+    p=${f:t:r}
+    load_state "$p"
+    alive=down
+    tunnel_alive && alive=up
+    print -- "$p  cdp=127.0.0.1:${LOCAL_PORT:-?}  tunnel=$alive"
+  done
+}
+
+[[ $# -ge 1 ]] || usage
+cmd=$1; shift
+case $cmd in
+  up)      [[ $# -eq 1 ]] || usage; cmd_up "$1" ;;
+  down)    [[ $# -eq 1 ]] || usage; cmd_down "$1" ;;
+  browser) [[ $# -ge 1 ]] || usage; p=$1; shift; [[ ${1:-} == -- ]] && shift; cmd_browser "$p" "$@" ;;
+  run)     [[ $# -ge 1 ]] || usage; p=$1; shift; [[ ${1:-} == -- ]] && shift; cmd_run "$p" "$@" ;;
+  secret)  [[ $# -ge 2 ]] || usage; cmd_secret "$@" ;;
+  save)    [[ $# -eq 1 ]] || usage; cmd_save "$1" ;;
+  list)    cmd_list ;;
+  *)       usage ;;
+esac
