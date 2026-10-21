@@ -58,7 +58,7 @@ export type LineAppCard = {
 
 export type LineOutbound = { handle: string; chat: ChatKey; text: string; mediaUrl?: string; sentAt: number; status: string };
 
-export type SendOptions = { replyTo?: string; sendStyle?: string };
+export type SendOptions = { replyTo?: string; sendStyle?: string; /** From upload(). */ mediaUrl?: string };
 
 export interface Line {
   /** The dedicated line's own number. */
@@ -69,8 +69,12 @@ export interface Line {
   backfill(sinceMs: number): Promise<LineInbound[]>;
   /** Outbound messages to a chat since sinceMs, used to tell whether an uncertain send actually went out. */
   outbound(chat: ChatKey, sinceMs: number): Promise<LineOutbound[]>;
+  /** Text and/or media. Empty text is allowed when options.mediaUrl is set. */
   sendText(chat: ChatKey, text: string, options?: SendOptions): Promise<{ handle: string }>;
-  sendFile(chat: ChatKey, file: LineFile, options?: SendOptions & { text?: string }): Promise<{ handle: string }>;
+  /** Uploads a file and returns the media_url to pass to sendText. */
+  upload(file: LineFile): Promise<string>;
+  /** One message by handle (inbound or outbound), for reply context. */
+  getMessage(handle: string): Promise<LineInbound | LineOutbound | undefined>;
   sendApp(chat: ChatKey, card: LineAppCard): Promise<{ handle: string }>;
   /** Tapback name (love, like, dislike, laugh, emphasize, question) or a single emoji. Inbound messages only. */
   react(handle: string, reaction: string): Promise<void>;
