@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { groupIMessageThreads, imessageChatOfPath, OWNER_CHAT_SLUG } from "./chatGrouping";
+import {
+  groupIMessageThreads,
+  imessageChatOfPath,
+  OWNER_CHAT_SLUG,
+  sortIMessageChats,
+} from "./chatGrouping";
 
 const ROOT = "/Users/ardud/.robob/imessage";
 
@@ -68,5 +73,16 @@ describe("groupIMessageThreads", () => {
 
   it("returns an empty list when there are no iMessage threads", () => {
     expect(groupIMessageThreads([thread("x", "/tmp/x", "2026-10-20T00:00:00Z")])).toEqual([]);
+  });
+});
+
+describe("sortIMessageChats", () => {
+  it("lists the owner first, then people, then groups", () => {
+    const chats = [{ slug: "group-family-a1b2c3" }, { slug: "moni" }, { slug: OWNER_CHAT_SLUG }];
+    expect(sortIMessageChats(chats).map((chat) => chat.slug)).toEqual([
+      OWNER_CHAT_SLUG,
+      "moni",
+      "group-family-a1b2c3",
+    ]);
   });
 });

@@ -92,3 +92,30 @@ function compareTimes(a: string, b: string): number {
   if (Number.isNaN(left) || Number.isNaN(right)) return a < b ? -1 : a > b ? 1 : 0;
   return left - right;
 }
+
+/** Drops iMessage threads so the ordinary thread list leaves them to the iMessage group. */
+export function withoutIMessageThreads<T extends { readonly worktreePath: string | null }>(
+  threads: ReadonlyArray<T>,
+): ReadonlyArray<T> {
+  const kept = threads.filter((thread) => imessageChatOfPath(thread.worktreePath) === null);
+  return kept.length === threads.length ? threads : kept;
+}
+
+export type IMessageChatKind = "owner" | "person" | "group";
+
+/** Group chats are created with a `group-` slug; everything else other than the owner is a person. */
+export function imessageChatKind(slug: string): IMessageChatKind {
+  if (slug === OWNER_CHAT_SLUG) return "owner";
+  return slug.startsWith("group-") ? "group" : "person";
+}
+
+const KIND_ORDER: Record<IMessageChatKind, number> = { owner: 0, person: 1, group: 2 };
+
+/** Owner first, then people, then groups; each kind keeps its latest-activity order. */
+export function sortIMessageChats<T extends { readonly slug: string }>(
+  chats: ReadonlyArray<T>,
+): ReadonlyArray<T> {
+  return [...chats].sort(
+    (a, b) => KIND_ORDER[imessageChatKind(a.slug)] - KIND_ORDER[imessageChatKind(b.slug)],
+  );
+}

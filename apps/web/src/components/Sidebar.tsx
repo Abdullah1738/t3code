@@ -283,6 +283,8 @@ import { SidebarContent, SidebarGroup, useSidebar } from "./ui/sidebar";
 import { MissionsSidebarGroup } from "../ardud/missions/MissionsSidebarGroup";
 import { useMissionList } from "../ardud/missions/missionsStore";
 import { missionThreadIds, withoutMissionThreads } from "@t3tools/client-runtime/ardud/missions";
+import { withoutIMessageThreads } from "@t3tools/client-runtime/ardud/imessage";
+import { IMessageSidebarGroup } from "../ardud/imessage/IMessageSidebarGroup";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { SidebarHeaderIconButton, SidebarThreadHeader } from "./sidebar/SidebarThreadHeader";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from "./ui/menu";
@@ -461,7 +463,7 @@ function useSidebarThreads(input: {
     input;
   // ardud missions: ui-web (a mission's threads open from the mission, not the list)
   const missionThreads = missionThreadIds(useMissionList());
-  const threads = withoutMissionThreads(useThreadShells(), missionThreads);
+  const threads = withoutIMessageThreads(withoutMissionThreads(useThreadShells(), missionThreads));
   const routeRowThreadKey =
     routeThreadRef === null
       ? null
@@ -4724,6 +4726,9 @@ export default function Sidebar() {
       >
         {/* ardud missions: ui-web */}
         {!isSearchingThreads ? <MissionsSidebarGroup /> : null}
+        {/* ardud imessage: ui-web */}
+        {!isSearchingThreads ? <IMessageSidebarGroup /> : null}
+        {/* end ardud imessage: ui-web */}
         {/* end ardud missions: ui-web */}
         <SidebarGroup className="flex-1" role="presentation">
           {isSearchingThreads ? (
