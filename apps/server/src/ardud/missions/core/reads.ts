@@ -204,8 +204,24 @@ export const makeReads = (
               ...records.lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
             ]),
           ];
+          // ardud missions: routing (only the master's questions reach the owner;
+          // the router's `masterRoleOf` falls back to the master-kind role the same way)
+          const masterRoleId =
+            mission.masterRoleId ??
+            (yield* store.listAllInMission("role", mission.id)).find(
+              (role) => role.kind === "master",
+            )?.id ??
+            null;
+          const masterThreadIds = bindings
+            .filter((binding) => binding.roleId === masterRoleId && binding.endedAt === null)
+            .map((binding) => binding.threadId);
           // ardud missions: router
-          return { ...item, requestsAnswered: answered.get(mission.id) ?? 0, threadIds };
+          return {
+            ...item,
+            requestsAnswered: answered.get(mission.id) ?? 0,
+            threadIds,
+            masterThreadIds,
+          };
         }),
     );
     return { revision: yield* store.revision, missions: items };

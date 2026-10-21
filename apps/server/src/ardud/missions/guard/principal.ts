@@ -36,6 +36,32 @@ export type WsSession = Parameters<typeof ownerAppProvenance>[0]["session"] & {
 };
 
 /**
+ * Components that pass other people's words along. The iMessage bridge relays
+ * whoever texted, and only an inbound that verifies as his is the owner's
+ * (`imessage.ts`), so its own credential still knocks.
+ */
+const RELAY_COMPONENTS: ReadonlySet<string> = new Set(["spectrum-bridge"]);
+
+/**
+ * A bearer session as the guard sees it. A component credential (its origin
+ * claim was validated when Robob issued it) is named by its component and,
+ * unless it relays for others, carries `component` so its sends reach mission
+ * threads directly. Anything else (a one-time token, a paired device) is just
+ * the session.
+ */
+export const sessionPrincipal = (session: WsSession): GuardPrincipal => {
+  const component = session.origin?._tag === "component" ? session.origin.component : undefined;
+  const label = session.clientLabel || component;
+  return {
+    _tag: "session",
+    sessionId: session.sessionId,
+    subject: session.subject,
+    ...(label ? { label } : {}),
+    ...(component !== undefined && !RELAY_COMPONENTS.has(component) ? { component } : {}),
+  };
+};
+
+/**
  * Classifies a WS session once. Only a paired Robob client (see
  * `ownerAppProvenance`, which core r3 moves to the origin claim) is the owner;
  * every other bearer, such as the CLI or a control token, is a session.
@@ -45,14 +71,7 @@ export const wsPrincipal = (input: {
   readonly session: WsSession;
 }): GuardPrincipal => {
   const provenance = ownerAppProvenance(input);
-  return provenance === null
-    ? {
-        _tag: "session",
-        sessionId: input.session.sessionId,
-        subject: input.session.subject,
-        ...(input.session.clientLabel ? { label: input.session.clientLabel } : {}),
-      }
-    : { _tag: "owner", provenance };
+  return provenance === null ? sessionPrincipal(input.session) : { _tag: "owner", provenance };
 };
 
 /**

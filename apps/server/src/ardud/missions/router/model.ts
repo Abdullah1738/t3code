@@ -78,6 +78,12 @@ export type SendSender =
       readonly subject: string;
       /** The client's own name from pairing. Display only: never grants anything. */
       readonly label?: string;
+      /**
+       * The Robob component the credential was issued to, read from its stored
+       * origin claim (never the body). Set only for components whose sends are
+       * their own: see `sessionPrincipal`.
+       */
+      readonly component?: string;
     }
   /** An OAuth MCP client outside Robob. */
   | { readonly _tag: "mcp-client"; readonly sessionId: string; readonly label: string }
@@ -104,7 +110,11 @@ export type GuardReason =
   | "other-mission"
   | "anonymous"
   | "agent-schedule"
-  | "unrecorded-schedule";
+  | "unrecorded-schedule"
+  /** One of Robob's own components (a watcher, t3ctl, crw): delivered and logged. */
+  | "component"
+  /** The target's lead answering the target's pending question. */
+  | "lead";
 
 export type GuardDecision =
   /** Target is not in any mission: the guard has no say. */
@@ -127,14 +137,21 @@ export interface GuardFacts {
   readonly sender: Member | null;
   readonly from: SendSender;
   readonly targetThreadId: ThreadId;
+  /**
+   * The sender thread is one of the target's leads (see `leadTiersOf`) and
+   * this is its answer to the target's pending question.
+   */
+  readonly leads?: boolean;
 }
 
 /**
  * Membership decides who may reach a member thread. Owner typing passes.
- * The master reaches its own members directly. Other members and member
- * services are routed through rooms. Schedules the owner made pass; a
- * thread's schedule passes only into that same thread, and a schedule with no
- * recorded creator is never treated as self. Everything else knocks.
+ * The master reaches its own members directly, and so does a lead answering
+ * the question its lane asked it. Robob's own components reach every member
+ * but the master directly. Other members and member services are routed
+ * through rooms. Schedules the owner made pass; a thread's schedule passes
+ * only into that same thread, and a schedule with no recorded creator is
+ * never treated as self. Everything else knocks.
  */
 export const decideSend = (facts: GuardFacts): GuardDecision => {
   const { target, sender, from } = facts;
@@ -158,6 +175,7 @@ export const decideSend = (facts: GuardFacts): GuardDecision => {
       if (from.threadId === facts.targetThreadId) return allow("self");
       if (!sameMission) return knock(sender === null ? "outsider" : "other-mission");
       if (sender.kind === "master") return allow("master");
+      if (facts.leads === true) return allow("lead");
       return {
         _tag: "route",
         missionId,
@@ -166,6 +184,8 @@ export const decideSend = (facts: GuardFacts): GuardDecision => {
       };
     }
     case "session":
+      // Nothing but the owner reaches the master unasked.
+      if (from.component !== undefined && target.kind !== "master") return allow("component");
       if (sameMission && sender.kind === "service") {
         return {
           _tag: "route",
@@ -188,7 +208,7 @@ export const senderLabel = (from: SendSender): string => {
     case "thread":
       return from.title.length > 0 ? from.title : from.threadId;
     case "session":
-      return from.label ?? "a paired device";
+      return from.label ?? from.component ?? "an unnamed session";
     case "mcp-client":
       return `MCP client ${from.label}`;
     case "schedule":

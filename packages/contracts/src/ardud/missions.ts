@@ -1964,6 +1964,13 @@ export const MissionListItem = Schema.Struct({
    */
   threadIds: Schema.optional(Schema.Array(ThreadId)),
   // --- end ui-web additions ---
+  // --- routing additions ---
+  /**
+   * The master's threads, a subset of `threadIds`. The other mission threads
+   * take their questions to their lead, so only these alert the owner.
+   */
+  masterThreadIds: Schema.optional(Schema.Array(ThreadId)),
+  // --- end routing additions ---
 });
 export type MissionListItem = typeof MissionListItem.Type;
 
@@ -3751,6 +3758,22 @@ export const MissionMasterInbox = Schema.Struct({
 export type MissionMasterInbox = typeof MissionMasterInbox.Type;
 
 // --- end asks additions ---
+
+// --- permissions additions ---
+
+/**
+ * A lead answering a permission request of a thread it leads. A standing rule
+ * (`acceptAlways`) stays with the owner, and `cancel` is not offered because it
+ * stops the lane's turn; the owner still has both in the thread itself.
+ */
+export const RespondMissionApprovalInput = Schema.Struct({
+  threadId: ThreadId,
+  requestId: TrimmedNonEmptyString,
+  decision: Schema.Literals(["accept", "acceptForSession", "decline"]),
+});
+export type RespondMissionApprovalInput = typeof RespondMissionApprovalInput.Type;
+
+// --- end permissions additions ---
 
 // ---------------------------------------------------------------------------
 // Errors

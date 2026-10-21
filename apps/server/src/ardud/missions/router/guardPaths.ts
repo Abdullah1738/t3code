@@ -9,7 +9,12 @@ import { OrchestratorMcpFailure, type MissionProvenance, type ThreadId } from "@
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 
-import { recordedSender, type GuardPrincipal } from "../guard/principal.ts";
+import {
+  recordedSender,
+  sessionPrincipal,
+  type GuardPrincipal,
+  type WsSession,
+} from "../guard/principal.ts";
 import { guardRefusal, guardSend, type SendGuardOutcome } from "./guardHook.ts";
 import type { SendPath, SendSender } from "./model.ts";
 
@@ -108,10 +113,11 @@ export const controlSendPath = (clientRequestId: string | undefined): SendPath =
 /**
  * A control session's send. `owner` is set only when the iMessage bridge
  * relays an inbound that verified as the owner's or Moni's (see
- * `guard/imessage.ts`); every other control send is the session itself.
+ * `guard/imessage.ts`); every other control send is the session itself,
+ * named by its component when it has one (`sessionPrincipal`).
  */
 export const guardControlSend = (input: {
-  readonly session: { readonly sessionId: string; readonly subject: string };
+  readonly session: WsSession;
   readonly owner?: MissionProvenance | null | undefined;
   readonly targetThreadId: ThreadId;
   readonly text: string;
@@ -122,7 +128,7 @@ export const guardControlSend = (input: {
     controlSendPath(input.clientRequestId),
     input.targetThreadId,
     input.owner == null
-      ? { _tag: "session", sessionId: input.session.sessionId, subject: input.session.subject }
+      ? sessionPrincipal(input.session)
       : { _tag: "owner", provenance: input.owner },
     input.text,
     input.commandId,

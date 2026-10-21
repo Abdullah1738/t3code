@@ -86,6 +86,15 @@ export interface ControlMessage {
   updatedAt: string | null;
 }
 
+/** A mission as the missions status snapshot lists it; only the fields the bridge reads. */
+export interface MissionThreads {
+  id: string;
+  /** Threads that belong to the mission. */
+  threadIds?: string[];
+  /** The master's threads; older servers leave it out. */
+  masterThreadIds?: string[];
+}
+
 export interface ControlEventFrame {
   id?: string;
   event?: string;
@@ -207,10 +216,20 @@ export class ControlClient {
   }
 
   /** Robob's session board snapshot. It lives outside the control prefix and has no `ok` envelope. */
-  async board<T>(): Promise<T> {
+  board<T>(): Promise<T> {
+    return this.outside<T>("/api/ardud/board", "board");
+  }
+
+  /** Every listed mission with its thread ids (`GET /api/ardud/missions/status`). */
+  missions(): Promise<{ missions: MissionThreads[] }> {
+    return this.outside("/api/ardud/missions/status", "missions");
+  }
+
+  /** A read-only GET outside the control prefix. */
+  private async outside<T>(path: string, what: string): Promise<T> {
     let response: Response;
     try {
-      response = await fetch(`${this.url}/api/ardud/board`, {
+      response = await fetch(`${this.url}${path}`, {
         headers: { authorization: `Bearer ${this.token}`, accept: "application/json" },
         signal: AbortSignal.timeout(15_000),
         redirect: "manual",
@@ -222,7 +241,7 @@ export class ControlClient {
     }
     if (!response.ok) {
       await response.body?.cancel().catch(() => {});
-      throw new ControlError(response.status, "board");
+      throw new ControlError(response.status, what);
     }
     return await response.json() as T;
   }

@@ -56,6 +56,7 @@ import {
   controlActor,
   guardControlRespond,
   recordControlWrite,
+  telegramAnswerOwner,
 } from "../missions/guard/control.ts";
 import { GUIDANCE_MAX_CHARS, guidanceContext, guidanceFits } from "../missions/guard/guidance.ts";
 import { isBridgeSession, optionalIMessageOwner } from "../missions/guard/imessage.ts";
@@ -1050,9 +1051,10 @@ const makeRoutes = Effect.gen(function* () {
     }
     // ardud missions: guard - the answer is judged before the request changes
     // state, so a routed or knocked answer leaves it pending. It is the owner's
-    // only when the bridge relays a verified iMessage for a thread outside every
-    // mission. One iMessage is one answer: a retry gets the first answer back,
-    // and runs as the first attempt's command.
+    // when the bridge relays a verified iMessage for a thread outside every
+    // mission, or when the Telegram bridge answers from his chat. One iMessage
+    // is one answer: a retry gets the first answer back, and runs as the first
+    // attempt's command.
     const answer = {
       decision: command.type === "runtime-request.respond" ? command.decision : undefined,
       answers: command.type === "runtime-request.respond" ? command.answers : undefined,
@@ -1070,7 +1072,7 @@ const makeRoutes = Effect.gen(function* () {
     });
     if (verified !== null && verified.result !== null) return json(verified.result);
     if (!open) return yield* alreadyIs();
-    const owner = verified?.provenance ?? null;
+    const owner = verified?.provenance ?? telegramAnswerOwner(session);
     const actedAs = verified === null ? commandId : CommandId.make(verified.commandId);
     const decided: OrchestrationV2Command =
       command.type === "runtime-request.respond"

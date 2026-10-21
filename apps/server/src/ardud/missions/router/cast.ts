@@ -10,6 +10,7 @@ import type {
   MissionId,
   Role,
   RoleBinding,
+  SubMission,
   ThreadId,
   WorkItem,
 } from "@t3tools/contracts";
@@ -26,6 +27,9 @@ export interface RouterCast {
   /** Bound role bindings only. */
   readonly bindings: ReadonlyArray<RoleBinding>;
   readonly lanes: ReadonlyArray<Lane>;
+  // --- routing additions ---
+  readonly subMissions: ReadonlyArray<SubMission>;
+  // --- end routing additions ---
 }
 
 /**
@@ -39,7 +43,8 @@ export const readCast = (store: MissionStore.MissionStore["Service"], missionId:
     const roles = yield* store.listAllInMission("role", missionId);
     const bindings = yield* store.listAllInMission("role-binding", missionId, ["bound"]);
     const lanes = yield* store.listAllInMission("lane", missionId);
-    const cast: RouterCast = { missionId, mission, roles, bindings, lanes };
+    const subMissions = yield* store.listAllInMission("sub-mission", missionId);
+    const cast: RouterCast = { missionId, mission, roles, bindings, lanes, subMissions };
     return cast;
   });
 
@@ -104,6 +109,45 @@ export const recordMembership = (cast: RouterCast, threadId: ThreadId): MemberKi
     (lane) => lane.threadId === threadId && lane.status !== "retired",
   );
   return holdsRole || holdsLane ? "created" : null;
+};
+
+/**
+ * Who a mission thread's questions go to, nearest first: its lane's lead,
+ * then its sub-mission's coordinator, then the master. Empty tiers are left
+ * out and the thread is never its own lead. A master thread, or a thread
+ * outside the mission, has no leads: its questions stay the owner's.
+ */
+export const leadTiersOf = (
+  cast: RouterCast,
+  threadId: ThreadId,
+): ReadonlyArray<ReadonlyArray<ThreadId>> => {
+  const masters = masterThreadsOf(cast);
+  if (masters.includes(threadId) || recordMembership(cast, threadId) === null) return [];
+  const held = (roleIds: ReadonlyArray<Role["id"] | null | undefined>) => [
+    ...new Set(
+      roleIds.flatMap((roleId) =>
+        roleId == null ? [] : boundThreads(cast, roleId).filter((each) => each !== threadId),
+      ),
+    ),
+  ];
+  const roleLanes = new Set(
+    cast.roles
+      .filter((role) => role.laneId !== null && boundThreads(cast, role.id).includes(threadId))
+      .map((role) => role.laneId),
+  );
+  const lanes = cast.lanes.filter(
+    (lane) => lane.status !== "retired" && (lane.threadId === threadId || roleLanes.has(lane.id)),
+  );
+  const coordinators = lanes.map(
+    (lane) =>
+      cast.subMissions.find((sub) => sub.id === lane.subMissionId && sub.status !== "closed")
+        ?.coordinatorRoleId,
+  );
+  return [
+    held(lanes.map((lane) => lane.leadRoleId)),
+    held(coordinators),
+    masters.filter((each) => each !== threadId),
+  ].filter((tier) => tier.length > 0);
 };
 
 /** The lane, else the role, a thread holds in this mission: what to call it. */

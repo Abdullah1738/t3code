@@ -134,6 +134,10 @@ const handlers = {
       router.reopenRequest(input, provenance).pipe(Effect.map((request) => ({ request }))),
     ),
   ),
+  // ardud missions: permissions
+  mission_approval_respond: McpToolAccess.actsAsCaller((input) =>
+    asCaller((router, _threadId, provenance) => router.approvalRespond(input, provenance)),
+  ),
 } satisfies McpToolAccess.Handlers<typeof RouterToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(RouterToolkit, handlers);

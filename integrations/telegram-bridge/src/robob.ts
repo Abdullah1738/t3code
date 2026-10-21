@@ -5,8 +5,11 @@ import {
 } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
-  type ControlConfigOptions, type PendingRequest, type ThreadState, type ThreadSummary,
+  type ControlConfigOptions, type MissionThreads, type PendingRequest, type ThreadState, type ThreadSummary,
 } from "./control.ts";
+
+/** How long one missions status read answers `leadAnswers`: about one attention tick. */
+const MISSIONS_FRESH_MS = 5_000;
 
 /** States that mean a thread is still working. `waiting` is not: its reply is out, only background work drains. */
 const BUSY = new Set<ThreadState>(["running", "needs-input", "queued"]);
@@ -91,6 +94,7 @@ export class RobobAlertBackend implements AlertBackend {
   /** Thread id to directory; a thread's folder does not change. */
   private readonly threadDirectories = new Map<string, string>();
   private readonly native = new Map<string, string>();
+  private missionsRead?: { at: number; read: Promise<{ missions: MissionThreads[] }> };
 
   constructor(options: RobobAlertOptions = {}) {
     this.client = options.client ?? new ControlClient(options);
@@ -183,6 +187,32 @@ export class RobobAlertBackend implements AlertBackend {
   /** Full-access threads never ask; subagents inherit their parent's mode. Undefined when unknown. */
   async isSessionAutoAccepting(sessionId: string): Promise<boolean | undefined> {
     try { return (await this.client.thread(await this.resolve(sessionId))).thread.runtimeMode === "full-access"; } catch { return undefined; }
+  }
+
+  /**
+   * Mission threads other than the master take their questions and permission
+   * requests to their lead (Robob's router tells it). One status read serves a
+   * whole attention tick.
+   */
+  async leadAnswers(sessionId: string): Promise<boolean> {
+    try {
+      const threadId = await this.resolve(sessionId);
+      const { missions } = await this.missionThreads();
+      return missions.some(mission => mission.masterThreadIds !== undefined
+        && mission.threadIds?.includes(threadId) === true
+        && !mission.masterThreadIds.includes(threadId));
+    } catch { return false; }
+  }
+
+  private missionThreads(): Promise<{ missions: MissionThreads[] }> {
+    const now = Date.now();
+    if (!this.missionsRead || now - this.missionsRead.at > MISSIONS_FRESH_MS) {
+      const read = this.client.missions();
+      this.missionsRead = { at: now, read };
+      // A failed read is not kept: the next check asks again.
+      read.catch(() => { if (this.missionsRead?.read === read) this.missionsRead = undefined; });
+    }
+    return this.missionsRead.read;
   }
 
   /**

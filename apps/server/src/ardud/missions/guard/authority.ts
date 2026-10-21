@@ -38,6 +38,7 @@ const PrincipalJson = Schema.fromJsonString(
       sessionId: Schema.String,
       subject: Schema.String,
       label: Schema.optionalKey(Schema.String),
+      component: Schema.optionalKey(Schema.String),
     }),
     Schema.TaggedStruct("mcp-client", { sessionId: Schema.String, label: Schema.String }),
   ]),

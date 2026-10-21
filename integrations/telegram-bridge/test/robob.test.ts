@@ -22,9 +22,13 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.db.close();
 });
 
+type MissionThreads = { id: string; threadIds?: string[]; masterThreadIds?: string[] };
+
 function fakeControl(events: string[] = []) {
   const threads = new Map<string, Thread>();
   const calls: Call[] = [];
+  /** The missions status the server reports; null answers 503. */
+  const missions: { list: MissionThreads[] | null } = { list: [] };
   const summary = (thread: Thread) => ({
     ...thread, status: thread.state === "running" ? "running" : "completed", nativeSessionId: null, rootThreadId: thread.parentThreadId ?? thread.threadId,
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
@@ -47,6 +51,10 @@ function fakeControl(events: string[] = []) {
         ...(thread.pending[0] ? { attention: { kind: thread.pending[0].kind, count: thread.pending.length } } : {}),
       }));
       return Response.json({ version: 1, revision: 1, activatedAt: BOARD_ACTIVATED, entries, syncError: null });
+    }
+    if (pathname === "/api/ardud/missions/status") {
+      if (missions.list === null) return Response.json({ ok: false }, { status: 503 });
+      return Response.json({ ok: true, revision: 1, missions: missions.list });
     }
     const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
     if (path === "/health") return ok({ status: "healthy" });
@@ -78,7 +86,7 @@ function fakeControl(events: string[] = []) {
     state: "idle", latestRunId: null, pending: [], ...thread,
   });
   const backend = new RobobAlertBackend({ url: server.url.origin, token: "test-token" });
-  return { threads, calls, add, backend };
+  return { threads, calls, add, backend, missions };
 }
 
 function attention(backend: RobobAlertBackend) {
@@ -189,4 +197,70 @@ test("a pending approval on a root thread becomes an approval prompt with button
   expect(outbox).toHaveLength(1);
   expect(outbox[0]!.text).toContain("Deploy needs your approval.\nPermission perm-9: bash\nmake deploy");
   expect(outbox[0]!.keyboard).toMatchObject({ rows: [[{ text: "Approve once" }, { text: "Reject" }]] });
+});
+
+test("a mission thread's question goes to its lead; the master's and everyone else's still alert", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  const ask = (requestId: string) => [{ requestId, kind: "question" as const, requestKind: "user_input", canRespond: true,
+    questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] }];
+  control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: ask("q-lane") });
+  control.add({ threadId: "master", title: "Crpko master", state: "needs-input", pending: ask("q-master") });
+  control.add({ threadId: "solo", title: "Solo work", state: "needs-input", pending: ask("q-solo") });
+  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"] }];
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  const texts = store.pendingOutbox().map(entry => entry.text);
+  expect(texts).toHaveLength(2);
+  expect(texts.some(text => text.includes("Crpko master"))).toBe(true);
+  expect(texts.some(text => text.includes("Solo work"))).toBe(true);
+  expect(texts.some(text => text.includes("GST lane"))).toBe(false);
+});
+
+test("when the missions read fails, a question alerts as before", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: [{ requestId: "q-lane", kind: "question", requestKind: "user_input",
+    canRespond: true, questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] }] });
+  control.missions.list = null;
+  expect(await control.backend.leadAnswers("lane")).toBe(false);
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("GST lane"))).toBe(true);
+});
+
+test("a mission thread's permission request goes to its lead; the master's and everyone else's still alert", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  const approve = (requestId: string) => [{ requestId, kind: "approval" as const, requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true }];
+  control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: approve("perm-lane") });
+  control.add({ threadId: "master", title: "Crpko master", state: "needs-input", pending: approve("perm-master") });
+  control.add({ threadId: "solo", title: "Solo work", state: "needs-input", pending: approve("perm-solo") });
+  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"] }];
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  const texts = store.pendingOutbox().map(entry => entry.text);
+  expect(texts).toHaveLength(2);
+  expect(texts.some(text => text.includes("Crpko master needs your approval"))).toBe(true);
+  expect(texts.some(text => text.includes("Solo work needs your approval"))).toBe(true);
+  expect(texts.some(text => text.includes("GST lane"))).toBe(false);
+});
+
+test("when the missions read fails, a mission thread's permission request alerts as before", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "lane", title: "GST lane", state: "needs-input",
+    pending: [{ requestId: "perm-lane", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true }] });
+  control.missions.list = null;
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("GST lane needs your approval"))).toBe(true);
 });
