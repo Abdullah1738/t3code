@@ -72,6 +72,8 @@ const rowsOf = (section: ViewSection, data: ViewSectionData | null): ReadonlyArr
       row: { scope: "refs", value: { ...ref, title: refLabel(ref) }, ref },
     }));
   }
+  // Script-backed source rows need the source's declared field kinds, which clients don't bind yet.
+  if (source._tag !== "query") return [];
   const kind = source.query.kind;
   return (data?.rows ?? []).slice(0, 20).map((row) => ({
     key: `${row.ref.kind}:${row.ref.id}`,
