@@ -40,4 +40,9 @@ export type ChatContext = {
   roleOf: (address: string) => { name: string; role: Role };
   /** True while someone in this chat is typing (a typing-on event in the last 30 s with no later typing-off or message). */
   typing: () => boolean;
+  /** Tapback name or one emoji on an inbound message handle. Best effort. */
+  react: (handle: string, reaction: string) => Promise<void>;
 };
+
+/** Sendblue Line constructor input (sendblue.ts). Keys come from credentials.env SENDBLUE_API_KEY_ID / SENDBLUE_API_SECRET. */
+export type SendblueOptions = { keyId: string; secret: string; number: string; fetch?: typeof fetch };
