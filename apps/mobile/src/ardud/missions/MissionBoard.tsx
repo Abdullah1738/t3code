@@ -23,7 +23,7 @@ import { Fragment, useState } from "react";
 import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
-import { DiscussionPanel } from "./Discussion";
+import { DiscussionPanel, OpenDiscussions } from "./Discussion";
 import { FeedError, LoadingLine } from "./FeedError";
 import { EntryRow } from "./InboxPane";
 import {
@@ -133,6 +133,15 @@ function BoardPage(props: PageProps) {
   );
   const since = sinceView(props.overview, props.nowMs);
   const toward = towardView(props.overview, props.nowMs);
+  // Records whose card here carries its discussion; Needs you past the first
+  // few still has one a tap away in the inbox.
+  const discussed = [
+    ...[...waiting, ...snoozed, ...withMaster].map((entry) => ({
+      kind: entry.kind,
+      id: entry.record.id,
+    })),
+    ...since.rows.flatMap((row) => (row.ref ? [row.ref] : [])),
+  ];
 
   return (
     <Page>
@@ -184,6 +193,10 @@ function BoardPage(props: PageProps) {
             />
           ) : null}
         </>
+      ) : null}
+
+      {inbox ? (
+        <OpenDiscussions missionId={missionId} shown={discussed} nowMs={props.nowMs} />
       ) : null}
 
       <SectionHead
