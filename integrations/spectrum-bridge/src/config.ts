@@ -28,6 +28,8 @@ export interface Config {
   transport?: "photon" | "sendblue";
   /** Our Sendblue line number, required when transport is "sendblue". */
   sendblueNumber?: string;
+  /** OpenRouter model for the tool-less scoped third-party responder (guest-responder.ts). */
+  guestModel?: string;
 }
 
 export function transportKind(config: { transport?: unknown }): "photon" | "sendblue" {

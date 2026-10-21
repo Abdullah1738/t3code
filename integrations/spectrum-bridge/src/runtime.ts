@@ -11,6 +11,7 @@ import type { Access, ChatContext, ChatInfo } from "./chats.ts";
 import { chatKey, LineError, type ChatKey, type Line } from "./line.ts";
 import { askOwner, editAccess, location, locationRequest, type SbApiDeps, type SbApiResult } from "./sb-api.ts";
 import { TYPING_WINDOW_MS, type IngressSink } from "./sb-ingress.ts";
+import type { GuestDesk } from "./guest-desk.ts";
 import { getSecretRequest, type SecretDeps } from "./secrets.ts";
 import { sessionMatches } from "./session.ts";
 import { Store } from "./store.ts";
@@ -107,8 +108,9 @@ export class ChatRegistry<P> {
   }
 
   /** Ingress target: opens chats lazily and records typing per chat. */
-  sink(note: IngressSink["note"], enabled: () => boolean = () => true): IngressSink {
+  sink(note: IngressSink["note"], enabled: () => boolean = () => true, guest?: IngressSink["guest"]): IngressSink {
     return {
+      ...(guest ? { guest: async (message: Parameters<NonNullable<IngressSink["guest"]>>[0]) => enabled() ? guest(message) : false } : {}),
       acceptInto: (key, groupName) => {
         if (!enabled()) return { accept: () => false };
         const chat = this.open(key, groupName);
@@ -198,6 +200,8 @@ export type SbApiOptions<P extends { api: Handler }> = {
   health: () => Record<string, unknown>;
   /** Called after an access edit so the next message sees it without waiting for the tick. */
   reloadAccess?: () => Promise<unknown>;
+  /** Scoped third parties (guest-desk.ts). Its routes are owner-chat only. */
+  guests?: GuestDesk;
 };
 
 /** Session-bound routes the per-chat Photon-era API already implements. */
@@ -373,6 +377,53 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           const outcome = await editAccess(deps(), { type: "allow-group", id: id.trim(), ...(name ? { name: name.trim() } : {}) });
           await options.reloadAccess?.();
           return result(outcome);
+        }
+        case "/guest-allow": {
+          only(body, ["address", "name", "purpose", "actions", "expires", "evidence", "sessionId"]);
+          // Never from a shell: a grant must come from the owner's chat, where his words are.
+          ownerOnly(false);
+          if (!options.guests) throw new HttpError(503, "Guests unavailable");
+          const { address, name, purpose, actions, expires, evidence } = body;
+          if (!text(address, 200) || !text(name, 100) || !text(purpose, 300) || !text(evidence, 220)
+            || (expires !== undefined && !text(expires, 10))
+            || !Array.isArray(actions) || actions.length > 4 || actions.some(action => typeof action !== "string")) throw new HttpError(400, "Invalid request");
+          return result(options.guests.allow({ address, name, purpose, actions: actions as string[], evidence, ...(expires ? { expires } : {}) }));
+        }
+        case "/guest-revoke": {
+          only(body, ["address", "sessionId"]);
+          ownerOnly(true);
+          if (!options.guests) throw new HttpError(503, "Guests unavailable");
+          if (!text(body.address, 200)) throw new HttpError(400, "Invalid request");
+          return result(options.guests.revoke(body.address));
+        }
+        case "/guests": {
+          only(body, ["sessionId"]);
+          ownerOnly(true);
+          if (!options.guests) throw new HttpError(503, "Guests unavailable");
+          return result(options.guests.list());
+        }
+        case "/guest-send": {
+          only(body, ["address", "text", "dedupeKey", "sessionId"]);
+          ownerOnly(false);
+          live();
+          if (!options.guests) throw new HttpError(503, "Guests unavailable");
+          if (!text(body.address, 200) || !text(body.text, 2_000) || !text(body.dedupeKey, 200)) throw new HttpError(400, "Invalid request");
+          return result(await options.guests.send(body.address, body.text, body.dedupeKey));
+        }
+        case "/share-contact": {
+          only(body, ["address", "chat", "sessionId"]);
+          ownerOnly(true);
+          live();
+          if (!options.guests) throw new HttpError(503, "Guests unavailable");
+          let address = typeof body.address === "string" ? body.address : undefined;
+          if (body.chat !== undefined) {
+            if (!text(body.chat, 100)) throw new HttpError(400, "Invalid request");
+            const target = registry.bySlugName(body.chat);
+            if (!target || target.info.kind === "group") throw new HttpError(404, "Unknown chat");
+            address = chatKey.target(target.info.key);
+          }
+          if (!text(address, 200)) throw new HttpError(400, "Invalid request");
+          return result(await options.guests.share(address));
         }
         case "/chats": {
           only(body, ["sessionId"]);

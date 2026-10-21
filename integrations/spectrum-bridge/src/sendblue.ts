@@ -436,6 +436,22 @@ export class Sendblue implements Line {
     await this.#call("POST", "/api/request-location", { json: { number: chatKey.target(chat), from_number: this.number }, send: true });
   }
 
+  /**
+   * Name & Photo Sharing: asks iMessage to share the line's published profile with one existing
+   * 1:1 chat. Sendblue dedupes per chat for 24 h; no message is sent.
+   */
+  async shareContact(address: string): Promise<{ requested: boolean; deduplicated: boolean }> {
+    const response = await this.#call("POST", "/api/v2/contact-sharing/share", { json: { fromNumber: this.number, toNumber: address } });
+    const data = isObject(response) && isObject(response.data) ? response.data : {};
+    return { requested: data.requested === true, deduplicated: data.deduplicated === true };
+  }
+
+  /** Current Name & Photo profile of the line. */
+  async contactProfile(): Promise<Record<string, unknown>> {
+    const response = await this.#call("GET", "/api/v2/contact-sharing/state", { query: { fromNumber: this.number } });
+    return isObject(response) && isObject(response.data) ? response.data : {};
+  }
+
   async location(address: string): Promise<LineLocation | LineNoFix | undefined> {
     const response = await this.#call("GET", `/api/location/${encodeURIComponent(address)}`, { query: { from_number: this.number }, allow404: true });
     if (!isObject(response)) return undefined;

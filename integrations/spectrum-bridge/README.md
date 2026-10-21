@@ -152,6 +152,46 @@ under `~/.config/spectrum-bridge/`.
   text travelled inside the leader's prompt. The batch outcome is on the
   leader row; the aggregate is kept in kv `batch:<leaderId>`.
 
+## Scoped third parties (Sendblue mode, 2026-10-21)
+
+Owner rule: someone the owner told to text the line may be answered, but only
+for that one purpose, and the owner's own words are the only approval.
+
+- An unknown 1:1 sender is never answered by an agent. `guest-desk.ts` holds
+  the message (owner store `guest-held:<address>`) and wakes the owner's chat
+  once per sender per 6 hours, at most 6 such wakes an hour (beyond that a
+  Telegram note). The wake quotes their text as data, says whether they are in
+  Contacts (`guest-evidence.ts` reads the AddressBook read-only) and lists
+  evidence: the owner's own outgoing messages (`from_me = 1`) in that person's
+  1:1 iMessage/WhatsApp chat or email to them, last 30 days, that name the line
+  number or "Robob" (message-archive `index.db`, read-only). Groups keep the
+  old Telegram note.
+- `guest-allow` (owner chat session only, never a bare shell or another chat)
+  stores a grant in `~/.config/spectrum-bridge/guests.json`: purpose, actions
+  (`meeting`, `create-hold`), expiry (default 7 d, max 30 d) and the evidence.
+  The bridge checks the evidence itself: `msgs:<id>` must be the owner's
+  outgoing message to that exact address that names the line, or
+  `owner:<inbound id>` must be something he typed in his chat. `create-hold`
+  also needs calendar wording in his message. A new grant replaces the old one;
+  scope never merges. Held messages are released to the responder, and the
+  owner gets a plain notice of the scope.
+- Granted senders are answered by `guest-responder.ts`, not by an agent: one
+  OpenRouter call (`guestModel`, default `anthropic/claude-sonnet-5.5`) with no
+  tools. The bridge works out free windows from `applecal` (start/end only,
+  all-day entries ignored, 10:00-18:00 Mon-Fri, 15 min buffers, 14 days) and
+  puts only those in the prompt. Nothing else about the owner is in it. The
+  model returns JSON (`reply`, `action`, `slot`, `ownerNote`); code checks it:
+  replies with links, emails or phone numbers are replaced and escalated, a
+  `book` slot must fit a free window (max 2 h). Without `create-hold` a booking
+  wakes the owner to confirm; with it the bridge writes a tentative hold and
+  tells him. `escalate`/`decline` wake the owner. Each inbound gets at most one
+  reply (marked before sending), 25 replies a day per guest, and Robob's
+  name and photo are shared after the first reply.
+- `guest-send` relays the owner's decision to someone who has texted the line;
+  `guest-revoke`, `guests` and `share-contact --chat|--address` (Name & Photo
+  Sharing) are owner-only. Every step goes to `guests-audit.jsonl` (0600, no
+  message bodies).
+
 ## Robob backend
 
 The bridge can run on Robob's control API (`/api/ardud/control/*`) instead of

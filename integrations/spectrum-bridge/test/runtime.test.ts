@@ -220,6 +220,34 @@ describe("Sendblue socket API", () => {
     expect(existsSync(join(stateRoot, "access.json"))).toBe(false);
   });
 
+  test("third-party grant routes are owner-chat only; a grant can't come from a shell or another chat", async () => {
+    const env = setup();
+    const chats = env.registry();
+    chats.owner.store.set("route", { id: "ses_owner", generation: 1 });
+    chats.open(chatKey.dm(moni)).store.set("route", { id: "ses_moni", generation: 2 });
+    const calls: string[] = [];
+    const guests = {
+      allow: () => { calls.push("allow"); return { status: 200, body: {} }; },
+      revoke: () => { calls.push("revoke"); return { status: 200, body: {} }; },
+      list: () => ({ status: 200, body: { guests: [] } }),
+      send: async () => { calls.push("send"); return { status: 202, body: {} }; },
+      share: async () => { calls.push("share"); return { status: 200, body: {} }; },
+    } as unknown as NonNullable<Parameters<typeof createSbApi>[0]["guests"]>;
+    const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"), enabled: () => true, health: () => ({}), guests });
+    const post = async (path: string, body: Record<string, unknown>) =>
+      (await handler(new Request(`http://bridge${path}`, { method: "POST", body: JSON.stringify(body) }))).status;
+    const allow = { address: "+447000000002", name: "Sam", purpose: "book a meeting", actions: ["meeting"], evidence: "msgs:1" };
+    expect(await post("/guest-allow", { ...allow, sessionId: "ses_moni" })).toBe(403);
+    expect(await post("/guest-allow", allow)).toBe(403);
+    expect(await post("/guest-send", { address: "+447000000002", text: "hi", dedupeKey: "k", sessionId: "ses_moni" })).toBe(403);
+    expect(await post("/guest-allow", { ...allow, extra: true, sessionId: "ses_owner" })).toBe(400);
+    expect(calls).toEqual([]);
+    expect(await post("/guest-allow", { ...allow, sessionId: "ses_owner" })).toBe(200);
+    expect(await post("/guest-revoke", { address: "+447000000002" })).toBe(200);
+    expect(await post("/share-contact", { chat: "moni", sessionId: "ses_owner" })).toBe(200);
+    expect(calls).toEqual(["allow", "revoke", "share"]);
+  });
+
   test("the owner chat can list chats, message one and pass decisions on", async () => {
     const { post, moniChat, stateRoot } = api();
     const listed = await post("/chats", { sessionId: "ses_owner" });
