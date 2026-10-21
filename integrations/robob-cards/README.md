@@ -23,3 +23,37 @@ signed with the cached "Abdullah Dev Wildcard (iPhone + iPad)" development
 profile, and with `--ota` publishes it to the tailnet OTA page
 (`https://abdullahs-macbook-pro.tailcca332.ts.net:8460/robob-cards/`, see the
 `ios-ota-tailscale` skill). Devices installing that build need Developer Mode.
+
+## Enroll a phone outside the tailnet
+
+`bin/robob-cards-enroll <name> [--thread ID]` gives someone whose iPhone is not
+on the tailnet (Moni) one public link and prints the steps to send them. The
+page runs on a Cloudflare quick tunnel for 24 hours (`--hours`) under an
+unguessable `/c/<token>/` path:
+
+1. "Register this iPhone" downloads a profile; installing it in Settings sends
+   the phone's UDID back to the page.
+2. The tool registers the device with the App Store Connect API, replaces the
+   ad hoc profile "Robob Cards Ad Hoc - <name>" (wildcard App ID, Apple
+   Distribution certificate) with one covering that person's phones, and
+   re-signs the current build with it. Ad hoc builds don't need Developer Mode.
+3. The same page turns into an Install page. Telegram and `--thread` hear
+   about each step.
+
+`status [name]`, `steps <name>`, `install <name> [--udid UDID]` (re-sign after a
+failure or a new build) and `stop <name>` cover the rest; `--help` lists them.
+State lives in `~/.local/share/robob-cards/enroll/<name>`. The App Store
+Connect key and the distribution key and certificate come from
+`~/.config/robob-cards/config.json` (absolute paths):
+
+```json
+{
+  "asc": { "keyId": "...", "issuerId": "...", "keyPath": "/Users/ardud/.config/robob-cards/AuthKey_<id>.p8" },
+  "signing": { "keyPath": "/Users/ardud/.config/robob-cards/dist.key", "certPath": "/Users/ardud/.config/robob-cards/dist.cer" }
+}
+```
+
+Signing uses a throwaway keychain per run, so the login keychain and the
+search list are never touched.
+
+Tests: `node --test test/enroll.test.mjs` and `node --test test/server.test.mjs`.
