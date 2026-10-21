@@ -213,6 +213,8 @@ describe("owner requests", () => {
         [...(listed?.threadIds ?? [])],
         [masterThread, writerThread, laneThread],
       );
+      // routing r21: only the master's own questions may reach the owner.
+      assert.deepStrictEqual(listed?.masterThreadIds, [masterThread]);
 
       // Opening the request to its end clears it.
       const page = yield* router.roomPage({ roomId: request.roomId }, ownerApp);

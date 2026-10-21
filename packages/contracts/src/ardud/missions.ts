@@ -1952,6 +1952,13 @@ export const MissionListItem = Schema.Struct({
    */
   threadIds: Schema.optional(Schema.Array(ThreadId)),
   // --- end ui-web additions ---
+  // --- routing additions ---
+  /**
+   * The master's threads, a subset of `threadIds`. The other mission threads
+   * take their questions to their lead, so only these alert the owner.
+   */
+  masterThreadIds: Schema.optional(Schema.Array(ThreadId)),
+  // --- end routing additions ---
 });
 export type MissionListItem = typeof MissionListItem.Type;
 
