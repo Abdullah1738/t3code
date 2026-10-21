@@ -1,4 +1,4 @@
-import { useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
 
 import type {
   DraftNote,
@@ -12,6 +12,7 @@ import type {
   RoomPage,
   Rule,
   SuggestionStats,
+  ViewLongTextInput,
 } from "@t3tools/contracts";
 import {
   createAtomMissionsTransport,
@@ -19,6 +20,9 @@ import {
   createKeyedSnapshotStores,
   createRpcMissionsSource,
   createSnapshotStore,
+  createViewLongTexts,
+  viewLongTextKey,
+  type ViewLongTextState,
   yourRequests,
   type FeedFailure,
   type SampledFeed,
@@ -135,6 +139,26 @@ export function useMissionViews(missionId: MissionId): MissionViewsState | null 
   const store = viewStores(missionId);
   return useSyncExternalStore(store.subscribe, store.get);
 }
+
+// --- views additions ---
+const longTexts = createViewLongTexts((input) => missionsSource.loadLongText(input));
+
+/** A long row value (a report's text), loaded once its block shows; undefined until asked. */
+export function useViewLongText(input: ViewLongTextInput | null): ViewLongTextState | undefined {
+  const key = input === null ? null : viewLongTextKey(input);
+  const state = useSyncExternalStore(longTexts.subscribe, () =>
+    key === null ? undefined : longTexts.get(key),
+  );
+  useEffect(() => {
+    if (input !== null) longTexts.request(input);
+  }, [input]);
+  return state;
+}
+
+export function retryViewLongText(input: ViewLongTextInput): void {
+  longTexts.request(input, { retry: true });
+}
+// --- end views additions ---
 
 const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | null>((key, emit) => {
   const [missionId, requestId] = key.split("\n") as [MissionId, string];

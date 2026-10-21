@@ -10,6 +10,8 @@ import {
   VIEW_HARD_LIMITS,
   VIEW_NODE_TAGS,
   VIEW_PATHS,
+  VIEW_QUERY_FILTERS,
+  VIEW_QUERY_SORTS,
   VIEW_REF_ROW_PATHS,
   VIEW_SECTION_PATHS,
   VIEW_TABLE_CELL_SLOT,
@@ -60,10 +62,14 @@ export const byteSize = (value: unknown): number =>
 
 type PathTable = Readonly<Record<string, ViewValueKind>>;
 
-/** Resolves a binding to its value kind, or explains why it can't. */
+/**
+ * Resolves a binding to its value kind, or explains why it can't. `perRow` is
+ * set inside a collapsible, where every slot reads the row it folds.
+ */
 type Binder = (
   bind: string,
   slot: ViewBindSlot,
+  perRow: boolean,
 ) => { readonly kind: ViewValueKind } | { readonly code: ViewIssueCode; readonly detail: string };
 
 const lookup = (table: PathTable, path: string): ViewValueKind | undefined =>
@@ -72,28 +78,6 @@ const lookup = (table: PathTable, path: string): ViewValueKind | undefined =>
 const splitBind = (bind: string) => {
   const dot = bind.indexOf(".");
   return { scope: bind.slice(0, dot), path: bind.slice(dot + 1) };
-};
-
-const checkBind = (
-  issues: Issues,
-  binder: Binder,
-  bind: string,
-  slot: ViewBindSlot,
-  path: string,
-) => {
-  const resolved = binder(bind, slot);
-  if ("code" in resolved) {
-    issues.add(path, resolved.code, resolved.detail);
-    return;
-  }
-  const accepts: ReadonlyArray<ViewValueKind> = VIEW_BIND_ACCEPTS[slot];
-  if (!accepts.includes(resolved.kind)) {
-    issues.add(
-      path,
-      "binding-kind",
-      `${bind} is ${resolved.kind}; this slot takes ${accepts.join("|")}`,
-    );
-  }
 };
 
 interface NodeRules {
@@ -107,69 +91,115 @@ interface Walk {
   nodes: number;
 }
 
-const walkNode = (
+/** Where a node sits: inside a collapsible its binds read one row and loads wait for the open. */
+interface Place {
+  readonly path: string;
+  readonly depth: number;
+  readonly folded: boolean;
+}
+
+// One row per collapsible: lists, tables and further collapsibles inside would need rows of rows.
+const NOT_FOLDED: ReadonlySet<ViewNodeTag> = new Set(["list", "table", "collapsible"]);
+
+const checkBind = (
   issues: Issues,
   rules: NodeRules,
-  walk: Walk,
-  node: ViewNode,
-  path: string,
-  depth: number,
+  place: Place,
+  bind: string,
+  slot: ViewBindSlot,
+  at: string,
 ) => {
+  const path = `${place.path}${at}`;
+  const resolved = rules.binder(bind, slot, place.folded);
+  if ("code" in resolved) {
+    issues.add(path, resolved.code, resolved.detail);
+    return;
+  }
+  const accepts: ReadonlyArray<ViewValueKind> = VIEW_BIND_ACCEPTS[slot];
+  if (!accepts.includes(resolved.kind)) {
+    issues.add(
+      path,
+      "binding-kind",
+      `${bind} is ${resolved.kind}; this slot takes ${accepts.join("|")}`,
+    );
+  } else if (resolved.kind === "longtext" && !place.folded) {
+    issues.add(path, "binding-kind", `${bind} is longtext; it binds only inside a collapsible`);
+  }
+};
+
+const walkNode = (issues: Issues, rules: NodeRules, walk: Walk, node: ViewNode, place: Place) => {
   walk.nodes += 1;
+  const { path, depth } = place;
   if (depth > VIEW_HARD_LIMITS.depth) {
     issues.add(path, "limit", `nested deeper than ${VIEW_HARD_LIMITS.depth} levels`);
   }
-  const refusal = rules.allowed(node._tag);
+  const refusal =
+    place.folded && NOT_FOLDED.has(node._tag)
+      ? `${node._tag} blocks can't sit inside a collapsible`
+      : rules.allowed(node._tag);
   if (refusal !== null) issues.add(path, "node-not-allowed", refusal);
+  const bind = (value: string, slot: ViewBindSlot, at: string) =>
+    checkBind(issues, rules, place, value, slot, at);
+  const walkChildren = (children: ReadonlyArray<ViewNode>, folded: boolean) =>
+    children.forEach((child, index) =>
+      walkNode(issues, rules, walk, child, {
+        path: `${path}.children[${index}]`,
+        depth: depth + 1,
+        folded,
+      }),
+    );
   switch (node._tag) {
     case "text":
-      checkBind(issues, rules.binder, node.bind, "text", `${path}.bind`);
+      bind(node.bind, "text", ".bind");
       return;
     case "facts":
-      node.rows.forEach((row, index) =>
-        checkBind(issues, rules.binder, row.bind, "fact", `${path}.rows[${index}].bind`),
-      );
+      node.rows.forEach((row, index) => bind(row.bind, "fact", `.rows[${index}].bind`));
       return;
     case "flags":
     case "links":
     case "refs":
-      checkBind(issues, rules.binder, node.bind, node._tag, `${path}.bind`);
+      bind(node.bind, node._tag, ".bind");
       return;
     case "list":
-      checkBind(issues, rules.binder, node.title, "listTitle", `${path}.title`);
-      node.meta.forEach((bind, index) =>
-        checkBind(issues, rules.binder, bind, "listMeta", `${path}.meta[${index}]`),
-      );
-      if (node.status !== null) {
-        checkBind(issues, rules.binder, node.status, "listStatus", `${path}.status`);
-      }
+      bind(node.title, "listTitle", ".title");
+      node.meta.forEach((value, index) => bind(value, "listMeta", `.meta[${index}]`));
+      if (node.status !== null) bind(node.status, "listStatus", ".status");
       return;
     case "group":
-      node.children.forEach((child, index) =>
-        walkNode(issues, rules, walk, child, `${path}.children[${index}]`, depth + 1),
-      );
+      walkChildren(node.children, place.folded);
       return;
     case "table":
       node.columns.forEach((column, index) =>
-        checkBind(
-          issues,
-          rules.binder,
-          column.bind,
-          VIEW_TABLE_CELL_SLOT[column.as],
-          `${path}.columns[${index}].bind`,
-        ),
+        bind(column.bind, VIEW_TABLE_CELL_SLOT[column.as], `.columns[${index}].bind`),
       );
       return;
     case "meter":
-      checkBind(issues, rules.binder, node.value, "meter", `${path}.value`);
-      checkBind(issues, rules.binder, node.max, "meter", `${path}.max`);
+      bind(node.value, "meter", ".value");
+      bind(node.max, "meter", ".max");
       return;
     case "gallery":
-      checkBind(issues, rules.binder, node.bind, "gallery", `${path}.bind`);
+      bind(node.bind, "gallery", ".bind");
       if (node.review === "per-asset" && rules.reviews !== true) {
         issues.add(`${path}.review`, "node-not-allowed", "per-asset review needs an ask card");
       }
       return;
+    case "markdown":
+      bind(node.bind, "markdown", ".bind");
+      return;
+    case "collapsible": {
+      if (node.title === null && node.label === undefined) {
+        issues.add(`${path}.title`, "shape", "a collapsible needs a title binding or a label");
+      }
+      const head = { ...place, folded: true };
+      if (node.title !== null) {
+        checkBind(issues, rules, head, node.title, "collapsibleTitle", ".title");
+      }
+      node.meta.forEach((value, index) =>
+        checkBind(issues, rules, head, value, "collapsibleMeta", `.meta[${index}]`),
+      );
+      walkChildren(node.children, true);
+      return;
+    }
     case "label":
     case "draft":
     case "choice":
@@ -214,7 +244,7 @@ const checkBody = (
       }
       return;
     }
-    walkNode(issues, rules, walk, decoded.success, path, 1);
+    walkNode(issues, rules, walk, decoded.success, { path, depth: 1, folded: false });
   });
   if (walk.nodes > VIEW_HARD_LIMITS.nodesPerDefinition) {
     issues.add("body", "limit", `at most ${VIEW_HARD_LIMITS.nodesPerDefinition} blocks in all`);
@@ -285,9 +315,14 @@ export const checkTemplate = (
   context: TemplateContext,
 ): CheckResult => {
   const issues = new Issues();
-  const binder = templateBinder(definition);
+  const rules: NodeRules = {
+    allowed: templateNodeRule(definition.backing),
+    binder: templateBinder(definition),
+    reviews: definition.backing === "ask",
+  };
   if (definition.title !== null && definition.title !== undefined) {
-    checkBind(issues, binder, definition.title, "title", "title");
+    const top = { path: "title", depth: 0, folded: false };
+    checkBind(issues, rules, top, definition.title, "title", "");
   }
 
   const fieldKeys = new Set<string>();
@@ -305,16 +340,7 @@ export const checkTemplate = (
     }
   });
 
-  const nodes = checkBody(
-    issues,
-    {
-      allowed: templateNodeRule(definition.backing),
-      binder,
-      reviews: definition.backing === "ask",
-    },
-    definition.body,
-    VIEW_HARD_LIMITS.templateBody,
-  );
+  const nodes = checkBody(issues, rules, definition.body, VIEW_HARD_LIMITS.templateBody);
 
   const actions = new Set<string>();
   definition.actions.forEach((action, index) => {
@@ -399,9 +425,11 @@ const SECTION_NODES: ReadonlySet<ViewNodeTag> = new Set([
   "group",
   "table",
   "meter",
+  "collapsible",
+  "markdown",
 ]);
 
-/** Slots read per row (list and table cells); the rest bind row.count / row.total. */
+/** Slots read per row (list rows, table cells); anything inside a collapsible reads its row too. */
 const ROW_SLOTS: ReadonlySet<ViewBindSlot> = new Set([
   "listTitle",
   "listMeta",
@@ -414,38 +442,24 @@ const ROW_SLOTS: ReadonlySet<ViewBindSlot> = new Set([
   "cellCount",
 ]);
 
-/** Query filters each record kind can take. */
-const WHERE_KINDS = {
-  subMissionId: ["work-item", "note", "approval", "draft", "ask", "milestone", "call"],
-  laneId: ["work-item", "note"],
-  status: ["approval", "draft", "ask", "milestone", "sub-mission"],
-  stage: ["work-item"],
-  workKind: ["work-item"],
-  noteType: ["note"],
-  approvalKind: ["approval"],
-  channel: ["draft"],
-  flag: ["approval", "draft"],
-  requestedBy: ["approval", "draft"],
-} as const satisfies Record<string, ReadonlyArray<ViewQueryKind>>;
-
-const SORT_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = {
-  rank: ["sub-mission"],
-  due: ["milestone"],
-};
+const WHERE_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = VIEW_QUERY_FILTERS;
+const SORT_KINDS: Readonly<Record<string, ReadonlyArray<ViewQueryKind>>> = VIEW_QUERY_SORTS;
 
 const sectionBinder =
   (rowPaths: PathTable): Binder =>
-  (bind, slot) => {
+  (bind, slot, perRow) => {
     const { scope, path } = splitBind(bind);
     if (scope !== "row") return { code: "bad-binding", detail: "sections bind row paths only" };
-    const inList = ROW_SLOTS.has(slot);
+    const inList = perRow || ROW_SLOTS.has(slot);
     const kind = inList
       ? (lookup(rowPaths, path) ?? lookup(VIEW_DERIVED_PATHS, path))
       : lookup(VIEW_SECTION_PATHS, path);
     if (kind !== undefined) return { kind };
     return {
       code: "bad-binding",
-      detail: inList ? `rows have no ${path}` : `outside a list only row.count and row.total bind`,
+      detail: inList
+        ? `rows have no ${path}`
+        : `outside a list, table or collapsible only row.count and row.total bind`,
     };
   };
 
@@ -466,8 +480,8 @@ export const checkSection = (
     rowPaths = VIEW_PATHS[query.kind];
     for (const [filter, kinds] of Object.entries(WHERE_KINDS)) {
       if (
-        query.where?.[filter as keyof typeof WHERE_KINDS] !== undefined &&
-        !(kinds as ReadonlyArray<string>).includes(query.kind)
+        query.where?.[filter as keyof typeof VIEW_QUERY_FILTERS] !== undefined &&
+        !kinds.includes(query.kind)
       ) {
         issues.add(`source.query.where.${filter}`, "field", `${query.kind} rows have no ${filter}`);
       }

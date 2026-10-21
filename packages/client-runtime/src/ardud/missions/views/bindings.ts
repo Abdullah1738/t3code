@@ -5,9 +5,11 @@ import {
   VIEW_SECTION_PATHS,
   type AskOption,
   type MissionActor,
+  type MissionId,
   type MissionLink,
   type MissionRecordRef,
   type ViewFieldValue,
+  type ViewLongTextInput,
   type ViewPathScope,
   type ViewValueKind,
 } from "@t3tools/contracts";
@@ -33,12 +35,18 @@ export interface ViewBindContext {
   readonly record: object | null;
   /** Values for `field.<key>`, from the record's `view.fields`. */
   readonly fields?: Readonly<Record<string, ViewFieldValue>>;
-  /** What `row.<path>` reads inside a section list. */
-  readonly row?: { readonly scope: ViewPathScope | "refs"; readonly value: object } | null;
+  /** What `row.<path>` reads inside a section list; `ref` is the row's record. */
+  readonly row?: {
+    readonly scope: ViewPathScope | "refs";
+    readonly value: object;
+    readonly ref?: MissionRecordRef | null;
+  } | null;
   /** Section-level `row.count` / `row.total`. */
   readonly section?: { readonly count: number; readonly total: number };
   readonly nowMs: number;
   readonly masterRoleId?: string | null;
+  /** Where long row values load from. */
+  readonly missionId?: MissionId | null;
 }
 
 const text = (value: string | null | undefined): ViewValue | null =>
@@ -142,6 +150,9 @@ const coerce = (
       return Array.isArray(raw)
         ? { kind: "assets", assetIds: raw.filter((id): id is string => typeof id === "string") }
         : null;
+    // Long values stay off the snapshot; a markdown block loads them on open.
+    case "longtext":
+      return typeof raw === "string" ? text(raw) : null;
     case "facts": {
       if (typeof raw !== "object") return null;
       const parts = Object.entries(raw).flatMap(([key, value]) =>
@@ -252,6 +263,21 @@ export function resolveViewBind(bind: string, context: ViewBindContext): ViewVal
     default:
       return null;
   }
+}
+
+/** Where a row's `longtext` value loads from; null for any other bind. */
+export function viewLongTextSource(
+  bind: string,
+  context: ViewBindContext,
+): ViewLongTextInput | null {
+  const row = context.row;
+  if (!bind.startsWith("row.") || !row?.ref || row.scope === "refs" || !context.missionId) {
+    return null;
+  }
+  const path = bind.slice("row.".length);
+  return lookup(VIEW_PATHS[row.scope], path) === "longtext"
+    ? { missionId: context.missionId, ref: row.ref, path }
+    : null;
 }
 
 /** A value as one line of text, for titles, text blocks and fact rows. */

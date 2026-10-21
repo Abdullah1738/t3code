@@ -25,6 +25,7 @@ import {
   type RestoreViewInput,
   type RestoreViewLayoutInput,
   type ViewHistoryInput,
+  type ViewLongTextInput,
   ViewSectionData,
   viewPinnedStrip,
 } from "@t3tools/contracts";
@@ -35,7 +36,7 @@ import * as Stream from "effect/Stream";
 import { OWNER_SESSION_REQUIRED, ownerAppProvenance } from "../core/provenance.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import type { MissionWsConnection } from "../ws.ts";
-import { queriedKinds, sectionData } from "./sectionRows.ts";
+import { queriedKinds } from "./sectionRows.ts";
 import { GLOBAL_TIMELINE, ViewService } from "./ViewService.ts";
 
 const sameSectionRows = Schema.toEquivalence(Schema.Array(ViewSectionData));
@@ -82,6 +83,10 @@ const changedKind = (item: MissionStreamItem): string | null => {
   return null;
 };
 
+type FeedTick =
+  | { readonly _tag: "item"; readonly item: MissionStreamItem }
+  | { readonly _tag: "report-saved" };
+
 interface FeedState {
   readonly snapshot: MissionViewsSnapshot;
   /** Kinds changed since the last event. */
@@ -113,14 +118,34 @@ export const makeViewsWsHandlers = (
     Stream.unwrap(
       Effect.gen(function* () {
         const subscription = yield* store.subscribe;
+        const reports = yield* views.reportSaves;
         const first = yield* views.snapshot(input.missionId);
-        const updates = Stream.fromSubscription(subscription).pipe(
+        // A saved report is not a store commit, so it arrives as its own tick.
+        const reportSaved = Stream.fromSubscription(reports).pipe(
+          Stream.filter((missionId) => missionId === input.missionId),
+          Stream.map((): FeedTick => ({ _tag: "report-saved" })),
+        );
+        const commits = Stream.fromSubscription(subscription).pipe(
           Stream.filter(touches(input.missionId)),
+          Stream.map((item): FeedTick => ({ _tag: "item", item })),
+        );
+        const updates = Stream.merge(commits, reportSaved).pipe(
           Stream.mapAccumEffect(
             (): FeedState => ({ snapshot: first, changed: new Set() }),
-            (state, item) =>
+            (state, tick) =>
               Effect.gen(function* () {
                 const last = state.snapshot;
+                if (tick._tag === "report-saved") {
+                  if (!queriedKinds(last.sections).has("report")) return [state, []] as const;
+                  const rows = yield* views.sectionData(input.missionId, last.sections);
+                  if (sameSectionRows(rows, last.sectionData ?? [])) return [state, []] as const;
+                  const snapshot: MissionViewsSnapshot = { ...last, sectionData: rows };
+                  return [
+                    { snapshot, changed: state.changed },
+                    [{ _tag: "snapshot", snapshot } as MissionViewsFeedItem],
+                  ] as const;
+                }
+                const item = tick.item;
                 const kind = changedKind(item);
                 if (kind !== null) {
                   const next: FeedState = {
@@ -137,7 +162,7 @@ export const makeViewsWsHandlers = (
                 const queried = queriedKinds(last.sections);
                 const rowsMayMove = [...state.changed].some((changed) => queried.has(changed));
                 const rows = rowsMayMove
-                  ? yield* sectionData(store, input.missionId, last.sections)
+                  ? yield* views.sectionData(input.missionId, last.sections)
                   : (last.sectionData ?? []);
                 const counts = yield* views.waiting(input.missionId);
                 const pinned = viewPinnedStrip(last.layout.layout, counts);
@@ -171,6 +196,7 @@ export const makeViewsWsHandlers = (
     [M.catalog]: (_input: Record<string, never>) => views.catalog,
     [M.history]: (input: ViewHistoryInput) => views.history(input),
     [M.preview]: (input: PreviewViewInput) => views.preview(input),
+    [M.longText]: (input: ViewLongTextInput) => views.longText(input),
     [M.defineTemplate]: asOwner((provenance, input: DefineViewTemplateInput) =>
       views.defineTemplate(provenance, input),
     ),

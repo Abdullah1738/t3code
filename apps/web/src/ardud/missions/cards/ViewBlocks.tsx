@@ -1,5 +1,5 @@
 import { useMemo, useState, type MouseEvent } from "react";
-import { XIcon } from "lucide-react";
+import { ChevronRightIcon, XIcon } from "lucide-react";
 
 import type { AssetResource, DraftChannel } from "@t3tools/contracts";
 import {
@@ -11,6 +11,7 @@ import {
   type ViewGalleryAsset,
   type ViewTableCell,
 } from "@t3tools/client-runtime/ardud/missions";
+import type { ViewLongTextInput } from "@t3tools/contracts";
 
 import { useAssetUrlState } from "../../../assets/assetUrls";
 import { Button } from "../../../components/ui/button";
@@ -18,6 +19,8 @@ import { Dialog, DialogPopup, DialogTitle } from "../../../components/ui/dialog"
 import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../../state/environments";
+import ChatMarkdown from "../../../components/ChatMarkdown";
+import { missionErrorMessage, retryViewLongText, useViewLongText } from "../missionsStore";
 import {
   ChoiceBlock,
   DraftBlock,
@@ -134,8 +137,150 @@ function ViewBlockView(props: {
           <ViewBlocks blocks={block.children} choice={props.choice} review={props.review} />
         </GroupBlock>
       );
+    // --- views additions ---
+    case "markdown":
+      return block.source ? (
+        <LongMarkdown source={block.source} maxLines={block.maxLines} />
+      ) : (
+        <MarkdownText text={block.text ?? ""} maxLines={block.maxLines} />
+      );
+    case "collapsible":
+      return <CollapsibleBlock block={block} choice={props.choice} review={props.review} />;
+    // --- end views additions ---
   }
 }
+
+// --- views additions ---
+// ---------------------------------------------------------------------------
+// collapsible, markdown
+
+function CollapsibleBlock(props: {
+  block: Extract<ViewBlock, { kind: "collapsible" }>;
+  choice: ViewChoiceState | undefined;
+  review: ViewReviewState | undefined;
+}) {
+  // Taps override the default, so a newer first row still opens by itself.
+  const [toggled, setToggled] = useState<ReadonlyMap<string, boolean>>(new Map());
+  return (
+    <ul className="flex min-w-0 flex-col">
+      {props.block.items.map((item, index) => {
+        const open = toggled.get(item.key) ?? (props.block.open === "first" && index === 0);
+        const toggle = () => setToggled((current) => new Map(current).set(item.key, !open));
+        const long = item.children.some((child) => child.kind === "markdown");
+        return (
+          <li key={item.key} className={cn("flex min-w-0 flex-col", DESK_ROW)}>
+            <button
+              type="button"
+              aria-expanded={open}
+              onClick={toggle}
+              className="flex min-w-0 items-baseline gap-2 rounded-lg py-2 text-start text-sm outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset"
+            >
+              <ChevronRightIcon
+                aria-hidden
+                className={cn(
+                  "size-3.5 shrink-0 self-center text-(--m-muted)",
+                  open && "rotate-90",
+                )}
+              />
+              <span className="min-w-0 flex-1 truncate font-medium text-(--m-text)">
+                {item.title}
+              </span>
+              {item.meta.map((meta) => (
+                <span
+                  key={meta}
+                  className="hidden shrink-0 text-xs text-(--m-muted) tabular-nums sm:inline"
+                >
+                  {meta}
+                </span>
+              ))}
+            </button>
+            {open ? (
+              <div className="flex min-w-0 flex-col gap-2.5 pb-3 ps-5.5">
+                {item.meta.length > 0 ? (
+                  <p className="text-xs text-(--m-muted) tabular-nums sm:hidden">
+                    {item.meta.join(" · ")}
+                  </p>
+                ) : null}
+                <ViewBlocks blocks={item.children} choice={props.choice} review={props.review} />
+                {long ? (
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost-muted"
+                    className="self-start"
+                    onClick={toggle}
+                  >
+                    Collapse
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/** Lines of `text-sm leading-relaxed`; markdown blocks can't line-clamp, so they cap height. */
+const markdownCap = (maxLines: number | null) =>
+  maxLines === null ? undefined : { maxHeight: `${maxLines * 1.625}em` };
+
+function MarkdownText(props: { text: string; maxLines: number | null }) {
+  if (props.text.trim() === "") return null;
+  return (
+    <div
+      className={cn("min-w-0 text-(--m-text)", props.maxLines !== null && "overflow-hidden")}
+      style={markdownCap(props.maxLines)}
+    >
+      <ChatMarkdown text={props.text} cwd={undefined} headingLevelOffset={2} />
+    </div>
+  );
+}
+
+function LongMarkdown(props: { source: ViewLongTextInput; maxLines: number | null }) {
+  const state = useViewLongText(props.source);
+  if (state === undefined || state.status === "loading") {
+    return (
+      <div aria-hidden className="flex flex-col gap-2 py-1">
+        {[0.9, 0.7, 0.8].map((width) => (
+          <span
+            key={width}
+            className="h-3 rounded-md bg-(--m-active)"
+            style={{ width: `${width * 100}%` }}
+          />
+        ))}
+      </div>
+    );
+  }
+  if (state.status === "failed") {
+    return (
+      <div className="flex min-w-0 items-center gap-3 text-sm text-(--m-muted)">
+        <span className="min-w-0 flex-1">{missionErrorMessage(state.error)}</span>
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost-muted"
+          onClick={() => retryViewLongText(props.source)}
+        >
+          Retry
+        </Button>
+      </div>
+    );
+  }
+  const { value } = state;
+  return (
+    <>
+      <MarkdownText text={value.text} maxLines={props.maxLines} />
+      {value.truncated ? (
+        <p className="text-xs text-(--m-muted)">
+          Cut at {value.text.length.toLocaleString()} of {value.size.toLocaleString()} characters.
+        </p>
+      ) : null}
+    </>
+  );
+}
+// --- end views additions ---
 
 // ---------------------------------------------------------------------------
 // list, table, meter

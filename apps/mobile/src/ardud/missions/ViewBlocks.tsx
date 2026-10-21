@@ -3,6 +3,7 @@ import type {
   AssetResource,
   MissionId,
   ViewBackedRecord,
+  ViewLongTextInput,
 } from "@t3tools/contracts";
 import {
   assetMarkOf,
@@ -20,14 +21,19 @@ import {
   type ViewListRow,
   type ViewTableRow,
 } from "@t3tools/client-runtime/ardud/missions";
+import { missionErrorMessage } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { Image } from "expo-image";
 import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { Modal, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppText as Text } from "../../components/ui/AppText";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { useMarkdownPreviewStyles } from "../../features/files/FileMarkdownPreview";
 import { assetImageSource } from "../../lib/assetImageSource";
 import { cn } from "../../lib/cn";
+import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
+import { SelectableMarkdownText } from "../../native/SelectableMarkdownText";
 import { useAssetUrl } from "../../state/assets";
 import { useMissionsEnvironmentId } from "./missionsStore";
 import {
@@ -44,7 +50,7 @@ import {
   Title,
 } from "./parts";
 import { useReviewMarks } from "./reviewMarks";
-import { useMissionViews } from "./viewsStore";
+import { retryViewLongText, useMissionViews, useViewLongText } from "./viewsStore";
 
 // The phone's drawing of view blocks: the bodies of templated cards and the
 // sections the master placed. Tables become stacked rows, the first column
@@ -151,8 +157,132 @@ function Block(props: BlockProps & { readonly block: ViewBlock }) {
           <ViewBlocks blocks={block.children} choice={props.choice} review={props.review} />
         </View>
       );
+    // --- views additions ---
+    case "markdown":
+      return block.source === null ? (
+        <MarkdownText text={block.text ?? ""} maxLines={block.maxLines} />
+      ) : (
+        <LongMarkdown source={block.source} maxLines={block.maxLines} />
+      );
+    case "collapsible":
+      return <CollapsibleRows block={block} choice={props.choice} review={props.review} />;
+    // --- end views additions ---
   }
 }
+
+// --- views additions ---
+function CollapsibleRows(
+  props: BlockProps & { readonly block: Extract<ViewBlock, { kind: "collapsible" }> },
+) {
+  // Taps override the default, so a newer first row still opens by itself.
+  const [toggled, setToggled] = useState<ReadonlyMap<string, boolean>>(new Map());
+  return (
+    <View>
+      {props.block.items.map((item, index) => {
+        const open = toggled.get(item.key) ?? (props.block.open === "first" && index === 0);
+        const toggle = () => setToggled((current) => new Map(current).set(item.key, !open));
+        const long = item.children.some((child) => child.kind === "markdown");
+        return (
+          <Fragment key={item.key}>
+            {index > 0 ? <View className="h-px bg-border" /> : null}
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ expanded: open }}
+              onPress={toggle}
+              className="min-h-11 flex-row items-center gap-2.5 py-2.5"
+            >
+              <SymbolView
+                name={open ? "chevron.down" : "chevron.right"}
+                size={12}
+                tintColorClassName="accent-icon-subtle"
+                type="monochrome"
+              />
+              <View className="min-w-0 flex-1 gap-1">
+                <Title>{item.title}</Title>
+                {item.meta.length > 0 ? (
+                  <View className="flex-row flex-wrap gap-x-3 gap-y-1">
+                    {item.meta.map((meta) => (
+                      <Meta key={meta}>{meta}</Meta>
+                    ))}
+                  </View>
+                ) : null}
+              </View>
+            </Pressable>
+            {open ? (
+              <View className="gap-3 pb-3 pl-[22px]">
+                <ViewBlocks blocks={item.children} choice={props.choice} review={props.review} />
+                {long ? (
+                  <View className="items-start">
+                    <LinkButton label="Collapse" onPress={toggle} />
+                  </View>
+                ) : null}
+              </View>
+            ) : null}
+          </Fragment>
+        );
+      })}
+    </View>
+  );
+}
+
+function MarkdownText(props: { readonly text: string; readonly maxLines: number | null }) {
+  const styles = useMarkdownPreviewStyles();
+  if (props.text.trim() === "") return null;
+  // The native markdown view can't clamp lines, so a capped block clips its height.
+  const cap = props.maxLines === null ? null : props.maxLines * styles.nativeTextStyle.lineHeight;
+  return (
+    <View
+      className={cap === null ? undefined : "overflow-hidden"}
+      style={{ maxHeight: cap ?? undefined }}
+    >
+      <SelectableMarkdownText
+        markdown={props.text}
+        textStyle={styles.nativeTextStyle}
+        onLinkPress={(href) => void tryOpenExternalUrl(href, "markdown-link")}
+      />
+    </View>
+  );
+}
+
+function LongMarkdown(props: {
+  readonly source: ViewLongTextInput;
+  readonly maxLines: number | null;
+}) {
+  const state = useViewLongText(props.source);
+  if (state === undefined || state.status === "loading") {
+    return (
+      <View accessibilityLabel="Loading" className="gap-2 py-1">
+        {[0.9, 0.7, 0.8].map((width) => (
+          <View
+            key={width}
+            className="h-3 rounded-md bg-secondary"
+            style={{ width: `${width * 100}%` }}
+          />
+        ))}
+      </View>
+    );
+  }
+  if (state.status === "failed") {
+    return (
+      <View className="flex-row items-center gap-3">
+        <Meta className="min-w-0 flex-1">{missionErrorMessage(state.error)}</Meta>
+        <LinkButton label="Retry" onPress={() => retryViewLongText(props.source)} />
+      </View>
+    );
+  }
+  const { value } = state;
+  return (
+    <>
+      <MarkdownText text={value.text} maxLines={props.maxLines} />
+      {value.truncated ? (
+        <Meta>
+          Cut at {value.text.length.toLocaleString()} of {value.size.toLocaleString()} characters.
+        </Meta>
+      ) : null}
+    </>
+  );
+}
+// --- end views additions ---
 
 function ChoiceList(props: {
   readonly options: ReadonlyArray<ViewChoiceOption>;
@@ -530,7 +660,9 @@ const galleryAssets = (blocks: ReadonlyArray<ViewBlock>): ReadonlyArray<ViewGall
       ? block.assets
       : block.kind === "group"
         ? galleryAssets(block.children)
-        : [],
+        : block.kind === "collapsible"
+          ? block.items.flatMap((item) => galleryAssets(item.children))
+          : [],
   );
 
 /**

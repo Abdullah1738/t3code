@@ -1563,6 +1563,9 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
           return;
       }
     },
+    // --- views additions ---
+    loadLongText: (input) => transport.request(VIEWS.longText, input),
+    // --- end views additions ---
 
     // --- Owner requests ---
 

@@ -33,6 +33,10 @@ const SECTION_NODES: ReadonlySet<ViewNodeTag> = new Set([
   "table",
   "meter",
   "group",
+  // --- views additions ---
+  "collapsible",
+  "markdown",
+  // --- end views additions ---
 ]);
 
 export const viewSectionAllows = (tag: ViewNodeTag): boolean => SECTION_NODES.has(tag);
@@ -65,14 +69,14 @@ const rowsOf = (section: ViewSection, data: ViewSectionData | null): ReadonlyArr
     return source.refs.map((ref) => ({
       key: `${ref.kind}:${ref.id}`,
       ref,
-      row: { scope: "refs", value: { ...ref, title: refLabel(ref) } },
+      row: { scope: "refs", value: { ...ref, title: refLabel(ref) }, ref },
     }));
   }
   const kind = source.query.kind;
   return (data?.rows ?? []).slice(0, 20).map((row) => ({
     key: `${row.ref.kind}:${row.ref.id}`,
     ref: row.ref,
-    row: { scope: kind, value: row.value },
+    row: { scope: kind, value: row.value, ref: row.ref },
   }));
 };
 
@@ -87,6 +91,7 @@ export function viewSection(section: ViewSection, options: ViewSectionOptions): 
     section: { count: raw.length, total },
     nowMs: options.nowMs,
     masterRoleId: options.masterRoleId ?? null,
+    missionId: section.missionId,
   };
   const rows = raw.map((row): ViewRowContext => ({
     key: row.key,

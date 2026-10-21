@@ -34,6 +34,8 @@ import {
   ViewCatalog,
   ViewHistory,
   ViewHistoryInput,
+  ViewLongText,
+  ViewLongTextInput,
   ViewPinned,
   ViewPreview,
 } from "./missionsViews.ts";
@@ -55,6 +57,9 @@ export const MISSIONS_VIEWS_WS_METHODS = {
   applyBundle: "missions.views.applyBundle",
   addAsset: "missions.views.addAsset",
   removeAsset: "missions.views.removeAsset",
+  // --- views additions ---
+  longText: "missions.views.longText",
+  // --- end views additions ---
 } as const;
 
 const M = MISSIONS_VIEWS_WS_METHODS;
@@ -106,6 +111,7 @@ export const MissionsViewsRpcs = RpcGroup.make(
   call(M.applyBundle, ApplyViewBundleInput, MissionMutationResult),
   call(M.addAsset, AddMissionAssetInput, MissionMutationResult),
   call(M.removeAsset, RemoveMissionAssetInput, MissionMutationResult),
+  call(M.longText, ViewLongTextInput, ViewLongText),
 );
 
 export const MISSIONS_VIEWS_READ_SCOPES = {
@@ -114,6 +120,7 @@ export const MISSIONS_VIEWS_READ_SCOPES = {
   [M.catalog]: AuthOrchestrationReadScope,
   [M.history]: AuthOrchestrationReadScope,
   [M.preview]: AuthOrchestrationReadScope,
+  [M.longText]: AuthOrchestrationReadScope,
 } as const;
 
 export const MISSIONS_VIEWS_GUARDED_SCOPES = {

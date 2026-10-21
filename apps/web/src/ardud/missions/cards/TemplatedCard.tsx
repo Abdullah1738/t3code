@@ -44,7 +44,9 @@ const galleryAssets = (blocks: ReadonlyArray<ViewBlock>): ReadonlyArray<ViewGall
       ? block.assets
       : block.kind === "group"
         ? galleryAssets(block.children)
-        : [],
+        : block.kind === "collapsible"
+          ? block.items.flatMap((item) => galleryAssets(item.children))
+          : [],
   );
 
 export function useTemplatedCard(

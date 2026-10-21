@@ -13,10 +13,13 @@ import {
   type ViewSectionRow,
   ViewNode,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
+import type { ReportKind } from "../scribe/reports.ts";
+import type { ReportSummary, ScribeStore } from "../scribe/ScribeStore.ts";
 import type * as MissionStore from "../store/MissionStore.ts";
 
 const decodeNode = Schema.decodeUnknownOption(ViewNode);
@@ -35,6 +38,7 @@ const nodeBinds = (node: ViewNode): ReadonlyArray<string> => {
     case "links":
     case "refs":
     case "gallery":
+    case "markdown":
       return [node.bind];
     case "facts":
       return node.rows.map((row) => row.bind);
@@ -44,6 +48,12 @@ const nodeBinds = (node: ViewNode): ReadonlyArray<string> => {
       return node.columns.map((column) => column.bind);
     case "meter":
       return [node.value, node.max];
+    case "collapsible":
+      return [
+        ...(node.title === null ? [] : [node.title]),
+        ...node.meta,
+        ...node.children.flatMap(nodeBinds),
+      ];
     case "group":
       return node.children.flatMap(nodeBinds);
     case "label":
@@ -142,9 +152,71 @@ const rowOf = (
   return { ref, value };
 };
 
+// Report rows come from the scribe's own table and never carry the text itself.
+const REPORT_KINDS: ReadonlyArray<ReportKind> = ["daily", "update"];
+
+/** The report's first markdown heading, else a name for its kind. */
+export const reportTitle = (report: Pick<ReportSummary, "kind" | "head">): string => {
+  for (const line of report.head.split("\n")) {
+    const heading = /^#{1,6}\s+(.+?)\s*#*\s*$/.exec(line.trim());
+    if (heading?.[1]) return heading[1].slice(0, 120);
+  }
+  return report.kind === "daily" ? "Daily report" : "Update";
+};
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+const utcParts = (iso: string) => {
+  const date = DateTime.make(iso);
+  if (Option.isNone(date)) return null;
+  const parts = DateTime.toPartsUtc(date.value);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return {
+    day: `${parts.day} ${MONTHS[parts.month - 1]}`,
+    time: `${pad(parts.hour)}:${pad(parts.minute)}`,
+  };
+};
+
+/** "21 Oct 00:00–04:00 UTC", or both days when the window crosses midnight. */
+export const reportPeriod = (fromIso: string, toIso: string): string => {
+  const from = utcParts(fromIso);
+  const to = utcParts(toIso);
+  if (from === null || to === null) return "";
+  return from.day === to.day
+    ? `${from.day} ${from.time}–${to.time} UTC`
+    : `${from.day} ${from.time} – ${to.day} ${to.time} UTC`;
+};
+
+/** "850 chars", "22k chars". */
+export const reportSize = (chars: number): string =>
+  chars < 1000 ? `${chars} chars` : `${Math.round(chars / 1000)}k chars`;
+
+const reportRow = (report: ReportSummary, fields: ReadonlySet<string>): ViewSectionRow => {
+  const title = reportTitle(report);
+  const all: Fields = {
+    title,
+    kind: report.kind,
+    period: reportPeriod(report.coversFrom, report.coversTo),
+    size: reportSize(report.size),
+    coversFrom: report.coversFrom,
+    coversTo: report.coversTo,
+    createdAt: report.createdAt,
+  };
+  const value: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (all[field] !== undefined) value[field] = all[field];
+  }
+  return { ref: { kind: "report", id: report.reportId, label: title }, value };
+};
+
+export interface SectionSources {
+  readonly store: MissionStore.MissionStore["Service"];
+  readonly scribe: ScribeStore["Service"];
+}
+
 /** Rows for one query section, or null for a refs section. */
 export const sectionRows = (
-  store: MissionStore.MissionStore["Service"],
+  { store, scribe }: SectionSources,
   missionId: MissionId,
   section: ViewSection,
 ) =>
@@ -152,9 +224,20 @@ export const sectionRows = (
     const source = section.definition.source;
     if (source._tag !== "query") return null;
     const query = source.query;
+    const fields = rowFields(section.definition.body);
+    if (query.kind === "report") {
+      const listed = yield* scribe
+        .listReports(missionId, query.where?.reportKind ?? REPORT_KINDS, query.limit)
+        .pipe(Effect.orDie);
+      const data: ViewSectionData = {
+        sectionId: section.id,
+        rows: listed.rows.map((report) => reportRow(report, fields)),
+        total: listed.total,
+      };
+      return data;
+    }
     const all = yield* store.listAllInMission(query.kind, missionId, statusFilter(query));
     const matched = (all as ReadonlyArray<Fields>).filter((record) => matches(query, record));
-    const fields = rowFields(section.definition.body);
     const rows = matched
       .toSorted(compare(query))
       .slice(0, query.limit)
@@ -165,13 +248,13 @@ export const sectionRows = (
 
 /** Rows for every active query section of a mission. */
 export const sectionData = (
-  store: MissionStore.MissionStore["Service"],
+  sources: SectionSources,
   missionId: MissionId,
   sections: ReadonlyArray<ViewSection>,
 ) =>
   Effect.forEach(
     sections.filter((section) => section.status === "active"),
-    (section) => sectionRows(store, missionId, section),
+    (section) => sectionRows(sources, missionId, section),
   ).pipe(Effect.map((all) => all.filter((data): data is ViewSectionData => data !== null)));
 
 /** Record kinds an active section queries; a commit touching one refreshes rows. */

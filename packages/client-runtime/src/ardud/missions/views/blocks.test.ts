@@ -16,9 +16,11 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   assetFeedback,
+  createViewLongTexts,
   markAsset,
   viewCard,
   viewSection,
+  viewLongTextKey,
   viewSectionData,
   withAssetFeedback,
   type ViewBlock,
@@ -148,6 +150,162 @@ describe("section rows from the server", () => {
     expect(viewSection(queue, { nowMs: NOW }).empty).toBe(true);
     const none = { ...data, rows: [], total: 0 };
     expect(viewSection(queue, { nowMs: NOW, data: none }).empty).toBe(true);
+  });
+});
+
+describe("report sections", () => {
+  const reports = section("sec-r", {
+    title: "Updates",
+    source: {
+      _tag: "query",
+      query: { kind: "report", where: { reportKind: ["update"] }, sort: "created-desc", limit: 8 },
+    },
+    body: [
+      {
+        _tag: "collapsible",
+        title: "row.title",
+        meta: ["row.period", "row.size"],
+        open: "first",
+        children: [
+          { _tag: "markdown", bind: "row.text" },
+          // A list can't fold inside a row; it is dropped, the rest stays.
+          { _tag: "list", title: "row.title", meta: [], status: null },
+        ],
+      },
+    ],
+  });
+  const row = (id: string, title: string) => ({
+    ref: { kind: "report" as const, id, label: title },
+    value: { title, period: "21 Oct 00:00–04:00 UTC", size: "22k chars" },
+  });
+  const data = {
+    sectionId: ViewSectionId.make("sec-r"),
+    total: 9,
+    rows: [row("crpko|update|b", "04:00 update"), row("crpko|update|a", "00:00 update")],
+  };
+
+  it("folds each report under its header and loads the text only from its source", () => {
+    const view = viewSection(reports, { nowMs: NOW, data });
+    expect(view.dropped).toBe(1);
+    expect(view.blocks).toEqual([
+      {
+        kind: "collapsible",
+        open: "first",
+        items: ["crpko|update|b", "crpko|update|a"].map((id, index) => ({
+          key: `report:${id}`,
+          title: index === 0 ? "04:00 update" : "00:00 update",
+          meta: ["21 Oct 00:00–04:00 UTC", "22k chars"],
+          children: [
+            {
+              kind: "markdown",
+              text: null,
+              maxLines: null,
+              source: { missionId, ref: data.rows[index]?.ref, path: "text" },
+            },
+          ],
+        })),
+      },
+    ]);
+  });
+
+  it("drops a markdown block whose short text is empty and keeps a card's fold", () => {
+    const notes = section("sec-n", {
+      title: "Notes",
+      source: { _tag: "query", query: { kind: "note", sort: "created-desc", limit: 5 } },
+      body: [
+        {
+          _tag: "collapsible",
+          title: null,
+          label: "Details",
+          meta: [],
+          open: "none",
+          children: [{ _tag: "markdown", bind: "row.summary", maxLines: 4 }],
+        },
+      ],
+    });
+    const view = viewSection(notes, {
+      nowMs: NOW,
+      data: {
+        sectionId: ViewSectionId.make("sec-n"),
+        total: 2,
+        rows: [
+          { ref: { kind: "note", id: "n-1" }, value: { summary: "**Bold** call" } },
+          { ref: { kind: "note", id: "n-2" }, value: { summary: "  " } },
+        ],
+      },
+    });
+    expect(view.blocks).toEqual([
+      {
+        kind: "collapsible",
+        open: "none",
+        items: [
+          {
+            key: "note:n-1",
+            title: "Details",
+            meta: [],
+            children: [{ kind: "markdown", text: "**Bold** call", source: null, maxLines: 4 }],
+          },
+        ],
+      },
+    ]);
+  });
+});
+
+describe("long texts", () => {
+  const input = (id: string) => ({
+    missionId,
+    ref: { kind: "report" as const, id },
+    path: "text",
+  });
+  const answer = (id: string) => ({
+    ref: { kind: "report" as const, id },
+    path: "text",
+    text: `# ${id}`,
+    size: id.length + 2,
+    truncated: false,
+  });
+  // The store's own handlers attach first, so these settle after its state moved.
+  const pending: Array<Promise<unknown>> = [];
+  const settled = () => Promise.allSettled(pending);
+
+  it("asks the server once per text, keeps the newest few and retries a failure on request", async () => {
+    const asked: Array<string> = [];
+    let failNext = true;
+    const texts = createViewLongTexts((request) => {
+      asked.push(request.ref.id);
+      const reply =
+        request.ref.id === "flaky" && failNext
+          ? Promise.reject(new Error("offline"))
+          : Promise.resolve(answer(request.ref.id));
+      if (request.ref.id === "flaky") failNext = false;
+      pending.push(reply);
+      return reply;
+    }, 2);
+    let changes = 0;
+    texts.subscribe(() => (changes += 1));
+    const state = (id: string) => texts.get(viewLongTextKey(input(id)));
+
+    texts.request(input("a"));
+    texts.request(input("a"));
+    expect(state("a")).toEqual({ status: "loading" });
+    await settled();
+    expect(state("a")).toEqual({ status: "loaded", value: answer("a") });
+    texts.request(input("b"));
+    texts.request(input("c"));
+    await settled();
+    expect(state("a")).toBeUndefined();
+    expect(state("c")).toEqual({ status: "loaded", value: answer("c") });
+
+    texts.request(input("flaky"));
+    await settled();
+    expect(state("flaky")?.status).toBe("failed");
+    texts.request(input("flaky"));
+    expect(state("flaky")?.status).toBe("failed");
+    texts.request(input("flaky"), { retry: true });
+    await settled();
+    expect(state("flaky")).toEqual({ status: "loaded", value: answer("flaky") });
+    expect(asked).toEqual(["a", "b", "c", "flaky", "flaky"]);
+    expect(changes).toBe(10);
   });
 });
 

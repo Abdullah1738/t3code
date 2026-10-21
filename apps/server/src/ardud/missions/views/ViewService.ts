@@ -19,6 +19,7 @@ import {
   VIEW_CATALOG,
   VIEW_CATALOG_VERSION,
   VIEW_HARD_LIMITS,
+  VIEW_PATHS,
   ViewSectionId,
   ViewTemplateId,
   formatViewIssues,
@@ -59,8 +60,12 @@ import {
   type ViewLayout,
   type ViewLayoutDefinition,
   type ViewLayoutEntry,
+  type ViewLongText,
+  type ViewLongTextInput,
+  type ViewPathScope,
   type ViewPreview,
   type ViewSection,
+  type ViewSectionData,
   type ViewStarterLayout,
   type ViewStatus,
   type ViewTemplate,
@@ -70,6 +75,8 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import type * as PubSub from "effect/PubSub";
+import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../../../config.ts";
@@ -78,6 +85,7 @@ import { standingOf } from "../asks/standing.ts";
 import { castOf } from "../core/master.ts";
 import { actorOf } from "../core/provenance.ts";
 import * as MissionService from "../MissionService.ts";
+import { ScribeStore } from "../scribe/ScribeStore.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { assetFilePath, deleteAssetFile, readAssetSource, writeAssetFile } from "./assets.ts";
 import { applyLayoutOps, insertInRegion } from "./layoutOps.ts";
@@ -126,6 +134,15 @@ export class ViewService extends Context.Service<
     readonly removeAsset: Write<RemoveMissionAssetInput>;
     /** An archived mission's images go: records expire and the copies are deleted. */
     readonly expireAssets: (missionId: MissionId) => Effect.Effect<void, MissionError>;
+    /** Rows of the given query sections, as the snapshot carries them. */
+    readonly sectionData: (
+      missionId: MissionId,
+      sections: ReadonlyArray<ViewSection>,
+    ) => Effect.Effect<ReadonlyArray<ViewSectionData>, MissionError>;
+    /** A row's `longtext` value, which the snapshot leaves out. */
+    readonly longText: (input: ViewLongTextInput) => Effect.Effect<ViewLongText, MissionError>;
+    /** Mission ids, published after the scribe saves a report. */
+    readonly reportSaves: Effect.Effect<PubSub.Subscription<string>, never, Scope.Scope>;
   }
 >()("t3/ardud/missions/views/ViewService") {}
 
@@ -232,6 +249,7 @@ const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
   const missions = yield* MissionService.MissionService;
   const views = yield* ViewStore.ViewStore;
+  const scribe = yield* ScribeStore;
   const { attachmentsDir } = yield* ServerConfig.ServerConfig;
   const lock = yield* Semaphore.make(1);
   const serial = <A, E>(effect: Effect.Effect<A, E>) => lock.withPermit(effect);
@@ -457,7 +475,7 @@ const make = Effect.gen(function* () {
         pinnedStrip: pinned.needsYou || pinned.requests,
         pinned,
         changesToday: yield* views.changesSince(mission.id, since),
-        sectionData: yield* sectionData(store, mission.id, sections),
+        sectionData: yield* sectionData({ store, scribe }, mission.id, sections),
         assets: (yield* views.assets(mission.id)).filter((asset) => asset.status === "active"),
       };
       return result;
@@ -1612,8 +1630,33 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const longText = Effect.fn("ViewService.longText")(function* (input: ViewLongTextInput) {
+    const mission = yield* requireMission(input.missionId);
+    const scope = input.ref.kind as ViewPathScope;
+    const kind = Object.hasOwn(VIEW_PATHS, scope) ? VIEW_PATHS[scope][input.path] : undefined;
+    if (kind !== "longtext") {
+      return yield* fail("invalid", `${input.ref.kind} rows have no long text ${input.path}`);
+    }
+    const max = VIEW_HARD_LIMITS.longTextChars;
+    // Reports are the only rows with long text today.
+    const found = yield* scribe.reportText(mission.id, input.ref.id, max).pipe(Effect.orDie);
+    if (found === null)
+      return yield* fail("not-found", `No report ${input.ref.id} in this mission.`);
+    const result: ViewLongText = {
+      ref: input.ref,
+      path: input.path,
+      text: found.text,
+      size: found.size,
+      truncated: found.size > max,
+    };
+    return result;
+  });
+
   return ViewService.of({
     snapshot,
+    sectionData: (missionId, sections) => sectionData({ store, scribe }, missionId, sections),
+    longText,
+    reportSaves: scribe.reportSaves,
     catalog: Effect.succeed(VIEW_CATALOG),
     history,
     preview,

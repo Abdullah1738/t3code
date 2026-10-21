@@ -205,6 +205,8 @@ export const MissionRecordKind = Schema.Literals([
   "view-layout",
   "view-starter-layout",
   "view-asset",
+  /** A scribe report row in a report section; not a store record. */
+  "report",
   // --- end views additions ---
   // --- core additions ---
   "portfolio",

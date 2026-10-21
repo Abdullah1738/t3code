@@ -282,6 +282,21 @@ export const ViewGalleryNode = Schema.TaggedStruct("gallery", {
   bind: ViewBind,
   review: Schema.Literals(["none", "per-asset"]),
 });
+/** Markdown text. A `longtext` value only binds inside a collapsible, which loads it on open. */
+export const ViewMarkdownNode = Schema.TaggedStruct("markdown", {
+  bind: ViewBind,
+  maxLines: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 40 }))),
+});
+/** A collapsible's header; its children decode on their own like a group's. */
+export const ViewCollapsibleHead = Schema.Struct({
+  /** Null shows `label`. */
+  title: Schema.NullOr(ViewBind),
+  label: Schema.optionalKey(ViewKicker),
+  meta: Schema.Array(ViewBind).check(Schema.isMaxLength(3)),
+  /** `first` opens the first item on load. */
+  open: Schema.Literals(["none", "first"]),
+});
+export type ViewCollapsibleHead = typeof ViewCollapsibleHead.Type;
 // --- end views additions ---
 
 export const ViewLeafNode = Schema.Union([
@@ -298,6 +313,7 @@ export const ViewLeafNode = Schema.Union([
   ViewTableNode,
   ViewMeterNode,
   ViewGalleryNode,
+  ViewMarkdownNode,
   // --- end views additions ---
 ]);
 export type ViewLeafNode = typeof ViewLeafNode.Type;
@@ -308,18 +324,48 @@ export interface ViewGroupNode {
   readonly direction: "column" | "row";
   readonly children: ReadonlyArray<ViewNode>;
 }
-export type ViewNode = ViewLeafNode | ViewGroupNode;
+// --- views additions ---
+/**
+ * A header that opens to show its children. In a section there is one per
+ * row and the children bind that row; a `longtext` value inside never rides
+ * in the snapshot, the client loads it on open.
+ */
+export interface ViewCollapsibleNode extends ViewCollapsibleHead {
+  readonly _tag: "collapsible";
+  readonly children: ReadonlyArray<ViewNode>;
+}
+// --- end views additions ---
+export type ViewNode =
+  | ViewLeafNode
+  | ViewGroupNode
+  // --- views additions ---
+  | ViewCollapsibleNode;
+// --- end views additions ---
 export type ViewNodeTag = ViewNode["_tag"];
 
+const ViewChildren = Schema.Array(Schema.suspend((): Schema.Codec<ViewNode> => ViewNode)).check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(6),
+);
 export const ViewGroupNode: Schema.Codec<ViewGroupNode> = Schema.Struct({
   _tag: Schema.tag("group"),
   direction: Schema.Literals(["column", "row"]),
-  children: Schema.Array(Schema.suspend((): Schema.Codec<ViewNode> => ViewNode)).check(
-    Schema.isMinLength(1),
-    Schema.isMaxLength(6),
-  ),
+  children: ViewChildren,
 });
-export const ViewNode: Schema.Codec<ViewNode> = Schema.Union([ViewLeafNode, ViewGroupNode]);
+// --- views additions ---
+export const ViewCollapsibleNode: Schema.Codec<ViewCollapsibleNode> = Schema.Struct({
+  _tag: Schema.tag("collapsible"),
+  ...ViewCollapsibleHead.fields,
+  children: ViewChildren,
+});
+// --- end views additions ---
+export const ViewNode: Schema.Codec<ViewNode> = Schema.Union([
+  ViewLeafNode,
+  ViewGroupNode,
+  // --- views additions ---
+  ViewCollapsibleNode,
+  // --- end views additions ---
+]);
 
 export const VIEW_NODE_TAGS: ReadonlyArray<ViewNodeTag> = [
   "text",
@@ -336,6 +382,8 @@ export const VIEW_NODE_TAGS: ReadonlyArray<ViewNodeTag> = [
   "table",
   "meter",
   "gallery",
+  "collapsible",
+  "markdown",
   // --- end views additions ---
 ];
 
@@ -457,6 +505,10 @@ export const ViewQueryKind = Schema.Literals([
   "milestone",
   "sub-mission",
   "call",
+  // --- views additions ---
+  /** The scribe's saved reports, newest first. */
+  "report",
+  // --- end views additions ---
 ]);
 export type ViewQueryKind = typeof ViewQueryKind.Type;
 
@@ -473,6 +525,11 @@ export const ViewQueryWhere = Schema.Struct({
   channel: Schema.optionalKey(Schema.Array(DraftChannel).check(Schema.isMinLength(1))),
   flag: Schema.optionalKey(ViewKicker),
   requestedBy: Schema.optionalKey(ViewKey),
+  // --- views additions ---
+  reportKind: Schema.optionalKey(
+    Schema.Array(Schema.Literals(["daily", "update"])).check(Schema.isMinLength(1)),
+  ),
+  // --- end views additions ---
 });
 export const ViewQuerySort = Schema.Literals(["updated-desc", "created-desc", "rank", "due"]);
 export const ViewQuery = Schema.Struct({
@@ -490,6 +547,29 @@ export const ViewSource = Schema.Union([
   }),
 ]);
 export type ViewSource = typeof ViewSource.Type;
+
+// --- views additions ---
+/** Query filters each record kind can take. */
+export const VIEW_QUERY_FILTERS = {
+  subMissionId: ["work-item", "note", "approval", "draft", "ask", "milestone", "call"],
+  laneId: ["work-item", "note"],
+  status: ["approval", "draft", "ask", "milestone", "sub-mission"],
+  stage: ["work-item"],
+  workKind: ["work-item"],
+  noteType: ["note"],
+  approvalKind: ["approval"],
+  channel: ["draft"],
+  flag: ["approval", "draft"],
+  requestedBy: ["approval", "draft"],
+  reportKind: ["report"],
+} as const satisfies Record<keyof typeof ViewQueryWhere.Type, ReadonlyArray<ViewQueryKind>>;
+
+/** Sorts that only some kinds take; the rest sort every kind. Reports read newest first either way. */
+export const VIEW_QUERY_SORTS = {
+  rank: ["sub-mission"],
+  due: ["milestone"],
+} as const satisfies Partial<Record<typeof ViewQuerySort.Type, ReadonlyArray<ViewQueryKind>>>;
+// --- end views additions ---
 
 /** Where a section shows lives in the layout record, not here. */
 export const ViewSectionDefinition = Schema.Struct({
@@ -570,6 +650,10 @@ export const VIEW_HARD_LIMITS = {
   fieldsPerTemplate: 12,
   layoutEntries: 48,
   issues: 20,
+  // --- views additions ---
+  /** A `longtext` value loads at most this many characters. */
+  longTextChars: 400_000,
+  // --- end views additions ---
 } as const;
 
 /** Sane upper bounds for the adjustable limits below. */
@@ -770,6 +854,8 @@ export const ViewValueKind = Schema.Literals([
   "facts",
   // --- views additions ---
   "assets",
+  /** Too long for the snapshot; only a markdown block inside a collapsible binds it, loaded on open. */
+  "longtext",
   // --- end views additions ---
 ]);
 export type ViewValueKind = typeof ViewValueKind.Type;
@@ -894,6 +980,20 @@ export const VIEW_PATHS: { readonly [K in ViewPathScope]: PathTable } = {
     reversible: "enum",
     createdAt: "time",
   },
+  // --- views additions ---
+  // `title` is the report's first heading; `period` and `size` are short
+  // display text the server derives, so rows never carry the report body.
+  report: {
+    title: "text",
+    kind: "enum",
+    period: "text",
+    size: "text",
+    coversFrom: "time",
+    coversTo: "time",
+    createdAt: "time",
+    text: "longtext",
+  },
+  // --- end views additions ---
 };
 
 /** Section-level values a section body may bind outside its list rows. */
@@ -931,6 +1031,9 @@ export const VIEW_BIND_ACCEPTS = {
   cellPerson: ["actor", "text", "enum"],
   cellLink: ["link", "links", "pr"],
   cellCount: ["number", "refs", "flags", "links", "assets"],
+  collapsibleTitle: ["text", "enum", "link", "pr"],
+  collapsibleMeta: SCALAR,
+  markdown: ["text", "longtext"],
   // --- end views additions ---
 } as const satisfies Record<string, ReadonlyArray<ViewValueKind>>;
 export type ViewBindSlot = keyof typeof VIEW_BIND_ACCEPTS;
@@ -1515,6 +1618,24 @@ export const ViewSectionData = Schema.Struct({
   total: NonNegativeInt,
 });
 export type ViewSectionData = typeof ViewSectionData.Type;
+
+/** One `longtext` value of a row, loaded when its collapsible opens. */
+export const ViewLongTextInput = Schema.Struct({
+  missionId: MissionId,
+  ref: MissionRecordRef,
+  path: ViewKey,
+});
+export type ViewLongTextInput = typeof ViewLongTextInput.Type;
+export const ViewLongText = Schema.Struct({
+  ref: MissionRecordRef,
+  path: Schema.String,
+  text: Schema.String,
+  /** Characters in the whole value. */
+  size: NonNegativeInt,
+  /** True when `text` stops at `VIEW_HARD_LIMITS.longTextChars`. */
+  truncated: Schema.Boolean,
+});
+export type ViewLongText = typeof ViewLongText.Type;
 // --- end views additions ---
 
 export const ViewHistoryTarget = Schema.Union([
@@ -1647,6 +1768,15 @@ export const ViewCatalog = Schema.Struct({
   hardLimits: Schema.Record(Schema.String, Schema.Number),
   ceilings: Schema.Record(Schema.String, Schema.Number),
   builtins: Schema.Array(Schema.Struct({ id: Schema.String, definition: ViewTemplateDefinition })),
+  // --- views additions ---
+  /** Which query kinds each `where` filter and each restricted sort takes. */
+  queries: Schema.optional(
+    Schema.Struct({
+      filters: Schema.Record(Schema.String, Schema.Array(ViewQueryKind)),
+      sorts: Schema.Record(Schema.String, Schema.Array(ViewQueryKind)),
+    }),
+  ),
+  // --- end views additions ---
 });
 export type ViewCatalog = typeof ViewCatalog.Type;
 
@@ -1694,6 +1824,18 @@ const NODE_SIGNATURES: ReadonlyArray<{ tag: ViewNodeTag; signature: string; wher
     signature: "{bind: assets field, review: none|per-asset}",
     where: "templates (per-asset on ask templates)",
   },
+  {
+    tag: "collapsible",
+    signature:
+      "{title: text bind|null, label?: ≤24 chars, meta: ≤3 binds, open: none|first, children: 1..6 nodes}",
+    where:
+      "templates, sections (one per row; its children bind that row; no list, table or collapsible inside)",
+  },
+  {
+    tag: "markdown",
+    signature: "{bind: text|longtext, maxLines?: 1..40}",
+    where: "templates, sections (longtext only inside a collapsible; it loads when that opens)",
+  },
   // --- end views additions ---
 ];
 
@@ -1711,4 +1853,5 @@ export const VIEW_CATALOG: ViewCatalog = {
   hardLimits: VIEW_HARD_LIMITS,
   ceilings: VIEW_LIMIT_CEILINGS,
   builtins: [...BUILTIN_VIEW_TEMPLATES, ...STOCK_VIEW_TEMPLATES],
+  queries: { filters: VIEW_QUERY_FILTERS, sorts: VIEW_QUERY_SORTS },
 };

@@ -1,5 +1,6 @@
 import {
   VIEW_HARD_LIMITS,
+  ViewCollapsibleHead,
   ViewLeafNode,
   type ViewNode,
   type ViewNodeTag,
@@ -11,6 +12,7 @@ import * as Schema from "effect/Schema";
 // card down. Each node decodes alone; what fails is dropped and counted.
 
 const decodeLeaf = Schema.decodeUnknownOption(ViewLeafNode);
+const decodeCollapsibleHead = Schema.decodeUnknownOption(ViewCollapsibleHead);
 
 const GROUP_DIRECTIONS: ReadonlySet<unknown> = new Set(["column", "row"]);
 const GROUP_CHILDREN_MAX = 6;
@@ -36,6 +38,9 @@ interface Walk {
 const tagOf = (raw: unknown): unknown =>
   typeof raw === "object" && raw !== null ? (raw as { readonly _tag?: unknown })._tag : undefined;
 
+/** Lists, tables and nested collapsibles iterate rows; a collapsible is already one row. */
+const FOLDED_OUT: ReadonlySet<ViewNodeTag> = new Set(["list", "table", "collapsible"]);
+
 const decodeAt = (
   raw: unknown,
   depth: number,
@@ -49,27 +54,36 @@ const decodeAt = (
   if (depth > VIEW_HARD_LIMITS.depth || walk.kept >= VIEW_HARD_LIMITS.nodesPerDefinition) {
     return drop();
   }
-  if (tagOf(raw) === "group") {
-    const group = raw as { readonly direction?: unknown; readonly children?: unknown };
-    if (!allows("group") || !GROUP_DIRECTIONS.has(group.direction)) return drop();
-    if (!Array.isArray(group.children)) return drop();
+  const tag = tagOf(raw);
+  if (tag === "group" || tag === "collapsible") {
+    const container = raw as { readonly direction?: unknown; readonly children?: unknown };
+    const head = tag === "collapsible" ? decodeCollapsibleHead(raw) : Option.none();
+    if (!allows(tag) || !Array.isArray(container.children)) return drop();
+    if (tag === "group" ? !GROUP_DIRECTIONS.has(container.direction) : Option.isNone(head)) {
+      return drop();
+    }
     walk.kept += 1;
+    const inner =
+      tag === "collapsible"
+        ? (child: ViewNodeTag) => allows(child) && !FOLDED_OUT.has(child)
+        : allows;
     const children: Array<ViewNode> = [];
-    for (const child of group.children) {
+    for (const child of container.children) {
       if (children.length >= GROUP_CHILDREN_MAX) {
         walk.dropped += 1;
         continue;
       }
-      const decoded = decodeAt(child, depth + 1, walk, allows);
+      const decoded = decodeAt(child, depth + 1, walk, inner);
       if (decoded !== null) children.push(decoded);
     }
     if (children.length === 0) {
       walk.kept -= 1;
       return drop();
     }
+    if (Option.isSome(head)) return { _tag: "collapsible", ...head.value, children };
     return {
       _tag: "group",
-      direction: group.direction === "row" ? "row" : "column",
+      direction: container.direction === "row" ? "row" : "column",
       children,
     };
   }
