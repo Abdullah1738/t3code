@@ -46,10 +46,10 @@ class ExitFidelityTests(Isolated):
         self.assertIn('offbox: remote exit 0 (status of the final `echo', last)
         self.assertIn('exit $rc', last)
 
-    def test_zero_from_unprotected_pipe_is_flagged(self):
+    def test_successful_pipe_needs_no_masking_hint(self):
         rc, last = self.run_cli(['go test ./... 2>&1 | tail -5'], 0)
         self.assertEqual(rc, 0)
-        self.assertIn('last pipe stage only', last)
+        self.assertEqual(last, 'offbox: remote exit 0')
 
     def test_lost_process_is_90_with_explicit_line(self):
         rc, last = self.run_cli(['go', 'test', './...'], None)
@@ -60,10 +60,10 @@ class ExitFidelityTests(Isolated):
         h = runs.masked_status_hint
         for cmd in ('go test ./...', "go test -run '^(TestA|TestB)$' ./pkg", 'go vet ./... && echo ok',
                     'set -o pipefail; go test ./... | tail -5', 'go test ./... |& tee out.txt; exit ${PIPESTATUS[0]}',
+                    'go test ./... | grep -E "^(ok|FAIL)"', 'go vet ./x 2>&1 | head -4',
                     'echo "a | b; c"', ''):
             self.assertEqual(h(cmd), '', cmd)
-        for cmd in ('go test ./...; echo EXIT=$?', 'go test ./...\necho done', 'make check || true',
-                    'go test ./... | grep -E "^(ok|FAIL)"', 'go vet ./x 2>&1 | head -4'):
+        for cmd in ('go test ./...; echo EXIT=$?', 'go test ./...\necho done', 'make check || true'):
             self.assertNotEqual(h(cmd), '', cmd)
 
 
@@ -76,7 +76,8 @@ class RemoteWrapperTests(unittest.TestCase):
             with patch.object(runs, 'GO_REPAIR', ':'):
                 script = runs.remote_script('w/repo', 'sub', argv, None, 'run-test')
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
-            return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True).returncode
+            return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True,
+                                  timeout=10).returncode
 
     def test_statuses_pass_through(self):
         self.assertEqual(self.run_script(['false']), 1)
@@ -85,10 +86,71 @@ class RemoteWrapperTests(unittest.TestCase):
         self.assertEqual(self.run_script(['set -o pipefail; false | cat']), 1)
         self.assertEqual(self.run_script(['false; rc=$?; echo EXIT=$rc; exit $rc']), 1)
 
-    def test_caller_masking_is_the_callers_shell_not_the_wrapper(self):
-        # These are 0 in any bash; offbox reports them faithfully and adds the hint line.
-        self.assertEqual(self.run_script(['false | tail -1']), 0)
+    def test_failed_pipeline_stage_is_not_hidden_by_output_filters(self):
+        for cmd, code in [('false | tail -1', 1), ('(exit 7) | tee /dev/null | tail -1', 7),
+                          ('true | (exit 3) | tail -1', 3), ('(exit 2) | (exit 4) | cat', 4)]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.run_script([cmd]), code)
+
+    def test_sigpipe_from_early_reader_is_success(self):
+        for cmd in ('yes | head -1', 'yes | head -1 | cat', '(exit 141) | (exit 141) | true',
+                    'yes | exit 0', 'yes 2>&1 | head -1'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.run_script([cmd]), 0)
+
+    def test_sigpipe_does_not_hide_real_failures(self):
+        for cmd, code in [('(exit 7) | (exit 141) | cat', 7), ('yes | head -1 | (exit 3)', 3),
+                          ('true | (exit 141)', 141), ('exit 141', 141),
+                          ('yes | head -1; exit 7', 7), ('yes | head -1; exit 141', 141),
+                          (r'yes | head -1; \exit 141', 141), ("yes | head -1; 'exit' 141", 141),
+                          ('! true | cat', 1), ('! false | cat', 0)]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.run_script([cmd]), code)
+
+    def test_compound_script_cannot_pass_after_skipping_checks(self):
+        for cmd in ('yes | head -1 && false', 'set -e; yes | head -1; false',
+                    'yes | head -1\nexit 141', 'yes | head -1;:;exit 141',
+                    "yes | head -1 | grep -v '(' && false ')'",
+                    'true | cat # comment\n(exit 141) | cat',
+                    "true | printf '|'\n(exit 141) | cat", 'yes |\nhead -1'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.run_script([cmd]), 141)
+
+    def test_readonly_caller_variables_cannot_mask_failures(self):
+        self.assertEqual(self.run_script(['readonly rc=0; false']), 1)
+        self.assertEqual(self.run_script(['readonly rc=0; (exit 97) | cat']), 97)
+
+    def test_incomplete_pipeline_stays_a_syntax_error(self):
+        for cmd in ('false |', 'true | # missing last stage', 'true |&'):
+            self.assertEqual(self.run_script([cmd]), 2)
+
+    def test_grep_no_match_remains_nonzero(self):
+        cmd = 'printf "ok\\n" | grep FAIL'
+        rc = self.run_script([cmd])
+        self.assertEqual(rc, 1)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            runs.report_exit(cmd, rc)
+        self.assertIn('trailing grep (no match)', err.getvalue())
+        self.assertEqual(err.getvalue().splitlines()[-1], 'offbox: remote exit 1')
+
+    def test_grep_hint_does_not_blame_a_successful_grep(self):
+        cmd = '(printf "ok\\n"; exit 1) | grep ok'
+        rc = self.run_script([cmd])
+        self.assertEqual(rc, 1)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            runs.report_exit(cmd, rc)
+        self.assertIn('or an earlier stage', err.getvalue())
+
+    def test_caller_masking_is_the_callers_choice(self):
         self.assertEqual(self.run_script(['false; echo EXIT=$?']), 0)
+        self.assertEqual(self.run_script(['false | tail -1; echo EXIT=$?']), 0)
+        self.assertEqual(self.run_script(['false | tail -1 || true']), 0)
+
+    def test_reserved_command_statuses_pass_through(self):
+        for code in (90, 91, 92, 97):
+            self.assertEqual(self.run_script([f'(exit {code}) | tail -1']), code)
 
 
 class FakeClock:

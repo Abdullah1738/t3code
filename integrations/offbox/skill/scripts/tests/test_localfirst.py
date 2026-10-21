@@ -401,6 +401,26 @@ class RunTests(Isolated):
         self.assertEqual(lines[-2], "offbox: offbox steps: 1 ok, 1 failed (step 2 rc=1)")
         self.assertEqual(lines[-1], "offbox: local exit 1")
 
+    def test_local_pipeline_failure_reaches_cli_and_run_record(self):
+        Path(self.cwd, "pkg", "a.go").write_text("package x\n\nthis is invalid Go\n")
+        rc, lines = self.run_cli(["--", "go vet ./pkg 2>&1 | tee /tmp/vet.log | tail -5"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(lines[-1], "offbox: local exit 1")
+        row = self.con.execute("SELECT status,exit_code FROM runs WHERE mode='local'").fetchone()
+        self.assertEqual(tuple(row), ("failed", 1))
+
+    def test_local_sigpipe_and_grep_statuses(self):
+        for cmd, expected in (("false | tail -1", 1), ("yes | head -1", 0),
+                              ("(exit 7) | (exit 141) | cat", 7), ("true | (exit 141)", 141),
+                              ("yes | head -1 && false", 141), ("readonly rc=0; false", 1)):
+            with self.subTest(cmd=cmd):
+                rc, _ = self.run_raw(cmd)
+                self.assertEqual(rc, expected)
+        rc, lines = self.run_cli(["--", "go version | grep no-such-version"])
+        self.assertEqual(rc, 1)
+        self.assertIn("trailing grep (no match)", lines[-2])
+        self.assertEqual(lines[-1], "offbox: local exit 1")
+
     def test_environment_is_an_allowlist(self):
         with patch.dict(os.environ, {"AWS_PROFILE": "prod", "GITHUB_TOKEN": "x", "DATABASE_URL": "pg://prod",
                                      "KAFKA_BROKERS": "b:9092"}):
