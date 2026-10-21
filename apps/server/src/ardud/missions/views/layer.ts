@@ -8,6 +8,8 @@ import * as Ports from "../asks/ports.ts";
 import type { SuggestionApplication } from "../asks/suggestionModel.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as ViewService from "./ViewService.ts";
+import * as SourceRunner from "./sources/runner.ts";
+import * as SourceService from "./sources/SourceService.ts";
 import * as ViewStore from "./ViewStore.ts";
 
 /**
@@ -86,5 +88,7 @@ export const viewsWiringLayer = Layer.effectDiscard(
  */
 export const ViewsLive = viewsWiringLayer.pipe(
   Layer.provideMerge(ViewService.layer),
+  Layer.provideMerge(SourceService.layer),
+  Layer.provideMerge(SourceRunner.layer),
   Layer.provideMerge(ViewStore.layer),
 );

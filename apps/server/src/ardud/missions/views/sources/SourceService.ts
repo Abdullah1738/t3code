@@ -241,15 +241,15 @@ const make = Effect.gen(function* () {
       WHERE mission_id = ${missionId}
     `.pipe(Effect.orDie);
 
-  const save = (
-    source: ViewDataSource,
-    trigger: SourceTrigger,
-    ranAt: string,
-    durationMs: number,
-    outcome: Outcome,
-    stderr: string,
-  ) =>
-    Effect.gen(function* () {
+  const save = Effect.fn("SourceService.save")(
+    function* (
+      source: ViewDataSource,
+      trigger: SourceTrigger,
+      ranAt: string,
+      durationMs: number,
+      outcome: Outcome,
+      stderr: string,
+    ) {
       const row = {
         source_id: source.id,
         mission_id: source.missionId,
@@ -310,93 +310,104 @@ const make = Effect.gen(function* () {
           LIMIT ${RUN_LOG_KEEP}
         )
       `;
-    }).pipe(sql.withTransaction, Effect.orDie);
+    },
+    sql.withTransaction,
+    Effect.orDie,
+  );
 
-  const execute = (source: ViewDataSource, trigger: SourceTrigger) =>
-    Effect.gen(function* () {
-      const result = yield* runner.run({
-        runtime: source.definition.runtime,
-        code: source.definition.code,
-        dir: sourceDir(stateDir, source.missionId, source.id),
-        timeoutMs: source.definition.timeoutSeconds * 1000,
-      });
-      const ranAt = DateTime.formatIso(yield* DateTime.now);
-      const durationMs = Math.max(0, Math.round(result.durationMs));
-      const outcome = outcomeOf(result, source);
-      const stderr = result.stderr.slice(-STDERR_CHARS);
-      yield* save(source, trigger, ranAt, durationMs, outcome, stderr);
-      if (outcome.ok) parsed.delete(source.id);
-      else {
-        yield* Effect.logWarning("missions: view source run failed", {
-          missionId: source.missionId,
-          sourceId: source.id,
-          trigger,
-          error: outcome.error,
-        });
-      }
-      const runResult: ViewSourceRunResult = {
-        sourceId: source.id,
-        ok: outcome.ok,
-        ranAt,
-        durationMs,
-        total: outcome.rows.length,
-        rows: outcome.rows.slice(0, PREVIEW_ROWS),
-        errors: outcome.errors.slice(0, PREVIEW_ROWS),
-        stderr,
-      };
-      return runResult;
+  const execute = Effect.fn("SourceService.execute")(function* (
+    source: ViewDataSource,
+    trigger: SourceTrigger,
+  ) {
+    const result = yield* runner.run({
+      runtime: source.definition.runtime,
+      code: source.definition.code,
+      dir: sourceDir(stateDir, source.missionId, source.id),
+      timeoutMs: source.definition.timeoutSeconds * 1000,
     });
+    const ranAt = DateTime.formatIso(yield* DateTime.now);
+    const durationMs = Math.max(0, Math.round(result.durationMs));
+    const outcome = outcomeOf(result, source);
+    const stderr = result.stderr.slice(-STDERR_CHARS);
+    yield* save(source, trigger, ranAt, durationMs, outcome, stderr);
+    if (outcome.ok) parsed.delete(source.id);
+    else {
+      yield* Effect.logWarning("missions: view source run failed", {
+        missionId: source.missionId,
+        sourceId: source.id,
+        trigger,
+        error: outcome.error,
+      });
+    }
+    const runResult: ViewSourceRunResult = {
+      sourceId: source.id,
+      ok: outcome.ok,
+      ranAt,
+      durationMs,
+      total: outcome.rows.length,
+      rows: outcome.rows.slice(0, PREVIEW_ROWS),
+      errors: outcome.errors.slice(0, PREVIEW_ROWS),
+      stderr,
+    };
+    return runResult;
+  });
 
   // Runs live in the service's scope so a caller that stops waiting (a closed
   // feed, a cancelled tool call) doesn't kill a run others may be joining.
-  const start = (source: ViewDataSource, trigger: SourceTrigger) =>
-    Effect.gen(function* () {
-      const going = inflight.get(source.id);
-      if (going !== undefined) return going;
-      const done = Deferred.makeUnsafe<ViewSourceRunResult>();
-      inflight.set(source.id, done);
-      yield* PubSub.publish(changed, source.missionId);
-      yield* permits.withPermit(execute(source, trigger)).pipe(
-        Effect.onExit((exit) =>
-          Effect.gen(function* () {
-            inflight.delete(source.id);
-            yield* Deferred.done(done, exit);
-            yield* PubSub.publish(changed, source.missionId);
-          }),
-        ),
-        Effect.forkIn(scope),
-      );
-      return done;
-    });
+  const start = Effect.fn("SourceService.start")(function* (
+    source: ViewDataSource,
+    trigger: SourceTrigger,
+  ) {
+    const going = inflight.get(source.id);
+    if (going !== undefined) return going;
+    const done = Deferred.makeUnsafe<ViewSourceRunResult>();
+    inflight.set(source.id, done);
+    yield* PubSub.publish(changed, source.missionId);
+    yield* permits.withPermit(execute(source, trigger)).pipe(
+      Effect.onExit((exit) =>
+        Effect.gen(function* () {
+          inflight.delete(source.id);
+          yield* Deferred.done(done, exit);
+          yield* PubSub.publish(changed, source.missionId);
+        }),
+      ),
+      Effect.forkIn(scope),
+    );
+    return done;
+  });
 
-  const due = (missionId: MissionId, sources: ReadonlyArray<ViewDataSource>) =>
-    Effect.gen(function* () {
-      const candidates = sources.filter(
-        (source) =>
-          source.missionId === missionId &&
-          source.status === "active" &&
-          source.definition.enabled &&
-          !inflight.has(source.id),
-      );
-      if (candidates.length === 0) return [];
-      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-      const cached = new Map((yield* cacheRows(missionId)).map((row) => [row.source_id, row]));
-      return candidates.filter((source) => isStale(source, cached.get(source.id), nowMs));
-    });
+  const due = Effect.fn("SourceService.due")(function* (
+    missionId: MissionId,
+    sources: ReadonlyArray<ViewDataSource>,
+  ) {
+    const candidates = sources.filter(
+      (source) =>
+        source.missionId === missionId &&
+        source.status === "active" &&
+        source.definition.enabled &&
+        !inflight.has(source.id),
+    );
+    if (candidates.length === 0) return [];
+    const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+    const cached = new Map((yield* cacheRows(missionId)).map((row) => [row.source_id, row]));
+    return candidates.filter((source) => isStale(source, cached.get(source.id), nowMs));
+  });
 
   const touch = (missionId: MissionId, sources: ReadonlyArray<ViewDataSource>) =>
     Effect.flatMap(due(missionId, sources), (stale) =>
       Effect.forEach(stale, (source) => start(source, "watched"), { discard: true }),
     );
 
-  const refreshStale = (missionId: MissionId, sources: ReadonlyArray<ViewDataSource>) =>
-    Effect.gen(function* () {
-      const stale = yield* due(missionId, sources);
-      const started = yield* Effect.forEach(stale, (source) => start(source, "watched"));
-      yield* Effect.forEach(started, (done) => Effect.ignore(Deferred.await(done)), {
-        discard: true,
-      });
+  const refreshStale = Effect.fn("SourceService.refreshStale")(function* (
+    missionId: MissionId,
+    sources: ReadonlyArray<ViewDataSource>,
+  ) {
+    const stale = yield* due(missionId, sources);
+    const started = yield* Effect.forEach(stale, (source) => start(source, "watched"));
+    yield* Effect.forEach(started, (done) => Effect.ignore(Deferred.await(done)), {
+      discard: true,
     });
+  });
 
   const runs = (missionId: MissionId, sources: ReadonlyArray<ViewDataSource>) =>
     Effect.map(cacheRows(missionId), (rows) => {
@@ -415,55 +426,53 @@ const make = Effect.gen(function* () {
       });
     });
 
-  const cachedRows = (sourceId: string) =>
-    Effect.gen(function* () {
-      const head = yield* sql<{ readonly ok_at: string | null }>`
+  const cachedRows = Effect.fn("SourceService.cachedRows")(function* (sourceId: string) {
+    const head = yield* sql<{ readonly ok_at: string | null }>`
         SELECT ok_at FROM ardud_mission_view_source_cache WHERE source_id = ${sourceId}
       `.pipe(Effect.orDie);
-      const okAt = head[0]?.ok_at ?? null;
-      if (okAt === null) return [];
-      const memo = parsed.get(sourceId);
-      if (memo?.okAt === okAt) return memo.rows;
-      const body = yield* sql<{ readonly rows_json: string }>`
+    const okAt = head[0]?.ok_at ?? null;
+    if (okAt === null) return [];
+    const memo = parsed.get(sourceId);
+    if (memo?.okAt === okAt) return memo.rows;
+    const body = yield* sql<{ readonly rows_json: string }>`
         SELECT rows_json FROM ardud_mission_view_source_cache WHERE source_id = ${sourceId}
       `.pipe(Effect.orDie);
-      const rows = Option.getOrElse(decodeRows(body[0]?.rows_json ?? "[]"), () => []);
-      parsed.set(sourceId, { okAt, rows });
-      return rows;
-    });
+    const rows = Option.getOrElse(decodeRows(body[0]?.rows_json ?? "[]"), () => []);
+    parsed.set(sourceId, { okAt, rows });
+    return rows;
+  });
 
-  const sectionData = (
+  const sectionData = Effect.fn("SourceService.sectionData")(function* (
     sections: ReadonlyArray<ViewSection>,
     sources: ReadonlyArray<ViewDataSource>,
-  ) =>
-    Effect.gen(function* () {
-      const live = new Map<string, ViewDataSource>();
-      for (const source of sources) {
-        if (source.status === "active" && source.definition.enabled) live.set(source.id, source);
-      }
-      const data: Array<ViewSectionData> = [];
-      for (const section of sections) {
-        const shape = section.definition.source;
-        if (section.status !== "active" || shape._tag !== "source") continue;
-        const source = live.get(shape.sourceId);
-        if (source === undefined) continue;
-        const paths = boundPaths(section.definition.body);
-        const rows = ordered(
-          (yield* cachedRows(source.id)).filter((row) => matches(row, shape.where)),
-          shape.sort,
-        );
-        data.push({
-          sectionId: section.id,
-          rows: rows.slice(0, shape.limit).map((row): ViewSectionRow => {
-            const value: Record<string, unknown> = {};
-            for (const path of paths) if (Object.hasOwn(row, path)) value[path] = row[path];
-            return { ref: { kind: "source-row", id: String(row.id) }, value };
-          }),
-          total: rows.length,
-        });
-      }
-      return data;
-    });
+  ) {
+    const live = new Map<string, ViewDataSource>();
+    for (const source of sources) {
+      if (source.status === "active" && source.definition.enabled) live.set(source.id, source);
+    }
+    const data: Array<ViewSectionData> = [];
+    for (const section of sections) {
+      const shape = section.definition.source;
+      if (section.status !== "active" || shape._tag !== "source") continue;
+      const source = live.get(shape.sourceId);
+      if (source === undefined) continue;
+      const paths = boundPaths(section.definition.body);
+      const rows = ordered(
+        (yield* cachedRows(source.id)).filter((row) => matches(row, shape.where)),
+        shape.sort,
+      );
+      data.push({
+        sectionId: section.id,
+        rows: rows.slice(0, shape.limit).map((row): ViewSectionRow => {
+          const value: Record<string, unknown> = {};
+          for (const path of paths) if (Object.hasOwn(row, path)) value[path] = row[path];
+          return { ref: { kind: "source-row", id: String(row.id) }, value };
+        }),
+        total: rows.length,
+      });
+    }
+    return data;
+  });
 
   return SourceService.of({
     run: (source, trigger) => Effect.flatMap(start(source, trigger), Deferred.await),

@@ -20,6 +20,7 @@ import {
   VIEW_CATALOG_VERSION,
   VIEW_HARD_LIMITS,
   VIEW_PATHS,
+  VIEW_SOURCE_LIMITS,
   ViewSectionId,
   ViewTemplateId,
   formatViewIssues,
@@ -69,6 +70,15 @@ import {
   type ViewStarterLayout,
   type ViewStatus,
   type ViewTemplate,
+  type RemoveViewSourceInput,
+  type RestoreViewSourceInput,
+  type RunViewSourceInput,
+  type SetViewSourceInput,
+  type ViewDataSource,
+  ViewDataSourceId,
+  type ViewSourceDefinition,
+  type ViewSourceListing,
+  type ViewSourceRunResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -90,6 +100,7 @@ import * as MissionStore from "../store/MissionStore.ts";
 import { assetFilePath, deleteAssetFile, readAssetSource, writeAssetFile } from "./assets.ts";
 import { applyLayoutOps, insertInRegion } from "./layoutOps.ts";
 import { sectionData } from "./sectionRows.ts";
+import { SourceService } from "./sources/SourceService.ts";
 import { byteSize, checkLayout, checkSection, checkTemplate } from "./validate.ts";
 import * as ViewStore from "./ViewStore.ts";
 
@@ -143,8 +154,31 @@ export class ViewService extends Context.Service<
     readonly longText: (input: ViewLongTextInput) => Effect.Effect<ViewLongText, MissionError>;
     /** Mission ids, published after the scribe saves a report. */
     readonly reportSaves: Effect.Effect<PubSub.Subscription<string>, never, Scope.Scope>;
+    readonly setSource: Write<SetViewSourceInput>;
+    readonly removeSource: Write<RemoveViewSourceInput>;
+    readonly restoreSource: Write<RestoreViewSourceInput>;
+    /** Runs a source now, for its owner or master, and returns what it produced. */
+    readonly runSource: (
+      provenance: MissionProvenance,
+      input: RunViewSourceInput,
+    ) => Effect.Effect<ViewSourceRunResult, MissionError>;
+    /** Mission ids, published when one of their source runs starts or finishes. */
+    readonly sourceChanges: Effect.Effect<PubSub.Subscription<MissionId>, never, Scope.Scope>;
   }
 >()("t3/ardud/missions/views/ViewService") {}
+
+const sourceListing = (source: ViewDataSource): ViewSourceListing => {
+  const { definition, ...meta } = source;
+  return {
+    ...meta,
+    title: definition.title,
+    runtime: definition.runtime,
+    fields: definition.fields,
+    refreshMinutes: definition.refreshMinutes,
+    timeoutSeconds: definition.timeoutSeconds,
+    enabled: definition.enabled,
+  };
+};
 
 /** The starter layout's changes go on the missions-wide timeline. */
 export const GLOBAL_TIMELINE = MissionId.make(ViewStore.STARTER_MISSION);
@@ -251,6 +285,7 @@ const make = Effect.gen(function* () {
   const views = yield* ViewStore.ViewStore;
   const scribe = yield* ScribeStore;
   const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+  const runs = yield* SourceService;
   const lock = yield* Semaphore.make(1);
   const serial = <A, E>(effect: Effect.Effect<A, E>) => lock.withPermit(effect);
 
@@ -452,9 +487,21 @@ const make = Effect.gen(function* () {
 
   // --- reads ---
 
+  const allSectionData = Effect.fn("ViewService.allSectionData")(function* (
+    missionId: MissionId,
+    sections: ReadonlyArray<ViewSection>,
+    sources: ReadonlyArray<ViewDataSource>,
+  ) {
+    const queried = yield* sectionData({ store, scribe }, missionId, sections);
+    return [...queried, ...(yield* runs.sectionData(sections, sources))];
+  });
+
+  // Reading the views counts as someone looking, which is what lets a stale source run.
   const snapshot = (missionId: MissionId) =>
     Effect.gen(function* () {
       const mission = yield* requireMission(missionId);
+      const sources = yield* views.sources(mission.id);
+      yield* runs.touch(mission.id, sources);
       const templates = yield* views.templates(mission.id);
       const sections = yield* views.sections(mission.id);
       const { layout } = yield* currentLayout(mission);
@@ -475,8 +522,10 @@ const make = Effect.gen(function* () {
         pinnedStrip: pinned.needsYou || pinned.requests,
         pinned,
         changesToday: yield* views.changesSince(mission.id, since),
-        sectionData: yield* sectionData({ store, scribe }, mission.id, sections),
+        sectionData: yield* allSectionData(mission.id, sections, sources),
         assets: (yield* views.assets(mission.id)).filter((asset) => asset.status === "active"),
+        sources: sources.map(sourceListing),
+        sourceRuns: yield* runs.runs(mission.id, sources),
       };
       return result;
     });
@@ -559,6 +608,7 @@ const make = Effect.gen(function* () {
         sections.find((section) => section.definition.key === proposal.definition.key)?.id;
       const check = checkSection(proposal.definition, {
         siblings: sections.filter((section) => section.id !== replacing),
+        sources: yield* views.sources(mission.id),
       });
       const result: ViewPreview = { ok: check.issues.length === 0, ...check };
       return result;
@@ -663,7 +713,10 @@ const make = Effect.gen(function* () {
 
         const templates = yield* views.templates(mission.id);
         const siblings = sections.filter((section) => section.id !== existing?.id);
-        const check = checkSection(input.definition, { siblings });
+        const check = checkSection(input.definition, {
+          siblings,
+          sources: yield* views.sources(mission.id),
+        });
         const issues = [...check.issues];
         const active = siblings.filter((section) => section.status === "active").length;
         if (existing === undefined && active >= limits.sections) {
@@ -938,7 +991,10 @@ const make = Effect.gen(function* () {
           );
         }
         const siblings = sections.filter((section) => section.id !== existing.id);
-        const check = checkSection(source.definition, { siblings });
+        const check = checkSection(source.definition, {
+          siblings,
+          sources: yield* views.sources(mission.id),
+        });
         const issues = [...check.issues];
         const active = siblings.filter((section) => section.status === "active").length;
         if (existing.status === "removed" && active >= limits.sections) {
@@ -1328,6 +1384,7 @@ const make = Effect.gen(function* () {
         });
 
         let nextSections: Array<ViewSection> = [...sections];
+        const bundleSources = yield* views.sources(mission.id);
         let entries = current.layout.layout.entries;
         const sectionChanges: Array<{ before: ViewSection | null; after: ViewSection }> = [];
         wantedSections.forEach((item, index) => {
@@ -1347,7 +1404,12 @@ const make = Effect.gen(function* () {
             return;
           }
           const siblings = nextSections.filter((section) => section.id !== existing?.id);
-          issues.push(...prefixed(at, checkSection(item.definition, { siblings }).issues));
+          issues.push(
+            ...prefixed(
+              at,
+              checkSection(item.definition, { siblings, sources: bundleSources }).issues,
+            ),
+          );
           const id = existing?.id ?? sectionId ?? ViewSectionId.make(newId("view-section"));
           const placed = entries.find(
             (entry) => entry.section._tag === "custom" && entry.section.sectionId === id,
@@ -1663,9 +1725,210 @@ const make = Effect.gen(function* () {
     return result;
   });
 
+  const findSource = Effect.fn("ViewService.findSource")(function* (
+    missionId: MissionId,
+    sourceId: ViewDataSourceId,
+  ) {
+    const sources = yield* views.sources(missionId);
+    const existing = sources.find((source) => source.id === sourceId);
+    if (existing === undefined) {
+      return yield* fail("not-found", `No view source ${sourceId} in this mission.`);
+    }
+    return { existing, sources };
+  });
+
+  const activeSourceLimit = (sources: ReadonlyArray<ViewDataSource>) =>
+    sources.filter((source) => source.status === "active").length >=
+    VIEW_SOURCE_LIMITS.sourcesPerMission
+      ? fail("invalid", `A mission holds at most ${VIEW_SOURCE_LIMITS.sourcesPerMission} sources.`)
+      : Effect.void;
+
+  const sourceWrite = (source: ViewDataSource): PendingWrite => ({
+    write: { scope: "source", value: source },
+    counts: true,
+  });
+
+  const setSource: Write<SetViewSourceInput> = (provenance, input) =>
+    serial(
+      Effect.gen(function* () {
+        const mission = yield* requireMission(input.missionId);
+        const caller = yield* editorOf(mission.id, provenance);
+        const found =
+          input.sourceId === undefined ? null : yield* findSource(mission.id, input.sourceId);
+        const existing = found?.existing;
+        const sources = found?.sources ?? (yield* views.sources(mission.id));
+        if (existing?.status === "removed") {
+          return yield* fail(
+            "conflict",
+            `Source ${existing.definition.title} is removed; restore it before changing it.`,
+          );
+        }
+        if (existing === undefined) yield* activeSourceLimit(sources);
+        const title = input.title ?? existing?.definition.title;
+        const runtime = input.runtime ?? existing?.definition.runtime;
+        const code = input.code ?? existing?.definition.code;
+        const fields = input.fields ?? existing?.definition.fields;
+        if (
+          title === undefined ||
+          runtime === undefined ||
+          code === undefined ||
+          fields === undefined
+        ) {
+          return yield* fail("invalid", "A new source needs title, runtime, code and fields.");
+        }
+        if (Object.hasOwn(fields, "id")) {
+          return yield* fail(
+            "invalid",
+            "Every row has an id already; don't declare it as a field.",
+          );
+        }
+        yield* fence(existing?.version ?? 0, input.expectedVersion, "This source");
+        yield* spendBudget(caller);
+        const definition: ViewSourceDefinition = {
+          title,
+          runtime,
+          code,
+          fields,
+          refreshMinutes: input.refreshMinutes ?? existing?.definition.refreshMinutes ?? 15,
+          timeoutSeconds: input.timeoutSeconds ?? existing?.definition.timeoutSeconds ?? 30,
+          enabled: input.enabled ?? existing?.definition.enabled ?? true,
+        };
+        const now = yield* nowIso;
+        const id = existing?.id ?? ViewDataSourceId.make(newId("view-source"));
+        const source: ViewDataSource = {
+          id,
+          missionId: mission.id,
+          definition,
+          ...changeMeta(caller, (existing?.version ?? 0) + 1, now, input.changeNote),
+          catalogVersion: VIEW_CATALOG_VERSION,
+          status: "active",
+          createdAt: existing?.createdAt ?? now,
+          createdBy: existing?.createdBy ?? caller.by,
+        };
+        const verb = existing === undefined ? "added" : "updated";
+        return yield* commit({
+          missionId: mission.id,
+          kind: "view.source-set",
+          caller,
+          summary: `${who(caller)} ${verb} view source ${title} (v${source.version})`,
+          subject: { kind: "view-source", id, label: title },
+          // The code stays out of the timeline; history has it.
+          payload: {
+            before: existing === undefined ? null : sourceListing(existing),
+            after: sourceListing(source),
+            codeChanged: existing !== undefined && existing.definition.code !== code,
+          },
+          writes: [sourceWrite(source)],
+        });
+      }),
+    );
+
+  const removeSource: Write<RemoveViewSourceInput> = (provenance, input) =>
+    serial(
+      Effect.gen(function* () {
+        const mission = yield* requireMission(input.missionId);
+        const caller = yield* editorOf(mission.id, provenance);
+        const { existing } = yield* findSource(mission.id, input.sourceId);
+        const title = existing.definition.title;
+        if (existing.status === "removed") {
+          return yield* fail("conflict", `Source ${title} is already removed.`);
+        }
+        yield* fence(existing.version, input.expectedVersion, "This source");
+        yield* spendBudget(caller);
+        const now = yield* nowIso;
+        const next: ViewDataSource = {
+          ...existing,
+          ...changeMeta(caller, existing.version + 1, now, input.reason),
+          status: "removed",
+        };
+        return yield* commit({
+          missionId: mission.id,
+          kind: "view.source-removed",
+          caller,
+          summary: `${who(caller)} removed view source ${title}`,
+          subject: { kind: "view-source", id: existing.id, label: title },
+          payload: { version: next.version, reason: input.reason ?? null },
+          writes: [sourceWrite(next)],
+        });
+      }),
+    );
+
+  const restoreSource: Write<RestoreViewSourceInput> = (provenance, input) =>
+    serial(
+      Effect.gen(function* () {
+        const mission = yield* requireMission(input.missionId);
+        const caller = yield* editorOf(mission.id, provenance);
+        const { existing, sources } = yield* findSource(mission.id, input.sourceId);
+        const title = existing.definition.title;
+        const from =
+          input.toVersion === undefined
+            ? existing
+            : (yield* views.sourceVersions(existing.id)).find(
+                (version) => version.version === input.toVersion,
+              );
+        if (from === undefined) {
+          return yield* fail("not-found", `Source ${title} has no version ${input.toVersion}.`);
+        }
+        if (input.toVersion === undefined && existing.status === "active") {
+          return yield* fail(
+            "invalid",
+            `Source ${title} is active; pass toVersion to roll it back.`,
+          );
+        }
+        if (existing.status === "removed") yield* activeSourceLimit(sources);
+        yield* fence(existing.version, input.expectedVersion, "This source");
+        yield* spendBudget(caller);
+        const now = yield* nowIso;
+        const note =
+          input.changeNote ??
+          (input.toVersion === undefined ? "Restored." : `Restored version ${from.version}.`);
+        const next: ViewDataSource = {
+          ...existing,
+          definition: from.definition,
+          ...changeMeta(caller, existing.version + 1, now, note),
+          status: "active",
+        };
+        return yield* commit({
+          missionId: mission.id,
+          kind: "view.source-restored",
+          caller,
+          summary: `${who(caller)} restored view source ${next.definition.title}${input.toVersion === undefined ? "" : ` to version ${from.version}`}`,
+          subject: { kind: "view-source", id: existing.id, label: next.definition.title },
+          payload: { version: next.version, fromVersion: from.version },
+          writes: [sourceWrite(next)],
+        });
+      }),
+    );
+
+  // Not under `serial`: a run can take a minute and must not hold up view edits.
+  const runSource = Effect.fn("ViewService.runSource")(function* (
+    provenance: MissionProvenance,
+    input: RunViewSourceInput,
+  ) {
+    const mission = yield* requireMission(input.missionId);
+    yield* editorOf(mission.id, provenance);
+    const { existing } = yield* findSource(mission.id, input.sourceId);
+    const title = existing.definition.title;
+    if (existing.status === "removed") {
+      return yield* fail("conflict", `Source ${title} is removed; restore it first.`);
+    }
+    if (!existing.definition.enabled) {
+      return yield* fail("invalid", `Source ${title} is disabled; enable it first.`);
+    }
+    return yield* runs.run(existing, "manual");
+  });
+
   return ViewService.of({
     snapshot,
-    sectionData: (missionId, sections) => sectionData({ store, scribe }, missionId, sections),
+    sectionData: (missionId, sections) =>
+      Effect.flatMap(views.sources(missionId), (sources) =>
+        allSectionData(missionId, sections, sources),
+      ),
+    setSource,
+    removeSource,
+    restoreSource,
+    runSource,
+    sourceChanges: runs.changes,
     longText,
     reportSaves: scribe.reportSaves,
     catalog: Effect.succeed(VIEW_CATALOG),

@@ -20,6 +20,11 @@ import {
   ViewHistory,
   ViewHistoryInput,
   ViewPreview,
+  RemoveViewSourceInput,
+  RestoreViewSourceInput,
+  RunViewSourceInput,
+  SetViewSourceInput,
+  ViewSourceRunResult,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Effect from "effect/Effect";
@@ -107,6 +112,37 @@ const RestoreTool = tool(
   MissionMutationResult,
 );
 
+const SOURCE_RULES =
+  'Sources are read-only: never write to GitHub, Linear or Cliq, never send messages, never print secrets. The script prints {"rows":[{"id":...,<field>:...}]} on stdout (<=500 rows, <=2 MB); each row needs a unique id, undeclared keys are dropped, and any bad row fails the run (the last good rows stay). It runs as the owner with the login PATH (gh, linctl, curl, jq), stdin closed, in a scratch dir, niced, with a timeout of at most 60 s, and only when stale and someone is looking (or on mission_view_source_run). Bind it from a section with source {_tag:"source", sourceId, where?:{field:value}, sort?:{field, dir}, limit<=20} and row.<field> or row.id. Worked Linear and GitHub examples are in mission_views catalog:true under sources.examples.';
+
+const SourceSetTool = tool(
+  "mission_view_source_set",
+  `Owner or master. Add a script-backed view source (omit sourceId; title, runtime bash|node|python3, code and fields {name: text|enum|number|time|link|links|actor|longtext} are required) or update one (pass sourceId and only what changes). refreshMinutes 5..1440 (default 15), timeoutSeconds <=60 (default 30), enabled (default true). ${SOURCE_RULES}`,
+  SetViewSourceInput,
+  MissionMutationResult,
+);
+
+const SourceRunTool = tool(
+  "mission_view_source_run",
+  "Owner or master. Run a source now (joins a run already going) and return its parsed rows (first 20), row errors and the stderr tail. Use it to test a script after mission_view_source_set. A failed run keeps the last good rows.",
+  RunViewSourceInput,
+  ViewSourceRunResult,
+);
+
+const SourceRemoveTool = tool(
+  "mission_view_source_remove",
+  "Owner or master. Remove a view source; sections bound to it show 'source off'. Undo with mission_view_source_restore.",
+  RemoveViewSourceInput,
+  MissionMutationResult,
+);
+
+const SourceRestoreTool = tool(
+  "mission_view_source_restore",
+  'Owner or master. Bring a removed view source back, or roll an active one back to toVersion (see mission_view_history with target {_tag:"source", id}).',
+  RestoreViewSourceInput,
+  MissionMutationResult,
+);
+
 const LayoutTool = tool(
   "mission_view_layout",
   "Owner or master. Change the mission layout with ops: hide, show, move (region, index within the region), rename (null title resets), remove, add, replace, limits (templates, sections, daily change budget), set (rebuild) or reset (copy the current starter). Hiding Needs you or Your requests while items wait on the owner moves them to the pinned strip.",
@@ -191,6 +227,10 @@ export const ViewsToolkit = Toolkit.make(
   annotated(ApplyTool, "Apply a views bundle", false),
   annotated(AssetAddTool, "Add a mission image", false),
   annotated(AssetRemoveTool, "Remove a mission image", false),
+  annotated(SourceSetTool, "Set a mission view source", false),
+  annotated(SourceRunTool, "Run a mission view source", false),
+  annotated(SourceRemoveTool, "Remove a mission view source", false),
+  annotated(SourceRestoreTool, "Restore a mission view source", false),
 );
 
 const REFUSALS: ReadonlySet<MissionError["code"]> = new Set([
@@ -235,6 +275,18 @@ const handlers = {
   ),
   mission_view_section: McpToolAccess.actsAsCaller((input) =>
     withViews((views, scope) => views.placeSection(callerProvenance(scope), input)),
+  ),
+  mission_view_source_set: McpToolAccess.actsAsCaller((input) =>
+    withViews((views, scope) => views.setSource(callerProvenance(scope), input)),
+  ),
+  mission_view_source_run: McpToolAccess.actsAsCaller((input) =>
+    withViews((views, scope) => views.runSource(callerProvenance(scope), input)),
+  ),
+  mission_view_source_remove: McpToolAccess.actsAsCaller((input) =>
+    withViews((views, scope) => views.removeSource(callerProvenance(scope), input)),
+  ),
+  mission_view_source_restore: McpToolAccess.actsAsCaller((input) =>
+    withViews((views, scope) => views.restoreSource(callerProvenance(scope), input)),
   ),
   mission_view_remove: McpToolAccess.actsAsCaller((input) =>
     withViews((views, scope) => views.remove(callerProvenance(scope), input)),
