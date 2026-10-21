@@ -9,6 +9,7 @@ ROOT=${OFFBOX_PERSON_ROOT:-$HOME/.local/share/offbox-person}
 OFFBOX=${OFFBOX_PERSON_OFFBOX:-offbox}
 AGENT_BROWSER=${OFFBOX_PERSON_AGENT_BROWSER:-agent-browser}
 CDP_REMOTE=9242
+HOME_REMOTE=1055
 
 die()  { print -u2 -- "person: $*"; exit 1; }
 note() { print -u2 -- "person: $*"; }
@@ -16,13 +17,15 @@ note() { print -u2 -- "person: $*"; }
 usage() {
   cat >&2 <<'EOF'
 usage:
-  offbox-person up <person>                          start/ensure box, CDP launcher and tunnel; prints local CDP port
-  offbox-person down <person>                        close tunnel, release the lease
+  offbox-person up <person>                          start/ensure box, desktop, browser, home route; prints local CDP port
+  offbox-person down <person>                        close the browser, tunnels and home route, release the lease
   offbox-person browser <person> -- <agent-browser args>
+  offbox-person cua <person> <tool> ['<json>']        cua-driver call on the box's desktop
+  offbox-person shot <person>                        desktop screenshot, copied to $TMPDIR/offbox-person/<person>/
   offbox-person run <person> -- <cmd...>             runs in ~/person/work on the box
   offbox-person secret set|get|rm <person> <name>    set reads the value from stdin
   offbox-person secret list <person>
-  offbox-person save <person>                        save a default base and pin it
+  offbox-person save <person>                        save a default base and pin it (stops the box)
   offbox-person list
 EOF
   exit 2
@@ -34,27 +37,47 @@ check_person() {
 
 person_dir() { print -- "$ROOT/$1"; }
 state_file() { print -- "$ROOT/state/$1.env"; }
+shot_dir()   { print -- "${${TMPDIR:-/tmp}%/}/offbox-person/$1"; }
 
 load_state() {
-  TUNNEL_PID=
-  LOCAL_PORT=
+  TUNNEL_PID= LOCAL_PORT= HOME_ROUTE= HOME_PID= SOCKS_PID= SOCKS_PORT=
   [[ -f $(state_file "$1") ]] && source "$(state_file "$1")"
   return 0
 }
 
 save_state() {
   mkdir -p -- "$ROOT/state"
-  printf 'TUNNEL_PID=%s\nLOCAL_PORT=%s\n' "$2" "$3" > "$(state_file "$1")"
+  printf 'TUNNEL_PID=%s\nLOCAL_PORT=%s\nHOME_ROUTE=%s\nHOME_PID=%s\nSOCKS_PID=%s\nSOCKS_PORT=%s\n' \
+    "$TUNNEL_PID" "$LOCAL_PORT" "$HOME_ROUTE" "$HOME_PID" "$SOCKS_PID" "$SOCKS_PORT" > "$(state_file "$1")"
 }
 
-tunnel_alive() { [[ -n $TUNNEL_PID ]] && kill -0 "$TUNNEL_PID" 2>/dev/null; }
+pid_alive() { [[ -n ${1:-} ]] && kill -0 "$1" 2>/dev/null; }
+tunnel_alive() { pid_alive "$TUNNEL_PID"; }
+home_alive() { [[ $HOME_ROUTE == 0 ]] || { pid_alive "$HOME_PID" && pid_alive "$SOCKS_PID"; }; }
 
-# Every offbox call runs from the person's dir with a fixed owner thread: the repo key becomes
-# the person slug and the lease belongs to the person, not to whichever thread asked.
+# `offbox ports` only closes its `ssh -N` child on Ctrl-C; kill the child of the pid we started first so it
+# doesn't outlive us.
+stop_pid() {
+  [[ -n ${1:-} ]] || return 0
+  pkill -P "$1" 2>/dev/null || true
+  kill "$1" 2>/dev/null || true
+}
+
+# Every offbox call runs from the person's dir with a fixed owner thread: the repo key becomes the person slug
+# and the lease belongs to the person, not to whichever thread asked. A pool of one keeps all her data on one box.
 off() {
   local p=$1; shift
   mkdir -p -- "$(person_dir "$p")"
-  (cd -- "$(person_dir "$p")" && OFFBOX_THREAD="person:$p" "$OFFBOX" "$@")
+  (cd -- "$(person_dir "$p")" && OFFBOX_THREAD="person:$p" OFFBOX_POOL_SIZE=1 "$OFFBOX" "$@")
+}
+
+# Background `offbox` (tunnels) that outlives this command; sets BG_PID. All fds are redirected so a caller's
+# $(...) doesn't wait for it.
+off_bg() {
+  local p=$1 log=$2; shift 2
+  cd -- "$(person_dir "$p")"
+  OFFBOX_THREAD="person:$p" OFFBOX_POOL_SIZE=1 nohup "$OFFBOX" "$@" >>"$log" 2>&1 </dev/null &
+  BG_PID=$!
 }
 
 # --no-fallback and --remote: a failed box call must never re-run on this Mac, where her data
@@ -69,11 +92,41 @@ free_port() {
 wait_cdp() {
   local port=$1 i
   for i in {1..40}; do
-    curl -fsS "http://127.0.0.1:$port/json/version" >/dev/null 2>&1 && return 0
+    curl -fsS -m 3 "http://127.0.0.1:$port/json/version" >/dev/null 2>&1 && return 0
     sleep 0.5
   done
   return 1
 }
+
+# 1 unless config.json turns the home route off or names another proxy.
+wants_home_route() {
+  local cfg="$(person_dir "$1")/config.json"
+  [[ -f $cfg ]] || { print 1; return; }
+  python3 -c 'import json, sys; c = json.load(open(sys.argv[1])); print(0 if c.get("proxy") or c.get("home", True) is False else 1)' "$cfg"
+}
+
+# The filtering SOCKS server on this Mac plus the reverse tunnel that exposes it on the box at 127.0.0.1:1055.
+start_home_route() {
+  local p=$1 pf="$ROOT/state/$1-socks.port" i
+  if ! pid_alive "$SOCKS_PID"; then
+    stop_pid "$HOME_PID"; HOME_PID=
+    rm -f -- "$pf"
+    nohup python3 "$OFFBOX_PERSON_HOME/bin/offbox-person-socks" --port-file "$pf" \
+      >>"$ROOT/state/$p-socks.log" 2>&1 </dev/null &
+    SOCKS_PID=$!
+    for i in {1..50}; do [[ -s $pf ]] && break; sleep 0.1; done
+    [[ -s $pf ]] || die "home route SOCKS server did not start ($ROOT/state/$p-socks.log)"
+    SOCKS_PORT=$(<"$pf")
+  fi
+  if ! pid_alive "$HOME_PID"; then
+    note "$p: home route box:127.0.0.1:$HOME_REMOTE -> socks 127.0.0.1:$SOCKS_PORT"
+    off_bg "$p" "$ROOT/state/$p-home.log" ports "$HOME_REMOTE" --local "$SOCKS_PORT" --reverse
+    HOME_PID=$BG_PID
+  fi
+  save_state "$p"
+}
+
+push() { box_ssh "$1" "mkdir -p ~/person && cat > ~/person/$2" < "$OFFBOX_PERSON_HOME/box/$2" >&2; }
 
 cmd_up() {
   local p=$1
@@ -82,44 +135,70 @@ cmd_up() {
   load_state "$p"
 
   note "$p: preparing box"
+  # The first run syncs (the near-empty person dir) so a new lease gets its remote dir; later calls use --no-sync.
   local setup_b64
   setup_b64=$(base64 < "$OFFBOX_PERSON_HOME/box/setup.sh" | tr -d '\n')
-  box_run "$p" "printf %s '$setup_b64' | base64 -d | bash" >&2 \
+  off "$p" run --no-fallback --remote -- "printf %s '$setup_b64' | base64 -d | bash" >&2 \
     || die "box setup failed for $p"
 
-  box_ssh "$p" 'mkdir -p ~/person && cat > ~/person/launch.py' < "$OFFBOX_PERSON_HOME/box/launch.py" >&2
+  push "$p" launch.py
+  push "$p" session.sh
   local cfg="$(person_dir "$p")/config.json"
   { if [[ -f $cfg ]]; then cat -- "$cfg"; else print -- '{}'; fi; } \
     | box_ssh "$p" 'cat > ~/person/config.json && chmod 600 ~/person/config.json' >&2
 
-  # The launcher survives the end of this offbox run: setsid + nohup + all fds redirected.
-  local start='mkdir -p ~/person/work; if ! curl -fsS http://127.0.0.1:9242/json/version >/dev/null 2>&1; then setsid nohup xvfb-run -a ~/person/venv/bin/python ~/person/launch.py >>~/person/launcher.log 2>&1 </dev/null & fi; for i in $(seq 1 60); do curl -fsS http://127.0.0.1:9242/json/version >/dev/null 2>&1 && exit 0; sleep 2; done; tail -20 ~/person/launcher.log >&2; exit 1'
-  box_run "$p" "$start" >&2 || die "CDP launcher did not come up on the box (~/person/launcher.log there)"
+  HOME_ROUTE=$(wants_home_route "$p")
+  if [[ $HOME_ROUTE == 1 ]]; then
+    start_home_route "$p"
+  else
+    stop_pid "$HOME_PID"; stop_pid "$SOCKS_PID"; HOME_PID= SOCKS_PID= SOCKS_PORT=
+  fi
+
+  box_ssh "$p" "HOME_ROUTE=$HOME_ROUTE bash ~/person/session.sh" >&2 \
+    || die "desktop/browser did not come up on the box (~/person/*.log there)"
 
   if ! tunnel_alive || [[ -z $LOCAL_PORT ]]; then
     LOCAL_PORT=$(free_port)
-    local tlog="$ROOT/state/$p-tunnel.log"
     note "$p: tunnel 127.0.0.1:$LOCAL_PORT -> box:$CDP_REMOTE"
-    cd -- "$(person_dir "$p")"
     # A live `offbox ports` process touches the lease and holds the auto-stop TTL, so this is what keeps the box up.
-    OFFBOX_THREAD="person:$p" nohup "$OFFBOX" ports "$CDP_REMOTE" --local "$LOCAL_PORT" >>"$tlog" 2>&1 </dev/null &
-    TUNNEL_PID=$!
-    save_state "$p" "$TUNNEL_PID" "$LOCAL_PORT"
+    off_bg "$p" "$ROOT/state/$p-tunnel.log" ports "$CDP_REMOTE" --local "$LOCAL_PORT"
+    TUNNEL_PID=$BG_PID
   fi
+  save_state "$p"
   wait_cdp "$LOCAL_PORT" || die "CDP at 127.0.0.1:$LOCAL_PORT did not answer (tunnel log: $ROOT/state/$p-tunnel.log)"
   print -- "$LOCAL_PORT"
+}
+
+# Commands that only need a running box skip the full `up` when the tunnels are alive and CDP answers.
+ensure_up() {
+  load_state "$1"
+  if tunnel_alive && home_alive && curl -fsS -m 3 "http://127.0.0.1:$LOCAL_PORT/json/version" >/dev/null 2>&1; then
+    print -- "$LOCAL_PORT"
+    return 0
+  fi
+  cmd_up "$1"
+}
+
+stop_local() {
+  local p=$1
+  load_state "$p"
+  stop_pid "$TUNNEL_PID"
+  stop_pid "$HOME_PID"
+  stop_pid "$SOCKS_PID"
+  rm -f -- "$(state_file "$p")" "$ROOT/state/$p-socks.port"
 }
 
 cmd_down() {
   local p=$1
   check_person "$p"
   load_state "$p"
-  if [[ -n $TUNNEL_PID ]]; then
-    # offbox ports only closes its `ssh -N` child on Ctrl-C; kill the child we own first so it doesn't outlive us.
-    pkill -P "$TUNNEL_PID" 2>/dev/null || true
-    kill "$TUNNEL_PID" 2>/dev/null || true
+  # Close the browser while the box is still up so the profile (her cookies) is flushed to disk; skipped when
+  # the tunnel is gone, since that would resume a stopped box just to close it.
+  if tunnel_alive; then
+    box_ssh "$p" 'bash ~/person/session.sh stop-browser' >&2 || note "browser did not close cleanly"
   fi
-  rm -f -- "$(state_file "$p")"
+  stop_local "$p"
+  rm -rf -- "$(shot_dir "$p")"
   off "$p" release --mine >&2 || note "offbox release reported a problem (check: offbox list)"
   note "$p: down"
 }
@@ -128,15 +207,40 @@ cmd_browser() {
   local p=$1; shift
   check_person "$p"
   local port
-  port=$(cmd_up "$p" 2>/dev/null) || die "could not bring up $p's box"
+  port=$(ensure_up "$p" 2>/dev/null) || die "could not bring up $p's box"
   exec "$AGENT_BROWSER" --session "person-$p" --cdp "$port" --input-mode human "$@"
+}
+
+cmd_cua() {
+  local p=$1 tool=$2 json=${3:-'{}'}
+  check_person "$p"
+  [[ $tool =~ '^[a-z][a-z0-9_]{0,63}$' ]] || die "cua tool must be a cua-driver tool name, got '$tool'"
+  ensure_up "$p" >/dev/null
+  # base64 keeps arbitrary JSON intact through the ssh command line.
+  local b64
+  b64=$(print -rn -- "$json" | base64 | tr -d '\n')
+  box_ssh "$p" ". ~/person/session.env && cua-driver call $tool \"\$(printf %s '$b64' | base64 -d)\""
+}
+
+cmd_shot() {
+  local p=$1
+  check_person "$p"
+  ensure_up "$p" >/dev/null
+  local dir out
+  dir=$(shot_dir "$p")
+  mkdir -p -- "$dir"
+  out="$dir/shot-$(date +%Y%m%d-%H%M%S).png"
+  box_ssh "$p" '. ~/person/session.env && d=$(mktemp -d) && cua-driver call get_desktop_state "{\"screenshot_out_file\":\"$d/shot.png\"}" >/dev/null && cat "$d/shot.png"; rc=$?; rm -rf "$d"; exit $rc' > "$out" \
+    || { rm -f -- "$out"; die "screenshot failed on $p's box"; }
+  [[ -s $out ]] || { rm -f -- "$out"; die "screenshot came back empty"; }
+  print -- "$out"
 }
 
 cmd_run() {
   local p=$1; shift
   check_person "$p"
   (( $# )) || usage
-  cmd_up "$p" >/dev/null
+  ensure_up "$p" >/dev/null
   box_run "$p" "mkdir -p ~/person/work && cd ~/person/work && $*"
 }
 
@@ -152,32 +256,35 @@ cmd_secret() {
       local value
       value=$(cat)
       [[ -n $value ]] || die "no secret value on stdin"
-      cmd_up "$p" >/dev/null
+      ensure_up "$p" >/dev/null
       print -rn -- "$value" | box_ssh "$p" "umask 077; mkdir -p $dir && cat > $dir/$name && chmod 600 $dir/$name"
       ;;
-    get)  cmd_up "$p" >/dev/null; box_ssh "$p" "cat $dir/$name" ;;
-    rm)   cmd_up "$p" >/dev/null; box_ssh "$p" "rm -f $dir/$name" ;;
-    list) cmd_up "$p" >/dev/null; box_ssh "$p" "ls -1 $dir 2>/dev/null || true" ;;
+    get)  ensure_up "$p" >/dev/null; box_ssh "$p" "cat $dir/$name" ;;
+    rm)   ensure_up "$p" >/dev/null; box_ssh "$p" "rm -f $dir/$name" ;;
+    list) ensure_up "$p" >/dev/null; box_ssh "$p" "ls -1 $dir 2>/dev/null || true" ;;
     *)    usage ;;
   esac
 }
 
+# Saving stops the box, which ends the tunnels; the browser is closed first so the snapshot has a flushed profile.
 cmd_save() {
   local p=$1
   check_person "$p"
-  cmd_up "$p" >/dev/null
+  ensure_up "$p" >/dev/null
+  box_ssh "$p" 'bash ~/person/session.sh stop-browser' >&2 || note "browser did not close cleanly"
+  stop_local "$p"
   off "$p" save --name person --default --note "person box $p" >&2
   off "$p" keep --days 3650 >&2
 }
 
 cmd_list() {
-  local f p alive
+  local f p state
   for f in "$ROOT"/state/*.env(N); do
     p=${f:t:r}
     load_state "$p"
-    alive=down
-    tunnel_alive && alive=up
-    print -- "$p  cdp=127.0.0.1:${LOCAL_PORT:-?}  tunnel=$alive"
+    state=down
+    tunnel_alive && state=up
+    print -- "$p  cdp=127.0.0.1:${LOCAL_PORT:-?}  tunnel=$state  home=$([[ $HOME_ROUTE == 1 ]] && { home_alive && print up || print down; } || print off)"
   done
 }
 
@@ -187,6 +294,8 @@ case $cmd in
   up)      [[ $# -eq 1 ]] || usage; cmd_up "$1" ;;
   down)    [[ $# -eq 1 ]] || usage; cmd_down "$1" ;;
   browser) [[ $# -ge 1 ]] || usage; p=$1; shift; [[ ${1:-} == -- ]] && shift; cmd_browser "$p" "$@" ;;
+  cua)     [[ $# -ge 2 && $# -le 3 ]] || usage; cmd_cua "$@" ;;
+  shot)    [[ $# -eq 1 ]] || usage; cmd_shot "$1" ;;
   run)     [[ $# -ge 1 ]] || usage; p=$1; shift; [[ ${1:-} == -- ]] && shift; cmd_run "$p" "$@" ;;
   secret)  [[ $# -ge 2 ]] || usage; cmd_secret "$@" ;;
   save)    [[ $# -eq 1 ]] || usage; cmd_save "$1" ;;
