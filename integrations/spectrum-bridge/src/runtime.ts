@@ -379,15 +379,20 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           return result(outcome);
         }
         case "/guest-allow": {
-          only(body, ["address", "name", "purpose", "actions", "expires", "evidence", "sessionId"]);
+          only(body, ["address", "name", "purpose", "providers", "actions", "facts", "expires", "evidence", "sessionId"]);
           // Never from a shell: a grant must come from the owner's chat, where his words are.
           ownerOnly(false);
           if (!options.guests) throw new HttpError(503, "Guests unavailable");
-          const { address, name, purpose, actions, expires, evidence } = body;
-          if (!text(address, 200) || !text(name, 100) || !text(purpose, 300) || !text(evidence, 220)
-            || (expires !== undefined && !text(expires, 10))
-            || !Array.isArray(actions) || actions.length > 4 || actions.some(action => typeof action !== "string")) throw new HttpError(400, "Invalid request");
-          return result(options.guests.allow({ address, name, purpose, actions: actions as string[], evidence, ...(expires ? { expires } : {}) }));
+          const { address, name, purpose, expires } = body;
+          const strings = (value: unknown, max: number, each: number): string[] | undefined =>
+            value === undefined ? [] : Array.isArray(value) && value.length <= max && value.every(item => text(item, each)) ? value as string[] : undefined;
+          const providers = strings(body.providers, 6, 40);
+          const actions = strings(body.actions, 4, 40);
+          const facts = strings(body.facts, 8, 345);
+          const evidence = typeof body.evidence === "string" ? [body.evidence] : strings(body.evidence, 4, 220);
+          if (!text(address, 200) || !text(name, 100) || !text(purpose, 300) || !evidence?.length
+            || (expires !== undefined && !text(expires, 10)) || !providers || !actions || !facts) throw new HttpError(400, "Invalid request");
+          return result(options.guests.allow({ address, name, purpose, providers: [...providers, ...actions], facts, evidence, ...(expires ? { expires } : {}) }));
         }
         case "/guest-revoke": {
           only(body, ["address", "sessionId"]);

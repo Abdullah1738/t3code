@@ -236,16 +236,18 @@ describe("Sendblue socket API", () => {
     const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"), enabled: () => true, health: () => ({}), guests });
     const post = async (path: string, body: Record<string, unknown>) =>
       (await handler(new Request(`http://bridge${path}`, { method: "POST", body: JSON.stringify(body) }))).status;
-    const allow = { address: "+447000000002", name: "Sam", purpose: "book a meeting", actions: ["meeting"], evidence: "msgs:1" };
+    const allow = { address: "+447000000002", name: "Sam", purpose: "book a meeting", providers: ["meeting"], facts: [], evidence: ["msgs:1"] };
     expect(await post("/guest-allow", { ...allow, sessionId: "ses_moni" })).toBe(403);
     expect(await post("/guest-allow", allow)).toBe(403);
     expect(await post("/guest-send", { address: "+447000000002", text: "hi", dedupeKey: "k", sessionId: "ses_moni" })).toBe(403);
     expect(await post("/guest-allow", { ...allow, extra: true, sessionId: "ses_owner" })).toBe(400);
     expect(calls).toEqual([]);
     expect(await post("/guest-allow", { ...allow, sessionId: "ses_owner" })).toBe(200);
+    // First-version callers still send actions and a single evidence string.
+    expect(await post("/guest-allow", { address: "+447000000002", name: "Sam", purpose: "x", actions: ["meeting"], evidence: "msgs:1", sessionId: "ses_owner" })).toBe(200);
     expect(await post("/guest-revoke", { address: "+447000000002" })).toBe(200);
     expect(await post("/share-contact", { chat: "moni", sessionId: "ses_owner" })).toBe(200);
-    expect(calls).toEqual(["allow", "revoke", "share"]);
+    expect(calls).toEqual(["allow", "allow", "revoke", "share"]);
   });
 
   test("the owner chat can list chats, message one and pass decisions on", async () => {

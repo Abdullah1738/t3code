@@ -63,7 +63,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
   "allow-group": ["id", "name", "session"],
-  "guest-allow": ["address", "name", "purpose", "action", "expires", "evidence", "session"],
+  "guest-allow": ["address", "name", "purpose", "provider", "action", "fact", "expires", "evidence", "session"],
   "guest-revoke": ["address", "session"],
   guests: ["session"],
   "guest-send": ["address", "text", "session", "key"],
@@ -74,7 +74,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   publish: ["port", "app"],
   unpublish: ["port"],
 };
-const REPEATABLE = ["option", "field", "action"];
+const REPEATABLE = ["option", "field", "action", "provider", "fact", "evidence"];
 const BOOLEAN_OPTIONS = ["forget", "card", "admin"];
 
 function parseOptions(args: string[]) {
@@ -289,12 +289,21 @@ export function parseCommand(args: string[]): Command {
       const address = label(required(values.address, "--address"), "--address", 200)!;
       const name = label(required(values.name, "--name"), "--name", 100)!;
       const purpose = label(required(values.purpose, "--purpose"), "--purpose", 300)!;
-      const evidence = label(required(values.evidence, "--evidence"), "--evidence", 220)!;
-      const actions = lists.action ?? [];
-      for (const action of actions) if (!["meeting", "create-hold"].includes(action)) throw new CliError("--action must be meeting or create-hold");
+      const evidence = lists.evidence ?? [];
+      if (!evidence.length || evidence.length > 4) throw new CliError("--evidence is required (up to 4)");
+      for (const ref of evidence) label(required(ref, "--evidence"), "--evidence", 220);
+      // --action is the first version's name for --provider.
+      const providers = [...lists.provider ?? [], ...lists.action ?? []];
+      if (providers.length > 6) throw new CliError("At most 6 --provider values");
+      for (const spec of providers) if (!/^(meeting|create-hold|flight-status|flight-updates)(:[A-Za-z0-9]{2}\d{1,4}(@\d{4}-\d{2}-\d{2})?)?$/.test(spec)) {
+        throw new CliError("--provider must be meeting, create-hold, flight-status[:EK57] or flight-updates[:EK57]");
+      }
+      const facts = lists.fact ?? [];
+      if (facts.length > 8) throw new CliError("At most 8 --fact values");
+      for (const fact of facts) if (!/^[^=]{1,40}=.{1,300}$/s.test(fact)) throw new CliError("--fact must look like \"gate code=4821\"");
       const expires = label(values.expires, "--expires", 10);
       return { method: "POST", path: "/guest-allow", body: {
-        address, name, purpose, evidence, actions, sessionId: sessionOnly(values.session)!, ...(expires === undefined ? {} : { expires }),
+        address, name, purpose, evidence, providers, facts, sessionId: sessionOnly(values.session)!, ...(expires === undefined ? {} : { expires }),
       } };
     }
     case "guest-revoke": {

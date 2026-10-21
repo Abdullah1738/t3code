@@ -357,3 +357,15 @@ describe("CLI entry point (no live socket)", () => {
     expect(stderr).toBe(`${JSON.stringify({ error })}\n`);
   });
 });
+
+describe("guest-allow", () => {
+  test("takes providers, facts and several evidence refs; --action is the old name for --provider", () => {
+    const body = parseCommand(["guest-allow", "--address", "+447700900123", "--name", "Ali", "--purpose", "pick me up",
+      "--provider", "flight-updates:EK57", "--action", "meeting", "--fact", "meeting point=Door 4", "--evidence", "msgs:21", "--evidence", "owner:o-1", "--session", "ses_1"]).body;
+    expect(body).toEqual({ address: "+447700900123", name: "Ali", purpose: "pick me up", providers: ["flight-updates:EK57", "meeting"],
+      facts: ["meeting point=Door 4"], evidence: ["msgs:21", "owner:o-1"], sessionId: "ses_1" });
+    expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--provider", "shell", "--evidence", "msgs:1", "--session", "ses_1"])).toThrow();
+    expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--fact", "nokey", "--evidence", "msgs:1", "--session", "ses_1"])).toThrow();
+    expect(() => parseCommand(["guest-allow", "--address", "+447700900123", "--name", "A", "--purpose", "p", "--session", "ses_1"])).toThrow();
+  });
+});
