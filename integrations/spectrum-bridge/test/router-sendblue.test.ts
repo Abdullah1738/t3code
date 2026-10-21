@@ -153,6 +153,15 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(owner).not.toContain("ask-owner");
 });
 
+test("every chat's prompt says which link kind to create and to fill preview metadata", () => {
+  for (const kind of ["owner", "dm", "group"] as const) {
+    const prompt = sendblueContextPrompt(context(kind), false, []);
+    expect(prompt).toContain("owner's own chat use `publish --app SLUG`");
+    expect(prompt).toContain("any group or anyone else use `share --app SLUG");
+    expect(prompt).toContain("og:title, og:description and og:image");
+  }
+});
+
 test("👀 is sent once for a non-owner batch and never in the owner chat", async () => {
   const start = Date.parse("2026-10-21T14:00:00Z");
   setSystemTime(start);

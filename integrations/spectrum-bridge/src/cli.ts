@@ -4,12 +4,12 @@ import { request } from "node:http";
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, resolve, win32 } from "node:path";
 import { parseArgs } from "node:util";
-import { resolveAppFile } from "./apps.ts";
+import { metadataWarnings, resolveAppFile, validAppSlug } from "./apps.ts";
 import { loadAppsConfig } from "./config.ts";
 import { type Exec, publish, PUBLISH_MAX, PUBLISH_MIN, PublishError, unpublish } from "./publish.ts";
 import { CARD_FIELDS, parseFieldSpec, SECRET_FIELD_TYPES, type SecretField, validFieldName, validToken } from "./secrets.ts";
 
-type Body = Record<string, string | boolean | string[] | SecretField[]>;
+type Body = Record<string, string | number | boolean | string[] | SecretField[]>;
 type Command = { method: "GET" | "POST"; path: string; body?: Body };
 /** Tailnet publishing runs in the CLI process itself; it never goes through the bridge socket. */
 export type LocalCommand =
@@ -25,6 +25,7 @@ class RawOutput {
 
 const COMMANDS_HELP = "Expected health, send, send-file, poll, app, react, wake, secret-request, secret, publish, or unpublish."
   + " Sendblue mode adds location-request, location, ask-owner, chats, allow, and allow-group."
+  + " Public links: share, unshare, and shares."
   + " Alerts and reminders moved to the telegram bridge CLI.";
 const LOCAL_COMMANDS = ["publish", "unpublish"];
 
@@ -67,6 +68,9 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   secret: ["token", "field", "forget"],
   publish: ["port", "app"],
   unpublish: ["port"],
+  share: ["app", "days"],
+  unshare: ["app"],
+  shares: [],
 };
 const REPEATABLE = ["option", "field"];
 const BOOLEAN_OPTIONS = ["forget", "card", "admin"];
@@ -119,7 +123,7 @@ function portOption(value: string | undefined, label: string): number {
   return port;
 }
 
-export const validAppSlug = (value: unknown): value is string => typeof value === "string" && /^[a-z0-9-]{1,64}$/.test(value);
+export { validAppSlug };
 
 export const isLocalCommand = (args: string[]): boolean => LOCAL_COMMANDS.includes(args[0] ?? "");
 
@@ -151,7 +155,7 @@ export async function runLocalCommand(command: LocalCommand, options: { exec?: E
     const index = await resolveAppFile(appsRoot, `/${command.app}/index.html`);
     if (!index) throw new CliError(`No app at ${appsRoot}/${command.app}/index.html`);
     const { url, port, created } = await publish(appsPort, deps);
-    return { url: `${url}/${command.app}/`, port, created };
+    return { url: `${url}/${command.app}/`, port, created, metadataWarnings: metadataWarnings(await Bun.file(index).text()) };
   } catch (error) {
     if (error instanceof CliError) throw error;
     throw new CliError(error instanceof PublishError ? error.message : "Tailnet publish failed");
@@ -312,6 +316,21 @@ export function parseCommand(args: string[]): Command {
       if (new Set(fields.map(field => field.name)).size !== fields.length) throw new CliError("--field names must be distinct");
       return { method: "POST", path: "/secret-request", body: { purpose, fields, ...session() } };
     }
+    case "share": {
+      const app = required(values.app, "--app");
+      if (!validAppSlug(app)) throw new CliError("--app must be 1-64 characters of a-z, 0-9, or -");
+      if (values.days !== undefined && !/^\d{1,2}$/.test(values.days)) throw new CliError("--days must be 1 to 30");
+      const days = values.days === undefined ? undefined : Number(values.days);
+      if (days !== undefined && (days < 1 || days > 30)) throw new CliError("--days must be 1 to 30");
+      return { method: "POST", path: "/share", body: days === undefined ? { app } : { app, days } };
+    }
+    case "unshare": {
+      const app = required(values.app, "--app");
+      if (!validAppSlug(app)) throw new CliError("--app must be 1-64 characters of a-z, 0-9, or -");
+      return { method: "POST", path: "/unshare", body: { app } };
+    }
+    case "shares":
+      return { method: "POST", path: "/shares", body: {} };
     case "secret": {
       const token = required(values.token, "--token");
       if (!validToken(token)) throw new CliError("Invalid --token");
@@ -402,7 +421,8 @@ async function sendCommand(command: Command): Promise<unknown> {
   // Queued sends echo only an acknowledgement; never surface their response bodies.
   const queued = ["/files", "/send", "/poll", "/app", "/wake"].includes(command.path);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
+  // Opening a quick tunnel waits for Cloudflare's edge, which can take a while.
+  const timer = setTimeout(() => controller.abort(), command.path === "/share" ? 60_000 : 15_000);
   try {
     return await new Promise<unknown>((resolve, reject) => {
       const fail = () => reject(new CliError(controller.signal.aborted ? "Bridge request timed out" : "Bridge request failed"));

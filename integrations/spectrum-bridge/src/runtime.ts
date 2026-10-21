@@ -12,6 +12,7 @@ import { chatKey, LineError, type ChatKey, type Line } from "./line.ts";
 import { askOwner, editAccess, location, locationRequest, type SbApiDeps, type SbApiResult } from "./sb-api.ts";
 import { TYPING_WINDOW_MS, type IngressSink } from "./sb-ingress.ts";
 import { getSecretRequest, type SecretDeps } from "./secrets.ts";
+import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import { sessionMatches } from "./session.ts";
 import { Store } from "./store.ts";
 
@@ -198,6 +199,8 @@ export type SbApiOptions<P extends { api: Handler }> = {
   health: () => Record<string, unknown>;
   /** Called after an access edit so the next message sees it without waiting for the tick. */
   reloadAccess?: () => Promise<unknown>;
+  /** Public Cloudflare links; any chat may share, since that is how non-owner chats get a page. */
+  shares?: Shares;
 };
 
 /** Session-bound routes the per-chat Photon-era API already implements. */
@@ -267,6 +270,10 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       }
 
       if (!body) throw new HttpError(400, "Invalid request");
+      if (SHARE_ROUTES.includes(path)) {
+        if (!options.shares) throw new HttpError(503, "Sharing is unavailable");
+        return result(await shareRoute(options.shares, path, body));
+      }
       const ownerOnly = (allowLocal: boolean) => {
         if (sessionId === undefined) {
           if (allowLocal) return;

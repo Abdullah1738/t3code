@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { contentType, createAppsHandler, resolveAppFile, startAppsServer } from "../src/apps.ts";
+import { absoluteMeta, contentType, createAppsHandler, createShareHandler, metadataWarnings, resolveAppFile, startAppsServer } from "../src/apps.ts";
 import { APPS_DEFAULTS, appsConfig, loadAppsConfig } from "../src/config.ts";
 
 let base: string;
@@ -103,6 +103,68 @@ test("the CLI reads only apps settings, defaulting when the config file is absen
   expect(await loadAppsConfig(join(base, "missing"))).toEqual({ ...APPS_DEFAULTS });
   await fs.writeFile(join(base, "config.json"), "{not json");
   await expect(loadAppsConfig(base)).rejects.toThrow("Invalid bridge configuration");
+});
+
+const RICH = `<html><head><title>Trip</title><meta property="og:title" content="Trip"><meta property="og:description" content="Plan">
+<meta property="og:image" content="assets/cover.png"><meta property="og:url" content="./"><meta name="twitter:image" content="/tracker/x.png">
+<meta property="og:image:alt" content="assets/alt"><meta property="og:image:secure_url" content="https://cdn.example/c.png"></head></html>`;
+
+describe("link preview metadata", () => {
+  test("relative og/twitter URLs become absolute for the forwarded public host", async () => {
+    await fs.writeFile(join(root, "tracker", "index.html"), RICH);
+    for (const [path, page] of [["/tracker/", "https://a-b.trycloudflare.com/tracker/"], ["/tracker", "https://a-b.trycloudflare.com/tracker/"],
+      ["/tracker/index.html", "https://a-b.trycloudflare.com/tracker/"]]) {
+      const response = await createAppsHandler(root)(new Request(`http://127.0.0.1:18791${path}`,
+        { headers: { host: "127.0.0.1:18791", "x-forwarded-host": "a-b.trycloudflare.com" } }));
+      const html = await response.text();
+      expect(html).toContain(`content="${page}assets/cover.png"`);
+      expect(html).toContain(`property="og:url" content="${page}"`);
+      expect(html).toContain(`content="https://a-b.trycloudflare.com/tracker/x.png"`);
+      expect(html).toContain(`content="assets/alt"`);
+      expect(html).toContain(`content="https://cdn.example/c.png"`);
+      expect(response.headers.get("content-length")).toBe(String(Buffer.byteLength(html)));
+    }
+    // Cloudflare sends the public host as Host; a bad host leaves the page untouched.
+    const viaHost = await createAppsHandler(root)(new Request("http://x.trycloudflare.com/tracker/", { headers: { host: "x.trycloudflare.com" } }));
+    expect(await viaHost.text()).toContain(`content="https://x.trycloudflare.com/tracker/assets/cover.png"`);
+    const bad = await createAppsHandler(root)(new Request("http://127.0.0.1/tracker/", { headers: { host: "evil\"host" } }));
+    expect(await bad.text()).toContain(`content="assets/cover.png"`);
+  });
+
+  test("warnings list what a rich preview still lacks", () => {
+    expect(metadataWarnings(RICH)).toEqual([]);
+    expect(metadataWarnings("<h1>x</h1>")).toEqual(["missing <title>", "missing og:title", "missing og:description", "missing og:image"]);
+    expect(metadataWarnings(`<title> </title><meta property="og:title" content=""><meta name="og:description" content="d">`))
+      .toEqual(["missing <title>", "missing og:title", "missing og:image"]);
+  });
+
+  test("absoluteMeta leaves non-preview tags and unparseable values alone", () => {
+    expect(absoluteMeta(`<meta name="description" content="a/b">`, "https://h/x/")).toBe(`<meta name="description" content="a/b">`);
+    expect(absoluteMeta(`<meta property="OG:IMAGE" content="i.png">`, "https://h/x/")).toBe(`<meta property="OG:IMAGE" content="https://h/x/i.png">`);
+  });
+});
+
+describe("share handler", () => {
+  const share = (path: string, method = "GET") => createShareHandler(join(root, "tracker"))(new Request(`http://127.0.0.1${path}`, { method }));
+
+  test("serves only the shared app's directory at /", async () => {
+    expect(await (await share("/")).text()).toBe("<h1>tracker</h1>");
+    expect(await (await share("/assets/app.js")).text()).toBe("console.log(1)");
+    expect((await share("/data.json", "HEAD")).status).toBe(200);
+    expect((await share("/", "POST")).status).toBe(405);
+    // URL parsing folds a leading ../ back to the share root, never its parent.
+    for (const path of ["/../index.html", "/%2e%2e/index.html"]) expect(await (await share(path)).text()).toBe("<h1>tracker</h1>");
+  });
+
+  test.each(["/tracker/", "/..%2findex.html", "/../.env", "/_secret", "/_secret/",
+    `/_secret/${"a".repeat(43)}`, "/assets", "/assets/", "/.hidden", "/%2e%2e%2f%2e%2e%2fsecret.txt"])("refuses %s", async path => {
+    await fs.mkdir(join(root, "tracker", "_secret"), { recursive: true });
+    await fs.writeFile(join(root, "tracker", "_secret", "index.html"), "PRIVATE");
+    await fs.writeFile(join(root, "tracker", ".hidden"), "PRIVATE");
+    const response = await share(path);
+    expect([path, response.status]).toEqual([path, 404]);
+    expect(await response.text()).not.toContain("PRIVATE");
+  });
 });
 
 test("the reserved /_secret prefix never serves static files, with or without the secrets dependency", async () => {

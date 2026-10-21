@@ -104,6 +104,16 @@ under `~/.config/spectrum-bridge/`.
   runs `tailscale serve` for a free HTTPS port in 18400-18499 (or reuses an
   existing mapping) and prints the URL; `unpublish --port N` removes one. Only
   ports in that range are ever created or removed.
+- Public links for people off the tailnet: `share --app SLUG [--days N]`
+  (default 7, max 30) serves only that app's folder from its own loopback
+  server through a Cloudflare quick tunnel (`cloudflared`, no account) and
+  prints the `trycloudflare.com` URL. The bridge owns the tunnels: at most 10
+  live, stopped at expiry, killed with the bridge, and re-created with a new
+  URL when the bridge starts again (`share-restarted` log). `unshare --app SLUG`
+  ends one; `shares` lists them. `share` and `publish --app` return
+  `metadataWarnings` for a missing `<title>`, `og:title`, `og:description` or
+  `og:image`, and served pages get relative `og:image`/`og:url` made absolute
+  so link previews load.
 - Secure forms: `secret-request --session S --key K --purpose P --field name:Label[:type]`
   sends a one-time app card (15 minutes) for credentials. Submitted values are
   stored in `~/.config/spectrum-bridge/secrets/` (0600, never in the chat,
