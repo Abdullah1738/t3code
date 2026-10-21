@@ -14,6 +14,7 @@ import {
   type ViewActionKey,
   type ViewBackedRecord,
   type ViewBackingKind,
+  type ViewLongTextInput,
   type ViewNode,
   type ViewNodeTag,
   type ViewTableCellKind,
@@ -25,6 +26,7 @@ import * as Schema from "effect/Schema";
 
 import {
   resolveViewBind,
+  viewLongTextSource,
   viewValueCount,
   viewValueText,
   type ViewBindContext,
@@ -87,7 +89,33 @@ export type ViewBlock =
       readonly kind: "group";
       readonly direction: "column" | "row";
       readonly children: ReadonlyArray<ViewBlock>;
+    }
+  // --- views additions ---
+  | {
+      readonly kind: "markdown";
+      /** Null while the text waits on `source`. */
+      readonly text: string | null;
+      /** Set for long values left off the snapshot: load them when the block shows. */
+      readonly source: ViewLongTextInput | null;
+      readonly maxLines: number | null;
+    }
+  | {
+      readonly kind: "collapsible";
+      /** `first` starts the first item open. */
+      readonly open: "none" | "first";
+      readonly items: ReadonlyArray<ViewCollapsibleItem>;
     };
+// --- end views additions ---
+
+// --- views additions ---
+/** One folded item: a section row, or the card itself. Children render only when open. */
+export interface ViewCollapsibleItem {
+  readonly key: string;
+  readonly title: string;
+  readonly meta: ReadonlyArray<string>;
+  readonly children: ReadonlyArray<ViewBlock>;
+}
+// --- end views additions ---
 
 export interface ViewChoiceOption {
   readonly id: string;
@@ -284,6 +312,36 @@ const galleryBlock = (
   return { kind: "gallery", review, assets: shown };
 };
 
+// --- views additions ---
+const collapsibleItem = (
+  node: Extract<ViewNode, { _tag: "collapsible" }>,
+  key: string,
+  context: ViewBindContext,
+  backed: ViewBackedRecord | null,
+  assets: ReadonlyArray<MissionAsset> | undefined,
+): ViewCollapsibleItem | null => {
+  const title =
+    (node.title === null ? null : viewValueText(resolveViewBind(node.title, context))) ??
+    node.label ??
+    null;
+  if (title === null) return null;
+  const children = node.children.flatMap((child) => {
+    const block = viewBlock(child, context, backed, assets === undefined ? {} : { assets });
+    return block === null ? [] : [block];
+  });
+  if (children.length === 0) return null;
+  return {
+    key,
+    title,
+    meta: node.meta.flatMap((bind) => {
+      const value = viewValueText(resolveViewBind(bind, context));
+      return value === null ? [] : [value];
+    }),
+    children,
+  };
+};
+// --- end views additions ---
+
 /** What a body resolves against besides its own record: section rows and mission images. */
 export interface ViewBlockSources {
   readonly rows?: ReadonlyArray<ViewRowContext>;
@@ -371,6 +429,26 @@ export function viewBlock(
       });
       return children.length === 0 ? null : { kind: "group", direction: node.direction, children };
     }
+    // --- views additions ---
+    case "markdown": {
+      const maxLines = node.maxLines ?? null;
+      const source = viewLongTextSource(node.bind, context);
+      if (source !== null) return { kind: "markdown", text: null, source, maxLines };
+      const text = viewValueText(resolveViewBind(node.bind, context));
+      return text === null ? null : { kind: "markdown", text, source: null, maxLines };
+    }
+    case "collapsible": {
+      // In a section each row folds on its own; on a card the card is the one item.
+      const items =
+        sources.rows === undefined
+          ? [collapsibleItem(node, "card", context, backed, sources.assets)]
+          : sources.rows.map((row) =>
+              collapsibleItem(node, row.key, row.context, backed, sources.assets),
+            );
+      const shown = items.filter((item): item is ViewCollapsibleItem => item !== null);
+      return shown.length === 0 ? null : { kind: "collapsible", open: node.open, items: shown };
+    }
+    // --- end views additions ---
   }
 }
 

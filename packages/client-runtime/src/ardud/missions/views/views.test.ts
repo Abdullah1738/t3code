@@ -140,6 +140,47 @@ describe("decodeViewBody", () => {
     expect(decoded.dropped).toBe(4);
   });
 
+  it("decodes a collapsible's children, refusing row iterators inside it", () => {
+    const decoded = decodeViewBody([
+      {
+        _tag: "collapsible",
+        title: "row.title",
+        meta: ["row.period"],
+        open: "first",
+        children: [
+          { _tag: "markdown", bind: "row.text" },
+          { _tag: "table", columns: [] },
+          {
+            _tag: "collapsible",
+            title: null,
+            label: "Inner",
+            meta: [],
+            open: "none",
+            children: [],
+          },
+        ],
+      },
+      { _tag: "collapsible", title: null, meta: [], open: "sideways", children: [] },
+      {
+        _tag: "collapsible",
+        title: null,
+        meta: [],
+        open: "none",
+        children: [{ _tag: "list", title: "row.title", meta: [], status: null }],
+      },
+    ]);
+    expect(decoded.nodes).toEqual([
+      {
+        _tag: "collapsible",
+        title: "row.title",
+        meta: ["row.period"],
+        open: "first",
+        children: [{ _tag: "markdown", bind: "row.text" }],
+      },
+    ]);
+    expect(decoded.dropped).toBe(5);
+  });
+
   it("drops nodes nested past the depth limit and groups left empty", () => {
     const deep = {
       _tag: "group",

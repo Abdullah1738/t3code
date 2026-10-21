@@ -84,6 +84,9 @@ import type {
 // --- end finish-a ---
 
 import type { ViewSectionRequest } from "./views/layout.ts";
+// --- views additions ---
+import type { ViewLongText, ViewLongTextInput } from "@t3tools/contracts";
+// --- end views additions ---
 
 export type Unsubscribe = () => void;
 export type Listener<T> = (value: T) => void;
@@ -740,6 +743,10 @@ export interface MissionsSource {
   subscribeViews(missionId: MissionId, listener: Listener<MissionViewsState | null>): Unsubscribe;
   /** Runs one layout change built by `viewSectionRequest`. */
   changeView(request: ViewSectionRequest): Promise<void>;
+  // --- views additions ---
+  /** A row value too long for the views snapshot (a report's text), fetched when it opens. */
+  loadLongText(input: ViewLongTextInput): Promise<ViewLongText>;
+  // --- end views additions ---
 
   /** The owner's requests to the master, newest activity first. */
   subscribeRequests(

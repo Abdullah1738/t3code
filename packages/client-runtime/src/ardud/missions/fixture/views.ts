@@ -33,7 +33,7 @@ export interface ViewsContext {
   readonly requestsUnread: (missionId: string) => number;
 }
 
-export type ViewsSource = Pick<MissionsSource, "subscribeViews" | "changeView">;
+export type ViewsSource = Pick<MissionsSource, "subscribeViews" | "changeView" | "loadLongText">;
 
 const titleOf = (entry: ViewLayoutEntry): string => {
   if (entry.title !== null) return entry.title;
@@ -202,5 +202,7 @@ export function createViews(ctx: ViewsContext): ViewsSource {
       commit();
       return Promise.resolve();
     },
+
+    loadLongText: () => fail("not-found", "Sample missions have no reports."),
   };
 }
