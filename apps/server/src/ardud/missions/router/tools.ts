@@ -16,6 +16,7 @@ import {
   TuneRoomInput,
   UpdateRoomInput,
   CreateRoomInput, // ardud missions: router
+  RespondMissionApprovalInput, // ardud missions: permissions
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
@@ -223,6 +224,22 @@ const MissionRequestReopenTool = Tool.make("mission_request_reopen", {
   dependencies,
 });
 
+// --- permissions additions ---
+const MissionApprovalRespondTool = Tool.make("mission_approval_respond", {
+  description:
+    "As a thread's lead (its lane lead, the coordinator over it, or the master), approve or decline a permission request it is waiting on: a command, a file change, an MCP elicitation. The router tells you about each one in the control room. accept allows it once, acceptForSession allows it for the rest of that thread's session, decline refuses it. A standing rule stays with the owner: ask him with mission_ask when it needs his call.",
+  parameters: RespondMissionApprovalInput,
+  success: Schema.Struct({
+    threadId: Schema.String,
+    requestId: Schema.String,
+    decision: Schema.String,
+  }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+});
+// --- end permissions additions ---
+
 interface ToolConfig {
   readonly parameters: Schema.Constraint;
   readonly success: Schema.Constraint;
@@ -263,4 +280,5 @@ export const RouterToolkit = Toolkit.make(
   annotated(MissionRequestReplyTool, "Reply to an owner request", false),
   annotated(MissionRequestSettleTool, "Settle an owner request", false),
   annotated(MissionRequestReopenTool, "Reopen an owner request", false),
+  annotated(MissionApprovalRespondTool, "Answer a lane's permission request", false), // ardud missions: permissions
 );

@@ -1,12 +1,14 @@
 import {
   MissionError,
   type OrchestrationV2UserInputQuestion,
+  type ProviderApprovalDecision,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import type { GuardPrincipal } from "../guard/principal.ts";
+import type { PendingApproval } from "./leadApprovals.ts";
 import type { ThreadActivity } from "./model.ts";
 import * as MissionRouter from "./MissionRouter.ts";
 import { RouterThreads } from "./ports.ts";
@@ -39,6 +41,15 @@ export const fakeRouterThreads = () => {
   const refuseSend = new Set<ThreadId>();
   /** Pending questions by `threadId:requestId`. */
   const questions = new Map<string, ReadonlyArray<OrchestrationV2UserInputQuestion>>();
+  /** Pending permission requests by `threadId:requestId`; answering one removes it. */
+  const approvals = new Map<string, PendingApproval>();
+  /** Every permission request answered, in order. */
+  const answered: Array<{
+    readonly threadId: ThreadId;
+    readonly requestId: string;
+    readonly decision: ProviderApprovalDecision;
+    readonly key: string;
+  }> = [];
   const layer = Layer.succeed(
     RouterThreads,
     RouterThreads.of({
@@ -70,6 +81,22 @@ export const fakeRouterThreads = () => {
             }),
       question: ({ threadId, requestId }) =>
         Effect.sync(() => questions.get(`${threadId}:${requestId}`) ?? null),
+      // --- permissions additions ---
+      approval: ({ threadId, requestId }) =>
+        Effect.sync(() => approvals.get(`${threadId}:${requestId}`) ?? null),
+      respondApproval: (input) =>
+        Effect.suspend(() => {
+          const id = `${input.threadId}:${input.requestId}`;
+          if (!approvals.has(id)) {
+            return Effect.fail(
+              new MissionError({ code: "conflict", detail: `No pending request ${id}.` }),
+            );
+          }
+          approvals.delete(id);
+          answered.push(input);
+          return Effect.void;
+        }),
+      // --- end permissions additions ---
     }),
   );
   return {
@@ -82,6 +109,8 @@ export const fakeRouterThreads = () => {
     archived,
     refuseSend,
     questions,
+    approvals,
+    answered,
     layer,
   };
 };

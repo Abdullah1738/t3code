@@ -59,8 +59,8 @@ export const OwnerConditionsLive = Layer.effect(
 /**
  * What a finished or paused run means for the doorbell: a run that ended
  * clears the thread's outstanding wake and may ring for what arrived since;
- * a run that is waiting on input can take a ring now. A question a role or
- * lane thread asks is passed to its lead.
+ * a run that is waiting on input can take a ring now. A question or
+ * permission request a role or lane thread raises is passed to its lead.
  */
 const onDomainEvent =
   (router: MissionRouter.MissionRouter["Service"]) => (event: OrchestrationV2DomainEvent) => {
@@ -73,6 +73,22 @@ const onDomainEvent =
       return router.questionRaised({ threadId: event.threadId, requestId: event.payload.id }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("missions router could not tell a lead about a question", {
+            threadId: event.threadId,
+            requestId: event.payload.id,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      );
+    }
+    // ardud missions: permissions - and so does its permission request.
+    if (
+      event.type === "runtime-request.updated" &&
+      event.payload.kind !== "user_input" &&
+      event.payload.status === "pending"
+    ) {
+      return router.approvalRaised({ threadId: event.threadId, requestId: event.payload.id }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("missions router could not tell a lead about a permission request", {
             threadId: event.threadId,
             requestId: event.payload.id,
             cause: Cause.pretty(cause),

@@ -316,4 +316,32 @@ describe("router MCP tools", () => {
       expect(reopened.structured).toMatchObject({ request: { status: "waiting-on-master" } });
     }).pipe(Effect.provide(layer));
   });
+
+  // --- permissions additions ---
+  it.effect("a lane's lead answers its permission request; the lane and outsiders cannot", () => {
+    const { threads, layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      threads.approvals.set(`${laneThread}:perm-1`, {
+        requestKind: "command",
+        title: "bash",
+        prompt: "make deploy",
+        options: null,
+      });
+      const args = { threadId: laneThread, requestId: "perm-1", decision: "accept" };
+      expect((yield* call("mission_approval_respond", laneThread, args)).isError).toBe(true);
+      expect((yield* call("mission_approval_respond", strayThread, args)).isError).toBe(true);
+      const alwaysArgs = { ...args, decision: "acceptAlways" };
+      const always = yield* Effect.exit(call("mission_approval_respond", masterThread, alwaysArgs));
+      expect(always._tag === "Failure" || always.value.isError).toBe(true);
+      expect(threads.answered).toEqual([]);
+      const approved = yield* call("mission_approval_respond", masterThread, args);
+      expect(approved.isError).toBe(false);
+      expect(approved.structured).toMatchObject({ requestId: "perm-1", decision: "accept" });
+      expect(threads.answered).toMatchObject([
+        { threadId: laneThread, requestId: "perm-1", decision: "accept" },
+      ]);
+    }).pipe(Effect.provide(layer));
+  });
+  // --- end permissions additions ---
 });

@@ -3747,6 +3747,22 @@ export type MissionMasterInbox = typeof MissionMasterInbox.Type;
 
 // --- end asks additions ---
 
+// --- permissions additions ---
+
+/**
+ * A lead answering a permission request of a thread it leads. A standing rule
+ * (`acceptAlways`) stays with the owner, and `cancel` is not offered because it
+ * stops the lane's turn; the owner still has both in the thread itself.
+ */
+export const RespondMissionApprovalInput = Schema.Struct({
+  threadId: ThreadId,
+  requestId: TrimmedNonEmptyString,
+  decision: Schema.Literals(["accept", "acceptForSession", "decline"]),
+});
+export type RespondMissionApprovalInput = typeof RespondMissionApprovalInput.Type;
+
+// --- end permissions additions ---
+
 // ---------------------------------------------------------------------------
 // Errors
 

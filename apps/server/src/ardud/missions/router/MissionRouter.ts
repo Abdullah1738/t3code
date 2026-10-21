@@ -45,6 +45,7 @@ import {
   type UpdateRoomInput,
   type WorkItem,
   type CreateRoomInput, // ardud missions: router
+  type RespondMissionApprovalInput, // ardud missions: permissions
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -73,6 +74,7 @@ import {
 } from "./cast.ts";
 import { roomActivity } from "./activity.ts";
 import { LEAD_QUESTION_PRODUCER, leadQuestionKey, leadQuestionText } from "./leadQuestions.ts";
+import { LEAD_APPROVAL_PRODUCER, leadApprovalKey, leadApprovalText } from "./leadApprovals.ts";
 import type { SendCheckRequest, SendGuardOutcome, SendGuardRequest } from "./guardHook.ts";
 import { postContentHash, sha256 } from "./hash.ts";
 import {
@@ -346,6 +348,33 @@ export class MissionRouter extends Context.Service<
       readonly requestId: string;
     }) => Effect.Effect<ReadonlyArray<ThreadId>, MissionError>;
     // --- end routing additions ---
+    // --- permissions additions ---
+    /**
+     * A role or lane thread asked for permission (a command, a file write, an
+     * MCP elicitation...): tells its nearest live leads, like `questionRaised`.
+     */
+    readonly approvalRaised: (input: {
+      readonly threadId: ThreadId;
+      readonly requestId: string;
+    }) => Effect.Effect<ReadonlyArray<ThreadId>, MissionError>;
+    /**
+     * A lead answers a pending permission request of a thread it leads (any
+     * lead tier, the master included). Anyone else, or the asking thread
+     * itself, is refused `forbidden`; a request no longer pending is
+     * `not-found`. Logged as an allowed `send.guarded` with reason `lead`.
+     */
+    readonly approvalRespond: (
+      input: RespondMissionApprovalInput,
+      provenance: MissionProvenance,
+    ) => Effect.Effect<
+      {
+        readonly threadId: ThreadId;
+        readonly requestId: string;
+        readonly decision: RespondMissionApprovalInput["decision"];
+      },
+      MissionError
+    >;
+    // --- end permissions additions ---
     /**
      * Posts for a trusted server component that resolved the speaker itself
      * (the coord shim). Same rules as `post` after that: dense seqs, key
@@ -1906,33 +1935,40 @@ const make = Effect.gen(function* () {
   // --- end router additions ---
 
   // --- routing additions ---
-  const questionRaised = Effect.fn("MissionRouter.questionRaised")(function* (input: {
-    readonly threadId: ThreadId;
-    readonly requestId: string;
-  }) {
+  /**
+   * Tells a thread's nearest live lead tier about a request it is waiting on,
+   * once per lead. `read` is null once the request is no longer pending.
+   */
+  const tellLeads = Effect.fn("MissionRouter.tellLeads")(function* <A>(
+    input: { readonly threadId: ThreadId; readonly requestId: string },
+    request: {
+      readonly read: Effect.Effect<A | null, MissionError>;
+      readonly text: (asker: string, pending: A) => string;
+      readonly key: (lead: ThreadId) => string;
+      readonly producer: string;
+    },
+  ) {
     for (const cast of yield* candidateCasts(input.threadId)) {
       const tiers = leadTiersOf(cast, input.threadId);
       if (tiers.length === 0) continue;
-      const questions = yield* threads.question(input);
-      if (questions === null) return [];
+      const pending = yield* request.read;
+      if (pending === null) return [];
       for (const tier of tiers) {
         const live: ThreadId[] = [];
         for (const lead of tier) {
           if ((yield* readiness(lead)) !== "gone") live.push(lead);
         }
         if (live.length === 0) continue;
-        const text = leadQuestionText({
-          asker: labelOf(cast, { _tag: "thread", threadId: input.threadId }),
-          threadId: input.threadId,
-          requestId: input.requestId,
-          questions,
-        });
+        const text = request.text(
+          labelOf(cast, { _tag: "thread", threadId: input.threadId }),
+          pending,
+        );
         for (const lead of live) {
           yield* notify({
             threadId: lead,
             text,
-            key: leadQuestionKey(input.threadId, input.requestId, lead),
-            producer: LEAD_QUESTION_PRODUCER,
+            key: request.key(lead),
+            producer: request.producer,
           });
         }
         return live;
@@ -1941,7 +1977,114 @@ const make = Effect.gen(function* () {
     }
     return [];
   });
+
+  const questionRaised = Effect.fn("MissionRouter.questionRaised")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly requestId: string;
+  }) {
+    return yield* tellLeads(input, {
+      read: threads.question(input),
+      text: (asker, questions) =>
+        leadQuestionText({
+          asker,
+          threadId: input.threadId,
+          requestId: input.requestId,
+          questions,
+        }),
+      key: (lead) => leadQuestionKey(input.threadId, input.requestId, lead),
+      producer: LEAD_QUESTION_PRODUCER,
+    });
+  });
   // --- end routing additions ---
+
+  // --- permissions additions ---
+  const approvalRaised = Effect.fn("MissionRouter.approvalRaised")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly requestId: string;
+  }) {
+    return yield* tellLeads(input, {
+      read: threads.approval(input),
+      text: (asker, approval) =>
+        leadApprovalText({
+          asker,
+          threadId: input.threadId,
+          requestId: input.requestId,
+          approval,
+        }),
+      key: (lead) => leadApprovalKey(input.threadId, input.requestId, lead),
+      producer: LEAD_APPROVAL_PRODUCER,
+    });
+  });
+
+  const approvalRespond = Effect.fn("MissionRouter.approvalRespond")(function* (
+    input: RespondMissionApprovalInput,
+    provenance: MissionProvenance,
+  ) {
+    const caller = actingThread(provenance);
+    if (caller === null) {
+      return yield* fail("forbidden", "Only a lead's thread answers a lane's permission request.");
+    }
+    if (caller === input.threadId) {
+      return yield* fail("forbidden", "A thread cannot answer its own permission request.");
+    }
+    let cast: RouterCast | null = null;
+    for (const each of yield* candidateCasts(input.threadId)) {
+      if (leadTiersOf(each, input.threadId).some((tier) => tier.includes(caller))) {
+        cast = each;
+        break;
+      }
+    }
+    if (cast === null) {
+      return yield* fail(
+        "forbidden",
+        `You do not lead thread ${input.threadId}, so its permission requests are not yours to answer.`,
+      );
+    }
+    const approval = yield* threads.approval(input);
+    if (approval === null) {
+      return yield* fail(
+        "not-found",
+        `Thread ${input.threadId} has no pending permission request ${input.requestId}; it was answered or dismissed.`,
+      );
+    }
+    if (
+      approval.options !== null &&
+      approval.options.length > 0 &&
+      !approval.options.some((option) => option.decision === input.decision)
+    ) {
+      return yield* fail(
+        "invalid",
+        `This request does not offer ${input.decision}; it offers ${approval.options.map((option) => option.decision).join(", ")}.`,
+      );
+    }
+    yield* threads.respondApproval({
+      threadId: input.threadId,
+      requestId: input.requestId,
+      decision: input.decision,
+      // One answer per lead: a second lead's answer fails as no longer pending.
+      key: `lead-approval-respond:${input.threadId}:${input.requestId}:${caller}`,
+    });
+    yield* store.appendEvent({
+      missionId: cast.missionId,
+      kind: "send.guarded",
+      actor: actorOf(provenance),
+      provenance,
+      summary: clipSummary(
+        `${labelOf(cast, { _tag: "thread", threadId: caller })} -> ${labelOf(cast, { _tag: "thread", threadId: input.threadId })} via request-respond: ${input.decision} (${approval.requestKind})`,
+      ),
+      subject: { kind: "thread", id: input.threadId },
+      payload: {
+        path: "request-respond",
+        outcome: "allowed",
+        reason: "lead",
+        requestId: input.requestId,
+        requestKind: approval.requestKind,
+        decision: input.decision,
+      },
+    });
+    return { threadId: input.threadId, requestId: input.requestId, decision: input.decision };
+  });
+  // --- end permissions additions ---
 
   /** One thread's reminder, under the bell lock. True when it was sent. */
   const remindThread = (
@@ -2108,6 +2251,8 @@ const make = Effect.gen(function* () {
     readiness,
     notify,
     questionRaised,
+    approvalRaised,
+    approvalRespond,
     relay,
     roomTuning,
     tuneRoom,

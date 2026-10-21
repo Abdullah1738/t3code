@@ -1566,5 +1566,171 @@ describe("lead questions (routing r21)", () => {
       assert.deepStrictEqual(h.sent, []);
     }).pipe(Effect.provide(h.layer));
   });
+
+  // --- permissions additions ---
+  const deploy = {
+    requestKind: "command",
+    title: "bash",
+    prompt: "make deploy ENV=dev",
+    options: [
+      { decision: "accept", label: "Approve" },
+      { decision: "acceptForSession", label: "Always allow this session" },
+      { decision: "decline", label: "Decline" },
+    ],
+  } as const;
+  const agentOf = (threadId: ThreadId) =>
+    ({ _tag: "agent", threadId, roleId: null }) satisfies MissionProvenance;
+
+  it.effect("a lane's permission request goes to its lead, who approves it", () => {
+    const h = harness();
+    h.approvals.set(`${laneThread}:p-1`, deploy);
+    return Effect.gen(function* () {
+      yield* seedLeads;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      assert.deepStrictEqual(
+        yield* router.approvalRaised({ threadId: laneThread, requestId: "p-1" }),
+        [leadThread],
+      );
+      // Raised again (a replayed event) it tells nobody twice.
+      yield* router.approvalRaised({ threadId: laneThread, requestId: "p-1" });
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.strictEqual(page.messages.length, 1);
+      const notice = page.messages[0]!;
+      assert.deepStrictEqual(notice.author, { _tag: "system", component: "lane-approvals" });
+      assert.deepStrictEqual(notice.to, [{ _tag: "thread", threadId: leadThread }]);
+      const { body } = yield* router.messageBody({ messageId: notice.id }, ownerApp);
+      assert.include(body, "API is waiting on a permission request you lead (command):");
+      assert.include(body, "- bash");
+      assert.include(body, "- make deploy ENV=dev");
+      assert.include(body, "accept (Approve) / acceptForSession");
+      assert.include(
+        body,
+        `mission_approval_respond using threadId ${laneThread} and requestId p-1`,
+      );
+      assert.include(body, "mission_ask");
+      assert.strictEqual(wakesFor(h.sent, leadThread).length, 1);
+      assert.deepStrictEqual(wakesFor(h.sent, masterThread), []);
+
+      const answer = yield* router.approvalRespond(
+        { threadId: laneThread, requestId: "p-1", decision: "accept" },
+        agentOf(leadThread),
+      );
+      assert.deepStrictEqual(answer, {
+        threadId: laneThread,
+        requestId: "p-1",
+        decision: "accept",
+      });
+      assert.deepStrictEqual(h.answered, [
+        {
+          threadId: laneThread,
+          requestId: "p-1",
+          decision: "accept",
+          key: `lead-approval-respond:${laneThread}:p-1:${leadThread}`,
+        },
+      ]);
+      const logged = (yield* store.eventsSince(missionId, 0)).filter(
+        (event) => event.kind === "send.guarded",
+      );
+      assert.deepStrictEqual(logged.at(-1)?.payload, {
+        path: "request-respond",
+        outcome: "allowed",
+        reason: "lead",
+        requestId: "p-1",
+        requestKind: "command",
+        decision: "accept",
+      });
+      // Answered, it is gone: a second answer finds nothing.
+      const again = yield* Effect.flip(
+        router.approvalRespond(
+          { threadId: laneThread, requestId: "p-1", decision: "decline" },
+          agentOf(leadThread),
+        ),
+      );
+      assert.strictEqual(again.code, "not-found");
+      assert.strictEqual(h.answered.length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect(
+    "only a lead answers: the lane itself, another member and outsiders are refused",
+    () => {
+      const h = harness();
+      h.approvals.set(`${laneThread}:p-1`, deploy);
+      return Effect.gen(function* () {
+        yield* seedLeads;
+        const router = yield* MissionRouter.MissionRouter;
+        const answer = (provenance: MissionProvenance, decision: "accept" | "decline" = "accept") =>
+          Effect.flip(
+            router.approvalRespond(
+              { threadId: laneThread, requestId: "p-1", decision },
+              provenance,
+            ),
+          );
+        assert.strictEqual((yield* answer(agentOf(laneThread))).code, "forbidden");
+        assert.strictEqual((yield* answer(agentOf(writerThread))).code, "forbidden");
+        assert.strictEqual((yield* answer(agentOf(strayThread))).code, "forbidden");
+        assert.strictEqual((yield* answer(ownerApp)).code, "forbidden");
+        assert.deepStrictEqual(h.answered, []);
+        // A decision the request does not offer is refused before it reaches the thread.
+        h.approvals.set(`${laneThread}:p-2`, { ...deploy, options: [deploy.options[2]] });
+        const unoffered = yield* Effect.flip(
+          router.approvalRespond(
+            { threadId: laneThread, requestId: "p-2", decision: "accept" },
+            agentOf(leadThread),
+          ),
+        );
+        assert.strictEqual(unoffered.code, "invalid");
+        // Every lead tier may answer: the coordinator and the master too.
+        yield* router.approvalRespond(
+          { threadId: laneThread, requestId: "p-1", decision: "decline" },
+          agentOf(masterThread),
+        );
+        yield* router.approvalRespond(
+          { threadId: laneThread, requestId: "p-2", decision: "decline" },
+          agentOf(coordThread),
+        );
+        assert.deepStrictEqual(
+          h.answered.map((each) => each.decision),
+          ["decline", "decline"],
+        );
+      }).pipe(Effect.provide(h.layer));
+    },
+  );
+
+  it.effect("the master's, a stranger's and an answered permission request go nowhere", () => {
+    const h = harness();
+    h.approvals.set(`${masterThread}:p-1`, deploy);
+    h.approvals.set(`${strayThread}:p-1`, deploy);
+    h.gone.add(leadThread);
+    h.gone.add(coordThread);
+    return Effect.gen(function* () {
+      yield* seedLeads;
+      const router = yield* MissionRouter.MissionRouter;
+      assert.deepStrictEqual(
+        yield* router.approvalRaised({ threadId: masterThread, requestId: "p-1" }),
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* router.approvalRaised({ threadId: strayThread, requestId: "p-1" }),
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* router.approvalRaised({ threadId: laneThread, requestId: "p-9" }),
+        [],
+      );
+      assert.deepStrictEqual(h.sent, []);
+      // With its lead and coordinator gone, a lane's request climbs to the master.
+      h.approvals.set(`${laneThread}:p-2`, { ...deploy, options: null });
+      assert.deepStrictEqual(
+        yield* router.approvalRaised({ threadId: laneThread, requestId: "p-2" }),
+        [masterThread],
+      );
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      const { body } = yield* router.messageBody({ messageId: page.messages[0]!.id }, ownerApp);
+      assert.include(body, "Decisions: accept / acceptForSession / decline");
+    }).pipe(Effect.provide(h.layer));
+  });
+  // --- end permissions additions ---
 });
 // --- end routing additions ---
