@@ -315,6 +315,25 @@ test("retireOthers settles idle iMessage chats except the kept one", async () =>
   expect(await backend.retireOthers(keep.id)).toBe(0);
 });
 
+test("a per-chat backend makes titled threads under chats/<slug> and retires only its own", async () => {
+  const control = fakeControl();
+  const root = control.backend();
+  const moni = root.forChat("chats/moni", "Moni");
+  const ownerOld = await root.createChat();
+  const moniOld = await moni.createChat();
+  const moniKeep = await moni.createChat();
+  expect(moniKeep.directory).toMatch(/^\/chats\/chats\/moni\/\d{4}-\d{2}-\d{2}\/session-[0-9a-f-]{36}$/);
+  expect(control.threads.get(moniKeep.id)!.title).toBe("Moni");
+  expect(await moni.retireOthers(moniKeep.id)).toBe(1);
+  expect(control.threads.get(moniOld.id)!.settled).toBe(true);
+  expect(control.threads.get(ownerOld.id)!.settled).toBeUndefined();
+  const ownerKeep = await root.createChat();
+  expect(await root.retireOthers(ownerKeep.id)).toBe(1);
+  expect(control.threads.get(ownerOld.id)!.settled).toBe(true);
+  expect(control.threads.get(moniKeep.id)!.settled).toBeUndefined();
+  expect(() => root.forChat("../escape", "x")).toThrow("Invalid iMessage chat folder");
+});
+
 test("retireOthers counts nothing when the server ignores settled", async () => {
   const control = fakeControl();
   const backend = control.backend();

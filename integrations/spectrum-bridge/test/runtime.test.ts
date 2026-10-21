@@ -1,0 +1,269 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Access } from "../src/chats.ts";
+import { chatKey, type Line, type LineInbound } from "../src/line.ts";
+import { ChatRegistry, createSbApi, type ChatCore } from "../src/runtime.ts";
+import { handleInbound, type IngressDeps } from "../src/sb-ingress.ts";
+import { Store } from "../src/store.ts";
+
+const owner = "+15555550123";
+const moni = "+15555550199";
+let access: Access;
+const dirs: string[] = [];
+const stores: Store[] = [];
+afterEach(() => {
+  for (const store of stores.splice(0)) store.close();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function fakeLine(): Line & { reactions: [string, string][]; locationRequests: string[] } {
+  const reactions: [string, string][] = [];
+  const locationRequests: string[] = [];
+  const line: Line = {
+    number: "+19362300565",
+    events: async function* () {},
+    backfill: async () => [],
+    outbound: async () => [],
+    sendText: async () => ({ handle: "out-1" }),
+    upload: async () => "https://cdn.example/file.jpg",
+    getMessage: async () => undefined,
+    sendApp: async () => ({ handle: "app-1" }),
+    react: async (handle, reaction) => { reactions.push([handle, reaction]); },
+    typing: async () => {},
+    read: async () => {},
+    requestLocation: async chat => { locationRequests.push(chat); },
+    location: async () => undefined,
+    download: async () => ({ data: new Uint8Array([1]), name: "a.jpg", mimeType: "image/jpeg" }),
+  };
+  return Object.assign(line, { reactions, locationRequests });
+}
+
+type Parts = { api: (request: Request) => Promise<Response>; forwarded: unknown[] };
+
+function setup() {
+  access = {
+    people: [{ name: "Moni", role: "admin", addresses: [moni, "moni@example.com"] }],
+    groups: [{ id: "GRP-Allowed-123", name: "Family Trip" }],
+  };
+  const stateRoot = mkdtempSync(join(tmpdir(), "sb-runtime-"));
+  dirs.push(stateRoot);
+  const ownerStore = new Store(join(stateRoot, "state.sqlite"));
+  stores.push(ownerStore);
+  const line = fakeLine();
+  const built: ChatCore[] = [];
+  const registry = (store = ownerStore) => {
+    const made = new ChatRegistry<Parts>({
+      line, owner, ownerStore: store, stateRoot, access: () => access,
+      build: chat => {
+        built.push(chat);
+        if (chat.store !== store) stores.push(chat.store);
+        // Stands in for the per-chat Photon-era API: echoes which chat received the request.
+        const forwarded: unknown[] = [];
+        return { forwarded, api: async request => {
+          forwarded.push(await request.json());
+          return Response.json({ chat: chat.info.slug, path: new URL(request.url).pathname });
+        } };
+      },
+    });
+    made.restore();
+    return made;
+  };
+  return { stateRoot, ownerStore, line, built, registry };
+}
+
+const message = (overrides: Partial<LineInbound>): LineInbound => ({
+  handle: "h-1", chat: chatKey.dm(owner), from: owner, text: "hi", kind: "message", service: "iMessage",
+  participants: [], sentAt: 1_000, ...overrides,
+});
+
+describe("chat registry", () => {
+  test("the owner chat uses state.sqlite; other chats are created lazily under chats/<slug>", () => {
+    const { registry, ownerStore, stateRoot } = setup();
+    const chats = registry();
+    expect(chats.all().map(chat => chat.info.slug)).toEqual(["owner"]);
+    expect(chats.owner.store).toBe(ownerStore);
+    expect(chats.owner.info).toMatchObject({ key: chatKey.dm(owner), kind: "owner" });
+    expect(existsSync(join(stateRoot, "chats"))).toBe(false);
+
+    const moniChat = chats.open(chatKey.dm(moni));
+    expect(moniChat.info).toMatchObject({ slug: "moni", kind: "dm", title: "Moni" });
+    expect(moniChat.stateRoot).toBe(join(stateRoot, "chats", "moni"));
+    expect(existsSync(join(stateRoot, "chats", "moni", "state.sqlite"))).toBe(true);
+
+    const group = chats.open(chatKey.group("GRP-Allowed-123"), "Family Trip");
+    expect(group.info.slug).toBe("group-family-trip-grp-al");
+    expect(group.info).toMatchObject({ kind: "group", title: "Family Trip" });
+  });
+
+  test("a person's second address joins their chat and slugs survive a restart", () => {
+    const { registry, ownerStore, built } = setup();
+    const first = registry();
+    const phone = first.open(chatKey.dm(moni));
+    expect(first.open(chatKey.dm("moni@example.com"))).toBe(phone);
+    first.open(chatKey.dm("+447000000000"));
+    const madeBefore = built.length;
+
+    // A rename in access.json must not move an existing chat to a new folder.
+    access.people[0]!.name = "Monika";
+    const second = registry(ownerStore);
+    expect(built.length - madeBefore).toBe(3);
+    expect(second.all().map(chat => chat.info.slug).sort()).toEqual(["dm-447000000000", "moni", "owner"]);
+    expect(second.get(chatKey.dm("moni@example.com"))!.info.slug).toBe("moni");
+  });
+
+  test("a different person whose name slugs the same gets a numbered slug", () => {
+    const { registry } = setup();
+    const chats = registry();
+    const first = chats.open(chatKey.dm(moni));
+    access.people.push({ name: "Moni!", role: "person", addresses: ["+447000000001"] });
+    const other = chats.open(chatKey.dm("+447000000001"));
+    expect(other).not.toBe(first);
+    expect(other.info.slug).toBe("moni-2");
+  });
+
+  test("an allowed Sendblue message lands in its own chat's store and unknown senders only produce a note", async () => {
+    const { registry, ownerStore, line } = setup();
+    const chats = registry();
+    const notes: string[] = [];
+    const deps: IngressDeps = {
+      line, owner, ownerStore, access: async () => access, now: () => 5_000,
+      sink: chats.sink(async (_address, text) => { notes.push(text); }),
+    };
+    chats.open(chatKey.dm(moni)).typing.set(moni, 4_000);
+    expect(await handleInbound(deps, message({ handle: "m-1", chat: chatKey.dm(moni), from: moni, text: "hey" }))).toBe(true);
+    const moniChat = chats.get(chatKey.dm(moni))!;
+    expect(moniChat.store.pendingInbound().map(row => row.id)).toEqual(["m-1"]);
+    expect(moniChat.store.pendingInbound()[0]!.payload).toMatchObject({ text: "hey", sender: moni });
+    expect(moniChat.controlsPending).toBe(true);
+    expect(moniChat.typing.size).toBe(0);
+    expect(chats.owner.store.pendingInbound()).toEqual([]);
+
+    expect(await handleInbound(deps, message({ handle: "m-1", chat: chatKey.dm(moni), from: moni, text: "hey" }))).toBe(false);
+    expect(await handleInbound(deps, message({ handle: "o-1", text: "owner here" }))).toBe(true);
+    expect(chats.owner.store.pendingInbound().map(row => row.id)).toEqual(["o-1"]);
+
+    expect(await handleInbound(deps, message({ handle: "x-1", chat: chatKey.dm("+447000000009"), from: "+447000000009" }))).toBe(false);
+    expect(chats.get(chatKey.dm("+447000000009"))).toBeUndefined();
+    expect(notes).toHaveLength(1);
+  });
+
+  test("a disabled bridge accepts nothing", async () => {
+    const { registry, ownerStore, line } = setup();
+    const chats = registry();
+    const deps: IngressDeps = { line, owner, ownerStore, access: async () => access, sink: chats.sink(async () => {}, () => false) };
+    expect(await handleInbound(deps, message({ handle: "m-1", chat: chatKey.dm(moni), from: moni }))).toBe(false);
+    expect(chats.get(chatKey.dm(moni))).toBeUndefined();
+  });
+});
+
+describe("Sendblue socket API", () => {
+  function api(enabled = true) {
+    const env = setup();
+    const chats = env.registry();
+    const moniChat = chats.open(chatKey.dm(moni));
+    chats.owner.store.set("route", { id: "ses_owner", generation: 1 });
+    moniChat.store.set("route", { id: "ses_moni", generation: 2 });
+    moniChat.store.acceptInbound("m-1", { id: "m-1", text: "hi", attachments: [], isAudioMessage: false, receivedAt: 1 });
+    const handler = createSbApi({
+      registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"), enabled: () => enabled,
+      health: () => ({ transport: "sendblue", line: env.line.number, chats: chats.all().length }),
+    });
+    const post = async (path: string, body: Record<string, unknown>) => {
+      const response = await handler(new Request(`http://bridge${path}`, { method: "POST", body: JSON.stringify(body) }));
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+    return { ...env, chats, moniChat, handler, post };
+  }
+
+  test("session-bound requests go to the chat that owns the session", async () => {
+    const { post } = api();
+    expect(await post("/send", { text: "hi", dedupeKey: "k", sessionId: "ses_moni@2" })).toEqual({ status: 200, body: { chat: "moni", path: "/send" } });
+    expect(await post("/app", { url: "https://x", sessionId: "ses_owner" })).toEqual({ status: 200, body: { chat: "owner", path: "/app" } });
+    expect((await post("/files", { sessionId: "ses_gone" })).status).toBe(409);
+    expect((await post("/wake", { text: "w", source: "watch", dedupeKey: "k" })).body).toEqual({ chat: "owner", path: "/wake" });
+  });
+
+  test("health reports the transport, line and chat count", async () => {
+    const { handler, line } = api();
+    const health = await (await handler(new Request("http://bridge/health"))).json();
+    expect(health).toEqual({ transport: "sendblue", line: line.number, chats: 2 });
+  });
+
+  test("owner-only commands are refused from other chats", async () => {
+    const { post, stateRoot } = api();
+    const fromMoni = { sessionId: "ses_moni" };
+    expect((await post("/send", { text: "x", to: "owner", dedupeKey: "k", ...fromMoni })).status).toBe(403);
+    expect((await post("/wake", { text: "x", chat: "owner", dedupeKey: "k", ...fromMoni })).status).toBe(403);
+    expect((await post("/chats", fromMoni)).status).toBe(403);
+    expect((await post("/allow", { address: "+447000000002", name: "Sam", ...fromMoni })).status).toBe(403);
+    expect((await post("/allow-group", { id: "grp-1", ...fromMoni })).status).toBe(403);
+    expect((await post("/send", { text: "x", to: "moni", dedupeKey: "k" })).status).toBe(403);
+    expect(existsSync(join(stateRoot, "access.json"))).toBe(false);
+  });
+
+  test("the owner chat can list chats, message one and pass decisions on", async () => {
+    const { post, moniChat, stateRoot } = api();
+    const listed = await post("/chats", { sessionId: "ses_owner" });
+    expect(listed.body.chats).toEqual([
+      { slug: "owner", title: "Abdullah", kind: "owner" },
+      { slug: "moni", title: "Moni", kind: "dm", lastActivityAt: 1 },
+    ]);
+    // The local shell (no session) may list chats and edit access too.
+    expect((await post("/chats", {})).status).toBe(200);
+
+    const sent = await post("/send", { text: "dinner at 8", to: "moni", dedupeKey: "k1", sessionId: "ses_owner" });
+    expect(sent.status).toBe(202);
+    expect(moniChat.store.pendingOutbox().map(row => row.text)).toEqual(["dinner at 8"]);
+    expect((await post("/send", { text: "dinner at 8", to: "moni", dedupeKey: "k1", sessionId: "ses_owner" })).status).toBe(200);
+    expect((await post("/send", { text: "x", to: "nobody", dedupeKey: "k2", sessionId: "ses_owner" })).status).toBe(404);
+
+    const woke = await post("/wake", { text: "yes, book it", chat: "moni", dedupeKey: "d1", sessionId: "ses_owner" });
+    expect(woke.status).toBe(202);
+    const wake = moniChat.store.pendingInbound().find(row => row.id === woke.body.id)!;
+    expect((wake.payload as { text: string }).text).toEndWith("\nyes, book it");
+
+    expect((await post("/allow", { address: "+447000000002", name: "Sam", admin: true })).status).toBe(200);
+    const saved = JSON.parse(readFileSync(join(stateRoot, "access.json"), "utf8")) as Access;
+    expect(saved.people.some(person => person.name === "Sam" && person.role === "admin")).toBe(true);
+  });
+
+  test("ask-owner wakes the owner's chat with the asking chat named", async () => {
+    const { post, chats } = api();
+    const asked = await post("/ask-owner", { text: "Can I order sushi?", dedupeKey: "q1", sessionId: "ses_moni" });
+    expect(asked.status).toBe(202);
+    const rows = chats.owner.store.pendingInbound();
+    expect(rows).toHaveLength(1);
+    expect((rows[0]!.payload as { text: string }).text).toContain("wake --chat moni");
+    expect((rows[0]!.payload as { text: string }).text).toContain("Can I order sushi?");
+    expect((await post("/ask-owner", { text: "Can I order sushi?", dedupeKey: "q1", sessionId: "ses_moni" })).status).toBe(202);
+    expect(chats.owner.store.pendingInbound()).toHaveLength(1);
+    expect((await post("/ask-owner", { text: "?", dedupeKey: "q2", sessionId: "ses_owner" })).status).toBe(400);
+  });
+
+  test("react takes a tapback or one emoji on an inbound message of any chat", async () => {
+    const { post, line } = api();
+    expect((await post("/react", { target: "m-1", kind: "love" })).status).toBe(200);
+    expect((await post("/react", { target: "m-1", kind: "🔥" })).status).toBe(200);
+    expect((await post("/react", { target: "m-1", kind: "🔥🔥" })).status).toBe(400);
+    expect((await post("/react", { target: "m-1", kind: "fire" })).status).toBe(400);
+    expect((await post("/react", { target: "nope", kind: "love" })).status).toBe(403);
+    expect(line.reactions).toEqual([["m-1", "love"], ["m-1", "🔥"]]);
+  });
+
+  test("location requests go to the calling 1:1 chat once per key", async () => {
+    const { post, line } = api();
+    expect((await post("/location-request", { dedupeKey: "l1", sessionId: "ses_moni" })).status).toBe(202);
+    expect((await post("/location-request", { dedupeKey: "l1", sessionId: "ses_moni" })).status).toBe(200);
+    expect(line.locationRequests).toEqual([chatKey.dm(moni)]);
+    expect((await post("/location", { sessionId: "ses_moni" })).body).toEqual({ location: "none" });
+    expect((await post("/location", { sessionId: "ses_gone" })).status).toBe(409);
+  });
+
+  test("a bridge that is not ready refuses sends but still lists chats", async () => {
+    const { post } = api(false);
+    expect((await post("/send", { text: "x", to: "moni", dedupeKey: "k", sessionId: "ses_owner" })).status).toBe(503);
+    expect((await post("/chats", { sessionId: "ses_owner" })).status).toBe(200);
+  });
+});
