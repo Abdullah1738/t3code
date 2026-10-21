@@ -4,16 +4,20 @@ import {
   Draft,
   MissionId,
   RoleId,
+  ViewDataSourceId,
   ViewSectionId,
   type AnswerAskInput,
   type AskId,
   type MissionAsset,
   type ViewSection,
   type ViewSectionDefinition,
+  type ViewSourceListing,
+  type ViewSourceRun,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
+import { formatDayLabel, formatTimeOfDay } from "../viewModel.ts";
 import {
   assetFeedback,
   createViewLongTexts,
@@ -22,8 +26,11 @@ import {
   viewSection,
   viewLongTextKey,
   viewSectionData,
+  viewSectionSource,
+  viewSourceNotice,
   withAssetFeedback,
   type ViewBlock,
+  type ViewSectionSource,
 } from "./index.ts";
 
 const decodeAsk = Schema.decodeUnknownSync(Ask);
@@ -150,6 +157,119 @@ describe("section rows from the server", () => {
     expect(viewSection(queue, { nowMs: NOW }).empty).toBe(true);
     const none = { ...data, rows: [], total: 0 };
     expect(viewSection(queue, { nowMs: NOW, data: none }).empty).toBe(true);
+  });
+});
+
+describe("script source sections", () => {
+  const sourceId = ViewDataSourceId.make("src-ci");
+  const builds = section("sec-s", {
+    title: "Builds",
+    source: { _tag: "source", sourceId, limit: 10 },
+    body: [
+      {
+        _tag: "table",
+        columns: [
+          { label: "Job", bind: "row.id", as: "text" },
+          { label: "Result", bind: "row.result", as: "status" },
+          { label: "By", bind: "row.by", as: "person" },
+          { label: "Took", bind: "row.secs", as: "text" },
+          { label: "Finished", bind: "row.at", as: "age" },
+        ],
+      },
+      { _tag: "table", columns: [{ label: "Stage", bind: "row.stage", as: "text" }] },
+      { _tag: "meter", value: "row.count", max: "row.total" },
+    ],
+  });
+  const listing: ViewSourceListing = {
+    id: sourceId,
+    missionId,
+    title: "CI builds",
+    runtime: "bash",
+    fields: { result: "enum", by: "actor", secs: "number", at: "time" },
+    refreshMinutes: 15,
+    timeoutSeconds: 30,
+    enabled: true,
+    ...meta,
+  };
+  const run: ViewSourceRun = {
+    sourceId,
+    okAt: "2026-10-19T09:30:00.000Z",
+    rows: 3,
+    ranAt: "2026-10-19T09:30:00.000Z",
+    durationMs: 800,
+    error: null,
+    running: false,
+  };
+  const data = {
+    sectionId: ViewSectionId.make("sec-s"),
+    total: 3,
+    rows: [
+      {
+        ref: { kind: "source-row" as const, id: "b-7" },
+        value: {
+          id: "b-7",
+          result: "failed",
+          by: { _tag: "person", name: "pavan" },
+          secs: 42,
+          at: T0,
+          stage: "build",
+        },
+      },
+      { ref: { kind: "source-row" as const, id: "b-6" }, value: { id: "b-6", result: true } },
+    ],
+  };
+  const cells = (block: ViewBlock | undefined) =>
+    block?.kind === "table" ? block.rows.map((row) => row.cells.map((cell) => cell.text)) : null;
+
+  it("binds rows through the source's declared field kinds", () => {
+    const view = viewSection(builds, {
+      nowMs: NOW,
+      data: viewSectionData({ sectionData: [data] }, "sec-s"),
+      source: viewSectionSource({ sources: [listing], sourceRuns: [run] }, builds),
+    });
+    expect(view.empty).toBe(false);
+    expect(view.notice).toBeNull();
+    expect(cells(view.blocks[0])).toEqual([
+      ["b-7", "failed", "pavan", "42", "2h ago"],
+      ["b-6", "yes", null, null, null],
+    ]);
+    // `stage` isn't declared, so its table has nothing to show even though rows carry it.
+    expect(kinds(view.blocks)).toEqual(["table", "meter"]);
+    expect(view.blocks[1]).toEqual({ kind: "meter", value: 2, max: 3 });
+  });
+
+  it("shows no rows without the source listing", () => {
+    expect(viewSection(builds, { nowMs: NOW, data }).empty).toBe(true);
+    expect(viewSectionSource({ sources: [], sourceRuns: [] }, builds)).toBeNull();
+    const refs = section("sec-r", {
+      ...builds.definition,
+      source: { _tag: "refs", refs: [{ kind: "work-item", id: "wi-1" }] },
+    });
+    expect(viewSectionSource({ sources: [listing] }, refs)).toBeNull();
+  });
+
+  it("says when the source is off or its last run failed", () => {
+    const notice = (next: ViewSectionSource, nowMs = NOW) => viewSourceNotice(next, nowMs);
+    expect(notice({ listing: { ...listing, enabled: false }, run })).toBe("Source off");
+    expect(notice({ listing: { ...listing, status: "removed" }, run })).toBe("Source off");
+    expect(notice({ listing, run: null })).toBeNull();
+    const failed = { ...run, ranAt: "2026-10-19T09:45:00.000Z", error: "exit 1" };
+    expect(notice({ listing, run: failed })).toBe(
+      `Couldn't refresh, showing ${formatTimeOfDay(run.okAt ?? "")} rows`,
+    );
+    expect(notice({ listing, run: failed }, NOW + 2 * 24 * 60 * 60 * 1000)).toBe(
+      `Couldn't refresh, showing ${formatDayLabel(run.okAt ?? "")} rows`,
+    );
+    expect(notice({ listing, run: { ...failed, okAt: null } })).toBe("Couldn't refresh");
+  });
+
+  it("keeps a section with a notice even when no rows show", () => {
+    const view = viewSection(builds, {
+      nowMs: NOW,
+      source: { listing: { ...listing, enabled: false }, run },
+    });
+    expect(view.empty).toBe(false);
+    expect(view.notice).toBe("Source off");
   });
 });
 
