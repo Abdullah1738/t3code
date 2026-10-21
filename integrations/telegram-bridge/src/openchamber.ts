@@ -215,8 +215,9 @@ export interface AlertBackend {
   questionReply(request: QuestionRequest, directory: string, answers: string[][]): Promise<boolean>;
   isSessionAutoAccepting(sessionId: string, directory: string): Promise<boolean | undefined>;
   /**
-   * True when the session's questions go to its mission lead, not the owner:
-   * a mission thread other than the master. Unknown or unreadable is false.
+   * True when the session's questions and permission requests go to its
+   * mission lead, not the owner: a mission thread other than the master.
+   * Unknown or unreadable is false.
    */
   leadAnswers?(sessionId: string): Promise<boolean>;
 }

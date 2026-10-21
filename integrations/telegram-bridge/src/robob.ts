@@ -190,8 +190,9 @@ export class RobobAlertBackend implements AlertBackend {
   }
 
   /**
-   * Mission threads other than the master take their questions to their lead
-   * (Robob's router tells it). One status read serves a whole attention tick.
+   * Mission threads other than the master take their questions and permission
+   * requests to their lead (Robob's router tells it). One status read serves a
+   * whole attention tick.
    */
   async leadAnswers(sessionId: string): Promise<boolean> {
     try {
@@ -208,7 +209,7 @@ export class RobobAlertBackend implements AlertBackend {
     if (!this.missionsRead || now - this.missionsRead.at > MISSIONS_FRESH_MS) {
       const read = this.client.missions();
       this.missionsRead = { at: now, read };
-      // A failed read is not kept: the next question asks again.
+      // A failed read is not kept: the next check asks again.
       read.catch(() => { if (this.missionsRead?.read === read) this.missionsRead = undefined; });
     }
     return this.missionsRead.read;

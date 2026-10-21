@@ -232,3 +232,35 @@ test("when the missions read fails, a question alerts as before", async () => {
   await alerts.tick();
   expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("GST lane"))).toBe(true);
 });
+
+test("a mission thread's permission request goes to its lead; the master's and everyone else's still alert", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  const approve = (requestId: string) => [{ requestId, kind: "approval" as const, requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true }];
+  control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: approve("perm-lane") });
+  control.add({ threadId: "master", title: "Crpko master", state: "needs-input", pending: approve("perm-master") });
+  control.add({ threadId: "solo", title: "Solo work", state: "needs-input", pending: approve("perm-solo") });
+  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"] }];
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  const texts = store.pendingOutbox().map(entry => entry.text);
+  expect(texts).toHaveLength(2);
+  expect(texts.some(text => text.includes("Crpko master needs your approval"))).toBe(true);
+  expect(texts.some(text => text.includes("Solo work needs your approval"))).toBe(true);
+  expect(texts.some(text => text.includes("GST lane"))).toBe(false);
+});
+
+test("when the missions read fails, a mission thread's permission request alerts as before", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "lane", title: "GST lane", state: "needs-input",
+    pending: [{ requestId: "perm-lane", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true }] });
+  control.missions.list = null;
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("GST lane needs your approval"))).toBe(true);
+});
