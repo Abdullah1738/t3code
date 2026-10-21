@@ -141,7 +141,7 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   const admin = sendblueContextPrompt(context("dm"), false, ["+971585933213"]);
   expect(admin).toContain("Moni (admin)");
   expect(admin).toContain("moni-prefs.md");
-  expect(admin).toContain("authbox");
+  expect(admin).toContain("offbox-person");
   const guest = sendblueContextPrompt(context("group"), false, ["+447700900123"]);
   expect(guest).toContain("Tom (guest)");
   expect(guest).toContain("ask-owner");
