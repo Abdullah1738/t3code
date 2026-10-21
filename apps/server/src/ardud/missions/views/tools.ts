@@ -65,7 +65,7 @@ const tool = <Name extends string, P extends Schema.Constraint, S extends Schema
 
 const ViewsTool = tool(
   "mission_views",
-  "A mission's card templates, sections and layout (every section entry: built-in, tab or custom, with region, order, hidden and title), the starter layout new missions start from, items waiting on the owner and whether the pinned strip shows. catalog:true adds the node catalog: node signatures, bindable paths per record kind (report rows included), which query filters and sorts each kind takes, the action table, limits and the built-in templates.",
+  "A mission's card templates, sections and layout (every section entry: built-in, tab or custom, with region, order, hidden and title), the starter layout new missions start from, items waiting on the owner and whether the pinned strip shows. catalog:true adds the node catalog: node signatures, bindable paths per record kind (report rows included), which query filters and sorts each kind takes, the action table, limits, the enum values each tone reads and the built-in templates.",
   Schema.Struct({ missionId: MissionId, catalog: Schema.optionalKey(Schema.Boolean) }),
   Schema.Struct({ views: MissionViewsSnapshot, catalog: Schema.NullOr(ViewCatalog) }),
 );
@@ -86,14 +86,14 @@ const PreviewTool = tool(
 
 const TemplateTool = tool(
   "mission_view_template",
-  "Owner or master. Define a card template, or update one (same templateId or key; expectedVersion fences concurrent edits). Body nodes come from the catalog and bind record.<path>, field.<key> or derived paths; actions come from the action table for the backing kind. match picks records automatically (most specific wins; an empty match replaces the built-in for its kind). Refused with every issue when a check fails; nothing is stored.",
+  "Owner or master. Define a card template, or update one (same templateId or key; expectedVersion fences concurrent edits). Body nodes come from the catalog and bind record.<path>, field.<key> or derived paths; actions come from the action table for the backing kind. Cards take stat, callout and code nodes too; chart and timeline need rows, so they live in sections. match picks records automatically (most specific wins; an empty match replaces the built-in for its kind). Refused with every issue when a check fails; nothing is stored.",
   DefineViewTemplateInput,
   MissionMutationResult,
 );
 
 const SectionTool = tool(
   "mission_view_section",
-  'Owner or master. Place a section (query or pinned refs, rows rendered by list, table or collapsible nodes) or update one by sectionId or key. A new section joins the mission layout in region (default main) at index; passing region or index on an update moves it. A collapsible folds one row per item under a header (title, meta) and holds up to 6 child nodes that bind that row. Query kind "report" lists the scribe\'s saved reports newest first (where.reportKind: daily|update); rows bind row.title, row.period, row.size, row.kind, row.coversTo, and row.text (the whole report, longtext) only in a markdown node inside a collapsible, which loads it when opened. Example, latest daily report open: {key:"daily-report", title:"Daily report", source:{_tag:"query", query:{kind:"report", where:{reportKind:["daily"]}, sort:"created-desc", limit:1}}, body:[{_tag:"collapsible", title:"row.title", meta:["row.period","row.size"], open:"first", children:[{_tag:"markdown", bind:"row.text"}]}]}. The last 8 updates: the same with key "updates", reportKind ["update"], limit 8, open "none".',
+  'Owner or master. Place a section (query or pinned refs, rows rendered by list, table or collapsible nodes) or update one by sectionId or key. A new section joins the mission layout in region (default main) at index; passing region or index on an update moves it. A collapsible folds one row per item under a header (title, meta) and holds up to 6 child nodes that bind that row. Query kind "report" lists the scribe\'s saved reports newest first (where.reportKind: daily|update); rows bind row.title, row.period, row.size, row.kind, row.coversTo, and row.text (the whole report, longtext) only in a markdown node inside a collapsible, which loads it when opened. Example, latest daily report open: {key:"daily-report", title:"Daily report", source:{_tag:"query", query:{kind:"report", where:{reportKind:["daily"]}, sort:"created-desc", limit:1}}, body:[{_tag:"collapsible", title:"row.title", meta:["row.period","row.size"], open:"first", children:[{_tag:"markdown", bind:"row.text"}]}]}. The last 8 updates: the same with key "updates", reportKind ["update"], limit 8, open "none". Rows also feed stat (one tile per row, or one tile for value row.count or row.total), chart (y a number across rows labelled by x, or a series field drawn per row; last 60 points), timeline (one entry per row: at, title, up to 2 meta, tone) and callout (one note per row, falling back to its label) nodes; tone binds an enum (good/ok/passed, warn/amber, bad/failed/red, info). code shows monospace text folded past 12 lines with a copy button. Example: {_tag:"stat", value:"row.count", label:"Open PRs"}.',
   PlaceViewSectionInput,
   MissionMutationResult,
 );
@@ -117,7 +117,7 @@ const SOURCE_RULES =
 
 const SourceSetTool = tool(
   "mission_view_source_set",
-  `Owner or master. Add a script-backed view source (omit sourceId; title, runtime bash|node|python3, code and fields {name: text|enum|number|time|link|links|actor|longtext} are required) or update one (pass sourceId and only what changes). refreshMinutes 5..1440 (default 15), timeoutSeconds <=60 (default 30), enabled (default true). ${SOURCE_RULES}`,
+  `Owner or master. Add a script-backed view source (omit sourceId; title, runtime bash|node|python3, code and fields {name: text|enum|number|series|time|link|links|actor|longtext} are required) or update one (pass sourceId and only what changes). refreshMinutes 5..1440 (default 15), timeoutSeconds <=60 (default 30), enabled (default true). ${SOURCE_RULES}`,
   SetViewSourceInput,
   MissionMutationResult,
 );

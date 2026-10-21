@@ -298,6 +298,49 @@ export const ViewCollapsibleHead = Schema.Struct({
 });
 export type ViewCollapsibleHead = typeof ViewCollapsibleHead.Type;
 // --- end views additions ---
+// --- blocks additions ---
+export const ViewTone = Schema.Literals(["info", "warn", "bad", "good"]);
+export type ViewTone = typeof ViewTone.Type;
+/**
+ * A big number with a label. Cards bind the record; a section draws one tile
+ * per row. `tone` binds an enum read through `VIEW_TONE_VALUES`.
+ */
+export const ViewStatNode = Schema.TaggedStruct("stat", {
+  value: ViewBind,
+  label: ViewKicker,
+  delta: Schema.optionalKey(ViewBind),
+  tone: Schema.optionalKey(ViewBind),
+  /** `$ € £ ¥` go before the number, anything else after it. */
+  unit: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(8))),
+});
+/**
+ * A static chart. A number `y` puts one point per section row, `x` labels
+ * them; a `series` `y` draws one chart per row, `x` names it. Sections only.
+ */
+export const ViewChartNode = Schema.TaggedStruct("chart", {
+  type: Schema.Literals(["line", "bar"]),
+  x: Schema.optionalKey(ViewBind),
+  y: ViewBind,
+});
+/** One entry per section row, in row order. Sections only. */
+export const ViewTimelineNode = Schema.TaggedStruct("timeline", {
+  at: ViewBind,
+  title: ViewBind,
+  meta: Schema.Array(ViewBind).check(Schema.isMaxLength(2)),
+  tone: Schema.optionalKey(ViewBind),
+});
+/** A toned note; null `text` shows `label`. */
+export const ViewCalloutNode = Schema.TaggedStruct("callout", {
+  tone: ViewTone,
+  text: Schema.NullOr(ViewBind),
+  label: Schema.optionalKey(ViewLabel),
+});
+/** Monospace text that folds past a few lines, with copy. `longtext` binds like markdown's. */
+export const ViewCodeNode = Schema.TaggedStruct("code", {
+  bind: ViewBind,
+  label: Schema.optionalKey(ViewKicker),
+});
+// --- end blocks additions ---
 
 export const ViewLeafNode = Schema.Union([
   ViewTextNode,
@@ -315,6 +358,13 @@ export const ViewLeafNode = Schema.Union([
   ViewGalleryNode,
   ViewMarkdownNode,
   // --- end views additions ---
+  // --- blocks additions ---
+  ViewStatNode,
+  ViewChartNode,
+  ViewTimelineNode,
+  ViewCalloutNode,
+  ViewCodeNode,
+  // --- end blocks additions ---
 ]);
 export type ViewLeafNode = typeof ViewLeafNode.Type;
 
@@ -385,6 +435,13 @@ export const VIEW_NODE_TAGS: ReadonlyArray<ViewNodeTag> = [
   "collapsible",
   "markdown",
   // --- end views additions ---
+  // --- blocks additions ---
+  "stat",
+  "chart",
+  "timeline",
+  "callout",
+  "code",
+  // --- end blocks additions ---
 ];
 
 /** Bodies on the wire: decode each node alone and drop what fails. */
@@ -558,6 +615,8 @@ export const ViewSourceFieldKind = Schema.Literals([
   "links",
   "actor",
   "longtext",
+  /** Numbers in order, drawn by a chart; only the last `chartPoints` are kept. */
+  "series",
 ]);
 export type ViewSourceFieldKind = typeof ViewSourceFieldKind.Type;
 
@@ -787,6 +846,12 @@ export const VIEW_HARD_LIMITS = {
   /** A `longtext` value loads at most this many characters. */
   longTextChars: 400_000,
   // --- end views additions ---
+  // --- blocks additions ---
+  /** A chart draws at most this many points; longer series keep their last ones. */
+  chartPoints: 60,
+  /** A code block shows this many lines before it folds. */
+  codeFoldLines: 12,
+  // --- end blocks additions ---
 } as const;
 
 /** Sane upper bounds for the adjustable limits below. */
@@ -990,6 +1055,10 @@ export const ViewValueKind = Schema.Literals([
   /** Too long for the snapshot; only a markdown block inside a collapsible binds it, loaded on open. */
   "longtext",
   // --- end views additions ---
+  // --- blocks additions ---
+  /** Numbers in order, for a chart. Source fields are the only producer. */
+  "series",
+  // --- end blocks additions ---
 ]);
 export type ViewValueKind = typeof ViewValueKind.Type;
 
@@ -1168,6 +1237,19 @@ export const VIEW_BIND_ACCEPTS = {
   collapsibleMeta: SCALAR,
   markdown: ["text", "longtext"],
   // --- end views additions ---
+  // --- blocks additions ---
+  statValue: ["number", "text"],
+  statDelta: ["number", "text"],
+  statTone: ["enum"],
+  chartX: ["text", "enum", "time"],
+  chartY: ["number", "series"],
+  timelineAt: ["time"],
+  timelineTitle: ["text", "enum", "link", "pr"],
+  timelineMeta: SCALAR,
+  timelineTone: ["enum"],
+  callout: SCALAR,
+  code: ["text", "longtext"],
+  // --- end blocks additions ---
 } as const satisfies Record<string, ReadonlyArray<ViewValueKind>>;
 export type ViewBindSlot = keyof typeof VIEW_BIND_ACCEPTS;
 
@@ -1997,6 +2079,10 @@ export const ViewCatalog = Schema.Struct({
     }),
   ),
   // --- end sources additions ---
+  // --- blocks additions ---
+  /** Enum values a `tone` bind maps to each tone. */
+  tones: Schema.optional(Schema.Record(Schema.String, Schema.Array(Schema.String))),
+  // --- end blocks additions ---
 });
 export type ViewCatalog = typeof ViewCatalog.Type;
 
@@ -2057,7 +2143,47 @@ const NODE_SIGNATURES: ReadonlyArray<{ tag: ViewNodeTag; signature: string; wher
     where: "templates, sections (longtext only inside a collapsible; it loads when that opens)",
   },
   // --- end views additions ---
+  // --- blocks additions ---
+  {
+    tag: "stat",
+    signature:
+      "{value: number|text bind, label: ≤24 chars, delta?: number|text bind, tone?: enum bind, unit?: ≤8 chars}",
+    where:
+      "templates, sections (one tile per row; value row.count or row.total makes one tile for the section, with no delta or tone)",
+  },
+  {
+    tag: "chart",
+    signature: "{type: line|bar, x?: text|enum|time row bind, y: number|series row bind}",
+    where:
+      "sections (number y: one point per row in row order, left to right, x labels it; series y: one chart per row, x names it; ≤60 points, the last ones kept; not inside a collapsible)",
+  },
+  {
+    tag: "timeline",
+    signature: "{at: time bind, title: bind, meta: ≤2 binds, tone?: enum bind}",
+    where: "sections (one entry per row, in row order; not inside a collapsible)",
+  },
+  {
+    tag: "callout",
+    signature: "{tone: info|warn|bad|good, text: bind|null, label?: ≤60 chars}",
+    where: "templates, sections (null text, or text with no value, shows label)",
+  },
+  {
+    tag: "code",
+    signature: "{bind: text|longtext, label?: ≤24 chars}",
+    where:
+      "templates, sections (monospace, folds past 12 lines, copy button; longtext only inside a collapsible)",
+  },
+  // --- end blocks additions ---
 ];
+// --- blocks additions ---
+/** Enum values a `tone` bind reads; anything else draws plain. */
+export const VIEW_TONE_VALUES: { readonly [K in ViewTone]: ReadonlyArray<string> } = {
+  good: ["good", "ok", "success", "passed", "pass", "green", "done", "merged", "on-track"],
+  warn: ["warn", "warning", "amber", "yellow", "pending", "degraded", "at-risk", "stuck"],
+  bad: ["bad", "error", "failed", "fail", "failure", "red", "down", "critical", "missed"],
+  info: ["info", "neutral", "blue"],
+};
+// --- end blocks additions ---
 
 export const VIEW_CATALOG: ViewCatalog = {
   version: VIEW_CATALOG_VERSION,
@@ -2083,7 +2209,7 @@ export const VIEW_CATALOG: ViewCatalog = {
       "Sources are read-only. Never write to GitHub, Linear, Cliq or anything else, never send messages, never print secrets or tokens.",
       'Print one JSON object to stdout: {"rows":[{"id":"...", <declared fields>}]}. At most 500 rows and 2 MB.',
       "Every row needs a unique string id. Undeclared keys are dropped and long strings are cut.",
-      "Kinds: text/enum/longtext strings, number, time (ISO), actor (a plain name), link (an https url or {url, label?}), links (a list of those). null is fine.",
+      "Kinds: text/enum/longtext strings, number, series (a list of numbers, the last 60 kept), time (ISO), actor (a plain name), link (an https url or {url, label?}), links (a list of those). null is fine.",
       "A wrong kind, a non-https link, a bad time or a non-zero exit fails the run; the section keeps the last good rows and says it couldn't refresh.",
       "Runs as the owner with the login PATH (gh, linctl, curl, jq), stdin closed, in a scratch directory, niced, within timeoutSeconds (max 60).",
       "Runs only when older than refreshMinutes and someone has the mission open, or on mission_view_source_run. Owner or master only.",
@@ -2182,4 +2308,7 @@ export const VIEW_CATALOG: ViewCatalog = {
     ],
   },
   // --- end sources additions ---
+  // --- blocks additions ---
+  tones: VIEW_TONE_VALUES,
+  // --- end blocks additions ---
 };

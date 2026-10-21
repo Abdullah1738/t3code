@@ -31,6 +31,10 @@ import {
   withAssetFeedback,
   type ViewBlock,
   type ViewSectionSource,
+  // --- blocks additions ---
+  viewChartLabels,
+  viewChartScale,
+  // --- end blocks additions ---
 } from "./index.ts";
 
 const decodeAsk = Schema.decodeUnknownSync(Ask);
@@ -578,3 +582,240 @@ describe("per-image review", () => {
     expect(withAssetFeedback(input, {}, shots)).toBe(input);
   });
 });
+
+describe("stat, chart, timeline, callout and code blocks", () => {
+  const notes = section("sec-notes", {
+    title: "Findings",
+    source: { _tag: "query", query: { kind: "note", sort: "created-desc", limit: 5 } },
+    body: [
+      { _tag: "stat", value: "row.count", label: "Findings" },
+      { _tag: "chart", type: "line", x: "row.createdAt", y: "row.confidence" },
+      {
+        _tag: "timeline",
+        at: "row.createdAt",
+        title: "row.summary",
+        meta: ["row.type"],
+        tone: "row.severity",
+      },
+      { _tag: "callout", tone: "warn", text: "row.summary", label: "Nothing flagged" },
+    ],
+  });
+  const note = (id: string, summary: string, severity: string, confidence: number) => ({
+    ref: { kind: "note" as const, id },
+    value: { summary, severity, confidence, type: "risk", createdAt: T0 },
+  });
+
+  it("draws one tile for the section, a point and an entry per row", () => {
+    const view = viewSection(notes, {
+      nowMs: NOW,
+      data: {
+        sectionId: ViewSectionId.make("sec-notes"),
+        total: 7,
+        rows: [note("n-1", "Lock contention", "critical", 0.8), note("n-2", "Slow CI", "low", 0.5)],
+      },
+    });
+    expect(view.blocks).toEqual([
+      {
+        kind: "stat",
+        label: "Findings",
+        tiles: [{ key: "one", value: "2", prefix: null, suffix: null, delta: null, tone: null }],
+      },
+      {
+        kind: "chart",
+        type: "line",
+        charts: [
+          {
+            key: "rows",
+            title: null,
+            points: [
+              { label: "2h ago", value: 0.8 },
+              { label: "2h ago", value: 0.5 },
+            ],
+          },
+        ],
+      },
+      {
+        kind: "timeline",
+        entries: [
+          {
+            key: "note:n-1",
+            at: "2h ago",
+            title: "Lock contention",
+            meta: ["risk"],
+            tone: "bad",
+            ref: { kind: "note", id: "n-1" },
+          },
+          {
+            key: "note:n-2",
+            at: "2h ago",
+            title: "Slow CI",
+            meta: ["risk"],
+            tone: null,
+            ref: { kind: "note", id: "n-2" },
+          },
+        ],
+      },
+      { kind: "callout", tone: "warn", texts: ["Lock contention", "Slow CI"] },
+    ]);
+  });
+
+  it("falls back to a callout's label and hides row blocks with no rows", () => {
+    const view = viewSection(notes, {
+      nowMs: NOW,
+      data: { sectionId: ViewSectionId.make("sec-notes"), total: 0, rows: [] },
+    });
+    expect(view.blocks).toEqual([
+      {
+        kind: "stat",
+        label: "Findings",
+        tiles: [{ key: "one", value: "0", prefix: null, suffix: null, delta: null, tone: null }],
+      },
+      { kind: "callout", tone: "warn", texts: ["Nothing flagged"] },
+    ]);
+  });
+
+  it("compacts big numbers, signs deltas and reads tones from enum values", () => {
+    const spend = section("sec-spend", {
+      title: "Spend",
+      source: { _tag: "query", query: { kind: "sub-mission", sort: "rank", limit: 5 } },
+      body: [
+        {
+          _tag: "stat",
+          value: "row.order",
+          label: "Spend",
+          delta: "row.order",
+          tone: "row.health",
+          unit: "$",
+        },
+        { _tag: "stat", value: "row.order", label: "Tokens", unit: "tok" },
+      ],
+    });
+    const view = viewSection(spend, {
+      nowMs: NOW,
+      data: {
+        sectionId: ViewSectionId.make("sec-spend"),
+        total: 2,
+        rows: [
+          { ref: { kind: "sub-mission", id: "s-1" }, value: { order: 1400, health: "amber" } },
+          { ref: { kind: "sub-mission", id: "s-2" }, value: { order: 12, health: "unknown" } },
+        ],
+      },
+    });
+    expect(view.blocks).toEqual([
+      {
+        kind: "stat",
+        label: "Spend",
+        tiles: [
+          {
+            key: "sub-mission:s-1",
+            value: "1.4k",
+            prefix: "$",
+            suffix: null,
+            delta: "+1.4k",
+            tone: "warn",
+          },
+          {
+            key: "sub-mission:s-2",
+            value: "12",
+            prefix: "$",
+            suffix: null,
+            delta: "+12",
+            tone: null,
+          },
+        ],
+      },
+      {
+        kind: "stat",
+        label: "Tokens",
+        tiles: [
+          {
+            key: "sub-mission:s-1",
+            value: "1.4k",
+            prefix: null,
+            suffix: "tok",
+            delta: null,
+            tone: null,
+          },
+          {
+            key: "sub-mission:s-2",
+            value: "12",
+            prefix: null,
+            suffix: "tok",
+            delta: null,
+            tone: null,
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("shows code and long code from their sources", () => {
+    const reports = section("sec-logs", {
+      title: "Logs",
+      source: { _tag: "query", query: { kind: "report", sort: "created-desc", limit: 2 } },
+      body: [
+        {
+          _tag: "collapsible",
+          title: "row.title",
+          meta: [],
+          open: "none",
+          children: [
+            { _tag: "code", bind: "row.text", label: "Tail" },
+            { _tag: "code", bind: "row.title" },
+          ],
+        },
+      ],
+    });
+    const ref = { kind: "report" as const, id: "crpko|update|a" };
+    const view = viewSection(reports, {
+      nowMs: NOW,
+      data: {
+        sectionId: ViewSectionId.make("sec-logs"),
+        total: 1,
+        rows: [{ ref, value: { title: "panic: nil map" } }],
+      },
+    });
+    expect(view.blocks).toEqual([
+      {
+        kind: "collapsible",
+        open: "none",
+        items: [
+          {
+            key: "report:crpko|update|a",
+            title: "panic: nil map",
+            meta: [],
+            children: [
+              { kind: "code", label: "Tail", text: null, source: { missionId, ref, path: "text" } },
+              { kind: "code", label: null, text: "panic: nil map", source: null },
+            ],
+          },
+        ],
+      },
+    ]);
+  });
+});
+
+// --- blocks additions ---
+describe("chart axes", () => {
+  const points = (values: ReadonlyArray<number>) =>
+    values.map((value, index) => ({ label: `d${index + 1}`, value }));
+  const ticks = (values: ReadonlyArray<number>) =>
+    viewChartScale(points(values)).ticks.map((tick) => tick.label);
+
+  it("steps the y axis in round numbers from zero past the top value", () => {
+    expect(ticks([3, 7, 12])).toEqual(["0", "5", "10", "15"]);
+    expect(ticks([-4, 6])).toEqual(["-5", "0", "5", "10"]);
+    expect(ticks([1400, 2600])).toEqual(["0", "1k", "2k", "3k"]);
+    expect(ticks([0.25, 0.8])).toEqual(["0", "0.5", "1"]);
+    expect(ticks([])).toEqual(["0", "0.5"]);
+  });
+
+  it("labels the first, last and evenly spaced points between", () => {
+    const ten = points([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(viewChartLabels(ten).map((tick) => tick.label)).toEqual(["d1", "d4", "d7", "d10"]);
+    expect(viewChartLabels(ten.slice(0, 2)).map((tick) => tick.index)).toEqual([0, 1]);
+    const unnamed = ten.map((point, index) => (index === 3 ? { ...point, label: null } : point));
+    expect(viewChartLabels(unnamed).map((tick) => tick.index)).toEqual([0, 6, 9]);
+  });
+});
+// --- end blocks additions ---

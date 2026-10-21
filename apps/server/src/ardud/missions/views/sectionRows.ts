@@ -31,6 +31,9 @@ const DERIVED_SOURCES: Record<string, ReadonlyArray<string>> = {
   approver: ["approver", "acceptor", "status"],
 };
 
+const optional = (bind: string | undefined): ReadonlyArray<string> =>
+  bind === undefined ? [] : [bind];
+
 export const nodeBinds = (node: ViewNode): ReadonlyArray<string> => {
   switch (node._tag) {
     case "text":
@@ -56,6 +59,18 @@ export const nodeBinds = (node: ViewNode): ReadonlyArray<string> => {
       ];
     case "group":
       return node.children.flatMap(nodeBinds);
+    // --- blocks additions ---
+    case "stat":
+      return [node.value, ...optional(node.delta), ...optional(node.tone)];
+    case "chart":
+      return [...optional(node.x), node.y];
+    case "timeline":
+      return [node.at, node.title, ...node.meta, ...optional(node.tone)];
+    case "callout":
+      return node.text === null ? [] : [node.text];
+    case "code":
+      return [node.bind];
+    // --- end blocks additions ---
     case "label":
     case "draft":
     case "choice":

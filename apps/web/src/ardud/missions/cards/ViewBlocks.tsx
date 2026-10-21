@@ -1,5 +1,5 @@
 import { useMemo, useState, type MouseEvent } from "react";
-import { ChevronRightIcon, XIcon } from "lucide-react";
+import { CheckIcon, ChevronRightIcon, CopyIcon, XIcon } from "lucide-react";
 
 import type { AssetResource, DraftChannel } from "@t3tools/contracts";
 import {
@@ -10,8 +10,20 @@ import {
   type ViewBlock,
   type ViewGalleryAsset,
   type ViewTableCell,
+  // --- blocks additions ---
+  viewChartLabels,
+  viewChartScale,
+  type ViewChart,
+  type ViewChartPoint,
+  type ViewStatTile,
+  type ViewTimelineEntry,
+  // --- end blocks additions ---
 } from "@t3tools/client-runtime/ardud/missions";
 import type { ViewLongTextInput } from "@t3tools/contracts";
+// --- blocks additions ---
+import { VIEW_HARD_LIMITS, type ViewTone } from "@t3tools/contracts";
+import { useCopyToClipboard } from "../../../hooks/useCopyToClipboard";
+// --- end blocks additions ---
 
 import { useAssetUrlState } from "../../../assets/assetUrls";
 import { Button } from "../../../components/ui/button";
@@ -38,7 +50,8 @@ import { LinkChip } from "./chips";
 
 // Draws the blocks a card template or a section resolves to. The view model
 // (client-runtime views/) did the binding; this only maps blocks onto the
-// shared card primitives, plus the list, table, meter and gallery blocks.
+// shared card primitives, plus the list, table, meter, gallery, stat, chart,
+// timeline, callout and code blocks.
 
 /** The card's answer choice, when the template has a choice node. */
 export interface ViewChoiceState {
@@ -147,6 +160,22 @@ function ViewBlockView(props: {
     case "collapsible":
       return <CollapsibleBlock block={block} choice={props.choice} review={props.review} />;
     // --- end views additions ---
+    // --- blocks additions ---
+    case "stat":
+      return <StatBlock label={block.label} tiles={block.tiles} />;
+    case "chart":
+      return <ChartBlock type={block.type} charts={block.charts} />;
+    case "timeline":
+      return <TimelineBlock entries={block.entries} />;
+    case "callout":
+      return <CalloutBlock tone={block.tone} texts={block.texts} />;
+    case "code":
+      return block.source ? (
+        <LongCode source={block.source} label={block.label} />
+      ) : (
+        <CodeText text={block.text ?? ""} label={block.label} />
+      );
+    // --- end blocks additions ---
   }
 }
 
@@ -281,6 +310,309 @@ function LongMarkdown(props: { source: ViewLongTextInput; maxLines: number | nul
   );
 }
 // --- end views additions ---
+
+// --- blocks additions ---
+// ---------------------------------------------------------------------------
+// stat, chart, timeline, callout, code
+
+const TONE_TEXT: Record<ViewTone, string> = {
+  good: "text-(--m-positive)",
+  warn: "text-(--m-warning)",
+  bad: "text-(--m-negative)",
+  info: "text-(--m-info)",
+};
+
+const TONE_DOT: Record<ViewTone, string> = {
+  good: "bg-(--m-positive)",
+  warn: "bg-(--m-warning)",
+  bad: "bg-(--m-negative)",
+  info: "bg-(--m-info)",
+};
+
+const TONE_NOTE: Record<ViewTone, string> = {
+  good: "bg-(--m-positive)/10 text-(--m-positive)",
+  warn: "bg-(--m-warning)/10 text-(--m-warning)",
+  bad: "bg-(--m-negative)/10 text-(--m-negative)",
+  info: "bg-(--m-info)/10 text-(--m-info)",
+};
+
+function StatBlock(props: { label: string; tiles: ReadonlyArray<ViewStatTile> }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <span className="text-xs text-(--m-muted)">{props.label}</span>
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-6 gap-y-2">
+        {props.tiles.map((tile) => (
+          <span key={tile.key} className="flex min-w-0 items-baseline gap-1.5 tabular-nums">
+            <span
+              className={cn(
+                "text-2xl font-semibold tracking-tight",
+                tile.delta === null && tile.tone !== null
+                  ? TONE_TEXT[tile.tone]
+                  : "text-(--m-text)",
+              )}
+            >
+              {tile.prefix}
+              {tile.value}
+            </span>
+            {tile.suffix ? <span className="text-sm text-(--m-muted)">{tile.suffix}</span> : null}
+            {tile.delta ? (
+              <span
+                className={cn("text-xs", tile.tone ? TONE_TEXT[tile.tone] : "text-(--m-muted)")}
+              >
+                {tile.delta}
+              </span>
+            ) : null}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ChartBlock(props: { type: "line" | "bar"; charts: ReadonlyArray<ViewChart> }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-4">
+      {props.charts.map((chart) => (
+        <figure key={chart.key} className="flex min-w-0 flex-col gap-1.5">
+          {chart.title ? (
+            <figcaption className="truncate text-xs text-(--m-muted)">{chart.title}</figcaption>
+          ) : null}
+          <ChartPlot type={props.type} title={chart.title} points={chart.points} />
+        </figure>
+      ))}
+    </div>
+  );
+}
+
+/** Where a point's centre sits across the plot, 0..100. */
+const chartX = (type: "line" | "bar", index: number, count: number) =>
+  type === "bar" ? ((index + 0.5) / count) * 100 : count === 1 ? 50 : (index / (count - 1)) * 100;
+
+function ChartPlot(props: {
+  type: "line" | "bar";
+  title: string | null;
+  points: ReadonlyArray<ViewChartPoint>;
+}) {
+  const { points } = props;
+  const scale = viewChartScale(points);
+  const y = (value: number) => 100 - ((value - scale.min) / (scale.max - scale.min)) * 100;
+  const zero = y(0);
+  const band = 100 / points.length;
+  const last = points.at(-1);
+  // One point has no slope; it reads as a level line across the plot.
+  const line =
+    points.length === 1
+      ? `0,${y(points[0]!.value)} 100,${y(points[0]!.value)}`
+      : points
+          .map((point, index) => `${chartX("line", index, points.length)},${y(point.value)}`)
+          .join(" ");
+  return (
+    <div className="flex min-w-0 gap-2">
+      <div
+        aria-hidden
+        className="relative h-36 w-9 shrink-0 text-2xs text-(--m-muted) tabular-nums"
+      >
+        {scale.ticks.map((tick) => (
+          <span
+            key={tick.value}
+            className="absolute end-0 -translate-y-1/2 leading-none"
+            style={{ top: `${y(tick.value)}%` }}
+          >
+            {tick.label}
+          </span>
+        ))}
+      </div>
+      <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+        <svg
+          role="img"
+          aria-label={`${props.title ?? "Chart"}: ${points.length} points${last ? `, last ${last.label ? `${last.label} ` : ""}${last.value.toLocaleString()}` : ""}`}
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          className="h-36 w-full overflow-visible"
+        >
+          {scale.ticks.map((tick) => (
+            <line
+              key={tick.value}
+              x1={0}
+              x2={100}
+              y1={y(tick.value)}
+              y2={y(tick.value)}
+              stroke={tick.value === 0 ? "var(--m-tick)" : "var(--m-rule)"}
+              strokeWidth={1}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+          {props.type === "bar" ? (
+            points.map((point, index) => (
+              <rect
+                // Points have no ids; their order is the rows'.
+                // eslint-disable-next-line react/no-array-index-key
+                key={index}
+                x={index * band + band * 0.2}
+                width={band * 0.6}
+                y={Math.min(y(point.value), zero)}
+                height={Math.abs(zero - y(point.value))}
+                fill="var(--m-accent)"
+              />
+            ))
+          ) : (
+            <polyline
+              points={line}
+              fill="none"
+              stroke="var(--m-accent)"
+              strokeWidth={2}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+        <div aria-hidden className="relative h-4 text-2xs text-(--m-muted) tabular-nums">
+          {viewChartLabels(points).map((tick, slot, all) => (
+            <span
+              key={tick.index}
+              className={cn(
+                "absolute top-0 truncate whitespace-nowrap",
+                slot === 0
+                  ? ""
+                  : slot === all.length - 1
+                    ? "-translate-x-full"
+                    : "-translate-x-1/2",
+              )}
+              style={{
+                left: `${slot === 0 ? 0 : slot === all.length - 1 ? 100 : chartX(props.type, tick.index, points.length)}%`,
+              }}
+            >
+              {tick.label}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TimelineBlock(props: { entries: ReadonlyArray<ViewTimelineEntry> }) {
+  return (
+    <ol className="ms-1 flex min-w-0 flex-col border-s border-(--m-rule)">
+      {props.entries.map((entry) => (
+        <li key={entry.key} className="relative flex min-w-0 flex-col gap-0.5 ps-4 pb-3 last:pb-0">
+          <span
+            aria-hidden
+            className={cn(
+              "absolute -start-[4.5px] top-1.5 size-2 rounded-full",
+              entry.tone ? TONE_DOT[entry.tone] : "bg-(--m-tick)",
+            )}
+          />
+          <span className="flex min-w-0 items-baseline gap-3 text-sm">
+            <span className="min-w-0 flex-1 truncate font-medium text-(--m-text)">
+              {entry.title}
+            </span>
+            {entry.at ? (
+              <span className="shrink-0 text-xs text-(--m-muted) tabular-nums">{entry.at}</span>
+            ) : null}
+          </span>
+          {entry.meta.length > 0 ? (
+            <span className="truncate text-xs text-(--m-muted)">{entry.meta.join(" · ")}</span>
+          ) : null}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function CalloutBlock(props: { tone: ViewTone; texts: ReadonlyArray<string> }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      {props.texts.map((text, index) => (
+        <p
+          // Notes have no ids; their order is the rows'.
+          // eslint-disable-next-line react/no-array-index-key
+          key={index}
+          role="note"
+          className={cn("rounded-lg px-3 py-2 text-sm break-words", TONE_NOTE[props.tone])}
+        >
+          {text}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+function CodeText(props: { text: string; label: string | null; note?: string | undefined }) {
+  const [unfolded, setUnfolded] = useState(false);
+  const { copyToClipboard, isCopied } = useCopyToClipboard({ target: "code", timeout: 1_200 });
+  if (props.text.trim() === "") return null;
+  const codeLines = props.text.split("\n");
+  const fold = VIEW_HARD_LIMITS.codeFoldLines;
+  const folded = !unfolded && codeLines.length > fold;
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="min-w-0 flex-1 truncate text-xs text-(--m-muted)">{props.label}</span>
+        <Button
+          type="button"
+          size="icon-xs"
+          variant="ghost-muted"
+          aria-label={isCopied ? "Copied" : "Copy"}
+          onClick={() => copyToClipboard(props.text)}
+        >
+          {isCopied ? <CheckIcon /> : <CopyIcon />}
+        </Button>
+      </div>
+      <pre className="min-w-0 overflow-x-auto rounded-xl bg-(--m-raised) px-3 py-2 font-mono text-xs leading-5 text-(--m-text)">
+        <code>{folded ? codeLines.slice(0, fold).join("\n") : props.text}</code>
+      </pre>
+      {codeLines.length > fold ? (
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost-muted"
+          className="self-start"
+          onClick={() => setUnfolded(!unfolded)}
+        >
+          {folded ? `Show all ${codeLines.length.toLocaleString()} lines` : "Show less"}
+        </Button>
+      ) : null}
+      {props.note ? <p className="text-xs text-(--m-muted)">{props.note}</p> : null}
+    </div>
+  );
+}
+
+function LongCode(props: { source: ViewLongTextInput; label: string | null }) {
+  const state = useViewLongText(props.source);
+  if (state === undefined || state.status === "loading") {
+    return <div aria-hidden className="h-24 rounded-xl bg-(--m-active)" />;
+  }
+  if (state.status === "failed") {
+    return (
+      <div className="flex min-w-0 items-center gap-3 text-sm text-(--m-muted)">
+        <span className="min-w-0 flex-1">{missionErrorMessage(state.error)}</span>
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost-muted"
+          onClick={() => retryViewLongText(props.source)}
+        >
+          Retry
+        </Button>
+      </div>
+    );
+  }
+  const { value } = state;
+  return (
+    <CodeText
+      text={value.text}
+      label={props.label}
+      note={
+        value.truncated
+          ? `Cut at ${value.text.length.toLocaleString()} of ${value.size.toLocaleString()} characters.`
+          : undefined
+      }
+    />
+  );
+}
+// --- end blocks additions ---
 
 // ---------------------------------------------------------------------------
 // list, table, meter

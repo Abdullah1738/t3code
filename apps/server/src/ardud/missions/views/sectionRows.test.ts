@@ -374,3 +374,140 @@ describe("section rows", () => {
     ),
   );
 });
+
+describe("block nodes", () => {
+  const deploys = (body: PlaceViewSectionInput["definition"]["body"]) => ({
+    ...releaseTrain.definition,
+    body,
+  });
+
+  it.effect("checks stat, chart, timeline, callout and code binds", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const section = (body: PlaceViewSectionInput["definition"]["body"]) =>
+          views.preview({ missionId, definition: { _tag: "section", definition: deploys(body) } });
+        const good = yield* section([
+          { _tag: "stat", value: "row.count", label: "Deploys" },
+          {
+            _tag: "timeline",
+            at: "row.updatedAt",
+            title: "row.title",
+            meta: ["row.stage"],
+            tone: "row.stage",
+          },
+          { _tag: "callout", tone: "warn", text: null, label: "Freeze after 18:00" },
+          {
+            _tag: "collapsible",
+            title: "row.title",
+            meta: [],
+            open: "first",
+            children: [{ _tag: "code", bind: "row.title", label: "Title" }],
+          },
+        ]);
+        assert.deepEqual(good.issues, []);
+        const notes = yield* views.preview({
+          missionId,
+          definition: {
+            _tag: "section",
+            definition: {
+              key: "confidence",
+              title: "Confidence",
+              source: {
+                _tag: "query",
+                query: { kind: "note", sort: "created-desc", limit: 20 },
+              },
+              body: [
+                { _tag: "chart", type: "line", x: "row.createdAt", y: "row.confidence" },
+                {
+                  _tag: "stat",
+                  value: "row.confidence",
+                  label: "Confidence",
+                  tone: "row.severity",
+                },
+              ],
+            },
+          },
+        });
+        assert.deepEqual(notes.issues, []);
+        const bad = yield* section([
+          { _tag: "stat", value: "row.total", label: "Deploys", tone: "row.stage" },
+          { _tag: "chart", type: "line", x: "row.heldBy", y: "row.title" },
+          { _tag: "timeline", at: "row.title", title: "row.title", meta: [] },
+          { _tag: "callout", tone: "info", text: null },
+          { _tag: "code", bind: "row.title" },
+          {
+            _tag: "collapsible",
+            title: "row.title",
+            meta: [],
+            open: "none",
+            children: [{ _tag: "timeline", at: "row.updatedAt", title: "row.title", meta: [] }],
+          },
+        ]);
+        assert.deepEqual(
+          bad.issues.map((issue) => `${issue.path} ${issue.code}`),
+          [
+            "body[0] shape",
+            "body[1].x binding-kind",
+            "body[1].y binding-kind",
+            "body[2].at binding-kind",
+            "body[3].text shape",
+            "body[4].bind bad-binding",
+            "body[5].children[0] node-not-allowed",
+          ],
+        );
+        const card = yield* views.preview({
+          missionId,
+          definition: {
+            _tag: "template",
+            definition: {
+              key: "deploy-card",
+              name: "Deploy card",
+              backing: "approval",
+              title: "record.title",
+              body: [
+                { _tag: "stat", value: "record.title", label: "Status", tone: "record.status" },
+                { _tag: "timeline", at: "record.createdAt", title: "record.title", meta: [] },
+              ],
+              actions: ["approve"],
+            },
+          },
+        });
+        assert.deepEqual(
+          card.issues.map((issue) => `${issue.path} ${issue.code}`),
+          ["body[1] node-not-allowed"],
+        );
+      }),
+    ),
+  );
+
+  it.effect("sends the fields a timeline binds", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        yield* work("wi-a", "deploy", "deploy", "2026-10-17T09:00:00.000Z");
+        const views = yield* ViewService;
+        const placed = yield* views.placeSection(ownerApp, {
+          missionId,
+          definition: deploys([
+            {
+              _tag: "timeline",
+              at: "row.updatedAt",
+              title: "row.title",
+              meta: [],
+              tone: "row.stage",
+            },
+          ]),
+        });
+        const snapshot = yield* views.snapshot(missionId);
+        const rows = snapshot.sectionData?.find((data) => data.sectionId === placed.ref.id)?.rows;
+        assert.deepEqual(Object.keys(rows?.[0]?.value ?? {}).toSorted(), [
+          "stage",
+          "title",
+          "updatedAt",
+        ]);
+      }),
+    ),
+  );
+});

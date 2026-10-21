@@ -5,6 +5,7 @@
  */
 import {
   type MissionLink,
+  VIEW_HARD_LIMITS,
   VIEW_SOURCE_LIMITS,
   type ViewSourceFieldKind,
   type ViewSourceFields,
@@ -83,6 +84,13 @@ const normalize = (raw: unknown, kind: ViewSourceFieldKind): Normalized => {
       return typeof raw === "number" && Number.isFinite(raw)
         ? { value: raw }
         : { error: "not a number" };
+    case "series": {
+      if (!Array.isArray(raw)) return { error: "not a list of numbers" };
+      if (!raw.every((point) => typeof point === "number" && Number.isFinite(point))) {
+        return { error: "not a list of numbers" };
+      }
+      return { value: raw.slice(Math.max(0, raw.length - VIEW_HARD_LIMITS.chartPoints)) };
+    }
     case "time": {
       if (typeof raw !== "string") return { error: "not an ISO time" };
       const at = DateTime.make(raw);

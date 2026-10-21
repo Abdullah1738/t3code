@@ -62,6 +62,17 @@ describe("parseSourceOutput", () => {
     assert.isFalse(row !== undefined && Object.hasOwn(row, "secret"));
   });
 
+  it("keeps the last chart points of a series field", () => {
+    const series = { burn: "series" } as const;
+    const points = Array.from({ length: 70 }, (_, index) => index);
+    const parsed = parseSourceOutput(output([{ id: "a", burn: points }]), series);
+    assert.isTrue(parsed.ok);
+    if (!parsed.ok) return;
+    assert.deepStrictEqual(parsed.rows[0]?.burn, points.slice(10));
+    const bad = parseSourceOutput(output([{ id: "a", burn: [1, "2"] }]), series);
+    assert.isFalse(bad.ok);
+  });
+
   it("fails the run on bad output", () => {
     const cases = [
       ["not json", "not JSON"],
