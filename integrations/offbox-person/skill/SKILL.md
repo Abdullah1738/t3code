@@ -124,7 +124,9 @@ Screenshots are transient: `down` deletes `$TMPDIR/offbox-person/<person>/`. Don
   mirror over a Dropbox repo with a different `config`.
 - `down` and `save` start it in the background once the box has stopped (it waits for a running
   backup instead of skipping). LaunchAgent `com.abdullah.offbox-person-backup` (installed by
-  `integrations/offbox-person/install.zsh`) runs `--all` at login and every 6 h.
+  `integrations/offbox-person/install.zsh`) runs `--all` at login and every 6 h. It runs a copy at
+  `~/.local/share/offbox-person/bin/` because launchd may not read the external drive, so re-run
+  `install.zsh` after changing the script.
 - Status: `~/.local/share/offbox-person/state/<person>-backup.json` (`ok`, `stage`,
   `last_success_ts`, `last_boat_snapshot`, `last_restic_snapshot`), log
   `<person>-backup-YYYYMM.log` (counts only, never her file names). A failure or a lock stuck over

@@ -9,6 +9,10 @@ mkdir -p "$HOME/.local/bin" "$HOME/.config/opencode/skills" "$HOME/.local/share/
 ln -sfn "$here/bin/offbox-person" "$HOME/.local/bin/offbox-person"
 ln -sfn "$here/bin/offbox-person-backup" "$HOME/.local/bin/offbox-person-backup"
 ln -sfn "$here/skill" "$HOME/.config/opencode/skills/offbox-person"
+# launchd's /bin/bash may not read the external drive (macOS privacy: "Operation not permitted"),
+# so the LaunchAgent runs an installed copy from the home folder.
+mkdir -p "$HOME/.local/share/offbox-person/bin"
+install -m 755 "$here/bin/offbox-person-backup" "$HOME/.local/share/offbox-person/bin/offbox-person-backup"
 
 # Reload only when the plist changed: a reload stops a backup that is running.
 loaded=0

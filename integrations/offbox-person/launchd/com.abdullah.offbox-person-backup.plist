@@ -7,7 +7,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/bash</string>
-		<string>/Users/ardud/.local/bin/offbox-person-backup</string>
+		<string>/Users/ardud/.local/share/offbox-person/bin/offbox-person-backup</string>
 		<string>--all</string>
 	</array>
 	<key>EnvironmentVariables</key>
