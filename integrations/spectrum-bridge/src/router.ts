@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { MAX_INCOMING_BYTES, MAX_INCOMING_FILES, MAX_PREVIEW_BYTES, prepareIncoming } from "./inbound-files.ts";
 import { stripInternalText } from "./formatting.ts";
 import { assistantText, type FilePart, type ChatBackend, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest } from "./openchamber.ts";
+import type { ChatContext } from "./chats.ts";
 import { classifyDownloadFailure, ownerChatGuid, TransportError, type NormalizedInbound, type Photon } from "./photon.ts";
 import { telegramNotificationLookup, type TelegramReference } from "./telegram-lookup.ts";
 import { imessagePreferences } from "./preferred-model.ts";
@@ -96,6 +97,8 @@ type Options = {
   failureNoticeMs?: number;
   /** Fixed event names and safe codes only; never message text. */
   log?: (event: string, code?: string) => void;
+  /** Sendblue mode: which chat this router serves and who is in it. chatGuid is then the ChatKey. Unset in Photon mode. */
+  context?: ChatContext;
 };
 /** A session whose turn the model provider refused; the next inbound batch starts a fresh session. */
 type Refused = { sessionId: string; generation: number; at: number; messageIds: string[] };
@@ -328,7 +331,8 @@ export class Router {
     private readonly transport: Pick<Photon, "typing" | "read" | "downloadAttachment"> & Partial<Pick<Photon, "getMessage">>,
     private readonly options: Options,
   ) {
-    if (!ownerChatGuid(options.chatGuid, options.owner)) throw new Error("Invalid owner chat");
+    if (!options.context && !ownerChatGuid(options.chatGuid, options.owner)) throw new Error("Invalid owner chat");
+    if (options.context && options.context.chat.key !== options.chatGuid) throw new Error("Chat key mismatch");
     if (!isAbsolute(options.skillPath) || /[\x00-\x1f\x7f]/.test(options.skillPath)) throw new Error("Expected absolute skill path");
     if (!isAbsolute(options.alertSkillPath) || /[\x00-\x1f\x7f]/.test(options.alertSkillPath)) throw new Error("Expected absolute alert skill path");
     if (!isAbsolute(options.alertSocketPath) || /[\x00-\x1f]/.test(options.alertSocketPath)) throw new Error("Expected absolute alert socket path");
