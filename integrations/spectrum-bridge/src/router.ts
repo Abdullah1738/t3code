@@ -309,6 +309,20 @@ export function replyText(text: string): string {
   return visible.split("\n").at(-1)!.trim() === NO_REPLY ? "" : trimmed;
 }
 
+/** Ids of assistant records whose OpenCode message, read as a whole, ends in NO_REPLY. */
+export function quietMessages(records: readonly MessageRecord[]): Set<string> {
+  const blocks = new Map<string, Extract<MessageRecord, { type: "assistant" }>[]>();
+  for (const record of records) {
+    if (record.type !== "assistant" || typeof record.nativeMessage !== "string") continue;
+    blocks.set(record.nativeMessage, [...blocks.get(record.nativeMessage) ?? [], record]);
+  }
+  const quiet = new Set<string>();
+  for (const group of blocks.values()) {
+    if (group.length > 1 && !replyText(group.map(assistantText).join("\n"))) for (const record of group) quiet.add(record.id);
+  }
+  return quiet;
+}
+
 const consentWords = (text: string) => text.normalize("NFKC").toLowerCase().replace(/['’`]/g, "")
   .replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(" ").filter(Boolean);
 
@@ -2250,13 +2264,21 @@ export class Router {
       const replies = (end < 0 ? after : after.slice(0, end))
         .filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = replies.at(-1);
-      // The last word of each earlier run still goes out, ahead of the final one.
+      // The last word of each earlier run still goes out, ahead of the final
+      // one, and so does a step the model stopped on before a steered text
+      // came in (`answer`, see opencode-steps.ts). Narration never does.
+      // One message written as several text blocks is judged whole: a NO_REPLY
+      // at its end keeps every block of it out of the chat.
+      const scope = end < 0 ? [] : after.slice(0, end);
+      const quiet = quietMessages(scope);
       const earlier: Extract<MessageRecord, { type: "assistant" }>[] = [];
       let last: MessageRecord | undefined;
-      for (const m of end < 0 ? [] : after.slice(0, end)) {
-        if (m.type === "idle" && last?.type === "assistant" && last.id !== final?.id) earlier.push(last);
+      for (const m of scope) {
+        if (m.type === "idle" && last?.type === "assistant" && last.id !== final?.id && !earlier.includes(last)) earlier.push(last);
+        if (m.type === "assistant" && m.answer === true && m.id !== final?.id) earlier.push(m);
         if (m.type === "assistant" || m.type === "idle") last = m;
       }
+      for (let i = earlier.length - 1; i >= 0; i--) if (quiet.has(earlier[i]!.id)) earlier.splice(i, 1);
       if (idle && idle.id !== this.seenIdle) {
         this.seenIdle = idle.id;
         this.stage("run-completed-seen", turn.inboundId ?? turn.messageId);

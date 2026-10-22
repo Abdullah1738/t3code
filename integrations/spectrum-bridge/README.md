@@ -260,6 +260,12 @@ router uses, so the router is unchanged.
   `GET /threads/by-native/:ses`. A stored route the mapping does not know (404)
   is dropped while idle, so the next text starts a fresh chat.
 - Context reset: Robob threads keep one thread across `/new` and rotation.
+- Replies: a run's last message always goes out. An earlier message goes out
+  too when the model stopped there (texts steered in mid-run arrive after it),
+  read read-only as `finish: "stop"` from OpenCode's own database
+  (`~/.local/share/opencode/opencode.db`); steps that went on to call tools
+  are narration and stay in the thread. If that database can't be read, only
+  the last message of each run goes out.
   The bridge doesn't reset anything itself; it queues a `reset:` row asking
   the agent to call `t3_context_reset` (`NEW_CHAT_NUDGE` / `ROTATE_NUDGE` in
   `src/router.ts`), so the server's own rules (background work, one reset at a
