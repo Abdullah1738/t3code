@@ -71,6 +71,19 @@ describe("send, poll, and app commands", () => {
     expect(await loadCommandPayload(command)).toEqual(command.body!);
   });
 
+  test("app --to keeps the caller session and validates the recipient slug", async () => {
+    const args = ["app", "--url", "https://ride.example.com/", "--caption", "Your ride", ...session];
+    const command = parseCommand([...args, "--to", "moni", "--summary", "Open ride"]);
+    expect(await loadCommandPayload(command)).toEqual({ url: "https://ride.example.com/", caption: "Your ride",
+      dedupeKey: "k-1", sessionId: "s-1", to: "moni", summary: "Open ride" });
+    for (const to of ["", "Moni", "../moni", "moni name", "x".repeat(101)]) {
+      expect(() => parseCommand([...args, "--to", to])).toThrow("Invalid chat slug");
+    }
+    expect(() => parseCommand([...args, "--to", "moni", "--to", "owner"])).toThrow("Duplicate command option");
+    expect(() => parseCommand(["app", "--url", "https://ride.example.com/", "--caption", "Your ride", "--key", "k", "--to", "moni"]))
+      .toThrow("--session is required");
+  });
+
   test("the CLI prints only the queue acknowledgement and hides response bodies", async () => {
     const home = await fs.mkdtemp(join(os.tmpdir(), "spectrum-cli-features-"));
     const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));

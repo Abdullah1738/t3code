@@ -120,6 +120,13 @@ under `~/.config/spectrum-bridge/`.
   `metadataWarnings` for a missing `<title>`, `og:title`, `og:description` or
   `og:image`, and served pages get relative `og:image`/`og:url` made absolute
   so link previews load.
+- In Sendblue mode, `app --to moni --session OWNER_SESSION --key KEY --url PUBLIC_HTTPS_URL --caption "Your ride"`
+  queues a card in that chat, like `send --to`. Cross-chat sends require the
+  current owner's session, including when the recipient is an admin. Omit
+  `--to` to send to the session's own chat. Use a publicly reachable URL for
+  Moni and other recipients (`share`, rather than the owner's tailnet-only
+  `publish` URL). Reuse the key only for an identical card to the same recipient;
+  the acknowledgement confirms queueing, not delivery.
 - Secure forms: `secret-request --session S --key K --purpose P --field name:Label[:type]`
   sends a one-time app card (15 minutes) for credentials. Submitted values are
   stored in `~/.config/spectrum-bridge/secrets/` (0600, never in the chat,

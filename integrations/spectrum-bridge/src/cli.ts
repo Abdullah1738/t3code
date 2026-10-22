@@ -69,7 +69,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   guests: ["session"],
   "guest-send": ["address", "text", "session", "key"],
   "share-contact": ["address", "chat", "session"],
-  app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key"],
+  app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key", "to"],
   "secret-request": ["purpose", "field", "card", "session", "key"],
   secret: ["token", "field", "forget"],
   publish: ["port", "app"],
@@ -345,6 +345,7 @@ export function parseCommand(args: string[]): Command {
       const url = required(values.url, "--url");
       if (!validAppUrl(url)) throw new CliError("--url must be an absolute https URL");
       const body: Record<string, string> = { url, caption: label(required(values.caption, "--caption"), "--caption", 200)!, ...session() };
+      if (values.to !== undefined) body.to = chatSlug(values.to);
       for (const [option, field, max] of [["subcaption", "subcaption", 200], ["trailing", "trailingCaption", 200],
         ["trailing-subcaption", "trailingSubcaption", 200], ["summary", "summary", 500]] as const) {
         const value = label(values[option], `--${option}`, max);
