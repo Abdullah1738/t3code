@@ -3,6 +3,7 @@ import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
 } from "./control.ts";
+import { nativeMessageId, opencodeFinishes, type StepFinishes } from "./opencode-steps.ts";
 import { imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 
@@ -117,6 +118,8 @@ export interface RobobBackendOptions extends ControlConfigOptions {
   subdir?: string;
   /** Title for new threads, e.g. the person's or group's name. */
   title?: string;
+  /** How each assistant step ended, read from OpenCode (see opencode-steps.ts). */
+  finishes?: StepFinishes;
 }
 
 const CHATS_DIR = "chats";
@@ -128,6 +131,9 @@ export class RobobBackend implements ChatBackend {
   private readonly chatRoot: string;
   private readonly directories: ThreadDirectories;
   private readonly native = new Map<string, string>();
+  private readonly finishes: StepFinishes;
+  /** A step's finish never changes once written, so each is looked up once. */
+  private readonly finished = new Map<string, string>();
 
   constructor(private readonly options: RobobBackendOptions) {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
@@ -135,6 +141,7 @@ export class RobobBackend implements ChatBackend {
     if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
+    this.finishes = options.finishes ?? opencodeFinishes();
   }
 
   /** Thread id for a stored route id. `ses_` ids resolve through the OpenCode import mapping. */
@@ -183,7 +190,7 @@ export class RobobBackend implements ChatBackend {
 
   /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
   forChat(subdir: string, title: string): RobobBackend {
-    return new RobobBackend({ ...this.options, client: this.client, subdir, title });
+    return new RobobBackend({ ...this.options, client: this.client, finishes: this.finishes, subdir, title });
   }
 
   private chatFolder(): string {
@@ -256,7 +263,31 @@ export class RobobBackend implements ChatBackend {
     const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
     // Like the OpenChamber pager: the newest page, extended back to `until` when it is present.
     const start = found >= 0 ? Math.min(found, Math.max(0, records.length - limit)) : Math.max(0, records.length - limit);
-    return records.slice(start);
+    return this.markAnswers(records.slice(start));
+  }
+
+  /**
+   * Marks finished assistant steps with `answer`: true when the model stopped
+   * there (it said something to the chat), false when it went on to call tools
+   * (narration). Steps OpenCode can't tell us about stay unmarked. Each step
+   * also carries its OpenCode message id (`nativeMessage`), so the router can
+   * judge a message written as several text blocks as a whole.
+   */
+  private markAnswers(records: MessageRecord[]): MessageRecord[] {
+    for (const record of records) {
+      const native = record.type === "assistant" ? nativeMessageId(record.id) : undefined;
+      if (native) record.nativeMessage = native;
+    }
+    const steps = records.filter((record): record is Extract<MessageRecord, { type: "assistant" }> => record.type === "assistant" && record.finish === "stop");
+    // Clear before working out what's missing, so this page's steps are looked up again rather than lost.
+    if (this.finished.size > 5_000) this.finished.clear();
+    const missing = steps.map(step => step.id).filter(id => !this.finished.has(id));
+    if (missing.length) for (const [id, finish] of this.finishes(missing)) this.finished.set(id, finish);
+    for (const step of steps) {
+      const finish = this.finished.get(step.id);
+      if (finish !== undefined) step.answer = finish === "stop";
+    }
+    return records;
   }
 
   async promptAccepted(id: string, _directory: string, messageId: string): Promise<boolean> {

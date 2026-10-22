@@ -1,9 +1,11 @@
 /**
  * Group chats: Robob is a silent observer (owner rule, 2026-10-22). A group
  * batch wakes the agent only when someone addresses him: by name, by a swipe
- * reply to one of his messages, or as a follow-up while he is engaged (a turn
- * is running, or he replied in the last few minutes). Everything else is kept
- * as context for the next turn he is woken for, and nothing is sent.
+ * reply to one of his messages, or when the group judge (group-judge.ts) says
+ * an unnamed message is meant for him. Without the judge, an unnamed message
+ * counts only as a follow-up while he is engaged (a turn is running, or he
+ * asked that person something in the last few minutes). Everything else is
+ * kept as context for the next turn he is woken for, and nothing is sent.
  */
 
 /**
@@ -88,12 +90,6 @@ export function classifyGroupMessage(message: GroupMessage): GroupVerdict {
   if (mentionsRobob(text)) return "addressed";
   if (message.repliesToRobob || message.engaged) return "addressed";
   return "observe";
-}
-
-/** Explicitly addressed (named or a swipe reply), as opposed to woken only as a follow-up. */
-export function explicitlyAddressed(message: GroupMessage): boolean {
-  const text = message.text.trim();
-  return !isTapback(text) && (mentionsRobob(text) || !!message.repliesToRobob);
 }
 
 /** Appends observed lines, keeping the newest within both caps. */

@@ -164,6 +164,139 @@ class RobobState(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_current_native_session(self):
+        con = sqlite3.connect(self.db)
+        con.executescript("""
+            CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY,
+                                                              active_provider_thread_id TEXT);
+            CREATE TABLE orchestration_v2_projection_provider_threads (
+              provider_thread_id TEXT PRIMARY KEY, thread_id TEXT, owner_node_id TEXT,
+              last_run_ordinal INTEGER, updated_at TEXT, payload_json TEXT);
+            CREATE TABLE orchestration_v2_projection_runs (
+              run_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, provider_thread_id TEXT,
+              status TEXT, requested_at TEXT, completed_at TEXT, payload_json TEXT);
+            CREATE TABLE orchestration_v2_projection_run_attempts (
+              attempt_id TEXT PRIMARY KEY, thread_id TEXT, run_id TEXT,
+              provider_thread_id TEXT, status TEXT, payload_json TEXT);
+        """)
+        natives = {}
+
+        def pt(ptid, thread_id, native, last_run=None, owner=None):
+            natives[ptid] = native
+            ref = None if native is None else {"nativeId": native}
+            con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?,?)",
+                        (ptid, thread_id, owner, last_run, "2026-10-01T00:00:00Z",
+                         json.dumps({"nativeThreadRef": ref})))
+
+        def run(thread_id, n, ptid, status="completed", started=True,
+                at="2026-09-01T00:00:00.000Z", start_at=None, attempt_started=None):
+            # the run's active attempt is on ptid; attempt_started=False is an attempt
+            # that never got going while the run kept an earlier startedAt
+            start_at = start_at or at
+            if attempt_started is None:
+                attempt_started = started
+            run_id, attempt_id = f"run:{thread_id}:{n}", f"attempt:{thread_id}:{n}"
+            payload = {"activeAttemptId": attempt_id}
+            if started:
+                payload["startedAt"] = start_at
+            done = None if status in ("queued", "running") else start_at
+            con.execute("INSERT INTO orchestration_v2_projection_runs VALUES (?,?,?,?,?,?,?,?)",
+                        (run_id, thread_id, n, ptid, status, at, done, json.dumps(payload)))
+            attempt = {"startedAt": start_at if attempt_started else None,
+                       "nativeThreadId": natives[ptid] if attempt_started else None,
+                       "completedAt": done}
+            con.execute("INSERT INTO orchestration_v2_projection_run_attempts VALUES (?,?,?,?,?,?)",
+                        (attempt_id, thread_id, run_id, ptid, status, json.dumps(attempt)))
+
+        def runs(thread_id, *ptids):
+            for n, ptid in enumerate(ptids, 1):
+                run(thread_id, n, ptid)
+
+        # reset: old OpenCode session, then a newer one
+        pt("pt:reset-old", "reset", "ses_old")
+        pt("pt:reset-new", "reset", "ses_new")
+        runs("reset", "pt:reset-old", "pt:reset-new")
+        # switched from OpenCode to another provider
+        pt("pt:switch-old", "switch", "ses_switch")
+        pt("pt:switch-new", "switch", "claude-native-id")
+        runs("switch", "pt:switch-old", "pt:switch-new")
+        # a native subagent's child thread (owned by a parent node, no runs of its own)
+        pt("pt:child", "child", "ses_child", owner="node:parent")
+        # active provider thread without a native ref yet
+        pt("pt:fresh", "fresh", None)
+        # startup recovery rewrote an old provider thread and moved the pointer back
+        pt("pt:back-old", "back", "ses_back_old")
+        pt("pt:back-new", "back", "ses_back_new")
+        runs("back", "pt:back-old", "pt:back-new")
+        # a dispatched reset whose new session doesn't exist yet, pointer moved back
+        pt("pt:pending-old", "pending", "ses_pending_old", 1)
+        pt("pt:pending-new", "pending", None, 2)
+        runs("pending", "pt:pending-old", "pt:pending-new")
+        # a handoff restarted the newest run on another provider thread with the same
+        # ordinal, then recovery moved the pointer back to the old one
+        pt("pt:hand-old", "hand", "ses_hand_old", 3)
+        pt("pt:hand-new", "hand", "ses_hand_new", 3)
+        runs("hand", "pt:hand-old", "pt:hand-old", "pt:hand-new")
+        # an imported thread that later got a second provider thread without a run
+        pt("pt:import-a", "import", "ses_import_a")
+        pt("pt:import-b", "import", "ses_import_b")
+        # a provider switch queued back onto an old provider thread, cancelled before it
+        # started, then recovery moved the pointer to that old thread too
+        pt("pt:queued-a", "queued", "ses_queued_a")
+        pt("pt:queued-b", "queued", "ses_queued_b")
+        runs("queued", "pt:queued-a", "pt:queued-b")
+        run("queued", 3, "pt:queued-a", status="cancelled", started=False)
+        # running on B while the pointer says A
+        pt("pt:busy-a", "busy", "ses_busy_a")
+        pt("pt:busy-b", "busy", "ses_busy_b")
+        runs("busy", "pt:busy-a")
+        run("busy", 2, "pt:busy-b", status="running")
+        # a turn running on the thread's only session
+        pt("pt:live", "live", "ses_live")
+        run("live", 1, "pt:live", status="running")
+        # last turn requested recently
+        pt("pt:recent", "recent", "ses_recent")
+        run("recent", 1, "pt:recent", at="2026-10-20T00:00:00.000Z")
+        # a steering restart moved the newest run back to old provider thread A and
+        # failed before that attempt started; the run kept its earlier startedAt
+        pt("pt:steer-a", "steer", "ses_steer_a")
+        pt("pt:steer-b", "steer", "ses_steer_b")
+        runs("steer", "pt:steer-a")
+        run("steer", 2, "pt:steer-a", status="failed", attempt_started=False)
+        # held since September, started and failed recently
+        pt("pt:held", "held", "ses_held")
+        run("held", 1, "pt:held", status="failed", start_at="2026-10-21T00:00:00.000Z")
+        con.executemany("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)", [
+            ("reset", "pt:reset-new"), ("switch", "pt:switch-new"), ("child", "pt:child"),
+            ("fresh", "pt:fresh"), ("idle", None), ("back", "pt:back-old"),
+            ("pending", "pt:pending-old"), ("hand", "pt:hand-old"), ("import", "pt:import-a"),
+            ("queued", "pt:queued-a"), ("busy", "pt:busy-a"), ("live", "pt:live"),
+            ("recent", "pt:recent"), ("steer", "pt:steer-a"), ("held", "pt:held")])
+        con.commit()
+        con.close()
+        with clean_env(ROBOB_STATE_DB=self.db):
+            self.assertEqual(backend.current_native_session("reset"), "ses_new")
+            self.assertEqual(backend.current_native_session("switch"), "claude-native-id")
+            self.assertEqual(backend.current_native_session("child"), "ses_child")
+            self.assertIsNone(backend.current_native_session("fresh"))
+            self.assertIsNone(backend.current_native_session("idle"))
+            self.assertIsNone(backend.current_native_session("missing"))
+            self.assertIsNone(backend.current_native_session("back"))
+            self.assertIsNone(backend.current_native_session("pending"))
+            self.assertIsNone(backend.current_native_session("hand"))
+            self.assertIsNone(backend.current_native_session("import"))
+            self.assertIsNone(backend.current_native_session("queued"))
+            self.assertIsNone(backend.current_native_session("busy"))
+            self.assertIsNone(backend.current_native_session("live"))
+            self.assertIsNone(backend.current_native_session("steer"))
+            quiet = "2026-10-01T00:00:00.000Z"
+            self.assertEqual(backend.current_native_session("recent"), "ses_recent")
+            self.assertIsNone(backend.current_native_session("recent", quiet))
+            self.assertEqual(backend.current_native_session("reset", quiet), "ses_new")
+            self.assertEqual(backend.current_native_session("child", quiet), "ses_child")
+            self.assertEqual(backend.current_native_session("held"), "ses_held")
+            self.assertIsNone(backend.current_native_session("held", quiet))
+
     def test_scheduled_task_sessions(self):
         make_state_db(self.db)
         with clean_env(ROBOB_STATE_DB=self.db):
@@ -249,19 +382,36 @@ class ReaperProtection(unittest.TestCase):
             self.assertEqual(session_reaper.backlog_ids(), set())
 
     def test_archive_robob_thread(self):
+        q = "2026-09-22T00:00:00.000Z"
         with clean_env(MEMORY_BACKEND="robob"), \
                 mock.patch.object(backend, "thread_for_session", return_value=None):
-            self.assertIsNone(session_reaper.archive_robob_thread("ses_x"))
+            self.assertEqual(session_reaper.archive_robob_thread("ses_x", q), (None, False))
+        current = {"threadId": "t1", "archived": False}
         with clean_env(MEMORY_BACKEND="robob"), \
-                mock.patch.object(backend, "thread_for_session", return_value={"threadId": "t1", "archived": False}), \
+                mock.patch.object(backend, "thread_for_session", return_value=current), \
+                mock.patch.object(backend, "current_native_session", return_value="ses_x") as cur, \
                 mock.patch.object(backend, "archive_thread") as arch:
-            self.assertEqual(session_reaper.archive_robob_thread("ses_x"), "t1")
+            self.assertEqual(session_reaper.archive_robob_thread("ses_x", q), ("t1", True))
+            cur.assert_called_once_with("t1", q)
             arch.assert_called_once_with("t1")
         with clean_env(MEMORY_BACKEND="robob"), \
-                mock.patch.object(backend, "thread_for_session", return_value={"threadId": "t1", "archived": True}), \
+                mock.patch.object(backend, "thread_for_session", return_value={**current, "archived": True}), \
+                mock.patch.object(backend, "current_native_session", return_value="ses_x"), \
                 mock.patch.object(backend, "archive_thread") as arch:
-            session_reaper.archive_robob_thread("ses_x")
+            session_reaper.archive_robob_thread("ses_x", q)
             arch.assert_not_called()
+
+    def test_archive_skips_thread_that_moved_on(self):
+        # A context reset or provider switch leaves the old session bound to the live thread.
+        for active in ("ses_new", "claude-native-id", None):
+            with clean_env(MEMORY_BACKEND="robob"), \
+                    mock.patch.object(backend, "thread_for_session",
+                                      return_value={"threadId": "t1", "archived": False}), \
+                    mock.patch.object(backend, "current_native_session", return_value=active), \
+                    mock.patch.object(backend, "archive_thread") as arch:
+                self.assertEqual(session_reaper.archive_robob_thread("ses_old", "2026-09-22T00:00:00.000Z"),
+                                 ("t1", False))
+                arch.assert_not_called()
 
     def test_by_native_404_is_no_thread(self):
         with mock.patch.object(backend, "control", return_value=(404, {"ok": False})):

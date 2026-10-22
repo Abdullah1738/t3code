@@ -121,8 +121,11 @@ function fakeControl() {
     thread.messages.push({ messageId: `assistant-${thread.messages.length}`, runId: run.runId, role: "assistant", text, streaming: false, createdBy: "agent", createdAt: now(), updatedAt: now() });
     run.status = status;
   };
-  const backend = (chatRoot = "/chats") => new RobobBackend({ chatRoot, url, token: "test-token", model: async () => ({ providerID: "opus", modelID: "claude-opus-5-5", variant: "high" }) });
-  return { url, threads, natives, calls, projects, flags, reply, backend };
+  const finishes = new Map<string, string>();
+  const lookups: string[][] = [];
+  const backend = (chatRoot = "/chats") => new RobobBackend({ chatRoot, url, token: "test-token", model: async () => ({ providerID: "opus", modelID: "claude-opus-5-5", variant: "high" }),
+    finishes: ids => { lookups.push([...ids]); return new Map(ids.flatMap(id => finishes.has(id) ? [[id, finishes.get(id)!] as const] : [])); } });
+  return { url, threads, natives, calls, projects, flags, reply, backend, finishes, lookups };
 }
 
 test("backend switch defaults to OpenChamber and rejects unknown values", () => {
@@ -442,5 +445,81 @@ test("the router runs a full iMessage turn on the Robob backend", async () => {
   await router.tick();
   const replies = store.pendingOutbox().filter(item => item.kind === "conversation");
   expect(replies.map(item => [item.text, item.sessionId])).toEqual([["All good here.", "thread-2"]]);
+  expect(store.get("activeTurn")).toBeNull();
+});
+
+test("a full finish cache is emptied before the page is checked, so no step on it loses its answer", () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const finished: Map<string, string> = backend["finished"];
+  for (let i = 0; i < 5_000; i++) finished.set(`old-${i}`, "stop");
+  finished.set("cached", "stop");
+  control.finishes.set("cached", "stop");
+  control.finishes.set("fresh", "tool-calls");
+  const step = (id: string) => ({ id, type: "assistant" as const, content: [{ type: "text" as const, text: id }], finish: "stop", time: { created: 1, completed: 1 } });
+  const marked = backend["markAnswers"]([step("cached"), step("fresh")]);
+  expect(marked.map(record => record.type === "assistant" && record.answer)).toEqual([true, false]);
+});
+
+test("assistant steps carry their OpenCode message id, so blocks of one message can be judged together", () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const block = (part: number) => `message:provider:opencode:native-item:${encodeURIComponent(`msg_quiet:text:${part}`)}`;
+  control.finishes.set(block(0), "stop");
+  control.finishes.set(block(1), "stop");
+  const step = (id: string) => ({ id, type: "assistant" as const, content: [{ type: "text" as const, text: id }], finish: "stop", time: { created: 1, completed: 1 } });
+  const marked = backend["markAnswers"]([step(block(0)), step(block(1)), step("assistant-plain")]);
+  expect(marked.map(record => record.type === "assistant" && [record.answer, record.nativeMessage])).toEqual([
+    [true, "msg_quiet"], [true, "msg_quiet"], [undefined, undefined],
+  ]);
+});
+
+test("a background run's answer before two steered texts reaches the chat along with the last one", async () => {
+  // 22 Oct, Home group: a finished delegated task woke the thread, Robob said the
+  // car was booked, two of Moni's texts were steered in, and only the next answer
+  // went out. Control lists the steered texts first (sent time), so order alone can't tell.
+  const control = fakeControl();
+  const backend = control.backend();
+  const store = new Store(":memory:");
+  stores.push(store);
+  const transport: Pick<Photon, "typing" | "read" | "downloadAttachment"> = {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  };
+  const router = new Router(store, backend, transport, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0,
+  });
+  store.acceptInbound("in-1", { id: "in-1", text: "Book a car for 11:50", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  const route = store.get<{ id: string }>("route")!;
+  control.reply(route.id, "On it, booking now.");
+  await router.tick();
+  expect(store.get("activeTurn")).toBeNull();
+  const thread = control.threads.get(route.id)!;
+  const runId = `run:thread:${thread.threadId}:ordinal:2`;
+  const at = (s: number) => new Date(Date.now() + s * 1000).toISOString();
+  const native = (id: string) => `message:provider:opencode:native-item:${encodeURIComponent(`${id}:text:0`)}`;
+  thread.runs.push({ runId, ordinal: 2, status: "completed" });
+  thread.messages.push(
+    { messageId: "wake", runId, role: "user", text: "Delegated task finished", streaming: false, createdBy: "agent", createdAt: at(1), updatedAt: at(1) },
+    { messageId: native("msg_check"), runId, role: "assistant", text: "Checking the booking status.", streaming: false, createdBy: "agent", createdAt: at(1.5), updatedAt: at(1.5) },
+    { messageId: `${sentMessagePrefix(thread.threadId)}steer-1`, runId, role: "user", text: "Moni: Robob can u draft a message for this pls", streaming: false, createdBy: "system", createdAt: at(2), updatedAt: at(2) },
+    { messageId: `${sentMessagePrefix(thread.threadId)}steer-2`, runId, role: "user", text: "Moni: (reply) okay what?", streaming: false, createdBy: "system", createdAt: at(3), updatedAt: at(3) },
+    { messageId: native("msg_booked"), runId, role: "assistant", text: "Wheely's booked for tomorrow at 11:50.", streaming: false, createdBy: "agent", createdAt: at(4), updatedAt: at(4) },
+    { messageId: native("msg_draft"), runId, role: "assistant", text: "Here's the draft for the clinic.", streaming: false, createdBy: "agent", createdAt: at(5), updatedAt: at(6) },
+  );
+  control.finishes.set(native("msg_check"), "tool-calls");
+  control.finishes.set(native("msg_booked"), "stop");
+  control.finishes.set(native("msg_draft"), "stop");
+  for (let i = 0; i < 4; i++) await router.tick();
+  const replies = store.pendingOutbox().filter(item => item.kind === "conversation").map(item => [item.id, item.text]);
+  expect(replies).toEqual([
+    [expect.stringMatching(/^reply:1:assistant-/), "On it, booking now."],
+    [`reply:1:${native("msg_booked")}`, "Wheely's booked for tomorrow at 11:50."],
+    [`reply:1:${native("msg_draft")}`, "Here's the draft for the clinic."],
+  ]);
+  // Narration (a step that went on to call tools) stays out, and each step's
+  // finish is looked up once however often the router polls.
+  expect(control.lookups.flat().filter(id => id === native("msg_booked"))).toHaveLength(1);
   expect(store.get("activeTurn")).toBeNull();
 });

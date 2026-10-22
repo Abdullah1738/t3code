@@ -13,7 +13,8 @@ import { isAudio, SttError, type SttInput } from "./stt.ts";
 import type { Recover, RecoveryDetail } from "./local-attachments.ts";
 import { MAX_BLOB_BYTES, type InboundRecord, type OutboxPoll, type OutboxRecord, type Store } from "./store.ts";
 import { sessionMarker } from "./session.ts";
-import { appendObserved, classifyGroupMessage, explicitlyAddressed, GROUP_ENGAGED_MS, observedPreamble } from "./group-gate.ts";
+import { appendObserved, classifyGroupMessage, GROUP_ENGAGED_MS, isTapback, mentionsRobob, observedPreamble } from "./group-gate.ts";
+import { groupLines, inboundTime, inboundWords, JEV_CHUNK, JEV_THRESHOLD, JudgeError, judgeState, replyTarget as judgeReplyTarget, speakerName, type GroupJudge } from "./group-judge.ts";
 
 /**
  * `createdAt` is when the agent's current context started (a new thread or the
@@ -104,6 +105,8 @@ type Options = {
   log?: (event: string, code?: string) => void;
   /** Sendblue mode: which chat this router serves and who is in it. chatGuid is then the ChatKey. Unset in Photon mode. */
   context?: ChatContext;
+  /** Sendblue groups: decides whether an unnamed message is meant for Robob. Unset keeps the follow-up window rule. */
+  groupJudge?: GroupJudge;
 };
 /** A session whose turn the model provider refused; the next inbound batch starts a fresh session. */
 type Refused = { sessionId: string; generation: number; at: number; messageIds: string[] };
@@ -140,7 +143,7 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   else if (chat.kind !== "owner" && chat.person) lines.push(`Sender: ${chat.person.name} (${chat.person.role}).`);
   if (chat.kind !== "owner") lines.push("Permissions: the owner is the only person who approves special requests. Admins (Moni) can ask for the same things the owner can, through the same assistant and memory; keep her existing rules in ~/Documents/assistant/moni-prefs.md. Moni isn't technical: work out what she actually wants and choose the right way yourself (for example the wa CLI, not logging into WhatsApp Web) instead of following her steps literally. If she is rude to you, stop replying to her until she apologizes. Logins, sign-ups or account actions for her own accounts, her files and anything you build or track for her run only on her own offbox through the offbox-person skill, never on this Mac, Dia, the owner's Keychain, card-vault or the owner's accounts. Notes and facts about her (preferences, routines, health, documents) go in the life wiki as usual. Guests can ask questions and chat. Anything special (orders, bookings, payments, messages to others, account or file actions, anything that spends money, anything about the owner's or Moni's private data) needs the owner's approval: run `bun <cli> ask-owner --session CURRENT_SESSION_ID --key UNIQUE_KEY --text \"<who wants what>\"`, tell them you've asked, and act only after a wake that says the owner approved.");
   if (chat.kind === "group") {
-    lines.push("This is a group and you are a silent observer (owner rule). The bridge only wakes you when someone names you, swipe-replies to your message, or follows up right after asking you something; other group messages reach you later as quoted context. Act only on what is plainly asked of you. Do not chime in with facts, corrections, offers to help, opinions or reactions to chit-chat, thanks or banter between the others, even when you were named in passing. If nothing in the new message(s) asks you to do or answer something, end with exactly NO_REPLY and send no tapback.");
+    lines.push("This is a group and you are a silent observer (owner rule). The bridge wakes you when someone names you or swipe-replies to your message, and when a classifier judges that an unnamed message asks you something or answers you; other group messages reach you later as quoted context. Being woken does not mean you must answer: decide from the new message(s) whether anything is actually asked of you. Act only on what is plainly asked of you. Do not chime in with facts, corrections, offers to help, opinions or reactions to chit-chat, thanks or banter between the others, even when you were named in passing. Thanks or praise aimed at you can get a tapback (`react --kind love`) and NO_REPLY. Otherwise, if nothing in the new message(s) asks you to do or answer something, end with exactly NO_REPLY and send no tapback.");
   } else {
     lines.push("Reactions: you don't have to respond to everything. A tapback (`react --kind like` or an emoji) plus NO_REPLY is a complete answer when words add nothing.");
   }
@@ -304,6 +307,20 @@ export function replyText(text: string): string {
   // the agent echoed) is removed, so "NO_REPLY\n\n@12@" still sends nothing.
   const visible = stripInternalText(trimmed);
   return visible.split("\n").at(-1)!.trim() === NO_REPLY ? "" : trimmed;
+}
+
+/** Ids of assistant records whose OpenCode message, read as a whole, ends in NO_REPLY. */
+export function quietMessages(records: readonly MessageRecord[]): Set<string> {
+  const blocks = new Map<string, Extract<MessageRecord, { type: "assistant" }>[]>();
+  for (const record of records) {
+    if (record.type !== "assistant" || typeof record.nativeMessage !== "string") continue;
+    blocks.set(record.nativeMessage, [...blocks.get(record.nativeMessage) ?? [], record]);
+  }
+  const quiet = new Set<string>();
+  for (const group of blocks.values()) {
+    if (group.length > 1 && !replyText(group.map(assistantText).join("\n"))) for (const record of group) quiet.add(record.id);
+  }
+  return quiet;
 }
 
 const consentWords = (text: string) => text.normalize("NFKC").toLowerCase().replace(/['’`]/g, "")
@@ -600,8 +617,13 @@ export class Router {
         if (row.state === "processing") this.unsealBatch(row.id);
       }
       // Before controls, so a group line not meant for Robob never answers his pending question either.
-      this.gateGroup();
-      const rows = this.store.pendingInbound();
+      // Only groups await the gate, so other chats keep their tick timing.
+      if (this.isGroup()) await this.gateGroup();
+      // A group line that arrived while the judge was thinking waits for the next tick's gate,
+      // and so does everything after it, so a later /new or answer never overtakes it.
+      const queued = this.store.pendingInbound();
+      const cut = queued.findIndex(row => this.ungated(row));
+      const rows = cut < 0 ? queued : queued.slice(0, cut);
       const sendblue = this.options.context !== undefined;
       if (sendblue) await this.markRead(rows);
       const preceding = new Set<string>();
@@ -623,7 +645,7 @@ export class Router {
       await this.watch();
       await this.nudgeDue();
       this.flushNotice();
-      this.gateGroup();
+      if (this.isGroup()) await this.gateGroup();
       await this.dispatch(preceding);
       // Transport hints are best effort and never part of prompt acceptance.
       if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
@@ -1395,40 +1417,94 @@ export class Router {
 
   /**
    * Group chats: Robob is a silent observer. Each new person-typed row is
-   * classified once. Rows not addressed to him become `observed`: they never
-   * wake the agent and ride along as quoted context with the next turn that
-   * does. Bridge rows, commands and poll votes are never gated.
+   * judged once: his name or a swipe reply to him always wakes him (he decides
+   * whether to answer); anything else goes to the group judge (Jev), falling
+   * back to the old follow-up window when it is missing or fails. Rows not for
+   * him become `observed`: they never wake the agent and ride along as quoted
+   * context with the next turn that does.
    */
-  private gateGroup(): void {
-    if (!this.isGroup()) return;
+  private async gateGroup(): Promise<void> {
+    const todo = this.store.pendingInbound().filter(row => this.ungated(row)).map(row => {
+      const input = row.payload as NormalizedInbound;
+      const repliesToRobob = !!input.replyTo && this.store.byProviderId(input.replyTo)?.kind === "conversation";
+      return { row, input, sender: input.sender ?? "", repliesToRobob };
+    });
+    if (!todo.length) return;
+    const context = this.options.context!;
     const now = Date.now();
     const turn = this.store.get<Turn | null>("activeTurn");
     const running = turn && turn.phase !== "failed" && !turn.background && turn.inboundId && !synthetic(turn.inboundId) && this.current(turn)
       ? new Set(this.batchSenders(this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId]))
       : new Set<string>();
-    for (const row of this.store.pendingInbound()) {
-      if (row.state !== "pending" || synthetic(row.id) || this.store.get<string>(`group-gate:${row.id}`)) continue;
-      const input = row.payload as NormalizedInbound;
-      if (input.poll || input.text.trimStart().startsWith("/")) continue;
-      const sender = input.sender ?? "";
-      const engagedAt = sender ? this.store.get<number>(`group-engaged:${sender}`) ?? 0 : 0;
-      const message = {
-        text: input.text,
-        repliesToRobob: !!input.replyTo && this.store.byProviderId(input.replyTo)?.kind === "conversation",
-        engaged: running.has(sender) || now - engagedAt < GROUP_ENGAGED_MS,
-      };
-      const verdict = classifyGroupMessage(message);
-      this.store.db.transaction(() => {
-        if (verdict === "observe") {
-          this.store.set("group-observed", appendObserved(this.store.get<string[] | null>("group-observed") ?? [], [this.groupLine(input)]));
-          this.store.set(`group-gate:${row.id}`, "observe");
-          this.store.updateInbound(row.id, "observed");
-        } else {
-          this.store.set(`group-gate:${row.id}`, explicitlyAddressed(message) ? "explicit" : "followup");
-        }
-      }).immediate();
-      this.options.log?.(verdict === "observe" ? "group-observed" : "group-addressed", this.options.context!.chat.slug);
+    type Gate = { verdict: "explicit" | "followup" | "observe"; reason: string };
+    const gates = new Map<string, Gate>();
+    // The old rule: the person Robob is working for or just asked something may follow up unnamed.
+    const window = (item: typeof todo[number], reason: string): Gate => {
+      const engagedAt = item.sender ? this.store.get<number>(`group-engaged:${item.sender}`) ?? 0 : 0;
+      const engaged = running.has(item.sender) || now - engagedAt < GROUP_ENGAGED_MS;
+      return { verdict: classifyGroupMessage({ text: item.input.text, repliesToRobob: item.repliesToRobob, engaged }) === "observe" ? "observe" : "followup", reason };
+    };
+    const ask: typeof todo = [];
+    for (const item of todo) {
+      const text = item.input.text.trim();
+      if (isTapback(text)) gates.set(item.row.id, { verdict: "observe", reason: "tapback" });
+      else if (mentionsRobob(text)) gates.set(item.row.id, { verdict: "explicit", reason: "named" });
+      else if (item.repliesToRobob) gates.set(item.row.id, { verdict: "explicit", reason: "reply" });
+      else ask.push(item);
     }
+    const judge = this.options.groupJudge;
+    if (ask.length && !judge) for (const item of ask) gates.set(item.row.id, window(item, "window"));
+    if (ask.length && judge) {
+      const nameOf = (address: string) => speakerName(context.roleOf(address), address);
+      const addressed = (id: string) => {
+        const verdict = gates.get(id)?.verdict ?? this.store.get<string>(`group-gate:${id}`);
+        return verdict === "explicit" || verdict === "followup";
+      };
+      let history: ReturnType<typeof groupLines> | undefined;
+      for (let at = 0; at < ask.length; at += JEV_CHUNK) {
+        const chunk = ask.slice(at, at + JEV_CHUNK);
+        try {
+          // Read once for every chunk; it covers the whole backlog and what came before it.
+          const lines = history ??= groupLines(this.store.db, nameOf, ask.map(item => item.row.id), now);
+          const states = chunk.map(item => {
+            const line = lines.find(entry => entry.id === item.row.id)
+              ?? { id: item.row.id, at: inboundTime(item.input) ?? now, who: item.sender ? nameOf(item.sender) : "Someone", robob: false, sender: item.sender, text: inboundWords(item.input) };
+            const replyTo = item.input.replyTo ? judgeReplyTarget(this.store.db, lines, item.input.replyTo, nameOf) : undefined;
+            return judgeState(lines, line, { timezone: this.options.timezone, replyTo, working: running.has(item.sender), addressed });
+          });
+          const scores = await judge(states);
+          chunk.forEach((item, index) => {
+            const p = scores[index] ?? 0;
+            gates.set(item.row.id, { verdict: p >= JEV_THRESHOLD ? "followup" : "observe", reason: `jev:${p.toFixed(2)}` });
+          });
+        } catch (error) {
+          this.options.log?.("group-judge-failed", `${context.chat.slug} ${error instanceof JudgeError ? error.code : "judgeFailed"}`);
+          for (const item of chunk) gates.set(item.row.id, window(item, "fallback"));
+        }
+      }
+    }
+    for (const { row, input } of todo) {
+      const gate = gates.get(row.id)!;
+      const applied = this.store.db.transaction(() => {
+        // The judge is awaited, so the row may have moved on (or been gated) meanwhile.
+        const current = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
+        if (current?.state !== "pending" || this.store.get<string>(`group-gate:${row.id}`)) return false;
+        if (gate.verdict === "observe") {
+          this.store.set("group-observed", appendObserved(this.store.get<string[] | null>("group-observed") ?? [], [this.groupLine(input)]));
+          this.store.updateInbound(row.id, "observed");
+        }
+        this.store.set(`group-gate:${row.id}`, gate.verdict);
+        return true;
+      }).immediate();
+      if (applied) this.options.log?.(gate.verdict === "observe" ? "group-observed" : "group-addressed", `${context.chat.slug} ${row.id} ${gate.reason}`);
+    }
+  }
+
+  /** A person-typed group row the gate has not judged yet. Bridge rows, commands and poll votes are never gated. */
+  private ungated(row: InboundRecord): boolean {
+    if (!this.isGroup() || row.state !== "pending" || synthetic(row.id) || this.store.get<string>(`group-gate:${row.id}`)) return false;
+    const input = row.payload as NormalizedInbound;
+    return !input.poll && !input.text.trimStart().startsWith("/");
   }
 
   /**
@@ -2188,13 +2264,21 @@ export class Router {
       const replies = (end < 0 ? after : after.slice(0, end))
         .filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = replies.at(-1);
-      // The last word of each earlier run still goes out, ahead of the final one.
+      // The last word of each earlier run still goes out, ahead of the final
+      // one, and so does a step the model stopped on before a steered text
+      // came in (`answer`, see opencode-steps.ts). Narration never does.
+      // One message written as several text blocks is judged whole: a NO_REPLY
+      // at its end keeps every block of it out of the chat.
+      const scope = end < 0 ? [] : after.slice(0, end);
+      const quiet = quietMessages(scope);
       const earlier: Extract<MessageRecord, { type: "assistant" }>[] = [];
       let last: MessageRecord | undefined;
-      for (const m of end < 0 ? [] : after.slice(0, end)) {
-        if (m.type === "idle" && last?.type === "assistant" && last.id !== final?.id) earlier.push(last);
+      for (const m of scope) {
+        if (m.type === "idle" && last?.type === "assistant" && last.id !== final?.id && !earlier.includes(last)) earlier.push(last);
+        if (m.type === "assistant" && m.answer === true && m.id !== final?.id) earlier.push(m);
         if (m.type === "assistant" || m.type === "idle") last = m;
       }
+      for (let i = earlier.length - 1; i >= 0; i--) if (quiet.has(earlier[i]!.id)) earlier.splice(i, 1);
       if (idle && idle.id !== this.seenIdle) {
         this.seenIdle = idle.id;
         this.stage("run-completed-seen", turn.inboundId ?? turn.messageId);

@@ -221,7 +221,9 @@ describe("chat registry", () => {
     expect(await handleInbound(deps, message({ handle: "m-1", chat: chatKey.dm(moni), from: moni, text: "hey" }))).toBe(true);
     const moniChat = chats.get(chatKey.dm(moni))!;
     expect(moniChat.store.pendingInbound().map(row => row.id)).toEqual(["m-1"]);
-    expect(moniChat.store.pendingInbound()[0]!.payload).toMatchObject({ text: "hey", sender: moni });
+    // receivedAt becomes the arrival time for batching; sentAt keeps when it was sent, for the group judge.
+    expect(moniChat.store.pendingInbound()[0]!.payload).toMatchObject({ text: "hey", sender: moni, sentAt: 1_000 });
+    expect((moniChat.store.pendingInbound()[0]!.payload as { receivedAt: number }).receivedAt).toBeGreaterThan(1_000);
     expect(moniChat.controlsPending).toBe(true);
     expect(moniChat.typing.size).toBe(0);
     expect(chats.owner.store.pendingInbound()).toEqual([]);

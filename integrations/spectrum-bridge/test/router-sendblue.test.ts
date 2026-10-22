@@ -1,6 +1,7 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
 import type { ChatContext, ChatInfo, Role } from "../src/chats.ts";
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
+import { JudgeError, type GroupJudge, type JudgeState } from "../src/group-judge.ts";
 import { Router, sendblueContextPrompt } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 import { OpenChamber, type MessageRecord, type PermissionRequest, type QuestionRequest, type SessionRecord } from "../src/openchamber.ts";
@@ -55,7 +56,7 @@ function context(kind: ChatInfo["kind"], over: Partial<ChatContext> = {}) {
   return ctx;
 }
 
-function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; getMessage?: (guid: string) => Promise<unknown> } = {}) {
+function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; getMessage?: (guid: string) => Promise<unknown>; groupJudge?: GroupJudge; log?: (event: string, code?: string) => void } = {}) {
   const store = new Store(":memory:");
   stores.push(store);
   const backend = new Recorder();
@@ -457,6 +458,128 @@ test("groups: the person Robob just asked something may answer unnamed; others s
   expect(h.backend.prompts[0]!.text.endsWith("Moni: also add a gem kit")).toBe(true);
   // Woken only as a follow-up, so no 👀.
   expect(ctx.reacted).toEqual([]);
+  setSystemTime(start);
+});
+
+test("groups: Jev decides unnamed messages in one call; names, swipe replies and tapbacks never reach it", async () => {
+  const start = Date.parse("2026-10-22T10:00:00Z");
+  setSystemTime(start);
+  const ctx = context("group");
+  const asked: JudgeState[][] = [];
+  const logs: [string, string | undefined][] = [];
+  const groupJudge: GroupJudge = async states => {
+    asked.push(states);
+    return states.map(state => /book/.test(state.new_message) ? 0.88 : 0.07);
+  };
+  const h = setup(ctx, { quietMs: 0, groupJudge, log: (event, code) => logs.push([event, code]) });
+  h.store.enqueue({ id: "reply:1:x", kind: "conversation", text: "Flight's EK57 tomorrow at 2:25pm.", sessionId: "ses_0", generation: 1 });
+  h.store.outboxState("reply:1:x", "sent", "robob-msg");
+  h.store.set("sent-at:reply:1:x", start - 30_000);
+  h.input("a", "What time r we leaving tomo", "+971585933213");
+  h.input("b", "Can you book a Wheely for 11.50 please", "+447700900123");
+  h.input("c", "Loved \u201cFlight's EK57 tomorrow\u201d", "+971585933213");
+  h.input("d", "thanks robob", "+447700900123");
+  h.input("e", "is that the final one?", "+971585933213", { replyTo: "robob-msg" });
+  // Only Robob's own name is a fast path; naming Abdullah is ordinary text for Jev.
+  h.input("f", "Abdullah can you check the gate code", "+971585933213");
+  await h.router.tick();
+  expect(asked).toHaveLength(1);
+  expect(asked[0]!.map(state => state.new_message)).toEqual(["What time r we leaving tomo", "Can you book a Wheely for 11.50 please", "Abdullah can you check the gate code"]);
+  expect(asked[0]![1]!.recent_conversation.at(-1)).toBe("[Thu 14:00] Moni: What time r we leaving tomo");
+  expect(asked[0]![1]!.minutes_since_robob_last_wrote).toBe(1);
+  expect(asked[0]![1]!.new_message_from).toBe("Tom");
+  expect(["a", "b", "c", "d", "e", "f"].map(id => h.store.get<string>(`group-gate:${id}`))).toEqual(["observe", "followup", "observe", "explicit", "explicit", "observe"]);
+  expect(logs.filter(([event]) => event.startsWith("group-"))).toEqual([
+    ["group-observed", "group-friends-abc123 a jev:0.07"],
+    ["group-addressed", "group-friends-abc123 b jev:0.88"],
+    ["group-observed", "group-friends-abc123 c tapback"],
+    ["group-addressed", "group-friends-abc123 d named"],
+    ["group-addressed", "group-friends-abc123 e reply"],
+    ["group-observed", "group-friends-abc123 f jev:0.07"],
+  ]);
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!.text;
+  expect(prompt).toContain(JSON.stringify("Moni: What time r we leaving tomo"));
+  expect(prompt).toContain("Tom (+447700900123): Can you book a Wheely for 11.50 please");
+  // Named and swipe-replied rows count as asked, so the batch gets one 👀.
+  expect(ctx.reacted).toEqual([["d", "👀"]]);
+  setSystemTime(start);
+});
+
+test("groups: when Jev fails the old follow-up window decides, and the failure is logged without text", async () => {
+  const start = Date.parse("2026-10-22T10:30:00Z");
+  setSystemTime(start);
+  const logs: [string, string | undefined][] = [];
+  const h = setup(context("group"), {
+    quietMs: 0, log: (event, code) => logs.push([event, code]),
+    groupJudge: async () => { throw new JudgeError("timeout"); },
+  });
+  h.store.set("group-engaged:+971585933213", start - 60_000);
+  h.input("a", "the blue one", "+971585933213");
+  h.input("b", "lol nice", "+447700900123");
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:a")).toBe("followup");
+  expect(h.store.get<string>("group-gate:b")).toBe("observe");
+  expect(logs).toContainEqual(["group-judge-failed", "group-friends-abc123 timeout"]);
+  expect(logs).toContainEqual(["group-addressed", "group-friends-abc123 a fallback"]);
+  expect(logs).toContainEqual(["group-observed", "group-friends-abc123 b fallback"]);
+  expect(h.backend.prompts).toHaveLength(1);
+  setSystemTime(start);
+});
+
+test("groups: a line arriving while Jev is thinking is gated before it can join the batch", async () => {
+  const start = Date.parse("2026-10-22T10:40:00Z");
+  setSystemTime(start);
+  let release: (p: number[]) => void = () => {};
+  let calls = 0;
+  const h = setup(context("group"), {
+    quietMs: 0,
+    groupJudge: states => { calls += 1; return calls === 1 ? new Promise(resolve => { release = resolve; }) : Promise.resolve(states.map(() => 0.9)); },
+  });
+  h.input("a", "can you check the weather", "+971585933213");
+  const tick = h.router.tick();
+  await Promise.resolve();
+  h.input("b", "and the traffic", "+971585933213");
+  release([0.9]);
+  await tick;
+  // b skipped the controls pass, so this tick holds the batch; the second gate pass judged it.
+  expect(calls).toBe(2);
+  expect(h.store.get<string>("group-gate:a")).toBe("followup");
+  expect(h.store.get<string>("group-gate:b")).toBe("followup");
+  expect(h.backend.prompts).toHaveLength(0);
+  await h.router.tick();
+  expect(calls).toBe(2);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.text).toContain("can you check the weather");
+  expect(h.backend.prompts[0]!.text).toContain("and the traffic");
+  setSystemTime(start);
+});
+
+test("groups: a /new sent while Jev is thinking still cancels the unjudged line before it", async () => {
+  const start = Date.parse("2026-10-22T10:45:00Z");
+  setSystemTime(start);
+  let release: (p: number[]) => void = () => {};
+  let calls = 0;
+  const h = setup(context("group"), {
+    quietMs: 0,
+    groupJudge: states => { calls += 1; return calls === 1 ? new Promise(resolve => { release = resolve; }) : Promise.resolve(states.map(() => 0.9)); },
+  });
+  h.input("a", "can you check the weather", "+971585933213");
+  const tick = h.router.tick();
+  await Promise.resolve();
+  h.input("b", "and book the table", "+971585933213");
+  h.input("reset", "/new", "+15555550123");
+  release([0.9]);
+  await tick;
+  // /new waits behind the line Jev hasn't seen yet instead of jumping it.
+  expect(h.store.pendingInbound().find(row => row.id === "reset")?.state).toBe("pending");
+  await h.router.tick();
+  await h.router.tick();
+  const state = (id: string) => h.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state;
+  expect(state("a")).toBe("cancelled");
+  expect(state("b")).toBe("cancelled");
+  expect(state("reset")).toBe("done");
+  expect(h.backend.prompts.map(p => p.text).join("\n")).not.toContain("book the table");
   setSystemTime(start);
 });
 

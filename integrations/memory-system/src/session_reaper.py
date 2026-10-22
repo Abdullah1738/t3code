@@ -238,15 +238,32 @@ def control_gate():
         raise Gate(f"Robob control API not healthy (HTTP {code} {backend._err(body)})")
 
 
-def archive_robob_thread(ses_id):
-    """Archive the Robob thread bound to a deleted root session. Returns the
-    thread id, None when no thread is bound, or raises."""
+def archive_robob_thread(ses_id, quiet_before):
+    """Archive the Robob thread bound to a deleted root session. Returns
+    (thread id, archived), (None, False) when no thread is bound, or raises.
+
+    by-native also resolves sessions a thread used before a context reset,
+    rebind or provider switch, so a stale old session can map to a thread that
+    is still in use. Only archive when the deleted session is the one the
+    thread runs on now (backend.current_native_session). The control API's
+    nativeSessionId can't decide this: it skips non-OpenCode providers and
+    subagent child threads.
+
+    The check and the archive aren't atomic, and unarchiving can't undo an
+    archive (it cancels queued runs and detaches sessions). So the thread must
+    also have been quiet since quiet_before (the stale cutoff): no live run and
+    no run or attempt requested, started or finished since. What's left is work
+    arriving during this one request on a thread idle for a month whose current
+    session was deleted just before; the control API has no conditional archive."""
     thread = backend.thread_for_session(ses_id)
     if not thread:
-        return None
+        return None, False
+    tid = thread["threadId"]
+    if backend.current_native_session(tid, quiet_before) != ses_id:
+        return tid, False
     if not thread.get("archived"):
-        backend.archive_thread(thread["threadId"])
-    return thread["threadId"]
+        backend.archive_thread(tid)
+    return tid, True
 
 
 # ------------------------------------------------------------------ candidates
@@ -411,6 +428,7 @@ def main():
         st["kept"] = {k: sum(1 for v in reason.values() if v == k) for k in set(reason.values())}
         log(f"gate ok (snapshot {ev['snapshot'][:8]}); {len(sessions)} sessions, "
             f"{st['stale_trees']} stale trees ({st['stale_sessions']} sessions)")
+        quiet_before = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t0 - STALE_DAYS * 86400))
         ver = Verifier(oc)
         n_sess = n_msgs = 0
         for root, tree in work:
@@ -480,7 +498,11 @@ def main():
             rec["delete_secs"] = round(dt, 2)
             if backend.is_robob():
                 try:
-                    rec["robob_thread"] = archive_robob_thread(root["id"])
+                    thread_id, archived = archive_robob_thread(root["id"], quiet_before)
+                    rec["robob_thread"] = thread_id
+                    if thread_id and not archived:
+                        rec["robob_thread_kept"] = "thread moved on or not idle"
+                        st["kept_threads"] = st.get("kept_threads", 0) + 1
                 except Exception as e:
                     rec["robob_thread_error"] = str(e)[:200]
                     st["errors"].append(f"{root['id']}: deleted, but archiving its Robob thread failed: {str(e)[:120]}")

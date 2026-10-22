@@ -374,6 +374,80 @@ test("a steer that lands after the run ended is delivered once and both answers 
   expect(h.store.pendingInbound()).toEqual([]);
 });
 
+test("an answer given before a steered text came in goes out too, once, ahead of the final one", async () => {
+  const h = setup();
+  const steers = steering(h.backend);
+  h.input("in_1", "Book the car");
+  await h.router.tick();
+  h.backend.step("Checking prices", "tool-calls", "msg_narration").answer = false;
+  // The model stops with an answer; two texts are steered in before the run ends.
+  const booked = h.backend.step("Booked for 11:50", "stop", "msg_booked");
+  booked.answer = true;
+  h.input("in_2", "Also draft a message for the clinic");
+  await h.router.tick();
+  h.input("in_3", "Thanks");
+  await h.router.tick();
+  expect(steers).toHaveLength(2);
+  const draft = h.backend.step("Here's the draft", "stop", "msg_draft");
+  draft.answer = true;
+  h.backend.settle();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text, op.replyTo])).toEqual([
+    ["reply:1:msg_booked", "Booked for 11:50", "in_1"],
+    ["reply:1:msg_draft", "Here's the draft", "in_1"],
+  ]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test("a background run's earlier answer goes out; steps nobody could classify keep the last-word rule", async () => {
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("first", "Start something long");
+  await h.router.tick();
+  h.backend.final("On it");
+  await h.router.tick();
+  // The work finishes on its own: one answer, a NO_REPLY answer, an unknown step, then the last word.
+  const done = h.backend.step("Wheely's booked", "stop", "msg_done");
+  done.answer = true;
+  h.backend.step("NO_REPLY", "stop", "msg_quiet").answer = true;
+  h.backend.step("Unclassified middle step", "stop", "msg_unknown");
+  const last = h.backend.step("GNC draft is ready", "stop", "msg_last");
+  last.answer = true;
+  h.backend.settle();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([
+    [expect.stringMatching(/^reply:1:/), "On it"],
+    ["reply:1:msg_done", "Wheely's booked"],
+    ["reply:1:msg_last", "GNC draft is ready"],
+  ]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test("a message written as several blocks is judged whole, so a NO_REPLY at its end keeps all of it out", async () => {
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("first", "Start something long");
+  await h.router.tick();
+  h.backend.final("On it");
+  await h.router.tick();
+  const block = (text: string, message: string, part: number) => {
+    const record = h.backend.step(text, "stop", `${message}:text:${part}`);
+    record.answer = true;
+    record.nativeMessage = message;
+  };
+  block("Logged the routine event.", "msg_quiet", 0);
+  block("NO_REPLY", "msg_quiet", 1);
+  block("Wheely's booked.", "msg_booked", 0);
+  block("Pickup is 11:50.", "msg_booked", 1);
+  block("GNC draft is ready", "msg_last", 0);
+  h.backend.settle();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([
+    [expect.stringMatching(/^reply:1:/), "On it"],
+    ["reply:1:msg_booked:text:0", "Wheely's booked."],
+    ["reply:1:msg_booked:text:1", "Pickup is 11:50."],
+    ["reply:1:msg_last:text:0", "GNC draft is ready"],
+  ]);
+});
+
 test("a steer the server refuses goes out once as its own turn after the current one", async () => {
   const h = setup();
   const steers = steering(h.backend, async () => "refused");

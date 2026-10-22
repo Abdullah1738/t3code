@@ -6,7 +6,7 @@ Read-only INBOX mail, WhatsApp and iMessage/SMS collection every **300 seconds**
 
 Requires the existing robob-watch runner, mailsearch/mail_oauth authentication, wa-db helper, read access to the chat stores and the existing OpenRouter key. Configure local identities before enabling a fresh installation:
 
-1. Create `~/Documents/assistant/inbox-triage/settings.json` from `settings.template.json`. Set the self WhatsApp JID, group mention names and excluded iMessage chat IDs/identifiers (assistant bridge, self-chat and chats already handled elsewhere); set `configured` to true.
+1. Create `~/Documents/assistant/inbox-triage/settings.json` from `settings.template.json`. Set the self WhatsApp JID, group mention names and excluded iMessage chat IDs/identifiers (self-chat and chats already handled elsewhere); set `configured` to true. Chats with a Robob line in them are skipped by themselves: the line comes from the bridge's `sendblueNumber` in `~/.config/spectrum-bridge/config.json`, plus any extra numbers in `robob_lines`.
 2. From this directory run `/usr/bin/python3 -B install.py`. It copies only the named source files and registers `watcher.json`. Missing prefs/noise files are seeded from templates; existing files are preserved.
 3. Run `unset BUN_INSPECT` then `robob-watch test inbox-triage` and `robob-watch show inbox-triage`.
 
@@ -21,6 +21,7 @@ The installer waits for `check.lock` (65 seconds maximum), atomically replaces s
 - `check.lock` prevents overlap; a separate `dry-run.lock` means replay diagnostics cannot suppress a scheduled check. Contention exits 75 so the runner cannot overwrite a prior output acknowledgement. Installation registers paused under the lock and resumes after release.
 - OTP context is checked across the whole message before redacting preview fields. FETCH literals must have valid UIDs; omitted messages are confirmed expunged before the cursor can advance past them.
 - Atomic cursor + candidate queue writes happen before classification. Hits commit to an outbox before stdout; the runner's `.run-ok` acknowledges them. Failed sources retain their last successful cursor. Model failures become manual-review candidates without a second call.
+- A chat message is dropped once it has been dealt with: its chat has a Robob line in it (`robob_chat`), or it was answered. In a direct chat a later message or tapback from the owner, or from a Robob line, counts. In a group only a swipe reply or tapback on that very message counts, since he may be talking to someone else. Failed, unsent, retracted, revoked or removed follow-ups never count. Both are checked against the live stores when the batch is built, again after classifying, and once more if an unacknowledged wake is replayed (the replayed wake is rebuilt from the batch file as it stands), so a candidate that was already queued still gets dropped. Mail has no such check. A store that can't be read drops nothing.
 - Messages and context are untrusted data. No outgoing messages, payments or read-flag mutations happen in this check.
 
 Local data: `~/Documents/assistant/inbox-triage/{prefs.md,noise.json,settings.json,runs.jsonl,batches/}`. State: `~/.local/share/robob-watch/watchers/inbox-triage/`. Keep both outside git. Only generic templates belong here.
@@ -33,7 +34,7 @@ unset BUN_INSPECT
 robob-watch test inbox-triage
 ```
 
-A historical mail replay does not advance live cursors or send notifications:
+A historical replay (mail, WhatsApp and iMessage) does not advance live cursors or send notifications. It reads exactly the requested window (up to 20,000 rows per chat source, and says so in `source_errors` if it stops early) and classifies every candidate, 64 at a time. The report lists every dropped id with its reason:
 
 ```sh
 /usr/bin/python3 -B triage.py --dry-run-hours 2 --report "$HOME/Documents/assistant/inbox-triage/replay.json"

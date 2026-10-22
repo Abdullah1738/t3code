@@ -12,6 +12,7 @@ Checks that the whole pipeline is flowing, not just that processes exist:
   disk      internal disk has room
   session_reaper   hourly deletion of 30-day-idle OpenCode sessions runs and is not stuck gated
   location_reaper  5-min cua-driver MCP cleanup runs without errors
+  msgs      message archive (com.ardud.message-archive) still reads chat.db
 
 Writes logs/health_last.json and logs/memory_check.log. Sends a Telegram
 alert when a check starts failing (once per check per day while it keeps
@@ -20,6 +21,7 @@ notifies.
 """
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -50,6 +52,12 @@ RECALL_MAX_LAG = 20000          # events the session catalog may trail by
 BACKUP_MAX_AGE = 9 * 3600       # backup every 4 h
 BACKUP_LOCK_MAX_AGE = 2 * 3600  # runs take up to ~1.7 h
 DISK_MIN_GB = 30
+MSGS_VOLUME = "/Volumes/ExternalSSD"
+MSGS_DB = os.path.join(MSGS_VOLUME, "message-archive/index.db")
+MSGS_LOG = os.path.join(HOME, ".local/share/message-archive/logs/daemon.log")
+MSGS_MAX_AGE = 3600             # awake time without a new iMessage pass; passes run every 30 s, ~15 min under load
+MSGS_SEEN = os.path.join(LOGS, "msgs_seen.json")
+DRY_RUN = False                 # --dry-run: checks report but keep no state
 
 
 def ro(path):
@@ -311,12 +319,179 @@ def check_worktree_reaper():
     return True, f"removed {len(st.get('removed', []))} worktrees this run, {st.get('worktrees', '?')} checked"
 
 
+def _last_log_error(path, source, tail_bytes=256 * 1024):
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - tail_bytes))
+            lines = f.read().decode(errors="replace").splitlines()
+    except OSError:
+        return None
+    return next((ln for ln in reversed(lines) if f" {source}: ERROR " in ln), None)
+
+
+def _boot_id():
+    # kern.boottime moves when the wall clock is stepped, so it can't tell a
+    # reboot apart from a clock change; the boot session UUID only changes on boot.
+    try:
+        r = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None  # the uptime check below still spots a reboot
+    return r.stdout.strip() or None
+
+
+def _msgs_failing():
+    try:
+        with open(STATE) as f:
+            return "msgs" in json.load(f).get("failing", {})
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _msgs_seen():
+    try:
+        with open(MSGS_SEEN) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _uptime():
+    return time.clock_gettime(time.CLOCK_UPTIME_RAW)  # stops while asleep, 0 at boot
+
+
+def _num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _msgs_track(last_ok, prev):
+    """Record for last_ok as the archive's newest iMessage pass, and the awake
+    seconds since these runs first saw it. The uptime clock stops while the
+    Mac sleeps, so a wake gets the allowance to catch up but never a fresh
+    one, and only a new pass starts over. After a reboot the time already
+    counted carries over and the new boot's uptime counts too. A boot id
+    lookup that fails is unknown, not a reboot: the uptime clock decides."""
+    up, boot = _uptime(), _boot_id()
+    # seen: last sample on a confirmed boot (the accounting); up: last sample
+    # of any kind, so a reboot still shows as uptime going back
+    rec = {"last_ok": last_ok, "boot": boot, "start": up, "seen": up, "carried": 0, "up": up}
+    try:
+        if prev["last_ok"] == last_ok:
+            start, seen, carried, last_up = prev["start"], prev["seen"], prev["carried"], prev["up"]
+            prev_boot = prev["boot"]
+            # Older record layouts (no "up", numeric boot) can't say which boot
+            # their last sample was on, so they count from now like bad ones.
+            if not (all(map(_num, (start, seen, carried, last_up))) and 0 <= start <= seen <= last_up
+                    and carried >= 0 and (prev_boot is None or isinstance(prev_boot, str))):
+                raise TypeError("bad timing fields")
+            known = boot is not None and prev_boot is not None
+            rebooted = up < last_up or (known and boot != prev_boot)
+            if rebooted:
+                # Carry only time certain to be before this boot. Uptime going back
+                # puts every earlier sample before it; a boot id change alone
+                # doesn't say which boot the unknown samples since `seen` were on.
+                rec.update(start=0, carried=carried + (last_up if up < last_up else seen) - start)
+            elif boot is None:
+                # Unknown boot: keep the last confirmed sample as is. Saving this
+                # uptime under the old boot id would count it twice if it turns
+                # out to be a new boot, once carried and once as the new uptime.
+                rec.update(boot=prev_boot, start=start, seen=seen, carried=carried)
+            else:
+                rec.update(start=start, carried=carried)
+            if "failed" in prev:
+                rec["failed"] = prev["failed"]
+    except (KeyError, TypeError):
+        pass  # no usable record: count from now
+    return rec, rec["carried"] + up - rec["start"]
+
+
+def _msgs_save(rec):
+    if DRY_RUN:
+        return  # a dry run must not move the baseline the next real run compares with
+    tmp = MSGS_SEEN + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, MSGS_SEEN)
+
+
+def _msgs_last_ok():
+    for attempt in range(2):  # opening the WAL db read-only can fail once while the daemon checkpoints
+        try:
+            c = ro(MSGS_DB)
+            try:
+                row = c.execute("SELECT value FROM sync_state WHERE key='imessage'").fetchone()
+            finally:
+                c.close()
+            break
+        except sqlite3.OperationalError:
+            if attempt:
+                raise
+            time.sleep(5)
+    return (json.loads(row[0]) if row else {}).get("last_ok")
+
+
+def check_msgs():
+    # Full Disk Access for chat.db is granted to the Homebrew Cellar python3.14
+    # binary, so a brew upgrade silently cuts the iMessage source off. The daemon
+    # only logs and backs off, so watch the last good pass instead.
+    _, _, loaded = launchd_exit("com.ardud.message-archive")
+    mounted = os.path.ismount(MSGS_VOLUME)
+    prev = _msgs_seen()
+    if mounted:
+        last_ok = _msgs_last_ok()
+        if not last_ok:
+            return False, "the message archive has never finished an iMessage pass"
+    else:
+        last_ok = prev.get("last_ok")  # can't read the archive: keep counting from the last pass seen
+    age = time.time() - last_ok if last_ok else None
+    rec, stuck = _msgs_track(last_ok, prev)
+    # A failure holds for the same last pass, so a lost record, a clock change
+    # or a failure main() saw without this record (a crash, an unsaved record)
+    # can't read as a recovery; only a new pass releases it.
+    if prev.get("last_ok") is not None and prev.get("last_ok") != last_ok:
+        latched = False
+    else:
+        latched = bool(rec.get("failed")) or _msgs_failing()
+    fresh = loaded and mounted and age is not None and 0 <= age <= MSGS_MAX_AGE
+    # Awake time on the same pass decides, not the wall clock: it ignores
+    # sleep, and a clock set back can't make an old pass look new.
+    ok = stuck < MSGS_MAX_AGE and not latched
+    rec["failed"] = not ok
+    note = ""
+    try:
+        _msgs_save(rec)
+    except OSError as e:
+        # without a saved record every run would look like a first sighting
+        note = f" (can't save {MSGS_SEEN}: {e})"
+        ok = ok and fresh
+    synced = f"iMessage archive last synced {age / 3600:.1f} h ago" if age is not None else "no iMessage pass seen"
+    if ok:
+        if fresh:
+            return True, f"iMessage archived {age / 60:.0f} min ago"
+        # after a sleep, a remount or a daemon restart the next pass can take ~15 min
+        state = "" if loaded and mounted else " while paused (daemon not loaded or SSD not mounted)"
+        return True, f"{synced}, waiting{state}: {stuck / 60:.0f} of {MSGS_MAX_AGE / 60:.0f} awake min"
+    if not loaded:
+        return False, "com.ardud.message-archive is not loaded; " + synced + note
+    if not mounted:
+        return False, f"{MSGS_VOLUME} is not mounted, the message archive is paused; " + synced + note
+    msg = synced + note
+    err = _last_log_error(MSGS_LOG, "imessage")
+    if not err:
+        return False, msg + ", no error logged (daemon stuck?)"
+    msg += f"; last error: {err[:200]}"
+    if re.search(r"unable to open|authorization denied|not permitted", err, re.I):
+        py = os.path.realpath("/opt/homebrew/opt/python@3.14/bin/python3.14")
+        msg += f". Full Disk Access is probably missing for {py} (brew upgrade?): grant it, then kickstart com.ardud.message-archive"
+    return False, msg
+
+
 CHECKS = [("sync", check_sync), ("lag", check_lag), ("muse_lag", check_muse_lag), ("recall", check_recall),
           ("backup", check_backup),
           ("backup_lock", check_backup_lock),
           ("dropbox", check_dropbox), ("disk", check_disk), ("cold_finalize", check_cold_finalize),
           ("session_reaper", check_session_reaper), ("location_reaper", check_location_reaper),
-          ("worktree_reaper", check_worktree_reaper)]
+          ("worktree_reaper", check_worktree_reaper), ("msgs", check_msgs)]
 
 
 def notify(severity, text, key):
@@ -329,6 +504,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    global DRY_RUN
+    DRY_RUN = args.dry_run
 
     results = {}
     for name, fn in CHECKS:

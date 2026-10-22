@@ -184,6 +184,317 @@ class TriageTests(unittest.TestCase):
             self.assertIn('outbox', state)
             self.assertEqual(t.read_json(Path(state['outbox']['batch']))['hits'][0]['id'], 'mail:a:1:1')
 
+    def test_answered_chats_are_dropped_before_and_after_classifying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            t.atomic(wd / 'cursor.json', {'version': 1, 'initialized_at': 1000, 'cursors': {}, 'queue': []})
+            chat = [self.item(id=f'imsg:{n}', source='imessage', ts=1_800_000_000) for n in (1, 2, 3)]
+            result = {'imessage': {'cursor': 3, 'items': chat, 'drops': {}, 'scanned': 3}}
+            args = types.SimpleNamespace(dry_run_hours=None, report=None)
+            hits = [{'id': i, 'reason': 'r', 'urgency': 'today'} for i in ('imsg:2', 'imsg:3')]
+            with patch.dict(t.os.environ, {'WATCH_DIR': str(wd), 'WATCH_RUN': 'test'}), \
+                 patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                 patch.object(t, 'collect', return_value=(result, {})), patch.object(t, 'build_context', return_value={}), \
+                 patch.object(t, 'handled', side_effect=[({'imsg:1': 'answered'}, {}), ({'imsg:3': 'robob_chat'}, {})]) as handled, \
+                 patch.object(t, 'classify', return_value=(hits, {'cost_usd': 0})) as model, patch('builtins.print'):
+                self.assertEqual(t.run(args), 0)
+            self.assertEqual([i['id'] for i in model.call_args[0][0]], ['imsg:2', 'imsg:3'])
+            self.assertEqual([h['id'] for h in handled.call_args[0][0]], ['imsg:2', 'imsg:3'])
+            state = t.read_json(wd / 'cursor.json')
+            batch = t.read_json(Path(state['outbox']['batch']))
+            self.assertEqual([h['id'] for h in batch['hits']], ['imsg:2'])
+            self.assertEqual((batch['dropped']['answered'], batch['dropped']['robob_chat']), (1, 1))
+            self.assertNotIn('imsg:3', state['outbox']['event'])
+
+
+ROBOB = '+19362300565'
+MONI = '+971500000001'
+BOB = '+971500000002'
+
+
+def chat_db(path, messages, chats):
+    """Minimal chat.db: messages are (rowid, chat_id, sender or None for the owner, seconds, reaction[, extra
+    columns]). A chat with more than one member is a group."""
+    import sqlite3
+    c = sqlite3.connect(path)
+    c.executescript('''
+        CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT, attributedBody BLOB, subject TEXT,
+            handle_id INTEGER, is_from_me INTEGER, date INTEGER, associated_message_type INTEGER DEFAULT 0,
+            is_system_message INTEGER DEFAULT 0, is_service_message INTEGER DEFAULT 0, is_spam INTEGER DEFAULT 0,
+            date_retracted INTEGER DEFAULT 0, cache_has_attachments INTEGER DEFAULT 0, is_sent INTEGER DEFAULT 1,
+            error INTEGER DEFAULT 0, thread_originator_guid TEXT, associated_message_guid TEXT);
+        CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+        CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT, display_name TEXT, style INTEGER);
+        CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER, message_date INTEGER);
+        CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER);
+    ''')
+    handles = {}
+    def handle(address):
+        if address not in handles:
+            handles[address] = c.execute('INSERT INTO handle (id) VALUES (?)', (address,)).lastrowid
+        return handles[address]
+    for chat_id, members in chats.items():
+        c.execute('INSERT INTO chat VALUES (?, ?, ?, ?)', (chat_id, f'chat{chat_id}', '', 43 if len(members) > 1 else 45))
+        for address in members:
+            c.execute('INSERT INTO chat_handle_join VALUES (?, ?)', (chat_id, handle(address)))
+    for rowid, chat_id, sender, seconds, reaction, *extra in messages:
+        date = int((seconds - t.APPLE_EPOCH) * 1e9)
+        c.execute('INSERT INTO message (ROWID, guid, text, handle_id, is_from_me, date, associated_message_type) VALUES (?,?,?,?,?,?,?)',
+                  (rowid, f'g{rowid}', f'text {rowid}', handle(sender) if sender else 0, int(sender is None), date, reaction))
+        for column, value in (extra[0] if extra else {}).items():
+            c.execute(f'UPDATE message SET {column}=? WHERE ROWID=?', (value, rowid))
+        c.execute('INSERT INTO chat_message_join VALUES (?, ?, ?)', (chat_id, rowid, date))
+    c.commit()
+    c.close()
+
+
+class ChatFollowUpTests(unittest.TestCase):
+    """Chats Robob is in, and messages already answered, never reach the owner."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        home = Path(self.tmp.name)
+        (home / 'Library/Messages').mkdir(parents=True)
+        (home / '.config/spectrum-bridge').mkdir(parents=True)
+        (home / '.config/spectrum-bridge/config.json').write_text(json.dumps({'sendblueNumber': ROBOB}))
+        (home / 'data').mkdir()
+        (home / 'data/settings.json').write_text(json.dumps({}))
+        self.home = home
+        self.patches = [patch.object(t, 'HOME', home), patch.object(t, 'DATA', home / 'data')]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def imsg(self, rowid, ts):
+        return {'id': f'imsg:{rowid}', 'source': 'imessage', 'ts': ts}
+
+    def test_robob_lines_come_from_the_bridge_and_settings(self):
+        self.assertEqual(t.robob_lines({'robob_lines': ['+1 (555) 010-0000', 'Bot@Example.com']}),
+                         {ROBOB, '+15550100000', 'bot@example.com'})
+        (self.home / '.config/spectrum-bridge/config.json').unlink()
+        self.assertEqual(t.robob_lines({}), set())
+
+    def test_group_with_a_robob_line_is_dropped_and_others_stay(self):
+        now = 1_800_000_000
+        chat_db(self.home / 'Library/Messages/chat.db',
+                [(1, 10, MONI, now - 60, 0), (2, 20, BOB, now - 50, 0), (3, 30, ROBOB, now - 40, 0)],
+                {10: [MONI, ROBOB], 20: [BOB], 30: [ROBOB]})
+        config = {'excluded_imessage_chat_ids': [], 'excluded_imessage_identifiers': []}
+        with patch.object(t, 'settings', return_value=config):
+            result = t.collect_imessage(0, now)
+        self.assertEqual([i['id'] for i in result['items']], ['imsg:2'])
+        self.assertEqual(result['drops'], {'robob_chat': 2})
+        self.assertEqual(result['dropped'], [['imsg:1', 'robob_chat'], ['imsg:3', 'robob_chat']])
+
+    def test_imessage_answered_later_by_the_owner_or_a_robob_tapback(self):
+        now = 1_800_000_000
+        chat_db(self.home / 'Library/Messages/chat.db', [
+            (1, 10, MONI, now - 300, 0), (2, 10, None, now - 200, 0),       # he replied after it
+            (3, 20, BOB, now - 300, 0), (4, 20, ROBOB, now - 100, 2006, {'associated_message_guid': 'p:0/g3'}),  # Robob tapped it
+            (5, 30, MONI, now - 300, 0), (6, 30, MONI, now - 100, 0),       # only her again
+            (7, 40, None, now - 400, 0), (8, 40, BOB, now - 300, 0),        # his text came before it
+        ], {10: [MONI], 20: [BOB, ROBOB], 30: [MONI], 40: [BOB]})
+        items = [self.imsg(1, now - 300), self.imsg(3, now - 300), self.imsg(5, now - 300), self.imsg(8, now - 300)]
+        self.assertEqual(t.answered(items), ({'imsg:1', 'imsg:3'}, {}))
+
+    def test_group_answers_must_target_the_message_and_failed_or_withdrawn_ones_never_count(self):
+        now = 1_800_000_000
+        chat_db(self.home / 'Library/Messages/chat.db', [
+            # Group: he swipe-replied to Bob, not to Moni's question; then to Moni's other message.
+            (1, 10, MONI, now - 300, 0), (2, 10, BOB, now - 290, 0),
+            (3, 10, None, now - 280, 0, {'thread_originator_guid': 'g2'}),
+            (4, 10, MONI, now - 270, 0), (5, 10, None, now - 260, 0, {'thread_originator_guid': 'g4'}),
+            (6, 10, MONI, now - 250, 0), (7, 10, None, now - 240, 2001, {'associated_message_guid': 'p:0/g6'}),
+            # Direct chats: a failed send, an unsent one, a retracted one and a removed tapback.
+            (11, 21, BOB, now - 300, 0), (12, 21, None, now - 200, 0, {'error': 4, 'is_sent': 0}),
+            (13, 22, BOB, now - 300, 0), (14, 22, None, now - 200, 0, {'is_sent': 0}),
+            (15, 23, BOB, now - 300, 0), (16, 23, None, now - 200, 0, {'date_retracted': 1}),
+            (17, 24, BOB, now - 300, 0), (18, 24, None, now - 200, 3001, {'associated_message_guid': 'p:0/g17'}),
+        ], {10: [MONI, BOB], 21: [BOB], 22: [BOB], 23: [BOB], 24: [BOB]})
+        items = [self.imsg(n, now - 300) for n in (1, 4, 6, 11, 13, 15, 17)]
+        self.assertEqual(t.answered(items), ({'imsg:4', 'imsg:6'}, {}))
+
+    def wa_db(self, rows):
+        import sqlite3
+        (self.home / '.wacli').mkdir()
+        c = sqlite3.connect(self.home / '.wacli/wacli.db')
+        c.execute('CREATE TABLE messages (rowid INTEGER PRIMARY KEY, chat_jid TEXT, msg_id TEXT, ts INTEGER, from_me INTEGER, '
+                  'quoted_msg_id TEXT, reaction_to_id TEXT, reaction_emoji TEXT, revoked INTEGER DEFAULT 0, deleted_at INTEGER)')
+        for rowid, jid, ts, from_me, *extra in rows:
+            c.execute('INSERT INTO messages (rowid, chat_jid, msg_id, ts, from_me) VALUES (?,?,?,?,?)', (rowid, jid, f'w{rowid}', ts, from_me))
+            for column, value in (extra[0] if extra else {}).items():
+                c.execute(f'UPDATE messages SET {column}=? WHERE rowid=?', (value, rowid))
+        c.commit()
+        c.close()
+
+    def test_whatsapp_answered_later_by_the_owner(self):
+        self.wa_db([
+            (1, 'a@s.whatsapp.net', 100, 0), (2, 'a@lid', 100, 1),     # same second, later row, other id
+            (3, 'b@s.whatsapp.net', 100, 0), (4, 'b@s.whatsapp.net', 90, 1),
+            (5, 'c@s.whatsapp.net', 100, 0), (6, 'c@s.whatsapp.net', 120, 1, {'revoked': 1}),
+            (7, 'd@s.whatsapp.net', 100, 0), (8, 'd@s.whatsapp.net', 120, 1, {'reaction_to_id': 'w7', 'reaction_emoji': ''}),
+            # Group: a reply to someone else doesn't answer her; a quote or a reaction on hers does.
+            (10, 'g@g.us', 100, 0), (11, 'g@g.us', 101, 0), (12, 'g@g.us', 120, 1, {'quoted_msg_id': 'w11'}),
+            (13, 'g@g.us', 130, 1, {'quoted_msg_id': 'w14'}), (14, 'g@g.us', 100, 0),
+            (15, 'g@g.us', 100, 0), (16, 'g@g.us', 140, 1, {'reaction_to_id': 'w15', 'reaction_emoji': '👍'})])
+        wa = types.SimpleNamespace(resolve=lambda con, jid: [jid, jid.replace('@s.whatsapp.net', '@lid')])
+        items = [{'id': f'wa:{n}', 'source': 'whatsapp', 'ts': 100, 'chat_jid': jid, 'message_id': f'w{n}'}
+                 for n, jid in ((1, 'a@s.whatsapp.net'), (3, 'b@s.whatsapp.net'), (5, 'c@s.whatsapp.net'),
+                                (7, 'd@s.whatsapp.net'), (10, 'g@g.us'), (14, 'g@g.us'), (15, 'g@g.us'))]
+        with patch.object(t, 'load_module', return_value=wa):
+            self.assertEqual(t.answered(items), ({'wa:1', 'wa:14', 'wa:15'}, {}))
+
+    def test_unreadable_store_answers_nothing(self):
+        done, errors = t.answered([self.imsg(1, 0)])
+        self.assertEqual(done, set())
+        self.assertIn('imessage', errors)
+
+    def test_unreadable_settings_drop_nothing_instead_of_stopping_the_check(self):
+        chat_db(self.home / 'Library/Messages/chat.db', [(1, 10, MONI, 0, 0)], {10: [MONI, ROBOB]})
+        for broken in ('{not json', None):
+            path = self.home / 'data/settings.json'
+            path.unlink(missing_ok=True)
+            if broken is None:
+                path.mkdir()
+            else:
+                path.write_text(broken)
+            reasons, errors = t.handled([self.imsg(1, 0)])
+            self.assertEqual(reasons, {})
+            self.assertIn('imessage', errors)
+            if broken is None:
+                path.rmdir()
+
+    def test_replayed_wake_drops_hits_answered_since(self):
+        now = 1_800_000_000
+        chat_db(self.home / 'Library/Messages/chat.db',
+                [(1, 10, MONI, now - 300, 0), (2, 20, BOB, now - 300, 0), (3, 10, None, now - 10, 0)],
+                {10: [MONI], 20: [BOB]})
+        wd = self.home / 'watch'
+        batch = self.home / 'batch.json'
+        hits = [{**self.imsg(n, now - 300), 'urgency': 'today', 'sender': 's', 'subject': '', 'preview': 'p', 'reason': 'r'} for n in (1, 2)]
+        t.atomic(batch, {'hits': hits, 'source_errors': {}})
+        state = {'outbox': {'run': 'old', 'event': t.event_text(batch, hits, {}), 'batch': str(batch)}}
+        event = t.replay_outbox(state, wd, 'new')
+        self.assertIn('imsg:2', event)
+        self.assertNotIn('imsg:1', event)
+        self.assertEqual(t.read_json(batch)['handled_before_wake'], {'imsg:1': 'answered'})
+        self.assertEqual(t.read_json(wd / 'cursor.json')['outbox']['event'], event)
+        # Once he has answered everything, the wake is dropped instead of replayed.
+        import sqlite3
+        c = sqlite3.connect(self.home / 'Library/Messages/chat.db')
+        c.execute('INSERT INTO message (ROWID, guid, handle_id, is_from_me, date) VALUES (4, ?, 0, 1, ?)', ('g4', int((now - t.APPLE_EPOCH) * 1e9)))
+        c.execute('INSERT INTO chat_message_join VALUES (20, 4, ?)', (int((now - t.APPLE_EPOCH) * 1e9),))
+        c.commit()
+        c.close()
+        self.assertIsNone(t.replay_outbox(state, wd, 'third'))
+        self.assertNotIn('outbox', t.read_json(wd / 'cursor.json'))
+
+    def test_candidates_queued_or_waiting_to_wake_are_dropped_once_their_chat_has_robob(self):
+        now = 1_800_000_000
+        # Robob joined Moni's group after her message was queued; Bob's chat stays without him.
+        chat_db(self.home / 'Library/Messages/chat.db',
+                [(1, 10, MONI, now - 300, 0), (2, 20, BOB, now - 300, 0), (3, 30, ROBOB, now - 300, 0)],
+                {10: [MONI, ROBOB], 20: [BOB], 30: [MONI]})
+        items = [self.imsg(n, now - 300) for n in (1, 2, 3)]
+        self.assertEqual(t.handled(items), ({'imsg:1': 'robob_chat', 'imsg:3': 'robob_chat'}, {}))
+        wd = self.home / 'watch'
+        batch = self.home / 'batch.json'
+        hits = [{**i, 'urgency': 'today', 'sender': 's', 'subject': '', 'preview': 'p', 'reason': 'r'} for i in items]
+        t.atomic(batch, {'hits': hits, 'source_errors': {}})
+        state = {'outbox': {'run': 'old', 'event': t.event_text(batch, hits, {}), 'batch': str(batch)}}
+        event = t.replay_outbox(state, wd, 'new')
+        self.assertIn('imsg:2', event)
+        self.assertNotIn('imsg:1', event)
+        self.assertEqual(t.read_json(batch)['handled_before_wake'], {'imsg:1': 'robob_chat', 'imsg:3': 'robob_chat'})
+
+    def test_a_replay_keeps_exactly_its_window(self):
+        now = 1_800_000_000
+        chat_db(self.home / 'Library/Messages/chat.db',
+                [(1, 20, BOB, now - 10 * 3600, 0), (2, 20, BOB, now - 4 * 3600, 0), (3, 20, BOB, now - 600, 0)],
+                {20: [BOB]})
+        config = {'excluded_imessage_chat_ids': [], 'excluded_imessage_identifiers': []}
+        with patch.object(t, 'settings', return_value=config):
+            hour = t.collect_imessage(0, now, since=now - 3600)
+            twelve = t.collect_imessage(0, now, since=now - 12 * 3600)
+            live = t.collect_imessage(0, now)
+        self.assertEqual([i['id'] for i in hour['items']], ['imsg:3'])
+        self.assertEqual(hour['drops'], {'before_window': 2})
+        self.assertEqual([i['id'] for i in twelve['items']], ['imsg:1', 'imsg:2', 'imsg:3'])
+        self.assertEqual([i['id'] for i in live['items']], ['imsg:2', 'imsg:3'])
+        self.assertEqual(live['drops'], {'history_backfill': 1})
+
+    def test_a_wake_whose_batch_was_trimmed_before_a_crash_is_rebuilt_from_the_batch(self):
+        wd = self.home / 'watch'
+        batch = self.home / 'batch.json'
+        hits = [{**self.imsg(n, 0), 'urgency': 'today', 'sender': 's', 'subject': '', 'preview': 'p', 'reason': 'r'} for n in (1, 2)]
+        stale = t.event_text(batch, hits, {})
+        # The last run removed imsg:1 from the batch, then died before saving the cursor.
+        t.atomic(batch, {'hits': hits[1:], 'source_errors': {}, 'handled_before_wake': {'imsg:1': 'answered'}})
+        with patch.object(t, 'handled', return_value=({}, {})):
+            event = t.replay_outbox({'outbox': {'run': 'old', 'event': stale, 'batch': str(batch)}}, wd, 'new')
+            self.assertIn('imsg:2', event)
+            self.assertNotIn('imsg:1', event)
+            t.atomic(batch, {'hits': [], 'source_errors': {}})
+            state = {'outbox': {'run': 'old', 'event': stale, 'batch': str(batch)}}
+            self.assertIsNone(t.replay_outbox(state, wd, 'new'))
+            self.assertNotIn('outbox', t.read_json(wd / 'cursor.json'))
+
+
+class ReplayTests(unittest.TestCase):
+    def test_a_replay_reads_its_whole_window_and_says_where_it_stopped(self):
+        def pages(sizes):
+            def collect_page(cursor):
+                start = cursor or 0
+                size = sizes[min(start // t.PAGE, len(sizes) - 1)]
+                return {'items': [{'id': f'x:{start + 1}'}], 'cursor': start + size, 'drops': {'own': 1},
+                        'dropped': [[f'x:{start + 2}', 'own']], 'scanned': size}
+            return collect_page
+        total = t.replay_pages(pages([t.PAGE, t.PAGE, 3]))
+        self.assertEqual((total['scanned'], total['cursor'], total['drops']), (2 * t.PAGE + 3, 2 * t.PAGE + 3, {'own': 3}))
+        self.assertEqual(len(total['items']), 3)
+        self.assertNotIn('partial', total)
+        with patch.object(t, 'REPLAY_PAGES', 2):
+            total = t.replay_pages(pages([t.PAGE]))
+        self.assertIn('not read', total['partial'])
+
+    def test_a_dry_run_lists_every_dropped_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / 'replay.json'
+            item = {'id': 'wa:9', 'source': 'whatsapp', 'ts': 1_800_000_000, 'sender': 'Bob', 'subject': '', 'preview': 'thanks'}
+            result = {'whatsapp': {'cursor': 9, 'items': [item], 'drops': {'own': 1}, 'dropped': [['wa:8', 'own']], 'scanned': 2},
+                      'mail': {'cursor': {}, 'items': [], 'drops': {'bulk': 1}, 'dropped': [['mail:a:1:5', 'bulk']], 'scanned': 1}}
+            args = types.SimpleNamespace(dry_run_hours=1, report=str(report))
+            with patch.dict(t.os.environ, {'WATCH_DIR': tmp}), patch.object(t, 'active_watchers', return_value=[]), \
+                 patch.object(t, 'noise_rules', return_value=[]), patch.object(t, 'collect', return_value=(result, {})), \
+                 patch.object(t, 'handled', return_value=({}, {})), patch('builtins.print'):
+                self.assertEqual(t.run(args), 0)
+            self.assertEqual(sorted(map(tuple, t.read_json(report)['dropped_ids'])),
+                             [('mail:a:1:5', 'bulk'), ('wa:8', 'own'), ('wa:9', 'greeting')])
+
+    def test_a_dry_run_classifies_every_candidate_a_batch_at_a_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / 'replay.json'
+            items = [{'id': f'wa:{n}', 'source': 'whatsapp', 'ts': 1_800_000_000, 'sender': 'Bob', 'subject': '',
+                      'preview': f'can you send the invoice {n}'} for n in range(t.MAX_BATCH + 1)]
+            result = {'whatsapp': {'cursor': 99, 'items': items, 'drops': {}, 'dropped': [], 'scanned': len(items)}}
+            def classify(batch, context):
+                return [{'id': batch[-1]['id'], 'reason': 'r', 'urgency': 'today'}], {'model': 'm', 'input_tokens': 1, 'output_tokens': 1, 'cost_usd': 0.5}
+            args = types.SimpleNamespace(dry_run_hours=1, report=str(report))
+            with patch.dict(t.os.environ, {'WATCH_DIR': tmp}), patch.object(t, 'active_watchers', return_value=[]), \
+                 patch.object(t, 'noise_rules', return_value=[]), patch.object(t, 'collect', return_value=(result, {})), \
+                 patch.object(t, 'handled', return_value=({}, {})), patch.object(t, 'build_context', return_value={}), \
+                 patch.object(t, 'classify', side_effect=classify) as model, patch('builtins.print'):
+                self.assertEqual(t.run(args), 0)
+            self.assertEqual([len(call[0][0]) for call in model.call_args_list], [t.MAX_BATCH, 1])
+            out = t.read_json(report)
+            self.assertEqual(out['candidate_count'], t.MAX_BATCH + 1)
+            self.assertEqual([h['id'] for h in out['hits']], [f'wa:{t.MAX_BATCH - 1}', f'wa:{t.MAX_BATCH}'])
+            self.assertEqual((out['usage']['input_tokens'], out['usage']['cost_usd']), (2, 1.0))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -14,7 +14,8 @@ a trip that disappears without a terminal history status shows "Checking" and is
 UNKNOWN_GIVE_UP_S, then frozen as unconfirmed. It never sends anything itself.
 
 Env overrides (all optional):
-  WATCH_DIR          directory for rides.json (default: current working dir)
+  WATCH_DIR          directory for rides.json and polls.jsonl (one line per poll: raw Uber status,
+                     headline, pickup ETA, car-to-pickup metres, card state; default: current dir)
   RIDE_SHARE_STATE   full path of the state file
   RIDE_SHARE_HINTS   rider/booker hint directory (default ~/.local/share/rides-notify)
   RIDE_CARD_ROOT     where cards are written. Unset: the live imessage-apps folder only when WATCH_DIR
@@ -90,6 +91,27 @@ def uber(*args, timeout=25):
     return json.loads((p.stdout.strip().splitlines() or ["{}"])[-1])
 
 
+POLL_LOG_MAX = 2_000_000    # bytes; polls.jsonl keeps its newest half past this
+
+
+def log_poll(trip, card, now):
+    """One line per poll of a live trip with Uber's raw status, so the at-pickup rule can be checked
+    against real rides. Distance only, never the car's coordinates."""
+    path = Path(WD) / "polls.jsonl"
+    try:  # diagnostics only: never let a bad row stop the watcher's real work
+        row = {"ts": rc.iso(now), "trip": card["trip"], "status": trip.get("status"),
+               "headline": rc.clean(trip.get("headline")), "detail": rc.clean(trip.get("detail")),
+               "eta": rc.clean(trip.get("pickupEta"), 16), "dist_m": rc.pickup_distance(trip), "card": card["state"]}
+        line = json.dumps(row) + "\n"
+        if path.exists() and path.stat().st_size > POLL_LOG_MAX:
+            keep = path.read_bytes()[-POLL_LOG_MAX // 2:]
+            rc.atomic_write(path, keep[keep.find(b"\n") + 1:], "wb")
+        with open(path, "a") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"ride-share: poll log failed: {e!r}", file=sys.stderr)
+
+
 def who(uuid):
     rider, hinted = rc.rider_for(uuid)
     return rider, hinted, f"{rider}{'' if hinted else '(assumed)'}"
@@ -146,6 +168,7 @@ def main():
                 rc.write_card(card)
             elif rc.preview_pending(cur):
                 s["preview_retry"].setdefault(cur, 0)
+        log_poll(trip, prev if prev and prev.get("terminal") else card, now)
         t.pop("misses", None)
         t.update(status=trip.get("status"), dest=card.get("dropoff") or t.get("dest"), last_seen=now,
                  rider=rider, rider_hinted=hinted)
