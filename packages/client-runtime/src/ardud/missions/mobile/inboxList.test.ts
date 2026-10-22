@@ -179,4 +179,33 @@ describe("phone inbox list", () => {
         history.suggestions.length,
     );
   });
+
+  it("keeps the owner's comments and what a draft actually sent on its decided row", () => {
+    const source = createFixtureMissionsSource({ now: () => NOW });
+    const history = first<MissionInboxHistory>((listener) =>
+      source.subscribeInboxHistory(CRPKO, listener),
+    );
+    const draft = history.drafts[0];
+    if (!draft) throw new Error("fixture has no decided draft");
+    const comment = { id: "c-1", body: "Post it after lunch", at: FIXTURE_NOW };
+    const rows = decidedRows(
+      { ...history, drafts: [{ ...draft, sentText: "Posted after lunch, with the link." }] },
+      NOW,
+      [
+        {
+          id: `draft:${draft.id}`,
+          missionId: CRPKO,
+          subject: { kind: "draft", id: draft.id },
+          comments: [comment],
+          snooze: null,
+          updatedAt: FIXTURE_NOW,
+        },
+      ],
+    );
+    expect(rows.find((row) => row.key === `draft:${draft.id}`)).toMatchObject({
+      comments: [comment],
+      sent: "Posted after lunch, with the link.",
+    });
+    expect(rows.filter((row) => row.comments.length > 0)).toHaveLength(1);
+  });
 });

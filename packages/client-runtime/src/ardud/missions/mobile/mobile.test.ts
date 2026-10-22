@@ -8,8 +8,10 @@ import type {
 import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "../fixture/index.ts";
-import type { MissionRoomEntry, MissionsSource } from "../source.ts";
+import { commentsOf } from "../inboxViewModel.ts";
+import type { MissionInboxSnapshot, MissionRoomEntry, MissionsSource } from "../source.ts";
 import {
+  approvalDecisionInput,
   askAnswerInput,
   askView,
   draftDecisionInput,
@@ -141,6 +143,67 @@ describe("drafts, knocks and suggestions", () => {
     });
     expect(draftDecisionInput(draft, { action: "approve", editedText: "  " }).ok).toBe(false);
     expect(draftDecisionInput(draft, { action: "rewrite", note: "" }).ok).toBe(false);
+  });
+
+  it("sends the owner's note with a draft decision, never beside a rewrite note", () => {
+    const draft = inboxOf(fixture()).drafts[0]!;
+    expect(draftDecisionInput(draft, { action: "approve" }, " After lunch ")).toEqual({
+      ok: true,
+      input: { draftId: draft.id, action: "approve", revision: 0, note: "After lunch" },
+    });
+    expect(draftDecisionInput(draft, { action: "drop" }, "  ")).toEqual({
+      ok: true,
+      input: { draftId: draft.id, action: "drop" },
+    });
+    expect(draftDecisionInput(draft, { action: "rewrite", note: "Shorter" }, "Shorter")).toEqual({
+      ok: true,
+      input: { draftId: draft.id, action: "rewrite", rewriteNote: "Shorter" },
+    });
+  });
+
+  it("sends the owner's note with an answer, a knock, a suggestion and an approval", () => {
+    const inbox = inboxOf(fixture());
+    const ask = inbox.asks[0]!;
+    expect(askAnswerInput(ask, { optionId: "hold", text: "" }, " Tell Pavan ")).toEqual({
+      ok: true,
+      input: { askId: ask.id, optionId: "hold", text: "", note: "Tell Pavan" },
+    });
+    expect(askAnswerInput(ask, { optionId: "hold", text: "" }, "")).toEqual({
+      ok: true,
+      input: { askId: ask.id, optionId: "hold", text: "" },
+    });
+    const knock = inbox.knocks[0]!;
+    expect(knockDecisionInput(knock, { action: "drop" }, "Spam")).toEqual({
+      ok: true,
+      input: { knockId: knock.id, action: "drop", note: "Spam" },
+    });
+    const suggestion = inbox.suggestions[0]!;
+    expect(suggestionDecisionInput(suggestion, { action: "accept" }, " Try a week ")).toEqual({
+      ok: true,
+      input: { suggestionId: suggestion.id, action: "accept", note: "Try a week" },
+    });
+    const approval = inbox.approvals[0]!;
+    expect(approvalDecisionInput(approval, "reject", " ")).toEqual({
+      ok: true,
+      input: { approvalId: approval.id, action: "reject" },
+    });
+    expect(approvalDecisionInput(approval, "approve", "x".repeat(4001)).ok).toBe(false);
+  });
+
+  it("keeps a decision note as a comment on the item once it is decided", async () => {
+    const source = fixture();
+    const inbox = latest<MissionInboxSnapshot>((listener) =>
+      source.subscribeInbox(CRPKO, listener),
+    );
+    const knock = inbox.value.knocks[0]!;
+    const result = knockDecisionInput(knock, { action: "drop" }, "Not for the master");
+    if (!result.ok) throw new Error(result.error);
+    await source.decideKnock(result.input);
+    expect(inbox.value.knocks).toEqual([]);
+    expect(commentsOf(inbox.value, `knock:${knock.id}`).map((comment) => comment.body)).toEqual([
+      "Not for the master",
+    ]);
+    inbox.close();
   });
 
   it("forwards a knock to the master, with the edit only when it changed", async () => {

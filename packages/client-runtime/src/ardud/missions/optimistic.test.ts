@@ -1,9 +1,9 @@
 // @effect-diagnostics globalDate:off - Tests build times on the local clock.
-import type { MissionId } from "@t3tools/contracts";
+import type { InboxItemKind, InboxMark, MissionId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { createFixtureMissionsSource, FIXTURE_NOW } from "./fixture/index.ts";
-import { inboxTabCounts } from "./inboxViewModel.ts";
+import { commentsOf, inboxTabCounts } from "./inboxViewModel.ts";
 import {
   reopenedRequest,
   settledRequest,
@@ -161,24 +161,38 @@ describe("withoutInboxItem", () => {
     expect(withoutInboxItem(inbox, "knock", "missing")).toBe(inbox);
   });
 
-  it("drops the item's mark so snoozed counts stay right", () => {
+  const markOn = (
+    kind: InboxItemKind,
+    id: string,
+    overrides: Partial<InboxMark> = {},
+  ): InboxMark => ({
+    id: `${kind}:${id}`,
+    missionId: null,
+    subject: { kind, id },
+    comments: [],
+    snooze: { at: FIXTURE_NOW, until: null, stamp: "s" },
+    updatedAt: FIXTURE_NOW,
+    ...overrides,
+  });
+
+  it("drops a snooze-only mark so snoozed counts stay right", () => {
     const ask = inbox.asks[0]!;
-    const marked: MissionInboxSnapshot = {
-      ...inbox,
-      marks: [
-        {
-          id: `ask:${ask.id}`,
-          missionId: null,
-          subject: { kind: "ask", id: ask.id },
-          comments: [],
-          snooze: { at: FIXTURE_NOW, until: null, stamp: "s" },
-          updatedAt: FIXTURE_NOW,
-        },
-      ],
-    };
-    const next = withoutInboxItem(marked, "ask", ask.id);
+    const next = withoutInboxItem({ ...inbox, marks: [markOn("ask", ask.id)] }, "ask", ask.id);
     expect(next.marks).toEqual([]);
     expect(inboxTabCounts(next, "owner", NOW).decide).toBe(0);
+  });
+
+  it("keeps the comments on a decided item and only lifts its snooze", () => {
+    const ask = inbox.asks[0]!;
+    const comments = [{ id: "c-1", body: "Leaning hold", at: FIXTURE_NOW }];
+    const snoozed = markOn("ask", ask.id, { comments });
+    const next = withoutInboxItem({ ...inbox, marks: [snoozed] }, "ask", ask.id);
+    expect(commentsOf(next, `ask:${ask.id}`)).toEqual(comments);
+    expect(next.marks?.[0]?.snooze).toBeNull();
+    expect(inboxTabCounts(next, "owner", NOW).decide).toBe(0);
+    // Comments without a snooze are left exactly as they were.
+    const commented = { ...inbox, marks: [markOn("ask", ask.id, { comments, snooze: null })] };
+    expect(withoutInboxItem(commented, "ask", ask.id).marks).toBe(commented.marks);
   });
 });
 
@@ -234,6 +248,32 @@ describe("withOptimisticDecisions", () => {
     expect(shown.value.drafts.map((draft) => draft.id)).not.toContain(draftId);
     expect(shown.value.counts.approve).toBe(inbox.counts.approve - 1);
     expect(harness.sends.map((send) => send.method)).toEqual(["decideDraft"]);
+  });
+
+  it("sends the decision note as given and keeps the item's comments in view", () => {
+    const harness = controlled();
+    const shown = latest<MissionInboxSnapshot>((listener) =>
+      harness.source.subscribeInbox(null, listener),
+    );
+    const comments = [{ id: "c-1", body: "Earlier thought", at: FIXTURE_NOW }];
+    harness.pushInbox({
+      ...inbox,
+      marks: [
+        {
+          id: `draft:${draftId}`,
+          missionId: null,
+          subject: { kind: "draft", id: draftId },
+          comments,
+          snooze: null,
+          updatedAt: FIXTURE_NOW,
+        },
+      ],
+    });
+    const noted = { ...decideDraft, note: "Post after lunch" };
+    void harness.source.decideDraft(noted as never);
+    expect(harness.sends[0]?.input).toEqual(noted);
+    expect(shown.value.drafts.map((draft) => draft.id)).not.toContain(draftId);
+    expect(commentsOf(shown.value, `draft:${draftId}`)).toEqual(comments);
   });
 
   it("keeps the item hidden when a stale snapshot lands before the send finishes", async () => {

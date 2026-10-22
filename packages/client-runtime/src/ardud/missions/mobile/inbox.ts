@@ -19,6 +19,7 @@ import type {
   SuggestionTargetKind,
 } from "@t3tools/contracts";
 
+import { decisionNote } from "../inboxViewModel.ts";
 import { refLabel } from "../viewModel.ts";
 
 // Inbox logic for the owner's phone: which segment to show, what each card
@@ -32,6 +33,12 @@ export type FormResult<T> =
 
 const ok = <T>(input: T): FormResult<T> => ({ ok: true, input });
 const fail = <T>(error: string): FormResult<T> => ({ ok: false, error });
+
+/** The input with the owner's decision note, or the note's problem. A blank note is left out. */
+function withNote<T>(input: T, note: string): FormResult<T> {
+  const noted = decisionNote(note);
+  return noted.ok ? ok({ ...input, ...noted.value }) : fail(noted.error);
+}
 
 /** Reads the owner-facing detail of a rejected mutation. */
 export function missionErrorMessage(error: unknown): string {
@@ -155,14 +162,18 @@ export function toggleAskOption(form: AskAnswerForm, optionId: string): AskAnswe
   return { ...form, optionId: form.optionId === optionId ? null : optionId };
 }
 
-export function askAnswerInput(ask: Ask, form: AskAnswerForm): FormResult<AnswerAskInput> {
+export function askAnswerInput(
+  ask: Ask,
+  form: AskAnswerForm,
+  note = "",
+): FormResult<AnswerAskInput> {
   if (ask.status !== "open") return fail("This ask is already closed.");
   const text = form.text.trim();
   if (form.optionId !== null && !ask.options.some((option) => option.id === form.optionId)) {
     return fail("Pick one of the listed options.");
   }
   if (form.optionId === null && text === "") return fail("Pick an option or write an answer.");
-  return ok({ askId: ask.id, optionId: form.optionId, text });
+  return withNote<AnswerAskInput>({ askId: ask.id, optionId: form.optionId, text }, note);
 }
 
 export function canSubmitAskAnswer(ask: Ask, form: AskAnswerForm): boolean {
@@ -201,29 +212,37 @@ export type DraftForm =
   | { readonly action: "rewrite"; readonly note: string }
   | { readonly action: "drop" };
 
-export function draftDecisionInput(draft: Draft, form: DraftForm): FormResult<DecideDraftInput> {
+/** `note` goes with approve and drop; a rewrite sends its own note as the rewrite note only. */
+export function draftDecisionInput(
+  draft: Draft,
+  form: DraftForm,
+  note = "",
+): FormResult<DecideDraftInput> {
   if (draft.status !== "pending") return fail("This draft is already decided.");
   // The server binds an approval to the revision the owner read and refuses one without it.
   const revision = draft.revision ?? 0;
   switch (form.action) {
     case "approve": {
       if (form.editedText === undefined) {
-        return ok({ draftId: draft.id, action: "approve", revision });
+        return withNote<DecideDraftInput>({ draftId: draft.id, action: "approve", revision }, note);
       }
       const edited = form.editedText.trim();
       if (edited === "") return fail("The draft can't be empty.");
       // An untouched edit is a plain approval, so the record does not claim an edit.
       if (edited === draft.text.trim())
-        return ok({ draftId: draft.id, action: "approve", revision });
-      return ok({ draftId: draft.id, action: "approve", editedText: edited, revision });
+        return withNote<DecideDraftInput>({ draftId: draft.id, action: "approve", revision }, note);
+      return withNote<DecideDraftInput>(
+        { draftId: draft.id, action: "approve", editedText: edited, revision },
+        note,
+      );
     }
     case "rewrite": {
-      const note = form.note.trim();
-      if (note === "") return fail("Say what the rewrite should change.");
-      return ok({ draftId: draft.id, action: "rewrite", rewriteNote: note });
+      const rewriteNote = form.note.trim();
+      if (rewriteNote === "") return fail("Say what the rewrite should change.");
+      return ok({ draftId: draft.id, action: "rewrite", rewriteNote });
     }
     case "drop":
-      return ok({ draftId: draft.id, action: "drop" });
+      return withNote<DecideDraftInput>({ draftId: draft.id, action: "drop" }, note);
   }
 }
 
@@ -236,12 +255,7 @@ export function approvalDecisionInput(
   note: string,
 ): FormResult<DecideApprovalInput> {
   if (approval.status !== "pending") return fail("This approval is already decided.");
-  const trimmed = note.trim();
-  return ok({
-    approvalId: approval.id,
-    action,
-    ...(trimmed === "" ? {} : { note: trimmed }),
-  });
+  return withNote<DecideApprovalInput>({ approvalId: approval.id, action }, note);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,14 +276,19 @@ export type KnockForm =
   | { readonly action: "drop" };
 
 /** Forwarding goes to the mission's master; the source picks the master role. */
-export function knockDecisionInput(knock: Knock, form: KnockForm): FormResult<DecideKnockInput> {
+export function knockDecisionInput(
+  knock: Knock,
+  form: KnockForm,
+  note = "",
+): FormResult<DecideKnockInput> {
   if (knock.status !== "pending") return fail("This knock is already handled.");
-  if (form.action === "drop") return ok({ knockId: knock.id, action: "drop" });
-  if (form.editedText === undefined) return ok({ knockId: knock.id, action: "forward" });
+  const decided = (input: DecideKnockInput) => withNote(input, note);
+  if (form.action === "drop") return decided({ knockId: knock.id, action: "drop" });
+  if (form.editedText === undefined) return decided({ knockId: knock.id, action: "forward" });
   const edited = form.editedText.trim();
   if (edited === "") return fail("The message can't be empty.");
-  if (edited === knock.summary.trim()) return ok({ knockId: knock.id, action: "forward" });
-  return ok({ knockId: knock.id, action: "forward", editedText: edited });
+  if (edited === knock.summary.trim()) return decided({ knockId: knock.id, action: "forward" });
+  return decided({ knockId: knock.id, action: "forward", editedText: edited });
 }
 
 // ---------------------------------------------------------------------------
@@ -326,14 +345,16 @@ export type SuggestionForm =
 export function suggestionDecisionInput(
   suggestion: Suggestion,
   form: SuggestionForm,
+  note = "",
 ): FormResult<DecideSuggestionInput> {
   if (suggestion.status !== "open") return fail("This suggestion is already decided.");
+  const decided = (input: DecideSuggestionInput) => withNote(input, note);
   switch (form.action) {
     case "accept":
-      return ok({ suggestionId: suggestion.id, action: "accept" });
+      return decided({ suggestionId: suggestion.id, action: "accept" });
     case "dismiss": {
       const reason = form.reason.trim();
-      return ok({
+      return decided({
         suggestionId: suggestion.id,
         action: "dismiss",
         ...(reason === "" ? {} : { dismissReason: reason }),
@@ -351,9 +372,9 @@ export function suggestionDecisionInput(
         }
       }
       if (JSON.stringify(editedAfter) === JSON.stringify(suggestion.after)) {
-        return ok({ suggestionId: suggestion.id, action: "accept" });
+        return decided({ suggestionId: suggestion.id, action: "accept" });
       }
-      return ok({ suggestionId: suggestion.id, action: "accept-edited", editedAfter });
+      return decided({ suggestionId: suggestion.id, action: "accept-edited", editedAfter });
     }
   }
 }
