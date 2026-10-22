@@ -55,6 +55,13 @@ ABSOLUTE_DATE_RE = r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}'
 DUBAI = dt.timezone(dt.timedelta(hours=4))
 
 
+class CatalogError(journal.JournalError):
+    def __init__(self, code, sku_config):
+        self.code = code
+        self.details = {'sku_config': sku_config}
+        super().__init__(code)
+
+
 def _fail(code):
     journal.fail(code)
 
@@ -85,8 +92,12 @@ def resolve_rocket_offer(headers, sku_config, *, deadline=None, timeout=25):
     """
     if not isinstance(sku_config, str) or not market.ID.fullmatch(sku_config):
         _fail('SUPERMALL_SKU_CONFIG_INVALID')
+    def unavailable(code):
+        raise CatalogError(code, sku_config)
     headers = seam._headers(headers)
-    headers.update({'x-mp': 'noon', 'x-experience': 'ecom'})
+    # Ecom search collapses some Rocket skuConfigs into a different variant.
+    # Catalog uses rocket; the separately captured checkout still uses ecom.
+    headers.update({'x-mp': 'noon', 'x-experience': 'rocket'})
     url = ('https://' + SEARCH_HOST + SEARCH_PATH + '?q='
            + urllib.parse.quote(sku_config, safe=''))
     request = urllib.request.Request(url, headers=headers, method='GET')
@@ -99,23 +110,23 @@ def resolve_rocket_offer(headers, sku_config, *, deadline=None, timeout=25):
                     raise core.NoonError('HTTP_' + str(response.code))
                 data = seam.decode_response(response.read(seam.MAX_BYTES + 1))
     except (OSError, ValueError, urllib.error.URLError, core.NoonError):
-        _fail('SUPERMALL_CATALOG_SEARCH_FAILED')
+        unavailable('SUPERMALL_CATALOG_SEARCH_FAILED')
     hits = data.get('hits') if isinstance(data, dict) else None
     if not isinstance(hits, list) or len(hits) > 200:
-        _fail('SUPERMALL_CATALOG_SCHEMA_CHANGED')
+        unavailable('SUPERMALL_CATALOG_SCHEMA_CHANGED')
     matches = [hit for hit in hits if isinstance(hit, dict)
                and hit.get('sku_config') == sku_config]
     offers = {hit.get('offer_code') for hit in matches
               if _truthy(hit.get('is_buyable'))}
     if not matches or len(offers) != 1:
-        _fail('SUPERMALL_CATALOG_ITEM_UNAVAILABLE')
+        unavailable('SUPERMALL_CATALOG_ITEM_UNAVAILABLE')
     rocket = [hit for hit in matches
               if hit.get('offer_code') in offers and _is_rocket_hit(hit)]
     if len(rocket) != 1:
-        _fail('SUPERMALL_ITEM_NOT_ROCKET')
+        unavailable('SUPERMALL_ITEM_NOT_ROCKET')
     offer = rocket[0].get('offer_code')
     if not isinstance(offer, str) or not market.ID.fullmatch(offer):
-        _fail('SUPERMALL_CATALOG_SCHEMA_CHANGED')
+        unavailable('SUPERMALL_CATALOG_SCHEMA_CHANGED')
     minimum = max([_positive_int(hit.get('stock_minimum_quantity')) or 1
                    for hit in matches])
     return {'offer': offer, 'stock_minimum_quantity': minimum,
@@ -125,9 +136,8 @@ def resolve_rocket_offer(headers, sku_config, *, deadline=None, timeout=25):
 
 def _is_rocket_hit(hit):
     flags = hit.get('flags')
-    if isinstance(flags, list) and 'rocket' in [f for f in flags if isinstance(f, str)]:
-        return True
-    return isinstance(hit.get('rocket'), dict) and bool(hit['rocket'])
+    # A nested rocket object can advertise a DIFFERENT offer on a standard hit.
+    return isinstance(flags, list) and 'rocket' in flags
 
 
 def active_marketplace_orders(*, timeout=25):
@@ -423,6 +433,9 @@ class SupermallOrderFlow:
                                 evidence_hash=journal.digest({'reason': 'EXACT_ADDED_MANIFEST_MISMATCH'}))
             _fail('SUPERMALL_EXACT_ADDED_MANIFEST_MISMATCH')
         self.last_cart = after
+        if self.current_operation:
+            journal.observe(self.flow_id, self.current_operation, outcome='CART_READBACK',
+                            evidence_hash=market.cleanup_readback_hash(after, self.account_hash, self.address_hash))
         result = {'items': added, 'count': summary['count']}
         if self.single:
             result.update({'offer': self.offer, 'sku_config': self.sku_config,

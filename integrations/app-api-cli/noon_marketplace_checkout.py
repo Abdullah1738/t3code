@@ -177,8 +177,11 @@ def operation(service, name, **args):
         method, mutation = 'GET', False
         page = _bool(args.pop('is_page_cart', False))
         path = CART + '?isPageCart=' + str(page).lower()
-    elif name in ('add', 'quantity'):
-        offer, qty = _id(args.pop('offer')), _quantity(args.pop('quantity'))
+    elif name in ('add', 'quantity', 'remove'):
+        offer = _id(args.pop('offer'))
+        # Explicit cart-only removal uses the quantity PUT at zero. Ordinary
+        # quantity/add operations still reject zero and negative quantities.
+        qty = 0 if name == 'remove' else _quantity(args.pop('quantity'))
         page = _bool(args.pop('is_page_cart', False))
         path = CART + '/item/' + urllib.parse.quote(offer, safe='') + '/' + str(qty)
         if name == 'add':
@@ -372,6 +375,11 @@ def cart_projection(data):
     return {'count': count, 'items': rows, 'empty': count == 0 and not rows and not data['offers'],
             'has_rocket_tab': isinstance(data.get('rocketTab'), dict),
             'populated_manifest_live_validated': False}
+
+
+def cleanup_readback_hash(response, account_hash, address_hash):
+    """Bind full RAM-only cart evidence to the verified account, Home and rail."""
+    return fingerprint([response.operation.service, account_hash, address_hash, response.data])
 
 
 def selection_payload(cart, changes):

@@ -23,6 +23,8 @@ commerce recover-payment FLOW_UUID --max-reads 90
 commerce await-payment FLOW_UUID --minutes 4
 commerce release-flow FLOW_UUID
 commerce abandon-flow FLOW_UUID
+commerce clear-cart supermall --flow FLOW_UUID
+commerce clear-cart main --flow FLOW_UUID
 commerce track FLOW_UUID
 commerce track-exact noon minutes I_ORDER_ID
 commerce track-exact noon nownow NN_ORDER_ID
@@ -72,6 +74,20 @@ All seven lanes accept `--items-file FILE` (or `-` for stdin), a JSON array or
 Many items stay in one checkout/flow; do not silently split a requested basket.
 Unverified merchant variants, modifiers and scheduled slots still require an
 explicit app fallback. Mart/Shops notes and choices are not supported.
+
+For abandoned Main/Supermall preparations, close the nonfinancial flow with
+`abandon-flow`, then explicitly `clear-cart VERTICAL --flow FLOW_UUID`. Cleanup
+requires journal-owned adds, unchanged full-cart evidence, matching account/Home,
+no later local writer and no active order/account flow. Every removal is consumed
+once and independently read back; partial/ambiguous clears stay fenced. Old flows
+without cart readback evidence require an exact match to the retained add-response
+hash. A failed prepare alone does not authorize clearing a different basket.
+Marketplace cleanup is fixture-tested only; no live removal proof. Noon exposes
+no atomic cart revision guard, so do not run it during phone/app cart editing.
+
+Supermall offer resolution uses the Rocket catalog experience (checkout remains
+ecom). Only the selected offer's `rocket` flag qualifies; a nested Rocket promotion
+on an FBN offer does not. Catalog failures include `details.sku_config`.
 
 For Talabat, `recover-payment` restores the exact received transaction and native
 polling cursor. For Minutes, it reads the exact persisted order, including a

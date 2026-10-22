@@ -119,6 +119,8 @@ def strip_html(s):
 def search(mode, query, limit, page, timeout, rocket=False):
     saved, headers = session(mode)
     location = verify_home(headers, timeout)
+    if mode == 'noon':
+        headers = dict(headers, **{'x-mp': 'noon', 'x-experience': 'rocket' if rocket else 'ecom'})
     u = urllib.parse.urlsplit(saved['url'])
     expected = ('api-app-instant.noon.com', '/_svc/catalog/search') if mode == 'minutes' else ('api-app.noon.com', '/_svc/catalog/api/v3/u/search')
     if (u.hostname, u.path) != expected:
@@ -135,7 +137,8 @@ def search(mode, query, limit, page, timeout, rocket=False):
         sale = next((p[k] for k in ['offerPrice', 'offer_price', 'salePrice', 'sale_price'] if p.get(k) is not None), None)
         regular = p.get('price')
         flags = p.get('flags') or []
-        rk = p.get('rocket') or {}
+        is_rocket = isinstance(flags, list) and 'rocket' in flags
+        rk = p.get('rocket') if is_rocket and isinstance(p.get('rocket'), dict) else {}
         from catalog_schema import image
         row = {'id': p.get('sku'), 'name': clean_name(name), 'size': p.get('sizeInfo', p.get('size_info')),
                'image_url': image(p, 'https://f.nooncdn.com/p/'),
@@ -145,7 +148,8 @@ def search(mode, query, limit, page, timeout, rocket=False):
                'unavailable_reason': p.get('notBuyableReason', p.get('not_buyable_reason')),
                'seller': p.get('store_name')}
         if mode == 'noon':
-            row.update(eta=strip_html(p.get('estimated_delivery_date')),
+            row.update(sku_config=p.get('sku_config'), offer_code=p.get('offer_code'),
+                       is_rocket=is_rocket, eta=strip_html(p.get('estimated_delivery_date')),
                        rocket_eta=strip_html(rk.get('estimation_text')) if rk else None,
                        rocket_price=money(rk.get('sale_price') or rk.get('price')) if rk else None,
                        express='fbn' in flags or 'rocket' in flags, rating=(p.get('product_rating') or {}).get('value'))
@@ -155,7 +159,7 @@ def search(mode, query, limit, page, timeout, rocket=False):
     fetched_count = len(rows)
     rows = [r for r in rows if item_matches(query, r['name'])]
     if rocket:
-        rows = [r for r in rows if r.get('rocket_eta')]
+        rows = [r for r in rows if r.get('is_rocket')]
     result = base(mode, query, location)
     result.update({'items': rows[:limit], 'total': data.get('nbHits'), 'pages': data.get('nbPages'), 'page': page,
                    'fetched_count': fetched_count, 'unrelated_removed': fetched_count-len(rows),

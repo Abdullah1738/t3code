@@ -381,6 +381,9 @@ class MainOrderFlow:
                                 evidence_hash=journal.digest({'reason': 'EXACT_ADDED_MANIFEST_MISMATCH'}))
             _fail('MAIN_EXACT_ADDED_MANIFEST_MISMATCH')
         self.last_cart = after
+        if self.current_operation:
+            journal.observe(self.flow_id, self.current_operation, outcome='CART_READBACK',
+                            evidence_hash=market.cleanup_readback_hash(after, self.account_hash, self.address_hash))
         result = {'items': added, 'count': summary['count']}
         if self.single:
             result.update({'offer': self.offer, 'sku_config': self.sku_config,

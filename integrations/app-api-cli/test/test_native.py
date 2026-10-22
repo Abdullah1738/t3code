@@ -6,6 +6,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import native
 
 class NativeReadOnlyTests(unittest.TestCase):
+    def test_rocket_search_requires_selected_offer_flag(self):
+        saved = {'url': 'https://api-app.noon.com/_svc/catalog/api/v3/u/search'}
+        promotion = {'sku': 'BOOK', 'sku_config': 'BOOK', 'name': 'Coloring book',
+                     'flags': ['fbn', 'nano'], 'rocket': {'estimation_text': 'GET IN 1 HR', 'price': 26}}
+        real = dict(promotion, sku='REAL', sku_config='REAL', flags=['rocket'])
+        with patch.object(native, 'session', return_value=(saved, {})), \
+                patch.object(native, 'verify_home', return_value={}), \
+                patch.object(native, 'get', return_value={'hits': [promotion, real]}) as get:
+            rows = native.search('noon', 'book', 10, 1, 5, rocket=True)['items']
+            self.assertEqual([row['id'] for row in rows], ['REAL'])
+            self.assertEqual(get.call_args.args[1]['x-experience'], 'rocket')
+            rows = native.search('noon', 'book', 10, 1, 5)['items']
+            self.assertIs(rows[0]['is_rocket'], False)
+            self.assertIsNone(rows[0]['rocket_eta'])
+
     def test_no_writes_or_credential_redirects(self):
         for url in ['https://api-app.noon.com/_svc/checkout-v2/order/place',
                     'https://api-app-instant.noon.com/_svc/instant/session/sync',

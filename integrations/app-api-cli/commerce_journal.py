@@ -30,7 +30,7 @@ OUTCOMES = frozenset({'RESPONSE_RECEIVED', 'UNKNOWN', 'CHALLENGE_REQUIRED',
                        'EXACT_ORDER_CONFIRMED', 'TRACKER_REGISTERED',
                        'PREORDER_INTENT_RECEIVED','PREORDER_PAYMENT_CONFIRMED',
                        'FLOW_RELEASED_NO_PAYMENT_SENT', 'STABLE_CART_ADOPTED',
-                        'FENCED_PAYMENT_RECONCILED', 'PREPARATION_FAILED'})
+                        'FENCED_PAYMENT_RECONCILED', 'PREPARATION_FAILED', 'CART_READBACK'})
 KINDS = frozenset({'cart', 'quote', 'instructions', 'selection', 'place', 'payment',
                    'preauthorize','prepay'})
 SCHEMA = {
@@ -816,6 +816,49 @@ def claim_minutes_cleanup(source_flow_id, cleanup_flow_id, *, evidence_hash):
     return open_flow(flow_id=cleanup_flow_id, app='noon', vertical='minutes',
                      account_hash=proof['account_hash'],
                      scope_hash=digest({'cleanup_of': source_flow_id, 'evidence_hash': evidence_hash}))
+
+
+def marketplace_cleanup_source(flow_id, vertical, *, cleanup_flow_id=None):
+    """Closed, observed adds only; later writers across noon invalidate ownership."""
+    with _db() as db:
+        flow = _get(db, flow_id)
+        ops = list(db.execute('SELECT rowid AS seq,* FROM operations WHERE flow_id=? ORDER BY rowid', (flow_id,)))
+        adds = [op for op in ops if op['kind'] == 'cart'
+                and re.fullmatch(r'add(?:_rocket)?(?:_[0-9a-f]{16})?', op['name'])]
+        if (vertical not in ('main', 'supermall') or flow['app'] != 'noon'
+                or flow['vertical'] != vertical or flow['state'] != 'RELEASED'
+                or flow['reserved_minor'] != 0 or any(flow[k] is not None for k in
+                    ('order_id', 'review_hash', 'place_cart_hash')) or not adds
+                or any(op['state'] != 'OBSERVED' or not (op in adds or
+                    op['kind'] == 'quote' and re.fullmatch(r'session(?:_[0-9a-f]{8})?', op['name'])) for op in ops)):
+            fail('MARKETPLACE_CLEAR_CLOSED_CART_ONLY_FLOW_REQUIRED')
+        observations = list(db.execute('SELECT * FROM observations WHERE flow_id=? ORDER BY sequence', (flow_id,)))
+        for op in ops:
+            evidence = [row for row in observations if row['operation'] == op['name']]
+            if (not any(row['outcome'] == 'RESPONSE_RECEIVED' for row in evidence)
+                    or any(row['outcome'] not in ('RESPONSE_RECEIVED', 'CART_READBACK')
+                           or row['order_id'] is not None for row in evidence)):
+                fail('MARKETPLACE_CLEAR_CART_EVIDENCE_REQUIRED')
+        readbacks = [row for row in observations if row['outcome'] == 'CART_READBACK']
+        last_add = adds[-1]
+        add_evidence = [row for row in observations if row['operation'] == last_add['name']
+                        and row['outcome'] == 'RESPONSE_RECEIVED'][-1]['evidence_hash']
+        proof = {'account_hash': flow['account_hash'], 'scope_hash': flow['scope_hash'],
+                 'adds': [{'name': op['name'], 'request_hash': op['request_hash']} for op in adds],
+                 'add_evidence_hash': add_evidence,
+                 'readback_hash': readbacks[-1]['evidence_hash'] if readbacks else None}
+        if cleanup_flow_id is not None:
+            claim = _get(db, cleanup_flow_id)
+            if (claim['app'] != 'noon' or claim['vertical'] != vertical
+                    or claim['account_hash'] != flow['account_hash'] or claim['state'] != 'ACTIVE'
+                    or claim['scope_hash'] != digest({'cleanup_of': flow_id, 'proof': proof})):
+                fail('MARKETPLACE_CLEAR_CLAIM_INVALID')
+        if db.execute("SELECT 1 FROM operations p JOIN flows f ON p.flow_id=f.id "
+                      "WHERE f.app='noon' AND f.account_hash=? AND p.rowid>? "
+                      "AND f.id!=? AND f.id!=?", (flow['account_hash'], ops[-1]['seq'],
+                                                flow_id, cleanup_flow_id or '')).fetchone():
+            fail('MARKETPLACE_CLEAR_CART_OWNERSHIP_SUPERSEDED')
+        return proof
 
 
 def adopt_stable_cart(new_flow_id, old_flow_id, cart_hash, *, evidence_hash):
