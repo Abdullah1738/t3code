@@ -51,6 +51,17 @@ describe("createDelayedStatus", () => {
     expect(changes.at(-1)).toBeNull();
   });
 
+  it("waits for a custom show delay", () => {
+    const changes: Array<ShownStatus<string> | null> = [];
+    const status = createDelayedStatus<string>((shown) => changes.push(shown), 2_000);
+    status.update("a", "reconnecting");
+    vi.advanceTimersByTime(1_999);
+    expect(changes).toEqual([]);
+
+    vi.advanceTimersByTime(1);
+    expect(changes).toEqual([{ key: "a", value: "reconnecting" }]);
+  });
+
   it("drops the shown status at once when the key changes", () => {
     const { changes, status } = track();
     status.update("a", "syncing");

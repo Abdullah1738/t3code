@@ -18,6 +18,7 @@ export interface DelayedStatus<A> {
  */
 export function createDelayedStatus<A>(
   onChange: (shown: ShownStatus<A> | null) => void,
+  showDelayMs: number = STATUS_SHOW_DELAY_MS,
 ): DelayedStatus<A> {
   let key = "";
   let latest: A | null = null;
@@ -58,7 +59,7 @@ export function createDelayedStatus<A>(
           timer = setTimeout(() => {
             timer = undefined;
             if (latest !== null) show(latest);
-          }, STATUS_SHOW_DELAY_MS);
+          }, showDelayMs);
         }
         return;
       }
