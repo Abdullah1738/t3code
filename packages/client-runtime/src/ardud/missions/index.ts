@@ -15,6 +15,7 @@ export * from "./timelineViewModel.ts";
 export * from "./portfolioViewModel.ts";
 export * from "./textDiff.ts";
 export * from "./requestsViewModel.ts";
+export * from "./optimistic.ts";
 export * from "./layoutViewModel.ts";
 export * from "./masterInbox.ts";
 export * from "./boardViewModel.ts";
