@@ -2874,6 +2874,28 @@ export type MissionAttention = typeof MissionAttention.Type;
 export const OwnerRequestText = TrimmedNonEmptyString.check(Schema.isMaxLength(20_000));
 export type OwnerRequestText = typeof OwnerRequestText.Type;
 
+// --- r23 request images ---
+/**
+ * An image a request message carries: an upload of the caller's own (the
+ * composer's attachment upload) or a file on the server (the CLI). It is
+ * copied into the mission's images, about the request.
+ */
+export const OwnerRequestImage = Schema.Union([
+  Schema.TaggedStruct("attachment", { attachmentId: TrimmedNonEmptyString }),
+  Schema.TaggedStruct("file", { path: TrimmedNonEmptyString }),
+]);
+export type OwnerRequestImage = typeof OwnerRequestImage.Type;
+/**
+ * In order: `{image1}` in the text is the first. Each one sits where its
+ * marker is; one without a marker goes at the end.
+ */
+export const OwnerRequestImages = Schema.Array(OwnerRequestImage).check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(12),
+);
+export type OwnerRequestImages = typeof OwnerRequestImages.Type;
+// --- end r23 request images ---
+
 export const OpenOwnerRequestInput = Schema.Struct({
   missionId: MissionId,
   /** The first line becomes the title. */
@@ -2891,6 +2913,9 @@ export const OpenOwnerRequestInput = Schema.Struct({
    * another one.
    */
   subject: Schema.optional(MissionRecordRef),
+  // --- r23 request images ---
+  images: Schema.optional(OwnerRequestImages),
+  // --- end r23 request images ---
 });
 export type OpenOwnerRequestInput = typeof OpenOwnerRequestInput.Type;
 
@@ -2902,6 +2927,9 @@ export const ReplyOwnerRequestInput = Schema.Struct({
   /** Master only: `waiting-on-master` while it is still working. Defaults to `answered`. */
   status: Schema.optional(Schema.Literals(["answered", "waiting-on-master"])),
   key: Schema.optional(TrimmedNonEmptyString),
+  // --- r23 request images ---
+  images: Schema.optional(OwnerRequestImages),
+  // --- end r23 request images ---
 });
 export type ReplyOwnerRequestInput = typeof ReplyOwnerRequestInput.Type;
 
