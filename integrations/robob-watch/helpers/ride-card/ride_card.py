@@ -449,6 +449,11 @@ footer{margin:8px 16px 4px;padding:6px 0;font-size:11px}}
 h1.long{font-size:26px}.sub{font-size:13px;margin-top:2px}.stale{margin:6px 14px 0}ol.rail{padding:8px 14px 0}
 .car{margin:8px 14px 0;padding:8px 10px}.plate{font-size:16px;padding:5px 8px}.route{padding:10px 14px 0}footer{margin:6px 14px 4px}}
 @media (max-height:480px) and (max-width:340px){.car{grid-template-columns:auto 1fr}.plate{grid-row:span 2;justify-self:auto}}
+/* In the bubble the card runs edge to edge (Messages rounds the corners itself), so every inset is
+   the same 16px. Messages draws the app icon over the top-left corner: the first line starts past it. */
+@media (max-height:480px) and (max-width:480px){html,body{background:var(--card)}body{padding:0}
+main{max-width:none;border-radius:0}.hero{padding-top:6px}.who{min-height:24px;padding-left:30px;align-items:center}}
+@media (max-height:480px) and (max-width:340px){.who span:last-child{display:none}}
 """.replace("FONT", FONT)
 
 JS = """
