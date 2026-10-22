@@ -14,7 +14,7 @@ import {
   type SubMissionId,
   type SuggestionStats,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import type {
   ApprovalRoutingTable,
@@ -165,6 +165,25 @@ describe("fixture missions source", () => {
     const stop = store.subscribe(() => {});
     expect(store.get()?.missions.length).toBe(2);
     stop();
+  });
+
+  it("holds first snapshots back by the opt-in latency and drops them once closed", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const source = createFixtureMissionsSource({ now, latencyMs: 300 });
+      const list = latest<MissionListSnapshot>((l) => source.subscribeList(l));
+      const closed = latest<MissionListSnapshot>((l) => source.subscribeList(l));
+      closed.close();
+      expect(list.count).toBe(0);
+      vi.advanceTimersByTime(299);
+      expect(list.count).toBe(0);
+      vi.advanceTimersByTime(1);
+      expect(list.count).toBe(1);
+      expect(closed.count).toBe(0);
+      list.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("answers post into the ask's room with owner provenance and only wake the asker", async () => {

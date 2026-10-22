@@ -50,14 +50,18 @@ let source: MissionsSource | null = null;
 
 /**
  * The phone's one missions source: the paired server over the environment
- * connection. `EXPO_PUBLIC_MISSIONS_FIXTURE=1` runs on the fixture alone.
+ * connection. `EXPO_PUBLIC_MISSIONS_FIXTURE=1` runs on the fixture alone;
+ * `EXPO_PUBLIC_MISSIONS_FIXTURE_DELAY_MS` gives it a server-like first load.
  * Built on first use so app start stays cheap.
  */
 export function missionsSource(): MissionsSource {
   if (source) return source;
   source =
     process.env.EXPO_PUBLIC_MISSIONS_FIXTURE === "1"
-      ? createFixtureMissionsSource({ surface: "mobile" })
+      ? createFixtureMissionsSource({
+          surface: "mobile",
+          latencyMs: Number(process.env.EXPO_PUBLIC_MISSIONS_FIXTURE_DELAY_MS) || 0,
+        })
       : createRpcMissionsSource({
           transport: createAtomMissionsTransport({
             runtime: connectionAtomRuntime,

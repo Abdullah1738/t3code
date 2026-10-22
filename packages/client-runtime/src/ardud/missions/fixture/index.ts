@@ -120,6 +120,11 @@ export interface FixtureMissionsSourceOptions {
   readonly now?: () => number;
   /** Which client the owner acts from, recorded on answers and decisions. */
   readonly surface?: OwnerSurface;
+  /**
+   * Holds each subscription's first snapshot back this long, like a server
+   * round trip, so screens can be timed against realistic loads. Off by default.
+   */
+  readonly latencyMs?: number;
 }
 
 const SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3 } as const;
@@ -140,6 +145,7 @@ export function createFixtureMissionsSource(
 ): MissionsSource {
   const now = options.now ?? Date.now;
   const surface = options.surface ?? "web";
+  const latencyMs = Math.max(0, options.latencyMs ?? 0);
 
   // Records are immutable: every change replaces the record, so a snapshot
   // handed to a screen never changes under it.
@@ -274,15 +280,29 @@ export function createFixtureMissionsSource(
 
   function watch<T>(read: () => T, listener: Listener<T>): Unsubscribe {
     let last: T | undefined;
+    let ready = latencyMs === 0;
     const push = () => {
+      if (!ready) return;
       const next = read();
       if (Object.is(next, last)) return;
       last = next;
       listener(next);
     };
     listeners.add(push);
-    push();
+    if (ready) {
+      push();
+      return () => {
+        listeners.delete(push);
+      };
+    }
+    // @effect-diagnostics-next-line globalTimers:off - Simulated network delay for a plain callback source.
+    const timer = setTimeout(() => {
+      ready = true;
+      push();
+    }, latencyMs);
     return () => {
+      // @effect-diagnostics-next-line globalTimers:off - Cancels the simulated delay above.
+      clearTimeout(timer);
       listeners.delete(push);
     };
   }
