@@ -36,6 +36,12 @@ const layerSetup = Layer.effectDiscard(
     // PASSIVE checkpoints never shrink the -wal file, so it otherwise keeps its
     // largest size until the last connection closes.
     yield* sql.unsafe(`PRAGMA journal_size_limit = ${WAL_SIZE_LIMIT_BYTES};`);
+    // A sort holds up to cache_size in memory, then spills to a temp file. At
+    // the 2 MB default the shell snapshot sort (~26 MB) spilled on every read,
+    // about 26 MB a second of disk writes. temp_store = MEMORY would stop that
+    // too, but leaves index builds and large search sorts without a bound.
+    // The reader worker uses the same 64 MB.
+    yield* sql`PRAGMA cache_size = -65536;`;
     yield* runMigrations();
     // No planner statistics. Collecting them reads every page of the large
     // tables, and stats taken while a table was small make the planner scan it

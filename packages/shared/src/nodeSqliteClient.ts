@@ -189,6 +189,9 @@ try {
     allowExtension: workerData.allowExtension,
   });
   next.exec("PRAGMA busy_timeout = 5000;");
+  // Sorts spill to temp files past cache_size; at the 2 MB default the shell
+  // snapshot sort spilled on every read. Same size as the server's writer.
+  next.exec("PRAGMA cache_size = -65536;");
   // Without WAL a reader's shared lock blocks the writer's commits, so refuse.
   const mode = String(next.prepare("PRAGMA journal_mode").get().journal_mode).toLowerCase();
   if (mode !== "wal") throw new Error("database uses journal_mode " + mode + ", not wal");
