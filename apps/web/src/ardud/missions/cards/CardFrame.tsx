@@ -122,6 +122,8 @@ export interface CardFrameProps {
   readonly end?: ReactNode;
   /** The owner's comments on the item, under its body. */
   readonly comments?: ReactNode;
+  /** The note that goes with whichever decision is pressed, first in the decide bar. */
+  readonly note?: ReactNode;
 }
 
 export function CardFrame(props: CardFrameProps) {
@@ -215,6 +217,7 @@ export function CardFrame(props: CardFrameProps) {
                   : "pt-1",
               )}
             >
+              {props.note ? <div className="min-w-0 basis-full">{props.note}</div> : null}
               {decisions.map((action) => (
                 <Button
                   key={action.key}

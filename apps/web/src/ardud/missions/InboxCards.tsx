@@ -7,6 +7,7 @@ import {
   type Ask,
   type Draft,
   type DraftNote,
+  type InboxComment,
   type InboxMark,
   type Knock,
   type MissionListSnapshot,
@@ -41,6 +42,7 @@ import {
   type InboxUiState,
 } from "@t3tools/client-runtime/ardud/missions";
 
+import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import {
   ChoiceBlock,
@@ -55,7 +57,7 @@ import {
 } from "./cards/blocks";
 import { CardFrame, type CardAction, type CardFrameProps } from "./cards/CardFrame";
 import { APPROVER_NAME, PersonChip } from "./cards/chips";
-import { useItemMarks, type ItemMarks } from "./cards/ItemMarks";
+import { CommentList, useItemMarks, type ItemMarks } from "./cards/ItemMarks";
 import { useTemplatedCard } from "./cards/TemplatedCard";
 import { ConditionNote, useCardDiscussion, type CardDiscussion } from "./DiscussPanel";
 import { rerouteRecord } from "./operationCommands";
@@ -116,6 +118,23 @@ function withDiscuss(discussion: CardDiscussion, context: CardContext): CardActi
   ];
 }
 
+/**
+ * The note that goes with whichever decision is pressed, to whoever acts on
+ * it. Kept on the item as a comment; it opens no discussion.
+ */
+function NoteField(props: { value: string; onChange: (value: string) => void; disabled: boolean }) {
+  return (
+    <Input
+      size="sm"
+      aria-label="Note"
+      placeholder="Note for whoever acts on it (optional)"
+      disabled={props.disabled}
+      value={props.value}
+      onChange={(event) => props.onChange(event.target.value)}
+    />
+  );
+}
+
 /** A short reason field for Rewrite, Drop-with-reason and Move. */
 function ReasonField(props: {
   label: string;
@@ -155,6 +174,7 @@ export function AskCard(
     props.nowMs,
   );
   const [text, setText] = useState("");
+  const [note, setNote] = useState("");
   const [busy, run] = useBusy();
   const choice = { picked: props.picked, onPick: props.onPick, disabled: busy };
   const backed = useMemo(() => ({ kind: "ask" as const, record: ask }), [ask]);
@@ -169,10 +189,11 @@ export function AskCard(
       primary: true,
       disabled: busy || (props.picked === null && text.trim() === ""),
       onRun: () =>
-        void run(() => props.actions.answer(ask, props.picked, text, templated?.attach)).then(
+        void run(() => props.actions.answer(ask, props.picked, text, templated?.attach, note)).then(
           (sent) => {
             if (!sent) return;
             setText("");
+            setNote("");
             templated?.clear();
           },
         ),
@@ -189,6 +210,7 @@ export function AskCard(
       title={ask.question}
       actions={actions}
       approver="owner"
+      note={<NoteField value={note} onChange={setNote} disabled={busy} />}
     >
       {templated ? (
         templated.body
@@ -258,6 +280,7 @@ export function DraftCard(
   const [edited, setEdited] = useState(draft.text);
   const [rewriting, setRewriting] = useState(false);
   const [rewriteNote, setRewriteNote] = useState("");
+  const [note, setNote] = useState("");
   const [busy, run] = useBusy();
   const move = useMove(draft, "draft");
   const discussion = useCardDiscussion(
@@ -281,7 +304,7 @@ export function DraftCard(
     },
   ];
   const decide = (decision: Parameters<InboxActions["decideDraft"]>[1]) =>
-    void run(() => props.actions.decideDraft(draft, decision));
+    void run(() => props.actions.decideDraft(draft, decision, note));
   const actions: CardAction[] = rewriting
     ? [
         {
@@ -354,6 +377,12 @@ export function DraftCard(
       title={draftTitle(draft)}
       actions={actions}
       approver={approverOf(draft)}
+      // A rewrite's own note is what the writer acts on; a move decides nothing.
+      note={
+        rewriting || move.moving ? null : (
+          <NoteField value={note} onChange={setNote} disabled={busy} />
+        )
+      }
     >
       <LinksBlock links={[draft.target]}>
         {draft.head ? (
@@ -430,6 +459,7 @@ export function ApprovalCard(
   },
 ) {
   const { approval } = props;
+  const [note, setNote] = useState("");
   const [busy, run] = useBusy();
   const move = useMove(approval, "approval");
   const discussion = useCardDiscussion(
@@ -443,7 +473,7 @@ export function ApprovalCard(
     masterRoleId: props.masterRoleId,
   });
   const decide = (action: "approve" | "reject") =>
-    void run(() => props.actions.decideApproval(approval, action));
+    void run(() => props.actions.decideApproval(approval, action, note));
   const actions: CardAction[] = move.moving
     ? [
         {
@@ -475,6 +505,7 @@ export function ApprovalCard(
       title={approval.title}
       actions={actions}
       approver={approverOf(approval)}
+      note={move.moving ? null : <NoteField value={note} onChange={setNote} disabled={busy} />}
     >
       {templated ? (
         templated.body
@@ -508,7 +539,12 @@ export function ApprovalCard(
  * A decided approval in the history list (stale ones show why they closed;
  * ones the master decided on the owner's condition quote it).
  */
-export function ClosedApprovalRow(props: { approval: Approval; nowMs: number }) {
+export function ClosedApprovalRow(props: {
+  approval: Approval;
+  nowMs: number;
+  /** The owner's comments on it, kept after the decision. */
+  comments: ReadonlyArray<InboxComment>;
+}) {
   const { approval } = props;
   const condition = ownerConditionOf(approval);
   return (
@@ -524,6 +560,7 @@ export function ClosedApprovalRow(props: { approval: Approval; nowMs: number }) 
         }}
       />
       {condition ? <ConditionNote condition={condition} /> : null}
+      <CommentList comments={props.comments} nowMs={props.nowMs} />
     </li>
   );
 }
@@ -541,6 +578,7 @@ export function KnockCard(
 ) {
   const { knock } = props;
   const [edited, setEdited] = useState(knock.summary);
+  const [note, setNote] = useState("");
   const [busy, run] = useBusy();
   const discussion = useCardDiscussion(
     knock.missionId,
@@ -549,7 +587,7 @@ export function KnockCard(
   );
   const edit = textEdit(knock.summary, edited);
   const decide = (decision: Parameters<InboxActions["decideKnock"]>[1]) =>
-    void run(() => props.actions.decideKnock(knock, decision));
+    void run(() => props.actions.decideKnock(knock, decision, note));
   const actions: CardAction[] = [
     {
       key: "forward",
@@ -572,6 +610,7 @@ export function KnockCard(
       title={knock.summary}
       actions={actions}
       approver="owner"
+      note={<NoteField value={note} onChange={setNote} disabled={busy} />}
     >
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
         <PersonChip kind="person" name={knock.fromTitle} prefix="From " />
@@ -616,6 +655,7 @@ export function SuggestionCard(
   const [mode, setMode] = useState<"idle" | "edit" | "dismiss">("idle");
   const [edited, setEdited] = useState(() => suggestionAfterText(suggestion));
   const [reason, setReason] = useState("");
+  const [note, setNote] = useState("");
   const [busy, run] = useBusy();
   const discussion = useCardDiscussion(
     suggestion.missionId,
@@ -624,7 +664,7 @@ export function SuggestionCard(
   );
   const record = props.stats === null ? null : suggestionTrackRecord(props.stats, suggestion);
   const decide = (decision: Parameters<InboxActions["decideSuggestion"]>[1]) =>
-    void run(() => props.actions.decideSuggestion(suggestion, decision));
+    void run(() => props.actions.decideSuggestion(suggestion, decision, note));
   const actions: CardAction[] =
     mode === "edit"
       ? [
@@ -667,6 +707,7 @@ export function SuggestionCard(
       title={suggestion.title}
       actions={actions}
       approver={suggestion.acceptor}
+      note={<NoteField value={note} onChange={setNote} disabled={busy} />}
     >
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
         <PersonChip

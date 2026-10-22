@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 
-import type { InboxMark } from "@t3tools/contracts";
+import type { InboxComment, InboxMark } from "@t3tools/contracts";
 import {
   ageView,
   isSnoozed,
@@ -81,28 +81,7 @@ export function useItemMarks(
   const panel =
     comments.length > 0 || open ? (
       <div className="flex max-w-[72ch] min-w-0 flex-col gap-2.5">
-        {comments.length > 0 ? (
-          <ul aria-label="Your comments" className="flex min-w-0 flex-col gap-2.5">
-            {comments.map((comment) => {
-              const age = ageView(comment.at, nowMs);
-              return (
-                <li key={comment.id} className="flex min-w-0 flex-col gap-1">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <PersonChip kind="you" name="You" />
-                    {age ? (
-                      <span className="ms-auto">
-                        <AgeElement age={age} at={comment.at} />
-                      </span>
-                    ) : null}
-                  </div>
-                  <p className="text-sm leading-5.5 text-pretty whitespace-pre-line">
-                    {comment.body}
-                  </p>
-                </li>
-              );
-            })}
-          </ul>
-        ) : null}
+        <CommentList comments={comments} nowMs={nowMs} />
         {open === "comment" ? (
           <CommentBox
             busy={busy}
@@ -129,6 +108,31 @@ export function useItemMarks(
     },
     panel,
   };
+}
+
+/** The owner's comments on an item, waiting or decided. Nothing when there are none. */
+export function CommentList(props: { comments: ReadonlyArray<InboxComment>; nowMs: number }) {
+  if (props.comments.length === 0) return null;
+  return (
+    <ul aria-label="Your comments" className="flex max-w-[72ch] min-w-0 flex-col gap-2.5">
+      {props.comments.map((comment) => {
+        const age = ageView(comment.at, props.nowMs);
+        return (
+          <li key={comment.id} className="flex min-w-0 flex-col gap-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <PersonChip kind="you" name="You" />
+              {age ? (
+                <span className="ms-auto">
+                  <AgeElement age={age} at={comment.at} />
+                </span>
+              ) : null}
+            </div>
+            <p className="text-sm leading-5.5 text-pretty whitespace-pre-line">{comment.body}</p>
+          </li>
+        );
+      })}
+    </ul>
+  );
 }
 
 function CommentBox(props: {

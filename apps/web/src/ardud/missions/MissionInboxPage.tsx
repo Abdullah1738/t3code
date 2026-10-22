@@ -1,13 +1,21 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { ChevronLeftIcon, ListFilterIcon } from "lucide-react";
 
-import type { InboxTab, MissionId, MissionListItem, MissionListSnapshot } from "@t3tools/contracts";
+import type {
+  InboxComment,
+  InboxTab,
+  MissionId,
+  MissionListItem,
+  MissionListSnapshot,
+} from "@t3tools/contracts";
 import {
   ageView,
+  commentsOf,
   defaultInboxTab,
   DRAFT_STATUS_LABEL,
   draftOwnerEdit,
+  draftSentText,
   draftTitle,
   entryRow,
   formatRelative,
@@ -17,10 +25,12 @@ import {
   inboxLead,
   inboxTabCounts,
   discussionUnread,
+  KNOCK_STATUS_LABEL,
   ownerConditionOf,
   ownerWaitingEntries,
   requestAbout,
   staleApprovals,
+  SUGGESTION_STATUS_LABEL,
   type InboxEntry,
   type InboxEntryGroup,
   type InboxRouteFilter,
@@ -49,7 +59,9 @@ import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
+import { LabelBlock, TextBlock } from "./cards/blocks";
 import { AgeElement, DiscussionSymbol, HealthGlyph } from "./cards/chips";
+import { CommentList } from "./cards/ItemMarks";
 import { WithdrawnDrafts } from "./cards/WithdrawnDrafts";
 import { ConditionNote } from "./DiscussPanel";
 import { DraftNotesPanel } from "./DraftNotesPanel";
@@ -631,92 +643,194 @@ function InboxRow(props: {
 
 /** What sits under the list for a tab: decisions on a condition, routing, history, draft notes. */
 function InboxExtras(props: { missionId: MissionId | null; tab: InboxTab; nowMs: number }) {
-  if (props.tab === "decide") return <AnsweredOnCondition missionId={props.missionId} />;
-  if (props.tab !== "approve") return null;
+  switch (props.tab) {
+    case "decide":
+      return <DecideHistory missionId={props.missionId} nowMs={props.nowMs} />;
+    case "knocks":
+    case "suggestions":
+      return <NotedHistory missionId={props.missionId} tab={props.tab} nowMs={props.nowMs} />;
+    case "fyi":
+      return null;
+    case "approve":
+      return (
+        <>
+          {props.missionId ? <RoutingPanel missionId={props.missionId} /> : null}
+          <ApproveHistory missionId={props.missionId} nowMs={props.nowMs} />
+          <WithdrawnDrafts missionId={props.missionId} nowMs={props.nowMs} />
+          <MissionSection title="Draft notes">
+            <DraftNotesPanel missionId={props.missionId} />
+          </MissionSection>
+        </>
+      );
+  }
+}
+
+/** One decided item: what it was, how it ended, and the owner's comments kept on it. */
+function DecidedRow(props: {
+  title: string;
+  status: string | null;
+  at: string | null;
+  nowMs: number;
+  comments: ReadonlyArray<InboxComment>;
+  children?: ReactNode;
+}) {
   return (
-    <>
-      {props.missionId ? <RoutingPanel missionId={props.missionId} /> : null}
-      <ApproveHistory missionId={props.missionId} nowMs={props.nowMs} />
-      <WithdrawnDrafts missionId={props.missionId} nowMs={props.nowMs} />
-      <MissionSection title="Draft notes">
-        <DraftNotesPanel missionId={props.missionId} />
-      </MissionSection>
-    </>
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <p className="flex min-w-0 items-center gap-1.5 text-sm">
+        <span className="min-w-0 truncate font-medium">{props.title}</span>
+        {props.status ? (
+          <span className="shrink-0 text-xs text-(--m-muted)">{props.status}</span>
+        ) : null}
+        {props.at ? (
+          <time
+            dateTime={props.at}
+            className="ms-auto shrink-0 text-xs text-(--m-muted) tabular-nums"
+          >
+            {formatRelative(props.at, props.nowMs)}
+          </time>
+        ) : null}
+      </p>
+      {props.children}
+      <CommentList comments={props.comments} nowMs={props.nowMs} />
+    </div>
   );
 }
 
-/** Asks the master answered on a condition the owner stated in a Discuss request. */
-function AnsweredOnCondition(props: { missionId: MissionId | null }) {
+/**
+ * Asks the master answered on a condition the owner stated in a Discuss
+ * request, and asks the owner left a note on.
+ */
+function DecideHistory(props: { missionId: MissionId | null; nowMs: number }) {
   const history = useMissionInboxHistory(props.missionId);
+  const inbox = useMissionInbox(props.missionId);
   const answered = (history?.asks ?? []).flatMap((ask) => {
     const condition = ask.answer ? ownerConditionOf(ask.answer) : null;
-    return condition ? [{ ask, condition }] : [];
+    const comments = commentsOf(inbox, `ask:${ask.id}`);
+    return condition || comments.length > 0 ? [{ ask, condition, comments }] : [];
   });
   if (answered.length === 0) return null;
   return (
     <MissionSection title="Decided today">
-      {answered.map(({ ask, condition }) => (
-        <div key={ask.id} className="flex min-w-0 flex-col gap-1.5">
-          <p className="min-w-0 truncate text-sm font-medium">{ask.question}</p>
-          <ConditionNote condition={condition} />
-        </div>
+      {answered.map(({ ask, condition, comments }) => (
+        <DecidedRow
+          key={ask.id}
+          title={ask.question}
+          status={ask.status === "answered" ? "Answered" : null}
+          at={ask.answer?.answeredAt ?? null}
+          nowMs={props.nowMs}
+          comments={comments}
+        >
+          {condition ? <ConditionNote condition={condition} /> : null}
+        </DecidedRow>
       ))}
     </MissionSection>
   );
 }
 
-/** Drafts the owner edited (the diff he taught the writer) and closed approvals. */
+/**
+ * Drafts the owner edited (the diff he taught the writer), decided on a
+ * condition, noted, or that went out other than approved; and closed approvals.
+ */
 function ApproveHistory(props: { missionId: MissionId | null; nowMs: number }) {
   const history = useMissionInboxHistory(props.missionId);
+  const inbox = useMissionInbox(props.missionId);
   if (!history) return null;
-  const editedDrafts = history.drafts
-    .map((draft) => ({ draft, edit: draftOwnerEdit(draft) }))
-    .filter((item) => item.edit !== null);
+  const drafts = history.drafts.flatMap((draft) => {
+    const edit = draftOwnerEdit(draft);
+    const condition = ownerConditionOf(draft);
+    const sent = draftSentText(draft);
+    const comments = commentsOf(inbox, `draft:${draft.id}`);
+    return edit || condition || sent || comments.length > 0
+      ? [{ draft, edit, condition, sent, comments }]
+      : [];
+  });
   const closed = [
     ...staleApprovals(history),
     ...history.approvals.filter((approval) => approval.status !== "stale-closed"),
   ];
-  const conditionDrafts = history.drafts.flatMap((draft) => {
-    const condition = ownerConditionOf(draft);
-    return condition ? [{ draft, condition }] : [];
-  });
-  if (editedDrafts.length === 0 && closed.length === 0 && conditionDrafts.length === 0) {
-    return null;
-  }
+  if (drafts.length === 0 && closed.length === 0) return null;
   return (
     <MissionSection title="Decided today">
-      {editedDrafts.map(({ draft, edit }) => (
-        <div key={draft.id} className="flex flex-col gap-1">
-          <p className="flex min-w-0 items-center gap-1.5 text-xs text-(--m-muted)">
-            <span className="shrink-0 font-medium">Your edit</span>
-            <span className="truncate">To {draft.audience}</span>
-            {draft.decidedAt ? (
-              <time dateTime={draft.decidedAt} className="ms-auto shrink-0 tabular-nums">
-                {formatRelative(draft.decidedAt, props.nowMs)}
-              </time>
-            ) : null}
-          </p>
-          {edit ? <WordDiff segments={edit.segments} /> : null}
-        </div>
-      ))}
-      {conditionDrafts.map(({ draft, condition }) => (
-        <div key={`condition:${draft.id}`} className="flex min-w-0 flex-col gap-1.5">
-          <p className="flex min-w-0 items-center gap-1.5 text-sm">
-            <span className="min-w-0 truncate font-medium">{draftTitle(draft)}</span>
-            <span className="shrink-0 text-xs text-(--m-muted)">
-              {DRAFT_STATUS_LABEL[draft.status]}
-            </span>
-          </p>
-          <ConditionNote condition={condition} />
-        </div>
+      {drafts.map(({ draft, edit, condition, sent, comments }) => (
+        <DecidedRow
+          key={draft.id}
+          title={draftTitle(draft)}
+          status={DRAFT_STATUS_LABEL[draft.status]}
+          at={draft.decidedAt}
+          nowMs={props.nowMs}
+          comments={comments}
+        >
+          {edit ? (
+            <div className="flex min-w-0 flex-col gap-1">
+              <LabelBlock text="Your edit" />
+              <WordDiff segments={edit.segments} />
+            </div>
+          ) : null}
+          {condition ? <ConditionNote condition={condition} /> : null}
+          {sent ? (
+            <div className="flex min-w-0 flex-col gap-1">
+              <LabelBlock text="What went out" />
+              <TextBlock text={sent} tone="meta" maxLines={4} />
+            </div>
+          ) : null}
+        </DecidedRow>
       ))}
       {closed.length > 0 ? (
         <ul className="flex flex-col gap-4">
           {closed.map((approval) => (
-            <ClosedApprovalRow key={approval.id} approval={approval} nowMs={props.nowMs} />
+            <ClosedApprovalRow
+              key={approval.id}
+              approval={approval}
+              nowMs={props.nowMs}
+              comments={commentsOf(inbox, `approval:${approval.id}`)}
+            />
           ))}
         </ul>
       ) : null}
+    </MissionSection>
+  );
+}
+
+/** Knocks or suggestions decided with a note from the owner, so the note stays readable. */
+function NotedHistory(props: {
+  missionId: MissionId | null;
+  tab: "knocks" | "suggestions";
+  nowMs: number;
+}) {
+  const history = useMissionInboxHistory(props.missionId);
+  const inbox = useMissionInbox(props.missionId);
+  if (!history) return null;
+  const rows =
+    props.tab === "knocks"
+      ? history.knocks.map((knock) => ({
+          key: `knock:${knock.id}`,
+          title: knock.summary,
+          status: KNOCK_STATUS_LABEL[knock.status],
+          at: knock.decidedAt,
+        }))
+      : history.suggestions.map((suggestion) => ({
+          key: `suggestion:${suggestion.id}`,
+          title: suggestion.title,
+          status: SUGGESTION_STATUS_LABEL[suggestion.status],
+          at: suggestion.decidedAt,
+        }));
+  const noted = rows.flatMap((row) => {
+    const comments = commentsOf(inbox, row.key);
+    return comments.length > 0 ? [{ ...row, comments }] : [];
+  });
+  if (noted.length === 0) return null;
+  return (
+    <MissionSection title="Decided today">
+      {noted.map((row) => (
+        <DecidedRow
+          key={row.key}
+          title={row.title}
+          status={row.status}
+          at={row.at}
+          nowMs={props.nowMs}
+          comments={row.comments}
+        />
+      ))}
     </MissionSection>
   );
 }
