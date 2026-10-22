@@ -3,14 +3,19 @@
 
     ride-card refresh --trip UUID            read `uber rides status` (exact UUID) and rebuild the card
     ride-card send --trip UUID --session S   share the card once per recipient (idempotent, frozen payload)
-         [--from-chat owner|moni] [--dry-run]
-    ride-card meta --trip UUID --rider moni|abdullah [--booker abdullah|moni]
+         [--from-chat owner|SLUG] [--dry-run]
+    ride-card meta --trip UUID --rider WHO [--rider-name NAME] [--booker WHO] [--booker-name NAME]
+         [--recipient SLUG]...   WHO = abdullah (owner chat), moni, or another bridge chat slug
     ride-card show --trip UUID               card data + share journal (no side effects)
     ride-card sample --out DIR               render every state for a sample trip (tests, contact sheet)
 
 Card folder (public, sanitized only): ~/.local/share/imessage-apps/ride-<uuid>/
   data.json, index.html, preview.png. The page re-reads data.json every 20s.
-Share journal (private): ~/.local/state/ride-card/<uuid>.json
+Private (never served): ~/.local/state/ride-card/<uuid>.json (share journal) and <uuid>.meta.json
+  (rider, booker, extra recipients by bridge chat slug, display names).
+Recipients: abdullah + moni + rider + booker + extras, deduped. Abdullah (owner chat) gets the tailnet
+URL; everyone else gets the public share URL. From the owner session every recipient is reachable
+(--to SLUG); from any other chat only that chat itself.
 
 The ride-share-updates watcher calls update_card() every 30s; it never sends.
 Nothing here infers arrival from an ETA or completion from a missing trip.
@@ -33,6 +38,8 @@ TERMINAL = {"COMPLETED": "done", "CANCELED": "cancelled", "CANCELLED": "cancelle
             "UNFULFILLED": "failed", "FAILED": "failed"}
 STALE_S = 120
 NAMES = {"abdullah": "Abdullah", "moni": "Moni"}
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+BASE_RECIPIENTS = ("abdullah", "moni")
 
 
 def root():
@@ -127,12 +134,58 @@ def _hint(kind, uuid):
         return "abdullah", False
 
 
+def person(v):
+    """Normalise a recipient id: the owner chat is 'abdullah'; others are bridge chat slugs."""
+    v = (v or "").strip().lower()
+    if v in ("owner", "abdullah", "me"):
+        return "abdullah"
+    if not SLUG_RE.match(v):
+        raise SystemExit(f"ride-card: not a bridge chat slug: {v!r} (list them with `cli.ts chats`)")
+    return v
+
+
+def safe_name(v):
+    v = clean(v, 30)
+    if not v or not re.match(r"^[^\W\d_][\w .'-]*$", v, re.U) or re.search(r"\d", v):
+        return None
+    return v
+
+
+def meta_path(uuid):
+    return journal_dir() / f"{check_uuid(uuid)}.meta.json"
+
+
+def load_meta(uuid):
+    return read_json(meta_path(uuid), {}) or {}
+
+
 def rider_for(uuid):
+    m = load_meta(uuid)
+    if m.get("rider"):
+        return m["rider"], True
     return _hint("rider", uuid)
 
 
 def booker_for(uuid):
-    return _hint("booker", uuid)[0]
+    m = load_meta(uuid)
+    return m.get("booker") or _hint("booker", uuid)[0]
+
+
+def display(who, uuid=None):
+    if who in NAMES:
+        return NAMES[who]
+    names = load_meta(uuid).get("names", {}) if uuid else {}
+    return names.get(who)
+
+
+def recipients_for(uuid):
+    m = load_meta(uuid)
+    rider, _ = rider_for(uuid)
+    out = []
+    for r in (*BASE_RECIPIENTS, rider, booker_for(uuid), *(m.get("extras") or [])):
+        if r and r not in out:
+            out.append(r)
+    return out
 
 
 # ---------- card model (sanitized; this is what goes public) ----------
@@ -148,7 +201,8 @@ def from_live(trip, prev, rider, booker, now):
     """Card for a live `rides status` trip. Driver/car/plate come ONLY from this trip read."""
     uuid = check_uuid(trip.get("uuid"))
     c = dict(prev) if prev and prev.get("trip") == uuid else blank(uuid, rider, booker)
-    c.update(rider=rider, booker=booker, terminal=False, note=None)
+    c.update(rider=rider, booker=booker, terminal=False, note=None,
+             rider_name=display(rider, uuid), booker_name=display(booker, uuid))
     status = trip.get("status") or ""
     drv = trip.get("driver") or {}
     veh = trip.get("vehicle") or {}
@@ -200,10 +254,15 @@ def to_unknown(prev, now, final=False):
     return c
 
 
-def possessive(who, recipient=None):
+def possessive(who, recipient=None, name=None):
     if recipient and who == recipient:
         return "Your"
-    return f"{NAMES.get(who, who.title())}'s"
+    name = name or NAMES.get(who)
+    return f"{name}'s" if name else "The"
+
+
+def rider_pos(c, recipient=None):
+    return possessive(c["rider"], recipient, c.get("rider_name"))
 
 
 def clock(isots):
@@ -240,7 +299,7 @@ def texts(c):
         big, sub, word = "Ride failed", c.get("note") or "Uber could not complete it", "Ride failed"
     else:
         big, sub, word = "Checking", c.get("note") or "Waiting for Uber to confirm", "Status unconfirmed"
-    title = f"{possessive(c['rider'])} ride · {word}"
+    title = f"{rider_pos(c)} ride · {word}"
     bits = [x for x in (c.get("car"), c.get("plate")) if x] if s in ("assigned", "arriving", "arrived", "ontrip") else []
     bits.append(f"To {dest}")
     return {"big": big, "sub": sub, "word": word, "kick": kick, "og_title": title, "og_desc": " · ".join(bits)}
@@ -256,8 +315,8 @@ def public(c):
     allowed = ("trip", "v", "state", "step", "terminal", "rider", "booker", "driver", "rating", "car",
                "plate", "pickup", "dropoff", "pickup_eta", "arrival_eta", "note", "driver_changed", "checked_at", "since")
     out = {k: c.get(k) for k in allowed}
-    out["rider"] = NAMES.get(out["rider"], "Rider")
-    out["booker"] = NAMES.get(out["booker"], "Booker")
+    out["rider"] = c.get("rider_name") or NAMES.get(c.get("rider")) or None
+    out["booker"] = c.get("booker_name") or NAMES.get(c.get("booker")) or None
     return out
 
 
@@ -351,7 +410,8 @@ def page(c, t):
     checked = c.get("checked_at") or iso(time.time())
     local = clock(checked) or ""
     big_cls = ' class="long"' if len(t["big"]) > 7 else ""
-    booker = "" if c["booker"] == c["rider"] else f"Booked by {NAMES.get(c['booker'], 'Abdullah')}"
+    bname = c.get("booker_name") or NAMES.get(c.get("booker"))
+    booker = "" if c["booker"] == c["rider"] or not bname else f"Booked by {bname}"
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -368,7 +428,7 @@ def page(c, t):
 <style>{CSS}</style>
 </head><body><main>
 <section class="hero" aria-live="polite">
-<div class="who"><span><b>{e(possessive(c['rider']))} Uber</b></span><span>{e(booker)}</span></div>
+<div class="who"><span><b>{e(rider_pos(c))} Uber</b></span><span>{e(booker)}</span></div>
 {f'<p class="kick">{e(t["kick"])}</p>' if t.get("kick") else ''}<h1{big_cls}>{e(t['big'])}</h1>
 <p class="sub">{e(t['sub'])}</p>
 {f'<span class="note">{e(c["note"])}</span>' if c.get("note") and s not in ("cancelled", "failed", "unknown") else ''}
@@ -394,9 +454,9 @@ def og_doc(c, t):
         vehicle = f'<div class="veh"><b>{e(c["plate"])}</b><span>{e(c.get("car") or "")}</span></div>'
     else:
         vehicle = f'<div class="line">{e(t["sub"])}</div>'
-    kicker = f"{possessive(c['rider'])} Uber · To {c.get('dropoff') or 'drop-off'}"
+    kicker = f"{rider_pos(c)} Uber · To {c.get('dropoff') or 'drop-off'}"
     if t.get("kick"):
-        kicker = f"{possessive(c['rider'])} Uber · {t['kick']}"
+        kicker = f"{rider_pos(c)} Uber · {t['kick']}"
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>
 *{{box-sizing:border-box;margin:0}}
 html,body{{width:1200px;height:630px;overflow:hidden}}
@@ -427,31 +487,57 @@ def write_card(c, outdir=None, force=False):
     Returns the card with v set. Terminal cards are frozen: later writes are ignored."""
     d = Path(outdir) if outdir else card_dir(c["trip"])
     old = read_json(d / "data.json")
-    old_sig = read_json(d / ".sig.json", {}).get("sig")
+    meta = read_json(d / ".sig.json", {}) or {}
+    old_sig = meta.get("sig")
     if old and old.get("terminal") and not force:
+        # frozen, but a preview that failed to render is still retried (same version)
+        if meta.get("preview") != old_sig or not (d / "preview.png").exists():
+            card = _unpublic(old, old["trip"]) if not outdir else dict(old, rider_name=old.get("rider"),
+                                                                     booker_name=old.get("booker"))
+            if render_preview(card, d):
+                atomic_write(d / ".sig.json", json.dumps({"sig": old_sig, "preview": old_sig}))
         return old
     sig = signature(public(c))
     c = dict(c)
-    c["v"] = (old or {}).get("v", 0) + (1 if sig != old_sig or not (d / "index.html").exists() else 0)
+    changed = sig != old_sig or not (d / "index.html").exists()
+    c["v"] = (old or {}).get("v", 0) + (1 if changed else 0)
     pub = public(c)
-    if sig != old_sig or not (d / "index.html").exists() or force:
-        t = texts(c)
-        d.mkdir(parents=True, exist_ok=True)
-        if os.environ.get("RIDE_CARD_NO_IMAGE") != "1":
-            try:
-                tmp_png = d / f".preview-{os.getpid()}.png"
-                _cp().render_html(og_doc(c, t), str(tmp_png))
-                os.replace(tmp_png, d / "preview.png")
-            except Exception as ex:  # keep the page current even if Chrome hiccups
-                try: os.unlink(d / f".preview-{os.getpid()}.png")
-                except OSError: pass
-                print(f"ride-card: preview render failed: {ex}", file=sys.stderr)
-        atomic_write(d / "index.html", page(c, t))
+    preview_sig = meta.get("preview") if not changed else None
+    d.mkdir(parents=True, exist_ok=True)
+    if changed or force:
+        atomic_write(d / "index.html", page(c, texts(c)))
+    if changed or force or preview_sig != sig or not (d / "preview.png").exists():
+        preview_sig = sig if render_preview(c, d) else None
     if c.get("last_plate") and not outdir:
         atomic_write(journal_dir() / f".{c['trip']}.card.json", json.dumps({"last_plate": c["last_plate"]}))
     atomic_write(d / "data.json", json.dumps(pub, indent=1))
-    atomic_write(d / ".sig.json", json.dumps({"sig": sig}))
+    atomic_write(d / ".sig.json", json.dumps({"sig": sig, "preview": preview_sig}))
     return c
+
+
+def preview_pending(uuid):
+    """True when the card's preview.png is missing or older than its current state."""
+    d = card_dir(uuid)
+    if not (d / "data.json").exists():
+        return False
+    meta = read_json(d / ".sig.json", {}) or {}
+    return meta.get("preview") != meta.get("sig") or not (d / "preview.png").exists()
+
+
+def render_preview(c, d):
+    """Render preview.png for the card as it is now. False (and no partial file) on failure."""
+    if os.environ.get("RIDE_CARD_NO_IMAGE") == "1":
+        return True
+    tmp_png = d / f".preview-{os.getpid()}.png"
+    try:
+        _cp().render_html(og_doc(c, texts(c)), str(tmp_png))
+        os.replace(tmp_png, d / "preview.png")
+        return True
+    except Exception as ex:  # keep the page current even if Chrome hiccups; retried next check
+        try: os.unlink(tmp_png)
+        except OSError: pass
+        print(f"ride-card: preview render failed: {ex}", file=sys.stderr)
+        return False
 
 
 # ---------- live read ----------
@@ -478,11 +564,12 @@ def refresh(uuid):
         return write_card(from_live(trip, prev_raw, rider, booker_for(uuid), time.time()))
 
 
-def _unpublic(p):
+def _unpublic(p, uuid):
+    """Public card -> working card. Identities come from private metadata, never the public file."""
     c = dict(p)
-    inv = {v: k for k, v in NAMES.items()}
-    c["rider"] = inv.get(c.get("rider"), "abdullah")
-    c["booker"] = inv.get(c.get("booker"), "abdullah")
+    c["rider"], _ = rider_for(uuid)
+    c["booker"] = booker_for(uuid)
+    c["rider_name"], c["booker_name"] = display(c["rider"], uuid), display(c["booker"], uuid)
     return c
 
 
@@ -490,7 +577,7 @@ def load_card(uuid):
     p = read_json(card_dir(uuid) / "data.json")
     if not p:
         return None
-    c = _unpublic(p)
+    c = _unpublic(p, uuid)
     priv = read_json(journal_dir() / f".{check_uuid(uuid)}.card.json", {}) or {}
     if priv.get("last_plate"):
         c["last_plate"] = priv["last_plate"]
@@ -562,7 +649,7 @@ def card_words(text):
 
 
 def payload_for(c, recipient, url, mode):
-    caption = f"{possessive(c['rider'], recipient)} ride"
+    caption = f"{rider_pos(c, recipient)} ride"
     place = card_words(c.get("dropoff")) if c.get("dropoff") else None
     sub = f"To {place}" if place and place != "Ride" else None
     p = {"url": url, "mode": mode, "caption": caption, "subcaption": sub, "summary": "Live ride card"}
@@ -587,6 +674,7 @@ def deliver(uuid, recipient, p, session, to, key):
 def send(uuid, session, from_chat="owner", dry_run=False, modes=None, force=False):
     """Share the card once per recipient. Frozen payload per trip+recipient; same bridge key on retries."""
     uuid = check_uuid(uuid)
+    from_chat = person(from_chat)
     if not session or not re.match(r"^[A-Za-z0-9:_@.-]{6,200}$", session):
         raise SystemExit("ride-card: --session must be the current iMessage session id")
     c = load_card(uuid)
@@ -602,8 +690,13 @@ def _send_locked(uuid, c, session, from_chat, dry_run, modes, force):
     modes = modes or {}
     j = load_journal(uuid)
     recips = j.setdefault("recipients", {})
-    # who this session can reach: owner chat -> both (Moni via --to); Moni's chat -> only Moni
-    plan = [("abdullah", None), ("moni", "moni")] if from_chat == "owner" else [("moni", None)]
+    everyone = recipients_for(uuid)
+    if from_chat == "abdullah":
+        plan = [(r, None if r == "abdullah" else r) for r in everyone]
+    elif from_chat in everyone:
+        plan = [(from_chat, None)]  # a non-owner chat can only reach itself
+    else:
+        raise SystemExit(f"ride-card: chat {from_chat!r} is not a recipient of this ride")
     result, failed = {}, False
     for who, to in plan:
         r = recips.setdefault(who, {})
@@ -616,7 +709,8 @@ def _send_locked(uuid, c, session, from_chat, dry_run, modes, force):
                 if dry_run:
                     result[who] = "would publish+send"
                     continue
-                mode = modes.get(who) or ("card" if who == "abdullah" else ("card" if moni_has_cards() else "link"))
+                mode = modes.get(who) or ("card" if who == "abdullah"
+                                          else "card" if who == "moni" and moni_has_cards() else "link")
                 if mode == "card" and to and not bridge_app_to():
                     raise RuntimeError("bridge has no `app --to` yet; use link mode for this recipient")
                 if who == "abdullah":
@@ -654,12 +748,35 @@ def _save_journal(uuid, j):
     os.chmod(p, 0o600)
 
 
-def set_meta(uuid, rider, booker=None):
+def set_meta(uuid, rider, booker=None, rider_name=None, booker_name=None, extras=()):
+    """Private ride metadata. Adding extras later keeps the earlier ones; names must look like names."""
     uuid = check_uuid(uuid)
-    hints_dir().mkdir(parents=True, exist_ok=True)
-    atomic_write(hints_dir() / f"rider-{uuid}", rider + "\n")
-    if booker:
-        atomic_write(hints_dir() / f"booker-{uuid}", booker + "\n")
+    rider = person(rider)
+    booker = person(booker) if booker else None
+    extras = [person(x) for x in extras]
+    with trip_lock(uuid):
+        m = load_meta(uuid)
+        booker = booker or m.get("booker") or "abdullah"
+        names = dict(m.get("names") or {})
+        for who, name in ((rider, rider_name), (booker, booker_name)):
+            if name is not None:
+                n = safe_name(name)
+                if not n:
+                    raise SystemExit(f"ride-card: unsafe display name {name!r} (plain first name only)")
+                if who not in NAMES:
+                    names[who] = n
+        ex = list(m.get("extras") or [])
+        for x in extras:
+            if x not in ex:
+                ex.append(x)
+        m.update(trip=uuid, rider=rider, booker=booker, names=names, extras=ex)
+        p = meta_path(uuid)
+        atomic_write(p, json.dumps(m, indent=1))
+        os.chmod(p, 0o600)
+    if rider in NAMES:  # legacy hint for older readers
+        hints_dir().mkdir(parents=True, exist_ok=True)
+        atomic_write(hints_dir() / f"rider-{uuid}", rider + "\n")
+    return m
 
 
 # ---------- sample (design checks, never touches live dirs unless --out says so) ----------
@@ -697,10 +814,13 @@ def main(argv=None):
     sp = ap.add_subparsers(dest="cmd", required=True)
     a = sp.add_parser("refresh"); a.add_argument("--trip", required=True)
     a = sp.add_parser("send"); a.add_argument("--trip", required=True); a.add_argument("--session", required=True)
-    a.add_argument("--from-chat", choices=["owner", "moni"], default="owner"); a.add_argument("--dry-run", action="store_true")
+    a.add_argument("--from-chat", default="owner", help="owner (default) or the bridge chat slug this session is in")
+    a.add_argument("--dry-run", action="store_true")
     a.add_argument("--moni-mode", choices=["card", "link"]); a.add_argument("--abdullah-mode", choices=["card", "link"])
     a = sp.add_parser("meta"); a.add_argument("--trip", required=True)
-    a.add_argument("--rider", choices=["moni", "abdullah"], required=True); a.add_argument("--booker", choices=["moni", "abdullah"])
+    a.add_argument("--rider", required=True); a.add_argument("--booker")
+    a.add_argument("--rider-name"); a.add_argument("--booker-name")
+    a.add_argument("--recipient", action="append", default=[], help="extra bridge chat slug (repeatable)")
     a = sp.add_parser("show"); a.add_argument("--trip", required=True)
     a = sp.add_parser("sample"); a.add_argument("--out", required=True); a.add_argument("--rider", default="moni")
     a = ap.parse_args(argv)
@@ -713,10 +833,10 @@ def main(argv=None):
         print(json.dumps(res))
         return 1 if failed else 0
     elif a.cmd == "meta":
-        set_meta(a.trip, a.rider, a.booker)
-        print("ok")
+        m = set_meta(a.trip, a.rider, a.booker, a.rider_name, a.booker_name, a.recipient)
+        print(json.dumps({"recipients": recipients_for(a.trip), "rider": m["rider"], "booker": m["booker"]}))
     elif a.cmd == "show":
-        print(json.dumps({"card": read_json(card_dir(a.trip) / "data.json"),
+        print(json.dumps({"card": read_json(card_dir(a.trip) / "data.json"), "recipients": recipients_for(a.trip),
                           "journal": read_json(journal_path(a.trip))}, indent=1))
     elif a.cmd == "sample":
         out = Path(a.out)

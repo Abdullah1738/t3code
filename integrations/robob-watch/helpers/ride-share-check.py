@@ -47,7 +47,7 @@ REBOOK_WINDOW_S = 180
 UNKNOWN_GIVE_UP_S = 3 * 3600
 CARD_RETRY_S = 600          # one more CARD_READY if someone still lacks the card 10 min later
 MISSES_BEFORE_UNKNOWN = 2   # a single empty poll doesn't flip a live card to "Checking"
-RECIPIENTS = ("abdullah", "moni")
+PREVIEW_RETRIES = 10        # checks spent re-rendering a frozen card's failed preview
 
 
 def now_ts():
@@ -66,6 +66,7 @@ def load():
     s.setdefault("fail_since", None)
     s.setdefault("ending", {})
     s.setdefault("pending_cancel", {})
+    s.setdefault("preview_retry", {})
     # migrate the old text-era state: an announced trip counts as shared and requested
     for t in s["trips"].values():
         if t.get("booked_fired") is not None and t.get("card_requested") is None:
@@ -143,6 +144,8 @@ def main():
             card = rc.from_live(trip, prev, rider, rc.booker_for(cur), now)
             if not (prev and prev.get("terminal")):
                 rc.write_card(card)
+            elif rc.preview_pending(cur):
+                s["preview_retry"].setdefault(cur, 0)
         t.pop("misses", None)
         t.update(status=trip.get("status"), dest=card.get("dropoff") or t.get("dest"), last_seen=now,
                  rider=rider, rider_hinted=hinted)
@@ -155,7 +158,7 @@ def main():
                     t.get("card_requested") is None
                     or (not t.get("card_retried") and not t.get("legacy_shared")
                         and now - t["card_requested"] >= CARD_RETRY_S)):
-                missing = [r for r in RECIPIENTS if r not in rc.sent_to(cur)]
+                missing = [r for r in rc.recipients_for(cur) if r not in rc.sent_to(cur)]
                 if t.get("card_requested") is not None:
                     t["card_retried"] = now
                 else:
@@ -188,6 +191,8 @@ def main():
             card = rc.load_card(uuid)
             if status in rc.TERMINAL and card and not card.get("terminal"):
                 rc.write_card(rc.to_terminal(card, status, now))
+                if rc.preview_pending(uuid):
+                    s["preview_retry"][uuid] = 0
         if status in rc.TERMINAL:
             del ending[uuid]
             t = trips.setdefault(uuid, {"first_seen": since})
@@ -222,6 +227,17 @@ def main():
                 del ending[uuid]
         elif now - since >= UNKNOWN_GIVE_UP_S:
             del ending[uuid]
+
+    # frozen cards whose final preview failed to render: retry (same version) for a few checks
+    for uuid, n in list(s["preview_retry"].items()):
+        with rc.trip_lock(uuid):
+            card = rc.load_card(uuid)
+            if card and rc.preview_pending(uuid) and n < PREVIEW_RETRIES:
+                rc.write_card(card)
+        if not card or not rc.preview_pending(uuid) or n + 1 >= PREVIEW_RETRIES:
+            s["preview_retry"].pop(uuid, None)
+        else:
+            s["preview_retry"][uuid] = n + 1
 
     for uuid, p in list(pending.items()):
         if now - p["since"] >= REBOOK_WINDOW_S:

@@ -332,6 +332,168 @@ class WatcherTest(Base):
         self.assertIn("Moni&#x27;s ride", self.page(A))
 
 
+FAKE_PREVIEW = """
+import os
+def render_html(doc, out, width=1200, height=630):
+    flag = os.environ["FAKE_PREVIEW_FAIL"]
+    if os.path.exists(flag):
+        os.unlink(flag)
+        raise RuntimeError("chrome hiccup")
+    with open(out, "wb") as f:
+        f.write(b"png")
+    with open(os.environ["FAKE_PREVIEW_LOG"], "a") as f:
+        f.write("render\\n")
+"""
+
+
+class RecipientTest(Base):
+    def meta(self, *args, ok=True):
+        return self.card_cli("meta", "--trip", A, *args, ok=ok)
+
+    def test_extras_deduped_and_each_non_owner_gets_public_url(self):
+        p = self.meta("--rider", "sara-k", "--rider-name", "Sara", "--recipient", "moni",
+                      "--recipient", "omar", "--recipient", "sara-k", "--recipient", "omar")
+        self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "sara-k", "omar"])
+        self.set_state(trip(A, "Accepted"), {})
+        res = json.loads(self.card_cli("send", "--trip", A, "--session", "thread-1@3").stdout)
+        self.assertEqual(res, {"abdullah": "sent", "moni": "sent", "sara-k": "sent", "omar": "sent"})
+        calls = self.bridge_calls()
+        self.assertEqual([c[0] for c in calls].count("publish"), 1)
+        for c in calls:
+            if c[0] in ("send", "app"):
+                to = c[c.index("--to") + 1] if "--to" in c else None
+                body = " ".join(c)
+                if to is None:
+                    self.assertIn("ts.net", body)
+                else:
+                    self.assertNotIn("ts.net", body)
+                    self.assertIn("trycloudflare.com", body)
+        texts = {c[c.index("--to") + 1]: c[c.index("--text") + 1] for c in calls if c[0] == "send"}
+        self.assertEqual(set(texts), {"moni", "sara-k", "omar"})
+        self.assertTrue(texts["sara-k"].startswith("Your ride"))
+        self.assertTrue(texts["omar"].startswith("Sara's ride"))
+        app = [c for c in calls if c[0] == "app"][0]
+        self.assertEqual(app[app.index("--caption") + 1], "Sara's ride")
+        again = json.loads(self.card_cli("send", "--trip", A, "--session", "thread-1@4").stdout)
+        self.assertEqual(set(again.values()), {"already sent"})
+
+    def test_recipient_metadata_private_and_not_in_public_files(self):
+        self.meta("--rider", "sara-k", "--rider-name", "Sara", "--recipient", "group-run-club-abc123")
+        self.set_state(trip(A, "OnTrip"), {})
+        self.run_check(0)
+        blob = json.dumps(self.card(A)) + self.page(A)
+        self.assertIn("Sara", blob)
+        for bad in ("sara-k", "group-run-club", "abdullah\"", "moni\""):
+            self.assertNotIn(bad, blob)
+        meta = os.path.join(self.journal, f"{A}.meta.json")
+        self.assertEqual(oct(os.stat(meta).st_mode & 0o777), "0o600")
+        self.assertFalse(any(f.endswith("meta.json") for f in os.listdir(os.path.join(self.cards, f"ride-{A}"))))
+
+    def test_unnamed_extra_rider_shows_no_slug(self):
+        self.meta("--rider", "lina-2")
+        self.set_state(trip(A, "Accepted"), {})
+        self.run_check(0)
+        c, page = self.card(A), self.page(A)
+        self.assertIsNone(c["rider"])
+        self.assertNotIn("lina", page)
+        self.assertIn("The Uber", page)
+
+    def test_invalid_recipient_and_names_rejected(self):
+        for args in (["--rider", "moni", "--recipient", "Bad Slug!"],
+                     ["--rider", "+971501234567"],
+                     ["--rider", "sara-k", "--rider-name", "+971 50 123 4567"],
+                     ["--rider", "sara-k", "--rider-name", "<b>x</b>"]):
+            p = self.meta(*args, ok=False)
+            self.assertNotEqual(p.returncode, 0, args)
+        self.assertFalse(os.path.exists(os.path.join(self.journal, f"{A}.meta.json")))
+
+    def test_watcher_missing_lists_extras(self):
+        self.meta("--rider", "moni", "--recipient", "omar")
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "moni-thread@1", "--from-chat", "moni")
+        self.run_check(0)
+        out = self.run_check(70)
+        self.assertIn("missing=abdullah,omar", out[0])
+
+    def test_non_owner_chat_reaches_only_itself(self):
+        self.meta("--rider", "omar", "--rider-name", "Omar")
+        self.set_state(trip(A, "Accepted"), {})
+        res = json.loads(self.card_cli("send", "--trip", A, "--session", "omar-thread@1", "--from-chat", "omar").stdout)
+        self.assertEqual(res, {"omar": "sent"})
+        self.assertTrue(all("--to" not in c for c in self.bridge_calls()))
+        p = self.card_cli("send", "--trip", A, "--session", "x-thread@1", "--from-chat", "stranger", ok=False)
+        self.assertIn("not a recipient", p.stderr)
+
+    def test_non_moni_recipient_gets_link_even_when_cards_installed(self):
+        installed = self._exe("enroll-ok", "#!/bin/sh\necho 'moni: installed'\n")
+        self.meta("--rider", "omar", "--rider-name", "Omar")
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "thread-1@3", RIDE_CARD_ENROLL=installed)
+        calls = self.bridge_calls()
+        moni = [c for c in calls if "--to" in c and c[c.index("--to") + 1] == "moni"][0]
+        omar = [c for c in calls if "--to" in c and c[c.index("--to") + 1] == "omar"][0]
+        self.assertEqual(moni[0], "app", "Moni keeps her Robob Cards readiness")
+        self.assertEqual(omar[0], "send", "other people get a plain public link")
+
+    def test_display_name_with_digits_rejected(self):
+        p = self.meta("--rider", "sara-k", "--rider-name", "Al 50 12 34", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+
+    def test_adding_extras_later_keeps_rider_booker_and_earlier_extras(self):
+        self.meta("--rider", "moni", "--booker", "moni", "--recipient", "omar")
+        p = self.meta("--rider", "moni", "--recipient", "lina")
+        self.assertEqual(json.loads(p.stdout)["booker"], "moni")
+        self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "omar", "lina"])
+
+
+class PreviewRetryTest(Base):
+    def test_failed_preview_retried_next_check_without_version_bump(self):
+        lib = os.path.join(self.dir, "plib")
+        os.makedirs(lib)
+        with open(os.path.join(lib, "cardpreview.py"), "w") as f:
+            f.write(FAKE_PREVIEW)
+        flag = os.path.join(self.dir, "fail-once")
+        open(flag, "w").close()
+        log = os.path.join(self.dir, "renders")
+        env = dict(RIDE_CARD_NO_IMAGE="0", RIDE_CARD_PREVIEW_LIB=lib, FAKE_PREVIEW_FAIL=flag, FAKE_PREVIEW_LOG=log)
+        png = os.path.join(self.cards, f"ride-{A}", "preview.png")
+        self.set_state(trip(A, "Accepted"), {})
+        self.run_check(0, **env)
+        self.assertFalse(os.path.exists(png))
+        v = self.card(A)["v"]
+        self.run_check(30, **env)
+        self.assertTrue(os.path.exists(png), "preview retried on the next check")
+        self.assertEqual(self.card(A)["v"], v, "a preview retry must not bump the version")
+        self.run_check(60, **env)
+        with open(log) as f:
+            self.assertEqual(f.read().count("render"), 1, "no re-render once the preview is current")
+        self.assertFalse([x for x in os.listdir(os.path.dirname(png)) if x.startswith(".preview-")])
+
+    def test_terminal_card_preview_retried_by_watcher(self):
+        lib = os.path.join(self.dir, "plib")
+        os.makedirs(lib)
+        with open(os.path.join(lib, "cardpreview.py"), "w") as f:
+            f.write(FAKE_PREVIEW)
+        flag = os.path.join(self.dir, "fail-once")
+        log = os.path.join(self.dir, "renders")
+        env = dict(RIDE_CARD_NO_IMAGE="0", RIDE_CARD_PREVIEW_LIB=lib, FAKE_PREVIEW_FAIL=flag, FAKE_PREVIEW_LOG=log)
+        self.set_state(trip(A, "OnTrip"), {})
+        self.run_check(0, **env)
+        self.set_state(None, {A: {"status": "COMPLETED"}})
+        open(flag, "w").close()
+        self.run_check(30, **env)  # terminal transition, preview render fails
+        c = self.card(A)
+        self.assertEqual(c["state"], "done")
+        self.set_state(None, {})
+        self.run_check(60, **env)  # watcher retries the frozen card's preview
+        self.assertEqual(self.card(A)["v"], c["v"])
+        self.run_check(90, **env)
+        with open(log) as f:
+            self.assertEqual(f.read().count("render"), 2, "initial + one retry, then nothing")
+        with open(self.state) as f:
+            self.assertEqual(json.load(f)["preview_retry"], {})
+
+
 class SendTest(Base):
     def test_send_publishes_and_shares_once_with_stable_keys(self):
         self.set_state(trip(A, "Accepted"), {})
