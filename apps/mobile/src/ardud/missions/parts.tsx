@@ -370,6 +370,9 @@ export function ChoiceRow<Value extends string>(props: {
       accessibilityLabel={props.accessibilityLabel}
       accessibilityRole="tablist"
       showsHorizontalScrollIndicator={false}
+      // A horizontal ScrollView grows by default, so in a column it would take
+      // any spare height and stretch the chips.
+      className="grow-0"
       contentContainerClassName="gap-1.5"
     >
       {props.options.map((option) => {
