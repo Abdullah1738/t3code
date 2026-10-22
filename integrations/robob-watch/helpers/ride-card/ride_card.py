@@ -371,6 +371,24 @@ ol.rail{padding-left:18px;padding-right:18px;gap:4px}ol.rail li{font-size:11px}h
 @media (max-width:430px){ol.rail li{font-size:11px}}
 @media (max-width:340px){.car{grid-template-columns:1fr}.plate{grid-row:auto;justify-self:start}}
 @media (prefers-reduced-motion:reduce){ol.rail.live li.now::before{animation:none}}
+/* Bubble fit: Robob Cards shows this page live in a non-scrolling iMessage bubble (~345x310 CSS px).
+   Short viewports get a compact first screen: time, status, bar, car/plate and driver. */
+@media (max-height:480px){body{min-height:0;padding:8px 8px 16px}main{border-radius:22px}
+.hero{padding:12px 16px 12px}.who{font-size:14px;line-height:1.25}.who span:last-child{font-size:12px}
+.kick{font-size:13px;margin-top:8px;line-height:1.25}h1{font-size:44px;margin-top:6px;letter-spacing:-.04em}.kick+h1{margin-top:0}
+h1.long{font-size:30px;line-height:1.1;letter-spacing:-.03em}
+.sub{font-size:14px;margin-top:4px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.note{margin-top:6px;font-size:12px;padding:3px 9px}
+.stale{margin:8px 16px 0;padding:4px 10px;border-radius:10px;font-size:12px;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.stale .more{display:none}
+ol.rail{padding:10px 16px 0;gap:4px;column-gap:4px}ol.rail li,ol.rail li.now{font-size:0;line-height:0}ol.rail li::before{height:5px;margin:0}
+.car{margin:10px 16px 0;padding:10px 12px;border-radius:14px;gap:2px 12px}.plate{font-size:17px;padding:6px 9px;border-radius:8px}
+.model{font-size:14px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;overflow-wrap:normal}.driver{font-size:13px;line-height:1.25}
+.route{padding:12px 16px 0;gap:8px}.route li{font-size:14px;gap:10px}.route small{font-size:12px}
+footer{margin:8px 16px 4px;padding:6px 0;font-size:11px}}
+@media (max-height:300px){.hero{padding:10px 14px}.who{font-size:13px}.kick{font-size:12px;margin-top:4px}h1{font-size:38px;margin-top:4px}
+h1.long{font-size:26px}.sub{font-size:13px;margin-top:2px}.stale{margin:6px 14px 0}ol.rail{padding:8px 14px 0}
+.car{margin:8px 14px 0;padding:8px 10px}.plate{font-size:16px;padding:5px 8px}.route{padding:10px 14px 0}footer{margin:6px 14px 4px}}
+@media (max-height:480px) and (max-width:340px){.car{grid-template-columns:auto 1fr}.plate{grid-row:span 2;justify-self:auto}}
 """.replace("FONT", FONT)
 
 JS = """
@@ -380,7 +398,7 @@ let at=new Date($('time').getAttribute('datetime'));
 const fmt=d=>new Intl.DateTimeFormat(undefined,{hour:'numeric',minute:'2-digit',timeZone:'Asia/Dubai'}).format(d);
 function paint(){const s=Math.max(0,Math.round((Date.now()-at)/1000)),m=Math.round(s/60);
 $('time').textContent=fmt(at);$('#ago').textContent=s<60?'just now':m+' min ago';
-const st=$('#stale');if(!TERM&&s>%d){st.hidden=false;st.textContent='No update for '+m+' min. Details may be out of date.';}else st.hidden=true;}
+const st=$('#stale');if(!TERM&&s>%d){st.hidden=false;st.innerHTML='No update for '+m+' min<span class="more">. Details may be out of date.</span>';}else st.hidden=true;}
 async function poll(){try{const r=await fetch('data.json',{cache:'no-store'});if(!r.ok)return;const d=await r.json();
 if(d.v!==V){location.reload();return;}if(d.checked_at)at=new Date(d.checked_at);}catch(e){}paint();}
 paint();if(!TERM){setInterval(poll,20000);setInterval(paint,15000);}
