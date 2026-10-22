@@ -127,6 +127,68 @@ describe("inbound ledger", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("a replay keeps the group chat his message came from", () => {
+    const h = harness([{ ...typed("in-1", "file a bug"), bridgeChat: "group-sb_gro" }]);
+    return Effect.gen(function* () {
+      const ledger = yield* inboundLedger;
+      const fresh = yield* ledger.redeem(attempt());
+      expect(fresh.provenance).toEqual({
+        _tag: "owner-imessage",
+        chat: "owner",
+        inboundId: "in-1",
+        quote: "file a bug",
+        bridgeChat: "group-sb_gro",
+      });
+      if (fresh._tag !== "fresh") throw new Error("expected a fresh claim");
+      yield* fresh.finish({ ok: true });
+      const replay = yield* ledger.redeem(attempt());
+      expect(replay._tag).toBe("replay");
+      expect(replay.provenance).toEqual(fresh.provenance);
+      expect(h.lookedUp).toEqual(["in-1"]);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a ledger made before bridge_chat gets the column and keeps its rows", () => {
+    const h = harness([{ ...typed("in-2", "go with b"), bridgeChat: "group-sb_gro" }]);
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql.unsafe(`CREATE TABLE ardud_mission_guard_inbound_actions (
+        inbound_id TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        action TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        command_id TEXT,
+        chat TEXT NOT NULL,
+        quote TEXT,
+        result_json TEXT,
+        claimed_at TEXT NOT NULL,
+        PRIMARY KEY (inbound_id, subject, action)
+      )`);
+      yield* sql`
+        INSERT INTO ardud_mission_guard_inbound_actions
+          (inbound_id, subject, action, payload_json, command_id, chat, quote, result_json,
+            claimed_at)
+        VALUES ('in-1', 'ask:ask-1', 'answer', '{"optionId":"a"}', NULL, 'owner', 'go with a',
+          '{"ok":true}', '2026-10-19T10:00:00.000Z')
+      `;
+      const ledger = yield* inboundLedger;
+      const old = yield* ledger.redeem(attempt());
+      expect(old).toMatchObject({ _tag: "replay", result: { ok: true } });
+      expect(old.provenance).toEqual({
+        _tag: "owner-imessage",
+        chat: "owner",
+        inboundId: "in-1",
+        quote: "go with a",
+      });
+      const fresh = yield* ledger.redeem(attempt({ inboundId: "in-2" }));
+      expect(fresh.provenance.bridgeChat).toBe("group-sb_gro");
+      const columns = yield* sql<{ readonly name: string }>`
+        SELECT name FROM pragma_table_info('ardud_mission_guard_inbound_actions')
+      `;
+      expect(columns.filter((column) => column.name === "bridge_chat")).toHaveLength(1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
   // Live clock: the claim's age is judged against now.
   it.live("an unfinished claim holds a minute, then a retry takes it over", () => {
     const h = harness([typed("in-1", "go with a")]);

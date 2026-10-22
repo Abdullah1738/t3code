@@ -40,8 +40,32 @@ const ACTIONS_DDL = `CREATE TABLE IF NOT EXISTS ardud_mission_guard_inbound_acti
   quote TEXT,
   result_json TEXT,
   claimed_at TEXT NOT NULL,
+  bridge_chat TEXT,
   PRIMARY KEY (inbound_id, subject, action)
 )`;
+
+/**
+ * Tables made before `bridge_chat` existed get it added in place; the table is
+ * created on use, outside the numbered migrations.
+ */
+const ensureActionsTable = Effect.fn("InboundLedger.ensureActionsTable")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  yield* sql.unsafe(ACTIONS_DDL);
+  const hasBridgeChat = sql<{ readonly name: string }>`
+    SELECT name FROM pragma_table_info('ardud_mission_guard_inbound_actions')
+  `.pipe(Effect.map((columns) => columns.some((column) => column.name === "bridge_chat")));
+  if (yield* hasBridgeChat) return;
+  yield* sql
+    .unsafe("ALTER TABLE ardud_mission_guard_inbound_actions ADD COLUMN bridge_chat TEXT")
+    .pipe(
+      // Another redeem may have added it between the check and here.
+      Effect.catchTags({
+        SqlError: (error) =>
+          hasBridgeChat.pipe(Effect.flatMap((added) => (added ? Effect.void : Effect.fail(error)))),
+      }),
+    );
+});
 
 /** How long an unfinished claim holds before another attempt may take it over. */
 export const STALE_CLAIM_MS = 60_000;
@@ -51,6 +75,7 @@ interface ActionRow {
   readonly commandId: string | null;
   readonly chat: string;
   readonly quote: string | null;
+  readonly bridgeChat: string | null;
   readonly resultJson: string | null;
   readonly claimedAt: string;
 }
@@ -122,6 +147,7 @@ const provenanceOf = (inboundId: string, row: ActionRow): OwnerIMessage => ({
   chat: row.chat === "moni" ? "moni" : "owner",
   inboundId,
   ...(row.quote === null ? {} : { quote: row.quote }),
+  ...(row.bridgeChat === null ? {} : { bridgeChat: row.bridgeChat }),
 });
 
 /**
@@ -152,7 +178,7 @@ export const inboundLedger = Effect.gen(function* () {
       const row = () =>
         sql<ActionRow>`
           SELECT payload_json AS "payloadJson", command_id AS "commandId", chat, quote,
-            result_json AS "resultJson", claimed_at AS "claimedAt"
+            bridge_chat AS "bridgeChat", result_json AS "resultJson", claimed_at AS "claimedAt"
           FROM ardud_mission_guard_inbound_actions
           WHERE inbound_id = ${inboundId} AND subject = ${subject} AND action = ${action}
         `.pipe(Effect.map((rows) => rows[0] ?? null));
@@ -191,7 +217,7 @@ export const inboundLedger = Effect.gen(function* () {
         ),
       });
 
-      yield* sql.unsafe(ACTIONS_DDL);
+      yield* ensureActionsTable(sql);
       const now = yield* DateTime.now;
       const nowIso = DateTime.formatIso(now);
       const known = yield* row();
@@ -252,9 +278,10 @@ export const inboundLedger = Effect.gen(function* () {
       }
       const claimed = yield* sql<{ readonly inboundId: string }>`
         INSERT INTO ardud_mission_guard_inbound_actions
-          (inbound_id, subject, action, payload_json, command_id, chat, quote, claimed_at)
+          (inbound_id, subject, action, payload_json, command_id, chat, quote, bridge_chat,
+            claimed_at)
         VALUES (${inboundId}, ${subject}, ${action}, ${payloadJson}, ${attempt.commandId ?? null},
-          ${verified.chat}, ${verified.quote ?? null}, ${nowIso})
+          ${verified.chat}, ${verified.quote ?? null}, ${verified.bridgeChat ?? null}, ${nowIso})
         ON CONFLICT (inbound_id, subject, action) DO NOTHING
         RETURNING inbound_id AS "inboundId"
       `;
@@ -269,6 +296,7 @@ export const inboundLedger = Effect.gen(function* () {
         commandId: attempt.commandId ?? null,
         chat: verified.chat,
         quote: verified.quote ?? null,
+        bridgeChat: verified.bridgeChat ?? null,
         resultJson: null,
         claimedAt: nowIso,
       });
