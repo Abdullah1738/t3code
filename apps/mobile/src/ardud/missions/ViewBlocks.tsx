@@ -2,13 +2,13 @@ import type {
   AnswerAskInput,
   AssetResource,
   MissionId,
+  MissionViewsSnapshot,
   ViewBackedRecord,
   ViewLongTextInput,
 } from "@t3tools/contracts";
 import {
   assetMarkOf,
   refLabel,
-  resolveViewSnapshotLayout,
   viewCard,
   viewSection,
   viewSectionData,
@@ -20,6 +20,7 @@ import {
   type ViewChoiceOption,
   type ViewGalleryAsset,
   type ViewListRow,
+  type ViewSectionEntry,
   type ViewTableRow,
   // --- blocks additions ---
   viewChartLabels,
@@ -966,43 +967,41 @@ function Viewer(props: {
 // ---------------------------------------------------------------------------
 // Sections and templated cards
 
-/** The master's sections, in layout order, each hidden while it has nothing. */
-export function CustomSections(props: { readonly missionId: MissionId; readonly nowMs: number }) {
-  const views = useMissionViews(props.missionId);
-  const sections = useMemo(() => {
-    if (!views) return [];
-    const { snapshot } = views;
-    return resolveViewSnapshotLayout(snapshot).stacked.flatMap((entry) => {
-      if (entry.kind !== "custom" || entry.section === null) return [];
-      const data = viewSectionData(snapshot, entry.section.id);
-      const view = viewSection(entry.section, {
-        nowMs: props.nowMs,
-        data,
-        source: viewSectionSource(snapshot, entry.section),
-        assets: snapshot.assets ?? [],
-      });
-      const shown = data?.rows.length ?? 0;
-      const more = data !== null && data.total > shown ? data.total : null;
-      return view.empty ? [] : [{ key: entry.key, title: entry.title, view, more }];
+/** One of the master's sections under its own title, hidden while it has nothing. */
+export function CustomSection(props: {
+  readonly snapshot: MissionViewsSnapshot;
+  readonly entry: ViewSectionEntry;
+  readonly nowMs: number;
+}) {
+  const { snapshot, nowMs } = props;
+  const { section, title } = props.entry;
+  const shown = useMemo(() => {
+    if (section === null) return null;
+    const data = viewSectionData(snapshot, section.id);
+    const view = viewSection(section, {
+      nowMs,
+      data,
+      source: viewSectionSource(snapshot, section),
+      assets: snapshot.assets ?? [],
     });
-  }, [views, props.nowMs]);
+    const rows = data?.rows.length ?? 0;
+    const more = data !== null && data.total > rows ? data.total : null;
+    return view.empty ? null : { view, more };
+  }, [snapshot, section, nowMs]);
+  if (shown === null) return null;
   return (
     <>
-      {sections.map((section) => (
-        <Fragment key={section.key}>
-          <SectionHead
-            className="pt-3"
-            title={section.title}
-            trailing={section.more === null ? null : <Meta>{section.more}</Meta>}
-          />
-          <Group>
-            <View className="gap-3 px-3.5 py-3">
-              {section.view.notice ? <Meta>{section.view.notice}</Meta> : null}
-              <ViewBlocks blocks={section.view.blocks} />
-            </View>
-          </Group>
-        </Fragment>
-      ))}
+      <SectionHead
+        className="pt-3"
+        title={title}
+        trailing={shown.more === null ? null : <Meta>{shown.more}</Meta>}
+      />
+      <Group>
+        <View className="gap-3 px-3.5 py-3">
+          {shown.view.notice ? <Meta>{shown.view.notice}</Meta> : null}
+          <ViewBlocks blocks={shown.view.blocks} />
+        </View>
+      </Group>
     </>
   );
 }

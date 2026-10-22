@@ -1,19 +1,30 @@
-import type { CallId, MissionId, MissionListSnapshot, ThreadId } from "@t3tools/contracts";
+import {
+  VIEW_BUILTIN_SECTION_TITLES,
+  type CallId,
+  type MissionId,
+  type MissionListSnapshot,
+  type ThreadId,
+} from "@t3tools/contracts";
 import {
   attachedThreadGroups,
   dayOnePlan,
+  formatPercent,
   groupRequests,
+  isRequestUnread,
   masterRoutedEntries,
   ownerConditionOf,
   ownerWaitingEntries,
   PLAN_KICKER,
+  resolveMissionLayout,
   type InboxEntry,
   type MissionOverviewSnapshot,
+  type ViewSectionEntry,
 } from "@t3tools/client-runtime/ardud/missions";
 import {
   boardFigures,
   entrySubject,
   laneSections,
+  priorityStackView,
   sinceView,
   snoozedFor,
   towardView,
@@ -24,6 +35,7 @@ import { Fragment, useState } from "react";
 import { ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
+import { boardSlotKey, boardSlots, type BoardSlot } from "./boardLayout";
 import { DiscussionPanel, OpenDiscussions } from "./Discussion";
 import { FeedError, LoadingLine } from "./FeedError";
 import { EntryRow } from "./InboxPane";
@@ -51,11 +63,13 @@ import {
   TextField,
   Title,
 } from "./parts";
+import { PinnedStrip } from "./PinnedStrip";
 import { useRequestComposer } from "./recordLogic";
 import { RequestReader } from "./RequestReader";
 import { MISSION_PAGES, type MissionPage } from "./routeParams";
 import { RequestRows } from "./rows";
-import { CustomSections } from "./ViewBlocks";
+import { CustomSection } from "./ViewBlocks";
+import { useMissionViews } from "./viewsStore";
 
 const BOARD_LIMIT = 3;
 
@@ -116,8 +130,10 @@ function Page(props: { readonly children: React.ReactNode }) {
 function BoardPage(props: PageProps) {
   const missionId = props.overview.mission.id;
   const inbox = useMissionInbox(missionId);
-  const requests = useYourRequests(missionId) ?? [];
+  const loadedRequests = useYourRequests(missionId);
+  const requests = loadedRequests ?? [];
   const lanes = useMissionLanes(missionId);
+  const views = useMissionViews(missionId);
   const actions = useOverviewActions(props.overview);
   const inboxFeed = useMissionInboxFeed(missionId);
   const requestsFeed = useOwnerRequestsFeed(missionId);
@@ -129,177 +145,282 @@ function BoardPage(props: PageProps) {
   const snoozed = inbox ? snoozedFor(inbox, "all", props.nowMs) : [];
   const withMaster = inbox ? masterRoutedEntries(inbox) : [];
   const { open } = groupRequests(requests);
+  const unread = requests.filter(isRequestUnread);
   const problems = laneSections(lanes ?? [], props.nowMs).filter(
     (section) => section.key === "stuck" || section.key === "waiting",
   );
   const since = sinceView(props.overview, props.nowMs);
   const toward = towardView(props.overview, props.nowMs);
+  const stack = priorityStackView(props.overview).rows;
+  // The pinned strip counts what this board would show, as the web board does.
+  const layout = views
+    ? resolveMissionLayout(views.snapshot, {
+        ...(inbox ? { ownerWaiting: waiting.length } : {}),
+        ...(loadedRequests ? { requestsUnread: unread.length } : {}),
+      })
+    : null;
+  const slots = boardSlots(layout);
+  const visible = new Set(
+    slots.flatMap((slot) => (slot.type === "section" ? [slot.entry.kind] : [])),
+  );
   // Records whose card here carries its discussion; Needs you past the first
   // few still has one a tap away in the inbox.
   const discussed = [
-    ...[...waiting, ...snoozed, ...withMaster].map((entry) => ({
-      kind: entry.kind,
-      id: entry.record.id,
-    })),
-    ...since.rows.flatMap((row) => (row.ref ? [row.ref] : [])),
+    ...[
+      ...(visible.has("needs-you") ? [...waiting, ...snoozed] : []),
+      ...(visible.has("with-the-master") ? withMaster : []),
+    ].map((entry) => ({ kind: entry.kind, id: entry.record.id })),
+    ...(visible.has("since-last-looked")
+      ? since.rows.flatMap((row) => (row.ref ? [row.ref] : []))
+      : []),
   ];
 
-  return (
-    <Page>
-      {props.tabs}
-      <Figures figures={boardFigures(props.overview, requests, props.nowMs)} wide={props.wide} />
-
-      <SectionHead
-        className="pt-3"
-        title="Needs you"
-        trailing={
-          waiting.length > BOARD_LIMIT ? (
-            <LinkButton label={`All ${waiting.length}`} onPress={props.onOpenInbox} />
-          ) : null
-        }
-      />
-      <FeedError what="what needs you" feed={inboxFeed} nowMs={props.nowMs} />
-      {waiting.length === 0 ? (
-        inboxFeed.failure ? null : (
-          <EmptyLine label="Nothing needs you." />
-        )
-      ) : (
-        <EntryCards
-          entries={waiting.slice(0, BOARD_LIMIT)}
-          missionId={missionId}
-          list={props.list}
-          nowMs={props.nowMs}
-          onOpen={props.onOpenItem}
-          planKey={plan?.key ?? null}
-        />
-      )}
-      {snoozed.length > 0 ? (
-        <>
-          <SectionHead
-            title={`Snoozed ${snoozed.length}`}
-            trailing={
-              <LinkButton
-                label={snoozedOpen ? "Hide" : "Show"}
-                onPress={() => setSnoozedOpen(!snoozedOpen)}
+  const section = (entry: ViewSectionEntry): React.ReactNode => {
+    switch (entry.kind) {
+      case "header-stats":
+        return null;
+      case "needs-you":
+        return (
+          <>
+            <SectionHead
+              className="pt-3"
+              title={entry.title}
+              trailing={
+                waiting.length > BOARD_LIMIT ? (
+                  <LinkButton label={`All ${waiting.length}`} onPress={props.onOpenInbox} />
+                ) : null
+              }
+            />
+            <FeedError what="what needs you" feed={inboxFeed} nowMs={props.nowMs} />
+            {waiting.length === 0 ? (
+              inboxFeed.failure ? null : (
+                <EmptyLine label="Nothing needs you." />
+              )
+            ) : (
+              <EntryCards
+                entries={waiting.slice(0, BOARD_LIMIT)}
+                missionId={missionId}
+                list={props.list}
+                nowMs={props.nowMs}
+                onOpen={props.onOpenItem}
+                planKey={plan?.key ?? null}
               />
-            }
-          />
-          {snoozedOpen ? (
+            )}
+            {snoozed.length > 0 ? (
+              <>
+                <SectionHead
+                  title={`Snoozed ${snoozed.length}`}
+                  trailing={
+                    <LinkButton
+                      label={snoozedOpen ? "Hide" : "Show"}
+                      onPress={() => setSnoozedOpen(!snoozedOpen)}
+                    />
+                  }
+                />
+                {snoozedOpen ? (
+                  <EntryCards
+                    entries={snoozed}
+                    missionId={missionId}
+                    list={props.list}
+                    nowMs={props.nowMs}
+                    onOpen={props.onOpenItem}
+                  />
+                ) : null}
+              </>
+            ) : null}
+          </>
+        );
+      case "your-requests":
+        return (
+          <>
+            <SectionHead
+              className="pt-3"
+              title={entry.title}
+              trailing={<LinkButton label="Ask" onPress={() => props.onPage("requests")} />}
+            />
+            <FeedError what="your requests" feed={requestsFeed} nowMs={props.nowMs} />
+            {open.length === 0 ? (
+              requestsFeed.failure ? null : (
+                <EmptyLine label="Nothing open." />
+              )
+            ) : (
+              <RequestRows
+                requests={open.slice(0, BOARD_LIMIT)}
+                nowMs={props.nowMs}
+                onOpen={props.onOpenRequest}
+              />
+            )}
+          </>
+        );
+      case "since-last-looked":
+        return (
+          <>
+            <SectionHead
+              className="pt-3"
+              title={entry.title}
+              trailing={
+                <View className="flex-row items-center gap-3">
+                  {since.mark ? <Meta>{since.mark}</Meta> : null}
+                  {since.canMarkSeen ? (
+                    <LinkButton
+                      label="Mark seen"
+                      disabled={actions.pending}
+                      onPress={actions.markSeen}
+                    />
+                  ) : null}
+                </View>
+              }
+            />
+            <SinceRows
+              rows={since.rows}
+              missionId={missionId}
+              nowMs={props.nowMs}
+              onFine={(callId) => actions.react(callId as CallId, "ok")}
+            />
+          </>
+        );
+      case "path-to-milestone":
+        if (!toward) return null;
+        return (
+          <>
+            <SectionHead
+              className="pt-3"
+              // A renamed section keeps its name; the stock one names the day.
+              title={
+                entry.title === VIEW_BUILTIN_SECTION_TITLES["path-to-milestone"]
+                  ? toward.title
+                  : entry.title
+              }
+              trailing={<Meta>{toward.countdown}</Meta>}
+            />
+            <Group>
+              {toward.milestones.map((milestone, index) => (
+                <Fragment key={milestone.id}>
+                  {index > 0 ? <Separator /> : null}
+                  <Row>
+                    <Title className="flex-1">{milestone.title}</Title>
+                    <Meta className={milestone.atRisk ? "text-warning-foreground" : undefined}>
+                      {milestone.status}
+                    </Meta>
+                  </Row>
+                </Fragment>
+              ))}
+            </Group>
+          </>
+        );
+      case "sub-missions":
+        if (stack.length === 0) return null;
+        return (
+          <>
+            <SectionHead
+              className="pt-3"
+              title={entry.title}
+              trailing={<Meta>{stack.length}</Meta>}
+            />
+            <Group>
+              {stack.map((sub, index) => (
+                <Fragment key={sub.id}>
+                  {index > 0 ? <Separator /> : null}
+                  <Row>
+                    <Meta className="w-5 pt-0.5">{sub.position}</Meta>
+                    <View className="pt-1.5">
+                      <StateGlyph state={sub.tone} />
+                    </View>
+                    <Text className="flex-1 text-[15px]" numberOfLines={2}>
+                      {sub.title}
+                    </Text>
+                    {sub.actual === null ? null : (
+                      <Meta className="pt-0.5">{formatPercent(sub.actual)}</Meta>
+                    )}
+                  </Row>
+                </Fragment>
+              ))}
+            </Group>
+          </>
+        );
+      case "with-the-master":
+        if (withMaster.length === 0) return null;
+        return (
+          <>
+            <SectionHead className="pt-3" title={entry.title} />
             <EntryCards
-              entries={snoozed}
+              entries={withMaster}
               missionId={missionId}
               list={props.list}
               nowMs={props.nowMs}
               onOpen={props.onOpenItem}
             />
-          ) : null}
-        </>
-      ) : null}
+          </>
+        );
+      case "custom":
+        return views ? (
+          <CustomSection snapshot={views.snapshot} entry={entry} nowMs={props.nowMs} />
+        ) : null;
+    }
+  };
 
-      {inbox ? (
-        <OpenDiscussions missionId={missionId} shown={discussed} nowMs={props.nowMs} />
-      ) : null}
-
-      <SectionHead
-        className="pt-3"
-        title="Your requests"
-        trailing={<LinkButton label="Ask" onPress={() => props.onPage("requests")} />}
-      />
-      <FeedError what="your requests" feed={requestsFeed} nowMs={props.nowMs} />
-      {open.length === 0 ? (
-        requestsFeed.failure ? null : (
-          <EmptyLine label="Nothing open." />
-        )
-      ) : (
-        <RequestRows
-          requests={open.slice(0, BOARD_LIMIT)}
-          nowMs={props.nowMs}
-          onOpen={props.onOpenRequest}
-        />
-      )}
-
-      <SectionHead
-        className="pt-3"
-        title="Lanes"
-        trailing={<LinkButton label="All" onPress={() => props.onPage("lanes")} />}
-      />
-      {problems.length === 0 ? (
-        <EmptyLine label="No lane is stuck or waiting." />
-      ) : (
-        <LaneGroups sections={problems} limit={BOARD_LIMIT} onOpenThread={props.onOpenThread} />
-      )}
-
-      <SectionHead
-        className="pt-3"
-        title="Since you last looked"
-        trailing={
-          <View className="flex-row items-center gap-3">
-            {since.mark ? <Meta>{since.mark}</Meta> : null}
-            {since.canMarkSeen ? (
-              <LinkButton label="Mark seen" disabled={actions.pending} onPress={actions.markSeen} />
-            ) : null}
-          </View>
-        }
-      />
-      <SinceRows
-        rows={since.rows}
-        missionId={missionId}
-        nowMs={props.nowMs}
-        onFine={(callId) => actions.react(callId as CallId, "ok")}
-      />
-
-      {toward ? (
-        <>
-          <SectionHead
-            className="pt-3"
-            title={toward.title}
-            trailing={<Meta>{toward.countdown}</Meta>}
+  const slot = (item: BoardSlot): React.ReactNode => {
+    switch (item.type) {
+      case "figures":
+        return (
+          <Figures
+            figures={boardFigures(props.overview, requests, props.nowMs)}
+            wide={props.wide}
           />
-          <Group>
-            {toward.milestones.map((milestone, index) => (
-              <Fragment key={milestone.id}>
-                {index > 0 ? <Separator /> : null}
-                <Row>
-                  <Title className="flex-1">{milestone.title}</Title>
-                  <Meta className={milestone.atRisk ? "text-warning-foreground" : undefined}>
-                    {milestone.status}
-                  </Meta>
-                </Row>
-              </Fragment>
-            ))}
-            {toward.subMissions.map((sub) => (
-              <Fragment key={sub.id}>
-                <Separator />
-                <Row>
-                  <Meta className="w-5 pt-0.5">{sub.rank}</Meta>
-                  <View className="pt-1.5">
-                    <StateGlyph state={sub.tone} />
-                  </View>
-                  <Text className="flex-1 text-[15px]" numberOfLines={2}>
-                    {sub.title}
-                  </Text>
-                  {sub.share ? <Meta className="pt-0.5">{sub.share}</Meta> : null}
-                </Row>
-              </Fragment>
-            ))}
-          </Group>
-        </>
-      ) : null}
-
-      <CustomSections missionId={missionId} nowMs={props.nowMs} />
-
-      {withMaster.length > 0 ? (
-        <>
-          <SectionHead className="pt-3" title="With the master" />
-          <EntryCards
-            entries={withMaster}
-            missionId={missionId}
+        );
+      case "pinned":
+        return views ? (
+          <PinnedStrip
+            views={views}
+            entry={item.entry}
+            rows={
+              item.kind === "needs-you"
+                ? { kind: "entries", entries: waiting }
+                : { kind: "requests", requests: unread }
+            }
             list={props.list}
             nowMs={props.nowMs}
-            onOpen={props.onOpenItem}
+            onOpenAll={
+              item.kind === "needs-you" ? props.onOpenInbox : () => props.onPage("requests")
+            }
+            onOpenItem={props.onOpenItem}
+            onOpenRequest={props.onOpenRequest}
           />
-        </>
-      ) : null}
+        ) : null;
+      case "lanes":
+        return (
+          <>
+            <SectionHead
+              className="pt-3"
+              title="Lanes"
+              trailing={<LinkButton label="All" onPress={() => props.onPage("lanes")} />}
+            />
+            {problems.length === 0 ? (
+              <EmptyLine label="No lane is stuck or waiting." />
+            ) : (
+              <LaneGroups
+                sections={problems}
+                limit={BOARD_LIMIT}
+                onOpenThread={props.onOpenThread}
+              />
+            )}
+          </>
+        );
+      case "discussions":
+        return inbox ? (
+          <OpenDiscussions missionId={missionId} shown={discussed} nowMs={props.nowMs} />
+        ) : null;
+      case "section":
+        return section(item.entry);
+    }
+  };
+
+  return (
+    <Page>
+      {props.tabs}
+      {slots.map((item) => (
+        <Fragment key={boardSlotKey(item)}>{slot(item)}</Fragment>
+      ))}
     </Page>
   );
 }
