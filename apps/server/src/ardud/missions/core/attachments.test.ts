@@ -10,10 +10,12 @@ import * as Option from "effect/Option";
 
 import {
   failureCode,
+  governor,
   harness,
   laneThread,
   masterThread,
   missionId,
+  otherMissionId,
   ownerApp,
   seed,
   seedOther,
@@ -42,7 +44,8 @@ const listedThreads = Effect.gen(function* () {
 
 describe("thread attachments", () => {
   it.effect("an attached thread belongs to the mission until it is detached", () => {
-    const { layer } = harness();
+    const { layer, threadOrigins } = harness();
+    threadOrigins.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       const missions = yield* MissionService.MissionService;
@@ -85,13 +88,30 @@ describe("thread attachments", () => {
   });
 
   it.effect("only the component that runs a thread attaches it, in one mission at a time", () => {
-    const { layer } = harness();
+    const { layer, threadOrigins } = harness();
+    threadOrigins.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       yield* seedOther;
       const missions = yield* MissionService.MissionService;
 
       assert.equal(yield* failureCode(missions.attachThread(ownerApp, attach())), "forbidden");
+      // The thread must exist and its recorded origin must be crw; saying so is not enough.
+      const unknown = ThreadId.make("t-nowhere");
+      assert.equal(
+        yield* failureCode(missions.attachThread(crw, attach({ threadId: unknown }))),
+        "not-found",
+      );
+      for (const [threadId, origin] of [
+        [ThreadId.make("t-imessage"), "imessage"],
+        [ThreadId.make("t-typed"), null],
+      ] as const) {
+        threadOrigins.set(threadId, origin);
+        assert.equal(
+          yield* failureCode(missions.attachThread(crw, attach({ threadId }))),
+          "forbidden",
+        );
+      }
       assert.equal(
         yield* failureCode(missions.attachThread(crw, attach({ attachedBy: "governor" }))),
         "forbidden",
@@ -104,12 +124,11 @@ describe("thread attachments", () => {
       );
 
       yield* missions.attachThread(crw, attach());
-      const governor: MissionProvenance = { _tag: "system", component: "governor" };
       assert.equal(
         yield* failureCode(missions.attachThread(governor, attach({ attachedBy: "governor" }))),
         "forbidden",
       );
-      const elsewhere = attach({ missionId: MissionId.make("m-2") });
+      const elsewhere = attach({ missionId: otherMissionId });
       assert.equal(yield* failureCode(missions.attachThread(crw, elsewhere)), "conflict");
 
       // Detached, it may move.
@@ -130,11 +149,12 @@ describe("thread attachments", () => {
   it.effect(
     "old settled threads go back to the thread list together with the Reviews group",
     () => {
-      const { layer } = harness();
+      const { layer, threadOrigins } = harness();
+      const threads = Array.from({ length: 22 }, (_, index) => ThreadId.make(`t-pr-${index}`));
+      for (const threadId of threads) threadOrigins.set(threadId, "crw");
       return Effect.gen(function* () {
         yield* seed;
         const missions = yield* MissionService.MissionService;
-        const threads = Array.from({ length: 22 }, (_, index) => ThreadId.make(`t-pr-${index}`));
         for (const [index, threadId] of threads.entries()) {
           const pullRequest = { repository: "Equicom-Crypto/edge-api", number: index + 1 };
           yield* missions.attachThread(crw, attach({ threadId, pullRequest }));

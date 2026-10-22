@@ -15,6 +15,7 @@ import * as HttpRouter from "effect/http/HttpRouter";
 import type { SessionOrigin } from "../auth/SessionOrigins.ts";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
+import { AttachTargets } from "./core/attachTargets.ts";
 import { MISSIONS_ROUTE_PREFIX, missionsRouteLayer } from "./http.ts";
 import * as MissionService from "./MissionService.ts";
 import * as MissionStore from "./store/MissionStore.ts";
@@ -41,8 +42,18 @@ const seeded = Layer.effectDiscard(
   }),
 );
 
+// crw created the review thread; nothing else exists.
+const targets = Layer.succeed(
+  AttachTargets,
+  AttachTargets.of({
+    lookup: (threadId) =>
+      Effect.succeed(threadId === "thread-review-361" ? { origin: "crw" } : null),
+  }),
+);
+
 const services = seeded.pipe(
   Layer.provideMerge(MissionService.layer),
+  Layer.provideMerge(targets),
   Layer.provideMerge(MissionStore.layer),
   Layer.provideMerge(Sqlite.layerMemory),
 );
@@ -308,6 +319,9 @@ describe("missions routes", () => {
       expect((await post(attach("crw"), "Bearer scribe")).status).toBe(403);
       expect((await post(attach("scribe"), "Bearer scribe")).status).toBe(403);
       expect((await post(attach("crw"), "Bearer operator")).status).toBe(403);
+      expect(
+        (await post({ ...attach("crw"), threadId: "thread-elsewhere" }, "Bearer crw")).status,
+      ).toBe(404);
       const first = await post(attach("crw"), "Bearer crw");
       expect(first.status).toBe(200);
       const { seq } = (await first.json()) as { seq: number };

@@ -11,6 +11,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import type { AttachTargets } from "./attachTargets.ts";
 import type { WriteKit } from "./kit.ts";
 
 const fail = (code: MissionError["code"], detail: string) =>
@@ -41,8 +42,33 @@ const VERB: Record<ThreadAttachmentState, string> = {
  * Attachments carry no authority: role holders and lanes stay the only
  * threads that act for the mission.
  */
-export const makeAttachmentWrites = (kit: WriteKit) => {
+export const makeAttachmentWrites = (kit: WriteKit, targets: AttachTargets["Service"]) => {
   const { store, serial, loadMission, unchanged, commit } = kit;
+
+  /** A role holder or lane acts for a mission; hiding it as someone's review would bury it. */
+  const requireNotActing = Effect.fn("MissionAttachments.requireNotActing")(function* (
+    threadId: ThreadAttachment["threadId"],
+  ) {
+    const acting = yield* store.missionsOfThread(threadId);
+    if (acting.length > 0) {
+      return yield* fail(
+        "conflict",
+        `Thread ${threadId} acts for mission ${acting.join(", ")}; it is not attachable.`,
+      );
+    }
+  });
+
+  /** Only a thread the component itself created comes in; `attachedBy` alone proves nothing. */
+  const requireCreatedBy = Effect.fn("MissionAttachments.requireCreatedBy")(function* (
+    threadId: ThreadAttachment["threadId"],
+    component: string,
+  ) {
+    const target = yield* targets.lookup(threadId);
+    if (target === null) return yield* fail("not-found", `No thread ${threadId}.`);
+    if (target.origin !== component) {
+      return yield* fail("forbidden", `Thread ${threadId} was not created by ${component}.`);
+    }
+  });
 
   const attachThread = (provenance: MissionProvenance, input: AttachThreadInput) =>
     serial(
@@ -66,13 +92,10 @@ export const makeAttachmentWrites = (kit: WriteKit) => {
             `Thread ${input.threadId} belongs to mission ${before.missionId}; detach it there first.`,
           );
         }
-        // A role holder or lane acts for a mission; hiding it as someone's review would bury it.
-        const acting = state === "open" ? yield* store.missionsOfThread(input.threadId) : [];
-        if (acting.length > 0) {
-          return yield* fail(
-            "conflict",
-            `Thread ${input.threadId} acts for mission ${acting.join(", ")}; it is not attachable.`,
-          );
+        const inMission = before !== null && before.missionId === mission.id;
+        if (state === "open") yield* requireNotActing(input.threadId);
+        if (!inMission || before.state === "detached") {
+          yield* requireCreatedBy(input.threadId, provenance.component);
         }
         const pullRequest =
           input.pullRequest === undefined ? (before?.pullRequest ?? null) : input.pullRequest;
