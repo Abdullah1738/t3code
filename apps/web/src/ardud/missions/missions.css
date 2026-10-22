@@ -86,3 +86,26 @@ html[data-theme-id="desk"].dark {
   --m-info: #82abf2;
   /* --- end blocks additions --- */
 }
+
+/* --- views additions --- */
+/*
+ * Report markdown on a card. A list sits close under the paragraph that
+ * introduces it, and a loose list (items split by blank lines, so each item is
+ * a paragraph) keeps the same even item gap as a tight one.
+ */
+[data-mission-markdown] p:has(+ :is(ul, ol)) {
+  margin-bottom: 0.35rem;
+}
+
+[data-mission-markdown] p + :is(ul, ol) {
+  margin-top: 0.35rem;
+}
+
+[data-mission-markdown] li > p {
+  margin: 0;
+}
+
+[data-mission-markdown] li > p + p {
+  margin-top: 0.35rem;
+}
+/* --- end views additions --- */
