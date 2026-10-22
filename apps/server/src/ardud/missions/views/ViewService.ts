@@ -164,6 +164,8 @@ export class ViewService extends Context.Service<
     ) => Effect.Effect<ViewSourceRunResult, MissionError>;
     /** Mission ids, published when one of their source runs starts or finishes. */
     readonly sourceChanges: Effect.Effect<PubSub.Subscription<MissionId>, never, Scope.Scope>;
+    /** Someone still has the views open: starts runs for stale sources without waiting. */
+    readonly touchSources: (missionId: MissionId) => Effect.Effect<void, MissionError>;
   }
 >()("t3/ardud/missions/views/ViewService") {}
 
@@ -1929,6 +1931,8 @@ const make = Effect.gen(function* () {
     restoreSource,
     runSource,
     sourceChanges: runs.changes,
+    touchSources: (missionId) =>
+      Effect.flatMap(views.sources(missionId), (sources) => runs.touch(missionId, sources)),
     longText,
     reportSaves: scribe.reportSaves,
     catalog: Effect.succeed(VIEW_CATALOG),
