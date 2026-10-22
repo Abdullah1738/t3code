@@ -802,9 +802,12 @@ const makeRoutes = Effect.gen(function* () {
             .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
           location,
         )
-      : (yield* threads
-          .getShellSnapshot({ location })
-          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))))).threads;
+      : yield* threads.getShellSnapshot({ location }).pipe(
+          Effect.map((snapshot) =>
+            location === "archive" ? snapshot.archivedThreads : snapshot.threads,
+          ),
+          Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+        );
     let shells = candidates.filter(
       (shell) =>
         shell.deletedAt === null &&

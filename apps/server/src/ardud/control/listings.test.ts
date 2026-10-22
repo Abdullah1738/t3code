@@ -139,6 +139,20 @@ const seedRows = Effect.gen(function* () {
   yield* request("quiet", "request-answered", "resolved");
 });
 
+// Shaped like the real snapshot: the location picks which threads are read,
+// and archived ones always come back under archivedThreads.
+const snapshotFor = (location: "active" | "archive") => {
+  const read = shells.filter(
+    (candidate) => (candidate.archivedAt !== null) === (location === "archive"),
+  );
+  return {
+    schemaVersion: 1,
+    snapshotSequence: 1,
+    threads: read.filter((candidate) => candidate.archivedAt === null),
+    archivedThreads: read.filter((candidate) => candidate.archivedAt !== null),
+  };
+};
+
 const makeHarness = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* seedRows;
@@ -146,15 +160,7 @@ const makeHarness = Effect.gen(function* () {
   const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     getShellSnapshot: (options) =>
       Ref.update(snapshotReads, (count) => count + 1).pipe(
-        Effect.as({
-          schemaVersion: 1,
-          snapshotSequence: 1,
-          threads: shells.filter(
-            (candidate) =>
-              (candidate.archivedAt !== null) === (options?.location === "archive"),
-          ),
-          archivedThreads: [],
-        }),
+        Effect.as(snapshotFor(options?.location ?? "active")),
       ),
     getThreadShell: (threadId) =>
       Effect.succeed(shells.find((candidate) => candidate.id === threadId) ?? null),
@@ -266,7 +272,13 @@ describe("control listings", () => {
           "live-settling",
           "quiet",
         ]);
-        assert.strictEqual(yield* Ref.get(snapshotReads), 2);
+        assert.deepStrictEqual(yield* threadIds("/threads?archived=true&state=running"), [
+          "live-archived",
+        ]);
+        assert.deepStrictEqual(yield* threadIds("/threads?archived=true&state=idle,running"), [
+          "live-archived",
+        ]);
+        assert.strictEqual(yield* Ref.get(snapshotReads), 3);
       }),
     ),
   );
