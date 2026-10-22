@@ -1545,122 +1545,127 @@ const make = Effect.gen(function* () {
   // Knocks
 
   const decideKnock = (input: DecideKnockInput, provenance: MissionProvenance) =>
-    Effect.gen(function* () {
-      const knock = Option.getOrNull(yield* store.get("knock", input.knockId));
-      if (knock === null) return yield* fail("not-found", `No knock ${input.knockId}.`);
-      if (knock.status !== "pending") {
-        return yield* fail("conflict", `Knock ${knock.id} was already ${knock.status}.`);
-      }
-      const cast = yield* loadCast(knock.missionId);
-      const owner = isOwnerProvenance(provenance);
-      const toMaster =
-        knock.targetThreadId !== undefined && masterThreadsOf(cast).includes(knock.targetThreadId);
-      if (!owner && !(isMaster(cast, provenance) && !toMaster)) {
-        return yield* fail(
-          "forbidden",
-          toMaster
-            ? "Only the owner decides knocks addressed to the master."
-            : "Only the owner or the mission's master decides knocks.",
-        );
-      }
-      // The owner's note is a comment on the knock, saved with the decision; the
-      // forward carries every comment he left so the receiver acts on them.
-      const decidedAt = yield* nowIso;
-      const subject = { kind: "knock" as const, id: knock.id };
-      const note = yield* decisionNoteOf(input.note, provenance);
-      const mark =
-        note === null
-          ? null
-          : withComment(
-              yield* store.get("inbox-mark", markIdOf(subject)),
-              subject,
-              knock.missionId,
-              {
-                id: `comment-${sha256(`${knock.id}:${decidedAt}`).slice(0, 32)}`,
-                body: note,
-                at: decidedAt,
-              },
-            );
-      const comments = mark?.comments ?? (yield* commentsOn(store, subject));
-      const withComments = (body: string) =>
-        comments.length === 0
-          ? body
-          : `${body}\n\nThe owner's comments:\n${commentLines(comments)}`;
-      const text = input.editedText ?? knock.body;
-      let forwardedTo: MissionActor | null = null;
-      if (input.action === "forward") {
-        forwardedTo =
-          input.forwardTo ??
-          (knock.targetThreadId === undefined
-            ? null
-            : { _tag: "thread", threadId: knock.targetThreadId });
-        if (forwardedTo === null) {
-          return yield* fail("invalid", "Say who to forward this knock to.");
+    // The owner's note joins the knock's comments, which comments write under this lock too.
+    store.withItemLock(
+      markIdOf({ kind: "knock", id: input.knockId }),
+      Effect.gen(function* () {
+        const knock = Option.getOrNull(yield* store.get("knock", input.knockId));
+        if (knock === null) return yield* fail("not-found", `No knock ${input.knockId}.`);
+        if (knock.status !== "pending") {
+          return yield* fail("conflict", `Knock ${knock.id} was already ${knock.status}.`);
         }
-        // A knock is forwarded inside its own mission only: the internal send
-        // below skips the guard, so it must never reach another mission's thread.
-        yield* requireInMission(cast, [forwardedTo]);
-        const targets = threadsOfActor(cast, forwardedTo);
-        if (targets.length === 0) {
+        const cast = yield* loadCast(knock.missionId);
+        const owner = isOwnerProvenance(provenance);
+        const toMaster =
+          knock.targetThreadId !== undefined &&
+          masterThreadsOf(cast).includes(knock.targetThreadId);
+        if (!owner && !(isMaster(cast, provenance) && !toMaster)) {
           return yield* fail(
-            "invalid",
-            `${labelOf(cast, forwardedTo)} has no thread to receive it.`,
+            "forbidden",
+            toMaster
+              ? "Only the owner decides knocks addressed to the master."
+              : "Only the owner or the mission's master decides knocks.",
           );
         }
-        for (const threadId of targets) {
-          if ((yield* membershipIn(within(cast), threadId)) === null) {
+        // The owner's note is a comment on the knock, saved with the decision; the
+        // forward carries every comment he left so the receiver acts on them.
+        const decidedAt = yield* nowIso;
+        const subject = { kind: "knock" as const, id: knock.id };
+        const note = yield* decisionNoteOf(input.note, provenance);
+        const mark =
+          note === null
+            ? null
+            : withComment(
+                yield* store.get("inbox-mark", markIdOf(subject)),
+                subject,
+                knock.missionId,
+                {
+                  id: `comment-${sha256(`${knock.id}:${decidedAt}`).slice(0, 32)}`,
+                  body: note,
+                  at: decidedAt,
+                },
+              );
+        const comments = mark?.comments ?? (yield* commentsOn(store, subject));
+        const withComments = (body: string) =>
+          comments.length === 0
+            ? body
+            : `${body}\n\nThe owner's comments:\n${commentLines(comments)}`;
+        const text = input.editedText ?? knock.body;
+        let forwardedTo: MissionActor | null = null;
+        if (input.action === "forward") {
+          forwardedTo =
+            input.forwardTo ??
+            (knock.targetThreadId === undefined
+              ? null
+              : { _tag: "thread", threadId: knock.targetThreadId });
+          if (forwardedTo === null) {
+            return yield* fail("invalid", "Say who to forward this knock to.");
+          }
+          // A knock is forwarded inside its own mission only: the internal send
+          // below skips the guard, so it must never reach another mission's thread.
+          yield* requireInMission(cast, [forwardedTo]);
+          const targets = threadsOfActor(cast, forwardedTo);
+          if (targets.length === 0) {
             return yield* fail(
-              "forbidden",
-              `Thread ${threadId} is not a member of mission ${cast.missionId}.`,
+              "invalid",
+              `${labelOf(cast, forwardedTo)} has no thread to receive it.`,
             );
           }
+          for (const threadId of targets) {
+            if ((yield* membershipIn(within(cast), threadId)) === null) {
+              return yield* fail(
+                "forbidden",
+                `Thread ${threadId} is not a member of mission ${cast.missionId}.`,
+              );
+            }
+          }
+          yield* Effect.forEach(
+            targets,
+            (threadId) =>
+              threads.send({
+                threadId,
+                text: withComments(
+                  `[Forwarded by ${owner ? "the owner" : "the master"} from ${knock.fromTitle}] ${text}`,
+                ),
+                key: `knock:${knock.id}:forward:${threadId}`,
+                asOwner: owner,
+              }),
+            { discard: true },
+          );
         }
-        yield* Effect.forEach(
-          targets,
-          (threadId) =>
-            threads.send({
-              threadId,
-              text: withComments(
-                `[Forwarded by ${owner ? "the owner" : "the master"} from ${knock.fromTitle}] ${text}`,
-              ),
-              key: `knock:${knock.id}:forward:${threadId}`,
-              asOwner: owner,
-            }),
-          { discard: true },
-        );
-      }
-      const decided: Knock = {
-        ...knock,
-        status: input.action === "forward" ? "forwarded" : "dropped",
-        forwardedText: input.action === "forward" ? text : null,
-        forwardedTo,
-        decidedAt,
-      };
-      yield* store.commit({
-        event: {
-          missionId: knock.missionId,
-          kind: "knock.decided",
-          actor: actorOf(provenance),
-          provenance,
-          summary: clipSummary(
-            `${input.action === "forward" ? "Forwarded" : "Dropped"} knock from ${knock.fromTitle}: ${knock.summary}`,
-          ),
-          subject: { kind: "knock", id: knock.id },
-          payload: {
-            action: input.action,
-            edited: input.editedText !== undefined,
-            ...(mark === null ? {} : { commentId: mark.comments.at(-1)?.id ?? null }),
+        const decided: Knock = {
+          ...knock,
+          status: input.action === "forward" ? "forwarded" : "dropped",
+          forwardedText: input.action === "forward" ? text : null,
+          forwardedTo,
+          decidedAt,
+        };
+        yield* store.commit({
+          event: {
+            missionId: knock.missionId,
+            kind: "knock.decided",
+            actor: actorOf(provenance),
+            provenance,
+            summary: clipSummary(
+              `${input.action === "forward" ? "Forwarded" : "Dropped"} knock from ${knock.fromTitle}: ${knock.summary}`,
+            ),
+            subject: { kind: "knock", id: knock.id },
+            payload: {
+              action: input.action,
+              edited: input.editedText !== undefined,
+              ...(mark === null ? {} : { commentId: mark.comments.at(-1)?.id ?? null }),
+            },
           },
-        },
-        upserts: [
-          { _tag: "knock", record: decided },
-          ...(mark === null ? [] : [{ _tag: "inbox-mark" as const, record: mark }]),
-        ],
-      });
-      if (comments.length > 0)
-        yield* tellMasterOfKnockComments(cast, decided, comments, provenance);
-      return decided;
-    });
+          upserts: [
+            { _tag: "knock", record: decided },
+            ...(mark === null ? [] : [{ _tag: "inbox-mark" as const, record: mark }]),
+          ],
+        });
+        if (comments.length > 0)
+          yield* tellMasterOfKnockComments(cast, decided, comments, provenance);
+        return decided;
+      }),
+    );
 
   /** The master hears the owner's comments on a knock he decided, once. */
   const tellMasterOfKnockComments = Effect.fn("MissionRouter.tellMasterOfKnockComments")(

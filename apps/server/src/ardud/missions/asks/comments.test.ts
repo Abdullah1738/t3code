@@ -9,6 +9,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Scheduler from "effect/Scheduler";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as MissionService from "../MissionService.ts";
@@ -479,6 +480,46 @@ describe("owner comments travel with his decisions", () => {
       );
       const [pending] = yield* missions.approvals({ missionId, ids: [pendingId] });
       expect(pending?.decisionNote ?? null).toBeNull();
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a comment racing a decision note on the same item keeps both", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const missions = yield* MissionService.MissionService;
+      const store = yield* MissionStore.MissionStore;
+      const approvalId = ApprovalId.make("m-1:approval:crw:acme/api#11@eeeeeeeeeeee");
+      yield* missions.openApproval(crw, {
+        missionId,
+        approvalId,
+        kind: "merge",
+        title: "Good to merge: acme/api#11",
+        detail: "Decide in the review thread.",
+        requestedBy: "crw",
+        links: [pullRequest(11)],
+      });
+      // Yield on every op so the two writes interleave between read and commit.
+      yield* Effect.all(
+        [
+          asks.commentInboxItem(
+            { subject: { kind: "approval", id: approvalId }, body: "Check the migration." },
+            ownerApp,
+          ),
+          missions.decideApproval(ownerApp, { approvalId, action: "approve", note: "Ship it." }),
+        ],
+        { concurrency: "unbounded", discard: true },
+      ).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 8));
+
+      const mark = yield* store.get("inbox-mark", `approval:${approvalId}`);
+      const bodies = mark._tag === "Some" ? mark.value.comments.map((each) => each.body) : [];
+      expect([...bodies].toSorted()).toEqual(["Check the migration.", "Ship it."]);
+      const [approval] = yield* missions.approvals({ missionId, ids: [approvalId] });
+      expect(approval?.decisionNote?.split("\n").toSorted()).toEqual([
+        "Check the migration.",
+        "Ship it.",
+      ]);
     }).pipe(Effect.provide(layer));
   });
 

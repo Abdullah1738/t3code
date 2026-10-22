@@ -2149,6 +2149,10 @@ const make = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   // ardud missions: finish-a - comments and snoozes on inbox items
 
+  // Approval and knock decisions write the same mark outside the asks lock.
+  const onItem = <A, E, R>(subject: InboxItemRef, effect: Effect.Effect<A, E, R>) =>
+    store.withItemLock(markIdOf(subject), effect);
+
   const markedItem = (subject: InboxItemRef, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       if (!isOwnerProvenance(provenance)) {
@@ -2532,13 +2536,14 @@ const make = Effect.gen(function* () {
     // ardud missions: r22 comments
     withComments: (kind, records) => attachComments(store, kind, records),
     commentInboxItem: (input, provenance) =>
-      serialized(commentInboxItemCommand(input, provenance)).pipe(
+      serialized(onItem(input.subject, commentInboxItemCommand(input, provenance))).pipe(
         Effect.tap(({ record, item }) => tellOfComment(input.subject, record, item.label)),
         Effect.map(({ record }) => record),
       ),
-    snoozeInboxItem: (input, provenance) => serialized(snoozeInboxItemCommand(input, provenance)),
+    snoozeInboxItem: (input, provenance) =>
+      serialized(onItem(input.subject, snoozeInboxItemCommand(input, provenance))),
     unsnoozeInboxItem: (input, provenance) =>
-      serialized(unsnoozeInboxItemCommand(input, provenance)),
+      serialized(onItem(input.subject, unsnoozeInboxItemCommand(input, provenance))),
   });
 });
 
