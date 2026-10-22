@@ -9,7 +9,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 
-import { at, item, missionId, ownerApp, seed } from "../asks/AsksService.testkit.ts";
+import { at, item, mission, missionId, ownerApp, seed } from "../asks/AsksService.testkit.ts";
 import * as ScribeStore from "../scribe/ScribeStore.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { ViewService } from "./ViewService.ts";
@@ -157,6 +157,45 @@ describe("report sections", () => {
           views.longText({ missionId, ref: { ...ref, id: "nope" }, path: "text" }),
         );
         assert.equal(missing.code, "not-found");
+      }),
+    ),
+  );
+
+  it.effect("labels periods in the mission's day zone and lists only current reports", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const store = yield* MissionStore.MissionStore;
+        yield* store.upsert(
+          { _tag: "mission", record: { ...mission, reports: { dayBoundary: "Asia/Dubai" } } },
+          {
+            missionId,
+            kind: "mission.updated",
+            actor: { _tag: "system", component: "test" },
+            provenance: { _tag: "system", component: "test" },
+            summary: "day boundary",
+            subject: null,
+          },
+        );
+        // An old 04:30Z daily, then the Dubai-day daily that overlaps it.
+        yield* report("daily", "2026-10-20T04:30:00.000Z", "2026-10-21T04:30:00.000Z", "# Old");
+        yield* report("daily", "2026-10-20T20:00:00.000Z", "2026-10-21T20:00:00.000Z", "# Wed");
+        yield* report("update", "2026-10-21T04:00:00.000Z", "2026-10-21T08:00:00.000Z", "# Up");
+        const views = yield* ViewService;
+        const daily = yield* views.placeSection(ownerApp, reportSection("daily", ["daily"], 5));
+        const updates = yield* views.placeSection(
+          ownerApp,
+          reportSection("updates", ["update"], 5),
+        );
+        const snapshot = yield* views.snapshot(missionId);
+        const dailyRows = snapshot.sectionData?.find((data) => data.sectionId === daily.ref.id);
+        assert.equal(dailyRows?.total, 1);
+        assert.deepEqual(
+          dailyRows?.rows.map((row) => [row.value.title, row.value.period]),
+          [["Wed", "Wed 21 Oct (Dubai day)"]],
+        );
+        const updateRows = snapshot.sectionData?.find((data) => data.sectionId === updates.ref.id);
+        assert.equal(updateRows?.rows[0]?.value.period, "21 Oct 08:00–12:00 Dubai");
       }),
     ),
   );

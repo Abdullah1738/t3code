@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 import {
+  isOwnerProvenance,
   MissionError,
   MissionId,
   Note,
@@ -17,6 +18,9 @@ import {
   type MissionProvenance,
 } from "@t3tools/contracts";
 
+import { standingOf } from "../asks/standing.ts";
+import { castOf } from "../core/master.ts";
+import { actorOf } from "../core/provenance.ts";
 import { MissionStore, type MissionCommit } from "../store/MissionStore.ts";
 import { assembleBatch, type BatchStats, type ScribeBatchInput } from "./batch.ts";
 import {
@@ -29,8 +33,16 @@ import {
   readEditorState,
 } from "./editor.ts";
 import { currentNotes, fyiScore, rankFyi } from "./notes.ts";
-import { type BuiltReport, buildReport, type ReportKind } from "./reports.ts";
-import { ScribeStore, type ScribeStoreError, toJson } from "./ScribeStore.ts";
+import { type BuiltReport, buildReport, type OpenItem, type ReportKind } from "./reports.ts";
+import { dayWindow, reportPeriod, reportTitle, reportZone } from "./reportTime.ts";
+import {
+  REPORT_HEAD_CHARS,
+  type ReportAuthor,
+  reportIdOf,
+  ScribeStore,
+  type ScribeStoreError,
+  toJson,
+} from "./ScribeStore.ts";
 
 /**
  * Server side of the scribe: hands the runner its lanes and cursors, checks
@@ -98,12 +110,47 @@ export type ScribeError = MissionError | ScribeStoreError;
 export interface ReportRequest {
   readonly missionId: string;
   readonly kind: ReportKind;
-  /** End of the window; defaults to now. */
+  /**
+   * End of the window; defaults to now. A daily for a mission with a day
+   * boundary defaults to the last midnight there.
+   */
   readonly to?: string | undefined;
-  /** Start of the window; defaults to the last report of this kind, else 4h/24h back. */
+  /**
+   * Start of the window; defaults to the last report of this kind, else 4h/24h
+   * back. A daily for a mission with a day boundary covers one day there.
+   */
   readonly from?: string | undefined;
   /** Keep the report so the next one closes out what it left open. */
   readonly save: boolean;
+}
+
+/** A written report to keep, from the scribe's writer, the master or the owner. */
+export interface ReportPut {
+  readonly missionId: string;
+  readonly kind: ReportKind;
+  readonly coversFrom: string;
+  readonly coversTo: string;
+  /** Kept exactly as given. */
+  readonly text: string;
+  /** Items left open, for the next report to close out. */
+  readonly open?: ReadonlyArray<OpenItem> | undefined;
+  /** The facts the text was written from. */
+  readonly facts?: unknown;
+}
+
+export interface ReportPutResult {
+  readonly reportId: string;
+  readonly kind: ReportKind;
+  readonly coversFrom: string;
+  readonly coversTo: string;
+  readonly revision: number;
+  readonly author: ReportAuthor;
+  /** Characters in the text. */
+  readonly size: number;
+  /** False when this exact report was already the current one; nothing changed. */
+  readonly saved: boolean;
+  /** Reports this one hides from lists: older revisions and overlapping dailies. */
+  readonly hides: ReadonlyArray<string>;
 }
 
 export interface EditorApply {
@@ -147,6 +194,10 @@ export const EDITOR_PROVENANCE: MissionProvenance = { _tag: "system", component:
 const EDITOR_WINDOW_HOURS = 24;
 
 const WINDOW_HOURS: Record<ReportKind, number> = { update: 4, daily: 24 };
+/** Longest report text kept; a daily aims for 25-45k characters. */
+const REPORT_TEXT_MAX = 200_000;
+/** Longest facts pack kept, as JSON. */
+const REPORT_FACTS_MAX = 2_000_000;
 /** Notes read for ranking and reports: the newest this many per mission. */
 const NOTE_WINDOW = 5000;
 /** Page size when reading the event log for a report window. */
@@ -207,6 +258,16 @@ export class ScribeService extends Context.Service<
     ) => Effect.Effect<ScribeStats, ScribeError>;
     /** Build the 4h update or the daily summary from mission data. */
     readonly report: (request: ReportRequest) => Effect.Effect<BuiltReport, ScribeError>;
+    /**
+     * Keep a written report, as the scribe, the owner or the mission's master.
+     * The same window end again adds a revision and keeps the old text; the
+     * same report again changes nothing. The scribe never replaces a report
+     * the owner or the master wrote.
+     */
+    readonly putReport: (
+      provenance: MissionProvenance,
+      input: ReportPut,
+    ) => Effect.Effect<ReportPutResult, ScribeError>;
     /** What the hourly editor pass reads. */
     readonly editorInput: (missionId: string) => Effect.Effect<EditorInput, ScribeError>;
     /** Check and store one editor reply; re-applying the same reply opens nothing new. */
@@ -226,6 +287,8 @@ const make = Effect.gen(function* () {
   const scribe = yield* ScribeStore;
   // One batch at a time, so the cursor check and the write see the same cursor.
   const ingestLock = yield* Semaphore.make(1);
+  // One report save at a time, so the revision read and the insert agree.
+  const reportLock = yield* Semaphore.make(1);
   const suggestionSink = yield* Ref.make<EditorSuggestionSink | null>(null);
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
@@ -535,19 +598,28 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { missionId, kind } = request;
       const mission = yield* requireMission(missionId);
+      // A daily for a mission with a day boundary covers one whole day there.
+      const zone = kind === "daily" ? reportZone(mission) : null;
       // Windows are compared as strings below and in SQL, so every bound is
       // normalized to the same ISO form first.
-      const to = request.to === undefined ? yield* now : yield* isoTime("to", request.to);
+      const to =
+        request.to !== undefined
+          ? yield* isoTime("to", request.to)
+          : zone !== null
+            ? dayWindow(zone, { nowIso: yield* now }).to
+            : yield* now;
       const id = MissionId.make(missionId);
       const previous = yield* scribe.lastReport(missionId, kind);
       const usablePrevious = previous !== null && previous.coversTo < to ? previous : null;
       const from =
         request.from !== undefined
           ? yield* isoTime("from", request.from)
-          : (usablePrevious?.coversTo ??
-            DateTime.formatIso(
-              DateTime.subtract(DateTime.makeUnsafe(to), { hours: WINDOW_HOURS[kind] }),
-            ));
+          : zone !== null
+            ? dayWindow(zone, { toIso: to, nowIso: to }).from
+            : (usablePrevious?.coversTo ??
+              DateTime.formatIso(
+                DateTime.subtract(DateTime.makeUnsafe(to), { hours: WINDOW_HOURS[kind] }),
+              ));
       if (from >= to) {
         return yield* new MissionError({
           code: "invalid",
@@ -597,19 +669,170 @@ const make = Effect.gen(function* () {
         usage,
       });
       if (request.save) {
-        yield* scribe.saveReport({
-          reportId: `${missionId}|${kind}|${to}`,
+        yield* keepReport(mission, "scribe", SCRIBE_PROVENANCE, {
           missionId,
           kind,
           coversFrom: from,
           coversTo: to,
-          open: built.open,
           text: built.text,
-          createdAt: yield* now,
+          open: built.open,
         });
       }
       return built;
     });
+
+  /** Who may keep a report, and the provenance its event carries. */
+  const reportAuthorOf = Effect.fn("ScribeService.reportAuthorOf")(function* (
+    missionId: string,
+    provenance: MissionProvenance,
+  ) {
+    if (provenance._tag === "system" && provenance.component === "scribe") {
+      return { author: "scribe" as const, provenance };
+    }
+    if (isOwnerProvenance(provenance)) return { author: "owner" as const, provenance };
+    if (provenance._tag === "agent") {
+      const cast = yield* castOf(store, MissionId.make(missionId));
+      const standing = cast.mission === null ? null : standingOf(cast, provenance);
+      if (standing?.isMaster === true) {
+        return { author: "master" as const, provenance: standing.caller.provenance };
+      }
+    }
+    return yield* new MissionError({
+      code: "forbidden",
+      detail: `Only the scribe, the owner or mission ${missionId}'s master saves its reports.`,
+    });
+  });
+
+  const sameJson = (left: unknown, right: unknown) =>
+    toJson(left ?? null) === toJson(right ?? null);
+
+  const keepReport = Effect.fn("ScribeService.keepReport")(function* (
+    mission: { readonly reports?: { readonly dayBoundary?: string | undefined } | undefined },
+    author: ReportAuthor,
+    provenance: MissionProvenance,
+    input: ReportPut,
+  ) {
+    const { missionId, kind, text } = input;
+    const coversFrom = yield* isoTime("coversFrom", input.coversFrom);
+    const coversTo = yield* isoTime("coversTo", input.coversTo);
+    const invalid = (detail: string) => Effect.fail(new MissionError({ code: "invalid", detail }));
+    if (coversFrom >= coversTo) {
+      return yield* invalid(`report window ${coversFrom} to ${coversTo}`);
+    }
+    if (text.trim().length === 0) return yield* invalid("report text is empty");
+    if (text.length > REPORT_TEXT_MAX) {
+      return yield* invalid(
+        `report text is ${text.length} characters; the limit is ${REPORT_TEXT_MAX}`,
+      );
+    }
+    const open = input.open ?? [];
+    const facts = input.facts ?? null;
+    const factsSize = yield* Effect.try({
+      try: () => toJson(facts).length,
+      catch: () => new MissionError({ code: "invalid", detail: "report facts are not JSON" }),
+    });
+    if (factsSize > REPORT_FACTS_MAX) {
+      return yield* invalid(
+        `report facts are ${factsSize} characters as JSON; the limit is ${REPORT_FACTS_MAX}`,
+      );
+    }
+    const latest = yield* scribe.latestRevision(missionId, kind, coversTo);
+    const unchanged =
+      latest !== null &&
+      latest.current &&
+      latest.report.author === author &&
+      latest.report.coversFrom === coversFrom &&
+      latest.report.text === text &&
+      sameJson(latest.report.open, open) &&
+      sameJson(latest.report.facts, facts);
+    if (unchanged) {
+      return {
+        reportId: latest.report.reportId,
+        kind,
+        coversFrom,
+        coversTo,
+        revision: latest.report.revision,
+        author,
+        size: text.length,
+        saved: false,
+        hides: [],
+      } satisfies ReportPutResult;
+    }
+    const hidden = yield* scribe.reportsHiddenBy(missionId, kind, coversFrom, coversTo);
+    const written = hidden.find((report) => report.author !== "scribe");
+    if (author === "scribe" && written !== undefined) {
+      return yield* new MissionError({
+        code: "conflict",
+        detail: `report ${written.reportId} was written by the ${written.author}; the scribe does not replace it`,
+      });
+    }
+    const revision = (latest?.report.revision ?? 0) + 1;
+    const reportId = reportIdOf(missionId, kind, coversTo, revision);
+    const hides = hidden.map((report) => report.reportId);
+    const at = yield* now;
+    const title = reportTitle({ kind, head: text.slice(0, REPORT_HEAD_CHARS) });
+    const period = reportPeriod(coversFrom, coversTo, reportZone(mission));
+    const who = author === "scribe" ? "Scribe" : author === "owner" ? "Owner" : "Master";
+    yield* store.commit({
+      event: {
+        missionId: MissionId.make(missionId),
+        kind: "report.saved",
+        actor: actorOf(provenance),
+        provenance,
+        summary: clipLine(
+          `${who} saved ${kind === "daily" ? "daily" : "update"} "${title}" for ${period}${revision > 1 ? `, revision ${revision}` : ""}`,
+        ),
+        subject: { kind: "report", id: reportId, label: title },
+        payload: {
+          reportId,
+          kind,
+          coversFrom,
+          coversTo,
+          revision,
+          author,
+          size: text.length,
+          hides,
+        },
+        at,
+      },
+      alongside: scribe
+        .writeReport({
+          reportId,
+          missionId,
+          kind,
+          coversFrom,
+          coversTo,
+          open,
+          text,
+          createdAt: at,
+          author,
+          revision,
+          facts,
+        })
+        .pipe(Effect.orDie),
+    });
+    yield* scribe.announceReport(missionId);
+    return {
+      reportId,
+      kind,
+      coversFrom,
+      coversTo,
+      revision,
+      author,
+      size: text.length,
+      saved: true,
+      hides,
+    } satisfies ReportPutResult;
+  }, reportLock.withPermit);
+
+  const putReport = Effect.fn("ScribeService.putReport")(function* (
+    provenance: MissionProvenance,
+    input: ReportPut,
+  ) {
+    const mission = yield* requireMission(input.missionId);
+    const caller = yield* reportAuthorOf(input.missionId, provenance);
+    return yield* keepReport(mission, caller.author, caller.provenance, input);
+  });
 
   const editorStateOf = (missionId: string) =>
     scribe
@@ -839,6 +1062,7 @@ const make = Effect.gen(function* () {
     fyi,
     stats,
     report,
+    putReport,
     editorInput,
     applyEditor,
     editorView,
