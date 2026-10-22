@@ -56,4 +56,12 @@ Connect key and the distribution key and certificate come from
 Signing uses a throwaway keychain per run, so the login keychain and the
 search list are never touched.
 
+Apple can hold a newly registered device in `PROCESSING` for 24–72 hours.
+It cannot be enabled manually or added to a profile during that hold. The
+tool waits briefly with backoff, then leaves the enrollment in `preparing`
+with the Apple status in `status <name>`. Re-run `install <name>` once Apple
+enables it; the existing page is reused while its tunnel is still open.
+Only `DISABLED` devices are re-enabled. Duplicate registration responses are
+reconciled by UDID, and profile creation retries device-propagation conflicts.
+
 Tests: `node --test test/enroll.test.mjs` and `node --test test/server.test.mjs`.

@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { DevicePendingError } from "./asc.mjs";
 import { enrollPage, extractDevice, manifestPlist, profileServiceConfig } from "./enroll.mjs";
 import { notifyOwner, wakeThread } from "./notify.mjs";
 import { provision } from "./provision.mjs";
@@ -76,7 +77,7 @@ export function createHandler({ dir, onEnrolled }) {
 
       if (page === "/") {
         const phase = state.phase ?? "waiting";
-        return send(res, 200, "text/html; charset=utf-8", enrollPage({ phase, manifestUrl: `${base}manifest.plist` }));
+        return send(res, 200, "text/html; charset=utf-8", enrollPage({ phase, pendingDevice: state.pendingDevice, manifestUrl: `${base}manifest.plist` }));
       }
       if (page === "/profile.mobileconfig") {
         return send(
@@ -176,6 +177,12 @@ async function main(dir) {
       notifyOwner({ name, key: `ready:${state.build.profileId}`, severity: "info", text });
       wakeThread(thread, text);
     } catch (error) {
+      if (error instanceof DevicePendingError) {
+        const text = `Robob Cards for ${name} is waiting for Apple to enable the registered iPhone. Apple reports ${error.deviceStatus}; processing can take 24–72 hours. The page remains pending. Retry: integrations/robob-cards/bin/robob-cards-enroll install ${name}`;
+        notifyOwner({ name, key: `processing:${error.deviceId}`, severity: "attention", text });
+        wakeThread(thread, text);
+        return;
+      }
       const text = `Robob Cards for ${name} failed while preparing the app: ${error.message}. ${name}'s page says something went wrong. Fix it, then run: integrations/robob-cards/bin/robob-cards-enroll install ${name}`;
       notifyOwner({ name, key: `failed:${Date.now()}`, severity: "attention", text });
       wakeThread(thread, text);
