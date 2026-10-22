@@ -136,6 +136,7 @@ export function inboundFromLine(message: { handle: string; text: string; from: s
     receivedAt: message.sentAt,
     source: "typed",
     sender: message.from,
+    sentAt: message.sentAt,
     ...(location ? { location: { latitude: location.latitude, longitude: location.longitude,
       ...(location.accuracy === undefined ? {} : { accuracy: location.accuracy }),
       ...(location.at === undefined ? {} : { at: location.at }) } } : {}),

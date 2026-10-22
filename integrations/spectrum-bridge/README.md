@@ -175,6 +175,23 @@ under `~/.config/spectrum-bridge/`.
   text travelled inside the leader's prompt. The batch outcome is on the
   leader row; the aggregate is kept in kv `batch:<leaderId>`.
 
+## Group chats (Sendblue mode)
+
+Robob only listens in groups. The word Robob anywhere (`@robob` too) or a swipe
+reply to one of his messages always wakes him; tapbacks never do. Other names
+(Abdullah, Moni) are ordinary text. Every other person-typed line goes
+to Jev (`typesafe/jev-1.13` on OpenRouter's decisions API, `src/group-judge.ts`)
+with the last 15 lines of the chat (people and Robob, speaker-labelled), and
+wakes him at p >= 0.45. If Jev fails twice, the old rule decides: only someone
+Robob is working for or just asked something can follow up unnamed. Lines that
+don't wake him are marked `observed` and ride along as context with the next
+turn. Each verdict is logged as `group-addressed` / `group-observed` with the
+row id and why (`named`, `reply`, `tapback`, `jev:0.62`, `fallback`).
+
+`bun scripts/group-replay.ts [--chat group-sb_gro] [--since ISO] [--labels FILE]`
+re-runs the gate over a group's stored history (read-only) and prints each
+verdict next to what the live gate did.
+
 ## Scoped third parties (Sendblue mode, 2026-10-21)
 
 Owner rule: someone the owner told to text the line may be answered, but only

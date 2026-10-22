@@ -107,6 +107,7 @@ describe("inbound mapping", () => {
     expect(mapped.attachments[0]).toMatchObject({ guid: "https://cdn/x/voice.caf", mimeType: "audio/x-caf", totalBytes: 0 });
     expect(mapped.source).toBe("typed");
     expect(mapped.sender).toBe(moni);
+    expect(mapped.sentAt).toBe(5);
   });
 
   test("a location share becomes the shared-location text and keeps coordinates", () => {
