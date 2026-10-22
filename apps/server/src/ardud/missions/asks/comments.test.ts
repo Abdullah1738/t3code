@@ -426,6 +426,62 @@ describe("owner comments travel with his decisions", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("a comment after an approval is decided reaches its requester", () => {
+    const { posts, layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const missions = yield* MissionService.MissionService;
+      const approvalId = ApprovalId.make("m-1:approval:crw:acme/api#9@cccccccccccc");
+      yield* missions.openApproval(crw, {
+        missionId,
+        approvalId,
+        kind: "merge",
+        title: "Good to merge: acme/api#9",
+        detail: "Decide in the review thread.",
+        requestedBy: "crw",
+        links: [pullRequest(9)],
+      });
+      yield* missions.decideApproval(ownerApp, {
+        approvalId,
+        action: "approve",
+        note: "Squash it.",
+      });
+      const before = posts.length;
+      yield* asks.commentInboxItem(
+        { subject: { kind: "approval", id: approvalId }, body: "Wait for the deploy window." },
+        ownerApp,
+      );
+
+      // crw reads the decision note from /approvals, so the late comment is on it.
+      const [approval] = yield* missions.approvals({ missionId, ids: [approvalId] });
+      expect(approval?.status).toBe("approved");
+      expect(approval?.decisionNote).toBe("Squash it.\nWait for the deploy window.");
+      expect(posts.length).toBe(before + 1);
+      expect(posts.at(-1)?.input.to).toEqual([toMaster]);
+      expect(posts.at(-1)?.input.body).toContain("crw reads the comment in the decision note");
+      expect(posts.at(-1)?.input.body).toContain("- Wait for the deploy window.");
+
+      // A pending approval's note is written when he decides, not by a comment.
+      const pendingId = ApprovalId.make("m-1:approval:crw:acme/api#10@dddddddddddd");
+      yield* missions.openApproval(crw, {
+        missionId,
+        approvalId: pendingId,
+        kind: "merge",
+        title: "Good to merge: acme/api#10",
+        detail: "Decide in the review thread.",
+        requestedBy: "crw",
+        links: [pullRequest(10)],
+      });
+      yield* asks.commentInboxItem(
+        { subject: { kind: "approval", id: pendingId }, body: "Not yet." },
+        ownerApp,
+      );
+      const [pending] = yield* missions.approvals({ missionId, ids: [pendingId] });
+      expect(pending?.decisionNote ?? null).toBeNull();
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("a comment on a pending knock to the master stays with the owner", () => {
     const { posts, layer } = harness();
     return Effect.gen(function* () {

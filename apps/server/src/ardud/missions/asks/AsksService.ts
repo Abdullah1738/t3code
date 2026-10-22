@@ -2197,6 +2197,19 @@ const make = Effect.gen(function* () {
               now: at,
             })
           : null;
+      // The requester reads a decided approval's note, not the inbox mark, so
+      // a comment after the decision goes on that note too.
+      const approval =
+        input.subject.kind === "approval" ? yield* need("approval", input.subject.id) : null;
+      const noted =
+        approval === null || approval.status === "pending" || approval.status === "stale-closed"
+          ? null
+          : {
+              ...approval,
+              decisionNote: [approval.decisionNote, input.body]
+                .filter((line): line is string => typeof line === "string" && line.length > 0)
+                .join("\n"),
+            };
       yield* persist(
         item.missionId,
         [
@@ -2213,6 +2226,7 @@ const make = Effect.gen(function* () {
         [
           { _tag: "inbox-mark", record },
           ...(sentBack === null ? [] : [{ _tag: "draft" as const, record: sentBack.record }]),
+          ...(noted === null ? [] : [{ _tag: "approval" as const, record: noted }]),
         ],
       );
       return { record, item, comment };
@@ -2271,6 +2285,18 @@ const make = Effect.gen(function* () {
           lead: `Knock ${knock.id} from ${knock.fromTitle} is ${knock.status}.`,
           current: all,
           ownerOnly: toMaster,
+        };
+      }
+      case "approval": {
+        const approval = yield* need("approval", subject.id);
+        const decided = approval.status === "approved" || approval.status === "rejected";
+        return {
+          to: [],
+          lead:
+            approval.status === "pending"
+              ? `Approval ${approval.id} is waiting on his decision: ${approval.title}`
+              : `Approval ${approval.id} is ${approval.status}: ${approval.title}.${decided ? ` ${approval.requestedBy} reads the comment in the decision note.` : ""}`,
+          current: all,
         };
       }
       default:
