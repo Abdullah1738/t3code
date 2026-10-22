@@ -33,6 +33,7 @@ import {
   strayThread,
   writerThread,
 } from "../asks/AsksService.testkit.ts";
+import { makeReads } from "../core/reads.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { answerText } from "./answers.ts";
 import type { SendGuardRequest } from "./guardHook.ts";
@@ -1632,6 +1633,45 @@ describe("lead questions (routing r21)", () => {
         [],
       );
       assert.deepStrictEqual(h.sent, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("an attached thread has no lead, and the status snapshot says so", () => {
+    const h = harness();
+    const reviewThread = ThreadId.make("t-review");
+    h.questions.set(`${reviewThread}:q-1`, question);
+    h.questions.set(`${laneThread}:q-1`, question);
+    const attachment = (threadId: ThreadId) => ({
+      _tag: "thread-attachment" as const,
+      record: {
+        threadId,
+        missionId,
+        attachedBy: "crw",
+        title: "Review",
+        pullRequest: null,
+        state: "open" as const,
+        createdAt: "2026-10-22T00:00:00.000Z",
+        updatedAt: "2026-10-22T00:00:00.000Z",
+      },
+    });
+    return Effect.gen(function* () {
+      yield* seedLeads;
+      yield* commitUpserts([attachment(reviewThread), attachment(laneThread)]);
+      const router = yield* MissionRouter.MissionRouter;
+      assert.deepStrictEqual(
+        yield* router.questionRaised({ threadId: reviewThread, requestId: "q-1" }),
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* router.questionRaised({ threadId: laneThread, requestId: "q-1" }),
+        [leadThread],
+      );
+      const reads = makeReads(yield* MissionStore.MissionStore, () => null);
+      const listed = (yield* reads.listSnapshot).missions.find((each) => each.id === missionId);
+      assert.includeMembers([...(listed?.threadIds ?? [])], [reviewThread, laneThread]);
+      // Telegram keeps alerting for these; a lane that is also attached still has its lead.
+      assert.deepStrictEqual(listed?.attachedThreadIds, [reviewThread]);
+      assert.deepStrictEqual(listed?.masterThreadIds, [masterThread]);
     }).pipe(Effect.provide(h.layer));
   });
 
