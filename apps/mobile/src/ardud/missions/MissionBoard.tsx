@@ -566,7 +566,7 @@ function RequestsPage(props: PageProps) {
           onChangeText={composer.setText}
           placeholder="Ask or tell the master"
           autoFocus={props.askKey > 0}
-          minHeight="few"
+          fixedHeight
         />
         <View className="flex-row">
           <ActionButton

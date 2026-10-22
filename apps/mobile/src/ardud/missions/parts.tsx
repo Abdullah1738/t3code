@@ -295,6 +295,13 @@ export function TextField(props: {
   readonly autoFocus?: boolean;
   readonly editable?: boolean;
   readonly minHeight?: "one" | "few";
+  /**
+   * Keeps the box one height whatever it holds; longer text scrolls inside.
+   * For a composer that clears itself after sending: iOS doesn't shrink a
+   * grown multiline input when its value is reset, and a box that changes
+   * height on send shoves everything around it.
+   */
+  readonly fixedHeight?: boolean;
 }) {
   return (
     <AppTextInput
@@ -309,7 +316,7 @@ export function TextField(props: {
       textAlignVertical="top"
       className={cn(
         "rounded-[18px] border-border bg-card-alt text-[15px]",
-        props.minHeight === "few" ? "min-h-24" : "max-h-36",
+        props.fixedHeight ? "h-28" : props.minHeight === "few" ? "min-h-24" : "max-h-36",
       )}
     />
   );
@@ -370,6 +377,9 @@ export function ChoiceRow<Value extends string>(props: {
       accessibilityLabel={props.accessibilityLabel}
       accessibilityRole="tablist"
       showsHorizontalScrollIndicator={false}
+      // A horizontal ScrollView grows by default, so in a column it would take
+      // any spare height and stretch the chips.
+      className="grow-0"
       contentContainerClassName="gap-1.5"
     >
       {props.options.map((option) => {
