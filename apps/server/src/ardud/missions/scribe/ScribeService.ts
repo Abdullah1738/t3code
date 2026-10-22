@@ -602,12 +602,13 @@ const make = Effect.gen(function* () {
       const zone = kind === "daily" ? reportZone(mission) : null;
       // Windows are compared as strings below and in SQL, so every bound is
       // normalized to the same ISO form first.
+      const nowIso = yield* now;
       const to =
         request.to !== undefined
           ? yield* isoTime("to", request.to)
           : zone !== null
-            ? dayWindow(zone, { nowIso: yield* now }).to
-            : yield* now;
+            ? dayWindow(zone, { nowIso }).to
+            : nowIso;
       const id = MissionId.make(missionId);
       const previous = yield* scribe.lastReport(missionId, kind);
       const usablePrevious = previous !== null && previous.coversTo < to ? previous : null;
@@ -737,9 +738,10 @@ const make = Effect.gen(function* () {
       );
     }
     const latest = yield* scribe.latestRevision(missionId, kind, coversTo);
+    // A retry matches the slot's newest revision even when a newer daily has
+    // hidden it since, so a retried save never brings an old window back.
     const unchanged =
       latest !== null &&
-      latest.current &&
       latest.report.author === author &&
       latest.report.coversFrom === coversFrom &&
       latest.report.text === text &&
@@ -759,7 +761,11 @@ const make = Effect.gen(function* () {
       } satisfies ReportPutResult;
     }
     const hidden = yield* scribe.reportsHiddenBy(missionId, kind, coversFrom, coversTo);
-    const written = hidden.find((report) => report.author !== "scribe");
+    // The slot itself counts too: a written report stays the master's or the
+    // owner's even after another daily hides it.
+    const written = [...(latest === null ? [] : [latest.report]), ...hidden].find(
+      (report) => report.author !== "scribe",
+    );
     if (author === "scribe" && written !== undefined) {
       return yield* new MissionError({
         code: "conflict",

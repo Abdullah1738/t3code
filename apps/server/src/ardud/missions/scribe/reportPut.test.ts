@@ -272,6 +272,73 @@ it.effect(
     ),
 );
 
+it.effect("a retried daily stays hidden behind the newer one that overlaps it", () =>
+  fresh(
+    Effect.gen(function* () {
+      yield* seed;
+      const service = yield* ScribeService.ScribeService;
+      const scribe = yield* ScribeStore.ScribeStore;
+      const first = {
+        missionId: MISSION_ID,
+        kind: "daily" as const,
+        coversFrom: "2026-10-20T04:30:00.000Z",
+        coversTo: "2026-10-21T04:30:00.000Z",
+        text: "# First",
+      };
+      const a = yield* service.putReport(master, first);
+      yield* TestClock.adjust("10 minutes");
+      const b = yield* service.putReport(master, { ...dubaiDay, text: "# Second" });
+      assert.deepStrictEqual(b.hides, [a.reportId]);
+
+      yield* TestClock.adjust("10 minutes");
+      const retry = yield* service.putReport(master, first);
+      assert.isFalse(retry.saved);
+      assert.equal(retry.reportId, a.reportId);
+      assert.equal(retry.revision, 1);
+      const dailies = yield* scribe.listReports(MISSION_ID, ["daily"], 10);
+      assert.deepStrictEqual(
+        dailies.rows.map((row) => row.reportId),
+        [b.reportId],
+      );
+      assert.equal((yield* reportEvents).length, 2);
+    }),
+  ),
+);
+
+it.effect("the scribe can't take over a written daily's slot after it was hidden", () =>
+  fresh(
+    Effect.gen(function* () {
+      yield* seed;
+      const service = yield* ScribeService.ScribeService;
+      // A two-day daily from the master, then one day inside it that hides it.
+      const wide = yield* service.putReport(master, {
+        missionId: MISSION_ID,
+        kind: "daily",
+        coversFrom: "2026-10-20T00:00:00.000Z",
+        coversTo: "2026-10-22T00:00:00.000Z",
+        text: "# Two days",
+      });
+      yield* TestClock.adjust("10 minutes");
+      const inside = yield* service.putReport(master, { ...dubaiDay, text: "# One day" });
+      assert.deepStrictEqual(inside.hides, [wide.reportId]);
+
+      // Same end as the hidden daily, a window clear of the newer one.
+      yield* TestClock.adjust("10 minutes");
+      const code = yield* failureOf(
+        service.putReport(ScribeService.SCRIBE_PROVENANCE, {
+          missionId: MISSION_ID,
+          kind: "daily",
+          coversFrom: "2026-10-21T20:00:00.000Z",
+          coversTo: "2026-10-22T00:00:00.000Z",
+          text: "# Scribe",
+        }),
+      );
+      assert.equal(code, "conflict");
+      assert.equal((yield* reportEvents).length, 2);
+    }),
+  ),
+);
+
 it.effect("only the scribe, the owner and the master save reports", () =>
   fresh(
     Effect.gen(function* () {
