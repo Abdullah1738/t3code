@@ -760,9 +760,9 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               );
             }
           }
-          if (input.subject !== undefined && writer._tag !== "owner") {
-            return yield* fail("invalid", "Only the owner opens a request about a record.");
-          }
+          // The master opens a discussion about a record only for the owner,
+          // quoting where he asked (checked above): it lands on the record,
+          // unread for him, not in his own requests.
           const subject =
             input.subject === undefined ? null : yield* subjectOf(mission.id, input.subject);
           const to = writer._tag === "owner" ? yield* masterAddress(cast) : [];
@@ -785,6 +785,10 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             idKey === null
               ? null
               : (inboundKeyOf(provenance, target) ?? `request:${requestId}:open`);
+          const quoted = (opening: boolean) =>
+            writer._tag === "master"
+              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${input.quotedFrom}.]\n\n${input.text}`
+              : input.text;
           if (subject !== null && idKey !== null) {
             const prior = yield* appendedBefore(
               mission.id,
@@ -794,11 +798,13 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             );
             if (prior !== null) {
               const earlier = prior.request;
+              // The master's words added to an open discussion are a status reply.
+              const opening = earlier.id === requestId;
               const same = postContentHash(
                 messageInput(
                   { missionId: mission.id, roomId: earlier.roomId },
-                  "request",
-                  input.text,
+                  writer._tag === "owner" || opening ? "request" : "status",
+                  quoted(opening),
                   to,
                   appendKey(earlier.id),
                 ),
@@ -814,8 +820,14 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           }
           const ongoing = subject === null ? null : yield* openAbout(mission.id, subject);
           if (ongoing !== null && ongoing.id !== requestId) {
+            // His quote stays with the master's words when they join an open
+            // discussion, and the master still owes him updates there.
             return yield* replyLocked(
-              { requestId: ongoing.id, text: input.text },
+              {
+                requestId: ongoing.id,
+                text: quoted(false),
+                ...(writer._tag === "master" ? { status: "waiting-on-master" as const } : {}),
+              },
               provenance,
               appendKey(ongoing.id),
             );
@@ -823,14 +835,10 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           const roomId = requestRoomId(mission.id, requestId);
           const title = requestTitleOf(input.text);
           const subMissionId = input.subMissionId ?? null;
-          const body =
-            writer._tag === "master"
-              ? `[Opened by the master for the owner, quoting what he said in ${input.quotedFrom}.]\n\n${input.text}`
-              : input.text;
           const message = messageInput(
             { missionId: mission.id, roomId },
             "request",
-            body,
+            quoted(true),
             to,
             inboundKey ?? `request:${requestId}:open`,
           );

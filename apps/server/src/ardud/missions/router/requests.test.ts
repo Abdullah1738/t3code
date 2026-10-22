@@ -2,6 +2,7 @@ import {
   OwnerRequestId,
   RoleId,
   ThreadId,
+  WorkItemId,
   type MissionLink,
   type MissionProvenance,
   type OwnerRequestsInput,
@@ -906,16 +907,7 @@ describe("discuss", () => {
       yield* seed;
       yield* seedOther;
       const router = yield* MissionRouter.MissionRouter;
-      // Only the owner, only records of this mission, never another request.
-      assert.strictEqual(
-        yield* failureCode(
-          router.openRequest(
-            { missionId, text: "About this", subject: ask, quotedFrom: "his thread" },
-            master,
-          ),
-        ),
-        "invalid",
-      );
+      // Only records of this mission, never another request.
       assert.strictEqual(
         yield* failureCode(
           router.openRequest(
@@ -1469,6 +1461,154 @@ describe("owner conditions, sol boundary 4", () => {
       yield* router.settleRequest({ requestId: second.id }, ownerApp);
       const reopened = yield* router.reopenRequest({ requestId: first.id }, ownerApp);
       assert.strictEqual(reopened.status, "waiting-on-master");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the master opens a discussion on a draft when the owner asked for one", () => {
+    const h = integrated();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const router = yield* MissionRouter.MissionRouter;
+      const draft = yield* asks.submitDraft(
+        { missionId, audience: "Sami", channel: "linear", target: ticket, text: "Merged." },
+        agent(writerThread),
+      );
+      const draftRef = { kind: "draft", id: draft.id } as const;
+      const asked = "Approved, send it and keep me posted here.";
+      const opening = { missionId, text: asked, subject: draftRef };
+      // Only the master, and only quoting where he asked.
+      assert.strictEqual(yield* failureCode(router.openRequest(opening, master)), "invalid");
+      for (const other of [writerThread, laneThread]) {
+        assert.strictEqual(
+          yield* failureCode(
+            router.openRequest({ ...opening, quotedFrom: "his thread" }, agent(other)),
+          ),
+          "forbidden",
+        );
+      }
+      const first = { ...opening, quotedFrom: "iMessage, 22 Oct", key: "posted" };
+      const talk = yield* router.openRequest(first, master);
+      assert.strictEqual((yield* router.openRequest(first, master)).id, talk.id);
+      assert.strictEqual(
+        yield* failureCode(router.openRequest({ ...first, text: "Hold it." }, master)),
+        "conflict",
+      );
+      assert.strictEqual(talk.subject?.kind, "draft");
+      assert.strictEqual(talk.subject?.id, draft.id);
+      assert.strictEqual(talk.status, "waiting-on-master");
+      assert.isTrue(talk.unreadForOwner);
+      const ids = (input: Omit<OwnerRequestsInput, "missionId">) =>
+        Effect.map(router.ownerRequests({ missionId, ...input }, ownerApp), (listed) =>
+          listed.requests.map((view) => view.request.id),
+        );
+      // On the draft and under his discussions, never in his own requests.
+      assert.deepStrictEqual(yield* ids({ subject: draftRef }), [talk.id]);
+      assert.deepStrictEqual(yield* ids({ discussions: true }), [talk.id]);
+      assert.deepStrictEqual(yield* ids({ discussions: false }), []);
+
+      // Asked again, the master's words join the open discussion, quote and all.
+      const tellSami = {
+        missionId,
+        text: "Tell Sami too.",
+        subject: draftRef,
+        quotedFrom: "his thread",
+        key: "tell-sami",
+      };
+      const again = yield* router.openRequest(tellSami, master);
+      // A retry lands once; the same key saying something else conflicts.
+      assert.strictEqual((yield* router.openRequest(tellSami, master)).id, talk.id);
+      assert.strictEqual(
+        yield* failureCode(router.openRequest({ ...tellSami, text: "Tell Ana." }, master)),
+        "conflict",
+      );
+      assert.strictEqual(again.id, talk.id);
+      assert.strictEqual(again.status, "waiting-on-master");
+      assert.isTrue(again.unreadForOwner);
+      assert.strictEqual((yield* ids({})).length, 1);
+      const view = (yield* router.ownerRequests({ missionId, requestId: talk.id }, ownerApp))
+        .requests[0]!;
+      assert.strictEqual(view.unreadMessages, 2);
+      assert.strictEqual(view.messages.length, 2);
+      const [opened, added] = view.messages;
+      assert.strictEqual(opened!.message.kind, "request");
+      assert.include(opened!.body ?? "", "Opened by the master for the owner");
+      assert.include(opened!.body ?? "", "quoting what he said in iMessage, 22 Oct");
+      assert.include(opened!.body ?? "", asked);
+      assert.strictEqual(added!.message.kind, "status");
+      assert.include(added!.body ?? "", "Added by the master for the owner");
+      assert.include(added!.body ?? "", "quoting what he said in his thread");
+      assert.include(added!.body ?? "", "Tell Sami too.");
+
+      // The master's quote of him never stands as his condition.
+      assert.strictEqual(
+        yield* failureCode(
+          asks.decideDraft(
+            {
+              draftId: draft.id,
+              action: "approve",
+              revision: 0,
+              onOwnerCondition: { requestId: talk.id, quote: asked },
+            },
+            master,
+          ),
+        ),
+        "forbidden",
+      );
+      assert.strictEqual((yield* asks.drafts({ missionId }))[0]!.status, "pending");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a progress discussion opened after approval outlives the send", () => {
+    const h = integrated();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const router = yield* MissionRouter.MissionRouter;
+      const draft = yield* asks.submitDraft(
+        {
+          missionId,
+          audience: "Sami",
+          channel: "linear",
+          target: ticket,
+          text: "Merged.",
+          workItemId: WorkItemId.make("wi-free"),
+        },
+        agent(writerThread),
+      );
+      const draftRef = { kind: "draft", id: draft.id } as const;
+      yield* asks.decideDraft({ draftId: draft.id, action: "approve", revision: 0 }, ownerApp);
+      const talk = yield* router.openRequest(
+        {
+          missionId,
+          text: "Approved, send it and keep me posted.",
+          subject: draftRef,
+          quotedFrom: "iMessage",
+        },
+        master,
+      );
+      yield* asks.recordDraftSent({ draftId: draft.id }, agent(writerThread));
+      // Its progress goes on the same discussion, linked to the draft's work item.
+      const update = yield* router.replyRequest(
+        {
+          requestId: talk.id,
+          text: "Posted on CRP-1; the lane is on the follow-up.",
+          status: "waiting-on-master",
+          links: [{ kind: "work-item", id: "wi-free" }],
+        },
+        master,
+      );
+      assert.strictEqual(update.status, "waiting-on-master");
+      assert.deepStrictEqual(
+        update.links.map((link) => [link.kind, link.id]),
+        [["work-item", "wi-free"]],
+      );
+      assert.strictEqual((yield* asks.drafts({ missionId }))[0]!.status, "sent");
+      const about = yield* router.ownerRequests({ missionId, subject: draftRef }, ownerApp);
+      assert.deepStrictEqual(
+        about.requests.map((view) => [view.request.id, view.request.status]),
+        [[talk.id, "waiting-on-master"]],
+      );
     }).pipe(Effect.provide(h.layer));
   });
 });
