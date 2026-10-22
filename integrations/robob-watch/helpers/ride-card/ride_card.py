@@ -527,12 +527,15 @@ def bridge(*args, timeout=60):
 
 
 def bridge_app_to():
-    """True once the live bridge CLI accepts `app --to` (spectrum-app-recipient change deployed)."""
+    """True only once `app --to` is deployed AND the bridge server was restarted onto it.
+    The CLI alone isn't enough: an old server would ignore `to` and post Moni's card in the
+    caller's chat. Whoever restarts com.abdullah.agent-bridges creates the marker file."""
     if os.environ.get("RIDE_CARD_BRIDGE"):
         return True
+    marker = journal_dir() / "app-to-live"
     try:
         src = (HOME / ".local/share/spectrum-bridge/src/cli.ts").read_text()
-        return bool(re.search(r'app:\s*\[[^\]]*"to"', src))
+        return marker.exists() and bool(re.search(r'app:\s*\[[^\]]*"to"', src))
     except Exception:
         return False
 
