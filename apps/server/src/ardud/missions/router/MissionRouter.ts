@@ -1672,6 +1672,11 @@ const make = Effect.gen(function* () {
     ) {
       const master = masterRoleOf(cast);
       if (master === null || isMaster(cast, provenance)) return;
+      // A knock addressed to the master is the owner's alone until he forwards
+      // it; a drop must not leak its summary or his comments to the master.
+      const addressedToMaster =
+        knock.targetThreadId !== undefined && masterThreadsOf(cast).includes(knock.targetThreadId);
+      if (addressedToMaster && knock.status !== "forwarded") return;
       const target = knock.forwardedTo;
       const forwardedToMaster =
         (target?._tag === "role" && target.roleId === master.id) ||

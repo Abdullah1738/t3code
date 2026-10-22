@@ -1,9 +1,18 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ApprovalId, DraftId, type MissionLink, type MissionProvenance } from "@t3tools/contracts";
+import {
+  ApprovalId,
+  DraftId,
+  type Knock,
+  KnockId,
+  type MissionLink,
+  type MissionProvenance,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as MissionService from "../MissionService.ts";
+import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
   agent,
@@ -17,6 +26,7 @@ import {
   missionId,
   ownerApp,
   seed,
+  strayThread,
   writerThread,
 } from "./AsksService.testkit.ts";
 import { askResolvedLine } from "./ports.ts";
@@ -409,6 +419,58 @@ describe("owner comments travel with his decisions", () => {
         "Squash it.",
         "Delete the branch after.",
       ]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a comment on a pending knock to the master stays with the owner", () => {
+    const { posts, layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const store = yield* MissionStore.MissionStore;
+      const knock = (id: string, targetThreadId: ThreadId): Knock => ({
+        id: KnockId.make(id),
+        missionId,
+        fromThreadId: strayThread,
+        fromTitle: "Stray",
+        path: "thread-send",
+        summary: "Wants a look at its PR",
+        body: "please look at my PR",
+        status: "pending",
+        forwardedText: null,
+        forwardedTo: null,
+        decidedAt: null,
+        createdAt: at,
+        targetThreadId,
+      });
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "knock.received",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "knocks",
+          subject: null,
+        },
+        upserts: [
+          { _tag: "knock", record: knock("knock-master", masterThread) },
+          { _tag: "knock", record: knock("knock-lane", laneThread) },
+        ],
+      });
+
+      yield* asks.commentInboxItem(
+        { subject: { kind: "knock", id: KnockId.make("knock-master") }, body: "Ignore it." },
+        ownerApp,
+      );
+      expect(posts).toHaveLength(0);
+
+      // A knock to anyone else is the master's to see, so it hears the comment.
+      yield* asks.commentInboxItem(
+        { subject: { kind: "knock", id: KnockId.make("knock-lane") }, body: "Not now." },
+        ownerApp,
+      );
+      expect(posts).toHaveLength(1);
+      expect(posts[0]?.input.to).toEqual([toMaster]);
     }).pipe(Effect.provide(layer));
   });
 });

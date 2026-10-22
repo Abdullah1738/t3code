@@ -148,6 +148,7 @@ import {
 import {
   defaultAsker,
   isParticipant,
+  masterThreadsIn,
   standingOf,
   type MissionCast,
   type Standing,
@@ -571,6 +572,8 @@ const make = Effect.gen(function* () {
       readonly decidedBy: MissionProvenance | null;
       readonly to?: ReadonlyArray<MissionActor>;
       readonly notTo?: ReadonlyArray<MissionActor>;
+      /** A knock to the master is the owner's alone until he forwards it. */
+      readonly ownerOnly?: boolean;
     }) {
       const missionId = input.missionId;
       if (missionId === null) return;
@@ -578,11 +581,12 @@ const make = Effect.gen(function* () {
       const masterRoleId =
         cast.mission?.masterRoleId ?? cast.roles.find((role) => role.kind === "master")?.id ?? null;
       const decider = input.decidedBy;
-      const masterDecided =
-        decider !== null &&
-        decider._tag === "agent" &&
-        masterRoleId !== null &&
-        decider.roleId === masterRoleId;
+      const skipMaster =
+        input.ownerOnly === true ||
+        (decider !== null &&
+          decider._tag === "agent" &&
+          masterRoleId !== null &&
+          decider.roleId === masterRoleId);
       const recipients: MissionActor[] = [];
       const add = (actor: MissionActor) => {
         // Only members with a thread read the control room.
@@ -592,7 +596,7 @@ const make = Effect.gen(function* () {
         recipients.push(actor);
       };
       for (const actor of input.to ?? []) add(actor);
-      if (masterRoleId !== null && !masterDecided) add({ _tag: "role", roleId: masterRoleId });
+      if (masterRoleId !== null && !skipMaster) add({ _tag: "role", roleId: masterRoleId });
       if (recipients.length === 0) return;
       yield* rooms.post(
         {
@@ -2227,6 +2231,7 @@ const make = Effect.gen(function* () {
       readonly to: ReadonlyArray<MissionActor>;
       readonly lead: string;
       readonly current: (comments: ReadonlyArray<InboxComment>) => ReadonlyArray<InboxComment>;
+      readonly ownerOnly?: boolean;
     },
     MissionError
   > {
@@ -2255,10 +2260,17 @@ const make = Effect.gen(function* () {
       }
       case "knock": {
         const knock = yield* need("knock", subject.id);
+        // A knock to the master stays hidden from it until the owner forwards
+        // it, so the target is the original one, not where it went.
+        const toMaster =
+          knock.status !== "forwarded" &&
+          knock.targetThreadId !== undefined &&
+          masterThreadsIn(yield* castOf(knock.missionId)).includes(knock.targetThreadId);
         return {
           to: knock.forwardedTo === null ? [] : [knock.forwardedTo],
           lead: `Knock ${knock.id} from ${knock.fromTitle} is ${knock.status}.`,
           current: all,
+          ownerOnly: toMaster,
         };
       }
       default:
@@ -2279,6 +2291,7 @@ const make = Effect.gen(function* () {
         key: `comment:${markIdOf(subject)}:${comment.id}`,
         decidedBy: null,
         to: actor.to,
+        ownerOnly: actor.ownerOnly === true,
       });
     },
     // The comment is saved already; a failed notice must not fail the call and

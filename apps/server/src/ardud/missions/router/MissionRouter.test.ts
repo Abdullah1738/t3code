@@ -623,6 +623,27 @@ describe("knocks", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("dropping a knock to the master with a note tells the master nothing", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), masterThread));
+      if (outcome._tag !== "knocked") return assert.fail("expected a knock");
+      yield* router.decideKnock(
+        { knockId: outcome.knockId, action: "drop", note: "Spam, ignore." },
+        ownerApp,
+      );
+      // Nothing was posted, so the control room was never even opened.
+      const page = yield* router.roomPage({ roomId: control }, ownerApp).pipe(
+        Effect.map((read) => read.messages),
+        Effect.orElseSucceed(() => []),
+      );
+      assert.deepStrictEqual(page, []);
+      assert.deepStrictEqual(h.sent, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
   it.effect("unknown knocks are not found", () => {
     const h = harness();
     return Effect.gen(function* () {
