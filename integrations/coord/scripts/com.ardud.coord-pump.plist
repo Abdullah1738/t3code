@@ -14,10 +14,11 @@
   <dict>
     <key>HOME</key><string>/Users/ardud</string>
     <key>PATH</key><string>/Users/ardud/.nvm/versions/node/v26.2.0/bin:/Users/ardud/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>COORD_PUMP_LOG</key><string>/Users/ardud/Library/Logs/coord-pump.log</string>
   </dict>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
-  <key>ProcessType</key><string>Background</string>
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardOutPath</key><string>/Users/ardud/Library/Logs/coord-pump.log</string>
   <key>StandardErrorPath</key><string>/Users/ardud/Library/Logs/coord-pump.log</string>
 </dict>

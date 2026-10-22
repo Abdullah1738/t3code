@@ -5,6 +5,7 @@
 // At-least-once: the clientRequestId is deterministic per (thread, covered deliveries), so a resend after a
 // crash between send and mark replays the first result in Robob instead of posting twice.
 import { createHash } from 'node:crypto';
+import { renameSync, statSync } from 'node:fs';
 import { tx, get, all, run } from './db.mjs';
 import { clock, gate, DEFAULTS, releaseObserve, messaging } from './coord.mjs';
 import { controlConfig } from './control.mjs';
@@ -409,6 +410,20 @@ function heartbeat(res) {
     superseded: res?.superseded ?? 0, error: res?.error ?? null });
   stamp(HEARTBEAT, v);
   return { at: new Date(t * 1000).toISOString(), gap_s: prev == null ? null : t - prev, superseded: res?.superseded ?? 0 };
+}
+
+// launchd appends every tick to one log and never rotates it (13 MB by Oct 2026). The LaunchAgent sets
+// COORD_PUMP_LOG to its StandardOutPath; a tick that finds that file over `max` renames it to `<log>.1`.
+// launchd opens the path again for every run, so this tick still writes into `.1` and the next starts a new file.
+export function rotateLog(path = process.env.COORD_PUMP_LOG, max = 10 * 1024 * 1024) {
+  if (!path) return null;
+  try {
+    if (statSync(path).size <= max) return null;
+    renameSync(path, `${path}.1`);
+    return { rotated: `${path}.1` };
+  } catch (e) {
+    return e.code === 'ENOENT' ? null : { error: e.message };
+  }
 }
 
 // One pump tick: deliveries, then observe a bounded number of running releases (oldest observation first).
