@@ -13,6 +13,7 @@ import {
   ownerConditionOf,
   requestAbout,
   requestPreview,
+  requestReadMark,
   requestTitle,
   yourRequests,
 } from "./requestsViewModel.ts";
@@ -108,6 +109,29 @@ describe("owner requests", () => {
     const back = read().find((r) => r.id === created.id)!;
     expect(back.status).toBe("waiting");
     expect(back.messages.at(-1)).toMatchObject({ author: "owner", text: "Actually, wait" });
+  });
+
+  it("marks an unread request once per newest message, row or full read alike", () => {
+    const message = (id: string, text: string) => ({
+      id,
+      author: "master" as const,
+      text,
+      at: FIXTURE_NOW,
+      refs: [],
+    });
+    const row = request({ id: "r1", unread: true, messages: [message("m2", "Short")] });
+    const full = request({
+      id: "r1",
+      unread: true,
+      messages: [message("m1", "Earlier"), message("m2", "Short, then the whole body")],
+    });
+    expect(requestReadMark(row)).toBe(requestReadMark(full));
+    expect(
+      requestReadMark({ ...full, messages: [...full.messages, message("m3", "New")] }),
+    ).not.toBe(requestReadMark(full));
+    expect(requestReadMark({ ...full, unread: false })).toBeNull();
+    expect(requestReadMark(undefined)).toBeNull();
+    expect(requestReadMark(null)).toBeNull();
   });
 
   it("keeps one open request per discussed record", async () => {

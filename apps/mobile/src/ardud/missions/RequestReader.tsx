@@ -5,7 +5,7 @@ import { ScrollView, View } from "react-native";
 import { AppText as Text } from "../../components/ui/AppText";
 import { Conversation } from "./Discussion";
 import { LoadingLine } from "./FeedError";
-import { ActionBar, ActionButton, Chip, EmptyLine, TextField } from "./parts";
+import { ActionBar, ActionButton, Chip, EmptyLine, Meta, TextField } from "./parts";
 import { useRequestThread } from "./recordLogic";
 
 /**
@@ -50,6 +50,7 @@ export function RequestReader(props: {
           </View>
         ) : null}
         <Conversation messages={request.messages} nowMs={props.nowMs} />
+        {thread.partial ? <Meta>Showing the latest messages</Meta> : null}
       </ScrollView>
       <ActionBar bottomInset={props.bottomInset}>
         <View className="w-full gap-2">

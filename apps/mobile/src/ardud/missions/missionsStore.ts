@@ -220,20 +220,13 @@ export function useYourRequests(missionId: MissionId): ReadonlyArray<OwnerReques
   return useMemo(() => (requests === undefined ? undefined : yourRequests(requests)), [requests]);
 }
 
-/**
- * One request's whole conversation; null once it is gone. Until the full read
- * lands it shows the request's row from the list, so opening one never waits
- * on a blank screen.
- */
+/** One request's whole conversation; null once it is gone. */
 export function useOwnerRequest(
   missionId: MissionId,
   requestId: string,
 ): OwnerRequest | null | undefined {
   const store = requestThreadStores(`${missionId}\n${requestId}`);
-  const thread = useSyncExternalStore(store.subscribe, store.get);
-  const requests = useOwnerRequests(missionId);
-  if (thread !== undefined) return thread;
-  return requests?.find((request) => request.id === requestId);
+  return useSyncExternalStore(store.subscribe, store.get);
 }
 
 /**
