@@ -13,6 +13,7 @@ import * as AsksService from "../asks/AsksService.ts";
 import { missionsDeskRouteLayer } from "../asks/http.ts";
 import * as Inbound from "../asks/inbound.ts";
 import * as AsksPorts from "../asks/ports.ts";
+import { AttachTargets } from "../core/attachTargets.ts";
 import { MISSIONS_ROUTE_PREFIX, missionsRouteLayer } from "../http.ts";
 import * as MissionService from "../MissionService.ts";
 import { policyRouteLayer } from "../policy/http.ts";
@@ -85,11 +86,22 @@ const asksPorts = Layer.mergeAll(
   NodeServices.layer,
 );
 
+// crw created the review thread it attaches; attach checks that origin.
+const attachTargets = Layer.succeed(
+  AttachTargets,
+  AttachTargets.of({
+    lookup: (threadId) =>
+      Effect.succeed(threadId === "thread-missions" ? { origin: fixture.component } : null),
+  }),
+);
+
 const makeHandler = () => {
   const ports = makePorts();
   const services = AsksService.layer.pipe(
     Layer.provide(asksPorts),
-    Layer.provideMerge(seeded.pipe(Layer.provideMerge(testLayer(ports.layer)))),
+    Layer.provideMerge(
+      seeded.pipe(Layer.provideMerge(testLayer(Layer.mergeAll(ports.layer, attachTargets)))),
+    ),
   );
   return HttpRouter.toWebHandler(
     Layer.mergeAll(policyRouteLayer, missionsRouteLayer, missionsDeskRouteLayer).pipe(
