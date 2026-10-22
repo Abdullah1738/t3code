@@ -2723,9 +2723,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               yield* settleCall(call, "completed", output);
               if (!call.background) finished.push({ call, status: "completed", output });
             } else if (part.state.status === "error") {
-              yield* settleCall(call, "failed", part.state.error.message);
+              // As live: a call stopped with its turn ends interrupted, not failed.
+              const status = part.state.error.type === "aborted" ? "interrupted" : "failed";
+              yield* settleCall(call, status, part.state.error.message);
               if (!call.background) {
-                finished.push({ call, status: "failed", output: part.state.error.message });
+                finished.push({ call, status, output: part.state.error.message });
               }
             } else {
               yield* emitSubagent(call);
@@ -2929,12 +2931,16 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       for (const state of withBackground()) {
         // A run a foreground call shared already answered its background calls.
         yield* recoverShared(state, finished, active);
-        // A subagent still running keeps its call; its end arrives on the new stream.
+        // A subagent still running keeps its call; its end arrives on the new
+        // stream. One not given its child yet waits only while the turn that
+        // has to name it still runs: once that turn ended here, its session's
+        // events are dropped.
         for (const call of runningCalls(state)) {
-          const child = call.child?.sessionId;
-          if (child === undefined || !(child in active)) {
-            yield* settleCall(call, "interrupted", LOST_BACKGROUND);
-          }
+          const alive =
+            call.child !== undefined
+              ? call.child.sessionId in active
+              : call.state.active === call.turn && call.state.sessionId in active;
+          if (!alive) yield* settleCall(call, "interrupted", LOST_BACKGROUND);
         }
         for (const session of sessionsOf(state)) {
           discardWakes(session, session.wakes.splice(0));
