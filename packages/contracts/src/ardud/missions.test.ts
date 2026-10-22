@@ -37,6 +37,19 @@ describe("missions contracts", () => {
     ).toThrow();
   });
 
+  it("iMessage provenance names the bridge chat a group or Moni's text came from", () => {
+    const group = {
+      _tag: "owner-imessage",
+      chat: "owner",
+      inboundId: "in-2",
+      quote: "file a bug",
+      bridgeChat: "group-sb_gro",
+    };
+    expect(decodeProvenance(group)).toEqual(group);
+    expect(isOwnerProvenance(decodeProvenance(group))).toBe(true);
+    expect(() => decodeProvenance({ ...group, bridgeChat: "  " })).toThrow();
+  });
+
   it("asks carry what they block and no default", () => {
     const ask = decodeAsk({
       id: "ask-1",

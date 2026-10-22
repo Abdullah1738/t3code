@@ -3,12 +3,16 @@ import { normalizeText, ok, refuse, type Outcome } from "./shared.ts";
 
 /**
  * An iMessage the owner or Moni sent, as read (read only) from the iMessage
- * bridge's inbound store or Moni's chat history. Only messages the Mac
- * received count: rows the Mac sent (agents use `imsg send`) never do.
+ * bridge's inbound stores (his direct chat, groups, Moni's) or Moni's chat
+ * history. Only messages the Mac received count: rows the Mac sent (agents use
+ * `imsg send`) never do.
  */
 export interface InboundMessage {
   readonly id: string;
+  /** Who typed it. */
   readonly chat: TrustedChat;
+  /** The bridge chat it was typed in, when that wasn't his direct chat (`group-sb_gro`, `moni`). */
+  readonly bridgeChat?: string | undefined;
   readonly text: string;
   /** Epoch milliseconds the message arrived. */
   readonly receivedAt: number;
@@ -104,7 +108,7 @@ export const verifyInbound = (command: VerifyInboundCommand): Outcome<OwnerIMess
   if (inbound === null || inbound.id !== inboundId) {
     return refuse(
       "provenance-invalid",
-      `No iMessage ${inboundId} from the owner's or Moni's chat was found.`,
+      `No iMessage ${inboundId} the owner or Moni typed in a chat on the iMessage line was found.`,
     );
   }
   if (!inbound.typed) {
@@ -126,6 +130,7 @@ export const verifyInbound = (command: VerifyInboundCommand): Outcome<OwnerIMess
     chat: inbound.chat,
     inboundId: inbound.id,
     quote: quoteOf(inbound.text),
+    ...(inbound.bridgeChat === undefined ? {} : { bridgeChat: inbound.bridgeChat }),
   });
 };
 
