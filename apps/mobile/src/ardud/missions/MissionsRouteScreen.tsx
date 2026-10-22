@@ -14,7 +14,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { AppText as Text } from "../../components/ui/AppText";
 import { AppBar } from "../../components/ui/AppBar";
 import { cn } from "../../lib/cn";
-import { useBoardReady, useWarmBoards } from "./boardFeeds";
+import { useBoardReady, useWarmBoards, warmBoard } from "./boardFeeds";
 import { InboxPane } from "./InboxPane";
 import { MissionBoard } from "./MissionBoard";
 import { useMissionList, useMissionOverview, useMissionsEnvironmentId } from "./missionsStore";
@@ -109,7 +109,12 @@ export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRoutePa
       ) : rows.length === 0 ? (
         <EmptyLine label="No missions yet." />
       ) : (
-        <MissionRows rows={rows} selectedId={state.missionId} onOpen={pickMission} />
+        <MissionRows
+          rows={rows}
+          selectedId={state.missionId}
+          onPressIn={warmBoard}
+          onOpen={pickMission}
+        />
       )}
     </ScrollView>
   );

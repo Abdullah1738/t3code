@@ -28,7 +28,10 @@ export function MissionRows(props: {
   readonly rows: ReadonlyArray<MissionGroupRow>;
   readonly selectedId?: MissionId | null;
   readonly onOpen: (missionId: MissionId) => void;
+  /** Called as a row is pressed, before it opens. */
+  readonly onPressIn?: (missionId: MissionId) => void;
 }) {
+  const { onPressIn } = props;
   return (
     <Group>
       {props.rows.map((row, index) => (
@@ -38,6 +41,7 @@ export function MissionRows(props: {
             accessibilityLabel={`${row.title}, ${row.statusLine}`}
             selected={props.selectedId === row.id}
             onPress={() => props.onOpen(row.id)}
+            onPressIn={onPressIn && (() => onPressIn(row.id))}
           >
             <View className="pt-1.5">
               <StateGlyph state={row.tone} />

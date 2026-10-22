@@ -28,20 +28,33 @@ export function useBoardReady(missionId: MissionId | null): boolean {
     [missionId],
   );
   const ready = useSyncExternalStore(feeds.subscribe, feeds.ready);
-  const [waited, setWaited] = useState<MissionId | null>(null);
+  // Keyed on the gate, not the mission: coming back to a mission waits again.
+  const [waited, setWaited] = useState<object | null>(null);
 
   useEffect(() => {
     if (missionId === null || ready) return;
-    const timer = setTimeout(() => setWaited(missionId), BOARD_PATIENCE_MS);
+    const timer = setTimeout(() => setWaited(feeds), BOARD_PATIENCE_MS);
     return () => clearTimeout(timer);
-  }, [missionId, ready]);
+  }, [feeds, missionId, ready]);
 
-  return ready || (missionId !== null && waited === missionId);
+  return ready || (missionId !== null && waited === feeds);
 }
 
 /**
- * Keeps the first few listed missions' boards loading while their rows are on
- * screen, so a tap opens a board that is already there.
+ * Starts loading a mission's board ahead of a tap, as a row is pressed. The
+ * feeds stay open for their keep-alive, so the board is there when it opens.
+ * A press can be the start of a scroll, so views (which keep the mission's
+ * view sources running) wait for the board itself.
+ */
+export function warmBoard(missionId: MissionId): void {
+  createSnapshotGate(missionBoardStores(missionId)).subscribe(() => {})();
+}
+
+/**
+ * Keeps the first few listed missions' boards loading while the mission picker
+ * is up, so a tap opens a board that is already there. Not for the thread
+ * list: it is up most of the time, and an open views feed keeps the mission's
+ * view sources running.
  */
 export function useWarmBoards(missionIds: ReadonlyArray<MissionId>, active: boolean): void {
   const key = active ? missionIds.slice(0, WARM_LIMIT).join("\n") : "";
