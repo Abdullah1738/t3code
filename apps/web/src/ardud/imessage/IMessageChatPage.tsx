@@ -6,6 +6,7 @@ import {
   groupIMessageThreads,
   imessageChatKind,
   imessageDayKey,
+  imessageEarlierStep,
   imessageThreadWindowStart,
   sortIMessageThreadsByCreation,
 } from "@t3tools/client-runtime/ardud/imessage";
@@ -13,6 +14,7 @@ import {
   threadRuntimeIsActive,
   type EnvironmentThreadShell,
 } from "@t3tools/client-runtime/state/models";
+import { shouldShowLoadEarlierControl } from "@t3tools/client-runtime/state/threads";
 
 import { deriveTimelineEntriesFromVisibleTurnItems } from "../../session-logic";
 import { Button } from "../../components/ui/button";
@@ -24,7 +26,9 @@ import {
 } from "../../components/WorkspaceBreadcrumb";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
-import { useThreadShells, useThreadVisibleTurnItems } from "../../state/entities";
+import { useThreadHistory, useThreadShells, useThreadVisibleTurnItems } from "../../state/entities";
+import { threadEnvironment } from "../../state/threads";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { cn } from "../../lib/utils";
 import { IMessageAvatar, iMessageThreadInput, imessageChatLabel } from "./IMessageSidebarGroup";
 import {
@@ -96,6 +100,16 @@ function ChatTranscript(props: {
   const start = imessageThreadWindowStart(props.threads, openedAt, earlierDays);
   const visible = props.threads.slice(start);
   const namedSenders = imessageChatKind(props.chatSlug) !== "owner";
+  const oldest = visible[0]!;
+  const oldestHistory = useThreadHistory({
+    environmentId: oldest.environmentId,
+    threadId: oldest.id,
+  });
+  const loadEarlierHistory = useLoadEarlierHistory();
+  const earlierStep = imessageEarlierStep({
+    windowStart: start,
+    oldestHasMoreHistory: oldestHistory.hasMoreHistory,
+  });
 
   return (
     // column-reverse opens at the bottom and keeps the reader's place when earlier
@@ -103,12 +117,18 @@ function ChatTranscript(props: {
     <div className="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto overscroll-y-contain scrollbar-gutter-both">
       <div className="mx-auto flex w-full max-w-[620px] flex-col px-6 pt-3 pb-6 max-sm:px-3.5 max-sm:pt-1 max-sm:pb-4">
         <h1 className="sr-only">{props.label}</h1>
-        {start > 0 ? (
-          <div className="flex justify-center pt-2 pb-1">
-            <Button variant="outline" size="sm" onClick={() => setEarlierDays((days) => days + 1)}>
-              Show earlier
-            </Button>
-          </div>
+        {earlierStep !== null || oldestHistory.error !== null ? (
+          <ShowEarlier
+            loading={earlierStep === "history" && oldestHistory.loading}
+            error={oldestHistory.error}
+            onShow={
+              earlierStep === "history"
+                ? () => loadEarlierHistory(oldest)
+                : earlierStep === "sessions"
+                  ? () => setEarlierDays((days) => days + 1)
+                  : null
+            }
+          />
         ) : null}
         {visible.map((thread, index) => (
           <ChatThreadRows
@@ -116,9 +136,42 @@ function ChatTranscript(props: {
             thread={thread}
             previousDayKey={index === 0 ? null : imessageDayKey(visible[index - 1]!.updatedAt)}
             namedSenders={namedSenders}
+            pagesOwnHistory={index > 0}
           />
         ))}
       </div>
+    </div>
+  );
+}
+
+function useLoadEarlierHistory() {
+  const load = useAtomCommand(threadEnvironment.loadEarlierHistory, {
+    label: "load earlier thread history",
+    reportFailure: false,
+  });
+  // One bounded page per click; the loader ignores clicks while a page is in flight.
+  return (thread: EnvironmentThreadShell) => {
+    void load({ environmentId: thread.environmentId, input: { threadId: thread.id } });
+  };
+}
+
+function ShowEarlier(props: {
+  loading: boolean;
+  error: string | null;
+  onShow: (() => void) | null;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-1.5 pt-2 pb-1">
+      {props.onShow !== null ? (
+        <Button variant="outline" size="sm" disabled={props.loading} onClick={props.onShow}>
+          {props.loading ? "Loading…" : "Show earlier"}
+        </Button>
+      ) : null}
+      {props.error !== null ? (
+        <p role="status" className="text-center text-xs text-muted-foreground">
+          {props.error}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -128,12 +181,14 @@ const ChatThreadRows = memo(function ChatThreadRows(props: {
   thread: EnvironmentThreadShell;
   previousDayKey: string | null;
   namedSenders: boolean;
+  /** The oldest shown session pages through the transcript's top control instead. */
+  pagesOwnHistory: boolean;
 }) {
   const { thread } = props;
-  const visibleTurnItems = useThreadVisibleTurnItems({
-    environmentId: thread.environmentId,
-    threadId: thread.id,
-  });
+  const ref = { environmentId: thread.environmentId, threadId: thread.id };
+  const visibleTurnItems = useThreadVisibleTurnItems(ref);
+  const history = useThreadHistory(props.pagesOwnHistory ? ref : null);
+  const loadEarlierHistory = useLoadEarlierHistory();
   const activeRunId = threadRuntimeIsActive(thread.runtime)
     ? (thread.runtime?.activeRunId ?? null)
     : null;
@@ -143,6 +198,13 @@ const ChatThreadRows = memo(function ChatThreadRows(props: {
   );
   return (
     <>
+      {shouldShowLoadEarlierControl(history) ? (
+        <ShowEarlier
+          loading={history.loading}
+          error={history.error}
+          onShow={history.hasMoreHistory ? () => loadEarlierHistory(thread) : null}
+        />
+      ) : null}
       {rows.map((row) => (
         <ChatRow key={row.id} row={row} thread={thread} />
       ))}

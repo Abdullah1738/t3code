@@ -18,7 +18,7 @@ export {
   imessageGuidanceText,
   imessageSentReply,
 } from "./messageKinds.ts";
-export { imessageDayKey, imessageThreadWindowStart } from "./threadWindow.ts";
+export { imessageDayKey, imessageEarlierStep, imessageThreadWindowStart } from "./threadWindow.ts";
 export type {
   IMessageTypedPart,
   IMessageUserMessage,
