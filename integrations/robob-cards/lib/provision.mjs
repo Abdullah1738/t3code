@@ -1,7 +1,7 @@
 import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { Asc } from "./asc.mjs";
+import { Asc, DevicePendingError } from "./asc.mjs";
 import { builtApp, readState, updateState } from "./state.mjs";
 import { certificateSerial, resignAdHoc } from "./sign.mjs";
 
@@ -47,7 +47,7 @@ export async function provision({ dir, name, config, env = process.env, asc = ne
     const state = readState(dir);
     const devices = state?.devices ?? [];
     if (devices.length === 0) throw new Error(`no phone has registered for ${name} yet`);
-    updateState(dir, { phase: "preparing", error: null });
+    updateState(dir, { phase: "preparing", error: null, pendingDevice: null });
     const deviceIds = [];
     for (const device of devices) {
       const registered = await asc.ensureDevice({ udid: device.udid, name: portalDeviceName(name, device) });
@@ -76,7 +76,11 @@ export async function provision({ dir, name, config, env = process.env, asc = ne
       },
     });
   } catch (error) {
-    updateState(dir, { phase: "failed", error: error.message });
+    updateState(dir, {
+      phase: error instanceof DevicePendingError ? "preparing" : "failed",
+      error: error.message,
+      pendingDevice: error instanceof DevicePendingError ? { id: error.deviceId, status: error.deviceStatus } : null,
+    });
     throw error;
   } finally {
     unlock();

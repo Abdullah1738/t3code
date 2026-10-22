@@ -3,9 +3,12 @@
 Abdullah's standing approval covers paying for Moni's orders, not choosing
 them. Before a `--for moni` order is placed, the caller passes her words
 (`--moni-go "yes order it"`) and this module confirms that a message from her,
-containing those words, arrived in her chat within the window, and that she
-did not call it off in a later message. It fails closed: no matching message,
-no readable history, or a later cancel from her means no order.
+containing those words, arrived within the window, and that she did not call
+it off in a later message. Her messages come from two places, merged in time
+order: her Robob thread on the assistant line (the bridge's moni chat DB) and
+her iMessage chat with Abdullah (chat 45). It fails closed: no matching
+message, either source unreadable, or a later cancel from her in either one
+means no order.
 
 Agents can run the same check before any order step (prepare-only, resume,
 recover) without placing anything:
@@ -13,17 +16,25 @@ recover) without placing anything:
     python3 moni_go.py check --go "<her words>"
 
 It prints JSON and exits 0 (go stands), 4 (she cancelled after it) or 2 (no
-go found, or her chat could not be read). It only runs `imsg history`.
+go found, or her messages could not be read). It only runs `imsg history` and
+a read-only open of the bridge's moni chat DB.
 """
 import argparse
 import datetime as dt
 import json
+import os
+from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import unicodedata
 
 MONI_CHAT_ID = '45'
+MONI_NUMBER = '+971585933213'
+BRIDGE_DB = Path.home() / '.config/spectrum-bridge/chats/moni/state.sqlite'
+# Bridge rows get string ids, so they never collide with imsg's integer ids.
+BRIDGE_ID_PREFIX = 'bridge:'
 WINDOW_MINUTES = 45
 HISTORY_LIMIT = 80
 EXIT_OK = 0
@@ -136,47 +147,114 @@ def read_history(runner=subprocess.run):
     return rows
 
 
-def _moni_rows(rows, oldest, latest):
-    """Her own messages in her chat inside the window, oldest first (id breaks ties),
-    and the ids of hers whose time would not parse."""
+# iMessage tapbacks arrive as text quoting the message they react to; the quote is not her words.
+TAPBACK = re.compile(r'^\s*(?:loved|liked|disliked|laughed at|emphasized|questioned|reacted .{1,16} to|'
+                     r'removed an? .{1,24} from)\s+["\u201c]', re.I)
+
+
+def _bridge_time(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def read_bridge(path=None):
+    """Her inbound rows from her Robob thread (bridge moni chat DB), read-only, oldest first.
+
+    None when the DB or any row can't be read, so the caller fails closed.
+    """
+    db = Path(path or os.environ.get('MONI_BRIDGE_DB') or BRIDGE_DB)
+    try:
+        con = sqlite3.connect(f'{db.absolute().as_uri()}?mode=ro', uri=True, timeout=5)
+        try:
+            raw = con.execute('select id, payload from inbound order by rowid').fetchall()
+        finally:
+            con.close()
+    except (OSError, ValueError, RuntimeError, sqlite3.Error):
+        return None
+    rows = []
+    for row_id, payload in raw:
+        try:
+            item = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(item, dict):
+            return None
+        sender = item.get('sender')
+        # Bridge wakes and other machine rows carry no sender.
+        if not isinstance(sender, str) or not sender:
+            continue
+        text = item.get('text')
+        tapback = isinstance(text, str) and bool(TAPBACK.match(text))
+        rows.append({'id': f'{BRIDGE_ID_PREFIX}{row_id}', 'created_at': _bridge_time(item.get('receivedAt')),
+                     'text': text, '_bridge': True,
+                     # Only her number starts an order; a tapback or her other address can only call it off.
+                     '_cancel_only': tapback or sender != MONI_NUMBER,
+                     # A voice note's words are not in the row, so it could be a cancel.
+                     '_opaque': item.get('isAudioMessage') is True})
+    return rows
+
+
+def _moni_rows(rows, oldest, latest, bridge_rows=()):
+    """Her own messages from both sources inside the window, oldest first, and the
+    ids of hers whose time would not parse. On equal times a cancel sorts last, then
+    chat 45 by id."""
     kept, unparsed = [], []
-    for row in rows:
-        if row.get('is_from_me') or str(row.get('chat_id')) != MONI_CHAT_ID:
+    tagged = [(row, None) for row in rows] + [(row, seq) for seq, row in enumerate(bridge_rows)]
+    for row, seq in tagged:
+        if seq is None and (row.get('is_from_me') or str(row.get('chat_id')) != MONI_CHAT_ID):
             continue
         at = _parse_time(row.get('created_at'))
         if at is None:
-            # No usable id either: treat it as newer than the go (fail closed).
-            unparsed.append(_row_id(row, missing=float('inf')))
+            # No usable id either: treat it as newer than the go (fail closed). Bridge ids
+            # can't be compared with chat 45's, so a bridge row without a time always is.
+            unparsed.append(float('inf') if seq is not None else _row_id(row, missing=float('inf')))
             continue
         if at < oldest or at > latest:
             continue
-        kept.append((at, _row_id(row), row))
-    kept.sort(key=lambda item: (item[0], item[1]))
-    return [row for _, _, row in kept], unparsed
+        stops = bool(row.get('_opaque')) or reads_as_cancel(row.get('text'))
+        kept.append((at, stops, seq is not None, _row_id(row) if seq is None else seq, row))
+    kept.sort(key=lambda item: item[:4])
+    return [item[-1] for item in kept], unparsed
 
 
-def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subprocess.run):
+def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subprocess.run, bridge=None):
     """Return the go that stands or raise RuntimeError with a stable code.
 
-    Walks her messages in time order from the first one with her go words.
-    Cancels before it don't count. After it, a cancel calls the order off (even
-    in a message that repeats the go words), and only her go words again or a
-    clear go phrase put it back on. The latest state decides.
+    Walks her messages from both sources in time order from the first one with
+    her go words. Cancels before it don't count. After it, a cancel calls the
+    order off (even in a message that repeats the go words), and only her go
+    words again or a clear go phrase put it back on. The latest state decides.
+    A tapback quotes someone else's words, so it can call an order off but
+    never starts one.
     """
     wanted = normalize(go_text)
     if len(wanted) < 2:
         raise RuntimeError('MONI_GO_REQUIRED')
     rows = read_history(runner)
-    if rows is None:
+    bridge_rows = (bridge or read_bridge)()
+    if rows is None or bridge_rows is None:
         raise RuntimeError('MONI_GO_UNVERIFIABLE')
     now = now or dt.datetime.now(dt.timezone.utc)
     oldest = now - dt.timedelta(minutes=window_minutes)
     # After a cancel, only a clear go phrase, or her go words when they are specific, put it back on.
     rego_by_words = len(wanted.split()) >= REGO_MIN_WORDS
-    go_row = cancel_row = None
-    mine, unparsed = _moni_rows(rows, oldest, now + dt.timedelta(minutes=2))
+    go_row = cancel_row = unheard = bridge_go_at = None
+    mine, unparsed = _moni_rows(rows, oldest, now + dt.timedelta(minutes=2), bridge_rows)
     for row in mine:
+        if go_row is not None and go_row.get('_bridge'):
+            bridge_go_at = _parse_time(go_row.get('created_at'))
         text = normalize(row.get('text'))
+        if row.get('_opaque'):
+            unheard = unheard or (row if go_row is not None else None)
+            continue
+        if row.get('_cancel_only'):
+            if go_row is not None and reads_as_cancel(text):
+                cancel_row = cancel_row or row
+            continue
         if go_row is None:
             if _has(text, wanted):
                 go_row = row
@@ -194,11 +272,20 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
                 any(_has(text, p) for p in GO_PHRASES) and not _has(text, 'myself')):
             # "ok order it myself" means she will order it, not us.
             go_row, cancel_row = row, None
+    if go_row is not None and go_row.get('_bridge'):
+        bridge_go_at = _parse_time(go_row.get('created_at'))
     if go_row is None:
         raise RuntimeError('MONI_GO_NOT_FOUND')
-    if any(mid > _row_id(go_row) for mid in unparsed):
-        # A newer message of hers has no readable time; it could be a cancel after the go.
+    if any(mid > _row_id(go_row) for mid in unparsed) or unheard is not None:
+        # A newer message of hers has no readable time or words; it could be a cancel after the go.
         raise RuntimeError('MONI_GO_UNVERIFIABLE')
+    if cancel_row is None and bridge_go_at is not None:
+        # Bridge times are when the bridge stored a message, which can lag her send by any
+        # amount, so once a go from her Robob thread counted, a chat 45 cancel anywhere
+        # before it in the window may really have come after it.
+        cancel_row = next((row for row in mine if not row.get('_bridge')
+                           and _parse_time(row.get('created_at')) <= bridge_go_at
+                           and reads_as_cancel(row.get('text'))), None)
     if cancel_row is not None:
         error = RuntimeError('MONI_CANCELLED_AFTER_GO')
         error.go = _ref(go_row)
@@ -207,14 +294,14 @@ def verify(go_text, *, now=None, window_minutes=WINDOW_MINUTES, runner=subproces
     return _ref(go_row)
 
 
-def main(argv=None, runner=subprocess.run, now=None):
-    parser = argparse.ArgumentParser(prog='moni_go.py', description="Read-only check of Moni's go in her chat")
+def main(argv=None, runner=subprocess.run, now=None, bridge=None):
+    parser = argparse.ArgumentParser(prog='moni_go.py', description="Read-only check of Moni's go in her messages")
     commands = parser.add_subparsers(dest='command', required=True)
     check = commands.add_parser('check', help='exit 0 go stands, 4 cancelled after the go, 2 not found or unverifiable')
     check.add_argument('--go', required=True, metavar='HER_WORDS', help='her go, quoted from her chat')
     args = parser.parse_args(argv)
     try:
-        found = verify(args.go, now=now, runner=runner)
+        found = verify(args.go, now=now, runner=runner, bridge=bridge)
     except RuntimeError as exc:
         code = str(exc)
         go = getattr(exc, 'go', None) or {'message_id': None, 'at': None, 'text': None}
