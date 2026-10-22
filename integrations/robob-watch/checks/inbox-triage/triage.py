@@ -37,6 +37,8 @@ MODEL = 'anthropic/claude-haiku-5.5'
 INPUT_USD = 0.10 / 1_000_000
 OUTPUT_USD = 0.50 / 1_000_000
 MAX_BATCH = 64
+PAGE = 500  # chat rows per collector call; a live run carries on from its cursor next tick
+REPLAY_PAGES = 40
 APPLE_EPOCH = 978307200
 UTC = dt.timezone.utc
 TRANSACTION = re.compile(r'\b(confirmation|confirmed|booking|reservation|itinerary|appointment|cancell?ed|refund|complaint|payment (failed|due)|account (locked|restricted)|security alert|flight (change|delay))\b', re.I)
@@ -165,6 +167,109 @@ def settings():
     if not config.get('configured') or not config.get('self_whatsapp_jid') or not config.get('excluded_imessage_chat_ids'):
         raise ValueError('configure private inbox-triage/settings.json identities and chat exclusions first')
     return config
+
+
+def robob_lines(config):
+    """Robob's own iMessage addresses: the bridge's Sendblue line plus any listed in settings."""
+    try:
+        listed = [json.loads((HOME / '.config/spectrum-bridge/config.json').read_text()).get('sendblueNumber')]
+    except (OSError, ValueError):
+        listed = []
+    lines = set()
+    for value in listed + list(config.get('robob_lines', [])):
+        value = str(value or '').strip()
+        if '@' in value:
+            lines.add(value.lower())
+        elif re.sub(r'\D', '', value):
+            lines.add('+' + re.sub(r'\D', '', value))
+    return lines
+
+
+def answered(items):
+    """Ids of chat candidates already followed up: a later message or tapback from the owner,
+    or from a Robob line. In a direct chat any such message counts; in a group only a swipe
+    reply or tapback on that very message does, since he may be talking to someone else.
+    Failed, unsent, revoked and removed follow-ups never count. Reads the stores as they are
+    now, not the scanned batch, so a reply sent after the cursor moved still counts. Mail is
+    not checked. A store that can't be read answers nothing, so nothing is lost."""
+    done, errors = set(), {}
+    chats = [i for i in items if i['source'] == 'imessage']
+    if chats:
+        try:
+            lines = sorted(robob_lines(read_json(DATA / 'settings.json', {})))
+            query = ('SELECT 1 FROM chat_message_join j JOIN message m ON m.ROWID=j.message_id '
+                     'LEFT JOIN handle h ON h.ROWID=m.handle_id '
+                     'WHERE j.chat_id IN (SELECT chat_id FROM chat_message_join WHERE message_id=:id) '
+                     'AND j.message_date > :date '
+                     'AND ((m.is_from_me=1 AND m.is_sent=1 AND m.error=0) '
+                     f'OR (m.is_from_me=0 AND h.id IN ({",".join(f":l{n}" for n in range(len(lines)))}))) '
+                     'AND coalesce(m.date_retracted,0)=0 AND m.associated_message_type NOT BETWEEN 3000 AND 3999 '
+                     "AND (NOT :group OR m.thread_originator_guid=:guid OR instr(coalesce(m.associated_message_guid,''), :guid)>0) "
+                     'LIMIT 1')
+            with db(HOME / 'Library/Messages/chat.db') as c:
+                for item in chats:
+                    rowid = int(item['id'].split(':')[1])
+                    message = c.execute('SELECT guid, date FROM message WHERE ROWID=?', (rowid,)).fetchone()
+                    if not message:
+                        continue
+                    group = c.execute('SELECT 1 FROM chat_message_join j JOIN chat ch ON ch.ROWID=j.chat_id '
+                                      'WHERE j.message_id=? AND ch.style=43 LIMIT 1', (rowid,)).fetchone() is not None
+                    args = {'id': rowid, 'date': message['date'], 'group': group, 'guid': message['guid'],
+                            **{f'l{n}': line for n, line in enumerate(lines)}}
+                    if c.execute(query, args).fetchone():
+                        done.add(item['id'])
+        except Exception as e:
+            errors['imessage'] = f'{type(e).__name__}: {str(e)[:160]}'
+    chats = [i for i in items if i['source'] == 'whatsapp']
+    if chats:
+        try:
+            wa = load_module('triage_wadb', HELPERS / 'wa-db')
+            with db(HOME / '.wacli/wacli.db') as c:
+                for item in chats:
+                    group = item['chat_jid'].endswith('@g.us')
+                    if group and not item.get('message_id'):
+                        continue
+                    jids = sorted(set(wa.resolve(c, item['chat_jid'])))
+                    rowid = int(item['id'].split(':')[1])
+                    query = (f'SELECT 1 FROM messages WHERE chat_jid IN ({",".join("?" * len(jids))}) '
+                             'AND from_me=1 AND (ts>? OR (ts=? AND rowid>?)) AND revoked=0 AND deleted_at IS NULL '
+                             "AND NOT (coalesce(reaction_to_id,'')!='' AND coalesce(reaction_emoji,'')='') "
+                             + ('AND (quoted_msg_id=? OR reaction_to_id=?) ' if group else '') + 'LIMIT 1')
+                    args = (*jids, item['ts'], item['ts'], rowid, *((item['message_id'],) * 2 if group else ()))
+                    if c.execute(query, args).fetchone():
+                        done.add(item['id'])
+        except Exception as e:
+            errors['whatsapp'] = f'{type(e).__name__}: {str(e)[:160]}'
+    return done, errors
+
+
+def handled(items):
+    """Chat candidates that no longer need the owner, with why: they sit in a chat Robob is in
+    (`robob_chat`), or were already answered (`answered`). Checked at every step a candidate can
+    wait at (the queue, classifying, an unsent wake), so a candidate queued before a rule or a
+    reply arrived still gets dropped. A store or settings file that can't be read drops nothing."""
+    reasons, errors = {}, {}
+    chats = [i for i in items if i['source'] == 'imessage']
+    if chats:
+        try:
+            lines = sorted(robob_lines(read_json(DATA / 'settings.json', {})))
+            marks = ','.join('?' * len(lines))
+            query = ('SELECT 1 FROM chat_message_join j JOIN chat_handle_join ch ON ch.chat_id=j.chat_id '
+                     f'JOIN handle h ON h.ROWID=ch.handle_id WHERE j.message_id=? AND lower(h.id) IN ({marks}) '
+                     'UNION ALL SELECT 1 FROM message m JOIN handle h ON h.ROWID=m.handle_id '
+                     f'WHERE m.ROWID=? AND lower(h.id) IN ({marks}) LIMIT 1')
+            with db(HOME / 'Library/Messages/chat.db') as c:
+                for item in chats:
+                    rowid = int(item['id'].split(':')[1])
+                    if c.execute(query, (rowid, *lines, rowid, *lines)).fetchone():
+                        reasons[item['id']] = 'robob_chat'
+        except Exception as e:
+            errors['imessage'] = f'{type(e).__name__}: {str(e)[:160]}'
+    done, answer_errors = answered([i for i in items if i['id'] not in reasons])
+    reasons.update(dict.fromkeys(done, 'answered'))
+    for source, error in answer_errors.items():
+        errors.setdefault(source, error)
+    return reasons, errors
 
 
 def prefilter(item, now, rules):
@@ -310,7 +415,7 @@ def mail_worker(account, request):
             cutoff = request['initialized_at']
         # Continue large bursts next tick, with no silent truncation.
         uids = uids[:120] if since is None else uids
-        out, drops = [], collections.Counter()
+        out, drops, dropped = [], collections.Counter(), []
         if not uids:
             return {'items': [], 'cursor': {'validity': validity, 'uid': next_uid - 1}, 'drops': {}, 'scanned': 0}
         fields = '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID LIST-UNSUBSCRIBE PRECEDENCE)])'
@@ -331,12 +436,13 @@ def mail_worker(account, request):
                 break
             if reason:
                 drops[reason] += 1
+                dropped.append([f'mail:{account}:{validity}:{record[0]}', reason])
             elif item:
                 out.append(item)
             completed += 1
             last_uid = record[0]
         return {'items': out, 'cursor': {'validity': validity, 'uid': last_uid if partial else max(uids)},
-                'drops': dict(drops), 'scanned': completed, 'partial': partial}
+                'drops': dict(drops), 'dropped': dropped, 'scanned': completed, 'partial': partial}
     finally:
         # Close the socket locally; LOGOUT need not consume another server round trip.
         try:
@@ -394,7 +500,14 @@ def db(path):
     return c
 
 
-def collect_whatsapp(cursor, now, excluded, initialized_at=None):
+def too_old(ts, now, since):
+    """A replay keeps exactly its window; a live run drops history synced in late (over 6 h old)."""
+    if since is not None:
+        return 'before_window' if ts < since else None
+    return 'history_backfill' if ts < now - 6 * 3600 else None
+
+
+def collect_whatsapp(cursor, now, excluded, initialized_at=None, since=None):
     config = settings()
     wa = load_module('triage_wadb', HELPERS / 'wa-db')
     ok, why = wa.daemon_status()
@@ -413,16 +526,16 @@ def collect_whatsapp(cursor, now, excluded, initialized_at=None):
         for jid in list(resolved):
             resolved.update(wa.resolve(c, jid))
         self_jids = set(wa.resolve(c, config['self_whatsapp_jid']))
-        rows = c.execute('SELECT * FROM messages WHERE rowid>? ORDER BY rowid LIMIT 500', (cursor,)).fetchall()
-        items, drops = [], collections.Counter()
+        rows = c.execute('SELECT * FROM messages WHERE rowid>? ORDER BY rowid LIMIT ?', (cursor, PAGE)).fetchall()
+        items, drops, dropped = [], collections.Counter(), []
         for r in rows:
             reason = None
             if r['from_me'] or r['chat_jid'] in self_jids:
                 reason = 'own'
             elif r['revoked'] or r['deleted_at'] or r['reaction_emoji']:
                 reason = 'reaction_deleted'
-            elif r['ts'] < now - 6 * 3600:
-                reason = 'history_backfill'
+            elif too_old(r['ts'], now, since):
+                reason = too_old(r['ts'], now, since)
             elif r['chat_jid'] in resolved:
                 reason = 'other_watcher'
             elif r['chat_jid'].endswith(('@broadcast', '@newsletter')):
@@ -435,13 +548,14 @@ def collect_whatsapp(cursor, now, excluded, initialized_at=None):
                     reason = 'group_unmentioned'
             if reason:
                 drops[reason] += 1
+                dropped.append([f'wa:{r["rowid"]}', reason])
                 continue
             items.append({'id': f'wa:{r["rowid"]}', 'source': 'whatsapp', 'ts': r['ts'],
                           'chat_jid': r['chat_jid'], 'message_id': r['msg_id'],
                           'sender': clean(wa.label(c, r), 150), 'subject': clean(r['chat_name'], 120),
                           'preview': clean(text)})
         return {'items': items, 'cursor': rows[-1]['rowid'] if rows else cursor,
-                'drops': dict(drops), 'scanned': len(rows)}
+                'drops': dict(drops), 'dropped': dropped, 'scanned': len(rows)}
 
 
 def attributed(blob):
@@ -459,7 +573,7 @@ def attributed(blob):
         return ''
 
 
-def collect_imessage(cursor, now, initialized_at=None):
+def collect_imessage(cursor, now, initialized_at=None, since=None):
     config = settings()
     with db(HOME / 'Library/Messages/chat.db') as c:
         top = c.execute('SELECT coalesce(max(ROWID),0) FROM message').fetchone()[0]
@@ -470,22 +584,28 @@ def collect_imessage(cursor, now, initialized_at=None):
             cursor = cursor - 1 if cursor is not None else top
         if top < cursor:
             raise RuntimeError('Messages rowid regressed; inspect restore before rebasing')
-        rows = c.execute('SELECT m.*, h.id AS sender FROM message m LEFT JOIN handle h ON h.ROWID=m.handle_id WHERE m.ROWID>? ORDER BY m.ROWID LIMIT 500', (cursor,)).fetchall()
-        items, drops = [], collections.Counter()
+        rows = c.execute('SELECT m.*, h.id AS sender FROM message m LEFT JOIN handle h ON h.ROWID=m.handle_id WHERE m.ROWID>? ORDER BY m.ROWID LIMIT ?', (cursor, PAGE)).fetchall()
+        lines = sorted(robob_lines(config))
+        # Chats Robob is in are his to handle; he already sees every message there.
+        robob_chats = {r[0] for r in c.execute(f'SELECT j.chat_id FROM chat_handle_join j JOIN handle h ON h.ROWID=j.handle_id WHERE h.id IN ({",".join("?" * len(lines))})', lines)}
+        items, drops, dropped = [], collections.Counter(), []
         for r in rows:
             chats = c.execute('SELECT c.ROWID,c.chat_identifier,c.display_name FROM chat c JOIN chat_message_join j ON j.chat_id=c.ROWID WHERE j.message_id=?', (r['ROWID'],)).fetchall()
             ts = r['date'] / 1e9 + APPLE_EPOCH
             reason = None
             if r['is_from_me']:
                 reason = 'own'
+            elif any(x['ROWID'] in robob_chats for x in chats) or (r['sender'] or '').lower() in lines:
+                reason = 'robob_chat'
             elif any(x['ROWID'] in config['excluded_imessage_chat_ids'] or x['chat_identifier'] in config.get('excluded_imessage_identifiers', []) for x in chats):
                 reason = 'excluded_chat'
             elif r['associated_message_type'] or r['is_system_message'] or r['is_service_message'] or r['is_spam'] or r['date_retracted']:
                 reason = 'reaction_system'
-            elif ts < now - 6 * 3600:
-                reason = 'history_backfill'
+            elif too_old(ts, now, since):
+                reason = too_old(ts, now, since)
             if reason:
                 drops[reason] += 1
+                dropped.append([f'imsg:{r["ROWID"]}', reason])
                 continue
             text = r['text'] or attributed(r['attributedBody'])
             if r['cache_has_attachments']:
@@ -494,7 +614,7 @@ def collect_imessage(cursor, now, initialized_at=None):
                           'chat_id': chats[0]['ROWID'] if chats else None, 'guid': r['guid'],
                           'sender': clean(r['sender'], 150), 'subject': clean(r['subject'], 150), 'preview': clean(text)})
         return {'items': items, 'cursor': rows[-1]['ROWID'] if rows else cursor,
-                'drops': dict(drops), 'scanned': len(rows)}
+                'drops': dict(drops), 'dropped': dropped, 'scanned': len(rows)}
 
 
 def build_context(items, watchers, now):
@@ -549,6 +669,24 @@ def classify(items, context):
     return hits, meta
 
 
+def classify_batch(items, context):
+    """One classifier call under a wall-clock budget. On any failure every item goes to
+    manual review instead; there is no retry or second LLM call."""
+    def classify_deadline(*_):
+        raise TimeoutError('classifier wall-clock budget exceeded')
+    previous_handler = signal.signal(signal.SIGALRM, classify_deadline)
+    signal.alarm(20)
+    try:
+        return classify(items, context)
+    except Exception as e:
+        # cost_usd None: a timed-out HTTP request may still be billed.
+        return ([{'id': i['id'], 'reason': 'Classifier unavailable; manually review', 'urgency': 'info'} for i in items],
+                {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': None, 'classifier_error': type(e).__name__})
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def log_run(wd, record):
     # scratch/test runs never mutate live logs or reports.
     root = DATA if wd.resolve() == LIVE.resolve() else wd / 'diagnostics'
@@ -576,12 +714,54 @@ def replay_outbox(state, wd, run):
     if out['run'] and out['run'] == ack:
         state.pop('outbox')
         return None
+    # The wake never went out: drop chat hits handled since, then rebuild it from the
+    # batch as it now stands, which also covers a batch trimmed by a run that died
+    # before saving the cursor. Any trouble reading the batch replays the event unchanged.
+    try:
+        report = read_json(Path(out['batch']), None) if out.get('batch') else None
+        hits = report['hits'] if report else None
+        done = handled(hits)[0] if hits else {}
+    except (OSError, ValueError, KeyError, TypeError):
+        report, done = None, {}
+    if report is not None and isinstance(report.get('hits'), list):
+        if done:
+            report['hits'] = [h for h in report['hits'] if h['id'] not in done]
+            report['handled_before_wake'] = {**report.get('handled_before_wake', {}), **done}
+            atomic(Path(out['batch']), report)
+        if not report['hits']:
+            state.pop('outbox')
+            atomic(wd / 'cursor.json', state)
+            return None
+        out['event'] = event_text(out['batch'], report['hits'], report.get('source_errors'))
     out['run'] = run
     atomic(wd / 'cursor.json', state)
     return out['event']
 
 
-def collect(state, now, watchers, rules, since=None, mail_only=False, baseline=False):
+def replay_pages(collect_page):
+    """A replay has no next tick, so it reads its whole window a page at a time, and says
+    where it stopped if the window is bigger than REPLAY_PAGES pages."""
+    total, cursor = None, None
+    for _ in range(REPLAY_PAGES):
+        page = collect_page(cursor)
+        if total is None:
+            total = {**page, 'drops': collections.Counter(page['drops']), 'dropped': list(page.get('dropped', []))}
+        else:
+            total['items'] += page['items']
+            total['drops'].update(page['drops'])
+            total['dropped'] += page.get('dropped', [])
+            total['scanned'] += page['scanned']
+            total['cursor'] = page['cursor']
+        if page['scanned'] < PAGE:
+            break
+        cursor = page['cursor']
+    else:
+        total['partial'] = f'replay stopped after {total["scanned"]} rows at cursor {total["cursor"]}; the rest of the window was not read'
+    total['drops'] = dict(total['drops'])
+    return total
+
+
+def collect(state, now, watchers, rules, since=None, baseline=False):
     jids, seen = exclusions(watchers)
     tasks = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool:
@@ -590,10 +770,14 @@ def collect(state, now, watchers, rules, since=None, mail_only=False, baseline=F
                    'initialized_at': state['initialized_at'], 'baseline': baseline,
                    'rules': rules, 'seen': list(seen[account])}
             tasks[pool.submit(run_mail, account, req)] = account
-        if not mail_only:
-            cutoff = None if baseline else state['initialized_at']
+        # A dry run replays chats from `since` too; it never saves their cursors.
+        cutoff = since if since is not None else None if baseline else state['initialized_at']
+        if since is None:
             tasks[pool.submit(collect_whatsapp, state['cursors'].get('whatsapp'), now, jids, cutoff)] = 'whatsapp'
             tasks[pool.submit(collect_imessage, state['cursors'].get('imessage'), now, cutoff)] = 'imessage'
+        else:
+            tasks[pool.submit(replay_pages, lambda cursor: collect_whatsapp(cursor, now, jids, cutoff, since))] = 'whatsapp'
+            tasks[pool.submit(replay_pages, lambda cursor: collect_imessage(cursor, now, cutoff, since))] = 'imessage'
         results, errors = {}, {}
         for f in concurrent.futures.as_completed(tasks):
             source = tasks[f]
@@ -622,18 +806,20 @@ def run(args):
             print(replay, flush=True)
             return 0
     watchers, rules = active_watchers(now), noise_rules()
-    results, errors = collect(state, now, watchers, rules, now - args.dry_run_hours * 3600 if dry else None, dry, new)
-    stats, drops = {}, collections.Counter()
+    results, errors = collect(state, now, watchers, rules, now - args.dry_run_hours * 3600 if dry else None, new)
+    stats, drops, dropped = {}, collections.Counter(), []
     queue_ids = {i['id'] for i in state['queue']}
     for source, result in results.items():
         state['cursors'][source] = result['cursor']
         stats[source] = result['scanned']
         drops.update(result['drops'])
+        dropped += result.get('dropped', [])
         for item in result['items']:
             redact_item(item)
             reason = prefilter(item, now, rules)
             if reason:
                 drops[reason] += 1
+                dropped.append([item['id'], reason])
             elif item['id'] not in queue_ids:
                 state['queue'].append(item)
                 queue_ids.add(item['id'])
@@ -643,37 +829,49 @@ def run(args):
         reason = prefilter(item, now, rules)
         if reason:
             drops[reason] += 1
+            dropped.append([item['id'], reason])
         else:
             kept.append(item)
+    done, answer_errors = handled(kept)
+    for i, reason in sorted(done.items()):
+        drops[reason] += 1
+        dropped.append([i, reason])
+    kept = [i for i in kept if i['id'] not in done]
     state['queue'] = kept
     state['source_errors'] = errors
     if not dry:
         # Cursor and pending candidates commit together before the network call.
         atomic(wd / 'cursor.json', state)
-    items = state['queue'][:MAX_BATCH]
+    # A live run classifies one batch and leaves the rest queued for the next tick; a
+    # replay has no next tick, so it classifies every candidate, a batch at a time.
+    items = state['queue'] if dry else state['queue'][:MAX_BATCH]
     meta = {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0}
     hits = []
     context = build_context(items, watchers, now) if items else {}
-    if items:
-        def classify_deadline(*_):
-            raise TimeoutError('classifier wall-clock budget exceeded')
-        previous_handler = signal.signal(signal.SIGALRM, classify_deadline)
-        signal.alarm(20)
-        try:
-            hits, meta = classify(items, context)
-        except Exception as e:
-            # No retry/second LLM call. The reviewer handles surviving candidates.
-            meta['classifier_error'] = type(e).__name__
-            meta['cost_usd'] = None  # a timed-out HTTP request may still be billed
-            hits = [{'id': i['id'], 'reason': 'Classifier unavailable; manually review', 'urgency': 'info'} for i in items]
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous_handler)
+    for n in range(0, len(items), MAX_BATCH):
+        got, used = classify_batch(items[n:n + MAX_BATCH], context)
+        hits += got
+        meta['model'] = used.get('model', meta['model'])
+        for k in ('input_tokens', 'output_tokens'):
+            meta[k] += used.get(k, 0)
+        meta['cost_usd'] = None if meta['cost_usd'] is None or used.get('cost_usd') is None else meta['cost_usd'] + used['cost_usd']
+        if 'classifier_error' in used:
+            meta['classifier_error'] = used['classifier_error']
     by_id = {i['id']: i for i in items}
     selected = [{**by_id[h['id']], **h} for h in hits]
+    # Classification takes seconds; a reply sent meanwhile still counts.
+    late, late_errors = handled(selected)
+    for i, reason in sorted(late.items()):
+        drops[reason] += 1
+        dropped.append([i, reason])
+    selected = [h for h in selected if h['id'] not in late]
+    answer_errors = {**answer_errors, **late_errors}
     report = {'at': stamp(now), 'dry_run': dry, 'scanned': stats, 'dropped': dict(drops), 'candidate_count': len(items),
               'hits': selected, 'source_errors': errors, 'usage': meta}
+    if answer_errors:
+        report['answer_check_errors'] = answer_errors
     if dry:
+        report['dropped_ids'] = dropped
         report['candidates'] = items
         report['current_context'] = context
         if args.report:
@@ -691,7 +889,8 @@ def run(args):
         state['outbox'] = {'run': run_id, 'event': event, 'batch': str(path)}
     atomic(wd / 'cursor.json', state)
     log_run(wd, {'initialized': new, 'scanned': stats, 'dropped': dict(drops), 'candidates': len(items),
-                 'hits': len(hits), 'queued': len(state['queue']), 'source_errors': errors,
+                 'hits': len(selected), 'queued': len(state['queue']), 'source_errors': errors,
+                 **({'answer_check_errors': answer_errors} if answer_errors else {}),
                  'ms': round((time.time() - now) * 1000), **meta})
     if event:
         print(event, flush=True)
