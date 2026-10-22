@@ -46,8 +46,7 @@ Plain Node (v22.5+, `node:sqlite`), no dependencies.
 
 State: `~/.local/share/coord/data/coord.db` (override with `COORD_DB`). Control API url/token come
 from `T3_CONTROL_URL` / `T3_CONTROL_TOKEN`, else coord's own credential file (`COORD_CONTROL_TOKEN_FILE`, default
-`~/.robob/components/coord.json`, chmod 600). While that default file is missing, the shared
-`~/.robob/ardud-control.json` still works. `T3_CONTROL_TOKEN_FILE` is crw's setting and coord ignores it.
+`~/.robob/components/coord.json`, chmod 600). `T3_CONTROL_TOKEN_FILE` is crw's setting and coord ignores it.
 
 Defaults (env overrides): reconcile by `COORD_RECONCILERS` (`master,release`), manual admits by
 `COORD_ADMITTERS` (`master,release`), approval sources `COORD_APPROVAL_SOURCES` (`web,mobile`),

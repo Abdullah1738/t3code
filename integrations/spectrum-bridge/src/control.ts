@@ -109,32 +109,22 @@ export interface ControlConfigOptions {
 }
 
 /**
- * Explicit options, then T3_CONTROL_URL / T3_CONTROL_TOKEN, then a token file.
- * A file named by `tokenFile` or T3_CONTROL_TOKEN_FILE must exist, so a typo
- * never acts as another component. Otherwise this bridge's own component
- * credential, then the shared ~/.robob/ardud-control.json, whichever exists
- * first. Token files must be chmod 600. Same order as the control API's own
- * client.mjs.
+ * Explicit options, then T3_CONTROL_URL / T3_CONTROL_TOKEN, then a token file:
+ * the one named by `tokenFile` or T3_CONTROL_TOKEN_FILE, else this bridge's own
+ * component credential. The file must exist and be chmod 600, so a typo never
+ * acts as another component.
  */
 export function discoverControlConfig(options: ControlConfigOptions = {}): { url: string; token: string } {
   const env = options.env ?? process.env;
   let url = options.url ?? env.T3_CONTROL_URL;
   let token = options.token ?? env.T3_CONTROL_TOKEN;
-  const named = options.tokenFile ?? env.T3_CONTROL_TOKEN_FILE;
-  const robob = join(options.home ?? homedir(), ".robob");
-  const files = named ? [named] : [join(robob, "components", `${COMPONENT}.json`), join(robob, "ardud-control.json")];
-  for (const file of url && token ? [] : files) {
-    let stored: { url?: unknown; token?: unknown };
-    try {
-      if (statSync(file).mode & 0o077) throw new Error("Robob control token file must be chmod 600");
-      stored = JSON.parse(readFileSync(file, "utf8"));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT" && !named) continue;
-      throw error;
-    }
+  if (!url || !token) {
+    const file = (options.tokenFile ?? env.T3_CONTROL_TOKEN_FILE)
+      || join(options.home ?? homedir(), ".robob", "components", `${COMPONENT}.json`);
+    if (statSync(file).mode & 0o077) throw new Error("Robob control token file must be chmod 600");
+    const stored: { url?: unknown; token?: unknown } = JSON.parse(readFileSync(file, "utf8"));
     url ??= typeof stored?.url === "string" ? stored.url : undefined;
     token ??= typeof stored?.token === "string" ? stored.token : undefined;
-    break;
   }
   if (!url || !LOOPBACK.test(url)) throw new Error("Robob control URL must be an HTTP origin on 127.0.0.1 or localhost");
   if (!token || /[\s\x00-\x1f\x7f]/.test(token)) throw new Error("Robob control token unavailable");

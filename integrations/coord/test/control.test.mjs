@@ -27,15 +27,11 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test('coord reads its own component credential before the shared control token', () => {
+test('coord reads its own component credential and ignores the retired shared token', () => {
   write(shared(), 'shared');
+  assert.throws(() => controlConfig(), /no control API url\/token/);
   write(own(), 'coord');
   assert.deepEqual(controlConfig(), { url: 'http://127.0.0.1:3773', token: 'coord' });
-});
-
-test('the shared control token still works while the coord credential is missing', () => {
-  write(shared(), 'shared');
-  assert.equal(controlConfig().token, 'shared');
 });
 
 test('COORD_CONTROL_TOKEN_FILE picks the file, and T3_CONTROL_TOKEN_FILE (crw\'s setting) is ignored', () => {
@@ -48,7 +44,7 @@ test('COORD_CONTROL_TOKEN_FILE picks the file, and T3_CONTROL_TOKEN_FILE (crw\'s
   write(elsewhere, 'elsewhere');
   process.env.COORD_CONTROL_TOKEN_FILE = elsewhere;
   assert.equal(controlConfig().token, 'elsewhere');
-  // A named file that doesn't exist doesn't fall back to the shared token.
+  // A named file that doesn't exist doesn't fall back to anything.
   write(shared(), 'shared');
   process.env.COORD_CONTROL_TOKEN_FILE = join(home, 'missing.json');
   assert.throws(() => controlConfig(), /no control API url\/token/);

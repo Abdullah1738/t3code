@@ -68,8 +68,7 @@ API. Switch it on with `BRIDGE_BACKEND=robob` or `"backend": "robob"` in
 config.json (default `openchamber`). The token comes from
 `T3_CONTROL_URL`/`T3_CONTROL_TOKEN`, else the chmod 600 file named by
 `T3_CONTROL_TOKEN_FILE` (which must exist), else
-`~/.robob/components/telegram-bridge.json` (its own component credential),
-else the old shared `~/.robob/ardud-control.json`.
+`~/.robob/components/telegram-bridge.json` (its own component credential).
 
 - Events: one `GET /events` stream, resumed with `Last-Event-ID` across
   reconnects, decoded into the same notification events as before
