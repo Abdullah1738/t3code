@@ -131,7 +131,8 @@ def resolve_rocket_offer(headers, sku_config, *, deadline=None, timeout=25):
                    for hit in matches])
     return {'offer': offer, 'stock_minimum_quantity': minimum,
             'sale_price': matches[0].get('sale_price'),
-            'title': matches[0].get('name')}
+            'title': matches[0].get('name'),
+            'image_url': __import__('catalog_schema').image(matches[0], 'https://f.nooncdn.com/p/')}
 
 
 def _is_rocket_hit(hit):
@@ -351,6 +352,7 @@ class SupermallOrderFlow:
                                   'sku_config': item['sku_config']}), flush=True)
                 _fail('SUPERMALL_QUANTITY_BELOW_STOCK_MINIMUM')
         self.offers = {code: row['offer'] for code, row in resolved.items()}
+        self.card_catalog = resolved
         self.offer = self.offers.get(self.sku_config) if self.single else None
         return resolved
 
@@ -690,6 +692,8 @@ class SupermallOrderFlow:
                 _fail('SUPERMALL_WATCHER_ETA_INVALID')
         name = f"order-noon-{self.order.lower()}"
         command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order,
+                   *__import__('delivery_cards').commerce_args(self, 'supermall'),
+                   '--payment-confirmed',
                    *order_watch_receipt.command_args(recipient, order_watch_receipt.reserved_minor(journal, self.flow_id)),
                    '--placed-at', dt.datetime.now(DUBAI).isoformat()]
         if eta is not None:

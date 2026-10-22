@@ -39,9 +39,10 @@ def register_tracking(flow, label, recipient='owner', *, paid=True):
     if not order:journal.fail('EXACT_ORDER_ID_UNAVAILABLE')
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app',state['app'],'--order',order,
+             *__import__('delivery_cards').commerce_args(flow, state['vertical']),
              *order_watch_receipt.command_args(recipient,state.get('reserved_minor')),
              '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),'--label',label,
-             *([] if paid else ['--hold-placed-text'])]
+             *(['--payment-confirmed'] if paid else ['--hold-placed-text'])]
     try:
         result=subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=125)
     except (OSError,subprocess.TimeoutExpired):
@@ -683,11 +684,13 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
                     registered=False
                 who='moni' if registered and cfg.get('for')=='moni' else recipient
                 closed=registered and cfg.get('active') is False
-                if not registered or (who=='moni' and not closed):
+                if not registered or (not closed and (who=='moni' or cfg.get('delivery_card', {}).get('held'))):
                     # Re-adding an existing watcher only releases a placement
                     # text held while payment was unconfirmed; never twice.
                     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
                     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app','talabat','--order',order,
+                             '--vertical', binding['vertical'],
+                             '--payment-confirmed',
                              *order_watch_receipt.command_args(who,order_watch_receipt.reserved_minor(journal,flow_id)),
                              '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),
                              '--label','talabat recovered paid order']

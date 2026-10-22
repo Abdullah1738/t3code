@@ -561,6 +561,8 @@ class NowNowOrderFlow:
         """order-watch add with durable readback; observe TRACKER_REGISTERED."""
         name = f"order-noon-{self.order.lower()}"
         command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order,
+                   *__import__('delivery_cards').commerce_args(self, 'nownow'),
+                   '--payment-confirmed',
                    *order_watch_receipt.command_args(recipient, order_watch_receipt.reserved_minor(journal, self.flow_id)),
                    '--placed-at', dt.datetime.now(dt.timezone(dt.timedelta(hours=4))).isoformat(),
                    '--label', label]

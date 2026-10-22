@@ -578,6 +578,8 @@ class MinutesFlow:
         order=self.review['order']
         name=f"order-noon-{order.lower()}"
         command=[WATCH_BIN,'add','--app','noon','--order',order,
+                 *__import__('delivery_cards').commerce_args(self, 'minutes'),
+                 '--payment-confirmed',
                  *order_watch_receipt.command_args(recipient,order_watch_receipt.reserved_minor(j,self.flow_id)),
                  '--placed-at',placed_at or self.review.get('placed_at')
                  or dt.datetime.now(dt.timezone(dt.timedelta(hours=4))).isoformat(),

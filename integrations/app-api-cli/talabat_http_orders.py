@@ -299,6 +299,15 @@ def project(data, order):
             'eta': None, **details, **address,
             'checked_at': dt.datetime.now(dt.timezone.utc).isoformat(),
             'coverage': 'exact_record_pending_confirmation_preparing_out_for_delivery_nearby_delivered; payment_capture_unverified; display_eta_only_no_absolute_timezone; instantiated_rider_name_only'}
+    # The instantiated details widget is already in this response; no extra
+    # tracking/menu request is needed to populate a delivery card.
+    try:
+        from talabat_order_items import order_lines
+        display = order_lines(data, order)
+        result['items'] = [{'name': row['name'], 'quantity': row['quantity']} for row in display['lines']]
+        result['vendor_name'] = display['vendor_name']
+    except (TalabatError, ValueError, TypeError, KeyError):
+        pass
     if raw in ('order_confirming', 'order_confirmingdelayed'):
         result['merchant_acceptance'] = 'unconfirmed'
         result['status_text'] = 'Merchant acceptance is not confirmed.'
