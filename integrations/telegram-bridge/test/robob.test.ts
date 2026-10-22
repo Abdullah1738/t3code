@@ -28,7 +28,7 @@ function fakeControl(events: string[] = []) {
   const threads = new Map<string, Thread>();
   const calls: Call[] = [];
   /** The missions status the server reports; null answers 503. */
-  const missions: { list: MissionThreads[] | null } = { list: [] };
+  const missions: { list: MissionThreads[] | null; routed: string[] | null } = { list: [], routed: [] };
   const summary = (thread: Thread) => ({
     ...thread, status: thread.state === "running" ? "running" : "completed", nativeSessionId: null, rootThreadId: thread.parentThreadId ?? thread.threadId,
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
@@ -55,6 +55,10 @@ function fakeControl(events: string[] = []) {
     if (pathname === "/api/ardud/missions/status") {
       if (missions.list === null) return Response.json({ ok: false }, { status: 503 });
       return Response.json({ ok: true, revision: 1, missions: missions.list });
+    }
+    if (pathname === "/api/ardud/missions/lead-routed") {
+      if (missions.routed === null) return Response.json({ ok: false }, { status: 503 });
+      return Response.json({ ok: true, routed: missions.routed.includes(searchParams.get("threadId") ?? "") });
     }
     const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
     if (path === "/health") return ok({ status: "healthy" });
@@ -269,6 +273,41 @@ test("when the missions read fails, a question alerts as before", async () => {
   setSystemTime(now + 20_000);
   await alerts.tick();
   expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("GST lane"))).toBe(true);
+});
+
+test("a thread a lane delegated leaves its requests to the lane; a failed router read alerts", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "lane", title: "GST lane", state: "running" });
+  control.add({ threadId: "sol-review", parentThreadId: "lane", title: "Sol review", state: "needs-input", pending: [
+    { requestId: "perm-review", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true },
+  ] });
+  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"], attachedThreadIds: [] }];
+  control.missions.routed = ["lane", "sol-review"];
+  expect(await control.backend.leadAnswers("sol-review")).toBe(true);
+  expect(await control.backend.leadAnswers("stranger")).toBe(false);
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("Sol review"))).toBe(false);
+
+  const failing = fakeControl();
+  failing.missions.list = [];
+  failing.missions.routed = null;
+  expect(await failing.backend.leadAnswers("sol-review")).toBe(false);
+  // A failed read is not kept: the next check asks again.
+  failing.missions.routed = ["sol-review"];
+  expect(await failing.backend.leadAnswers("sol-review")).toBe(true);
+
+  // A status answer the bridge can't read still leaves the router to decide.
+  const garbled = fakeControl();
+  garbled.missions.list = [null as unknown as MissionThreads];
+  garbled.missions.routed = [];
+  expect(await garbled.backend.leadAnswers("sol-review")).toBe(false);
+  garbled.missions.routed = ["sol-review"];
+  setSystemTime(now + 60_000);
+  expect(await garbled.backend.leadAnswers("sol-review")).toBe(true);
 });
 
 test("a mission thread's permission request goes to its lead; the master's and everyone else's still alert", async () => {

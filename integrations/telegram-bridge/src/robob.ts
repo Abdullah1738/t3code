@@ -95,6 +95,8 @@ export class RobobAlertBackend implements AlertBackend {
   private readonly threadDirectories = new Map<string, string>();
   private readonly native = new Map<string, string>();
   private missionsRead?: { at: number; read: Promise<{ missions: MissionThreads[] }> };
+  /** Router lead-routing answers by thread, kept about one attention tick. */
+  private readonly routedReads = new Map<string, { at: number; read: Promise<boolean> }>();
 
   constructor(options: RobobAlertOptions = {}) {
     this.client = options.client ?? new ControlClient(options);
@@ -191,20 +193,20 @@ export class RobobAlertBackend implements AlertBackend {
 
   /**
    * Mission threads other than the master take their questions and permission
-   * requests to their lead (Robob's router tells it). Attached threads have no
-   * lead, and a server that can't say which threads are which leaves the
-   * question with the owner. One status read serves a whole attention tick.
+   * requests to their lead (Robob's router tells it), and so do the threads a
+   * lane delegated. Attached threads have no lead, and a server that can't say
+   * which threads are which leaves the question with the owner. One status
+   * read serves a whole attention tick; the router is asked about the rest.
    */
   async leadAnswers(sessionId: string): Promise<boolean> {
-    try {
-      const threadId = await this.resolve(sessionId);
-      const { missions } = await this.missionThreads();
-      return missions.some(mission => mission.masterThreadIds !== undefined
-        && mission.attachedThreadIds !== undefined
-        && mission.threadIds?.includes(threadId) === true
-        && !mission.masterThreadIds.includes(threadId)
-        && !mission.attachedThreadIds.includes(threadId));
-    } catch { return false; }
+    let threadId: string;
+    try { threadId = await this.resolve(sessionId); } catch { return false; }
+    const listed = await this.missionThreads().then(({ missions }) => missions.some(mission => mission.masterThreadIds !== undefined
+      && mission.attachedThreadIds !== undefined
+      && mission.threadIds?.includes(threadId) === true
+      && !mission.masterThreadIds.includes(threadId)
+      && !mission.attachedThreadIds.includes(threadId))).catch(() => false);
+    return listed || await this.leadRouted(threadId);
   }
 
   private missionThreads(): Promise<{ missions: MissionThreads[] }> {
@@ -216,6 +218,20 @@ export class RobobAlertBackend implements AlertBackend {
       read.catch(() => { if (this.missionsRead?.read === read) this.missionsRead = undefined; });
     }
     return this.missionsRead.read;
+  }
+
+  /** The router's answer for one thread, kept as long as a status read; any failure is false. */
+  private leadRouted(threadId: string): Promise<boolean> {
+    const now = Date.now();
+    for (const [id, entry] of this.routedReads) if (now - entry.at > MISSIONS_FRESH_MS) this.routedReads.delete(id);
+    const cached = this.routedReads.get(threadId);
+    if (cached) return cached.read;
+    const read = this.client.leadRouted(threadId).then(({ routed }) => routed === true, () => {
+      if (this.routedReads.get(threadId)?.read === read) this.routedReads.delete(threadId);
+      return false;
+    });
+    this.routedReads.set(threadId, { at: now, read });
+    return read;
   }
 
   /**

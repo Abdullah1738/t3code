@@ -227,6 +227,14 @@ export class ControlClient {
     return this.outside("/api/ardud/missions/status", "missions");
   }
 
+  /**
+   * Whether Robob's router takes a thread's questions and permission requests
+   * to a lead, a thread delegated by a lane included (`GET /api/ardud/missions/lead-routed`).
+   */
+  leadRouted(threadId: string): Promise<{ routed: boolean }> {
+    return this.outside(`/api/ardud/missions/lead-routed?threadId=${encodeURIComponent(threadId)}`, "lead routing");
+  }
+
   /** A read-only GET outside the control prefix. */
   private async outside<T>(path: string, what: string): Promise<T> {
     let response: Response;
