@@ -224,4 +224,55 @@ describe("mission CLI", () => {
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("forbidden: Mission provenance-invalid");
   });
+
+  it("files a chat's report with an absolute file, and refuses a missing chat or file", async () => {
+    const { url, seen } = await listen(() => ({ ok: true, report: { chat: "moni" } }));
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "mission-report-"));
+    NodeFS.writeFileSync(NodePath.join(dir, "noon.log"), "502");
+    const session = "ardud-control:thread:abc@4";
+
+    const sent = await new Promise<{ readonly code: number }>((resolve) => {
+      NodeChildProcess.execFile(
+        process.execPath,
+        [
+          CLI,
+          "report",
+          "robob",
+          "--chat",
+          session,
+          "--text",
+          "noon CLI 502 at checkout",
+          "--file",
+          "noon.log",
+          "--key",
+          "noon-502",
+          "--url",
+          url,
+          "--token",
+          "t0k",
+        ],
+        { cwd: dir, env: { ...process.env, T3_CONTROL_TOKEN_FILE: "/nonexistent" } },
+        (error) => resolve({ code: error ? Number(error.code ?? 1) : 0 }),
+      );
+    });
+    expect(sent.code).toBe(0);
+    expect(seen.map(({ method, url: path }) => `${method} ${path}`)).toEqual([
+      "POST /api/ardud/missions/desk/reports",
+    ]);
+    expect(JSON.parse(seen[0]!.body)).toEqual({
+      missionId: "robob",
+      chat: session,
+      text: "noon CLI 502 at checkout",
+      file: NodePath.join(NodeFS.realpathSync(dir), "noon.log"),
+      key: "noon-502",
+    });
+
+    const refused = await Promise.all([
+      run(url, ["report", "robob", "--text", "no chat"]),
+      run(url, ["report", "robob", "--chat", session]),
+      run(url, ["report", "robob", "--chat", session, "--text", "x", "--file", "/no/such/file"]),
+    ]);
+    expect(refused.map((result) => result.code)).toEqual([2, 2, 2]);
+    expect(seen).toHaveLength(1);
+  });
 });
