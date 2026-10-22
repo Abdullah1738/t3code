@@ -1171,6 +1171,70 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
+  it.effect("waits for a cleanup that starts while shutdown waits on an earlier one", () =>
+    Effect.gen(function* () {
+      const firstGate = yield* Deferred.make<void>();
+      const secondGate = yield* Deferred.make<void>();
+      const firstFinished = yield* Deferred.make<void>();
+      const secondFinished = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        release: (attempt) =>
+          attempt === 1
+            ? Deferred.await(firstGate).pipe(
+                Effect.andThen(Deferred.succeed(firstFinished, undefined)),
+                Effect.asVoid,
+              )
+            : attempt === 2
+              ? Deferred.await(secondGate).pipe(
+                  Effect.andThen(Deferred.succeed(secondFinished, undefined)),
+                  Effect.asVoid,
+                )
+              : Effect.void,
+      });
+      const supervisorScope = yield* Scope.make();
+      yield* Effect.gen(function* () {
+        const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+          initiallyDesired: true,
+        }).pipe(Effect.provide(harness.dependencies), Scope.provide(supervisorScope));
+
+        yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+        yield* harness.wake("application-active-reconnect");
+        yield* awaitState(
+          supervisor.state,
+          (state) => state.phase === "connected" && state.generation === 2,
+        );
+        yield* awaitRelease(harness.releaseCount, 1);
+
+        const closing = yield* Scope.close(supervisorScope, Exit.void).pipe(
+          Effect.andThen(Deferred.succeed(closed, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        // Shutdown is still waiting on the first cleanup while the second
+        // session ends and its own cleanup starts.
+        yield* harness.closeLatestSession();
+        yield* awaitRelease(harness.releaseCount, 2);
+        yield* Deferred.succeed(firstGate, undefined);
+        yield* Deferred.await(firstFinished);
+        for (let i = 0; i < 50; i++) {
+          yield* Effect.yieldNow;
+        }
+        expect(yield* Deferred.isDone(closed)).toBe(false);
+
+        yield* Deferred.succeed(secondGate, undefined);
+        yield* Fiber.join(closing);
+        expect(yield* Deferred.isDone(secondFinished)).toBe(true);
+      }).pipe(
+        Effect.ensuring(
+          Deferred.succeed(firstGate, undefined).pipe(
+            Effect.andThen(Deferred.succeed(secondGate, undefined)),
+            Effect.andThen(Scope.close(supervisorScope, Exit.void)),
+          ),
+        ),
+      );
+    }),
+  );
+
   it.effect("restarts the retry ladder when mobile returns to the foreground", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();

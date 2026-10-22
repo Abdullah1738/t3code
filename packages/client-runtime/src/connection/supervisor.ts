@@ -933,9 +933,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         replacing,
       ).pipe(Scope.provide(attemptScope));
       // Dead-socket teardown must not delay reconnect. Keep it uninterruptible
-      // and owned by the supervisor so removal still waits for cleanup.
+      // and owned by attemptsScope: that closes only after this loop has
+      // stopped, so removal waits for every cleanup, including one that starts
+      // while an earlier cleanup is holding shutdown up.
       yield* Scope.close(attemptScope, Exit.void).pipe(
-        Effect.forkIn(supervisorScope, { uninterruptible: true }),
+        Effect.forkIn(attemptsScope, { uninterruptible: true }),
       );
       replacing = false;
       const failedProbe = yield* Ref.getAndSet(probeUnanswered, false);
