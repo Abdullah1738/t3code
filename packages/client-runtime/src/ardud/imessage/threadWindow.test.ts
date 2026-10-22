@@ -1,7 +1,7 @@
 // @effect-diagnostics globalDate:off -- Tests exercise local calendar day boundaries.
 import { describe, expect, it } from "vite-plus/test";
 
-import { imessageDayKey, imessageThreadWindowStart } from "./threadWindow.ts";
+import { imessageDayKey, imessageEarlierStep, imessageThreadWindowStart } from "./threadWindow.ts";
 
 // Local wall-clock times, since day boundaries follow the viewer's clock.
 const at = (day: number, hour: number) => new Date(2026, 9, day, hour).toISOString();
@@ -37,5 +37,20 @@ describe("imessageDayKey", () => {
   it("splits on the local calendar day", () => {
     expect(imessageDayKey(at(20, 23))).not.toBe(imessageDayKey(at(21, 0)));
     expect(imessageDayKey(at(21, 0))).toBe(imessageDayKey(at(21, 23)));
+  });
+});
+
+describe("imessageEarlierStep", () => {
+  it("pages a single long session instead of hiding the control", () => {
+    expect(imessageEarlierStep({ windowStart: 0, oldestHasMoreHistory: true })).toBe("history");
+  });
+
+  it("pages the oldest shown session before widening to older sessions", () => {
+    expect(imessageEarlierStep({ windowStart: 3, oldestHasMoreHistory: true })).toBe("history");
+    expect(imessageEarlierStep({ windowStart: 3, oldestHasMoreHistory: false })).toBe("sessions");
+  });
+
+  it("offers nothing once every session and turn is shown", () => {
+    expect(imessageEarlierStep({ windowStart: 0, oldestHasMoreHistory: false })).toBeNull();
   });
 });

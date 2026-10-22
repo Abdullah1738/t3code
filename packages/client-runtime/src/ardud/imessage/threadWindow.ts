@@ -33,3 +33,16 @@ export function imessageThreadWindowStart(
   }
   return start;
 }
+
+/**
+ * What the transcript's top "Show earlier" reveals next. A long session arrives with
+ * only its newest turns, so its own omitted turns come before any older session;
+ * widening first would bury them mid-transcript.
+ */
+export function imessageEarlierStep(input: {
+  readonly windowStart: number;
+  readonly oldestHasMoreHistory: boolean;
+}): "history" | "sessions" | null {
+  if (input.oldestHasMoreHistory) return "history";
+  return input.windowStart > 0 ? "sessions" : null;
+}
