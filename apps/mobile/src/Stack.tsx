@@ -132,6 +132,9 @@ import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
 import { MissionRecordRouteScreen } from "./ardud/missions/MissionRecordRouteScreen";
 import { MissionsRouteScreen } from "./ardud/missions/MissionsRouteScreen";
 // end ardud missions: ui-mobile
+// ardud imessage: mobile
+import { IMessageChatRouteScreen } from "./ardud/imessage/IMessageChatRouteScreen";
+// end ardud imessage: mobile
 import { SettingsAboutRouteScreen } from "./features/settings/SettingsAboutRouteScreen";
 import { SettingsNotificationsRouteScreen } from "./features/settings/SettingsNotificationsRouteScreen";
 import { SettingsRouteScreen } from "./features/settings/SettingsRouteScreen";
@@ -793,6 +796,13 @@ const RootStackConfig = createWorkspaceStackNavigator({
       options: { ...SOLID_HEADER_OPTIONS, title: "Missions" },
     }),
     // end ardud missions: ui-mobile
+    // ardud imessage: mobile
+    IMessageChat: createNativeStackScreen({
+      screen: IMessageChatRouteScreen,
+      linking: "imessage/:chatSlug",
+      options: { ...SOLID_HEADER_OPTIONS, title: "iMessage" },
+    }),
+    // end ardud imessage: mobile
     ThreadTerminal: createNativeStackScreen({
       screen: ThreadTerminalRouteScreen,
       linking: `${THREAD_LINKING_PREFIX}/terminal`,

@@ -36,6 +36,9 @@ import { useWorkspaceTabs } from "../workspace/WorkspaceTabsContext";
 import { missionThreadIds, withoutMissionThreads } from "@t3tools/client-runtime/ardud/missions";
 import { useMissionList } from "../../ardud/missions/missionsStore";
 // end ardud missions: ui-web
+// ardud imessage: mobile (iMessage threads open from their chat, not the list)
+import { withoutIMessageThreads } from "@t3tools/client-runtime/ardud/imessage";
+// end ardud imessage: mobile
 
 export function HomeRouteScreen() {
   const { width: windowWidth } = useWindowDimensions();
@@ -51,11 +54,14 @@ export function HomeRouteScreen() {
   const visible = useHomeRouteVisible();
   // ardud missions: ui-web (a mission's threads open from the mission, not the list)
   const missionThreads = missionThreadIds(useMissionList());
-  const threads = withoutMissionThreads(
+  const listThreads = withoutMissionThreads(
     useAtomValueWhileVisible(environmentThreadShells.navigationThreadShellsAtom, visible),
     missionThreads,
   );
   // end ardud missions: ui-web
+  // ardud imessage: mobile
+  const threads = withoutIMessageThreads(listThreads);
+  // end ardud imessage: mobile
   const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
   const { savedConnectionsById } = useSavedRemoteConnections();
   const navigation = useNavigation();

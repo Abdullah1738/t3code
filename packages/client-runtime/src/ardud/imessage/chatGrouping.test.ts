@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   groupIMessageThreads,
+  imessageChatLabel,
   imessageChatOfPath,
   OWNER_CHAT_SLUG,
   sortIMessageChats,
@@ -154,5 +155,14 @@ describe("sortIMessageChats", () => {
       "moni",
       "group-family-a1b2c3",
     ]);
+  });
+});
+
+describe("imessageChatLabel", () => {
+  it("names the owner chat, then prefers the bridge title over the slug", () => {
+    expect(imessageChatLabel(OWNER_CHAT_SLUG, "Anything")).toBe("Abdullah");
+    expect(imessageChatLabel("moni-x1y2z3", "Moni")).toBe("Moni");
+    expect(imessageChatLabel("moni-x1y2z3", "iMessage 2026-10-20 09:00")).toBe("Moni");
+    expect(imessageChatLabel("group-family-a1b2c3")).toBe("Family");
   });
 });

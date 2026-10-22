@@ -3,12 +3,19 @@ import { Link } from "@tanstack/react-router";
 import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon } from "lucide-react";
 
 import {
+  buildIMessageChatRows,
+  formatIMessageDuration,
   groupIMessageThreads,
+  imessageAgentSummary,
   imessageChatKind,
+  imessageChatLabel,
   imessageDayKey,
   imessageEarlierStep,
+  imessageThreadInput,
   imessageThreadWindowStart,
   sortIMessageThreadsByCreation,
+  type IMessageAgentStep,
+  type IMessageChatRow,
 } from "@t3tools/client-runtime/ardud/imessage";
 import {
   threadRuntimeIsActive,
@@ -30,14 +37,7 @@ import { useThreadHistory, useThreadShells, useThreadVisibleTurnItems } from "..
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { cn } from "../../lib/utils";
-import { IMessageAvatar, iMessageThreadInput, imessageChatLabel } from "./IMessageSidebarGroup";
-import {
-  buildIMessageChatRows,
-  formatIMessageDuration,
-  imessageAgentSummary,
-  type IMessageAgentStep,
-  type IMessageChatRow,
-} from "./imessageChatRows";
+import { IMessageAvatar } from "./IMessageSidebarGroup";
 
 /**
  * Read-only transcript of one iMessage chat, stitched from its threads oldest first.
@@ -45,7 +45,7 @@ import {
  */
 export function IMessageChatPage(props: { chatSlug: string }) {
   const threads = useThreadShells();
-  const chat = groupIMessageThreads(threads.map(iMessageThreadInput)).find(
+  const chat = groupIMessageThreads(threads.map(imessageThreadInput)).find(
     (candidate) => candidate.slug === props.chatSlug,
   );
   const label = imessageChatLabel(props.chatSlug, chat?.latestTitle);

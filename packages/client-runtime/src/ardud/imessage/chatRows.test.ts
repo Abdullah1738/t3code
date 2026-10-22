@@ -1,16 +1,17 @@
-import { imessageDayKey } from "@t3tools/client-runtime/ardud/imessage";
+// @effect-diagnostics globalDate:off -- Tests exercise local calendar day boundaries.
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
-import type { TimelineEntry, WorkLogEntry } from "../../session-logic";
-import type { ChatMessage } from "../../types";
 import {
   buildIMessageChatRows,
   formatIMessageDuration,
   imessageAgentSummary,
   type IMessageChatRow,
   type IMessageChatRowOptions,
-} from "./imessageChatRows";
+  type IMessageTimelineEntry,
+  type IMessageTimelineMessage,
+} from "./chatRows.ts";
+import { imessageDayKey } from "./threadWindow.ts";
 
 const morning = new Date(2026, 9, 20, 9, 0).toISOString();
 const noon = new Date(2026, 9, 20, 12, 0).toISOString();
@@ -31,9 +32,9 @@ function message(
   text: string,
   runId: string,
   createdAt = morning,
-  extra: Partial<ChatMessage> = {},
-): TimelineEntry {
-  const chatMessage = {
+  extra: Partial<IMessageTimelineMessage> = {},
+): IMessageTimelineEntry {
+  const chatMessage: IMessageTimelineMessage = {
     id,
     role,
     text,
@@ -42,19 +43,12 @@ function message(
     createdAt,
     updatedAt: createdAt,
     ...extra,
-  } as unknown as ChatMessage;
+  };
   return { id, kind: "message", createdAt, message: chatMessage };
 }
 
-function work(id: string, runId: string, createdAt = morning): TimelineEntry {
-  const entry = {
-    id,
-    createdAt,
-    runId,
-    label: `ran ${id}`,
-    tone: "tool",
-  } as unknown as WorkLogEntry;
-  return { id, kind: "work", createdAt, entry };
+function work(id: string, runId: string, createdAt = morning): IMessageTimelineEntry {
+  return { id, kind: "work", createdAt, entry: { id, runId, label: `ran ${id}`, tone: "tool" } };
 }
 
 const kinds = (rows: ReadonlyArray<IMessageChatRow>) => rows.map((row) => row.kind);
@@ -156,12 +150,11 @@ describe("buildIMessageChatRows", () => {
       createdAt: noon,
       entry: {
         id: "note",
-        createdAt: noon,
         runId: "r2",
         label: 'Subagent "Reconcile order" finished',
         tone: "info",
-      } as unknown as WorkLogEntry,
-    } satisfies TimelineEntry;
+      },
+    } satisfies IMessageTimelineEntry;
     const rows = buildIMessageChatRows(
       [
         message("in", "user", "Order the PSL", "r1"),
@@ -254,14 +247,13 @@ describe("buildIMessageChatRows", () => {
       createdAt: morning,
       entry: {
         id: "cmd",
-        createdAt: morning,
         runId: "r1",
         label: "Ran command",
         command: "wa read thomas | tail -8",
         tone: "tool",
         structuredPayload: { startedAt: started, completedAt: completed },
-      } as unknown as WorkLogEntry,
-    } satisfies TimelineEntry;
+      },
+    } satisfies IMessageTimelineEntry;
     const rows = buildIMessageChatRows(
       [
         message("in", "user", "Did Thomas reply?", "r1"),

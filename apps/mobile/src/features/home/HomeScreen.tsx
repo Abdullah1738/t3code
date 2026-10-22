@@ -91,6 +91,9 @@ import { ThreadListFilters } from "./ThreadListFilters";
 // ardud missions: mobile
 import { MissionsThreadGroup } from "../../ardud/missions/MissionsThreadGroup";
 // end ardud missions: mobile
+// ardud imessage: mobile
+import { IMessageThreadGroup } from "../../ardud/imessage/IMessageThreadGroup";
+// end ardud imessage: mobile
 
 interface HomeScreenProps {
   readonly projects: ReadonlyArray<EnvironmentProject>;
@@ -798,6 +801,9 @@ export function HomeScreen(props: HomeScreenProps) {
       {/* ardud missions: mobile */}
       {hasSearchQuery ? null : <MissionsThreadGroup />}
       {/* end ardud missions: mobile */}
+      {/* ardud imessage: mobile */}
+      {hasSearchQuery ? null : <IMessageThreadGroup />}
+      {/* end ardud imessage: mobile */}
     </>
   );
 

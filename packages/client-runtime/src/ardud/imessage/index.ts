@@ -1,7 +1,9 @@
 export {
   groupIMessageThreads,
   imessageChatKind,
+  imessageChatLabel,
   imessageChatOfPath,
+  imessageThreadInput,
   OWNER_CHAT_SLUG,
   sortIMessageChats,
   sortIMessageThreadsByCreation,
@@ -24,3 +26,13 @@ export type {
   IMessageUserMessage,
   IMessageUserMessageInput,
 } from "./messageKinds.ts";
+export { buildIMessageChatRows, formatIMessageDuration, imessageAgentSummary } from "./chatRows.ts";
+export type {
+  IMessageAgentOutcome,
+  IMessageAgentStep,
+  IMessageChatRow,
+  IMessageChatRowOptions,
+  IMessageTimelineEntry,
+  IMessageTimelineMessage,
+  IMessageTimelineWork,
+} from "./chatRows.ts";

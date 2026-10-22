@@ -2200,3 +2200,7 @@ export function buildThreadFeed(
   }
   return feed;
 }
+
+// ardud imessage: mobile (iMessage steps share the feed's labels)
+export { toFeedActivity };
+// end ardud imessage: mobile
