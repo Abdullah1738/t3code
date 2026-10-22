@@ -365,7 +365,8 @@ export class MissionRouter extends Context.Service<
     }) => Effect.Effect<ReadonlyArray<ThreadId>, MissionError>;
     /**
      * A lead answers a pending permission request of a thread it leads (any
-     * lead tier, the master included). Anyone else, or the asking thread
+     * lead tier, the master included), or of a thread a lane or role thread
+     * delegated (that thread first, then its leads). Anyone else, or the asking thread
      * itself, is refused `forbidden`; a request no longer pending is
      * `not-found`. Logged as an allowed `send.guarded` with reason `lead`.
      */
@@ -381,6 +382,15 @@ export class MissionRouter extends Context.Service<
       MissionError
     >;
     // --- end permissions additions ---
+    // --- r22 fixes ---
+    /**
+     * Whether a thread's questions and permission requests go to a lead
+     * (`questionRaised`, `approvalRaised`): a lane or role thread, or a thread
+     * one of them delegated. The Telegram bridge reads it to leave those to
+     * the leads instead of alerting the owner.
+     */
+    readonly leadRouted: (threadId: ThreadId) => Effect.Effect<boolean, MissionError>;
+    // --- end r22 fixes ---
     /**
      * Posts for a trusted server component that resolved the speaker itself
      * (the coord shim). Same rules as `post` after that: dense seqs, key
@@ -1988,6 +1998,90 @@ const make = Effect.gen(function* () {
   // --- end router additions ---
 
   // --- routing additions ---
+  // --- r22 fixes ---
+  /**
+   * The thread that delegated this one: its parent, when the parent is the
+   * recorded creator (a subagent or fork it made). One level only. An owner
+   * fork, or a thread with no recorded creator, has no delegator.
+   */
+  const delegatorOf = Effect.fn("MissionRouter.delegatorOf")(function* (threadId: ThreadId) {
+    const facts = yield* threads.facts(threadId);
+    const parent = facts?.parentThreadId ?? null;
+    if (facts === null || parent === null || parent === threadId) return null;
+    const creator = yield* threads.creator(threadId);
+    if (creator?._tag !== "thread" || creator.threadId !== parent) return null;
+    return { threadId: parent, childTitle: facts.title };
+  });
+
+  /** Who answers a thread's requests in one mission, nearest tier first. */
+  interface LeadRoute {
+    readonly cast: RouterCast;
+    readonly tiers: ReadonlyArray<ReadonlyArray<ThreadId>>;
+    /** What the asking thread is called in this mission. */
+    readonly asker: string;
+  }
+
+  const DELEGATED_TITLE_MAX = 60;
+
+  /**
+   * A thread's lead routes: its own lead tiers where it has any. Otherwise a
+   * thread delegated by a mission member other than the master goes to that
+   * member first, then to the member's own leads. Only questions and
+   * permission requests travel this way: the delegated thread gets no
+   * membership and no send rights, so the guard still treats it as an
+   * outsider. A master never climbs to its parent.
+   */
+  const leadRoutes = Effect.fn("MissionRouter.leadRoutes")(function* (threadId: ThreadId) {
+    const own = yield* candidateCasts(threadId);
+    const routes: LeadRoute[] = [];
+    for (const cast of own) {
+      const tiers = leadTiersOf(cast, threadId);
+      if (tiers.length > 0) {
+        routes.push({ cast, tiers, asker: labelOf(cast, { _tag: "thread", threadId }) });
+      }
+    }
+    if (routes.length > 0) return routes;
+    if (own.some((cast) => masterThreadsOf(cast).includes(threadId))) return routes;
+    const delegator = yield* delegatorOf(threadId);
+    if (delegator === null) return routes;
+    // The child names itself, so quotes and invisible characters go: its title
+    // must not read as words of the notice around it.
+    const title = Array.from(
+      delegator.childTitle
+        .replace(/\s+/g, " ")
+        .replace(/[\p{C}"“”`]/gu, "")
+        .trim(),
+    );
+    const shown =
+      title.length <= DELEGATED_TITLE_MAX
+        ? title.join("")
+        : `${title.slice(0, DELEGATED_TITLE_MAX - 1).join("")}…`;
+    for (const cast of yield* candidateCasts(delegator.threadId)) {
+      const kind = recordMembership(cast, delegator.threadId);
+      if (kind === null || kind === "master") continue;
+      const lane = labelOf(cast, { _tag: "thread", threadId: delegator.threadId });
+      routes.push({
+        cast,
+        tiers: [[delegator.threadId], ...leadTiersOf(cast, delegator.threadId)],
+        asker:
+          shown.length > 0 ? `${lane}'s delegated thread "${shown}"` : `${lane}'s delegated thread`,
+      });
+    }
+    return routes;
+  });
+
+  // Mirrors tellLeads, which only tries the first route: with every lead there
+  // gone nobody is told, so the request stays the owner's.
+  const leadRouted = Effect.fn("MissionRouter.leadRouted")(function* (threadId: ThreadId) {
+    const [route] = yield* leadRoutes(threadId);
+    if (route === undefined) return false;
+    for (const lead of route.tiers.flat()) {
+      if ((yield* readiness(lead)) !== "gone") return true;
+    }
+    return false;
+  });
+  // --- end r22 fixes ---
+
   /**
    * Tells a thread's nearest live lead tier about a request it is waiting on,
    * once per lead. `read` is null once the request is no longer pending.
@@ -2001,21 +2095,16 @@ const make = Effect.gen(function* () {
       readonly producer: string;
     },
   ) {
-    for (const cast of yield* candidateCasts(input.threadId)) {
-      const tiers = leadTiersOf(cast, input.threadId);
-      if (tiers.length === 0) continue;
+    for (const route of yield* leadRoutes(input.threadId)) {
       const pending = yield* request.read;
       if (pending === null) return [];
-      for (const tier of tiers) {
+      for (const tier of route.tiers) {
         const live: ThreadId[] = [];
         for (const lead of tier) {
           if ((yield* readiness(lead)) !== "gone") live.push(lead);
         }
         if (live.length === 0) continue;
-        const text = request.text(
-          labelOf(cast, { _tag: "thread", threadId: input.threadId }),
-          pending,
-        );
+        const text = request.text(route.asker, pending);
         for (const lead of live) {
           yield* notify({
             threadId: lead,
@@ -2080,14 +2169,10 @@ const make = Effect.gen(function* () {
     if (caller === input.threadId) {
       return yield* fail("forbidden", "A thread cannot answer its own permission request.");
     }
-    let cast: RouterCast | null = null;
-    for (const each of yield* candidateCasts(input.threadId)) {
-      if (leadTiersOf(each, input.threadId).some((tier) => tier.includes(caller))) {
-        cast = each;
-        break;
-      }
-    }
-    if (cast === null) {
+    const route = (yield* leadRoutes(input.threadId)).find((each) =>
+      each.tiers.some((tier) => tier.includes(caller)),
+    );
+    if (route === undefined) {
       return yield* fail(
         "forbidden",
         `You do not lead thread ${input.threadId}, so its permission requests are not yours to answer.`,
@@ -2118,12 +2203,12 @@ const make = Effect.gen(function* () {
       key: `lead-approval-respond:${input.threadId}:${input.requestId}:${caller}`,
     });
     yield* store.appendEvent({
-      missionId: cast.missionId,
+      missionId: route.cast.missionId,
       kind: "send.guarded",
       actor: actorOf(provenance),
       provenance,
       summary: clipSummary(
-        `${labelOf(cast, { _tag: "thread", threadId: caller })} -> ${labelOf(cast, { _tag: "thread", threadId: input.threadId })} via request-respond: ${input.decision} (${approval.requestKind})`,
+        `${labelOf(route.cast, { _tag: "thread", threadId: caller })} -> ${route.asker} via request-respond: ${input.decision} (${approval.requestKind})`,
       ),
       subject: { kind: "thread", id: input.threadId },
       payload: {
@@ -2307,6 +2392,7 @@ const make = Effect.gen(function* () {
     questionRaised,
     approvalRaised,
     approvalRespond,
+    leadRouted, // ardud missions: r22 fixes
     relay,
     roomTuning,
     tuneRoom,

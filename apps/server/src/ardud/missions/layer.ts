@@ -17,6 +17,7 @@ import { recoveryRouteLayer } from "./recovery/http.ts";
 import { RecoveryLive } from "./recovery/layer.ts";
 import { coordShimRouteLayer } from "./router/coordHttp.ts";
 import { OwnerConditionsLive, RouterAsksPortsLive, RouterLive } from "./router/layer.ts";
+import { leadRoutedRouteLayer } from "./router/leadRoutedHttp.ts";
 import { masterFeedLayer } from "./router/masterFeed.ts";
 import { requestsDeskRouteLayer } from "./router/requestsHttp.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
@@ -74,4 +75,5 @@ export const ArdudMissionsRoutesLive = Layer.mergeAll(
   coordShimRouteLayer,
   recoveryRouteLayer,
   requestsDeskRouteLayer, // ardud missions: router (owner requests)
+  leadRoutedRouteLayer, // ardud missions: r22 fixes (telegram leaves lead-routed requests alone)
 );
