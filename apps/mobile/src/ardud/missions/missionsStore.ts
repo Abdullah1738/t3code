@@ -14,6 +14,7 @@ import {
   createKeyedSnapshotStores,
   createRpcMissionsSource,
   createSnapshotStore,
+  withOptimisticDecisions,
   yourRequests,
   type FeedFailure,
   type MissionInboxSnapshot,
@@ -51,11 +52,12 @@ let source: MissionsSource | null = null;
 /**
  * The phone's one missions source: the paired server over the environment
  * connection. `EXPO_PUBLIC_MISSIONS_FIXTURE=1` runs on the fixture alone.
- * Built on first use so app start stays cheap.
+ * Built on first use so app start stays cheap. The owner's decisions show at
+ * once and send in the background.
  */
 export function missionsSource(): MissionsSource {
   if (source) return source;
-  source =
+  source = withOptimisticDecisions(
     process.env.EXPO_PUBLIC_MISSIONS_FIXTURE === "1"
       ? createFixtureMissionsSource({ surface: "mobile" })
       : createRpcMissionsSource({
@@ -64,7 +66,8 @@ export function missionsSource(): MissionsSource {
             registry: appAtomRegistry,
             environmentId: missionsEnvironmentIdAtom,
           }),
-        });
+        }),
+  );
   return source;
 }
 

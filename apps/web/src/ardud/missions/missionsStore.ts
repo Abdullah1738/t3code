@@ -23,6 +23,7 @@ import {
   createViewLongTexts,
   viewLongTextKey,
   type ViewLongTextState,
+  withOptimisticDecisions,
   yourRequests,
   type FeedFailure,
   type SampledFeed,
@@ -50,18 +51,21 @@ import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
 
 // The web client's one missions source: the primary server over WS RPC.
 // `?missionsFixture=1` runs on the fixture alone; nothing else falls back to it.
+// The owner's decisions show at once and send in the background.
 const useFixtureOnly =
   typeof window !== "undefined" &&
   new URLSearchParams(window.location.search).get("missionsFixture") === "1";
-export const missionsSource: MissionsSource = useFixtureOnly
-  ? createFixtureMissionsSource({ surface: "web" })
-  : createRpcMissionsSource({
-      transport: createAtomMissionsTransport({
-        runtime: connectionAtomRuntime,
-        registry: appAtomRegistry,
-        environmentId: primaryEnvironmentIdAtom,
+export const missionsSource: MissionsSource = withOptimisticDecisions(
+  useFixtureOnly
+    ? createFixtureMissionsSource({ surface: "web" })
+    : createRpcMissionsSource({
+        transport: createAtomMissionsTransport({
+          runtime: connectionAtomRuntime,
+          registry: appAtomRegistry,
+          environmentId: primaryEnvironmentIdAtom,
+        }),
       }),
-    });
+);
 
 /** True when a section's data comes from the fixture rather than the server. */
 export function isSampleFeed(feed: SampledFeed): boolean {
