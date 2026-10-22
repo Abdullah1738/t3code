@@ -1,37 +1,53 @@
 #!/usr/bin/python3
-"""ride-share-updates: tell the other person (Abdullah <-> Moni) where a ride is
-going and when it arrives. Polls `uber rides status --json` on Abdullah's Uber
-account. Prints one event line per new happening; state in the state file so
-each trip fires BOOKED once and ENDED once.
+"""ride-share-updates: keep one live ride card per Uber trip current, and wake the agent only when
+a card has to be shared or a shared ride really got cancelled/failed.
+
+Polls `uber rides status --json` (Abdullah's account, incl. rides booked for Moni) every run, rebuilds
+the trip's card (ride_card.py: data.json, index.html, preview.png) and prints at most:
+
+  CARD_READY trip=<uuid> rider=<who>[(assumed)] missing=<recipients>   driver assigned ~60s, card not yet sent to everyone
+  CANCELED trip=<uuid> rider=<who>[(assumed)]                          a shared ride was cancelled and not rebooked within 180s
+  FAILED trip=<uuid> rider=<who>[(assumed)] result=<STATUS>            a shared ride ended UNFULFILLED/FAILED
+
+Completion is quiet (the card turns to Dropped off). Completion is only ever taken from trip history;
+a trip that disappears without a terminal history status shows "Checking" and is retried for
+UNKNOWN_GIVE_UP_S, then frozen as unconfirmed. It never sends anything itself.
 
 Env overrides (all optional):
   WATCH_DIR          directory for rides.json (default: current working dir)
   RIDE_SHARE_STATE   full path of the state file
-  RIDE_SHARE_HINTS   rider hint directory (default ~/.local/share/rides-notify)
-  UBER_BIN           uber binary (default: PATH lookup, then the fixed path)
+  RIDE_SHARE_HINTS   rider/booker hint directory (default ~/.local/share/rides-notify)
+  RIDE_CARD_ROOT     where cards are written. Unset: the live imessage-apps folder only when WATCH_DIR
+                     is the live watcher dir, otherwise WATCH_DIR/cards (so `robob-watch test` scratch
+                     runs never touch live cards)
+  RIDE_CARD_JOURNAL  share journal dir (default ~/.local/state/ride-card), read only here
+  UBER_BIN           uber binary
   RIDE_SHARE_NOW     epoch seconds to use as "now" (tests only)
-
-Rider hint: whoever books a ride for Moni writes
-~/.local/share/rides-notify/rider-<TRIP_UUID> containing "moni" (or "abdullah").
-No hint -> rider assumed Abdullah (the woken agent double-checks).
-
-BOOKED needs a driver on two checks at least 60s apart. A trip that was announced
-as BOOKED and then CANCELED is held for 180s; a new BOOKED for the same rider in
-that window prints one REBOOKED line and no cancel line.
 """
 import json, os, shutil, subprocess, sys, time
-from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "ride-card"))
 
 WD = os.environ.get("WATCH_DIR", os.getcwd())
 STATE = os.environ.get("RIDE_SHARE_STATE") or os.path.join(WD, "rides.json")
-HINTS = os.environ.get("RIDE_SHARE_HINTS") or os.path.expanduser("~/.local/share/rides-notify")
+LIVE_DIR = Path.home() / ".local/share/robob-watch/watchers/ride-share-updates"
+if not os.environ.get("RIDE_CARD_ROOT"):
+    if Path(WD).resolve() != LIVE_DIR.resolve():
+        os.environ["RIDE_CARD_ROOT"] = os.path.join(WD, "cards")
+        os.environ.setdefault("RIDE_CARD_JOURNAL", os.path.join(WD, "journal"))
+import ride_card as rc  # noqa: E402  (after RIDE_CARD_ROOT is settled)
+
 UBER = os.environ.get("UBER_BIN") or shutil.which("uber") or "/Users/ardud/.nvm/versions/node/v26.2.0/bin/uber"
 ENV = dict(os.environ, PATH="/Users/ardud/.nvm/versions/node/v26.2.0/bin:" + os.environ.get("PATH", ""))
-DXB = timezone(timedelta(hours=4))
 FAIL_ALERT_S = 600
 BOOK_CONFIRM_S = 60
 REBOOK_WINDOW_S = 180
-ACTIVE_NO_DRIVER = {"Searching", "Dispatching", "Matching", "Requesting", "WaitingForDispatch"}
+UNKNOWN_GIVE_UP_S = 3 * 3600
+CARD_RETRY_S = 600          # one more CARD_READY if someone still lacks the card 10 min later
+MISSES_BEFORE_UNKNOWN = 2   # a single empty poll doesn't flip a live card to "Checking"
+RECIPIENTS = ("abdullah", "moni")
 
 
 def now_ts():
@@ -42,9 +58,22 @@ def now_ts():
 def load():
     try:
         with open(STATE) as f:
-            return json.load(f)
+            s = json.load(f)
     except Exception:
-        return {"trips": {}, "active": None, "fail_since": None}
+        s = {}
+    s.setdefault("trips", {})
+    s.setdefault("active", None)
+    s.setdefault("fail_since", None)
+    s.setdefault("ending", {})
+    s.setdefault("pending_cancel", {})
+    # migrate the old text-era state: an announced trip counts as shared and requested
+    for t in s["trips"].values():
+        if t.get("booked_fired") is not None and t.get("card_requested") is None:
+            t["card_requested"] = t["booked_fired"]
+            t["legacy_shared"] = True
+    for p in s["pending_cancel"].values():
+        p.setdefault("label", p.get("rider"))
+    return s
 
 
 def save(s):
@@ -55,26 +84,28 @@ def save(s):
 
 
 def uber(*args, timeout=25):
-    p = subprocess.run([UBER, *args, "--json"], capture_output=True, text=True, timeout=timeout, env=ENV)
-    return json.loads(p.stdout)
+    p = subprocess.run([UBER, *args, "--json"], capture_output=True, text=True, timeout=timeout, env=ENV,
+                       stdin=subprocess.DEVNULL)
+    return json.loads((p.stdout.strip().splitlines() or ["{}"])[-1])
 
 
-def rider_for(uuid):
-    try:
-        with open(os.path.join(HINTS, f"rider-{uuid}")) as f:
-            v = f.read().strip().lower()
-            return ("moni" if v.startswith("mon") else "abdullah"), True
-    except Exception:
-        return "abdullah", False
+def who(uuid):
+    rider, hinted = rc.rider_for(uuid)
+    return rider, hinted, f"{rider}{'' if hinted else '(assumed)'}"
 
 
-def hhmm(iso):
-    if not iso:
-        return "unknown"
-    try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(DXB).strftime("%H:%M")
-    except Exception:
-        return str(iso)
+def card_shared(uuid, t=None):
+    """A card counts as shared once any recipient got it (or the old text flow announced the trip)."""
+    return bool(rc.sent_to(uuid)) or bool((t or {}).get("legacy_shared"))
+
+
+def q(v):
+    return json.dumps(v if v is None else str(v), ensure_ascii=False)
+
+
+def recently_requested(trips, rider, now, exclude):
+    return any(u != exclude and t.get("rider") == rider and t.get("card_requested")
+               and now - t["card_requested"] < REBOOK_WINDOW_S for u, t in trips.items())
 
 
 def main():
@@ -94,86 +125,109 @@ def main():
         return
 
     out = []
+    trips, ending, pending = s["trips"], s["ending"], s["pending_cancel"]
     trip = (d.get("result") or {}).get("trip")
-    cur = trip.get("uuid") if trip else None
-    trips = s.setdefault("trips", {})
-    pending = s.setdefault("pending_cancel", {})
-    ready = None
-
-    if trip and cur:
+    cur = None
+    if trip and trip.get("uuid"):
+        try:
+            cur = rc.check_uuid(trip["uuid"])
+        except SystemExit:
+            print(f"ride-share: ignoring malformed trip uuid {str(trip.get('uuid'))[:60]!r}", file=sys.stderr)
+            save(s)
+            return  # can't bind a card to it; leave every other trip untouched this run
+    if cur:
         t = trips.setdefault(cur, {"first_seen": now})
-        stops = trip.get("stops") or []
-        dest = next((x.get("title") for x in stops if x.get("type") == "Dropoff"), None)
-        t.update(status=trip.get("status"), dest=dest or t.get("dest"), eta=trip.get("arrivalEta"), last_seen=now)
-        rider, hinted = rider_for(cur)
-        t["rider"], t["rider_hinted"] = rider, hinted
-        if trip.get("driver") and trip.get("status") not in ACTIVE_NO_DRIVER:
+        rider, hinted, label = who(cur)
+        with rc.trip_lock(cur):
+            prev = rc.load_card(cur)
+            card = rc.from_live(trip, prev, rider, rc.booker_for(cur), now)
+            if not (prev and prev.get("terminal")):
+                rc.write_card(card)
+        t.pop("misses", None)
+        t.update(status=trip.get("status"), dest=card.get("dropoff") or t.get("dest"), last_seen=now,
+                 rider=rider, rider_hinted=hinted)
+        ending.pop(cur, None)
+        has_driver = card["state"] not in ("searching",)
+        if has_driver:
             if t.get("driver_seen") is None:
                 t["driver_seen"] = now
-            elif not t.get("booked_fired") and now - t["driver_seen"] >= BOOK_CONFIRM_S:
-                ready = cur
+            elif now - t["driver_seen"] >= BOOK_CONFIRM_S and (
+                    t.get("card_requested") is None
+                    or (not t.get("card_retried") and not t.get("legacy_shared")
+                        and now - t["card_requested"] >= CARD_RETRY_S)):
+                missing = [r for r in RECIPIENTS if r not in rc.sent_to(cur)]
+                if t.get("card_requested") is not None:
+                    t["card_retried"] = now
+                else:
+                    t["card_requested"] = now
+                if missing:
+                    out.append(f"CARD_READY trip={cur} rider={label} missing={','.join(missing)} "
+                               f"state={card['state']} dest={q(card.get('dropoff'))}")
+                # a rebook inside the window replaces the old trip's cancel line
+                for old, p in list(pending.items()):
+                    if p.get("rider") == rider and now - p["since"] < REBOOK_WINDOW_S:
+                        pending.pop(old, None)
         else:
             t["driver_seen"] = None
 
-    prev = s.get("active")
-    if prev and prev != cur:
-        s.setdefault("ending", {})[prev] = s.get("ending", {}).get(prev, now)
-        if prev in trips:
-            trips[prev]["driver_seen"] = None
+    prev_active = s.get("active")
+    if prev_active and prev_active != cur and prev_active not in ending:
+        ending[prev_active] = now
+        trips.setdefault(prev_active, {"first_seen": now})["misses"] = 0
     s["active"] = cur
 
-    for uuid, since in list(s.get("ending", {}).items()):
-        t = trips.get(uuid, {})
-        status, ended = None, None
+    for uuid, since in list(ending.items()):
+        status = None
         try:
             g = uber("trips", "get", uuid)
             if g.get("ok"):
                 status = ((g.get("result") or {}).get("status") or "").upper() or None
-                ended = (g.get("result") or {}).get("endedAt")
         except Exception:
             pass
-        terminal = status in ("COMPLETED", "CANCELED", "CANCELLED", "UNFULFILLED", "FAILED")
-        if not terminal:
-            # history lags the live status by a few minutes; after 5 min without
-            # an active trip, treat it as ended (most likely completed)
-            if now - since < 300:
+        with rc.trip_lock(uuid):
+            card = rc.load_card(uuid)
+            if status in rc.TERMINAL and card and not card.get("terminal"):
+                rc.write_card(rc.to_terminal(card, status, now))
+        if status in rc.TERMINAL:
+            del ending[uuid]
+            t = trips.setdefault(uuid, {"first_seen": since})
+            if t.get("ended_fired"):
                 continue
-            status = f"{status or 'not-in-history'}; no longer active for 5+ min (likely completed)"
-        del s["ending"][uuid]
-        if t.get("ended_fired"):
+            t["ended_fired"] = now
+            t["result"] = status
+            if not card_shared(uuid, t):
+                continue  # nothing was shared: nothing to correct
+            rider, _, label = who(uuid)
+            if rc.TERMINAL[status] == "cancelled":
+                if recently_requested(trips, rider, now, uuid):
+                    continue  # already rebooked: the new card says it all
+                pending[uuid] = {"since": now, "rider": rider, "label": label}
+            elif rc.TERMINAL[status] == "failed":
+                out.append(f"FAILED trip={uuid} rider={label} result={status}")
             continue
-        t["ended_fired"] = now
-        if not t.get("booked_fired"):
-            continue  # never had a driver: nothing was announced, nothing to close
-        rider, hinted = rider_for(uuid)
-        if status in ("CANCELED", "CANCELLED"):
-            pending[uuid] = {"since": now, "rider": rider, "rider_hinted": hinted, "dest": t.get("dest")}
-            continue
-        out.append(f"ENDED trip={uuid} rider={rider}{'' if hinted else '(assumed)'} result={status} "
-                   f"dest=\"{t.get('dest')}\" ended_at={hhmm(ended) if ended else hhmm(datetime.fromtimestamp(now, timezone.utc).isoformat())} (Dubai)")
-
-    if ready:
-        t = trips[ready]
-        rider, hinted = t["rider"], t["rider_hinted"]
-        t["booked_fired"] = now
-        match = sorted((p["since"], u) for u, p in pending.items()
-                       if p["rider"] == rider and now - p["since"] < REBOOK_WINDOW_S)
-        if match:
-            old = match[0][1]
-            pending.pop(old, None)
-            out.append(f"REBOOKED trip={ready} replaces={old} rider={rider}{'' if hinted else '(assumed)'} "
-                       f"dest=\"{t['dest']}\" arrive_eta={hhmm(t['eta'])} (Dubai) status={t['status']}")
-        else:
-            out.append(f"BOOKED trip={ready} rider={rider}{'' if hinted else '(assumed)'} dest=\"{t['dest']}\" "
-                       f"arrive_eta={hhmm(t['eta'])} (Dubai) status={t['status']}")
+        # no terminal history yet: never assume completion
+        t = trips.setdefault(uuid, {"first_seen": since})
+        t["misses"] = t.get("misses", 0) + 1
+        if card and not card.get("terminal") and t["misses"] < MISSES_BEFORE_UNKNOWN \
+                and now - since < UNKNOWN_GIVE_UP_S:
+            continue  # one empty poll: keep the live card as is
+        if card and not card.get("terminal"):
+            final = now - since >= UNKNOWN_GIVE_UP_S
+            with rc.trip_lock(uuid):
+                if card.get("state") != "unknown" or final:
+                    rc.write_card(rc.to_unknown(card, now, final=final))
+                else:
+                    rc.write_card(dict(card, checked_at=rc.iso(now)))
+            if final:
+                del ending[uuid]
+        elif now - since >= UNKNOWN_GIVE_UP_S:
+            del ending[uuid]
 
     for uuid, p in list(pending.items()):
         if now - p["since"] >= REBOOK_WINDOW_S:
             del pending[uuid]
-            out.append(f"ENDED trip={uuid} rider={p['rider']}{'' if p['rider_hinted'] else '(assumed)'} result=CANCELED "
-                       f"dest=\"{p['dest']}\" ended_at={hhmm(datetime.fromtimestamp(p['since'], timezone.utc).isoformat())} (Dubai)")
+            out.append(f"CANCELED trip={uuid} rider={p.get('label') or p.get('rider')}")
 
-    # prune old trip records
     for uuid in [u for u, t in trips.items() if now - t.get("last_seen", t.get("first_seen", now)) > 14 * 86400]:
         trips.pop(uuid, None)
     save(s)
