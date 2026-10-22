@@ -73,14 +73,20 @@ export function isSampleFeed(feed: SampledFeed): boolean {
 const listStore = createSnapshotStore<MissionListSnapshot>((emit) =>
   missionsSource.subscribeList(emit),
 );
+// Switching missions or requests and coming back should not wait on the server
+// again, so a board's feeds stay open a while after the screen leaves.
+const warm = { keepAliveMs: 2 * 60_000 };
 const overviewStores = createKeyedSnapshotStores<MissionId, MissionOverviewSnapshot | null>(
   (id, emit) => missionsSource.subscribeOverview(id, emit),
+  warm,
 );
-const laneStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Lane>>((id, emit) =>
-  missionsSource.subscribeLanes(id, emit),
+const laneStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Lane>>(
+  (id, emit) => missionsSource.subscribeLanes(id, emit),
+  warm,
 );
 const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInboxSnapshot>(
   (id, emit, fail) => missionsSource.subscribeInbox(id, emit, fail),
+  warm,
 );
 const routingStores = createKeyedSnapshotStores<MissionId, ApprovalRoutingTable | null>(
   (id, emit) => missionsSource.subscribeRouting(id, emit),
@@ -127,11 +133,13 @@ const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Missio
 const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit, fail) =>
   missionsSource.subscribeRoom(id, emit, fail),
 );
-const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>((id, emit) =>
-  missionsSource.subscribeViews(id, emit),
+const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>(
+  (id, emit) => missionsSource.subscribeViews(id, emit),
+  warm,
 );
 const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
   (id, emit, fail) => missionsSource.subscribeRequests(id, emit, fail),
+  warm,
 );
 
 /** The mission's views record (its layout of sections and tabs) and its change log. */
@@ -163,7 +171,7 @@ export function retryViewLongText(input: ViewLongTextInput): void {
 const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | null>((key, emit) => {
   const [missionId, requestId] = key.split("\n") as [MissionId, string];
   return missionsSource.subscribeRequest({ missionId, requestId }, emit);
-});
+}, warm);
 
 const NO_REQUESTS: SnapshotStore<ReadonlyArray<OwnerRequest>> = {
   get: () => undefined,

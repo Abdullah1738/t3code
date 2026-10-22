@@ -8,13 +8,14 @@ import {
 } from "@t3tools/client-runtime/ardud/missions";
 import { useEffect, useSyncExternalStore } from "react";
 
-import { missionsSource } from "./missionsStore";
+import { MISSION_FEED_KEEP_ALIVE_MS, missionsSource } from "./missionsStore";
 
 // The mission's views: its layout, card templates, placed sections with the
 // server's rows, and its images. One subscription per mission.
 
-const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>((id, emit) =>
-  missionsSource().subscribeViews(id, emit),
+const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>(
+  (id, emit) => missionsSource().subscribeViews(id, emit),
+  { keepAliveMs: MISSION_FEED_KEEP_ALIVE_MS },
 );
 
 const NONE = { get: () => undefined, subscribe: () => () => {} };
