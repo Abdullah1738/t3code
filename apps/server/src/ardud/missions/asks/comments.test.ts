@@ -243,6 +243,10 @@ describe("owner comments travel with his decisions", () => {
       );
       const third = yield* decision("d-2");
       expect(third.rewriteNote).toContain("- Say please.\n- And thank them.");
+      // crw already forwarded the first rewrite: the changed revision tells it to forward again.
+      expect(second.commentsRevision).toBeDefined();
+      expect(third.commentsRevision).not.toBe(second.commentsRevision);
+      expect(yield* decision("d-2")).toEqual(third);
 
       // His own rewrite note carries the comments too.
       const rewritten = yield* open("d-3", 10);
