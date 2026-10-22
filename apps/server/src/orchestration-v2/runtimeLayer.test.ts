@@ -5420,16 +5420,19 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       yield* send(0, "Active");
       yield* send(1, "Queued before the restart");
       yield* recovery.reconcile("startup");
-      yield* send(2, "Resume note", true);
-      yield* send(3, "Ordinary agent message");
+      // The thread is idle after recovery, so this agent message starts a healthy run.
+      yield* send(2, "Healthy run");
+      yield* send(3, "Resume note", true);
+      yield* send(4, "Ordinary agent message");
       const queued = yield* orchestrator.getThreadProjection(threadId);
       const runFor = (index: number) =>
         queued.runs.find(
           (run) => run.userMessageId === MessageId.make(`${threadId}:message:${index}`),
         )!;
-      const [held, note, ordinary] = [runFor(1), runFor(2), runFor(3)];
-      const active = queued.runs.find((run) => run.status === "starting")!;
+      const [held, active, note, ordinary] = [runFor(1), runFor(2), runFor(3), runFor(4)];
+      assert.equal(active.status, "starting");
       assert.isTrue(held.queueHeld);
+      assert.equal(note.status, "queued");
       assert.equal(note.contextReset, true);
       assert.notEqual(note.queueHeld, true);
       assert.isTrue(ordinary.queueHeld);

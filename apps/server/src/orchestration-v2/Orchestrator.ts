@@ -5265,13 +5265,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // Buffered wakes need a T3 run for output the CLI already started producing.
       // Stop still holds wakes that arrive before the active run settles.
       // ardud: a context-reset resume note comes from the run that is still
-      // active, so a hold left by an older failure must not swallow it.
-      const wakeSkipsHold =
+      // active, so a hold left by an older failure must not swallow it. Both
+      // wait after a Stop even when the queue was empty, so neither outlives it.
+      const activeRunWork =
         activeRun !== undefined &&
-        queueIsHeld &&
         ((command.createdBy === "agent" && command.creationSource === "provider") ||
-          command.contextReset === true) &&
-        !(yield* stopReachedRun(command, command.threadId, activeRun.id));
+          command.contextReset === true);
+      const stoppedBeforeWork =
+        activeRunWork && (yield* stopReachedRun(command, command.threadId, activeRun.id));
+      const wakeSkipsHold = activeRunWork && queueIsHeld && !stoppedBeforeWork;
       const run: OrchestrationV2Run = {
         id: runId,
         threadId: command.threadId,
@@ -5284,6 +5286,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         activeAttemptId: attemptId,
         status: "queued",
         ...(worktreeMissingRun !== undefined ||
+        stoppedBeforeWork ||
         (heldRunsToRelease.length === 0 && queueIsHeld && !wakeSkipsHold)
           ? { queueHeld: true }
           : {}),
