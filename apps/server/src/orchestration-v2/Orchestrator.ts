@@ -145,6 +145,8 @@ import {
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import { contextResetTurnItem } from "../ardud/context-reset/divider.ts";
+// ardud: archive only while idle
+import { idleBlocker, OrchestratorThreadNotIdleError } from "../ardud/archive-if-idle/idle.ts";
 // ardud missions: guard
 import { countsAsUserTurn } from "../ardud/missions/guard/turns.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -296,6 +298,7 @@ export const OrchestratorV2Error = Schema.Union([
   OrchestratorCommandIdConflictError,
   OrchestratorSubagentThreadReadOnlyError,
   OrchestratorThreadAboveModeLimitError,
+  OrchestratorThreadNotIdleError,
 ]);
 export type OrchestratorV2Error = typeof OrchestratorV2Error.Type;
 
@@ -2637,6 +2640,32 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandType: command.type,
           cause: `Thread ${command.threadId} is no longer empty.`,
         });
+    }
+    // ardud: the idle check runs under the thread's dispatch lock, so no work
+    // can land between it and the archive.
+    if (command.type === "thread.archive" && command.ifIdle !== undefined) {
+      const projection = yield* loadProjectionForCommand(
+        command,
+        ["runs", "runtimeRequests", "subagents", "providerThreads"],
+      );
+      const restartContinuation = yield* Effect.findFirst(
+        projection.runs.filter((run) => run.status !== "queued"),
+        awaitsRestartContinuation,
+      ).pipe(mapDispatchError(command));
+      const blocker = idleBlocker({
+        projection,
+        restartContinuationPending: Option.isSome(restartContinuation),
+        expectedNativeSessionId: command.ifIdle.expectedNativeSessionId,
+        now: yield* DateTime.now,
+      });
+      if (blocker !== null) {
+        return yield* new OrchestratorThreadNotIdleError({
+          commandId: command.commandId,
+          threadId: command.threadId,
+          reason: blocker.reason,
+          detail: blocker.detail,
+        });
+      }
     }
     if (command.type === "thread.archive" && thread.archivedAt !== null) {
       return yield* new OrchestratorDispatchError({

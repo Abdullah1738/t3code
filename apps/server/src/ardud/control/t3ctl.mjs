@@ -28,6 +28,7 @@ const HELP = `t3ctl <command> [options]
   respond THREAD REQUEST (--approve | --deny | --always | --answer KEY=VALUE ... | --dismiss)
   origin THREAD ORIGIN|none
   set THREAD [--mode RUNTIME_MODE] [--model M] [--variant V] [--title T] [--archive|--unarchive] [--settle|--unsettle]
+  archive-if-idle THREAD [--session NATIVE_SESSION_ID]   exits 3 when refused (thread left alone)
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
@@ -68,6 +69,7 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     settle: { type: "boolean" },
     unsettle: { type: "boolean" },
     thread: { type: "string" },
+    session: { type: "string" },
     types: { type: "string" },
     after: { type: "string" },
     text: { type: "boolean" },
@@ -234,6 +236,14 @@ async function main() {
           ...(flags.settle ? { settled: true } : flags.unsettle ? { settled: false } : {}),
         }),
       );
+    case "archive-if-idle": {
+      const result = await client.archiveIfIdle(need(args[0], "THREAD"), {
+        expectedSession: flags.session,
+      });
+      print(result);
+      if (!result?.archived) process.exitCode = 3;
+      return;
+    }
     case "events": {
       const controller = new AbortController();
       process.once("SIGINT", () => controller.abort());

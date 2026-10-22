@@ -34,12 +34,16 @@ const PREFIX = "/api/ardud/control";
  */
 
 export class ControlApiError extends Error {
-  /** @param {number} status @param {string} code @param {string} message */
-  constructor(status, code, message) {
+  /**
+   * @param {number} status @param {string} code @param {string} message
+   * @param {unknown} [body] the parsed response, for refusals that carry more than a message
+   */
+  constructor(status, code, message, body) {
     super(message);
     this.name = "ControlApiError";
     this.status = status;
     this.code = code;
+    this.body = body;
   }
 }
 
@@ -120,6 +124,7 @@ export class ControlClient {
         response.status,
         data?.error?.code ?? "http_error",
         data?.error?.message ?? `HTTP ${response.status}`,
+        data,
       );
     }
     return data;
@@ -251,6 +256,27 @@ export class ControlClient {
    */
   updateThread(threadId, settings) {
     return this.request("PATCH", `/threads/${encodeURIComponent(threadId)}`, settings);
+  }
+
+  /**
+   * Archives the thread only if it is idle when the server takes it, and, with
+   * `expectedSession`, still on that native session. A refusal resolves to
+   * `{ ok: false, archived: false, error: { code: "not_idle", reason, message } }`
+   * and leaves the thread alone.
+   * @param {string} threadId
+   * @param {{ expectedSession?: string }} [options]
+   */
+  async archiveIfIdle(threadId, options = {}) {
+    try {
+      return await this.request(
+        "POST",
+        `/threads/${encodeURIComponent(threadId)}/archive-if-idle`,
+        options.expectedSession ? { expectedSession: options.expectedSession } : {},
+      );
+    } catch (error) {
+      if (error instanceof ControlApiError && error.code === "not_idle") return error.body;
+      throw error;
+    }
   }
 
   /**

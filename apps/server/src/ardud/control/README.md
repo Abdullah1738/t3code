@@ -82,6 +82,7 @@ All paths are under `/api/ardud/control`.
 | GET    | `/threads/by-native/:sesId`                | Thread for an OpenCode session id (`ses_...`).                                              |
 | GET    | `/threads/:id`                             | Detail: state, current run, recent runs, pending requests.                                  |
 | PATCH  | `/threads/:id`                             | Change `runtimeMode`, `interactionMode`, `model`/`variant`, `title`, `archived`, `settled`. |
+| POST   | `/threads/:id/archive-if-idle`             | Archive only if the thread is still idle; otherwise refuse and leave it alone.              |
 | GET    | `/threads/:id/messages`                    | Messages plus `lastAssistant`.                                                              |
 | GET    | `/threads/:id/wait`                        | Long-poll until not running (or needs input).                                               |
 | POST   | `/threads/:id/send`                        | Send a message.                                                                             |
@@ -139,6 +140,24 @@ Defaults: the project's or environment's default model and runtime mode.
 Response (201): `threadId`, `projectId`, `directory`, `messageId`, `runId`,
 `status`, `model`, `runtimeMode`, `resumed` (true and HTTP 200 when
 `clientRequestId` replayed an earlier create).
+
+### POST /threads/:id/archive-if-idle
+
+`{ "expectedSession"?: "ses_..." }`. The server checks and archives in one step
+under the thread's dispatch lock, so nothing can start in between (a plain
+`PATCH { archived: true }` cancels whatever is queued). Idle means no live or
+queued run, no pending approval or question, no running subagent or background
+task, no pending wake (restart continuation, armed usage-limit auto resume, or a
+snooze not yet due) and, with `expectedSession`, the thread's active provider
+session is still that native session id.
+
+- 200 `{ "ok": true, "archived": true, "thread": <detail> }`
+- 409 `{ "ok": false, "archived": false, "error": { "code": "not_idle", "reason", "message" } }`
+  with `reason` one of `archived`, `running`, `queued`, `pending-request`,
+  `background-work`, `pending-wake`, `session-changed`. The thread is unchanged.
+- 404 `not_found` for an unknown or deleted thread.
+
+`t3ctl archive-if-idle THREAD [--session ses_...]` exits 3 when refused.
 
 ### GET /threads/:id/messages
 
