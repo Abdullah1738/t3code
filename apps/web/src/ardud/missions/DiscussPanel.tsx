@@ -131,7 +131,12 @@ function DiscussionThread(props: { request: OwnerRequest; onClose: () => void; n
       <DiscussionComposer
         reply
         onSend={(text) => replyRequest(request.id, text)}
-        onSettle={(note) => settleRequest(request.id, note)}
+        onSettle={(note) => {
+          // Settling hides the discussion at once; close first so the card
+          // does not flash an empty new-discussion box while it sends.
+          props.onClose();
+          return settleRequest(request.id, note);
+        }}
         onClose={props.onClose}
       />
     </section>
