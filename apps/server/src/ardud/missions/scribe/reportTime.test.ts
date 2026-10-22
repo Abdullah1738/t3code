@@ -4,6 +4,8 @@ import { dayWindow, reportPeriod, reportTitle, reportZone, zoneLabel } from "./r
 
 const dubai = reportZone({ reports: { dayBoundary: "Asia/Dubai" } });
 const berlin = reportZone({ reports: { dayBoundary: "Europe/Berlin" } });
+// Santiago skips its midnight on Sunday 6 Sep 2026: that day starts at 01:00.
+const santiago = reportZone({ reports: { dayBoundary: "America/Santiago" } });
 
 describe("report zones", () => {
   it("reads the day boundary zone and ignores a missing or unknown one", () => {
@@ -48,6 +50,25 @@ describe("day windows", () => {
       dayWindow(berlin!, { toIso: "2026-10-25T23:00:00.000Z", nowIso: "2026-10-26T12:00:00.000Z" }),
     ).toEqual({ from: "2026-10-24T22:00:00.000Z", to: "2026-10-25T23:00:00.000Z" });
   });
+
+  it("starts each day at its own start when a midnight is skipped", () => {
+    // Saturday ends at Sunday's 01:00 start; Saturday itself starts at midnight.
+    expect(dayWindow(santiago!, { nowIso: "2026-09-06T12:00:00.000Z" })).toEqual({
+      from: "2026-09-05T04:00:00.000Z",
+      to: "2026-09-06T04:00:00.000Z",
+    });
+    // Sunday is 23 hours, from its 01:00 start to Monday's midnight.
+    expect(dayWindow(santiago!, { nowIso: "2026-09-07T12:00:00.000Z" })).toEqual({
+      from: "2026-09-06T04:00:00.000Z",
+      to: "2026-09-07T03:00:00.000Z",
+    });
+  });
+
+  it("keeps a rolling day for an end that isn't a day start", () => {
+    expect(
+      dayWindow(dubai!, { toIso: "2026-10-22T04:30:00.000Z", nowIso: "2026-10-30T00:00:00.000Z" }),
+    ).toEqual({ from: "2026-10-21T04:30:00.000Z", to: "2026-10-22T04:30:00.000Z" });
+  });
 });
 
 describe("report periods", () => {
@@ -81,6 +102,12 @@ describe("report periods", () => {
     );
     expect(reportPeriod("2026-10-24T22:00:00.000Z", "2026-10-25T23:00:00.000Z", berlin)).toBe(
       "Sun 25 Oct (Berlin day)",
+    );
+    expect(reportPeriod("2026-09-05T04:00:00.000Z", "2026-09-06T04:00:00.000Z", santiago)).toBe(
+      "Sat 5 Sep (Santiago day)",
+    );
+    expect(reportPeriod("2026-09-06T04:00:00.000Z", "2026-09-07T03:00:00.000Z", santiago)).toBe(
+      "Sun 6 Sep (Santiago day)",
     );
   });
 

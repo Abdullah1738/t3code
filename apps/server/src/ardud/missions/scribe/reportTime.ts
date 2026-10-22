@@ -27,21 +27,28 @@ export const reportZone = (
 const zoned = (zone: DateTime.TimeZone, iso: string) =>
   DateTime.makeZonedUnsafe(iso, { timeZone: zone });
 
+/** Where a day starts in its zone: midnight, or the first hour after a skipped one. */
+const dayStart = (date: DateTime.Zoned) => DateTime.startOf(date, "day");
+
+const isDayStart = (date: DateTime.Zoned) =>
+  DateTime.toEpochMillis(dayStart(date)) === DateTime.toEpochMillis(date);
+
 /**
  * The day ending at `toIso` (or, with no end, the last whole day before
- * `nowIso`), midnight to midnight in `zone`. Day math runs on wall time, so a
- * day across a DST change is 23 or 25 hours.
+ * `nowIso`), day start to day start in `zone`, so a day across a DST change is
+ * 23 or 25 hours. An end that isn't a day start keeps a rolling day back.
  */
 export const dayWindow = (
   zone: DateTime.TimeZone,
   input: { readonly toIso?: string | undefined; readonly nowIso: string },
 ): { readonly from: string; readonly to: string } => {
   const end =
-    input.toIso === undefined
-      ? DateTime.startOf(zoned(zone, input.nowIso), "day")
-      : zoned(zone, input.toIso);
+    input.toIso === undefined ? dayStart(zoned(zone, input.nowIso)) : zoned(zone, input.toIso);
+  // Each bound is its own day's start: a day back from a skipped midnight
+  // lands an hour late.
+  const back = DateTime.subtract(end, { days: 1 });
   return {
-    from: DateTime.formatIso(DateTime.subtract(end, { days: 1 })),
+    from: DateTime.formatIso(isDayStart(end) ? dayStart(back) : back),
     to: DateTime.formatIso(end),
   };
 };
@@ -85,10 +92,11 @@ export const reportPeriod = (
   const to = wallParts(toIso, zone);
   if (from === null || to === null) return "";
   const label = zone === null ? "UTC" : zoneLabel(zone);
-  if (zone !== null && from.time === "00:00" && to.time === "00:00") {
+  if (zone !== null && isDayStart(zoned(zone, toIso))) {
     const window = dayWindow(zone, { toIso, nowIso: toIso });
-    const sameInstant = (left: string, right: string) => Date.parse(left) === Date.parse(right);
-    if (sameInstant(window.from, fromIso)) return `${from.weekday} ${from.day} (${label} day)`;
+    if (Date.parse(window.from) === Date.parse(fromIso)) {
+      return `${from.weekday} ${from.day} (${label} day)`;
+    }
   }
   return from.day === to.day
     ? `${from.day} ${from.time}–${to.time} ${label}`
