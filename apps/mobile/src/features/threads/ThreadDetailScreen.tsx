@@ -335,6 +335,7 @@ function useStreamingHaptics(threadId: ThreadId, feed: ReadonlyArray<ThreadFeedE
   }, [threadId, feed]);
 }
 
+const QUIET_RECONNECT_STATUS_DELAY_MS = 2_000;
 const USAGE_LIMITS_PANEL_GAP = 12;
 const USAGE_LIMITS_PANEL_MIN_HEIGHT = 44;
 
@@ -516,13 +517,35 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
       : Math.max(insets.bottom, 12);
   const composerKeyboardOffset = Platform.OS === "android" ? composerBottomInset : 0;
   const contentPresentationKind = props.contentPresentation.kind;
+  const liveConnectionStatus = connectionFloatingStatus({
+    connectionError: props.connectionError,
+    connectionState: props.connectionStateLabel,
+    environmentLabel: props.environmentLabel,
+    onReconnect: props.onReconnectEnvironment,
+  });
+  // A reconnect with no failure yet, typically the socket replaced after an app resume, usually
+  // finishes in a second or two while the cached thread stays readable, so it only shows if it
+  // lasts. Failures and offline show at once.
+  const quietReconnectLabel =
+    liveConnectionStatus?.kind === "connection" &&
+    liveConnectionStatus.tone === "reconnecting" &&
+    props.connectionError === null
+      ? liveConnectionStatus.label
+      : null;
+  const shownQuietReconnectLabel = useDelayedStatus(
+    selectedThreadKey,
+    quietReconnectLabel,
+    QUIET_RECONNECT_STATUS_DELAY_MS,
+  );
+  const connectionStatus =
+    quietReconnectLabel !== null && shownQuietReconnectLabel === null ? null : liveConnectionStatus;
   const realThreadSyncLabel = (() => {
     switch (props.threadSyncStatus) {
       case "empty":
       case "cached":
       case "synchronizing":
         if (contentPresentationKind === "ready") {
-          return "Syncing messages...";
+          return quietReconnectLabel === null ? "Syncing messages..." : null;
         }
         return contentPresentationKind === "loading" ? "Loading messages..." : null;
       default:
@@ -534,12 +557,6 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
     props.selectedThread.pendingBackgroundTasks,
   );
   const floatingStatus = ((): FloatingWorkingStatus | null => {
-    const connectionStatus = connectionFloatingStatus({
-      connectionError: props.connectionError,
-      connectionState: props.connectionStateLabel,
-      environmentLabel: props.environmentLabel,
-      onReconnect: props.onReconnectEnvironment,
-    });
     if (connectionStatus !== null) {
       return connectionStatus;
     }
@@ -609,7 +626,6 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
     agentsSegment !== null ||
     devicePreviews.length > 0 ||
     browserTabs.tabs.length > 0 ||
-    props.connectionStateLabel !== "connected" ||
     props.queuedMessages.length > 0 ||
     props.selectedThreadFeed.some(
       (entry) => "acknowledged" in entry && entry.acknowledged === true,

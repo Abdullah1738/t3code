@@ -18,6 +18,7 @@ import {
 } from "./workspace-connection-status";
 
 const STATUS_SHOW_DELAY_MS = 800;
+const PROGRESS_STATUS_SHOW_DELAY_MS = 2_000;
 const FADE_IN_MS = 250;
 
 type ConnectionStatus = WorkspaceConnectionStatusPresentation & {
@@ -37,22 +38,29 @@ export function WorkspaceConnectionStatusProvider(props: { readonly children: Re
   const { state } = useWorkspaceState();
   const presentation = workspaceConnectionStatusPresentation(state);
   const hasStatus = presentation !== null;
+  const label = presentation?.label;
+  const showsProgress = presentation?.showsProgress ?? false;
   const [phase, setPhase] = useState<"waiting" | "fading" | "shown">("waiting");
 
   useEffect(() => {
     if (!hasStatus) return;
-    const timers = [
-      setTimeout(() => setPhase("fading"), STATUS_SHOW_DELAY_MS),
-      setTimeout(() => setPhase("shown"), STATUS_SHOW_DELAY_MS + FADE_IN_MS),
-    ];
-    return () => {
-      for (const timer of timers) clearTimeout(timer);
-      setPhase("waiting");
-    };
+    return () => setPhase("waiting");
   }, [hasStatus]);
 
-  const label = presentation?.label;
-  const showsProgress = presentation?.showsProgress ?? false;
+  // Progress with no failure (a reconnect after an app resume, a thread list catching up) waits
+  // longer, since the cached list stays usable meanwhile. Offline and failures keep the short wait.
+  useEffect(() => {
+    if (!hasStatus || phase === "shown") return;
+    const timer =
+      phase === "waiting"
+        ? setTimeout(
+            () => setPhase("fading"),
+            showsProgress ? PROGRESS_STATUS_SHOW_DELAY_MS : STATUS_SHOW_DELAY_MS,
+          )
+        : setTimeout(() => setPhase("shown"), FADE_IN_MS);
+    return () => clearTimeout(timer);
+  }, [hasStatus, phase, showsProgress]);
+
   const status = useMemo(
     () =>
       label === undefined || phase === "waiting"
