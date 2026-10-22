@@ -4,6 +4,7 @@ Watcher checks supply already-read evidence. No polling process or merchant
 request is started here. Only the allowlisted view is written to the web root.
 """
 import argparse
+from collections import Counter
 import datetime as dt
 import fcntl
 import hashlib
@@ -109,11 +110,145 @@ def items(rows):
         if price is None and row.get('price_minor') is not None:
             price = number(row['price_minor'])
             price = price / 100 if price is not None else None
+        # Choices are the server's own label (size, sauce, sides). Notes and
+        # special requests are the customer's free text and never reach a card.
+        # Talabat allows 600 characters; keep them all so two long labels that differ only
+        # at the end stay different. The bubble trims at display time.
+        detail = next((text(row[k], 600) for k in ('detail', 'choices_text', 'choicesString', 'choices')
+                       if isinstance(row.get(k), str) and row[k].strip()), None)
         out.append({'name': name or (f'Item {ident}' if ident else 'Item details pending'),
-                    'unresolved': bool(row.get('unresolved') or not name),
+                    'unresolved': bool(row.get('unresolved') or not name), 'detail': detail,
                     'qty': int(qty), 'price': price, 'line_total': amount(row.get('line_total')),
                     'image': image_url(row.get('image_url') or row.get('image') or row.get('imageUrl'))})
     return out
+
+
+def fill_details(rows, observed):
+    """Add choices from the tracking read to stored rows that lack them.
+
+    A choice is only attached when the pairing is certain: the open stored
+    lines and the read's remaining lines agree in count and quantity, and
+    either there is one of each or every read line has the same choices.
+    Otherwise, when no stored line of that dish has choices yet, the read's
+    own lines replace the dish's lines without per-line prices, so a variant
+    is never shown next to another variant's price. A conflict (a stored
+    variant the read shows with another quantity) leaves the dish as stored."""
+    key = lambda i: i['name'].casefold()
+    plan = {}
+    for k in {key(r) for r in rows}:
+        mine = [r for r in rows if key(r) == k]
+        theirs = [i for i in observed if key(i) == k]
+        if not any(i['detail'] for i in theirs):
+            continue
+        # Lines that already carry their choices claim the read line with the
+        # same choices and quantity.
+        conflict = False
+        for r in mine:
+            if not r.get('detail'):
+                continue
+            same = [i for i in theirs if (i['detail'] or '').casefold() == r['detail'].casefold()]
+            hit = next((i for i in same if i['qty'] == r['qty']), None)
+            if hit:
+                theirs.remove(hit)
+            elif same:
+                conflict = True
+        open_rows = [r for r in mine if not r.get('detail')]
+        if (conflict or not open_rows or len(open_rows) != len(theirs)
+                or sum(r['qty'] for r in open_rows) != sum(i['qty'] for i in theirs)):
+            continue
+        details = {i['detail'] for i in theirs}
+        if len(details) == 1:
+            if None not in details and sorted(r['qty'] for r in open_rows) == sorted(i['qty'] for i in theirs):
+                plan[k] = ('fill', theirs[0]['detail'])
+        elif len(open_rows) == len(mine):
+            plan[k] = ('swap', theirs)
+    out, swapped = [], set()
+    for row in rows:
+        k = key(row)
+        how = plan.get(k)
+        if not how or row.get('detail'):
+            out.append(row)
+        elif how[0] == 'fill':
+            out.append({**row, 'detail': how[1]})
+        elif k not in swapped:
+            swapped.add(k)
+            out.extend({**i, 'price': None, 'line_total': None} for i in how[1])
+    return out
+
+
+def choice_parts(detail):
+    """A choices label split on its top-level commas, so "Half & Half (Chicken, Beef)" stays
+    one choice. When brackets or quotes don't pair up, the label stays whole."""
+    pairs = {')': '(', ']': '[', '}': '{', '”': '“'}
+    parts, stack, quoted, start = [], [], False, 0
+    for n, ch in enumerate(detail):
+        if ch == '"':
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif ch in '([{“':
+            stack.append(ch)
+        elif ch in pairs:
+            if not stack or stack.pop() != pairs[ch]:
+                return [detail]
+        elif ch == ',' and not stack:
+            parts.append(detail[start:n])
+            start = n + 1
+    if stack or quoted:
+        return [detail]
+    parts.append(detail[start:])
+    return [p.strip() for p in parts if p.strip()] or [detail]
+
+
+def picks(rows):
+    """Bubble label for a dish ordered more than once. It leads with choices that set this line
+    apart from every other variant of the dish, closest variant first, so the cut-off tail is
+    what they share. Choices are counted, so a second "Cheese" is a difference. The full page
+    keeps the server's order."""
+    def key(part):
+        return ' '.join(part.split()).casefold()
+    groups = {}
+    for i in rows:
+        if i.get('detail'):
+            groups.setdefault(i['name'].casefold(), []).append(Counter(map(key, choice_parts(i['detail']))))
+    out = []
+    for i in rows:
+        pick = None
+        if i.get('detail'):
+            parts = choice_parts(i['detail'])
+            mine = Counter(map(key, parts))
+            # Identical lines can't be told apart anyway, and a line that holds all of this
+            # one's choices and more doesn't say which of them matter, so neither counts.
+            open_ = [d for d in (mine - other for other in groups[i['name'].casefold()]) if d]
+            order = {}
+            for n, p in enumerate(parts):
+                order.setdefault(key(p), n)
+            lead = []
+            # Greedy cover: each variant still looking the same gets one of its differences
+            # up front, the closest variants first, preferring a choice that splits off several.
+            while open_:
+                least = min(sum(d.values()) for d in open_)
+                pool = {k for d in open_ if sum(d.values()) == least for k in d}
+                k = min(pool, key=lambda k: (-sum(1 for d in open_ if d[k]), order[k]))
+                lead.append(k)
+                open_ = [d for d in open_ if not d[k]]
+            if lead:
+                used, first = set(), []
+                for k in lead:
+                    n = next(n for n, p in enumerate(parts) if n not in used and key(p) == k)
+                    used.add(n)
+                    first.append(parts[n])
+                pick = text(', '.join(first + [p for n, p in enumerate(parts) if n not in used]), 160)
+        out.append({**i, 'pick': pick} if pick else i)
+    return out
+
+
+def names(rows, limit=160):
+    """Short item line for the bubble: one entry per dish, quantities merged."""
+    counts = {}
+    for i in rows:
+        counts[i['name']] = counts.get(i['name'], 0) + i['qty']
+    return text(' · '.join(f'{n} ×{q}' if q > 1 else n for n, q in counts.items()), limit)
 
 
 def commerce_metadata(flow, vertical):
@@ -226,10 +361,10 @@ def eta(data, cfg):
     at = checked + dt.timedelta(minutes=minutes) if checked and minutes is not None and 0 <= minutes < 2880 else None
     at = at or instant(data.get('eta')) or instant(cfg.get('eta'))
     if not at:
-        return '—', raw or 'Waiting for an estimate', None
+        return raw or 'No estimate yet', '', None
     local = at.astimezone(DUBAI)
     now = dt.datetime.now(DUBAI)
-    prefix = 'Expected by' if local.date() == now.date() else local.strftime('%a %-d %b · by')
+    prefix = 'Expected by' if local.date() == now.date() else local.strftime('Expected %a %-d %b by')
     return local.strftime('%H:%M'), prefix, at.isoformat()
 
 
@@ -239,7 +374,7 @@ def view(cfg, data, meta):
     steps, idx, label, terminal = stage(data, food)
     big, sub, at = eta(data, cfg)
     if terminal:
-        big, sub, at = label, ('Delivery confirmed' if label == 'Delivered' else 'Order closed'), None
+        big, sub, at = label, '', None
     app = cfg['app']
     brand = NAMES[app] + (' ' + LABELS[vertical] if vertical else '')
     store = text(meta.get('store') or cfg.get('store') or data.get('vendor_name'))
@@ -249,12 +384,16 @@ def view(cfg, data, meta):
     observed = items(data.get('manifest_items') or data.get('items'))
     if not rows or (observed and any(not i['unresolved'] for i in observed) and all(i['unresolved'] for i in rows)):
         rows = observed or rows
+    else:
+        rows = fill_details(rows, observed)
+    rows = picks(rows)
     total = amount(meta.get('total') if meta.get('total') is not None else cfg.get('total'))
     partial = bool(data.get('whole_order_complete') is False and (
         any(p.get('stage') == 'delivered' for p in data.get('partial_evidence', [])) or
         any(p.get('status') == 'delivered' for p in data.get('shipments', []))))
     return {'version': 1, 'app': app, 'vertical': vertical, 'brand': brand, 'store': store,
             'order': cfg['order'], 'big': big, 'sub': sub, 'eta': at, 'stage': label,
+            'word': at is None, 'summary': names(rows),
             'steps': steps, 'index': idx, 'terminal': terminal, 'partial': partial,
             'checked_at': data.get('checked_at'), 'unavailable': bool(data.get('errors')),
             'items': rows, 'count': sum(i['qty'] for i in rows) if rows else data.get('manifest_item_count'),
@@ -267,6 +406,13 @@ def description(v):
                                   f"{v['currency']} {v['total']:,.2f}" if v['total'] is not None else '') if x)
 
 
+def head_class(v):
+    # A worded estimate ("Expected Wednesday 23 September") is set smaller so the date stays whole.
+    if not v.get('word', v['terminal']):
+        return ''
+    return 'word long' if len(v['big']) > 16 else 'word'
+
+
 def markup(v):
     e = lambda x: html.escape(str(x or ''), quote=True)
     progress = ''.join(f'<li class="{"on" if i <= v["index"] else ""}"' +
@@ -277,15 +423,23 @@ def markup(v):
         photo = f'<img src="{e(i["image"])}" alt="" width="56" height="56" loading="lazy" referrerpolicy="no-referrer">' if i['image'] else ''
         line = i['line_total'] if i['line_total'] is not None else i['price'] * i['qty'] if i['price'] is not None else None
         price = f'<span class="price">{line:,.2f}</span>' if line is not None else ''
-        rows.append(f'<li class="{"has-photo" if photo else ""}">{photo}<span class="name">{e(i["name"])}<span class="qty"> ×{i["qty"]}</span></span>{price}</li>')
+        detail = f'<span class="detail" dir="auto">{e(i["detail"])}</span>' if i.get('detail') else ''
+        detail += f'<span class="pick" dir="auto">{e(i["pick"])}</span>' if i.get('pick') else ''
+        rows.append(f'<li class="{"has-photo" if photo else ""}">{photo}<span class="name"><span class="dish">{e(i["name"])}</span><span class="qty"> ×{i["qty"]}</span>{detail}</span>{price}</li>')
     heading = f'{v["count"]} item' + ('' if v['count'] == 1 else 's') if v['count'] is not None else 'Your order'
     total = f'<p class="total">Total<span><small>{e(v["currency"])}</small> {v["total"]:,.2f}</span></p>' if v['total'] is not None else ''
+    tally = ' · '.join(x for x in (heading if v['count'] is not None else '',
+                                   f'{v["currency"]} {v["total"]:,.2f}' if v['total'] is not None else '') if x)
+    summary = f'<p class="summary">{e(tally)}</p>' if tally else ''
+    # The bubble lists the first lines whole; past three it says how many are left.
+    more = f'<p class="more">+{len(rows) - 2} more</p>' if len(rows) > 3 else ''
+    when = f'<p class="when">{e(v["sub"])}</p>' if v['sub'] else ''
     return f'''<header class="eta"><div class="store">{e(v['brand'])}<span>{e(v['store'])}</span><span class="order">{e(v['order'])}</span></div>
-<h1 class="{'word' if v['terminal'] else ''}">{e(v['big'])}</h1><p class="when">{e(v['sub'])}</p></header>
+{when}<h1 class="{head_class(v)}">{e(v['big'])}</h1></header>
 <section aria-label="Delivery progress"><p class="status" role="status">{e(v['stage'])}</p>
 {'' if v['stage'] == 'Cancelled' else f'<ol class="steps" style="--steps:{len(v["steps"])}">{progress}</ol>'}
-{'<p class="notice">Part delivered · remaining items still tracked</p>' if v['partial'] else ''}</section>
-<section aria-labelledby="items-title"><h2 id="items-title">{e(heading)}</h2><ul class="items">{''.join(rows)}</ul>
+{'<p class="notice">Part delivered<span> · remaining items still tracked</span></p>' if v['partial'] else ''}{summary}</section>
+<section aria-labelledby="items-title"><h2 id="items-title">{e(heading)}</h2><ul class="items">{''.join(rows)}</ul>{more}
 {'' if rows else '<p class="empty">Item details haven’t been added yet.</p>'}{total}</section>
 <footer><p id="freshness">{'Sample order' if v['sample'] else 'Latest tracking check'}<time datetime="{e(v['checked_at'])}"></time></p><button type="button" id="refresh">Refresh</button></footer>'''
 
@@ -322,10 +476,14 @@ def preview(path, v):
         draw.text((64, y), value, fill=v['theme'][1], font=font(size))
     fitted(v['brand'], 44, 40)
     fitted(v['store'], 32, 106)
-    fitted(v['big'], 180, 160)
-    fitted(v['sub'], 38, 380)
-    fitted(description(v), 32, 460)
-    fitted('Sample order' if v['sample'] else 'Open for the latest tracking', 26, 550)
+    # The label reads before the time it qualifies ("Expected by" / "18:06").
+    if v['sub']:
+        fitted(v['sub'], 38, 178)
+    fitted(v['big'], 180 if not v.get('word') else 120, 220 if v['sub'] else 180)
+    fitted(description(v), 32, 440)
+    if v.get('summary'):
+        fitted(v['summary'], 28, 492)
+    fitted('Sample order' if v['sample'] else 'Open for the latest tracking', 26, 556)
     tmp = path.with_name('preview.tmp.png')
     im.save(tmp)
     tmp.replace(path)
@@ -339,7 +497,7 @@ def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
     # JSON refresh and static fallback use the same projection.
     atomic(folder / 'status.json', v)
     atomic(folder / 'index.html', page(v, url))
-    fingerprint = hashlib.sha256(json.dumps({k: v[k] for k in ('brand', 'store', 'big', 'sub', 'stage', 'count', 'total', 'sample')}, sort_keys=True).encode()).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps({k: v[k] for k in ('brand', 'store', 'big', 'sub', 'stage', 'count', 'total', 'sample', 'summary')}, sort_keys=True).encode()).hexdigest()
     if read(folder / 'preview-state.json').get('hash') != fingerprint or not (folder / 'preview.png').exists():
         preview(folder / 'preview.png', v)
         atomic(folder / 'preview-state.json', {'hash': fingerprint})

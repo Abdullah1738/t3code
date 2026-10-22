@@ -94,6 +94,15 @@ class OrderLinesTest(unittest.TestCase):
         self.assertEqual(info['lines'][1]['note'], 'Extra crispy')
         self.assertIsNone(info['lines'][0]['note'])
 
+    def test_tracking_items_carry_choices_but_never_notes(self):
+        with patch.object(http, 'visible_details', return_value={'status_text': None, 'status_text_source': None}), \
+                patch('talabat_delivery_address.project', return_value={}):
+            result = http.project(tracking(), '3969819746')
+        self.assertEqual(result['items'], [
+            {'name': 'Spicy Chicken Ranch Pizza\U0001f336\ufe0f', 'quantity': 1, 'choices': 'No Jalapenos'},
+            {'name': 'Crispy Chicken Strips', 'quantity': 2, 'choices': 'Hot Honey Sauce (Cal:97 P:1g F:2g C:18g)'}])
+        self.assertNotIn('Extra crispy', str(result['items']))
+
     def test_unreferenced_widget_fails_closed(self):
         with self.assertRaisesRegex(http.TalabatError, 'ORDER_DETAILS_UNAVAILABLE'):
             items.order_lines(tracking(referenced=False), '1')

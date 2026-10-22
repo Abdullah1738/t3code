@@ -56,6 +56,147 @@ class CardTests(unittest.TestCase):
         self.assertEqual(c.eta({**d,'eta_text':'1 hr 5 min'}, {})[0], '13:05')
         self.assertIsNone(c.eta({'eta_text':'in 8 min'}, {})[2])
 
+    def test_label_reads_before_the_time_and_no_estimate_is_a_word(self):
+        d = {'checked_at':'2026-10-22T08:00:00Z','eta_text':'Arrives in 25-35 mins'}
+        v = c.view(self.cfg, d, self.cfg['card_meta'])
+        self.assertEqual((v['big'], v['word']), ('12:35', False))
+        self.assertRegex(v['sub'], r'^Expected (\w{3} \d+ \w{3} )?by$')
+        doc = c.markup(v)
+        self.assertLess(doc.index('class="when"'), doc.index('<h1'))
+        v = c.view(self.cfg, self.data, self.cfg['card_meta'])
+        self.assertEqual((v['big'], v['sub'], v['word']), ('No estimate yet', '', True))
+        self.assertNotIn('class="when"', c.markup(v))
+        self.assertIn('<h1 class="word">', c.markup(v))
+        dated = c.view(self.cfg, {**self.data, 'eta_text':'Expected Wednesday 23 September'}, self.cfg['card_meta'])
+        self.assertEqual((dated['big'], dated['word']), ('Expected Wednesday 23 September', True))
+        self.assertIn('<h1 class="word long">', c.markup(dated))
+        # The whole worded estimate reaches the page; only the bubble trims how it shows.
+        window = 'Expected Wednesday 23 September between 17:00 and 19:00'
+        self.assertEqual(c.view(self.cfg, {**self.data, 'eta_text': window}, self.cfg['card_meta'])['big'], window)
+        done = c.view(self.cfg, {**self.data, 'status':'delivered'}, self.cfg['card_meta'])
+        self.assertEqual((done['big'], done['sub'], done['word']), ('Delivered', '', True))
+
+    def test_variants_tell_same_dish_apart_and_notes_stay_private(self):
+        rows = c.items([
+            {'name':'Grilled Shrimp','qty':1,'choicesString':'200g, Satay Sauce, Sweet Potato','specialRequest':'ring twice'},
+            {'name':'Grilled Shrimp','qty':1,'choices':[812, 913]},
+            {'name':'Organic Eggs','quantity':1,'note':'leave at door'}])
+        self.assertEqual([r['detail'] for r in rows], ['200g, Satay Sauce, Sweet Potato', None, None])
+        observed = c.items([{'name':'grilled shrimp','quantity':1,'choices':'200g, Satay Sauce, Sweet Potato'},
+                            {'name':'Grilled Shrimp','quantity':1,'choices':'100g'}])
+        filled = c.fill_details(rows, observed)
+        self.assertEqual([r['detail'] for r in filled], ['200g, Satay Sauce, Sweet Potato', '100g', None])
+        meta = {'items': rows, 'total': 141.7}
+        v = c.view(self.cfg, {**self.data, 'items':[{'name':'Grilled Shrimp','quantity':1,'choices':'100g'}]}, meta)
+        doc = c.markup(v)
+        self.assertIn('<span class="detail" dir="auto">200g, Satay Sauce, Sweet Potato</span>', doc)
+        self.assertIn('<span class="detail" dir="auto">100g</span>', doc)
+        self.assertNotIn('ring twice', doc + json.dumps(v))
+        self.assertNotIn('leave at door', doc + json.dumps(v))
+        self.assertEqual(v['summary'], 'Grilled Shrimp ×2 · Organic Eggs')
+        self.assertIn('<p class="summary">3 items · AED 141.70</p>', doc)
+        self.assertNotIn('class="more"', doc)
+        many = c.view(self.cfg, self.data, {'items': [{'name': f'Item {n}', 'qty': 1} for n in range(5)]})
+        self.assertIn('<p class="more">+3 more</p>', c.markup(many))
+
+    def test_repeated_dish_leads_with_the_choices_that_differ(self):
+        pizza = 'Spicy Chicken Ranch Pizza with Cheese'
+        rows = c.items([{'name': pizza, 'qty': 1, 'choicesString': 'Large, thin crust, stuffed cheese, No Jalapenos'},
+                        {'name': pizza, 'qty': 1, 'choicesString': 'Large, thin crust, stuffed cheese, Extra Jalapenos'},
+                        {'name': 'Garlic Bread', 'qty': 1, 'choicesString': 'Large, thin crust'}])
+        v = c.view(self.cfg, self.data, {'items': rows})
+        self.assertEqual([i.get('pick') for i in v['items']],
+                         ['No Jalapenos, Large, thin crust, stuffed cheese',
+                          'Extra Jalapenos, Large, thin crust, stuffed cheese', None])
+        doc = c.markup(v)
+        # The full page keeps the server's order; the lead label is extra, for the bubble.
+        self.assertIn('<span class="detail" dir="auto">Large, thin crust, stuffed cheese, No Jalapenos</span>'
+                      '<span class="pick" dir="auto">No Jalapenos, Large, thin crust, stuffed cheese</span>', doc)
+        same = c.view(self.cfg, self.data, {'items': c.items([{'name': pizza, 'qty': 1, 'choicesString': 'Large'}] * 2)})
+        self.assertNotIn('class="pick"', c.markup(same))
+
+    def test_picks_set_each_line_apart_from_its_closest_sibling(self):
+        pizza = 'Spicy Chicken Ranch Pizza with Cheese'
+
+        def picked(*details):
+            rows = c.items([{'name': pizza, 'qty': 1, 'choicesString': d} for d in details])
+            return [i.get('pick') for i in c.picks(rows)]
+        # A third variant that shares nothing with the first two must not hide their difference.
+        # A line whose difference already leads still gets the label (and the wider room).
+        self.assertEqual(picked('Large, thin crust, stuffed cheese, No Jalapenos',
+                                'Large, thin crust, stuffed cheese, Extra Jalapenos',
+                                'Small, thick crust, regular cheese, No Jalapenos'),
+                         ['No Jalapenos, Large, thin crust, stuffed cheese',
+                          'Extra Jalapenos, Large, thin crust, stuffed cheese',
+                          'Small, thick crust, regular cheese, No Jalapenos'])
+        # The closest variant's difference can be one the other two share; each line
+        # still leads with something that sets it apart from every variant.
+        base = 'Large, thin crust, stuffed cheese'
+        self.assertEqual(picked(f'{base}, Chicken, Bacon, Extra cheese', f'{base}, Beef, Olives, Extra cheese',
+                                f'{base}, Chicken, Bacon, Beef, Olives'),
+                         [f'Extra cheese, Chicken, {base}, Bacon', f'Extra cheese, Beef, {base}, Olives',
+                          f'Chicken, Beef, {base}, Bacon, Olives'])
+        # A repeated choice counts.
+        self.assertEqual(picked('Large, thin crust, Cheese', 'Large, thin crust, Cheese, Cheese'),
+                         [None, 'Cheese, Large, thin crust, Cheese'])
+        # Commas inside brackets belong to one choice; unpaired brackets keep the label whole.
+        self.assertEqual(picked('Large, Half & Half (Chicken, Beef)', 'Large, Half & Half (Chicken, Tofu)'),
+                         ['Half & Half (Chicken, Beef), Large', 'Half & Half (Chicken, Tofu), Large'])
+        self.assertEqual(picked('Half & Half (Chicken, Beef), Large', 'Half & Half (Chicken, Tofu), Large'),
+                         ['Half & Half (Chicken, Beef), Large', 'Half & Half (Chicken, Tofu), Large'])
+        self.assertEqual(picked('Large, Extra (cheese', 'Large, Extra (beef'),
+                         ['Large, Extra (cheese', 'Large, Extra (beef'])
+        self.assertEqual(c.choice_parts('Large, "Chef, special", Mild'), ['Large', '"Chef, special"', 'Mild'])
+        self.assertEqual(c.choice_parts('Large, Half (Chicken, Beef], Mild'), ['Large, Half (Chicken, Beef], Mild'])
+        # A line holding both choices doesn't hide what sets the other two apart.
+        base = 'Large, thin crust, stuffed cheese'
+        self.assertEqual(picked(f'{base}, Cheese', f'{base}, Olives', f'{base}, Cheese, Olives'),
+                         [f'Cheese, {base}', f'Olives, {base}', f'Cheese, Olives, {base}'])
+        # Long labels that differ only at the end keep the difference.
+        long = 'Large, ' + ', '.join(f'Topping {n}' for n in range(16))
+        self.assertGreater(len(long), 160)
+        self.assertEqual(picked(f'{long}, No Jalapenos', f'{long}, Extra Jalapenos'),
+                         [f'No Jalapenos, {long}'[:160], f'Extra Jalapenos, {long}'[:160]])
+        # Arabic choices keep their own direction, so the cut falls on the shared tail.
+        rows = c.picks(c.items([{'name': pizza, 'qty': 1, 'choicesString': d}
+                                for d in ('كبير, بدون فلفل', 'كبير, فلفل إضافي')]))
+        doc = c.markup({**c.view(self.cfg, self.data, {}), "items": rows})
+        self.assertIn('<span class="pick" dir="auto">بدون فلفل, كبير</span>', doc)
+
+    def test_unpaired_variants_never_borrow_another_lines_price(self):
+        stored = c.items([{'name':'Grilled Shrimp','qty':1,'line_total':40.5},
+                          {'name':'Grilled Shrimp','qty':1,'line_total':73.8},
+                          {'name':'Organic Eggs','qty':1,'line_total':22.5}])
+        read = c.items([{'name':'Organic Eggs','quantity':1},
+                        {'name':'Grilled Shrimp','quantity':1,'choices':'200g, Satay Sauce, Sweet Potato'},
+                        {'name':'Grilled Shrimp','quantity':1,'choices':'100g'}])
+        rows = c.fill_details(stored, read)
+        self.assertEqual([(r['name'], r['detail'], r['line_total']) for r in rows], [
+            ('Grilled Shrimp', '200g, Satay Sauce, Sweet Potato', None), ('Grilled Shrimp', '100g', None),
+            ('Organic Eggs', None, 22.5)])
+        # Quantities that don't add up leave the stored lines alone.
+        short = c.fill_details(stored, read[:2])
+        self.assertEqual([r['detail'] for r in short], [None, None, None])
+        # Same choices on every line pair safely with prices kept.
+        same = c.fill_details(stored[:2], c.items([{'name':'Grilled Shrimp','quantity':1,'choices':'100g'}] * 2))
+        self.assertEqual([(r['detail'], r['line_total']) for r in same], [('100g', 40.5), ('100g', 73.8)])
+
+    def test_variant_pairing_respects_quantities(self):
+        stored = c.items([{'name':'Grilled Shrimp','qty':2,'choicesString':'100g','line_total':81},
+                          {'name':'Grilled Shrimp','qty':1,'line_total':73.8}])
+        # The read shows 100g once, not twice: which line is which is unknown, so nothing moves.
+        read = c.items([{'name':'Grilled Shrimp','quantity':1,'choices':'100g'},
+                        {'name':'Grilled Shrimp','quantity':2,'choices':'200g'}])
+        self.assertEqual(c.fill_details(stored, read), stored)
+        # A matching quantity pairs as before.
+        read = c.items([{'name':'Grilled Shrimp','quantity':2,'choices':'100g'},
+                        {'name':'Grilled Shrimp','quantity':1,'choices':'200g'}])
+        self.assertEqual([(r['detail'], r['line_total']) for r in c.fill_details(stored, read)],
+                         [('100g', 81), ('200g', 73.8)])
+        # One line each, quantities differ: no fill.
+        one = c.items([{'name':'Grilled Shrimp','qty':2,'line_total':81}])
+        self.assertEqual(c.fill_details(one, c.items([{'name':'Grilled Shrimp','quantity':1,'choices':'100g'}])), one)
+
     def test_one_public_link_and_no_progress_send(self):
         first = c.sync(self.cfg, self.data, send=True)
         self.assertEqual(first['status'], 'sent')

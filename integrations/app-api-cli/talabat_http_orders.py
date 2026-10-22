@@ -304,7 +304,10 @@ def project(data, order):
     try:
         from talabat_order_items import order_lines
         display = order_lines(data, order)
-        result['items'] = [{'name': row['name'], 'quantity': row['quantity']} for row in display['lines']]
+        # Choices tell two lines of the same dish apart; the free-text note stays out.
+        result['items'] = [{'name': row['name'], 'quantity': row['quantity'],
+                            **({'choices': row['choices_text']} if row['choices_text'] else {})}
+                           for row in display['lines']]
         result['vendor_name'] = display['vendor_name']
     except (TalabatError, ValueError, TypeError, KeyError):
         pass
