@@ -3,6 +3,7 @@ import {
   type OrchestrationV2ThreadProjection,
   ThreadId,
 } from "@t3tools/contracts";
+import { latestExecutedRun } from "@t3tools/shared/orchestrationV2ThreadError";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
@@ -41,7 +42,13 @@ export interface IdleBlocker {
 export interface IdleInput {
   readonly projection: Pick<
     OrchestrationV2ThreadProjection,
-    "thread" | "runs" | "runtimeRequests" | "subagents" | "providerThreads"
+    | "thread"
+    | "runs"
+    | "attempts"
+    | "runtimeRequests"
+    | "subagents"
+    | "providerThreads"
+    | "providerTurns"
   >;
   /** A run whose restart continuation is still owed, so the thread wakes on its own. */
   readonly restartContinuationPending: boolean;
@@ -82,6 +89,24 @@ export const idleBlocker = (input: IdleInput): IdleBlocker | null => {
       detail: `Thread ${thread.id} still runs ${background.map(describeWork).join("; ")}.`,
     };
   }
+  // A native subagent's child thread runs provider turns that belong to no
+  // app run, so its run list stays empty while it works.
+  const runlessTurn = input.projection.providerTurns.find(
+    (turn) => turn.runAttemptId === null && LIVE_TURN_STATUSES.has(turn.status),
+  );
+  if (runlessTurn !== undefined) {
+    return {
+      reason: "background-work",
+      detail: `Thread ${thread.id} has provider turn ${runlessTurn.id} ${runlessTurn.status}.`,
+    };
+  }
+  const delivery = owedDelegatedCompletion(input.projection);
+  if (delivery !== null) {
+    return {
+      reason: "pending-wake",
+      detail: `Thread ${thread.id} still owes run ${delivery} a delegated task report.`,
+    };
+  }
   if (input.restartContinuationPending) {
     return {
       reason: "pending-wake",
@@ -102,19 +127,60 @@ export const idleBlocker = (input: IdleInput): IdleBlocker | null => {
     };
   }
   if (input.expectedNativeSessionId !== undefined) {
-    const active = input.projection.providerThreads.find(
-      (providerThread) => providerThread.id === thread.activeProviderThreadId,
-    );
-    const native = active?.nativeThreadRef?.nativeId ?? null;
-    if (native !== input.expectedNativeSessionId) {
-      return {
-        reason: "session-changed",
-        detail:
-          native === null
-            ? `Thread ${thread.id} has no active native session, not ${input.expectedNativeSessionId}.`
-            : `Thread ${thread.id} is on native session ${native}, not ${input.expectedNativeSessionId}.`,
-      };
+    const changed = sessionChange(input.projection, input.expectedNativeSessionId);
+    if (changed !== null) {
+      return { reason: "session-changed", detail: `Thread ${thread.id} ${changed}.` };
     }
+  }
+  return null;
+};
+
+const LIVE_TURN_STATUSES = new Set(["pending", "running"]);
+const OWED_TASK_DELIVERIES = new Set(["pending", "claimed"]);
+
+/** The run still owed a delegated task report, which wakes the thread when sent. */
+const owedDelegatedCompletion = (projection: IdleInput["projection"]): string | null => {
+  const open = projection.runs.filter((run) => run.delegatedCompletion?.disposition === "open");
+  const reserved = open.find((run) => (run.delegatedCompletion?.delivery?.taskIds.length ?? 0) > 0);
+  if (reserved !== undefined) return reserved.id;
+  const openIds = new Set<string>(open.map((run) => run.id));
+  const task = projection.subagents.find(
+    (subagent) =>
+      subagent.runId !== null &&
+      openIds.has(subagent.runId) &&
+      subagent.completionDelivery !== undefined &&
+      OWED_TASK_DELIVERIES.has(subagent.completionDelivery.state),
+  );
+  return task?.runId ?? null;
+};
+
+/**
+ * The active provider thread pointer also moves when an older provider thread
+ * is rewritten (startup recovery, a queued provider switch), so the session
+ * only counts when the latest run actually ran on it.
+ */
+const sessionChange = (projection: IdleInput["projection"], expected: string): string | null => {
+  const activeId = projection.thread.activeProviderThreadId;
+  const active = projection.providerThreads.find((candidate) => candidate.id === activeId);
+  const native = active?.nativeThreadRef?.nativeId ?? null;
+  if (native === null) return `has no active native session, not ${expected}`;
+  if (native !== expected) return `is on native session ${native}, not ${expected}`;
+  const latest = latestExecutedRun(projection.runs);
+  if (latest === null) {
+    return projection.providerThreads.length === 1
+      ? null
+      : `has ${projection.providerThreads.length} provider threads and no run to tell which is current`;
+  }
+  const attempt = projection.attempts.find((candidate) => candidate.id === latest.activeAttemptId);
+  if (attempt === undefined || attempt.startedAt === null) {
+    return `has no started attempt on run ${latest.id}`;
+  }
+  if (
+    attempt.nativeThreadId !== expected ||
+    latest.providerThreadId !== activeId ||
+    attempt.providerThreadId !== activeId
+  ) {
+    return `last ran run ${latest.id} on another session than ${expected}`;
   }
   return null;
 };

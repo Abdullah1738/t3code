@@ -4,22 +4,91 @@ import * as DateTime from "effect/DateTime";
 import { idleBlocker, type IdleInput } from "./idle.ts";
 
 const now = DateTime.makeUnsafe("2026-10-22T12:00:00.000Z");
+const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled"]);
+
+interface RunFixture {
+  readonly id: string;
+  readonly status: string;
+  readonly providerThreadId?: string;
+  readonly delegatedCompletion?: {
+    readonly disposition: string;
+    readonly delivery: { readonly taskIds: ReadonlyArray<string> } | null;
+  };
+}
+
+interface AttemptFixture {
+  readonly runId: string;
+  readonly providerThreadId?: string;
+  readonly nativeThreadId?: string;
+  readonly startedAt?: string | null;
+}
 
 interface Fixture {
   readonly archivedAt?: string | null;
-  readonly runs?: ReadonlyArray<{ readonly id: string; readonly status: string }>;
+  readonly runs?: ReadonlyArray<RunFixture>;
+  readonly attempts?: ReadonlyArray<AttemptFixture>;
+  readonly turns?: ReadonlyArray<{
+    readonly id: string;
+    readonly status: string;
+    readonly runAttemptId: string | null;
+  }>;
   readonly requests?: ReadonlyArray<{ readonly id: string; readonly kind: string; readonly status: string }>;
-  readonly subagents?: ReadonlyArray<{ readonly id: string; readonly status: string }>;
+  readonly subagents?: ReadonlyArray<{
+    readonly id: string;
+    readonly status: string;
+    readonly runId?: string;
+    readonly origin?: string;
+    readonly completionDelivery?: { readonly state: string };
+  }>;
   readonly roster?: ReadonlyArray<{ readonly taskId: string; readonly kind: string }>;
   readonly native?: string | null;
+  readonly singleProviderThread?: boolean;
   readonly limitRecovery?: { readonly autoResume: boolean };
   readonly snoozedUntil?: DateTime.Utc;
   readonly restartContinuationPending?: boolean;
   readonly expectedNativeSessionId?: string;
 }
 
-const input = (fixture: Fixture = {}): IdleInput =>
-  ({
+const input = (fixture: Fixture = {}): IdleInput => {
+  const runs = (fixture.runs ?? [{ id: "run-1", status: "completed" }]).map((run, index) => ({
+    ordinal: index + 1,
+    providerThreadId: "provider-thread-active",
+    activeAttemptId: run.status === "queued" ? null : `attempt-${run.id}`,
+    startedAt: run.status === "queued" ? null : "2026-10-22T10:00:00.000Z",
+    completedAt: TERMINAL.has(run.status)
+      ? DateTime.makeUnsafe(`2026-10-22T10:0${index + 1}:00.000Z`)
+      : null,
+    ...run,
+  }));
+  const attempts = (
+    fixture.attempts ??
+    runs
+      .filter((run) => run.status !== "queued")
+      .map((run): AttemptFixture => ({ runId: run.id }))
+  ).map((attempt) => ({
+    id: `attempt-${attempt.runId}`,
+    runId: attempt.runId,
+    providerThreadId:
+      attempt.providerThreadId ??
+      runs.find((run) => run.id === attempt.runId)?.providerThreadId ??
+      "provider-thread-active",
+    nativeThreadId: attempt.nativeThreadId ?? "ses_current",
+    startedAt: attempt.startedAt === undefined ? "2026-10-22T10:00:00.000Z" : attempt.startedAt,
+  }));
+  const active = {
+    id: "provider-thread-active",
+    nativeThreadRef:
+      fixture.native === null
+        ? null
+        : { driver: "opencode", nativeId: fixture.native ?? "ses_current", strength: "strong" },
+    pendingBackgroundTasks: fixture.roster ?? [],
+  };
+  const old = {
+    id: "provider-thread-old",
+    nativeThreadRef: { driver: "opencode", nativeId: "ses_old", strength: "strong" },
+    pendingBackgroundTasks: [],
+  };
+  return {
     projection: {
       thread: {
         id: "thread-idle",
@@ -28,35 +97,25 @@ const input = (fixture: Fixture = {}): IdleInput =>
         limitRecovery: fixture.limitRecovery ?? null,
         snoozedUntil: fixture.snoozedUntil ?? null,
       },
-      runs: fixture.runs ?? [{ id: "run-1", status: "completed" }],
+      runs,
+      attempts,
+      providerTurns: fixture.turns ?? [],
       runtimeRequests: fixture.requests ?? [],
       subagents: (fixture.subagents ?? []).map((subagent) => ({
-        ...subagent,
         origin: "provider_native",
+        runId: null,
         title: null,
         nativeTaskRef: null,
         childThreadId: null,
+        ...subagent,
       })),
-      providerThreads: [
-        {
-          id: "provider-thread-old",
-          nativeThreadRef: { driver: "opencode", nativeId: "ses_old", strength: "strong" },
-          pendingBackgroundTasks: [],
-        },
-        {
-          id: "provider-thread-active",
-          nativeThreadRef:
-            fixture.native === null
-              ? null
-              : { driver: "opencode", nativeId: fixture.native ?? "ses_current", strength: "strong" },
-          pendingBackgroundTasks: fixture.roster ?? [],
-        },
-      ],
+      providerThreads: fixture.singleProviderThread === true ? [active] : [old, active],
     },
     restartContinuationPending: fixture.restartContinuationPending ?? false,
     expectedNativeSessionId: fixture.expectedNativeSessionId,
     now,
-  }) as unknown as IdleInput;
+  } as unknown as IdleInput;
+};
 
 const reason = (fixture?: Fixture) => idleBlocker(input(fixture))?.reason ?? null;
 
@@ -74,8 +133,13 @@ describe("idleBlocker", () => {
         ],
         requests: [{ id: "request-1", kind: "user_input", status: "resolved" }],
         subagents: [{ id: "subagent-1", status: "completed" }],
+        turns: [
+          { id: "turn-1", status: "completed", runAttemptId: null },
+          { id: "turn-2", status: "running", runAttemptId: "attempt-run-3" },
+        ],
         limitRecovery: { autoResume: false },
         snoozedUntil: DateTime.makeUnsafe("2026-10-22T11:00:00.000Z"),
+        expectedNativeSessionId: "ses_current",
       }),
     ).toBeNull();
   });
@@ -112,6 +176,45 @@ describe("idleBlocker", () => {
     expect(reason({ roster: [{ taskId: "task-1", kind: "command" }] })).toBe("background-work");
   });
 
+  it("refuses a subagent child thread whose provider turn still runs without a run", () => {
+    const child = { runs: [], turns: [{ id: "turn-1", status: "running", runAttemptId: null }] };
+    expect(reason(child)).toBe("background-work");
+    expect(idleBlocker(input(child))?.detail).toBe(
+      "Thread thread-idle has provider turn turn-1 running.",
+    );
+    expect(reason({ runs: [], turns: [{ id: "turn-1", status: "pending", runAttemptId: null }] })).toBe(
+      "background-work",
+    );
+  });
+
+  it("refuses a thread still owed a delegated task report", () => {
+    const open = (taskIds: ReadonlyArray<string> | null) => ({
+      id: "run-1",
+      status: "completed",
+      delegatedCompletion: {
+        disposition: "open",
+        delivery: taskIds === null ? null : { taskIds },
+      },
+    });
+    const task = (state: string) => ({
+      id: "task-1",
+      status: "completed",
+      runId: "run-1",
+      origin: "app_owned",
+      completionDelivery: { state },
+    });
+    expect(reason({ runs: [open(["task-1"])] })).toBe("pending-wake");
+    expect(reason({ runs: [open(null)], subagents: [task("pending")] })).toBe("pending-wake");
+    expect(reason({ runs: [open(null)], subagents: [task("claimed")] })).toBe("pending-wake");
+    expect(reason({ runs: [open(null)], subagents: [task("delivered")] })).toBeNull();
+    expect(
+      reason({
+        runs: [{ id: "run-1", status: "completed", delegatedCompletion: { disposition: "disposed", delivery: null } }],
+        subagents: [task("pending")],
+      }),
+    ).toBeNull();
+  });
+
   it("refuses a thread that wakes on its own", () => {
     expect(reason({ restartContinuationPending: true })).toBe("pending-wake");
     expect(reason({ limitRecovery: { autoResume: true } })).toBe("pending-wake");
@@ -125,6 +228,39 @@ describe("idleBlocker", () => {
     expect(
       idleBlocker(input({ native: null, expectedNativeSessionId: "ses_current" }))?.reason,
     ).toBe("session-changed");
+  });
+
+  it("trusts the expected session only when the latest run ran on it", () => {
+    const expectedNativeSessionId = "ses_current";
+    // Rewriting the old provider thread moved the pointer, but the last run
+    // still ran on the old session.
+    expect(
+      reason({
+        runs: [{ id: "run-1", status: "completed", providerThreadId: "provider-thread-old" }],
+        attempts: [{ runId: "run-1", nativeThreadId: "ses_old" }],
+        expectedNativeSessionId,
+      }),
+    ).toBe("session-changed");
+    expect(
+      reason({ attempts: [{ runId: "run-1", startedAt: null }], expectedNativeSessionId }),
+    ).toBe("session-changed");
+    expect(reason({ attempts: [], expectedNativeSessionId })).toBe("session-changed");
+    expect(
+      reason({ attempts: [{ runId: "run-1", nativeThreadId: "ses_other" }], expectedNativeSessionId }),
+    ).toBe("session-changed");
+    expect(
+      reason({
+        attempts: [{ runId: "run-1", providerThreadId: "provider-thread-old" }],
+        expectedNativeSessionId,
+      }),
+    ).toBe("session-changed");
+  });
+
+  it("trusts a runless thread's session only with a single provider thread", () => {
+    expect(reason({ runs: [], expectedNativeSessionId: "ses_current" })).toBe("session-changed");
+    expect(
+      reason({ runs: [], singleProviderThread: true, expectedNativeSessionId: "ses_current" }),
+    ).toBeNull();
   });
 
   it("refuses an archived thread first", () => {

@@ -4675,13 +4675,54 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             ],
           });
         });
-      // Ending the active run hands the turn to the queued one.
+      // Ending the active run hands the turn to the queued one, from a
+      // listener that runs on its own fiber.
+      const started = yield* Queue.unbounded<RunId>();
+      const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+      yield* events.stream({ threadId, afterSequence }).pipe(
+        Stream.runForEach((stored) =>
+          stored.event.type === "run.updated" && stored.event.payload.status === "starting"
+            ? Queue.offer(started, stored.event.payload.id)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
       yield* complete(active.id);
-      const promoted = yield* orchestrator.getThreadProjection(threadId);
-      assert.notEqual(promoted.runs.find((run) => run.id === queued.id)?.status, "queued");
+      assert.equal(yield* Queue.take(started), queued.id);
       assert.equal(yield* refusal(), "running");
 
       yield* complete(queued.id);
+      // Provider requests land without the dispatch lock; the check inside the
+      // archive's commit still sees them.
+      const now = yield* DateTime.now;
+      const request = {
+        id: RuntimeRequestId.make(`${threadId}:request`),
+        nodeId: NodeId.make(`${threadId}:request-node`),
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input" as const,
+        status: "pending" as const,
+        responseCapability: { type: "message" as const },
+        createdAt: now,
+        resolvedAt: null,
+      };
+      const writeRequest = (status: "pending" | "resolved") =>
+        events.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:request:${status}`),
+              type: "runtime-request.updated",
+              threadId,
+              runId: queued.id,
+              occurredAt: now,
+              payload: { ...request, status, resolvedAt: status === "pending" ? null : now },
+            },
+          ],
+        });
+      yield* writeRequest("pending");
+      assert.equal(yield* refusal(), "pending-request");
+      yield* writeRequest("resolved");
       assert.equal(yield* refusal("ses_not_this_one"), "session-changed");
 
       yield* archiveIfIdle();
