@@ -127,6 +127,39 @@ describe("runner", () => {
       assert.isBelow(result.durationMs, 10_000);
     }),
   );
+
+  it.effect("ends when the script exits, killing what it left holding the pipes", () =>
+    Effect.gen(function* () {
+      const result = yield* runScript({
+        runtime: "bash",
+        code: `sleep 30 &\nprintf '{"rows":[]}'`,
+        dir: dir(),
+        timeoutMs: 20_000,
+      });
+      assert.equal(result.exitCode, 0);
+      assert.isFalse(result.timedOut);
+      assert.equal(result.stdout, '{"rows":[]}');
+      assert.isBelow(result.durationMs, 5_000);
+    }),
+  );
+
+  it.effect("stops waiting at the deadline on pipes held outside the group", () =>
+    Effect.gen(function* () {
+      const result = yield* runScript({
+        runtime: "node",
+        // detached puts the holder in its own session, out of reach of the group kill
+        code: [
+          'import { spawn } from "node:child_process";',
+          'spawn("sleep", ["5"], { detached: true, stdio: "inherit" }).unref();',
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+        dir: dir(),
+        timeoutMs: 300,
+      });
+      assert.isTrue(result.timedOut);
+      assert.isBelow(result.durationMs, 3_000);
+    }),
+  );
 });
 
 const script = (rows: ReadonlyArray<unknown>) => `cat <<'JSON'\n${output(rows)}\nJSON`;

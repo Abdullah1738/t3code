@@ -74,13 +74,16 @@ export const scriptEnv = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
   return clean;
 };
 
+const leaderRunning = (child: NodeChildProcess.ChildProcess) =>
+  child.exitCode === null && child.signalCode === null;
+
+/** detached gives the script its own process group, so pipelines it starts die with it. */
 const killGroup = (child: NodeChildProcess.ChildProcess) => {
-  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  if (child.pid === undefined) return;
   try {
-    // detached gives the script its own process group, so pipelines it starts die with it
     process.kill(-child.pid, "SIGKILL");
   } catch {
-    child.kill("SIGKILL");
+    if (leaderRunning(child)) child.kill("SIGKILL");
   }
 };
 
@@ -116,16 +119,28 @@ const spawnScript = (spec: ScriptSpec, scriptPath: string, cwd: string) =>
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
     });
+    // Something outside the group (a setsid daemon) can hold our pipes forever,
+    // so a stopped run closes its ends instead of waiting for `close`. Once the
+    // leader exited its group was already killed and its id may be reused.
+    const stop = () => {
+      if (leaderRunning(child)) killGroup(child);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
     const timer = setTimeout(() => {
-      timedOut = true;
-      killGroup(child);
+      if (settled) return;
+      // A script that already exited and left only pipe holders behind did finish.
+      timedOut = leaderRunning(child);
+      stop();
+      finish(child.exitCode, null);
     }, spec.timeoutMs);
     child.stdout?.on("data", (chunk: Buffer) => {
-      if (overflow) return;
+      if (overflow || settled) return;
       stdoutBytes += chunk.length;
       if (stdoutBytes > VIEW_SOURCE_LIMITS.outputBytes) {
         overflow = true;
-        killGroup(child);
+        stop();
+        finish(null, null);
         return;
       }
       stdout.push(chunk);
@@ -134,8 +149,19 @@ const spawnScript = (spec: ScriptSpec, scriptPath: string, cwd: string) =>
       stderr = (stderr + chunk.toString("utf8")).slice(-STDERR_TAIL);
     });
     child.on("error", (error) => finish(null, error.message));
+    // The script is done; whatever it left in its group (`cmd &`) would hold our
+    // pipes and keep `close` from coming, so it goes too. A group with members
+    // keeps its id from being reused.
+    child.on("exit", () => {
+      if (!settled) killGroup(child);
+    });
     child.on("close", (code) => finish(code, null));
-    const abort = () => killGroup(child);
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stop();
+    };
     signal.addEventListener("abort", abort, { once: true });
     return Effect.sync(abort);
   });

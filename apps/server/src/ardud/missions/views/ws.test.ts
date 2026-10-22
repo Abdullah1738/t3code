@@ -12,11 +12,13 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import { RPC_REQUIRED_SCOPES } from "../../../auth/RpcAuthorization.ts";
-import { failureCode, missionId, seed } from "../asks/AsksService.testkit.ts";
+import { failureCode, missionId, ownerApp, seed } from "../asks/AsksService.testkit.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { fresh } from "./views.testkit.ts";
+import { ViewService } from "./ViewService.ts";
 import { viewsWsHandlers } from "./ws.ts";
 
 const M = MISSIONS_VIEWS_WS_METHODS;
@@ -138,6 +140,50 @@ describe("views WS RPCs", () => {
             last.snapshot.layout.layout.entries.find((entry) => entry.key === "sub-missions")
               ?.title,
         ).toBe("Workstreams");
+      }),
+    ),
+  );
+
+  it.effect("a source stays fresh while its views are open", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const set = yield* views.setSource(ownerApp, {
+          missionId,
+          title: "Counter",
+          runtime: "bash",
+          code: `printf '{"rows":[]}'`,
+          fields: { title: "text" },
+          refreshMinutes: 5,
+        });
+        const app = yield* viewsWsHandlers({ surface: "web", session: paired });
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const pull = yield* Stream.toPull(app[M.subscribe]({ missionId }));
+            // The feed's next snapshot showing a finished run other than `before`.
+            const ranAfter = (before: string | null) =>
+              Effect.gen(function* () {
+                while (true) {
+                  for (const item of yield* pull) {
+                    if (item._tag !== "snapshot") continue;
+                    const run = item.snapshot.sourceRuns?.find((r) => r.sourceId === set.ref.id);
+                    if (run && !run.running && run.ranAt !== null && run.ranAt !== before) {
+                      return run;
+                    }
+                  }
+                }
+              });
+            // Opening the views runs the source that never ran.
+            const first = yield* ranAfter(null);
+            expect(first.error).toBeNull();
+            // Nothing reads a snapshot from here on; only the open feed can notice it went stale.
+            yield* TestClock.adjust("5 minutes");
+            const second = yield* ranAfter(first.ranAt);
+            expect(second.error).toBeNull();
+            expect(Date.parse(second.ranAt ?? "") - Date.parse(first.ranAt ?? "")).toBe(300_000);
+          }),
+        );
       }),
     ),
   );

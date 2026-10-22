@@ -88,7 +88,11 @@ const changedKind = (item: MissionStreamItem): string | null => {
 type FeedTick =
   | { readonly _tag: "item"; readonly item: MissionStreamItem }
   | { readonly _tag: "report-saved" }
-  | { readonly _tag: "source-ran" };
+  | { readonly _tag: "source-ran" }
+  | { readonly _tag: "sources-due" };
+
+/** Sources refresh every 5 minutes at the most, so a watched one is at most a minute late. */
+const SOURCES_DUE_CHECK = "1 minute";
 
 interface FeedState {
   readonly snapshot: MissionViewsSnapshot;
@@ -137,7 +141,13 @@ export const makeViewsWsHandlers = (
           Stream.filter((missionId) => missionId === input.missionId),
           Stream.map((): FeedTick => ({ _tag: "source-ran" })),
         );
-        const updates = Stream.mergeAll([commits, reportSaved, sourceRan], {
+        // Staleness is otherwise checked only when a snapshot is read, which an
+        // open view with nothing changing never does. Lives as long as the feed.
+        const sourcesDue = Stream.tick(SOURCES_DUE_CHECK).pipe(
+          Stream.drop(1),
+          Stream.map((): FeedTick => ({ _tag: "sources-due" })),
+        );
+        const updates = Stream.mergeAll([commits, reportSaved, sourceRan, sourcesDue], {
           concurrency: "unbounded",
         }).pipe(
           Stream.mapAccumEffect(
@@ -145,6 +155,11 @@ export const makeViewsWsHandlers = (
             (state, tick) =>
               Effect.gen(function* () {
                 const last = state.snapshot;
+                if (tick._tag === "sources-due") {
+                  // A run it starts comes back as `source-ran`.
+                  yield* views.touchSources(input.missionId);
+                  return [state, []] as const;
+                }
                 if (tick._tag === "source-ran") {
                   const snapshot = yield* views.snapshot(input.missionId);
                   return [

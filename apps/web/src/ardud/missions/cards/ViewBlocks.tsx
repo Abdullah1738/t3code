@@ -18,6 +18,7 @@ import {
   type ViewStatTile,
   type ViewTimelineEntry,
   // --- end blocks additions ---
+  viewChartFraction,
 } from "@t3tools/client-runtime/ardud/missions";
 import type { ViewLongTextInput } from "@t3tools/contracts";
 // --- blocks additions ---
@@ -395,7 +396,7 @@ function ChartPlot(props: {
 }) {
   const { points } = props;
   const scale = viewChartScale(points);
-  const y = (value: number) => 100 - ((value - scale.min) / (scale.max - scale.min)) * 100;
+  const y = (value: number) => 100 - viewChartFraction(scale, value) * 100;
   const zero = y(0);
   const band = 100 / points.length;
   const last = points.at(-1);
