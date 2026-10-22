@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { IMESSAGE_ORIGIN, sessionOrigin, type AlertBackend, type BoardEntry, type BoardSnapshot, type JsonValue, type PermissionRequest, type QuestionRequest, type SessionRecord } from "./openchamber.ts";
+import { IMESSAGE_ORIGIN, sessionOrigin, type AlertBackend, type BoardEntry, type BoardSnapshot, type JsonValue, type PermissionRequest, type QuestionRequest, type RequestReader, type SessionRecord } from "./openchamber.ts";
 import { parseNotificationEvent, type NotificationEvent } from "./notification-events.ts";
 import { spectrumRouterStatus, type RouterStatus } from "./spectrum-status.ts";
 import { callbackToken, sessionNoticeId, type KeyboardSpec, type SessionNotice, type Store } from "./store.ts";
@@ -10,6 +10,8 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const label = (title: string | undefined) => (title ?? "").replace(/\p{Cc}/gu, " ").replace(/\s+/g, " ").trim().slice(0, 180) || "Session";
 const ATTENTION_DELAY = 5_000;
 const AUTO_ACCEPT_GRACE = 15_000;
+/** How often a quiet tick still reads pending requests, in case an event was missed. */
+const REQUEST_SWEEP = 60_000;
 type Selection = Record<string, number[]>;
 /** Durable progress of a multi-question prompt asked one question at a time. */
 type Sequence = { answers: string[][]; selected: number[]; text?: string };
@@ -39,6 +41,7 @@ export class Attention {
   private readonly sessionDirectories = new Map<string, string>();
   private stopped = false;
   private handling?: Promise<void>;
+  private requestsReadAt = 0;
 
   constructor(
     private readonly store: Store,
@@ -225,9 +228,36 @@ export class Attention {
       .filter(entry => entry.attention || entry.state === "running")
       .map(entry => entry.directory));
     for (const identity of this.activeSessions) directories.add(identity.split("\0")[0]!);
-    for (const directory of directories) {
+    // A shared read lists every pending request and is the expensive call.
+    // While the board shows no request and no notice is open there is nothing
+    // to find, so only a sweep a minute reads it; an opened request arrives as
+    // an event or on the board. Backends read per folder keep polling each tick.
+    const sharedReads = this.backend.pendingRequests !== undefined;
+    const quiet = sharedReads && board?.migrationComplete === true && !board.entries.some(entry => entry.attention)
+      && this.store.pendingSessionNotices().length === 0 && Date.now() - this.requestsReadAt < REQUEST_SWEEP;
+    // One read serves the tick. A notice first seen after that read started
+    // gets a new one, so it is never judged by a list taken before it existed.
+    let shared: { at: number; read: Promise<RequestReader> } | undefined;
+    const requests = (since = 0) => {
+      if (!shared || shared.at <= since) {
+        const at = Date.now();
+        const read = this.readRequests();
+        read.then(() => { this.requestsReadAt = Math.max(this.requestsReadAt, at); }, () => {});
+        shared = { at, read };
+      }
+      return shared.read;
+    };
+    if (sharedReads && !quiet) {
+      // A request can sit in a folder the board does not list, such as a subagent in its own worktree.
+      for (const directory of await requests().then(reader => reader.directories?.() ?? [], () => [])) directories.add(directory);
+      if (epoch !== this.epoch || this.stopped) return;
+    }
+    for (const directory of quiet ? [] : directories) {
       const revision = new Map(this.sessionEpochs);
-      const results = await Promise.allSettled([this.backend.permissions(directory), this.backend.questions(directory)]);
+      const results = await Promise.allSettled([
+        requests().then(reader => reader.permissions(directory)),
+        requests().then(reader => reader.questions(directory)),
+      ]);
       if (epoch !== this.epoch || this.stopped) return;
       for (const [index, kind] of (["approval", "question"] as const).entries()) {
         const result = results[index]!;
@@ -248,7 +278,7 @@ export class Attention {
         const op = this.store.getOperation(notice.id);
         if (op?.state === "sent") { this.store.saveSessionNotice({ ...notice, state: "sent" }); continue; }
         const sessionEpoch = this.sessionEpochs.get(`${notice.directory}\0${notice.sessionId}`);
-        const result = await this.check(notice, parents);
+        const result = await this.check(notice, parents, requests);
         if (epoch !== this.epoch || this.stopped) return;
         if (sessionEpoch !== this.sessionEpochs.get(`${notice.directory}\0${notice.sessionId}`)) continue;
         if (result === "cancel") { this.cancel(notice); continue; }
@@ -316,14 +346,34 @@ export class Attention {
       : session.parentID ? `Subsession ${label(session.title)}` : label(session.title);
   }
 
-  private async check(notice: SessionNotice, parents?: Map<string, Promise<SessionRecord | undefined>>): Promise<"cancel" | "wait" | { text: string; keyboard?: KeyboardSpec; signature: string }> {
+  /**
+   * A backend that reads every request at once is read once and scoped by
+   * folder afterwards; any other backend reads each folder live.
+   */
+  private readRequests(): Promise<RequestReader> {
+    return this.backend.pendingRequests?.() ?? Promise.resolve(this.backend);
+  }
+
+  /**
+   * `shared` is the tick's request read. Without it (the dispatch boundary)
+   * every read is live, as are the button and reply paths.
+   */
+  private async check(
+    notice: SessionNotice,
+    parents?: Map<string, Promise<SessionRecord | undefined>>,
+    shared?: (since: number) => Promise<RequestReader>,
+  ): Promise<"cancel" | "wait" | { text: string; keyboard?: KeyboardSpec; signature: string }> {
     const age = Date.now() - notice.firstSeen;
     // Ready-for-review notices were retired; withdraw any left in the store.
     if (notice.kind === "review") return "cancel";
     if (age < ATTENTION_DELAY) return "wait";
     if (!notice.requestId) return "cancel";
     if (await this.routerOwns(notice.directory, notice.sessionId, notice.requestId)) return "wait";
-    const requests = notice.kind === "approval" ? await this.backend.permissions(notice.directory) : await this.backend.questions(notice.directory);
+    const pending = async () => {
+      const reader = await (shared ? shared(notice.firstSeen) : this.readRequests());
+      return notice.kind === "approval" ? reader.permissions(notice.directory) : reader.questions(notice.directory);
+    };
+    const requests = await pending();
     if (!requests) return "wait";
     if (!requests.some(request => request.id === notice.requestId && request.sessionID === notice.sessionId)) return "cancel";
     // Robob hands a mission thread's question or permission request to its lead,
@@ -340,7 +390,7 @@ export class Attention {
     }
     const parent = session.parentID ? await this.backend.getSession(session.parentID, session.directory).catch(() => undefined) : undefined;
     const context = this.contextOf(session, parent);
-    const freshRequests = notice.kind === "approval" ? await this.backend.permissions(notice.directory) : await this.backend.questions(notice.directory);
+    const freshRequests = await pending();
     if (!freshRequests) return "wait";
     const request = freshRequests.find(row => row.id === notice.requestId && row.sessionID === notice.sessionId);
     if (!request) return "cancel";

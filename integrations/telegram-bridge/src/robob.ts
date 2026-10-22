@@ -1,7 +1,7 @@
 import type { NotificationEvent } from "./notification-events.ts";
 import {
   type AlertBackend, type BoardEntry, type BoardSnapshot, type PermissionRequest,
-  type QuestionRequest, type SessionRecord, type SessionStatus,
+  type QuestionRequest, type RequestReader, type SessionRecord, type SessionStatus,
 } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
@@ -152,22 +152,40 @@ export class RobobAlertBackend implements AlertBackend {
     return statuses;
   }
 
-  /** Pending requests whose thread runs in `directory`, the way OpenChamber scoped them by location. */
-  private async pending(directory: string, kind: PendingRequest["kind"]): Promise<Array<PendingRequest & { threadId: string }>> {
+  /**
+   * One `GET /requests`, scoped to a folder by each thread's directory, the way
+   * OpenChamber scoped requests by location. The route lists every thread's
+   * requests and is expensive on the server, so attention reads it once a tick.
+   */
+  async pendingRequests(): Promise<RequestReader> {
     const { requests } = await this.client.request<{ requests: Array<PendingRequest & { threadId: string }> }>("GET", "/requests");
-    const found = [];
-    for (const request of requests) {
-      if (request.kind === kind && await this.directoryOf(request.threadId) === directory) found.push(request);
-    }
-    return found;
+    const inFolder = async (directory: string, kind: PendingRequest["kind"]) => {
+      const found = [];
+      for (const request of requests) {
+        if (request.kind === kind && await this.directoryOf(request.threadId) === directory) found.push(request);
+      }
+      return found;
+    };
+    return {
+      permissions: async directory => (await inFolder(directory, "approval")).map(request => permissionFrom(request, request.threadId)),
+      questions: async directory => (await inFolder(directory, "question")).map(request => questionFrom(request, request.threadId)),
+      directories: async () => {
+        const found = new Set<string>();
+        for (const request of requests) {
+          const directory = await this.directoryOf(request.threadId).catch(() => undefined);
+          if (directory !== undefined) found.add(directory);
+        }
+        return [...found];
+      },
+    };
   }
 
   async permissions(directory: string): Promise<PermissionRequest[]> {
-    return (await this.pending(directory, "approval")).map(request => permissionFrom(request, request.threadId));
+    return (await this.pendingRequests()).permissions(directory);
   }
 
   async questions(directory: string): Promise<QuestionRequest[]> {
-    return (await this.pending(directory, "question")).map(request => questionFrom(request, request.threadId));
+    return (await this.pendingRequests()).questions(directory);
   }
 
   async permissionReply(sessionId: string, requestId: string, _directory: string, reply: "once" | "reject"): Promise<boolean> {

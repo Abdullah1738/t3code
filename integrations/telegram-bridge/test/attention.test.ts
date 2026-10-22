@@ -848,3 +848,45 @@ test("forms a chat reply cannot answer are surfaced without buttons and never an
   expect(h.store.getOperation("ack:902")?.text).toContain("does not accept custom text");
   expect(h.store.getOperation("ack:903")?.text).toContain("Choose one answer per question");
 });
+
+test("a request that opens while the tick's read is in flight is checked against a newer read, never cancelled", async () => {
+  const h = setup();
+  let reads = 0;
+  const late = permission();
+  Object.assign(h.backend, { pendingRequests: async () => {
+    reads++;
+    const permissions = [...h.backend.permissionRequests];
+    if (reads === 1) {
+      // The event lands after this read was taken, and the tick runs on past the alert delay.
+      h.backend.permissionRequests.push(late);
+      h.attention.processEvent(askedEvent("approval", late.id));
+      setSystemTime(now + 20_000);
+    }
+    return { permissions: async () => permissions, questions: async () => [] };
+  } });
+  h.attention.processEvent(statusEvent("busy"));
+  await h.attention.tick();
+  expect(reads).toBe(2);
+  expect(h.store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("needs your approval")]);
+});
+
+test("a backend read per folder keeps polling every tick, and a failed read is retried on the next", async () => {
+  const h = setup();
+  h.backend.board = { version: 1, revision: 1, activatedAt: 1, migrationComplete: true,
+    entries: [{ sessionId: "ses_1", directory: "/Chats", title: "Deployment review", state: "running", status: "busy", workRevision: 1, updatedAt: now }] };
+  const permissions = h.backend.permissions.bind(h.backend);
+  let fail = true;
+  h.backend.permissions = async () => { if (fail) { h.backend.permissionReads++; throw new Error("down"); } return permissions(); };
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(1);
+  fail = false;
+  h.backend.permissionRequests = [permission()];
+  setSystemTime(now + 5_000);
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBe(2);
+  expect(h.store.pendingSessionNotices()).toHaveLength(1);
+  setSystemTime(now + 10_000);
+  h.backend.permissionRequests = [];
+  await h.attention.tick();
+  expect(h.backend.permissionReads).toBeGreaterThanOrEqual(3);
+});

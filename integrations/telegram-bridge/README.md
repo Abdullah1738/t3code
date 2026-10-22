@@ -75,6 +75,12 @@ config.json (default `openchamber`). The token comes from
   (`request.opened`/`resolved` to asked/resolved, `thread.status` to busy/idle,
   user `message.completed` to changed, runtime-mode changes to invalidate).
 - Requests: `GET /requests`, scoped to a directory by each thread's folder.
+  The route builds a full thread snapshot on the server, so an attention tick
+  shares one read across all folders and notice checks, plus a fresh read for
+  a notice newer than it. Folders with a pending request join the board's
+  folders. While the board shows no request and no notice is open, a sweep
+  reads it once a minute; opened requests also arrive as events. Button taps,
+  replies and the final send check read it live.
   Replies use the respond route.
 - Board: read from Robob's session board (`GET /api/ardud/board`, same
   bearer token) only to find directories with running or attention-needing

@@ -211,6 +211,12 @@ export interface AlertBackend {
   statuses(): Promise<Record<string, SessionStatus>>;
   permissions(directory: string): Promise<PermissionRequest[]>;
   questions(directory: string): Promise<QuestionRequest[]>;
+  /**
+   * Every pending request in one read, scoped by folder afterwards, for a
+   * backend that cannot read one folder at a time. Attention reads it once a
+   * tick instead of twice per folder.
+   */
+  pendingRequests?(): Promise<RequestReader>;
   permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject"): Promise<boolean>;
   questionReply(request: QuestionRequest, directory: string, answers: string[][]): Promise<boolean>;
   isSessionAutoAccepting(sessionId: string, directory: string): Promise<boolean | undefined>;
@@ -221,6 +227,12 @@ export interface AlertBackend {
    */
   leadAnswers?(sessionId: string): Promise<boolean>;
 }
+
+/**
+ * Pending requests of one folder, from a live read or from one read shared by
+ * a tick. A shared read also names the folders its requests belong to.
+ */
+export type RequestReader = Pick<AlertBackend, "permissions" | "questions"> & { directories?(): Promise<string[]> };
 
 export class OpenChamber implements AlertBackend {
   private readonly baseUrl: string;
