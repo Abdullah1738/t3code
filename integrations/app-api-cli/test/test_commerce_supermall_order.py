@@ -239,6 +239,30 @@ class CapturedContractTests(unittest.TestCase):
 
 
 class ResolveOfferTests(unittest.TestCase):
+    def test_exact_variant_uses_rocket_catalog_experience(self):
+        hit = FIXTURE['search']['hits'][0]
+        class Opener:
+            def open(self, request, timeout=None):
+                selected = hit if request.get_header('X-experience') == 'rocket' else dict(hit, sku_config='SIBLING')
+                return patched_resolve({'hits': [selected]})().open(request, timeout)
+        with patch.object(c.urllib.request, 'build_opener', return_value=Opener()):
+            self.assertEqual(c.resolve_rocket_offer(HEADERS, SKU)['offer'], OFFER)
+
+    def test_nested_rocket_promotion_is_not_the_selected_offer(self):
+        hit = dict(FIXTURE['search']['hits'][0], flags=['fbn', 'nano'],
+                   rocket={'estimation_text': 'GET IN 1 HR', 'offer_code': 'OTHER'})
+        with patch.object(c.urllib.request, 'build_opener',
+                          return_value=patched_resolve({'hits': [hit]})()):
+            with self.assertRaisesRegex(j.JournalError, 'ITEM_NOT_ROCKET') as error:
+                c.resolve_rocket_offer(HEADERS, SKU)
+        self.assertEqual(error.exception.details, {'sku_config': SKU})
+
+    def test_missing_sku_error_names_the_item(self):
+        with patch.object(c.urllib.request, 'build_opener', return_value=patched_resolve({'hits': []})()):
+            with self.assertRaises(j.JournalError) as error:
+                c.resolve_rocket_offer(HEADERS, SKU)
+        self.assertEqual(error.exception.details, {'sku_config': SKU})
+
     def test_resolve_exact_buyable_rocket_hit(self):
         case = {'hits': [FIXTURE['search']['hits'][0], {'sku_config': 'OTHER'}]}
         with patch.object(c.urllib.request, 'build_opener', return_value=patched_resolve(case)()):

@@ -38,6 +38,12 @@ node cli.mjs report --mission ID --kind update|daily [--since ISO] [--to ISO] [-
 node cli.mjs watch --mission ID [--sweep-minutes 15]  # a pass whenever a lane's run settles
 ```
 
+`run`, `dry-run` and `watch` take `--min-severity low|medium|high|critical`:
+notes under it are not posted, except updates that replace an open note shown
+in the prompt (so a blocker can still be closed), and the model is told the
+floor. Without it
+every note is kept.
+
 `dry-run` never touches the server: cursors and notes go to `DIR/state.json`,
 batches to `DIR/batches.jsonl` and raw model replies to `DIR/replies.jsonl`.
 The default output directory is `$TMPDIR/opencode/missions-scribe/`.

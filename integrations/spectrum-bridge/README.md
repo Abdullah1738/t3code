@@ -120,6 +120,13 @@ under `~/.config/spectrum-bridge/`.
   `metadataWarnings` for a missing `<title>`, `og:title`, `og:description` or
   `og:image`, and served pages get relative `og:image`/`og:url` made absolute
   so link previews load.
+- In Sendblue mode, `app --to moni --session OWNER_SESSION --key KEY --url PUBLIC_HTTPS_URL --caption "Your ride"`
+  queues a card in that chat, like `send --to`. Cross-chat sends require the
+  current owner's session, including when the recipient is an admin. Omit
+  `--to` to send to the session's own chat. Use a publicly reachable URL for
+  Moni and other recipients (`share`, rather than the owner's tailnet-only
+  `publish` URL). Reuse the key only for an identical card to the same recipient;
+  the acknowledgement confirms queueing, not delivery.
 - Secure forms: `secret-request --session S --key K --purpose P --field name:Label[:type]`
   sends a one-time app card (15 minutes) for credentials. Submitted values are
   stored in `~/.config/spectrum-bridge/secrets/` (0600, never in the chat,
@@ -218,9 +225,11 @@ router uses, so the router is unchanged.
   in `~/.config/spectrum-bridge/config.json`. The default is `openchamber`; any
   other value stops the bridge at startup.
 - Server and token: `T3_CONTROL_URL` + `T3_CONTROL_TOKEN`, else the JSON file
-  `T3_CONTROL_TOKEN_FILE` or `~/.robob/ardud-control.json`
+  named by `T3_CONTROL_TOKEN_FILE` (which must exist), else
+  `~/.robob/components/spectrum-bridge.json` (its own component credential),
+  else the old shared `~/.robob/ardud-control.json`
   (`{"url":"http://127.0.0.1:<port>","token":"..."}`, chmod 600, loopback URL only).
-  Issue the token with `t3 auth session issue --base-dir <t3 home> --label bridges --ttl 365d --json`.
+  Issue the component credential with `t3 ardud component-token issue spectrum-bridge`.
 - Chat root: `ROBOB_IMESSAGE_CHAT_ROOT`, else `robobChatRoot` in config.json,
   else `~/.robob/imessage`. It must be a registered Robob project
   (`t3 project add <root> --title iMessage`); `check` fails otherwise. Each new

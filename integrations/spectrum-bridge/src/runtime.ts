@@ -7,6 +7,7 @@ import { mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { chatInfo, personFor, roleOf, slugFor } from "./access.ts";
+import { appContent } from "./api.ts";
 import type { Access, ChatContext, ChatInfo } from "./chats.ts";
 import { chatKey, LineError, type ChatKey, type Line } from "./line.ts";
 import { askOwner, editAccess, location, locationRequest, type SbApiDeps, type SbApiResult } from "./sb-api.ts";
@@ -208,7 +209,7 @@ export type SbApiOptions<P extends { api: Handler }> = {
 };
 
 /** Session-bound routes the per-chat Photon-era API already implements. */
-const FORWARDED = ["/files", "/poll", "/app", "/secret-request"];
+const FORWARDED = ["/files", "/poll", "/secret-request"];
 const TAPBACKS = ["like", "love", "dislike", "laugh", "emphasize", "question"];
 const RESERVED_TARGET = /^(?:secret|wake|reset):/;
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -267,7 +268,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       }
       // Watchers wake the owner; only `wake --chat` reaches another chat.
       if (path === "/wake" && body?.chat === undefined) return forward(registry.owner);
-      if (FORWARDED.includes(path) || (path === "/send" && body?.to === undefined)) {
+      if (FORWARDED.includes(path) || ((path === "/send" || path === "/app") && body?.to === undefined)) {
         // No session: the owner chat's API gives the same validation errors as before.
         if (sessionId === undefined) return forward(registry.owner);
         return caller ? forward(caller) : reply(409, { error: "No chat for this session" });
@@ -305,6 +306,25 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       });
 
       switch (path) {
+        case "/app": {
+          if (request.headers.has("origin")) throw new HttpError(403, "Forbidden");
+          only(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "to", "dedupeKey", "sessionId"]);
+          ownerOnly(false);
+          live();
+          const { to, dedupeKey } = body;
+          const app = appContent(body);
+          if (!app || !text(to, 100) || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(to) || !text(dedupeKey, 200)) {
+            throw new HttpError(400, "Invalid request");
+          }
+          const target = registry.bySlugName(to);
+          if (!target) throw new HttpError(404, "Unknown chat");
+          const id = `app:${hash(`${target.info.slug}:${dedupeKey}`)}`;
+          let created: boolean;
+          // Like send --to, this is an owner-authorized relay, not a reply in the recipient's session.
+          try { created = target.store.enqueue({ id, kind: "conversation", text: "", app }); }
+          catch { throw new HttpError(409, "Operation could not be completed"); }
+          return reply(created ? 202 : 200, { id, created });
+        }
         case "/send": {
           only(body, ["text", "to", "dedupeKey", "sessionId"]);
           ownerOnly(false);

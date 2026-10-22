@@ -39,9 +39,10 @@ def register_tracking(flow, label, recipient='owner', *, paid=True):
     if not order:journal.fail('EXACT_ORDER_ID_UNAVAILABLE')
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app',state['app'],'--order',order,
+             *__import__('delivery_cards').commerce_args(flow, state['vertical']),
              *order_watch_receipt.command_args(recipient,state.get('reserved_minor')),
              '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),'--label',label,
-             *([] if paid else ['--hold-placed-text'])]
+             *(['--payment-confirmed'] if paid else ['--hold-placed-text'])]
     try:
         result=subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=125)
     except (OSError,subprocess.TimeoutExpired):
@@ -683,11 +684,13 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
                     registered=False
                 who='moni' if registered and cfg.get('for')=='moni' else recipient
                 closed=registered and cfg.get('active') is False
-                if not registered or (who=='moni' and not closed):
+                if not registered or (not closed and (who=='moni' or cfg.get('delivery_card', {}).get('held'))):
                     # Re-adding an existing watcher only releases a placement
                     # text held while payment was unconfirmed; never twice.
                     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
                     command=[str(Path.home()/'.local/bin/order-watch'),'add','--app','talabat','--order',order,
+                             '--vertical', binding['vertical'],
+                             '--payment-confirmed',
                              *order_watch_receipt.command_args(who,order_watch_receipt.reserved_minor(journal,flow_id)),
                              '--placed-at',dt.datetime.now(dt.timezone.utc).isoformat(),
                              '--label','talabat recovered paid order']
@@ -845,8 +848,8 @@ def main(argv=None):
     options.add_argument('vertical',choices=('minutes',))
     options.add_argument('--sku',required=True)
     options.add_argument('--query',help='Product-name search hint; result must match --sku exactly')
-    clear=commands.add_parser('clear-cart',help='Clear an unchanged cart owned by a closed, cart-only Minutes flow')
-    clear.add_argument('vertical',choices=('minutes',))
+    clear=commands.add_parser('clear-cart',help='Clear an unchanged cart owned by a closed, cart-only noon flow')
+    clear.add_argument('vertical',choices=('minutes','main','supermall'))
     clear.add_argument('--flow',dest='flow_id',required=True)
     for name in ('menu','choices'):
         discovery=commands.add_parser(name,help='Read Talabat menu items or item choices; never changes a cart')
@@ -943,8 +946,12 @@ def main(argv=None):
             result={'ok':True,'financial_send':False,'cart_mutation_sent':False,
                     **read_options(args.sku,query=args.query)}
         elif args.command=='clear-cart':
-            from commerce_minutes_cleanup import clear_cart
-            result=clear_cart(args.flow_id)
+            if args.vertical=='minutes':
+                from commerce_minutes_cleanup import clear_cart
+                result=clear_cart(args.flow_id)
+            else:
+                from commerce_marketplace_cleanup import clear_cart
+                result=clear_cart(args.flow_id, args.vertical)
         elif args.command in ('menu','choices'):result=talabat_discovery(args)
         elif args.command=='restaurant-cart-contract':
             from talabat_restaurant_cart import contract
@@ -1013,7 +1020,8 @@ def main(argv=None):
         return 1 if result.get('ok') is False else 0
     except Exception as exc:
         from noon_minutes_options import OptionsError
-        if isinstance(exc,OptionsError):
+        from commerce_supermall_order import CatalogError
+        if isinstance(exc,(OptionsError,CatalogError)):
             print(json.dumps({'ok':False,'error':exc.code,'details':exc.details,
                               'financial_send':False,'financial_retry':False}))
             return 1

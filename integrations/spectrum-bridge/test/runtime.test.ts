@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createApi } from "../src/api.ts";
 import type { Access } from "../src/chats.ts";
 import { chatKey, type Line, type LineInbound } from "../src/line.ts";
 import { ChatRegistry, createSbApi, type ChatCore } from "../src/runtime.ts";
@@ -43,7 +44,7 @@ function fakeLine(): Line & { reactions: [string, string][]; locationRequests: s
 
 type Parts = { api: (request: Request) => Promise<Response>; forwarded: unknown[] };
 
-function setup() {
+function setup(realApi = false) {
   access = {
     people: [{ name: "Moni", role: "admin", addresses: [moni, "moni@example.com"] }],
     groups: [{ id: "GRP-Allowed-123", name: "Family Trip" }],
@@ -62,6 +63,8 @@ function setup() {
         if (chat.store !== store) stores.push(chat.store);
         // Stands in for the per-chat Photon-era API: echoes which chat received the request.
         const forwarded: unknown[] = [];
+        if (realApi) return { forwarded, api: createApi({ store: chat.store, photon: { react: async () => {} },
+          router: () => undefined, chatGuid: () => chat.info.key, enabled: () => true, health: () => ({}) }) };
         return { forwarded, api: async request => {
           forwarded.push(await request.json());
           return Response.json({ chat: chat.info.slug, path: new URL(request.url).pathname });
@@ -77,6 +80,88 @@ function setup() {
 const message = (overrides: Partial<LineInbound>): LineInbound => ({
   handle: "h-1", chat: chatKey.dm(owner), from: owner, text: "hi", kind: "message", service: "iMessage",
   participants: [], sentAt: 1_000, ...overrides,
+});
+
+describe("recipient app cards", () => {
+  const card = { url: "https://ride.example.com/", caption: "Your ride", subcaption: "Driver assigned",
+    trailingCaption: "Lux", trailingSubcaption: "Mercedes", summary: "Open ride" };
+  function api(enabled = true) {
+    const env = setup(true);
+    const chats = env.registry();
+    const moniChat = chats.open(chatKey.dm(moni));
+    chats.owner.store.set("route", { id: "ses_owner", generation: 1 });
+    moniChat.store.set("route", { id: "ses_moni", generation: 2 });
+    const handler = createSbApi({ registry: chats, line: env.line, accessPath: join(env.stateRoot, "access.json"),
+      enabled: () => enabled, health: () => ({}) });
+    const post = async (body: Record<string, unknown>, origin?: string) => {
+      const response = await handler(new Request("http://bridge/app", {
+        method: "POST", headers: { "Content-Type": "application/json", ...(origin ? { Origin: origin } : {}) }, body: JSON.stringify(body),
+      }));
+      return { status: response.status, body: await response.json() as { id: string; created: boolean } };
+    };
+    return { chats, moniChat, post };
+  }
+
+  test("the owner can queue a card in Moni's outbox without borrowing her session", async () => {
+    const { chats, moniChat, post } = api();
+    const body = { ...card, to: "moni", dedupeKey: "ride-1", sessionId: "ses_owner@1" };
+    const first = await post(body);
+    expect(first.status).toBe(202);
+    expect(first.body).toEqual({ id: expect.stringMatching(/^app:[a-f0-9]{64}$/), created: true });
+    expect(chats.owner.store.pendingOutbox()).toEqual([]);
+    expect(moniChat.store.pendingOutbox()).toEqual([{ id: first.body.id, kind: "conversation", text: "", app: card, state: "pending", attempts: 0 }]);
+    expect(await post({ ...body, sessionId: "ses_owner" })).toEqual({ status: 200, body: { id: first.body.id, created: false } });
+    expect((await post({ ...body, caption: "Changed" })).status).toBe(409);
+    expect((await post({ ...body, url: "https://ride.example.com/other" })).status).toBe(409);
+    // A relay remains valid when the destination rotates or has no active agent.
+    moniChat.store.set("route", null);
+    expect((await post(body)).status).toBe(200);
+    expect((await post({ ...body, dedupeKey: "ride-2" })).status).toBe(202);
+    expect(moniChat.store.pendingOutbox()).toHaveLength(2);
+    expect((await post({ ...body, to: "owner" })).status).toBe(202);
+    expect(chats.owner.store.pendingOutbox()[0]!.id).not.toBe(first.body.id);
+  });
+
+  test("without --to cards still bind to the calling chat and its generation", async () => {
+    const { chats, moniChat, post } = api();
+    const body = { ...card, dedupeKey: "ride-1" };
+    expect((await post({ ...body, sessionId: "ses_owner@1" })).status).toBe(202);
+    expect((await post({ ...body, sessionId: "ses_moni@2" })).status).toBe(202);
+    expect(chats.owner.store.pendingOutbox()[0]).toMatchObject({ app: card, sessionId: "ses_owner", generation: 1 });
+    expect(moniChat.store.pendingOutbox()[0]).toMatchObject({ app: card, sessionId: "ses_moni", generation: 2 });
+    expect((await post({ ...body, sessionId: "ses_owner@0" })).status).toBe(409);
+  });
+
+  test("recipient routing requires the current owner session, even for admin callers", async () => {
+    const { chats, moniChat, post } = api();
+    const body = { ...card, to: "moni", dedupeKey: "ride-1" };
+    expect((await post({ ...body, sessionId: "ses_owner" }, "https://other.example.com")).status).toBe(403);
+    expect((await post(body)).status).toBe(403);
+    expect((await post({ ...body, sessionId: "ses_moni@2" })).status).toBe(403);
+    const person = chats.open(chatKey.dm("+15555550188"));
+    person.store.set("route", { id: "ses_person", generation: 1 });
+    expect((await post({ ...body, sessionId: "ses_person" })).status).toBe(403);
+    expect((await post({ ...body, sessionId: "ses_unknown" })).status).toBe(409);
+    expect((await post({ ...body, sessionId: "ses_owner@0" })).status).toBe(409);
+    expect((await post({ ...body, sessionId: "ses_owner", to: "missing" })).status).toBe(404);
+    chats.owner.store.set("route", { id: "ses_owner", generation: 2 });
+    expect((await post({ ...body, sessionId: "ses_owner@1" })).status).toBe(409);
+    expect(moniChat.store.pendingOutbox()).toEqual([]);
+  });
+
+  test("recipient cards keep app validation and readiness checks", async () => {
+    const { moniChat, post } = api();
+    const body = { ...card, to: "moni", dedupeKey: "ride-1", sessionId: "ses_owner" };
+    for (const patch of [{ url: "http://ride.example.com/" }, { url: "https://user:password@ride.example.com/" },
+      { caption: "" }, { subcaption: "line\nbreak" }, { trailingCaption: 123 }, { summary: "x".repeat(501) },
+      { dedupeKey: "" }, { to: null }, { to: "../moni" }, { generation: 1 }, { extra: true }]) {
+      expect((await post({ ...body, ...patch })).status).toBe(400);
+    }
+    expect(moniChat.store.pendingOutbox()).toEqual([]);
+    const disabled = api(false);
+    expect((await disabled.post(body)).status).toBe(503);
+    expect(disabled.moniChat.store.pendingOutbox()).toEqual([]);
+  });
 });
 
 describe("chat registry", () => {

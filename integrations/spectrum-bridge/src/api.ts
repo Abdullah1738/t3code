@@ -6,7 +6,7 @@ import { forgetSecret, newToken, putSecretRequest, readSecret, SECRET_REQUEST_TT
   validToken } from "./secrets.ts";
 import { sessionMatches } from "./session.ts";
 import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
-import type { OutboxOperation, Store } from "./store.ts";
+import type { OutboxApp, OutboxOperation, Store } from "./store.ts";
 
 type Options = {
   store: Store;
@@ -97,6 +97,15 @@ function fields(body: Record<string, unknown>, allowed: string[]): void {
 const line = (value: unknown, max: number): value is string => string(value, max) && !/[\x00-\x1f\x7f-\x9f]/.test(value);
 const optionalLine = (value: unknown, max: number) => value === undefined || line(value, max);
 const validSession = (value: unknown): value is string => string(value, 200) && !/\s|[\x00-\x1f\x7f-\x9f]/.test(value);
+
+/** Shared card validation for session sends and owner-authorized cross-chat sends. */
+export function appContent(body: Record<string, unknown>): OutboxApp | undefined {
+  const { url, caption, subcaption, trailingCaption, trailingSubcaption, summary } = body;
+  if (!validAppUrl(url) || !line(caption, 200) || !optionalLine(subcaption, 200) || !optionalLine(trailingCaption, 200)
+    || !optionalLine(trailingSubcaption, 200) || !optionalLine(summary, 500)) return;
+  const optional = { subcaption, trailingCaption, trailingSubcaption, summary } as Record<string, string | undefined>;
+  return { url, caption, ...Object.fromEntries(Object.entries(optional).filter(([, value]) => value !== undefined)) };
+}
 
 /** Framing for a watcher event, so the agent never mistakes it for something the owner typed. */
 export const wakeText = (source: string, text: string): string =>
@@ -263,12 +272,9 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
 
       if (path === "/app") {
         fields(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "dedupeKey", "sessionId"]);
-        const { url, caption, subcaption, trailingCaption, trailingSubcaption, summary, dedupeKey, sessionId } = body;
-        if (!validAppUrl(url) || !line(caption, 200) || !optionalLine(subcaption, 200) || !optionalLine(trailingCaption, 200)
-          || !optionalLine(trailingSubcaption, 200) || !optionalLine(summary, 500)
-          || !string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);
-        const optional = { subcaption, trailingCaption, trailingSubcaption, summary } as Record<string, string | undefined>;
-        const app = { url, caption, ...Object.fromEntries(Object.entries(optional).filter(([, value]) => value !== undefined)) };
+        const { dedupeKey, sessionId } = body;
+        const app = appContent(body);
+        if (!app || !string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);
         const { id, created } = queueSession(store, "app", dedupeKey, sessionId, { text: "", app });
         return json({ id, created }, created ? 202 : 200);
       }

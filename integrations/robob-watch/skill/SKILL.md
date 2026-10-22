@@ -107,7 +107,7 @@ A woken turn (and a finished background subagent) does not have to text the owne
 - When the owner texted directly, always reply; `NO_REPLY` is for watcher and background turns.
 - A false positive: log it (or fix the watcher) and end with `NO_REPLY`.
 
-The `activity-digest` watcher (custom check, every 10 min) wakes the agent with unreported log lines when the oldest is 3h+ old or at 18:00-18:10 Dubai, never 23:00-08:00. The woken agent sends one short catch-up (or a PNG if dense), skipping noise, or ends with `NO_REPLY` if nothing is worth saying. Its marker lives in `~/.local/share/robob-watch/watchers/activity-digest/marker` (count of lines already reported). Write context for your own watchers with this in mind: say what counts as worth a text right away.
+The `activity-digest` watcher (custom check, every 10 min) wakes the agent when the oldest unreported log line is 3h+ old or at 18:00-18:10 Dubai, never 23:00-08:00, and at most once every 2h (15 Oct 2026). The wake text is capped at 15 lines: count, time span and per-topic counts built by `summarize.py`, plus the path of a file in `watchers/activity-digest/digests/` holding the full list (newest 30 kept). Read that file if you need detail. The woken agent sends one short catch-up (or a PNG if dense), skipping noise, or ends with `NO_REPLY` if nothing is worth saying. Its marker lives in `~/.local/share/robob-watch/watchers/activity-digest/marker` (count of lines already reported). Write context for your own watchers with this in mind: say what counts as worth a text right away.
 
 **Delivery fallbacks**, in order: bridge `wake` → plain iMessage `send` into the live session (the owner sees the event text, no agent turn) → Telegram notify. Failure and expiry alerts go Telegram-first. `robob-watch logs ID` shows `via=wake` for a normal wake.
 
@@ -126,6 +126,9 @@ robob-watch remove ID             # archived under ~/.local/share/robob-watch/ar
 ```
 
 Remove watchers once the thing is resolved, or when the owner says to stop. Done and expired watchers stay listed until removed. Remove them when you notice them.
+
+- Nightly 2026-10-15: `add --json` with `--replace` reads the expiry from the key `expires` (ISO or "14d"), not `expires_at`. Using `expires_at` silently resets it to the 14d default. After a replace, check `watcher.json` `expires_at` and fix it with `robob-watch resume ID --expires <ISO>`.
+- Nightly 2026-10-15: an email watcher whose filter changes gets a new seen-file key (`sha256(acct|mbox|query)`). Copy `mail-<oldkey>.seen` and `.seen.init` to the new key before `--replace`, or the new query re-baselines and misses the mail that prompted the change.
 
 ## Troubleshooting
 

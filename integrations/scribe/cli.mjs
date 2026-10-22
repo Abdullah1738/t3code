@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // scribe: reads mission lane transcripts and writes cited notes.
 //
-//   scribe run [--mission ID] [--slices N]          one pass over every lane the server lists
-//   scribe dry-run --thread ID [--name N] [--since ISO | --from EVENT] [--slices N] [--out DIR]
+//   scribe run [--mission ID] [--slices N] [--min-severity S]
+//                                                   one pass over every lane the server lists
+//   scribe dry-run --thread ID [--name N] [--since ISO | --from EVENT] [--slices N] [--min-severity S] [--out DIR]
 //                                                   one lane, real model, notes to files only
 //   scribe editor --mission ID [--input FILE] [--out FILE]
 //                                                   one Opus editor pass (bottom line, FYI, feed, suggestions);
@@ -10,9 +11,12 @@
 //   scribe report --mission ID --kind update|daily [--since ISO] [--to ISO] [--save] [--out FILE] [--live]
 //                                                   build a report from mission data; export it (scratch by default;
 //                                                   the live Crpko status files only with --live)
-//   scribe watch --mission ID [--sweep-minutes 15] [--slices N]
+//   scribe watch --mission ID [--sweep-minutes 15] [--slices N] [--min-severity S]
 //                                                   a run pass whenever a lane's run settles, plus a sweep;
 //                                                   runs until stopped
+//
+// --min-severity low|medium|high|critical keeps only notes at or above it (plus
+// updates to notes already on record); by default every note is kept.
 //
 // Nothing here starts itself; the cutover's LaunchAgents or a person do
 // (tmp/memory/cutover/scribe-schedules.json in the Robob checkout).
@@ -22,7 +26,7 @@ import { appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path';
 import { chat, EDITOR_MODEL, SCRIBE_MODEL } from './lib/model.mjs';
 import { eventsAfter, firstEventSince, openDb, threadInfo } from './lib/source.mjs';
-import { runLane } from './lib/run.mjs';
+import { runLane, severityFloor } from './lib/run.mjs';
 import { localSink } from './lib/local.mjs';
 import { controlConfig, serverClient, serverSink } from './lib/server.mjs';
 
@@ -50,6 +54,7 @@ const ask = (model) => ({ system, user }) => chat({ model, system, user });
 
 async function dryRun(opts) {
   if (!opts.thread) throw new Error('dry-run needs --thread');
+  severityFloor(opts['min-severity']);
   const db = openDb();
   const info = threadInfo(db, opts.thread);
   if (!info) throw new Error(`thread not found: ${opts.thread}`);
@@ -82,13 +87,17 @@ async function dryRun(opts) {
     ask: recordingAsk,
     sink,
     maxSlices: Number(opts.slices || 3),
+    minSeverity: opts['min-severity'],
     log,
   });
   db.close();
   return { ...summary, out };
 }
 
-async function run(opts, client = serverClient()) {
+async function run(opts, client) {
+  // Checked before any lane or credential read, so a typo fails as a typo.
+  severityFloor(opts['min-severity']);
+  client ??= serverClient();
   const db = openDb();
   const lanes = await client.lanes(opts.mission);
   const results = [];
@@ -101,6 +110,7 @@ async function run(opts, client = serverClient()) {
           ask: ask(SCRIBE_MODEL),
           sink: serverSink(client, lane),
           maxSlices: Number(opts.slices || 10),
+          minSeverity: opts['min-severity'],
           log,
         }),
       );
@@ -158,6 +168,7 @@ async function report(opts) {
 
 async function watch(opts) {
   if (!opts.mission) throw new Error('watch needs --mission');
+  severityFloor(opts['min-severity']);
   const { watchMission } = await import('./lib/watch.mjs');
   const config = controlConfig();
   const client = serverClient(config);

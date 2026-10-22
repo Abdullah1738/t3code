@@ -1,12 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { chunk, eventText, redact, resolveEvent, sliceText, toEvent, trim } from '../lib/transcript.mjs';
 import { normalizeReply, parseJson } from '../lib/model.mjs';
-import { runLane } from '../lib/run.mjs';
+import { runLane, severityFloor } from '../lib/run.mjs';
 import { localSink } from '../lib/local.mjs';
 
 const row = (ordinal, type, payload) => ({ ordinal, type, payload_json: JSON.stringify(payload) });
@@ -143,5 +145,121 @@ test('only checkpoints since the cursor move it without a model call', async () 
     assert.equal(summary.slices, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a severity floor keeps high notes and updates to open notes, and tells the model', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scribe-test-'));
+  try {
+    const all = [
+      toEvent(row(1, 'assistant_message', { text: 'Deploy failed: the bridge socket is gone after restart.' })),
+      toEvent(row(2, 'assistant_message', { text: 'Renamed a helper in the README, nothing else changed.' })),
+      toEvent(row(3, 'assistant_message', { text: 'Socket is back, the earlier deploy blocker is cleared.' })),
+    ];
+    const readEvents = async (after) => {
+      const events = all.filter((event) => event.event > after);
+      return { events, complete: true, lastSeen: events.at(-1)?.event ?? after };
+    };
+    const prompts = [];
+    const ask = async ({ user }) => {
+      prompts.push(user);
+      return {
+        content: JSON.stringify({
+          notes: [
+            { type: 'blocker', summary: 'Deploy blocked on the bridge socket.', quote: 'Deploy failed: the bridge socket is gone', event: 1, severity: 'high' },
+            { type: 'decision', summary: 'README helper renamed.', quote: 'Renamed a helper in the README', event: 2, severity: 'low' },
+            { type: 'blocker', summary: 'Socket back, deploy unblocked.', quote: 'Socket is back, the earlier deploy blocker is cleared.', event: 3, severity: 'low', replaces: 'note-open-1' },
+            { type: 'risk', summary: 'Replaces a note that is not open.', quote: 'Socket is back', event: 3, severity: 'medium', replaces: 'note-elsewhere' },
+          ],
+        }),
+        usage: { input: 10, output: 5 },
+      };
+    };
+    const sink = localSink(dir, { threadId: 't-1', missionId: 'm-1' });
+    const openNotes = sink.openNotes;
+    sink.openNotes = async () => [{ id: 'note-open-1', type: 'blocker', severity: 'high', summary: 'Deploy blocked.' }, ...(await openNotes())];
+    const summary = await runLane({ lane: { name: 'a', threadId: 't-1', missionId: 'm-1' }, readEvents, ask, sink, minSeverity: 'high' });
+    assert.equal(summary.notes, 2);
+    assert.equal(summary.belowFloor, 2);
+    assert.equal(summary.cursor, 3);
+    const [batch] = readFileSync(join(dir, 'batches.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.deepEqual(batch.notes.map((note) => note.summary), ['Deploy blocked on the bridge socket.', 'Socket back, deploy unblocked.']);
+    assert.match(prompts[0], /Only notes of severity high or above are kept/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('no floor keeps every note, and an unknown floor is refused', async () => {
+  assert.equal(severityFloor(undefined), 0);
+  assert.equal(severityFloor('critical'), 3);
+  assert.throws(() => severityFloor('loud'), /unknown severity loud/);
+  assert.throws(() => severityFloor(true), /unknown severity/);
+  const readEvents = async (after) => {
+    const events = after < 1 ? [toEvent(row(1, 'assistant_message', { text: 'Picked option B for the cache layout.' }))] : [];
+    return { events, complete: true, lastSeen: events.at(-1)?.event ?? after };
+  };
+  let prompt = '';
+  const ask = async ({ user }) => {
+    prompt = user;
+    return {
+      content: JSON.stringify({ notes: [{ type: 'decision', summary: 'Option B.', quote: 'Picked option B', event: 1, severity: 'low' }] }),
+      usage: { input: 1, output: 1 },
+    };
+  };
+  const dir = mkdtempSync(join(tmpdir(), 'scribe-test-'));
+  try {
+    const summary = await runLane({ lane: { name: 'a', threadId: 't-1', missionId: 'm-1' }, readEvents, ask, sink: localSink(dir, { threadId: 't-1', missionId: 'm-1' }) });
+    assert.equal(summary.notes, 1);
+    assert.equal(summary.belowFloor, 0);
+    assert.doesNotMatch(prompt, /Only notes of severity/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a floor that drops every note still moves the cursor past the slice', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scribe-test-'));
+  try {
+    const all = [
+      toEvent(row(1, 'assistant_message', { text: 'Tidied a comment in the README.' })),
+      toEvent(row(2, 'checkpoint', { files: [] })),
+    ];
+    const readEvents = async (after) => {
+      const events = all.filter((event) => event.event > after);
+      return { events, complete: true, lastSeen: events.at(-1)?.event ?? after };
+    };
+    let calls = 0;
+    const ask = async () => {
+      calls += 1;
+      return {
+        content: JSON.stringify({ notes: [{ type: 'decision', summary: 'README tidied.', quote: 'Tidied a comment', event: 1, severity: 'low' }] }),
+        usage: { input: 1, output: 1 },
+      };
+    };
+    const lane = { name: 'a', threadId: 't-1', missionId: 'm-1' };
+    const first = await runLane({ lane, readEvents, ask, sink: localSink(dir, lane), minSeverity: 'high' });
+    assert.equal(first.notes, 0);
+    assert.equal(first.belowFloor, 1);
+    assert.equal(first.cursor, 2);
+    const again = await runLane({ lane, readEvents, ask, sink: localSink(dir, lane), minSeverity: 'high' });
+    assert.equal(again.slices, 0);
+    assert.equal(calls, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('run refuses a bad floor before it looks for a credential', () => {
+  const home = mkdtempSync(join(tmpdir(), 'scribe-home-'));
+  try {
+    const env = { ...process.env, HOME: home, SCRIBE_CONTROL_FILE: join(home, 'missing.json') };
+    delete env.T3_CONTROL_TOKEN;
+    const cli = join(dirname(fileURLToPath(import.meta.url)), '..', 'cli.mjs');
+    const result = spawnSync(process.execPath, [cli, 'run', '--mission', 'm-1', '--min-severity', 'loud'], { env, encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /unknown severity loud/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });

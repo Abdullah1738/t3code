@@ -13,6 +13,7 @@ import { isAudio, SttError, type SttInput } from "./stt.ts";
 import type { Recover, RecoveryDetail } from "./local-attachments.ts";
 import { MAX_BLOB_BYTES, type InboundRecord, type OutboxPoll, type OutboxRecord, type Store } from "./store.ts";
 import { sessionMarker } from "./session.ts";
+import { appendObserved, classifyGroupMessage, explicitlyAddressed, GROUP_ENGAGED_MS, observedPreamble } from "./group-gate.ts";
 
 /**
  * `createdAt` is when the agent's current context started (a new thread or the
@@ -138,8 +139,11 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   }).join(", ")}. Messages from people other than the owner are prefixed with their name.`);
   else if (chat.kind !== "owner" && chat.person) lines.push(`Sender: ${chat.person.name} (${chat.person.role}).`);
   if (chat.kind !== "owner") lines.push("Permissions: the owner is the only person who approves special requests. Admins (Moni) can ask for the same things the owner can, through the same assistant and memory; keep her existing rules in ~/Documents/assistant/moni-prefs.md. Moni isn't technical: work out what she actually wants and choose the right way yourself (for example the wa CLI, not logging into WhatsApp Web) instead of following her steps literally. If she is rude to you, stop replying to her until she apologizes. Logins, sign-ups or account actions for her own accounts, her files and anything you build or track for her run only on her own offbox through the offbox-person skill, never on this Mac, Dia, the owner's Keychain, card-vault or the owner's accounts. Notes and facts about her (preferences, routines, health, documents) go in the life wiki as usual. Guests can ask questions and chat. Anything special (orders, bookings, payments, messages to others, account or file actions, anything that spends money, anything about the owner's or Moni's private data) needs the owner's approval: run `bun <cli> ask-owner --session CURRENT_SESSION_ID --key UNIQUE_KEY --text \"<who wants what>\"`, tell them you've asked, and act only after a wake that says the owner approved.");
-  if (chat.kind === "group") lines.push("This is a group: respond to the people here, but be less permissive than in a direct chat. Reply only when addressed or clearly useful, otherwise reply exactly NO_REPLY.");
-  lines.push("Reactions: you don't have to respond to everything. A tapback (`react --kind like` or an emoji) plus NO_REPLY is a complete answer when words add nothing.");
+  if (chat.kind === "group") {
+    lines.push("This is a group and you are a silent observer (owner rule). The bridge only wakes you when someone names you, swipe-replies to your message, or follows up right after asking you something; other group messages reach you later as quoted context. Act only on what is plainly asked of you. Do not chime in with facts, corrections, offers to help, opinions or reactions to chit-chat, thanks or banter between the others, even when you were named in passing. If nothing in the new message(s) asks you to do or answer something, end with exactly NO_REPLY and send no tapback.");
+  } else {
+    lines.push("Reactions: you don't have to respond to everything. A tapback (`react --kind like` or an emoji) plus NO_REPLY is a complete answer when words add nothing.");
+  }
   if (chat.kind === "group") lines.push("Location: not available in groups; ask the person to message this number directly.");
   else {
     const other = chat.kind === "owner" ? " (add `--chat moni` for Moni's)" : "";
@@ -149,6 +153,7 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   lines.push("Polls are not available on this line; ask in text. App cards still work (`app`).");
   lines.push("Links you create: for the owner's own chat use `publish --app SLUG` (tailnet only). For Moni, any group or anyone else use `share --app SLUG [--days N]` (public Cloudflare link, 7 days by default; `unshare --app SLUG` ends it). Every page you send needs <title>, og:title, og:description and og:image so link previews show; fix any metadataWarnings before sending the link.");
   if (chat.kind === "owner") lines.push("Other chats: `chats --session CURRENT_SESSION_ID` lists them; `send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` messages one; `wake --chat <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` passes the owner's decision to that chat's assistant. `allow --address A --name N [--admin]` and `allow-group --id G [--name N]` add people or groups when the owner asks.");
+  if (chat.kind === "owner") lines.push("Robob work (owner rule 2026-10-21): when the owner asks for a fix or change to Robob itself (this chat, the bridges, watchers, the app), don't do it here; open a mission request in his words with `mission request open robob --text \"<his words>\" --via imessage --inbound <id of the message where he asked>` (the Current incoming message ID, or the matching Source incoming message ID in a batch) and tell him it's with the Robob team. The `mission` CLI also reads the board for him (`mission needs`, `mission status robob`, `mission requests robob`) and acts on his asks, drafts and approvals only when he tells you to; the imessage skill's Missions section has the commands.");
   if (chat.kind === "owner") lines.push("Third parties (owner rule 2026-10-21/22): strangers who text the line are never answered by you directly. The bridge holds them and wakes you with the evidence it found in the owner's own outgoing messages. Grant a narrow, expiring scope only on that evidence or on the owner's own words: `guest-allow --address A --name N --purpose \"<his context, in his words>\" [--provider meeting|create-hold|flight-status[:EK57]|flight-updates[:EK57]] [--fact \"key=value\"] [--expires 7d] --evidence msgs:<id>|owner:<message id> [--evidence ...] --session CURRENT_SESSION_ID`. The bridge's scoped replier then talks with them within that purpose and sees only the providers and facts granted (fact values must be in his messages; flight grants default to arrival + 6h). A stranger's own claims never count. When the replier escalates, tell the owner with its proposed reply; his answer can widen the grant (a new guest-allow replaces it) or be relayed with `guest-send --address A --text T --session CURRENT_SESSION_ID --key K`. `guests` lists grants, `guest-revoke --address A` ends one. When unsure, ask the owner who they are and what to reply. `share-contact --chat <slug>` shares Robob's name and photo with a chat.");
   if (eyes) lines.push("The 👀 reaction to this message is already sent. Never write \"on it\" or \"working on it\".");
   return lines.join("\n");
@@ -594,6 +599,8 @@ export class Router {
       for (const row of this.store.pendingInbound()) {
         if (row.state === "processing") this.unsealBatch(row.id);
       }
+      // Before controls, so a group line not meant for Robob never answers his pending question either.
+      this.gateGroup();
       const rows = this.store.pendingInbound();
       const sendblue = this.options.context !== undefined;
       if (sendblue) await this.markRead(rows);
@@ -616,6 +623,7 @@ export class Router {
       await this.watch();
       await this.nudgeDue();
       this.flushNotice();
+      this.gateGroup();
       await this.dispatch(preceding);
       // Transport hints are best effort and never part of prompt acceptance.
       if (!sendblue && rows.length) await bounded(this.transport.read(this.options.chatGuid)).catch(() => {});
@@ -678,6 +686,8 @@ export class Router {
           "SELECT id, payload, state FROM inbound WHERE rowid > (SELECT rowid FROM inbound WHERE id = ?) ORDER BY rowid",
         ).all(leader.id);
         for (const row of following) {
+          // Group lines kept as context only never split a batch of addressed ones.
+          if (row.state === "observed") continue;
           const next = JSON.parse(row.payload) as NormalizedInbound;
           // Watcher events travel alone, so owner text is never read as part of one (or the reverse).
           if (row.state !== "pending" || next.text.trimStart().startsWith("/") || next.replyTo !== input.replyTo
@@ -783,7 +793,7 @@ export class Router {
       }
     }).immediate();
     const context = this.options.context;
-    const eyes = context !== undefined && context.chat.kind !== "owner";
+    const eyes = context !== undefined && this.eyesFor(input.batchIds ?? [row.id]);
     if (eyes && !this.store.get<boolean>(`eyes:${row.id}`)) {
       this.store.set(`eyes:${row.id}`, true);
       await bounded(context.react(input.id, "👀")).catch(() => this.options.log?.("eyes-reaction-failed"));
@@ -1360,6 +1370,79 @@ export class Router {
     } catch { return "wait"; }
   }
 
+  private isGroup(): boolean {
+    return this.options.context?.chat.kind === "group";
+  }
+
+  /**
+   * Sendblue: non-owner chats get a 👀 instead of an "on it". In a group only a
+   * batch that explicitly asked Robob gets one; a follow-up woken just in case does not.
+   */
+  private eyesFor(ids: string[]): boolean {
+    const context = this.options.context;
+    if (!context || context.chat.kind === "owner") return false;
+    return !this.isGroup() || ids.some(id => this.store.get<string>(`group-gate:${id}`) === "explicit");
+  }
+
+  /** How a group line reads in a prompt: the sender's name, plus the address for guests. */
+  private groupLine(input: NormalizedInbound): string {
+    const context = this.options.context!;
+    const who = input.sender ? context.roleOf(input.sender) : undefined;
+    const name = who ? `${who.name}${who.role === "guest" ? ` (${input.sender})` : ""}` : "Someone";
+    const words = input.text.trim() || (input.attachments.length ? `[sent ${input.attachments.length === 1 ? "a file" : `${input.attachments.length} files`}]` : "");
+    return `${name}: ${words}`;
+  }
+
+  /**
+   * Group chats: Robob is a silent observer. Each new person-typed row is
+   * classified once. Rows not addressed to him become `observed`: they never
+   * wake the agent and ride along as quoted context with the next turn that
+   * does. Bridge rows, commands and poll votes are never gated.
+   */
+  private gateGroup(): void {
+    if (!this.isGroup()) return;
+    const now = Date.now();
+    const turn = this.store.get<Turn | null>("activeTurn");
+    const running = turn && turn.phase !== "failed" && !turn.background && turn.inboundId && !synthetic(turn.inboundId) && this.current(turn)
+      ? new Set(this.batchSenders(this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId]))
+      : new Set<string>();
+    for (const row of this.store.pendingInbound()) {
+      if (row.state !== "pending" || synthetic(row.id) || this.store.get<string>(`group-gate:${row.id}`)) continue;
+      const input = row.payload as NormalizedInbound;
+      if (input.poll || input.text.trimStart().startsWith("/")) continue;
+      const sender = input.sender ?? "";
+      const engagedAt = sender ? this.store.get<number>(`group-engaged:${sender}`) ?? 0 : 0;
+      const message = {
+        text: input.text,
+        repliesToRobob: !!input.replyTo && this.store.byProviderId(input.replyTo)?.kind === "conversation",
+        engaged: running.has(sender) || now - engagedAt < GROUP_ENGAGED_MS,
+      };
+      const verdict = classifyGroupMessage(message);
+      this.store.db.transaction(() => {
+        if (verdict === "observe") {
+          this.store.set("group-observed", appendObserved(this.store.get<string[] | null>("group-observed") ?? [], [this.groupLine(input)]));
+          this.store.set(`group-gate:${row.id}`, "observe");
+          this.store.updateInbound(row.id, "observed");
+        } else {
+          this.store.set(`group-gate:${row.id}`, explicitlyAddressed(message) ? "explicit" : "followup");
+        }
+      }).immediate();
+      this.options.log?.(verdict === "observe" ? "group-observed" : "group-addressed", this.options.context!.chat.slug);
+    }
+  }
+
+  /**
+   * After a group reply that asks the people it answered something, they may
+   * answer without naming Robob for a while. A reply that asks nothing closes it.
+   */
+  private noteGroupReply(inboundId: string | undefined, replies: string[]): void {
+    if (!this.isGroup() || !inboundId || synthetic(inboundId)) return;
+    const asked = replies.some(reply => /\?/.test(stripInternalText(reply)));
+    for (const sender of this.batchSenders(this.store.get<NormalizedInbound | null>(`batch:${inboundId}`)?.batchIds ?? [inboundId])) {
+      this.store.set(`group-engaged:${sender}`, asked ? Date.now() : null);
+    }
+  }
+
   /** Distinct sender addresses across a batch's inbound rows (Sendblue mode). */
   private batchSenders(ids: string[]): string[] {
     const senders = new Set<string>();
@@ -1701,7 +1784,7 @@ export class Router {
     // resolution and the built-in guidance apply.
     const context = this.options.context;
     // Sendblue: a non-owner batch gets a 👀 once, instead of the agent writing "on it". Best effort.
-    const eyes = context !== undefined && context.chat.kind !== "owner";
+    const eyes = context !== undefined && this.eyesFor(input.batchIds ?? [row.id]);
     if (eyes && !this.store.get<boolean>(`eyes:${row.id}`)) {
       this.store.set(`eyes:${row.id}`, true);
       await bounded(context.react(input.id, "👀")).catch(() => this.options.log?.("eyes-reaction-failed"));
@@ -1723,6 +1806,9 @@ export class Router {
     }
     let body = text || (parts.length ? "Please examine the attached file(s)." : "The attached files are available at the quoted paths. Ask what I would like to do with them.");
     if (quote) body = `${quote}\n${body}`;
+    // Group lines Robob only observed come along once, as quoted context ahead of what woke him.
+    const observed = this.isGroup() && !members.some(resetRow) ? this.store.get<string[] | null>("group-observed") ?? [] : [];
+    if (observed.length) body = `${observedPreamble(observed)}\n${body}`;
     // One message he typed, with nothing of the bridge's mixed into his words, goes to
     // Robob as his exact text plus its inbound id; anything else is the bridge speaking.
     const typed = input.text.trim();
@@ -1746,6 +1832,12 @@ export class Router {
       }
       // A rotation recap only covers what came after the latest reset nudge.
       if (members.some(resetRow)) this.store.set("resetMark", { sessionId: turn.id, messageId: turn.messageId });
+      if (observed.length) {
+        const current = this.store.get<string[] | null>("group-observed") ?? [];
+        // Lines observed while this prompt was built stay for the next turn.
+        const carried = current.length >= observed.length && observed.every((line, i) => current[i] === line);
+        this.store.set("group-observed", carried ? current.slice(observed.length) : current.filter(line => !observed.includes(line)));
+      }
       return true;
     }).immediate();
     if (!submitting) return;
@@ -2168,6 +2260,8 @@ export class Router {
           id: `reply:${turn!.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
           ...replyTarget(turn!.inboundId),
         });
+        const said = [...earlier.map(reply => replyText(assistantText(reply))), text].filter(Boolean);
+        if (said.length) this.noteGroupReply(turn!.inboundId, said);
         if (turn!.inboundId) this.store.updateInbound(turn!.inboundId, "done");
         for (const id of this.syntheticBatch(turn!.inboundId) ?? []) this.store.set(this.retryKey(id), null);
         if (usage) this.store.set("routeContext", { sessionId: turn!.id, tokens: usage.input! + (usage.cache?.read ?? 0) + (usage.cache?.write ?? 0) });

@@ -9,6 +9,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { WAL_SIZE_LIMIT_BYTES } from "./Sqlite.ts";
 import * as SqlitePersistence from "./Sqlite.ts";
@@ -116,6 +117,33 @@ it.effect("only fsyncs the database file at WAL checkpoints", () => {
     const sql = yield* SqlClient.SqlClient;
     const rows = yield* sql<{ readonly synchronous: number }>`PRAGMA synchronous`;
     assert.equal(rows[0]?.synchronous, 1);
+  }).pipe(
+    Effect.provide(SqlitePersistence.layerFromPath(dbPath).pipe(Layer.provide(NodeServices.layer))),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
+  );
+});
+
+it.effect("gives the writer and the reader a 64 MB cache so sorts stay off disk", () => {
+  const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-cache-"));
+  const dbPath = NodePath.join(tempDir, "state.sqlite");
+
+  return Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TABLE cache_probe(id INTEGER PRIMARY KEY)`;
+    const writer = yield* sql<{ readonly cache_size: number }>`PRAGMA cache_size`;
+    const reader = yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const rows = yield* sql<{ readonly cache_size: number }>`PRAGMA cache_size`;
+          // Only the read-only reader refuses this, so the rows above came from it.
+          const write = yield* sql`INSERT INTO cache_probe(id) VALUES (${1})`.pipe(Effect.flip);
+          assert.include(String(write.reason.cause), "readonly database");
+          return rows;
+        }),
+      )
+      .pipe(NodeSqliteClient.readOnly);
+    assert.equal(writer[0]?.cache_size, -65536);
+    assert.equal(reader[0]?.cache_size, -65536);
   }).pipe(
     Effect.provide(SqlitePersistence.layerFromPath(dbPath).pipe(Layer.provide(NodeServices.layer))),
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),

@@ -27,6 +27,10 @@ def sent_text(args):
 
 class AddNoticeTests(unittest.TestCase):
     def setUp(self):
+        # Retain coverage for pre-card registrations and their legacy text retry.
+        patcher = mock.patch.object(t, 'card_enrollment', return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
@@ -94,7 +98,7 @@ class AddNoticeTests(unittest.TestCase):
         code, row = self.add()
         self.assertEqual(code, 0)
         self.assertEqual(row, {'tracker_id': 'order-talabat-3999000111', 'watcher_registered': True,
-                               'moni_notified': 'sent'})
+                               'moni_notified': 'sent', 'delivery_card': None})
         self.assertEqual(len(self.sends), 1)
         args = self.sends[0]
         self.assertNotIn('imsg', args)
@@ -355,7 +359,7 @@ class ReceiptParseTests(unittest.TestCase):
         self.assertEqual(receipt.parse(out, 0, 'moni', 'w'),
                          (True, {'for': 'moni', 'tracker_id': 'w', 'watcher_registered': True,
                                  'moni_notified': 'sent', 'moni_notice_failed': False,
-                                 'moni_notice_held': False}))
+                                  'moni_notice_held': False, 'delivery_card': None}))
         ok, row = receipt.parse(out.replace('"sent"', '"failed:bridge_exit_1"').encode(), 3, 'moni', 'w')
         self.assertTrue(ok)
         self.assertTrue(row['moni_notice_failed'])
@@ -468,7 +472,7 @@ class CLIPassThroughTests(unittest.TestCase):
             flow = mock.Mock(flow_id='f')
             flow.purchase.return_value = {'state': state}
             with self.subTest(state=state), \
-                    mock.patch.object(cli.journal, 'inspect', return_value={'order_id': '3999', 'app': 'talabat'}), \
+                    mock.patch.object(cli.journal, 'inspect', return_value={'order_id': '3999', 'app': 'talabat', 'vertical': 'shops'}), \
                     mock.patch.object(cli, 'register_tracking', return_value={'watcher': 'w'}) as register:
                 args = SimpleNamespace(label='Latea: boba', recipient='moni', prepare_only=False, resume_flow=None)
                 with mock.patch('commerce_talabat.TalabatFlow', return_value=flow), \
@@ -489,7 +493,7 @@ class CLIPassThroughTests(unittest.TestCase):
         import commerce_cli as cli
         for paid in (True, False):
             with self.subTest(paid=paid), tempfile.TemporaryDirectory() as temp, \
-                    mock.patch.object(cli.journal, 'inspect', return_value={'order_id': '3999', 'app': 'talabat'}), \
+                    mock.patch.object(cli.journal, 'inspect', return_value={'order_id': '3999', 'app': 'talabat', 'vertical': 'shops'}), \
                     mock.patch.object(cli.Path, 'home', return_value=Path(temp)), \
                     mock.patch.object(cli.subprocess, 'run', return_value=subprocess.CompletedProcess(
                         [], 0, stdout=b'{"moni_notified": "held:payment_unconfirmed"}', stderr=b'')) as run:

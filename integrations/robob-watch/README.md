@@ -1,9 +1,9 @@
 # robob-watch
 
-Durable watcher runner for Robob (the iMessage agent). Watchers poll a check command (default every 30s) and, on a new event, wake the live iMessage agent turn with context via the spectrum-bridge `POST /wake` endpoint (fallbacks: bridge `send` to the live route session, then telegram-bridge `notify`). Wakes still pending after 120s trigger a one-time heads-up text.
+Durable watcher runner for Robob (the iMessage agent). Watchers run a check command on an interval (default every 15s, minimum 5s) or within about a second of a trigger file changing and, on a new event, wake the live iMessage agent turn with context via the spectrum-bridge `POST /wake` endpoint (fallbacks: bridge `send` to the live route session, then telegram-bridge `notify`). Wakes still pending after 120s trigger a one-time heads-up text.
 
 Layout (runtime lives at `~/.local/share/robob-watch`; this directory is the canonical source):
-- `src/runner.ts` runner loop (10s tick), `src/cli.ts` CLI (add/list/show/remove/pause/resume/test/fire-test), `src/lib.ts` shared logic
+- `src/runner.ts` runner loop (1s tick), `src/cli.ts` CLI (add/list/show/remove/pause/resume/test/fire-test), `src/lib.ts` shared logic
 - `helpers/` check helpers: whatsapp-new-message, output-changed, email-new-message, wa-lock
 - `test/` bun tests
 - `scripts/com.ardud.robob-watch.plist` LaunchAgent, `scripts/robob-watch` CLI wrapper for `~/.local/bin`

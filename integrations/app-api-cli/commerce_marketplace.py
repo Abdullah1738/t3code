@@ -132,6 +132,8 @@ class MarketplaceFlow:
                 evidence_hash=journal.digest({'reason':'EXACT_ADDED_MANIFEST_MISMATCH'}))
             journal.fail('EXACT_ADDED_MANIFEST_MISMATCH')
         self.last_cart=after
+        journal.observe(self.flow_id, self.current_operation, outcome='CART_READBACK',
+            evidence_hash=market.cleanup_readback_hash(after, self.account_hash, self.address_hash))
         self.owned_offers=((offer,'',quantity),)
         return result.summary()
 

@@ -437,6 +437,7 @@ class MinutesFlow:
             j.fail('MINUTES_PAYMENT_ALREADY_CONSUMED_OR_ORDER_MISSING')
         self=object.__new__(cls);self.auth=auth or NoonAuthLifecycle()
         self.current=readback_session(self.auth)
+        self.card_recovered=True
         self.snapshot=self.auth.reconcile('minutes') if self.auth.status('minutes')['maintenance_state']!='none' else self.auth.revalidate('minutes')
         if self.snapshot.account_ref!=binding['account_hash']:j.fail('MINUTES_RECOVERY_ACCOUNT_CHANGED')
         self.flow_id=flow_id;self.scope_hash=binding['scope_hash'];self.opened=True
@@ -578,6 +579,8 @@ class MinutesFlow:
         order=self.review['order']
         name=f"order-noon-{order.lower()}"
         command=[WATCH_BIN,'add','--app','noon','--order',order,
+                 *__import__('delivery_cards').commerce_args(self, 'minutes'),
+                 '--payment-confirmed',
                  *order_watch_receipt.command_args(recipient,order_watch_receipt.reserved_minor(j,self.flow_id)),
                  '--placed-at',placed_at or self.review.get('placed_at')
                  or dt.datetime.now(dt.timezone(dt.timedelta(hours=4))).isoformat(),
