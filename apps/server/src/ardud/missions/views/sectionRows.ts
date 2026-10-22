@@ -246,12 +246,16 @@ export const sectionData = (
     (section) => sectionRows(sources, missionId, section),
   ).pipe(Effect.map((all) => all.filter((data): data is ViewSectionData => data !== null)));
 
-/** Record kinds an active section queries; a commit touching one refreshes rows. */
+/**
+ * Record kinds an active section's rows read; a commit touching one refreshes
+ * rows. Report periods follow the mission's day boundary, so they read the
+ * mission too.
+ */
 export const queriedKinds = (sections: ReadonlyArray<ViewSection>): ReadonlySet<string> =>
   new Set(
-    sections.flatMap((section) =>
-      section.status === "active" && section.definition.source._tag === "query"
-        ? [section.definition.source.query.kind]
-        : [],
-    ),
+    sections.flatMap((section) => {
+      if (section.status !== "active" || section.definition.source._tag !== "query") return [];
+      const kind = section.definition.source.query.kind;
+      return kind === "report" ? [kind, "mission"] : [kind];
+    }),
   );

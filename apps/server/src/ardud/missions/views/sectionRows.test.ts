@@ -306,6 +306,54 @@ describe("report sections", () => {
       }),
     ),
   );
+
+  it.effect("a new day boundary relabels the report rows of an open view", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        yield* report("daily", "2026-10-20T20:00:00.000Z", "2026-10-21T20:00:00.000Z", "# Wed");
+        const views = yield* ViewService;
+        const store = yield* MissionStore.MissionStore;
+        const placed = yield* views.placeSection(ownerApp, reportSection("daily", ["daily"], 5));
+        const app = yield* viewsWsHandlers({
+          surface: "web",
+          session: {
+            sessionId: "session-app",
+            subject: "one-time-token",
+            origin: { _tag: "owner", source: "cli" },
+          },
+        });
+        const periodOf = (item: MissionViewsFeedItem | undefined) =>
+          item?._tag === "snapshot"
+            ? item.snapshot.sectionData?.find((data) => data.sectionId === placed.ref.id)?.rows[0]
+                ?.value.period
+            : undefined;
+        const items = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const pull = yield* Stream.toPull(
+              app[MISSIONS_VIEWS_WS_METHODS.subscribe]({ missionId }),
+            );
+            const seen: Array<MissionViewsFeedItem> = [...(yield* pull)];
+            yield* store.upsert(
+              { _tag: "mission", record: { ...mission, reports: { dayBoundary: "Asia/Dubai" } } },
+              {
+                missionId,
+                kind: "mission.updated",
+                actor: { _tag: "system", component: "test" },
+                provenance: { _tag: "system", component: "test" },
+                summary: "day boundary",
+                subject: null,
+              },
+            );
+            while (seen.length < 2) seen.push(...(yield* pull));
+            return seen;
+          }),
+        );
+        assert.equal(periodOf(items[0]), "20 Oct 20:00 – 21 Oct 20:00 UTC");
+        assert.equal(periodOf(items[1]), "Wed 21 Oct (Dubai day)");
+      }),
+    ),
+  );
 });
 
 describe("section rows", () => {
