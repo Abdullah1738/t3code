@@ -816,6 +816,8 @@ describe("chart axes", () => {
       [Number.MAX_VALUE],
       [-Number.MAX_VALUE],
       [-Number.MAX_VALUE, Number.MAX_VALUE],
+      [-8e307, 8e307],
+      [-Number.MAX_VALUE / 2.1, Number.MAX_VALUE / 2.1],
       [1, Number.MAX_VALUE],
       [Number.MIN_VALUE],
     ]) {

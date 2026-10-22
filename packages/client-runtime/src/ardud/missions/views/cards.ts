@@ -581,19 +581,19 @@ export function viewChartScale(points: ReadonlyArray<ViewChartPoint>): ViewChart
   // Values near Number.MAX_VALUE overflow the rounded bounds (or the span) to
   // Infinity, and a denormal span rounds the step to 0; the plot then spans
   // the raw values (high > low here) with no ticks between.
-  if (!([span, step, min, max].every(Number.isFinite) && step > 0)) {
-    return {
-      min: low,
-      max: high,
-      ticks: [low, high].map((value) => ({ value, label: chartLabel(value) })),
-    };
-  }
-  const count = Math.min(CHART_TICKS_MAX, Math.round((max - min) / step) + 1);
+  const raw: ViewChartScale = {
+    min: low,
+    max: high,
+    ticks: [low, high].map((value) => ({ value, label: chartLabel(value) })),
+  };
+  if (!([span, step, min, max].every(Number.isFinite) && step > 0)) return raw;
+  // Divided first, so bounds near ±MAX_VALUE don't overflow the count.
+  const count = Math.min(CHART_TICKS_MAX, Math.round(max / step - min / step) + 1);
   const ticks = Array.from({ length: count }, (_, slot) => {
     const clean = Number((min + slot * step).toPrecision(12));
     return { value: clean, label: chartLabel(clean) };
   });
-  return { min, max, ticks };
+  return ticks.every((tick) => Number.isFinite(tick.value)) ? { min, max, ticks } : raw;
 }
 
 /** How high a value sits on the scale, 0 at the bottom and 1 at the top. */
