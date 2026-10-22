@@ -111,6 +111,16 @@ const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | nul
   return missionsSource().subscribeRequest({ missionId, requestId }, emit);
 }, warm);
 
+/** The per-mission feeds a board reads, besides its views. */
+export function missionBoardStores(missionId: MissionId): ReadonlyArray<SnapshotStore<unknown>> {
+  return [
+    overviewStores(missionId),
+    inboxStores(missionId),
+    requestStores(missionId),
+    laneStores(missionId),
+  ];
+}
+
 const NONE: SnapshotStore<never> = {
   get: () => undefined,
   subscribe: () => () => {},

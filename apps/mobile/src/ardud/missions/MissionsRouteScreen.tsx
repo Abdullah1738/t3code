@@ -14,6 +14,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { AppText as Text } from "../../components/ui/AppText";
 import { AppBar } from "../../components/ui/AppBar";
 import { cn } from "../../lib/cn";
+import { useBoardReady, useWarmBoards } from "./boardFeeds";
 import { InboxPane } from "./InboxPane";
 import { MissionBoard } from "./MissionBoard";
 import { useMissionList, useMissionOverview, useMissionsEnvironmentId } from "./missionsStore";
@@ -48,6 +49,7 @@ export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRoutePa
   const state = missionsRouteState(route.params);
   const list = useMissionList();
   const overview = useMissionOverview(state.missionId);
+  const boardReady = useBoardReady(state.tab === "missions" ? state.missionId : null);
   const actions = useOverviewActions(overview);
   const [width, setWidth] = useState(0);
   const [askKey, setAskKey] = useState(0);
@@ -94,6 +96,11 @@ export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRoutePa
         : (missionRow?.title ?? "Missions");
   const mission = overview?.mission ?? null;
 
+  const picking = state.tab === "missions" && state.missionId === null;
+  useWarmBoards(
+    rows.map((row) => row.id),
+    picking,
+  );
   const pickMission = (missionId: MissionId) => go({ missionId, page: "board" });
   const missionPicker = (
     <ScrollView className="flex-1" contentContainerClassName="gap-3 px-4 pb-8 pt-3">
@@ -136,7 +143,10 @@ export function MissionsRouteScreen({ route }: StaticScreenProps<MissionsRoutePa
     );
   } else if (state.missionId === null) {
     body = missionPicker;
-  } else if (overview === undefined) {
+  } else if (
+    overview === undefined ||
+    (overview !== null && state.page === "board" && !boardReady)
+  ) {
     body = <LoadingLine />;
   } else if (overview === null) {
     body = <EmptyLine label="This mission is gone." />;

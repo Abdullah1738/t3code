@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   connectionLabel,
+  createSnapshotGate,
   createSnapshotStore,
   feedFailureLines,
   feedOfflineLines,
@@ -117,6 +118,35 @@ describe("snapshot store", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("a gate opens every store and turns ready once each answered, then stays ready", () => {
+    const sources: Array<{ emit: (value: number) => void; fail: (error: unknown) => void }> = [];
+    let closed = 0;
+    const store = () =>
+      createSnapshotStore<number>((emit, fail) => {
+        sources.push({ emit, fail });
+        return () => {
+          closed += 1;
+        };
+      });
+    const gate = createSnapshotGate([store(), store()]);
+    let changes = 0;
+    const stop = gate.subscribe(() => {
+      changes += 1;
+    });
+
+    expect(sources).toHaveLength(2);
+    expect(gate.ready()).toBe(false);
+    sources[0]?.emit(1);
+    expect(gate.ready()).toBe(false);
+    sources[1]?.fail(new Error("down"));
+    expect(gate.ready()).toBe(true);
+    expect(changes).toBe(2);
+
+    stop();
+    expect(closed).toBe(2);
+    expect(gate.ready()).toBe(true);
   });
 
   it("says what failed and when it last loaded, with the day once it is not today", () => {

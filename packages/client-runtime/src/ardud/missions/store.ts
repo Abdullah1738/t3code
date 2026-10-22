@@ -189,3 +189,29 @@ export function createKeyedSnapshotStores<K, T>(
     return store;
   };
 }
+
+/**
+ * Reads several stores as one. Subscribing opens them all; `ready` turns true
+ * once each has answered with a value or a failure, and stays true after, so
+ * a screen that has shown does not blank while one feed retries.
+ */
+export function createSnapshotGate(stores: ReadonlyArray<SnapshotStore<unknown>>): {
+  readonly subscribe: (onChange: () => void) => () => void;
+  readonly ready: () => boolean;
+} {
+  let shown = false;
+  return {
+    subscribe: (onChange) => {
+      const stops = stores.map((store) => store.subscribe(onChange));
+      return () => {
+        for (const stop of stops) stop();
+      };
+    },
+    ready: () => {
+      if (!shown) {
+        shown = stores.every((store) => store.get() !== undefined || store.failure() !== undefined);
+      }
+      return shown;
+    },
+  };
+}
