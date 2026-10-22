@@ -1504,6 +1504,19 @@ export const AttachThreadInput = Schema.Struct({
 export type AttachThreadInput = typeof AttachThreadInput.Type;
 // --- end crw-threads additions ---
 
+// --- r22 fixes ---
+/**
+ * The owner or the mission's master moves one of its attached threads on:
+ * detach a wrong one back to the ordinary list, close it, or reopen it.
+ */
+export const SetThreadAttachmentInput = Schema.Struct({
+  missionId: MissionId,
+  threadId: ThreadId,
+  state: ThreadAttachmentState,
+});
+export type SetThreadAttachmentInput = typeof SetThreadAttachmentInput.Type;
+// --- end r22 fixes ---
+
 /** The one answer to "what does PR X need next?" for crw, lanes and the merge gate. */
 export const ReviewPlan = Schema.Struct({
   missionId: MissionId,

@@ -1591,6 +1591,12 @@ export function createFixtureMissionsSource(
       commit();
       return Promise.resolve();
     },
+
+    // ardud missions: r22 fixes
+    // The fixture shows no attached threads, so there is nothing to move.
+    setThreadAttachment({ missionId, threadId }) {
+      return fail("not-found", `Thread ${threadId} is not attached to mission ${missionId}.`);
+    },
   };
   return source;
 }

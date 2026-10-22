@@ -1410,6 +1410,10 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     mergeLanes: async (input) => {
       await transport.request(WS_METHODS.missionsMergeLanes, input);
     },
+    // ardud missions: r22 fixes
+    setThreadAttachment: async (input) => {
+      await transport.request(WS_METHODS.missionsSetThreadAttachment, input);
+    },
 
     // --- Policy ---
 

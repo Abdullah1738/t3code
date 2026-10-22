@@ -1,9 +1,11 @@
 import {
+  isOwnerProvenance,
   MissionError,
   type AttachThreadInput,
   type MissionEventKind,
   type MissionProvenance,
   type MissionRecordRef,
+  type SetThreadAttachmentInput,
   type ThreadAttachment,
   type ThreadAttachmentState,
 } from "@t3tools/contracts";
@@ -13,6 +15,7 @@ import * as Option from "effect/Option";
 
 import type { AttachTargets } from "./attachTargets.ts";
 import type { WriteKit } from "./kit.ts";
+import { isMasterOf } from "./master.ts";
 
 const fail = (code: MissionError["code"], detail: string) =>
   Effect.fail(new MissionError({ code, detail }));
@@ -40,7 +43,8 @@ const VERB: Record<ThreadAttachmentState, string> = {
 /**
  * A component (crw) keeps the threads it runs for the mission inside it.
  * Attachments carry no authority: role holders and lanes stay the only
- * threads that act for the mission.
+ * threads that act for the mission. The owner and the mission's master can
+ * move any attachment on, including detaching one that should not be there.
  */
 export const makeAttachmentWrites = (kit: WriteKit, targets: AttachTargets["Service"]) => {
   const { store, serial, loadMission, unchanged, commit } = kit;
@@ -93,6 +97,10 @@ export const makeAttachmentWrites = (kit: WriteKit, targets: AttachTargets["Serv
           );
         }
         const inMission = before !== null && before.missionId === mission.id;
+        // A detach by the owner or master sticks when the PR later settles; a fresh open reattaches.
+        if (inMission && before.state === "detached" && state !== "open") {
+          return yield* unchanged(mission.id, attachmentRef(before));
+        }
         if (state === "open") yield* requireNotActing(input.threadId);
         if (!inMission || before.state === "detached") {
           yield* requireCreatedBy(input.threadId, provenance.component);
@@ -130,7 +138,50 @@ export const makeAttachmentWrites = (kit: WriteKit, targets: AttachTargets["Serv
       }),
     );
 
-  return { attachThread };
+  const setThreadAttachment = (provenance: MissionProvenance, input: SetThreadAttachmentInput) =>
+    serial(
+      Effect.gen(function* () {
+        if (
+          !isOwnerProvenance(provenance) &&
+          !(yield* isMasterOf(store, input.missionId, provenance))
+        ) {
+          return yield* fail(
+            "forbidden",
+            `Only the owner or mission ${input.missionId}'s master moves its attached threads.`,
+          );
+        }
+        const mission = yield* loadMission(input.missionId);
+        const before = Option.getOrNull(yield* store.get("thread-attachment", input.threadId));
+        if (before === null || before.missionId !== mission.id) {
+          return yield* fail(
+            "not-found",
+            `Thread ${input.threadId} is not attached to mission ${mission.id}.`,
+          );
+        }
+        if (before.state === input.state)
+          return yield* unchanged(mission.id, attachmentRef(before));
+        if (input.state === "open") yield* requireNotActing(input.threadId);
+        const record: ThreadAttachment = {
+          ...before,
+          state: input.state,
+          updatedAt: yield* nowIso,
+        };
+        return yield* commit(provenance, {
+          missionId: mission.id,
+          kind: EVENT[input.state],
+          summary: `${VERB[input.state]} ${record.title}`,
+          ref: attachmentRef(record),
+          upserts: [{ _tag: "thread-attachment", record }],
+          payload: {
+            state: input.state,
+            attachedBy: record.attachedBy,
+            pullRequest: record.pullRequest,
+          },
+        });
+      }),
+    );
+
+  return { attachThread, setThreadAttachment };
 };
 
 const samePullRequest = (a: ThreadAttachment["pullRequest"], b: ThreadAttachment["pullRequest"]) =>

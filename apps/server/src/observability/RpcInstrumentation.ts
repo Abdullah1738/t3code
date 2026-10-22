@@ -266,6 +266,8 @@ const RPC_AGGREGATES = {
   [WS_METHODS.missionsPortfolio]: "missions",
   [WS_METHODS.missionsSetPortfolioOrder]: "missions",
   [WS_METHODS.missionsNudgeLane]: "missions",
+  // ardud missions: r22 fixes
+  [WS_METHODS.missionsSetThreadAttachment]: "missions",
   // ardud missions: router
   [WS_METHODS.missionsRooms]: "missions",
   [WS_METHODS.missionsRoomPage]: "missions",

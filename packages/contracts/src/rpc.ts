@@ -359,6 +359,7 @@ import {
   MissionWorkItemsPage,
   MissionPortfolioInput,
   NudgeLaneInput,
+  SetThreadAttachmentInput,
   PortfolioSnapshot,
   SetPortfolioOrderInput,
   AnswerAskInput,
@@ -644,6 +645,8 @@ export const WS_METHODS = {
   missionsPortfolio: "missions.portfolio",
   missionsSetPortfolioOrder: "missions.setPortfolioOrder",
   missionsNudgeLane: "missions.nudgeLane",
+  // ardud missions: r22 fixes
+  missionsSetThreadAttachment: "missions.setThreadAttachment",
   // ardud missions: router
   missionsRooms: "missions.rooms",
   missionsRoomPage: "missions.roomPage",
@@ -2152,6 +2155,12 @@ const WsMissionsNudgeLaneRpc = missionRpc(
   NudgeLaneInput,
   MissionMutationResult,
 );
+// ardud missions: r22 fixes
+const WsMissionsSetThreadAttachmentRpc = missionRpc(
+  WS_METHODS.missionsSetThreadAttachment,
+  SetThreadAttachmentInput,
+  MissionMutationResult,
+);
 // ardud missions: router
 const WsMissionsRoomsRpc = missionRpc(
   WS_METHODS.missionsRooms,
@@ -2299,6 +2308,8 @@ export const WsMissionsRpcGroup = RpcGroup.make(
   WsMissionsPortfolioRpc,
   WsMissionsSetPortfolioOrderRpc,
   WsMissionsNudgeLaneRpc,
+  // ardud missions: r22 fixes
+  WsMissionsSetThreadAttachmentRpc,
   // ardud missions: router
   WsMissionsRoomsRpc,
   WsMissionsRoomPageRpc,

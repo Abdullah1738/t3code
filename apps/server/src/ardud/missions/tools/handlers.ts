@@ -482,6 +482,12 @@ const handlers = {
       missions.setApprovalRouting(provenance, input),
     ),
   ),
+  // ardud missions: r22 fixes
+  mission_thread_attachment: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.setThreadAttachment(provenance, input),
+    ),
+  ),
   mission_rule: McpToolAccess.actsAsCaller((input) =>
     withRules((rules, provenance) =>
       rules.upsertRule(provenance, input).pipe(Effect.map((rule) => ({ rule }))),
