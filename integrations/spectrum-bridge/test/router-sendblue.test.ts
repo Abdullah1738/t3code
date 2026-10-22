@@ -155,6 +155,13 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(owner).not.toContain("ask-owner");
 });
 
+test("only the owner's prompt sends Robob fixes to the mission as his request", () => {
+  const owner = sendblueContextPrompt(context("owner"), false, []);
+  expect(owner).toContain("mission request open robob");
+  expect(owner).toContain("--inbound <id of the message where he asked>");
+  for (const kind of ["dm", "group"] as const) expect(sendblueContextPrompt(context(kind), false, [])).not.toContain("mission request");
+});
+
 test("every chat's prompt says which link kind to create and to fill preview metadata", () => {
   for (const kind of ["owner", "dm", "group"] as const) {
     const prompt = sendblueContextPrompt(context(kind), false, []);
