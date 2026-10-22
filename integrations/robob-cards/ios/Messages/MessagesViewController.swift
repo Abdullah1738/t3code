@@ -18,8 +18,10 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     private let note = UILabel()
     private let retry = UIButton(type: .system)
     private let spinner = UIActivityIndicatorView(style: .medium)
-    // Compact mode is a preview inside the app drawer; a tap anywhere asks
-    // Messages for the full-height view so the page can be used.
+    // Compact (the app drawer) and transcript (the live bubble in the chat) are
+    // previews; a tap anywhere asks Messages for the full-height view so the
+    // page can be used. From the transcript Messages opens a new expanded
+    // instance, which loads the same selected message.
     private let expandOverlay = UIControl()
     private var cardURL: URL?
 
@@ -112,7 +114,7 @@ final class MessagesViewController: MSMessagesAppViewController, WKNavigationDel
     }
 
     private func layout(for style: MSMessagesAppPresentationStyle) {
-        let preview = style == .compact && cardURL != nil
+        let preview = (style == .compact || style == .transcript) && cardURL != nil
         expandOverlay.isHidden = !preview
         webView.scrollView.isScrollEnabled = !preview
     }
