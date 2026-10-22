@@ -120,13 +120,19 @@ def commerce_metadata(flow, vertical):
     """Project only display fields from the checkout already verified by its lane."""
     rows = []
     if vertical == 'minutes':
+        if getattr(flow, 'card_recovered', False):
+            return []  # A post-place session can belong to a newer basket.
         current = getattr(flow, 'current', None)
         rows = (getattr(current, 'wire', None) or {}).get('items', [])
         if not rows:
             rows = (getattr(current, 'projection', None) or {}).get('lines', [])
+        # The payable total is verified, but unit-price discount semantics vary
+        # across Minutes rows. Omit prices rather than label list prices as paid.
+        rows = [{**r, 'price': None, 'price_minor': None} for r in rows]
     elif vertical == 'nownow':
         current = getattr(flow, 'current', None)
         rows = (getattr(current, 'wire', None) or {}).get('data', {}).get('products', [])
+        rows = [{**r, 'price': None, 'line_total': amount(r.get('totalPrice'))} for r in rows]
     elif vertical in ('main', 'supermall'):
         response = getattr(flow, 'session_response', None)
         rows = [i for s in (getattr(response, 'data', None) or {}).get('shipments', [])
@@ -325,10 +331,10 @@ def preview(path, v):
     tmp.replace(path)
 
 
-def build(cfg, data, meta=None, outdir=None, url=None):
+def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
     folder = Path(outdir) if outdir else APPS / slug(cfg['app'], cfg['order'])
     folder.mkdir(parents=True, exist_ok=True)
-    metadata = {**read(folder / 'items.json'), **cfg.get('card_meta', {}), **(meta or {})}
+    metadata = {**({} if public else read(folder / 'items.json')), **cfg.get('card_meta', {}), **(meta or {})}
     v = view(cfg, data, metadata)
     # JSON refresh and static fallback use the same projection.
     atomic(folder / 'status.json', v)
@@ -358,6 +364,32 @@ def bridge(args, timeout=12):
     return json.loads(p.stdout)
 
 
+def prune_completed_shares():
+    """Free only delivery-owned shares whose terminal page had an hour to be read."""
+    records = bridge(['shares'], timeout=2).get('shares', [])
+    by_app = {r['app']: r for r in records if isinstance(r,dict) and isinstance(r.get('app'),str)}
+    for path in sorted((ROOT / 'cards').glob('*.json')):
+        state = read(path)
+        finished = state.get('terminal_at')
+        if not finished or time.time() - finished < 3600 or state.get('unshared'):
+            continue
+        shared = by_app.get(state.get('slug'))
+        if not shared or shared.get('url') != state.get('url'):
+            continue
+        bridge(['unshare', '--app', state['slug']], timeout=2)
+        state['unshared'] = True
+        atomic(path, state)
+        return  # Bound maintenance latency per new registration.
+
+
+def share_days(cfg):
+    days = 7 if cfg.get('app') == 'amazon' or cfg.get('vertical') in ('main', 'supermall') else 2
+    promised = instant(cfg.get('eta'))
+    if promised:
+        days = max(days, math.ceil((promised.timestamp()-time.time())/86400)+2)
+    return min(30, max(1, days))
+
+
 def sync(cfg, data, *, send=False):
     settings = cfg.get('delivery_card')
     if not isinstance(settings, dict):
@@ -375,7 +407,6 @@ def sync(cfg, data, *, send=False):
         if recipient != 'owner':
             public_slug = public_slug[:48] + '-' + hashlib.sha256((key + ':public-v1').encode()).hexdigest()[:12]
         folder = APPS / public_slug
-        rendered = build(cfg, data, outdir=folder, url=state.get('url'))
         if recipient != 'owner' and folder.exists():
             allowed = {'index.html', 'status.json', 'preview.png', 'preview-state.json'}
             extras = [p for p in folder.iterdir() if p.name not in allowed]
@@ -383,7 +414,10 @@ def sync(cfg, data, *, send=False):
                 state.update(status='failed:public_directory_has_extra_files')
                 atomic(statepath, state)
                 return {'status': state['status'], 'slug': public_slug}
+        rendered = build(cfg, data, outdir=folder, url=state.get('url'), public=recipient != 'owner')
         state.update(rendered)
+        if rendered['stage'] in ('Delivered', 'Cancelled'):
+            state.setdefault('terminal_at', time.time())
         if not send or settings.get('held') or settings.get('skip_send'):
             if state.get('status') != 'sent':
                 state['status'] = 'held:payment_unconfirmed' if settings.get('held') else 'skipped' if settings.get('skip_send') else state.get('status', 'not_sent')
@@ -395,7 +429,14 @@ def sync(cfg, data, *, send=False):
             else:
                 try:
                     if not state.get('url'):
-                        published = bridge(['publish' if recipient == 'owner' else 'share', '--app', rendered['slug']])
+                        if recipient != 'owner':
+                            try:
+                                prune_completed_shares()
+                            except Exception:
+                                pass  # Maintenance cannot block this order's card.
+                        published = bridge(['publish' if recipient == 'owner' else 'share', '--app', rendered['slug'],
+                                            *(['--days', str(share_days(cfg))] if recipient != 'owner' else [])],
+                                           timeout=65 if recipient != 'owner' else 12)
                         if published.get('metadataWarnings'):
                             raise ValueError('card_metadata_incomplete')
                         url = published.get('url')
@@ -405,7 +446,7 @@ def sync(cfg, data, *, send=False):
                             raise ValueError('public_card_url_required')
                         state['url'] = url
                         atomic(statepath, state)
-                        build(cfg, data, outdir=folder, url=url)
+                        build(cfg, data, outdir=folder, url=url, public=recipient != 'owner')
                     if not state.get('send_args'):
                         session = route()
                         dedupe = 'delivery-card:' + key
@@ -425,9 +466,9 @@ def sync(cfg, data, *, send=False):
                     state['status'] = 'failed:' + (str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
         # Quick-tunnel links can change after bridge restart. Report a broken
         # original link for repair, without sending another progress message.
-        if state.get('status') == 'sent' and recipient != 'owner' and time.time() - state.get('link_checked_at', 0) > 300:
+        if state.get('status') == 'sent' and recipient != 'owner' and not state.get('unshared') and time.time() - state.get('link_checked_at', 0) > 300:
             try:
-                shared = bridge(['shares'])
+                shared = bridge(['shares'], timeout=2)
                 records = shared if isinstance(shared, list) else shared.get('shares', [])
                 live = next((r for r in records if r.get('app') == public_slug), None)
                 state['link_health'] = 'ok' if live and live.get('live') and live.get('url') == state.get('url') else 'needs_repair'
@@ -437,6 +478,45 @@ def sync(cfg, data, *, send=False):
         atomic(statepath, state)
         statepath.chmod(0o600)
         return {k: state.get(k) for k in ('status', 'slug', 'url', 'link_health')}
+
+
+def repair_link(cfg, data):
+    """Explicit replacement for a confirmed-sent link; never a progress ping."""
+    settings = cfg.get('delivery_card', {})
+    recipient = settings.get('chat') or cfg.get('for')
+    if recipient == 'owner' or settings.get('held') or settings.get('skip_send'):
+        raise ValueError('public_sent_card_required')
+    path = ROOT / 'cards' / (cfg['watcher'] + '.json')
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read(path)
+        if state.get('status') != 'sent' or not state.get('url'):
+            raise ValueError('public_sent_card_required')
+        repair = state.get('repair')
+        if not repair or repair.get('status') == 'sent':
+            shared = bridge(['shares']).get('shares', [])
+            current = next((r for r in shared if r.get('app') == state['slug'] and r.get('live')), None)
+            url = current.get('url') if current else None
+            if not url:
+                url = bridge(['share','--app',state['slug'],'--days',str(share_days(cfg))],timeout=65).get('url')
+            if not isinstance(url,str) or not (urlparse(url).hostname or '').endswith('.trycloudflare.com'):
+                raise ValueError('public_card_url_required')
+            if url == state['url']:
+                state['link_health'] = 'ok'; atomic(path,state)
+                return {'status':'unchanged','url':url}
+            key = 'delivery-card-repair:' + cfg['watcher'] + ':' + hashlib.sha256(url.encode()).hexdigest()[:12]
+            repair = {'status':'attempting','url':url,'args':['send','--to',recipient,'--text='+url,
+                      '--session',route(),'--key',key]}
+            state['repair'] = repair
+            atomic(path,state)
+        build(cfg,data,outdir=APPS/state['slug'],url=repair['url'],public=True)
+        ack = bridge(repair['args'])
+        if not isinstance(ack.get('id'),str) or not isinstance(ack.get('created'),bool):
+            raise ValueError('card_send_bad_ack')
+        repair.update(status='sent',bridge_id=ack['id'])
+        state.update(url=repair['url'],link_health='ok',link_checked_at=time.time())
+        atomic(path,state)
+        return {'status':'sent','url':state['url']}
 
 
 def safe_sync(cfg, data, *, send=False):
@@ -456,6 +536,7 @@ def main(argv=None):
     ap.add_argument('--data-file', help='fixture/status JSON; never contacts a provider')
     ap.add_argument('--vertical')
     ap.add_argument('--send', action='store_true', help='retry an enrolled card with its retained idempotency key')
+    ap.add_argument('--repair-link', action='store_true', help='explicitly send a replacement for a changed public URL')
     ap.add_argument('--loop', type=int, default=0, help='legacy compatibility; watcher hooks are preferred')
     ap.add_argument('--hours', type=float, default=4)
     a = ap.parse_args(argv)
@@ -463,7 +544,7 @@ def main(argv=None):
         ap.error('Invalid order ID')
     cfg = read(ROOT / 'orders' / f'order-{a.app}-{a.order.lower()}.json')
     cfg.update(app=a.app, order=a.order)
-    if a.send and (a.data_file or a.dir or not cfg.get('delivery_card')):
+    if (a.send or a.repair_link) and (a.data_file or a.dir or not cfg.get('delivery_card')):
         ap.error('--send requires a registered, enrolled order; no fixture or custom directory')
     if a.vertical:
         cfg['vertical'] = a.vertical
@@ -482,6 +563,8 @@ def main(argv=None):
         result = build(cfg, data, meta, a.dir)
         if a.send:
             result['delivery_card'] = safe_sync(cfg, data, send=True)
+        if a.repair_link:
+            result['repair'] = repair_link(cfg,data)
         print(json.dumps(result), flush=True)
         if not a.loop or result['stage'] in ('Delivered', 'Cancelled') or time.time() >= end:
             break

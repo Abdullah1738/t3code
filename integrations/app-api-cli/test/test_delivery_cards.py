@@ -25,8 +25,8 @@ class CardTests(unittest.TestCase):
         def bridge(args, **kw):
             self.calls.append(args)
             if args[0] == 'shares':
-                published=next(a for a in self.calls if a[0]=='share')
-                return {'shares':[{'app':published[-1],'live':True,'url':'https://cards.trycloudflare.com/'}]}
+                published=next((a for a in self.calls if a[0]=='share'),None)
+                return {'shares':[{'app':published[published.index('--app')+1],'live':True,'url':'https://cards.trycloudflare.com/'}] if published else []}
             if args[0] in ('share', 'publish'):
                 return {'url': 'https://cards.trycloudflare.com/' if args[0] == 'share' else 'https://host.ts.net:18400/card/'}
             if self.fail_send:
@@ -61,8 +61,8 @@ class CardTests(unittest.TestCase):
         self.assertEqual(first['status'], 'sent')
         for status in ('picked up','out for delivery','delivered'):
             c.sync(self.cfg,{**self.data,'status':status},send=True)
-        self.assertEqual([a[0] for a in self.calls], ['share','send','shares'])
-        self.assertEqual(self.calls[1][1:3], ['--to','moni'])
+        self.assertEqual([a[0] for a in self.calls], ['shares','share','send','shares'])
+        self.assertEqual(self.calls[2][1:3], ['--to','moni'])
         doc = (c.APPS / first['slug'] / 'index.html').read_text()
         self.assertIn('https://cards.trycloudflare.com/preview.png',doc)
         self.assertIn('Delivered', doc)
@@ -107,7 +107,7 @@ class CardTests(unittest.TestCase):
         self.assertEqual(cfg['placed_notice']['channel'],'delivery_card')
         with patch.dict(t.os.environ,WATCH_DIR=str(t.WATCHERS/cfg['watcher'])),patch.object(t,'fetch',return_value={**self.data,'status':'picked up'}),patch.object(t.store,'reconcile'),contextlib.redirect_stdout(io.StringIO()):
             t.check(cfg)
-        self.assertEqual([a[0] for a in self.calls],['share','send','shares'])
+        self.assertEqual([a[0] for a in self.calls],['shares','share','send','shares'])
         state=c.read(c.ROOT/'cards/order-talabat-123.json')
         v=c.read(c.APPS/state['slug']/'status.json')
         self.assertEqual(v['stage'],'Picked up')
@@ -139,7 +139,7 @@ class CardTests(unittest.TestCase):
         self.assertTrue(t.read(t.ROOT/'orders/order-talabat-123.json')['delivery_card']['held'])
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(t.main([*argv,'--payment-confirmed']),0)
-        self.assertEqual([a[0] for a in self.calls],['share','send','shares'])
+        self.assertEqual([a[0] for a in self.calls],['shares','share','send','shares'])
 
     def test_public_directory_does_not_reuse_private_legacy_metadata(self):
         legacy=c.APPS/c.slug('talabat','123');legacy.mkdir(parents=True)
@@ -169,6 +169,63 @@ class CardTests(unittest.TestCase):
             result=c.sync(self.cfg,self.data,send=True)
         self.assertEqual(result['link_health'],'needs_repair')
         self.assertEqual(sum(a[0]=='send' for a in self.calls),1)
+
+    def test_public_extra_files_refuse_before_any_page_write(self):
+        result=c.sync(self.cfg,self.data,send=True)
+        folder=c.APPS/result['slug']
+        before=(folder/'index.html').read_bytes()
+        (folder/'items.json').write_text('{"store":"private metadata"}')
+        result=c.sync(self.cfg,{**self.data,'status':'delivered'},send=False)
+        self.assertEqual(result['status'],'failed:public_directory_has_extra_files')
+        self.assertEqual(before,(folder/'index.html').read_bytes())
+
+    def test_now_now_native_total_and_minutes_price_omission(self):
+        from types import SimpleNamespace as N
+        flow=N(current=N(wire={'data':{'products':[{'name':'Milk','qty':2,'price':20,'totalPrice':20}]}},projection={}))
+        rows=c.commerce_metadata(flow,'nownow')
+        self.assertIsNone(rows[0]['price'])
+        self.assertEqual(rows[0]['line_total'],20)
+        flow.current.wire={'items':[{'title':'Milk','qty':2,'price':20,'salePrice':15}]}
+        self.assertIsNone(c.commerce_metadata(flow,'minutes')[0]['price'])
+        flow.card_recovered=True
+        self.assertEqual(c.commerce_metadata(flow,'minutes'),[])
+
+    def test_changed_link_explicit_repair_uses_new_key_and_is_idempotent(self):
+        c.sync(self.cfg,self.data,send=True)
+        original=next(a for a in self.calls if a[0]=='send')
+        state=c.read(c.ROOT/'cards/order-talabat-123.json')
+        calls=[]
+        def repaired(args,**kw):
+            calls.append(args)
+            if args[0]=='shares':return {'shares':[{'app':state['slug'],'live':True,'url':'https://new.trycloudflare.com/'}]}
+            self.assertIn('https://new.trycloudflare.com/preview.png',(c.APPS/state['slug']/'index.html').read_text())
+            return {'id':'repair-ack','created':True}
+        with patch.object(c,'bridge',side_effect=repaired):
+            self.assertEqual(c.repair_link(self.cfg,self.data)['status'],'sent')
+            self.assertEqual(c.repair_link(self.cfg,self.data)['status'],'unchanged')
+        sent=[a for a in calls if a[0]=='send']
+        self.assertEqual(len(sent),1)
+        self.assertNotEqual(sent[0][-1],original[-1])
+        self.assertIn('new.trycloudflare.com',(c.APPS/state['slug']/'index.html').read_text())
+
+    def test_prune_only_completed_owned_delivery_shares(self):
+        c.sync(self.cfg,{**self.data,'status':'delivered'},send=True)
+        path=c.ROOT/'cards/order-talabat-123.json';state=c.read(path)
+        state['terminal_at']=c.time.time()-3601;c.atomic(path,state)
+        c.prune_completed_shares()
+        self.assertEqual(self.calls[-1],['unshare','--app',state['slug']])
+        self.assertTrue(c.read(path)['unshared'])
+
+    def test_cleanup_failure_cannot_block_new_card(self):
+        with patch.object(c,'prune_completed_shares',side_effect=ValueError('offline')):
+            result=c.sync(self.cfg,self.data,send=True)
+        self.assertEqual(result['status'],'sent')
+
+    def test_share_lifetime_covers_long_promises(self):
+        self.assertEqual(c.share_days(self.cfg),2)
+        self.assertEqual(c.share_days({**self.cfg,'vertical':'main'}),7)
+        cfg={**self.cfg,'eta':(dt.datetime.now(dt.timezone.utc)+dt.timedelta(days=12)).isoformat()}
+        self.assertGreaterEqual(c.share_days(cfg),14)
 
 
 if __name__ == '__main__':

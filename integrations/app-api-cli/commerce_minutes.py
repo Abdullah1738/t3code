@@ -437,6 +437,7 @@ class MinutesFlow:
             j.fail('MINUTES_PAYMENT_ALREADY_CONSUMED_OR_ORDER_MISSING')
         self=object.__new__(cls);self.auth=auth or NoonAuthLifecycle()
         self.current=readback_session(self.auth)
+        self.card_recovered=True
         self.snapshot=self.auth.reconcile('minutes') if self.auth.status('minutes')['maintenance_state']!='none' else self.auth.revalidate('minutes')
         if self.snapshot.account_ref!=binding['account_hash']:j.fail('MINUTES_RECOVERY_ACCOUNT_CHANGED')
         self.flow_id=flow_id;self.scope_hash=binding['scope_hash'];self.opened=True
