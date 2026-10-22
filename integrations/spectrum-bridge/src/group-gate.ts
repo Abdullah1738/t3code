@@ -83,7 +83,9 @@ export type GroupVerdict = "addressed" | "observe";
 export function classifyGroupMessage(message: GroupMessage): GroupVerdict {
   const text = message.text.trim();
   if (isTapback(text)) return "observe";
-  if (callsRobob(text)) return courtesyOnly(text) && !message.engaged ? "observe" : "addressed";
+  // Owner rule (2026-10-22): his name anywhere in the message wakes him, including
+  // thanks/praise ("Good work, Robob"); he can answer those with a tapback.
+  if (mentionsRobob(text)) return "addressed";
   if (message.repliesToRobob || message.engaged) return "addressed";
   return "observe";
 }
@@ -91,7 +93,7 @@ export function classifyGroupMessage(message: GroupMessage): GroupVerdict {
 /** Explicitly addressed (named or a swipe reply), as opposed to woken only as a follow-up. */
 export function explicitlyAddressed(message: GroupMessage): boolean {
   const text = message.text.trim();
-  return !isTapback(text) && ((callsRobob(text) && !courtesyOnly(text)) || !!message.repliesToRobob);
+  return !isTapback(text) && (mentionsRobob(text) || !!message.repliesToRobob);
 }
 
 /** Appends observed lines, keeping the newest within both caps. */

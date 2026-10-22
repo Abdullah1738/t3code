@@ -399,7 +399,7 @@ test("groups: a message nobody addressed to Robob never wakes him, gets no 👀,
   const h = setup(ctx, { quietMs: 0 });
   h.input("a", "Na middle is awful babe", "+971585933213");
   h.input("b", "Laughed at \u201cShe's in the group ya numpty\u201d", "+447700900123");
-  h.input("c", "Thanks Robob!", "+447700900123");
+  h.input("c", "Thanks babe!", "+447700900123");
   await h.router.tick();
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(0);
@@ -411,7 +411,7 @@ test("groups: a message nobody addressed to Robob never wakes him, gets no 👀,
   const prompt = h.backend.prompts[0]!.text;
   expect(prompt).toContain("not addressed to you. Context only");
   expect(prompt).toContain(JSON.stringify("Moni: Na middle is awful babe"));
-  expect(prompt).toContain("Tom (+447700900123): Thanks Robob!");
+  expect(prompt).toContain("Tom (+447700900123): Thanks babe!");
   expect(prompt.endsWith("Moni: Robob can you check the weather in Duisburg tomorrow?")).toBe(true);
   expect(ctx.reacted).toEqual([["d", "👀"]]);
   expect(h.store.get<string[]>("group-observed")).toEqual([]);
