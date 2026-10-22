@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backendKind } from "../src/backend.ts";
@@ -144,7 +144,21 @@ test("control config: env first, then a chmod 600 token file, loopback only", ()
   expect(discoverControlConfig({ env: { T3_CONTROL_URL: "http://localhost:1/", T3_CONTROL_TOKEN: "env", T3_CONTROL_TOKEN_FILE: file } }))
     .toEqual({ url: "http://localhost:1", token: "env" });
   expect(() => discoverControlConfig({ env: { T3_CONTROL_URL: "https://example.com", T3_CONTROL_TOKEN: "x" } })).toThrow("127.0.0.1");
-  expect(() => discoverControlConfig({ env: { T3_CONTROL_TOKEN_FILE: join(dir, "missing.json") } })).toThrow();
+  expect(() => discoverControlConfig({ env: { T3_CONTROL_TOKEN_FILE: join(dir, "missing.json") }, home: dir })).toThrow("ENOENT");
+});
+
+test("control config reads the bridge's own credential before the shared file", () => {
+  const home = mkdtempSync(join(tmpdir(), "robob-config-"));
+  dirs.push(home);
+  const write = (path: string, token: string) => {
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(path, JSON.stringify({ url: "http://127.0.0.1:14033", token }), { mode: 0o600 });
+  };
+  write(join(home, ".robob", "ardud-control.json"), "shared");
+  expect(discoverControlConfig({ home, env: {} }).token).toBe("shared");
+  write(join(home, ".robob", "components", "spectrum-bridge.json"), "own");
+  expect(discoverControlConfig({ home, env: {} }).token).toBe("own");
+  expect(() => discoverControlConfig({ home, env: { T3_CONTROL_TOKEN_FILE: join(home, "typo.json") } })).toThrow("ENOENT");
 });
 
 test("createChat makes an imessage-origin full-access thread in a dated folder under the chat root", async () => {

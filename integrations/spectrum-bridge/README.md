@@ -225,9 +225,11 @@ router uses, so the router is unchanged.
   in `~/.config/spectrum-bridge/config.json`. The default is `openchamber`; any
   other value stops the bridge at startup.
 - Server and token: `T3_CONTROL_URL` + `T3_CONTROL_TOKEN`, else the JSON file
-  `T3_CONTROL_TOKEN_FILE` or `~/.robob/ardud-control.json`
+  named by `T3_CONTROL_TOKEN_FILE` (which must exist), else
+  `~/.robob/components/spectrum-bridge.json` (its own component credential),
+  else the old shared `~/.robob/ardud-control.json`
   (`{"url":"http://127.0.0.1:<port>","token":"..."}`, chmod 600, loopback URL only).
-  Issue the token with `t3 auth session issue --base-dir <t3 home> --label bridges --ttl 365d --json`.
+  Issue the component credential with `t3 ardud component-token issue spectrum-bridge`.
 - Chat root: `ROBOB_IMESSAGE_CHAT_ROOT`, else `robobChatRoot` in config.json,
   else `~/.robob/imessage`. It must be a registered Robob project
   (`t3 project add <root> --title iMessage`); `check` fails otherwise. Each new
