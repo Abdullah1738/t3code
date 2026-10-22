@@ -1,10 +1,12 @@
 import { MissionError, type MissionProvenance } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 
 import { forkParked } from "../../../serverActivation.ts";
 import * as Ports from "../asks/ports.ts";
+import { RequestImages } from "../router/requestImages.ts";
 import type { SuggestionApplication } from "../asks/suggestionModel.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as ViewService from "./ViewService.ts";
@@ -50,7 +52,8 @@ export const applyLayoutSuggestion =
  * Stores each new mission's layout from the starter in force when it was
  * created (missions created before views existed get the same layout lazily:
  * reads compute it and the first change stores it), expires an archived
- * mission's images, and applies accepted starter offers.
+ * mission's images, applies accepted starter offers, and stores the images
+ * of owner request messages.
  */
 export const viewsWiringLayer = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -59,6 +62,13 @@ export const viewsWiringLayer = Layer.effectDiscard(
     const viewStore = yield* ViewStore.ViewStore;
     const registry = yield* Ports.SuggestionApplierRegistry;
     yield* registry.register(["layout"], applyLayoutSuggestion(views, viewStore.starters));
+    // Absent where views run without the router (their own tests).
+    const requestImages = yield* Effect.serviceOption(RequestImages);
+    if (Option.isSome(requestImages)) {
+      yield* requestImages.value.register(({ missionId, requestId, image, provenance }) =>
+        views.addRequestImage(provenance, { missionId, requestId, source: image }),
+      );
+    }
     const subscription = yield* store.subscribe;
     const quietly = (what: string) =>
       Effect.catchCause((cause) => Effect.logWarning(`missions views: ${what} failed`, cause));

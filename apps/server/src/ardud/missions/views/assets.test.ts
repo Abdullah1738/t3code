@@ -159,6 +159,43 @@ describe("mission images", () => {
     ),
   );
 
+  it.effect("keeps a request's image once, about that request, however often it is sent", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+        const upload = yield* threadAttachment(masterThread, png(6, 4));
+        const source = { _tag: "attachment", attachmentId: upload } as const;
+        const first = yield* views.addRequestImage(ownerApp, {
+          missionId,
+          requestId: "request-a",
+          source,
+        });
+        assert.equal(first.path, NodePath.join(attachmentsDir, `${first.assetId}.png`));
+        assert.isTrue(NodeFS.existsSync(first.path));
+        assert.deepEqual(
+          yield* views.addRequestImage(ownerApp, { missionId, requestId: "request-a", source }),
+          first,
+        );
+        const other = yield* views.addRequestImage(ownerApp, {
+          missionId,
+          requestId: "request-b",
+          source,
+        });
+        assert.notEqual(other.assetId, first.assetId);
+        const assets = (yield* views.snapshot(missionId)).assets ?? [];
+        assert.deepEqual(
+          assets.map((asset) => asset.subject).toSorted((a, b) => (a!.id < b!.id ? -1 : 1)),
+          [
+            { kind: "owner-request", id: "request-a" },
+            { kind: "owner-request", id: "request-b" },
+          ],
+        );
+      }),
+    ),
+  );
+
   it.effect("archiving the mission expires its images and deletes their files", () =>
     fresh(
       Effect.gen(function* () {

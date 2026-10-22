@@ -35,6 +35,7 @@ import * as MissionStore from "../store/MissionStore.ts";
 import * as ViewStore from "../views/ViewStore.ts";
 import * as MissionRouter from "./MissionRouter.ts";
 import { fakeRouterThreads, routerOverFakes, type Sent } from "./MissionRouter.testkit.ts";
+import { RequestImages } from "./requestImages.ts";
 
 const harness = () => {
   const threads = fakeRouterThreads();
@@ -419,6 +420,73 @@ describe("owner requests", () => {
         "invalid",
       );
       assert.strictEqual((yield* requestEvents).length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("images sit where his markers put them, as paths the master can open", () => {
+    const h = harness();
+    const stored: Array<{ requestId: string; image: unknown }> = [];
+    const pathOf = (n: number) =>
+      `/home/t3/attachments/mission-0000000${n}-0000-4000-8000-000000000000.png`;
+    return Effect.gen(function* () {
+      yield* seed;
+      const registry = yield* RequestImages;
+      yield* registry.register(({ requestId, image }) =>
+        Effect.sync(() => {
+          stored.push({ requestId, image });
+          return { assetId: `asset-${stored.length}`, path: pathOf(stored.length) };
+        }),
+      );
+      const router = yield* MissionRouter.MissionRouter;
+      const shot = (attachmentId: string) => ({ _tag: "attachment", attachmentId }) as const;
+      const request = yield* router.openRequest(
+        {
+          missionId,
+          text: "The header in {image2} should match {image1}.",
+          images: [shot("before"), shot("after")],
+        },
+        ownerApp,
+      );
+      const said = `The header in [image 2: ${pathOf(2)}] should match [image 1: ${pathOf(1)}].`;
+      assert.deepStrictEqual(
+        stored.map((each) => each.requestId),
+        [request.id, request.id],
+      );
+      assert.strictEqual(request.title, "The header in [image 2] should match [image 1].");
+      assert.include(wakesFor(h.sent, masterThread)[0]!.text, said);
+      const one = yield* router.ownerRequests({ missionId, requestId: request.id }, ownerApp);
+      assert.strictEqual(one.requests[0]!.messages[0]!.body, said);
+      assert.strictEqual(
+        one.requests[0]!.messages[0]!.message.summary,
+        "The header in [image 2] should match [image 1].",
+      );
+      assert.include((yield* router.inbox(masterThread)).entries[0]!.body ?? "", said);
+
+      // Without a marker the image goes after his words.
+      yield* router.replyRequest(
+        { requestId: request.id, text: "And this one.", images: [shot("third")] },
+        ownerApp,
+      );
+      const thread = yield* router.ownerRequests({ missionId, requestId: request.id }, ownerApp);
+      assert.strictEqual(
+        thread.requests[0]!.messages[1]!.body,
+        `And this one.\n\n[image 1: ${pathOf(3)}]`,
+      );
+      assert.strictEqual(thread.requests[0]!.request.lastReply, "And this one. [image 1]");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a server without an image store refuses images, not the words", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const images = [{ _tag: "attachment", attachmentId: "shot" }] as const;
+      assert.strictEqual(
+        yield* failureCode(router.openRequest({ missionId, text: "Look", images }, ownerApp)),
+        "invalid",
+      );
+      assert.deepStrictEqual(yield* requestEvents, []);
     }).pipe(Effect.provide(h.layer));
   });
 
