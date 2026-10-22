@@ -2014,6 +2014,13 @@ export const MissionListItem = Schema.Struct({
    */
   masterThreadIds: Schema.optional(Schema.Array(ThreadId)),
   // --- end routing additions ---
+  // --- r22 fixes ---
+  /**
+   * Threads in `threadIds` only because a component attached them (no role,
+   * no lane). No lead answers their questions, so they alert the owner.
+   */
+  attachedThreadIds: Schema.optional(Schema.Array(ThreadId)),
+  // --- end r22 fixes ---
 });
 export type MissionListItem = typeof MissionListItem.Type;
 

@@ -191,16 +191,19 @@ export class RobobAlertBackend implements AlertBackend {
 
   /**
    * Mission threads other than the master take their questions and permission
-   * requests to their lead (Robob's router tells it). One status read serves a
-   * whole attention tick.
+   * requests to their lead (Robob's router tells it). Attached threads have no
+   * lead, and a server that can't say which threads are which leaves the
+   * question with the owner. One status read serves a whole attention tick.
    */
   async leadAnswers(sessionId: string): Promise<boolean> {
     try {
       const threadId = await this.resolve(sessionId);
       const { missions } = await this.missionThreads();
       return missions.some(mission => mission.masterThreadIds !== undefined
+        && mission.attachedThreadIds !== undefined
         && mission.threadIds?.includes(threadId) === true
-        && !mission.masterThreadIds.includes(threadId));
+        && !mission.masterThreadIds.includes(threadId)
+        && !mission.attachedThreadIds.includes(threadId));
     } catch { return false; }
   }
 

@@ -234,12 +234,26 @@ export const makeReads = (
           const masterThreadIds = bindings
             .filter((binding) => binding.roleId === masterRoleId && binding.endedAt === null)
             .map((binding) => binding.threadId);
+          // ardud missions: r22 fixes (the router finds leads only through roles and
+          // lanes, so an attached thread's questions still need the owner's Telegram)
+          const routed = new Set([
+            ...bindings.map((binding) => binding.threadId),
+            ...records.lanes.flatMap((lane) => (lane.threadId === null ? [] : [lane.threadId])),
+          ]);
+          const attachedThreadIds = [
+            ...new Set(
+              attached
+                .map((attachment) => attachment.threadId)
+                .filter((threadId) => !routed.has(threadId)),
+            ),
+          ];
           // ardud missions: router
           return {
             ...item,
             requestsAnswered: answered.get(mission.id) ?? 0,
             threadIds,
             masterThreadIds,
+            attachedThreadIds,
           };
         }),
     );

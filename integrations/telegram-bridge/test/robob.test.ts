@@ -22,7 +22,7 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.db.close();
 });
 
-type MissionThreads = { id: string; threadIds?: string[]; masterThreadIds?: string[] };
+type MissionThreads = { id: string; threadIds?: string[]; masterThreadIds?: string[]; attachedThreadIds?: string[] };
 
 function fakeControl(events: string[] = []) {
   const threads = new Map<string, Thread>();
@@ -207,7 +207,7 @@ test("a mission thread's question goes to its lead; the master's and everyone el
   control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: ask("q-lane") });
   control.add({ threadId: "master", title: "Crpko master", state: "needs-input", pending: ask("q-master") });
   control.add({ threadId: "solo", title: "Solo work", state: "needs-input", pending: ask("q-solo") });
-  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"] }];
+  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"], attachedThreadIds: [] }];
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();
   setSystemTime(now + 20_000);
@@ -217,6 +217,44 @@ test("a mission thread's question goes to its lead; the master's and everyone el
   expect(texts.some(text => text.includes("Crpko master"))).toBe(true);
   expect(texts.some(text => text.includes("Solo work"))).toBe(true);
   expect(texts.some(text => text.includes("GST lane"))).toBe(false);
+});
+
+test("an attached thread's question and permission request still alert; it has no lead", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "review", title: "PR review", state: "needs-input", pending: [
+    { requestId: "q-review", kind: "question", requestKind: "user_input", canRespond: true,
+      questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] },
+    { requestId: "perm-review", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true },
+  ] });
+  control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: [{ requestId: "q-lane", kind: "question",
+    requestKind: "user_input", canRespond: true, questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] }] });
+  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane", "review"], masterThreadIds: ["master"], attachedThreadIds: ["review"] }];
+  expect(await control.backend.leadAnswers("review")).toBe(false);
+  expect(await control.backend.leadAnswers("lane")).toBe(true);
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  const texts = store.pendingOutbox().map(entry => entry.text);
+  expect(texts.filter(text => text.includes("PR review"))).toHaveLength(2);
+  expect(texts.some(text => text.includes("PR review needs your approval"))).toBe(true);
+  expect(texts.some(text => text.includes("GST lane"))).toBe(false);
+});
+
+test("a server that doesn't list attached threads leaves every mission question with the owner", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "review", title: "PR review", state: "needs-input", pending: [{ requestId: "q-review", kind: "question",
+    requestKind: "user_input", canRespond: true, questions: [{ id: "q", header: "Ship", question: "Ship it?", options: [{ label: "yes", description: "" }] }] }] });
+  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane", "review"], masterThreadIds: ["master"] }];
+  expect(await control.backend.leadAnswers("review")).toBe(false);
+  expect(await control.backend.leadAnswers("lane")).toBe(false);
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("PR review"))).toBe(true);
 });
 
 test("when the missions read fails, a question alerts as before", async () => {
@@ -240,7 +278,7 @@ test("a mission thread's permission request goes to its lead; the master's and e
   control.add({ threadId: "lane", title: "GST lane", state: "needs-input", pending: approve("perm-lane") });
   control.add({ threadId: "master", title: "Crpko master", state: "needs-input", pending: approve("perm-master") });
   control.add({ threadId: "solo", title: "Solo work", state: "needs-input", pending: approve("perm-solo") });
-  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"] }];
+  control.missions.list = [{ id: "crpko", threadIds: ["master", "lane"], masterThreadIds: ["master"], attachedThreadIds: [] }];
   const { store, attention: alerts } = attention(control.backend);
   await alerts.tick();
   setSystemTime(now + 20_000);
