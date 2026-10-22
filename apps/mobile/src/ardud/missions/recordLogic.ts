@@ -67,9 +67,12 @@ function sendChecked<T>(
 
 /** Read receipts are best effort: the next open marks the request again. */
 function markRead(request: OwnerRequest | null | undefined): void {
-  if (!request?.unread) return;
+  if (request?.unread) markReadById(request.id);
+}
+
+function markReadById(requestId: string): void {
   missionsSource()
-    .markRequestRead({ requestId: request.id })
+    .markRequestRead({ requestId })
     .catch(() => undefined);
 }
 
@@ -192,9 +195,12 @@ export function useRequestThread(missionId: MissionId, requestId: string): Reque
   const [text, setText] = useState("");
   const { pending, run } = useMissionAction();
 
+  // The list row shows first and the full read replaces it: mark once per
+  // unread spell, not once per read.
+  const unreadId = request?.unread ? request.id : null;
   useEffect(() => {
-    markRead(request);
-  }, [request]);
+    if (unreadId !== null) markReadById(unreadId);
+  }, [unreadId]);
 
   const clearOn = (done: boolean) => {
     if (done) setText("");
