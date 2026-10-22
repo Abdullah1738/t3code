@@ -301,7 +301,6 @@ export function createFixtureMissionsSource(
       push();
     }, latencyMs);
     return () => {
-      // @effect-diagnostics-next-line globalTimers:off - Cancels the simulated delay above.
       clearTimeout(timer);
       listeners.delete(push);
     };
