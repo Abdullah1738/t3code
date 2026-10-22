@@ -47,6 +47,15 @@ const HELP = `mission <command> [options]
   events MISSION [--after SEQ] [--limit N]
   watch MISSION --on KINDS [--id ID] [--interval SECONDS]   prints the robob-watch command
   watch-check MISSION --on KINDS [--id ID] --cursor FILE    one tick: prints new matches only
+  report MISSION --chat C --text T [--file PATH] [--key K]  a chat's bug or idea to the master
+
+report is for an iMessage chat agent: a tool or CLI broke, or something in
+the chat could work better. --chat is the chat's session (its Robob thread
+id) or slug (owner, moni, group-...). Put the command, error, ids and what
+you tried in --text. It reaches the master as a request from that chat,
+never as him, and the same report twice posts once (--key names a report you
+may resend). Complaints he or Moni typed still go through
+request open ... --via imessage --inbound ID.
 
 Watch kinds: ask-opened, ask-answered, draft-opened, draft-decided,
 suggestion-opened, milestone-at-risk, lane-stalled, swarm-paused,
@@ -95,6 +104,9 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     offset: { type: "string" },
     before: { type: "string" },
     cursor: { type: "string" },
+    chat: { type: "string" },
+    file: { type: "string" },
+    key: { type: "string" },
     pretty: { type: "boolean" },
     help: { type: "boolean", short: "h" },
   },
@@ -391,6 +403,25 @@ async function main() {
     }
     case "watch-check":
       return watchCheck(need(args[0] ?? flags.mission, "MISSION"));
+    case "report": {
+      const missionId = need(args[0] ?? flags.mission, "MISSION");
+      const chat = need(flags.chat, "--chat (this chat's session or slug)");
+      const text = need(flags.text, "--text (what broke: command, error, ids, what you tried)");
+      let file;
+      if (flags.file !== undefined) {
+        file = NodePath.resolve(need(flags.file, "--file"));
+        if (!NodeFS.existsSync(file)) fail(`--file ${file} does not exist`);
+      }
+      return print(
+        await request("POST", "/reports", {
+          missionId,
+          chat,
+          text,
+          ...(file === undefined ? {} : { file }),
+          ...(flags.key === undefined ? {} : { key: need(flags.key, "--key") }),
+        }),
+      );
+    }
     default:
       return fail(
         `unknown command ${command}. Mission writes use the mission_* MCP tools.\n\n${HELP}`,

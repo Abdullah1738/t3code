@@ -19,6 +19,7 @@ import { coordShimRouteLayer } from "./router/coordHttp.ts";
 import { OwnerConditionsLive, RouterAsksPortsLive, RouterLive } from "./router/layer.ts";
 import { leadRoutedRouteLayer } from "./router/leadRoutedHttp.ts";
 import { masterFeedLayer } from "./router/masterFeed.ts";
+import { reportsDeskRouteLayer } from "./router/reportsHttp.ts";
 import { requestsDeskRouteLayer } from "./router/requestsHttp.ts";
 import { scribeRouteLayer } from "./scribe/http.ts";
 import { ScribeLive } from "./scribe/layer.ts";
@@ -76,4 +77,5 @@ export const ArdudMissionsRoutesLive = Layer.mergeAll(
   recoveryRouteLayer,
   requestsDeskRouteLayer, // ardud missions: router (owner requests)
   leadRoutedRouteLayer, // ardud missions: r22 fixes (telegram leaves lead-routed requests alone)
+  reportsDeskRouteLayer, // ardud missions: r22 reports (an iMessage chat's bugs and ideas to the master)
 );
