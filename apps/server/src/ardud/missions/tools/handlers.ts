@@ -153,11 +153,14 @@ const handlers = {
   ),
   mission_asks: McpToolAccess.reads((input) =>
     withCaller((asks) =>
-      input.askId !== undefined
-        ? asks.ask(input.askId).pipe(Effect.map((ask) => ({ asks: [ask] })))
-        : asks
-            .asks({ missionId: input.missionId, status: input.status })
-            .pipe(Effect.map((found) => ({ asks: found }))),
+      Effect.gen(function* () {
+        const found =
+          input.askId !== undefined
+            ? [yield* asks.ask(input.askId)]
+            : yield* asks.asks({ missionId: input.missionId, status: input.status });
+        // ardud missions: r22 comments
+        return { asks: yield* asks.withComments("ask", found) };
+      }),
     ),
   ),
   mission_drafts: McpToolAccess.reads((input) =>
@@ -166,7 +169,9 @@ const handlers = {
         if (input.guideFor !== undefined && input.missionId === undefined) {
           return yield* invalid("guideFor needs missionId.");
         }
-        const drafts = yield* asks.drafts({ missionId: input.missionId, status: input.status });
+        const found = yield* asks.drafts({ missionId: input.missionId, status: input.status });
+        // ardud missions: r22 comments
+        const drafts = yield* asks.withComments("draft", found);
         const guide =
           input.guideFor === undefined || input.missionId === undefined
             ? null
@@ -410,14 +415,15 @@ const handlers = {
     ),
   ),
   mission_approvals: McpToolAccess.reads((input) =>
-    withCaller(() =>
+    withCaller((asks) =>
       Effect.gen(function* () {
         const missions = yield* MissionService.MissionService;
-        const approvals = yield* missions.approvals({
+        const found = yield* missions.approvals({
           missionId: input.missionId,
           ...(input.status === undefined ? {} : { status: input.status }),
         });
-        return { approvals };
+        // ardud missions: r22 comments
+        return { approvals: yield* asks.withComments("approval", found) };
       }),
     ),
   ),

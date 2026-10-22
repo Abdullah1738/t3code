@@ -259,6 +259,47 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("mission reads carry the owner's comments on drafts and asks", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const writer = threadCaller(writerThread);
+      const master = threadCaller(masterThread);
+      const submitted = yield* call("mission_draft", writer, {
+        missionId,
+        audience: "Pavan",
+        channel: "cliq",
+        target: { kind: "url", label: "Cliq DM", url: null, ref: "pavan" },
+        text: "Hi Pavan. Quick one. Order: 42 shipped.",
+      });
+      const draftId = (submitted.structured.draft as { id: string }).id;
+      const opened = yield* call("mission_ask", master, askInput("Ship today?"));
+      const askId = (opened.structured.ask as { id: string }).id;
+      yield* asks.commentInboxItem(
+        { subject: { kind: "draft", id: draftId }, body: "Remove the first sentence." },
+        ownerApp,
+      );
+      yield* asks.commentInboxItem(
+        { subject: { kind: "ask", id: askId }, body: "Leaning yes." },
+        ownerApp,
+      );
+      const bodies = (row: unknown) =>
+        ((row as { comments?: ReadonlyArray<{ body: string }> }).comments ?? []).map(
+          (comment) => comment.body,
+        );
+      const drafts = yield* call("mission_drafts", writer, { missionId });
+      const listed = (drafts.structured.drafts as ReadonlyArray<{ id: string }>).find(
+        (row) => row.id === draftId,
+      );
+      expect(bodies(listed)).toEqual(["Remove the first sentence."]);
+      const asked = yield* call("mission_asks", writer, { missionId });
+      expect(bodies((asked.structured.asks as ReadonlyArray<unknown>)[0])).toEqual([
+        "Leaning yes.",
+      ]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("lets the master route, annotate and decide drafts and keep draft notes", () => {
     const { layer } = toolsLayer();
     return Effect.gen(function* () {

@@ -237,7 +237,7 @@ const MissionDraftTool = Tool.make("mission_draft", {
 
 const MissionDraftApproveTool = Tool.make("mission_draft_approve", {
   description:
-    "Decide a draft as the mission's master: approve (optionally with edited text), rewrite with a note, or drop. This works for drafts routed to the master, or for one routed to the owner when you pass onOwnerCondition: the open owner request about this draft and his exact words stating the condition your decision meets, whole sentences from his newest message there (not a question). The owner decides his own drafts in the app or through his iMessage agent (mission CLI), never through this tool. The writer hears every decision; after an approval it posts exactly the approved text and records it with mission_draft_sent.",
+    "Decide a draft as the mission's master: approve (optionally with edited text), rewrite with a note, or drop. This works for drafts routed to the master, or for one routed to the owner when you pass onOwnerCondition: the open owner request about this draft and his exact words stating the condition your decision meets, whole sentences from his newest message there (not a question). The owner decides his own drafts in the app or through his iMessage agent (mission CLI), never through this tool. The writer hears every decision; after an approval it posts the approved text, with any comments the owner left applied, and records it with mission_draft_sent.",
   parameters: Schema.Struct({
     draftId: DraftId,
     action: Schema.Literals(["approve", "rewrite", "drop"]),
@@ -307,7 +307,8 @@ const MissionSuggestTool = Tool.make("mission_suggest", {
 const MissionSuggestionDecideTool = Tool.make("mission_suggestion_decide", {
   description:
     "As the mission's master, accept, accept with edits, or dismiss any suggestion in the mission, including ones addressed to the owner. The timeline records that the master decided it.",
-  parameters: DecideSuggestionInput,
+  // A note with a decision is the owner's alone.
+  parameters: DecideSuggestionInput.mapFields(({ note: _note, ...fields }) => fields),
   success: Schema.Struct({ suggestion: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
   failureMode: "return",
@@ -326,7 +327,7 @@ const MissionDraftReopenTool = Tool.make("mission_draft_reopen", {
 
 const MissionDraftSentTool = Tool.make("mission_draft_sent", {
   description:
-    "After posting an approved draft's exact text, record it sent: you as its writer, or the mission's master. Pass link when the post has one (the comment or message URL). Refused unless the draft is approved; a sent draft is never sent again, so don't post it twice.",
+    "After posting an approved draft, record it sent: you as its writer, or the mission's master. Pass link when the post has one (the comment or message URL). When the owner left comments on the draft, apply them before posting and pass text, the exact text you posted; it is refused without it. Refused unless the draft is approved; a sent draft is never sent again, so don't post it twice.",
   parameters: RecordDraftSentInput,
   success: Schema.Struct({ draft: Schema.Unknown }),
   failure: OrchestratorMcpFailure,

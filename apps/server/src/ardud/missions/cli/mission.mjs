@@ -25,11 +25,11 @@ const HELP = `mission <command> [options]
   digest MISSION [--since 6h|ISO]           what happened since (default 24h)
   asks [--mission M] [--open | --status S]  asks, newest first
   ask show ASK
-  ask answer ASK (--option ID | --text T) --via imessage --inbound ID
+  ask answer ASK (--option ID | --text T) [--note T] --via imessage --inbound ID
   drafts [--mission M] [--status pending,rewrite-requested]
-  draft approve DRAFT [--edit TEXT] --via imessage --inbound ID
+  draft approve DRAFT [--edit TEXT] [--note T] --via imessage --inbound ID
   draft rewrite DRAFT --note TEXT --via imessage --inbound ID
-  draft drop DRAFT --via imessage --inbound ID
+  draft drop DRAFT [--note T] --via imessage --inbound ID
   draft show DRAFT                          full text plus attachments (paths, urls)
   requests MISSION [--status waiting-on-master|answered|settled]
   request open MISSION --text T --via imessage --inbound ID
@@ -57,7 +57,9 @@ Actions for the owner need --via imessage --inbound ID: the id of the iMessage
 in which he told you to. The server checks it is a message he (or Moni) typed
 after the record opened, keeps his words as the quote, and lets one message
 do each action once. Pass your reading of his words as the option, text or
-note; never invent an inbound id.
+note; never invent an inbound id. A --note given with a decision is his
+comment for whoever acts on it (applied before anything is posted); it is
+saved on the item and does not open a discussion.
 
 Everything else that changes a mission (plan, lanes, rules, asks) goes
 through the mission_* MCP tools from the calling thread, never this CLI: HTTP
@@ -223,6 +225,7 @@ async function main() {
             optionId: flags.option ?? null,
             text: flags.text ?? "",
             inboundId,
+            ...(flags.note === undefined ? {} : { note: flags.note }),
           }),
         );
       }
@@ -245,6 +248,7 @@ async function main() {
           inboundId,
           ...(action === "approve" && flags.edit !== undefined ? { editedText: flags.edit } : {}),
           ...(action === "rewrite" ? { rewriteNote: need(flags.note, "--note") } : {}),
+          ...(action !== "rewrite" && flags.note !== undefined ? { note: flags.note } : {}),
         }),
       );
     }

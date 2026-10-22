@@ -53,6 +53,7 @@ import { askEpochOf, askReopened } from "./askModel.ts";
 import { AsksService } from "./AsksService.ts";
 import { epochOf, revisionOf } from "./draftModel.ts";
 import { draftAttachments, pendingAndRecent, progressOf } from "./ownerView.ts";
+import { attachComments } from "./inboxMarks.ts"; // ardud missions: r22 comments
 import { canRedeemInbound } from "./provenance.ts";
 import {
   isWatchKind,
@@ -150,6 +151,7 @@ const AnswerBody = Schema.Struct({
   optionId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   text: Schema.optional(Schema.String),
   inboundId: TrimmedNonEmptyString,
+  note: Schema.optional(Schema.String),
 });
 const decodeAnswerBody = Schema.decodeUnknownEffect(AnswerBody);
 
@@ -159,6 +161,7 @@ const DecideBody = Schema.Struct({
   rewriteNote: Schema.optional(Schema.String),
   inboundId: TrimmedNonEmptyString,
   revision: Schema.optional(NonNegativeInt),
+  note: Schema.optional(Schema.String),
 });
 const decodeDecideBody = Schema.decodeUnknownEffect(DecideBody);
 
@@ -369,14 +372,15 @@ const makeRoutes = Effect.gen(function* () {
         missionId: missionParam(query.get("mission")),
         status: listParam(query.get("status")),
       });
-      return json({ ok: true, asks: result });
+      return json({ ok: true, asks: yield* attachComments(store, "ask", result) });
     }),
   );
 
   const getAsk = read(
     Effect.gen(function* () {
       const askId = AskId.make(yield* param("askId"));
-      return json({ ok: true, ask: yield* asks.ask(askId) });
+      const [ask] = yield* attachComments(store, "ask", [yield* asks.ask(askId)]);
+      return json({ ok: true, ask });
     }),
   );
 
@@ -389,6 +393,7 @@ const makeRoutes = Effect.gen(function* () {
         optionId: body.optionId ?? null,
         text: body.text ?? "",
         inboundId: body.inboundId,
+        ...(body.note === undefined ? {} : { note: body.note }),
       };
       return json(
         yield* ledger.once(
@@ -397,7 +402,11 @@ const makeRoutes = Effect.gen(function* () {
             inboundId: body.inboundId,
             subject: `ask:${askId}`,
             action: "answer",
-            payload: { optionId: input.optionId, text: input.text },
+            payload: {
+              optionId: input.optionId,
+              text: input.text,
+              ...(body.note === undefined ? {} : { note: body.note }),
+            },
             what: "Answering an ask",
             notBefore: () =>
               asks.ask(askId).pipe(
@@ -425,7 +434,7 @@ const makeRoutes = Effect.gen(function* () {
         missionId: missionParam(query.get("mission")),
         status: listParam(query.get("status")),
       });
-      return json({ ok: true, drafts: result });
+      return json({ ok: true, drafts: yield* attachComments(store, "draft", result) });
     }),
   );
 
@@ -440,6 +449,7 @@ const makeRoutes = Effect.gen(function* () {
         ...(body.editedText === undefined ? {} : { editedText: body.editedText }),
         ...(body.rewriteNote === undefined ? {} : { rewriteNote: body.rewriteNote }),
         ...(body.revision === undefined ? {} : { revision: body.revision }),
+        ...(body.note === undefined ? {} : { note: body.note }),
       };
       return json(
         yield* ledger.once(
@@ -453,6 +463,7 @@ const makeRoutes = Effect.gen(function* () {
               editedText: body.editedText ?? null,
               rewriteNote: body.rewriteNote ?? null,
               revision: body.revision ?? null,
+              ...(body.note === undefined ? {} : { note: body.note }),
             },
             what: "Deciding a draft",
             notBefore: () =>
@@ -696,14 +707,16 @@ const makeRoutes = Effect.gen(function* () {
       const statuses = listParam(query.get("status"));
       if (statuses === undefined) {
         const all = yield* missions.approvals({ missionId });
-        return json({ ok: true, approvals: pendingAndRecent(all, RECENT_APPROVALS) });
+        const shown = pendingAndRecent(all, RECENT_APPROVALS);
+        return json({ ok: true, approvals: yield* attachComments(store, "approval", shown) });
       }
       const status = yield* decodeApprovalStatuses(statuses).pipe(
         Effect.mapError(() =>
           fail("invalid_request", "status must be pending, approved, rejected or stale-closed."),
         ),
       );
-      return json({ ok: true, approvals: yield* missions.approvals({ missionId, status }) });
+      const found = yield* missions.approvals({ missionId, status });
+      return json({ ok: true, approvals: yield* attachComments(store, "approval", found) });
     }),
   );
 
@@ -721,9 +734,10 @@ const makeRoutes = Effect.gen(function* () {
       const draftId = yield* param("draftId");
       const found = yield* store.get("draft", draftId);
       if (Option.isNone(found)) return yield* fail("not_found", `No draft ${draftId}.`);
+      const [draft] = yield* attachComments(store, "draft", [found.value]);
       return json({
         ok: true,
-        draft: found.value,
+        draft,
         attachments: draftAttachments(found.value),
       });
     }),
