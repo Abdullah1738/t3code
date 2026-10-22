@@ -61,7 +61,16 @@ function submitForm<T>(
   return run(failureTitle, () => send(result.input));
 }
 
-export interface AskCardState {
+/**
+ * The note that goes with whichever decision is pressed, to whoever acts on
+ * it. The server keeps it as a comment on the item; it opens no discussion.
+ */
+export interface DecisionNoteState {
+  readonly note: string;
+  readonly setNote: (note: string) => void;
+}
+
+export interface AskCardState extends DecisionNoteState {
   readonly view: AskView;
   readonly pickedOptionId: string | null;
   readonly text: string;
@@ -82,20 +91,23 @@ export function useAskCard(
   },
 ): AskCardState {
   const [form, setForm] = useState<AskAnswerForm>(EMPTY_ASK_ANSWER);
+  const [note, setNote] = useState("");
   const action = useMissionAction();
   return {
     view: askView(ask),
     pickedOptionId: form.optionId,
     text: form.text,
+    note,
     canSubmit: askAnswerInput(ask, form).ok && !action.pending,
     pending: action.pending,
     pickOption: (optionId) => setForm((current) => toggleAskOption(current, optionId)),
     setText: (text) => setForm((current) => ({ ...current, text })),
+    setNote,
     submit: () => {
       void submitForm(
         action.run,
         "Could not send your answer",
-        askAnswerInput(ask, form),
+        askAnswerInput(ask, form, note),
         (input) => missionsSource().answerAsk(review ? review.attach(input) : input),
       ).then((sent) => {
         if (sent) review?.clear();
@@ -106,7 +118,7 @@ export function useAskCard(
 
 export type DraftCardMode = "idle" | "editing" | "rewriting";
 
-export interface DraftCardState {
+export interface DraftCardState extends DecisionNoteState {
   readonly mode: DraftCardMode;
   readonly editedText: string;
   readonly rewriteNote: string;
@@ -126,9 +138,10 @@ export function useDraftCard(draft: Draft): DraftCardState {
   const [mode, setMode] = useState<DraftCardMode>("idle");
   const [editedText, setEditedText] = useState(draft.text);
   const [rewriteNote, setRewriteNote] = useState("");
+  const [note, setNote] = useState("");
   const action = useMissionAction();
   const decide = (failureTitle: string, form: DraftForm) => {
-    void submitForm(action.run, failureTitle, draftDecisionInput(draft, form), (input) =>
+    void submitForm(action.run, failureTitle, draftDecisionInput(draft, form, note), (input) =>
       missionsSource().decideDraft(input),
     );
   };
@@ -136,9 +149,11 @@ export function useDraftCard(draft: Draft): DraftCardState {
     mode,
     editedText,
     rewriteNote,
+    note,
     pending: action.pending,
     setEditedText,
     setRewriteNote,
+    setNote,
     approve: () => decide("Could not approve the draft", { action: "approve" }),
     startEditing: () => {
       setEditedText(draft.text);
@@ -160,10 +175,8 @@ export function useDraftCard(draft: Draft): DraftCardState {
   };
 }
 
-export interface ApprovalCardState {
-  readonly note: string;
+export interface ApprovalCardState extends DecisionNoteState {
   readonly pending: boolean;
-  readonly setNote: (note: string) => void;
   readonly approve: () => void;
   readonly reject: () => void;
 }
@@ -197,7 +210,7 @@ export function useApprovalCard(approval: Approval): ApprovalCardState {
 
 export type KnockCardMode = "idle" | "editing";
 
-export interface KnockCardState {
+export interface KnockCardState extends DecisionNoteState {
   readonly mode: KnockCardMode;
   readonly editedText: string;
   readonly pending: boolean;
@@ -213,17 +226,20 @@ export interface KnockCardState {
 export function useKnockCard(knock: Knock): KnockCardState {
   const [mode, setMode] = useState<KnockCardMode>("idle");
   const [editedText, setEditedText] = useState(knock.summary);
+  const [note, setNote] = useState("");
   const action = useMissionAction();
   const decide = (failureTitle: string, form: KnockForm) => {
-    void submitForm(action.run, failureTitle, knockDecisionInput(knock, form), (input) =>
+    void submitForm(action.run, failureTitle, knockDecisionInput(knock, form, note), (input) =>
       missionsSource().decideKnock(input),
     );
   };
   return {
     mode,
     editedText,
+    note,
     pending: action.pending,
     setEditedText,
+    setNote,
     forward: () => decide("Could not forward the knock", { action: "forward" }),
     startEditing: () => {
       setEditedText(knock.summary);
@@ -305,7 +321,7 @@ export function useMoveRecord(
 
 export type SuggestionCardMode = "idle" | "editing" | "dismissing";
 
-export interface SuggestionCardState {
+export interface SuggestionCardState extends DecisionNoteState {
   readonly mode: SuggestionCardMode;
   readonly afterText: string;
   readonly dismissReason: string;
@@ -324,19 +340,25 @@ export function useSuggestionCard(suggestion: Suggestion): SuggestionCardState {
   const [mode, setMode] = useState<SuggestionCardMode>("idle");
   const [afterText, setAfterText] = useState(() => suggestionAfterText(suggestion));
   const [dismissReason, setDismissReason] = useState("");
+  const [note, setNote] = useState("");
   const action = useMissionAction();
   const decide = (failureTitle: string, form: SuggestionForm) => {
-    void submitForm(action.run, failureTitle, suggestionDecisionInput(suggestion, form), (input) =>
-      missionsSource().decideSuggestion(input),
+    void submitForm(
+      action.run,
+      failureTitle,
+      suggestionDecisionInput(suggestion, form, note),
+      (input) => missionsSource().decideSuggestion(input),
     );
   };
   return {
     mode,
     afterText,
     dismissReason,
+    note,
     pending: action.pending,
     setAfterText,
     setDismissReason,
+    setNote,
     accept: () => decide("Could not accept the suggestion", { action: "accept" }),
     startEditing: () => {
       setAfterText(suggestionAfterText(suggestion));

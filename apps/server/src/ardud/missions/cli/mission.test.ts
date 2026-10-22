@@ -207,6 +207,28 @@ describe("mission CLI", () => {
     expect(seen).toHaveLength(13);
   });
 
+  it("sends his --note with a decision; a rewrite keeps it as the rewrite note", async () => {
+    const { url, seen } = await listen(() => ({ ok: true }));
+    const via = ["--via", "imessage", "--inbound", "spc-msg-4"];
+    const commands = [
+      ["ask", "answer", "ask-1", "--option", "a", "--note", "only for v2", ...via],
+      ["draft", "approve", "draft-1", "--note", "drop the first sentence", ...via],
+      ["draft", "rewrite", "draft-1", "--note", "start with Order:", ...via],
+      ["draft", "drop", "draft-1", "--note", "Pavan already knows", ...via],
+      ["approval", "reject", "approval-1", "--note", "split it first", ...via],
+    ];
+    for (const args of commands) {
+      expect((await run(url, args)).code).toBe(0);
+    }
+    expect(seen.map((entry) => JSON.parse(entry.body))).toEqual([
+      { optionId: "a", text: "", inboundId: "spc-msg-4", note: "only for v2" },
+      { action: "approve", inboundId: "spc-msg-4", note: "drop the first sentence" },
+      { action: "rewrite", inboundId: "spc-msg-4", rewriteNote: "start with Order:" },
+      { action: "drop", inboundId: "spc-msg-4", note: "Pavan already knows" },
+      { action: "reject", inboundId: "spc-msg-4", note: "split it first" },
+    ]);
+  });
+
   it("surfaces server refusals", async () => {
     const { url } = await listen(() => ({
       ok: false,

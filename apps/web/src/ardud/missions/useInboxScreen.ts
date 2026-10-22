@@ -14,6 +14,7 @@ import type {
 import {
   answerAskInput,
   commentInput,
+  decideApprovalInput,
   decideDraftInput,
   decideKnockInput,
   decideSuggestionInput,
@@ -135,7 +136,9 @@ const withAttached = (
 
 /**
  * Owner decisions from the inbox. Each resolves `true` when the source took
- * it, and marks the item done so its pick and editor are forgotten.
+ * it, and marks the item done so its pick and editor are forgotten. `note`
+ * goes with the decision to whoever acts on it and stays on the item as a
+ * comment; it opens no discussion.
  */
 export function inboxActions(dispatch: (event: InboxUiEvent) => void) {
   const done = (key: string) => (sent: boolean) => {
@@ -148,21 +151,23 @@ export function inboxActions(dispatch: (event: InboxUiEvent) => void) {
       optionId: string | null,
       text: string,
       attach: (input: AnswerAskInput) => AnswerAskInput = (input) => input,
+      note = "",
     ) =>
       submitMissionInput(
-        withAttached(answerAskInput(ask, { optionId, text }), attach),
+        withAttached(answerAskInput(ask, { optionId, text }, note), attach),
         (input) => missionsSource.answerAsk(input),
         "Couldn't send the answer",
       ).then(done(`ask:${ask.id}`)),
-    decideDraft: (draft: Draft, decision: DraftDecision) =>
+    decideDraft: (draft: Draft, decision: DraftDecision, note = "") =>
       submitMissionInput(
-        decideDraftInput(draft, decision),
+        decideDraftInput(draft, decision, note),
         (input) => missionsSource.decideDraft(input),
         "Couldn't decide the draft",
       ).then(done(`draft:${draft.id}`)),
-    decideApproval: (approval: Approval, action: "approve" | "reject") =>
-      runMissionAction(
-        missionsSource.decideApproval({ approvalId: approval.id, action }),
+    decideApproval: (approval: Approval, action: "approve" | "reject", note = "") =>
+      submitMissionInput(
+        decideApprovalInput(approval, action, note),
+        (input) => missionsSource.decideApproval(input),
         "Couldn't decide the approval",
       ).then(done(`approval:${approval.id}`)),
     decideKnock: (
@@ -170,15 +175,16 @@ export function inboxActions(dispatch: (event: InboxUiEvent) => void) {
       decision:
         | { readonly action: "forward"; readonly editedText?: string }
         | { readonly action: "drop" },
+      note = "",
     ) =>
       submitMissionInput(
-        decideKnockInput(knock, decision),
+        decideKnockInput(knock, decision, note),
         (input) => missionsSource.decideKnock(input),
         "Couldn't decide the knock",
       ).then(done(`knock:${knock.id}`)),
-    decideSuggestion: (suggestion: Suggestion, decision: SuggestionDecision) =>
+    decideSuggestion: (suggestion: Suggestion, decision: SuggestionDecision, note = "") =>
       submitMissionInput(
-        decideSuggestionInput(suggestion, decision),
+        decideSuggestionInput(suggestion, decision, note),
         (input) => missionsSource.decideSuggestion(input),
         "Couldn't decide the suggestion",
       ).then(done(`suggestion:${suggestion.id}`)),

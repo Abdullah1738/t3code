@@ -101,7 +101,8 @@ const MissionKnocksTool = Tool.make("mission_knocks", {
 const MissionKnockDecideTool = Tool.make("mission_knock_decide", {
   description:
     "As the mission's master, forward (optionally edited, optionally to another member) or drop a pending knock that is not addressed to the master.",
-  parameters: DecideKnockInput,
+  // A note with a decision is the owner's alone.
+  parameters: DecideKnockInput.mapFields(({ note: _note, ...fields }) => fields),
   success: Schema.Struct({ knock: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
   failureMode: "return",

@@ -11,6 +11,7 @@ import {
   MissionMessageId,
   WorkItemId,
   type Ask,
+  type InboxComment,
   type Lane,
   type Mission,
   type MissionMessage,
@@ -135,6 +136,7 @@ export const item = (id: string): WorkItem => ({
 export interface Signal {
   readonly ask: Ask;
   readonly released: ReadonlyArray<MissionRecordRef>;
+  readonly comments?: ReadonlyArray<InboxComment>;
 }
 
 /** A room post the service handed the router. */
@@ -158,7 +160,11 @@ export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
   const signalsLayer = Layer.succeed(
     Ports.AsksSignals,
     Ports.AsksSignals.of({
-      askResolved: ({ ask, released }) => Effect.sync(() => void signals.push({ ask, released })),
+      askResolved: ({ ask, released, comments }) =>
+        Effect.sync(
+          () =>
+            void signals.push({ ask, released, ...(comments === undefined ? {} : { comments }) }),
+        ),
     }),
   );
   const rooms = Layer.succeed(

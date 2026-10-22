@@ -1,18 +1,21 @@
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import type { MissionId, RoomId } from "@t3tools/contracts";
-import { markOf, roomName } from "@t3tools/client-runtime/ardud/missions";
-import { findEntry } from "@t3tools/client-runtime/ardud/missions/mobile";
+import type { InboxComment, MissionId, RoomId } from "@t3tools/contracts";
+import { commentsOf, markOf, roomName } from "@t3tools/client-runtime/ardud/missions";
+import { decidedRows, findEntry } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { type ReactNode, useEffect, useRef } from "react";
-import { View } from "react-native";
+import { ScrollView, View } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppBar } from "../../components/ui/AppBar";
+import { DecidedSummary } from "./InboxPane";
 import { ItemReader } from "./ItemReader";
+import { CommentList } from "./ItemMarks";
 import { FeedError, LoadingLine } from "./FeedError";
 import {
   useMissionInbox,
   useMissionInboxFeed,
+  useMissionInboxHistory,
   useMissionOverview,
   useRoomPage,
 } from "./missionsStore";
@@ -118,7 +121,16 @@ function ItemScreen(props: {
       <LoadingLine />
     );
   }
-  if (entry === null) return <EmptyLine label="Already decided." />;
+  if (entry === null) {
+    return (
+      <DecidedItem
+        itemKey={props.itemKey}
+        missionId={props.missionId}
+        comments={commentsOf(inbox, props.itemKey)}
+        nowMs={props.nowMs}
+      />
+    );
+  }
   return (
     <ItemReader
       entry={entry}
@@ -127,6 +139,28 @@ function ItemScreen(props: {
       bottomInset={props.bottomInset}
       mark={markOf(inbox, entry.key)}
     />
+  );
+}
+
+/**
+ * An item that left the inbox: how it ended, when the day's history has it,
+ * and the owner's comments, which stay on it after the decision.
+ */
+function DecidedItem(props: {
+  readonly itemKey: string;
+  readonly missionId: MissionId | null;
+  readonly comments: ReadonlyArray<InboxComment>;
+  readonly nowMs: number;
+}) {
+  const history = useMissionInboxHistory(props.missionId);
+  const row = history
+    ? decidedRows(history, props.nowMs).find((candidate) => candidate.key === props.itemKey)
+    : undefined;
+  return (
+    <ScrollView contentContainerClassName="gap-4 px-4 pb-8 pt-4">
+      {row ? <DecidedSummary row={row} /> : <EmptyLine label="Already decided." />}
+      <CommentList comments={props.comments} nowMs={props.nowMs} />
+    </ScrollView>
   );
 }
 

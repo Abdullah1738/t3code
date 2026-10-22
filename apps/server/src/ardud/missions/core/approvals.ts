@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - comment ids use node:crypto, like core record ids.
+import * as NodeCrypto from "node:crypto";
+
 import {
   approverOf,
   isOwnerProvenance,
@@ -25,6 +28,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import { commentsOn, decisionNoteOf, markIdOf, withComment } from "../asks/inboxMarks.ts";
 import { settleDiscussion } from "./conditions.ts";
 import type { WriteKit } from "./kit.ts";
 import { isMasterOf } from "./master.ts";
@@ -434,12 +438,38 @@ export const makeApprovalWrites = (kit: WriteKit) => {
               : `Only the owner or mission ${before.missionId}'s master decides approval ${before.id}.`,
           );
         }
+        const decidedAt = yield* nowIso;
+        // The owner's note stays on the approval as a comment, saved with the
+        // decision. Whoever acts reads decisionNote, so it carries every comment
+        // he left on the approval, not only this note.
+        const subject = { kind: "approval" as const, id: before.id };
+        const noteBody = owner ? ((yield* decisionNoteOf(input.note, provenance)) ?? "") : "";
+        const mark =
+          noteBody === ""
+            ? null
+            : withComment(
+                yield* store.get("inbox-mark", markIdOf(subject)),
+                subject,
+                before.missionId,
+                {
+                  id: `comment-${NodeCrypto.randomUUID()}`,
+                  body: noteBody,
+                  at: decidedAt,
+                },
+              );
+        const comments = mark?.comments ?? (yield* commentsOn(store, subject));
+        const commented = owner && comments.length > 0;
+        const masterNote = owner ? "" : (input.note?.trim() ?? "");
+        const said = [...comments.map((comment) => comment.body), masterNote].filter(
+          (line) => line !== "",
+        );
+        const decisionNote = said.length > 0 ? said.join("\n") : (input.note ?? null);
         const record: Approval = {
           ...before,
           status: input.action === "approve" ? "approved" : "rejected",
           decidedBy: provenance,
-          decidedAt: yield* nowIso,
-          decisionNote: input.note ?? null,
+          decidedAt,
+          decisionNote,
           ...(condition === null ? {} : { onOwnerCondition: condition }),
         };
         const verb = input.action === "approve" ? "Approved" : "Rejected";
@@ -451,12 +481,17 @@ export const makeApprovalWrites = (kit: WriteKit) => {
               ? `${verb}: ${record.title}`
               : `${verb} on the owner's condition: ${record.title}`,
           ref: approvalRef(record),
-          upserts: [{ _tag: "approval", record }],
+          upserts: [
+            { _tag: "approval", record },
+            ...(mark === null ? [] : [{ _tag: "inbox-mark" as const, record: mark }]),
+          ],
           payload: {
             action: input.action,
             approver,
             note: input.note ?? null,
             onOwnerCondition: condition,
+            ...(mark === null ? {} : { commentId: mark.comments.at(-1)?.id ?? null }),
+            ...(commented ? { commented: true } : {}),
           },
         });
       }),

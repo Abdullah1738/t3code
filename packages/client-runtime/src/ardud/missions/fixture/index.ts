@@ -250,6 +250,14 @@ export function createFixtureMissionsSource(
       }
     );
   };
+  // The owner's note given with a decision is kept as a comment on the item.
+  const keepDecisionNote = (subject: InboxItemRef, note: string | undefined, at: string) => {
+    const body = note?.trim() ?? "";
+    if (body === "") return;
+    const mark = markFor(subject, at);
+    const comment = { id: localId("comment"), body, at };
+    marks.set(mark.id, { ...mark, comments: [...mark.comments, comment], updatedAt: at });
+  };
   // --- end finish-a ---
 
   let revision = 1;
@@ -1199,6 +1207,7 @@ export function createFixtureMissionsSource(
         },
         updatedAt: at,
       });
+      keepDecisionNote({ kind: "ask", id: ask.id }, input.note, at);
       commit();
       return Promise.resolve();
     },
@@ -1250,6 +1259,7 @@ export function createFixtureMissionsSource(
           replace(drafts, { ...decided, status: "dropped" });
           break;
       }
+      keepDecisionNote({ kind: "draft", id: draft.id }, input.note, at);
       commit();
       return Promise.resolve();
     },
@@ -1284,6 +1294,7 @@ export function createFixtureMissionsSource(
           });
           break;
       }
+      keepDecisionNote({ kind: "suggestion", id: suggestion.id }, input.note, at);
       commit();
       return Promise.resolve();
     },
@@ -1309,6 +1320,7 @@ export function createFixtureMissionsSource(
           decidedAt: at,
         });
       }
+      keepDecisionNote({ kind: "knock", id: knock.id }, input.note, at);
       commit();
       return Promise.resolve();
     },
@@ -1319,11 +1331,16 @@ export function createFixtureMissionsSource(
       if (approval.status !== "pending")
         return fail("conflict", "This approval is already decided.");
       // The owner can decide any approval, whoever it is routed to.
+      const at = nowIso();
+      keepDecisionNote({ kind: "approval", id: approval.id }, input.note, at);
+      // Like the server: the requester reads every comment he left as the note.
+      const said = (marks.get(`approval:${approval.id}`)?.comments ?? []).map((c) => c.body);
       replace(approvals, {
         ...approval,
         status: input.action === "approve" ? "approved" : "rejected",
         decidedBy: ownerProvenance(),
-        decidedAt: nowIso(),
+        decidedAt: at,
+        decisionNote: said.length > 0 ? said.join("\n") : null,
       });
       log.record({
         missionId: approval.missionId,

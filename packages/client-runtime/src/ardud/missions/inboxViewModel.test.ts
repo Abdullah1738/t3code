@@ -20,12 +20,14 @@ import {
   blocksLine,
   commentInput,
   commentsOf,
+  decideApprovalInput,
   decideDraftInput,
   decideKnockInput,
   decideSuggestionInput,
   defaultInboxTab,
   draftNotesFor,
   draftOwnerEdit,
+  draftSentText,
   fyiView,
   groupDraftNotes,
   INITIAL_INBOX_UI,
@@ -218,6 +220,19 @@ describe("Decide", () => {
     expect(answerAskInput(ask(), { optionId: "hold", text: "" }).ok).toBe(true);
   });
 
+  it("sends the owner's note with the answer only when there is one", () => {
+    expect(answerAskInput(ask(), { optionId: "hold", text: "" }, " Tell Pavan too ")).toEqual({
+      ok: true,
+      value: { askId: "ask-1", optionId: "hold", text: "", note: "Tell Pavan too" },
+    });
+    expect(answerAskInput(ask(), { optionId: "hold", text: "" }, "  ")).toEqual({
+      ok: true,
+      value: { askId: "ask-1", optionId: "hold", text: "" },
+    });
+    // A note alone is not an answer.
+    expect(answerAskInput(ask(), { optionId: null, text: "" }, "Tell Pavan").ok).toBe(false);
+  });
+
   it("formats the wait in minutes, hours, then days", () => {
     expect(waitingLabel("2026-10-17T08:21:00.000Z", NOW)).toBe("waiting 12m");
     expect(waitingLabel("2026-10-14T08:33:00.000Z", NOW)).toBe("waiting 3d");
@@ -321,6 +336,49 @@ describe("drafts and draft notes", () => {
     });
   });
 
+  it("sends the owner's note with approve, edit-approve and drop, never twice on a rewrite", () => {
+    const pending = draft();
+    expect(decideDraftInput(pending, { action: "approve" }, "  Post it after lunch  ")).toEqual({
+      ok: true,
+      value: { draftId: "draft-1", action: "approve", revision: 0, note: "Post it after lunch" },
+    });
+    expect(
+      decideDraftInput(pending, { action: "edit-approve", editedText: "Rebase #124." }, "Shorter"),
+    ).toMatchObject({ ok: true, value: { editedText: "Rebase #124.", note: "Shorter" } });
+    expect(decideDraftInput(pending, { action: "drop" }, "Already said on Slack")).toEqual({
+      ok: true,
+      value: { draftId: "draft-1", action: "drop", note: "Already said on Slack" },
+    });
+    // Blank notes are left out.
+    expect(decideDraftInput(pending, { action: "drop" }, "   ")).toEqual({
+      ok: true,
+      value: { draftId: "draft-1", action: "drop" },
+    });
+    // The rewrite note is the note; nothing is sent beside it.
+    expect(
+      decideDraftInput(pending, { action: "rewrite", note: " Less formal " }, "Less formal"),
+    ).toEqual({
+      ok: true,
+      value: { draftId: "draft-1", action: "rewrite", rewriteNote: "Less formal" },
+    });
+    expect(decideDraftInput(pending, { action: "approve" }, "x".repeat(4001)).ok).toBe(false);
+  });
+
+  it("shows what went out only when it differs from what was approved", () => {
+    expect(draftSentText(draft({ status: "sent", sentText: null }))).toBeNull();
+    expect(
+      draftSentText(draft({ status: "sent", sentText: " Hi Pavan, please rebase #124. " })),
+    ).toBeNull();
+    expect(
+      draftSentText(
+        draft({ status: "sent", approvedText: "Rebase #124.", sentText: "Rebase #124." }),
+      ),
+    ).toBeNull();
+    expect(
+      draftSentText(draft({ status: "sent", sentText: "Hi Pavan, rebase #124 after lunch." })),
+    ).toBe("Hi Pavan, rebase #124 after lunch.");
+  });
+
   it("approves the revision the owner read", () => {
     expect(decideDraftInput(draft({ revision: 2 }), { action: "approve" })).toEqual({
       ok: true,
@@ -384,6 +442,44 @@ describe("knocks and suggestions", () => {
     expect(decideKnockInput(knock, { action: "forward", editedText: "Shorter." })).toMatchObject({
       ok: true,
       value: { editedText: "Shorter." },
+    });
+  });
+
+  it("sends the owner's note with a knock, a suggestion or an approval decision", () => {
+    const knock = { id: "k" as never, summary: "Wants to tell the master." };
+    expect(decideKnockInput(knock, { action: "drop" }, " Not now ")).toEqual({
+      ok: true,
+      value: { knockId: "k", action: "drop", note: "Not now" },
+    });
+    expect(decideKnockInput(knock, { action: "forward" }, "")).toEqual({
+      ok: true,
+      value: { knockId: "k", action: "forward" },
+    });
+    expect(decideSuggestionInput(suggestion(), { action: "accept" }, "Try it a week")).toEqual({
+      ok: true,
+      value: { suggestionId: "s-1", action: "accept", note: "Try it a week" },
+    });
+    // An unchanged edit is still an accept, and keeps the note.
+    expect(
+      decideSuggestionInput(
+        suggestion(),
+        { action: "accept-edited", editedText: '{ "everyMinutes": 30, "running": true }' },
+        "Fine",
+      ),
+    ).toEqual({ ok: true, value: { suggestionId: "s-1", action: "accept", note: "Fine" } });
+    expect(
+      decideSuggestionInput(suggestion(), { action: "dismiss", reason: "Too often" }, " "),
+    ).toEqual({
+      ok: true,
+      value: { suggestionId: "s-1", action: "dismiss", dismissReason: "Too often" },
+    });
+    expect(decideApprovalInput({ id: "a" as never }, "reject", " After the freeze ")).toEqual({
+      ok: true,
+      value: { approvalId: "a", action: "reject", note: "After the freeze" },
+    });
+    expect(decideApprovalInput({ id: "a" as never }, "approve")).toEqual({
+      ok: true,
+      value: { approvalId: "a", action: "approve" },
     });
   });
 

@@ -1,5 +1,7 @@
 // @effect-diagnostics globalDate:off - Snoozed items come back on the reader's clock.
 import type {
+  InboxComment,
+  InboxMark,
   InboxTab,
   MissionId,
   MissionInboxHistory,
@@ -18,9 +20,12 @@ import {
 import {
   APPROVAL_STATUS_LABEL,
   DRAFT_STATUS_LABEL,
+  draftSentText,
   inboxEntries,
   inboxTabCounts,
+  KNOCK_STATUS_LABEL,
   snoozedEntries,
+  SUGGESTION_STATUS_LABEL,
   type InboxEntry,
 } from "../inboxViewModel.ts";
 import { ownerConditionOf } from "../requestsViewModel.ts";
@@ -191,23 +196,22 @@ export interface DecidedRowView {
   readonly age: string | null;
   /** The owner's words the master decided on, quoted from a discussion. */
   readonly condition: string | null;
+  /** The owner's comments, including notes given with the decision. */
+  readonly comments: ReadonlyArray<InboxComment>;
+  /** A draft's text as it went out, when that differs from what was approved. */
+  readonly sent: string | null;
 }
 
-const KNOCK_OUTCOME = { pending: "Waiting", forwarded: "Forwarded", dropped: "Dropped" } as const;
-const SUGGESTION_OUTCOME = {
-  open: "Open",
-  accepted: "Accepted",
-  edited: "Accepted, edited",
-  dismissed: "Dismissed",
-} as const;
-
-/** What was decided in the last day, newest first, with any condition quote. */
+/** What was decided in the last day, newest first, with any condition quote and comments. */
 export function decidedRows(
   history: Pick<MissionInboxHistory, "asks" | "drafts" | "approvals" | "knocks" | "suggestions">,
   nowMs: number,
+  marks: ReadonlyArray<InboxMark> = [],
 ): DecidedRowView[] {
   const age = (at: string | null | undefined, fallback: string) =>
     ageView(at ?? fallback, nowMs)?.label ?? null;
+  const commentsBy = new Map(marks.map((mark) => [mark.id, mark.comments]));
+  const comments = (key: string) => commentsBy.get(key) ?? [];
   const rows: Array<DecidedRowView & { readonly at: string }> = [
     ...history.asks.map((ask) => ({
       key: `ask:${ask.id}`,
@@ -216,6 +220,8 @@ export function decidedRows(
       at: ask.answer?.answeredAt ?? ask.createdAt,
       age: age(ask.answer?.answeredAt, ask.createdAt),
       condition: ask.answer ? (ownerConditionOf(ask.answer)?.quote ?? null) : null,
+      comments: comments(`ask:${ask.id}`),
+      sent: null,
     })),
     ...history.drafts.map((draft) => ({
       key: `draft:${draft.id}`,
@@ -227,6 +233,8 @@ export function decidedRows(
       at: draft.decidedAt ?? draft.createdAt,
       age: age(draft.decidedAt, draft.createdAt),
       condition: ownerConditionOf(draft)?.quote ?? null,
+      comments: comments(`draft:${draft.id}`),
+      sent: draftSentText(draft),
     })),
     ...history.approvals.map((approval) => ({
       key: `approval:${approval.id}`,
@@ -235,22 +243,28 @@ export function decidedRows(
       at: approval.decidedAt ?? approval.createdAt,
       age: age(approval.decidedAt, approval.createdAt),
       condition: ownerConditionOf(approval)?.quote ?? null,
+      comments: comments(`approval:${approval.id}`),
+      sent: null,
     })),
     ...history.knocks.map((knock) => ({
       key: `knock:${knock.id}`,
       title: knock.summary,
-      outcome: KNOCK_OUTCOME[knock.status],
+      outcome: KNOCK_STATUS_LABEL[knock.status],
       at: knock.decidedAt ?? knock.createdAt,
       age: age(knock.decidedAt, knock.createdAt),
       condition: null,
+      comments: comments(`knock:${knock.id}`),
+      sent: null,
     })),
     ...history.suggestions.map((suggestion) => ({
       key: `suggestion:${suggestion.id}`,
       title: suggestion.title,
-      outcome: SUGGESTION_OUTCOME[suggestion.status],
+      outcome: SUGGESTION_STATUS_LABEL[suggestion.status],
       at: suggestion.decidedAt ?? suggestion.createdAt,
       age: age(suggestion.decidedAt, suggestion.createdAt),
       condition: null,
+      comments: comments(`suggestion:${suggestion.id}`),
+      sent: null,
     })),
   ];
   return rows

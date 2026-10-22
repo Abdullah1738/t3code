@@ -17,7 +17,12 @@ import type {
 
 const less = (count: number) => Math.max(0, count - 1);
 
-/** The inbox without one waiting item, its count and its mark. Unchanged when the item is gone. */
+/**
+ * The inbox without one waiting item and its count. Unchanged when the item is
+ * gone. Its mark loses the snooze, as the server drops it once the item
+ * changes, so snoozed counts stay right; the comments stay to be read on the
+ * decided item, and a mark left with none goes.
+ */
 export function withoutInboxItem(
   inbox: MissionInboxSnapshot,
   kind: InboxItemKind,
@@ -26,8 +31,17 @@ export function withoutInboxItem(
   const next = removeItem(inbox, kind, id);
   if (next === inbox || !inbox.marks) return next;
   const markId = `${kind}:${id}`;
-  if (!inbox.marks.some((mark) => mark.id === markId)) return next;
-  return { ...next, marks: inbox.marks.filter((mark) => mark.id !== markId) };
+  const mark = inbox.marks.find((candidate) => candidate.id === markId);
+  if (!mark || mark.snooze === null) return next;
+  return {
+    ...next,
+    marks:
+      mark.comments.length === 0
+        ? inbox.marks.filter((candidate) => candidate !== mark)
+        : inbox.marks.map((candidate) =>
+            candidate === mark ? { ...candidate, snooze: null } : candidate,
+          ),
+  };
 }
 
 function removeItem(

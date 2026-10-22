@@ -25,6 +25,7 @@ import {
   type DraftNote,
   type DraftNoteId,
   type DraftNoteScope,
+  type InboxComment,
   type MissionActor,
   type MissionId,
   type MissionLink,
@@ -42,6 +43,7 @@ import {
 import * as Result from "effect/Result";
 
 import { routeApprover } from "../core/approvals.ts";
+import { applyCommentsNote, commentLines } from "./inboxMarks.ts";
 import {
   actorOf,
   callerActsAs,
@@ -317,6 +319,25 @@ export const revisionOf = (draft: Pick<Draft, "revision">): number => draft.revi
 export const epochOf = (draft: Pick<Draft, "revisedAt" | "createdAt">): string =>
   draft.revisedAt ?? draft.createdAt;
 
+/**
+ * The owner's comments that apply to the text as it stands: those left in the
+ * current epoch. Earlier ones were about text a revision already replaced.
+ */
+export const currentComments = (
+  draft: Pick<Draft, "revisedAt" | "createdAt">,
+  comments: ReadonlyArray<InboxComment>,
+): ReadonlyArray<InboxComment> => {
+  const epoch = epochOf(draft);
+  return comments.filter((comment) => comment.at >= epoch);
+};
+
+/** A system writer's rewrite note: his own words, then every comment to apply. */
+const systemRewriteNote = (note: string | null, comments: ReadonlyArray<InboxComment>): string => {
+  if (note === null) return applyCommentsNote(comments);
+  if (comments.length === 0) return note;
+  return [note, "", "The owner's comments:", commentLines(comments)].join("\n");
+};
+
 /** Starts a new epoch: whatever was said about the earlier text or decision no longer counts. */
 const nextEpoch = (draft: Draft, now: string): Pick<Draft, "revision" | "revisedAt"> => ({
   revision: revisionOf(draft) + 1,
@@ -379,6 +400,8 @@ export interface DecideDraftCommand {
    */
   readonly onOwnerCondition?: OwnerCondition;
   readonly now: string;
+  /** The owner's comments on the draft, including a note given with this decision. */
+  readonly comments?: ReadonlyArray<InboxComment>;
 }
 
 export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision> => {
@@ -437,6 +460,36 @@ export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision>
       if (edited !== undefined && edited.length === 0) {
         return refuse("invalid", "Edited text is empty; drop the draft instead.");
       }
+      // A system writer posts approved text as given, so it can't apply comments
+      // itself: the draft goes back to it with the comments as the rewrite note.
+      const comments = currentComments(draft, command.comments ?? []);
+      const system = (draft.requestedBy ?? null) !== null;
+      if (system && changed && (input.note?.trim() ?? "") !== "") {
+        return refuse(
+          "invalid",
+          `${draft.requestedBy} posts the edited text of draft ${draft.id} as given; put the change in the edit, or approve without editing and leave the note.`,
+        );
+      }
+      if (system && !changed && comments.length > 0) {
+        const record: Draft = {
+          ...draft,
+          ...decided,
+          status: "rewrite-requested",
+          rewriteNote: systemRewriteNote(null, comments),
+        };
+        return ok({
+          record,
+          edit: null,
+          events: [
+            decisionEvent(
+              record,
+              provenance,
+              "Approved once the owner's comments are applied",
+              withCondition({ action: "approve", edited: false, applyComments: true }),
+            ),
+          ],
+        });
+      }
       const record: Draft = {
         ...draft,
         ...decided,
@@ -459,11 +512,15 @@ export const decideDraft = (command: DecideDraftCommand): Outcome<DraftDecision>
     case "rewrite": {
       const note = input.rewriteNote?.trim() ?? "";
       if (note.length === 0) return refuse("invalid", "Say what to change for the rewrite.");
+      // A system writer only reads the rewrite note, so it carries his comments too.
       const record: Draft = {
         ...draft,
         ...decided,
         status: "rewrite-requested",
-        rewriteNote: note,
+        rewriteNote:
+          (draft.requestedBy ?? null) === null
+            ? note
+            : systemRewriteNote(note, currentComments(draft, command.comments ?? [])),
       };
       return ok({
         record,
@@ -705,12 +762,45 @@ export const draftWriter = (draft: Draft): MissionActor | null => {
   return null;
 };
 
-/** What the writer is told once its draft is decided; null while nothing was decided. */
+/**
+ * What the writer is told once its draft is decided; null while nothing was
+ * decided. The owner's comments ride along: on an approval they are changes to
+ * make before posting.
+ */
 export const draftDecisionNotice = (
   draft: Draft,
+  allComments: ReadonlyArray<InboxComment> = [],
 ): { readonly summary: string; readonly body: string } | null => {
   const what = `draft for ${draft.audience} (${draft.channel})`;
   const ref = `Draft ${draft.id}`;
+  const notice = baseDecisionNotice(draft, what, ref);
+  const comments = currentComments(draft, allComments);
+  if (notice === null || comments.length === 0) return notice;
+  if (draft.status === "approved") {
+    return {
+      summary: clipSummary(`Approved with comments: ${what}`),
+      body: [
+        `${ref} is approved${draft.approvedText === null ? "" : " with edits"}, with the owner's comments below. Apply every comment to the text before you post it, post the result once, then record it with mission_draft_sent, passing the text you posted (and the link when there is one).`,
+        "",
+        "The owner's comments:",
+        commentLines(comments),
+        "",
+        "Approved text:",
+        draft.approvedText ?? draft.text,
+      ].join("\n"),
+    };
+  }
+  return {
+    summary: notice.summary,
+    body: [notice.body, "", "The owner's comments:", commentLines(comments)].join("\n"),
+  };
+};
+
+const baseDecisionNotice = (
+  draft: Draft,
+  what: string,
+  ref: string,
+): { readonly summary: string; readonly body: string } | null => {
   switch (draft.status) {
     case "approved":
       return {
@@ -1032,7 +1122,12 @@ export const closeStaleDraft = (command: {
  * What a system may act on for one draft at one head. Only a decision on exactly that head
  * counts; a stale draft or any other head reads as `stale`.
  */
-export const systemDraftDecision = (draft: Draft, head: string): SystemDraftDecision => {
+export const systemDraftDecision = (
+  draft: Draft,
+  head: string,
+  allComments: ReadonlyArray<InboxComment> = [],
+): SystemDraftDecision => {
+  const comments = currentComments(draft, allComments);
   const delivery =
     draft.status === "sent" ? "sent" : draft.status === "send-failed" ? "send-failed" : "unsent";
   const base = {
@@ -1043,6 +1138,7 @@ export const systemDraftDecision = (draft: Draft, head: string): SystemDraftDeci
     rewriteNote: null,
     revision: revisionOf(draft),
     delivery,
+    ...(comments.length === 0 ? {} : { comments: [...comments] }),
   } as const;
   if ((draft.staleReason ?? null) !== null || draft.head !== head) {
     return { ...base, state: "stale", decidedAt: null };
@@ -1148,8 +1244,16 @@ const markSent = (
   provenance: MissionProvenance,
   link: MissionLink | null,
   now: string,
+  sentText: string | null = null,
 ): Transition<Draft> => {
-  const record: Draft = { ...draft, status: "sent", sentAt: now, sentLink: link, sendError: null };
+  const record: Draft = {
+    ...draft,
+    status: "sent",
+    sentAt: now,
+    sentLink: link,
+    sendError: null,
+    ...(sentText === null ? {} : { sentText }),
+  };
   const where = link === null ? "" : ` at ${link.label}`;
   return {
     record,
@@ -1166,6 +1270,7 @@ const markSent = (
           link,
           reason: null,
           previousStatus: draft.status,
+          ...(sentText === null ? {} : { text: sentText }),
         },
       },
     ],
@@ -1184,6 +1289,10 @@ export const recordDraftSent = (command: {
   readonly callerIsMaster: boolean;
   readonly link: MissionLink | null;
   readonly now: string;
+  /** What was actually posted. */
+  readonly text?: string;
+  /** The owner's comments on the draft; with any, the posted text is required. */
+  readonly comments?: ReadonlyArray<InboxComment>;
 }): Outcome<Transition<Draft>> => {
   const { draft, caller, link } = command;
   if ((draft.requestedBy ?? null) !== null) {
@@ -1212,7 +1321,74 @@ export const recordDraftSent = (command: {
       `Draft ${draft.id} is ${draft.status}; only an approved draft is sent.`,
     );
   }
-  return ok(markSent(draft, caller.provenance, link, command.now));
+  const sentText = command.text?.trim() ?? "";
+  if (sentText === "" && currentComments(draft, command.comments ?? []).length > 0) {
+    return refuse(
+      "invalid",
+      `The owner commented on draft ${draft.id}; pass the text you posted, with his comments applied.`,
+    );
+  }
+  return ok(
+    markSent(draft, caller.provenance, link, command.now, sentText === "" ? null : sentText),
+  );
+};
+
+/**
+ * The owner commented on a system's draft after approving it, before it went
+ * out: the system can only post text as given, so the draft goes back to it
+ * with every comment as the rewrite note. Null when there is nothing to send
+ * back (a thread's draft, or one already out or closed).
+ */
+export const sendBackForComments = (command: {
+  readonly draft: Draft;
+  readonly comments: ReadonlyArray<InboxComment>;
+  readonly provenance: MissionProvenance;
+  readonly now: string;
+}): Transition<Draft> | null => {
+  const { draft, provenance } = command;
+  const comments = currentComments(draft, command.comments);
+  const latest = comments.at(-1);
+  if ((draft.requestedBy ?? null) === null || latest === undefined) return null;
+  if ((draft.staleReason ?? null) !== null) return null;
+  if (draft.status === "rewrite-requested") {
+    // Already back with the system: the new comment joins the rewrite note it
+    // reads, after the comment list the note already ends with, if any.
+    const before = draft.rewriteNote ?? "";
+    const previous = comments.at(-2);
+    const rewriteNote =
+      previous !== undefined && before.endsWith(`- ${previous.body}`)
+        ? `${before}\n- ${latest.body}`
+        : systemRewriteNote(before === "" ? null : before, [latest]);
+    return {
+      record: { ...draft, rewriteNote },
+      events: [
+        decisionEvent(
+          { ...draft, rewriteNote },
+          provenance,
+          "The owner's comment joins the rewrite",
+          { action: "rewrite", note: rewriteNote, applyComments: true },
+        ),
+      ],
+    };
+  }
+  if (draft.status !== "approved" && draft.status !== "send-failed") return null;
+  const record: Draft = {
+    ...draft,
+    status: "rewrite-requested",
+    rewriteNote: systemRewriteNote(null, comments),
+    decidedBy: provenance,
+    decidedAt: command.now,
+  };
+  return {
+    record,
+    events: [
+      decisionEvent(record, provenance, "Sent back to apply the owner's comments", {
+        action: "rewrite",
+        note: record.rewriteNote,
+        applyComments: true,
+      }),
+    ],
+  };
 };
 
 /** Edit pairs the owner approved: the raw material for edit learning. */

@@ -11,6 +11,7 @@ import type {
   AnswerAskInput,
   Approval,
   Ask,
+  DecideApprovalInput,
   DecideDraftInput,
   DecideKnockInput,
   DecideSuggestionInput,
@@ -447,17 +448,31 @@ export function askView(ask: Ask, nowMs: number): AskView {
   };
 }
 
+/**
+ * The owner's note given with a decision, for whoever acts on it. The server
+ * keeps it as a comment on the item; it opens no discussion. A blank note is
+ * left out.
+ */
+export function decisionNote(note: string | undefined): Result<{ readonly note?: string }> {
+  const trimmed = note?.trim() ?? "";
+  if (trimmed.length > 4000) return err("Keep the note under 4000 characters.");
+  return ok(trimmed === "" ? {} : { note: trimmed });
+}
+
 /** An answer needs an option, some text, or both. */
 export function answerAskInput(
   ask: Pick<Ask, "id" | "options">,
   answer: { readonly optionId: string | null; readonly text: string },
+  note = "",
 ): Result<AnswerAskInput> {
   const text = answer.text.trim();
   if (answer.optionId !== null && !ask.options.some((option) => option.id === answer.optionId)) {
     return err("That option is no longer on the ask.");
   }
   if (answer.optionId === null && text === "") return err("Pick an option or write an answer.");
-  return ok({ askId: ask.id, optionId: answer.optionId, text } as AnswerAskInput);
+  const noted = decisionNote(note);
+  if (!noted.ok) return err(noted.error);
+  return ok({ askId: ask.id, optionId: answer.optionId, text, ...noted.value } as AnswerAskInput);
 }
 
 // ---------------------------------------------------------------------------
@@ -624,31 +639,51 @@ export type DraftDecision =
   | { readonly action: "rewrite"; readonly note: string }
   | { readonly action: "drop" };
 
+/**
+ * `note` goes with approve, edit-approve and drop. A rewrite's own note is
+ * what the writer acts on, so it is sent as the rewrite note only.
+ */
 export function decideDraftInput(
   draft: Pick<Draft, "id" | "text" | "revision">,
   decision: DraftDecision,
+  note = "",
 ): Result<DecideDraftInput> {
   // The server binds an approval to the revision the owner read and refuses one without it.
   const revision = draft.revision ?? 0;
+  if (decision.action === "rewrite") {
+    const rewriteNote = decision.note.trim();
+    if (rewriteNote === "") return err("Say what the rewrite should change.");
+    return ok({ draftId: draft.id, action: "rewrite", rewriteNote });
+  }
+  const noted = decisionNote(note);
+  if (!noted.ok) return err(noted.error);
   switch (decision.action) {
     case "approve":
-      return ok({ draftId: draft.id, action: "approve", revision });
+      return ok({ draftId: draft.id, action: "approve", revision, ...noted.value });
     case "edit-approve": {
       const editedText = decision.editedText.trim();
       if (editedText === "") return err("The edited draft is empty.");
       // An unchanged edit is a plain approve; no diff to learn from.
       return editedText === draft.text.trim()
-        ? ok({ draftId: draft.id, action: "approve", revision })
-        : ok({ draftId: draft.id, action: "approve", editedText, revision });
-    }
-    case "rewrite": {
-      const rewriteNote = decision.note.trim();
-      if (rewriteNote === "") return err("Say what the rewrite should change.");
-      return ok({ draftId: draft.id, action: "rewrite", rewriteNote });
+        ? ok({ draftId: draft.id, action: "approve", revision, ...noted.value })
+        : ok({ draftId: draft.id, action: "approve", editedText, revision, ...noted.value });
     }
     case "drop":
-      return ok({ draftId: draft.id, action: "drop" });
+      return ok({ draftId: draft.id, action: "drop", ...noted.value });
   }
+}
+
+/**
+ * What the writer reports it actually posted, when that differs from the
+ * text the owner approved. `null` when it went out as approved.
+ */
+export function draftSentText(
+  draft: Pick<Draft, "text" | "approvedText"> & Partial<Pick<Draft, "sentText">>,
+): string | null {
+  const sent = draft.sentText?.trim() ?? "";
+  if (sent === "") return null;
+  const approved = (draft.approvedText ?? draft.text).trim();
+  return sent === approved ? null : sent;
 }
 
 export const DRAFT_STATUS_LABEL: Record<Draft["status"], string> = {
@@ -667,6 +702,29 @@ export const APPROVAL_STATUS_LABEL: Record<Approval["status"], string> = {
   "stale-closed": "Closed as stale",
 };
 
+export const KNOCK_STATUS_LABEL: Record<Knock["status"], string> = {
+  pending: "Waiting",
+  forwarded: "Forwarded",
+  dropped: "Dropped",
+};
+
+export const SUGGESTION_STATUS_LABEL: Record<Suggestion["status"], string> = {
+  open: "Open",
+  accepted: "Accepted",
+  edited: "Accepted, edited",
+  dismissed: "Dismissed",
+};
+
+export function decideApprovalInput(
+  approval: Pick<Approval, "id">,
+  action: DecideApprovalInput["action"],
+  note = "",
+): Result<DecideApprovalInput> {
+  const noted = decisionNote(note);
+  if (!noted.ok) return err(noted.error);
+  return ok({ approvalId: approval.id, action, ...noted.value });
+}
+
 /** crw approvals that closed themselves as stale, newest first, for the closed list. */
 export function staleApprovals(history: Pick<MissionInboxHistory, "approvals">): Approval[] {
   return history.approvals
@@ -682,13 +740,16 @@ export function decideKnockInput(
   decision:
     | { readonly action: "forward"; readonly editedText?: string }
     | { readonly action: "drop" },
+  note = "",
 ): Result<DecideKnockInput> {
-  if (decision.action === "drop") return ok({ knockId: knock.id, action: "drop" });
+  const noted = decisionNote(note);
+  if (!noted.ok) return err(noted.error);
+  if (decision.action === "drop") return ok({ knockId: knock.id, action: "drop", ...noted.value });
   const edited = decision.editedText?.trim();
   if (edited === "") return err("The forwarded text is empty.");
   return edited === undefined || edited === knock.summary.trim()
-    ? ok({ knockId: knock.id, action: "forward" })
-    : ok({ knockId: knock.id, action: "forward", editedText: edited });
+    ? ok({ knockId: knock.id, action: "forward", ...noted.value })
+    : ok({ knockId: knock.id, action: "forward", editedText: edited, ...noted.value });
 }
 
 // ---------------------------------------------------------------------------
@@ -778,22 +839,35 @@ export type SuggestionDecision =
 export function decideSuggestionInput(
   suggestion: Pick<Suggestion, "id" | "after">,
   decision: SuggestionDecision,
+  note = "",
 ): Result<DecideSuggestionInput> {
+  const noted = decisionNote(note);
+  if (!noted.ok) return err(noted.error);
+  const accept = ok<DecideSuggestionInput>({
+    suggestionId: suggestion.id,
+    action: "accept",
+    ...noted.value,
+  });
   switch (decision.action) {
     case "accept":
-      return ok({ suggestionId: suggestion.id, action: "accept" });
+      return accept;
     case "dismiss": {
       const dismissReason = decision.reason.trim();
       if (dismissReason === "") return err("Say why, so the author learns from it.");
-      return ok({ suggestionId: suggestion.id, action: "dismiss", dismissReason });
+      return ok({ suggestionId: suggestion.id, action: "dismiss", dismissReason, ...noted.value });
     }
     case "accept-edited": {
       const text = decision.editedText.trim();
       if (text === "") return err("The edited value is empty.");
       if (typeof suggestion.after === "string") {
         return text === suggestion.after.trim()
-          ? ok({ suggestionId: suggestion.id, action: "accept" })
-          : ok({ suggestionId: suggestion.id, action: "accept-edited", editedAfter: text });
+          ? accept
+          : ok({
+              suggestionId: suggestion.id,
+              action: "accept-edited",
+              editedAfter: text,
+              ...noted.value,
+            });
       }
       let editedAfter: unknown;
       try {
@@ -802,8 +876,8 @@ export function decideSuggestionInput(
         return err("That is not valid JSON.");
       }
       return JSON.stringify(editedAfter) === JSON.stringify(suggestion.after)
-        ? ok({ suggestionId: suggestion.id, action: "accept" })
-        : ok({ suggestionId: suggestion.id, action: "accept-edited", editedAfter });
+        ? accept
+        : ok({ suggestionId: suggestion.id, action: "accept-edited", editedAfter, ...noted.value });
     }
   }
 }

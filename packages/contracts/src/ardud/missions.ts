@@ -1175,6 +1175,10 @@ export const Draft = Schema.Struct({
   /** Why the master took it back from the owner; set only on a withdrawn (dropped) draft. */
   withdrawNote: Schema.optional(Schema.NullOr(Schema.String)),
   // --- end asks additions ---
+  // --- r22 comments ---
+  /** The text the writer reports it actually posted, when the owner's comments changed it. */
+  sentText: Schema.optional(Schema.NullOr(Schema.String)),
+  // --- end r22 comments ---
 });
 export type Draft = typeof Draft.Type;
 
@@ -2563,6 +2567,10 @@ export const AnswerAskInput = Schema.Struct({
   // --- views additions ---
   feedback: Schema.optional(AssetFeedbackList),
   // --- end views additions ---
+  // --- r22 comments ---
+  /** The owner's note given with the answer; saved as a comment on the ask. */
+  note: Schema.optional(Schema.String),
+  // --- end r22 comments ---
 });
 export type AnswerAskInput = typeof AnswerAskInput.Type;
 
@@ -2597,6 +2605,10 @@ export const DecideDraftInput = Schema.Struct({
   /** The master decides an owner-routed draft: the owner request whose stated condition this meets. */
   onOwnerCondition: Schema.optional(OwnerCondition),
   // --- end asks additions ---
+  // --- r22 comments ---
+  /** The owner's note given with the decision; saved as a comment on the draft. */
+  note: Schema.optional(Schema.String),
+  // --- end r22 comments ---
 });
 export type DecideDraftInput = typeof DecideDraftInput.Type;
 
@@ -2605,6 +2617,10 @@ export const DecideSuggestionInput = Schema.Struct({
   action: Schema.Literals(["accept", "accept-edited", "dismiss"]),
   editedAfter: Schema.optional(Schema.Unknown),
   dismissReason: Schema.optional(Schema.String),
+  // --- r22 comments ---
+  /** The owner's note given with the decision; saved as a comment on the suggestion. */
+  note: Schema.optional(Schema.String),
+  // --- end r22 comments ---
 });
 export type DecideSuggestionInput = typeof DecideSuggestionInput.Type;
 
@@ -2613,6 +2629,10 @@ export const DecideKnockInput = Schema.Struct({
   action: Schema.Literals(["forward", "drop"]),
   forwardTo: Schema.optional(MissionActor),
   editedText: Schema.optional(Schema.String),
+  // --- r22 comments ---
+  /** The owner's note given with the decision; saved as a comment on the knock. */
+  note: Schema.optional(Schema.String),
+  // --- end r22 comments ---
 });
 export type DecideKnockInput = typeof DecideKnockInput.Type;
 
@@ -3777,6 +3797,10 @@ export const SystemDraftDecision = Schema.Struct({
   revision: NonNegativeInt,
   /** Whether the system already reported posting the approved text. */
   delivery: Schema.Literals(["unsent", "sent", "send-failed"]),
+  // --- r22 comments ---
+  /** The owner's comments on the draft, oldest first. */
+  comments: Schema.optional(Schema.Array(InboxComment)),
+  // --- end r22 comments ---
 });
 export type SystemDraftDecision = typeof SystemDraftDecision.Type;
 
@@ -3806,6 +3830,10 @@ export type ReportDraftSentInput = typeof ReportDraftSentInput.Type;
 export const RecordDraftSentInput = Schema.Struct({
   draftId: DraftId,
   link: Schema.optional(MissionLink),
+  // --- r22 comments ---
+  /** The text actually posted. Required when the owner commented on the draft. */
+  text: Schema.optional(Schema.String),
+  // --- end r22 comments ---
 });
 export type RecordDraftSentInput = typeof RecordDraftSentInput.Type;
 

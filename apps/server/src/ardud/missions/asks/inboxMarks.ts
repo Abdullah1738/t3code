@@ -9,15 +9,16 @@
 import type {
   Approval,
   Draft,
+  InboxComment,
   InboxItemKind,
   InboxItemRef,
   InboxMark,
   InboxSnooze,
   MissionId,
-  MissionError,
+  MissionProvenance,
   Suggestion,
 } from "@t3tools/contracts";
-import { approverOf } from "@t3tools/contracts";
+import { approverOf, isOwnerProvenance, MissionError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
@@ -139,7 +140,7 @@ export const waitsOnOwner = (kind: InboxItemKind, record: unknown): boolean => {
   }
 };
 
-/** Items the master decides: a comment on one knocks the master once. */
+/** Items the master decides rather than the owner. */
 export const isMasterRouted = (kind: InboxItemKind, record: unknown): boolean => {
   switch (kind) {
     case "draft":
@@ -166,3 +167,92 @@ export const itemLabel = (kind: InboxItemKind, record: unknown): string => {
           : value.summary;
   return typeof text === "string" && text.trim() !== "" ? text : `${kind} ${String(value.id)}`;
 };
+
+// A note the owner gives with a decision is a comment on the item: it goes to
+// whoever acts on the decision and stays on the item, and never opens a
+// discussion.
+
+const NOTE_LIMIT = 4000;
+
+/** The owner's note given with a decision, or null when there is none. */
+export const decisionNoteOf = (
+  note: string | undefined,
+  provenance: MissionProvenance,
+): Effect.Effect<string | null, MissionError> => {
+  const body = note?.trim() ?? "";
+  if (body === "") return Effect.succeed(null);
+  if (!isOwnerProvenance(provenance)) {
+    return Effect.fail(
+      new MissionError({
+        code: "forbidden",
+        detail: "Only the owner leaves a note with a decision; post yours to the room.",
+      }),
+    );
+  }
+  if (body.length > NOTE_LIMIT) {
+    return Effect.fail(
+      new MissionError({ code: "invalid", detail: `A note is at most ${NOTE_LIMIT} characters.` }),
+    );
+  }
+  return Effect.succeed(body);
+};
+
+/** The item's mark with one more comment. */
+export const withComment = (
+  existing: Option.Option<InboxMark>,
+  subject: InboxItemRef,
+  missionId: MissionId | null,
+  comment: InboxComment,
+): InboxMark => {
+  const mark = Option.getOrElse(existing, () => emptyMark(subject, missionId, comment.at));
+  return { ...mark, comments: [...mark.comments, comment], updatedAt: comment.at };
+};
+
+/** Every comment the owner left on the item, oldest first. */
+export const commentsOn = (
+  store: Store,
+  subject: InboxItemRef,
+): Effect.Effect<ReadonlyArray<InboxComment>, MissionError> =>
+  Effect.map(store.get("inbox-mark", markIdOf(subject)), (mark) =>
+    Option.match(mark, { onNone: () => [], onSome: (found) => found.comments }),
+  );
+
+export const commentLines = (comments: ReadonlyArray<InboxComment>): string =>
+  comments.map((comment) => `- ${comment.body}`).join("\n");
+
+/**
+ * The rewrite note a system writer gets when the owner approved its draft with
+ * comments: it rewrites and resubmits, since it can only post text as given.
+ */
+export const applyCommentsNote = (comments: ReadonlyArray<InboxComment>): string =>
+  ["Approved once these comments from the owner are applied:", commentLines(comments)].join("\n");
+
+export type WithComments<R> = R & { readonly comments?: ReadonlyArray<InboxComment> };
+
+/**
+ * Records with the owner's comments on them (only those that have any), so a
+ * read shows them after the item has left his inbox.
+ */
+export const attachComments = Effect.fn("inboxMarks.attachComments")(function* <
+  R extends { readonly id: string; readonly missionId: MissionId | null },
+>(
+  store: Store,
+  kind: InboxItemKind,
+  records: ReadonlyArray<R>,
+): Effect.fn.Return<ReadonlyArray<WithComments<R>>, MissionError> {
+  if (records.length === 0) return records;
+  const missions = new Set(records.map((record) => record.missionId));
+  const [only] = missions;
+  const marks =
+    missions.size === 1 && only !== null && only !== undefined
+      ? yield* store.listAllInMission("inbox-mark", only)
+      : yield* store.listAll("inbox-mark");
+  const byId = new Map(
+    marks.filter((mark) => mark.comments.length > 0).map((mark) => [mark.id, mark.comments]),
+  );
+  if (byId.size === 0) return records;
+  return records.map((record) => {
+    const comments = byId.get(markIdOf({ kind, id: record.id }));
+    return comments === undefined ? record : { ...record, comments };
+  });
+});

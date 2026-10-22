@@ -1,5 +1,6 @@
 import type {
   Ask,
+  InboxComment,
   MissionActor,
   MissionMessage,
   MissionRecordRef,
@@ -73,6 +74,7 @@ export const asksSignalsLayer = Layer.effect(
     const askResolved = (input: {
       readonly ask: Ask;
       readonly released: ReadonlyArray<MissionRecordRef>;
+      readonly comments?: ReadonlyArray<InboxComment>;
     }) =>
       Effect.gen(function* () {
         const { ask, released } = input;
@@ -83,7 +85,7 @@ export const asksSignalsLayer = Layer.effect(
         add(ask.askedBy);
         for (const ref of released) add(yield* ownerOfRecord(store, ref));
         if (to.size === 0) return;
-        const line = askResolvedLine(ask, released);
+        const line = askResolvedLine(ask, released, input.comments);
         const summary = clipSummary(line);
         yield* router.relay({
           input: {
