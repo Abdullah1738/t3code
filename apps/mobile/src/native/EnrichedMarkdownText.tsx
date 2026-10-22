@@ -14,6 +14,7 @@ import {
   type MarkdownMediaAsset,
 } from "react-native-enriched-markdown";
 import type { SelectableMarkdownTextProps } from "./SelectableMarkdownText.types";
+import { markdownLeadingSpace, markdownMargins, type MarkdownSpacing } from "./markdownSpacing";
 
 import { useAppearancePreferences } from "../features/settings/appearance/AppearancePreferencesProvider";
 import { Menu } from "../components/ui/Menu";
@@ -28,8 +29,10 @@ import {
 function enrichedStyle(
   style: SelectableMarkdownTextProps["textStyle"],
   dark: boolean,
+  spacing: MarkdownSpacing,
 ): MarkdownStyle {
   const monospace = Platform.OS === "ios" ? "Menlo" : "monospace";
+  const gaps = markdownMargins(spacing);
   // Keep the radius modest: iOS clips square table-cell borders without stroking the corner arcs.
   const block = {
     marginTop: 4,
@@ -44,7 +47,7 @@ function enrichedStyle(
     fontSize: style.fontSize,
     lineHeight: style.lineHeight,
     marginTop: 0,
-    marginBottom: 8,
+    marginBottom: gaps.paragraph,
   };
   const heading = (level: number) => {
     const fontSize = style.headingFontSizes?.[level - 1] ?? style.fontSize * (1.6 - level * 0.1);
@@ -54,7 +57,8 @@ function enrichedStyle(
       fontFamily: style.headingFontFamily,
       fontSize,
       lineHeight: fontSize * 1.35,
-      marginTop: 8,
+      marginTop: gaps.headingTop,
+      marginBottom: gaps.headingBottom,
     };
   };
   return {
@@ -125,7 +129,13 @@ function enrichedStyle(
       borderWidth: 2,
       gapWidth: 12,
     },
-    list: { ...body, bulletColor: style.mutedColor, markerColor: style.mutedColor, gapWidth: 6 },
+    list: {
+      ...body,
+      bulletColor: style.mutedColor,
+      markerColor: style.mutedColor,
+      gapWidth: 6,
+      itemSpacing: gaps.listItem,
+    },
     thematicBreak: { color: style.dividerColor, height: 1, marginTop: 8, marginBottom: 8 },
     table: {
       ...body,
@@ -266,8 +276,11 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
     [onCite],
   );
   const markdownStyle = useMemo(
-    () => ({ ...enrichedStyle(props.textStyle, themeAppearance === "dark"), linkVariants }),
-    [props.textStyle, themeAppearance, linkVariants],
+    () => ({
+      ...enrichedStyle(props.textStyle, themeAppearance === "dark", props.spacing ?? "chat"),
+      linkVariants,
+    }),
+    [props.textStyle, themeAppearance, props.spacing, linkVariants],
   );
   const renderMedia = useCallback(
     (asset: MarkdownMediaAsset) =>
@@ -303,12 +316,13 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
           }
         : undefined;
 
+    const leadingSpace = markdownLeadingSpace(props.markdown, props.spacing ?? "chat");
     return (
       <View
         style={{
           flexShrink: 1,
           minWidth: 0,
-          marginTop: props.marginTop,
+          marginTop: leadingSpace === 0 ? props.marginTop : (props.marginTop ?? 0) - leadingSpace,
           marginBottom: props.marginBottom,
         }}
       >

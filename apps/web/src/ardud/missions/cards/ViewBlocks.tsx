@@ -1,4 +1,5 @@
-import { useMemo, useState, type MouseEvent } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { flushSync } from "react-dom";
 import { CheckIcon, ChevronRightIcon, CopyIcon, XIcon } from "lucide-react";
 
 import type { AssetResource, DraftChannel } from "@t3tools/contracts";
@@ -19,6 +20,8 @@ import {
   type ViewTimelineEntry,
   // --- end blocks additions ---
   viewChartFraction,
+  viewMarkdownFold,
+  viewMarkdownPreview,
 } from "@t3tools/client-runtime/ardud/missions";
 import type { ViewLongTextInput } from "@t3tools/contracts";
 // --- blocks additions ---
@@ -30,6 +33,7 @@ import { useAssetUrlState } from "../../../assets/assetUrls";
 import { Button } from "../../../components/ui/button";
 import { Dialog, DialogPopup, DialogTitle } from "../../../components/ui/dialog";
 import { Textarea } from "../../../components/ui/textarea";
+import { observeResize } from "../../../lib/observeResize";
 import { cn } from "../../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../../state/environments";
 import ChatMarkdown from "../../../components/ChatMarkdown";
@@ -257,13 +261,79 @@ const markdownCap = (maxLines: number | null) =>
   maxLines === null ? undefined : { maxHeight: `${maxLines * 1.625}em` };
 
 function MarkdownText(props: { text: string; maxLines: number | null }) {
+  const [unfolded, setUnfolded] = useState(false);
+  const [size, setSize] = useState<{ content: number; cap: number } | null>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const capped = props.maxLines !== null;
+  const open = capped && unfolded;
+  const preview =
+    props.maxLines === null
+      ? { text: props.text, cut: false }
+      : viewMarkdownPreview(props.text, props.maxLines);
+  const { maxLines } = props;
+  useLayoutEffect(() => {
+    const element = content.current;
+    const clip = element?.parentElement;
+    // Measured while folded only: the open block keeps the fold it opened from.
+    if (!element || !clip || maxLines === null || open) return;
+    const measure = () => {
+      const next = {
+        content: element.getBoundingClientRect().height,
+        cap: maxLines * 1.625 * Number.parseFloat(getComputedStyle(clip).fontSize),
+      };
+      setSize((last) => (last?.content === next.content && last.cap === next.cap ? last : next));
+    };
+    measure();
+    return observeResize(element, measure);
+  }, [maxLines, open]);
   if (props.text.trim() === "") return null;
+  // The DOM lays out the longest report fine, so web grows in place at any length.
+  const fold = viewMarkdownFold({
+    chars: props.text.length,
+    cut: preview.cut,
+    contentHeight: size?.content ?? null,
+    // Before the first measure only a cut preview is known to overflow.
+    capHeight: capped ? (size?.cap ?? Number.POSITIVE_INFINITY) : null,
+  });
   return (
-    <div
-      className={cn("min-w-0 text-(--m-text)", props.maxLines !== null && "overflow-hidden")}
-      style={markdownCap(props.maxLines)}
-    >
-      <ChatMarkdown text={props.text} cwd={undefined} headingLevelOffset={2} />
+    <div className="flex min-w-0 flex-col gap-1">
+      <div
+        id={id}
+        data-mission-markdown=""
+        className={cn("min-w-0 text-sm text-(--m-text)", capped && !open && "overflow-hidden")}
+        style={open ? undefined : markdownCap(props.maxLines)}
+      >
+        <div ref={content}>
+          <ChatMarkdown
+            text={open ? props.text : preview.text}
+            cwd={undefined}
+            headingLevelOffset={2}
+          />
+        </div>
+      </div>
+      {fold === "none" && !open ? null : (
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost-muted"
+          className="self-start"
+          aria-expanded={open}
+          aria-controls={id}
+          onClick={(event) => {
+            if (!open) {
+              setUnfolded(true);
+              return;
+            }
+            // Folding a long report would leave the reader far below it; keep the button in view.
+            const button = event.currentTarget;
+            flushSync(() => setUnfolded(false));
+            button.scrollIntoView({ block: "nearest" });
+          }}
+        >
+          {open ? "Show less" : "Show all"}
+        </Button>
+      )}
     </div>
   );
 }

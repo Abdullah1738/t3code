@@ -7,4 +7,5 @@ export * from "./review.ts";
 // --- views additions ---
 export * from "./longText.ts";
 export * from "./sources.ts";
+export * from "./markdownFold.ts";
 // --- end views additions ---

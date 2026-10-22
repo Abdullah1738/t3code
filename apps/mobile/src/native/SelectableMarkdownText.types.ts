@@ -82,4 +82,9 @@ export interface SelectableMarkdownTextProps {
   readonly onCite?: (selectedText: string) => void;
   readonly marginTop?: number;
   readonly marginBottom?: number;
+  /**
+   * `document` sets long reads apart: room above headings, a gap between
+   * list items. Chat messages keep the tighter default.
+   */
+  readonly spacing?: "chat" | "document";
 }
