@@ -405,7 +405,7 @@ h1.long{font-size:clamp(36px,10vw,54px);letter-spacing:-.035em;line-height:1.05}
 .sub{font-size:18px;font-weight:500;margin-top:8px;line-height:1.3}
 .note{display:inline-block;margin-top:12px;font-size:14px;font-weight:650;padding:5px 12px;border-radius:999px;background:var(--field-ink);color:var(--field)}
 .stale{margin:16px 24px 0;padding:10px 14px;border-radius:14px;background:var(--well);font-size:14px;line-height:1.35;color:var(--warn);font-weight:600}
-.stale[hidden]{display:none}
+.stale[hidden]{display:none}.stale .tag{display:none}
 ol.rail{list-style:none;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;column-gap:8px;padding:20px 24px 4px}
 ol.rail li{font-size:12px;line-height:1.35;color:var(--soft);font-weight:500;min-width:0}
 ol.rail li::before{content:"";display:block;height:6px;border-radius:3px;background:var(--well);margin-bottom:9px}
@@ -450,9 +450,18 @@ h1.long{font-size:26px}.sub{font-size:13px;margin-top:2px}.stale{margin:6px 14px
 .car{margin:8px 14px 0;padding:8px 10px}.plate{font-size:16px;padding:5px 8px}.route{padding:10px 14px 0}footer{margin:6px 14px 4px}}
 @media (max-height:480px) and (max-width:340px){.car{grid-template-columns:auto 1fr}.plate{grid-row:span 2;justify-self:auto}}
 /* In the bubble the card runs edge to edge (Messages rounds the corners itself), so every inset is
-   the same 16px. Messages draws the app icon over the top-left corner: the first line starts past it. */
+   the same 16px. Messages draws the app icon over the top-left corner: the first line starts past it.
+   The bubble doesn't scroll, so the route is one line per stop (the dots tell them apart), the
+   footer goes, names stay on one line (a booker that doesn't fit wraps out of sight), and a New driver tag
+   takes the sub line's place (a stale banner takes both and leads with the tag), so pickup and
+   drop-off always fit. */
 @media (max-height:480px) and (max-width:480px){html,body{background:var(--card)}body{padding:0}
-main{max-width:none;border-radius:0}.hero{padding-top:6px}.who{min-height:24px;padding-left:30px;align-items:center}}
+main{max-width:none;border-radius:0}.hero{padding-top:6px}.who{min-height:24px;padding-left:30px;align-items:center}
+.route{padding-top:10px;gap:4px}.route li{align-items:center}.route li::before{margin-top:0}.route small{display:none}
+.route span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;overflow-wrap:normal}footer{display:none}
+.who{flex-wrap:wrap;height:24px;line-height:24px;overflow:hidden;white-space:nowrap}.who span{min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.note{margin-top:4px;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:top}
+.hero:has(.note) .sub,.hero:has(+.stale:not([hidden])) :is(.sub,.note){display:none}.stale .tag{display:inline}.driver{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 @media (max-height:480px) and (max-width:340px){.who span:last-child{display:none}}
 """.replace("FONT", FONT)
 
@@ -463,7 +472,9 @@ let at=new Date($('time').getAttribute('datetime'));
 const fmt=d=>new Intl.DateTimeFormat(undefined,{hour:'numeric',minute:'2-digit',timeZone:'Asia/Dubai'}).format(d);
 function paint(){const s=Math.max(0,Math.round((Date.now()-at)/1000)),m=Math.round(s/60);
 $('time').textContent=fmt(at);$('#ago').textContent=s<60?'just now':m+' min ago';
-const st=$('#stale');if(!TERM&&s>%d){st.hidden=false;st.innerHTML='No update for '+m+' min<span class="more">. Details may be out of date.</span>';}else st.hidden=true;}
+const st=$('#stale');if(!TERM&&s>%d){st.hidden=false;const nd=$('.hero .note');
+st.innerHTML=(nd?'<span class="tag"></span>':'')+'No update for '+m+' min<span class="more">. Details may be out of date.</span>';
+if(nd)st.firstChild.textContent=nd.textContent+' · ';}else st.hidden=true;}
 async function poll(){try{const r=await fetch('data.json',{cache:'no-store'});if(!r.ok)return;const d=await r.json();
 if(d.v!==V){location.reload();return;}if(d.checked_at)at=new Date(d.checked_at);}catch(e){}paint();}
 paint();if(!TERM){setInterval(poll,20000);setInterval(paint,15000);}
