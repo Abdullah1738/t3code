@@ -93,6 +93,8 @@ export interface MissionThreads {
   threadIds?: string[];
   /** The master's threads; older servers leave it out. */
   masterThreadIds?: string[];
+  /** Threads attached by a component, with no role or lane; older servers leave it out. */
+  attachedThreadIds?: string[];
 }
 
 export interface ControlEventFrame {
