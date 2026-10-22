@@ -4196,6 +4196,221 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  /** A reconnect whose history holds a background subagent launched in the gap. */
+  const reconnectedWithBackgroundLaunch = (active: Record<string, unknown>) => [
+    { type: "runtime_exit", status: "success" } as const,
+    out("event.subscribe"),
+    out("session.active"),
+    replyData("session.active", active),
+    out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+    reply("message.list", {
+      data: [
+        { id: "msg_idle_gap", time: { created: 3 }, type: "idle", outcome: "succeeded" },
+        {
+          id: "msg_assistant_gap",
+          time: { created: 2 },
+          type: "assistant",
+          agent: "build",
+          model: { id: "big-pickle", providerID: "opencode", variant: "default" },
+          content: [
+            {
+              type: "tool",
+              id: "call_gap_subagent",
+              name: "subagent",
+              executed: true,
+              // A background call completes at launch; its child keeps running.
+              state: {
+                status: "completed",
+                input: { description: "Sleep", prompt: "sleep", background: true },
+                content: [{ type: "text", text: "The subagent is working in the background." }],
+                metadata: { sessionID: CHILD, status: "running" },
+              },
+              time: { created: 2, ran: 2, completed: 2 },
+            },
+          ],
+          finish: "stop",
+        },
+        { id: PROMPT_ID, time: { created: 1 }, text: "hi", type: "user" },
+      ],
+      cursor: {},
+    }),
+  ];
+
+  it.effect("settles a background subagent launched and gone while the stream was down", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        ...reconnectedWithBackgroundLaunch({}),
+        out("session.update", { sessionID: CHILD, permissions: "<any>" }),
+        reply("session.update", null),
+      ]);
+      const settled = yield* Deferred.make<string | null>();
+      yield* runtime.events.pipe(
+        Stream.tap((event) =>
+          event.type === "subagent.updated" && event.subagent.status === "interrupted"
+            ? Deferred.succeed(settled, event.subagent.result)
+            : Effect.void,
+        ),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      assert.include((yield* Deferred.await(settled)) ?? "", "lost its connection to OpenCode");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("leaves a background subagent that reported before the stream dropped settled", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.started", { sessionID: SESSION }),
+        event("session.tool.input.started", {
+          sessionID: SESSION,
+          assistantMessageID: "msg_assistant_gap",
+          id: "call_gap_subagent",
+          name: "subagent",
+        }),
+        event("session.tool.called", {
+          sessionID: SESSION,
+          assistantMessageID: "msg_assistant_gap",
+          id: "call_gap_subagent",
+          name: "subagent",
+          input: { description: "Sleep", prompt: "sleep", background: true },
+          executed: false,
+        }),
+        event("session.created", childCreated(CHILD)),
+        event("session.tool.progress", {
+          sessionID: SESSION,
+          assistantMessageID: "msg_assistant_gap",
+          id: "call_gap_subagent",
+          metadata: { sessionID: CHILD, status: "running" },
+        }),
+        event("session.execution.succeeded", { sessionID: CHILD }),
+        event("session.inbox.enqueued", {
+          inboxID: "msg_report",
+          sessionID: SESSION,
+          item: {
+            type: "synthetic",
+            payload: {
+              text: `<subagent sessionID="${CHILD}" state="completed" description="Sleep">\nCHILD_OK\n</subagent>`,
+              description: "Sleep",
+              metadata: {
+                source: "subagent",
+                childID: CHILD,
+                agent: "General",
+                state: "completed",
+              },
+            },
+            delivery: "steer",
+          },
+        }),
+        // Its launch part is still in the history the reconnect reads back.
+        ...reconnectedWithBackgroundLaunch({}),
+      ]);
+      const events = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      const collected = yield* Fiber.join(events);
+      const statuses = collected.flatMap((event) =>
+        event.type === "subagent.updated" ? [event.subagent.status] : [],
+      );
+      assert.equal(statuses.at(-1), "completed");
+      assert.deepInclude(collected.at(-1), { type: "turn.terminal", status: "completed" });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a background subagent with no child yet while its caller still runs", () =>
+    Effect.gen(function* () {
+      const tool = {
+        sessionID: SESSION,
+        assistantMessageID: "msg_assistant_gap",
+        id: "call_gap_subagent",
+      };
+      const input = { description: "Sleep", prompt: "sleep", background: true };
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.started", { sessionID: SESSION }),
+        event("session.tool.input.started", { ...tool, name: "subagent" }),
+        event("session.tool.called", { ...tool, name: "subagent", input, executed: false }),
+        // The stream drops before OpenCode names the child.
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", { [SESSION]: { type: "running" } }),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        gapHistory(
+          [
+            {
+              type: "tool",
+              id: "call_gap_subagent",
+              name: "subagent",
+              executed: false,
+              state: { status: "running", input, metadata: {} },
+              time: { created: 2, ran: 2 },
+            },
+          ],
+          false,
+        ),
+        ...noRequests(SESSION),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Sleep"), "running");
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("reads back a subagent stopped while the stream was down as interrupted", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", {}),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        gapHistory(
+          [
+            {
+              type: "tool",
+              id: "call_gap_subagent",
+              name: "subagent",
+              executed: true,
+              state: {
+                status: "error",
+                input: { description: "Stopped", prompt: "stop" },
+                error: { type: "aborted", message: "The operation was aborted." },
+              },
+              time: { created: 2, ran: 2, completed: 2 },
+            },
+          ],
+          true,
+        ),
+      ]);
+      const events = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      const collected = yield* Fiber.join(events);
+      const statuses = collected.flatMap((event) =>
+        event.type === "subagent.updated" ? [event.subagent.status] : [],
+      );
+      assert.equal(statuses.at(-1), "interrupted");
+    }).pipe(Effect.scoped),
+  );
+
   it.effect(
     "settles background calls launched while the stream was down with their shared run",
     () =>
