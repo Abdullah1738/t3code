@@ -51,7 +51,8 @@ let source: MissionsSource | null = null;
 
 /**
  * The phone's one missions source: the paired server over the environment
- * connection. `EXPO_PUBLIC_MISSIONS_FIXTURE=1` runs on the fixture alone.
+ * connection. `EXPO_PUBLIC_MISSIONS_FIXTURE=1` runs on the fixture alone;
+ * `EXPO_PUBLIC_MISSIONS_FIXTURE_DELAY_MS` gives it a server-like first load.
  * Built on first use so app start stays cheap. The owner's decisions show at
  * once and send in the background.
  */
@@ -59,7 +60,10 @@ export function missionsSource(): MissionsSource {
   if (source) return source;
   source = withOptimisticDecisions(
     process.env.EXPO_PUBLIC_MISSIONS_FIXTURE === "1"
-      ? createFixtureMissionsSource({ surface: "mobile" })
+      ? createFixtureMissionsSource({
+          surface: "mobile",
+          latencyMs: Number(process.env.EXPO_PUBLIC_MISSIONS_FIXTURE_DELAY_MS) || 0,
+        })
       : createRpcMissionsSource({
           transport: createAtomMissionsTransport({
             runtime: connectionAtomRuntime,
@@ -75,17 +79,25 @@ export function missionsSource(): MissionsSource {
 const listStore = createSnapshotStore<MissionListSnapshot>((emit) =>
   missionsSource().subscribeList(emit),
 );
+// Switching missions or requests and coming back should not reopen the feed and
+// wait on the server again, so per-mission feeds stay open a while after the
+// screen that read them goes away.
+export const MISSION_FEED_KEEP_ALIVE_MS = 2 * 60_000;
+const warm = { keepAliveMs: MISSION_FEED_KEEP_ALIVE_MS };
 const overviewStores = createKeyedSnapshotStores<MissionId, MissionOverviewSnapshot | null>(
   (id, emit) => missionsSource().subscribeOverview(id, emit),
+  warm,
 );
 const inboxStores = createKeyedSnapshotStores<MissionId | null, MissionInboxSnapshot>(
   (id, emit, fail) => missionsSource().subscribeInbox(id, emit, fail),
+  warm,
 );
 const historyStores = createKeyedSnapshotStores<MissionId | null, MissionInboxHistory>((id, emit) =>
   missionsSource().subscribeInboxHistory(id, emit),
 );
-const laneStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Lane>>((id, emit) =>
-  missionsSource().subscribeLanes(id, emit),
+const laneStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<Lane>>(
+  (id, emit) => missionsSource().subscribeLanes(id, emit),
+  warm,
 );
 const roomListStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<MissionRoomEntry>>(
   (id, emit, fail) => missionsSource().subscribeRooms(id, emit, fail),
@@ -95,11 +107,22 @@ const roomStores = createKeyedSnapshotStores<RoomId, RoomPage | null>((id, emit,
 );
 const requestStores = createKeyedSnapshotStores<MissionId, ReadonlyArray<OwnerRequest>>(
   (id, emit, fail) => missionsSource().subscribeRequests(id, emit, fail),
+  warm,
 );
 const requestThreadStores = createKeyedSnapshotStores<string, OwnerRequest | null>((key, emit) => {
   const [missionId, requestId] = key.split("\n") as [MissionId, string];
   return missionsSource().subscribeRequest({ missionId, requestId }, emit);
-});
+}, warm);
+
+/** The per-mission feeds a board reads, besides its views. */
+export function missionBoardStores(missionId: MissionId): ReadonlyArray<SnapshotStore<unknown>> {
+  return [
+    overviewStores(missionId),
+    inboxStores(missionId),
+    requestStores(missionId),
+    laneStores(missionId),
+  ];
+}
 
 const NONE: SnapshotStore<never> = {
   get: () => undefined,

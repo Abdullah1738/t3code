@@ -4,18 +4,25 @@ import {
   createViewLongTexts,
   viewLongTextKey,
   type MissionViewsState,
+  type SnapshotStore,
   type ViewLongTextState,
 } from "@t3tools/client-runtime/ardud/missions";
 import { useEffect, useSyncExternalStore } from "react";
 
-import { missionsSource } from "./missionsStore";
+import { MISSION_FEED_KEEP_ALIVE_MS, missionsSource } from "./missionsStore";
 
 // The mission's views: its layout, card templates, placed sections with the
 // server's rows, and its images. One subscription per mission.
 
-const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>((id, emit) =>
-  missionsSource().subscribeViews(id, emit),
+const viewStores = createKeyedSnapshotStores<MissionId, MissionViewsState | null>(
+  (id, emit) => missionsSource().subscribeViews(id, emit),
+  { keepAliveMs: MISSION_FEED_KEEP_ALIVE_MS },
 );
+
+/** The views feed of one mission, for screens that open a board's feeds together. */
+export function missionViewsStore(missionId: MissionId): SnapshotStore<MissionViewsState | null> {
+  return viewStores(missionId);
+}
 
 const NONE = { get: () => undefined, subscribe: () => () => {} };
 

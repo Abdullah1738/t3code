@@ -98,6 +98,18 @@ export function isRequestUnread(request: Pick<OwnerRequest, "status" | "unread">
 }
 
 /**
+ * What a read receipt is for: an unread request at its newest message, or null
+ * when there is nothing to mark. A list row and the full read share the newest
+ * message, so a screen that keys its mark on this sends one per new message.
+ */
+export function requestReadMark(
+  request: Pick<OwnerRequest, "id" | "unread" | "messages"> | null | undefined,
+): string | null {
+  if (!request?.unread) return null;
+  return `${request.id}\n${request.messages.at(-1)?.id ?? ""}`;
+}
+
+/**
  * A Discuss about a record. It lives on that record's card, never in Your
  * requests (owner, 19 Oct: "Discussions stay on the item").
  */

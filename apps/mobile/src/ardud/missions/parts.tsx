@@ -107,6 +107,7 @@ export function LinkButton(props: {
 export function Row(props: {
   readonly children: ReactNode;
   readonly onPress?: (() => void) | undefined;
+  readonly onPressIn?: (() => void) | undefined;
   readonly accessibilityLabel?: string;
   readonly selected?: boolean;
   readonly className?: string;
@@ -123,6 +124,7 @@ export function Row(props: {
       accessibilityLabel={props.accessibilityLabel}
       accessibilityState={{ selected: props.selected ?? false }}
       onPress={props.onPress}
+      onPressIn={props.onPressIn}
       className={className}
     >
       {props.children}

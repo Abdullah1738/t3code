@@ -3,6 +3,7 @@ import { inboxTotal, missionGroupRows } from "@t3tools/client-runtime/ardud/miss
 import { useMemo } from "react";
 import { View } from "react-native";
 
+import { warmBoard } from "./boardFeeds";
 import { useMissionList } from "./missionsStore";
 import { LinkButton, SectionHead } from "./parts";
 import { missionsRouteParams } from "./routeParams";
@@ -31,6 +32,7 @@ export function MissionsThreadGroup() {
       />
       <MissionRows
         rows={rows}
+        onPressIn={warmBoard}
         onOpen={(missionId) =>
           navigation.navigate("Missions", missionsRouteParams({ tab: "missions", missionId }))
         }

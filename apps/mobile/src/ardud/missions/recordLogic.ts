@@ -18,6 +18,7 @@ import {
   receiptNudgeLanes,
   receiptNudgeNote,
   replyRequestInput,
+  requestReadMark,
   roomMembers,
   roomUiReducer,
   roomView,
@@ -65,11 +66,15 @@ function sendChecked<T>(
   });
 }
 
-/** Read receipts are best effort: the next open marks the request again. */
-function markRead(request: OwnerRequest | null | undefined): void {
-  if (!request?.unread) return;
+/**
+ * Takes a `requestReadMark`. Read receipts are best effort: the next new
+ * message marks the request again.
+ */
+function markRead(mark: string | null): void {
+  if (mark === null) return;
+  const [requestId = ""] = mark.split("\n");
   missionsSource()
-    .markRequestRead({ requestId: request.id })
+    .markRequestRead({ requestId })
     .catch(() => undefined);
 }
 
@@ -113,9 +118,10 @@ export function useDiscussion(
   const [text, setText] = useState("");
   const { pending, run } = useMissionAction();
 
+  const readMark = open ? requestReadMark(request) : null;
   useEffect(() => {
-    if (open) markRead(request);
-  }, [open, request]);
+    markRead(readMark);
+  }, [readMark]);
 
   const send = () => {
     const done = (sent: boolean) => {
@@ -178,6 +184,8 @@ export function useRequestComposer(
 export interface RequestThreadState {
   /** Undefined while loading, null once the request is gone. */
   readonly request: OwnerRequest | null | undefined;
+  /** True while only the list row is known: the newest few messages, clipped. */
+  readonly partial: boolean;
   readonly text: string;
   readonly pending: boolean;
   readonly setText: (text: string) => void;
@@ -188,19 +196,25 @@ export interface RequestThreadState {
 
 /** One of Your requests, opened: reply, settle with an optional note, reopen. */
 export function useRequestThread(missionId: MissionId, requestId: string): RequestThreadState {
-  const request = useOwnerRequest(missionId, requestId);
+  const thread = useOwnerRequest(missionId, requestId);
+  // Until the full read lands the request shows as its list row, so opening
+  // one never waits on a blank screen.
+  const row = useOwnerRequests(missionId)?.find((request) => request.id === requestId);
+  const request = thread === undefined ? row : thread;
   const [text, setText] = useState("");
   const { pending, run } = useMissionAction();
 
+  const readMark = requestReadMark(request);
   useEffect(() => {
-    markRead(request);
-  }, [request]);
+    markRead(readMark);
+  }, [readMark]);
 
   const clearOn = (done: boolean) => {
     if (done) setText("");
   };
   return {
     request,
+    partial: thread === undefined && row !== undefined,
     text,
     pending,
     setText,

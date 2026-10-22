@@ -6,8 +6,8 @@ import { formatDayLabel, formatTimeOfDay } from "./viewModel.ts";
 /**
  * Latest-value cache over one source subscription, shaped for React's
  * `useSyncExternalStore` (and any other client). The source subscription opens
- * with the first reader and closes with the last, so a screen pays for exactly
- * one subscription however many rows read it.
+ * with the first reader and closes with the last (or a keep-alive after it), so
+ * a screen pays for exactly one subscription however many rows read it.
  */
 export interface SnapshotStore<T> {
   readonly get: () => T | undefined;
@@ -78,10 +78,22 @@ export function feedOfflineLines(
 
 export type SnapshotOpen<T> = (emit: Listener<T>, fail: Listener<unknown>) => Unsubscribe;
 
+export interface SnapshotStoreOptions {
+  readonly now?: () => number;
+  /**
+   * How long the source stays open after the last reader leaves. Coming back
+   * within it finds the feed still live, so the screen neither reopens the
+   * subscription nor repaints with a refetched copy. 0 closes at once.
+   */
+  readonly keepAliveMs?: number;
+}
+
 export function createSnapshotStore<T>(
   open: SnapshotOpen<T>,
-  now: () => number = Date.now,
+  options: SnapshotStoreOptions = {},
 ): SnapshotStore<T> {
+  const now = options.now ?? Date.now;
+  const keepAliveMs = Math.max(0, options.keepAliveMs ?? 0);
   let value: T | undefined;
   let close: Unsubscribe | null = null;
   let failure: FeedFailure | undefined;
@@ -89,7 +101,14 @@ export function createSnapshotStore<T>(
   // Each opening gets its own generation so a late emit or failure from a
   // closed subscription is ignored.
   let generation = 0;
+  let idle: ReturnType<typeof setTimeout> | null = null;
   const listeners = new Set<() => void>();
+
+  const cancelIdle = () => {
+    if (idle === null) return;
+    clearTimeout(idle);
+    idle = null;
+  };
 
   const notify = () => {
     for (const listener of Array.from(listeners)) listener();
@@ -106,8 +125,10 @@ export function createSnapshotStore<T>(
     };
     const fail = (error: unknown) => {
       if (own !== generation || failure !== undefined) return;
-      failure = { error, lastLoadedAt };
       stop();
+      // Kept open with nobody looking: the next reader starts fresh instead.
+      if (listeners.size === 0) return;
+      failure = { error, lastLoadedAt };
       notify();
     };
     const opened = open(emit, fail);
@@ -117,6 +138,7 @@ export function createSnapshotStore<T>(
   };
 
   const stop = () => {
+    cancelIdle();
     generation += 1;
     const closeSource = close;
     close = null;
@@ -128,13 +150,20 @@ export function createSnapshotStore<T>(
     failure: () => failure,
     subscribe(onChange) {
       listeners.add(onChange);
+      cancelIdle();
       if (close === null && failure === undefined) start();
       return () => {
         listeners.delete(onChange);
         if (listeners.size > 0) return;
         // Nobody is looking: the next reader starts fresh.
         failure = undefined;
-        stop();
+        if (keepAliveMs === 0 || close === null) {
+          stop();
+          return;
+        }
+        cancelIdle();
+        // @effect-diagnostics-next-line globalTimers:off - Plain callback store shared by web and mobile.
+        idle = setTimeout(stop, keepAliveMs);
       };
     },
     retry() {
@@ -149,13 +178,40 @@ export function createSnapshotStore<T>(
 /** One `SnapshotStore` per key, created on first use and reused after. */
 export function createKeyedSnapshotStores<K, T>(
   open: (key: K, emit: Listener<T>, fail: Listener<unknown>) => Unsubscribe,
+  options: SnapshotStoreOptions = {},
 ): (key: K) => SnapshotStore<T> {
   const stores = new Map<K, SnapshotStore<T>>();
   return (key) => {
     const existing = stores.get(key);
     if (existing) return existing;
-    const store = createSnapshotStore<T>((emit, fail) => open(key, emit, fail));
+    const store = createSnapshotStore<T>((emit, fail) => open(key, emit, fail), options);
     stores.set(key, store);
     return store;
+  };
+}
+
+/**
+ * Reads several stores as one. Subscribing opens them all; `ready` turns true
+ * once each has answered with a value or a failure, and stays true after, so
+ * a screen that has shown does not blank while one feed retries.
+ */
+export function createSnapshotGate(stores: ReadonlyArray<SnapshotStore<unknown>>): {
+  readonly subscribe: (onChange: () => void) => () => void;
+  readonly ready: () => boolean;
+} {
+  let shown = false;
+  return {
+    subscribe: (onChange) => {
+      const stops = stores.map((store) => store.subscribe(onChange));
+      return () => {
+        for (const stop of stops) stop();
+      };
+    },
+    ready: () => {
+      if (!shown) {
+        shown = stores.every((store) => store.get() !== undefined || store.failure() !== undefined);
+      }
+      return shown;
+    },
   };
 }
