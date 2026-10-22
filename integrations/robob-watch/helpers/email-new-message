@@ -11,7 +11,13 @@ key=$(print -rn -- "$acct|$mbox|$query" | shasum -a 256 | cut -c1-16)
 state="$dir/mail-$key.seen"
 since=$(date -v-3d +%Y-%m-%d)
 # Server sort order is unreliable (iCloud), so bound by date and dedupe by message-id.
-json=$(himalaya envelope search -a "$acct" -m "$mbox" -s 200 --json "after $since and ($query)" 2>/dev/null) || { echo "himalaya search failed" >&2; exit 1; }
+# Outlook IMAP intermittently answers "User is authenticated but not connected"; retry briefly.
+json=""; ok=0
+for attempt in 1 2 3 4; do
+  if json=$(himalaya envelope search -a "$acct" -m "$mbox" -s 200 --json "after $since and ($query)" 2>/dev/null); then ok=1; break; fi
+  (( attempt < 4 )) && sleep 3
+done
+(( ok )) || { echo "himalaya search failed" >&2; exit 1; }
 rows=$(print -r -- "$json" | /usr/bin/python3 -c '
 import json,sys
 d=json.load(sys.stdin)

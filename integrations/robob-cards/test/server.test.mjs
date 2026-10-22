@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
+import { DevicePendingError } from "../lib/asc.mjs";
 import { provision, profileName } from "../lib/provision.mjs";
 import { createHandler, provisionQueue, QUICK_TUNNEL } from "../lib/server.mjs";
 import { readState, writeState } from "../lib/state.mjs";
@@ -79,6 +80,25 @@ test("once ready the page offers the install and serves the manifest and ipa", a
   assert.equal(readState(dir).downloads, 1);
 });
 
+test("an Apple processing hold is distinct from active preparation on the public page", async () => {
+  const original = readState(dir);
+  try {
+    writeState(dir, { ...original, phase: "preparing", pendingDevice: { id: "D1", status: "PROCESSING" } });
+    const response = await fetch(`${base}/c/${TOKEN}/`);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, /Waiting for Apple/);
+    assert.match(html, /24–72 hours/);
+    assert.doesNotMatch(html, /minute or two|being made|>Install<\/a>/);
+    assert.equal((await fetch(`${base}/c/${TOKEN}/manifest.plist`)).status, 404);
+    assert.equal((await fetch(`${base}/c/${TOKEN}/RobobCards.ipa`)).status, 404);
+    writeState(dir, { ...readState(dir), pendingDevice: null });
+    assert.match(await (await fetch(`${base}/c/${TOKEN}/`)).text(), /being made/);
+  } finally {
+    writeState(dir, original);
+  }
+});
+
 test("quick tunnel URLs are recognised in cloudflared output", () => {
   const line = "2026-10-22T01:00:00Z INF |  https://brave-tiger-sample-words.trycloudflare.com  |";
   assert.equal(line.match(QUICK_TUNNEL)?.[0], "https://brave-tiger-sample-words.trycloudflare.com");
@@ -151,6 +171,41 @@ test("provision registers every phone, replaces the profile and records the buil
       /does not list/,
     );
     assert.equal(readState(phoneDir).phase, "failed");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Apple processing holds keep the same enrollment pending without creating a profile or signing", async () => {
+  const home = mkdtempSync(join(tmpdir(), "robob-cards-pending-"));
+  const env = { ROBOB_CARDS_HOME: home };
+  mkdirSync(join(home, "build", "RobobCards.app"), { recursive: true });
+  const phoneDir = join(home, "enroll", "moni");
+  const original = { name: "moni", token: TOKEN, phase: "failed", devices: [{ udid: UDID }], publicUrl: "https://original.trycloudflare.com" };
+  writeState(phoneDir, original);
+  let attempts = 0;
+  try {
+    const run = () => provision({
+      dir: phoneDir, name: "moni", env, config: {},
+      asc: {
+        ensureDevice: async () => {
+          attempts += 1;
+          throw new DevicePendingError({ id: "D1", attributes: { status: "PROCESSING" } });
+        },
+        certificateId: async () => assert.fail("pending devices must not reach profile creation"),
+      },
+      resign: () => assert.fail("pending devices must not be signed"),
+    });
+    await assert.rejects(run(), DevicePendingError);
+    await assert.rejects(run(), DevicePendingError);
+    assert.equal(attempts, 2, "the provisioning lock is released even when pending");
+    const state = readState(phoneDir);
+    assert.equal(state.phase, "preparing");
+    assert.deepEqual(state.pendingDevice, { id: "D1", status: "PROCESSING" });
+    assert.match(state.error, /24.*72 hours/);
+    assert.equal(state.publicUrl, original.publicUrl);
+    assert.equal(state.token, original.token);
+    assert.deepEqual(state.devices, original.devices);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

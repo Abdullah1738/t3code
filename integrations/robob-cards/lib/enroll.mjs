@@ -195,8 +195,17 @@ const list = (items) => `<ol>${items.map((item) => `<li>${escapeXml(item)}</li>`
 
 // Relative links keep the page working whatever public host the tunnel got,
 // so each page lives at /c/<token>/ and its assets beside it.
-export function enrollPage({ phase, manifestUrl }) {
+export function enrollPage({ phase, manifestUrl, pendingDevice }) {
   if (phase === "preparing") {
+    if (pendingDevice?.status === "PROCESSING") {
+      return layout({
+        title: "Waiting for Apple",
+        refreshSeconds: 60,
+        body: `<h1>Waiting for Apple</h1>
+<p>Your iPhone is registered. Apple is still approving it, which can take 24–72 hours.</p>
+<p class="note">No need to register again. Come back to this page for Install once the app is ready.</p>`,
+      });
+    }
     return layout({
       title: "Almost there",
       refreshSeconds: 10,

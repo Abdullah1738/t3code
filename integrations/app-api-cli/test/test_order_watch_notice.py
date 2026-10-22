@@ -1,10 +1,11 @@
 """Moni placement texts from order-watch add, and lane pass-through.
 
-imsg and robob-watch are always mocked; nothing here can message anyone.
+The bridge send and robob-watch are always mocked; nothing here can message anyone.
 """
 import contextlib
 import io
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -19,15 +20,31 @@ import order_tracker as t
 import order_watch_receipt as receipt
 
 
+def sent_text(args):
+    (text,) = [a[len('--text='):] for a in args if a.startswith('--text=')]
+    return text
+
+
 class AddNoticeTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.sends = []
-        self.imsg_code = 0
-        self.imsg_error = None
+        self.send_code = 0
+        self.send_error = None
+        self.send_stdout = None
         self.robob_calls = []
+        self.route = 'ardud-control:thread:0b46eb22-1111-2222-3333-444455556666'
+        self.bridge_db = self.root / 'bridge.sqlite'
+        con = sqlite3.connect(self.bridge_db)
+        con.execute('create table kv (key text primary key, value text not null)')
+        con.execute("insert into kv values ('route', ?)", (json.dumps({'id': self.route}),))
+        con.commit()
+        con.close()
+        patcher = mock.patch.dict(_os.environ, {'SPECTRUM_BRIDGE_DB': str(self.bridge_db)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for target, value in (('ROOT', self.root / 'state'), ('WATCHERS', self.root / 'watchers')):
             patcher = mock.patch.object(t, target, value)
             patcher.start()
@@ -53,11 +70,18 @@ class AddNoticeTests(unittest.TestCase):
         return 'ok\n'
 
     def fake_subprocess(self, args, **kwargs):
-        self.assertEqual(args[:2], ['imsg', 'send'], 'only imsg may be spawned here')
+        self.assertEqual(args[:5], [t.BUN, t.BRIDGE_CLI, 'send', '--to', 'moni'], 'only the bridge send may be spawned here')
+        self.assertFalse(any(k.startswith('BUN_INSPECT') for k in kwargs['env']))
         self.sends.append(args)
-        if self.imsg_error:
-            raise self.imsg_error
-        return subprocess.CompletedProcess(args, self.imsg_code, '', '')
+        if self.send_error:
+            raise self.send_error
+        key = args[args.index('--key') + 1]
+        out = self.send_stdout if self.send_stdout is not None else json.dumps(
+            {'id': 'send:' + 'a' * 64, 'created': key not in [a[a.index('--key') + 1] for a in self.sends[:-1]]})
+        return subprocess.CompletedProcess(args, self.send_code, out if self.send_code == 0 else '', '')
+
+    def notice(self, order):
+        return t.read(self.root / 'state' / 'orders' / f'order-talabat-{order}.json')['placed_notice']
 
     def add(self, *extra, order='3999000111', who='moni', label='Latea: 2x Brown Sugar Boba With Milk'):
         argv = ['add', '--app', 'talabat', '--order', order, '--for', who, '--label', label, *extra]
@@ -66,15 +90,20 @@ class AddNoticeTests(unittest.TestCase):
         lines = [x for x in out.getvalue().splitlines() if x.startswith('{"tracker_id"')]
         return code, json.loads(lines[-1])
 
-    def test_moni_add_sends_once_to_chat_45_and_is_idempotent(self):
+    def test_moni_add_sends_once_to_her_robob_thread_and_is_idempotent(self):
         code, row = self.add()
         self.assertEqual(code, 0)
         self.assertEqual(row, {'tracker_id': 'order-talabat-3999000111', 'watcher_registered': True,
                                'moni_notified': 'sent'})
         self.assertEqual(len(self.sends), 1)
         args = self.sends[0]
-        self.assertEqual(args[args.index('--chat-id') + 1], '45')
-        text = args[args.index('--text') + 1]
+        self.assertNotIn('imsg', args)
+        self.assertEqual(args[args.index('--session') + 1], self.route)
+        self.assertEqual(args[args.index('--key') + 1], 'order-placed:order-talabat-3999000111')
+        notice = self.notice('3999000111')
+        self.assertEqual((notice['status'], notice['channel'], notice['bridge_id'], notice['created']),
+                         ('sent', 'bridge', 'send:' + 'a' * 64, True))
+        text = sent_text(args)
         self.assertEqual(text, 'Ordered: 2x Brown Sugar Boba With Milk from Latea. ETA in 25-35 mins.')
         self.assertFalse(text.lower().startswith('robob'))
         for word in ('watcher', 'tracker', 'order-watch', 'robob'):
@@ -83,6 +112,16 @@ class AddNoticeTests(unittest.TestCase):
         code, row = self.add()
         self.assertEqual((code, row['moni_notified']), (0, 'skipped'))
         self.assertEqual(len(self.sends), 1)
+
+    def test_moni_watcher_context_names_the_bridge_not_imsg(self):
+        self.add(order='3999000223')
+        add = next(a for a in self.robob_calls if a[:2] == ['robob-watch', 'add'])
+        context = add[add.index('--context') + 1]
+        self.assertIn('spectrum-bridge/src/cli.ts send --to moni', context)
+        self.assertIn('--key order-talabat-3999000223-<event>', context)
+        self.assertNotIn('imsg send', context)
+        self.assertNotIn('chat-id', context)
+        self.assertLessEqual(len(context), 6000)
 
     def test_owner_add_never_texts_and_context_drops_arrival_question(self):
         code, row = self.add(who='owner', order='3999000222')
@@ -96,7 +135,7 @@ class AddNoticeTests(unittest.TestCase):
     def test_custom_and_skipped_text(self):
         code, row = self.add('--placed-text', 'Got you the boba, about 30 min', order='3999000333')
         self.assertEqual((code, row['moni_notified']), (0, 'sent'))
-        self.assertEqual(self.sends[0][-1], 'Got you the boba, about 30 min')
+        self.assertEqual(sent_text(self.sends[0]), 'Got you the boba, about 30 min')
         code, row = self.add('--no-placed-text', order='3999000444')
         self.assertEqual((code, row['moni_notified']), (0, 'skipped'))
         self.assertEqual(len(self.sends), 1)
@@ -121,33 +160,103 @@ class AddNoticeTests(unittest.TestCase):
     def test_total_flag_is_stored_and_sent_in_placed_text(self):
         code, row = self.add('--total', 'AED 47.25', order='3999000110')
         self.assertEqual((code, row['moni_notified']), (0, 'sent'))
-        text = self.sends[-1][self.sends[-1].index('--text') + 1]
+        text = sent_text(self.sends[-1])
         self.assertEqual(text, 'Ordered: 2x Brown Sugar Boba With Milk from Latea, AED 47.25. ETA in 25-35 mins.')
         stored = t.read(self.root / 'state' / 'orders' / 'order-talabat-3999000110.json')
         self.assertEqual(stored['total'], 'AED 47.25')
 
-    def test_failed_send_is_reported_and_never_resent_blind(self):
-        self.imsg_code = 1
+    def test_failed_send_is_retried_only_with_the_same_key(self):
+        self.send_code = 1
         code, row = self.add(order='3999000777')
-        self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:imsg_exit_1'))
+        self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:bridge_exit_1'))
         self.assertTrue(row['watcher_registered'])
-        self.imsg_code = 0
-        code, row = self.add(order='3999000777')
+        self.assertEqual(self.notice('3999000777')['status'], 'ambiguous')
+        first_text = sent_text(self.sends[0])
+        # The bridge never sends one key twice, so the retry reuses the key and the text.
+        self.send_code = 0
+        code, row = self.add('--placed-text', 'something else', order='3999000777')
+        self.assertEqual((code, row['moni_notified']), (0, 'sent'))
+        self.assertEqual(len(self.sends), 2)
+        keys = [a[a.index('--key') + 1] for a in self.sends]
+        self.assertEqual(keys, ['order-placed:order-talabat-3999000777'] * 2)
+        self.assertEqual(sent_text(self.sends[1]), first_text)
+        self.assertEqual(self.notice('3999000777')['created'], False)
+        # Sent stays sent.
+        self.assertEqual(self.add(order='3999000777')[1]['moni_notified'], 'skipped')
+        self.assertEqual(len(self.sends), 2)
+
+    def test_imsg_era_unclear_send_is_never_resent(self):
+        path = self.root / 'state' / 'orders' / 'order-talabat-3999000778.json'
+        self.add('--hold-placed-text', order='3999000778')
+        cfg = t.read(path)
+        cfg['placed_notice'] = {'status': 'ambiguous', 'at': t.stamp(), 'text': 'x'}
+        t.write(path, cfg)
+        code, row = self.add(order='3999000778')
         self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:ambiguous_check_imsg_history'))
-        self.assertEqual(len(self.sends), 1)
+        self.assertEqual(self.sends, [])
         # After checking chat history the caller closes it out.
-        code, row = self.add('--no-placed-text', order='3999000777')
+        code, row = self.add('--no-placed-text', order='3999000778')
         self.assertEqual((code, row['moni_notified']), (0, 'skipped'))
 
-    def test_timeout_and_missing_imsg(self):
-        self.imsg_error = subprocess.TimeoutExpired('imsg', 30)
-        self.assertEqual(self.add(order='3999000888')[1]['moni_notified'], 'failed:imsg_timeout')
-        self.imsg_error = OSError('no imsg')
+    def test_timeout_missing_bun_and_bad_ack(self):
+        self.send_error = subprocess.TimeoutExpired('bun', 20)
+        code, row = self.add(order='3999000888')
+        self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:bridge_timeout'))
+        self.assertEqual(self.notice('3999000888')['status'], 'ambiguous')
+        self.send_error = OSError('no bun')
         code, row = self.add(order='3999000999')
-        self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:imsg_unavailable'))
+        self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:bridge_unavailable'))
         # A send that never started may be retried.
-        self.imsg_error = None
+        self.send_error = None
         self.assertEqual(self.add(order='3999000999')[1]['moni_notified'], 'sent')
+        self.send_stdout = 'not json'
+        code, row = self.add(order='3999000989')
+        self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:bridge_bad_ack'))
+        self.assertEqual(self.notice('3999000989')['status'], 'ambiguous')
+
+    def test_text_starting_with_a_dash_is_passed_as_one_argument(self):
+        code, row = self.add('--placed-text=- your boba is on the way', order='3999000904')
+        self.assertEqual((code, row['moni_notified']), (0, 'sent'))
+        self.assertIn('--text=- your boba is on the way', self.sends[-1])
+
+    def test_bridge_notice_with_another_key_or_a_crash_mid_send(self):
+        path = self.root / 'state' / 'orders' / 'order-talabat-3999000905.json'
+        self.add('--hold-placed-text', order='3999000905')
+        cfg = t.read(path)
+        # A crash after 'attempting' was saved: the re-add retries with the same key and text.
+        cfg['placed_notice'] = {'status': 'attempting', 'at': t.stamp(), 'text': 'Ordered: boba from Latea.',
+                                'channel': 'bridge', 'key': 'order-placed:order-talabat-3999000905'}
+        t.write(path, cfg)
+        self.assertEqual(self.add('--hold-placed-text', order='3999000905')[1]['moni_notified'], 'held:payment_unconfirmed')
+        self.assertEqual(self.sends, [])
+        self.assertEqual(self.add(order='3999000905')[1]['moni_notified'], 'sent')
+        self.assertEqual(sent_text(self.sends[-1]), 'Ordered: boba from Latea.')
+        # A bridge notice under any other key is never resent.
+        cfg = t.read(path)
+        cfg['placed_notice'] = {**cfg['placed_notice'], 'status': 'ambiguous', 'key': 'order-placed:other'}
+        t.write(path, cfg)
+        code, row = self.add(order='3999000905')
+        self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:ambiguous_check_imsg_history'))
+        self.assertEqual(len(self.sends), 1)
+
+    def test_no_route_sends_nothing_and_stays_pending(self):
+        for setup in ('missing', 'empty', 'bad'):
+            with self.subTest(setup=setup):
+                order = {'missing': '3999000901', 'empty': '3999000902', 'bad': '3999000903'}[setup]
+                if setup == 'missing':
+                    self.bridge_db.unlink()
+                else:
+                    con = sqlite3.connect(self.bridge_db)
+                    con.execute('create table if not exists kv (key text primary key, value text not null)')
+                    con.execute('delete from kv')
+                    if setup == 'bad':
+                        con.execute("insert into kv values ('route', ?)", (json.dumps({'id': 'bad id; rm'}),))
+                    con.commit()
+                    con.close()
+                code, row = self.add(order=order)
+                self.assertEqual((code, row['moni_notified']), (t.NOTICE_FAILED_EXIT, 'failed:bridge_no_route'))
+                self.assertEqual(self.notice(order)['status'], 'pending')
+        self.assertEqual(self.sends, [])
 
     def test_unpaid_hold_keeps_notice_pending_for_paid_readd(self):
         code, row = self.add('--hold-placed-text', order='3999002000')
@@ -247,7 +356,7 @@ class ReceiptParseTests(unittest.TestCase):
                          (True, {'for': 'moni', 'tracker_id': 'w', 'watcher_registered': True,
                                  'moni_notified': 'sent', 'moni_notice_failed': False,
                                  'moni_notice_held': False}))
-        ok, row = receipt.parse(out.replace('"sent"', '"failed:imsg_exit_1"').encode(), 3, 'moni', 'w')
+        ok, row = receipt.parse(out.replace('"sent"', '"failed:bridge_exit_1"').encode(), 3, 'moni', 'w')
         self.assertTrue(ok)
         self.assertTrue(row['moni_notice_failed'])
         # Exit 3 is only a notice failure for Moni; any other failure is registration failure.
@@ -292,7 +401,7 @@ class LaneRegistrationTests(unittest.TestCase):
     def test_lanes_forward_recipient_and_receipt(self):
         for name, module, attr, call in self.lanes():
             for recipient, notified, code in (('owner', 'skipped', 0), ('moni', 'sent', 0),
-                                              ('moni', 'failed:imsg_exit_1', 3)):
+                                              ('moni', 'failed:bridge_exit_1', 3)):
                 with self.subTest(lane=name, recipient=recipient, code=code), \
                         tempfile.TemporaryDirectory() as temp:
                     flow = object.__new__(getattr(module, {'main': 'MainOrderFlow', 'nownow': 'NowNowOrderFlow',
