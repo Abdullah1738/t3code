@@ -2,13 +2,11 @@ import { memo } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
 
-import {
-  threadRuntimeIsActive,
-  type EnvironmentThreadShell,
-} from "@t3tools/client-runtime/state/models";
+import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import {
   groupIMessageThreads,
-  imessageChatKind,
+  imessageChatLabel,
+  imessageThreadInput,
   sortIMessageChats,
   type IMessageChatSummary,
 } from "@t3tools/client-runtime/ardud/imessage";
@@ -34,44 +32,13 @@ function rowState(isActive: boolean) {
   return isActive ? "bg-sidebar-row-active font-medium" : "hover:bg-sidebar-row-hover";
 }
 
-/** An iMessage thread is any thread whose path sits in the iMessage workspace. */
-export const iMessageThreadInput = (thread: EnvironmentThreadShell) => ({
-  id: thread.id,
-  path: thread.worktreePath,
-  title: thread.title,
-  createdAt: thread.createdAt,
-  updatedAt: thread.updatedAt,
-  running: threadRuntimeIsActive(thread.runtime),
-  child: thread.lineage.relationshipToParent !== null,
-});
-
-// Owner threads are titled by session time; any other title is the chat's name.
-const SESSION_TITLE = /^iMessage \d{4}-\d{2}-\d{2}/;
-
-/**
- * The owner's chat is "Abdullah". Other chats use the name the bridge titles their
- * threads with, falling back to the slug written as a name.
- */
-export function imessageChatLabel(slug: string, threadTitle?: string): string {
-  if (imessageChatKind(slug) === "owner") return "Abdullah";
-  const title = threadTitle?.trim();
-  if (title && !SESSION_TITLE.test(title)) return title;
-  return slug
-    .replace(/^group-/, "")
-    .replace(/-[a-z0-9]{6}$/, "")
-    .split("-")
-    .filter((part) => part.length > 0)
-    .map((part) => part[0]!.toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
 /**
  * The iMessage group above the thread list: one row per chat, owner first, then
  * people, then groups. Read-only; each row opens the chat's transcript.
  */
 export function IMessageSidebarGroup() {
   const threads = useThreadShells();
-  const chats = sortIMessageChats(groupIMessageThreads(threads.map(iMessageThreadInput)));
+  const chats = sortIMessageChats(groupIMessageThreads(threads.map(imessageThreadInput)));
   const byId = new Map<string, EnvironmentThreadShell>(
     threads.map((thread) => [thread.id, thread] as const),
   );

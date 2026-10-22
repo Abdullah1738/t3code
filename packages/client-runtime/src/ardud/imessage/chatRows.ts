@@ -1,13 +1,65 @@
-import {
-  classifyIMessageUserMessage,
-  imessageDayKey,
-  imessageGuidanceText,
-  imessageSentReply,
-} from "@t3tools/client-runtime/ardud/imessage";
 import * as DateTime from "effect/DateTime";
 
-import type { TimelineEntry, WorkLogEntry } from "../../session-logic";
-import type { ChatMessage } from "../../types";
+import {
+  classifyIMessageUserMessage,
+  imessageGuidanceText,
+  imessageSentReply,
+} from "./messageKinds.ts";
+import { imessageDayKey } from "./threadWindow.ts";
+
+/**
+ * The slice of a timeline message the rows read. Web's chat message and mobile's feed message
+ * both satisfy it, so each client keeps its own timeline builder.
+ */
+export interface IMessageTimelineMessage {
+  readonly id: string;
+  readonly role: "user" | "assistant" | "system";
+  readonly text: string;
+  readonly runId: string | null;
+  readonly streaming: boolean;
+  readonly createdBy?: "user" | "agent" | "system" | undefined;
+  readonly context?: { readonly records: ReadonlyArray<{ readonly kind: string }> } | undefined;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface IMessageTimelineWork {
+  readonly id: string;
+  readonly runId?: string | null | undefined;
+  readonly label: string;
+  readonly tone: "thinking" | "tool" | "info" | "error";
+  readonly command?: string | undefined;
+  readonly detail?: string | undefined;
+  readonly structuredPayload?:
+    | {
+        readonly startedAt: DateTime.Utc | null;
+        readonly completedAt: DateTime.Utc | null;
+      }
+    | undefined;
+}
+
+interface IMessageTimelineBase {
+  readonly id: string;
+  readonly createdAt: string;
+}
+
+export type IMessageTimelineEntry =
+  | (IMessageTimelineBase & { readonly kind: "message"; readonly message: IMessageTimelineMessage })
+  | (IMessageTimelineBase & { readonly kind: "work"; readonly entry: IMessageTimelineWork })
+  | (IMessageTimelineBase & {
+      readonly kind: "proposed-plan";
+      readonly proposedPlan: { readonly runId: string | null; readonly planMarkdown: string };
+    })
+  | (IMessageTimelineBase & {
+      readonly kind: "html-render" | "mcp-app";
+      readonly runId: string | null;
+    })
+  | (IMessageTimelineBase & {
+      readonly kind: "event";
+      readonly projectedItem: {
+        readonly item: { readonly runId: string | null; readonly type: string };
+      };
+    });
 
 /** One line in an agent row's details: a tool call, or a frame nobody typed. */
 export interface IMessageAgentStep {
@@ -74,7 +126,7 @@ export interface IMessageChatRowOptions {
 
 interface Turn {
   readonly key: string;
-  readonly entries: TimelineEntry[];
+  readonly entries: IMessageTimelineEntry[];
 }
 
 /**
@@ -84,7 +136,7 @@ interface Turn {
  * agent row's details.
  */
 export function buildIMessageChatRows(
-  entries: ReadonlyArray<TimelineEntry>,
+  entries: ReadonlyArray<IMessageTimelineEntry>,
   options: IMessageChatRowOptions,
 ): IMessageChatRow[] {
   const rows: IMessageChatRow[] = [];
@@ -102,7 +154,7 @@ export function buildIMessageChatRows(
     let lastSender: string | null = null;
 
     const steps: IMessageAgentStep[] = [];
-    const assistants: ChatMessage[] = [];
+    const assistants: IMessageTimelineMessage[] = [];
     let endedAt = first.createdAt;
     for (const entry of turn.entries) {
       endedAt = later(
@@ -187,7 +239,7 @@ export function formatIMessageDuration(seconds: number): string {
 }
 
 /** Runs split turns; entries without a run stay with the turn they arrived in. */
-function splitTurns(entries: ReadonlyArray<TimelineEntry>): Turn[] {
+function splitTurns(entries: ReadonlyArray<IMessageTimelineEntry>): Turn[] {
   const turns: Turn[] = [];
   for (const entry of entries) {
     const runId = entryRunId(entry);
@@ -201,7 +253,7 @@ function splitTurns(entries: ReadonlyArray<TimelineEntry>): Turn[] {
   return turns;
 }
 
-function entryRunId(entry: TimelineEntry): string | null {
+function entryRunId(entry: IMessageTimelineEntry): string | null {
   switch (entry.kind) {
     case "message":
       return entry.message.runId;
@@ -218,7 +270,7 @@ function entryRunId(entry: TimelineEntry): string | null {
 }
 
 function addUserMessage(
-  message: ChatMessage,
+  message: IMessageTimelineMessage,
   namedSenders: boolean,
   lastSender: string | null,
   rows: IMessageChatRow[],
@@ -285,7 +337,7 @@ function addUserMessage(
 }
 
 /** Newer bridge versions move the guidance out of the text into a context record. */
-function contextGuidance(message: ChatMessage): string | null {
+function contextGuidance(message: IMessageTimelineMessage): string | null {
   for (const record of message.context?.records ?? []) {
     if (record.kind !== "ardud-guidance" || !("payload" in record)) continue;
     const payload: unknown = record.payload;
@@ -297,7 +349,7 @@ function contextGuidance(message: ChatMessage): string | null {
   return null;
 }
 
-function entryStep(entry: Exclude<TimelineEntry, { kind: "message" }>): IMessageAgentStep {
+function entryStep(entry: Exclude<IMessageTimelineEntry, { kind: "message" }>): IMessageAgentStep {
   switch (entry.kind) {
     case "work":
       return workStep(entry.entry);
@@ -312,7 +364,7 @@ function entryStep(entry: Exclude<TimelineEntry, { kind: "message" }>): IMessage
   }
 }
 
-function workStep(work: WorkLogEntry): IMessageAgentStep {
+function workStep(work: IMessageTimelineWork): IMessageAgentStep {
   const seconds = workSeconds(work);
   const error = work.tone === "error";
   if (work.command !== undefined && work.command.trim().length > 0) {
@@ -341,7 +393,7 @@ function workStep(work: WorkLogEntry): IMessageAgentStep {
   };
 }
 
-function workSeconds(work: WorkLogEntry): number | null {
+function workSeconds(work: IMessageTimelineWork): number | null {
   const item = work.structuredPayload;
   if (item?.startedAt == null || item.completedAt == null) return null;
   return (DateTime.toEpochMillis(item.completedAt) - DateTime.toEpochMillis(item.startedAt)) / 1000;
