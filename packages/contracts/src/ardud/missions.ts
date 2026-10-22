@@ -10,6 +10,7 @@ import {
   TrimmedNonEmptyString,
 } from "../baseSchemas.ts";
 import { ModelSelection } from "../modelSelection.ts";
+import { isValidTimeZone } from "./scheduledTaskSchedules.ts";
 
 /**
  * Fork-only Missions contracts: the records a long-running, multi-lane piece of
@@ -329,6 +330,30 @@ export const LockedFields = Schema.Array(TrimmedNonEmptyString);
 export type LockedFields = typeof LockedFields.Type;
 
 // ---------------------------------------------------------------------------
+// --- scribe additions ---
+/**
+ * Report settings. `dayBoundary` is the IANA zone whose midnight starts a daily
+ * report's day (Asia/Dubai means 20:00Z to 20:00Z); unset means UTC.
+ */
+export const MissionReportSettings = Schema.Struct({
+  dayBoundary: Schema.optional(
+    TrimmedNonEmptyString.annotate({
+      description: "IANA time zone whose midnight starts a daily report, such as Asia/Dubai.",
+    }),
+  ),
+});
+export type MissionReportSettings = typeof MissionReportSettings.Type;
+
+/** Report settings as written: the day boundary must be a known IANA zone. */
+export const MissionReportSettingsInput = MissionReportSettings.check(
+  Schema.makeFilter((settings) =>
+    settings.dayBoundary === undefined || isValidTimeZone(settings.dayBoundary)
+      ? true
+      : `Unknown time zone '${settings.dayBoundary}'.`,
+  ),
+);
+// --- end scribe additions ---
+
 // Mission structure
 
 export const MissionStatus = Schema.Literals(["active", "paused", "draining", "archived"]);
@@ -362,6 +387,9 @@ export const Mission = Schema.Struct({
       Schema.suspend((): Schema.Codec<ApprovalRoute, ApprovalRouteEncoded> => ApprovalRoute),
     ),
   ),
+  // --- scribe additions ---
+  /** How the mission's reports are windowed and labelled. */
+  reports: Schema.optional(MissionReportSettings),
 });
 export type Mission = typeof Mission.Type;
 
@@ -1859,6 +1887,8 @@ export const MissionEventKind = Schema.Literals([
   "note.recorded",
   /** The editor refreshed the bottom line, FYI ranking and feed. */
   "editor.updated",
+  /** A report was saved or revised (scribe, master or owner); subject is the report. */
+  "report.saved",
   // --- end scribe additions ---
   "rule.created",
   "rule.updated",
@@ -2999,6 +3029,8 @@ export const UpdateMissionInput = Schema.Struct({
   borrowCeiling: Schema.optional(Share),
   projectId: Schema.optional(Schema.NullOr(ProjectId)),
   masterRoleId: Schema.optional(Schema.NullOr(RoleId)),
+  /** Report windows and labels; replaces the whole settings object. */
+  reports: Schema.optional(MissionReportSettingsInput),
 });
 export type UpdateMissionInput = typeof UpdateMissionInput.Type;
 
