@@ -471,6 +471,30 @@ const makeRoutes = Effect.gen(function* () {
       ),
     );
 
+  /**
+   * Shells for a few known threads, one cheap lookup each. Lists that only
+   * want live threads use this instead of building the whole shell snapshot,
+   * which grows with every thread ever made.
+   */
+  const shellsFor = (threadIds: ReadonlyArray<string>, location: "active" | "archive") =>
+    Effect.forEach(
+      threadIds,
+      (threadId) =>
+        threads
+          .getThreadShell(ThreadId.make(threadId))
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
+      { concurrency: 4 },
+    ).pipe(
+      Effect.map((shells) =>
+        shells.filter(
+          (shell): shell is OrchestrationV2ThreadShell =>
+            shell !== null &&
+            shell.deletedAt === null &&
+            (shell.archivedAt !== null) === (location === "archive"),
+        ),
+      ),
+    );
+
   const readRecords = (threadId: string) =>
     threads
       .getThreadRecords(ThreadId.make(threadId), ["runs", "runtimeRequests", "turnItems"], {
@@ -759,9 +783,7 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
     const archived = boolParam(params.get("archived")) === true;
-    const snapshot = yield* threads
-      .getShellSnapshot({ location: archived ? "archive" : "active" })
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    const location = archived ? "archive" : "active";
     const since = parseSince(params.get("updatedSince"));
     const active = boolParam(params.get("active"));
     const projectId = params.get("projectId");
@@ -769,7 +791,21 @@ const makeRoutes = Effect.gen(function* () {
     const includeSubagents = boolParam(params.get("includeSubagents")) ?? false;
     const ids = params.get("ids")?.split(",").filter(Boolean);
     const parentThreadId = params.get("parentThreadId");
-    let shells = snapshot.threads.filter(
+    // Only live threads can be non-idle, so those lists start from the few
+    // live ids instead of every thread's shell. The exact filters below
+    // still decide.
+    const liveOnly = active === true || (states !== undefined && !states.includes("idle"));
+    const candidates = liveOnly
+      ? yield* shellsFor(
+          yield* store
+            .liveThreadIds()
+            .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
+          location,
+        )
+      : (yield* threads
+          .getShellSnapshot({ location })
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))))).threads;
+    let shells = candidates.filter(
       (shell) =>
         shell.deletedAt === null &&
         (includeSubagents ||
@@ -1253,12 +1289,13 @@ const makeRoutes = Effect.gen(function* () {
   const listRequests = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
-    const snapshot = yield* threads
-      .getShellSnapshot({ location: "active" })
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    const waiting = snapshot.threads.filter(
-      (shell) => shell.deletedAt === null && shell.pendingRuntimeRequest !== null,
+    const candidates = yield* shellsFor(
+      yield* store
+        .pendingRequestThreadIds()
+        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))),
+      "active",
     );
+    const waiting = candidates.filter((shell) => shell.pendingRuntimeRequest !== null);
     const summaries = yield* summarize(waiting);
     const origin = params.get("origin");
     const rows = yield* Effect.forEach(

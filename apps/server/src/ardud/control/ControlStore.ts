@@ -42,6 +42,14 @@ export interface ControlStoreShape {
   readonly nativeSessionIds: (
     threadIds: ReadonlyArray<string>,
   ) => Effect.Effect<ReadonlyMap<string, string>, ControlStoreError>;
+  /**
+   * Threads that may be non-idle: a run that has not ended, or a pending
+   * runtime request. A superset of what the shell calls active, read from
+   * the partial recovery indexes so listings skip the full shell snapshot.
+   */
+  readonly liveThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
+  /** Threads with a pending runtime request (approval or user input). */
+  readonly pendingRequestThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
 }
 
 export class ControlStore extends Context.Service<ControlStore, ControlStoreShape>()(
@@ -149,12 +157,35 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("read-native-sessions")),
     );
 
+  const liveThreadIds: ControlStoreShape["liveThreadIds"] = () =>
+    sql<{ readonly thread_id: string }>`
+      SELECT thread_id FROM orchestration_v2_projection_runs
+      WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+      UNION
+      SELECT thread_id FROM orchestration_v2_projection_runtime_requests
+      WHERE status = 'pending'
+    `.pipe(
+      Effect.map((rows) => rows.map((row) => row.thread_id)),
+      Effect.mapError(fail("read-live-threads")),
+    );
+
+  const pendingRequestThreadIds: ControlStoreShape["pendingRequestThreadIds"] = () =>
+    sql<{ readonly thread_id: string }>`
+      SELECT DISTINCT thread_id FROM orchestration_v2_projection_runtime_requests
+      WHERE status = 'pending'
+    `.pipe(
+      Effect.map((rows) => rows.map((row) => row.thread_id)),
+      Effect.mapError(fail("read-pending-request-threads")),
+    );
+
   return ControlStore.of({
     getOrigin,
     getOrigins,
     setOrigin,
     threadIdForNativeSession,
     nativeSessionIds,
+    liveThreadIds,
+    pendingRequestThreadIds,
   });
 });
 
