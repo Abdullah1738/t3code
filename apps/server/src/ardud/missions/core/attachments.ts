@@ -69,7 +69,7 @@ export const makeAttachmentWrites = (kit: WriteKit, targets: AttachTargets["Serv
   ) {
     const target = yield* targets.lookup(threadId);
     if (target === null) return yield* fail("not-found", `No thread ${threadId}.`);
-    if (target.origin !== component) {
+    if (target.createdBy !== component) {
       return yield* fail("forbidden", `Thread ${threadId} was not created by ${component}.`);
     }
   });

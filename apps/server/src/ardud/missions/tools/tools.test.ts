@@ -86,7 +86,7 @@ const mcpClient = McpSchema.McpServerClient.of({
 });
 
 const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
-  const { layer, threadOrigins } = harness(inbound);
+  const { layer, threadCreators } = harness(inbound);
   // What the tools hand the secret service: the card and who answers it.
   const answered: Array<Parameters<SecretRequests.SecretRequests["Service"]["answer"]>> = [];
   const secrets = Layer.mock(SecretRequests.SecretRequests)({
@@ -108,7 +108,7 @@ const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
   return {
     answered,
     threads,
-    threadOrigins,
+    threadCreators,
     layer: McpHttpServer.toolkitRegistration(MissionsToolkit, MissionsHandlers.layer).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
       Layer.provideMerge(liveThreadsLayer),
@@ -533,9 +533,9 @@ describe("mission MCP tools", () => {
   });
 
   it.effect("gives the master every plan control, each on the timeline as the master", () => {
-    const { layer, threadOrigins } = toolsLayer();
+    const { layer, threadCreators } = toolsLayer();
     const reviewThread = ThreadId.make("t-review-7");
-    threadOrigins.set(reviewThread, "crw");
+    threadCreators.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       const master = threadCaller(masterThread);

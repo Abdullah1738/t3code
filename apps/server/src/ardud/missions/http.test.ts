@@ -47,7 +47,7 @@ const targets = Layer.succeed(
   AttachTargets,
   AttachTargets.of({
     lookup: (threadId) =>
-      Effect.succeed(threadId === "thread-review-361" ? { origin: "crw" } : null),
+      Effect.succeed(threadId === "thread-review-361" ? { createdBy: "crw" } : null),
   }),
 );
 

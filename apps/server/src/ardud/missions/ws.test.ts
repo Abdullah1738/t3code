@@ -34,7 +34,7 @@ import { makeMissionWsHandlers, measuredUsage, missionWsHandlers } from "./ws.ts
 
 const reviewThread = ThreadId.make("t-review-ws");
 const testHarness = harness();
-testHarness.threadOrigins.set(reviewThread, "crw");
+testHarness.threadCreators.set(reviewThread, "crw");
 const TestLayer = RuleService.layer.pipe(
   Layer.provideMerge(routerOverFakes(fakeRouterThreads())),
   Layer.provideMerge(testHarness.layer),

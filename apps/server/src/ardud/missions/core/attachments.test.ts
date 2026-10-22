@@ -46,8 +46,8 @@ const listedThreads = Effect.gen(function* () {
 
 describe("thread attachments", () => {
   it.effect("an attached thread belongs to the mission until it is detached", () => {
-    const { layer, threadOrigins } = harness();
-    threadOrigins.set(reviewThread, "crw");
+    const { layer, threadCreators } = harness();
+    threadCreators.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       const missions = yield* MissionService.MissionService;
@@ -90,25 +90,25 @@ describe("thread attachments", () => {
   });
 
   it.effect("only the component that runs a thread attaches it, in one mission at a time", () => {
-    const { layer, threadOrigins } = harness();
-    threadOrigins.set(reviewThread, "crw");
+    const { layer, threadCreators } = harness();
+    threadCreators.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       yield* seedOther;
       const missions = yield* MissionService.MissionService;
 
       assert.equal(yield* failureCode(missions.attachThread(ownerApp, attach())), "forbidden");
-      // The thread must exist and its recorded origin must be crw; saying so is not enough.
+      // The thread must exist and crw must have created it; saying so is not enough.
       const unknown = ThreadId.make("t-nowhere");
       assert.equal(
         yield* failureCode(missions.attachThread(crw, attach({ threadId: unknown }))),
         "not-found",
       );
-      for (const [threadId, origin] of [
-        [ThreadId.make("t-imessage"), "imessage"],
+      for (const [threadId, creator] of [
+        [ThreadId.make("t-bridge"), "spectrum-bridge"],
         [ThreadId.make("t-typed"), null],
       ] as const) {
-        threadOrigins.set(threadId, origin);
+        threadCreators.set(threadId, creator);
         assert.equal(
           yield* failureCode(missions.attachThread(crw, attach({ threadId }))),
           "forbidden",
@@ -151,9 +151,9 @@ describe("thread attachments", () => {
   it.effect(
     "old settled threads go back to the thread list together with the Reviews group",
     () => {
-      const { layer, threadOrigins } = harness();
+      const { layer, threadCreators } = harness();
       const threads = Array.from({ length: 22 }, (_, index) => ThreadId.make(`t-pr-${index}`));
-      for (const threadId of threads) threadOrigins.set(threadId, "crw");
+      for (const threadId of threads) threadCreators.set(threadId, "crw");
       return Effect.gen(function* () {
         yield* seed;
         const missions = yield* MissionService.MissionService;
@@ -180,8 +180,8 @@ describe("thread attachments", () => {
   );
 
   it.effect("the owner or the master detaches any attachment; crw can attach it again", () => {
-    const { layer, threadOrigins } = harness();
-    threadOrigins.set(reviewThread, "crw");
+    const { layer, threadCreators } = harness();
+    threadCreators.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       yield* seedOther;

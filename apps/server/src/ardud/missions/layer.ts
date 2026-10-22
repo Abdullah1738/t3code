@@ -38,7 +38,7 @@ const MissionTracksLive = Layer.mergeAll(
   RouterLive,
 ).pipe(
   Layer.provideMerge(OwnerConditionsLive), // ardud missions: router (discuss)
-  Layer.provide(AttachTargetsLive), // ardud missions: r22 fixes (attach checks thread origins)
+  Layer.provide(AttachTargetsLive), // ardud missions: r22 fixes (attach checks who created the thread)
 );
 
 /**

@@ -194,14 +194,14 @@ export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
       find: (id) => Effect.succeed(inbound.find((message) => message.id === id) ?? null),
     }),
   );
-  // The threads that exist, by recorded origin; a test adds the ones it attaches.
-  const threadOrigins = new Map<ThreadId, string | null>();
+  // The threads that exist, by the component that created them; a test adds the ones it attaches.
+  const threadCreators = new Map<ThreadId, string | null>();
   const targets = Layer.succeed(
     AttachTargets,
     AttachTargets.of({
       lookup: (threadId) =>
         Effect.succeed(
-          threadOrigins.has(threadId) ? { origin: threadOrigins.get(threadId) ?? null } : null,
+          threadCreators.has(threadId) ? { createdBy: threadCreators.get(threadId) ?? null } : null,
         ),
     }),
   );
@@ -218,7 +218,7 @@ export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
       ),
     ),
   );
-  return { signals, posts, threadOrigins, layer };
+  return { signals, posts, threadCreators, layer };
 };
 
 export const seed = Effect.gen(function* () {

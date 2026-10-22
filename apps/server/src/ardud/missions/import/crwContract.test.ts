@@ -86,12 +86,12 @@ const asksPorts = Layer.mergeAll(
   NodeServices.layer,
 );
 
-// crw created the review thread it attaches; attach checks that origin.
+// crw created the review thread it attaches; attach checks that.
 const attachTargets = Layer.succeed(
   AttachTargets,
   AttachTargets.of({
     lookup: (threadId) =>
-      Effect.succeed(threadId === "thread-missions" ? { origin: fixture.component } : null),
+      Effect.succeed(threadId === "thread-missions" ? { createdBy: fixture.component } : null),
   }),
 );
 
