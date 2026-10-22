@@ -40,6 +40,7 @@ import {
   useNoteCard,
   useSuggestionCard,
   type AskCardState,
+  type DecisionNoteState,
   type MoveState,
 } from "./inboxLogic";
 import { CommentsBlock, SnoozeControl } from "./ItemMarks";
@@ -133,6 +134,17 @@ function withFacts(facts: ReadonlyArray<CardFact>, extra: CardFact | null): Card
   return extra ? [...facts, extra] : [...facts];
 }
 
+/** The note that goes with whichever decision is pressed. It opens no discussion. */
+function NoteField(props: { readonly card: DecisionNoteState }) {
+  return (
+    <TextField
+      value={props.card.note}
+      onChangeText={props.card.setNote}
+      placeholder="Note for whoever acts on it (optional)"
+    />
+  );
+}
+
 /** The reason field and buttons while a draft or approval is being moved. */
 function MoveField(props: { readonly move: MoveState }) {
   if (!props.move.open) return null;
@@ -199,6 +211,7 @@ function AskItem(props: FrameProps & { readonly ask: Ask }) {
         placeholder={view.options.length > 0 ? "Or answer in your own words" : "Your answer"}
         minHeight="few"
       />
+      <NoteField card={card} />
     </Frame>
   );
 }
@@ -313,8 +326,12 @@ function DraftItem(props: FrameProps & { readonly draft: Draft }) {
           onChangeText={card.setRewriteNote}
           placeholder="What should change?"
         />
-      ) : null}
-      <MoveField move={move} />
+      ) : move.open ? (
+        <MoveField move={move} />
+      ) : (
+        // A rewrite's own note is what the writer acts on, so this one hides then.
+        <NoteField card={card} />
+      )}
     </Frame>
   );
 }
@@ -355,11 +372,7 @@ function ApprovalItem(props: FrameProps & { readonly approval: Approval }) {
         </>
       )}
       {moved ? <Facts facts={[{ label: "Moved because", value: moved }]} /> : null}
-      {move.open ? (
-        <MoveField move={move} />
-      ) : (
-        <TextField value={card.note} onChangeText={card.setNote} placeholder="Note" />
-      )}
+      {move.open ? <MoveField move={move} /> : <NoteField card={card} />}
     </Frame>
   );
 }
@@ -401,6 +414,7 @@ function KnockItem(props: FrameProps & { readonly knock: Knock }) {
       ) : props.knock.body ? (
         <Body>{props.knock.body}</Body>
       ) : null}
+      <NoteField card={card} />
     </Frame>
   );
 }
@@ -458,6 +472,7 @@ function SuggestionItem(props: FrameProps & { readonly suggestion: Suggestion })
           placeholder="Why not?"
         />
       ) : null}
+      <NoteField card={card} />
     </Frame>
   );
 }

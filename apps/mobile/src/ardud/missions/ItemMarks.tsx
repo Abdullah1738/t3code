@@ -1,3 +1,4 @@
+import type { InboxComment } from "@t3tools/contracts";
 import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { useState } from "react";
 import { Pressable, View } from "react-native";
@@ -64,13 +65,16 @@ export function SnoozeControl(props: { readonly marks: ItemMarksState }) {
   );
 }
 
-/** The owner's comments on the item, and the box to add one. */
-export function CommentsBlock(props: { readonly marks: ItemMarksState; readonly nowMs: number }) {
-  const { marks } = props;
+/** The owner's comments on an item, waiting or decided. Nothing when there are none. */
+export function CommentList(props: {
+  readonly comments: ReadonlyArray<InboxComment>;
+  readonly nowMs: number;
+}) {
+  if (props.comments.length === 0) return null;
   return (
     <View className="gap-2">
-      {marks.comments.length > 0 ? <SectionHead title="Your comments" /> : null}
-      {marks.comments.map((comment) => (
+      <SectionHead title="Your comments" />
+      {props.comments.map((comment) => (
         <Bubble
           key={comment.id}
           fromOwner
@@ -79,6 +83,16 @@ export function CommentsBlock(props: { readonly marks: ItemMarksState; readonly 
           text={comment.body}
         />
       ))}
+    </View>
+  );
+}
+
+/** The owner's comments on the item, and the box to add one. */
+export function CommentsBlock(props: { readonly marks: ItemMarksState; readonly nowMs: number }) {
+  const { marks } = props;
+  return (
+    <View className="gap-2">
+      <CommentList comments={marks.comments} nowMs={props.nowMs} />
       {marks.composing ? (
         <View className="gap-2">
           <TextField

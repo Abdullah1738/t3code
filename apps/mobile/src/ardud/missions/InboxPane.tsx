@@ -1,4 +1,4 @@
-import type { MissionId, MissionListSnapshot } from "@t3tools/contracts";
+import type { InboxMark, MissionId, MissionListSnapshot } from "@t3tools/contracts";
 import { markOf, type InboxEntry } from "@t3tools/client-runtime/ardud/missions";
 import {
   decidedRows,
@@ -8,6 +8,7 @@ import {
   INBOX_EMPTY_LABEL,
   resolveInboxFilter,
   snoozedFor,
+  type DecidedRowView,
   type InboxFilter,
 } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { Fragment, useState } from "react";
@@ -118,7 +119,7 @@ export function InboxPane(props: {
           {snoozedOpen ? rows(snoozed) : null}
         </View>
       ) : null}
-      <DecidedToday missionId={props.missionId} nowMs={props.nowMs} />
+      <DecidedToday missionId={props.missionId} marks={inbox.marks} nowMs={props.nowMs} />
     </ScrollView>
   );
 
@@ -166,10 +167,14 @@ export function EntryRow(props: {
   );
 }
 
-function DecidedToday(props: { readonly missionId: MissionId | null; readonly nowMs: number }) {
+function DecidedToday(props: {
+  readonly missionId: MissionId | null;
+  readonly marks: ReadonlyArray<InboxMark> | undefined;
+  readonly nowMs: number;
+}) {
   const history = useMissionInboxHistory(props.missionId);
   const [open, setOpen] = useState(false);
-  const rows = history ? decidedRows(history, props.nowMs) : [];
+  const rows = history ? decidedRows(history, props.nowMs, props.marks) : [];
   if (rows.length === 0) return null;
   return (
     <View className="gap-2 pt-3">
@@ -184,12 +189,10 @@ function DecidedToday(props: { readonly missionId: MissionId | null; readonly no
               {index > 0 ? <Separator /> : null}
               <Row>
                 <View className="min-w-0 flex-1 gap-1">
-                  <View className="flex-row items-start gap-3">
-                    <Title className="flex-1">{row.title}</Title>
-                    {row.age ? <Meta className="pt-0.5">{row.age}</Meta> : null}
-                  </View>
-                  <Meta>{row.outcome}</Meta>
-                  {row.condition ? <ConditionQuote quote={row.condition} /> : null}
+                  <DecidedSummary row={row} />
+                  {row.comments.map((comment) => (
+                    <Meta key={comment.id}>You: {comment.body}</Meta>
+                  ))}
                 </View>
               </Row>
             </Fragment>
@@ -197,5 +200,21 @@ function DecidedToday(props: { readonly missionId: MissionId | null; readonly no
         </Group>
       ) : null}
     </View>
+  );
+}
+
+/** A decided item's title, outcome, condition and, for a draft, what went out. */
+export function DecidedSummary(props: { readonly row: DecidedRowView }) {
+  const { row } = props;
+  return (
+    <>
+      <View className="flex-row items-start gap-3">
+        <Title className="flex-1">{row.title}</Title>
+        {row.age ? <Meta className="pt-0.5">{row.age}</Meta> : null}
+      </View>
+      <Meta>{row.outcome}</Meta>
+      {row.condition ? <ConditionQuote quote={row.condition} /> : null}
+      {row.sent ? <Meta>What went out: {row.sent}</Meta> : null}
+    </>
   );
 }
