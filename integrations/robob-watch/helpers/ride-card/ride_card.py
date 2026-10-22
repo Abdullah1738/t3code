@@ -17,13 +17,15 @@ Recipients: abdullah + moni + rider + booker + extras, deduped. Abdullah (owner 
 URL; everyone else gets the public share URL. From the owner session every recipient is reachable
 (--to SLUG); from any other chat only that chat itself.
 
-The ride-share-updates watcher calls update_card() every 30s; it never sends.
-Nothing here infers arrival from an ETA or completion from a missing trip.
+The ride-share-updates watcher rebuilds the card every 30s; it never sends.
+Nothing here infers arrival from an ETA or completion from a missing trip. Arrived needs Uber's
+ArrivingAtPickup status and the car within AT_PICKUP_M of the pickup pin.
 
 Env overrides: RIDE_CARD_ROOT, RIDE_CARD_JOURNAL, RIDE_SHARE_HINTS, RIDE_CARD_BRIDGE (bridge CLI
 command, space separated), RIDE_CARD_PREVIEW_LIB, RIDE_CARD_NO_IMAGE=1 (skip Chrome, tests), UBER_BIN.
 """
-import argparse, fcntl, hashlib, tempfile, html, json, os, re, shlex, shutil, subprocess, sys, time
+import argparse, fcntl, hashlib, tempfile, html, json, math, os, re, shlex, shutil, subprocess, sys, time
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -32,8 +34,15 @@ DXB = timezone(timedelta(hours=4))
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 STEPS = ["Booked", "Arriving", "Arrived", "On trip", "Dropped off"]
 SEARCHING = {"Searching", "Dispatching", "Matching", "Requesting", "WaitingForDispatch"}
-LIVE = {"Accepted": ("assigned", 0), "ArrivingAtPickup": ("arriving", 1),
-        "WaitingForPickup": ("arrived", 2), "OnTrip": ("ontrip", 3)}
+# Uber's names read backwards: WaitingForPickup is the rider waiting while the driver drives over
+# (ETA counts down), ArrivingAtPickup starts when the driver is about there. Recorded trips (Oct 2026)
+# sat in ArrivingAtPickup at "0 mins" both a few hundred metres out and parked at the pin, so the
+# status alone never shows Arrived: it also needs the car within AT_PICKUP_M of the pickup pin.
+LIVE = {"Accepted": ("assigned", 0), "WaitingForPickup": ("arriving", 1),
+        "ArrivingAtPickup": ("arriving", 1), "OnTrip": ("ontrip", 3)}
+AT_PICKUP = {"ArrivingAtPickup"}
+AT_PICKUP_M = 100
+LEAVE_PICKUP_M = 250
 TERMINAL = {"COMPLETED": "done", "CANCELED": "cancelled", "CANCELLED": "cancelled",
             "UNFULFILLED": "failed", "FAILED": "failed"}
 STALE_S = 120
@@ -197,18 +206,64 @@ def blank(uuid, rider, booker):
             "arrival_eta": None, "note": None, "checked_at": None, "since": None}
 
 
+def latlng(loc):
+    """(lat, lng) from the CLI's {latitude, longitude} (or {lat, lng}); None when absent or junk."""
+    if not isinstance(loc, dict):
+        return None
+    la, ln = loc.get("latitude", loc.get("lat")), loc.get("longitude", loc.get("lng"))
+    try:
+        la, ln = float(la), float(ln)
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= la <= 90 and -180 <= ln <= 180) or (la == 0 and ln == 0):
+        return None
+    return la, ln
+
+
+def pickup_distance(trip):
+    """Metres from the driver's car to the pickup pin, or None when either point is missing."""
+    car = latlng((trip.get("vehicle") or {}).get("location"))
+    pin = latlng(next((s.get("location") for s in trip.get("stops") or [] if s.get("type") == "Pickup"), None))
+    if not car or not pin:
+        return None
+    (a, b), (c, d) = map(lambda p: (math.radians(p[0]), math.radians(p[1])), (car, pin))
+    h = math.sin((c - a) / 2) ** 2 + math.cos(a) * math.cos(c) * math.sin((d - b) / 2) ** 2
+    return round(2 * 6371000 * math.asin(math.sqrt(h)))
+
+
+def plate_key(plate):
+    """Plate identity ignoring case, spaces and punctuation, any script; empty when there's no
+    plate. Letters stay in, so plates that differ only in an Arabic letter stay different."""
+    raw = unicodedata.normalize("NFKC", str(plate or "")).casefold()
+    return "".join(str(unicodedata.decimal(ch)) if ch.isdecimal() else ch for ch in raw if ch.isalnum())
+
+
+def at_pickup(status, dist, was_arrived):
+    """Arrived only on Uber's at-pickup status plus the car at the pin. Once shown it holds through
+    GPS jitter until the car is clearly elsewhere or Uber moves on."""
+    if status not in AT_PICKUP or dist is None:
+        return False
+    return dist <= (LEAVE_PICKUP_M if was_arrived else AT_PICKUP_M)
+
+
 def from_live(trip, prev, rider, booker, now):
     """Card for a live `rides status` trip. Driver/car/plate come ONLY from this trip read."""
     uuid = check_uuid(trip.get("uuid"))
     c = dict(prev) if prev and prev.get("trip") == uuid else blank(uuid, rider, booker)
+    veh = trip.get("vehicle") or {}
+    # The looser hold only applies to the car that arrived; a replacement driver (or a car we
+    # can't identify) starts over.
+    held = plate_key(c.get("plate"))
+    was_arrived = c.get("state") == "arrived" and bool(held) and held == plate_key(clean(veh.get("plate"), 16))
     c.update(rider=rider, booker=booker, terminal=False, note=None,
              rider_name=display(rider, uuid), booker_name=display(booker, uuid))
     status = trip.get("status") or ""
     drv = trip.get("driver") or {}
-    veh = trip.get("vehicle") or {}
     has_driver = bool(drv.get("name")) and status not in SEARCHING
     if status in SEARCHING or not has_driver:
         state, step = ("searching", 0)
+    elif at_pickup(status, pickup_distance(trip), was_arrived):
+        state, step = ("arrived", 2)
     else:
         state, step = LIVE.get(status, ("assigned", 0))
     old_plate = c.get("plate") or c.get("last_plate")
@@ -219,7 +274,7 @@ def from_live(trip, prev, rider, booker, now):
     c["plate"] = clean(veh.get("plate"), 16) if has_driver else None
     if c["plate"]:
         c["last_plate"] = c["plate"]
-    if old_plate and c["plate"] and old_plate != c["plate"]:
+    if old_plate and c["plate"] and plate_key(old_plate) != plate_key(c["plate"]):
         c["note"] = "New driver"
         c["driver_changed"] = True
     elif c.get("driver_changed") and c["plate"]:
@@ -280,9 +335,14 @@ def texts(c):
     if s == "searching":
         big, sub, word = "Finding a driver", "Uber is matching a car", "Finding a driver"
     elif s in ("assigned", "arriving"):
-        big = c.get("pickup_eta") or "On the way"
+        eta = c.get("pickup_eta")
         sub, word = "Driver heading to pickup", "Driver on the way"
-        kick = "Driver arrives in" if c.get("pickup_eta") else ""
+        if eta and re.match(r"^0\s*min", eta):
+            # Uber shows "0 mins" for minutes before the car reaches the pin; it is not arrival
+            big, sub = "Nearly there", "Driver is close to pickup"
+        else:
+            big = eta or "On the way"
+            kick = "Driver arrives in" if eta else ""
     elif s == "arrived":
         big, sub, word = "Arrived", "Driver is waiting at pickup", "Driver arrived"
     elif s == "ontrip":
@@ -802,24 +862,35 @@ def set_meta(uuid, rider, booker=None, rider_name=None, booker_name=None, extras
 SAMPLE_UUID = "00000000-0000-4000-8000-000000000001"
 
 
-def sample_trip(status, plate="K 48213", car="Black Lexus ES", name="Imran Khan"):
-    t = {"uuid": SAMPLE_UUID, "status": status, "pickupEta": "4 min", "arrivalEta": "2026-10-22T10:42:00Z",
+SAMPLE_PIN = (25.0702, 55.1405)
+
+
+def sample_trip(status, plate="K 48213", car="Black Lexus ES", name="Imran Khan", eta="4 mins", north_m=1500):
+    """Same shape as `uber rides status --json`: coordinates are {latitude, longitude}."""
+    t = {"uuid": SAMPLE_UUID, "status": status, "pickupEta": eta, "arrivalEta": "2026-10-22T10:42:00Z",
          "pin": "4821", "fare": "AED 65.89", "cancelable": True,
-         "stops": [{"type": "Pickup", "title": "Banyan Tree Residences • Hillside", "location": {"lat": 25.07, "lng": 55.14}},
-                   {"type": "Dropoff", "title": "ARKHE Club, Silverene Tower", "location": {"lat": 25.08, "lng": 55.14}}],
-         "route": [[25.0, 55.1]]}
+         "stops": [{"type": "Pickup", "title": "Banyan Tree Residences • Hillside",
+                    "location": {"latitude": SAMPLE_PIN[0], "longitude": SAMPLE_PIN[1]}},
+                   {"type": "Dropoff", "title": "ARKHE Club, Silverene Tower",
+                    "location": {"latitude": 25.0811, "longitude": 55.1403}}],
+         "route": "sample"}
     if status not in SEARCHING:
         t["driver"] = {"name": name, "rating": 4.93, "photo": "https://example.invalid/p.jpg"}
-        t["vehicle"] = {"description": car, "plate": plate, "location": {"lat": 25.0, "lng": 55.1}}
+        t["vehicle"] = {"description": car, "plate": plate,
+                        "location": {"latitude": SAMPLE_PIN[0] + north_m / 111195, "longitude": SAMPLE_PIN[1]}}
     return t
 
 
 def sample_states(rider="moni"):
+    """The order a real Uber ride goes through, plus the end states."""
     now = time.time()
     seq, c = [], None
-    for st in ("Searching", "Accepted", "ArrivingAtPickup", "WaitingForPickup", "OnTrip"):
-        c = from_live(sample_trip(st), c, rider, "abdullah", now)
-        seq.append((st, dict(c)))
+    for name, st, eta, north in (("Searching", "Searching", None, 0), ("Accepted", "Accepted", "6 mins", 3000),
+                                 ("WaitingForPickup", "WaitingForPickup", "4 mins", 1500),
+                                 ("Nearby", "ArrivingAtPickup", "0 mins", 400),
+                                 ("AtPickup", "ArrivingAtPickup", "0 mins", 20), ("OnTrip", "OnTrip", None, 0)):
+        c = from_live(sample_trip(st, eta=eta, north_m=north), c, rider, "abdullah", now)
+        seq.append((name, dict(c)))
     seq.append(("Unknown", to_unknown(c, now)))
     seq.append(("Completed", to_terminal(c, "COMPLETED", now)))
     seq.append(("Cancelled", to_terminal(seq[1][1], "CANCELED", now)))

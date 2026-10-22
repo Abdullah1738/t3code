@@ -46,17 +46,23 @@ else:
 """
 
 
-def trip(uuid, status, plate="K 48213", name="Imran Khan", car="Black Lexus ES"):
+PIN = (25.0712, 55.1401)
+
+
+def trip(uuid, status, plate="K 48213", name="Imran Khan", car="Black Lexus ES", eta="4 mins", north_m=5000):
+    """`uber rides status --json` shape; the car sits north_m metres due north of the pickup pin."""
     t = {
-        "uuid": uuid, "status": status, "pickupEta": "4 min", "arrivalEta": "2026-10-19T10:30:00Z",
-        "pin": "9731", "fare": "AED 65.89", "headline": "Imran is on the way",
-        "stops": [{"type": "Pickup", "title": "Banyan Tree Residences", "location": {"lat": 25.0712, "lng": 55.1401}},
-                  {"type": "Dropoff", "title": "Dubai Mall", "location": {"lat": 25.1972, "lng": 55.2797}}],
-        "route": [[25.07123, 55.14011]],
+        "uuid": uuid, "status": status, "pickupEta": eta, "arrivalEta": "2026-10-19T10:30:00Z",
+        "pin": "9731", "fare": "AED 65.89", "headline": "Meet at Banyan Tree Residences", "detail": "",
+        "stops": [{"type": "Pickup", "title": "Banyan Tree Residences",
+                   "location": {"latitude": PIN[0], "longitude": PIN[1]}},
+                  {"type": "Dropoff", "title": "Dubai Mall", "location": {"latitude": 25.1972, "longitude": 55.2797}}],
+        "route": "encoded-polyline",
     }
     if status not in ("Searching", "Dispatching", "Matching", "Requesting", "WaitingForDispatch"):
         t["driver"] = {"name": name, "rating": 4.9, "photo": "https://cdn.example/photo-secret.jpg"}
-        t["vehicle"] = {"description": car, "plate": plate, "location": {"lat": 25.1, "lng": 55.2}}
+        t["vehicle"] = {"description": car, "plate": plate,
+                        "location": {"latitude": PIN[0] + north_m / 111195, "longitude": PIN[1]}}
     return t
 
 
@@ -137,10 +143,12 @@ class WatcherTest(Base):
         v = self.card(A)["v"]
         self.assertEqual(self.run_check(120), [])
         self.assertEqual(self.card(A)["v"], v, "unchanged state must not bump the version")
-        for i, (st, want) in enumerate([("ArrivingAtPickup", "arriving"), ("WaitingForPickup", "arrived"), ("OnTrip", "ontrip")]):
-            self.set_state(trip(A, st), {})
+        # the order Uber really uses: WaitingForPickup while the driver drives over, then ArrivingAtPickup
+        for i, (st, north, want) in enumerate([("WaitingForPickup", 1500, "arriving"), ("ArrivingAtPickup", 300, "arriving"),
+                                               ("ArrivingAtPickup", 20, "arrived"), ("OnTrip", 0, "ontrip")]):
+            self.set_state(trip(A, st, eta="0 mins", north_m=north), {})
             self.assertEqual(self.run_check(150 + 30 * i), [])
-            self.assertEqual(self.card(A)["state"], want)
+            self.assertEqual(self.card(A)["state"], want, (st, north))
         self.assertGreater(self.card(A)["v"], v)
         self.set_state(None, {})
         self.assertEqual(self.run_check(300), [])
@@ -306,6 +314,35 @@ class WatcherTest(Base):
         for bad in ("9731", "photo-secret", "25.0712", "55.1401", "AED 65.89", "Khan"):
             self.assertNotIn(bad, blob)
 
+    def test_poll_log_keeps_raw_status_and_distance_not_coordinates(self):
+        self.set_state(trip(A, "WaitingForPickup", eta="3 mins", north_m=900), {})
+        self.run_check(0)
+        self.set_state(trip(A, "ArrivingAtPickup", eta="0 mins", north_m=10), {})
+        self.run_check(30)
+        with open(os.path.join(self.dir, "polls.jsonl")) as f:
+            raw = f.read()
+        rows = [json.loads(x) for x in raw.splitlines()]
+        self.assertEqual([(r["status"], r["eta"], r["dist_m"], r["card"]) for r in rows],
+                         [("WaitingForPickup", "3 mins", 900, "arriving"), ("ArrivingAtPickup", "0 mins", 10, "arrived")])
+        self.assertEqual(rows[0]["headline"], "Meet at Banyan Tree Residences")
+        for bad in ("25.07", "55.14", "Khan", "9731"):
+            self.assertNotIn(bad, raw)
+
+    def test_poll_log_failure_never_stops_the_watcher(self):
+        # a lone surrogate in Uber's text used to raise while logging, after the card but before state
+        t = trip(A, "WaitingForPickup")
+        t["headline"] = "Meet at \ud800 Banyan"
+        self.set_state(t, {})
+        self.run_check(0)
+        self.assertEqual(self.run_check(90)[0].split()[:2], ["CARD_READY", f"trip={A}"])
+        with open(os.path.join(self.dir, "polls.jsonl")) as f:
+            self.assertEqual(json.loads(f.readline())["status"], "WaitingForPickup")
+        os.remove(os.path.join(self.dir, "polls.jsonl"))
+        os.mkdir(os.path.join(self.dir, "polls.jsonl"))
+        self.set_state(trip(B, "Accepted"), {})
+        self.run_check(120)
+        self.assertEqual(self.run_check(180)[0].split()[:2], ["CARD_READY", f"trip={B}"])
+
     def test_scratch_watch_dir_writes_cards_inside_watch_dir(self):
         env = {k: v for k, v in self.env.items() if k not in ("RIDE_CARD_ROOT", "RIDE_CARD_JOURNAL")}
         self.set_state(trip(A, "Accepted"), {})
@@ -344,6 +381,105 @@ def render_html(doc, out, width=1200, height=630):
     with open(os.environ["FAKE_PREVIEW_LOG"], "a") as f:
         f.write("render\\n")
 """
+
+
+class ArrivalTest(unittest.TestCase):
+    """Arrived needs Uber's ArrivingAtPickup plus the car at the pickup pin (recorded trips, Oct 2026)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.dirname(CARD))
+        import ride_card
+        cls.rc = ride_card
+
+    def live(self, *polls):
+        c = None
+        for st, eta, north in polls:
+            c = self.rc.from_live(trip(A, st, eta=eta, north_m=north), c, "abdullah", "abdullah", 0)
+        return c
+
+    def test_waiting_for_pickup_is_on_the_way_even_near_the_pin(self):
+        # 22 Oct: the card said Arrived at booking while the driver was ~5 min out
+        for north in (5000, 40, 0):
+            c = self.live(("WaitingForPickup", "5 mins", north))
+            self.assertEqual((c["state"], c["step"]), ("arriving", 1), north)
+            self.assertEqual(self.rc.texts(c)["big"], "5 mins")
+
+    def test_arriving_at_pickup_far_from_pin_is_not_arrived(self):
+        # 14 Oct trip 034e1320: ArrivingAtPickup "0 mins" for minutes while still driving in
+        c = self.live(("WaitingForPickup", "2 mins", 900), ("ArrivingAtPickup", "0 mins", 400))
+        self.assertEqual(c["state"], "arriving")
+        t = self.rc.texts(c)
+        self.assertEqual((t["big"], t["kick"]), ("Nearly there", ""))
+        self.assertNotIn("rriv", t["og_title"].split("·")[-1])
+
+    def test_arrived_at_the_pin_and_holds_through_gps_jitter(self):
+        c = self.live(("ArrivingAtPickup", "0 mins", 60))
+        self.assertEqual((c["state"], c["step"]), ("arrived", 2))
+        self.assertEqual(self.rc.texts(c)["big"], "Arrived")
+        c = self.rc.from_live(trip(A, "ArrivingAtPickup", eta="0 mins", north_m=180), c, "abdullah", "abdullah", 30)
+        self.assertEqual(c["state"], "arrived", "a jitter past 100 m keeps Arrived")
+        c = self.rc.from_live(trip(A, "ArrivingAtPickup", eta="1 min", north_m=600), c, "abdullah", "abdullah", 60)
+        self.assertEqual(c["state"], "arriving", "a car clearly elsewhere drops back")
+
+    def test_replacement_driver_must_reach_the_pin_itself(self):
+        c = self.live(("ArrivingAtPickup", "0 mins", 30))
+        self.assertEqual(c["state"], "arrived")
+        swap = lambda north, now: self.rc.from_live(
+            trip(A, "ArrivingAtPickup", plate="Z 777", name="Omar", eta="1 min", north_m=north), c, "abdullah", "abdullah", now)
+        c = swap(180, 30)
+        self.assertEqual((c["state"], c["note"]), ("arriving", "New driver"))
+        c = swap(60, 60)
+        self.assertEqual((c["state"], c["since"]), ("arrived", self.rc.iso(60)))
+
+    def test_hold_needs_a_known_plate(self):
+        t = lambda north, name: trip(A, "ArrivingAtPickup", plate=None, name=name, eta="0 mins", north_m=north)
+        c = self.rc.from_live(t(30, "Imran"), None, "abdullah", "abdullah", 0)
+        self.assertEqual(c["state"], "arrived")
+        c = self.rc.from_live(t(180, "Omar"), c, "abdullah", "abdullah", 30)
+        self.assertEqual(c["state"], "arriving")
+
+    def test_hold_survives_plate_formatting(self):
+        c = self.live(("ArrivingAtPickup", "0 mins", 30))
+        self.assertEqual(c["state"], "arrived")
+        for plate in ("K48213", "k 48213", "K-48213"):
+            t = trip(A, "ArrivingAtPickup", plate=plate, eta="0 mins", north_m=180)
+            n = self.rc.from_live(t, c, "abdullah", "abdullah", 30)
+            self.assertEqual((n["state"], n["note"]), ("arrived", None), plate)
+
+    def test_plates_in_any_script_keep_their_letters(self):
+        t = trip(A, "ArrivingAtPickup", plate="أ 12345", eta="0 mins", north_m=30)
+        c = self.rc.from_live(t, None, "abdullah", "abdullah", 0)
+        self.assertEqual(c["state"], "arrived")
+        held = self.rc.from_live(trip(A, "ArrivingAtPickup", plate="أ-12345", eta="0 mins", north_m=180),
+                                 c, "abdullah", "abdullah", 30)
+        self.assertEqual((held["state"], held["note"]), ("arrived", None))
+        swap = self.rc.from_live(trip(A, "ArrivingAtPickup", plate="ب 12345", eta="0 mins", north_m=180),
+                                 c, "abdullah", "abdullah", 30)
+        self.assertEqual((swap["state"], swap["note"]), ("arriving", "New driver"))
+        self.assertEqual(self.rc.plate_key("دبي ١٢٣٤٥"), self.rc.plate_key("دبي 12345"))
+
+    def test_no_location_never_shows_arrived(self):
+        t = trip(A, "ArrivingAtPickup", eta="0 mins", north_m=0)
+        t["vehicle"]["location"] = None
+        self.assertEqual(self.rc.from_live(t, None, "abdullah", "abdullah", 0)["state"], "arriving")
+        t = trip(A, "ArrivingAtPickup", eta="0 mins", north_m=0)
+        t["stops"][0]["location"] = None
+        self.assertEqual(self.rc.from_live(t, None, "abdullah", "abdullah", 0)["state"], "arriving")
+        t = trip(A, "ArrivingAtPickup", eta="0 mins", north_m=0)
+        t["vehicle"]["location"] = {"latitude": 0, "longitude": 0}
+        self.assertIsNone(self.rc.pickup_distance(t))
+
+    def test_distance_reads_both_coordinate_shapes(self):
+        t = trip(A, "ArrivingAtPickup", north_m=250)
+        self.assertEqual(self.rc.pickup_distance(t), 250)
+        t["vehicle"]["location"] = {"lat": PIN[0], "lng": PIN[1] + 0.001}
+        self.assertAlmostEqual(self.rc.pickup_distance(t), 101, delta=2)
+
+    def test_sample_states_follow_real_uber_order(self):
+        got = [(n, c["state"]) for n, c in self.rc.sample_states()][:6]
+        self.assertEqual(got, [("Searching", "searching"), ("Accepted", "assigned"), ("WaitingForPickup", "arriving"),
+                               ("Nearby", "arriving"), ("AtPickup", "arrived"), ("OnTrip", "ontrip")])
 
 
 class RecipientTest(Base):
