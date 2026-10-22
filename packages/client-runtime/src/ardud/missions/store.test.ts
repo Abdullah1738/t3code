@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   connectionLabel,
@@ -19,7 +19,7 @@ describe("snapshot store", () => {
           closed += 1;
         };
       },
-      () => clock,
+      { now: () => clock },
     );
     let changes = 0;
     const stop = store.subscribe(() => {
@@ -59,6 +59,64 @@ describe("snapshot store", () => {
     expect(closed).toBe(1);
     stop();
     expect(closed).toBe(1);
+  });
+
+  it("keeps the source open for the keep-alive after the last reader leaves", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const opened: Array<(value: number) => void> = [];
+      let closed = 0;
+      const store = createSnapshotStore<number>(
+        (emit) => {
+          opened.push(emit);
+          return () => {
+            closed += 1;
+          };
+        },
+        { keepAliveMs: 1000 },
+      );
+      const first = store.subscribe(() => {});
+      opened[0]?.(1);
+      first();
+      expect(closed).toBe(0);
+      // Back within the keep-alive: same subscription, value already there.
+      vi.advanceTimersByTime(999);
+      const second = store.subscribe(() => {});
+      expect(opened).toHaveLength(1);
+      expect(store.get()).toBe(1);
+      second();
+      vi.advanceTimersByTime(1000);
+      expect(closed).toBe(1);
+      // Past it the next reader opens again and sees the last value meanwhile.
+      const third = store.subscribe(() => {});
+      expect(opened).toHaveLength(2);
+      expect(store.get()).toBe(1);
+      third();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a feed that fails while kept open starts fresh for the next reader", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const opened: Array<(error: unknown) => void> = [];
+      const store = createSnapshotStore<number>(
+        (_emit, fail) => {
+          opened.push(fail);
+          return () => {};
+        },
+        { keepAliveMs: 1000 },
+      );
+      store.subscribe(() => {})();
+      opened[0]?.("dropped");
+      expect(store.failure()).toBeUndefined();
+      const again = store.subscribe(() => {});
+      expect(opened).toHaveLength(2);
+      again();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("says what failed and when it last loaded, with the day once it is not today", () => {
