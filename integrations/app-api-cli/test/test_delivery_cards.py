@@ -227,6 +227,15 @@ class CardTests(unittest.TestCase):
         cfg={**self.cfg,'eta':(dt.datetime.now(dt.timezone.utc)+dt.timedelta(days=12)).isoformat()}
         self.assertGreaterEqual(c.share_days(cfg),14)
 
+    def test_recovery_without_cart_keeps_registered_item_metadata(self):
+        cfg={**self.cfg,'delivery_card':{'held':True}}
+        t.write(t.ROOT/'orders/order-talabat-123.json',cfg)
+        t.write(t.WATCHERS/cfg['watcher']/'watcher.json',{'id':'existing'})
+        with contextlib.redirect_stdout(io.StringIO()):
+            t.main(['add','--app','talabat','--order','123','--for','moni','--card-items-json','[]'])
+        saved=t.read(t.ROOT/'orders/order-talabat-123.json')
+        self.assertEqual(saved['card_meta']['items'],cfg['card_meta']['items'])
+
 
 if __name__ == '__main__':
     unittest.main()

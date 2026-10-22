@@ -986,7 +986,9 @@ def main(argv=None, _locked=False):
             if args.items_file or args.card_items_json:
                 source = json.loads(Path(args.items_file).read_text() if args.items_file else args.card_items_json)
                 source = {'items': source} if isinstance(source, list) else source
-                metadata['items'] = delivery_cards.items(source.get('items'))
+                incoming_items = delivery_cards.items(source.get('items'))
+                if incoming_items or not metadata.get('items'):
+                    metadata['items'] = incoming_items
                 for field in ('store', 'currency', 'total'):
                     if source.get(field):
                         metadata[field] = delivery_cards.text(source[field])
