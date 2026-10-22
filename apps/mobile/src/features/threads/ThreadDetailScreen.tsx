@@ -335,7 +335,8 @@ function useStreamingHaptics(threadId: ThreadId, feed: ReadonlyArray<ThreadFeedE
   }, [threadId, feed]);
 }
 
-const QUIET_RECONNECT_STATUS_DELAY_MS = 2_000;
+const QUIET_PROGRESS_STATUS_DELAY_MS = 2_000;
+const SYNCING_MESSAGES_LABEL = "Syncing messages...";
 const USAGE_LIMITS_PANEL_GAP = 12;
 const USAGE_LIMITS_PANEL_MIN_HEIGHT = 44;
 
@@ -523,36 +524,37 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
     environmentLabel: props.environmentLabel,
     onReconnect: props.onReconnectEnvironment,
   });
-  // A reconnect with no failure yet, typically the socket replaced after an app resume, usually
-  // finishes in a second or two while the cached thread stays readable, so it only shows if it
-  // lasts. Failures and offline show at once.
+  const threadCatchingUp =
+    props.threadSyncStatus === "empty" ||
+    props.threadSyncStatus === "cached" ||
+    props.threadSyncStatus === "synchronizing";
+  // A reconnect with no failure yet, typically the socket replaced after an app resume, and the
+  // catch-up that follows usually finish in a second or two while the thread on screen stays
+  // readable, so together they only show if they last. Both feed one delayed status so the window
+  // runs from the start of the reconnect, not from the moment the socket is back. Failures and
+  // offline show at once.
   const quietReconnectLabel =
     liveConnectionStatus?.kind === "connection" &&
     liveConnectionStatus.tone === "reconnecting" &&
     props.connectionError === null
       ? liveConnectionStatus.label
       : null;
-  const shownQuietReconnectLabel = useDelayedStatus(
+  const readySyncLabel =
+    threadCatchingUp && contentPresentationKind === "ready" ? SYNCING_MESSAGES_LABEL : null;
+  const shownQuietProgressLabel = useDelayedStatus(
     selectedThreadKey,
-    quietReconnectLabel,
-    QUIET_RECONNECT_STATUS_DELAY_MS,
+    quietReconnectLabel ?? readySyncLabel,
+    QUIET_PROGRESS_STATUS_DELAY_MS,
   );
   const connectionStatus =
-    quietReconnectLabel !== null && shownQuietReconnectLabel === null ? null : liveConnectionStatus;
-  const realThreadSyncLabel = (() => {
-    switch (props.threadSyncStatus) {
-      case "empty":
-      case "cached":
-      case "synchronizing":
-        if (contentPresentationKind === "ready") {
-          return quietReconnectLabel === null ? "Syncing messages..." : null;
-        }
-        return contentPresentationKind === "loading" ? "Loading messages..." : null;
-      default:
-        return null;
-    }
-  })();
-  const threadSyncLabel = useDelayedStatus(selectedThreadKey, realThreadSyncLabel);
+    quietReconnectLabel !== null && shownQuietProgressLabel === null ? null : liveConnectionStatus;
+  const loadingSyncLabel = useDelayedStatus(
+    selectedThreadKey,
+    threadCatchingUp && contentPresentationKind === "loading" ? "Loading messages..." : null,
+  );
+  const threadSyncLabel =
+    loadingSyncLabel ??
+    (shownQuietProgressLabel === SYNCING_MESSAGES_LABEL ? SYNCING_MESSAGES_LABEL : null);
   const pendingBackgroundWork = presentPendingBackgroundWork(
     props.selectedThread.pendingBackgroundTasks,
   );
