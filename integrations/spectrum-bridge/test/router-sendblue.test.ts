@@ -118,12 +118,12 @@ test("group batches name each sender, and guests carry their address", async () 
   const start = Date.parse("2026-10-21T12:00:00Z");
   setSystemTime(start);
   const h = setup(context("group"), { quietMs: 0 });
-  h.input("m1", "book a table", "+971585933213");
-  h.input("g1", "and me too", "+447700900123");
+  h.input("m1", "robob book a table", "+971585933213");
+  h.input("g1", "and me too robob", "+447700900123");
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(1);
-  expect(h.backend.prompts[0]!.text).toContain("Moni: book a table");
-  expect(h.backend.prompts[0]!.text).toContain("Tom (+447700900123): and me too");
+  expect(h.backend.prompts[0]!.text).toContain("Moni: robob book a table");
+  expect(h.backend.prompts[0]!.text).toContain("Tom (+447700900123): and me too robob");
   setSystemTime(start);
 });
 
@@ -145,7 +145,9 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   const guest = sendblueContextPrompt(context("group"), false, ["+447700900123"]);
   expect(guest).toContain("Tom (guest)");
   expect(guest).toContain("ask-owner");
-  expect(guest).toContain("less permissive");
+  expect(guest).toContain("silent observer");
+  expect(guest).toContain("send no tapback");
+  expect(guest).not.toContain("A tapback (`react --kind like` or an emoji) plus NO_REPLY is a complete answer");
   expect(guest).toContain("NO_REPLY");
   expect(guest).not.toContain("send --to");
   const owner = sendblueContextPrompt(context("owner"), false, []);
@@ -358,7 +360,7 @@ test("a follow-up from Moni mid-turn is steered with its own 👀, typing stays 
 test("groups and bridge wakes never show typing", async () => {
   setSystemTime(Date.parse("2026-10-21T12:00:00Z"));
   const g = live(context("group"));
-  g.input("a", "hey all", "+447700900123");
+  g.input("a", "hey robob, what's the plan", "+447700900123");
   await g.router.tick();
   await g.router.tick();
   expect(g.hints.filter(hint => hint === "start")).toEqual([]);
@@ -388,4 +390,88 @@ test("location guidance points at the Sendblue commands, never Find My, and only
   expect(moni).toContain("location-request --session CURRENT_SESSION_ID --key UNIQUE_KEY`, say you've asked");
   expect(moni).not.toContain("--chat");
   expect(group).toContain("Location: not available in groups");
+});
+
+test("groups: a message nobody addressed to Robob never wakes him, gets no 👀, and rides along later as context", async () => {
+  const start = Date.parse("2026-10-22T09:00:00Z");
+  setSystemTime(start);
+  const ctx = context("group");
+  const h = setup(ctx, { quietMs: 0 });
+  h.input("a", "Na middle is awful babe", "+971585933213");
+  h.input("b", "Laughed at \u201cShe's in the group ya numpty\u201d", "+447700900123");
+  h.input("c", "Thanks Robob!", "+447700900123");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(0);
+  expect(ctx.reacted).toEqual([]);
+  expect(h.store.pendingInbound()).toEqual([]);
+  h.input("d", "Robob can you check the weather in Duisburg tomorrow?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!.text;
+  expect(prompt).toContain("not addressed to you. Context only");
+  expect(prompt).toContain(JSON.stringify("Moni: Na middle is awful babe"));
+  expect(prompt).toContain("Tom (+447700900123): Thanks Robob!");
+  expect(prompt.endsWith("Moni: Robob can you check the weather in Duisburg tomorrow?")).toBe(true);
+  expect(ctx.reacted).toEqual([["d", "👀"]]);
+  expect(h.store.get<string[]>("group-observed")).toEqual([]);
+  setSystemTime(start);
+});
+
+test("groups: a swipe reply to Robob's message wakes him; a reply to someone else does not", async () => {
+  const start = Date.parse("2026-10-22T09:10:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0 });
+  h.store.enqueue({ id: "reply:1:x", kind: "conversation", text: "Gate is B30", sessionId: "ses_0", generation: 1 });
+  h.store.outboxState("reply:1:x", "sent", "robob-msg");
+  h.input("a", "is that the final one?", "+447700900123", { replyTo: "someone-else" });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(0);
+  h.input("b", "is that the final one?", "+447700900123", { replyTo: "robob-msg" });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  setSystemTime(start);
+});
+
+test("groups: the person Robob just asked something may answer unnamed; others stay observed", async () => {
+  const start = Date.parse("2026-10-22T09:20:00Z");
+  setSystemTime(start);
+  const ctx = context("group");
+  const h = setup(ctx, { quietMs: 0 });
+  h.store.set("group-engaged:+971585933213", start - 60_000);
+  h.store.set("group-engaged:+447700900123", start - 10 * 60_000);
+  h.input("a", "also add a gem kit", "+971585933213");
+  h.input("b", "lol nice", "+447700900123");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.text).toContain("Moni: also add a gem kit");
+  // Tom's line was not for Robob: it is quoted as context only, never as part of what woke him.
+  expect(h.backend.prompts[0]!.text).toContain(JSON.stringify("Tom (+447700900123): lol nice"));
+  expect(h.backend.prompts[0]!.text.endsWith("Moni: also add a gem kit")).toBe(true);
+  // Woken only as a follow-up, so no 👀.
+  expect(ctx.reacted).toEqual([]);
+  setSystemTime(start);
+});
+
+test("groups: watcher wakes and owner relays are never gated", async () => {
+  const start = Date.parse("2026-10-22T09:30:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0 });
+  h.store.acceptInbound("wake:abc", { id: "wake:abc", text: "[Watcher event from flights] EK57 gate B30", attachments: [], isAudioMessage: false, receivedAt: start });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  setSystemTime(start);
+});
+
+test("direct chats are never gated", async () => {
+  const start = Date.parse("2026-10-22T09:40:00Z");
+  setSystemTime(start);
+  const ctx = context("dm");
+  const h = setup(ctx, { quietMs: 0 });
+  h.input("a", "lol ok", DM_KEY);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.text).not.toContain("Context only");
+  expect(ctx.reacted).toEqual([["a", "👀"]]);
+  setSystemTime(start);
 });
