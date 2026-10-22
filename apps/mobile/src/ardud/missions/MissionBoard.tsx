@@ -547,6 +547,7 @@ const CLOSED_SHOWN = 5;
 /** Threads crw runs for the mission's PRs; they live here, not in the thread list. */
 function ReviewThreads(props: PageProps) {
   const groups = attachedThreadGroups(props.overview.attachedThreads);
+  const actions = useOverviewActions(props.overview);
   const [all, setAll] = useState(false);
   if (groups.open.length === 0 && groups.closed.length === 0) return null;
   const rows = [...groups.open, ...(all ? groups.closed : groups.closed.slice(0, CLOSED_SHOWN))];
@@ -567,6 +568,12 @@ function ReviewThreads(props: PageProps) {
               <Text className="min-w-0 flex-1 text-[15px] font-t3-medium" numberOfLines={1}>
                 {row.title}
               </Text>
+              <LinkButton
+                label="Detach"
+                accessibilityLabel={`Detach ${row.title}`}
+                disabled={actions.pending}
+                onPress={() => actions.detachThread(row.threadId, row.title)}
+              />
             </Row>
           </Fragment>
         ))}

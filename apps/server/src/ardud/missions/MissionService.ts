@@ -33,6 +33,7 @@ import {
   type SetMissionFocusInput,
   type SetMissionStatusInput,
   type SetPortfolioOrderInput,
+  type SetThreadAttachmentInput,
   type SetSubMissionStatusInput,
   type SplitLaneInput,
   type UpdateMissionInput,
@@ -232,6 +233,8 @@ export class MissionService extends Context.Service<
     // ardud missions: crw-threads
     /** A component (crw) keeps a thread it runs inside the mission, or moves it on. */
     readonly attachThread: Write<AttachThreadInput>;
+    /** The owner or the mission's master detaches, closes or reopens one of its attached threads. */
+    readonly setThreadAttachment: Write<SetThreadAttachmentInput>;
     /**
      * The owner decides any pending approval; the master those routed to it,
      * or any on a verified owner condition (`onOwnerCondition`).

@@ -1,4 +1,4 @@
-import type { CallId, MissionOverview, SubMissionId } from "@t3tools/contracts";
+import type { CallId, MissionOverview, SubMissionId, ThreadId } from "@t3tools/contracts";
 import { moveSubMissionInput } from "@t3tools/client-runtime/ardud/missions/mobile";
 
 import { missionsSource } from "./missionsStore";
@@ -13,6 +13,8 @@ export interface OverviewActions {
   readonly react: (callId: CallId, reaction: "ok" | "discuss") => void;
   readonly markSeen: () => void;
   readonly move: (subMissionId: SubMissionId, direction: "up" | "down") => void;
+  /** Sends a wrong attachment from Reviews back to the ordinary thread list. */
+  readonly detachThread: (threadId: ThreadId, title: string) => void;
 }
 
 export function useOverviewActions(overview: MissionOverview | null | undefined): OverviewActions {
@@ -64,6 +66,20 @@ export function useOverviewActions(overview: MissionOverview | null | undefined)
       const input = moveSubMissionInput(overview, subMissionId, direction);
       if (!input) return;
       run("Could not reorder sub-missions", () => missionsSource().reorderSubMissions(input));
+    },
+    detachThread: (threadId, title) => {
+      if (!overview) return;
+      const missionId = overview.mission.id;
+      confirmAction({
+        title: `Detach ${title}?`,
+        message:
+          "It goes back to your thread list. The component that attached it can attach it again.",
+        confirmLabel: "Detach",
+        onConfirm: () =>
+          run("Could not detach the thread", () =>
+            missionsSource().setThreadAttachment({ missionId, threadId, state: "detached" }),
+          ),
+      });
     },
   };
 }

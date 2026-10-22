@@ -37,6 +37,7 @@ import {
   SetApprovalRoutingInput,
   SetMissionFocusInput,
   SetMissionStatusInput,
+  SetThreadAttachmentInput,
   SplitLaneInput,
   SubMissionId,
   ThreadId,
@@ -564,6 +565,13 @@ const MissionApprovalRoutingTool = missionWriteTool(
   SetApprovalRoutingInput,
 );
 
+// ardud missions: r22 fixes
+const MissionThreadAttachmentTool = missionWriteTool(
+  "mission_thread_attachment",
+  "As the mission's master, move one of its attached threads (the Reviews group, e.g. crw's PR reviews): detached sends a wrong one back to the ordinary thread list, closed settles it, open brings it back. The component that attached it can attach it again.",
+  SetThreadAttachmentInput,
+);
+
 const ruleDependencies = [...planDependencies, RuleService.RuleService];
 
 const MissionRuleTool = Tool.make("mission_rule", {
@@ -716,6 +724,7 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionApprovalRouteTool, "Route one approval"),
   writeTool(MissionApprovalAnnotateTool, "Annotate an approval"),
   writeTool(MissionApprovalRoutingTool, "Set approval routing"),
+  writeTool(MissionThreadAttachmentTool, "Detach, close or reopen an attached thread"),
   writeTool(MissionRuleTool, "Write, edit or retire a rule"),
   writeTool(MissionRuleUseTool, "Record a rule applied or broken"),
   writeTool(MissionRuleAckTool, "Acknowledge a rule"),

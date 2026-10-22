@@ -134,6 +134,8 @@ export const makeMissionWsHandlers = (
     [WS_METHODS.missionsNudgeLane]: asOwner((by, input: NudgeLaneInput) =>
       nudgeLane({ store, router }, by, input),
     ),
+    // ardud missions: r22 fixes
+    [WS_METHODS.missionsSetThreadAttachment]: asOwner(missions.setThreadAttachment),
   } as const;
 };
 

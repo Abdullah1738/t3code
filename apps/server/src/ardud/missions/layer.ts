@@ -3,6 +3,7 @@ import * as Layer from "effect/Layer";
 import * as AsksService from "./asks/AsksService.ts";
 import { missionsDeskRouteLayer } from "./asks/http.ts";
 import { asksWiringLayer } from "./asks/wiring.ts";
+import { AttachTargetsLive } from "./core/attachTargets.ts";
 import * as MasterControls from "./core/MasterControls.ts";
 import { MissionOwnerNameLive } from "./core/ownerName.ts";
 import * as RuleService from "./core/RuleService.ts";
@@ -35,7 +36,10 @@ const MissionTracksLive = Layer.mergeAll(
   // policy builds the same AsksService layer, so it needs the same router ports
   PolicyLive.pipe(Layer.provide(RouterAsksPortsLive)),
   RouterLive,
-).pipe(Layer.provideMerge(OwnerConditionsLive)); // ardud missions: router (discuss)
+).pipe(
+  Layer.provideMerge(OwnerConditionsLive), // ardud missions: router (discuss)
+  Layer.provide(AttachTargetsLive), // ardud missions: r22 fixes (attach checks thread origins)
+);
 
 /**
  * Services built on the tracks: rules, the scribe registered as editor, and

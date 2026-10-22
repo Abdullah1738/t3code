@@ -1,9 +1,11 @@
 import {
+  isOwnerProvenance,
   MissionError,
   type AttachThreadInput,
   type MissionEventKind,
   type MissionProvenance,
   type MissionRecordRef,
+  type SetThreadAttachmentInput,
   type ThreadAttachment,
   type ThreadAttachmentState,
 } from "@t3tools/contracts";
@@ -11,7 +13,9 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import type { AttachTargets } from "./attachTargets.ts";
 import type { WriteKit } from "./kit.ts";
+import { isMasterOf } from "./master.ts";
 
 const fail = (code: MissionError["code"], detail: string) =>
   Effect.fail(new MissionError({ code, detail }));
@@ -39,10 +43,36 @@ const VERB: Record<ThreadAttachmentState, string> = {
 /**
  * A component (crw) keeps the threads it runs for the mission inside it.
  * Attachments carry no authority: role holders and lanes stay the only
- * threads that act for the mission.
+ * threads that act for the mission. The owner and the mission's master can
+ * move any attachment on, including detaching one that should not be there.
  */
-export const makeAttachmentWrites = (kit: WriteKit) => {
+export const makeAttachmentWrites = (kit: WriteKit, targets: AttachTargets["Service"]) => {
   const { store, serial, loadMission, unchanged, commit } = kit;
+
+  /** A role holder or lane acts for a mission; hiding it as someone's review would bury it. */
+  const requireNotActing = Effect.fn("MissionAttachments.requireNotActing")(function* (
+    threadId: ThreadAttachment["threadId"],
+  ) {
+    const acting = yield* store.missionsOfThread(threadId);
+    if (acting.length > 0) {
+      return yield* fail(
+        "conflict",
+        `Thread ${threadId} acts for mission ${acting.join(", ")}; it is not attachable.`,
+      );
+    }
+  });
+
+  /** Only a thread the component itself created comes in; `attachedBy` alone proves nothing. */
+  const requireCreatedBy = Effect.fn("MissionAttachments.requireCreatedBy")(function* (
+    threadId: ThreadAttachment["threadId"],
+    component: string,
+  ) {
+    const target = yield* targets.lookup(threadId);
+    if (target === null) return yield* fail("not-found", `No thread ${threadId}.`);
+    if (target.origin !== component) {
+      return yield* fail("forbidden", `Thread ${threadId} was not created by ${component}.`);
+    }
+  });
 
   const attachThread = (provenance: MissionProvenance, input: AttachThreadInput) =>
     serial(
@@ -66,13 +96,14 @@ export const makeAttachmentWrites = (kit: WriteKit) => {
             `Thread ${input.threadId} belongs to mission ${before.missionId}; detach it there first.`,
           );
         }
-        // A role holder or lane acts for a mission; hiding it as someone's review would bury it.
-        const acting = state === "open" ? yield* store.missionsOfThread(input.threadId) : [];
-        if (acting.length > 0) {
-          return yield* fail(
-            "conflict",
-            `Thread ${input.threadId} acts for mission ${acting.join(", ")}; it is not attachable.`,
-          );
+        const inMission = before !== null && before.missionId === mission.id;
+        // A detach by the owner or master sticks when the PR later settles; a fresh open reattaches.
+        if (inMission && before.state === "detached" && state !== "open") {
+          return yield* unchanged(mission.id, attachmentRef(before));
+        }
+        if (state === "open") yield* requireNotActing(input.threadId);
+        if (!inMission || before.state === "detached") {
+          yield* requireCreatedBy(input.threadId, provenance.component);
         }
         const pullRequest =
           input.pullRequest === undefined ? (before?.pullRequest ?? null) : input.pullRequest;
@@ -107,7 +138,50 @@ export const makeAttachmentWrites = (kit: WriteKit) => {
       }),
     );
 
-  return { attachThread };
+  const setThreadAttachment = (provenance: MissionProvenance, input: SetThreadAttachmentInput) =>
+    serial(
+      Effect.gen(function* () {
+        if (
+          !isOwnerProvenance(provenance) &&
+          !(yield* isMasterOf(store, input.missionId, provenance))
+        ) {
+          return yield* fail(
+            "forbidden",
+            `Only the owner or mission ${input.missionId}'s master moves its attached threads.`,
+          );
+        }
+        const mission = yield* loadMission(input.missionId);
+        const before = Option.getOrNull(yield* store.get("thread-attachment", input.threadId));
+        if (before === null || before.missionId !== mission.id) {
+          return yield* fail(
+            "not-found",
+            `Thread ${input.threadId} is not attached to mission ${mission.id}.`,
+          );
+        }
+        if (before.state === input.state)
+          return yield* unchanged(mission.id, attachmentRef(before));
+        if (input.state === "open") yield* requireNotActing(input.threadId);
+        const record: ThreadAttachment = {
+          ...before,
+          state: input.state,
+          updatedAt: yield* nowIso,
+        };
+        return yield* commit(provenance, {
+          missionId: mission.id,
+          kind: EVENT[input.state],
+          summary: `${VERB[input.state]} ${record.title}`,
+          ref: attachmentRef(record),
+          upserts: [{ _tag: "thread-attachment", record }],
+          payload: {
+            state: input.state,
+            attachedBy: record.attachedBy,
+            pullRequest: record.pullRequest,
+          },
+        });
+      }),
+    );
+
+  return { attachThread, setThreadAttachment };
 };
 
 const samePullRequest = (a: ThreadAttachment["pullRequest"], b: ThreadAttachment["pullRequest"]) =>

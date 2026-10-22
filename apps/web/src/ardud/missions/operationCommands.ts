@@ -11,6 +11,8 @@ import type {
   RuleChangeRequestId,
   RuleScope,
   SubMissionId,
+  ThreadAttachmentState,
+  ThreadId,
 } from "@t3tools/contracts";
 import {
   editRuleInput,
@@ -35,6 +37,7 @@ import {
   type RerouteRecordInput,
 } from "@t3tools/client-runtime/ardud/missions";
 
+import { toastManager } from "../../components/ui/toast";
 import { runMissionAction, submitMissionInput } from "./missionActions";
 import { missionsSource } from "./missionsStore";
 
@@ -224,4 +227,31 @@ export function rerouteRecord(
     (input) => missionsSource.rerouteRecord(input),
     "Couldn't move it",
   );
+}
+
+/**
+ * Sends a wrong attachment back to the ordinary thread list. The toast puts it
+ * back the way it was; the component that attached it can also attach it again.
+ */
+export async function detachThread(
+  missionId: MissionId,
+  thread: { readonly threadId: ThreadId; readonly title: string },
+  restore: Exclude<ThreadAttachmentState, "detached">,
+) {
+  const move = (state: ThreadAttachmentState) =>
+    missionsSource.setThreadAttachment({ missionId, threadId: thread.threadId, state });
+  const done = await runMissionAction(move("detached"), "Couldn't detach the thread");
+  if (!done) return false;
+  const id = toastManager.add({
+    type: "info",
+    title: `Detached ${thread.title}`,
+    actionProps: {
+      children: "Undo",
+      onClick: () => {
+        toastManager.close(id);
+        void runMissionAction(move(restore), "Couldn't put the thread back");
+      },
+    },
+  });
+  return true;
 }

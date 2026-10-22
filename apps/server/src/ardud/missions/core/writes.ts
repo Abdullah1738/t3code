@@ -40,6 +40,7 @@ import { makeApprovalWrites } from "./approvals.ts";
 import { makeAttachmentWrites } from "./attachments.ts";
 import { makeCallWrites } from "./calls.ts";
 import { makePortfolioWrites } from "./portfolio.ts";
+import { attachTargets } from "./attachTargets.ts";
 import { ownerConditions } from "./conditions.ts";
 import type { WriteKit } from "./kit.ts";
 import { actorOf } from "./provenance.ts";
@@ -100,6 +101,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
   Effect.gen(function* () {
     const writeLock = yield* Semaphore.make(1);
     const conditions = yield* ownerConditions;
+    const targets = yield* attachTargets;
     const serial = <A>(effect: Effect.Effect<A, MissionError>) => writeLock.withPermit(effect);
 
     const need = <A>(
@@ -659,7 +661,7 @@ export const makeWrites = (store: MissionStore.MissionStore["Service"]) =>
       ...makeCallWrites(kit),
       ...makePortfolioWrites(kit),
       // ardud missions: crw-threads
-      ...makeAttachmentWrites(kit),
+      ...makeAttachmentWrites(kit, targets),
     };
   });
 

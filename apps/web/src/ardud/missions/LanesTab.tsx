@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 
-import type { Lane, SubMission, SubMissionId, ThreadId } from "@t3tools/contracts";
+import type { Lane, MissionId, SubMission, SubMissionId, ThreadId } from "@t3tools/contracts";
 import {
   ageView,
   attachedThreadGroups,
@@ -34,6 +34,7 @@ import {
   useMissionWorkFeed,
 } from "./missionsStore";
 import {
+  detachThread,
   handOffLane,
   mergeLanes,
   moveLane,
@@ -127,14 +128,18 @@ const CLOSED_SHOWN = 5;
 /** Threads crw runs for the mission's PRs; they live here, not in the thread list. */
 function ReviewsSection(props: { overview: MissionOverviewSnapshot }) {
   const groups = attachedThreadGroups(props.overview.attachedThreads);
+  const missionId = props.overview.mission.id;
   const [all, setAll] = useState(false);
   if (groups.open.length === 0 && groups.closed.length === 0) return null;
   const closed = all ? groups.closed : groups.closed.slice(0, CLOSED_SHOWN);
   return (
     <MissionSection title="Reviews" caption={groups.open.length}>
       <ul className="flex flex-col">
-        {[...groups.open, ...closed].map((row) => (
-          <ReviewThreadItem key={row.threadId} row={row} />
+        {groups.open.map((row) => (
+          <ReviewThreadItem key={row.threadId} missionId={missionId} row={row} state="open" />
+        ))}
+        {closed.map((row) => (
+          <ReviewThreadItem key={row.threadId} missionId={missionId} row={row} state="closed" />
         ))}
       </ul>
       {all ? null : (
@@ -144,14 +149,19 @@ function ReviewsSection(props: { overview: MissionOverviewSnapshot }) {
   );
 }
 
-function ReviewThreadItem(props: { row: AttachedThreadRow }) {
+function ReviewThreadItem(props: {
+  missionId: MissionId;
+  row: AttachedThreadRow;
+  state: "open" | "closed";
+}) {
   const environmentId = usePrimaryEnvironmentId();
+  const [pending, setPending] = useState(false);
   const { row } = props;
   const body = <span className="truncate font-medium">{row.title}</span>;
   const rowClass =
-    "flex min-w-0 items-baseline justify-between gap-3.5 rounded-xl px-1 py-2.75 text-sm";
+    "flex min-w-0 flex-1 items-baseline justify-between gap-3.5 rounded-xl px-1 py-2.75 text-sm";
   return (
-    <li className={DESK_ROW}>
+    <li className={cn(DESK_ROW, "flex items-center gap-2")}>
       {environmentId ? (
         <Link
           to="/$environmentId/$threadId"
@@ -166,6 +176,19 @@ function ReviewThreadItem(props: { row: AttachedThreadRow }) {
       ) : (
         <span className={rowClass}>{body}</span>
       )}
+      <Button
+        size="xs"
+        variant="ghost-muted"
+        disabled={pending}
+        aria-label={`Detach ${row.title}`}
+        onClick={async () => {
+          setPending(true);
+          await detachThread(props.missionId, row, props.state);
+          setPending(false);
+        }}
+      >
+        Detach
+      </Button>
     </li>
   );
 }

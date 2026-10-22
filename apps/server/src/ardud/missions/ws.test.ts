@@ -4,6 +4,7 @@ import {
   CLIENT_GUARDED_RPC_SCOPES,
   MissionId,
   MissionError,
+  ThreadId,
   WS_METHODS,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
@@ -31,9 +32,12 @@ import * as MissionStore from "./store/MissionStore.ts";
 import type { PolicyService } from "./policy/PolicyService.ts";
 import { makeMissionWsHandlers, measuredUsage, missionWsHandlers } from "./ws.ts";
 
+const reviewThread = ThreadId.make("t-review-ws");
+const testHarness = harness();
+testHarness.threadOrigins.set(reviewThread, "crw");
 const TestLayer = RuleService.layer.pipe(
   Layer.provideMerge(routerOverFakes(fakeRouterThreads())),
-  Layer.provideMerge(harness().layer),
+  Layer.provideMerge(testHarness.layer),
 );
 
 const paired = {
@@ -187,6 +191,20 @@ it.layer(TestLayer)("missions WS handlers", (it) => {
       const [nudge] = yield* missions.eventsSince(missionId, nudged.seq - 1);
       assert.equal(nudge?.kind, "lane.nudged");
       assert.deepStrictEqual(nudge?.actor, { _tag: "owner" });
+
+      // ardud missions: r22 fixes - the owner detaches a thread crw attached
+      yield* missions.attachThread(
+        { _tag: "system", component: "crw" },
+        { missionId, threadId: reviewThread, attachedBy: "crw", title: "acme/api#7" },
+      );
+      const detached = yield* app[WS_METHODS.missionsSetThreadAttachment]({
+        missionId,
+        threadId: reviewThread,
+        state: "detached",
+      });
+      const [detach] = yield* missions.eventsSince(missionId, detached.seq - 1);
+      assert.equal(detach?.kind, "thread.detached");
+      assert.deepStrictEqual(detach?.actor, { _tag: "owner" });
     }),
   );
 

@@ -86,7 +86,7 @@ const mcpClient = McpSchema.McpServerClient.of({
 });
 
 const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
-  const { layer } = harness(inbound);
+  const { layer, threadOrigins } = harness(inbound);
   // What the tools hand the secret service: the card and who answers it.
   const answered: Array<Parameters<SecretRequests.SecretRequests["Service"]["answer"]>> = [];
   const secrets = Layer.mock(SecretRequests.SecretRequests)({
@@ -108,6 +108,7 @@ const toolsLayer = (inbound: Parameters<typeof harness>[0] = []) => {
   return {
     answered,
     threads,
+    threadOrigins,
     layer: McpHttpServer.toolkitRegistration(MissionsToolkit, MissionsHandlers.layer).pipe(
       Layer.provideMerge(McpServer.McpServer.layer),
       Layer.provideMerge(liveThreadsLayer),
@@ -532,12 +533,19 @@ describe("mission MCP tools", () => {
   });
 
   it.effect("gives the master every plan control, each on the timeline as the master", () => {
-    const { layer } = toolsLayer();
+    const { layer, threadOrigins } = toolsLayer();
+    const reviewThread = ThreadId.make("t-review-7");
+    threadOrigins.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       const master = threadCaller(masterThread);
       const lane = threadCaller(laneThread);
       const store = yield* MissionStore.MissionStore;
+      const missions = yield* MissionService.MissionService;
+      yield* missions.attachThread(
+        { _tag: "system", component: "crw" },
+        { missionId, threadId: reviewThread, attachedBy: "crw", title: "acme/api#7" },
+      );
       const run = (name: string, args: Record<string, unknown>) =>
         Effect.map(call(name, master, args), (outcome) => {
           expect(outcome.isError, `${name}: ${outcome.text}`).toBe(false);
@@ -576,6 +584,11 @@ describe("mission MCP tools", () => {
         routes: [{ id: "all", match: { _tag: "approval" }, approver: "master" }],
         reason: "Owner handed merges to the master",
       });
+      yield* run("mission_thread_attachment", {
+        missionId,
+        threadId: reviewThread,
+        state: "detached",
+      });
       const rule = yield* run("mission_rule", {
         missionId,
         title: "Plain words",
@@ -600,6 +613,7 @@ describe("mission MCP tools", () => {
         "mission.paused",
         "mission.resumed",
         "approval-routing.updated",
+        "thread.detached",
         "rule.created",
         "rule.applied",
         "mission.archived",
@@ -620,6 +634,7 @@ describe("mission MCP tools", () => {
         ["mission_set_status", { missionId, status: "active" }],
         ["mission_sub_mission_reorder", { missionId, order: [] }],
         ["mission_approval_routing", { missionId, routes: [] }],
+        ["mission_thread_attachment", { missionId, threadId: reviewThread, state: "open" }],
         ["mission_rule", { missionId, title: "Mine", quote: "Lanes rule." }],
       ] as const) {
         const refused = yield* call(name, lane, args);

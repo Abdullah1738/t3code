@@ -26,6 +26,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import { AttachTargets } from "../core/attachTargets.ts";
 import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
@@ -193,11 +194,23 @@ export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
       find: (id) => Effect.succeed(inbound.find((message) => message.id === id) ?? null),
     }),
   );
+  // The threads that exist, by recorded origin; a test adds the ones it attaches.
+  const threadOrigins = new Map<ThreadId, string | null>();
+  const targets = Layer.succeed(
+    AttachTargets,
+    AttachTargets.of({
+      lookup: (threadId) =>
+        Effect.succeed(
+          threadOrigins.has(threadId) ? { origin: threadOrigins.get(threadId) ?? null } : null,
+        ),
+    }),
+  );
   const layer = Layer.mergeAll(AsksService.layer, MissionService.layer).pipe(
     Layer.provideMerge(
       Layer.mergeAll(
         MissionStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)),
         lookup,
+        targets,
         signalsLayer,
         rooms,
         Ports.applierRegistry,
@@ -205,7 +218,7 @@ export const harness = (inbound: ReadonlyArray<InboundMessage> = []) => {
       ),
     ),
   );
-  return { signals, posts, layer };
+  return { signals, posts, threadOrigins, layer };
 };
 
 export const seed = Effect.gen(function* () {

@@ -59,6 +59,7 @@ import type {
   SetMissionFocusInput,
   SetMissionStatusInput,
   SetPoolCapacityInput as ContractSetPoolCapacityInput,
+  SetThreadAttachmentInput,
   SetRoleModelInput,
   SplitLaneInput,
   SubMissionId,
@@ -727,6 +728,9 @@ export interface MissionsSource {
   moveLane(input: MoveLaneInput): Promise<void>;
   splitLane(input: SplitLaneInput): Promise<void>;
   mergeLanes(input: MergeLanesInput): Promise<void>;
+  // ardud missions: r22 fixes
+  /** Detaches, closes or reopens a thread a component attached (the Reviews group). */
+  setThreadAttachment(input: SetThreadAttachmentInput): Promise<void>;
 
   /** Applies on the role's next turn (`pendingModelSelection` until then). */
   setRoleModel(input: SetRoleModelInput): Promise<void>;

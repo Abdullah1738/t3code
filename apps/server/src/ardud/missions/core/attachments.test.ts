@@ -9,11 +9,15 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import {
+  agent,
   failureCode,
+  governor,
   harness,
   laneThread,
   masterThread,
   missionId,
+  otherMasterThread,
+  otherMissionId,
   ownerApp,
   seed,
   seedOther,
@@ -42,7 +46,8 @@ const listedThreads = Effect.gen(function* () {
 
 describe("thread attachments", () => {
   it.effect("an attached thread belongs to the mission until it is detached", () => {
-    const { layer } = harness();
+    const { layer, threadOrigins } = harness();
+    threadOrigins.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       const missions = yield* MissionService.MissionService;
@@ -85,13 +90,30 @@ describe("thread attachments", () => {
   });
 
   it.effect("only the component that runs a thread attaches it, in one mission at a time", () => {
-    const { layer } = harness();
+    const { layer, threadOrigins } = harness();
+    threadOrigins.set(reviewThread, "crw");
     return Effect.gen(function* () {
       yield* seed;
       yield* seedOther;
       const missions = yield* MissionService.MissionService;
 
       assert.equal(yield* failureCode(missions.attachThread(ownerApp, attach())), "forbidden");
+      // The thread must exist and its recorded origin must be crw; saying so is not enough.
+      const unknown = ThreadId.make("t-nowhere");
+      assert.equal(
+        yield* failureCode(missions.attachThread(crw, attach({ threadId: unknown }))),
+        "not-found",
+      );
+      for (const [threadId, origin] of [
+        [ThreadId.make("t-imessage"), "imessage"],
+        [ThreadId.make("t-typed"), null],
+      ] as const) {
+        threadOrigins.set(threadId, origin);
+        assert.equal(
+          yield* failureCode(missions.attachThread(crw, attach({ threadId }))),
+          "forbidden",
+        );
+      }
       assert.equal(
         yield* failureCode(missions.attachThread(crw, attach({ attachedBy: "governor" }))),
         "forbidden",
@@ -104,12 +126,11 @@ describe("thread attachments", () => {
       );
 
       yield* missions.attachThread(crw, attach());
-      const governor: MissionProvenance = { _tag: "system", component: "governor" };
       assert.equal(
         yield* failureCode(missions.attachThread(governor, attach({ attachedBy: "governor" }))),
         "forbidden",
       );
-      const elsewhere = attach({ missionId: MissionId.make("m-2") });
+      const elsewhere = attach({ missionId: otherMissionId });
       assert.equal(yield* failureCode(missions.attachThread(crw, elsewhere)), "conflict");
 
       // Detached, it may move.
@@ -130,11 +151,12 @@ describe("thread attachments", () => {
   it.effect(
     "old settled threads go back to the thread list together with the Reviews group",
     () => {
-      const { layer } = harness();
+      const { layer, threadOrigins } = harness();
+      const threads = Array.from({ length: 22 }, (_, index) => ThreadId.make(`t-pr-${index}`));
+      for (const threadId of threads) threadOrigins.set(threadId, "crw");
       return Effect.gen(function* () {
         yield* seed;
         const missions = yield* MissionService.MissionService;
-        const threads = Array.from({ length: 22 }, (_, index) => ThreadId.make(`t-pr-${index}`));
         for (const [index, threadId] of threads.entries()) {
           const pullRequest = { repository: "Equicom-Crypto/edge-api", number: index + 1 };
           yield* missions.attachThread(crw, attach({ threadId, pullRequest }));
@@ -156,4 +178,81 @@ describe("thread attachments", () => {
       }).pipe(Effect.provide(layer));
     },
   );
+
+  it.effect("the owner or the master detaches any attachment; crw can attach it again", () => {
+    const { layer, threadOrigins } = harness();
+    threadOrigins.set(reviewThread, "crw");
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* seedOther;
+      const missions = yield* MissionService.MissionService;
+      const store = yield* MissionStore.MissionStore;
+      const detach = { missionId, threadId: reviewThread, state: "detached" } as const;
+      const stateOf = Effect.map(
+        store.get("thread-attachment", reviewThread),
+        (found) => Option.getOrThrow(found).state,
+      );
+      yield* missions.attachThread(crw, attach());
+
+      // Components, lanes and other missions' masters do not move it.
+      for (const by of [
+        crw,
+        governor,
+        agent(laneThread),
+        agent(writerThread),
+        agent(otherMasterThread),
+      ]) {
+        assert.equal(yield* failureCode(missions.setThreadAttachment(by, detach)), "forbidden");
+      }
+      assert.equal(
+        yield* failureCode(
+          missions.setThreadAttachment(ownerApp, { ...detach, threadId: ThreadId.make("t-other") }),
+        ),
+        "not-found",
+      );
+      assert.equal(
+        yield* failureCode(
+          missions.setThreadAttachment(agent(otherMasterThread), {
+            ...detach,
+            missionId: otherMissionId,
+          }),
+        ),
+        "not-found",
+      );
+
+      const detached = yield* missions.setThreadAttachment(ownerApp, detach);
+      const [event] = yield* missions.eventsSince(missionId, detached.seq - 1);
+      assert.equal(event?.kind, "thread.detached");
+      assert.deepStrictEqual(event?.actor, { _tag: "owner" });
+      assert.notInclude(yield* listedThreads, reviewThread);
+      assert.deepStrictEqual((yield* missions.overview(missionId)).attachedThreads, []);
+      assert.equal((yield* missions.setThreadAttachment(ownerApp, detach)).seq, detached.seq);
+
+      // The PR merging later does not pull it back in; a fresh attach does.
+      const merged = yield* missions.attachThread(crw, attach({ state: "closed" }));
+      assert.equal(merged.seq, detached.seq);
+      assert.equal(yield* stateOf, "detached");
+      yield* missions.attachThread(crw, attach());
+      assert.equal(yield* stateOf, "open");
+      assert.include(yield* listedThreads, reviewThread);
+
+      // The master can do the same, and put it back.
+      const master = agent(masterThread);
+      yield* missions.setThreadAttachment(master, detach);
+      assert.equal(yield* stateOf, "detached");
+      yield* missions.setThreadAttachment(master, { ...detach, state: "open" });
+      assert.equal(yield* stateOf, "open");
+      yield* missions.setThreadAttachment(master, { ...detach, state: "closed" });
+      assert.equal(yield* stateOf, "closed");
+      const record = Option.getOrThrow(yield* store.get("thread-attachment", reviewThread));
+      assert.equal(record.attachedBy, "crw");
+      assert.deepStrictEqual(record.pullRequest, attach().pullRequest);
+
+      // Detached by the master, it can move to the mission it belongs to.
+      yield* missions.setThreadAttachment(master, detach);
+      yield* missions.attachThread(crw, attach({ missionId: otherMissionId }));
+      const moved = Option.getOrThrow(yield* store.get("thread-attachment", reviewThread));
+      assert.deepStrictEqual([moved.missionId, moved.state], [otherMissionId, "open"]);
+    }).pipe(Effect.provide(layer));
+  });
 });
