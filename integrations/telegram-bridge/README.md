@@ -68,14 +68,19 @@ API. Switch it on with `BRIDGE_BACKEND=robob` or `"backend": "robob"` in
 config.json (default `openchamber`). The token comes from
 `T3_CONTROL_URL`/`T3_CONTROL_TOKEN`, else the chmod 600 file named by
 `T3_CONTROL_TOKEN_FILE` (which must exist), else
-`~/.robob/components/telegram-bridge.json` (its own component credential),
-else the old shared `~/.robob/ardud-control.json`.
+`~/.robob/components/telegram-bridge.json` (its own component credential).
 
 - Events: one `GET /events` stream, resumed with `Last-Event-ID` across
   reconnects, decoded into the same notification events as before
   (`request.opened`/`resolved` to asked/resolved, `thread.status` to busy/idle,
   user `message.completed` to changed, runtime-mode changes to invalidate).
 - Requests: `GET /requests`, scoped to a directory by each thread's folder.
+  The route builds a full thread snapshot on the server, so an attention tick
+  shares one read across all folders and notice checks, plus a fresh read for
+  a notice newer than it. Folders with a pending request join the board's
+  folders. While the board shows no request and no notice is open, a sweep
+  reads it once a minute; opened requests also arrive as events. Button taps,
+  replies and the final send check read it live.
   Replies use the respond route.
 - Board: read from Robob's session board (`GET /api/ardud/board`, same
   bearer token) only to find directories with running or attention-needing

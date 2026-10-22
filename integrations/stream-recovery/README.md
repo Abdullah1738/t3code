@@ -100,8 +100,8 @@ also looks for those:
   threads are mission members. Those get no note here
   and no busy hold-back (mission recovery sends its own notice, master first,
   paced), but their held queue is still released. The summary adds one line per
-  mission. Without the credential the shared `~/.robob/ardud-control.json` is
-  used and Robob refuses the report (403); stream-recovery then only asks
+  mission. If the file named there belongs to another component, Robob refuses
+  the report (403); stream-recovery then only asks
   `GET .../members` which threads are members and leaves them alone (mission
   recovery still finds their cut turns through its own boot check and scans).
   If the route is unreachable the incident waits up to 3 scans, then everyone

@@ -302,3 +302,64 @@ test("when the missions read fails, a mission thread's permission request alerts
   await alerts.tick();
   expect(store.pendingOutbox().map(entry => entry.text).some(text => text.includes("GST lane needs your approval"))).toBe(true);
 });
+
+test("an attention tick reads pending requests once, however many folders are busy", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "a", title: "A", state: "running" });
+  control.add({ threadId: "b", title: "B", state: "running", worktreePath: "/repo/b" });
+  control.add({ threadId: "c", title: "Deploy", state: "needs-input", worktreePath: "/repo/c",
+    pending: [{ requestId: "perm-c", kind: "approval", requestKind: "command", title: "bash", prompt: "make deploy", canRespond: true }] });
+  const reads = () => control.calls.filter(call => call.path === "/requests").length;
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  expect(reads()).toBe(1);
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  expect(reads()).toBe(2);
+  const outbox = store.pendingOutbox();
+  expect(outbox.map(entry => entry.text)).toEqual([expect.stringContaining("Deploy needs your approval")]);
+  // The dispatch boundary still rechecks live, before and after its other reads.
+  expect(await alerts.beforeSend({ id: outbox[0]!.id })).toBe("send");
+  expect(reads()).toBe(4);
+});
+
+test("while nothing is pending, requests are read once a minute; an open notice reads every tick", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "a", title: "Build", state: "running" });
+  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a" });
+  const reads = () => control.calls.filter(call => call.path === "/requests").length;
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  expect(reads()).toBe(1);
+  for (const at of [5_000, 30_000, 55_000]) {
+    setSystemTime(now + at);
+    await alerts.tick();
+  }
+  expect(reads()).toBe(1);
+  // This board stand-in hides subagents, so with no event the minute sweep is what finds the request.
+  control.threads.get("sub")!.pending = [{ requestId: "perm-sub", kind: "approval", requestKind: "command", title: "bash", prompt: "ls", canRespond: true }];
+  setSystemTime(now + 61_000);
+  await alerts.tick();
+  expect(reads()).toBe(2);
+  expect(store.pendingSessionNotices()).toHaveLength(1);
+  setSystemTime(now + 81_000);
+  await alerts.tick();
+  expect(reads()).toBe(3);
+  expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("Subsession Helper in Build needs your approval")]);
+});
+
+test("a request in a folder the board does not list is still found, such as a subagent in its own worktree", async () => {
+  setSystemTime(now);
+  const control = fakeControl();
+  control.add({ threadId: "a", title: "Build", state: "running" });
+  control.add({ threadId: "sub", title: "Helper", state: "running", parentThreadId: "a", worktreePath: "/repo/child",
+    pending: [{ requestId: "perm-sub", kind: "approval", requestKind: "command", title: "bash", prompt: "ls", canRespond: true }] });
+  const { store, attention: alerts } = attention(control.backend);
+  await alerts.tick();
+  expect(store.pendingSessionNotices().map(notice => notice.directory)).toEqual(["/repo/child"]);
+  setSystemTime(now + 20_000);
+  await alerts.tick();
+  expect(store.pendingOutbox().map(entry => entry.text)).toEqual([expect.stringContaining("needs your approval")]);
+});

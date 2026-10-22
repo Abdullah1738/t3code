@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { chunk, eventText, redact, resolveEvent, sliceText, toEvent, trim } from '../lib/transcript.mjs';
 import { normalizeReply, parseJson } from '../lib/model.mjs';
@@ -247,6 +247,30 @@ test('a floor that drops every note still moves the cursor past the slice', asyn
     assert.equal(calls, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the scribe reads its own credential and ignores the retired shared file', () => {
+  const home = mkdtempSync(join(tmpdir(), 'scribe-home-'));
+  try {
+    mkdirSync(join(home, '.robob'));
+    writeFileSync(join(home, '.robob', 'ardud-control.json'), JSON.stringify({ url: 'http://127.0.0.1:9', token: 'shared' }));
+    const env = { ...process.env, HOME: home };
+    delete env.SCRIBE_CONTROL_FILE;
+    delete env.T3_CONTROL_TOKEN;
+    delete env.T3_CONTROL_URL;
+    const cli = join(dirname(fileURLToPath(import.meta.url)), '..', 'cli.mjs');
+    const result = spawnSync(process.execPath, [cli, 'run', '--mission', 'm-1'], { env, encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /no control token \(set T3_CONTROL_TOKEN or write .*components\/scribe\.json\)/);
+    mkdirSync(join(home, '.robob', 'components'));
+    writeFileSync(join(home, '.robob', 'components', 'scribe.json'), JSON.stringify({ url: 'http://127.0.0.1:9', token: 'own' }));
+    const server = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'server.mjs')).href;
+    const read = spawnSync(process.execPath, ['--input-type=module', '-e', `const { controlConfig } = await import(${JSON.stringify(server)}); console.log(JSON.stringify(controlConfig()));`], { env, encoding: 'utf8' });
+    assert.equal(read.status, 0, read.stderr);
+    assert.deepEqual(JSON.parse(read.stdout), { url: 'http://127.0.0.1:9', token: 'own' });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 

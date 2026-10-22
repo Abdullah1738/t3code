@@ -226,37 +226,35 @@ export function threadMessageIdsSince(db, threadId, sinceIso) {
 
 // ---------- Robob control API ----------
 
-// Robob's address and credential: T3_CONTROL_TOKEN_FILE, then the component
-// credential ~/.robob/components/stream-recovery.json (from `t3 ardud
-// component-token issue stream-recovery`), then the shared
-// ~/.robob/ardud-control.json. Mission recovery takes restart reports only from
-// the stream-recovery credential. Token files must be chmod 600.
+// Robob's address and credential: T3_CONTROL_URL/T3_CONTROL_TOKEN, else
+// T3_CONTROL_TOKEN_FILE, else the component credential
+// ~/.robob/components/stream-recovery.json (from `t3 ardud component-token
+// issue stream-recovery`). Mission recovery takes restart reports only from
+// that credential. Token files must be chmod 600.
 export function controlConfig(env = process.env, home = HOME) {
-  const own = join(home, ".robob/components/stream-recovery.json");
-  const shared = join(home, ".robob/ardud-control.json");
-  // A named file must exist; only the defaults are skipped when missing.
+  // A named file must exist; only the default is skipped when missing.
   const named = env.T3_CONTROL_TOKEN_FILE;
-  const files = named ? [named] : [own, shared];
+  const path = named || join(home, ".robob/components/stream-recovery.json");
   let file = {};
-  for (const path of env.T3_CONTROL_TOKEN && env.T3_CONTROL_URL ? [] : files) {
+  if (!(env.T3_CONTROL_TOKEN && env.T3_CONTROL_URL)) {
     let mode;
     try {
       mode = statSync(path).mode;
     } catch (e) {
-      if (e.code === "ENOENT" && !named) continue;
-      throw e;
+      if (e.code !== "ENOENT" || named) throw e;
     }
-    if (mode & 0o077) throw new Error(`${path} must be chmod 600`);
-    try {
-      file = JSON.parse(readFileSync(path, "utf8"));
-    } catch (e) {
-      throw new Error(`${path} is not valid JSON: ${e.message}`);
+    if (mode !== undefined) {
+      if (mode & 0o077) throw new Error(`${path} must be chmod 600`);
+      try {
+        file = JSON.parse(readFileSync(path, "utf8"));
+      } catch (e) {
+        throw new Error(`${path} is not valid JSON: ${e.message}`);
+      }
     }
-    if (file?.token) break;
   }
   file ??= {};
   const token = env.T3_CONTROL_TOKEN || file.token;
-  if (!token) throw new Error(`no control token (${files.join(", ")})`);
+  if (!token) throw new Error(`no control token (${path})`);
   return {
     url: (env.T3_CONTROL_URL || file.url || "http://127.0.0.1:3773").replace(/\/+$/, ""),
     token,
@@ -297,8 +295,8 @@ export async function missionRecoveryReport(body) {
   return api("POST", "/api/ardud/missions/recovery/incident", body);
 }
 
-// Which of these threads belong to a live mission. A read: works with the
-// shared token when the report itself is refused for lack of the credential.
+// Which of these threads belong to a live mission. A read, so it still works
+// with a credential the report itself is refused for.
 export async function missionRecoveryMembers(threadIds) {
   const query = encodeURIComponent(threadIds.join(","));
   return (await api("GET", `/api/ardud/missions/recovery/members?threadIds=${query}`)).members ?? [];

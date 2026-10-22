@@ -147,7 +147,7 @@ test("control config: env first, then a chmod 600 token file, loopback only", ()
   expect(() => discoverControlConfig({ env: { T3_CONTROL_TOKEN_FILE: join(dir, "missing.json") }, home: dir })).toThrow("ENOENT");
 });
 
-test("control config reads the bridge's own credential before the shared file", () => {
+test("control config reads the bridge's own credential and ignores the retired shared file", () => {
   const home = mkdtempSync(join(tmpdir(), "robob-config-"));
   dirs.push(home);
   const write = (path: string, token: string) => {
@@ -155,9 +155,11 @@ test("control config reads the bridge's own credential before the shared file", 
     writeFileSync(path, JSON.stringify({ url: "http://127.0.0.1:14033", token }), { mode: 0o600 });
   };
   write(join(home, ".robob", "ardud-control.json"), "shared");
-  expect(discoverControlConfig({ home, env: {} }).token).toBe("shared");
+  expect(() => discoverControlConfig({ home, env: {} })).toThrow("ENOENT");
   write(join(home, ".robob", "components", "spectrum-bridge.json"), "own");
   expect(discoverControlConfig({ home, env: {} }).token).toBe("own");
+  expect(discoverControlConfig({ home, env: { T3_CONTROL_TOKEN_FILE: "" } }).token).toBe("own");
+  expect(discoverControlConfig({ home, env: {}, tokenFile: "" }).token).toBe("own");
   expect(() => discoverControlConfig({ home, env: { T3_CONTROL_TOKEN_FILE: join(home, "typo.json") } })).toThrow("ENOENT");
 });
 

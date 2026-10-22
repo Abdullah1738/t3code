@@ -35,6 +35,8 @@ const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "test-model" };
 
 const stopEarlierBackgroundWork = ({
+  wakeAfterStop = false,
+  lateWorkAfterStop,
   failedStart = false,
   stopWithQueue,
   olderStart = false,
@@ -42,6 +44,8 @@ const stopEarlierBackgroundWork = ({
   stalledRun,
   workflowMember = false,
 }: {
+  readonly wakeAfterStop?: boolean;
+  readonly lateWorkAfterStop?: "provider-wake" | "context-reset";
   readonly failedStart?: boolean;
   readonly backgroundWorkAfterStop?: "running" | "unknown";
   readonly stopWithQueue?: "thread.stop" | "run.interrupt";
@@ -197,6 +201,81 @@ const stopEarlierBackgroundWork = ({
         });
         yield* worker.drain();
         yield* Fiber.join(running);
+        if (wakeAfterStop || lateWorkAfterStop !== undefined) {
+          const send = (id: string, provider = false) =>
+            orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(id),
+              threadId,
+              messageId: MessageId.make(`message:${id}`),
+              text: id,
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: provider ? "agent" : "user",
+              creationSource: provider ? "provider" : "web",
+            });
+          if (lateWorkAfterStop !== undefined) {
+            // Nothing is queued when Stop lands, so no hold exists for late work to inherit.
+            yield* orchestrator.dispatch({
+              type: "thread.stop",
+              commandId: CommandId.make("stop"),
+              threadId,
+            });
+            yield* lateWorkAfterStop === "provider-wake"
+              ? send("Background task completed.", true)
+              : orchestrator.dispatch({
+                  type: "message.dispatch",
+                  commandId: CommandId.make("resume-note"),
+                  threadId,
+                  messageId: MessageId.make("message:resume-note"),
+                  text: "Resume note",
+                  attachments: [],
+                  dispatchMode: { type: "queue_after_active" },
+                  createdBy: "agent",
+                  creationSource: "mcp",
+                  contextReset: true,
+                });
+            const late = (yield* orchestrator.getThreadProjection(threadId)).runs[1];
+            assert.isTrue(late?.queueHeld);
+
+            yield* worker.drain();
+            yield* orchestrator.resumeQueuedRuns;
+            yield* worker.drain();
+            const after = yield* orchestrator.getThreadProjection(threadId);
+            assert.deepEqual(
+              after.runs.map((run) => run.status),
+              ["interrupted", "queued"],
+            );
+            assert.lengthOf(started, 1);
+            return;
+          }
+          yield* send("follow-up");
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make("stop"),
+            threadId,
+          });
+          // Stop is committed, but its provider interrupt has not run yet.
+          yield* send("Background task completed.", true);
+          const [stopped, followUp, wake] = (yield* orchestrator.getThreadProjection(threadId))
+            .runs;
+          assert.equal(stopped?.status, "running");
+          assert.isTrue(followUp?.queueHeld);
+          assert.isTrue(wake?.queueHeld);
+
+          yield* worker.drain();
+          yield* orchestrator.resumeQueuedRuns;
+          yield* worker.drain();
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          assert.deepEqual(
+            after.runs.map((run) => run.status),
+            ["interrupted", "queued", "queued"],
+          );
+          assert.isTrue(after.runs.find((run) => run.id === followUp?.id)?.queueHeld);
+          assert.isTrue(after.runs.find((run) => run.id === wake?.id)?.queueHeld);
+          assert.lengthOf(started, 1);
+          return;
+        }
         const first = started[0]!;
         const codexTurn = (yield* orchestrator.getThreadProjection(threadId)).providerTurns[0]!;
         const devServerId = TurnItemId.make("turn-item:dev-server");
@@ -1029,4 +1108,13 @@ it.effect.each([
   "superseded-attempt",
 ] as const)("Stop recovers a stalled run after %s without changing a newer attempt", (stalledRun) =>
   stopEarlierBackgroundWork({ stalledRun }),
+);
+
+it.effect("Stop holds a provider wake that queues before the stopped turn ends", () =>
+  stopEarlierBackgroundWork({ wakeAfterStop: true }),
+);
+
+it.effect.each(["provider-wake", "context-reset"] as const)(
+  "Stop with an empty queue holds a %s that queues before the stopped turn ends",
+  (lateWorkAfterStop) => stopEarlierBackgroundWork({ lateWorkAfterStop }),
 );

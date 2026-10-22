@@ -18,7 +18,7 @@ const tokenFile = (name: string, token: string, mode = 0o600) => {
   return file;
 };
 
-test("control config reads the bridge's own credential before the shared file", () => {
+test("control config reads the bridge's own credential and ignores the retired shared file", () => {
   const home = mkdtempSync(join(tmpdir(), "telegram-control-"));
   dirs.push(home);
   const write = (path: string, token: string) => {
@@ -26,9 +26,11 @@ test("control config reads the bridge's own credential before the shared file", 
     writeFileSync(path, JSON.stringify({ url: "http://127.0.0.1:14033", token }), { mode: 0o600 });
   };
   write(join(home, ".robob", "ardud-control.json"), "shared");
-  expect(discoverControlConfig({ home, env: {} }).token).toBe("shared");
+  expect(() => discoverControlConfig({ home, env: {} })).toThrow("ENOENT");
   write(join(home, ".robob", "components", "telegram-bridge.json"), "own");
   expect(discoverControlConfig({ home, env: {} }).token).toBe("own");
+  expect(discoverControlConfig({ home, env: { T3_CONTROL_TOKEN_FILE: "" } }).token).toBe("own");
+  expect(discoverControlConfig({ home, env: {}, tokenFile: "" }).token).toBe("own");
 });
 
 test("control config refuses a named token file that does not exist", () => {

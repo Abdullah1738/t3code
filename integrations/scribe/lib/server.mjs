@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const HOME = process.env.HOME || homedir();
-const CONTROL_FILE = process.env.SCRIBE_CONTROL_FILE || join(HOME, '.robob/ardud-control.json');
+const CONTROL_FILE = process.env.SCRIBE_CONTROL_FILE || join(HOME, '.robob/components/scribe.json');
 export const SCRIBE_PREFIX = '/api/ardud/missions/scribe';
 
 export function controlConfig() {

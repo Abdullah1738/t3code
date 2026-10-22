@@ -1,7 +1,6 @@
 // Robob control API location and token, shared by the pump (thread sends) and the messaging forward mode
 // (missions API). Explicit values win, then T3_CONTROL_URL/T3_CONTROL_TOKEN, then coord's own credential file:
-// COORD_CONTROL_TOKEN_FILE, default ~/.robob/components/coord.json. While that default file doesn't exist the old
-// shared token (~/.robob/ardud-control.json) still works. Either file must be chmod 600.
+// COORD_CONTROL_TOKEN_FILE, default ~/.robob/components/coord.json. The file must be chmod 600.
 // T3_CONTROL_TOKEN_FILE is ignored on purpose: crw loads coord in-process and points that setting at its own
 // credential, and Robob only takes forwarded coord calls from the coord credential.
 import { readFileSync, statSync } from 'node:fs';
@@ -18,12 +17,8 @@ function readTokenFile(file) {
   }
 }
 
-function tokenFile() {
-  const own = process.env.COORD_CONTROL_TOKEN_FILE;
-  if (own) return readTokenFile(own);
-  const robob = join(homedir(), '.robob');
-  return readTokenFile(join(robob, 'components', 'coord.json')) ?? readTokenFile(join(robob, 'ardud-control.json'));
-}
+const tokenFile = () =>
+  readTokenFile(process.env.COORD_CONTROL_TOKEN_FILE || join(homedir(), '.robob', 'components', 'coord.json'));
 
 export function controlConfig(o = {}) {
   let url = o.url ?? process.env.T3_CONTROL_URL;

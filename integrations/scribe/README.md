@@ -59,7 +59,7 @@ status files take `--live`, which only the report jobs pass.
 
 Environment: `SCRIBE_DB`, `SCRIBE_ROUTER_URL`, `SCRIBE_MODEL`,
 `SCRIBE_EDITOR_MODEL`, `SCRIBE_OUT`, `SCRIBE_CONTROL_FILE` (defaults to
-`~/.robob/ardud-control.json`), `T3_CONTROL_URL`, `T3_CONTROL_TOKEN`.
+`~/.robob/components/scribe.json`), `T3_CONTROL_URL`, `T3_CONTROL_TOKEN`.
 
 `watch` follows the control API's run events and runs one `run` pass when a
 lane's run settles, plus a sweep every 15 minutes for lanes running long. Passes

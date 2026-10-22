@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import * as C from './lib/coord.mjs';
 import * as E from './lib/evidence.mjs';
-import { deliver, pump, controlConfig, threadState } from './lib/pump.mjs';
+import { deliver, pump, rotateLog, controlConfig, threadState } from './lib/pump.mjs';
 
 const USAGE = `coord <command> [args] (JSON output; see README.md)
   init                                             (idempotent seed: crw process actor)
@@ -92,7 +92,11 @@ async function main() {
     case 'inbox': return C.inbox({ as: o.as, unacked: o.unacked, after: o.after });
     case 'ack': return C.ack(o.as, p.slice(1));
     case 'deliver': return deliver();
-    case 'pump': return pump();
+    case 'pump': {
+      const log = rotateLog();
+      const r = await pump();
+      return log ? { ...r, log } : r;
+    }
     case 'claim': return C.claim(sub, { as: o.as, env: o.env, ttl: o.ttl, purpose: o.purpose, op: o.op });
     case 'renew': return C.renew(sub, { as: o.as, fence: o.fence, ttl: o.ttl, op: o.op });
     case 'release':

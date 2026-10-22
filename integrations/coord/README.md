@@ -35,15 +35,18 @@ Plain Node (v22.5+, `node:sqlite`), no dependencies.
   `attention.held_queues`. Queue list/cancel go over the app's `/ws` RPC (`getThreadProjection`,
   `queued-run.cancel`) with the control token. Counted in `deliver.superseded`/`supersedes`.
   Each tick stamps `pump:heartbeat` in `control` (with `superseded`); `attention.pump.stale` flags a pump
-  silent for 5 min.
+  silent for 5 min. When `COORD_PUMP_LOG` is set (the LaunchAgent sets it to its log), a tick that finds
+  that log over 10 MB renames it to `<log>.1`, so the pump keeps at most about 20 MB of log.
 - `cli.mjs`: the CLI. JSON out; exit 1 with `error.code` on refusal, 2 on usage.
 - `scripts/coord`: wrapper for `~/.local/bin`. `scripts/com.ardud.coord-pump.plist`: the pump
   LaunchAgent (`coord pump` every 60 s).
+- `scripts/pump-heartbeat.mjs`: the check for the robob-watch watcher `coord-pump-heartbeat`. It sends
+  one Telegram alert once the pump has been stale on two runs, repeats every 6 h, and sends one note
+  when it ticks again.
 
 State: `~/.local/share/coord/data/coord.db` (override with `COORD_DB`). Control API url/token come
 from `T3_CONTROL_URL` / `T3_CONTROL_TOKEN`, else coord's own credential file (`COORD_CONTROL_TOKEN_FILE`, default
-`~/.robob/components/coord.json`, chmod 600). While that default file is missing, the shared
-`~/.robob/ardud-control.json` still works. `T3_CONTROL_TOKEN_FILE` is crw's setting and coord ignores it.
+`~/.robob/components/coord.json`, chmod 600). `T3_CONTROL_TOKEN_FILE` is crw's setting and coord ignores it.
 
 Defaults (env overrides): reconcile by `COORD_RECONCILERS` (`master,release`), manual admits by
 `COORD_ADMITTERS` (`master,release`), approval sources `COORD_APPROVAL_SOURCES` (`web,mobile`),
@@ -335,6 +338,9 @@ Tests use a temp DB and a stub control server; they never touch Robob.
 install -m 755 integrations/coord/scripts/coord ~/.local/bin/coord
 cp integrations/coord/scripts/com.ardud.coord-pump.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ardud.coord-pump.plist
+robob-watch add --id coord-pump-heartbeat --title "coord pump heartbeat" --mode notify --interval 300 \
+  --max-fires 0 --expires 3650d --check 'node ~/.local/share/coord/scripts/pump-heartbeat.mjs' \
+  --context "Telegram alert when the coord pump stops ticking; the check sends it and prints nothing."
 ```
 
 No Robob or OpenCode restart is needed.
