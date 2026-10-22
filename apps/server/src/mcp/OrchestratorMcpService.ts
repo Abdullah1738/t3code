@@ -262,14 +262,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function scheduledTaskWorkspaceStrategy(
-  boundToThread: boolean,
-): ScheduledTask["workspaceStrategy"] {
-  return boundToThread
-    ? { type: "root" }
-    : { type: "worktree", baseRef: "main", startFromOrigin: true };
-}
-
 function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): OrchestratorMcpScheduledTask {
   return {
     scheduledTaskId: task.id,
@@ -1008,6 +1000,30 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+
+  const scheduledTaskWorkspaceStrategy = Effect.fn("scheduledTaskWorkspaceStrategy")(function* (
+    workspaceRoot: string,
+  ): Effect.fn.Return<ScheduledTask["workspaceStrategy"]> {
+    // Only a confirmed non-repository uses root; other failures surface when the worktree launches.
+    const isRepository = yield* gitDriver
+      .execute({
+        operation: "OrchestratorMcpService.scheduledTaskWorkspaceStrategy",
+        cwd: workspaceRoot,
+        args: ["rev-parse", "--git-dir"],
+        env: { LC_ALL: "C" },
+        timeoutMs: 5_000,
+        maxOutputBytes: 4_096,
+      })
+      .pipe(
+        Effect.as(true),
+        Effect.catchTags({
+          GitCommandError: (error) => Effect.succeed(error.reason !== "not_a_repository"),
+        }),
+      );
+    return isRepository
+      ? { type: "worktree", baseRef: "main", startFromOrigin: true }
+      : { type: "root" };
+  });
 
   const projectDefaultModelSelection = (
     project: Effect.Success<ReturnType<typeof requireProject>>,
@@ -1764,7 +1780,9 @@ const make = Effect.gen(function* () {
         schedule: input.schedule,
         projectId,
         threadId: bindToCurrentThread && parent !== undefined ? parent.thread.id : null,
-        workspaceStrategy: scheduledTaskWorkspaceStrategy(bindToCurrentThread),
+        workspaceStrategy: bindToCurrentThread
+          ? { type: "root" }
+          : yield* scheduledTaskWorkspaceStrategy(project.workspaceRoot),
         modelSelection,
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
@@ -1831,12 +1849,16 @@ const make = Effect.gen(function* () {
               ? parent.thread.id
               : null;
         // Rebinding changes where runs execute, so the workspace strategy must
-        // follow: unbinding a root-strategy task would otherwise run loose
-        // prompts in the shared project checkout.
+        // follow: unbinding a root-strategy task in a Git project would
+        // otherwise run loose prompts in the shared project checkout.
         const workspaceStrategy =
           input.bindToCurrentThread === undefined
             ? existing.workspaceStrategy
-            : scheduledTaskWorkspaceStrategy(input.bindToCurrentThread);
+            : input.bindToCurrentThread
+              ? { type: "root" as const }
+              : yield* scheduledTaskWorkspaceStrategy(
+                  (yield* requireProject(existing.projectId)).workspaceRoot,
+                );
         const upsertInput: ScheduledTaskUpsertInput = {
           id: existing.id,
           title: input.title ?? existing.title,
