@@ -2932,13 +2932,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         // A run a foreground call shared already answered its background calls.
         yield* recoverShared(state, finished, active);
         // A subagent still running keeps its call; its end arrives on the new
-        // stream. One not given its child yet is judged by its caller's session,
-        // which still has to name the child.
+        // stream. One not given its child yet waits only while the turn that
+        // has to name it still runs: once that turn ended here, its session's
+        // events are dropped.
         for (const call of runningCalls(state)) {
-          const session = call.child?.sessionId ?? call.state.sessionId;
-          if (!(session in active)) {
-            yield* settleCall(call, "interrupted", LOST_BACKGROUND);
-          }
+          const alive =
+            call.child !== undefined
+              ? call.child.sessionId in active
+              : call.state.active === call.turn && call.state.sessionId in active;
+          if (!alive) yield* settleCall(call, "interrupted", LOST_BACKGROUND);
         }
         for (const session of sessionsOf(state)) {
           discardWakes(session, session.wakes.splice(0));

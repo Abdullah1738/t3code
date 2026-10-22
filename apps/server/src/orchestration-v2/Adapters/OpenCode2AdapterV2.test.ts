@@ -4411,6 +4411,86 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("settles a nested call with no child yet once the gap stopped its caller", () =>
+    Effect.gen(function* () {
+      const MIDDLE = "ses_middle0000000000000000000";
+      const tool = (session: string, id: string) => ({
+        sessionID: session,
+        assistantMessageID: `msg_assistant_${id}`,
+        id,
+      });
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, id: PROMPT_ID, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.started", { sessionID: SESSION }),
+        event("session.tool.input.started", { ...tool(SESSION, "call-middle"), name: "subagent" }),
+        event("session.tool.called", {
+          ...tool(SESSION, "call-middle"),
+          name: "subagent",
+          input: { description: "Middle", prompt: "delegate" },
+          executed: false,
+        }),
+        event("session.created", { ...childCreated(MIDDLE), title: "Middle" }),
+        event("session.tool.progress", {
+          ...tool(SESSION, "call-middle"),
+          metadata: { sessionID: MIDDLE, status: "running" },
+        }),
+        event("session.execution.started", { sessionID: MIDDLE }),
+        event("session.tool.input.started", { ...tool(MIDDLE, "call-deep"), name: "subagent" }),
+        event("session.tool.called", {
+          ...tool(MIDDLE, "call-deep"),
+          name: "subagent",
+          input: { description: "Deep", prompt: "sleep", background: true },
+          executed: false,
+        }),
+        // The stream drops before the middle session names its child, and the
+        // root's history then shows the middle call stopped.
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", {
+          [SESSION]: { type: "running" },
+          [MIDDLE]: { type: "running" },
+        }),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        gapHistory(
+          [
+            {
+              type: "tool",
+              id: "call-middle",
+              name: "subagent",
+              executed: true,
+              state: {
+                status: "error",
+                input: { description: "Middle", prompt: "delegate" },
+                error: { type: "aborted", message: "The operation was aborted." },
+              },
+              time: { created: 2, ran: 2, completed: 2 },
+            },
+          ],
+          false,
+        ),
+        ...noRequests(SESSION),
+        ...noRequests(MIDDLE),
+        // The middle session's own end and its call's failure come after its
+        // turn ended here, so they reach no turn.
+        event("session.execution.interrupted", { sessionID: MIDDLE }),
+        event("session.tool.failed", {
+          ...tool(MIDDLE, "call-deep"),
+          error: { type: "aborted", message: "The operation was aborted." },
+          executed: true,
+        }),
+        lastEvent,
+      ]);
+      const watch = yield* watchSubagents(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(watch.done);
+      assert.equal(watch.status.get("Middle"), "interrupted");
+      assert.equal(watch.status.get("Deep"), "interrupted");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
+
   it.effect(
     "settles background calls launched while the stream was down with their shared run",
     () =>
