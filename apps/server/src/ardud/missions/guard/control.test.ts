@@ -529,9 +529,10 @@ describe("iMessage bridge provenance (imessage r1, 19 Oct)", () => {
 
 describe("component credentials (routing r21)", () => {
   const watchers = component("watchers");
+  const t3ctl = component("t3ctl");
 
   it.effect("a Robob component reaches a lane straight, and still knocks on the master", () =>
-    runAs(watchers, new Map(), ({ seen, delivered, post }) =>
+    runAs(t3ctl, new Map(), ({ seen, delivered, post }) =>
       Effect.gen(function* () {
         const pulse = yield* post(`/threads/${lane}/send`, { text: "pulse" });
         assert.strictEqual(pulse.status, 200);
@@ -540,16 +541,30 @@ describe("component credentials (routing r21)", () => {
         expect(toMaster.body).toMatchObject({ guard: { _tag: "knocked" } });
         expect(seen.at(-1)?.from).toEqual({
           _tag: "session",
-          sessionId: watchers.sessionId,
-          subject: watchers.subject,
-          label: "watchers",
-          component: "watchers",
+          sessionId: t3ctl.sessionId,
+          subject: t3ctl.subject,
+          label: "t3ctl",
+          component: "t3ctl",
         });
         expect(yield* Queue.take(delivered.sends)).toMatchObject({
           threadId: lane,
           createdBy: "system",
         });
         assert.strictEqual(yield* Queue.size(delivered.sends), 0);
+      }),
+    ),
+  );
+
+  // 22 Oct: lane-pulse findings knocked the owner instead of reaching the master.
+  it.effect("the watchers reach the master straight", () =>
+    runAs(watchers, new Map(), ({ delivered, post }) =>
+      Effect.gen(function* () {
+        const toMaster = yield* post(`/threads/${master}/send`, { text: "pulse" });
+        assert.strictEqual(toMaster.status, 200);
+        expect(yield* Queue.take(delivered.sends)).toMatchObject({
+          threadId: master,
+          createdBy: "system",
+        });
       }),
     ),
   );

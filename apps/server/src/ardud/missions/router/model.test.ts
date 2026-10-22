@@ -155,8 +155,8 @@ describe("decideSend", () => {
     expect(senderLabel(base)).toBe("an unnamed session");
   });
 
-  // routing r21: watchers knocked the owner 41 times overnight.
-  it("delivers a Robob component straight to any member but the master", () => {
+  // routing r21: watchers knocked the owner 41 times overnight; 22 Oct: and on the master.
+  it("delivers a Robob component straight to members, and only the watchers to the master", () => {
     const watchers: SendSender = {
       _tag: "session",
       sessionId: "s2",
@@ -177,6 +177,14 @@ describe("decideSend", () => {
         target: member(master, "master"),
         sender: null,
         from: watchers,
+        targetThreadId: master,
+      }),
+    ).toEqual({ _tag: "allow", missionId: mission, reason: "component" });
+    expect(
+      decideSend({
+        target: member(master, "master"),
+        sender: null,
+        from: { ...watchers, subject: "component:t3ctl", component: "t3ctl" },
         targetThreadId: master,
       }),
     ).toEqual({ _tag: "knock", missionId: mission, reason: "anonymous" });

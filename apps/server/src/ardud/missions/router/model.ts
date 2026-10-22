@@ -145,13 +145,21 @@ export interface GuardFacts {
 }
 
 /**
+ * Components that reach the master straight. The watchers (lane-pulse) report
+ * stalled lanes to the master, and the owner wants that in front of the master,
+ * not in his inbox. Agents running t3ctl or the desk CLI, the bridges and crw
+ * still knock on the master.
+ */
+const MASTER_COMPONENTS: ReadonlySet<string> = new Set(["watchers"]);
+
+/**
  * Membership decides who may reach a member thread. Owner typing passes.
  * The master reaches its own members directly, and so does a lead answering
- * the question its lane asked it. Robob's own components reach every member
- * but the master directly. Other members and member services are routed
- * through rooms. Schedules the owner made pass; a thread's schedule passes
- * only into that same thread, and a schedule with no recorded creator is
- * never treated as self. Everything else knocks.
+ * the question its lane asked it. Robob's own components reach every member,
+ * and the watchers reach the master too. Other members and member services
+ * are routed through rooms. Schedules the owner made pass; a thread's schedule
+ * passes only into that same thread, and a schedule with no recorded creator
+ * is never treated as self. Everything else knocks.
  */
 export const decideSend = (facts: GuardFacts): GuardDecision => {
   const { target, sender, from } = facts;
@@ -184,8 +192,12 @@ export const decideSend = (facts: GuardFacts): GuardDecision => {
       };
     }
     case "session":
-      // Nothing but the owner reaches the master unasked.
-      if (from.component !== undefined && target.kind !== "master") return allow("component");
+      if (
+        from.component !== undefined &&
+        (target.kind !== "master" || MASTER_COMPONENTS.has(from.component))
+      ) {
+        return allow("component");
+      }
       if (sameMission && sender.kind === "service") {
         return {
           _tag: "route",
