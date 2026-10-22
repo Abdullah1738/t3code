@@ -186,7 +186,7 @@ const MissionRequestsTool = Tool.make("mission_requests", {
 
 const MissionRequestOpenTool = Tool.make("mission_request_open", {
   description:
-    "As the mission's master, put something the owner asked you elsewhere (his own thread, iMessage) on the mission's requests, in his words. quotedFrom says where he asked it. It does not wake you; answer it with mission_request_reply.",
+    "As the mission's master, put something the owner asked you elsewhere (his own thread, iMessage) on the mission's requests, in his words. quotedFrom says where he asked it. When he asked for a discussion on an item (\"open a discussion on that draft\"), pass it as subject: the discussion opens on that record, unread for him and outside his own requests, or your text joins the discussion already open about it. Approving or dropping a draft settles its open discussion, so open a progress discussion after the decision. It does not wake you; answer it with mission_request_reply.",
   parameters: OpenOwnerRequestInput,
   success: Schema.Struct({ request: Schema.Unknown }),
   failure: OrchestratorMcpFailure,
@@ -196,7 +196,7 @@ const MissionRequestOpenTool = Tool.make("mission_request_open", {
 
 const MissionRequestReplyTool = Tool.make("mission_request_reply", {
   description:
-    'As the mission\'s master, answer one of the owner\'s requests. status "answered" (the default) when you have answered; "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, rules or suggestions you made from it. No defaults, deadlines or "unless you say otherwise": the owner decides in his own time. Your reply wakes nobody.',
+    'As the mission\'s master, answer one of the owner\'s requests. status "answered" (the default) when you have answered; "waiting-on-master" with a progress note while you still work. Pass links for the work items, asks, rules or suggestions you made from it. A discussion opened on a draft after its decision stays open after it is sent: link the work item the draft belongs to and keep posting its progress there, so the owner follows it in one place. No defaults, deadlines or "unless you say otherwise": the owner decides in his own time. Your reply wakes nobody.',
   parameters: ReplyOwnerRequestInput,
   success: Schema.Struct({ request: Schema.Unknown }),
   failure: OrchestratorMcpFailure,

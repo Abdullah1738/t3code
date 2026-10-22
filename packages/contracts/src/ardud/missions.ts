@@ -2864,9 +2864,11 @@ export const OpenOwnerRequestInput = Schema.Struct({
   /** Idempotency key: the same key opens the same request once. */
   key: Schema.optional(TrimmedNonEmptyString),
   /**
-   * Owner only: the record being discussed (Discuss on a card). It must belong to
-   * the mission. While a request about it is open, opening again adds the text to
-   * that request instead of starting another one.
+   * The record being discussed: the owner's Discuss on a card, or the master
+   * opening that discussion for him (with `quotedFrom`, when he asked for one
+   * on that item). It must belong to the mission. While a request about it is
+   * open, opening again adds the text to that request instead of starting
+   * another one.
    */
   subject: Schema.optional(MissionRecordRef),
 });
