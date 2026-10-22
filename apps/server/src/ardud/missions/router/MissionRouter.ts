@@ -9,6 +9,7 @@ import {
   ThreadId,
   type CoordEventRef,
   type DecideKnockInput,
+  type InboxComment, // ardud missions: r22 comments
   type Knock,
   type MarkReadInput,
   type MessageBodyInput,
@@ -55,6 +56,13 @@ import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
 import { clipSummary } from "../asks/shared.ts";
+import {
+  commentLines,
+  commentsOn,
+  decisionNoteOf,
+  markIdOf,
+  withComment,
+} from "../asks/inboxMarks.ts"; // ardud missions: r22 comments
 import { actorOf } from "../core/provenance.ts";
 import type { GuardPrincipal } from "../guard/principal.ts";
 import * as MissionStore from "../store/MissionStore.ts";
@@ -133,6 +141,7 @@ const LIVE_MISSIONS: ReadonlySet<string> = new Set(["active", "paused", "drainin
 const MEMBER_RANK: Record<MemberKind, number> = { master: 0, created: 1, attached: 2, service: 3 };
 
 const fail = (code: MissionError["code"], detail: string) => new MissionError({ code, detail });
+const KNOCK_COMMENTS = { _tag: "system", component: "knocks" } as const;
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 /** Standard rooms a post may create on first use: control, release, arch, per sub-mission, per work item. */
@@ -1554,6 +1563,29 @@ const make = Effect.gen(function* () {
             : "Only the owner or the mission's master decides knocks.",
         );
       }
+      // The owner's note is a comment on the knock, saved with the decision; the
+      // forward carries every comment he left so the receiver acts on them.
+      const decidedAt = yield* nowIso;
+      const subject = { kind: "knock" as const, id: knock.id };
+      const note = yield* decisionNoteOf(input.note, provenance);
+      const mark =
+        note === null
+          ? null
+          : withComment(
+              yield* store.get("inbox-mark", markIdOf(subject)),
+              subject,
+              knock.missionId,
+              {
+                id: `comment-${sha256(`${knock.id}:${decidedAt}`).slice(0, 32)}`,
+                body: note,
+                at: decidedAt,
+              },
+            );
+      const comments = mark?.comments ?? (yield* commentsOn(store, subject));
+      const withComments = (body: string) =>
+        comments.length === 0
+          ? body
+          : `${body}\n\nThe owner's comments:\n${commentLines(comments)}`;
       const text = input.editedText ?? knock.body;
       let forwardedTo: MissionActor | null = null;
       if (input.action === "forward") {
@@ -1588,7 +1620,9 @@ const make = Effect.gen(function* () {
           (threadId) =>
             threads.send({
               threadId,
-              text: `[Forwarded by ${owner ? "the owner" : "the master"} from ${knock.fromTitle}] ${text}`,
+              text: withComments(
+                `[Forwarded by ${owner ? "the owner" : "the master"} from ${knock.fromTitle}] ${text}`,
+              ),
               key: `knock:${knock.id}:forward:${threadId}`,
               asOwner: owner,
             }),
@@ -1600,7 +1634,7 @@ const make = Effect.gen(function* () {
         status: input.action === "forward" ? "forwarded" : "dropped",
         forwardedText: input.action === "forward" ? text : null,
         forwardedTo,
-        decidedAt: yield* nowIso,
+        decidedAt,
       };
       yield* store.commit({
         event: {
@@ -1612,12 +1646,66 @@ const make = Effect.gen(function* () {
             `${input.action === "forward" ? "Forwarded" : "Dropped"} knock from ${knock.fromTitle}: ${knock.summary}`,
           ),
           subject: { kind: "knock", id: knock.id },
-          payload: { action: input.action, edited: input.editedText !== undefined },
+          payload: {
+            action: input.action,
+            edited: input.editedText !== undefined,
+            ...(mark === null ? {} : { commentId: mark.comments.at(-1)?.id ?? null }),
+          },
         },
-        upserts: [{ _tag: "knock", record: decided }],
+        upserts: [
+          { _tag: "knock", record: decided },
+          ...(mark === null ? [] : [{ _tag: "inbox-mark" as const, record: mark }]),
+        ],
       });
+      if (comments.length > 0)
+        yield* tellMasterOfKnockComments(cast, decided, comments, provenance);
       return decided;
     });
+
+  /** The master hears the owner's comments on a knock he decided, once. */
+  const tellMasterOfKnockComments = Effect.fn("MissionRouter.tellMasterOfKnockComments")(
+    function* (
+      cast: RouterCast,
+      knock: Knock,
+      comments: ReadonlyArray<InboxComment>,
+      provenance: MissionProvenance,
+    ) {
+      const master = masterRoleOf(cast);
+      if (master === null || isMaster(cast, provenance)) return;
+      const target = knock.forwardedTo;
+      const forwardedToMaster =
+        (target?._tag === "role" && target.roleId === master.id) ||
+        (target?._tag === "thread" && masterThreadsOf(cast).includes(target.threadId));
+      if (forwardedToMaster) return;
+      const how =
+        knock.status === "forwarded" && knock.forwardedTo !== null
+          ? `forwarded to ${labelOf(cast, knock.forwardedTo)}`
+          : knock.status;
+      yield* relay({
+        input: {
+          missionId: knock.missionId,
+          roomId: controlRoomId(knock.missionId),
+          kind: "decision",
+          summary: clipSummary(`The owner's comments on the knock from ${knock.fromTitle}`),
+          body: `Knock from ${knock.fromTitle} (${knock.summary}) was ${how}.\n\nThe owner's comments:\n${commentLines(comments)}`,
+          to: [{ _tag: "role", roleId: master.id }],
+          key: `knock:${knock.id}:${knock.status}:comments`,
+        },
+        provenance: KNOCK_COMMENTS,
+        author: KNOCK_COMMENTS,
+        authorThread: null,
+      });
+    },
+    (effect, _cast, knock) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("missions router: knock comments did not reach the master", {
+            knockId: knock.id,
+            cause,
+          }),
+        ),
+      ),
+  );
 
   // ---------------------------------------------------------------------------
   // Send guard

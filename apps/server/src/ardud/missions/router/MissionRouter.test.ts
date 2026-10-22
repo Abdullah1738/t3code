@@ -561,6 +561,68 @@ describe("knocks", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("the owner's note goes with the forwarded knock and to the master", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), laneThread));
+      if (outcome._tag !== "knocked") return assert.fail("expected a knock");
+      // Only the owner's word rides along as a comment.
+      const fromMaster = yield* failureCode(
+        router.decideKnock(
+          { knockId: outcome.knockId, action: "forward", note: "Low priority." },
+          agent(masterThread),
+        ),
+      );
+      assert.strictEqual(fromMaster, "forbidden");
+      yield* router.decideKnock(
+        { knockId: outcome.knockId, action: "forward", note: "Answer after the deploy." },
+        ownerApp,
+      );
+      const forwarded = h.sent.find((each) => each.key.startsWith(`knock:${outcome.knockId}`));
+      assert.include(forwarded?.text ?? "", "please drop everything");
+      assert.include(forwarded?.text ?? "", "The owner's comments:\n- Answer after the deploy.");
+      const mark = Option.getOrThrow(yield* store.get("inbox-mark", `knock:${outcome.knockId}`));
+      assert.deepStrictEqual(
+        mark.comments.map((comment) => comment.body),
+        ["Answer after the deploy."],
+      );
+      const page = yield* router.roomPage({ roomId: control }, ownerApp);
+      const toMaster = page.messages.filter((message) =>
+        message.to.some((actor) => actor._tag === "role" && actor.roleId === "role-master"),
+      );
+      assert.strictEqual(toMaster.length, 1);
+      const body = yield* router.messageBody({ messageId: toMaster[0]!.id }, ownerApp);
+      assert.include(JSON.stringify(body), "- Answer after the deploy.");
+
+      // Forwarded to the master's own thread: the forward already carries the
+      // comments, so no second notice.
+      const again = yield* router.guard({
+        ...guardRequest(fromThread(strayThread), laneThread),
+        requestKey: `thread-send:${laneThread}:2`,
+      });
+      if (again._tag !== "knocked") return assert.fail("expected a knock");
+      yield* router.decideKnock(
+        {
+          knockId: again.knockId,
+          action: "forward",
+          forwardTo: { _tag: "thread", threadId: masterThread },
+          note: "Yours.",
+        },
+        ownerApp,
+      );
+      const after = yield* router.roomPage({ roomId: control }, ownerApp);
+      assert.strictEqual(
+        after.messages.filter((message) =>
+          message.to.some((actor) => actor._tag === "role" && actor.roleId === "role-master"),
+        ).length,
+        1,
+      );
+    }).pipe(Effect.provide(h.layer));
+  });
+
   it.effect("unknown knocks are not found", () => {
     const h = harness();
     return Effect.gen(function* () {

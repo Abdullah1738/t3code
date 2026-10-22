@@ -43,7 +43,7 @@ const paired = {
 const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
 
 describe("inbox comments and snoozes", () => {
-  it.effect("a comment decides nothing and wakes nobody unless the master decides the item", () => {
+  it.effect("a comment decides nothing and reaches whoever acts on the item and the master", () => {
     const { posts, layer } = harness();
     return Effect.gen(function* () {
       yield* TestClock.setTime(T0);
@@ -66,13 +66,20 @@ describe("inbox comments and snoozes", () => {
       expect(mark.comments.map((comment) => comment.body)).toEqual([
         "Leaning online, checking with Sami.",
       ]);
-      // Still open, nobody told.
+      // Still open; the asker (the master here) hears it once.
       expect((yield* asks.ask(ask.id)).status).toBe("open");
-      expect(posts).toEqual([]);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toMatchObject({
+        input: {
+          kind: "request",
+          to: [{ _tag: "role", roleId: "role-master" }],
+        },
+      });
+      expect(posts[0]?.input.body).toContain("- Leaning online, checking with Sami.");
       // The master's view of the mission shows it.
       expect((yield* asks.desk(missionId)).marks.map((each) => each.id)).toEqual([`ask:${ask.id}`]);
 
-      // A draft the master approves: one knock to the master per comment.
+      // A draft the master approves: the writer and the master hear the comment.
       yield* missions.setApprovalRouting(master, {
         missionId,
         routes: [{ id: "email", match: { _tag: "draft", channel: "email" }, approver: "master" }],
@@ -86,16 +93,19 @@ describe("inbox comments and snoozes", () => {
         { subject: { kind: "draft", id: draft.id }, body: "Mention the deploy too." },
         ownerApp,
       );
-      expect(posts).toHaveLength(1);
-      expect(posts[0]).toMatchObject({
+      expect(posts).toHaveLength(2);
+      expect(posts[1]).toMatchObject({
         input: {
           missionId,
           roomId: `${missionId}:room:control`,
-          to: [{ _tag: "role", roleId: "role-master" }],
-          body: "Mention the deploy too.",
+          to: [
+            { _tag: "role", roleId: "role-writer" },
+            { _tag: "role", roleId: "role-master" },
+          ],
         },
         provenance: { _tag: "system", component: "asks" },
       });
+      expect(posts[1]?.input.body).toContain("- Mention the deploy too.");
       expect((yield* asks.drafts({ missionId }))[0]?.status).toBe("pending");
     }).pipe(Effect.provide(layer));
   });

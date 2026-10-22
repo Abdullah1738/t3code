@@ -1,6 +1,7 @@
 import {
   MissionError,
   type Ask,
+  type InboxComment,
   type MissionMessage,
   type MissionProvenance,
   type MissionRecordRef,
@@ -25,6 +26,8 @@ export class AsksSignals extends Context.Service<
     readonly askResolved: (input: {
       readonly ask: Ask;
       readonly released: ReadonlyArray<MissionRecordRef>;
+      /** The owner's comments on the ask, the note he gave with the answer last. */
+      readonly comments?: ReadonlyArray<InboxComment>;
     }) => Effect.Effect<void>;
   }
 >()("t3/ardud/missions/asks/ports/AsksSignals") {}
@@ -37,7 +40,17 @@ export const signalsNoop = Layer.succeed(
 const refLabel = (ref: MissionRecordRef) => ref.label ?? `${ref.kind} ${ref.id}`;
 
 /** The line the asker gets when its ask resolves. */
-export const askResolvedLine = (ask: Ask, released: ReadonlyArray<MissionRecordRef>): string => {
+export const askResolvedLine = (
+  ask: Ask,
+  released: ReadonlyArray<MissionRecordRef>,
+  comments: ReadonlyArray<InboxComment> = [],
+): string => {
+  const line = resolvedLine(ask, released);
+  if (comments.length === 0) return line;
+  return [line, "", "The owner's comments:", ...comments.map((c) => `- ${c.body}`)].join("\n");
+};
+
+const resolvedLine = (ask: Ask, released: ReadonlyArray<MissionRecordRef>): string => {
   const freed = released.length === 0 ? "" : ` Released: ${released.map(refLabel).join(", ")}.`;
   if (ask.status === "answered" && ask.answer !== null) {
     const option = ask.answer.optionId

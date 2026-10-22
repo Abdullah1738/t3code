@@ -26,6 +26,7 @@ import * as Stream from "effect/Stream";
 
 import { forkParked } from "../../../serverActivation.ts";
 import { clipSummary } from "../asks/shared.ts";
+import { commentLines, commentsOn } from "../asks/inboxMarks.ts"; // ardud missions: r22 comments
 import * as ScribeService from "../scribe/ScribeService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { masterRoleOf, readCast } from "./cast.ts";
@@ -62,8 +63,19 @@ const ownerNote = (event: MissionEvent): string | null => {
   return typeof note === "string" && note.trim().length > 0 ? note.trim() : null;
 };
 
+/** An owner decision on an approval that carries his comments (a note or earlier ones). */
+const ownerCommented = (event: MissionEvent) =>
+  ownerNote(event) !== null ||
+  (event.kind === "approval.decided" &&
+    (event.provenance._tag === "owner-app" ||
+      (event.provenance._tag === "owner-imessage" && event.provenance.chat === "owner")) &&
+    typeof event.payload === "object" &&
+    event.payload !== null &&
+    "commented" in event.payload &&
+    event.payload.commented === true);
+
 const feedRelevant = (event: MissionEvent) =>
-  event.kind === "editor.updated" || ROUTED_KINDS.has(event.kind) || ownerNote(event) !== null;
+  event.kind === "editor.updated" || ROUTED_KINDS.has(event.kind) || ownerCommented(event);
 
 interface Notice {
   readonly kind: MissionMessageKind;
@@ -144,7 +156,7 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
       if (ROUTED_KINDS.has(event.kind)) return yield* routedNotice(event);
       // ardud missions: crw-threads
       const note = ownerNote(event);
-      if (note !== null) {
+      if (ownerCommented(event)) {
         const approval =
           event.subject?.kind === "approval"
             ? Option.getOrNull(yield* store.get("approval", event.subject.id))
@@ -152,12 +164,19 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
         const links = (approval?.links ?? []).flatMap((link) =>
           link.url === null ? [] : [`${link.label}: ${link.url}`],
         );
+        // Every comment he left on the approval, the note with the decision included.
+        const comments =
+          event.subject?.kind === "approval"
+            ? yield* commentsOn(store, { kind: "approval", id: event.subject.id })
+            : [];
+        const said = comments.length > 0 ? commentLines(comments) : (note ?? "");
+        if (said === "") return null;
         const notice: Notice = {
           kind: "decision",
           summary: `Owner's note: ${event.summary}`,
           body: [
-            `The owner decided ${approval?.title ?? event.subject?.label ?? "an approval"} and left this note:`,
-            note,
+            `The owner decided ${approval?.title ?? event.subject?.label ?? "an approval"} and left ${comments.length > 1 ? "these comments" : "this note"}:`,
+            said,
             ...links,
             "Take it as direction for this kind of work, not only this item.",
           ].join("\n"),

@@ -47,6 +47,8 @@ import {
   type SystemDraftDecision,
   // ardud missions: finish-a
   type CommentInboxItemInput,
+  type InboxComment,
+  type InboxItemKind,
   type InboxItemRef,
   type InboxMark,
   type MissionInboxMarks,
@@ -103,18 +105,25 @@ import {
   routeDraft,
   routeDraftApprover,
   saveDraftNote,
+  sendBackForComments,
+  currentComments,
   submitDraft,
   systemDraftDecision,
   withdrawDraft,
 } from "./draftModel.ts";
 import { heldLane, heldRecords, heldWorkItem, type HeldRecord } from "./holds.ts";
 import {
+  attachComments,
+  commentLines,
+  commentsOn,
+  decisionNoteOf,
   emptyMark,
-  isMasterRouted,
   itemLabel,
   liveSnooze,
   markIdOf,
   stampOf,
+  withComment,
+  type WithComments,
 } from "./inboxMarks.ts";
 import * as Inbound from "./inbound.ts";
 import {
@@ -259,6 +268,13 @@ export class AsksService extends Context.Service<
     readonly masterInbox: (missionId: MissionId | null) => Fx<MissionMasterInbox>;
     /** ardud missions: finish-a - comments and holding snoozes (null: every mission). */
     readonly inboxMarks: (missionId: MissionId | null) => Fx<MissionInboxMarks>;
+    /** The records with the owner's comments on each (only those that have any). */
+    readonly withComments: <
+      R extends { readonly id: string; readonly missionId: MissionId | null },
+    >(
+      kind: InboxItemKind,
+      records: ReadonlyArray<R>,
+    ) => Fx<ReadonlyArray<WithComments<R>>>;
     readonly notes: (missionId: MissionId) => Fx<ReadonlyArray<Note>>;
     /** Who the caller is in a mission: its roles, lanes and whether it is the master. */
     readonly standing: (missionId: MissionId, provenance: MissionProvenance) => Fx<Standing>;
@@ -371,6 +387,10 @@ const fail = (code: MissionError["code"], detail: string) =>
 
 /** Who speaks when asks itself posts into a room. */
 const ASKS_SYSTEM: MissionProvenance = { _tag: "system", component: "asks" };
+
+/** A notice's lead line followed by the owner's comments on the item. */
+const commentsBody = (lead: string, comments: ReadonlyArray<InboxComment>): string =>
+  [lead, "", "The owner's comments:", commentLines(comments)].join("\n");
 
 /** The line the owner reads in his conversation about an ask once it is answered. */
 const answeredNote = (ask: Ask): string => {
@@ -494,6 +514,111 @@ const make = Effect.gen(function* () {
     });
 
   /**
+   * A note the owner gives with a decision is a comment on the item, saved in
+   * the decision's own commit. Returns every comment on the item (the note
+   * last) for the decision's notices; a note from anyone else is refused.
+   */
+  const decisionComments = Effect.fn("AsksService.decisionComments")(function* (input: {
+    readonly subject: InboxItemRef;
+    readonly missionId: MissionId | null;
+    readonly label: string;
+    readonly note: string | undefined;
+    readonly provenance: MissionProvenance;
+    readonly at: string;
+  }) {
+    const body = yield* decisionNoteOf(input.note, input.provenance);
+    const existing = yield* store.get("inbox-mark", markIdOf(input.subject));
+    if (body === null) {
+      return {
+        comments: Option.match(existing, {
+          onNone: (): ReadonlyArray<InboxComment> => [],
+          onSome: (mark) => mark.comments,
+        }),
+        events: [] as ReadonlyArray<ModelEvent>,
+        upserts: [] as ReadonlyArray<MissionStoreRecord>,
+      };
+    }
+    const comment: InboxComment = { id: yield* newId("comment"), body, at: input.at };
+    const record = withComment(existing, input.subject, input.missionId, comment);
+    return {
+      comments: record.comments,
+      events: [
+        markEvent(
+          "inbox.commented",
+          input.subject,
+          clipSummary(input.label),
+          `Comment: ${body}`,
+          input.provenance,
+          { commentId: comment.id, withDecision: true },
+        ),
+      ] as ReadonlyArray<ModelEvent>,
+      upserts: [{ _tag: "inbox-mark", record }] as ReadonlyArray<MissionStoreRecord>,
+    };
+  });
+
+  /**
+   * One post to whoever acts on an item and the mission's master, carrying the
+   * owner's comments. The master is skipped when it made the decision itself;
+   * `notTo` drops anyone already told in another notice. A failure is logged.
+   */
+  const tellOfComments = Effect.fn("AsksService.tellOfComments")(
+    function* (input: {
+      readonly missionId: MissionId | null;
+      readonly kind: "decision" | "request";
+      readonly summary: string;
+      readonly body: string;
+      readonly key: string;
+      readonly decidedBy: MissionProvenance | null;
+      readonly to?: ReadonlyArray<MissionActor>;
+      readonly notTo?: ReadonlyArray<MissionActor>;
+    }) {
+      const missionId = input.missionId;
+      if (missionId === null) return;
+      const cast = yield* castOf(missionId);
+      const masterRoleId =
+        cast.mission?.masterRoleId ?? cast.roles.find((role) => role.kind === "master")?.id ?? null;
+      const decider = input.decidedBy;
+      const masterDecided =
+        decider !== null &&
+        decider._tag === "agent" &&
+        masterRoleId !== null &&
+        decider.roleId === masterRoleId;
+      const recipients: MissionActor[] = [];
+      const add = (actor: MissionActor) => {
+        // Only members with a thread read the control room.
+        if (actor._tag !== "role" && actor._tag !== "lane" && actor._tag !== "thread") return;
+        if (recipients.some((held) => sameActor(held, actor))) return;
+        if ((input.notTo ?? []).some((skip) => sameActor(skip, actor))) return;
+        recipients.push(actor);
+      };
+      for (const actor of input.to ?? []) add(actor);
+      if (masterRoleId !== null && !masterDecided) add({ _tag: "role", roleId: masterRoleId });
+      if (recipients.length === 0) return;
+      yield* rooms.post(
+        {
+          missionId,
+          roomId: RoomId.make(`${missionId}:room:control`),
+          kind: input.kind,
+          summary: clipSummary(input.summary),
+          body: input.body,
+          to: recipients,
+          key: input.key,
+        },
+        ASKS_SYSTEM,
+      );
+    },
+    (effect, input) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("The owner's comments did not reach whoever acts", {
+            key: input.key,
+            cause,
+          }),
+        ),
+      ),
+  );
+
+  /**
    * Owner provenance for a decision: the app session as is, or an iMessage the
    * transport already redeemed through the guard's inbound ledger (only the
    * iMessage bridge and the mission CLI may). An inbound id from anyone else is
@@ -568,8 +693,51 @@ const make = Effect.gen(function* () {
       return upserts;
     });
 
-  const signalResolved = (ask: Ask, released: ReadonlyArray<MissionRecordRef>) =>
-    signals.askResolved({ ask, released });
+  const signalResolved = (
+    ask: Ask,
+    released: ReadonlyArray<MissionRecordRef>,
+    comments: ReadonlyArray<InboxComment> = [],
+  ) => signals.askResolved({ ask, released, ...(comments.length === 0 ? {} : { comments }) });
+
+  /** The asker hears the comments with the answer; the master hears them here. */
+  const tellOfAskComments = (result: {
+    readonly ask: Ask;
+    readonly comments: ReadonlyArray<InboxComment>;
+    readonly decidedBy: MissionProvenance;
+  }) =>
+    result.comments.length === 0
+      ? Effect.void
+      : tellOfComments({
+          missionId: result.ask.missionId,
+          kind: "decision",
+          summary: `The owner's comments on ask ${result.ask.question}`,
+          body: commentsBody(answeredNote(result.ask), result.comments),
+          key: `ask:${result.ask.id}:${result.ask.status}:${result.ask.updatedAt}:comments`,
+          decidedBy: result.decidedBy,
+          notTo: [result.ask.askedBy],
+        });
+
+  /** A note with a call reaction goes to whoever made the call and the master. */
+  const tellOfCallNote = (call: Call, input: ReactToCallInput) => {
+    const note = input.note?.trim() ?? "";
+    if (note === "") return Effect.void;
+    return Effect.flatMap(now, (at) =>
+      tellOfComments({
+        missionId: call.missionId,
+        kind: "decision",
+        summary: `The owner's note on call ${call.title}`,
+        body: [
+          `Call ${call.id}: ${call.title}. Reaction: ${call.ownerReaction ?? "cleared"}.`,
+          "",
+          "The owner's note:",
+          `- ${note}`,
+        ].join("\n"),
+        key: `call:${call.id}:${call.ownerReaction ?? "none"}:${at}`,
+        decidedBy: null,
+        to: [call.decidedBy],
+      }),
+    );
+  };
 
   const allDraftNotes = (missionId: MissionId | null) =>
     Effect.gen(function* () {
@@ -651,13 +819,27 @@ const make = Effect.gen(function* () {
       const resolution = yield* fromOutcome(
         answerAsk({ ask, input, provenance: voice, asks, now: at }),
       );
+      const noted = yield* decisionComments({
+        subject: { kind: "ask", id: ask.id },
+        missionId: ask.missionId,
+        label: ask.question,
+        note: input.note,
+        provenance: voice,
+        at,
+      });
       const after = replaceById(asks, resolution.record);
       const holds = yield* syncHolds(ask.missionId, ask.blocks, after, at);
-      yield* persist(ask.missionId, resolution.events, [
-        { _tag: "ask", record: resolution.record },
-        ...holds,
-      ]);
-      return { ask: resolution.record, released: resolution.released };
+      yield* persist(
+        ask.missionId,
+        [...resolution.events, ...noted.events],
+        [{ _tag: "ask", record: resolution.record }, ...holds, ...noted.upserts],
+      );
+      return {
+        ask: resolution.record,
+        released: resolution.released,
+        comments: noted.comments,
+        decidedBy: voice,
+      };
     });
 
   const withdrawAskCommand = (input: WithdrawAskInput, provenance: MissionProvenance) =>
@@ -723,13 +905,27 @@ const make = Effect.gen(function* () {
         }),
       );
       yield* conditions.verify({ subject: askRef(ask), condition });
+      const noted = yield* decisionComments({
+        subject: { kind: "ask", id: ask.id },
+        missionId: ask.missionId,
+        label: ask.question,
+        note: input.note,
+        provenance: standing.caller.provenance,
+        at,
+      });
       const after = replaceById(asks, resolution.record);
       const holds = yield* syncHolds(ask.missionId, ask.blocks, after, at);
-      yield* persist(ask.missionId, resolution.events, [
-        { _tag: "ask", record: resolution.record },
-        ...holds,
-      ]);
-      return { ask: resolution.record, released: resolution.released };
+      yield* persist(
+        ask.missionId,
+        [...resolution.events, ...noted.events],
+        [{ _tag: "ask", record: resolution.record }, ...holds, ...noted.upserts],
+      );
+      return {
+        ask: resolution.record,
+        released: resolution.released,
+        comments: noted.comments,
+        decidedBy: standing.caller.provenance,
+      };
     });
 
   /** The conversation about a record closes with it; a failure there never undoes the decision. */
@@ -745,41 +941,64 @@ const make = Effect.gen(function* () {
 
   /**
    * One knock to the thread that wrote a decided draft, in the mission's
-   * control room through the router: the decision, the approved text and any
-   * note. Nobody is told when the writer decided it itself; a failure is
-   * logged and never undoes the decision.
+   * control room through the router: the decision, the approved text, any
+   * note and every comment the owner left on it. Nobody is told when the
+   * writer decided it itself; a failure is logged and never undoes the
+   * decision. With comments the master hears them too.
    */
-  const tellWriter = (draft: Draft) =>
-    Effect.gen(function* () {
+  const tellWriter = Effect.fn("AsksService.tellWriter")(
+    function* (draft: Draft, allComments: ReadonlyArray<InboxComment>) {
       const writer = draftWriter(draft);
-      const notice = draftDecisionNotice(draft);
-      if (writer === null || notice === null) return;
+      const comments = currentComments(draft, allComments);
+      const notice = draftDecisionNotice(draft, comments);
+      if (notice === null) return;
       const decider = draft.decidedBy;
-      if (
+      const writerDecided =
+        writer !== null &&
         decider !== null &&
         decider._tag === "agent" &&
         writer._tag === "role" &&
-        decider.roleId === writer.roleId
-      ) {
-        return;
+        decider.roleId === writer.roleId;
+      if (writer !== null && !writerDecided) {
+        yield* rooms.post(
+          {
+            missionId: draft.missionId,
+            roomId: RoomId.make(`${draft.missionId}:room:control`),
+            kind: "decision",
+            summary: notice.summary,
+            body: notice.body,
+            to: [writer],
+            key: `draft:${draft.id}:${draft.status}:${draft.revision ?? 0}`,
+          },
+          ASKS_SYSTEM,
+        );
       }
-      yield* rooms.post(
-        {
-          missionId: draft.missionId,
-          roomId: RoomId.make(`${draft.missionId}:room:control`),
-          kind: "decision",
-          summary: notice.summary,
-          body: notice.body,
-          to: [writer],
-          key: `draft:${draft.id}:${draft.status}:${draft.revision ?? 0}`,
-        },
-        ASKS_SYSTEM,
-      );
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("Draft decision did not reach its writer", { draftId: draft.id, cause }),
+      if (comments.length === 0) return;
+      const label = clipSummary(itemLabel("draft", draft));
+      const lead =
+        (draft.requestedBy ?? null) !== null && draft.status === "rewrite-requested"
+          ? `${decidedNote(draft)} ${draft.requestedBy} rewrites it with his comments before anything is posted.`
+          : decidedNote(draft);
+      yield* tellOfComments({
+        missionId: draft.missionId,
+        kind: "decision",
+        summary: `The owner's comments on draft ${label}`,
+        body: commentsBody(`Draft ${draft.id}: ${lead}`, comments),
+        key: `draft:${draft.id}:${draft.status}:${draft.revision ?? 0}:comments`,
+        decidedBy: decider,
+        notTo: writer === null ? [] : [writer],
+      });
+    },
+    (effect, draft) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Draft decision did not reach its writer", {
+            draftId: draft.id,
+            cause,
+          }),
+        ),
       ),
-    );
+  );
 
   const reopenAskCommand = (input: ReopenAskInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
@@ -1068,20 +1287,34 @@ const make = Effect.gen(function* () {
       });
       // A master's decision is recorded under its role, never as the owner.
       const { standing } = yield* standingIn(draft.missionId, voice);
+      const at = yield* now;
+      const noted = yield* decisionComments({
+        subject: { kind: "draft", id: draft.id },
+        missionId: draft.missionId,
+        label: itemLabel("draft", draft),
+        note: input.note,
+        provenance: voice,
+        at,
+      });
       const decided = yield* fromOutcome(
         decideDraft({
           draft,
           input,
           provenance: standing.caller.provenance,
           callerIsMaster: standing.isMaster,
-          now: yield* now,
+          comments: noted.comments,
+          now: at,
         }),
       );
-      yield* persist(draft.missionId, decided.events, [{ _tag: "draft", record: decided.record }]);
+      yield* persist(
+        draft.missionId,
+        [...decided.events, ...noted.events],
+        [{ _tag: "draft", record: decided.record }, ...noted.upserts],
+      );
       // Only the owner's own edits teach the house style.
       const suggestions =
         decided.edit === null || !isOwnerProvenance(voice) ? [] : yield* learnFrom(draft.missionId);
-      return { draft: decided.record, suggestions };
+      return { draft: decided.record, suggestions, comments: noted.comments };
     });
 
   /**
@@ -1102,6 +1335,15 @@ const make = Effect.gen(function* () {
       }
       const draft = yield* need("draft", input.draftId);
       const { standing } = yield* standingIn(draft.missionId, provenance);
+      const at = yield* now;
+      const noted = yield* decisionComments({
+        subject: { kind: "draft", id: draft.id },
+        missionId: draft.missionId,
+        label: itemLabel("draft", draft),
+        note: input.note,
+        provenance: standing.caller.provenance,
+        at,
+      });
       const decided = yield* fromOutcome(
         decideDraft({
           draft,
@@ -1109,13 +1351,14 @@ const make = Effect.gen(function* () {
           provenance: standing.caller.provenance,
           callerIsMaster: standing.isMaster,
           onOwnerCondition: condition,
-          now: yield* now,
+          comments: noted.comments,
+          now: at,
         }),
       );
       yield* conditions.verify({ subject: draftRef(draft), condition });
       yield* persist(draft.missionId, decided.events, [{ _tag: "draft", record: decided.record }]);
       // Only the owner's own edits teach the house style.
-      return { draft: decided.record, suggestions: [] };
+      return { draft: decided.record, suggestions: [], comments: noted.comments };
     });
 
   const reopenDraftCommand = (input: ReopenDraftInput, provenance: MissionProvenance) =>
@@ -1154,6 +1397,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const draft = yield* need("draft", input.draftId);
       const { standing } = yield* standingIn(draft.missionId, provenance);
+      const comments = yield* commentsOn(store, { kind: "draft", id: draft.id });
       const sent = yield* fromOutcome(
         recordDraftSent({
           draft,
@@ -1161,6 +1405,8 @@ const make = Effect.gen(function* () {
           callerIsMaster: standing.isMaster,
           link: input.link ?? null,
           now: yield* now,
+          ...(input.text === undefined ? {} : { text: input.text }),
+          comments,
         }),
       );
       if (sent.events.length === 0) return sent.record;
@@ -1333,7 +1579,11 @@ const make = Effect.gen(function* () {
           `Draft ${draft.id} was not opened by ${input.requestedBy}.`,
         );
       }
-      return systemDraftDecision(draft, input.head);
+      return systemDraftDecision(
+        draft,
+        input.head,
+        yield* commentsOn(store, { kind: "draft", id: draft.id }),
+      );
     });
 
   const reportDraftSentCommand = (input: ReportDraftSentInput, provenance: MissionProvenance) =>
@@ -1449,6 +1699,7 @@ const make = Effect.gen(function* () {
     readonly application: SuggestionApplication | null;
     readonly decisionId: MissionEvent["id"];
     readonly decider: MissionProvenance;
+    readonly comments: ReadonlyArray<InboxComment>;
   }
 
   /**
@@ -1464,6 +1715,14 @@ const make = Effect.gen(function* () {
         decideSuggestion({ suggestion, input, caller, callerIsMaster: isMaster, now: at }),
       );
       const decider = decided.record.decidedBy ?? provenance;
+      const noted = yield* decisionComments({
+        subject: { kind: "suggestion", id: suggestion.id },
+        missionId: suggestion.missionId,
+        label: suggestion.title,
+        note: input.note,
+        provenance,
+        at,
+      });
       let record = decided.record;
       const events: ModelEvent[] = [...decided.events];
       const upserts: MissionStoreRecord[] = [];
@@ -1490,15 +1749,17 @@ const make = Effect.gen(function* () {
           record = recordOutcome(record, `Not applied: ${applied.failure.detail}`);
         }
       }
-      const committed = yield* persist(suggestion.missionId, events, [
-        { _tag: "suggestion", record },
-        ...upserts,
-      ]);
+      const committed = yield* persist(
+        suggestion.missionId,
+        [...events, ...noted.events],
+        [{ _tag: "suggestion", record }, ...upserts, ...noted.upserts],
+      );
       const pending: PendingApplication = {
         record,
         application,
         decisionId: committed.id,
         decider,
+        comments: noted.comments,
       };
       if (application !== null) applying.add(record.id);
       return pending;
@@ -1539,10 +1800,27 @@ const make = Effect.gen(function* () {
     Effect.uninterruptible(
       Effect.gen(function* () {
         const pending = yield* serialized(decideSuggestionStep(input, provenance));
+        yield* tellOfSuggestionComments(pending);
         if (pending.application === null) return pending.record;
         return yield* applyDecided(pending, pending.application);
       }),
     );
+
+  /** The master applies the change an accepted suggestion asks for, so it hears his comments. */
+  const tellOfSuggestionComments = (pending: PendingApplication) =>
+    pending.comments.length === 0
+      ? Effect.void
+      : tellOfComments({
+          missionId: pending.record.missionId,
+          kind: "decision",
+          summary: `The owner's comments on suggestion ${pending.record.title}`,
+          body: commentsBody(
+            `Suggestion ${pending.record.id} is ${pending.record.status}.`,
+            pending.comments,
+          ),
+          key: `suggestion:${pending.record.id}:${pending.record.status}:comments`,
+          decidedBy: pending.decider,
+        });
 
   /** Runs a claimed decision's applier and records what it did. */
   const applyDecided = (pending: PendingApplication, application: SuggestionApplication) =>
@@ -1699,6 +1977,8 @@ const make = Effect.gen(function* () {
           application,
           decisionId: decision.id,
           decider: record.decidedBy ?? decision.provenance,
+          // The restart sweep only finishes the applier; the notice went with the decision.
+          comments: [],
         };
         const done = followed.has(decision.id);
         const tooOld =
@@ -1902,6 +2182,17 @@ const make = Effect.gen(function* () {
       );
       const comment = { id: yield* newId("comment"), body: input.body, at };
       const record: InboxMark = { ...mark, comments: [...mark.comments, comment], updatedAt: at };
+      // A system posts an approved draft's text as given, so a comment on one
+      // that hasn't gone out sends it back to apply the comments first.
+      const sentBack =
+        input.subject.kind === "draft"
+          ? sendBackForComments({
+              draft: yield* need("draft", input.subject.id),
+              comments: record.comments,
+              provenance,
+              now: at,
+            })
+          : null;
       yield* persist(
         item.missionId,
         [
@@ -1913,52 +2204,114 @@ const make = Effect.gen(function* () {
             provenance,
             { commentId: comment.id },
           ),
+          ...(sentBack?.events ?? []),
         ],
-        [{ _tag: "inbox-mark", record }],
+        [
+          { _tag: "inbox-mark", record },
+          ...(sentBack === null ? [] : [{ _tag: "draft" as const, record: sentBack.record }]),
+        ],
       );
       return { record, item, comment };
     });
 
   /**
-   * One knock to the master when the commented item is the master's to decide;
-   * anything else wakes nobody. A failure is logged and keeps the comment.
+   * A comment reaches whoever acts on the item (a draft's writer, an ask's
+   * asker, where a knock went) and the master, in one post. It decides
+   * nothing and opens no discussion. A failure is logged and keeps the comment.
    */
-  const tellMasterOfComment = (
+  /** Who acts on an item now, and the line telling them where it stands. */
+  const whoActsOn = Effect.fn("AsksService.whoActsOn")(function* (
     subject: InboxItemRef,
-    item: {
-      readonly record: unknown;
-      readonly missionId: MissionId | null;
-      readonly label: string;
+  ): Effect.fn.Return<
+    {
+      readonly to: ReadonlyArray<MissionActor>;
+      readonly lead: string;
+      readonly current: (comments: ReadonlyArray<InboxComment>) => ReadonlyArray<InboxComment>;
     },
-    comment: { readonly id: string; readonly body: string },
-  ) =>
-    Effect.gen(function* () {
-      const missionId = item.missionId;
-      if (missionId === null || !isMasterRouted(subject.kind, item.record)) return;
-      const cast = yield* castOf(missionId);
-      const masterRoleId =
-        cast.mission?.masterRoleId ?? cast.roles.find((role) => role.kind === "master")?.id ?? null;
-      if (masterRoleId === null) return;
-      yield* rooms.post(
-        {
-          missionId,
-          roomId: RoomId.make(`${missionId}:room:control`),
-          kind: "request",
-          summary: clipSummary(`The owner commented on ${subject.kind} ${item.label}`),
-          body: comment.body,
-          to: [{ _tag: "role", roleId: masterRoleId }],
-          key: `comment:${markIdOf(subject)}:${comment.id}`,
-        },
-        ASKS_SYSTEM,
-      );
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("Inbox comment did not reach the master", {
-          subject: markIdOf(subject),
-          cause,
-        }),
+    MissionError
+  > {
+    const ref = `${subject.kind} ${subject.id}`;
+    const all = (comments: ReadonlyArray<InboxComment>) => comments;
+    switch (subject.kind) {
+      case "draft": {
+        const draft = yield* need("draft", subject.id);
+        const writer = draftWriter(draft);
+        return {
+          to: writer === null ? [] : [writer],
+          lead: draftCommentLead(draft),
+          current: (comments) => currentComments(draft, comments),
+        };
+      }
+      case "ask": {
+        const ask = yield* need("ask", subject.id);
+        return {
+          to: [ask.askedBy],
+          lead:
+            ask.status === "open"
+              ? `Ask ${ask.id} is waiting on his answer: ${ask.question}`
+              : `Ask ${ask.id} is ${ask.status}: ${ask.question}`,
+          current: all,
+        };
+      }
+      case "knock": {
+        const knock = yield* need("knock", subject.id);
+        return {
+          to: knock.forwardedTo === null ? [] : [knock.forwardedTo],
+          lead: `Knock ${knock.id} from ${knock.fromTitle} is ${knock.status}.`,
+          current: all,
+        };
+      }
+      default:
+        return { to: [], lead: `The owner commented on ${ref}.`, current: all };
+    }
+  });
+
+  const tellOfComment = Effect.fn("AsksService.tellOfComment")(
+    function* (subject: InboxItemRef, mark: InboxMark, label: string) {
+      const comment = mark.comments.at(-1);
+      if (comment === undefined) return;
+      const actor = yield* whoActsOn(subject);
+      yield* tellOfComments({
+        missionId: mark.missionId,
+        kind: "request",
+        summary: `The owner commented on ${subject.kind} ${label}`,
+        body: commentsBody(actor.lead, actor.current(mark.comments)),
+        key: `comment:${markIdOf(subject)}:${comment.id}`,
+        decidedBy: null,
+        to: actor.to,
+      });
+    },
+    // The comment is saved already; a failed notice must not fail the call and
+    // invite a retry that saves it twice.
+    (effect, subject) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("The owner's comment did not reach whoever acts", {
+            subject: markIdOf(subject),
+            cause,
+          }),
+        ),
       ),
-    );
+  );
+
+  const draftCommentLead = (draft: Draft): string => {
+    const ref = `Draft ${draft.id}`;
+    const system = draft.requestedBy ?? null;
+    switch (draft.status) {
+      case "approved":
+        return `${ref} is approved and not sent yet. Apply the owner's comments before you post it, then record it with mission_draft_sent, passing the text you posted.`;
+      case "rewrite-requested":
+        return system === null
+          ? `${ref} is back for a rewrite. Apply the owner's comments in the new text.`
+          : `${ref} went back to ${system} to apply the owner's comments; nothing is posted until he approves the new text.`;
+      case "pending":
+        return `${ref} is waiting on a decision.`;
+      case "sent":
+        return `${ref} already went out; the owner commented after.`;
+      default:
+        return `${ref} is ${draft.status}.`;
+    }
+  };
 
   const snoozeInboxItemCommand = (input: SnoozeInboxItemInput, provenance: MissionProvenance) =>
     Effect.gen(function* () {
@@ -2073,8 +2426,10 @@ const make = Effect.gen(function* () {
           ? answerAskCommand(input, provenance)
           : answerAskOnConditionCommand(input, input.onOwnerCondition, provenance),
       ).pipe(
-        Effect.tap((result) => signalResolved(result.ask, result.released)),
+        Effect.tap((result) => signalResolved(result.ask, result.released, result.comments)),
+        Effect.tap((result) => tellOfAskComments(result)),
         Effect.tap((result) => settleDiscussion(askRef(result.ask), answeredNote(result.ask))),
+        Effect.map(({ ask, released }) => ({ ask, released })),
       ),
     withdrawAsk: (input, provenance) =>
       serialized(withdrawAskCommand(input, provenance)).pipe(
@@ -2088,7 +2443,10 @@ const make = Effect.gen(function* () {
       ),
     reopenAsk: (input, provenance) => serialized(reopenAskCommand(input, provenance)),
     makeCall: (input, provenance) => serialized(makeCallCommand(input, provenance)),
-    reactToCall: (input, provenance) => serialized(reactToCallCommand(input, provenance)),
+    reactToCall: (input, provenance) =>
+      serialized(reactToCallCommand(input, provenance)).pipe(
+        Effect.tap((call) => tellOfCallNote(call, input)),
+      ),
     submitDraft: (input, provenance) => serialized(submitDraftCommand(input, provenance)),
     reviseDraft: (input, provenance) => serialized(reviseDraftCommand(input, provenance)),
     decideDraft: (input, provenance) =>
@@ -2103,13 +2461,14 @@ const make = Effect.gen(function* () {
             ? Effect.void
             : settleDiscussion(draftRef(result.draft), decidedNote(result.draft)),
         ),
-        Effect.tap((result) => tellWriter(result.draft)),
+        Effect.tap((result) => tellWriter(result.draft, result.comments)),
+        Effect.map(({ draft, suggestions }) => ({ draft, suggestions })),
       ),
     reopenDraft: (input, provenance) => serialized(reopenDraftCommand(input, provenance)),
     withdrawDraft: (input, provenance) =>
       serialized(withdrawDraftCommand(input, provenance)).pipe(
         Effect.tap((draft) => settleDiscussion(draftRef(draft), `Withdrawn: ${input.note}`)),
-        Effect.tap(tellWriter),
+        Effect.tap((draft) => tellWriter(draft, [])),
       ),
     recordDraftSent: (input, provenance) => serialized(recordDraftSentCommand(input, provenance)),
     routeDraft: (input, provenance) => serialized(routeDraftCommand(input, provenance)),
@@ -2131,9 +2490,11 @@ const make = Effect.gen(function* () {
     post: postCommand,
     // ardud missions: finish-a
     inboxMarks,
+    // ardud missions: r22 comments
+    withComments: (kind, records) => attachComments(store, kind, records),
     commentInboxItem: (input, provenance) =>
       serialized(commentInboxItemCommand(input, provenance)).pipe(
-        Effect.tap(({ item, comment }) => tellMasterOfComment(input.subject, item, comment)),
+        Effect.tap(({ record, item }) => tellOfComment(input.subject, record, item.label)),
         Effect.map(({ record }) => record),
       ),
     snoozeInboxItem: (input, provenance) => serialized(snoozeInboxItemCommand(input, provenance)),

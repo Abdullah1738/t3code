@@ -9,9 +9,11 @@ import {
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import { agent, at, masterThread, missionId, seed } from "../asks/AsksService.testkit.ts";
+import { withComment } from "../asks/inboxMarks.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { digestText, makeMasterFeed } from "./masterFeed.ts";
 import { controlRoomId, MissionRouter } from "./MissionRouter.ts";
@@ -230,6 +232,47 @@ describe("master inbox feed", () => {
       const after = yield* controlMessages;
       assert.strictEqual(after.length, 2);
       assert.include((yield* rooms.messageBody(after[1]!.id)) ?? "", "Smaller PRs please.");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("comments the owner left before deciding reach the master with the decision", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      const feed = yield* feedOf(null);
+      const record = approval("14", "owner");
+      yield* openApproval(record);
+      const subject = { kind: "approval", id: record.id } as const;
+      const comment = (id: string, body: string) => ({ id, body, at });
+      const mark = withComment(
+        Option.some(withComment(Option.none(), subject, missionId, comment("c-1", "Squash it."))),
+        subject,
+        missionId,
+        comment("c-2", "Delete the branch after."),
+      );
+      const owner: MissionProvenance = { _tag: "owner-app", surface: "web", sessionId: "s-1" };
+      const decided = yield* store.commit({
+        event: {
+          missionId,
+          kind: "approval.decided",
+          actor: { _tag: "owner" },
+          provenance: owner,
+          summary: `Approved: ${record.title}`,
+          subject,
+          payload: { action: "approve", approver: "owner", note: null, commented: true },
+        },
+        upserts: [
+          { _tag: "approval", record: { ...record, status: "approved" } },
+          { _tag: "inbox-mark", record: mark },
+        ],
+      });
+      yield* feed.handle(decided.event);
+      const messages = yield* controlMessages;
+      assert.strictEqual(messages.length, 1);
+      const rooms = yield* RouterStore.RouterStore;
+      const body = (yield* rooms.messageBody(messages[0]!.id)) ?? "";
+      assert.include(body, "left these comments:\n- Squash it.\n- Delete the branch after.");
     }).pipe(Effect.provide(h.layer));
   });
 
