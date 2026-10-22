@@ -32,10 +32,10 @@ const HELP = `mission <command> [options]
   draft drop DRAFT [--note T] --via imessage --inbound ID
   draft show DRAFT                          full text plus attachments (paths, urls)
   requests MISSION [--status waiting-on-master|answered|settled]
-  request open MISSION --text T --via imessage --inbound ID
-  request reply REQUEST --text T --via imessage --inbound ID
+  request open MISSION --text T [--image PATH]... --via imessage --inbound ID
+  request reply REQUEST --text T [--image PATH]... --via imessage --inbound ID
   request settle|reopen REQUEST [--note T] --via imessage --inbound ID
-  discuss KIND:ID --mission M --text T --via imessage --inbound ID
+  discuss KIND:ID --mission M --text T [--image PATH]... --via imessage --inbound ID
   needs [--mission M]                       what the board shows him under Needs you
   approvals MISSION [--status pending,approved]   default: pending plus recent
   approval approve|reject APPROVAL [--note T] --via imessage --inbound ID
@@ -56,6 +56,10 @@ you tried in --text. It reaches the master as a request from that chat,
 never as him, and the same report twice posts once (--key names a report you
 may resend). Complaints he or Moni typed still go through
 request open ... --via imessage --inbound ID.
+
+--image attaches a screenshot or photo he sent (PNG, JPEG, WebP or GIF, 10 MiB
+at most; repeat it for more). Each one sits where {image1}, {image2}... is in
+--text, else at the end, and the master gets it as [image N: /path] in place.
 
 Watch kinds: ask-opened, ask-answered, draft-opened, draft-decided,
 suggestion-opened, milestone-at-risk, lane-stalled, swarm-paused,
@@ -108,6 +112,7 @@ const { values: flags, positionals } = NodeUtil.parseArgs({
     cursor: { type: "string" },
     chat: { type: "string" },
     file: { type: "string" },
+    image: { type: "string", multiple: true },
     key: { type: "string" },
     pretty: { type: "boolean" },
     help: { type: "boolean", short: "h" },
@@ -127,6 +132,15 @@ const query = (params) => {
   return entries.length === 0 ? "" : `?${new URLSearchParams(entries).toString()}`;
 };
 const id = (value, name) => encodeURIComponent(need(value, name));
+// The server reads each file itself, so it needs the absolute path.
+const images = () => {
+  const paths = (flags.image ?? []).map((path) => {
+    const absolute = NodePath.resolve(path);
+    if (!NodeFS.existsSync(absolute)) fail(`--image ${absolute} does not exist`);
+    return { _tag: "file", path: absolute };
+  });
+  return paths.length === 0 ? {} : { images: paths };
+};
 
 async function request(method, path, body) {
   const { url, token } = discoverConfig({
@@ -287,18 +301,24 @@ async function main() {
         return fail(`unknown request action ${action ?? ""}\n\n${HELP}`);
       }
       const text = need(flags.text, "--text (what he asked, in his words)");
+      const attached = images();
       const inboundId = ownerInbound();
       if (action === "open") {
         return print(
           await request("POST", "/requests", {
             missionId: need(target ?? flags.mission, "MISSION"),
             text,
+            ...attached,
             inboundId,
           }),
         );
       }
       return print(
-        await request("POST", `/requests/${id(target, "REQUEST")}/reply`, { text, inboundId }),
+        await request("POST", `/requests/${id(target, "REQUEST")}/reply`, {
+          text,
+          ...attached,
+          inboundId,
+        }),
       );
     }
     case "discuss": {
@@ -307,12 +327,14 @@ async function main() {
       const split = ref.indexOf(":");
       if (split <= 0 || split === ref.length - 1) fail("discuss needs KIND:ID, e.g. draft:draft-1");
       const text = need(flags.text, "--text (what he wants to discuss)");
+      const attached = images();
       const inboundId = ownerInbound();
       return print(
         await request("POST", "/requests", {
           missionId: need(flags.mission, "--mission"),
           text,
           subject: { kind: ref.slice(0, split), id: ref.slice(split + 1) },
+          ...attached,
           inboundId,
         }),
       );

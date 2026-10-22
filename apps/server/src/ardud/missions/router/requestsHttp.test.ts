@@ -18,6 +18,7 @@ import type { InboundMessage } from "../asks/provenance.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import * as MissionRouter from "./MissionRouter.ts";
 import { fakeRouterThreads, routerOverFakes } from "./MissionRouter.testkit.ts";
+import { RequestImages } from "./requestImages.ts";
 import { requestsRoutes } from "./requestsHttp.ts";
 
 const SCOPES = ["orchestration:read" as const, "orchestration:operate" as const];
@@ -322,6 +323,57 @@ describe("owner requests over iMessage", () => {
       }).pipe(Effect.provide(h.layer));
     },
   );
+
+  it.live("carries his images from iMessage into the request, once per message", () => {
+    const inbound: InboundMessage[] = [];
+    const h = harness(inbound);
+    return Effect.gen(function* () {
+      yield* seed;
+      const stored: string[] = [];
+      const registry = yield* RequestImages;
+      yield* registry.register(({ image }) => {
+        const path = image._tag === "file" ? image.path : image.attachmentId;
+        stored.push(path);
+        const assetId = `mission-00000000-0000-4000-8000-00000000000${stored.length}`;
+        return Effect.succeed({ assetId, path: `/assets/${assetId}.png` });
+      });
+      const now = yield* Clock.currentTimeMillis;
+      inbound.push(said(now, "in-1", "this header is off, see the screenshot"));
+      const body = {
+        missionId,
+        text: "{image1} is off",
+        images: [{ _tag: "file", path: "/Users/him/header.png" }],
+        inboundId: "in-1",
+      };
+      yield* withDesk(async (handle) => {
+        const opened = await call(handle, "POST", "/requests", body, "cli-token");
+        expect(opened.status).toBe(200);
+        expect(opened.reply.request.title).toBe("[image 1] is off");
+        // A retry replays; other images under the same message are a different write.
+        const retried = await call(handle, "POST", "/requests", body, "bridge-token");
+        expect(retried.reply).toEqual(opened.reply);
+        const other = await call(
+          handle,
+          "POST",
+          "/requests",
+          { ...body, images: [{ _tag: "file", path: "/Users/him/footer.png" }] },
+          "cli-token",
+        );
+        expect(other.status).toBe(409);
+        const listed = await call(
+          handle,
+          "GET",
+          `/requests?mission=${missionId}&request=${opened.reply.request.id}`,
+          undefined,
+          "cli-token",
+        );
+        expect(listed.reply.requests[0].messages.map((each: any) => each.body)).toEqual([
+          "[image 1: /assets/mission-00000000-0000-4000-8000-000000000001.png] is off",
+        ]);
+      });
+      expect(stored).toEqual(["/Users/him/header.png"]);
+    }).pipe(Effect.provide(h.layer));
+  });
 
   // Sol boundary 4, Q1: a Telegram session opened a request with a real typed
   // inbound and was recorded as the owner. Now no credential but the iMessage

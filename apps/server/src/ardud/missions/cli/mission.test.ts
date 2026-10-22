@@ -142,6 +142,70 @@ describe("mission CLI", () => {
       { text: "Ship it", inboundId: "spc-msg-2" },
     ]);
   });
+
+  it("sends his images in order, as absolute paths, with his markers left in place", async () => {
+    const { url, seen } = await listen(() => ({ ok: true, request: { id: "request-1" } }));
+    const dir = NodeFS.realpathSync(
+      NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "mission-images-")),
+    );
+    const first = NodePath.join(dir, "header.png");
+    const second = NodePath.join(dir, "footer.png");
+    NodeFS.writeFileSync(first, "png");
+    NodeFS.writeFileSync(second, "png");
+    const via = ["--via", "imessage", "--inbound", "spc-msg-4"];
+
+    const opened = await run(url, [
+      "request",
+      "open",
+      "m-1",
+      "--text",
+      "{image2} should match {image1}",
+      "--image",
+      first,
+      "--image",
+      second,
+      ...via,
+    ]);
+    const replied = await run(url, [
+      "request",
+      "reply",
+      "request-1",
+      "--text",
+      "And this one",
+      "--image",
+      second,
+      ...via,
+    ]);
+    const missing = await run(url, [
+      "request",
+      "reply",
+      "request-1",
+      "--text",
+      "x",
+      "--image",
+      NodePath.join(dir, "gone.png"),
+      ...via,
+    ]);
+
+    expect([opened.code, replied.code, missing.code]).toEqual([0, 0, 2]);
+    expect(missing.stderr).toContain("gone.png does not exist");
+    expect(seen.map((entry) => JSON.parse(entry.body))).toEqual([
+      {
+        missionId: "m-1",
+        text: "{image2} should match {image1}",
+        images: [
+          { _tag: "file", path: first },
+          { _tag: "file", path: second },
+        ],
+        inboundId: "spc-msg-4",
+      },
+      {
+        text: "And this one",
+        images: [{ _tag: "file", path: second }],
+        inboundId: "spc-msg-4",
+      },
+    ]);
+  });
   // end ardud missions: router
 
   it("reads his full view and acts for him only with the inbound id", async () => {
