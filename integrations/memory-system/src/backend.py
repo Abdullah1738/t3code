@@ -176,6 +176,75 @@ def robob_ro():
     return c
 
 
+LIVE_RUN_STATUSES = ("preparing", "queued", "starting", "running", "waiting")
+
+CURRENT_NATIVE_SQL = """
+SELECT json_extract(a.payload_json, '$.nativeThreadRef.nativeId'),
+       t.active_provider_thread_id,
+       (SELECT count(*) FROM orchestration_v2_projection_provider_threads p WHERE p.thread_id = t.thread_id),
+       (SELECT count(*) FROM orchestration_v2_projection_runs r
+        WHERE r.thread_id = t.thread_id AND r.status IN ({live})),
+       n.run_id, n.provider_thread_id,
+       at.provider_thread_id, json_extract(at.payload_json, '$.startedAt'),
+       json_extract(at.payload_json, '$.nativeThreadId'),
+       (SELECT max(x) FROM (
+          SELECT r.requested_at AS x FROM orchestration_v2_projection_runs r WHERE r.thread_id = t.thread_id
+          UNION ALL SELECT r.completed_at FROM orchestration_v2_projection_runs r WHERE r.thread_id = t.thread_id
+          UNION ALL SELECT json_extract(r.payload_json, '$.startedAt')
+            FROM orchestration_v2_projection_runs r WHERE r.thread_id = t.thread_id
+          UNION ALL SELECT json_extract(x.payload_json, '$.startedAt')
+            FROM orchestration_v2_projection_run_attempts x WHERE x.thread_id = t.thread_id
+          UNION ALL SELECT json_extract(x.payload_json, '$.completedAt')
+            FROM orchestration_v2_projection_run_attempts x WHERE x.thread_id = t.thread_id))
+FROM orchestration_v2_projection_threads t
+LEFT JOIN orchestration_v2_projection_provider_threads a ON a.provider_thread_id = t.active_provider_thread_id
+LEFT JOIN orchestration_v2_projection_runs n ON n.run_id = (
+  SELECT r.run_id FROM orchestration_v2_projection_runs r
+  WHERE r.thread_id = t.thread_id ORDER BY r.ordinal DESC LIMIT 1)
+LEFT JOIN orchestration_v2_projection_run_attempts at
+  ON at.attempt_id = json_extract(n.payload_json, '$.activeAttemptId')
+WHERE t.thread_id = ?
+""".format(live=", ".join("'%s'" % s for s in LIVE_RUN_STATUSES))
+
+
+def current_native_session(thread_id, quiet_before=None):
+    """Native id of the provider thread a Robob thread runs on now (any provider),
+    or None when it has none or it's unclear. Covers subagent child threads too.
+
+    The active pointer alone isn't enough: startup recovery rewrites old provider
+    threads, and every rewrite moves the pointer back to them. So it has to be the
+    session the newest run's active attempt actually started on. Run-level fields
+    aren't enough either: a queued provider switch can target an old provider
+    thread and keeps it after a cancel, and a steering restart moves a run to
+    another provider thread but keeps the run's earlier startedAt. Any live run
+    means the thread is busy, so it's unclear too. Threads without runs (subagent
+    children, imports) only count when they have a single provider thread.
+
+    quiet_before (ISO UTC, same format as the run timestamps) also gives None when
+    any run or attempt of the thread was requested, started or finished at or
+    after it. A held run keeps its old requested_at when it starts later."""
+    con = robob_ro()
+    try:
+        row = con.execute(CURRENT_NATIVE_SQL, (thread_id,)).fetchone()
+    finally:
+        con.close()
+    if not row:
+        return None
+    (native, active, provider_threads, live, run_id, run_pt,
+     attempt_pt, attempt_started, attempt_native, last_activity) = row
+    if native is None or live:
+        return None
+    if quiet_before and last_activity and last_activity >= quiet_before:
+        return None
+    if run_id is None:
+        return native if provider_threads == 1 else None
+    if attempt_started is None or attempt_native != native:
+        return None
+    if run_pt != active or attempt_pt != active:
+        return None
+    return native
+
+
 def tables(con, like):
     return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?", (like,))}
 
