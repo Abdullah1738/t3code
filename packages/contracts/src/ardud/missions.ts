@@ -23,7 +23,8 @@ import { ModelSelection } from "../modelSelection.ts";
  * - Suggestions never apply themselves; accept goes through the same service
  *   call a human edit uses.
  * - Owner provenance is either typed in the Robob app or a verified iMessage
- *   inbound id from the owner's or Moni's chat. Everything else is agent text.
+ *   inbound id the owner or Moni typed in a chat on the iMessage line (his
+ *   direct chat, Moni's, or a group). Everything else is agent text.
  * - Review stages point at roles, never at model ids. "Critical" is per mission,
  *   judged by the master from a written guide.
  */
@@ -131,11 +132,16 @@ export const MissionProvenance = Schema.Union([
   }),
   Schema.TaggedStruct("owner-imessage", {
     chat: TrustedChat,
-    /** Spectrum inbound message id the server verified (exists, trusted chat, typed by him). */
+    /** Spectrum inbound message id the server verified (exists, typed by him or Moni on the bridge's line). */
     inboundId: TrimmedNonEmptyString,
     // --- guard additions ---
     /** His words in that iMessage (clipped); what was recorded is the reader's take on them. */
     quote: Schema.optional(Schema.String),
+    /**
+     * The bridge chat it was typed in, when that wasn't his direct chat
+     * (`group-sb_gro`, `moni`). `chat` stays who typed it.
+     */
+    bridgeChat: Schema.optional(TrimmedNonEmptyString),
     // --- end guard additions ---
   }),
   Schema.TaggedStruct("agent", {
