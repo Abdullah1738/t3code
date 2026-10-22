@@ -24,6 +24,7 @@ import type {
   MissionInbox,
   MissionInboxHistory,
   MissionLink,
+  OwnerRequestImage,
   MissionListSnapshot,
   MissionMessage,
   MissionOverview,
@@ -493,6 +494,8 @@ export interface OpenRequestInput {
   readonly text: string;
   /** Discuss: the record it is about. The server keeps one open request per subject. */
   readonly subject?: MissionRecordRef;
+  /** In `{imageN}` marker order; see `requestTextWithImages`. */
+  readonly images?: ReadonlyArray<OwnerRequestImage>;
 }
 
 export interface RequestThreadInput {
@@ -503,6 +506,7 @@ export interface RequestThreadInput {
 export interface ReplyRequestInput {
   readonly requestId: string;
   readonly text: string;
+  readonly images?: ReadonlyArray<OwnerRequestImage>;
 }
 
 export interface RequestIdInput {
