@@ -49,12 +49,15 @@ const openNoteLine = (note) =>
   `- ${note.id} [${note.type}, ${note.severity}] ${note.summary}`;
 
 /** Per-slice user message: lane context, open notes, then the slice. */
-export function userPrompt({ lane, openNotes, slice, count }) {
+export function userPrompt({ lane, openNotes, slice, count, minSeverity }) {
   const header = [
     `Lane: ${lane.name}${lane.purpose ? ` (${lane.purpose})` : ''}`,
     lane.missionTitle ? `Mission: ${lane.missionTitle}` : null,
     lane.subMissionTitle ? `Sub-mission: ${lane.subMissionTitle}` : null,
     `Slice: events e1 to e${count}`,
+    minSeverity && minSeverity !== SEVERITIES[0]
+      ? `Only notes of severity ${minSeverity} or above are kept for this mission, plus updates to the open notes below. Skip the rest.`
+      : null,
   ].filter(Boolean);
   const open =
     openNotes.length === 0
