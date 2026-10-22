@@ -35,6 +35,7 @@ import {
   viewChartLabels,
   viewChartScale,
   // --- end blocks additions ---
+  viewChartFraction,
 } from "./index.ts";
 
 const decodeAsk = Schema.decodeUnknownSync(Ask);
@@ -808,6 +809,30 @@ describe("chart axes", () => {
     expect(ticks([1400, 2600])).toEqual(["0", "1k", "2k", "3k"]);
     expect(ticks([0.25, 0.8])).toEqual(["0", "0.5", "1"]);
     expect(ticks([])).toEqual(["0", "0.5"]);
+  });
+
+  it("keeps a finite scale for values whose rounded bounds overflow", () => {
+    for (const values of [
+      [Number.MAX_VALUE],
+      [-Number.MAX_VALUE],
+      [-Number.MAX_VALUE, Number.MAX_VALUE],
+      [1, Number.MAX_VALUE],
+      [Number.MIN_VALUE],
+    ]) {
+      const scale = viewChartScale(points(values));
+      expect(Number.isFinite(scale.min) && Number.isFinite(scale.max)).toBe(true);
+      expect(scale.max).toBeGreaterThan(scale.min);
+      expect(scale.ticks.length).toBeGreaterThanOrEqual(2);
+      expect(scale.ticks.length).toBeLessThanOrEqual(6);
+      expect(scale.ticks.every((tick) => Number.isFinite(tick.value))).toBe(true);
+      for (const value of [...values, 0]) {
+        const fraction = viewChartFraction(scale, value);
+        expect(fraction).toBeGreaterThanOrEqual(0);
+        expect(fraction).toBeLessThanOrEqual(1);
+      }
+    }
+    const widest = viewChartScale(points([-Number.MAX_VALUE, Number.MAX_VALUE]));
+    expect(viewChartFraction(widest, 0)).toBe(0.5);
   });
 
   it("labels the first, last and evenly spaced points between", () => {

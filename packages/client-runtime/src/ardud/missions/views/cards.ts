@@ -564,9 +564,12 @@ export interface ViewChartScale {
 const chartLabel = (value: number): string =>
   compactNumber(value) ?? String(Number(value.toFixed(2)));
 
+/** Three steps cover the data; rounding out at both ends can add one more. */
+const CHART_TICKS_MAX = 6;
+
 /** Round y ticks that always include zero, so bars stand on a real baseline. */
 export function viewChartScale(points: ReadonlyArray<ViewChartPoint>): ViewChartScale {
-  const values = points.map((point) => point.value);
+  const values = points.map((point) => point.value).filter(Number.isFinite);
   const low = Math.min(0, ...values);
   const high = Math.max(0, ...values);
   const span = high - low || 1;
@@ -575,12 +578,30 @@ export function viewChartScale(points: ReadonlyArray<ViewChartPoint>): ViewChart
   const step = ([1, 2, 2.5, 5, 10].find((m) => m * magnitude >= rough) ?? 10) * magnitude;
   const min = Math.floor(low / step) * step;
   const max = Math.max(Math.ceil(high / step) * step, min + step);
-  const ticks: Array<{ value: number; label: string }> = [];
-  for (let value = min; value <= max + step / 2; value += step) {
-    const clean = Number(value.toPrecision(12));
-    ticks.push({ value: clean, label: chartLabel(clean) });
+  // Values near Number.MAX_VALUE overflow the rounded bounds (or the span) to
+  // Infinity, and a denormal span rounds the step to 0; the plot then spans
+  // the raw values (high > low here) with no ticks between.
+  if (!([span, step, min, max].every(Number.isFinite) && step > 0)) {
+    return {
+      min: low,
+      max: high,
+      ticks: [low, high].map((value) => ({ value, label: chartLabel(value) })),
+    };
   }
+  const count = Math.min(CHART_TICKS_MAX, Math.round((max - min) / step) + 1);
+  const ticks = Array.from({ length: count }, (_, slot) => {
+    const clean = Number((min + slot * step).toPrecision(12));
+    return { value: clean, label: chartLabel(clean) };
+  });
   return { min, max, ticks };
+}
+
+/** How high a value sits on the scale, 0 at the bottom and 1 at the top. */
+export function viewChartFraction(scale: ViewChartScale, value: number): number {
+  const span = scale.max - scale.min;
+  if (Number.isFinite(span)) return (value - scale.min) / span;
+  // A scale from -MAX_VALUE to MAX_VALUE spans Infinity; halved it fits.
+  return (value / 2 - scale.min / 2) / (scale.max / 2 - scale.min / 2);
 }
 
 /** Up to `count` evenly spaced x labels, first and last included; a phone fits about four. */

@@ -29,6 +29,7 @@ import {
   type ViewStatTile,
   type ViewTimelineEntry,
   // --- end blocks additions ---
+  viewChartFraction,
 } from "@t3tools/client-runtime/ardud/missions";
 import { missionErrorMessage } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { Image } from "expo-image";
@@ -411,8 +412,7 @@ function ChartPlot(props: {
   const [width, setWidth] = useState(0);
   const { points } = props;
   const scale = viewChartScale(points);
-  const y = (value: number) =>
-    PLOT_HEIGHT - ((value - scale.min) / (scale.max - scale.min)) * PLOT_HEIGHT;
+  const y = (value: number) => PLOT_HEIGHT - viewChartFraction(scale, value) * PLOT_HEIGHT;
   const zero = y(0);
   const band = width / points.length;
   const last = points.at(-1);
