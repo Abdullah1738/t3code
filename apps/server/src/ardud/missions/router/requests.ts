@@ -831,18 +831,35 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               ? null
               : yield* appendedBefore(mission.id, inboundId, `request:${requestId}:open`, subject);
           const ongoing = subject === null ? null : yield* openAbout(mission.id, subject);
+          const heading = (opening: boolean) =>
+            writer._tag === "master"
+              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${escapeRequestImageRefs(input.quotedFrom ?? "")}.]\n\n`
+              : "";
+          if (prior === null && ongoing !== null && ongoing.id !== requestId) {
+            // His quote stays with the master's words when they join an open
+            // discussion, and the master still owes him updates there. The
+            // reply stores and places his images, once.
+            return yield* replyLocked(
+              {
+                requestId: ongoing.id,
+                text: input.text,
+                ...(input.images === undefined ? {} : { images: input.images }),
+                ...(writer._tag === "master" ? { status: "waiting-on-master" as const } : {}),
+              },
+              provenance,
+              appendKey(ongoing.id),
+              heading(false),
+            );
+          }
           // The images go with the request this message lands in.
           const text = yield* images.place(
             mission.id,
-            prior?.request.id ?? ongoing?.id ?? requestId,
+            prior?.request.id ?? requestId,
             input.text,
             input.images,
             provenance,
           );
-          const quoted = (opening: boolean) =>
-            writer._tag === "master"
-              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${escapeRequestImageRefs(input.quotedFrom ?? "")}.]\n\n${text}`
-              : text;
+          const quoted = (opening: boolean) => `${heading(opening)}${text}`;
           if (prior !== null && subject !== null) {
             const earlier = prior.request;
             // The master's words added to an open discussion are a status reply.
@@ -863,19 +880,6 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               );
             }
             return { result: earlier, speaker: null, deliveries: [] };
-          }
-          if (ongoing !== null && ongoing.id !== requestId) {
-            // His quote stays with the master's words when they join an open
-            // discussion, and the master still owes him updates there.
-            return yield* replyLocked(
-              {
-                requestId: ongoing.id,
-                text: quoted(false),
-                ...(writer._tag === "master" ? { status: "waiting-on-master" as const } : {}),
-              },
-              provenance,
-              appendKey(ongoing.id),
-            );
           }
           const roomId = requestRoomId(mission.id, requestId);
           const title = requestTitleOf(text);
@@ -962,12 +966,14 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
 
     /**
      * A reply, under the request lock the caller holds. `messageKey` replaces
-     * the key derived from the input when Discuss adds to an open request.
+     * the key derived from the input when Discuss adds to an open request, and
+     * `heading` (already escaped) goes before the placed words.
      */
     const replyLocked = (
       input: ReplyOwnerRequestInput,
       provenance: MissionProvenance,
       messageKey: string | null = null,
+      heading = "",
     ) => {
       const images = imageBatch();
       return Effect.gen(function* () {
@@ -999,13 +1005,14 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           if (!owner) yield* refuseSilence(input.text);
           yield* checkLinks(request.missionId, links);
         }
-        const text = yield* images.place(
+        const placed = yield* images.place(
           request.missionId,
           request.id,
           input.text,
           input.images,
           provenance,
         );
+        const text = `${heading}${placed}`;
         const message = messageInput(request, owner ? "request" : "status", text, to, key);
         // A retried reply lands on the message it already wrote.
         if ((yield* priorPost(key, message)) === "repeat") {
