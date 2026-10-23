@@ -43,7 +43,7 @@ it("keeps Return on a hardware keyboard as a new line, since only the buttons se
     text: "",
     selection: { start: 0, end: 0 },
     context: [],
-    uploading: false,
+    busy: false,
     preview: null,
   } as unknown as RequestDraft;
   root = createRoot(document.createElement("div"));

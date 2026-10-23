@@ -145,16 +145,12 @@ export function useDiscussion(
 
   const settle = () => {
     if (!request) return;
-    const note = draft.noteOnly();
-    if (note === null) return;
-    void run("Could not settle", () =>
-      missionsSource().settleRequest(settleInput(request.id, note)),
-    ).then((done) => {
-      if (done) draft.clear();
-    });
+    void draft.sendNote((note) =>
+      run("Could not settle", () => missionsSource().settleRequest(settleInput(request.id, note))),
+    );
   };
 
-  return { request, unread, draft, pending: pending || draft.uploading, send, settle };
+  return { request, unread, draft, pending: pending || draft.busy, send, settle };
 }
 
 export interface RequestComposerState {
@@ -187,7 +183,7 @@ export function useRequestComposer(
         if (sent && opened) onOpened(opened);
       });
   };
-  return { draft, pending: pending || draft.uploading, send };
+  return { draft, pending: pending || draft.busy, send };
 }
 
 export interface RequestThreadState {
@@ -217,14 +213,11 @@ export function useRequestThread(missionId: MissionId, requestId: string): Reque
     markRead(readMark);
   }, [readMark]);
 
-  const clearOn = (done: boolean) => {
-    if (done) draft.clear();
-  };
   return {
     request,
     partial: thread === undefined && row !== undefined,
     draft,
-    pending: pending || draft.uploading,
+    pending: pending || draft.busy,
     reply: () => {
       void draft.send((text, images) =>
         sendChecked(run, "Could not send", replyRequestInput(requestId, text, images), (input) =>
@@ -233,18 +226,14 @@ export function useRequestThread(missionId: MissionId, requestId: string): Reque
       );
     },
     settle: () => {
-      const note = draft.noteOnly();
-      if (note === null) return;
-      void run("Could not settle", () =>
-        missionsSource().settleRequest(settleInput(requestId, note)),
-      ).then(clearOn);
+      void draft.sendNote((note) =>
+        run("Could not settle", () => missionsSource().settleRequest(settleInput(requestId, note))),
+      );
     },
     reopen: () => {
-      const note = draft.noteOnly();
-      if (note === null) return;
-      void run("Could not reopen", () =>
-        missionsSource().reopenRequest(settleInput(requestId, note)),
-      ).then(clearOn);
+      void draft.sendNote((note) =>
+        run("Could not reopen", () => missionsSource().reopenRequest(settleInput(requestId, note))),
+      );
     },
   };
 }

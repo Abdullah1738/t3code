@@ -3,6 +3,7 @@ import "vite-plus/test/config";
 
 const reactTests = [
   "src/ardud/missions/RequestEditor.test.tsx",
+  "src/ardud/missions/requestDraft.test.tsx",
   "src/components/ui/Dialog.android.test.tsx",
   "src/features/home/home-route-visibility.test.tsx",
   "src/features/settings/SettingsServerControlsRouteScreen.test.tsx",

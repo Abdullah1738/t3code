@@ -38,7 +38,7 @@ export function RequestEditor(props: {
           context={draft.context}
           placeholder={props.placeholder}
           autoFocus={props.autoFocus}
-          editable={!draft.uploading}
+          editable={!draft.busy}
           singleLineCentered={false}
           contentInsetVertical={0}
           onChangeText={draft.setText}
@@ -55,7 +55,7 @@ export function RequestEditor(props: {
       </View>
       <View className="flex-row flex-wrap items-center gap-2">
         <ComposerAttachmentButton
-          disabled={draft.uploading}
+          disabled={draft.busy}
           supportsFiles={false}
           onPickMedia={draft.attach}
           onPickFiles={async () => undefined}

@@ -38,7 +38,8 @@ export interface RequestDraft {
   /** The words alone, for a settle or reopen note. */
   readonly words: string;
   readonly empty: boolean;
-  readonly uploading: boolean;
+  /** A send or note is in flight; the box takes no words or images until it ends. */
+  readonly busy: boolean;
   readonly preview: FilePreviewSource | null;
   readonly setText: (text: string) => void;
   readonly setSelection: (selection: DraftSelection) => void;
@@ -48,8 +49,11 @@ export interface RequestDraft {
   readonly closePreview: () => void;
   /** Uploads the chipped images, then hands the text and their ids to `deliver`. */
   readonly send: (deliver: Deliver) => Promise<boolean>;
-  /** The words for a settle or reopen note; null, after saying so, while images are chipped. */
-  readonly noteOnly: () => string | null;
+  /**
+   * Runs a settle or reopen with the words alone, and clears the box once it's
+   * done. Refused, after saying so, while images are chipped.
+   */
+  readonly sendNote: (action: (note: string) => Promise<boolean>) => Promise<boolean>;
   readonly clear: () => void;
 }
 
@@ -82,7 +86,7 @@ export function useRequestDraft(): RequestDraft {
   const environmentId = useMissionsEnvironmentId();
   const [field, setField] = useState<Field>(EMPTY_FIELD);
   const [images, setImages] = useState<ReadonlyArray<DraftComposerImageAttachment>>([]);
-  const [uploading, setUploading] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<FilePreviewSource | null>(null);
   // What the box holds, uploads included, for clearing and closing it.
   const held = useRef(images);
@@ -90,6 +94,10 @@ export function useRequestDraft(): RequestDraft {
     held.current = images;
   }, [images]);
   useEffect(() => () => releaseUploads(held.current), []);
+  // A send in flight takes no new images, and images still being read when a
+  // message went were meant for it, so they don't land in the next one.
+  const sending = useRef(false);
+  const cleared = useRef(0);
 
   const chipped = chippedImages(field.text, images);
   const words = draftWords(field.text);
@@ -105,7 +113,25 @@ export function useRequestDraft(): RequestDraft {
     setField((current) => insertImageChips(current.text, current.selection, kept));
   };
 
+  /** Adds images picked or pasted before now, unless a message went or is going meanwhile. */
+  const addFrom = async (read: () => Promise<ReadonlyArray<DraftComposerImageAttachment>>) => {
+    if (sending.current) {
+      Alert.alert("Not attached", "Wait for the message to send, then attach it.");
+      return;
+    }
+    const round = cleared.current;
+    const picked = await read();
+    if (sending.current || cleared.current !== round) {
+      if (picked.length > 0) {
+        Alert.alert("Not attached", "A message went while it was read. Attach it again.");
+      }
+      return;
+    }
+    add(picked);
+  };
+
   const clear = () => {
+    cleared.current += 1;
     // A sent message's images are mission images by now; the uploads were only the way there.
     releaseUploads(held.current);
     held.current = [];
@@ -113,8 +139,20 @@ export function useRequestDraft(): RequestDraft {
     setImages([]);
   };
 
-  const send = async (deliver: Deliver): Promise<boolean> => {
-    if (uploading) return false;
+  // Set before the first await, so a second tap in the same frame sees it.
+  const whileSending = async (work: () => Promise<boolean>): Promise<boolean> => {
+    if (sending.current) return false;
+    sending.current = true;
+    setBusy(true);
+    try {
+      return await work();
+    } finally {
+      sending.current = false;
+      setBusy(false);
+    }
+  };
+
+  const deliverDraft = async (deliver: Deliver): Promise<boolean> => {
     const { text } = field;
     if (chipped.length === 0) {
       const sent = await deliver(text, []);
@@ -125,7 +163,6 @@ export function useRequestDraft(): RequestDraft {
       Alert.alert("Could not send", "Connect to the server to send images.");
       return false;
     }
-    setUploading(true);
     try {
       const prepared = await prepareTurnAttachments({
         environmentId,
@@ -161,8 +198,6 @@ export function useRequestDraft(): RequestDraft {
         error instanceof Error ? error.message : "The images didn't upload.",
       );
       return false;
-    } finally {
-      setUploading(false);
     }
   };
 
@@ -172,17 +207,18 @@ export function useRequestDraft(): RequestDraft {
     context: requestDraftContext(field.text, images),
     words,
     empty: words === "" && chipped.length === 0,
-    uploading,
+    busy,
     preview,
     setText: (text) => setField((current) => ({ ...current, text })),
     setSelection: (selection) => setField((current) => ({ ...current, selection })),
-    attach: async () => {
-      const picked = await pickComposerImages({ existingCount: 0 });
-      if (picked.error) Alert.alert("Could not attach", picked.error);
-      add(picked.images);
-    },
+    attach: () =>
+      addFrom(async () => {
+        const picked = await pickComposerImages({ existingCount: 0 });
+        if (picked.error) Alert.alert("Could not attach", picked.error);
+        return picked.images;
+      }),
     pasteImages: (uris) => {
-      void convertPastedImagesToAttachments({ uris, existingCount: 0 }).then(add);
+      void addFrom(() => convertPastedImagesToAttachments({ uris, existingCount: 0 }));
     },
     openChip: (source) => {
       const image = imageOfChip(source, images);
@@ -190,11 +226,15 @@ export function useRequestDraft(): RequestDraft {
       setPreview({ ...previewItem(image), gallery: chipped.map(previewItem) });
     },
     closePreview: () => setPreview(null),
-    send,
-    noteOnly: () => {
-      if (chipped.length === 0) return words;
-      Alert.alert("Images go in a reply", "A note is words only. Send the images first.");
-      return null;
+    send: (deliver) => whileSending(() => deliverDraft(deliver)),
+    sendNote: async (action) => {
+      if (chipped.length > 0) {
+        Alert.alert("Images go in a reply", "A note is words only. Send the images first.");
+        return false;
+      }
+      const done = await whileSending(() => action(words));
+      if (done) clear();
+      return done;
     },
     clear,
   };
