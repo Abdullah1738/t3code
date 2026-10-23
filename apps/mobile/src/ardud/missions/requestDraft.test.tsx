@@ -7,6 +7,7 @@ import type { DraftComposerImageAttachment } from "../../lib/composerImages";
 const harness = vi.hoisted(() => ({
   alerts: [] as Array<{ title: string; message: string }>,
   pick: null as null | ((images: ReadonlyArray<unknown>) => void),
+  paste: null as null | ((images: ReadonlyArray<unknown>) => void),
 }));
 
 vi.mock("react-native", () => ({
@@ -20,7 +21,10 @@ vi.mock("../../lib/attachmentUpload", () => ({
 }));
 vi.mock("../../lib/composerImages", () => ({
   isComposerImageAttachment: () => true,
-  convertPastedImagesToAttachments: vi.fn(),
+  convertPastedImagesToAttachments: () =>
+    new Promise((resolve) => {
+      harness.paste = resolve;
+    }),
   pickComposerImages: () =>
     new Promise((resolve) => {
       harness.pick = (images) => resolve({ images, error: null });
@@ -70,6 +74,7 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   harness.alerts.length = 0;
   harness.pick = null;
+  harness.paste = null;
   root = createRoot(document.createElement("div"));
   act(() => root?.render(<Probe />));
 });
@@ -126,6 +131,31 @@ it("drops a photo still being picked when a message went meanwhile", async () =>
     await picking;
   });
   expect(current().text).toBe("");
+  expect(current().empty).toBe(true);
+  expect(harness.alerts).toEqual([
+    { title: "Not attached", message: "A message went while it was read. Attach it again." },
+  ]);
+});
+
+it("refuses a paste that finishes reading as a settle note goes", async () => {
+  act(() => current().setText("done here"));
+  act(() => current().pasteImages(["file:///tmp/pasted.png"]));
+  const settled = deferred();
+  const notes: string[] = [];
+  let settling: Promise<boolean> = Promise.resolve(false);
+  act(() => {
+    settling = current().sendNote((note) => {
+      notes.push(note);
+      return settled.promise;
+    });
+  });
+
+  await act(async () => {
+    settled.resolve(true);
+    harness.paste?.([photo("pasted")]);
+    expect(await settling).toBe(true);
+  });
+  expect(notes).toEqual(["done here"]);
   expect(current().empty).toBe(true);
   expect(harness.alerts).toEqual([
     { title: "Not attached", message: "A message went while it was read. Attach it again." },

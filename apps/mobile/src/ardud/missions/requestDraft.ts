@@ -232,9 +232,12 @@ export function useRequestDraft(): RequestDraft {
         Alert.alert("Images go in a reply", "A note is words only. Send the images first.");
         return false;
       }
-      const done = await whileSending(() => action(words));
-      if (done) clear();
-      return done;
+      // Cleared before the guard drops, like a send, so a paste read meanwhile is refused.
+      return whileSending(async () => {
+        const done = await action(words);
+        if (done) clear();
+        return done;
+      });
     },
     clear,
   };
