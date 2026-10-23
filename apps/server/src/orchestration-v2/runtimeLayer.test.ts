@@ -58,7 +58,10 @@ import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
-import { OrchestratorThreadNotIdleError } from "../ardud/archive-if-idle/idle.ts";
+import {
+  ArchiveIfIdleBeforeCommit,
+  OrchestratorThreadNotIdleError,
+} from "../ardud/archive-if-idle/idle.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import { ROLLBACK_FAILED_MESSAGE } from "./CheckpointRollbackService.ts";
 import * as EffectWorker from "./EffectWorker.ts";
@@ -4693,8 +4696,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(yield* refusal(), "running");
 
       yield* complete(queued.id);
-      // Provider requests land without the dispatch lock; the check inside the
-      // archive's commit still sees them.
+      // Provider requests land without the dispatch lock, so one can land after
+      // the archive is planned; the check inside its commit still sees it.
       const now = yield* DateTime.now;
       const request = {
         id: RuntimeRequestId.make(`${threadId}:request`),
@@ -4707,22 +4710,59 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         createdAt: now,
         resolvedAt: null,
       };
-      const writeRequest = (status: "pending" | "resolved") =>
-        events.write({
-          events: [
-            {
-              id: EventId.make(`${threadId}:request:${status}`),
-              type: "runtime-request.updated",
-              threadId,
-              runId: queued.id,
-              occurredAt: now,
-              payload: { ...request, status, resolvedAt: status === "pending" ? null : now },
-            },
-          ],
+      const writeRequest = (status: "pending" | "resolved", tag: string = status) =>
+        events
+          .write({
+            events: [
+              {
+                id: EventId.make(`${threadId}:request:${tag}`),
+                type: "runtime-request.updated",
+                threadId,
+                runId: queued.id,
+                occurredAt: now,
+                payload: { ...request, status, resolvedAt: status === "pending" ? null : now },
+              },
+            ],
+          })
+          .pipe(Effect.asVoid, Effect.orDie);
+      const archiveWithGap = (tag: string, gap: Effect.Effect<void>) =>
+        Effect.gen(function* () {
+          const commandId = CommandId.make(`${threadId}:archive:${tag}`);
+          const archive = orchestrator.dispatch({
+            type: "thread.archive",
+            commandId,
+            threadId,
+            ifIdle: {},
+          });
+          const error = yield* archive.pipe(
+            Effect.provideService(ArchiveIfIdleBeforeCommit, gap),
+            Effect.flip,
+          );
+          assert.instanceOf(error, OrchestratorThreadNotIdleError);
+          const replay = yield* archive.pipe(Effect.flip);
+          assert.equal(replay._tag, "OrchestratorCommandPreviouslyRejectedError");
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          assert.isNull(projection.thread.archivedAt);
+          return { reason: error.reason, projection };
         });
-      yield* writeRequest("pending");
-      assert.equal(yield* refusal(), "pending-request");
+
+      const asked = yield* archiveWithGap("request", writeRequest("pending"));
+      assert.equal(asked.reason, "pending-request");
+      assert.equal(
+        asked.projection.runtimeRequests.find((candidate) => candidate.id === request.id)?.status,
+        "pending",
+      );
       yield* writeRequest("resolved");
+
+      // Anything else since planning refuses too, since the planned events
+      // would write over it.
+      const changed = yield* archiveWithGap("changed", writeRequest("resolved", "resolved-again"));
+      assert.equal(changed.reason, "changed");
+      assert.equal(
+        changed.projection.runs.find((run) => run.id === queued.id)?.status,
+        "completed",
+      );
+
       assert.equal(yield* refusal("ses_not_this_one"), "session-changed");
 
       yield* archiveIfIdle();

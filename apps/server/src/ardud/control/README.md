@@ -143,18 +143,22 @@ Response (201): `threadId`, `projectId`, `directory`, `messageId`, `runId`,
 
 ### POST /threads/:id/archive-if-idle
 
-`{ "expectedSession"?: "ses_..." }`. The server checks and archives in one step
-under the thread's dispatch lock, so nothing can start in between (a plain
+`{ "expectedSession"?: "ses_..." }`. The server decides inside the archive's
+commit transaction, so nothing can land in between (a plain
 `PATCH { archived: true }` cancels whatever is queued). Idle means no live or
-queued run, no pending approval or question, no running subagent or background
-task, no pending wake (restart continuation, armed usage-limit auto resume, or a
-snooze not yet due) and, with `expectedSession`, the thread's active provider
-session is still that native session id.
+queued run, no pending approval or question, no running subagent, background
+task, runless provider turn or work its live provider session still holds, no
+pending wake (restart continuation, provider continuation not yet started, owed
+delegated task report, armed usage-limit auto resume, watched pull request, or a
+snooze not yet due) and, with `expectedSession`, the thread's latest run ran on
+that native session on its active provider thread. Any thread event between
+planning and commit refuses with `changed`; try again later.
 
 - 200 `{ "ok": true, "archived": true, "thread": <detail> }`
 - 409 `{ "ok": false, "archived": false, "error": { "code": "not_idle", "reason", "message" } }`
   with `reason` one of `archived`, `running`, `queued`, `pending-request`,
-  `background-work`, `pending-wake`, `session-changed`. The thread is unchanged.
+  `background-work`, `pending-wake`, `session-changed`, `changed`. The thread is
+  unchanged.
 - 404 `not_found` for an unknown or deleted thread.
 
 `t3ctl archive-if-idle THREAD [--session ses_...]` exits 3 when refused.

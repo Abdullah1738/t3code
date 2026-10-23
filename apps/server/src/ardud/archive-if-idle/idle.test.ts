@@ -45,7 +45,14 @@ interface Fixture {
   readonly singleProviderThread?: boolean;
   readonly limitRecovery?: { readonly autoResume: boolean };
   readonly snoozedUntil?: DateTime.Utc;
+  readonly pullRequests?: ReadonlyArray<{
+    readonly number: number;
+    readonly source: string;
+    readonly watched: boolean;
+  }>;
   readonly restartContinuationPending?: boolean;
+  readonly continuationOffered?: boolean;
+  readonly providerThreadsHoldingWork?: ReadonlyArray<string>;
   readonly expectedNativeSessionId?: string;
 }
 
@@ -96,6 +103,13 @@ const input = (fixture: Fixture = {}): IdleInput => {
         activeProviderThreadId: "provider-thread-active",
         limitRecovery: fixture.limitRecovery ?? null,
         snoozedUntil: fixture.snoozedUntil ?? null,
+        pullRequests: (fixture.pullRequests ?? []).map((link) => ({
+          host: "github.com",
+          repository: "ardud/robob",
+          number: link.number,
+          source: link.source,
+          ...(link.watched ? { watch: { wakes: 0 } } : {}),
+        })),
       },
       runs,
       attempts,
@@ -112,6 +126,8 @@ const input = (fixture: Fixture = {}): IdleInput => {
       providerThreads: fixture.singleProviderThread === true ? [active] : [old, active],
     },
     restartContinuationPending: fixture.restartContinuationPending ?? false,
+    continuationOffered: fixture.continuationOffered ?? false,
+    providerThreadsHoldingWork: fixture.providerThreadsHoldingWork ?? [],
     expectedNativeSessionId: fixture.expectedNativeSessionId,
     now,
   } as unknown as IdleInput;
@@ -176,6 +192,14 @@ describe("idleBlocker", () => {
     expect(reason({ roster: [{ taskId: "task-1", kind: "command" }] })).toBe("background-work");
   });
 
+  it("refuses work or a wake that only the provider session still holds", () => {
+    const held = { providerThreadsHoldingWork: ["provider-thread-active"] };
+    expect(reason(held)).toBe("background-work");
+    expect(idleBlocker(input(held))?.detail).toBe(
+      "Thread thread-idle has background work or a wake held by provider thread provider-thread-active.",
+    );
+  });
+
   it("refuses a subagent child thread whose provider turn still runs without a run", () => {
     const child = { runs: [], turns: [{ id: "turn-1", status: "running", runAttemptId: null }] };
     expect(reason(child)).toBe("background-work");
@@ -217,10 +241,25 @@ describe("idleBlocker", () => {
 
   it("refuses a thread that wakes on its own", () => {
     expect(reason({ restartContinuationPending: true })).toBe("pending-wake");
+    expect(idleBlocker(input({ continuationOffered: true }))).toEqual({
+      reason: "pending-wake",
+      detail: "Thread thread-idle has a provider continuation waiting to start.",
+    });
     expect(reason({ limitRecovery: { autoResume: true } })).toBe("pending-wake");
     expect(reason({ snoozedUntil: DateTime.makeUnsafe("2026-10-22T13:00:00.000Z") })).toBe(
       "pending-wake",
     );
+  });
+
+  it("refuses a thread that watches a pull request", () => {
+    expect(
+      idleBlocker(input({ pullRequests: [{ number: 7, source: "agent", watched: true }] })),
+    ).toEqual({ reason: "pending-wake", detail: "Thread thread-idle watches ardud/robob#7." });
+    expect(reason({ pullRequests: [{ number: 7, source: "agent", watched: false }] })).toBeNull();
+    // A dismissed stack member is not watched any more, even with a stale watch on it.
+    expect(
+      reason({ pullRequests: [{ number: 7, source: "stack-dismissed", watched: true }] }),
+    ).toBeNull();
   });
 
   it("refuses when the active session is not the expected one", () => {

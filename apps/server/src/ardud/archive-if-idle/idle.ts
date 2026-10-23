@@ -4,7 +4,10 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { latestExecutedRun } from "@t3tools/shared/orchestrationV2ThreadError";
+import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { describeWork, runningBackgroundWork } from "../context-reset/backgroundWork.ts";
@@ -17,6 +20,7 @@ export const ThreadNotIdleReason = Schema.Literals([
   "background-work",
   "pending-wake",
   "session-changed",
+  "changed",
 ]);
 export type ThreadNotIdleReason = typeof ThreadNotIdleReason.Type;
 
@@ -33,6 +37,15 @@ export class OrchestratorThreadNotIdleError extends Schema.TaggedError<Orchestra
     return this.detail;
   }
 }
+
+/**
+ * Runs after archive-if-idle is planned and before its commit. Tests use it to
+ * land work in that gap; it does nothing otherwise.
+ */
+export const ArchiveIfIdleBeforeCommit = Context.Reference<Effect.Effect<void>>(
+  "t3/ardud/ArchiveIfIdleBeforeCommit",
+  { defaultValue: () => Effect.void },
+);
 
 export interface IdleBlocker {
   readonly reason: ThreadNotIdleReason;
@@ -52,6 +65,13 @@ export interface IdleInput {
   >;
   /** A run whose restart continuation is still owed, so the thread wakes on its own. */
   readonly restartContinuationPending: boolean;
+  /** A provider asked for a continuation turn that has not been handled yet. */
+  readonly continuationOffered: boolean;
+  /**
+   * Provider threads whose live session still holds background work or a
+   * buffered wake. Those live only in the provider's memory, not in events.
+   */
+  readonly providerThreadsHoldingWork: ReadonlyArray<string>;
   readonly expectedNativeSessionId: string | undefined;
   readonly now: DateTime.Utc;
 }
@@ -100,6 +120,13 @@ export const idleBlocker = (input: IdleInput): IdleBlocker | null => {
       detail: `Thread ${thread.id} has provider turn ${runlessTurn.id} ${runlessTurn.status}.`,
     };
   }
+  const holding = input.providerThreadsHoldingWork[0];
+  if (holding !== undefined) {
+    return {
+      reason: "background-work",
+      detail: `Thread ${thread.id} has background work or a wake held by provider thread ${holding}.`,
+    };
+  }
   const delivery = owedDelegatedCompletion(input.projection);
   if (delivery !== null) {
     return {
@@ -113,10 +140,26 @@ export const idleBlocker = (input: IdleInput): IdleBlocker | null => {
       detail: `Thread ${thread.id} still owes a continuation after a restart.`,
     };
   }
+  if (input.continuationOffered) {
+    return {
+      reason: "pending-wake",
+      detail: `Thread ${thread.id} has a provider continuation waiting to start.`,
+    };
+  }
   if (thread.limitRecovery?.autoResume === true) {
     return {
       reason: "pending-wake",
       detail: `Thread ${thread.id} resumes on its own when its usage limit resets.`,
+    };
+  }
+  // A watched pull request wakes the thread on checks, comments or conflicts.
+  const watched = visibleThreadPullRequests(thread.pullRequests ?? []).find(
+    (link) => link.watch !== undefined,
+  );
+  if (watched !== undefined) {
+    return {
+      reason: "pending-wake",
+      detail: `Thread ${thread.id} watches ${watched.repository}#${watched.number}.`,
     };
   }
   const snoozedUntil = thread.snoozedUntil ?? null;
