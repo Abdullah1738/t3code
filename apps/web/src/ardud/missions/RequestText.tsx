@@ -39,15 +39,19 @@ function TextWithImages(props: {
     attachmentId: image.assetId,
   }));
   const urls = useAssetUrls(props.environmentId, resources);
-  const [preview, setPreview] = useState<ExpandedImagePreview | null>(null);
-  const open = (at: number) =>
-    setPreview({
-      images: props.images.map((image, index) => ({
-        src: urls[index] ?? null,
-        name: `Image ${image.index}`,
-      })),
-      index: at,
-    });
+  // The viewer keeps only which image is open, so a URL that resolves after
+  // the click still reaches it.
+  const [opened, setOpened] = useState<number | null>(null);
+  const preview: ExpandedImagePreview | null =
+    opened === null
+      ? null
+      : {
+          images: props.images.map((image, index) => ({
+            src: urls[index] ?? null,
+            name: `Image ${image.index}`,
+          })),
+          index: opened,
+        };
   let seen = 0;
   return (
     <>
@@ -63,11 +67,11 @@ function TextWithImages(props: {
             size=""
             aria-label={`Open image ${part.index}`}
             className="mx-0.5"
-            onClick={() => open(at)}
+            onClick={() => setOpened(at)}
           />
         );
       })}
-      {preview ? <ExpandedImageDialog preview={preview} onClose={() => setPreview(null)} /> : null}
+      {preview ? <ExpandedImageDialog preview={preview} onClose={() => setOpened(null)} /> : null}
     </>
   );
 }
