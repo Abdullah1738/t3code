@@ -87,7 +87,7 @@ it.effect("fires a once task when due, then disables it and keeps the record", (
         const [after] = (yield* service.list()).tasks;
         assert.equal(after?.enabled, false);
         assert.isNull(after?.nextRunAt ?? null);
-        assert.equal(after?.lastRunStatus, "succeeded");
+        assert.equal(after?.lastRunStatus, "running");
         assert.equal(after?.runCount, 1);
 
         // Nothing fires again, and re-enabling a spent once task is refused.
@@ -159,7 +159,7 @@ it.effect("fires a once task missed by less than an hour when the server comes b
         assert.equal(yield* Ref.get(launches), 1);
         const [task] = (yield* service.list()).tasks;
         assert.equal(task?.enabled, false);
-        assert.equal(task?.lastRunStatus, "succeeded");
+        assert.equal(task?.lastRunStatus, "running");
       }),
     );
   }).pipe(Effect.provide(Sqlite.layerMemory)),

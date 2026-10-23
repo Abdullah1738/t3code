@@ -66,6 +66,8 @@ import * as WorktreeMcpService from "./WorktreeMcpService.ts";
 import * as ContextResetHandlers from "../ardud/context-reset/handlers.ts";
 import * as ContextResetService from "../ardud/context-reset/ContextResetService.ts";
 import { ContextResetToolkit } from "../ardud/context-reset/tools.ts";
+// ardud schedules: retry a scheduled task's blocked runs.
+import * as ScheduledTaskBlockRetry from "../ardud/schedules/blockRetryTools.ts";
 // ardud missions: asks
 import * as MissionsHandlers from "../ardud/missions/tools/handlers.ts";
 import { MissionsToolkit } from "../ardud/missions/tools/tools.ts";
@@ -1066,6 +1068,10 @@ const layerContextResetToolkitRegistration = toolkitRegistration(
   ContextResetToolkit,
   ContextResetHandlers.layer,
 ).pipe(Layer.provide(ContextResetService.layer));
+const layerScheduledTaskBlockRetryRegistration = toolkitRegistration(
+  ScheduledTaskBlockRetry.ScheduledTaskBlockRetryToolkit,
+  ScheduledTaskBlockRetry.layer,
+);
 
 const layerPreviewControlsRegistration = toolkitRegistration(
   PreviewControlsToolkit,
@@ -1122,6 +1128,7 @@ export const layer = Layer.mergeAll(
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,
   layerContextResetToolkitRegistration,
+  layerScheduledTaskBlockRetryRegistration,
   // ardud missions: asks
   layerMissionsToolkitRegistration,
   // ardud missions: policy
