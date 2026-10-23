@@ -202,7 +202,7 @@ describe("ProviderContinuationService", () => {
     }),
   );
 
-  it.effect("keeps a wake owed after its dispatch failed until a later one goes through", () =>
+  it.effect("settles a request whose dispatch failed", () =>
     Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();
       const otherThreadId = ThreadId.make("thread-provider-continuation-other");
@@ -211,13 +211,8 @@ describe("ProviderContinuationService", () => {
         yield* requests.offer(request());
         yield* Queue.take(dispatched);
         // The worker handles one request at a time, so once the next one is
-        // dispatched the failed one has been settled.
-        yield* requests.offer({ ...request(), threadId: otherThreadId });
-        yield* Queue.take(dispatched);
-        assert.isTrue(yield* requests.pending!(threadId));
-
-        yield* requests.offer(request());
-        yield* Queue.take(dispatched);
+        // dispatched the failed one has been settled. A wake it still owes
+        // stays with the adapter that holds it.
         yield* requests.offer({ ...request(), threadId: otherThreadId });
         yield* Queue.take(dispatched);
         assert.isFalse(yield* requests.pending!(threadId));

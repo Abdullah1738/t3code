@@ -1,6 +1,5 @@
 import { CommandId, type OrchestrationV2ThreadProjection } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 
@@ -244,12 +243,10 @@ export const layer = Layer.effectDiscard(
     );
 
     // ardud: archive-if-idle reads the offered requests. The finalizer goes on
-    // as soon as a request is taken, so nothing in between can drop it; only a
-    // dispatch that failed with no retry stays pending, since its wake is
-    // still owed.
+    // as soon as a request is taken, so nothing in between can leave it
+    // pending. A wake still owed after a failed dispatch stays with its adapter.
     const handle = (request: ProviderContinuationRequests.ProviderContinuationRequest) =>
       dispatchContinuation(request).pipe(
-        Effect.as("done" as const),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logWarning("orchestration-v2.provider-continuation.dispatch-failed", {
@@ -257,7 +254,7 @@ export const layer = Layer.effectDiscard(
               providerThreadId: request.providerThreadId,
               cause,
             });
-            if (request.delegatedCompletion === undefined) return "owed" as const;
+            if (request.delegatedCompletion === undefined) return;
             const completion = request.delegatedCompletion;
             const retryKey = delegatedCompletionRetryKey(request, completion);
             const retryDelay = yield* nextRetryDelay(retryKey);
@@ -288,8 +285,6 @@ export const layer = Layer.effectDiscard(
               ),
               Effect.forkScoped,
             );
-            // The retry offers it again; the open delivery keeps the thread awake meanwhile.
-            return "done" as const;
           }),
         ),
       );
@@ -297,13 +292,7 @@ export const layer = Layer.effectDiscard(
     yield* Effect.uninterruptibleMask((restore) =>
       restore(requests.take).pipe(
         Effect.flatMap((request) =>
-          restore(handle(request)).pipe(
-            Effect.onExit(
-              (exit) =>
-                requests.settle?.(request, Exit.isSuccess(exit) ? exit.value : "done") ??
-                Effect.void,
-            ),
-          ),
+          restore(handle(request)).pipe(Effect.ensuring(requests.settle?.(request) ?? Effect.void)),
         ),
       ),
     ).pipe(Effect.forever, Effect.forkScoped);

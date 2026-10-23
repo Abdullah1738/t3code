@@ -25,26 +25,11 @@ describe("ProviderContinuationRequests", () => {
       // Taking it is not enough: the dispatch it leads to has not happened yet.
       const first = yield* requests.take;
       assert.isTrue(yield* pending("thread-a"));
-      yield* requests.settle!(first, "done");
+      yield* requests.settle!(first);
       assert.isTrue(yield* pending("thread-a"));
 
-      yield* requests.settle!(yield* requests.take, "done");
+      yield* requests.settle!(yield* requests.take);
       assert.isFalse(yield* pending("thread-a"));
-    }).pipe(Effect.provide(ProviderContinuationRequests.layer)),
-  );
-
-  it.effect("keeps a wake owed after a failed dispatch until a later one goes through", () =>
-    Effect.gen(function* () {
-      const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
-      const pending = () => requests.pending!(ThreadId.make("thread-a"));
-
-      yield* requests.offer(request("thread-a"));
-      yield* requests.settle!(yield* requests.take, "owed");
-      assert.isTrue(yield* pending());
-
-      yield* requests.offer(request("thread-a"));
-      yield* requests.settle!(yield* requests.take, "done");
-      assert.isFalse(yield* pending());
     }).pipe(Effect.provide(ProviderContinuationRequests.layer)),
   );
 });

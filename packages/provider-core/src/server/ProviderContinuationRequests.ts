@@ -50,62 +50,43 @@ export class ProviderContinuationRequests extends Context.Reference<{
    */
   readonly pending?: (threadId: ThreadId) => Effect.Effect<boolean>;
   /**
-   * ardud: the worker calls this once it is done with a request it took. `owed` means its
-   * dispatch failed with no retry, so the thread still owes that wake until a later request for it
-   * goes through.
+   * ardud: the worker calls this once it is done with a request it took, whatever came of it. A
+   * wake that is still owed after a failed dispatch stays with the adapter that holds it.
    */
-  readonly settle?: (
-    request: ProviderContinuationRequest,
-    outcome: "done" | "owed",
-  ) => Effect.Effect<void>;
+  readonly settle?: (request: ProviderContinuationRequest) => Effect.Effect<void>;
 }>("@t3tools/provider-core/server/ProviderContinuationRequests", {
   defaultValue: () => ({ offer: () => Effect.void, take: Effect.never }),
 }) {}
-
-interface Outstanding {
-  readonly queued: ReadonlyMap<ThreadId, number>;
-  readonly owed: ReadonlySet<ThreadId>;
-}
 
 export const layer = Layer.effect(
   ProviderContinuationRequests,
   Effect.gen(function* () {
     const queue = yield* Queue.unbounded<ProviderContinuationRequest>();
-    const outstanding = yield* Ref.make<Outstanding>({ queued: new Map(), owed: new Set() });
-    const count = (current: Outstanding, threadId: ThreadId, delta: number): Outstanding => {
-      const queued = new Map(current.queued);
-      const value = (queued.get(threadId) ?? 0) + delta;
-      if (value > 0) {
-        queued.set(threadId, value);
-      } else {
-        queued.delete(threadId);
-      }
-      return { ...current, queued };
-    };
+    const outstanding = yield* Ref.make<ReadonlyMap<ThreadId, number>>(new Map());
+    const count = (threadId: ThreadId, delta: number) =>
+      Ref.update(outstanding, (current) => {
+        const updated = new Map(current);
+        const value = (updated.get(threadId) ?? 0) + delta;
+        if (value > 0) {
+          updated.set(threadId, value);
+        } else {
+          updated.delete(threadId);
+        }
+        return updated;
+      });
     return {
       // The count and the queue move together, or an interrupted offer would
       // leave a request pending that the worker never takes.
       offer: (request: ProviderContinuationRequest) =>
-        Ref.update(outstanding, (current) => count(current, request.threadId, 1)).pipe(
+        count(request.threadId, 1).pipe(
           Effect.andThen(Queue.offer(queue, request)),
           Effect.asVoid,
           Effect.uninterruptible,
         ),
       take: Queue.take(queue),
       pending: (threadId: ThreadId) =>
-        Ref.get(outstanding).pipe(
-          Effect.map((current) => current.queued.has(threadId) || current.owed.has(threadId)),
-        ),
-      settle: (request: ProviderContinuationRequest, outcome: "done" | "owed") =>
-        Ref.update(outstanding, (current) => {
-          const owed = new Set(current.owed);
-          if (outcome === "owed") {
-            owed.add(request.threadId);
-          } else {
-            owed.delete(request.threadId);
-          }
-          return { ...count(current, request.threadId, -1), owed };
-        }),
+        Ref.get(outstanding).pipe(Effect.map((current) => current.has(threadId))),
+      settle: (request: ProviderContinuationRequest) => count(request.threadId, -1),
     };
   }),
 );
