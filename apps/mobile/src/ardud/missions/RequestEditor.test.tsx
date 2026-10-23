@@ -44,6 +44,7 @@ it("keeps Return on a hardware keyboard as a new line, since only the buttons se
     selection: { start: 0, end: 0 },
     context: [],
     busy: false,
+    pasteEpoch: 0,
     preview: null,
   } as unknown as RequestDraft;
   root = createRoot(document.createElement("div"));

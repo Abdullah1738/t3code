@@ -252,9 +252,13 @@ export function useRequestDraft() {
         warn("Not sent yet", ready.reason);
         return false;
       }
-      const sent = await whileSending(() => deliver(text, ready.images));
-      if (sent) clear();
-      return sent;
+      // Cleared before `sending` drops, so an image that finishes reading in
+      // between is refused rather than chipped and then wiped.
+      return whileSending(async () => {
+        const sent = await deliver(text, ready.images);
+        if (sent) clear();
+        return sent;
+      });
     },
   );
 
@@ -265,9 +269,11 @@ export function useRequestDraft() {
         warn("Images go in a reply", "A settle note is words only. Send the images first.");
         return false;
       }
-      const done = await whileSending(() => action(words));
-      if (done && clearOnDone) clear();
-      return done;
+      return whileSending(async () => {
+        const done = await action(words);
+        if (done && clearOnDone) clear();
+        return done;
+      });
     },
   );
 

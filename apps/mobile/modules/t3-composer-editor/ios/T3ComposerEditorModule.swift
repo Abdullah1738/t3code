@@ -106,6 +106,9 @@ public class T3ComposerEditorModule: Module {
       Prop("maxInputChars") { (view: T3ComposerEditorView, maxInputChars: Int) in
         view.setMaxInputChars(maxInputChars)
       }
+      Prop("pasteEpoch") { (view: T3ComposerEditorView, epoch: Int) in
+        view.setPasteEpoch(epoch)
+      }
 
       Events(
         "onComposerChange",

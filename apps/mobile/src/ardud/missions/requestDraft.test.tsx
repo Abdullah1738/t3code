@@ -162,6 +162,26 @@ it("refuses a paste that finishes reading as a settle note goes", async () => {
   ]);
 });
 
+it("refuses a native paste from before a send that went in one go", async () => {
+  act(() => current().setText("first"));
+  const before = current().pasteEpoch;
+  // Sent and cleared at once, so busy never shows and the editor never locks.
+  await act(() => current().send(async () => true));
+  expect(current().text).toBe("");
+
+  act(() => current().pasteImages(["file:///tmp/old.png"], before));
+  await act(async () => harness.paste?.([photo("old")]));
+  expect(current().empty).toBe(true);
+  expect(harness.alerts).toEqual([
+    { title: "Not attached", message: "A message went while it was read. Attach it again." },
+  ]);
+
+  act(() => current().pasteImages(["file:///tmp/new.png"], current().pasteEpoch));
+  await act(async () => harness.paste?.([photo("new")]));
+  expect(current().context?.records).toHaveLength(1);
+  expect(harness.alerts).toHaveLength(1);
+});
+
 it("chips a photo picked while nothing is sending", async () => {
   let picking: Promise<void> = Promise.resolve();
   act(() => {

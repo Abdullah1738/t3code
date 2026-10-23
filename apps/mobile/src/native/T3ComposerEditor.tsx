@@ -19,6 +19,7 @@ export function ComposerEditor({
   singleLineCentered: _singleLineCentered,
   enterBehavior: _enterBehavior,
   readOnly = false,
+  pasteEpoch: _pasteEpoch,
   ...props
 }: ComposerEditorProps) {
   const inputRef = useRef<TextInputInstance>(null);

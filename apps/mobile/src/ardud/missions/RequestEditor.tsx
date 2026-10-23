@@ -43,6 +43,7 @@ export function RequestEditor(props: {
           contentInsetVertical={0}
           onChangeText={draft.setText}
           onSelectionChange={draft.setSelection}
+          pasteEpoch={draft.pasteEpoch}
           onPasteImages={draft.pasteImages}
           onContextPress={(reference) => draft.openChip(reference.source)}
           style={{ minHeight: 72, maxHeight: 160 }}
