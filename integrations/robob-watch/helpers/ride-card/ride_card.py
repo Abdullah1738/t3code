@@ -3,7 +3,7 @@
 
     ride-card refresh --trip UUID            read `uber rides status` (exact UUID) and rebuild the card
     ride-card send --trip UUID --session S   share the card once per recipient (idempotent, frozen payload)
-         [--from-chat owner|SLUG] [--dry-run]
+         [--chat SLUG]... [--dry-run]     S = the CURRENT session id of the chat you are in
     ride-card meta --trip UUID --rider WHO [--rider-name NAME] [--booker WHO] [--booker-name NAME]
          [--recipient SLUG]...   WHO = abdullah (owner chat), moni, or another bridge chat slug
     ride-card show --trip UUID               card data + share journal (no side effects)
@@ -14,17 +14,22 @@ Card folder (public, sanitized only): ~/.local/share/imessage-apps/ride-<uuid>/
 Private (never served): ~/.local/state/ride-card/<uuid>.json (share journal) and <uuid>.meta.json
   (rider, booker, extra recipients by bridge chat slug, display names).
 Recipients: abdullah + moni + rider + booker + extras, deduped. Abdullah (owner chat) gets the tailnet
-URL; everyone else gets the public share URL. From the owner session every recipient is reachable
-(--to SLUG); from any other chat only that chat itself.
+URL; everyone else gets the public share URL (group chats always get it as a link: the bridge has no
+app cards in groups). The caller's chat comes from the bridge's own route for --session, never from a
+flag. From the owner session every recipient is reachable (--to SLUG), and --chat SLUG sends only to
+those chats and adds them to the ride. From any other chat only that chat itself, which is always
+allowed. Session ids rotate, so never store one in a watcher: wakes land in the owner thread, which
+sends with its current session and --chat SLUG.
 
 The ride-share-updates watcher rebuilds the card every 30s; it never sends.
 Nothing here infers arrival from an ETA or completion from a missing trip. Arrived needs Uber's
 ArrivingAtPickup status and the car within AT_PICKUP_M of the pickup pin.
 
 Env overrides: RIDE_CARD_ROOT, RIDE_CARD_JOURNAL, RIDE_SHARE_HINTS, RIDE_CARD_BRIDGE (bridge CLI
-command, space separated), RIDE_CARD_PREVIEW_LIB, RIDE_CARD_NO_IMAGE=1 (skip Chrome, tests), UBER_BIN.
+command, space separated), RIDE_CARD_BRIDGE_STATE (bridge state dir, read only), RIDE_CARD_PREVIEW_LIB,
+RIDE_CARD_NO_IMAGE=1 (skip Chrome, tests), UBER_BIN.
 """
-import argparse, fcntl, hashlib, tempfile, html, json, math, os, re, shlex, shutil, subprocess, sys, time
+import argparse, fcntl, hashlib, tempfile, html, json, math, os, re, shlex, shutil, sqlite3, subprocess, sys, time
 import unicodedata
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -68,6 +73,10 @@ def bridge_cmd():
     if v:
         return shlex.split(v)
     return ["/Users/ardud/.bun/bin/bun", str(HOME / ".local/share/spectrum-bridge/src/cli.ts")]
+
+
+def bridge_state():
+    return Path(os.environ.get("RIDE_CARD_BRIDGE_STATE") or HOME / ".config/spectrum-bridge")
 
 
 def check_uuid(u):
@@ -759,6 +768,51 @@ def payload_for(c, recipient, url, mode):
     return p
 
 
+def read_route(db):
+    """One chat's current bridge route, read only; None when the store is missing or unreadable."""
+    try:
+        con = sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("select value from kv where key = 'route'").fetchone()
+        finally:
+            con.close()
+        return json.loads(row[0]) if row and row[0] else None
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+
+
+def session_matches(route, session):
+    """Same rule as the bridge's sessionMatches: the bare route id or id@generation."""
+    if not isinstance(route, dict) or not isinstance(route.get("id"), str):
+        return False
+    g = route.get("generation")
+    if not isinstance(g, int) or isinstance(g, bool) or g < 0:
+        return False
+    return session in (route["id"], f"{route['id']}@{g}")
+
+
+def chat_stores():
+    base = bridge_state()
+    yield "abdullah", base / "state.sqlite"
+    for db in sorted((base / "chats").glob("*/state.sqlite")):
+        if SLUG_RE.match(db.parent.name):
+            yield db.parent.name, db
+
+
+def chat_for_session(session):
+    """The chat whose live route is this session, as the bridge will see it; None when stale."""
+    return next((slug for slug, db in chat_stores() if session_matches(read_route(db), session)), None)
+
+
+def known_chat(slug):
+    return slug == "abdullah" or (bridge_state() / "chats" / slug / "state.sqlite").is_file()
+
+
+def ambiguous(error):
+    """A bridge HTTP 4xx was refused before queueing; anything else (timeout, 5xx, no reply) may have sent."""
+    return not re.search(r"HTTP 4\d\d", error or "")
+
+
 def deliver(uuid, recipient, p, session, to, key):
     if p["mode"] == "card":
         args = ["app", "--url", p["url"], "--caption", p["caption"], "--summary", p["summary"],
@@ -772,46 +826,86 @@ def deliver(uuid, recipient, p, session, to, key):
     return bridge(*args)
 
 
-def send(uuid, session, from_chat="owner", dry_run=False, modes=None, force=False):
+def send(uuid, session, from_chat=None, dry_run=False, modes=None, force=False, chats=()):
     """Share the card once per recipient. Frozen payload per trip+recipient; same bridge key on retries."""
     uuid = check_uuid(uuid)
-    from_chat = person(from_chat)
     if not session or not re.match(r"^[A-Za-z0-9:_@.-]{6,200}$", session):
         raise SystemExit("ride-card: --session must be the current iMessage session id")
+    caller = chat_for_session(session)
+    if not caller:
+        raise SystemExit(f"ride-card: {session} is not the live session of any chat (sessions rotate). "
+                         "Use the current session id of the chat you are in; from a watcher wake that is "
+                         "the owner thread's, with --chat SLUG for another chat.")
+    if from_chat and person(from_chat) != caller:
+        raise SystemExit(f"ride-card: this session is in chat {caller!r}, not {person(from_chat)!r}")
+    targets = []
+    for x in map(person, chats or ()):
+        if x not in targets:
+            targets.append(x)
+    for x in targets:
+        if caller != "abdullah" and x != caller:
+            raise SystemExit(f"ride-card: only the owner's chat can send to other chats; this session is in {caller!r}")
+        if not known_chat(x):
+            raise SystemExit(f"ride-card: no bridge chat {x!r} (list them with `cli.ts chats` from the owner session)")
     c = load_card(uuid)
     if not c:
         c = refresh(uuid)
     with trip_lock(uuid):
-        return _send_locked(uuid, c, session, from_chat, dry_run, modes, force)
+        return _send_locked(uuid, c, session, caller, dry_run, modes, force, targets)
 
 
-def _send_locked(uuid, c, session, from_chat, dry_run, modes, force):
+def _add_extras(uuid, slugs):
+    """Record chats a card went to as ride recipients. The caller already holds trip_lock."""
+    m = load_meta(uuid)
+    ex = list(m.get("extras") or [])
+    new = [s for s in slugs if s not in ex]
+    if not new:
+        return
+    m.update(trip=uuid, extras=ex + new)
+    p = meta_path(uuid)
+    atomic_write(p, json.dumps(m, indent=1))
+    os.chmod(p, 0o600)
+
+
+def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
+    result, failed = {}, False
     if c.get("terminal") and not force:
-        raise SystemExit(f"ride-card: trip {uuid} already ended ({c['state']}); not sending a new card")
+        if not dry_run:
+            raise SystemExit(f"ride-card: trip {uuid} already ended ({c['state']}); not sending a new card")
+        result["note"] = f"trip already ended ({c['state']}); a real send would be refused"
     modes = modes or {}
     j = load_journal(uuid)
     recips = j.setdefault("recipients", {})
     everyone = recipients_for(uuid)
-    if from_chat == "abdullah":
-        plan = [(r, None if r == "abdullah" else r) for r in everyone]
-    elif from_chat in everyone:
-        plan = [(from_chat, None)]  # a non-owner chat can only reach itself
+    if caller != "abdullah":
+        plan = [(caller, None)]  # a non-owner chat can only reach itself, and always can
+    elif targets:
+        plan = [(r, None if r == "abdullah" else r) for r in targets]
     else:
-        raise SystemExit(f"ride-card: chat {from_chat!r} is not a recipient of this ride")
-    result, failed = {}, False
+        plan = [(r, None if r == "abdullah" else r) for r in everyone]
+    if not dry_run:
+        _add_extras(uuid, [who for who, _ in plan if who != "abdullah" and who not in everyone])
     for who, to in plan:
         r = recips.setdefault(who, {})
         if r.get("status") == "sent":
             result[who] = "already sent"
             continue
-        key = f"uber:{uuid}:card:{who}"
+        key = r.get("key") or f"uber:{uuid}:card:{who}"
+        via = "to" if to else "self"
+        sending = False
+        if r.get("ambiguous") and r.get("via") not in (None, via):
+            # The bridge dedupes each route on its own key, so switching routes could send twice.
+            result[who] = (f"failed: the last attempt may have gone through via {r['via']}; "
+                           "retry from the same chat, or check the chat before sending again")
+            failed = True
+            continue
         try:
             if "payload" not in r:
-                if dry_run:
-                    result[who] = "would publish+send"
-                    continue
                 mode = modes.get(who) or ("card" if who == "abdullah"
                                           else "card" if who == "moni" and moni_has_cards() else "link")
+                if dry_run:
+                    result[who] = f"would publish+send {mode}" + (f" --to {to}" if to else " to this chat")
+                    continue
                 if mode == "card" and to and not bridge_app_to():
                     raise RuntimeError("bridge has no `app --to` yet; use link mode for this recipient")
                 if who == "abdullah":
@@ -829,17 +923,24 @@ def _send_locked(uuid, c, session, from_chat, dry_run, modes, force):
                 r["created_at"] = iso(time.time())
                 _save_journal(uuid, j)
             if dry_run:
-                result[who] = f"would send {r['payload']['mode']} {r['payload']['url']}"
+                result[who] = (f"would send {r['payload']['mode']} {r['payload']['url']}"
+                               + (f" --to {to}" if to else " to this chat"))
                 continue
             r["attempts"] = r.get("attempts", 0) + 1
-            deliver(uuid, who, r["payload"], session, to, r.get("key", key))
-            r.update(status="sent", sent_at=iso(time.time()), error=None)
+            r["via"] = via
+            sending = True
+            deliver(uuid, who, r["payload"], session, to, key)
+            r.update(status="sent", sent_at=iso(time.time()), error=None, ambiguous=False)
             result[who] = "sent"
         except Exception as ex:
-            r.update(status="failed", error=str(ex)[:300])
-            result[who] = f"failed: {str(ex)[:200]}"
+            err = str(ex)[:300]
+            r.update(status="failed", error=err)
+            if sending:
+                r["ambiguous"] = ambiguous(err)
+            result[who] = f"failed: {err[:200]}"
             failed = True
-        _save_journal(uuid, j)
+        if not dry_run:
+            _save_journal(uuid, j)
     return result, failed
 
 
@@ -926,8 +1027,10 @@ def main(argv=None):
     sp = ap.add_subparsers(dest="cmd", required=True)
     a = sp.add_parser("refresh"); a.add_argument("--trip", required=True)
     a = sp.add_parser("send"); a.add_argument("--trip", required=True); a.add_argument("--session", required=True)
-    a.add_argument("--from-chat", default="owner", help="owner (default) or the bridge chat slug this session is in")
-    a.add_argument("--dry-run", action="store_true")
+    a.add_argument("--chat", action="append", default=[],
+                   help="from the owner session: send only to this bridge chat slug and add it to the ride (repeatable)")
+    a.add_argument("--from-chat", help="optional check: the chat this session is in (it is read from the bridge)")
+    a.add_argument("--dry-run", action="store_true", help="show the plan; publishes, sends and writes nothing")
     a.add_argument("--moni-mode", choices=["card", "link"]); a.add_argument("--abdullah-mode", choices=["card", "link"])
     a = sp.add_parser("meta"); a.add_argument("--trip", required=True)
     a.add_argument("--rider", required=True); a.add_argument("--booker")
@@ -941,7 +1044,7 @@ def main(argv=None):
         print(json.dumps({"dir": str(card_dir(c["trip"])), "state": c["state"], "v": c["v"]}))
     elif a.cmd == "send":
         modes = {k: v for k, v in (("moni", a.moni_mode), ("abdullah", a.abdullah_mode)) if v}
-        res, failed = send(a.trip, a.session, a.from_chat, a.dry_run, modes)
+        res, failed = send(a.trip, a.session, a.from_chat, a.dry_run, modes, chats=a.chat)
         print(json.dumps(res))
         return 1 if failed else 0
     elif a.cmd == "meta":

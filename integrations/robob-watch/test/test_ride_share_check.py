@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -36,7 +37,7 @@ log = os.environ["FAKE_BRIDGE_LOG"]
 with open(log, "a") as f:
     f.write(json.dumps(args) + "\\n")
 if os.environ.get("FAKE_BRIDGE_FAIL") == args[0]:
-    print("boom", file=sys.stderr); sys.exit(1)
+    print(os.environ.get("FAKE_BRIDGE_ERR") or "boom", file=sys.stderr); sys.exit(1)
 if args[0] == "publish":
     print(json.dumps({"url": "https://host.ts.net:18401/" + args[2] + "/", "metadataWarnings": []}))
 elif args[0] == "share":
@@ -80,12 +81,27 @@ class Base(unittest.TestCase):
         self.cards = os.path.join(self.dir, "cards")
         self.journal = os.path.join(self.dir, "journal")
         self.blog = os.path.join(self.dir, "bridge.log")
+        self.bstate = os.path.join(self.dir, "bridge-state")
+        self.route("abdullah", "thread-1", 3)
+        self.route("moni", "moni-thread", 1)
+        self.route("omar", "omar-thread", 1)
+        self.route("group-run_club", "group-thread", 1)
         self.env = dict(
             os.environ, UBER_BIN=self.fake, FAKE_UBER_STATE=self.fixture, RIDE_SHARE_STATE=self.state,
             RIDE_SHARE_HINTS=self.hints, RIDE_CARD_ROOT=self.cards, RIDE_CARD_JOURNAL=self.journal,
             RIDE_CARD_NO_IMAGE="1", RIDE_CARD_BRIDGE=self.bridge, FAKE_BRIDGE_LOG=self.blog,
-            RIDE_CARD_ENROLL=self.enroll, WATCH_DIR=self.dir,
+            RIDE_CARD_ENROLL=self.enroll, WATCH_DIR=self.dir, RIDE_CARD_BRIDGE_STATE=self.bstate,
         )
+
+    def route(self, chat, rid, generation):
+        """A bridge chat store with its live route, laid out like ~/.config/spectrum-bridge."""
+        d = self.bstate if chat == "abdullah" else os.path.join(self.bstate, "chats", chat)
+        os.makedirs(d, exist_ok=True)
+        con = sqlite3.connect(os.path.join(d, "state.sqlite"))
+        con.execute("create table if not exists kv (key text primary key, value text not null)")
+        con.execute("insert or replace into kv values ('route', ?)", (json.dumps({"id": rid, "generation": generation}),))
+        con.commit()
+        con.close()
 
     def _exe(self, name, body):
         p = os.path.join(self.dir, name)
@@ -510,6 +526,7 @@ class RecipientTest(Base):
         self.assertTrue(texts["omar"].startswith("Sara's ride"))
         app = [c for c in calls if c[0] == "app"][0]
         self.assertEqual(app[app.index("--caption") + 1], "Sara's ride")
+        self.route("abdullah", "thread-1", 4)
         again = json.loads(self.card_cli("send", "--trip", A, "--session", "thread-1@4").stdout)
         self.assertEqual(set(again.values()), {"already sent"})
 
@@ -558,7 +575,7 @@ class RecipientTest(Base):
         self.assertEqual(res, {"omar": "sent"})
         self.assertTrue(all("--to" not in c for c in self.bridge_calls()))
         p = self.card_cli("send", "--trip", A, "--session", "x-thread@1", "--from-chat", "stranger", ok=False)
-        self.assertIn("not a recipient", p.stderr)
+        self.assertIn("not the live session of any chat", p.stderr)
 
     def test_non_moni_recipient_gets_link_even_when_cards_installed(self):
         installed = self._exe("enroll-ok", "#!/bin/sh\necho 'moni: installed'\n")
@@ -646,6 +663,9 @@ class SendTest(Base):
         self.assertIn(f"uber:{A}:card:moni", moni)
         self.assertIn("trycloudflare.com", moni[moni.index("--text") + 1])
         self.assertNotIn("ts.net", " ".join(moni))
+        self.route("abdullah", "thread-1", 4)  # the owner route moved on; the old marker is stale now
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", ok=False)
+        self.assertIn("not the live session", p.stderr)
         p = self.card_cli("send", "--trip", A, "--session", "thread-1@4")
         self.assertEqual(json.loads(p.stdout), {"abdullah": "already sent", "moni": "already sent"})
         self.assertEqual(len(self.bridge_calls()), 4)
@@ -677,6 +697,119 @@ class SendTest(Base):
         calls = self.bridge_calls()
         self.assertEqual([c[0] for c in calls], ["share", "send"])
         self.assertNotIn("--to", calls[1])
+
+    def share_log(self):
+        p = os.path.join(self.journal, f"{A}.json")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return json.load(f)
+
+    def test_group_from_owner_session_gets_one_public_link_and_joins_the_ride(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+        calls = self.bridge_calls()
+        self.assertEqual([c[0] for c in calls], ["share", "send"], "a group gets a link, never an app card")
+        send = calls[1]
+        self.assertEqual(send[send.index("--to") + 1], "group-run_club")
+        self.assertEqual(send[send.index("--session") + 1], "thread-1@3")
+        self.assertIn(f"uber:{A}:card:group-run_club", send)
+        self.assertIn("trycloudflare.com", send[send.index("--text") + 1])
+        self.assertTrue(send[send.index("--text") + 1].startswith("Abdullah's ride"))
+        meta = json.loads(self.card_cli("show", "--trip", A).stdout)
+        self.assertEqual(meta["recipients"], ["abdullah", "moni", "group-run_club"])
+        # A later full send skips the group and still reaches the others once.
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "sent", "moni": "sent", "group-run_club": "already sent"})
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "already sent"})
+        self.assertEqual(len([c for c in self.bridge_calls() if c[0] == "send" and "group-run_club" in c]), 1)
+
+    def test_group_own_session_reaches_itself_without_meta(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+        calls = self.bridge_calls()
+        self.assertEqual([c[0] for c in calls], ["share", "send"])
+        self.assertNotIn("--to", calls[1])
+        self.assertIn(f"uber:{A}:card:group-run_club", calls[1])
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "already sent"})
+
+    def test_stale_session_refused_before_anything_is_written(self):
+        self.set_state(trip(A, "Accepted"), {})
+        self.route("group-run_club", "group-thread-2", 1)  # the group moved to a new thread overnight
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("not the live session of any chat", p.stderr)
+        self.assertIn("--chat SLUG", p.stderr)
+        self.assertEqual(self.bridge_calls(), [])
+        self.assertIsNone(self.share_log())
+        # The owner thread, which every watcher wake lands in, sends with its current session.
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+
+    def test_non_owner_session_cannot_name_another_chat(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "moni-thread@1", "--chat", "group-run_club", ok=False)
+        self.assertIn("only the owner's chat can send to other chats", p.stderr)
+        p = self.card_cli("send", "--trip", A, "--session", "moni-thread@1", "--from-chat", "group-run_club", ok=False)
+        self.assertIn("this session is in chat 'moni'", p.stderr)
+        self.assertEqual(self.bridge_calls(), [])
+        self.assertIsNone(self.share_log())
+
+    def test_unknown_chat_refused(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-nobody", ok=False)
+        self.assertIn("no bridge chat 'group-nobody'", p.stderr)
+        self.assertEqual(self.bridge_calls(), [])
+
+    def test_dry_run_writes_nothing_and_shows_routes(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", "--dry-run")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "would publish+send link --to group-run_club"})
+        self.assertEqual(self.bridge_calls(), [])
+        self.assertIsNone(self.share_log())
+        self.assertFalse(os.path.exists(os.path.join(self.journal, f"{A}.meta.json")))
+        self.mark_sent(A)
+        before = self.share_log()
+        end = ("import sys, time; sys.path.insert(0, sys.argv[1]); import ride_card as rc; "
+               "rc.write_card(rc.to_terminal(rc.load_card(sys.argv[2]), 'COMPLETED', time.time()), force=True)")
+        subprocess.run([sys.executable, "-c", end, os.path.dirname(CARD), A], env=self.env, check=True, timeout=60)
+        self.assertTrue(self.card(A)["terminal"])
+        before = self.share_log()
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", "--dry-run")
+        out = json.loads(p.stdout)
+        self.assertIn("a real send would be refused", out["note"])
+        self.assertEqual(self.share_log(), before)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", ok=False)
+        self.assertIn("already ended", p.stderr)
+
+    def test_ambiguous_attempt_is_not_retried_by_another_route(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False,
+                          FAKE_BRIDGE_FAIL="send", FAKE_BRIDGE_ERR='{"error":"Bridge request timed out"}')
+        self.assertEqual(p.returncode, 1)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", ok=False)
+        self.assertIn("may have gone through via self", p.stdout)
+        self.assertEqual(len([c for c in self.bridge_calls() if c[0] == "send"]), 1)
+        # The same route retries the identical payload under the same key.
+        self.card_cli("send", "--trip", A, "--session", "group-thread@1")
+        sends = [c for c in self.bridge_calls() if c[0] == "send"]
+        self.assertEqual(sends[0], sends[1])
+
+    def test_refused_attempt_can_switch_route(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False, FAKE_BRIDGE_FAIL="send",
+                          FAKE_BRIDGE_ERR='{"error":"Bridge request failed (HTTP 409)"}')
+        self.assertEqual(p.returncode, 1)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+        sends = [c for c in self.bridge_calls() if c[0] == "send"]
+        self.assertEqual(sends[0][sends[0].index("--key") + 1], sends[1][sends[1].index("--key") + 1])
+        self.assertEqual(sends[0][sends[0].index("--text") + 1], sends[1][sends[1].index("--text") + 1])
+        self.assertEqual(sends[1][sends[1].index("--to") + 1], "group-run_club")
 
     def test_send_refuses_mismatched_trip(self):
         self.set_state(trip(B, "Accepted"), {})
