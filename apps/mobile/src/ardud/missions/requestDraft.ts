@@ -40,11 +40,16 @@ export interface RequestDraft {
   readonly empty: boolean;
   /** A send or note is in flight; the box takes no words or images until it ends. */
   readonly busy: boolean;
+  /**
+   * Bumped each time the box clears. The editor tags a paste with the one it
+   * started under, so a paste from before a send can't land in the next draft.
+   */
+  readonly pasteEpoch: number;
   readonly preview: FilePreviewSource | null;
   readonly setText: (text: string) => void;
   readonly setSelection: (selection: DraftSelection) => void;
   readonly attach: () => Promise<void>;
-  readonly pasteImages: (uris: ReadonlyArray<string>) => void;
+  readonly pasteImages: (uris: ReadonlyArray<string>, epoch?: number) => void;
   readonly openChip: (source: string) => void;
   readonly closePreview: () => void;
   /** Uploads the chipped images, then hands the text and their ids to `deliver`. */
@@ -87,6 +92,7 @@ export function useRequestDraft(): RequestDraft {
   const [field, setField] = useState<Field>(EMPTY_FIELD);
   const [images, setImages] = useState<ReadonlyArray<DraftComposerImageAttachment>>([]);
   const [busy, setBusy] = useState(false);
+  const [pasteEpoch, setPasteEpoch] = useState(0);
   const [preview, setPreview] = useState<FilePreviewSource | null>(null);
   // What the box holds, uploads included, for clearing and closing it.
   const held = useRef(images);
@@ -113,13 +119,19 @@ export function useRequestDraft(): RequestDraft {
     setField((current) => insertImageChips(current.text, current.selection, kept));
   };
 
-  /** Adds images picked or pasted before now, unless a message went or is going meanwhile. */
-  const addFrom = async (read: () => Promise<ReadonlyArray<DraftComposerImageAttachment>>) => {
+  /**
+   * Adds images picked or pasted before now, unless a message went or is going
+   * meanwhile. `round` is the epoch a native paste started under: a send that
+   * clears in one go never locks the editor, so the paste can arrive after it.
+   */
+  const addFrom = async (
+    read: () => Promise<ReadonlyArray<DraftComposerImageAttachment>>,
+    round = cleared.current,
+  ) => {
     if (sending.current) {
       Alert.alert("Not attached", "Wait for the message to send, then attach it.");
       return;
     }
-    const round = cleared.current;
     const picked = await read();
     if (sending.current || cleared.current !== round) {
       if (picked.length > 0) {
@@ -132,6 +144,7 @@ export function useRequestDraft(): RequestDraft {
 
   const clear = () => {
     cleared.current += 1;
+    setPasteEpoch(cleared.current);
     // A sent message's images are mission images by now; the uploads were only the way there.
     releaseUploads(held.current);
     held.current = [];
@@ -208,6 +221,7 @@ export function useRequestDraft(): RequestDraft {
     words,
     empty: words === "" && chipped.length === 0,
     busy,
+    pasteEpoch,
     preview,
     setText: (text) => setField((current) => ({ ...current, text })),
     setSelection: (selection) => setField((current) => ({ ...current, selection })),
@@ -217,8 +231,8 @@ export function useRequestDraft(): RequestDraft {
         if (picked.error) Alert.alert("Could not attach", picked.error);
         return picked.images;
       }),
-    pasteImages: (uris) => {
-      void addFrom(() => convertPastedImagesToAttachments({ uris, existingCount: 0 }));
+    pasteImages: (uris, epoch) => {
+      void addFrom(() => convertPastedImagesToAttachments({ uris, existingCount: 0 }), epoch);
     },
     openChip: (source) => {
       const image = imageOfChip(source, images);

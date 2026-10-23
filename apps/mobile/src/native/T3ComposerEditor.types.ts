@@ -59,7 +59,14 @@ export interface ComposerEditorProps {
   readonly textStyle?: StyleProp<TextStyle>;
   readonly onChangeText: (value: string) => void;
   readonly onSelectionChange?: (selection: ComposerEditorSelection) => void;
-  readonly onPasteImages?: (uris: ReadonlyArray<string>) => void;
+  /**
+   * iOS: tags an image paste or drop with the value it started under, as
+   * `onPasteImages`' `epoch`. Images load in the background there, so the
+   * owner can tell one that began before its draft cleared.
+   */
+  readonly pasteEpoch?: number;
+  /** `epoch` is `pasteEpoch` when the paste began, or absent when it was immediate. */
+  readonly onPasteImages?: (uris: ReadonlyArray<string>, epoch?: number) => void;
   readonly onContextPress?: (reference: {
     readonly source: string;
     readonly start: number;

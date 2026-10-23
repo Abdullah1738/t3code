@@ -131,3 +131,52 @@ it("drops an image still being read when the message it was meant for went", asy
   expect(harness.uploads).toHaveLength(0);
   expect(harness.warned).toContain("Not attached");
 });
+
+it("drops an image that finishes reading as the message or note goes", async () => {
+  // The read can land a few ticks either side of delivery; none of them may
+  // chip and upload an image the clear then wipes.
+  // Gap 0 resolves both in one turn, which is where the old clear-after-
+  // release order let the image through.
+  const settle = async (ticks: number) => {
+    for (let tick = 0; tick < ticks; tick += 1) await Promise.resolve();
+  };
+
+  const orders = (["read", "deliver"] as const).flatMap((first) =>
+    [0, 1, 2, 3, 4].map((gap) => ({ first, gap })),
+  );
+  for (const go of ["send", "note"] as const) {
+    for (const order of orders) {
+      harness.warned.length = 0;
+      harness.uploads.length = 0;
+      act(() => draft().onChange("on its way", 10));
+      const reading = deferred<CompressImageFileResult>();
+      harness.prepare.mockImplementation(() => reading.promise);
+      let attached: Promise<void> | undefined;
+      act(() => {
+        attached = draft().addFiles([photo()]);
+      });
+      const delivery = deferred<boolean>();
+      let went: Promise<boolean> | undefined;
+      act(() => {
+        went =
+          go === "send"
+            ? draft().send(() => delivery.promise)
+            : draft().run(() => delivery.promise, true);
+      });
+
+      await act(async () => {
+        const [first, second] =
+          order.first === "read"
+            ? [() => reading.resolve(read(photo())), () => delivery.resolve(true)]
+            : [() => delivery.resolve(true), () => reading.resolve(read(photo()))];
+        first();
+        if (order.gap > 0) await settle(order.gap);
+        second();
+        await went;
+        await attached;
+      });
+      const after = { uploads: harness.uploads.length, empty: draft().empty };
+      expect({ go, ...order, ...after }).toEqual({ go, ...order, uploads: 0, empty: true });
+    }
+  }
+});

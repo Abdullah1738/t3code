@@ -89,7 +89,8 @@ private final class ComposerTextView: UITextView {
     "undo:",
   ])
 
-  var onPasteImages: (([String]) -> Void)?
+  /// The URLs, and the owner's `pasteEpoch` from when the paste or drop began.
+  var onPasteImages: (([String], Int) -> Void)?
   var onPasteContext: (([String: String]) -> Void)?
   var onPasteText: ((String, NSRange) -> Void)?
   var clipboardFragment = ""
@@ -99,6 +100,9 @@ private final class ComposerTextView: UITextView {
   /// Bumped when the editor starts or stops taking input (a send), so an image
   /// still loading from an earlier paste or drop doesn't land in what follows.
   var pasteGeneration = 0
+  /// Set by the owner and bumped when its draft clears. A send that clears in
+  /// one render never flips `isEditable`, so the owner compares this instead.
+  var pasteEpoch = 0
   var textPasteThresholdBytes = 0
   var maxInputChars = Int.max
   var enterBehavior: ComposerEnterBehavior = .send
@@ -239,7 +243,7 @@ private final class ComposerTextView: UITextView {
     if !images.isEmpty {
       let urls = images.compactMap(Self.writeTemporaryImage)
       if !urls.isEmpty {
-        onPasteImages?(urls)
+        onPasteImages?(urls, pasteEpoch)
         return
       }
     }
@@ -297,6 +301,7 @@ private final class ComposerTextView: UITextView {
     let group = DispatchGroup()
     let lock = NSLock()
     let generation = pasteGeneration
+    let epoch = pasteEpoch
     var images = [UIImage?](repeating: nil, count: providers.count)
 
     for (index, provider) in providers.enumerated() {
@@ -318,7 +323,7 @@ private final class ComposerTextView: UITextView {
       }
       let urls = images.compactMap { $0 }.compactMap(Self.writeTemporaryImage)
       if !urls.isEmpty {
-        self.onPasteImages?(urls)
+        self.onPasteImages?(urls, epoch)
       }
     }
   }
@@ -499,8 +504,8 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     textView.alwaysBounceVertical = false
     textView.showsVerticalScrollIndicator = true
     textView.adjustsFontForContentSizeCategory = true
-    textView.onPasteImages = { [weak self] urls in
-      self?.onComposerPasteImages(["uris": urls])
+    textView.onPasteImages = { [weak self] urls, epoch in
+      self?.onComposerPasteImages(["uris": urls, "epoch": epoch])
     }
     textView.onPasteContext = { [weak self] context in
       guard let self else { return }
@@ -755,6 +760,10 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
 
   func setMaxInputChars(_ maxInputChars: Int) {
     textView.maxInputChars = maxInputChars
+  }
+
+  func setPasteEpoch(_ epoch: Int) {
+    textView.pasteEpoch = epoch
   }
 
   func focusEditor() {

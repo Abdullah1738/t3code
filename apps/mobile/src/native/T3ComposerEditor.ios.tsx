@@ -50,6 +50,7 @@ type NativeSelectionEvent = NativeSyntheticEvent<{
 
 type NativePasteImagesEvent = NativeSyntheticEvent<{
   readonly uris: ReadonlyArray<string>;
+  readonly epoch?: number;
 }>;
 
 type NativePasteTextEvent = NativeSyntheticEvent<{
@@ -95,6 +96,7 @@ interface NativeComposerEditorProps extends ViewProps {
   ) => void;
   readonly textPasteThresholdBytes: number;
   readonly maxInputChars: number;
+  readonly pasteEpoch: number;
   readonly onComposerPasteText?: (event: NativePasteTextEvent) => void;
   readonly onComposerFocus?: () => void;
   readonly onComposerBlur?: () => void;
@@ -286,6 +288,7 @@ export function ComposerEditor({
       spellCheck={props.spellCheck ?? true}
       textPasteThresholdBytes={onPasteText ? PASTED_TEXT_ATTACHMENT_THRESHOLD_BYTES : 0}
       maxInputChars={PROVIDER_SEND_TURN_MAX_INPUT_CHARS}
+      pasteEpoch={props.pasteEpoch ?? 0}
       style={style as StyleProp<ViewStyle>}
       onComposerChange={(event) => {
         const acknowledgedEventCount = acceptNativeEvent(
@@ -317,7 +320,9 @@ export function ComposerEditor({
         setMostRecentEventCount(acknowledgedEventCount);
         forceNativeEventRender((sequence) => sequence + 1);
       }}
-      onComposerPasteImages={(event) => onPasteImages?.(event.nativeEvent.uris)}
+      onComposerPasteImages={(event) =>
+        onPasteImages?.(event.nativeEvent.uris, event.nativeEvent.epoch)
+      }
       onComposerContextPress={(event) => props.onContextPress?.(event.nativeEvent)}
       onComposerPasteContext={(event) => {
         const paste = event.nativeEvent;
