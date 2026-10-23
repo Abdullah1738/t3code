@@ -145,8 +145,10 @@ export function useDiscussion(
 
   const settle = () => {
     if (!request) return;
+    const note = draft.noteOnly();
+    if (note === null) return;
     void run("Could not settle", () =>
-      missionsSource().settleRequest(settleInput(request.id, draft.words)),
+      missionsSource().settleRequest(settleInput(request.id, note)),
     ).then((done) => {
       if (done) draft.clear();
     });
@@ -231,13 +233,17 @@ export function useRequestThread(missionId: MissionId, requestId: string): Reque
       );
     },
     settle: () => {
+      const note = draft.noteOnly();
+      if (note === null) return;
       void run("Could not settle", () =>
-        missionsSource().settleRequest(settleInput(requestId, draft.words)),
+        missionsSource().settleRequest(settleInput(requestId, note)),
       ).then(clearOn);
     },
     reopen: () => {
+      const note = draft.noteOnly();
+      if (note === null) return;
       void run("Could not reopen", () =>
-        missionsSource().reopenRequest(settleInput(requestId, draft.words)),
+        missionsSource().reopenRequest(settleInput(requestId, note)),
       ).then(clearOn);
     },
   };

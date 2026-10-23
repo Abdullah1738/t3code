@@ -1,6 +1,6 @@
 import type { RequestDraftImage } from "@t3tools/client-runtime/ardud/missions";
-import type { OrchestrationMessageContext } from "@t3tools/contracts";
-import { useState } from "react";
+import type { EnvironmentId, OrchestrationMessageContext } from "@t3tools/contracts";
+import { useEffect, useRef, useState } from "react";
 import { Alert } from "react-native";
 
 import type { FilePreviewItem, FilePreviewSource } from "../../components/FilePreviewModal.types";
@@ -48,6 +48,8 @@ export interface RequestDraft {
   readonly closePreview: () => void;
   /** Uploads the chipped images, then hands the text and their ids to `deliver`. */
   readonly send: (deliver: Deliver) => Promise<boolean>;
+  /** The words for a settle or reopen note; null, after saying so, while images are chipped. */
+  readonly noteOnly: () => string | null;
   readonly clear: () => void;
 }
 
@@ -62,12 +64,32 @@ function previewItem(image: DraftComposerImageAttachment): FilePreviewItem {
   return { kind: "image", uri: image.previewUri, name: image.name, mimeType: image.mimeType };
 }
 
+/** Drops uploads a draft made but never sent; best effort, the server sweeps the rest. */
+function releaseUploads(images: ReadonlyArray<DraftComposerImageAttachment>): void {
+  const byEnvironment = new Map<EnvironmentId, string[]>();
+  for (const image of images) {
+    if (!image.uploadedAttachmentId || !image.uploadEnvironmentId) continue;
+    const ids = byEnvironment.get(image.uploadEnvironmentId) ?? [];
+    ids.push(image.uploadedAttachmentId);
+    byEnvironment.set(image.uploadEnvironmentId, ids);
+  }
+  for (const [environmentId, ids] of byEnvironment) {
+    void releasePendingAttachmentUploads(environmentId, ids).catch(() => undefined);
+  }
+}
+
 export function useRequestDraft(): RequestDraft {
   const environmentId = useMissionsEnvironmentId();
   const [field, setField] = useState<Field>(EMPTY_FIELD);
   const [images, setImages] = useState<ReadonlyArray<DraftComposerImageAttachment>>([]);
   const [uploading, setUploading] = useState(false);
   const [preview, setPreview] = useState<FilePreviewSource | null>(null);
+  // What the box holds, uploads included, for clearing and closing it.
+  const held = useRef(images);
+  useEffect(() => {
+    held.current = images;
+  }, [images]);
+  useEffect(() => () => releaseUploads(held.current), []);
 
   const chipped = chippedImages(field.text, images);
   const words = draftWords(field.text);
@@ -84,6 +106,9 @@ export function useRequestDraft(): RequestDraft {
   };
 
   const clear = () => {
+    // A sent message's images are mission images by now; the uploads were only the way there.
+    releaseUploads(held.current);
+    held.current = [];
     setField(EMPTY_FIELD);
     setImages([]);
   };
@@ -114,7 +139,9 @@ export function useRequestDraft(): RequestDraft {
           .filter(isComposerImageAttachment)
           .map((image) => [image.id, image]),
       );
-      setImages((current) => current.map((image) => uploaded.get(image.id) ?? image));
+      const annotated = images.map((image) => uploaded.get(image.id) ?? image);
+      held.current = annotated;
+      setImages(annotated);
       const refs = chipped.flatMap((image, index): RequestDraftImage[] => {
         const attachment = prepared.attachments[index];
         return attachment && "id" in attachment && attachment.id !== undefined
@@ -126,13 +153,7 @@ export function useRequestDraft(): RequestDraft {
         return false;
       }
       const sent = await deliver(text, refs);
-      if (sent) {
-        clear();
-        // The server keeps its own copy as a mission image; the upload was only the way there.
-        void releasePendingAttachmentUploads(environmentId, prepared.pendingAttachmentIds).catch(
-          () => undefined,
-        );
-      }
+      if (sent) clear();
       return sent;
     } catch (error) {
       Alert.alert(
@@ -170,6 +191,11 @@ export function useRequestDraft(): RequestDraft {
     },
     closePreview: () => setPreview(null),
     send,
+    noteOnly: () => {
+      if (chipped.length === 0) return words;
+      Alert.alert("Images go in a reply", "A note is words only. Send the images first.");
+      return null;
+    },
     clear,
   };
 }
