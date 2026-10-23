@@ -31,13 +31,52 @@ print(json.dumps(out))
 """
 
 FAKE_BRIDGE = """#!/usr/bin/python3
-import json, os, sys
+import hashlib, json, os, sqlite3, sys
 args = sys.argv[1:]
 log = os.environ["FAKE_BRIDGE_LOG"]
 with open(log, "a") as f:
     f.write(json.dumps(args) + "\\n")
-if os.environ.get("FAKE_BRIDGE_FAIL") == args[0]:
+
+def opt(name):
+    return args[args.index(name) + 1] if name in args else None
+
+def queue(state):
+    # Like the bridge: --to ops sit in the target chat's store under hash(slug:key) with no session;
+    # a chat's own ops sit under hash(key), bound to its route id and generation.
+    base = os.environ["RIDE_CARD_BRIDGE_STATE"]
+    h = lambda s: hashlib.sha256(s.encode()).hexdigest()
+    to, key, session = opt("--to"), opt("--key"), opt("--session")
+    dbs = [os.path.join(base, "state.sqlite")] + [os.path.join(base, "chats", c, "state.sqlite")
+                                                 for c in sorted(os.listdir(os.path.join(base, "chats")))]
+    if to:
+        db = dbs[0] if to == "owner" else os.path.join(base, "chats", to, "state.sqlite")
+        oid, op = args[0] + ":" + h(to + ":" + key), {}
+    else:
+        for db in dbs:
+            con = sqlite3.connect(db)
+            route = json.loads(con.execute("select value from kv where key='route'").fetchone()[0])
+            con.close()
+            if session in (route["id"], route["id"] + "@" + str(route["generation"])):
+                break
+        else:
+            print('{"error":"Bridge request failed (HTTP 409)"}', file=sys.stderr); sys.exit(1)
+        oid, op = args[0] + ":" + h(key), {"sessionId": route["id"], "generation": route["generation"]}
+    con = sqlite3.connect(db)
+    con.execute("insert or ignore into outbox values (?, ?, ?, 0)", (oid, json.dumps(op), state))
+    con.commit()
+    con.close()
+
+if args[0] in ("send", "app") and os.environ.get("FAKE_BRIDGE_PEEK"):
+    # What the share journal said while the bridge call was in flight.
+    with open(os.environ["FAKE_BRIDGE_PEEK"]) as f, open(os.environ["FAKE_BRIDGE_PEEK"] + ".seen", "a") as g:
+        g.write(f.read() + "\\n")
+fail = os.environ.get("FAKE_BRIDGE_FAIL") == args[0]
+if fail and os.environ.get("FAKE_BRIDGE_QUEUED"):
+    queue(os.environ["FAKE_BRIDGE_QUEUED"])  # accepted, but the reply never came back
+if fail:
     print(os.environ.get("FAKE_BRIDGE_ERR") or "boom", file=sys.stderr); sys.exit(1)
+if args[0] in ("send", "app"):
+    queue("sent")
 if args[0] == "publish":
     print(json.dumps({"url": "https://host.ts.net:18401/" + args[2] + "/", "metadataWarnings": []}))
 elif args[0] == "share":
@@ -99,7 +138,24 @@ class Base(unittest.TestCase):
         os.makedirs(d, exist_ok=True)
         con = sqlite3.connect(os.path.join(d, "state.sqlite"))
         con.execute("create table if not exists kv (key text primary key, value text not null)")
+        con.execute("create table if not exists outbox (id text primary key, payload text not null, "
+                    "state text not null, attempts integer not null default 0)")
         con.execute("insert or replace into kv values ('route', ?)", (json.dumps({"id": rid, "generation": generation}),))
+        con.commit()
+        con.close()
+
+    def outbox(self, chat):
+        d = self.bstate if chat == "abdullah" else os.path.join(self.bstate, "chats", chat)
+        con = sqlite3.connect(os.path.join(d, "state.sqlite"))
+        rows = con.execute("select id, state, attempts from outbox order by rowid").fetchall()
+        con.close()
+        return rows
+
+    def set_op(self, chat, state, attempts=None):
+        """Move every op in a chat's outbox, as the bridge would."""
+        d = self.bstate if chat == "abdullah" else os.path.join(self.bstate, "chats", chat)
+        con = sqlite3.connect(os.path.join(d, "state.sqlite"))
+        con.execute("update outbox set state = ?, attempts = coalesce(?, attempts)", (state, attempts))
         con.commit()
         con.close()
 
@@ -506,6 +562,7 @@ class RecipientTest(Base):
         p = self.meta("--rider", "sara-k", "--rider-name", "Sara", "--recipient", "moni",
                       "--recipient", "omar", "--recipient", "sara-k", "--recipient", "omar")
         self.assertEqual(json.loads(p.stdout)["recipients"], ["abdullah", "moni", "sara-k", "omar"])
+        self.route("sara-k", "sara-thread", 1)
         self.set_state(trip(A, "Accepted"), {})
         res = json.loads(self.card_cli("send", "--trip", A, "--session", "thread-1@3").stdout)
         self.assertEqual(res, {"abdullah": "sent", "moni": "sent", "sara-k": "sent", "omar": "sent"})
@@ -515,7 +572,7 @@ class RecipientTest(Base):
             if c[0] in ("send", "app"):
                 to = c[c.index("--to") + 1] if "--to" in c else None
                 body = " ".join(c)
-                if to is None:
+                if to == "owner":
                     self.assertIn("ts.net", body)
                 else:
                     self.assertNotIn("ts.net", body)
@@ -656,7 +713,7 @@ class SendTest(Base):
         self.assertEqual([c[0] for c in calls], ["publish", "app", "share", "send"])
         app = calls[1]
         self.assertIn(f"uber:{A}:card:abdullah", app)
-        self.assertNotIn("--to", app)
+        self.assertEqual(app[app.index("--to") + 1], "owner", "the owner's card rides --to, which no rotation cancels")
         self.assertEqual(app[app.index("--caption") + 1], "Your ride")
         moni = calls[3]
         self.assertEqual(moni[moni.index("--to") + 1], "moni")
@@ -687,7 +744,7 @@ class SendTest(Base):
     def test_card_mode_for_moni_uses_app_to(self):
         self.set_state(trip(A, "Accepted"), {})
         self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--moni-mode", "card")
-        moni = [c for c in self.bridge_calls() if c[0] == "app" and "--to" in c][0]
+        moni = [c for c in self.bridge_calls() if c[0] == "app" and c[c.index("--to") + 1] == "moni"][0]
         self.assertEqual(moni[moni.index("--caption") + 1], "Abdullah's ride")
         self.assertTrue(moni[moni.index("--url") + 1].startswith("https://x.trycloudflare.com/"))
 
@@ -697,6 +754,16 @@ class SendTest(Base):
         calls = self.bridge_calls()
         self.assertEqual([c[0] for c in calls], ["share", "send"])
         self.assertNotIn("--to", calls[1])
+
+    def tree(self):
+        snap = {}
+        for top in (self.cards, self.journal):
+            for d, _, files in os.walk(top):
+                for f in files:
+                    path = os.path.join(d, f)
+                    with open(path, "rb") as fh:
+                        snap[path] = (fh.read(), os.stat(path).st_mtime_ns)
+        return snap
 
     def share_log(self):
         p = os.path.join(self.journal, f"{A}.json")
@@ -768,36 +835,93 @@ class SendTest(Base):
     def test_dry_run_writes_nothing_and_shows_routes(self):
         self.set_state(trip(A, "Accepted"), {})
         p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", "--dry-run")
-        self.assertEqual(json.loads(p.stdout), {"group-run_club": "would publish+send link --to group-run_club"})
+        out = json.loads(p.stdout)
+        self.assertEqual(out["group-run_club"], "would publish+send link --to group-run_club")
+        self.assertIn("no card yet", out["note"])
         self.assertEqual(self.bridge_calls(), [])
-        self.assertIsNone(self.share_log())
-        self.assertFalse(os.path.exists(os.path.join(self.journal, f"{A}.meta.json")))
+        # No card yet: nothing is built, locked or read from Uber.
+        self.assertFalse(os.path.exists(self.cards))
+        self.assertFalse(os.path.exists(self.journal))
+        self.assertFalse(os.path.exists(self.fixture + ".calls"))
         self.mark_sent(A)
         before = self.share_log()
         end = ("import sys, time; sys.path.insert(0, sys.argv[1]); import ride_card as rc; "
                "rc.write_card(rc.to_terminal(rc.load_card(sys.argv[2]), 'COMPLETED', time.time()), force=True)")
         subprocess.run([sys.executable, "-c", end, os.path.dirname(CARD), A], env=self.env, check=True, timeout=60)
         self.assertTrue(self.card(A)["terminal"])
-        before = self.share_log()
+        before = self.tree()
         p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", "--dry-run")
         out = json.loads(p.stdout)
         self.assertIn("a real send would be refused", out["note"])
-        self.assertEqual(self.share_log(), before)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--dry-run")
+        self.assertEqual(json.loads(p.stdout)["abdullah"], "already sent")
+        self.assertEqual(self.tree(), before, "a dry run leaves the card and the journal byte for byte")
         p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", ok=False)
         self.assertIn("already ended", p.stderr)
 
-    def test_ambiguous_attempt_is_not_retried_by_another_route(self):
+    def sends(self):
+        return [c for c in self.bridge_calls() if c[0] in ("send", "app")]
+
+    def test_accepted_but_unacked_send_is_not_resent_by_any_route(self):
+        # The group's own session queues the link, the reply is lost, then the group's route rotates
+        # (its own retry now gets 409). The owner retrying over --to must not post a second link.
         self.set_state(trip(A, "Accepted"), {})
-        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False,
-                          FAKE_BRIDGE_FAIL="send", FAKE_BRIDGE_ERR='{"error":"Bridge request timed out"}')
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False, FAKE_BRIDGE_FAIL="send",
+                          FAKE_BRIDGE_QUEUED="pending", FAKE_BRIDGE_ERR='{"error":"Bridge request timed out"}')
         self.assertEqual(p.returncode, 1)
-        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", ok=False)
-        self.assertIn("may have gone through via self", p.stdout)
-        self.assertEqual(len([c for c in self.bridge_calls() if c[0] == "send"]), 1)
-        # The same route retries the identical payload under the same key.
-        self.card_cli("send", "--trip", A, "--session", "group-thread@1")
-        sends = [c for c in self.bridge_calls() if c[0] == "send"]
-        self.assertEqual(sends[0], sends[1])
+        self.set_op("group-run_club", "sent", attempts=1)
+        self.route("group-run_club", "group-thread-2", 1)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "already queued (bridge: sent)"})
+        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(self.share_log()["recipients"]["group-run_club"]["status"], "sent")
+
+    def test_attempt_is_on_disk_before_the_bridge_call(self):
+        self.set_state(trip(A, "Accepted"), {})
+        peek = os.path.join(self.journal, f"{A}.json")
+        self.card_cli("send", "--trip", A, "--session", "group-thread@1", FAKE_BRIDGE_PEEK=peek)
+        with open(peek + ".seen") as f:
+            seen = json.loads(f.read().strip())["recipients"]["group-run_club"]
+        self.assertEqual((seen["status"], seen["via"], seen["attempts"]), ("attempting", "self", 1))
+        self.assertEqual(seen["keys"], [f"uber:{A}:card:group-run_club"])
+
+    def test_queued_op_after_a_cut_process_counts_as_sent(self):
+        # Killed between the bridge accepting the op and the journal update: the next run reads the outbox.
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", ok=False,
+                      FAKE_BRIDGE_FAIL="send", FAKE_BRIDGE_QUEUED="pending")
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "already queued (bridge: pending)"})
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_maybe_delivered_op_is_never_resent(self):
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False, FAKE_BRIDGE_FAIL="send",
+                      FAKE_BRIDGE_QUEUED="pending")
+        for state, attempts in (("uncertain", 1), ("cancelled", 1)):
+            self.set_op("group-run_club", state, attempts=attempts)
+            p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", ok=False)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("may have reached group-run_club", p.stdout)
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_rotation_before_any_attempt_retries_under_a_fresh_key(self):
+        # The group's session-bound op was cancelled by a rotation before the bridge tried it:
+        # nothing went out, and the same key would be a silent no-op, so the retry gets a new one.
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False, FAKE_BRIDGE_FAIL="send",
+                      FAKE_BRIDGE_QUEUED="pending")
+        self.route("group-run_club", "group-thread-2", 1)
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread-2@1")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+        first, second = self.sends()
+        self.assertEqual(first[first.index("--key") + 1], f"uber:{A}:card:group-run_club")
+        self.assertEqual(second[second.index("--key") + 1], f"uber:{A}:card:group-run_club:2")
+        self.assertEqual(first[first.index("--text") + 1], second[second.index("--text") + 1])
+        r = self.share_log()["recipients"]["group-run_club"]
+        self.assertEqual(r["keys"], [f"uber:{A}:card:group-run_club", f"uber:{A}:card:group-run_club:2"])
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "already sent"})
 
     def test_refused_attempt_can_switch_route(self):
         self.set_state(trip(A, "Accepted"), {})
@@ -806,10 +930,33 @@ class SendTest(Base):
         self.assertEqual(p.returncode, 1)
         p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
         self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
-        sends = [c for c in self.bridge_calls() if c[0] == "send"]
-        self.assertEqual(sends[0][sends[0].index("--key") + 1], sends[1][sends[1].index("--key") + 1])
-        self.assertEqual(sends[0][sends[0].index("--text") + 1], sends[1][sends[1].index("--text") + 1])
-        self.assertEqual(sends[1][sends[1].index("--to") + 1], "group-run_club")
+        first, second = self.sends()
+        self.assertEqual(first[first.index("--key") + 1], second[second.index("--key") + 1])
+        self.assertEqual(first[first.index("--text") + 1], second[second.index("--text") + 1])
+        self.assertEqual(second[second.index("--to") + 1], "group-run_club")
+        self.assertEqual(len(self.outbox("group-run_club")), 1)
+
+    def test_owner_card_survives_owner_route_rotation(self):
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_FAIL="app",
+                      FAKE_BRIDGE_QUEUED="pending", FAKE_BRIDGE_ERR='{"error":"Bridge request timed out"}')
+        self.route("abdullah", "thread-1", 4)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@4")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "already queued (bridge: pending)", "moni": "already sent"})
+        self.assertEqual([c[0] for c in self.sends()], ["app", "send"])
+
+    def test_unreadable_outbox_after_an_attempt_refuses(self):
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False, FAKE_BRIDGE_FAIL="send")
+        os.unlink(os.path.join(self.bstate, "chats", "group-run_club", "state.sqlite"))
+        self.route("group-run_club", "group-thread", 1)
+        con = sqlite3.connect(os.path.join(self.bstate, "chats", "group-run_club", "state.sqlite"))
+        con.execute("drop table outbox")
+        con.commit()
+        con.close()
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False)
+        self.assertIn("can't read the bridge outbox", p.stdout)
+        self.assertEqual(len(self.sends()), 1)
 
     def test_send_refuses_mismatched_trip(self):
         self.set_state(trip(B, "Accepted"), {})
@@ -847,7 +994,7 @@ print(json.dumps(res))
         res = json.loads(p.stdout.strip().splitlines()[-1])
         self.assertEqual(res["abdullah"], "sent")
         self.assertIn("app --to", res["moni"])
-        self.assertFalse(any(c[0] == "app" and "--to" in c for c in self.bridge_calls()))
+        self.assertFalse(any(c[0] == "app" and c[c.index("--to") + 1] == "moni" for c in self.bridge_calls()))
         with open(os.path.join(self.journal, f"{A}.json")) as f:
             self.assertNotIn("payload", json.load(f)["recipients"]["moni"])
 

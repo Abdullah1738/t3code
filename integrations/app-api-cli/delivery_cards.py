@@ -525,6 +525,70 @@ def live_session(args):
     return args
 
 
+def chat_store(slug):
+    base = Path(os.environ.get('SPECTRUM_BRIDGE_DB') or Path.home() / '.config/spectrum-bridge/state.sqlite').parent
+    return base / 'state.sqlite' if slug == 'owner' else base / 'chats' / slug / 'state.sqlite'
+
+
+def op_ids(args):
+    """Outbox ids a saved send can have: hash(slug:key) over --to, hash(key) on the caller's own route."""
+    kind = 'app' if args[0] == 'app' else 'send'
+    key = args[args.index('--key') + 1]
+    slug = args[args.index('--to') + 1] if '--to' in args else 'owner'
+    h = lambda s: hashlib.sha256(s.encode()).hexdigest()
+    return slug, {'to': f'{kind}:{h(slug + ":" + key)}', 'self': f'{kind}:{h(key)}'}
+
+
+def queued(args):
+    """The bridge's own record of a saved send, read only.
+
+    live: out or still deliverable; maybe: the bridge can't tell, or it was cancelled
+    after an attempt; taken: this exact route+key holds a dead op, so resending it
+    would be a silent no-op; None: nothing there. Owner cards first saved without
+    --to sat in the owner's session-bound queue, so both routes are checked."""
+    slug, ids = op_ids(args)
+    wanted = list(ids.values()) if slug == 'owner' else [ids['to']]
+    with sqlite3.connect(f'{chat_store(slug).as_uri()}?mode=ro', uri=True, timeout=2) as con:
+        rows = con.execute(f"select id, state, attempts, payload from outbox where id in ({','.join('?'*len(wanted))})",
+                           wanted).fetchall()
+        route = con.execute("select value from kv where key='route'").fetchone()
+    route = json.loads(route[0]) if route and route[0] else {}
+    kinds = set()
+    for oid, state, attempts, payload in rows:
+        op = json.loads(payload or '{}')
+        stale = op.get('generation') is not None and (op.get('sessionId'), op.get('generation')) != (route.get('id'), route.get('generation'))
+        if state in ('sent', 'fallback', 'sending') or (state == 'pending' and not stale):
+            kinds.add('live')
+        elif state == 'uncertain' or (state in ('pending', 'cancelled') and attempts):
+            kinds.add('maybe')
+        elif oid == ids['to' if '--to' in args else 'self']:
+            kinds.add('taken')
+    return next((k for k in ('live', 'maybe', 'taken') if k in kinds), None)
+
+
+def reconcile(args):
+    """Args for the next attempt at a saved send, or a final status when it must not be sent again."""
+    seen = queued(args)
+    if seen == 'live':
+        return 'sent', args
+    if seen == 'maybe':
+        return 'failed:may_have_sent_check_chat', args
+    args = owner_to(args)
+    if queued(args) == 'taken':
+        i = args.index('--key') + 1
+        base, _, n = args[i].partition('#')
+        args[i] = f'{base}#{int(n or 1) + 1}'
+    return None, args
+
+
+def owner_to(args):
+    """New owner-card form: --to owner carries no session, so no rotation can cancel or refuse it."""
+    args = list(args)
+    if args[0] == 'app' and '--to' not in args:
+        args += ['--to', 'owner']
+    return args
+
+
 def bridge(args, timeout=12):
     env = {k: v for k, v in os.environ.items() if k not in ('BUN_INSPECT', 'BUN_OPTIONS', 'NODE_OPTIONS')}
     p = subprocess.run([BUN, BRIDGE, *args], capture_output=True, text=True, timeout=timeout, env=env)
@@ -616,22 +680,29 @@ def sync(cfg, data, *, send=False):
                         state['url'] = url
                         atomic(statepath, state)
                         build(cfg, data, outdir=folder, url=url, public=recipient != 'owner')
+                    final = None
                     if not state.get('send_args'):
                         session = route()
                         dedupe = 'delivery-card:' + key
                         if recipient == 'owner':
-                            state['send_args'] = ['app', '--url', state['url'], '--caption', 'Delivery tracking', '--summary', 'Open your order', '--session', session, '--key', dedupe]
+                            state['send_args'] = ['app', '--url', state['url'], '--caption', 'Delivery tracking', '--summary', 'Open your order', '--session', session, '--key', dedupe, '--to', 'owner']
                         else:
-                            # app has no --to route. A public rich link also works
-                            # for recipients who have not installed Robob Cards.
+                            # A public rich link also works for recipients who
+                            # have not installed Robob Cards.
                             state['send_args'] = ['send', '--to', recipient, '--text=' + state['url'], '--session', session, '--key', dedupe]
-                    state['send_args'] = live_session(state['send_args'])
-                    state['status'] = 'attempting'
-                    atomic(statepath, state)
-                    ack = bridge(state['send_args'])
-                    if not isinstance(ack.get('id'), str) or not isinstance(ack.get('created'), bool):
-                        raise ValueError('card_send_bad_ack')
-                    state.update(status='sent', bridge_id=ack['id'])
+                    else:
+                        # A retry: the bridge outbox says whether the last attempt got through.
+                        final, state['send_args'] = reconcile(state['send_args'])
+                    if final:
+                        state['status'] = final
+                    else:
+                        state['send_args'] = live_session(state['send_args'])
+                        state['status'] = 'attempting'
+                        atomic(statepath, state)
+                        ack = bridge(state['send_args'])
+                        if not isinstance(ack.get('id'), str) or not isinstance(ack.get('created'), bool):
+                            raise ValueError('card_send_bad_ack')
+                        state.update(status='sent', bridge_id=ack['id'])
                 except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
                     state['status'] = 'failed:' + (str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
         # Quick-tunnel links can change after bridge restart. Report a broken
@@ -680,7 +751,19 @@ def repair_link(cfg, data):
             state['repair'] = repair
             atomic(path,state)
         build(cfg,data,outdir=APPS/state['slug'],url=repair['url'],public=True)
+        if repair.get('tried'):
+            final, repair['args'] = reconcile(repair['args'])
+            if final == 'sent':
+                repair.update(status='sent')
+                state.update(url=repair['url'],link_health='ok',link_checked_at=time.time())
+                atomic(path,state)
+                return {'status':'sent','url':state['url']}
+            if final:
+                repair['status'] = final
+                atomic(path,state)
+                raise ValueError('repair_may_have_sent_check_chat')
         repair['args'] = live_session(repair['args'])
+        repair['tried'] = True
         atomic(path,state)
         ack = bridge(repair['args'])
         if not isinstance(ack.get('id'),str) or not isinstance(ack.get('created'),bool):

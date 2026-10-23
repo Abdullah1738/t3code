@@ -808,9 +808,61 @@ def known_chat(slug):
     return slug == "abdullah" or (bridge_state() / "chats" / slug / "state.sqlite").is_file()
 
 
-def ambiguous(error):
-    """A bridge HTTP 4xx was refused before queueing; anything else (timeout, 5xx, no reply) may have sent."""
-    return not re.search(r"HTTP 4\d\d", error or "")
+def bridge_slug(who):
+    return "owner" if who == "abdullah" else who
+
+
+def op_ids(who, mode, key):
+    """The bridge's outbox ids for one key: the chat's own route and the owner's --to route."""
+    prefix = "app" if mode == "card" else "send"
+    h = lambda s: hashlib.sha256(s.encode()).hexdigest()
+    return {"self": f"{prefix}:{h(key)}", "to": f"{prefix}:{h(bridge_slug(who) + ':' + key)}"}
+
+
+def chat_db(who):
+    base = bridge_state()
+    return base / "state.sqlite" if who == "abdullah" else base / "chats" / who / "state.sqlite"
+
+
+def op_kind(state, attempts, stale):
+    """How a bridge outbox op stands. live: out, or still queued and deliverable; maybe: the bridge
+    itself can't tell ("uncertain"), or the op was cancelled or is about to be after an attempt that
+    may have reached the phone; dead: never went (refused, or cancelled by a route rotation before
+    any attempt)."""
+    if state in ("sent", "fallback", "sending") or (state == "pending" and not stale):
+        return "live"
+    if state == "uncertain" or (state in ("pending", "cancelled") and attempts):
+        return "maybe"
+    return "dead"
+
+
+def outbox(who, ids):
+    """{id: (kind, state)} for these ops in the recipient chat's bridge store, read only; None if unreadable."""
+    db = chat_db(who)
+    if not ids or not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute("select id, state, attempts, payload from outbox where id in "
+                               f"({','.join('?' * len(ids))})", list(ids)).fetchall()
+            route = con.execute("select value from kv where key = 'route'").fetchone()
+        finally:
+            con.close()
+        route = json.loads(route[0]) if route and route[0] else {}
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+    out = {}
+    for oid, state, attempts, payload in rows:
+        try:
+            op = json.loads(payload)
+        except ValueError:
+            op = {}
+        # Session-bound ops (a chat's own route) die with their route; --to ops carry no session.
+        stale = (op.get("generation") is not None
+                 and (op.get("sessionId"), op.get("generation")) != (route.get("id"), route.get("generation")))
+        out[oid] = (op_kind(state, attempts, stale), state)
+    return out
 
 
 def deliver(uuid, recipient, p, session, to, key):
@@ -847,6 +899,9 @@ def send(uuid, session, from_chat=None, dry_run=False, modes=None, force=False, 
             raise SystemExit(f"ride-card: only the owner's chat can send to other chats; this session is in {caller!r}")
         if not known_chat(x):
             raise SystemExit(f"ride-card: no bridge chat {x!r} (list them with `cli.ts chats` from the owner session)")
+    if dry_run:
+        # Read only: no Uber refresh, no lock file, no journal.
+        return _send_locked(uuid, load_card(uuid), session, caller, True, modes, force, targets)
     c = load_card(uuid)
     if not c:
         c = refresh(uuid)
@@ -869,7 +924,9 @@ def _add_extras(uuid, slugs):
 
 def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
     result, failed = {}, False
-    if c.get("terminal") and not force:
+    if c is None:
+        result["note"] = "no card yet; a real send builds it from `uber rides status` first"
+    elif c.get("terminal") and not force:
         if not dry_run:
             raise SystemExit(f"ride-card: trip {uuid} already ended ({c['state']}); not sending a new card")
         result["note"] = f"trip already ended ({c['state']}); a real send would be refused"
@@ -877,12 +934,12 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
     j = load_journal(uuid)
     recips = j.setdefault("recipients", {})
     everyone = recipients_for(uuid)
+    # The owner sends every card over --to (the owner chat's own slug is "owner"): those ops carry no
+    # session, so a route rotation never cancels or refuses them. Other chats can only use their own.
     if caller != "abdullah":
         plan = [(caller, None)]  # a non-owner chat can only reach itself, and always can
-    elif targets:
-        plan = [(r, None if r == "abdullah" else r) for r in targets]
     else:
-        plan = [(r, None if r == "abdullah" else r) for r in everyone]
+        plan = [(r, bridge_slug(r)) for r in (targets or everyone)]
     if not dry_run:
         _add_extras(uuid, [who for who, _ in plan if who != "abdullah" and who not in everyone])
     for who, to in plan:
@@ -890,23 +947,47 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
         if r.get("status") == "sent":
             result[who] = "already sent"
             continue
-        key = r.get("key") or f"uber:{uuid}:card:{who}"
         via = "to" if to else "self"
-        sending = False
-        if r.get("ambiguous") and r.get("via") not in (None, via):
-            # The bridge dedupes each route on its own key, so switching routes could send twice.
-            result[who] = (f"failed: the last attempt may have gone through via {r['via']}; "
-                           "retry from the same chat, or check the chat before sending again")
-            failed = True
-            continue
+        where = f" --to {to}" if to else " to this chat"
+        keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
+        key = keys[-1] if keys else f"uber:{uuid}:card:{who}"
+        if "payload" in r and keys:
+            # Whatever went before, the bridge outbox has the truth: one live op for any key on either
+            # route means the card is out or on its way, and nothing is sent again.
+            ids = {(k, route): op for k in keys for route, op in op_ids(who, r["payload"]["mode"], k).items()}
+            states = outbox(who, set(ids.values()))
+            live = sorted({s for kind, s in (states or {}).values() if kind == "live"})
+            maybe = sorted({s for kind, s in (states or {}).values() if kind == "maybe"})
+            if states is None and r.get("attempts"):
+                result[who] = (f"failed: can't read the bridge outbox for {who}, and an earlier attempt "
+                               "may have gone through; not sending again")
+                failed = True
+                continue
+            if maybe and not live:
+                result[who] = (f"failed: an earlier attempt may have reached {who} (bridge: {', '.join(maybe)}); "
+                               "check the chat before sending again")
+                failed = True
+                continue
+            if live:
+                result[who] = f"already queued (bridge: {', '.join(live)})"
+                if not dry_run:
+                    r.update(status="sent", sent_at=r.get("sent_at") or iso(time.time()), error=None)
+                    _save_journal(uuid, j)
+                continue
+            if ids[(key, via)] in (states or {}):
+                # This route already holds this key, failed or cancelled; resending it would be a
+                # silent no-op on the bridge, so the retry gets a fresh key.
+                key = f"uber:{uuid}:card:{who}:{len(keys) + 1}"
         try:
             if "payload" not in r:
                 mode = modes.get(who) or ("card" if who == "abdullah"
                                           else "card" if who == "moni" and moni_has_cards() else "link")
                 if dry_run:
-                    result[who] = f"would publish+send {mode}" + (f" --to {to}" if to else " to this chat")
+                    result[who] = f"would publish+send {mode}{where}"
                     continue
-                if mode == "card" and to and not bridge_app_to():
+                if mode == "card" and to and who != "abdullah" and not bridge_app_to():
+                    # An old server ignores `to` and posts in the caller's chat. For the owner's own
+                    # card that is the same chat, so only other recipients need the new server.
                     raise RuntimeError("bridge has no `app --to` yet; use link mode for this recipient")
                 if who == "abdullah":
                     pub = bridge("publish", "--app", slug(uuid))
@@ -919,24 +1000,23 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                 if not url or not str(url).startswith("https://"):
                     raise RuntimeError(f"no https URL from bridge: {str(pub)[:200]}")
                 r["payload"] = payload_for(c, who, url, mode)
-                r["key"] = key
                 r["created_at"] = iso(time.time())
                 _save_journal(uuid, j)
             if dry_run:
-                result[who] = (f"would send {r['payload']['mode']} {r['payload']['url']}"
-                               + (f" --to {to}" if to else " to this chat"))
+                result[who] = f"would send {r['payload']['mode']} {r['payload']['url']}{where}"
                 continue
-            r["attempts"] = r.get("attempts", 0) + 1
-            r["via"] = via
-            sending = True
+            # On disk before the bridge call, so a cut process is reconciled from the outbox next time.
+            if key not in keys:
+                keys.append(key)
+            r.update(key=key, keys=keys, via=via, status="attempting", attempts=r.get("attempts", 0) + 1,
+                     attempted_at=iso(time.time()))
+            _save_journal(uuid, j)
             deliver(uuid, who, r["payload"], session, to, key)
-            r.update(status="sent", sent_at=iso(time.time()), error=None, ambiguous=False)
+            r.update(status="sent", sent_at=iso(time.time()), error=None)
             result[who] = "sent"
         except Exception as ex:
             err = str(ex)[:300]
             r.update(status="failed", error=err)
-            if sending:
-                r["ambiguous"] = ambiguous(err)
             result[who] = f"failed: {err[:200]}"
             failed = True
         if not dry_run:

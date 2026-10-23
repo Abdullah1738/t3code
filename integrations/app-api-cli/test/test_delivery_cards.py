@@ -1,8 +1,11 @@
 import contextlib
 import datetime as dt
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -22,6 +25,11 @@ class CardTests(unittest.TestCase):
             p = patch.object(obj, name, value); p.start(); self.addCleanup(p.stop)
         self.calls = []
         self.fail_send = False
+        self.queue_on_fail = None
+        self.bridge_dir = self.root / 'bridge'
+        for chat in ('owner', 'moni', 'group-sb_gro'):
+            self.store(chat, 'fixture-session', 1)
+        p = patch.dict(os.environ, {'SPECTRUM_BRIDGE_DB': str(self.bridge_dir / 'state.sqlite')}); p.start(); self.addCleanup(p.stop)
         def bridge(args, **kw):
             self.calls.append(args)
             if args[0] == 'shares':
@@ -30,7 +38,11 @@ class CardTests(unittest.TestCase):
             if args[0] in ('share', 'publish'):
                 return {'url': 'https://cards.trycloudflare.com/' if args[0] == 'share' else 'https://host.ts.net:18400/card/'}
             if self.fail_send:
+                if self.queue_on_fail:
+                    self.queue(args, self.queue_on_fail)  # accepted, but the reply was lost
                 raise ValueError('bridge_request_failed')
+            if args[0] in ('send', 'app'):
+                self.queue(args, 'sent')
             return {'id': 'message-fixture', 'created': True}
         for name, value in (('bridge', bridge), ('route', lambda: 'fixture-session')):
             p = patch.object(c, name, value); p.start(); self.addCleanup(p.stop)
@@ -38,6 +50,37 @@ class CardTests(unittest.TestCase):
                     'registered_at':dt.datetime.now(dt.timezone.utc).isoformat(), 'vertical':'restaurants',
                     'delivery_card':{'ready':True}, 'card_meta':{'items':[{'name':'Iced latte','qty':1}]}}
         self.data = {'status':'preparing','checked_at':dt.datetime.now(dt.timezone.utc).isoformat()}
+
+    def db(self, chat):
+        return self.bridge_dir / 'state.sqlite' if chat == 'owner' else self.bridge_dir / 'chats' / chat / 'state.sqlite'
+
+    def store(self, chat, rid, generation):
+        self.db(chat).parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db(chat)) as con:
+            con.execute('create table if not exists kv (key text primary key, value text not null)')
+            con.execute('create table if not exists outbox (id text primary key, payload text not null, state text not null, attempts integer not null default 0)')
+            con.execute("insert or replace into kv values ('route', ?)", (json.dumps({'id': rid, 'generation': generation}),))
+
+    def queue(self, args, state, attempts=0):
+        # Like the bridge: --to ops sit in the target's store under hash(slug:key) with no session;
+        # the caller's own route (the owner, here) holds hash(key) bound to its route.
+        h = lambda v: hashlib.sha256(v.encode()).hexdigest()
+        key = args[args.index('--key') + 1]
+        if '--to' in args:
+            chat = args[args.index('--to') + 1]
+            oid, op = f'{args[0]}:{h(chat + ":" + key)}', {}
+        else:
+            chat, oid, op = 'owner', f'{args[0]}:{h(key)}', {'sessionId': 'fixture-session', 'generation': 1}
+        with sqlite3.connect(self.db(chat)) as con:
+            con.execute('insert or ignore into outbox values (?, ?, ?, ?)', (oid, json.dumps(op), state, attempts))
+
+    def ops(self, chat):
+        with sqlite3.connect(self.db(chat)) as con:
+            return con.execute('select state, attempts from outbox order by rowid').fetchall()
+
+    def set_ops(self, chat, state, attempts):
+        with sqlite3.connect(self.db(chat)) as con:
+            con.execute('update outbox set state = ?, attempts = ?', (state, attempts))
 
     def test_food_steps_and_scoped_terminal_proof(self):
         self.assertEqual(c.stage(self.data, True)[2], 'Preparing')
@@ -215,6 +258,8 @@ class CardTests(unittest.TestCase):
         cfg['delivery_card']['held'] = False
         self.assertEqual(c.sync(cfg,self.data,send=True)['status'],'sent')
         self.assertEqual([a[0] for a in self.calls],['publish','app'])
+        app = self.calls[1]
+        self.assertEqual(app[app.index('--to')+1],'owner','owner cards ride --to, which no rotation cancels')
 
     def test_ambiguous_send_retries_exact_payload_and_key(self):
         self.fail_send = True
@@ -237,6 +282,67 @@ class CardTests(unittest.TestCase):
         self.assertEqual(retry[retry.index('--session')+1],'rotated-session')
         drop = lambda a: [x for i,x in enumerate(a) if '--session' not in a[max(i-1,0):i+1]]
         self.assertEqual(drop(first),drop(retry))
+
+    def owner_cfg(self):
+        return {**self.cfg,'for':'owner','delivery_card':{'ready':True}}
+
+    def test_owner_card_accepted_before_a_lost_reply_is_not_sent_again(self):
+        self.fail_send, self.queue_on_fail = True, 'pending'
+        self.assertTrue(c.sync(self.owner_cfg(),self.data,send=True)['status'].startswith('failed:'))
+        self.fail_send = False
+        self.store('owner','rotated-session',2)
+        with patch.object(c,'route',lambda: 'rotated-session'):
+            self.assertEqual(c.sync(self.owner_cfg(),self.data,send=True)['status'],'sent')
+        self.assertEqual(sum(a[0]=='app' for a in self.calls),1)
+
+    def test_maybe_delivered_send_waits_for_the_bridge(self):
+        self.fail_send, self.queue_on_fail = True, 'pending'
+        c.sync(self.cfg,self.data,send=True)
+        self.fail_send = False
+        self.set_ops('moni','uncertain',1)
+        self.assertEqual(c.sync(self.cfg,self.data,send=True)['status'],'failed:may_have_sent_check_chat')
+        self.set_ops('moni','sent',1)  # the bridge's own retry got it out
+        self.assertEqual(c.sync(self.cfg,self.data,send=True)['status'],'sent')
+        self.assertEqual(sum(a[0]=='send' for a in self.calls),1)
+
+    def legacy_owner_attempt(self, state, attempts):
+        # A card saved before owner cards moved to --to: session-bound, in the owner's own queue.
+        cfg = self.owner_cfg()
+        self.fail_send = True
+        c.sync(cfg,self.data,send=True)
+        self.fail_send = False
+        path = c.ROOT/'cards/order-talabat-123.json'
+        saved = c.read(path)
+        args = [a for i,a in enumerate(saved['send_args']) if a != '--to' and saved['send_args'][i-1] != '--to']
+        saved['send_args'] = args
+        c.atomic(path, saved)
+        self.queue(args, state, attempts)
+        self.store('owner','rotated-session',2)
+        with patch.object(c,'route',lambda: 'rotated-session'):
+            return cfg, c.sync(cfg,self.data,send=True)['status']
+
+    def test_legacy_owner_card_cancelled_by_rotation_moves_to_to_owner(self):
+        _, status = self.legacy_owner_attempt('pending', 0)
+        self.assertEqual(status,'sent')
+        apps = [a for a in self.calls if a[0]=='app']
+        self.assertEqual(apps[-1][apps[-1].index('--to')+1],'owner')
+        self.assertEqual(apps[-1][apps[-1].index('--key')+1],'delivery-card:order-talabat-123')
+        self.assertEqual(apps[-1][apps[-1].index('--session')+1],'rotated-session')
+
+    def test_legacy_owner_card_already_out_is_not_resent(self):
+        _, status = self.legacy_owner_attempt('sent', 1)
+        self.assertEqual(status,'sent')
+        self.assertEqual(sum(a[0]=='app' for a in self.calls),1)
+
+    def test_refused_op_retries_under_a_fresh_key(self):
+        self.fail_send, self.queue_on_fail = True, 'pending'
+        c.sync(self.cfg,self.data,send=True)
+        self.fail_send = False
+        self.set_ops('moni','failed',1)  # the line refused it outright; same key would be a no-op
+        self.assertEqual(c.sync(self.cfg,self.data,send=True)['status'],'sent')
+        first, retry = [a for a in self.calls if a[0]=='send']
+        self.assertEqual(retry[retry.index('--key')+1], first[first.index('--key')+1] + '#2')
+        self.assertEqual([x for x in retry if x.startswith('--text=')], [x for x in first if x.startswith('--text=')])
 
     def test_group_card_chat_gets_the_public_link(self):
         cfg = {**self.cfg,'for':'owner','delivery_card':{'ready':True,'chat':'group-sb_gro'}}
@@ -368,6 +474,23 @@ class CardTests(unittest.TestCase):
         self.assertEqual(len(sent),1)
         self.assertNotEqual(sent[0][-1],original[-1])
         self.assertIn('new.trycloudflare.com',(c.APPS/state['slug']/'index.html').read_text())
+
+    def test_repair_retry_after_a_lost_reply_is_not_sent_twice(self):
+        c.sync(self.cfg,self.data,send=True)
+        state=c.read(c.ROOT/'cards/order-talabat-123.json')
+        calls=[]
+        def flaky(args,**kw):
+            calls.append(args)
+            if args[0]=='shares':return {'shares':[{'app':state['slug'],'live':True,'url':'https://new.trycloudflare.com/'}]}
+            self.queue(args,'pending')  # accepted, then the reply was lost
+            raise ValueError('bridge_request_failed')
+        with patch.object(c,'bridge',side_effect=flaky):
+            with self.assertRaises(ValueError):
+                c.repair_link(self.cfg,self.data)
+        with patch.object(c,'bridge',side_effect=flaky):
+            self.assertEqual(c.repair_link(self.cfg,self.data)['status'],'sent')
+        self.assertEqual(sum(a[0]=='send' for a in calls),1)
+        self.assertEqual(c.read(c.ROOT/'cards/order-talabat-123.json')['url'],'https://new.trycloudflare.com/')
 
     def test_prune_only_completed_owned_delivery_shares(self):
         c.sync(self.cfg,{**self.data,'status':'delivered'},send=True)
