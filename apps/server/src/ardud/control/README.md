@@ -162,8 +162,9 @@ planning and commit refuses with `changed`; try again later.
 - 409 `conflict` when the orchestrator rejects the archive for another reason.
 - 404 `not_found` for an unknown or deleted thread, also when it was deleted
   while the archive ran.
-- 503 `unavailable` while the server is still starting; 500 `internal` when
-  storage or a read failed. Neither means the thread is busy.
+- 503 `unavailable` when the server failed to become ready for commands or is
+  shutting down; 500 `internal` when storage or a read failed. Neither means
+  the thread is busy.
 
 `t3ctl archive-if-idle THREAD [--session ses_...]` exits 3 when refused.
 
