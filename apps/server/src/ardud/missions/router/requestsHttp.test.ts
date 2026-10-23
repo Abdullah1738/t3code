@@ -331,12 +331,16 @@ describe("owner requests over iMessage", () => {
       yield* seed;
       const stored: string[] = [];
       const registry = yield* RequestImages;
-      yield* registry.register(({ image }) => {
-        const path = image._tag === "file" ? image.path : image.attachmentId;
-        stored.push(path);
-        const assetId = `mission-00000000-0000-4000-8000-00000000000${stored.length}`;
-        return Effect.succeed({ assetId, path: `/assets/${assetId}.png` });
-      });
+      yield* registry.register(({ images }) =>
+        Effect.succeed({
+          images: images.map((image) => {
+            stored.push(image._tag === "file" ? image.path : image.attachmentId);
+            const assetId = `mission-00000000-0000-4000-8000-00000000000${stored.length}`;
+            return { assetId, path: `/assets/${assetId}.png` };
+          }),
+          undo: Effect.void,
+        }),
+      );
       const now = yield* Clock.currentTimeMillis;
       inbound.push(said(now, "in-1", "this header is off, see the screenshot"));
       const body = {

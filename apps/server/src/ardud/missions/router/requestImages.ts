@@ -16,12 +16,20 @@ export interface StoredRequestImage {
   readonly path: string;
 }
 
-export type StoreRequestImage = (input: {
+export interface StoredRequestImages {
+  /** In the order they were given. */
+  readonly images: ReadonlyArray<StoredRequestImage>;
+  /** Drops the images this call created, for a message that never lands. */
+  readonly undo: Effect.Effect<void>;
+}
+
+/** Stores a message's images together: a bad one stores none. */
+export type StoreRequestImages = (input: {
   readonly missionId: MissionId;
   readonly requestId: OwnerRequestId;
-  readonly image: OwnerRequestImage;
+  readonly images: ReadonlyArray<OwnerRequestImage>;
   readonly provenance: MissionProvenance;
-}) => Effect.Effect<StoredRequestImage, MissionError>;
+}) => Effect.Effect<StoredRequestImages, MissionError>;
 
 /**
  * Stores a request message's images as mission images about the request.
@@ -31,12 +39,12 @@ export type StoreRequestImage = (input: {
 export class RequestImages extends Context.Service<
   RequestImages,
   {
-    readonly register: (store: StoreRequestImage) => Effect.Effect<void>;
-    readonly store: StoreRequestImage;
+    readonly register: (store: StoreRequestImages) => Effect.Effect<void>;
+    readonly store: StoreRequestImages;
   }
 >()("t3/ardud/missions/router/requestImages") {}
 
-const unwired: StoreRequestImage = () =>
+const unwired: StoreRequestImages = () =>
   Effect.fail(
     new MissionError({ code: "invalid", detail: "This server can't store request images." }),
   );

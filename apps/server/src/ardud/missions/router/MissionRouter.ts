@@ -1043,7 +1043,7 @@ const make = Effect.gen(function* () {
     loadCast,
     post: postChecked,
     afterPost,
-    storeImage: images.store,
+    storeImages: images.store,
   });
 
   const post = (input: PostMessageInput, provenance: MissionProvenance) =>

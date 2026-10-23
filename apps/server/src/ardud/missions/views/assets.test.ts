@@ -4,7 +4,12 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import { assert, describe, it } from "@effect/vitest";
-import type { MissionStreamItem } from "@t3tools/contracts";
+import type {
+  MissionAssetSource,
+  MissionId,
+  MissionProvenance,
+  MissionStreamItem,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 
@@ -24,6 +29,7 @@ import * as MissionService from "../MissionService.ts";
 import * as MissionStore from "../store/MissionStore.ts";
 import { sniffImage } from "./assets.ts";
 import { ViewService } from "./ViewService.ts";
+import * as ViewStore from "./ViewStore.ts";
 import { fresh } from "./views.testkit.ts";
 
 /** A PNG header with real dimensions; enough for the sniff and size reads. */
@@ -53,6 +59,25 @@ const threadAttachment = (threadId: string, bytes: Uint8Array) =>
     writeFile(attachmentsDir, `${id}.png`, bytes);
     return id;
   });
+
+/** A one-image request message. */
+const addRequestImage = (
+  views: ViewService["Service"],
+  provenance: MissionProvenance,
+  input: {
+    readonly missionId: MissionId;
+    readonly requestId: string;
+    readonly source: MissionAssetSource;
+  },
+) =>
+  Effect.map(
+    views.addRequestImages(provenance, {
+      missionId: input.missionId,
+      requestId: input.requestId,
+      sources: [input.source],
+    }),
+    (stored) => stored.images[0]!,
+  );
 
 describe("mission images", () => {
   it("knows images by their bytes, not their names", () => {
@@ -167,7 +192,7 @@ describe("mission images", () => {
         const { attachmentsDir } = yield* ServerConfig.ServerConfig;
         const upload = yield* threadAttachment(masterThread, png(6, 4));
         const source = { _tag: "attachment", attachmentId: upload } as const;
-        const first = yield* views.addRequestImage(ownerApp, {
+        const first = yield* addRequestImage(views, ownerApp, {
           missionId,
           requestId: "request-a",
           source,
@@ -175,10 +200,10 @@ describe("mission images", () => {
         assert.equal(first.path, NodePath.join(attachmentsDir, `${first.assetId}.png`));
         assert.isTrue(NodeFS.existsSync(first.path));
         assert.deepEqual(
-          yield* views.addRequestImage(ownerApp, { missionId, requestId: "request-a", source }),
+          yield* addRequestImage(views, ownerApp, { missionId, requestId: "request-a", source }),
           first,
         );
-        const other = yield* views.addRequestImage(ownerApp, {
+        const other = yield* addRequestImage(views, ownerApp, {
           missionId,
           requestId: "request-b",
           source,
@@ -190,7 +215,7 @@ describe("mission images", () => {
         const onServer = writeFile(NodePath.join(stateDir, "shots"), "salary.png", png(2, 2));
         assert.equal(
           yield* failureCode(
-            views.addRequestImage(ownerApp, {
+            addRequestImage(views, ownerApp, {
               missionId,
               requestId: "request-a",
               source: { _tag: "file", path: onServer },
@@ -198,7 +223,8 @@ describe("mission images", () => {
           ),
           "invalid",
         );
-        const fromDesk = yield* views.addRequestImage(
+        const fromDesk = yield* addRequestImage(
+          views,
           { _tag: "owner-imessage", chat: "owner", inboundId: "spc-msg-1" },
           { missionId, requestId: "request-a", source: { _tag: "file", path: onServer } },
         );
@@ -210,6 +236,111 @@ describe("mission images", () => {
         assert.isFalse(added.some((event) => JSON.stringify(event).includes("salary")));
         assert.isFalse(added.some((event) => JSON.stringify(event).includes("request-a")));
         assert.notEqual(fromDesk.assetId, first.assetId);
+      }),
+    ),
+  );
+
+  it.effect("a request message stores all its images or none, and can take back its own", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+        const good = {
+          _tag: "attachment",
+          attachmentId: yield* threadAttachment(masterThread, png(6, 4)),
+        } as const;
+        const bad = {
+          _tag: "attachment",
+          attachmentId: yield* threadAttachment(masterThread, new Uint8Array([1, 2, 3, 4])),
+        } as const;
+        const files = () =>
+          NodeFS.readdirSync(attachmentsDir).filter((name) => name.startsWith("mission-"));
+        assert.equal(
+          yield* failureCode(
+            views.addRequestImages(ownerApp, {
+              missionId,
+              requestId: "request-a",
+              sources: [good, bad],
+            }),
+          ),
+          "invalid",
+        );
+        assert.deepEqual(files(), []);
+
+        const kept = yield* addRequestImage(views, ownerApp, {
+          missionId,
+          requestId: "request-a",
+          source: good,
+        });
+        const other = {
+          _tag: "attachment",
+          attachmentId: yield* threadAttachment(masterThread, png(8, 8)),
+        } as const;
+        const retried = yield* views.addRequestImages(ownerApp, {
+          missionId,
+          requestId: "request-a",
+          sources: [good, other],
+        });
+        assert.equal(retried.images[0]!.assetId, kept.assetId);
+        assert.deepEqual(retried.created, [retried.images[1]!.assetId]);
+        yield* views.dropRequestImages(missionId, retried.created);
+        assert.deepEqual(files(), [`${kept.assetId}.png`]);
+        const viewStore = yield* ViewStore.ViewStore;
+        const active = (yield* viewStore.assets(missionId)).filter(
+          (asset) => asset.status === "active",
+        );
+        assert.deepEqual(
+          active.map((asset) => asset.id),
+          [kept.assetId],
+        );
+      }),
+    ),
+  );
+
+  it.effect("no event a reader can see names his request images", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const store = yield* MissionStore.MissionStore;
+        const missions = yield* MissionService.MissionService;
+        const upload = yield* threadAttachment(masterThread, png(6, 4));
+        const source = { _tag: "attachment", attachmentId: upload } as const;
+        const removed = yield* addRequestImage(views, ownerApp, {
+          missionId,
+          requestId: "request-a",
+          source,
+        });
+        yield* views.removeAsset(ownerApp, { missionId, assetId: removed.assetId as never });
+        const kept = yield* addRequestImage(views, ownerApp, {
+          missionId,
+          requestId: "request-b",
+          source,
+        });
+        const card = yield* views.addAsset(ownerApp, { missionId, source });
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const subscription = yield* store.subscribe;
+            yield* missions.setMissionStatus(ownerApp, { missionId, status: "archived" });
+            yield* Stream.fromSubscription(subscription).pipe(
+              Stream.filter(
+                (item: MissionStreamItem) =>
+                  item._tag === "upsert" &&
+                  item.record._tag === "event" &&
+                  item.record.record.kind === "view.assets-expired",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+            );
+          }),
+        );
+        const digest = JSON.stringify(yield* missions.digest(missionId, { _tag: "seq", seq: 0 }));
+        assert.include(digest, "view.assets-expired");
+        assert.include(digest, card.ref.id);
+        assert.notInclude(digest, removed.assetId);
+        assert.notInclude(digest, kept.assetId);
       }),
     ),
   );

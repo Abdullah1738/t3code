@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { OpenOwnerRequestInput, ReplyOwnerRequestInput } from "./missions.ts";
 import {
+  escapeRequestImageRefs,
   placeRequestImages,
   requestImageMarker,
   requestImageRef,
@@ -91,5 +92,18 @@ describe("requestTextParts", () => {
   it("keeps refs that are not mission assets as text", () => {
     const text = "see [image 1: /tmp/not-an-asset.png]";
     expect(requestTextParts(text)).toEqual([{ type: "text", text }]);
+  });
+
+  it("never turns a ref he typed into an image, and gives his words back as typed", () => {
+    const typed = `look [image 1: /tmp/${assetA}.txt] and [image 2\\: ${pathB}]`;
+    const stored = placeRequestImages(`${typed} {image1}`, [requestImageRef(1, pathB)]);
+    expect(stored).not.toContain(`[image 1: /tmp/`);
+    expect(requestTextParts(stored)).toEqual([
+      { type: "text", text: `${typed} ` },
+      { type: "image", index: 1, assetId: assetB, path: pathB },
+    ]);
+    const words = escapeRequestImageRefs(typed);
+    expect(requestTextParts(words)).toEqual([{ type: "text", text: typed }]);
+    expect(requestPlainText(placeRequestImages(typed, []))).toBe(typed);
   });
 });

@@ -16,6 +16,7 @@ import {
   MissionError,
   MissionMessageId,
   OwnerRequestId,
+  escapeRequestImageRefs,
   placeRequestImages,
   requestImageRef,
   requestPlainText,
@@ -67,7 +68,7 @@ import {
   settledBy,
   withLastReply,
 } from "./requestsModel.ts";
-import type { StoreRequestImage } from "./requestImages.ts";
+import type { StoreRequestImages } from "./requestImages.ts";
 import type { RouterStore } from "./RouterStore.ts";
 
 /** Requests one list returns, newest activity first. */
@@ -134,7 +135,7 @@ export interface OwnerRequestDeps {
     speaker: ThreadId | null,
     deliveries: ReadonlyArray<ThreadId>,
   ) => Effect.Effect<void>;
-  readonly storeImage: StoreRequestImage;
+  readonly storeImages: StoreRequestImages;
 }
 
 type RoomCount = { readonly total: number; readonly unreadForOwner: number };
@@ -530,23 +531,37 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
     const speakerOf = (writer: Writer) => (writer._tag === "master" ? writer.threadId : null);
 
     /**
-     * The message text with each image stored and its ref in place. A retry
-     * finds the images it stored, so it writes the same text.
+     * One write's stored images. `place` gives the message text with each
+     * image stored and its ref in place; a retry finds the images it stored,
+     * so it writes the same text. When the write fails after that, the
+     * images it created go again and the ones it reused stay.
      */
-    const withImages = (
-      missionId: MissionId,
-      requestId: OwnerRequestId,
-      text: string,
-      images: ReadonlyArray<OwnerRequestImage> | undefined,
-      provenance: MissionProvenance,
-    ) =>
-      images === undefined || images.length === 0
-        ? Effect.succeed(text)
-        : Effect.forEach(images, (image, at) =>
-            Effect.map(deps.storeImage({ missionId, requestId, image, provenance }), (stored) =>
-              requestImageRef(at + 1, stored.path),
-            ),
-          ).pipe(Effect.map((refs) => placeRequestImages(text, refs)));
+    const imageBatch = () => {
+      const undos: Array<Effect.Effect<void>> = [];
+      return {
+        place: (
+          missionId: MissionId,
+          requestId: OwnerRequestId,
+          text: string,
+          images: ReadonlyArray<OwnerRequestImage> | undefined,
+          provenance: MissionProvenance,
+        ) =>
+          images === undefined || images.length === 0
+            ? Effect.succeed(placeRequestImages(text, []))
+            : Effect.map(
+                deps.storeImages({ missionId, requestId, images, provenance }),
+                (stored) => {
+                  undos.push(stored.undo);
+                  return placeRequestImages(
+                    text,
+                    stored.images.map((image, at) => requestImageRef(at + 1, image.path)),
+                  );
+                },
+              ),
+        undoOnFailure: <A, E, R>(self: Effect.Effect<A, E, R>) =>
+          Effect.onError(self, () => Effect.all(undos, { discard: true })),
+      };
+    };
 
     /**
      * Discuss: the record a request is about, read live. Null when it is gone.
@@ -755,8 +770,9 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         return { missionId: input.missionId, requests } satisfies OwnerRequests;
       });
 
-    const open = (input: OpenOwnerRequestInput, provenance: MissionProvenance) =>
-      write(
+    const open = (input: OpenOwnerRequestInput, provenance: MissionProvenance) => {
+      const images = imageBatch();
+      return write(
         Effect.gen(function* () {
           const mission = yield* liveMission(input.missionId);
           const cast = yield* loadCast(mission.id);
@@ -816,7 +832,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
               : yield* appendedBefore(mission.id, inboundId, `request:${requestId}:open`, subject);
           const ongoing = subject === null ? null : yield* openAbout(mission.id, subject);
           // The images go with the request this message lands in.
-          const text = yield* withImages(
+          const text = yield* images.place(
             mission.id,
             prior?.request.id ?? ongoing?.id ?? requestId,
             input.text,
@@ -825,7 +841,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           );
           const quoted = (opening: boolean) =>
             writer._tag === "master"
-              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${input.quotedFrom}.]\n\n${text}`
+              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${escapeRequestImageRefs(input.quotedFrom ?? "")}.]\n\n${text}`
               : text;
           if (prior !== null && subject !== null) {
             const earlier = prior.request;
@@ -937,8 +953,9 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             speaker: posted.fresh ? speakerOf(writer) : null,
             deliveries: posted.fresh ? posted.deliveries : [],
           };
-        }),
+        }).pipe(images.undoOnFailure),
       );
+    };
 
     const reply = (input: ReplyOwnerRequestInput, provenance: MissionProvenance) =>
       write(replyLocked(input, provenance));
@@ -951,8 +968,9 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
       input: ReplyOwnerRequestInput,
       provenance: MissionProvenance,
       messageKey: string | null = null,
-    ) =>
-      Effect.gen(function* () {
+    ) => {
+      const images = imageBatch();
+      return Effect.gen(function* () {
         const request = yield* need(input.requestId);
         yield* liveMission(request.missionId);
         const cast = yield* loadCast(request.missionId);
@@ -981,7 +999,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           if (!owner) yield* refuseSilence(input.text);
           yield* checkLinks(request.missionId, links);
         }
-        const text = yield* withImages(
+        const text = yield* images.place(
           request.missionId,
           request.id,
           input.text,
@@ -1027,7 +1045,8 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           speaker: posted.fresh ? speakerOf(writer) : null,
           deliveries: posted.fresh ? posted.deliveries : [],
         };
-      });
+      }).pipe(images.undoOnFailure);
+    };
 
     const settle = (input: SettleOwnerRequestInput, provenance: MissionProvenance) =>
       write(
@@ -1090,12 +1109,13 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           return { result: next, speaker, deliveries: [] as ReadonlyArray<ThreadId> };
         }
         if (master) yield* refuseSilence(noteText);
+        const said = escapeRequestImageRefs(noteText);
         // The owner's closing words are for the master: it wakes once with them.
         const to = owner && masterRoleOf(cast) !== null ? yield* masterAddress(cast) : [];
         const note = messageInput(
           request,
           owner ? "decision" : "status",
-          noteText,
+          said,
           to,
           inboundKeyOf(provenance, request.id),
         );
@@ -1110,7 +1130,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             const next = withLastReply(
               // The note from deciding the record is news for the owner.
               settler._tag === "system" ? { ...settled, unreadForOwner: true } : settled,
-              noteText,
+              said,
               settler.actor,
               at,
             );
@@ -1180,7 +1200,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           }
           if (!owner && input.note !== undefined) yield* refuseSilence(input.note);
           // The owner reopening is the owner speaking: the master wakes with everything.
-          const text = input.note ?? "Reopened by the owner.";
+          const text = escapeRequestImageRefs(input.note ?? "Reopened by the owner.");
           const to = owner ? yield* masterAddress(cast) : [];
           const message = messageInput(
             request,

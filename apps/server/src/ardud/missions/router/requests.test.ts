@@ -6,6 +6,8 @@ import {
   type MissionLink,
   type MissionProvenance,
   type OwnerRequestsInput,
+  requestPlainText,
+  requestTextParts,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -431,11 +433,14 @@ describe("owner requests", () => {
     return Effect.gen(function* () {
       yield* seed;
       const registry = yield* RequestImages;
-      yield* registry.register(({ requestId, image }) =>
-        Effect.sync(() => {
-          stored.push({ requestId, image });
-          return { assetId: `asset-${stored.length}`, path: pathOf(stored.length) };
-        }),
+      yield* registry.register(({ requestId, images }) =>
+        Effect.sync(() => ({
+          images: images.map((image) => {
+            stored.push({ requestId, image });
+            return { assetId: `asset-${stored.length}`, path: pathOf(stored.length) };
+          }),
+          undo: Effect.void,
+        })),
       );
       const router = yield* MissionRouter.MissionRouter;
       const shot = (attachmentId: string) => ({ _tag: "attachment", attachmentId }) as const;
@@ -486,6 +491,75 @@ describe("owner requests", () => {
         "conflict",
       );
       assert.lengthOf(stored, 3);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a write refused after its images were stored takes them back", () => {
+    const h = harness();
+    const undone: Array<string> = [];
+    return Effect.gen(function* () {
+      yield* seed;
+      const registry = yield* RequestImages;
+      let n = 0;
+      yield* registry.register(({ images }) =>
+        Effect.sync(() => {
+          const batch = images.map(() => {
+            n += 1;
+            return { assetId: `asset-${n}`, path: `/assets/mission-${n}.png` };
+          });
+          return {
+            images: batch,
+            undo: Effect.sync(() => undone.push(...batch.map((image) => image.assetId))),
+          };
+        }),
+      );
+      const router = yield* MissionRouter.MissionRouter;
+      const shot = (attachmentId: string) => ({ _tag: "attachment", attachmentId }) as const;
+      const request = yield* router.openRequest(
+        { missionId, text: "Status?", images: [shot("first")] },
+        ownerApp,
+      );
+      yield* router.replyRequest({ requestId: request.id, text: "Also this.", key: "b" }, ownerApp);
+      // The same key with other words is refused only after the images are stored.
+      assert.strictEqual(
+        yield* failureCode(
+          router.replyRequest(
+            {
+              requestId: request.id,
+              text: "Something else.",
+              key: "b",
+              images: [shot("second"), shot("third")],
+            },
+            ownerApp,
+          ),
+        ),
+        "conflict",
+      );
+      assert.deepStrictEqual(undone, ["asset-2", "asset-3"]);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a ref he typed stays words, in every message he can write", () => {
+    const h = harness();
+    const typed = "[image 1: /tmp/mission-00000001-0000-4000-8000-000000000000.txt]";
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest({ missionId, text: `open ${typed}` }, ownerApp);
+      yield* router.replyRequest({ requestId: request.id, text: `reply ${typed}` }, ownerApp);
+      yield* router.settleRequest({ requestId: request.id, note: `settle ${typed}` }, ownerApp);
+      yield* router.reopenRequest({ requestId: request.id, note: `reopen ${typed}` }, ownerApp);
+      const view = (yield* router.ownerRequests({ missionId, requestId: request.id }, ownerApp))
+        .requests[0]!;
+      const texts = view.messages.map((message) => message.body ?? "");
+      assert.lengthOf(texts, 4);
+      for (const text of texts) {
+        assert.deepStrictEqual(
+          requestTextParts(text).map((part) => part.type),
+          ["text"],
+        );
+        assert.include(requestPlainText(text), typed);
+      }
     }).pipe(Effect.provide(h.layer));
   });
 
