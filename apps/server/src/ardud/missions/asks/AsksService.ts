@@ -148,6 +148,7 @@ import {
 import {
   defaultAsker,
   isParticipant,
+  masterThreadsIn,
   standingOf,
   type MissionCast,
   type Standing,
@@ -571,6 +572,8 @@ const make = Effect.gen(function* () {
       readonly decidedBy: MissionProvenance | null;
       readonly to?: ReadonlyArray<MissionActor>;
       readonly notTo?: ReadonlyArray<MissionActor>;
+      /** A knock to the master is the owner's alone until he forwards it. */
+      readonly ownerOnly?: boolean;
     }) {
       const missionId = input.missionId;
       if (missionId === null) return;
@@ -578,11 +581,12 @@ const make = Effect.gen(function* () {
       const masterRoleId =
         cast.mission?.masterRoleId ?? cast.roles.find((role) => role.kind === "master")?.id ?? null;
       const decider = input.decidedBy;
-      const masterDecided =
-        decider !== null &&
-        decider._tag === "agent" &&
-        masterRoleId !== null &&
-        decider.roleId === masterRoleId;
+      const skipMaster =
+        input.ownerOnly === true ||
+        (decider !== null &&
+          decider._tag === "agent" &&
+          masterRoleId !== null &&
+          decider.roleId === masterRoleId);
       const recipients: MissionActor[] = [];
       const add = (actor: MissionActor) => {
         // Only members with a thread read the control room.
@@ -592,7 +596,7 @@ const make = Effect.gen(function* () {
         recipients.push(actor);
       };
       for (const actor of input.to ?? []) add(actor);
-      if (masterRoleId !== null && !masterDecided) add({ _tag: "role", roleId: masterRoleId });
+      if (masterRoleId !== null && !skipMaster) add({ _tag: "role", roleId: masterRoleId });
       if (recipients.length === 0) return;
       yield* rooms.post(
         {
@@ -2145,6 +2149,10 @@ const make = Effect.gen(function* () {
   // -------------------------------------------------------------------------
   // ardud missions: finish-a - comments and snoozes on inbox items
 
+  // Approval and knock decisions write the same mark outside the asks lock.
+  const onItem = <A, E, R>(subject: InboxItemRef, effect: Effect.Effect<A, E, R>) =>
+    store.withItemLock(markIdOf(subject), effect);
+
   const markedItem = (subject: InboxItemRef, provenance: MissionProvenance) =>
     Effect.gen(function* () {
       if (!isOwnerProvenance(provenance)) {
@@ -2193,6 +2201,19 @@ const make = Effect.gen(function* () {
               now: at,
             })
           : null;
+      // The requester reads a decided approval's note, not the inbox mark, so
+      // a comment after the decision goes on that note too.
+      const approval =
+        input.subject.kind === "approval" ? yield* need("approval", input.subject.id) : null;
+      const noted =
+        approval === null || approval.status === "pending" || approval.status === "stale-closed"
+          ? null
+          : {
+              ...approval,
+              decisionNote: [approval.decisionNote, input.body]
+                .filter((line): line is string => typeof line === "string" && line.length > 0)
+                .join("\n"),
+            };
       yield* persist(
         item.missionId,
         [
@@ -2209,6 +2230,7 @@ const make = Effect.gen(function* () {
         [
           { _tag: "inbox-mark", record },
           ...(sentBack === null ? [] : [{ _tag: "draft" as const, record: sentBack.record }]),
+          ...(noted === null ? [] : [{ _tag: "approval" as const, record: noted }]),
         ],
       );
       return { record, item, comment };
@@ -2227,6 +2249,7 @@ const make = Effect.gen(function* () {
       readonly to: ReadonlyArray<MissionActor>;
       readonly lead: string;
       readonly current: (comments: ReadonlyArray<InboxComment>) => ReadonlyArray<InboxComment>;
+      readonly ownerOnly?: boolean;
     },
     MissionError
   > {
@@ -2255,9 +2278,28 @@ const make = Effect.gen(function* () {
       }
       case "knock": {
         const knock = yield* need("knock", subject.id);
+        // A knock to the master stays hidden from it until the owner forwards
+        // it, so the target is the original one, not where it went.
+        const toMaster =
+          knock.status !== "forwarded" &&
+          knock.targetThreadId !== undefined &&
+          masterThreadsIn(yield* castOf(knock.missionId)).includes(knock.targetThreadId);
         return {
           to: knock.forwardedTo === null ? [] : [knock.forwardedTo],
           lead: `Knock ${knock.id} from ${knock.fromTitle} is ${knock.status}.`,
+          current: all,
+          ownerOnly: toMaster,
+        };
+      }
+      case "approval": {
+        const approval = yield* need("approval", subject.id);
+        const decided = approval.status === "approved" || approval.status === "rejected";
+        return {
+          to: [],
+          lead:
+            approval.status === "pending"
+              ? `Approval ${approval.id} is waiting on his decision: ${approval.title}`
+              : `Approval ${approval.id} is ${approval.status}: ${approval.title}.${decided ? ` ${approval.requestedBy} reads the comment in the decision note.` : ""}`,
           current: all,
         };
       }
@@ -2279,6 +2321,7 @@ const make = Effect.gen(function* () {
         key: `comment:${markIdOf(subject)}:${comment.id}`,
         decidedBy: null,
         to: actor.to,
+        ownerOnly: actor.ownerOnly === true,
       });
     },
     // The comment is saved already; a failed notice must not fail the call and
@@ -2493,13 +2536,14 @@ const make = Effect.gen(function* () {
     // ardud missions: r22 comments
     withComments: (kind, records) => attachComments(store, kind, records),
     commentInboxItem: (input, provenance) =>
-      serialized(commentInboxItemCommand(input, provenance)).pipe(
+      serialized(onItem(input.subject, commentInboxItemCommand(input, provenance))).pipe(
         Effect.tap(({ record, item }) => tellOfComment(input.subject, record, item.label)),
         Effect.map(({ record }) => record),
       ),
-    snoozeInboxItem: (input, provenance) => serialized(snoozeInboxItemCommand(input, provenance)),
+    snoozeInboxItem: (input, provenance) =>
+      serialized(onItem(input.subject, snoozeInboxItemCommand(input, provenance))),
     unsnoozeInboxItem: (input, provenance) =>
-      serialized(unsnoozeInboxItemCommand(input, provenance)),
+      serialized(onItem(input.subject, unsnoozeInboxItemCommand(input, provenance))),
   });
 });
 

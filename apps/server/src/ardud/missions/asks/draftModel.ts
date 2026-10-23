@@ -1139,6 +1139,9 @@ export const systemDraftDecision = (
     revision: revisionOf(draft),
     delivery,
     ...(comments.length === 0 ? {} : { comments: [...comments] }),
+    // Comments are only ever appended within a revision, so the count and the
+    // newest id name the set.
+    commentsRevision: `${revisionOf(draft)}:${comments.length}:${comments.at(-1)?.id ?? ""}`,
   } as const;
   if ((draft.staleReason ?? null) !== null || draft.head !== head) {
     return { ...base, state: "stale", decidedAt: null };

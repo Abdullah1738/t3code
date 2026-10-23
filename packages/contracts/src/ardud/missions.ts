@@ -3800,6 +3800,11 @@ export const SystemDraftDecision = Schema.Struct({
   // --- r22 comments ---
   /** The owner's comments on the draft, oldest first. */
   comments: Schema.optional(Schema.Array(InboxComment)),
+  /**
+   * Changes whenever the comments that apply to this revision change, so a system that already
+   * acted on the decision (forwarded a rewrite, bound the approval) knows to act again.
+   */
+  commentsRevision: Schema.optional(Schema.String),
   // --- end r22 comments ---
 });
 export type SystemDraftDecision = typeof SystemDraftDecision.Type;

@@ -398,103 +398,107 @@ export const makeApprovalWrites = (kit: WriteKit) => {
 
   const decideApproval = (provenance: MissionProvenance, input: DecideApprovalInput) =>
     serial(
-      Effect.gen(function* () {
-        const before = yield* loadApproval(input.approvalId);
-        if (before.status !== "pending") {
-          return yield* fail(
-            "conflict",
-            before.status === "stale-closed"
-              ? `Approval ${before.id} closed as stale (${before.staleReason ?? "no reason"}); it no longer counts.`
-              : `Approval ${before.id} was already ${before.status}.`,
-          );
-        }
-        const approver = approverOf(before);
-        const owner = isOwnerProvenance(provenance);
-        const condition = input.onOwnerCondition ?? null;
-        if (condition !== null) {
-          if (owner) {
+      // The owner's note joins the item's comments, which comments write under this lock too.
+      store.withItemLock(
+        markIdOf({ kind: "approval", id: input.approvalId }),
+        Effect.gen(function* () {
+          const before = yield* loadApproval(input.approvalId);
+          if (before.status !== "pending") {
             return yield* fail(
-              "invalid",
-              "The owner decides directly; owner conditions are for the master.",
+              "conflict",
+              before.status === "stale-closed"
+                ? `Approval ${before.id} closed as stale (${before.staleReason ?? "no reason"}); it no longer counts.`
+                : `Approval ${before.id} was already ${before.status}.`,
             );
           }
-          if (!(yield* isMasterOf(store, before.missionId, provenance))) {
-            return yield* fail(
-              "forbidden",
-              `Only mission ${before.missionId}'s master decides on the owner's condition.`,
-            );
-          }
-          yield* conditions.verify({ subject: approvalRef(before), condition });
-        }
-        const allowed =
-          owner ||
-          condition !== null ||
-          (approver === "master" && (yield* isMasterOf(store, before.missionId, provenance)));
-        if (!allowed) {
-          return yield* fail(
-            approver === "owner" ? "provenance-required" : "forbidden",
-            approver === "owner"
-              ? `Approval ${before.id} is routed to the owner.`
-              : `Only the owner or mission ${before.missionId}'s master decides approval ${before.id}.`,
-          );
-        }
-        const decidedAt = yield* nowIso;
-        // The owner's note stays on the approval as a comment, saved with the
-        // decision. Whoever acts reads decisionNote, so it carries every comment
-        // he left on the approval, not only this note.
-        const subject = { kind: "approval" as const, id: before.id };
-        const noteBody = owner ? ((yield* decisionNoteOf(input.note, provenance)) ?? "") : "";
-        const mark =
-          noteBody === ""
-            ? null
-            : withComment(
-                yield* store.get("inbox-mark", markIdOf(subject)),
-                subject,
-                before.missionId,
-                {
-                  id: `comment-${NodeCrypto.randomUUID()}`,
-                  body: noteBody,
-                  at: decidedAt,
-                },
+          const approver = approverOf(before);
+          const owner = isOwnerProvenance(provenance);
+          const condition = input.onOwnerCondition ?? null;
+          if (condition !== null) {
+            if (owner) {
+              return yield* fail(
+                "invalid",
+                "The owner decides directly; owner conditions are for the master.",
               );
-        const comments = mark?.comments ?? (yield* commentsOn(store, subject));
-        const commented = owner && comments.length > 0;
-        const masterNote = owner ? "" : (input.note?.trim() ?? "");
-        const said = [...comments.map((comment) => comment.body), masterNote].filter(
-          (line) => line !== "",
-        );
-        const decisionNote = said.length > 0 ? said.join("\n") : (input.note ?? null);
-        const record: Approval = {
-          ...before,
-          status: input.action === "approve" ? "approved" : "rejected",
-          decidedBy: provenance,
-          decidedAt,
-          decisionNote,
-          ...(condition === null ? {} : { onOwnerCondition: condition }),
-        };
-        const verb = input.action === "approve" ? "Approved" : "Rejected";
-        return yield* commit(provenance, {
-          missionId: before.missionId,
-          kind: "approval.decided",
-          summary:
-            condition === null
-              ? `${verb}: ${record.title}`
-              : `${verb} on the owner's condition: ${record.title}`,
-          ref: approvalRef(record),
-          upserts: [
-            { _tag: "approval", record },
-            ...(mark === null ? [] : [{ _tag: "inbox-mark" as const, record: mark }]),
-          ],
-          payload: {
-            action: input.action,
-            approver,
-            note: input.note ?? null,
-            onOwnerCondition: condition,
-            ...(mark === null ? {} : { commentId: mark.comments.at(-1)?.id ?? null }),
-            ...(commented ? { commented: true } : {}),
-          },
-        });
-      }),
+            }
+            if (!(yield* isMasterOf(store, before.missionId, provenance))) {
+              return yield* fail(
+                "forbidden",
+                `Only mission ${before.missionId}'s master decides on the owner's condition.`,
+              );
+            }
+            yield* conditions.verify({ subject: approvalRef(before), condition });
+          }
+          const allowed =
+            owner ||
+            condition !== null ||
+            (approver === "master" && (yield* isMasterOf(store, before.missionId, provenance)));
+          if (!allowed) {
+            return yield* fail(
+              approver === "owner" ? "provenance-required" : "forbidden",
+              approver === "owner"
+                ? `Approval ${before.id} is routed to the owner.`
+                : `Only the owner or mission ${before.missionId}'s master decides approval ${before.id}.`,
+            );
+          }
+          const decidedAt = yield* nowIso;
+          // The owner's note stays on the approval as a comment, saved with the
+          // decision. Whoever acts reads decisionNote, so it carries every comment
+          // he left on the approval, not only this note.
+          const subject = { kind: "approval" as const, id: before.id };
+          const noteBody = owner ? ((yield* decisionNoteOf(input.note, provenance)) ?? "") : "";
+          const mark =
+            noteBody === ""
+              ? null
+              : withComment(
+                  yield* store.get("inbox-mark", markIdOf(subject)),
+                  subject,
+                  before.missionId,
+                  {
+                    id: `comment-${NodeCrypto.randomUUID()}`,
+                    body: noteBody,
+                    at: decidedAt,
+                  },
+                );
+          const comments = mark?.comments ?? (yield* commentsOn(store, subject));
+          const commented = owner && comments.length > 0;
+          const masterNote = owner ? "" : (input.note?.trim() ?? "");
+          const said = [...comments.map((comment) => comment.body), masterNote].filter(
+            (line) => line !== "",
+          );
+          const decisionNote = said.length > 0 ? said.join("\n") : (input.note ?? null);
+          const record: Approval = {
+            ...before,
+            status: input.action === "approve" ? "approved" : "rejected",
+            decidedBy: provenance,
+            decidedAt,
+            decisionNote,
+            ...(condition === null ? {} : { onOwnerCondition: condition }),
+          };
+          const verb = input.action === "approve" ? "Approved" : "Rejected";
+          return yield* commit(provenance, {
+            missionId: before.missionId,
+            kind: "approval.decided",
+            summary:
+              condition === null
+                ? `${verb}: ${record.title}`
+                : `${verb} on the owner's condition: ${record.title}`,
+            ref: approvalRef(record),
+            upserts: [
+              { _tag: "approval", record },
+              ...(mark === null ? [] : [{ _tag: "inbox-mark" as const, record: mark }]),
+            ],
+            payload: {
+              action: input.action,
+              approver,
+              note: input.note ?? null,
+              onOwnerCondition: condition,
+              ...(mark === null ? {} : { commentId: mark.comments.at(-1)?.id ?? null }),
+              ...(commented ? { commented: true } : {}),
+            },
+          });
+        }),
+      ),
     ).pipe(
       Effect.tap((result) =>
         settleDiscussion(

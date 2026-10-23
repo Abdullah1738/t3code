@@ -1,5 +1,6 @@
 import {
   KnockId,
+  MissionError,
   MissionId,
   MissionMessageId,
   RoleId,
@@ -50,6 +51,30 @@ const harness = () => {
     Layer.provideMerge(Sqlite.layerMemory),
   );
   return { ...threads, layer };
+};
+
+/** The fake world over a store that can be told to fail knock decisions. */
+const flakyHarness = () => {
+  const threads = fakeRouterThreads();
+  const failing = { knockDecisions: false };
+  const store = Layer.effect(
+    MissionStore.MissionStore,
+    Effect.gen(function* () {
+      const real = yield* MissionStore.MissionStore;
+      return MissionStore.MissionStore.of({
+        ...real,
+        commit: (commit) =>
+          failing.knockDecisions && commit.event.kind === "knock.decided"
+            ? Effect.fail(new MissionError({ code: "conflict", detail: "The store is down." }))
+            : real.commit(commit),
+      });
+    }),
+  ).pipe(Layer.provide(MissionStore.layer));
+  const layer = routerOverFakes(threads).pipe(
+    Layer.provideMerge(store),
+    Layer.provideMerge(Sqlite.layerMemory),
+  );
+  return { ...threads, failing, layer };
 };
 
 const control = RoomId.make(`${missionId}:room:control`);
@@ -550,7 +575,7 @@ describe("knocks", () => {
         {
           threadId: masterThread,
           text: `[Forwarded by the owner from ${strayThread}] Stray asks about its PR.`,
-          key: `knock:${outcome.knockId}:forward:${masterThread}`,
+          key: `knock:${outcome.knockId}:forward:${masterThread}:${decided.decidedAt}`,
           asOwner: true,
         },
       ]);
@@ -620,6 +645,111 @@ describe("knocks", () => {
         ).length,
         1,
       );
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("dropping a knock to the master with a note tells the master nothing", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), masterThread));
+      if (outcome._tag !== "knocked") return assert.fail("expected a knock");
+      yield* router.decideKnock(
+        { knockId: outcome.knockId, action: "drop", note: "Spam, ignore." },
+        ownerApp,
+      );
+      // Nothing was posted, so the control room was never even opened.
+      const page = yield* router.roomPage({ roomId: control }, ownerApp).pipe(
+        Effect.map((read) => read.messages),
+        Effect.orElseSucceed(() => []),
+      );
+      assert.deepStrictEqual(page, []);
+      assert.deepStrictEqual(h.sent, []);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a forward whose decision fails to save sends nothing", () => {
+    const h = flakyHarness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), laneThread));
+      if (outcome._tag !== "knocked") return assert.fail("expected a knock");
+      const forwards = () =>
+        h.sent.filter((each) => each.key.startsWith(`knock:${outcome.knockId}:`));
+      const forward = router.decideKnock(
+        { knockId: outcome.knockId, action: "forward", note: "Answer after the deploy." },
+        ownerApp,
+      );
+      h.failing.knockDecisions = true;
+      assert.strictEqual(yield* failureCode(forward), "conflict");
+      assert.deepStrictEqual(forwards(), []);
+      const pending = Option.getOrThrow(yield* store.get("knock", outcome.knockId));
+      assert.strictEqual(pending.status, "pending");
+      assert.isTrue(Option.isNone(yield* store.get("inbox-mark", `knock:${outcome.knockId}`)));
+
+      h.failing.knockDecisions = false;
+      const decided = yield* forward;
+      assert.deepStrictEqual(
+        forwards().map((each) => each.key),
+        [`knock:${outcome.knockId}:forward:${laneThread}:${decided.decidedAt}`],
+      );
+      assert.include(forwards()[0]?.text ?? "", "- Answer after the deploy.");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a forward that fails to deliver stays decided and resends on a retry", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), laneThread));
+      if (outcome._tag !== "knocked") return assert.fail("expected a knock");
+      const forwards = () =>
+        h.sent.filter((each) => each.key.startsWith(`knock:${outcome.knockId}:`));
+      const forward = router.decideKnock(
+        { knockId: outcome.knockId, action: "forward", note: "Answer after the deploy." },
+        ownerApp,
+      );
+      h.refuseSend.add(laneThread);
+      assert.strictEqual(yield* failureCode(forward), "conflict");
+      assert.deepStrictEqual(forwards(), []);
+      const saved = Option.getOrThrow(yield* store.get("knock", outcome.knockId));
+      assert.strictEqual(saved.status, "forwarded");
+      const mark = Option.getOrThrow(yield* store.get("inbox-mark", `knock:${outcome.knockId}`));
+      assert.deepStrictEqual(
+        mark.comments.map((comment) => comment.body),
+        ["Answer after the deploy."],
+      );
+
+      // The retry sends the committed forward under the committed decision's key.
+      h.refuseSend.delete(laneThread);
+      const again = yield* forward;
+      assert.strictEqual(again.decidedAt, saved.decidedAt);
+      assert.deepStrictEqual(
+        forwards().map((each) => each.key),
+        [`knock:${outcome.knockId}:forward:${laneThread}:${saved.decidedAt}`],
+      );
+      assert.include(forwards()[0]?.text ?? "", "- Answer after the deploy.");
+      const after = Option.getOrThrow(yield* store.get("inbox-mark", `knock:${outcome.knockId}`));
+      assert.strictEqual(after.comments.length, 1);
+
+      // A different forward or a drop is a new decision, refused once forwarded.
+      const otherNote = yield* failureCode(
+        router.decideKnock(
+          { knockId: outcome.knockId, action: "forward", note: "Actually, now." },
+          ownerApp,
+        ),
+      );
+      assert.strictEqual(otherNote, "conflict");
+      const drop = yield* failureCode(
+        router.decideKnock({ knockId: outcome.knockId, action: "drop" }, ownerApp),
+      );
+      assert.strictEqual(drop, "conflict");
+      assert.strictEqual(forwards().length, 1);
     }).pipe(Effect.provide(h.layer));
   });
 

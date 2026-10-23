@@ -49,6 +49,15 @@ export const masterThreadOf = (cast: MissionCast): ThreadId | null => {
   return role === null ? null : (activeBinding(cast, role)?.threadId ?? null);
 };
 
+/** Every thread bound to the master role now, as the router's knock filter counts them. */
+export const masterThreadsIn = (cast: MissionCast): ReadonlyArray<ThreadId> => {
+  const role = masterRole(cast);
+  if (role === null) return [];
+  return cast.bindings
+    .filter((binding) => binding.roleId === role.id && binding.endedAt === null)
+    .map((binding) => binding.threadId);
+};
+
 /** The thread that speaks for an actor right now, if any. */
 export const threadOfActor = (cast: MissionCast, actor: MissionActor): ThreadId | null => {
   switch (actor._tag) {

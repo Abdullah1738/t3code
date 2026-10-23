@@ -1,9 +1,19 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ApprovalId, DraftId, type MissionLink, type MissionProvenance } from "@t3tools/contracts";
+import {
+  ApprovalId,
+  DraftId,
+  type Knock,
+  KnockId,
+  type MissionLink,
+  type MissionProvenance,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Scheduler from "effect/Scheduler";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as MissionService from "../MissionService.ts";
+import * as MissionStore from "../store/MissionStore.ts";
 import * as AsksService from "./AsksService.ts";
 import {
   agent,
@@ -17,6 +27,7 @@ import {
   missionId,
   ownerApp,
   seed,
+  strayThread,
   writerThread,
 } from "./AsksService.testkit.ts";
 import { askResolvedLine } from "./ports.ts";
@@ -233,6 +244,10 @@ describe("owner comments travel with his decisions", () => {
       );
       const third = yield* decision("d-2");
       expect(third.rewriteNote).toContain("- Say please.\n- And thank them.");
+      // crw already forwarded the first rewrite: the changed revision tells it to forward again.
+      expect(second.commentsRevision).toBeDefined();
+      expect(third.commentsRevision).not.toBe(second.commentsRevision);
+      expect(yield* decision("d-2")).toEqual(third);
 
       // His own rewrite note carries the comments too.
       const rewritten = yield* open("d-3", 10);
@@ -409,6 +424,154 @@ describe("owner comments travel with his decisions", () => {
         "Squash it.",
         "Delete the branch after.",
       ]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a comment after an approval is decided reaches its requester", () => {
+    const { posts, layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const missions = yield* MissionService.MissionService;
+      const approvalId = ApprovalId.make("m-1:approval:crw:acme/api#9@cccccccccccc");
+      yield* missions.openApproval(crw, {
+        missionId,
+        approvalId,
+        kind: "merge",
+        title: "Good to merge: acme/api#9",
+        detail: "Decide in the review thread.",
+        requestedBy: "crw",
+        links: [pullRequest(9)],
+      });
+      yield* missions.decideApproval(ownerApp, {
+        approvalId,
+        action: "approve",
+        note: "Squash it.",
+      });
+      const before = posts.length;
+      yield* asks.commentInboxItem(
+        { subject: { kind: "approval", id: approvalId }, body: "Wait for the deploy window." },
+        ownerApp,
+      );
+
+      // crw reads the decision note from /approvals, so the late comment is on it.
+      const [approval] = yield* missions.approvals({ missionId, ids: [approvalId] });
+      expect(approval?.status).toBe("approved");
+      expect(approval?.decisionNote).toBe("Squash it.\nWait for the deploy window.");
+      expect(posts.length).toBe(before + 1);
+      expect(posts.at(-1)?.input.to).toEqual([toMaster]);
+      expect(posts.at(-1)?.input.body).toContain("crw reads the comment in the decision note");
+      expect(posts.at(-1)?.input.body).toContain("- Wait for the deploy window.");
+
+      // A pending approval's note is written when he decides, not by a comment.
+      const pendingId = ApprovalId.make("m-1:approval:crw:acme/api#10@dddddddddddd");
+      yield* missions.openApproval(crw, {
+        missionId,
+        approvalId: pendingId,
+        kind: "merge",
+        title: "Good to merge: acme/api#10",
+        detail: "Decide in the review thread.",
+        requestedBy: "crw",
+        links: [pullRequest(10)],
+      });
+      yield* asks.commentInboxItem(
+        { subject: { kind: "approval", id: pendingId }, body: "Not yet." },
+        ownerApp,
+      );
+      const [pending] = yield* missions.approvals({ missionId, ids: [pendingId] });
+      expect(pending?.decisionNote ?? null).toBeNull();
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a comment racing a decision note on the same item keeps both", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const missions = yield* MissionService.MissionService;
+      const store = yield* MissionStore.MissionStore;
+      const approvalId = ApprovalId.make("m-1:approval:crw:acme/api#11@eeeeeeeeeeee");
+      yield* missions.openApproval(crw, {
+        missionId,
+        approvalId,
+        kind: "merge",
+        title: "Good to merge: acme/api#11",
+        detail: "Decide in the review thread.",
+        requestedBy: "crw",
+        links: [pullRequest(11)],
+      });
+      // Yield on every op so the two writes interleave between read and commit.
+      yield* Effect.all(
+        [
+          asks.commentInboxItem(
+            { subject: { kind: "approval", id: approvalId }, body: "Check the migration." },
+            ownerApp,
+          ),
+          missions.decideApproval(ownerApp, { approvalId, action: "approve", note: "Ship it." }),
+        ],
+        { concurrency: "unbounded", discard: true },
+      ).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 8));
+
+      const mark = yield* store.get("inbox-mark", `approval:${approvalId}`);
+      const bodies = mark._tag === "Some" ? mark.value.comments.map((each) => each.body) : [];
+      expect([...bodies].toSorted()).toEqual(["Check the migration.", "Ship it."]);
+      const [approval] = yield* missions.approvals({ missionId, ids: [approvalId] });
+      expect(approval?.decisionNote?.split("\n").toSorted()).toEqual([
+        "Check the migration.",
+        "Ship it.",
+      ]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a comment on a pending knock to the master stays with the owner", () => {
+    const { posts, layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const store = yield* MissionStore.MissionStore;
+      const knock = (id: string, targetThreadId: ThreadId): Knock => ({
+        id: KnockId.make(id),
+        missionId,
+        fromThreadId: strayThread,
+        fromTitle: "Stray",
+        path: "thread-send",
+        summary: "Wants a look at its PR",
+        body: "please look at my PR",
+        status: "pending",
+        forwardedText: null,
+        forwardedTo: null,
+        decidedAt: null,
+        createdAt: at,
+        targetThreadId,
+      });
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "knock.received",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "knocks",
+          subject: null,
+        },
+        upserts: [
+          { _tag: "knock", record: knock("knock-master", masterThread) },
+          { _tag: "knock", record: knock("knock-lane", laneThread) },
+        ],
+      });
+
+      yield* asks.commentInboxItem(
+        { subject: { kind: "knock", id: KnockId.make("knock-master") }, body: "Ignore it." },
+        ownerApp,
+      );
+      expect(posts).toHaveLength(0);
+
+      // A knock to anyone else is the master's to see, so it hears the comment.
+      yield* asks.commentInboxItem(
+        { subject: { kind: "knock", id: KnockId.make("knock-lane") }, body: "Not now." },
+        ownerApp,
+      );
+      expect(posts).toHaveLength(1);
+      expect(posts[0]?.input.to).toEqual([toMaster]);
     }).pipe(Effect.provide(layer));
   });
 });

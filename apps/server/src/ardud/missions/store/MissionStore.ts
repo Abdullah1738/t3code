@@ -305,6 +305,17 @@ export class MissionStore extends Context.Service<
       fields: ReadonlyArray<string>,
     ) => Effect.Effect<ReadonlyArray<MissionFieldChange>, MissionError>;
     // --- end core additions ---
+    // --- r22 comments ---
+    /**
+     * Runs `effect` holding one inbox item's lock. Comments, snoozes and decisions all
+     * read the item's mark and write it back whole, so each read-modify-write holds it.
+     * Not reentrant; take it inside the asks or write lock, never around them.
+     */
+    readonly withItemLock: <A, E, R>(
+      key: string,
+      effect: Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E, R>;
+    // --- end r22 comments ---
   }
 >()("t3/ardud/missions/store/MissionStore") {}
 
@@ -327,6 +338,16 @@ const make = Effect.gen(function* () {
   const changes = yield* PubSub.unbounded<MissionStreamItem>();
   // Serializes commit + publish so subscribers see each mission's seq in order.
   const commitLock = yield* Semaphore.make(1);
+  const itemLocks = new Map<string, Semaphore.Semaphore>();
+  const withItemLock = <A, E, R>(key: string, effect: Effect.Effect<A, E, R>) =>
+    Effect.suspend(() => {
+      let lock = itemLocks.get(key);
+      if (lock === undefined) {
+        lock = Semaphore.makeUnsafe(1);
+        itemLocks.set(key, lock);
+      }
+      return lock.withPermit(effect);
+    });
 
   const decodeStoredRecord = (kind: string, id: string, json: string) =>
     decodeRecord(json).pipe(
@@ -760,6 +781,9 @@ const make = Effect.gen(function* () {
     listPage,
     latestFieldChanges,
     // --- end core additions ---
+    // --- r22 comments ---
+    withItemLock,
+    // --- end r22 comments ---
   });
 });
 
