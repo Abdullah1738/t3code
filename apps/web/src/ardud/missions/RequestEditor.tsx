@@ -135,6 +135,10 @@ export function useRequestDraft() {
       held.current.forEach(discard);
     };
   }, []);
+  // A send in flight takes no new images, and images still being read when a
+  // message went were meant for it, so they don't land in the next one.
+  const sending = useRef(false);
+  const cleared = useRef(0);
 
   const chipped = chippedImages(text, images);
   const words = stripInlineContextReferences(text).trim();
@@ -172,10 +176,21 @@ export function useRequestDraft() {
       warn("Couldn't attach", "Not connected to the server.");
       return;
     }
+    if (sending.current) {
+      warn("Not attached", "Wait for the message to send, then attach it.");
+      return;
+    }
+    const round = cleared.current;
     const added = await prepared(attachable(files, REQUEST_IMAGE_LIMIT - chipped.length));
     // Reading big files can outlast the box.
     if (!mounted.current) {
       added.forEach(discard);
+      return;
+    }
+    if (sending.current || cleared.current !== round) {
+      added.forEach(discard);
+      if (added.length > 0)
+        warn("Not attached", "A message went while it was read. Attach it again.");
       return;
     }
     if (added.length === 0) return;
@@ -206,10 +221,22 @@ export function useRequestDraft() {
   });
 
   const clear = () => {
+    cleared.current += 1;
     held.current.forEach(discard);
     setImages([]);
     setText("");
     setCursor(0);
+  };
+
+  const whileSending = async (work: () => Promise<boolean>) => {
+    sending.current = true;
+    setBusy(true);
+    try {
+      return await work();
+    } finally {
+      sending.current = false;
+      setBusy(false);
+    }
   };
 
   /**
@@ -225,9 +252,7 @@ export function useRequestDraft() {
         warn("Not sent yet", ready.reason);
         return false;
       }
-      setBusy(true);
-      const sent = await deliver(text, ready.images);
-      setBusy(false);
+      const sent = await whileSending(() => deliver(text, ready.images));
       if (sent) clear();
       return sent;
     },
@@ -240,9 +265,7 @@ export function useRequestDraft() {
         warn("Images go in a reply", "A settle note is words only. Send the images first.");
         return false;
       }
-      setBusy(true);
-      const done = await action(words);
-      setBusy(false);
+      const done = await whileSending(() => action(words));
       if (done && clearOnDone) clear();
       return done;
     },

@@ -51,6 +51,14 @@ function draft(): RequestDraft {
 
 const photo = () => new File([new Uint8Array([1, 2, 3])], "photo.png", { type: "image/png" });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 const read = (file: File): CompressImageFileResult => ({ ok: true, file, recompressed: false });
 
 beforeEach(() => {
@@ -82,4 +90,44 @@ it("takes an image in a box mounted under StrictMode", async () => {
 
   expect(draft().empty).toBe(false);
   expect(harness.uploads).toHaveLength(1);
+});
+
+it("takes no image while a message is sending", async () => {
+  act(() => draft().onChange("on its way", 10));
+  const delivery = deferred<boolean>();
+  let sent: Promise<boolean> | undefined;
+  act(() => {
+    sent = draft().send(() => delivery.promise);
+  });
+
+  await act(() => draft().addFiles([photo()]));
+  expect(harness.uploads).toHaveLength(0);
+  expect(harness.warned).toContain("Not attached");
+
+  await act(async () => {
+    delivery.resolve(true);
+    await sent;
+  });
+  expect(draft().empty).toBe(true);
+});
+
+it("drops an image still being read when the message it was meant for went", async () => {
+  act(() => draft().onChange("look at this", 12));
+  const reading = deferred<CompressImageFileResult>();
+  harness.prepare.mockImplementation(() => reading.promise);
+  let attached: Promise<void> | undefined;
+  act(() => {
+    attached = draft().addFiles([photo()]);
+  });
+
+  await act(() => draft().send(async () => true));
+  expect(draft().empty).toBe(true);
+
+  await act(async () => {
+    reading.resolve(read(photo()));
+    await attached;
+  });
+  expect(draft().empty).toBe(true);
+  expect(harness.uploads).toHaveLength(0);
+  expect(harness.warned).toContain("Not attached");
 });
