@@ -126,7 +126,14 @@ export function useRequestDraft() {
   useEffect(() => {
     held.current = images;
   }, [images]);
-  useEffect(() => () => held.current.forEach(discard), []);
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      held.current.forEach(discard);
+    },
+    [],
+  );
 
   const chipped = chippedImages(text, images);
   const words = stripInlineContextReferences(text).trim();
@@ -155,7 +162,7 @@ export function useRequestDraft() {
     const nextCursor = collapseExpandedComposerCursor(next, edit.start + edit.text.length);
     setText(next);
     setCursor(nextCursor);
-    setImages([...images, ...added]);
+    setImages((current) => [...current, ...added]);
     window.requestAnimationFrame(() => editor.current?.focusAt(nextCursor));
   });
 
@@ -165,6 +172,11 @@ export function useRequestDraft() {
       return;
     }
     const added = await prepared(attachable(files, REQUEST_IMAGE_LIMIT - chipped.length));
+    // Reading big files can outlast the box.
+    if (!mounted.current) {
+      added.forEach(discard);
+      return;
+    }
     if (added.length === 0) return;
     insertImages(added);
     for (const image of added) startAttachmentUpload({ environmentId, image });
@@ -193,7 +205,7 @@ export function useRequestDraft() {
   });
 
   const clear = () => {
-    images.forEach(discard);
+    held.current.forEach(discard);
     setImages([]);
     setText("");
     setCursor(0);
@@ -223,6 +235,10 @@ export function useRequestDraft() {
   /** Another action on the box's words alone (Settle with note, Reopen). */
   const run = useStableCallback(
     async (action: (words: string) => Promise<boolean>, clearOnDone: boolean) => {
+      if (clearOnDone && chipped.length > 0) {
+        warn("Images go in a reply", "A settle note is words only. Send the images first.");
+        return false;
+      }
       setBusy(true);
       const done = await action(words);
       setBusy(false);
@@ -324,7 +340,7 @@ export function RequestEditor(props: {
             cursor={draft.cursor}
             contextRecords={draft.contextRecords}
             skills={NO_SKILLS}
-            disabled={false}
+            disabled={draft.busy}
             placeholder={props.placeholder}
             ariaLabel={props.label}
             className="max-h-64 min-h-12"

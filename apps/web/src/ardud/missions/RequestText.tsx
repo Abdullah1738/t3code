@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 import {
+  requestPlainText,
   requestTextParts,
   type AssetResource,
   type EnvironmentId,
@@ -23,7 +24,8 @@ export function RequestText(props: { text: string }) {
   const parts = requestTextParts(props.text);
   const environmentId = usePrimaryEnvironmentId();
   const images = parts.filter((part): part is ImagePart => part.type === "image");
-  if (images.length === 0 || environmentId === null) return props.text;
+  if (images.length === 0) return props.text;
+  if (environmentId === null) return requestPlainText(props.text);
   return <TextWithImages parts={parts} images={images} environmentId={environmentId} />;
 }
 
