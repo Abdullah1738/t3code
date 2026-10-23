@@ -321,6 +321,39 @@ describe("owner comments travel with his decisions", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("a reopen keeps the owner's comments on text it did not change", () => {
+    const { posts, layer } = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(at));
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const draft = yield* asks.submitDraft(
+        { missionId, audience: "Pavan", channel: "cliq", target: ticket, text: "Hi. Order: ship." },
+        writer,
+      );
+      yield* asks.decideDraft(
+        { draftId: draft.id, action: "approve", revision: 0, note: "Remove the first sentence." },
+        ownerApp,
+      );
+      yield* TestClock.adjust("1 minute");
+      const reopened = yield* asks.reopenDraft({ draftId: draft.id }, ownerApp);
+      yield* TestClock.adjust("1 minute");
+      yield* asks.decideDraft(
+        { draftId: draft.id, action: "approve", revision: reopened.revision ?? 0 },
+        ownerApp,
+      );
+      const notice = posts.findLast((post) => post.input.key === `draft:${draft.id}:approved:1`);
+      expect(notice?.input.to).toEqual([toWriter]);
+      expect(notice?.input.body).toContain("Apply every comment");
+      expect(notice?.input.body).toContain("- Remove the first sentence.");
+      expect(yield* failureCode(asks.recordDraftSent({ draftId: draft.id }, writer))).toBe(
+        "invalid",
+      );
+      const sent = yield* asks.recordDraftSent({ draftId: draft.id, text: "Order: ship." }, writer);
+      expect(sent.sentText).toBe("Order: ship.");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("an ask answer, a suggestion, a call and an approval carry the note", () => {
     const { posts, signals, layer } = harness();
     return Effect.gen(function* () {

@@ -1188,6 +1188,8 @@ export const Draft = Schema.Struct({
   // --- r22 comments ---
   /** The text the writer reports it actually posted, when the owner's comments changed it. */
   sentText: Schema.optional(Schema.NullOr(Schema.String)),
+  /** When the current text was written. The owner's comments before it were about text a revision replaced; a reopen keeps it. Missing means revisedAt. */
+  textRevisedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   // --- end r22 comments ---
 });
 export type Draft = typeof Draft.Type;
