@@ -1544,6 +1544,63 @@ const make = Effect.gen(function* () {
   // ---------------------------------------------------------------------------
   // Knocks
 
+  /** The member threads a forward reaches, checked before anything is decided. */
+  const forwardTargets = Effect.fn("MissionRouter.forwardTargets")(function* (
+    cast: RouterCast,
+    forwardedTo: MissionActor,
+  ) {
+    // A knock is forwarded inside its own mission only: the internal send
+    // skips the guard, so it must never reach another mission's thread.
+    yield* requireInMission(cast, [forwardedTo]);
+    const targets = threadsOfActor(cast, forwardedTo);
+    if (targets.length === 0) {
+      return yield* fail("invalid", `${labelOf(cast, forwardedTo)} has no thread to receive it.`);
+    }
+    for (const threadId of targets) {
+      if ((yield* membershipIn(within(cast), threadId)) === null) {
+        return yield* fail(
+          "forbidden",
+          `Thread ${threadId} is not a member of mission ${cast.missionId}.`,
+        );
+      }
+    }
+    return targets;
+  });
+
+  /**
+   * Sends a committed forward. The key names the decision, so a retry lands
+   * once and nothing that went out can belong to a decision that never saved.
+   */
+  const deliverForward = (
+    knock: Knock,
+    targets: ReadonlyArray<ThreadId>,
+    comments: ReadonlyArray<InboxComment>,
+    owner: boolean,
+  ) => {
+    const text = `[Forwarded by ${owner ? "the owner" : "the master"} from ${knock.fromTitle}] ${knock.forwardedText ?? knock.body}`;
+    return Effect.forEach(
+      targets,
+      (threadId) =>
+        threads.send({
+          threadId,
+          text:
+            comments.length === 0
+              ? text
+              : `${text}\n\nThe owner's comments:\n${commentLines(comments)}`,
+          key: `knock:${knock.id}:forward:${threadId}:${knock.decidedAt ?? ""}`,
+          asOwner: owner,
+        }),
+      { discard: true },
+    ).pipe(
+      Effect.mapError((error) =>
+        fail(
+          error.code,
+          `Knock ${knock.id} is forwarded but did not reach every thread (${error.detail}). Forward it again to resend.`,
+        ),
+      ),
+    );
+  };
+
   const decideKnock = (input: DecideKnockInput, provenance: MissionProvenance) =>
     // The owner's note joins the knock's comments, which comments write under this lock too.
     store.withItemLock(
@@ -1551,7 +1608,8 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const knock = Option.getOrNull(yield* store.get("knock", input.knockId));
         if (knock === null) return yield* fail("not-found", `No knock ${input.knockId}.`);
-        if (knock.status !== "pending") {
+        const resending = knock.status === "forwarded" && input.action === "forward";
+        if (knock.status !== "pending" && !resending) {
           return yield* fail("conflict", `Knock ${knock.id} was already ${knock.status}.`);
         }
         const cast = yield* loadCast(knock.missionId);
@@ -1566,6 +1624,25 @@ const make = Effect.gen(function* () {
               ? "Only the owner decides knocks addressed to the master."
               : "Only the owner or the mission's master decides knocks.",
           );
+        }
+        if (resending) {
+          // Its decision committed but the delivery failed: send it again from the
+          // committed record. Asking for a different forward is a new decision.
+          const note = yield* decisionNoteOf(input.note, provenance);
+          const comments = yield* commentsOn(store, { kind: "knock", id: knock.id });
+          const same =
+            (input.editedText === undefined || input.editedText === knock.forwardedText) &&
+            (input.forwardTo === undefined ||
+              (knock.forwardedTo !== null && sameActor(input.forwardTo, knock.forwardedTo))) &&
+            (note === null || comments.some((comment) => comment.body === note));
+          if (!same || knock.forwardedTo === null) {
+            return yield* fail("conflict", `Knock ${knock.id} was already forwarded.`);
+          }
+          const targets = yield* forwardTargets(cast, knock.forwardedTo);
+          if (comments.length > 0)
+            yield* tellMasterOfKnockComments(cast, knock, comments, provenance);
+          yield* deliverForward(knock, targets, comments, owner);
+          return knock;
         }
         // The owner's note is a comment on the knock, saved with the decision; the
         // forward carries every comment he left so the receiver acts on them.
@@ -1586,12 +1663,9 @@ const make = Effect.gen(function* () {
                 },
               );
         const comments = mark?.comments ?? (yield* commentsOn(store, subject));
-        const withComments = (body: string) =>
-          comments.length === 0
-            ? body
-            : `${body}\n\nThe owner's comments:\n${commentLines(comments)}`;
         const text = input.editedText ?? knock.body;
         let forwardedTo: MissionActor | null = null;
+        let targets: ReadonlyArray<ThreadId> = [];
         if (input.action === "forward") {
           forwardedTo =
             input.forwardTo ??
@@ -1601,37 +1675,7 @@ const make = Effect.gen(function* () {
           if (forwardedTo === null) {
             return yield* fail("invalid", "Say who to forward this knock to.");
           }
-          // A knock is forwarded inside its own mission only: the internal send
-          // below skips the guard, so it must never reach another mission's thread.
-          yield* requireInMission(cast, [forwardedTo]);
-          const targets = threadsOfActor(cast, forwardedTo);
-          if (targets.length === 0) {
-            return yield* fail(
-              "invalid",
-              `${labelOf(cast, forwardedTo)} has no thread to receive it.`,
-            );
-          }
-          for (const threadId of targets) {
-            if ((yield* membershipIn(within(cast), threadId)) === null) {
-              return yield* fail(
-                "forbidden",
-                `Thread ${threadId} is not a member of mission ${cast.missionId}.`,
-              );
-            }
-          }
-          yield* Effect.forEach(
-            targets,
-            (threadId) =>
-              threads.send({
-                threadId,
-                text: withComments(
-                  `[Forwarded by ${owner ? "the owner" : "the master"} from ${knock.fromTitle}] ${text}`,
-                ),
-                key: `knock:${knock.id}:forward:${threadId}`,
-                asOwner: owner,
-              }),
-            { discard: true },
-          );
+          targets = yield* forwardTargets(cast, forwardedTo);
         }
         const decided: Knock = {
           ...knock,
@@ -1661,8 +1705,11 @@ const make = Effect.gen(function* () {
             ...(mark === null ? [] : [{ _tag: "inbox-mark" as const, record: mark }]),
           ],
         });
+        // Delivery only follows a committed decision, so a receiver never acts on
+        // a note the knock's history lacks.
         if (comments.length > 0)
           yield* tellMasterOfKnockComments(cast, decided, comments, provenance);
+        yield* deliverForward(decided, targets, comments, owner);
         return decided;
       }),
     );
