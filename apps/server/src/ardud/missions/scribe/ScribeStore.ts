@@ -300,10 +300,11 @@ export class ScribeStore extends Context.Service<
       payload: unknown,
       at: string,
     ) => Effect.Effect<void, ScribeStoreError>;
-    /** The current report of this kind with the latest window end. */
+    /** The current report of this kind with the latest window end, before `beforeIso` when given. */
     readonly lastReport: (
       missionId: string,
       kind: ReportKind,
+      beforeIso?: string,
     ) => Effect.Effect<ReportRecord | null, ScribeStoreError>;
     /** Current reports of this kind ending after `fromIso` and by `toIso`, oldest first. */
     readonly reportsBetween: (
@@ -551,10 +552,11 @@ const make = Effect.gen(function* () {
         payload_json = excluded.payload_json, updated_at = excluded.updated_at
     `.pipe(Effect.asVoid, Effect.mapError(fail("save editor state")));
 
-  const lastReport = (missionId: string, kind: ReportKind) =>
+  const lastReport = (missionId: string, kind: ReportKind, beforeIso?: string) =>
     sql<ReportRow>`
       SELECT r.* FROM ardud_mission_scribe_report r
       WHERE r.mission_id = ${missionId} AND r.kind = ${kind} AND ${isCurrent}
+        ${beforeIso === undefined ? sql`` : sql`AND r.covers_to < ${beforeIso}`}
       ORDER BY r.covers_to DESC, r.created_at DESC LIMIT 1
     `.pipe(
       Effect.map((rows) => (rows[0] ? reportFromRow(rows[0]) : null)),

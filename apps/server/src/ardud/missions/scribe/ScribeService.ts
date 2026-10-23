@@ -610,14 +610,21 @@ const make = Effect.gen(function* () {
             ? dayWindow(zone, { nowIso }).to
             : nowIso;
       const id = MissionId.make(missionId);
-      const previous = yield* scribe.lastReport(missionId, kind);
-      const usablePrevious = previous !== null && previous.coversTo < to ? previous : null;
+      // The report before this window closes out what it left open. Looking
+      // strictly before `to` keeps a retry of a saved report from finding itself.
+      const previous = yield* scribe.lastReport(missionId, kind, to);
+      // A retry keeps the window its report was saved with.
+      const slot =
+        request.from === undefined && zone === null
+          ? yield* scribe.latestRevision(missionId, kind, to)
+          : null;
       const from =
         request.from !== undefined
           ? yield* isoTime("from", request.from)
           : zone !== null
             ? dayWindow(zone, { toIso: to, nowIso: to }).from
-            : (usablePrevious?.coversTo ??
+            : (slot?.report.coversFrom ??
+              previous?.coversTo ??
               DateTime.formatIso(
                 DateTime.subtract(DateTime.makeUnsafe(to), { hours: WINDOW_HOURS[kind] }),
               ));
@@ -661,7 +668,7 @@ const make = Effect.gen(function* () {
         notes,
         suggestions,
         events,
-        previous: usablePrevious,
+        previous,
         updates,
         bottomLine:
           editor?.bottomLine != null && editor.bottomLineAt !== null

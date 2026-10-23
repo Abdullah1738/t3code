@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  type Ask,
   MissionId,
   ProviderInstanceId,
   type MissionProvenance,
@@ -421,6 +422,56 @@ it.effect("a daily with a day boundary defaults to the last whole day there", ()
       const update = yield* service.report({ missionId: MISSION_ID, kind: "update", save: false });
       assert.equal(update.coversTo, "2026-10-22T10:00:00.000Z");
       assert.equal(update.coversFrom, "2026-10-22T06:00:00.000Z");
+    }),
+  ),
+);
+
+it.effect("a retried update keeps its window and what the one before it left open", () =>
+  fresh(
+    Effect.gen(function* () {
+      yield* seed;
+      yield* putRecord({
+        _tag: "ask",
+        record: {
+          id: "ask-go",
+          missionId: MISSION_ID,
+          subMissionId: null,
+          askedBy: { _tag: "lane", laneId: "lane-money" },
+          question: "Ship the rewards backfill?",
+          context: "",
+          options: [{ id: "yes", label: "Yes", detail: "" }],
+          recommendation: null,
+          blocks: [],
+          costOfWaiting: "",
+          urgency: "normal",
+          status: "open",
+          answer: null,
+          createdAt: "2026-10-22T09:00:00.000Z",
+          updatedAt: "2026-10-22T09:00:00.000Z",
+        } as unknown as Ask,
+      });
+      const service = yield* ScribeService.ScribeService;
+      const scribe = yield* ScribeStore.ScribeStore;
+      const update = (to: string) =>
+        service.report({ missionId: MISSION_ID, kind: "update", to, save: true });
+
+      yield* update("2026-10-22T12:00:00.000Z");
+      const second = yield* update("2026-10-22T16:00:00.000Z");
+      assert.equal(second.coversFrom, "2026-10-22T12:00:00.000Z");
+      assert.include(second.text, "Left hanging from 12:00:");
+
+      const retry = yield* update("2026-10-22T16:00:00.000Z");
+      assert.equal(retry.coversFrom, second.coversFrom);
+      assert.equal(retry.text, second.text);
+      const listed = yield* scribe.listReports(MISSION_ID, ["update"], 10);
+      assert.deepStrictEqual(
+        listed.rows.map((row) => [row.coversTo, row.revision]),
+        [
+          ["2026-10-22T16:00:00.000Z", 1],
+          ["2026-10-22T12:00:00.000Z", 1],
+        ],
+      );
+      assert.equal((yield* reportEvents).length, 2);
     }),
   ),
 );
