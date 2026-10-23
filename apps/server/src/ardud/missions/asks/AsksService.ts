@@ -1930,7 +1930,10 @@ const make = Effect.gen(function* () {
       const decisions = new Map<string, MissionEvent>();
       const decisionIds = new Set<string>();
       const followed = new Set<string>();
+      // The decision's own commit appends the owner's note as a comment on the
+      // suggestion; only what an applier changed elsewhere shows it ran.
       const trace = (event: MissionEvent) => {
+        if (event.kind.startsWith("inbox.") || event.subject?.kind === "suggestion") return;
         if (event.causedBy !== null && decisionIds.has(event.causedBy)) {
           followed.add(event.causedBy);
         }
