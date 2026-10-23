@@ -1250,6 +1250,34 @@ def sample_states(rider="moni"):
     return seq
 
 
+LONG_DRIVER, LONG_CAR = "Mohammed Abdulrahman Al Mansoori", "White Mercedes-Benz S-Class"
+
+
+def acceptance_states(rider="moni"):
+    """Every state plus the cases that broke the compact bubble before: a new driver, a stale
+    read, long driver/car/rider/booker names, and those combined."""
+    now = time.time()
+    old = iso(now - 600)
+
+    def card(status, eta="4 mins", north=1500, prev=None, **kw):
+        return from_live(sample_trip(status, eta=eta, north_m=north, **kw), prev, rider, "abdullah", now)
+
+    first = card("WaitingForPickup")
+    new = card("WaitingForPickup", prev=first, plate="Z 777", name=LONG_DRIVER, car=LONG_CAR)
+    names = {"rider_name": "Chandrashekharasubramaniam", "booker_name": "Christopher Montgomery"}
+    return sample_states(rider) + [
+        ("NewDriver", new),
+        ("Stale", dict(card("WaitingForPickup", name=LONG_DRIVER), checked_at=old)),
+        ("StaleNewDriver", dict(new, checked_at=old)),
+        ("OnTripStale", dict(card("OnTrip", eta=None, north=0, name=LONG_DRIVER), checked_at=old)),
+        ("ArrivedNewDriver", dict(card("ArrivingAtPickup", eta="0 mins", north=20, prev=first, plate="Z 777"),
+                                  checked_at=old)),
+        ("LongRider", dict(new, rider_name="Muhammad Abdullah")),
+        ("LongNames", dict(card("Accepted", eta="6 mins", north=3000), **names)),
+        ("LongNamesNewDriverStale", dict(new, checked_at=old, **names)),
+    ]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -1266,6 +1294,7 @@ def main(argv=None):
     a.add_argument("--recipient", action="append", default=[], help="extra bridge chat slug (repeatable)")
     a = sp.add_parser("show"); a.add_argument("--trip", required=True)
     a = sp.add_parser("sample"); a.add_argument("--out", required=True); a.add_argument("--rider", default="moni")
+    a.add_argument("--acceptance", action="store_true", help="add the compact-bubble hard cases (card-check set)")
     a = ap.parse_args(argv)
     if a.cmd == "refresh":
         c = refresh(a.trip)
@@ -1283,7 +1312,7 @@ def main(argv=None):
                           "journal": read_json(journal_path(a.trip))}, indent=1))
     elif a.cmd == "sample":
         out = Path(a.out)
-        for name, c in sample_states(a.rider):
+        for name, c in (acceptance_states if a.acceptance else sample_states)(a.rider):
             print(json.dumps({"state": name, "dir": str(write_card(c, out / name.lower(), force=True) and out / name.lower())}))
     return 0
 

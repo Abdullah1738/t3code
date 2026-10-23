@@ -1,0 +1,14 @@
+#!/bin/zsh
+# Compact-bubble acceptance checks for ride, delivery and quick cards. See cli.mjs --help.
+emulate -L zsh
+here=${0:A:h}
+node=${CARD_CHECK_NODE:-}
+if [[ -z $node ]]; then
+  for c in $HOME/.nvm/versions/node/v2[2-9]*/bin/node(Nn[-1]) /opt/homebrew/bin/node $(command -v node 2>/dev/null); do
+    [[ -x $c ]] || continue
+    v=$($c -p 'process.versions.node.split(".")[0]' 2>/dev/null) || continue
+    (( v >= 22 )) && { node=$c; break }
+  done
+fi
+[[ -n $node ]] || { print -u2 "card-check: needs Node 22+"; exit 2 }
+exec $node $here/cli.mjs "$@"

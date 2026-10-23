@@ -588,6 +588,17 @@ class ArrivalTest(unittest.TestCase):
         self.assertEqual(got, [("Searching", "searching"), ("Accepted", "assigned"), ("WaitingForPickup", "arriving"),
                                ("Nearby", "arriving"), ("AtPickup", "arrived"), ("OnTrip", "ontrip")])
 
+    def test_acceptance_states_add_hard_cases_to_every_sample(self):
+        samples = [n for n, _ in self.rc.sample_states()]
+        cases = dict(self.rc.acceptance_states())
+        self.assertEqual(list(cases)[:len(samples)], samples)
+        self.assertEqual(cases["NewDriver"]["note"], "New driver")
+        self.assertEqual(cases["LongNames"]["booker_name"], "Christopher Montgomery")
+        now = self.rc.time.time()
+        for name in ("Stale", "StaleNewDriver", "OnTripStale", "LongNamesNewDriverStale"):
+            at = self.rc.datetime.fromisoformat(cases[name]["checked_at"].replace("Z", "+00:00")).timestamp()
+            self.assertGreater(now - at, self.rc.STALE_S, name)
+
 
 class RecipientTest(Base):
     def meta(self, *args, ok=True):
