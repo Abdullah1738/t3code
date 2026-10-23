@@ -65,8 +65,14 @@ export const viewsWiringLayer = Layer.effectDiscard(
     // Absent where views run without the router (their own tests).
     const requestImages = yield* Effect.serviceOption(RequestImages);
     if (Option.isSome(requestImages)) {
-      yield* requestImages.value.register(({ missionId, requestId, image, provenance }) =>
-        views.addRequestImage(provenance, { missionId, requestId, source: image }),
+      yield* requestImages.value.register(({ missionId, requestId, images, provenance }) =>
+        Effect.map(
+          views.addRequestImages(provenance, { missionId, requestId, sources: images }),
+          (stored) => ({
+            images: stored.images,
+            undo: views.dropRequestImages(missionId, stored.created),
+          }),
+        ),
       );
     }
     const subscription = yield* store.subscribe;

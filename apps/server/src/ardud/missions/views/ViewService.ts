@@ -150,17 +150,29 @@ export class ViewService extends Context.Service<
     readonly applyBundle: Write<ApplyViewBundleInput>;
     readonly addAsset: Write<AddMissionAssetInput>;
     /**
-     * An image in an owner request message, about that request. The same
-     * image already stored for the request is reused.
+     * The images in an owner request message, about that request, all read
+     * and checked before any is written. The same image already stored for
+     * the request is reused; `created` names the ones this call wrote.
      */
-    readonly addRequestImage: (
+    readonly addRequestImages: (
       provenance: MissionProvenance,
       input: {
         readonly missionId: MissionId;
         readonly requestId: string;
-        readonly source: MissionAssetSource;
+        readonly sources: ReadonlyArray<MissionAssetSource>;
       },
-    ) => Effect.Effect<{ readonly assetId: string; readonly path: string }, MissionError>;
+    ) => Effect.Effect<
+      {
+        readonly images: ReadonlyArray<{ readonly assetId: string; readonly path: string }>;
+        readonly created: ReadonlyArray<string>;
+      },
+      MissionError
+    >;
+    /** Drops request images whose message never landed. Best effort. */
+    readonly dropRequestImages: (
+      missionId: MissionId,
+      assetIds: ReadonlyArray<string>,
+    ) => Effect.Effect<void>;
     readonly removeAsset: Write<RemoveMissionAssetInput>;
     /** An archived mission's images go: records expire and the copies are deleted. */
     readonly expireAssets: (missionId: MissionId) => Effect.Effect<void, MissionError>;
@@ -1683,41 +1695,112 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const addRequestImage: ViewService["Service"]["addRequestImage"] = (provenance, input) =>
+  /** Marks request images removed and deletes their copies, under the lock. */
+  const dropRequestImagesLocked = Effect.fn("ViewService.dropRequestImages")(function* (
+    missionId: MissionId,
+    assetIds: ReadonlyArray<string>,
+  ) {
+    if (assetIds.length === 0) return;
+    const drop = new Set(assetIds);
+    const gone = (yield* views.assets(missionId)).filter(
+      (asset) => drop.has(asset.id) && asset.status === "active" && requestImage(asset),
+    );
+    if (gone.length === 0) return;
+    const now = yield* nowIso;
+    yield* commit({
+      missionId,
+      kind: "view.asset-removed",
+      caller: SYSTEM_CALLER,
+      summary: `${gone.length} request image${gone.length === 1 ? "" : "s"} dropped with an unsent message`,
+      subject: { kind: "mission", id: missionId },
+      payload: { kind: "image", count: gone.length },
+      writes: gone.map((asset) => ({
+        write: {
+          scope: "asset" as const,
+          value: {
+            ...asset,
+            status: "removed" as const,
+            version: asset.version + 1,
+            changedAt: now,
+          },
+        },
+        counts: false,
+      })),
+    });
+    yield* Effect.forEach(gone, (asset) => deleteAssetFile(assetFilePath(attachmentsDir, asset)), {
+      discard: true,
+    });
+  });
+
+  const dropRequestImages: ViewService["Service"]["dropRequestImages"] = (missionId, assetIds) =>
+    serial(dropRequestImagesLocked(missionId, assetIds)).pipe(Effect.ignore);
+
+  const addRequestImages: ViewService["Service"]["addRequestImages"] = (provenance, input) =>
     serial(
       Effect.gen(function* () {
         const { mission, caller } = yield* assetCaller(input.missionId, provenance);
         // The app sends uploads; server paths come from the iMessage desk and agents.
-        if (input.source._tag === "file" && provenance._tag === "owner-app") {
+        if (
+          provenance._tag === "owner-app" &&
+          input.sources.some((source) => source._tag === "file")
+        ) {
           return yield* fail("invalid", "Attach images from the app as uploads, not server paths.");
         }
-        // His file names can say as much as his words, so the copy goes unnamed.
-        const read = yield* readAssetSource({
-          attachmentsDir,
-          source: input.source,
-          provenance,
-          name: "Request image",
-        });
+        // Every image is read and checked first, so a bad one stores none.
+        // His file names can say as much as his words, so the copies go unnamed.
+        const reads = yield* Effect.forEach(input.sources, (source) =>
+          readAssetSource({ attachmentsDir, source, provenance, name: "Request image" }),
+        );
         const subject: MissionRecordRef = { kind: "owner-request", id: input.requestId };
+        const stored = (yield* views.assets(mission.id)).filter(
+          (asset) => asset.status === "active",
+        );
         // A retried message stores nothing new, so it writes the same text.
-        const same = (yield* views.assets(mission.id)).find(
-          (asset) =>
-            asset.status === "active" &&
-            asset.sha256 === read.sha256 &&
-            asset.subject?.kind === subject.kind &&
-            asset.subject.id === subject.id,
-        );
-        if (same !== undefined) {
-          return { assetId: same.id, path: assetFilePath(attachmentsDir, same) };
+        const sameAs = (sha256: string) =>
+          stored.find(
+            (asset) =>
+              asset.sha256 === sha256 &&
+              asset.subject?.kind === subject.kind &&
+              asset.subject.id === subject.id,
+          );
+        const fresh = new Map<string, AssetBytes>();
+        for (const read of reads) {
+          if (sameAs(read.sha256) === undefined) fresh.set(read.sha256, read);
         }
-        const saved = yield* saveAsset(
-          mission.id,
-          caller,
-          read,
-          subject,
-          `${who(caller)} attached an image to a request`,
+        const used = stored.reduce((sum, asset) => sum + asset.sizeBytes, 0);
+        const adding = [...fresh.values()].reduce((sum, read) => sum + read.bytes.byteLength, 0);
+        if (used + adding > VIEW_ASSET_LIMITS.missionBytes) {
+          return yield* fail("invalid", "This mission's images would pass its 2 GiB limit.");
+        }
+        const created: Array<string> = [];
+        const saved = new Map<string, { assetId: string; path: string }>();
+        yield* Effect.forEach(
+          fresh.values(),
+          (read) =>
+            Effect.map(
+              saveAsset(
+                mission.id,
+                caller,
+                read,
+                subject,
+                `${who(caller)} attached an image to a request`,
+              ),
+              (each) => {
+                created.push(each.asset.id);
+                saved.set(read.sha256, { assetId: each.asset.id, path: each.path });
+              },
+            ),
+          { discard: true },
+        ).pipe(
+          Effect.onError(() => dropRequestImagesLocked(mission.id, created).pipe(Effect.ignore)),
         );
-        return { assetId: saved.asset.id, path: saved.path };
+        const images = reads.map((read) => {
+          const same = sameAs(read.sha256);
+          return same === undefined
+            ? saved.get(read.sha256)!
+            : { assetId: same.id, path: assetFilePath(attachmentsDir, same) };
+        });
+        return { images, created };
       }),
     );
 
@@ -2043,7 +2126,8 @@ const make = Effect.gen(function* () {
     seedLayout,
     applyBundle,
     addAsset,
-    addRequestImage,
+    addRequestImages,
+    dropRequestImages,
     removeAsset,
     expireAssets,
   });
