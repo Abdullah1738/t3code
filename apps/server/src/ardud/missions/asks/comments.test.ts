@@ -427,6 +427,41 @@ describe("owner comments travel with his decisions", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("a suggestion dismissed again after a reopen tells the master the new note", () => {
+    const { posts, layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const suggestion = yield* asks.proposeSuggestion(
+        {
+          missionId,
+          targetKind: "pool",
+          title: "Raise pool",
+          after: { size: 3 },
+          diffText: "size -> 3",
+          why: "Lanes queue.",
+          evidence: [{ kind: "lane", id: "lane-api" }],
+        },
+        governor,
+      );
+      const dismiss = (note: string) =>
+        asks.decideSuggestion(
+          { suggestionId: suggestion.id, action: "dismiss", dismissReason: "no", note },
+          ownerApp,
+        );
+      const notices = () =>
+        posts.filter((post) => post.input.key?.startsWith(`suggestion:${suggestion.id}:`));
+      yield* dismiss("Not while the queue is short.");
+      yield* asks.reopenSuggestion({ suggestionId: suggestion.id }, ownerApp);
+      yield* dismiss("Ask again next quarter.");
+      // Rooms keep one message per key, so the second dismissal needs its own key.
+      const keys = notices().map((post) => post.input.key);
+      expect(keys).toHaveLength(2);
+      expect(new Set(keys).size).toBe(2);
+      expect(notices().at(-1)?.input.body).toContain("- Ask again next quarter.");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("a comment after an approval is decided reaches its requester", () => {
     const { posts, layer } = harness();
     return Effect.gen(function* () {

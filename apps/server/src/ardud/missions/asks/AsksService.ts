@@ -1822,7 +1822,8 @@ const make = Effect.gen(function* () {
             `Suggestion ${pending.record.id} is ${pending.record.status}.`,
             pending.comments,
           ),
-          key: `suggestion:${pending.record.id}:${pending.record.status}:comments`,
+          // Each decision is its own notice; a reopened suggestion decided again is news.
+          key: `suggestion:${pending.record.id}:${pending.record.status}:${pending.decisionId}:comments`,
           decidedBy: pending.decider,
         });
 
