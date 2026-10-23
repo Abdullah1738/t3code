@@ -225,6 +225,26 @@ class CardTests(unittest.TestCase):
         self.assertEqual(first,[a for a in self.calls if a[0]=='send'][-1])
         self.assertEqual(sum(a[0]=='share' for a in self.calls),1)
 
+    def test_retry_after_owner_route_rotation_uses_the_live_session(self):
+        self.fail_send = True
+        c.sync(self.cfg,self.data,send=True)
+        first = next(a for a in self.calls if a[0]=='send')
+        self.fail_send = False
+        with patch.object(c,'route',lambda: 'rotated-session'):
+            self.assertEqual(c.sync(self.cfg,self.data,send=True)['status'],'sent')
+        retry = [a for a in self.calls if a[0]=='send'][-1]
+        self.assertEqual(first[first.index('--session')+1],'fixture-session')
+        self.assertEqual(retry[retry.index('--session')+1],'rotated-session')
+        drop = lambda a: [x for i,x in enumerate(a) if '--session' not in a[max(i-1,0):i+1]]
+        self.assertEqual(drop(first),drop(retry))
+
+    def test_group_card_chat_gets_the_public_link(self):
+        cfg = {**self.cfg,'for':'owner','delivery_card':{'ready':True,'chat':'group-sb_gro'}}
+        self.assertEqual(c.sync(cfg,self.data,send=True)['status'],'sent')
+        sent = next(a for a in self.calls if a[0]=='send')
+        self.assertEqual(sent[sent.index('--to')+1],'group-sb_gro')
+        self.assertIn('--text=https://cards.trycloudflare.com/',sent)
+
     def test_safe_projection_escaping_zero_and_unknown(self):
         cfg = {**self.cfg,'total':'AED 0.00','address':'private','token':'secret'}
         v = c.view(cfg,self.data,{'store':'<script>bad</script>','items':[{'name':'<b>Milk</b>','qty':2,'image':'javascript:alert(1)'}]})

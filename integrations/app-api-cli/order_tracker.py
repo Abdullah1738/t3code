@@ -923,7 +923,8 @@ def main(argv=None, _locked=False):
         parser.error('Payment hold and confirmation are mutually exclusive')
     if args.vertical and args.vertical not in delivery_cards.LANES[app]:
         parser.error('--vertical is not supported by this app')
-    if args.card_chat and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', args.card_chat):
+    # Same rule as the bridge's chat slugs; group slugs carry "_" (group-sb_gro).
+    if args.card_chat and not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,99}', args.card_chat):
         parser.error('Invalid --card-chat')
     wid = f'order-{app}-{args.order.lower()}'
     path = ROOT / 'orders' / (wid + '.json')

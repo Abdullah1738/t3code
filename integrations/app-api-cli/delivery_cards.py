@@ -514,6 +514,17 @@ def route():
     return value
 
 
+def live_session(args):
+    """Saved bridge args with --session re-read from the live owner route.
+
+    The owner's session rotates; a session frozen with the first attempt makes
+    every later retry 409. Key, text and URL stay exactly as first saved."""
+    args = list(args)
+    if '--session' in args:
+        args[args.index('--session') + 1] = route()
+    return args
+
+
 def bridge(args, timeout=12):
     env = {k: v for k, v in os.environ.items() if k not in ('BUN_INSPECT', 'BUN_OPTIONS', 'NODE_OPTIONS')}
     p = subprocess.run([BUN, BRIDGE, *args], capture_output=True, text=True, timeout=timeout, env=env)
@@ -614,6 +625,7 @@ def sync(cfg, data, *, send=False):
                             # app has no --to route. A public rich link also works
                             # for recipients who have not installed Robob Cards.
                             state['send_args'] = ['send', '--to', recipient, '--text=' + state['url'], '--session', session, '--key', dedupe]
+                    state['send_args'] = live_session(state['send_args'])
                     state['status'] = 'attempting'
                     atomic(statepath, state)
                     ack = bridge(state['send_args'])
@@ -668,6 +680,8 @@ def repair_link(cfg, data):
             state['repair'] = repair
             atomic(path,state)
         build(cfg,data,outdir=APPS/state['slug'],url=repair['url'],public=True)
+        repair['args'] = live_session(repair['args'])
+        atomic(path,state)
         ack = bridge(repair['args'])
         if not isinstance(ack.get('id'),str) or not isinstance(ack.get('created'),bool):
             raise ValueError('card_send_bad_ack')

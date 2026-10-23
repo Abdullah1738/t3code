@@ -136,6 +136,16 @@ class AddNoticeTests(unittest.TestCase):
         self.assertNotIn('actually arrive', context)
         self.assertNotIn('--asked', context)
 
+    def test_card_chat_accepts_bridge_group_slugs(self):
+        with mock.patch.object(t, 'card_enrollment', return_value=True), \
+                mock.patch.object(t.delivery_cards, 'safe_sync', return_value={'status': 'not_sent'}):
+            code, _ = self.add('--card-chat', 'group-sb_gro', '--no-card-send', who='owner', order='3999000555')
+        self.assertEqual(code, 0)
+        cfg = t.read(self.root / 'state' / 'orders' / 'order-talabat-3999000555.json')
+        self.assertEqual(cfg['delivery_card']['chat'], 'group-sb_gro')
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            t.main(['add', '--app', 'talabat', '--order', '3999000666', '--card-chat', 'Group Chat'])
+
     def test_custom_and_skipped_text(self):
         code, row = self.add('--placed-text', 'Got you the boba, about 30 min', order='3999000333')
         self.assertEqual((code, row['moni_notified']), (0, 'sent'))
