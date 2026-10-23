@@ -966,6 +966,21 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           inboundKeyOf(provenance, request.id) ??
           (input.key === undefined ? null : `request:${request.id}:${input.key}`);
         const to = owner ? yield* masterAddress(cast) : [];
+        const status = input.status ?? "answered";
+        const links = dedupeRefs(input.links ?? []);
+        // A retry only repeats what it already wrote. Anything new is checked
+        // before its images are stored, so a refused reply leaves none behind.
+        const retry = key !== null && (yield* rooms.messageByKey(request.missionId, key)) !== null;
+        if (!retry) {
+          if (request.status === "settled") {
+            return yield* fail(
+              "conflict",
+              `Request "${request.title}" is settled; reopen it first.`,
+            );
+          }
+          if (!owner) yield* refuseSilence(input.text);
+          yield* checkLinks(request.missionId, links);
+        }
         const text = yield* withImages(
           request.missionId,
           request.id,
@@ -978,13 +993,6 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
         if ((yield* priorPost(key, message)) === "repeat") {
           return { result: request, speaker: null, deliveries: [] };
         }
-        if (request.status === "settled") {
-          return yield* fail("conflict", `Request "${request.title}" is settled; reopen it first.`);
-        }
-        if (!owner) yield* refuseSilence(input.text);
-        const status = input.status ?? "answered";
-        const links = dedupeRefs(input.links ?? []);
-        yield* checkLinks(request.missionId, links);
         let written: OwnerRequest | null = null;
         const posted = yield* post({
           input: message,

@@ -132,12 +132,13 @@ const query = (params) => {
   return entries.length === 0 ? "" : `?${new URLSearchParams(entries).toString()}`;
 };
 const id = (value, name) => encodeURIComponent(need(value, name));
-// The server reads each file itself, so it needs the absolute path.
+// The server reads each file itself, so it needs the real absolute path.
 const images = () => {
   const paths = (flags.image ?? []).map((path) => {
     const absolute = NodePath.resolve(path);
     if (!NodeFS.existsSync(absolute)) fail(`--image ${absolute} does not exist`);
-    return { _tag: "file", path: absolute };
+    // The server refuses links, and /tmp is one on macOS.
+    return { _tag: "file", path: NodeFS.realpathSync(absolute) };
   });
   return paths.length === 0 ? {} : { images: paths };
 };

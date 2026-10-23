@@ -143,7 +143,7 @@ describe("mission CLI", () => {
     ]);
   });
 
-  it("sends his images in order, as absolute paths, with his markers left in place", async () => {
+  it("sends his images in order, as real absolute paths, with his markers left in place", async () => {
     const { url, seen } = await listen(() => ({ ok: true, request: { id: "request-1" } }));
     const dir = NodeFS.realpathSync(
       NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "mission-images-")),
@@ -152,6 +152,9 @@ describe("mission CLI", () => {
     const second = NodePath.join(dir, "footer.png");
     NodeFS.writeFileSync(first, "png");
     NodeFS.writeFileSync(second, "png");
+    // The server refuses links, so a path through one goes as its target.
+    const linked = NodePath.join(dir, "linked");
+    NodeFS.symlinkSync(dir, linked);
     const via = ["--via", "imessage", "--inbound", "spc-msg-4"];
 
     const opened = await run(url, [
@@ -173,7 +176,7 @@ describe("mission CLI", () => {
       "--text",
       "And this one",
       "--image",
-      second,
+      NodePath.join(linked, "footer.png"),
       ...via,
     ]);
     const missing = await run(url, [

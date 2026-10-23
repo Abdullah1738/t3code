@@ -544,7 +544,11 @@ const make = Effect.gen(function* () {
         pinned,
         changesToday: yield* views.changesSince(mission.id, since),
         sectionData: yield* allSectionData(mission.id, sections, sources),
-        assets: (yield* views.assets(mission.id)).filter((asset) => asset.status === "active"),
+        // Request images are part of the owner's words, which only the owner
+        // and the master read, through the request itself.
+        assets: (yield* views.assets(mission.id)).filter(
+          (asset) => asset.status === "active" && asset.subject?.kind !== "owner-request",
+        ),
         sources: sources.map(sourceListing),
         sourceRuns: yield* runs.runs(mission.id, sources),
       };
@@ -1608,6 +1612,7 @@ const make = Effect.gen(function* () {
     caller: ViewCaller,
     read: AssetBytes,
     subject: MissionRecordRef | null,
+    summary: string = `${who(caller)} added image ${read.name}`,
   ) {
     const stored = (yield* views.assets(missionId)).filter((asset) => asset.status === "active");
     const used = stored.reduce((sum, asset) => sum + asset.sizeBytes, 0);
@@ -1638,13 +1643,13 @@ const make = Effect.gen(function* () {
       missionId,
       kind: "view.asset-added",
       caller,
-      summary: `${who(caller)} added image ${asset.name}`,
+      summary,
       subject: assetRef(asset),
       payload: {
         assetId: asset.id,
         kind: asset.kind,
         sizeBytes: asset.sizeBytes,
-        subject: asset.subject,
+        ...(subject?.kind === "owner-request" ? {} : { subject: asset.subject }),
       },
       writes: [{ write: { scope: "asset", value: asset }, counts: false }],
     }).pipe(Effect.onError(() => deleteAssetFile(path)));
@@ -1670,11 +1675,16 @@ const make = Effect.gen(function* () {
     serial(
       Effect.gen(function* () {
         const { mission, caller } = yield* assetCaller(input.missionId, provenance);
+        // The app sends uploads; server paths come from the iMessage desk and agents.
+        if (input.source._tag === "file" && provenance._tag === "owner-app") {
+          return yield* fail("invalid", "Attach images from the app as uploads, not server paths.");
+        }
+        // His file names can say as much as his words, so the copy goes unnamed.
         const read = yield* readAssetSource({
           attachmentsDir,
           source: input.source,
           provenance,
-          name: undefined,
+          name: "Request image",
         });
         const subject: MissionRecordRef = { kind: "owner-request", id: input.requestId };
         // A retried message stores nothing new, so it writes the same text.
@@ -1688,7 +1698,13 @@ const make = Effect.gen(function* () {
         if (same !== undefined) {
           return { assetId: same.id, path: assetFilePath(attachmentsDir, same) };
         }
-        const saved = yield* saveAsset(mission.id, caller, read, subject);
+        const saved = yield* saveAsset(
+          mission.id,
+          caller,
+          read,
+          subject,
+          `${who(caller)} attached an image to a request`,
+        );
         return { assetId: saved.asset.id, path: saved.path };
       }),
     );

@@ -184,14 +184,32 @@ describe("mission images", () => {
           source,
         });
         assert.notEqual(other.assetId, first.assetId);
-        const assets = (yield* views.snapshot(missionId)).assets ?? [];
-        assert.deepEqual(
-          assets.map((asset) => asset.subject).toSorted((a, b) => (a!.id < b!.id ? -1 : 1)),
-          [
-            { kind: "owner-request", id: "request-a" },
-            { kind: "owner-request", id: "request-b" },
-          ],
+        // His request images stay out of the views every agent reads, nameless.
+        assert.deepEqual((yield* views.snapshot(missionId)).assets ?? [], []);
+        const { stateDir } = yield* ServerConfig.ServerConfig;
+        const onServer = writeFile(NodePath.join(stateDir, "shots"), "salary.png", png(2, 2));
+        assert.equal(
+          yield* failureCode(
+            views.addRequestImage(ownerApp, {
+              missionId,
+              requestId: "request-a",
+              source: { _tag: "file", path: onServer },
+            }),
+          ),
+          "invalid",
         );
+        const fromDesk = yield* views.addRequestImage(
+          { _tag: "owner-imessage", chat: "owner", inboundId: "spc-msg-1" },
+          { missionId, requestId: "request-a", source: { _tag: "file", path: onServer } },
+        );
+        const store = yield* MissionStore.MissionStore;
+        const added = (yield* store.recentEvents(missionId, 50)).filter(
+          (event) => event.kind === "view.asset-added",
+        );
+        assert.lengthOf(added, 3);
+        assert.isFalse(added.some((event) => JSON.stringify(event).includes("salary")));
+        assert.isFalse(added.some((event) => JSON.stringify(event).includes("request-a")));
+        assert.notEqual(fromDesk.assetId, first.assetId);
       }),
     ),
   );

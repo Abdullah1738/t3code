@@ -473,6 +473,19 @@ describe("owner requests", () => {
         `And this one.\n\n[image 1: ${pathOf(3)}]`,
       );
       assert.strictEqual(thread.requests[0]!.request.lastReply, "And this one. [image 1]");
+
+      // A refused reply stores none of its images.
+      yield* router.settleRequest({ requestId: request.id }, ownerApp);
+      assert.strictEqual(
+        yield* failureCode(
+          router.replyRequest(
+            { requestId: request.id, text: "One more.", images: [shot("fourth")] },
+            ownerApp,
+          ),
+        ),
+        "conflict",
+      );
+      assert.lengthOf(stored, 3);
     }).pipe(Effect.provide(h.layer));
   });
 
