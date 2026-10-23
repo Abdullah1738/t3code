@@ -117,6 +117,32 @@ const fail = (code: ControlErrorCode, message: string) => new ControlError({ cod
 const errorDetail = (cause: unknown): string =>
   userFacingDispatchErrorMessage(cause) ?? (cause instanceof Error ? cause.message : String(cause));
 
+// ardud: the reaper retries a conflict later, so only the orchestrator's own
+// refusals count as one. Its rejections carry a text cause; a storage or read
+// failure carries the failure itself.
+const archiveFailureCode = (
+  cause:
+    | Effect.Error<ReturnType<typeof archiveIfIdle>>
+    | ServerRuntimeStartup.ServerRuntimeStartupError,
+): ControlErrorCode => {
+  switch (cause._tag) {
+    case "ServerRuntimeStartupError":
+      return "unavailable";
+    case "OrchestratorDispatchError":
+      return typeof cause.cause === "string" ? "conflict" : "internal";
+    case "OrchestratorThreadAlreadyExistsError":
+    case "OrchestratorCommandRejectedError":
+    case "OrchestratorCommandPreviouslyRejectedError":
+    case "OrchestratorCommandIdConflictError":
+    case "OrchestratorSubagentThreadReadOnlyError":
+    case "OrchestratorThreadAboveModeLimitError":
+    case "ThreadManagementProviderInstanceDisabledError":
+      return "conflict";
+    default:
+      return "internal";
+  }
+};
+
 const NO_STORE = { "cache-control": "no-store" } as const;
 
 const json = (body: unknown, status = 200) =>
@@ -1246,7 +1272,16 @@ const makeRoutes = Effect.gen(function* () {
               : expectedSession,
         }).pipe(Effect.provideService(ThreadManagementService.ThreadManagementService, threads)),
       )
-      .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      .pipe(
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            const code = archiveFailureCode(cause);
+            // A thread deleted after the first read is a 404, not a failure.
+            if (code !== "unavailable") yield* getShell(threadId);
+            return yield* fail(code, errorDetail(cause));
+          }),
+        ),
+      );
     if (!result.archived) {
       return json(
         {

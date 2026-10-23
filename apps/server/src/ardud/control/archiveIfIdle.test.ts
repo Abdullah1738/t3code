@@ -22,6 +22,7 @@ import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
 import { idleThreadProjection, liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
+import { OrchestratorDispatchError } from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
@@ -34,11 +35,17 @@ import * as ServerSettings from "../../serverSettings.ts";
 import { OrchestratorThreadNotIdleError } from "../archive-if-idle/idle.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 
-const known = new Set(["thread-idle", "thread-busy"]);
-
 const makeHarness = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const known = new Set([
+    "thread-idle",
+    "thread-busy",
+    "thread-broken",
+    "thread-deleting",
+    "thread-rejected",
+  ]);
   const dispatched = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
+  const startupFailed = yield* Ref.make(false);
   const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     getThreadShell: (threadId) =>
       Effect.succeed(known.has(threadId) ? liveThreadShell(threadId) : null),
@@ -49,13 +56,28 @@ const makeHarness = Effect.gen(function* () {
     dispatch: (command) =>
       Effect.gen(function* () {
         yield* Ref.update(dispatched, (all) => [...all, command]);
-        if (command.type === "thread.archive" && command.threadId === "thread-busy") {
-          return yield* new OrchestratorThreadNotIdleError({
+        if (command.type !== "thread.archive") return { sequence: 1, storedEvents: [] };
+        const rejected = (cause: unknown) =>
+          new OrchestratorDispatchError({
             commandId: command.commandId,
-            threadId: command.threadId,
-            reason: "running",
-            detail: "Thread thread-busy has a running run.",
+            commandType: command.type,
+            cause,
           });
+        switch (command.threadId) {
+          case "thread-busy":
+            return yield* new OrchestratorThreadNotIdleError({
+              commandId: command.commandId,
+              threadId: command.threadId,
+              reason: "running",
+              detail: "Thread thread-busy has a running run.",
+            });
+          case "thread-broken":
+            return yield* rejected(new Error("disk I/O error"));
+          case "thread-deleting":
+            known.delete(command.threadId);
+            return yield* rejected(`Thread ${command.threadId} is deleted.`);
+          case "thread-rejected":
+            return yield* rejected(`Thread ${command.threadId} is already archived.`);
         }
         return { sequence: 1, storedEvents: [] };
       }),
@@ -83,7 +105,23 @@ const makeHarness = Effect.gen(function* () {
               Layer.mock(ProviderRegistry.ProviderRegistry)({}),
               ServerSettings.layerTest(),
               Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
-                enqueueCommand: (effect) => effect,
+                enqueueCommand: <A, E>(effect: Effect.Effect<A, E>) =>
+                  Effect.flatMap(
+                    Ref.get(startupFailed),
+                    (
+                      failed,
+                    ): Effect.Effect<A, E | ServerRuntimeStartup.ServerRuntimeStartupError> =>
+                      failed
+                        ? Effect.fail(
+                            new ServerRuntimeStartup.ServerRuntimeStartupError({
+                              mode: "web",
+                              host: null,
+                              port: 0,
+                              cause: new Error("listen failed"),
+                            }),
+                          )
+                        : effect,
+                  ),
               }),
               Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({}),
               Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
@@ -115,7 +153,7 @@ const makeHarness = Effect.gen(function* () {
       );
       return { status: response.status, body: (await response.json()) as Record<string, any> };
     });
-  return { post, dispatched };
+  return { post, dispatched, startupFailed };
 });
 
 const run = <A, E>(body: (h: Effect.Success<typeof makeHarness>) => Effect.Effect<A, E>) =>
@@ -189,6 +227,37 @@ describe("control archive-if-idle", () => {
         assert.strictEqual(bad.body.error.code, "invalid_request");
 
         assert.strictEqual((yield* Ref.get(dispatched)).length, 0);
+      }),
+    ),
+  );
+
+  // The reaper retries a conflict later, so a broken server must not look like one.
+  it.effect("tells failures apart from conflicts", () =>
+    run(({ post, dispatched, startupFailed }) =>
+      Effect.gen(function* () {
+        const broken = yield* post("thread-broken");
+        assert.strictEqual(broken.status, 500);
+        assert.strictEqual(broken.body.error.code, "internal");
+
+        const deleted = yield* post("thread-deleting");
+        assert.strictEqual(deleted.status, 404);
+        assert.strictEqual(deleted.body.error.code, "not_found");
+
+        const rejected = yield* post("thread-rejected");
+        assert.strictEqual(rejected.status, 409);
+        assert.strictEqual(rejected.body.error.code, "conflict");
+
+        yield* Ref.set(startupFailed, true);
+        const starting = yield* post("thread-idle");
+        assert.strictEqual(starting.status, 503);
+        assert.strictEqual(starting.body.error.code, "unavailable");
+
+        assert.deepStrictEqual(
+          (yield* Ref.get(dispatched)).map((command) =>
+            command.type === "thread.archive" ? command.threadId : command.type,
+          ),
+          ["thread-broken", "thread-deleting", "thread-rejected"],
+        );
       }),
     ),
   );

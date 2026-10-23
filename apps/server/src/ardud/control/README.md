@@ -159,7 +159,11 @@ planning and commit refuses with `changed`; try again later.
   with `reason` one of `archived`, `running`, `queued`, `pending-request`,
   `background-work`, `pending-wake`, `session-changed`, `changed`. The thread is
   unchanged.
-- 404 `not_found` for an unknown or deleted thread.
+- 409 `conflict` when the orchestrator rejects the archive for another reason.
+- 404 `not_found` for an unknown or deleted thread, also when it was deleted
+  while the archive ran.
+- 503 `unavailable` while the server is still starting; 500 `internal` when
+  storage or a read failed. Neither means the thread is busy.
 
 `t3ctl archive-if-idle THREAD [--session ses_...]` exits 3 when refused.
 
