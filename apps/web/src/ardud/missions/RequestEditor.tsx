@@ -126,14 +126,15 @@ export function useRequestDraft() {
   useEffect(() => {
     held.current = images;
   }, [images]);
-  const mounted = useRef(true);
-  useEffect(
-    () => () => {
+  // Set in setup too: StrictMode runs cleanup then setup again on mount.
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
       held.current.forEach(discard);
-    },
-    [],
-  );
+    };
+  }, []);
 
   const chipped = chippedImages(text, images);
   const words = stripInlineContextReferences(text).trim();
