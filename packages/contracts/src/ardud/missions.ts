@@ -726,6 +726,22 @@ export const Knock = Schema.Struct({
    * is a label such as `control-api:<subject>`, not a real thread.
    */
   senderKind: Schema.optional(Schema.Literals(["thread", "session", "mcp-client", "schedule"])),
+  // --- r22 comments ---
+  /**
+   * A forward's delivery, saved with the decision. `pending` until every target thread has
+   * it; a retry sends the same text under the same keys. Missing on older forwards: delivered.
+   */
+  delivery: Schema.optional(
+    Schema.Struct({
+      status: Schema.Literals(["pending", "sent"]),
+      /** Exactly what each thread gets, the owner's comments included. */
+      text: Schema.String,
+      threadIds: Schema.Array(ThreadId),
+      asOwner: Schema.Boolean,
+      sentAt: Schema.NullOr(IsoDateTime),
+    }),
+  ),
+  // --- end r22 comments ---
 });
 export type Knock = typeof Knock.Type;
 
@@ -1870,6 +1886,9 @@ export const MissionEventKind = Schema.Literals([
   "draft.sent",
   "knock.received",
   "knock.decided",
+  // --- r22 comments ---
+  "knock.delivered",
+  // --- end r22 comments ---
   // --- router additions ---
   "message.posted",
   "send.guarded",

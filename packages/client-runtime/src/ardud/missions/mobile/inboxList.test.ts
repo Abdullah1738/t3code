@@ -1,9 +1,12 @@
 import type {
+  Knock,
+  KnockId,
   MissionId,
   MissionInboxHistory,
   MissionListSnapshot,
   MissionRecordRef,
   OwnerRequestId,
+  ThreadId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -207,5 +210,42 @@ describe("phone inbox list", () => {
       sent: "Posted after lunch, with the link.",
     });
     expect(rows.filter((row) => row.comments.length > 0)).toHaveLength(1);
+  });
+
+  it("says a forwarded knock is not delivered yet until its send lands", () => {
+    const source = createFixtureMissionsSource({ now: () => NOW });
+    const history = first<MissionInboxHistory>((listener) =>
+      source.subscribeInboxHistory(CRPKO, listener),
+    );
+    const knock: Knock = {
+      id: "knock-1" as KnockId,
+      missionId: CRPKO,
+      fromThreadId: "thread-stray" as ThreadId,
+      fromTitle: "Stray",
+      path: "thread-send",
+      summary: "Stray wants to say hi",
+      body: "hi",
+      status: "forwarded",
+      forwardedText: "hi",
+      forwardedTo: { _tag: "owner" },
+      decidedAt: FIXTURE_NOW,
+      createdAt: FIXTURE_NOW,
+    };
+    const delivery = {
+      status: "pending" as const,
+      text: "[Forwarded by the owner from Stray] hi",
+      threadIds: [],
+      asOwner: true,
+      sentAt: null,
+    };
+    const outcome = (record: Knock) =>
+      decidedRows({ ...history, knocks: [record] }, NOW).find(
+        (row) => row.key === `knock:${knock.id}`,
+      )?.outcome;
+    expect(outcome({ ...knock, delivery })).toBe("Forwarded, not delivered yet");
+    expect(
+      outcome({ ...knock, delivery: { ...delivery, status: "sent", sentAt: FIXTURE_NOW } }),
+    ).toBe("Forwarded");
+    expect(outcome(knock)).toBe("Forwarded");
   });
 });

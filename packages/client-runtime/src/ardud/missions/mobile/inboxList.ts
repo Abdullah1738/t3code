@@ -23,7 +23,7 @@ import {
   draftSentText,
   inboxEntries,
   inboxTabCounts,
-  KNOCK_STATUS_LABEL,
+  knockOutcomeLabel,
   snoozedEntries,
   SUGGESTION_STATUS_LABEL,
   type InboxEntry,
@@ -249,7 +249,7 @@ export function decidedRows(
     ...history.knocks.map((knock) => ({
       key: `knock:${knock.id}`,
       title: knock.summary,
-      outcome: KNOCK_STATUS_LABEL[knock.status],
+      outcome: knockOutcomeLabel(knock),
       at: knock.decidedAt ?? knock.createdAt,
       age: age(knock.decidedAt, knock.createdAt),
       condition: null,

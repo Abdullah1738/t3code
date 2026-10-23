@@ -143,8 +143,13 @@ export const RouterLive = Layer.effectDiscard(
     );
     // Reminders look for stale deliveries on a slow timer; each pass is
     // bounded by the 30-minute rules in reminders.ts, not by the timer.
+    // Forwarded knocks that never landed are sent again on the same pass.
     yield* forkParked(
-      router.remind.pipe(Effect.repeat(Schedule.spaced(REMIND_SWEEP)), Effect.asVoid),
+      router.remind.pipe(
+        Effect.andThen(router.redeliverForwards),
+        Effect.repeat(Schedule.spaced(REMIND_SWEEP)),
+        Effect.asVoid,
+      ),
     );
   }),
 ).pipe(Layer.provideMerge(RouterServicesLive));

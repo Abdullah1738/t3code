@@ -142,6 +142,9 @@ const MEMBER_RANK: Record<MemberKind, number> = { master: 0, created: 1, attache
 
 const fail = (code: MissionError["code"], detail: string) => new MissionError({ code, detail });
 const KNOCK_COMMENTS = { _tag: "system", component: "knocks" } as const;
+// ardud missions: r22 comments (forwards whose send failed are retried this long after the decision)
+const KNOCK_DELIVERY = KNOCK_COMMENTS;
+const REDELIVER_WINDOW_DAYS = 7;
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 /** Standard rooms a post may create on first use: control, release, arch, per sub-mission, per work item. */
@@ -438,6 +441,12 @@ export class MissionRouter extends Context.Service<
      * once. Returns how many threads were reminded.
      */
     readonly remind: Effect.Effect<number>;
+    /**
+     * Sends forwarded knocks whose delivery has not landed (a crash or refused
+     * send after the decision committed), with the saved text and keys.
+     * Returns how many were delivered.
+     */
+    readonly redeliverForwards: Effect.Effect<number>;
     /**
      * Holds wakes and reminders after a restart, so recovery can scan before
      * router traffic starts lanes. Pokes are remembered and replayed on
@@ -1567,39 +1576,81 @@ const make = Effect.gen(function* () {
     return targets;
   });
 
-  /**
-   * Sends a committed forward. The key names the decision, so a retry lands
-   * once and nothing that went out can belong to a decision that never saved.
-   */
-  const deliverForward = (
+  /** What a forward sends to each target, fixed when its decision commits. */
+  const forwardDelivery = (
     knock: Knock,
+    text: string,
     targets: ReadonlyArray<ThreadId>,
     comments: ReadonlyArray<InboxComment>,
     owner: boolean,
-  ) => {
-    const text = `[Forwarded by ${owner ? "the owner" : "the master"} from ${knock.fromTitle}] ${knock.forwardedText ?? knock.body}`;
-    return Effect.forEach(
-      targets,
+  ): NonNullable<Knock["delivery"]> => {
+    const line = `[Forwarded by ${owner ? "the owner" : "the master"} from ${knock.fromTitle}] ${text}`;
+    return {
+      status: "pending",
+      text:
+        comments.length === 0
+          ? line
+          : `${line}\n\nThe owner's comments:\n${commentLines(comments)}`,
+      threadIds: [...targets],
+      asOwner: owner,
+      sentAt: null,
+    };
+  };
+
+  /**
+   * Sends a committed forward from its saved delivery, then records it sent.
+   * The key names the decision, so the decide call again and the sweep both
+   * land it once, and nothing that went out belongs to a decision that never
+   * saved. A target that left the mission since keeps it undelivered.
+   */
+  const deliverForward = Effect.fn("MissionRouter.deliverForward")(function* (knock: Knock) {
+    const delivery = knock.delivery;
+    if (delivery === undefined || delivery.status === "sent") return knock;
+    const cast = yield* loadCast(knock.missionId);
+    for (const threadId of delivery.threadIds) {
+      if ((yield* membershipIn(within(cast), threadId)) === null) {
+        return yield* fail(
+          "forbidden",
+          `Knock ${knock.id} is forwarded but thread ${threadId} is no longer in mission ${knock.missionId}.`,
+        );
+      }
+    }
+    yield* Effect.forEach(
+      delivery.threadIds,
       (threadId) =>
         threads.send({
           threadId,
-          text:
-            comments.length === 0
-              ? text
-              : `${text}\n\nThe owner's comments:\n${commentLines(comments)}`,
+          text: delivery.text,
           key: `knock:${knock.id}:forward:${threadId}:${knock.decidedAt ?? ""}`,
-          asOwner: owner,
+          asOwner: delivery.asOwner,
         }),
       { discard: true },
     ).pipe(
       Effect.mapError((error) =>
         fail(
           error.code,
-          `Knock ${knock.id} is forwarded but did not reach every thread (${error.detail}). Forward it again to resend.`,
+          `Knock ${knock.id} is forwarded but did not reach every thread yet (${error.detail}). It is sent again on its own.`,
         ),
       ),
     );
-  };
+    const sent: Knock = {
+      ...knock,
+      delivery: { ...delivery, status: "sent", sentAt: yield* nowIso },
+    };
+    yield* store.commit({
+      event: {
+        missionId: knock.missionId,
+        kind: "knock.delivered",
+        actor: actorOf(KNOCK_DELIVERY),
+        provenance: KNOCK_DELIVERY,
+        summary: clipSummary(`Delivered the forwarded knock from ${knock.fromTitle}`),
+        subject: { kind: "knock", id: knock.id },
+        payload: { threadIds: delivery.threadIds },
+      },
+      upserts: [{ _tag: "knock", record: sent }],
+    });
+    return sent;
+  });
 
   const decideKnock = (input: DecideKnockInput, provenance: MissionProvenance) =>
     // The owner's note joins the knock's comments, which comments write under this lock too.
@@ -1626,8 +1677,8 @@ const make = Effect.gen(function* () {
           );
         }
         if (resending) {
-          // Its decision committed but the delivery failed: send it again from the
-          // committed record. Asking for a different forward is a new decision.
+          // Its decision committed but the delivery has not landed: send the saved
+          // delivery again. Asking for a different forward is a new decision.
           const note = yield* decisionNoteOf(input.note, provenance);
           const comments = yield* commentsOn(store, { kind: "knock", id: knock.id });
           const same =
@@ -1638,11 +1689,9 @@ const make = Effect.gen(function* () {
           if (!same || knock.forwardedTo === null) {
             return yield* fail("conflict", `Knock ${knock.id} was already forwarded.`);
           }
-          const targets = yield* forwardTargets(cast, knock.forwardedTo);
           if (comments.length > 0)
             yield* tellMasterOfKnockComments(cast, knock, comments, provenance);
-          yield* deliverForward(knock, targets, comments, owner);
-          return knock;
+          return yield* deliverForward(knock);
         }
         // The owner's note is a comment on the knock, saved with the decision; the
         // forward carries every comment he left so the receiver acts on them.
@@ -1683,6 +1732,11 @@ const make = Effect.gen(function* () {
           forwardedText: input.action === "forward" ? text : null,
           forwardedTo,
           decidedAt,
+          // The delivery commits with the decision, so a crash or a refused send
+          // leaves it pending for the next decide call or the sweep.
+          ...(input.action === "forward"
+            ? { delivery: forwardDelivery(knock, text, targets, comments, owner) }
+            : {}),
         };
         yield* store.commit({
           event: {
@@ -1709,10 +1763,50 @@ const make = Effect.gen(function* () {
         // a note the knock's history lacks.
         if (comments.length > 0)
           yield* tellMasterOfKnockComments(cast, decided, comments, provenance);
-        yield* deliverForward(decided, targets, comments, owner);
-        return decided;
+        return yield* deliverForward(decided);
       }),
     );
+
+  /**
+   * Sends every forward whose delivery is still pending, each under its knock's
+   * lock so a decide call resending it at the same time lands it once.
+   */
+  const redeliverForwards = Effect.gen(function* () {
+    if (bootHold === "holding") return 0;
+    const since = DateTime.subtract(yield* DateTime.now, { days: REDELIVER_WINDOW_DAYS });
+    const forwarded = yield* store.list("knock", {
+      status: ["forwarded"],
+      updatedSince: DateTime.formatIso(since),
+      order: "oldest",
+    });
+    let delivered = 0;
+    for (const { id } of forwarded.filter((knock) => knock.delivery?.status === "pending")) {
+      const sent = yield* store
+        .withItemLock(
+          markIdOf({ kind: "knock", id }),
+          Effect.gen(function* () {
+            const knock = Option.getOrNull(yield* store.get("knock", id));
+            if (knock?.status !== "forwarded" || knock.delivery?.status !== "pending") return false;
+            yield* deliverForward(knock);
+            return true;
+          }),
+        )
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("missions router: forwarded knock still undelivered", {
+              knockId: id,
+              cause,
+            }).pipe(Effect.as(false)),
+          ),
+        );
+      if (sent) delivered += 1;
+    }
+    return delivered;
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("missions router: forward redelivery failed", { cause }).pipe(Effect.as(0)),
+    ),
+  );
 
   /** The master hears the owner's comments on a knock he decided, once. */
   const tellMasterOfKnockComments = Effect.fn("MissionRouter.tellMasterOfKnockComments")(
@@ -2544,6 +2638,7 @@ const make = Effect.gen(function* () {
     updateRoom,
     createRoom, // ardud missions: router
     remind,
+    redeliverForwards, // ardud missions: r22 comments
     holdDoorbells, // ardud missions: recovery
     releaseDoorbells, // ardud missions: recovery
     attention,

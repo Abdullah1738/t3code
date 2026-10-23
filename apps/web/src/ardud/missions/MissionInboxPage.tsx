@@ -25,7 +25,7 @@ import {
   inboxLead,
   inboxTabCounts,
   discussionUnread,
-  KNOCK_STATUS_LABEL,
+  knockOutcomeLabel,
   ownerConditionOf,
   ownerWaitingEntries,
   requestAbout,
@@ -805,7 +805,7 @@ function NotedHistory(props: {
       ? history.knocks.map((knock) => ({
           key: `knock:${knock.id}`,
           title: knock.summary,
-          status: KNOCK_STATUS_LABEL[knock.status],
+          status: knockOutcomeLabel(knock),
           at: knock.decidedAt,
         }))
       : history.suggestions.map((suggestion) => ({
