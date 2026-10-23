@@ -96,6 +96,9 @@ private final class ComposerTextView: UITextView {
   var onAttributedMutation: (() -> Void)?
   var onSubmit: ((Bool) -> Void)?
   var isReadOnly = false
+  /// Bumped when the editor starts or stops taking input (a send), so an image
+  /// still loading from an earlier paste or drop doesn't land in what follows.
+  var pasteGeneration = 0
   var textPasteThresholdBytes = 0
   var maxInputChars = Int.max
   var enterBehavior: ComposerEnterBehavior = .send
@@ -293,6 +296,7 @@ private final class ComposerTextView: UITextView {
   func loadImages(from providers: [NSItemProvider]) {
     let group = DispatchGroup()
     let lock = NSLock()
+    let generation = pasteGeneration
     var images = [UIImage?](repeating: nil, count: providers.count)
 
     for (index, provider) in providers.enumerated() {
@@ -309,7 +313,7 @@ private final class ComposerTextView: UITextView {
     }
 
     group.notify(queue: .main) { [weak self] in
-      guard let self, !self.isReadOnly else {
+      guard let self, !self.isReadOnly, self.pasteGeneration == generation else {
         return
       }
       let urls = images.compactMap { $0 }.compactMap(Self.writeTemporaryImage)
@@ -706,6 +710,9 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
   }
 
   func setEditable(_ editable: Bool) {
+    if textView.isEditable != editable {
+      textView.pasteGeneration += 1
+    }
     textView.isEditable = editable
   }
 
