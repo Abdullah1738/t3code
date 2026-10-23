@@ -31,6 +31,8 @@ export function RequestEditor(props: {
         <ComposerEditor
           multiline
           scrollEnabled
+          // The buttons under the box send; Return on a hardware keyboard is a new line.
+          enterBehavior="newline"
           value={draft.text}
           selection={draft.selection}
           context={draft.context}
