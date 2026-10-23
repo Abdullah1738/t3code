@@ -22,6 +22,7 @@ import { Router } from "./router.ts";
 import { ChatRegistry, createSbApi, type ChatCore } from "./runtime.ts";
 import { runIngress } from "./sb-ingress.ts";
 import { sbTransport } from "./sb-transport.ts";
+import { cardPreviewImage } from "./card-preview.ts";
 import { GuestDesk } from "./guest-desk.ts";
 import { jevJudge } from "./group-judge.ts";
 import { flightyDb } from "./guest-flight.ts";
@@ -183,7 +184,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const isOwner = chat.info.kind === "owner";
     const chatBackend = !isOwner && backend instanceof RobobBackend
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
-    const transport = sbTransport(observed, chat.info.key, chat.store);
+    const liveCards = (config.liveCardChats ?? ["owner"]).includes(chat.info.slug);
+    const transport = sbTransport(observed, chat.info.key, chat.store, undefined,
+      liveCards ? {} : { static: true, previewImage: cardPreviewImage() });
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,

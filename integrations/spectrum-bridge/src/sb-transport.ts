@@ -19,7 +19,14 @@ export function classifyLineFailure(error: unknown): TransportError {
 
 export type SbTransport = ReturnType<typeof sbTransport>;
 
-export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () => Date.now()) {
+/**
+ * Static cards skip the live transcript view: Messages draws the captions and preview image
+ * itself, and a tap still opens the installed extension. Used where a live view has rendered
+ * as an empty bubble.
+ */
+export type CardOptions = { static?: boolean; previewImage?: (pageUrl: string) => Promise<string | undefined> };
+
+export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () => Date.now(), cards: CardOptions = {}) {
   const wrap = async <T>(work: () => Promise<T>): Promise<T> => {
     try { return await work(); } catch (error) { throw classifyLineFailure(error); }
   };
@@ -94,7 +101,12 @@ export function sbTransport(line: Line, chat: ChatKey, store: Store, now = () =>
     async sendApp(input: { id: string; chatGuid: string } & LineAppCard): Promise<{ providerId?: string; duplicate?: boolean }> {
       const saved = store.get<{ handle: string }>(sentKey(input.id));
       if (saved) return { providerId: saved.handle, duplicate: true };
-      const { id: _id, chatGuid: _chat, ...card } = input;
+      const { id: _id, chatGuid: _chat, ...given } = input;
+      let card: LineAppCard = given;
+      if (cards.static) {
+        const imageUrl = card.imageUrl ?? await cards.previewImage?.(card.url).catch(() => undefined);
+        card = { ...card, interactive: false, ...(imageUrl ? { imageUrl } : {}) };
+      }
       const sent = await wrap(() => line.sendApp(chat, card));
       store.set(sentKey(input.id), { handle: sent.handle });
       rearm();
