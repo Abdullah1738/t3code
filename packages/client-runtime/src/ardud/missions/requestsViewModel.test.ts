@@ -11,9 +11,11 @@ import {
   looseDiscussions,
   openRequestInput,
   ownerConditionOf,
+  replyRequestInput,
   requestAbout,
   requestPreview,
   requestReadMark,
+  requestTextWithImages,
   requestTitle,
   yourRequests,
 } from "./requestsViewModel.ts";
@@ -251,5 +253,62 @@ describe("owner requests", () => {
       ),
     ).toEqual(["request-d613679c", "request-d505b6a1"]);
     expect(looseDiscussions([{ ...acked, status: "settled" }], [])).toEqual([]);
+  });
+
+  it("turns image chips into numbered markers where they sit, in chip order", () => {
+    const chip = (id: string, label: string) => `![${label}](t3-context://v1/image/${id})`;
+    const shot = { contextId: "image_a", attachmentId: "att-a" };
+    const mock = { contextId: "image_b", attachmentId: "att-b" };
+    const loose = { contextId: "image_c", attachmentId: "att-c" };
+    const text = `The header in ${chip("image_b", "mock.png")} should match ${chip("image_a", "shot.png")}, see ${chip("image_b", "mock.png")} again.`;
+    expect(requestTextWithImages(text, [shot, mock, loose])).toEqual({
+      text: "The header in {image1} should match {image2}, see {image1} again.\n\n{image3}",
+      images: [
+        { _tag: "attachment", attachmentId: "att-b" },
+        { _tag: "attachment", attachmentId: "att-a" },
+        { _tag: "attachment", attachmentId: "att-c" },
+      ],
+    });
+    // A chip with no image behind it stays as typed; text alone is unchanged.
+    expect(requestTextWithImages(`Look ${chip("image_x", "gone")}`, [])).toEqual({
+      text: `Look ${chip("image_x", "gone")}`,
+      images: [],
+    });
+
+    expect(openRequestInput(CRPKO, "   ", [shot])).toEqual({
+      ok: true,
+      value: {
+        missionId: CRPKO,
+        text: "{image1}",
+        images: [{ _tag: "attachment", attachmentId: "att-a" }],
+      },
+    });
+    expect(
+      replyRequestInput("request-1", ` Same here ${chip("image_a", "shot.png")} `, [shot]),
+    ).toEqual({
+      ok: true,
+      value: {
+        requestId: "request-1",
+        text: "Same here {image1}",
+        images: [{ _tag: "attachment", attachmentId: "att-a" }],
+      },
+    });
+    expect(replyRequestInput("request-1", "Thanks")).toEqual({
+      ok: true,
+      value: { requestId: "request-1", text: "Thanks" },
+    });
+    expect(
+      requestPreview({
+        messages: [
+          {
+            id: "m1",
+            author: "owner",
+            text: "Fix [image 1: /a/mission-00000000-0000-4000-8000-000000000001.png] please",
+            at: FIXTURE_NOW,
+            refs: [],
+          },
+        ],
+      }),
+    ).toBe("Fix [image 1] please");
   });
 });

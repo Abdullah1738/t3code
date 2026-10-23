@@ -3,8 +3,8 @@
  * the `mission` CLI:
  *
  * - `GET  /api/ardud/missions/desk/requests?mission&status&request&discussions&about&unread`
- * - `POST /api/ardud/missions/desk/requests`                     `{ missionId, text, subMissionId?, subject?, inboundId }`
- * - `POST /api/ardud/missions/desk/requests/:requestId/reply`    `{ text, inboundId }`
+ * - `POST /api/ardud/missions/desk/requests`                     `{ missionId, text, subMissionId?, subject?, images?, inboundId }`
+ * - `POST /api/ardud/missions/desk/requests/:requestId/reply`    `{ text, images?, inboundId }`
  * - `POST /api/ardud/missions/desk/requests/:requestId/settle`   `{ note?, inboundId }`
  * - `POST /api/ardud/missions/desk/requests/:requestId/reopen`   `{ note?, inboundId }`
  *
@@ -29,6 +29,7 @@ import {
   MissionId,
   MissionRecordRef,
   OwnerRequestId,
+  OwnerRequestImages,
   OwnerRequestStatus,
   OwnerRequestText,
   SubMissionId,
@@ -100,11 +101,13 @@ const OpenBody = Schema.Struct({
   subMissionId: Schema.optional(SubMissionId),
   /** Discuss: the record this request is about. */
   subject: Schema.optional(MissionRecordRef),
+  images: Schema.optional(OwnerRequestImages),
   inboundId: TrimmedNonEmptyString,
 });
 
 const ReplyBody = Schema.Struct({
   text: OwnerRequestText,
+  images: Schema.optional(OwnerRequestImages),
   inboundId: TrimmedNonEmptyString,
 });
 
@@ -266,6 +269,7 @@ const makeRoutes = Effect.gen(function* () {
               missionId: body.missionId,
               text: body.text,
               subMissionId: body.subMissionId ?? null,
+              ...(body.images === undefined ? {} : { images: body.images }),
             },
             what: body.subject === undefined ? "A request" : "Discussing a record",
             notBefore: () =>
@@ -283,6 +287,7 @@ const makeRoutes = Effect.gen(function* () {
                   text: body.text,
                   ...(body.subMissionId === undefined ? {} : { subMissionId: body.subMissionId }),
                   ...(body.subject === undefined ? {} : { subject: body.subject }),
+                  ...(body.images === undefined ? {} : { images: body.images }),
                 },
                 owner,
               )
@@ -305,14 +310,24 @@ const makeRoutes = Effect.gen(function* () {
             inboundId: body.inboundId,
             subject: `owner-request:${requestId}`,
             action: "reply",
-            payload: { text: body.text },
+            payload: {
+              text: body.text,
+              ...(body.images === undefined ? {} : { images: body.images }),
+            },
             what: "A reply",
             // A reply must come after the request it answers was opened.
             notBefore: () => atCreation(request),
           },
           (owner) =>
             router
-              .replyRequest({ requestId, text: body.text }, owner)
+              .replyRequest(
+                {
+                  requestId,
+                  text: body.text,
+                  ...(body.images === undefined ? {} : { images: body.images }),
+                },
+                owner,
+              )
               .pipe(Effect.map((next) => ({ ok: true, request: next }))),
         );
         return json(result);

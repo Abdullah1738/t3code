@@ -16,6 +16,9 @@ import {
   MissionError,
   MissionMessageId,
   OwnerRequestId,
+  placeRequestImages,
+  requestImageRef,
+  requestPlainText,
   RoomId,
   type Mission,
   type MissionActor,
@@ -29,6 +32,7 @@ import {
   type OwnerCondition,
   type OwnerRequest,
   type OwnerRequests,
+  type OwnerRequestImage,
   type OwnerRequestsInput,
   type OwnerRequestStatus,
   type OwnerRequestView,
@@ -63,6 +67,7 @@ import {
   settledBy,
   withLastReply,
 } from "./requestsModel.ts";
+import type { StoreRequestImage } from "./requestImages.ts";
 import type { RouterStore } from "./RouterStore.ts";
 
 /** Requests one list returns, newest activity first. */
@@ -129,6 +134,7 @@ export interface OwnerRequestDeps {
     speaker: ThreadId | null,
     deliveries: ReadonlyArray<ThreadId>,
   ) => Effect.Effect<void>;
+  readonly storeImage: StoreRequestImage;
 }
 
 type RoomCount = { readonly total: number; readonly unreadForOwner: number };
@@ -515,13 +521,32 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
       missionId: request.missionId,
       roomId: request.roomId,
       kind,
-      summary: clipSummary(text),
+      summary: clipSummary(requestPlainText(text)),
       body: text,
       to: [...to],
       ...(key === null ? {} : { key }),
     });
 
     const speakerOf = (writer: Writer) => (writer._tag === "master" ? writer.threadId : null);
+
+    /**
+     * The message text with each image stored and its ref in place. A retry
+     * finds the images it stored, so it writes the same text.
+     */
+    const withImages = (
+      missionId: MissionId,
+      requestId: OwnerRequestId,
+      text: string,
+      images: ReadonlyArray<OwnerRequestImage> | undefined,
+      provenance: MissionProvenance,
+    ) =>
+      images === undefined || images.length === 0
+        ? Effect.succeed(text)
+        : Effect.forEach(images, (image, at) =>
+            Effect.map(deps.storeImage({ missionId, requestId, image, provenance }), (stored) =>
+              requestImageRef(at + 1, stored.path),
+            ),
+          ).pipe(Effect.map((refs) => placeRequestImages(text, refs)));
 
     /**
      * Discuss: the record a request is about, read live. Null when it is gone.
@@ -785,40 +810,44 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             idKey === null
               ? null
               : (inboundKeyOf(provenance, target) ?? `request:${requestId}:open`);
+          const prior =
+            subject === null || idKey === null
+              ? null
+              : yield* appendedBefore(mission.id, inboundId, `request:${requestId}:open`, subject);
+          const ongoing = subject === null ? null : yield* openAbout(mission.id, subject);
+          // The images go with the request this message lands in.
+          const text = yield* withImages(
+            mission.id,
+            prior?.request.id ?? ongoing?.id ?? requestId,
+            input.text,
+            input.images,
+            provenance,
+          );
           const quoted = (opening: boolean) =>
             writer._tag === "master"
-              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${input.quotedFrom}.]\n\n${input.text}`
-              : input.text;
-          if (subject !== null && idKey !== null) {
-            const prior = yield* appendedBefore(
-              mission.id,
-              inboundId,
-              `request:${requestId}:open`,
-              subject,
+              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${input.quotedFrom}.]\n\n${text}`
+              : text;
+          if (prior !== null && subject !== null) {
+            const earlier = prior.request;
+            // The master's words added to an open discussion are a status reply.
+            const opening = earlier.id === requestId;
+            const same = postContentHash(
+              messageInput(
+                { missionId: mission.id, roomId: earlier.roomId },
+                writer._tag === "owner" || opening ? "request" : "status",
+                quoted(opening),
+                to,
+                appendKey(earlier.id),
+              ),
             );
-            if (prior !== null) {
-              const earlier = prior.request;
-              // The master's words added to an open discussion are a status reply.
-              const opening = earlier.id === requestId;
-              const same = postContentHash(
-                messageInput(
-                  { missionId: mission.id, roomId: earlier.roomId },
-                  writer._tag === "owner" || opening ? "request" : "status",
-                  quoted(opening),
-                  to,
-                  appendKey(earlier.id),
-                ),
+            if (prior.contentHash !== same || !sameRef(earlier.subject, subject)) {
+              return yield* fail(
+                "conflict",
+                `Key ${input.key ?? appendKey(earlier.id)} already said something else in ${earlier.id}.`,
               );
-              if (prior.contentHash !== same || !sameRef(earlier.subject, subject)) {
-                return yield* fail(
-                  "conflict",
-                  `Key ${input.key ?? appendKey(earlier.id)} already said something else in ${earlier.id}.`,
-                );
-              }
-              return { result: earlier, speaker: null, deliveries: [] };
             }
+            return { result: earlier, speaker: null, deliveries: [] };
           }
-          const ongoing = subject === null ? null : yield* openAbout(mission.id, subject);
           if (ongoing !== null && ongoing.id !== requestId) {
             // His quote stays with the master's words when they join an open
             // discussion, and the master still owes him updates there.
@@ -833,7 +862,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             );
           }
           const roomId = requestRoomId(mission.id, requestId);
-          const title = requestTitleOf(input.text);
+          const title = requestTitleOf(text);
           const subMissionId = input.subMissionId ?? null;
           const message = messageInput(
             { missionId: mission.id, roomId },
@@ -887,7 +916,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
                 updatedAt: at,
                 ...(subject === null ? {} : { subject }),
               };
-              const noted = withLastReply(request, input.text, writer.actor, at);
+              const noted = withLastReply(request, text, writer.actor, at);
               written = noted;
               return {
                 kind: "request.opened",
@@ -937,18 +966,33 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           inboundKeyOf(provenance, request.id) ??
           (input.key === undefined ? null : `request:${request.id}:${input.key}`);
         const to = owner ? yield* masterAddress(cast) : [];
-        const message = messageInput(request, owner ? "request" : "status", input.text, to, key);
+        const status = input.status ?? "answered";
+        const links = dedupeRefs(input.links ?? []);
+        // A retry only repeats what it already wrote. Anything new is checked
+        // before its images are stored, so a refused reply leaves none behind.
+        const retry = key !== null && (yield* rooms.messageByKey(request.missionId, key)) !== null;
+        if (!retry) {
+          if (request.status === "settled") {
+            return yield* fail(
+              "conflict",
+              `Request "${request.title}" is settled; reopen it first.`,
+            );
+          }
+          if (!owner) yield* refuseSilence(input.text);
+          yield* checkLinks(request.missionId, links);
+        }
+        const text = yield* withImages(
+          request.missionId,
+          request.id,
+          input.text,
+          input.images,
+          provenance,
+        );
+        const message = messageInput(request, owner ? "request" : "status", text, to, key);
         // A retried reply lands on the message it already wrote.
         if ((yield* priorPost(key, message)) === "repeat") {
           return { result: request, speaker: null, deliveries: [] };
         }
-        if (request.status === "settled") {
-          return yield* fail("conflict", `Request "${request.title}" is settled; reopen it first.`);
-        }
-        if (!owner) yield* refuseSilence(input.text);
-        const status = input.status ?? "answered";
-        const links = dedupeRefs(input.links ?? []);
-        yield* checkLinks(request.missionId, links);
         let written: OwnerRequest | null = null;
         const posted = yield* post({
           input: message,
@@ -957,7 +1001,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           asRequest: (_message, at) => {
             const next = withLastReply(
               owner ? afterOwnerSpoke(request, at) : afterMasterSpoke(request, at, status, links),
-              input.text,
+              text,
               writer.actor,
               at,
             );

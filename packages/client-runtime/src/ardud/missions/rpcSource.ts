@@ -32,6 +32,7 @@ import {
   type MissionViewsSnapshot,
   type OwnerRequest as OwnerRequestRecord,
   type OwnerRequestId,
+  type OwnerRequestImage,
   type OwnerRequestView,
   type PoolView,
   type PoolsSnapshot,
@@ -1583,23 +1584,30 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
     // --- end finish-a ---
     subscribeRequest: ({ missionId, requestId }, listener) =>
       requestThreadFeed(`${missionId}\n${requestId}`, listener),
-    openRequest: async ({ missionId, text, subject }) => {
+    openRequest: async ({ missionId, text, subject, images }) => {
       // Router r5 adds `subject` (one open request per record); until then the
       // server drops it and Discuss opens a plain request.
-      const input: { missionId: MissionId; text: string; subject?: MissionRecordRef } = {
+      const input: {
+        missionId: MissionId;
+        text: string;
+        subject?: MissionRecordRef;
+        images?: ReadonlyArray<OwnerRequestImage>;
+      } = {
         missionId,
         text: text.trim(),
         ...(subject === undefined ? {} : { subject }),
+        ...(images === undefined || images.length === 0 ? {} : { images }),
       };
       const request = await transport.request(WS_METHODS.missionsOpenOwnerRequest, input);
       touchRequest(request);
       return ownerRequestOf(request);
     },
-    replyRequest: async ({ requestId, text }) => {
+    replyRequest: async ({ requestId, text, images }) => {
       touchRequest(
         await transport.request(WS_METHODS.missionsReplyOwnerRequest, {
           requestId: requestId as OwnerRequestId,
           text: text.trim(),
+          ...(images === undefined || images.length === 0 ? {} : { images }),
         }),
       );
     },

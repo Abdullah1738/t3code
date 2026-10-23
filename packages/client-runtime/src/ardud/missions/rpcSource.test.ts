@@ -707,6 +707,25 @@ describe("rpc missions source", () => {
       subject: { kind: "ask", id: "ask-1" },
     });
 
+    // Images go with their markers; an empty list stays off the wire.
+    const shot = { _tag: "attachment" as const, attachmentId: "att-1" };
+    await source.openRequest({ missionId: CRPKO, text: "See {image1}", images: [shot] });
+    await source.replyRequest({ requestId: "request-1", text: "And {image1}", images: [shot] });
+    await source.replyRequest({ requestId: "request-1", text: "No picture", images: [] });
+    expect(asked(WS_METHODS.missionsOpenOwnerRequest).at(-1)?.input).toEqual({
+      missionId: CRPKO,
+      text: "See {image1}",
+      images: [shot],
+    });
+    expect(
+      asked(WS_METHODS.missionsReplyOwnerRequest)
+        .slice(-2)
+        .map((call) => call.input),
+    ).toEqual([
+      { requestId: "request-1", text: "And {image1}", images: [shot] },
+      { requestId: "request-1", text: "No picture" },
+    ]);
+
     // The settle note is the owner's closing words; a blank one stays off the wire.
     await source.settleRequest({ requestId: "request-1", note: "  Ship it Friday  " });
     await source.settleRequest({ requestId: "request-1", note: "   " });

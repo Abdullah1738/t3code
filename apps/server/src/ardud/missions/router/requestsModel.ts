@@ -7,6 +7,7 @@
  */
 import {
   OwnerRequestId,
+  requestPlainText,
   RoomId,
   type MissionActor,
   type MissionId,
@@ -42,11 +43,12 @@ export const keyedRequestId = (missionId: MissionId, key: string): OwnerRequestI
 
 /** The request's first non-empty line, at most 120 characters. */
 export const requestTitleOf = (text: string): string => {
+  const plain = requestPlainText(text);
   const line =
-    text
+    plain
       .split(/\r?\n/)
       .map((each) => each.trim())
-      .find((each) => each.length > 0) ?? text.trim();
+      .find((each) => each.length > 0) ?? plain.trim();
   const flat = line.replace(/\s+/g, " ");
   return flat.length <= TITLE_MAX ? flat : `${flat.slice(0, TITLE_MAX - 1).trimEnd()}…`;
 };
@@ -61,7 +63,7 @@ export const withLastReply = (
   author: MissionActor,
   at: string,
 ): OwnerRequest => {
-  const flat = text.replace(/\s+/g, " ").trim();
+  const flat = requestPlainText(text).replace(/\s+/g, " ").trim();
   const short =
     flat.length <= LAST_REPLY_MAX ? flat : `${flat.slice(0, LAST_REPLY_MAX - 1).trimEnd()}…`;
   return { ...request, lastReply: short, lastReplyBy: author, lastReplyAt: at };

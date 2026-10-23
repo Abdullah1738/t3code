@@ -42,6 +42,7 @@ import {
   useOwnerRequests,
   useRoomPage,
 } from "./missionsStore";
+import { useRequestDraft, type RequestDraft } from "./requestDraft";
 import { useMissionAction } from "./useMissionsLogic";
 
 // State and actions for the record screens: a discussion on an inbox item,
@@ -86,9 +87,8 @@ function settleInput(requestId: string, text: string) {
 export interface DiscussionState {
   readonly request: OwnerRequest | null;
   readonly unread: number;
-  readonly text: string;
+  readonly draft: RequestDraft;
   readonly pending: boolean;
-  readonly setText: (text: string) => void;
   readonly send: () => void;
   readonly settle: () => void;
 }
@@ -115,7 +115,7 @@ export function useDiscussion(
   const full = useFullOwnerRequest(missionId, open ? (mark.request?.id ?? null) : null);
   const request = full ?? mark.request;
   const { unread } = mark;
-  const [text, setText] = useState("");
+  const draft = useRequestDraft();
   const { pending, run } = useMissionAction();
 
   const readMark = open ? requestReadMark(request) : null;
@@ -124,40 +124,42 @@ export function useDiscussion(
   }, [readMark]);
 
   const send = () => {
-    const done = (sent: boolean) => {
-      if (sent) setText("");
-    };
     if (request) {
-      void sendChecked(run, "Could not send", replyRequestInput(request.id, text), (input) =>
-        missionsSource().replyRequest(input),
-      ).then(done);
+      void draft.send((text, images) =>
+        sendChecked(run, "Could not send", replyRequestInput(request.id, text, images), (input) =>
+          missionsSource().replyRequest(input),
+        ),
+      );
       return;
     }
     if (!missionId) return;
-    void sendChecked(
-      run,
-      "Could not send",
-      discussRequestInput(missionId, subject, text),
-      (input) => missionsSource().openRequest(input),
-    ).then(done);
+    void draft.send((text, images) =>
+      sendChecked(
+        run,
+        "Could not send",
+        discussRequestInput(missionId, subject, text, images),
+        (input) => missionsSource().openRequest(input),
+      ),
+    );
   };
 
   const settle = () => {
     if (!request) return;
+    const note = draft.noteOnly();
+    if (note === null) return;
     void run("Could not settle", () =>
-      missionsSource().settleRequest(settleInput(request.id, text)),
+      missionsSource().settleRequest(settleInput(request.id, note)),
     ).then((done) => {
-      if (done) setText("");
+      if (done) draft.clear();
     });
   };
 
-  return { request, unread, text, pending, setText, send, settle };
+  return { request, unread, draft, pending: pending || draft.uploading, send, settle };
 }
 
 export interface RequestComposerState {
-  readonly text: string;
+  readonly draft: RequestDraft;
   readonly pending: boolean;
-  readonly setText: (text: string) => void;
   readonly send: () => void;
 }
 
@@ -166,19 +168,26 @@ export function useRequestComposer(
   missionId: MissionId,
   onOpened: (request: OwnerRequest) => void,
 ): RequestComposerState {
-  const [text, setText] = useState("");
+  const draft = useRequestDraft();
   const { pending, run } = useMissionAction();
   const send = () => {
     let opened: OwnerRequest | null = null;
-    void sendChecked(run, "Could not send", openRequestInput(missionId, text), async (input) => {
-      opened = await missionsSource().openRequest(input);
-    }).then((sent) => {
-      if (!sent) return;
-      setText("");
-      if (opened) onOpened(opened);
-    });
+    void draft
+      .send((text, images) =>
+        sendChecked(
+          run,
+          "Could not send",
+          openRequestInput(missionId, text, images),
+          async (input) => {
+            opened = await missionsSource().openRequest(input);
+          },
+        ),
+      )
+      .then((sent) => {
+        if (sent && opened) onOpened(opened);
+      });
   };
-  return { text, pending, setText, send };
+  return { draft, pending: pending || draft.uploading, send };
 }
 
 export interface RequestThreadState {
@@ -186,9 +195,8 @@ export interface RequestThreadState {
   readonly request: OwnerRequest | null | undefined;
   /** True while only the list row is known: the newest few messages, clipped. */
   readonly partial: boolean;
-  readonly text: string;
+  readonly draft: RequestDraft;
   readonly pending: boolean;
-  readonly setText: (text: string) => void;
   readonly reply: () => void;
   readonly settle: () => void;
   readonly reopen: () => void;
@@ -201,7 +209,7 @@ export function useRequestThread(missionId: MissionId, requestId: string): Reque
   // one never waits on a blank screen.
   const row = useOwnerRequests(missionId)?.find((request) => request.id === requestId);
   const request = thread === undefined ? row : thread;
-  const [text, setText] = useState("");
+  const draft = useRequestDraft();
   const { pending, run } = useMissionAction();
 
   const readMark = requestReadMark(request);
@@ -210,27 +218,32 @@ export function useRequestThread(missionId: MissionId, requestId: string): Reque
   }, [readMark]);
 
   const clearOn = (done: boolean) => {
-    if (done) setText("");
+    if (done) draft.clear();
   };
   return {
     request,
     partial: thread === undefined && row !== undefined,
-    text,
-    pending,
-    setText,
+    draft,
+    pending: pending || draft.uploading,
     reply: () => {
-      void sendChecked(run, "Could not send", replyRequestInput(requestId, text), (input) =>
-        missionsSource().replyRequest(input),
-      ).then(clearOn);
+      void draft.send((text, images) =>
+        sendChecked(run, "Could not send", replyRequestInput(requestId, text, images), (input) =>
+          missionsSource().replyRequest(input),
+        ),
+      );
     },
     settle: () => {
+      const note = draft.noteOnly();
+      if (note === null) return;
       void run("Could not settle", () =>
-        missionsSource().settleRequest(settleInput(requestId, text)),
+        missionsSource().settleRequest(settleInput(requestId, note)),
       ).then(clearOn);
     },
     reopen: () => {
+      const note = draft.noteOnly();
+      if (note === null) return;
       void run("Could not reopen", () =>
-        missionsSource().reopenRequest(settleInput(requestId, text)),
+        missionsSource().reopenRequest(settleInput(requestId, note)),
       ).then(clearOn);
     },
   };

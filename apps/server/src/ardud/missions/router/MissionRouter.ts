@@ -112,6 +112,7 @@ import {
   reminderLine,
   reminderRequestId,
 } from "./reminders.ts";
+import { RequestImages, requestImagesRegistry } from "./requestImages.ts";
 import { makeOwnerRequests, readsRequestWords, type RequestCommit } from "./requests.ts";
 import { requestIdOfRoom } from "./requestsModel.ts";
 import { RouterStore, type DeliveryRow, type RecipientRow } from "./RouterStore.ts";
@@ -510,6 +511,7 @@ const make = Effect.gen(function* () {
   const store = yield* MissionStore.MissionStore;
   const rooms = yield* RouterStore;
   const threads = yield* RouterThreads;
+  const images = yield* RequestImages;
   const postLock = yield* Semaphore.make(1);
   const bellLock = yield* Semaphore.make(1);
   // Boot hold (recovery): see holdDoorbells. Read and released under bellLock.
@@ -1041,6 +1043,7 @@ const make = Effect.gen(function* () {
     loadCast,
     post: postChecked,
     afterPost,
+    storeImage: images.store,
   });
 
   const post = (input: PostMessageInput, provenance: MissionProvenance) =>
@@ -2672,4 +2675,7 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(MissionRouter, make);
+/** The router, and the request images port it uses for the views track to fill. */
+export const layer = Layer.effect(MissionRouter, make).pipe(
+  Layer.provideMerge(requestImagesRegistry),
+);

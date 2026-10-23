@@ -5,8 +5,9 @@ import { ScrollView, View } from "react-native";
 import { AppText as Text } from "../../components/ui/AppText";
 import { Conversation } from "./Discussion";
 import { LoadingLine } from "./FeedError";
-import { ActionBar, ActionButton, Chip, EmptyLine, Meta, TextField } from "./parts";
+import { ActionBar, ActionButton, Chip, EmptyLine, Meta } from "./parts";
 import { useRequestThread } from "./recordLogic";
+import { RequestEditor } from "./RequestEditor";
 
 /**
  * One of the owner's requests: the conversation with the master, the reply
@@ -23,7 +24,7 @@ export function RequestReader(props: {
   if (request === undefined) return <LoadingLine />;
   if (request === null) return <EmptyLine label="This request is gone." />;
   const settled = request.status === "settled";
-  const hasText = thread.text.trim().length > 0;
+  const hasText = !thread.draft.empty;
 
   return (
     <View className="flex-1">
@@ -53,13 +54,11 @@ export function RequestReader(props: {
         {thread.partial ? <Meta>Showing the latest messages</Meta> : null}
       </ScrollView>
       <ActionBar bottomInset={props.bottomInset}>
-        <View className="w-full gap-2">
-          <TextField
-            value={thread.text}
-            onChangeText={thread.setText}
+        <View className="w-full">
+          <RequestEditor
+            draft={thread.draft}
             placeholder={settled ? "Why reopen it?" : "Reply to the master"}
-          />
-          <View className="flex-row flex-wrap gap-2">
+          >
             {settled ? (
               <ActionButton
                 label="Reopen"
@@ -83,7 +82,7 @@ export function RequestReader(props: {
                 />
               </>
             )}
-          </View>
+          </RequestEditor>
         </View>
       </ActionBar>
     </View>

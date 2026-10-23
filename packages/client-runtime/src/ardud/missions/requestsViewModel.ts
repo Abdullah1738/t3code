@@ -1,4 +1,12 @@
-import type { MissionId, MissionRecordRef, OwnerCondition } from "@t3tools/contracts";
+import {
+  requestImageMarker,
+  requestPlainText,
+  type MissionId,
+  type MissionRecordRef,
+  type OwnerCondition,
+  type OwnerRequestImage,
+} from "@t3tools/contracts";
+import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
 
 import type {
   OpenRequestInput,
@@ -33,10 +41,62 @@ export function requestTitle(text: string): string {
   return line.length <= REQUEST_TITLE_MAX ? line : `${line.slice(0, REQUEST_TITLE_MAX - 1)}…`;
 }
 
-export function openRequestInput(missionId: MissionId, text: string): Result<OpenRequestInput> {
+/** An image the owner attached in a request composer: its chip's context id and the uploaded attachment. */
+export interface RequestDraftImage {
+  readonly contextId: string;
+  readonly attachmentId: string;
+}
+
+/**
+ * The composer's text as the server takes it: each image chip becomes an
+ * `{imageN}` marker where it sits, numbered in the order the chips appear.
+ * An image without a chip in the text gets its marker at the end.
+ */
+export function requestTextWithImages(
+  text: string,
+  images: ReadonlyArray<RequestDraftImage>,
+): { readonly text: string; readonly images: ReadonlyArray<OwnerRequestImage> } {
+  if (images.length === 0) return { text, images: [] };
+  const byContext = new Map(images.map((image) => [image.contextId, image] as const));
+  const order: Array<RequestDraftImage> = [];
+  const marker = (image: RequestDraftImage) => {
+    const at = order.indexOf(image);
+    if (at >= 0) return requestImageMarker(at + 1);
+    order.push(image);
+    return requestImageMarker(order.length);
+  };
+  const body = replaceComposerContextReferences(text, (occurrence) => {
+    const image = occurrence.image ? byContext.get(occurrence.contextId) : undefined;
+    return image === undefined ? occurrence.source : marker(image);
+  }).trim();
+  const tail = images.filter((image) => !order.includes(image)).map(marker);
+  return {
+    text: [body, tail.join(" ")].filter((part) => part !== "").join("\n\n"),
+    images: order.map((image) => ({
+      _tag: "attachment" as const,
+      attachmentId: image.attachmentId,
+    })),
+  };
+}
+
+function withImages<T extends { readonly text: string }>(
+  base: T,
+  images: ReadonlyArray<RequestDraftImage>,
+): T & { readonly images?: ReadonlyArray<OwnerRequestImage> } {
+  const placed = requestTextWithImages(base.text, images);
+  return placed.images.length === 0
+    ? { ...base, text: placed.text }
+    : { ...base, text: placed.text, images: placed.images };
+}
+
+export function openRequestInput(
+  missionId: MissionId,
+  text: string,
+  images: ReadonlyArray<RequestDraftImage> = [],
+): Result<OpenRequestInput> {
   const trimmed = text.trim();
-  if (trimmed === "") return err("Write what you want first.");
-  return ok({ missionId, text: trimmed });
+  if (trimmed === "" && images.length === 0) return err("Write what you want first.");
+  return ok(withImages({ missionId, text: trimmed }, images));
 }
 
 /**
@@ -47,10 +107,11 @@ export function discussRequestInput(
   missionId: MissionId,
   subject: MissionRecordRef,
   text: string,
+  images: ReadonlyArray<RequestDraftImage> = [],
 ): Result<OpenRequestInput> {
   const trimmed = text.trim();
-  if (trimmed === "") return err("Write what you want to discuss first.");
-  return ok({ missionId, text: trimmed, subject });
+  if (trimmed === "" && images.length === 0) return err("Write what you want to discuss first.");
+  return ok(withImages({ missionId, text: trimmed, subject }, images));
 }
 
 /** The open request about a record, if the owner is already discussing it. */
@@ -76,10 +137,14 @@ export function ownerConditionOf(record: {
   return record.onOwnerCondition ?? null;
 }
 
-export function replyRequestInput(requestId: string, text: string): Result<ReplyRequestInput> {
+export function replyRequestInput(
+  requestId: string,
+  text: string,
+  images: ReadonlyArray<RequestDraftImage> = [],
+): Result<ReplyRequestInput> {
   const trimmed = text.trim();
-  if (trimmed === "") return err("Write a reply first.");
-  return ok({ requestId, text: trimmed });
+  if (trimmed === "" && images.length === 0) return err("Write a reply first.");
+  return ok(withImages({ requestId, text: trimmed }, images));
 }
 
 export function lastMasterReply(
@@ -162,7 +227,11 @@ export function groupRequests(requests: ReadonlyArray<OwnerRequest>): RequestGro
 export function requestPreview(request: Pick<OwnerRequest, "messages">): string {
   const reply = lastMasterReply(request);
   const source = reply ?? request.messages[0];
-  return source?.text.split("\n")[0]?.trim() ?? "";
+  return (
+    requestPlainText(source?.text ?? "")
+      .split("\n")[0]
+      ?.trim() ?? ""
+  );
 }
 
 /**

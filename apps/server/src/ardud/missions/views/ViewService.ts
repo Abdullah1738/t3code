@@ -38,6 +38,7 @@ import {
   type EditViewLayoutInput,
   type Mission,
   type MissionActor,
+  type MissionAssetSource,
   type MissionEventKind,
   type MissionMutationResult,
   type MissionProvenance,
@@ -97,7 +98,13 @@ import { actorOf } from "../core/provenance.ts";
 import * as MissionService from "../MissionService.ts";
 import { ScribeStore } from "../scribe/ScribeStore.ts";
 import * as MissionStore from "../store/MissionStore.ts";
-import { assetFilePath, deleteAssetFile, readAssetSource, writeAssetFile } from "./assets.ts";
+import {
+  assetFilePath,
+  deleteAssetFile,
+  readAssetSource,
+  writeAssetFile,
+  type AssetBytes,
+} from "./assets.ts";
 import { applyLayoutOps, insertInRegion } from "./layoutOps.ts";
 import { sectionData } from "./sectionRows.ts";
 import { SourceService } from "./sources/SourceService.ts";
@@ -142,6 +149,18 @@ export class ViewService extends Context.Service<
     /** Templates and sections (own or copied from another mission) in one change. */
     readonly applyBundle: Write<ApplyViewBundleInput>;
     readonly addAsset: Write<AddMissionAssetInput>;
+    /**
+     * An image in an owner request message, about that request. The same
+     * image already stored for the request is reused.
+     */
+    readonly addRequestImage: (
+      provenance: MissionProvenance,
+      input: {
+        readonly missionId: MissionId;
+        readonly requestId: string;
+        readonly source: MissionAssetSource;
+      },
+    ) => Effect.Effect<{ readonly assetId: string; readonly path: string }, MissionError>;
     readonly removeAsset: Write<RemoveMissionAssetInput>;
     /** An archived mission's images go: records expire and the copies are deleted. */
     readonly expireAssets: (missionId: MissionId) => Effect.Effect<void, MissionError>;
@@ -525,7 +544,11 @@ const make = Effect.gen(function* () {
         pinned,
         changesToday: yield* views.changesSince(mission.id, since),
         sectionData: yield* allSectionData(mission.id, sections, sources),
-        assets: (yield* views.assets(mission.id)).filter((asset) => asset.status === "active"),
+        // Request images are part of the owner's words, which only the owner
+        // and the master read, through the request itself.
+        assets: (yield* views.assets(mission.id)).filter(
+          (asset) => asset.status === "active" && asset.subject?.kind !== "owner-request",
+        ),
         sources: sources.map(sourceListing),
         sourceRuns: yield* runs.runs(mission.id, sources),
       };
@@ -1568,67 +1591,121 @@ const make = Effect.gen(function* () {
     label: asset.name,
   });
 
+  /** The live mission and a caller allowed to add images to it. */
+  const assetCaller = Effect.fn("ViewService.assetCaller")(function* (
+    missionId: MissionId,
+    provenance: MissionProvenance,
+  ) {
+    const mission = yield* requireMission(missionId);
+    if (mission.status === "archived") {
+      return yield* fail("invalid", "This mission is archived.");
+    }
+    const caller = yield* memberCaller(mission.id, provenance);
+    if (caller === null) {
+      return yield* fail("forbidden", "Only the owner and the mission's agents can add images.");
+    }
+    return { mission, caller };
+  });
+
+  const saveAsset = Effect.fn("ViewService.saveAsset")(function* (
+    missionId: MissionId,
+    caller: ViewCaller,
+    read: AssetBytes,
+    subject: MissionRecordRef | null,
+    summary: string = `${who(caller)} added image ${read.name}`,
+  ) {
+    const stored = (yield* views.assets(missionId)).filter((asset) => asset.status === "active");
+    const used = stored.reduce((sum, asset) => sum + asset.sizeBytes, 0);
+    if (used + read.bytes.byteLength > VIEW_ASSET_LIMITS.missionBytes) {
+      return yield* fail("invalid", "This mission's images would pass its 2 GiB limit.");
+    }
+    const now = yield* nowIso;
+    const asset: MissionAsset = {
+      id: `mission-${NodeCrypto.randomUUID()}`,
+      missionId,
+      subject,
+      kind: "image",
+      mimeType: read.mimeType,
+      sizeBytes: read.bytes.byteLength,
+      width: read.width,
+      height: read.height,
+      name: read.name,
+      sha256: read.sha256,
+      addedBy: caller.actor,
+      status: "active",
+      version: 1,
+      createdAt: now,
+      changedAt: now,
+    };
+    const path = assetFilePath(attachmentsDir, asset);
+    yield* writeAssetFile(path, read.bytes);
+    const result = yield* commit({
+      missionId,
+      kind: "view.asset-added",
+      caller,
+      summary,
+      subject: assetRef(asset),
+      payload: {
+        assetId: asset.id,
+        kind: asset.kind,
+        sizeBytes: asset.sizeBytes,
+        ...(subject?.kind === "owner-request" ? {} : { subject: asset.subject }),
+      },
+      writes: [{ write: { scope: "asset", value: asset }, counts: false }],
+    }).pipe(Effect.onError(() => deleteAssetFile(path)));
+    return { asset, path, result };
+  });
+
   const addAsset: Write<AddMissionAssetInput> = (provenance, input) =>
     serial(
       Effect.gen(function* () {
-        const mission = yield* requireMission(input.missionId);
-        if (mission.status === "archived") {
-          return yield* fail("invalid", "This mission is archived.");
-        }
-        const caller = yield* memberCaller(mission.id, provenance);
-        if (caller === null) {
-          return yield* fail(
-            "forbidden",
-            "Only the owner and the mission's agents can add images.",
-          );
-        }
+        const { mission, caller } = yield* assetCaller(input.missionId, provenance);
         const read = yield* readAssetSource({
           attachmentsDir,
           source: input.source,
           provenance,
           name: input.name,
         });
-        const stored = (yield* views.assets(mission.id)).filter(
-          (asset) => asset.status === "active",
-        );
-        const used = stored.reduce((sum, asset) => sum + asset.sizeBytes, 0);
-        if (used + read.bytes.byteLength > VIEW_ASSET_LIMITS.missionBytes) {
-          return yield* fail("invalid", "This mission's images would pass its 2 GiB limit.");
+        const saved = yield* saveAsset(mission.id, caller, read, input.subject ?? null);
+        return saved.result;
+      }),
+    );
+
+  const addRequestImage: ViewService["Service"]["addRequestImage"] = (provenance, input) =>
+    serial(
+      Effect.gen(function* () {
+        const { mission, caller } = yield* assetCaller(input.missionId, provenance);
+        // The app sends uploads; server paths come from the iMessage desk and agents.
+        if (input.source._tag === "file" && provenance._tag === "owner-app") {
+          return yield* fail("invalid", "Attach images from the app as uploads, not server paths.");
         }
-        const now = yield* nowIso;
-        const asset: MissionAsset = {
-          id: `mission-${NodeCrypto.randomUUID()}`,
-          missionId: mission.id,
-          subject: input.subject ?? null,
-          kind: "image",
-          mimeType: read.mimeType,
-          sizeBytes: read.bytes.byteLength,
-          width: read.width,
-          height: read.height,
-          name: read.name,
-          sha256: read.sha256,
-          addedBy: caller.actor,
-          status: "active",
-          version: 1,
-          createdAt: now,
-          changedAt: now,
-        };
-        const path = assetFilePath(attachmentsDir, asset);
-        yield* writeAssetFile(path, read.bytes);
-        return yield* commit({
-          missionId: mission.id,
-          kind: "view.asset-added",
+        // His file names can say as much as his words, so the copy goes unnamed.
+        const read = yield* readAssetSource({
+          attachmentsDir,
+          source: input.source,
+          provenance,
+          name: "Request image",
+        });
+        const subject: MissionRecordRef = { kind: "owner-request", id: input.requestId };
+        // A retried message stores nothing new, so it writes the same text.
+        const same = (yield* views.assets(mission.id)).find(
+          (asset) =>
+            asset.status === "active" &&
+            asset.sha256 === read.sha256 &&
+            asset.subject?.kind === subject.kind &&
+            asset.subject.id === subject.id,
+        );
+        if (same !== undefined) {
+          return { assetId: same.id, path: assetFilePath(attachmentsDir, same) };
+        }
+        const saved = yield* saveAsset(
+          mission.id,
           caller,
-          summary: `${who(caller)} added image ${asset.name}`,
-          subject: assetRef(asset),
-          payload: {
-            assetId: asset.id,
-            kind: asset.kind,
-            sizeBytes: asset.sizeBytes,
-            subject: asset.subject,
-          },
-          writes: [{ write: { scope: "asset", value: asset }, counts: false }],
-        }).pipe(Effect.onError(() => deleteAssetFile(path)));
+          read,
+          subject,
+          `${who(caller)} attached an image to a request`,
+        );
+        return { assetId: saved.asset.id, path: saved.path };
       }),
     );
 
@@ -1951,6 +2028,7 @@ const make = Effect.gen(function* () {
     seedLayout,
     applyBundle,
     addAsset,
+    addRequestImage,
     removeAsset,
     expireAssets,
   });

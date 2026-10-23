@@ -11,14 +11,15 @@ import {
   requestAbout,
   requestPreview,
   type OwnerRequest,
+  type RequestDraftImage,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../components/ui/button";
-import { Textarea } from "../../components/ui/textarea";
 import type { CardAction } from "./cards/CardFrame";
 import { AgeElement, Avatar, DiscussionSymbol } from "./cards/chips";
 import { discussRecord, markRequestRead, replyRequest, settleRequest } from "./missionCommands";
 import { PANEL_CLASS as SECTION_PANEL_CLASS } from "./MissionSection";
+import { AttachImagesButton, RequestEditor, useRequestDraft } from "./RequestEditor";
 import { useOwnerRequest, useOwnerRequests } from "./missionsStore";
 import { SectionCount } from "./sections/SectionShell";
 import { RequestMessage } from "./sections/YourRequests";
@@ -70,7 +71,7 @@ export function useCardDiscussion(
   } else if (open) {
     panel = (
       <DiscussionComposer
-        onSend={(text) => discussRecord(missionId, subject, text)}
+        onSend={(text, images) => discussRecord(missionId, subject, text, images)}
         onClose={() => setOpen(false)}
       />
     );
@@ -130,7 +131,7 @@ function DiscussionThread(props: { request: OwnerRequest; onClose: () => void; n
       </ol>
       <DiscussionComposer
         reply
-        onSend={(text) => replyRequest(request.id, text)}
+        onSend={(text, images) => replyRequest(request.id, text, images)}
         onSettle={(note) => {
           // Settling hides the discussion at once; close first so the card
           // does not flash an empty new-discussion box while it sends.
@@ -146,23 +147,14 @@ function DiscussionThread(props: { request: OwnerRequest; onClose: () => void; n
 function DiscussionComposer(props: {
   /** Replying in an open discussion rather than starting one. */
   reply?: boolean;
-  onSend: (text: string) => Promise<boolean>;
-  /** Settles with the box's text, when any, as the closing note. */
+  onSend: (text: string, images: ReadonlyArray<RequestDraftImage>) => Promise<boolean>;
+  /** Settles with the box's words, when any, as the closing note. */
   onSettle?: (note: string) => Promise<boolean>;
   onClose: () => void;
 }) {
-  const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
-  const run = async (action: () => Promise<boolean>, close: boolean) => {
-    setBusy(true);
-    const sent = await action();
-    setBusy(false);
-    if (!sent) return;
-    setText("");
-    if (close) props.onClose();
-  };
+  const draft = useRequestDraft();
   const send = () => {
-    if (text.trim() !== "") void run(() => props.onSend(text), false);
+    if (!draft.empty && !draft.busy) void draft.send(props.onSend);
   };
   const form = (
     <form
@@ -172,37 +164,34 @@ function DiscussionComposer(props: {
         send();
       }}
     >
-      <Textarea
-        size="sm"
+      <RequestEditor
+        draft={draft}
         autoFocus
-        aria-label={props.reply ? "Reply to the master" : "What to discuss"}
+        label={props.reply ? "Reply to the master" : "What to discuss"}
         placeholder={props.reply ? "Reply" : "What do you want to talk through?"}
-        value={text}
-        onChange={(event) => setText(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-            event.preventDefault();
-            send();
-          }
-        }}
+        onSubmit={send}
       />
       <div className="flex min-w-0 items-center gap-1.5">
-        <Button type="submit" size="sm" variant="secondary" disabled={busy || text.trim() === ""}>
+        <Button type="submit" size="sm" variant="secondary" disabled={draft.busy || draft.empty}>
           <SendIcon aria-hidden />
           {props.reply ? "Reply" : "Send"}
         </Button>
+        <AttachImagesButton draft={draft} disabled={draft.busy} />
         {props.onSettle ? (
           <Button
             type="button"
             size="sm"
             variant="ghost-muted"
-            disabled={busy}
+            disabled={draft.busy}
             onClick={() => {
               const settle = props.onSettle;
-              if (settle) void run(() => settle(text), true);
+              if (!settle) return;
+              void draft.run(settle, true).then((done) => {
+                if (done) props.onClose();
+              });
             }}
           >
-            {text.trim() === "" ? "Settle" : "Settle with note"}
+            {draft.words === "" ? "Settle" : "Settle with note"}
           </Button>
         ) : null}
         <Button type="button" size="sm" variant="ghost-muted" onClick={props.onClose}>

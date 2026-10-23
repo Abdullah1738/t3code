@@ -329,7 +329,8 @@ export function Bubble(props: {
   readonly fromOwner: boolean;
   readonly author: string;
   readonly time: string;
-  readonly text: string;
+  /** Words, or words with inline parts such as image chips. */
+  readonly text: ReactNode;
 }) {
   return (
     <View className={cn("max-w-[86%] gap-1", props.fromOwner ? "self-end" : "self-start")}>

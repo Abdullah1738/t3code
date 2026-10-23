@@ -21,6 +21,7 @@ import type {
   MissionInboxSnapshot,
   MissionOverviewSnapshot,
   MissionRoomEntry,
+  OwnerRequest,
 } from "../source.ts";
 import { createSnapshotStore } from "../store.ts";
 import { foldLaneCounts } from "../viewModel.ts";
@@ -288,6 +289,22 @@ describe("fixture missions source", () => {
     expect(inCheck("call-10211")).toBe(true);
     await source.reactToCall({ callId: "call-10194" as never, reaction: "ok" });
     expect(inCheck("call-10194")).toBe(false);
+  });
+
+  it("shows his images as labels where he put them, with no files behind them", async () => {
+    const source = createFixtureMissionsSource({ now });
+    const image = { _tag: "attachment" as const, attachmentId: "upload-1" };
+    const request = await source.openRequest({
+      missionId: CRPKO,
+      text: "{image2} looks off next to {image1}",
+      images: [image, { ...image, attachmentId: "upload-2" }],
+    });
+    expect(request.messages[0]?.text).toBe("[image 2] looks off next to [image 1]");
+    const thread = latest<OwnerRequest | null>((l) =>
+      source.subscribeRequest({ missionId: CRPKO, requestId: request.id }, l),
+    );
+    await source.replyRequest({ requestId: request.id, text: "", images: [image] });
+    expect(thread.value?.messages.at(-1)?.text).toBe("[image 1]");
   });
 
   it("records who last changed the intended share and locks nothing", async () => {
