@@ -150,6 +150,7 @@ import {
   ArchiveIfIdleBeforeCommit,
   idleBlocker,
   OrchestratorThreadNotIdleError,
+  sessionHoldsWork,
 } from "../ardud/archive-if-idle/idle.ts";
 // ardud missions: guard
 import { countsAsUserTurn } from "../ardud/missions/guard/turns.ts";
@@ -10366,24 +10367,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
         const session = yield* providerSessions.peek(providerThread.providerSessionId);
         if (Option.isNone(session)) return false;
-        const runtime = session.value;
-        // Both thread-scoped probes count, since each leaves out what the
-        // other sees. A session with neither answers for every thread on it.
-        const threadProbes = [
-          runtime.holdsWorkForThread?.(providerThread),
-          runtime.hasPendingBackgroundWorkForThread?.(providerThread),
-        ].filter((probe) => probe !== undefined);
-        const probes =
-          threadProbes.length > 0
-            ? threadProbes
-            : runtime.hasPendingBackgroundWork === undefined
-              ? []
-              : [runtime.hasPendingBackgroundWork];
-        const holding = yield* Effect.findFirst(probes, (probe) =>
-          // A failed probe cannot confirm that the work ended.
-          probe.pipe(Effect.catchCause(() => Effect.succeed(true))),
-        );
-        return Option.isSome(holding);
+        return yield* sessionHoldsWork(session.value, providerThread);
       }),
     );
     const blocker = idleBlocker({
@@ -11720,8 +11704,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .latestSequence({ threadId: command.threadId })
               .pipe(
                 Effect.mapError(
-                  (cause) =>
-                    new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+                  (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
                 ),
               ),
           }

@@ -1,7 +1,9 @@
+import type { OrchestrationV2ProviderThread } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
 
-import { idleBlocker, type IdleInput } from "./idle.ts";
+import { idleBlocker, type IdleInput, sessionHoldsWork } from "./idle.ts";
 
 const now = DateTime.makeUnsafe("2026-10-22T12:00:00.000Z");
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled"]);
@@ -32,7 +34,11 @@ interface Fixture {
     readonly status: string;
     readonly runAttemptId: string | null;
   }>;
-  readonly requests?: ReadonlyArray<{ readonly id: string; readonly kind: string; readonly status: string }>;
+  readonly requests?: ReadonlyArray<{
+    readonly id: string;
+    readonly kind: string;
+    readonly status: string;
+  }>;
   readonly subagents?: ReadonlyArray<{
     readonly id: string;
     readonly status: string;
@@ -69,9 +75,7 @@ const input = (fixture: Fixture = {}): IdleInput => {
   }));
   const attempts = (
     fixture.attempts ??
-    runs
-      .filter((run) => run.status !== "queued")
-      .map((run): AttemptFixture => ({ runId: run.id }))
+    runs.filter((run) => run.status !== "queued").map((run): AttemptFixture => ({ runId: run.id }))
   ).map((attempt) => ({
     id: `attempt-${attempt.runId}`,
     runId: attempt.runId,
@@ -206,9 +210,9 @@ describe("idleBlocker", () => {
     expect(idleBlocker(input(child))?.detail).toBe(
       "Thread thread-idle has provider turn turn-1 running.",
     );
-    expect(reason({ runs: [], turns: [{ id: "turn-1", status: "pending", runAttemptId: null }] })).toBe(
-      "background-work",
-    );
+    expect(
+      reason({ runs: [], turns: [{ id: "turn-1", status: "pending", runAttemptId: null }] }),
+    ).toBe("background-work");
   });
 
   it("refuses a thread still owed a delegated task report", () => {
@@ -233,7 +237,13 @@ describe("idleBlocker", () => {
     expect(reason({ runs: [open(null)], subagents: [task("delivered")] })).toBeNull();
     expect(
       reason({
-        runs: [{ id: "run-1", status: "completed", delegatedCompletion: { disposition: "disposed", delivery: null } }],
+        runs: [
+          {
+            id: "run-1",
+            status: "completed",
+            delegatedCompletion: { disposition: "disposed", delivery: null },
+          },
+        ],
         subagents: [task("pending")],
       }),
     ).toBeNull();
@@ -285,7 +295,10 @@ describe("idleBlocker", () => {
     ).toBe("session-changed");
     expect(reason({ attempts: [], expectedNativeSessionId })).toBe("session-changed");
     expect(
-      reason({ attempts: [{ runId: "run-1", nativeThreadId: "ses_other" }], expectedNativeSessionId }),
+      reason({
+        attempts: [{ runId: "run-1", nativeThreadId: "ses_other" }],
+        expectedNativeSessionId,
+      }),
     ).toBe("session-changed");
     expect(
       reason({
@@ -310,4 +323,64 @@ describe("idleBlocker", () => {
       }),
     ).toBe("archived");
   });
+});
+
+describe("sessionHoldsWork", () => {
+  const providerThread = { id: "provider-thread-1" } as unknown as OrchestrationV2ProviderThread;
+
+  // Work finishing hands off to a continuation: it leaves the running set and
+  // enters the held set as the first probe returns, as a provider can between
+  // two reads.
+  const handingOff = () => {
+    let state: "running" | "handed-off" = "running";
+    const probe = (read: () => boolean) =>
+      Effect.sync(() => {
+        const answer = read();
+        state = "handed-off";
+        return answer;
+      });
+    return {
+      hasPendingBackgroundWorkForThread: () => probe(() => state === "running"),
+      holdsWorkForThread: () => probe(() => state === "handed-off"),
+    };
+  };
+
+  it.effect("sees work that moves from running to a handoff between its probes", () =>
+    Effect.gen(function* () {
+      expect(yield* sessionHoldsWork(handingOff(), providerThread)).toBe(true);
+    }),
+  );
+
+  it.effect("counts a failed probe as held work", () =>
+    Effect.gen(function* () {
+      expect(
+        yield* sessionHoldsWork(
+          {
+            hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+            holdsWorkForThread: () => Effect.die("probe crashed"),
+          },
+          providerThread,
+        ),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("asks the whole session only when it has no thread probes", () =>
+    Effect.gen(function* () {
+      expect(
+        yield* sessionHoldsWork({ hasPendingBackgroundWork: Effect.succeed(true) }, providerThread),
+      ).toBe(true);
+      expect(
+        yield* sessionHoldsWork(
+          {
+            hasPendingBackgroundWork: Effect.succeed(true),
+            hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+            holdsWorkForThread: () => Effect.succeed(false),
+          },
+          providerThread,
+        ),
+      ).toBe(false);
+      expect(yield* sessionHoldsWork({}, providerThread)).toBe(false);
+    }),
+  );
 });

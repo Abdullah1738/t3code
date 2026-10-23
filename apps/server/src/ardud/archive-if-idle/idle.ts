@@ -1,13 +1,16 @@
 import {
   CommandId,
+  type OrchestrationV2ProviderThread,
   type OrchestrationV2ThreadProjection,
   ThreadId,
 } from "@t3tools/contracts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { latestExecutedRun } from "@t3tools/shared/orchestrationV2ThreadError";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import { describeWork, runningBackgroundWork } from "../context-reset/backgroundWork.ts";
@@ -46,6 +49,38 @@ export const ArchiveIfIdleBeforeCommit = Context.Reference<Effect.Effect<void>>(
   "t3/ardud/ArchiveIfIdleBeforeCommit",
   { defaultValue: () => Effect.void },
 );
+
+type SessionProbes = Pick<
+  ProviderAdapter.ProviderAdapterV2SessionRuntime,
+  "hasPendingBackgroundWork" | "hasPendingBackgroundWorkForThread" | "holdsWorkForThread"
+>;
+
+/**
+ * Whether a live session still holds work for the provider thread. Work moves
+ * from the running set into a handoff or wake, never back, so the running set
+ * is read first and the holding probe, which covers both, last. A session with
+ * no thread probes answers for every thread on it.
+ */
+export const sessionHoldsWork = Effect.fn("archiveIfIdle.sessionHoldsWork")(function* (
+  runtime: SessionProbes,
+  providerThread: OrchestrationV2ProviderThread,
+) {
+  const threadProbes = [
+    runtime.hasPendingBackgroundWorkForThread?.(providerThread),
+    runtime.holdsWorkForThread?.(providerThread),
+  ].filter((probe) => probe !== undefined);
+  const probes =
+    threadProbes.length > 0
+      ? threadProbes
+      : runtime.hasPendingBackgroundWork === undefined
+        ? []
+        : [runtime.hasPendingBackgroundWork];
+  const holding = yield* Effect.findFirst(probes, (probe) =>
+    // A failed probe cannot confirm that the work ended.
+    probe.pipe(Effect.catchCause(() => Effect.succeed(true))),
+  );
+  return Option.isSome(holding);
+});
 
 export interface IdleBlocker {
   readonly reason: ThreadNotIdleReason;
