@@ -1926,6 +1926,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         // terminal, otherwise the root terminal can strand child projections.
         const deferredRootTerminals = yield* Ref.make(new Map<string, DeferredCodexRootTerminal>());
         const offeredContinuationItemsByTurn = yield* Ref.make(new Map<string, Set<string>>());
+        // ardud: a settled command leaves the running set before its
+        // continuation is offered; archive-if-idle counts it as held meanwhile.
+        const continuationHandoffs = yield* Ref.make(new Map<string, number>());
+        const countHandoff = (providerThreadId: string, delta: number) =>
+          Ref.update(continuationHandoffs, (current) => {
+            const updated = new Map(current);
+            const next = (current.get(providerThreadId) ?? 0) + delta;
+            if (next > 0) updated.set(providerThreadId, next);
+            else updated.delete(providerThreadId);
+            return updated;
+          });
         const finalAnswerItemIdsByTurn = yield* Ref.make(new Map<string, Set<string>>());
         const completedFinalAnswerTextsByTurn = yield* Ref.make(new Map<string, Set<string>>());
         // Native completion and the interrupt timeout share one finalization
@@ -4890,6 +4901,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (payload.item.type === "commandExecution") {
               // Other tools can retain the context after thread closure.
               if (context.closedCommandItemIds?.has(payload.item.id)) return;
+              if (settled) yield* countHandoff(context.providerThread.id, 1);
               const turnDrained = yield* clearRunningCommandItem(payload.turnId, payload.item.id);
               const artifacts = yield* buildCommandExecutionArtifacts(context, payload.item);
               yield* emitProviderEvent({
@@ -4949,6 +4961,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     });
                   }
                 }
+                yield* countHandoff(context.providerThread.id, -1);
                 if (turnDrained) {
                   yield* releaseSettledTurnIfIdle(payload.turnId);
                 }
@@ -6607,6 +6620,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
             return false;
           }),
+          holdsWorkForThread: (providerThread) =>
+            Ref.get(continuationHandoffs).pipe(
+              Effect.map((current) => current.has(providerThread.id)),
+            ),
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
               Effect.andThen(mcpSessions.read(threadInput.threadId)),

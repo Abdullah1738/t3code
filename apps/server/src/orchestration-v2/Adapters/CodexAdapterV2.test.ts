@@ -2020,6 +2020,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       Effect.void,
     onRequest: (method: string, params: unknown) => Effect.Effect<void> = () => Effect.void,
     readChildMetadata?: Parameters<typeof withCodexReplayChildMetadata>[2],
+    onOffer: (
+      request: ProviderContinuationRequests.ProviderContinuationRequest,
+    ) => Effect.Effect<void> = () => Effect.void,
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2069,9 +2072,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         serverConfig,
         continuationRequests: {
           offer: (request) =>
-            Effect.sync(() => {
-              continuationRequests.push(request);
-            }),
+            onOffer(request).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  continuationRequests.push(request);
+                }),
+              ),
+            ),
         },
       });
       const threadId = ThreadId.make(`thread-${transcript.scenario}`);
@@ -4987,6 +4994,61 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           ),
         ),
       ),
+  );
+
+  it.effect("holds a finished background command until its continuation is offered", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const harness = yield* makeCodexReplayHarness(
+          backgroundExecTranscript,
+          undefined,
+          undefined,
+          undefined,
+          () => Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        );
+        const now = yield* DateTime.now;
+        const holdsWork = () => harness.runtime.holdsWorkForThread!(harness.providerThread);
+
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-bg-handoff"),
+            text: BG_PROMPT,
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+        assert.isFalse(yield* holdsWork());
+
+        yield* TestClock.adjust("30 seconds");
+        yield* Deferred.await(reached);
+        // The command already left the running set, so only the handoff
+        // shows that a continuation is still owed.
+        assert.isFalse(
+          yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
+        );
+        assert.isTrue(yield* holdsWork());
+
+        yield* Deferred.succeed(release, undefined);
+        yield* awaitUntil(
+          () => harness.continuationRequests.length === 1,
+          "continuation request",
+        );
+        let held = true;
+        for (let attempt = 0; attempt < 5000 && held; attempt++) {
+          held = yield* holdsWork();
+          if (held) yield* Effect.yieldNow;
+        }
+        assert.isFalse(held);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
   );
 
   it.effect.each([false, true])(

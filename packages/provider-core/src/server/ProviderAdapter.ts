@@ -568,10 +568,10 @@ export interface ProviderAdapterV2SessionRuntime {
     providerThread: OrchestrationV2ProviderThread,
   ) => Effect.Effect<boolean>;
   /**
-   * ardud: whether the session still holds work for this provider thread, a
-   * buffered wake included. Archive-if-idle asks this before the thread goes;
-   * it is wider than hasPendingBackgroundWorkForThread, so it must not decide
-   * run subscriptions.
+   * ardud: work the session holds for this provider thread that
+   * hasPendingBackgroundWorkForThread leaves out, such as a buffered wake or a
+   * continuation being handed off. Archive-if-idle asks both before the thread
+   * goes; this one must not decide run subscriptions.
    */
   readonly holdsWorkForThread?: (
     providerThread: OrchestrationV2ProviderThread,

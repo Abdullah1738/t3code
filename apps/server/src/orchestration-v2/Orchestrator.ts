@@ -10367,15 +10367,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const session = yield* providerSessions.peek(providerThread.providerSessionId);
         if (Option.isNone(session)) return false;
         const runtime = session.value;
-        // The thread-scoped probes come first; a session that only knows its
-        // own pending work answers for every thread on it.
-        const probe =
-          runtime.holdsWorkForThread?.(providerThread) ??
-          runtime.hasPendingBackgroundWorkForThread?.(providerThread) ??
-          runtime.hasPendingBackgroundWork;
-        if (probe === undefined) return false;
-        // A failed probe cannot confirm that the work ended.
-        return yield* probe.pipe(Effect.catchCause(() => Effect.succeed(true)));
+        // Both thread-scoped probes count, since each leaves out what the
+        // other sees. A session with neither answers for every thread on it.
+        const threadProbes = [
+          runtime.holdsWorkForThread?.(providerThread),
+          runtime.hasPendingBackgroundWorkForThread?.(providerThread),
+        ].filter((probe) => probe !== undefined);
+        const probes =
+          threadProbes.length > 0
+            ? threadProbes
+            : runtime.hasPendingBackgroundWork === undefined
+              ? []
+              : [runtime.hasPendingBackgroundWork];
+        const holding = yield* Effect.findFirst(probes, (probe) =>
+          // A failed probe cannot confirm that the work ended.
+          probe.pipe(Effect.catchCause(() => Effect.succeed(true))),
+        );
+        return Option.isSome(holding);
       }),
     );
     const blocker = idleBlocker({
