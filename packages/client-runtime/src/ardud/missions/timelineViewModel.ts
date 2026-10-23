@@ -71,6 +71,7 @@ const PREFIXES: Record<string, { readonly group: TimelineKindGroup; readonly kic
   mission: { group: "mission", kicker: "Mission" },
   portfolio: { group: "mission", kicker: "Portfolio" },
   editor: { group: "mission", kicker: "Bottom line" },
+  report: { group: "mission", kicker: "Report" },
   field: { group: "mission", kicker: "Field" },
   governor: { group: "mission", kicker: "Governor" },
   import: { group: "mission", kicker: "Import" },
