@@ -396,8 +396,9 @@ body{background:var(--ground);color:var(--ink);min-height:100svh;display:flex;ju
 padding:max(16px,env(safe-area-inset-top)) 16px calc(env(safe-area-inset-bottom) + 72px);-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
 main{width:100%;max-width:420px;align-self:flex-start;background:var(--card);border-radius:28px;overflow:hidden}
 .hero{background:var(--field);color:var(--field-ink);padding:20px 24px 22px}
-.who{display:flex;justify-content:space-between;gap:12px;font-size:17px;font-weight:650;line-height:1.3}
-.who span:last-child{font-size:14px;font-weight:500;color:var(--field-soft);text-align:right;min-width:0;overflow-wrap:anywhere;align-self:center}
+.who{display:flex;flex-wrap:wrap;justify-content:space-between;column-gap:12px;font-size:17px;font-weight:650;line-height:1.3}
+.who span{min-width:0;overflow-wrap:anywhere}
+.who span:last-child{font-size:14px;font-weight:500;color:var(--field-soft);text-align:right;margin-left:auto;align-self:center}
 .kick{font-size:15px;font-weight:500;color:var(--field-soft);margin-top:18px}
 h1{text-wrap:balance;font-size:76px;line-height:1;letter-spacing:-.045em;font-weight:700;margin-top:18px;overflow-wrap:anywhere}
 .kick+h1{margin-top:4px}
