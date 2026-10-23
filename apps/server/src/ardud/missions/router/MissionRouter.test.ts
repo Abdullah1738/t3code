@@ -7,6 +7,7 @@ import {
   RoomId,
   SubMissionId,
   ThreadId,
+  type Knock,
   type MissionProvenance,
   type PostMessageInput,
   type SubMission,
@@ -804,6 +805,65 @@ describe("knocks", () => {
       assert.strictEqual(yield* router.redeliverForwards, 0);
       yield* router.decideKnock({ knockId: outcome.knockId, action: "forward" }, ownerApp);
       assert.strictEqual(forwards().length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the sweep finds a pending forward behind more than a page of delivered ones", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const now = yield* DateTime.now;
+      const at = (seconds: number) => DateTime.formatIso(DateTime.add(now, { seconds }));
+      const forwarded = (id: string, decidedAt: string, status: "pending" | "sent"): Knock => ({
+        id: KnockId.make(id),
+        missionId,
+        fromThreadId: strayThread,
+        fromTitle: "stray",
+        path: "thread-send",
+        summary: "please look",
+        body: "please look",
+        status: "forwarded",
+        forwardedText: null,
+        forwardedTo: null,
+        decidedAt,
+        createdAt: decidedAt,
+        targetThreadId: laneThread,
+        delivery: {
+          status,
+          text: `forward ${id}`,
+          threadIds: [laneThread],
+          asOwner: true,
+          sentAt: status === "sent" ? decidedAt : null,
+        },
+      });
+      // More delivered forwards than one store page, all older than the pending one.
+      const delivered = Array.from({ length: 1001 }, (_, index) =>
+        forwarded(`k-old-${index}`, at(-3600 + index), "sent"),
+      );
+      yield* store.commit({
+        event: {
+          missionId,
+          kind: "knock.decided",
+          actor: { _tag: "system", component: "test" },
+          provenance: { _tag: "system", component: "test" },
+          summary: "seed forwards",
+          subject: null,
+        },
+        upserts: [
+          ...delivered.map((record) => ({ _tag: "knock" as const, record })),
+          { _tag: "knock", record: forwarded("k-pending", at(-60), "pending") },
+        ],
+      });
+
+      assert.strictEqual(yield* router.redeliverForwards, 1);
+      assert.deepStrictEqual(
+        h.sent.filter((each) => each.key.startsWith("knock:")).map((each) => each.text),
+        ["forward k-pending"],
+      );
+      const saved = Option.getOrThrow(yield* store.get("knock", "k-pending"));
+      assert.strictEqual(saved.delivery?.status, "sent");
     }).pipe(Effect.provide(h.layer));
   });
 

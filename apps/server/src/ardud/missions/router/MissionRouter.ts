@@ -1778,9 +1778,10 @@ const make = Effect.gen(function* () {
       status: ["forwarded"],
       updatedSince: DateTime.formatIso(since),
       order: "oldest",
+      deliveryPending: true,
     });
     let delivered = 0;
-    for (const { id } of forwarded.filter((knock) => knock.delivery?.status === "pending")) {
+    for (const { id } of forwarded) {
       const sent = yield* store
         .withItemLock(
           markIdOf({ kind: "knock", id }),

@@ -165,6 +165,10 @@ export interface MissionListFilter {
   readonly updatedSince?: string;
   readonly order?: "newest" | "oldest";
   readonly limit?: number;
+  // --- r22 comments ---
+  /** Only knocks whose forward still waits on delivery, filtered before the limit. */
+  readonly deliveryPending?: boolean;
+  // --- end r22 comments ---
 }
 
 // --- router additions ---
@@ -517,6 +521,9 @@ const make = Effect.gen(function* () {
         ...(filter.status === undefined ? [] : [sql.in("status", filter.status)]),
         ...(filter.ids === undefined ? [] : [sql.in("id", filter.ids)]),
         ...(filter.updatedSince === undefined ? [] : [sql`updated_at > ${filter.updatedSince}`]),
+        ...(filter.deliveryPending === true
+          ? [sql`json_extract(record_json, '$.record.delivery.status') = 'pending'`]
+          : []),
       ];
       const order =
         filter.order === "oldest"
