@@ -163,6 +163,13 @@ export interface ProviderSessionManagerV2Shape {
     ProviderSessionManagerV2Error
   >;
   readonly isLive: (providerSessionId: ProviderSessionId) => Effect.Effect<boolean>;
+  /**
+   * ardud: the live runtime without counting as activity, so nothing is scheduled. Safe inside a
+   * write transaction, where archive-if-idle asks it for work the provider still holds.
+   */
+  readonly peek?: (
+    providerSessionId: ProviderSessionId,
+  ) => Effect.Effect<Option.Option<ProviderAdapter.ProviderAdapterV2SessionRuntime>>;
   readonly close: (
     providerSessionId: ProviderSessionId,
   ) => Effect.Effect<void, ProviderSessionManagerV2Error>;
@@ -2283,6 +2290,12 @@ export const layerWithOptions = (
         isLive: (providerSessionId) =>
           Ref.get(sessions).pipe(
             Effect.map((current) => current.has(sessionKey(providerSessionId))),
+          ),
+        peek: (providerSessionId) =>
+          Ref.get(sessions).pipe(
+            Effect.map((current) =>
+              Option.fromNullishOr(current.get(sessionKey(providerSessionId))?.exposedRuntime),
+            ),
           ),
         get: Effect.fn("ProviderSessionManager.get")(
           function* (providerSessionId) {

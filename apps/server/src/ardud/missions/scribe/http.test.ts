@@ -109,6 +109,23 @@ const handlerWith = (ingested: Array<ScribeBatchInput>, writes: Array<string> = 
                 open: [],
               };
             }),
+          putReport: (provenance, input) =>
+            Effect.sync(() => {
+              writes.push(
+                `put:${provenance._tag === "system" ? provenance.component : provenance._tag}:${input.kind}:${input.coversFrom}:${input.coversTo}:${input.text}`,
+              );
+              return {
+                reportId: `${input.missionId}|${input.kind}|${input.coversTo}`,
+                kind: input.kind,
+                coversFrom: input.coversFrom,
+                coversTo: input.coversTo,
+                revision: 1,
+                author: "scribe" as const,
+                size: input.text.length,
+                saved: true,
+                hides: [],
+              };
+            }),
         }),
       ),
       Layer.provide(
@@ -207,6 +224,42 @@ describe("scribe routes", () => {
         request("/lanes?missionId=mission-crpko", { token: "Bearer operator" }),
       );
       expect(lanes.status).toBe(200);
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("keeps a written report only from the scribe's credential, with an exact window", async () => {
+    const writes: Array<string> = [];
+    const { handler, dispose } = handlerWith([], writes);
+    const written = {
+      missionId: "mission-crpko",
+      kind: "daily",
+      from: "2026-10-20T20:00:00.000Z",
+      to: "2026-10-21T20:00:00.000Z",
+      text: "# Crpko daily",
+      facts: { prs: [] },
+    };
+    try {
+      for (const token of ["Bearer reader", "Bearer operator", "Bearer owner"]) {
+        const response = await handler(request("/reports", { token, body: written }));
+        expect(response.status, token).toBe(403);
+      }
+      const noWindow = await handler(
+        request("/reports", { token: "Bearer scribe", body: { ...written, from: null } }),
+      );
+      expect(noWindow.status).toBe(400);
+      expect(writes).toEqual([]);
+
+      const kept = await handler(request("/reports", { token: "Bearer scribe", body: written }));
+      expect(kept.status).toBe(200);
+      expect(await kept.json()).toMatchObject({
+        ok: true,
+        saved: { reportId: "mission-crpko|daily|2026-10-21T20:00:00.000Z", saved: true },
+      });
+      expect(writes).toEqual([
+        "put:scribe:daily:2026-10-20T20:00:00.000Z:2026-10-21T20:00:00.000Z:# Crpko daily",
+      ]);
     } finally {
       await dispose();
     }

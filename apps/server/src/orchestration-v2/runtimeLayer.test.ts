@@ -58,6 +58,10 @@ import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
+import {
+  ArchiveIfIdleBeforeCommit,
+  OrchestratorThreadNotIdleError,
+} from "../ardud/archive-if-idle/idle.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import { ROLLBACK_FAILED_MESSAGE } from "./CheckpointRollbackService.ts";
 import * as EffectWorker from "./EffectWorker.ts";
@@ -4586,6 +4590,187 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
 
       const afterPromotion = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(afterPromotion.runs.find((run) => run.id === queuedRun.id)?.status, "cancelled");
+    }),
+  );
+
+  it.effect("archives only while idle and leaves a busy thread untouched", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("runtime-layer-archive-if-idle");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        title: "Archive if idle",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: "/tmp/runtime-layer-archive-if-idle",
+      });
+      const send = (index: number) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:message:${index}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:message:${index}`),
+          text: `Message ${index}`,
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: index === 0 ? "start_immediately" : "queue_after_active" },
+        });
+      let attempt = 0;
+      const archiveIfIdle = (expectedNativeSessionId?: string) =>
+        orchestrator.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make(`${threadId}:archive:${attempt++}`),
+          threadId,
+          ifIdle: expectedNativeSessionId === undefined ? {} : { expectedNativeSessionId },
+        });
+      const refusal = (expectedNativeSessionId?: string) =>
+        Effect.gen(function* () {
+          const sequence = yield* orchestrator.getThreadEventSequence(threadId);
+          const error = yield* archiveIfIdle(expectedNativeSessionId).pipe(Effect.flip);
+          assert.instanceOf(error, OrchestratorThreadNotIdleError);
+          assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          assert.isNull(projection.thread.archivedAt);
+          return error.reason;
+        });
+
+      yield* send(0);
+      yield* send(1);
+      const busy = yield* orchestrator.getThreadProjection(threadId);
+      const active = busy.runs.find((run) => run.status === "starting")!;
+      const queued = busy.runs.find((run) => run.status === "queued")!;
+      assert.equal(yield* refusal(), "running");
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(after.runs.find((run) => run.id === queued.id)?.status, "queued");
+
+      const rejected = CommandId.make(`${threadId}:archive:0`);
+      const replay = yield* orchestrator
+        .dispatch({ type: "thread.archive", commandId: rejected, threadId, ifIdle: {} })
+        .pipe(Effect.flip);
+      assert.equal(replay._tag, "OrchestratorCommandPreviouslyRejectedError");
+
+      const complete = (runId: typeof active.id) =>
+        Effect.gen(function* () {
+          const run = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (candidate) => candidate.id === runId,
+          )!;
+          const now = yield* DateTime.now;
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${threadId}:${runId}:done`),
+                type: "run.updated",
+                threadId,
+                runId,
+                occurredAt: now,
+                payload: { ...run, status: "completed", completedAt: now },
+              },
+            ],
+          });
+        });
+      // Ending the active run hands the turn to the queued one, from a
+      // listener that runs on its own fiber.
+      const started = yield* Queue.unbounded<RunId>();
+      const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+      yield* events.stream({ threadId, afterSequence }).pipe(
+        Stream.runForEach((stored) =>
+          stored.event.type === "run.updated" && stored.event.payload.status === "starting"
+            ? Queue.offer(started, stored.event.payload.id)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      yield* complete(active.id);
+      assert.equal(yield* Queue.take(started), queued.id);
+      assert.equal(yield* refusal(), "running");
+
+      yield* complete(queued.id);
+      // Provider requests land without the dispatch lock, so one can land after
+      // the archive is planned; the check inside its commit still sees it.
+      const now = yield* DateTime.now;
+      const request = {
+        id: RuntimeRequestId.make(`${threadId}:request`),
+        nodeId: NodeId.make(`${threadId}:request-node`),
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input" as const,
+        status: "pending" as const,
+        responseCapability: { type: "message" as const },
+        createdAt: now,
+        resolvedAt: null,
+      };
+      const writeRequest = (status: "pending" | "resolved", tag: string = status) =>
+        events
+          .write({
+            events: [
+              {
+                id: EventId.make(`${threadId}:request:${tag}`),
+                type: "runtime-request.updated",
+                threadId,
+                runId: queued.id,
+                occurredAt: now,
+                payload: { ...request, status, resolvedAt: status === "pending" ? null : now },
+              },
+            ],
+          })
+          .pipe(Effect.asVoid, Effect.orDie);
+      const archiveWithGap = (tag: string, gap: Effect.Effect<void>) =>
+        Effect.gen(function* () {
+          const commandId = CommandId.make(`${threadId}:archive:${tag}`);
+          const archive = orchestrator.dispatch({
+            type: "thread.archive",
+            commandId,
+            threadId,
+            ifIdle: {},
+          });
+          const error = yield* archive.pipe(
+            Effect.provideService(ArchiveIfIdleBeforeCommit, gap),
+            Effect.flip,
+          );
+          assert.instanceOf(error, OrchestratorThreadNotIdleError);
+          const replay = yield* archive.pipe(Effect.flip);
+          assert.equal(replay._tag, "OrchestratorCommandPreviouslyRejectedError");
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          assert.isNull(projection.thread.archivedAt);
+          return { reason: error.reason, projection };
+        });
+
+      const asked = yield* archiveWithGap("request", writeRequest("pending"));
+      assert.equal(asked.reason, "pending-request");
+      assert.equal(
+        asked.projection.runtimeRequests.find((candidate) => candidate.id === request.id)?.status,
+        "pending",
+      );
+      yield* writeRequest("resolved");
+
+      // Anything else since planning refuses too, since the planned events
+      // would write over it.
+      const changed = yield* archiveWithGap("changed", writeRequest("resolved", "resolved-again"));
+      assert.equal(changed.reason, "changed");
+      assert.equal(
+        changed.projection.runs.find((run) => run.id === queued.id)?.status,
+        "completed",
+      );
+
+      assert.equal(yield* refusal("ses_not_this_one"), "session-changed");
+
+      yield* archiveIfIdle();
+      const archived = yield* orchestrator.getThreadProjection(threadId);
+      assert.isNotNull(archived.thread.archivedAt);
+      const again = yield* archiveIfIdle().pipe(Effect.flip);
+      assert.instanceOf(again, OrchestratorThreadNotIdleError);
+      assert.equal(again.reason, "archived");
     }),
   );
 

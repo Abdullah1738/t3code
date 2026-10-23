@@ -2624,6 +2624,16 @@ export const OrchestrationV2Command = Schema.Union([
     type: Schema.Literal("thread.archive"),
     commandId: CommandId,
     threadId: ThreadId,
+    /**
+     * ardud: archive only while the thread is idle, decided under the thread's
+     * dispatch lock. With `expectedNativeSessionId`, the active provider
+     * thread must still be on that native session.
+     */
+    ifIdle: Schema.optional(
+      Schema.Struct({
+        expectedNativeSessionId: Schema.optional(TrimmedNonEmptyString),
+      }),
+    ),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.unarchive"),

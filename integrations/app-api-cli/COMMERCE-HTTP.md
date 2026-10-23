@@ -20,7 +20,7 @@ commerce capabilities
 commerce order-status FLOW_UUID
 commerce reconcile-order FLOW_UUID
 commerce recover-payment FLOW_UUID --max-reads 90
-commerce await-payment FLOW_UUID --minutes 4
+commerce await-payment FLOW_UUID --minutes 10
 commerce release-flow FLOW_UUID
 commerce abandon-flow FLOW_UUID
 commerce clear-cart supermall --flow FLOW_UUID
@@ -177,8 +177,25 @@ The full paid Minutes flow — guard, sync, place, encrypted-CVV completion, 3DS
 Telegram wait, paid triple, tracking and watcher — is documented in
 [NOON-MINUTES-E2E.md](NOON-MINUTES-E2E.md).
 
-Plain `reconcile-order` reads the persisted place receipt first, then the exact native
-order and available intent/transaction status. It reports route/method/time and
+Main/Supermall accept `--cvv-from-keychain`. CVV is encrypted in RAM before
+placement; an exact pending order's returned intent is completed at most once.
+Pending/3DS payment triggers an immediate Telegram attention alert:
+`this is ours: approve noon AED X in ENBD X`. Order/payment reads continue for
+at most ten minutes. `commerce await-payment FLOW_UUID --minutes 10` resumes
+status-only after interruption, including tracking registration on success.
+It never submits an unconsumed payment or resends a consumed one. This challenge
+path is fixture-tested, not live-paid validated.
+
+For Main/Supermall, `commerce reconcile-order FLOW_UUID` closes a failed flow
+only when fresh native checkout status, cancelled order-v2 items and refund GET
+evidence agree: the full reserved amount on card 5542, no pending/non-refundable
+balance, exact item IDs, and noon's explicit statement that payment was not
+captured and will not be charged. It records the evidence hash, releases the local
+reservation and preserves consumed order/operation ownership. Bank hold release
+timing remains bank-side. Failure without this evidence keeps the financial fence.
+
+For the other lanes, plain `reconcile-order` reads the persisted place receipt
+first, then the exact native order and available intent/transaction status. It reports route/method/time and
 projected-evidence/reference hashes without exposing private intent material.
 It does not release a reservation or reopen a flow. Failed/zero-total orders and
 status errors do not establish no charge. The current missing interface is an

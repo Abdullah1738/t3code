@@ -158,6 +158,11 @@ export interface EventSinkV2Shape {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
     };
+    /**
+     * ardud: runs inside the write transaction before any event is appended.
+     * A failure rolls the command back and comes out as the write error's cause.
+     */
+    readonly recheck?: Effect.Effect<void, unknown>;
   }) => Effect.Effect<
     {
       readonly receipt: CommandReceiptStore.CommandReceiptV2;
@@ -641,6 +646,7 @@ const layerBase: Layer.Layer<
             const existing = yield* existingCommandResult(input.commandId);
             return { ...existing, committed: false as const, cancelledEffectIds: [] };
           }
+          if (input.recheck !== undefined) yield* input.recheck;
 
           const normalized = yield* normalizeEvents(input.events);
           const storedEvents = yield* eventStore.append({

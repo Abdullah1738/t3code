@@ -197,6 +197,37 @@ describe("transport shim", () => {
     expect(calls).toEqual(["start", "start", "stop"]);
   });
 
+  test("static card chats send interactive:false with the page's preview image", async () => {
+    const cards: unknown[] = [];
+    const line = fakeLine({ sendApp: async (_chat, card) => { cards.push(card); return { handle: "app-s" }; } });
+    const pages: string[] = [];
+    const transport = sbTransport(line, chatKey.dm(moni), store(), undefined, {
+      static: true, previewImage: async url => { pages.push(url); return "https://cdn.example/p.png"; },
+    });
+    await transport.sendApp({ id: "s1", chatGuid: "x", url: "https://example.com/ride", caption: "Ride" });
+    await transport.sendApp({ id: "s2", chatGuid: "x", url: "https://example.com/r2", caption: "Ride", imageUrl: "https://given.example/i.png" });
+    expect(cards).toEqual([
+      { url: "https://example.com/ride", caption: "Ride", interactive: false, imageUrl: "https://cdn.example/p.png" },
+      { url: "https://example.com/r2", caption: "Ride", interactive: false, imageUrl: "https://given.example/i.png" },
+    ]);
+    expect(pages).toEqual(["https://example.com/ride"]);
+
+    const live: unknown[] = [];
+    const liveLine = fakeLine({ sendApp: async (_chat, card) => { live.push(card); return { handle: "app-l" }; } });
+    await sbTransport(liveLine, chatKey.dm(owner), store()).sendApp({ id: "l1", chatGuid: "x", url: "https://example.com/a", caption: "A" });
+    expect(live).toEqual([{ url: "https://example.com/a", caption: "A" }]);
+  });
+
+  test("a static card still goes out when the preview lookup fails", async () => {
+    const cards: unknown[] = [];
+    const line = fakeLine({ sendApp: async (_chat, card) => { cards.push(card); return { handle: "app-f" }; } });
+    const transport = sbTransport(line, chatKey.dm(moni), store(), undefined, {
+      static: true, previewImage: async () => { throw new Error("offline"); },
+    });
+    await transport.sendApp({ id: "f1", chatGuid: "x", url: "https://example.com/x", caption: "X" });
+    expect(cards).toEqual([{ url: "https://example.com/x", caption: "X", interactive: false }]);
+  });
+
   test("typing failures surface as transport errors with the line code", async () => {
     const line = fakeLine({ typing: async () => { throw new LineError("x", "http_503:worker_unavailable", true, false); } });
     const transport = sbTransport(line, chatKey.dm(owner), store());

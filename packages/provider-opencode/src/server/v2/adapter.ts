@@ -278,7 +278,7 @@ interface FinishedCall {
  * the continuation turn T3 opens for it takes them.
  */
 interface Wake {
-  readonly messageId: MessageId | undefined;
+  messageId: MessageId | undefined;
   readonly events: Array<OpenCode2Client.OpenCode2StreamEvent>;
   running: boolean;
   readonly reports: Array<BackgroundWorkReport>;
@@ -2238,31 +2238,37 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       }
     });
 
-    const takeReports = Effect.fnUntraced(function* (state: ThreadState) {
+    const drainReports = (state: ThreadState) => {
       const delivered = [...state.reports.values()];
       state.reports.clear();
       const stopped =
         delivered.length > 0 &&
         delivered.every((entry) => state.stoppedChildren.has(entry.childId));
       for (const entry of delivered) state.stoppedChildren.delete(entry.childId);
-      if (stopped) {
-        markUnsettled(state);
-        yield* client.session
-          .interrupt({ sessionID: Session.ID.make(state.sessionId) })
-          .pipe(Effect.timeout(INTERRUPT_TIMEOUT), Effect.ignore({ log: true }));
-      }
       return { delivered, stopped };
+    };
+
+    const interruptStopped = Effect.fnUntraced(function* (state: ThreadState) {
+      markUnsettled(state);
+      yield* client.session
+        .interrupt({ sessionID: Session.ID.make(state.sessionId) })
+        .pipe(Effect.timeout(INTERRUPT_TIMEOUT), Effect.ignore({ log: true }));
+    });
+
+    const takeReports = Effect.fnUntraced(function* (state: ThreadState) {
+      const taken = drainReports(state);
+      if (taken.stopped) yield* interruptStopped(state);
+      return taken;
     });
 
     const onWake = Effect.fnUntraced(function* (state: ThreadState) {
-      const { delivered, stopped } = yield* takeReports(state);
-      if (stopped) return;
-      const route = state.providerThread.appThreadId;
+      const { delivered, stopped } = drainReports(state);
+      if (stopped) return yield* interruptStopped(state);
+      // The wake goes on the thread before anything can yield, so the thread
+      // never reads as idle between OpenCode starting this turn on its own and
+      // the continuation being asked for. Its message id comes after.
       const wake: Wake = {
-        messageId:
-          route === null
-            ? undefined
-            : yield* idAllocator.allocate.message({ threadId: route, ordinal: 0 }),
+        messageId: undefined,
         events: [],
         running: true,
         reports: delivered.map((entry) => entry.report),
@@ -2273,6 +2279,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         children: new Set(),
       };
       state.wakes.push(wake);
+      const route = state.providerThread.appThreadId;
+      if (route !== null) {
+        wake.messageId = yield* idAllocator.allocate.message({ threadId: route, ordinal: 0 });
+      }
       yield* Effect.logInfo("OpenCode started a turn on its own; asking for a continuation.", {
         providerThreadId: state.providerThread.id,
       });

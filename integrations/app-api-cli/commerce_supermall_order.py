@@ -43,6 +43,7 @@ import noon_marketplace_checkout as market
 import order_watch_receipt
 import noon_minutes_checkout as seam
 from noon_auth_lifecycle import NoonAuthLifecycle
+from commerce_marketplace_payment import MarketplacePayment
 
 WATCH_BIN = str(Path.home() / '.local/bin/order-watch')
 WATCH_ORDERS = Path.home() / '.local/state/order-tracker/orders'
@@ -217,8 +218,10 @@ def _promise_eta(value):
     return moment.isoformat()
 
 
-class SupermallOrderFlow:
+class SupermallOrderFlow(MarketplacePayment):
     """One owned supermall (rocket) order following the captured contract."""
+
+    vertical = 'supermall'
 
     def __init__(self, *, sku_config=None, quantity=None, items=None, auth=None,
                  request=market.native_request):
@@ -272,15 +275,16 @@ class SupermallOrderFlow:
                                           flow_id=self.flow_id if self.opened else None)
         if self.expected is None or metadata != {
                 'service': 'main', 'operation': self.expected[0],
-                'request_digest': self.expected[1], 'order_id': None}:
+                'request_digest': self.expected[1],
+                'order_id': self.order if self.expected[0] == 'payment_complete' else None}:
             _fail('SUPERMALL_REQUEST_NOT_BOUND')
         operation = self.expected[0]
-        kinds = {'add_rocket': 'cart', 'session': 'quote', 'place': 'place'}
+        kinds = {'add_rocket': 'cart', 'session': 'quote', 'place': 'place', 'payment_complete': 'payment'}
         kind = kinds.get(operation)
         if kind is None:
             _fail('SUPERMALL_OPERATION_UNMAPPED')
-        financial = kind == 'place'
-        if financial and (self.review is None or time.time() - self.review['observed_at'] > 60):
+        financial = kind in ('place', 'payment')
+        if financial and (self.review is None or kind == 'place' and time.time() - self.review['observed_at'] > 60):
             _fail('SUPERMALL_FRESH_REVIEW_REQUIRED')
         if not self.opened:
             journal.open_flow(flow_id=self.flow_id, app='noon', vertical='supermall',
@@ -305,16 +309,17 @@ class SupermallOrderFlow:
         result = journal.consume(self.flow_id, name, kind=kind,
                                  request_hash=metadata['request_digest'], cart_hash=self.cart_hash,
                                  review_hash=self.review['digest'] if financial else None,
-                                 payable_minor=self.review['payable_minor'] if financial else None)
+                                 payable_minor=self.review['payable_minor'] if financial else None,
+                                 payment_order_id=self.order if kind == 'payment' else None)
         self.expected = None
         return result
 
     def _receipt(self, record):
         if record['service'] != 'main':
             _fail('SUPERMALL_RECEIPT_SCOPE_MISMATCH')
-        if record['operation'] == 'place':
+        if record['operation'] in ('place', 'payment_complete'):
             self.receipt_store.append(receipts.Receipt(
-                operation='place',
+                operation='place' if record['operation'] == 'place' else 'payment',
                 state='SUBMISSION_UNKNOWN' if record['outcome'] == 'UNKNOWN' else record['outcome'],
                 http_status=record['http_status'], order_id=record['order_id'], currency='AED',
                 payable_minor=self.review['payable_minor'], review_sha256=self.review['digest']))
@@ -325,7 +330,7 @@ class SupermallOrderFlow:
     def _cookies(self, operation, values, *, response_url, http_status, outcome_journaled):
         record = (self.snapshot, tuple(values), response_url, http_status)
         self.pending_cookies.append(record)
-        if operation not in ('cart', 'order_status', 'order_detail', 'payment_config',
+        if operation not in ('cart', 'order_status', 'order_detail', 'order_refund', 'payment_config',
                              'payment_status') and not outcome_journaled:
             return True
         self.auth.retain_response_cookies('supermall', record[0], record[1],
@@ -620,44 +625,6 @@ class SupermallOrderFlow:
                                   timeout=timeout)
         self.order = result.summary()['order']
         return {'order': self.order}
-
-    def await_success(self, *, attempts=60, sleep=time.sleep, timeout=25):
-        """Poll order-status until success+shipments; paymentError is failure."""
-        if self.order is None:
-            _fail('SUPERMALL_ORDER_REQUIRED')
-        import re as _re
-        expected_total = f"{self.review['payable_minor'] / 100:.2f}"
-        last = None
-        for attempt in range(attempts):
-            response = self.client.call('order_status', order=self.order, timeout=timeout)
-            data = response.data
-            if not isinstance(data, dict):
-                _fail('SUPERMALL_STATUS_SCHEMA_CHANGED')
-            status, message = data.get('status'), data.get('statusMessage')
-            if (status, message) != last:
-                last = (status, message)
-                print(json.dumps({'phase': 'order_status_poll', 'order': self.order,
-                                  'status': status, 'message': message}), flush=True)
-            if data.get('paymentError') or data.get('paymentErrorMsg'):
-                _fail('SUPERMALL_PAYMENT_ERROR_NO_RETRY')
-            if status == 'success':
-                shipments = data.get('shipments')
-                total = data.get('total')
-                if (not isinstance(shipments, list) or not shipments
-                        or not isinstance(total, str)
-                        or not _re.fullmatch(PAID_TOTAL_RE, total) or total != expected_total):
-                    _fail('SUPERMALL_SUCCESS_READBACK_MISMATCH')
-                return {'paid': True, 'status': status, 'total': total,
-                        'signal': 'success_with_shipments'}
-            sleep(2)
-        _fail('SUPERMALL_PAYMENT_WINDOW_ELAPSED_NO_RETRY')
-
-    def confirm_paid(self):
-        journal.observe(self.flow_id, 'place', outcome='PAYMENT_REPORTED_SUCCESS',
-                        evidence_hash=journal.digest({'order': self.order,
-                                                      'signal': 'success_with_shipments'}),
-                        order_id=self.order)
-        return {'paid': True}
 
     def exact_tracking(self, *, attempts=10, sleep=time.sleep, timeout=25):
         """Exact order-v2 manifest read; empty groups repopulate asynchronously."""

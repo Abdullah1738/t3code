@@ -10,6 +10,7 @@ import {
   OpenAskInput,
   PoolHold,
   RuleChangeRequest,
+  UpdateMissionInput,
 } from "./missions.ts";
 
 const decodeAsk = Schema.decodeSync(Ask);
@@ -20,6 +21,7 @@ const decodeStreamItem = Schema.decodeSync(MissionStreamItem);
 const decodeDraft = Schema.decodeUnknownSync(Draft);
 const encodeDraft = Schema.encodeSync(Draft);
 const decodeRuleChange = Schema.decodeUnknownSync(RuleChangeRequest);
+const decodeUpdateMission = Schema.decodeUnknownSync(UpdateMissionInput);
 
 describe("missions contracts", () => {
   it("only app-typed and verified iMessage provenance counts as the owner", () => {
@@ -142,6 +144,20 @@ describe("missions contracts", () => {
     expect("forkId" in request).toBe(false);
   });
   // --- end asks additions ---
+
+  // --- scribe additions ---
+  it("a mission's report day boundary must be a real time zone", () => {
+    const update = decodeUpdateMission({
+      missionId: "m",
+      reports: { dayBoundary: "Asia/Dubai" },
+    });
+    expect(update.reports).toEqual({ dayBoundary: "Asia/Dubai" });
+    expect(decodeUpdateMission({ missionId: "m", reports: {} }).reports).toEqual({});
+    expect(() =>
+      decodeUpdateMission({ missionId: "m", reports: { dayBoundary: "Mars/Olympus" } }),
+    ).toThrow(/Unknown time zone/);
+  });
+  // --- end scribe additions ---
 
   it("stream deltas carry records by kind", () => {
     const item = decodeStreamItem({

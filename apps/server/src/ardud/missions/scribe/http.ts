@@ -13,7 +13,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
 import { componentProvenance } from "../core/provenance.ts";
-import { type ScribeError, ScribeService } from "./ScribeService.ts";
+import { SCRIBE_PROVENANCE, type ScribeError, ScribeService } from "./ScribeService.ts";
 
 /** Routes the scribe runner calls, under the missions HTTP prefix. */
 export const SCRIBE_ROUTE_PREFIX = "/api/ardud/missions/scribe";
@@ -110,12 +110,22 @@ const EditorBody = Schema.Struct({
   usage: Usage,
 });
 
+const ReportOpenItem = Schema.Struct({
+  ref: Schema.String,
+  label: Schema.String,
+  since: Schema.String,
+});
+
 const ReportBody = Schema.Struct({
   missionId: Schema.String,
   kind: Schema.Literals(["update", "daily"]),
   from: Schema.optional(Schema.NullOr(Schema.String)),
   to: Schema.optional(Schema.NullOr(Schema.String)),
   save: Schema.optional(Schema.Boolean),
+  /** A report the writer already wrote: kept as is for `from` to `to`. */
+  text: Schema.optional(Schema.NullOr(Schema.String)),
+  open: Schema.optional(Schema.NullOr(Schema.Array(ReportOpenItem))),
+  facts: Schema.optional(Schema.Unknown),
 });
 
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
@@ -267,6 +277,25 @@ const makeRoutes = Effect.gen(function* () {
 
   const postReport = Effect.gen(function* () {
     const body = yield* decodeBody(decodeReport);
+    if (body.text !== undefined && body.text !== null) {
+      // A written report is kept as is, so it needs an exact window.
+      yield* authenticateScribe;
+      if (!body.from || !body.to) {
+        return yield* fail("invalid_request", "A report with text needs from and to.");
+      }
+      const saved = yield* call(
+        scribe.putReport(SCRIBE_PROVENANCE, {
+          missionId: body.missionId,
+          kind: body.kind,
+          coversFrom: body.from,
+          coversTo: body.to,
+          text: body.text,
+          open: body.open ?? undefined,
+          facts: body.facts,
+        }),
+      );
+      return json({ ok: true, saved });
+    }
     // Building is a read; keeping the report for the next close-out is a write.
     if (body.save === true) {
       yield* authenticateScribe;

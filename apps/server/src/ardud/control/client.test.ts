@@ -99,6 +99,45 @@ describe("ControlClient", () => {
     await expect(bad.projects()).rejects.toBeInstanceOf(ControlApiError);
   });
 
+  it("returns an archive-if-idle refusal instead of throwing it", async () => {
+    const bodies: Array<unknown> = [];
+    const url = await listen((request, response) => {
+      let text = "";
+      request.on("data", (chunk) => (text += chunk));
+      request.on("end", () => {
+        bodies.push(JSON.parse(text));
+        response.setHeader("content-type", "application/json");
+        if (request.url!.includes("thread-busy")) {
+          response.statusCode = 409;
+          response.end(
+            JSON.stringify({
+              ok: false,
+              archived: false,
+              error: { code: "not_idle", reason: "queued", message: "busy" },
+            }),
+          );
+          return;
+        }
+        if (request.url!.includes("thread-gone")) {
+          response.statusCode = 404;
+          response.end(JSON.stringify({ ok: false, error: { code: "not_found", message: "no" } }));
+          return;
+        }
+        response.end(JSON.stringify({ ok: true, archived: true, thread: {} }));
+      });
+    });
+    const client = new ControlClient({ url, token: "t0k" });
+    expect(await client.archiveIfIdle("thread-idle", { expectedSession: "ses_1" })).toMatchObject({
+      archived: true,
+    });
+    expect(await client.archiveIfIdle("thread-busy")).toMatchObject({
+      archived: false,
+      error: { code: "not_idle", reason: "queued" },
+    });
+    await expect(client.archiveIfIdle("thread-gone")).rejects.toBeInstanceOf(ControlApiError);
+    expect(bodies).toEqual([{ expectedSession: "ses_1" }, {}, {}]);
+  });
+
   it("parses SSE frames and resumes with Last-Event-ID", async () => {
     const seen: Array<string | undefined> = [];
     const url = await listen((request, response) => {

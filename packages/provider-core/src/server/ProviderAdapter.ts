@@ -568,6 +568,17 @@ export interface ProviderAdapterV2SessionRuntime {
     providerThread: OrchestrationV2ProviderThread,
   ) => Effect.Effect<boolean>;
   /**
+   * ardud: all work the session holds for this provider thread, including what
+   * hasPendingBackgroundWorkForThread leaves out, such as a buffered wake or a
+   * continuation being handed off. Answer from one synchronous read so work
+   * moving between those states is never missed. Archive-if-idle asks
+   * hasPendingBackgroundWorkForThread first and then this; this one must not
+   * decide run subscriptions.
+   */
+  readonly holdsWorkForThread?: (
+    providerThread: OrchestrationV2ProviderThread,
+  ) => Effect.Effect<boolean>;
+  /**
    * Set when every background task this session lists on its provider threads
    * runs inside the session's own process and ends when it closes. Leave unset
    * when a task can outlive the session, for example on a shared server, so its

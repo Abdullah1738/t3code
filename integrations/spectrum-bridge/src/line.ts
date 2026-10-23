@@ -60,6 +60,8 @@ export type LineAppCard = {
   imageUrl?: string;
   /** Shown where the card can't render. */
   fallbackText?: string;
+  /** false: Messages draws the static template bubble instead of asking the extension for a live view. */
+  interactive?: boolean;
 };
 
 export type LineOutbound = { handle: string; chat: ChatKey; text: string; mediaUrl?: string; sentAt: number; status: string };

@@ -24,6 +24,79 @@ def tearDownModule():
     _card_state.cleanup()
 
 
+class MarketplacePaymentCLITests(unittest.TestCase):
+    def test_both_lanes_prepare_cvv_before_single_place_and_wait(self):
+        from unittest.mock import Mock
+        for lane, target in (('main','commerce_main_order.MainOrderFlow'),
+                             ('supermall','commerce_supermall_order.SupermallOrderFlow')):
+            with self.subTest(lane=lane):
+                flow = Mock()
+                flow.flow_id, flow.order = 'fixture-flow', 'NAEFIxture'
+                flow.review = {'payable_minor': 1980}
+                flow.prepare_only.return_value = {'flow_id': flow.flow_id, 'prepared_only': True,
+                    'review': {}, 'readback': {'verified': True}}
+                flow.place.return_value = {'order': flow.order}
+                flow.await_success.return_value = {'paid': True}
+                flow.verify_tracking.return_value = {'status': 'placed'}
+                flow.register_tracker.return_value = {'watcher': 'fixture-watcher', 'registered': True}
+                with patch(target,return_value=flow), patch.object(c,'CommerceAuth'), \
+                     patch.object(c,'cvv_from_keychain',return_value=b'123') as cvv, \
+                     patch.object(c.journal,'complete') as complete, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(c.main(['order',lane,'--sku-config','Z1','--cvv-from-keychain']),0)
+                cvv.assert_called_once()
+                flow.prepare_payment.assert_called_once_with(cvv=b'123')
+                flow.place.assert_called_once()
+                flow.await_success.assert_called_once()
+                names = [call[0] for call in flow.mock_calls]
+                self.assertLess(names.index('prepare_payment'), names.index('place'))
+                self.assertLess(names.index('await_success'), names.index('register_tracker'))
+                complete.assert_called_once_with(flow.flow_id)
+
+    def test_marketplace_await_routes_readonly_resume_then_tracker(self):
+        from unittest.mock import Mock
+        for lane, target in (('main','commerce_main_order.MainOrderFlow'),
+                             ('supermall','commerce_supermall_order.SupermallOrderFlow')):
+            with self.subTest(lane=lane), patch(target) as cls, \
+                 patch.object(c.journal,'binding',return_value={'app':'noon','vertical':lane}), \
+                 patch.object(c.journal,'payment_reported',return_value=False), \
+                 patch.object(c.journal,'complete') as complete, \
+                 patch.object(c,'cvv_from_keychain',side_effect=AssertionError('no CVV in recovery')), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                flow=cls.resume_payment.return_value
+                flow.order='NAE123'
+                flow.await_success.return_value={'paid':True}
+                flow.verify_tracking.return_value={'status':'placed'}
+                flow.register_tracker.return_value={'watcher':'fixture-watcher'}
+                self.assertEqual(c.main(['await-payment','fixture-flow','--no-notify']),0)
+                cls.resume_payment.assert_called_once_with('fixture-flow')
+                flow.await_success.assert_called_once_with(wait_seconds=600,notify=None)
+                flow.place.assert_not_called()
+                complete.assert_called_once_with('fixture-flow')
+
+    def test_already_paid_marketplace_resume_does_not_need_checkout_record(self):
+        from unittest.mock import Mock
+        from noon_marketplace_checkout import MarketplaceError
+        for lane, target in (('main','commerce_main_order.MainOrderFlow'),
+                             ('supermall','commerce_supermall_order.SupermallOrderFlow')):
+            with self.subTest(lane=lane), patch(target) as cls, \
+                 patch.object(c.journal,'binding',return_value={'app':'noon','vertical':lane}), \
+                 patch.object(c.journal,'payment_reported',return_value=True), \
+                 patch.object(c.journal,'inspect',return_value={'state':'ACTIVE'}), \
+                 patch.object(c.journal,'complete') as complete, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                flow=cls.resume_payment.return_value
+                flow.order='NAE123'
+                flow.await_success.side_effect=MarketplaceError('CHECKOUT_ORDER_NOT_FOUND')
+                flow.verify_tracking.return_value={'status':'placed'}
+                flow.register_tracker.return_value={'watcher':'fixture-watcher'}
+                self.assertEqual(c.main(['await-payment','fixture-flow']),0)
+                flow.await_success.assert_not_called()
+                flow.verify_tracking.assert_called_once()
+                flow.register_tracker.assert_called_once()
+                complete.assert_called_once_with('fixture-flow')
+
+
 class RecoveryTests(unittest.TestCase):
     def test_capabilities_are_explicit_and_auth_failure_sets_exit_status(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -236,6 +309,7 @@ class MinutesOrderTests(unittest.TestCase):
     def test_await_payment_dispatches_resume_path(self):
         import commerce_minutes as cm
         with patch.object(cm,'MinutesFlow') as flow, \
+                patch.object(c.journal,'binding',return_value={'app':'noon','vertical':'minutes'}), \
                 patch.object(cm,'telegram_3ds_notify',return_value={'notified':True}) as notify, \
                 contextlib.redirect_stdout(io.StringIO()):
             flow.resume_payment.return_value.review={'order':'IAEGA123'}
@@ -300,6 +374,7 @@ class MinutesOrderTests(unittest.TestCase):
         paid={'paid':True,'payment_status':'payment_confirmed','transaction_status':'CAPTURED',
               'polls':0,'timed_out':False,'already_observed':True}
         with patch.object(cm,'MinutesFlow') as flow_cls, \
+                patch.object(c.journal,'binding',return_value={'app':'noon','vertical':'minutes'}), \
                 patch.object(c.journal,'payment_reported',return_value=True) as reported, \
                 patch.object(c.journal,'complete',return_value={'state':'COMPLETE'}) as complete, \
                 patch.object(cm,'telegram_3ds_notify') as notify, \

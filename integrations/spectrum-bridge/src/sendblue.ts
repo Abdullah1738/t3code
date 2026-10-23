@@ -406,6 +406,7 @@ export class Sendblue implements Line {
     const appCard: Json = { ...this.#cardApp, url: card.url, layout };
     const fallbackText = card.fallbackText ? cardSafeText(card.fallbackText) : "";
     if (fallbackText) appCard.fallbackText = fallbackText;
+    if (card.interactive !== undefined) appCard.interactive = card.interactive;
     const response = await this.#call("POST", "/api/send-message", {
       json: { number: chatKey.target(chat), from_number: this.number, app_card: appCard },
       send: true,

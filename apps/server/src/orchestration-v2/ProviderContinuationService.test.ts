@@ -94,10 +94,26 @@ const makeGuard = Effect.fnUntraced(function* (completed?: Deferred.Deferred<voi
 function layerTest(input: {
   readonly dispatched: Queue.Queue<unknown>;
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
+  /** Holds every dispatch, once recorded, until it is opened. */
+  readonly dispatchGate?: Deferred.Deferred<void>;
+  /** How many of the first dispatches fail once recorded. */
+  readonly failingDispatches?: number;
 }) {
+  let failures = input.failingDispatches ?? 0;
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     getThreadRecords: input.getThreadRecords,
-    dispatch: (command) => Queue.offer(input.dispatched, command).pipe(Effect.as({} as never)),
+    dispatch: (command) =>
+      Queue.offer(input.dispatched, command).pipe(
+        Effect.andThen(
+          input.dispatchGate === undefined ? Effect.void : Deferred.await(input.dispatchGate),
+        ),
+        Effect.andThen(
+          Effect.suspend(() =>
+            failures-- > 0 ? Effect.fail(new Error("dispatch failed") as never) : Effect.void,
+          ),
+        ),
+        Effect.as({} as never),
+      ),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
     Layer.provide(
@@ -151,6 +167,62 @@ describe("ProviderContinuationService", () => {
       }).pipe(
         Effect.provide(
           layerTest({ dispatched, getThreadRecords: () => Effect.succeed(recovered) }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("keeps a request pending until its dispatch is done", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const dispatchGate = yield* Deferred.make<void>();
+      const otherThreadId = ThreadId.make("thread-provider-continuation-other");
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer(request());
+        yield* Queue.take(dispatched);
+        assert.isTrue(yield* requests.pending!(threadId));
+        yield* Deferred.succeed(dispatchGate, undefined);
+        // The worker handles one request at a time, so the next dispatch
+        // starts only after the first one was settled.
+        yield* requests.offer({ ...request(), threadId: otherThreadId });
+        yield* Queue.take(dispatched);
+        assert.isFalse(yield* requests.pending!(threadId));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            dispatchGate,
+            getThreadRecords: () => Effect.succeed(projection),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("settles a request whose dispatch failed", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const otherThreadId = ThreadId.make("thread-provider-continuation-other");
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer(request());
+        yield* Queue.take(dispatched);
+        // The worker handles one request at a time, so once the next one is
+        // dispatched the failed one has been settled. A wake it still owes
+        // stays with the adapter that holds it.
+        yield* requests.offer({ ...request(), threadId: otherThreadId });
+        yield* Queue.take(dispatched);
+        assert.isFalse(yield* requests.pending!(threadId));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            failingDispatches: 1,
+            getThreadRecords: () => Effect.succeed(projection),
+          }),
         ),
         Effect.scoped,
       );

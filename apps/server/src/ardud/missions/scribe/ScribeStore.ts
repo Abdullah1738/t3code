@@ -65,10 +65,20 @@ const DDL = [
     covers_to TEXT NOT NULL,
     open_json TEXT NOT NULL,
     text TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    author TEXT NOT NULL DEFAULT 'scribe',
+    revision INTEGER NOT NULL DEFAULT 1,
+    facts_json TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS ardud_mission_scribe_report_kind
     ON ardud_mission_scribe_report (mission_id, kind, covers_to)`,
+] as const;
+
+/** Report columns added after the table first shipped; older databases get them by ALTER. */
+const REPORT_COLUMNS = [
+  ["author", "TEXT NOT NULL DEFAULT 'scribe'"],
+  ["revision", "INTEGER NOT NULL DEFAULT 1"],
+  ["facts_json", "TEXT"],
 ] as const;
 
 export class ScribeStoreError extends Schema.TaggedError<ScribeStoreError>()("ScribeStoreError", {
@@ -102,6 +112,14 @@ export interface CandidateRecord {
   readonly updatedAt: string;
 }
 
+/** Who wrote a saved report. */
+export type ReportAuthor = "scribe" | "master" | "owner";
+
+/**
+ * A saved report. Saving again for the same mission, kind and `coversTo` adds a
+ * revision and keeps the old text; only the newest revision is current. A daily
+ * is also hidden once a daily saved after it overlaps its window.
+ */
 export interface ReportRecord {
   readonly reportId: string;
   readonly missionId: string;
@@ -112,7 +130,27 @@ export interface ReportRecord {
   readonly open: ReadonlyArray<OpenItem>;
   readonly text: string;
   readonly createdAt: string;
+  readonly author: ReportAuthor;
+  /** 1 for the first save of a window, then counting up. */
+  readonly revision: number;
+  /** The facts the text was written from, when the writer kept them. */
+  readonly facts: unknown;
 }
+
+/** A report to store; author, revision and facts default to scribe, 1 and none. */
+export type ReportWrite = Omit<ReportRecord, "author" | "revision" | "facts"> &
+  Partial<Pick<ReportRecord, "author" | "revision" | "facts">>;
+
+/** The id of a report revision: the first keeps the original `mission|kind|to` form. */
+export const reportIdOf = (
+  missionId: string,
+  kind: ReportKind,
+  coversTo: string,
+  revision: number,
+): string =>
+  revision <= 1
+    ? `${missionId}|${kind}|${coversTo}`
+    : `${missionId}|${kind}|${coversTo}|r${revision}`;
 
 /** A saved report without its text: the opening lines and the length stand in. */
 export interface ReportSummary {
@@ -121,6 +159,8 @@ export interface ReportSummary {
   readonly coversFrom: string;
   readonly coversTo: string;
   readonly createdAt: string;
+  readonly author: ReportAuthor;
+  readonly revision: number;
   /** Characters in the whole text. */
   readonly size: number;
   /** The first `REPORT_HEAD_CHARS` characters, enough for the heading. */
@@ -171,6 +211,9 @@ interface ReportRow {
   readonly open_json: string;
   readonly text: string;
   readonly created_at: string;
+  readonly author: string;
+  readonly revision: number;
+  readonly facts_json: string | null;
 }
 
 const JsonText = Schema.fromJsonString(Schema.Unknown);
@@ -206,6 +249,9 @@ const batchFromRow = (row: BatchRow): BatchRecord => ({
   createdAt: row.created_at,
 });
 
+const reportAuthor = (author: string): ReportAuthor =>
+  author === "master" || author === "owner" ? author : "scribe";
+
 const reportFromRow = (row: ReportRow): ReportRecord => ({
   reportId: row.report_id,
   missionId: row.mission_id,
@@ -215,6 +261,9 @@ const reportFromRow = (row: ReportRow): ReportRecord => ({
   open: parse<ReadonlyArray<OpenItem>>(row.open_json, []),
   text: row.text,
   createdAt: row.created_at,
+  author: reportAuthor(row.author),
+  revision: Number(row.revision),
+  facts: row.facts_json === null ? null : parse<unknown>(row.facts_json, null),
 });
 
 export class ScribeStore extends Context.Service<
@@ -251,18 +300,48 @@ export class ScribeStore extends Context.Service<
       payload: unknown,
       at: string,
     ) => Effect.Effect<void, ScribeStoreError>;
+    /** The current report of this kind with the latest window end, before `beforeIso` when given. */
     readonly lastReport: (
       missionId: string,
       kind: ReportKind,
+      beforeIso?: string,
     ) => Effect.Effect<ReportRecord | null, ScribeStoreError>;
+    /** Current reports of this kind ending after `fromIso` and by `toIso`, oldest first. */
     readonly reportsBetween: (
       missionId: string,
       kind: ReportKind,
       fromIso: string,
       toIso: string,
     ) => Effect.Effect<ReadonlyArray<ReportRecord>, ScribeStoreError>;
-    readonly saveReport: (report: ReportRecord) => Effect.Effect<void, ScribeStoreError>;
-    /** Newest first by the end of the window, without the text; `total` counts every match. */
+    /** The newest revision for one window end, current or not. */
+    readonly latestRevision: (
+      missionId: string,
+      kind: ReportKind,
+      coversTo: string,
+    ) => Effect.Effect<
+      { readonly report: ReportRecord; readonly current: boolean } | null,
+      ScribeStoreError
+    >;
+    /** The current reports a new one for this window would hide. */
+    readonly reportsHiddenBy: (
+      missionId: string,
+      kind: ReportKind,
+      coversFrom: string,
+      coversTo: string,
+    ) => Effect.Effect<
+      ReadonlyArray<{ readonly reportId: string; readonly author: ReportAuthor }>,
+      ScribeStoreError
+    >;
+    /** Stores a report without telling subscribers; fails if the id is taken. */
+    readonly writeReport: (report: ReportWrite) => Effect.Effect<void, ScribeStoreError>;
+    /** Tells `reportSaves` subscribers the mission has a new report. */
+    readonly announceReport: (missionId: string) => Effect.Effect<void>;
+    /** `writeReport`, then `announceReport`. */
+    readonly saveReport: (report: ReportWrite) => Effect.Effect<void, ScribeStoreError>;
+    /**
+     * Current reports, newest first by the end of the window, without the text;
+     * `total` counts every current match.
+     */
     readonly listReports: (
       missionId: string,
       kinds: ReadonlyArray<ReportKind>,
@@ -305,7 +384,47 @@ const make = Effect.gen(function* () {
   yield* Effect.forEach(DDL, (statement) => sql.unsafe(statement), { discard: true }).pipe(
     Effect.mapError(fail("create tables")),
   );
+  const reportColumns = sql<{ readonly name: string }>`
+    SELECT name FROM pragma_table_info('ardud_mission_scribe_report')
+  `.pipe(Effect.map((columns) => new Set(columns.map((column) => column.name))));
+  yield* Effect.forEach(
+    REPORT_COLUMNS,
+    ([name, definition]) =>
+      Effect.gen(function* () {
+        if ((yield* reportColumns).has(name)) return;
+        yield* sql
+          .unsafe(`ALTER TABLE ardud_mission_scribe_report ADD COLUMN ${name} ${definition}`)
+          .pipe(
+            // Another server may have added it between the check and the ALTER.
+            Effect.catchTags({
+              SqlError: (error) =>
+                reportColumns.pipe(
+                  Effect.flatMap((added) => (added.has(name) ? Effect.void : Effect.fail(error))),
+                ),
+            }),
+          );
+      }),
+    { discard: true },
+  ).pipe(Effect.mapError(fail("add report columns")));
   const saves = yield* PubSub.unbounded<string>();
+
+  /**
+   * True for `r` while it is current: no newer revision for its window end, and
+   * for a daily, no daily saved after it whose window overlaps its own.
+   */
+  const isCurrent = sql`NOT EXISTS (
+    SELECT 1 FROM ardud_mission_scribe_report n
+    WHERE n.mission_id = r.mission_id AND n.kind = r.kind AND n.report_id <> r.report_id
+      AND (
+        (n.covers_to = r.covers_to AND n.revision > r.revision)
+        OR (
+          r.kind = 'daily'
+          AND n.covers_from < r.covers_to AND n.covers_to > r.covers_from
+          AND (n.created_at > r.created_at
+            OR (n.created_at = r.created_at AND n.rowid > r.rowid))
+        )
+      )
+  )`;
 
   const cursor = (missionId: string, threadId: string) =>
     sql<CursorRow>`
@@ -433,11 +552,12 @@ const make = Effect.gen(function* () {
         payload_json = excluded.payload_json, updated_at = excluded.updated_at
     `.pipe(Effect.asVoid, Effect.mapError(fail("save editor state")));
 
-  const lastReport = (missionId: string, kind: ReportKind) =>
+  const lastReport = (missionId: string, kind: ReportKind, beforeIso?: string) =>
     sql<ReportRow>`
-      SELECT * FROM ardud_mission_scribe_report
-      WHERE mission_id = ${missionId} AND kind = ${kind}
-      ORDER BY covers_to DESC, created_at DESC LIMIT 1
+      SELECT r.* FROM ardud_mission_scribe_report r
+      WHERE r.mission_id = ${missionId} AND r.kind = ${kind} AND ${isCurrent}
+        ${beforeIso === undefined ? sql`` : sql`AND r.covers_to < ${beforeIso}`}
+      ORDER BY r.covers_to DESC, r.created_at DESC LIMIT 1
     `.pipe(
       Effect.map((rows) => (rows[0] ? reportFromRow(rows[0]) : null)),
       Effect.mapError(fail("read last report")),
@@ -445,16 +565,50 @@ const make = Effect.gen(function* () {
 
   const reportsBetween = (missionId: string, kind: ReportKind, fromIso: string, toIso: string) =>
     sql<ReportRow>`
-      SELECT * FROM ardud_mission_scribe_report
-      WHERE mission_id = ${missionId} AND kind = ${kind}
-        AND covers_to > ${fromIso} AND covers_to <= ${toIso}
-      ORDER BY covers_to
+      SELECT r.* FROM ardud_mission_scribe_report r
+      WHERE r.mission_id = ${missionId} AND r.kind = ${kind}
+        AND r.covers_to > ${fromIso} AND r.covers_to <= ${toIso} AND ${isCurrent}
+      ORDER BY r.covers_to
     `.pipe(
       Effect.map((rows) => rows.map(reportFromRow)),
       Effect.mapError(fail("read reports")),
     );
 
-  const saveReport = (report: ReportRecord) =>
+  const latestRevision = (missionId: string, kind: ReportKind, coversTo: string) =>
+    sql<ReportRow & { readonly current: number }>`
+      SELECT r.*, ${isCurrent} AS current FROM ardud_mission_scribe_report r
+      WHERE r.mission_id = ${missionId} AND r.kind = ${kind} AND r.covers_to = ${coversTo}
+      ORDER BY r.revision DESC LIMIT 1
+    `.pipe(
+      Effect.map((rows) =>
+        rows[0] ? { report: reportFromRow(rows[0]), current: Number(rows[0].current) === 1 } : null,
+      ),
+      Effect.mapError(fail("read report revision")),
+    );
+
+  const reportsHiddenBy = (
+    missionId: string,
+    kind: ReportKind,
+    coversFrom: string,
+    coversTo: string,
+  ) => {
+    const window =
+      kind === "daily"
+        ? sql`(r.covers_to = ${coversTo} OR (r.covers_from < ${coversTo} AND r.covers_to > ${coversFrom}))`
+        : sql`r.covers_to = ${coversTo}`;
+    return sql<{ readonly report_id: string; readonly author: string }>`
+      SELECT r.report_id, r.author FROM ardud_mission_scribe_report r
+      WHERE r.mission_id = ${missionId} AND r.kind = ${kind} AND ${window} AND ${isCurrent}
+      ORDER BY r.covers_to
+    `.pipe(
+      Effect.map((rows) =>
+        rows.map((row) => ({ reportId: row.report_id, author: reportAuthor(row.author) })),
+      ),
+      Effect.mapError(fail("read hidden reports")),
+    );
+  };
+
+  const writeReport = (report: ReportWrite) =>
     sql`
       INSERT INTO ardud_mission_scribe_report ${sql.insert({
         report_id: report.reportId,
@@ -465,35 +619,42 @@ const make = Effect.gen(function* () {
         open_json: toJson(report.open),
         text: report.text,
         created_at: report.createdAt,
+        author: report.author ?? "scribe",
+        revision: report.revision ?? 1,
+        facts_json:
+          report.facts === undefined || report.facts === null ? null : toJson(report.facts),
       })}
-      ON CONFLICT (report_id) DO NOTHING
-    `.pipe(
-      Effect.asVoid,
-      Effect.mapError(fail("save report")),
-      Effect.tap(() => PubSub.publish(saves, report.missionId)),
-    );
+    `.pipe(Effect.asVoid, Effect.mapError(fail("save report")));
+
+  const announceReport = (missionId: string) =>
+    PubSub.publish(saves, missionId).pipe(Effect.asVoid);
+
+  const saveReport = (report: ReportWrite) =>
+    writeReport(report).pipe(Effect.tap(() => announceReport(report.missionId)));
 
   const listReports = Effect.fn("ScribeStore.listReports")(
     function* (missionId: string, kinds: ReadonlyArray<ReportKind>, limit: number) {
       if (kinds.length === 0) return { rows: [], total: 0 };
-      const where = sql.and([sql`mission_id = ${missionId}`, sql.in("kind", kinds)]);
+      const where = sql`r.mission_id = ${missionId} AND r.kind IN ${sql.in(kinds)} AND ${isCurrent}`;
       const rows = yield* sql<{
         readonly report_id: string;
         readonly kind: string;
         readonly covers_from: string;
         readonly covers_to: string;
         readonly created_at: string;
+        readonly author: string;
+        readonly revision: number;
         readonly size: number;
         readonly head: string;
       }>`
-        SELECT report_id, kind, covers_from, covers_to, created_at,
-          length(text) AS size, substr(text, 1, ${REPORT_HEAD_CHARS}) AS head
-        FROM ardud_mission_scribe_report
+        SELECT r.report_id, r.kind, r.covers_from, r.covers_to, r.created_at, r.author, r.revision,
+          length(r.text) AS size, substr(r.text, 1, ${REPORT_HEAD_CHARS}) AS head
+        FROM ardud_mission_scribe_report r
         WHERE ${where}
-        ORDER BY covers_to DESC, created_at DESC LIMIT ${limit}
+        ORDER BY r.covers_to DESC, r.created_at DESC LIMIT ${limit}
       `;
       const counted = yield* sql<{ readonly total: number }>`
-        SELECT count(*) AS total FROM ardud_mission_scribe_report WHERE ${where}
+        SELECT count(*) AS total FROM ardud_mission_scribe_report r WHERE ${where}
       `;
       return {
         rows: rows.map((row): ReportSummary => ({
@@ -502,6 +663,8 @@ const make = Effect.gen(function* () {
           coversFrom: row.covers_from,
           coversTo: row.covers_to,
           createdAt: row.created_at,
+          author: reportAuthor(row.author),
+          revision: Number(row.revision),
           size: Number(row.size),
           head: row.head,
         })),
@@ -572,6 +735,10 @@ const make = Effect.gen(function* () {
     saveEditorState,
     lastReport,
     reportsBetween,
+    latestRevision,
+    reportsHiddenBy,
+    writeReport,
+    announceReport,
     saveReport,
     listReports,
     reportText,

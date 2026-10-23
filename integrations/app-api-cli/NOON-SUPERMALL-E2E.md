@@ -8,7 +8,7 @@ clientSecret consumption**. Rocket express promise "Get in 1 hr 8 mins",
 absolute deliveryDate `2026-10-11T00:37:00` (+04).
 
 CLI: `commerce order supermall --sku-config ZC3D2FE430033CA47B932Z --quantity 1
---label "…"` (+ `--resume-flow FLOW_UUID`, 24h window pre-place; read-only
+--cvv-from-keychain --label "…"` (+ `--resume-flow FLOW_UUID`, 24h window pre-place; read-only
 paid completion post-place).
 
 Module map: `commerce_supermall_order.py` (journalled lane) over
@@ -22,10 +22,9 @@ tests: `test/test_commerce_supermall_order.py`,
 ## Rocket deltas vs the Main lane (same checkout-v2 family)
 
 1. **Catalog verify** requires the unique buyable offer of the skuConfig to be
-   rocket-flagged (`hit.flags` contains `rocket` / `hit.rocket` object);
+   rocket-flagged (`hit.flags` contains `rocket`);
    `SUPERMALL_ITEM_NOT_ROCKET` otherwise. Search runs with `x-experience:
-   ecom` (as captured; the rocket experience header only appears on
-   listing/carousel reads).
+   rocket`; checkout uses the separately captured `ecom` experience.
 2. **Cart add** is the PDP quick_atc route: `POST
    cart-v1/cart/item/{offerCode}/{qty}?showCart` with body
    `{"isFouponSelected":false,"isInstallationSelected":false}` — no
@@ -72,10 +71,12 @@ tests: `test/test_commerce_supermall_order.py`,
 5. **Paid signal**: poll `GET checkout-v2/order/order-status?order_nr=…`:
    `pending` ("Payment pending") → **`status:"success"` + populated
    `shipments` + `total:"25.49"`** = PAID. `paymentError`/`paymentErrorMsg`
-   non-null is failure (`SUPERMALL_PAYMENT_ERROR_NO_RETRY`); `clientSecret`
-   is null on this lane and never consumed.
-6. **Confirm + track + watch**: journal PAYMENT_REPORTED_SUCCESS on the single
-   `place` op; exact order-v2 order-detail readback (bounded retries while
+   non-null is failure (`SUPERMALL_PAYMENT_ERROR_NO_RETRY`). A pending `clientSecret`
+   is completed once with the selected card and encrypted CVV. Pending/3DS prompts
+   ENBD approval via Telegram, then polls for at most ten minutes. Challenge coverage
+   is fixture-only; `await-payment FLOW` resumes reads without another payment.
+6. **Confirm + track + watch**: journal PAYMENT_REPORTED_SUCCESS on the financial
+   op; exact order-v2 order-detail readback (bounded retries while
    `itemGroups` repopulates — `INCOMPLETE_MANIFEST`/`INVALID_RESPONSE` only;
    any schema mismatch still fails fast); `order-watch add … --eta
    <promise deliveryDate+04:00>` with durable readback; journal COMPLETE.
@@ -127,8 +128,8 @@ guard read, inheritance, foreign/conflicting rejection).
 
 ## Contract deviations vs the 2026-10-10 capture
 
-- None on the wire chain (search → quick-add → session → place →
-  order-status). The lane adds no setter calls: silent delivery and the
+- Pending payment adds encrypted-CVV completion and payment-status reads
+  (fixture coverage only). The lane adds no setter calls: silent delivery and the
   default card are account-level and verified server-side, exactly as
   captured.
 - The search query differs: the capture browsed supermall carousels and a

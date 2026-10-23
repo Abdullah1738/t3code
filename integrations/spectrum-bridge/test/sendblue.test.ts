@@ -130,6 +130,15 @@ test("sendApp addresses the configured card app and drops appStoreId when it has
   });
 });
 
+test("sendApp passes interactive only when the caller sets it", async () => {
+  const fake = fakeFetch(() => json(202, { message_handle: "card4" }));
+  const client = makeClient(fake.fetch);
+  await client.sendApp("dm:+15550001", { url: "https://example.com/s/6", caption: "Ride", interactive: false, imageUrl: "https://x.example/p.png" });
+  await client.sendApp("dm:+15550001", { url: "https://example.com/s/7", caption: "Ride" });
+  expect(fake.calls[0]!.body!.app_card).toMatchObject({ interactive: false, layout: { caption: "Ride", imageUrl: "https://x.example/p.png" } });
+  expect((fake.calls[1]!.body!.app_card as Record<string, unknown>).interactive).toBeUndefined();
+});
+
 test("sendApp keeps times and dates out of every text field the bubble can show", async () => {
   const fake = fakeFetch(() => json(202, { message_handle: "card3" }));
   const client = makeClient(fake.fetch);

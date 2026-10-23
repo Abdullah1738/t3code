@@ -9638,6 +9638,35 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ).size > 0
             );
           }),
+          // ardud: archive-if-idle also needs the wake buffered for the thread,
+          // which the probe above leaves out so it never pins a run. A wake
+          // turn's init alone already asks for a continuation. One synchronous
+          // read, so a task moving from the roster into a wake is never missed.
+          holdsWorkForThread: Effect.fn("ClaudeAdapterV2.holdsWorkForThread")(
+            function* (providerThread) {
+              const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
+              if (nativeThreadId === undefined || nativeThreadId === null) {
+                return false;
+              }
+              return yield* Effect.sync(() => {
+                const roster = rosterForNativeThread(
+                  Ref.getUnsafe(pendingBackgroundTasksByNativeThread),
+                  nativeThreadId,
+                );
+                if (roster.size > 0) return true;
+                const buffered = Ref.getUnsafe(wakeBuffers).get(nativeThreadId);
+                return (
+                  buffered?.messages.some(
+                    (message) =>
+                      message.type === "user" ||
+                      message.type === "assistant" ||
+                      message.type === "result" ||
+                      isClaudeTurnStartMessage(message),
+                  ) ?? false
+                );
+              });
+            },
+          ),
           ensureThread: Effect.fn("ClaudeAdapterV2.ensureThread")(
             function* (threadInput: ProviderAdapter.ProviderAdapterV2EnsureThreadInput) {
               const createdAt = yield* DateTime.now;

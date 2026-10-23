@@ -288,6 +288,7 @@ export const openCode2ReplayRuntime = (
     readonly replayGate?: ProviderReplayGate;
     readonly attachmentsDir?: string;
     readonly fileSystem?: FileSystem.FileSystem;
+    readonly idAllocator?: Layer.Layer<IdAllocator.IdAllocatorV2>;
   },
 ) =>
   Effect.gen(function* () {
@@ -321,7 +322,7 @@ export const openCode2ReplayRuntime = (
         options?.attachmentsDir === undefined
           ? layerReplayHost
           : layerReplayHostWithAttachments(options.attachmentsDir),
-        IdAllocator.layer,
+        options?.idAllocator ?? IdAllocator.layer,
         NodeServices.layer,
       ),
     ),

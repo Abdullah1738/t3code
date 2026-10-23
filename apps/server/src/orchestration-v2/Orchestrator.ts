@@ -145,6 +145,13 @@ import {
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import { contextResetTurnItem } from "../ardud/context-reset/divider.ts";
+// ardud: archive only while idle
+import {
+  ArchiveIfIdleBeforeCommit,
+  idleBlocker,
+  OrchestratorThreadNotIdleError,
+  sessionHoldsWork,
+} from "../ardud/archive-if-idle/idle.ts";
 // ardud missions: guard
 import { countsAsUserTurn } from "../ardud/missions/guard/turns.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -296,8 +303,10 @@ export const OrchestratorV2Error = Schema.Union([
   OrchestratorCommandIdConflictError,
   OrchestratorSubagentThreadReadOnlyError,
   OrchestratorThreadAboveModeLimitError,
+  OrchestratorThreadNotIdleError,
 ]);
 export type OrchestratorV2Error = typeof OrchestratorV2Error.Type;
+const isThreadNotIdleError = Schema.is(OrchestratorThreadNotIdleError);
 
 export interface OrchestratorV2DispatchResult {
   readonly sequence: number;
@@ -2637,6 +2646,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandType: command.type,
           cause: `Thread ${command.threadId} is no longer empty.`,
         });
+    }
+    // ardud: archive-if-idle checks the rest inside the commit transaction.
+    if (
+      command.type === "thread.archive" &&
+      command.ifIdle !== undefined &&
+      thread.archivedAt !== null
+    ) {
+      return yield* new OrchestratorThreadNotIdleError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: "archived",
+        detail: `Thread ${command.threadId} is already archived.`,
+      });
     }
     if (command.type === "thread.archive" && thread.archivedAt !== null) {
       return yield* new OrchestratorDispatchError({
@@ -10312,6 +10334,74 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
 
+  // ardud: provider events land without the dispatch lock, so archive-if-idle
+  // decides inside the commit transaction, where nothing else can write. The
+  // archive's events carry run snapshots taken while planning, so any event
+  // since then refuses too: committing them would roll that change back.
+  // A provider can also settle its last subagent and hold the wake for it
+  // without writing an event, so each live session is asked as well. `peek`
+  // reads the session without counting as activity, which would fork a timer
+  // from inside the transaction.
+  const refuseUnlessIdle = Effect.fn("orchestrationV2.archiveIfIdle.recheck")(function* (
+    command: Extract<OrchestrationV2ServerCommand, { type: "thread.archive" }>,
+    expectedNativeSessionId: string | undefined,
+    plannedAtSequence: number,
+  ) {
+    const projection = yield* projectionStore.getThreadRecords(command.threadId, [
+      "runs",
+      "attempts",
+      "runtimeRequests",
+      "subagents",
+      "providerThreads",
+      "providerTurns",
+    ]);
+    const restartContinuation = yield* Effect.findFirst(
+      projection.runs.filter((run) => run.status !== "queued"),
+      awaitsRestartContinuation,
+    );
+    const providerThreadsHoldingWork = yield* Effect.filter(
+      projection.providerThreads,
+      Effect.fnUntraced(function* (providerThread: OrchestrationV2ProviderThread) {
+        if (providerThread.providerSessionId == null || providerSessions.peek === undefined) {
+          return false;
+        }
+        const session = yield* providerSessions.peek(providerThread.providerSessionId);
+        if (Option.isNone(session)) return false;
+        return yield* sessionHoldsWork(session.value, providerThread);
+      }),
+    );
+    const blocker = idleBlocker({
+      projection,
+      restartContinuationPending: Option.isSome(restartContinuation),
+      continuationOffered:
+        continuationRequests.pending === undefined
+          ? false
+          : yield* continuationRequests.pending(command.threadId),
+      providerThreadsHoldingWork: providerThreadsHoldingWork.map(
+        (providerThread) => providerThread.id,
+      ),
+      expectedNativeSessionId,
+      now: yield* DateTime.now,
+    });
+    if (blocker !== null) {
+      return yield* new OrchestratorThreadNotIdleError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: blocker.reason,
+        detail: blocker.detail,
+      });
+    }
+    const sequence = yield* eventSink.latestSequence({ threadId: command.threadId });
+    if (sequence !== plannedAtSequence) {
+      return yield* new OrchestratorThreadNotIdleError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: "changed",
+        detail: `Thread ${command.threadId} changed while it was being archived.`,
+      });
+    }
+  });
+
   const childAwaitsRestartContinuation = (
     runs: ReadonlyArray<OrchestrationV2Run>,
     resultRun: OrchestrationV2Run,
@@ -11604,6 +11694,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (shell !== null) yield* refuseAboveDispatchModeLimit(command, threadId, shell);
     }
 
+    // ardud: archive-if-idle commits only when nothing landed since planning.
+    const archiveIfIdle =
+      command.type === "thread.archive" && command.ifIdle !== undefined
+        ? {
+            command,
+            expectedNativeSessionId: command.ifIdle.expectedNativeSessionId,
+            plannedAtSequence: yield* eventSink
+              .latestSequence({ threadId: command.threadId })
+              .pipe(
+                Effect.mapError(
+                  (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+                ),
+              ),
+          }
+        : undefined;
+
     const plan = yield* dispatchOnce(command).pipe(
       Effect.flatMap((planned) =>
         planned.events.length > 0 ||
@@ -11685,6 +11791,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return { sequence: resultSequence, storedEvents: [] } satisfies OrchestratorV2DispatchResult;
     }
     const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
+    if (archiveIfIdle !== undefined) yield* yield* ArchiveIfIdleBeforeCommit;
+    const recheck =
+      archiveIfIdle === undefined
+        ? undefined
+        : refuseUnlessIdle(
+            archiveIfIdle.command,
+            archiveIfIdle.expectedNativeSessionId,
+            archiveIfIdle.plannedAtSequence,
+          );
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,
@@ -11696,15 +11811,39 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
+        ...(recheck === undefined ? {} : { recheck }),
       })
       .pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId: command.commandId,
-              commandType: command.type,
-              cause,
-            }),
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            const notIdle = cause._tag === "EventSinkWriteError" ? cause.cause : undefined;
+            if (!isThreadNotIdleError(notIdle)) {
+              return yield* new OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause,
+              });
+            }
+            yield* eventSink
+              .commitRejectedCommand({
+                commandId: command.commandId,
+                threadId: commandThreadId(command),
+                commandType: command.type,
+                rejectedAt: yield* DateTime.now,
+                error: notIdle.message,
+              })
+              .pipe(
+                Effect.mapError(
+                  (receiptCause) =>
+                    new OrchestratorDispatchError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      cause: receiptCause,
+                    }),
+                ),
+              );
+            return yield* notIdle;
+          }),
         ),
       );
 

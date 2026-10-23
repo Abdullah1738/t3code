@@ -82,6 +82,7 @@ All paths are under `/api/ardud/control`.
 | GET    | `/threads/by-native/:sesId`                | Thread for an OpenCode session id (`ses_...`).                                              |
 | GET    | `/threads/:id`                             | Detail: state, current run, recent runs, pending requests.                                  |
 | PATCH  | `/threads/:id`                             | Change `runtimeMode`, `interactionMode`, `model`/`variant`, `title`, `archived`, `settled`. |
+| POST   | `/threads/:id/archive-if-idle`             | Archive only if the thread is still idle; otherwise refuse and leave it alone.              |
 | GET    | `/threads/:id/messages`                    | Messages plus `lastAssistant`.                                                              |
 | GET    | `/threads/:id/wait`                        | Long-poll until not running (or needs input).                                               |
 | POST   | `/threads/:id/send`                        | Send a message.                                                                             |
@@ -139,6 +140,33 @@ Defaults: the project's or environment's default model and runtime mode.
 Response (201): `threadId`, `projectId`, `directory`, `messageId`, `runId`,
 `status`, `model`, `runtimeMode`, `resumed` (true and HTTP 200 when
 `clientRequestId` replayed an earlier create).
+
+### POST /threads/:id/archive-if-idle
+
+`{ "expectedSession"?: "ses_..." }`. The server decides inside the archive's
+commit transaction, so nothing can land in between (a plain
+`PATCH { archived: true }` cancels whatever is queued). Idle means no live or
+queued run, no pending approval or question, no running subagent, background
+task, runless provider turn or work its live provider session still holds, no
+pending wake (restart continuation, provider continuation not yet started, owed
+delegated task report, armed usage-limit auto resume, watched pull request, or a
+snooze not yet due) and, with `expectedSession`, the thread's latest run ran on
+that native session on its active provider thread. Any thread event between
+planning and commit refuses with `changed`; try again later.
+
+- 200 `{ "ok": true, "archived": true, "thread": <detail> }`
+- 409 `{ "ok": false, "archived": false, "error": { "code": "not_idle", "reason", "message" } }`
+  with `reason` one of `archived`, `running`, `queued`, `pending-request`,
+  `background-work`, `pending-wake`, `session-changed`, `changed`. The thread is
+  unchanged.
+- 409 `conflict` when the orchestrator rejects the archive for another reason.
+- 404 `not_found` for an unknown or deleted thread, also when it was deleted
+  while the archive ran.
+- 503 `unavailable` when the server failed to become ready for commands or is
+  shutting down; 500 `internal` when storage or a read failed. Neither means
+  the thread is busy.
+
+`t3ctl archive-if-idle THREAD [--session ses_...]` exits 3 when refused.
 
 ### GET /threads/:id/messages
 

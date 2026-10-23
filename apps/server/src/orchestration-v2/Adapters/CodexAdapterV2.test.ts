@@ -54,6 +54,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
+import * as Tracer from "effect/Tracer";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import packageJson from "../../../package.json" with { type: "json" };
@@ -2020,6 +2021,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       Effect.void,
     onRequest: (method: string, params: unknown) => Effect.Effect<void> = () => Effect.void,
     readChildMetadata?: Parameters<typeof withCodexReplayChildMetadata>[2],
+    onOffer: (
+      request: ProviderContinuationRequests.ProviderContinuationRequest,
+    ) => Effect.Effect<void> = () => Effect.void,
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2069,9 +2073,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         serverConfig,
         continuationRequests: {
           offer: (request) =>
-            Effect.sync(() => {
-              continuationRequests.push(request);
-            }),
+            onOffer(request).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  continuationRequests.push(request);
+                }),
+              ),
+            ),
         },
       });
       const threadId = ThreadId.make(`thread-${transcript.scenario}`);
@@ -4989,6 +4997,102 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
+  it.effect("holds a finished background command until its continuation is offered", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const harness = yield* makeCodexReplayHarness(
+          backgroundExecTranscript,
+          undefined,
+          undefined,
+          undefined,
+          () => Deferred.succeed(reached, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        );
+        const now = yield* DateTime.now;
+        const holdsWork = () => harness.runtime.holdsWorkForThread!(harness.providerThread);
+
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-bg-handoff"),
+            text: BG_PROMPT,
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+        // The running command counts too, so its move into the handoff is
+        // never between two reads.
+        assert.isTrue(yield* holdsWork());
+
+        yield* TestClock.adjust("30 seconds");
+        yield* Deferred.await(reached);
+        // The command already left the running set, so only the handoff
+        // shows that a continuation is still owed.
+        assert.isFalse(
+          yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
+        );
+        assert.isTrue(yield* holdsWork());
+
+        yield* Deferred.succeed(release, undefined);
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "continuation request");
+        let held = true;
+        for (let attempt = 0; attempt < 5000 && held; attempt++) {
+          held = yield* holdsWork();
+          if (held) yield* Effect.yieldNow;
+        }
+        assert.isFalse(held);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("drops the handoff when offering the continuation crashes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const reached = yield* Deferred.make<void>();
+        const harness = yield* makeCodexReplayHarness(
+          backgroundExecTranscript,
+          undefined,
+          undefined,
+          undefined,
+          () =>
+            Deferred.succeed(reached, undefined).pipe(Effect.andThen(Effect.die("offer crashed"))),
+        );
+        const now = yield* DateTime.now;
+        const holdsWork = () => harness.runtime.holdsWorkForThread!(harness.providerThread);
+
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-bg-handoff-crash"),
+            text: BG_PROMPT,
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "root turn terminal");
+        yield* TestClock.adjust("30 seconds");
+        yield* Deferred.await(reached);
+
+        let held = true;
+        for (let attempt = 0; attempt < 5000 && held; attempt++) {
+          held = yield* holdsWork();
+          if (held) yield* Effect.yieldNow;
+        }
+        assert.isFalse(held);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect.each([false, true])(
     "keeps commands interrupted after native thread closure (persistent tool: %s)",
     (retainContext) =>
@@ -7708,6 +7812,139 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
+      ),
+    ),
+  );
+
+  const persistentMcpAppToolItem = (status: "inProgress" | "completed") => ({
+    ...mcpAppToolItem(status),
+    arguments: { city: "Oslo", persistent: true },
+  });
+  const lateMcpAppTranscript = makeCodexReplayTranscript({
+    scenario: "codex-mcp-app-capture-after-settle",
+    entries: [
+      ...codexReplayPreamble({
+        nativeThreadId: MCP_APP_NATIVE_THREAD,
+        nativeTurnId: MCP_APP_NATIVE_TURN,
+        prompt: MCP_APP_PROMPT,
+      }),
+      {
+        type: "emit_inbound",
+        label: "item/started/app-tool",
+        frame: {
+          method: "item/started",
+          params: {
+            item: persistentMcpAppToolItem("inProgress"),
+            threadId: MCP_APP_NATIVE_THREAD,
+            turnId: MCP_APP_NATIVE_TURN,
+            startedAtMs: 1782622440500,
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "turn/completed",
+        frame: {
+          method: "turn/completed",
+          params: {
+            threadId: MCP_APP_NATIVE_THREAD,
+            turn: makeCodexReplayTurn({ id: MCP_APP_NATIVE_TURN, status: "completed" }),
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "item/completed/app-tool",
+        frame: {
+          method: "item/completed",
+          params: {
+            item: persistentMcpAppToolItem("completed"),
+            threadId: MCP_APP_NATIVE_THREAD,
+            turnId: MCP_APP_NATIVE_TURN,
+            completedAtMs: 1782622441500,
+          },
+        },
+      },
+      {
+        type: "expect_outbound",
+        label: "mcpServer/resource/read",
+        frame: {
+          id: 4,
+          method: "mcpServer/resource/read",
+          params: { threadId: MCP_APP_NATIVE_THREAD, server: "weather", uri: MCP_APP_RESOURCE },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "mcpServer/resource/read",
+        frame: {
+          id: 4,
+          result: {
+            contents: [
+              {
+                uri: MCP_APP_RESOURCE,
+                mimeType: "text/html;profile=mcp-app",
+                text: MCP_APP_HTML,
+              },
+            ],
+          },
+        },
+      },
+    ],
+  });
+
+  it.effect("holds a settled turn's MCP app while it moves from running to its capture", () =>
+    Effect.gen(function* () {
+      // The capture span opens after the tool left the running set and before
+      // the capture registers, so a probe there reads the gap.
+      let probe: (() => boolean) | undefined;
+      const heldInGap: Array<boolean> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          if (options.name === "CodexAdapterV2.captureMcpApp" && probe !== undefined) {
+            heldInGap.push(probe());
+          }
+          return new Tracer.NativeSpan(options);
+        },
+      });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const appCaptured = yield* Deferred.make<void>();
+          const harness = yield* makeCodexReplayHarness(lateMcpAppTranscript, (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.status === "completed"
+              ? Deferred.succeed(appCaptured, undefined)
+              : Effect.void,
+          );
+          const holdsWork = () => harness.runtime.holdsWorkForThread!(harness.providerThread);
+          // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- The tracer hook is synchronous and is the only point inside the gap.
+          probe = () => Effect.runSync(holdsWork());
+          const now = yield* DateTime.now;
+
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("attempt-codex-mcp-app-late"),
+              text: MCP_APP_PROMPT,
+            }),
+          );
+          yield* Deferred.await(appCaptured);
+          assert.deepEqual(heldInGap, [true]);
+
+          let held = true;
+          for (let attempt = 0; attempt < 5000 && held; attempt++) {
+            held = yield* holdsWork();
+            if (held) yield* Effect.yieldNow;
+          }
+          assert.isFalse(held);
+        }),
+      ).pipe(Effect.withTracer(tracer));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
   );

@@ -79,6 +79,8 @@ import { RouterToolkit } from "../ardud/missions/router/tools.ts";
 import * as MissionsRecoveryTools from "../ardud/missions/tools/recovery.ts";
 // ardud missions: views
 import * as MissionsViewsTools from "../ardud/missions/views/tools.ts";
+// ardud missions: reports
+import * as MissionsReportTools from "../ardud/missions/scribe/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -1055,6 +1057,11 @@ const layerMissionsViewsToolkitRegistration = toolkitRegistration(
   MissionsViewsTools.ViewsToolkit,
   MissionsViewsTools.layer,
 );
+// ardud missions: reports (ScribeService comes from ArdudMissionsLive in server.ts)
+const layerMissionsReportToolkitRegistration = toolkitRegistration(
+  MissionsReportTools.ReportsToolkit,
+  MissionsReportTools.layer,
+);
 const layerContextResetToolkitRegistration = toolkitRegistration(
   ContextResetToolkit,
   ContextResetHandlers.layer,
@@ -1125,6 +1132,8 @@ export const layer = Layer.mergeAll(
   layerMissionsRecoveryToolkitRegistration,
   // ardud missions: views
   layerMissionsViewsToolkitRegistration,
+  // ardud missions: reports
+  layerMissionsReportToolkitRegistration,
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,

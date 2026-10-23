@@ -46,6 +46,7 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlStore from "./ControlStore.ts";
+import { archiveIfIdle } from "../archive-if-idle/archiveIfIdle.ts";
 import { BoardService } from "../board/BoardService.ts";
 // ardud missions: router
 import { guardControlSend, type SendRefused } from "../missions/router/guardPaths.ts";
@@ -115,6 +116,32 @@ const fail = (code: ControlErrorCode, message: string) => new ControlError({ cod
 
 const errorDetail = (cause: unknown): string =>
   userFacingDispatchErrorMessage(cause) ?? (cause instanceof Error ? cause.message : String(cause));
+
+// ardud: the reaper retries a conflict later, so only the orchestrator's own
+// refusals count as one. Its rejections carry a text cause; a storage or read
+// failure carries the failure itself.
+const archiveFailureCode = (
+  cause:
+    | Effect.Error<ReturnType<typeof archiveIfIdle>>
+    | ServerRuntimeStartup.ServerRuntimeStartupError,
+): ControlErrorCode => {
+  switch (cause._tag) {
+    case "ServerRuntimeStartupError":
+      return "unavailable";
+    case "OrchestratorDispatchError":
+      return typeof cause.cause === "string" ? "conflict" : "internal";
+    case "OrchestratorThreadAlreadyExistsError":
+    case "OrchestratorCommandRejectedError":
+    case "OrchestratorCommandPreviouslyRejectedError":
+    case "OrchestratorCommandIdConflictError":
+    case "OrchestratorSubagentThreadReadOnlyError":
+    case "OrchestratorThreadAboveModeLimitError":
+    case "ThreadManagementProviderInstanceDisabledError":
+      return "conflict";
+    default:
+      return "internal";
+  }
+};
 
 const NO_STORE = { "cache-control": "no-store" } as const;
 
@@ -262,6 +289,10 @@ const SettingsBody = Schema.Struct({
   settled: Schema.optional(Schema.Boolean),
 });
 
+const ArchiveIfIdleBody = Schema.Struct({
+  expectedSession: Schema.optional(Schema.String),
+});
+
 const UploadBody = Schema.Struct({
   type: Schema.optional(Schema.Literals(["image", "file"])),
   name: Schema.String,
@@ -275,6 +306,7 @@ const decodeInterruptBody = Schema.decodeUnknownEffect(InterruptBody);
 const decodeRespondBody = Schema.decodeUnknownEffect(RespondBody);
 const decodeOriginBody = Schema.decodeUnknownEffect(OriginBody);
 const decodeSettingsBody = Schema.decodeUnknownEffect(SettingsBody);
+const decodeArchiveIfIdleBody = Schema.decodeUnknownEffect(ArchiveIfIdleBody);
 const decodeUploadBody = Schema.decodeUnknownEffect(UploadBody);
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
 const decodeUploadInput = Schema.decodeUnknownEffect(AttachmentCreateUploadUrlInput);
@@ -1221,6 +1253,48 @@ const makeRoutes = Effect.gen(function* () {
     return json({ ok: true, thread: yield* threadDetail(threadId) });
   });
 
+  // The reaper's switch: the idle check and the archive happen together under
+  // the thread's dispatch lock, so a run that lands first wins.
+  const archiveThreadIfIdle = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationOperateScope);
+    const threadId = yield* param("threadId");
+    const body = yield* decodeBody(decodeArchiveIfIdleBody);
+    yield* getShell(threadId);
+    const expectedSession = body.expectedSession?.trim();
+    const result = yield* startup
+      .enqueueCommand(
+        archiveIfIdle({
+          commandId: yield* commandIdFor(`archive-if-idle:${threadId}`, undefined),
+          threadId: ThreadId.make(threadId),
+          expectedNativeSessionId:
+            expectedSession === undefined || expectedSession.length === 0
+              ? undefined
+              : expectedSession,
+        }).pipe(Effect.provideService(ThreadManagementService.ThreadManagementService, threads)),
+      )
+      .pipe(
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            const code = archiveFailureCode(cause);
+            // A thread deleted after the first read is a 404, not a failure.
+            if (code !== "unavailable") yield* getShell(threadId);
+            return yield* fail(code, errorDetail(cause));
+          }),
+        ),
+      );
+    if (!result.archived) {
+      return json(
+        {
+          ok: false,
+          archived: false,
+          error: { code: "not_idle", reason: result.reason, message: result.detail },
+        },
+        STATUS.conflict,
+      );
+    }
+    return json({ ok: true, archived: true, thread: yield* threadDetail(threadId) });
+  });
+
   const wait = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
@@ -1435,6 +1509,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
     HttpRouter.route("GET", `${p}/threads/:threadId`, handle(getThread)),
     HttpRouter.route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
+    HttpRouter.route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),
     HttpRouter.route("GET", `${p}/threads/:threadId/messages`, handle(getMessages)),
     HttpRouter.route("GET", `${p}/threads/:threadId/wait`, handle(wait)),
     HttpRouter.route("POST", `${p}/threads/:threadId/send`, handle(send)),

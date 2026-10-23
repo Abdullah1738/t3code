@@ -8034,6 +8034,84 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect("counts a wake buffered for the thread as work it still holds", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const holdsWork = () => harness.runtime.holdsWorkForThread!(harness.providerThread);
+        const runProbe = () =>
+          harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread);
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-wake-holds"),
+            text: "Run the build in the background.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, wakeTaskStarted);
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+        assert.isTrue(yield* holdsWork());
+
+        yield* Queue.offer(harness.sdkMessages, wakeNotification);
+        let quietYields = 0;
+        yield* awaitUntil(() => quietYields++ >= 50, "notification-only quiet window");
+        assert.isFalse(yield* holdsWork());
+
+        yield* Queue.offer(harness.sdkMessages, wakeAssistant);
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "continuation request");
+        // The run probe leaves the buffered wake out so it never pins a run;
+        // archiving would drop it, so the archive probe counts it.
+        assert.isFalse(yield* runProbe());
+        assert.isTrue(yield* holdsWork());
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("counts a wake turn that has only opened as work it still holds", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-wake-init-holds"),
+            text: "Run the build in the background.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, wakeTaskStarted);
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+        yield* harness.offerAndWait(wakeNotification);
+        yield* harness.offerAndWait(wakeTurnInit);
+        assert.lengthOf(harness.continuationRequests, 1);
+        assert.isFalse(
+          yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
+        );
+        assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect("starts the wake run when Claude opens the wake turn, before its output", () =>
     Effect.scoped(
       Effect.gen(function* () {

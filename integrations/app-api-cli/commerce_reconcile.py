@@ -121,6 +121,9 @@ def owner_attest_no_charge(flow_id, *, evidence, attested_by, auth=None):
 
 def reconcile(flow_id, *, auth=None):
     binding=journal.binding(flow_id);local=journal.inspect(flow_id)
+    if binding['app']=='noon' and binding['vertical'] in ('main','supermall'):
+        from commerce_marketplace_disposition import reconcile as marketplace_reconcile
+        return marketplace_reconcile(flow_id, auth=auth.noon if auth else None)
     store=receipts.load(**binding).snapshot()
     order=local['order_id']
     from commerce_order_status import talabat_place_failure

@@ -242,54 +242,59 @@ export const layer = Layer.effectDiscard(
       },
     );
 
-    yield* requests.take.pipe(
-      Effect.flatMap((request) =>
-        dispatchContinuation(request).pipe(
-          Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              yield* Effect.logWarning("orchestration-v2.provider-continuation.dispatch-failed", {
-                threadId: request.threadId,
-                providerThreadId: request.providerThreadId,
-                cause,
-              });
-              if (request.delegatedCompletion !== undefined) {
-                const completion = request.delegatedCompletion;
-                const retryKey = delegatedCompletionRetryKey(request, completion);
-                const retryDelay = yield* nextRetryDelay(retryKey);
-                yield* Effect.gen(function* () {
-                  yield* Effect.sleep(`${retryDelay} millis`);
-                  const projection = yield* threads.getThreadRecords(
-                    request.threadId,
-                    ["messages", "runs", "providerTurns"],
-                    {
-                      messageIds:
-                        request.delegatedCompletion === undefined
-                          ? []
-                          : [request.delegatedCompletion.messageId],
-                    },
-                  );
-                  if (currentDelegatedCompletionDelivery(projection, completion) !== undefined) {
-                    yield* requests.offer(request);
-                  } else {
-                    yield* clearRetryAttempt(retryKey);
-                  }
-                }).pipe(
-                  Effect.catchCause((retryCause) =>
-                    Effect.logWarning("orchestration-v2.provider-continuation.retry-check-failed", {
-                      threadId: request.threadId,
-                      providerThreadId: request.providerThreadId,
-                      cause: retryCause,
-                    }).pipe(Effect.andThen(requests.offer(request))),
-                  ),
-                  Effect.forkScoped,
-                );
+    // ardud: archive-if-idle reads the offered requests. The finalizer goes on
+    // as soon as a request is taken, so nothing in between can leave it
+    // pending. A wake still owed after a failed dispatch stays with its adapter.
+    const handle = (request: ProviderContinuationRequests.ProviderContinuationRequest) =>
+      dispatchContinuation(request).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            yield* Effect.logWarning("orchestration-v2.provider-continuation.dispatch-failed", {
+              threadId: request.threadId,
+              providerThreadId: request.providerThreadId,
+              cause,
+            });
+            if (request.delegatedCompletion === undefined) return;
+            const completion = request.delegatedCompletion;
+            const retryKey = delegatedCompletionRetryKey(request, completion);
+            const retryDelay = yield* nextRetryDelay(retryKey);
+            yield* Effect.gen(function* () {
+              yield* Effect.sleep(`${retryDelay} millis`);
+              const projection = yield* threads.getThreadRecords(
+                request.threadId,
+                ["messages", "runs", "providerTurns"],
+                {
+                  messageIds:
+                    request.delegatedCompletion === undefined
+                      ? []
+                      : [request.delegatedCompletion.messageId],
+                },
+              );
+              if (currentDelegatedCompletionDelivery(projection, completion) !== undefined) {
+                yield* requests.offer(request);
+              } else {
+                yield* clearRetryAttempt(retryKey);
               }
-            }),
-          ),
+            }).pipe(
+              Effect.catchCause((retryCause) =>
+                Effect.logWarning("orchestration-v2.provider-continuation.retry-check-failed", {
+                  threadId: request.threadId,
+                  providerThreadId: request.providerThreadId,
+                  cause: retryCause,
+                }).pipe(Effect.andThen(requests.offer(request))),
+              ),
+              Effect.forkScoped,
+            );
+          }),
+        ),
+      );
+
+    yield* Effect.uninterruptibleMask((restore) =>
+      restore(requests.take).pipe(
+        Effect.flatMap((request) =>
+          restore(handle(request)).pipe(Effect.ensuring(requests.settle?.(request) ?? Effect.void)),
         ),
       ),
-      Effect.forever,
-      Effect.forkScoped,
-    );
+    ).pipe(Effect.forever, Effect.forkScoped);
   }),
 );

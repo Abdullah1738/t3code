@@ -539,7 +539,11 @@ export const buildDaily = (input: ReportInput): BuiltReport => {
 
   const youAsked = input.events
     .filter(
-      (event) => isOwnerProvenance(event.provenance) && inWindow(event.at, input.from, input.to),
+      // A report the owner saved is not something he asked.
+      (event) =>
+        isOwnerProvenance(event.provenance) &&
+        event.kind !== "report.saved" &&
+        inWindow(event.at, input.from, input.to),
     )
     .map((event) => `- ${hhmm(event.at)}Z ${sentence(event.summary)}`);
 

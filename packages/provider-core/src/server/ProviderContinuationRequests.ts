@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 
 export interface ProviderContinuationRequest {
   readonly threadId: ThreadId;
@@ -43,6 +44,16 @@ export interface ProviderContinuationRequest {
 export class ProviderContinuationRequests extends Context.Reference<{
   readonly offer: (request: ProviderContinuationRequest) => Effect.Effect<void>;
   readonly take: Effect.Effect<ProviderContinuationRequest>;
+  /**
+   * ardud: whether a request offered for the thread has not been handled yet. Requests live only
+   * in memory, so this is the one place that knows a wake is on its way.
+   */
+  readonly pending?: (threadId: ThreadId) => Effect.Effect<boolean>;
+  /**
+   * ardud: the worker calls this once it is done with a request it took, whatever came of it. A
+   * wake that is still owed after a failed dispatch stays with the adapter that holds it.
+   */
+  readonly settle?: (request: ProviderContinuationRequest) => Effect.Effect<void>;
 }>("@t3tools/provider-core/server/ProviderContinuationRequests", {
   defaultValue: () => ({ offer: () => Effect.void, take: Effect.never }),
 }) {}
@@ -51,10 +62,31 @@ export const layer = Layer.effect(
   ProviderContinuationRequests,
   Effect.gen(function* () {
     const queue = yield* Queue.unbounded<ProviderContinuationRequest>();
+    const outstanding = yield* Ref.make<ReadonlyMap<ThreadId, number>>(new Map());
+    const count = (threadId: ThreadId, delta: number) =>
+      Ref.update(outstanding, (current) => {
+        const updated = new Map(current);
+        const value = (updated.get(threadId) ?? 0) + delta;
+        if (value > 0) {
+          updated.set(threadId, value);
+        } else {
+          updated.delete(threadId);
+        }
+        return updated;
+      });
     return {
+      // The count and the queue move together, or an interrupted offer would
+      // leave a request pending that the worker never takes.
       offer: (request: ProviderContinuationRequest) =>
-        Queue.offer(queue, request).pipe(Effect.asVoid),
+        count(request.threadId, 1).pipe(
+          Effect.andThen(Queue.offer(queue, request)),
+          Effect.asVoid,
+          Effect.uninterruptible,
+        ),
       take: Queue.take(queue),
+      pending: (threadId: ThreadId) =>
+        Ref.get(outstanding).pipe(Effect.map((current) => current.has(threadId))),
+      settle: (request: ProviderContinuationRequest) => count(request.threadId, -1),
     };
   }),
 );

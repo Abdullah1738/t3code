@@ -34,6 +34,16 @@ export interface Config {
   guestEffort?: "minimal" | "low" | "medium" | "high";
   /** iMessage app that renders Sendblue app cards; loadConfig fills in the Spectrum identity. */
   cardApp?: CardApp;
+  /** Chat slugs whose cards render live in the bubble; every other chat gets static cards. Default ["owner"]. */
+  liveCardChats?: string[];
+}
+
+export function liveCardChatsConfig(raw: unknown): string[] {
+  if (raw === undefined) return ["owner"];
+  if (!Array.isArray(raw) || raw.length > 50 || !raw.every(slug => typeof slug === "string" && /^[a-z0-9][a-z0-9._-]{0,99}$/.test(slug))) {
+    throw new Error("Invalid bridge configuration");
+  }
+  return raw as string[];
 }
 
 /** The Messages extension a card is addressed to. Recipients need that app installed to open it. */
@@ -108,7 +118,8 @@ export async function loadConfig(): Promise<Config> {
   if (!/^\+[1-9]\d{6,14}$/.test(config.owner) || typeof config.enabled !== "boolean"
     || typeof config.timezone !== "string") throw new Error("Invalid bridge configuration");
   new Intl.DateTimeFormat("en-US", { timeZone: config.timezone });
-  return { ...config, ...appsConfig(config), cardApp: cardAppConfig(config.cardApp) };
+  return { ...config, ...appsConfig(config), cardApp: cardAppConfig(config.cardApp),
+    liveCardChats: liveCardChatsConfig(config.liveCardChats) };
 }
 
 export async function backendConnection(): Promise<{ baseUrl: string; headers: Record<string, string> }> {

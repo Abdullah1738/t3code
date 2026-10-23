@@ -1926,6 +1926,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         // terminal, otherwise the root terminal can strand child projections.
         const deferredRootTerminals = yield* Ref.make(new Map<string, DeferredCodexRootTerminal>());
         const offeredContinuationItemsByTurn = yield* Ref.make(new Map<string, Set<string>>());
+        // ardud: a settled command leaves the running set before its
+        // continuation is offered; archive-if-idle counts it as held meanwhile.
+        const continuationHandoffs = yield* Ref.make(new Map<string, number>());
+        const countHandoff = (providerThreadId: string, delta: number) =>
+          Ref.update(continuationHandoffs, (current) => {
+            const updated = new Map(current);
+            const next = (current.get(providerThreadId) ?? 0) + delta;
+            if (next > 0) updated.set(providerThreadId, next);
+            else updated.delete(providerThreadId);
+            return updated;
+          });
+        // Released by the enclosing scope, so a failed offer cannot leak a hold.
+        const holdHandoff = (providerThreadId: string) =>
+          Effect.acquireRelease(countHandoff(providerThreadId, 1), () =>
+            countHandoff(providerThreadId, -1),
+          );
         const finalAnswerItemIdsByTurn = yield* Ref.make(new Map<string, Set<string>>());
         const completedFinalAnswerTextsByTurn = yield* Ref.make(new Map<string, Set<string>>());
         // Native completion and the interrupt timeout share one finalization
@@ -2204,6 +2220,28 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
             return false;
           });
+
+        // ardud: archive-if-idle needs one read covering both sides of a
+        // running -> handoff move; separate Ref reads can miss work in transit.
+        const threadHoldsWorkUnsafe = (providerThreadId: string) => {
+          if (Ref.getUnsafe(continuationHandoffs).has(providerThreadId)) return true;
+          const active = Ref.getUnsafe(activeTurns);
+          const contexts = [...active.values(), ...Ref.getUnsafe(settledTurns).values()];
+          const roots = contexts.filter(
+            (context) => context.providerThread.id === providerThreadId,
+          );
+          const commands = Ref.getUnsafe(runningCommandItemsByTurn);
+          const captures = Ref.getUnsafe(pendingMcpAppCaptures);
+          const tools = Ref.getUnsafe(runningDynamicToolsByTurn);
+          return contexts.some((context) => {
+            if (!roots.some((root) => context === root || isDescendantCodexTurn(context, root)))
+              return false;
+            const turnId = context.nativeTurnId;
+            if ((commands.get(turnId)?.size ?? 0) > 0 || captures.has(turnId)) return true;
+            if (context.subagent !== null && active.has(turnId)) return true;
+            return [...(tools.get(turnId)?.values() ?? [])].some(isPersistentCodexDynamicTool);
+          });
+        };
 
         const releaseSettledTurnIfIdle =
           /* Provider events include streaming deltas; avoid a span for each update. */
@@ -3835,6 +3873,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     )
                   : undefined;
               const artifacts = yield* buildDynamicToolArtifacts(context, item);
+              // ardud: held until the item lands, after the capture leaves the set.
+              yield* holdHandoff(context.providerThread.id);
               // Cleared before the final emit: ingestion re-checks pending work
               // after each event, and must see this capture done by then.
               if (!(yield* takePendingMcpAppCapture(nativeTurnId, item.id))) {
@@ -3869,7 +3909,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               if ((yield* Ref.get(settledTurns)).has(nativeTurnId)) {
                 yield* releaseSettledTurnIfIdle(nativeTurnId);
               }
-            }),
+            }).pipe(Effect.scoped),
           );
 
         const terminalizeMcpAppCaptures = Effect.fn("CodexAdapterV2.terminalizeMcpAppCaptures")(
@@ -4890,6 +4930,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (payload.item.type === "commandExecution") {
               // Other tools can retain the context after thread closure.
               if (context.closedCommandItemIds?.has(payload.item.id)) return;
+              if (settled) yield* holdHandoff(context.providerThread.id);
               const turnDrained = yield* clearRunningCommandItem(payload.turnId, payload.item.id);
               const artifacts = yield* buildCommandExecutionArtifacts(context, payload.item);
               yield* emitProviderEvent({
@@ -4957,6 +4998,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "mcpToolCall" || payload.item.type === "dynamicToolCall") {
+              // ardud: covers the gap until the capture registers or the item lands.
+              if (settled) yield* holdHandoff(context.providerThread.id);
               yield* clearRunningDynamicTool(payload.turnId, payload.item.id);
               const appResourceUri = codexMcpAppResourceUri(payload.item);
               if (appResourceUri !== undefined && payload.item.type === "mcpToolCall") {
@@ -5138,7 +5181,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 result: text,
               });
             }
-          }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
+          }).pipe(Effect.scoped, Effect.orDie, turnTerminalizationPermit.withPermits(1)),
         );
 
         yield* client.handleServerRequest("item/commandExecution/requestApproval", (payload) =>
@@ -6607,6 +6650,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
             return false;
           }),
+          holdsWorkForThread: (providerThread) =>
+            Effect.sync(() => threadHoldsWorkUnsafe(providerThread.id)),
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
               Effect.andThen(mcpSessions.read(threadInput.threadId)),
