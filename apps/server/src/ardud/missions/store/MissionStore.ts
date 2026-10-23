@@ -165,10 +165,8 @@ export interface MissionListFilter {
   readonly updatedSince?: string;
   readonly order?: "newest" | "oldest";
   readonly limit?: number;
-  // --- r22 comments ---
   /** Only knocks whose forward still waits on delivery, filtered before the limit. */
   readonly deliveryPending?: boolean;
-  // --- end r22 comments ---
 }
 
 // --- router additions ---
