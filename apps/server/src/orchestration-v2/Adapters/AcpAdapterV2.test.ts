@@ -72,6 +72,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { makeTurnInput } from "./AcpAdapterV2.testkit.ts";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import { sessionHoldsWork } from "../../ardud/archive-if-idle/idle.ts";
 import {
   AcpProviderCapabilitiesV2,
   acpProviderItemNativeId,
@@ -11603,6 +11604,9 @@ describe("AcpAdapterV2", () => {
         0,
         "mid-turn completed mutation must not offer while the root turn is active",
       );
+      // ardud: counted as held, since a deferred finalize offers it outside the callback permit.
+      assert.isFalse(yield* hasPendingBackgroundWork);
+      assert.isTrue(yield* sessionHoldsWork(runtime, providerThread));
 
       yield* Deferred.succeed(promptGates[1]!, { stopReason: "end_turn" });
       const secondProviderTurnId = idAllocator.derive.providerTurn({
@@ -11714,6 +11718,178 @@ describe("AcpAdapterV2", () => {
         0,
         "post-finalize must not offer when the mid-turn completion was handled in-turn",
       );
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  // ardud: archive-if-idle must see a late completion between the running set and its wake.
+  it.effect("holds a settled task's completion while it moves into the wake buffer", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const path = yield* Path.Path;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const protocolEvents = yield* Queue.bounded<EffectAcpProtocol.AcpProtocolLogEvent>(256);
+      const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
+        [];
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+      const promptGates: Array<Deferred.Deferred<EffectAcpSchema.PromptResponse, never>> = [];
+      const probes: Array<{ readonly holds: boolean; readonly pending: boolean }> = [];
+      let probeInGap: (() => void) | undefined;
+      const completion = {
+        taskId: "task-monitor-gap",
+        status: "completed",
+        appendOutput: "GAP_LISTING",
+      } as const;
+      const instanceId = ProviderInstanceId.make("acp-test");
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          enablePostSettleContinuation: true,
+          extractBackgroundTaskId: (toolCall) =>
+            toolCall.toolCallId === "tool-call-monitor-gap" ? "task-monitor-gap" : undefined,
+          // The adapter resumes this iterator after it drops the task from the
+          // running set and before it buffers the wake: the only point in the gap.
+          extractBackgroundTaskCompletion: (toolCall) =>
+            toolCall.toolCallId === "tool-call-fetch-gap"
+              ? Object.assign([completion], {
+                  *[Symbol.iterator]() {
+                    yield completion;
+                    probeInGap?.();
+                  },
+                })
+              : [],
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            environment: { T3_ACP_HANG_PROMPT_FOREVER: "1" },
+            protocolEvents,
+            wrapRuntime: (runtime) => ({
+              ...runtime,
+              handleSessionUpdate: (handler) =>
+                Effect.sync(() => {
+                  sessionUpdateHandler = handler;
+                }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+              prompt: () =>
+                Effect.gen(function* () {
+                  const gate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+                  promptGates.push(gate);
+                  return yield* Deferred.await(gate);
+                }),
+            }),
+          }),
+        },
+        selfInvocation,
+        continuationRequests: {
+          offer: (request) =>
+            Effect.sync(() => {
+              continuationRequests.push(request);
+            }),
+        },
+      });
+      const threadId = ThreadId.make("thread-acp-archive-wake-gap");
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-archive-wake-gap"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const hasPendingBackgroundWork = runtime.hasPendingBackgroundWork;
+      if (hasPendingBackgroundWork === undefined) {
+        return yield* Effect.die("post-settle continuation must expose hasPendingBackgroundWork");
+      }
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* runtime
+        .startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now: yield* DateTime.now,
+            ordinal: 1,
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      while (promptGates.length < 1) {
+        yield* Effect.yieldNow;
+      }
+      if (sessionUpdateHandler === undefined) {
+        return yield* Effect.die("session handler must be wired");
+      }
+      const handler = sessionUpdateHandler;
+      yield* handler({
+        sessionId: "mock-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-call-monitor-gap",
+          title: "Monitor: gap",
+          kind: "execute",
+          status: "pending",
+          rawInput: {},
+        },
+      });
+      yield* Deferred.succeed(promptGates[0]!, { stopReason: "end_turn" });
+      const providerTurnId = idAllocator.derive.providerTurn({
+        driver: ACP_TEST_DRIVER,
+        nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
+      });
+      let terminal: string | null = null;
+      while (terminal === null) {
+        const event = yield* Queue.take(events);
+        if (event.type === "turn.terminal" && event.providerTurnId === providerTurnId) {
+          terminal = event.status;
+        }
+      }
+      assert.equal(terminal, "completed");
+      assert.isTrue(yield* hasPendingBackgroundWork, "the monitor still runs after settle");
+      assert.lengthOf(continuationRequests, 0);
+
+      probeInGap = () => {
+        probes.push({
+          // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- The iterator is synchronous and is the only point inside the gap.
+          holds: Effect.runSync(sessionHoldsWork(runtime, providerThread)),
+          // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- Same point, the old whole-session probe.
+          pending: Effect.runSync(hasPendingBackgroundWork),
+        });
+      };
+      yield* handler({
+        sessionId: "mock-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-call-fetch-gap",
+          title: "get_command_or_subagent_output",
+          kind: "other",
+          status: "completed",
+          rawInput: {},
+          rawOutput: { output: "GAP_LISTING" },
+        },
+      });
+      probeInGap = undefined;
+
+      assert.deepStrictEqual(probes, [{ holds: true, pending: false }]);
+      assert.lengthOf(continuationRequests, 1, "the late completion still offers its wake");
+      assert.isTrue(yield* sessionHoldsWork(runtime, providerThread));
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 

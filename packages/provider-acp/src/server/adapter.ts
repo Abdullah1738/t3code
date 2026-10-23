@@ -7591,6 +7591,38 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }),
         );
 
+        // ardud: one synchronous read, so archive-if-idle never sees half a move.
+        const pendingBackgroundWorkNow = () => {
+          const rootSessionId = Ref.getUnsafe(activeSessionId);
+          if (
+            followsAgentWorkState &&
+            rootSessionId !== null &&
+            hasWorkingDescendant(rootSessionId)
+          )
+            return true;
+          if (
+            followsAgentWorkState &&
+            (agentWork?.state === "running" ||
+              agentWork?.state === "requires_action" ||
+              agentRequests.size > 0)
+          )
+            return true;
+          if (Ref.getUnsafe(wakeBuffer).length > 0) return true;
+          if (Ref.getUnsafe(continuationRequested)) return true;
+          if (Ref.getUnsafe(runningBackgroundTaskIds).size > 0) return true;
+          const active = Ref.getUnsafe(activeTurn);
+          if (
+            active !== null &&
+            [...active.subagents.values()].some(acpSubagentHasPendingBackgroundWork)
+          ) {
+            return true;
+          }
+          const carryover = Ref.getUnsafe(carryoverSubagents);
+          return (
+            carryover !== null && carryover.subagents.some(acpSubagentHasPendingBackgroundWork)
+          );
+        };
+
         const sessionRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: options.instanceId,
           driver,
@@ -7609,40 +7641,23 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               }),
           ...(postSettleContinuationEnabled || followsAgentWorkState
             ? {
-                hasPendingBackgroundWork: Effect.gen(function* () {
-                  const rootSessionId = yield* Ref.get(activeSessionId);
-                  if (
-                    followsAgentWorkState &&
-                    rootSessionId !== null &&
-                    hasWorkingDescendant(rootSessionId)
-                  )
-                    return true;
-                  if (
-                    followsAgentWorkState &&
-                    (agentWork?.state === "running" ||
-                      agentWork?.state === "requires_action" ||
-                      agentRequests.size > 0)
-                  )
-                    return true;
-                  if ((yield* Ref.get(wakeBuffer)).length > 0) return true;
-                  if (yield* Ref.get(continuationRequested)) return true;
-                  if ((yield* Ref.get(runningBackgroundTaskIds)).size > 0) return true;
-                  const active = yield* Ref.get(activeTurn);
-                  if (
-                    active !== null &&
-                    [...active.subagents.values()].some(acpSubagentHasPendingBackgroundWork)
-                  ) {
-                    return true;
-                  }
-                  const carryover = yield* Ref.get(carryoverSubagents);
-                  if (
-                    carryover !== null &&
-                    carryover.subagents.some(acpSubagentHasPendingBackgroundWork)
-                  ) {
-                    return true;
-                  }
-                  return false;
-                }),
+                hasPendingBackgroundWork: Effect.sync(pendingBackgroundWorkNow),
+                // ardud: a finished task leaves the running set before its wake is
+                // buffered and offered, all inside one runtime callback, so a busy
+                // callback counts as held work. Never wait for it: the offer calls
+                // into the orchestrator. A deferred finalize offers for unreported
+                // mid-turn completions outside the permit, so those count too.
+                holdsWorkForThread: () =>
+                  runtimeCallbackPermit
+                    .withPermitsIfAvailable(1)(
+                      Effect.sync(
+                        () =>
+                          pendingBackgroundWorkNow() ||
+                          (postSettleContinuationEnabled &&
+                            Ref.getUnsafe(midTurnUnreportedCompletedTaskIds).size > 0),
+                      ),
+                    )
+                    .pipe(Effect.map(Option.getOrElse(() => true))),
               }
             : {}),
           ensureThread: Effect.fn("AcpAdapterV2.ensureThread")(
