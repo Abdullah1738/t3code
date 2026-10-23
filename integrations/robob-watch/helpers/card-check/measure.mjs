@@ -17,9 +17,15 @@ export function measure(opts) {
   const root = document.scrollingElement || html;
   const rootStyle = getComputedStyle(html);
   const bodyStyle = getComputedStyle(body);
+  // Any containment (contain, container-type, content-visibility) on the root or the body
+  // stops the body's overflow from moving to the viewport (checked in Chrome 154).
+  const contained = (s) => s.contain !== "none" || (s.containerType || "normal") !== "normal" || (s.contentVisibility || "visible") !== "visible";
+  // Paint containment clips an element's content at its box whatever its overflow says.
+  const paintContained = (s) => /paint|strict|content/.test(s.contain) || /^(auto|hidden)$/.test(s.contentVisibility || "visible");
   // CSS overflow propagation: the root's overflow applies to the viewport, and when the
   // root leaves it visible the body's does instead (and the body then clips nothing).
-  const fromBody = rootStyle.overflowX === "visible" && rootStyle.overflowY === "visible";
+  const fromBody =
+    rootStyle.overflowX === "visible" && rootStyle.overflowY === "visible" && bodyStyle.display !== "none" && !contained(rootStyle) && !contained(bodyStyle);
   const vpY = (fromBody ? bodyStyle : rootStyle).overflowY;
   // In the Messages bubble nothing scrolls. On a page the document scrolls unless the
   // viewport's overflow turns that off.
@@ -32,18 +38,22 @@ export function measure(opts) {
     if (!s) styles.set(el, (s = getComputedStyle(el)));
     return s;
   };
-  // Does this element clip its own content? The root never does (its overflow is the
-  // viewport's), nor does a body whose overflow went to the viewport.
-  // Overflow does nothing on inline boxes either.
-  const clipsOwn = (el, axis) =>
-    el !== html && !(el === body && fromBody) && clipped(style(el)[axis]) && !/^(inline|contents|none)$/.test(style(el).display);
+  // Does this element clip its own content? Overflow does nothing on the root (it is the
+  // viewport's), on a body whose overflow went to the viewport, or on inline boxes; paint
+  // containment clips any non-inline box, the root included.
+  const clipsOwn = (el, axis) => {
+    const s = style(el);
+    if (/^(inline|contents|none)$/.test(s.display)) return false;
+    if (paintContained(s)) return true;
+    return el !== html && !(el === body && fromBody) && clipped(s[axis]);
+  };
   const clips = new Map();
-  // Visible region for an element's content: every overflow-clipping ancestor plus the
-  // viewport. A clipping element clips its own content at its padding box.
+  // Visible region for an element's content: every clipping ancestor plus the viewport.
+  // A clipping element clips its own content at its padding box.
   const clipOf = (el) => {
-    if (!el || el === html) return viewport;
+    if (!el) return viewport;
     if (clips.has(el)) return clips.get(el);
-    let c = clipOf(el.parentElement);
+    let c = el === html ? viewport : clipOf(el.parentElement);
     const cx = clipsOwn(el, "overflowX");
     const cy = clipsOwn(el, "overflowY");
     if (c && (cx || cy)) {
@@ -79,39 +89,56 @@ export function measure(opts) {
     if (!blocks.has(e)) blocks.set(e, blocks.size);
     return blocks.get(e);
   };
-  // text-overflow only draws on the block container that clips the line sideways, and
-  // the dots are only seen when no outer box cuts that block too.
+  // text-overflow draws only on the block container that lays the line out (the nearest
+  // non-inline ancestor), only when that block clips sideways, only at its end edge, and
+  // the dots are only seen when no outer box cuts that block too. Returns the edge the
+  // ellipsis covers ("r" or "l") or false.
   const BLOCKISH = /^(block|inline-block|flow-root|list-item|-webkit-box|-webkit-inline-box|table-cell|table-caption)$/;
   const ells = new Map();
   const ellipsisOf = (el) => {
     if (ells.has(el)) return ells.get(el);
     let e = el;
-    while (e && e !== html && !clipsOwn(e, "overflowX")) e = e.parentElement;
+    while (e && e !== html && /^inline$|^contents$/.test(style(e).display)) e = e.parentElement;
     const s = e && e !== html ? style(e) : null;
-    const ok = !!s && s.textOverflow === "ellipsis" && BLOCKISH.test(s.display) && whole(e);
-    ells.set(el, ok);
-    return ok;
+    const ok = !!s && BLOCKISH.test(s.display) && clipsOwn(e, "overflowX") && s.textOverflow === "ellipsis" && whole(e);
+    const edge = ok ? (s.direction === "rtl" ? "l" : "r") : false;
+    ells.set(el, edge);
+    return edge;
   };
-  // An effective -webkit-line-clamp box (clamp + -webkit-box + clipping), returned only
-  // when the clamp box itself is whole on screen, so lines below it were dropped by the
-  // clamp (with its ellipsis) and not by the bubble edge.
-  const clampsOf = new Map();
-  const clampOf = (el) => {
-    if (clampsOf.has(el)) return clampsOf.get(el);
+  // A line clamp that really shortens its box. Computed style can't prove it (Chrome 154
+  // computes both a working -webkit-box clamp and an inert flow-root one as flow-root), so
+  // lay the box out again without height limits, with and then without the clamp: the
+  // clamp works when it alone makes the box shorter, and its edge is that height. A
+  // height crop above that edge is a crop. Only returned when the box is whole on screen.
+  const clamps = new Map();
+  const clampBox = (e) => {
+    if (clamps.has(e)) return clamps.get(e);
     let out = null;
-    for (let e = el; e && e !== html; e = e.parentElement) {
-      const s = style(e);
-      // Chrome 140+ computes a clamped -webkit-box as flow-root (native line-clamp).
-      if (/^\d+$/.test(s.webkitLineClamp || "") && /^(-webkit-(inline-)?box|flow-root|block|inline-block)$/.test(s.display) && clipsOwn(e, "overflowY")) {
-        if (whole(e)) {
-          const r = e.getBoundingClientRect();
-          out = { t: round(r.top + e.clientTop), b: round(r.top + e.clientTop + e.clientHeight) };
-        }
-        break;
+    if (whole(e)) {
+      const old = e.getAttribute("style");
+      const set = (k, v) => e.style.setProperty(k, v, "important");
+      set("height", "auto");
+      set("max-height", "none");
+      set("min-height", "0");
+      set("flex", "0 0 auto");
+      const free = e.clientHeight;
+      set("-webkit-line-clamp", "none");
+      const full = e.clientHeight;
+      if (old === null) e.removeAttribute("style");
+      else e.setAttribute("style", old);
+      if (free < full - 0.5) {
+        const r = e.getBoundingClientRect();
+        out = { t: round(r.top + e.clientTop), b: round(r.top + e.clientTop + free) };
       }
     }
-    clampsOf.set(el, out);
+    clamps.set(e, out);
     return out;
+  };
+  const clampOf = (el) => {
+    for (let e = el; e && e !== html; e = e.parentElement) {
+      if (/^\d+$/.test(style(e).webkitLineClamp || "")) return clampBox(e);
+    }
+    return null;
   };
   const path = (el) => {
     const bits = [];

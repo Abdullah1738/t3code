@@ -67,7 +67,14 @@ const clipV = (x) => {
   const s = inkShown(x);
   return s ? g.b - g.t - (s.b - s.t) : 0;
 };
-const clipH = (x) => (x.vis ? Math.max(0, x.vis.l - x.l) + Math.max(0, x.r - x.vis.r) : 0);
+// Sideways loss, minus the edge an ellipsis covers (ell is "r", "l" or false).
+const clipH = (x) => {
+  if (!x.vis) return 0;
+  const left = Math.max(0, x.vis.l - x.l);
+  const right = Math.max(0, x.r - x.vis.r);
+  return (x.ell === "l" ? 0 : left) + (x.ell === "r" || x.ell === true ? 0 : right);
+};
+const lostH = (x) => (x.vis ? Math.max(0, x.vis.l - x.l) + Math.max(0, x.r - x.vis.r) : 0);
 
 // One finding per element and rule, not one per line box.
 function push(out, f) {
@@ -94,7 +101,7 @@ export function evaluate(m, view, family = "page") {
     if (cut > Math.max(2, 0.15 * (x.size || 16))) {
       push(out, { rule: "cut", level: "FAIL", detail: `text line cut ${Math.round(cut)}px by the ${bubble ? "bubble" : "card"} edge`, sel: x.sel, text: x.text, box: x });
     }
-    if (!x.ell && clipH(x) > 2) {
+    if (clipH(x) > 2) {
       push(out, { rule: "slice", level: "FAIL", detail: "text sliced at the side with no ellipsis", sel: x.sel, text: x.text, box: x });
     }
     const under = bubble ? intoCircle(g, ICON) : 0;
@@ -144,7 +151,7 @@ export function evaluate(m, view, family = "page") {
     }
   }
 
-  const h1 = m.lines.filter((x) => /(^|> )h1/.test(x.sel) && x.vis && clipH(x) > 2);
+  const h1 = m.lines.filter((x) => /(^|> )h1/.test(x.sel) && x.vis && lostH(x) > 2);
   for (const x of h1) push(out, { rule: "headline", level: "WARN", detail: "headline truncated", sel: x.sel, text: x.text, box: x });
 
   const left = m.main.l;

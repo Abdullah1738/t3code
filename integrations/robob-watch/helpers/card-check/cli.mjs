@@ -1,12 +1,12 @@
 // card-check: render Robob cards the way Messages shows them and fail what a person would
 // notice (text under the app icon or in a masked corner, a half-cut line, a lost ETA,
 // sideways scroll, an off-centre card, text under the status bar, a missing preview).
-import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { findChrome, launch } from "./cdp.mjs";
-import { BUILDERS, familyOf, locate, pageDir } from "./families.mjs";
+import { BUILDERS, familyOf, locate, pageDir, stopBuilders } from "./families.mjs";
 import { measure } from "./measure.mjs";
 import { evaluate, KEEP, previewFindings, THEMES, VIEWS } from "./rules.mjs";
 import { sheetHtml, sheetWidth } from "./sheet.mjs";
@@ -34,7 +34,11 @@ function parse(argv) {
     const next = () => argv[++i];
     if (v === "--only") a.only = new Set(next().split(",").map((s) => s.trim().toLowerCase()));
     else if (v === "--out") a.out = resolve(next());
-    else if (v === "--themes") a.themes = next().split(",").filter((t) => THEMES.includes(t));
+    else if (v === "--themes") {
+      a.themes = [...new Set(next().split(",").map((t) => t.trim()).filter(Boolean))];
+      const bad = a.themes.filter((t) => !THEMES.includes(t));
+      if (bad.length || !a.themes.length) throw new Error(`--themes takes ${THEMES.join(",")} (got ${bad.join(",") || "nothing"})`);
+    }
     else if (v === "--jobs") a.jobs = Math.max(1, +next() || 6);
     else if (v === "--timeout") a.timeout = Math.max(30, +next() || 300);
     else if (v === "--family") a.family = next();
@@ -54,14 +58,20 @@ const previewSrc = (dir, image) => {
 };
 
 // Loads og:image from the card page itself (relative URLs resolve against it) and
-// reports the decoded size, so a stub or broken file fails like it would in Messages.
+// decodes its pixels, so a stub or broken file fails like it would in Messages. onload
+// and naturalWidth only prove the header parsed; createImageBitmap needs real pixels.
 const loadImage = (page, image) =>
   page.eval(
     `new Promise((ok) => {
        const img = new Image();
-       const t = setTimeout(() => ok({ error: "timed out" }), 10000);
-       img.onload = () => (clearTimeout(t), ok(img.naturalWidth ? { w: img.naturalWidth, h: img.naturalHeight } : { error: "did not decode" }));
-       img.onerror = () => (clearTimeout(t), ok({ error: "did not load or decode" }));
+       let done = false;
+       const end = (v) => { if (!done) { done = true; clearTimeout(t); ok(v); } };
+       const t = setTimeout(() => end({ error: "timed out" }), 10000);
+       img.onload = () => createImageBitmap(img).then(
+         (bm) => { const v = { w: bm.width, h: bm.height }; bm.close(); end(v); },
+         (e) => end({ error: "did not decode (" + e.name + ")" }),
+       );
+       img.onerror = () => end({ error: "did not load or decode" });
        img.src = new URL(${JSON.stringify(image)}, location.href).href;
      })`,
     15000,
@@ -189,31 +199,56 @@ async function main() {
   const out = a.out || join(process.env.TMPDIR || tmpdir(), "card-check", stamp());
   mkdirSync(join(out, "shots"), { recursive: true });
   const t0 = Date.now();
-  // One deadline for the whole run: sample builds are killed through the signal, the
-  // browser is closed, and the run exits 2.
+  // Renderers get TMPDIR here, so Chrome profiles a killed renderer leaves go with it.
+  const scratch = mkdtempSync(join(out, ".scratch-"));
+  // One deadline for the whole run. On it, or on any failure, the sample builds and
+  // everything they started are stopped and waited for, the browser is closed, and the
+  // run exits 2.
   const abort = new AbortController();
   let browser = null;
+  let cleaning = null;
+  const cleanup = () =>
+    (cleaning ||= (async () => {
+      abort.abort();
+      await stopBuilders();
+      await browser?.close();
+      rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    })());
   const deadline = setTimeout(() => {
     console.error(`card-check: gave up after ${a.timeout}s`);
-    abort.abort();
-    Promise.resolve(browser?.close()).finally(() => process.exit(2));
+    cleanup().finally(() => process.exit(2));
   }, a.timeout * 1000);
   try {
-    await run(a, chrome, out, t0, abort.signal, (b) => (browser = b));
+    await run(a, chrome, out, t0, abort.signal, () => abort.abort(), scratch, (b) => (browser = b));
   } finally {
     clearTimeout(deadline);
-    await browser?.close();
+    await cleanup();
   }
 }
 
-async function run(a, chrome, out, t0, signal, setBrowser) {
+async function run(a, chrome, out, t0, signal, stop, scratch, setBrowser) {
   let cases = [];
   if (a.cmd === "set") {
     const fams = a.args.length ? a.args : Object.keys(BUILDERS);
     const bad = fams.filter((f) => !BUILDERS[f]);
     if (bad.length) throw new Error(`unknown family: ${bad.join(", ")} (ride, delivery, qcard)`);
     const where = locate();
-    const built = await Promise.all(fams.map(async (f) => ({ f, list: await BUILDERS[f](join(out, "cards", f), where, signal) })));
+    // The first family to fail stops the others, and all of them are waited for, so none
+    // is left running unwatched. Its error is the one reported, not the stopped siblings'.
+    let broke = null;
+    const settled = await Promise.allSettled(
+      fams.map(async (f) => {
+        try {
+          return { f, list: await BUILDERS[f](join(out, "cards", f), where, signal, scratch) };
+        } catch (err) {
+          broke ||= err;
+          stop();
+          throw err;
+        }
+      }),
+    );
+    if (broke) throw broke;
+    const built = settled.map((s) => s.value);
     for (const { f, list } of built) {
       for (const c of list) if (!a.only || a.only.has(c.name)) cases.push({ family: f, name: c.name, dir: c.dir, file: join(c.dir, "index.html") });
     }
@@ -254,6 +289,11 @@ async function run(a, chrome, out, t0, signal, setBrowser) {
     for (const t of tasks) {
       if (t.error) t.k.shots.push({ view: t.view, theme: t.theme, png: null, findings: [{ rule: "load", level: "FAIL", detail: t.error, view: t.view.id, theme: t.theme }] });
     }
+    // A PASS has to mean every view was looked at in every theme.
+    const want = VIEWS.length * a.themes.length;
+    const short = cases.filter((k) => k.shots.length !== want);
+    if (signal.aborted) throw new Error("stopped");
+    if (!want || short.length) throw new Error(`checked ${short.map((k) => `${k.name} ${k.shots.length}/${want}`).join(", ") || "no views"}; not reporting a result`);
     for (const k of cases) {
       const meta = k.meta || {};
       k.previewFindings = k.meta ? previewFindings(meta, k.previewImg) : [];

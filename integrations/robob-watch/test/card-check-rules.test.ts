@@ -53,7 +53,14 @@ test("a line cut by the bubble bottom fails, a hairline of ascent padding does n
 test("a side slice fails unless the line ends in an ellipsis", () => {
   const sliced = line(16, 100, 320, 120, { vis: { l: 16, t: 100, r: 259, b: 120 } });
   expect(rules(measure({ lines: [sliced] }))).toContain("FAIL slice");
-  expect(rules(measure({ lines: [{ ...sliced, ell: true }] }))).toEqual([]);
+  expect(rules(measure({ lines: [{ ...sliced, ell: "r" }] }))).toEqual([]);
+  // The ellipsis covers one edge only: text lost off the other edge still fails.
+  const both = line(-64, 100, 320, 120, { vis: { l: 16, t: 100, r: 259, b: 120 }, ell: "r" });
+  expect(rules(measure({ lines: [both] }))).toContain("FAIL slice");
+  // Right-to-left text ends on the left, so its ellipsis covers that edge.
+  const rtl = line(-64, 100, 259, 120, { vis: { l: 16, t: 100, r: 259, b: 120 }, ell: "l" });
+  expect(rules(measure({ lines: [rtl] }))).toEqual([]);
+  expect(rules(measure({ lines: [{ ...sliced, ell: "l" }] }))).toContain("FAIL slice");
 });
 
 test("text in a masked corner fails", () => {

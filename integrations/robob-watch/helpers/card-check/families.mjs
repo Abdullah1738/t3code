@@ -1,13 +1,11 @@
 // Where each card family's renderer lives and how it writes its own acceptance set.
 // The renderers own their samples; this file only knows how to ask for them.
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
-const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const home = homedir();
 const first = (...paths) => paths.find((p) => p && existsSync(p)) || null;
@@ -34,37 +32,90 @@ const lines = (stdout) =>
     .filter((l) => l.trim().startsWith("{"))
     .map((l) => JSON.parse(l));
 
-const BIG = { maxBuffer: 32 * 1024 * 1024, timeout: 180000 };
+// Renderers start their own Chrome (cardpreview, qcard's og shot). Each one runs in its
+// own process group so a stop takes the whole tree, and with TMPDIR pointed at a scratch
+// dir the run owns, so profiles left by a killed renderer are removed with it.
+const kids = new Set();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const groupAlive = (pgid) => {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+};
+async function reap(pgid, ms = 3000) {
+  for (const [sig, wait] of [["SIGTERM", ms], ["SIGKILL", 2000]]) {
+    if (!groupAlive(pgid)) return true;
+    try {
+      process.kill(-pgid, sig);
+    } catch {}
+    for (let t = 0; t < wait && groupAlive(pgid); t += 100) await sleep(100);
+  }
+  return !groupAlive(pgid);
+}
 
-// Every builder takes the run's AbortSignal so the overall --timeout kills it.
-async function buildRide(out, where, signal) {
+// Stops every renderer still running (and anything it started), then waits for them.
+export async function stopBuilders() {
+  const live = [...kids];
+  await Promise.all(live.map((k) => reap(k.pid)));
+  await Promise.all(live.map((k) => Promise.race([k.closed, sleep(2000)])));
+}
+
+function exec(cmd, args, { signal, env, input, timeout = 180000 }) {
+  return new Promise((ok, fail) => {
+    if (signal?.aborted) return fail(new Error("stopped"));
+    const p = spawn(cmd, args, { detached: true, stdio: ["pipe", "pipe", "pipe"], env });
+    let stdout = "";
+    let stderr = "";
+    p.stdout.on("data", (d) => (stdout += d));
+    p.stderr.on("data", (d) => (stderr = (stderr + d).slice(-4000)));
+    const kid = { pid: p.pid, closed: new Promise((r) => p.once("close", r)) };
+    if (p.pid) kids.add(kid);
+    const stop = () => p.pid && reap(p.pid);
+    const timer = setTimeout(stop, timeout);
+    signal?.addEventListener("abort", stop, { once: true });
+    p.once("error", (err) => fail(new Error(`${basename(cmd)}: ${err.message}`)));
+    p.once("close", (code, sig) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      // Whatever it left behind in its group goes too.
+      Promise.resolve(p.pid && groupAlive(p.pid) ? reap(p.pid) : true).finally(() => {
+        kids.delete(kid);
+        if (code === 0) ok(stdout);
+        else fail(new Error(`${basename(cmd)} ${args[0] || ""} failed (${code ?? sig}): ${stderr.trim().split("\n").at(-1) || "no output"}`));
+      });
+    });
+    p.stdin.on("error", () => {});
+    p.stdin.end(input ?? "");
+  });
+}
+
+// Every builder takes the run's AbortSignal and scratch dir.
+async function buildRide(out, where, signal, scratch) {
   if (!where.ride) throw new Error("ride_card.py not found (set CARD_CHECK_RIDE)");
-  const { stdout } = await run("/usr/bin/python3", [where.ride, "sample", "--acceptance", "--out", out], { ...BIG, signal });
+  const stdout = await exec("/usr/bin/python3", [where.ride, "sample", "--acceptance", "--out", out], { signal, env: { ...process.env, TMPDIR: scratch } });
   return lines(stdout).map((r) => ({ name: r.state.toLowerCase(), dir: r.dir }));
 }
 
-async function buildDelivery(out, where, signal) {
+async function buildDelivery(out, where, signal, scratch) {
   if (!where.delivery) throw new Error("delivery_card_samples.py not found (set CARD_CHECK_DELIVERY)");
-  const { stdout } = await run(where.deliveryPython, [where.delivery, "--out", out], {
-    ...BIG,
+  const stdout = await exec(where.deliveryPython, [where.delivery, "--out", out], {
     signal,
-    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    env: { ...process.env, TMPDIR: scratch, PYTHONDONTWRITEBYTECODE: "1" },
   });
   return lines(stdout).map((r) => ({ name: r.state, dir: r.dir }));
 }
 
-async function qspec(where, spec, dir, signal) {
-  return new Promise((ok, fail) => {
-    const p = execFile(where.qcard, ["spec", "-", "--out", dir], { ...BIG, signal }, (err, stdout, stderr) =>
-      err ? fail(new Error(`qcard ${spec.template}: ${stderr || err.message}`)) : ok(stdout),
-    );
-    p.stdin.end(JSON.stringify(spec));
+const qspec = (where, spec, dir, signal, scratch) =>
+  exec(where.qcard, ["spec", "-", "--out", dir], { signal, env: { ...process.env, TMPDIR: scratch }, input: JSON.stringify(spec) }).catch((err) => {
+    throw new Error(`qcard ${spec.template}: ${err.message}`);
   });
-}
 
-async function buildQcard(out, where, signal) {
+async function buildQcard(out, where, signal, scratch) {
   if (!where.qcard) throw new Error("qcard not found (set CARD_CHECK_QCARD)");
-  const { stdout } = await run(where.qcard, ["templates"], { ...BIG, signal });
+  const stdout = await exec(where.qcard, ["templates"], { signal, env: { ...process.env, TMPDIR: scratch } });
   const specs = { ...JSON.parse(stdout), ...QCARD_HARD };
   mkdirSync(out, { recursive: true });
   const names = Object.keys(specs);
@@ -73,7 +124,7 @@ async function buildQcard(out, where, signal) {
     await Promise.all(
       names.slice(i, i + 4).map(async (name) => {
         const dir = join(out, name);
-        await qspec(where, specs[name], dir, signal);
+        await qspec(where, specs[name], dir, signal, scratch);
         done.push({ name, dir });
       }),
     );

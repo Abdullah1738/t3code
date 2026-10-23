@@ -64,10 +64,14 @@ export async function launch(chrome) {
   let dead = null;
   const pending = new Map();
   const listeners = new Set();
+  const waiters = new Set();
+  // A dead transport rejects every call and every event wait at once, so nothing is left
+  // to time out (or reject unhandled) after the run has moved on.
   const fail = (err) => {
     dead ||= err;
     for (const { reject } of pending.values()) reject(dead);
     pending.clear();
+    for (const w of [...waiters]) w.cancel(dead);
   };
   // Resolves once the process is gone (or never started), so close() can wait for it.
   const exited = new Promise((done) => {
@@ -120,20 +124,29 @@ export async function launch(chrome) {
       }
     });
 
-  const waitFor = (sessionId, method, timeout = 15000) =>
-    new Promise((resolve, reject) => {
+  // Returns a promise with cancel(err): the wait is dropped and the promise rejects with err.
+  const waitFor = (sessionId, method, timeout = 15000) => {
+    let w;
+    const promise = new Promise((resolve, reject) => {
+      const end = () => {
+        listeners.delete(fn);
+        waiters.delete(w);
+        clearTimeout(timer);
+      };
       const fn = (msg) => {
         if (msg.sessionId !== sessionId || msg.method !== method) return;
-        listeners.delete(fn);
-        clearTimeout(timer);
+        end();
         resolve(msg.params);
       };
-      const timer = setTimeout(() => {
-        listeners.delete(fn);
-        reject(new Error(`${method}: no event after ${timeout} ms`));
-      }, timeout);
+      const timer = setTimeout(() => (end(), reject(new Error(`${method}: no event after ${timeout} ms`))), timeout);
+      w = { cancel: (err) => (end(), reject(err)) };
+      if (dead) return w.cancel(dead);
       listeners.add(fn);
+      waiters.add(w);
     });
+    promise.cancel = (err) => w.cancel(err);
+    return promise;
+  };
 
   async function newPage() {
     const { targetId } = await send("Target.createTarget", { url: "about:blank" });
@@ -155,10 +168,18 @@ export async function launch(chrome) {
         }
         return r.result.value;
       },
+      // The load wait starts before navigating (the event can beat the reply) and is
+      // dropped if navigation fails, so it never rejects on its own later.
       async goto(url) {
-        const loaded = waitFor(sessionId, "Page.loadEventFired", 20000);
-        const nav = await send("Page.navigate", { url }, sessionId);
-        if (nav.errorText) throw new Error(`navigate ${url}: ${nav.errorText}`);
+        const loaded = waitFor(sessionId, "Page.loadEventFired", 30000);
+        loaded.catch(() => {});
+        try {
+          const nav = await send("Page.navigate", { url }, sessionId);
+          if (nav.errorText) throw new Error(`navigate ${url}: ${nav.errorText}`);
+        } catch (err) {
+          loaded.cancel(err);
+          throw err;
+        }
         await loaded;
       },
       // Fonts, two frames and a beat for on-load layout scripts (card.js fit()).
