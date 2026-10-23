@@ -1591,6 +1591,22 @@ const make = Effect.gen(function* () {
     label: asset.name,
   });
 
+  const requestImage = (asset: Pick<MissionAsset, "subject">) =>
+    asset.subject?.kind === "owner-request";
+
+  // Every reader sees mission events, and an attachment id is enough to fetch the
+  // file, so events about his request images never carry their ids.
+  const assetEvent = (asset: MissionAsset) =>
+    requestImage(asset)
+      ? {
+          subject: { kind: "mission", id: asset.missionId } satisfies MissionRecordRef,
+          payload: { kind: asset.kind, sizeBytes: asset.sizeBytes },
+        }
+      : {
+          subject: assetRef(asset),
+          payload: { assetId: asset.id, kind: asset.kind, sizeBytes: asset.sizeBytes },
+        };
+
   /** The live mission and a caller allowed to add images to it. */
   const assetCaller = Effect.fn("ViewService.assetCaller")(function* (
     missionId: MissionId,
@@ -1639,18 +1655,14 @@ const make = Effect.gen(function* () {
     };
     const path = assetFilePath(attachmentsDir, asset);
     yield* writeAssetFile(path, read.bytes);
+    const event = assetEvent(asset);
     const result = yield* commit({
       missionId,
       kind: "view.asset-added",
       caller,
       summary,
-      subject: assetRef(asset),
-      payload: {
-        assetId: asset.id,
-        kind: asset.kind,
-        sizeBytes: asset.sizeBytes,
-        ...(subject?.kind === "owner-request" ? {} : { subject: asset.subject }),
-      },
+      subject: event.subject,
+      payload: requestImage(asset) ? event.payload : { ...event.payload, subject: asset.subject },
       writes: [{ write: { scope: "asset", value: asset }, counts: false }],
     }).pipe(Effect.onError(() => deleteAssetFile(path)));
     return { asset, path, result };
@@ -1732,13 +1744,14 @@ const make = Effect.gen(function* () {
           changedAt: now,
         };
         const note = input.reason === undefined ? "" : `: ${input.reason}`;
+        const event = assetEvent(asset);
         const result = yield* commit({
           missionId: mission.id,
           kind: "view.asset-removed",
           caller: member,
           summary: `${who(member)} removed image ${asset.name}${note}`,
-          subject: assetRef(asset),
-          payload: { assetId: asset.id, kind: asset.kind, sizeBytes: asset.sizeBytes },
+          subject: event.subject,
+          payload: event.payload,
           writes: [{ write: { scope: "asset", value: removed }, counts: false }],
         });
         yield* deleteAssetFile(assetFilePath(attachmentsDir, asset));
@@ -1760,7 +1773,9 @@ const make = Effect.gen(function* () {
           caller: SYSTEM_CALLER,
           summary: `${active.length} image${active.length === 1 ? "" : "s"} expired with the mission`,
           subject: { kind: "mission", id: missionId },
-          payload: { assetIds: active.map((asset) => asset.id) },
+          payload: {
+            assetIds: active.filter((asset) => !requestImage(asset)).map((asset) => asset.id),
+          },
           writes: active.map((asset) => ({
             write: {
               scope: "asset" as const,

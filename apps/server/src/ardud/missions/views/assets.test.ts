@@ -214,6 +214,53 @@ describe("mission images", () => {
     ),
   );
 
+  it.effect("no event a reader can see names his request images", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const store = yield* MissionStore.MissionStore;
+        const missions = yield* MissionService.MissionService;
+        const upload = yield* threadAttachment(masterThread, png(6, 4));
+        const source = { _tag: "attachment", attachmentId: upload } as const;
+        const removed = yield* views.addRequestImage(ownerApp, {
+          missionId,
+          requestId: "request-a",
+          source,
+        });
+        yield* views.removeAsset(ownerApp, { missionId, assetId: removed.assetId as never });
+        const kept = yield* views.addRequestImage(ownerApp, {
+          missionId,
+          requestId: "request-b",
+          source,
+        });
+        const card = yield* views.addAsset(ownerApp, { missionId, source });
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const subscription = yield* store.subscribe;
+            yield* missions.setMissionStatus(ownerApp, { missionId, status: "archived" });
+            yield* Stream.fromSubscription(subscription).pipe(
+              Stream.filter(
+                (item: MissionStreamItem) =>
+                  item._tag === "upsert" &&
+                  item.record._tag === "event" &&
+                  item.record.record.kind === "view.assets-expired",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+            );
+          }),
+        );
+        const digest = JSON.stringify(yield* missions.digest(missionId, { _tag: "seq", seq: 0 }));
+        assert.include(digest, "view.assets-expired");
+        assert.include(digest, card.ref.id);
+        assert.notInclude(digest, removed.assetId);
+        assert.notInclude(digest, kept.assetId);
+      }),
+    ),
+  );
+
   it.effect("archiving the mission expires its images and deletes their files", () =>
     fresh(
       Effect.gen(function* () {
