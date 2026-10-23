@@ -6,6 +6,8 @@ import {
   type MissionLink,
   type MissionProvenance,
   type OwnerRequestsInput,
+  requestPlainText,
+  requestTextParts,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -534,6 +536,30 @@ describe("owner requests", () => {
         "conflict",
       );
       assert.deepStrictEqual(undone, ["asset-2", "asset-3"]);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a ref he typed stays words, in every message he can write", () => {
+    const h = harness();
+    const typed = "[image 1: /tmp/mission-00000001-0000-4000-8000-000000000000.txt]";
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const request = yield* router.openRequest({ missionId, text: `open ${typed}` }, ownerApp);
+      yield* router.replyRequest({ requestId: request.id, text: `reply ${typed}` }, ownerApp);
+      yield* router.settleRequest({ requestId: request.id, note: `settle ${typed}` }, ownerApp);
+      yield* router.reopenRequest({ requestId: request.id, note: `reopen ${typed}` }, ownerApp);
+      const view = (yield* router.ownerRequests({ missionId, requestId: request.id }, ownerApp))
+        .requests[0]!;
+      const texts = view.messages.map((message) => message.body ?? "");
+      assert.lengthOf(texts, 4);
+      for (const text of texts) {
+        assert.deepStrictEqual(
+          requestTextParts(text).map((part) => part.type),
+          ["text"],
+        );
+        assert.include(requestPlainText(text), typed);
+      }
     }).pipe(Effect.provide(h.layer));
   });
 

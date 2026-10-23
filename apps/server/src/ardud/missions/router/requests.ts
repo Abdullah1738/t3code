@@ -16,6 +16,7 @@ import {
   MissionError,
   MissionMessageId,
   OwnerRequestId,
+  escapeRequestImageRefs,
   placeRequestImages,
   requestImageRef,
   requestPlainText,
@@ -546,7 +547,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           provenance: MissionProvenance,
         ) =>
           images === undefined || images.length === 0
-            ? Effect.succeed(text)
+            ? Effect.succeed(placeRequestImages(text, []))
             : Effect.map(
                 deps.storeImages({ missionId, requestId, images, provenance }),
                 (stored) => {
@@ -840,7 +841,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           );
           const quoted = (opening: boolean) =>
             writer._tag === "master"
-              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${input.quotedFrom}.]\n\n${text}`
+              ? `[${opening ? "Opened" : "Added"} by the master for the owner, quoting what he said in ${escapeRequestImageRefs(input.quotedFrom ?? "")}.]\n\n${text}`
               : text;
           if (prior !== null && subject !== null) {
             const earlier = prior.request;
@@ -1108,12 +1109,13 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           return { result: next, speaker, deliveries: [] as ReadonlyArray<ThreadId> };
         }
         if (master) yield* refuseSilence(noteText);
+        const said = escapeRequestImageRefs(noteText);
         // The owner's closing words are for the master: it wakes once with them.
         const to = owner && masterRoleOf(cast) !== null ? yield* masterAddress(cast) : [];
         const note = messageInput(
           request,
           owner ? "decision" : "status",
-          noteText,
+          said,
           to,
           inboundKeyOf(provenance, request.id),
         );
@@ -1128,7 +1130,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
             const next = withLastReply(
               // The note from deciding the record is news for the owner.
               settler._tag === "system" ? { ...settled, unreadForOwner: true } : settled,
-              noteText,
+              said,
               settler.actor,
               at,
             );
@@ -1198,7 +1200,7 @@ export const makeOwnerRequests = (deps: OwnerRequestDeps) =>
           }
           if (!owner && input.note !== undefined) yield* refuseSilence(input.note);
           // The owner reopening is the owner speaking: the master wakes with everything.
-          const text = input.note ?? "Reopened by the owner.";
+          const text = escapeRequestImageRefs(input.note ?? "Reopened by the owner.");
           const to = owner ? yield* masterAddress(cast) : [];
           const message = messageInput(
             request,
