@@ -5,7 +5,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(HERE, "..", "helpers", "ride-share-check.py")
@@ -70,13 +72,15 @@ if args[0] in ("send", "app") and os.environ.get("FAKE_BRIDGE_PEEK"):
     # What the share journal said while the bridge call was in flight.
     with open(os.environ["FAKE_BRIDGE_PEEK"]) as f, open(os.environ["FAKE_BRIDGE_PEEK"] + ".seen", "a") as g:
         g.write(f.read() + "\\n")
+if args[0] in ("send", "app") and os.environ.get("FAKE_BRIDGE_NO_TO") and opt("--to") == "owner":
+    print('{"error":"Invalid command arguments"}', file=sys.stderr); sys.exit(1)  # an older bridge
 fail = os.environ.get("FAKE_BRIDGE_FAIL") == args[0]
 if fail and os.environ.get("FAKE_BRIDGE_QUEUED"):
     queue(os.environ["FAKE_BRIDGE_QUEUED"])  # accepted, but the reply never came back
 if fail:
     print(os.environ.get("FAKE_BRIDGE_ERR") or "boom", file=sys.stderr); sys.exit(1)
 if args[0] in ("send", "app"):
-    queue("sent")
+    queue(os.environ.get("FAKE_BRIDGE_ACK_STATE") or "sent")
 if args[0] == "publish":
     print(json.dumps({"url": "https://host.ts.net:18401/" + args[2] + "/", "metadataWarnings": []}))
 elif args[0] == "share":
@@ -150,6 +154,29 @@ class Base(unittest.TestCase):
         rows = con.execute("select id, state, attempts from outbox order by rowid").fetchall()
         con.close()
         return rows
+
+    def kv(self, chat, key, value):
+        d = self.bstate if chat == "abdullah" else os.path.join(self.bstate, "chats", chat)
+        con = sqlite3.connect(os.path.join(d, "state.sqlite"))
+        con.execute("insert or replace into kv values (?, ?)", (key, json.dumps(value)))
+        con.commit()
+        con.close()
+
+    def ops(self, chat):
+        return [row[0] for row in self.outbox(chat)]
+
+    def journal_edit(self, who, **fields):
+        path = os.path.join(self.journal, f"{A}.json")
+        with open(path) as f:
+            j = json.load(f)
+        j["recipients"][who].update(fields)
+        with open(path, "w") as f:
+            json.dump(j, f)
+
+    def rc(self):
+        sys.path.insert(0, os.path.dirname(CARD))
+        import ride_card
+        return ride_card
 
     def set_op(self, chat, state, attempts=None):
         """Move every op in a chat's outbox, as the bridge would."""
@@ -957,6 +984,122 @@ class SendTest(Base):
         p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False)
         self.assertIn("can't read the bridge outbox", p.stdout)
         self.assertEqual(len(self.sends()), 1)
+
+    def test_outbox_reads_ops_and_route_in_one_snapshot(self):
+        # The bridge sends the op and rotates the route between two reads: a pending self op read
+        # against the new route would look cancelled-before-send, and the retry would post twice.
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False, FAKE_BRIDGE_FAIL="send",
+                      FAKE_BRIDGE_QUEUED="pending", FAKE_BRIDGE_ERR='{"error":"Bridge request timed out"}')
+        rc, db = self.rc(), os.path.join(self.bstate, "chats", "group-run_club", "state.sqlite")
+        real = rc.sqlite3.connect
+
+        class Racing:
+            def __init__(self, con):
+                self.con = con
+
+            def execute(self, *a):
+                cur = self.con.execute(*a)
+                rows = cur.fetchall()
+                w = real(db)  # the bridge moves on right after the first statement
+                w.execute("update outbox set state = 'sent', attempts = 1")
+                w.execute("update kv set value = ? where key = 'route'",
+                          (json.dumps({"id": "group-thread-2", "generation": 1}),))
+                w.commit()
+                w.close()
+                return Fixed(rows)
+
+            def close(self):
+                self.con.close()
+
+        class Fixed:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchall(self):
+                return self.rows
+
+            def fetchone(self):
+                return self.rows[0] if self.rows else None
+
+        env = {"RIDE_CARD_BRIDGE_STATE": self.bstate, "RIDE_CARD_JOURNAL": self.journal}
+        with unittest.mock.patch.dict(os.environ, env), \
+                unittest.mock.patch.object(rc.sqlite3, "connect", lambda *a, **k: Racing(real(*a, **k))):
+            with open(os.path.join(self.journal, f"{A}.json")) as f:
+                r = json.load(f)["recipients"]["group-run_club"]
+            self.assertEqual(rc.standing(A, "group-run_club", r, "to")[0][0], "sent")
+
+    def test_failed_owner_card_waits_while_the_telegram_fallback_may_send_it(self):
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_FAIL="app",
+                      FAKE_BRIDGE_QUEUED="failed", FAKE_BRIDGE_ERR='{"error":"Bridge request timed out"}')
+        (oid,) = [o for o in self.ops("abdullah") if o.startswith("app:")]
+        self.kv("abdullah", f"firstAttempt:{oid}", int(time.time() * 1000) - 60_000)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", ok=False)
+        self.assertIn("may have reached abdullah (bridge: failed)", p.stdout)
+        self.kv("abdullah", f"fallback:{oid}", {"skipped": 1})  # the fallback gave up on it
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.assertEqual(json.loads(p.stdout)["abdullah"], "sent")
+        first, second = [c for c in self.sends() if c[0] == "app"]
+        self.assertEqual(second[second.index("--key") + 1], f"uber:{A}:card:abdullah:2")
+
+    def test_cut_attempt_with_no_op_is_only_retried_the_same_way(self):
+        # The group's own request died without a reply and left nothing in the outbox yet; it can
+        # still land, so the owner's --to route (another op id) must not race it.
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False, FAKE_BRIDGE_FAIL="send",
+                      FAKE_BRIDGE_ERR='{"error":"Bridge request timed out"}')
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club", ok=False)
+        self.assertIn("may still land", p.stdout)
+        self.assertEqual(len(self.sends()), 1)
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+        first, second = self.sends()
+        self.assertEqual(first[first.index("--key") + 1], second[second.index("--key") + 1])
+        self.assertNotIn("--to", second)
+        self.assertEqual(len(self.outbox("group-run_club")), 1)
+
+    def test_cut_attempt_long_past_can_take_the_owner_route(self):
+        self.set_state(trip(A, "Accepted"), {})
+        self.card_cli("send", "--trip", A, "--session", "group-thread@1", ok=False, FAKE_BRIDGE_FAIL="send",
+                      FAKE_BRIDGE_ERR='{"error":"Bridge request timed out"}')
+        self.journal_edit("group-run_club", attempted_at="2026-01-01T00:00:00Z")
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+        self.assertEqual(self.sends()[-1][self.sends()[-1].index("--to") + 1], "group-run_club")
+
+    def test_queued_card_the_bridge_drops_counts_as_missing_again(self):
+        # Accepted (pending), then a route rotation cancels it before any attempt: not sent after all.
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "group-thread@1", FAKE_BRIDGE_ACK_STATE="pending")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+        rc = self.rc()
+        env = {"RIDE_CARD_BRIDGE_STATE": self.bstate, "RIDE_CARD_JOURNAL": self.journal}
+        with unittest.mock.patch.dict(os.environ, env):
+            self.assertEqual(rc.sent_to(A), {"group-run_club"})
+            self.set_op("group-run_club", "cancelled", attempts=0)
+            self.assertEqual(rc.sent_to(A), set())
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "sent"})
+        first, second = self.sends()
+        self.assertEqual(first[first.index("--text") + 1], second[second.index("--text") + 1])
+        self.assertEqual(second[second.index("--to") + 1], "group-run_club")
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "group-run_club")
+        self.assertEqual(json.loads(p.stdout), {"group-run_club": "already sent"})
+
+    def test_owner_card_falls_back_to_its_own_route_on_an_older_bridge(self):
+        self.set_state(trip(A, "Accepted"), {})
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "abdullah", FAKE_BRIDGE_NO_TO="1")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "sent"})
+        refused, sent = [c for c in self.bridge_calls() if c[0] == "app"]
+        self.assertEqual(refused[refused.index("--to") + 1], "owner")
+        self.assertNotIn("--to", sent)
+        self.assertEqual(refused[refused.index("--key") + 1], sent[sent.index("--key") + 1])
+        self.assertEqual(len(self.outbox("abdullah")), 1)
+        r = self.share_log()["recipients"]["abdullah"]
+        self.assertEqual((r["via"], r["no_to"]), ("self", True))
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3", "--chat", "abdullah", FAKE_BRIDGE_NO_TO="1")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "already sent"})
 
     def test_send_refuses_mismatched_trip(self):
         self.set_state(trip(B, "Accepted"), {})

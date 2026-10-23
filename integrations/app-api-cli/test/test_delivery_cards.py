@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +27,9 @@ class CardTests(unittest.TestCase):
         self.calls = []
         self.fail_send = False
         self.queue_on_fail = None
+        self.fail_err = '{"error":"Bridge request timed out"}'
+        self.no_to = False
+        self.ack_state = 'sent'
         self.bridge_dir = self.root / 'bridge'
         for chat in ('owner', 'moni', 'group-sb_gro'):
             self.store(chat, 'fixture-session', 1)
@@ -37,12 +41,14 @@ class CardTests(unittest.TestCase):
                 return {'shares':[{'app':published[published.index('--app')+1],'live':True,'url':'https://cards.trycloudflare.com/'}] if published else []}
             if args[0] in ('share', 'publish'):
                 return {'url': 'https://cards.trycloudflare.com/' if args[0] == 'share' else 'https://host.ts.net:18400/card/'}
+            if self.no_to and args[0] in ('send', 'app') and args[-2:] == ['--to', 'owner']:
+                raise c.BridgeError('{"error":"Invalid command arguments"}')  # an older bridge
             if self.fail_send:
                 if self.queue_on_fail:
                     self.queue(args, self.queue_on_fail)  # accepted, but the reply was lost
-                raise ValueError('bridge_request_failed')
+                raise c.BridgeError(self.fail_err)
             if args[0] in ('send', 'app'):
-                self.queue(args, 'sent')
+                self.queue(args, self.ack_state)
             return {'id': 'message-fixture', 'created': True}
         for name, value in (('bridge', bridge), ('route', lambda: 'fixture-session')):
             p = patch.object(c, name, value); p.start(); self.addCleanup(p.stop)
@@ -77,6 +83,21 @@ class CardTests(unittest.TestCase):
     def ops(self, chat):
         with sqlite3.connect(self.db(chat)) as con:
             return con.execute('select state, attempts from outbox order by rowid').fetchall()
+
+    def kv(self, chat, key, value):
+        with sqlite3.connect(self.db(chat)) as con:
+            con.execute('insert or replace into kv values (?, ?)', (key, json.dumps(value)))
+
+    def ids(self, chat):
+        with sqlite3.connect(self.db(chat)) as con:
+            return [r[0] for r in con.execute('select id from outbox order by rowid')]
+
+    def card_state(self):
+        return c.read(c.ROOT/'cards/order-talabat-123.json')
+
+    def edit_state(self, **fields):
+        path = c.ROOT/'cards/order-talabat-123.json'
+        c.atomic(path, {**c.read(path), **fields})
 
     def set_ops(self, chat, state, attempts):
         with sqlite3.connect(self.db(chat)) as con:
@@ -343,6 +364,96 @@ class CardTests(unittest.TestCase):
         first, retry = [a for a in self.calls if a[0]=='send']
         self.assertEqual(retry[retry.index('--key')+1], first[first.index('--key')+1] + '#2')
         self.assertEqual([x for x in retry if x.startswith('--text=')], [x for x in first if x.startswith('--text=')])
+
+    def test_outbox_reads_ops_and_route_in_one_snapshot(self):
+        self.fail_send, self.queue_on_fail = True, 'pending'
+        c.sync(self.owner_cfg(), self.data, send=True)
+        args = self.card_state()['send_args']
+        args = [a for i, a in enumerate(args) if a != '--to' and args[i-1] != '--to']  # a legacy self op
+        self.queue(args, 'pending')
+        real = sqlite3.connect
+        db = self.db('owner')
+        class Racing:
+            def __init__(self, con): self.con = con
+            def execute(self, *a):
+                rows = self.con.execute(*a).fetchall()
+                with real(db) as w:  # the bridge sends it and rotates right after the first statement
+                    w.execute("update outbox set state = 'sent', attempts = 1")
+                    w.execute("update kv set value = ? where key = 'route'", (json.dumps({'id': 'rotated', 'generation': 2}),))
+                return type('Rows', (), {'fetchall': lambda _: rows, 'fetchone': lambda _: rows[0] if rows else None})()
+            def close(self): self.con.close()
+        with patch.object(c.sqlite3, 'connect', lambda *a, **k: Racing(real(*a, **k))):
+            self.assertEqual(c.queued(args), 'live')
+
+    def test_failed_owner_card_waits_while_the_telegram_fallback_may_send_it(self):
+        self.fail_send, self.queue_on_fail = True, 'failed'
+        c.sync(self.owner_cfg(), self.data, send=True)
+        self.fail_send = False
+        (oid,) = self.ids('owner')
+        self.kv('owner', f'firstAttempt:{oid}', int(time.time() * 1000) - 60_000)
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'failed:may_have_sent_check_chat')
+        self.kv('owner', f'fallback:{oid}', {'skipped': 1})
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
+        first, retry = [a for a in self.calls if a[0] == 'app']
+        self.assertEqual(retry[retry.index('--key') + 1], first[first.index('--key') + 1] + '#2')
+
+    def test_cut_attempt_with_no_op_keeps_its_route_and_key(self):
+        # A legacy owner card's own-route request died without a reply and left nothing in the outbox
+        # yet: it can still land, so the retry is the same op, not --to owner (another op id).
+        self.fail_send = True
+        c.sync(self.owner_cfg(), self.data, send=True)
+        args = self.card_state()['send_args']
+        legacy = [a for i, a in enumerate(args) if a != '--to' and args[i-1] != '--to']
+        self.edit_state(send_args=legacy)
+        self.fail_send = False
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
+        self.assertNotIn('--to', [a for a in self.calls if a[0] == 'app'][-1])
+        self.assertEqual(len(self.ids('owner')), 1)
+
+    def test_cut_attempt_long_past_moves_to_to_owner(self):
+        self.fail_send = True
+        c.sync(self.owner_cfg(), self.data, send=True)
+        args = self.card_state()['send_args']
+        self.edit_state(send_args=[a for i, a in enumerate(args) if a != '--to' and args[i-1] != '--to'],
+                        attempted_at=time.time() - 3600)
+        self.fail_send = False
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
+        last = [a for a in self.calls if a[0] == 'app'][-1]
+        self.assertEqual(last[last.index('--to') + 1], 'owner')
+
+    def test_refused_send_may_move_route_right_away(self):
+        self.fail_send, self.fail_err = True, '{"error":"Bridge request failed (HTTP 409): No chat for this session"}'
+        c.sync(self.owner_cfg(), self.data, send=True)
+        args = self.card_state()['send_args']
+        self.edit_state(send_args=[a for i, a in enumerate(args) if a != '--to' and args[i-1] != '--to'])
+        self.fail_send = False
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
+        last = [a for a in self.calls if a[0] == 'app'][-1]
+        self.assertEqual(last[last.index('--to') + 1], 'owner')
+
+    def test_queued_card_the_bridge_drops_is_sendable_again(self):
+        self.ack_state = 'pending'
+        self.assertEqual(c.sync(self.cfg, self.data, send=True)['status'], 'sent')
+        self.assertEqual(c.sync(self.cfg, self.data)['status'], 'sent')  # still queued: nothing to do
+        self.set_ops('moni', 'failed', 0)  # the bridge dropped it unsent
+        self.assertEqual(c.sync(self.cfg, self.data)['status'], 'failed:dropped_by_bridge')
+        self.ack_state = 'sent'
+        self.assertEqual(c.sync(self.cfg, self.data, send=True)['status'], 'sent')
+        first, retry = [a for a in self.calls if a[0] == 'send']
+        self.assertEqual(retry[retry.index('--key') + 1], first[first.index('--key') + 1] + '#2')
+        self.assertEqual(c.sync(self.cfg, self.data)['status'], 'sent')
+        self.assertTrue(self.card_state()['bridge_confirmed'])
+        self.set_ops('moni', 'failed', 0)
+        self.assertEqual(c.sync(self.cfg, self.data)['status'], 'sent', 'a confirmed send is never reopened')
+
+    def test_owner_card_on_an_older_bridge_uses_its_own_route(self):
+        self.no_to = True
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
+        refused, sent = [a for a in self.calls if a[0] == 'app']
+        self.assertEqual(refused[-2:], ['--to', 'owner'])
+        self.assertNotIn('--to', sent)
+        self.assertEqual(refused[refused.index('--key') + 1], sent[sent.index('--key') + 1])
+        self.assertTrue(self.card_state()['no_to'])
 
     def test_group_card_chat_gets_the_public_link(self):
         cfg = {**self.cfg,'for':'owner','delivery_card':{'ready':True,'chat':'group-sb_gro'}}

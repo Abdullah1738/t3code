@@ -705,8 +705,10 @@ def load_journal(uuid):
 
 
 def sent_to(uuid):
+    """Recipients whose card the bridge took, minus any the bridge's outbox shows it later dropped."""
     j = read_json(journal_path(uuid), {}) or {}
-    return {r for r, v in (j.get("recipients") or {}).items() if v.get("status") == "sent"}
+    return {who for who, r in (j.get("recipients") or {}).items()
+            if r.get("status") == "sent" and not dropped(who, r)}
 
 
 def bridge(*args, timeout=60):
@@ -824,16 +826,39 @@ def chat_db(who):
     return base / "state.sqlite" if who == "abdullah" else base / "chats" / who / "state.sqlite"
 
 
-def op_kind(state, attempts, stale):
+RETRY_WINDOW_MS = 24 * 3600 * 1000  # the bridge's own retry and fallback window
+
+# One statement is one read snapshot: the op rows, the route and the fallback marks can't be
+# read across a send or a route rotation that happens between two queries.
+OUTBOX_SQL = ("select o.id, o.state, o.attempts, o.payload, "
+              "(select value from kv where key = 'route'), "
+              "(select value from kv where key = 'firstAttempt:' || o.id), "
+              "(select value from kv where key = 'fallback:' || o.id) "
+              "from outbox o where o.id in ({})")
+
+
+def op_kind(oid, state, attempts, stale, first=None, fell=None, owner=False, now_ms=None):
     """How a bridge outbox op stands. live: out, or still queued and deliverable; maybe: the bridge
-    itself can't tell ("uncertain"), or the op was cancelled or is about to be after an attempt that
-    may have reached the phone; dead: never went (refused, or cancelled by a route rotation before
-    any attempt)."""
+    itself can't tell ("uncertain"), the op was cancelled or is about to be after an attempt that
+    may have reached the phone, or a failed card the owner chat's Telegram fallback can still send
+    (only the owner chat has one; it takes failed app ops inside the retry window until it marks
+    them); dead: never went (refused, or cancelled by a route rotation before any attempt)."""
     if state in ("sent", "fallback", "sending") or (state == "pending" and not stale):
         return "live"
     if state == "uncertain" or (state in ("pending", "cancelled") and attempts):
         return "maybe"
+    now_ms = time.time() * 1000 if now_ms is None else now_ms
+    if (owner and state == "failed" and oid.startswith("app:") and fell is None
+            and isinstance(first, (int, float)) and 0 <= now_ms - first < RETRY_WINDOW_MS):
+        return "maybe"
     return "dead"
+
+
+def _kv(value):
+    try:
+        return json.loads(value) if value else None
+    except ValueError:
+        return value
 
 
 def outbox(who, ids):
@@ -844,25 +869,110 @@ def outbox(who, ids):
     try:
         con = sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
         try:
-            rows = con.execute("select id, state, attempts, payload from outbox where id in "
-                               f"({','.join('?' * len(ids))})", list(ids)).fetchall()
-            route = con.execute("select value from kv where key = 'route'").fetchone()
+            rows = con.execute(OUTBOX_SQL.format(",".join("?" * len(ids))), list(ids)).fetchall()
         finally:
             con.close()
-        route = json.loads(route[0]) if route and route[0] else {}
     except (OSError, ValueError, sqlite3.Error):
         return None
     out = {}
-    for oid, state, attempts, payload in rows:
-        try:
-            op = json.loads(payload)
-        except ValueError:
-            op = {}
+    for oid, state, attempts, payload, route, first, fell in rows:
+        op, route = _kv(payload) or {}, _kv(route) or {}
+        if not isinstance(op, dict) or not isinstance(route, dict):
+            return None
         # Session-bound ops (a chat's own route) die with their route; --to ops carry no session.
         stale = (op.get("generation") is not None
                  and (op.get("sessionId"), op.get("generation")) != (route.get("id"), route.get("generation")))
-        out[oid] = (op_kind(state, attempts, stale), state)
+        out[oid] = (op_kind(oid, state, attempts, stale, _kv(first), fell, owner=who == "abdullah"), state)
     return out
+
+
+def refused(err):
+    """True when the bridge said no, or the CLI never sent the request: nothing was queued."""
+    return bool(re.search(r"\(HTTP (4\d\d|503)\)|Invalid command arguments", err or ""))
+
+
+def no_to(err):
+    """An older bridge that doesn't know `--to` for this command (CLI or server refused it)."""
+    return bool(re.search(r"Invalid command arguments|\(HTTP 400\)", err or ""))
+
+
+def _ops(who, r):
+    keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
+    mode = (r.get("payload") or {}).get("mode")
+    if not keys or not mode:
+        return keys, {}, None
+    return keys, {(k, route): op for k in keys for route, op in op_ids(who, mode, k).items()}, \
+        outbox(who, {op for k in keys for op in op_ids(who, mode, k).values()})
+
+
+def dropped(who, r):
+    """A card the bridge took and later dropped unsent: its last op is dead and nothing else is live."""
+    keys, ids, states = _ops(who, r)
+    if not states:
+        return False
+    if any(kind != "dead" for kind, _ in states.values()):
+        return False
+    last = [ids.get((r.get("key") or keys[-1], r["via"]))] if r.get("via") else list(ids.values())
+    return any(op in states for op in last)
+
+
+QUIET_S = 600  # a bridge request can't land this long after its CLI call (that times out in 15s)
+
+
+def quiet(r):
+    """True once the last attempt is old enough that a missing op means the bridge never took it."""
+    try:
+        return time.time() - datetime.fromisoformat(r["attempted_at"].replace("Z", "+00:00")).timestamp() > QUIET_S
+    except (KeyError, AttributeError, ValueError):
+        return False
+
+
+def standing(uuid, who, r, planned):
+    """What the bridge outbox says about the earlier attempts for one recipient.
+
+    Returns (outcome, key): outcome ("sent"|"failed", text) when nothing may be sent now, else None
+    and the key the send on the planned route ("self"|"to") must use. An earlier attempt that left
+    no op and no clear refusal may still land, so only the same route and key (the same bridge op)
+    can carry its retry; a dead or refused op lets any route go again on a key it never used."""
+    keys, ids, states = _ops(who, r)
+    sent = r.get("status") == "sent"
+    fresh = lambda: (keys[-1] if ids.get((keys[-1], planned)) not in (states or {})
+                     else f"uber:{uuid}:card:{who}:{len(keys) + 1}")
+    if not ids:
+        if sent:
+            return ("sent", "already sent"), None
+        return None, (keys[-1] if keys else f"uber:{uuid}:card:{who}")
+    if states is None:
+        if sent:
+            return ("sent", "already sent"), None
+        if r.get("attempts"):
+            return ("failed", f"failed: can't read the bridge outbox for {who}, and an earlier attempt "
+                              "may have gone through; not sending again"), None
+        return None, keys[-1]
+    seen = {}
+    for kind, state in states.values():
+        seen.setdefault(kind, set()).add(state)
+    if "live" in seen:
+        return ("sent", "already sent" if sent
+                else f"already queued (bridge: {', '.join(sorted(seen['live']))})"), None
+    if "maybe" in seen:
+        if sent:
+            return ("sent", f"already sent (bridge: {', '.join(sorted(seen['maybe']))})"), None
+        return ("failed", f"failed: an earlier attempt may have reached {who} (bridge: "
+                          f"{', '.join(sorted(seen['maybe']))}); check the chat before sending again"), None
+    last_key, last_via = r.get("key") or keys[-1], r.get("via")
+    last = [ids[(last_key, last_via)]] if last_via in ("self", "to") else [ids[(last_key, v)] for v in ("self", "to")]
+    if any(op in states for op in last):
+        return None, fresh()  # the bridge took the last one and dropped it unsent
+    if sent:
+        return ("sent", "already sent"), None  # nothing shows it was lost
+    if r.get("attempts") and not r.get("refused") and not quiet(r):
+        if last_via != planned:
+            gone = {"to": "over the owner chat", "self": "from that chat itself"}.get(last_via, "by another route")
+            return ("failed", f"failed: the last attempt for {who} went {gone} and may still land; "
+                              "retry the same way, or check the chat first"), None
+        return None, last_key
+    return None, fresh()
 
 
 def deliver(uuid, recipient, p, session, to, key):
@@ -944,44 +1054,25 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
         _add_extras(uuid, [who for who, _ in plan if who != "abdullah" and who not in everyone])
     for who, to in plan:
         r = recips.setdefault(who, {})
-        if r.get("status") == "sent":
-            result[who] = "already sent"
-            continue
+        mode = (r.get("payload") or {}).get("mode") or modes.get(who) or (
+            "card" if who == "abdullah" else "card" if who == "moni" and moni_has_cards() else "link")
+        if who == "abdullah" and r.get("via") == "self" and r.get("no_to"):
+            to = None  # this bridge refused `--to owner` before: the owner session reaches itself
         via = "to" if to else "self"
         where = f" --to {to}" if to else " to this chat"
-        keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
-        key = keys[-1] if keys else f"uber:{uuid}:card:{who}"
-        if "payload" in r and keys:
-            # Whatever went before, the bridge outbox has the truth: one live op for any key on either
-            # route means the card is out or on its way, and nothing is sent again.
-            ids = {(k, route): op for k in keys for route, op in op_ids(who, r["payload"]["mode"], k).items()}
-            states = outbox(who, set(ids.values()))
-            live = sorted({s for kind, s in (states or {}).values() if kind == "live"})
-            maybe = sorted({s for kind, s in (states or {}).values() if kind == "maybe"})
-            if states is None and r.get("attempts"):
-                result[who] = (f"failed: can't read the bridge outbox for {who}, and an earlier attempt "
-                               "may have gone through; not sending again")
+        outcome, key = standing(uuid, who, r, via)
+        if outcome:
+            kind, text = outcome
+            result[who] = text
+            if kind == "failed":
                 failed = True
-                continue
-            if maybe and not live:
-                result[who] = (f"failed: an earlier attempt may have reached {who} (bridge: {', '.join(maybe)}); "
-                               "check the chat before sending again")
-                failed = True
-                continue
-            if live:
-                result[who] = f"already queued (bridge: {', '.join(live)})"
-                if not dry_run:
-                    r.update(status="sent", sent_at=r.get("sent_at") or iso(time.time()), error=None)
-                    _save_journal(uuid, j)
-                continue
-            if ids[(key, via)] in (states or {}):
-                # This route already holds this key, failed or cancelled; resending it would be a
-                # silent no-op on the bridge, so the retry gets a fresh key.
-                key = f"uber:{uuid}:card:{who}:{len(keys) + 1}"
+            elif not dry_run and r.get("status") != "sent":
+                r.update(status="sent", sent_at=r.get("sent_at") or iso(time.time()), error=None)
+                _save_journal(uuid, j)
+            continue
+        sending = False
         try:
             if "payload" not in r:
-                mode = modes.get(who) or ("card" if who == "abdullah"
-                                          else "card" if who == "moni" and moni_has_cards() else "link")
                 if dry_run:
                     result[who] = f"would publish+send {mode}{where}"
                     continue
@@ -1005,18 +1096,33 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
             if dry_run:
                 result[who] = f"would send {r['payload']['mode']} {r['payload']['url']}{where}"
                 continue
-            # On disk before the bridge call, so a cut process is reconciled from the outbox next time.
-            if key not in keys:
-                keys.append(key)
-            r.update(key=key, keys=keys, via=via, status="attempting", attempts=r.get("attempts", 0) + 1,
-                     attempted_at=iso(time.time()))
-            _save_journal(uuid, j)
-            deliver(uuid, who, r["payload"], session, to, key)
+            keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
+            for attempt in (1, 2):
+                # On disk before the bridge call, so a cut process is reconciled from the outbox next time.
+                if key not in keys:
+                    keys.append(key)
+                r.update(key=key, keys=keys, via=via, status="attempting", attempts=r.get("attempts", 0) + 1,
+                         attempted_at=iso(time.time()), refused=False)
+                _save_journal(uuid, j)
+                sending = True
+                try:
+                    deliver(uuid, who, r["payload"], session, to, key)
+                    break
+                except Exception as ex:
+                    if attempt == 1 and who == "abdullah" and to and no_to(str(ex)):
+                        # An older bridge: nothing was queued, and from the owner session the owner's
+                        # own route reaches the same chat.
+                        to, via, where = None, "self", " to this chat"
+                        r.update(no_to=True, refused=True)
+                        continue
+                    raise
             r.update(status="sent", sent_at=iso(time.time()), error=None)
             result[who] = "sent"
         except Exception as ex:
             err = str(ex)[:300]
             r.update(status="failed", error=err)
+            if sending:
+                r["refused"] = refused(err)
             result[who] = f"failed: {err[:200]}"
             failed = True
         if not dry_run:
