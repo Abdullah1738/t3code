@@ -1,10 +1,18 @@
-import { MissionId } from "@t3tools/contracts";
+import { MissionId, placeRequestImages, type OwnerRequestImage } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 import { isRequestUnread, requestTitle, yourRequests } from "../requestsViewModel.ts";
 import type { Listener, MissionsSource, OwnerRequest, Unsubscribe } from "../source.ts";
 import { AT, CRPKO } from "./data.ts";
 import { fail } from "./util.ts";
+
+/** The fixture keeps no image files: each image shows as its plain label where he put it. */
+function withFixtureImages(text: string, images: ReadonlyArray<OwnerRequestImage> = []): string {
+  return placeRequestImages(
+    text,
+    images.map((_, at) => `[image ${at + 1}]`),
+  ).trim();
+}
 
 // Sample owner requests for the fixture source, shaped like the router's
 // owner-request records once mapped for the UI.
@@ -191,8 +199,8 @@ export function createRequests(ctx: RequestsContext): RequestsSource & {
     subscribeRequest: ({ requestId }, listener) =>
       watch(() => requests.find((request) => request.id === requestId) ?? null, listener),
 
-    openRequest({ missionId, text, subject }) {
-      const body = text.trim();
+    openRequest({ missionId, text, subject, images }) {
+      const body = withFixtureImages(text, images);
       if (body === "") return fail("invalid", "Write what you want first.");
       const at = nowIso();
       // One open request per record: Discuss again continues it.
@@ -240,8 +248,8 @@ export function createRequests(ctx: RequestsContext): RequestsSource & {
       return Promise.resolve(request);
     },
 
-    replyRequest({ requestId, text }) {
-      const body = text.trim();
+    replyRequest({ requestId, text, images }) {
+      const body = withFixtureImages(text, images);
       if (body === "") return fail("invalid", "Write a reply first.");
       return update(requestId, (request) => {
         if (request.status === "settled") return "Reopen it before replying.";
