@@ -140,6 +140,8 @@ import { asksWsHandlers } from "./ardud/missions/asks/ws.ts";
 import { viewsWsHandlers } from "./ardud/missions/views/ws.ts";
 // ardud missions: guard
 import { makeWsGuard } from "./ardud/missions/guard/ws.ts";
+// ardud missions: request images
+import { guardRequestImageUrl } from "./ardud/missions/views/requestImageAccess.ts";
 // ardud missions: recovery
 import { RecoveryService } from "./ardud/missions/recovery/RecoveryService.ts";
 import { makeRecoveryWsHandlers } from "./ardud/missions/recovery/ws.ts";
@@ -2837,6 +2839,11 @@ export const layerWsRpc = (
           /* Request instrumentation already owns the span; keep this helper in that context. */
           Effect.fnUntraced(function* (input) {
             const path = yield* Path.Path;
+            // ardud missions: request images - only for readers of his words.
+            yield* guardRequestImageUrl(
+              { surface: clientOrigin.surface, session: currentSession, sql },
+              input.resource,
+            );
             if (
               input.resource._tag === "attachment" ||
               input.resource._tag === "native-app-icon" ||
