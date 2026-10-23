@@ -17,6 +17,7 @@ import {
   type DraftNoteScopeChoice,
   type MissionViewsState,
   type OwnerRequest,
+  type RequestDraftImage,
   type ViewSectionChange,
 } from "@t3tools/client-runtime/ardud/missions";
 
@@ -73,9 +74,14 @@ export function reactToCall(callId: string, reaction: "ok") {
  * Discuss on any Needs-you card: the owner's words open a request about the
  * record, or add to the one already open about it. The record keeps waiting.
  */
-export function discussRecord(missionId: MissionId, subject: MissionRecordRef, text: string) {
+export function discussRecord(
+  missionId: MissionId,
+  subject: MissionRecordRef,
+  text: string,
+  images: ReadonlyArray<RequestDraftImage> = [],
+) {
   return submitMissionInput(
-    discussRequestInput(missionId, subject, text),
+    discussRequestInput(missionId, subject, text, images),
     async (input) => {
       await missionsSource.openRequest(input);
     },
@@ -150,10 +156,14 @@ export function askAboutSection(
 // --- Your requests ---
 
 /** Resolves to the new request, or null when it couldn't be sent. */
-export async function openRequest(missionId: MissionId, text: string) {
+export async function openRequest(
+  missionId: MissionId,
+  text: string,
+  images: ReadonlyArray<RequestDraftImage> = [],
+) {
   const created: { request: OwnerRequest | null } = { request: null };
   const sent = await submitMissionInput(
-    openRequestInput(missionId, text),
+    openRequestInput(missionId, text, images),
     async (input) => {
       created.request = await missionsSource.openRequest(input);
     },
@@ -162,9 +172,13 @@ export async function openRequest(missionId: MissionId, text: string) {
   return sent ? created.request : null;
 }
 
-export function replyRequest(requestId: string, text: string) {
+export function replyRequest(
+  requestId: string,
+  text: string,
+  images: ReadonlyArray<RequestDraftImage> = [],
+) {
   return submitMissionInput(
-    replyRequestInput(requestId, text),
+    replyRequestInput(requestId, text, images),
     (input) => missionsSource.replyRequest(input),
     "Couldn't send the reply",
   );

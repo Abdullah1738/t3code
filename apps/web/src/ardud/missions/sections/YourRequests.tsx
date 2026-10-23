@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { ArrowLeftIcon, SendIcon } from "lucide-react";
 
-import type { MissionId } from "@t3tools/contracts";
+import { requestPlainText, type MissionId } from "@t3tools/contracts";
 import {
   ageView,
   formatRelative,
@@ -18,7 +18,6 @@ import {
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { Button } from "../../../components/ui/button";
-import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
 import {
   AgeElement,
@@ -38,6 +37,8 @@ import {
   settleRequest,
 } from "../missionCommands";
 import { useOwnerRequest, useOwnerRequestsFeed } from "../missionsStore";
+import { AttachImagesButton, RequestEditor, useRequestDraft } from "../RequestEditor";
+import { RequestText } from "../RequestText";
 import { FeedError } from "./FeedError";
 import { FoldButton, LoadingRows, SectionShell } from "./SectionShell";
 
@@ -182,56 +183,46 @@ export function RequestComposer(props: {
   /** Escape, or leaving it empty, closes it. */
   onCancel?: () => void;
 }) {
-  const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
-  const send = async () => {
-    setBusy(true);
-    const created = await openRequest(props.missionId, text);
-    setBusy(false);
-    if (created) {
-      setText("");
-      props.onOpened(created.id);
-    }
+  const draft = useRequestDraft();
+  const send = () => {
+    if (draft.empty || draft.busy) return;
+    let created: OwnerRequest | null = null;
+    void draft
+      .send(async (text, images) => {
+        created = await openRequest(props.missionId, text, images);
+        return created !== null;
+      })
+      .then(() => {
+        if (created) props.onOpened(created.id);
+      });
   };
   return (
     <form
-      className="flex min-w-0 items-end gap-2"
+      className="flex min-w-0"
       onSubmit={(event) => {
         event.preventDefault();
-        void send();
+        send();
       }}
     >
-      <Textarea
-        size="sm"
-        autoFocus={props.autoFocus}
-        aria-label="Ask or tell the master"
+      <RequestEditor
+        draft={draft}
+        label="Ask or tell the master"
         placeholder="Ask or tell the master"
-        value={text}
-        onChange={(event) => setText(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-            event.preventDefault();
-            void send();
-          }
-          if (event.key === "Escape" && props.onCancel) {
-            event.preventDefault();
-            props.onCancel();
-          }
-        }}
-        onBlur={(event) => {
-          const next = event.relatedTarget;
-          const inForm = next instanceof Node && event.currentTarget.form?.contains(next);
-          if (props.onCancel && text.trim() === "" && !inForm) props.onCancel();
-        }}
-      />
-      <Button
-        type="submit"
-        size="icon-sm"
-        aria-label="Send to the master"
-        disabled={busy || text.trim() === ""}
+        autoFocus={props.autoFocus}
+        onSubmit={send}
+        onEscape={props.onCancel}
+        onLeaveEmpty={props.onCancel}
       >
-        <SendIcon aria-hidden />
-      </Button>
+        <AttachImagesButton draft={draft} disabled={draft.busy} />
+        <Button
+          type="submit"
+          size="icon-sm"
+          aria-label="Send to the master"
+          disabled={draft.busy || draft.empty}
+        >
+          <SendIcon aria-hidden />
+        </Button>
+      </RequestEditor>
     </form>
   );
 }
@@ -268,7 +259,7 @@ function RequestRow(props: { request: OwnerRequest; nowMs: number; onOpen: () =>
         {age ? <AgeElement age={age} at={request.updatedAt} /> : <span />}
         {reply ? (
           <span className="col-start-2 col-end-5 min-w-0 text-sm text-(--m-muted) max-sm:line-clamp-2 sm:truncate">
-            {reply.text.split("\n")[0]}
+            {requestPlainText(reply.text).split("\n")[0]}
           </span>
         ) : null}
       </button>
@@ -327,14 +318,11 @@ export function RequestThread(props: {
   useEffect(() => {
     root.current?.scrollIntoView({ block: "nearest" });
   }, []);
-  const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
+  const draft = useRequestDraft();
   const settled = request.status === "settled";
-  const run = async (action: () => Promise<boolean>, clear = false) => {
-    setBusy(true);
-    const sent = await action();
-    setBusy(false);
-    if (sent && clear) setText("");
+  const reply = () => {
+    if (draft.empty || draft.busy) return;
+    void draft.send((text, images) => replyRequest(request.id, text, images));
   };
   return (
     <div ref={root} className="flex min-w-0 scroll-mt-4 flex-col gap-3">
@@ -365,40 +353,40 @@ export function RequestThread(props: {
         </div>
       ) : null}
       {settled ? null : (
-        <div className="mt-2 flex max-w-[72ch] min-w-0 items-end gap-2">
-          <Textarea
-            size="sm"
-            aria-label="Reply to the master"
-            placeholder="Reply to the master"
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-          />
+        <RequestEditor
+          draft={draft}
+          label="Reply to the master"
+          placeholder="Reply to the master"
+          onSubmit={reply}
+          className="mt-2 max-w-[72ch] gap-2"
+        >
+          <AttachImagesButton draft={draft} disabled={draft.busy} />
           <Button
             size="sm"
             variant="secondary"
-            disabled={busy || text.trim() === ""}
-            onClick={() => void run(() => replyRequest(request.id, text), true)}
+            disabled={draft.busy || draft.empty}
+            onClick={reply}
           >
             Send
           </Button>
-        </div>
+        </RequestEditor>
       )}
       <div className="flex min-w-0 items-center gap-1.5 border-t border-(--m-rule) pt-3">
         {settled ? (
           <Button
             size="sm"
-            disabled={busy}
-            onClick={() => void run(() => reopenRequest(request.id))}
+            disabled={draft.busy}
+            onClick={() => void draft.run(() => reopenRequest(request.id), false)}
           >
             Reopen
           </Button>
         ) : (
           <Button
             size="sm"
-            disabled={busy}
-            onClick={() => void run(() => settleRequest(request.id, text), true)}
+            disabled={draft.busy}
+            onClick={() => void draft.run((note) => settleRequest(request.id, note), true)}
           >
-            {text.trim() === "" ? "Settle" : "Settle with note"}
+            {draft.words === "" ? "Settle" : "Settle with note"}
           </Button>
         )}
       </div>
@@ -430,7 +418,7 @@ function ConversationMessage(props: { message: OwnerRequestMessage; nowMs: numbe
           owner ? "rounded-3xl bg-(--m-raised) px-4 py-3 leading-5.5" : "leading-6",
         )}
       >
-        {message.text}
+        <RequestText text={message.text} />
       </p>
       <MessageRefs message={message} />
     </li>
@@ -463,7 +451,9 @@ export function RequestMessage(props: { message: OwnerRequestMessage; nowMs: num
           </span>
         ) : null}
       </div>
-      <p className="text-sm leading-5.5 text-pretty whitespace-pre-line">{message.text}</p>
+      <p className="text-sm leading-5.5 text-pretty whitespace-pre-line">
+        <RequestText text={message.text} />
+      </p>
       <MessageRefs message={message} />
     </li>
   );
