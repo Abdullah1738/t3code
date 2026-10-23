@@ -89,6 +89,11 @@ test("keep: missing, hidden and clamped", () => {
   // Without a clamp box (or with nothing left on screen) the same loss is a FAIL.
   expect(rules(measure({ keep: [{ sel: "h1", items: [item([{ ...first, clamp: null }, { ...dropped, clamp: null }])] }] }))).toContain("FAIL keep");
   expect(rules(measure({ keep: [{ sel: "h1", items: [item([{ ...first, vis: null }, dropped])] }] }))).toContain("FAIL keep");
+  // A required element with no visible text in it (empty, zero-size, transparent) fails; an
+  // optional one may be shapes only.
+  const blank = { rendered: true, box: { l: 50, t: 60, r: 225, b: 85 }, vis: { l: 50, t: 60, r: 225, b: 85 }, lines: [], text: "Missing headline" };
+  expect(rules(measure({ keep: [{ sel: "h1", items: [blank] }] }))).toEqual(["FAIL keep"]);
+  expect(rules(measure({ keep: [{ sel: "?ol.steps", optional: true, items: [blank] }] }))).toEqual([]);
   // A bubble-only selector is not judged on the page view.
   const pageSize = { vw: 390, vh: 844, sw: 390, sh: 844, main: { l: 16, t: 0, r: 374, b: 800 } };
   expect(rules(measure({ ...pageSize, keep: [{ sel: ".summary", only: "bubble", items: [] }] }), page)).toEqual([]);
@@ -107,6 +112,18 @@ test("safe area: text under the status bar fails only with viewport-fit=cover", 
   const m = measure({ vw: 390, vh: 844, sw: 390, sh: 844, main: { l: 16, t: 0, r: 374, b: 800 }, lines: [top] });
   expect(rules(m, page)).toContain("FAIL safe-area");
   expect(rules({ ...m, meta: { viewport: "width=device-width" } }, page)).toEqual([]);
+  // A footer pinned to the screen bottom sits over the home indicator even on a long page;
+  // the same line in the flow of a long page is far above the page end.
+  const long = { ...m, sh: 1500, lines: [line(50, 826, 200, 844)] };
+  expect(rules({ ...long, lines: [line(50, 826, 200, 844, { fixed: true })] }, page)).toContain("FAIL safe-area");
+  expect(rules(long, page)).toEqual([]);
+});
+
+test("text under a clip shape or mask that can't be measured fails", () => {
+  const masked = line(46, 100, 200, 120, { odd: "a mask" });
+  expect(rules(measure({ lines: [masked] }))).toContain("FAIL clip");
+  const item = { rendered: true, box: {}, vis: true, lines: [masked], text: "Arrives" };
+  expect(rules(measure({ keep: [{ sel: "h1", items: [item] }] }))).toContain("FAIL keep");
 });
 
 test("ink box sits inside the line rect", () => {

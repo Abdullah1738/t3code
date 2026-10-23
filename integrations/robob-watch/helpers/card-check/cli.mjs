@@ -72,10 +72,11 @@ const loadImage = (page, image) =>
          (e) => end({ error: "did not decode (" + e.name + ")" }),
        );
        img.onerror = () => end({ error: "did not load or decode" });
-       img.src = new URL(${JSON.stringify(image)}, location.href).href;
+       try { img.src = new URL(${JSON.stringify(image)}, location.href).href; }
+       catch { end({ error: "not a valid URL" }); }
      })`,
     15000,
-  );
+  ).catch((err) => ({ error: String(err.message || err) }));
 
 async function shoot(page, url, view, theme, keep, pngPath) {
   await page.send("Emulation.setDeviceMetricsOverride", { width: view.w, height: view.h, deviceScaleFactor: view.scale, mobile: true });
@@ -214,10 +215,15 @@ async function main() {
       await browser?.close();
       rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     })());
-  const deadline = setTimeout(() => {
-    console.error(`card-check: gave up after ${a.timeout}s`);
-    cleanup().finally(() => process.exit(2));
-  }, a.timeout * 1000);
+  const giveUp = (why, code) => {
+    console.error(`card-check: ${why}`);
+    cleanup().finally(() => process.exit(code));
+  };
+  const deadline = setTimeout(() => giveUp(`gave up after ${a.timeout}s`, 2), a.timeout * 1000);
+  // Builders run in their own process groups and Chrome outlives a killed parent, so a
+  // signal has to go through the same cleanup or they are left running.
+  const onSignal = (sig) => giveUp(`stopped by ${sig}`, 128 + (sig === "SIGINT" ? 2 : sig === "SIGHUP" ? 1 : 15));
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(sig, onSignal);
   try {
     await run(a, chrome, out, t0, abort.signal, () => abort.abort(), scratch, (b) => (browser = b));
   } finally {
@@ -287,7 +293,10 @@ async function run(a, chrome, out, t0, signal, stop, scratch, setBrowser) {
       }
     });
     for (const t of tasks) {
-      if (t.error) t.k.shots.push({ view: t.view, theme: t.theme, png: null, findings: [{ rule: "load", level: "FAIL", detail: t.error, view: t.view.id, theme: t.theme }] });
+      // A shot that was taken stands; the error only fills in the views that have none.
+      if (t.error && !t.k.shots.some((s) => s.view.id === t.view.id && s.theme === t.theme)) {
+        t.k.shots.push({ view: t.view, theme: t.theme, png: null, findings: [{ rule: "load", level: "FAIL", detail: t.error, view: t.view.id, theme: t.theme }] });
+      }
     }
     // A PASS has to mean every view was looked at in every theme.
     const want = VIEWS.length * a.themes.length;

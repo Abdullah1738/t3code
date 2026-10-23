@@ -104,6 +104,9 @@ export function evaluate(m, view, family = "page") {
     if (clipH(x) > 2) {
       push(out, { rule: "slice", level: "FAIL", detail: "text sliced at the side with no ellipsis", sel: x.sel, text: x.text, box: x });
     }
+    if (x.odd) {
+      push(out, { rule: "clip", level: "FAIL", detail: `text under ${x.odd}: can't tell what of it shows`, sel: x.sel, text: x.text, box: x });
+    }
     const under = bubble ? intoCircle(g, ICON) : 0;
     if (under > 0.5) {
       push(out, { rule: "icon", level: "FAIL", detail: `text ${Math.ceil(under)}px under the app icon`, sel: x.sel, text: x.text, box: x });
@@ -121,7 +124,14 @@ export function evaluate(m, view, family = "page") {
       continue;
     }
     for (const i of rendered) {
-      const lost = i.lines.length ? i.lines.filter((x) => !inkShown(x) || clipV(x) > 1) : i.vis ? [] : [i];
+      // A required element has to show text a person can read: a box with no visible text
+      // in it (empty, zero-size or transparent text) is as good as missing. Optional ones
+      // may be shapes only (the compact step dots hide their labels on purpose).
+      if (!i.lines.length && !k.optional) {
+        push(out, { rule: "keep", level: "FAIL", detail: `${k.sel} shows no text`, sel: k.sel, text: i.text, box: i.box });
+        continue;
+      }
+      const lost = i.lines.length ? i.lines.filter((x) => !inkShown(x) || clipV(x) > 1 || x.odd) : i.vis ? [] : [i];
       if (!lost.length) continue;
       // A working line clamp is a chosen shortening, not a crop: part of the text still
       // shows, and every lost line sits below a clamp box that is itself whole on screen.
@@ -164,9 +174,10 @@ export function evaluate(m, view, family = "page") {
   if (!bubble && ins && /viewport-fit\s*=\s*cover/.test(m.meta.viewport || "")) {
     const top = shown.filter((x) => x.vis.t < ins.top - 0.5);
     for (const x of top) push(out, { rule: "safe-area", level: "FAIL", detail: `text under the status bar (top ${Math.round(x.vis.t)}px < ${ins.top}px)`, sel: x.sel, text: x.text, box: x });
-    const floor = Math.max(m.sh, m.vh) - ins.bottom;
-    const low = shown.filter((x) => x.vis.b > floor + 0.5);
-    for (const x of low) push(out, { rule: "safe-area", level: "FAIL", detail: "text under the home indicator at the end of the page", sel: x.sel, text: x.text, box: x });
+    // Text pinned to the screen sits over the home indicator however far the page scrolls;
+    // the rest only reaches it at the end of the page.
+    const low = shown.filter((x) => x.vis.b > (x.fixed ? m.vh : Math.max(m.sh, m.vh)) - ins.bottom + 0.5);
+    for (const x of low) push(out, { rule: "safe-area", level: "FAIL", detail: `text under the home indicator${x.fixed ? "" : " at the end of the page"}`, sel: x.sel, text: x.text, box: x });
   }
   return out;
 }
