@@ -18,7 +18,19 @@ import {
   toSafeThreadAttachmentSegment,
 } from "../../../attachmentStore.ts";
 import * as ServerConfig from "../../../config.ts";
-import { masterThread, missionId, ownerApp, seed } from "../asks/AsksService.testkit.ts";
+import {
+  agent,
+  failureCode,
+  laneThread,
+  masterThread,
+  missionId,
+  otherMasterThread,
+  otherMissionId,
+  ownerApp,
+  seed,
+  seedOther,
+  writerThread,
+} from "../asks/AsksService.testkit.ts";
 import { guardRequestImageUrl, type RequestImageCaller } from "./requestImageAccess.ts";
 import { ViewService } from "./ViewService.ts";
 import { fresh } from "./views.testkit.ts";
@@ -142,6 +154,145 @@ describe("request image URLs", () => {
         yield* drop(`${id}.png`);
         assert.equal(yield* refusal(reader, id), "AssetAttachmentNotFoundError");
         assert.equal(yield* refusal(owner, id), "allowed");
+      }),
+    ),
+  );
+});
+
+/** One of his request images in m-1, and the path the master's wake names. */
+const storedRequestImage = Effect.gen(function* () {
+  yield* seed;
+  const views = yield* ViewService;
+  const upload = yield* threadAttachment(masterThread);
+  const stored = yield* views.addRequestImages(ownerApp, {
+    missionId,
+    requestId: "request-a",
+    sources: [{ _tag: "attachment", attachmentId: upload }],
+  });
+  return stored.images[0]!;
+});
+
+const fileSource = (path: string) => ({ _tag: "file" as const, path });
+
+describe("request image copies", () => {
+  it.effect("an agent other than the master can't copy his image by its wake path", () =>
+    fresh(
+      Effect.gen(function* () {
+        const image = yield* storedRequestImage;
+        const views = yield* ViewService;
+        const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+        const dir = NodeFS.realpathSync(attachmentsDir);
+        const filesBefore = NodeFS.readdirSync(dir).length;
+        const real = NodeFS.realpathSync(image.path);
+
+        const link = NodePath.join(dir, "..", "linked.png");
+        NodeFS.symlinkSync(real, link);
+        const file = NodePath.basename(real);
+        // Template strings, since path.join would tidy the `.` and `..` away.
+        const spellings = [
+          image.path,
+          real,
+          `${dir}/./${file}`,
+          `${dir}/../${NodePath.basename(dir)}/${file}`,
+          link,
+        ];
+        // Case-insensitive disks reach the same file under another spelling.
+        const upper = NodePath.join(dir, file.toUpperCase());
+        if (NodeFS.existsSync(upper)) spellings.push(upper);
+
+        for (const path of spellings) {
+          for (const caller of [agent(writerThread), agent(laneThread)]) {
+            assert.equal(
+              yield* failureCode(views.addAsset(caller, { missionId, source: fileSource(path) })),
+              "forbidden",
+              path,
+            );
+          }
+        }
+        assert.deepEqual((yield* views.snapshot(missionId)).assets ?? [], []);
+        assert.equal(NodeFS.readdirSync(dir).length, filesBefore);
+      }),
+    ),
+  );
+
+  it.effect("the owner and the mission's master can still copy it", () =>
+    fresh(
+      Effect.gen(function* () {
+        const image = yield* storedRequestImage;
+        const views = yield* ViewService;
+        const real = NodeFS.realpathSync(image.path);
+        for (const caller of [ownerApp, agent(masterThread)]) {
+          yield* views.addAsset(caller, { missionId, source: fileSource(real) });
+        }
+        assert.equal((yield* views.snapshot(missionId)).assets?.length, 2);
+      }),
+    ),
+  );
+
+  it.effect("another mission's master can't copy it into theirs", () =>
+    fresh(
+      Effect.gen(function* () {
+        const image = yield* storedRequestImage;
+        yield* seedOther;
+        const views = yield* ViewService;
+        assert.equal(
+          yield* failureCode(
+            views.addAsset(agent(otherMasterThread), {
+              missionId: otherMissionId,
+              source: fileSource(NodeFS.realpathSync(image.path)),
+            }),
+          ),
+          "forbidden",
+        );
+      }),
+    ),
+  );
+
+  it.effect("only his side and the master can file a copy as his", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+        const shot = NodePath.join(NodeFS.realpathSync(attachmentsDir), "..", "shot.png");
+        NodeFS.writeFileSync(shot, png(12, 8));
+        const subject = { kind: "owner-request" as const, id: "request-a" };
+        assert.equal(
+          yield* failureCode(
+            views.addAsset(agent(writerThread), { missionId, source: fileSource(shot), subject }),
+          ),
+          "forbidden",
+        );
+        yield* views.addAsset(agent(masterThread), {
+          missionId,
+          source: fileSource(shot),
+          subject,
+        });
+      }),
+    ),
+  );
+
+  it.effect("ordinary images still copy for any agent of the mission", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+        const shot = NodePath.join(NodeFS.realpathSync(attachmentsDir), "..", "shot.png");
+        NodeFS.writeFileSync(shot, png(12, 8));
+        const added = yield* views.addAsset(agent(writerThread), {
+          missionId,
+          source: fileSource(shot),
+          subject: { kind: "work-item", id: "wi-held" },
+        });
+        // A mission image that isn't his copies again too.
+        const copy = NodePath.join(NodeFS.realpathSync(attachmentsDir), `${added.ref.id}.png`);
+        yield* views.addAsset(agent(writerThread), { missionId, source: fileSource(copy) });
+        yield* views.addAsset(agent(writerThread), {
+          missionId,
+          source: { _tag: "attachment", attachmentId: yield* threadAttachment(writerThread) },
+        });
+        assert.equal((yield* views.snapshot(missionId)).assets?.length, 3);
       }),
     ),
   );

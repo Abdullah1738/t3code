@@ -89,6 +89,7 @@ import * as Option from "effect/Option";
 import type * as PubSub from "effect/PubSub";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../../../config.ts";
 import { snoozedNow, waitsOnOwner } from "../asks/inboxMarks.ts";
@@ -106,6 +107,7 @@ import {
   type AssetBytes,
 } from "./assets.ts";
 import { applyLayoutOps, insertInRegion } from "./layoutOps.ts";
+import { guardRequestImageCopy } from "./requestImageAccess.ts";
 import { sectionData } from "./sectionRows.ts";
 import { SourceService } from "./sources/SourceService.ts";
 import { byteSize, checkLayout, checkSection, checkTemplate } from "./validate.ts";
@@ -318,6 +320,7 @@ const make = Effect.gen(function* () {
   const views = yield* ViewStore.ViewStore;
   const scribe = yield* ScribeStore;
   const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+  const sql = yield* SqlClient.SqlClient;
   const runs = yield* SourceService;
   const lock = yield* Semaphore.make(1);
   const serial = <A, E>(effect: Effect.Effect<A, E>) => lock.withPermit(effect);
@@ -1684,6 +1687,15 @@ const make = Effect.gen(function* () {
     serial(
       Effect.gen(function* () {
         const { mission, caller } = yield* assetCaller(input.missionId, provenance);
+        yield* guardRequestImageCopy({
+          sql,
+          store,
+          attachmentsDir,
+          provenance,
+          missionId: mission.id,
+          source: input.source,
+          subject: input.subject ?? null,
+        });
         const read = yield* readAssetSource({
           attachmentsDir,
           source: input.source,
@@ -1746,12 +1758,24 @@ const make = Effect.gen(function* () {
         ) {
           return yield* fail("invalid", "Attach images from the app as uploads, not server paths.");
         }
+        const subject: MissionRecordRef = { kind: "owner-request", id: input.requestId };
         // Every image is read and checked first, so a bad one stores none.
         // His file names can say as much as his words, so the copies go unnamed.
         const reads = yield* Effect.forEach(input.sources, (source) =>
-          readAssetSource({ attachmentsDir, source, provenance, name: "Request image" }),
+          guardRequestImageCopy({
+            sql,
+            store,
+            attachmentsDir,
+            provenance,
+            missionId: mission.id,
+            source,
+            subject,
+          }).pipe(
+            Effect.andThen(
+              readAssetSource({ attachmentsDir, source, provenance, name: "Request image" }),
+            ),
+          ),
         );
-        const subject: MissionRecordRef = { kind: "owner-request", id: input.requestId };
         const stored = (yield* views.assets(mission.id)).filter(
           (asset) => asset.status === "active",
         );
