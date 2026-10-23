@@ -320,6 +320,7 @@ const resumed = (
     readonly attachmentsDir?: string;
     readonly fileSystem?: FileSystem.FileSystem;
     readonly onPrompt?: (input: unknown) => void;
+    readonly idAllocator?: Layer.Layer<IdAllocator.IdAllocatorV2>;
   },
 ) =>
   Effect.gen(function* () {
@@ -342,6 +343,7 @@ const resumed = (
       ]),
     );
     const runtime = yield* openCode2ReplayRuntime(sink, {
+      ...(options?.idAllocator === undefined ? {} : { idAllocator: options.idAllocator }),
       ...(options?.fileSystem === undefined ? {} : { fileSystem: options.fileSystem }),
       ...(options?.onPrompt === undefined ? {} : { onPrompt: options.onPrompt }),
       ...(options?.external === undefined ? {} : { external: options.external }),
@@ -1019,6 +1021,94 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       yield* runtime.startTurn(withLineage(thread));
       yield* Deferred.await(reported);
       assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
+
+  /** Holds the wake's message id until `release`, signalling `reached` once asked for it. */
+  const gatedIds = (reached: Deferred.Deferred<void>, release: Deferred.Deferred<void>) =>
+    Layer.effect(
+      IdAllocator.IdAllocatorV2,
+      Effect.gen(function* () {
+        const base = yield* IdAllocator.IdAllocatorV2;
+        return IdAllocator.IdAllocatorV2.of({
+          ...base,
+          allocate: {
+            ...base.allocate,
+            message: (input) =>
+              Deferred.succeed(reached, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(base.allocate.message(input)),
+              ),
+          },
+        });
+      }),
+    ).pipe(Layer.provide(IdAllocator.layer));
+
+  it.effect("keeps a report pending while OpenCode's own turn for it is being set up", () =>
+    Effect.gen(function* () {
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const offered = yield* Deferred.make<void>();
+      const { runtime, thread } = yield* resumed(
+        [
+          ...backgroundLaunch(CHILD),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+          event("session.execution.succeeded", { sessionID: CHILD }),
+          event("session.inbox.enqueued", {
+            inboxID: "msg_report",
+            sessionID: SESSION,
+            item: {
+              type: "synthetic",
+              payload: {
+                text: `<subagent sessionID="${CHILD}" state="completed" description="Sleep">\nCHILD_OK\n</subagent>`,
+                description: "Sleep",
+                metadata: {
+                  source: "subagent",
+                  childID: CHILD,
+                  agent: "General",
+                  state: "completed",
+                },
+              },
+              delivery: "steer",
+            },
+          }),
+          event("session.execution.started", { sessionID: SESSION }),
+        ],
+        { idAllocator: gatedIds(reached, release) },
+      ).pipe(
+        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+          offer: () => Deferred.succeed(offered, undefined).pipe(Effect.asVoid),
+          take: Effect.never,
+        }),
+      );
+      yield* runtime.startTurn(withLineage(thread));
+      yield* Deferred.await(reached);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(offered);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a turn OpenCode started on its own pending while its continuation is set up", () =>
+    Effect.gen(function* () {
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const offered = yield* Deferred.make<void>();
+      const { runtime, thread } = yield* resumed(
+        [event("session.execution.started", { sessionID: SESSION })],
+        { idAllocator: gatedIds(reached, release) },
+      ).pipe(
+        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+          offer: () => Deferred.succeed(offered, undefined).pipe(Effect.asVoid),
+          take: Effect.never,
+        }),
+      );
+      yield* Deferred.await(reached);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(offered);
       assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
     }).pipe(Effect.scoped),
   );
