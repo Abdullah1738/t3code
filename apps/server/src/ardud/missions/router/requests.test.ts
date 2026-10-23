@@ -1135,6 +1135,48 @@ describe("discuss", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("Discuss with an image on an open discussion stores one real ref, retry too", () => {
+    const h = harness();
+    const path = "/home/t3/attachments/mission-00000001-0000-4000-8000-000000000000.png";
+    return Effect.gen(function* () {
+      yield* seed;
+      const registry = yield* RequestImages;
+      yield* registry.register(({ images }) =>
+        Effect.succeed({
+          images: images.map(() => ({ assetId: "asset-1", path })),
+          undo: Effect.void,
+        }),
+      );
+      const router = yield* MissionRouter.MissionRouter;
+      const first = yield* router.openRequest(
+        { missionId, text: "Why is this item still free?", subject: ask },
+        ownerApp,
+      );
+      const discuss = {
+        missionId,
+        text: "Like {image1}, and [image 2: typed]",
+        subject: ask,
+        key: "k-1",
+        images: [{ _tag: "attachment", attachmentId: "shot" }],
+      } as const;
+      const added = yield* router.openRequest(discuss, ownerApp);
+      const retried = yield* router.openRequest(discuss, ownerApp);
+      assert.strictEqual(added.id, first.id);
+      assert.strictEqual(retried.id, first.id);
+
+      const view = (yield* router.ownerRequests({ missionId, requestId: first.id }, ownerApp))
+        .requests[0]!;
+      assert.lengthOf(view.messages, 2);
+      const body = view.messages[1]!.body ?? "";
+      assert.strictEqual(body, `Like [image 1: ${path}], and [image 2\\: typed]`);
+      assert.deepStrictEqual(requestTextParts(body), [
+        { type: "text", text: "Like " },
+        { type: "image", index: 1, assetId: "mission-00000001-0000-4000-8000-000000000000", path },
+        { type: "text", text: ", and [image 2: typed]" },
+      ]);
+    }).pipe(Effect.provide(h.layer));
+  });
+
   it.effect("verify needs the owner's own words in the request about that record", () => {
     const h = harness();
     return Effect.gen(function* () {
