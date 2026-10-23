@@ -708,6 +708,12 @@ export const KNOCK_STATUS_LABEL: Record<Knock["status"], string> = {
   dropped: "Dropped",
 };
 
+/** A decided knock's outcome; a forward whose send has not landed says so until it does. */
+export const knockOutcomeLabel = (knock: Knock): string =>
+  knock.status === "forwarded" && knock.delivery?.status === "pending"
+    ? "Forwarded, not delivered yet"
+    : KNOCK_STATUS_LABEL[knock.status];
+
 export const SUGGESTION_STATUS_LABEL: Record<Suggestion["status"], string> = {
   open: "Open",
   accepted: "Accepted",

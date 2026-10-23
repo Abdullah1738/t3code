@@ -753,6 +753,60 @@ describe("knocks", () => {
     }).pipe(Effect.provide(h.layer));
   });
 
+  it.effect("a forward that fails to deliver after its commit is sent again by the sweep", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const router = yield* MissionRouter.MissionRouter;
+      const store = yield* MissionStore.MissionStore;
+      const outcome = yield* router.guard(guardRequest(fromThread(strayThread), laneThread));
+      if (outcome._tag !== "knocked") return assert.fail("expected a knock");
+      const forwards = () =>
+        h.sent.filter((each) => each.key.startsWith(`knock:${outcome.knockId}:`));
+      h.refuseSend.add(laneThread);
+      assert.strictEqual(
+        yield* failureCode(
+          router.decideKnock(
+            { knockId: outcome.knockId, action: "forward", note: "Answer after the deploy." },
+            ownerApp,
+          ),
+        ),
+        "conflict",
+      );
+      const saved = Option.getOrThrow(yield* store.get("knock", outcome.knockId));
+      assert.strictEqual(saved.status, "forwarded");
+      assert.strictEqual(saved.delivery?.status, "pending");
+      assert.include(saved.delivery?.text ?? "", "- Answer after the deploy.");
+
+      // Still refused: the sweep keeps it pending and sends nothing.
+      assert.strictEqual(yield* router.redeliverForwards, 0);
+      assert.deepStrictEqual(forwards(), []);
+
+      // Once the thread takes sends, the sweep sends the saved text under the decision's key.
+      h.refuseSend.delete(laneThread);
+      assert.strictEqual(yield* router.redeliverForwards, 1);
+      assert.deepStrictEqual(
+        forwards().map((each) => [each.key, each.text]),
+        [
+          [
+            `knock:${outcome.knockId}:forward:${laneThread}:${saved.decidedAt}`,
+            saved.delivery?.text,
+          ],
+        ],
+      );
+      const delivered = Option.getOrThrow(yield* store.get("knock", outcome.knockId));
+      assert.strictEqual(delivered.delivery?.status, "sent");
+      assert.isNotNull(delivered.delivery?.sentAt ?? null);
+      const kinds = (yield* store.eventsSince(missionId, 0)).map((event) => event.kind);
+      assert.strictEqual(kinds.filter((kind) => kind === "knock.delivered").length, 1);
+
+      // Delivered once: the next pass and a resend through decide send nothing new.
+      assert.strictEqual(yield* router.redeliverForwards, 0);
+      yield* router.decideKnock({ knockId: outcome.knockId, action: "forward" }, ownerApp);
+      assert.strictEqual(forwards().length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
   it.effect("unknown knocks are not found", () => {
     const h = harness();
     return Effect.gen(function* () {
