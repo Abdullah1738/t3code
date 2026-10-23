@@ -17,7 +17,7 @@ export const requestImageMarker = (index: number): string => `{image${index}}`;
 export const requestImageRef = (index: number, path: string): string => `[image ${index}: ${path}]`;
 
 /**
- * Puts each ref where its `{imageN}` marker is (1-based, in `refs` order). A
+ * Puts each ref wherever its `{imageN}` marker is (1-based, in `refs` order). A
  * ref without a marker goes at the end; a marker without a ref stays as typed.
  */
 export const placeRequestImages = (text: string, refs: ReadonlyArray<string>): string => {
@@ -25,7 +25,7 @@ export const placeRequestImages = (text: string, refs: ReadonlyArray<string>): s
   const body = text.replace(MARKER, (marker, digits: string) => {
     const index = Number(digits);
     const ref = refs[index - 1];
-    if (ref === undefined || placed.has(index)) return ref === undefined ? marker : "";
+    if (ref === undefined) return marker;
     placed.add(index);
     return ref;
   });

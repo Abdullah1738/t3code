@@ -67,8 +67,8 @@ describe("placeRequestImages", () => {
     expect(placeRequestImages("", ["[A]", "[B]"])).toBe("[A]\n[B]");
   });
 
-  it("places a repeated marker once", () => {
-    expect(placeRequestImages("{image1} then {image1}", ["[A]"])).toBe("[A] then ");
+  it("keeps an image at every place he referred to it", () => {
+    expect(placeRequestImages("{image1} then {image1}", ["[A]"])).toBe("[A] then [A]");
   });
 });
 
