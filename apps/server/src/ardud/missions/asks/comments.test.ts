@@ -321,6 +321,39 @@ describe("owner comments travel with his decisions", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("a reopen keeps the owner's comments on text it did not change", () => {
+    const { posts, layer } = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(at));
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const draft = yield* asks.submitDraft(
+        { missionId, audience: "Pavan", channel: "cliq", target: ticket, text: "Hi. Order: ship." },
+        writer,
+      );
+      yield* asks.decideDraft(
+        { draftId: draft.id, action: "approve", revision: 0, note: "Remove the first sentence." },
+        ownerApp,
+      );
+      yield* TestClock.adjust("1 minute");
+      const reopened = yield* asks.reopenDraft({ draftId: draft.id }, ownerApp);
+      yield* TestClock.adjust("1 minute");
+      yield* asks.decideDraft(
+        { draftId: draft.id, action: "approve", revision: reopened.revision ?? 0 },
+        ownerApp,
+      );
+      const notice = posts.findLast((post) => post.input.key === `draft:${draft.id}:approved:1`);
+      expect(notice?.input.to).toEqual([toWriter]);
+      expect(notice?.input.body).toContain("Apply every comment");
+      expect(notice?.input.body).toContain("- Remove the first sentence.");
+      expect(yield* failureCode(asks.recordDraftSent({ draftId: draft.id }, writer))).toBe(
+        "invalid",
+      );
+      const sent = yield* asks.recordDraftSent({ draftId: draft.id, text: "Order: ship." }, writer);
+      expect(sent.sentText).toBe("Order: ship.");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("an ask answer, a suggestion, a call and an approval carry the note", () => {
     const { posts, signals, layer } = harness();
     return Effect.gen(function* () {
@@ -424,6 +457,41 @@ describe("owner comments travel with his decisions", () => {
         "Squash it.",
         "Delete the branch after.",
       ]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a suggestion dismissed again after a reopen tells the master the new note", () => {
+    const { posts, layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const asks = yield* AsksService.AsksService;
+      const suggestion = yield* asks.proposeSuggestion(
+        {
+          missionId,
+          targetKind: "pool",
+          title: "Raise pool",
+          after: { size: 3 },
+          diffText: "size -> 3",
+          why: "Lanes queue.",
+          evidence: [{ kind: "lane", id: "lane-api" }],
+        },
+        governor,
+      );
+      const dismiss = (note: string) =>
+        asks.decideSuggestion(
+          { suggestionId: suggestion.id, action: "dismiss", dismissReason: "no", note },
+          ownerApp,
+        );
+      const notices = () =>
+        posts.filter((post) => post.input.key?.startsWith(`suggestion:${suggestion.id}:`));
+      yield* dismiss("Not while the queue is short.");
+      yield* asks.reopenSuggestion({ suggestionId: suggestion.id }, ownerApp);
+      yield* dismiss("Ask again next quarter.");
+      // Rooms keep one message per key, so the second dismissal needs its own key.
+      const keys = notices().map((post) => post.input.key);
+      expect(keys).toHaveLength(2);
+      expect(new Set(keys).size).toBe(2);
+      expect(notices().at(-1)?.input.body).toContain("- Ask again next quarter.");
     }).pipe(Effect.provide(layer));
   });
 

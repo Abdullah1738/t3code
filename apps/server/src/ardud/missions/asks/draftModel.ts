@@ -286,6 +286,7 @@ export const submitDraft = (command: SubmitDraftCommand): Outcome<Transition<Dra
     staleReason: null,
     revision: 0,
     revisedAt: command.now,
+    textRevisedAt: command.now,
     ...(command.about ?? NOT_ABOUT),
     ...(command.view === undefined ? {} : { view: command.view }),
   };
@@ -320,15 +321,17 @@ export const epochOf = (draft: Pick<Draft, "revisedAt" | "createdAt">): string =
   draft.revisedAt ?? draft.createdAt;
 
 /**
- * The owner's comments that apply to the text as it stands: those left in the
- * current epoch. Earlier ones were about text a revision already replaced.
+ * The owner's comments that apply to the text as it stands: those left since
+ * it was written. Earlier ones were about text a revision already replaced. A
+ * reopen starts a new decision epoch but leaves the text, so it keeps them:
+ * they stay outstanding until a revision addresses them.
  */
 export const currentComments = (
-  draft: Pick<Draft, "revisedAt" | "createdAt">,
+  draft: Pick<Draft, "textRevisedAt" | "revisedAt" | "createdAt">,
   comments: ReadonlyArray<InboxComment>,
 ): ReadonlyArray<InboxComment> => {
-  const epoch = epochOf(draft);
-  return comments.filter((comment) => comment.at >= epoch);
+  const written = draft.textRevisedAt ?? epochOf(draft);
+  return comments.filter((comment) => comment.at >= written);
 };
 
 /** A system writer's rewrite note: his own words, then every comment to apply. */
@@ -626,6 +629,7 @@ export const reviseDraft = (command: ReviseDraftCommand): Outcome<Transition<Dra
     decidedAt: null,
     ...conditionOf(draft, null),
     ...nextEpoch(draft, command.now),
+    textRevisedAt: command.now,
     ...(command.view === undefined ? {} : { view: command.view }),
   };
   return ok({
@@ -691,6 +695,8 @@ export const reopenDraft = (
       : { spentConditionIds: spendCondition(draft.spentConditionIds, spent.requestId) }),
     ...((draft.withdrawNote ?? null) === null ? {} : { withdrawNote: null }),
     ...nextEpoch(draft, now),
+    // The text did not change, so the owner's comments on it still stand.
+    textRevisedAt: draft.textRevisedAt ?? epochOf(draft),
   };
   return ok({
     record,
@@ -1062,6 +1068,7 @@ export const openSystemDraft = (command: OpenSystemDraftCommand): Outcome<System
     staleReason: null,
     revision: 0,
     revisedAt: command.now,
+    textRevisedAt: command.now,
     ...(command.about ?? NOT_ABOUT),
     ...(input.view === undefined ? {} : { view: input.view }),
   };

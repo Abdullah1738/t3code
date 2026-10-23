@@ -333,6 +333,71 @@ describe("boundary review regressions", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("an owner's note on an accepted split is not proof the split ran", () => {
+    const { layer } = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      yield* TestClock.setTime(T0 + MINUTE);
+      const asks = yield* AsksService.AsksService;
+      const store = yield* MissionStore.MissionStore;
+      const suggestion = yield* asks.proposeSuggestion(
+        {
+          missionId,
+          targetKind: "lane",
+          target: { kind: "lane", id: "lane-api" },
+          title: "API edge",
+          after: { split: { name: "API edge" } },
+          diffText: "API -> API + API edge",
+          why: "It grew.",
+          evidence: [{ kind: "lane", id: "lane-api" }],
+        },
+        governor,
+      );
+      // What the decision's commit leaves when the owner accepts with a note and
+      // the server stops before the applier: the decision, then his comment.
+      const decision = yield* store.commit({
+        event: {
+          missionId,
+          kind: "suggestion.decided",
+          actor: { _tag: "owner" },
+          provenance: ownerApp,
+          summary: `Suggestion accepted: ${suggestion.title}`,
+          subject: { kind: "suggestion", id: suggestion.id, label: suggestion.title },
+          payload: { action: "accept" },
+        },
+        upserts: [
+          {
+            _tag: "suggestion",
+            record: { ...suggestion, status: "accepted", decidedBy: ownerApp, decidedAt: at },
+          },
+        ],
+      });
+      yield* store.appendEvent({
+        missionId,
+        kind: "inbox.commented",
+        actor: { _tag: "owner" },
+        provenance: ownerApp,
+        summary: suggestion.title,
+        subject: { kind: "suggestion", id: suggestion.id, label: suggestion.title },
+        causedBy: decision.event.id,
+        payload: { commentId: "comment-1", withDecision: true },
+      });
+
+      const applied: string[] = [];
+      const registry = yield* Ports.SuggestionApplierRegistry;
+      yield* registry.register(["lane"], (application) =>
+        Effect.sync(() => {
+          applied.push(application.suggestion.id);
+          return `Applied: ${application.suggestion.title}.`;
+        }),
+      );
+      yield* asks.applyPendingSuggestions;
+      expect(applied).toEqual([suggestion.id]);
+      const saved = yield* store.get("suggestion", suggestion.id);
+      expect(saved._tag === "Some" ? saved.value.outcome : null).toBe("Applied: API edge.");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("R4: suggestions about a custom master role go to the owner", () => {
     const { layer } = harness();
     return Effect.gen(function* () {
