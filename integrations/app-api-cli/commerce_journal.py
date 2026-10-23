@@ -25,7 +25,7 @@ ORDER_LIMIT_MINOR = None
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 VERTICALS = {'noon': {'nownow', 'main', 'minutes', 'supermall'},
              'talabat': {'shops', 'restaurants', 'mart'}}
-OUTCOMES = frozenset({'RESPONSE_RECEIVED', 'UNKNOWN', 'CHALLENGE_REQUIRED',
+OUTCOMES = frozenset({'RESPONSE_RECEIVED', 'UNKNOWN', 'CHALLENGE_REQUIRED', 'PAYMENT_FAILED',
                        'ORDER_ID_RECEIVED', 'PAYMENT_REPORTED_SUCCESS',
                        'EXACT_ORDER_CONFIRMED', 'TRACKER_REGISTERED',
                        'PREORDER_INTENT_RECEIVED','PREORDER_PAYMENT_CONFIRMED',
@@ -356,7 +356,7 @@ def observe(flow_id, operation, *, outcome, evidence_hash, order_id=None):
             db.execute('INSERT OR IGNORE INTO orders VALUES (?,?,?,?)',
                        (flow['app'], flow['account_hash'], order_id, flow_id))
             db.execute('UPDATE flows SET order_id=? WHERE id=?', (order_id, flow_id))
-        if outcome in ('UNKNOWN', 'CHALLENGE_REQUIRED'):
+        if outcome in ('UNKNOWN', 'CHALLENGE_REQUIRED', 'PAYMENT_FAILED'):
             db.execute('UPDATE flows SET state=? WHERE id=?', ('FENCED', flow_id))
         # Observations never undo a prior unknown or free a consumed operation.
         db.execute('UPDATE operations SET state=? WHERE flow_id=? AND name=?', ('OBSERVED', flow_id, operation))
@@ -398,6 +398,68 @@ def reconcile_fenced_payment(flow_id, *, evidence_hash):
                    flow['order_id'], time.time()))
         db.execute('UPDATE flows SET state=? WHERE id=?', ('ACTIVE', flow_id))
     return {'outcome': 'FENCED_PAYMENT_RECONCILED', 'retry_allowed': False}
+
+
+def reconcile_marketplace_paid(flow_id, *, evidence_hash):
+    """Lift only financial fences superseded by exact marketplace paid evidence."""
+    if not _hash(evidence_hash):
+        fail('JOURNAL_OBSERVATION_INVALID')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        if (flow['app'] != 'noon' or flow['vertical'] not in ('main', 'supermall')
+                or flow['state'] != 'FENCED' or not flow['order_id']):
+            fail('JOURNAL_MARKETPLACE_RECONCILIATION_INVALID')
+        ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
+        if any(o['state'] != 'OBSERVED' for o in ops):
+            fail('JOURNAL_PREVIOUS_SEND_UNOBSERVED')
+        financial = next((o for o in ops if o['kind'] == 'payment'),
+                         next(o for o in ops if o['kind'] == 'place'))
+        success = db.execute("SELECT MAX(sequence) AS s FROM observations WHERE flow_id=? "
+            "AND operation=? AND outcome='PAYMENT_REPORTED_SUCCESS' AND order_id=?",
+            (flow_id, financial['name'], flow['order_id'])).fetchone()['s']
+        fences = list(db.execute("SELECT o.sequence,p.kind FROM observations o JOIN operations p "
+            "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
+            "AND o.outcome IN ('UNKNOWN','CHALLENGE_REQUIRED','PAYMENT_FAILED')", (flow_id,)))
+        if (not success or not fences or any(r['kind'] not in ('place', 'payment')
+                                            or r['sequence'] >= success for r in fences)):
+            fail('JOURNAL_RECONCILIATION_EVIDENCE_CHAIN_INVALID')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) '
+            'VALUES (?,?,?,?,?,?)', (flow_id, financial['name'], 'FENCED_PAYMENT_RECONCILED',
+                                   evidence_hash, flow['order_id'], time.time()))
+        db.execute("UPDATE flows SET state='ACTIVE' WHERE id=?", (flow_id,))
+
+
+def close_marketplace_uncharged(flow_id, *, evidence, expected_local):
+    """Terminal native no-capture closure; order/operation ownership stays consumed."""
+    if (not isinstance(evidence, dict) or evidence.get('provider_no_charge_proven') is not True
+            or evidence.get('payment_failed') is not True or evidence.get('all_items_cancelled') is not True
+            or evidence.get('currency') != 'AED' or evidence.get('card_last4') != '5542'):
+        fail('JOURNAL_MARKETPLACE_NO_CHARGE_EVIDENCE_REQUIRED')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        ops = list(db.execute('SELECT name,kind,state FROM operations WHERE flow_id=? ORDER BY created_at,name', (flow_id,)))
+        if (flow['app'] != 'noon' or flow['vertical'] not in ('main', 'supermall')
+                or flow['state'] not in ('ACTIVE', 'FENCED')
+                or flow['order_id'] != evidence.get('order')
+                or flow['account_hash'] != evidence.get('account_hash')
+                or flow['reserved_minor'] <= 0 or flow['reserved_minor'] != evidence.get('amount_minor')
+                or flow['state'] != expected_local['state']
+                or sorted([dict(o) for o in ops], key=lambda o: o['name']) !=
+                   sorted(expected_local['operations'], key=lambda o: o['name'])):
+            fail('JOURNAL_MARKETPLACE_CLOSURE_CHANGED')
+        if (sum(o['kind'] == 'place' for o in ops) != 1
+                or sum(o['kind'] == 'payment' for o in ops) > 1
+                or any(o['state'] != 'OBSERVED' or o['kind'] in ('prepay', 'preauthorize') for o in ops)):
+            fail('JOURNAL_MARKETPLACE_FINANCIAL_HISTORY_INVALID')
+        if db.execute("SELECT 1 FROM observations WHERE flow_id=? AND outcome='PAYMENT_REPORTED_SUCCESS'", (flow_id,)).fetchone():
+            fail('JOURNAL_RELEASE_SUCCESS_ALREADY_OBSERVED')
+        amount = flow['reserved_minor']
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) '
+            'VALUES (?,?,?,?,?,?)', (flow_id, next(o['name'] for o in ops if o['kind'] == 'place'),
+            'MARKETPLACE_CLOSED_UNCHARGED', digest(evidence), flow['order_id'], time.time()))
+        db.execute("UPDATE flows SET state='RELEASED',reserved_minor=0 WHERE id=?", (flow_id,))
+    return {'state': 'RELEASED', 'reservation_released_minor': amount,
+            'account_fence_lifted': True, 'retry_allowed': False}
 
 
 def complete(flow_id):

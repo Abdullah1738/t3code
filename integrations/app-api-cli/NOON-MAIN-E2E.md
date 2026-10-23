@@ -5,7 +5,7 @@ MaxShake Vanilla 330ml, skuConfig Z0B9474A290818B862A38Z, subtotal 19.80 (35% of
 from 30.88), shipping FREE, **AED 19.80 paid**) — frictionless saved-card
 (cc_noonpay, card 5542): **no CVV, no 3DS, no clientSecret consumption**.
 
-CLI: `commerce order main --sku-config Z0B9474A2908862A38Z... --quantity 2 --label "…"`
+CLI: `commerce order main --sku-config Z0B9474A2908862A38Z... --quantity 2 --cvv-from-keychain --label "…"`
 (+ `--resume-flow FLOW_UUID`, 24h window).
 
 Module map: `commerce_main_order.py` (journalled lane) over
@@ -42,9 +42,11 @@ reads). Fixture: `test/fixture_main_e2e_chain.json`; tests:
 5. **Paid signal**: poll `GET checkout-v2/order/order-status?order_nr=…`:
    `pending` ("Deal reservation pending" → "Payment pending") → **`status:
    "success"` + populated `shipments` + `total:"19.80"`** = PAID. `paymentError`/
-   `paymentErrorMsg` non-null is failure (`MAIN_PAYMENT_ERROR_NO_RETRY`); a
-   `clientSecret` may be present even on success and is never consumed.
-6. **Confirm**: journal PAYMENT_REPORTED_SUCCESS on the single `place` op, exact
+   `paymentErrorMsg` non-null is failure (`MAIN_PAYMENT_ERROR_NO_RETRY`). A pending
+   `clientSecret` is completed once with the selected card and encrypted CVV;
+   pending/3DS prompts ENBD approval via Telegram. Polling lasts at most ten minutes.
+   Success never consumes a returned secret. The challenge path is fixture-tested.
+6. **Confirm**: journal PAYMENT_REPORTED_SUCCESS on the financial op, exact
    order-detail tracking readback (order-v2 `/_svc/order-v2/order/{nr}` manifest),
    `order-watch add` with durable readback, journal COMPLETE.
 
@@ -60,8 +62,9 @@ reads). Fixture: `test/fixture_main_e2e_chain.json`; tests:
 
 ## Contract deviations vs the 2026-10-10 capture
 
-- None on the wire chain (search → cart → add → session → place → order-status →
-  post-order reads). The lane adds no setter calls: silent delivery and the
+- Pending payments can now use the mapped encrypted-CVV completion and payment
+  status routes; this extension has fixture coverage only. The lane adds no setter
+  calls: silent delivery and the
   default card are account-level and verified server-side, exactly as captured.
 - The search query differs: the capture used a human query ("maxi nutrition
   vanilla"); the lane queries by the exact skuConfig and requires a unique

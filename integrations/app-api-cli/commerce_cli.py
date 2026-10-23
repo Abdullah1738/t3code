@@ -382,7 +382,7 @@ def order_main(args):
     skuConfig -> offer -> cart add -> checkout session {shouldUpdateSession:
     true} with server-carried silent delivery + default card 5542 + home
     address -> place-order {total} -> order-status poll until success with
-    shipments (paid). Frictionless: no CVV, no 3DS, no clientSecret use.
+    shipments (paid), including encrypted CVV and out-of-band ENBD approval.
     """
     from commerce_main_order import MainOrderFlow
     import noon_marketplace_checkout as market_transport
@@ -400,6 +400,7 @@ def order_main(args):
     print(json.dumps({'flow_id':flow.flow_id,'phase':'review','review':review}),flush=True)
     if args.prepare_only:
         return verified
+    flow.prepare_payment(cvv=cvv_from_keychain() if args.cvv_from_keychain else None)
     try:
         placed=flow.place()
     except market_transport.MarketplaceError as exc:
@@ -427,7 +428,7 @@ def order_supermall(args):
     {shouldUpdateSession:true} with server-carried silent delivery + default
     card 5542 + home address + isRocket shipment with absolute express
     deliveryDate -> place-order {total} -> order-status poll until success
-    with shipments (paid). Frictionless: no CVV, no 3DS, no clientSecret use.
+    with shipments (paid), including encrypted CVV and ENBD approval.
     """
     from commerce_supermall_order import SupermallOrderFlow
     import noon_marketplace_checkout as market_transport
@@ -452,6 +453,7 @@ def order_supermall(args):
     print(json.dumps({'flow_id': flow.flow_id, 'phase': 'review', 'review': review}), flush=True)
     if args.prepare_only:
         return verified
+    flow.prepare_payment(cvv=cvv_from_keychain() if args.cvv_from_keychain else None)
     try:
         placed = flow.place()
     except market_transport.MarketplaceError as exc:
@@ -481,6 +483,28 @@ def await_payment_flow(args):
     confirmation and tracking/registration), this only finishes the exact
     tracking, watcher registration and journal completion.
     """
+    binding = journal.binding(args.flow_id)
+    if binding['app'] == 'noon' and binding['vertical'] in ('main', 'supermall'):
+        from commerce_main_order import MainOrderFlow
+        from commerce_supermall_order import SupermallOrderFlow
+        from commerce_marketplace_payment import telegram_3ds_notify
+        cls = MainOrderFlow if binding['vertical'] == 'main' else SupermallOrderFlow
+        flow = cls.resume_payment(args.flow_id)
+        if journal.payment_reported(args.flow_id):
+            if journal.inspect(args.flow_id)['state'] == 'FENCED':
+                journal.reconcile_marketplace_paid(args.flow_id,
+                    evidence_hash=journal.digest({'order': flow.order, 'retained_paid_evidence': True}))
+            paid = {'paid': True, 'already_observed': True}
+        else:
+            paid = flow.await_success(wait_seconds=args.minutes * 60,
+                                      notify=None if args.no_notify else telegram_3ds_notify)
+        tracking = flow.verify_tracking()
+        registration = flow.register_tracker(args.label, recipient=args.recipient)
+        journal.complete(args.flow_id)
+        return {'ok': True, 'flow_id': args.flow_id, 'order': flow.order, 'paid': paid,
+                'tracking': tracking, 'watcher': registration['watcher'],
+                **order_watch_receipt.fields(registration), 'financial_send': False,
+                'financial_retry': False}
     from commerce_minutes import MinutesFlow,telegram_3ds_notify
     flow=MinutesFlow.resume_payment(args.flow_id)
     already_paid=journal.payment_reported(args.flow_id)
@@ -911,19 +935,24 @@ def main(argv=None):
         help='Authorized noon MAIN marketplace paid order E2E: cart, session verify, frictionless place, status poll')
     basket_arguments(main_order,'--sku-config')
     main_order.add_argument('--label',default='Noon Main order')
+    main_order.add_argument('--cvv-from-keychain',action='store_true',
+        help='encrypt saved-card CVV in RAM for an exact pending payment')
     main_order.add_argument('--resume-flow',default=None,metavar='FLOW_UUID',
         help='continue an ACTIVE pre-place flow (24h window; exact basket readback)')
     supermall_order=order_commands.add_parser('supermall',
         help='Authorized noon SUPERMALL (rocket) paid order E2E: rocket resolve, quick-atc add, session verify, frictionless place, status poll')
     basket_arguments(supermall_order,'--sku-config')
     supermall_order.add_argument('--label',default='Noon Supermall order')
+    supermall_order.add_argument('--cvv-from-keychain',action='store_true',
+        help='encrypt saved-card CVV in RAM for an exact pending payment')
     supermall_order.add_argument('--resume-flow',default=None,metavar='FLOW_UUID',
         help='continue an ACTIVE flow (pre-place basket readback within 24h, or read-only paid completion)')
     supermall_order.add_argument('--eta',default=None,metavar='ISO_DATE',
         help='absolute promise deliveryDate (with offset) for the watcher; paid resume only')
-    await_cmd=commands.add_parser('await-payment',help='Status-only 3DS wait continuation of a consumed minutes payment')
+    await_cmd=commands.add_parser('await-payment',help='Status-only payment/3DS continuation for Minutes, Main and Supermall')
     await_cmd.add_argument('flow_id')
-    await_cmd.add_argument('--minutes',type=float,default=4.0)
+    await_cmd.add_argument('--minutes',type=float,default=10.0)
+    await_cmd.add_argument('--label',default='Noon order (payment resumed)')
     await_cmd.add_argument('--no-notify',action='store_true')
     recipient_argument(await_cmd)
     release=commands.add_parser('release-flow',

@@ -256,6 +256,11 @@ def operation(service, name, **args):
         method, mutation = 'GET', False
         order_id = _order(args.pop('order'))
         path = '/_svc/order-v2/order/' + order_id
+    elif name == 'order_refund':
+        # Native getRefundDetails: order-v2/order/<order>/refund (GET).
+        method, mutation = 'GET', False
+        order_id = _order(args.pop('order'))
+        path = '/_svc/order-v2/order/' + order_id + '/refund'
     elif name == 'payment_config':
         method, host, mutation = 'GET', PAYMENT_HOST, False
         path = '/_svc/mp-payment-api-public/config'
