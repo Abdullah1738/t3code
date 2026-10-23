@@ -60,11 +60,11 @@ import {
   SectionHead,
   Separator,
   StateGlyph,
-  TextField,
   Title,
 } from "./parts";
 import { PinnedStrip } from "./PinnedStrip";
 import { useRequestComposer } from "./recordLogic";
+import { RequestEditor } from "./RequestEditor";
 import { RequestReader } from "./RequestReader";
 import { MISSION_PAGES, type MissionPage } from "./routeParams";
 import { RequestRows } from "./rows";
@@ -559,24 +559,19 @@ function RequestsPage(props: PageProps) {
   const list = (
     <Page>
       {props.tabs}
-      <View className="gap-2">
-        <TextField
-          key={props.askKey}
-          value={composer.text}
-          onChangeText={composer.setText}
-          placeholder="Ask or tell the master"
-          autoFocus={props.askKey > 0}
-          fixedHeight
+      <RequestEditor
+        key={props.askKey}
+        draft={composer.draft}
+        placeholder="Ask or tell the master"
+        autoFocus={props.askKey > 0}
+      >
+        <ActionButton
+          label="Send"
+          primary
+          disabled={composer.pending || composer.draft.empty}
+          onPress={composer.send}
         />
-        <View className="flex-row">
-          <ActionButton
-            label="Send"
-            primary
-            disabled={composer.pending || composer.text.trim() === ""}
-            onPress={composer.send}
-          />
-        </View>
-      </View>
+      </RequestEditor>
       <FeedError what="your requests" feed={requestsFeed} nowMs={props.nowMs} />
       {requests === undefined ? (
         requestsFeed.failure ? null : (

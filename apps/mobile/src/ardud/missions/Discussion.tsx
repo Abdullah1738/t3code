@@ -1,4 +1,4 @@
-import type { MissionId, MissionRecordRef } from "@t3tools/contracts";
+import { requestPlainText, type MissionId, type MissionRecordRef } from "@t3tools/contracts";
 import {
   looseDiscussions,
   refLabel,
@@ -9,7 +9,9 @@ import { clockLabel } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { Fragment, useState } from "react";
 import { View } from "react-native";
 
-import { useOwnerRequests } from "./missionsStore";
+import { FilePreviewModal } from "../../components/FilePreviewModal";
+import type { FilePreviewSource } from "../../components/FilePreviewModal.types";
+import { useMissionsEnvironmentId, useOwnerRequests } from "./missionsStore";
 import {
   ActionButton,
   Bubble,
@@ -19,16 +21,19 @@ import {
   Meta,
   SectionHead,
   Separator,
-  TextField,
   Title,
 } from "./parts";
 import { useDiscussion } from "./recordLogic";
+import { RequestEditor } from "./RequestEditor";
+import { requestImagePreview, requestInline } from "./RequestText";
 
 /** A request's messages, oldest first: the owner's on the right. */
 export function Conversation(props: {
   readonly messages: ReadonlyArray<OwnerRequestMessage>;
   readonly nowMs: number;
 }) {
+  const environmentId = useMissionsEnvironmentId();
+  const [preview, setPreview] = useState<FilePreviewSource | null>(null);
   return (
     <View className="gap-3">
       {props.messages.map((message) => (
@@ -37,9 +42,16 @@ export function Conversation(props: {
           fromOwner={message.author === "owner"}
           author={message.author === "owner" ? "You" : "Master"}
           time={clockLabel(message.at, props.nowMs)}
-          text={message.text}
+          text={
+            environmentId === null
+              ? requestPlainText(message.text)
+              : requestInline(message.text, (position) =>
+                  setPreview(requestImagePreview(message.text, environmentId, position)),
+                )
+          }
         />
       ))}
+      <FilePreviewModal source={preview} onRequestClose={() => setPreview(null)} />
     </View>
   );
 }
@@ -73,23 +85,21 @@ export function DiscussionPanel(props: {
         trailing={request ? <DiscussionMark unread={discussion.unread} /> : null}
       />
       {request ? <Conversation messages={request.messages} nowMs={props.nowMs} /> : null}
-      <TextField
-        value={discussion.text}
-        onChangeText={discussion.setText}
+      <RequestEditor
+        draft={discussion.draft}
         placeholder={request ? "Reply to the master" : "Discuss with the master"}
-      />
-      <View className="flex-row flex-wrap gap-2">
+      >
         <ActionButton
           label="Send"
           primary
-          disabled={discussion.pending || discussion.text.trim() === ""}
+          disabled={discussion.pending || discussion.draft.empty}
           onPress={discussion.send}
         />
         {request && request.status !== "settled" ? (
           <ActionButton label="Settle" disabled={discussion.pending} onPress={discussion.settle} />
         ) : null}
         {props.open ? null : <ActionButton label="Close" onPress={() => setExpanded(false)} />}
-      </View>
+      </RequestEditor>
     </View>
   );
 }
