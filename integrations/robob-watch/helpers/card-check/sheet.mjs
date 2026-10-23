@@ -78,7 +78,7 @@ export function sheetHtml({ title, cases, columns, base, previewWidth = 300 }) {
         .join("");
       const pv = previewWidth
         ? k.preview
-          ? `<div><img class="preview" style="width:${previewWidth}px" src="${esc(relative(base, k.preview))}"><div class="cap">${esc(k.previewTitle || "")}</div></div>`
+          ? `<div><img class="preview" style="width:${previewWidth}px" src="${esc(/^[a-z][a-z0-9+.-]*:/i.test(k.preview) ? k.preview : relative(base, k.preview))}"><div class="cap">${esc(k.previewTitle || "")}</div></div>`
           : `<div class="cap">no preview image</div>`
         : "";
       return `<div class="row${fail ? " fail" : ""}" style="${grid}"><div class="name">${esc(k.family)}/${esc(k.name)}${summary(findings)}</div>${pv}${cells}</div>`;

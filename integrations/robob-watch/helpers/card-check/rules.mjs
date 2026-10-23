@@ -79,6 +79,11 @@ function push(out, f) {
 export function evaluate(m, view, family = "page") {
   const out = [];
   const bubble = view.kind === "bubble";
+  // Every rule below is in the view's CSS pixels. A page without a device-width viewport
+  // lays out at ~980px and gets scaled down, so its geometry says nothing about the bubble.
+  if (Math.abs(m.vw - view.w) > 1 || Math.abs(m.vh - view.h) > 1 || Math.abs((m.scale ?? 1) - 1) > 0.01) {
+    return [{ rule: "viewport", level: "FAIL", detail: `lays out at ${m.vw}x${m.vh} (scale ${m.scale ?? 1}) in a ${view.w}x${view.h} view: needs <meta name=viewport content="width=device-width, initial-scale=1">` }];
+  }
   const shown = m.lines.filter((x) => inkShown(x));
 
   if (m.sw > m.vw + 1) push(out, { rule: "width", level: "FAIL", detail: `scrolls sideways: content ${m.sw}px in a ${m.vw}px view` });
@@ -111,8 +116,10 @@ export function evaluate(m, view, family = "page") {
     for (const i of rendered) {
       const lost = i.lines.length ? i.lines.filter((x) => !inkShown(x) || clipV(x) > 1) : i.vis ? [] : [i];
       if (!lost.length) continue;
-      // A line clamp that ends in an ellipsis is a chosen shortening, not a crop.
-      const clamped = i.lines.length > 0 && lost.every((x) => x.ell);
+      // A working line clamp is a chosen shortening, not a crop: part of the text still
+      // shows, and every lost line sits below a clamp box that is itself whole on screen.
+      const seen = i.lines.length - lost.length;
+      const clamped = seen > 0 && lost.every((x) => x.clamp && (x.t + x.b) / 2 >= x.clamp.b);
       push(out, {
         rule: "keep",
         level: clamped ? "WARN" : "FAIL",
@@ -157,20 +164,17 @@ export function evaluate(m, view, family = "page") {
   return out;
 }
 
-// og meta + the image file itself (read by the CLI). Only judged once per case.
-export function previewFindings(meta, png) {
+// og meta + the decoded preview image (the CLI loads it the way a link preview would).
+// img: { w, h } natural size, or { error } when it did not load or decode.
+export function previewFindings(meta, img) {
   const out = [];
-  if (!meta.image) return [{ rule: "preview", level: "FAIL", detail: "no og:image" }];
+  if (!meta.image) out.push({ rule: "preview", level: "FAIL", detail: "no og:image" });
   if (meta.imageWidth !== "1200" || meta.imageHeight !== "630") {
     out.push({ rule: "preview", level: "FAIL", detail: `og:image size meta ${meta.imageWidth}x${meta.imageHeight}, want 1200x630` });
   }
   if (!meta.title) out.push({ rule: "preview", level: "FAIL", detail: "no og:title" });
-  if (!png) out.push({ rule: "preview", level: "FAIL", detail: `preview image missing (${meta.image})` });
-  else if (png.w !== 1200 || png.h !== 630) out.push({ rule: "preview", level: "FAIL", detail: `preview image is ${png.w}x${png.h}, want 1200x630` });
+  if (!meta.image) return out;
+  if (!img || img.error) out.push({ rule: "preview", level: "FAIL", detail: `preview image did not load (${img?.error || "not checked"}): ${meta.image}` });
+  else if (img.w !== 1200 || img.h !== 630) out.push({ rule: "preview", level: "FAIL", detail: `preview image is ${img.w}x${img.h}, want 1200x630` });
   return out;
-}
-
-export function pngSize(buf) {
-  if (buf.length < 24 || buf.readUInt32BE(12) !== 0x49484452) return null;
-  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
 }

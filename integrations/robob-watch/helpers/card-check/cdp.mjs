@@ -1,7 +1,7 @@
 // Minimal Chrome DevTools Protocol client over --remote-debugging-pipe (fd 3 in, fd 4 out,
 // NUL-delimited JSON). One headless browser, many pages. No npm dependencies.
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -32,7 +32,10 @@ export function findChrome(env = process.env) {
   return null;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 export async function launch(chrome) {
+  accessSync(chrome, constants.X_OK);
   const profile = mkdtempSync(join(tmpdir(), "card-check-chrome-"));
   const proc = spawn(
     chrome,
@@ -62,17 +65,29 @@ export async function launch(chrome) {
   const pending = new Map();
   const listeners = new Set();
   const fail = (err) => {
-    dead = err;
-    for (const { reject } of pending.values()) reject(err);
+    dead ||= err;
+    for (const { reject } of pending.values()) reject(dead);
     pending.clear();
   };
-  proc.on("exit", (code) => fail(new Error(`chrome exited (${code})`)));
-  proc.on("error", fail);
+  // Resolves once the process is gone (or never started), so close() can wait for it.
+  const exited = new Promise((done) => {
+    proc.once("exit", (code, signal) => (fail(new Error(`chrome exited (${code ?? signal})`)), done()));
+    proc.once("error", (err) => (fail(new Error(`chrome: ${err.message}`)), done()));
+  });
+  // A dead browser shows up as EPIPE/ECONNRESET on the pipes: fail the pending calls.
+  out.on("error", (err) => fail(new Error(`chrome pipe: ${err.message}`)));
+  inp.on("error", (err) => fail(new Error(`chrome pipe: ${err.message}`)));
   inp.on("data", (chunk) => {
     buf += chunk;
     let i;
     while ((i = buf.indexOf("\0")) >= 0) {
-      const msg = JSON.parse(buf.slice(0, i));
+      let msg;
+      try {
+        msg = JSON.parse(buf.slice(0, i));
+      } catch (err) {
+        buf = buf.slice(i + 1);
+        continue;
+      }
       buf = buf.slice(i + 1);
       if (msg.id && pending.has(msg.id)) {
         const { resolve, reject, method } = pending.get(msg.id);
@@ -98,7 +113,11 @@ export async function launch(chrome) {
         resolve: (v) => (clearTimeout(timer), resolve(v)),
         reject: (e) => (clearTimeout(timer), reject(e)),
       });
-      out.write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + "\0");
+      try {
+        out.write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + "\0", (err) => err && fail(new Error(`chrome pipe: ${err.message}`)));
+      } catch (err) {
+        fail(new Error(`chrome pipe: ${err.message}`));
+      }
     });
 
   const waitFor = (sessionId, method, timeout = 15000) =>
@@ -161,12 +180,19 @@ export async function launch(chrome) {
   return {
     newPage,
     version: () => send("Browser.getVersion"),
+    // Ask Chrome to quit, then TERM, then KILL, each with a short grace period. The
+    // profile is removed only after the process is gone (Chrome writes to it until then).
     async close() {
-      try {
-        await send("Browser.close", {}, undefined, 3000);
-      } catch {}
-      proc.kill();
-      rmSync(profile, { recursive: true, force: true });
+      if (!dead) await send("Browser.close", {}, undefined, 3000).catch(() => {});
+      const gone = (ms) => Promise.race([exited.then(() => true), sleep(ms).then(() => false)]);
+      if (!(await gone(3000))) {
+        proc.kill("SIGTERM");
+        if (!(await gone(2000))) {
+          proc.kill("SIGKILL");
+          await gone(2000);
+        }
+      }
+      rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     },
   };
 }

@@ -36,33 +36,35 @@ const lines = (stdout) =>
 
 const BIG = { maxBuffer: 32 * 1024 * 1024, timeout: 180000 };
 
-async function buildRide(out, where) {
+// Every builder takes the run's AbortSignal so the overall --timeout kills it.
+async function buildRide(out, where, signal) {
   if (!where.ride) throw new Error("ride_card.py not found (set CARD_CHECK_RIDE)");
-  const { stdout } = await run("/usr/bin/python3", [where.ride, "sample", "--acceptance", "--out", out], BIG);
+  const { stdout } = await run("/usr/bin/python3", [where.ride, "sample", "--acceptance", "--out", out], { ...BIG, signal });
   return lines(stdout).map((r) => ({ name: r.state.toLowerCase(), dir: r.dir }));
 }
 
-async function buildDelivery(out, where) {
+async function buildDelivery(out, where, signal) {
   if (!where.delivery) throw new Error("delivery_card_samples.py not found (set CARD_CHECK_DELIVERY)");
   const { stdout } = await run(where.deliveryPython, [where.delivery, "--out", out], {
     ...BIG,
+    signal,
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
   });
   return lines(stdout).map((r) => ({ name: r.state, dir: r.dir }));
 }
 
-async function qspec(where, spec, dir) {
+async function qspec(where, spec, dir, signal) {
   return new Promise((ok, fail) => {
-    const p = execFile(where.qcard, ["spec", "-", "--out", dir], BIG, (err, stdout, stderr) =>
+    const p = execFile(where.qcard, ["spec", "-", "--out", dir], { ...BIG, signal }, (err, stdout, stderr) =>
       err ? fail(new Error(`qcard ${spec.template}: ${stderr || err.message}`)) : ok(stdout),
     );
     p.stdin.end(JSON.stringify(spec));
   });
 }
 
-async function buildQcard(out, where) {
+async function buildQcard(out, where, signal) {
   if (!where.qcard) throw new Error("qcard not found (set CARD_CHECK_QCARD)");
-  const { stdout } = await run(where.qcard, ["templates"], BIG);
+  const { stdout } = await run(where.qcard, ["templates"], { ...BIG, signal });
   const specs = { ...JSON.parse(stdout), ...QCARD_HARD };
   mkdirSync(out, { recursive: true });
   const names = Object.keys(specs);
@@ -71,7 +73,7 @@ async function buildQcard(out, where) {
     await Promise.all(
       names.slice(i, i + 4).map(async (name) => {
         const dir = join(out, name);
-        await qspec(where, specs[name], dir);
+        await qspec(where, specs[name], dir, signal);
         done.push({ name, dir });
       }),
     );

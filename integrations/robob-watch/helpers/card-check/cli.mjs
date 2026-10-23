@@ -1,14 +1,14 @@
 // card-check: render Robob cards the way Messages shows them and fail what a person would
 // notice (text under the app icon or in a masked corner, a half-cut line, a lost ETA,
 // sideways scroll, an off-centre card, text under the status bar, a missing preview).
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { findChrome, launch } from "./cdp.mjs";
 import { BUILDERS, familyOf, locate, pageDir } from "./families.mjs";
 import { measure } from "./measure.mjs";
-import { evaluate, KEEP, pngSize, previewFindings, THEMES, VIEWS } from "./rules.mjs";
+import { evaluate, KEEP, previewFindings, THEMES, VIEWS } from "./rules.mjs";
 import { sheetHtml, sheetWidth } from "./sheet.mjs";
 
 const USAGE = `card-check: compact-bubble acceptance checks for Robob cards
@@ -18,11 +18,13 @@ const USAGE = `card-check: compact-bubble acceptance checks for Robob cards
   card-check page DIR|index.html ... [--family ride|delivery|qcard] [--out DIR]
       Check finished card directories (a real card before you send it).
 
-Options: --themes dark,light  --jobs N (6)  --json  --timeout SECONDS (300)
+Options: --themes dark,light  --jobs N (6)  --json  --timeout SECONDS (300, at least 30)
 
 Views: Messages bubble 275x266 (iPhone) and 345x310 (iPad) with the corner mask and
 app icon; full page at 300 and 390 wide (390 with iPhone safe-area insets); the
-1200x630 link preview is checked first. Exit 0 = no FAIL, 1 = FAIL, 2 = could not run.
+1200x630 link preview is checked first (an absolute og:image URL is loaded over the
+network, the way Messages loads it). --timeout covers the whole run, sample builds
+included. Exit 0 = no FAIL, 1 = FAIL, 2 = could not run.
 Output: report.json, sheet PNGs per family, fails.png, shots/. Read the sheets.`;
 
 function parse(argv) {
@@ -45,17 +47,25 @@ function parse(argv) {
 
 const stamp = () => new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
 
-function previewOf(dir, meta) {
-  if (!meta.image) return { png: null, path: null };
-  const rel = meta.image.split("?")[0];
-  if (/^[a-z]+:/i.test(rel)) return { png: null, path: rel, remote: true };
-  const path = resolve(dir, rel);
-  try {
-    return { png: pngSize(readFileSync(path)), path };
-  } catch {
-    return { png: null, path };
-  }
-}
+// Where the link preview image lives: a remote URL as is, a relative one in the card dir.
+const previewSrc = (dir, image) => {
+  if (!image) return null;
+  return /^[a-z][a-z0-9+.-]*:/i.test(image) ? image : resolve(dir, image.split(/[?#]/)[0]);
+};
+
+// Loads og:image from the card page itself (relative URLs resolve against it) and
+// reports the decoded size, so a stub or broken file fails like it would in Messages.
+const loadImage = (page, image) =>
+  page.eval(
+    `new Promise((ok) => {
+       const img = new Image();
+       const t = setTimeout(() => ok({ error: "timed out" }), 10000);
+       img.onload = () => (clearTimeout(t), ok(img.naturalWidth ? { w: img.naturalWidth, h: img.naturalHeight } : { error: "did not decode" }));
+       img.onerror = () => (clearTimeout(t), ok({ error: "did not load or decode" }));
+       img.src = new URL(${JSON.stringify(image)}, location.href).href;
+     })`,
+    15000,
+  );
 
 async function shoot(page, url, view, theme, keep, pngPath) {
   await page.send("Emulation.setDeviceMetricsOverride", { width: view.w, height: view.h, deviceScaleFactor: view.scale, mobile: true });
@@ -179,14 +189,31 @@ async function main() {
   const out = a.out || join(process.env.TMPDIR || tmpdir(), "card-check", stamp());
   mkdirSync(join(out, "shots"), { recursive: true });
   const t0 = Date.now();
+  // One deadline for the whole run: sample builds are killed through the signal, the
+  // browser is closed, and the run exits 2.
+  const abort = new AbortController();
+  let browser = null;
+  const deadline = setTimeout(() => {
+    console.error(`card-check: gave up after ${a.timeout}s`);
+    abort.abort();
+    Promise.resolve(browser?.close()).finally(() => process.exit(2));
+  }, a.timeout * 1000);
+  try {
+    await run(a, chrome, out, t0, abort.signal, (b) => (browser = b));
+  } finally {
+    clearTimeout(deadline);
+    await browser?.close();
+  }
+}
 
+async function run(a, chrome, out, t0, signal, setBrowser) {
   let cases = [];
   if (a.cmd === "set") {
     const fams = a.args.length ? a.args : Object.keys(BUILDERS);
     const bad = fams.filter((f) => !BUILDERS[f]);
     if (bad.length) throw new Error(`unknown family: ${bad.join(", ")} (ride, delivery, qcard)`);
     const where = locate();
-    const built = await Promise.all(fams.map(async (f) => ({ f, list: await BUILDERS[f](join(out, "cards", f), where) })));
+    const built = await Promise.all(fams.map(async (f) => ({ f, list: await BUILDERS[f](join(out, "cards", f), where, signal) })));
     for (const { f, list } of built) {
       for (const c of list) if (!a.only || a.only.has(c.name)) cases.push({ family: f, name: c.name, dir: c.dir, file: join(c.dir, "index.html") });
     }
@@ -199,13 +226,11 @@ async function main() {
     }
   }
   if (!cases.length) throw new Error("nothing to check");
+  if (signal.aborted) return;
 
   const browser = await launch(chrome);
-  const deadline = setTimeout(() => {
-    console.error(`card-check: gave up after ${a.timeout}s`);
-    browser.close().finally(() => process.exit(2));
-  }, a.timeout * 1000);
-  try {
+  setBrowser(browser);
+  {
     const version = (await browser.version()).product;
     const tasks = [];
     for (const k of cases) {
@@ -220,16 +245,20 @@ async function main() {
       const findings = evaluate(m, t.view, t.k.family).map((f) => ({ ...f, view: t.view.id, theme: t.theme }));
       t.k.shots.push({ view: t.view, theme: t.theme, png, height, findings });
       if (!t.k.meta) t.k.meta = m.meta;
+      // The preview is judged once per case, from whichever shot gets there first.
+      if (!t.k.previewClaimed && m.meta.image) {
+        t.k.previewClaimed = true;
+        t.k.previewImg = await loadImage(page, m.meta.image);
+      }
     });
     for (const t of tasks) {
       if (t.error) t.k.shots.push({ view: t.view, theme: t.theme, png: null, findings: [{ rule: "load", level: "FAIL", detail: t.error, view: t.view.id, theme: t.theme }] });
     }
     for (const k of cases) {
       const meta = k.meta || {};
-      const pv = previewOf(k.dir, meta);
-      k.preview = pv.png ? pv.path : null;
+      k.previewFindings = k.meta ? previewFindings(meta, k.previewImg) : [];
+      k.preview = k.previewImg && !k.previewImg.error ? previewSrc(k.dir, meta.image) : null;
       k.previewTitle = meta.title;
-      k.previewFindings = pv.remote ? [] : previewFindings(meta, pv.png);
       const order = (s) => VIEWS.findIndex((v) => v.id === s.view.id) * 10 + a.themes.indexOf(s.theme);
       k.shots.sort((x, y) => order(x) - order(y));
       k.findings = [...k.previewFindings, ...k.shots.flatMap((s) => s.findings)];
@@ -289,9 +318,6 @@ async function main() {
       console.log(`report ${join(out, "report.json")}`);
     }
     process.exitCode = report.ok ? 0 : 1;
-  } finally {
-    clearTimeout(deadline);
-    await browser.close();
   }
 }
 

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { evaluate, inCorner, ink, pngSize, previewFindings, VIEWS } from "../helpers/card-check/rules.mjs";
+import { evaluate, inCorner, ink, previewFindings, VIEWS } from "../helpers/card-check/rules.mjs";
 
 const bubble = VIEWS.find((v) => v.id === "bubble-iphone")!;
 const page = VIEWS.find((v) => v.id === "page-390")!;
@@ -72,9 +72,19 @@ test("keep: missing, hidden and clamped", () => {
   expect(rules(measure({ keep: [{ sel: "h1", items: [] }] }))).toContain("FAIL keep");
   expect(rules(measure({ keep: [{ sel: "?.note", optional: true, items: [] }] }))).toEqual([]);
   expect(rules(measure({ keep: [{ sel: "h1", items: [item([hidden])] }] }))).toContain("FAIL keep");
-  expect(rules(measure({ keep: [{ sel: "h1", items: [item([{ ...hidden, ell: true }])] }] }))).toContain("WARN keep");
+  // An ellipsis style does not excuse a heading that is gone altogether.
+  expect(rules(measure({ keep: [{ sel: "h1", items: [item([{ ...hidden, ell: true }])] }] }))).toContain("FAIL keep");
+  // A working clamp: first line shows, the dropped line sits below a clamp box that is whole on screen.
+  const clamp = { t: 100, b: 140 };
+  const first = line(16, 100, 200, 120, { clamp });
+  const dropped = line(16, 140, 200, 160, { clamp, vis: null });
+  expect(rules(measure({ keep: [{ sel: "h1", items: [item([first, dropped])] }] }))).toContain("WARN keep");
+  // Without a clamp box (or with nothing left on screen) the same loss is a FAIL.
+  expect(rules(measure({ keep: [{ sel: "h1", items: [item([{ ...first, clamp: null }, { ...dropped, clamp: null }])] }] }))).toContain("FAIL keep");
+  expect(rules(measure({ keep: [{ sel: "h1", items: [item([{ ...first, vis: null }, dropped])] }] }))).toContain("FAIL keep");
   // A bubble-only selector is not judged on the page view.
-  expect(rules(measure({ keep: [{ sel: ".summary", only: "bubble", items: [] }] }), page)).toEqual([]);
+  const pageSize = { vw: 390, vh: 844, sw: 390, sh: 844, main: { l: 16, t: 0, r: 374, b: 800 } };
+  expect(rules(measure({ ...pageSize, keep: [{ sel: ".summary", only: "bubble", items: [] }] }), page)).toEqual([]);
 });
 
 test("a flex item squeezed to a word per line fails", () => {
@@ -98,19 +108,21 @@ test("ink box sits inside the line rect", () => {
   expect(g.b).toBeLessThan(20);
 });
 
-test("preview checks og meta and the image size", () => {
+test("a page that does not lay out at the view size fails before any other rule", () => {
+  expect(rules(measure({ vw: 981, vh: 948, sw: 981, lines: [line(10, 8, 120, 28)] }))).toEqual(["FAIL viewport"]);
+  expect(rules(measure({ scale: 0.28 }))).toEqual(["FAIL viewport"]);
+});
+
+test("preview checks og meta and the decoded image", () => {
   const meta = { image: "preview.png?v=1", imageWidth: "1200", imageHeight: "630", title: "Uber" };
   expect(previewFindings(meta, { w: 1200, h: 630 })).toEqual([]);
   expect(previewFindings({ ...meta, image: "" }, null)[0].detail).toBe("no og:image");
   expect(previewFindings(meta, { w: 600, h: 315 })[0].detail).toContain("600x315");
-  expect(previewFindings(meta, null)[0].detail).toContain("missing");
-});
-
-test("pngSize reads the IHDR chunk", () => {
-  const buf = Buffer.alloc(24);
-  buf.writeUInt32BE(0x49484452, 12);
-  buf.writeUInt32BE(1200, 16);
-  buf.writeUInt32BE(630, 20);
-  expect(pngSize(buf)).toEqual({ w: 1200, h: 630 });
-  expect(pngSize(Buffer.alloc(8))).toBeNull();
+  expect(previewFindings(meta, { error: "did not load or decode" })[0].detail).toContain("did not load");
+  expect(previewFindings(meta, undefined)[0].detail).toContain("not checked");
+  // A remote image gets the same metadata checks.
+  const remote = { image: "https://example.invalid/preview.png", title: "" };
+  const details = previewFindings(remote, { error: "did not load or decode" }).map((f) => f.detail);
+  expect(details.some((d) => d.includes("size meta"))).toBe(true);
+  expect(details).toContain("no og:title");
 });
