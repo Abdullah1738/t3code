@@ -1,4 +1,4 @@
-import { requestTextParts, type EnvironmentId } from "@t3tools/contracts";
+import { requestPlainText, requestTextParts, type EnvironmentId } from "@t3tools/contracts";
 import type { ReactNode } from "react";
 
 import type { FilePreviewItem, FilePreviewSource } from "../../components/FilePreviewModal.types";
@@ -10,7 +10,8 @@ import { AppText as Text } from "../../components/ui/AppText";
  */
 export function requestInline(text: string, onOpen: (position: number) => void): ReactNode {
   const parts = requestTextParts(text);
-  if (!parts.some((part) => part.type === "image")) return text;
+  // Stored words keep typed ref look-alikes escaped; plain text reads them back.
+  if (!parts.some((part) => part.type === "image")) return requestPlainText(text);
   let position = 0;
   return parts.map((part, at) => {
     if (part.type === "text") return part.text;

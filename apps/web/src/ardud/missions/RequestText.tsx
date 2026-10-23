@@ -2,7 +2,6 @@ import { useState } from "react";
 
 import {
   requestPlainText,
-  requestTextParts,
   type AssetResource,
   type EnvironmentId,
   type RequestTextPart,
@@ -13,20 +12,18 @@ import { ExpandedImageDialog } from "../../components/chat/ExpandedImageDialog";
 import type { ExpandedImagePreview } from "../../components/chat/ExpandedImagePreview";
 import { ImageChipButton } from "../../components/contextChipParts";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-
-type ImagePart = Extract<RequestTextPart, { type: "image" }>;
+import { requestTextView, type RequestImagePart as ImagePart } from "./requestTextView";
 
 /**
  * A request message's words with its images as chips where the owner put
  * them; a chip opens the message's images full size at that one.
  */
 export function RequestText(props: { text: string }) {
-  const parts = requestTextParts(props.text);
+  const view = requestTextView(props.text);
   const environmentId = usePrimaryEnvironmentId();
-  const images = parts.filter((part): part is ImagePart => part.type === "image");
-  if (images.length === 0) return props.text;
+  if (view.type === "text") return view.text;
   if (environmentId === null) return requestPlainText(props.text);
-  return <TextWithImages parts={parts} images={images} environmentId={environmentId} />;
+  return <TextWithImages parts={view.parts} images={view.images} environmentId={environmentId} />;
 }
 
 function TextWithImages(props: {
