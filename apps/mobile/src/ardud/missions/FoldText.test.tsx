@@ -35,7 +35,14 @@ vi.mock("react-native", () => ({
 vi.mock("../../components/ui/AppText", () => ({
   AppText: (props: TextProps) => {
     texts.push(props);
-    return <span data-lines={props.numberOfLines ?? "all"}>{props.children}</span>;
+    return (
+      <span
+        data-lines={props.numberOfLines ?? "all"}
+        data-copy={props["aria-hidden"] === true ? "" : undefined}
+      >
+        {props.children}
+      </span>
+    );
   },
   AppTextInput: () => null,
 }));
@@ -50,10 +57,10 @@ const OTHER = "A restart interrupts every running lane turn and background helpe
 let host: HTMLDivElement;
 let root: Root;
 
-const render = (text = TEXT) =>
+const render = (text = TEXT, lines = 4) =>
   act(() =>
     root.render(
-      <FoldText text={text} lines={4} className="text-[15px] leading-6 text-foreground" />,
+      <FoldText text={text} lines={lines} className="text-[15px] leading-6 text-foreground" />,
     ),
   );
 
@@ -136,5 +143,28 @@ it("folds replacement text again instead of keeping the old text open", () => {
   render(TEXT);
   layOut(2);
   expect(latest().shown.numberOfLines).toBe(4);
+  expect(toggle()).toBeNull();
+});
+
+it("keeps Show all when only the fold limit changes", () => {
+  render();
+  layOut(9);
+  act(() => toggle()!.click());
+
+  // Native Text sends no new layout for an unchanged hidden copy, so none comes here.
+  render(TEXT, 3);
+  expect(latest().shown.numberOfLines).toBe(3);
+  expect(toggle()?.getAttribute("aria-label")).toBe("Show all");
+});
+
+it("lays replacement text out on a fresh hidden copy", () => {
+  render();
+  layOut(9);
+  const first = host.querySelector("[data-copy]");
+
+  render(OTHER);
+  expect(host.querySelector("[data-copy]")).not.toBe(first);
+  render(OTHER, 3);
+  expect(host.querySelector("[data-copy]")?.textContent).toBe(OTHER);
   expect(toggle()).toBeNull();
 });

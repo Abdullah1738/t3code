@@ -289,18 +289,20 @@ export function FoldText(props: {
   readonly className: string;
 }) {
   const { text, lines } = props;
-  // Opening and the measured line count belong to this text: replacement text starts
-  // folded with no toggle until its copy lays out.
+  // Opening belongs to this text and fold: replacement text starts folded.
   const key = `${lines}\n${text}`;
-  const [fold, setFold] = useState({ key, open: false, laidOut: 0 });
-  if (fold.key !== key) setFold({ key, open: false, laidOut: 0 });
-  const current = fold.key === key ? fold : { key, open: false, laidOut: 0 };
-  const open = current.open;
+  const [fold, setFold] = useState({ key, open: false });
+  if (fold.key !== key) setFold({ key, open: false });
+  const open = fold.key === key && fold.open;
+  // The line count belongs to the text alone, so a new fold limit reuses it: native
+  // Text sends no new layout event when the hidden copy's layout is unchanged.
+  const [layout, setLayout] = useState({ text, count: 0 });
+  if (layout.text !== text) setLayout({ text, count: 0 });
   // The hidden copy stays laid out while open, so a rotation that makes it fit drops the toggle.
-  const cut = current.laidOut > lines;
+  const cut = layout.text === text && layout.count > lines;
   const measure = (event: TextLayoutEvent) => {
-    const laidOut = event.nativeEvent.lines.length;
-    setFold((previous) => (previous.key === key ? { ...previous, laidOut } : previous));
+    const count = event.nativeEvent.lines.length;
+    setLayout((previous) => (previous.text === text ? { text, count } : previous));
   };
   return (
     <View className="gap-1">
@@ -308,14 +310,16 @@ export function FoldText(props: {
         <Text selectable numberOfLines={open ? undefined : lines} className={props.className}>
           {text}
         </Text>
-        <MeasureText text={text} className={props.className} onTextLayout={measure} />
+        {/* Keyed so replacement text lays out on its own native Text: a queued layout of
+            the old text resolves the current handler and would otherwise count as the new. */}
+        <MeasureText key={text} text={text} className={props.className} onTextLayout={measure} />
       </View>
       {cut ? (
         <View className="items-start">
           <LinkButton
             label={open ? "Show less" : "Show all"}
             expanded={open}
-            onPress={() => setFold({ ...current, open: !open })}
+            onPress={() => setFold({ key, open: !open })}
           />
         </View>
       ) : null}
