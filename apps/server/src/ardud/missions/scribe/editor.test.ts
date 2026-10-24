@@ -116,6 +116,44 @@ describe("editor input", () => {
     ]);
     expect(input.suggestions.map((shown) => shown.status)).toEqual(["dismissed"]);
   });
+
+  it("leaves out notes the master or the owner acked as handled", () => {
+    const roles = [{ id: "crpko:master", kind: "master" }] as unknown as EditorSource["roles"];
+    const input = buildEditorInput(
+      source({
+        mission: { ...mission, masterRoleId: "crpko:master" } as EditorSource["mission"],
+        roles,
+        notes: [
+          note("note-open"),
+          note("note-master", {
+            type: "owner-must-know",
+            severity: "critical",
+            ackedBy: [{ _tag: "role", roleId: "crpko:master" }],
+          }),
+          note("note-owner", { severity: "high", ackedBy: [{ _tag: "owner" }] }),
+          // A lane role's ack (not possible today) doesn't count as handled.
+          note("note-lane", { ackedBy: [{ _tag: "role", roleId: "crpko:lane-lead" }] }),
+        ],
+      }),
+    );
+    expect(input.notes.map((shown) => shown.id)).toEqual(["note-open", "note-lane"]);
+
+    // The editor can't bring an acked note back: fyiOrder and the feed drop it.
+    const plan = checkEditorOutput(
+      {
+        bottomLine: "One risk is open.",
+        fyiOrder: ["note-master", "note-owner", "note-open"],
+        feed: [
+          { kind: "note", summary: "Handled already", ref: "note:note-master" },
+          { kind: "note", summary: "Still open", ref: "note:note-open" },
+        ],
+        suggestions: [],
+      },
+      input,
+    );
+    expect(plan.fyiOrder).toEqual(["note-open"]);
+    expect(plan.feed.map((item) => item.ref?.id)).toEqual(["note-open"]);
+  });
 });
 
 describe("editor output check", () => {

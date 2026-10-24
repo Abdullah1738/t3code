@@ -198,8 +198,19 @@ export const buildEditorInput = (source: EditorSource): EditorInput => {
       })),
   ].toSorted((a, b) => a.at.localeCompare(b.at));
 
+  // A note the owner or the master acked was handled; shown again, the editor resurfaces it.
+  const masterRoles = new Set<string>([
+    ...(mission.masterRoleId === null ? [] : [mission.masterRoleId]),
+    ...source.roles.filter((role) => role.kind === "master").map((role) => role.id),
+  ]);
+  const handled = (note: Note) =>
+    note.ackedBy.some(
+      (actor) => actor._tag === "owner" || (actor._tag === "role" && masterRoles.has(actor.roleId)),
+    );
   const notes = currentNotes(source.notes)
-    .filter((note) => note.citation === "verified" && after(note.createdAt, since))
+    .filter(
+      (note) => note.citation === "verified" && after(note.createdAt, since) && !handled(note),
+    )
     .toSorted((a, b) => fyiScore(b) - fyiScore(a) || b.createdAt.localeCompare(a.createdAt))
     .slice(0, EDITOR_LIMITS.notes)
     .map((note) => ({
