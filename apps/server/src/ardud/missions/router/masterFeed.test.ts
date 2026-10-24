@@ -15,6 +15,7 @@ import * as Sqlite from "../../../persistence/Sqlite.ts";
 import { agent, at, masterThread, missionId, seed } from "../asks/AsksService.testkit.ts";
 import { withComment } from "../asks/inboxMarks.ts";
 import * as MissionStore from "../store/MissionStore.ts";
+import type { MissionStoreRecord } from "../store/recordIndex.ts";
 import { digestText, makeMasterFeed } from "./masterFeed.ts";
 import { controlRoomId, MissionRouter } from "./MissionRouter.ts";
 import { fakeRouterThreads, routerOverFakes } from "./MissionRouter.testkit.ts";
@@ -273,6 +274,108 @@ describe("master inbox feed", () => {
       const rooms = yield* RouterStore.RouterStore;
       const body = (yield* rooms.messageBody(messages[0]!.id)) ?? "";
       assert.include(body, "left these comments:\n- Squash it.\n- Delete the branch after.");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("the owner's decision on the master's own approval always reaches it", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* seed;
+      const store = yield* MissionStore.MissionStore;
+      const rooms = yield* RouterStore.RouterStore;
+      const feed = yield* feedOf(null);
+      const owner: MissionProvenance = { _tag: "owner-app", surface: "web", sessionId: "s-1" };
+      const release = (id: string): Approval => ({
+        ...approval(id, "owner"),
+        kind: "release",
+        title: `Robob release ${id}`,
+        requestedBy: "master",
+        links: [{ kind: "url", label: "iOS build", url: "https://example.test/ios", ref: null }],
+      });
+      const decide = (
+        record: Approval,
+        action: "approve" | "reject",
+        note: string | null,
+        upserts: ReadonlyArray<MissionStoreRecord> = [],
+      ) =>
+        Effect.gen(function* () {
+          const status = action === "approve" ? "approved" : "rejected";
+          const result = yield* store.commit({
+            event: {
+              missionId,
+              kind: "approval.decided",
+              actor: { _tag: "owner" },
+              provenance: owner,
+              summary: `${action === "approve" ? "Approved" : "Rejected"}: ${record.title}`,
+              subject: { kind: "approval", id: record.id },
+              payload: { action, approver: "owner", note, masterAsked: true },
+            },
+            upserts: [{ _tag: "approval", record: { ...record, status } }, ...upserts],
+          });
+          return result.event;
+        });
+
+      const bare = release("1");
+      yield* feed.handle(yield* openApproval(bare, agent(masterThread)));
+      yield* feed.handle(yield* decide(bare, "approve", null));
+      const first = yield* controlMessages;
+      assert.strictEqual(first.length, 1);
+      assert.strictEqual(first[0]!.kind, "decision");
+      assert.deepStrictEqual(first[0]!.to, [masterRole]);
+      const approvedBody = (yield* rooms.messageBody(first[0]!.id)) ?? "";
+      assert.include(approvedBody, "The owner approved Robob release 1.");
+      assert.include(approvedBody, "iOS build: https://example.test/ios");
+      assert.include(approvedBody, "Go ahead");
+      assert.deepStrictEqual(wakesFor(h.threads.sent), [masterThread]);
+
+      // His note is one comment: one notice, not a second owner-note one.
+      const noted = release("2");
+      yield* openApproval(noted, agent(masterThread));
+      const subject = { kind: "approval", id: noted.id } as const;
+      const mark = withComment(Option.none(), subject, missionId, {
+        id: "c-1",
+        body: "Wait for the weekend.",
+        at,
+      });
+      yield* feed.handle(
+        yield* decide(noted, "reject", "Wait for the weekend.", [
+          { _tag: "inbox-mark", record: mark },
+        ]),
+      );
+      const second = yield* controlMessages;
+      assert.strictEqual(second.length, 2);
+      const rejectedBody = (yield* rooms.messageBody(second[1]!.id)) ?? "";
+      assert.include(rejectedBody, "The owner rejected Robob release 2.");
+      assert.include(rejectedBody, "His comments:\n- Wait for the weekend.");
+      assert.include(rejectedBody, "Don't go ahead");
+
+      // The master deciding on his stated condition is its own act: no notice.
+      yield* feed.handle(
+        yield* store
+          .commit({
+            event: {
+              missionId,
+              kind: "approval.decided",
+              actor: { _tag: "role", roleId: RoleId.make("role-master") },
+              provenance: agent(masterThread),
+              summary: "Approved: Robob release 3",
+              subject: { kind: "approval", id: ApprovalId.make("3") },
+              payload: { action: "approve", approver: "owner", note: null, masterAsked: true },
+            },
+            upserts: [{ _tag: "approval", record: { ...release("3"), status: "approved" } }],
+          })
+          .pipe(Effect.map((result) => result.event)),
+      );
+      assert.strictEqual((yield* controlMessages).length, 2);
+
+      // Decided while the server was down: the restart still brings it.
+      const missed = release("4");
+      yield* openApproval(missed, agent(masterThread));
+      yield* decide(missed, "approve", null);
+      yield* (yield* feedOf(null)).backfill;
+      const after = yield* controlMessages;
+      assert.strictEqual(after.length, 3);
+      assert.include((yield* rooms.messageBody(after[2]!.id)) ?? "", "Robob release 4");
     }).pipe(Effect.provide(h.layer));
   });
 

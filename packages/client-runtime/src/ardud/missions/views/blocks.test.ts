@@ -520,6 +520,35 @@ describe("stock templates", () => {
     });
     expect(card.actions.map((action) => action.key)).toEqual(["approve", "reject", "discuss"]);
   });
+
+  it("shows the master's release summary and its whole markdown detail", () => {
+    const detail = [
+      "## Changelog",
+      ...Array.from({ length: 30 }, (_, index) => `- change ${index + 1}`),
+      "## Install",
+      "Quit Robob, then run the installer.",
+    ].join("\n");
+    const approval = decodeApproval({
+      id: "ap-m",
+      missionId: "m-1",
+      kind: "release",
+      title: "Robob release 1",
+      summary: "Missions approvals and limit resume.",
+      detail,
+      requestedBy: "master",
+      links: [{ kind: "url", label: "iOS build", url: "https://example.test/ios", ref: null }],
+      status: "pending",
+      staleReason: null,
+      decidedBy: null,
+      decidedAt: null,
+      createdAt: T0,
+    });
+    const card = viewCard({ kind: "approval", record: approval }, [], { nowMs: NOW });
+    expect(card.templateId).toBe("builtin:release");
+    expect(kinds(card.blocks)).toEqual(["text", "links", "markdown"]);
+    expect(card.blocks[0]).toMatchObject({ text: "Missions approvals and limit resume." });
+    expect(card.blocks[2]).toEqual({ kind: "markdown", text: detail, source: null, maxLines: 12 });
+  });
 });
 
 describe("withdrawn drafts", () => {

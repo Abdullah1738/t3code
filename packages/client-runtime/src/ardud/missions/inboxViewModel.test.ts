@@ -16,6 +16,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   addDraftNoteInput,
   answerAskInput,
+  approvalOutcomeLabel,
   askView,
   blocksLine,
   commentInput,
@@ -481,6 +482,16 @@ describe("knocks and suggestions", () => {
       ok: true,
       value: { approvalId: "a", action: "approve" },
     });
+  });
+
+  it("says the master withdrew its own approval and crw closed its as stale", () => {
+    expect(approvalOutcomeLabel({ status: "stale-closed", requestedBy: "master" })).toBe(
+      "Withdrawn",
+    );
+    expect(approvalOutcomeLabel({ status: "stale-closed", requestedBy: "crw" })).toBe(
+      "Closed as stale",
+    );
+    expect(approvalOutcomeLabel({ status: "approved", requestedBy: "master" })).toBe("Approved");
   });
 
   it("requires a dismiss reason and parses an edited JSON value", () => {

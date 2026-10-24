@@ -8,6 +8,7 @@ import type {
   Note,
   Suggestion,
 } from "@t3tools/contracts";
+import { isMasterApproval } from "@t3tools/contracts";
 import {
   ageView,
   entryHeadline,
@@ -57,7 +58,7 @@ import {
   ReplyContext,
   TextField,
 } from "./parts";
-import { useTemplatedItem } from "./ViewBlocks";
+import { MarkdownText, useTemplatedItem } from "./ViewBlocks";
 
 // The reading card for one inbox item with its decide bar pinned below. The
 // same component fills the pushed item screen on phones and the reading pane
@@ -369,6 +370,13 @@ function ApprovalItem(props: FrameProps & { readonly approval: Approval }) {
     >
       {templated ? (
         templated.render()
+      ) : isMasterApproval(props.approval) ? (
+        // The master's own asks carry a changelog, build links and an install plan he reads in full.
+        <>
+          {props.approval.summary?.trim() ? <Body>{props.approval.summary.trim()}</Body> : null}
+          <LinkChips links={props.approval.links} />
+          <MarkdownText text={props.approval.detail} maxLines={12} />
+        </>
       ) : (
         <>
           <LinkChips links={props.approval.links} />

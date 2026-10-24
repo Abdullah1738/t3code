@@ -227,7 +227,10 @@ export class MissionService extends Context.Service<
       readonly ids?: ReadonlyArray<string>;
       readonly status?: ReadonlyArray<ApprovalStatus>;
     }) => Effect.Effect<ReadonlyArray<Approval>, MissionError>;
-    /** Systems (crw) open and stale-close approvals in their own component name. */
+    /**
+     * Systems (crw) open and stale-close approvals in their own component name;
+     * the mission's master does the same under `MASTER_APPROVAL_REQUESTER`.
+     */
     readonly openApproval: Write<OpenApprovalInput>;
     readonly closeStaleApproval: Write<CloseStaleApprovalInput>;
     // ardud missions: crw-threads

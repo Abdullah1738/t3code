@@ -1,4 +1,9 @@
+// @effect-diagnostics nodeBuiltinImport:off - approval ids use node:crypto, like core record ids.
+import * as NodeCrypto from "node:crypto";
+
 import {
+  ApprovalId,
+  MASTER_APPROVAL_REQUESTER,
   MissionError,
   OrchestratorMcpFailure,
   type MissionId,
@@ -466,6 +471,28 @@ const handlers = {
         ),
       );
     }),
+  ),
+  mission_approval_open: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.openApproval(provenance, {
+        missionId: input.missionId,
+        approvalId:
+          input.approvalId ??
+          ApprovalId.make(`${input.missionId}:approval:master:${NodeCrypto.randomUUID()}`),
+        kind: input.kind,
+        title: input.title,
+        detail: input.detail,
+        requestedBy: MASTER_APPROVAL_REQUESTER,
+        links: input.links ?? [],
+        ...(input.summary === undefined ? {} : { summary: input.summary }),
+        ...(input.flags === undefined ? {} : { flags: input.flags }),
+      }),
+    ),
+  ),
+  mission_approval_withdraw: McpToolAccess.actsAsCaller((input) =>
+    asMaster(input.missionId, (missions, _asks, provenance) =>
+      missions.closeStaleApproval(provenance, input),
+    ),
   ),
   mission_approval_route: McpToolAccess.actsAsCaller((input) =>
     asMaster(input.missionId, (missions, _asks, provenance) =>

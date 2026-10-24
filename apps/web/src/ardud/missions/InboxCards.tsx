@@ -2,6 +2,7 @@ import { memo, useMemo, useState } from "react";
 
 import {
   approverOf,
+  isMasterApproval,
   type Approval,
   type Approver,
   type Ask,
@@ -18,7 +19,7 @@ import {
 import {
   actorLabel,
   APPROVAL_KICKER,
-  APPROVAL_STATUS_LABEL,
+  approvalOutcomeLabel,
   askView,
   cardSubMission,
   draftKicker,
@@ -61,6 +62,7 @@ import { CardFrame, type CardAction, type CardFrameProps } from "./cards/CardFra
 import { APPROVER_NAME, PersonChip } from "./cards/chips";
 import { CommentList, useItemMarks, type ItemMarks } from "./cards/ItemMarks";
 import { useTemplatedCard } from "./cards/TemplatedCard";
+import { MarkdownText } from "./cards/ViewBlocks";
 import { ConditionNote, useCardDiscussion, type CardDiscussion } from "./DiscussPanel";
 import { rerouteRecord } from "./operationCommands";
 import { inboxItemDomId, type InboxActions } from "./useInboxScreen";
@@ -477,6 +479,7 @@ export function ApprovalCard(
     nowMs: props.nowMs,
     masterRoleId: props.masterRoleId,
   });
+  const masterAsked = isMasterApproval(approval);
   const decide = (action: "approve" | "reject") =>
     void run(() => props.actions.decideApproval(approval, action, note));
   const actions: CardAction[] = move.moving
@@ -514,6 +517,14 @@ export function ApprovalCard(
     >
       {templated ? (
         templated.body
+      ) : masterAsked ? (
+        // The master's own asks carry a changelog, build links and an install plan he reads in full.
+        <>
+          <TextBlock text={approval.summary ?? ""} />
+          <LinksBlock links={approval.links} />
+          <FlagsBlock flags={approval.flags ?? []} />
+          <MarkdownText text={approval.detail} maxLines={12} />
+        </>
       ) : (
         <>
           <LinksBlock links={approval.links} />
@@ -523,7 +534,7 @@ export function ApprovalCard(
       )}
       <FactsBlock
         rows={[
-          { label: "Requested by", value: approval.requestedBy },
+          { label: "Requested by", value: masterAsked ? "Master" : approval.requestedBy },
           { label: "Moved because", value: routeLine(approval) },
         ]}
       />
@@ -560,7 +571,7 @@ export function ClosedApprovalRow(props: {
         nowMs={props.nowMs}
         title={approval.title}
         done={{
-          verb: APPROVAL_STATUS_LABEL[approval.status],
+          verb: approvalOutcomeLabel(approval),
           ...(approval.staleReason ? { detail: approval.staleReason } : {}),
         }}
       />

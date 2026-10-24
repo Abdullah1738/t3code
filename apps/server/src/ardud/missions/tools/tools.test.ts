@@ -813,6 +813,138 @@ describe("mission MCP tools", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("lets the master bring the owner its own approvals and withdraw them", () => {
+    const { layer } = toolsLayer();
+    return Effect.gen(function* () {
+      yield* seed;
+      const master = threadCaller(masterThread);
+      const lane = threadCaller(laneThread);
+      const missions = yield* MissionService.MissionService;
+      // Even a table that sends deploys to the master never lets it approve its own ask.
+      yield* missions.setApprovalRouting(ownerApp, {
+        missionId,
+        routes: [
+          { id: "deploys", match: { _tag: "approval", kind: "deploy" }, approver: "master" },
+        ],
+      });
+      const detail = [
+        "## Changelog",
+        "- Release approvals on the board",
+        "",
+        "## Install plan",
+        "1. Snapshot running threads",
+        "2. Reinstall and resume",
+      ].join("\n");
+      const release = {
+        missionId,
+        approvalId: "rel-1",
+        kind: "release",
+        title: "Robob release 1",
+        summary: "Board approvals for releases.",
+        detail,
+        links: [{ kind: "url", label: "iOS build", url: "https://example.test/ios", ref: null }],
+      };
+
+      const byLane = yield* call("mission_approval_open", lane, release);
+      expect(byLane.isError).toBe(true);
+      expect(byLane.text).toContain("master");
+
+      const opened = yield* call("mission_approval_open", master, release);
+      expect(opened.isError, opened.text).toBe(false);
+      const retried = yield* call("mission_approval_open", master, release);
+      expect(retried.isError, retried.text).toBe(false);
+      const deploy = yield* call("mission_approval_open", master, {
+        missionId,
+        kind: "deploy",
+        title: "Restart the OpenCode service",
+        detail: "Restart plan",
+      });
+      expect(deploy.isError, deploy.text).toBe(false);
+      // Merges stay crw's: the tool's kinds leave them out.
+      const merge = yield* Effect.exit(
+        call("mission_approval_open", master, {
+          ...release,
+          approvalId: "rel-merge",
+          kind: "merge",
+        }),
+      );
+      expect(merge._tag).toBe("Failure");
+
+      const listed = yield* call("mission_approvals", master, { missionId });
+      const approvals = listed.structured.approvals as Array<{
+        id: string;
+        kind: string;
+        status: string;
+        approver: string;
+        requestedBy: string;
+        detail: string;
+      }>;
+      expect(
+        approvals.map((approval) => [approval.kind, approval.approver, approval.requestedBy]),
+      ).toEqual([
+        ["release", "owner", "master"],
+        ["deploy", "owner", "master"],
+      ]);
+      expect(approvals.find((approval) => approval.id === "rel-1")?.detail).toBe(detail);
+      const deployId = approvals.find((approval) => approval.kind === "deploy")?.id ?? "";
+      expect(deployId.startsWith(`${missionId}:approval:master:`)).toBe(true);
+
+      const selfDecided = yield* call("mission_approval_decide", master, {
+        missionId,
+        approvalId: "rel-1",
+        action: "approve",
+      });
+      expect(selfDecided.isError).toBe(true);
+      const selfRouted = yield* call("mission_approval_route", master, {
+        missionId,
+        approvalId: "rel-1",
+        approver: "master",
+        reason: "Mine",
+      });
+      expect(selfRouted.isError).toBe(true);
+      expect(selfRouted.text).toContain("only the owner decides it");
+
+      const laneWithdraw = yield* call("mission_approval_withdraw", lane, {
+        missionId,
+        approvalId: deployId,
+        reason: "Not needed",
+      });
+      expect(laneWithdraw.isError).toBe(true);
+      const withdrawn = yield* call("mission_approval_withdraw", master, {
+        missionId,
+        approvalId: deployId,
+        reason: "Folded into release 1",
+      });
+      expect(withdrawn.isError, withdrawn.text).toBe(false);
+      const store = yield* MissionStore.MissionStore;
+      const closed = Option.getOrThrow(yield* store.get("approval", ApprovalId.make(deployId)));
+      expect(closed).toMatchObject({
+        status: "stale-closed",
+        staleReason: "Folded into release 1",
+      });
+
+      // crw's approvals stay crw's to close.
+      yield* missions.openApproval(
+        { _tag: "system", component: "crw" },
+        {
+          missionId,
+          approvalId: ApprovalId.make("ap-crw"),
+          kind: "merge",
+          title: "Good to merge: ap-crw",
+          detail: "",
+          requestedBy: "crw",
+          links: [],
+        },
+      );
+      const crwWithdraw = yield* call("mission_approval_withdraw", master, {
+        missionId,
+        approvalId: "ap-crw",
+        reason: "Mine now",
+      });
+      expect(crwWithdraw.isError).toBe(true);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("builds a watch check for a mission", () => {
     const { layer } = toolsLayer();
     return Effect.gen(function* () {
