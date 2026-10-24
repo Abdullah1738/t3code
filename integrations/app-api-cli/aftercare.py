@@ -40,13 +40,20 @@ ADDRESS = 'Banyantree Flat 2104'
 # An overdue case wakes again once a day until it is updated, closed or dropped.
 REPEAT_S = 86400
 INTERVAL_S = 900
-# The watcher outlives the later of the next try and the deadline by this much, and every change re-arms it.
-KEEP_S = 14 * 86400
 MAX_ITEMS = 10
 CONTEXT_LIMIT = 6000  # robob-watch refuses longer wake context
+CHECK_LOCK_WAIT_S = 20  # inside robob-watch's 60s check timeout; a CLI change can hold the case lock this long
 PLACEHOLDER = re.compile(r'(?:none|null|nil|n/?a|tbd|tba|pending|unknown|not yet|later|soon|asap|x+|-+|\?+|\.+)', re.I)
-MONTH = r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*'
-DATE = re.compile(rf'\b\d{{4}}-\d{{2}}-\d{{2}}\b|\b\d{{1,2}}(?:st|nd|rd|th)?\s*{MONTH}\b|\b{MONTH}\s*\d{{1,2}}\b', re.I)
+VAGUE = re.compile(r'\b(?:tbd|tba|tbc|pending|unknown|not yet|later|soon|asap|n/a|none|null)\b|\?', re.I)
+MONTHS = ('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec')
+MONTH = (r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(?:uary|ruary|ch|il|e|y|ust|t|tember|ober|ember)?\b')
+# 2026-10-27, 27/10/2026, 27 Oct, Oct 27; each one is checked against the calendar.
+DATES = ((re.compile(r'(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)'), 'ymd'),
+         (re.compile(r'(?<![\d/])(\d{1,2})/(\d{1,2})/(\d{4})(?![\d/])'), 'dmy'),
+         (re.compile(rf'(?<![\d.:])(\d{{1,2}})(?:st|nd|rd|th)?\s*{MONTH}', re.I), 'dm'),
+         (re.compile(rf'\b{MONTH}\s*(\d{{1,2}})(?![\d:])', re.I), 'md'))
+HOUR = r'(\d{1,2})(?::([0-5]\d))?\s*(?:am|pm)?'
+WINDOW = re.compile(rf'(?<![\d:]){HOUR}\s*(?:-|–|to)\s*{HOUR}(?![\d:])|\b(?:morning|afternoon|evening)\b', re.I)
 
 
 def stamp(value=None):
@@ -96,8 +103,8 @@ def write(path, data):
         raise
 
 
-def run(args, timeout=30):
-    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=clean_env())
+def run(args, timeout=30, stdin=None):
+    p = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=timeout, env=clean_env())
     if p.returncode:
         raise RuntimeError(f'{Path(args[0]).name} {args[1]} failed: {(p.stderr or p.stdout).strip()[-300:]}')
     return p.stdout
@@ -119,9 +126,20 @@ def path_for(cid):
     return ROOT / f'{cid}.json'
 
 
+def watcher_id(case, gen=None):
+    """Each round of a case (a reopen is a new round) gets a watcher of its own: robob-watch keys its
+    deliveries on watcher id + fire count, and a run of the old watcher must never write into the new
+    one's folder. Round 1 keeps the case id."""
+    gen = case.get('gen', 1) if gen is None else gen
+    if gen == 1:
+        return case['id']
+    tag = hashlib.sha256(f'{case["id"]}\0{gen}'.encode()).hexdigest()[:8]
+    return f'{case["id"][:39].rstrip("-")}-g{tag}'
+
+
 def watcher_status(case):
     """What the case's wake really is: active, missing, paused, expired, done, or stale (an older definition)."""
-    d = WATCHERS / case['id']
+    d = WATCHERS / watcher_id(case)
     if not (d / 'watcher.json').exists():
         return 'missing'
     w, s = read(d / 'watcher.json'), read(d / 'state.json')
@@ -173,34 +191,36 @@ def context(case):
             f'If {who} calls it off, run `order-watch aftercare drop --id {cid} --reason "..."` and stop.')
 
 
-def watch_until(case, now=None):
-    """Past the later of the next try and the deadline, so an open case never outlives its wake."""
-    ends = [epoch(case['next_at']), now or time.time()] + ([epoch(case['deadline'])] if case.get('deadline') else [])
-    return max(ends) + KEEP_S
+def spec(case, session):
+    """The watcher definition for this generation of the case. It never expires: an open case keeps its
+    wake until close or drop removes it, however long nobody touches it."""
+    cid = case['id']
+    return {'id': watcher_id(case), 'title': f'{WHO[case["for"]]} {APPS[case["app"]]} {case["kind"]} {case["order"]}',
+            'check': shlex.join([sys.executable, str(Path(__file__).resolve()), 'check', '--id', cid,
+                                 '--gen', str(case.get('gen', 1))]),
+            'interval_s': INTERVAL_S, 'mode': 'wake', 'max_fires': 0, 'expires_at': None,
+            'created_by_session': session, 'context': context(case)}
 
 
 def arm(case, session):
-    """Make the watcher match the case: (re)define it with this generation's context and expiry, then
-    re-arm it if it ran out. --no-prime: a prime run would race the runner's first check on the state file."""
-    cid, expires = case['id'], stamp(watch_until(case))
-    command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check', '--id', cid,
-                          '--gen', str(case.get('gen', 1))])
-    args = ['robob-watch', 'add', '--id', cid,
-            '--title', f'{WHO[case["for"]]} {APPS[case["app"]]} {case["kind"]} {case["order"]}',
-            '--check', command, '--interval', str(INTERVAL_S), '--mode', 'wake', '--expires', expires,
-            '--max-fires', '0', '--session', session, '--context', context(case)]
-    if (WATCHERS / cid / 'watcher.json').exists():
-        run(args + ['--replace'], 60)
-        if read(WATCHERS / cid / 'state.json').get('status', 'active') != 'active':
-            run(['robob-watch', 'resume', cid])
+    """Make the watcher match the case: (re)define it with this generation's context, then re-arm it if
+    it was stopped. --json is the only way to give robob-watch no expiry. --no-prime: a prime run would
+    race the runner's first check on the state file."""
+    wid, definition = watcher_id(case), json.dumps(spec(case, session))
+    if (WATCHERS / wid / 'watcher.json').exists():
+        run(['robob-watch', 'add', '--json', '-', '--replace'], 60, definition)
+        if read(WATCHERS / wid / 'state.json').get('status', 'active') != 'active':
+            run(['robob-watch', 'resume', wid])
     else:
-        run(args + ['--no-prime'], 60)
-    return expires
+        run(['robob-watch', 'add', '--json', '-', '--no-prime'], 60, definition)
 
 
-def drop_watcher(cid):
-    if (WATCHERS / cid).exists():
-        run(['robob-watch', 'remove', cid])
+def drop_watchers(case, keep=None):
+    """Remove the watchers of every round of the case except `keep`."""
+    for gen in range(1, case.get('gen', 1) + 1):
+        wid = watcher_id(case, gen)
+        if gen != keep and (WATCHERS / wid / 'watcher.json').exists():
+            run(['robob-watch', 'remove', wid])
 
 
 def event(case, sent_at, now):
@@ -216,25 +236,46 @@ def event(case, sent_at, now):
                      'can still be done (update --deadline if the store gives more time).')
     if sent_at:
         lines.append(f'Still open; first due {local(case["next_at"])}.')
-    lines.append(f'Case {case["id"]}: try again now, then update, close or drop it (see the watcher context).')
+    # The round and due time make each wake's text its own, whatever the runner keys deliveries on.
+    lines.append(f'Case {case["id"]} (round {case.get("gen", 1)}, due {local(case["next_at"])}): try again now, '
+                 'then update, close or drop it (see the watcher context).')
     return '\n'.join(lines)
+
+
+def shared_lock(lock, wait_s):
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.2)
 
 
 def check(cid, env=None, now=None, gen=None):
     """The watcher check. Prints once per due time (then daily); WATCH_RUN/.run-ok make it an outbox,
     so a wake printed by a run the runner never recorded (prime, crash, timeout) is printed again.
-    A watcher left from an earlier generation of the case (a reopen it missed) stays quiet."""
+    A watcher left from an earlier round of the case (a reopen it missed) stays quiet. The whole check
+    holds the case lock shared, so a close, drop or reopen can't land between reading the case and
+    printing its wake; while one is running the check stays quiet and the next run tries again."""
     env = os.environ if env is None else env
     now = time.time() if now is None else now
-    case = read(path_for(cid))
-    due = (bool(case) and case.get('status') == 'open' and now >= epoch(case['next_at'])
-           and (gen is None or case.get('gen', 1) == gen))
-    wdir = env.get('WATCH_DIR')
-    if not wdir:
-        return event(case, None, now) if due else ''
-    with (Path(wdir) / '.aftercare.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        return _check(case, due, Path(wdir), env, now)
+    if not path_for(cid).exists():
+        return ''
+    with (ROOT / '.lock').open('a') as lock:
+        if not shared_lock(lock, CHECK_LOCK_WAIT_S):
+            return ''
+        case = read(path_for(cid))
+        due = (bool(case) and case.get('status') == 'open' and now >= epoch(case['next_at'])
+               and (gen is None or case.get('gen', 1) == gen))
+        wdir = env.get('WATCH_DIR')
+        if not wdir:
+            return event(case, None, now) if due else ''
+        with (Path(wdir) / '.aftercare.lock').open('a') as wlock:
+            fcntl.flock(wlock, fcntl.LOCK_EX)
+            return _check(case, due, Path(wdir), env, now)
 
 
 def _check(case, due, wdir, env, now):
@@ -284,9 +325,36 @@ def same_order(case, args):
     return (case.get('app'), case.get('order'), case.get('kind')) == (args.app, args.order, args.kind)
 
 
+def real_date(match, form):
+    """A date the calendar has. Forms without a year are checked against a leap year."""
+    g = match.groups()
+    if form == 'ymd':
+        y, m, d = map(int, g)
+    elif form == 'dmy':
+        d, m, y = map(int, g)
+    else:
+        name, d = (g[1], g[0]) if form == 'dm' else g
+        y, m, d = 2024, MONTHS.index(name.lower()[:3]) + 1, int(d)
+    try:
+        dt.date(y, m, d)
+        return True
+    except ValueError:
+        return False
+
+
 def pickup_slot(value):
+    """The booked slot as the app shows it: one real date plus a time window, nothing left open."""
     slot = text(value, '--pickup', 120)
-    if PLACEHOLDER.fullmatch(slot) or not DATE.search(slot):
+    rest, dates = slot, 0
+    for pattern, form in DATES:
+        for match in pattern.finditer(rest):
+            if not real_date(match, form):
+                raise ValueError(f'--pickup has a date that does not exist: {match.group(0)}')
+            dates += 1
+        rest = pattern.sub(' ', rest)
+    window = WINDOW.search(rest)
+    hours_ok = window is not None and all(int(h) <= 24 for h in (window.group(1), window.group(3)) if h)
+    if PLACEHOLDER.fullmatch(slot) or VAGUE.search(slot) or not dates or not hours_ok:
         raise ValueError('--pickup must be the booked date and window the app shows, e.g. "Tue 27 Oct 9-1"')
     return slot
 
@@ -429,12 +497,14 @@ def mutate(args, parser, cid):
         # Re-arming keeps the wake target the case was opened with.
         session = case.get('session') or args.session
         case['session'] = session
-        expires = arm(case, session)
-        case.update(armed=case.get('gen', 1), watch_until=expires)
+        arm(case, session)
+        case.pop('watch_until', None)
+        case.update(armed=case.get('gen', 1), watcher_id=watcher_id(case))
         write(path, case)
+        drop_watchers(case, keep=case.get('gen', 1))  # a round a failed removal left behind
     else:
         write(path, case)
-        drop_watcher(cid)
+        drop_watchers(case)
     print(json.dumps({'case': cid, 'status': case['status'], 'next_at': case.get('next_at'),
                       'watcher': watcher_status(case) if case['status'] == 'open' else 'removed'}))
     return 0
