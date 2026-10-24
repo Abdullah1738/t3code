@@ -17,7 +17,9 @@ import {
   ModelSelection,
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
+  ProviderInteractionMode,
   RunId,
+  RuntimeMode,
   ScheduledTask,
   type ScheduledTaskError,
   ScheduledTaskId,
@@ -38,6 +40,10 @@ import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/sql/SqlClient";
 import type * as SqlError from "effect/sql/SqlError";
 
+import {
+  type DispatchModes,
+  exceededDispatchModeLimit,
+} from "../../orchestration-v2/DispatchModeLimit.ts";
 import type * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import type * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import { runningBackgroundWork } from "../context-reset/backgroundWork.ts";
@@ -64,6 +70,8 @@ const BLOCK_RETRY_DDL = `CREATE TABLE IF NOT EXISTS ardud_scheduled_task_block_r
   task_id TEXT PRIMARY KEY,
   task_created_at TEXT NOT NULL,
   fallbacks_json TEXT NOT NULL,
+  limit_runtime_mode TEXT NOT NULL,
+  limit_interaction_mode TEXT NOT NULL,
   updated_at TEXT NOT NULL
 )`;
 
@@ -132,7 +140,16 @@ export type FollowedThread = Pick<
   | "providerTurns"
   | "runtimeRequests"
   | "turnItems"
+  | "messages"
 >;
+
+const ENDED_RUN_STATUSES = new Set<OrchestrationV2Run["status"]>([
+  "completed",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "rolled_back",
+]);
 
 const runOutcome = (
   run: OrchestrationV2Run,
@@ -156,10 +173,26 @@ const latestCompletion = (projection: FollowedThread, sinceMs: number): number =
   return latest;
 };
 
+/** Delivery messages of open reports that no run was started for. */
+export const unsentReportMessages = (
+  runs: FollowedThread["runs"],
+): ReadonlyArray<NonNullable<OrchestrationV2Run["userMessageId"]>> =>
+  runs.flatMap((run) => {
+    const delivery =
+      run.delegatedCompletion?.disposition === "open" ? run.delegatedCompletion.delivery : null;
+    if (delivery === null || delivery.taskIds.length === 0) return [];
+    return runs.some((candidate) => candidate.userMessageId === delivery.messageId)
+      ? []
+      : [delivery.messageId];
+  });
+
 /**
  * A delegated report can still wake the thread, unless the run it was sent as
- * is parked in a held queue. A held queue elsewhere in the thread doesn't stop
- * a report that hasn't been sent yet.
+ * is parked in a held queue, or it was steered into a run that ended without
+ * a run of its own: a steer into a failed run is never delivered, and one
+ * into a completed run is sent again as its own run, which is then followed.
+ * A held queue elsewhere in the thread doesn't stop a report that hasn't been
+ * sent yet.
  */
 const owesReport = (projection: FollowedThread): boolean => {
   const open = new Set<string>();
@@ -171,7 +204,16 @@ const owesReport = (projection: FollowedThread): boolean => {
     if (cohort.delivery === null || cohort.delivery.taskIds.length === 0) continue;
     const { messageId, taskIds } = cohort.delivery;
     const sentAs = projection.runs.find((candidate) => candidate.userMessageId === messageId);
-    if (sentAs?.status !== "queued" || sentAs.queueHeld !== true) return true;
+    if (sentAs !== undefined) {
+      if (sentAs.status !== "queued" || sentAs.queueHeld !== true) return true;
+    } else {
+      const message = projection.messages.find((candidate) => candidate.id === messageId);
+      const steeredInto =
+        message === undefined || message.runId === null
+          ? undefined
+          : projection.runs.find((candidate) => candidate.id === message.runId);
+      if (steeredInto === undefined || !ENDED_RUN_STATUSES.has(steeredInto.status)) return true;
+    }
     for (const taskId of taskIds) parked.add(taskId);
   }
   return projection.subagents.some(
@@ -264,40 +306,68 @@ const FallbacksJson = Schema.fromJsonString(Schema.Array(ModelSelection));
 const decodeFallbacks = Schema.decodeUnknownOption(FallbacksJson);
 const encodeFallbacks = Schema.encodeEffect(FallbacksJson);
 
-/** The task's fallback models for a blocked run, in order; empty when it hasn't opted in. */
+/**
+ * A task's opt-in: the fallback models in order, and the modes of whoever
+ * turned it on. A retry never runs with broader modes than those, even for a
+ * run whose launch was still in flight when it was turned on.
+ */
+export interface BlockRetry {
+  readonly fallbacks: ReadonlyArray<ModelSelection>;
+  readonly limits: DispatchModes;
+}
+
+const decodeRuntimeMode = Schema.decodeUnknownOption(RuntimeMode);
+const decodeInteractionMode = Schema.decodeUnknownOption(ProviderInteractionMode);
+
+/** The task's opt-in, or null when it hasn't opted in. */
 export const readBlockRetry = Effect.fn("ScheduledTaskRunFollow.readBlockRetry")(function* (
   sql: SqlClient.SqlClient,
   task: Pick<ScheduledTask, "id" | "createdAt">,
-): Effect.fn.Return<ReadonlyArray<ModelSelection>, SqlError.SqlError> {
+): Effect.fn.Return<BlockRetry | null, SqlError.SqlError> {
   yield* ensureRunFollowTables(sql);
   // created_at ties the opt-in to this task, not a later one reusing its id.
-  const rows = yield* sql<{ readonly fallbacks_json: string }>`
-    SELECT fallbacks_json FROM ardud_scheduled_task_block_retry
+  const rows = yield* sql<{
+    readonly fallbacks_json: string;
+    readonly limit_runtime_mode: string;
+    readonly limit_interaction_mode: string;
+  }>`
+    SELECT fallbacks_json, limit_runtime_mode, limit_interaction_mode
+    FROM ardud_scheduled_task_block_retry
     WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt}
   `;
   const row = rows[0];
-  if (row === undefined) return [];
-  return Option.getOrElse(decodeFallbacks(row.fallbacks_json), () => []);
+  if (row === undefined) return null;
+  const fallbacks = Option.getOrNull(decodeFallbacks(row.fallbacks_json));
+  const runtimeMode = Option.getOrNull(decodeRuntimeMode(row.limit_runtime_mode));
+  const interactionMode = Option.getOrNull(decodeInteractionMode(row.limit_interaction_mode));
+  if (fallbacks === null || runtimeMode === null || interactionMode === null) return null;
+  return { fallbacks, limits: { runtimeMode, interactionMode } };
 });
 
 export const writeBlockRetry = Effect.fn("ScheduledTaskRunFollow.writeBlockRetry")(function* (
   sql: SqlClient.SqlClient,
   task: Pick<ScheduledTask, "id" | "createdAt">,
-  fallbacks: ReadonlyArray<ModelSelection> | null,
+  setting: BlockRetry | null,
 ): Effect.fn.Return<void, SqlError.SqlError> {
   yield* ensureRunFollowTables(sql);
-  if (fallbacks === null) {
+  if (setting === null) {
     yield* sql`DELETE FROM ardud_scheduled_task_block_retry WHERE task_id = ${task.id}`;
     return;
   }
-  const json = yield* encodeFallbacks(fallbacks).pipe(Effect.orDie);
+  const json = yield* encodeFallbacks(setting.fallbacks).pipe(Effect.orDie);
   const nowIso = DateTime.formatIso(yield* DateTime.now);
   yield* sql`
-    INSERT INTO ardud_scheduled_task_block_retry (task_id, task_created_at, fallbacks_json, updated_at)
-    VALUES (${task.id}, ${task.createdAt}, ${json}, ${nowIso})
+    INSERT INTO ardud_scheduled_task_block_retry
+      (task_id, task_created_at, fallbacks_json, limit_runtime_mode, limit_interaction_mode, updated_at)
+    VALUES (
+      ${task.id}, ${task.createdAt}, ${json},
+      ${setting.limits.runtimeMode}, ${setting.limits.interactionMode}, ${nowIso}
+    )
     ON CONFLICT (task_id) DO UPDATE SET
       task_created_at = excluded.task_created_at,
       fallbacks_json = excluded.fallbacks_json,
+      limit_runtime_mode = excluded.limit_runtime_mode,
+      limit_interaction_mode = excluded.limit_interaction_mode,
       updated_at = excluded.updated_at
   `;
 });
@@ -444,7 +514,14 @@ export const makeRunFollower = (deps: {
       ),
     );
     if (records === null) return failed("The thread is gone.");
-    return threadVerdict(records, Date.parse(row.since), nowMs);
+    // Only reports with no run of their own need their message, to see where they were steered.
+    const messageIds = unsentReportMessages(records.runs);
+    const steered =
+      messageIds.length === 0
+        ? { messages: [] }
+        : yield* orGone(threads.getThreadRecords(threadId, ["messages"], { messageIds }));
+    if (steered === null) return failed("The thread is gone.");
+    return threadVerdict({ ...records, messages: steered.messages }, Date.parse(row.since), nowMs);
   });
 
   const followRun = Effect.fn("ScheduledTaskRunFollow.followRun")(function* (
@@ -468,10 +545,18 @@ export const makeRunFollower = (deps: {
     blockedThreadId: string,
     blockedError: string,
   ) {
-    const fallbacks = yield* readBlockRetry(sql, task);
+    const setting = yield* readBlockRetry(sql, task);
+    const fallbacks = setting?.fallbacks ?? [];
     const launch = Option.getOrNull(decodeLaunchSettings(row.launch_json));
     if (launch === null) {
       return yield* settle(row, "failed", `${blockedError}. The retry could not start.`);
+    }
+    if (setting !== null && exceededDispatchModeLimit(setting.limits, launch) !== undefined) {
+      return yield* settle(
+        row,
+        "failed",
+        `${blockedError}. The retry wasn't started: this run's modes are broader than those of whoever turned the retry on.`,
+      );
     }
     for (let index = row.retry_index; index < fallbacks.length; index += 1) {
       const modelSelection = fallbacks[index];
@@ -547,8 +632,8 @@ export const makeRunFollower = (deps: {
         : yield* followRun(row, RunId.make(row.run_id));
     if (verdict._tag === "wait") return;
     if (verdict.blocked && row.run_id === null && row.attempt === 0) {
-      const fallbacks = yield* readBlockRetry(sql, task);
-      if (fallbacks.length > 0) {
+      const setting = yield* readBlockRetry(sql, task);
+      if (setting !== null && setting.fallbacks.length > 0) {
         return yield* retryBlocked(task, row, row.thread_id, verdict.error ?? BLOCKED_MESSAGE);
       }
     }

@@ -18,7 +18,7 @@ import { readBlockRetry, retryableLaunchModes, writeBlockRetry } from "./runFoll
 
 const ScheduledTaskBlockRetryTool = Tool.make("t3_scheduled_task_block_retry", {
   description:
-    "Read or set a scheduled task's retry for blocked responses. When a run of a task that starts a new thread ends with 'Provider blocked the response', T3 starts one new thread on the first fallback model that launches, with the original prompt and a link to the blocked thread. The blocked thread is left as it is, and the retry is never retried. Pass fallbacks to turn it on, null to turn it off, or leave it out to read it. Tasks bound to an existing thread can't retry.",
+    "Read or set a scheduled task's retry for blocked responses. When a run of a task that starts a new thread ends with 'Provider blocked the response', T3 starts one new thread on the first fallback model that launches, with the original prompt and a link to the blocked thread. The blocked thread is left as it is, and the retry is never retried. The retry keeps the blocked run's modes and is skipped if those are broader than yours. Pass fallbacks to turn it on, null to turn it off, or leave it out to read it. Tasks bound to an existing thread can't retry.",
   parameters: ScheduledTaskBlockRetryMcpInput,
   success: ScheduledTaskBlockRetryMcpResult,
   failure: OrchestratorMcpFailure,
@@ -87,10 +87,21 @@ const handlers = {
           schedulesAs(mcpPrincipal(scope, caller)),
           Effect.mapError(scheduleFailure("Could not change the blocked-run retry")),
         );
-        yield* writeBlockRetry(sql, task, input.fallbacks).pipe(Effect.mapError(unavailable));
+        // The caller's modes go with it, so a retry can't run broader than the caller can.
+        const setting =
+          input.fallbacks === null
+            ? null
+            : {
+                fallbacks: input.fallbacks,
+                limits: {
+                  runtimeMode: limits.runtimeMode,
+                  interactionMode: limits.interactionMode,
+                },
+              };
+        yield* writeBlockRetry(sql, task, setting).pipe(Effect.mapError(unavailable));
       }
-      const fallbacks = yield* readBlockRetry(sql, task).pipe(Effect.mapError(unavailable));
-      return { scheduledTaskId: task.id, fallbacks };
+      const setting = yield* readBlockRetry(sql, task).pipe(Effect.mapError(unavailable));
+      return { scheduledTaskId: task.id, fallbacks: setting?.fallbacks ?? [] };
     }),
   ),
 } satisfies McpToolAccess.Handlers<typeof ScheduledTaskBlockRetryToolkit.tools>;

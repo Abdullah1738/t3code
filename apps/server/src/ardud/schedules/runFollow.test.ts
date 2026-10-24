@@ -41,6 +41,8 @@ interface Fixture {
   }>;
   readonly deleted?: boolean;
   readonly autoResume?: boolean;
+  /** Delivery messages, with the run each was sent or steered into. */
+  readonly messages?: ReadonlyArray<{ readonly id: string; readonly runId: string | null }>;
 }
 
 const projection = (fixture: Fixture): FollowedThread =>
@@ -86,6 +88,7 @@ const projection = (fixture: Fixture): FollowedThread =>
         retryable: null,
       },
     })),
+    messages: fixture.messages ?? [],
   }) as unknown as FollowedThread;
 
 const settledAfterQuiet = (fixture: Fixture, lastEndMinute = 1) =>
@@ -279,6 +282,44 @@ describe("threadVerdict", () => {
         ],
         subagents: [{ ...child, completionDelivery: { state: "pending" } }],
         errors: [{ runId: "a", ...BLOCKED }],
+      })._tag,
+    ).toBe("wait");
+  });
+
+  it("does not wait on a report steered into a run that ended without taking it", () => {
+    // The report was steered into the parent's run, which then failed: the
+    // steer is never delivered and no run of its own is ever made for it.
+    const parent = {
+      id: "a",
+      status: "failed",
+      delegatedCompletion: {
+        disposition: "open",
+        nextGeneration: 2,
+        delivery: { generation: 1, messageId: "report", taskIds: ["task-1"] },
+      },
+    };
+    const child = {
+      id: "task-1",
+      status: "completed",
+      endsAt: 1,
+      runId: "a",
+      completionDelivery: { state: "claimed" },
+    };
+    expect(
+      settledAfterQuiet({
+        runs: [parent],
+        subagents: [child],
+        errors: [{ runId: "a", ...BLOCKED }],
+        messages: [{ id: "report", runId: "a" }],
+      }),
+    ).toMatchObject({ status: "failed", blocked: true });
+    // Written but not yet sent anywhere: it can still land.
+    expect(
+      settledAfterQuiet({
+        runs: [parent],
+        subagents: [child],
+        errors: [{ runId: "a", ...BLOCKED }],
+        messages: [{ id: "report", runId: null }],
       })._tag,
     ).toBe("wait");
   });

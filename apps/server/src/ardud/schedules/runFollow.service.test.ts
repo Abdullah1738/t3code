@@ -27,6 +27,7 @@ const BLOCKED = {
   message: "Provider blocked the response",
   retryable: null,
 };
+const FULL = { runtimeMode: "full-access", interactionMode: "default" } as const;
 
 interface RunState {
   readonly id: string;
@@ -247,7 +248,7 @@ it.effect("retries a blocked run once on the first fallback model and follows th
         const sql = yield* SqlClient.SqlClient;
         const task = yield* createTask;
         const fallback = { instanceId: "opencode", model: "opus/gpt-6-astra" } as never;
-        yield* writeBlockRetry(sql, task, [fallback]);
+        yield* writeBlockRetry(sql, task, { fallbacks: [fallback], limits: FULL });
         yield* service.runNow({ id: task.id });
         // An edit after the run started doesn't change what the retry runs.
         yield* service.upsert(
@@ -306,7 +307,7 @@ it.effect("never retries a retry", () =>
           { instanceId: "opencode", model: "opus/gpt-6-astra" },
           { instanceId: "opencode", model: "layso/gpt-6-astra" },
         ] as never;
-        yield* writeBlockRetry(sql, task, fallbacks);
+        yield* writeBlockRetry(sql, task, { fallbacks, limits: FULL });
         yield* service.runNow({ id: task.id });
 
         yield* blockAfterWake(harness, "thread-1", T0 + 2 * minute);
@@ -323,6 +324,34 @@ it.effect("never retries a retry", () =>
         );
         yield* TestClock.adjust("30 minutes");
         assert.equal((yield* Ref.get(harness.launches)).length, 2);
+      }),
+    );
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("never retries with broader modes than whoever turned the retry on", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(T0);
+    const harness = yield* makeHarness;
+    yield* withService(
+      harness,
+      Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        const sql = yield* SqlClient.SqlClient;
+        const task = yield* createTask;
+        // Turned on by an approval-required caller while a full-access launch was in flight.
+        yield* writeBlockRetry(sql, task, {
+          fallbacks: [{ instanceId: "opencode", model: "opus/gpt-6-astra" }] as never,
+          limits: { runtimeMode: "approval-required", interactionMode: "default" },
+        });
+        yield* service.runNow({ id: task.id });
+
+        yield* blockAfterWake(harness, "thread-1", T0 + 2 * minute);
+        yield* TestClock.adjust(FOLLOW_QUIET_MS + 3 * minute);
+        assert.equal((yield* Ref.get(harness.launches)).length, 1);
+        const settled = yield* currentTask;
+        assert.equal(settled.lastRunStatus, "failed");
+        assert.include(settled.lastRunError ?? "", "The retry wasn't started");
       }),
     );
   }).pipe(Effect.provide(Sqlite.layerMemory)),

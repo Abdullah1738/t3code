@@ -111,22 +111,25 @@ describe("t3_scheduled_task_block_retry", () => {
       yield* membershipGuard;
       const sql = yield* SqlClient.SqlClient;
       // Armed while the task was unbound, then bound to the master.
-      yield* writeBlockRetry(sql, task, [fallback]);
+      yield* writeBlockRetry(sql, task, {
+        fallbacks: [fallback],
+        limits: { runtimeMode: "full-access", interactionMode: "default" },
+      });
       const clear = { scheduledTaskId: task.id, fallbacks: null };
 
       const fromOutsider = yield* call(outsider, clear);
       expect(fromOutsider.isError).toBe(true);
-      expect(yield* readBlockRetry(sql, task)).toHaveLength(1);
+      expect(yield* readBlockRetry(sql, task)).not.toBeNull();
 
       // Within the task's modes, but below the bound thread's current ones.
       const fromLow = yield* call(lowCaller, clear);
       expect(fromLow.isError).toBe(true);
       expect(fromLow.text).toContain("broader than");
-      expect(yield* readBlockRetry(sql, task)).toHaveLength(1);
+      expect(yield* readBlockRetry(sql, task)).not.toBeNull();
 
       const fromMaster = yield* call(master, clear);
       expect(fromMaster.isError).toBe(false);
-      expect(yield* readBlockRetry(sql, task)).toHaveLength(0);
+      expect(yield* readBlockRetry(sql, task)).toBeNull();
     }).pipe(Effect.scoped, Effect.provide(layer)),
   );
 
@@ -154,13 +157,17 @@ describe("t3_scheduled_task_block_retry", () => {
       const fromLow = yield* call(lowCaller, arm);
       expect(fromLow.isError).toBe(true);
       expect(fromLow.text).toContain("broader than");
-      expect(yield* readBlockRetry(sql, unbound)).toHaveLength(0);
+      expect(yield* readBlockRetry(sql, unbound)).toBeNull();
 
-      // Once that run has been retried, arming can't reach it any more.
+      // Once that run has been retried, arming can't reach it any more. The
+      // caller's modes are kept, so a launch still in flight can't retry above them.
       yield* sql`UPDATE ardud_scheduled_task_follows SET attempt = 1`;
       const later = yield* call(lowCaller, arm);
       expect(later.isError).toBe(false);
-      expect(yield* readBlockRetry(sql, unbound)).toHaveLength(1);
+      expect(yield* readBlockRetry(sql, unbound)).toEqual({
+        fallbacks: [fallback],
+        limits: { runtimeMode: "approval-required", interactionMode: "default" },
+      });
     }).pipe(Effect.scoped, Effect.provide(layer)),
   );
 });
