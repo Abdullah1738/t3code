@@ -24,6 +24,7 @@ import {
   plus,
   previousBoot,
   runRow,
+  test,
   threadRow,
   webLane,
   webThread,
@@ -766,6 +767,260 @@ it.effect("lanes folded onto later resets move the master's summary with them", 
     assert.deepStrictEqual(
       fake.sent.map((sent) => sent.threadId),
       [masterThread],
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+/** An owner Stop: a cancelled run he interrupted himself. */
+const ownerStop = (threadId: string, ordinal: number, at: number) =>
+  Effect.gen(function* () {
+    yield* runRow({
+      threadId,
+      ordinal,
+      status: "cancelled",
+      completedAt: plus(at),
+      startedAt: plus(at - 40),
+    });
+    yield* itemRow(
+      `${threadId}-run-${ordinal}`,
+      threadId,
+      1,
+      "run_interrupt_request",
+      "completed",
+      {
+        message: "Interrupt requested",
+      },
+    );
+  });
+
+it.effect("a restart report and a newer limit cut on a waiting lane still send one notice", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600);
+    yield* at(UP + 901);
+    const waiting = yield* recovery.scan;
+    assert.isNotNull(waiting);
+    // Poked by hand, it is cut by an OpenCode restart at 09:16:40.
+    yield* runRow({
+      threadId: laneThread,
+      ordinal: 3,
+      status: "cancelled",
+      completedAt: plus(UP + 1000),
+      startedAt: plus(UP + 960),
+    });
+    yield* itemRow(`${laneThread}-run-3`, laneThread, 1, "command_execution", "running", {
+      input: "vp test run",
+    });
+    yield* at(UP + 1010);
+    const report = yield* recovery.report(test, {
+      reportId: "rs-20261024T091640Z",
+      cause: "opencode-restart",
+      startAt: plus(UP + 995),
+      endAt: plus(UP + 1005),
+      threads: [{ threadId: laneThread, runIds: [`${laneThread}-run-3`], childIds: [] }],
+    });
+    assert.strictEqual(report.incidentId, waiting?.id);
+    // Then it fails on the limit once more before anything went out.
+    yield* limitFailure(laneThread, 5, UP + 1020);
+    yield* at(UP + 1330);
+    assert.isNull(yield* recovery.scan);
+    const open = yield* recovery.incidents(missionId);
+    assert.deepStrictEqual(
+      open.map((incident) => [incident.id, view(incident)]),
+      [
+        [
+          waiting?.id,
+          [
+            {
+              threadId: laneThread,
+              action: "resume",
+              state: "pending",
+              usageLimit: "first",
+              notBefore: plus(UP + 1020 + 703),
+            },
+          ],
+        ],
+      ],
+    );
+    yield* at(UP + 1723);
+    assert.strictEqual(yield* recovery.tick, 1);
+    yield* TestClock.adjust("1 hour");
+    assert.strictEqual(yield* recovery.tick, 0);
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => sent.threadId),
+      [laneThread],
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a held limit notice takes a newer cut and stays held with what was lost", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600, {
+      running: "git push origin main",
+      tail: false,
+    });
+    yield* childRow({
+      id: "sub-first",
+      threadId: laneThread,
+      runId: `${laneThread}-run-1`,
+      status: "cancelled",
+      title: "Lint sweep",
+      completedAt: plus(UP + 600),
+      session: "ses_first",
+    });
+    yield* at(UP + 901);
+    const first = yield* recovery.scan;
+    assert.isNotNull(first);
+    yield* recovery.resume(agent(masterThread), { missionId, mode: "hold", threadId: laneThread });
+    // Poked by hand, it fails on the limit again.
+    yield* limitFailure(laneThread, 3, UP + 1000, { tail: false });
+    yield* at(UP + 1301);
+    assert.isNull(yield* recovery.scan);
+    const open = yield* recovery.incidents(missionId);
+    assert.deepStrictEqual(
+      open.map((incident) =>
+        incident.threads
+          .filter((thread) => thread.threadId === laneThread)
+          .map((thread) => ({
+            id: incident.id,
+            state: thread.state,
+            action: thread.action,
+            cutRunId: thread.cutRunId,
+            lost: thread.lostChildren.map((child) => child.title),
+            held: thread.decidedBy !== null,
+          })),
+      ),
+      [
+        [
+          {
+            id: first?.id,
+            state: "held",
+            action: "reconcile-first",
+            cutRunId: `${laneThread}-run-3`,
+            lost: ["Lint sweep"],
+            held: true,
+          },
+        ],
+      ],
+    );
+    yield* TestClock.adjust("1 hour");
+    yield* recovery.tick;
+    assert.notInclude(
+      fake.sent.map((sent) => sent.threadId),
+      laneThread,
+    );
+    // Released, it goes once, with the reconcile and the lost child.
+    yield* recovery.resume(agent(masterThread), { missionId, mode: "now", threadId: laneThread });
+    const lanes = fake.sent.filter((sent) => sent.threadId === laneThread);
+    assert.strictEqual(lanes.length, 1);
+    assert.include(lanes[0]?.text ?? "", "You were inside a git push");
+    assert.include(lanes[0]?.text ?? "", "Lint sweep");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a newer cut the scans never saw is replanned before a long reset sends", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    // A limit that resets in three hours.
+    yield* limitFailure(laneThread, 1, UP + 600, { resetAt: plus(UP + 600 + 3 * 3600) });
+    yield* at(UP + 901);
+    const waiting = yield* recovery.scan;
+    assert.strictEqual(waiting?.threads[0]?.notBefore, plus(UP + 600 + 3 * 3600 + 60));
+    // Poked by hand, it fails on something else mid `git push` with a child running,
+    // and no scan runs again until long after.
+    yield* runRow({
+      threadId: laneThread,
+      ordinal: 3,
+      status: "failed",
+      completedAt: plus(UP + 1500),
+      startedAt: plus(UP + 1440),
+    });
+    yield* itemRow(`${laneThread}-run-3`, laneThread, 1, "command_execution", "running", {
+      input: "git push origin main",
+    });
+    yield* itemRow(`${laneThread}-run-3`, laneThread, 2, "error", "failed", {
+      failure: {
+        class: "provider",
+        code: "provider.internal",
+        message: "OAuth token expired",
+        retryable: null,
+      },
+    });
+    yield* childRow({
+      id: "sub-second",
+      threadId: laneThread,
+      runId: `${laneThread}-run-3`,
+      status: "cancelled",
+      title: "Release notes",
+      completedAt: plus(UP + 1500),
+      session: "ses_second",
+    });
+    yield* at(UP + 600 + 3 * 3600 + 60);
+    // The master goes first: the newer cut needs a reconcile, not the old plain resume.
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => sent.threadId),
+      [masterThread],
+    );
+    const [open] = yield* recovery.incidents(missionId);
+    const lanePlan = open?.threads.find((thread) => thread.threadId === laneThread);
+    assert.deepStrictEqual(
+      {
+        action: lanePlan?.action,
+        cutRunId: lanePlan?.cutRunId,
+        lost: lanePlan?.lostChildren.map((child) => child.title),
+      },
+      { action: "reconcile-first", cutRunId: `${laneThread}-run-3`, lost: ["Release notes"] },
+    );
+    yield* TestClock.adjust("61 seconds");
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.include(fake.sent[1]?.text ?? "", "You were inside a git push");
+    assert.include(fake.sent[1]?.text ?? "", "Release notes");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a lane the owner stopped is under Skipped in the master's summary", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane, webLane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600);
+    yield* limitFailure(webThread, 1, UP + 610);
+    yield* at(UP + 911);
+    assert.isNotNull(yield* recovery.scan);
+    yield* ownerStop(laneThread, 3, UP + 1000);
+    // With the API lane out, the summary waits for the web lane's reset.
+    yield* at(UP + 1303);
+    assert.strictEqual(yield* recovery.tick, 0);
+    yield* at(UP + 1313);
+    assert.strictEqual(yield* recovery.tick, 1);
+    const summary = fake.sent[0];
+    assert.strictEqual(summary?.threadId, masterThread);
+    assert.include(summary?.text ?? "", '1. lane "Web"');
+    assert.notInclude(summary?.text ?? "", "2. lane");
+    assert.include(
+      summary?.text ?? "",
+      `Skipped: lane "API" ("Lane API", ${laneThread}) (stopped by the owner).`,
+    );
+    const [open] = yield* recovery.incidents(missionId);
+    assert.deepStrictEqual(
+      open?.threads
+        .filter((thread) => thread.threadId === laneThread)
+        .map((thread) => [thread.action, thread.state]),
+      [["skip", "skipped"]],
+    );
+    yield* TestClock.adjust("2 minutes");
+    yield* recovery.tick;
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => sent.threadId),
+      [masterThread, webThread],
     );
   }).pipe(Effect.provide(layer));
 });

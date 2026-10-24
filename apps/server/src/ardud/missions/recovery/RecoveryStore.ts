@@ -310,8 +310,8 @@ export class RecoveryStore extends Context.Service<
       readonly afterRunId: string;
       readonly beforeRunId: string;
     }) => Effect.Effect<boolean>;
-    /** The thread's newest cut run after this one, if any. */
-    readonly latestCutAfter: (runId: string) => Effect.Effect<CutRunRow | null>;
+    /** The thread's cut runs after this one, oldest first. */
+    readonly cutsAfter: (runId: string) => Effect.Effect<ReadonlyArray<CutRunRow>>;
 
     // Read-only projection reads.
     readonly cutRuns: (input: {
@@ -840,7 +840,7 @@ const make = Effect.gen(function* () {
       ),
     ).pipe(Effect.flatMap((rows) => toCutRuns(rows.flat())));
 
-  const latestCutAfter = (runId: string) =>
+  const cutsAfter = (runId: string) =>
     read(
       sql<RunRow>`
         SELECT ${runColumns}
@@ -850,12 +850,9 @@ const make = Effect.gen(function* () {
         WHERE a.run_id = ${runId}
           AND r.status IN ('cancelled', 'failed', 'interrupted')
           AND (r.status = 'failed' OR json_extract(r.payload_json, '$.startedAt') IS NOT NULL)
-        ORDER BY r.ordinal DESC LIMIT 1
+        ORDER BY r.ordinal
       `,
-    ).pipe(
-      Effect.flatMap(toCutRuns),
-      Effect.map((rows) => rows[0] ?? null),
-    );
+    ).pipe(Effect.flatMap(toCutRuns));
 
   const children = (input: { readonly threadIds: ReadonlyArray<string>; readonly since: string }) =>
     Effect.forEach(chunks(input.threadIds), (chunk) =>
@@ -1008,7 +1005,7 @@ const make = Effect.gen(function* () {
     saveLimitResume,
     workedAfter,
     workedBetween,
-    latestCutAfter,
+    cutsAfter,
     cutRuns,
     cutRunsById,
     children,

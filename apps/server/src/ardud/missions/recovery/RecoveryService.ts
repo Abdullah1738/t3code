@@ -160,6 +160,10 @@ const patchThread = (
   ),
 });
 
+/** One notice per incident, mission and thread, whatever route the router picks. */
+const noticeKey = (incident: RecoveryIncident, thread: RecoveryThread) =>
+  `${incident.id}:${thread.missionId}:${thread.threadId}`;
+
 const missionThreads = (incident: RecoveryIncident, missionId: MissionId) =>
   incident.threads
     .filter((thread) => thread.missionId === missionId)
@@ -197,9 +201,61 @@ const childKey = (child: RecoveryThread["lostChildren"][number]) =>
   child.ref ?? `${child.kind}:${child.title}`;
 
 /**
- * A thread cut again while its usage-limit notice still waits keeps that one
- * notice, replanned for the newer cut. What the earlier cut lost stays on it,
- * and an earlier reconcile is not downgraded to a plain resume.
+ * An unsent notice a newer cut of the same thread folds into, whichever path
+ * saw it: one still waiting on a usage limit (held ones too, they keep their
+ * decision), or any undecided pending one when the newer cut is itself a
+ * usage limit.
+ */
+const absorbs = (thread: RecoveryThread, limitCut: boolean) =>
+  thread.noticeAt === null &&
+  (thread.usageLimit === "first"
+    ? sendable(thread) || thread.state === "held"
+    : limitCut && thread.decidedBy === null && sendable(thread));
+
+/** `into` also carries what `from` lost, and its reconcile. */
+const absorbLosses = (into: RecoveryThread, from: RecoveryThread): RecoveryThread => {
+  const known = new Set(into.lostChildren.map(childKey));
+  const holds = new Set(into.holds.map((hold) => hold.holdId));
+  const reconcile = from.action === "reconcile-first" && into.action === "resume";
+  return {
+    ...into,
+    lostChildren: [
+      ...into.lostChildren,
+      ...from.lostChildren.filter((child) => !known.has(childKey(child))),
+    ],
+    holds: [...into.holds, ...from.holds.filter((hold) => !holds.has(hold.holdId))],
+    ...(reconcile ? { action: from.action, reason: from.reason } : {}),
+  };
+};
+
+/**
+ * A newer cut the plan skips without ending the wait (left for the master,
+ * already continued) still becomes the cut the notice talks about, so it is
+ * not judged again; a mutation it was inside turns a resume into a reconcile.
+ */
+const recordCut = (
+  waiting: RecoveryThread,
+  fresh: RecoveryThread,
+  mutation: string | null,
+): RecoveryThread =>
+  absorbLosses(
+    {
+      ...waiting,
+      cutRunId: fresh.cutRunId,
+      lastActivity: fresh.lastActivity,
+      serverContinued: fresh.serverContinued,
+      ...(mutation !== null && waiting.action === "resume"
+        ? { action: "reconcile-first" as const, reason: `cut inside ${mutation}` }
+        : {}),
+    },
+    fresh,
+  );
+
+/**
+ * A thread cut again while its notice still waits keeps that one notice,
+ * replanned for the newer cut. What the earlier cut lost stays on it, an
+ * earlier reconcile is not downgraded to a plain resume, and a held notice
+ * stays held with its decision.
  */
 const mergeCut = (
   waiting: RecoveryThread,
@@ -210,8 +266,10 @@ const mergeCut = (
   const known = new Set(waiting.lostChildren.map(childKey));
   const freshHolds = new Set(fresh.holds.map((hold) => hold.holdId));
   const keepReconcile = waiting.action === "reconcile-first" && fresh.action === "resume";
+  // A newer cut on something else means the provider answered again: no more wait.
+  const usageLimit = fresh.usageLimit;
   const notBefore =
-    fresh.usageLimit === "first" ? laterOf(waiting.notBefore, fresh.notBefore) : fresh.notBefore;
+    usageLimit === "first" ? laterOf(waiting.notBefore, fresh.notBefore) : fresh.notBefore;
   return {
     ...base,
     position: waiting.position,
@@ -223,13 +281,15 @@ const mergeCut = (
     action: keepReconcile ? waiting.action : fresh.action,
     reason: keepReconcile ? waiting.reason : fresh.reason,
     stateReason:
-      fresh.usageLimit === "first" && notBefore !== undefined
+      usageLimit === "first" && notBefore !== undefined
         ? `waiting for the usage limit to reset at ${Model.clockLabel(notBefore, timeZone)}`
         : fresh.stateReason,
+    ...(waiting.state === "held" ? { state: waiting.state, stateReason: waiting.stateReason } : {}),
+    handoffFrom: fresh.handoffFrom ?? waiting.handoffFrom,
     instruction: waiting.instruction,
     decidedBy: waiting.decidedBy,
     ...(waiting.instructionBy === undefined ? {} : { instructionBy: waiting.instructionBy }),
-    ...(fresh.usageLimit === undefined ? {} : { usageLimit: fresh.usageLimit }),
+    ...(usageLimit === undefined ? {} : { usageLimit }),
     ...(notBefore === undefined ? {} : { notBefore }),
   };
 };
@@ -906,74 +966,115 @@ export const make = Effect.gen(function* () {
         }
       }
 
-      // A thread cut again while its usage-limit notice still waits keeps that
-      // one notice, replanned for the newer cut; a Stop or skip ends it.
+      // A thread with an unsent notice still waiting on a usage limit (or cut
+      // on one while a notice is pending) keeps one notice, replanned for the
+      // newer cut, whether a scan, a boot or a restart report saw it. A Stop or
+      // a retired lane ends it; other skips leave it as it was.
       const folded = new Set<Planned>();
-      if (!restart) {
-        const open = new Map((yield* recovery.openIncidents).map((entry) => [entry.id, entry]));
-        // Incident id -> threads folded into it.
-        const changed = new Map<string, Set<string>>();
-        for (const entry of planned) {
-          if (entry.cut === null) continue;
-          const match = [...open.values()].flatMap((incident) => {
-            const waiting = incident.threads.find(
-              (thread) =>
-                thread.missionId === entry.member.missionId &&
-                thread.threadId === entry.member.threadId &&
-                thread.usageLimit === "first" &&
-                thread.noticeAt === null &&
-                sendable(thread),
-            );
-            return waiting === undefined ? [] : [{ incident, waiting }];
-          })[0];
-          if (match === undefined) continue;
-          folded.add(entry);
-          changed.set(
-            match.incident.id,
-            (changed.get(match.incident.id) ?? new Set()).add(entry.member.threadId),
+      const open = new Map((yield* recovery.openIncidents).map((entry) => [entry.id, entry]));
+      const changed = new Set<string>();
+      // Incident id -> threads whose newer cuts it now carries.
+      const carried = new Map<string, Set<string>>();
+      const skipIn = (id: string, target: RecoveryThread, reason: string) => {
+        const current = open.get(id);
+        if (current === undefined) return;
+        open.set(
+          id,
+          patchThread(current, target, {
+            action: "skip",
+            reason,
+            state: "skipped",
+            stateReason: reason,
+          }),
+        );
+        changed.add(id);
+      };
+      for (const entry of planned) {
+        const { missionId, threadId } = entry.member;
+        const limitCut = entry.cut !== null && Model.isUsageLimit(entry.cut);
+        const found = [...open.values()].flatMap((incident) => {
+          const waiting = incident.threads.find(
+            (thread) =>
+              thread.missionId === missionId &&
+              thread.threadId === threadId &&
+              absorbs(thread, limitCut),
           );
-          // A Stop or a retired lane ends the wait; other skips leave it as it was.
-          const ends = Model.isOwnerStop(entry.cut) || entry.member.laneStatus === "retired";
-          if (entry.action === "skip" && !ends) continue;
-          open.set(
-            match.incident.id,
-            entry.action === "skip"
-              ? patchThread(match.incident, match.waiting, {
-                  state: "skipped",
-                  stateReason: entry.reason,
-                })
-              : replaceThread(
-                  match.incident,
-                  mergeCut(
-                    match.waiting,
-                    toThread(entry, match.waiting.position, titles),
-                    delivery.timeZone,
-                  ),
-                ),
-          );
+          return waiting === undefined ? [] : [{ incident, waiting }];
+        });
+        // A notice the router already took counts as sent, so the newer cut
+        // gets its own; one stopped mid-send stays held for a human and takes
+        // the newer facts with it.
+        const matches: typeof found = [];
+        const claimed = new Set<string>();
+        for (const match of found) {
+          const claim = yield* recovery.noticeClaim(noticeKey(match.incident, match.waiting));
+          if (claim?.state === "sent") continue;
+          if (claim !== null) claimed.add(match.incident.id);
+          matches.push(match);
         }
-        for (const [id, foldedThreads] of changed) {
-          let next = open.get(id);
-          if (next === undefined) continue;
-          for (const missionId of next.missionIds) {
-            next = withMasterWait(
-              escalate(next, missionId, views, titles),
-              missionId,
-              delivery.timeZone,
-            );
-          }
-          yield* recovery.atomic(
-            recovery.saveIncident(next, now).pipe(
-              Effect.andThen(
-                recovery.markSeen(
-                  seen.filter((entry) => foldedThreads.has(entry.threadId)),
-                  id,
-                  now,
-                ),
-              ),
-            ),
-          );
+        // A notice that may already be on its way, or one a human holds, keeps the thread.
+        const survivor =
+          matches.find((match) => claimed.has(match.incident.id)) ??
+          matches.find((match) => match.waiting.state === "held") ??
+          matches[0];
+        if (survivor === undefined) continue;
+        folded.add(entry);
+        carried.set(
+          survivor.incident.id,
+          (carried.get(survivor.incident.id) ?? new Set()).add(threadId),
+        );
+        const ends =
+          (entry.cut !== null && Model.isOwnerStop(entry.cut)) ||
+          entry.member.laneStatus === "retired";
+        if (entry.action === "skip" && ends) {
+          for (const match of matches) skipIn(match.incident.id, match.waiting, entry.reason);
+          continue;
         }
+        const fresh = toThread(entry, survivor.waiting.position, titles);
+        let next =
+          entry.cut === null
+            ? absorbLosses(survivor.waiting, fresh)
+            : entry.action === "skip"
+              ? recordCut(survivor.waiting, fresh, Model.mutationOf(entry.cut.items))
+              : mergeCut(survivor.waiting, fresh, delivery.timeZone);
+        for (const match of matches) {
+          if (
+            match === survivor ||
+            claimed.has(match.incident.id) ||
+            match.waiting.state === "held"
+          )
+            continue;
+          next = absorbLosses(next, match.waiting);
+          skipIn(match.incident.id, match.waiting, `folded into recovery ${survivor.incident.id}`);
+        }
+        const current = open.get(survivor.incident.id) ?? survivor.incident;
+        open.set(survivor.incident.id, replaceThread(current, next));
+        changed.add(survivor.incident.id);
+      }
+      if (changed.size > 0 || carried.size > 0) {
+        yield* recovery.atomic(
+          Effect.gen(function* () {
+            for (const id of changed) {
+              let next = open.get(id);
+              if (next === undefined) continue;
+              for (const missionId of next.missionIds) {
+                next = withMasterWait(
+                  escalate(next, missionId, views, titles),
+                  missionId,
+                  delivery.timeZone,
+                );
+              }
+              yield* recovery.saveIncident(next, now);
+            }
+            for (const [id, threads] of carried) {
+              yield* recovery.markSeen(
+                seen.filter((entry) => threads.has(entry.threadId)),
+                id,
+                now,
+              );
+            }
+          }),
+        );
       }
 
       const threads: Array<RecoveryThread> = [];
@@ -1210,10 +1311,6 @@ export const make = Effect.gen(function* () {
     return queued ? Math.max(lead, Date.parse(incident.detectedAt) + MASTER_WAIT_MS) : lead;
   };
 
-  /** One notice per incident, mission and thread, whatever route the router picks. */
-  const noticeKey = (incident: RecoveryIncident, thread: RecoveryThread) =>
-    `${incident.id}:${thread.missionId}:${thread.threadId}`;
-
   /**
    * Sends one thread's notice. An idle thread gets it through its doorbell; a
    * running one gets it queued, so it lands after the current turn (lanes a
@@ -1360,8 +1457,9 @@ export const make = Effect.gen(function* () {
 
   /**
    * A limit notice whose wait ran out is checked against what the thread did
-   * since: a Stop ends it, and a newer cut the scan hasn't judged yet (it
-   * settles first) pushes the wait past that, so the scan can fold it in.
+   * since: a Stop ends it, a newer cut still settling pushes the wait past
+   * that, and a settled one is replanned into the notice by its run id now,
+   * whether or not a scan window still covers it.
    */
   const refreshLimits = Effect.fn("RecoveryService.refreshLimits")(function* (
     start: RecoveryIncident,
@@ -1380,18 +1478,54 @@ export const make = Effect.gen(function* () {
       ) {
         continue;
       }
-      const newer = yield* recovery.latestCutAfter(thread.cutRunId);
-      if (newer === null || newer.completedAt === null) continue;
-      if (Model.isOwnerStop(newer)) {
+      const newer = (yield* recovery.cutsAfter(thread.cutRunId)).filter(
+        (run) => run.completedAt !== null,
+      );
+      const latest = newer.at(-1);
+      if (latest?.completedAt == null) continue;
+      if (Model.isOwnerStop(latest)) {
         incident = patchThread(incident, thread, {
+          action: "skip",
+          reason: "stopped by the owner",
           state: "skipped",
           stateReason: "stopped by the owner",
         });
         continue;
       }
-      const reset = Model.limitResetOf(newer) ?? undefined;
-      const judged = iso(Date.parse(newer.completedAt) + SCAN_SETTLE_MS + 2 * MINUTE);
-      const notBefore = laterOf(laterOf(thread.notBefore, reset), judged) ?? judged;
+      const settledAt = (run: RecoveryStore.CutRunRow) =>
+        iso(Date.parse(run.completedAt ?? now) + SCAN_SETTLE_MS);
+      const judged = yield* recovery.seenKeys(newer.map((run) => `run:${run.runId}`));
+      const ready = newer.filter((run) => settledAt(run) <= now && !judged.has(`run:${run.runId}`));
+      if (ready.length > 0) {
+        // One cut at a time, oldest first, so each one's losses and mutation fold in.
+        if (incident !== start) yield* recovery.saveIncident(incident, now);
+        for (const run of ready) {
+          yield* collect({
+            cause: "run-interrupted",
+            id: `rcv-run-${compact(now)}-${run.runId}`,
+            source: COMPONENT,
+            window: { from: run.startedAt ?? thread.lastActivityAt ?? now, to: now },
+            windowEnd: null,
+            downSeconds: null,
+            runIds: [run.runId],
+            named: new Set(),
+            extraSeen: [],
+            bootId: null,
+          });
+        }
+        // Judged even when nothing came of it (no longer a member), so it isn't asked again.
+        yield* recovery.markSeen(
+          ready.map((run) => ({ key: `run:${run.runId}`, threadId: thread.threadId })),
+          null,
+          now,
+        );
+        incident = (yield* recovery.incident(start.id)) ?? incident;
+        continue;
+      }
+      const settled = settledAt(latest);
+      if (settled <= now) continue;
+      const reset = Model.limitResetOf(latest) ?? undefined;
+      const notBefore = laterOf(laterOf(thread.notBefore, reset), settled) ?? settled;
       if (notBefore === thread.notBefore) continue;
       const clock = Model.clockLabel(notBefore, delivery.timeZone);
       incident = patchThread(incident, thread, {
@@ -1517,7 +1651,9 @@ export const make = Effect.gen(function* () {
       if (yield* delivery.installerPending) return 0;
       const now = yield* nowIso;
       let sent = 0;
-      for (const open of yield* recovery.openIncidents) {
+      for (const listed of yield* recovery.openIncidents) {
+        // Replanning one incident's cut can fold another's notice into it.
+        const open = (yield* recovery.incident(listed.id)) ?? listed;
         let incident = open;
         for (const missionId of open.missionIds) {
           const out = yield* pumpMission(incident, missionId, now).pipe(
@@ -1928,6 +2064,11 @@ export const make = Effect.gen(function* () {
             named: new Set(input.threads.flatMap((thread) => thread.childIds)),
             extraSeen: [{ key: reportKey, threadId: members[0]?.threadId ?? "" }],
           });
+          // Every cut folded into a notice that already waited: report that incident.
+          if (incident === null) {
+            const [folded] = yield* recovery.seenIncidents(runIds.map((id) => `run:${id}`));
+            incident = folded === undefined ? null : yield* recovery.incident(folded);
+          }
         }
         return {
           incidentId: incident?.id ?? null,
