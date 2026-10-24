@@ -139,6 +139,8 @@ export interface BootInfo {
 
 /** A cut member run, plus what the projections say about how it ended. */
 export interface CutRunRow extends CutRun {
+  /** When the run started, if it did. */
+  readonly startedAt: string | null;
   readonly errorMessage: string | null;
   /** Robob's own restart continuation already started a turn for this run. */
   readonly serverContinued: boolean;
@@ -186,6 +188,7 @@ interface RunRow {
   readonly ordinal: number;
   readonly status: string;
   readonly completed_at: string | null;
+  readonly started_at: string | null;
   readonly interrupt_message: string | null;
   readonly error_message: string | null;
   readonly error_class: string | null;
@@ -307,6 +310,8 @@ export class RecoveryStore extends Context.Service<
       readonly afterRunId: string;
       readonly beforeRunId: string;
     }) => Effect.Effect<boolean>;
+    /** The thread's newest cut run after this one, if any. */
+    readonly latestCutAfter: (runId: string) => Effect.Effect<CutRunRow | null>;
 
     // Read-only projection reads.
     readonly cutRuns: (input: {
@@ -754,6 +759,7 @@ const make = Effect.gen(function* () {
           ordinal: row.ordinal,
           status: row.status,
           completedAt: row.completed_at,
+          startedAt: row.started_at,
           interruptMessage: row.interrupt_message,
           errorMessage: row.error_message,
           failure:
@@ -782,6 +788,7 @@ const make = Effect.gen(function* () {
 
   const runColumns = sql`
     r.run_id, r.thread_id, r.ordinal, r.status, r.completed_at,
+    json_extract(r.payload_json, '$.startedAt') AS started_at,
     (SELECT json_extract(i.payload_json, '$.message') FROM orchestration_v2_projection_turn_items i
       WHERE i.run_id = r.run_id AND i.type = 'run_interrupt_request'
       ORDER BY i.ordinal DESC LIMIT 1) AS interrupt_message,
@@ -832,6 +839,23 @@ const make = Effect.gen(function* () {
         `,
       ),
     ).pipe(Effect.flatMap((rows) => toCutRuns(rows.flat())));
+
+  const latestCutAfter = (runId: string) =>
+    read(
+      sql<RunRow>`
+        SELECT ${runColumns}
+        FROM orchestration_v2_projection_runs a
+        JOIN orchestration_v2_projection_runs r
+          ON r.thread_id = a.thread_id AND r.ordinal > a.ordinal
+        WHERE a.run_id = ${runId}
+          AND r.status IN ('cancelled', 'failed', 'interrupted')
+          AND (r.status = 'failed' OR json_extract(r.payload_json, '$.startedAt') IS NOT NULL)
+        ORDER BY r.ordinal DESC LIMIT 1
+      `,
+    ).pipe(
+      Effect.flatMap(toCutRuns),
+      Effect.map((rows) => rows[0] ?? null),
+    );
 
   const children = (input: { readonly threadIds: ReadonlyArray<string>; readonly since: string }) =>
     Effect.forEach(chunks(input.threadIds), (chunk) =>
@@ -984,6 +1008,7 @@ const make = Effect.gen(function* () {
     saveLimitResume,
     workedAfter,
     workedBetween,
+    latestCutAfter,
     cutRuns,
     cutRunsById,
     children,

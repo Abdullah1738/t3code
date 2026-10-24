@@ -51,14 +51,33 @@ const limitFailure = (
   threadId: string,
   ordinal: number,
   at: number,
-  options: { readonly message?: string; readonly resetAt?: string; readonly tail?: boolean } = {},
+  options: {
+    readonly message?: string;
+    readonly resetAt?: string;
+    readonly tail?: boolean;
+    /** Seconds the run ran before failing; a minute by default. */
+    readonly ran?: number;
+    /** A command still in flight when it failed, instead of a finished test run. */
+    readonly running?: string;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const runId = `${threadId}-run-${ordinal}`;
-    yield* runRow({ threadId, ordinal, status: "failed", completedAt: plus(at) });
-    yield* itemRow(runId, threadId, 1, "command_execution", "completed", {
-      input: "offbox run -- vp test run src/a.test.ts",
+    yield* runRow({
+      threadId,
+      ordinal,
+      status: "failed",
+      completedAt: plus(at),
+      startedAt: plus(at - (options.ran ?? 60)),
     });
+    yield* itemRow(
+      runId,
+      threadId,
+      1,
+      "command_execution",
+      options.running === undefined ? "completed" : "running",
+      { input: options.running ?? "offbox run -- vp test run src/a.test.ts" },
+    );
     yield* itemRow(runId, threadId, 2, "error", "failed", {
       failure: {
         class: "usage_limit",
@@ -75,6 +94,7 @@ const limitFailure = (
         ordinal: ordinal + 1,
         status: "completed",
         completedAt: plus(at + 1),
+        startedAt: plus(at),
       });
       yield* itemRow(tail, threadId, 1, "notification", "completed", { source: "background_task" });
       yield* itemRow(tail, threadId, 2, "checkpoint", "completed", {});
@@ -84,7 +104,13 @@ const limitFailure = (
 /** A completed run that did real work. */
 const workRun = (threadId: string, ordinal: number, at: number) =>
   Effect.gen(function* () {
-    yield* runRow({ threadId, ordinal, status: "completed", completedAt: plus(at) });
+    yield* runRow({
+      threadId,
+      ordinal,
+      status: "completed",
+      completedAt: plus(at),
+      startedAt: plus(at - 10),
+    });
     yield* itemRow(`${threadId}-run-${ordinal}`, threadId, 1, "assistant_message", "completed", {
       text: "Carried on.",
     });
@@ -526,5 +552,220 @@ it.effect("the master failing on the limit again is held and the owner told", ()
     yield* TestClock.adjust("1 hour");
     assert.strictEqual(yield* recovery.tick, 0);
     assert.strictEqual(fake.sent.length, 1);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a resume queued behind a long turn counts from when it ran, not when it went", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600);
+    yield* at(UP + 901);
+    yield* recovery.scan;
+    // Busy with a background notification turn: the resume queues behind it.
+    fake.busy.add(laneThread);
+    yield* at(UP + 1303);
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.isTrue(fake.sent[0]?.queue);
+    // That turn did no work and ran half an hour; the resume then started and
+    // failed on the limit a second later.
+    yield* runRow({
+      threadId: laneThread,
+      ordinal: 3,
+      status: "completed",
+      completedAt: plus(UP + 1303 + 1800),
+      startedAt: plus(UP + 1303),
+    });
+    yield* itemRow(`${laneThread}-run-3`, laneThread, 1, "notification", "completed", {
+      source: "background_task",
+    });
+    fake.busy.delete(laneThread);
+    yield* limitFailure(laneThread, 4, UP + 1303 + 1801, { ran: 1, tail: false });
+    yield* at(UP + 1303 + 1801 + 301);
+    const again = yield* recovery.scan;
+    assert.deepStrictEqual(
+      view(again).map((thread) => [thread.threadId, thread.state, thread.usageLimit]),
+      [
+        [masterThread, "pending", null],
+        [laneThread, "held", "again"],
+      ],
+    );
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.strictEqual(fake.sent.at(-1)?.kind, "blocker");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a newer limit failure the scan hasn't judged yet holds back the older notice", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600);
+    yield* at(UP + 901);
+    yield* recovery.scan;
+    // Poked again, it fails on the limit at 09:20:50, still inside the scan's settle time.
+    yield* limitFailure(laneThread, 3, UP + 1250, { message: "(reset after 20m)" });
+    yield* at(UP + 1303);
+    assert.strictEqual(yield* recovery.tick, 0);
+    assert.deepStrictEqual(fake.sent, []);
+    // The scan folds it into the waiting notice, which goes after the newer reset.
+    yield* at(UP + 1551);
+    assert.isNull(yield* recovery.scan);
+    const [open] = yield* recovery.incidents(missionId);
+    assert.deepStrictEqual(view(open ?? null), [
+      {
+        threadId: laneThread,
+        action: "resume",
+        state: "pending",
+        usageLimit: "first",
+        notBefore: plus(UP + 1250 + 1260),
+      },
+    ]);
+    yield* at(UP + 2509);
+    assert.strictEqual(yield* recovery.tick, 0);
+    yield* at(UP + 2510);
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.include(fake.sent[0]?.text ?? "", "failed at 09:20 on a provider usage limit");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("an owner Stop while the notice waits for the reset ends it", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600);
+    yield* at(UP + 901);
+    yield* recovery.scan;
+    // He runs it by hand at 09:16 and stops it.
+    yield* runRow({
+      threadId: laneThread,
+      ordinal: 3,
+      status: "cancelled",
+      completedAt: plus(UP + 1000),
+      startedAt: plus(UP + 960),
+    });
+    yield* itemRow(`${laneThread}-run-3`, laneThread, 1, "run_interrupt_request", "completed", {
+      message: "Interrupt requested",
+    });
+    yield* at(UP + 1303);
+    assert.strictEqual(yield* recovery.tick, 0);
+    const [after] = yield* recovery.incidents(missionId);
+    assert.deepStrictEqual(
+      after?.threads.map((thread) => [thread.state, thread.stateReason]),
+      [["skipped", "stopped by the owner"]],
+    );
+    yield* TestClock.adjust("1 hour");
+    assert.strictEqual(yield* recovery.tick, 0);
+    assert.deepStrictEqual(fake.sent, []);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("a newer cut inside a git push is replanned when it folds, keeping what was lost", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600);
+    yield* childRow({
+      id: "sub-first",
+      threadId: laneThread,
+      runId: `${laneThread}-run-1`,
+      status: "cancelled",
+      title: "Lint sweep",
+      completedAt: plus(UP + 600),
+      session: "ses_first",
+    });
+    yield* at(UP + 901);
+    const first = yield* recovery.scan;
+    assert.deepStrictEqual(
+      first?.threads.map((thread) => thread.lostChildren.map((child) => child.title)),
+      [["Lint sweep"]],
+    );
+    // Poked again, it fails on the limit mid `git push` with a child running.
+    yield* limitFailure(laneThread, 3, UP + 1000, {
+      message: "(reset after 20m)",
+      running: "git push origin main",
+      tail: false,
+    });
+    yield* childRow({
+      id: "sub-second",
+      threadId: laneThread,
+      runId: `${laneThread}-run-3`,
+      status: "cancelled",
+      title: "Release notes",
+      completedAt: plus(UP + 1000),
+      session: "ses_second",
+    });
+    yield* at(UP + 1301);
+    assert.isNull(yield* recovery.scan);
+    const [open] = yield* recovery.incidents(missionId);
+    assert.deepStrictEqual(
+      open?.threads.map((thread) => ({
+        threadId: thread.threadId,
+        position: thread.position,
+        action: thread.action,
+        cutRunId: thread.cutRunId,
+        lost: thread.lostChildren.map((child) => child.title),
+      })),
+      [
+        { threadId: masterThread, position: 0, action: "notice-only", cutRunId: null, lost: [] },
+        {
+          threadId: laneThread,
+          position: 1,
+          action: "reconcile-first",
+          cutRunId: `${laneThread}-run-3`,
+          lost: ["Lint sweep", "Release notes"],
+        },
+      ],
+    );
+    assert.strictEqual(open?.threads[1]?.reason, "cut inside a git push (`git push origin main`)");
+    // Not before the newer reset; then the master first, the lane after its lead.
+    yield* at(UP + 2259);
+    assert.strictEqual(yield* recovery.tick, 0);
+    yield* at(UP + 2260);
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.strictEqual(fake.sent[0]?.threadId, masterThread);
+    yield* TestClock.adjust("61 seconds");
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.include(fake.sent[1]?.text ?? "", "You were inside a git push");
+    assert.include(fake.sent[1]?.text ?? "", "Release notes");
+    assert.include(fake.sent[1]?.text ?? "", "Lint sweep");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("lanes folded onto later resets move the master's summary with them", () => {
+  const { fake, layer } = harness();
+  return Effect.gen(function* () {
+    yield* limitWorld([lane, webLane]);
+    const recovery = yield* RecoveryService.RecoveryService;
+    yield* limitFailure(laneThread, 1, UP + 600);
+    yield* limitFailure(webThread, 1, UP + 610);
+    yield* at(UP + 911);
+    const first = yield* recovery.scan;
+    assert.strictEqual(first?.threads[0]?.notBefore, plus(UP + 1303));
+    // Both fail again before 09:21 with a forty-minute reset.
+    yield* limitFailure(laneThread, 3, UP + 700, { message: "(reset after 40m)" });
+    yield* limitFailure(webThread, 3, UP + 710, { message: "(reset after 40m)" });
+    yield* at(UP + 1011);
+    assert.isNull(yield* recovery.scan);
+    const [open] = yield* recovery.incidents(missionId);
+    assert.deepStrictEqual(
+      view(open ?? null).map((thread) => [thread.threadId, thread.notBefore]),
+      [
+        [masterThread, plus(UP + 700 + 2460)],
+        [laneThread, plus(UP + 700 + 2460)],
+        [webThread, plus(UP + 710 + 2460)],
+      ],
+    );
+    yield* at(UP + 1303);
+    assert.strictEqual(yield* recovery.tick, 0);
+    yield* at(UP + 3160);
+    assert.strictEqual(yield* recovery.tick, 1);
+    assert.deepStrictEqual(
+      fake.sent.map((sent) => sent.threadId),
+      [masterThread],
+    );
   }).pipe(Effect.provide(layer));
 });

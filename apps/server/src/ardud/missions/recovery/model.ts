@@ -108,9 +108,9 @@ export const LIMIT_MARGIN_MS = 60_000;
 /** A usage limit that names no reset is retried this long after the failure. */
 export const LIMIT_DEFAULT_WAIT_MS = 15 * 60_000;
 /**
- * A thread that fails on the limit again this soon after its resume notice,
- * with no completed work in between, goes to the master instead. A resumed
- * turn that ran longer than this before failing counts as a new failure.
+ * A run started after the resume notice that fails on the limit again within
+ * this long of starting, with no completed work in between, goes to the master
+ * instead. One that ran longer before failing counts as a new failure.
  */
 export const LIMIT_AGAIN_WINDOW_MS = 20 * 60_000;
 

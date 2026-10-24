@@ -207,6 +207,8 @@ export const runRow = (input: {
   readonly status: string;
   readonly completedAt: string | null;
   readonly started?: boolean;
+  /** When it started; the test epoch by default. */
+  readonly startedAt?: string;
   readonly continuationOf?: string;
 }) =>
   insert("orchestration_v2_projection_runs", {
@@ -214,10 +216,10 @@ export const runRow = (input: {
     thread_id: input.threadId,
     ordinal: input.ordinal,
     status: input.status,
-    requested_at: at,
+    requested_at: input.startedAt ?? at,
     completed_at: input.completedAt,
     payload_json: toJson({
-      ...(input.started === false ? {} : { startedAt: at }),
+      ...(input.started === false ? {} : { startedAt: input.startedAt ?? at }),
       ...(input.continuationOf === undefined
         ? {}
         : { restartContinuationOfRunId: input.continuationOf }),
