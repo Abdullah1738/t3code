@@ -105,28 +105,57 @@ class PaymentError(JournalError):
         self.details = details
 
 
-def payment_fail(code, *, flow_id, order, amount_minor, proven=False, waiting=False):
-    """Stop on an unconfirmed payment. Only the provider's own no-capture proof makes it
-    "not charged": a decline or a timeout alone can still show up as a charge (a 3DS
-    approval that lands late, a hold the bank keeps), so the person isn't told otherwise."""
+def payment_details(*, flow_id, order, amount_minor, outcome):
+    """What may be said about a sent payment that didn't confirm. Only the provider's own
+    no-capture proof (outcome 'not_charged') makes it "not charged": a decline, a timeout or
+    a lost status read can still show up as a charge (a 3DS approval that lands late, a hold
+    the bank keeps), so the person isn't told otherwise."""
     amount = f'AED {amount_minor / 100:.2f}' if isinstance(amount_minor, int) else 'the order'
-    if proven:
+    status = f'commerce await-payment {flow_id} (status only, never resends)'
+    reconcile = f'commerce reconcile-order {flow_id} (closes only with the store\'s no-capture proof)'
+    unknown = 'I can\'t say yet whether the card was charged'
+    if outcome == 'not_charged':
         tell = f'The payment for {amount} didn\'t go through, and the store confirms nothing was captured.'
         steps = ['nothing to reconcile; a new order is a new purchase and needs its own go']
-    elif waiting:
-        tell = (f'The payment for {amount} is still waiting on the bank. '
-                'I can\'t say yet whether the card was charged.')
-        steps = ['check ENBD X for a pending approval or a charge SMS',
-                 f'commerce await-payment {flow_id} (status only, never resends)',
-                 f'commerce reconcile-order {flow_id} (closes only with the store\'s no-capture proof)']
+    elif outcome == 'waiting':
+        tell = f'The payment for {amount} is still waiting on the bank. {unknown}.'
+        steps = ['check ENBD X for a pending approval or a charge SMS', status, reconcile]
+    elif outcome == 'unconfirmed':
+        tell = f'The payment for {amount} went out but I lost its status before it confirmed. {unknown}.'
+        steps = ['check ENBD X for a pending approval or a charge SMS', status, reconcile]
     else:
-        tell = (f'The payment for {amount} didn\'t go through. '
-                'I can\'t say yet whether the card was charged; checking.')
-        steps = ['check ENBD X / the bank SMS for a charge or a hold',
-                 f'commerce reconcile-order {flow_id} (closes only with the store\'s no-capture proof)']
-    raise PaymentError(code, {'flow_id': flow_id, 'order': order, 'amount_minor': amount_minor,
-                              'charge': 'not_charged' if proven else 'unknown', 'tell': tell,
-                              'next': steps + ['never re-place or resend this payment']})
+        tell = f'The payment for {amount} didn\'t go through. {unknown}; checking.'
+        steps = ['check ENBD X / the bank SMS for a charge or a hold', reconcile]
+    return {'flow_id': flow_id, 'order': order, 'amount_minor': amount_minor,
+            'charge': 'not_charged' if outcome == 'not_charged' else 'unknown', 'tell': tell,
+            'next': steps + ['never re-place or resend this payment']}
+
+
+def payment_fail(code, *, flow_id, order, amount_minor, proven=False, waiting=False):
+    """Stop on an unconfirmed payment, with what may be said about it."""
+    outcome = 'not_charged' if proven else 'waiting' if waiting else 'declined'
+    raise PaymentError(code, payment_details(flow_id=flow_id, order=order,
+                                             amount_minor=amount_minor, outcome=outcome))
+
+
+class after_payment_send:
+    """Any stop between a payment send and its confirmation (a lost status read, a bad
+    readback, a crash in the wait) still says the charge is unknown and what is safe next.
+
+    A class, not @contextmanager: PaymentError is a RuntimeError, and contextlib would take
+    it for PEP 479 wrapping of a StopIteration and re-raise the bare original instead."""
+
+    def __init__(self, fallback, *, flow_id, order, amount_minor):
+        self.fallback, self.where = fallback, {'flow_id': flow_id, 'order': order, 'amount_minor': amount_minor}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, exc, tb):
+        if exc is None or isinstance(exc, PaymentError) or not isinstance(exc, Exception):
+            return False
+        code = str(exc) if re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}', str(exc)) else self.fallback
+        raise PaymentError(code, payment_details(**self.where, outcome='unconfirmed')) from exc
 
 
 def digest(value):
@@ -187,6 +216,9 @@ def _db():
         db.execute('PRAGMA synchronous=FULL')
         db.execute('PRAGMA fullfsync=ON')
         db.execute('BEGIN IMMEDIATE')
+        # BEGIN stays fail-fast against another writer; once we own the write lock, the
+        # commit may wait out a brief reader (open_payments) instead of losing the write.
+        db.execute('PRAGMA busy_timeout=5000')
         objects = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE substr(name,1,7) != 'sqlite_'"))
         version = db.execute('PRAGMA user_version').fetchone()[0]
         if not objects and version == 0 and before.st_size == 0:
@@ -809,6 +841,12 @@ def open_payments(*, since_seconds=1800, now=None):
     db = sqlite3.connect(f'{path.absolute().as_uri()}?mode=ro', uri=True, timeout=5)
     try:
         db.row_factory = sqlite3.Row
+        # An empty answer is read as "that bank prompt isn't ours", so only a journal this
+        # code fully understands may give it.
+        objects = {r['name']: r['sql'] for r in db.execute(
+            "SELECT name,sql FROM sqlite_master WHERE substr(name,1,7) != 'sqlite_'")}
+        if db.execute('PRAGMA user_version').fetchone()[0] != 3 or not _schema_matches(objects, SCHEMA):
+            fail('JOURNAL_SCHEMA_UNSUPPORTED')
         rows = db.execute(
             "SELECT f.id, f.app, f.vertical, f.state, f.order_id, f.reserved_minor, "
             "MAX(o.created_at) AS sent_at FROM flows f JOIN operations o ON o.flow_id=f.id "

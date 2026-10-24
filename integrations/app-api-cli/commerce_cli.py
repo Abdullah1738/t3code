@@ -307,13 +307,14 @@ def order_minutes(args):
     else:
         journal.fail('MINUTES_PAYMENT_NOT_PENDING')
     print(json.dumps({'flow_id':flow.flow_id,'phase':'owner_3ds_notified','notify':notify}),flush=True)
-    paid=flow.await_payment()
-    print(json.dumps({'flow_id':flow.flow_id,'phase':'payment_awaited','paid':paid['paid'],
-        'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
-        'authorized_minor':paid.get('authorized_minor'),'polls':paid['polls'],
-        'timed_out':paid['timed_out']}),flush=True)
-    if not paid['paid']:
-        minutes_payment_fail(flow,paid)
+    with minutes_after_send(flow):
+        paid=flow.await_payment()
+        print(json.dumps({'flow_id':flow.flow_id,'phase':'payment_awaited','paid':paid['paid'],
+            'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
+            'authorized_minor':paid.get('authorized_minor'),'polls':paid['polls'],
+            'timed_out':paid['timed_out']}),flush=True)
+        if not paid['paid']:
+            minutes_payment_fail(flow,paid)
     tracking=flow.verify_tracking()
     registration=flow.register_tracker(args.label,recipient=args.recipient)
     journal.complete(flow.flow_id)
@@ -407,8 +408,9 @@ def order_main(args):
             journal.fail('MAIN_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
     print(json.dumps({'flow_id':flow.flow_id,'phase':'placed','order':placed['order']}),flush=True)
-    paid=flow.await_success()
-    flow.confirm_paid()
+    with marketplace_after_send(flow,'main'):
+        paid=flow.await_success()
+        flow.confirm_paid()
     tracking=flow.verify_tracking()
     registration=flow.register_tracker(args.label,recipient=args.recipient)
     journal.complete(flow.flow_id)
@@ -460,8 +462,9 @@ def order_supermall(args):
             journal.fail('SUPERMALL_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
     print(json.dumps({'flow_id': flow.flow_id, 'phase': 'placed', 'order': placed['order']}), flush=True)
-    paid = flow.await_success()
-    flow.confirm_paid()
+    with marketplace_after_send(flow, 'supermall'):
+        paid = flow.await_success()
+        flow.confirm_paid()
     tracking = flow.verify_tracking()
     registration = flow.register_tracker(args.label, eta=flow.review.get('eta'),
                                          recipient=args.recipient)
@@ -473,6 +476,17 @@ def order_supermall(args):
             'eta': flow.review.get('eta'), 'watcher': registration['watcher'],
             **order_watch_receipt.fields(registration),
             'financial_retry': False}
+
+
+def marketplace_after_send(flow,lane):
+    return journal.after_payment_send(lane.upper()+'_PAYMENT_UNCONFIRMED_NO_RETRY',
+                                      flow_id=flow.flow_id,order=flow.order,
+                                      amount_minor=flow.review['payable_minor'])
+
+
+def minutes_after_send(flow):
+    return journal.after_payment_send('MINUTES_PAYMENT_UNCONFIRMED_NO_RETRY',flow_id=flow.flow_id,
+                                      order=flow.review.get('order'),amount_minor=flow.review.get('amount'))
 
 
 def minutes_payment_fail(flow,paid):
@@ -503,8 +517,9 @@ def await_payment_flow(args):
                     evidence_hash=journal.digest({'order': flow.order, 'retained_paid_evidence': True}))
             paid = {'paid': True, 'already_observed': True}
         else:
-            paid = flow.await_success(wait_seconds=args.minutes * 60,
-                                      notify=None if args.no_notify else telegram_3ds_notify)
+            with marketplace_after_send(flow, binding['vertical']):
+                paid = flow.await_success(wait_seconds=args.minutes * 60,
+                                          notify=None if args.no_notify else telegram_3ds_notify)
         tracking = flow.verify_tracking()
         registration = flow.register_tracker(args.label, recipient=args.recipient)
         journal.complete(args.flow_id)
@@ -521,12 +536,14 @@ def await_payment_flow(args):
               'already_observed':True}
     else:
         notify=None if args.no_notify else (lambda order,total:telegram_3ds_notify(order,total))
-        paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60)
-    print(json.dumps({'flow_id':args.flow_id,'phase':'payment_awaited','paid':paid['paid'],
-        'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
-        'polls':paid['polls'],'timed_out':paid['timed_out']}),flush=True)
-    if not paid['paid']:
-        minutes_payment_fail(flow,paid)
+        with minutes_after_send(flow):
+            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60)
+    with minutes_after_send(flow):
+        print(json.dumps({'flow_id':args.flow_id,'phase':'payment_awaited','paid':paid['paid'],
+            'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
+            'polls':paid['polls'],'timed_out':paid['timed_out']}),flush=True)
+        if not paid['paid']:
+            minutes_payment_fail(flow,paid)
     tracking=flow.verify_tracking()
     if not flow.review.get('eta') and tracking.get('eta'):
         flow.review['eta']=tracking['eta']

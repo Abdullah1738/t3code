@@ -306,6 +306,104 @@ class PaymentTests(unittest.TestCase):
         with j._db():
             self.assertEqual([f['flow_id'] for f in j.open_payments()], [flow.flow_id])
 
+    def test_payment_journal_writes_wait_out_a_reader(self):
+        # open-flows reads exactly while a payment waits; its shared lock must not make the
+        # payment lose an observation at commit.
+        import sqlite3
+        import threading
+        flow, _ = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        reader = sqlite3.connect(f'{(self.root / "journal.sqlite").as_uri()}?mode=ro', uri=True,
+                                 check_same_thread=False)
+        reader.execute('BEGIN')
+        reader.execute('SELECT count(*) FROM flows').fetchone()
+        threading.Timer(0.3, reader.close).start()
+        with self.assertRaises(j.PaymentError):
+            flow.await_success(attempts=1, sleep=lambda _: None, notify=None)
+        self.assertEqual(j.inspect(flow.flow_id)['state'], 'FENCED')
+
+    def test_open_flows_refuses_a_journal_it_does_not_understand(self):
+        import sqlite3
+        flow, _ = self.placed(order_status={'status': 'pending'})
+        flow.place()
+        with sqlite3.connect(self.root / 'journal.sqlite') as db:
+            db.execute('PRAGMA user_version=4')
+        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_SCHEMA_UNSUPPORTED'):
+            j.open_payments()
+        with sqlite3.connect(self.root / 'journal.sqlite') as db:
+            db.execute('PRAGMA user_version=3')
+            db.execute('CREATE TABLE payments_v4 (id TEXT)')
+        with self.assertRaisesRegex(j.JournalError, 'JOURNAL_SCHEMA_UNSUPPORTED'):
+            j.open_payments()
+
+    def test_stall_alert_still_fires_when_the_wait_ends_at_five_minutes(self):
+        for limits in ({'wait_seconds': 300}, {'attempts': 150}):
+            # A fresh journal each: the first fenced flow holds the account.
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            root = Path(temp.name).resolve() / 'commerce'
+            with self.subTest(**limits), patch.object(j, 'ROOT', root), patch.object(receipts, 'ROOT', root):
+                flow, _ = self.placed(order_status={'status': 'pending'})
+                flow.place()
+                now, stalled = [0.0], []
+                def sleep(seconds): now[0] += seconds
+                def stall(*args):
+                    stalled.append(now[0])
+                    return {'queued': True}
+                with self.assertRaises(j.PaymentError):
+                    flow.await_success(clock=lambda: now[0], sleep=sleep, notify=Mock(),
+                                       stall_notify=stall, **limits)
+                self.assertEqual(stalled, [300.0])
+
+    def test_read_that_confirms_at_five_minutes_has_no_stall_alert(self):
+        pending = {'status': 'pending'}
+        flow, _ = self.placed(order_status=[pending] * 150 + [main.FIXTURE['status_success']])
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        stall = Mock(return_value={'queued': True})
+        self.assertTrue(flow.await_success(clock=lambda: now[0], sleep=sleep, notify=Mock(),
+                                           stall_notify=stall)['paid'])
+        self.assertEqual(now[0], 300)
+        stall.assert_not_called()
+
+    def test_declined_payment_has_no_approve_or_stall_alert_and_says_so(self):
+        flow, wire = self.placed(order_status=[{'status': 'pending', 'clientSecret': 'intent'}]
+                                 + [{'status': 'pending'}] * 400,
+                                 payment_complete={'status': 'payment_failed'})
+        self.setup_cvv(flow, wire)
+        flow.place()
+        now = [0.0]
+        def sleep(seconds): now[0] += seconds
+        notify, stall = Mock(return_value={'queued': True}), Mock(return_value={'queued': True})
+        with self.assertRaises(j.PaymentError) as caught:
+            flow.await_success(clock=lambda: now[0], sleep=sleep, notify=notify, stall_notify=stall)
+        notify.assert_not_called()
+        stall.assert_not_called()
+        details = caught.exception.details
+        self.assertEqual(details['charge'], 'unknown')
+        self.assertIn("didn't go through", details['tell'])
+        self.assertIn("can't say yet whether the card was charged", details['tell'])
+
+    def test_lost_status_read_after_the_send_still_says_charge_unknown(self):
+        flow, wire = self.placed(order_status=[{'status': 'pending'},
+                                               market.MarketplaceError('REQUEST_TIMEOUT')])
+        flow.place()
+        with self.assertRaises(j.PaymentError) as caught, \
+                j.after_payment_send('MAIN_PAYMENT_UNCONFIRMED_NO_RETRY', flow_id=flow.flow_id,
+                                     order=flow.order, amount_minor=1980):
+            flow.await_success(sleep=lambda _: None, notify=None)
+        self.assertEqual(str(caught.exception), 'REQUEST_TIMEOUT')
+        details = caught.exception.details
+        self.assertEqual(details['charge'], 'unknown')
+        self.assertIn('AED 19.80 went out but I lost its status', details['tell'])
+        self.assertIn('never re-place or resend this payment', details['next'])
+        with self.assertRaises(j.PaymentError) as caught, \
+                j.after_payment_send('MAIN_PAYMENT_UNCONFIRMED_NO_RETRY', flow_id=flow.flow_id,
+                                     order=flow.order, amount_minor=1980):
+            raise KeyError('paid')
+        self.assertEqual(str(caught.exception), 'MAIN_PAYMENT_UNCONFIRMED_NO_RETRY')
+
     def test_pending_to_failed_closes_only_with_full_native_no_capture_proof(self):
         failed = failed_responses(main.ORDER, 1980)
         flow, wire = self.placed(**failed)

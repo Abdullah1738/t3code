@@ -551,8 +551,9 @@ class MinutesFlow:
                     return {**p,'polls':polls,'timed_out':False}
             if clock()>=deadline:
                 if p is not None:self._payment_receipt('PAYMENT_PENDING',p)
-                return {**(p or {}),'polls':polls,'timed_out':True,
-                        'state':'payment_window_elapsed'}
+                # Every read can have failed: the caller still gets the full unpaid shape.
+                return {'paid':False,'payment_status':None,'transaction_status':None,**(p or {}),
+                        'polls':polls,'timed_out':True,'state':'payment_window_elapsed'}
             sleep(poll_seconds)
 
     def _payment_receipt(self,state,p):

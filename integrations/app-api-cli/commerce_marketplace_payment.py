@@ -114,12 +114,17 @@ class MarketplacePayment:
             print(json.dumps({'phase': phase, 'notify': result}), flush=True)
 
         last = None
+        declined = False  # the payment itself reported failed; the order can lag behind it
+
+        def stalled():
+            # Neither confirmed nor failed for 5 minutes: he hears it, with the safe fallback.
+            # Checked after each read, so a read that settles the payment never alerts.
+            if not declined and clock() - start >= STALL_SECONDS:
+                alert('payment_stalled', stall_notify)
+
         for _ in range(attempts):
             if clock() >= end:
                 break
-            if clock() - start >= STALL_SECONDS:
-                # Neither confirmed nor failed for 5 minutes: he hears it, with the safe fallback.
-                alert('payment_stalled', stall_notify)
             response = self.client.call('order_status', order=self.order,
                                         timeout=min(timeout, end - clock()))
             data = response.data
@@ -183,18 +188,21 @@ class MarketplacePayment:
                 if state in ('failed', 'cancelled'):
                     self._payment_observation('PAYMENT_FAILED', payment)
                     # Order cancellation/refund propagation can lag payment status.
-                if state in ('pending', 'challenge_required') or summary['has_redirect']:
+                    declined = True
+                if not declined and (state in ('pending', 'challenge_required') or summary['has_redirect']):
                     alert('owner_3ds_notified', notify)
-            elif (status == 'pending' and not secret
+            elif (not declined and status == 'pending' and not secret
                   and (self._financial_operation() != 'place'
                        or data.get('statusMessage') == 'Payment pending'
                        or data.get('redirect_url'))):
                 alert('owner_3ds_notified', notify)
+            stalled()
             sleep(max(0, min(2, end - clock())))
+        stalled()  # a window or poll budget that ends at 5 minutes still alerts once
         journal.observe(self.flow_id, self._financial_operation(), outcome='UNKNOWN',
                         evidence_hash=journal.digest({'order': self.order, 'payment_wait_elapsed': True}),
                         order_id=self.order)
-        self._payment_fail('_PAYMENT_WINDOW_ELAPSED_NO_RETRY', waiting=True)
+        self._payment_fail('_PAYMENT_WINDOW_ELAPSED_NO_RETRY', waiting=not declined)
 
     def confirm_paid(self):
         if not journal.payment_reported(self.flow_id):
