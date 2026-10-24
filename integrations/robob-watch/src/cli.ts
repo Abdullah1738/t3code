@@ -3,17 +3,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  ARCHIVE, deliver, ensureDirs, iso, listIds, loadState, loadWatcher, log, normalize, runCheck, saveState, type State,
-  validId, type Watcher, watcherDir, WATCHERS, writeJson,
+  addStop, ARCHIVE, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
+  saveState, type State, type Stop, stopFor, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
 const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob) when something happens.
 
   robob-watch add --id ID --title TEXT --check CMD [--interval 30] [--mode wake|notify]
                   (--context TEXT | --context-file PATH) [--expires 14d|ISO] [--max-fires 1] [--serial]
-                  [--session CURRENT_SESSION_ID] [--trigger FILE]... [--replace] [--no-prime]
+                  [--session CURRENT_SESSION_ID] [--trigger FILE]... [--replace] [--no-prime] [--owner-only]
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, serial, triggers, created_by_session)
+                                         expires_at, max_fires, serial, triggers, quiet, trip, relays, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch logs ID [-n 40]
@@ -21,6 +21,9 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch fire-test ID               deliver a clearly-marked test event through the watcher's mode
   robob-watch pause ID | resume ID [--expires ...]   (resume also re-arms a done/expired watcher)
   robob-watch remove ID                  archive and stop it
+  robob-watch relay-ok ID --to JID [--eta ISO]   may this fire message JID now? "ok" (exit 0) counts it; "no" exits 3
+  robob-watch relays-off ID [--to JID] --quote TEXT   the owner stopped updates to JID (default everyone), on every
+                                         watcher sharing ID's trip
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
@@ -79,6 +82,7 @@ async function main(argv: string[]): Promise<void> {
       mode: { type: "string" }, context: { type: "string" }, "context-file": { type: "string" }, expires: { type: "string" },
       "max-fires": { type: "string" }, serial: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
       "no-prime": { type: "boolean" }, trigger: { type: "string", multiple: true }, json: { type: "string" }, n: { type: "string" }, help: { type: "boolean", short: "h" },
+      to: { type: "string" }, eta: { type: "string" }, quote: { type: "string" }, "owner-only": { type: "boolean" },
     },
   });
   ensureDirs();
@@ -98,10 +102,18 @@ async function main(argv: string[]): Promise<void> {
           ...(values.serial ? { serial: true } : {}),
           ...(values.trigger?.length ? { triggers: values.trigger } : {}),
           ...(values.session === undefined ? {} : { created_by_session: values.session }),
+          // Third parties can only be listed with --json; this says the fires tell nobody but the owner.
+          ...(values["owner-only"] ? { relays: [] } : {}),
         };
       }
       if (values.expires !== undefined) input.expires_at = duration(values.expires);
       if (input.expires_at === undefined) input.expires_at = duration("14d");
+      if (values["owner-only"]) input.relays = [];
+      const previous = values.replace && validId(input.id) ? loadWatcher(input.id as string) : undefined;
+      // Flags can't express relays, so a flag --replace keeps the ones the owner already allowed. Stops live
+      // outside watcher.json, so no replace can lift one.
+      if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
+      if (values.json === undefined && previous?.trip) input.trip = previous.trip;
       let watcher: Watcher;
       try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { throw new CliError((error as Error).message); }
       const dir = watcherDir(watcher.id);
@@ -191,6 +203,37 @@ async function main(argv: string[]): Promise<void> {
       saveState(w.id, s);
       log(w.id, command);
       console.log(JSON.stringify({ id: w.id, paused: w.paused, status: s.status }));
+      return;
+    }
+    case "relay-ok": {
+      const w = need(positionals[0]);
+      if (!values.to) throw new CliError("relay-ok needs --to");
+      const eta = values.eta === undefined ? undefined : Date.parse(values.eta);
+      if (eta !== undefined && Number.isNaN(eta)) throw new CliError("--eta must be an ISO time");
+      const verdict = relayCheck(w, values.to, eta);
+      log(w.id, `relay-ok ${values.to}${values.eta ? ` eta=${values.eta}` : ""}: ${verdict.ok ? "ok" : "no"} (${verdict.reason})`);
+      console.log(`${verdict.ok ? "ok" : "no"}: ${verdict.reason}`);
+      if (!verdict.ok) process.exitCode = 3;
+      return;
+    }
+    case "relays-off": {
+      const w = need(positionals[0]);
+      if (!values.quote?.trim()) throw new CliError("relays-off needs --quote with the owner's words");
+      const key = values.to === undefined ? undefined : contactKey(values.to);
+      // An @lid wacli can't map to a phone would match no grant, so say so instead of reporting a stop.
+      if (key !== undefined && /@lid$/.test(key)) throw new CliError(`can't find the phone number behind ${values.to}; stop it by phone jid (wa-db resolve)`);
+      // Names every sibling it reaches now, so a later replace that drops or changes `trip` doesn't slip out of it.
+      const covered = withRelayLock(() => {
+        const siblings = family(loadWatcher(w.id) ?? w);
+        const stop: Stop = { ...(w.trip ? { trip: w.trip } : {}), watchers: siblings.map(sibling => sibling.id),
+          ...(values.to !== undefined ? { to: values.to, key } : {}), at: iso(), quote: values.quote!.trim() };
+        addStop(stop);
+        return siblings.filter(sibling => (sibling.relays ?? []).some(relay => stopFor([stop], sibling, relay)));
+      });
+      for (const sibling of covered) log(sibling.id, `relays-off ${values.to ?? "everyone"} via ${w.id}`);
+      console.log(JSON.stringify({ stopped: values.to ?? "everyone", trip: w.trip ?? null, watchers: covered.map(sibling => sibling.id) }));
+      // Kept for grants added later, but nothing listed matched: don't tell the owner it's done.
+      if (!covered.length) process.exitCode = 3;
       return;
     }
     case "remove": {

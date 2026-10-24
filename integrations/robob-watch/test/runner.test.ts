@@ -20,7 +20,7 @@ const db = join(sandbox, "bridge.sqlite");
 Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv (key text primary key, value text); create table inbound (id text primary key, payload text, state text); insert into kv values ('route', '{"id":"ses_live123","generation":1}');`]);
 const env = { ...process.env, ROBOB_WATCH_ROOT: join(sandbox, "root"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
   ROBOB_WATCH_TELEGRAM_CLI: stub("telegram", ""), ROBOB_WATCH_BRIDGE_DB: db,
-  ROBOB_WATCH_HEADSUP_MS: "1000" };
+  ROBOB_WATCH_HEADSUP_MS: "1000", WACLI_STORE_DIR: join(sandbox, "wacli") };
 const cli = (...args: string[]) => Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), ...args], { env });
 const readCalls = () => readFileSync(calls, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { cli: string; args: string[] });
 const optIn = (id: string) => { const f = join(sandbox, "root/watchers", id, "watcher.json"); writeFileSync(f, JSON.stringify({ ...JSON.parse(readFileSync(f, "utf8")), headsup: true })); };
@@ -300,3 +300,119 @@ test("checks run with bounded concurrency; queue time does not count against the
     expect(state(`conc${i}`).last_run_ms).toBeGreaterThanOrEqual(900);
   }
 }, 20_000);
+
+test("relays: one stop reaches every watcher of the trip, and ETA updates to a person are throttled", () => {
+  const pam = { to: "120363@g.us", name: "Pam group", quote: "Keep Pam's group posted", at: "2026-10-19T04:00:00Z" };
+  const cars = { to: "971501234567@s.whatsapp.net", name: "ComfortCars", quote: "Send the driver the landing time", at: "2026-10-19T04:00:00Z" };
+  const add = (id: string, relays: unknown[], ...extra: string[]) => {
+    const file = join(sandbox, `${id}.json`);
+    writeFileSync(file, JSON.stringify({ id, title: id, check: "true", mode: "wake", context: "On a change, wa draft then wa send --approved.",
+      trip: "dus-oct", relays }));
+    return cli("add", "--json", file, "--no-prime", ...extra);
+  };
+  expect(add("ek57", [pam, cars]).exitCode).toBe(0);
+  expect(add("ek58", [pam]).exitCode).toBe(0);
+  const ok = (id: string, to: string, eta?: string) => {
+    const run = cli("relay-ok", id, "--to", to, ...(eta ? ["--eta", eta] : []));
+    return { code: run.exitCode, out: run.stdout.toString() };
+  };
+  expect(ok("ek57", "+971 50 123 4567", "2026-10-23T19:03:00Z")).toMatchObject({ code: 0, out: expect.stringContaining("ok: send to ComfortCars") });
+  // 23 Oct: 19:03, 19:12, 19:36 went out one after another.
+  expect(ok("ek57", "971501234567", "2026-10-23T19:12:00Z")).toMatchObject({ code: 3, out: expect.stringContaining("moved 9 min") });
+  expect(ok("ek57", "971501234567", "2026-10-23T19:36:00Z")).toMatchObject({ code: 3, out: expect.stringContaining("at most one an hour") });
+  expect(ok("ek57", "971501234567", "2026-10-23T20:10:00Z").code).toBe(0);
+  expect(ok("ek57", "120363999@g.us")).toMatchObject({ code: 3, out: expect.stringContaining("not one of this watcher's relays") });
+  expect(ok("ek58", "120363@g.us").code).toBe(0);
+
+  const off = cli("relays-off", "ek57", "--quote", "You can stop updating groups and people btw");
+  expect(JSON.parse(off.stdout.toString())).toEqual({ stopped: "everyone", trip: "dus-oct", watchers: ["ek57", "ek58"] });
+  expect(ok("ek58", "120363@g.us")).toMatchObject({ code: 3, out: expect.stringContaining("stopped updates to Pam group") });
+  expect(cli("fire-test", "ek58").exitCode).toBe(0);
+  const fired = readCalls().filter(call => call.args.includes("robob-watch ek58")).at(-1)!;
+  expect(fired.args[fired.args.indexOf("--text") + 1]).toContain(`- Pam group (120363@g.us): the owner stopped these on ${new Date().toISOString().slice(0, 10)} ("You can stop updating groups and people btw")`);
+  const shown = (id: string) => JSON.parse(cli("show", id).stdout.toString().split("\n--- log")[0]!).watcher;
+  // A flag --replace keeps who the owner allowed, and nothing that rewrites watcher.json lifts a stop.
+  expect(cli("add", "--id", "ek58", "--title", "EK58 again", "--check", "true", "--context", "Tell the owner; no wa send.", "--replace").exitCode).toBe(0);
+  expect(shown("ek58")).toMatchObject({ trip: "dus-oct", relays: [{ name: "Pam group" }] });
+  expect(cli("pause", "ek58").exitCode).toBe(0);
+  expect(cli("resume", "ek58").exitCode).toBe(0);
+  expect(ok("ek58", "120363@g.us").code).toBe(3);
+  // 24 Oct review: a sibling rewritten without its trip tag kept the old grant and slipped out of the trip's stop.
+  const untagged = join(sandbox, "ek58-untagged.json");
+  writeFileSync(untagged, JSON.stringify({ id: "ek58", title: "ek58", check: "true", mode: "wake", context: "wa send --approved.", relays: [pam] }));
+  expect(cli("add", "--json", untagged, "--no-prime", "--replace").exitCode).toBe(0);
+  expect(ok("ek58", "120363@g.us").code).toBe(3);
+  expect(add("ek58", [pam], "--replace").exitCode).toBe(0);
+  // Nor does replaying the JSON it was set up with, even after an owner-only version in between.
+  expect(add("ek57", [pam, cars], "--replace").exitCode).toBe(0);
+  expect(ok("ek57", "120363@g.us")).toMatchObject({ code: 3, out: expect.stringContaining("stopped updates to Pam group") });
+  expect(add("ek57", [pam, cars], "--replace", "--owner-only").exitCode).toBe(0);
+  expect(shown("ek57").relays).toEqual([]);
+  expect(add("ek57", [pam, cars], "--replace").exitCode).toBe(0);
+  expect(ok("ek57", "120363@g.us").code).toBe(3);
+  // Only a grant he gave after the stop lifts it, and a later stop covers that grant again.
+  expect(add("ek57", [{ ...pam, at: new Date(Date.now() + 3_600_000).toISOString() }, cars], "--replace").stderr.toString()).toContain("not in the future");
+  expect(add("ek57", [{ ...pam, at: new Date().toISOString(), quote: "Update Pam again" }, cars], "--replace").exitCode).toBe(0);
+  expect(ok("ek57", "120363@g.us").code).toBe(0);
+  expect(ok("ek58", "120363@g.us").code).toBe(3);
+  const again = cli("relays-off", "ek58", "--to", "120363@g.us", "--quote", "Stop Pam's group again");
+  expect(JSON.parse(again.stdout.toString()).watchers).toEqual(["ek58", "ek57"]);
+  expect(ok("ek57", "120363@g.us").code).toBe(3);
+  const flags = ["--title", "Gate change", "--check", "true", "--context", "Tell the owner. Never wa send to anyone.", "--no-prime"];
+  expect(cli("add", "--id", "gate", ...flags).stderr.toString()).toContain("--owner-only");
+  expect(cli("add", "--id", "gate", ...flags, "--owner-only").exitCode).toBe(0);
+});
+
+test("relays: a person's @lid and phone jid are one contact, and concurrent checks take one ETA slot", async () => {
+  mkdirSync(join(sandbox, "wacli"), { recursive: true });
+  Bun.spawnSync(["/usr/bin/sqlite3", join(sandbox, "wacli/session.db"),
+    "create table whatsmeow_lid_map (lid text primary key, pn text); insert into whatsmeow_lid_map values ('111222333', '971509876543');"]);
+  const driver = (to: string) => ({ to, name: "Driver", quote: "Keep the driver posted", at: "2026-10-19T04:00:00Z" });
+  const add = (id: string, to: string) => {
+    const file = join(sandbox, `${id}.json`);
+    writeFileSync(file, JSON.stringify({ id, title: id, check: "true", mode: "wake", context: "wa send the driver the ETA.", trip: "ride", relays: [driver(to)] }));
+    return cli("add", "--json", file, "--no-prime");
+  };
+  expect(add("r1", "971509876543@s.whatsapp.net").exitCode).toBe(0);
+  expect(add("r2", "+971 50 987 6543").exitCode).toBe(0);
+  expect(add("r3", "111222333@lid").stderr.toString()).toContain("not an @lid");
+  const ok = (id: string, to: string, eta: string) => cli("relay-ok", id, "--to", to, "--eta", eta).exitCode;
+  expect(ok("r2", "111222333@lid", "2026-10-24T10:00:00Z")).toBe(0);
+  // The same person under the other id, on a sibling: the ETA barely moved.
+  expect(ok("r1", "971509876543@s.whatsapp.net", "2026-10-24T10:05:00Z")).toBe(3);
+  const racers = await Promise.all(Array.from({ length: 5 }, () => Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"),
+    "relay-ok", "r1", "--to", "111222333@lid", "--eta", "2026-10-24T13:00:00Z"], { env, stdout: "ignore", stderr: "ignore" }).exited));
+  expect(racers.filter(code => code === 0)).toHaveLength(1);
+  const off = cli("relays-off", "r1", "--to", "111222333@lid", "--quote", "Stop texting the driver");
+  expect(JSON.parse(off.stdout.toString()).watchers).toEqual(["r1", "r2"]);
+  expect(ok("r2", "+971509876543", "2026-10-24T18:00:00Z")).toBe(3);
+  // A stop by an @lid wacli can't map would stop nobody, so it fails instead of claiming it worked.
+  const unknown = cli("relays-off", "r1", "--to", "999888777@lid", "--quote", "Stop texting him");
+  expect(unknown.exitCode).toBe(1);
+  expect(unknown.stderr.toString()).toContain("can't find the phone number behind 999888777@lid");
+}, 30_000);
+
+test("relays: each watcher's ETA moves on its own, while one person still gets at most one an hour", () => {
+  const host = { to: "971501112222@s.whatsapp.net", name: "Host", quote: "Tell the host when each of us lands", at: "2026-10-19T04:00:00Z" };
+  for (const id of ["fa", "fb"]) {
+    const file = join(sandbox, `${id}.json`);
+    writeFileSync(file, JSON.stringify({ id, title: id, check: "true", mode: "wake", context: "wa send the host the ETA.", trip: "two-flights", relays: [host] }));
+    expect(cli("add", "--json", file, "--no-prime").exitCode).toBe(0);
+  }
+  const ok = (id: string, eta: string) => cli("relay-ok", id, "--to", host.to, "--eta", eta).exitCode;
+  expect(ok("fa", "2026-10-24T18:00:00Z")).toBe(0);
+  expect(ok("fb", "2026-10-24T21:00:00Z")).toBe(0);
+  // 24 Oct review: each compared with the other flight's ETA, so a one-minute change looked like three hours.
+  expect(ok("fa", "2026-10-24T18:01:00Z")).toBe(3);
+  expect(ok("fb", "2026-10-24T21:01:00Z")).toBe(3);
+  expect(ok("fa", "2026-10-24T18:30:00Z")).toBe(3);
+  expect(ok("fa", "2026-10-24T19:30:00Z")).toBe(0);
+  // A third watcher on flight A starts from A's last ETA: 20 min later within the hour is still too soon.
+  const file = join(sandbox, "fc.json");
+  writeFileSync(file, JSON.stringify({ id: "fc", title: "fc", check: "true", mode: "wake", context: "wa send the host the ETA.", trip: "two-flights", relays: [host] }));
+  expect(cli("add", "--json", file, "--no-prime").exitCode).toBe(0);
+  expect(ok("fc", "2026-10-24T19:50:00Z")).toBe(3);
+  // 24 Oct review: archiving the watcher that sent 19:30 must not wipe what the host was already told.
+  expect(cli("remove", "fa").exitCode).toBe(0);
+  expect(ok("fc", "2026-10-24T19:50:00Z")).toBe(3);
+});

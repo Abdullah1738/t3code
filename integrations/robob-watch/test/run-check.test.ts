@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inQuiet, normalize, runCheck } from "../src/lib.ts";
+import { clip, inQuiet, MAX_WAKE, normalize, runCheck, sameContact, wakeText } from "../src/lib.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "robob-watch-runcheck-"));
 const watcher = (check: string) => normalize({ id: "rc", title: "rc", check, mode: "notify", context: "" });
@@ -36,4 +36,27 @@ test("quiet hours are validated and wrap past midnight", () => {
   expect(inQuiet({ start: 23, end: 8, time_zone: "Asia/Dubai" }, at(19))).toBe(true);
   expect(inQuiet({ start: 9, end: 17, time_zone: "UTC" }, at(12))).toBe(true);
   expect(inQuiet(undefined, at(0))).toBe(false);
+});
+
+test("a watcher that can send WhatsApp says who it may message, in the owner's words", () => {
+  const base = { id: "eta", title: "EK58 ETA", check: "true", mode: "wake" as const, context: "On an ETA change, wa draft <jid> then wa send --approved <id>." };
+  expect(() => normalize(base)).toThrow("list who it may message in relays");
+  expect(normalize({ ...base, relays: [] }).relays).toEqual([]);
+  const pam = { to: "120363@g.us", name: "Pam group", quote: "Keep Pam's group posted on the landing time", at: "2026-10-19T08:00:00+04:00" };
+  expect(normalize({ ...base, trip: "dus-oct", relays: [pam] }).relays).toEqual([{ ...pam, at: "2026-10-19T04:00:00.000Z" }]);
+  for (const relays of [[{ ...pam, quote: "" }], [{ ...pam, at: "soon" }], [pam, { ...pam, to: "120363@G.US" }], "Pam"])
+    expect(() => normalize({ ...base, relays } as never)).toThrow("relays must be");
+  expect(() => normalize({ ...base, relays: [], trip: "Bad Trip" })).toThrow("trip must be");
+  expect(sameContact("971501234567@s.whatsapp.net", "+971 50 123 4567")).toBe(true);
+  expect(sameContact("120363@g.us", "971501234567")).toBe(false);
+  const state = { status: "active" as const, fires: 0, consecutive_failures: 0, failure_alerted: false };
+  const live = wakeText(normalize({ ...base, relays: [pam] }), "ETA 21:40", state);
+  expect(live).toContain(`- Pam group (120363@g.us), allowed 2026-10-19: "Keep Pam's group posted on the landing time"`);
+  expect(live).toContain("robob-watch relay-ok eta --to <to>");
+  expect(wakeText(normalize({ ...base, relays: [] }), "ETA 21:40", state)).toContain("No third-party relays: tell only the owner.");
+  expect(wakeText(normalize({ ...base, context: "Tell the owner." }), "x", state)).not.toContain("third-party");
+  // The longest wake there can be is still clipped, but never the owner-only line.
+  const longest = wakeText(normalize({ ...base, context: `${base.context} ${"x".repeat(5_900)}`, relays: [] }), "e".repeat(6_000), state);
+  expect(longest.length).toBeGreaterThan(MAX_WAKE);
+  expect(clip(longest, MAX_WAKE)).toContain("No third-party relays: tell only the owner.");
 });

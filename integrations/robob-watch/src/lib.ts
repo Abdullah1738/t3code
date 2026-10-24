@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -34,13 +35,23 @@ export const TIMEOUT_BACKOFF_CAP_S = 120;
 export const SLOW_RUN_MS = 15_000;
 /** Holds the WATCH_RUN id of the last run whose output the runner recorded (see whatsapp-new-message's outbox). */
 export const RUN_OK_FILE = ".run-ok";
+/** Third parties hear about an ETA again only once it moved 15+ min, at most hourly unless it moved an hour or more. */
+export const RELAY_ETA_MOVE_MS = 15 * 60_000;
+export const RELAY_GAP_MS = 60 * 60_000;
 const MAX_EVENT = 6_000;
-const MAX_WAKE = 12_000;
+export const MAX_WAKE = 12_000;
 const MAX_LOG = 512 * 1024;
 
 export type Mode = "wake" | "notify";
 /** From start (inclusive) to end (exclusive), whole hours in time_zone; start > end wraps past midnight. */
 export type Quiet = { start: number; end: number; time_zone: string };
+/** One third party, with the owner's own words allowing updates. */
+export type Relay = { to: string; name: string; quote: string; at: string };
+/**
+ * The owner stopping updates to one person (key, from `to`) or to everyone, on a trip or on the listed watchers.
+ * Kept in its own file so no replace, removal or pause of a watcher can undo it; only a grant dated after it does.
+ */
+export type Stop = { trip?: string; watchers: string[]; to?: string; key?: string; at: string; quote: string };
 export type Watcher = {
   id: string;
   title: string;
@@ -65,6 +76,10 @@ export type Watcher = {
   trigger_gap_s?: number;
   /** Hours in which events, new or retried, wait instead of being delivered; the check itself still runs. */
   quiet?: Quiet;
+  /** Watchers of one trip or job share a tag, so "stop updating X" reaches all of them. */
+  trip?: string;
+  /** People other than the owner a fire may message. Nobody else hears from a fire (23 Oct: ETA flips reached a group 5-7 times). */
+  relays?: Relay[];
   created_at: string;
   created_by_session: string | null;
 };
@@ -116,6 +131,44 @@ function validQuiet(value: unknown): value is Quiet {
   try { new Intl.DateTimeFormat("en-GB", { timeZone: time_zone }); return true; } catch { return false; }
 }
 
+const oneLine = (value: unknown, max: number) => typeof value === "string" && !!value.trim() && value.length <= max && !/[\x00-\x1f]/.test(value);
+const words = (value: unknown) => typeof value === "string" && !!value.trim() && value.length <= 500;
+const isoDate = (value: unknown) => typeof value === "string" && !Number.isNaN(Date.parse(value));
+
+/** The phone number behind a WhatsApp @lid, from wacli's session store (the map wa-db resolve reads). */
+function lidPhone(lid: string): string | undefined {
+  try {
+    const db = new Database(join(WACLI_STORE, "session.db"), { readonly: true });
+    try {
+      const row = db.query("select pn from whatsmeow_lid_map where lid = ?").get(lid) as { pn?: unknown } | null;
+      return typeof row?.pn === "string" && row.pn ? row.pn : undefined;
+    } finally { db.close(); }
+  } catch { return undefined; }
+}
+
+/** One key per person: a phone jid, its mapped @lid, a +phone and a bare number match. Groups match by jid. */
+export function contactKey(value: string): string {
+  const text = value.trim().toLowerCase();
+  const [local = "", server] = text.split("@");
+  if (server === "lid") return lidPhone(local)?.replace(/\D/g, "") ?? text;
+  const phone = server === undefined || server === "s.whatsapp.net" || server === "c.us";
+  return phone && /^\+?[\d\s()-]{7,}$/.test(local) ? local.replace(/\D/g, "") : text;
+}
+
+export function sameContact(a: string, b: string): boolean {
+  return contactKey(a) === contactKey(b);
+}
+
+function validRelays(value: unknown): value is Relay[] {
+  if (!Array.isArray(value) || value.length > 8) return false;
+  // Grants name a phone or group, so a stop or throttle given under either of a person's ids finds them.
+  return value.every((relay, index) => !!relay && typeof relay === "object"
+    && oneLine(relay.to, 120) && !/@lid\s*$/i.test(relay.to) && oneLine(relay.name, 80) && words(relay.quote) && isoDate(relay.at)
+    // A grant dated ahead would outrank every stop until then.
+    && Date.parse(relay.at) <= now() + 60_000
+    && value.findIndex(other => sameContact(String(other?.to ?? ""), relay.to)) === index);
+}
+
 export const watcherDir = (id: string) => join(WATCHERS, id);
 
 /** Cheap change signature of a watcher's trigger files (a stat per file). */
@@ -161,6 +214,16 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
   const quiet = input.quiet;
   if (quiet !== undefined && !validQuiet(quiet)) errors.push("quiet must be {start, end, time_zone}: different whole hours 0-23 and an IANA time zone");
+  const trip = input.trip;
+  if (trip !== undefined && !validId(trip)) errors.push("trip must be a tag like an id (a-z, 0-9, -)");
+  const relays = input.relays;
+  if (relays !== undefined && !validRelays(relays)) {
+    errors.push("relays must be up to 8 distinct {to, name, quote, at}: to a phone number or phone/group jid (not an @lid), quote the owner's own words allowing it, at the ISO time he said it (not in the future)");
+  }
+  // 23 Oct: an ETA watcher's standing OK in its context let it text a group 5-7 times; who may hear from a fire is now a field.
+  if (relays === undefined && /\bwa\s+(draft|send|sendfile)\b/.test(`${input.check ?? ""}\n${input.context ?? ""}`)) {
+    errors.push("this watcher may send WhatsApp messages: list who it may message in relays (with the owner's words allowing each), or pass --owner-only (relays: []) so it tells only the owner");
+  }
   if (errors.length) throw new Error(errors.join("; "));
   return {
     id: input.id!, title: input.title!.trim(), check: input.check!, interval_s: interval, mode: mode as Mode,
@@ -172,6 +235,12 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(input.headsup === true ? { headsup: true } : {}),
     ...(Number.isFinite(Number(input.trigger_gap_s)) && Number(input.trigger_gap_s) > 0 ? { trigger_gap_s: Number(input.trigger_gap_s) } : {}),
     ...(quiet !== undefined ? { quiet: { start: quiet.start, end: quiet.end, time_zone: quiet.time_zone } } : {}),
+    ...(trip !== undefined ? { trip } : {}),
+    ...(relays !== undefined ? {
+      relays: (relays as Relay[]).map(relay => ({
+        to: relay.to.trim(), name: relay.name.trim(), quote: relay.quote.trim(), at: iso(Date.parse(relay.at)),
+      })),
+    } : {}),
     created_at: typeof input.created_at === "string" ? input.created_at : iso(),
     created_by_session: typeof input.created_by_session === "string" && input.created_by_session ? input.created_by_session : null,
   };
@@ -303,6 +372,114 @@ export function telegram(source: string, text: string, key: string, severity = "
   return run([BUN, TELEGRAM_CLI, "notify", "--source", telegramSource(source), "--severity", severity, "--text", clip(text, MAX_WAKE), "--key", key]);
 }
 
+function relayLines(watcher: Watcher): string[] {
+  if (watcher.relays === undefined && watcher.trip === undefined) return [];
+  const stops = readStops();
+  const relays = (watcher.relays ?? []).map(relay => ({ relay, stop: stopFor(stops, watcher, relay) }));
+  const live = relays.filter(entry => !entry.stop).map(entry => entry.relay);
+  return [
+    "",
+    live.length
+      ? `People besides the owner this may update (he allowed each one; nobody else hears from this watcher). Before each message run \`robob-watch relay-ok ${watcher.id} --to <to>\` (add --eta ISO for an ETA change) and send only on "ok":`
+      : "No third-party relays: tell only the owner.",
+    ...live.map(relay => `- ${relay.name} (${relay.to}), allowed ${relay.at.slice(0, 10)}: ${JSON.stringify(relay.quote)}`),
+    ...relays.flatMap(({ relay, stop }) => stop
+      ? [`- ${relay.name} (${relay.to}): the owner stopped these on ${stop.at.slice(0, 10)} (${JSON.stringify(stop.quote)}). Don't message them.`]
+      : []),
+  ];
+}
+
+// Next to the watchers (runtime state deploys never touch), not inside any one of them.
+const stopsPath = () => join(WATCHERS, ".relay-stops.json");
+
+export function readStops(): Stop[] {
+  return readJson<Stop[]>(stopsPath()) ?? [];
+}
+
+/** Record a stop. Call under withRelayLock. */
+export function addStop(stop: Stop): void {
+  mkdirSync(WATCHERS, { recursive: true, mode: 0o700 });
+  writeJson(stopsPath(), [...readStops(), stop]);
+}
+
+/** The stop covering this grant: same trip or watcher, same person or everyone, and not older than the grant. */
+export function stopFor(stops: Stop[], watcher: Watcher, relay: Relay): Stop | undefined {
+  const key = contactKey(relay.to);
+  return stops.find(stop => (stop.watchers.includes(watcher.id) || (stop.trip !== undefined && stop.trip === watcher.trip))
+    && (stop.key === undefined || stop.key === key) && Date.parse(stop.at) >= Date.parse(relay.at));
+}
+
+/** Watchers that share this one's trip, itself included. */
+export function family(watcher: Watcher): Watcher[] {
+  if (!watcher.trip) return [watcher];
+  const others = listIds().filter(id => id !== watcher.id).map(loadWatcher).filter((w): w is Watcher => w?.trip === watcher.trip);
+  return [watcher, ...others];
+}
+
+type Sent = { watcher: string; trip?: string; key: string; at: string; eta?: string };
+// One log for every watcher, so archiving a finished one doesn't forget what its people were already told.
+const sentPath = () => join(WATCHERS, ".relay-sent.json");
+const SENT_KEEP_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * May a fire message `to` now? Counts an ok, so ask right before sending. An ETA change waits until it moved
+ * 15+ min since the last ETA that person got, and an hour since then unless it moved an hour or more.
+ */
+export function relayCheck(given: Watcher, to: string, eta?: number, at = now()): { ok: boolean; reason: string } {
+  return withRelayLock(() => {
+    // Reread under the lock: a stop or another fire's send may have landed since the caller loaded it.
+    const watcher = loadWatcher(given.id) ?? given;
+    return relayVerdict(watcher, to, eta, at);
+  });
+}
+
+/**
+ * Relay checks, stops and replacements run one at a time across processes, so two fires can't both take one ETA
+ * slot or miss a stop written meanwhile. A SQLite write lock: the OS drops it if the holder dies.
+ */
+export function withRelayLock<T>(fn: () => T): T {
+  mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+  const db = new Database(join(ROOT, "relay-lock.sqlite"));
+  try {
+    db.exec("PRAGMA busy_timeout = 15000");
+    db.exec("BEGIN IMMEDIATE");
+    try { return fn(); } finally { db.exec("COMMIT"); }
+  } finally { db.close(); }
+}
+
+function relayVerdict(watcher: Watcher, to: string, eta: number | undefined, at: number): { ok: boolean; reason: string } {
+  const relay = watcher.relays?.find(entry => sameContact(entry.to, to));
+  if (!relay) return { ok: false, reason: `${to} is not one of this watcher's relays; only the owner hears about this` };
+  const stopped = stopFor(readStops(), watcher, relay);
+  if (stopped) return { ok: false, reason: `the owner stopped updates to ${relay.name} on ${stopped.at.slice(0, 10)}` };
+  const key = contactKey(relay.to);
+  const history = (readJson<Sent[]>(sentPath()) ?? []).filter(entry => at - Date.parse(entry.at) < SENT_KEEP_MS);
+  const etas = history.filter(entry => entry.key === key && entry.eta).sort((a, b) => a.at.localeCompare(b.at));
+  if (eta !== undefined) {
+    // Movement is measured on this watcher's own last ETA, since a sibling may track another flight; the hourly gap
+    // is per person. Before its first one, the closest ETA a sibling sent this hour stands in (same flight, likely).
+    // Siblings are matched by the trip recorded with each send, so a removed one still counts.
+    const recent = etas.filter(entry => at - Date.parse(entry.at) < RELAY_GAP_MS
+      && (entry.watcher === watcher.id || (watcher.trip !== undefined && entry.trip === watcher.trip)));
+    const distance = (entry: { eta?: string }) => Math.abs(eta - Date.parse(entry.eta!));
+    const own = etas.filter(entry => entry.watcher === watcher.id).at(-1)
+      ?? [...recent].sort((a, b) => distance(a) - distance(b))[0];
+    if (own) {
+      const moved = Math.abs(eta - Date.parse(own.eta!));
+      if (moved < RELAY_ETA_MOVE_MS) return { ok: false, reason: `the ETA moved ${Math.round(moved / 60_000)} min since the last one ${relay.name} got; wait for a 15+ min change` };
+      const last = recent.at(-1);
+      if (last && moved < RELAY_GAP_MS) {
+        return { ok: false, reason: `${relay.name} got an ETA ${Math.round((at - Date.parse(last.at)) / 60_000)} min ago; at most one an hour unless it moved an hour or more` };
+      }
+    }
+  }
+  mkdirSync(WATCHERS, { recursive: true, mode: 0o700 });
+  writeJson(sentPath(), [...history, {
+    watcher: watcher.id, ...(watcher.trip ? { trip: watcher.trip } : {}), key, at: iso(at), ...(eta !== undefined ? { eta: iso(eta) } : {}),
+  }]);
+  return { ok: true, reason: `send to ${relay.name}; counted at ${iso(at)}` };
+}
+
 export function wakeText(watcher: Watcher, event: string, state: State, test = false): string {
   const fires = watcher.max_fires === 0 ? `fire ${state.fires + 1}, unlimited` : `fire ${state.fires + 1} of ${watcher.max_fires}`;
   const after = watcher.max_fires !== 0 && state.fires + 1 >= watcher.max_fires
@@ -310,6 +487,9 @@ export function wakeText(watcher: Watcher, event: string, state: State, test = f
     : "The watcher keeps running; manage it with robob-watch show/pause/remove " + watcher.id + ".";
   return [
     `${test ? "[TEST FIRE, not a real event: acknowledge briefly and do nothing else] " : ""}${watcher.title}`,
+    "",
+    // Ahead of the event and context: the wake is clipped at the end, and who may be messaged must survive that.
+    ...relayLines(watcher),
     "",
     "Event:",
     clip(event.trim(), MAX_EVENT),

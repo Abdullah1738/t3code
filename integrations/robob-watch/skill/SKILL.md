@@ -24,7 +24,7 @@ robob-watch add --id nik-macbook --title "Nik replied on WhatsApp (MacBook order
   --context-file /path/to/context.txt     # or --context "..."
 ```
 
-Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode, context, expires_at ("14d" or ISO), max_fires, serial, triggers, trigger_gap_s, quiet, created_by_session}`. Add `--replace` to redefine an existing id (its state is kept, and since 1 Oct 2026 the prime run is skipped: a replace-prime once swallowed a real Dynamic reply that landed mid-prime).
+Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode, context, expires_at ("14d" or ISO), max_fires, serial, triggers, trigger_gap_s, quiet, trip, relays, created_by_session}`. Add `--replace` to redefine an existing id (its state is kept, and since 1 Oct 2026 the prime run is skipped: a replace-prime once swallowed a real Dynamic reply that landed mid-prime).
 
 `add` runs the check once to **prime** it: baseline helpers record what's already there, so old items never fire. Read the `prime` line in the output. If it says "printed (NOT delivered)", your check fires on existing data and needs fixing.
 
@@ -52,6 +52,15 @@ The context is all the woken agent knows. Write it for a fresh agent with no mem
 4. **What NOT to do**: "don't message Nik or Jashwanth without the owner's OK", "don't merge", "don't buy".
 
 Keep it under ~1500 characters. Never put secrets in it (it's stored in plain text).
+
+## Messaging anyone besides the owner (since 24 Oct 2026)
+
+A watcher whose check or context sends WhatsApp (`wa draft`, `wa send`) must say who it may message. `add` refuses it otherwise.
+
+- **relays** (watcher.json): `[{"to": "<phone jid, group jid or +number>", "name": "Pam's group", "quote": "<the owner's words allowing it>", "at": "<when he said it>"}]`, up to 8. Only people he named, in his words. No quote, no relay. Use the phone jid, not an `@lid` (`wa-db resolve` gives both); relay-ok and relays-off still match a person by either. Stops live outside watcher.json (`watchers/.relay-stops.json`), so no replace, pause or removal of a watcher lifts one; only a grant whose `at` is after the stop does (`at` can't be in the future). `--owner-only` (or `"relays": []`) means the fire tells only the owner.
+- **trip**: give watchers of one trip or job the same tag (`"trip": "dus-oct"`), so one stop reaches all of them.
+- The wake text lists who may hear from the watcher. Before each message to one of them, the agent runs `robob-watch relay-ok <id> --to <jid>` (add `--eta <ISO>` for an ETA change) and sends only on `ok`. It says no to anyone unlisted or stopped, to an ETA that moved less than 15 min since the last one this watcher sent that person, and to more than one ETA update an hour per person (across the trip) unless it moved an hour or more. Sends are counted in `watchers/.relay-sent.json` (a week), so removing a finished watcher doesn't reset what people were told. 23 Oct: ETA flips reached Pam's group and the driver 5-7 times in an evening.
+- **"Stop updating X"** (or "stop updating people"): run `robob-watch relays-off <id> [--to <jid>] --quote "<his words>"`. It stops X (or everyone) on every watcher of that trip at once, by name, so retagging one later doesn't free it; grants added later that predate it are covered too. Then tell him it's done and which watchers it covered. Exit 3 means no listed relay matched, and an `@lid` it can't map is refused; check the jid before telling him. Don't ask which flight or watcher he meant.
 
 ## Check contract
 
