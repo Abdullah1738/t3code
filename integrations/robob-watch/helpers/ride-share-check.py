@@ -199,7 +199,12 @@ def main():
             # all along: it reopens. Cards Uber's history ended stay frozen.
             frozen = bool(prev and prev.get("terminal")) and prev.get("state") != "unknown"
             if not frozen:
-                rc.write_card(card, force=bool(prev and prev.get("terminal")))
+                reopened = bool(prev and prev.get("terminal"))
+                rc.write_card(card, force=reopened)
+                if reopened and rc.unshared_path(cur).exists() and rc.relink(cur):
+                    # Its public link went while it looked over: whoever had it gets a new one.
+                    t.pop("card_requested", None)
+                    t.pop("card_retried", None)
             elif rc.preview_pending(cur):
                 s["preview_retry"].setdefault(cur, 0)
         log_poll(trip, prev if frozen else card, now)

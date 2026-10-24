@@ -240,6 +240,13 @@ class Base(unittest.TestCase):
         with open(self.blog) as f:
             return [json.loads(x) for x in f]
 
+    def share_log(self):
+        p = os.path.join(self.journal, f"{A}.json")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return json.load(f)
+
     def mark_sent(self, uuid):
         self.set_state(trip(uuid, "Accepted"), {})
         self.card_cli("send", "--trip", uuid, "--session", "thread-1@3")
@@ -820,6 +827,67 @@ class UnshareTest(Base):
         self.assertIn("live shares", json.loads(p.stdout)["moni"])
         self.assertEqual(self.unshares(), [])
 
+    def test_share_cap_spares_a_frozen_ride_uber_shows_again(self):
+        # A froze as "never confirmed" over 12h ago, but Uber shows it on a trip again; B's share hits
+        # the cap before the watcher has reopened A's card.
+        self.unconfirmed(A, int(time.time()) - 16 * 3600)
+        self.set_state(trip(B, "Accepted"), {})
+        self.card_cli("refresh", "--trip", B)  # B's card, without a watcher run that would reopen A
+        self.set_state(trip(A, "OnTrip"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1")
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [], "the ride Uber shows right now keeps its link")
+
+    def test_share_cap_frees_nothing_when_uber_cant_be_read(self):
+        self.unconfirmed(A, int(time.time()) - 16 * 3600)
+        self.set_state(trip(B, "Accepted"), {})
+        self.card_cli("refresh", "--trip", B)
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1",
+                          UBER_BIN=os.path.join(self.dir, "no-such-uber"))
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [])
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", FAKE_BRIDGE_CAP="1")
+        self.assertEqual(json.loads(p.stdout)["moni"], "sent")
+        self.assertEqual(self.unshares(), [f"ride-{A}"], "with Uber read, a ride frozen 12h+ ago can go")
+
+    def test_unshared_ride_that_shows_up_again_gets_a_new_link(self):
+        frozen = self.unconfirmed(A, 0)
+        self.run_check(frozen + 12 * 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+        old = self.share_log()["recipients"]["moni"]["payload"]["url"]
+        self.set_state(trip(A, "OnTrip"), {})
+        out = self.run_check(frozen + 13 * 3600)
+        self.assertEqual(len(out), 1, "the watcher wakes the owner thread to send the new link")
+        self.assertTrue(out[0].startswith(f"CARD_READY trip={A}") and "missing=moni" in out[0], out)
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "already sent", "moni": "sent"})
+        shares = [c for c in self.bridge_calls() if c[0] == "share"]
+        self.assertEqual(len(shares), 2, "the card is shared again")
+        moni = [c for c in self.bridge_calls() if c[0] == "send" and c[c.index("--to") + 1] == "moni"]
+        self.assertEqual(len(moni), 2)
+        self.assertEqual(moni[-1][moni[-1].index("--key") + 1], f"uber:{A}:card:moni:relink1")
+        self.assertIn(old, moni[-1][moni[-1].index("--text") + 1], "same page, shared again")
+        self.assertFalse(os.path.exists(os.path.join(self.journal, f".{A}.unshared")))
+        j = self.share_log()
+        self.assertEqual([r["who"] for r in j["retired"]], ["moni"])
+        self.assertEqual(self.run_check(frozen + 13 * 3600 + 60), [])
+        p = self.card_cli("send", "--trip", A, "--session", "thread-1@3")
+        self.assertEqual(json.loads(p.stdout), {"abdullah": "already sent", "moni": "already sent"})
+
+    def test_old_unconfirmed_card_without_a_freeze_time_keeps_its_link(self):
+        # Frozen before ended_at existed and with no readable checked_at: `since` is when "Checking"
+        # began, hours before the freeze, so it can't start the 12h clock. The 2-day share runs out.
+        frozen = self.unconfirmed(A, 0)
+        path = os.path.join(self.cards, f"ride-{A}", "data.json")
+        with open(path) as f:
+            c = json.load(f)
+        c.pop("ended_at", None)
+        c["checked_at"] = None
+        with open(path, "w") as f:
+            json.dump(c, f)
+        self.run_check(frozen + 30 * 3600)
+        self.assertEqual(self.unshares(), [])
+
     def test_live_ride_and_owner_only_card_keep_their_pages(self):
         self.set_state(trip(A, "OnTrip"), {})
         self.card_cli("send", "--trip", A, "--session", "thread-1@3")
@@ -978,13 +1046,6 @@ class SendTest(Base):
                     with open(path, "rb") as fh:
                         snap[path] = (fh.read(), os.stat(path).st_mtime_ns)
         return snap
-
-    def share_log(self):
-        p = os.path.join(self.journal, f"{A}.json")
-        if not os.path.exists(p):
-            return None
-        with open(p) as f:
-            return json.load(f)
 
     def test_group_from_owner_session_gets_one_public_link_and_joins_the_ride(self):
         self.set_state(trip(A, "Accepted"), {})
