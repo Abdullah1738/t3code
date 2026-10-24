@@ -18,7 +18,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
   RunId,
-  type ScheduledTask,
+  ScheduledTask,
   type ScheduledTaskError,
   ScheduledTaskId,
   ThreadId,
@@ -50,6 +50,7 @@ const FOLLOWS_DDL = `CREATE TABLE IF NOT EXISTS ardud_scheduled_task_follows (
   since TEXT NOT NULL,
   fire_key TEXT NOT NULL,
   prompt TEXT NOT NULL,
+  launch_json TEXT NOT NULL,
   thread_id TEXT NOT NULL,
   run_id TEXT,
   attempt INTEGER NOT NULL DEFAULT 0,
@@ -173,12 +174,13 @@ export const threadVerdict = (
       turn.runAttemptId === null && (turn.status === "pending" || turn.status === "running"),
   );
   if (runlessTurn) return WAIT;
-  if (owedDelegatedCompletion(projection) !== null) return WAIT;
+  // Held queued runs stay held; they never count as finished work.
+  const held = runs.some((run) => run.status === "queued");
+  // A report owed into a held queue is parked with it, so it can't wake the thread.
+  if (!held && owedDelegatedCompletion(projection) !== null) return WAIT;
   if (thread.limitRecovery?.autoResume === true) return WAIT;
   if (nowMs - latestCompletion(projection, sinceMs) < FOLLOW_QUIET_MS) return WAIT;
 
-  // Held queued runs stay held; they never count as finished work.
-  const held = runs.some((run) => run.status === "queued");
   const latest = latestExecutedRun(runs);
   if (latest === null) {
     return failed(held ? "The run is held in the thread's queue." : "The run never started.");
@@ -213,6 +215,24 @@ export const blockedRetryPrompt = (
     "---",
     `This is a retry. The provider blocked the response in this scheduled task's first run, [${title}](t3-thread://v1/${blockedThreadId}). That thread is left as it is. Read it before redoing work it already finished.`,
   ].join("\n");
+
+/**
+ * What an occurrence launched with. A retry reuses it rather than the task's
+ * current settings, so an edit made after the block can't pair the old prompt
+ * with new modes.
+ */
+const LaunchSettings = Schema.Struct({
+  projectId: ScheduledTask.fields.projectId,
+  title: ScheduledTask.fields.title,
+  workspaceStrategy: ScheduledTask.fields.workspaceStrategy,
+  runtimeMode: ScheduledTask.fields.runtimeMode,
+  interactionMode: ScheduledTask.fields.interactionMode,
+  createdBy: ScheduledTask.fields.createdBy,
+  creationSource: ScheduledTask.fields.creationSource,
+});
+const LaunchSettingsJson = Schema.fromJsonString(LaunchSettings);
+const decodeLaunchSettings = Schema.decodeUnknownOption(LaunchSettingsJson);
+const encodeLaunchSettings = Schema.encodeEffect(LaunchSettingsJson);
 
 const FallbacksJson = Schema.fromJsonString(Schema.Array(ModelSelection));
 const decodeFallbacks = Schema.decodeUnknownOption(FallbacksJson);
@@ -263,6 +283,7 @@ interface FollowRow {
   readonly since: string;
   readonly fire_key: string;
   readonly prompt: string;
+  readonly launch_json: string;
   readonly thread_id: string;
   readonly run_id: string | null;
   readonly attempt: number;
@@ -279,6 +300,7 @@ export interface FollowTarget {
 }
 
 export interface RecordFollowInput {
+  /** The task as dispatched: its prompt and settings are what a retry reuses. */
   readonly task: ScheduledTask;
   readonly startedAtIso: string;
   readonly fireKey: string;
@@ -303,21 +325,19 @@ export const makeRunFollower = (deps: {
   const { sql, threads, launcher, findTask, notifyChanged } = deps;
 
   /** Starts following a dispatched run; call it in the transaction that records the dispatch. */
-  const record = (input: RecordFollowInput) =>
-    ensureRunFollowTables(sql).pipe(
-      Effect.andThen(
-        sql`
-          INSERT INTO ardud_scheduled_task_follows
-            (task_id, task_created_at, started_at, since, fire_key, prompt, thread_id, run_id)
-          VALUES (
-            ${input.task.id}, ${input.task.createdAt}, ${input.startedAtIso}, ${input.startedAtIso},
-            ${input.fireKey}, ${input.prompt}, ${input.target.threadId}, ${input.target.runId}
-          )
-          ON CONFLICT (task_id, started_at) DO NOTHING
-        `,
-      ),
-      Effect.asVoid,
-    );
+  const record = Effect.fn("ScheduledTaskRunFollow.record")(function* (input: RecordFollowInput) {
+    yield* ensureRunFollowTables(sql);
+    const launch = yield* encodeLaunchSettings(input.task).pipe(Effect.orDie);
+    yield* sql`
+      INSERT INTO ardud_scheduled_task_follows
+        (task_id, task_created_at, started_at, since, fire_key, prompt, launch_json, thread_id, run_id)
+      VALUES (
+        ${input.task.id}, ${input.task.createdAt}, ${input.startedAtIso}, ${input.startedAtIso},
+        ${input.fireKey}, ${input.prompt}, ${launch}, ${input.target.threadId}, ${input.target.runId}
+      )
+      ON CONFLICT (task_id, started_at) DO NOTHING
+    `;
+  });
 
   /** Runs that are still followed; restart recovery leaves them to the follower. */
   const followedKeys = Effect.gen(function* () {
@@ -401,6 +421,10 @@ export const makeRunFollower = (deps: {
     blockedError: string,
   ) {
     const fallbacks = yield* readBlockRetry(sql, task);
+    const launch = Option.getOrNull(decodeLaunchSettings(row.launch_json));
+    if (launch === null) {
+      return yield* settle(row, "failed", `${blockedError}. The retry could not start.`);
+    }
     for (let index = row.retry_index; index < fallbacks.length; index += 1) {
       const modelSelection = fallbacks[index];
       if (modelSelection === undefined) break;
@@ -415,20 +439,20 @@ export const makeRunFollower = (deps: {
       const launched = yield* Effect.exit(
         launcher.launch({
           commandId: CommandId.make(`scheduled-task:${row.fire_key}:retry:${index}`),
-          projectId: task.projectId,
-          title: `${task.title} (retry)`,
+          projectId: launch.projectId,
+          title: `${launch.title} (retry)`,
           modelSelection,
-          runtimeMode: task.runtimeMode,
-          interactionMode: task.interactionMode,
-          workspaceStrategy: task.workspaceStrategy,
+          runtimeMode: launch.runtimeMode,
+          interactionMode: launch.interactionMode,
+          workspaceStrategy: launch.workspaceStrategy,
           initialMessage: {
             messageId: MessageId.make(`scheduled-task-message:${row.fire_key}:retry:${index}`),
             scheduledTaskId: task.id,
-            text: blockedRetryPrompt(row.prompt, task.title, blockedThreadId),
+            text: blockedRetryPrompt(row.prompt, launch.title, blockedThreadId),
             attachments: [],
           },
-          createdBy: task.createdBy,
-          creationSource: task.creationSource,
+          createdBy: launch.createdBy,
+          creationSource: launch.creationSource,
         }),
       );
       if (Exit.isSuccess(launched)) {

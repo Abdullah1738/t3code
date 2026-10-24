@@ -12,6 +12,8 @@ import * as McpToolAccess from "../../mcp/McpToolAccess.ts";
 import { assertTargetWithinLimits, loadCaller, unavailable } from "../../mcp/threadAccess.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ScheduledTaskService from "../../scheduledTasks/ScheduledTaskService.ts";
+import { mcpPrincipal, scheduleFailure, schedulesAs } from "../missions/guard/mcp.ts";
+import { authorizeScheduleChange } from "../missions/guard/schedules.ts";
 import { readBlockRetry, writeBlockRetry } from "./runFollow.ts";
 
 const ScheduledTaskBlockRetryTool = Tool.make("t3_scheduled_task_block_retry", {
@@ -39,7 +41,7 @@ export const ScheduledTaskBlockRetryToolkit = Toolkit.make(ScheduledTaskBlockRet
 const handlers = {
   t3_scheduled_task_block_retry: McpToolAccess.writes((input) =>
     Effect.gen(function* () {
-      const { limits } = yield* loadCaller();
+      const { scope, threads, caller, limits } = yield* loadCaller();
       const schedules = yield* ScheduledTaskService.ScheduledTaskService;
       const sql = yield* SqlClient.SqlClient;
       const { tasks } = yield* schedules.list().pipe(Effect.mapError(unavailable));
@@ -50,8 +52,17 @@ const handlers = {
           message: "The scheduled task was not found.",
         });
       }
-      // The retry runs with the task's modes, so a caller can't arm more than it may run.
+      // The same bar as update_scheduled_task: the task's modes, and a bound
+      // thread's current modes, must be within the caller's.
       yield* assertTargetWithinLimits(limits, task);
+      if (task.threadId !== null) {
+        const bound = yield* threads
+          .getThreadShell(task.threadId)
+          .pipe(Effect.mapError(unavailable));
+        if (bound !== null && bound.deletedAt === null) {
+          yield* assertTargetWithinLimits(limits, bound);
+        }
+      }
       if (input.fallbacks !== undefined) {
         if (input.fallbacks !== null && task.threadId !== null) {
           return yield* new OrchestratorMcpFailure({
@@ -60,6 +71,15 @@ const handlers = {
               "Only tasks that start a new thread can retry; this one posts into an existing thread.",
           });
         }
+        // Any change to a bound task goes through the mission guard, as an edit would.
+        yield* authorizeScheduleChange({
+          taskId: task.id,
+          threads: [task.threadId],
+          text: `Change the blocked-run retry of the schedule "${task.title}".`,
+        }).pipe(
+          schedulesAs(mcpPrincipal(scope, caller)),
+          Effect.mapError(scheduleFailure("Could not change the blocked-run retry")),
+        );
         yield* writeBlockRetry(sql, task, input.fallbacks).pipe(Effect.mapError(unavailable));
       }
       const fallbacks = yield* readBlockRetry(sql, task).pipe(Effect.mapError(unavailable));

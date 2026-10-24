@@ -205,6 +205,32 @@ describe("threadVerdict", () => {
     ).toMatchObject({ status: "failed", error: "The thread was deleted." });
   });
 
+  it("does not wait on a report parked in a held queue", () => {
+    // The parent cohort still owes a delegated report, but its wake run is held
+    // behind the blocked run, so nothing will ever deliver it.
+    const verdict = settledAfterQuiet({
+      runs: [
+        {
+          id: "a",
+          status: "failed",
+          delegatedCompletion: {
+            disposition: "open",
+            nextGeneration: 2,
+            delivery: { generation: 1, messageId: "wake", taskIds: ["task-1"] },
+          },
+        },
+        { id: "wake", status: "queued", queueHeld: true },
+      ],
+      subagents: [{ id: "task-1", status: "completed", endsAt: 1 }],
+      errors: [{ runId: "a", ...BLOCKED }],
+    });
+    expect(verdict).toMatchObject({
+      status: "failed",
+      error: "Provider blocked the response",
+      blocked: true,
+    });
+  });
+
   it("only treats the content filter as blocked", () => {
     expect(
       settledAfterQuiet({

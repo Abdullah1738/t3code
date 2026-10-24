@@ -909,7 +909,7 @@ export const layer = Layer.effect(
                   recordRun.pipe(
                     Effect.andThen(
                       runFollower.record({
-                        task: scheduleSource,
+                        task: active,
                         startedAtIso,
                         fireKey,
                         prompt,

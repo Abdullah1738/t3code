@@ -249,6 +249,21 @@ it.effect("retries a blocked run once on the first fallback model and follows th
         const fallback = { instanceId: "opencode", model: "opus/gpt-6-astra" } as never;
         yield* writeBlockRetry(sql, task, [fallback]);
         yield* service.runNow({ id: task.id });
+        // An edit after the run started doesn't change what the retry runs.
+        yield* service.upsert(
+          yield* decodeUpsertInput({
+            id: task.id,
+            title: task.title,
+            prompt: "Something else.",
+            enabled: true,
+            schedule: task.schedule,
+            projectId: task.projectId,
+            workspaceStrategy: task.workspaceStrategy,
+            modelSelection: task.modelSelection,
+            runtimeMode: "approval-required",
+            interactionMode: task.interactionMode,
+          }),
+        );
 
         yield* blockAfterWake(harness, "thread-1", T0 + 2 * minute);
         yield* TestClock.adjust(FOLLOW_QUIET_MS + 3 * minute);
@@ -258,6 +273,7 @@ it.effect("retries a blocked run once on the first fallback model and follows th
         const retry = launches[1]!;
         assert.isTrue(retry.commandId.endsWith(":retry:0"));
         assert.equal(retry.modelSelection.model, "opus/gpt-6-astra");
+        assert.equal(retry.runtimeMode, "full-access");
         assert.equal(retry.initialMessage?.scheduledTaskId, task.id);
         assert.isTrue(retry.initialMessage?.text.startsWith("Run the nightly review.") ?? false);
         assert.include(retry.initialMessage?.text ?? "", "(t3-thread://v1/thread-1)");
