@@ -22,8 +22,8 @@ import {
   viewChartFraction,
   viewMarkdownFold,
   viewMarkdownPreview,
+  type ViewLongTextRequest,
 } from "@t3tools/client-runtime/ardud/missions";
-import type { ViewLongTextInput } from "@t3tools/contracts";
 // --- blocks additions ---
 import { VIEW_HARD_LIMITS, type ViewTone } from "@t3tools/contracts";
 import { useCopyToClipboard } from "../../../hooks/useCopyToClipboard";
@@ -198,7 +198,7 @@ function CollapsibleBlock(props: {
   return (
     <ul className="flex min-w-0 flex-col">
       {props.block.items.map((item, index) => {
-        const open = toggled.get(item.key) ?? (props.block.open === "first" && index === 0);
+        const open = toggled.get(item.key) ?? index < props.block.openCount;
         const toggle = () => setToggled((current) => new Map(current).set(item.key, !open));
         const long = item.children.some((child) => child.kind === "markdown");
         return (
@@ -339,7 +339,7 @@ export function MarkdownText(props: { text: string; maxLines: number | null }) {
   );
 }
 
-function LongMarkdown(props: { source: ViewLongTextInput; maxLines: number | null }) {
+function LongMarkdown(props: { source: ViewLongTextRequest; maxLines: number | null }) {
   const state = useViewLongText(props.source);
   if (state === undefined || state.status === "loading") {
     return (
@@ -651,7 +651,7 @@ function CodeText(props: { text: string; label: string | null; note?: string | u
   );
 }
 
-function LongCode(props: { source: ViewLongTextInput; label: string | null }) {
+function LongCode(props: { source: ViewLongTextRequest; label: string | null }) {
   const state = useViewLongText(props.source);
   if (state === undefined || state.status === "loading") {
     return <div aria-hidden className="h-24 rounded-xl bg-(--m-active)" />;

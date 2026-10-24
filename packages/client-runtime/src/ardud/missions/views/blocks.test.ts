@@ -268,6 +268,65 @@ describe("script source sections", () => {
     expect(notice({ listing, run: { ...failed, okAt: null } })).toBe("Couldn't refresh");
   });
 
+  it("loads a script row's long text on open, keyed to the run it came from", () => {
+    const dailies = section("sec-d", {
+      title: "Dailies",
+      source: { _tag: "source", sourceId, limit: 7 },
+      body: [
+        {
+          _tag: "collapsible",
+          title: "row.title",
+          meta: [],
+          open: "none",
+          openCount: 3,
+          children: [{ _tag: "markdown", bind: "row.body" }],
+        },
+      ],
+    });
+    const view = viewSection(dailies, {
+      nowMs: NOW,
+      data: {
+        sectionId: ViewSectionId.make("sec-d"),
+        total: 4,
+        rows: [
+          {
+            ref: { kind: "source-row", id: "d-2" },
+            value: { title: "Daily 21" },
+            deferred: ["body"],
+          },
+          // Nothing to load, an older server's inline text and a value an older
+          // server left out show as they are; only marked values load.
+          { ref: { kind: "source-row", id: "d-1" }, value: { title: "Daily 20", body: null } },
+          { ref: { kind: "source-row", id: "d-0" }, value: { title: "Daily 19", body: "# Old" } },
+          { ref: { kind: "source-row", id: "d-9" }, value: { title: "Daily 18" } },
+        ],
+      },
+      source: {
+        listing: { ...listing, fields: { title: "text", body: "longtext" } },
+        run,
+      },
+    });
+    const block = view.blocks[0];
+    expect(block?.kind === "collapsible" && block.openCount).toBe(3);
+    expect(block?.kind === "collapsible" && block.items.map((item) => item.children)).toEqual([
+      [
+        {
+          kind: "markdown",
+          text: null,
+          maxLines: null,
+          source: {
+            missionId,
+            ref: { kind: "source-row", id: "d-2" },
+            path: "body",
+            sourceId,
+            revision: run.okAt,
+          },
+        },
+      ],
+      [{ kind: "markdown", text: "# Old", source: null, maxLines: null }],
+    ]);
+  });
+
   it("keeps a section with a notice even when no rows show", () => {
     const view = viewSection(builds, {
       nowMs: NOW,
@@ -315,7 +374,7 @@ describe("report sections", () => {
     expect(view.blocks).toEqual([
       {
         kind: "collapsible",
-        open: "first",
+        openCount: 1,
         items: ["crpko|update|b", "crpko|update|a"].map((id, index) => ({
           key: `report:${id}`,
           title: index === 0 ? "04:00 update" : "00:00 update",
@@ -362,7 +421,7 @@ describe("report sections", () => {
     expect(view.blocks).toEqual([
       {
         kind: "collapsible",
-        open: "none",
+        openCount: 0,
         items: [
           {
             key: "note:n-1",
@@ -431,6 +490,61 @@ describe("long texts", () => {
     expect(state("flaky")).toEqual({ status: "loaded", value: answer("flaky") });
     expect(asked).toEqual(["a", "b", "c", "flaky", "flaky"]);
     expect(changes).toBe(10);
+  });
+
+  it("asks again for a script row's text after a new run, without sending the run", async () => {
+    const sent: Array<object> = [];
+    const texts = createViewLongTexts((request) => {
+      sent.push(request);
+      const reply = Promise.resolve(answer(request.ref.id));
+      pending.push(reply);
+      return reply;
+    });
+    const row = (revision: string) => ({
+      missionId,
+      ref: { kind: "source-row" as const, id: "d-1" },
+      path: "body",
+      sourceId: ViewDataSourceId.make("src-d"),
+      revision,
+    });
+    texts.request(row("09:00"));
+    texts.request(row("09:00"));
+    texts.request(row("10:00"));
+    await settled();
+    expect(viewLongTextKey(row("09:00"))).not.toBe(viewLongTextKey(row("10:00")));
+    expect(sent).toEqual([
+      { missionId, ref: row("09:00").ref, path: "body", sourceId: "src-d" },
+      { missionId, ref: row("09:00").ref, path: "body", sourceId: "src-d" },
+    ]);
+  });
+
+  it("keeps every text on screen past the limit and drops it once nobody shows it", async () => {
+    const asked: Array<string> = [];
+    const texts = createViewLongTexts((request) => {
+      asked.push(request.ref.id);
+      const reply = Promise.resolve(answer(request.ref.id));
+      pending.push(reply);
+      return reply;
+    }, 2);
+    const state = (id: string) => texts.get(viewLongTextKey(input(id)));
+    const releases = ["a", "b", "c"].map((id) => texts.hold(input(id)));
+    const again = texts.hold(input("a"));
+    await settled();
+    expect(["a", "b", "c"].map((id) => state(id)?.status)).toEqual(["loaded", "loaded", "loaded"]);
+
+    releases[0]?.();
+    texts.request(input("d"));
+    await settled();
+    expect(state("a")?.status).toBe("loaded");
+    again();
+    again();
+    releases[1]?.();
+    texts.request(input("e"));
+    await settled();
+    expect(state("a")).toBeUndefined();
+    expect(state("b")).toBeUndefined();
+    expect(state("c")?.status).toBe("loaded");
+    expect(asked).toEqual(["a", "b", "c", "d", "e"]);
   });
 });
 
@@ -808,7 +922,7 @@ describe("stat, chart, timeline, callout and code blocks", () => {
     expect(view.blocks).toEqual([
       {
         kind: "collapsible",
-        open: "none",
+        openCount: 0,
         items: [
           {
             key: "report:crpko|update|a",

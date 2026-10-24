@@ -4,7 +4,12 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { assert, describe, it } from "@effect/vitest";
-import type { MissionViewsSnapshot, ViewDataSourceId, ViewSourceFields } from "@t3tools/contracts";
+import {
+  type MissionViewsSnapshot,
+  type ViewDataSourceId,
+  type ViewSourceFields,
+  VIEW_SOURCE_LIMITS,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
 import {
@@ -220,6 +225,94 @@ describe("view sources", () => {
         const status = after.sourceRuns?.find((run) => run.sourceId === sourceId);
         assert.include(status?.error ?? "", "not logged in");
         assert.isNotNull(status?.okAt ?? null);
+      }),
+    ),
+  );
+
+  it.effect("defers long text for clients that load it on open, inline for the rest", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        const views = yield* ViewService;
+        // Past the inline cap, made by the script so its code stays short. The
+        // field name is camelCase and 39 long, both fine for a script field.
+        const long = "Long part. ".repeat(3000);
+        const body = "fullDailyReportBodyForTheOwnersEyesOnly";
+        const set = yield* views.setSource(ownerApp, {
+          missionId,
+          title: "Dailies",
+          runtime: "node",
+          code: [
+            'const body = "Long part. ".repeat(3000);',
+            "const rows = [",
+            `  { id: "d1", title: "Daily 21", ${body}: body },`,
+            `  { id: "d2", title: "Daily 20", ${body}: "" },`,
+            '  { id: "d3", title: "Daily 19" },',
+            "];",
+            "console.log(JSON.stringify({ rows }));",
+          ].join("\n"),
+          fields: { title: "text", [body]: "longtext" },
+        });
+        const sourceId = set.ref.id as ViewDataSourceId;
+        const ran = yield* views.runSource(ownerApp, { missionId, sourceId });
+        assert.isTrue(ran.ok, ran.errors.join("; "));
+        const placed = yield* views.placeSection(ownerApp, {
+          missionId,
+          definition: {
+            key: "dailies",
+            title: "Dailies",
+            source: { _tag: "source", sourceId, limit: 5 },
+            body: [
+              {
+                _tag: "collapsible",
+                title: "row.title",
+                meta: [],
+                open: "none",
+                openCount: 1,
+                children: [{ _tag: "markdown", bind: `row.${body}` }],
+              },
+            ],
+          },
+        });
+        const rowsOf = (snapshot: MissionViewsSnapshot) =>
+          snapshot.sectionData?.find((entry) => entry.sectionId === placed.ref.id)?.rows ?? [];
+
+        const deferred = yield* views.snapshot(missionId, { deferLongText: true });
+        assert.notInclude(JSON.stringify(deferred.sectionData), "Long part.");
+        assert.deepStrictEqual(rowsOf(deferred), [
+          {
+            ref: { kind: "source-row", id: "d1" },
+            value: { id: "d1", title: "Daily 21" },
+            deferred: [body],
+          },
+          {
+            ref: { kind: "source-row", id: "d2" },
+            value: { id: "d2", title: "Daily 20", [body]: null },
+          },
+          { ref: { kind: "source-row", id: "d3" }, value: { id: "d3", title: "Daily 19" } },
+        ]);
+
+        // Clients that predate loading on open (and agents) get it inline, cut short.
+        const inline = rowsOf(yield* views.snapshot(missionId));
+        assert.equal(inline[0]?.value[body], long.slice(0, VIEW_SOURCE_LIMITS.inlineLongTextChars));
+        assert.isUndefined(inline[0]?.deferred);
+        assert.equal(inline[1]?.value[body], "");
+
+        const ref = { kind: "source-row", id: "d1" } as const;
+        const loaded = yield* views.longText({ missionId, ref, path: body, sourceId });
+        assert.equal(loaded.text, long);
+        assert.equal(loaded.size, long.length);
+        assert.isFalse(loaded.truncated);
+        const fail = (input: Parameters<typeof views.longText>[0]) =>
+          Effect.map(Effect.flip(views.longText(input)), (error) => error.code);
+        assert.equal(yield* fail({ missionId, ref, path: body }), "invalid");
+        assert.equal(yield* fail({ missionId, ref, path: "title", sourceId }), "invalid");
+        assert.equal(
+          yield* fail({ missionId, ref: { ...ref, id: "gone" }, path: body, sourceId }),
+          "not-found",
+        );
+        yield* views.setSource(ownerApp, { missionId, sourceId, enabled: false });
+        assert.equal(yield* fail({ missionId, ref, path: body, sourceId }), "not-found");
       }),
     ),
   );

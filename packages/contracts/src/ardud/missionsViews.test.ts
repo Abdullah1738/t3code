@@ -8,11 +8,13 @@ import {
   SetViewSourceInput,
   STOCK_VIEW_TEMPLATES,
   ViewBind,
+  ViewLongTextInput,
   ViewNode,
   ViewSectionDefinition,
   ViewSourceDefinition,
   ViewStarterLayout,
   ViewTemplate,
+  ViewSectionRow,
   ViewTemplateDefinition,
   viewLayoutPinsStrip,
   viewPinnedStrip,
@@ -134,6 +136,9 @@ describe("mission views catalog", () => {
       decodeNode({ ...folded, children: Array.from({ length: 7 }, () => markdown) })._tag,
     ).toBe("Failure");
     expect(decodeNode({ ...folded, open: "all" })._tag).toBe("Failure");
+    expect(decodeNode({ ...folded, open: "none", openCount: 3 })._tag).toBe("Success");
+    expect(decodeNode({ ...folded, openCount: 21 })._tag).toBe("Failure");
+    expect(decodeNode({ ...folded, openCount: 1.5 })._tag).toBe("Failure");
     expect(decodeNode({ ...folded, meta: ["row.a", "row.b", "row.c", "row.d"] })._tag).toBe(
       "Failure",
     );
@@ -147,6 +152,27 @@ describe("mission views catalog", () => {
       })._tag;
     expect(section({ reportKind: ["update"] })).toBe("Success");
     expect(section({ reportKind: ["weekly"] })).toBe("Failure");
+    expect(section({ reportKind: ["update"], sinceLatest: "daily" })).toBe("Success");
+    expect(section({ sinceLatest: "weekly" })).toBe("Failure");
+    expect(VIEW_CATALOG.queries?.filters.sinceLatest).toEqual(["report"]);
+    // Script long text loads by the source's own field name, camelCase or long.
+    const longText = (path: string) =>
+      Schema.decodeUnknownExit(ViewLongTextInput)({
+        missionId: "m-1",
+        ref: { kind: "source-row", id: "d-1" },
+        path,
+        sourceId: "src-1",
+      })._tag;
+    expect(longText("fullDailyReportBodyForTheOwnersEyesOnly")).toBe("Success");
+    expect(longText("row.body")).toBe("Failure");
+    const row = (deferred: unknown) =>
+      Schema.decodeUnknownExit(ViewSectionRow)({
+        ref: { kind: "source-row", id: "d-1" },
+        value: {},
+        deferred,
+      })._tag;
+    expect(row(["dailyBody"])).toBe("Success");
+    expect(row(["no spaces"])).toBe("Failure");
     expect(VIEW_PATHS.report.text).toBe("longtext");
     expect(VIEW_CATALOG.queries?.filters.reportKind).toEqual(["report"]);
     expect(VIEW_CATALOG.nodes.map((node) => node.tag)).toEqual(

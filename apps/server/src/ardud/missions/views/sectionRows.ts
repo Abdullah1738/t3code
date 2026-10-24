@@ -214,8 +214,15 @@ export const sectionRows = (
     const query = source.query;
     const fields = rowFields(section.definition.body);
     if (query.kind === "report") {
+      // A daily covers everything before its end, so "since the latest daily"
+      // starts there; a report-saved event resends these rows.
+      const since =
+        query.where?.sinceLatest === "daily"
+          ? (yield* scribe.listReports(missionId, ["daily"], 1).pipe(Effect.orDie)).rows[0]
+              ?.coversTo
+          : undefined;
       const listed = yield* scribe
-        .listReports(missionId, query.where?.reportKind ?? REPORT_KINDS, query.limit)
+        .listReports(missionId, query.where?.reportKind ?? REPORT_KINDS, query.limit, since)
         .pipe(Effect.orDie);
       const zone = reportZone(Option.getOrNull(yield* store.get("mission", missionId)));
       const data: ViewSectionData = {

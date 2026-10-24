@@ -103,6 +103,11 @@ const firstLine = (text: string) =>
     .map((line) => line.trim())
     .find((line) => line !== "") ?? null;
 
+const inlineLongText = (text: string) =>
+  text.length > VIEW_SOURCE_LIMITS.inlineLongTextChars
+    ? text.slice(0, VIEW_SOURCE_LIMITS.inlineLongTextChars)
+    : text;
+
 const outcomeOf = (result: ScriptResult, source: ViewDataSource): Outcome => {
   const failed = (problem: string, line: string = problem): Outcome => ({
     ok: false,
@@ -208,11 +213,23 @@ export class SourceService extends Context.Service<
       missionId: MissionId,
       sources: ReadonlyArray<ViewDataSource>,
     ) => Effect.Effect<ReadonlyArray<ViewSourceRun>>;
-    /** Cached rows for the active sections bound to active, enabled sources. */
+    /**
+     * Cached rows for the active sections bound to active, enabled sources.
+     * With `deferLongText` a non-blank longtext stays off and is listed in the
+     * row's `deferred`, for `longText` to load when its block opens. Without
+     * it the value rides inline, cut to `inlineLongTextChars`.
+     */
     readonly sectionData: (
       sections: ReadonlyArray<ViewSection>,
       sources: ReadonlyArray<ViewDataSource>,
+      deferLongText: boolean,
     ) => Effect.Effect<ReadonlyArray<ViewSectionData>>;
+    /** One row's longtext value from the last good run; null when the row or value is gone. */
+    readonly longText: (
+      sourceId: string,
+      rowId: string,
+      path: string,
+    ) => Effect.Effect<string | null>;
     /** Mission ids, published when one of their runs starts or finishes. */
     readonly changes: Effect.Effect<PubSub.Subscription<MissionId>, never, Scope.Scope>;
   }
@@ -445,6 +462,7 @@ const make = Effect.gen(function* () {
   const sectionData = Effect.fn("SourceService.sectionData")(function* (
     sections: ReadonlyArray<ViewSection>,
     sources: ReadonlyArray<ViewDataSource>,
+    deferLongText: boolean,
   ) {
     const live = new Map<string, ViewDataSource>();
     for (const source of sources) {
@@ -456,6 +474,7 @@ const make = Effect.gen(function* () {
       if (section.status !== "active" || shape._tag !== "source") continue;
       const source = live.get(shape.sourceId);
       if (source === undefined) continue;
+      const fields = source.definition.fields;
       const paths = boundPaths(section.definition.body);
       const rows = ordered(
         (yield* cachedRows(source.id)).filter((row) => matches(row, shape.where)),
@@ -465,13 +484,33 @@ const make = Effect.gen(function* () {
         sectionId: section.id,
         rows: rows.slice(0, shape.limit).map((row): ViewSectionRow => {
           const value: Record<string, unknown> = {};
-          for (const path of paths) if (Object.hasOwn(row, path)) value[path] = row[path];
-          return { ref: { kind: "source-row", id: String(row.id) }, value };
+          const deferred: Array<string> = [];
+          for (const path of paths) {
+            if (!Object.hasOwn(row, path)) continue;
+            const raw = row[path];
+            const long = Object.hasOwn(fields, path) && fields[path] === "longtext";
+            if (!long || typeof raw !== "string") value[path] = raw;
+            else if (!deferLongText) value[path] = inlineLongText(raw);
+            else if (raw.trim() === "") value[path] = null;
+            else deferred.push(path);
+          }
+          const ref = { kind: "source-row", id: String(row.id) } as const;
+          return deferred.length === 0 ? { ref, value } : { ref, value, deferred };
         }),
         total: rows.length,
       });
     }
     return data;
+  });
+
+  const longText = Effect.fn("SourceService.longText")(function* (
+    sourceId: string,
+    rowId: string,
+    path: string,
+  ) {
+    const row = (yield* cachedRows(sourceId)).find((candidate) => String(candidate.id) === rowId);
+    const value = row !== undefined && Object.hasOwn(row, path) ? row[path] : undefined;
+    return typeof value === "string" ? value : null;
   });
 
   return SourceService.of({
@@ -480,6 +519,7 @@ const make = Effect.gen(function* () {
     refreshStale,
     runs,
     sectionData,
+    longText,
     changes: PubSub.subscribe(changed),
   });
 });

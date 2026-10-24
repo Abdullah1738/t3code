@@ -124,10 +124,18 @@ export interface ViewWaiting {
   readonly requestsUnread: number;
 }
 
+export interface ViewSectionDataOptions {
+  /** Set by clients that load script longtext on open; everyone else gets it inline, cut short. */
+  readonly deferLongText?: boolean;
+}
+
 export class ViewService extends Context.Service<
   ViewService,
   {
-    readonly snapshot: (missionId: MissionId) => Effect.Effect<MissionViewsSnapshot, MissionError>;
+    readonly snapshot: (
+      missionId: MissionId,
+      options?: ViewSectionDataOptions,
+    ) => Effect.Effect<MissionViewsSnapshot, MissionError>;
     readonly catalog: Effect.Effect<ViewCatalog>;
     readonly history: (input: ViewHistoryInput) => Effect.Effect<ViewHistory, MissionError>;
     /** Runs the define-time checks and stores nothing. */
@@ -182,6 +190,7 @@ export class ViewService extends Context.Service<
     readonly sectionData: (
       missionId: MissionId,
       sections: ReadonlyArray<ViewSection>,
+      options?: ViewSectionDataOptions,
     ) => Effect.Effect<ReadonlyArray<ViewSectionData>, MissionError>;
     /** A row's `longtext` value, which the snapshot leaves out. */
     readonly longText: (input: ViewLongTextInput) => Effect.Effect<ViewLongText, MissionError>;
@@ -527,13 +536,15 @@ const make = Effect.gen(function* () {
     missionId: MissionId,
     sections: ReadonlyArray<ViewSection>,
     sources: ReadonlyArray<ViewDataSource>,
+    options: ViewSectionDataOptions | undefined,
   ) {
     const queried = yield* sectionData({ store, scribe }, missionId, sections);
-    return [...queried, ...(yield* runs.sectionData(sections, sources))];
+    const scripted = yield* runs.sectionData(sections, sources, options?.deferLongText === true);
+    return [...queried, ...scripted];
   });
 
   // Reading the views counts as someone looking, which is what lets a stale source run.
-  const snapshot = (missionId: MissionId) =>
+  const snapshot = (missionId: MissionId, options?: ViewSectionDataOptions) =>
     Effect.gen(function* () {
       const mission = yield* requireMission(missionId);
       const sources = yield* views.sources(mission.id);
@@ -558,7 +569,7 @@ const make = Effect.gen(function* () {
         pinnedStrip: pinned.needsYou || pinned.requests,
         pinned,
         changesToday: yield* views.changesSince(mission.id, since),
-        sectionData: yield* allSectionData(mission.id, sections, sources),
+        sectionData: yield* allSectionData(mission.id, sections, sources, options),
         // Request images are part of the owner's words, which only the owner
         // and the master read, through the request itself.
         assets: (yield* views.assets(mission.id)).filter(
@@ -1906,13 +1917,40 @@ const make = Effect.gen(function* () {
 
   const longText = Effect.fn("ViewService.longText")(function* (input: ViewLongTextInput) {
     const mission = yield* requireMission(input.missionId);
+    const max = VIEW_HARD_LIMITS.longTextChars;
+    if (input.ref.kind === "source-row") {
+      if (input.sourceId === undefined) {
+        return yield* fail("invalid", "A script row's long text needs its sourceId.");
+      }
+      const { existing } = yield* findSource(mission.id, input.sourceId);
+      const fields = existing.definition.fields;
+      if (!Object.hasOwn(fields, input.path) || fields[input.path] !== "longtext") {
+        return yield* fail(
+          "invalid",
+          `${existing.definition.title} has no long text ${input.path}`,
+        );
+      }
+      if (existing.status !== "active" || !existing.definition.enabled) {
+        return yield* fail("not-found", `${existing.definition.title} is off.`);
+      }
+      const text = yield* runs.longText(existing.id, input.ref.id, input.path);
+      if (text === null) {
+        return yield* fail("not-found", `No ${input.path} for row ${input.ref.id} any more.`);
+      }
+      const sourced: ViewLongText = {
+        ref: input.ref,
+        path: input.path,
+        text: text.slice(0, max),
+        size: text.length,
+        truncated: text.length > max,
+      };
+      return sourced;
+    }
     const scope = input.ref.kind as ViewPathScope;
     const kind = Object.hasOwn(VIEW_PATHS, scope) ? VIEW_PATHS[scope][input.path] : undefined;
     if (kind !== "longtext") {
       return yield* fail("invalid", `${input.ref.kind} rows have no long text ${input.path}`);
     }
-    const max = VIEW_HARD_LIMITS.longTextChars;
-    // Reports are the only rows with long text today.
     const found = yield* scribe.reportText(mission.id, input.ref.id, max).pipe(Effect.orDie);
     if (found === null)
       return yield* fail("not-found", `No report ${input.ref.id} in this mission.`);
@@ -2121,9 +2159,9 @@ const make = Effect.gen(function* () {
 
   return ViewService.of({
     snapshot,
-    sectionData: (missionId, sections) =>
+    sectionData: (missionId, sections, options) =>
       Effect.flatMap(views.sources(missionId), (sources) =>
-        allSectionData(missionId, sections, sources),
+        allSectionData(missionId, sections, sources, options),
       ),
     setSource,
     removeSource,

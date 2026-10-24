@@ -15,7 +15,6 @@ import {
   type ViewActionKey,
   type ViewBackedRecord,
   type ViewBackingKind,
-  type ViewLongTextInput,
   type ViewNode,
   type ViewNodeTag,
   type ViewTableCellKind,
@@ -35,6 +34,7 @@ import {
   type ViewValue,
 } from "./bindings.ts";
 import { decodeViewBody } from "./decode.ts";
+import type { ViewLongTextRequest } from "./longText.ts";
 
 // A card is a fixed frame (kicker, by-master marker, title, age, approver,
 // actions) around a body the template describes. These are the props the
@@ -98,13 +98,13 @@ export type ViewBlock =
       /** Null while the text waits on `source`. */
       readonly text: string | null;
       /** Set for long values left off the snapshot: load them when the block shows. */
-      readonly source: ViewLongTextInput | null;
+      readonly source: ViewLongTextRequest | null;
       readonly maxLines: number | null;
     }
   | {
       readonly kind: "collapsible";
-      /** `first` starts the first item open. */
-      readonly open: "none" | "first";
+      /** How many items start open, from the top. */
+      readonly openCount: number;
       readonly items: ReadonlyArray<ViewCollapsibleItem>;
     }
   // --- end views additions ---
@@ -122,7 +122,7 @@ export type ViewBlock =
       readonly label: string | null;
       /** Null while the text waits on `source`. */
       readonly text: string | null;
-      readonly source: ViewLongTextInput | null;
+      readonly source: ViewLongTextRequest | null;
     };
 
 export interface ViewStatTile {
@@ -727,7 +727,9 @@ export function viewBlock(
               collapsibleItem(node, row.key, row.context, backed, sources.assets),
             );
       const shown = items.filter((item): item is ViewCollapsibleItem => item !== null);
-      return shown.length === 0 ? null : { kind: "collapsible", open: node.open, items: shown };
+      if (shown.length === 0) return null;
+      const openCount = node.openCount ?? (node.open === "first" ? 1 : 0);
+      return { kind: "collapsible", openCount, items: shown };
     }
     // --- end views additions ---
     // --- blocks additions ---

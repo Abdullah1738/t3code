@@ -1520,7 +1520,7 @@ export function createRpcMissionsSource(options: RpcMissionsSourceOptions): Miss
       };
       const stopViews = transport.stream(
         VIEWS.subscribe,
-        { missionId },
+        { missionId, deferLongText: true },
         (item) => {
           if (item._tag === "snapshot") {
             snapshot = item.snapshot;

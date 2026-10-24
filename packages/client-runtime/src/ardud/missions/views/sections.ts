@@ -125,11 +125,22 @@ const rowsOf = (
   if (from._tag === "source") {
     if (source === null) return [];
     const paths = { id: "text" as const, ...source.listing.fields };
-    // Script rows are not mission records, so nothing opens them.
+    const sourceId = source.listing.id;
+    const revision = source.run?.okAt ?? null;
+    // Script rows are not mission records, so nothing opens them; their ref
+    // only locates long values.
     return rows.map((row) => ({
       key: `${row.ref.kind}:${row.ref.id}`,
       ref: null,
-      row: { scope: "source", value: row.value, paths },
+      row: {
+        scope: "source",
+        value: row.value,
+        paths,
+        ref: row.ref,
+        sourceId,
+        revision,
+        ...(row.deferred === undefined ? {} : { deferred: row.deferred }),
+      },
     }));
   }
   const kind = from.query.kind;

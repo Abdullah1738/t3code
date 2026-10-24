@@ -8,13 +8,14 @@ import {
   type MissionId,
   type MissionLink,
   type MissionRecordRef,
+  type ViewDataSourceId,
   type ViewFieldValue,
-  type ViewLongTextInput,
   type ViewPathScope,
   type ViewValueKind,
 } from "@t3tools/contracts";
 
 import { actorLabel, formatRelative } from "../viewModel.ts";
+import type { ViewLongTextRequest } from "./longText.ts";
 
 // Bindings name a record path, a template field or a section row. They resolve
 // to plain values the card blocks render; anything missing resolves to null
@@ -47,6 +48,10 @@ export interface ViewBindContext {
     readonly value: object;
     readonly ref?: MissionRecordRef | null;
     readonly paths?: Readonly<Record<string, ViewValueKind>>;
+    /** Script rows: the source and run their `deferred` long values load from. */
+    readonly sourceId?: ViewDataSourceId;
+    readonly revision?: string | null;
+    readonly deferred?: ReadonlyArray<string>;
   } | null;
   /** Section-level `row.count` / `row.total`. */
   readonly section?: { readonly count: number; readonly total: number };
@@ -292,18 +297,24 @@ export function resolveViewBind(bind: string, context: ViewBindContext): ViewVal
 export function viewLongTextSource(
   bind: string,
   context: ViewBindContext,
-): ViewLongTextInput | null {
+): ViewLongTextRequest | null {
   const row = context.row;
-  if (
-    !bind.startsWith("row.") ||
-    !row?.ref ||
-    row.scope === "refs" ||
-    row.scope === "source" ||
-    !context.missionId
-  ) {
+  if (!bind.startsWith("row.") || !row?.ref || row.scope === "refs" || !context.missionId) {
     return null;
   }
   const path = bind.slice("row.".length);
+  if (row.scope === "source") {
+    // Only values the server marked load on open; one that predates loading
+    // them sends long text inline and marks nothing.
+    if (row.sourceId === undefined || row.deferred?.includes(path) !== true) return null;
+    return {
+      missionId: context.missionId,
+      ref: row.ref,
+      path,
+      sourceId: row.sourceId,
+      revision: row.revision ?? null,
+    };
+  }
   return lookup(VIEW_PATHS[row.scope], path) === "longtext"
     ? { missionId: context.missionId, ref: row.ref, path }
     : null;

@@ -4,7 +4,6 @@ import type {
   MissionId,
   MissionViewsSnapshot,
   ViewBackedRecord,
-  ViewLongTextInput,
 } from "@t3tools/contracts";
 import {
   assetMarkOf,
@@ -20,6 +19,7 @@ import {
   type ViewChoiceOption,
   type ViewGalleryAsset,
   type ViewListRow,
+  type ViewLongTextRequest,
   type ViewSectionEntry,
   type ViewTableRow,
   // --- blocks additions ---
@@ -216,7 +216,7 @@ function CollapsibleRows(
   return (
     <View>
       {props.block.items.map((item, index) => {
-        const open = toggled.get(item.key) ?? (props.block.open === "first" && index === 0);
+        const open = toggled.get(item.key) ?? index < props.block.openCount;
         const toggle = () => setToggled((current) => new Map(current).set(item.key, !open));
         const long = item.children.some((child) => child.kind === "markdown");
         return (
@@ -384,7 +384,7 @@ function MarkdownReaderBody(props: { readonly text: string; readonly onClose: ()
 }
 
 function LongMarkdown(props: {
-  readonly source: ViewLongTextInput;
+  readonly source: ViewLongTextRequest;
   readonly maxLines: number | null;
 }) {
   const state = useViewLongText(props.source);
@@ -724,7 +724,7 @@ function CodeText(props: {
   );
 }
 
-function LongCode(props: { readonly source: ViewLongTextInput; readonly label: string | null }) {
+function LongCode(props: { readonly source: ViewLongTextRequest; readonly label: string | null }) {
   const state = useViewLongText(props.source);
   if (state === undefined || state.status === "loading") {
     return <View accessibilityLabel="Loading" className="h-24 rounded-xl bg-secondary" />;

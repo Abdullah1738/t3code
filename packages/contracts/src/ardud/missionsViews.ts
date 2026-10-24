@@ -295,6 +295,8 @@ export const ViewCollapsibleHead = Schema.Struct({
   meta: Schema.Array(ViewBind).check(Schema.isMaxLength(3)),
   /** `first` opens the first item on load. */
   open: Schema.Literals(["none", "first"]),
+  /** Opens the first N items on load instead; `open` stays for clients that predate it. */
+  openCount: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 20 }))),
 });
 export type ViewCollapsibleHead = typeof ViewCollapsibleHead.Type;
 // --- end views additions ---
@@ -586,6 +588,8 @@ export const ViewQueryWhere = Schema.Struct({
   reportKind: Schema.optionalKey(
     Schema.Array(Schema.Literals(["daily", "update"])).check(Schema.isMinLength(1)),
   ),
+  /** Only reports whose window starts at or after the newest daily's end; all of them before the first daily. */
+  sinceLatest: Schema.optionalKey(Schema.Literals(["daily"])),
   // --- end views additions ---
 });
 export const ViewQuerySort = Schema.Literals(["updated-desc", "created-desc", "rank", "due"]);
@@ -631,7 +635,10 @@ export const VIEW_SOURCE_LIMITS = {
   rows: 500,
   outputBytes: 2_000_000,
   textChars: 2_000,
-  longTextChars: 20_000,
+  /** Matches `VIEW_HARD_LIMITS.longTextChars`; these load on open, not with the section. */
+  longTextChars: 400_000,
+  /** What a longtext keeps when it rides inline, for clients that cannot load it on open. */
+  inlineLongTextChars: 20_000,
   links: 10,
   maxTimeoutSeconds: 60,
   minRefreshMinutes: 5,
@@ -754,6 +761,7 @@ export const VIEW_QUERY_FILTERS = {
   flag: ["approval", "draft"],
   requestedBy: ["approval", "draft"],
   reportKind: ["report"],
+  sinceLatest: ["report"],
 } as const satisfies Record<keyof typeof ViewQueryWhere.Type, ReadonlyArray<ViewQueryKind>>;
 
 /** Sorts that only some kinds take; the rest sort every kind. Reports read newest first either way. */
@@ -1829,6 +1837,10 @@ export const VIEW_ASSET_LIMITS = {
 export const ViewSectionRow = Schema.Struct({
   ref: MissionRecordRef,
   value: Schema.Record(Schema.String, Schema.Unknown),
+  /** Script longtext fields left out of `value`, to load with `missions.views.longText`. */
+  deferred: Schema.optionalKey(
+    Schema.Array(ViewSourceFieldName).check(Schema.isMaxLength(VIEW_SOURCE_LIMITS.fields)),
+  ),
 });
 export type ViewSectionRow = typeof ViewSectionRow.Type;
 export const ViewSectionData = Schema.Struct({
@@ -1842,7 +1854,10 @@ export type ViewSectionData = typeof ViewSectionData.Type;
 export const ViewLongTextInput = Schema.Struct({
   missionId: MissionId,
   ref: MissionRecordRef,
-  path: ViewKey,
+  /** A report path, or a script's field name for a `source-row` ref. */
+  path: ViewSourceFieldName,
+  /** The script whose last good run holds a `source-row` ref. */
+  sourceId: Schema.optionalKey(ViewDataSourceId),
 });
 export type ViewLongTextInput = typeof ViewLongTextInput.Type;
 export const ViewLongText = Schema.Struct({
@@ -1998,7 +2013,11 @@ export const ViewPreview = Schema.Struct({
 });
 export type ViewPreview = typeof ViewPreview.Type;
 
-export const MissionViewsInput = Schema.Struct({ missionId: MissionId });
+export const MissionViewsInput = Schema.Struct({
+  missionId: MissionId,
+  /** The client loads script longtext on open; without it those values ride inline, cut short. */
+  deferLongText: Schema.optionalKey(Schema.Boolean),
+});
 export type MissionViewsInput = typeof MissionViewsInput.Type;
 
 export const MissionViewsSnapshot = Schema.Struct({
@@ -2137,7 +2156,7 @@ const NODE_SIGNATURES: ReadonlyArray<{ tag: ViewNodeTag; signature: string; wher
   {
     tag: "collapsible",
     signature:
-      "{title: text bind|null, label?: ≤24 chars, meta: ≤3 binds, open: none|first, children: 1..6 nodes}",
+      "{title: text bind|null, label?: ≤24 chars, meta: ≤3 binds, open: none|first, openCount?: 0..20, children: 1..6 nodes}",
     where:
       "templates, sections (one per row; its children bind that row; no list, table or collapsible inside)",
   },

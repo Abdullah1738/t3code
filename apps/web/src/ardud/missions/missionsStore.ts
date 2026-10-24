@@ -12,7 +12,6 @@ import type {
   RoomPage,
   Rule,
   SuggestionStats,
-  ViewLongTextInput,
 } from "@t3tools/contracts";
 import {
   createAtomMissionsTransport,
@@ -43,6 +42,7 @@ import {
   type PortfolioSnapshot,
   type RecoveryIncident,
   type SnapshotStore,
+  type ViewLongTextRequest,
 } from "@t3tools/client-runtime/ardud/missions";
 
 import { connectionAtomRuntime } from "../../connection/runtime";
@@ -156,18 +156,17 @@ export function useMissionViews(missionId: MissionId): MissionViewsState | null 
 const longTexts = createViewLongTexts((input) => missionsSource.loadLongText(input));
 
 /** A long row value (a report's text), loaded once its block shows; undefined until asked. */
-export function useViewLongText(input: ViewLongTextInput | null): ViewLongTextState | undefined {
+export function useViewLongText(input: ViewLongTextRequest | null): ViewLongTextState | undefined {
   const key = input === null ? null : viewLongTextKey(input);
   const state = useSyncExternalStore(longTexts.subscribe, () =>
     key === null ? undefined : longTexts.get(key),
   );
-  useEffect(() => {
-    if (input !== null) longTexts.request(input);
-  }, [input]);
+  // Held while shown, so a value on screen never drops out of the store.
+  useEffect(() => (input === null ? undefined : longTexts.hold(input)), [input]);
   return state;
 }
 
-export function retryViewLongText(input: ViewLongTextInput): void {
+export function retryViewLongText(input: ViewLongTextRequest): void {
   longTexts.request(input, { retry: true });
 }
 // --- end views additions ---

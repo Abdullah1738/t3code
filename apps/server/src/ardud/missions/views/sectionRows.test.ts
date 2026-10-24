@@ -307,6 +307,136 @@ describe("report sections", () => {
     ),
   );
 
+  it.effect("shows the last seven dailies and only the updates since the newest one", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        for (let day = 10; day <= 17; day++) {
+          yield* report(
+            "daily",
+            `2026-10-${day}T04:30:00.000Z`,
+            `2026-10-${day + 1}T04:30:00.000Z`,
+            `# Daily ${day + 1}`,
+          );
+        }
+        for (const [from, to] of [
+          ["2026-10-18T00:30:00.000Z", "2026-10-18T04:30:00.000Z"],
+          ["2026-10-18T04:30:00.000Z", "2026-10-18T08:30:00.000Z"],
+          ["2026-10-18T08:30:00.000Z", "2026-10-18T12:30:00.000Z"],
+        ] as const) {
+          yield* report("update", from, to, `# Update ${to}`);
+        }
+        const views = yield* ViewService;
+        const week = reportSection("week", ["daily"], 7);
+        const dailies = yield* views.placeSection(ownerApp, {
+          ...week,
+          definition: { ...week.definition, body: [{ ...folded, open: "none", openCount: 3 }] },
+        });
+        const since = reportSection("since", ["update"], 8);
+        const updates = yield* views.placeSection(ownerApp, {
+          ...since,
+          definition: {
+            ...since.definition,
+            source: {
+              _tag: "query",
+              query: {
+                kind: "report",
+                where: { reportKind: ["update"], sinceLatest: "daily" },
+                sort: "created-desc",
+                limit: 8,
+              },
+            },
+          },
+        });
+        const rowsOf = (sectionId: string) =>
+          views
+            .snapshot(missionId)
+            .pipe(
+              Effect.map((snapshot) =>
+                snapshot.sectionData?.find((data) => data.sectionId === sectionId),
+              ),
+            );
+
+        const week1 = yield* rowsOf(dailies.ref.id);
+        assert.equal(week1?.total, 8);
+        assert.deepEqual(
+          week1?.rows.map((row) => row.value.title),
+          ["Daily 18", "Daily 17", "Daily 16", "Daily 15", "Daily 14", "Daily 13", "Daily 12"],
+        );
+        const since1 = yield* rowsOf(updates.ref.id);
+        assert.equal(since1?.total, 2);
+        assert.deepEqual(
+          since1?.rows.map((row) => row.value.period),
+          ["18 Oct 08:30–12:30 UTC", "18 Oct 04:30–08:30 UTC"],
+        );
+
+        yield* report(
+          "daily",
+          "2026-10-18T04:30:00.000Z",
+          "2026-10-19T04:30:00.000Z",
+          "# Daily 19",
+        );
+        const week2 = yield* rowsOf(dailies.ref.id);
+        assert.equal(week2?.rows[0]?.value.title, "Daily 19");
+        assert.equal(week2?.rows.length, 7);
+        const since2 = yield* rowsOf(updates.ref.id);
+        assert.equal(since2?.total, 0);
+        assert.deepEqual(since2?.rows, []);
+      }),
+    ),
+  );
+
+  it.effect("before the first daily every update counts as since the latest", () =>
+    fresh(
+      Effect.gen(function* () {
+        yield* seed;
+        yield* report("update", "2026-10-21T00:00:00.000Z", "2026-10-21T04:00:00.000Z", "# Up");
+        const views = yield* ViewService;
+        const base = reportSection("since", ["update"], 8);
+        const placed = yield* views.placeSection(ownerApp, {
+          ...base,
+          definition: {
+            ...base.definition,
+            source: {
+              _tag: "query",
+              query: {
+                kind: "report",
+                where: { reportKind: ["update"], sinceLatest: "daily" },
+                sort: "created-desc",
+                limit: 8,
+              },
+            },
+          },
+        });
+        const snapshot = yield* views.snapshot(missionId);
+        const rows = snapshot.sectionData?.find((data) => data.sectionId === placed.ref.id);
+        assert.equal(rows?.total, 1);
+        const misplaced = yield* views.preview({
+          missionId,
+          definition: {
+            _tag: "section",
+            definition: {
+              ...releaseTrain.definition,
+              source: {
+                _tag: "query",
+                query: {
+                  kind: "work-item",
+                  where: { sinceLatest: "daily" },
+                  sort: "updated-desc",
+                  limit: 5,
+                },
+              },
+            },
+          },
+        });
+        assert.deepEqual(
+          misplaced.issues.map((issue) => issue.path),
+          ["source.query.where.sinceLatest"],
+        );
+      }),
+    ),
+  );
+
   it.effect("a new day boundary relabels the report rows of an open view", () =>
     fresh(
       Effect.gen(function* () {

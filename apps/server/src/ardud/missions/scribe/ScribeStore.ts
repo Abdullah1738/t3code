@@ -340,12 +340,13 @@ export class ScribeStore extends Context.Service<
     readonly saveReport: (report: ReportWrite) => Effect.Effect<void, ScribeStoreError>;
     /**
      * Current reports, newest first by the end of the window, without the text;
-     * `total` counts every current match.
+     * `total` counts every current match. `since` keeps windows starting at or after it.
      */
     readonly listReports: (
       missionId: string,
       kinds: ReadonlyArray<ReportKind>,
       limit: number,
+      since?: string,
     ) => Effect.Effect<
       { readonly rows: ReadonlyArray<ReportSummary>; readonly total: number },
       ScribeStoreError
@@ -633,9 +634,10 @@ const make = Effect.gen(function* () {
     writeReport(report).pipe(Effect.tap(() => announceReport(report.missionId)));
 
   const listReports = Effect.fn("ScribeStore.listReports")(
-    function* (missionId: string, kinds: ReadonlyArray<ReportKind>, limit: number) {
+    function* (missionId: string, kinds: ReadonlyArray<ReportKind>, limit: number, since?: string) {
       if (kinds.length === 0) return { rows: [], total: 0 };
-      const where = sql`r.mission_id = ${missionId} AND r.kind IN ${sql.in(kinds)} AND ${isCurrent}`;
+      const where = sql`r.mission_id = ${missionId} AND r.kind IN ${sql.in(kinds)} AND ${isCurrent}
+        ${since === undefined ? sql`` : sql`AND r.covers_from >= ${since}`}`;
       const rows = yield* sql<{
         readonly report_id: string;
         readonly kind: string;

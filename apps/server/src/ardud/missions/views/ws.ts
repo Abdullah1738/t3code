@@ -127,7 +127,7 @@ export const makeViewsWsHandlers = (
         const subscription = yield* store.subscribe;
         const reports = yield* views.reportSaves;
         const sourceRuns = yield* views.sourceChanges;
-        const first = yield* views.snapshot(input.missionId);
+        const first = yield* views.snapshot(input.missionId, input);
         // A saved report is not a store commit, so it arrives as its own tick.
         const reportSaved = Stream.fromSubscription(reports).pipe(
           Stream.filter((missionId) => missionId === input.missionId),
@@ -161,7 +161,7 @@ export const makeViewsWsHandlers = (
                   return [state, []] as const;
                 }
                 if (tick._tag === "source-ran") {
-                  const snapshot = yield* views.snapshot(input.missionId);
+                  const snapshot = yield* views.snapshot(input.missionId, input);
                   return [
                     { snapshot, changed: state.changed },
                     [{ _tag: "snapshot", snapshot } as MissionViewsFeedItem],
@@ -169,7 +169,7 @@ export const makeViewsWsHandlers = (
                 }
                 if (tick._tag === "report-saved") {
                   if (!queriedKinds(last.sections).has("report")) return [state, []] as const;
-                  const rows = yield* views.sectionData(input.missionId, last.sections);
+                  const rows = yield* views.sectionData(input.missionId, last.sections, input);
                   if (sameSectionRows(rows, last.sectionData ?? [])) return [state, []] as const;
                   const snapshot: MissionViewsSnapshot = { ...last, sectionData: rows };
                   return [
@@ -187,14 +187,14 @@ export const makeViewsWsHandlers = (
                   return [next, []] as const;
                 }
                 if (isViewChange(item)) {
-                  const snapshot = yield* views.snapshot(input.missionId);
+                  const snapshot = yield* views.snapshot(input.missionId, input);
                   const next: MissionViewsFeedItem = { _tag: "snapshot", snapshot };
                   return [{ snapshot, changed: new Set<string>() }, [next]] as const;
                 }
                 const queried = queriedKinds(last.sections);
                 const rowsMayMove = [...state.changed].some((changed) => queried.has(changed));
                 const rows = rowsMayMove
-                  ? yield* views.sectionData(input.missionId, last.sections)
+                  ? yield* views.sectionData(input.missionId, last.sections, input)
                   : (last.sectionData ?? []);
                 const counts = yield* views.waiting(input.missionId);
                 const pinned = viewPinnedStrip(last.layout.layout, counts);
@@ -224,7 +224,7 @@ export const makeViewsWsHandlers = (
 
   return {
     [M.subscribe]: subscribe,
-    [M.get]: (input: MissionViewsInput) => views.snapshot(input.missionId),
+    [M.get]: (input: MissionViewsInput) => views.snapshot(input.missionId, input),
     [M.catalog]: (_input: Record<string, never>) => views.catalog,
     [M.history]: (input: ViewHistoryInput) => views.history(input),
     [M.preview]: (input: PreviewViewInput) => views.preview(input),
