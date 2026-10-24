@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import { findChrome, launch } from "./cdp.mjs";
 import { BUILDERS, familyOf, locate, pageDir, stopBuilders } from "./families.mjs";
 import { measure } from "./measure.mjs";
+import { checkReply } from "./reply.mjs";
 import { evaluate, KEEP, previewFindings, THEMES, VIEWS } from "./rules.mjs";
 import { sheetHtml, sheetWidth } from "./sheet.mjs";
 
@@ -17,6 +18,11 @@ const USAGE = `card-check: compact-bubble acceptance checks for Robob cards
       Build each renderer's acceptance set (all three by default) and check every case.
   card-check page DIR|index.html ... [--family ride|delivery|qcard] [--out DIR]
       Check finished card directories (a real card before you send it).
+  card-check reply [--chat SLUG] [--json] [TEXT | -]
+      Lint a chat reply before sending (text from args or stdin, no browser). FAIL means
+      structured data (codes, Wi-Fi, flight details, address with times, field lists,
+      tables): send a card plus a one-line takeaway. WARN group: a trip item in a 1:1 chat
+      goes to the owner+Moni group when both are on the trip.
 
 Options: --themes dark,light  --jobs N (6)  --json  --timeout SECONDS (300, at least 30)
 
@@ -28,7 +34,7 @@ included. Exit 0 = no FAIL, 1 = FAIL, 2 = could not run.
 Output: report.json, sheet PNGs per family, fails.png, shots/. Read the sheets.`;
 
 function parse(argv) {
-  const a = { cmd: argv[0], args: [], only: null, out: null, themes: THEMES, jobs: 6, json: false, timeout: 300, family: null };
+  const a = { cmd: argv[0], args: [], only: null, out: null, themes: THEMES, jobs: 6, json: false, timeout: 300, family: null, chat: null };
   for (let i = 1; i < argv.length; i++) {
     const v = argv[i];
     const next = () => argv[++i];
@@ -42,6 +48,7 @@ function parse(argv) {
     else if (v === "--jobs") a.jobs = Math.max(1, +next() || 6);
     else if (v === "--timeout") a.timeout = Math.max(30, +next() || 300);
     else if (v === "--family") a.family = next();
+    else if (v === "--chat") a.chat = next();
     else if (v === "--json") a.json = true;
     else if (v === "-h" || v === "--help") a.cmd = "help";
     else a.args.push(v);
@@ -191,10 +198,11 @@ async function sheets(browser, out, cases, themes) {
 
 async function main() {
   const a = parse(process.argv.slice(2));
-  if (!a.cmd || a.cmd === "help" || !["set", "page"].includes(a.cmd)) {
+  if (!a.cmd || a.cmd === "help" || !["set", "page", "reply"].includes(a.cmd)) {
     console.log(USAGE);
     process.exit(a.cmd === "help" ? 0 : 2);
   }
+  if (a.cmd === "reply") return reply(a);
   const chrome = findChrome();
   if (!chrome) throw new Error("no headless Chrome found (set CARD_CHECK_CHROME)");
   const out = a.out || join(process.env.TMPDIR || tmpdir(), "card-check", stamp());
@@ -230,6 +238,25 @@ async function main() {
     clearTimeout(deadline);
     await cleanup();
   }
+}
+
+// No browser: a text lint run on a reply before it goes out.
+async function reply(a) {
+  let text = a.args.filter((x) => x !== "-").join(" ");
+  if (!text) {
+    const chunks = [];
+    for await (const c of process.stdin) chunks.push(c);
+    text = Buffer.concat(chunks).toString("utf8");
+  }
+  if (!text.trim()) throw new Error("reply: no text (pass it as an argument or on stdin)");
+  const findings = checkReply(text, { chat: a.chat });
+  const ok = !findings.some((f) => f.level === "FAIL");
+  if (a.json) console.log(JSON.stringify({ ok, chat: a.chat, findings }));
+  else {
+    for (const f of findings) console.log(`${f.level} ${f.rule}: ${f.detail}${f.text ? ` ("${f.text}")` : ""}`);
+    console.log(ok ? "PASS: fine as text" : "FAIL: send this as a card (design it, card-check page it), plus a one-line takeaway");
+  }
+  process.exitCode = ok ? 0 : 1;
 }
 
 async function run(a, chrome, out, t0, signal, stop, scratch, setBrowser) {
