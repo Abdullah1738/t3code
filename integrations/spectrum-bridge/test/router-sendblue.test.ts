@@ -157,6 +157,14 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(owner).not.toContain("ask-owner");
 });
 
+test("other chats' prompts say who reads background replies and keep agent talk out of them", () => {
+  const moni = sendblueContextPrompt(context("dm"), false, []);
+  expect(moni).toContain("everything you write here goes to Moni, including your reply after a watcher event, background work or a subagent finishing");
+  expect(moni).toContain("Never tell them about agents, subagents, fix agents, tools, logs, the owner's thread");
+  expect(sendblueContextPrompt(context("group"), false, [])).toContain("goes to everyone in \"Friends\"");
+  expect(sendblueContextPrompt(context("owner"), false, [])).not.toContain("Who reads your replies");
+});
+
 test("only the owner's prompt sends Robob fixes to the mission as his request", () => {
   const owner = sendblueContextPrompt(context("owner"), false, []);
   expect(owner).toContain("mission request open robob");
