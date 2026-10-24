@@ -826,30 +826,29 @@ def chat_db(who):
     return base / "state.sqlite" if who == "abdullah" else base / "chats" / who / "state.sqlite"
 
 
-RETRY_WINDOW_MS = 24 * 3600 * 1000  # the bridge's own retry and fallback window
-
 # One statement is one read snapshot: the op rows, the route and the fallback marks can't be
-# read across a send or a route rotation that happens between two queries.
-OUTBOX_SQL = ("select o.id, o.state, o.attempts, o.payload, "
-              "(select value from kv where key = 'route'), "
+# read across a send or a route rotation that happens between two queries. The route comes
+# back even when none of the ops exist yet.
+OUTBOX_SQL = ("select r.route, o.id, o.state, o.attempts, o.payload, "
               "(select value from kv where key = 'firstAttempt:' || o.id), "
               "(select value from kv where key = 'fallback:' || o.id) "
-              "from outbox o where o.id in ({})")
+              "from (select (select value from kv where key = 'route') as route) r "
+              "left join outbox o on o.id in ({})")
 
 
-def op_kind(oid, state, attempts, stale, first=None, fell=None, owner=False, now_ms=None):
+def op_kind(oid, state, attempts, stale, first=None, fell=None, owner=False):
     """How a bridge outbox op stands. live: out, or still queued and deliverable; maybe: the bridge
     itself can't tell ("uncertain"), the op was cancelled or is about to be after an attempt that
-    may have reached the phone, or a failed card the owner chat's Telegram fallback can still send
-    (only the owner chat has one; it takes failed app ops inside the retry window until it marks
-    them); dead: never went (refused, or cancelled by a route rotation before any attempt)."""
+    may have reached the phone, or a failed card the owner chat's Telegram fallback may have sent
+    (only the owner chat has one; it takes failed app ops it has tried, and marks them only after
+    its own send returns, so only its "skipped" mark proves it never went); dead: never went
+    (refused, or cancelled by a route rotation before any attempt)."""
     if state in ("sent", "fallback", "sending") or (state == "pending" and not stale):
         return "live"
     if state == "uncertain" or (state in ("pending", "cancelled") and attempts):
         return "maybe"
-    now_ms = time.time() * 1000 if now_ms is None else now_ms
-    if (owner and state == "failed" and oid.startswith("app:") and fell is None
-            and isinstance(first, (int, float)) and 0 <= now_ms - first < RETRY_WINDOW_MS):
+    skipped = isinstance(fell, dict) and "skipped" in fell
+    if owner and state == "failed" and oid.startswith("app:") and not skipped and isinstance(first, (int, float)):
         return "maybe"
     return "dead"
 
@@ -862,10 +861,11 @@ def _kv(value):
 
 
 def outbox(who, ids):
-    """{id: (kind, state)} for these ops in the recipient chat's bridge store, read only; None if unreadable."""
+    """(route, {id: (kind, state)}) for these ops in the recipient chat's bridge store, read only;
+    (None, None) if unreadable."""
     db = chat_db(who)
     if not ids or not db.is_file():
-        return None
+        return None, None
     try:
         con = sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=5)
         try:
@@ -873,17 +873,21 @@ def outbox(who, ids):
         finally:
             con.close()
     except (OSError, ValueError, sqlite3.Error):
-        return None
-    out = {}
-    for oid, state, attempts, payload, route, first, fell in rows:
-        op, route = _kv(payload) or {}, _kv(route) or {}
-        if not isinstance(op, dict) or not isinstance(route, dict):
-            return None
+        return None, None
+    route, out = _kv(rows[0][0]) if rows else None, {}
+    if route is not None and not isinstance(route, dict):
+        return None, None
+    for _, oid, state, attempts, payload, first, fell in rows:
+        if oid is None:
+            continue
+        op = _kv(payload) or {}
+        if not isinstance(op, dict):
+            return None, None
         # Session-bound ops (a chat's own route) die with their route; --to ops carry no session.
         stale = (op.get("generation") is not None
-                 and (op.get("sessionId"), op.get("generation")) != (route.get("id"), route.get("generation")))
-        out[oid] = (op_kind(oid, state, attempts, stale, _kv(first), fell, owner=who == "abdullah"), state)
-    return out
+                 and (op.get("sessionId"), op.get("generation")) != ((route or {}).get("id"), (route or {}).get("generation")))
+        out[oid] = (op_kind(oid, state, attempts, stale, _kv(first), _kv(fell), owner=who == "abdullah"), state)
+    return route, out
 
 
 def refused(err):
@@ -900,41 +904,58 @@ def _ops(who, r):
     keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
     mode = (r.get("payload") or {}).get("mode")
     if not keys or not mode:
-        return keys, {}, None
-    return keys, {(k, route): op for k in keys for route, op in op_ids(who, mode, k).items()}, \
-        outbox(who, {op for k in keys for op in op_ids(who, mode, k).values()})
+        return keys, {}, None, None
+    route, states = outbox(who, {op for k in keys for op in op_ids(who, mode, k).values()})
+    return keys, {(k, via): op for k in keys for via, op in op_ids(who, mode, k).items()}, route, states
+
+
+def open_attempts(r):
+    """Bridge calls that got no answer: each may still be queued later, until something proves it can't."""
+    if "open" in r:
+        return list(r["open"])
+    # A journal from before per-attempt records: only its last attempt can still be open.
+    keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
+    if r.get("attempts") and keys and r.get("status") != "sent" and not r.get("refused"):
+        return [{"via": r.get("via"), "key": r.get("key") or keys[-1], "session": None}]
+    return []
+
+
+def waiting(r, ids, route, states):
+    """Open attempts that may still land. One that left an op is settled by that op. One on the
+    chat's own route is dead once the live route no longer takes its session: the bridge checks the
+    route when it queues, and a route never goes back to an older id or generation. Nothing settles
+    an unanswered --to request except an op, so only the same op may carry its retry."""
+    out = []
+    for a in open_attempts(r):
+        vias = [a.get("via")] if a.get("via") in ("self", "to") else ["self", "to"]
+        if any(ids.get((a.get("key"), v)) in states for v in vias):
+            continue
+        if vias == ["self"] and a.get("session") and isinstance(route, dict) and not session_matches(route, a["session"]):
+            continue
+        out.append(a)
+    return out
 
 
 def dropped(who, r):
-    """A card the bridge took and later dropped unsent: its last op is dead and nothing else is live."""
-    keys, ids, states = _ops(who, r)
+    """A card the bridge took and later dropped unsent: its last op is dead, nothing else is live,
+    and no unanswered attempt may still land."""
+    keys, ids, route, states = _ops(who, r)
     if not states:
         return False
-    if any(kind != "dead" for kind, _ in states.values()):
+    if any(kind != "dead" for kind, _ in states.values()) or waiting(r, ids, route, states):
         return False
     last = [ids.get((r.get("key") or keys[-1], r["via"]))] if r.get("via") else list(ids.values())
     return any(op in states for op in last)
-
-
-QUIET_S = 600  # a bridge request can't land this long after its CLI call (that times out in 15s)
-
-
-def quiet(r):
-    """True once the last attempt is old enough that a missing op means the bridge never took it."""
-    try:
-        return time.time() - datetime.fromisoformat(r["attempted_at"].replace("Z", "+00:00")).timestamp() > QUIET_S
-    except (KeyError, AttributeError, ValueError):
-        return False
 
 
 def standing(uuid, who, r, planned):
     """What the bridge outbox says about the earlier attempts for one recipient.
 
     Returns (outcome, key): outcome ("sent"|"failed", text) when nothing may be sent now, else None
-    and the key the send on the planned route ("self"|"to") must use. An earlier attempt that left
-    no op and no clear refusal may still land, so only the same route and key (the same bridge op)
-    can carry its retry; a dead or refused op lets any route go again on a key it never used."""
-    keys, ids, states = _ops(who, r)
+    and the key the send on the planned route ("self"|"to") must use. An earlier attempt that may
+    still land can only be retried as the same bridge op (same route and key); once every attempt
+    is settled, a dead op lets any route go again on a key it never used."""
+    keys, ids, route, states = _ops(who, r)
     sent = r.get("status") == "sent"
     fresh = lambda: (keys[-1] if ids.get((keys[-1], planned)) not in (states or {})
                      else f"uber:{uuid}:card:{who}:{len(keys) + 1}")
@@ -960,18 +981,20 @@ def standing(uuid, who, r, planned):
             return ("sent", f"already sent (bridge: {', '.join(sorted(seen['maybe']))})"), None
         return ("failed", f"failed: an earlier attempt may have reached {who} (bridge: "
                           f"{', '.join(sorted(seen['maybe']))}); check the chat before sending again"), None
+    held = waiting(r, ids, route, states)
+    if held:
+        ops = {(a.get("key"), a.get("via")) for a in held}
+        if len(ops) == 1 and next(iter(ops))[1] == planned:
+            return None, held[0]["key"]
+        gone = {"to": "over the owner chat", "self": "from that chat itself"}.get(held[-1].get("via"), "by another route")
+        return ("failed", f"failed: an earlier attempt for {who} went {gone}, got no answer and may still land; "
+                          "retry the same way, or check the chat first"), None
     last_key, last_via = r.get("key") or keys[-1], r.get("via")
     last = [ids[(last_key, last_via)]] if last_via in ("self", "to") else [ids[(last_key, v)] for v in ("self", "to")]
     if any(op in states for op in last):
         return None, fresh()  # the bridge took the last one and dropped it unsent
     if sent:
         return ("sent", "already sent"), None  # nothing shows it was lost
-    if r.get("attempts") and not r.get("refused") and not quiet(r):
-        if last_via != planned:
-            gone = {"to": "over the owner chat", "self": "from that chat itself"}.get(last_via, "by another route")
-            return ("failed", f"failed: the last attempt for {who} went {gone} and may still land; "
-                              "retry the same way, or check the chat first"), None
-        return None, last_key
     return None, fresh()
 
 
@@ -1070,7 +1093,6 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                 r.update(status="sent", sent_at=r.get("sent_at") or iso(time.time()), error=None)
                 _save_journal(uuid, j)
             continue
-        sending = False
         try:
             if "payload" not in r:
                 if dry_run:
@@ -1097,32 +1119,52 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                 result[who] = f"would send {r['payload']['mode']} {r['payload']['url']}{where}"
                 continue
             keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
+            r["open"] = open_attempts(r)
             for attempt in (1, 2):
                 # On disk before the bridge call, so a cut process is reconciled from the outbox next time.
                 if key not in keys:
                     keys.append(key)
+                entry = {"via": via, "key": key, "session": session, "at": iso(time.time())}
+                r["open"].append(entry)
                 r.update(key=key, keys=keys, via=via, status="attempting", attempts=r.get("attempts", 0) + 1,
-                         attempted_at=iso(time.time()), refused=False)
+                         attempted_at=entry["at"])
                 _save_journal(uuid, j)
-                sending = True
                 try:
-                    deliver(uuid, who, r["payload"], session, to, key)
-                    break
+                    ack = deliver(uuid, who, r["payload"], session, to, key)
                 except Exception as ex:
+                    if refused(str(ex)):
+                        r["open"].remove(entry)  # the bridge said no to this one: it queued nothing
                     if attempt == 1 and who == "abdullah" and to and no_to(str(ex)):
-                        # An older bridge: nothing was queued, and from the owner session the owner's
-                        # own route reaches the same chat.
+                        # An older bridge. From the owner session the owner's own route reaches the
+                        # same chat, but that route may hold an earlier op under this key.
                         to, via, where = None, "self", " to this chat"
-                        r.update(no_to=True, refused=True)
+                        r["no_to"] = True
+                        outcome, key = standing(uuid, who, r, via)
+                        if outcome and outcome[0] == "failed":
+                            raise RuntimeError(outcome[1].removeprefix("failed: "))
+                        if outcome:
+                            done = outcome[1]
+                            break
                         continue
                     raise
+                r["open"] = [a for a in r["open"] if (a.get("key"), a.get("via")) != (key, via)]
+                if isinstance(ack, dict) and ack.get("created") is False:
+                    # The bridge already had this op; that is only a send if the op is still going.
+                    _, ids, _, states = _ops(who, r)
+                    had = (states or {}).get(ids.get((key, via)))
+                    if not had:
+                        raise RuntimeError("the bridge says it already had this card, but its outbox doesn't "
+                                           "show it; check the chat first")
+                    if had[0] == "dead":
+                        raise RuntimeError("the bridge already had this card under that key and dropped it; "
+                                           "send again for a fresh key")
+                done = "sent"
+                break
             r.update(status="sent", sent_at=iso(time.time()), error=None)
-            result[who] = "sent"
+            result[who] = done
         except Exception as ex:
             err = str(ex)[:300]
             r.update(status="failed", error=err)
-            if sending:
-                r["refused"] = refused(err)
             result[who] = f"failed: {err[:200]}"
             failed = True
         if not dry_run:

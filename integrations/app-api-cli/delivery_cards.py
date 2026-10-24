@@ -539,16 +539,14 @@ def op_ids(args):
     return slug, {'to': f'{kind}:{h(slug + ":" + key)}', 'self': f'{kind}:{h(key)}'}
 
 
-RETRY_WINDOW_MS = 24 * 3600 * 1000  # the bridge's own retry and fallback window
-QUIET_S = 600  # a bridge request can't land this long after its CLI call (that times out in 15s)
-
 # One statement is one read snapshot: op rows, the route and the fallback marks can't be read
-# across a send or a route rotation that lands between two queries.
-OUTBOX_SQL = ("select o.id, o.state, o.attempts, o.payload, "
-              "(select value from kv where key = 'route'), "
+# across a send or a route rotation that lands between two queries. The route comes back even
+# when none of the ops exist yet.
+OUTBOX_SQL = ("select r.route, o.id, o.state, o.attempts, o.payload, "
               "(select value from kv where key = 'firstAttempt:' || o.id), "
               "(select value from kv where key = 'fallback:' || o.id) "
-              "from outbox o where o.id in ({})")
+              "from (select (select value from kv where key = 'route') as route) r "
+              "left join outbox o on o.id in ({})")
 
 
 def _kv(value):
@@ -560,21 +558,22 @@ def _kv(value):
 
 def op_kind(oid, state, attempts, stale, first, fell, owner):
     """live: out, or queued and deliverable; maybe: the bridge can't tell, it was cancelled after
-    an attempt, or it is a failed card the owner chat's Telegram fallback can still send (only
-    the owner chat has one; it takes failed app ops inside the retry window until it marks them);
-    dead: never went."""
+    an attempt, or it is a failed card the owner chat's Telegram fallback may have sent (only the
+    owner chat has one; it takes failed app ops it has tried and marks them only after its own
+    send returns, so only its "skipped" mark proves it never went); dead: never went."""
     if state in ('sent', 'fallback', 'sending') or (state == 'pending' and not stale):
         return 'live'
     if state == 'uncertain' or (state in ('pending', 'cancelled') and attempts):
         return 'maybe'
-    if (owner and state == 'failed' and oid.startswith('app:') and fell is None
-            and isinstance(first, (int, float)) and 0 <= time.time() * 1000 - first < RETRY_WINDOW_MS):
+    skipped = isinstance(fell, dict) and 'skipped' in fell
+    if owner and state == 'failed' and oid.startswith('app:') and not skipped and isinstance(first, (int, float)):
         return 'maybe'
     return 'dead'
 
 
 def ops(args):
-    """{id: (kind, state)}: the bridge's own record of a saved send, read only.
+    """(route, {id: (kind, state)}): the chat's live route and the bridge's own record of a
+    saved send, read only.
 
     Owner cards first saved without --to sat in the owner's session-bound queue, so both of
     the owner's routes are read."""
@@ -585,12 +584,15 @@ def ops(args):
         rows = con.execute(OUTBOX_SQL.format(','.join('?' * len(wanted))), wanted).fetchall()
     finally:
         con.close()
-    out = {}
-    for oid, state, attempts, payload, route, first, fell in rows:
-        op, route = _kv(payload) or {}, _kv(route) or {}
-        stale = op.get('generation') is not None and (op.get('sessionId'), op.get('generation')) != (route.get('id'), route.get('generation'))
-        out[oid] = (op_kind(oid, state, attempts, stale, _kv(first), fell, slug == 'owner'), state)
-    return out
+    route, out = _kv(rows[0][0]) if rows else None, {}
+    live = route if isinstance(route, dict) else {}
+    for _, oid, state, attempts, payload, first, fell in rows:
+        if oid is None:
+            continue
+        op = _kv(payload) or {}
+        stale = op.get('generation') is not None and (op.get('sessionId'), op.get('generation')) != (live.get('id'), live.get('generation'))
+        out[oid] = (op_kind(oid, state, attempts, stale, _kv(first), _kv(fell), slug == 'owner'), state)
+    return route, out
 
 
 def mine(args):
@@ -598,39 +600,56 @@ def mine(args):
     return op_ids(args)[1]['to' if '--to' in args else 'self']
 
 
-def queued(args):
-    """live, maybe, taken (this exact route+key holds a dead op, so resending it would be a
-    silent no-op) or None (nothing there)."""
-    seen = ops(args)
-    kinds = {kind for kind, _ in seen.values()}
-    return next((k for k in ('live', 'maybe') if k in kinds), 'taken' if mine(args) in seen else None)
+def open_attempts(holder, field):
+    """Bridge calls that got no answer: each may still be queued later, until something proves it can't."""
+    if 'open' in holder:
+        return list(holder['open'])
+    # Saved before per-attempt records: only its last attempt can still be open.
+    args = holder.get(field)
+    return [{'args': list(args)}] if args and holder.get('status') != 'sent' and not holder.get('refused') else []
 
 
-def quiet(last):
-    at = (last or {}).get('attempted_at')
-    return isinstance(at, (int, float)) and time.time() - at > QUIET_S
+def waiting(holder, field):
+    """Open attempts that may still land. One that left an op is settled by that op. One on the
+    owner's own route is dead once the live route has another id: the bridge checks the route when
+    it queues, and an old route id never comes back. Nothing settles an unanswered --to request
+    except its op, so only the same op may carry its retry. Each is read on its own: outbox rows
+    are never deleted and route ids only move on, so a later read can't undo an earlier one."""
+    out = []
+    for a in open_attempts(holder, field):
+        args = a['args']
+        route, seen = ops(args)
+        if mine(args) in seen:
+            continue
+        if '--to' not in args and isinstance(route, dict) and args[args.index('--session') + 1] != route.get('id'):
+            continue
+        out.append(a)
+    return out
 
 
-def reconcile(args, last=None):
+def reconcile(args, holder=None, field='send_args'):
     """Args for the next attempt at a saved send, or a final status when it must not be sent again.
 
-    last holds the previous attempt (attempted_at, refused, no_to). With no op on the bridge
-    and no clear refusal, that request may still land, so until it can't only the same op
-    (route and key) carries the retry."""
-    last = last or {}
+    While an earlier attempt may still land, only that same op (route and key) carries the retry;
+    once every attempt is settled, a dead op moves on to --to owner or a fresh key."""
+    holder = holder or {}
     for _ in range(20):
-        seen = queued(args)
-        if seen == 'live':
+        _, seen = ops(args)
+        kinds = {kind for kind, _ in seen.values()}
+        if 'live' in kinds:
             return 'sent', args
-        if seen == 'maybe':
+        if 'maybe' in kinds:
             return 'failed:may_have_sent_check_chat', args
-        if seen is None and not (last.get('refused') or quiet(last)):
-            return None, args
-        moved = owner_to(args, last)
+        held = {mine(a['args']): a['args'] for a in waiting(holder, field)}
+        if len(held) > 1:
+            return 'failed:may_have_sent_check_chat', args
+        if held:
+            return None, list(next(iter(held.values())))
+        moved = owner_to(args, holder)
         if moved != args:
             args = moved
             continue
-        if seen == 'taken':
+        if mine(args) in seen:
             i = args.index('--key') + 1
             base, _, n = args[i].partition('#')
             args = [*args[:i], f'{base}#{int(n or 1) + 1}', *args[i + 1:]]
@@ -658,20 +677,41 @@ class BridgeError(ValueError):
 
 
 def attempt(holder, field, save):
-    """One bridge call for saved args, on disk first so a cut process is reconciled next time.
-    An older bridge without `app --to owner` gets the owner's own route; it queued nothing."""
+    """One bridge call for saved args, recorded on disk first so a cut process is reconciled next
+    time. Returns 'sent' or a final status. An older bridge without `app --to owner` gets the
+    owner's own route, reconciled first: that route may hold an earlier op under this key."""
+    holder['open'] = open_attempts(holder, field)
     for n in (1, 2):
-        holder.update(attempted_at=time.time(), refused=False)
+        entry = {'args': list(holder[field]), 'at': time.time()}
+        holder['open'].append(entry)
+        holder['attempted_at'] = entry['at']
         save()
         try:
-            return bridge(holder[field])
+            ack = bridge(holder[field])
         except BridgeError as exc:
-            holder['refused'] = exc.refused
+            if exc.refused:
+                holder['open'].remove(entry)  # a clear no for this request: it queued nothing
             args = holder[field]
             if n == 1 and exc.no_to and args[0] == 'app' and args[-2:] == ['--to', 'owner']:
-                holder.update({field: args[:-2], 'no_to': True})
+                holder['no_to'] = True
+                final, holder[field] = reconcile(args[:-2], holder, field)
+                if final:
+                    return final
+                holder[field] = live_session(holder[field])
                 continue
             raise
+        holder['open'] = [a for a in holder['open'] if mine(a['args']) != mine(holder[field])]
+        if not isinstance(ack.get('id'), str) or not isinstance(ack.get('created'), bool):
+            raise ValueError('card_send_bad_ack')
+        holder['bridge_id'] = ack['id']
+        if ack['created'] is False:
+            # The bridge already had this op: a send only if that op is still going.
+            had = ops(holder[field])[1].get(mine(holder[field]))
+            if not had:
+                raise ValueError('bridge_outbox_unclear')  # the same key again can't post twice
+            if had[0] == 'dead':
+                raise ValueError('bridge_had_this_key_dropped')  # the next try takes a fresh key
+        return 'sent'
 
 
 def bridge(args, timeout=12):
@@ -740,13 +780,14 @@ def sync(cfg, data, *, send=False):
             # The bridge took the send; until its outbox shows it out, a route rotation or a
             # refusal can still drop it, and then it must be sendable again.
             try:
-                seen = ops(state['send_args'])
+                _, seen = ops(state['send_args'])
+                if seen and {st for _, st in seen.values()} & {'sent', 'fallback'}:
+                    state['bridge_confirmed'] = True
+                elif (seen and {kind for kind, _ in seen.values()} == {'dead'} and mine(state['send_args']) in seen
+                      and not waiting(state, 'send_args')):
+                    state['status'] = 'failed:dropped_by_bridge'
             except (OSError, ValueError, sqlite3.Error):
-                seen = None
-            if seen and {st for _, st in seen.values()} & {'sent', 'fallback'}:
-                state['bridge_confirmed'] = True
-            elif seen and {kind for kind, _ in seen.values()} == {'dead'} and mine(state['send_args']) in seen:
-                state['status'] = 'failed:dropped_by_bridge'
+                pass  # unreadable: keep what the ack said
         if not send or settings.get('held') or settings.get('skip_send'):
             if state.get('status') != 'sent':
                 state['status'] = 'held:payment_unconfirmed' if settings.get('held') else 'skipped' if settings.get('skip_send') else state.get('status', 'not_sent')
@@ -778,6 +819,7 @@ def sync(cfg, data, *, send=False):
                         build(cfg, data, outdir=folder, url=url, public=recipient != 'owner')
                     final = None
                     if not state.get('send_args'):
+                        state['open'] = []
                         session = route()
                         dedupe = 'delivery-card:' + key
                         if recipient == 'owner':
@@ -794,10 +836,7 @@ def sync(cfg, data, *, send=False):
                     else:
                         state['send_args'] = live_session(state['send_args'])
                         state['status'] = 'attempting'
-                        ack = attempt(state, 'send_args', lambda: atomic(statepath, state))
-                        if not isinstance(ack.get('id'), str) or not isinstance(ack.get('created'), bool):
-                            raise ValueError('card_send_bad_ack')
-                        state.update(status='sent', bridge_id=ack['id'])
+                        state['status'] = attempt(state, 'send_args', lambda: atomic(statepath, state))
                 except (OSError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
                     state['status'] = 'failed:' + (str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
         # Quick-tunnel links can change after bridge restart. Report a broken
@@ -841,28 +880,23 @@ def repair_link(cfg, data):
                 state['link_health'] = 'ok'; atomic(path,state)
                 return {'status':'unchanged','url':url}
             key = 'delivery-card-repair:' + cfg['watcher'] + ':' + hashlib.sha256(url.encode()).hexdigest()[:12]
-            repair = {'status':'attempting','url':url,'args':['send','--to',recipient,'--text='+url,
+            repair = {'status':'attempting','url':url,'open':[],'args':['send','--to',recipient,'--text='+url,
                       '--session',route(),'--key',key]}
             state['repair'] = repair
             atomic(path,state)
         build(cfg,data,outdir=APPS/state['slug'],url=repair['url'],public=True)
+        final = None
         if repair.get('tried'):
-            final, repair['args'] = reconcile(repair['args'], repair)
-            if final == 'sent':
-                repair.update(status='sent')
-                state.update(url=repair['url'],link_health='ok',link_checked_at=time.time())
-                atomic(path,state)
-                return {'status':'sent','url':state['url']}
-            if final:
-                repair['status'] = final
-                atomic(path,state)
-                raise ValueError('repair_may_have_sent_check_chat')
-        repair['args'] = live_session(repair['args'])
-        repair['tried'] = True
-        ack = attempt(repair, 'args', lambda: atomic(path, state))
-        if not isinstance(ack.get('id'),str) or not isinstance(ack.get('created'),bool):
-            raise ValueError('card_send_bad_ack')
-        repair.update(status='sent',bridge_id=ack['id'])
+            final, repair['args'] = reconcile(repair['args'], repair, 'args')
+        if not final:
+            repair['args'] = live_session(repair['args'])
+            repair['tried'] = True
+            final = attempt(repair, 'args', lambda: atomic(path, state))
+        if final != 'sent':
+            repair['status'] = final
+            atomic(path,state)
+            raise ValueError('repair_may_have_sent_check_chat')
+        repair.update(status='sent')
         state.update(url=repair['url'],link_health='ok',link_checked_at=time.time())
         atomic(path,state)
         return {'status':'sent','url':state['url']}

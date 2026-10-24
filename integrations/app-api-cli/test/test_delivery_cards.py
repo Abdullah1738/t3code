@@ -48,7 +48,7 @@ class CardTests(unittest.TestCase):
                     self.queue(args, self.queue_on_fail)  # accepted, but the reply was lost
                 raise c.BridgeError(self.fail_err)
             if args[0] in ('send', 'app'):
-                self.queue(args, self.ack_state)
+                return self.queue(args, self.ack_state)
             return {'id': 'message-fixture', 'created': True}
         for name, value in (('bridge', bridge), ('route', lambda: 'fixture-session')):
             p = patch.object(c, name, value); p.start(); self.addCleanup(p.stop)
@@ -76,9 +76,20 @@ class CardTests(unittest.TestCase):
             chat = args[args.index('--to') + 1]
             oid, op = f'{args[0]}:{h(chat + ":" + key)}', {}
         else:
-            chat, oid, op = 'owner', f'{args[0]}:{h(key)}', {'sessionId': 'fixture-session', 'generation': 1}
+            chat, oid = 'owner', f'{args[0]}:{h(key)}'
+            with sqlite3.connect(self.db(chat)) as con:
+                live = json.loads(con.execute("select value from kv where key = 'route'").fetchone()[0])
+            if args[args.index('--session') + 1] != live['id']:
+                raise c.BridgeError('{"error":"Bridge request failed (HTTP 409): No chat for this session"}')
+            op = {'sessionId': live['id'], 'generation': live['generation']}
+        op['content'] = next((a for a in args if a.startswith(('--text=', 'https://'))), None)
         with sqlite3.connect(self.db(chat)) as con:
-            con.execute('insert or ignore into outbox values (?, ?, ?, ?)', (oid, json.dumps(op), state, attempts))
+            row = con.execute('select payload from outbox where id = ?', (oid,)).fetchone()
+            if row and row[0] != json.dumps(op):
+                raise c.BridgeError('{"error":"Bridge request failed (HTTP 409)"}')  # same id, other content
+            if not row:
+                con.execute('insert into outbox values (?, ?, ?, ?)', (oid, json.dumps(op), state, attempts))
+        return {'id': oid, 'created': not row}
 
     def ops(self, chat):
         with sqlite3.connect(self.db(chat)) as con:
@@ -365,12 +376,27 @@ class CardTests(unittest.TestCase):
         self.assertEqual(retry[retry.index('--key')+1], first[first.index('--key')+1] + '#2')
         self.assertEqual([x for x in retry if x.startswith('--text=')], [x for x in first if x.startswith('--text=')])
 
-    def test_outbox_reads_ops_and_route_in_one_snapshot(self):
-        self.fail_send, self.queue_on_fail = True, 'pending'
+    def legacy_owner_state(self, **fields):
+        """A card saved before owner cards moved to --to: the owner's own session-bound route, and
+        none of the per-attempt records."""
+        self.fail_send = True
         c.sync(self.owner_cfg(), self.data, send=True)
-        args = self.card_state()['send_args']
-        args = [a for i, a in enumerate(args) if a != '--to' and args[i-1] != '--to']  # a legacy self op
+        self.fail_send = False
+        path = c.ROOT/'cards/order-talabat-123.json'
+        saved = c.read(path)
+        args = [a for i, a in enumerate(saved['send_args']) if a != '--to' and saved['send_args'][i-1] != '--to']
+        saved = {k: v for k, v in saved.items() if k != 'open'}
+        saved.update(send_args=args, refused=False, **fields)
+        c.atomic(path, saved)
+        self.calls.clear()
+        return args
+
+    def test_outbox_reads_ops_and_route_in_one_snapshot(self):
+        # Only the legacy self op exists. Read across a send plus a rotation, it would look
+        # cancelled before any attempt, and the card would go out again.
+        args = self.legacy_owner_state()
         self.queue(args, 'pending')
+        self.assertEqual(self.ids('owner'), [c.mine(args)])
         real = sqlite3.connect
         db = self.db('owner')
         class Racing:
@@ -383,7 +409,7 @@ class CardTests(unittest.TestCase):
                 return type('Rows', (), {'fetchall': lambda _: rows, 'fetchone': lambda _: rows[0] if rows else None})()
             def close(self): self.con.close()
         with patch.object(c.sqlite3, 'connect', lambda *a, **k: Racing(real(*a, **k))):
-            self.assertEqual(c.queued(args), 'live')
+            self.assertEqual(c.ops(args)[1][c.mine(args)], ('live', 'pending'))
 
     def test_failed_owner_card_waits_while_the_telegram_fallback_may_send_it(self):
         self.fail_send, self.queue_on_fail = True, 'failed'
@@ -392,6 +418,9 @@ class CardTests(unittest.TestCase):
         (oid,) = self.ids('owner')
         self.kv('owner', f'firstAttempt:{oid}', int(time.time() * 1000) - 60_000)
         self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'failed:may_have_sent_check_chat')
+        # Past the bridge's 24h window, an unmarked fallback still proves nothing.
+        self.kv('owner', f'firstAttempt:{oid}', int(time.time() * 1000) - 25 * 3600 * 1000)
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'failed:may_have_sent_check_chat')
         self.kv('owner', f'fallback:{oid}', {'skipped': 1})
         self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
         first, retry = [a for a in self.calls if a[0] == 'app']
@@ -399,27 +428,52 @@ class CardTests(unittest.TestCase):
 
     def test_cut_attempt_with_no_op_keeps_its_route_and_key(self):
         # A legacy owner card's own-route request died without a reply and left nothing in the outbox
-        # yet: it can still land, so the retry is the same op, not --to owner (another op id).
-        self.fail_send = True
-        c.sync(self.owner_cfg(), self.data, send=True)
-        args = self.card_state()['send_args']
-        legacy = [a for i, a in enumerate(args) if a != '--to' and args[i-1] != '--to']
-        self.edit_state(send_args=legacy)
-        self.fail_send = False
+        # yet. An hour on it can still land (a held request has no expiry), so the retry is the same
+        # op, not --to owner (another op id).
+        self.legacy_owner_state(attempted_at=time.time() - 3600)
         self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
         self.assertNotIn('--to', [a for a in self.calls if a[0] == 'app'][-1])
         self.assertEqual(len(self.ids('owner')), 1)
 
-    def test_cut_attempt_long_past_moves_to_to_owner(self):
-        self.fail_send = True
-        c.sync(self.owner_cfg(), self.data, send=True)
-        args = self.card_state()['send_args']
-        self.edit_state(send_args=[a for i, a in enumerate(args) if a != '--to' and args[i-1] != '--to'],
-                        attempted_at=time.time() - 3600)
-        self.fail_send = False
-        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
+    def test_cut_attempt_settles_once_the_owner_route_moves_on(self):
+        self.legacy_owner_state()
+        self.store('owner', 'rotated-session', 2)  # the bridge refuses the old session from now on
+        with patch.object(c, 'route', lambda: 'rotated-session'):
+            self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
         last = [a for a in self.calls if a[0] == 'app'][-1]
         self.assertEqual(last[last.index('--to') + 1], 'owner')
+
+    def test_later_refusal_keeps_an_earlier_unanswered_attempt_open(self):
+        self.legacy_owner_state()
+        self.fail_send, self.fail_err = True, '{"error":"Bridge request failed (HTTP 503): Bridge is not ready"}'
+        self.assertTrue(c.sync(self.owner_cfg(), self.data, send=True)['status'].startswith('failed:'))
+        self.fail_send = False
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
+        apps = [a for a in self.calls if a[0] == 'app']
+        self.assertEqual(len(apps), 2)
+        self.assertNotIn('--to', apps[-1], 'the first request may still land, so only its own op retries')
+        self.assertEqual(len(self.ids('owner')), 1)
+
+    def test_older_bridge_fallback_reconciles_the_owner_route(self):
+        # The owner's own queue already holds this key, cancelled by a rotation before any attempt.
+        # Resending it there would only get created:false, so the fallback takes a fresh key.
+        args = self.legacy_owner_state()
+        self.queue(args, 'cancelled')
+        self.edit_state(send_args=c.owner_to(args), open=[])
+        self.no_to = True
+        self.assertEqual(c.sync(self.owner_cfg(), self.data, send=True)['status'], 'sent')
+        refused, sent = [a for a in self.calls if a[0] == 'app']
+        self.assertEqual(refused[-2:], ['--to', 'owner'])
+        self.assertNotIn('--to', sent)
+        self.assertEqual(sent[sent.index('--key') + 1], 'delivery-card:order-talabat-123#2')
+
+    def test_ack_for_an_op_the_bridge_already_dropped_is_not_a_send(self):
+        self.queue(['send', '--to', 'moni', '--text=https://cards.trycloudflare.com/', '--session', 'fixture-session',
+                    '--key', 'delivery-card:order-talabat-123'], 'failed')
+        self.assertEqual(c.sync(self.cfg, self.data, send=True)['status'], 'failed:bridge_had_this_key_dropped')
+        self.assertEqual(c.sync(self.cfg, self.data, send=True)['status'], 'sent')
+        retry = [a for a in self.calls if a[0] == 'send'][-1]
+        self.assertEqual(retry[retry.index('--key') + 1], 'delivery-card:order-talabat-123#2')
 
     def test_refused_send_may_move_route_right_away(self):
         self.fail_send, self.fail_err = True, '{"error":"Bridge request failed (HTTP 409): No chat for this session"}'
