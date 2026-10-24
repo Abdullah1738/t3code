@@ -24,7 +24,7 @@ This tree is the source of truth. Every change is committed and pushed to
 cd integrations/offbox/skill/scripts
 python3 -m unittest discover -s tests -p 'test_*.py'   # ~1-2 min
 OFFBOX_RULES=../heavy-rules.json python3 classify.py --test
-(cd tests && unset BUN_INSPECT && bun test classify.test.ts)
+(cd tests && unset BUN_INSPECT && bun test classify.test.ts gate-plugin.test.ts)
 cd ../.. && git commit ... && git push origin HEAD:main
 ./install.zsh --dry-run && ./install.zsh               # or: integrations/deploy.zsh offbox
 ./install.zsh --check                                   # live copy == repo, HEAD on origin
