@@ -2,6 +2,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -33,12 +34,21 @@ class AftercareTest(unittest.TestCase):
         self.calls = []
 
         def run(args, timeout=30):
+            # Like robob-watch: --replace keeps the state, a new watcher starts active.
             self.calls.append(args)
             if args[1] == 'add':
                 d = self.watchers / args[args.index('--id') + 1]
-                d.mkdir(parents=True)
-                (d / 'watcher.json').write_text('{}')
-                (d / 'state.json').write_text('{"status": "active"}')
+                if (d / 'watcher.json').exists() and '--replace' not in args:
+                    raise RuntimeError('robob-watch add failed: exists; use --replace')
+                d.mkdir(parents=True, exist_ok=True)
+                (d / 'watcher.json').write_text(json.dumps({'expires_at': args[args.index('--expires') + 1]}))
+                if not (d / 'state.json').exists():
+                    (d / 'state.json').write_text('{"status": "active"}')
+            elif args[1] == 'resume':
+                (self.watchers / args[2] / 'state.json').write_text('{"status": "active"}')
+            elif args[1] == 'remove':
+                d = self.watchers / args[2]
+                d.rename(self.tmp / f'archived-{args[2]}-{len(self.calls)}')
             return ''
         p = mock.patch.object(a, 'run', run)
         p.start()
@@ -62,12 +72,17 @@ class AftercareTest(unittest.TestCase):
         self.assertLessEqual(len(long), 48)
         self.assertRegex(long, r'^[a-z0-9][a-z0-9-]{0,47}$')
         self.assertNotEqual(long, a.case_id('amazon', '408-1234567-1234567-ABCDEFGHIK', 'follow-up'))
+        # Order ids that only differ in what the watcher id can't hold never share a case.
+        ids = {a.case_id('noon', o, 'return') for o in ('A_B', 'A-B', 'a-b', 'A.B', 'A B')}
+        self.assertEqual(len(ids), 5)
+        for cid in ids:
+            self.assertRegex(cid, r'^[a-z0-9][a-z0-9-]{0,47}$')
 
     def test_add_saves_the_case_and_registers_one_wake_watcher(self):
         code, out, _ = self.cli(*ADD, '--request', 'Moni: ok it and the return too')
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out), {'case': CID, 'status': 'open',
-                                           'next_at': '2026-10-24T09:00:00+04:00', 'watcher': True})
+                                           'next_at': '2026-10-24T09:00:00+04:00', 'watcher': 'active'})
         case = self.case()
         self.assertEqual((case['status'], case['for'], case['session']), ('open', 'moni', SESSION))
         self.assertEqual(case['deadline'], '2026-11-06T23:59:00+04:00')
@@ -77,12 +92,13 @@ class AftercareTest(unittest.TestCase):
         self.assertEqual(add[:2], ['robob-watch', 'add'])
         self.assertEqual((flag('--id'), flag('--mode'), flag('--max-fires'), flag('--session')),
                          (CID, 'wake', '0', SESSION))
-        self.assertTrue(flag('--check').endswith(f'aftercare.py check --id {CID}'))
-        self.assertEqual(a.epoch(flag('--expires')), a.epoch('2026-11-09T23:59:00+04:00'))
+        self.assertIn('--no-prime', add, 'a prime run would race the runner on the state file')
+        self.assertTrue(flag('--check').endswith(f'aftercare.py check --id {CID} --gen 1'))
+        self.assertEqual(a.epoch(flag('--expires')), a.epoch('2026-11-20T23:59:00+04:00'))
         context = flag('--context')
         for phrase in ('Never place, cancel or change an order', 'close the case with that reference',
                        'Banyantree Flat 2104', 'pickup on or after 27 Oct', 'refund to card 5542',
-                       f'--key {CID}-closed', 'Never via imsg', 'Never say it is booked or refunded'):
+                       f'--key {CID}-g1-closed', 'Never via imsg', 'Never say it is booked or refunded'):
             self.assertIn(phrase, context)
         self.assertEqual(oct_mode(self.tmp / 'aftercare' / f'{CID}.json'), 0o600)
 
@@ -104,23 +120,97 @@ class AftercareTest(unittest.TestCase):
         self.cli(*ADD)
         self.assertEqual(self.cli('update', '--id', CID, '--next-at', '2026-10-25T09:00:00+04:00',
                                   '--blocker', 'still only to 26 Oct')[0], 0)
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[-1][:2], ['robob-watch', 'add'])
+        self.assertIn('--replace', self.calls[-1])
         (self.watchers / CID / 'state.json').write_text('{"status": "expired"}')
+        self.assertIn('WATCHER EXPIRED', self.cli('list')[1])
         self.cli('update', '--id', CID, '--note', 'checked again')
         self.assertEqual(self.calls[-1][:3], ['robob-watch', 'resume', CID])
+        self.assertNotIn('WATCHER', self.cli('list')[1])
         case = self.case()
         self.assertEqual((case['blocker'], case['next_at']), ('still only to 26 Oct', '2026-10-25T09:00:00+04:00'))
         self.assertEqual([h['event'] for h in case['history']], ['opened', 'updated', 'updated'])
         self.assertIn('needs --blocker', self.cli('update', '--id', CID)[2])
 
+    def test_the_watcher_always_outlives_the_next_try_and_the_deadline(self):
+        no_deadline = ADD[:ADD.index('--deadline')]
+        no_deadline[no_deadline.index('--next-at') + 1] = '2026-12-01T09:00:00+04:00'
+        self.cli(*no_deadline)
+        expires = lambda: a.epoch(self.calls[-1][self.calls[-1].index('--expires') + 1])
+        self.assertEqual(expires(), a.epoch('2026-12-15T09:00:00+04:00'))
+        self.cli('update', '--id', CID, '--next-at', '2027-01-10T09:00:00+04:00', '--blocker', 'away')
+        self.assertEqual(expires(), a.epoch('2027-01-24T09:00:00+04:00'))
+        self.assertEqual(self.case()['watch_until'], self.calls[-1][self.calls[-1].index('--expires') + 1])
+        # A deadline the store extends moves the wake with it.
+        self.cli('update', '--id', CID, '--deadline', '2027-02-01')
+        self.assertEqual(expires(), a.epoch('2027-02-15T23:59:00+04:00'))
+        # A wake past the deadline doesn't go quiet: it says to tell Abdullah, daily, until someone acts.
+        out = a.check(CID, {}, a.epoch('2027-02-03T09:00:00+04:00'))
+        self.assertIn('has passed: tell Abdullah now', out)
+
+    def test_a_reopened_case_gets_its_own_watcher_and_completion_key(self):
+        self.cli(*ADD)
+        self.cli('drop', '--id', CID, '--reason', 'Moni is keeping it')
+        # The old watcher's removal failed: it is still on disk with the first case's context.
+        self.calls.clear()
+        self.cli(*ADD)
+        [add] = [c for c in self.calls if c[1] == 'add']
+        flag = lambda name: add[add.index(name) + 1]
+        self.assertTrue(flag('--check').endswith(f'--id {CID} --gen 2'))
+        self.assertIn(f'--key {CID}-g2-closed', flag('--context'))
+        self.assertEqual((self.case()['gen'], self.case()['armed']), (2, 2))
+        due = a.epoch('2026-10-24T09:00:00+04:00')
+        self.assertEqual(a.check(CID, {}, due, gen=1), '', 'a watcher from the dropped case stays quiet')
+        self.assertIn('Aftercare due', a.check(CID, {}, due, gen=2))
+
+    def test_a_stale_watcher_left_by_a_failed_reopen_is_shown_and_quiet(self):
+        self.cli(*ADD)
+        self.cli('drop', '--id', CID, '--reason', 'x')
+        d = self.watchers / CID
+        d.mkdir(parents=True)
+        (d / 'watcher.json').write_text('{}')
+        (d / 'state.json').write_text('{"status": "active"}')
+        with mock.patch.object(a, 'run', side_effect=RuntimeError('robob-watch add failed: boom')):
+            self.assertEqual(self.cli(*ADD)[0], 1)
+        self.assertIn('WATCHER STALE', self.cli('list')[1])
+        self.assertEqual(a.check(CID, {}, a.epoch('2026-10-24T09:00:00+04:00'), gen=1), '')
+
+    def test_one_case_file_never_serves_another_order(self):
+        self.cli(*ADD)
+        case = self.case()
+        case['order'] = 'NAEIA0072787151X'  # what a sanitizing collision would have left
+        (self.tmp / 'aftercare' / f'{CID}.json').write_text(json.dumps(case))
+        code, _, err = self.cli('update', '--app', 'noon', '--order', 'NAEIA0072787151', '--note', 'x')
+        self.assertEqual(code, 2)
+        self.assertIn('belongs to noon order NAEIA0072787151X', err)
+
+    def test_wake_context_stays_inside_the_watcher_limit(self):
+        many = [x for i in range(11) for x in ('--item', f'item {i}')]
+        self.assertIn('at most 10 --item', self.cli(*ADD, *many[2:])[2])
+        long = [x for i in range(10) for x in ('--item', f'{i} ' + 'very long item name ' * 7)]
+        self.assertEqual(self.cli(*ADD[:ADD.index('--item')], *ADD[ADD.index('--item') + 2:], *long,
+                                  '--request', 'r' * 400)[0], 0)
+        [add] = self.calls
+        self.assertLessEqual(len(add[add.index('--context') + 1]), a.CONTEXT_LIMIT)
+        self.assertIn('and 9 more', add[add.index('--context') + 1])
+        self.assertEqual(len(self.case()['items']), 10, 'the case file keeps every item')
+
     def test_a_return_closes_only_with_a_reference_and_a_pickup(self):
         self.cli(*ADD)
         self.assertIn('reference the app shows', self.cli('close', '--id', CID, '--reference', 'pending', '--pickup', 'x')[2])
+        for ref in ('null', 'N/A', '...', 'later', 'x'):
+            self.assertIn('reference the app shows', self.cli('close', '--id', CID, '--reference', ref,
+                                                              '--pickup', 'Tue 27 Oct 9-1')[2], ref)
+        for slot in ('pending', 'soon', 'tomorrow', 'TBD', 'morning'):
+            self.assertIn('booked date and window', self.cli('close', '--id', CID, '--reference', 'RT123',
+                                                             '--pickup', slot)[2], slot)
         self.assertIn('pickup slot', self.cli('close', '--id', CID, '--reference', 'RT123')[2])
         self.assertEqual(self.case()['status'], 'open')
         code, out, _ = self.cli('close', '--id', CID, '--reference', 'RT123', '--pickup', 'Tue 27 Oct 9-1')
         self.assertEqual((code, json.loads(out)['status']), (0, 'closed'))
         self.assertEqual(self.calls[-1], ['robob-watch', 'remove', CID])
+        for slot in ('2026-10-27 09:00-13:00', '27th October, morning', 'Oct 27 9am-1pm'):
+            self.assertEqual(a.pickup_slot(slot), slot)
         self.assertEqual(self.case()['closed']['pickup'], 'Tue 27 Oct 9-1')
         self.assertIn('add it again to reopen', self.cli('update', '--id', CID, '--note', 'x')[2])
 
@@ -137,7 +227,7 @@ class AftercareTest(unittest.TestCase):
         self.assertIn(CID, out)
         self.assertIn('next try Sat 24 Oct 09:00, deadline Fri 6 Nov', out)
         (self.watchers / CID / 'watcher.json').unlink()
-        self.assertIn('NO WATCHER', self.cli('list')[1])
+        self.assertIn('WATCHER MISSING', self.cli('list')[1])
         self.cli('drop', '--id', CID, '--reason', 'x')
         self.assertEqual(self.cli('list')[1].strip(), 'No open aftercare.')
         self.assertIn('dropped: x', self.cli('list', '--all')[1])
@@ -185,10 +275,29 @@ class AftercareTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('boom', err)
         self.assertEqual(self.case()['status'], 'open')
-        self.assertNotIn('session', self.case())
-        self.assertIn('NO WATCHER', self.cli('list')[1])
+        self.assertNotIn('armed', self.case())
+        self.assertIn('WATCHER MISSING', self.cli('list')[1])
         self.cli('update', '--id', CID, '--note', 'retry')
-        self.assertEqual(self.case()['session'], SESSION)
+        self.assertEqual((self.case()['session'], self.case()['armed']), (SESSION, 1))
+        self.assertNotIn('WATCHER', self.cli('list')[1])
+
+    def test_check_and_cli_writes_never_share_a_temp_file(self):
+        path = self.tmp / 'race' / 'aftercare-state.json'
+        errors = []
+
+        def writer(n):
+            try:
+                for i in range(300):
+                    a.write(path, {'writer': n, 'i': i})
+            except Exception as e:  # noqa: BLE001 - any failure is the bug
+                errors.append(e)
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ['aftercare-state.json'])
 
 
 def oct_mode(path):
