@@ -288,25 +288,34 @@ export function FoldText(props: {
   readonly lines: number;
   readonly className: string;
 }) {
-  const [open, setOpen] = useState(false);
+  const { text, lines } = props;
+  // Opening and the measured line count belong to this text: replacement text starts
+  // folded with no toggle until its copy lays out.
+  const key = `${lines}\n${text}`;
+  const [fold, setFold] = useState({ key, open: false, laidOut: 0 });
+  if (fold.key !== key) setFold({ key, open: false, laidOut: 0 });
+  const current = fold.key === key ? fold : { key, open: false, laidOut: 0 };
+  const open = current.open;
   // The hidden copy stays laid out while open, so a rotation that makes it fit drops the toggle.
-  const [cut, setCut] = useState(false);
-  const { lines } = props;
-  const measure = (event: TextLayoutEvent) => setCut(event.nativeEvent.lines.length > lines);
+  const cut = current.laidOut > lines;
+  const measure = (event: TextLayoutEvent) => {
+    const laidOut = event.nativeEvent.lines.length;
+    setFold((previous) => (previous.key === key ? { ...previous, laidOut } : previous));
+  };
   return (
     <View className="gap-1">
       <View>
         <Text selectable numberOfLines={open ? undefined : lines} className={props.className}>
-          {props.text}
+          {text}
         </Text>
-        <MeasureText text={props.text} className={props.className} onTextLayout={measure} />
+        <MeasureText text={text} className={props.className} onTextLayout={measure} />
       </View>
       {cut ? (
         <View className="items-start">
           <LinkButton
             label={open ? "Show less" : "Show all"}
             expanded={open}
-            onPress={() => setOpen(!open)}
+            onPress={() => setFold({ ...current, open: !open })}
           />
         </View>
       ) : null}

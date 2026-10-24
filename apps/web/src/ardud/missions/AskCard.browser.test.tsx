@@ -30,6 +30,13 @@ const LONG = [
   "A restart interrupts every running lane turn and background helper.",
   "Until then lanes keep the interim format.",
 ].join("\n");
+const OTHER_LONG = LONG.split("\n").toReversed().join("\n");
+const FOUR_SHORT = [
+  "Built and pushed.",
+  "Tests are green.",
+  "Needs a restart.",
+  "Lanes keep going.",
+].join("\n");
 
 const ask = (context: string): Ask => ({
   id: AskId.make("ask-1"),
@@ -72,6 +79,12 @@ const render = (record: Ask) =>
     ),
   );
 
+/** The shown context, not its hidden measuring copy. */
+const shownContext = (text: string) =>
+  [...host.querySelectorAll("p")].find(
+    (node) => node.textContent === text && node.getAttribute("aria-hidden") !== "true",
+  );
+
 const showAll = () =>
   [...host.querySelectorAll("button")].find(
     (button) => button.textContent === "Show all" || button.textContent === "Show less",
@@ -93,7 +106,7 @@ afterEach(() => {
 
 it("folds a long decision context to four lines and opens it in place with Show all", () => {
   render(ask(LONG));
-  const context = [...host.querySelectorAll("p")].find((node) => node.textContent === LONG);
+  const context = shownContext(LONG);
   expect(context).toBeDefined();
   expect(context!.className).toContain("line-clamp-4");
   expect(context!.scrollHeight).toBeGreaterThan(context!.clientHeight);
@@ -127,4 +140,31 @@ it("offers Show all once longer context arrives on the same card", () => {
   expect(showAll()).toBeUndefined();
   render(ask(LONG));
   expect(showAll()?.textContent).toBe("Show all");
+});
+
+it("offers Show all when the same box rewraps past four lines", async () => {
+  render(ask(FOUR_SHORT));
+  const context = shownContext(FOUR_SHORT)!;
+  const height = context.clientHeight;
+  expect(showAll()).toBeUndefined();
+
+  // A font swap rewraps without changing the clamped box; letter spacing does the same here.
+  host.style.letterSpacing = "40px";
+  await vi.waitFor(() => expect(showAll()?.textContent).toBe("Show all"));
+  expect(context.clientHeight).toBe(height);
+});
+
+it("folds replacement context instead of keeping the old text open", () => {
+  render(ask(LONG));
+  act(() => showAll()!.click());
+  expect(showAll()?.textContent).toBe("Show less");
+
+  render(ask(OTHER_LONG));
+  expect(shownContext(OTHER_LONG)!.className).toContain("line-clamp-4");
+  expect(showAll()?.textContent).toBe("Show all");
+  expect(showAll()!.getAttribute("aria-expanded")).toBe("false");
+
+  act(() => showAll()!.click());
+  render(ask("Needs a Robob restart."));
+  expect(showAll()).toBeUndefined();
 });

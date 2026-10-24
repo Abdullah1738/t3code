@@ -45,21 +45,22 @@ vi.mock("../../components/ui/ControlPill", () => ({ ControlPill: () => null }));
 import { FoldText } from "./parts";
 
 const TEXT = "Built and pushed in the Robob fork. It needs a signed build plus a restart.";
+const OTHER = "A restart interrupts every running lane turn and background helper.";
 
 let host: HTMLDivElement;
 let root: Root;
 
-const render = () =>
+const render = (text = TEXT) =>
   act(() =>
     root.render(
-      <FoldText text={TEXT} lines={4} className="text-[15px] leading-6 text-foreground" />,
+      <FoldText text={text} lines={4} className="text-[15px] leading-6 text-foreground" />,
     ),
   );
 
 /** The latest render of the shown text and of its hidden unclamped copy. */
 const latest = () => {
   const shown = texts.findLast(
-    (props) => props["aria-hidden"] !== true && props.children === TEXT,
+    (props) => props["aria-hidden"] !== true && [TEXT, OTHER].includes(props.children as string),
   )!;
   const copy = texts.findLast((props) => props["aria-hidden"] === true)!;
   return { shown, copy };
@@ -114,5 +115,26 @@ it("drops the toggle when the open text fits after a rotation", () => {
   layOut(6);
   act(() => toggle()!.click());
   layOut(3);
+  expect(toggle()).toBeNull();
+});
+
+it("folds replacement text again instead of keeping the old text open", () => {
+  render();
+  layOut(9);
+  act(() => toggle()!.click());
+  expect(latest().shown.numberOfLines).toBeUndefined();
+
+  render(OTHER);
+  expect(latest().shown.children).toBe(OTHER);
+  expect(latest().shown.numberOfLines).toBe(4);
+  expect(toggle()).toBeNull();
+  layOut(7);
+  expect(toggle()?.getAttribute("aria-label")).toBe("Show all");
+  expect(toggle()?.getAttribute("aria-expanded")).toBe("false");
+
+  act(() => toggle()!.click());
+  render(TEXT);
+  layOut(2);
+  expect(latest().shown.numberOfLines).toBe(4);
   expect(toggle()).toBeNull();
 });

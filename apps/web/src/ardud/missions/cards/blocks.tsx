@@ -67,24 +67,44 @@ export function TextBlock(props: { text: string; tone?: "body" | "meta"; maxLine
 /** Clamped text that opens in place with Show all, only when the clamp cuts something. */
 function FoldedText(props: { text: string; className: string; maxLines: MaxLines }) {
   const id = useId();
-  const paragraph = useRef<HTMLParagraphElement>(null);
-  const [open, setOpen] = useState(false);
-  const [cut, setCut] = useState(false);
+  const copy = useRef<HTMLParagraphElement>(null);
   const { text, maxLines } = props;
+  // Opening belongs to this text: replacement text starts folded and measured afresh.
+  const key = `${maxLines}\n${text}`;
+  const [fold, setFold] = useState({ key, open: false });
+  if (fold.key !== key) setFold({ key, open: false });
+  const open = fold.key === key && fold.open;
+  const [cut, setCut] = useState(false);
   useLayoutEffect(() => {
-    const element = paragraph.current;
-    // Measured while clamped only: the open text keeps the toggle it opened from.
-    if (open || !element) return;
-    const measure = () => setCut(element.scrollHeight > element.clientHeight + 1);
+    const element = copy.current;
+    if (!element) return;
+    // The clamped box keeps its height when a font swap or letter spacing rewraps the
+    // text, so the unclamped copy is what gets observed.
+    const measure = () => {
+      const style = getComputedStyle(element);
+      const lineHeight =
+        Number.parseFloat(style.lineHeight) || Number.parseFloat(style.fontSize) * 1.2;
+      setCut(element.offsetHeight > lineHeight * (maxLines + 0.5));
+    };
     measure();
     return observeResize(element, measure);
-  }, [open, text, maxLines]);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- New text is measured in the commit that shows it; the observer would only catch it after paint.
+  }, [text, maxLines]);
   return (
     <div className="flex min-w-0 flex-col gap-1">
-      <p id={id} ref={paragraph} className={cn(props.className, !open && CLAMP[maxLines])}>
-        {text}
-      </p>
-      {cut || open ? (
+      <div className="relative overflow-clip">
+        <p id={id} className={cn(props.className, !open && CLAMP[maxLines])}>
+          {text}
+        </p>
+        <p
+          ref={copy}
+          aria-hidden
+          className={cn(props.className, "pointer-events-none invisible absolute inset-x-0 top-0")}
+        >
+          {text}
+        </p>
+      </div>
+      {cut ? (
         <Button
           type="button"
           size="xs"
@@ -94,12 +114,12 @@ function FoldedText(props: { text: string; className: string; maxLines: MaxLines
           aria-controls={id}
           onClick={(event) => {
             if (!open) {
-              setOpen(true);
+              setFold({ key, open: true });
               return;
             }
             // Folding long text would leave the reader far below it; keep the button in view.
             const button = event.currentTarget;
-            flushSync(() => setOpen(false));
+            flushSync(() => setFold({ key, open: false }));
             button.scrollIntoView({ block: "nearest" });
           }}
         >
