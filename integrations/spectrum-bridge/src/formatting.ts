@@ -81,6 +81,9 @@ export function formatText(raw: string): FormattedText {
   return { text: output, formatting };
 }
 
+/** Longest bubble delivery sends; longer text goes out in several. */
+export const BUBBLE_CHARS = 3_500;
+
 /** Splits at code point boundaries and clips formatting into chunk-relative UTF-16 ranges. */
 export function splitFormatted(value: FormattedText, size: number): FormattedText[] {
   const characters = Array.from(value.text);

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { IMessageError } from "@photon-ai/advanced-imessage/grpc";
-import { formatText, isSingleUrl, splitFormatted, stripInternalText } from "./formatting.ts";
+import { BUBBLE_CHARS, formatText, isSingleUrl, splitFormatted, stripInternalText } from "./formatting.ts";
 import { classifySendFailure, isEffect, type Photon, type PollResult } from "./photon.ts";
 import { rememberUnmatchedPoll } from "./poll-match.ts";
 import type { OutboxRecord, PollRecord, Store } from "./store.ts";
@@ -276,7 +276,7 @@ export class Delivery {
       if (!backlogDue && (this.store.get<number>(`retry:${item.id}`) ?? 0) > Date.now()) continue;
 
       // Split after stripping markup so every chunk carries its own native ranges.
-      const chunks = splitFormatted(formatText(item.text.trim() ? item.text : ""), 3_500);
+      const chunks = splitFormatted(formatText(item.text.trim() ? item.text : ""), BUBBLE_CHARS);
       const app = item.app && sanitizeApp(item.app);
       // Nothing but leaked metadata: never send an empty bubble or a blank card.
       if ((!chunks.length && !item.attachment && !item.poll && !item.app) || (item.app && !app)) {
