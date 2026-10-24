@@ -96,6 +96,39 @@ def fail(code):
     raise JournalError(code)
 
 
+class PaymentError(JournalError):
+    """A payment that went out and didn't confirm. `details` says whether a no-charge is
+    proven, what the person may be told, and the safe next steps; the CLI prints them."""
+
+    def __init__(self, code, details):
+        super().__init__(code)
+        self.details = details
+
+
+def payment_fail(code, *, flow_id, order, amount_minor, proven=False, waiting=False):
+    """Stop on an unconfirmed payment. Only the provider's own no-capture proof makes it
+    "not charged": a decline or a timeout alone can still show up as a charge (a 3DS
+    approval that lands late, a hold the bank keeps), so the person isn't told otherwise."""
+    amount = f'AED {amount_minor / 100:.2f}' if isinstance(amount_minor, int) else 'the order'
+    if proven:
+        tell = f'The payment for {amount} didn\'t go through, and the store confirms nothing was captured.'
+        steps = ['nothing to reconcile; a new order is a new purchase and needs its own go']
+    elif waiting:
+        tell = (f'The payment for {amount} is still waiting on the bank. '
+                'I can\'t say yet whether the card was charged.')
+        steps = ['check ENBD X for a pending approval or a charge SMS',
+                 f'commerce await-payment {flow_id} (status only, never resends)',
+                 f'commerce reconcile-order {flow_id} (closes only with the store\'s no-capture proof)']
+    else:
+        tell = (f'The payment for {amount} didn\'t go through. '
+                'I can\'t say yet whether the card was charged; checking.')
+        steps = ['check ENBD X / the bank SMS for a charge or a hold',
+                 f'commerce reconcile-order {flow_id} (closes only with the store\'s no-capture proof)']
+    raise PaymentError(code, {'flow_id': flow_id, 'order': order, 'amount_minor': amount_minor,
+                              'charge': 'not_charged' if proven else 'unknown', 'tell': tell,
+                              'next': steps + ['never re-place or resend this payment']})
+
+
 def digest(value):
     """Canonical private input -> binding. The input is never written."""
     try:
@@ -761,6 +794,34 @@ def completed_order_binding(*, app, vertical, account_hash, order_id):
             "WHERE o.app=? AND o.account_hash=? AND o.order_id=? AND f.vertical=? AND f.state='COMPLETE'",
             (app, account_hash, order_id, vertical)).fetchone()
         return {'flow_id': row['id'], 'scope_hash': row['scope_hash']} if row is not None else None
+
+
+def open_payments(*, since_seconds=1800, now=None):
+    """Flows with a payment send in the window that haven't closed, newest first. Read only.
+
+    A bank prompt (ENBD X 3DS) that shows up while one of these is listed is ours."""
+    now = time.time() if now is None else now
+    path = ROOT / 'journal.sqlite'
+    if not path.is_file():
+        return []
+    # Not _db(): its BEGIN IMMEDIATE would make the live payment's own journal calls (timeout=0)
+    # fail while this runs, and this is read exactly while a payment waits on the bank.
+    db = sqlite3.connect(f'{path.absolute().as_uri()}?mode=ro', uri=True, timeout=5)
+    try:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT f.id, f.app, f.vertical, f.state, f.order_id, f.reserved_minor, "
+            "MAX(o.created_at) AS sent_at FROM flows f JOIN operations o ON o.flow_id=f.id "
+            "WHERE o.kind IN ('place','payment','preauthorize','prepay') "
+            "AND f.state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') "
+            "GROUP BY f.id HAVING sent_at >= ? ORDER BY sent_at DESC", (now - since_seconds,)).fetchall()
+    except sqlite3.Error:
+        fail('JOURNAL_BUSY_OR_UNAVAILABLE')
+    finally:
+        db.close()
+    return [{'flow_id': r['id'], 'app': r['app'], 'vertical': r['vertical'], 'state': r['state'],
+             'order_id': r['order_id'], 'amount_minor': r['reserved_minor'],
+             'sent_seconds_ago': round(now - r['sent_at'])} for r in rows]
 
 
 def flow_created_at(flow_id):

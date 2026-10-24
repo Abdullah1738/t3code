@@ -2,6 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import contextlib
+import json
 import io
 from unittest.mock import patch
 
@@ -310,15 +311,22 @@ class MinutesOrderTests(unittest.TestCase):
         import commerce_minutes as cm
         with patch.object(cm,'MinutesFlow') as flow, \
                 patch.object(c.journal,'binding',return_value={'app':'noon','vertical':'minutes'}), \
+                patch.object(c.journal,'payment_reported',return_value=False), \
                 patch.object(cm,'telegram_3ds_notify',return_value={'notified':True}) as notify, \
-                contextlib.redirect_stdout(io.StringIO()):
-            flow.resume_payment.return_value.review={'order':'IAEGA123'}
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            flow.resume_payment.return_value.flow_id='flow'
+            flow.resume_payment.return_value.review={'order':'IAEGA123','amount':1725}
             flow.resume_payment.return_value.await_payment.return_value={
                 'paid':False,'payment_status':'payment_pending',
                 'transaction_status':'CREATED','polls':1,'timed_out':True}
             self.assertEqual(c.main(['await-payment','flow','--no-notify']),1)
         flow.resume_payment.assert_called_once_with('flow')
+        flow.resume_payment.return_value.await_payment.assert_called_once_with(notify=None,wait_seconds=600.0)
         notify.assert_not_called()
+        # Unconfirmed is never reported as uncharged.
+        result=json.loads(output.getvalue().strip().splitlines()[-1])
+        self.assertEqual((result['error'],result['charge']),('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY','unknown'))
+        self.assertIn('AED 17.25 is still waiting on the bank',result['tell'])
 
     def test_release_flow_is_minutes_only_and_evidence_gated(self):
         import json

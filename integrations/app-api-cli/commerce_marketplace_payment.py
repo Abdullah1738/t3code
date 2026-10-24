@@ -31,6 +31,29 @@ def telegram_3ds_notify(order, total_minor):
     return {'queued': queued, 'key': key}
 
 
+STALL_SECONDS = 300
+
+
+def telegram_stall_notify(order, total_minor):
+    """Second, separate alert when a sent payment has neither confirmed nor failed in 5 min."""
+    key = f'noon-marketplace-stall-{order}'
+    text = (f"noon AED {total_minor / 100:.2f} still not confirmed after 5 min. If ENBD X has "
+            "a prompt, approve it. No prompt: check noon > Orders before ordering in the app, "
+            "this one can still go through.")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ('NODE_OPTIONS', 'BUN_OPTIONS', 'BUN_INSPECT')}
+    command = [str(Path.home() / '.bun/bin/bun'),
+               str(Path.home() / '.local/share/telegram-bridge/src/cli.ts'), 'notify',
+               '--source', 'Noon payment', '--severity', 'attention',
+               '--text', text, '--key', key]
+    try:
+        queued = subprocess.run(command, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        queued = False
+    return {'queued': queued, 'key': key}
+
+
 class MarketplacePayment:
     vertical = None
 
@@ -62,31 +85,41 @@ class MarketplacePayment:
         journal.observe(self.flow_id, self._financial_operation(), outcome=outcome,
                         evidence_hash=response.digest, order_id=self.order)
 
+    def _payment_fail(self, code, **kind):
+        journal.payment_fail(self.vertical.upper() + code, flow_id=self.flow_id, order=self.order,
+                             amount_minor=self.review['payable_minor'], **kind)
+
     def await_success(self, *, attempts=300, sleep=time.sleep, timeout=25,
-                      wait_seconds=600, clock=time.monotonic, notify=telegram_3ds_notify):
+                      wait_seconds=600, clock=time.monotonic, notify=telegram_3ds_notify,
+                      stall_notify=telegram_stall_notify):
         if not math.isfinite(wait_seconds) or not 0 < wait_seconds <= 600:
             journal.fail('MARKETPLACE_PAYMENT_WAIT_INVALID')
         if self.order is None:
             journal.fail('MARKETPLACE_ORDER_REQUIRED')
-        end = clock() + wait_seconds
-        notified = False
-        notification_attempts = 0
-        next_notification = 0
+        if notify is None:
+            stall_notify = None  # --no-notify silences both alerts
+        start = clock()
+        end = start + wait_seconds
+        alerts = {}
 
-        def alert():
-            nonlocal notified, notification_attempts, next_notification
-            if notified or notify is None or notification_attempts >= 6 or clock() < next_notification:
+        def alert(phase, send):
+            # One queued alert per phase; a failed send retries with backoff, at most 6 times.
+            sent = alerts.setdefault(phase, {'queued': False, 'attempts': 0, 'next': 0})
+            if sent['queued'] or send is None or sent['attempts'] >= 6 or clock() < sent['next']:
                 return
-            notification_attempts += 1
-            result = notify(self.order, self.review['payable_minor'])
-            notified = result.get('queued') is True
-            next_notification = clock() + min(30, 2 ** notification_attempts)
-            print(json.dumps({'phase': 'owner_3ds_notified', 'notify': result}), flush=True)
+            sent['attempts'] += 1
+            result = send(self.order, self.review['payable_minor'])
+            sent['queued'] = result.get('queued') is True
+            sent['next'] = clock() + min(30, 2 ** sent['attempts'])
+            print(json.dumps({'phase': phase, 'notify': result}), flush=True)
 
         last = None
         for _ in range(attempts):
             if clock() >= end:
                 break
+            if clock() - start >= STALL_SECONDS:
+                # Neither confirmed nor failed for 5 minutes: he hears it, with the safe fallback.
+                alert('payment_stalled', stall_notify)
             response = self.client.call('order_status', order=self.order,
                                         timeout=min(timeout, end - clock()))
             data = response.data
@@ -104,9 +137,11 @@ class MarketplacePayment:
                     closed = reconcile(self.flow_id, client=self.client)
                     print(json.dumps({'phase': 'payment_failed', **closed}), flush=True)
                 except Exception:
+                    closed = {}
                     print(json.dumps({'phase': 'payment_failed', 'flow_id': self.flow_id,
                                       'disposition': 'retain_fence_and_reservation'}), flush=True)
-                journal.fail(self.vertical.upper() + '_PAYMENT_ERROR_NO_RETRY')
+                self._payment_fail('_PAYMENT_ERROR_NO_RETRY',
+                                   proven=closed.get('provider_no_charge_proven') is True)
             if status == 'success':
                 if (not isinstance(data.get('shipments'), list) or not data['shipments']
                         or market.fils(data.get('total')) != self.review['payable_minor']):
@@ -149,17 +184,17 @@ class MarketplacePayment:
                     self._payment_observation('PAYMENT_FAILED', payment)
                     # Order cancellation/refund propagation can lag payment status.
                 if state in ('pending', 'challenge_required') or summary['has_redirect']:
-                    alert()
+                    alert('owner_3ds_notified', notify)
             elif (status == 'pending' and not secret
                   and (self._financial_operation() != 'place'
                        or data.get('statusMessage') == 'Payment pending'
                        or data.get('redirect_url'))):
-                alert()
+                alert('owner_3ds_notified', notify)
             sleep(max(0, min(2, end - clock())))
         journal.observe(self.flow_id, self._financial_operation(), outcome='UNKNOWN',
                         evidence_hash=journal.digest({'order': self.order, 'payment_wait_elapsed': True}),
                         order_id=self.order)
-        journal.fail(self.vertical.upper() + '_PAYMENT_WINDOW_ELAPSED_NO_RETRY')
+        self._payment_fail('_PAYMENT_WINDOW_ELAPSED_NO_RETRY', waiting=True)
 
     def confirm_paid(self):
         if not journal.payment_reported(self.flow_id):

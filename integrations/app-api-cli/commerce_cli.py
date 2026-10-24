@@ -313,8 +313,7 @@ def order_minutes(args):
         'authorized_minor':paid.get('authorized_minor'),'polls':paid['polls'],
         'timed_out':paid['timed_out']}),flush=True)
     if not paid['paid']:
-        journal.fail('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY' if paid['timed_out']
-                     else 'MINUTES_PAYMENT_FAILED_NO_RETRY')
+        minutes_payment_fail(flow,paid)
     tracking=flow.verify_tracking()
     registration=flow.register_tracker(args.label,recipient=args.recipient)
     journal.complete(flow.flow_id)
@@ -476,6 +475,14 @@ def order_supermall(args):
             'financial_retry': False}
 
 
+def minutes_payment_fail(flow,paid):
+    # No Minutes read proves a no-capture, so a failed or unconfirmed payment is never "not charged".
+    journal.payment_fail('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY' if paid['timed_out']
+                         else 'MINUTES_PAYMENT_FAILED_NO_RETRY',flow_id=flow.flow_id,
+                         order=flow.review.get('order'),amount_minor=flow.review.get('amount'),
+                         waiting=bool(paid['timed_out']))
+
+
 def await_payment_flow(args):
     """Restart-safe status-only continuation of a consumed, unconfirmed payment.
 
@@ -519,8 +526,7 @@ def await_payment_flow(args):
         'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
         'polls':paid['polls'],'timed_out':paid['timed_out']}),flush=True)
     if not paid['paid']:
-        journal.fail('MINUTES_PAYMENT_WINDOW_ELAPSED_NO_RETRY' if paid['timed_out']
-                     else 'MINUTES_PAYMENT_FAILED_NO_RETRY')
+        minutes_payment_fail(flow,paid)
     tracking=flow.verify_tracking()
     if not flow.review.get('eta') and tracking.get('eta'):
         flow.review['eta']=tracking['eta']
@@ -881,6 +887,9 @@ def main(argv=None):
         discovery.add_argument('--branch',type=int,required=True)
         if name=='choices':discovery.add_argument('--item',type=int,required=True)
     inspect=commands.add_parser('inspect');inspect.add_argument('flow_id')
+    open_flows=commands.add_parser('open-flows',
+        help='Read-only: unsettled payments sent recently. A bank/3DS prompt while one is listed is ours')
+    open_flows.add_argument('--minutes',type=float,default=30.0)
     recover=commands.add_parser('recover-payment');recover.add_argument('flow_id')
     recover.add_argument('--max-reads',type=int,default=90)
     recipient_argument(recover)
@@ -995,6 +1004,10 @@ def main(argv=None):
         elif args.command=='release-flow':result=release_flow(args)
         elif args.command=='abandon-flow':result=abandon_flow(args)
         elif args.command=='inspect':result=journal.inspect(args.flow_id)
+        elif args.command=='open-flows':
+            flows=journal.open_payments(since_seconds=max(0.0,args.minutes)*60)
+            result={'ok':True,'open':flows,'financial_send':False,
+                    'bank_prompt':'ours: approve it' if flows else 'no open payment from us in this window'}
         elif args.command=='recover-payment':
             result=recover_payment(args.flow_id,max_reads=args.max_reads,recipient=args.recipient)
             if isinstance(result,dict) and result.get('reason') in CARD_DECLINE_REASONS:
@@ -1061,7 +1074,9 @@ def main(argv=None):
                               'cause':preparation[2],'financial_send':False,'financial_retry':False}))
             return 1
         if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code):code='COMMERCE_OPERATION_FAILED'
-        print(json.dumps({'ok':False,'error':code,'financial_retry':False}))
+        # A sent payment that didn't confirm: say whether a no-charge is proven, never assume it.
+        details=exc.details if isinstance(exc,journal.PaymentError) else {}
+        print(json.dumps({'ok':False,'error':code,**details,'financial_retry':False}))
         return 1
 
 
