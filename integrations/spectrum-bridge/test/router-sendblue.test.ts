@@ -144,6 +144,12 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(admin).toContain("Moni (admin)");
   expect(admin).toContain("moni-prefs.md");
   expect(admin).toContain("offbox-person");
+  // 24 Oct, owner: "Moni is an admin, you do not need to ask me."
+  expect(admin).not.toContain("the owner is the only person who approves");
+  expect(admin).toContain("the owner and admins (Moni) approve their own requests");
+  expect(admin).toContain("without asking the owner");
+  expect(admin).toContain("confirm with the admin who asked instead");
+  expect(admin).toContain("Anything special they ask for");
   const guest = sendblueContextPrompt(context("group"), false, ["+447700900123"]);
   expect(guest).toContain("Tom (guest)");
   expect(guest).toContain("ask-owner");
