@@ -133,10 +133,11 @@ def recently_requested(trips, rider, now, exclude):
                and now - t["card_requested"] < REBOOK_WINDOW_S for u, t in trips.items())
 
 
-def unshare_ended(now):
+def unshare_ended(now, live=None):
     """An hour after a ride ends, its public share link goes: the bridge caps live shares at 10 and
     old ride links used them all up (trip e44d36f9). Reads the share journal, so rides this state
-    file no longer tracks are covered too. A bridge that fails is tried again next run."""
+    file no longer tracks are covered too. A bridge that fails is tried again next run. The trip Uber
+    shows right now is never touched, whatever its card says."""
     if not os.environ.get("RIDE_CARD_BRIDGE") and Path(WD).resolve() != LIVE_DIR.resolve():
         return  # a scratch run's journal isn't the real one: never touch real shares from it
     done = 0
@@ -144,18 +145,21 @@ def unshare_ended(now):
         if done >= UNSHARES_PER_RUN:
             return  # the rest go next run; the check has a 60s budget
         uuid = p.stem
-        if not rc.UUID_RE.match(uuid) or rc.unshared_path(uuid).exists() or not rc.public_link(uuid):
+        if uuid == live or not rc.UUID_RE.match(uuid) or rc.unshared_path(uuid).exists() \
+                or not rc.public_link(uuid):
             continue
-        with rc.trip_lock(uuid):
-            end = rc.ended_at(rc.load_card(uuid))
-            if end is None or now - end < rc.UNSHARE_AFTER_S or rc.unshared_path(uuid).exists():
-                continue
-            try:
-                rc.unshare(uuid)
-                done += 1
-            except Exception as e:
-                print(f"ride-share: unshare {uuid} failed: {e}"[:300], file=sys.stderr)
-                return  # the bridge is down or busy: no point trying the rest this run
+        try:
+            with rc.trip_lock(uuid, wait=False):
+                if not rc.link_done(rc.load_card(uuid), now) or rc.unshared_path(uuid).exists():
+                    continue
+                try:
+                    rc.unshare(uuid)
+                    done += 1
+                except Exception as e:
+                    print(f"ride-share: unshare {uuid} failed: {e}"[:300], file=sys.stderr)
+                    return  # the bridge is down or busy: no point trying the rest this run
+        except BlockingIOError:
+            continue  # a send or refresh holds it: next run
 
 
 def main():
@@ -191,11 +195,14 @@ def main():
         with rc.trip_lock(cur):
             prev = rc.load_card(cur)
             card = rc.from_live(trip, prev, rider, rc.booker_for(cur), now)
-            if not (prev and prev.get("terminal")):
-                rc.write_card(card)
+            # A card frozen as "Uber never confirmed the end" whose trip Uber shows again was live
+            # all along: it reopens. Cards Uber's history ended stay frozen.
+            frozen = bool(prev and prev.get("terminal")) and prev.get("state") != "unknown"
+            if not frozen:
+                rc.write_card(card, force=bool(prev and prev.get("terminal")))
             elif rc.preview_pending(cur):
                 s["preview_retry"].setdefault(cur, 0)
-        log_poll(trip, prev if prev and prev.get("terminal") else card, now)
+        log_poll(trip, prev if frozen else card, now)
         t.pop("misses", None)
         t.update(status=trip.get("status"), dest=card.get("dropoff") or t.get("dest"), last_seen=now,
                  rider=rider, rider_hinted=hinted)
@@ -289,7 +296,7 @@ def main():
         else:
             s["preview_retry"][uuid] = n + 1
 
-    unshare_ended(now)
+    unshare_ended(now, live=cur)
 
     for uuid, p in list(pending.items()):
         if now - p["since"] >= REBOOK_WINDOW_S:

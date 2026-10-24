@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import sqlite3
@@ -729,19 +730,95 @@ class UnshareTest(Base):
         self.run_check(30 + 3630)
         self.assertEqual(self.unshares(), [f"ride-{A}"], "taken down once")
 
+    def unconfirmed(self, uuid, start):
+        """A shared ride Uber stops showing with no history status: frozen as unconfirmed at
+        start + 30 + 3h. Returns the freeze time."""
+        self.set_state(trip(uuid, "OnTrip"), {})
+        self.card_cli("send", "--trip", uuid, "--session", "thread-1@3")
+        self.run_check(start)
+        self.set_state(None, {})
+        frozen = start + 30 + 3 * 3600
+        for t in (start + 30, start + 60, frozen):
+            self.run_check(t)
+        self.assertEqual((self.card(uuid)["state"], self.card(uuid)["terminal"]), ("unknown", True))
+        return frozen
+
     def test_cancelled_and_unconfirmed_rides_are_unshared_too(self):
         self.ended(A, status="CANCELED")
         self.run_check(30 + 3600)
         self.assertEqual(self.unshares(), [f"ride-{A}"])
-        self.set_state(trip(B, "OnTrip"), {})
-        self.card_cli("send", "--trip", B, "--session", "thread-1@3")
-        self.run_check(4000)
-        self.set_state(None, {})
-        for t in (4030, 4060, 4060 + 3 * 3600):
-            self.run_check(t)
-        self.assertEqual((self.card(B)["state"], self.card(B)["terminal"]), ("unknown", True))
-        self.run_check(4060 + 3 * 3600 + 30)
+        frozen = self.unconfirmed(B, 4000)
+        self.run_check(frozen + 12 * 3600)
         self.assertEqual(self.unshares(), [f"ride-{A}", f"ride-{B}"])
+
+    def test_unconfirmed_ride_keeps_its_link_for_12h_after_it_froze(self):
+        # "Checking" started 3h before the freeze; the link's clock starts at the freeze itself.
+        frozen = self.unconfirmed(A, 0)
+        for t in (frozen + 30, frozen + 3600, frozen + 12 * 3600 - 30):
+            self.run_check(t)
+        self.assertEqual(self.unshares(), [], "a ride Uber never confirmed ended may still be going")
+        self.run_check(frozen + 12 * 3600)
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+
+    def test_unconfirmed_ride_that_shows_up_again_reopens_and_keeps_its_link(self):
+        frozen = self.unconfirmed(A, 0)
+        self.set_state(trip(A, "OnTrip"), {})
+        self.run_check(frozen + 600)
+        c = self.card(A)
+        self.assertEqual((c["state"], c["terminal"]), ("ontrip", False), "the ride was live all along")
+        for t in (frozen + 12 * 3600, frozen + 30 * 3600):
+            self.run_check(t)
+        self.assertEqual(self.unshares(), [], "a ride Uber shows right now keeps its link")
+        self.set_state(None, {A: {"status": "COMPLETED"}})
+        self.run_check(frozen + 30 * 3600 + 30)
+        self.assertEqual(self.card(A)["state"], "done")
+        self.run_check(frozen + 31 * 3600 + 30)
+        self.assertEqual(self.unshares(), [f"ride-{A}"])
+
+    def test_trip_uber_shows_now_is_never_unshared(self):
+        self.ended(A)
+        self.set_state(trip(A, "OnTrip"), {A: {"status": "COMPLETED"}})  # history and status disagree
+        self.run_check(30 + 7200)
+        self.assertEqual(self.unshares(), [])
+        self.assertEqual(self.card(A)["state"], "done", "a history-confirmed end stays frozen")
+
+    def hold(self, uuid):
+        f = open(os.path.join(self.journal, f".{uuid}.lock"), "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        self.addCleanup(f.close)
+        return f
+
+    def test_busy_trip_is_skipped_not_waited_on(self):
+        self.ended(A)
+        self.ended(B)
+        for u in (A, B):  # previews current, so the preview retry has no reason to touch A
+            open(os.path.join(self.cards, f"ride-{u}", "preview.png"), "w").close()
+        self.run_check(30 + 60)
+        held = self.hold(A)
+        start = time.time()
+        self.run_check(30 + 3600)
+        self.assertLess(time.time() - start, 20, "the check never waits on another trip's lock")
+        self.assertEqual(self.unshares(), [f"ride-{B}"])
+        fcntl.flock(held, fcntl.LOCK_UN)
+        self.run_check(30 + 3630)
+        self.assertEqual(self.unshares(), [f"ride-{B}", f"ride-{A}"])
+
+    def test_share_cap_skips_a_trip_someone_is_sending(self):
+        # The cap path takes each candidate's lock without waiting: a busy one is left alone.
+        self.ended(A)
+        self.ended("cccccccc-0000-4000-8000-000000000001")
+        self.hold(A)
+        self.set_state(trip(B, "Accepted"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", FAKE_BRIDGE_CAP="1")
+        self.assertEqual(json.loads(p.stdout)["moni"], "sent")
+        self.assertEqual(self.unshares(), ["ride-cccccccc-0000-4000-8000-000000000001"])
+
+    def test_share_cap_frees_no_ride_that_may_still_be_going(self):
+        self.unconfirmed(A, int(time.time()) - 3 * 3600 - 60)  # froze a minute ago (send uses the real clock)
+        self.set_state(trip(B, "Accepted"), {})
+        p = self.card_cli("send", "--trip", B, "--session", "thread-1@3", ok=False, FAKE_BRIDGE_CAP="1")
+        self.assertIn("live shares", json.loads(p.stdout)["moni"])
+        self.assertEqual(self.unshares(), [])
 
     def test_live_ride_and_owner_only_card_keep_their_pages(self):
         self.set_state(trip(A, "OnTrip"), {})

@@ -122,13 +122,19 @@ def atomic_write(path, data, mode="w"):
 
 
 class trip_lock:
-    """Per-trip exclusive lock (journal dir) shared by the watcher, refresh and send."""
-    def __init__(self, uuid):
+    """Per-trip exclusive lock (journal dir) shared by the watcher, refresh and send.
+    wait=False raises BlockingIOError at once when someone else holds it."""
+    def __init__(self, uuid, wait=True):
         self.path = journal_dir() / f".{check_uuid(uuid)}.lock"
+        self.wait = wait
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.f = open(self.path, "a")
-        fcntl.flock(self.f, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | (0 if self.wait else fcntl.LOCK_NB))
+        except OSError:
+            self.f.close()
+            raise
         return self
     def __exit__(self, *a):
         fcntl.flock(self.f, fcntl.LOCK_UN)
@@ -264,7 +270,7 @@ def from_live(trip, prev, rider, booker, now):
     # can't identify) starts over.
     held = plate_key(c.get("plate"))
     was_arrived = c.get("state") == "arrived" and bool(held) and held == plate_key(clean(veh.get("plate"), 16))
-    c.update(rider=rider, booker=booker, terminal=False, note=None,
+    c.update(rider=rider, booker=booker, terminal=False, note=None, ended_at=None,
              rider_name=display(rider, uuid), booker_name=display(booker, uuid))
     status = trip.get("status") or ""
     drv = trip.get("driver") or {}
@@ -303,7 +309,8 @@ def from_live(trip, prev, rider, booker, now):
 def to_terminal(prev, status, now, note=None):
     c = dict(prev)
     state = TERMINAL[status]
-    c.update(state=state, terminal=True, pickup_eta=None, arrival_eta=None, checked_at=iso(now), since=iso(now))
+    c.update(state=state, terminal=True, pickup_eta=None, arrival_eta=None, checked_at=iso(now), since=iso(now),
+             ended_at=iso(now))
     c["step"] = 4 if state == "done" else c.get("step", 0)
     c["note"] = note or ("No driver found" if status == "UNFULFILLED" else None)
     return c
@@ -313,7 +320,8 @@ def to_unknown(prev, now, final=False):
     c = dict(prev)
     if c.get("state") != "unknown":
         c["since"] = iso(now)
-    c.update(state="unknown", pickup_eta=None, arrival_eta=None, checked_at=iso(now), terminal=bool(final))
+    c.update(state="unknown", pickup_eta=None, arrival_eta=None, checked_at=iso(now), terminal=bool(final),
+             ended_at=iso(now) if final else None)
     c["note"] = "Uber never confirmed the end" if final else "Waiting for Uber to confirm"
     return c
 
@@ -382,7 +390,8 @@ def signature(c):
 def public(c):
     """Exactly the fields allowed into the public folder."""
     allowed = ("trip", "v", "state", "step", "terminal", "rider", "booker", "driver", "rating", "car",
-               "plate", "pickup", "dropoff", "pickup_eta", "arrival_eta", "note", "driver_changed", "checked_at", "since")
+               "plate", "pickup", "dropoff", "pickup_eta", "arrival_eta", "note", "driver_changed", "checked_at", "since",
+               "ended_at")
     out = {k: c.get(k) for k in allowed}
     out["rider"] = c.get("rider_name") or NAMES.get(c.get("rider")) or None
     out["booker"] = c.get("booker_name") or NAMES.get(c.get("booker")) or None
@@ -740,16 +749,31 @@ def public_link(uuid):
                for who, r in (j.get("recipients") or {}).items())
 
 
+UNCONFIRMED_UNSHARE_AFTER_S = 12 * 3600  # frozen as "never confirmed": the trip might come back
+
+
 def ended_at(card):
-    """When a frozen card's trip ended (its last state change); None while the card is live."""
+    """When a frozen card froze; None while the card is live. Cards frozen before `ended_at` was
+    written fall back to checked_at, the frozen write itself (`since` is when "Checking" began)."""
     if not card or not card.get("terminal"):
         return None
-    for field in ("since", "checked_at"):
+    for field in ("ended_at", "checked_at", "since"):
         try:
             return datetime.fromisoformat(str(card.get(field)).replace("Z", "+00:00")).timestamp()
         except ValueError:
             continue
     return None
+
+
+def link_done(card, now, grace=UNSHARE_AFTER_S):
+    """True when a frozen card's public link can go: `grace` after the end Uber confirmed (the share
+    cap passes 0), or UNCONFIRMED_UNSHARE_AFTER_S after a card froze as "never confirmed" either way.
+    That ride may still be going (its card reopens if Uber shows it again), and a quick tunnel's
+    link can't be given back once it's gone."""
+    end = ended_at(card)
+    if end is None:
+        return False
+    return now - end >= (UNCONFIRMED_UNSHARE_AFTER_S if card.get("state") == "unknown" else grace)
 
 
 def unshare(uuid):
@@ -760,17 +784,21 @@ def unshare(uuid):
 
 
 def free_ended_shares(exclude=None):
-    """The bridge's live-share cap is hit: every ended trip's public link goes now, grace or not.
-    Returns how many the bridge really removed."""
-    freed = 0
+    """The bridge's live-share cap is hit: every trip Uber confirmed ended loses its public link now,
+    without the hour's grace. Returns how many the bridge really removed."""
+    freed, now = 0, time.time()
     for p in sorted(journal_dir().glob("*.json")):
         uuid = p.stem
-        if uuid == exclude or not UUID_RE.match(uuid) or unshared_path(uuid).exists():
-            continue
-        if ended_at(load_card(uuid)) is None or not public_link(uuid):
+        if uuid == exclude or not UUID_RE.match(uuid):
             continue
         try:
-            freed += bool(unshare(uuid).get("removed"))
+            # Under the trip's own lock, so a send re-sharing it can't race the unshare. A trip
+            # someone else holds is skipped, not waited on.
+            with trip_lock(uuid, wait=False):
+                if (unshared_path(uuid).exists() or not link_done(load_card(uuid), now, grace=0)
+                        or not public_link(uuid)):
+                    continue
+                freed += bool(unshare(uuid).get("removed"))
         except Exception:
             continue
     return freed
