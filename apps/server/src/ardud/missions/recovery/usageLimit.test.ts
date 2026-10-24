@@ -1038,13 +1038,23 @@ const restartCut = (ordinal: number, at: number) =>
       startedAt: plus(at - 40),
     });
     yield* itemRow(runId, laneThread, 1, "command_execution", "running", { input: "vp test run" });
+    // The restart takes a background child down with it.
+    yield* childRow({
+      id: `sub-${ordinal}`,
+      threadId: laneThread,
+      runId,
+      status: "cancelled",
+      title: `Child ${ordinal}`,
+      completedAt: plus(at),
+      session: `ses_${ordinal}`,
+    });
     yield* TestClock.setTime(T0 + (at + 10) * 1000);
     return yield* recovery.report(test, {
       reportId: `rs-${runId}`,
       cause: "opencode-restart",
       startAt: plus(at - 5),
       endAt: plus(at + 5),
-      threads: [{ threadId: laneThread, runIds: [runId], childIds: [] }],
+      threads: [{ threadId: laneThread, runIds: [runId], childIds: [`sub-${ordinal}`] }],
     });
   });
 
@@ -1092,7 +1102,11 @@ it.effect("notices the router refused fold into one limit notice that waits for 
     yield* recovery.tick;
     yield* TestClock.adjust("1 hour");
     yield* recovery.tick;
-    assert.strictEqual(fake.sent.filter((sent) => sent.threadId === laneThread).length, 1);
+    const lanes = fake.sent.filter((sent) => sent.threadId === laneThread);
+    assert.strictEqual(lanes.length, 1);
+    // Both restarts' lost children are in the one notice.
+    assert.include(lanes[0]?.text ?? "", "Child 1");
+    assert.include(lanes[0]?.text ?? "", "Child 3");
   }).pipe(Effect.provide(layer));
 });
 

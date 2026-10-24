@@ -1331,11 +1331,14 @@ export const make = Effect.gen(function* () {
    * The plan skips a cut turn that was already continued, but delivery can come
    * much later (master first, rate limit): a turn that got going again in
    * between needs no notice either, or it lands hours later as stale news.
+   * A usage-limit failure is always followed by a one-second notification run,
+   * so those are judged on real work since instead (below).
    */
   const continuedSincePlan = Effect.fn("RecoveryService.continuedSincePlan")(function* (
     target: RecoveryThread,
   ) {
     if (
+      target.usageLimit !== undefined ||
       target.roleKind === "master" ||
       target.action !== "resume" ||
       target.cutRunId === null ||
