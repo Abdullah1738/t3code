@@ -40,7 +40,7 @@ if not os.environ.get("RIDE_CARD_ROOT"):
         os.environ.setdefault("RIDE_CARD_JOURNAL", os.path.join(WD, "journal"))
 import ride_card as rc  # noqa: E402  (after RIDE_CARD_ROOT is settled)
 
-UBER = os.environ.get("UBER_BIN") or shutil.which("uber") or "/Users/ardud/.nvm/versions/node/v26.2.0/bin/uber"
+UBER = os.environ.get("UBER_BIN") or rc.fixed_uber() or shutil.which("uber") or "/Users/ardud/.nvm/versions/node/v26.2.0/bin/uber"
 ENV = dict(os.environ, PATH="/Users/ardud/.nvm/versions/node/v26.2.0/bin:" + os.environ.get("PATH", ""))
 FAIL_ALERT_S = 600
 BOOK_CONFIRM_S = 60

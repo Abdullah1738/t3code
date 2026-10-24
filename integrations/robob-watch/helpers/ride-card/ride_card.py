@@ -636,8 +636,14 @@ def render_preview(c, d):
 
 # ---------- live read ----------
 
+def fixed_uber():
+    """~/.local/bin/uber: the local-helpers wrapper that pins node, so a short watcher PATH still runs it."""
+    p = os.path.expanduser("~/.local/bin/uber")
+    return p if os.access(p, os.X_OK) else None
+
+
 def uber_status(timeout=20):
-    uber = os.environ.get("UBER_BIN") or shutil.which("uber") or "/Users/ardud/.nvm/versions/node/v26.2.0/bin/uber"
+    uber = os.environ.get("UBER_BIN") or fixed_uber() or shutil.which("uber") or "/Users/ardud/.nvm/versions/node/v26.2.0/bin/uber"
     env = dict(os.environ, PATH="/Users/ardud/.nvm/versions/node/v26.2.0/bin:" + os.environ.get("PATH", ""))
     p = subprocess.run([uber, "rides", "status", "--json"], capture_output=True, text=True, timeout=timeout,
                        env=env, stdin=subprocess.DEVNULL)
