@@ -1,4 +1,5 @@
 import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { flushSync } from "react-dom";
 import {
   MailIcon,
   MessageCircleIcon,
@@ -52,19 +53,60 @@ const CLAMP = {
 
 export type MaxLines = keyof typeof CLAMP;
 
-/** Body or meta text, optionally clamped to 1-6 lines. */
+/** Body or meta text, optionally folded to 1-6 lines with Show all. */
 export function TextBlock(props: { text: string; tone?: "body" | "meta"; maxLines?: MaxLines }) {
   if (props.text.trim() === "") return null;
+  const className = cn(
+    "text-sm leading-5.5 text-pretty whitespace-pre-line wrap-anywhere",
+    props.tone === "meta" ? "text-(--m-muted)" : "text-(--m-text)",
+  );
+  if (!props.maxLines) return <p className={className}>{props.text}</p>;
+  return <FoldedText text={props.text} className={className} maxLines={props.maxLines} />;
+}
+
+/** Clamped text that opens in place with Show all, only when the clamp cuts something. */
+function FoldedText(props: { text: string; className: string; maxLines: MaxLines }) {
+  const id = useId();
+  const paragraph = useRef<HTMLParagraphElement>(null);
+  const [open, setOpen] = useState(false);
+  const [cut, setCut] = useState(false);
+  const { text, maxLines } = props;
+  useLayoutEffect(() => {
+    const element = paragraph.current;
+    // Measured while clamped only: the open text keeps the toggle it opened from.
+    if (open || !element) return;
+    const measure = () => setCut(element.scrollHeight > element.clientHeight + 1);
+    measure();
+    return observeResize(element, measure);
+  }, [open, text, maxLines]);
   return (
-    <p
-      className={cn(
-        "text-sm leading-5.5 text-pretty whitespace-pre-line wrap-anywhere",
-        props.tone === "meta" ? "text-(--m-muted)" : "text-(--m-text)",
-        props.maxLines ? CLAMP[props.maxLines] : null,
-      )}
-    >
-      {props.text}
-    </p>
+    <div className="flex min-w-0 flex-col gap-1">
+      <p id={id} ref={paragraph} className={cn(props.className, !open && CLAMP[maxLines])}>
+        {text}
+      </p>
+      {cut || open ? (
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost-muted"
+          className="self-start"
+          aria-expanded={open}
+          aria-controls={id}
+          onClick={(event) => {
+            if (!open) {
+              setOpen(true);
+              return;
+            }
+            // Folding long text would leave the reader far below it; keep the button in view.
+            const button = event.currentTarget;
+            flushSync(() => setOpen(false));
+            button.scrollIntoView({ block: "nearest" });
+          }}
+        >
+          {open ? "Show less" : "Show all"}
+        </Button>
+      ) : null}
+    </div>
   );
 }
 

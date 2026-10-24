@@ -262,6 +262,8 @@ const REPLY_LINES = 3;
 function MeasureText(props: {
   readonly text: string;
   readonly onTextLayout: (event: TextLayoutEvent) => void;
+  /** The shown text's type classes, so both lay out the same lines. */
+  readonly className?: string;
 }) {
   return (
     <Text
@@ -270,10 +272,45 @@ function MeasureText(props: {
       importantForAccessibility="no-hide-descendants"
       pointerEvents="none"
       onTextLayout={props.onTextLayout}
-      className="absolute inset-x-0 top-0 text-[13px] leading-5 opacity-0"
+      className={cn(
+        "absolute inset-x-0 top-0 opacity-0",
+        props.className ?? "text-[13px] leading-5",
+      )}
     >
       {props.text}
     </Text>
+  );
+}
+
+/** Text clamped to `lines` that opens in place with Show all, only when the clamp cuts it. */
+export function FoldText(props: {
+  readonly text: string;
+  readonly lines: number;
+  readonly className: string;
+}) {
+  const [open, setOpen] = useState(false);
+  // The hidden copy stays laid out while open, so a rotation that makes it fit drops the toggle.
+  const [cut, setCut] = useState(false);
+  const { lines } = props;
+  const measure = (event: TextLayoutEvent) => setCut(event.nativeEvent.lines.length > lines);
+  return (
+    <View className="gap-1">
+      <View>
+        <Text selectable numberOfLines={open ? undefined : lines} className={props.className}>
+          {props.text}
+        </Text>
+        <MeasureText text={props.text} className={props.className} onTextLayout={measure} />
+      </View>
+      {cut ? (
+        <View className="items-start">
+          <LinkButton
+            label={open ? "Show less" : "Show all"}
+            expanded={open}
+            onPress={() => setOpen(!open)}
+          />
+        </View>
+      ) : null}
+    </View>
   );
 }
 
