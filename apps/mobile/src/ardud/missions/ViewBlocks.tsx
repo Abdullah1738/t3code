@@ -62,6 +62,7 @@ import {
   Body,
   Chip,
   Facts,
+  FoldText,
   Group,
   LinkButton,
   LinkChips,
@@ -117,16 +118,16 @@ function Block(props: BlockProps & { readonly block: ViewBlock }) {
   switch (block.kind) {
     case "text":
       if (block.text.trim() === "") return null;
-      return block.tone === "meta" ? (
-        <Meta numberOfLines={block.maxLines}>{block.text}</Meta>
-      ) : (
-        <Text
-          selectable
-          numberOfLines={block.maxLines}
-          className="text-[15px] leading-6 text-foreground"
-        >
-          {block.text}
-        </Text>
+      return (
+        <FoldText
+          text={block.text}
+          lines={block.maxLines}
+          className={
+            block.tone === "meta"
+              ? "text-xs text-foreground-muted"
+              : "text-[15px] leading-6 text-foreground"
+          }
+        />
       );
     case "label":
       return (

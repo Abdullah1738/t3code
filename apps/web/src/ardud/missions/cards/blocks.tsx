@@ -1,4 +1,5 @@
 import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { flushSync } from "react-dom";
 import {
   MailIcon,
   MessageCircleIcon,
@@ -52,19 +53,80 @@ const CLAMP = {
 
 export type MaxLines = keyof typeof CLAMP;
 
-/** Body or meta text, optionally clamped to 1-6 lines. */
+/** Body or meta text, optionally folded to 1-6 lines with Show all. */
 export function TextBlock(props: { text: string; tone?: "body" | "meta"; maxLines?: MaxLines }) {
   if (props.text.trim() === "") return null;
+  const className = cn(
+    "text-sm leading-5.5 text-pretty whitespace-pre-line wrap-anywhere",
+    props.tone === "meta" ? "text-(--m-muted)" : "text-(--m-text)",
+  );
+  if (!props.maxLines) return <p className={className}>{props.text}</p>;
+  return <FoldedText text={props.text} className={className} maxLines={props.maxLines} />;
+}
+
+/** Clamped text that opens in place with Show all, only when the clamp cuts something. */
+function FoldedText(props: { text: string; className: string; maxLines: MaxLines }) {
+  const id = useId();
+  const copy = useRef<HTMLParagraphElement>(null);
+  const { text, maxLines } = props;
+  // Opening belongs to this text: replacement text starts folded and measured afresh.
+  const key = `${maxLines}\n${text}`;
+  const [fold, setFold] = useState({ key, open: false });
+  if (fold.key !== key) setFold({ key, open: false });
+  const open = fold.key === key && fold.open;
+  const [cut, setCut] = useState(false);
+  useLayoutEffect(() => {
+    const element = copy.current;
+    if (!element) return;
+    // The clamped box keeps its height when a font swap or letter spacing rewraps the
+    // text, so the unclamped copy is what gets observed.
+    const measure = () => {
+      const style = getComputedStyle(element);
+      const lineHeight =
+        Number.parseFloat(style.lineHeight) || Number.parseFloat(style.fontSize) * 1.2;
+      setCut(element.offsetHeight > lineHeight * (maxLines + 0.5));
+    };
+    measure();
+    return observeResize(element, measure);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- New text is measured in the commit that shows it; the observer would only catch it after paint.
+  }, [text, maxLines]);
   return (
-    <p
-      className={cn(
-        "text-sm leading-5.5 text-pretty whitespace-pre-line wrap-anywhere",
-        props.tone === "meta" ? "text-(--m-muted)" : "text-(--m-text)",
-        props.maxLines ? CLAMP[props.maxLines] : null,
-      )}
-    >
-      {props.text}
-    </p>
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="relative overflow-clip">
+        <p id={id} className={cn(props.className, !open && CLAMP[maxLines])}>
+          {text}
+        </p>
+        <p
+          ref={copy}
+          aria-hidden
+          className={cn(props.className, "pointer-events-none invisible absolute inset-x-0 top-0")}
+        >
+          {text}
+        </p>
+      </div>
+      {cut ? (
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost-muted"
+          className="self-start"
+          aria-expanded={open}
+          aria-controls={id}
+          onClick={(event) => {
+            if (!open) {
+              setFold({ key, open: true });
+              return;
+            }
+            // Folding long text would leave the reader far below it; keep the button in view.
+            const button = event.currentTarget;
+            flushSync(() => setFold({ key, open: false }));
+            button.scrollIntoView({ block: "nearest" });
+          }}
+        >
+          {open ? "Show less" : "Show all"}
+        </Button>
+      ) : null}
+    </div>
   );
 }
 
