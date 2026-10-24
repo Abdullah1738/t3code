@@ -1461,12 +1461,16 @@ export const STOCK_VIEW_TEMPLATES: ReadonlyArray<ViewBuiltinTemplate> = [
         { key: "changes", label: "Changes", type: "text", required: false, editable: false },
         { key: "prs", label: "PRs", type: "links", required: false, editable: false },
       ],
+      // The master's releases carry no fields: summary plus a markdown detail
+      // (changelog, build links, install plan) the owner reads in full.
       body: [
         facts(["Version", "field.version"], ["Environment", "field.env"]),
+        text("record.summary", "body", 3),
         text("field.changes", "body", 6),
         { _tag: "links", bind: "field.prs" },
         { _tag: "flags", bind: "record.flags" },
         { _tag: "links", bind: "record.links" },
+        { _tag: "markdown", bind: "record.detail", maxLines: 12 },
       ],
       actions: ["approve", "reject", "discuss"],
       primary: "approve",
