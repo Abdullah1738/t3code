@@ -94,6 +94,7 @@ export interface Sent {
   readonly key: string;
   /** Queued behind a running turn instead of rung. */
   readonly queue: boolean;
+  readonly kind?: "request" | "blocker";
 }
 
 /**

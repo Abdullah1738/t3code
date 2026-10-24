@@ -106,6 +106,10 @@ interface Planned {
   readonly reason: string;
   /** Boots in a row that cut this thread's turn, counting this one; 0 outside boots. */
   readonly bootCuts?: number;
+  /** The cut run failed on a usage limit: when it may be resumed, and whether it failed again. */
+  readonly limit?: { readonly notBefore: string; readonly again: boolean };
+  /** The master's summary for lanes that all wait on a usage limit waits with them. */
+  readonly wait?: string;
 }
 
 interface CollectInput {
@@ -163,6 +167,20 @@ const missionThreads = (incident: RecoveryIncident, missionId: MissionId) =>
 
 const sendable = (thread: RecoveryThread) =>
   thread.state === "pending" || thread.state === "failed";
+
+/** The thread without its usage-limit wait: a human said to send it now. */
+const withoutWait = (incident: RecoveryIncident, target: RecoveryThread): RecoveryIncident => ({
+  ...incident,
+  threads: incident.threads.map((thread) => {
+    if (thread.missionId !== target.missionId || thread.threadId !== target.threadId) return thread;
+    const { notBefore: _wait, ...rest } = thread;
+    return rest;
+  }),
+});
+
+/** Sendable, and past any wait for a usage limit to reset. */
+const due = (thread: RecoveryThread, nowMs: number) =>
+  sendable(thread) && (thread.notBefore === undefined || Date.parse(thread.notBefore) <= nowMs);
 
 export class RecoveryService extends Context.Service<
   RecoveryService,
@@ -438,7 +456,12 @@ export const make = Effect.gen(function* () {
             thread.action === "reconcile-first" ||
             thread.holds.some((hold) => hold.reconcileRequired),
         );
-        const stopped = threads.some(Model.isBootStopped);
+        // A master held on the usage limit has nobody but the owner to tell.
+        const stopped = threads.some(
+          (thread) =>
+            Model.isBootStopped(thread) ||
+            (thread.roleKind === "master" && Model.isLimitHeld(thread)),
+        );
         const upserts: Array<MissionStoreRecord> = [];
         if (ownerNote || reconcile || stopped) {
           const note: Note = {
@@ -483,6 +506,9 @@ export const make = Effect.gen(function* () {
                 reason: thread.reason,
                 lostChildren: thread.lostChildren.length,
                 ...(thread.bootCuts === undefined ? {} : { bootCuts: thread.bootCuts }),
+                ...(thread.usageLimit === undefined
+                  ? {}
+                  : { usageLimit: thread.usageLimit, notBefore: thread.notBefore ?? null }),
               })),
             },
           },
@@ -510,10 +536,11 @@ export const make = Effect.gen(function* () {
     const { member, cut } = planned;
     const bootCuts = planned.bootCuts ?? 0;
     // The master still gets its summary; its notice says not to rerun its own turn.
-    const stopped =
-      bootCuts >= Model.MAX_BOOT_CUTS &&
-      member.roleKind !== "master" &&
-      (planned.action === "resume" || planned.action === "reconcile-first");
+    const resuming = planned.action === "resume" || planned.action === "reconcile-first";
+    const stopped = bootCuts >= Model.MAX_BOOT_CUTS && member.roleKind !== "master" && resuming;
+    // Failing on the limit again right after its one resume: the master decides.
+    const limitHeld = planned.limit?.again === true && resuming && !stopped;
+    const waiting = planned.limit !== undefined && !limitHeld;
     return {
       missionId: member.missionId,
       threadId: member.threadId,
@@ -534,17 +561,32 @@ export const make = Effect.gen(function* () {
       holds: planned.holds,
       action: planned.action,
       reason: planned.reason,
-      state: planned.action === "skip" ? "skipped" : stopped ? "held" : "pending",
+      state: planned.action === "skip" ? "skipped" : stopped || limitHeld ? "held" : "pending",
       stateReason:
         planned.action === "skip"
           ? planned.reason
           : stopped
             ? Model.bootStopReason(bootCuts)
-            : null,
+            : limitHeld
+              ? Model.LIMIT_AGAIN_REASON
+              : waiting && planned.limit !== undefined
+                ? `waiting for the usage limit to reset at ${Model.clockLabel(planned.limit.notBefore, delivery.timeZone)}`
+                : planned.wait !== undefined
+                  ? `waiting for the lanes' usage limit to reset at ${Model.clockLabel(planned.wait, delivery.timeZone)}`
+                  : null,
       instruction: null,
       noticeAt: null,
       decidedBy: null,
       ...(bootCuts > 0 ? { bootCuts } : {}),
+      ...(planned.limit === undefined
+        ? {}
+        : {
+            usageLimit: planned.limit.again ? ("again" as const) : ("first" as const),
+            notBefore: planned.limit.notBefore,
+          }),
+      ...(planned.limit === undefined && planned.wait !== undefined
+        ? { notBefore: planned.wait }
+        : {}),
     };
   };
 
@@ -571,6 +613,57 @@ export const make = Effect.gen(function* () {
         const previous = cuts.get(row.threadId);
         if (previous === undefined || row.ordinal > previous.ordinal) cuts.set(row.threadId, row);
       }
+      // A thread that fails on the limit again while its earlier limit notice
+      // still waits for the reset keeps that one notice, only later.
+      if (!restart) {
+        for (const open of yield* recovery.openIncidents) {
+          let next = open;
+          for (const thread of open.threads) {
+            const cut = cuts.get(thread.threadId);
+            const reset = cut === undefined ? null : Model.limitResetOf(cut);
+            if (cut === undefined || reset === null) continue;
+            if (thread.usageLimit !== "first" || !sendable(thread) || thread.noticeAt !== null) {
+              continue;
+            }
+            const notBefore =
+              thread.notBefore !== undefined && thread.notBefore > reset ? thread.notBefore : reset;
+            next = patchThread(next, thread, {
+              cutRunId: cut.runId,
+              lastActivityAt: cut.completedAt,
+              interruptReason: cut.errorMessage ?? thread.interruptReason,
+              notBefore,
+              stateReason: `waiting for the usage limit to reset at ${Model.clockLabel(notBefore, delivery.timeZone)}`,
+            });
+          }
+          if (next === open) continue;
+          for (const thread of next.threads) {
+            if (thread.cutRunId !== null && cuts.get(thread.threadId)?.runId === thread.cutRunId) {
+              cuts.delete(thread.threadId);
+            }
+          }
+          yield* recovery.saveIncident(next, now);
+        }
+      }
+      const priorLimits = yield* recovery.limitResumes(
+        [...cuts.values()].filter((cut) => Model.isUsageLimit(cut)).map((cut) => cut.threadId),
+      );
+      /** When a limit cut may be resumed, and whether it failed again right after its one resume. */
+      const limitOf = Effect.fn("RecoveryService.limitOf")(function* (
+        cut: RecoveryStore.CutRunRow | null,
+      ) {
+        const notBefore = cut === null ? null : Model.limitResetOf(cut);
+        if (cut === null || notBefore === null || cut.completedAt === null) return undefined;
+        const prior = priorLimits.get(cut.threadId);
+        const since =
+          prior === undefined ? Number.NaN : Date.parse(cut.completedAt) - Date.parse(prior.sentAt);
+        const again =
+          prior !== undefined &&
+          prior.runId !== cut.runId &&
+          since >= 0 &&
+          since <= Model.LIMIT_AGAIN_WINDOW_MS &&
+          !(yield* recovery.workedBetween({ afterRunId: prior.runId, beforeRunId: cut.runId }));
+        return { notBefore, again };
+      });
 
       // Boots in a row that cut the same turn: a cut continues the chain when
       // the previous boot cut it too and no run of the thread completed since.
@@ -671,6 +764,7 @@ export const make = Effect.gen(function* () {
             recentInterrupts: interrupts.get(member.threadId) ?? 0,
             cause: input.cause,
           });
+          const limit = yield* limitOf(cut);
           planned.push({
             view,
             member,
@@ -680,6 +774,7 @@ export const make = Effect.gen(function* () {
             action: plan.action,
             reason: plan.reason,
             bootCuts: bootCuts.get(member.threadId) ?? 0,
+            ...(limit === undefined ? {} : { limit }),
           });
           seen.push(
             ...lost.map((child) => ({ key: `child:${child.id}`, threadId: member.threadId })),
@@ -700,11 +795,21 @@ export const make = Effect.gen(function* () {
         const masterEntry = mine.find((entry) => entry.member.roleKind === "master");
         if (acting.length === 0 && (masterEntry === undefined || masterEntry.action === "skip"))
           continue;
-        // One lane failing on its own doesn't need the master; a restart or several do.
+        // One lane failing on its own doesn't need the master; a restart, several,
+        // or a lane that failed on the limit again after its one resume do.
         const needsMaster =
           restart ||
           acting.length >= 2 ||
-          acting.some((entry) => entry.action === "reconcile-first");
+          acting.some((entry) => entry.action === "reconcile-first" || entry.limit?.again === true);
+        // The master likely shares the limit: its summary waits for the earliest
+        // reset, unless a lane is already held for it to decide.
+        const limitWaits = acting.flatMap((entry) =>
+          entry.limit === undefined || entry.limit.again ? [] : [entry.limit.notBefore],
+        );
+        const masterWait =
+          acting.length > 0 && limitWaits.length === acting.length
+            ? limitWaits.toSorted()[0]
+            : undefined;
         const masterMember = view.members.find((member) => member.roleKind === "master");
         const withMaster =
           masterEntry === undefined &&
@@ -727,6 +832,7 @@ export const make = Effect.gen(function* () {
                     recentInterrupts: 0,
                     cause: input.cause,
                   }),
+                  ...(masterWait === undefined ? {} : { wait: masterWait }),
                 },
               ]
             : mine;
@@ -940,6 +1046,21 @@ export const make = Effect.gen(function* () {
       if (readiness === "gone") {
         return yield* settle({ state: "skipped", stateReason: "thread archived or deleted" });
       }
+      // A lane that got going again before its limit wait ran out needs no resume.
+      if (
+        target.usageLimit === "first" &&
+        target.roleKind !== "master" &&
+        target.cutRunId !== null &&
+        target.decidedBy === null &&
+        target.lostChildren.length === 0 &&
+        target.action === "resume" &&
+        (yield* recovery.workedAfter(target.cutRunId))
+      ) {
+        return yield* settle({
+          state: "skipped",
+          stateReason: "carried on before the limit reset",
+        });
+      }
       const key = noticeKey(start, target);
       const claim = yield* recovery.noticeClaim(key);
       if (claim?.state === "sending") {
@@ -983,6 +1104,10 @@ export const make = Effect.gen(function* () {
             text,
             key: attempt === 0 ? key : `${key}#${attempt}`,
             queue,
+            ...(target.roleKind === "master" &&
+            missionThreads(start, target.missionId).some(Model.isLimitHeld)
+              ? { kind: "blocker" as const }
+              : {}),
           })
           .pipe(Effect.result);
         if (Result.isFailure(result)) {
@@ -1026,7 +1151,18 @@ export const make = Effect.gen(function* () {
               : {}),
           },
         },
-        alongside: recovery.saveIncident(next, now),
+        alongside: recovery.saveIncident(next, now).pipe(
+          Effect.andThen(
+            target.usageLimit !== undefined && target.cutRunId !== null
+              ? recovery.saveLimitResume({
+                  threadId: target.threadId,
+                  runId: target.cutRunId,
+                  incidentId: start.id,
+                  sentAt: now,
+                })
+              : Effect.void,
+          ),
+        ),
       });
       return { incident: next, sent: outcome !== null };
     });
@@ -1036,8 +1172,16 @@ export const make = Effect.gen(function* () {
       let incident = start;
       let sent = 0;
       const nowMs = Date.parse(now);
-      if (nowMs - Date.parse(incident.detectedAt) > GIVE_UP_MS) {
-        for (const thread of missionThreads(incident, missionId).filter(sendable)) {
+      const overdue = (thread: RecoveryThread) =>
+        sendable(thread) &&
+        nowMs -
+          Math.max(
+            Date.parse(incident.detectedAt),
+            thread.notBefore === undefined ? 0 : Date.parse(thread.notBefore),
+          ) >
+          GIVE_UP_MS;
+      if (missionThreads(incident, missionId).some(overdue)) {
+        for (const thread of missionThreads(incident, missionId).filter(overdue)) {
           incident = patchThread(incident, thread, {
             state: "skipped",
             stateReason: "not delivered within 12 hours",
@@ -1052,7 +1196,7 @@ export const make = Effect.gen(function* () {
           : missionThreads(incident, missionId).find(
               (thread) => thread.roleKind === "master" && thread.action !== "skip",
             );
-      if (master !== undefined && sendable(master)) {
+      if (master !== undefined && due(master, nowMs)) {
         const out = yield* deliver(incident, master, now);
         incident = out.incident;
         if (out.sent) sent += 1;
@@ -1074,7 +1218,10 @@ export const make = Effect.gen(function* () {
                 settings,
               )
             : sendable(masterNow)
-              ? Date.parse(incident.detectedAt) + MASTER_WAIT_MS
+              ? Math.max(
+                  Date.parse(incident.detectedAt),
+                  masterNow.notBefore === undefined ? 0 : Date.parse(masterNow.notBefore),
+                ) + MASTER_WAIT_MS
               : 0;
       if (nowMs < lanesOpenAt) return { incident, sent };
       const lanes = missionThreads(incident, missionId).filter(
@@ -1087,7 +1234,7 @@ export const make = Effect.gen(function* () {
         ).length;
       for (const thread of lanes) {
         if (budget <= 0) break;
-        if (!sendable(thread)) continue;
+        if (!due(thread, nowMs)) continue;
         const out = yield* deliver(incident, thread, now);
         incident = out.incident;
         if (out.sent) {
@@ -1375,11 +1522,14 @@ export const make = Effect.gen(function* () {
               });
               resent = open;
               for (const thread of open) {
-                incident = patchThread(incident, thread, {
-                  state: "pending",
-                  stateReason: null,
-                  decidedBy: actor,
-                });
+                incident = withoutWait(
+                  patchThread(incident, thread, {
+                    state: "pending",
+                    stateReason: null,
+                    decidedBy: actor,
+                  }),
+                  thread,
+                );
               }
               summary = `Recovery resume now by ${by}: ${open.map(who).join(", ")}.`;
               break;

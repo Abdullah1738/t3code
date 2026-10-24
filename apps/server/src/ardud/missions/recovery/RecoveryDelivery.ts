@@ -51,6 +51,8 @@ export interface NoticeInput {
   readonly text: string;
   readonly key: string;
   readonly queue: boolean;
+  /** Room post kind; `blocker` when the master has to act. Default `request`. */
+  readonly kind?: "request" | "blocker";
 }
 
 /** The component recovery posts as. */
@@ -96,7 +98,7 @@ export const layerWith = (options?: {
             input: {
               missionId: input.missionId,
               roomId,
-              kind: "request",
+              kind: input.kind ?? "request",
               summary: clipSummary(input.text),
               body: input.text,
               to: [{ _tag: "thread", threadId: input.threadId }],

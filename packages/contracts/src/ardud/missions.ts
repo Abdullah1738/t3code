@@ -2222,6 +2222,14 @@ export const RecoveryThread = Schema.Struct({
    * its notice and is told not to rerun its own turn.
    */
   bootCuts: Schema.optional(NonNegativeInt),
+  /**
+   * The run failed on a provider usage limit: `first` is resumed once the limit
+   * resets, `again` failed the same way right after that resume and is held for
+   * the master instead.
+   */
+  usageLimit: Schema.optional(Schema.Literals(["first", "again"])),
+  /** No notice goes out before this (a usage limit's reset); resume mode now overrides it. */
+  notBefore: Schema.optional(IsoDateTime),
 });
 export type RecoveryThread = typeof RecoveryThread.Type;
 

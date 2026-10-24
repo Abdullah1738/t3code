@@ -19,6 +19,7 @@ import type {
   SubMissionId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 
 export const DEFAULT_SETTINGS = { resumePerMinute: 4, masterLeadSeconds: 60 } as const;
 /** Same thread interrupted this often within an hour stops getting resume turns. */
@@ -75,8 +76,75 @@ export interface CutRun {
   readonly interruptMessage: string | null;
   /** A later run on the thread already started (Robob's restart continuation, or anyone). */
   readonly continued: boolean;
+  /**
+   * A later run that was not cut itself did real work. A failed run is often
+   * followed by a one-second run that only delivers a background notification;
+   * that one doesn't count.
+   */
+  readonly workedAfter: boolean;
+  /** The provider failure recorded on a failed run. */
+  readonly failure: RunFailure | null;
   readonly items: ReadonlyArray<CutItem>;
 }
+
+export interface RunFailure {
+  readonly class: string | null;
+  readonly code: string | null;
+  readonly message: string | null;
+  readonly resetAt: string | null;
+}
+
+/** Turn item types that show a run did real work. */
+export const WORK_ITEMS = [
+  "assistant_message",
+  "command_execution",
+  "dynamic_tool",
+  "file_change",
+  "subagent",
+];
+
+/** Added to a usage limit's reset before resuming, so the first call lands after it. */
+export const LIMIT_MARGIN_MS = 60_000;
+/** A usage limit that names no reset is retried this long after the failure. */
+export const LIMIT_DEFAULT_WAIT_MS = 15 * 60_000;
+/**
+ * A thread that fails on the limit again this soon after its resume notice,
+ * with no completed work in between, goes to the master instead. A resumed
+ * turn that ran longer than this before failing counts as a new failure.
+ */
+export const LIMIT_AGAIN_WINDOW_MS = 20 * 60_000;
+
+const RESET_AFTER = /reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?/i;
+
+/** A failed run that stopped on a provider usage or rate limit. */
+export const isUsageLimit = (run: CutRun) =>
+  run.status === "failed" &&
+  run.completedAt !== null &&
+  (run.failure?.class === "usage_limit" || run.failure?.code === "provider.rate-limit");
+
+/**
+ * When a run that failed on a usage limit may be resumed: the provider's reset
+ * (as recorded, or "reset after 10m 43s" in the message, else a default wait)
+ * plus a margin. Null for any other run.
+ */
+export const limitResetOf = (run: CutRun): string | null => {
+  if (!isUsageLimit(run) || run.completedAt === null) return null;
+  const ended = Date.parse(run.completedAt);
+  if (Number.isNaN(ended)) return null;
+  const recorded = run.failure?.resetAt ? Date.parse(run.failure.resetAt) : Number.NaN;
+  let reset = recorded;
+  if (Number.isNaN(reset)) {
+    const match = RESET_AFTER.exec(run.failure?.message ?? "");
+    const [hours, minutes, seconds] = [match?.[1], match?.[2], match?.[3]].map((part) =>
+      part === undefined ? null : Number(part),
+    );
+    reset =
+      hours === null && minutes === null && seconds === null
+        ? ended + LIMIT_DEFAULT_WAIT_MS
+        : ended + ((hours ?? 0) * 3600 + (minutes ?? 0) * 60 + (seconds ?? 0)) * 1000;
+  }
+  return DateTime.formatIso(DateTime.makeUnsafe(Math.max(reset, ended) + LIMIT_MARGIN_MS));
+};
 
 export interface ChildFacts {
   readonly id: string;
@@ -275,11 +343,18 @@ export const planThread = (
   );
   const reconcile = mutation !== null || openHolds.length > 0;
   const isMaster = member.roleKind === "master";
+  // A usage limit is waited out, not counted as a flapping thread; failing
+  // again right after its resume is caught by the service instead.
+  const limit = cut !== null && isUsageLimit(cut);
   if (cut !== null && isOwnerStop(cut)) {
     return { action: "skip", reason: "stopped by the owner", mutation };
   }
   if (member.laneStatus === "retired") return { action: "skip", reason: "lane retired", mutation };
-  if (input.cause === "run-interrupted" && input.recentInterrupts >= MAX_RUN_INTERRUPTS_PER_HOUR) {
+  if (
+    input.cause === "run-interrupted" &&
+    !limit &&
+    input.recentInterrupts >= MAX_RUN_INTERRUPTS_PER_HOUR
+  ) {
     return {
       action: "skip",
       reason: `interrupted ${input.recentInterrupts} times in the last hour; left for the master`,
@@ -298,7 +373,10 @@ export const planThread = (
       ? { action: "notice-only", reason: "summary for the master", mutation }
       : { action: "skip", reason: "nothing was running", mutation };
   }
-  if (cut !== null && cut.continued && lost.length === 0 && !reconcile && !isMaster) {
+  if (cut !== null && limit && cut.workedAfter && lost.length === 0 && !reconcile && !isMaster) {
+    return { action: "skip", reason: "carried on after the usage limit", mutation };
+  }
+  if (cut !== null && !limit && cut.continued && lost.length === 0 && !reconcile && !isMaster) {
     return { action: "skip", reason: "turn already continued, nothing lost", mutation };
   }
   if (reconcile) {
@@ -312,7 +390,7 @@ export const planThread = (
     };
   }
   if (cut === null) return { action: "resume", reason: "background children lost", mutation };
-  return { action: "resume", reason: "turn cut", mutation };
+  return { action: "resume", reason: limit ? "failed on a usage limit" : "turn cut", mutation };
 };
 
 const ROLE_RANK: Partial<Record<RoleKind, number>> = {
@@ -403,6 +481,20 @@ export const isBootStopped = (thread: RecoveryThread) =>
 export const bootStopReason = (cuts: number) =>
   `the same turn was cut by ${cuts} boots in a row; not resumed on its own`;
 
+export const LIMIT_AGAIN_REASON =
+  "failed on the usage limit again right after recovery resumed it once; resume it by hand";
+
+/**
+ * A thread that failed on a usage limit again right after recovery resumed it
+ * once, not yet released or decided: a lane is held for the master, a master
+ * for the owner.
+ */
+export const isLimitHeld = (thread: RecoveryThread) =>
+  thread.usageLimit === "again" &&
+  (thread.action === "resume" || thread.action === "reconcile-first") &&
+  thread.state === "held" &&
+  thread.decidedBy === null;
+
 const OPEN_STATES = new Set(["pending", "held", "failed"]);
 
 export const isOpen = (thread: RecoveryThread) => OPEN_STATES.has(thread.state);
@@ -491,6 +583,9 @@ const opening = (context: NoticeContext, thread: RecoveryThread) => {
     case "opencode-restart":
       return `OpenCode restarted at ${context.at}.`;
     case "run-interrupted":
+      if (thread.usageLimit !== undefined) {
+        return `Your run failed at ${context.at} on a provider usage limit${thread.interruptReason ? ` (${truncate(thread.interruptReason, 160)})` : ""}; it should have reset by now.`;
+      }
       return `Your run was interrupted at ${context.at}${thread.interruptReason ? ` (${truncate(thread.interruptReason, 160)})` : ""}.`;
     case "succession":
       return `You took over ${thread.laneName === null ? "this role" : `lane "${thread.laneName}"`} at ${context.at}${thread.handoffFrom ? ` from thread "${thread.handoffFrom.title}" (${thread.handoffFrom.threadId})` : ""}.`;
@@ -537,6 +632,9 @@ const instructionLabel = (decidedBy: MissionActor | null): string => {
   }
 };
 
+const FINISHED_CHILDREN =
+  "Background children that finished while you were stopped already have their results: read them (task_status, or the subagent's last message) instead of running them again.";
+
 /** The message one mission thread gets. */
 export const threadNotice = (context: NoticeContext, thread: RecoveryThread) => {
   const waits = thread.action === "notice-only" && thread.roleKind !== "master";
@@ -551,6 +649,7 @@ export const threadNotice = (context: NoticeContext, thread: RecoveryThread) => 
     waits
       ? children.replace("Resume each one:", "When you are released, resume each one:")
       : children,
+    thread.usageLimit === undefined ? "" : FINISHED_CHILDREN,
   ];
   if (
     thread.action === "reconcile-first" ||
@@ -637,8 +736,9 @@ export const masterNotice = (input: MasterSummaryInput) => {
       ? ""
       : ` (down about ${Math.round(input.downSeconds / 60)} min)`;
   const stopped = input.others.filter(isBootStopped);
+  const limited = input.others.filter((thread) => isLimitHeld(thread) && !stopped.includes(thread));
   const queue = input.others.filter(
-    (thread) => thread.action !== "skip" && !stopped.includes(thread),
+    (thread) => thread.action !== "skip" && !stopped.includes(thread) && !limited.includes(thread),
   );
   const skipped = input.others.filter((thread) => thread.action === "skip");
   const head =
@@ -664,6 +764,11 @@ export const masterNotice = (input: MasterSummaryInput) => {
   if (stopped.length > 0) {
     lines.push(
       `Not resumed on their own, the same turn was cut by ${MAX_BOOT_CUTS} or more boots in a row: ${stopped.map((thread) => `${threadLabel(thread)} (${thread.bootCuts} boots${thread.lastActivity === null ? "" : `, cut while ${thread.lastActivity}`})`).join("; ")}. Check what each was running first; resume one by hand with mission_recovery_resume (mode now or release, with its threadId), or skip it.`,
+    );
+  }
+  if (limited.length > 0) {
+    lines.push(
+      `Blocked, failed on a provider usage limit again right after recovery resumed them once: ${limited.map((thread) => `${threadLabel(thread)}${thread.interruptReason === null ? "" : ` (${truncate(thread.interruptReason, 160)})`}`).join("; ")}. Recovery does not resume them again. Check the provider's limit, then resume each by hand with mission_recovery_resume (mode now or release, with its threadId), or skip it.`,
     );
   }
   const reconcileHolds = [master, ...input.others].flatMap((thread) =>
@@ -692,8 +797,11 @@ export const incidentSummary = (
 ) => {
   const counts = new Map<RecoveryAction, number>();
   const stopped = missionThreads.filter(isBootStopped);
+  const limited = missionThreads.filter(
+    (thread) => isLimitHeld(thread) && !stopped.includes(thread),
+  );
   for (const thread of missionThreads) {
-    if (stopped.includes(thread)) continue;
+    if (stopped.includes(thread) || limited.includes(thread)) continue;
     counts.set(thread.action, (counts.get(thread.action) ?? 0) + 1);
   }
   const parts = (["resume", "reconcile-first", "notice-only", "skip"] as const)
@@ -708,8 +816,12 @@ export const incidentSummary = (
     lanes.length === stopped.length
       ? ""
       : ` The master's own turn was cut by ${MAX_BOOT_CUTS}+ boots in a row; it was told not to rerun it.`;
+  const limit =
+    limited.length === 0
+      ? ""
+      : ` Failed on a usage limit again after one resume, not resumed again: ${limited.map((thread) => `"${truncate(thread.title, 40)}"`).join(", ")}.`;
   return truncate(
-    `${label}: ${missionThreads.length} thread(s)${parts.length === 0 ? "" : ` (${parts.join(", ")})`}.${held}${master} Master first, then ${settings.resumePerMinute} per minute.`,
+    `${label}: ${missionThreads.length} thread(s)${parts.length === 0 ? "" : ` (${parts.join(", ")})`}.${held}${master}${limit} Master first, then ${settings.resumePerMinute} per minute.`,
     400,
   );
 };

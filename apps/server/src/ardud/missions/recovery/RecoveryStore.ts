@@ -16,7 +16,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import type { ChildFacts, CutItem, CutRun } from "./model.ts";
+import { WORK_ITEMS, type ChildFacts, type CutItem, type CutRun } from "./model.ts";
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS ardud_mission_recovery_boots (
@@ -92,6 +92,14 @@ const DDL = [
     incident_id TEXT,
     updated_at TEXT NOT NULL
   )`,
+  // The last resume notice sent to a thread whose run failed on a usage limit:
+  // a second limit failure right after it goes to the master, not resumed again.
+  `CREATE TABLE IF NOT EXISTS ardud_mission_recovery_limit_resumes (
+    thread_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    incident_id TEXT NOT NULL,
+    sent_at TEXT NOT NULL
+  )`,
 ];
 
 const BOOTS_KEPT = 20;
@@ -147,6 +155,15 @@ export interface NoticeClaim {
   readonly attempt: number;
 }
 
+/** The last limit resume recovery sent a thread. */
+export interface LimitResume {
+  readonly threadId: string;
+  /** The failed run that resume was for. */
+  readonly runId: string;
+  readonly incidentId: string;
+  readonly sentAt: string;
+}
+
 /** Boots in a row that cut a thread's turn, as of its latest boot cut. */
 export interface BootChain {
   readonly threadId: string;
@@ -171,7 +188,11 @@ interface RunRow {
   readonly completed_at: string | null;
   readonly interrupt_message: string | null;
   readonly error_message: string | null;
+  readonly error_class: string | null;
+  readonly error_code: string | null;
+  readonly error_reset_at: string | null;
   readonly continued: number;
+  readonly worked_after: number;
   readonly server_continued: number;
 }
 
@@ -273,6 +294,19 @@ export class RecoveryStore extends Context.Service<
     ) => Effect.Effect<void>;
     /** The highest ordinal of a run of the thread that completed, below `before`. */
     readonly lastCompleted: (threadId: string, before: number) => Effect.Effect<number | null>;
+
+    readonly limitResumes: (
+      threadIds: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyMap<string, LimitResume>>;
+    /** Run inside the notice-sent commit. */
+    readonly saveLimitResume: (resume: LimitResume) => Effect.Effect<void>;
+    /** A later run of the same thread, running or finished but not cut itself, did real work. */
+    readonly workedAfter: (runId: string) => Effect.Effect<boolean>;
+    /** A run of the same thread between the two completed and did real work. */
+    readonly workedBetween: (input: {
+      readonly afterRunId: string;
+      readonly beforeRunId: string;
+    }) => Effect.Effect<boolean>;
 
     // Read-only projection reads.
     readonly cutRuns: (input: {
@@ -609,6 +643,80 @@ const make = Effect.gen(function* () {
       `,
     ).pipe(Effect.map((rows) => rows[0]?.ordinal ?? null));
 
+  const limitResumes = (threadIds: ReadonlyArray<string>) =>
+    Effect.forEach(chunks(threadIds), (chunk) =>
+      read(
+        sql<{
+          readonly thread_id: string;
+          readonly run_id: string;
+          readonly incident_id: string;
+          readonly sent_at: string;
+        }>`
+          SELECT thread_id, run_id, incident_id, sent_at FROM ardud_mission_recovery_limit_resumes
+          WHERE thread_id IN ${sql.in(chunk)}
+        `,
+      ),
+    ).pipe(
+      Effect.map(
+        (rows) =>
+          new Map(
+            rows.flat().map((row): [string, LimitResume] => [
+              row.thread_id,
+              {
+                threadId: row.thread_id,
+                runId: row.run_id,
+                incidentId: row.incident_id,
+                sentAt: row.sent_at,
+              },
+            ]),
+          ),
+      ),
+    );
+
+  const saveLimitResume = (resume: LimitResume) =>
+    sql`
+      INSERT INTO ardud_mission_recovery_limit_resumes ${sql.insert({
+        thread_id: resume.threadId,
+        run_id: resume.runId,
+        incident_id: resume.incidentId,
+        sent_at: resume.sentAt,
+      })}
+      ON CONFLICT (thread_id) DO UPDATE SET
+        run_id = excluded.run_id,
+        incident_id = excluded.incident_id,
+        sent_at = excluded.sent_at
+    `.pipe(Effect.asVoid, Effect.orDie);
+
+  const workedAfter = (runId: string) =>
+    read(
+      sql<{ readonly worked: number }>`
+        SELECT EXISTS (
+          SELECT 1 FROM orchestration_v2_projection_runs a
+          JOIN orchestration_v2_projection_runs l
+            ON l.thread_id = a.thread_id AND l.ordinal > a.ordinal
+          JOIN orchestration_v2_projection_turn_items w ON w.run_id = l.run_id
+          WHERE a.run_id = ${runId}
+            AND l.status NOT IN ('failed', 'cancelled', 'interrupted')
+            AND w.type IN ${sql.in(WORK_ITEMS)}
+        ) AS worked
+      `,
+    ).pipe(Effect.map((rows) => rows[0]?.worked === 1));
+
+  const workedBetween = (input: { readonly afterRunId: string; readonly beforeRunId: string }) =>
+    read(
+      sql<{ readonly worked: number }>`
+        SELECT EXISTS (
+          SELECT 1 FROM orchestration_v2_projection_runs a
+          JOIN orchestration_v2_projection_runs b ON b.thread_id = a.thread_id
+          JOIN orchestration_v2_projection_runs l
+            ON l.thread_id = a.thread_id AND l.ordinal > a.ordinal AND l.ordinal < b.ordinal
+          JOIN orchestration_v2_projection_turn_items w ON w.run_id = l.run_id
+          WHERE a.run_id = ${input.afterRunId} AND b.run_id = ${input.beforeRunId}
+            AND l.status = 'completed' AND w.type IN ${sql.in(WORK_ITEMS)}
+        ) AS worked
+      `,
+    ).pipe(Effect.map((rows) => rows[0]?.worked === 1));
+
   const itemsFor = (runIds: ReadonlyArray<string>) =>
     Effect.forEach(runIds, (runId) =>
       read(
@@ -648,24 +756,47 @@ const make = Effect.gen(function* () {
           completedAt: row.completed_at,
           interruptMessage: row.interrupt_message,
           errorMessage: row.error_message,
+          failure:
+            row.error_class === null && row.error_code === null && row.error_message === null
+              ? null
+              : {
+                  class: row.error_class,
+                  code: row.error_code,
+                  message: row.error_message,
+                  resetAt: row.error_reset_at,
+                },
           continued: row.continued === 1,
+          workedAfter: row.worked_after === 1,
           serverContinued: row.server_continued === 1,
           items: items.get(row.run_id) ?? [],
         })),
       ),
     );
 
+  // One field of the latest provider failure on the run.
+  const failureField = (path: string) => sql`
+    (SELECT json_extract(i.payload_json, ${path}) FROM orchestration_v2_projection_turn_items i
+      WHERE i.run_id = r.run_id AND i.type = 'error'
+      ORDER BY i.ordinal DESC LIMIT 1)
+  `;
+
   const runColumns = sql`
     r.run_id, r.thread_id, r.ordinal, r.status, r.completed_at,
     (SELECT json_extract(i.payload_json, '$.message') FROM orchestration_v2_projection_turn_items i
       WHERE i.run_id = r.run_id AND i.type = 'run_interrupt_request'
       ORDER BY i.ordinal DESC LIMIT 1) AS interrupt_message,
-    (SELECT json_extract(i.payload_json, '$.failure.message') FROM orchestration_v2_projection_turn_items i
-      WHERE i.run_id = r.run_id AND i.type = 'error'
-      ORDER BY i.ordinal DESC LIMIT 1) AS error_message,
+    ${failureField("$.failure.message")} AS error_message,
+    ${failureField("$.failure.class")} AS error_class,
+    ${failureField("$.failure.code")} AS error_code,
+    ${failureField("$.failure.resetAt")} AS error_reset_at,
     EXISTS (SELECT 1 FROM orchestration_v2_projection_runs l
       WHERE l.thread_id = r.thread_id AND l.ordinal > r.ordinal
         AND json_extract(l.payload_json, '$.startedAt') IS NOT NULL) AS continued,
+    EXISTS (SELECT 1 FROM orchestration_v2_projection_runs l
+      JOIN orchestration_v2_projection_turn_items w ON w.run_id = l.run_id
+      WHERE l.thread_id = r.thread_id AND l.ordinal > r.ordinal
+        AND l.status NOT IN ('failed', 'cancelled', 'interrupted')
+        AND w.type IN ${sql.in(WORK_ITEMS)}) AS worked_after,
     EXISTS (SELECT 1 FROM orchestration_v2_projection_runs l
       WHERE l.thread_id = r.thread_id
         AND json_extract(l.payload_json, '$.restartContinuationOfRunId') = r.run_id) AS server_continued
@@ -849,6 +980,10 @@ const make = Effect.gen(function* () {
     chains,
     saveChains,
     lastCompleted,
+    limitResumes,
+    saveLimitResume,
+    workedAfter,
+    workedBetween,
     cutRuns,
     cutRunsById,
     children,
