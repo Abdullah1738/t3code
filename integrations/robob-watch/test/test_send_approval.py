@@ -263,6 +263,156 @@ class SendApprovalTest(unittest.TestCase):
         for iid in ("wake:abc", "V1", "C1", "G1", "M1", "nope"):
             self.assertEqual(self.ok(iid)[0], 2, iid)
 
+    def admin(self, role="admin", name="Moni", routes=None):
+        with open(os.path.join(self.root, "access.json"), "w") as fh:
+            json.dump({"people": [{"name": name, "role": role, "addresses": ["moni@example.com", MONI]}],
+                       "groups": []}, fh)
+        # The bridge's saved routes (owner store kv sbChats): chat key -> chat dir.
+        self.routes(routes if routes is not None else {"dm:" + MONI: "moni", "group:abc123": "group-sb_gro"})
+        if not hasattr(self, "moni"):
+            self.moni = Bridge(self.root, "moni")
+        return self.moni
+
+    def routes(self, m):
+        self.owner.con.execute("insert or replace into kv values ('sbChats', ?)",
+                               (json.dumps({k: {"slug": v} for k, v in m.items()}),))
+        self.owner.con.commit()
+
+    def test_his_word_after_her_ok_and_hers_after_his_go_to_the_judge(self):
+        # Sol (moni-admin r1 B1): checking Moni's OK used to drop what he said in her chat, and the other way round.
+        moni = self.admin()
+        moni.shown("m0", PREVIEW, NOW - 60_000)
+        moni.typed("M1", "yes send it", NOW - 30_000, sender=MONI)
+        moni.typed("A9", "wait, do not send it", NOW - 20_000, sender=OWNER)
+        self.assertEqual(self.ok("M1")[0], 0)  # the stub judge says yes, but it has to see his veto
+        self.assertEqual(self.judged()["later"], [{"from": "Abdullah", "role": "owner", "text": "wait, do not send it"}])
+        self.assertEqual(self.ok("M1", judge="exit 1")[0], 2)  # no plain-OK fallback past his message
+        moni.con.execute("delete from inbound where id = 'A9'")
+        moni.con.commit()
+        # A photo from him after her OK can't be read: refuse.
+        moni.typed("P1", "", NOW - 20_000, sender=OWNER, attachments=[{"guid": "https://x.test/p.jpg"}])
+        code, _, err = self.ok("M1")
+        self.assertEqual(code, 2)
+        self.assertIn("Abdullah sent something after the preview", err)
+        moni.con.execute("delete from inbound where id = 'P1'")
+        moni.con.commit()
+        # His veto typed while the judge thinks.
+        db = os.path.join(self.root, "chats", "moni", "state.sqlite")
+        late = json.dumps({"id": "L1", "text": "no, hold it", "sentAt": NOW, "receivedAt": NOW, "source": "typed",
+                           "sender": OWNER, "attachments": []})
+        slow = ("cat > %s; /usr/bin/python3 -c \"import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+                "c.execute('insert into inbound values (?,?,?)', ('L1', sys.argv[2], 'done')); c.commit()\" %s '%s'; "
+                "echo 0.9") % (self.judge_in, db, late)
+        code, _, err = self.ok("M1", judge=slow)
+        self.assertEqual(code, 2)
+        self.assertIn("wrote again while the OK was being checked", err)
+        # And the other way round: her "hold it" after his OK in a group they share reaches the judge.
+        group = Bridge(self.root, "group-sb_gro")
+        group.shown("g0", PREVIEW, NOW - 60_000)
+        group.typed("G1", "send it", NOW - 30_000, sender=OWNER)
+        group.typed("G2", "hold it, I'll call them", NOW - 20_000, sender=MONI)
+        self.assertEqual(self.ok("G1")[0], 0)
+        self.assertEqual(self.judged()["later"], [{"from": "Moni", "role": "admin", "text": "hold it, I'll call them"}])
+
+    def test_her_own_chat_comes_from_the_bridge_routes_not_her_name(self):
+        # Sol (moni-admin r1 B2): the dir named like her could be a group's, and a renamed admin keeps her old dir.
+        moni = self.admin(routes={"dm:" + MONI: "moni-2", "group:abc123": "moni"})
+        moni.shown("m0", PREVIEW, NOW - 60_000)
+        moni.typed("M1", "yes send it", NOW - 30_000, sender=MONI)
+        code, _, err = self.ok("M1")  # "moni" is a group's dir here
+        self.assertEqual(code, 2)
+        self.assertIn("by an admin in her own chat", err)
+        self.admin(routes={"dm:" + MONI: "moni", "group:abc123": "moni"})
+        self.assertEqual(self.ok("M1")[0], 2)  # a dir a group also uses is nobody's own chat
+        self.admin(name="Monika", routes={"dm:" + MONI: "moni"})
+        self.assertEqual(self.ok("M1")[0], 0)  # renamed, still her saved route
+        self.admin(routes={})
+        self.assertEqual(self.ok("M1")[0], 2)  # no saved route, no own chat
+        self.admin(routes={"dm:moni@example.com": "moni"})
+        self.assertEqual(self.ok("M1")[0], 0)  # her other address routes there too
+
+    def test_an_admin_named_like_him_or_the_assistant_is_still_an_admin(self):
+        # Sol (moni-admin r2): the role came from the display name, so an admin called "Abdullah" could OK in any
+        # chat, and one called "assistant" had a long veto clipped like the assistant's own text.
+        moni = self.admin(name="Abdullah")
+        group = Bridge(self.root, "group-sb_gro")
+        group.shown("g0", PREVIEW, NOW - 60_000)
+        group.typed("G1", "yes send it", NOW - 30_000, sender=MONI)
+        self.assertEqual(self.ok("G1")[0], 2)
+        self.assertEqual(self.ok("G1", judge="exit 1")[0], 2)
+        self.owner.shown("o0", PREVIEW, NOW - 60_000)
+        self.owner.typed("O1", "yes send it", NOW - 30_000, sender=MONI)
+        self.assertEqual(self.ok("O1")[0], 2)
+        moni.shown("m0", PREVIEW, NOW - 60_000)
+        moni.typed("M1", "yes send it", NOW - 30_000, sender=MONI)
+        self.assertEqual(self.ok("M1")[0], 0)  # her own chat still works
+        moni.con.execute("delete from outbox")
+        moni.con.execute("delete from kv")
+        moni.con.execute("delete from inbound")
+        moni.con.commit()
+        self.admin(name="assistant")
+        moni.shown("m1", PREVIEW, NOW - 60_000)
+        moni.typed("M2", "yes send it", NOW - 30_000, sender=MONI)
+        veto = "x " * 750 + "STOP: do not send this draft. " + "y " * 750
+        moni.typed("M3", veto, NOW - 20_000, sender=MONI)
+        picky = "cat > %s; grep -q 'STOP: do not send' %s && echo 0.1 || echo 0.9" % (self.judge_in, self.judge_in)
+        self.assertEqual(self.ok("M2", judge=picky)[0], 2)
+        self.assertEqual(self.judged()["later"], [{"from": "assistant", "role": "admin", "text": veto}])
+
+    def test_odd_access_json_never_breaks_his_own_ok(self):
+        # Sol (moni-admin r1 S1): {"people": 1} raised a TypeError on his own OK.
+        self.owner.shown("o1", PREVIEW, NOW - 60_000)
+        self.owner.typed("A1", "send it", NOW - 30_000)
+        for bad in ({"people": 1}, {"people": [{"name": "Moni", "role": "admin", "addresses": 5}]}, [], "x"):
+            with open(os.path.join(self.root, "access.json"), "w") as fh:
+                json.dump(bad, fh)
+            code, _, err = self.ok("A1")
+            self.assertEqual(code, 0, (bad, err))
+
+    def test_moni_as_admin_oks_in_her_own_chat_like_him(self):
+        # 24 Oct, owner: "Moni is an admin, you do not need to ask me."
+        moni = self.admin()
+        moni.shown("m0", PREVIEW, NOW - 60_000)
+        moni.typed("M1", "yes send it", NOW - 30_000, sender=MONI)
+        code, out, err = self.ok("M1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Moni's reply M1", out)
+        state = self.judged()
+        self.assertEqual(state["reply"], "yes send it")
+        moni.typed("M2", "wait, change the date", NOW - 20_000, sender=MONI)
+        self.ok("M1")
+        self.assertEqual(self.judged()["later"], [{"from": "Moni", "role": "admin", "text": "wait, change the date"}])
+        with open(self.log) as fh:
+            self.assertEqual(json.loads(fh.read().splitlines()[-1])["approver"], "Moni")
+
+    def test_moni_ok_needs_admin_role_her_own_chat_typed_text_and_the_preview_there(self):
+        moni = self.admin(role="person")
+        moni.shown("m0", PREVIEW, NOW - 60_000)
+        moni.typed("M1", "yes send it", NOW - 30_000, sender=MONI)
+        self.assertEqual(self.ok("M1")[0], 2)  # not an admin
+        self.admin()
+        self.assertEqual(self.ok("M1")[0], 0)
+        moni.typed("V1", "yes send it", NOW - 29_000, sender=MONI, audio=True)
+        moni.typed("G1", "yes send it", NOW - 28_000, sender="+15550000000")
+        moni.typed("wake:m", "yes send it", NOW - 27_000, sender=MONI)
+        for iid in ("V1", "G1", "wake:m"):
+            self.assertEqual(self.ok(iid)[0], 2, iid)
+        # Her OK in a group, even with the preview there, isn't her own chat.
+        group = Bridge(self.root, "group-sb_gro")
+        group.shown("g0", PREVIEW, NOW - 60_000)
+        group.typed("GM", "yes send it", NOW - 26_000, sender=MONI)
+        self.assertEqual(self.ok("GM")[0], 2)
+        # The preview has to be in her chat: shown only to him doesn't count for her reply.
+        self.clear()
+        self.admin()  # clear() wiped the saved routes in the owner store
+        self.owner.shown("o1", PREVIEW, NOW - 60_000)
+        moni.con.execute("delete from outbox")
+        moni.con.execute("delete from kv")
+        moni.con.commit()
+        code, _, err = self.ok("M1")
+        self.assertEqual(code, 2)
+        self.assertIn("Moni wasn't shown this draft's preview", err)
+
     def test_owner_ok_in_a_group_chat_needs_the_preview_in_that_chat(self):
         group = Bridge(self.root, "group-sb_gro")
         self.owner.shown("o1", PREVIEW, NOW - 60_000)
@@ -291,7 +441,7 @@ class SendApprovalTest(unittest.TestCase):
         state = self.judged()
         self.assertEqual([b["text"] for b in state["between"]], ["Want me to make it shorter?", "hmm"])
         self.assertEqual(len(state["later"]), 6)
-        self.assertEqual(state["later"][-1], {"from": "Abdullah", "text": tail})  # his words are never clipped
+        self.assertEqual(state["later"][-1], {"from": "Abdullah", "role": "owner", "text": tail})  # his words are never clipped
 
     def test_too_much_said_after_the_preview_is_refused_not_clipped(self):
         self.owner.shown("o1", PREVIEW, NOW - 90_000)
@@ -498,7 +648,7 @@ class SendApprovalTest(unittest.TestCase):
         self.owner.con.commit()
         self.assertEqual(self.ok("A1")[0], 0)  # the judge stub approves; what matters is what it saw
         self.assertEqual(self.judged()["later"], [{"from": "Abdullah (voice note, transcribed)",
-                                                   "text": "Wait, do not send it"}])
+                                                   "role": "owner", "text": "Wait, do not send it"}])
         self.assertEqual(self.ok("A1", judge="exit 1")[0], 2)  # judge down: no plain-OK shortcut with a later note
         photo = [{"guid": "https://cdn.test/p.jpg", "fileName": "p.jpg", "mimeType": "image/jpeg"}]
         self.owner.typed("P1", "", NOW - 10_000, attachments=photo)
@@ -533,7 +683,7 @@ class SendApprovalTest(unittest.TestCase):
         self.owner.typed("A1", "send it", NOW - 30_000)
         code, _, err = self.ok("A1", judge=slow)
         self.assertEqual(code, 2)
-        self.assertIn("wrote again while his OK was being checked", err)
+        self.assertIn("wrote again while the OK was being checked", err)
 
     def test_judge_score_has_to_be_a_probability(self):
         # Astra r1 S2: "nan" passed the threshold check.

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
-"""send-approval: did Abdullah OK this exact outgoing message after he saw it? Used by `wa send --approved`
-and `mailsend send --approved`; read-only.
+"""send-approval: did Abdullah (or an admin, Moni) OK this exact outgoing message after seeing it? Used by
+`wa send --approved` and `mailsend send --approved`; read-only.
 
   send-approval check (--inbound ID | --app) --preview TEXT --drafted-at EPOCH [--file SHA256 NAME]...
   send-approval visible TEXT     exit 2 if the chat would hide part of TEXT (drafts are refused at write time)
@@ -22,7 +22,9 @@ Exit 0 and one "approved: ..." line, or exit 2 and "Refused: ..." on stderr.
           Files: the bridge also delivered that exact file (sha256) to the chat around the preview. A Robob
           thread can't show that, so drafts with files are refused with --app.
   reply   --inbound ID: the bridge id of a message he typed in the last 24h after the preview ("Current
-          incoming message ID"), ordered by the time he sent it. Wakes, voice notes, Moni and guests don't count.
+          incoming message ID"), ordered by the time he sent it. Wakes, voice notes, relays and guests don't
+          count. An admin (role "admin" in the bridge's access.json, Moni) OKs the same way in her own direct
+          chat: the preview delivered there, her typed reply there (owner, 24 Oct: "Moni is an admin").
           --app: the first message he typed in this Robob thread (web or mobile) after the preview finished.
   judge   Jev reads the preview, everything said between it and his reply, the reply and everything after it
           (his voice notes by their transcript), and has to agree he OKed this draft and didn't take it back.
@@ -247,28 +249,93 @@ def bridge_config():
         return {}
 
 
-def his(chat, p, owner):
-    """Written by him: his number, or no sender in his own chat (photon-era rows and poll votes)."""
+def access_admins():
+    """[(name, {addresses})] for every admin in the bridge's access.json. Odd shapes count as no admins, like
+    the bridge's own loadAccess, and never break his own check."""
+    try:
+        with open(os.path.join(BRIDGE, "access.json")) as fh:
+            people = json.load(fh).get("people")
+    except (OSError, ValueError, AttributeError):
+        return []
+    out = []
+    for p in people if isinstance(people, list) else []:
+        if not isinstance(p, dict) or p.get("role") != "admin" or not isinstance(p.get("name"), str) \
+                or not p["name"].strip() or not isinstance(p.get("addresses"), list):
+            continue
+        addrs = {address(a) for a in p["addresses"] if isinstance(a, str) and a.strip()}
+        if addrs:
+            out.append((p["name"].strip(), addrs))
+    return out
+
+
+def admin_routes(admin_list):
+    """{chat dir: (name, {addresses})}: each admin's own direct chat, read from the bridge's saved routes
+    (owner store kv sbChats, chat key -> slug) rather than guessed from her name. A dir that any group route
+    also uses is nobody's direct chat."""
+    path = os.path.join(BRIDGE, "state.sqlite")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        con = ro(path)
+        row = con.execute("select value from kv where key = 'sbChats'").fetchone()
+        con.close()
+        saved = json.loads(row[0]) if row else {}
+    except (sqlite3.Error, ValueError, TypeError):
+        return {}
+    if not isinstance(saved, dict):
+        return {}
+    slugs = {k: v.get("slug") for k, v in saved.items() if isinstance(k, str) and isinstance(v, dict)
+             and isinstance(v.get("slug"), str) and v["slug"] and v["slug"] != "owner"}
+    groups = {s for k, s in slugs.items() if not k.startswith("dm:")}
+    out = {}
+    for k, slug in slugs.items():
+        if not k.startswith("dm:") or slug in groups:
+            continue
+        who = [a for a in admin_list if address(k[3:]) in a[1]]
+        if len(who) == 1 and out.get(slug, who[0]) == who[0]:
+            out[slug] = who[0]
+        else:
+            out[slug] = None  # two people on one route: no one's own chat
+    return {s: v for s, v in out.items() if v}
+
+
+def speaker(chat, p, owner, admin_list):
+    """Who wrote this inbound row, if it was him or an admin: ("owner", "Abdullah"), ("admin", her name), or
+    None (guests, others). The role comes from the sender's address, never from a display name. In his own
+    chat a row without a sender is his (photon-era rows and poll votes)."""
     sender = p.get("sender")
-    if chat == "owner":
-        return sender is None or bool(owner and address(sender) == owner)
-    return bool(owner) and address(sender) == owner
+    if owner and address(sender) == owner or (chat == "owner" and sender is None):
+        return ("owner", "Abdullah")
+    for name, addrs in admin_list:
+        if address(sender) in addrs:
+            return ("admin", name)
+    return None
 
 
-def owner_typed(chat, p, owner):
-    """Same rule as the missions inbound check, minus Moni: only he OKs sends in his name."""
-    if p.get("source") != "typed" or p.get("isAudioMessage") or p.get("attachments") \
-            or not str(p.get("text") or "").strip():
-        return False
-    return his(chat, p, owner)
+def approver_for(chat, p, owner, admin_list, routes):
+    """Who may OK with this row as the reply: him anywhere he writes, an admin only in her own direct chat
+    (a saved dm route of one of her addresses). None for anyone else."""
+    who = speaker(chat, p, owner, admin_list)
+    if who and who[0] == "owner":
+        return who
+    if who and chat in routes and routes[chat][0] == who[1] and address(p.get("sender")) in routes[chat][1]:
+        return who
+    return None
 
 
-def said_by_him(con, p):
-    """(label, text) the judge reads for one of his messages, or None when part of it can't be read."""
+def owner_typed(p):
+    """Same rule as the missions inbound check: typed text only (no wakes, voice notes or attachments)."""
+    return p.get("source") == "typed" and not p.get("isAudioMessage") and not p.get("attachments") \
+        and bool(str(p.get("text") or "").strip())
+
+
+def said_by_him(con, p, name):
+    """(label, text) the judge reads for one of his or an admin's messages (name = display name), or None when
+    part of it can't be read."""
     text = str(p.get("text") or "")
     files = [a for a in p.get("attachments") or [] if isinstance(a, dict)]
     if not files:
-        return ("Abdullah", text)
+        return (name, text)
     if not p.get("isAudioMessage") or len(files) != 1 or not files[0].get("guid"):
         return None  # a photo or file: the judge can't see what it says
     key = "transcript:" + hashlib.sha256(str(files[0]["guid"]).encode()).hexdigest()
@@ -279,11 +346,12 @@ def said_by_him(con, p):
         heard = None
     if not isinstance(heard, str) or not heard.strip():
         return None
-    return "Abdullah (voice note, transcribed)", (text + "\n" + heard).strip()
+    return f"{name} (voice note, transcribed)", (text + "\n" + heard).strip()
 
 
-def owner_rows(con, chat, owner, t_s, skip):
-    """Everything he sent to this chat after t_s except the reply: [(t, id, payload)]."""
+def owner_rows(con, chat, owner, admin_list, t_s, skip):
+    """Everything he or an admin sent to this chat after t_s except the reply: [(t, id, payload, (role, name))].
+    All of it, whoever OKs: his change or veto counts against her OK and hers against his."""
     out = []
     for rid, payload in con.execute("select id, payload from inbound order by id"):
         if rid == skip or rid.startswith(NOT_SAID):
@@ -295,8 +363,9 @@ def owner_rows(con, chat, owner, t_s, skip):
         if not isinstance(p, dict):
             continue
         t = int_ms(p.get("sentAt")) or int_ms(p.get("receivedAt"))
-        if t is not None and t > t_s and his(chat, p, owner):
-            out.append((t, rid, p))
+        name = speaker(chat, p, owner, admin_list) if t is not None and t > t_s else None
+        if name:
+            out.append((t, rid, p, name))
     return sorted(out, key=lambda x: (x[0], x[1]))
 
 
@@ -453,8 +522,16 @@ def check_bridge(iid, block, seen, files, drafted):
         reply = json.loads(row[0])
     except ValueError:
         refuse(f"incoming message {iid} is unreadable")
-    if not isinstance(reply, dict) or not owner_typed(chat, reply, owner):
-        refuse(f"incoming message {iid} wasn't typed by Abdullah (wake, voice note, attachment or someone else).")
+    admin_list = access_admins()
+    name = None
+    if isinstance(reply, dict):
+        # Saved routes only matter for an admin's OK; his own never depends on them.
+        first = speaker(chat, reply, owner, admin_list)
+        who = approver_for(chat, reply, owner, admin_list, admin_routes(admin_list) if first and first[0] == "admin" else {})
+        name = who and who[1]
+    if not name or not owner_typed(reply):
+        refuse(f"incoming message {iid} wasn't typed by Abdullah, or by an admin in her own chat (wake, voice note, "
+               "attachment or someone else).")
     # receivedAt can be a late arrival (backfill); sentAt is when he sent it.
     ta = int_ms(reply.get("sentAt"))
     if ta is None:
@@ -478,8 +555,8 @@ def check_bridge(iid, block, seen, files, drafted):
     with_block = [x for x in sent if drafted <= x[0] < ta and find_block(lines_of(x[2].get("text")), block) is not None
                   and find_block(lines_of(shown_r[x[1]]["text"]), seen) is not None]
     if not with_block:
-        refuse(f"Abdullah wasn't shown this draft's preview before his reply {iid} ({stamp(ta)}). Paste the "
-               "preview block as is in his chat, wait for his OK, then use the id of that reply.")
+        refuse(f"{name} wasn't shown this draft's preview in this chat before the reply {iid} ({stamp(ta)}). Paste "
+               "the preview block as is in the chat of whoever OKs it, wait for the OK, then use the id of that reply.")
     why = None
     for cand in reversed(with_block):
         why = undelivered(con, cand[1], cand[2], shown_r[cand[1]]["chunks"], ta)
@@ -490,39 +567,39 @@ def check_bridge(iid, block, seen, files, drafted):
         refuse(f"the preview before his reply {iid} isn't confirmed delivered to him before he replied ({why}). "
                "If Sendblue is still delivering it, wait a minute and try again; otherwise show the preview again "
                "and use his next OK.")
-    for sha, name in files:
+    for sha, fname in files:
         if not any((x[2].get("attachment") or {}).get("sha256") == sha and t_s - FILE_LEAD_MS <= x[0] < ta
                    and not undelivered(con, x[1], x[2], shown_r[x[1]]["chunks"], ta) for x in sent):
-            refuse(f"the file {name} itself didn't reach Abdullah's chat with the preview (or isn't confirmed "
-                   "delivered). send-file it there right before the preview, then use the id of his OK.")
+            refuse(f"the file {fname} itself didn't reach the chat with the preview (or isn't confirmed "
+                   "delivered). send-file it there right before the preview, then use the id of the OK.")
 
     def gather():
-        rows = owner_rows(con, chat, owner, t_s, iid)
+        rows = owner_rows(con, chat, owner, admin_list, t_s, iid)
         items = []
-        for t, rid, p in rows:
+        for t, rid, p, (role, wname) in rows:
             if not str(p.get("text") or "").strip() and not p.get("attachments"):
                 continue  # nothing in it
-            s = said_by_him(con, p)
+            s = said_by_him(con, p, wname)
             if s is None:
-                raise NotOk(f"he sent something after the preview that can't be read as text ({rid}: a photo, file "
-                            "or untranscribed voice note). Ask him in words and use that reply.")
-            items.append((t, s[0], s[1]))
+                raise NotOk(f"{wname} sent something after the preview that can't be read as text ({rid}: a photo, "
+                            "file or untranscribed voice note). Ask in words and use that reply.")
+            items.append((t, role, s[0], s[1]))
         return rows, items
 
     try:
         rows, owners = gather()
         bare = only_preview(lines_of(shown_r[shown_id]["text"]), seen)
-        said = sorted(owners + [(t, "assistant", outbox_text({**p, "text": shown_r[oid]["text"]}))
+        said = sorted(owners + [(t, "assistant", "assistant", outbox_text({**p, "text": shown_r[oid]["text"]}))
                                 for t, oid, p in sent if t > t_s and oid != shown_id], key=lambda x: x[0])
         verdict = decide(block, shown_r[shown_id]["text"], [x for x in said if x[0] < ta], reply.get("text") or "",
-                         [x for x in said if x[0] >= ta], f"his reply {iid} ({stamp(ta)})", t_s, bare)
+                         [x for x in said if x[0] >= ta], (f"his reply {iid}" if who[0] == "owner" else f"{name}'s reply {iid}") + f" ({stamp(ta)})", t_s, bare, who)
         # He may have written again while the judge was thinking.
-        if [r[1] for r in owner_rows(con, chat, owner, t_s, iid)] != [r[1] for r in rows]:
-            raise NotOk("he wrote again while his OK was being checked. Read it, then run the send again.")
+        if [r[1] for r in owner_rows(con, chat, owner, admin_list, t_s, iid)] != [r[1] for r in rows]:
+            raise NotOk("someone wrote again while the OK was being checked. Read it, then run the send again.")
     except NotOk as e:
         refuse(str(e))
     con.close()
-    log({"decision": "approved", **verdict[1]})
+    log({"decision": "approved", "approver": name, "approver_role": who[0], **verdict[1]})
     print(verdict[0])
 
 
@@ -634,7 +711,7 @@ def check_app(raw, drafted):
             if m["who"] == "Abdullah" and m.get("files"):
                 raise NotOk("he attached something after the preview, and that can't be read as text. Ask him in "
                             "words and use that reply.")
-            out.append((m["t"], m["who"], m["text"]))
+            out.append((m["t"], "owner" if m["who"] == "Abdullah" else "assistant", m["who"], m["text"]))
         return out
 
     why = None
@@ -648,7 +725,7 @@ def check_app(raw, drafted):
             bare = len(outside) <= 1 and all(x.lower() in SEND_PROMPTS for x in outside)
             before = [(m["t"], m["text"]) for m in msgs if m["who"] == "Abdullah" and m["t"] > msgs[s]["done_t"]]
             verdict = decide(block, msgs[s]["text"], said(msgs[s + 1:r]), msgs[r]["text"], said(msgs[r + 1:]),
-                             f"his message at {stamp(msgs[r]['t'])}", msgs[s]["done_t"], bare)
+                             f"his message at {stamp(msgs[r]['t'])}", msgs[s]["done_t"], bare, ("owner", "Abdullah"))
             after = [(m["t"], m["text"]) for m in app_messages(row[0])
                      if m["who"] == "Abdullah" and m["t"] > msgs[s]["done_t"]]
             if after != before:
@@ -683,7 +760,8 @@ def probability(v):
     return p
 
 
-def jev(state):
+def jev(state, who):
+    role, name = who
     if JUDGE:
         r = subprocess.run(JUDGE, shell=True, input=json.dumps(state), capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
@@ -693,14 +771,15 @@ def jev(state):
         key = fh.read().strip()
     body = {"model": JEV_MODEL, "state": {"s": state}, "questions": {"s": {
         "type": "noul",
-        "instructions": "Abdullah was shown `s.shown`, which contains the preview `s.draft` of an outgoing "
-                        "message an assistant wants to send in his name. `s.between` lists what was said after "
-                        "that, oldest first. Then he typed `s.reply`. `s.later` lists everything said after his "
-                        "reply. Decide whether he approved sending exactly this draft.",
+        "instructions": f"{name} (the {role}) was shown `s.shown`, which contains the preview `s.draft` of an "
+                        f"outgoing message an assistant wants to send on {name}'s say-so. `s.between` lists what was "
+                        "said after that, oldest first; `role` says who said it: the owner (Abdullah), an admin "
+                        f"(such as Moni) or the assistant. Then {name} typed `s.reply`. `s.later` lists everything "
+                        "said after that reply. Decide whether the draft is approved to send exactly as shown.",
         "criteria": {
             "true": "`s.reply` clearly OKs sending this draft as shown (yes, send it, go ahead, approved, looks "
-                    "good), or OKs a set of drafts that includes it, and nothing he says in `s.between` or "
-                    "`s.later` changes, holds or takes it back.",
+                    "good), or OKs a set of drafts that includes it, and nothing the owner or an admin says in "
+                    "`s.between` or `s.later` changes, holds or takes it back.",
             "false": "He asks for changes, asks a question, declines, approves something else or another version, "
                      "holds or takes it back later, or it is unclear."}}}}
     req = urllib.request.Request(JEV_URL, data=json.dumps(body).encode(), headers={
@@ -715,26 +794,28 @@ def jev(state):
     raise RuntimeError(str(last))
 
 
-def decide(block, shown, between, reply, later, where, t_s, bare):
+def decide(block, shown, between, reply, later, where, t_s, bare, who):
     """(approved line, log fields), or NotOk. `bare`: the showing message was only the preview (+ a send prompt)."""
     if len(between) + len(later) > MAX_ITEMS:
         raise NotOk(f"too much was said since the preview ({len(between) + len(later)} messages) to check his OK. "
                     "Show the preview again and use his fresh OK.")
 
-    def item(who, text):
-        if who.startswith("Abdullah") and len(text) > MAX_OWNER_CHARS:
-            raise NotOk("one of his messages since the preview is too long to check. Show the preview again.")
-        return {"from": who, "text": text if who.startswith("Abdullah") else clip_mid(text, 1500)}
+    def item(role, label, text):
+        # His and an admin's words go to the judge whole; only the assistant's are clipped. The role comes from
+        # where the message came from (outbox or a known sender), never from the name.
+        if role != "assistant" and len(text) > MAX_OWNER_CHARS:
+            raise NotOk("one of the messages since the preview is too long to check. Show the preview again.")
+        return {"from": label, "role": role, "text": text if role != "assistant" else clip_mid(text, 1500)}
 
     if len(reply) > MAX_OWNER_CHARS:
         raise NotOk("his reply is too long to check as an OK. Ask him for a plain OK after the preview.")
     state = {"draft": clip_mid("\n".join(block), 6000), "shown": clip_mid(shown, 8000),
-             "between": [item(w, t) for _, w, t in between], "reply": reply,
-             "later": [item(w, t) for _, w, t in later]}
+             "between": [item(r, w, t) for _, r, w, t in between], "reply": reply,
+             "later": [item(r, w, t) for _, r, w, t in later]}
     if len(json.dumps(state)) > MAX_STATE_CHARS:
         raise NotOk("too much was said since the preview to check his OK. Show the preview again.")
     try:
-        p = jev(state)
+        p = jev(state, who)
     except Exception as e:
         if plain_ok(reply) and not between and not later and bare:
             return (f"approved: {where} \"{clip(reply, 80)}\" right after the preview shown {stamp(t_s)}",

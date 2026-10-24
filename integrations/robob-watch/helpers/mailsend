@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""mailsend: email in Abdullah's name, draft first. Only a draft he OKed after seeing it goes out.
+"""mailsend: email in Abdullah's name, draft first. Only a draft he (or Moni, an admin, in her chat) OKed after seeing it goes out.
 
   mailsend draft -a ACCT -t ADDR [-t ADDR]... [--cc ADDR]... -s SUBJECT (--body TEXT | --body-file PATH) [--attach PATH]...
   mailsend reply -a ACCT -m MAILBOX ID (--body TEXT | --body-file PATH) [--cc ADDR]... [--attach PATH]...
@@ -150,8 +150,8 @@ def fresh(d):
 
 def print_draft(d):
     print(f"DRAFT {d['id']} email to {', '.join(d['to'] + d['cc'])}: {d['subject']}")
-    print("Show Abdullah these lines as is (the full email that goes out; in a Robob thread alone in a plain ``` "
-          "code block), then wait for his OK:")
+    print("Show Abdullah these lines as is (the full email that goes out; for Moni's own request: Moni, in her chat; "
+          "in a Robob thread alone in a plain ``` code block), then wait for the OK:")
     print(d["preview"])
     print(f"After his OK: mailsend send --approved {d['id']} --inbound <incoming message ID of his reply> "
           "(in a Robob thread: --app)")

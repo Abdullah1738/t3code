@@ -11,7 +11,7 @@
 #                             --more N shows N*40 more and asks the phone for older history when the store runs out
 #   wa draft <jid> <text...>  store a single-line text draft (sends nothing); prints the preview lines to show Abdullah
 #   wa draftfile <jid> <path> [--as image|video|audio|document|auto] [caption...]   same for a file (bound to its bytes)
-#   wa send --approved <id> (--inbound <id> | --app)   send a text draft once Abdullah OKed its preview (once, within 24h).
+#   wa send --approved <id> (--inbound <id> | --app)   send a text draft once Abdullah (or Moni, in her chat) OKed its preview.
 #                             --inbound: the incoming message ID of his OK (iMessage), --app: his reply in this Robob
 #                             thread. send-approval checks he got the preview lines before that reply and that it is an OK.
 #   wa sendfile --approved <id> (--inbound <id> | --app)   same for a file draft
@@ -110,7 +110,7 @@ check_ok() {
 }
 # Print the preview lines the agent pastes to Abdullah before asking for his OK.
 show_preview() {
-  print -r -- "Show Abdullah these lines as is (in a Robob thread: alone in a plain \`\`\` code block), then wait for his OK:"
+  print -r -- "Show Abdullah these lines as is (for Moni's own request: Moni, in her chat; in a Robob thread: alone in a plain \`\`\` code block), then wait for the OK:"
   print -r -- "$3"
   print -r -- "After his OK: wa $2 --approved $1 --inbound <incoming message ID of his reply> (in a Robob thread: --app)"
 }
