@@ -260,7 +260,8 @@ function CollapsibleBlock(props: {
 const markdownCap = (maxLines: number | null) =>
   maxLines === null ? undefined : { maxHeight: `${maxLines * 1.625}em` };
 
-function MarkdownText(props: { text: string; maxLines: number | null }) {
+/** Markdown folded to `maxLines` with Show all; grows in place when opened. */
+export function MarkdownText(props: { text: string; maxLines: number | null }) {
   const [unfolded, setUnfolded] = useState(false);
   const [size, setSize] = useState<{ content: number; cap: number } | null>(null);
   const content = useRef<HTMLDivElement>(null);

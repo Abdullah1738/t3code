@@ -35,6 +35,8 @@ import type {
   SuggestionTargetKind,
 } from "@t3tools/contracts";
 
+import { isMasterApproval } from "@t3tools/contracts";
+
 import { routedTo, suggestionsFor, type InboxRouteFilter } from "./routingViewModel.ts";
 import type { AddDraftNoteInput, MissionInboxSnapshot } from "./source.ts";
 import { diffStats, diffWords, type DiffSegment, type DiffStats } from "./textDiff.ts";
@@ -701,6 +703,12 @@ export const APPROVAL_STATUS_LABEL: Record<Approval["status"], string> = {
   rejected: "Rejected",
   "stale-closed": "Closed as stale",
 };
+
+/** The master withdraws its own asks; crw closes its approvals as stale. */
+export const approvalOutcomeLabel = (approval: Pick<Approval, "status" | "requestedBy">): string =>
+  approval.status === "stale-closed" && isMasterApproval(approval)
+    ? "Withdrawn"
+    : APPROVAL_STATUS_LABEL[approval.status];
 
 export const KNOCK_STATUS_LABEL: Record<Knock["status"], string> = {
   pending: "Waiting",

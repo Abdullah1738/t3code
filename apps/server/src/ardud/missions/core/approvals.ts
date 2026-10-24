@@ -3,7 +3,9 @@ import * as NodeCrypto from "node:crypto";
 
 import {
   approverOf,
+  isMasterApproval,
   isOwnerProvenance,
+  MASTER_APPROVAL_REQUESTER,
   MissionError,
   type AnnotateApprovalInput,
   type Approval,
@@ -36,7 +38,8 @@ import { sameValue } from "./rules.ts";
 
 /**
  * Approvals: a system (crw) opens one per decision and closes it as stale
- * when the head moves or the PR closes. The mission's routing table decides
+ * when the head moves or the PR closes. The mission's master opens its own
+ * (releases, deploys) the same way and never decides them. The routing table decides
  * whether the owner or the master is the approver; the owner can always
  * decide, the master only what is routed to it. A stale-closed approval never
  * counts as a decision, and every decision is pinned to its record, whose id
@@ -294,16 +297,31 @@ export const makeApprovalWrites = (kit: WriteKit) => {
       { discard: true },
     );
 
-  /** Systems open approvals in their own name. */
-  const requireRequester = (provenance: MissionProvenance, requestedBy: string) =>
-    provenance._tag === "system" && provenance.component === requestedBy
-      ? Effect.void
-      : fail("forbidden", `Only ${requestedBy} opens or closes its approvals.`);
+  /**
+   * Systems open approvals in their own name; approvals in the master's name
+   * come only from the mission's master thread, never from a system.
+   */
+  const requireRequester = (
+    missionId: MissionId,
+    provenance: MissionProvenance,
+    requestedBy: string,
+  ) =>
+    Effect.gen(function* () {
+      if (requestedBy === MASTER_APPROVAL_REQUESTER) {
+        if (yield* isMasterOf(store, missionId, provenance)) return;
+        return yield* fail(
+          "forbidden",
+          `Only mission ${missionId}'s master opens or closes its approvals.`,
+        );
+      }
+      if (provenance._tag === "system" && provenance.component === requestedBy) return;
+      return yield* fail("forbidden", `Only ${requestedBy} opens or closes its approvals.`);
+    });
 
   const openApproval = (provenance: MissionProvenance, input: OpenApprovalInput) =>
     serial(
       Effect.gen(function* () {
-        yield* requireRequester(provenance, input.requestedBy);
+        yield* requireRequester(input.missionId, provenance, input.requestedBy);
         const mission = yield* loadMission(input.missionId);
         const existing = yield* store.get("approval", input.approvalId);
         if (Option.isSome(existing)) {
@@ -320,12 +338,17 @@ export const makeApprovalWrites = (kit: WriteKit) => {
         const work = routesByWork(mission.approvalRouting)
           ? approvalWork(input.links, yield* store.list("work-item", { missionId: mission.id }))
           : { subMissionId: null, workItemId: null };
-        const route = routeApprover(mission.approvalRouting, {
+        const routed = routeApprover(mission.approvalRouting, {
           _tag: "approval",
           kind: input.kind,
           repository: repositoryOf(input.links),
           ...work,
         });
+        // The master never approves what it asked for itself.
+        const route =
+          input.requestedBy === MASTER_APPROVAL_REQUESTER && routed.approver === "master"
+            ? { approver: "owner" as const, routeId: null }
+            : routed;
         const now = yield* nowIso;
         const record: Approval = {
           id: input.approvalId,
@@ -373,7 +396,7 @@ export const makeApprovalWrites = (kit: WriteKit) => {
             `Approval ${before.id} is not in mission ${input.missionId}.`,
           );
         }
-        yield* requireRequester(provenance, before.requestedBy);
+        yield* requireRequester(before.missionId, provenance, before.requestedBy);
         if (before.status === "stale-closed")
           return yield* unchanged(before.missionId, approvalRef(before));
         if (before.status !== "pending") {
@@ -495,6 +518,8 @@ export const makeApprovalWrites = (kit: WriteKit) => {
               onOwnerCondition: condition,
               ...(mark === null ? {} : { commentId: mark.comments.at(-1)?.id ?? null }),
               ...(commented ? { commented: true } : {}),
+              // The master feed sends every decision on the master's own approvals back to it.
+              ...(isMasterApproval(before) ? { masterAsked: true } : {}),
             },
           });
         }),
@@ -521,6 +546,12 @@ export const makeApprovalWrites = (kit: WriteKit) => {
         }
         const from = approverOf(before);
         if (from === input.approver) return yield* unchanged(before.missionId, approvalRef(before));
+        if (input.approver === "master" && isMasterApproval(before)) {
+          return yield* fail(
+            "invalid",
+            `Approval ${before.id} is the master's own ask; only the owner decides it.`,
+          );
+        }
         const record: Approval = { ...before, approver: input.approver, routeNote: input.reason };
         return yield* commit(provenance, {
           missionId: before.missionId,

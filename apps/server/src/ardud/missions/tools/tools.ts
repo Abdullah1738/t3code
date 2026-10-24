@@ -21,6 +21,8 @@ import {
   NonNegativeInt,
   OwnerCondition,
   NoteId,
+  OpenMasterApprovalInput,
+  CloseStaleApprovalInput,
   OrchestratorMcpFailure,
   PostMessageInput,
   RecordDraftSentInput,
@@ -548,6 +550,18 @@ const MissionCallReviseTool = missionWriteTool(
   }),
 );
 
+const MissionApprovalOpenTool = missionWriteTool(
+  "mission_approval_open",
+  "As the mission's master, bring a release, deploy or other go/no-go to the approver as an approval (Approve or Reject with comments on Needs you). Routed by the mission's approval routing, never to yourself. Put the changelog, build links and install plan in detail (markdown, shown in full); summary is one or two lines. Pass a stable approvalId so a retry is a no-op. The decision and the owner's comments come back to you in the control room; act on approved only.",
+  OpenMasterApprovalInput,
+);
+
+const MissionApprovalWithdrawTool = missionWriteTool(
+  "mission_approval_withdraw",
+  "As the mission's master, close one of your own pending approvals with the reason (e.g. superseded by a newer build). It never counts as a decision; open a new id for the replacement.",
+  CloseStaleApprovalInput,
+);
+
 const MissionApprovalRouteTool = missionWriteTool(
   "mission_approval_route",
   "As the mission's master, send one pending approval to the owner or to the master, with the reason. The reason is logged and shown with the approval.",
@@ -722,6 +736,8 @@ export const MissionsToolkit = Toolkit.make(
   writeTool(MissionCallReviseTool, "Revise a call on the owner's condition"),
   writeTool(MissionPortfolioReorderTool, "Set the portfolio order"),
   writeTool(MissionLaneNudgeTool, "Nudge a lane"),
+  writeTool(MissionApprovalOpenTool, "Open an approval"),
+  writeTool(MissionApprovalWithdrawTool, "Withdraw an approval"),
   writeTool(MissionApprovalRouteTool, "Route one approval"),
   writeTool(MissionApprovalAnnotateTool, "Annotate an approval"),
   writeTool(MissionApprovalRoutingTool, "Set approval routing"),

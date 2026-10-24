@@ -18,7 +18,7 @@ import {
   type InboxEntryGroup,
 } from "../cardViewModel.ts";
 import {
-  APPROVAL_STATUS_LABEL,
+  approvalOutcomeLabel,
   DRAFT_STATUS_LABEL,
   draftSentText,
   inboxEntries,
@@ -239,7 +239,7 @@ export function decidedRows(
     ...history.approvals.map((approval) => ({
       key: `approval:${approval.id}`,
       title: approval.title,
-      outcome: APPROVAL_STATUS_LABEL[approval.status],
+      outcome: approvalOutcomeLabel(approval),
       at: approval.decidedAt ?? approval.createdAt,
       age: age(approval.decidedAt, approval.createdAt),
       condition: ownerConditionOf(approval)?.quote ?? null,

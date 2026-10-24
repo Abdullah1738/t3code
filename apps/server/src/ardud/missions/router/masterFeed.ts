@@ -1,7 +1,8 @@
 /**
  * What reaches the master besides messages addressed to it: one digest per
- * editor pass, the approvals and drafts routed to the master, and the notes
- * the owner leaves when deciding an approval. Each one
+ * editor pass, the approvals and drafts routed to the master, the notes
+ * the owner leaves when deciding an approval, and every owner decision on an
+ * approval the master opened itself. Each one
  * is a message in the mission's control room addressed to the master role,
  * so it rings the doorbell like every other delivery. Keys come from the
  * event id, so a replayed event posts nothing new.
@@ -12,6 +13,7 @@
  */
 import {
   approverOf,
+  isOwnerProvenance,
   type MissionEvent,
   type MissionId,
   type MissionMessageKind,
@@ -74,8 +76,20 @@ const ownerCommented = (event: MissionEvent) =>
     "commented" in event.payload &&
     event.payload.commented === true);
 
+/** The owner decided an approval the master opened (a release): the master waits on it either way. */
+const ownerDecidedMasterAsk = (event: MissionEvent) =>
+  event.kind === "approval.decided" &&
+  isOwnerProvenance(event.provenance) &&
+  typeof event.payload === "object" &&
+  event.payload !== null &&
+  "masterAsked" in event.payload &&
+  event.payload.masterAsked === true;
+
 const feedRelevant = (event: MissionEvent) =>
-  event.kind === "editor.updated" || ROUTED_KINDS.has(event.kind) || ownerCommented(event);
+  event.kind === "editor.updated" ||
+  ROUTED_KINDS.has(event.kind) ||
+  ownerCommented(event) ||
+  ownerDecidedMasterAsk(event);
 
 interface Notice {
   readonly kind: MissionMessageKind;
@@ -154,6 +168,28 @@ export const makeMasterFeed = ({ router, store, rooms, digest }: MasterFeedDeps)
         return notice;
       }
       if (ROUTED_KINDS.has(event.kind)) return yield* routedNotice(event);
+      if (ownerDecidedMasterAsk(event) && event.subject?.kind === "approval") {
+        const subject = { kind: "approval" as const, id: event.subject.id };
+        const approval = Option.getOrNull(yield* store.get("approval", subject.id));
+        const approved = approval?.status === "approved";
+        const comments = yield* commentsOn(store, subject);
+        const links = (approval?.links ?? []).flatMap((link) =>
+          link.url === null ? [] : [`${link.label}: ${link.url}`],
+        );
+        const notice: Notice = {
+          kind: "decision",
+          summary: `Owner's decision: ${event.summary}`,
+          body: [
+            `The owner ${approved ? "approved" : "rejected"} ${approval?.title ?? event.subject.label}.`,
+            ...(comments.length > 0 ? ["His comments:", commentLines(comments)] : []),
+            ...links,
+            approved
+              ? "Go ahead as the approval describes, with his comments applied."
+              : "Don't go ahead. If you redo it, open a new approval with his comments addressed.",
+          ].join("\n"),
+        };
+        return notice;
+      }
       // ardud missions: crw-threads
       const note = ownerNote(event);
       if (ownerCommented(event)) {

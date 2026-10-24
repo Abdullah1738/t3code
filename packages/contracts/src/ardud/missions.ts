@@ -1307,6 +1307,12 @@ export type Approval = typeof Approval.Type;
 export const approverOf = (approval: Pick<Approval, "approver">): Approver =>
   approval.approver ?? "owner";
 
+/** `requestedBy` on approvals the mission's master opened (releases, deploys), not a system. */
+export const MASTER_APPROVAL_REQUESTER = "master";
+
+export const isMasterApproval = (approval: Pick<Approval, "requestedBy">): boolean =>
+  approval.requestedBy === MASTER_APPROVAL_REQUESTER;
+
 /**
  * What a routing row matches; a missing field matches anything. `repository`
  * is `owner/repo`, read from the approval's pull-request link. Draft rows are
@@ -3651,6 +3657,23 @@ export const CloseStaleApprovalInput = Schema.Struct({
   reason: TrimmedNonEmptyString,
 });
 export type CloseStaleApprovalInput = typeof CloseStaleApprovalInput.Type;
+
+/**
+ * The master brings a release, deploy or other go/no-go to the approver.
+ * `detail` is markdown and shown in full (changelog, build links, install plan).
+ */
+export const OpenMasterApprovalInput = Schema.Struct({
+  missionId: MissionId,
+  /** Pass a stable id so a retry is a no-op; one is made when missing. */
+  approvalId: Schema.optional(ApprovalId),
+  kind: Schema.Literals(["release", "deploy", "other"]),
+  title: TrimmedNonEmptyString,
+  summary: Schema.optional(Schema.NullOr(Schema.String)),
+  detail: Schema.String,
+  links: Schema.optional(Schema.Array(MissionLink)),
+  flags: Schema.optional(Schema.Array(Schema.String)),
+});
+export type OpenMasterApprovalInput = typeof OpenMasterApprovalInput.Type;
 
 /** Replace a mission's approval routing table. Owner or the mission's master. */
 export const SetApprovalRoutingInput = Schema.Struct({

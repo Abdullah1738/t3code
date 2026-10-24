@@ -264,7 +264,8 @@ function CollapsibleRows(
 
 const openMarkdownLink = (href: string) => void tryOpenExternalUrl(href, "markdown-link");
 
-function MarkdownText(props: { readonly text: string; readonly maxLines: number | null }) {
+/** Markdown folded to `maxLines`; long text opens in a full-screen reader. */
+export function MarkdownText(props: { readonly text: string; readonly maxLines: number | null }) {
   const styles = useMarkdownPreviewStyles();
   const [unfolded, setUnfolded] = useState(false);
   const [reading, setReading] = useState(false);
