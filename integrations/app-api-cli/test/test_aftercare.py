@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import re
 import sys
 import tempfile
 import threading
@@ -41,6 +43,8 @@ class AftercareTest(unittest.TestCase):
             if args[1] == 'add':
                 self.assertEqual(args[2:4], ['--json', '-'])
                 spec = json.loads(stdin)
+                if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', spec['id']):
+                    raise RuntimeError(f'robob-watch add failed: invalid watcher id {spec["id"]}')
                 self.specs.append(spec)
                 d = self.watchers / spec['id']
                 if (d / 'watcher.json').exists() and '--replace' not in args:
@@ -51,6 +55,9 @@ class AftercareTest(unittest.TestCase):
                     (d / 'state.json').write_text('{"status": "active"}')
             elif args[1] == 'resume':
                 (self.watchers / args[2] / 'state.json').write_text('{"status": "active"}')
+            elif args[1] == 'pause':
+                w = self.watchers / args[2] / 'watcher.json'
+                w.write_text(json.dumps(dict(json.loads(w.read_text()), paused=True)))
             elif args[1] == 'remove':
                 d = self.watchers / args[2]
                 d.rename(self.tmp / f'archived-{args[2]}-{len(self.calls)}')
@@ -349,6 +356,74 @@ class AftercareTest(unittest.TestCase):
             th.join()
         self.assertEqual(errors, [])
         self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ['aftercare-state.json'])
+
+    def test_every_round_of_a_long_id_case_gets_a_watcher_robob_watch_takes(self):
+        amazon = ['add', '--app', 'amazon', '--order', '408-1234567-1234567', '--for', 'owner', '--item', 'cable',
+                  '--blocker', 'no slot', '--next-at', '2026-10-24T09:00:00+04:00']
+        hashed = [x if x != '408-1234567-1234567' else '408-1234567-1234567-ABCDEFGHIJ' for x in amazon]
+        for add in (amazon, hashed):
+            cid = a.case_id('amazon', add[add.index('--order') + 1], 'return')
+            for _ in range(3):
+                self.assertEqual(self.cli(*add)[0], 0)
+                case = json.loads(a.path_for(cid).read_text())
+                self.assertEqual(a.watcher_status(case), 'active', a.watcher_id(case))
+                self.assertEqual(self.cli('drop', '--id', cid, '--reason', 'x')[0], 0)
+            self.assertEqual(len({a.watcher_id(case, g) for g in (1, 2, 3)}), 3)
+
+    def test_a_retired_round_is_paused_before_removal_so_a_held_wake_cannot_go_out(self):
+        self.cli(*ADD)
+        real = a.run
+
+        def remove_fails(args, timeout=30, stdin=None):
+            if args[1] == 'remove':
+                raise RuntimeError('robob-watch remove failed: boom')
+            return real(args, timeout, stdin)
+        with mock.patch.object(a, 'run', remove_fails):
+            self.assertEqual(self.cli('drop', '--id', CID, '--reason', 'x')[0], 1)
+            # Left behind (with whatever wake it held), but off: the runner skips paused watchers.
+            self.assertTrue(json.loads((self.watchers / CID / 'watcher.json').read_text())['paused'])
+            self.assertEqual(self.cli(*ADD)[0], 1)
+        self.assertTrue(json.loads((self.watchers / CID / 'watcher.json').read_text())['paused'])
+        self.assertEqual(self.cli('update', '--id', CID, '--note', 'retry')[0], 0)
+        self.assertFalse((self.watchers / CID).exists())
+        self.assertEqual(self.calls[-1], ['robob-watch', 'remove', CID])
+        # A definition from before rounds (no --gen) is round 1 and stays quiet for round 2, which is due.
+        self.assertIn('round 2', a.check(CID, {}, time.time(), gen=2))
+        env = {k: v for k, v in os.environ.items() if k not in ('WATCH_DIR', 'WATCH_RUN')}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(self.cli('check', '--id', CID)[:2], (0, ''))
+
+    def test_a_check_that_waits_out_a_change_still_settles_the_last_wake(self):
+        self.cli(*ADD)
+        wdir = self.tmp / 'w'
+        wdir.mkdir()
+        due = a.epoch('2026-10-24T09:00:00+04:00')
+        env = lambda run: {'WATCH_DIR': str(wdir), 'WATCH_RUN': run}
+        first = a.check(CID, env('r1'), due)
+        self.assertIn('Aftercare due', first)
+        (wdir / '.run-ok').write_text('r1')
+        import fcntl
+        with mock.patch.object(a, 'CHECK_LOCK_WAIT_S', 0.2), (a.ROOT / '.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(a.check(CID, env('r2'), due + 900), '')
+        (wdir / '.run-ok').write_text('r2')  # the runner records the quiet run
+        self.assertEqual(a.check(CID, env('r3'), due + 1800), '', 'r1 went out; no second wake the same day')
+        self.assertIn('Still open', a.check(CID, env('r4'), due + a.REPEAT_S))
+
+    def test_pickup_dates_are_checked_in_their_own_year_and_app_wordings_pass(self):
+        self.cli(*ADD)
+        for slot in ('29 February 2026 morning', 'Feb 29, 2026 9-1', '29th of February 2026 10:00-14:00',
+                     '29.02.2026 09:00-13:00', '29-02-2026 9-13'):
+            self.assertIn('does not exist', self.cli('close', '--id', CID, '--reference', 'RT123',
+                                                     '--pickup', slot)[2], slot)
+        for slot in ('Tomorrow 9-1', 'tomorrow morning', 'today 14:00-18:00'):
+            self.assertIn('calendar date', self.cli('close', '--id', CID, '--reference', 'RT123',
+                                                    '--pickup', slot)[2], slot)
+        self.assertEqual(self.case()['status'], 'open')
+        for slot in ('27 October between 10:00 and 14:00', '27-10-2026 9-13', '27.10.2026 09:00-13:00',
+                     'Tue, 27 Oct, 9 AM - 1 PM', '29 February 2028 morning', 'Oct 27th, 2026 9 am until 1 pm',
+                     '27 Oct 2026 10:00 till 14:00'):
+            self.assertEqual(a.pickup_slot(slot), slot)
 
 
 def oct_mode(path):

@@ -47,13 +47,17 @@ PLACEHOLDER = re.compile(r'(?:none|null|nil|n/?a|tbd|tba|pending|unknown|not yet
 VAGUE = re.compile(r'\b(?:tbd|tba|tbc|pending|unknown|not yet|later|soon|asap|n/a|none|null)\b|\?', re.I)
 MONTHS = ('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec')
 MONTH = (r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(?:uary|ruary|ch|il|e|y|ust|t|tember|ober|ember)?\b')
-# 2026-10-27, 27/10/2026, 27 Oct, Oct 27; each one is checked against the calendar.
+# 2026-10-27, 27/10/2026 (or 27-10-2026, 27.10.2026), 27 Oct [2026], Oct 27[, 2026]; each one is
+# checked against the calendar, in its own year when it names one.
+YEAR = r'(?:,?\s*(20\d\d)(?![\d:]))?'
 DATES = ((re.compile(r'(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)'), 'ymd'),
-         (re.compile(r'(?<![\d/])(\d{1,2})/(\d{1,2})/(\d{4})(?![\d/])'), 'dmy'),
-         (re.compile(rf'(?<![\d.:])(\d{{1,2}})(?:st|nd|rd|th)?\s*{MONTH}', re.I), 'dm'),
-         (re.compile(rf'\b{MONTH}\s*(\d{{1,2}})(?![\d:])', re.I), 'md'))
+         (re.compile(r'(?<![\d/.-])(\d{1,2})([/.-])(\d{1,2})\2(\d{4})(?![\d/.-])'), 'dmy'),
+         (re.compile(rf'(?<![\d.:])(\d{{1,2}})(?:st|nd|rd|th)?\s*(?:of\s+)?{MONTH}{YEAR}', re.I), 'dm'),
+         (re.compile(rf'\b{MONTH}\s*(\d{{1,2}})(?:st|nd|rd|th)?(?![\d:]){YEAR}', re.I), 'md'))
+RELATIVE = re.compile(r'\b(?:today|tonight|tomorrow|day after|next (?:week|\w+day))\b', re.I)
 HOUR = r'(\d{1,2})(?::([0-5]\d))?\s*(?:am|pm)?'
-WINDOW = re.compile(rf'(?<![\d:]){HOUR}\s*(?:-|–|to)\s*{HOUR}(?![\d:])|\b(?:morning|afternoon|evening)\b', re.I)
+WINDOW = re.compile(rf'(?<![\d:]){HOUR}\s*(?:-|–|—|to|and|until|till)\s*{HOUR}(?![\d:])'
+                    r'|\b(?:morning|afternoon|evening)\b', re.I)
 
 
 def stamp(value=None):
@@ -133,8 +137,8 @@ def watcher_id(case, gen=None):
     gen = case.get('gen', 1) if gen is None else gen
     if gen == 1:
         return case['id']
-    tag = hashlib.sha256(f'{case["id"]}\0{gen}'.encode()).hexdigest()[:8]
-    return f'{case["id"][:39].rstrip("-")}-g{tag}'
+    suffix = '-g' + hashlib.sha256(f'{case["id"]}\0{gen}'.encode()).hexdigest()[:8]
+    return case['id'][:48 - len(suffix)].rstrip('-') + suffix
 
 
 def watcher_status(case):
@@ -216,10 +220,14 @@ def arm(case, session):
 
 
 def drop_watchers(case, keep=None):
-    """Remove the watchers of every round of the case except `keep`."""
+    """Remove the watchers of every round of the case except `keep`. Each is paused first: the runner
+    retries a held wake without running the check, so a watcher a failed removal leaves behind must
+    already be off."""
     for gen in range(1, case.get('gen', 1) + 1):
         wid = watcher_id(case, gen)
         if gen != keep and (WATCHERS / wid / 'watcher.json').exists():
+            if not read(WATCHERS / wid / 'watcher.json').get('paused'):
+                run(['robob-watch', 'pause', wid])
             run(['robob-watch', 'remove', wid])
 
 
@@ -264,13 +272,19 @@ def check(cid, env=None, now=None, gen=None):
     now = time.time() if now is None else now
     if not path_for(cid).exists():
         return ''
+    wdir = env.get('WATCH_DIR')
     with (ROOT / '.lock').open('a') as lock:
         if not shared_lock(lock, CHECK_LOCK_WAIT_S):
+            if wdir:
+                # The runner records this quiet run in .run-ok, so the last run's wake has to be
+                # settled now or the next run would take it for unrecorded and print it again.
+                with (Path(wdir) / '.aftercare.lock').open('a') as wlock:
+                    fcntl.flock(wlock, fcntl.LOCK_EX)
+                    settle(Path(wdir))
             return ''
         case = read(path_for(cid))
         due = (bool(case) and case.get('status') == 'open' and now >= epoch(case['next_at'])
                and (gen is None or case.get('gen', 1) == gen))
-        wdir = env.get('WATCH_DIR')
         if not wdir:
             return event(case, None, now) if due else ''
         with (Path(wdir) / '.aftercare.lock').open('a') as wlock:
@@ -278,12 +292,11 @@ def check(cid, env=None, now=None, gen=None):
             return _check(case, due, Path(wdir), env, now)
 
 
-def _check(case, due, wdir, env, now):
+def settle(wdir):
+    """Apply the outbox: the wake printed by the last run counts as sent once .run-ok names that run."""
     spath = wdir / 'aftercare-state.json'
     state = read(spath)
-    # Keyed on the generation too: a reopened case with the same next try is a new wake.
-    key = f"{case.get('gen', 1)}|{case['next_at']}" if case else None
-    pending = state.get('pending')
+    pending = state.pop('pending', None)
     if pending:
         try:
             acked = (wdir / '.run-ok').read_text().strip() == pending['run']
@@ -291,14 +304,19 @@ def _check(case, due, wdir, env, now):
             acked = False
         if acked:
             state.update(sent_for=pending['for'], sent_at=pending['at'])
-        state.pop('pending')
-    fresh = due and (state.get('sent_for') != key or now - epoch(state['sent_at']) >= REPEAT_S)
-    if fresh:
-        state['pending'] = {'for': key, 'run': env.get('WATCH_RUN', ''), 'at': stamp(now)}
-    if fresh or pending:
         write(spath, state)
+    return state
+
+
+def _check(case, due, wdir, env, now):
+    state = settle(wdir)
+    # Keyed on the generation too: a reopened case with the same next try is a new wake.
+    key = f"{case.get('gen', 1)}|{case['next_at']}" if case else None
+    fresh = due and (state.get('sent_for') != key or now - epoch(state['sent_at']) >= REPEAT_S)
     if not fresh:
         return ''
+    state['pending'] = {'for': key, 'run': env.get('WATCH_RUN', ''), 'at': stamp(now)}
+    write(wdir / 'aftercare-state.json', state)
     return event(case, state.get('sent_at') if state.get('sent_for') == key else None, now)
 
 
@@ -326,15 +344,15 @@ def same_order(case, args):
 
 
 def real_date(match, form):
-    """A date the calendar has. Forms without a year are checked against a leap year."""
+    """A date the calendar has. A named date without a year is checked against a leap year."""
     g = match.groups()
     if form == 'ymd':
         y, m, d = map(int, g)
     elif form == 'dmy':
-        d, m, y = map(int, g)
+        d, m, y = int(g[0]), int(g[2]), int(g[3])
     else:
-        name, d = (g[1], g[0]) if form == 'dm' else g
-        y, m, d = 2024, MONTHS.index(name.lower()[:3]) + 1, int(d)
+        name, d, year = (g[1], g[0], g[2]) if form == 'dm' else g
+        y, m, d = int(year or 2024), MONTHS.index(name.lower()[:3]) + 1, int(d)
     try:
         dt.date(y, m, d)
         return True
@@ -345,6 +363,10 @@ def real_date(match, form):
 def pickup_slot(value):
     """The booked slot as the app shows it: one real date plus a time window, nothing left open."""
     slot = text(value, '--pickup', 120)
+    if RELATIVE.search(slot):
+        # Saved as is, "tomorrow" means nothing a day later.
+        raise ValueError('--pickup must be the booked date and window the app shows, with its calendar '
+                         'date rather than "tomorrow", e.g. "Tue 27 Oct 9-1"')
     rest, dates = slot, 0
     for pattern, form in DATES:
         for match in pattern.finditer(rest):
@@ -393,7 +415,8 @@ def main(argv=None, session=None):
             return listing(args)
         cid = resolve(args, parser)
         if args.command == 'check':
-            out = check(cid, gen=args.gen)
+            # A definition from before rounds had no --gen: it belongs to round 1.
+            out = check(cid, gen=args.gen or 1)
             if out:
                 print(out)
             return 0
