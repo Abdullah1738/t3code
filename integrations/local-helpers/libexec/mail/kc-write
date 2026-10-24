@@ -1,0 +1,4 @@
+#!/bin/sh
+# usage: kc-write <service>  (secret on stdin) -> upsert into login keychain
+secret=$(cat)
+exec /usr/bin/security add-generic-password -U -a "${2:-ortie}" -s "$1" -w "$secret"

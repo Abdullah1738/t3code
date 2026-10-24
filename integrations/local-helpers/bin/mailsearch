@@ -1,0 +1,426 @@
+#!/usr/bin/python3
+"""Fast cross-account mail search/read (server-side IMAP SEARCH, no client-side sort).
+
+  mailsearch [opts] QUERY            search all accounts in parallel (Gmail search syntax)
+  mailsearch read ACCOUNT FOLDER UID [--raw|--html]
+                                     print one message (never marks it read)
+
+QUERY uses Gmail syntax. Google accounts (gmail, fund, juno) pass it verbatim via
+X-GM-RAW, so anything that works in the Gmail search box works (from:, subject:,
+after:2026/08/15, newer_than:30d, "exact phrase", OR, -word, has:attachment...).
+iCloud/Outlook translate the common subset to IMAP SEARCH: from: to: cc: subject:
+after:/since: before: newer_than:/older_than:Nd|m|y is:unread is:read is:starred,
+bare words / "phrases" (full-text). Negations (-word, -from:x, -subject:x) are
+applied client-side to the newest candidates, and -word matches SUBJECT only
+(server-side NOT makes iCloud scan the whole mailbox, 20-30s). Other operators
+become full-text words.
+
+Options:
+  -a ACCT      limit to account (repeatable; default: icloud gmail fund outlook juno)
+  -n N         max hits per account/folder (default 15, newest first)
+  -t SECS      per-account timeout (default 25)
+  --all        also search Sent/Trash/Deleted folders
+  --json       JSON output
+
+UIDs are the same IDs himalaya uses: `himalaya message read -a ACCT -m FOLDER UID` works too.
+IPv4 is forced (this Mac's IPv6 has been blackholed before, which made himalaya hang).
+"""
+import email
+import email.policy
+import html
+import imaplib
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import datetime, timedelta, timezone
+from email.header import decode_header, make_header
+from email.utils import parsedate_to_datetime, parseaddr
+
+HOME = os.path.expanduser("~")
+ORTIE = f"{HOME}/.local/bin/ortie"
+KC_READ = f"{HOME}/.local/libexec/mail/kc-read"
+sys.path.insert(0, f"{HOME}/.local/libexec/mail")
+import mail_oauth  # noqa: E402
+
+ACCOUNTS = {
+    "icloud": {"host": "imap.mail.me.com", "user": "abdullahrangoonwala@icloud.com", "auth": "icloud",
+               "folders": ["INBOX", "Archive", "Junk"], "extra": ["Sent Messages", "Deleted Messages"]},
+    "gmail": {"host": "imap.gmail.com", "user": "surprisedwarrior@gmail.com", "auth": "google"},
+    "fund": {"host": "imap.gmail.com", "user": "me@abdullah.fund", "auth": "google"},
+    "outlook": {"host": "outlook.office365.com", "user": "ardudeisepic@outlook.com", "auth": "outlook",
+                "folders": ["INBOX", "Archive", "Junk"], "extra": ["Sent", "Deleted"]},
+    "juno": {"host": "imap.gmail.com", "user": "abdullah@thejunowallet.com", "auth": "google"},
+}
+GOOGLE_FOLDERS = ["[Gmail]/All Mail", "[Gmail]/Spam"]
+GOOGLE_EXTRA = ["[Gmail]/Bin", "[Gmail]/Trash"]
+
+_orig_gai = socket.getaddrinfo
+
+
+def _gai_v4(host, port, family=0, *a, **k):
+    if family in (0, socket.AF_UNSPEC):
+        try:
+            return _orig_gai(host, port, socket.AF_INET, *a, **k)
+        except socket.gaierror:
+            pass
+    return _orig_gai(host, port, family, *a, **k)
+
+
+socket.getaddrinfo = _gai_v4
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def secret(cmd, timeout):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError(f"credential command failed ({os.path.basename(cmd[0])} rc={r.returncode}): "
+                           f"{r.stderr.strip()[:160]}")
+    return r.stdout.strip()
+
+
+def connect(name, timeout):
+    cfg = ACCOUNTS[name]
+    if cfg["auth"] == "icloud":
+        M = imaplib.IMAP4_SSL(cfg["host"], timeout=timeout)
+        try:
+            M.login(cfg["user"], secret([KC_READ, "himalaya-icloud", "himalaya"], timeout))
+        except imaplib.IMAP4.error as e:
+            raise RuntimeError(f"IMAP auth failed: {e}")
+        return M
+    # XOAUTH2 with self-heal (other MS frontends, token refresh): ~/.local/libexec/mail/mail_oauth.py
+    return mail_oauth.xoauth2_connect(name, cfg["host"], cfg["user"], timeout=timeout)
+
+def q(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+
+
+def imap_date(v):
+    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", v)
+    if not m:
+        raise ValueError(f"bad date {v!r} (use YYYY-MM-DD)")
+    y, mo, d = map(int, m.groups())
+    return f"{d}-{MONTHS[mo - 1]}-{y}"
+
+
+def rel_date(v):
+    m = re.match(r"^(\d+)([dmy])$", v)
+    if not m:
+        raise ValueError(f"bad relative date {v!r} (use e.g. 30d, 2m, 1y)")
+    n, u = int(m.group(1)), m.group(2)
+    dt = datetime.now() - timedelta(days=n * {"d": 1, "m": 30, "y": 365}[u])
+    return f"{dt.day}-{MONTHS[dt.month - 1]}-{dt.year}"
+
+
+def gmail_to_imap(query):
+    """Translate a Gmail-style query to IMAP SEARCH criteria (AND of all terms).
+
+    Negated text terms are returned as client-side excludes: server-side NOT on
+    text/header fields makes iCloud scan the whole mailbox (20-30s)."""
+    crit, excludes = [], []
+    for tok in shlex.split(query, posix=True):
+        neg = tok.startswith("-") and len(tok) > 1
+        if neg:
+            tok = tok[1:]
+        if tok.upper() in ("AND", "OR"):  # OR unsupported generically; treat as AND
+            continue
+        key, sep, val = tok.partition(":")
+        key = key.lower()
+        if neg and not (sep and key in ("after", "since", "before", "newer_than", "older_than", "is")):
+            field = key if sep and key in ("from", "to", "subject") else "subject"
+            excludes.append((field, (val if sep and key in ("from", "to", "subject") else tok).lower()))
+            continue
+        part = None
+        if sep and val:
+            if key in ("from", "to", "cc", "bcc", "subject"):
+                part = [key.upper(), q(val)]
+            elif key in ("after", "since"):
+                part = ["SINCE", imap_date(val)]
+            elif key == "before":
+                part = ["BEFORE", imap_date(val)]
+            elif key == "newer_than":
+                part = ["SINCE", rel_date(val)]
+            elif key == "older_than":
+                part = ["BEFORE", rel_date(val)]
+            elif key == "is":
+                part = {"unread": ["UNSEEN"], "read": ["SEEN"], "starred": ["FLAGGED"],
+                        "flagged": ["FLAGGED"], "answered": ["ANSWERED"]}.get(val.lower())
+            elif key in ("in", "label", "has", "category", "filename", "larger", "smaller"):
+                part = []  # no IMAP equivalent: ignore
+        if part is None:
+            part = ["TEXT", q(tok)]
+        if not part:
+            continue
+        crit += (["NOT"] + part) if neg else part
+    return crit or ["ALL"], excludes
+
+
+def decode(s):
+    if not s:
+        return ""
+    try:
+        return str(make_header(decode_header(s))).replace("\r", "").replace("\n", " ")
+    except Exception:
+        return s
+
+
+def list_special(M):
+    """Map special-use flags (\\All, \\Junk, \\Trash...) to mailbox names."""
+    out = {}
+    typ, data = M.list()
+    for line in data or []:
+        if not isinstance(line, bytes):
+            continue
+        m = re.match(rb'\((.*?)\) "(.*?)" (.*)$', line)
+        if not m:
+            continue
+        flags, name = m.group(1).decode(), m.group(3).decode().strip()
+        if name.startswith('"'):
+            name = name[1:-1].replace('\\"', '"')
+        for f in flags.split():
+            out[f.lower()] = name
+    return out
+
+
+def search_account(name, query, limit, timeout, all_folders, deadline):
+    cfg = ACCOUNTS[name]
+    t0 = time.time()
+    M = connect(name, timeout)
+    hits = []
+    try:
+        google = cfg["auth"] == "google"
+        if google:
+            sp = list_special(M)
+            folders = [sp.get("\\all", GOOGLE_FOLDERS[0]), sp.get("\\junk", GOOGLE_FOLDERS[1])]
+            if all_folders:
+                folders.append(sp.get("\\trash", GOOGLE_EXTRA[0]))
+        else:
+            folders = cfg["folders"] + (cfg["extra"] if all_folders else [])
+            crit, excludes = gmail_to_imap(query)
+        for folder in folders:
+            if time.time() > deadline:
+                break
+            typ, _ = M.select(q(folder), readonly=True)
+            if typ != "OK":
+                continue
+            if google:
+                raw = query.encode("utf-8")
+                if raw.isascii() and "\n" not in query:
+                    typ, data = M.uid("SEARCH", "X-GM-RAW", q(query))
+                else:
+                    M.literal = raw
+                    typ, data = M.uid("SEARCH", "CHARSET", "UTF-8", "X-GM-RAW")
+            else:
+                typ, data = M.uid("SEARCH", *crit)
+            if typ != "OK":
+                raise RuntimeError(f"SEARCH failed in {folder}: {data}")
+            uids = data[0].split() if data and data[0] else []
+            total = len(uids)
+            fetch_n = limit if google or not excludes else max(limit * 4, 60)
+            uids = sorted(uids, key=int)[-fetch_n:]
+            folder_hits = []
+            if uids:
+                typ, fd = M.uid("FETCH", b",".join(uids).decode(),
+                                "(BODY.PEEK[HEADER.FIELDS (DATE FROM TO SUBJECT MESSAGE-ID)] INTERNALDATE)")
+                for i, item in enumerate(fd):
+                    if not isinstance(item, tuple):
+                        continue
+                    meta, hdr = item
+                    # Outlook sends "UID n" / INTERNALDATE after the header literal
+                    if i + 1 < len(fd) and isinstance(fd[i + 1], bytes):
+                        meta += fd[i + 1]
+                    um = re.search(rb"UID (\d+)", meta)
+                    im = re.search(rb'INTERNALDATE "([^"]+)"', meta)
+                    h = email.message_from_bytes(hdr)
+                    dt = None
+                    try:
+                        dt = parsedate_to_datetime(h.get("Date"))
+                    except Exception:
+                        pass
+                    if (dt is None or dt.tzinfo is None) and im:
+                        try:
+                            dt = datetime.strptime(im.group(1).decode(), "%d-%b-%Y %H:%M:%S %z")
+                        except Exception:
+                            pass
+                    fname, faddr = parseaddr(decode(h.get("From")))
+                    subj = decode(h.get("Subject"))
+                    if not google and excludes:
+                        fields = {"from": decode(h.get("From")).lower(), "to": decode(h.get("To")).lower(),
+                                  "subject": subj.lower()}
+                        if any(v in fields[f] for f, v in excludes):
+                            total -= 1
+                            continue
+                    folder_hits.append({
+                        "account": name,
+                        "folder": "Inbox" if folder.upper() == "INBOX" else folder,
+                        "uid": int(um.group(1)) if um else None,
+                        "date": dt.astimezone().strftime("%Y-%m-%d %H:%M") if dt else "",
+                        "_ts": dt.timestamp() if dt else 0,
+                        "from": f"{fname} <{faddr}>" if fname else faddr,
+                        "subject": subj,
+                        "message_id": (h.get("Message-ID") or "").strip(),
+                    })
+            folder_hits.sort(key=lambda x: x["uid"] or 0)
+            for fh in folder_hits[-limit:]:
+                fh["folder_total"] = total
+                hits.append(fh)
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    return hits, time.time() - t0
+
+
+def cmd_search(argv):
+    accts, limit, timeout, as_json, all_folders, words = [], 15, 25.0, False, False, []
+    it = iter(argv)
+    for a in it:
+        if a == "-a":
+            accts.append(next(it))
+        elif a == "-n":
+            limit = int(next(it))
+        elif a == "-t":
+            timeout = float(next(it))
+        elif a == "--json":
+            as_json = True
+        elif a == "--all":
+            all_folders = True
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            words.append(a)
+    query = " ".join(words).strip()
+    if not query:
+        die("usage: mailsearch [-a ACCT] [-n N] [-t SECS] [--all] [--json] QUERY   (see --help)")
+    accts = accts or list(ACCOUNTS)
+    for a in accts:
+        if a not in ACCOUNTS:
+            die(f"unknown account {a!r}; known: {', '.join(ACCOUNTS)}")
+    deadline = time.time() + timeout
+    ex = ThreadPoolExecutor(max_workers=len(accts))
+    futs = {ex.submit(search_account, a, query, limit, timeout, all_folders, deadline): a for a in accts}
+    done, pending = wait(futs, timeout=timeout + 2)
+    hits, status = [], {}
+    for f, a in futs.items():
+        if f in pending:
+            status[a] = {"ok": False, "error": f"timeout after {timeout:.0f}s"}
+            continue
+        try:
+            h, secs = f.result()
+            hits += h
+            status[a] = {"ok": True, "hits": len(h), "secs": round(secs, 1)}
+        except Exception as e:
+            status[a] = {"ok": False, "error": str(e)[:300]}
+    hits.sort(key=lambda h: h["_ts"], reverse=True)
+    for h in hits:
+        h.pop("_ts", None)
+    if as_json:
+        print(json.dumps({"query": query, "status": status, "hits": hits}, ensure_ascii=False, indent=1))
+    else:
+        for h in hits:
+            print(f"{h['account']:<7} {h['folder'][:18]:<18} {h['uid'] or '?':>7}  {h['date']}  "
+                  f"{h['from'][:40]:<40}  {h['subject'][:90]}")
+        summ = []
+        for a in accts:
+            s = status[a]
+            summ.append(f"{a}: {s['hits']} ({s['secs']}s)" if s["ok"] else f"{a}: ERROR {s['error']}")
+        print("-- " + " | ".join(summ), file=sys.stderr)
+        if any(h.get("folder_total", 0) > limit for h in hits):
+            print(f"-- some folders had more than {limit} matches; narrow the query or raise -n", file=sys.stderr)
+    sys.stdout.flush()
+    os._exit(0 if all(s["ok"] for s in status.values()) else 1)
+
+
+def html_to_text(s):
+    s = re.sub(r"(?is)<(script|style|head).*?</\1>", " ", s)
+    s = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|h\d|li)>", "\n", s)
+    s = re.sub(r"(?i)</td>", " ", s)
+    s = re.sub(r"(?is)<a [^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", r"\2 [\1]", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html.unescape(s)
+    s = re.sub(r"[ \t\u00a0\u200c\u200b\u034f\u00ad]+", " ", s)
+    return re.sub(r"\n\s*\n+", "\n", s).strip()
+
+
+def cmd_read(argv):
+    raw_mode = "--raw" in argv
+    html_mode = "--html" in argv
+    args = [a for a in argv if a not in ("--raw", "--html")]
+    if len(args) != 3 or args[0] not in ACCOUNTS:
+        die("usage: mailsearch read ACCOUNT FOLDER UID [--raw|--html]")
+    name, folder, uid = args
+    if folder.lower() == "inbox":
+        folder = "INBOX"
+    M = connect(name, 25)
+    try:
+        typ, _ = M.select(q(folder), readonly=True)
+        if typ != "OK":
+            die(f"cannot select {folder!r}")
+        typ, fd = M.uid("FETCH", uid, "(BODY.PEEK[])")
+        data = next((i[1] for i in fd if isinstance(i, tuple)), None)
+        if not data:
+            die(f"UID {uid} not found in {name}/{folder}", 1)
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    if raw_mode:
+        sys.stdout.write(data.decode("utf-8", "replace"))
+        return 0
+    msg = email.message_from_bytes(data, policy=email.policy.default)
+    for hname in ("Date", "From", "To", "Cc", "Subject", "Message-ID"):
+        if msg.get(hname):
+            print(f"{hname}: {decode(str(msg.get(hname)))}")
+    plain, htm, atts = [], [], []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ct = part.get_content_type()
+        if part.get_content_disposition() == "attachment" or (part.get_filename() and ct not in ("text/plain", "text/html")):
+            atts.append(f"{part.get_filename()} ({ct})")
+            continue
+        try:
+            if ct == "text/plain":
+                plain.append(part.get_content())
+            elif ct == "text/html":
+                htm.append(part.get_content())
+        except Exception:
+            continue
+    if atts:
+        print("Attachments: " + ", ".join(atts))
+    print()
+    if html_mode and htm:
+        print("\n".join(htm))
+    else:
+        body = "\n".join(plain).strip() if plain and "".join(plain).strip() else html_to_text("\n".join(htm))
+        print(body)
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "read":
+        sys.exit(cmd_read(argv[1:]))
+    if argv and argv[0] == "search":
+        argv = argv[1:]
+    cmd_search(argv)
+
+
+if __name__ == "__main__":
+    main()

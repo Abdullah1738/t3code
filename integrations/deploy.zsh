@@ -9,7 +9,8 @@ shift || true
 case "$name" in
   agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|scribe|catalog-guard|message-archive) ;;
   offbox) exec "${0:A:h}/offbox/install.zsh" "$@" ;;  # several live targets, see offbox/README.md
-  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|scribe|catalog-guard|message-archive|offbox> [--dry-run]"; exit 2 ;;
+  local-helpers) exec "${0:A:h}/local-helpers/install.zsh" "$@" ;;  # files under ~/.local, see local-helpers/README.md
+  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|scribe|catalog-guard|message-archive|offbox|local-helpers> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"

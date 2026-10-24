@@ -1,0 +1,3 @@
+#!/bin/sh
+# himalaya with OAuth self-heal: on XOAUTH2 failure refreshes the ortie token and retries.
+exec /usr/bin/python3 "$HOME/.local/libexec/mail/mail_oauth.py" himalaya "$@"

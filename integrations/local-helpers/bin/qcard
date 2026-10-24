@@ -1,0 +1,191 @@
+#!/usr/bin/python3
+"""qcard: quick chat cards (page + 1200x630 og preview) in a couple of seconds.
+
+usage:
+  qcard price ASSET [--range 1D|1W|1M|1Y|5Y]        live price card (gold, silver, btc, eth, AAPL, EURUSD, oil, sp500...)
+  qcard spec FILE.json|-                              any template from a JSON spec
+  qcard stat|compare|list|timeline|breakdown --json '{...}'   same, inline JSON (template from the verb)
+  qcard templates                                     print a sample spec for every template
+  qcard clean [--days 14]                             remove old q-* card dirs
+
+common options:
+  --name NAME          slug part (default from title)      --out DIR   write somewhere else (no publish)
+  --send owner|moni|CHAT   publish (owner: tailnet) or share (others: public link) and, with --session, send the app card
+  --session ID --key K     bridge session (the chat the card goes to) + dedupe key
+  --caption/--subcaption/--summary   override card text (no times/dates/day words; the bridge strips them)
+  --no-og              skip the preview image (faster, for local checks)
+Prints JSON: {dir, page, og, slug, url?, caption, subcaption, title, description, ms}.
+"""
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
+
+LIB = os.path.expanduser("~/.local/libexec/qcard")
+sys.path.insert(0, LIB)
+import render  # noqa: E402
+
+APPS = os.path.expanduser("~/.local/share/imessage-apps")
+CHROME = os.path.expanduser("~/Library/Caches/ms-playwright/chromium_headless_shell-1223/"
+                            "chrome-headless-shell-mac-arm64/chrome-headless-shell")
+BUN = "/Users/ardud/.bun/bin/bun"
+BRIDGE = os.path.expanduser("~/.local/share/spectrum-bridge/src/cli.ts")
+TEMPLATES = ["price", "stat", "compare", "list", "timeline", "breakdown"]
+TIMEWORDS = re.compile(r"\b(today|tonight|tomorrow|yesterday|now|mon|tue|wed|thu|fri|sat|sun)[a-z]*\b|\d{1,2}:\d{2}|\b\d{1,2}\s?(am|pm)\b", re.I)
+
+
+def slugify(s):
+    return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")[:28] or "card"
+
+
+def shot(html_path, png, w, h, budget=250):
+    with tempfile.TemporaryDirectory() as prof:
+        subprocess.run([CHROME, "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run", f"--user-data-dir={prof}",
+                        "--force-device-scale-factor=1", f"--virtual-time-budget={budget}", f"--window-size={w},{h}",
+                        f"--screenshot={png}", "file://" + html_path], check=True, capture_output=True, timeout=30)
+
+
+def bridge(*args):
+    env = {k: v for k, v in os.environ.items() if k != "BUN_INSPECT"}
+    r = subprocess.run([BUN, BRIDGE, *args], capture_output=True, text=True, env=env, timeout=60)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        raise SystemExit(f"qcard: bridge {args[0]} failed: {r.stdout.strip()} {r.stderr.strip()}")
+
+
+def clean(days=14):
+    cut, gone = time.time() - days * 86400, []
+    if not os.path.isdir(APPS):
+        return gone
+    for d in os.listdir(APPS):
+        p = os.path.join(APPS, d)
+        if d.startswith("q-") and os.path.isdir(p) and os.path.getmtime(p) < cut:
+            shutil.rmtree(p, ignore_errors=True)
+            gone.append(d)
+    return gone
+
+
+def card_text(s):
+    return TIMEWORDS.sub("", s or "").replace("  ", " ").strip(" ·-")
+
+
+SAMPLES = {
+    "stat": {"template": "stat", "title": "Body weight", "sub": "Scale, 7-day average", "value": 81.4, "unit": "kg", "decimals": 1,
+             "change": -1.2, "change_note": "vs last month", "points": [83.1, 82.9, 82.6, 82.7, 82.2, 81.9, 81.8, 81.4],
+             "stats": [{"label": "Lowest", "value": "81.1 kg"}, {"label": "Goal", "value": "78 kg"}], "accent": "#2f6fdb"},
+    "compare": {"template": "compare", "title": "Flights to London", "sub": "DXB to LHR, one adult", "best_by": "Price", "best_dir": "min",
+                "fields": ["Price", "Time", "Stops"],
+                "options": [{"name": "Emirates", "values": {"Price": "AED 2,890", "Time": "7h 40m", "Stops": "Direct"}, "note": "A380, lounge access"},
+                            {"name": "BA", "values": {"Price": "AED 2,640", "Time": "7h 55m", "Stops": "Direct"}},
+                            {"name": "Turkish", "values": {"Price": "AED 2,150", "Time": "11h 20m", "Stops": "1 stop"}, "note": "IST layover 2h"}]},
+    "list": {"template": "list", "title": "Trip packing", "items": [{"text": "Passports", "done": True}, {"text": "Dog passports", "done": True},
+             {"text": "Chargers"}, {"text": "Gym kit", "note": "Lifting belt"}, {"text": "Meds box", "value": "8 days"}], "accent": "#2e9e6a"},
+    "timeline": {"template": "timeline", "title": "Visa renewal", "sub": "UAE residence",
+                 "events": [{"when": "1 Oct", "text": "Medical test", "state": "done"}, {"when": "8 Oct", "text": "Emirates ID biometrics", "state": "done"},
+                            {"when": "This week", "text": "Visa stamping", "state": "now", "note": "Waiting on GDRFA"},
+                            {"when": "Next", "text": "Collect Emirates ID"}], "accent": "#d9534f"},
+    "breakdown": {"template": "breakdown", "title": "October spend", "currency": "AED", "kind": "donut",
+                  "items": [{"label": "Rent", "value": 9500}, {"label": "Food", "value": 3200}, {"label": "Rides", "value": 1450},
+                            {"label": "Gym", "value": 900}, {"label": "Other", "value": 1100}]},
+}
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="qcard", add_help=False)
+    ap.add_argument("cmd")
+    ap.add_argument("arg", nargs="?")
+    ap.add_argument("--range", default="1M")
+    ap.add_argument("--json")
+    ap.add_argument("--name")
+    ap.add_argument("--out")
+    ap.add_argument("--send")
+    ap.add_argument("--session")
+    ap.add_argument("--key")
+    ap.add_argument("--caption")
+    ap.add_argument("--subcaption")
+    ap.add_argument("--summary")
+    ap.add_argument("--days", type=int, default=14)
+    ap.add_argument("--no-og", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    a = ap.parse_args()
+    t0 = time.time()
+
+    if a.cmd == "templates":
+        print(json.dumps(SAMPLES, indent=2))
+        return
+    if a.cmd == "clean":
+        print(json.dumps({"removed": clean(a.days)}))
+        return
+    if a.cmd == "price":
+        import data
+        if not a.arg:
+            raise SystemExit("qcard price ASSET")
+        spec = data.price_spec(a.arg, a.range)
+    elif a.cmd == "spec":
+        src = sys.stdin.read() if a.arg in (None, "-") else open(a.arg).read()
+        spec = json.loads(src)
+    elif a.cmd in TEMPLATES:
+        if not a.json and not a.arg:
+            raise SystemExit(f"qcard {a.cmd} --json '{{...}}'  (see qcard templates)")
+        spec = json.loads(a.json or (sys.stdin.read() if a.arg == "-" else open(a.arg).read()))
+        spec.setdefault("template", a.cmd)
+    else:
+        raise SystemExit(__doc__)
+    if spec.get("template") not in TEMPLATES:
+        raise SystemExit(f"qcard: template must be one of {TEMPLATES}")
+    t_data = time.time()
+
+    built = time.time()
+    page, og, meta = render.build(spec, built)
+    name = slugify(a.name or spec.get("name") or spec.get("title"))
+    slug = f"q-{name}-{int(built)}"[:64]
+    out = os.path.abspath(a.out) if a.out else os.path.join(APPS, slug)
+    os.makedirs(out, exist_ok=True)
+    open(os.path.join(out, "index.html"), "w").write(page)
+    open(os.path.join(out, "spec.json"), "w").write(json.dumps(spec, default=str))
+    og_png = os.path.join(out, "og.png")
+    if not a.no_og:
+        og_html = os.path.join(out, ".og.html")
+        open(og_html, "w").write(og)
+        shot(og_html, og_png + ".tmp.png", 1200, 630)
+        os.replace(og_png + ".tmp.png", og_png)
+        os.unlink(og_html)
+    caption = card_text(a.caption or meta["caption"])
+    sub = card_text(a.subcaption or meta["subcaption"])
+    res = dict(dir=out, page=os.path.join(out, "index.html"), og=og_png if not a.no_og else None, slug=slug,
+               title=meta["title"], description=meta["description"], caption=caption, subcaption=sub)
+
+    if a.send:
+        if a.out:
+            raise SystemExit("qcard: --send needs the default imessage-apps dir (drop --out)")
+        if a.send == "owner":
+            pub = bridge("publish", "--app", slug)
+            url = pub["url"]
+            if pub.get("metadataWarnings"):
+                res["metadataWarnings"] = pub["metadataWarnings"]
+        else:
+            sh = bridge("share", "--app", slug, "--days", "7")
+            url = sh.get("url") or sh.get("publicUrl") or next((v for v in sh.values() if isinstance(v, str) and v.startswith("https://")), None)
+            if not url:
+                raise SystemExit(f"qcard: share gave no url: {sh}")
+        url = url + ("" if url.endswith("/") else "/") + f"?v={int(built)}"
+        res["url"] = url
+        if a.session:
+            args = ["app", "--url", url, "--caption", caption, "--session", a.session, "--key", a.key or f"qcard:{slug}"]
+            if sub:
+                args += ["--subcaption", sub]
+            if a.summary:
+                args += ["--summary", card_text(a.summary)]
+            res["sent"] = bridge(*args)
+    res["ms"] = {"data": int((t_data - t0) * 1000), "total": int((time.time() - t0) * 1000)}
+    print(json.dumps(res, indent=1))
+    if not a.out and a.cmd != "clean":
+        try:
+            clean(a.days)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
