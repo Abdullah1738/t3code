@@ -54,10 +54,13 @@ describe("owner view of a draft's reply context", () => {
     );
   });
 
-  it("prints a summary alone, and nothing when the writer gave none", () => {
+  it("prints a situation summary as About, and nothing when the writer gave none", () => {
     expect(replyingToText(draft({ inReplyTo: { summary: "Dev was down for an hour." } }))).toBe(
-      "Replying to:\nDev was down for an hour.",
+      "About:\nDev was down for an hour.",
     );
+    expect(
+      replyingToText(draft({ inReplyTo: { summary: "Asks for an ETA.", author: "Lee" } })),
+    ).toBe("Replying to Lee:\nAsks for an ETA.");
     expect(replyingToText(draft())).toBeNull();
     expect(replyingToText(draft({ inReplyTo: null }))).toBeNull();
   });

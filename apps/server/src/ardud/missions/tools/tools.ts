@@ -231,7 +231,7 @@ const MissionDraftTool = Tool.make("mission_draft", {
     view: Schema.optional(RecordView),
     inReplyTo: Schema.optional(DraftReplyContextInput).annotate({
       description:
-        "What the text answers: the message, comment or ticket it replies to (or, for new outbound text, the situation it is about). Shown to the approver above the draft; never posted.",
+        "What the text answers: the message, comment or ticket it replies to (or, for new outbound text, the situation it is about). Shown to the approver above the draft; never posted. summary (required, plain text, 1500 characters at most): what was said or asked, faithfully, or the situation. quote (2000 at most): the exact words, only when short enough to copy whole. author (120 at most). at: ISO date-time with its zone, e.g. 2026-10-24T09:30:00Z. link: the message, comment or ticket, same shape as target.",
     }),
   }),
   success: Schema.Struct({ draft: Schema.Unknown }),

@@ -1170,10 +1170,14 @@ export const DraftReplyContext = Schema.Struct({
 });
 export type DraftReplyContext = typeof DraftReplyContext.Type;
 
+/** An ISO date-time with its zone (Z or an offset): without one it reads as the reader's local time. */
+export const ZONED_ISO_TIME =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i;
+
 const isIsoTime = Schema.makeFilter((value: string) =>
-  /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value))
+  ZONED_ISO_TIME.test(value) && Number.isFinite(Date.parse(value))
     ? true
-    : "at must be an ISO date-time, e.g. 2026-10-24T09:30:00Z.",
+    : "at must be an ISO date-time with its zone, e.g. 2026-10-24T09:30:00Z.",
 );
 
 /** The reply context as a writer sends it: bounded, with a real time. */
@@ -1190,7 +1194,7 @@ export const DraftReplyContextInput = Schema.Struct({
     description: "Who wrote what is being answered.",
   }),
   at: Schema.optional(TrimmedNonEmptyString.check(isIsoTime)).annotate({
-    description: "When it was written, ISO date-time.",
+    description: "When it was written, ISO date-time with its zone (Z or an offset).",
   }),
   link: Schema.optional(MissionLink).annotate({
     description: "The message, comment or ticket being answered (same shape as target).",

@@ -101,7 +101,7 @@ it("shows what the draft replies to above the draft text", () => {
       },
     }),
   );
-  const block = host.querySelector<HTMLElement>('section[aria-label="Replying to"]');
+  const block = host.querySelector<HTMLElement>('[role="group"][aria-label="Replying to"]');
   expect(block).not.toBeNull();
   expect(block!.textContent).toContain("Sami");
   expect(block!.querySelector("time")?.textContent).toBe("3h ago");
@@ -133,12 +133,12 @@ it("shows what the draft replies to above the draft text", () => {
 
 it("labels a situation summary alone as About and shows nothing without a context", () => {
   render(draft({ inReplyTo: { summary: "Dev was down for an hour this morning." } }));
-  const about = host.querySelector<HTMLElement>('section[aria-label="About"]');
+  const about = host.querySelector<HTMLElement>('[role="group"][aria-label="About"]');
   expect(about?.textContent).toContain("Dev was down for an hour this morning.");
   expect(about?.querySelector("blockquote")).toBeNull();
   expect([...about!.querySelectorAll("button")].map((button) => button.textContent)).toEqual([]);
 
   render(draft());
-  expect(host.querySelector('section[aria-label="Replying to"]')).toBeNull();
-  expect(host.querySelector('section[aria-label="About"]')).toBeNull();
+  expect(host.querySelector('[role="group"][aria-label="Replying to"]')).toBeNull();
+  expect(host.querySelector('[role="group"][aria-label="About"]')).toBeNull();
 });

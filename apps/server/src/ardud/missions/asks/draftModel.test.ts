@@ -444,6 +444,9 @@ describe("reply context", () => {
     expect(code(submit({ inReplyTo: { summary: "x".repeat(1501) } }))).toBe("invalid");
     expect(code(submit({ inReplyTo: { summary: "ok", quote: "q".repeat(2001) } }))).toBe("invalid");
     expect(code(submit({ inReplyTo: { summary: "ok", at: "yesterday" } }))).toBe("invalid");
+    // A time with no zone would read as the reader's local time.
+    expect(code(submit({ inReplyTo: { summary: "ok", at: "2026-10-24T09:00" } }))).toBe("invalid");
+    expect(code(submit({ inReplyTo: { summary: "ok", at: "2026-10-24T09:00+04:00" } }))).toBe("ok");
     expect(
       code(submit({ inReplyTo: { summary: "x".repeat(1500), quote: "q".repeat(2000) } })),
     ).toBe("ok");

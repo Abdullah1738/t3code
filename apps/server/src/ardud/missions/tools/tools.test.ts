@@ -321,6 +321,7 @@ describe("mission MCP tools", () => {
         { ...inReplyTo, sendWith: true },
         { summary: "x".repeat(1501) },
         { quote: "no summary" },
+        { summary: "No zone on the time.", at: "2026-10-24T08:00" },
       ]) {
         const refused = yield* Effect.exit(
           call("mission_draft", writer, { ...base, text: "Another one.", inReplyTo: bad }),

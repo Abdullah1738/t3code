@@ -2,7 +2,7 @@ import type { LaneStatus, MissionLink } from "@t3tools/contracts";
 import type { ReplyContextView } from "@t3tools/client-runtime/ardud/missions";
 import type { HealthTone } from "@t3tools/client-runtime/ardud/missions/mobile";
 import { useState, type ReactNode } from "react";
-import { Linking, Pressable, ScrollView, View } from "react-native";
+import { Linking, Pressable, ScrollView, View, type TextLayoutEvent } from "react-native";
 
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
@@ -82,11 +82,16 @@ export function LinkButton(props: {
   readonly onPress: () => void;
   readonly disabled?: boolean;
   readonly accessibilityLabel?: string;
+  /** For a show/hide toggle. */
+  readonly expanded?: boolean;
 }) {
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={props.accessibilityLabel ?? props.label}
+      {...(props.expanded === undefined
+        ? {}
+        : { accessibilityState: { expanded: props.expanded } })}
       disabled={props.disabled}
       hitSlop={10}
       onPress={props.onPress}
@@ -253,16 +258,37 @@ export function Facts(props: {
 
 const REPLY_LINES = 3;
 
-/** Roughly more than REPLY_LINES lines at phone width; RN can't report a clamp. */
-const longerThanClamp = (text: string | null) =>
-  text !== null && (text.length > 160 || text.split("\n").length > REPLY_LINES);
+/** An invisible unclamped copy of a text at the same width, for its line count. */
+function MeasureText(props: {
+  readonly text: string;
+  readonly onTextLayout: (event: TextLayoutEvent) => void;
+}) {
+  return (
+    <Text
+      aria-hidden
+      accessibilityElementsHidden
+      importantForAccessibility="no-hide-descendants"
+      pointerEvents="none"
+      onTextLayout={props.onTextLayout}
+      className="absolute inset-x-0 top-0 text-[13px] leading-5 opacity-0"
+    >
+      {props.text}
+    </Text>
+  );
+}
 
 /** What a draft answers, above its text: who and when, the quote clamped, the summary. */
 export function ReplyContext(props: { readonly reply: ReplyContextView }) {
   const { reply } = props;
   const [open, setOpen] = useState(false);
-  const foldable = longerThanClamp(reply.quote) || longerThanClamp(reply.summary);
+  // Laid out unclamped once, hidden, to learn whether the clamp cuts anything.
+  const [cut, setCut] = useState({ quote: false, summary: false });
+  const foldable = cut.quote || cut.summary;
   const lines = open ? undefined : REPLY_LINES;
+  const measure = (key: "quote" | "summary") => (event: TextLayoutEvent) => {
+    const over = event.nativeEvent.lines.length > REPLY_LINES;
+    setCut((previous) => (previous[key] === over ? previous : { ...previous, [key]: over }));
+  };
   return (
     <View className="gap-1.5" accessibilityLabel={reply.label}>
       <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
@@ -278,21 +304,31 @@ export function ReplyContext(props: { readonly reply: ReplyContextView }) {
       {reply.quote ? (
         <View className="flex-row gap-2.5">
           <View className="w-[2px] rounded-full bg-border" />
-          <Text
-            selectable
-            numberOfLines={lines}
-            className="flex-1 text-[13px] leading-5 text-foreground-muted"
-          >
-            {reply.quote}
-          </Text>
+          <View className="flex-1">
+            <Text
+              selectable
+              numberOfLines={lines}
+              className="text-[13px] leading-5 text-foreground-muted"
+            >
+              {reply.quote}
+            </Text>
+            <MeasureText text={reply.quote} onTextLayout={measure("quote")} />
+          </View>
         </View>
       ) : null}
-      <Text selectable numberOfLines={lines} className="text-[13px] leading-5 text-foreground">
-        {reply.summary}
-      </Text>
+      <View>
+        <Text selectable numberOfLines={lines} className="text-[13px] leading-5 text-foreground">
+          {reply.summary}
+        </Text>
+        <MeasureText text={reply.summary} onTextLayout={measure("summary")} />
+      </View>
       {foldable ? (
         <View className="items-start">
-          <LinkButton label={open ? "Show less" : "Show all"} onPress={() => setOpen(!open)} />
+          <LinkButton
+            label={open ? "Show less" : "Show all"}
+            expanded={open}
+            onPress={() => setOpen(!open)}
+          />
         </View>
       ) : null}
     </View>

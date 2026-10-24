@@ -16,6 +16,7 @@ import {
   approverOf,
   isOwnerProvenance,
   LaneId,
+  ZONED_ISO_TIME,
   type ApprovalRoute,
   type Approver,
   type DecideDraftInput,
@@ -223,8 +224,11 @@ export const cleanReplyContext = (input: DraftReplyContext): Outcome<DraftReplyC
     return refuse("invalid", `inReplyTo.author is longer than ${REPLY_AUTHOR_MAX} characters.`);
   }
   const at = input.at?.trim() ?? "";
-  if (at !== "" && !(/^\d{4}-\d{2}-\d{2}T/.test(at) && Number.isFinite(Date.parse(at)))) {
-    return refuse("invalid", "inReplyTo.at must be an ISO date-time, e.g. 2026-10-24T09:30:00Z.");
+  if (at !== "" && !(ZONED_ISO_TIME.test(at) && Number.isFinite(Date.parse(at)))) {
+    return refuse(
+      "invalid",
+      "inReplyTo.at must be an ISO date-time with its zone, e.g. 2026-10-24T09:30:00Z.",
+    );
   }
   return ok({
     summary,
@@ -1219,6 +1223,7 @@ export const openSystemDraft = (command: OpenSystemDraftCommand): Outcome<System
           requestedBy: input.requestedBy,
           head: input.head,
           staleClosed: closed.map((transition) => transition.record.id),
+          ...(inReplyTo === undefined ? {} : { inReplyTo }),
         },
       },
       ...closed.flatMap((transition) => transition.events),

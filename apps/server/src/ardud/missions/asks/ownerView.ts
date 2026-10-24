@@ -6,6 +6,8 @@ import type {
   WorkItem,
   WorkStage,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
+import * as Option from "effect/Option";
 
 /**
  * Shapes for the owner's full view over the desk (his iMessage agent reads
@@ -21,26 +23,24 @@ export interface DraftAttachment {
   readonly from: "target" | "reply" | "view" | "sent";
 }
 
+const OWNER_ZONE = DateTime.zoneMakeNamedUnsafe("Asia/Dubai");
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const pad = (value: number) => String(value).padStart(2, "0");
+
 /** "Mon 19 Oct 14:05" in Dubai time, where the owner reads. */
 const replyTime = (at: string): string => {
-  const ms = Date.parse(at);
-  if (!Number.isFinite(ms)) return at;
-  return new Intl.DateTimeFormat("en-GB", {
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    timeZone: "Asia/Dubai",
-  })
-    .format(ms)
-    .replace(",", "");
+  const date = DateTime.make(at);
+  if (Option.isNone(date)) return at;
+  const parts = DateTime.toParts(DateTime.setZone(date.value, OWNER_ZONE));
+  return `${WEEKDAYS[parts.weekDay] ?? ""} ${parts.day} ${MONTHS[parts.month - 1] ?? ""} ${pad(parts.hour)}:${pad(parts.minute)}`;
 };
 
 /**
  * What a draft replies to as plain text for the owner's chat, or null when the
- * writer gave none. The agent sends it above the draft text.
+ * writer gave none. The agent sends it above the draft text. A summary with no
+ * author, quote, time or link is the situation new text is about, so it reads
+ * "About:" as on the card.
  */
 export const replyingToText = (draft: Pick<Draft, "inReplyTo">): string | null => {
   const reply = draft.inReplyTo ?? null;
@@ -48,7 +48,8 @@ export const replyingToText = (draft: Pick<Draft, "inReplyTo">): string | null =
   const who = [reply.author, reply.at === undefined ? undefined : replyTime(reply.at)]
     .filter((part): part is string => part !== undefined && part !== "")
     .join(", ");
-  const lines = [who === "" ? "Replying to:" : `Replying to ${who}:`];
+  const about = who === "" && reply.quote === undefined && reply.link === undefined;
+  const lines = [about ? "About:" : who === "" ? "Replying to:" : `Replying to ${who}:`];
   if (reply.quote !== undefined) {
     lines.push(...reply.quote.split("\n").map((line) => `> ${line}`));
   }

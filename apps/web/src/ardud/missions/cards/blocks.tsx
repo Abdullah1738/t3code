@@ -371,7 +371,7 @@ export function ReplyContextBlock(props: { reply: ReplyContextView }) {
     };
   }, [open]);
   return (
-    <section aria-label={reply.label} className="flex min-w-0 flex-col gap-1.5">
+    <div role="group" aria-label={reply.label} className="flex min-w-0 flex-col gap-1.5">
       <div className="flex min-h-6 min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-(--m-muted)">
         <span className="inline-flex items-center gap-1.5">
           <ReplyIcon aria-hidden className="size-3.5 shrink-0" />
@@ -392,7 +392,7 @@ export function ReplyContextBlock(props: { reply: ReplyContextView }) {
           <blockquote
             ref={quote}
             className={cn(
-              "min-w-0 border-s-2 border-(--m-control) ps-2.5 text-sm leading-5.5 whitespace-pre-line wrap-anywhere text-(--m-muted)",
+              "min-w-0 border-s-2 border-(--m-control) ps-2.5 text-sm leading-5.5 whitespace-pre-wrap wrap-anywhere text-(--m-muted)",
               !open && "line-clamp-3",
             )}
           >
@@ -422,7 +422,7 @@ export function ReplyContextBlock(props: { reply: ReplyContextView }) {
           {open ? "Show less" : "Show all"}
         </Button>
       ) : null}
-    </section>
+    </div>
   );
 }
 
