@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   alert, CHECK_TIMEOUT_MS, deliver, ensureDirs, escalate, hash, shouldEscalate, HEADSUP_GIVE_UP_MS, HEADSUP_MS, headsUpText, imessage,
-  inboundState, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
+  inboundState, inQuiet, iso, listIds, loadState, loadWatcher, log, now, ROOT, RUN_OK_FILE, runCheck, saveState, type State, telegram, type TrackedWake,
   triggerSig, type Watcher, wakeInboundId, watcherDir, shouldAlert, SLOW_RUN_MS, TIMEOUT_BACKOFF_CAP_S,
 } from "./lib.ts";
 
@@ -42,6 +42,8 @@ function finish(watcher: Watcher, state: State, status: State["status"]): void {
 
 /** Returns true once the event is delivered (or had been already). */
 async function deliverPending(watcher: Watcher, state: State): Promise<boolean> {
+  // A held event keeps its key and is retried each minute, so it goes out once the quiet hours end.
+  if (inQuiet(watcher.quiet)) return false;
   const pending = state.pending!;
   const delivery = await deliver(watcher, pending.event, pending.key, state);
   log(watcher.id, `deliver key=${pending.key} ok=${delivery.ok} via=${delivery.via} ${delivery.detail}`);
@@ -187,6 +189,7 @@ async function tickOne(id: string): Promise<void> {
   saveState(id, fresh);
   ackRun();
   log(id, `event: ${event.slice(0, 500)}`);
+  if (inQuiet(watcher.quiet)) log(id, "quiet hours: event held until they end");
   await deliverPending(watcher, fresh);
 }
 

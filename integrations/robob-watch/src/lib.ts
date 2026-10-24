@@ -39,6 +39,8 @@ const MAX_WAKE = 12_000;
 const MAX_LOG = 512 * 1024;
 
 export type Mode = "wake" | "notify";
+/** From start (inclusive) to end (exclusive), whole hours in time_zone; start > end wraps past midnight. */
+export type Quiet = { start: number; end: number; time_zone: string };
 export type Watcher = {
   id: string;
   title: string;
@@ -61,6 +63,8 @@ export type Watcher = {
   triggers?: string[];
   /** Minimum seconds between trigger-driven runs (default 2); raise it for expensive checks on busy files. */
   trigger_gap_s?: number;
+  /** Hours in which events, new or retried, wait instead of being delivered; the check itself still runs. */
+  quiet?: Quiet;
   created_at: string;
   created_by_session: string | null;
 };
@@ -97,6 +101,20 @@ export const validId = (id: unknown): id is string => typeof id === "string" && 
 export const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 export const now = () => Date.now();
 export const iso = (ms = now()) => new Date(ms).toISOString();
+
+export function inQuiet(quiet: Quiet | undefined, ms = now()): boolean {
+  if (!quiet) return false;
+  const hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hourCycle: "h23", timeZone: quiet.time_zone }).format(ms));
+  return quiet.start < quiet.end ? hour >= quiet.start && hour < quiet.end : hour >= quiet.start || hour < quiet.end;
+}
+
+function validQuiet(value: unknown): value is Quiet {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const { start, end, time_zone } = value as Record<string, unknown>;
+  const hour = (h: unknown) => Number.isInteger(h) && (h as number) >= 0 && (h as number) <= 23;
+  if (!hour(start) || !hour(end) || start === end || typeof time_zone !== "string" || !time_zone) return false;
+  try { new Intl.DateTimeFormat("en-GB", { timeZone: time_zone }); return true; } catch { return false; }
+}
 
 export const watcherDir = (id: string) => join(WATCHERS, id);
 
@@ -141,6 +159,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (expires !== null && (typeof expires !== "string" || Number.isNaN(Date.parse(expires)))) errors.push("expires_at must be an ISO date");
   const maxFires = input.max_fires === undefined ? 1 : Number(input.max_fires);
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
+  const quiet = input.quiet;
+  if (quiet !== undefined && !validQuiet(quiet)) errors.push("quiet must be {start, end, time_zone}: different whole hours 0-23 and an IANA time zone");
   if (errors.length) throw new Error(errors.join("; "));
   return {
     id: input.id!, title: input.title!.trim(), check: input.check!, interval_s: interval, mode: mode as Mode,
@@ -151,6 +171,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
     ...(Number.isFinite(Number(input.trigger_gap_s)) && Number(input.trigger_gap_s) > 0 ? { trigger_gap_s: Number(input.trigger_gap_s) } : {}),
+    ...(quiet !== undefined ? { quiet: { start: quiet.start, end: quiet.end, time_zone: quiet.time_zone } } : {}),
     created_at: typeof input.created_at === "string" ? input.created_at : iso(),
     created_by_session: typeof input.created_by_session === "string" && input.created_by_session ? input.created_by_session : null,
   };

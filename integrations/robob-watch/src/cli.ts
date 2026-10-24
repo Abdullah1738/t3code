@@ -111,6 +111,7 @@ async function main(argv: string[]): Promise<void> {
         const existing = loadWatcher(watcher.id)!;
         watcher.created_at = existing.created_at;
         if (existing.headsup && values.json === undefined) watcher.headsup = true;
+        if (existing.quiet && values.json === undefined) watcher.quiet = existing.quiet;
       }
       Bun.spawnSync(["/bin/mkdir", "-p", dir]);
       writeJson(join(dir, "watcher.json"), watcher);

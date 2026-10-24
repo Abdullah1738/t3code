@@ -78,6 +78,31 @@ test("an undelivered event is kept and retried under the same key before the che
   expect(state("retry")).toMatchObject({ status: "done", fires: 1, last_delivery: "telegram" });
 }, 20_000);
 
+test("quiet hours hold an event, new or retried, under its key and deliver it once they end", async () => {
+  writeFileSync(calls, "");
+  for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
+  const hour = new Date().getUTCHours();
+  const window = (from: number) => ({ start: (hour + from + 24) % 24, end: (hour + from + 2 + 24) % 24, time_zone: "UTC" });
+  const def = { id: "hush", title: "Hush", check: "echo quiet-event", interval_s: 10, mode: "notify", context: "x",
+    expires_at: "1d", max_fires: 1, quiet: window(0) };
+  const add = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/cli.ts"), "add", "--json", "-", "--no-prime"],
+    { env, stdin: new TextEncoder().encode(JSON.stringify(def)) });
+  expect(add.exitCode).toBe(0);
+  await runnerFor(2_500);
+  const held = state("hush");
+  expect(held.pending.event).toBe("quiet-event");
+  expect(held.fires).toBe(0);
+  expect(readCalls().some(call => call.args.join(" ").includes("quiet-event"))).toBe(false);
+  const file = join(sandbox, "root/watchers/hush/watcher.json");
+  writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), quiet: window(3) }));
+  writeFileSync(join(sandbox, "root/watchers/hush/state.json"), JSON.stringify({ ...state("hush"), next_at: 0 }));
+  await runnerFor(2_500);
+  const sent = readCalls().filter(call => call.args.join(" ").includes("quiet-event"));
+  expect(sent).toHaveLength(1);
+  expect(sent[0]!.args[sent[0]!.args.indexOf("--key") + 1]).toBe(held.pending.key);
+  expect(state("hush")).toMatchObject({ status: "done", fires: 1 });
+}, 20_000);
+
 test("failing checks back off and alert once; expired watchers switch off with a notice", async () => {
   writeFileSync(calls, "");
   for (const name of ["wake", "send", "notify"]) rmSync(join(sandbox, `fail-${name}`), { force: true });
