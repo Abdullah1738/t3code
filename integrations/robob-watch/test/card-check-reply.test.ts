@@ -53,6 +53,43 @@ test("one or two plain facts stay text", () => {
   expect(rules("It's at Banyan Tree Residences, Flat 2104.")).toEqual(["WARN:address"]);
 });
 
+test("codes need an access label, Wi-Fi needs a credential, and a bare building number is an address", () => {
+  for (const text of [
+    "The API returned error code: 403",
+    "Wi-Fi is back now.",
+    "The Wi-Fi password is wrong, I'll ask the host.",
+    "Use promo code SAVE20 at checkout.",
+  ]) {
+    expect(checkReply(text), text).toEqual([]);
+  }
+  expect(rules("It's at Building 123")).toEqual(["WARN:address"]);
+  for (const text of [
+    "Flight: EK57\nGate: B12",
+    "Flight EK57: DXB \u2192 DUS, 24 Oct, 14:05\u201319:15.",
+    "Wi\u2011Fi: LakeHouse_5G",
+    "Door code: \u0661\u0662\u0663\u0664",
+    "Door code: A1234#",
+    "SSID Lake_5G, password: hunter22",
+    "Gate code: 4821 for the villa",
+  ]) {
+    expect(fails(text).length, text).toBeGreaterThan(0);
+  }
+});
+
+test("long runs of spaces or junk can't stall the check", () => {
+  for (const text of [
+    "door" + " ".repeat(4000) + "x",
+    "Wi-Fi " + "a".repeat(20000),
+    "password " + "x".repeat(20000),
+    "+9" + "1 ".repeat(5000) + "x",
+    ("Flight EK57 " + " \t ".repeat(500)).repeat(20),
+  ]) {
+    const started = performance.now();
+    checkReply(text, { chat: "moni" });
+    expect(performance.now() - started, text.slice(0, 20)).toBeLessThan(250);
+  }
+});
+
 test("a trip item in a 1:1 chat points at the group", () => {
   const text = "EK57 boards at 14:05 from gate B12.";
   expect(rules(text, "moni")).toContain("WARN:group");
