@@ -1,0 +1,349 @@
+#!/usr/bin/python3
+"""mailsend: email in Abdullah's name, draft first. Only a draft he OKed after seeing it goes out.
+
+  mailsend draft -a ACCT -t ADDR [-t ADDR]... [--cc ADDR]... -s SUBJECT (--body TEXT | --body-file PATH) [--attach PATH]...
+  mailsend reply -a ACCT -m MAILBOX ID (--body TEXT | --body-file PATH) [--cc ADDR]... [--attach PATH]...
+  mailsend forward -a ACCT -m MAILBOX ID -t ADDR [-t ADDR]... [--cc ADDR]... [--body TEXT | --body-file PATH] [--attach PATH]...
+  mailsend show ID
+  mailsend send --approved ID (--inbound ID | --app)
+
+draft, reply and forward build the exact message with himalaya (nothing is sent), keep it and print its preview:
+sender, recipients, subject, files and the full text that goes out (quoted original included). Show Abdullah the
+preview lines as is (send-file him any attachment in the same chat first), wait for his OK, then send with the id of
+his reply: --inbound <Current incoming message ID> from iMessage, --app in a Robob thread (checked by send-approval).
+A draft is single use and expires after 24h. A changed draft gets a new id and needs a new OK; so does the same
+email drafted again after the old draft expired (it is kept as <id>.expired.json).
+No Bcc: himalaya 2.1 leaves the Bcc header in the sent mail, so every recipient would see it.
+icloud and outlook get a copy in Sent after sending; Google accounts save their own.
+"""
+import argparse, email, email.policy, fcntl, hashlib, json, os, re, shlex, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+D = os.environ.get("MAILSEND_DRAFT_DIR") or os.path.join(HOME, ".local/state/mail-drafts")
+HERE = os.path.dirname(os.path.realpath(__file__))
+SA = os.environ.get("MAILSEND_SEND_APPROVAL") or os.path.join(HERE, "send-approval")
+# himalaya through the XOAUTH2 retry wrapper (absolute path inside, so agent PATH shims don't apply).
+HIMALAYA = shlex.split(os.environ.get("MAILSEND_HIMALAYA") or
+                       f"/usr/bin/python3 {HOME}/.local/libexec/mail/mail_oauth.py himalaya")
+SAVE_COPY = {"icloud", "outlook"}
+MAX_AGE = 86400
+SEND_TIMEOUT = int(os.environ.get("MAILSEND_SEND_TIMEOUT") or 180)
+ADDR = re.compile(r"^[^\s<>@,;\"']+@[^\s<>@,;\"']+\.[^\s<>@,;\"']+$")
+RE_ID = re.compile(r"^[0-9a-f]{10}$")
+USED = ("sent", "sending", "failed", "uncertain", "expired")
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def run(argv, timeout=120):
+    try:
+        return subprocess.run(HIMALAYA + argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def sha_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def addrs(header):
+    return [a.addr_spec for a in getattr(header, "addresses", ()) or ()] if header is not None else []
+
+
+def check_addrs(values, flag):
+    for v in values:
+        if not ADDR.match(v):
+            die(f"error: {flag} takes a plain address like name@example.com, not {v!r}")
+
+
+def build(a):
+    """Run himalaya without --send and return (argv, raw MIME)."""
+    check_addrs(a.to, "-t/--to")
+    check_addrs(a.cc, "--cc")
+    if getattr(a, "bcc", None):
+        die("Refused: no Bcc. himalaya leaves the Bcc header in the sent mail, so every recipient would see it. "
+            "Send a separate email instead.")
+    if a.body is not None and a.body_file:
+        die("error: use --body or --body-file, not both")
+    body = a.body
+    if a.body_file:
+        try:
+            with open(a.body_file, encoding="utf-8") as fh:
+                body = fh.read()
+        except (OSError, UnicodeDecodeError) as e:
+            die(f"error: can't read --body-file: {e}")
+    if a.kind in ("draft", "reply") and not (body or "").strip():
+        die("error: empty body")
+    for p in a.attach:
+        if not os.path.isfile(p):
+            die(f"error: no such file: {p}")
+    argv = ["-a", a.account, "message", {"draft": "compose", "reply": "reply", "forward": "forward"}[a.kind]]
+    if a.kind != "draft":
+        argv += ["-m", a.mailbox]
+    argv += [f"--to={t}" for t in a.to] + [f"--cc={c}" for c in a.cc]
+    if a.kind == "draft":
+        argv.append(f"--subject={a.subject}")
+    argv.append(f"--body={body or ''}")
+    argv += [f"--attach={os.path.abspath(p)}" for p in a.attach]
+    if a.kind != "draft":
+        argv += ["--", a.id]
+    r = run(argv)
+    if r is None:
+        die("error: himalaya timed out building the draft (nothing was sent)", 1)
+    if r.returncode != 0 or not r.stdout.strip():
+        die(f"error: himalaya couldn't build the draft (nothing was sent): "
+            f"{(r.stderr or r.stdout).decode(errors='replace').strip()[:400]}", 1)
+    return body or "", r.stdout
+
+
+def draft_path(i, state=None):
+    return os.path.join(D, f"{i}.{state}.json" if state else f"{i}.json")
+
+
+def load(i):
+    with open(draft_path(i)) as fh:
+        return json.load(fh)
+
+
+def text_of(msg):
+    """The text that goes out: every text/plain body part, in order. Anything else is refused."""
+    parts = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        if part.get_content_disposition() == "attachment":
+            continue
+        if part.get_content_type() != "text/plain":
+            die(f"error: the draft has a {part.get_content_type()} part; mailsend sends plain text only "
+                "(nothing was sent)", 1)
+        # MIME text lines end in CRLF; the preview shows them as plain lines (a bare CR is refused later).
+        parts.append(part.get_content().replace("\r\n", "\n"))
+    return "\n".join(parts)
+
+
+def preview(d, text):
+    lines = [f"Email from {d['from']} ({d['account']})", f"To: {', '.join(d['to'])}"]
+    if d["cc"]:
+        lines.append(f"Cc: {', '.join(d['cc'])}")
+    lines.append(f"Subject: {d['subject']}")
+    for f in d["attachments"]:
+        lines.append(f"Attachment: {f['path']} (sha256 {f['sha256'][:12]})")
+    lines.append("")
+    lines.append(text.strip() or "(no text)")
+    lines.append(f"(draft {d['id']})")
+    return "\n".join(lines)
+
+
+def fresh(d):
+    """Pending and still sendable: under 24h old and every attachment unchanged."""
+    if not isinstance(d.get("created_at"), int) or time.time() - d["created_at"] > MAX_AGE or not d.get("preview"):
+        return False
+    return all(os.path.isfile(f["path"]) and sha_file(f["path"]) == f["sha256"] for f in d["attachments"])
+
+
+def print_draft(d):
+    print(f"DRAFT {d['id']} email to {', '.join(d['to'] + d['cc'])}: {d['subject']}")
+    print("Show Abdullah these lines as is (the full email that goes out; in a Robob thread alone in a plain ``` "
+          "code block), then wait for his OK:")
+    print(d["preview"])
+    print(f"After his OK: mailsend send --approved {d['id']} --inbound <incoming message ID of his reply> "
+          "(in a Robob thread: --app)")
+    if d["attachments"]:
+        print("In iMessage, send-file him each attachment in the same chat right before the preview.")
+
+
+def lock(i):
+    """One builder or sender per draft id at a time; held until this process exits."""
+    os.makedirs(os.path.join(D, "locks"), exist_ok=True)
+    fh = open(os.path.join(D, "locks", i), "a")
+    deadline = time.time() + 60
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except BlockingIOError:
+            if time.time() > deadline:
+                die(f"Refused: draft {i} is busy (another mailsend is writing or sending it). Try again in a minute.")
+            time.sleep(0.2)
+
+
+def cmd_build(a):
+    body, raw = build(a)
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    if msg["Bcc"] is not None:
+        die("Refused: the draft has a Bcc header (every recipient would see it). Nothing was sent.")
+    frm, to, cc = addrs(msg["From"]), addrs(msg["To"]), addrs(msg["Cc"])
+    if len(frm) != 1 or not to:
+        die("error: himalaya built a draft without a sender or recipient (nothing was sent)", 1)
+    subject = str(msg["Subject"] or "")
+    files = [{"path": os.path.abspath(p), "name": os.path.basename(p), "sha256": sha_file(p)} for p in a.attach]
+    got = sorted(hashlib.sha256(part.get_payload(decode=True) or b"").hexdigest() for part in msg.iter_attachments())
+    if sorted(f["sha256"] for f in files) != got:
+        die("error: the built draft's attachments don't match the files given (nothing was sent)", 1)
+    text = text_of(msg)
+    # The bridge strips model-internal and DCP text from what he reads, so a draft with any can't be shown whole.
+    probe = {"id": "0" * 10, "account": a.account, "from": frm[0], "to": to, "cc": cc, "subject": subject,
+             "attachments": files}
+    if subprocess.run([SA, "visible", preview(probe, text)]).returncode != 0:
+        sys.exit(2)
+    key = json.dumps([a.kind, a.account, getattr(a, "mailbox", ""), getattr(a, "id", ""), frm[0], to, cc, subject,
+                      body, [f["sha256"] for f in files]], ensure_ascii=False)
+    n = 0
+    while True:
+        i = hashlib.sha256((key if not n else f"{key}\nretry {n}").encode()).hexdigest()[:10]
+        # After a failed send or an expired draft the same email gets a new id, so the old OK can't send it again.
+        if os.path.exists(draft_path(i, "failed")) or os.path.exists(draft_path(i, "expired")):
+            n += 1
+            continue
+        held = lock(i)
+        # Another builder may have retired this id while we waited for its lock.
+        if os.path.exists(draft_path(i, "failed")) or os.path.exists(draft_path(i, "expired")):
+            held.close()
+            n += 1
+            continue
+        for s in ("sent", "sending", "uncertain"):
+            if os.path.exists(draft_path(i, s)):
+                die(f"Refused: this exact email ({i}) was already {'sent' if s == 'sent' else 'sent or attempted'} "
+                    f"({s}). Check Sent first; to try again, change the text a little.")
+        if not os.path.isfile(draft_path(i)):
+            break
+        d = load(i)
+        if fresh(d):
+            # Pending already: keep the stored message and its clock, so what he OKs is what goes out.
+            print_draft(d)
+            return
+        os.replace(draft_path(i), draft_path(i, "expired"))
+        held.close()
+    os.makedirs(D, exist_ok=True)
+    eml = os.path.join(D, f"{i}.eml")
+    with open(eml + ".tmp", "wb") as fh:
+        fh.write(raw)
+    os.replace(eml + ".tmp", eml)
+    d = {"id": i, "kind": a.kind, "account": a.account, "from": frm[0], "to": to, "cc": cc, "subject": subject,
+         "body": body, "attachments": files, "eml": eml, "eml_sha256": hashlib.sha256(raw).hexdigest(),
+         "created_at": int(time.time())}
+    if a.kind != "draft":
+        d["source"] = {"mailbox": a.mailbox, "id": a.id}
+    d["preview"] = preview(d, text)
+    with open(draft_path(i) + ".tmp", "w") as fh:
+        json.dump(d, fh, ensure_ascii=False)
+    os.replace(draft_path(i) + ".tmp", draft_path(i))
+    print_draft(d)
+    held.close()
+
+
+def cmd_show(a):
+    if not RE_ID.match(a.draft):
+        die(f"error: bad draft id: {a.draft}")
+    if not os.path.isfile(draft_path(a.draft)):
+        die(f"no pending draft {a.draft}")
+    print_draft(load(a.draft))
+
+
+def cmd_send(a):
+    i = a.approved
+    if not RE_ID.match(i):
+        die(f"error: bad draft id: {i}")
+    if not (a.inbound or a.app):
+        die("Refused: --approved <id> alone isn't Abdullah's OK. Add --inbound <incoming message ID of his reply> "
+            "(iMessage) or --app (his reply in this Robob thread), after he saw the preview.")
+    held = lock(i)
+    for s in USED:
+        if os.path.exists(draft_path(i, s)):
+            die(f"Refused: draft {i} already used ({s}). Write a new draft.")
+    if not os.path.isfile(draft_path(i)):
+        die(f"Refused: no draft {i}. Write one with mailsend draft, reply or forward.")
+    d = load(i)
+    if not d.get("preview"):
+        die(f"Refused: draft {i} predates preview binding. Write it again and show the new preview.")
+    if not isinstance(d.get("created_at"), int) or time.time() - d["created_at"] > MAX_AGE:
+        die(f"Refused: draft {i} is older than 24h. Write a new draft.")
+    try:
+        with open(d["eml"], "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        die(f"Refused: the stored message for draft {i} is gone. Write a new draft.")
+    if hashlib.sha256(raw).hexdigest() != d["eml_sha256"]:
+        die(f"Refused: the stored message for draft {i} changed. Write a new draft.")
+    for f in d["attachments"]:
+        if not os.path.isfile(f["path"]) or sha_file(f["path"]) != f["sha256"]:
+            die(f"Refused: {f['path']} changed or is gone since draft {i}. Write a new draft and show it again.")
+
+    files = []
+    for f in d["attachments"]:
+        files += ["--file", f["sha256"], f["name"]]
+    via = ["--app"] if a.app else ["--inbound", a.inbound]
+    if subprocess.run([SA, "check"] + via + ["--preview", d["preview"], "--drafted-at", str(d["created_at"])]
+                      + files).returncode != 0:
+        sys.exit(2)
+
+    # Claim: the link fails if a claim already exists, so two senders can't both go.
+    claimed = draft_path(i, "sending")
+    try:
+        os.link(draft_path(i), claimed)
+        os.unlink(draft_path(i))
+    except OSError:
+        die(f"Refused: draft {i} already used.")
+    r = run(["-a", d["account"], "message", "send", "--", d["eml"]], timeout=SEND_TIMEOUT)
+    if r is None:
+        os.replace(claimed, draft_path(i, "uncertain"))
+        die(f"himalaya timed out: the email may or may not have gone out. Check {d['account']} Sent before "
+            "anything else; never resend this draft blindly.", 1)
+    if r.returncode != 0:
+        os.replace(claimed, draft_path(i, "failed"))
+        die((r.stderr or r.stdout).decode(errors="replace").strip()[:800] or f"himalaya exit {r.returncode}", 1)
+    os.replace(claimed, draft_path(i, "sent"))
+    held.close()
+    print(f"(sent) Email to {', '.join(d['to'] + d['cc'])}: {d['subject']}")
+    if d["account"] in SAVE_COPY:
+        s = run(["-a", d["account"], "message", "add", "-m", "sent", "-f", "seen", "--", d["eml"]])
+        if s is None or s.returncode != 0:
+            print(f"warning: sent, but the copy in {d['account']} Sent failed; don't resend", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mailsend", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd")
+    for kind in ("draft", "reply", "forward"):
+        p = sub.add_parser(kind)
+        p.set_defaults(kind=kind, fn=cmd_build)
+        p.add_argument("-a", "--account", required=True)
+        if kind != "draft":
+            p.add_argument("-m", "--mailbox", required=True)
+            p.add_argument("id")
+        if kind != "reply":
+            p.add_argument("-t", "--to", action="append", default=[], required=True)
+        else:
+            p.set_defaults(to=[])
+        p.add_argument("--cc", action="append", default=[])
+        p.add_argument("--bcc", action="append", default=[])
+        if kind == "draft":
+            p.add_argument("-s", "--subject", required=True)
+        p.add_argument("--body")
+        p.add_argument("--body-file")
+        p.add_argument("--attach", action="append", default=[])
+    p = sub.add_parser("show")
+    p.add_argument("draft")
+    p.set_defaults(fn=cmd_show)
+    p = sub.add_parser("send")
+    p.add_argument("--approved", required=True)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--inbound")
+    g.add_argument("--app", action="store_true")
+    p.set_defaults(fn=cmd_send)
+    a = ap.parse_args()
+    if not getattr(a, "fn", None):
+        print(__doc__)
+        sys.exit(2)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
